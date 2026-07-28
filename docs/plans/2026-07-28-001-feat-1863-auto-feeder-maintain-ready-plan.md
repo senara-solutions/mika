@@ -170,6 +170,67 @@ being re-promoted. Audit via the existing `log_audit_event(session_id, "auto_fee
 trace_id)` signature. `WORKING_SET_CAP: usize = 50` and `AUTO_FEEDER_MIN_READY_ENV`/`_DEFAULT`/`_MIN`/`_MAX`
 consts added next to the Phase 2 consts.
 
+### D6 — 50-issue working-set cap rationale (F4)
+
+The cap is a **pagination + grooming-signal** bound, not an arbitrary limit. Two reasons keep it at 50
+rather than raising to 100:
+
+1. **API pagination.** The shared `gh issue list` fetch pages at a default page size; 50 open, groomed,
+   dispatchable-but-not-ready candidates is already an order of magnitude beyond any healthy steady state
+   (the feeder tops the pool to ≤ 10, and the pool drains within one webhook cycle). Ranking past
+   position 50 costs pages for candidates the feeder will never reach in a single tick.
+2. **Grooming-pipeline health signal.** A groomed-not-ready backlog **exceeding 50** is itself a
+   symptom: grooming is out-running dispatch, which is a *grooming-throughput* problem (surfaced by the
+   `auto_feeder_no_backlog` inverse and by the AC9 pool-sampling), not a feeder-visibility problem.
+   Raising the cap would mask that signal by letting the feeder churn a deep backlog instead of leaving
+   it visible. If real operation ever shows a legitimate >50 dispatchable backlog, raise the const — it
+   is a single-line change with no structural coupling. Documented in `mika/CLAUDE.md` (impl step 8).
+
+Citation: review-guide.md § YAGNI — cap the visible working set to the smallest bound that covers the
+real steady state; make the overflow observable rather than silently absorbed.
+
+---
+
+## Divergence ratification (F1 — BLOCKING, spec-level)
+
+**D2 (pullable-count, diverges from AC3) and D3 (`is_groomed` full callout, diverges from AC4) are
+spec amendments, not implementation details.** Per the *issue-as-versioned-contract* convention, a plan
+may not silently override literal AC text: the divergence must be ratified into the issue body **before
+this plan merges**, or the plan must fall back to the literal AC (raw-count + `Plan:` substring — the
+fallback that reintroduces the founding-incident idle, see Risks § R-divergence-from-AC).
+
+**This is a merge gate, tracked in the Definition of Done.** The pilot's content-only contract cannot
+edit the issue body or solicit operator ratification; those two actions are owned by the
+orchestrator/operator step below. What the plan *can* do — and does here — is the "closure annotation
+in plan" half of the ratification: pin the exact proposed AC replacement text so ratification is a
+one-action operator step.
+
+**Proposed AC3 replacement (to be written into the issue body on ratification):**
+
+> **AC3** — Query the current **pullable**-ready count — `ready`-labelled issues that are actually
+> dispatchable (no open closing PR, no in-flight self_dev task, not `blocked`/`operator-review`) — not
+> the raw `gh issue list --label ready | jq length`. If pullable-count ≥ `MIN_READY` → no-op, return
+> early. *(Divergence from the original raw-count wording, ratified — the 2026-07-27→28 11 h idle
+> proves raw-count is the wrong signal: #1682 open-PR + #1646 in-flight kept raw-count ≥ 1 while
+> pullable-count was 0.)*
+
+**Proposed AC4 replacement (to be written into the issue body on ratification):**
+
+> **AC4** — Query the groomed-not-ready backlog: open, **`is_groomed(body)` full canonical callout**
+> (Branch + `docs/plans/` + second-pass GROOMED marker — **not** the loose `Plan: docs/plans/`
+> substring), no `ready` label; sorted by priority (`p1-important` > `agent-core` > p2/p3 > age-DESC);
+> working set capped at 50. *(Divergence from the substring wording, ratified — the #919 dispatch gate
+> rejects any promoted ticket lacking the full callout with `dispatch_no_grooming_marker`, manufacturing
+> the stuck-ready churn Phase 2 exists to clean up.)*
+
+**Operator/orchestrator ratification step (owned outside this content-only pilot run):** on architect
+GROOMED, before merge — (1) apply the two AC replacements above to the issue body, (2) add an
+edit-notice comment on #1863 recording the AC3/AC4 amendment with a link to D2/D3, (3) confirm this
+plan's closure annotation matches the ratified body. If Vincent declines the divergence, the fallback
+is the literal-AC path (raw-count + substring) documented in Risks § R-divergence-from-AC.
+
+Citation: user_summary § issue-as-versioned-contract.
+
 ---
 
 ## Implementation steps
@@ -180,7 +241,12 @@ consts added next to the Phase 2 consts.
 2. **`parse_min_ready(raw: Option<&str>) -> u32`** + `auto_feeder_min_ready()` env reader (D2/R2). `0` →
    `0` (disable sentinel, preserved through clamp); `1..=10` → as-is; `>10` → `10`; missing/invalid →
    `3` (WARN on invalid). Unit-tested without env mutation.
-3. **`feeder_rank(labels: &[IssueLabel]) -> u8`** (R6) — real-label max-rank.
+3. **`feeder_rank(labels: &[IssueLabel]) -> u8`** (R6) — real-label max-rank. **Add a doc comment on the
+   function (F2):** `// Corrects the latent priority_rank bug (matches bare "p1", returns 0 for real` `//
+   issues). Uses the real .github/labels.yml taxonomy. Unifying the two into one ranker requires` `//
+   verifying agent-core label handling across the whole auto_pull surface — out of scope here.` The
+   comment makes the intentional divergence from `priority_rank` legible to the next reader rather than
+   looking like accidental duplication.
 4. **`count_pullable_ready(issues, open_pr, in_flight) -> usize`** and
    **`select_feeder_candidates(issues, open_pr, in_flight, slots) -> Vec<u64>`** (D4) — pure predicates.
    Candidate filter chain: `!ready` → `is_groomed` → `!open_pr` → `!in_flight` → `!blocked` →
@@ -194,7 +260,11 @@ consts added next to the Phase 2 consts.
    For each candidate: circuit-breaker guard → `gh_apply_label(…, "ready")` → on success
    `record_auto_pull` + `reset_auto_pull_failure` + `auto_feeder_promoted` audit + INFO; on failure
    `increment_auto_pull_failure` + WARN, continue. Return promoted count.
-6. **Wire Phase 0** into `auto_pull_groomed_ticket` before Phase 1 (D1).
+6. **Wire Phase 0** into `auto_pull_groomed_ticket` before Phase 1 (D1). **Add an orchestrator comment
+   documenting the N+1 bound (F3):** at the Phase 0 → Phase 1 boundary, note that Phase 0 tops the pool
+   to `min_ready` (N) and Phase 1's `!ready` filter may then promote one *additional* groomed ticket
+   when the queue is idle → at most **N+1** ready tickets per tick. State the bound is intentional and
+   benign (webhook drains the pool; the two phases have complementary intents — buffer vs idle-kick).
 7. **Tests** (AC8, all pure — no network/DB, mirroring the existing 39-test pattern with `make_issue`):
    - `parse_min_ready`: default-on-missing, `0`-disables, clamp-min (`1`), clamp-max (`>10`→`10`),
      invalid-falls-back, valid-passthrough.
@@ -208,7 +278,11 @@ consts added next to the Phase 2 consts.
      post-deploy verify.)
 8. **Docs**: add `MIKA_AUTO_FEEDER_MIN_READY` to `mika/CLAUDE.md` env section (new "auto-feeder" bullet
    next to the auto-pull stuck-ready reconciler entry), documenting default/clamp/`0`-disables, the
-   pullable-count semantics (D2), and the three audit events.
+   pullable-count semantics (D2), and the three audit events. **Also document (F3) the N+1 over-promotion
+   bound** — Phase 0 tops to N, Phase 1 may add one more when idle → at most N+1 ready per tick, benign —
+   and **(F4) the 50-issue working-set cap rationale** per D6 (pagination bound + a >50 dispatchable
+   backlog is a grooming-throughput signal, kept observable rather than absorbed; single-line raise if
+   real operation warrants it).
 
 ---
 
@@ -244,6 +318,10 @@ consts added next to the Phase 2 consts.
 - Three `auto_feeder` audit events emitted (R7); fail-open preserved (R8).
 - Circuit breaker reused; no promotion of un-dispatchable (non-`is_groomed`) tickets (D3, D5).
 - Feeder unit tests pass; clippy/fmt clean; Phase 1/2 tests unchanged.
+- **Divergence ratification gate (F1):** AC3/AC4 spec amendments (D2/D3) ratified into the issue body
+  per the ratification section — proposed replacement text pinned in-plan; body edit + edit-notice
+  comment owned by the orchestrator/operator step **before merge**. If declined, fall back to literal-AC
+  path (Risks § R-divergence-from-AC).
 
 ---
 
@@ -311,3 +389,24 @@ consts added next to the Phase 2 consts.
   rupture D (TBD). Precondition-blocking: cpp#79.
 - Orchestrator memory `feedback_always_busy_requires_feeding_queue` (2026-07-28) — this ticket is its
   structural fix.
+
+---
+
+## Revision history
+
+- rev 2 (2026-07-28): addressed architect first-pass ITERATE findings.
+  - **F1 (BLOCKING)** — added a dedicated *Divergence ratification (F1)* section that pins the exact
+    proposed AC3/AC4 replacement text, names the divergence a pre-merge gate, records it in the DoD, and
+    delegates the issue-body edit + edit-notice comment to the orchestrator/operator step (the
+    content-only pilot contract forbids body edits and operator solicitation — the in-plan closure
+    annotation is the half this run can own). Citation preserved: user_summary § issue-as-versioned-contract.
+  - **F2 (sharpening)** — impl step 3 now specifies the `feeder_rank` doc comment noting it corrects the
+    latent `priority_rank` bare-`"p1"` bug and that unification needs agent-core label-handling
+    verification. Citation: review-guide.md § Maintainability.
+  - **F3 (sharpening)** — N+1 over-promotion bound now documented explicitly in both the orchestrator
+    comment (impl step 6) and `mika/CLAUDE.md` (impl step 8), beyond the existing D1 phase-interaction
+    note. Citation: review-guide.md § KISS.
+  - **F4 (sharpening)** — added D6 documenting the 50-issue working-set cap rationale (pagination bound +
+    >50 dispatchable backlog = grooming-throughput signal, kept observable; single-line raise if warranted),
+    surfaced in `mika/CLAUDE.md` via impl step 8. Kept cap at 50 rather than raising to 100. Citation:
+    review-guide.md § YAGNI.
