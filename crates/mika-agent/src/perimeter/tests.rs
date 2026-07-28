@@ -320,3 +320,153 @@ fn summary_reports_mechanical_count() {
     assert!(summary.contains("MECHANICAL"));
     assert!(summary.contains('2'));
 }
+
+// ---------------------------------------------------------------------------
+// claude-pilot (mika#1860) — precondition for cpp#79 autonomous onboarding.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cpp_non_security_python_is_mechanical() {
+    // Files enumerated in MECHANICAL_PREFIXES as cpp non-security python.
+    // Each has documented rationale (see rules.rs comment).
+    for path in [
+        "src/claude_pilot/agent.py",
+        "src/claude_pilot/cli.py",
+        "src/claude_pilot/guardrails.py",
+        "src/claude_pilot/inbox_writer.py",
+        "src/claude_pilot/logger.py",
+        "src/claude_pilot/transport.py",
+        "src/claude_pilot/types.py",
+        "src/claude_pilot/ui.py",
+    ] {
+        assert_eq!(
+            classify_path(path),
+            Classification::Mechanical,
+            "cpp non-security python must be MECHANICAL: {path} (mika#1860)"
+        );
+    }
+}
+
+#[test]
+fn cpp_ipython_subdir_is_mechanical() {
+    // `src/claude_pilot/ipython/` prefix covers all optional IPython magics.
+    for path in [
+        "src/claude_pilot/ipython/__init__.py",
+        "src/claude_pilot/ipython/magics.py",
+    ] {
+        assert_eq!(classify_path(path), Classification::Mechanical, "{path}");
+    }
+}
+
+#[test]
+fn cpp_tests_dir_is_mechanical() {
+    // cpp tests live at repo root under `tests/` (mika tests live under
+    // `crates/*/tests/` and are covered by MECHANICAL_CONTAINS).
+    for path in [
+        "tests/test_tier1.py",
+        "tests/test_policy_devpilot.py",
+        "tests/test_permissions.py",
+        "tests/replay/replay_relay_decisions.py",
+    ] {
+        assert_eq!(classify_path(path), Classification::Mechanical, "{path}");
+    }
+}
+
+#[test]
+fn cpp_root_artifacts_are_mechanical() {
+    // Python packaging + license — no security surface.
+    for path in ["pyproject.toml", "uv.lock", "LICENSE"] {
+        assert_eq!(classify_path(path), Classification::Mechanical, "{path}");
+    }
+}
+
+#[test]
+fn cpp_docs_solutions_and_plans_are_mechanical() {
+    // cpp shares `docs/solutions/` and `docs/plans/` with mika; already
+    // covered by the shared MECHANICAL_PREFIXES. Assert cpp paths get the
+    // right classification through the shared rules.
+    for path in [
+        "docs/solutions/security-issues/foo.md",
+        "docs/plans/2026-07-28-001-cpp-plan.md",
+    ] {
+        assert_eq!(classify_path(path), Classification::Mechanical, "{path}");
+    }
+}
+
+#[test]
+fn cpp_classifier_tiers_are_decision_core() {
+    // The 5 cpp files enumerated as DECISION-CORE in the rules.rs doc header.
+    // These MUST fail-closed to DecisionCore — a false MECHANICAL here would
+    // let the autonomous loop auto-merge a permission-policy widening,
+    // re-opening the mika#1853 invariant hole on cpp (mika#1860 rationale).
+    for path in [
+        "src/claude_pilot/tier1.py",
+        "src/claude_pilot/policy.py",
+        "src/claude_pilot/permissions.py",
+        "src/claude_pilot/per_spawn.py",
+        "src/claude_pilot/policies/permissions.yaml",
+    ] {
+        assert_eq!(
+            classify_path(path),
+            Classification::DecisionCore,
+            "cpp classifier tier must be DECISION-CORE: {path} (mika#1860)"
+        );
+    }
+}
+
+#[test]
+fn cpp_future_policy_files_are_decision_core() {
+    // Any new .yaml in src/claude_pilot/policies/ must fail-closed to
+    // DECISION-CORE — the fail-closed default catches unenumerated policy
+    // files (no `src/claude_pilot/policies/` prefix in the MECHANICAL
+    // allowlist, so it correctly falls through).
+    for path in [
+        "src/claude_pilot/policies/new_policy.yaml",
+        "src/claude_pilot/policies/overrides.yaml",
+        "src/claude_pilot/policies/__init__.py",
+    ] {
+        assert_eq!(
+            classify_path(path),
+            Classification::DecisionCore,
+            "unenumerated cpp policy file must fail-closed to DECISION-CORE: {path}"
+        );
+    }
+}
+
+#[test]
+fn cpp_mixed_pr_taints_to_decision_core() {
+    // Cross-repo integration invariant: a cpp PR touching ONE DECISION-CORE
+    // file (tier1.py) alongside MECHANICAL files (logger.py, tests/) must
+    // classify the whole PR as DECISION-CORE. Mirrors the mika mixed-PR
+    // taint invariant for cpp-side onboarding readiness (cpp#79 blocked
+    // by mika#1860).
+    let files = vec![
+        "src/claude_pilot/logger.py".to_string(),
+        "tests/test_tier1.py".to_string(),
+        "src/claude_pilot/tier1.py".to_string(), // DECISION-CORE taint
+    ];
+    let result = classify_pr_files(&files);
+    assert_eq!(result.verdict, Classification::DecisionCore);
+    assert_eq!(
+        result.decision_core_files,
+        vec!["src/claude_pilot/tier1.py"]
+    );
+    assert_eq!(result.mechanical_files.len(), 2);
+}
+
+#[test]
+fn cpp_all_mechanical_pr_classifies_mechanical() {
+    // Positive case: cpp PR touching only MECHANICAL cpp files auto-merges.
+    // This is the throughput case cpp#79 enables — dep bumps, doc fixes,
+    // test additions, non-security refactors flow through auto-merge.
+    let files = vec![
+        "src/claude_pilot/logger.py".to_string(),
+        "src/claude_pilot/ui.py".to_string(),
+        "tests/test_permissions.py".to_string(),
+        "pyproject.toml".to_string(),
+    ];
+    let result = classify_pr_files(&files);
+    assert_eq!(result.verdict, Classification::Mechanical);
+    assert!(result.decision_core_files.is_empty());
+    assert_eq!(result.mechanical_files.len(), 4);
+}

@@ -24,6 +24,8 @@
 //! For clarity and audit-trail — none of these paths appears in the rules
 //! below, so they fail-closed to DECISION-CORE via [`super::classify_path`]:
 //!
+//! ### mika (senara-solutions/mika)
+//!
 //! - `crates/mika-agent/src/perimeter/**` — the perimeter itself
 //! - `crates/mika-agent/src/server/verdict.rs` — verdict parser
 //! - `crates/mika-agent/src/server/verdict_handler.rs` — verdict-form / dispatch-authority
@@ -35,6 +37,20 @@
 //! - `.github/labels.yml` — label taxonomy (governance)
 //! - `docs/gate/perimeter.md` — the perimeter doc (self-reference at doc layer)
 //! - `docs/architecture/**`, `docs/adr/**`, `docs/design/**` — authority docs
+//!
+//! ### claude-pilot (senara-solutions/claude-pilot) — mika#1860, precondition for cpp#79
+//!
+//! - `src/claude_pilot/tier1.py` — tier-1 auto-approval classifier
+//! - `src/claude_pilot/policy.py` — tier-2 policy YAML evaluator (decision authority)
+//! - `src/claude_pilot/permissions.py` — can_use_tool orchestration + chain-safe
+//! - `src/claude_pilot/per_spawn.py` — per-spawn permission-policy evaluator (mika#1708)
+//! - `src/claude_pilot/policies/permissions.yaml` — policy rules themselves
+//! - `src/claude_pilot/policies/**` (any `.yaml` under this prefix) — any future policy file
+//! - `src/claude_pilot/policies/__init__.py` — policy loader (touches loader = touches policy)
+//!
+//! Non-security cpp python files (agent.py, cli.py, guardrails.py, inbox_writer.py,
+//! ipython/, logger.py, transport.py, types.py, ui.py) are enumerated as MECHANICAL
+//! below; anything not listed defaults to DECISION-CORE via fail-closed.
 //!
 //! ## Growth
 //!
@@ -77,6 +93,30 @@ const MECHANICAL_PREFIXES: &[&str] = &[
     // These control how versions are stamped and released, not what the
     // engine does at runtime.
     ".github/release-please/",
+    // --- claude-pilot (senara-solutions/claude-pilot) non-security python ---
+    //
+    // Precondition for cpp#79 (autonomous onboarding). Each path below is
+    // provably non-security-critical: no allowlist, no policy decision, no
+    // permission surface. DECISION-CORE cpp files (tier1.py, policy.py,
+    // permissions.py, per_spawn.py, policies/*.yaml, policies/__init__.py)
+    // are NOT in this list — they fail-closed to DECISION-CORE via the
+    // classify_path fall-through, correct semantics.
+    //
+    // The MECHANICAL classification only activates ONCE cpp webhooks flow
+    // through mika-agent (post-cpp#79). Until then this list is precondition
+    // work only. mika#1860.
+    "src/claude_pilot/agent.py", // ClaudeSDKClient wrapper — delegates to permissions.py
+    "src/claude_pilot/cli.py",   // argparse + signal handling — no policy
+    "src/claude_pilot/guardrails.py", // stall/empty/idle detection — no permission surface
+    "src/claude_pilot/inbox_writer.py", // gateway POST side-channel — no permission decision
+    "src/claude_pilot/ipython/", // optional REPL magics — opt-in `[ipython]` extra
+    "src/claude_pilot/logger.py", // stderr + file sink — no auth surface
+    "src/claude_pilot/transport.py", // asyncio subprocess wrapper — no allowlist
+    "src/claude_pilot/types.py", // Pydantic models — no runtime decision
+    "src/claude_pilot/ui.py",    // ANSI color renderer — no logic
+    // cpp tests at repo root (mika tests live under `crates/*/tests/` and are
+    // already covered by the MECHANICAL_CONTAINS `/tests/` rule below).
+    "tests/",
 ];
 
 /// Exact file paths that grant MECHANICAL.
@@ -89,6 +129,11 @@ const MECHANICAL_EXACT: &[&str] = &[
     // The workspace-level README — cosmetic for humans, not consumed by
     // the engine.
     "README.md",
+    // --- claude-pilot (senara-solutions/claude-pilot) root artifacts ---
+    // Precondition for cpp#79. Python packaging + license — no security surface.
+    "pyproject.toml", // cpp deps (Dependabot-managed; visible in diff)
+    "uv.lock",        // cpp dep lock (regenerated from pyproject.toml)
+    "LICENSE",        // license file (both repos have one; universally safe)
 ];
 
 /// Path substrings that grant MECHANICAL when found anywhere in the path.
