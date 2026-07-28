@@ -1492,7 +1492,14 @@ fi
 # - The diverged path uses --force-with-lease=$BRANCH:origin/$BRANCH (explicit ref form)
 # - The diverged path does NOT use plain --force
 # - The fast-forward and first-push paths do NOT use any force flag
-PUSH_FUNC_SRC=$(declare -f _push_branch)
+#
+# Note (mika#1857): the push_cmd construction was extracted into
+# `_push_with_rebase_retry` (race-recovery helper). Both `_push_branch` (which
+# constructs push_cmd for the primary attempt) and `_push_with_rebase_retry`
+# (which reconstructs it for retries after rebase) must uphold the safety
+# contract — the structural check reads BOTH function bodies as one haystack.
+PUSH_FUNC_SRC="$(declare -f _push_branch)
+$(declare -f _push_with_rebase_retry)"
 # Verify explicit lease form (pins expected remote SHA)
 if printf '%s' "$PUSH_FUNC_SRC" | grep -q 'force-with-lease=.*BRANCH.*origin.*BRANCH'; then
     PASS=$((PASS + 1)); echo "  ✓ Lease form: --force-with-lease uses explicit ref pinning"
@@ -1679,10 +1686,15 @@ echo ""
 echo "Test 12g: Structural assertions (mika#1364)"
 echo "---------------------------------------------"
 
-# _push_branch uses merge-base --is-ancestor for divergence detection
+# _push_branch uses merge-base --is-ancestor for divergence detection.
+# Note (mika#1857): the push_cmd construction was extracted into
+# `_push_with_rebase_retry` — the force-with-lease structural check reads both
+# function bodies as one haystack (same rationale as test 12d above).
 PUSH_FUNC=$(declare -f _push_branch)
+PUSH_FUNC_WITH_HELPER="$(declare -f _push_branch)
+$(declare -f _push_with_rebase_retry)"
 assert_contains "_push_branch uses merge-base --is-ancestor" "merge-base --is-ancestor" "$PUSH_FUNC"
-assert_contains "_push_branch uses force-with-lease" "force-with-lease" "$PUSH_FUNC"
+assert_contains "_push_branch (or retry helper) uses force-with-lease" "force-with-lease" "$PUSH_FUNC_WITH_HELPER"
 assert_contains "_push_branch tracks push_mode" "push_mode" "$PUSH_FUNC"
 
 # _set_up_worktree rebase captures stderr (no 2>/dev/null on rebase)
