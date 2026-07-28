@@ -1333,14 +1333,25 @@ Push: SKIPPED — duplicate-commit guard detected patch-equivalent commits on br
     # Push with upstream tracking (-u sets upstream on first push).
     # Diverged branches use --force-with-lease to land rebased history
     # without clobbering concurrent remote advances (mika#1364 KTD-1).
-    local push_err push_cmd
+    #
+    # Race-recovery (mika#1857, rupture B — 30% of pilot-throughput failures):
+    # A single-shot push can fail with "remote advanced since fetch" when the
+    # remote branch changed between our initial `git fetch origin $BRANCH`
+    # (line 1281) and this push (~2 min later). Concurrent activity that
+    # advances the remote branch: staleness-check workflow adding labels /
+    # pushing metadata commits, main-branch merges reflected on the branch,
+    # sibling pushes. The single-shot behavior stranded commits local-only
+    # in incidents #22/#23/#24 (2026-07-27).
+    #
+    # `_push_with_rebase_retry` wraps push_cmd in a bounded retry chain:
+    # on race-shaped rejection, fetch origin/main + rebase + retry (max 2
+    # attempts). Non-race failures (credential, network, hook rejection) do
+    # NOT retry — the race detection is `rejected|fetch first|remote contains
+    # work` substring match. Rebase conflicts abort the rebase and bail to
+    # the existing FAILED path, preserving the wip-rescue draft flow.
+    local push_err
     push_err=$(mktemp /tmp/push-branch-err-XXXXXX)
-    if [ "$push_mode" = "diverged" ]; then
-        push_cmd=(git -C "$WORKTREE_DIR" push --force-with-lease="$BRANCH:origin/$BRANCH" -u origin "$BRANCH")
-    else
-        push_cmd=(git -C "$WORKTREE_DIR" push -u origin "$BRANCH")
-    fi
-    if "${push_cmd[@]}" >/dev/null 2>"$push_err"; then
+    if _push_with_rebase_retry "$push_mode" "$push_err"; then
         echo "push_branch: pushed $BRANCH to origin (mode=$push_mode)" >&2
         RESULT="${RESULT}
 Push: pushed to origin/$BRANCH (mode=$push_mode)"
@@ -1350,6 +1361,9 @@ Push: pushed to origin/$BRANCH (mode=$push_mode)"
         echo "WARN: push_branch_failed for $BRANCH — commits remain local-only" >&2
         cat "$push_err" >&2
         # Distinguish lease-stale abort from other push failures (mika#1364).
+        # After the retry-with-rebase loop, if we still see race-shaped errors,
+        # the retry either exhausted or the rebase failed — either way, the
+        # commits are stranded and the FAILED semantics stand.
         if printf '%s' "$push_err_content" | grep -q "stale info\|expected old/new\|failed to push"; then
             RESULT="${RESULT}
 Push: FAILED — remote advanced since fetch (lease aborted); commits remain local-only on $BRANCH"
@@ -1359,6 +1373,103 @@ Push: FAILED — commits remain local-only on $BRANCH"
         fi
     fi
     rm -f "$push_err"
+}
+
+# `_push_with_rebase_retry` — race-recovery wrapper for _push_branch's push_cmd
+# (mika#1857, rupture B). Attempts push up to MAX_ATTEMPTS times; on race-shaped
+# rejection, fetches origin/main and rebases the current branch before retrying.
+# Non-race failures short-circuit (no retry). Rebase conflicts abort and bail
+# to caller's FAILED path.
+#
+# Inputs:
+#   $1 = push_mode ("diverged"|"fast-forward"|"first-push") — controls whether
+#        we use --force-with-lease or plain push
+#   $2 = err_file  — mktemp path the caller uses to capture stderr for post-fail
+#        classification (mika#1364 lease-stale detection)
+#
+# Reads globals set by _push_branch: WORKTREE_DIR, BRANCH
+# Writes stderr on retry attempts + rebase abort for operator observability.
+#
+# Returns 0 on eventual push success, 1 on unrecoverable failure.
+_push_with_rebase_retry() {
+    local push_mode="$1"
+    local err_file="$2"
+    local max_attempts=2
+    local attempt=1
+    local push_cmd
+
+    # Reconstruct the push_cmd based on mode (mirrors caller's construction).
+    # Post-rebase attempts always use --force-with-lease because the rebase
+    # rewrote history — a plain push would non-ff-reject even after fetching
+    # the remote's new state.
+    if [ "$push_mode" = "diverged" ]; then
+        push_cmd=(git -C "$WORKTREE_DIR" push --force-with-lease="$BRANCH:origin/$BRANCH" -u origin "$BRANCH")
+    else
+        push_cmd=(git -C "$WORKTREE_DIR" push -u origin "$BRANCH")
+    fi
+
+    while [ "$attempt" -le "$max_attempts" ]; do
+        # Truncate err_file for this attempt so the caller's post-fail parsing
+        # sees only the LAST attempt's stderr (mika#1364 lease-stale detection).
+        : > "$err_file"
+
+        if "${push_cmd[@]}" >/dev/null 2>"$err_file"; then
+            [ "$attempt" -gt 1 ] && echo "_push_with_rebase_retry: succeeded on attempt $attempt/$max_attempts after rebase (branch=$BRANCH)" >&2
+            return 0
+        fi
+
+        # Classify: is this a push-race (recoverable) or a hard failure
+        # (credential/network/hook — do NOT retry)?
+        # Broad match across git versions:
+        #   - "rejected"           — most git versions
+        #   - "fetch first"        — hint line on non-ff reject
+        #   - "remote contains work" — verbose form
+        # A lease-stale rejection also matches "rejected" (git's shared prefix).
+        if ! grep -qE 'rejected|fetch first|remote contains work' "$err_file"; then
+            # Non-race failure — do NOT retry. Bail immediately so the caller's
+            # FAILED path fires with the original stderr.
+            [ "$attempt" -gt 1 ] && echo "_push_with_rebase_retry: non-race failure on attempt $attempt — bailing" >&2
+            return 1
+        fi
+
+        # If this was the last attempt, do NOT rebase (nothing to retry after) —
+        # bail with the race-shaped stderr so caller's mika#1364 branch fires.
+        if [ "$attempt" -ge "$max_attempts" ]; then
+            echo "_push_with_rebase_retry: exhausted $max_attempts attempts on race errors — bailing to draft rescue (branch=$BRANCH)" >&2
+            return 1
+        fi
+
+        echo "_push_with_rebase_retry: race-shaped rejection on attempt $attempt/$max_attempts — fetching + rebasing (branch=$BRANCH)" >&2
+
+        # Fetch fresh origin/main. Fetch failure = network/auth — do not retry.
+        if ! git -C "$WORKTREE_DIR" fetch origin main >/dev/null 2>&1; then
+            echo "_push_with_rebase_retry: fetch origin main failed — bailing (branch=$BRANCH)" >&2
+            return 1
+        fi
+
+        # Rebase onto fresh origin/main. Conflicts → abort + bail.
+        # The abort leaves the branch in pre-rebase state so caller's existing
+        # wip-rescue draft path can push the un-rebased commits (with the
+        # wip-rescue label indicating operator must resolve conflicts manually).
+        if ! git -C "$WORKTREE_DIR" rebase origin/main >/dev/null 2>&1; then
+            echo "_push_with_rebase_retry: rebase conflict — aborting rebase + bailing to draft rescue (branch=$BRANCH)" >&2
+            git -C "$WORKTREE_DIR" rebase --abort >/dev/null 2>&1 || true
+            return 1
+        fi
+
+        echo "_push_with_rebase_retry: rebase succeeded on attempt $attempt — retrying push (branch=$BRANCH)" >&2
+
+        # After a successful rebase, history was rewritten — the next push
+        # MUST use --force-with-lease even if the original push_mode was
+        # "fast-forward" or "first-push". Swap to lease-guarded push.
+        push_cmd=(git -C "$WORKTREE_DIR" push --force-with-lease="$BRANCH:origin/$BRANCH" -u origin "$BRANCH")
+
+        attempt=$((attempt + 1))
+    done
+
+    # Unreachable — the loop exits via early return or exhausts on line 1394.
+    # Defensive: bail if we somehow fall through.
+    return 1
 }
 
 _check_duplicate_commits() {
