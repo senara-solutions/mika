@@ -29,6 +29,30 @@ const STUCK_READY_THRESHOLD_ENV: &str = "MIKA_AUTO_PULL_STUCK_READY_THRESHOLD_SE
 /// Overflow is logged and left for the next tick.
 const MAX_STUCK_RESCUE_PER_TICK: usize = 5;
 
+// ───────────────────── Phase 0 auto-feeder consts (mika#1863) ─────────────────────
+
+/// Env override for the auto-feeder ready-pool target (mika#1863 R2/AC1).
+const AUTO_FEEDER_MIN_READY_ENV: &str = "MIKA_AUTO_FEEDER_MIN_READY";
+
+/// Default pullable-ready pool target (mika#1863 R2). The feeder tops the pool
+/// up to this count each tick.
+const AUTO_FEEDER_MIN_READY_DEFAULT: u32 = 3;
+
+/// Lower clamp for the pool target (mika#1863 R2). The literal `0` bypasses the
+/// clamp as a disable sentinel — see [`parse_min_ready`].
+const AUTO_FEEDER_MIN_READY_MIN: u32 = 1;
+
+/// Upper clamp for the pool target (mika#1863 R2).
+const AUTO_FEEDER_MIN_READY_MAX: u32 = 10;
+
+/// Working-set cap on the groomed-not-ready backlog the feeder ranks per tick
+/// (mika#1863 R4/D6/F4). A pagination + grooming-signal bound, not an arbitrary
+/// limit: a dispatchable backlog exceeding this is itself a grooming-throughput
+/// signal (surfaced via `auto_feeder_no_backlog` and AC9 pool-sampling) rather
+/// than a feeder-visibility problem. Single-line raise if real operation ever
+/// shows a legitimate >50 dispatchable backlog.
+const FEEDER_WORKING_SET_CAP: usize = 50;
+
 /// Pure parse of the stuck-ready threshold from an optional env value. Returns
 /// [`STUCK_READY_THRESHOLD_DEFAULT_SECS`] when the value is absent, empty, or
 /// unparseable/negative (WARN on invalid). Split out from the env read so it is
@@ -54,6 +78,39 @@ fn parse_stuck_ready_threshold(raw: Option<&str>) -> i64 {
 /// falling back to [`STUCK_READY_THRESHOLD_DEFAULT_SECS`] (mika#1824 R3).
 fn stuck_ready_threshold_secs() -> i64 {
     parse_stuck_ready_threshold(std::env::var(STUCK_READY_THRESHOLD_ENV).ok().as_deref())
+}
+
+/// Pure parse of the auto-feeder pool target from an optional env value
+/// (mika#1863 R2). Split out from the env read so it is unit-testable without
+/// mutating process environment, mirroring [`parse_stuck_ready_threshold`].
+///
+/// - Missing/empty/unparseable → [`AUTO_FEEDER_MIN_READY_DEFAULT`] (WARN on invalid).
+/// - Literal `0` → `0` (disable sentinel; preserved through the clamp so Phase 0
+///   returns early — the feeder is turned off).
+/// - `1..=10` → as-is.
+/// - `>10` → clamped to [`AUTO_FEEDER_MIN_READY_MAX`].
+fn parse_min_ready(raw: Option<&str>) -> u32 {
+    match raw {
+        Some(v) if !v.trim().is_empty() => match v.trim().parse::<u32>() {
+            Ok(0) => 0, // disable sentinel — bypasses the [MIN, MAX] clamp
+            Ok(n) => n.clamp(AUTO_FEEDER_MIN_READY_MIN, AUTO_FEEDER_MIN_READY_MAX),
+            Err(_) => {
+                warn!(
+                    value = %v,
+                    default = AUTO_FEEDER_MIN_READY_DEFAULT,
+                    "auto_feeder: invalid {AUTO_FEEDER_MIN_READY_ENV}, using default"
+                );
+                AUTO_FEEDER_MIN_READY_DEFAULT
+            }
+        },
+        _ => AUTO_FEEDER_MIN_READY_DEFAULT,
+    }
+}
+
+/// Read the auto-feeder pool target from the environment, falling back to
+/// [`AUTO_FEEDER_MIN_READY_DEFAULT`] (mika#1863 R2).
+fn auto_feeder_min_ready() -> u32 {
+    parse_min_ready(std::env::var(AUTO_FEEDER_MIN_READY_ENV).ok().as_deref())
 }
 
 // ───────────────────── Issue types ─────────────────────
@@ -111,6 +168,32 @@ pub fn priority_rank(labels: &[IssueLabel]) -> u8 {
         }
     }
     0 // unlabelled
+}
+
+/// Feeder priority rank keyed on the **real** `.github/labels.yml` taxonomy
+/// (mika#1863 R6): `p0-critical`=5, `p1-important`=4, `agent-core`=3,
+/// `p2-normal`=2, `p3-nice-to-have`=1, none=0. The rank is the **max** per-label
+/// rank, so a ticket carrying both `p1-important` and `agent-core` (e.g. #1863)
+/// ranks 4.
+///
+/// Corrects the latent `priority_rank` bug (matches bare `"p1"`, returns 0 for
+/// every real issue — the taxonomy uses suffixed names). Uses the real
+/// `.github/labels.yml` taxonomy. Unifying the two into one ranker requires
+/// verifying agent-core label handling across the whole auto_pull surface — out
+/// of scope here.
+fn feeder_rank(labels: &[IssueLabel]) -> u8 {
+    labels
+        .iter()
+        .map(|l| match l.name.as_str() {
+            "p0-critical" => 5,
+            "p1-important" => 4,
+            "agent-core" => 3,
+            "p2-normal" => 2,
+            "p3-nice-to-have" => 1,
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 // ───────────────────── Selection logic ─────────────────────
@@ -179,6 +262,80 @@ fn select_stuck_ready_candidates(
         .collect();
     selected.sort_unstable();
     selected
+}
+
+// ───────────────────── Phase 0 feeder selection (mika#1863) ─────────────────────
+
+/// Returns `true` if `issue` carries a label that structurally excludes it from
+/// the pullable pool AND the feeder backlog (mika#1863 R3/R4): `blocked` or
+/// `operator-review`. Both mean "not dispatchable regardless of grooming state".
+fn is_feeder_excluded(issue: &Issue) -> bool {
+    issue
+        .labels
+        .iter()
+        .any(|l| l.name == "blocked" || l.name == "operator-review")
+}
+
+/// Count the **pullable**-ready tickets — the threshold signal for the feeder
+/// (mika#1863 R3/D2), NOT the raw `ready` count. A ticket counts toward the pool
+/// iff it (a) has `ready`, (b) has no open PR closing it, (c) has no in-flight
+/// self_dev task, and (d) is not labelled `blocked`/`operator-review`.
+///
+/// This is the founding-incident correctness fix: the 2026-07-27→28 11 h idle
+/// had raw-count ≥ 1 (#1682 open-PR + #1646 in-flight) while pullable-count was
+/// 0. Pure/in-memory — no GitHub or DB calls.
+fn count_pullable_ready(
+    issues: &[Issue],
+    open_pr_issue_numbers: &HashSet<u64>,
+    in_flight_issue_numbers: &HashSet<u64>,
+) -> usize {
+    issues
+        .iter()
+        .filter(|i| i.labels.iter().any(|l| l.name == "ready"))
+        .filter(|i| !open_pr_issue_numbers.contains(&i.number))
+        .filter(|i| !in_flight_issue_numbers.contains(&i.number))
+        .filter(|i| !is_feeder_excluded(i))
+        .count()
+}
+
+/// Select the groomed-not-ready tickets to promote, highest [`feeder_rank`]
+/// first (oldest-`updated_at` tiebreak), capped at `slots` (mika#1863 R4/R5/D4).
+///
+/// Candidate filter chain: `!ready` → [`is_groomed`] (full canonical callout,
+/// not the loose `Plan:` substring — see D3) → `!open_pr` → `!in_flight` →
+/// `!blocked`/`!operator-review`. The surviving set is sorted by rank DESC then
+/// `updated_at` ASC and truncated to `min(slots, FEEDER_WORKING_SET_CAP)` — the
+/// working-set cap (D6/F4) bounds the promoted count independent of `slots`.
+///
+/// Pure/in-memory — no GitHub or DB calls. The async wrapper resolves the
+/// `in_flight` set and wires real `gh`/DB, same split as the Phase 2 predicate.
+fn select_feeder_candidates(
+    issues: &[Issue],
+    open_pr_issue_numbers: &HashSet<u64>,
+    in_flight_issue_numbers: &HashSet<u64>,
+    slots: usize,
+) -> Vec<u64> {
+    let mut candidates: Vec<&Issue> = issues
+        .iter()
+        .filter(|i| !i.labels.iter().any(|l| l.name == "ready"))
+        .filter(|i| !open_pr_issue_numbers.contains(&i.number))
+        .filter(|i| !in_flight_issue_numbers.contains(&i.number))
+        .filter(|i| !is_feeder_excluded(i))
+        .filter(|i| is_groomed(&i.body))
+        .collect();
+
+    // Rank DESC, then oldest `updated_at` first within a rank tier.
+    candidates.sort_by(|a, b| {
+        let ra = feeder_rank(&a.labels);
+        let rb = feeder_rank(&b.labels);
+        rb.cmp(&ra).then_with(|| a.updated_at.cmp(&b.updated_at))
+    });
+
+    candidates
+        .into_iter()
+        .take(slots.min(FEEDER_WORKING_SET_CAP))
+        .map(|i| i.number)
+        .collect()
 }
 
 // ───────────────────── GitHub CLI helpers ─────────────────────
@@ -462,7 +619,29 @@ pub async fn auto_pull_groomed_ticket(
         }
     };
 
+    // Phase 0 — feeder: top the pullable-ready pool up to MIN_READY (mika#1863).
+    // Runs BEFORE Phase 1 in the same tick, sharing the two `gh` fetches above,
+    // so AC2's "feeder promotes → puller picks up same tick" is structural, not
+    // scheduling-luck (D1).
+    let fed = phase0_feed_ready_pool(
+        db,
+        github_token,
+        &issues,
+        &open_pr_issue_numbers,
+        trace_id,
+        session_id,
+    )
+    .await;
+    debug!(fed, "auto_pull: phase 0 feeder complete");
+
     // Phase 1 — promote a groomed-not-ready ticket (queue-empty gate lives inside).
+    //
+    // N+1 over-promotion bound (F3, benign): Phase 0 tops the pool to MIN_READY
+    // (N). Phase 1's filter is `!ready`, so when the queue is idle it may promote
+    // ONE additional groomed-not-ready ticket the feeder just skipped → at most
+    // N+1 ready tickets per tick. Intentional and harmless — the webhook dispatch
+    // drains the pool, and the two phases have complementary intents (feeder =
+    // hold a buffer; Phase 1 = kick a dispatch when idle). No coupling change.
     let promoted = phase1_promote_groomed(
         db,
         github_token,
@@ -480,6 +659,197 @@ pub async fn auto_pull_groomed_ticket(
         rescued,
         "auto_pull: phase 2 stuck-ready reconciler complete"
     );
+
+    promoted
+}
+
+/// Phase 0 (mika#1863): auto-feeder — keep the **pullable**-ready pool topped up
+/// to `MIN_READY` from the groomed-dispatchable backlog. Runs before Phase 1 on
+/// every tick, independent of queue depth.
+///
+/// Reuses the shared `issues` + `open_pr` fetches (D1), `is_groomed`,
+/// `gh_apply_label`, the per-issue circuit breaker, and
+/// `has_active_self_dev_task_for_issue` verbatim. Returns the number of tickets
+/// promoted this tick.
+///
+/// Emits three `auto_feeder` audit events (R7/AC6): `auto_feeder_skip` when the
+/// pool already meets the threshold, `auto_feeder_no_backlog` when the pool is
+/// under threshold but no dispatchable backlog exists (true starvation signal),
+/// and `auto_feeder_promoted` per successful apply.
+async fn phase0_feed_ready_pool(
+    db: &AsyncDatabase,
+    github_token: &str,
+    issues: &[Issue],
+    open_pr_issue_numbers: &HashSet<u64>,
+    trace_id: &str,
+    session_id: &str,
+) -> usize {
+    // R2: read the pool target; `0` disables the feeder entirely.
+    let min_ready = auto_feeder_min_ready();
+    if min_ready == 0 {
+        debug!("auto_feeder: disabled (MIN_READY=0), skipping");
+        return 0;
+    }
+
+    // Build the in-flight set (D4): probe `has_active_self_dev_task_for_issue`
+    // over the union of ready tickets (for the pullable count) and pre-in-flight
+    // groomed-not-ready candidates (for selection). Bounded by FEEDER_WORKING_SET_CAP
+    // on the candidate side; the ready side is bounded by the small pool. A probe
+    // error is treated conservatively as in-flight (excluded from both pullable
+    // and promotion) — fail-safe against re-promoting an already-dispatching ticket.
+    let mut probe_targets: Vec<u64> = Vec::new();
+    let mut candidate_probes = 0usize;
+    for issue in issues {
+        let has_ready = issue.labels.iter().any(|l| l.name == "ready");
+        if has_ready {
+            probe_targets.push(issue.number);
+            continue;
+        }
+        // Pre-in-flight candidate shape: groomed, not open-PR, not excluded.
+        if candidate_probes < FEEDER_WORKING_SET_CAP
+            && !open_pr_issue_numbers.contains(&issue.number)
+            && !is_feeder_excluded(issue)
+            && is_groomed(&issue.body)
+        {
+            probe_targets.push(issue.number);
+            candidate_probes += 1;
+        }
+    }
+
+    let mut in_flight_issue_numbers: HashSet<u64> = HashSet::new();
+    for n in probe_targets {
+        let issue_url = format!("https://github.com/{}/issues/{}", DEFAULT_REPO, n);
+        match db.has_active_self_dev_task_for_issue(&issue_url).await {
+            Ok(true) => {
+                in_flight_issue_numbers.insert(n);
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(error = %e, issue = n, "auto_feeder: in-flight probe failed; treating as in-flight");
+                in_flight_issue_numbers.insert(n);
+            }
+        }
+    }
+
+    // R3/D2: pullable-ready count is the threshold signal, not raw `ready` count.
+    let pullable = count_pullable_ready(issues, open_pr_issue_numbers, &in_flight_issue_numbers);
+    if pullable >= min_ready as usize {
+        debug!(
+            pullable,
+            min_ready, "auto_feeder: pool already at/above threshold, skipping"
+        );
+        if let Err(e) = db
+            .log_audit_event(
+                session_id,
+                "auto_feeder",
+                "auto_feeder_skip",
+                None,
+                Some(&format!(
+                    "pool at threshold: pullable={pullable} >= min_ready={min_ready}"
+                )),
+                None,
+                Some(trace_id),
+            )
+            .await
+        {
+            warn!(error = %e, "auto_feeder: failed to write skip audit event");
+        }
+        return 0;
+    }
+
+    // R5: promote up to `min_ready − pullable` top candidates.
+    let slots = min_ready as usize - pullable;
+    let candidates = select_feeder_candidates(
+        issues,
+        open_pr_issue_numbers,
+        &in_flight_issue_numbers,
+        slots,
+    );
+
+    if candidates.is_empty() {
+        // R7: pool is under threshold but no dispatchable backlog — the grooming
+        // pipeline (not the feeder) is the bottleneck. Surface it explicitly.
+        info!(pullable, min_ready, "auto_feeder_no_backlog");
+        if let Err(e) = db
+            .log_audit_event(
+                session_id,
+                "auto_feeder",
+                "auto_feeder_no_backlog",
+                None,
+                Some(&format!(
+                    "under threshold but no dispatchable backlog: pullable={pullable}, min_ready={min_ready}"
+                )),
+                None,
+                Some(trace_id),
+            )
+            .await
+        {
+            warn!(error = %e, "auto_feeder: failed to write no-backlog audit event");
+        }
+        return 0;
+    }
+
+    // R5/D5: promote each candidate, guarded by the per-issue circuit breaker
+    // (identical to Phase 1). A failing apply increments the breaker and moves on.
+    let mut promoted = 0usize;
+    for n in candidates {
+        // Circuit-breaker check: skip a persistently-failing issue.
+        match db.get_auto_pull_failure_count(DEFAULT_REPO, n).await {
+            Ok(count) if count >= CIRCUIT_BREAKER_THRESHOLD => {
+                info!(
+                    issue = n,
+                    failure_count = count,
+                    "auto_feeder: circuit-breaker skip for #{n} ({count}× failures)"
+                );
+                continue;
+            }
+            Err(e) => {
+                warn!(error = %e, issue = n, "auto_feeder: failed to check circuit-breaker, proceeding");
+                // Fail-open: proceed with the promotion.
+            }
+            _ => {} // count < threshold, proceed
+        }
+
+        let rank = issues
+            .iter()
+            .find(|i| i.number == n)
+            .map(|i| feeder_rank(&i.labels))
+            .unwrap_or(0);
+
+        if let Err(e) = gh_apply_label(github_token, n, "ready").await {
+            warn!(error = %e, issue = n, "auto_feeder: failed to apply ready label");
+            if let Err(e2) = db.increment_auto_pull_failure(DEFAULT_REPO, n).await {
+                warn!(error = %e2, "auto_feeder: failed to increment failure counter");
+            }
+            continue;
+        }
+
+        if let Err(e) = db.record_auto_pull(DEFAULT_REPO, n).await {
+            warn!(error = %e, "auto_feeder: failed to record auto-pull event");
+        }
+        if let Err(e) = db.reset_auto_pull_failure(DEFAULT_REPO, n).await {
+            warn!(error = %e, "auto_feeder: failed to reset failure counter");
+        }
+
+        info!(issue = n, feeder_rank = rank, "auto_feeder_promoted");
+        if let Err(e) = db
+            .log_audit_event(
+                session_id,
+                "auto_feeder",
+                "auto_feeder_promoted",
+                None,
+                Some(&format!(
+                    "promoted #{n} (feeder_rank={rank}, reason=pullable={pullable}<min_ready={min_ready})"
+                )),
+                None,
+                Some(trace_id),
+            )
+            .await
+        {
+            warn!(error = %e, "auto_feeder: failed to write promotion audit event");
+        }
+        promoted += 1;
+    }
 
     promoted
 }
@@ -1302,5 +1672,267 @@ This ticket has been GROOMED and is ready.
         }
         let selected = select_stuck_ready_candidates(&issues, &open_pr, &in_flight, &ages, 900);
         assert_eq!(selected, vec![10, 20, 30], "selected numbers ascending");
+    }
+
+    // ── mika#1863 Phase 0: parse_min_ready tests (R2) ──
+
+    #[test]
+    fn test_min_ready_default_when_absent() {
+        assert_eq!(parse_min_ready(None), AUTO_FEEDER_MIN_READY_DEFAULT);
+        assert_eq!(parse_min_ready(Some("   ")), AUTO_FEEDER_MIN_READY_DEFAULT);
+    }
+
+    #[test]
+    fn test_min_ready_zero_disables() {
+        // Literal 0 is the disable sentinel — must NOT be clamped up to MIN.
+        assert_eq!(parse_min_ready(Some("0")), 0);
+        assert_eq!(parse_min_ready(Some(" 0 ")), 0);
+    }
+
+    #[test]
+    fn test_min_ready_clamp_min() {
+        // Below MIN but non-zero → clamped up to MIN (1). Only literal 0 disables.
+        assert_eq!(parse_min_ready(Some("1")), AUTO_FEEDER_MIN_READY_MIN);
+    }
+
+    #[test]
+    fn test_min_ready_clamp_max() {
+        assert_eq!(parse_min_ready(Some("11")), AUTO_FEEDER_MIN_READY_MAX);
+        assert_eq!(parse_min_ready(Some("9999")), AUTO_FEEDER_MIN_READY_MAX);
+    }
+
+    #[test]
+    fn test_min_ready_invalid_falls_back() {
+        assert_eq!(
+            parse_min_ready(Some("not-a-number")),
+            AUTO_FEEDER_MIN_READY_DEFAULT
+        );
+        // Negative is unparseable as u32 → default.
+        assert_eq!(parse_min_ready(Some("-5")), AUTO_FEEDER_MIN_READY_DEFAULT);
+    }
+
+    #[test]
+    fn test_min_ready_valid_passthrough() {
+        assert_eq!(parse_min_ready(Some("5")), 5);
+        assert_eq!(parse_min_ready(Some(" 7 ")), 7);
+        assert_eq!(parse_min_ready(Some("10")), 10);
+    }
+
+    // ── mika#1863 Phase 0: feeder_rank tests (R6) ──
+
+    #[test]
+    fn test_feeder_rank_p1_important() {
+        let labels = vec![IssueLabel {
+            name: "p1-important".to_string(),
+        }];
+        assert_eq!(feeder_rank(&labels), 4);
+    }
+
+    #[test]
+    fn test_feeder_rank_agent_core() {
+        let labels = vec![IssueLabel {
+            name: "agent-core".to_string(),
+        }];
+        assert_eq!(feeder_rank(&labels), 3);
+    }
+
+    #[test]
+    fn test_feeder_rank_1863_shape_max_of_two() {
+        // #1863 carries both p1-important and agent-core → max rank = 4.
+        let labels = vec![
+            IssueLabel {
+                name: "agent-core".to_string(),
+            },
+            IssueLabel {
+                name: "p1-important".to_string(),
+            },
+        ];
+        assert_eq!(feeder_rank(&labels), 4, "max per-label rank wins");
+    }
+
+    #[test]
+    fn test_feeder_rank_p0_and_lower_tiers() {
+        assert_eq!(
+            feeder_rank(&[IssueLabel {
+                name: "p0-critical".to_string()
+            }]),
+            5
+        );
+        assert_eq!(
+            feeder_rank(&[IssueLabel {
+                name: "p2-normal".to_string()
+            }]),
+            2
+        );
+        assert_eq!(
+            feeder_rank(&[IssueLabel {
+                name: "p3-nice-to-have".to_string()
+            }]),
+            1
+        );
+    }
+
+    #[test]
+    fn test_feeder_rank_none() {
+        assert_eq!(feeder_rank(&[]), 0);
+        assert_eq!(
+            feeder_rank(&[IssueLabel {
+                name: "bug".to_string()
+            }]),
+            0
+        );
+    }
+
+    // ── mika#1863 Phase 0: count_pullable_ready tests (R3/D2) ──
+
+    #[test]
+    fn test_count_pullable_ready_excludes_all_skip_predicates() {
+        let issues = vec![
+            // #1 plain ready → counts
+            make_issue(1, GROOMED_BODY, &["ready", "p1-important"], "t"),
+            // #2 ready + open PR → excluded
+            make_issue(2, GROOMED_BODY, &["ready"], "t"),
+            // #3 ready + in-flight → excluded
+            make_issue(3, GROOMED_BODY, &["ready"], "t"),
+            // #4 ready + blocked → excluded
+            make_issue(4, GROOMED_BODY, &["ready", "blocked"], "t"),
+            // #5 ready + operator-review → excluded
+            make_issue(5, GROOMED_BODY, &["ready", "operator-review"], "t"),
+            // #6 not ready → excluded (not a pool member)
+            make_issue(6, GROOMED_BODY, &["p1-important"], "t"),
+        ];
+        let mut open_pr = HashSet::new();
+        open_pr.insert(2u64);
+        let mut in_flight = HashSet::new();
+        in_flight.insert(3u64);
+
+        assert_eq!(
+            count_pullable_ready(&issues, &open_pr, &in_flight),
+            1,
+            "only #1 is genuinely pullable"
+        );
+    }
+
+    #[test]
+    fn test_count_pullable_ready_counts_multiple_plain_ready() {
+        let issues = vec![
+            make_issue(1, GROOMED_BODY, &["ready"], "t"),
+            make_issue(2, GROOMED_BODY, &["ready"], "t"),
+            make_issue(3, GROOMED_BODY, &["ready"], "t"),
+        ];
+        assert_eq!(
+            count_pullable_ready(&issues, &HashSet::new(), &HashSet::new()),
+            3
+        );
+    }
+
+    // ── mika#1863 Phase 0: select_feeder_candidates tests (R4/R5) ──
+
+    #[test]
+    fn test_select_feeder_filters_all_skip_predicates() {
+        let issues = vec![
+            // #1 ready → excluded (already in pool)
+            make_issue(1, GROOMED_BODY, &["ready", "p1-important"], "t"),
+            // #2 ungroomed → excluded
+            make_issue(2, UNGROOMED_BODY, &["p1-important"], "t"),
+            // #3 groomed + open PR → excluded
+            make_issue(3, GROOMED_BODY, &["p1-important"], "t"),
+            // #4 groomed + in-flight → excluded
+            make_issue(4, GROOMED_BODY, &["p1-important"], "t"),
+            // #5 groomed + blocked → excluded
+            make_issue(5, GROOMED_BODY, &["p1-important", "blocked"], "t"),
+            // #6 groomed + operator-review → excluded
+            make_issue(6, GROOMED_BODY, &["p1-important", "operator-review"], "t"),
+            // #7 clean groomed candidate → SELECTED
+            make_issue(7, GROOMED_BODY, &["p1-important"], "t"),
+        ];
+        let mut open_pr = HashSet::new();
+        open_pr.insert(3u64);
+        let mut in_flight = HashSet::new();
+        in_flight.insert(4u64);
+
+        let selected = select_feeder_candidates(&issues, &open_pr, &in_flight, 10);
+        assert_eq!(selected, vec![7], "only the clean groomed candidate wins");
+    }
+
+    #[test]
+    fn test_select_feeder_rank_then_oldest_first_ordering() {
+        let issues = vec![
+            // Highest rank (p0-critical), newer.
+            make_issue(1, GROOMED_BODY, &["p0-critical"], "2026-07-05T00:00:00Z"),
+            // Same rank tier p1-important, older → should precede #3.
+            make_issue(2, GROOMED_BODY, &["p1-important"], "2026-07-01T00:00:00Z"),
+            // Same rank tier p1-important, newer.
+            make_issue(3, GROOMED_BODY, &["p1-important"], "2026-07-03T00:00:00Z"),
+        ];
+        let selected = select_feeder_candidates(&issues, &HashSet::new(), &HashSet::new(), 10);
+        assert_eq!(
+            selected,
+            vec![1, 2, 3],
+            "rank DESC first (#1), then oldest-first within tier (#2 before #3)"
+        );
+    }
+
+    #[test]
+    fn test_select_feeder_respects_slots_cap() {
+        let issues = vec![
+            make_issue(1, GROOMED_BODY, &["p1-important"], "2026-07-01T00:00:00Z"),
+            make_issue(2, GROOMED_BODY, &["p1-important"], "2026-07-02T00:00:00Z"),
+            make_issue(3, GROOMED_BODY, &["p1-important"], "2026-07-03T00:00:00Z"),
+        ];
+        let selected = select_feeder_candidates(&issues, &HashSet::new(), &HashSet::new(), 2);
+        assert_eq!(selected, vec![1, 2], "slots=2 caps the promotion count");
+    }
+
+    #[test]
+    fn test_select_feeder_respects_working_set_cap() {
+        // 60 clean groomed candidates + an oversized slots value → the output is
+        // bounded by FEEDER_WORKING_SET_CAP (50), not slots.
+        let issues: Vec<Issue> = (1..=60)
+            .map(|n| {
+                make_issue(
+                    n,
+                    GROOMED_BODY,
+                    &["p1-important"],
+                    &format!("2026-07-{:02}T00:00:00Z", (n % 28) + 1),
+                )
+            })
+            .collect();
+        let selected = select_feeder_candidates(&issues, &HashSet::new(), &HashSet::new(), 100);
+        assert_eq!(
+            selected.len(),
+            FEEDER_WORKING_SET_CAP,
+            "working-set cap bounds the count when slots exceeds it"
+        );
+    }
+
+    #[test]
+    fn test_select_feeder_end_to_end_at_predicate_level() {
+        // AC8 end-to-end at predicate level: 0 pullable + 5 groomed backlog +
+        // min_ready=3 → slots=3 → returns exactly the top 3 by rank.
+        let issues = vec![
+            make_issue(
+                1,
+                GROOMED_BODY,
+                &["p3-nice-to-have"],
+                "2026-07-01T00:00:00Z",
+            ),
+            make_issue(2, GROOMED_BODY, &["p0-critical"], "2026-07-01T00:00:00Z"),
+            make_issue(3, GROOMED_BODY, &["p2-normal"], "2026-07-01T00:00:00Z"),
+            make_issue(4, GROOMED_BODY, &["p1-important"], "2026-07-01T00:00:00Z"),
+            make_issue(5, GROOMED_BODY, &["agent-core"], "2026-07-01T00:00:00Z"),
+        ];
+        // 0 pullable (no ready-labelled tickets), min_ready=3 → slots=3.
+        assert_eq!(
+            count_pullable_ready(&issues, &HashSet::new(), &HashSet::new()),
+            0
+        );
+        let slots = 3;
+        let selected = select_feeder_candidates(&issues, &HashSet::new(), &HashSet::new(), slots);
+        assert_eq!(
+            selected,
+            vec![2, 4, 5],
+            "top 3 by rank: p0-critical(#2) > p1-important(#4) > agent-core(#5)"
+        );
     }
 }
