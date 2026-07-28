@@ -1,5 +1,6 @@
 mod a2a;
 mod auth;
+pub mod check_suite_dedup;
 pub mod checkpoint;
 pub mod ci_failure_handler;
 pub mod ci_success_handler;
