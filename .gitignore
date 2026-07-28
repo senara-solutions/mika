@@ -38,3 +38,10 @@ node_modules
 # Lefthook
 lefthook-local.yml
 .context/compound-engineering/
+
+# `.iterate/` — dispatch-lib rescue-path scratch (findings, escalate markers).
+# Written by dev-groom/dev-pilot iteration loop as ephemeral session state;
+# NEVER meant to persist. Committing these files causes rebase conflicts on
+# every stale branch touched by dispatch-lib after a fresh iteration run
+# (mika#1705 blocked 2× on this class, 41 commits behind).
+.iterate/
