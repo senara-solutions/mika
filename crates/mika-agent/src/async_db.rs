@@ -630,6 +630,18 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Find parent self_dev issue tasks left `in_progress` with zero callback
+    /// children, aged past the grace window (mika#1687). See
+    /// [`Database::find_childless_stuck_parent_tasks`].
+    pub async fn find_childless_stuck_parent_tasks(
+        &self,
+        grace_seconds: i64,
+    ) -> Result<Vec<crate::db::ChildlessStuckParent>> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.find_childless_stuck_parent_tasks(&a, grace_seconds))
+            .await
+    }
+
     /// Return ALL children of a parent task for the reaper's structured log
     /// event. See [`Database::get_reaper_child_snapshot`].
     pub async fn get_reaper_child_snapshot(
