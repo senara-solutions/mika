@@ -27,7 +27,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 44;
+pub const CURRENT_SCHEMA_VERSION: i64 = 45;
 
 /// mika#1742 Problem B: refuse-to-zombie grace window for
 /// [`Database::create_recurring_task_if_absent`]. Recent same-label recurring
@@ -134,6 +134,21 @@ pub struct TeamRow {
     pub name: String,
     pub config_path: String,
     pub created_at: String,
+}
+
+/// One parsed pilot-transcript row awaiting insert (mika#1705). Bodies are
+/// secret-scrubbed by the ingestion tick before construction. All fields are
+/// optional because a claude-pilot JSONL entry may omit any of them.
+#[derive(Debug, Clone, Default)]
+pub struct PilotTranscriptRow {
+    pub timestamp: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub request_body: Option<String>,
+    pub response_body: Option<String>,
+    pub tokens_in: Option<i64>,
+    pub tokens_out: Option<i64>,
+    pub latency_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -1045,6 +1060,11 @@ impl Database {
         if (3..=43).contains(&version) {
             self.migrate_v43_to_v44()?;
             info!(version = 44, "database migrated to v44");
+        }
+
+        if (3..=44).contains(&version) {
+            self.migrate_v44_to_v45()?;
+            info!(version = 45, "database migrated to v45");
         }
 
         Ok(())
@@ -4438,6 +4458,117 @@ impl Database {
             ],
         )?;
         Ok(())
+    }
+
+    /// v44→v45: additive `pilot_transcripts` table (mika#1705).
+    ///
+    /// Captures the LLM-call transcripts emitted by claude-pilot subprocesses
+    /// (the implementation-reasoning corpus, ~90% of the trajectory that the
+    /// in-process `llm_calls` table never sees). Rows are ingested by the
+    /// engine tick from `~/.mika/data/pilot-transcripts/<task-id>.jsonl` files
+    /// written by claude-pilot-py and linked back to the dispatching callback
+    /// `task_id`. Additive-only — no rebuild of existing tables. Two indexes
+    /// support the two query shapes: per-task correlation and time-window
+    /// retention scans.
+    fn migrate_v44_to_v45(&mut self) -> Result<()> {
+        let version = self.schema_version()?;
+        if version >= 45 {
+            return Ok(());
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS pilot_transcripts (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                timestamp TEXT,
+                provider TEXT,
+                model TEXT,
+                request_body TEXT,
+                response_body TEXT,
+                tokens_in INTEGER,
+                tokens_out INTEGER,
+                latency_ms INTEGER,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_pilot_transcripts_task_id
+                ON pilot_transcripts(task_id);
+            CREATE INDEX IF NOT EXISTS idx_pilot_transcripts_created_at
+                ON pilot_transcripts(created_at DESC);",
+        )?;
+
+        tx.execute("INSERT INTO schema_version (version) VALUES (45)", [])?;
+        tx.commit()?;
+
+        info!("v44→v45: added pilot_transcripts table (mika#1705)");
+
+        Ok(())
+    }
+
+    /// Insert a batch of pilot-transcript rows for one task in a single
+    /// transaction (mika#1705). Atomic per source JSONL file: either every row
+    /// commits or none does, so a crash mid-import never leaves a half-imported
+    /// file that the ingestion tick would then delete (idempotency contract).
+    /// `request_body`/`response_body` are already secret-scrubbed by the caller.
+    /// A fresh UUID is minted per row — JSONL entries carry no stable id.
+    pub fn insert_pilot_transcripts_batch(
+        &mut self,
+        task_id: &str,
+        rows: &[PilotTranscriptRow],
+    ) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO pilot_transcripts (
+                    id, task_id, timestamp, provider, model,
+                    request_body, response_body, tokens_in, tokens_out, latency_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            )?;
+            for r in rows {
+                let id = uuid::Uuid::new_v4().to_string();
+                stmt.execute(params![
+                    id,
+                    task_id,
+                    r.timestamp,
+                    r.provider,
+                    r.model,
+                    r.request_body,
+                    r.response_body,
+                    r.tokens_in,
+                    r.tokens_out,
+                    r.latency_ms,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(rows.len())
+    }
+
+    /// Prune pilot transcripts older than `retention_secs` (mika#1705 AC6).
+    /// Retention keys off `created_at` (import time, guaranteed ISO 8601) so
+    /// the scan is a simple lexicographic comparison, matching the
+    /// `prune_old_llm_calls` shape.
+    pub fn prune_old_pilot_transcripts(&self, retention_secs: i64) -> Result<usize> {
+        let cutoff = timestamp::now_minus(Duration::seconds(retention_secs));
+        let n = self.conn.execute(
+            "DELETE FROM pilot_transcripts WHERE created_at < ?1",
+            params![cutoff],
+        )?;
+        Ok(n)
+    }
+
+    /// Count pilot transcripts for a given task (mika#1705). Used by the
+    /// ingestion tick's idempotency guard and by tests.
+    pub fn count_pilot_transcripts_for_task(&self, task_id: &str) -> Result<i64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pilot_transcripts WHERE task_id = ?1",
+            params![task_id],
+            |r| r.get(0),
+        )?;
+        Ok(n)
     }
 
     /// Check if a column exists on a table within a transaction scope.
@@ -16797,6 +16928,7 @@ mod tests {
         db2.migrate_v41_to_v42().unwrap();
         db2.migrate_v42_to_v43().unwrap();
         db2.migrate_v43_to_v44().unwrap();
+        db2.migrate_v44_to_v45().unwrap();
 
         let final_version: i64 = db2
             .conn
