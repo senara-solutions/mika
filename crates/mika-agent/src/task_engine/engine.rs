@@ -1382,29 +1382,41 @@ fn compute_reaper_age_minutes(created_at: &str) -> i64 {
         .unwrap_or(0)
 }
 
-/// Resolve the childless-parent reaper grace window (mika#1687, D5).
-///
-/// Reads `MIKA_CHILDLESS_PARENT_REAPER_GRACE_SECS`, parses to `i64`, and falls
-/// back to [`CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS`] (1800) on
-/// missing/invalid/≤0 (WARN on invalid). Same safe-fallback shape as the
-/// watchdog's `effective_callback_watchdog_grace_period_secs()`. Env read once
-/// per tick is negligible at the 60s DB-scan cadence.
-fn childless_parent_reaper_grace_secs() -> i64 {
-    match std::env::var(CHILDLESS_PARENT_REAPER_GRACE_ENV) {
-        Ok(raw) => match raw.trim().parse::<i64>() {
+/// Pure parse of the childless-parent reaper grace window from an optional env
+/// value (mika#1687, D5). Returns [`CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS`]
+/// (1800) when the value is absent, empty, or unparseable/≤0 (WARN on invalid).
+/// Split out from the env read so it is unit-testable without mutating process
+/// environment (mirrors `parse_stuck_ready_threshold` in `auto_pull.rs`).
+fn parse_childless_parent_reaper_grace(raw: Option<&str>) -> i64 {
+    match raw {
+        Some(v) if !v.trim().is_empty() => match v.trim().parse::<i64>() {
             Ok(secs) if secs > 0 => secs,
             _ => {
                 warn!(
                     env = CHILDLESS_PARENT_REAPER_GRACE_ENV,
-                    value = %raw,
+                    value = %v,
                     default = CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS,
                     "invalid childless-parent reaper grace value; falling back to default"
                 );
                 CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS
             }
         },
-        Err(_) => CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS,
+        _ => CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS,
     }
+}
+
+/// Resolve the childless-parent reaper grace window (mika#1687, D5).
+///
+/// Reads `MIKA_CHILDLESS_PARENT_REAPER_GRACE_SECS` and delegates to
+/// [`parse_childless_parent_reaper_grace`]. Same safe-fallback shape as the
+/// watchdog's `effective_callback_watchdog_grace_period_secs()`. Env read once
+/// per tick is negligible at the 60s DB-scan cadence.
+fn childless_parent_reaper_grace_secs() -> i64 {
+    parse_childless_parent_reaper_grace(
+        std::env::var(CHILDLESS_PARENT_REAPER_GRACE_ENV)
+            .ok()
+            .as_deref(),
+    )
 }
 
 #[cfg(test)]
@@ -2425,5 +2437,52 @@ mod tests {
                  DISPATCH_CLASSES in engine.rs to include it (mika#1175)."
             );
         }
+    }
+
+    // -- childless-parent reaper grace reader tests (mika#1687, D5) --
+
+    #[test]
+    fn test_childless_grace_default_when_absent() {
+        assert_eq!(
+            parse_childless_parent_reaper_grace(None),
+            CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS
+        );
+    }
+
+    #[test]
+    fn test_childless_grace_default_when_empty() {
+        assert_eq!(
+            parse_childless_parent_reaper_grace(Some("   ")),
+            CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS
+        );
+    }
+
+    #[test]
+    fn test_childless_grace_valid_override() {
+        assert_eq!(parse_childless_parent_reaper_grace(Some("3600")), 3600);
+        // Surrounding whitespace is tolerated (trimmed before parse).
+        assert_eq!(parse_childless_parent_reaper_grace(Some(" 900 ")), 900);
+    }
+
+    #[test]
+    fn test_childless_grace_default_when_invalid() {
+        assert_eq!(
+            parse_childless_parent_reaper_grace(Some("not-a-number")),
+            CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS
+        );
+    }
+
+    #[test]
+    fn test_childless_grace_default_when_non_positive() {
+        // Zero and negative are invalid (a legitimately-dispatching parent is
+        // never childless for a non-positive window) → fall back to default.
+        assert_eq!(
+            parse_childless_parent_reaper_grace(Some("0")),
+            CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_childless_parent_reaper_grace(Some("-300")),
+            CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS
+        );
     }
 }

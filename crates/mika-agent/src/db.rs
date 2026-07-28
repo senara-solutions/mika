@@ -13359,6 +13359,212 @@ mod tests {
         );
     }
 
+    // -- find_childless_stuck_parent_tasks tests (mika#1687) --
+
+    /// Create a childless self_dev **issue** parent left `in_progress`, with
+    /// `updated_at` aged `age_secs` into the past. Returns `parent_id`. The
+    /// zero-child complement of `create_orphaned_parent_setup` — no callback
+    /// child is spawned (the silent-pilot-death signature).
+    fn create_childless_stuck_parent(db: &Database, age_secs: i64) -> String {
+        let mut parent = new_task("mika", "Implement mika#1687", "manual", "none");
+        parent.source = Some("self_dev".to_string());
+        // type defaults to 'issue' via SQL DEFAULT (r#type: None).
+        let parent_id = db.create_task(&parent).unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'in_progress',
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+                 WHERE id = ?1",
+                params![parent_id, format!("-{age_secs} seconds")],
+            )
+            .unwrap();
+        parent_id
+    }
+
+    #[test]
+    fn test_find_childless_stuck_parent_selects_qualifying() {
+        let db = db();
+        let parent_id = create_childless_stuck_parent(&db, 2000);
+
+        let stuck = db.find_childless_stuck_parent_tasks("mika", 1800).unwrap();
+        assert_eq!(stuck.len(), 1);
+        assert_eq!(stuck[0].id, parent_id);
+        assert_eq!(stuck[0].agent_id, "mika");
+        assert!(!stuck[0].created_at.is_empty());
+        assert!(!stuck[0].updated_at.is_empty());
+    }
+
+    #[test]
+    fn test_find_childless_stuck_parent_excludes_parent_with_any_child() {
+        let db = db();
+        let parent_id = create_childless_stuck_parent(&db, 2000);
+
+        // Add a callback child that is merely `pending` (not delivered). The
+        // NOT EXISTS predicate excludes on ANY child row — this is the exact
+        // complement of the orphan reaper's `delivered`-child INNER JOIN.
+        let mut child = callback_task("mika");
+        child.parent_task_id = Some(parent_id.clone());
+        db.create_task(&child).unwrap();
+
+        let stuck = db.find_childless_stuck_parent_tasks("mika", 1800).unwrap();
+        assert!(
+            stuck.is_empty(),
+            "parent with any child (even pending) must not be reaped"
+        );
+    }
+
+    #[test]
+    fn test_find_childless_stuck_parent_excludes_younger_than_grace() {
+        let db = db();
+        create_childless_stuck_parent(&db, 100);
+
+        let stuck = db.find_childless_stuck_parent_tasks("mika", 1800).unwrap();
+        assert!(
+            stuck.is_empty(),
+            "parent younger than grace must not be reaped"
+        );
+    }
+
+    #[test]
+    fn test_find_childless_stuck_parent_excludes_milestone_and_project() {
+        let db = db();
+
+        for task_type in ["milestone", "project"] {
+            let mut parent = new_task("mika", "Milestone parent", "manual", "none");
+            parent.source = Some("self_dev".to_string());
+            parent.r#type = Some(task_type.to_string());
+            let parent_id = db.create_task(&parent).unwrap();
+            db.conn
+                .execute(
+                    "UPDATE tasks SET status = 'in_progress',
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-2000 seconds')
+                     WHERE id = ?1",
+                    params![parent_id],
+                )
+                .unwrap();
+        }
+
+        let stuck = db.find_childless_stuck_parent_tasks("mika", 1800).unwrap();
+        assert!(
+            stuck.is_empty(),
+            "milestone/project parents are out of scope for v1 (D2)"
+        );
+    }
+
+    #[test]
+    fn test_find_childless_stuck_parent_excludes_wrong_status_source_trigger() {
+        let db = db();
+
+        // (a) pending (never reached in_progress): backdate but leave pending.
+        let mut pending = new_task("mika", "Pending", "manual", "none");
+        pending.source = Some("self_dev".to_string());
+        let pending_id = db.create_task(&pending).unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-2000 seconds')
+                 WHERE id = ?1",
+                params![pending_id],
+            )
+            .unwrap();
+
+        // (b) non-self_dev source, in_progress, aged.
+        let mut other_source = new_task("mika", "Other source", "manual", "none");
+        other_source.source = Some("webhook".to_string());
+        let other_source_id = db.create_task(&other_source).unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'in_progress',
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-2000 seconds')
+                 WHERE id = ?1",
+                params![other_source_id],
+            )
+            .unwrap();
+
+        // (c) non-manual trigger (recurring), self_dev, in_progress, aged.
+        let mut recurring = new_task("mika", "Recurring", "recurring", "none");
+        recurring.source = Some("self_dev".to_string());
+        let recurring_id = db.create_task(&recurring).unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'in_progress',
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-2000 seconds')
+                 WHERE id = ?1",
+                params![recurring_id],
+            )
+            .unwrap();
+
+        let stuck = db.find_childless_stuck_parent_tasks("mika", 1800).unwrap();
+        assert!(
+            stuck.is_empty(),
+            "pending / non-self_dev / non-manual parents must not be reaped"
+        );
+    }
+
+    #[test]
+    fn test_find_childless_stuck_parent_excludes_other_agents() {
+        let db = db();
+        db.register_agent("agent_a", "Agent A", "/tmp/a").unwrap();
+        db.register_agent("agent_b", "Agent B", "/tmp/b").unwrap();
+
+        let mut parent = new_task("agent_a", "Implement task", "manual", "none");
+        parent.source = Some("self_dev".to_string());
+        let parent_id = db.create_task(&parent).unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'in_progress',
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-2000 seconds')
+                 WHERE id = ?1",
+                params![parent_id],
+            )
+            .unwrap();
+
+        // agent_b sees nothing; agent_a sees its own stuck parent.
+        assert!(
+            db.find_childless_stuck_parent_tasks("agent_b", 1800)
+                .unwrap()
+                .is_empty()
+        );
+        let stuck = db
+            .find_childless_stuck_parent_tasks("agent_a", 1800)
+            .unwrap();
+        assert_eq!(stuck.len(), 1);
+        assert_eq!(stuck[0].id, parent_id);
+    }
+
+    /// Terminal-state race: once the childless parent is transitioned out of
+    /// `in_progress`, the guarded `update_task_failed` no-ops (Ok(false)) and
+    /// the query stops selecting it — the reaper never double-writes (R7).
+    #[test]
+    fn test_find_childless_stuck_parent_terminal_state_race() {
+        let db = db();
+        let parent_id = create_childless_stuck_parent(&db, 2000);
+
+        // First reap succeeds.
+        assert!(
+            db.update_task_failed(&parent_id, "mika", "stuck_in_progress_no_callback_child")
+                .unwrap()
+        );
+
+        // No longer selected (left in_progress).
+        assert!(
+            db.find_childless_stuck_parent_tasks("mika", 1800)
+                .unwrap()
+                .is_empty()
+        );
+
+        // A second guarded write no-ops rather than overwriting.
+        assert!(
+            !db.update_task_failed(&parent_id, "mika", "should not overwrite")
+                .unwrap()
+        );
+        let task = db.get_task(&parent_id, "mika").unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+        assert_eq!(
+            task.result.as_deref(),
+            Some("stuck_in_progress_no_callback_child")
+        );
+    }
+
     /// mika#1126 — get_reaper_child_snapshot returns ALL children of a parent.
     #[test]
     fn test_get_reaper_child_snapshot_returns_all_children() {
