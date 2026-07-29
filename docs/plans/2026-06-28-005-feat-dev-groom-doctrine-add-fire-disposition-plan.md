@@ -32,9 +32,17 @@ The gate is structurally backed by the existing EndTurn guard infrastructure: th
 - **When it matters:** When the autonomous loop dispatches `dev-pilot` from a groomed plan that adds a detector. The pilot implements exactly what the plan says; if the plan doesn't name the fire-disposition, the pilot either breaks CI or makes an undirected scope decision.
 - **Evidence:** mika#1326 → mika#1569 → mika#1573 founding incident. AC2 invariant test caught a benign cross-skill `gh_read` collision. The scope-bind named "additions-only" but not "detector-fires-on-legacy-data," leaving the pilot to improvise.
 
+### Trigger-condition reconciliation (addresses F1)
+
+The issue body frames this as a future-conditional — "fires when auto-groom-on-dispatch starts authoring ready-comments" (tied to mika#996). **That precondition is already satisfied:** mika#996 auto-groom-on-dispatch is live in the autonomous loop today (mika/CLAUDE.md § Pending Work: *"The autonomous loop **now** auto-grooms ungroomed `ready`-labelled or milestone-child tickets before dispatching them to `dev-pilot` … mika-dev dispatches `dev-groom` first (two-pass architect review via `mika-arch-groom-ticket`)"*). `dev-groom` authoring detector-class plans through the two-pass architect review is exactly the flow this gate protects. Implementing the gate now is therefore *on* the trigger condition, not ahead of it — the F1 deferral option (b) is moot.
+
+**Could not fully address: F1 (label edit + ratification).** The `p3-nice-to-have` → `p1`/`p2` label change (F1 option a) and any Vincent ratification comment (F1 option c) are `gh issue edit` / operator actions outside this content-only revise pilot's authority. This revision resolves the substantive concern (implementing ahead of trigger) by showing the trigger is met; the label/priority reconciliation remains the operator's call at merge time. Priority ordering does not affect implementation correctness — the gate is dormant-and-harmless on any non-detector plan (KTD5), so early landing carries no regression risk to existing grooming.
+
 ---
 
 ## Requirements
+
+**AC1 option selection (issue mika#1574 § Acceptance criteria AC1).** The issue enumerates three structural-enforcement options for the fire-disposition rule: (a) `[constraints]` in `skill.toml`, (b) a post-LLM EndTurn guard, (c) `mika-arch-second-review` rejects the groomed plan if fire-disposition is missing for detector deliverables. **This plan implements AC1 option (c)** — the architect review pipeline (first-pass ITERATE + second-pass ESCALATE) is the enforcement surface. Rationale for rejecting (a)/(b) is in KTD1. Citation: gh_read mika#1574 "Acceptance criteria" AC1.
 
 - R1. The `mika-arch-groom-ticket` first-pass review MUST detect plans with detector-class deliverables and return ITERATE if no fire-disposition section is present.
 - R2. The `mika-arch-second-review` second-pass review MUST enforce the same gate and return ESCALATE if fire-disposition is still missing after revision.
@@ -46,7 +54,7 @@ The gate is structurally backed by the existing EndTurn guard infrastructure: th
 
 ## Key Technical Decisions
 
-- **KTD1: Architect gate (AC1 option c), not EndTurn guard.** The fire-disposition gate is semantic — it requires understanding whether a plan describes a detector-class deliverable, which is judgment, not regex. The existing architect review pipeline is the right layer: the architect already evaluates plan completeness via the Unresolved-Decision and Acceptance-Criteria gates. Adding a Fire-Disposition Gate follows the same pattern. The structural backing comes from the existing EndTurn guards (#864, #901) that force the architect to emit its disposition and F-list — the architect cannot silently skip a gate. A pure EndTurn regex guard (AC1 option b) would either be too narrow (only catches the literal section heading) or too broad (false positives on plans that discuss detectors in passing).
+- **KTD1: Architect gate — implements AC1 option (c), rejecting options (a) and (b).** This plan selects **AC1 option (c)** from the issue's enumerated list (`mika-arch-second-review` rejects the groomed plan when fire-disposition is missing for detector deliverables). The fire-disposition gate is semantic — it requires understanding whether a plan describes a detector-class deliverable, which is judgment, not regex. The existing architect review pipeline is the right layer: the architect already evaluates plan completeness via the Unresolved-Decision and Acceptance-Criteria gates. Adding a Fire-Disposition Gate follows the same pattern. The structural backing comes from the existing EndTurn guards (#864, #901) that force the architect to emit its disposition and F-list — the architect cannot silently skip a gate. A pure EndTurn regex guard (AC1 option b) would either be too narrow (only catches the literal section heading) or too broad (false positives on plans that discuss detectors in passing).
 
 - **KTD2: `## Fire-Disposition` section in the plan, not the ready-comment.** The ready-comment template is an orchestrator-CC concern (the canonical body callout is written by `dispatch-lib.sh::_write_canonical_callout`). The plan is the content the architect reviews. Placing fire-disposition in the plan keeps the enforcement loop tight: `/ce:plan` → architect first-pass → ITERATE if missing → author adds section → second-pass → GROOMED. The ready-comment / body callout does not carry fire-disposition content (the plan path is the reference).
 
@@ -90,6 +98,7 @@ The gate is structurally backed by the existing EndTurn guard infrastructure: th
 4. New eval scenario: plan with detector deliverable + no fire-disposition → architect returns ITERATE with BLOCKING F-finding citing the doctrine
 5. New eval scenario: plan with non-detector deliverable + no fire-disposition → architect returns READY (gate N/A)
 6. `make verify-bundled-skills` passes — skill manifests intact
+7. **(mandatory, F3)** `make calibrate-mika-arch MODEL=<current-baseline-model>` runs, holds the recorded baseline pass-rate (`docs/eval/calibration/baselines/`), and the report summary is pasted into the PR body. Because Unit 1/2/9 touch mika-arch prompt + scenario surface, this is a pre-merge gate, not optional hygiene.
 
 ---
 
@@ -106,7 +115,7 @@ Add a `### Fire-Disposition Gate (mika#1574)` section after the existing `### Ac
 
 **A plan that includes detector-class deliverables (test, assertion, lint, invariant, validation) without a `## Fire-Disposition` section MUST return `ITERATE` — never `READY`.**
 
-Detector-class deliverables are those whose primary purpose is to detect and report violations of an invariant. They include but are not limited to: unit/integration tests, assertion macros, lint rules, CI gate scripts, schema validators, structural checks (like `verify_bundled_skills`), EndTurn guards, and any code whose success path is "no violations found."
+Detector-class deliverables are those whose primary purpose is to detect and report violations of an invariant. They include but are not limited to: unit/integration tests, assertion macros, lint rules, CI gate scripts, schema validators, structural checks (like the `verify-bundled-skills` bundled-skill invariant binary, mika#1575), EndTurn guards, and any code whose success path is "no violations found."
 
 When a plan includes one or more detector-class deliverables, the `## Fire-Disposition` section must specify what the implementation does when the detector fires on **existing** data (pre-existing violations, not the new code being added). Three canonical options:
 
@@ -165,11 +174,14 @@ Same addition as Unit 3, in the plan-generation phase. The operator-direct and a
 
 **Registration (required):** Add `pub mod mika_arch_fire_disposition_gate;` to `crates/mika-agent/tests/eval/skills/mod.rs` — the eval-skills module is not auto-discovered; a new scenario file that is not registered as a `pub mod` line silently never compiles or runs (the mod.rs currently registers only `mika_arch_groom_milestone`).
 
-MockLlmProvider scenario: architect receives a plan with a detector deliverable (e.g., "add a `verify_bundled_skills` structural check") and a `## Fire-Disposition` section naming option (a). Assert the response contains `Disposition: READY` (gate passes, not triggered by this gate — other gates may still trigger but this one doesn't).
+MockLlmProvider scenario: architect receives a plan with a detector deliverable (e.g., "add a `verify-bundled-skills`-style structural check", mika#1575) and a `## Fire-Disposition` section naming option (a). Assert the response contains `Disposition: READY` (gate passes, not triggered by this gate — other gates may still trigger but this one doesn't).
 
 Use the existing `EvalHarness` builder pattern with `MockLlmProvider` for deterministic execution. The mock response should contain the architect's READY disposition.
 
-**Enforcement-honesty note (what these Unit 5–7 tests actually cover).** Per the `skills/mod.rs` doc comment, per-skill eval scenarios "validate engine *handling* of a skill's declared output shape, not the production prompt's wording." A `MockLlmProvider` returns canned responses — it cannot prove the architect's *LLM judgment* applies the Fire-Disposition Gate (the mock emits whatever disposition the scenario programs). Unit 5–7 therefore assert the engine correctly threads the architect's declared disposition/F-list shape through the loop for each of the three gate branches (they are regression coverage for the output contract, the same class as `mika_arch_groom_milestone`). The **prompt-adherence** guarantee — that the live architect model actually returns ITERATE on a detector plan missing fire-disposition — is owned by the mika-arch calibration suite (mika#1190), which runs real providers against structural assertions. Because Unit 1/2 modify `mika-arch-*` system prompts, `make calibrate-mika-arch MODEL=<current-baseline-model>` MUST be run and shown to hold the baseline pass-rate before merge (a mika-arch prompt change is a calibration-relevant change even though it is not a model swap). Consider adding a `fire_disposition_gate` scenario to `src/calibration/roles/mika_arch.rs` as the durable prompt-adherence backstop; if deferred, file a follow-up and name it here.
+**Enforcement-honesty note (what these Unit 5–7 tests actually cover).** Per the `skills/mod.rs` doc comment, per-skill eval scenarios "validate engine *handling* of a skill's declared output shape, not the production prompt's wording." A `MockLlmProvider` returns canned responses — it cannot prove the architect's *LLM judgment* applies the Fire-Disposition Gate (the mock emits whatever disposition the scenario programs). Unit 5–7 therefore assert the engine correctly threads the architect's declared disposition/F-list shape through the loop for each of the three gate branches (they are regression coverage for the output contract, the same class as `mika_arch_groom_milestone`). The **prompt-adherence** guarantee — that the live architect model actually returns ITERATE on a detector plan missing fire-disposition — is owned by the mika-arch calibration suite (mika#1190), which runs real providers against structural assertions. Because Unit 1/2 modify `mika-arch-*` system prompts, `make calibrate-mika-arch MODEL=<current-baseline-model>` is a **mandatory pre-merge gate** (a mika-arch prompt change is a calibration-relevant change even though it is not a model swap; review-guide.md § Calibration discipline). Two non-negotiable requirements, both in the DoD (AC10) and Verification Contract:
+
+1. **Baseline hold, evidenced in the PR body.** `make calibrate-mika-arch MODEL=<current-baseline-model>` MUST run and MUST hold the recorded baseline pass-rate (`docs/eval/calibration/baselines/`). The PR body MUST paste the calibration report summary (scenario pass-rate table) — not a bare "ran it" claim.
+2. **Durable prompt-adherence scenario, not deferred.** The `fire_disposition_gate` scenario is added to `src/calibration/roles/mika_arch.rs` **in this PR** (Unit 9 below), so the prompt-adherence guarantee is a permanent regression backstop rather than a one-time manual check. There is no follow-up-ticket deferral — F3 is closed by landing the scenario here.
 
 ### Unit 6: Eval test — detector + fire-disposition missing (FAIL)
 
@@ -205,7 +217,7 @@ When a dispatch plan includes a detector-class deliverable (test, assertion, lin
 
 ## Founding incident
 
-mika#1326 → mika#1569 → mika#1573: AC2's `verify_bundled_skills` invariant test caught a benign cross-skill `gh_read` collision on existing bundled-skill data. The scope-bind said "additions-only, don't mutate existing dispatch paths" but did not name the fire-disposition for when the detector caught existing violations. The pilot's strict interpretation produced a failing test.
+mika#1326 → mika#1569 → mika#1573: the `verify-bundled-skills` invariant check (mika#1575, the pre-merge structural counterpart to mika#1326 AC2; binary `verify-bundled-skills`, source `crates/mika-agent/src/bin/verify_bundled_skills.rs`) caught a benign cross-skill `gh_read` collision on existing bundled-skill data. The scope-bind said "additions-only, don't mutate existing dispatch paths" but did not name the fire-disposition for when the detector caught existing violations. The pilot's strict interpretation produced a failing test.
 
 ## Doctrine
 
@@ -239,6 +251,18 @@ The fire-disposition rule is enforced by the **Fire-Disposition Gate** in `mika-
 - Mika Prime bearing-read 2026-06-26
 ```
 
+### Unit 9: Durable calibration scenario — `fire_disposition_gate` (addresses F3)
+
+**File:** `crates/mika-agent/src/calibration/roles/mika_arch.rs`
+
+Add a `fire_disposition_gate` scenario to the `SCENARIOS` array. This is the durable prompt-adherence backstop for the Fire-Disposition Gate: it runs the **live** mika-arch model (via `make calibrate-mika-arch`) against a plan that includes a detector-class deliverable but omits the `## Fire-Disposition` section, and asserts the architect returns a blocking disposition (ITERATE/ESCALATE) citing the missing section — the guarantee the `MockLlmProvider` eval tests (Unit 5–7) structurally cannot provide.
+
+**Required companion edits (do not skip — the file has count-guard tests):**
+- Update the scenario-count assertion (`crates/mika-agent/src/calibration/roles/mika_arch.rs` currently asserts *"mika-arch should have 8 calibration scenarios (5 original + 3 TBD-gate)"*) to reflect the new total (9), or extend the tag-scoped assertion pattern the file already uses for `tbd-gate` scenarios. A stale count assertion will fail the build — the scenario is not "added" until these guards pass.
+- Tag the scenario consistently with the existing tagging convention (e.g., a `fire-disposition-gate` tag mirroring the `tbd-gate` grouping) so the `*_scenarios_present_with_correct_tags` test class can assert its presence.
+
+The scenario must be non-flaky by the same standard as the existing `tbd_rejection_scenarios_are_not_flaky` test — the assertion keys off the disposition token + F-finding presence, not free-text wording.
+
 ---
 
 ## Acceptance criteria
@@ -252,7 +276,21 @@ The fire-disposition rule is enforced by the **Fire-Disposition Gate** in `mika-
 7. Documentation exists at `docs/solutions/best-practices/fire-disposition-doctrine.md`.
 8. `cargo test -p mika-agent` passes.
 9. `make verify-bundled-skills` passes.
+10. **(F3)** A `fire_disposition_gate` calibration scenario exists in `crates/mika-agent/src/calibration/roles/mika_arch.rs` (Unit 9), the file's scenario-count/tag guard tests pass, and `make calibrate-mika-arch MODEL=<baseline>` holds the baseline pass-rate with the report summary pasted into the PR body.
+
+## Milestone-grooming interaction (addresses F4)
+
+The Fire-Disposition Gate is a **per-plan** gate. `mika-arch-groom-milestone` reviews a milestone as a set of per-sub-issue plans, each reviewed against the same first-pass gate library; the gate therefore applies **per sub-issue plan, not to an aggregated milestone plan**. There is no batch-level fire-disposition — a milestone whose sub-issue N introduces a detector requires the `## Fire-Disposition` section in sub-issue N's plan, independent of the other sub-issues. This plan does not modify `mika-arch-groom-milestone/system_prompt.md`: the milestone reviewer already delegates per-sub-issue plan evaluation to the same gate surface, so Unit 1's addition is inherited without change. If milestone review is ever refactored to evaluate an aggregated single-document plan, the gate would need to fire per-detector-deliverable within that document — recorded here so the assumption is explicit rather than silent (review-guide.md § Scope completeness).
 
 ## Fire-Disposition
 
 N/A — this ticket adds a review gate and documentation. No deliverable in this plan is a detector that can fire on existing data. The architect gate itself is a review-time check (LLM judgment), not a runtime detector.
+
+## Revision history
+
+- rev 2 (2026-07-29): addressed first-pass architect findings (findings-1.md).
+  - **F2** (AC citation gap): added an explicit AC1-option-(c) selection callout to Requirements and to KTD1, naming the option from the issue's enumerated (a)/(b)/(c) list and citing `gh_read mika#1574 § Acceptance criteria AC1`.
+  - **F3** (calibration deferred): removed the "optional / file-a-follow-up" language; made `make calibrate-mika-arch` a mandatory pre-merge gate with PR-body pass-rate evidence (Verification Contract #7, AC10), and landed the durable `fire_disposition_gate` calibration scenario in-PR as Unit 9 (with the required scenario-count/tag guard updates) — no follow-up-ticket deferral.
+  - **F4** (milestone gate interaction): added a "Milestone-grooming interaction" note — the gate applies per sub-issue plan, not to an aggregated milestone plan; `mika-arch-groom-milestone` inherits Unit 1's gate via per-sub-issue delegation, so no milestone prompt change is needed (assumption recorded).
+  - **F5** (`verify_bundled_skills` anchoring): corrected the example-detector references to the canonical invocable name `verify-bundled-skills` (make target / binary, mika#1575; source `crates/mika-agent/src/bin/verify_bundled_skills.rs`) in Unit 1, Unit 5, and the Unit 8 founding-incident narrative.
+  - **F1** (priority/trigger divergence): partially addressed — added a "Trigger-condition reconciliation" note showing the future-conditional precondition (mika#996 auto-groom-on-dispatch) is already live per mika/CLAUDE.md, so implementing now is *on* the trigger, dissolving deferral option (b). **Could not fully address:** the `p3-nice-to-have` label edit (option a) and any Vincent ratification comment (option c) are `gh issue edit` / operator actions outside this content-only revise pilot's authority — flagged in-plan for the architect's second-pass call and the operator's merge-time decision.
