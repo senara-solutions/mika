@@ -138,7 +138,7 @@ async fn test_detector_with_fire_disposition_emits_ready() -> anyhow::Result<()>
 
     let mock_response = "\
 Annotated plan content:
-  Unit 1 adds a `verify_bundled_skills` structural check — a detector-class
+  Unit 1 adds a `verify-bundled-skills` structural check — a detector-class
   deliverable (its success path is \"no violations found\").
   The plan carries a `## Fire-Disposition` section naming option (a): named
   allowlist exception with a self-cleaning assertion + follow-up tracker for
@@ -158,7 +158,7 @@ Disposition: READY";
         .await?;
 
     let user_msg = "architect-review: Review the plan for mika#1574 that adds a \
-                    `verify_bundled_skills` structural check. The plan includes a \
+                    `verify-bundled-skills` structural check. The plan includes a \
                     `## Fire-Disposition` section naming option (a).";
     let trace = harness.run(user_msg).await?;
 
