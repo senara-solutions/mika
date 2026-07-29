@@ -464,6 +464,28 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         secret: false,
         description: "Server-side held-request timeout in seconds. Timeout materializes an internal deny (fail-closed). Default: 300.",
     },
+    // Bounded webhook queue (mika#1870)
+    ConfigKeyInfo {
+        key: "webhook_queue_max_depth",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_WEBHOOK_QUEUE_MAX_DEPTH"),
+        secret: false,
+        description: "Per-agent bounded webhook-queue max depth. Caps distinct (non-coalescing) events held before the queue drops its oldest entry. Default: 64. Invalid/0 falls back to default.",
+    },
+    ConfigKeyInfo {
+        key: "webhook_queue_block_timeout_ms",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_WEBHOOK_QUEUE_BLOCK_TIMEOUT_MS"),
+        secret: false,
+        description: "Per-agent bounded webhook-queue block timeout in milliseconds. When the queue is full, enqueue blocks up to this long for a drain slot before dropping the oldest entry. Default: 100.",
+    },
+    ConfigKeyInfo {
+        key: "webhook_queue_enabled",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_WEBHOOK_QUEUE_ENABLED"),
+        secret: false,
+        description: "Bounded webhook-queue kill-switch. true (default) = POST /message enqueues into the per-agent bounded queue; false = legacy try_lock 429-reject path (instant rollback, no redeploy).",
+    },
     // ReadOnly (runtime-computed)
     ConfigKeyInfo {
         key: "home_dir",
@@ -612,6 +634,14 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
             DecisionAuthority::Override => "override".to_string(),
         }),
         "permission_hold_timeout_secs" => Some(settings.permission_hold_timeout_secs.to_string()),
+        // Bounded webhook queue (mika#1870)
+        "webhook_queue_max_depth" => Some(settings.effective_webhook_queue_max_depth().to_string()),
+        "webhook_queue_block_timeout_ms" => Some(
+            settings
+                .effective_webhook_queue_block_timeout_ms()
+                .to_string(),
+        ),
+        "webhook_queue_enabled" => Some(settings.effective_webhook_queue_enabled().to_string()),
         // DB keys (timezone, thinking_level) not available from Settings
         _ => None,
     }
@@ -945,6 +975,31 @@ pub struct Settings {
     #[serde(default = "default_permission_hold_timeout_secs")]
     pub permission_hold_timeout_secs: u64,
 
+    /// Bounded webhook-queue max depth per agent (mika#1870). The per-agent
+    /// drain worker coalesces redundant webhook bursts and applies backpressure;
+    /// this caps the number of distinct (non-coalescing) events held before the
+    /// queue drops its oldest entry. Unset = [`DEFAULT_WEBHOOK_QUEUE_MAX_DEPTH`]
+    /// (64). Invalid/`0` falls back to the default (WARN-logged in the effective
+    /// helper).
+    #[serde(default)]
+    pub webhook_queue_max_depth: Option<usize>,
+
+    /// Bounded webhook-queue block timeout in milliseconds (mika#1870). When the
+    /// queue is full, `enqueue` blocks up to this long waiting for the drain
+    /// worker to free a slot before dropping the oldest entry. Unset =
+    /// [`DEFAULT_WEBHOOK_QUEUE_BLOCK_TIMEOUT_MS`] (100). Invalid/`0` falls back to
+    /// the default (WARN-logged in the effective helper).
+    #[serde(default)]
+    pub webhook_queue_block_timeout_ms: Option<u64>,
+
+    /// Bounded webhook-queue kill-switch (mika#1870 AC9). When `true` (default),
+    /// `POST /message` enqueues into the per-agent bounded queue. When `false`,
+    /// the legacy `try_lock_owned()` → 429-reject path is used verbatim, allowing
+    /// instant rollback without a redeploy. Unset =
+    /// [`DEFAULT_WEBHOOK_QUEUE_ENABLED`] (true).
+    #[serde(default)]
+    pub webhook_queue_enabled: Option<bool>,
+
     /// Resolved home directory path (populated after load, not from config file)
     #[serde(skip)]
     pub home_dir: PathBuf,
@@ -962,6 +1017,17 @@ pub const DEFAULT_KG_BATCH_BUDGET: u32 = 500;
 /// After detecting subprocess death, wait this long before marking the callback
 /// task `failed` — allows for in-flight callback delivery that may be in transit.
 pub const DEFAULT_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS: u64 = 120;
+
+/// Default bounded webhook-queue max depth per agent (mika#1870).
+pub const DEFAULT_WEBHOOK_QUEUE_MAX_DEPTH: usize = 64;
+
+/// Default bounded webhook-queue block timeout in milliseconds (mika#1870).
+pub const DEFAULT_WEBHOOK_QUEUE_BLOCK_TIMEOUT_MS: u64 = 100;
+
+/// Default bounded webhook-queue enabled state (mika#1870 AC9). `true` = enqueue
+/// path active; set `MIKA_WEBHOOK_QUEUE_ENABLED=false` to revert to the legacy
+/// 429-reject path (kill-switch).
+pub const DEFAULT_WEBHOOK_QUEUE_ENABLED: bool = true;
 
 fn default_true() -> bool {
     true
@@ -1320,6 +1386,45 @@ impl Settings {
             .unwrap_or(DEFAULT_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS)
     }
 
+    /// Effective bounded webhook-queue max depth (mika#1870).
+    ///
+    /// Returns the configured value or [`DEFAULT_WEBHOOK_QUEUE_MAX_DEPTH`] (64).
+    /// A configured `0` is invalid (an unbounded/never-holding queue defeats the
+    /// backpressure design) and falls back to the default with a `warn!`.
+    pub fn effective_webhook_queue_max_depth(&self) -> usize {
+        match self.webhook_queue_max_depth {
+            Some(0) | None => {
+                if self.webhook_queue_max_depth == Some(0) {
+                    tracing::warn!(
+                        "MIKA_WEBHOOK_QUEUE_MAX_DEPTH=0 is invalid; falling back to default {}",
+                        DEFAULT_WEBHOOK_QUEUE_MAX_DEPTH
+                    );
+                }
+                DEFAULT_WEBHOOK_QUEUE_MAX_DEPTH
+            }
+            Some(n) => n,
+        }
+    }
+
+    /// Effective bounded webhook-queue block timeout in milliseconds (mika#1870).
+    ///
+    /// Returns the configured value or [`DEFAULT_WEBHOOK_QUEUE_BLOCK_TIMEOUT_MS`]
+    /// (100). A configured `0` is honored as "do not block" — enqueue drops the
+    /// oldest immediately when the queue is full.
+    pub fn effective_webhook_queue_block_timeout_ms(&self) -> u64 {
+        self.webhook_queue_block_timeout_ms
+            .unwrap_or(DEFAULT_WEBHOOK_QUEUE_BLOCK_TIMEOUT_MS)
+    }
+
+    /// Effective bounded webhook-queue enabled state (mika#1870 AC9).
+    ///
+    /// Returns the configured value or [`DEFAULT_WEBHOOK_QUEUE_ENABLED`] (true).
+    /// `false` reverts `POST /message` to the legacy 429-reject path (kill-switch).
+    pub fn effective_webhook_queue_enabled(&self) -> bool {
+        self.webhook_queue_enabled
+            .unwrap_or(DEFAULT_WEBHOOK_QUEUE_ENABLED)
+    }
+
     /// Parse a `provider/model` string and create an LLM provider.
     ///
     /// Reusable by `make_kg_extraction_provider` and `make_kg_resolution_provider`.
@@ -1532,6 +1637,9 @@ impl Settings {
             operational_partner: false,
             decision_authority: DecisionAuthority::Strict,
             permission_hold_timeout_secs: DEFAULT_PERMISSION_HOLD_TIMEOUT_SECS,
+            webhook_queue_max_depth: None,
+            webhook_queue_block_timeout_ms: None,
+            webhook_queue_enabled: None,
         }
     }
 }
@@ -2423,5 +2531,86 @@ mod tests {
         assert_eq!(settings.effective_callback_watchdog_grace_period_secs(), 60);
 
         unsafe { std::env::remove_var("MIKA_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS") };
+    }
+
+    // -- Bounded webhook queue (mika#1870) --
+
+    #[test]
+    #[serial]
+    fn webhook_queue_defaults() {
+        clean_env();
+        unsafe {
+            std::env::remove_var("MIKA_WEBHOOK_QUEUE_MAX_DEPTH");
+            std::env::remove_var("MIKA_WEBHOOK_QUEUE_BLOCK_TIMEOUT_MS");
+            std::env::remove_var("MIKA_WEBHOOK_QUEUE_ENABLED");
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(settings.webhook_queue_max_depth, None);
+        assert_eq!(settings.webhook_queue_block_timeout_ms, None);
+        assert_eq!(settings.webhook_queue_enabled, None);
+
+        assert_eq!(
+            settings.effective_webhook_queue_max_depth(),
+            DEFAULT_WEBHOOK_QUEUE_MAX_DEPTH
+        );
+        assert_eq!(settings.effective_webhook_queue_max_depth(), 64);
+        assert_eq!(
+            settings.effective_webhook_queue_block_timeout_ms(),
+            DEFAULT_WEBHOOK_QUEUE_BLOCK_TIMEOUT_MS
+        );
+        assert_eq!(settings.effective_webhook_queue_block_timeout_ms(), 100);
+        assert!(settings.effective_webhook_queue_enabled());
+    }
+
+    #[test]
+    #[serial]
+    fn webhook_queue_env_overrides() {
+        clean_env();
+        // Safety: test-only env vars.
+        unsafe {
+            std::env::set_var("MIKA_WEBHOOK_QUEUE_MAX_DEPTH", "128");
+            std::env::set_var("MIKA_WEBHOOK_QUEUE_BLOCK_TIMEOUT_MS", "250");
+            std::env::set_var("MIKA_WEBHOOK_QUEUE_ENABLED", "false");
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(settings.webhook_queue_max_depth, Some(128));
+        assert_eq!(settings.effective_webhook_queue_max_depth(), 128);
+        assert_eq!(settings.webhook_queue_block_timeout_ms, Some(250));
+        assert_eq!(settings.effective_webhook_queue_block_timeout_ms(), 250);
+        assert_eq!(settings.webhook_queue_enabled, Some(false));
+        assert!(!settings.effective_webhook_queue_enabled());
+
+        unsafe {
+            std::env::remove_var("MIKA_WEBHOOK_QUEUE_MAX_DEPTH");
+            std::env::remove_var("MIKA_WEBHOOK_QUEUE_BLOCK_TIMEOUT_MS");
+            std::env::remove_var("MIKA_WEBHOOK_QUEUE_ENABLED");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn webhook_queue_zero_max_depth_falls_back_to_default() {
+        clean_env();
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_WEBHOOK_QUEUE_MAX_DEPTH", "0") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        // 0 is stored verbatim but the effective helper rejects it as invalid
+        // (a never-holding queue defeats backpressure) and warns + falls back.
+        assert_eq!(settings.webhook_queue_max_depth, Some(0));
+        assert_eq!(
+            settings.effective_webhook_queue_max_depth(),
+            DEFAULT_WEBHOOK_QUEUE_MAX_DEPTH
+        );
+
+        unsafe { std::env::remove_var("MIKA_WEBHOOK_QUEUE_MAX_DEPTH") };
     }
 }

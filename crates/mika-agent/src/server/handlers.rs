@@ -30,6 +30,7 @@ use super::verdict_handler::{VerdictAction, try_handle_pr_review_verdict};
 use super::webhook_queue::{
     self, DEFERRAL_TIMEOUT, DeferredWebhook, correlate_webhook, should_defer_webhook,
 };
+use super::webhook_queue_v2::{self, EnqueueResult, QueuedWebhook, WebhookQueue};
 
 /// Media types accepted by the Claude API for image content blocks.
 const ALLOWED_IMAGE_MEDIA_TYPES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
@@ -274,6 +275,105 @@ pub async fn handle_message(
             }),
         )
             .into_response();
+    }
+
+    // Bounded webhook queue (mika#1870 AC3). When enabled, every inbound request
+    // enqueues into the per-agent bounded queue; the drain worker is the sole
+    // consumer that acquires `agent_lock` and runs the loop. 202 on
+    // Enqueued/Coalesced; 429 only when the queue overflows (Dropped). When
+    // disabled (kill-switch, AC9), fall through to the verbatim legacy
+    // try_lock → 429 path below.
+    if agent_state.settings.effective_webhook_queue_enabled() {
+        let agent_label = if req.agent.is_empty() {
+            state.default_agent.clone()
+        } else {
+            req.agent.clone()
+        };
+
+        // Store chat_id before enqueue (idempotent per-customer config). The
+        // legacy path stores it after lock acquire; here we store it on receipt
+        // regardless of coalescing since chat_id is per-customer, not per-message.
+        if let Some(chat_id) = req.chat_id
+            && chat_id != 0
+        {
+            let _ = agent_state
+                .db
+                .set_customer_config("chat_id", &chat_id.to_string())
+                .await;
+        }
+
+        let request_id = req.request_id.clone();
+        let kind = webhook_queue_v2::classify_event(&req.text);
+        let kind_label = kind.label();
+        let key = webhook_queue_v2::coalescing_key(&kind);
+        let key_display = key.as_deref().unwrap_or("none").to_string();
+
+        match agent_state.webhook_queue_v2.enqueue(req).await {
+            EnqueueResult::Enqueued { depth } => {
+                emit_webhook_queue_audit(
+                    &state,
+                    &agent_state,
+                    &agent_label,
+                    "webhook_queue_enqueued",
+                    &format!("event_kind={kind_label} coalescing_key={key_display} depth={depth}"),
+                    "webhook enqueued to bounded queue",
+                )
+                .await;
+                // Status is "accepted" (not "queued") so the gateway sees the
+                // exact same accepted-case response as the legacy path — the
+                // uniform queue is invisible to the gateway (plan §3.1). The
+                // enqueue/coalesce distinction lives in the audit events.
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(AcceptedResponse {
+                        request_id,
+                        status: "accepted".to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+            EnqueueResult::Coalesced { replaced_event_id } => {
+                emit_webhook_queue_audit(
+                    &state,
+                    &agent_state,
+                    &agent_label,
+                    "webhook_queue_coalesced",
+                    &format!(
+                        "event_kind={kind_label} coalescing_key={key_display} replaces_event_id={replaced_event_id}"
+                    ),
+                    "webhook coalesced into a queued sibling",
+                )
+                .await;
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(AcceptedResponse {
+                        request_id,
+                        status: "accepted".to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+            EnqueueResult::Dropped => {
+                let depth = agent_state.webhook_queue_v2.depth().await;
+                emit_webhook_queue_audit(
+                    &state,
+                    &agent_state,
+                    &agent_label,
+                    "webhook_queue_drop_oldest",
+                    &format!("event_kind={kind_label} reason=queue_full depth={depth}"),
+                    "webhook queue overflow — dropped oldest (dead-letter)",
+                )
+                .await;
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({
+                        "request_id": request_id,
+                        "error": "webhook queue overflow"
+                    })),
+                )
+                    .into_response();
+            }
+        }
     }
 
     // Try to acquire the agent lock (non-blocking)
@@ -795,6 +895,191 @@ async fn replay_deferred_webhooks(
             .unwrap_or_default();
 
         run_agent_for_message(state, agent_state, deferred.request, user_images, lock).await;
+    }
+}
+
+// -- Bounded webhook queue (mika#1870) --
+
+/// Minimum interval between `webhook_queue_*` audit-event emissions per
+/// (agent, action) — AC5. Same throttle discipline as `rate_limit_trip`: a burst
+/// must not itself flood the audit table.
+const WEBHOOK_QUEUE_AUDIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Structured-log gauge heartbeat interval for the drain worker (best-effort,
+/// not a hard AC — plan §3.6).
+const WEBHOOK_QUEUE_GAUGE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Emit one throttled `webhook_queue_*` audit event (AC5), keyed
+/// `"{agent}:{action}"` against `AppState.webhook_queue_audit_last`.
+async fn emit_webhook_queue_audit(
+    state: &AppState,
+    agent_state: &Arc<AgentState>,
+    agent_label: &str,
+    action: &str,
+    after: &str,
+    reasoning: &str,
+) {
+    let throttle_key = format!("{agent_label}:{action}");
+    let now = std::time::Instant::now();
+    if !should_emit_rate_limit_audit(
+        &state.webhook_queue_audit_last,
+        &throttle_key,
+        now,
+        WEBHOOK_QUEUE_AUDIT_INTERVAL,
+    ) {
+        return;
+    }
+    let target_key = format!("agent:{agent_label}");
+    if let Err(e) = agent_state
+        .db
+        .log_audit_event(
+            "system",
+            action,
+            &target_key,
+            None,
+            Some(after),
+            Some(reasoning),
+            None,
+        )
+        .await
+    {
+        warn!(error = %e, action, "failed to log webhook_queue audit event");
+    }
+}
+
+/// Emit the best-effort 5s queue-depth gauge. Skipped entirely when the queue is
+/// idle and has never coalesced/dropped, so steady-state agents stay quiet.
+async fn emit_webhook_queue_gauge(agent_label: &str, queue: &Arc<WebhookQueue>) {
+    let depth = queue.depth().await;
+    let (enqueued, coalesced, dropped) = queue.counters();
+    if depth == 0 && coalesced == 0 && dropped == 0 {
+        return;
+    }
+    info!(
+        target: "mika::otel",
+        event = "webhook_queue.gauge",
+        agent_id = %agent_label,
+        depth,
+        enqueued_total = enqueued,
+        coalesced_total = coalesced,
+        dropped_total = dropped,
+        "webhook queue gauge"
+    );
+}
+
+/// Spawn the per-agent webhook drain worker (AC4). The sole consumer of the
+/// agent's bounded queue: it dequeues, acquires `agent_lock` with a long blocking
+/// wait, and runs the agent loop. Serial by construction (one lock, one in-flight
+/// turn). Never crashes its loop — processing runs in a child task whose panic is
+/// captured as a `JoinError`, matching the fail-open discipline of the KG ticks.
+pub(super) fn spawn_webhook_drain_worker(
+    state: AppState,
+    agent_state: Arc<AgentState>,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let agent_label = agent_state.db.agent_id().to_string();
+        let queue = agent_state.webhook_queue_v2.clone();
+        debug!(agent = %agent_label, "webhook drain worker started");
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    debug!(agent = %agent_label, "webhook drain worker shutting down");
+                    break;
+                }
+                item = queue.dequeue() => {
+                    let Some(item) = item else { continue };
+                    drain_one_webhook(&state, &agent_state, &agent_label, item).await;
+                }
+                _ = tokio::time::sleep(WEBHOOK_QUEUE_GAUGE_INTERVAL) => {
+                    emit_webhook_queue_gauge(&agent_label, &queue).await;
+                }
+            }
+        }
+    })
+}
+
+/// Process a single dequeued webhook: acquire the lock, flush failed sends, run
+/// the agent loop (panic-isolated), and audit the dequeue.
+async fn drain_one_webhook(
+    state: &AppState,
+    agent_state: &Arc<AgentState>,
+    agent_label: &str,
+    item: QueuedWebhook,
+) {
+    let kind_label = item.kind.label();
+    let wait_ms = item.enqueued_at.elapsed().as_millis();
+
+    // Blocking acquire — serialises with any other lock holder; the prior turn
+    // should have released it by now. This is the exact primitive
+    // `replay_deferred_webhooks` uses.
+    let lock = agent_state.agent_lock.clone().lock_owned().await;
+
+    // Flush previously-failed sends (best-effort, non-blocking) — mirrors the
+    // legacy accepted path.
+    let flush_state = state.clone();
+    let flush_agent = agent_state.clone();
+    tokio::spawn(async move {
+        flush_failed_sends(&flush_state, &flush_agent).await;
+    });
+
+    let user_images: Vec<LlmImage> = item
+        .request
+        .images
+        .as_ref()
+        .map(|imgs| {
+            imgs.iter()
+                .map(|img| LlmImage {
+                    media_type: img.media_type.clone(),
+                    data: img.data.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Process in a child task so a panic never crashes the drain loop. The lock
+    // guard moves into the child and drops on completion (even on panic), so the
+    // next dequeue proceeds.
+    let st = state.clone();
+    let ag = agent_state.clone();
+    let request = item.request;
+    let processed_ok = match tokio::spawn(async move {
+        run_agent_for_message(&st, &ag, request, user_images, lock).await;
+    })
+    .await
+    {
+        Ok(()) => true,
+        Err(e) => {
+            error!(
+                agent = %agent_label,
+                error = %e,
+                event_kind = kind_label,
+                "webhook drain processing panicked; loop continues"
+            );
+            false
+        }
+    };
+
+    emit_webhook_queue_audit(
+        state,
+        agent_state,
+        agent_label,
+        "webhook_queue_dequeued",
+        &format!("event_kind={kind_label} wait_ms={wait_ms} processed_ok={processed_ok}"),
+        "drain worker processed a queued webhook",
+    )
+    .await;
+
+    if !processed_ok {
+        emit_webhook_queue_audit(
+            state,
+            agent_state,
+            agent_label,
+            "webhook_queue_processing_error",
+            &format!("event_kind={kind_label} error=panic retry_scheduled=false"),
+            "webhook processing panicked in the drain worker",
+        )
+        .await;
     }
 }
 
