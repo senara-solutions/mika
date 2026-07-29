@@ -63,7 +63,42 @@ prose must NOT match, and genuine intent phrasing MUST match. See the
 ## Note on the matcher engine
 
 Switching the matcher from substring `contains()` to word-boundary (`\b…\b`)
-matching is a larger structural change that would relax this rule — tracked
-separately. Until that lands, this keyword-set discipline is the only defense
+matching is a larger structural change that would relax this rule — tracked in
+**mika#1878**. Until that lands, this keyword-set discipline is the only defense
 against the collision class. Author keyword lists as if substring matching is
 permanent, because today it is.
+
+## Design decision: semantic intent-layer declined (mika#1651)
+
+A follow-up design pass (mika#1651, same architectural class as the mika#1575
+unsound-proxy ruling) asked whether a **new semantic intent-layer** should sit
+between keyword-match and the required-tools EndTurn gate — to distinguish "the
+user mentioned GitHub" from "the user wants me to do GitHub work." Three shapes
+were weighed: (A) an LLM intent classifier, (B) per-skill `intent_patterns`, and
+(C) message-structure heuristics.
+
+**Verdict: declined (mika-arch RATIFY, 2026-07-29).** The existing three-part
+defense — narrow multi-word keywords + this authoring discipline + the tracked
+word-boundary matcher swap — is the correct permanent shape. Reasoning:
+
+1. **Multi-word intent phrases already ARE the intent-layer.** A two-word phrase
+   requires both tokens adjacent, which *is* an intent signal at zero new
+   machinery. Shape B (`intent_patterns`) re-implements what the keyword
+   discipline above already prescribes — a second place to express the same
+   constraint (an Orthogonality/DRY violation; see `review-guide.md`).
+2. **A classifier in a deterministic gate is a category mismatch.** The
+   required-tools gate is a predictable, one-retry post-condition. Shape A injects
+   non-determinism and per-turn cost into a mechanism whose value *is* its
+   predictability. Its false-negative failure mode (gate silently fails to fire
+   when the user genuinely wanted a fetch → wrong-but-confident answer, no
+   correction signal) is worse than the current false-positive (one wasted
+   re-prompt).
+3. **The root cause is substring matching, and the fix is the matcher swap.** The
+   word-boundary (`\b…\b`) upgrade tracked in "Note on the matcher engine" above
+   (**mika#1878**) raises the precision floor for *every* skill at once,
+   structurally retiring the collision class — it subsumes most of what Shapes
+   A/B/C would buy.
+
+Do not re-litigate this by adding a per-skill intent DSL or an in-gate classifier.
+If the collision class resurfaces after per-skill tightening, the correct lever is
+the word-boundary matcher swap (mika#1878), not a new intent-layer.
