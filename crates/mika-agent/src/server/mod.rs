@@ -91,6 +91,11 @@ const AUTO_PULL_CRON: &str = "0 */10 * * * *";
 /// Default cron schedule for the curator review: daily at 03:00 UTC (mika#1584).
 const CURATOR_REVIEW_CRON: &str = "0 0 3 * * *";
 
+/// Cron schedule for the wip-rescue auto-resume scan: every 5 minutes (mika#1852).
+/// Low-priority (fond-de-file, AC7); the scan handles at most one draft per tick
+/// (concurrency cap = 1, AC6).
+const WIP_RESCUE_CRON: &str = "0 */5 * * * *";
+
 /// Build the Axum router with all routes and middleware.
 ///
 /// Shared between production `run_server` and test `test_app`.
@@ -1438,6 +1443,28 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                     "auto_pull_groomed",
                     AUTO_PULL_CRON,
                     r#"{"trigger":"auto_pull_groomed"}"#,
+                )
+                .await;
+            }
+        }
+
+        // Register wip-rescue auto-resume scan for mika-dev only (mika#1852).
+        // Same env-gated shape as auto_pull: MIKA_DEV_WIP_RESCUE=0 disables it.
+        if name == "mika-dev" {
+            if std::env::var("MIKA_DEV_WIP_RESCUE")
+                .map(|v| v == "0")
+                .unwrap_or(false)
+            {
+                info!(agent = %name, "wip_rescue disabled via MIKA_DEV_WIP_RESCUE=0");
+                if let Err(e) = db.cancel_recurring_task_by_label("wip_rescue").await {
+                    warn!(agent = %name, error = %e, "failed to cancel stale wip_rescue task");
+                }
+            } else {
+                task_engine::ensure_recurring_task(
+                    &db,
+                    "wip_rescue",
+                    WIP_RESCUE_CRON,
+                    r#"{"trigger":"wip_rescue"}"#,
                 )
                 .await;
             }
