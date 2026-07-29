@@ -3,7 +3,11 @@ name = "qa-review"
 description = "Quality gate for PR review — produces structured pass/hold/block verdicts for mika-dev"
 version = "0.9.0"
 always_on = true
-max_prompt_size = 57344
+# Raised from 57344 (56 KB) to 65536 (64 KB) for mika#1729: the Dependabot
+# DEP-REVIEW section (Prime's load-bearing distinct-from-CI signal) pushed the
+# prompt to ~58 KB. 64 KB stays well under the 80 KB ceiling and the 95% warn
+# gate (bundled_skills_approaching_max_prompt_size_warns).
+max_prompt_size = 65536
 dependencies = ["github", "build-mika"]
 
 [triggers]
