@@ -1735,7 +1735,26 @@ const GH_API_ALLOW_MATRIX: &[GhApiAllowEntry] = &[
         path_pattern: r"^/?repos/[^/]+/[^/]+/milestones/\d+$",
         rule: "write:milestone-update",
     },
+    // -- GitHub Advisory Database (mika#1729) --
+    // The independent, distinct-from-CI breaking-change / CVE signal mika-qa
+    // issues on Dependabot PRs (AC5). Global (not repo-scoped) advisory listing;
+    // query params (ecosystem, affects, severity, …) arrive as `-f`/`-F` flags or
+    // an in-path query string, both covered by the optional `(\?.*)?` suffix.
+    GhApiAllowEntry {
+        method: "GET",
+        path_pattern: ADVISORY_API_PATH_PATTERN,
+        rule: "read:advisories",
+    },
 ];
+
+/// GitHub Advisory Database REST path (mika#1729). Shared by the global
+/// `gh api` allow-matrix (`GH_API_ALLOW_MATRIX`) and qa-review's skill-scoped
+/// gate (`validate_qa_review_gh_scope`) so both enforce the identical surface.
+const ADVISORY_API_PATH_PATTERN: &str = r"^/?advisories(\?.*)?$";
+
+static ADVISORY_API_PATH_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(ADVISORY_API_PATH_PATTERN).expect("advisory api path regex")
+});
 
 struct CompiledGhApiAllowEntry {
     method: &'static str,
@@ -1978,11 +1997,30 @@ fn validate_qa_review_gh_scope(args: &[String], ctx: &ToolContext<'_>) -> Result
     {
         return Ok(());
     }
+    // `gh api` is permitted for qa-review ONLY for the GitHub Advisory Database
+    // query (mika#1729 AC5) — the independent, distinct-from-CI breaking-change
+    // signal on Dependabot PRs. Every other `gh api` path (branch/commit/
+    // milestone reads, milestone mutations) stays OUT of qa-review scope; the
+    // global allow-matrix (`validate_gh_api_scope`, runs next in `run_gh`)
+    // enforces the same advisory-only path a second time, defense-in-depth.
+    if subcommand == "api" {
+        let method = extract_api_method(args);
+        let path = extract_api_path(args);
+        if method.eq_ignore_ascii_case("GET") && ADVISORY_API_PATH_RE.is_match(path) {
+            return Ok(());
+        }
+        return Err(ToolOutput::error(format!(
+            "gh api {method} '{path}' is not in qa-review's scope. qa-review may call \
+             `gh api` ONLY for GET /advisories (the GitHub Advisory Database dep-review \
+             check, mika#1729). Source: builtin_handlers.rs::validate_qa_review_gh_scope."
+        )));
+    }
     Err(ToolOutput::error(format!(
         "gh subcommand '{subcommand} {verb}' is not in qa-review's scope. \
-         Permitted (qa-review): pr review, pr diff, pr list, issue view. \
+         Permitted (qa-review): pr review, pr diff, pr list, issue view, \
+         api (GET /advisories only). \
          Source: skills/bundled/qa-review/skill.toml (always_on=true) + \
-         builtin_handlers.rs::validate_qa_review_gh_scope (mika#1196)."
+         builtin_handlers.rs::validate_qa_review_gh_scope (mika#1196, mika#1729)."
     )))
 }
 
@@ -3489,6 +3527,33 @@ mod tests {
             validate_gh_api_scope(&args).unwrap(),
             Some("read:milestone")
         );
+    }
+
+    #[test]
+    fn test_gh_api_advisories_get_allowed() {
+        // mika#1729 AC5: GitHub Advisory Database query — both the in-path
+        // query-string form and the bare path (with `-f` query flags) resolve
+        // to the read:advisories rule.
+        assert_eq!(
+            validate_gh_api_scope(&str_args(&[
+                "api",
+                "/advisories?ecosystem=rust&affects=tokio"
+            ]))
+            .unwrap(),
+            Some("read:advisories")
+        );
+        assert_eq!(
+            validate_gh_api_scope(&str_args(&["api", "advisories", "-f", "ecosystem=rust"]))
+                .unwrap(),
+            Some("read:advisories")
+        );
+    }
+
+    #[test]
+    fn test_gh_api_advisories_write_rejected() {
+        // Advisory endpoint is GET-only in the matrix.
+        let args = str_args(&["api", "-X", "POST", "/advisories"]);
+        assert!(validate_gh_api_scope(&args).is_err());
     }
 
     #[test]
@@ -7118,6 +7183,64 @@ mod tests {
         ctx.active_skill_paths = &paths;
         let result = validate_qa_review_gh_scope(&str_args(&["issue", "view", "123"]), &ctx);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_qa_review_gh_scope_accepts_advisories_get() {
+        // mika#1729 AC5: the GitHub Advisory Database query is qa-review's sole
+        // permitted `gh api` path — both the in-path query-string form and the
+        // `-f` flag form must pass.
+        let harness = TestHarness::new();
+        let paths = qa_review_skill_paths();
+        let mut ctx = harness.ctx();
+        ctx.active_skill_paths = &paths;
+        assert!(
+            validate_qa_review_gh_scope(
+                &str_args(&["api", "/advisories?ecosystem=rust&affects=tokio"]),
+                &ctx
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_qa_review_gh_scope(
+                &str_args(&[
+                    "api",
+                    "advisories",
+                    "-f",
+                    "ecosystem=rust",
+                    "-f",
+                    "affects=tokio"
+                ]),
+                &ctx
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_qa_review_gh_scope_rejects_non_advisory_api() {
+        // qa-review's `gh api` allowance is advisory-only — a branch/commit read
+        // (permitted for other agents by the global matrix) is still out of scope.
+        let harness = TestHarness::new();
+        let paths = qa_review_skill_paths();
+        let mut ctx = harness.ctx();
+        ctx.active_skill_paths = &paths;
+        let result =
+            validate_qa_review_gh_scope(&str_args(&["api", "/repos/o/r/branches/main"]), &ctx);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().content.contains("advisories"));
+    }
+
+    #[test]
+    fn test_validate_qa_review_gh_scope_rejects_advisory_write() {
+        // Advisory scope is GET-only: a non-GET method to /advisories is rejected.
+        let harness = TestHarness::new();
+        let paths = qa_review_skill_paths();
+        let mut ctx = harness.ctx();
+        ctx.active_skill_paths = &paths;
+        let result =
+            validate_qa_review_gh_scope(&str_args(&["api", "-X", "POST", "/advisories"]), &ctx);
+        assert!(result.is_err());
     }
 
     #[test]

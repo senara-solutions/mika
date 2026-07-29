@@ -215,7 +215,13 @@ pub async fn try_handle_pr_review_verdict(
                 )
                 .await
             }
-            "security" | "pipeline" => {
+            // block[dependency] (mika#1729): a Dependabot PR whose changelog or
+            // GitHub Advisory Database query surfaced a confirmed breaking change
+            // or open advisory. Mirrors block[security]/block[pipeline] semantics:
+            // mark the task blocked, notify the operator, NO auto-dispatch and NO
+            // auto-merge. Human-gated — the whole point of Prime's teeth is that a
+            // breaking-change dep does not launder through to an approve+merge.
+            "security" | "pipeline" | "dependency" => {
                 handle_escalate(&event, db, &reason, message_sender, session_id, trace_id).await
             }
             _ => {
