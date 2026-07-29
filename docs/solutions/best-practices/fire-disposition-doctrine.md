@@ -15,7 +15,7 @@ When a dispatch plan includes a detector-class deliverable (test, assertion, lin
 
 ## Founding incident
 
-mika#1326 → mika#1569 → mika#1573: AC2's `verify_bundled_skills` invariant test caught a benign cross-skill `gh_read` collision on existing bundled-skill data. The scope-bind said "additions-only, don't mutate existing dispatch paths" but did not name the fire-disposition for when the detector caught existing violations. The pilot's strict interpretation produced a failing test.
+mika#1326 → mika#1569 → mika#1573: the `verify-bundled-skills` invariant check (mika#1575, the pre-merge structural counterpart to mika#1326 AC2; binary `verify-bundled-skills`, source `crates/mika-agent/src/bin/verify_bundled_skills.rs`) caught a benign cross-skill `gh_read` collision on existing bundled-skill data. The scope-bind said "additions-only, don't mutate existing dispatch paths" but did not name the fire-disposition for when the detector caught existing violations. The pilot's strict interpretation produced a failing test.
 
 ## Doctrine
 

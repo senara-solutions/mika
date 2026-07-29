@@ -74,7 +74,7 @@ The downstream qa-review gate hard-`block[pipeline]`s any plan that reaches it w
 
 **A plan that includes detector-class deliverables (test, assertion, lint, invariant, validation) without a `## Fire-Disposition` section MUST return `ITERATE` — never `READY`.**
 
-Detector-class deliverables are those whose primary purpose is to detect and report violations of an invariant. They include but are not limited to: unit/integration tests, assertion macros, lint rules, CI gate scripts, schema validators, structural checks (like `verify_bundled_skills`), EndTurn guards, and any code whose success path is "no violations found."
+Detector-class deliverables are those whose primary purpose is to detect and report violations of an invariant. They include but are not limited to: unit/integration tests, assertion macros, lint rules, CI gate scripts, schema validators, structural checks (like the `verify-bundled-skills` bundled-skill invariant binary, mika#1575), EndTurn guards, and any code whose success path is "no violations found."
 
 When a plan includes one or more detector-class deliverables, the `## Fire-Disposition` section must specify what the implementation does when the detector fires on **existing** data (pre-existing violations, not the new code being added). Three canonical options:
 
