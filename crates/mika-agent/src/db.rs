@@ -15375,21 +15375,22 @@ mod tests {
     fn test_get_or_create_canonical_session_is_idempotent() {
         // mika#1401: repeated calls reuse the same row (INSERT OR IGNORE), so every
         // `mika ask` to a singleton agent lands on one canonical session.
+        // Uses the test DB's registered agent ("mika") to satisfy the sessions FK.
         let db = db();
-        let id = "canonical-mika-prime";
+        let id = "canonical-mika";
         let r1 = db
-            .get_or_create_canonical_session(id, "mika-prime", "cli")
+            .get_or_create_canonical_session(id, "mika", "cli")
             .unwrap();
         assert_eq!(r1, id);
         // Write a message to the canonical session.
-        db.save_message("mika-prime", id, "user", "first ask", None)
+        db.save_message("mika", id, "user", "first ask", None)
             .unwrap();
         // Second invocation must not fail on duplicate PK and must not clobber.
         let r2 = db
-            .get_or_create_canonical_session(id, "mika-prime", "cli")
+            .get_or_create_canonical_session(id, "mika", "cli")
             .unwrap();
         assert_eq!(r2, id);
-        db.save_message("mika-prime", id, "user", "second ask", None)
+        db.save_message("mika", id, "user", "second ask", None)
             .unwrap();
 
         // Exactly one session row exists, accumulating both messages.
@@ -15417,8 +15418,8 @@ mod tests {
     fn test_end_session_unless_canonical_noops_on_canonical() {
         // mika#1401: the canonical session must never be ended (pruning-safe).
         let db = db();
-        let id = "canonical-mika-prime";
-        db.get_or_create_canonical_session(id, "mika-prime", "cli")
+        let id = "canonical-mika";
+        db.get_or_create_canonical_session(id, "mika", "cli")
             .unwrap();
         // Attempt to end it while passing itself as the canonical id → no-op.
         db.end_session_unless_canonical(id, Some(id)).unwrap();
@@ -15469,8 +15470,8 @@ mod tests {
         // mika#1401 + D5: the `canonical-` prefix is not in prune_old_sessions's
         // LIKE list, so even an (erroneously) ended canonical session survives.
         let db = db();
-        let id = "canonical-mika-prime";
-        db.get_or_create_canonical_session(id, "mika-prime", "cli")
+        let id = "canonical-mika";
+        db.get_or_create_canonical_session(id, "mika", "cli")
             .unwrap();
         // Force-end and backdate to simulate a worst-case stale row.
         db.end_session(id).unwrap();
