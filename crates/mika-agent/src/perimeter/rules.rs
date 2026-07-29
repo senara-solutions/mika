@@ -20,6 +20,10 @@
 //!   `docs/gate/**` — those are gated)
 //! - repo-root scaffolding config (`.gitignore`/`.gitattributes`/`.editorconfig`)
 //!   via exact-match (root-only); nested copies stay DECISION-CORE (mika#1864)
+//! - repo-root dependency manifests (`Cargo.toml`/`Cargo.lock` for mika,
+//!   `pyproject.toml`/`uv.lock` for claude-pilot) via exact-match (root-only) —
+//!   Dependabot-managed, diff-visible, never engine-runtime authority (mika#1729);
+//!   nested member-crate manifests stay DECISION-CORE
 //!
 //! ## What is explicitly DECISION-CORE (grep-anchored)
 //!
@@ -136,6 +140,21 @@ const MECHANICAL_EXACT: &[&str] = &[
     "pyproject.toml", // cpp deps (Dependabot-managed; visible in diff)
     "uv.lock",        // cpp dep lock (regenerated from pyproject.toml)
     "LICENSE",        // license file (both repos have one; universally safe)
+    // --- mika (senara-solutions/mika) root dependency manifests (mika#1729) ---
+    // Rust equivalents of cpp's pyproject.toml / uv.lock above: Dependabot-managed,
+    // fully visible in the diff, and consumed by cargo — not by the engine at
+    // runtime. Exact-match (root-only) BY DESIGN so the autonomous Dependabot
+    // review chain (Dependabot → mika-qa approve → mika-dev merge, mika#1729 AC4)
+    // clears the forge-gate for a workspace-root dependency bump. A NEW dependency
+    // (vs a version bump) is still surfaced by qa-review's diff pass + CI build,
+    // and the AC5 DEP-REVIEW advisory/changelog check runs regardless. NESTED
+    // member-crate manifests (e.g. `crates/mika-agent/Cargo.toml`) deliberately
+    // stay DECISION-CORE: a prefix/suffix rule here would open an auto-merge
+    // bypass for decision-core PRs. Grouped `[workspace.dependencies]` bumps —
+    // the common Dependabot shape on this workspace — touch only the two paths
+    // below plus (optionally) member manifests, which then route to the operator.
+    "Cargo.toml", // workspace root manifest ([workspace.dependencies] lives here)
+    "Cargo.lock", // workspace lockfile (regenerated from Cargo.toml)
     // --- Repo-root scaffolding config (mika#1864) ---
     // Pure config/scaffolding with zero decision-core semantics. EXACT-match
     // (root-only) BY DESIGN: `is_mechanical` checks `MECHANICAL_EXACT.contains(&path)`,

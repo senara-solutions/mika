@@ -397,6 +397,114 @@ async fn verdict_block_security_escalates() -> Result<()> {
 }
 
 // -------------------------------------------------------------------------
+// Test: block[dependency] -> Handled with escalation (mika#1729)
+// -------------------------------------------------------------------------
+
+#[tokio::test]
+async fn verdict_block_dependency_escalates() -> Result<()> {
+    let db = test_db().await;
+    let pr_url = "https://github.com/senara-solutions/mika/pull/42";
+    let task_id = create_task_with_pr_url(&db, pr_url).await;
+
+    let text = pr_review_text(
+        "commented",
+        "senara-solutions/mika",
+        42,
+        "mika-qa",
+        "VERDICT: block[dependency]\nREASON: tokio 1.40→1.41 changelog lists a \
+         breaking change to the runtime shutdown API.",
+    );
+
+    let action = try_handle_pr_review_verdict(
+        &text,
+        &db,
+        Some("fake-token"),
+        None,
+        SESSION_ID,
+        "trace-1",
+        &test_skills(),
+    )
+    .await;
+
+    match action {
+        VerdictAction::Dispatched { .. } => {
+            unreachable!("block[dependency] must never auto-dispatch")
+        }
+        VerdictAction::Handled { pre_digest } => {
+            assert!(
+                pre_digest.contains("block[dependency]"),
+                "pre-digest should mention block[dependency]"
+            );
+            assert!(
+                pre_digest.contains("Do NOT dispatch"),
+                "must not dispatch for a breaking-change dependency"
+            );
+            assert!(
+                pre_digest.contains("operator review"),
+                "block[dependency] should require operator review"
+            );
+        }
+        VerdictAction::Passthrough { .. } => {
+            panic!("block[dependency] should be handled structurally");
+        }
+    }
+
+    // Verify task was marked blocked (mirrors block[security] escalation).
+    let task = db
+        .get_task(&task_id)
+        .await
+        .expect("get task")
+        .expect("task should exist");
+    assert_eq!(
+        task.status, "blocked",
+        "task should be blocked for a breaking-change dependency escalation"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn verdict_block_dependency_no_task_passes_through() -> Result<()> {
+    // A Dependabot PR has no correlated mika task (never dispatched by mika-dev).
+    // block[dependency] on a task-less PR must pass through to the LLM
+    // (self-dev-webhook-qa), which routes it to the operator — it must NOT panic
+    // or silently drop the breaking-change signal.
+    let db = test_db().await;
+
+    let text = pr_review_text(
+        "commented",
+        "senara-solutions/mika",
+        77,
+        "mika-qa",
+        "VERDICT: block[dependency]\nREASON: open advisory GHSA-xxxx in the bumped range.",
+    );
+
+    let action = try_handle_pr_review_verdict(
+        &text,
+        &db,
+        Some("fake-token"),
+        None,
+        SESSION_ID,
+        "trace-1",
+        &test_skills(),
+    )
+    .await;
+
+    match action {
+        VerdictAction::Passthrough { enrichment } => {
+            let enrichment = enrichment.expect("task-less escalate should enrich");
+            assert!(
+                enrichment.contains("block[dependency]"),
+                "enrichment should name the block[dependency] verdict"
+            );
+        }
+        other => panic!("task-less block[dependency] should pass through, got {other:?}"),
+    }
+
+    Ok(())
+}
+
+// -------------------------------------------------------------------------
 // Test: block[pipeline] -> Handled with escalation (#889 R4)
 // -------------------------------------------------------------------------
 

@@ -1771,6 +1771,29 @@ mod tests {
     }
 
     #[test]
+    fn test_route_event_pr_review_is_author_independent() {
+        // mika#1729 (R3/AC3): the mika-qa review trigger is gateway routing, NOT
+        // per-repo GitHub Actions workflows. `route_event` keys ONLY on
+        // (event_type, action) — it never consults the PR author. This pins that
+        // author-independence so `dependabot[bot]`-authored PRs route to mika-qa
+        // identically to agent-authored PRs on all INTERNAL_REPOS. The author gate
+        // that DOES exist (`is_suppressed_review_request`) is scoped to the
+        // `review_requested` action only and is tested separately below.
+        //
+        // A regression that added an author filter to `route_event` (e.g. to
+        // suppress bot PRs) would break the Dependabot autonomous review chain;
+        // this test is the tripwire.
+        for action in ["opened", "synchronize", "ready_for_review"] {
+            assert_eq!(
+                route_event("pull_request", Some(action), None),
+                Some("mika-qa"),
+                "pull_request.{action} must route to mika-qa regardless of author \
+                 (dependabot[bot] included)"
+            );
+        }
+    }
+
+    #[test]
     fn test_route_event_pr_closed() {
         assert_eq!(
             route_event("pull_request", Some("closed"), None),
