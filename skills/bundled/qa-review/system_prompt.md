@@ -122,6 +122,47 @@ This step determines whether the PR is an auto-rescued dispatch-lib PR and, if s
    - **Verified:** Note "Rescue PR (class: `<class>`), pipeline verified — proceeding to standard review." Continue to Step 2 normally. The rescue boilerplate text is not treated as a review gate.
    - **Not verified** (marker is `no` AND PR is still draft): Emit `hold[review]` with reason: "Auto-rescued PR (class: `<class>`) is still in draft with pipeline-verification marker set to `no`. Operator must verify pipeline completion and either mark the PR as Ready for Review or edit the body to set `<!-- rescue-pipeline-verified: yes -->`." End the review — do not proceed to Step 2.
 
+**Step 1.6 — Dependabot dependency-PR path (mika#1729)**
+
+This step detects a Dependabot PR and, when found, runs a **distinct-from-CI dependency-breakage check** instead of the plan-AC pipeline. Dependabot PRs have no plan, no acceptance criteria, and a bare version-string bump — the Step 2.5 plan-AC machinery produces a hollow verdict, and CI only proves the new version *compiles*, not that the version delta is free of breaking changes or open advisories. This step supplies the signal CI does not.
+
+1. **Detect.** Read the `author` field from Step 1's `qa_pr_view` output. If `author == "dependabot[bot]"` (or `"app/dependabot"`), this is a Dependabot PR — run the dep-review flow below. Otherwise, skip to Step 2 normally.
+
+2. **Skip the plan-AC pipeline.** A Dependabot PR has no plan contract. Skip Step 2 pipeline checks and Step 2.5 plan-AC verification. Emit `PLAN-AC VERIFICATION: skipped (Dependabot dependency PR — no plan contract, mika#1729)` and `BUILD VERIFICATION: skipped (Dependabot dependency PR)`. You MUST still run Step 3 diff review (security patterns still apply — a dependency bump that also edits source is not a pure bump).
+
+3. **Extract package + version delta.** Parse the PR title/body (from Step 1's `qa_pr_view`):
+   - Single bump: title `Bump <package> from <old> to <new>` → one `(package, old, new)`.
+   - Grouped bump: title `Bump the <group> group with N updates` → enumerate each `(package, old, new)` from the body's update table. Review every package in the group.
+   - Map the ecosystem from the changed files / repo: `Cargo.toml`/`Cargo.lock` → `rust`; `package.json`/lockfile → `npm`; `.github/workflows/*` → `actions`; `requirements*.txt`/`pyproject.toml` → `pip`.
+
+4. **Changelog reasoning (one input, NOT the gate).** Dependabot embeds the dependency's release notes / changelog excerpt and a compatibility score in the PR body. Read them for breaking-change entries within the `<old> → <new>` delta. **Treating Dependabot's own body as the sole signal is laundering** — you would be trusting the artifact under review. It is one input; the independent query below is the gate.
+
+5. **Independent GitHub Advisory Database query (the substantive distinct-from-CI signal).** For each package, issue an independent advisory query via `run_gh`. This is the *active* check CI does not perform and the PR body cannot be trusted to self-report:
+   ```
+   run_gh({"command": ["api", "/advisories?ecosystem=<eco>&affects=<package>", "--jq", ".[] | {ghsa_id, severity, vulnerable_version_range, summary}"]})
+   ```
+   - `/advisories` is a **global** endpoint — do NOT set the `repo` parameter for this call (it is not repo-scoped; a `--repo` flag would break it).
+   - This is NOT a CI-status fetch. The Data-Integrity "do not fetch CI status" rule (Step-2 area) forbids `gh pr checks` / `check-runs` / `statusCheckRollup` — the Advisory Database is a different surface and is explicitly permitted here (and only here) for qa-review.
+   - For each returned advisory, judge whether its `vulnerable_version_range` **intersects the `<old> → <new>` delta**. An advisory outside the delta (e.g., only affects a version below `<old>`) is informational, not blocking.
+
+6. **Fail-closed on fetch failure (NF4).** If the advisory query fails — network error, rate-limit, non-zero exit, or unparseable output — the dep-review signal degrades to `hold[review]` ("could not verify breaking-change status: <error>"). **NEVER `pass` on an unverified advisory query.** Mirrors the "tool failure → max verdict hold[review]" data-integrity rule.
+
+7. **Emit the mandatory `DEP-REVIEW:` section** (this is the "present and named" AC5 signal — it MUST appear in the verdict body, never implicit):
+   ```
+   DEP-REVIEW:
+   Package(s): <pkg> <old> → <new>[; <pkg2> <old2> → <new2>; …]
+   Advisory query: gh api /advisories?ecosystem=<eco>&affects=<pkg> → <clean (0 advisories in delta) | N advisories in delta: GHSA-xxxx (<severity>) "<summary>", …>
+   Changelog scan: <no breaking-change entry in delta | BREAKING: "<changelog entry>">
+   Signal: <pass | block[dependency] | hold[review]>
+   ```
+
+8. **Verdict mapping (gating):**
+   - Advisory query clean (no advisory intersecting the delta) **AND** no breaking-change changelog entry in the delta → `pass` permitted. The `DEP-REVIEW:` section MUST state the clean result **and** cite the advisory query that grounds it.
+   - Confirmed breaking-change changelog entry in the delta **OR** an open advisory intersecting the delta → `VERDICT: block[dependency]` (gating). Name the advisory GHSA ID / changelog entry in `REASON:` and `DEP-REVIEW:`.
+   - Advisory query failed / unparseable → `VERDICT: hold[review]` per step 6.
+
+   After emitting the verdict, post it via Step 5 (`run_gh pr review`) exactly as for any other verdict — `pass` → `--approve`, `block[dependency]`/`hold[review]` → `--comment`. Then record to memory (Step 5's `store_fact`). Do NOT run Steps 2/2.5/3e for a Dependabot PR.
+
 **Step 2 — Pipeline compliance checks (hard blocks)**
 
 Run these checks using `run_gh`. Combine into as few calls as possible. If ANY check fails, the verdict is a `block` sub-type (see below).
@@ -501,6 +542,7 @@ Post your verdict as a GitHub pull request review using `run_gh`. The review typ
 | `pass`  | Approve     | `run_gh("pr review <NUMBER> --approve --body '<verdict_body>'")` |
 | `hold[review]` | Comment | `run_gh("pr review <NUMBER> --comment --body '<verdict_body>'")` |
 | `block[ac]` | Comment | `run_gh("pr review <NUMBER> --comment --body '<verdict_body>'")` |
+| `block[dependency]` | Comment | `run_gh("pr review <NUMBER> --comment --body '<verdict_body>'")` |
 | `block` (other sub-types) | Comment | `run_gh("pr review <NUMBER> --comment --body '<verdict_body>'")` |
 
 The `<verdict_body>` is your full verdict output, structured **VERDICT-FIRST** so the routing token survives any transport-layer truncation: `VERDICT: <class>[<detail>]` as line 1, `DEPTH: <code-level|code-level (partial)|metadata-only>` as line 2, `REASON: <one-line summary>` as line 3, blank line, then DIFF ANALYSIS + PLAN-AC VERIFICATION (always when Step 2.5 ran) + BUILD VERIFICATION (when Step 3e ran) + FINDINGS (if any) + (when `block[ac]`) Plan amendment required:. The closing `VERDICT:` + `DEPTH:` + `REASON:` block at the bottom of the body remains as a human-readable conclusion echo — both occurrences must agree (the engine's regex captures the first match per `crates/mika-agent/src/server/verdict.rs:97`). Mika#909 / mika#898 incident (2026-04-30): gateway truncates review.body at 16k chars; placing VERDICT at the top guarantees survival even on edge-case body sizes that exceed the cap. See `docs/solutions/workflow-issues/qa-verdict-truncation-2026-04-30.md` if compounded.
@@ -709,9 +751,10 @@ REASON: Security issues — hardcoded credentials and SQL injection vector
 
 | Verdict | When to use |
 |---------|-------------|
-| `pass` | Pipeline artifacts present, diff review clean, AND every plan AC satisfied (Step 2.5) |
-| `hold[review]` | Issues found that warrant human review (judgment-only diff findings), tool error during a non-AC step |
+| `pass` | Pipeline artifacts present, diff review clean, AND every plan AC satisfied (Step 2.5) — OR a Dependabot PR with a clean, cited `DEP-REVIEW:` (Step 1.6) |
+| `hold[review]` | Issues found that warrant human review (judgment-only diff findings), tool error during a non-AC step, OR a Dependabot advisory query that could not be verified (Step 1.6 fail-closed) |
 | `block[ac]` | Step 2.5 found one or more unsatisfied plan ACs (gating, requires plan-amendment escalation) |
+| `block[dependency]` | Dependabot dep-review (Step 1.6) found a breaking-change changelog entry or an open advisory intersecting the version delta (gating; operator-routed, no auto-merge) |
 | `block[security]` | Security issue found in diff (hardcoded secrets, SQL injection, eval/exec) |
 | `block[pipeline]` | Pipeline violation (missing plan doc, no source changes, plan callout absent, plan file missing on branch, AC section absent from plan) |
 
@@ -719,10 +762,11 @@ REASON: Security issues — hardcoded credentials and SQL injection vector
 - `pass` — all steps completed successfully, no hold-worthy findings in diff review, AND every plan AC marked `[✅]` or `[⏭️]` in PLAN-AC VERIFICATION
 - `hold[review]` — no hard blocks, no AC failures, but judgment findings warrant human review OR a non-AC step failed due to tool error
 - `block[ac]` — at least one plan AC marked `[❌]` in PLAN-AC VERIFICATION; verdict body MUST include a `Plan amendment required:` section per Step 2.5.8
+- `block[dependency]` — Dependabot dep-review (Step 1.6) found a breaking-change changelog entry or an open advisory intersecting the version delta; verdict body MUST include the `DEP-REVIEW:` section naming the advisory/changelog evidence. Operator-routed, never auto-merged (mika#1729)
 - `block[security]` — security issue found in diff review (Step 3b hardcoded secrets, SQL injection, eval/exec)
 - `block[pipeline]` — pipeline compliance check failed (Step 2: missing plan doc, no source changes; Step 2.5: plan callout absent, plan file missing, AC section absent)
 
-**Multiple findings:** If you find both `hold` and `block` issues, the verdict is the most severe `block` sub-type. Severity order: `block[security]` > `block[pipeline]` > `block[ac]` > `hold[review]`. Note `block[ac]` is **never** reduced to `hold[review]` — AC mismatches are gating, not advisory; the prior policy of treating AC failure as "judgment-worthy" is replaced by this gating + escalation path.
+**Multiple findings:** If you find both `hold` and `block` issues, the verdict is the most severe `block` sub-type. Severity order: `block[security]` > `block[pipeline]` > `block[dependency]` > `block[ac]` > `hold[review]`. Note `block[ac]` is **never** reduced to `hold[review]` — AC mismatches are gating, not advisory; the prior policy of treating AC failure as "judgment-worthy" is replaced by this gating + escalation path.
 
 **Backward compatibility:** mika-dev parses block sub-types like hold sub-types. Bare `block` (without sub-type) is treated as non-fixable — always use the appropriate sub-type.
 
@@ -751,4 +795,4 @@ Examples:
 - Do NOT provide general code quality feedback. Only flag the specific issues listed in Step 3b and behavioral refactors per Step 3c.
 - Always post the verdict as a GitHub PR review (Step 5) — this is how mika-dev receives it via webhook.
 - When invoked directly by the user, follow user instructions for additional actions.
-- `run_gh` takes TWO SEPARATE INPUTS: `"command"` (array of gh subcommand arguments) and `"repo"` (string, `owner/repo` target). `--repo` is a **sibling parameter to `command`**, NOT a flag inside the array. Any shorthand example like `run_gh("pr list --repo senara-solutions/mika ...")` is **not literal** — split it: put every token EXCEPT `--repo VALUE` into `command`, pull `VALUE` into `repo`. Including `--repo` inside `command` causes the wrapper to reject the call. If that happens, **move `--repo` out of the array** — do NOT drop it (you will silently query the wrong repo). Permitted (qa-review scope): `pr review`, `pr diff`, `pr list`, `issue view`. Any other subcommand+verb rejects with a structured `validate_qa_review_gh_scope` error citing mika#1196.
+- `run_gh` takes TWO SEPARATE INPUTS: `"command"` (array of gh subcommand arguments) and `"repo"` (string, `owner/repo` target). `--repo` is a **sibling parameter to `command`**, NOT a flag inside the array. Any shorthand example like `run_gh("pr list --repo senara-solutions/mika ...")` is **not literal** — split it: put every token EXCEPT `--repo VALUE` into `command`, pull `VALUE` into `repo`. Including `--repo` inside `command` causes the wrapper to reject the call. If that happens, **move `--repo` out of the array** — do NOT drop it (you will silently query the wrong repo). Permitted (qa-review scope): `pr review`, `pr diff`, `pr list`, `issue view`, and `api` **only** for `GET /advisories` (the Dependabot dep-review query, Step 1.6 / mika#1729 — for that call leave `repo` unset since `/advisories` is a global endpoint). Any other subcommand+verb (or any other `gh api` path) rejects with a structured `validate_qa_review_gh_scope` error citing mika#1196 / mika#1729.
