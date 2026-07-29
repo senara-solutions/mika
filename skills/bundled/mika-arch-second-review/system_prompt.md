@@ -69,6 +69,19 @@ This is the structural guarantee: `GROOMED` cannot be emitted without the sectio
 
 **Gate precedence:** any `ESCALATE` from this gate or the Unresolved-Decision Gate wins over `GROOMED` — emit the union of all F-findings under the `ESCALATE` verdict.
 
+### Fire-Disposition Gate (mika#1574)
+
+**A revised plan that includes detector-class deliverables without a `## Fire-Disposition` section MUST return `ESCALATE` — never `GROOMED`.** (No ITERATE exists at second pass per the two-pass limit.)
+
+Detector-class deliverables: tests, assertions, lints, invariants, validations — any deliverable whose primary purpose is detecting violations. The section must name one of three canonical options (named allowlist, land disabled, halt-and-surface) with enough detail for the implementer to act without further scoping.
+
+**Decision tree:**
+1. Detector deliverables present + non-empty `## Fire-Disposition` section ⇒ gate passes.
+2. Detector deliverables present + section missing or empty ⇒ `ESCALATE` with a BLOCKING F-finding.
+3. No detector deliverables ⇒ gate is N/A.
+
+**Gate precedence:** any `ESCALATE` from this gate or the other gates wins over `GROOMED` — emit the union of all F-findings under the `ESCALATE` verdict.
+
 ### Output
 
 Return the annotated revised plan content as a single string, followed by a blank line and an explicit verdict:

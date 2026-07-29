@@ -70,6 +70,25 @@ The downstream qa-review gate hard-`block[pipeline]`s any plan that reaches it w
 
 **Read-only reminder:** you flag the gap; you do not write the section. Injection is performed by the groomer session acting on this `ITERATE` finding during its existing revise-and-resubmit step — the identical mechanism already used for Unresolved-Decision-Gate findings.
 
+### Fire-Disposition Gate (mika#1574)
+
+**A plan that includes detector-class deliverables (test, assertion, lint, invariant, validation) without a `## Fire-Disposition` section MUST return `ITERATE` — never `READY`.**
+
+Detector-class deliverables are those whose primary purpose is to detect and report violations of an invariant. They include but are not limited to: unit/integration tests, assertion macros, lint rules, CI gate scripts, schema validators, structural checks (like `verify_bundled_skills`), EndTurn guards, and any code whose success path is "no violations found."
+
+When a plan includes one or more detector-class deliverables, the `## Fire-Disposition` section must specify what the implementation does when the detector fires on **existing** data (pre-existing violations, not the new code being added). Three canonical options:
+
+- **(a) Named allowlist exception** (default) — the detector enforces for new cases, with a grep-visible named exception for each existing violation. Each exception must: (1) name the specific data triggering it, (2) reference a follow-up tracker issue, (3) include a self-cleaning assertion that fails when the exception becomes stale (the follow-up resolved the underlying violation).
+- **(b) Land disabled** — the detector lands with `#[ignore]`, `#[cfg(skip)]`, or equivalent, plus a tracked follow-up to enable it. Use only when the existing violation is itself dangerous to leave un-flagged.
+- **(c) Halt-and-surface** — the implementation stops and surfaces to the operator for scoping. Use only when the existing violation's resolution is itself the scope-decision.
+
+**Decision tree:**
+1. Plan has detector-class deliverables AND a non-empty `## Fire-Disposition` section naming one of the three options with sufficient implementation detail ⇒ gate passes.
+2. Plan has detector-class deliverables AND the section is missing or empty ⇒ return `ITERATE` with a BLOCKING F-finding naming the detected deliverables and requesting the section.
+3. Plan has no detector-class deliverables ⇒ gate is N/A (does not influence disposition).
+
+**Gate precedence:** when this gate, the Unresolved-Decision Gate, and the Acceptance-Criteria Gate demand different dispositions on the same plan, take the most-blocking disposition (`ESCALATE` > `ITERATE` > `READY`) and emit the union of all F-findings under it.
+
 ### Output
 
 Return the annotated plan content as a single string, followed by a blank line and an explicit disposition:
