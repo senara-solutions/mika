@@ -161,6 +161,16 @@ jobs:
       - name: Reject tokio::select! inside run_loop (mika#848)
         run: bash scripts/check-loop-select.sh
 
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          fetch-depth: 0
+      - name: Scan changed files for secrets and oversized blobs (mika#1689)
+        run: bash scripts/check-secrets.sh --changed origin/main
+
   pipeline-artifacts:
     name: Pipeline Artifacts
     runs-on: ubuntu-22.04
