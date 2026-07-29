@@ -15,7 +15,7 @@ When you receive a GitHub webhook event for `pull_request_review.submitted`:
 The message contains the review body, PR URL, repo, and reviewer. mika-qa posts structured verdicts as PR reviews.
 
 1. **Parse the verdict** from the review body:
-   - Find the line starting with `VERDICT:` — extract the token (e.g., `pass`, `hold[review]`, `block[ci]`, `block[ac]`, `block[security]`, `block[pipeline]`).
+   - Find the line starting with `VERDICT:` — extract the token (e.g., `pass`, `hold[review]`, `block[ci]`, `block[ac]`, `block[dependency]`, `block[security]`, `block[pipeline]`).
    - `block[ac]` is a distinct, non-auto-retryable verdict class introduced when plan-AC verification is gating. Route it through the dedicated `block[ac]` branch in Step 3 — do NOT collapse it into `block[ci]` (auto-retry, semantically wrong) or treat it as `hold[review]` (advisory, semantically wrong).
    - If no `VERDICT:` line found: treat as informational comment, no action needed
 2. **Extract PR coordinates** from the PR URL in the message:
@@ -28,6 +28,8 @@ The message contains the review body, PR URL, repo, and reviewer. mika-qa posts 
    > **ZERO-NARRATION RULE: On a `pass` verdict, your FIRST output MUST be a `pr_merge_with_gate` tool call. No text, no explanation, no questions, no status checks before the tool call. Narration before action is a workflow failure. Evidence → Action.**
 
    > **CRITICAL: You MUST call `pr_merge_with_gate`, then act on its response. A text-only response with 0 tool calls is a workflow failure.** All tools listed in WEBHOOK TOOL LIMITATIONS above are available.
+
+   > **Task-less Dependabot PRs (mika#1729).** A Dependabot PR carries no mika task — mika-dev never dispatched it — yet it merges through this same `pass` path. `pr_merge_with_gate` is the hard gate: it enforces the forge-gate perimeter (a Dependabot dependency-manifest bump is MECHANICAL and clears; a bump that also touches a DECISION-CORE zone is held for the operator by the engine before this turn), the required-CI checks, and behind-main — all author-independent. Step 4 correlation finding **no task is expected** for a Dependabot PR; skip task updates per Step 4's no-task rule (the merge already succeeded). **Least-author-surface (NF2):** the task-less autonomous-merge path is intended for `dependabot[bot]` only. If Step 4 finds no correlated task AND the PR author (from the merge response, or `run_gh(["pr","view",<number>,"--json","author"], repo)`) is NOT `dependabot[bot]`/`app/dependabot`, add a heads-up to your Vincent notification — a task-less non-bot PR merging autonomously is unexpected and warrants a look.
 
    1. Call `pr_merge_with_gate({"pr_number": <number>, "repo": "<owner/repo>"})` — use the coordinates from Step 2.
    2. Branch on the `action` field in the response:
@@ -139,6 +141,15 @@ The message contains the review body, PR URL, repo, and reviewer. mika-qa posts 
       Auto-retry inappropriate — this is a plan-vs-implementation conflict, not a transient failure. Resolution requires plan amendment OR AC rewording. {PR URL}
       ```
    6. Proceed to Step 5 with `blocked`. Do NOT call `run_claude_pilot`. Do NOT increment `qa_retry_count` or `ci_fix_count`.
+
+   **block[dependency]** — Dependency breakage / open advisory (mika#1729), NOT auto-retryable:
+
+   `block[dependency]` means mika-qa's dep-review (its Step 1.6) found a confirmed breaking-change changelog entry or an open GitHub Advisory intersecting the bumped version delta. This is the substance behind Prime's teeth: a breaking-change dependency must NOT launder through to an approve+merge. It is not transient — auto-retry (via `run_claude_pilot`) is semantically wrong; resolution requires a human decision (accept the risk, pin a safe version, or wait for a fixed release).
+   - Correlate to task (Step 4). A Dependabot PR is typically task-less — if no task is found, skip task updates and notify regardless.
+   - Extract the `DEP-REVIEW:` section from the review body (package, version delta, advisory GHSA IDs / changelog entry).
+   - Notify Vincent via `send_message`: "{repo}#{number} BLOCKED [block[dependency]]: {package} {old}→{new} — {advisory/changelog summary}. Not auto-mergeable; manual decision needed (accept / pin / wait for fix). {PR URL}"
+   - Do NOT call `pr_merge_with_gate`. Do NOT call `run_claude_pilot`. Do NOT increment any retry counter.
+   - Proceed to Step 5 with `blocked` (if a task was correlated).
 
    **block[security]**, **block[pipeline]**, **block** (bare) — Non-fixable:
    - Correlate to task (Step 4).
