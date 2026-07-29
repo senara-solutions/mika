@@ -1121,7 +1121,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (44);
+            INSERT INTO schema_version (version) VALUES (45);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -1770,6 +1770,28 @@ impl Database {
                 ON permission_decisions(request_id);
             CREATE INDEX idx_permission_decisions_created_at
                 ON permission_decisions(created_at DESC);
+
+            -- v45: pilot_transcripts (mika#1705). Must be in v1 DDL so fresh installs
+            -- get the table without depending on the v44→v45 migration chain (which is
+            -- skipped on fresh install because migrate() captures version BEFORE
+            -- migrate_v1 runs and the (3..=44).contains(&0) guard fails).
+            CREATE TABLE pilot_transcripts (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                timestamp TEXT,
+                provider TEXT,
+                model TEXT,
+                request_body TEXT,
+                response_body TEXT,
+                tokens_in INTEGER,
+                tokens_out INTEGER,
+                latency_ms INTEGER,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            CREATE INDEX idx_pilot_transcripts_task_id
+                ON pilot_transcripts(task_id);
+            CREATE INDEX idx_pilot_transcripts_created_at
+                ON pilot_transcripts(created_at DESC);
 
             -- Pre-register the default 'mika' agent
             INSERT INTO agents (id, name, home_dir) VALUES ('mika', 'Mika', '');
