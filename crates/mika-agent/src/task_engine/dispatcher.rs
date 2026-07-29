@@ -207,6 +207,7 @@ impl TaskDispatcher {
             "heartbeat" => Ok(self.dispatch_heartbeat(task).await?),
             "reflection" => Ok(self.dispatch_reflection(task).await?),
             "auto_pull_groomed" => Ok(self.dispatch_auto_pull_groomed(task).await?),
+            "wip_rescue" => Ok(self.dispatch_wip_rescue(task).await?),
             "curator_review" => Ok(self.dispatch_curator_review(task).await?),
             other => Err(anyhow!("unknown run_skill trigger: {}", other).into()),
         }
@@ -891,6 +892,61 @@ impl TaskDispatcher {
                     task_id = %task.id,
                     trace_id = %trace_id,
                     "auto_pull: no action taken"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Run the auto-resume wip-rescue drafts scan (mika#1852).
+    ///
+    /// Cron-driven, low-priority (fond-de-file, AC7): like `auto_pull` this does
+    /// NOT run a silent agent turn — it directly executes the scan which drives
+    /// at most one eligible `wip-rescue` draft PR back toward review (rebase →
+    /// clippy → perimeter gate → un-draft), or bails it to a human. The
+    /// concurrency cap of 1 (AC6) is intrinsic: the scan handles one draft per
+    /// tick.
+    async fn dispatch_wip_rescue(&self, task: &Task) -> Result<()> {
+        let github_token = match self.github_token.as_deref() {
+            Some(t) => t,
+            None => {
+                debug!(task_id = %task.id, "wip_rescue: no github_token configured, skipping");
+                return Ok(());
+            }
+        };
+
+        let trace_id = mika_common::trace::generate_trace_id();
+        let session_id = format!("wip-rescue-{}", uuid::Uuid::new_v4());
+
+        info!(
+            task_id = %task.id,
+            trace_id = %trace_id,
+            "wip_rescue: running auto-resume scan"
+        );
+
+        let result = crate::wip_rescue::auto_resume_wip_rescue_drafts(
+            &self.db,
+            github_token,
+            &trace_id,
+            &session_id,
+        )
+        .await;
+
+        match result {
+            Some(count) => {
+                info!(
+                    task_id = %task.id,
+                    resumed = count,
+                    trace_id = %trace_id,
+                    "wip_rescue: scan complete"
+                );
+            }
+            None => {
+                debug!(
+                    task_id = %task.id,
+                    trace_id = %trace_id,
+                    "wip_rescue: no action taken"
                 );
             }
         }
