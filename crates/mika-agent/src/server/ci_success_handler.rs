@@ -27,6 +27,18 @@
 //!   A push after approval — even a mechanical fix — is unreviewed code.
 //!   The cost is one extra QA cycle. The alternative is silently trusting
 //!   that the push was safe, which is the judgment call we're trying to avoid here.
+//!
+//! - Burst dedup (mika#1869): a single push fans out to up to 8 workflows, each
+//!   firing its own `check_suite.completed(success)` webhook, and every one walks
+//!   this full path doing identical work (the aggregation above re-runs on each).
+//!   Two `head_sha`-keyed layers collapse the burst to one evaluation, placed
+//!   right after `find_open_pr` resolves `head_sha`: (1) an in-memory precise gate
+//!   ([`super::check_suite_dedup`], `ci_success_dedup.skip` log) and (2) an
+//!   audit-durable gate (`ci_success_handler_processed` marker rows +
+//!   `count_recent_audit_events_for_target`, `ci_success_handler.dedup_skip` log)
+//!   that survives a process restart the in-memory map cannot. Both key on
+//!   `(repo, branch, head_sha)` / `pr:{repo}#{n}@{head_sha}`, so genuine distinct
+//!   pushes (new `head_sha`) are never conflated. The audit read fails open.
 
 use std::sync::Arc;
 
@@ -43,6 +55,7 @@ use crate::tools::pr_merge_with_gate::{
     run_gh_pr_view, run_gh_subprocess,
 };
 
+use super::check_suite_dedup;
 use super::verdict::{Verdict, parse_verdict};
 use super::verdict_handler::VerdictAction;
 
@@ -77,6 +90,13 @@ pub(crate) fn parse_check_suite_success(text: &str) -> Option<CheckSuiteEvent> {
         repo: repo.to_string(),
         branch: branch.to_string(),
     })
+}
+
+/// Decide whether a prior `ci_success_handler_processed` audit marker means this
+/// event is a cross-restart duplicate (AC2, mika#1869). Pure so it can be unit
+/// tested without touching the network or the `gh` subprocess entry point.
+pub(crate) fn is_duplicate_processed(recent_marker_count: i64) -> bool {
+    recent_marker_count >= 1
 }
 
 /// Attempt to handle a CI success event structurally before the LLM turn.
@@ -146,6 +166,91 @@ pub async fn try_handle_ci_success(
             return VerdictAction::Passthrough { enrichment: None };
         }
     };
+
+    // 2b. Dedup layer 1 — in-memory, precise (AC1, mika#1869).
+    //
+    // A single push triggers up to 8 workflows; each fires its own
+    // check_suite.completed(success) webhook, and every one walks this full path
+    // (gh calls + merge attempt) doing identical work. head_sha is only known now
+    // (find_open_pr resolved it), so this is the earliest precise dedup point.
+    // Distinct pushes advance head_sha and are never conflated.
+    if check_suite_dedup::try_dedup_check_suite(
+        &event.repo,
+        &event.branch,
+        &pr.head_sha,
+        check_suite_dedup::DEDUP_WINDOW,
+    ) {
+        info!(
+            event = "ci_success_dedup.skip",
+            repo = %event.repo,
+            branch = %event.branch,
+            head_sha = %pr.head_sha,
+            pr_number = pr.number,
+            "CI success dedup: duplicate check_suite event within window — skipping merge evaluation"
+        );
+        return VerdictAction::Passthrough { enrichment: None };
+    }
+
+    // 2c. Dedup layer 2 — audit-durable, cross-restart (AC2, mika#1869).
+    //
+    // The in-memory map above is empty after a process restart; the audit trail
+    // persists. A re-fired event within the window still dedups via a marker row.
+    // Scope note: count_recent_audit_events_for_target counts within this agent's
+    // agent_id scope. check_suite success events for a given PR route to the same
+    // agent (mika-qa), so the scope is correct. Fail-open on read error — never
+    // let an audit hiccup block a legitimate merge.
+    let processed_key = format!("pr:{}#{}@{}", event.repo, pr.number, pr.head_sha);
+    let since = crate::timestamp::now_minus(chrono::Duration::seconds(60));
+    match db
+        .count_recent_audit_events_for_target(
+            "ci_success_handler_processed",
+            &processed_key,
+            &since,
+        )
+        .await
+    {
+        Ok(count) if is_duplicate_processed(count) => {
+            info!(
+                event = "ci_success_handler.dedup_skip",
+                repo = %event.repo,
+                pr_number = pr.number,
+                head_sha = %pr.head_sha,
+                prior_markers = count,
+                "CI success dedup: prior processing marker found within window — skipping merge evaluation"
+            );
+            return VerdictAction::Passthrough { enrichment: None };
+        }
+        Ok(_) => {
+            // First real processing for this (repo, pr, head_sha) — write the
+            // marker early (before find_pass_verdict) so concurrent siblings that
+            // cleared the empty DashMap on a cold start still find the row.
+            if let Err(e) = db
+                .log_audit_event(
+                    session_id,
+                    "ci_success_handler_processed",
+                    &processed_key,
+                    None,
+                    None,
+                    Some("trigger=check_suite_success dedup_marker"),
+                    Some(trace_id),
+                )
+                .await
+            {
+                warn!(
+                    error = %e,
+                    pr_number = pr.number,
+                    "Failed to write ci_success_handler_processed dedup marker (continuing)"
+                );
+            }
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                pr_number = pr.number,
+                "CI success dedup: audit-count query failed — proceeding (fail-open)"
+            );
+        }
+    }
 
     // 3. Find QA pass verdict
     let verdict_review = match find_pass_verdict(pr.number, &event.repo, token).await {
@@ -954,5 +1059,77 @@ mod tests {
             text.contains("Rebase"),
             "Behind-main enrichment should instruct rebase: {text}"
         );
+    }
+
+    // ---- Audit-durable dedup gate tests (AC2, mika#1869) ----
+
+    #[test]
+    fn is_duplicate_processed_matches_ticket_semantics() {
+        // Zero prior markers → first real processing (not a duplicate).
+        assert!(!is_duplicate_processed(0));
+        // One or more prior markers → cross-restart duplicate.
+        assert!(is_duplicate_processed(1));
+        assert!(is_duplicate_processed(7));
+    }
+
+    #[tokio::test]
+    async fn audit_gate_query_wiring_detects_prior_marker() {
+        use crate::db::Database;
+
+        let db = AsyncDatabase::new(Database::open_in_memory().unwrap());
+        let session_id = "test-session";
+        db.create_session(session_id, "mika", "github")
+            .await
+            .unwrap();
+
+        let processed_key = "pr:senara-solutions/mika#1869@abc123";
+        let since = crate::timestamp::now_minus(chrono::Duration::seconds(60));
+
+        // Before any marker: count is 0 → not a duplicate → handler would proceed.
+        let count_before = db
+            .count_recent_audit_events_for_target(
+                "ci_success_handler_processed",
+                processed_key,
+                &since,
+            )
+            .await
+            .unwrap();
+        assert_eq!(count_before, 0);
+        assert!(!is_duplicate_processed(count_before));
+
+        // Write the processing marker (the handler's first-processing path).
+        db.log_audit_event(
+            session_id,
+            "ci_success_handler_processed",
+            processed_key,
+            None,
+            None,
+            Some("trigger=check_suite_success dedup_marker"),
+            Some("trace-1869"),
+        )
+        .await
+        .unwrap();
+
+        // After the marker: the exact-match count query sees it → duplicate → skip.
+        let count_after = db
+            .count_recent_audit_events_for_target(
+                "ci_success_handler_processed",
+                processed_key,
+                &since,
+            )
+            .await
+            .unwrap();
+        assert_eq!(count_after, 1);
+        assert!(is_duplicate_processed(count_after));
+
+        // A different head_sha key is unaffected (distinct-push invariant is
+        // head_sha-precise even at the audit layer).
+        let other_key = "pr:senara-solutions/mika#1869@def456";
+        let count_other = db
+            .count_recent_audit_events_for_target("ci_success_handler_processed", other_key, &since)
+            .await
+            .unwrap();
+        assert_eq!(count_other, 0);
+        assert!(!is_duplicate_processed(count_other));
     }
 }
