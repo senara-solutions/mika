@@ -2425,6 +2425,29 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Insert a batch of pilot-transcript rows for one task atomically
+    /// (mika#1705). Bodies must already be secret-scrubbed by the caller.
+    pub async fn insert_pilot_transcripts_batch(
+        &self,
+        task_id: String,
+        rows: Vec<crate::db::PilotTranscriptRow>,
+    ) -> Result<usize> {
+        self.with_db(move |db| db.insert_pilot_transcripts_batch(&task_id, &rows))
+            .await
+    }
+
+    /// Prune pilot transcripts older than `retention_secs` (mika#1705 AC6).
+    pub async fn prune_old_pilot_transcripts(&self, retention_secs: i64) -> Result<usize> {
+        self.with_db(move |db| db.prune_old_pilot_transcripts(retention_secs))
+            .await
+    }
+
+    /// Count pilot transcripts for a task (mika#1705 idempotency guard).
+    pub async fn count_pilot_transcripts_for_task(&self, task_id: String) -> Result<i64> {
+        self.with_db(move |db| db.count_pilot_transcripts_for_task(&task_id))
+            .await
+    }
+
     pub async fn query_llm_calls_by_trace(
         &self,
         trace_id: &str,

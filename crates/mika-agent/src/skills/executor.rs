@@ -65,6 +65,67 @@ pub(crate) fn scrub_mika_env_vars_std(cmd: &mut std::process::Command) {
     }
 }
 
+/// Environment variable claude-pilot-py honors to append a per-LLM-call JSONL
+/// transcript (mika#1705). Deliberately non-`MIKA_*` so it survives the
+/// child-env scrub in [`scrub_mika_env_vars`] and flows through dispatch-lib.sh
+/// into the claude-pilot subprocess.
+const PILOT_TRANSCRIPT_ENV: &str = "ANTHROPIC_LOG_FILE";
+
+/// Read the `MIKA_LOG_PILOT_TRANSCRIPTS` gate from mika-spirit's own environment
+/// (mika#1705 committed position 4 — default ON once shipped, gateable). Reads
+/// the parent process env directly, before the child-command scrub. `0`,
+/// `false`, `no`, `off` (case-insensitive) disable; any other value or absence
+/// enables.
+pub(crate) fn pilot_transcripts_enabled() -> bool {
+    match std::env::var("MIKA_LOG_PILOT_TRANSCRIPTS") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
+/// Inject `ANTHROPIC_LOG_FILE` for claude-pilot dispatch skills so the
+/// subprocess appends its LLM-call corpus to
+/// `{home}/data/pilot-transcripts/<task-id>.jsonl` (mika#1705). The engine
+/// ingestion tick imports finished files into the `pilot_transcripts` table.
+///
+/// MUST be called AFTER [`scrub_mika_env_vars`] so the injected var is not
+/// stripped. Best-effort: feature-off, non-pilot skill, home resolution failure,
+/// or dir-create failure are all silent no-ops — transcript capture must never
+/// block or fail a dispatch.
+fn inject_pilot_transcript_env(
+    cmd: &mut tokio::process::Command,
+    skill_dir: &std::path::Path,
+    task_id: &str,
+) {
+    if !pilot_transcripts_enabled() {
+        return;
+    }
+    // Only the two claude-pilot dispatch skills produce subprocess LLM
+    // trajectories worth capturing (both source `_shared/dispatch-lib.sh`).
+    let is_pilot_skill = skill_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "dev-pilot" || n == "dev-groom");
+    if !is_pilot_skill {
+        return;
+    }
+    let Ok(home) = mika_common::home::resolve_home_dir() else {
+        warn!(task_id = %task_id, "mika#1705: could not resolve home dir; skipping transcript capture");
+        return;
+    };
+    let dir = home.join("data").join("pilot-transcripts");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        warn!(task_id = %task_id, error = %e, "mika#1705: failed to create pilot-transcripts dir; skipping capture");
+        return;
+    }
+    let path = dir.join(format!("{task_id}.jsonl"));
+    cmd.env(PILOT_TRANSCRIPT_ENV, &path);
+    debug!(task_id = %task_id, path = %path.display(), "mika#1705: pilot transcript capture enabled");
+}
+
 /// Maximum raw image file size (5 MB).
 const MAX_IMAGE_SIZE: u64 = 5 * 1024 * 1024;
 
@@ -2186,6 +2247,9 @@ pub(crate) fn spawn_long_running_exec(
         if let Some(ref token) = github_token {
             cmd.env("GH_TOKEN", token);
         }
+        // mika#1705: enable claude-pilot subprocess LLM-transcript capture.
+        // Injected AFTER the MIKA_* scrub so the non-MIKA var survives.
+        inject_pilot_transcript_env(&mut cmd, &skill_dir, &task_id);
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {

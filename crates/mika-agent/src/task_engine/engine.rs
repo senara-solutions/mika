@@ -43,6 +43,17 @@ const CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS: i64 = 1800;
 /// Env var overriding [`CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS`].
 const CHILDLESS_PARENT_REAPER_GRACE_ENV: &str = "MIKA_CHILDLESS_PARENT_REAPER_GRACE_SECS";
 
+/// Ticks between pilot-transcript retention sweeps (mika#1705 AC6). At the 1s
+/// tick cadence, 86_400 ticks ≈ 24h — a daily prune, matching the plan's
+/// "daily tick deletes rows older than N days". Startup also runs one sweep.
+const PILOT_TRANSCRIPT_RETENTION_INTERVAL_TICKS: u64 = 86_400;
+
+/// Env var overriding the pilot-transcript retention window (mika#1705 AC6).
+const PILOT_TRANSCRIPT_RETENTION_ENV: &str = "MIKA_PILOT_TRANSCRIPT_RETENTION_DAYS";
+
+/// Default pilot-transcript retention window in days (mika#1705 AC6).
+const PILOT_TRANSCRIPT_RETENTION_DEFAULT_DAYS: i64 = 90;
+
 /// The two currently-defined dispatch classes (per `derive_dispatch_class` at
 /// `skills/executor.rs`). Iteration order is `implement` first because pre-v34
 /// NULL-class wrappers fall into this bucket via `COALESCE` — promote those
@@ -51,6 +62,36 @@ const CHILDLESS_PARENT_REAPER_GRACE_ENV: &str = "MIKA_CHILDLESS_PARENT_REAPER_GR
 /// test in this crate pins this slice against `derive_dispatch_class` to catch
 /// drift when a new class is added to the executor (mika#1175).
 const DISPATCH_CLASSES: &[&str] = &["implement", "groom"];
+
+/// Parse one claude-pilot transcript JSONL object into a [`crate::db::PilotTranscriptRow`]
+/// (mika#1705). Missing fields become `None`; body fields are secret-scrubbed.
+/// Body values that are JSON objects/arrays are serialized to their compact
+/// string form before scrubbing (claude-pilot may emit either shape).
+fn parse_pilot_transcript_line(v: &serde_json::Value) -> crate::db::PilotTranscriptRow {
+    let str_field = |key: &str| v.get(key).and_then(|x| x.as_str()).map(str::to_owned);
+    let i64_field = |key: &str| v.get(key).and_then(serde_json::Value::as_i64);
+    let scrubbed_body = |key: &str| -> Option<String> {
+        match v.get(key) {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(s)) => {
+                Some(crate::secret_scrubber::scrub_secrets(s).into_owned())
+            }
+            Some(other) => {
+                Some(crate::secret_scrubber::scrub_secrets(&other.to_string()).into_owned())
+            }
+        }
+    };
+    crate::db::PilotTranscriptRow {
+        timestamp: str_field("timestamp"),
+        provider: str_field("provider"),
+        model: str_field("model"),
+        request_body: scrubbed_body("request_body"),
+        response_body: scrubbed_body("response_body"),
+        tokens_in: i64_field("tokens_in"),
+        tokens_out: i64_field("tokens_out"),
+        latency_ms: i64_field("latency_ms"),
+    }
+}
 
 /// The unified task engine: a min-heap BinaryHeap backed by SQLite, driven by a
 /// 1-second tick loop that fires tasks whose `next_fire_at <= now`.
@@ -184,6 +225,9 @@ impl TaskEngine {
             Err(e) => warn!(error = %e, "failed to prune old tool_calls"),
         }
 
+        // 6. Prune pilot transcripts past the retention window (mika#1705 AC6).
+        self.prune_old_pilot_transcripts().await;
+
         debug!(
             loaded = count,
             queue_len = self.queue.len(),
@@ -302,6 +346,19 @@ impl TaskEngine {
             // the parent-task reaper above, for the `team_runs` lifecycle:
             // frees team slots held by runs whose finalizer never executed.
             crate::teams::engine::reap_orphaned_team_runs(&self.db).await;
+
+            // mika#1705: ingest finished claude-pilot transcript JSONL files
+            // into the pilot_transcripts table (the implementation-reasoning
+            // corpus for the owned-model bet).
+            self.ingest_pilot_transcripts().await;
+        }
+
+        // mika#1705 AC6: daily pilot-transcript retention sweep.
+        if self
+            .tick_count
+            .is_multiple_of(PILOT_TRANSCRIPT_RETENTION_INTERVAL_TICKS)
+        {
+            self.prune_old_pilot_transcripts().await;
         }
 
         let now = crate::timestamp::now();
@@ -702,6 +759,146 @@ impl TaskEngine {
     /// Any new writers of `callback_delivered_without_pr_url` must respect
     /// the groom-class filter. SOLE WRITER: this method is the only site
     /// that writes `callback_delivered_without_pr_url` to `tasks.result`.
+    /// mika#1705: ingest finished claude-pilot transcript JSONL files into the
+    /// `pilot_transcripts` table, then delete each imported file.
+    ///
+    /// Runs on the periodic DB scan. Files live in a single shared directory
+    /// (`{home}/data/pilot-transcripts/<callback-task-id>.jsonl`); because
+    /// [`AsyncDatabase::get_task`] is agent-scoped, each file resolves to
+    /// exactly one engine (the dispatching agent's), so N engines scanning the
+    /// same directory never double-import — non-owners see `None` and skip.
+    ///
+    /// Race safety (mika#1705 Risk 5): a file is only imported once its owning
+    /// callback task has left `in_progress`/`pending` — by then the pilot
+    /// subprocess has exited (dispatch-lib's EXIT trap completes the task only
+    /// after `claude-pilot` returns), so the JSONL is fully written. Import is
+    /// transactional (all rows or none) and the file is deleted only after a
+    /// successful commit; a pre-existing row count short-circuits to delete,
+    /// giving idempotency when a prior commit succeeded but the unlink failed.
+    async fn ingest_pilot_transcripts(&self) {
+        if !crate::skills::executor::pilot_transcripts_enabled() {
+            return;
+        }
+        let dir = self
+            .dispatcher
+            .settings
+            .home_dir
+            .join("data")
+            .join("pilot-transcripts");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            // Dir absent = nothing dispatched with capture yet. Not an error.
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(task_id) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else {
+                continue;
+            };
+
+            // Agent-scoped lookup routes each file to exactly one engine.
+            let task = match self.db.get_task(&task_id).await {
+                Ok(Some(t)) => t,
+                Ok(None) => continue, // not this agent's task — leave for owner
+                Err(e) => {
+                    warn!(task_id = %task_id, error = %e, "mika#1705: task lookup failed; skipping transcript file");
+                    continue;
+                }
+            };
+
+            // Only import once the pilot subprocess has exited (task no longer
+            // pending/in_progress) so we never read a partially-written file.
+            if matches!(
+                task.status.as_str(),
+                task_status::PENDING | task_status::IN_PROGRESS
+            ) {
+                continue;
+            }
+
+            // Idempotency: rows already present ⇒ a prior import committed but
+            // the unlink failed. Just delete the file and move on.
+            match self
+                .db
+                .count_pilot_transcripts_for_task(task_id.clone())
+                .await
+            {
+                Ok(n) if n > 0 => {
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        warn!(task_id = %task_id, error = %e, "mika#1705: failed to delete already-imported transcript file");
+                    }
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(task_id = %task_id, error = %e, "mika#1705: transcript count check failed; skipping");
+                    continue;
+                }
+            }
+
+            let contents = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(task_id = %task_id, error = %e, "mika#1705: failed to read transcript file");
+                    continue;
+                }
+            };
+
+            let rows: Vec<crate::db::PilotTranscriptRow> = contents
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .map(|v| parse_pilot_transcript_line(&v))
+                .collect();
+
+            if rows.is_empty() {
+                // Empty or all-unparseable file: delete so it doesn't linger.
+                if let Err(e) = std::fs::remove_file(&path) {
+                    warn!(task_id = %task_id, error = %e, "mika#1705: failed to delete empty transcript file");
+                }
+                continue;
+            }
+
+            match self
+                .db
+                .insert_pilot_transcripts_batch(task_id.clone(), rows)
+                .await
+            {
+                Ok(imported) => {
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        warn!(task_id = %task_id, error = %e, "mika#1705: import committed but file delete failed (idempotent next tick)");
+                    }
+                    info!(task_id = %task_id, imported, "mika#1705: ingested pilot transcript");
+                }
+                Err(e) => {
+                    // Leave the file in place — retried on the next scan.
+                    warn!(task_id = %task_id, error = %e, "mika#1705: transcript import failed; will retry");
+                }
+            }
+        }
+    }
+
+    /// mika#1705 AC6: delete `pilot_transcripts` rows older than the retention
+    /// window (`MIKA_PILOT_TRANSCRIPT_RETENTION_DAYS`, default 90). Called at
+    /// startup and once per [`PILOT_TRANSCRIPT_RETENTION_INTERVAL_TICKS`].
+    async fn prune_old_pilot_transcripts(&self) {
+        let days = std::env::var(PILOT_TRANSCRIPT_RETENTION_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .filter(|d| *d > 0)
+            .unwrap_or(PILOT_TRANSCRIPT_RETENTION_DEFAULT_DAYS);
+        let retention_secs = days * 24 * 60 * 60;
+        match self.db.prune_old_pilot_transcripts(retention_secs).await {
+            Ok(n) if n > 0 => info!(count = n, days, "mika#1705: pruned old pilot transcripts"),
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "mika#1705: failed to prune old pilot transcripts"),
+        }
+    }
+
     async fn reap_orphaned_parent_tasks(&self) {
         let candidates = match self
             .db

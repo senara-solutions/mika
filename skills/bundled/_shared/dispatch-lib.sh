@@ -676,6 +676,14 @@ _run_claude_pilot() {
     if [ "${CLAUDE_PILOT_TRACE:-}" = "1" ] || [ "${CLAUDE_PILOT_TRACE:-}" = "true" ]; then
         TRACE_FLAG="--trace"
     fi
+    # mika#1705: pilot-transcript capture. When MIKA_LOG_PILOT_TRANSCRIPTS is on,
+    # the mika-spirit executor injects ANTHROPIC_LOG_FILE into this handler's env
+    # (AFTER its MIKA_* scrub, since this handler cannot read MIKA_* itself), and
+    # points it at ~/.mika/data/pilot-transcripts/<task-id>.jsonl. claude-pilot
+    # inherits our env, so ANTHROPIC_LOG_FILE flows through to the subprocess,
+    # where claude-pilot-py appends one JSONL line per LLM call. The mika engine
+    # tick then ingests finished files into the pilot_transcripts table. Nothing
+    # to do here except NOT clobber the inherited env before the run below.
     set +e
     # CWD_ARGS is intentionally word-split (multiple flags)
     # shellcheck disable=SC2086
