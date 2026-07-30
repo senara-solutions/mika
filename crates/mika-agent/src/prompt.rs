@@ -144,6 +144,39 @@ pub struct SkillsIdentityConfig {
     pub allow_authoring: Option<bool>,
 }
 
+/// Session config from the `[session]` block in identity.toml (mika#1401).
+///
+/// Makes an agent **single-session-by-construction**: when `singleton = true`,
+/// every conversational invocation (`mika ask`, `mika chat`, HTTP `/send`) reuses
+/// one canonical session instead of minting a fresh `Uuid::new_v4()` per ask. The
+/// invariant is enforced by the engine, not by remembering to pass `--session-id`.
+///
+/// Opt-in — absent or `singleton = false` preserves the default (random UUID per
+/// ask). Explicit `--session-id` always overrides the canonical session.
+///
+/// ```toml
+/// [session]
+/// singleton = true
+/// canonical_id = "00000000-0000-0000-0000-000000000000"  # optional
+/// ```
+///
+/// **Compaction interaction:** compaction already keys on `agent_id`, not
+/// `session_id`, so a singleton agent is unaffected — the single canonical
+/// session simply accumulates all history. See mika#1401.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct SessionIdentityConfig {
+    /// When `true`, this agent uses a single canonical session for all
+    /// conversational interactions. The session persists across invocations
+    /// and is never ended by `end_session`. Default: `false`.
+    #[serde(default)]
+    pub singleton: bool,
+    /// Explicit canonical session ID. When absent and `singleton = true`,
+    /// the engine derives one as `canonical-{agent_id}`. Exists specifically
+    /// for mika-prime's operator-chosen zero-UUID.
+    #[serde(default)]
+    pub canonical_id: Option<String>,
+}
+
 /// Tool visibility config from the `[tools]` block in identity.toml.
 ///
 /// Used by well-known agents (mika-arch, etc.) to deny specific built-in tools
@@ -273,6 +306,8 @@ pub struct Identity {
     #[serde(default)]
     pub context: ContextIdentityConfig,
     #[serde(default)]
+    pub session: SessionIdentityConfig,
+    #[serde(default)]
     pub curator: Option<CuratorConfig>,
 }
 
@@ -295,6 +330,7 @@ impl Default for Identity {
             skills: SkillsIdentityConfig::default(),
             tools: ToolsIdentityConfig::default(),
             context: ContextIdentityConfig::default(),
+            session: SessionIdentityConfig::default(),
             curator: None,
         }
     }
@@ -400,8 +436,29 @@ fn fail_closed_identity() -> Identity {
                 max_tokens: None,
             },
         },
+        session: SessionIdentityConfig::default(),
         curator: None,
     }
+}
+
+/// Resolve the canonical session ID for a singleton agent (mika#1401).
+///
+/// Returns `None` when the agent is not `singleton` — callers then mint a
+/// fresh `Uuid::new_v4()` per invocation (the default behavior). When
+/// `singleton = true`, returns the operator-chosen `canonical_id` if set,
+/// else the derived `canonical-{agent_id}` (prefix-typed sibling of
+/// `system-{agent_id}`, structurally exempt from `prune_old_sessions`).
+pub fn resolve_canonical_session_id(identity: &Identity, agent_id: &str) -> Option<String> {
+    if !identity.session.singleton {
+        return None;
+    }
+    Some(
+        identity
+            .session
+            .canonical_id
+            .clone()
+            .unwrap_or_else(|| format!("canonical-{agent_id}")),
+    )
 }
 
 /// Context needed to build the system prompt.
@@ -1081,12 +1138,87 @@ mod tests {
             skills: SkillsIdentityConfig::default(),
             tools: ToolsIdentityConfig::default(),
             context: ContextIdentityConfig::default(),
+            session: SessionIdentityConfig::default(),
             curator: None,
         }
     }
 
     fn test_time() -> DateTime<Utc> {
         "2026-02-24T12:00:00Z".parse().unwrap()
+    }
+
+    // --- Canonical session resolution (mika#1401) ---
+
+    #[test]
+    fn test_resolve_canonical_session_non_singleton_returns_none() {
+        // Default identity is non-singleton — callers mint a fresh UUID per ask.
+        let identity = test_identity();
+        assert!(!identity.session.singleton);
+        assert_eq!(resolve_canonical_session_id(&identity, "mika-prime"), None);
+    }
+
+    #[test]
+    fn test_resolve_canonical_session_singleton_derives_id() {
+        // singleton = true without an explicit canonical_id derives
+        // `canonical-{agent_id}` (prefix-typed sibling of system-{agent_id}).
+        let mut identity = test_identity();
+        identity.session.singleton = true;
+        assert_eq!(
+            resolve_canonical_session_id(&identity, "mika-prime"),
+            Some("canonical-mika-prime".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_canonical_session_singleton_honors_explicit_id() {
+        // An explicit canonical_id (e.g. mika-prime's zero-UUID) wins over derivation.
+        let mut identity = test_identity();
+        identity.session.singleton = true;
+        identity.session.canonical_id = Some("00000000-0000-0000-0000-000000000000".to_string());
+        assert_eq!(
+            resolve_canonical_session_id(&identity, "mika-prime"),
+            Some("00000000-0000-0000-0000-000000000000".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_canonical_session_canonical_id_ignored_when_not_singleton() {
+        // canonical_id present but singleton = false → still None (opt-in gate).
+        let mut identity = test_identity();
+        identity.session.singleton = false;
+        identity.session.canonical_id = Some("00000000-0000-0000-0000-000000000000".to_string());
+        assert_eq!(resolve_canonical_session_id(&identity, "mika-prime"), None);
+    }
+
+    #[test]
+    fn test_session_identity_config_parses_from_toml() {
+        // The [session] block deserializes with both fields set.
+        let toml = r#"
+name = "Mika Prime"
+emoji = "✦"
+
+[session]
+singleton = true
+canonical_id = "00000000-0000-0000-0000-000000000000"
+"#;
+        let identity: Identity = toml::from_str(toml).unwrap();
+        assert!(identity.session.singleton);
+        assert_eq!(
+            identity.session.canonical_id.as_deref(),
+            Some("00000000-0000-0000-0000-000000000000")
+        );
+    }
+
+    #[test]
+    fn test_session_identity_config_defaults_when_absent() {
+        // Absent [session] block → singleton = false, canonical_id = None.
+        let toml = r#"
+name = "Mika"
+emoji = "✦"
+"#;
+        let identity: Identity = toml::from_str(toml).unwrap();
+        assert!(!identity.session.singleton);
+        assert!(identity.session.canonical_id.is_none());
     }
 
     fn test_core_memory() -> Vec<CoreMemoryEntry> {
@@ -1164,6 +1296,7 @@ mod tests {
             skills: SkillsIdentityConfig::default(),
             tools: ToolsIdentityConfig::default(),
             context: ContextIdentityConfig::default(),
+            session: SessionIdentityConfig::default(),
             curator: None,
         };
         let ctx = PromptContext {

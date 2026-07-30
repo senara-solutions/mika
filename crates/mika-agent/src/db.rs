@@ -7210,6 +7210,21 @@ impl Database {
         Ok(())
     }
 
+    /// End a session unless it is the agent's canonical singleton session (mika#1401).
+    ///
+    /// Singleton agents (`[session] singleton = true` in identity.toml) reuse one
+    /// canonical session across every invocation; ending it would set `ended_at`
+    /// and — worse — surface it in the dashboard as a finished conversation. This
+    /// helper no-ops when `id == canonical_id`, so the canonical session's
+    /// `ended_at` stays NULL forever. When `canonical_id` is `None` (non-singleton
+    /// agent) it behaves exactly like [`end_session`].
+    pub fn end_session_unless_canonical(&self, id: &str, canonical_id: Option<&str>) -> Result<()> {
+        if canonical_id == Some(id) {
+            return Ok(());
+        }
+        self.end_session(id)
+    }
+
     pub fn get_or_create_system_session(&self, agent_id: &str) -> Result<String> {
         let id = format!("system-{agent_id}");
         self.conn.execute(
@@ -7217,6 +7232,28 @@ impl Database {
             params![&id, agent_id],
         )?;
         Ok(id)
+    }
+
+    /// Idempotently create the canonical session for a singleton agent (mika#1401).
+    ///
+    /// Mirrors [`get_or_create_system_session`]: `INSERT OR IGNORE` so the first
+    /// invocation creates the row and every subsequent `mika ask` / `/send` reuses
+    /// it. Unlike the system session the ID is caller-supplied (either the derived
+    /// `canonical-{agent_id}` or an operator-chosen `canonical_id` such as
+    /// mika-prime's zero-UUID). Channel type defaults to `'cli'`; the singleton
+    /// concept is orthogonal to channel — multiple channels merging into one
+    /// session is the designed intent for single-surface oracles.
+    pub fn get_or_create_canonical_session(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        channel_type: &str,
+    ) -> Result<String> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO sessions (id, agent_id, channel_type) VALUES (?1, ?2, ?3)",
+            params![session_id, agent_id, channel_type],
+        )?;
+        Ok(session_id.to_string())
     }
 
     /// Prune ended system/silent sessions older than `retention_secs`.
@@ -15485,6 +15522,129 @@ mod tests {
             )
             .unwrap();
         assert!(ended.is_some());
+    }
+
+    #[test]
+    fn test_get_or_create_canonical_session_is_idempotent() {
+        // mika#1401: repeated calls reuse the same row (INSERT OR IGNORE), so every
+        // `mika ask` to a singleton agent lands on one canonical session.
+        // Uses the test DB's registered agent ("mika") to satisfy the sessions FK.
+        let db = db();
+        let id = "canonical-mika";
+        let r1 = db
+            .get_or_create_canonical_session(id, "mika", "cli")
+            .unwrap();
+        assert_eq!(r1, id);
+        // Write a message to the canonical session.
+        db.save_message("mika", id, "user", "first ask", None)
+            .unwrap();
+        // Second invocation must not fail on duplicate PK and must not clobber.
+        let r2 = db
+            .get_or_create_canonical_session(id, "mika", "cli")
+            .unwrap();
+        assert_eq!(r2, id);
+        db.save_message("mika", id, "user", "second ask", None)
+            .unwrap();
+
+        // Exactly one session row exists, accumulating both messages.
+        let session_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(session_count, 1);
+        let msg_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(msg_count, 2);
+    }
+
+    #[test]
+    fn test_end_session_unless_canonical_noops_on_canonical() {
+        // mika#1401: the canonical session must never be ended (pruning-safe).
+        let db = db();
+        let id = "canonical-mika";
+        db.get_or_create_canonical_session(id, "mika", "cli")
+            .unwrap();
+        // Attempt to end it while passing itself as the canonical id → no-op.
+        db.end_session_unless_canonical(id, Some(id)).unwrap();
+        let ended: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ended.is_none(), "canonical session must stay open");
+    }
+
+    #[test]
+    fn test_end_session_unless_canonical_ends_non_canonical() {
+        // A non-canonical session (or None canonical_id) ends normally.
+        let db = db();
+        db.create_session("per-ask", "mika", "cli").unwrap();
+        db.end_session_unless_canonical("per-ask", Some("canonical-mika"))
+            .unwrap();
+        let ended: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = 'per-ask'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ended.is_some(), "non-canonical session should be ended");
+
+        // None canonical_id (non-singleton agent) also ends normally.
+        db.create_session("per-ask-2", "mika", "cli").unwrap();
+        db.end_session_unless_canonical("per-ask-2", None).unwrap();
+        let ended: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = 'per-ask-2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ended.is_some());
+    }
+
+    #[test]
+    fn test_canonical_session_exempt_from_pruning() {
+        // mika#1401 + D5: the `canonical-` prefix is not in prune_old_sessions's
+        // LIKE list, so even an (erroneously) ended canonical session survives.
+        let db = db();
+        let id = "canonical-mika";
+        db.get_or_create_canonical_session(id, "mika", "cli")
+            .unwrap();
+        // Force-end and backdate to simulate a worst-case stale row.
+        db.end_session(id).unwrap();
+        db.conn
+            .execute(
+                "UPDATE sessions SET ended_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-30 days') WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        let pruned = db.prune_old_sessions(7 * 24 * 60 * 60).unwrap();
+        assert_eq!(pruned, 0, "canonical prefix must be exempt from pruning");
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]
