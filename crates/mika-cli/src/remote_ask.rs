@@ -105,39 +105,30 @@ fn build_send_params(message: &str) -> MessageSendParams {
     }
 }
 
-/// Dispatch a `mika ask` invocation in remote mode and return the rendered output.
+/// Send a single user message to an agent's A2A endpoint via `message/send` and
+/// return the terminal `Task`.
 ///
-/// Validates `remote_url`, sends the prompt via `A2aClient::send_message`, and
-/// renders the returned `Task` to a string in the requested format. Returns the
-/// rendered string rather than printing it so integration tests can assert on the
-/// output without capturing stdout. `run_remote` wraps this with a print.
+/// Shared core for both the `--remote` cloud path (`dispatch_remote`) and the
+/// local mika-spirit thin-client path (`commands::ask`, mika#1727). Handles auth,
+/// dispatch, and terminal-state validation; rendering is left to the caller so
+/// each surface can apply its own output shape.
 ///
-/// Errors are surfaced as `anyhow` failures with single-line prefixes per
-/// `A2aError` variant so the caller can `eprintln!("Error: {e}")` and exit non-zero.
-pub async fn dispatch_remote(
-    message: &str,
-    remote_url: &str,
-    format: OutputFormat,
-    verbose: bool,
-) -> Result<String> {
-    // Fail-fast URL validation. A2aClient itself doesn't pre-parse, so an invalid
-    // URL would surface as a reqwest send error — a less actionable message.
-    reqwest::Url::parse(remote_url)
-        .with_context(|| format!("invalid --remote URL: {remote_url}"))?;
-
-    // Filter out an empty MIKA_INTERNAL_TOKEN — set-but-empty (common with a
-    // misconfigured .env) would otherwise forward `Authorization: Bearer `, which
-    // the gateway 401s with no diagnostic hint. Treating empty as unset surfaces
-    // the same 401 but at least matches the no-auth diagnostic shape.
-    // Note on secrets discipline: `mika/CLAUDE.md` mandates `secrecy::SecretString`
-    // at the `Settings` accessor boundary, with downstream types using plain `String`.
-    // `A2aClient::new` takes `Option<String>` — its API IS the downstream boundary,
-    // so a plain-String read here is consistent with the convention. `A2aClient`
-    // does not derive `Debug`, so accidental log leakage is constrained.
+/// Auth is bearer-token via `MIKA_INTERNAL_TOKEN`. An empty value is treated as
+/// unset — set-but-empty (common with a misconfigured `.env`) would otherwise
+/// forward `Authorization: Bearer `, which the server 401s with no diagnostic
+/// hint; treating empty as unset surfaces the same 401 but matches the no-auth
+/// diagnostic shape. Per `mika/CLAUDE.md`, `secrecy::SecretString` guards the
+/// `Settings` accessor boundary; `A2aClient::new` takes `Option<String>` as the
+/// downstream boundary, so a plain-String read here is consistent, and
+/// `A2aClient` does not derive `Debug`, so accidental log leakage is constrained.
+///
+/// The caller is responsible for URL validation with a surface-appropriate error
+/// message (e.g. `--remote` vs. the local spirit endpoint).
+pub async fn send_message_to_agent(message: &str, url: &str) -> Result<Task> {
     let auth_token = std::env::var("MIKA_INTERNAL_TOKEN")
         .ok()
         .filter(|t| !t.is_empty());
-    let client = A2aClient::new(remote_url, auth_token);
+    let client = A2aClient::new(url, auth_token);
 
     let task = match client.send_message(build_send_params(message)).await {
         Ok(task) => task,
@@ -152,12 +143,11 @@ pub async fn dispatch_remote(
     // Inspect the terminal Task state. Per A2A v0.3 §6, a synchronous
     // `message/send` returns a Task in one of: Completed, Failed, Canceled,
     // Rejected, InputRequired, AuthRequired (terminal-or-pending). Submitted /
-    // Working are async-dispatch states the gateway should not return here.
+    // Working are async-dispatch states the server should not return here.
     //
-    // Render output for Completed and the pending-input states (the latter
-    // carry meaningful text content the user needs to see). Surface terminal-bad
-    // states and async-in-progress states as errors so the shell exit code
-    // matches the local `mika ask` contract.
+    // Completed and the pending-input states carry meaningful text the user needs
+    // to see. Surface terminal-bad and async-in-progress states as errors so the
+    // shell exit code matches the local `mika ask` contract.
     match task.status.state {
         TaskState::Completed | TaskState::InputRequired | TaskState::AuthRequired => {}
         TaskState::Failed | TaskState::Canceled | TaskState::Rejected => {
@@ -176,6 +166,30 @@ pub async fn dispatch_remote(
         }
     }
 
+    Ok(task)
+}
+
+/// Dispatch a `mika ask` invocation in remote mode and return the rendered output.
+///
+/// Validates `remote_url`, sends the prompt via `send_message_to_agent`, and
+/// renders the returned `Task` to a string in the requested format. Returns the
+/// rendered string rather than printing it so integration tests can assert on the
+/// output without capturing stdout. `run_remote` wraps this with a print.
+///
+/// Errors are surfaced as `anyhow` failures with single-line prefixes per
+/// `A2aError` variant so the caller can `eprintln!("Error: {e}")` and exit non-zero.
+pub async fn dispatch_remote(
+    message: &str,
+    remote_url: &str,
+    format: OutputFormat,
+    verbose: bool,
+) -> Result<String> {
+    // Fail-fast URL validation. A2aClient itself doesn't pre-parse, so an invalid
+    // URL would surface as a reqwest send error — a less actionable message.
+    reqwest::Url::parse(remote_url)
+        .with_context(|| format!("invalid --remote URL: {remote_url}"))?;
+
+    let task = send_message_to_agent(message, remote_url).await?;
     render(&task, format, verbose)
 }
 
