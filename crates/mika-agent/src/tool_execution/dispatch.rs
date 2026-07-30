@@ -6,6 +6,9 @@
 
 use std::collections::HashMap;
 
+use mika_a2a::streaming::{
+    StreamEvent, StreamEventSender, ToolCallResultEvent, ToolCallStartEvent, truncate_tool_summary,
+};
 use mika_common::llm::{
     LlmContent, LlmContentBlock, LlmImage, LlmMessage, LlmRequest, LlmResponseContent, LlmRole,
     LlmToolResultBlock, LlmToolResultContent,
@@ -64,6 +67,12 @@ pub(crate) async fn process_tool_calls(
     // guard only applies in conversation mode — silent/callback modes use
     // send_message as a notification mechanism, not a user-dialog interaction.
     conversation_mode: bool,
+    // Per-task A2A broadcast sender (mika#1731). When `Some`, this fn emits
+    // `ToolCallStart` / `ToolCallResult` SSE frames around each physical tool
+    // dispatch so streaming clients (mika#1727 thin-client TUI) get
+    // fine-grained tool receipts. `None` for non-streaming callers
+    // (`message/send`, silent/callback turns) — emission is skipped entirely.
+    stream_tx: Option<&StreamEventSender>,
 ) -> Vec<ToolCallSummary> {
     let mut tool_results: Vec<LlmContentBlock> = Vec::new();
     let mut summaries = Vec::new();
@@ -162,6 +171,19 @@ pub(crate) async fn process_tool_calls(
                     mcp_manager,
                     long_running_ctx,
                 };
+                // mika#1731 — emit ToolCallStart on the A2A stream immediately
+                // before physical dispatch. Fire-and-forget: a send error (e.g.
+                // no subscribers connected) NEVER affects tool execution.
+                if let Some(tx) = stream_tx {
+                    let _ = tx.send(StreamEvent::ToolCallStart(ToolCallStartEvent {
+                        task_id: tool_ctx.trace_id.to_string(),
+                        context_id: None,
+                        step,
+                        tool_name: name.clone(),
+                        args_summary: truncate_tool_summary(&input_summary),
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                    }));
+                }
                 let tool_start = std::time::Instant::now();
                 let output = execute_tool(&dispatch, name, arguments.clone()).await;
                 let tool_latency_ms = tool_start.elapsed().as_millis() as u64;
@@ -238,6 +260,22 @@ pub(crate) async fn process_tool_calls(
                 };
                 let non_zero_exit = !output.is_error && has_non_zero_exit_prefix(&output.content);
                 let tool_succeeded = !output.is_error && !non_zero_exit;
+                // mika#1731 — emit ToolCallResult on the A2A stream immediately
+                // after dispatch, before `output_summary` is moved into the
+                // ToolCallSummary. Fire-and-forget (see ToolCallStart above).
+                if let Some(tx) = stream_tx {
+                    let _ = tx.send(StreamEvent::ToolCallResult(ToolCallResultEvent {
+                        task_id: tool_ctx.trace_id.to_string(),
+                        context_id: None,
+                        step,
+                        tool_name: name.clone(),
+                        success: tool_succeeded,
+                        non_zero_exit,
+                        output_summary: truncate_tool_summary(&output_summary),
+                        duration_ms: tool_latency_ms,
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                    }));
+                }
                 summaries.push(ToolCallSummary {
                     step,
                     name: name.clone(),
@@ -428,4 +466,119 @@ async fn execute_tool(
 
     warn!(tool = %name, "unknown tool requested");
     ToolOutput::error(format!("Unknown tool: {name}"))
+}
+
+#[cfg(test)]
+mod stream_emit_tests {
+    //! mika#1731 — verify `process_tool_calls` emits `ToolCallStart` /
+    //! `ToolCallResult` SSE frames around physical tool dispatch when a
+    //! `stream_tx` is supplied, and stays silent (backward-compatible) when
+    //! it is not. The "unknown tool" path is used deliberately: it is still a
+    //! physical dispatch (non-cached branch), so both frames must fire — the
+    //! result frame simply carries `success = false`.
+    use super::*;
+    use crate::test_utils::test_helpers::TestHarness;
+    use std::sync::Arc;
+
+    fn empty_request() -> LlmRequest {
+        LlmRequest {
+            model: "test-model".to_string(),
+            system: None,
+            messages: Vec::new(),
+            tools: None,
+            max_tokens: 1024,
+            thinking: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_one_unknown_tool(
+        harness: &TestHarness,
+        request: &mut LlmRequest,
+        step: u32,
+        stream_tx: Option<&StreamEventSender>,
+    ) -> Vec<ToolCallSummary> {
+        let ctx = harness.ctx();
+        let tools = ToolRegistry::new();
+        let skill_tools: HashMap<String, &ResolvedSkillTool> = HashMap::new();
+        let response = vec![LlmResponseContent::ToolCall {
+            id: "call-1".to_string(),
+            name: "definitely_unknown_tool".to_string(),
+            arguments: serde_json::json!({"x": 1}),
+        }];
+        let mut boundary = false;
+        let mut suppressed = Vec::new();
+        let mut capture = String::new();
+
+        process_tool_calls(
+            response,
+            &tools,
+            &skill_tools,
+            30,
+            &ctx,
+            request,
+            step,
+            None,
+            None,
+            &harness.db,
+            "test-session",
+            false, // store_tool_calls — avoid DB writes in this unit test
+            None,
+            &mut boundary,
+            &mut suppressed,
+            &mut capture,
+            true, // conversation_mode
+            stream_tx,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn emits_tool_call_frames_when_stream_tx_present() {
+        let harness = TestHarness::new();
+        let mut request = empty_request();
+
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<StreamEvent>(16);
+        let sender: StreamEventSender = Arc::new(tx);
+
+        let summaries = run_one_unknown_tool(&harness, &mut request, 7, Some(&sender)).await;
+        assert_eq!(summaries.len(), 1);
+
+        match rx.try_recv().expect("expected a ToolCallStart frame") {
+            StreamEvent::ToolCallStart(e) => {
+                assert_eq!(e.step, 7);
+                assert_eq!(e.tool_name, "definitely_unknown_tool");
+                assert!(e.args_summary.contains("\"x\""));
+            }
+            other => panic!("expected ToolCallStart, got {other:?}"),
+        }
+
+        match rx.try_recv().expect("expected a ToolCallResult frame") {
+            StreamEvent::ToolCallResult(e) => {
+                assert_eq!(e.step, 7);
+                assert_eq!(e.tool_name, "definitely_unknown_tool");
+                // Unknown tool → dispatch returns an error output.
+                assert!(!e.success);
+            }
+            other => panic!("expected ToolCallResult, got {other:?}"),
+        }
+
+        // Exactly the two frames — nothing else queued.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn no_frames_and_still_dispatches_when_stream_tx_absent() {
+        let harness = TestHarness::new();
+        let mut request = empty_request();
+
+        // A receiver on a separate channel proves that when stream_tx is None
+        // no frame is produced by the dispatch path.
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<StreamEvent>(16);
+        let _keep_sender_alive = tx;
+
+        let summaries = run_one_unknown_tool(&harness, &mut request, 0, None).await;
+        assert_eq!(summaries.len(), 1);
+        assert!(rx.try_recv().is_err());
+    }
 }

@@ -674,6 +674,11 @@ async fn run_loop(
     internal: bool,
     deadline: Instant,
     scope_task_id: Option<&str>,
+    // Per-task A2A broadcast sender (mika#1731). Threaded into
+    // `process_tool_calls` so it can emit `ToolCallStart` / `ToolCallResult`
+    // SSE frames as tools dispatch. `Some` only on the A2A streaming path
+    // (`message/stream`); `None` for `message/send`, CLI, silent/callback.
+    stream_tx: Option<&mika_a2a::streaming::StreamEventSender>,
 ) -> Result<LoopResult> {
     // Filter required_tools to only include tools that are actually available in the
     // current tool set (builtins + skill tools + MCP). See #516, #517.
@@ -976,6 +981,7 @@ async fn run_loop(
                         &mut suppressed_write_tools,
                         &mut send_message_text_capture,
                         mode.is_conversation(),
+                        stream_tx,
                     )
                     .await;
                     all_tool_summaries.extend(step_summaries);
@@ -2381,6 +2387,7 @@ async fn run_loop(
                     &mut suppressed_write_tools,
                     &mut send_message_text_capture,
                     mode.is_conversation(),
+                    stream_tx,
                 )
                 .await;
                 all_tool_summaries.extend(step_summaries);
@@ -3134,6 +3141,7 @@ async fn run_agent_inner(
         params.internal,
         deadline,
         scope_task_id,
+        params.stream_tx.as_ref(), // mika#1731: A2A streaming tool-call frames
     )
     .await?;
 
@@ -3977,6 +3985,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         false, // silent mode messages are never internal
         deadline,
         scope_task_id.as_deref(),
+        None, // silent turns are not the A2A streaming path (mika#1731)
     )
     .await?;
 
@@ -4408,6 +4417,7 @@ async fn run_team_agent_inner_impl(
         false, // team mode messages are never internal
         deadline,
         None, // team mode: no task context for parallel narrative
+        None, // team turns are not the A2A streaming path (mika#1731)
     )
     .await?;
 
