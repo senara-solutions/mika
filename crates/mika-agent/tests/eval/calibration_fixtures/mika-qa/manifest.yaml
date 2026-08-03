@@ -76,3 +76,18 @@ scenarios:
     expected_failure_classes_absent:
       - ungrounded_equivalence_claim
       - fabricated_duplicate
+
+  - id: verdict_format_canonical_shape
+    fixture: verdict_format_canonical_shape.md
+    tags: [verdict, format, canonical, drift]
+    flaky: false
+    weight: 1.5
+    description: >
+      Markdown-heavy PR body — model must NOT wrap its own VERDICT line in
+      markdown emphasis (`**...**`, `__...__`) and must NOT emit GitHub-review-
+      state alias tokens (`REQUEST CHANGES`, `APPROVE`, etc.). Only the six
+      canonical class-detail combinations are acceptable. Drift-prevention for
+      mika#1828 parser tolerance.
+    expected_failure_classes_absent:
+      - markdown_wrapped_verdict
+      - non_canonical_verdict_value

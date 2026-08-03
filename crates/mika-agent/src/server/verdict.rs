@@ -1,5 +1,6 @@
 use regex::Regex;
 use std::sync::LazyLock;
+use tracing::info;
 
 /// Parsed PR review event from gateway-formatted text.
 #[derive(Debug, Clone)]
@@ -45,8 +46,13 @@ static HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("header regex")
 });
 
+// mika#1828: VERDICT_RE tolerates markdown-emphasis wrappers observed in the
+// wild (`**Verdict: REQUEST CHANGES**` on PR #1821, also `*Verdict:*`, `__X__`).
+// Permissive leading emphasis run (any mix of `*`/`_`); captures the rest of
+// the line. Trailing-emphasis peel + trailing-content truncation happens in
+// `parse_verdict` — the regex just gets us to the value.
 static VERDICT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?mi)^VERDICT:\s*(.+)$").expect("verdict regex"));
+    LazyLock::new(|| Regex::new(r"(?mi)^\s*[*_]*\s*VERDICT:\s*(.+)$").expect("verdict regex"));
 
 static DEPTH_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?mi)^DEPTH:\s*(.+)$").expect("depth regex"));
@@ -105,10 +111,71 @@ pub(crate) fn parse_pr_review_event(text: &str) -> Option<PrReviewEvent> {
     })
 }
 
+/// Strip a leading/trailing run of `*`/`_` characters (defense-in-depth for the
+/// single-emphasis `*Verdict:*` and stray-asterisk shapes that VERDICT_RE's
+/// double-emphasis alternation misses). mika#1828.
+fn strip_md_emphasis(value: &str) -> &str {
+    value.trim_matches(['*', '_'])
+}
+
+/// Normalize an alias-candidate value: lowercase, collapse `[_\-\s]+` runs to a
+/// single space, then trim. mika#1828 AC2. Maps `REQUEST_CHANGES`,
+/// `changes-requested`, `Request  Changes` all to `request changes`.
+fn normalize_alias(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    let mut out = String::with_capacity(lower.len());
+    let mut in_sep = false;
+    for c in lower.chars() {
+        if c == '_' || c == '-' || c.is_whitespace() {
+            if !in_sep && !out.is_empty() {
+                out.push(' ');
+            }
+            in_sep = true;
+        } else {
+            out.push(c);
+            in_sep = false;
+        }
+    }
+    // Trailing separator run left a trailing space.
+    while out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+/// Map a normalized alias to a canonical Verdict. Returns `None` for
+/// unrecognized values (which fall through to `Verdict::Missing`).
+///
+/// mika#1828 AC2 alias table. Default-safer target for CHANGES aliases is
+/// `Block("ac")` (AC-fix path is retriable; security/pipeline would misroute).
+fn alias_to_verdict(normalized: &str) -> Option<Verdict> {
+    match normalized {
+        "request changes" | "request change" | "changes requested" => {
+            Some(Verdict::Block("ac".to_string()))
+        }
+        "approve" | "approved" => Some(Verdict::Pass),
+        _ => None,
+    }
+}
+
 /// Parse a verdict from a review body.
 pub(crate) fn parse_verdict(body: &str) -> Verdict {
     if let Some(caps) = VERDICT_RE.captures(body) {
-        let value = caps[1].trim();
+        // The regex captured to end-of-line. Two-step normalization
+        // (mika#1828 D1):
+        // 1. Strip leading emphasis (`**`, `__`, `*`, `_` runs) — handles
+        //    `**block[ac]` (unbalanced) and `*value*` (single-emphasis).
+        // 2. Then find the FIRST trailing `**`/`__` in the remaining string
+        //    and truncate at it — handles `X** — trailing comment` shape from
+        //    PR #1821. Truncating first would over-eat `**value` cases.
+        let raw = caps[1].trim();
+        let stripped_leading = raw.trim_start_matches(['*', '_']);
+        let truncated_at_close = stripped_leading
+            .find("**")
+            .or_else(|| stripped_leading.find("__"))
+            .map(|pos| &stripped_leading[..pos])
+            .unwrap_or(stripped_leading);
+        let value = strip_md_emphasis(truncated_at_close.trim()).trim();
 
         if value.eq_ignore_ascii_case("pass") {
             return Verdict::Pass;
@@ -120,6 +187,22 @@ pub(crate) fn parse_verdict(body: &str) -> Verdict {
 
         if let Some(hcaps) = HOLD_RE.captures(value) {
             return Verdict::Hold(hcaps[1].to_string());
+        }
+
+        // mika#1828 AC2: alias fallback. GitHub-review-state-adjacent tokens
+        // (`REQUEST CHANGES`, `REQUEST_CHANGES`, `CHANGES_REQUESTED`, `APPROVE`,
+        // `APPROVED`) map to canonical Verdicts. Runs after the exact
+        // canonical checks so a legitimate `block[ac]` is never rewritten.
+        let normalized = normalize_alias(value);
+        if let Some(mapped) = alias_to_verdict(&normalized) {
+            info!(
+                event = "verdict_alias_normalized",
+                raw_value = value,
+                normalized = normalized.as_str(),
+                mapped_to = ?mapped,
+                "verdict: normalized non-canonical alias to canonical verdict (mika#1828)"
+            );
+            return mapped;
         }
 
         // Unrecognized verdict value
@@ -324,5 +407,154 @@ Please fix the pipeline issues.";
     fn parse_depth_first_match_wins() {
         let body = "DEPTH: code-level\nDEPTH: metadata-only";
         assert_eq!(parse_review_depth(body), Some(ReviewDepth::CodeLevel));
+    }
+
+    // --- mika#1828: markdown-bold + alias tolerance tests -------------------
+
+    #[test]
+    fn parse_verdict_markdown_bold_pass() {
+        assert_eq!(parse_verdict("**VERDICT: pass**"), Verdict::Pass);
+    }
+
+    #[test]
+    fn parse_verdict_markdown_bold_all_canonical_classes() {
+        assert_eq!(
+            parse_verdict("**Verdict: block[ac]**"),
+            Verdict::Block("ac".to_string())
+        );
+        assert_eq!(
+            parse_verdict("**VERDICT: block[ci]**"),
+            Verdict::Block("ci".to_string())
+        );
+        assert_eq!(
+            parse_verdict("**VERDICT: block[security]**"),
+            Verdict::Block("security".to_string())
+        );
+        assert_eq!(
+            parse_verdict("**VERDICT: block[pipeline]**"),
+            Verdict::Block("pipeline".to_string())
+        );
+        assert_eq!(
+            parse_verdict("**VERDICT: hold[review]**"),
+            Verdict::Hold("review".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_verdict_underscore_bold() {
+        assert_eq!(
+            parse_verdict("__VERDICT: block[ci]__"),
+            Verdict::Block("ci".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_verdict_single_emphasis_strip() {
+        // Single `*` isn't in the regex alternation, but `strip_md_emphasis`
+        // peels it as defense-in-depth.
+        assert_eq!(parse_verdict("*VERDICT: pass*"), Verdict::Pass);
+    }
+
+    #[test]
+    fn parse_verdict_alias_request_changes_space() {
+        assert_eq!(
+            parse_verdict("VERDICT: REQUEST CHANGES"),
+            Verdict::Block("ac".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_verdict_alias_request_changes_underscore() {
+        assert_eq!(
+            parse_verdict("VERDICT: REQUEST_CHANGES"),
+            Verdict::Block("ac".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_verdict_alias_changes_requested() {
+        assert_eq!(
+            parse_verdict("VERDICT: CHANGES_REQUESTED"),
+            Verdict::Block("ac".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_verdict_alias_hyphen_lowercase() {
+        assert_eq!(
+            parse_verdict("VERDICT: changes-requested"),
+            Verdict::Block("ac".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_verdict_alias_approve() {
+        assert_eq!(parse_verdict("VERDICT: APPROVE"), Verdict::Pass);
+    }
+
+    #[test]
+    fn parse_verdict_alias_approved_lowercase() {
+        assert_eq!(parse_verdict("VERDICT: approved"), Verdict::Pass);
+    }
+
+    /// mika#1828 founding regression — PR mika#1821 review body shape
+    /// (`**Verdict: REQUEST CHANGES**`). Both deviations (markdown-bold wrapper
+    /// AND non-canonical class token) combined. Must map to Block("ac") so the
+    /// handler dispatches the AC-fix path instead of `hold[review]` silent-drop.
+    #[test]
+    fn parse_verdict_pr1821_combined_shape() {
+        let body = "## QA Review — mika#1821\n\n\
+                    **Verdict: REQUEST CHANGES** — one blocking finding.";
+        assert_eq!(parse_verdict(body), Verdict::Block("ac".to_string()));
+    }
+
+    #[test]
+    fn parse_verdict_regression_no_emphasis_still_parses() {
+        // Regression guard for the non-greedy capture change — the plain
+        // `VERDICT: block[ac]` form must still parse (no emphasis to peel).
+        assert_eq!(
+            parse_verdict("VERDICT: block[ac]"),
+            Verdict::Block("ac".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_verdict_regression_frobnicate_still_missing() {
+        // Genuinely-unrecognized values (not in canonical set, not in alias
+        // table) must still return Missing — the alias fallback must not be a
+        // catch-all.
+        assert_eq!(
+            parse_verdict("VERDICT: frobnicate"),
+            Verdict::Missing { truncated: false }
+        );
+    }
+
+    #[test]
+    fn parse_verdict_unbalanced_emphasis_strips_gracefully() {
+        // `**block[ac]` (unbalanced opening emphasis, no closing). The strip
+        // helper peels the leading `**`, parser sees `block[ac]`, canonical
+        // block form matches.
+        assert_eq!(
+            parse_verdict("VERDICT: **block[ac]"),
+            Verdict::Block("ac".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_alias_handles_all_separators() {
+        assert_eq!(normalize_alias("REQUEST_CHANGES"), "request changes");
+        assert_eq!(normalize_alias("changes-requested"), "changes requested");
+        assert_eq!(normalize_alias("  Request  Changes  "), "request changes");
+        assert_eq!(normalize_alias("APPROVE"), "approve");
+    }
+
+    #[test]
+    fn strip_md_emphasis_edge_cases() {
+        assert_eq!(strip_md_emphasis("**bold**"), "bold");
+        assert_eq!(strip_md_emphasis("__underscored__"), "underscored");
+        assert_eq!(strip_md_emphasis("***triple***"), "triple");
+        assert_eq!(strip_md_emphasis("no emphasis"), "no emphasis");
+        assert_eq!(strip_md_emphasis(""), "");
+        assert_eq!(strip_md_emphasis("*single*"), "single");
     }
 }
