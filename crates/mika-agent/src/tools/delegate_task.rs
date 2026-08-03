@@ -53,7 +53,7 @@ impl Tool for DelegateTaskTool {
     }
 
     fn timeout_secs(&self) -> Option<u64> {
-        Some(120)
+        Some(crate::planning::policy::TEAM_AGENT_TIMEOUT_SECS)
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
