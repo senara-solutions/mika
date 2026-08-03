@@ -4184,6 +4184,33 @@ async fn run_team_agent_inner(
         .await
 }
 
+/// Emit a stage-timing INFO event for the team-agent pre-LLM prelude.
+/// Returns the current instant so the caller can chain (`prev = emit_team_stage(...)`).
+///
+/// Delegation-hang diagnostic: when `delegate_task`'s 120s tool timeout fires
+/// with zero LLM calls in the delegate session, this trail tells the operator
+/// exactly which prelude stage stalled. Grep `event = "team_agent_stage"` in
+/// `$MIKA_SPIRIT_LOG_FILE` for stage/elapsed_ms per session.
+fn emit_team_stage(
+    stage: &'static str,
+    agent_name: &str,
+    session_id: &str,
+    prev: Instant,
+) -> Instant {
+    let now = Instant::now();
+    let elapsed_ms = now.duration_since(prev).as_millis() as u64;
+    tracing::info!(
+        target: "mika::otel",
+        event = "team_agent_stage",
+        agent = agent_name,
+        session_id = session_id,
+        stage,
+        elapsed_ms,
+        "team_agent pre-LLM stage complete"
+    );
+    now
+}
+
 async fn run_team_agent_inner_impl(
     params: &TeamAgentParams<'_>,
     deadline: Instant,
@@ -4191,7 +4218,26 @@ async fn run_team_agent_inner_impl(
     let llm = params.llm;
     let tools = params.tools;
 
+    // Pre-LLM stage-timing observability (mika delegation-hang diagnostic).
+    // The delegate_task tool has a 120s timeout; when it fires the inner
+    // `run_team_agent` future is dropped, so if the hang is in the pre-LLM
+    // prelude we see ZERO downstream events (no llm_call, no tool_call).
+    // Without checkpoints between session-create and first LLM call, the
+    // operator can't tell whether the hang was in `load_agent_context`, in
+    // `resolve_github_token` (App token exchange network), in
+    // `resolve_contexts` (per-context fetch), or in tool injection.
+    // Six checkpoints, each with elapsed_ms since the previous one, keyed
+    // on `event = "team_agent_stage"` for grep-friendly log queries.
+    let stage_start = Instant::now();
+
     let ctx = load_agent_context(params.db, params.home_dir).await?;
+    let mut stage_prev = stage_start;
+    stage_prev = emit_team_stage(
+        "load_agent_context",
+        params.agent_name,
+        params.session_id,
+        stage_prev,
+    );
 
     let prompt_ctx = prompt::PromptContext {
         soul_content: &ctx.soul_content,
@@ -4221,6 +4267,12 @@ async fn run_team_agent_inner_impl(
         system.push_str(params.team_context);
         system.push('\n');
     }
+    stage_prev = emit_team_stage(
+        "build_system_prompt",
+        params.agent_name,
+        params.session_id,
+        stage_prev,
+    );
 
     // Resolve GitHub token once: prefer GitHub App installation token, fall back to PAT.
     let team_resolved_github_token = if let Some(settings) = params.settings {
@@ -4228,6 +4280,12 @@ async fn run_team_agent_inner_impl(
     } else {
         params.github_token.map(String::from)
     };
+    stage_prev = emit_team_stage(
+        "resolve_github_token",
+        params.agent_name,
+        params.session_id,
+        stage_prev,
+    );
 
     // Match skills and resolve tool definitions
     let mut matched = params.skills.match_message(params.task_message);
@@ -4236,6 +4294,12 @@ async fn run_team_agent_inner_impl(
     review_filter::apply_review_filter(&mut matched, params.task_message);
 
     let matched_entries: Vec<&SkillEntry> = matched.iter().map(|m| m.entry).collect();
+    stage_prev = emit_team_stage(
+        "match_skills",
+        params.agent_name,
+        params.session_id,
+        stage_prev,
+    );
 
     // Resolve context requirements before LLM override
     let (resolved_context, context_exclude) = context::resolve_contexts(
@@ -4248,6 +4312,12 @@ async fn run_team_agent_inner_impl(
     for &idx in context_exclude.iter().rev() {
         matched.remove(idx);
     }
+    let _ = emit_team_stage(
+        "resolve_contexts",
+        params.agent_name,
+        params.session_id,
+        stage_prev,
+    );
     // Resolve per-skill LLM override (keyword-matched skills only — #463)
     let skill_llm_override = resolve_skill_llm_override(&matched, params.settings, llm);
     let matched_entries: Vec<&SkillEntry> = matched.iter().map(|m| m.entry).collect();
