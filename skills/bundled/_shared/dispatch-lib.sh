@@ -190,6 +190,13 @@ _run_pilot_sandboxed() {
             --setenv HTTPS_PROXY "http://127.0.0.1:$_PILOT_EGRESS_TCP_PORT"
             --setenv HTTP_PROXY "http://127.0.0.1:$_PILOT_EGRESS_TCP_PORT"
             --setenv NO_PROXY "localhost,127.0.0.1"
+            # Exec-si-contenu attestation for cpp (Vincent-ratified 2026-08-04).
+            # Only set in Phase 2b full mode (fs+net+kernel cut ALL active).
+            # cpp reads this env at classify-time and enables the safe-exec
+            # tier1 primitives (node/python3/cargo/npm) SOLELY when this
+            # attestation is present. Phase 2a fallback (net open) intentionally
+            # does NOT set this — safe-exec stays denied, invariant preserved.
+            --setenv MIKA_PILOT_CONTAINED "1"
         )
         # sh -c wrapper that starts the shim, waits for it, execs the pilot,
         # cleans up on exit. `exec` in the final position ensures the pilot's
