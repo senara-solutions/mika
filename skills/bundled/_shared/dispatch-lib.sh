@@ -86,6 +86,62 @@ _pilot_sandbox_enabled() {
     esac
 }
 
+# Phase 2b (network cut): egress-proxy unix socket path + sandbox-side TCP
+# bridge port. The proxy script is installed to ~/.local/bin by `make install`
+# and speaks HTTP CONNECT with a hostname allowlist. See
+# scripts/mika-pilot-egress-proxy for the allowlist + threat model.
+_PILOT_EGRESS_SOCK="/tmp/mika-pilot-egress.sock"
+_PILOT_EGRESS_TCP_PORT="8891"
+_PILOT_EGRESS_PROXY_BIN="$HOME/.local/bin/mika-pilot-egress-proxy"
+
+# Idempotent host-side egress proxy launcher. Runs once per host; on subsequent
+# calls, verifies the daemon is alive and returns. Fail-open on missing binary
+# (Phase 2b not yet deployed) — sandbox falls back to Phase 2a (fs cut only,
+# network open) so the pilot still functions during the deploy window.
+_ensure_pilot_egress_proxy() {
+    if [ ! -x "$_PILOT_EGRESS_PROXY_BIN" ]; then
+        echo "dispatch-lib: mika-pilot-egress-proxy not found at $_PILOT_EGRESS_PROXY_BIN — Phase 2b network cut disabled (falling back to fs-only)" >&2
+        return 1
+    fi
+    # Liveness probe: socket exists + accepts a connection.
+    if [ -S "$_PILOT_EGRESS_SOCK" ] && python3 -c "
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(1)
+try:
+    s.connect('$_PILOT_EGRESS_SOCK')
+    s.close()
+    sys.exit(0)
+except OSError:
+    sys.exit(1)
+" 2>/dev/null; then
+        return 0  # already alive
+    fi
+    # Launch as detached daemon. Log to /var/log/mika/ if writable, else stderr.
+    local log_dir="/var/log/mika"
+    local log_file
+    if [ -w "$log_dir" ] || mkdir -p "$log_dir" 2>/dev/null; then
+        log_file="$log_dir/pilot-egress-proxy.log"
+    else
+        log_file="/tmp/mika-pilot-egress-proxy.log"
+    fi
+    nohup "$_PILOT_EGRESS_PROXY_BIN" --host-unix --socket "$_PILOT_EGRESS_SOCK" \
+        >>"$log_file" 2>&1 </dev/null &
+    disown 2>/dev/null || true
+    # Wait for socket to appear (bounded).
+    local i=0
+    while [ $i -lt 20 ] && [ ! -S "$_PILOT_EGRESS_SOCK" ]; do
+        sleep 0.1
+        i=$((i + 1))
+    done
+    if [ ! -S "$_PILOT_EGRESS_SOCK" ]; then
+        echo "dispatch-lib: pilot-egress-proxy failed to bind $_PILOT_EGRESS_SOCK within 2s — falling back to fs-only" >&2
+        return 1
+    fi
+    echo "dispatch-lib: pilot-egress-proxy launched (pid $!, log $log_file)" >&2
+    return 0
+}
+
 # Passthrough env allowlist: after `--clearenv`, these vars are re-injected
 # via `--setenv` when present in the parent env. Deliberately narrow — any
 # non-listed var (AWS_*, NPM_TOKEN, ATLASSIAN_API_TOKEN, non-MIKA_
@@ -116,6 +172,31 @@ _run_pilot_sandboxed() {
     # here so the bind is stable even on a fresh install.
     mkdir -p "$HOME/.mika/data/pilot-transcripts" 2>/dev/null || true
 
+    # Phase 2b: launch host-side egress proxy (idempotent). If it's not
+    # available (binary missing, first deploy), returns non-zero and we run
+    # in Phase 2a mode (fs cut only, network open) — degraded but functional.
+    local -a net_bwrap_args=()
+    local -a net_setenv_args=()
+    local sandbox_entrypoint_prefix=""
+    if _ensure_pilot_egress_proxy; then
+        # Full Phase 2b: unshare-net + bind unix socket + wrap with in-sandbox
+        # TCP→unix shim + HTTPS_PROXY pointing at shim.
+        net_bwrap_args=(
+            --unshare-net
+            --bind "$_PILOT_EGRESS_SOCK" "$_PILOT_EGRESS_SOCK"
+            --ro-bind "$_PILOT_EGRESS_PROXY_BIN" "$_PILOT_EGRESS_PROXY_BIN"
+        )
+        net_setenv_args=(
+            --setenv HTTPS_PROXY "http://127.0.0.1:$_PILOT_EGRESS_TCP_PORT"
+            --setenv HTTP_PROXY "http://127.0.0.1:$_PILOT_EGRESS_TCP_PORT"
+            --setenv NO_PROXY "localhost,127.0.0.1"
+        )
+        # sh -c wrapper that starts the shim, waits for it, execs the pilot,
+        # cleans up on exit. `exec` in the final position ensures the pilot's
+        # exit status becomes the sh's.
+        sandbox_entrypoint_prefix="/bin/sh"
+    fi
+
     local -a setenv_args=()
     local var
     for var in "${_PILOT_SANDBOX_ENV_ALLOWLIST[@]}"; do
@@ -130,45 +211,115 @@ _run_pilot_sandboxed() {
     # share/uv/credentials/ / .env respectively. Adding a new bind requires
     # confirming its subtree carries no cred-shaped file (see
     # coherence audit 2026-08-04).
-    bwrap \
-        --as-pid-1 \
-        --unshare-user \
-        --unshare-pid \
-        --unshare-ipc \
-        --unshare-uts \
-        --unshare-cgroup \
-        --new-session \
-        --die-with-parent \
-        --clearenv \
-        --ro-bind /usr /usr \
-        --ro-bind-try /lib /lib \
-        --ro-bind-try /lib64 /lib64 \
-        --ro-bind /bin /bin \
-        --ro-bind-try /sbin /sbin \
-        --ro-bind /etc /etc \
-        --ro-bind-try /opt /opt \
-        --dev /dev \
-        --proc /proc \
-        --tmpfs /tmp \
-        --tmpfs /var/tmp \
-        --tmpfs /run \
-        --tmpfs /home \
-        --bind "$WORKTREE_DIR" "$WORKTREE_DIR" \
-        --ro-bind-try "$HOME/.local/bin/claude-pilot" "$HOME/.local/bin/claude-pilot" \
-        --ro-bind-try "$HOME/.local/share/uv/tools/claude-pilot" "$HOME/.local/share/uv/tools/claude-pilot" \
-        --ro-bind-try "$HOME/.claude/plugins" "$HOME/.claude/plugins" \
-        --ro-bind-try "$HOME/.claude/settings.json" "$HOME/.claude/settings.json" \
-        --ro-bind-try "$HOME/.claude/commands" "$HOME/.claude/commands" \
-        --ro-bind-try "$HOME/.claude/hooks" "$HOME/.claude/hooks" \
-        --ro-bind-try "$HOME/.nvm/versions" "$HOME/.nvm/versions" \
-        --ro-bind-try "$HOME/.cargo/registry" "$HOME/.cargo/registry" \
-        --ro-bind-try "$HOME/.cargo/config.toml" "$HOME/.cargo/config.toml" \
-        --ro-bind-try "$HOME/.cargo/bin" "$HOME/.cargo/bin" \
-        --ro-bind-try "$HOME/.rustup" "$HOME/.rustup" \
-        --bind "$HOME/.mika/data/pilot-transcripts" "$HOME/.mika/data/pilot-transcripts" \
-        "${setenv_args[@]}" \
-        --chdir "$WORKTREE_DIR" \
-        -- "$@"
+    if [ -n "$sandbox_entrypoint_prefix" ]; then
+        # Phase 2b mode: quote the original argv so the sh -c can re-exec it
+        # verbatim. Uses `printf '%q'` for shell-safe re-quoting.
+        local quoted_argv
+        quoted_argv=$(printf ' %q' "$@")
+        bwrap \
+            --as-pid-1 \
+            --unshare-user \
+            --unshare-pid \
+            --unshare-ipc \
+            --unshare-uts \
+            --unshare-cgroup \
+            --new-session \
+            --die-with-parent \
+            --clearenv \
+            --ro-bind /usr /usr \
+            --ro-bind-try /lib /lib \
+            --ro-bind-try /lib64 /lib64 \
+            --ro-bind /bin /bin \
+            --ro-bind-try /sbin /sbin \
+            --ro-bind /etc /etc \
+            --ro-bind-try /opt /opt \
+            --dev /dev \
+            --proc /proc \
+            --tmpfs /tmp \
+            --tmpfs /var/tmp \
+            --tmpfs /run \
+            --tmpfs /home \
+            --bind "$WORKTREE_DIR" "$WORKTREE_DIR" \
+            --ro-bind-try "$HOME/.local/bin/claude-pilot" "$HOME/.local/bin/claude-pilot" \
+            --ro-bind-try "$HOME/.local/share/uv/tools/claude-pilot" "$HOME/.local/share/uv/tools/claude-pilot" \
+            --ro-bind-try "$HOME/.claude/plugins" "$HOME/.claude/plugins" \
+            --ro-bind-try "$HOME/.claude/settings.json" "$HOME/.claude/settings.json" \
+            --ro-bind-try "$HOME/.claude/commands" "$HOME/.claude/commands" \
+            --ro-bind-try "$HOME/.claude/hooks" "$HOME/.claude/hooks" \
+            --ro-bind-try "$HOME/.nvm/versions" "$HOME/.nvm/versions" \
+            --ro-bind-try "$HOME/.cargo/registry" "$HOME/.cargo/registry" \
+            --ro-bind-try "$HOME/.cargo/config.toml" "$HOME/.cargo/config.toml" \
+            --ro-bind-try "$HOME/.cargo/bin" "$HOME/.cargo/bin" \
+            --ro-bind-try "$HOME/.rustup" "$HOME/.rustup" \
+            --bind "$HOME/.mika/data/pilot-transcripts" "$HOME/.mika/data/pilot-transcripts" \
+            "${net_bwrap_args[@]}" \
+            "${setenv_args[@]}" \
+            "${net_setenv_args[@]}" \
+            --chdir "$WORKTREE_DIR" \
+            -- "$sandbox_entrypoint_prefix" -c "
+python3 '$_PILOT_EGRESS_PROXY_BIN' --sandbox-tcp $_PILOT_EGRESS_TCP_PORT --socket '$_PILOT_EGRESS_SOCK' >&2 &
+_shim_pid=\$!
+# Bounded wait for shim to listen (max ~1s).
+_i=0
+while [ \$_i -lt 20 ]; do
+    if python3 -c 'import socket
+s=socket.socket()
+s.settimeout(0.1)
+try:
+    s.connect((\"127.0.0.1\", $_PILOT_EGRESS_TCP_PORT))
+    s.close()
+except Exception:
+    exit(1)' 2>/dev/null; then
+        break
+    fi
+    sleep 0.05
+    _i=\$((_i + 1))
+done
+trap 'kill \$_shim_pid 2>/dev/null' EXIT
+$quoted_argv
+"
+    else
+        # Phase 2a fallback: fs cut only, network unrestricted.
+        bwrap \
+            --as-pid-1 \
+            --unshare-user \
+            --unshare-pid \
+            --unshare-ipc \
+            --unshare-uts \
+            --unshare-cgroup \
+            --new-session \
+            --die-with-parent \
+            --clearenv \
+            --ro-bind /usr /usr \
+            --ro-bind-try /lib /lib \
+            --ro-bind-try /lib64 /lib64 \
+            --ro-bind /bin /bin \
+            --ro-bind-try /sbin /sbin \
+            --ro-bind /etc /etc \
+            --ro-bind-try /opt /opt \
+            --dev /dev \
+            --proc /proc \
+            --tmpfs /tmp \
+            --tmpfs /var/tmp \
+            --tmpfs /run \
+            --tmpfs /home \
+            --bind "$WORKTREE_DIR" "$WORKTREE_DIR" \
+            --ro-bind-try "$HOME/.local/bin/claude-pilot" "$HOME/.local/bin/claude-pilot" \
+            --ro-bind-try "$HOME/.local/share/uv/tools/claude-pilot" "$HOME/.local/share/uv/tools/claude-pilot" \
+            --ro-bind-try "$HOME/.claude/plugins" "$HOME/.claude/plugins" \
+            --ro-bind-try "$HOME/.claude/settings.json" "$HOME/.claude/settings.json" \
+            --ro-bind-try "$HOME/.claude/commands" "$HOME/.claude/commands" \
+            --ro-bind-try "$HOME/.claude/hooks" "$HOME/.claude/hooks" \
+            --ro-bind-try "$HOME/.nvm/versions" "$HOME/.nvm/versions" \
+            --ro-bind-try "$HOME/.cargo/registry" "$HOME/.cargo/registry" \
+            --ro-bind-try "$HOME/.cargo/config.toml" "$HOME/.cargo/config.toml" \
+            --ro-bind-try "$HOME/.cargo/bin" "$HOME/.cargo/bin" \
+            --ro-bind-try "$HOME/.rustup" "$HOME/.rustup" \
+            --bind "$HOME/.mika/data/pilot-transcripts" "$HOME/.mika/data/pilot-transcripts" \
+            "${setenv_args[@]}" \
+            --chdir "$WORKTREE_DIR" \
+            -- "$@"
+    fi
 }
 
 # mika#749: TERM trap writes cancel discriminator before exit.
