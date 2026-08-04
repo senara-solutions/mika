@@ -65,6 +65,70 @@ pub(crate) fn scrub_mika_env_vars_std(cmd: &mut std::process::Command) {
     }
 }
 
+/// Baseline exact-match allowlist for [`is_sandbox_env_allowed`]. Every well-behaved
+/// subprocess needs these — missing `PATH` breaks every exec, missing `HOME` breaks
+/// every `~/.config/…` read. Kept narrow: no key here may start with `MIKA_`.
+const SANDBOX_ENV_CORE_ALLOWLIST: &[&str] = &[
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "LC_ALL", "TMPDIR", "HOSTNAME",
+];
+
+/// Prefix-match allowlist for [`is_sandbox_env_allowed`]. Wildcard families the
+/// pilot subprocess needs to interoperate with system tooling. Deliberately covers
+/// only NON-secret families — no `AWS_`, no `OPENAI_`, no `NODE_AUTH_`.
+const SANDBOX_ENV_ALLOWED_PREFIXES: &[&str] = &[
+    "LC_",     // locale variants (LC_MESSAGES, LC_NUMERIC, …) — user's shell
+    "XDG_",    // Claude Code plugin cache, gh config, freedesktop paths
+    "NVM_",    // nvm-managed node runtime discovery
+    "CARGO_",  // cargo build cache / config for pilot-invoked builds
+    "RUSTUP_", // rustup toolchain resolution
+];
+
+/// Pure predicate for the [`sandboxed_pilot_env`] allowlist. Extracted for
+/// unit-testing so the shape can be verified without spawning a subprocess or
+/// mutating the process-wide env.
+fn is_sandbox_env_allowed(key: &str) -> bool {
+    // Never allow a MIKA_* key through even if it were listed — defense against
+    // a future refactor that adds one to the core list. Composed with the
+    // debug_assert in `sandboxed_pilot_env` for both dynamic and static checks.
+    if key.starts_with("MIKA_") {
+        return false;
+    }
+    if SANDBOX_ENV_CORE_ALLOWLIST.contains(&key) {
+        return true;
+    }
+    SANDBOX_ENV_ALLOWED_PREFIXES
+        .iter()
+        .any(|p| key.starts_with(p))
+}
+
+/// Positive-allowlist environment for the pilot subprocess — used by
+/// [`spawn_long_running_exec`] which invokes claude-pilot in the highest-untrust
+/// context on the platform (LLM-generated commands running via cpp).
+///
+/// Strictly stronger than [`scrub_mika_env_vars`]: instead of removing MIKA_\*
+/// (negative shape), this clears the entire env and copies only the vars matched
+/// by [`is_sandbox_env_allowed`]. Any operator-injected token not in the allowlist
+/// (`AWS_*`, `OPENAI_*` without the MIKA_ prefix, `NODE_AUTH_TOKEN`, `NPM_TOKEN`,
+/// custom credential vars) cannot leak by inheritance.
+///
+/// Callers still re-inject `GH_TOKEN` and `ANTHROPIC_LOG_FILE` AFTER this call, same
+/// as with the older scrub. See mika#TBD (Phase 1 of dev-pilot containment layer,
+/// coupled to bubblewrap fs+network isolation in Phase 2).
+pub(crate) fn sandboxed_pilot_env(cmd: &mut tokio::process::Command) {
+    cmd.env_clear();
+    for (key, value) in std::env::vars() {
+        if is_sandbox_env_allowed(&key) {
+            cmd.env(&key, &value);
+        }
+    }
+    debug_assert!(
+        SANDBOX_ENV_CORE_ALLOWLIST
+            .iter()
+            .all(|k| !k.starts_with("MIKA_")),
+        "SANDBOX_ENV_CORE_ALLOWLIST contains a MIKA_ variable — a secret would leak"
+    );
+}
+
 /// Environment variable claude-pilot-py honors to append a per-LLM-call JSONL
 /// transcript (mika#1705). Deliberately non-`MIKA_*` so it survives the
 /// child-env scrub in [`scrub_mika_env_vars`] and flows through dispatch-lib.sh
@@ -2243,12 +2307,17 @@ pub(crate) fn spawn_long_running_exec(
             .env_remove("TMUX_PANE")
             .kill_on_drop(false)
             .process_group(0); // Make child a process group leader (#855)
-        scrub_mika_env_vars(&mut cmd);
+        // Positive-allowlist env (Phase 1 of dev-pilot containment). Strictly
+        // stronger than the legacy MIKA_* scrub: any operator token outside
+        // the allowlist (AWS_*, NODE_AUTH_TOKEN, non-MIKA_ OPENAI_/ANTHROPIC_,
+        // etc.) cannot leak by inheritance. Companion to Phase 2 (bubblewrap
+        // fs+network isolation).
+        sandboxed_pilot_env(&mut cmd);
         if let Some(ref token) = github_token {
             cmd.env("GH_TOKEN", token);
         }
         // mika#1705: enable claude-pilot subprocess LLM-transcript capture.
-        // Injected AFTER the MIKA_* scrub so the non-MIKA var survives.
+        // Injected AFTER the env sandbox so the non-allowlisted var survives.
         inject_pilot_transcript_env(&mut cmd, &skill_dir, &task_id);
         let mut child = match cmd.spawn() {
             Ok(child) => child,
@@ -2380,6 +2449,64 @@ mod tests {
     use mika_common::claude::ToolDefinition;
     use std::fs;
     use std::path::PathBuf;
+
+    #[test]
+    fn sandbox_env_allows_core_vars() {
+        for key in [
+            "PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "TERM", "TMPDIR",
+        ] {
+            assert!(
+                is_sandbox_env_allowed(key),
+                "core var {key} must be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_env_allows_prefix_families() {
+        for key in [
+            "LC_MESSAGES",
+            "XDG_CONFIG_HOME",
+            "XDG_RUNTIME_DIR",
+            "NVM_DIR",
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+        ] {
+            assert!(
+                is_sandbox_env_allowed(key),
+                "prefix-family var {key} must be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_env_denies_secret_vars() {
+        for key in [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "NODE_AUTH_TOKEN",
+            "NPM_TOKEN",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GH_TOKEN",
+            "MIKA_ANTHROPIC_API_KEY",
+            "MIKA_INTERNAL_TOKEN",
+            "MIKA_GITHUB_APP_PRIVATE_KEY",
+        ] {
+            assert!(
+                !is_sandbox_env_allowed(key),
+                "secret-shaped var {key} must NOT be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_env_denies_mika_prefixed_vars_even_if_core_listed() {
+        // Defense against a future refactor accidentally adding a MIKA_ key
+        // to the core allowlist: the MIKA_ prefix check runs first.
+        assert!(!is_sandbox_env_allowed("MIKA_PATH"));
+        assert!(!is_sandbox_env_allowed("MIKA_"));
+    }
 
     /// Write a script file and make it executable, with fsync to avoid races.
     fn write_script(path: &std::path::Path, content: &str) {
