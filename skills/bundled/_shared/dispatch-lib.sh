@@ -29,31 +29,55 @@
 
 # mika#TBD (containment Phase 2a): fs-cut sandbox for the pilot subprocess.
 # Prepends bwrap to the claude-pilot invocation so the process runs with a
-# minimal-visibility filesystem — ~/.ssh, ~/.aws, ~/.mika/.env, and other
-# operator-home secrets become invisible (tmpfs /home covers them; explicit
-# binds re-expose only what the pilot legitimately needs).
+# minimal-visibility filesystem AND a clean environment AND fresh kernel
+# namespaces (pid/ipc/uts/cgroup/user). Combined with the caller's env
+# scrub (see executor.rs `sandboxed_pilot_env`), the pilot cannot see or
+# exfiltrate operator-home secrets, cross-repo worktrees, other host
+# processes' env vars, or host IPC channels.
 #
-# Design (Phase 2a, fs-only):
-#   * `--ro-bind / /`     : root fs read-only baseline (bins, libs, /etc, …)
-#   * `--tmpfs /home`     : blanks the operator home — key protection
-#   * bind narrow subset  : ~/.local, ~/.claude, ~/.nvm, ~/.config/gh, ~/.mika/data
-#                           (writable — pilot needs to log/read/execute here)
-#   * `--bind $WORKTREE`  : the branch worktree, writable (git-plumbing target)
-#   * `--dev /dev --proc /proc --tmpfs /tmp` : minimal virtual filesystems
-#   * `--chdir $WORKTREE_DIR --setenv HOME $HOME` : preserve invocation semantics
+# Design (Phase 2a, fs-only — Phase 2b adds `--unshare-net` + egress relay):
 #
-# NOT included in Phase 2a: network cut (`--unshare-net` or nftables egress).
+#   Kernel isolation:
+#     * `--as-pid-1`           make the pilot PID 1 in the namespace (removes
+#                              the bwrap reaper whose /proc/1/environ would
+#                              leak the mika-spirit host env with API keys)
+#     * `--unshare-user/pid/ipc/uts/cgroup` — no cross-process channel back
+#                              to host, /proc shows only sandbox processes
+#     * `--new-session --die-with-parent` — no controlling tty, sandbox dies
+#                              with parent
+#     * `--clearenv` + `--setenv ...` — env allowlist (no ANTHROPIC_API_KEY /
+#                              AWS_* / NPM_TOKEN inheritance)
+#
+#   Filesystem allowlist (no `--ro-bind / /` — that would expose /var, /srv,
+#                        cross-worktree /data/workspace paths):
+#     * ro binds : /usr, /bin, /sbin, /lib, /lib64, /etc, /opt
+#                   (toolchain, ca-certs, resolver config, rust runtime)
+#     * tmpfs   : /home, /tmp, /var/tmp, /run
+#                   (blanks operator-home + host tempdirs)
+#     * ro binds under /home (must come AFTER `--tmpfs /home`) :
+#                 ~/.local (uv + claude-pilot binary), ~/.claude (plugin cache),
+#                 ~/.nvm (node runtime), ~/.cargo/{registry,config.toml,bin}
+#                 (crate cache + config — NOT credentials.toml)
+#     * rw binds: $WORKTREE_DIR (branch worktree), ~/.mika/data (transcripts)
+#
+#   NOT bound (per coherence threat-model review):
+#     * ~/.ssh, ~/.aws, ~/.config, ~/.mika (except /data), /var/spool/*
+#     * ~/.cargo/credentials.toml (cargo publish secret — dev-pilot never
+#                                  publishes; safe to omit)
+#     * ~/.config/gh (contains hosts.yml with gh token) — gh CLI uses the
+#                     GH_TOKEN env var re-injected below
+#     * $SSH_AUTH_SOCK, docker.sock, dbus, cm/NATS unix sockets
+#     * /data/workspace outside the branch worktree (other worktrees + repos)
+#
+# NOT included in Phase 2a: network cut (`--unshare-net` + egress relay).
 # Phase 2b tracks that separately — until it lands, an in-sandbox process
-# still has full outbound network access. Env-scrub (PR#1893) is the
-# orthogonal defense reducing what the process sees at all.
+# still has full outbound network access (can exfil via HTTP, DNS, SNI).
+# The invariant "Exec-si-contenu" holds only after Phase 2a + 2b ship.
 #
-# Opt-out: `MIKA_PILOT_SANDBOX=0` (or any of `false`/`no`/`off`, case-insensitive)
-# reverts to direct invocation. Default: enabled (Phase 2a is safe fallback —
-# fs cut hides secrets, never breaks legitimate reads of allowlisted paths).
-#
-# The helper prints its resolved bwrap prefix to stdout; callers use it via
-# command substitution:  eval "$(_pilot_sandbox_prefix) claude-pilot …"
-# Empty output when sandbox disabled — callers can invoke claude-pilot direct.
+# Opt-out: `MIKA_PILOT_SANDBOX=0` (or `false`/`no`/`off`/`disabled`,
+# case-insensitive) reverts to direct invocation. Default: enabled. Also
+# degrades gracefully to direct invocation if `bwrap` is not on PATH
+# (WARN-logged) — first-rollout deployment tolerance.
 _pilot_sandbox_enabled() {
     local mode="${MIKA_PILOT_SANDBOX:-1}"
     case "$(echo "$mode" | tr '[:upper:]' '[:lower:]')" in
@@ -61,6 +85,18 @@ _pilot_sandbox_enabled() {
         *) return 0 ;;
     esac
 }
+
+# Passthrough env allowlist: after `--clearenv`, these vars are re-injected
+# via `--setenv` when present in the parent env. Deliberately narrow — any
+# non-listed var (AWS_*, NPM_TOKEN, ATLASSIAN_API_TOKEN, non-MIKA_
+# OPENAI_/ANTHROPIC_, etc.) is DROPPED by --clearenv and does not reach the
+# sandbox. `GH_TOKEN` is passed through so `gh` works without needing
+# ~/.config/gh (which stays hidden). `ANTHROPIC_LOG_FILE` is the pilot
+# transcript hook (mika#1705). `MIKA_LOG_PILOT_TRANSCRIPTS` gates transcript.
+_PILOT_SANDBOX_ENV_ALLOWLIST=(
+    HOME PATH USER LOGNAME SHELL TERM LANG LC_ALL TMPDIR HOSTNAME
+    GH_TOKEN ANTHROPIC_LOG_FILE MIKA_LOG_PILOT_TRANSCRIPTS
+)
 
 _run_pilot_sandboxed() {
     # Runs "$@" (the full claude-pilot invocation) under bwrap when enabled,
@@ -74,19 +110,46 @@ _run_pilot_sandboxed() {
         "$@"
         return $?
     fi
+    local -a setenv_args=()
+    local var
+    for var in "${_PILOT_SANDBOX_ENV_ALLOWLIST[@]}"; do
+        if [ -n "${!var:-}" ]; then
+            setenv_args+=(--setenv "$var" "${!var}")
+        fi
+    done
     bwrap \
-        --ro-bind / / \
+        --as-pid-1 \
+        --unshare-user \
+        --unshare-pid \
+        --unshare-ipc \
+        --unshare-uts \
+        --unshare-cgroup \
+        --new-session \
+        --die-with-parent \
+        --clearenv \
+        --ro-bind /usr /usr \
+        --ro-bind-try /lib /lib \
+        --ro-bind-try /lib64 /lib64 \
+        --ro-bind /bin /bin \
+        --ro-bind-try /sbin /sbin \
+        --ro-bind /etc /etc \
+        --ro-bind-try /opt /opt \
+        --dev /dev \
+        --proc /proc \
+        --tmpfs /tmp \
+        --tmpfs /var/tmp \
+        --tmpfs /run \
         --tmpfs /home \
         --bind "$WORKTREE_DIR" "$WORKTREE_DIR" \
-        --bind "$HOME/.local" "$HOME/.local" \
-        --bind "$HOME/.claude" "$HOME/.claude" \
-        --bind "$HOME/.config/gh" "$HOME/.config/gh" \
-        --bind "$HOME/.nvm" "$HOME/.nvm" \
+        --ro-bind-try "$HOME/.local" "$HOME/.local" \
+        --ro-bind-try "$HOME/.claude" "$HOME/.claude" \
+        --ro-bind-try "$HOME/.nvm" "$HOME/.nvm" \
+        --ro-bind-try "$HOME/.cargo/registry" "$HOME/.cargo/registry" \
+        --ro-bind-try "$HOME/.cargo/config.toml" "$HOME/.cargo/config.toml" \
+        --ro-bind-try "$HOME/.cargo/bin" "$HOME/.cargo/bin" \
         --bind "$HOME/.mika/data" "$HOME/.mika/data" \
-        --dev /dev --proc /proc --tmpfs /tmp \
+        "${setenv_args[@]}" \
         --chdir "$WORKTREE_DIR" \
-        --setenv HOME "$HOME" \
-        --setenv PATH "$PATH" \
         -- "$@"
 }
 
