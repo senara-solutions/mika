@@ -110,6 +110,12 @@ _run_pilot_sandboxed() {
         "$@"
         return $?
     fi
+    # Ensure pilot-transcript dir exists BEFORE the bind — bwrap refuses to
+    # bind a source path that doesn't exist. The dir is created on demand by
+    # mika#1705 anyway when the first transcript flushes; we create it eagerly
+    # here so the bind is stable even on a fresh install.
+    mkdir -p "$HOME/.mika/data/pilot-transcripts" 2>/dev/null || true
+
     local -a setenv_args=()
     local var
     for var in "${_PILOT_SANDBOX_ENV_ALLOWLIST[@]}"; do
@@ -117,6 +123,13 @@ _run_pilot_sandboxed() {
             setenv_args+=(--setenv "$var" "${!var}")
         fi
     done
+    # HOME bind property: EACH bind-in HOME must not carry any credential
+    # or session token. Enforced by narrow subpaths per family — never bind
+    # a whole family directory (~/.claude, ~/.local, ~/.mika) because those
+    # roots hold .credentials.json / share/jupyter/*_secret /
+    # share/uv/credentials/ / .env respectively. Adding a new bind requires
+    # confirming its subtree carries no cred-shaped file (see
+    # coherence audit 2026-08-04).
     bwrap \
         --as-pid-1 \
         --unshare-user \
@@ -141,13 +154,18 @@ _run_pilot_sandboxed() {
         --tmpfs /run \
         --tmpfs /home \
         --bind "$WORKTREE_DIR" "$WORKTREE_DIR" \
-        --ro-bind-try "$HOME/.local" "$HOME/.local" \
-        --ro-bind-try "$HOME/.claude" "$HOME/.claude" \
-        --ro-bind-try "$HOME/.nvm" "$HOME/.nvm" \
+        --ro-bind-try "$HOME/.local/bin/claude-pilot" "$HOME/.local/bin/claude-pilot" \
+        --ro-bind-try "$HOME/.local/share/uv/tools/claude-pilot" "$HOME/.local/share/uv/tools/claude-pilot" \
+        --ro-bind-try "$HOME/.claude/plugins" "$HOME/.claude/plugins" \
+        --ro-bind-try "$HOME/.claude/settings.json" "$HOME/.claude/settings.json" \
+        --ro-bind-try "$HOME/.claude/commands" "$HOME/.claude/commands" \
+        --ro-bind-try "$HOME/.claude/hooks" "$HOME/.claude/hooks" \
+        --ro-bind-try "$HOME/.nvm/versions" "$HOME/.nvm/versions" \
         --ro-bind-try "$HOME/.cargo/registry" "$HOME/.cargo/registry" \
         --ro-bind-try "$HOME/.cargo/config.toml" "$HOME/.cargo/config.toml" \
         --ro-bind-try "$HOME/.cargo/bin" "$HOME/.cargo/bin" \
-        --bind "$HOME/.mika/data" "$HOME/.mika/data" \
+        --ro-bind-try "$HOME/.rustup" "$HOME/.rustup" \
+        --bind "$HOME/.mika/data/pilot-transcripts" "$HOME/.mika/data/pilot-transcripts" \
         "${setenv_args[@]}" \
         --chdir "$WORKTREE_DIR" \
         -- "$@"
