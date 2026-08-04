@@ -27,6 +27,310 @@
 
 # --- Internal helpers (underscore-prefixed, not part of the API contract) ---
 
+# mika#TBD (containment Phase 2a): fs-cut sandbox for the pilot subprocess.
+# Prepends bwrap to the claude-pilot invocation so the process runs with a
+# minimal-visibility filesystem AND a clean environment AND fresh kernel
+# namespaces (pid/ipc/uts/cgroup/user). Combined with the caller's env
+# scrub (see executor.rs `sandboxed_pilot_env`), the pilot cannot see or
+# exfiltrate operator-home secrets, cross-repo worktrees, other host
+# processes' env vars, or host IPC channels.
+#
+# Design (Phase 2a, fs-only — Phase 2b adds `--unshare-net` + egress relay):
+#
+#   Kernel isolation:
+#     * `--as-pid-1`           make the pilot PID 1 in the namespace (removes
+#                              the bwrap reaper whose /proc/1/environ would
+#                              leak the mika-spirit host env with API keys)
+#     * `--unshare-user/pid/ipc/uts/cgroup` — no cross-process channel back
+#                              to host, /proc shows only sandbox processes
+#     * `--new-session --die-with-parent` — no controlling tty, sandbox dies
+#                              with parent
+#     * `--clearenv` + `--setenv ...` — env allowlist (no ANTHROPIC_API_KEY /
+#                              AWS_* / NPM_TOKEN inheritance)
+#
+#   Filesystem allowlist (no `--ro-bind / /` — that would expose /var, /srv,
+#                        cross-worktree /data/workspace paths):
+#     * ro binds : /usr, /bin, /sbin, /lib, /lib64, /etc, /opt
+#                   (toolchain, ca-certs, resolver config, rust runtime)
+#     * tmpfs   : /home, /tmp, /var/tmp, /run
+#                   (blanks operator-home + host tempdirs)
+#     * ro binds under /home (must come AFTER `--tmpfs /home`) :
+#                 ~/.local (uv + claude-pilot binary), ~/.claude (plugin cache),
+#                 ~/.nvm (node runtime), ~/.cargo/{registry,config.toml,bin}
+#                 (crate cache + config — NOT credentials.toml)
+#     * rw binds: $WORKTREE_DIR (branch worktree), ~/.mika/data (transcripts)
+#
+#   NOT bound (per coherence threat-model review):
+#     * ~/.ssh, ~/.aws, ~/.config, ~/.mika (except /data), /var/spool/*
+#     * ~/.cargo/credentials.toml (cargo publish secret — dev-pilot never
+#                                  publishes; safe to omit)
+#     * ~/.config/gh (contains hosts.yml with gh token) — gh CLI uses the
+#                     GH_TOKEN env var re-injected below
+#     * $SSH_AUTH_SOCK, docker.sock, dbus, cm/NATS unix sockets
+#     * /data/workspace outside the branch worktree (other worktrees + repos)
+#
+# NOT included in Phase 2a: network cut (`--unshare-net` + egress relay).
+# Phase 2b tracks that separately — until it lands, an in-sandbox process
+# still has full outbound network access (can exfil via HTTP, DNS, SNI).
+# The invariant "Exec-si-contenu" holds only after Phase 2a + 2b ship.
+#
+# Opt-out: `MIKA_PILOT_SANDBOX=0` (or `false`/`no`/`off`/`disabled`,
+# case-insensitive) reverts to direct invocation. Default: enabled. Also
+# degrades gracefully to direct invocation if `bwrap` is not on PATH
+# (WARN-logged) — first-rollout deployment tolerance.
+_pilot_sandbox_enabled() {
+    local mode="${MIKA_PILOT_SANDBOX:-1}"
+    case "$(echo "$mode" | tr '[:upper:]' '[:lower:]')" in
+        0|false|no|off|disabled) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# Phase 2b (network cut): egress-proxy unix socket path + sandbox-side TCP
+# bridge port. The proxy script is installed to ~/.local/bin by `make install`
+# and speaks HTTP CONNECT with a hostname allowlist. See
+# scripts/mika-pilot-egress-proxy for the allowlist + threat model.
+_PILOT_EGRESS_SOCK="/tmp/mika-pilot-egress.sock"
+_PILOT_EGRESS_TCP_PORT="8891"
+_PILOT_EGRESS_PROXY_BIN="$HOME/.local/bin/mika-pilot-egress-proxy"
+
+# Idempotent host-side egress proxy launcher. Runs once per host; on subsequent
+# calls, verifies the daemon is alive and returns. Fail-open on missing binary
+# (Phase 2b not yet deployed) — sandbox falls back to Phase 2a (fs cut only,
+# network open) so the pilot still functions during the deploy window.
+_ensure_pilot_egress_proxy() {
+    if [ ! -x "$_PILOT_EGRESS_PROXY_BIN" ]; then
+        echo "dispatch-lib: mika-pilot-egress-proxy not found at $_PILOT_EGRESS_PROXY_BIN — Phase 2b network cut disabled (falling back to fs-only)" >&2
+        return 1
+    fi
+    # Liveness probe: socket exists + accepts a connection.
+    if [ -S "$_PILOT_EGRESS_SOCK" ] && python3 -c "
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(1)
+try:
+    s.connect('$_PILOT_EGRESS_SOCK')
+    s.close()
+    sys.exit(0)
+except OSError:
+    sys.exit(1)
+" 2>/dev/null; then
+        return 0  # already alive
+    fi
+    # Launch as detached daemon. Log to /var/log/mika/ if writable, else stderr.
+    local log_dir="/var/log/mika"
+    local log_file
+    if [ -w "$log_dir" ] || mkdir -p "$log_dir" 2>/dev/null; then
+        log_file="$log_dir/pilot-egress-proxy.log"
+    else
+        log_file="/tmp/mika-pilot-egress-proxy.log"
+    fi
+    nohup "$_PILOT_EGRESS_PROXY_BIN" --host-unix --socket "$_PILOT_EGRESS_SOCK" \
+        >>"$log_file" 2>&1 </dev/null &
+    disown 2>/dev/null || true
+    # Wait for socket to appear (bounded).
+    local i=0
+    while [ $i -lt 20 ] && [ ! -S "$_PILOT_EGRESS_SOCK" ]; do
+        sleep 0.1
+        i=$((i + 1))
+    done
+    if [ ! -S "$_PILOT_EGRESS_SOCK" ]; then
+        echo "dispatch-lib: pilot-egress-proxy failed to bind $_PILOT_EGRESS_SOCK within 2s — falling back to fs-only" >&2
+        return 1
+    fi
+    echo "dispatch-lib: pilot-egress-proxy launched (pid $!, log $log_file)" >&2
+    return 0
+}
+
+# Passthrough env allowlist: after `--clearenv`, these vars are re-injected
+# via `--setenv` when present in the parent env. Deliberately narrow — any
+# non-listed var (AWS_*, NPM_TOKEN, ATLASSIAN_API_TOKEN, non-MIKA_
+# OPENAI_/ANTHROPIC_, etc.) is DROPPED by --clearenv and does not reach the
+# sandbox. `GH_TOKEN` is passed through so `gh` works without needing
+# ~/.config/gh (which stays hidden). `ANTHROPIC_LOG_FILE` is the pilot
+# transcript hook (mika#1705). `MIKA_LOG_PILOT_TRANSCRIPTS` gates transcript.
+_PILOT_SANDBOX_ENV_ALLOWLIST=(
+    HOME PATH USER LOGNAME SHELL TERM LANG LC_ALL TMPDIR HOSTNAME
+    GH_TOKEN ANTHROPIC_LOG_FILE MIKA_LOG_PILOT_TRANSCRIPTS
+)
+
+_run_pilot_sandboxed() {
+    # Runs "$@" (the full claude-pilot invocation) under bwrap when enabled,
+    # or direct-exec otherwise. Preserves stdin/stdout/stderr semantics.
+    if ! _pilot_sandbox_enabled; then
+        "$@"
+        return $?
+    fi
+    if ! command -v bwrap >/dev/null 2>&1; then
+        echo "dispatch-lib: MIKA_PILOT_SANDBOX enabled but bwrap not installed on PATH — falling back to direct invocation" >&2
+        "$@"
+        return $?
+    fi
+    # Ensure pilot-transcript dir exists BEFORE the bind — bwrap refuses to
+    # bind a source path that doesn't exist. The dir is created on demand by
+    # mika#1705 anyway when the first transcript flushes; we create it eagerly
+    # here so the bind is stable even on a fresh install.
+    mkdir -p "$HOME/.mika/data/pilot-transcripts" 2>/dev/null || true
+
+    # Phase 2b: launch host-side egress proxy (idempotent). If it's not
+    # available (binary missing, first deploy), returns non-zero and we run
+    # in Phase 2a mode (fs cut only, network open) — degraded but functional.
+    local -a net_bwrap_args=()
+    local -a net_setenv_args=()
+    local sandbox_entrypoint_prefix=""
+    if _ensure_pilot_egress_proxy; then
+        # Full Phase 2b: unshare-net + bind unix socket + wrap with in-sandbox
+        # TCP→unix shim + HTTPS_PROXY pointing at shim.
+        net_bwrap_args=(
+            --unshare-net
+            --bind "$_PILOT_EGRESS_SOCK" "$_PILOT_EGRESS_SOCK"
+            --ro-bind "$_PILOT_EGRESS_PROXY_BIN" "$_PILOT_EGRESS_PROXY_BIN"
+        )
+        net_setenv_args=(
+            --setenv HTTPS_PROXY "http://127.0.0.1:$_PILOT_EGRESS_TCP_PORT"
+            --setenv HTTP_PROXY "http://127.0.0.1:$_PILOT_EGRESS_TCP_PORT"
+            --setenv NO_PROXY "localhost,127.0.0.1"
+            # Exec-si-contenu attestation for cpp (Vincent-ratified 2026-08-04).
+            # Only set in Phase 2b full mode (fs+net+kernel cut ALL active).
+            # cpp reads this env at classify-time and enables the safe-exec
+            # tier1 primitives (node/python3/cargo/npm) SOLELY when this
+            # attestation is present. Phase 2a fallback (net open) intentionally
+            # does NOT set this — safe-exec stays denied, invariant preserved.
+            --setenv MIKA_PILOT_CONTAINED "1"
+        )
+        # sh -c wrapper that starts the shim, waits for it, execs the pilot,
+        # cleans up on exit. `exec` in the final position ensures the pilot's
+        # exit status becomes the sh's.
+        sandbox_entrypoint_prefix="/bin/sh"
+    fi
+
+    local -a setenv_args=()
+    local var
+    for var in "${_PILOT_SANDBOX_ENV_ALLOWLIST[@]}"; do
+        if [ -n "${!var:-}" ]; then
+            setenv_args+=(--setenv "$var" "${!var}")
+        fi
+    done
+    # HOME bind property: EACH bind-in HOME must not carry any credential
+    # or session token. Enforced by narrow subpaths per family — never bind
+    # a whole family directory (~/.claude, ~/.local, ~/.mika) because those
+    # roots hold .credentials.json / share/jupyter/*_secret /
+    # share/uv/credentials/ / .env respectively. Adding a new bind requires
+    # confirming its subtree carries no cred-shaped file (see
+    # coherence audit 2026-08-04).
+    if [ -n "$sandbox_entrypoint_prefix" ]; then
+        # Phase 2b mode: quote the original argv so the sh -c can re-exec it
+        # verbatim. Uses `printf '%q'` for shell-safe re-quoting.
+        local quoted_argv
+        quoted_argv=$(printf ' %q' "$@")
+        bwrap \
+            --as-pid-1 \
+            --unshare-user \
+            --unshare-pid \
+            --unshare-ipc \
+            --unshare-uts \
+            --unshare-cgroup \
+            --new-session \
+            --die-with-parent \
+            --clearenv \
+            --ro-bind /usr /usr \
+            --ro-bind-try /lib /lib \
+            --ro-bind-try /lib64 /lib64 \
+            --ro-bind /bin /bin \
+            --ro-bind-try /sbin /sbin \
+            --ro-bind /etc /etc \
+            --ro-bind-try /opt /opt \
+            --dev /dev \
+            --proc /proc \
+            --tmpfs /tmp \
+            --tmpfs /var/tmp \
+            --tmpfs /run \
+            --tmpfs /home \
+            --bind "$WORKTREE_DIR" "$WORKTREE_DIR" \
+            --ro-bind-try "$HOME/.local/bin/claude-pilot" "$HOME/.local/bin/claude-pilot" \
+            --ro-bind-try "$HOME/.local/share/uv/tools/claude-pilot" "$HOME/.local/share/uv/tools/claude-pilot" \
+            --ro-bind-try "/data/workspace/mika-platform/claude-pilot/src" "/data/workspace/mika-platform/claude-pilot/src" \
+            --ro-bind-try "$HOME/.claude/plugins" "$HOME/.claude/plugins" \
+            --ro-bind-try "$HOME/.claude/settings.json" "$HOME/.claude/settings.json" \
+            --ro-bind-try "$HOME/.claude/commands" "$HOME/.claude/commands" \
+            --ro-bind-try "$HOME/.claude/hooks" "$HOME/.claude/hooks" \
+            --ro-bind-try "$HOME/.nvm/versions" "$HOME/.nvm/versions" \
+            --ro-bind-try "$HOME/.cargo/registry" "$HOME/.cargo/registry" \
+            --ro-bind-try "$HOME/.cargo/config.toml" "$HOME/.cargo/config.toml" \
+            --ro-bind-try "$HOME/.cargo/bin" "$HOME/.cargo/bin" \
+            --ro-bind-try "$HOME/.rustup" "$HOME/.rustup" \
+            --bind "$HOME/.mika/data/pilot-transcripts" "$HOME/.mika/data/pilot-transcripts" \
+            "${net_bwrap_args[@]}" \
+            "${setenv_args[@]}" \
+            "${net_setenv_args[@]}" \
+            --chdir "$WORKTREE_DIR" \
+            -- "$sandbox_entrypoint_prefix" -c "
+python3 '$_PILOT_EGRESS_PROXY_BIN' --sandbox-tcp $_PILOT_EGRESS_TCP_PORT --socket '$_PILOT_EGRESS_SOCK' >&2 &
+_shim_pid=\$!
+# Bounded wait for shim to listen (max ~1s).
+_i=0
+while [ \$_i -lt 20 ]; do
+    if python3 -c 'import socket
+s=socket.socket()
+s.settimeout(0.1)
+try:
+    s.connect((\"127.0.0.1\", $_PILOT_EGRESS_TCP_PORT))
+    s.close()
+except Exception:
+    exit(1)' 2>/dev/null; then
+        break
+    fi
+    sleep 0.05
+    _i=\$((_i + 1))
+done
+trap 'kill \$_shim_pid 2>/dev/null' EXIT
+$quoted_argv
+"
+    else
+        # Phase 2a fallback: fs cut only, network unrestricted.
+        bwrap \
+            --as-pid-1 \
+            --unshare-user \
+            --unshare-pid \
+            --unshare-ipc \
+            --unshare-uts \
+            --unshare-cgroup \
+            --new-session \
+            --die-with-parent \
+            --clearenv \
+            --ro-bind /usr /usr \
+            --ro-bind-try /lib /lib \
+            --ro-bind-try /lib64 /lib64 \
+            --ro-bind /bin /bin \
+            --ro-bind-try /sbin /sbin \
+            --ro-bind /etc /etc \
+            --ro-bind-try /opt /opt \
+            --dev /dev \
+            --proc /proc \
+            --tmpfs /tmp \
+            --tmpfs /var/tmp \
+            --tmpfs /run \
+            --tmpfs /home \
+            --bind "$WORKTREE_DIR" "$WORKTREE_DIR" \
+            --ro-bind-try "$HOME/.local/bin/claude-pilot" "$HOME/.local/bin/claude-pilot" \
+            --ro-bind-try "$HOME/.local/share/uv/tools/claude-pilot" "$HOME/.local/share/uv/tools/claude-pilot" \
+            --ro-bind-try "/data/workspace/mika-platform/claude-pilot/src" "/data/workspace/mika-platform/claude-pilot/src" \
+            --ro-bind-try "$HOME/.claude/plugins" "$HOME/.claude/plugins" \
+            --ro-bind-try "$HOME/.claude/settings.json" "$HOME/.claude/settings.json" \
+            --ro-bind-try "$HOME/.claude/commands" "$HOME/.claude/commands" \
+            --ro-bind-try "$HOME/.claude/hooks" "$HOME/.claude/hooks" \
+            --ro-bind-try "$HOME/.nvm/versions" "$HOME/.nvm/versions" \
+            --ro-bind-try "$HOME/.cargo/registry" "$HOME/.cargo/registry" \
+            --ro-bind-try "$HOME/.cargo/config.toml" "$HOME/.cargo/config.toml" \
+            --ro-bind-try "$HOME/.cargo/bin" "$HOME/.cargo/bin" \
+            --ro-bind-try "$HOME/.rustup" "$HOME/.rustup" \
+            --bind "$HOME/.mika/data/pilot-transcripts" "$HOME/.mika/data/pilot-transcripts" \
+            "${setenv_args[@]}" \
+            --chdir "$WORKTREE_DIR" \
+            -- "$@"
+    fi
+}
+
 # mika#749: TERM trap writes cancel discriminator before exit.
 # Convention: reason file at /tmp/mika-cancel-reason-$$ (PID-based).
 # cancel_task pre-writes CANCELLED_BY_OPERATOR before SIGTERM; this trap
@@ -687,7 +991,7 @@ _run_claude_pilot() {
     set +e
     # CWD_ARGS is intentionally word-split (multiple flags)
     # shellcheck disable=SC2086
-    claude-pilot --verbose --log-dir --task-id "$LOG_ID" --command "$ENTRY_COMMAND" $TRACE_FLAG $CWD_ARGS -- "$PROMPT" >"$STDOUT_FILE" 2>"$STDERR_FILE"
+    _run_pilot_sandboxed claude-pilot --verbose --log-dir --task-id "$LOG_ID" --command "$ENTRY_COMMAND" $TRACE_FLAG $CWD_ARGS -- "$PROMPT" >"$STDOUT_FILE" 2>"$STDERR_FILE"
     PILOT_EXIT=$?
     # Persist stderr to durable file before any processing (mika#1097).
     # Scrub secrets from the persistent copy to prevent durable secret retention (mika#903).
@@ -1970,7 +2274,7 @@ _launch_revise_pilot() {
     set +e
     # CWD_ARGS is intentionally word-split (multiple flags)
     # shellcheck disable=SC2086
-    claude-pilot --verbose --log-dir --task-id "$revise_log_id" \
+    _run_pilot_sandboxed claude-pilot --verbose --log-dir --task-id "$revise_log_id" \
         --command "/mika-revise-plan" $CWD_ARGS \
         -- "@${findings_file}" \
         >"$revise_stdout" 2>"$revise_stderr"

@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""HTTPS CONNECT proxy with hostname allowlist — dev-pilot containment Phase 2b.
+
+Two invocation modes:
+
+  mika-pilot-egress-proxy --host-unix
+      Listens on `/tmp/mika-pilot-egress.sock` (unix socket).
+      Accepts HTTP CONNECT, filters by hostname allowlist, forwards to upstream.
+      This is the SECURITY BOUNDARY — only the allowlisted hosts reachable.
+      Runs as long-lived daemon on the host (spawned by dispatch-lib.sh).
+
+  mika-pilot-egress-proxy --sandbox-tcp <PORT>
+      Listens on 127.0.0.1:<PORT> (TCP, on sandbox loopback).
+      Forwards each connection verbatim to `/tmp/mika-pilot-egress.sock`
+      (which is bind-mounted from host by bwrap). No filtering here — the
+      host side is the gate. This exists ONLY because most HTTP clients
+      (reqwest, node fetch, cargo) don't accept `HTTPS_PROXY=unix:///path`.
+
+Design rationale (see coherence audit 2026-08-04 + Phase 2b design):
+
+  * `--unshare-net` in bwrap gives a fresh network namespace — the sandbox
+    has ONLY `lo` interface. No route to host loopback, no DNS, no anything.
+  * The unix socket is the sole escape from the sandbox namespace, and
+    only the allowlisted hosts (via CONNECT hostname check) can be reached.
+  * DNS is done host-side by this proxy — the sandbox has no resolver
+    (nothing bound at /etc/resolv.conf resolution level once net is gone).
+  * Raw sockets from sandbox → nowhere to go: no host reachable via TCP.
+
+Allowlist covers the three concrete need classes:
+  1. LLM providers: api.anthropic.com, api.openai.com, api.z.ai, openrouter.ai
+  2. GitHub (gh CLI, git push/fetch): api.github.com, github.com, ssh.github.com,
+     codeload.github.com, objects.githubusercontent.com (LFS)
+  3. Package registries used by the pilot's builds:
+     - crates.io ecosystem: crates.io, static.crates.io, index.crates.io
+     - npm: registry.npmjs.org (some cargo/plugin flows)
+     - PyPI: pypi.org, files.pythonhosted.org (uv / pip if the pilot touches Python)
+
+Adding a hostname requires a code change here — deliberate friction. If a
+pilot needs to reach a new host, that surfaces as a proxy-403 in its logs
+and gets a governance decision.
+
+Failure modes:
+  * 403 Forbidden — hostname not in allowlist.
+  * 502 Bad Gateway — upstream connect failed (DNS / connect timeout).
+  * 400 Bad Request — malformed CONNECT.
+  * Socket errors closed silently — expected on client abort.
+"""
+
+import argparse
+import asyncio
+import os
+import re
+import socket
+import stat
+import sys
+from pathlib import Path
+
+# Sole security boundary — every entry is a decision.
+HOST_ALLOWLIST = frozenset({
+    # LLM providers used by claude-pilot / claude-agent-sdk.
+    "api.anthropic.com",
+    "api.openai.com",
+    "api.z.ai",
+    "openrouter.ai",
+    # GitHub — pilot uses gh CLI + git push/fetch.
+    "api.github.com",
+    "github.com",
+    "ssh.github.com",
+    "codeload.github.com",
+    "objects.githubusercontent.com",
+    # Cargo registry ecosystem.
+    "crates.io",
+    "static.crates.io",
+    "index.crates.io",
+    # npm registry (some cargo/plugin flows pull JS deps).
+    "registry.npmjs.org",
+    # PyPI (uv / pip if the pilot touches Python).
+    "pypi.org",
+    "files.pythonhosted.org",
+})
+
+DEFAULT_UNIX_SOCK = "/tmp/mika-pilot-egress.sock"
+BUFFER_SIZE = 65536
+CONNECT_RE = re.compile(rb"^CONNECT ([^:\s]+):(\d+) HTTP/1\.[01]\r\n", re.ASCII)
+
+
+async def pipe_bytes(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """Forward reader → writer until either side closes. Silent on error."""
+    try:
+        while True:
+            data = await reader.read(BUFFER_SIZE)
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+    except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError, OSError):
+        pass
+    finally:
+        try:
+            writer.close()
+        except OSError:
+            pass
+
+
+async def handle_host_client(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+) -> None:
+    """Host-side handler: parse CONNECT, filter hostname, bridge to upstream."""
+    peer = "unknown"
+    try:
+        # Read request line + headers (up to blank line).
+        try:
+            request = await asyncio.wait_for(
+                reader.readuntil(b"\r\n\r\n"), timeout=10.0
+            )
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError):
+            writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+            await writer.drain()
+            return
+
+        match = CONNECT_RE.match(request)
+        if not match:
+            writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+            await writer.drain()
+            return
+
+        host = match.group(1).decode("ascii", errors="replace")
+        port = int(match.group(2))
+        peer = f"{host}:{port}"
+
+        if host not in HOST_ALLOWLIST:
+            body = (
+                f"host '{host}' not in mika-pilot egress allowlist"
+                "\n"
+            ).encode("utf-8")
+            writer.write(
+                b"HTTP/1.1 403 Forbidden\r\n"
+                b"Content-Type: text/plain; charset=utf-8\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                b"Connection: close\r\n"
+                b"\r\n"
+                + body
+            )
+            await writer.drain()
+            print(f"[egress] DENY {peer}", file=sys.stderr, flush=True)
+            return
+
+        # Upstream connect. Bounded timeout so a dead upstream can't wedge.
+        try:
+            up_reader, up_writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=15.0
+            )
+        except (asyncio.TimeoutError, OSError) as exc:
+            writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            await writer.drain()
+            print(f"[egress] FAIL {peer}: {exc}", file=sys.stderr, flush=True)
+            return
+
+        writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        await writer.drain()
+        print(f"[egress] ALLOW {peer}", file=sys.stderr, flush=True)
+
+        # Bidirectional relay. Either side closing tears down both.
+        await asyncio.gather(
+            pipe_bytes(reader, up_writer),
+            pipe_bytes(up_reader, writer),
+            return_exceptions=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — proxy must not crash on bad clients
+        print(f"[egress] ERROR {peer}: {exc}", file=sys.stderr, flush=True)
+    finally:
+        try:
+            writer.close()
+        except OSError:
+            pass
+
+
+async def handle_sandbox_client(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    unix_sock_path: str,
+) -> None:
+    """Sandbox-side handler: verbatim pipe TCP client ↔ unix socket to host."""
+    try:
+        try:
+            up_reader, up_writer = await asyncio.wait_for(
+                asyncio.open_unix_connection(unix_sock_path), timeout=5.0
+            )
+        except (asyncio.TimeoutError, OSError):
+            writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            await writer.drain()
+            return
+        await asyncio.gather(
+            pipe_bytes(reader, up_writer),
+            pipe_bytes(up_reader, writer),
+            return_exceptions=True,
+        )
+    finally:
+        try:
+            writer.close()
+        except OSError:
+            pass
+
+
+async def run_host_mode(unix_sock_path: str) -> None:
+    sock_path = Path(unix_sock_path)
+    # Remove stale socket if present.
+    if sock_path.exists():
+        try:
+            if stat.S_ISSOCK(sock_path.stat().st_mode):
+                sock_path.unlink()
+            else:
+                sys.exit(f"refusing to unlink non-socket: {sock_path}")
+        except OSError as exc:
+            sys.exit(f"stale-socket cleanup failed: {exc}")
+
+    server = await asyncio.start_unix_server(handle_host_client, str(sock_path))
+    # World-writable so the sandbox (running as same uid, but env-cleared) can
+    # still connect through the bwrap-mounted socket path.
+    sock_path.chmod(0o666)
+    print(
+        f"[egress] host-unix listening on {sock_path} (allowlist: "
+        f"{len(HOST_ALLOWLIST)} hosts)",
+        file=sys.stderr,
+        flush=True,
+    )
+    async with server:
+        await server.serve_forever()
+
+
+async def run_sandbox_mode(port: int, unix_sock_path: str) -> None:
+    server = await asyncio.start_server(
+        lambda r, w: handle_sandbox_client(r, w, unix_sock_path),
+        host="127.0.0.1",
+        port=port,
+    )
+    print(
+        f"[egress-shim] tcp 127.0.0.1:{port} → {unix_sock_path}",
+        file=sys.stderr,
+        flush=True,
+    )
+    async with server:
+        await server.serve_forever()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="mika-pilot-egress-proxy",
+        description=__doc__.split("\n", 1)[0],
+    )
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
+        "--host-unix",
+        action="store_true",
+        help="Run as host-side unix socket proxy with hostname allowlist",
+    )
+    mode.add_argument(
+        "--sandbox-tcp",
+        type=int,
+        metavar="PORT",
+        help="Run as sandbox-side TCP→unix bridge on 127.0.0.1:PORT",
+    )
+    parser.add_argument(
+        "--socket",
+        default=DEFAULT_UNIX_SOCK,
+        help=f"Unix socket path (default: {DEFAULT_UNIX_SOCK})",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    try:
+        if args.host_unix:
+            asyncio.run(run_host_mode(args.socket))
+        else:
+            asyncio.run(run_sandbox_mode(args.sandbox_tcp, args.socket))
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
