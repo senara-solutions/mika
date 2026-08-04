@@ -33,7 +33,7 @@ Two-layer decomposition today:
    (`match_skills`; the substring test is at `matcher.rs:47`):
    `message_lower.contains(kw)` → `MatchedSkill { reason: Keyword }`. Pure
    substring, no word boundaries, no semantics.
-2. **Enforcement layer** — `crates/mika-agent/src/agent_loop/mod.rs:4709`
+2. **Enforcement layer** — `crates/mika-agent/src/agent_loop/mod.rs:4779`
    (`collect_required_tools`): unions `required_tools` across `MatchReason::Keyword`
    skills; the EndTurn required-tools gate (post-condition #3) rejects the turn
    once if those tools were not called.
@@ -239,7 +239,7 @@ architect's design pass)"), which frames them for the architect's deliberation:
 - Same architectural class: mika#1575 (unsound-proxy ruling)
 - Match function: `crates/mika-agent/src/skills/matcher.rs:38` (`match_skills`;
   substring test at `matcher.rs:47`)
-- Required-tools collection: `crates/mika-agent/src/agent_loop/mod.rs:4709`
+- Required-tools collection: `crates/mika-agent/src/agent_loop/mod.rs:4779`
   (`collect_required_tools`)
 - `MatchReason` enum (#463 conditioning): `crates/mika-agent/src/skills/matcher.rs:10`
 - Required-tools gate (post-condition #3): `crates/mika-agent/CLAUDE.md`
