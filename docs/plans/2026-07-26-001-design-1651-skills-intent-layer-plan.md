@@ -153,10 +153,12 @@ mika-arch produces a design verdict, one of:
   so future authors don't re-litigate. This is a **docs-only** change, in-scope
   for a content pass.
 - R2b — Ensure the substring→word-boundary matcher upgrade is captured as a
-  concrete tracked ticket. If it already has an issue, cite it. If not, file ONE
-  sub-issue: *"feat(skills): word-boundary keyword matching in `match_skills` to
-  structurally retire the substring-collision class."* This is the real long-term
-  correctness lever the ticket gestures at.
+  concrete tracked ticket. **Satisfied: filed as mika#1878 —
+  *"feat(skills): word-boundary keyword matching in `match_skills` to
+  structurally retire the substring-collision class"* (OPEN).** This is the real
+  long-term correctness lever the ticket gestures at; the RATIFY branch folds the
+  intent-layer ambition into that matcher-swap rather than building a standalone
+  semantic layer.
 
 **If FILE:**
 
@@ -201,7 +203,8 @@ test-shaped:
       post-mika#1650 state of the world.
 - [ ] RATIFY branch: AC3 discipline confirmed in `skill-keyword-design-rules.md`
       (with an optional short "intent-layer declined" decision note added); the
-      word-boundary matcher-swap is tracked as a cited or newly-filed sub-issue.
+      word-boundary matcher-swap is tracked as a cited or newly-filed sub-issue
+      (**filed: mika#1878**).
 - [ ] FILE branch: AC2 sub-issue(s) filed with shape + scope + ACs + rollout +
       mika#1650 composability + sequence.
 - [ ] No product-code change in this ticket's PR; implementation (if any) is
@@ -230,6 +233,8 @@ architect's design pass)"), which frames them for the architect's deliberation:
 
 - Ticket: mika#1651 (design, P2-normal, agent-core)
 - Sibling: mika#1650 — keyword-tighten (**CLOSED / shipped** — the cheap 80% fix)
+- Long-term correctness lever (RATIFY R2b deliverable): mika#1878 — word-boundary
+  keyword matching in `match_skills` (**OPEN**)
 - Existing discipline doc: `docs/architecture/skill-keyword-design-rules.md`
 - Same architectural class: mika#1575 (unsound-proxy ruling)
 - Match function: `crates/mika-agent/src/skills/matcher.rs:38` (`match_skills`;
