@@ -242,6 +242,7 @@ _run_pilot_sandboxed() {
             --bind "$WORKTREE_DIR" "$WORKTREE_DIR" \
             --ro-bind-try "$HOME/.local/bin/claude-pilot" "$HOME/.local/bin/claude-pilot" \
             --ro-bind-try "$HOME/.local/share/uv/tools/claude-pilot" "$HOME/.local/share/uv/tools/claude-pilot" \
+            --ro-bind-try "/data/workspace/mika-platform/claude-pilot/src" "/data/workspace/mika-platform/claude-pilot/src" \
             --ro-bind-try "$HOME/.claude/plugins" "$HOME/.claude/plugins" \
             --ro-bind-try "$HOME/.claude/settings.json" "$HOME/.claude/settings.json" \
             --ro-bind-try "$HOME/.claude/commands" "$HOME/.claude/commands" \
@@ -306,6 +307,7 @@ $quoted_argv
             --bind "$WORKTREE_DIR" "$WORKTREE_DIR" \
             --ro-bind-try "$HOME/.local/bin/claude-pilot" "$HOME/.local/bin/claude-pilot" \
             --ro-bind-try "$HOME/.local/share/uv/tools/claude-pilot" "$HOME/.local/share/uv/tools/claude-pilot" \
+            --ro-bind-try "/data/workspace/mika-platform/claude-pilot/src" "/data/workspace/mika-platform/claude-pilot/src" \
             --ro-bind-try "$HOME/.claude/plugins" "$HOME/.claude/plugins" \
             --ro-bind-try "$HOME/.claude/settings.json" "$HOME/.claude/settings.json" \
             --ro-bind-try "$HOME/.claude/commands" "$HOME/.claude/commands" \

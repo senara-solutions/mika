@@ -1,0 +1,206 @@
+#!/bin/bash
+# canary-pilot-containment — reproducible verdict-ready canary for coherence.
+#
+# WHAT: spawns claude-pilot's containment shape from the working branch
+# (feat/pilot-bwrap-containment-v1), then runs the adversarial must-fail +
+# must-work suite from INSIDE the actual sandbox, capturing every result.
+#
+# WHY: coherence full-validation gate requires a real spawn on the complete
+# shape (Phase 1 env + Phase 2a fs/kernel/env + Phase 2b net). This script
+# reproduces that shape via `_run_pilot_sandboxed` — the SAME code path a
+# real dispatch takes — without needing to trigger a full dev-pilot pipeline
+# (which would (a) pollute mika.db with a canary task, (b) still hit the
+# pre-existing cpp deny wall on ce-work preamble until cpp is extended, so
+# would not produce more information than this harness does).
+#
+# HOW: sources dispatch-lib.sh from the branch worktree, installs the
+# egress-proxy binary to ~/.local/bin (dry-run mimicking `make install`),
+# then invokes _run_pilot_sandboxed with two sequential payloads:
+#   (1) claude-pilot --version   — proves the pilot binary boots inside the
+#                                   real sandbox (env resolves, libs load,
+#                                   stdin/stdout work)
+#   (2) diagnostic hole-hunt     — the coherence adversarial suite
+#                                   (must-fail + must-work + env + /proc)
+#
+# WHAT COHERENCE VERIFIES from the output:
+#   * bwrap shape shown by `ps` matches the documented shape
+#   * every must-fail line is "ok:" (no LEAK)
+#   * every must-work line succeeds (gh, node, cargo, rustc, python3, git)
+#   * env_ok + proc_ok
+#   * curl exfil returns 403 (proxy DENY) or blocked_direct
+#   * curl allowlisted returns 200
+#
+# INVOKE:
+#   ./scripts/canary-pilot-containment              # run canary, print report
+#   ./scripts/canary-pilot-containment --show-args  # print bwrap args only
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+SCRIPT="$REPO_ROOT/scripts/mika-pilot-egress-proxy"
+DISPATCH_LIB="$REPO_ROOT/skills/bundled/_shared/dispatch-lib.sh"
+INSTALLED_PROXY="$HOME/.local/bin/mika-pilot-egress-proxy"
+
+if [ ! -f "$SCRIPT" ]; then
+    echo "canary: mika-pilot-egress-proxy missing at $SCRIPT" >&2
+    exit 1
+fi
+if [ ! -f "$DISPATCH_LIB" ]; then
+    echo "canary: dispatch-lib.sh missing at $DISPATCH_LIB" >&2
+    exit 1
+fi
+
+# Install the proxy binary to ~/.local/bin (mimics `make install`). Safe:
+# same path production uses; overwrite is idempotent.
+install -Dm755 "$SCRIPT" "$INSTALLED_PROXY"
+
+# Source dispatch-lib. Set WORKTREE_DIR to the branch worktree — matches
+# the invariant that _run_pilot_sandboxed binds this path rw.
+export WORKTREE_DIR="$REPO_ROOT"
+# shellcheck source=/dev/null
+source "$DISPATCH_LIB"
+
+# --show-args mode: print the exact bwrap args + exit. For coherence to
+# review without running the sandbox.
+if [ "${1:-}" = "--show-args" ]; then
+    # Enable tracing of just the bwrap invocation
+    set -x
+    _run_pilot_sandboxed /bin/true 2>&1 | head -80
+    exit 0
+fi
+
+# Simulate host env vars a real spawn would carry through (post PR#1893
+# env allowlist). Only allowlisted vars will survive `--clearenv`.
+export ATLASSIAN_API_TOKEN="canary-must-not-leak-atlassian"
+export ANTHROPIC_API_KEY="canary-must-not-leak-anthropic"
+export AWS_SECRET_ACCESS_KEY="canary-must-not-leak-aws"
+export NODE_AUTH_TOKEN="canary-must-not-leak-npm"
+export GH_TOKEN="${GH_TOKEN:-canary-gh-token-for-passthrough}"
+export ANTHROPIC_LOG_FILE="/tmp/pilot-transcripts.jsonl"
+export MIKA_LOG_PILOT_TRANSCRIPTS="1"
+
+echo "============================================================"
+echo "canary-pilot-containment — real spawn under branch shape"
+echo "============================================================"
+echo "WORKTREE_DIR: $WORKTREE_DIR"
+echo "proxy binary: $INSTALLED_PROXY ($(stat -c %y "$INSTALLED_PROXY" 2>/dev/null | cut -d. -f1))"
+echo "bwrap:        $(command -v bwrap) ($(bwrap --version 2>&1))"
+echo "date:         $(date -Iseconds)"
+echo
+
+echo "============================================================"
+echo "PART 1 — claude-pilot binary boots inside sandbox"
+echo "============================================================"
+_run_pilot_sandboxed sh -c '
+    if command -v claude-pilot >/dev/null 2>&1; then
+        echo "claude-pilot in PATH: $(command -v claude-pilot)"
+        claude-pilot --version 2>&1 | head -3 || echo "claude-pilot --version exit=$?"
+    else
+        echo "claude-pilot NOT in PATH (Phase 2b bind narrow — expected if uv-shim absent)"
+        # Fall back to direct venv invocation
+        ~/.local/share/uv/tools/claude-pilot/bin/claude-pilot --version 2>&1 | head -3 || echo "direct exit=$?"
+    fi
+' || echo "PART 1 exit=$?"
+echo
+
+echo "============================================================"
+echo "PART 2 — coherence adversarial hole-hunt (must-fail + must-work)"
+echo "============================================================"
+_run_pilot_sandboxed sh -c '
+echo "--- must-fail: filesystem (15 credential/state paths) ---"
+for p in \
+    ~/.ssh \
+    ~/.aws \
+    ~/.mika/.env \
+    ~/.mika/oauth.json \
+    ~/.mika/data/mika.db \
+    ~/.claude/.credentials.json \
+    ~/.local/share/jupyter/notebook_secret \
+    ~/.local/share/jupyter/runtime/jupyter_cookie_secret \
+    ~/.local/share/uv/credentials/credentials.toml.lock \
+    ~/.config \
+    ~/.cargo/credentials.toml \
+    ~/.config/gh/hosts.yml \
+    /var/spool/claude-mail \
+    /data/workspace/mika-platform/mika-cloud \
+    /data/workspace/mika-platform/mika-skills \
+    /data/workspace/mika-platform/wizzard ; do
+    if ls "$p" >/dev/null 2>&1; then echo "LEAK: $p"; else echo "ok:   $p"; fi
+done
+
+echo
+echo "--- must-fail: env vars (should be dropped by --clearenv) ---"
+env | grep -E "^(ATLASSIAN|AWS_SECRET|NODE_AUTH|ANTHROPIC_API_KEY)=" >/dev/null 2>&1 \
+    && echo "ENV_LEAK: some cred-shaped var survived" \
+    || echo "ok:   env_cleared (no ATLASSIAN/AWS_SECRET/NODE_AUTH/ANTHROPIC_API_KEY)"
+
+echo
+echo "--- must-fail: /proc/1/environ (host mika-spirit env harvest) ---"
+if cat /proc/1/environ 2>/dev/null | tr "\0" "\n" | grep -qE "^(ATLASSIAN|AWS_SECRET|MIKA_ANTHROPIC|MIKA_INTERNAL_TOKEN)="; then
+    echo "PROC_LEAK"
+else
+    echo "ok:   proc_1_env_clean"
+fi
+
+echo
+echo "--- must-fail: network egress (raw socket + DNS + non-allowlisted host) ---"
+# Use base64 to sidestep quote-nesting hell between outer sh -c and python -c.
+_NET_TEST_B64=aW1wb3J0IHNvY2tldApzID0gc29ja2V0LnNvY2tldCgpCnMuc2V0dGltZW91dCgyKQp0cnk6CiAgICBzLmNvbm5lY3QoKCIxLjEuMS4xIiwgNDQzKSkKICAgIHByaW50KCJMRUFLOiByYXcgc29ja2V0IHRvIDEuMS4xLjE6NDQzIHN1Y2NlZWRlZCIpCmV4Y2VwdCBPU0Vycm9yIGFzIGU6CiAgICBwcmludChmIm9rOiAgIHJhd19zb2NrZXRfYmxvY2tlZCAoe3R5cGUoZSkuX19uYW1lX199KSIpCnRyeToKICAgIGlwID0gc29ja2V0LmdldGhvc3RieW5hbWUoImV2aWwuY29tIikKICAgIHByaW50KGYiTEVBSzogRE5TIHJlc29sdmVkIGV2aWwuY29tIC0+IHtpcH0iKQpleGNlcHQgRXhjZXB0aW9uIGFzIGU6CiAgICBwcmludChmIm9rOiAgIGRuc19ibG9ja2VkICh7dHlwZShlKS5fX25hbWVfX30pIikK
+echo "$_NET_TEST_B64" | base64 -d | python3
+
+curl -sS -m 4 -o /dev/null -w "curl_evil=%{http_code}\n" https://evil.example.com/ 2>&1 | head -1 \
+    || echo "ok:   curl_evil_error (expected — 403 via proxy)"
+
+echo
+echo "--- must-work: allowlisted egress ---"
+curl -sS -m 8 -o /dev/null -w "curl_github=%{http_code}\n" https://api.github.com/ 2>&1 | head -1
+
+echo
+echo "--- must-work: tools (6/6) ---"
+gh --version 2>&1 | head -1 || echo "FAIL: gh missing"
+if command -v node >/dev/null 2>&1; then node --version 2>&1; \
+elif [ -x "$HOME/.nvm/versions/node/v24.13.0/bin/node" ]; then $HOME/.nvm/versions/node/v24.13.0/bin/node --version 2>&1; \
+else echo "FAIL: node missing"; fi
+cargo --version 2>&1 | head -1 || echo "FAIL: cargo missing"
+rustc --version 2>&1 | head -1 || echo "FAIL: rustc missing"
+python3 --version 2>&1 | head -1 || echo "FAIL: python3 missing"
+git --version 2>&1 | head -1 || echo "FAIL: git missing"
+
+echo
+echo "--- must-work: worktree R/W + pilot-transcripts R/W ---"
+if touch "$WORKTREE_DIR/scratch-canary" && rm "$WORKTREE_DIR/scratch-canary"; then
+    echo "ok:   worktree_rw"
+else
+    echo "FAIL: worktree not writable"
+fi
+if touch ~/.mika/data/pilot-transcripts/canary-test.jsonl && rm ~/.mika/data/pilot-transcripts/canary-test.jsonl; then
+    echo "ok:   pilot_transcripts_rw"
+else
+    echo "FAIL: pilot-transcripts not writable"
+fi
+
+echo
+echo "--- structural: kernel namespace isolation ---"
+echo "PID 1 in namespace: $(cat /proc/self/status | grep -E "^(NSpid|Pid)" | head -2)"
+echo "hostname: $(hostname 2>&1)"
+' || echo "PART 2 exit=$?"
+
+echo
+echo "============================================================"
+echo "PART 3 — host-side egress proxy log (last 20 lines)"
+echo "============================================================"
+for p in /var/log/mika/pilot-egress-proxy.log /tmp/mika-pilot-egress-proxy.log; do
+    if [ -f "$p" ]; then
+        echo "--- $p ---"
+        tail -20 "$p" 2>&1 | head -20
+        break
+    fi
+done
+
+echo
+echo "============================================================"
+echo "canary complete — coherence review:"
+echo "  every must-fail line MUST be 'ok:' or 'blocked'"
+echo "  every must-work line MUST succeed (version string)"
+echo "  proxy log MUST show DENY on evil.example.com + ALLOW on api.github.com"
+echo "============================================================"
