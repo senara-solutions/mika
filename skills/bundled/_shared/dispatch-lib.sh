@@ -198,44 +198,35 @@ _run_pilot_sandboxed() {
             # does NOT set this — safe-exec stays denied, invariant preserved.
             --setenv MIKA_PILOT_CONTAINED "1"
         )
-        # Anthropic auth passthrough (2026-08-05, Option C — sami-ratified).
-        # The Phase 2a fs cut hides ~/.claude/.credentials.json (Anthropic OAuth
-        # identity token — cred-invariant "no cred in HOME binds"). Without an
-        # alternate auth path, Claude Code inside the sandbox prints "Not logged
-        # in" and exits at 1 turn / $0.
+        # Anthropic auth via HOST-SIDE proxy injection (2026-08-05 — Q3 shape,
+        # sami+coherence-ratified). The Phase 2a fs cut hides
+        # ~/.claude/.credentials.json (Anthropic OAuth identity token —
+        # cred-invariant "no cred in HOME binds"). Without an alternate auth
+        # path Claude Code inside the sandbox prints "Not logged in" and
+        # exits at 1 turn / $0.
         #
-        # CRITICAL: we read MIKA_PILOT_ANTHROPIC_KEY (a DEDICATED, revocable,
-        # rate-limited API key created by the operator specifically for the
-        # pilot subprocess). We do NOT read MIKA_ANTHROPIC_API_KEY — that
-        # variable holds the same OAuth identity token as .credentials.json
-        # (`sk-ant-oat01-...`), and injecting it here would re-expose exactly
-        # what the round-2 fs cut protects (readable via `cat /proc/self/environ`
-        # + exfiltrable via the sanctioned api.anthropic.com channel). Blast
-        # radius: pilot-scoped key = billing/rate-limit + independent revocation;
-        # OAuth token = full Claude Code identity impersonation. The whole
-        # containment point is minimal-scope credentials.
+        # Q3 approach: the sandbox NEVER holds an Anthropic secret. Instead:
+        #   * mika-pilot-egress-proxy (host-side, outside bwrap) reads the
+        #     scoped key MIKA_PILOT_ANTHROPIC_KEY from ~/.mika/.env directly.
+        #   * The sandbox points ANTHROPIC_BASE_URL at the proxy's HTTP
+        #     reverse-proxy endpoint (localhost / not-CONNECT).
+        #   * Claude Code sends unauthenticated HTTP requests to that URL;
+        #     the proxy injects `Authorization: Bearer <scoped-key>`
+        #     host-side and forwards over TLS to api.anthropic.com.
         #
-        # Silent no-op if MIKA_PILOT_ANTHROPIC_KEY is absent: dispatch proceeds
-        # without ANTHROPIC_API_KEY set, pilot hits "Not logged in" and exits
-        # visibly at 1 turn. This is the correct fail-mode until the operator
-        # provisions the scoped key — no fallback to the OAuth token.
+        # Property: `cat /proc/self/environ` inside the sandbox reveals NO
+        # Anthropic secret material, EVER — the key never crosses the bwrap
+        # boundary. A pilot fully compromised by a malicious dep cannot
+        # exfiltrate the key; the worst case is unauthorized API calls
+        # bounded by the scoped key's rate/spend limits.
         #
-        # Last-win semantics via `tail -n1` — matches dotenvy: if the .env file
-        # has multiple entries (e.g. after a key rotation where the operator
-        # appended rather than replaced), the latest wins. Quotes stripped
-        # best-effort.
-        local _mika_env_file="$HOME/.mika/.env"
-        if [ -f "$_mika_env_file" ]; then
-            local _anthropic_key
-            _anthropic_key=$(grep '^MIKA_PILOT_ANTHROPIC_KEY=' "$_mika_env_file" 2>/dev/null \
-                | tail -n1 \
-                | sed -e 's/^MIKA_PILOT_ANTHROPIC_KEY=//' \
-                      -e 's/^"\(.*\)"$/\1/' \
-                      -e "s/^'\(.*\)'$/\1/")
-            if [ -n "$_anthropic_key" ]; then
-                net_setenv_args+=(--setenv ANTHROPIC_API_KEY "$_anthropic_key")
-            fi
-        fi
+        # ANTHROPIC_API_KEY is set to a placeholder so Claude Code doesn't
+        # short-circuit into "Not logged in" — the proxy overwrites the
+        # Authorization header regardless of what the sandbox sent.
+        net_setenv_args+=(
+            --setenv ANTHROPIC_BASE_URL "http://127.0.0.1:$_PILOT_EGRESS_TCP_PORT/anthropic-proxy"
+            --setenv ANTHROPIC_API_KEY "proxy-managed-no-secret"
+        )
         # sh -c wrapper that starts the shim, waits for it, execs the pilot,
         # cleans up on exit. `exec` in the final position ensures the pilot's
         # exit status becomes the sh's.

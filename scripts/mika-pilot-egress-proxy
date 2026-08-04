@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
-"""HTTPS CONNECT proxy with hostname allowlist — dev-pilot containment Phase 2b.
+"""HTTPS CONNECT proxy with hostname allowlist + Anthropic auth reverse-proxy
+— dev-pilot containment Phase 2b.
 
 Two invocation modes:
 
   mika-pilot-egress-proxy --host-unix
       Listens on `/tmp/mika-pilot-egress.sock` (unix socket).
-      Accepts HTTP CONNECT, filters by hostname allowlist, forwards to upstream.
-      This is the SECURITY BOUNDARY — only the allowlisted hosts reachable.
+      Two request shapes accepted on the same endpoint (dispatched by method
+      + path on the request line):
+
+        (1) CONNECT <host>:<port>  — HTTPS tunnel via allowlist. Existing.
+        (2) <METHOD> /anthropic-proxy/...  — HTTP reverse-proxy to
+            api.anthropic.com/... with Authorization: Bearer <scoped-key>
+            injected host-side. The sandbox NEVER sees the key
+            (Q3 shape, sami+coherence-ratified 2026-08-05).
+
       Runs as long-lived daemon on the host (spawned by dispatch-lib.sh).
 
   mika-pilot-egress-proxy --sandbox-tcp <PORT>
@@ -14,7 +22,9 @@ Two invocation modes:
       Forwards each connection verbatim to `/tmp/mika-pilot-egress.sock`
       (which is bind-mounted from host by bwrap). No filtering here — the
       host side is the gate. This exists ONLY because most HTTP clients
-      (reqwest, node fetch, cargo) don't accept `HTTPS_PROXY=unix:///path`.
+      (reqwest, node fetch, cargo) don't accept `HTTPS_PROXY=unix:///path`,
+      AND because ANTHROPIC_BASE_URL points at this loopback port for the
+      auth-injection reverse-proxy flow.
 
 Design rationale (see coherence audit 2026-08-04 + Phase 2b design):
 
@@ -51,6 +61,7 @@ import asyncio
 import os
 import re
 import socket
+import ssl
 import stat
 import sys
 from pathlib import Path
@@ -83,6 +94,60 @@ DEFAULT_UNIX_SOCK = "/tmp/mika-pilot-egress.sock"
 BUFFER_SIZE = 65536
 CONNECT_RE = re.compile(rb"^CONNECT ([^:\s]+):(\d+) HTTP/1\.[01]\r\n", re.ASCII)
 
+# Q3 auth-injection reverse-proxy — path prefix stripped, forwarded to
+# api.anthropic.com over TLS with `Authorization: Bearer <scoped-key>`
+# injected host-side. See ANTHROPIC_PROXY_PATH_PREFIX + read_scoped_key.
+ANTHROPIC_UPSTREAM_HOST = "api.anthropic.com"
+ANTHROPIC_UPSTREAM_PORT = 443
+ANTHROPIC_PROXY_PATH_PREFIX = "/anthropic-proxy"
+ANTHROPIC_METHOD_RE = re.compile(
+    rb"^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS) "
+    rb"(" + re.escape(ANTHROPIC_PROXY_PATH_PREFIX.encode("ascii")) + rb"[^\s]*)"
+    rb" HTTP/1\.[01]\r\n",
+    re.ASCII,
+)
+
+# Scoped Anthropic API key — held host-side, re-read on ~/.mika/.env mtime
+# change so operator rotations pick up without proxy restart. The var name
+# `MIKA_PILOT_ANTHROPIC_KEY` is dedicated to the pilot subprocess; distinct
+# from `MIKA_ANTHROPIC_API_KEY` which holds the OAuth identity token (never
+# read here — see Q3 design note in dispatch-lib.sh).
+_SCOPED_KEY_VAR = "MIKA_PILOT_ANTHROPIC_KEY"
+_MIKA_ENV_PATH = Path.home() / ".mika" / ".env"
+_scoped_key_cache = {"mtime": None, "value": None}
+
+
+def read_scoped_key() -> str | None:
+    """Return the scoped Anthropic key from ~/.mika/.env, cached by mtime.
+
+    Returns None if the file or key is absent — caller must handle the
+    no-key case (return 401 upstream-style, don't inject a bogus header).
+    """
+    try:
+        st = _MIKA_ENV_PATH.stat()
+    except OSError:
+        return None
+    if _scoped_key_cache["mtime"] == st.st_mtime:
+        return _scoped_key_cache["value"]
+    # Re-read + last-win parse (matches dotenvy semantics).
+    latest: str | None = None
+    try:
+        with _MIKA_ENV_PATH.open("r", encoding="utf-8", errors="replace") as fh:
+            prefix = f"{_SCOPED_KEY_VAR}="
+            for line in fh:
+                if line.startswith(prefix):
+                    val = line[len(prefix):].rstrip("\r\n")
+                    # Strip surrounding quotes (single or double), best-effort.
+                    if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+                        val = val[1:-1]
+                    if val:
+                        latest = val
+    except OSError:
+        return None
+    _scoped_key_cache["mtime"] = st.st_mtime
+    _scoped_key_cache["value"] = latest
+    return latest
+
 
 async def pipe_bytes(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     """Forward reader → writer until either side closes. Silent on error."""
@@ -102,11 +167,145 @@ async def pipe_bytes(reader: asyncio.StreamReader, writer: asyncio.StreamWriter)
             pass
 
 
+async def handle_anthropic_reverse_proxy(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    request: bytes,
+    method: bytes,
+    path: bytes,
+) -> None:
+    """Q3 host-side auth injection.
+
+    Sandbox client sends an HTTP request to <method> /anthropic-proxy/<rest>.
+    We strip the prefix, rewrite Host and Authorization headers with the
+    scoped key from ~/.mika/.env (never crosses sandbox boundary), open TLS
+    to api.anthropic.com:443, forward request, and stream response back.
+    """
+    scoped_key = read_scoped_key()
+    if scoped_key is None:
+        body = (
+            f"mika-pilot-egress: scoped key {_SCOPED_KEY_VAR} not set in "
+            f"{_MIKA_ENV_PATH} — operator must provision before dispatch\n"
+        ).encode("utf-8")
+        writer.write(
+            b"HTTP/1.1 503 Service Unavailable\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+            b"Connection: close\r\n"
+            b"\r\n" + body
+        )
+        await writer.drain()
+        print(f"[anthropic-proxy] DENY no-key path={path.decode('ascii', 'replace')}",
+              file=sys.stderr, flush=True)
+        return
+
+    # Split request into request-line + headers. body follows blank line.
+    try:
+        head, _sep, _ = request.partition(b"\r\n\r\n")
+    except Exception:
+        writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+        await writer.drain()
+        return
+    lines = head.split(b"\r\n")
+    header_lines = lines[1:]  # skip request line
+    new_path = path[len(ANTHROPIC_PROXY_PATH_PREFIX.encode("ascii")):]
+    if not new_path or not new_path.startswith(b"/"):
+        new_path = b"/" + new_path
+    # Drop Host, Authorization, X-API-Key, X-Api-Key from client headers —
+    # we re-write them. Drop Proxy-Authorization defensively. Preserve
+    # everything else (Content-Type, Content-Length, Transfer-Encoding,
+    # Accept, User-Agent, anthropic-version, anthropic-beta, etc.).
+    drop_re = re.compile(
+        rb"^(host|authorization|x-api-key|proxy-authorization)\s*:",
+        re.IGNORECASE,
+    )
+    filtered_headers = [h for h in header_lines if not drop_re.match(h)]
+    # Detect body length. Support Content-Length (fixed) and
+    # Transfer-Encoding: chunked (streaming).
+    content_length = 0
+    is_chunked = False
+    for h in filtered_headers:
+        if re.match(rb"^content-length\s*:", h, re.IGNORECASE):
+            try:
+                content_length = int(h.split(b":", 1)[1].strip())
+            except (ValueError, IndexError):
+                content_length = 0
+        elif re.match(rb"^transfer-encoding\s*:.*chunked", h, re.IGNORECASE):
+            is_chunked = True
+    # Build new request line + injected headers.
+    new_request = (
+        method + b" " + new_path + b" HTTP/1.1\r\n"
+        + b"Host: " + ANTHROPIC_UPSTREAM_HOST.encode("ascii") + b"\r\n"
+        + b"Authorization: Bearer " + scoped_key.encode("ascii") + b"\r\n"
+        + b"Connection: close\r\n"  # force one-shot, avoid keepalive complexity
+        + b"\r\n".join(filtered_headers)
+        + b"\r\n\r\n"
+    )
+    # Open TLS upstream.
+    try:
+        ssl_ctx = ssl.create_default_context()
+        up_reader, up_writer = await asyncio.wait_for(
+            asyncio.open_connection(
+                ANTHROPIC_UPSTREAM_HOST, ANTHROPIC_UPSTREAM_PORT,
+                ssl=ssl_ctx, server_hostname=ANTHROPIC_UPSTREAM_HOST,
+            ),
+            timeout=15.0,
+        )
+    except (asyncio.TimeoutError, OSError, ssl.SSLError) as exc:
+        writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+        await writer.drain()
+        print(f"[anthropic-proxy] UPSTREAM_FAIL: {exc}",
+              file=sys.stderr, flush=True)
+        return
+
+    try:
+        # Send request head.
+        up_writer.write(new_request)
+        await up_writer.drain()
+        # Forward request body from client → upstream.
+        if is_chunked:
+            # Stream chunked body verbatim until 0-length chunk terminator.
+            while True:
+                chunk = await reader.read(BUFFER_SIZE)
+                if not chunk:
+                    break
+                up_writer.write(chunk)
+                await up_writer.drain()
+                if b"0\r\n\r\n" in chunk:
+                    break
+        elif content_length > 0:
+            remaining = content_length
+            while remaining > 0:
+                chunk = await reader.read(min(BUFFER_SIZE, remaining))
+                if not chunk:
+                    break
+                up_writer.write(chunk)
+                await up_writer.drain()
+                remaining -= len(chunk)
+        # Stream response upstream → client until upstream closes.
+        while True:
+            chunk = await up_reader.read(BUFFER_SIZE)
+            if not chunk:
+                break
+            writer.write(chunk)
+            await writer.drain()
+        print(
+            f"[anthropic-proxy] ALLOW {method.decode('ascii')} "
+            f"{new_path.decode('ascii', 'replace')}",
+            file=sys.stderr, flush=True,
+        )
+    finally:
+        try:
+            up_writer.close()
+        except OSError:
+            pass
+
+
 async def handle_host_client(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
 ) -> None:
-    """Host-side handler: parse CONNECT, filter hostname, bridge to upstream."""
+    """Host-side handler: dispatch by request-line to CONNECT or reverse-proxy."""
     peer = "unknown"
     try:
         # Read request line + headers (up to blank line).
@@ -117,6 +316,16 @@ async def handle_host_client(
         except (asyncio.TimeoutError, asyncio.IncompleteReadError):
             writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
             await writer.drain()
+            return
+
+        # Dispatch: CONNECT vs anthropic-proxy HTTP reverse-proxy.
+        anthropic_match = ANTHROPIC_METHOD_RE.match(request)
+        if anthropic_match:
+            method = anthropic_match.group(1)
+            path = anthropic_match.group(2)
+            await handle_anthropic_reverse_proxy(
+                reader, writer, request, method, path,
+            )
             return
 
         match = CONNECT_RE.match(request)
