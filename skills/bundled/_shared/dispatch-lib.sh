@@ -200,25 +200,36 @@ _run_pilot_sandboxed() {
         )
         # Anthropic auth passthrough (2026-08-05, Option C — sami-ratified).
         # The Phase 2a fs cut hides ~/.claude/.credentials.json (Anthropic OAuth
-        # token — cred-invariant "no cred in HOME binds"). Without an alternate
-        # auth path, Claude Code inside the sandbox prints "Not logged in" and
-        # exits at 1 turn / $0. Fix: extract MIKA_ANTHROPIC_API_KEY from
-        # ~/.mika/.env (mika-spirit's dotenvy source) — a project-scoped API key
-        # (rotatable, revocable, blast-radius = billing) rather than the OAuth
-        # token (blast-radius = full Claude Code identity impersonation). Set as
-        # ANTHROPIC_API_KEY in the sandbox env allowlist so claude-agent-sdk
-        # picks it up without needing the credentials.json file at all.
+        # identity token — cred-invariant "no cred in HOME binds"). Without an
+        # alternate auth path, Claude Code inside the sandbox prints "Not logged
+        # in" and exits at 1 turn / $0.
+        #
+        # CRITICAL: we read MIKA_PILOT_ANTHROPIC_KEY (a DEDICATED, revocable,
+        # rate-limited API key created by the operator specifically for the
+        # pilot subprocess). We do NOT read MIKA_ANTHROPIC_API_KEY — that
+        # variable holds the same OAuth identity token as .credentials.json
+        # (`sk-ant-oat01-...`), and injecting it here would re-expose exactly
+        # what the round-2 fs cut protects (readable via `cat /proc/self/environ`
+        # + exfiltrable via the sanctioned api.anthropic.com channel). Blast
+        # radius: pilot-scoped key = billing/rate-limit + independent revocation;
+        # OAuth token = full Claude Code identity impersonation. The whole
+        # containment point is minimal-scope credentials.
+        #
+        # Silent no-op if MIKA_PILOT_ANTHROPIC_KEY is absent: dispatch proceeds
+        # without ANTHROPIC_API_KEY set, pilot hits "Not logged in" and exits
+        # visibly at 1 turn. This is the correct fail-mode until the operator
+        # provisions the scoped key — no fallback to the OAuth token.
         #
         # Last-win semantics via `tail -n1` — matches dotenvy: if the .env file
-        # has multiple MIKA_ANTHROPIC_API_KEY entries (e.g. after a key rotation
-        # where the operator appended rather than replaced), the latest wins.
-        # Quotes stripped best-effort. Silent no-op if the file/key is absent.
+        # has multiple entries (e.g. after a key rotation where the operator
+        # appended rather than replaced), the latest wins. Quotes stripped
+        # best-effort.
         local _mika_env_file="$HOME/.mika/.env"
         if [ -f "$_mika_env_file" ]; then
             local _anthropic_key
-            _anthropic_key=$(grep '^MIKA_ANTHROPIC_API_KEY=' "$_mika_env_file" 2>/dev/null \
+            _anthropic_key=$(grep '^MIKA_PILOT_ANTHROPIC_KEY=' "$_mika_env_file" 2>/dev/null \
                 | tail -n1 \
-                | sed -e 's/^MIKA_ANTHROPIC_API_KEY=//' \
+                | sed -e 's/^MIKA_PILOT_ANTHROPIC_KEY=//' \
                       -e 's/^"\(.*\)"$/\1/' \
                       -e "s/^'\(.*\)'$/\1/")
             if [ -n "$_anthropic_key" ]; then
