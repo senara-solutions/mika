@@ -198,6 +198,33 @@ _run_pilot_sandboxed() {
             # does NOT set this — safe-exec stays denied, invariant preserved.
             --setenv MIKA_PILOT_CONTAINED "1"
         )
+        # Anthropic auth passthrough (2026-08-05, Option C — sami-ratified).
+        # The Phase 2a fs cut hides ~/.claude/.credentials.json (Anthropic OAuth
+        # token — cred-invariant "no cred in HOME binds"). Without an alternate
+        # auth path, Claude Code inside the sandbox prints "Not logged in" and
+        # exits at 1 turn / $0. Fix: extract MIKA_ANTHROPIC_API_KEY from
+        # ~/.mika/.env (mika-spirit's dotenvy source) — a project-scoped API key
+        # (rotatable, revocable, blast-radius = billing) rather than the OAuth
+        # token (blast-radius = full Claude Code identity impersonation). Set as
+        # ANTHROPIC_API_KEY in the sandbox env allowlist so claude-agent-sdk
+        # picks it up without needing the credentials.json file at all.
+        #
+        # Last-win semantics via `tail -n1` — matches dotenvy: if the .env file
+        # has multiple MIKA_ANTHROPIC_API_KEY entries (e.g. after a key rotation
+        # where the operator appended rather than replaced), the latest wins.
+        # Quotes stripped best-effort. Silent no-op if the file/key is absent.
+        local _mika_env_file="$HOME/.mika/.env"
+        if [ -f "$_mika_env_file" ]; then
+            local _anthropic_key
+            _anthropic_key=$(grep '^MIKA_ANTHROPIC_API_KEY=' "$_mika_env_file" 2>/dev/null \
+                | tail -n1 \
+                | sed -e 's/^MIKA_ANTHROPIC_API_KEY=//' \
+                      -e 's/^"\(.*\)"$/\1/' \
+                      -e "s/^'\(.*\)'$/\1/")
+            if [ -n "$_anthropic_key" ]; then
+                net_setenv_args+=(--setenv ANTHROPIC_API_KEY "$_anthropic_key")
+            fi
+        fi
         # sh -c wrapper that starts the shim, waits for it, execs the pilot,
         # cleans up on exit. `exec` in the final position ensures the pilot's
         # exit status becomes the sh's.
