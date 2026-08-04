@@ -33,6 +33,15 @@
 # INVOKE:
 #   ./scripts/canary-pilot-containment              # run canary, print report
 #   ./scripts/canary-pilot-containment --show-args  # print bwrap args only
+#   ./scripts/canary-pilot-containment --enter      # enter live sandbox as sh
+#                                                     (coherence probes here from
+#                                                     the OUTSIDE — probes come
+#                                                     via stdin; interactive if
+#                                                     stdin is a TTY)
+#   ./scripts/canary-pilot-containment --ensure-relay
+#                                                   # start the egress relay
+#                                                     daemon if not running, exit
+#                                                     0 (idempotent)
 
 set -euo pipefail
 
@@ -61,12 +70,53 @@ export WORKTREE_DIR="$REPO_ROOT"
 source "$DISPATCH_LIB"
 
 # --show-args mode: print the exact bwrap args + exit. For coherence to
-# review without running the sandbox.
+# review without running the sandbox. Runs the helper under bash -x so
+# every command (including the internal bwrap invocation) is traced.
 if [ "${1:-}" = "--show-args" ]; then
-    # Enable tracing of just the bwrap invocation
-    set -x
-    _run_pilot_sandboxed /bin/true 2>&1 | head -80
+    export WORKTREE_DIR
+    bash -x -c "
+        source '$DISPATCH_LIB'
+        _run_pilot_sandboxed /bin/true
+    " 2>&1 | grep -E '^\+ *(bwrap|--)' | head -100
     exit 0
+fi
+
+# --ensure-relay mode: bring up host-side egress-proxy daemon idempotently,
+# print status, exit. Coherence runs this once before entering the sandbox
+# (or the sandbox itself will lazy-launch it via _ensure_pilot_egress_proxy).
+if [ "${1:-}" = "--ensure-relay" ]; then
+    if _ensure_pilot_egress_proxy; then
+        echo "relay: up ($_PILOT_EGRESS_SOCK)"
+        exit 0
+    fi
+    echo "relay: FAILED to start (see stderr above)" >&2
+    exit 1
+fi
+
+# --enter mode: bring up the relay, then exec /bin/sh inside the FULL branch
+# shape (Phase 2b bwrap wrap). stdin/stdout/stderr are passed through so:
+#   * a piped-in adversarial script runs and prints results
+#   * an interactive TTY on stdin gets a shell prompt
+# This is the sonde-live pattern coherence needs: MPC does not control what
+# runs inside, coherence does. Print the exact bwrap args first so the
+# invocation is auditable (the "author is not their own control" gate).
+if [ "${1:-}" = "--enter" ]; then
+    echo "============================================================" >&2
+    echo "canary --enter: full branch shape, coherence probes here" >&2
+    echo "============================================================" >&2
+    echo "The exact bwrap invocation follows (--show-args tracing):" >&2
+    echo "------------------------------------------------------------" >&2
+    ( set -x; _run_pilot_sandboxed /bin/true 2>&1 ) 2>&1 >/dev/null | head -100 >&2 || true
+    echo "------------------------------------------------------------" >&2
+    echo "Egress-proxy log tail (host-side allowlist audit):" >&2
+    for p in /var/log/mika/pilot-egress-proxy.log /tmp/mika-pilot-egress-proxy.log; do
+        if [ -f "$p" ]; then echo "$p" >&2; break; fi
+    done
+    echo "------------------------------------------------------------" >&2
+    echo "Entering sandbox. Type your hole-hunt (Ctrl-D to exit)." >&2
+    echo >&2
+    _run_pilot_sandboxed /bin/sh
+    exit $?
 fi
 
 # Simulate host env vars a real spawn would carry through (post PR#1893
