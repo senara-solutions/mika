@@ -27,6 +27,69 @@
 
 # --- Internal helpers (underscore-prefixed, not part of the API contract) ---
 
+# mika#TBD (containment Phase 2a): fs-cut sandbox for the pilot subprocess.
+# Prepends bwrap to the claude-pilot invocation so the process runs with a
+# minimal-visibility filesystem — ~/.ssh, ~/.aws, ~/.mika/.env, and other
+# operator-home secrets become invisible (tmpfs /home covers them; explicit
+# binds re-expose only what the pilot legitimately needs).
+#
+# Design (Phase 2a, fs-only):
+#   * `--ro-bind / /`     : root fs read-only baseline (bins, libs, /etc, …)
+#   * `--tmpfs /home`     : blanks the operator home — key protection
+#   * bind narrow subset  : ~/.local, ~/.claude, ~/.nvm, ~/.config/gh, ~/.mika/data
+#                           (writable — pilot needs to log/read/execute here)
+#   * `--bind $WORKTREE`  : the branch worktree, writable (git-plumbing target)
+#   * `--dev /dev --proc /proc --tmpfs /tmp` : minimal virtual filesystems
+#   * `--chdir $WORKTREE_DIR --setenv HOME $HOME` : preserve invocation semantics
+#
+# NOT included in Phase 2a: network cut (`--unshare-net` or nftables egress).
+# Phase 2b tracks that separately — until it lands, an in-sandbox process
+# still has full outbound network access. Env-scrub (PR#1893) is the
+# orthogonal defense reducing what the process sees at all.
+#
+# Opt-out: `MIKA_PILOT_SANDBOX=0` (or any of `false`/`no`/`off`, case-insensitive)
+# reverts to direct invocation. Default: enabled (Phase 2a is safe fallback —
+# fs cut hides secrets, never breaks legitimate reads of allowlisted paths).
+#
+# The helper prints its resolved bwrap prefix to stdout; callers use it via
+# command substitution:  eval "$(_pilot_sandbox_prefix) claude-pilot …"
+# Empty output when sandbox disabled — callers can invoke claude-pilot direct.
+_pilot_sandbox_enabled() {
+    local mode="${MIKA_PILOT_SANDBOX:-1}"
+    case "$(echo "$mode" | tr '[:upper:]' '[:lower:]')" in
+        0|false|no|off|disabled) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+_run_pilot_sandboxed() {
+    # Runs "$@" (the full claude-pilot invocation) under bwrap when enabled,
+    # or direct-exec otherwise. Preserves stdin/stdout/stderr semantics.
+    if ! _pilot_sandbox_enabled; then
+        "$@"
+        return $?
+    fi
+    if ! command -v bwrap >/dev/null 2>&1; then
+        echo "dispatch-lib: MIKA_PILOT_SANDBOX enabled but bwrap not installed on PATH — falling back to direct invocation" >&2
+        "$@"
+        return $?
+    fi
+    bwrap \
+        --ro-bind / / \
+        --tmpfs /home \
+        --bind "$WORKTREE_DIR" "$WORKTREE_DIR" \
+        --bind "$HOME/.local" "$HOME/.local" \
+        --bind "$HOME/.claude" "$HOME/.claude" \
+        --bind "$HOME/.config/gh" "$HOME/.config/gh" \
+        --bind "$HOME/.nvm" "$HOME/.nvm" \
+        --bind "$HOME/.mika/data" "$HOME/.mika/data" \
+        --dev /dev --proc /proc --tmpfs /tmp \
+        --chdir "$WORKTREE_DIR" \
+        --setenv HOME "$HOME" \
+        --setenv PATH "$PATH" \
+        -- "$@"
+}
+
 # mika#749: TERM trap writes cancel discriminator before exit.
 # Convention: reason file at /tmp/mika-cancel-reason-$$ (PID-based).
 # cancel_task pre-writes CANCELLED_BY_OPERATOR before SIGTERM; this trap
@@ -687,7 +750,7 @@ _run_claude_pilot() {
     set +e
     # CWD_ARGS is intentionally word-split (multiple flags)
     # shellcheck disable=SC2086
-    claude-pilot --verbose --log-dir --task-id "$LOG_ID" --command "$ENTRY_COMMAND" $TRACE_FLAG $CWD_ARGS -- "$PROMPT" >"$STDOUT_FILE" 2>"$STDERR_FILE"
+    _run_pilot_sandboxed claude-pilot --verbose --log-dir --task-id "$LOG_ID" --command "$ENTRY_COMMAND" $TRACE_FLAG $CWD_ARGS -- "$PROMPT" >"$STDOUT_FILE" 2>"$STDERR_FILE"
     PILOT_EXIT=$?
     # Persist stderr to durable file before any processing (mika#1097).
     # Scrub secrets from the persistent copy to prevent durable secret retention (mika#903).
@@ -1970,7 +2033,7 @@ _launch_revise_pilot() {
     set +e
     # CWD_ARGS is intentionally word-split (multiple flags)
     # shellcheck disable=SC2086
-    claude-pilot --verbose --log-dir --task-id "$revise_log_id" \
+    _run_pilot_sandboxed claude-pilot --verbose --log-dir --task-id "$revise_log_id" \
         --command "/mika-revise-plan" $CWD_ARGS \
         -- "@${findings_file}" \
         >"$revise_stdout" 2>"$revise_stderr"
