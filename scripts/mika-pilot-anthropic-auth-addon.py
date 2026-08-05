@@ -47,27 +47,40 @@ _ANTHROPIC_HOST = "api.anthropic.com"
 _token_cache: dict[str, object] = {"mtime": None, "value": None}
 
 
-def _extract_oauth_token(obj) -> str | None:
-    """Walk a JSON-decoded object looking for the first string that starts
-    with sk-ant-oat. Handles nested/flat/snake_case shapes uniformly."""
+_ACCESS_TOKEN_KEYS = ("accessToken", "access_token")
 
-    def _walk(node):
+
+def _extract_oauth_token(obj) -> str | None:
+    """Walk a JSON-decoded object looking for an OAuth access token.
+
+    Prefers a value under a key literally named `accessToken`/`access_token`
+    when present (defensive against schemas that also store refresh tokens
+    with the same prefix). Falls back to first string with `sk-ant-oat`
+    prefix (handles flat/nested/snake_case shapes uniformly).
+    """
+
+    def _walk(node, prefer_access_key):
         if isinstance(node, dict):
+            if prefer_access_key:
+                for k, v in node.items():
+                    if k in _ACCESS_TOKEN_KEYS and isinstance(v, str) and v.startswith(_OAUTH_TOKEN_PREFIX):
+                        return v
             for v in node.values():
                 if isinstance(v, str) and v.startswith(_OAUTH_TOKEN_PREFIX):
                     return v
             for v in node.values():
-                found = _walk(v)
+                found = _walk(v, prefer_access_key)
                 if found is not None:
                     return found
         elif isinstance(node, list):
             for item in node:
-                found = _walk(item)
+                found = _walk(item, prefer_access_key)
                 if found is not None:
                     return found
         return None
 
-    return _walk(obj)
+    # Two-pass walk: prefer accessToken key first, fall back to any oat prefix.
+    return _walk(obj, prefer_access_key=True) or _walk(obj, prefer_access_key=False)
 
 
 def _read_subscription_token() -> str | None:
@@ -109,6 +122,19 @@ def request(flow: http.HTTPFlow) -> None:
     for header_name in ("authorization", "x-api-key", "proxy-authorization"):
         flow.request.headers.pop(header_name, None)
     flow.request.headers["Authorization"] = f"Bearer {token}"
-    # Soft-warn if token appears expired (mitmdump log — visible in stderr).
-    # Anthropic will 401 anyway but this makes it grep-able.
-    # (We don't have direct access to expires_at without another parse pass.)
+    # Anthropic requires the OAuth beta header for Bearer subscription tokens
+    # on all endpoints; without it a Bearer <sk-ant-oat*> is rejected as
+    # "x-api-key header is required" (401). Voie-A reverse-proxy works because
+    # the SDK message-API path already sends this header — the CONNECT-tunnel
+    # paths caught by γ MITM (auto-update, OAuth check, telemetry, etc.) do
+    # NOT set it, so we must inject host-side. Coherence REFUTE 2026-08-05.
+    # Append rather than clobber if the client sent other beta values already.
+    _OAUTH_BETA = "oauth-2025-04-20"
+    existing_beta = flow.request.headers.get("anthropic-beta", "")
+    if existing_beta:
+        beta_values = [v.strip() for v in existing_beta.split(",") if v.strip()]
+        if _OAUTH_BETA not in beta_values:
+            beta_values.append(_OAUTH_BETA)
+        flow.request.headers["anthropic-beta"] = ",".join(beta_values)
+    else:
+        flow.request.headers["anthropic-beta"] = _OAUTH_BETA
