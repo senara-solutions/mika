@@ -94,6 +94,77 @@ _PILOT_EGRESS_SOCK="/tmp/mika-pilot-egress.sock"
 _PILOT_EGRESS_TCP_PORT="8891"
 _PILOT_EGRESS_PROXY_BIN="$HOME/.local/bin/mika-pilot-egress-proxy"
 
+# Helper daemon for anthropic api chain (2026-08-05).
+_PILOT_HELPER_BIN="$HOME/.local/bin/mitmdump"
+_PILOT_HELPER_PORT="8892"
+_PILOT_HELPER_ADDON="/data/workspace/mika-platform/mika/scripts/mika-pilot-anthropic-auth-addon.py"
+_PILOT_HELPER_CA="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
+_PILOT_HELPER_LOG="/var/log/mika/pilot-helper.log"
+
+# Idempotent helper daemon launcher for the anthropic api chain
+# (2026-08-05, Vincent-authorized). Chained from the front egress proxy
+# when a CONNECT to api.anthropic.com is seen.
+_ensure_pilot_helper() {
+    if [ ! -x "$_PILOT_HELPER_BIN" ]; then
+        echo "dispatch-lib: pilot helper binary not found at $_PILOT_HELPER_BIN — chained tunnel disabled" >&2
+        return 1
+    fi
+    if [ ! -f "$_PILOT_HELPER_ADDON" ]; then
+        echo "dispatch-lib: pilot helper addon not found at $_PILOT_HELPER_ADDON" >&2
+        return 1
+    fi
+    # Liveness probe: TCP port accepts a connection.
+    if python3 -c "
+import socket
+s = socket.socket()
+s.settimeout(1)
+try:
+    s.connect(('127.0.0.1', $_PILOT_HELPER_PORT))
+    s.close()
+except OSError:
+    exit(1)
+" 2>/dev/null; then
+        return 0
+    fi
+    mkdir -p "$(dirname "$_PILOT_HELPER_LOG")" 2>/dev/null || true
+    nohup "$_PILOT_HELPER_BIN" \
+        --listen-host 127.0.0.1 --listen-port "$_PILOT_HELPER_PORT" \
+        --scripts "$_PILOT_HELPER_ADDON" \
+        --set stream_large_bodies=1 \
+        --set http2=true \
+        --set flow_detail=0 \
+        >>"$_PILOT_HELPER_LOG" 2>&1 </dev/null &
+    disown 2>/dev/null || true
+    local i=0
+    while [ $i -lt 40 ]; do
+        if python3 -c "
+import socket
+s = socket.socket()
+s.settimeout(0.1)
+try:
+    s.connect(('127.0.0.1', $_PILOT_HELPER_PORT))
+    s.close()
+except Exception:
+    exit(1)
+" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+    if [ $i -eq 40 ]; then
+        echo "dispatch-lib: pilot helper failed to bind :$_PILOT_HELPER_PORT within 4s" >&2
+        return 1
+    fi
+    if [ ! -f "$_PILOT_HELPER_CA" ]; then
+        echo "dispatch-lib: pilot helper CA cert not found at $_PILOT_HELPER_CA" >&2
+        return 1
+    fi
+    echo "dispatch-lib: pilot helper launched (:$_PILOT_HELPER_PORT, log $_PILOT_HELPER_LOG)" >&2
+    return 0
+}
+
+
 # Idempotent host-side egress proxy launcher. Runs once per host; on subsequent
 # calls, verifies the daemon is alive and returns. Fail-open on missing binary
 # (Phase 2b not yet deployed) — sandbox falls back to Phase 2a (fs cut only,
@@ -178,6 +249,8 @@ _run_pilot_sandboxed() {
     local -a net_bwrap_args=()
     local -a net_setenv_args=()
     local sandbox_entrypoint_prefix=""
+    _ensure_pilot_helper || true
+
     if _ensure_pilot_egress_proxy; then
         # Full Phase 2b: unshare-net + bind unix socket + wrap with in-sandbox
         # TCP→unix shim + HTTPS_PROXY pointing at shim.
@@ -186,6 +259,11 @@ _run_pilot_sandboxed() {
             --bind "$_PILOT_EGRESS_SOCK" "$_PILOT_EGRESS_SOCK"
             --ro-bind "$_PILOT_EGRESS_PROXY_BIN" "$_PILOT_EGRESS_PROXY_BIN"
         )
+        if [ -f "$_PILOT_HELPER_CA" ]; then
+            net_bwrap_args+=(
+                --ro-bind "$_PILOT_HELPER_CA" "/etc/ssl/certs/mika-pilot-helper-ca.pem"
+            )
+        fi
         net_setenv_args=(
             --setenv HTTPS_PROXY "http://127.0.0.1:$_PILOT_EGRESS_TCP_PORT"
             --setenv HTTP_PROXY "http://127.0.0.1:$_PILOT_EGRESS_TCP_PORT"
@@ -244,6 +322,14 @@ _run_pilot_sandboxed() {
             --setenv ANTHROPIC_BASE_URL "http://127.0.0.1:$_PILOT_EGRESS_TCP_PORT/anthropic-proxy"
             --setenv CLAUDE_CODE_API_BASE_URL "http://127.0.0.1:$_PILOT_EGRESS_TCP_PORT/anthropic-proxy"
             --setenv ANTHROPIC_API_KEY "proxy-managed-no-secret"
+            # γ trust for the helper CA (Vincent-authorized 2026-08-05).
+            # NODE_EXTRA_CA_CERTS is ADDITIVE (adds to Node's built-in trust)
+            # so bundled claude keeps trusting the system CA for anything else.
+            # SSL_CERT_FILE / REQUESTS_CA_BUNDLE deliberately NOT set — they
+            # would REPLACE (not extend) the system trust bundle, breaking
+            # Python/curl verification of github.com etc. Bundled claude is
+            # Node — NODE_EXTRA_CA_CERTS suffices for our api.anthropic.com path.
+            --setenv NODE_EXTRA_CA_CERTS "/etc/ssl/certs/mika-pilot-helper-ca.pem"
         )
         # sh -c wrapper that starts the shim, waits for it, execs the pilot,
         # cleans up on exit. `exec` in the final position ensures the pilot's
