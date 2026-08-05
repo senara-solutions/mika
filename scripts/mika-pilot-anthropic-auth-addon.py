@@ -104,6 +104,26 @@ def _read_subscription_token() -> str | None:
     return token
 
 
+def responseheaders(flow: http.HTTPFlow) -> None:
+    """Force streaming pass-through on the RESPONSE for api.anthropic.com.
+
+    Anthropic's /v1/messages endpoint returns a long SSE stream (thinking
+    tokens + text blocks + tool_use blocks + stop_reason, delivered as
+    incremental SSE events). If mitmproxy buffers the response body before
+    forwarding, long completions get truncated / mal-framed — the tool_use
+    SSE events may not arrive at the client, so bundled claude sees a text
+    block but no tool_use → guardrail idle_timeout with no more progress.
+
+    `flow.response.stream = True` in responseheaders opts this specific
+    response out of body buffering — chunks are forwarded incrementally as
+    they arrive from upstream, preserving SSE framing exactly. Coherence
+    REFUTE #3 hypothesis (2026-08-05, sami).
+    """
+    if flow.request.host != _ANTHROPIC_HOST:
+        return
+    flow.response.stream = True
+
+
 def requestheaders(flow: http.HTTPFlow) -> None:
     """Called by mitmproxy when request HEADERS first arrive — BEFORE any
     body-streaming decision. Injecting Authorization + anthropic-beta here
