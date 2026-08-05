@@ -1,0 +1,9 @@
+# mika-dev-confidence-{high,low} — RT-005 physics pilot, brick 2/5.
+# Byte-identical for both derived agents. Copies the mika-dev shape
+# (base model glm-5.2 per mika#1633); the ONLY behavioral difference
+# between the two agents lives in soul.md's confidence prior block.
+
+llm_provider = "openrouter"
+openrouter_model = "z-ai/glm-5.2"
+llm_max_tokens = 8192
+log_level = "info"
