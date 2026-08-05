@@ -138,7 +138,7 @@ except OSError:
     nohup "$_PILOT_HELPER_BIN" \
         --listen-host 127.0.0.1 --listen-port "$_PILOT_HELPER_PORT" \
         --scripts "$_PILOT_HELPER_ADDON" \
-        --set stream_large_bodies=1 \
+        --set stream_large_bodies=10m \
         --set http2=true \
         --set flow_detail=0 \
         >>"$_PILOT_HELPER_LOG" 2>&1 </dev/null &

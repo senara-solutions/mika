@@ -104,8 +104,16 @@ def _read_subscription_token() -> str | None:
     return token
 
 
-def request(flow: http.HTTPFlow) -> None:
-    """Called by mitmproxy on every request. We only rewrite for api.anthropic.com."""
+def requestheaders(flow: http.HTTPFlow) -> None:
+    """Called by mitmproxy when request HEADERS first arrive — BEFORE any
+    body-streaming decision. Injecting Authorization + anthropic-beta here
+    (rather than in the `request` hook) guarantees the rewrite lands before
+    mitmdump forwards headers upstream, even when `stream_large_bodies` is
+    aggressive. Coherence REFUTE #2 (2026-08-05) traced the 401 to my
+    original `request`-hook injection firing AFTER headers had already gone
+    upstream under streaming — timing bug, not a header-content bug. This
+    hook is the correct home for auth mutation regardless of streaming.
+    """
     if flow.request.host != _ANTHROPIC_HOST:
         return
     token = _read_subscription_token()
