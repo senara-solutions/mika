@@ -223,8 +223,26 @@ _run_pilot_sandboxed() {
         # ANTHROPIC_API_KEY is set to a placeholder so Claude Code doesn't
         # short-circuit into "Not logged in" — the proxy overwrites the
         # Authorization header regardless of what the sandbox sent.
+        #
+        # CLAUDE_CODE_API_BASE_URL (2026-08-05 — anti-jour finding, sami-ratified):
+        # ANTHROPIC_BASE_URL covers the Anthropic SDK's message API client, but
+        # bundled `claude` v2.1.191 has INTERNAL code paths (auto-update check,
+        # session bootstrap, OAuth handshake, telemetry) that hardcode
+        # https://api.anthropic.com/... and honor a distinct CC-specific env
+        # var — CLAUDE_CODE_API_BASE_URL — for their base URL override. Setting
+        # this alongside ANTHROPIC_BASE_URL routes ALL CC-internal traffic
+        # through the /anthropic-proxy/* reverse-proxy path where host-side
+        # OAuth injection lives. Without it, those internal calls fall through
+        # to HTTPS_PROXY CONNECT tunnels (carrying the sandbox placeholder key)
+        # → Anthropic 401 / SDK stall → guardrail idle_timeout 300s → pilot
+        # dies at Turns:1 with HEAD unchanged (n=6 dispatches observed).
+        # Found via `strings` on bundled claude binary; verified end-to-end
+        # in canary (opus-4-8, stream-json, no --bare) → 1.7s clean completion.
+        # γ (MITM CONNECT tunnels) filed as long-term robustness follow-up so
+        # we're not dependent on this internal env var indefinitely.
         net_setenv_args+=(
             --setenv ANTHROPIC_BASE_URL "http://127.0.0.1:$_PILOT_EGRESS_TCP_PORT/anthropic-proxy"
+            --setenv CLAUDE_CODE_API_BASE_URL "http://127.0.0.1:$_PILOT_EGRESS_TCP_PORT/anthropic-proxy"
             --setenv ANTHROPIC_API_KEY "proxy-managed-no-secret"
         )
         # sh -c wrapper that starts the shim, waits for it, execs the pilot,
