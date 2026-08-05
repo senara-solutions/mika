@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
-"""HTTPS CONNECT proxy with hostname allowlist — dev-pilot containment Phase 2b.
+"""HTTPS CONNECT proxy with hostname allowlist + Anthropic auth reverse-proxy
+— dev-pilot containment Phase 2b.
 
 Two invocation modes:
 
   mika-pilot-egress-proxy --host-unix
       Listens on `/tmp/mika-pilot-egress.sock` (unix socket).
-      Accepts HTTP CONNECT, filters by hostname allowlist, forwards to upstream.
-      This is the SECURITY BOUNDARY — only the allowlisted hosts reachable.
+      Two request shapes accepted on the same endpoint (dispatched by method
+      + path on the request line):
+
+        (1) CONNECT <host>:<port>  — HTTPS tunnel via allowlist. Existing.
+        (2) <METHOD> /anthropic-proxy/...  — HTTP reverse-proxy to
+            api.anthropic.com/... with Authorization: Bearer <scoped-key>
+            injected host-side. The sandbox NEVER sees the key
+            (Q3 shape, sami+coherence-ratified 2026-08-05).
+
       Runs as long-lived daemon on the host (spawned by dispatch-lib.sh).
 
   mika-pilot-egress-proxy --sandbox-tcp <PORT>
@@ -14,7 +22,9 @@ Two invocation modes:
       Forwards each connection verbatim to `/tmp/mika-pilot-egress.sock`
       (which is bind-mounted from host by bwrap). No filtering here — the
       host side is the gate. This exists ONLY because most HTTP clients
-      (reqwest, node fetch, cargo) don't accept `HTTPS_PROXY=unix:///path`.
+      (reqwest, node fetch, cargo) don't accept `HTTPS_PROXY=unix:///path`,
+      AND because ANTHROPIC_BASE_URL points at this loopback port for the
+      auth-injection reverse-proxy flow.
 
 Design rationale (see coherence audit 2026-08-04 + Phase 2b design):
 
@@ -48,11 +58,14 @@ Failure modes:
 
 import argparse
 import asyncio
+import json
 import os
 import re
 import socket
+import ssl
 import stat
 import sys
+import time
 from pathlib import Path
 
 # Sole security boundary — every entry is a decision.
@@ -83,6 +96,104 @@ DEFAULT_UNIX_SOCK = "/tmp/mika-pilot-egress.sock"
 BUFFER_SIZE = 65536
 CONNECT_RE = re.compile(rb"^CONNECT ([^:\s]+):(\d+) HTTP/1\.[01]\r\n", re.ASCII)
 
+# Q3 auth-injection reverse-proxy — path prefix stripped, forwarded to
+# api.anthropic.com over TLS with `Authorization: Bearer <subscription-access-token>`
+# injected host-side. Voie A (2026-08-05, Vincent-ratified): token source is
+# ~/.claude/.credentials.json (the subscription OAuth cred, refreshed by the
+# local Claude Code CLI). The proxy is read-only on that file — refresh is
+# delegated to the host CLI (natural during Vincent's use + cron keep-warm
+# for headless nights). Voie B (proxy owns refresh) is a follow-up.
+#
+# Vincent's decision (2026-08-05): pilot MUST auth via the paid subscription,
+# not a metered API key — cost is flat-and-bounded vs API bill that grows
+# with the loop. The blast-radius trade (subscription OAuth = full identity
+# vs API key = billing-only) is knowingly accepted because containment is
+# for the *pilot* (untrusted code), not the *host* (trusted zone anyway);
+# the sandbox stays blind either way.
+ANTHROPIC_UPSTREAM_HOST = "api.anthropic.com"
+ANTHROPIC_UPSTREAM_PORT = 443
+ANTHROPIC_PROXY_PATH_PREFIX = "/anthropic-proxy"
+ANTHROPIC_METHOD_RE = re.compile(
+    rb"^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS) "
+    rb"(" + re.escape(ANTHROPIC_PROXY_PATH_PREFIX.encode("ascii")) + rb"[^\s]*)"
+    rb" HTTP/1\.[01]\r\n",
+    re.ASCII,
+)
+
+# Subscription OAuth token — held host-side (never crosses bwrap boundary),
+# read from ~/.claude/.credentials.json with mtime-caching so the CLI's
+# natural refresh writes are picked up on the next request without proxy
+# restart. The proxy NEVER writes this file (Voie A: read-only).
+_CREDS_PATH = Path.home() / ".claude" / ".credentials.json"
+_OAUTH_TOKEN_PREFIX = "sk-ant-oat"
+_token_cache = {"mtime": None, "value": None, "expires_at": None}
+
+
+def _extract_oauth_token(obj) -> tuple[str | None, float | None]:
+    """Walk a JSON-decoded object looking for an OAuth access token +
+    optional expiry. Handles multiple credentials.json shapes:
+
+      * flat:   {"accessToken": "...", "expiresAt": 1234567890}
+      * nested: {"claudeAiOauth": {"accessToken": "...", "expiresAt": ...}}
+      * snake:  {"access_token": "...", "expires_at": ...}
+      * any other nested variant
+
+    The heuristic: first string value that starts with `sk-ant-oat` wins;
+    expiry is picked from any sibling `expiresAt`/`expires_at`/`exp` key.
+    Returns (token, expires_at_seconds) or (None, None).
+    """
+    def _walk(node, expiry_hint):
+        if isinstance(node, dict):
+            local_expiry = expiry_hint
+            for k, v in node.items():
+                if isinstance(v, (int, float)) and k in (
+                    "expiresAt", "expires_at", "exp"
+                ):
+                    # Some sources use ms epoch, some seconds. Detect and
+                    # normalize: values > 10^12 are ms since epoch.
+                    local_expiry = v / 1000 if v > 1e12 else float(v)
+            for k, v in node.items():
+                if isinstance(v, str) and v.startswith(_OAUTH_TOKEN_PREFIX):
+                    return v, local_expiry
+            for v in node.values():
+                found = _walk(v, local_expiry)
+                if found[0] is not None:
+                    return found
+        elif isinstance(node, list):
+            for item in node:
+                found = _walk(item, expiry_hint)
+                if found[0] is not None:
+                    return found
+        return None, None
+    return _walk(obj, None)
+
+
+def read_subscription_token() -> tuple[str | None, float | None]:
+    """Return (access_token, expires_at) from ~/.claude/.credentials.json,
+    cached by file mtime. Returns (None, None) if the file/token is absent.
+
+    The Claude Code CLI refreshes this file periodically (on user interaction
+    or before expiry). The proxy READS it on each Anthropic-bound request;
+    mtime-cache avoids re-parsing on every hit but picks up refreshes as
+    soon as the CLI writes them.
+    """
+    try:
+        st = _CREDS_PATH.stat()
+    except OSError:
+        return None, None
+    if _token_cache["mtime"] == st.st_mtime:
+        return _token_cache["value"], _token_cache["expires_at"]
+    try:
+        with _CREDS_PATH.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    token, expires_at = _extract_oauth_token(data)
+    _token_cache["mtime"] = st.st_mtime
+    _token_cache["value"] = token
+    _token_cache["expires_at"] = expires_at
+    return token, expires_at
+
 
 async def pipe_bytes(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     """Forward reader → writer until either side closes. Silent on error."""
@@ -102,11 +213,162 @@ async def pipe_bytes(reader: asyncio.StreamReader, writer: asyncio.StreamWriter)
             pass
 
 
+async def handle_anthropic_reverse_proxy(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    request: bytes,
+    method: bytes,
+    path: bytes,
+) -> None:
+    """Q3 host-side auth injection (Voie A — subscription OAuth).
+
+    Sandbox client sends an HTTP request to <method> /anthropic-proxy/<rest>.
+    We strip the prefix, rewrite Host and Authorization headers with the
+    subscription OAuth access token from ~/.claude/.credentials.json
+    (host-side, never crosses sandbox boundary), open TLS to
+    api.anthropic.com:443, forward request, and stream response back.
+
+    Refresh: delegated to the local Claude Code CLI. When the CLI refreshes
+    its token, the file mtime changes and the proxy picks up the new value
+    on the next request. If expired without a refresh (marathon-nights with
+    no CLI activity), Anthropic responds 401 → pilot fails visibly → cron
+    keep-warm covers this case (see docs/solutions/).
+    """
+    token, expires_at = read_subscription_token()
+    if token is None:
+        body = (
+            f"mika-pilot-egress: subscription OAuth token not found in "
+            f"{_CREDS_PATH}. Vincent must be logged in to Claude Code on "
+            f"the host for the pilot to authenticate.\n"
+        ).encode("utf-8")
+        writer.write(
+            b"HTTP/1.1 503 Service Unavailable\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+            b"Connection: close\r\n"
+            b"\r\n" + body
+        )
+        await writer.drain()
+        print(f"[anthropic-proxy] DENY no-token path={path.decode('ascii', 'replace')}",
+              file=sys.stderr, flush=True)
+        return
+    # Soft-warn if the token appears expired — Anthropic will 401 anyway,
+    # this makes debugging easier from the proxy log.
+    if expires_at is not None and expires_at < time.time():
+        print(
+            f"[anthropic-proxy] WARN token appears expired "
+            f"({int(time.time() - expires_at)}s ago) — Anthropic will 401. "
+            f"Refresh via a Claude Code CLI call on the host.",
+            file=sys.stderr, flush=True,
+        )
+
+    # Split request into request-line + headers. body follows blank line.
+    try:
+        head, _sep, _ = request.partition(b"\r\n\r\n")
+    except Exception:
+        writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+        await writer.drain()
+        return
+    lines = head.split(b"\r\n")
+    header_lines = lines[1:]  # skip request line
+    new_path = path[len(ANTHROPIC_PROXY_PATH_PREFIX.encode("ascii")):]
+    if not new_path or not new_path.startswith(b"/"):
+        new_path = b"/" + new_path
+    # Drop Host, Authorization, X-API-Key, X-Api-Key from client headers —
+    # we re-write them. Drop Proxy-Authorization defensively. Preserve
+    # everything else (Content-Type, Content-Length, Transfer-Encoding,
+    # Accept, User-Agent, anthropic-version, anthropic-beta, etc.).
+    drop_re = re.compile(
+        rb"^(host|authorization|x-api-key|proxy-authorization)\s*:",
+        re.IGNORECASE,
+    )
+    filtered_headers = [h for h in header_lines if not drop_re.match(h)]
+    # Detect body length. Support Content-Length (fixed) and
+    # Transfer-Encoding: chunked (streaming).
+    content_length = 0
+    is_chunked = False
+    for h in filtered_headers:
+        if re.match(rb"^content-length\s*:", h, re.IGNORECASE):
+            try:
+                content_length = int(h.split(b":", 1)[1].strip())
+            except (ValueError, IndexError):
+                content_length = 0
+        elif re.match(rb"^transfer-encoding\s*:.*chunked", h, re.IGNORECASE):
+            is_chunked = True
+    # Build new request line + injected headers.
+    new_request = (
+        method + b" " + new_path + b" HTTP/1.1\r\n"
+        + b"Host: " + ANTHROPIC_UPSTREAM_HOST.encode("ascii") + b"\r\n"
+        + b"Authorization: Bearer " + token.encode("ascii") + b"\r\n"
+        + b"Connection: close\r\n"  # force one-shot, avoid keepalive complexity
+        + b"\r\n".join(filtered_headers)
+        + b"\r\n\r\n"
+    )
+    # Open TLS upstream.
+    try:
+        ssl_ctx = ssl.create_default_context()
+        up_reader, up_writer = await asyncio.wait_for(
+            asyncio.open_connection(
+                ANTHROPIC_UPSTREAM_HOST, ANTHROPIC_UPSTREAM_PORT,
+                ssl=ssl_ctx, server_hostname=ANTHROPIC_UPSTREAM_HOST,
+            ),
+            timeout=15.0,
+        )
+    except (asyncio.TimeoutError, OSError, ssl.SSLError) as exc:
+        writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+        await writer.drain()
+        print(f"[anthropic-proxy] UPSTREAM_FAIL: {exc}",
+              file=sys.stderr, flush=True)
+        return
+
+    try:
+        # Send request head.
+        up_writer.write(new_request)
+        await up_writer.drain()
+        # Forward request body from client → upstream.
+        if is_chunked:
+            # Stream chunked body verbatim until 0-length chunk terminator.
+            while True:
+                chunk = await reader.read(BUFFER_SIZE)
+                if not chunk:
+                    break
+                up_writer.write(chunk)
+                await up_writer.drain()
+                if b"0\r\n\r\n" in chunk:
+                    break
+        elif content_length > 0:
+            remaining = content_length
+            while remaining > 0:
+                chunk = await reader.read(min(BUFFER_SIZE, remaining))
+                if not chunk:
+                    break
+                up_writer.write(chunk)
+                await up_writer.drain()
+                remaining -= len(chunk)
+        # Stream response upstream → client until upstream closes.
+        while True:
+            chunk = await up_reader.read(BUFFER_SIZE)
+            if not chunk:
+                break
+            writer.write(chunk)
+            await writer.drain()
+        print(
+            f"[anthropic-proxy] ALLOW {method.decode('ascii')} "
+            f"{new_path.decode('ascii', 'replace')}",
+            file=sys.stderr, flush=True,
+        )
+    finally:
+        try:
+            up_writer.close()
+        except OSError:
+            pass
+
+
 async def handle_host_client(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
 ) -> None:
-    """Host-side handler: parse CONNECT, filter hostname, bridge to upstream."""
+    """Host-side handler: dispatch by request-line to CONNECT or reverse-proxy."""
     peer = "unknown"
     try:
         # Read request line + headers (up to blank line).
@@ -117,6 +379,16 @@ async def handle_host_client(
         except (asyncio.TimeoutError, asyncio.IncompleteReadError):
             writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
             await writer.drain()
+            return
+
+        # Dispatch: CONNECT vs anthropic-proxy HTTP reverse-proxy.
+        anthropic_match = ANTHROPIC_METHOD_RE.match(request)
+        if anthropic_match:
+            method = anthropic_match.group(1)
+            path = anthropic_match.group(2)
+            await handle_anthropic_reverse_proxy(
+                reader, writer, request, method, path,
+            )
             return
 
         match = CONNECT_RE.match(request)
