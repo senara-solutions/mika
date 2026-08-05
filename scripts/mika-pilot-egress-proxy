@@ -113,6 +113,18 @@ DEFAULT_UNIX_SOCK = "/tmp/mika-pilot-egress.sock"
 BUFFER_SIZE = 65536
 CONNECT_RE = re.compile(rb"^CONNECT ([^:\s]+):(\d+) HTTP/1\.[01]\r\n", re.ASCII)
 
+# γ auth-injection tunnel (2026-08-05, Vincent-authorized): hosts listed
+# here have their CONNECT chained to the local mitmdump daemon rather than
+# tunneled directly. mitmdump handles the TLS termination + addon-based
+# auth rewrite (see scripts/mika-pilot-anthropic-auth-addon.py) + upstream
+# re-TLS. Kept narrow — api.anthropic.com is the sole host where the
+# sandbox has no real credential to present (only a placeholder). Other
+# LLM providers / github / registries stay on the plain CONNECT allowlist
+# path where the sandbox carries its own real credentials through the
+# encrypted tunnel (GH_TOKEN etc.).
+MITM_FORWARD_HOSTS = frozenset({"api.anthropic.com"})
+MITM_UPSTREAM_PORT = 8892  # mitmdump --listen-port (managed by dispatch-lib)
+
 # Q3 auth-injection reverse-proxy — path prefix stripped, forwarded to
 # api.anthropic.com over TLS with `Authorization: Bearer <subscription-access-token>`
 # injected host-side. Voie A (2026-08-05, Vincent-ratified): token source is
@@ -417,6 +429,35 @@ async def handle_host_client(
         host = match.group(1).decode("ascii", errors="replace")
         port = int(match.group(2))
         peer = f"{host}:{port}"
+
+        # γ auth-injection tunnel (2026-08-05, Vincent-authorized): CONNECT
+        # to api.anthropic.com is chained to the local mitmdump daemon on
+        # 127.0.0.1:MITM_UPSTREAM_PORT rather than tunneled to Anthropic
+        # directly. mitmdump handles TLS with its own CA (sandbox trusts it
+        # via NODE_EXTRA_CA_CERTS bind — dispatch-lib.sh) and an addon
+        # rewrites the Authorization header before upstream forwarding.
+        # See scripts/mika-pilot-anthropic-auth-addon.py for the addon.
+        if host in MITM_FORWARD_HOSTS:
+            try:
+                up_reader, up_writer = await asyncio.wait_for(
+                    asyncio.open_connection("127.0.0.1", MITM_UPSTREAM_PORT),
+                    timeout=5.0,
+                )
+            except (asyncio.TimeoutError, OSError) as exc:
+                writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                await writer.drain()
+                print(f"[mitm-forward] MITMDUMP_DOWN {peer}: {exc}",
+                      file=sys.stderr, flush=True)
+                return
+            up_writer.write(request)
+            await up_writer.drain()
+            print(f"[mitm-forward] {peer} → mitmdump", file=sys.stderr, flush=True)
+            await asyncio.gather(
+                pipe_bytes(reader, up_writer),
+                pipe_bytes(up_reader, writer),
+                return_exceptions=True,
+            )
+            return
 
         if host not in HOST_ALLOWLIST:
             body = (
