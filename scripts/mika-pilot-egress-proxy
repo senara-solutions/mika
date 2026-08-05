@@ -69,9 +69,26 @@ import time
 from pathlib import Path
 
 # Sole security boundary — every entry is a decision.
+#
+# NOTE: `api.anthropic.com` is deliberately ABSENT from the CONNECT allowlist
+# (2026-08-05 root-cause fix). All Anthropic API traffic MUST route through
+# the /anthropic-proxy/* reverse-proxy path where host-side OAuth injection
+# happens. Any CONNECT tunnel attempt to api.anthropic.com now fails fast
+# with a 403, converting a silent hang (SDK trying auth via CONNECT with the
+# sandbox placeholder key) into a visible fail-fast — RT#003 (silent→noisy)
+# applied at the egress layer.
+#
+# Diagnostic evidence (canary --enter, 2026-08-05): bundled claude v2.1.191
+# with HTTPS_PROXY set + BASE_URL set uses HTTPS_PROXY CONNECT for SOME API
+# paths (bypassing BASE_URL). Those calls carry the sandbox's placeholder
+# ANTHROPIC_API_KEY (proxy-managed-no-secret) as bearer → Anthropic returns
+# 401 or the SDK stalls waiting for a valid response → guardrail idle_timeout
+# 300s → PIPELINE FAILURE zero commits. Removing api.anthropic.com from
+# CONNECT allowlist forces the SDK to fall back to BASE_URL (verified in
+# canary: tool-use flow completes cleanly, tool_use → tool_result exchange
+# observed end-to-end).
 HOST_ALLOWLIST = frozenset({
-    # LLM providers used by claude-pilot / claude-agent-sdk.
-    "api.anthropic.com",
+    # LLM providers other than Anthropic (Anthropic is REVERSE-PROXIED, not tunneled).
     "api.openai.com",
     "api.z.ai",
     "openrouter.ai",
