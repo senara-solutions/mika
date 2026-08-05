@@ -58,12 +58,14 @@ Failure modes:
 
 import argparse
 import asyncio
+import json
 import os
 import re
 import socket
 import ssl
 import stat
 import sys
+import time
 from pathlib import Path
 
 # Sole security boundary — every entry is a decision.
@@ -95,8 +97,19 @@ BUFFER_SIZE = 65536
 CONNECT_RE = re.compile(rb"^CONNECT ([^:\s]+):(\d+) HTTP/1\.[01]\r\n", re.ASCII)
 
 # Q3 auth-injection reverse-proxy — path prefix stripped, forwarded to
-# api.anthropic.com over TLS with `Authorization: Bearer <scoped-key>`
-# injected host-side. See ANTHROPIC_PROXY_PATH_PREFIX + read_scoped_key.
+# api.anthropic.com over TLS with `Authorization: Bearer <subscription-access-token>`
+# injected host-side. Voie A (2026-08-05, Vincent-ratified): token source is
+# ~/.claude/.credentials.json (the subscription OAuth cred, refreshed by the
+# local Claude Code CLI). The proxy is read-only on that file — refresh is
+# delegated to the host CLI (natural during Vincent's use + cron keep-warm
+# for headless nights). Voie B (proxy owns refresh) is a follow-up.
+#
+# Vincent's decision (2026-08-05): pilot MUST auth via the paid subscription,
+# not a metered API key — cost is flat-and-bounded vs API bill that grows
+# with the loop. The blast-radius trade (subscription OAuth = full identity
+# vs API key = billing-only) is knowingly accepted because containment is
+# for the *pilot* (untrusted code), not the *host* (trusted zone anyway);
+# the sandbox stays blind either way.
 ANTHROPIC_UPSTREAM_HOST = "api.anthropic.com"
 ANTHROPIC_UPSTREAM_PORT = 443
 ANTHROPIC_PROXY_PATH_PREFIX = "/anthropic-proxy"
@@ -107,46 +120,79 @@ ANTHROPIC_METHOD_RE = re.compile(
     re.ASCII,
 )
 
-# Scoped Anthropic API key — held host-side, re-read on ~/.mika/.env mtime
-# change so operator rotations pick up without proxy restart. The var name
-# `MIKA_PILOT_ANTHROPIC_KEY` is dedicated to the pilot subprocess; distinct
-# from `MIKA_ANTHROPIC_API_KEY` which holds the OAuth identity token (never
-# read here — see Q3 design note in dispatch-lib.sh).
-_SCOPED_KEY_VAR = "MIKA_PILOT_ANTHROPIC_KEY"
-_MIKA_ENV_PATH = Path.home() / ".mika" / ".env"
-_scoped_key_cache = {"mtime": None, "value": None}
+# Subscription OAuth token — held host-side (never crosses bwrap boundary),
+# read from ~/.claude/.credentials.json with mtime-caching so the CLI's
+# natural refresh writes are picked up on the next request without proxy
+# restart. The proxy NEVER writes this file (Voie A: read-only).
+_CREDS_PATH = Path.home() / ".claude" / ".credentials.json"
+_OAUTH_TOKEN_PREFIX = "sk-ant-oat"
+_token_cache = {"mtime": None, "value": None, "expires_at": None}
 
 
-def read_scoped_key() -> str | None:
-    """Return the scoped Anthropic key from ~/.mika/.env, cached by mtime.
+def _extract_oauth_token(obj) -> tuple[str | None, float | None]:
+    """Walk a JSON-decoded object looking for an OAuth access token +
+    optional expiry. Handles multiple credentials.json shapes:
 
-    Returns None if the file or key is absent — caller must handle the
-    no-key case (return 401 upstream-style, don't inject a bogus header).
+      * flat:   {"accessToken": "...", "expiresAt": 1234567890}
+      * nested: {"claudeAiOauth": {"accessToken": "...", "expiresAt": ...}}
+      * snake:  {"access_token": "...", "expires_at": ...}
+      * any other nested variant
+
+    The heuristic: first string value that starts with `sk-ant-oat` wins;
+    expiry is picked from any sibling `expiresAt`/`expires_at`/`exp` key.
+    Returns (token, expires_at_seconds) or (None, None).
+    """
+    def _walk(node, expiry_hint):
+        if isinstance(node, dict):
+            local_expiry = expiry_hint
+            for k, v in node.items():
+                if isinstance(v, (int, float)) and k in (
+                    "expiresAt", "expires_at", "exp"
+                ):
+                    # Some sources use ms epoch, some seconds. Detect and
+                    # normalize: values > 10^12 are ms since epoch.
+                    local_expiry = v / 1000 if v > 1e12 else float(v)
+            for k, v in node.items():
+                if isinstance(v, str) and v.startswith(_OAUTH_TOKEN_PREFIX):
+                    return v, local_expiry
+            for v in node.values():
+                found = _walk(v, local_expiry)
+                if found[0] is not None:
+                    return found
+        elif isinstance(node, list):
+            for item in node:
+                found = _walk(item, expiry_hint)
+                if found[0] is not None:
+                    return found
+        return None, None
+    return _walk(obj, None)
+
+
+def read_subscription_token() -> tuple[str | None, float | None]:
+    """Return (access_token, expires_at) from ~/.claude/.credentials.json,
+    cached by file mtime. Returns (None, None) if the file/token is absent.
+
+    The Claude Code CLI refreshes this file periodically (on user interaction
+    or before expiry). The proxy READS it on each Anthropic-bound request;
+    mtime-cache avoids re-parsing on every hit but picks up refreshes as
+    soon as the CLI writes them.
     """
     try:
-        st = _MIKA_ENV_PATH.stat()
+        st = _CREDS_PATH.stat()
     except OSError:
-        return None
-    if _scoped_key_cache["mtime"] == st.st_mtime:
-        return _scoped_key_cache["value"]
-    # Re-read + last-win parse (matches dotenvy semantics).
-    latest: str | None = None
+        return None, None
+    if _token_cache["mtime"] == st.st_mtime:
+        return _token_cache["value"], _token_cache["expires_at"]
     try:
-        with _MIKA_ENV_PATH.open("r", encoding="utf-8", errors="replace") as fh:
-            prefix = f"{_SCOPED_KEY_VAR}="
-            for line in fh:
-                if line.startswith(prefix):
-                    val = line[len(prefix):].rstrip("\r\n")
-                    # Strip surrounding quotes (single or double), best-effort.
-                    if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
-                        val = val[1:-1]
-                    if val:
-                        latest = val
-    except OSError:
-        return None
-    _scoped_key_cache["mtime"] = st.st_mtime
-    _scoped_key_cache["value"] = latest
-    return latest
+        with _CREDS_PATH.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    token, expires_at = _extract_oauth_token(data)
+    _token_cache["mtime"] = st.st_mtime
+    _token_cache["value"] = token
+    _token_cache["expires_at"] = expires_at
+    return token, expires_at
 
 
 async def pipe_bytes(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -174,18 +220,26 @@ async def handle_anthropic_reverse_proxy(
     method: bytes,
     path: bytes,
 ) -> None:
-    """Q3 host-side auth injection.
+    """Q3 host-side auth injection (Voie A — subscription OAuth).
 
     Sandbox client sends an HTTP request to <method> /anthropic-proxy/<rest>.
     We strip the prefix, rewrite Host and Authorization headers with the
-    scoped key from ~/.mika/.env (never crosses sandbox boundary), open TLS
-    to api.anthropic.com:443, forward request, and stream response back.
+    subscription OAuth access token from ~/.claude/.credentials.json
+    (host-side, never crosses sandbox boundary), open TLS to
+    api.anthropic.com:443, forward request, and stream response back.
+
+    Refresh: delegated to the local Claude Code CLI. When the CLI refreshes
+    its token, the file mtime changes and the proxy picks up the new value
+    on the next request. If expired without a refresh (marathon-nights with
+    no CLI activity), Anthropic responds 401 → pilot fails visibly → cron
+    keep-warm covers this case (see docs/solutions/).
     """
-    scoped_key = read_scoped_key()
-    if scoped_key is None:
+    token, expires_at = read_subscription_token()
+    if token is None:
         body = (
-            f"mika-pilot-egress: scoped key {_SCOPED_KEY_VAR} not set in "
-            f"{_MIKA_ENV_PATH} — operator must provision before dispatch\n"
+            f"mika-pilot-egress: subscription OAuth token not found in "
+            f"{_CREDS_PATH}. Vincent must be logged in to Claude Code on "
+            f"the host for the pilot to authenticate.\n"
         ).encode("utf-8")
         writer.write(
             b"HTTP/1.1 503 Service Unavailable\r\n"
@@ -195,9 +249,18 @@ async def handle_anthropic_reverse_proxy(
             b"\r\n" + body
         )
         await writer.drain()
-        print(f"[anthropic-proxy] DENY no-key path={path.decode('ascii', 'replace')}",
+        print(f"[anthropic-proxy] DENY no-token path={path.decode('ascii', 'replace')}",
               file=sys.stderr, flush=True)
         return
+    # Soft-warn if the token appears expired — Anthropic will 401 anyway,
+    # this makes debugging easier from the proxy log.
+    if expires_at is not None and expires_at < time.time():
+        print(
+            f"[anthropic-proxy] WARN token appears expired "
+            f"({int(time.time() - expires_at)}s ago) — Anthropic will 401. "
+            f"Refresh via a Claude Code CLI call on the host.",
+            file=sys.stderr, flush=True,
+        )
 
     # Split request into request-line + headers. body follows blank line.
     try:
@@ -236,7 +299,7 @@ async def handle_anthropic_reverse_proxy(
     new_request = (
         method + b" " + new_path + b" HTTP/1.1\r\n"
         + b"Host: " + ANTHROPIC_UPSTREAM_HOST.encode("ascii") + b"\r\n"
-        + b"Authorization: Bearer " + scoped_key.encode("ascii") + b"\r\n"
+        + b"Authorization: Bearer " + token.encode("ascii") + b"\r\n"
         + b"Connection: close\r\n"  # force one-shot, avoid keepalive complexity
         + b"\r\n".join(filtered_headers)
         + b"\r\n\r\n"
