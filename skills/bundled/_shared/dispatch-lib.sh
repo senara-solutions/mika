@@ -95,11 +95,19 @@ _PILOT_EGRESS_TCP_PORT="8891"
 _PILOT_EGRESS_PROXY_BIN="$HOME/.local/bin/mika-pilot-egress-proxy"
 
 # Helper daemon for anthropic api chain (2026-08-05).
+# Addon path = installed alongside the proxy binary in ~/.local/bin/ (see
+# Makefile install target); NOT a hardcoded repo path (would fail when
+# dispatch-lib is extracted from mika-spirit binary in a fresh checkout).
 _PILOT_HELPER_BIN="$HOME/.local/bin/mitmdump"
 _PILOT_HELPER_PORT="8892"
-_PILOT_HELPER_ADDON="/data/workspace/mika-platform/mika/scripts/mika-pilot-anthropic-auth-addon.py"
+_PILOT_HELPER_ADDON="$HOME/.local/bin/mika-pilot-anthropic-auth-addon.py"
 _PILOT_HELPER_CA="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
 _PILOT_HELPER_LOG="/var/log/mika/pilot-helper.log"
+# Bind target for the helper CA inside the sandbox. MUST be under /tmp
+# (which is tmpfs — writable, allows new mount points) rather than /etc
+# (already ro-bound before net_bwrap_args, so binds inside it fail with
+# EROFS). See coherence audit Bug B (2026-08-05).
+_PILOT_HELPER_CA_SANDBOX_PATH="/tmp/mika-pilot-ca/ca.pem"
 
 # Idempotent helper daemon launcher for the anthropic api chain
 # (2026-08-05, Vincent-authorized). Chained from the front egress proxy
@@ -260,8 +268,10 @@ _run_pilot_sandboxed() {
             --ro-bind "$_PILOT_EGRESS_PROXY_BIN" "$_PILOT_EGRESS_PROXY_BIN"
         )
         if [ -f "$_PILOT_HELPER_CA" ]; then
+            # Bind under /tmp (tmpfs) — /etc/ssl/certs is under an already
+            # ro-bound /etc so nested binds there fail EROFS (Bug B).
             net_bwrap_args+=(
-                --ro-bind "$_PILOT_HELPER_CA" "/etc/ssl/certs/mika-pilot-helper-ca.pem"
+                --ro-bind "$_PILOT_HELPER_CA" "$_PILOT_HELPER_CA_SANDBOX_PATH"
             )
         fi
         net_setenv_args=(
@@ -329,7 +339,7 @@ _run_pilot_sandboxed() {
             # would REPLACE (not extend) the system trust bundle, breaking
             # Python/curl verification of github.com etc. Bundled claude is
             # Node — NODE_EXTRA_CA_CERTS suffices for our api.anthropic.com path.
-            --setenv NODE_EXTRA_CA_CERTS "/etc/ssl/certs/mika-pilot-helper-ca.pem"
+            --setenv NODE_EXTRA_CA_CERTS "$_PILOT_HELPER_CA_SANDBOX_PATH"
         )
         # sh -c wrapper that starts the shim, waits for it, execs the pilot,
         # cleans up on exit. `exec` in the final position ensures the pilot's
