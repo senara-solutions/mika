@@ -1,6 +1,75 @@
 use std::collections::{HashMap, VecDeque};
 
+use regex::Regex;
+use tracing::warn;
+
 use super::index::SkillEntry;
+
+/// Return `true` if `c` is a "word" character for the purpose of deciding
+/// whether a word-boundary anchor (`\b`) makes sense next to a keyword edge.
+///
+/// This mirrors the ASCII notion of `\w = [A-Za-z0-9_]`. We only use it to
+/// decide *whether to emit* a `\b` next to a keyword's edge — the regex engine
+/// itself uses the Unicode-aware definition of `\b` (Rust `regex` crate
+/// default) when it evaluates the resulting pattern against the message,
+/// which is the safer choice against accented / non-ASCII neighbors.
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// Build a regex fragment for a single keyword that enforces word boundaries
+/// only on edges where the keyword's edge character is itself a word char.
+///
+/// - `"gh"`           → `\bgh\b`             (both edges are word chars)
+/// - `"issue #"`      → `\bissue #`          (trailing `#` is non-word; no `\b`)
+/// - `"/mika-groom"`  → `/mika\-groom\b`     (leading `/` is non-word; no `\b`)
+/// - `"[GitHub]"`     → `\[GitHub\]`         (both edges non-word; no `\b`)
+///
+/// Only emitting `\b` at word-char edges avoids the classic `\b#\b` bug where
+/// a boundary can never satisfy (e.g. `issue #` followed by digits would not
+/// match with an unconditional trailing `\b`).
+fn keyword_to_pattern(kw: &str) -> String {
+    let escaped = regex::escape(kw);
+    let leading = kw.chars().next().map(is_word_char).unwrap_or(false);
+    let trailing = kw.chars().last().map(is_word_char).unwrap_or(false);
+    match (leading, trailing) {
+        (true, true) => format!(r"\b{escaped}\b"),
+        (true, false) => format!(r"\b{escaped}"),
+        (false, true) => format!(r"{escaped}\b"),
+        (false, false) => escaped,
+    }
+}
+
+/// Build a single alternation regex over all keywords for a skill.
+///
+/// Returns `None` when the keyword list is empty or every keyword is empty
+/// after filtering. On regex compile failure (which should be unreachable
+/// once each keyword is `regex::escape`'d) we log a warning and return
+/// `None`, effectively skipping keyword matching for that skill on this
+/// call — safer than falling silently back to substring semantics.
+fn build_matcher_regex(skill_name: &str, keywords_lower: &[String]) -> Option<Regex> {
+    let alternation = keywords_lower
+        .iter()
+        .filter(|k| !k.is_empty())
+        .map(|k| keyword_to_pattern(k))
+        .collect::<Vec<_>>()
+        .join("|");
+    if alternation.is_empty() {
+        return None;
+    }
+    match Regex::new(&alternation) {
+        Ok(re) => Some(re),
+        Err(e) => {
+            warn!(
+                skill = %skill_name,
+                error = %e,
+                pattern = %alternation,
+                "keyword matcher regex failed to compile — skill will not fire on keyword this turn"
+            );
+            None
+        }
+    }
+}
 
 /// Why a skill was included in the matched set.
 ///
@@ -27,10 +96,21 @@ pub struct MatchedSkill<'a> {
 /// Match skills against a user message.
 ///
 /// Returns all enabled `always_on` skills plus any enabled skill where at least
-/// one keyword is a substring of the lowercased message. Then resolves the full
+/// one keyword matches the lowercased message on **word boundaries** (Rust
+/// `regex` crate `\b` — Unicode-aware by default). Then resolves the full
 /// transitive dependency tree via BFS: if a matched skill declares
 /// `dependencies = ["foo"]` and foo depends on `["bar"]`, all three are included
 /// (if enabled and present). Disabled mid-chain skills break their sub-tree.
+///
+/// **Word-boundary matching (mika#1878).** Historically the matcher used
+/// `message_lower.contains(kw)` — a bare `"gh"` keyword collided on
+/// `"thought"`/`"through"`, `"pr"` on `"approach"`/`"press"`. Every gated
+/// skill had to defend against that class per-skill (see
+/// `docs/architecture/skill-keyword-design-rules.md`). Word-boundary matching
+/// retires the class structurally: keywords with word-char edges get `\b`
+/// anchors; keywords with non-word edges (`"issue #"`, `"/mika-groom-ticket"`,
+/// `"[GitHub]"`) are anchored only on their word-char side, so punctuation-
+/// suffixed intent phrases still work.
 ///
 /// Each returned skill is annotated with a [`MatchReason`] indicating why it was
 /// included. If a skill is both `always_on` and has a keyword hit, the reason is
@@ -41,10 +121,9 @@ pub fn match_skills<'a>(skills: &'a [SkillEntry], user_message: &str) -> Vec<Mat
     // First pass: direct matches (always_on or keyword hit), tracking reason
     let mut matched_reasons: HashMap<usize, MatchReason> = HashMap::new();
     for (i, entry) in skills.iter().enumerate() {
-        let keyword_hit = entry
-            .keywords_lower
-            .iter()
-            .any(|kw| message_lower.contains(kw));
+        let keyword_hit = build_matcher_regex(&entry.manifest.skill.name, &entry.keywords_lower)
+            .map(|re| re.is_match(&message_lower))
+            .unwrap_or(false);
         if keyword_hit {
             // Keyword match takes precedence even if also always_on
             matched_reasons.insert(i, MatchReason::Keyword);
@@ -172,7 +251,11 @@ mod tests {
             make_entry("reminders", &["remind"], false),
             make_entry("other", &["unrelated"], false),
         ];
-        // "remind" is a substring of "remember" so both match
+        // Both `remember` and `remind` appear as whole tokens in the message
+        // (they are adjacent words separated by "to"), so both fire.
+        // Post-mika#1878: word-boundary matching means `remind` does NOT
+        // match on `remember` as a substring — it matches on the standalone
+        // `remind` token later in the sentence.
         let matched = match_skills(&skills, "remember to remind me");
         assert_eq!(matched.len(), 2);
     }
@@ -183,7 +266,13 @@ mod tests {
             make_entry("memory", &["remember"], true),
             make_entry("reminders", &["remind"], false),
         ];
-        let matched = match_skills(&skills, "set a reminder");
+        // Message uses `remind` as a standalone token so the word-boundary
+        // matcher (mika#1878) fires the reminders skill via keyword. `memory`
+        // fires via always_on. The pre-mika#1878 wording of this test used
+        // `"set a reminder"`, which relied on substring matching (`remind`
+        // inside `reminder`); that's the exact false-positive class the
+        // structural fix retires.
+        let matched = match_skills(&skills, "please remind me later");
         assert_eq!(matched.len(), 2);
     }
 
@@ -616,5 +705,250 @@ mod tests {
             );
             assert_eq!(matched[0].reason, MatchReason::Keyword);
         }
+    }
+
+    // --- Word-boundary matcher tests (mika#1878) ---
+
+    #[test]
+    fn test_word_boundary_bare_bigram_does_not_collide_on_prose() {
+        // Before mika#1878, bare `"gh"` as a keyword matched anywhere it
+        // appeared as a substring — including inside `"thought"`, `"through"`,
+        // `"eight"`, `"high"`, `"light"`, `"right"`. This is the load-bearing
+        // collision class the design-rule doc calls out and mika#1650 had to
+        // paper over per-skill by dropping the bare bigram entirely.
+        //
+        // With word-boundary matching, `\bgh\b` will never anchor inside any of
+        // those tokens — `g`/`h` are word chars adjacent to word chars on both
+        // sides, so no `\b` is satisfied.
+        let skills = vec![make_entry("gh-skill", &["gh"], false)];
+        for prose in &[
+            "I thought about it",
+            "we went through the plan",
+            "eight items remain",
+            "high priority stuff",
+            "let it shine a light on the bug",
+            "that's the right approach",
+            "although it may take time",
+            "neighbor concerns",
+        ] {
+            let matched = match_skills(&skills, prose);
+            assert!(
+                matched.is_empty(),
+                "bare `gh` keyword must NOT collide on incidental prose: {prose:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_word_boundary_bare_bigram_still_fires_on_standalone_token() {
+        // Corollary of the above: a bare `"gh"` MUST still fire when the user
+        // actually types `gh` as a standalone token (with normal English
+        // whitespace / punctuation neighbors). Word boundaries are anchored on
+        // both edges here because `g` and `h` are word chars — spaces,
+        // commas, question marks, and start/end of message all count as
+        // non-word neighbors and satisfy the anchor.
+        let skills = vec![make_entry("gh-skill", &["gh"], false)];
+        for msg in &[
+            "can you gh auth for me?",
+            "gh",
+            "please run gh",
+            "run gh, then check the output",
+            "run gh; then check",
+            "use 'gh' to view the PR",
+        ] {
+            let matched = match_skills(&skills, msg);
+            assert_eq!(
+                matched.len(),
+                1,
+                "bare `gh` keyword MUST fire on standalone token: {msg:?}"
+            );
+            assert_eq!(matched[0].reason, MatchReason::Keyword);
+        }
+    }
+
+    #[test]
+    fn test_word_boundary_bare_pr_does_not_collide_on_prose() {
+        // Same class as `gh`, exercised on the other founding-incident bigram:
+        // `"pr"` used to false-positive on `"approach"`, `"appropriate"`,
+        // `"press"`, `"process"`, `"problem"`, `"project"`, `"provide"`, etc.
+        let skills = vec![make_entry("pr-skill", &["pr"], false)];
+        for prose in &[
+            "this approach is too risky",
+            "the proposal was appropriate",
+            "press the button",
+            "the process is rough",
+            "there's a problem with the plan",
+            "this project is on track",
+            "please provide feedback",
+            "prevent the regression",
+            "properly configured",
+        ] {
+            let matched = match_skills(&skills, prose);
+            assert!(
+                matched.is_empty(),
+                "bare `pr` keyword must NOT collide on incidental prose: {prose:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_word_boundary_multiword_keyword_requires_adjacent_tokens() {
+        // A multi-word keyword `"view issue"` must match only when the tokens
+        // appear adjacent in the message (whitespace-separated). It must NOT
+        // fire when the same tokens appear scattered elsewhere.
+        let skills = vec![make_entry("gh-read", &["view issue"], false)];
+
+        // Positive: adjacent tokens, various neighbors.
+        for msg in &[
+            "view issue #123",
+            "please view issue 42",
+            "view issue, then close it",
+            "if you view issue 5 you'll see",
+        ] {
+            let matched = match_skills(&skills, msg);
+            assert_eq!(
+                matched.len(),
+                1,
+                "multi-word keyword MUST fire on adjacent tokens: {msg:?}"
+            );
+        }
+
+        // Negative: tokens present but not adjacent, or embedded in larger words.
+        for msg in &[
+            "the view is nice, and there's an issue",
+            "reviewing issues in the tracker",
+            "overview: no issue reported",
+            "preview the issue tomorrow",
+        ] {
+            let matched = match_skills(&skills, msg);
+            assert!(
+                matched.is_empty(),
+                "multi-word keyword must NOT fire on non-adjacent or embedded tokens: {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_word_boundary_punctuation_suffixed_keyword_still_fires() {
+        // Keywords like `"issue #"` and `"pr #"` end in a non-word character.
+        // The old substring matcher happily anchored them; the word-boundary
+        // matcher must still let them fire — the fix is to skip the trailing
+        // `\b` when the keyword's trailing char is non-word (`#`).
+        let skills = vec![make_entry("gh-read", &["issue #", "pr #"], false)];
+        for msg in &[
+            "close issue #123",
+            "reference issue #4 tomorrow",
+            "merge pr #1878",
+            "the pr #1899 landed",
+        ] {
+            let matched = match_skills(&skills, msg);
+            assert_eq!(
+                matched.len(),
+                1,
+                "punctuation-suffixed intent phrase MUST still fire: {msg:?}"
+            );
+        }
+        // Negative: the leading token must still be word-anchored so
+        // `"pr #"` doesn't collide inside `"appropriate #tag"`.
+        for prose in &["an appropriate #tag would help", "reissue #123 next week"] {
+            let matched = match_skills(&skills, prose);
+            assert!(
+                matched.is_empty(),
+                "punctuation-suffixed keyword must still respect leading boundary: {prose:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_word_boundary_slash_prefixed_keyword_still_fires() {
+        // Slash-command keywords like `"/mika-groom-ticket"` start with a
+        // non-word char. The matcher must not emit a leading `\b` (the
+        // regex-`\b` between two non-word chars — start of a word char
+        // sequence — is fine, but between two non-word chars is UB in intent).
+        // In practice: `\b/…` would demand the preceding char be a word char,
+        // which is the opposite of what we want. Skipping the leading `\b`
+        // gives the correct semantic: match `/mika-groom-ticket` anywhere
+        // provided its trailing edge respects the word boundary.
+        let skills = vec![make_entry("dev-groom", &["/mika-groom-ticket"], false)];
+        for msg in &[
+            "/mika-groom-ticket #123",
+            "please /mika-groom-ticket the plan",
+            "run /mika-groom-ticket",
+        ] {
+            let matched = match_skills(&skills, msg);
+            assert_eq!(
+                matched.len(),
+                1,
+                "slash-prefixed keyword MUST still fire: {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_word_boundary_hyphenated_keyword_matches_on_outer_edges() {
+        // `groom-ticket` has word chars on both outer edges; the internal `-`
+        // is non-word but that doesn't affect the outer anchors. `\b` on both
+        // edges rejects embedded matches inside larger identifier-shaped
+        // tokens like `mygroom-ticketxyz`.
+        let skills = vec![make_entry(
+            "mika-arch-groom-ticket",
+            &["groom-ticket"],
+            false,
+        )];
+
+        // Positive.
+        assert_eq!(
+            match_skills(&skills, "please review groom-ticket now").len(),
+            1
+        );
+        assert_eq!(match_skills(&skills, "groom-ticket").len(), 1);
+
+        // Negative: embedded inside larger identifier.
+        assert!(
+            match_skills(&skills, "mygroom-ticket run").is_empty(),
+            "hyphenated keyword must not match inside a larger identifier prefix"
+        );
+        assert!(
+            match_skills(&skills, "groom-ticketxyz").is_empty(),
+            "hyphenated keyword must not match inside a larger identifier suffix"
+        );
+    }
+
+    #[test]
+    fn test_word_boundary_case_insensitivity_preserved() {
+        // Boundary matching still runs against the lowercased message with
+        // lowercased keywords, so case-insensitivity from mika#0 is preserved.
+        let skills = vec![make_entry("memory", &["remember"], false)];
+        let matched = match_skills(&skills, "REMEMBER this");
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].reason, MatchReason::Keyword);
+
+        // And still respects the boundary — `REMEMBER` inside `REMEMBERED`
+        // is (correctly) NOT a match under boundary semantics.
+        // (See test_multiple_matches: `remind` in `remember` doesn't match.)
+        let matched = match_skills(&skills, "REMEMBERED it");
+        assert!(
+            matched.is_empty(),
+            "case-insensitivity must NOT bypass word-boundary anchoring"
+        );
+    }
+
+    #[test]
+    fn test_word_boundary_empty_keyword_string_is_skipped() {
+        // An empty string inside the keyword list must not create an
+        // alternation entry that matches every message. This is a
+        // defense-in-depth check against future manifest bugs.
+        let skills = vec![make_entry("s", &["", "gh"], false)];
+
+        // Empty keyword must not fire on unrelated prose.
+        assert!(
+            match_skills(&skills, "unrelated text").is_empty(),
+            "empty keyword must not match any message"
+        );
+
+        // Non-empty keyword still fires normally.
+        let matched = match_skills(&skills, "run gh please");
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].reason, MatchReason::Keyword);
     }
 }
