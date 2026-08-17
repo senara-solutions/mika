@@ -6,8 +6,16 @@ db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 
 [[advisories.ignore]]
-id = "RUSTSEC-2024-0436"
-reason = "paste is unmaintained but has no security impact; widely used transitive dependency with no drop-in replacement yet."
+id = "RUSTSEC-2026-0253"
+reason = "lru LruCache::pop panic-safety (unsound); transitive dep only, we do not pass panicking Drop keys to pop()."
+
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0221"
+reason = "event-listener !Send tags via StackSlot (unsound); transitive dep only, we do not share listeners across threads on custom !Send types."
+
+[[advisories.ignore]]
+id = "RUSTSEC-2026-0205"
+reason = "scc Array::insert exception safety (unsound); transitive dep only, we do not pass panicking compare fns."
 
 [licenses]
 allow = [
