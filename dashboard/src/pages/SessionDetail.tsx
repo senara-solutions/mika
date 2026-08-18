@@ -4,8 +4,8 @@ import { useSessionDetail, useSessionMessages, type Message } from '../api/sessi
 import { useTeamRun, useTeamWorkspace, type TeamWorkspaceEntry } from '../api/teams.ts'
 import { useSessionLlmCalls } from '../api/llmCalls.ts'
 import { useSessionToolCalls, useSessionSkills, useTraceToolCalls } from '../api/toolCalls.ts'
-import { CopyButton, Pagination, EmptyState, LoadingState, ErrorState, formatApiError, StatusBadge, formatTimestamp, getAgentColor } from '@senara-solutions/ui'
-import type { StatusBadgeVariant } from '@senara-solutions/ui'
+import { CopyButton, Pagination, EmptyState, LoadingState, ErrorState, formatApiError, StatusBadge, formatTimestamp, getAgentColor } from '@samidarko/ui'
+import type { StatusBadgeVariant } from '@samidarko/ui'
 import InvestigationPanel, {
   type InvestigationScope,
 } from '../components/InvestigationPanel.tsx'

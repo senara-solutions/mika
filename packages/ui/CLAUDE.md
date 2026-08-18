@@ -1,4 +1,4 @@
-# @senara-solutions/ui — Shared Component Library
+# @samidarko/ui — Shared Component Library
 
 Vite library mode, published to npmjs.org as a public package (`access: public`, token-free anonymous install — mika#1386). Peer deps: React 19, Tailwind CSS v4, lucide-react.
 
@@ -54,7 +54,7 @@ return <AgentFilter agents={agents} value={filters.agent_id ?? ''} onChange={(v)
 Every `useQuery` consumer renders three states before the happy path. The canonical ternary:
 
 ```tsx
-import { LoadingState, ErrorState, EmptyState, formatApiError } from '@senara-solutions/ui'
+import { LoadingState, ErrorState, EmptyState, formatApiError } from '@samidarko/ui'
 
 const { data, isLoading, error, refetch } = useMyQuery(filters)
 
@@ -76,7 +76,7 @@ Detail pages use `variant="detail"` for `<LoadingState />` and early returns ins
 `<TimeRangeFilter />` is URL-state friendly — read `from`/`to` from `searchParams`, pass back via `updateFilter`:
 
 ```tsx
-import { TimeRangeFilter } from '@senara-solutions/ui'
+import { TimeRangeFilter } from '@samidarko/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 
 const { searchParams, updateFilter } = useSearchParamsFilter()

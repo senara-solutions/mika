@@ -2,7 +2,7 @@ import { useState, Fragment } from 'react'
 import { Link } from 'react-router'
 import { useToolCalls, type ToolCallsFilters } from '../api/toolCalls.ts'
 import { useAgents } from '../api/agents.ts'
-import { CopyButton, Pagination, EmptyState, LoadingState, ErrorState, formatApiError, StatusBadge, ListRow, AgentFilter, SelectFilter, TimeRangeFilter, formatTimestamp } from '@senara-solutions/ui'
+import { CopyButton, Pagination, EmptyState, LoadingState, ErrorState, formatApiError, StatusBadge, ListRow, AgentFilter, SelectFilter, TimeRangeFilter, formatTimestamp } from '@samidarko/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { Search } from 'lucide-react'
 

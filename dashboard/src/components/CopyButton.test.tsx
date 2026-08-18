@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, act } from '@testing-library/react'
-import { CopyButton } from '@senara-solutions/ui'
+import { CopyButton } from '@samidarko/ui'
 
 describe('CopyButton', () => {
   beforeEach(() => {

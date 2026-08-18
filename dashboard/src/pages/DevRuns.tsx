@@ -1,6 +1,6 @@
 import { Link } from 'react-router'
 import { useDevRuns, type DevRunsFilters } from '../api/devRuns.ts'
-import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, TaskStatusBadge, ListRow, SelectFilter, TimeRangeFilter, formatRelativeTime } from '@senara-solutions/ui'
+import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, TaskStatusBadge, ListRow, SelectFilter, TimeRangeFilter, formatRelativeTime } from '@samidarko/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 
 const STATUS_OPTIONS = [

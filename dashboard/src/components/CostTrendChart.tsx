@@ -8,7 +8,7 @@ import {
   ResponsiveContainer,
   Legend,
 } from 'recharts'
-import { LoadingState, ErrorState, EmptyState, formatApiError } from '@senara-solutions/ui'
+import { LoadingState, ErrorState, EmptyState, formatApiError } from '@samidarko/ui'
 
 export interface CostTrendBucket {
   timestamp: string

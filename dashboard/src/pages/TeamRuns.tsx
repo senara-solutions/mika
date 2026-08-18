@@ -1,6 +1,6 @@
 import { Link } from 'react-router'
 import { useTeamRuns, type TeamRunsFilters } from '../api/teams.ts'
-import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, TaskStatusBadge, ListRow, SelectFilter, TimeRangeFilter, formatRelativeTime } from '@senara-solutions/ui'
+import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, TaskStatusBadge, ListRow, SelectFilter, TimeRangeFilter, formatRelativeTime } from '@samidarko/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 
 const STATUS_OPTIONS = [
