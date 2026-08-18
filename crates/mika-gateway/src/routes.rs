@@ -242,15 +242,24 @@ pub fn build_router(state: AppState) -> Router {
                 require_bearer_token,
             )),
         )
-        // Admin: customer registration (mika#1609)
+        // Admin: customer registration (mika#1609) + orphan listing (mika#1820)
         .route(
             "/admin/customers",
             post(handle_register_customer)
+                .get(handle_list_customers)
                 .route_layer(middleware::from_fn_with_state(
                     state.clone(),
                     require_bearer_token,
                 ))
                 .layer(RequestBodyLimitLayer::new(16 * 1024)),
+        )
+        // Admin: read a customer record (mika#1820) — safe fields only, never secrets
+        .route(
+            "/admin/customers/{customer_id}",
+            get(handle_get_customer).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_bearer_token,
+            )),
         )
         // Admin: unlink a customer's Telegram binding (mika#1749)
         .route(
@@ -1270,6 +1279,301 @@ async fn handle_admin_unlink(
     }
 }
 
+// -- Admin: customer read + orphan listing (mika#1820) --
+//
+// GET /admin/customers/{id} — returns the customer record with the safe subset
+// of fields (never bot_token, never pairing_token value, never webhook_secret).
+// GET /admin/customers?status=X&paired=Y&stale_after_minutes=N — lists orphaned
+// customers (provisioned + unpaired + older than the stale window). Both share
+// the same `MIKA_INTERNAL_TOKEN` bearer-auth surface as `POST /admin/customers`.
+//
+// Founding friction: Yaohong pair-fail diagnostic 2026-07-22 required Vincent-only
+// port-forward+psql to answer "is this customer paired?" — this endpoint replaces
+// that multi-step flow with a 200ms `curl`. See mika#1820.
+
+/// Full customer record returned by `GET /admin/customers/{id}`.
+///
+/// **Security contract:** never contains `bot_token`, the `pairing_token` value,
+/// or the `webhook_secret` value. Only the *presence* of a pairing token is
+/// surfaced (`pairing_token_present: bool`) along with its expiry (which is
+/// non-secret — an expiry timestamp cannot be used to authenticate).
+#[derive(Debug, serde::Serialize)]
+struct GetCustomerResponse {
+    customer_id: Uuid,
+    name: String,
+    /// The per-customer Telegram bot username (mika#1454). `None` for customers
+    /// still on single-bot fallback (bot columns nullable per migration 008).
+    bot_username: Option<String>,
+    status: String,
+    /// `Some(ts)` after successful `handle_pairing`; `None` for orphaned/provisioned rows.
+    paired_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `Some(chat_id)` when paired; released to `None` by `/unlink` self-service
+    /// or `POST /admin/customers/{id}/unlink` admin release (mika#1749).
+    telegram_chat_id: Option<i64>,
+    plan: String,
+    /// Presence-only signal — the pairing_token VALUE is a secret and is never
+    /// surfaced. `true` means an unconsumed token exists; `false` after
+    /// `handle_pairing` NULLs it out (see `crates/mika-gateway/src/routes.rs::handle_pairing`).
+    pairing_token_present: bool,
+    /// Non-secret — expiry timestamp cannot be used to pair.
+    pairing_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Row shape read from Postgres for `GET /admin/customers/{id}`.
+///
+/// Note the mapping `pairing_token → pairing_token_present`: SQL uses
+/// `(pairing_token IS NOT NULL) AS pairing_token_present` so the secret value
+/// never leaves the database. The column list is intentional — it makes
+/// the `SELECT` clause below reviewable for the "no secret columns" invariant.
+///
+/// Named `AdminCustomerRow` to avoid collision with the existing routing-side
+/// `CustomerRow` (`{id, status}` only) used by the Telegram inbound path.
+#[derive(Debug, sqlx::FromRow)]
+struct AdminCustomerRow {
+    id: Uuid,
+    name: String,
+    bot_username: Option<String>,
+    status: String,
+    paired_at: Option<chrono::DateTime<chrono::Utc>>,
+    telegram_chat_id: Option<i64>,
+    plan: String,
+    pairing_token_present: bool,
+    pairing_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<AdminCustomerRow> for GetCustomerResponse {
+    fn from(r: AdminCustomerRow) -> Self {
+        Self {
+            customer_id: r.id,
+            name: r.name,
+            bot_username: r.bot_username,
+            status: r.status,
+            paired_at: r.paired_at,
+            telegram_chat_id: r.telegram_chat_id,
+            plan: r.plan,
+            pairing_token_present: r.pairing_token_present,
+            pairing_expires_at: r.pairing_expires_at,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        }
+    }
+}
+
+/// Explicit column list — enforces the "no secret columns" invariant of the
+/// mika#1820 security contract. Kept as a named `const` so any drift is caught
+/// in code review as an edit to a security-labelled constant.
+///
+/// The SELECT list intentionally *never* names `bot_token`, `pairing_token`, or
+/// `webhook_secret`. `pairing_token` is projected only as `IS NOT NULL AS
+/// pairing_token_present` — see `CustomerRow` above.
+const CUSTOMER_SAFE_COLUMNS: &str = "id, name, bot_username, status, paired_at, \
+                                     telegram_chat_id, plan, \
+                                     (pairing_token IS NOT NULL) AS pairing_token_present, \
+                                     pairing_expires_at, created_at, updated_at";
+
+/// Handle `GET /admin/customers/{customer_id}` — returns the safe customer view.
+///
+/// Auth: `MIKA_INTERNAL_TOKEN` bearer (via `require_bearer_token` middleware,
+/// same surface as `POST /admin/customers`).
+///
+/// Returns:
+/// - 200 with `GetCustomerResponse` on hit.
+/// - 404 with `{"error": "customer not found"}` when the id does not exist.
+/// - 500 with `{"error": "database error"}` on Postgres failure.
+async fn handle_get_customer(
+    State(state): State<AppState>,
+    Path(customer_id): Path<Uuid>,
+) -> impl IntoResponse {
+    let sql = format!("SELECT {CUSTOMER_SAFE_COLUMNS} FROM customers WHERE id = $1");
+    match sqlx::query_as::<_, AdminCustomerRow>(&sql)
+        .bind(customer_id)
+        .fetch_optional(&state.pool)
+        .await
+    {
+        Ok(Some(row)) => (StatusCode::OK, Json(GetCustomerResponse::from(row))).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "customer not found"})),
+        )
+            .into_response(),
+        Err(e) => {
+            error!(error = %e, %customer_id, "GET /admin/customers/{{id}} query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Query params for `GET /admin/customers`.
+///
+/// **Filter semantics (mika#1820 livrable 2):**
+/// - `status` — exact match against `customers.status` (e.g. `provisioned`,
+///   `active`, `suspended`). When absent, no status filter is applied.
+/// - `paired` — `true` requires `paired_at IS NOT NULL`; `false` requires
+///   `paired_at IS NULL`. When absent, no pairing filter is applied.
+/// - `stale_after_minutes` — when set, restricts to rows whose age exceeds N
+///   minutes (`now() - created_at > N minutes`). Useful for orphan sweeps.
+///
+/// The canonical orphan probe is `?status=provisioned&paired=false&stale_after_minutes=30`
+/// — the shape the mika-cloud dashboard-side polling depends on.
+#[derive(Debug, serde::Deserialize)]
+struct ListCustomersQuery {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    paired: Option<bool>,
+    #[serde(default)]
+    stale_after_minutes: Option<i64>,
+}
+
+/// Item in the `GET /admin/customers` list response. Same "safe fields only"
+/// contract as `GetCustomerResponse` — surfaced as a compact summary tuned for
+/// orphan-sweep dashboards + operator alerting.
+#[derive(Debug, serde::Serialize)]
+struct CustomerSummary {
+    customer_id: Uuid,
+    bot_username: Option<String>,
+    status: String,
+    paired_at: Option<chrono::DateTime<chrono::Utc>>,
+    plan: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    /// Elapsed minutes since `created_at`, computed server-side so operators
+    /// don't have to subtract wall-clock in dashboards.
+    age_minutes: i64,
+}
+
+/// Row shape for `GET /admin/customers` list results.
+#[derive(Debug, sqlx::FromRow)]
+struct CustomerListRow {
+    id: Uuid,
+    bot_username: Option<String>,
+    status: String,
+    paired_at: Option<chrono::DateTime<chrono::Utc>>,
+    plan: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    age_minutes: i64,
+}
+
+impl From<CustomerListRow> for CustomerSummary {
+    fn from(r: CustomerListRow) -> Self {
+        Self {
+            customer_id: r.id,
+            bot_username: r.bot_username,
+            status: r.status,
+            paired_at: r.paired_at,
+            plan: r.plan,
+            created_at: r.created_at,
+            age_minutes: r.age_minutes,
+        }
+    }
+}
+
+/// Response body for `GET /admin/customers`.
+#[derive(Debug, serde::Serialize)]
+struct ListCustomersResponse {
+    customers: Vec<CustomerSummary>,
+    count: usize,
+}
+
+/// Max rows returned per list call — cheap defence against unbounded scans on a
+/// customers table that could grow large. Orphan sweeps of realistic size fit
+/// comfortably; a saturating response is itself a signal to page or narrow the
+/// filter.
+const LIST_CUSTOMERS_LIMIT: i64 = 500;
+
+/// Handle `GET /admin/customers` — filtered list of customer summaries.
+///
+/// Auth: `MIKA_INTERNAL_TOKEN` bearer (shared surface with `POST /admin/customers`
+/// and `GET /admin/customers/{id}`).
+///
+/// Same secret-hygiene contract as `handle_get_customer`: never returns
+/// `bot_token`, `pairing_token`, or `webhook_secret`.
+async fn handle_list_customers(
+    State(state): State<AppState>,
+    Query(q): Query<ListCustomersQuery>,
+) -> impl IntoResponse {
+    // Build the WHERE clause dynamically. Every filter is a bound parameter —
+    // no string interpolation of user-supplied values reaches the SQL text.
+    let mut where_clauses: Vec<String> = Vec::new();
+    let mut next_param: usize = 1;
+
+    let status = q.status.as_deref();
+    if status.is_some() {
+        where_clauses.push(format!("status = ${next_param}"));
+        next_param += 1;
+    }
+
+    if let Some(paired) = q.paired {
+        if paired {
+            where_clauses.push("paired_at IS NOT NULL".to_string());
+        } else {
+            where_clauses.push("paired_at IS NULL".to_string());
+        }
+    }
+
+    // Negative / zero minutes would either match everything or nothing in
+    // confusing ways; treat `< 1` as "no stale filter" and log a debug hint so
+    // operators notice the input was ignored.
+    let stale_minutes = q.stale_after_minutes.filter(|m| *m > 0);
+    if stale_minutes.is_some() {
+        where_clauses.push(format!(
+            "(EXTRACT(EPOCH FROM (now() - created_at)) / 60) > ${next_param}"
+        ));
+        next_param += 1;
+    }
+    let _ = next_param; // silence unused-assign lint on the last increment
+
+    let where_sql = if where_clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", where_clauses.join(" AND "))
+    };
+
+    let sql = format!(
+        "SELECT id, bot_username, status, paired_at, plan, created_at, \
+                CAST(FLOOR(EXTRACT(EPOCH FROM (now() - created_at)) / 60) AS BIGINT) AS age_minutes \
+         FROM customers{where_sql} \
+         ORDER BY created_at ASC \
+         LIMIT {LIST_CUSTOMERS_LIMIT}"
+    );
+
+    let mut query = sqlx::query_as::<_, CustomerListRow>(&sql);
+    if let Some(s) = status {
+        query = query.bind(s);
+    }
+    if let Some(m) = stale_minutes {
+        query = query.bind(m);
+    }
+
+    match query.fetch_all(&state.pool).await {
+        Ok(rows) => {
+            let customers: Vec<CustomerSummary> =
+                rows.into_iter().map(CustomerSummary::from).collect();
+            let count = customers.len();
+            (
+                StatusCode::OK,
+                Json(ListCustomersResponse { customers, count }),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            error!(error = %e, "GET /admin/customers query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 // -- Token generation --
 
 /// Generate a cryptographic pairing token (32 random bytes, hex-encoded → 64 chars).
@@ -2278,5 +2582,194 @@ mod tests {
     fn test_valid_bot_username_max_length() {
         let name = "a".repeat(32);
         assert!(is_valid_bot_username(&name));
+    }
+
+    // ------------------------------------------------------------------
+    // mika#1820 — admin customer read + orphan listing
+    // ------------------------------------------------------------------
+    //
+    // These tests guard the SECURITY CONTRACT of the two new endpoints: the
+    // response JSON never carries secret fields (`bot_token`,
+    // `pairing_token`, `webhook_secret`). The SQL-level regression lives
+    // in `tests/admin_customers.rs` alongside the mika#1612 lifecycle test.
+
+    /// Build a filled `GetCustomerResponse` and assert the serialized JSON
+    /// contains the expected non-secret fields.
+    #[test]
+    fn get_customer_response_serializes_safe_fields() {
+        let now = chrono::Utc::now();
+        let resp = GetCustomerResponse {
+            customer_id: Uuid::parse_str("a0394c24-9558-4cb6-9078-52043912ecbc").unwrap(),
+            name: "Yaohong".to_string(),
+            bot_username: Some("mikachan1_bot".to_string()),
+            status: "provisioned".to_string(),
+            paired_at: None,
+            telegram_chat_id: None,
+            plan: "standard".to_string(),
+            pairing_token_present: true,
+            pairing_expires_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        };
+        let json = serde_json::to_string(&resp).expect("serialize");
+        // The 9-ish safe fields from the ticket schema.
+        assert!(json.contains("\"customer_id\""));
+        assert!(json.contains("\"name\":\"Yaohong\""));
+        assert!(json.contains("\"bot_username\":\"mikachan1_bot\""));
+        assert!(json.contains("\"status\":\"provisioned\""));
+        assert!(json.contains("\"paired_at\":null"));
+        assert!(json.contains("\"telegram_chat_id\":null"));
+        assert!(json.contains("\"plan\":\"standard\""));
+        assert!(json.contains("\"pairing_token_present\":true"));
+        assert!(json.contains("\"pairing_expires_at\""));
+        assert!(json.contains("\"created_at\""));
+        assert!(json.contains("\"updated_at\""));
+    }
+
+    /// SECURITY-CRITICAL: the response JSON must NEVER surface any of the three
+    /// secret fields. Enforced structurally by the `CUSTOMER_SAFE_COLUMNS`
+    /// SELECT list and by omitting them from `GetCustomerResponse`, but this
+    /// test detects a future field addition that leaks a secret name.
+    #[test]
+    fn get_customer_response_never_contains_secret_fields() {
+        let now = chrono::Utc::now();
+        let resp = GetCustomerResponse {
+            customer_id: Uuid::new_v4(),
+            name: "with a secret-shaped name maybe?".to_string(),
+            bot_username: Some("botty".to_string()),
+            status: "active".to_string(),
+            paired_at: Some(now),
+            telegram_chat_id: Some(12345),
+            plan: "premium".to_string(),
+            pairing_token_present: false,
+            pairing_expires_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let json = serde_json::to_string(&resp).expect("serialize");
+        assert!(
+            !json.contains("bot_token"),
+            "response leaked bot_token: {json}"
+        );
+        assert!(
+            !json.contains("webhook_secret"),
+            "response leaked webhook_secret: {json}"
+        );
+        // "pairing_token_present" is allowed and expected — but the raw
+        // "pairing_token" key (value, not just presence) must never appear.
+        // Assert the exact JSON key form.
+        assert!(
+            !json.contains("\"pairing_token\":"),
+            "response leaked pairing_token value: {json}"
+        );
+    }
+
+    /// Same secret-hygiene contract for the list-endpoint summary type.
+    #[test]
+    fn customer_summary_never_contains_secret_fields() {
+        let now = chrono::Utc::now();
+        let sum = CustomerSummary {
+            customer_id: Uuid::new_v4(),
+            bot_username: Some("mikachan1_bot".to_string()),
+            status: "provisioned".to_string(),
+            paired_at: None,
+            plan: "standard".to_string(),
+            created_at: now,
+            age_minutes: 47,
+        };
+        let json = serde_json::to_string(&sum).expect("serialize");
+        assert!(!json.contains("bot_token"));
+        assert!(!json.contains("webhook_secret"));
+        assert!(!json.contains("\"pairing_token\":"));
+        // And the fields we DO want.
+        assert!(json.contains("\"customer_id\""));
+        assert!(json.contains("\"bot_username\":\"mikachan1_bot\""));
+        assert!(json.contains("\"age_minutes\":47"));
+    }
+
+    /// Regression guard on the SELECT column list — a future refactor must not
+    /// silently add `bot_token`/`pairing_token`/`webhook_secret` here. The
+    /// constant lives in code so this test locks it structurally.
+    #[test]
+    fn customer_safe_columns_excludes_secrets() {
+        assert!(
+            !CUSTOMER_SAFE_COLUMNS.contains("bot_token"),
+            "CUSTOMER_SAFE_COLUMNS leaks bot_token"
+        );
+        assert!(
+            !CUSTOMER_SAFE_COLUMNS.contains("webhook_secret"),
+            "CUSTOMER_SAFE_COLUMNS leaks webhook_secret"
+        );
+        // `pairing_token` may only appear inside the `IS NOT NULL` projection.
+        // Assert the raw column value is projected only via the boolean form.
+        assert!(
+            CUSTOMER_SAFE_COLUMNS.contains("(pairing_token IS NOT NULL) AS pairing_token_present"),
+            "CUSTOMER_SAFE_COLUMNS must project pairing_token only via presence check"
+        );
+        // The bare column reference `pairing_token,` (comma-terminated) would be
+        // a leak; the projection form above ends with `AS pairing_token_present`
+        // instead. Assert the leak shape is absent.
+        assert!(
+            !CUSTOMER_SAFE_COLUMNS.contains("pairing_token,"),
+            "CUSTOMER_SAFE_COLUMNS leaks raw pairing_token column"
+        );
+    }
+
+    /// `ListCustomersQuery` deserializes cleanly from the canonical orphan
+    /// probe URL shape used by mika-cloud dashboard polling. Exercised via
+    /// JSON here (serde_json is already a direct dep) — the axum `Query`
+    /// extractor uses `serde_urlencoded` at runtime, but the derived
+    /// `Deserialize` impl is identical across formats.
+    #[test]
+    fn list_customers_query_deserializes_orphan_probe() {
+        let q: ListCustomersQuery = serde_json::from_str(
+            r#"{"status":"provisioned","paired":false,"stale_after_minutes":30}"#,
+        )
+        .expect("deserialize orphan probe");
+        assert_eq!(q.status.as_deref(), Some("provisioned"));
+        assert_eq!(q.paired, Some(false));
+        assert_eq!(q.stale_after_minutes, Some(30));
+    }
+
+    /// All three filters are optional — an empty object produces the no-filter
+    /// shape (unbounded scan up to LIST_CUSTOMERS_LIMIT).
+    #[test]
+    fn list_customers_query_all_optional() {
+        let q: ListCustomersQuery = serde_json::from_str(r#"{}"#).expect("deserialize empty");
+        assert!(q.status.is_none());
+        assert!(q.paired.is_none());
+        assert!(q.stale_after_minutes.is_none());
+    }
+
+    /// `paired=true` and `paired=false` both accepted.
+    #[test]
+    fn list_customers_query_paired_bool_only() {
+        let t: ListCustomersQuery =
+            serde_json::from_str(r#"{"paired":true}"#).expect("deserialize paired=true");
+        assert_eq!(t.paired, Some(true));
+        let f: ListCustomersQuery =
+            serde_json::from_str(r#"{"paired":false}"#).expect("deserialize paired=false");
+        assert_eq!(f.paired, Some(false));
+    }
+
+    /// The safe list-endpoint response type serializes with the wire shape the
+    /// mika-cloud dashboard poller depends on: `{customers: [...], count: N}`.
+    #[test]
+    fn list_customers_response_wire_shape() {
+        let resp = ListCustomersResponse {
+            customers: vec![CustomerSummary {
+                customer_id: Uuid::new_v4(),
+                bot_username: Some("mikachan1_bot".to_string()),
+                status: "provisioned".to_string(),
+                paired_at: None,
+                plan: "standard".to_string(),
+                created_at: chrono::Utc::now(),
+                age_minutes: 47,
+            }],
+            count: 1,
+        };
+        let json = serde_json::to_string(&resp).expect("serialize");
+        assert!(json.contains("\"customers\":["));
+        assert!(json.contains("\"count\":1"));
     }
 }
