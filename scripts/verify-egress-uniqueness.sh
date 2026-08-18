@@ -50,10 +50,13 @@ AUTHORIZED_PATHS=(
     "crates/mika-gateway/src/egress_search/"
     "crates/mika-gateway/docs/egress-search.md"
     "crates/mika-gateway/docs/egress-search-threat-model.md"
+    "crates/mika-gateway/docs/egress-search-no-log-audit.md"
     "crates/mika-gateway/tests/egress_search"
     "docs/plans/2026-08-18-1807-e1-egress-substrate-plan.md"
     "scripts/verify-egress-uniqueness.sh"
     "scripts/verify-egress-request-shape.sh"
+    "scripts/verify-egress-no-log.sh"
+    "scripts/audit-egress-no-log.sh"
 )
 
 # Legacy allowlist — code paths that ship this identifier pre-E1 and are
