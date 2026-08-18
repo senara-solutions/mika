@@ -554,6 +554,7 @@ mod tests {
             delivery_slots: Arc::new(Semaphore::new(
                 crate::circuit_breaker::MAX_INFLIGHT_DELIVERIES,
             )),
+            search_egress_client: None,
         }
     }
 

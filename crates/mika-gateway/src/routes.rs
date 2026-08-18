@@ -21,6 +21,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::a2a_routes;
+use crate::egress_search;
 use crate::github;
 use crate::orchestrator_inbox;
 use crate::telegram::{
@@ -142,6 +143,13 @@ pub struct AppState {
     /// delivery tasks at `MAX_INFLIGHT_DELIVERIES`; overflow sheds durably to the
     /// DLQ (drop-oldest via Postgres) rather than accumulating unbounded tasks.
     pub delivery_slots: Arc<tokio::sync::Semaphore>,
+
+    /// E1 egress-search substrate (mika#1807). `Some` when a search upstream
+    /// is configured (`MIKA_SEARCH_UPSTREAM=brave`), `None` otherwise —
+    /// `POST /internal/search` returns 404 when absent. Shared across every
+    /// tenant per Q3 partagé no-log (see
+    /// `crates/mika-gateway/src/egress_search.rs`).
+    pub(crate) search_egress_client: Option<egress_search::SharedSearchEgressClient>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -241,6 +249,19 @@ pub fn build_router(state: AppState) -> Router {
                 state.clone(),
                 require_bearer_token,
             )),
+        )
+        // Egress-search substrate (mika#1807) — single controlled search
+        // egress module. Bearer-token auth (same as /send). Body limit
+        // matches the tightest existing internal endpoint at 16 KB — a
+        // search request is a short query, not a payload.
+        .route(
+            "/internal/search",
+            post(egress_search::handle_internal_search)
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    require_bearer_token,
+                ))
+                .layer(RequestBodyLimitLayer::new(16 * 1024)),
         )
         // Admin: customer registration (mika#1609) + orphan listing (mika#1820)
         .route(
