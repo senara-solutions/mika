@@ -358,6 +358,12 @@ pub(crate) type SharedSearchEgressClient = Arc<SearchEgressClient>;
 
 // -- Tests --
 
+// E4 adversarial no-log test (mika#1810) — inline sibling of the `tests`
+// module below. Kept in its own file so the format-stream harness stays
+// separable from the field-visitor harness.
+#[cfg(test)]
+mod tests_e4_no_log;
+
 #[cfg(test)]
 mod tests {
     use super::*;

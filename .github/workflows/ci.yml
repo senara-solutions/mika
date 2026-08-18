@@ -177,6 +177,14 @@ jobs:
       - name: Enforce E3 dé-liage identité↔requête (mika#1809)
         run: bash scripts/verify-egress-request-shape.sh
 
+  egress-no-log-lint:
+    name: Egress No-Log Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - name: Enforce no-log discipline on egress substrate (mika#1810 E4)
+        run: bash scripts/verify-egress-no-log.sh
+
   pipeline-artifacts:
     name: Pipeline Artifacts
     runs-on: ubuntu-22.04
