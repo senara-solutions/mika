@@ -23,6 +23,7 @@ pub mod variants;
 pub(crate) mod verdict;
 pub mod verdict_handler;
 pub mod webhook_queue;
+pub mod webhook_queue_v2;
 
 use crate::kg::config::KgAgentConfig;
 use anyhow::{Context as _, Result, anyhow};
@@ -550,6 +551,12 @@ async fn init_agent(
         }
     };
 
+    // Bounded webhook queue (mika#1870), sized from effective per-agent config.
+    let webhook_queue_v2 = Arc::new(webhook_queue_v2::WebhookQueue::new(
+        agent_settings.effective_webhook_queue_max_depth(),
+        std::time::Duration::from_millis(agent_settings.effective_webhook_queue_block_timeout_ms()),
+    ));
+
     let agent_state = AgentState {
         db: async_db,
         skills: std::sync::Mutex::new(skill_registry),
@@ -564,6 +571,7 @@ async fn init_agent(
         llm: agent_llm,
         github_app,
         webhook_queue: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        webhook_queue_v2,
         kg_config,
         canonical_session_id,
     };
@@ -1324,6 +1332,10 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         }
     }
 
+    // Parent cancellation token for the per-agent webhook drain workers
+    // (mika#1870). Sibling to `kg_shutdown_token`; cancelled at shutdown below.
+    let webhook_queue_shutdown = CancellationToken::new();
+
     let state = AppState {
         agents: Arc::new(agents),
         default_agent,
@@ -1349,6 +1361,8 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         a2a_broadcasters: Arc::new(dashmap::DashMap::new()),
         pr_reviews_posted,
         rate_limit_audit_last: Arc::new(dashmap::DashMap::new()),
+        webhook_queue_audit_last: Arc::new(dashmap::DashMap::new()),
+        webhook_queue_shutdown: webhook_queue_shutdown.clone(),
         permissions_channel: Arc::new(permissions_stream::PermissionsChannel::new()),
         task_events_channel: Arc::new(tasks_stream::TaskEventsChannel::new()),
     };
@@ -1534,6 +1548,16 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         );
         tick_handles.push(watchdog_handle);
 
+        // Spawn the per-agent webhook drain worker (mika#1870 AC4). Sole consumer
+        // of the agent's bounded queue. Cancelled via the shared parent token at
+        // shutdown; also abort-tracked in tick_handles as belt-and-suspenders.
+        let drain_handle = handlers::spawn_webhook_drain_worker(
+            state.clone(),
+            agent_state.clone(),
+            webhook_queue_shutdown.child_token(),
+        );
+        tick_handles.push(drain_handle);
+
         // Background cleanup runs concurrently — fire and forget
         tokio::spawn(startup_cleanup(db, agent_state.embedding_client.clone()));
     }
@@ -1560,6 +1584,9 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
             // this between iterations and between per-entity LLM calls,
             // so worst-case latency is one LLM call (~1-2s).
             kg_shutdown_token.cancel();
+            // Cancel the webhook drain workers cooperatively (mika#1870); their
+            // select! loops break on the next poll.
+            webhook_queue_shutdown.cancel();
             for handle in &tick_handles {
                 handle.abort();
             }
@@ -1628,6 +1655,14 @@ mod tests {
     }
 
     fn test_state() -> AppState {
+        test_state_with_settings(test_settings())
+    }
+
+    /// Build a test `AppState` whose single "mika" agent carries the given
+    /// per-agent `Settings`. Lets tests flip the mika#1870 webhook-queue
+    /// kill-switch (`webhook_queue_enabled = Some(false)`) to exercise the legacy
+    /// 429-reject path.
+    fn test_state_with_settings(agent_settings: Settings) -> AppState {
         let db = test_async_db();
         let dashboard_db = db.clone();
         let llm = mika_common::llm::dummy_provider();
@@ -1647,10 +1682,14 @@ mod tests {
             home_dir: std::path::PathBuf::from("/tmp/mika-test"),
             embedding_client: None,
             mcp_manager: None,
-            settings: test_settings(),
+            settings: agent_settings,
             llm: llm.clone(),
             github_app: None,
             webhook_queue: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            webhook_queue_v2: Arc::new(webhook_queue_v2::WebhookQueue::new(
+                64,
+                std::time::Duration::from_millis(100),
+            )),
             kg_config: crate::kg::config::KgAgentConfig::Disabled {
                 reason: crate::kg::config::DisabledReason::OperatorOptOut,
             },
@@ -1682,6 +1721,8 @@ mod tests {
             a2a_broadcasters: Arc::new(dashmap::DashMap::new()),
             pr_reviews_posted: Arc::new(dashmap::DashMap::new()),
             rate_limit_audit_last: Arc::new(dashmap::DashMap::new()),
+            webhook_queue_audit_last: Arc::new(dashmap::DashMap::new()),
+            webhook_queue_shutdown: CancellationToken::new(),
             permissions_channel: Arc::new(permissions_stream::PermissionsChannel::new()),
             task_events_channel: Arc::new(tasks_stream::TaskEventsChannel::new()),
         }
@@ -1886,7 +1927,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_message_returns_429_when_busy() {
-        let state = test_state();
+        // Kill-switch path (mika#1870 AC9): with the bounded queue disabled, a
+        // busy lock yields the legacy 429-reject with no enqueue.
+        let mut disabled = test_settings();
+        disabled.webhook_queue_enabled = Some(false);
+        let state = test_state_with_settings(disabled);
         state.ready.store(true, Ordering::Release);
 
         let agent_state = state.agents.get("mika").unwrap().value().clone();
@@ -1919,8 +1964,11 @@ mod tests {
     #[tokio::test]
     async fn test_rate_limit_trip_emits_audit_event() {
         // mika#1710 AC3: the busy-lock 429 path emits a `rate_limit_trip` audit
-        // event so the trip is visible to the orchestrator.
-        let state = test_state();
+        // event so the trip is visible to the orchestrator. Exercised with the
+        // bounded queue disabled (legacy path, mika#1870 AC9).
+        let mut disabled = test_settings();
+        disabled.webhook_queue_enabled = Some(false);
+        let state = test_state_with_settings(disabled);
         state.ready.store(true, Ordering::Release);
 
         let agent_state = state.agents.get("mika").unwrap().value().clone();
@@ -1962,7 +2010,10 @@ mod tests {
     async fn test_rate_limit_trip_audit_throttled() {
         // mika#1710 AC3 volume guard: N rapid 429s within the interval emit at most
         // one audit row per agent — the audit write must not itself become a flood.
-        let state = test_state();
+        // Exercised with the bounded queue disabled (legacy path, mika#1870 AC9).
+        let mut disabled = test_settings();
+        disabled.webhook_queue_enabled = Some(false);
+        let state = test_state_with_settings(disabled);
         state.ready.store(true, Ordering::Release);
 
         let agent_state = state.agents.get("mika").unwrap().value().clone();
@@ -1997,6 +2048,95 @@ mod tests {
         assert_eq!(
             trips, 1,
             "rapid 429s within the throttle interval must emit at most one audit row"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_message_enqueues_when_busy_instead_of_429() {
+        // mika#1870 AC3: with the bounded queue enabled (default), a busy agent
+        // no longer 429s — the request is accepted (202) and held in the queue for
+        // the drain worker. This is the core behavioral change from the legacy
+        // 429-reject path (asserted in test_message_returns_429_when_busy).
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+
+        let agent_state = state.agents.get("mika").unwrap().value().clone();
+        // Hold the lock so the legacy path *would* have 429'd.
+        let _guard = agent_state.agent_lock.clone().lock_owned().await;
+
+        assert_eq!(agent_state.webhook_queue_v2.depth().await, 0);
+
+        let app = test_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/message")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(
+                        r#"{"text":"hi","chat_id":123,"channel":"telegram","request_id":"q1"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Accepted, not 429 — and byte-identical accepted-case response.
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "accepted");
+
+        // The message was enqueued (no drain worker runs in this router-only test).
+        assert_eq!(
+            agent_state.webhook_queue_v2.depth().await,
+            1,
+            "busy-agent message must enqueue rather than 429"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_message_enqueue_emits_audit_event() {
+        // mika#1870 AC5: an enqueue writes a `webhook_queue_enqueued` audit event.
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let agent_state = state.agents.get("mika").unwrap().value().clone();
+        let db = agent_state.db.clone();
+        // Hold the lock so the item stays queued (no drain worker in this test).
+        let _guard = agent_state.agent_lock.clone().lock_owned().await;
+
+        let app = test_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/message")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(
+                        r#"{"text":"hello mika","chat_id":123,"channel":"telegram","request_id":"aq1"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let events = db.get_audit_events("system").await.unwrap();
+        let enqueued: Vec<_> = events
+            .iter()
+            .filter(|e| e.tool_name == "webhook_queue_enqueued")
+            .collect();
+        assert_eq!(enqueued.len(), 1, "exactly one webhook_queue_enqueued row");
+        assert_eq!(enqueued[0].target_key, "agent:mika");
+        assert!(
+            enqueued[0]
+                .after_value
+                .as_deref()
+                .unwrap_or("")
+                .contains("event_kind=other"),
+            "audit records the classified event kind"
         );
     }
 
