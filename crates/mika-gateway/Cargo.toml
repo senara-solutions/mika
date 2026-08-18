@@ -53,3 +53,6 @@ jsonwebtoken = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
+# egress_search #1807 log-assertion test needs `Registry` + `SubscriberExt`
+# to attach a capturing Layer. Workspace features already carry json+env-filter.
+tracing-subscriber = { workspace = true, features = ["registry"] }

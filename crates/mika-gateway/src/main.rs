@@ -2,6 +2,7 @@ mod a2a_auth;
 mod a2a_routes;
 pub(crate) mod circuit_breaker;
 pub(crate) mod dlq;
+pub(crate) mod egress_search;
 pub mod github;
 pub mod openapi;
 pub(crate) mod orchestrator_inbox;
@@ -19,6 +20,7 @@ use secrecy::ExposeSecret;
 use tokio::net::TcpListener;
 use tracing::info;
 
+use egress_search::{BraveConfig, SearchEgressClient, SearchUpstream};
 use routes::{AppState, build_router};
 use settings::GatewaySettings;
 use telegram::TelegramClient;
@@ -161,6 +163,34 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Build the E1 egress-search substrate client (mika#1807) — one shared
+    // instance across every tenant per Q3 partagé no-log. Absent config
+    // leaves the endpoint 404 by design. Settings validation has already
+    // hard-enforced that `search_upstream = "brave"` implies
+    // `brave_api_key` is Some.
+    let search_egress_client = match settings.search_upstream.as_deref().map(str::trim) {
+        Some(kind) if kind.eq_ignore_ascii_case("brave") => {
+            let api_key = settings
+                .brave_api_key
+                .clone()
+                .expect("validated in GatewaySettings::load");
+            let endpoint = settings
+                .brave_endpoint
+                .clone()
+                .unwrap_or_else(|| egress_search::DEFAULT_BRAVE_ENDPOINT.to_string());
+            info!("egress-search substrate configured (upstream=brave)");
+            Some(Arc::new(SearchEgressClient::new(SearchUpstream::Brave(
+                BraveConfig { api_key, endpoint },
+            ))))
+        }
+        Some("") => None,
+        None => {
+            info!("egress-search substrate disabled (MIKA_SEARCH_UPSTREAM not set)");
+            None
+        }
+        Some(_) => unreachable!("validated in GatewaySettings::load"),
+    };
+
     // Build app state
     let state = AppState {
         pool,
@@ -187,6 +217,7 @@ async fn main() -> Result<()> {
         delivery_slots: Arc::new(tokio::sync::Semaphore::new(
             circuit_breaker::MAX_INFLIGHT_DELIVERIES,
         )),
+        search_egress_client,
     };
 
     // Spawn DLQ background worker (retries pending deliveries every 30s)
