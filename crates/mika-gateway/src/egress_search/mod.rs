@@ -54,6 +54,9 @@ use crate::routes::AppState;
 
 pub(crate) mod brave;
 
+#[cfg(test)]
+mod tests_e3_request_shape;
+
 /// Default endpoint for Brave Search API. Overridable via
 /// `MIKA_BRAVE_ENDPOINT` for E2 integration tests / self-hosted mirrors.
 pub(crate) const DEFAULT_BRAVE_ENDPOINT: &str = "https://api.search.brave.com/res/v1/web/search";
