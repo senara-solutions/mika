@@ -1,8 +1,10 @@
 # Egress Search Substrate
 
-Module: [`crates/mika-gateway/src/egress_search.rs`](../src/egress_search.rs)
+Module: [`crates/mika-gateway/src/egress_search/`](../src/egress_search/) (split — `mod.rs` owns marker types + handler + Q4 test; [`brave.rs`](../src/egress_search/brave.rs) owns the concrete HTTP call for Brave)
 Owner: mika-gateway
-Ticket: [mika#1807](https://github.com/senara-solutions/mika/issues/1807) (E1 keystone of milestone [#1806](https://github.com/senara-solutions/mika/issues/1806))
+Tickets:
+- [mika#1807](https://github.com/senara-solutions/mika/issues/1807) — E1 keystone of milestone [#1806](https://github.com/senara-solutions/mika/issues/1806) (substrate, marker types, Q4 log-absence test)
+- [mika#1808](https://github.com/senara-solutions/mika/issues/1808) — E2 Brave client wired behind the substrate (this doc reflects post-E2 state)
 Plan: [`docs/plans/2026-08-18-1807-e1-egress-substrate-plan.md`](../../../docs/plans/2026-08-18-1807-e1-egress-substrate-plan.md)
 
 ---
@@ -33,11 +35,11 @@ Body: {"query": "…", "max_results": 5}
 
 | Status | Meaning                                                                            |
 | ------ | ---------------------------------------------------------------------------------- |
-| `200`  | `SearchResponse` — E2 onward.                                                      |
-| `401`  | Missing / wrong bearer token.                                                      |
+| `200`  | `SearchResponse` — results from the upstream. `upstream_latency_ms` is the wall-clock time observed at the substrate. |
+| `401`  | Missing / wrong bearer token (mika-spirit → gateway auth).                         |
 | `404`  | No upstream configured for this deploy (`MIKA_SEARCH_UPSTREAM` unset).              |
-| `501`  | E1 substrate live but E2 (#1808) has not yet wired the concrete upstream call.     |
-| `502`  | Upstream returned non-2xx / transport error (E2 onward).                           |
+| `501`  | Reserved for a future `SearchUpstream` variant with no concrete client wired.      |
+| `502`  | Upstream returned non-2xx (`error: "upstream_error"` / `"unauthorized"` / `"parse_error"`) or transport failed (`error: "transport_error"`). |
 
 Response bodies carry only a small JSON envelope:
 - Success (200): `{"results": [...], "upstream_latency_ms": <u32>}`
@@ -122,7 +124,7 @@ leave this module and nothing else:
 {"event": "search_egress", "upstream": "brave", "latency_ms": <u32>, "status": "<taxonomy>", "message": "search egress audit event"}
 ```
 
-Where `status ∈ {"ok", "not_implemented", "upstream_error", "transport_error"}`.
+Where `status ∈ {"ok", "not_implemented", "upstream_error", "unauthorized", "transport_error", "parse_error"}`. The `not_implemented` label is reserved for future upstream variants that don't yet have a concrete client wired — the Brave upstream never emits it post-E2.
 
 That's it. **No other fields.** A CapturingLayer test
 (`egress_search::tests::log_assertion_no_tenant_no_query_no_forbidden_fields`)
@@ -173,6 +175,51 @@ does not produce ex-post correlation. The audit event carries no data
 that could re-tie a request to a tenant.
 
 ---
+
+## Brave upstream — concrete wire format (E2, mika#1808)
+
+The Brave client lives in [`brave.rs`](../src/egress_search/brave.rs) and is
+the only concrete `SearchUpstream` variant with a wired network path today.
+It is invoked by `SearchEgressClient::search` when constructed with
+`SearchUpstream::Brave(BraveConfig { .. })`.
+
+**Endpoint:** `GET https://api.search.brave.com/res/v1/web/search` (overridable via `MIKA_BRAVE_ENDPOINT` for tests and self-hosted mirrors).
+
+**Request:**
+- Header `X-Subscription-Token: <MIKA_BRAVE_API_KEY>` (kept in `secrecy::SecretString` end-to-end; `.expose_secret()` is called only at the header write site).
+- Header `Accept: application/json`.
+- Query params `q=<caller query>` + `count=<max_results clamped to [1,20]>`. The clamp is a defense — a caller asking for 1000 results would burn quota and trip Brave's cap.
+
+**Response shape parsed** (`web.results[].{title, url, description}` → `SearchResult { title, url, snippet }`). Missing `web` block or empty `results` returns an empty `Vec` — this is a valid "no hits" outcome, not a `parse_error`.
+
+**Timeout budget:** the substrate holds an overall 5s wall-clock cap ([`EGRESS_HARD_TIMEOUT_SECS`](../src/egress_search/mod.rs)). The `reqwest::Client` per-request timeout is 3s; the retry window (below) is bounded so initial + retry + backoff cannot exceed the wall-clock cap.
+
+**Retry policy** (at most one retry — Brave freemium is ~2000 requests / month, so retries are expensive):
+
+| Upstream response       | Retry?                                                        | Terminal error taxonomy         |
+|-------------------------|---------------------------------------------------------------|---------------------------------|
+| 2xx                     | success                                                       | `ok`                            |
+| 401 / 403               | **NO** — fail fast so operator can rotate key without burning quota | `unauthorized`             |
+| 429                     | YES — honor `Retry-After` (numeric seconds only, capped at 2s); if persistent, terminal | `upstream_error` (with status 429) |
+| 5xx                     | YES — 500ms backoff                                           | `upstream_error`                |
+| Transport / timeout     | YES — 500ms backoff                                           | `transport_error`               |
+| Other 4xx (400/404/…)   | NO — malformed request unlikely to succeed on retry           | `upstream_error`                |
+| 2xx body that won't parse | NO — schema drift, not flakiness                            | `parse_error`                   |
+
+The retry wait is `min(nominal_wait, remaining_budget)` — a `Retry-After: 30s` at 4s into the budget returns 429 immediately rather than blocking the caller.
+
+**Rate limits & fallback:** Brave freemium quota is ~2000 requests / month. The substrate does NOT hold a per-tenant counter (Q3 partagé no-log), so quota exhaustion surfaces as `unauthorized` / `upstream_error(429)` — the operator dashboard tracks aggregate counts and rotates keys or upgrades tier. There is no fallback upstream in E2; the SearXNG contingency lives in [E6 (#1812)](https://github.com/senara-solutions/mika/issues/1812) and would be wired as a second `SearchUpstream` variant (same substrate, different client module).
+
+**Security discipline** (enforced structurally):
+- `BraveConfig.api_key` is `SecretString` — its `Debug` impl redacts, and it drop-zeroizes.
+- The Brave module emits **zero** `tracing` calls. All observability comes from the parent module's two-event audit (Q4 STRIP TOTAL).
+- The reqwest error types (whose `Debug` can include URL context, and hence query bytes) are **discarded** on the failure path — the substrate returns only the taxonomy label. See `send_once` and `parse_brave_body` for the explicit drops.
+- The `reqwest::Client` is a shared factory ([`build_client`](../src/egress_search/mod.rs)) — no other code path in the crate constructs a client pointed at a search upstream. Enforced by `scripts/verify-egress-uniqueness.sh`.
+
+**Test surface:**
+- Unit: URL construction (`count` clamp), `Retry-After` parsing, response schema tolerance for missing fields.
+- Wiremock integration (`brave.rs::wiremock_integration`): success + zero-hits + 401 fail-fast + 403 fail-fast + 429 retry-then-succeed + 429 persistent → terminal + 500 retry + 400 no-retry + parse-error + max-results clamp + success-path log-absence.
+- The Q4 log-absence discipline test lives in `mod.rs::tests::log_assertion_no_tenant_no_query_no_forbidden_fields` and exercises the transport-error path; the wiremock success-path variant complements it.
 
 ## Configuration
 
