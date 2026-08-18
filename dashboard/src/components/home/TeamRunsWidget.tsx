@@ -2,7 +2,7 @@ import { Link } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
 import { apiFetch, type PaginatedResponse } from '../../api/client.ts'
 import type { TeamRun } from '../../api/teams.ts'
-import { TaskStatusBadge, LoadingState, ErrorState, EmptyState, formatApiError } from '@senara-solutions/ui'
+import { TaskStatusBadge, LoadingState, ErrorState, EmptyState, formatApiError } from '@samidarko/ui'
 import WidgetSection from './WidgetSection.tsx'
 
 interface TeamRunsWidgetProps {

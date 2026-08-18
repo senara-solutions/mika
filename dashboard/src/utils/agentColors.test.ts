@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { getAgentColor } from '@senara-solutions/ui'
+import { getAgentColor } from '@samidarko/ui'
 
 describe('getAgentColor', () => {
   it('returns a color object with bg, text, and dot', () => {

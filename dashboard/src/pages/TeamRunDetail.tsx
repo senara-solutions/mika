@@ -10,7 +10,7 @@ import { useTraceLlmCalls, type LlmCallRow } from '../api/llmCalls.ts'
 import { useTraceToolCalls, type ToolCallRow } from '../api/toolCalls.ts'
 import { TERMINAL_STATUSES } from '../api/tasks.ts'
 import { useLiveRefresh } from '../hooks/useLiveRefresh.ts'
-import { TaskStatusBadge, CopyButton, EmptyState, LoadingState, ErrorState, formatApiError, MarkdownContent, formatRelativeTime, LiveRefreshToggle } from '@senara-solutions/ui'
+import { TaskStatusBadge, CopyButton, EmptyState, LoadingState, ErrorState, formatApiError, MarkdownContent, formatRelativeTime, LiveRefreshToggle } from '@samidarko/ui'
 import TraceIdWidget from '../components/TraceIdWidget.tsx'
 import { ChevronDown, ChevronRight, Clock, Cpu, Wrench, Users, DollarSign, MessageSquare } from 'lucide-react'
 

@@ -1,6 +1,6 @@
 import { Link, useParams } from 'react-router'
 import { useToolCall } from '../api/toolCalls.ts'
-import { CopyButton, StatusBadge, EmptyState, LoadingState, ErrorState, formatApiError, formatRelativeTime } from '@senara-solutions/ui'
+import { CopyButton, StatusBadge, EmptyState, LoadingState, ErrorState, formatApiError, formatRelativeTime } from '@samidarko/ui'
 import { MetadataRow } from '../components/MetadataRow.tsx'
 
 function formatLatency(ms: number): string {

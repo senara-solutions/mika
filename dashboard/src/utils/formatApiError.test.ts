@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { formatApiError } from '@senara-solutions/ui'
+import { formatApiError } from '@samidarko/ui'
 
 describe('formatApiError', () => {
   it('returns connectivity message for TypeError with "fetch"', () => {

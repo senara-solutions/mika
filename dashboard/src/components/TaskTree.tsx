@@ -1,7 +1,7 @@
 import { useState, useMemo, type ReactNode } from 'react'
 import { Link } from 'react-router'
 import { ChevronDown, ChevronRight } from 'lucide-react'
-import { TaskStatusBadge, formatRelativeTime } from '@senara-solutions/ui'
+import { TaskStatusBadge, formatRelativeTime } from '@samidarko/ui'
 import type { TaskItem } from '../api/tasks.ts'
 
 interface TaskTreeProps {

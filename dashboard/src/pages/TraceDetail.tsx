@@ -3,8 +3,8 @@ import { useParams, Link } from 'react-router'
 import { useTraceDetail, useTraceMessages, type TraceMessage } from '../api/timeline.ts'
 import { useTraceLlmCalls } from '../api/llmCalls.ts'
 import { useTraceToolCalls } from '../api/toolCalls.ts'
-import { CopyButton, EmptyState, LoadingState, ErrorState, formatApiError, StatusBadge, formatTimestamp, eventTypeBadge, eventTypeColor } from '@senara-solutions/ui'
-import type { StatusBadgeVariant } from '@senara-solutions/ui'
+import { CopyButton, EmptyState, LoadingState, ErrorState, formatApiError, StatusBadge, formatTimestamp, eventTypeBadge, eventTypeColor } from '@samidarko/ui'
+import type { StatusBadgeVariant } from '@samidarko/ui'
 import InvestigationPanel, {
   type InvestigationScope,
 } from '../components/InvestigationPanel.tsx'

@@ -1,5 +1,5 @@
 import { Link } from 'react-router'
-import { CopyButton } from '@senara-solutions/ui'
+import { CopyButton } from '@samidarko/ui'
 import { Activity } from 'lucide-react'
 
 interface TraceIdWidgetProps {
@@ -11,7 +11,7 @@ interface TraceIdWidgetProps {
 
 /**
  * Trace ID chip — displays a truncated trace ID with copy + link affordances.
- * Uses CopyButton from @senara-solutions/ui per mika#665 AC3 constraint.
+ * Uses CopyButton from @samidarko/ui per mika#665 AC3 constraint.
  */
 export default function TraceIdWidget({ traceId, llmCallCount, className = '' }: TraceIdWidgetProps) {
   return (

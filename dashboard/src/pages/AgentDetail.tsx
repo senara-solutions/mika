@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useParams, Link, useSearchParams } from 'react-router'
 import { useAgentDetail, useAgentSessions, useAgentAudit, useAgentFacts, type CoreMemory, type FactEntry, type AuditEvent } from '../api/agents.ts'
-import { StatusBadge, Pagination, EmptyState, LoadingState, ErrorState, formatApiError, MarkdownContent, formatRelativeTime, CopyButton, TokenBudgetBar, CostMeter } from '@senara-solutions/ui'
+import { StatusBadge, Pagination, EmptyState, LoadingState, ErrorState, formatApiError, MarkdownContent, formatRelativeTime, CopyButton, TokenBudgetBar, CostMeter } from '@samidarko/ui'
 import { ArrowLeft, User, Brain, Target, Users, GitBranch, ChevronDown } from 'lucide-react'
 
 const BLOCK_TOKEN_CAP = 500

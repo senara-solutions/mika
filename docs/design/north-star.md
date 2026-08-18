@@ -1,7 +1,7 @@
 # Mika Design North Star
 
 **Status:** Active — the WHY behind every visual and interaction decision across the Mika ecosystem.
-**Scope:** All three product surfaces — Observability Dashboard, Cloud Console, Landing Page — and the shared `@senara-solutions/ui` component library that backs them.
+**Scope:** All three product surfaces — Observability Dashboard, Cloud Console, Landing Page — and the shared `@samidarko/ui` component library that backs them.
 **Owner:** Vincent. Updates land as direct commits to main; this document is not relitigated through PRs.
 **Companion:** [`luminescent-core.md`](./luminescent-core.md) — the design system rulebook this north star asks us to apply.
 
@@ -30,7 +30,7 @@ Mika is **new-generation technology**. The interface signals that. It does not l
 
 [The Luminescent Core](./luminescent-core.md) is the single Mika design system. Every surface adopts it; surfaces never fork it. When a surface needs something the rulebook doesn't cover (e.g., the Dashboard needs trace widgets the Cloud Console doesn't), the answer is to **extend** the rulebook — add the new pattern to it, mark which surfaces use it. The rulebook grows. It never splits.
 
-The technical embodiment of the rulebook is the `@senara-solutions/ui` package (`packages/ui/` in the `mika` repo, published to GitHub Packages). Tokens, primitives, and components defined there are consumed by all three surfaces. Anything that needs to be uniform lives there.
+The technical embodiment of the rulebook is the `@samidarko/ui` package (`packages/ui/` in the `mika` repo, published to GitHub Packages). Tokens, primitives, and components defined there are consumed by all three surfaces. Anything that needs to be uniform lives there.
 
 ### Three reconciliations, sequenced
 
@@ -39,7 +39,7 @@ Each surface needs a reconciliation pass: walk through what exists, categorize r
 | Order | Surface | Why this order | Effort |
 |---|---|---|---|
 | 1 | Observability Dashboard | First reconciliation establishes the workflow. No design system attached today. | Heavier |
-| 2 | Cloud Console | Source of The Luminescent Core. Mostly aligned with itself; needs a confirmation pass that the implementation matches the rulebook and tokens flow cleanly through `@senara-solutions/ui`. | Lighter |
+| 2 | Cloud Console | Source of The Luminescent Core. Mostly aligned with itself; needs a confirmation pass that the implementation matches the rulebook and tokens flow cleanly through `@samidarko/ui`. | Lighter |
 | 3 | Landing Page | Oldest surface, most likely drifted. Likely needs a redesign pass. | Heaviest |
 
 The workflow we agree on for the Dashboard becomes the template for the other two.
@@ -50,7 +50,7 @@ The workflow we agree on for the Dashboard becomes the template for the other tw
 |---|---|
 | The north star (this file) | Direct commit to main, owned by Vincent. |
 | The Luminescent Core rulebook ([`luminescent-core.md`](./luminescent-core.md)) | Direct commit to main, owned by Vincent. Extensions are also direct commits. |
-| `@senara-solutions/ui` primitives — adding/changing components to match the rulebook | PR. The PR's job is to faithfully apply what the rulebook already says, not to debate the rulebook. |
+| `@samidarko/ui` primitives — adding/changing components to match the rulebook | PR. The PR's job is to faithfully apply what the rulebook already says, not to debate the rulebook. |
 | Surface-level implementation (Dashboard pages, Console pages, Landing Page sections) | PR. Reviewed against the rulebook + this north star, not against personal taste. |
 
 The discipline is: **arguments about the system happen with Vincent on the rulebook itself.** Arguments about implementation happen in PRs against the system.
