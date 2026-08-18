@@ -161,6 +161,14 @@ jobs:
       - name: Reject tokio::select! inside run_loop (mika#848)
         run: bash scripts/check-loop-select.sh
 
+  egress-uniqueness-lint:
+    name: Egress Uniqueness Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - name: Enforce single-controlled search egress (mika#1807 AC4)
+        run: bash scripts/verify-egress-uniqueness.sh
+
   pipeline-artifacts:
     name: Pipeline Artifacts
     runs-on: ubuntu-22.04
