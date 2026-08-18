@@ -86,7 +86,7 @@ Application : une seule `SearchEgressClient` instance dans `mika-gateway`, parta
 
 ### Q4 — Format instrumentation
 
-**Résolution : `tracing` structuré + Prometheus metrics agrégés, jamais de query content ni user identifier.**
+**Résolution v1 (sami-tranchée 2026-08-18 06:41, re-confirmée 06:51) : `tracing` structuré + Prometheus metrics agrégés, ZÉRO tenant_hash, ZÉRO query content.**
 
 **Metrics exposées :**
 - `mika_gateway_egress_search_requests_total{status=ok|error|timeout}` — counter
@@ -94,18 +94,29 @@ Application : une seule `SearchEgressClient` instance dans `mika-gateway`, parta
 - `mika_gateway_egress_search_upstream_errors_total{code=4xx|5xx}` — counter per upstream error class
 
 **Logs structurés (tracing crate) :**
-- Level INFO : `search_requested{tenant_hash="anon", upstream="brave"}` — tenant_hash = **anonymized bucket** (e.g., hash-mod-64 of tenant_id, non-reversible), permet trouble-shooting per-cohort sans identifier user. `upstream` = fixe (nom du provider), pas la query.
-- Level WARN/ERROR : upstream failures, timeouts (sans contenu requête)
+- Level INFO : `search_requested{upstream="brave"}` — SEUL le nom du provider est tracé, aucun identifiant per-request/per-tenant.
+- Level WARN/ERROR : upstream failures, timeouts (sans contenu requête ni identifier)
 
-**Ce qui N'EST JAMAIS loggé :**
+**Ce qui N'EST JAMAIS loggé (v1 strip total) :**
 - Query string content (`user searched for X`)
-- User/tenant ID (identifiable form)
+- User/tenant ID (identifiable form) — **ni brut, ni hashé, ni bucketé**
 - Upstream response body
 - API key / credentials
 
-**Format audit tracé :** compatible avec cm audit_events pattern déjà en place ([cm#99 emitter](https://github.com/senara-solutions/control-monitor/issues/99)). L'egress search event = `{type: "search_egress", upstream, latency_ms, status, tenant_hash}` — never `query` field.
+**Format audit tracé :** compatible avec cm audit_events pattern ([cm#99 emitter](https://github.com/senara-solutions/control-monitor/issues/99)). L'egress search event v1 = `{type: "search_egress", upstream, latency_ms, status}` — sans `tenant_hash`, sans `tenant_id`, sans `query`.
 
-**Rationale sur `tenant_hash`** : sami's e3 "dé-liage identité↔requête" exige pas d'attribution corrélable. Un hash-64-mod non-réversible côté logs permet SRE trouble-shooting ("X% de requêtes en erreur sur bucket Y") sans dé-anonymisation. Si sami's e3 review juge que même le hash est trop, on strip totalement — le trade-off = zéro debugging cohort possible.
+**Rationale strip total (sami tranche 2026-08-18) :**
+
+Bucket-64 avait été initialement proposé pour cohort SRE trouble-shooting. Sami a arbitré strip total en v1 :
+
+> "Raison : bucket-64 sur une famille de quelques dizaines d'utilisateurs ≈ pseudonyme quasi-par-tenant → corrélable user-side, ce que la doctrine dé-liage interdit. Réversibilité-asymétrie : ajouter de la télémétrie-cohorte plus tard (avec bearing Prime) = facile ; dé-fuiter = dur. On assume zéro cohort-debug en v1."
+
+**Conséquences opérationnelles v1 :**
+- Aucun cohort-debug SRE (impossible de dire "X% erreurs sur bucket Y")
+- Trouble-shooting possible UNIQUEMENT via metrics agrégats globaux (total counter + latency histogram)
+- Si un jour un cohort-debug s'avère nécessaire, ce sera une **feature v2 gated Prime** (pas un ajout silent)
+
+**Cette discipline transporte** : la Prime rule "construis l'incapacité, ne promets pas la retenue" (analogie #1796). On construit un log path qui NE PEUT PAS écrire un tenant identifier — pas seulement une promise que le code ne le fait pas.
 
 ---
 
