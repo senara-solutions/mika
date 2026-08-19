@@ -279,9 +279,7 @@ jobs:
           - dockerfile: os/Dockerfile
             target: mika-runtime-gateway
             tag: mika-runtime-gateway
-          - dockerfile: os/Dockerfile
-            target: mika-runtime-cli
-            tag: mika-runtime-cli
+          # mika-runtime-cli split to canari self-hosted job (mika#1919 Phase 1)
           - dockerfile: os/Dockerfile
             target: mika-runtime-all
             tag: mika-runtime-all
@@ -301,6 +299,59 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.tag }}
           cache-to: type=gha,scope=${{ matrix.tag }},mode=max
           platforms: linux/amd64
+
+  # ------------------------------------------------------------------
+  # Phase 1 canari (mika#1919, Vincent-authorized 2026-08-19):
+  # Migrate mika-runtime-cli ONLY to self-hosted gentux runner.
+  # Other targets stay on ubuntu-22.04 above. Rollback = flip runs-on.
+  #
+  # GHCR pull-through registry cache avoids rebuild of base layers.
+  # Storage-delta instrumentation captures df/docker system df pre+post
+  # so root can calibrate prune cadence against measured accumulation.
+  #
+  # concurrency group prevents stacking on the single gentux runner.
+  # ------------------------------------------------------------------
+  docker-build-os-canari-cli:
+    name: Docker Build OS (mika-runtime-cli — self-hosted gentux canari)
+    runs-on: [self-hosted, gentux, docker]
+    needs: docker-build-filter
+    if: github.event_name == 'pull_request' && needs.docker-build-filter.outputs.os-relevant == 'true'
+    concurrency:
+      group: docker-canari-cli-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2  # v3
+      - name: Login to GHCR
+        uses: docker/login-action@e92390c5fb421da1463c202d546fed0ec5c39f20  # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Storage delta — BEFORE
+        run: |
+          echo "=== canari mika-runtime-cli — BEFORE build ==="
+          df -h /
+          docker system df
+      - name: Build mika-runtime-cli
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83  # v6
+        with:
+          context: .
+          file: os/Dockerfile
+          target: mika-runtime-cli
+          tags: mika-runtime-cli:ci
+          push: false
+          load: true
+          cache-from: type=registry,ref=ghcr.io/senara-solutions/mika-cache:mika-runtime-cli
+          cache-to: type=registry,ref=ghcr.io/senara-solutions/mika-cache:mika-runtime-cli,mode=max
+          platforms: linux/amd64
+      - name: Storage delta — AFTER
+        if: always()
+        run: |
+          echo "=== canari mika-runtime-cli — AFTER build ==="
+          df -h /
+          docker system df
 
   security:
     name: Security
