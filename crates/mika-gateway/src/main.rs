@@ -1,5 +1,6 @@
 mod a2a_auth;
 mod a2a_routes;
+pub(crate) mod audit_events;
 pub(crate) mod circuit_breaker;
 pub(crate) mod dlq;
 pub(crate) mod egress_search;
