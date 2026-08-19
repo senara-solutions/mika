@@ -1170,7 +1170,10 @@ pub async fn handle_skills_list(
     use crate::bundled_skills::is_bundled_skill;
     use crate::skills::{SkillListFilter, SkillSource, apply_filter};
 
-    let agent_state = match state.agents.iter().next().map(|r| r.value().clone()) {
+    // Extract the first agent state out of the DashMap iter scrutinee so the
+    // shard-lock guard is released before we branch (clippy::sig_drop, #1724).
+    let first_agent_state = state.agents.iter().next().map(|r| r.value().clone());
+    let agent_state = match first_agent_state {
         Some(a) => a,
         None => {
             return (

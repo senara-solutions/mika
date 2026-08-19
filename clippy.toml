@@ -1,0 +1,24 @@
+# Clippy configuration for the mika workspace.
+#
+# Wedge-class prevention (mika#1724, mika#1719):
+# Two adjacent Rust footguns get structural CI enforcement here so the
+# quality gate — not review — catches recurrences.
+#
+# 1. `await-holding-invalid-types` — DashMap guard held across `.await`
+#    deadlocks the shard against every other thread on any worker. This is
+#    the class the mika#1719 friend-review hunt chased when auditing the
+#    single-mutex 8h outage on 2026-07-02.
+#
+# 2. `significant_drop_in_scrutinee` (enabled at [workspace.lints] in
+#    Cargo.toml, nursery lint) — the mika#1719 site fix bug shape:
+#    a `match lock.get(...)` scrutinee holds its RAII guard across every
+#    arm, deadlocking against a same-thread writer inside an arm.
+
+await-holding-invalid-types = [
+    { path = "dashmap::mapref::one::Ref",           reason = "Holding DashMap Ref across .await can deadlock a shard reader against writers on any thread." },
+    { path = "dashmap::mapref::one::RefMut",        reason = "Holding DashMap RefMut across .await deadlocks the shard writer against everyone." },
+    { path = "dashmap::iter::Iter",                 reason = "DashMap iter holds shard locks seriatim; .await inside the loop body deadlocks." },
+    { path = "dashmap::iter::IterMut",              reason = "Same as Iter, exclusive." },
+    { path = "dashmap::mapref::multiple::RefMulti", reason = "Multi-ref pattern holds shard lock." },
+    { path = "dashmap::mapref::multiple::RefMutMulti", reason = "Same, exclusive." },
+]

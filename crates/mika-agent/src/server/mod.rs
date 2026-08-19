@@ -824,7 +824,10 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     // Validate the active agent exists; fall back to the first available agent
     // if the active_agent file points to a name that no longer exists.
     if agents.get(&default_agent).is_none() {
-        if let Some(fallback) = agents.iter().next().map(|r| r.key().clone()) {
+        // Extract the fallback key out of the DashMap iter scrutinee so the
+        // shard-lock guard is released before we branch (clippy::sig_drop, #1724).
+        let fallback = agents.iter().next().map(|r| r.key().clone());
+        if let Some(fallback) = fallback {
             warn!(
                 requested = %default_agent,
                 fallback = %fallback,
@@ -911,9 +914,14 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     let kg_shutdown_token = CancellationToken::new();
     let mut kg_tick_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     {
-        for entry in agents.iter() {
-            let agent_name = entry.key();
-            let agent_state = entry.value();
+        // Snapshot (name, state) before the awaits below so the DashMap shard
+        // locks are released before any .await runs (clippy::await_holding, #1724).
+        // Startup-only path — DashMap is not mutated concurrently here.
+        let kg_lexical_entries: Vec<(String, Arc<AgentState>)> = agents
+            .iter()
+            .map(|r| (r.key().clone(), r.value().clone()))
+            .collect();
+        for (agent_name, agent_state) in &kg_lexical_entries {
             let KgAgentConfig::Enabled { ref corpora } = agent_state.kg_config else {
                 info!(
                     agent = agent_name.as_str(),
@@ -1413,9 +1421,15 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     let mut tick_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut total_tasks_loaded: usize = 0;
 
-    for entry in state.agents.iter() {
-        let name = entry.key();
-        let agent_state = entry.value();
+    // Snapshot (name, state) before the awaits below so the DashMap shard
+    // locks are released before any .await runs (clippy::await_holding, #1724).
+    // Startup-only path — DashMap is not mutated concurrently here.
+    let task_engine_entries: Vec<(String, Arc<AgentState>)> = state
+        .agents
+        .iter()
+        .map(|r| (r.key().clone(), r.value().clone()))
+        .collect();
+    for (name, agent_state) in &task_engine_entries {
         let engine = agent_state.task_engine.clone();
         let db = agent_state.db.clone();
         let agent_name = name.clone();
