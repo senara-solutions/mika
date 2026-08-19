@@ -180,7 +180,11 @@ mod tests {
             if let Some(err) = self.infra_error.lock().unwrap().as_ref() {
                 return Err(anyhow::anyhow!("{}", err));
             }
-            match self.outcome.lock().unwrap().clone() {
+            // Release the std::sync::Mutex guard before matching so the guard
+            // is not held across the arms (clippy::sig_drop, #1724 —
+            // structural mirror of the mika#1719 same-thread deadlock shape).
+            let outcome = self.outcome.lock().unwrap().clone();
+            match outcome {
                 Some(outcome) => Ok(outcome),
                 None => Ok(SendOutcome::Delivered),
             }

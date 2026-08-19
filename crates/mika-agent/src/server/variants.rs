@@ -57,7 +57,10 @@ fn find_skill_dir(
 // ---------------------------------------------------------------------------
 
 pub async fn handle_variants_summary(State(state): State<AppState>) -> impl IntoResponse {
-    let agent_state = match state.agents.iter().next().map(|r| r.value().clone()) {
+    // Extract the first agent state out of the DashMap iter scrutinee so the
+    // shard-lock guard is released before we branch (clippy::sig_drop, #1724).
+    let first_agent_state = state.agents.iter().next().map(|r| r.value().clone());
+    let agent_state = match first_agent_state {
         Some(a) => a,
         None => {
             return (
@@ -304,7 +307,10 @@ pub async fn handle_variant_promote(
     State(state): State<AppState>,
     Path((skill_name, provider, model)): Path<(String, String, String)>,
 ) -> impl IntoResponse {
-    let agent_state = match state.agents.iter().next().map(|r| r.value().clone()) {
+    // Extract the first agent state out of the DashMap iter scrutinee so the
+    // shard-lock guard is released before we branch (clippy::sig_drop, #1724).
+    let first_agent_state = state.agents.iter().next().map(|r| r.value().clone());
+    let agent_state = match first_agent_state {
         Some(a) => a,
         None => {
             return (
