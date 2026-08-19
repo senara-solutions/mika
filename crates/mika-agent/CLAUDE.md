@@ -50,6 +50,8 @@ Skills with `[context.*]` sections have their data pre-fetched by the engine bef
 
 **Per-agent override:** mika-arch sets `[context.summary] inject = false`, removing the *conversation summary* layer from its system prompt entirely (mika#1009 leak protection). New agents that disable summary injection should be listed here.
 
+**Stop-signal convention (mika#1813):** the `stop_topic_*` preference key prefix (`prompt::STOP_TOPIC_PREFIX`) captures user requests to stop being re-nagged on a subject. When the user says "arrête" / "stop bringing this up" on subject X, the agent persists a `store_fact(category='preference', key='stop_topic_<slug>', value=…)` in the same turn. `AgentContext::load_agent_context` (`agent_loop/mod.rs`) fetches these via `search_preferences(STOP_TOPIC_PREFIX)` on every turn and threads them into both `PromptContext` (conversation) and `SilentPromptContext` (silent). Both prompt builders render them as a `<stopped-topics>` block with an explicit "do NOT re-initiate on these" instruction. The state layer is the structural gate — the block re-appears on every future turn even if the model forgets, so the pattern degrades gracefully. Direct user questions about a stopped topic remain answerable (stop = don't re-initiate; question = respond normally).
+
 ## Context Injection Configuration
 
 `[context]` section in `identity.toml` controls prompt-assembly behavior for context blocks. Each context block has its own nested subsection.

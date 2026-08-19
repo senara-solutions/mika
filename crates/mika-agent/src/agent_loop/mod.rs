@@ -207,6 +207,10 @@ struct AgentContext {
     identity: prompt::Identity,
     core_memory: Vec<crate::db::CoreMemoryEntry>,
     timezone: Option<String>,
+    /// Active `stop_topic_*` preferences (mika#1813). Loaded fail-open — a query
+    /// error here must not block the turn; the `<stopped-topics>` block simply
+    /// stays empty.
+    stopped_topics: Vec<crate::db::Preference>,
 }
 
 async fn load_agent_context(db: &AsyncDatabase, home_dir: &Path) -> Result<AgentContext> {
@@ -216,11 +220,17 @@ async fn load_agent_context(db: &AsyncDatabase, home_dir: &Path) -> Result<Agent
     let identity = prompt::load_identity_async(home_dir).await;
     let core_memory = db.get_all_core_memory().await?;
     let timezone = db.get_customer_config("timezone").await?;
+    // mika#1813: load stop-signal preferences for injection into every turn.
+    let stopped_topics = db
+        .search_preferences(prompt::STOP_TOPIC_PREFIX)
+        .await
+        .unwrap_or_default();
     Ok(AgentContext {
         soul_content,
         identity,
         core_memory,
         timezone,
+        stopped_topics,
     })
 }
 
@@ -2758,6 +2768,7 @@ async fn run_agent_inner(
         } else {
             None
         },
+        stopped_topics: &ctx.stopped_topics,
     };
     let is_compact_provider = llm.provider_name() == ProviderKind::MikaModel.config_prefix();
     let mut system = if is_compact_provider {
@@ -3654,6 +3665,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         home_dir: Some(params.home_dir),
         task_health: task_health.as_ref(),
         stored_preferences: &stored_preferences,
+        stopped_topics: &ctx.stopped_topics,
     };
     let mut system = prompt::build_silent_prompt(&silent_ctx);
 
@@ -4253,6 +4265,7 @@ async fn run_team_agent_inner_impl(
         telegram_configured: params.message_sender.is_some(),
         home_dir: Some(params.home_dir),
         callback_context: None,
+        stopped_topics: &ctx.stopped_topics,
     };
     let is_compact_provider = llm.provider_name() == ProviderKind::MikaModel.config_prefix();
     let mut system = if is_compact_provider {
