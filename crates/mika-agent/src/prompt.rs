@@ -14,6 +14,31 @@ use crate::db::{
 /// future turn even if the model forgets. The prompt discipline (persist on
 /// refusal; consult before initiating) is the intent half.
 pub const STOP_TOPIC_PREFIX: &str = "stop_topic_";
+
+/// Filter a `search_preferences` result set down to strict stop-topic rows
+/// (mika#1813).
+///
+/// `db::search_preferences(query)` runs `WHERE agent_id = ?1 AND (category LIKE
+/// '%query%' OR value LIKE '%query%')`. Two ways that under-constrains for
+/// `STOP_TOPIC_PREFIX`:
+///
+/// 1. **`_` is a SQLite LIKE wildcard.** `LIKE '%stop_topic_%'` matches any
+///    `stop_topic<X>` where `X` is any character, including an unrelated key
+///    like `stop_topicalization`.
+/// 2. **OR on `value`.** A preference whose value happens to contain
+///    `stop_topic_` as a substring (a `task_policy_*` row paraphrasing the
+///    convention, a prose preference referencing it) is surfaced as a stopped
+///    topic and would mute unrelated axes (AC4 leak).
+///
+/// The load path (`AgentContext::load_agent_context`) applies this filter so
+/// only preferences whose `category` is a strict `stop_topic_` prefix are
+/// injected into `<stopped-topics>`.
+pub fn filter_stop_topic_preferences(prefs: Vec<Preference>) -> Vec<Preference> {
+    prefs
+        .into_iter()
+        .filter(|p| p.category.starts_with(STOP_TOPIC_PREFIX))
+        .collect()
+}
 use chrono::{DateTime, NaiveTime, Utc};
 use mika_common::{agent, team};
 use serde::Deserialize;
@@ -686,10 +711,13 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
          \"no more\", \"assez\", \"laisse tomber\", \"oublie ça\"), acknowledge concisely AND \
          call `store_fact(category='preference', key='stop_topic_<short-slug>', \
          value='<one-line: what the user asked to stop, with today's date>')` in the SAME \
-         turn. `<short-slug>` is a lowercase kebab-case identifier for the subject (e.g., \
-         `stop_topic_web-config`, `stop_topic_budget-review`). Do NOT re-initiate on that \
-         topic in later turns unless the user re-opens it themselves. A direct user question \
-         about the topic is not a re-opening — you may still answer it.\n",
+         turn. `<short-slug>` is a lowercase kebab-case identifier for the subject — for \
+         example, subject `web-config` → `key='stop_topic_web-config'`; subject \
+         `budget-review` → `key='stop_topic_budget-review'`. Choose a slug specific enough \
+         to distinguish this subject from any other `stop_topic_*` key already in the \
+         `## Stopped Topics` block. Do NOT re-initiate on that topic in later turns unless \
+         the user re-opens it themselves. A direct user question about the topic is not a \
+         re-opening — you may still answer it.\n",
     );
     prompt.push_str(
         "- **Respect stop signals (consult):** If a `## Stopped Topics` section is present \
@@ -954,6 +982,15 @@ Core memory tracks key people briefly — the people table is the full record.\n
 /// the MikaModel provider expects ≤5-10 tools max, so tool catalog injection
 /// is gated upstream at the call site (see `is_compact_provider` check in
 /// `agent.rs`), not inside this builder.
+///
+/// **mika#1813 carve-out (tracked in mika#1925):** the stop-signal contract
+/// (`<stopped-topics>` block + persist/consult rules) is intentionally NOT
+/// rendered here — the compact budget cannot afford it and the MikaModel
+/// provider is not currently used by family-tier or operator-tier agents in
+/// production. mika#1925 tracks wiring a size-capped variant when MikaModel
+/// goes live for real tenants. The `stopped_topics` field on `PromptContext`
+/// is accepted by this builder to keep the type signature uniform across the
+/// three builders; it is deliberately unused here.
 pub fn build_compact_system_prompt(ctx: &PromptContext<'_>) -> String {
     let mut prompt = String::with_capacity(512);
 
@@ -3441,5 +3478,102 @@ inject = false
         // must agree on the same string. Guarding the literal here catches
         // an accidental rename that would silently break the coupling.
         assert_eq!(STOP_TOPIC_PREFIX, "stop_topic_");
+    }
+
+    #[test]
+    fn test_filter_stop_topic_preferences_keeps_strict_prefix() {
+        // Baseline: a `stop_topic_<slug>` category must survive the filter.
+        let prefs = vec![Preference {
+            category: "stop_topic_web-config".to_string(),
+            value: "user asked to stop, 2026-08-19".to_string(),
+            updated_at: "2026-08-19T00:00:00Z".to_string(),
+        }];
+        let filtered = filter_stop_topic_preferences(prefs);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].category, "stop_topic_web-config");
+    }
+
+    #[test]
+    fn test_filter_stop_topic_preferences_drops_value_only_matches() {
+        // Anti-regression: `db::search_preferences('stop_topic_')` ORs on
+        // category AND value with a substring LIKE, so a row whose CATEGORY is
+        // not a stop-topic but whose VALUE happens to mention the substring
+        // would otherwise surface in `<stopped-topics>` and mute unrelated
+        // axes (AC4 leak). The filter must drop it.
+        let prefs = vec![Preference {
+            category: "task_policy_finance".to_string(),
+            value: "when user says stop_topic_x we do Y".to_string(),
+            updated_at: "2026-08-19T00:00:00Z".to_string(),
+        }];
+        let filtered = filter_stop_topic_preferences(prefs);
+        assert!(
+            filtered.is_empty(),
+            "value-only matches must not surface as stop-topics"
+        );
+    }
+
+    #[test]
+    fn test_filter_stop_topic_preferences_drops_wildcard_underscore_neighbours() {
+        // Anti-regression: SQLite LIKE treats `_` as a single-char wildcard,
+        // so `%stop_topic_%` matches `stop_topicalization` (the trailing `_`
+        // matches `a`). A non-prefix category must not be promoted to a
+        // stop-topic. `starts_with` in the filter is a byte-level literal
+        // check with no LIKE semantics — it rejects the imposter cleanly.
+        let prefs = vec![
+            Preference {
+                category: "stop_topicalization".to_string(),
+                value: "unrelated".to_string(),
+                updated_at: "2026-08-19T00:00:00Z".to_string(),
+            },
+            Preference {
+                category: "stop_topic_web-config".to_string(),
+                value: "user asked to stop, 2026-08-19".to_string(),
+                updated_at: "2026-08-19T00:00:00Z".to_string(),
+            },
+        ];
+        let filtered = filter_stop_topic_preferences(prefs);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].category, "stop_topic_web-config");
+    }
+
+    #[test]
+    fn test_compact_prompt_omits_stopped_topics_block_by_design() {
+        // The compact prompt (ProviderKind::MikaModel) is intentionally
+        // silent on stop-topics — the ≤5 KB budget cannot afford them and
+        // MikaModel is not currently used for production agents. This test
+        // pins the carve-out documented at build_compact_system_prompt so a
+        // future wire-up is deliberate (test flips) rather than accidental.
+        let identity = test_identity();
+        let stops = vec![stop_topic_pref(
+            "web-config",
+            "user asked to stop, 2026-08-19",
+        )];
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+            stopped_topics: &stops,
+        };
+        let prompt = build_compact_system_prompt(&ctx);
+        assert!(
+            !prompt.contains("<stopped-topics>"),
+            "compact prompt must not emit the stop-topics block (carve-out)"
+        );
+        assert!(
+            !prompt.contains("Stopped Topics"),
+            "compact prompt must not emit the stop-topics section header"
+        );
+        assert!(
+            !prompt.contains("Respect stop signals"),
+            "compact prompt must not carry stop-signal rules"
+        );
     }
 }

@@ -221,10 +221,24 @@ async fn load_agent_context(db: &AsyncDatabase, home_dir: &Path) -> Result<Agent
     let core_memory = db.get_all_core_memory().await?;
     let timezone = db.get_customer_config("timezone").await?;
     // mika#1813: load stop-signal preferences for injection into every turn.
-    let stopped_topics = db
-        .search_preferences(prompt::STOP_TOPIC_PREFIX)
-        .await
-        .unwrap_or_default();
+    //
+    // Fail-open by design (per AgentContext::stopped_topics doc). Log the error
+    // so a persistent DB failure is greppable instead of silently disabling the
+    // suppression list on every turn.
+    //
+    // Filter with `prompt::filter_stop_topic_preferences` because
+    // `search_preferences` uses a substring `LIKE '%prefix%'` on BOTH the
+    // category AND value columns (see db.rs) — so a preference whose value
+    // merely mentions the substring, or whose category matches via SQLite's
+    // single-char `_` wildcard, would otherwise be surfaced as an authoritative
+    // stop-topic and mute unrelated axes (AC4 leak).
+    let stopped_topics = match db.search_preferences(prompt::STOP_TOPIC_PREFIX).await {
+        Ok(rows) => prompt::filter_stop_topic_preferences(rows),
+        Err(e) => {
+            warn!(error = %e, "stop_topic_load_failed");
+            Vec::new()
+        }
+    };
     Ok(AgentContext {
         soul_content,
         identity,
