@@ -187,6 +187,13 @@ impl AppState {
         .await
         {
             Ok(agent_state) => {
+                // mika#1758: attach the per-process task-event broadcast
+                // channel BEFORE inserting into the agents map so any
+                // lifecycle transition that fires immediately after (e.g.,
+                // during webhook-drain-worker spawn below) reaches the wire.
+                agent_state
+                    .db
+                    .set_task_events_channel(self.task_events_channel.clone());
                 let agent_state = Arc::new(agent_state);
                 self.agents.insert(normalized.clone(), agent_state.clone());
                 tracing::info!(

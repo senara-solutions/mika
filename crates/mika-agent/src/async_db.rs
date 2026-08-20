@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use tokio::sync::oneshot;
 
@@ -11,6 +11,7 @@ use crate::db::{
     TaskMessage, TaskSessionRow, TeamRow, TeamRunFilters, TeamRunRow, TeamRunSummary,
     TeamWorkspaceEntry, TimelineFilters, TimelineRow,
 };
+use crate::server::tasks_stream::{TaskEventFrame, TaskEventsChannel};
 
 type DbClosure = Box<dyn FnOnce(&mut Database) + Send>;
 
@@ -32,6 +33,14 @@ pub struct AsyncDatabase {
 struct AsyncDatabaseInner {
     sender: Mutex<Option<tokio::sync::mpsc::Sender<DbClosure>>>,
     thread_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Per-process task-event broadcast handle (mika#1758). Attached once at
+    /// server startup by `run_server` (and `AppState::resolve_agent` for
+    /// lazy-resolved agents) via [`AsyncDatabase::set_task_events_channel`].
+    /// `OnceLock::get()` returns `None` in tests / CLI / any non-server caller,
+    /// making [`AsyncDatabase::emit_task_event`] a silent no-op there. All
+    /// clones share the same `Inner`, so a single attach covers every derived
+    /// handle (including those returned by [`AsyncDatabase::with_agent`]).
+    task_events_channel: OnceLock<Arc<TaskEventsChannel>>,
 }
 
 impl AsyncDatabase {
@@ -68,8 +77,36 @@ impl AsyncDatabase {
             inner: Arc::new(AsyncDatabaseInner {
                 sender: Mutex::new(Some(tx)),
                 thread_handle: Mutex::new(Some(handle)),
+                task_events_channel: OnceLock::new(),
             }),
             agent_id: agent_id.to_string(),
+        }
+    }
+
+    /// Attach the per-process task-event broadcast channel (mika#1758). Safe
+    /// to call repeatedly — only the first call wins (`OnceLock::set` returns
+    /// `Err` on second attach and is silently ignored). Every clone of this
+    /// handle shares the same inner and therefore the same attached channel;
+    /// a single attach at server startup covers dispatcher/engine/tool
+    /// derivations via [`Self::with_agent`] and `.clone()`.
+    ///
+    /// When unattached (tests / CLI), [`Self::emit_task_event`] is a silent
+    /// no-op.
+    pub fn set_task_events_channel(&self, channel: Arc<TaskEventsChannel>) {
+        let _ = self.inner.task_events_channel.set(channel);
+    }
+
+    /// Fire-and-forget broadcast of a [`TaskEventFrame`] (mika#1758).
+    ///
+    /// **Contract:** callers invoke this AFTER the associated DB write has
+    /// committed and returned the "transition happened" signal (`Ok(true)`
+    /// for guarded UPDATEs, `Ok(id)` for INSERTs). Absent-channel = silent
+    /// no-op. Zero-subscriber broadcast returns `false` — also silent.
+    /// This method NEVER errors and NEVER blocks — `broadcast::Sender::send`
+    /// is synchronous and lock-free. Do not `.await` — no await point exists.
+    fn emit_task_event(&self, frame: TaskEventFrame) {
+        if let Some(channel) = self.inner.task_events_channel.get() {
+            let _ = channel.broadcast_frame(frame);
         }
     }
 
@@ -252,12 +289,74 @@ impl AsyncDatabase {
     // -- Task CRUD --
 
     pub async fn create_task(&self, task: NewTask) -> Result<String> {
-        self.with_db(move |db| db.create_task(&task)).await
+        // mika#1758: capture the emission-relevant fields BEFORE moving the
+        // NewTask into the DB-thread closure — we cannot read them back after.
+        // `created_at` is captured at emit time (off by ≤1ms vs the DB-committed
+        // value; the wire is a UI hint, exact-match against DB is not required).
+        //
+        // agent_id source: `task.agent_id`, NOT `self.agent_id`. The
+        // `Database::create_task` INSERT uses `task.agent_id`, and callers on
+        // shared handles legitimately pass a different `NewTask.agent_id`
+        // (e.g. `teams/engine.rs` writes child tasks with the assigned team
+        // member's agent id, not the orchestrator's). The frame's agent_id
+        // must match the row on disk so consumers correlating via
+        // `GET /api/v1/tasks/{task_id}` see a consistent view.
+        let kind = task.trigger_type.clone();
+        let action_type = task.action_type.clone();
+        let label = if task.label.is_empty() {
+            None
+        } else {
+            Some(task.label.clone())
+        };
+        let parent_task_id = task.parent_task_id.clone();
+        let agent_id = task.agent_id.clone();
+
+        let id = self.with_db(move |db| db.create_task(&task)).await?;
+
+        self.emit_task_event(TaskEventFrame::TaskCreated {
+            task_id: id.clone(),
+            agent_id,
+            kind,
+            action_type,
+            label,
+            parent_task_id,
+            created_at: crate::timestamp::now(),
+        });
+
+        Ok(id)
     }
 
     pub async fn create_recurring_task_if_absent(&self, task: NewTask) -> Result<Option<String>> {
-        self.with_db(move |db| db.create_recurring_task_if_absent(task))
-            .await
+        // mika#1758: idempotent create — only emit `TaskCreated` when the
+        // underlying DB call returns `Ok(Some(id))` (a new row was inserted).
+        // `Ok(None)` means the task already exists, no transition, no frame.
+        let kind = task.trigger_type.clone();
+        let action_type = task.action_type.clone();
+        let label = if task.label.is_empty() {
+            None
+        } else {
+            Some(task.label.clone())
+        };
+        let parent_task_id = task.parent_task_id.clone();
+        let agent_id = task.agent_id.clone();
+
+        let outcome = self
+            .with_db(move |db| db.create_recurring_task_if_absent(task))
+            .await?;
+
+        if let Some(ref id) = outcome {
+            self.emit_task_event(TaskEventFrame::TaskCreated {
+                task_id: id.clone(),
+                agent_id,
+                kind,
+                action_type,
+                label,
+                parent_task_id,
+                created_at: crate::timestamp::now(),
+            });
+        }
+
+        Ok(outcome)
     }
 
     pub async fn get_recurring_task_cron(&self, label: &str) -> Result<Option<String>> {
@@ -282,6 +381,14 @@ impl AsyncDatabase {
     }
 
     pub async fn cancel_recurring_task_by_label(&self, label: &str) -> Result<()> {
+        // mika#1758 note: this method cancels 0..N recurring rows keyed by
+        // (agent_id, label) without returning the affected task ids. Emitting
+        // per-row `TaskCancelled` frames would require an extra pre-fetch
+        // (SELECT id FROM tasks WHERE ...) and doubles the DB round-trip on
+        // the cleanup path. Deferred to a follow-up that widens the DB
+        // signature to return the affected ids (v2 concern); the wire stays
+        // silent on this cleanup transition for v1. The related operator
+        // paths (`cancel_task`, `update_manual_task_status`) do emit.
         let a = self.agent_id.clone();
         let l = label.to_owned();
         self.with_db(move |db| db.cancel_recurring_task_by_label(&a, &l))
@@ -332,15 +439,73 @@ impl AsyncDatabase {
     }
 
     pub async fn claim_and_fire_task(&self, id: &str) -> Result<bool> {
-        let id = id.to_string();
+        let id_owned = id.to_string();
         let a = self.agent_id.clone();
-        self.with_db(move |db| db.claim_and_fire_task(&id, &a))
-            .await
+        let claimed = self
+            .with_db({
+                let id_c = id_owned.clone();
+                let a_c = a.clone();
+                move |db| db.claim_and_fire_task(&id_c, &a_c)
+            })
+            .await?;
+
+        // mika#1758: emit TaskClaimed only when the atomic claim actually
+        // transitioned the row. `Ok(false)` = task no longer claimable
+        // (cancelled/completed/expired between DB scan and this call) — no
+        // transition, no frame.
+        if claimed {
+            self.emit_task_event(TaskEventFrame::TaskClaimed {
+                task_id: id_owned,
+                agent_id: a,
+                claimed_at: crate::timestamp::now(),
+            });
+        }
+
+        Ok(claimed)
     }
 
     pub async fn update_task_status(&self, id: &str, status: &str) -> Result<()> {
         let (i, s) = (id.to_owned(), status.to_owned());
-        self.with_db(move |db| db.update_task_status(&i, &s)).await
+        let is_cancel = s == "cancelled";
+
+        // mika#1758: `Database::update_task_status` is an *unguarded* UPDATE
+        // returning `Ok(())` regardless of whether the row existed or the
+        // status actually changed. To honour the "emit only on real
+        // transitions" contract shared with the guarded wrappers
+        // (`cancel_task`, `update_manual_task_status`), pre-fetch the task
+        // when a cancel emit would otherwise fire and only emit when the
+        // row exists AND was not already `cancelled`. Fail-closed on the
+        // pre-fetch error path — treat unknown as already-cancelled so a
+        // read failure does not fire a spurious frame.
+        let prior_status = if is_cancel {
+            match self.get_task_unscoped(&i).await {
+                Ok(Some(t)) => Some(t.status),
+                Ok(None) => None, // row does not exist → skip emit
+                Err(_) => Some("cancelled".to_string()), // read failed → skip emit
+            }
+        } else {
+            None
+        };
+
+        self.with_db(move |db| db.update_task_status(&i, &s))
+            .await?;
+
+        // Emit TaskCancelled only when a real row transitioned from a
+        // non-cancelled state to cancelled. Real caller today:
+        // `teams/engine.rs` cancelling a team-parent task. Dedicated cancel
+        // wrappers (`cancel_task`, `update_manual_task_status`) own their
+        // own emissions and never route through this path for the same
+        // call site.
+        if is_cancel && prior_status.as_deref().is_some_and(|s| s != "cancelled") {
+            self.emit_task_event(TaskEventFrame::TaskCancelled {
+                task_id: id.to_owned(),
+                agent_id: self.agent_id.clone(),
+                cancelled_at: crate::timestamp::now(),
+                reason: Some("cancelled_via_update_task_status".to_string()),
+            });
+        }
+
+        Ok(())
     }
 
     /// Record the trace_id of the execution that ran this task.
@@ -352,27 +517,90 @@ impl AsyncDatabase {
     }
 
     pub async fn update_task_completed(&self, id: &str, result: Option<&str>) -> Result<bool> {
-        let (i, r) = (id.to_owned(), result.map(|s| s.to_owned()));
+        let id_owned = id.to_owned();
+        let result_owned = result.map(|s| s.to_owned());
         let a = self.agent_id.clone();
-        self.with_db(move |db| db.update_task_completed(&i, &a, r.as_deref()))
-            .await
+        let transitioned = self
+            .with_db({
+                let i = id_owned.clone();
+                let a_c = a.clone();
+                let r = result_owned.clone();
+                move |db| db.update_task_completed(&i, &a_c, r.as_deref())
+            })
+            .await?;
+
+        // mika#1758: emit TaskCompleted only when the guarded UPDATE actually
+        // transitioned the row. `Ok(false)` = task already in terminal state
+        // (race with reaper/promoter/operator) — no transition, no frame.
+        if transitioned {
+            self.emit_task_event(TaskEventFrame::completed(
+                id_owned,
+                a,
+                crate::timestamp::now(),
+                result_owned.as_deref(),
+            ));
+        }
+
+        Ok(transitioned)
     }
 
     pub async fn update_task_failed(&self, id: &str, error: &str) -> Result<bool> {
-        let id = id.to_string();
-        let error = error.to_string();
+        let id_owned = id.to_string();
+        let error_owned = error.to_string();
         let a = self.agent_id.clone();
-        self.with_db(move |db| db.update_task_failed(&id, &a, &error))
-            .await
+        let transitioned = self
+            .with_db({
+                let i = id_owned.clone();
+                let a_c = a.clone();
+                let e = error_owned.clone();
+                move |db| db.update_task_failed(&i, &a_c, &e)
+            })
+            .await?;
+
+        // mika#1758: emit TaskFailed only when the guarded UPDATE actually
+        // transitioned the row. `Ok(false)` = task already terminal — no frame.
+        if transitioned {
+            self.emit_task_event(TaskEventFrame::failed(
+                id_owned,
+                a,
+                crate::timestamp::now(),
+                Some(error_owned.as_str()),
+            ));
+        }
+
+        Ok(transitioned)
     }
 
     /// Promote a task from `failed` → `completed` (#958).
     pub async fn promote_task_completed(&self, id: &str, reason: &str) -> Result<bool> {
-        let id = id.to_string();
-        let reason = reason.to_string();
+        let id_owned = id.to_string();
+        let reason_owned = reason.to_string();
         let a = self.agent_id.clone();
-        self.with_db(move |db| db.promote_task_completed(&id, &a, &reason))
-            .await
+        let transitioned = self
+            .with_db({
+                let i = id_owned.clone();
+                let a_c = a.clone();
+                let r = reason_owned.clone();
+                move |db| db.promote_task_completed(&i, &a_c, &r)
+            })
+            .await?;
+
+        // mika#1758: emit TaskCompleted on the failed→completed promotion.
+        // From the observer's standpoint, "task reached completed" is the
+        // semantic invariant — the intermediate failed → completed promotion
+        // is a legitimate second `TaskCompleted` for the same task_id. The
+        // wire faithfully records the sequence; consumers who only care about
+        // final state can ignore the earlier `TaskFailed`.
+        if transitioned {
+            self.emit_task_event(TaskEventFrame::completed(
+                id_owned,
+                a,
+                crate::timestamp::now(),
+                Some(reason_owned.as_str()),
+            ));
+        }
+
+        Ok(transitioned)
     }
 
     pub async fn update_task_next_fire_at(&self, id: &str, next_fire_at: &str) -> Result<()> {
@@ -389,9 +617,28 @@ impl AsyncDatabase {
     }
 
     pub async fn cancel_task(&self, id: &str) -> Result<bool> {
-        let i = id.to_owned();
+        let id_owned = id.to_owned();
         let a = self.agent_id.clone();
-        self.with_db(move |db| db.cancel_task(&i, &a)).await
+        let cancelled = self
+            .with_db({
+                let i = id_owned.clone();
+                let a_c = a.clone();
+                move |db| db.cancel_task(&i, &a_c)
+            })
+            .await?;
+
+        // mika#1758: emit TaskCancelled only when the guarded UPDATE actually
+        // transitioned the row. `Ok(false)` = task not in a cancellable state.
+        if cancelled {
+            self.emit_task_event(TaskEventFrame::TaskCancelled {
+                task_id: id_owned,
+                agent_id: a,
+                cancelled_at: crate::timestamp::now(),
+                reason: Some("cancelled_via_cancel_task".to_string()),
+            });
+        }
+
+        Ok(cancelled)
     }
 
     pub async fn update_manual_task_status(
@@ -399,11 +646,32 @@ impl AsyncDatabase {
         task_id: &str,
         new_status: &str,
     ) -> Result<Option<String>> {
-        let i = task_id.to_owned();
+        let id_owned = task_id.to_owned();
         let a = self.agent_id.clone();
-        let s = new_status.to_owned();
-        self.with_db(move |db| db.update_manual_task_status(&i, &a, &s))
-            .await
+        let status_owned = new_status.to_owned();
+        let is_cancel = status_owned == "cancelled";
+        let outcome = self
+            .with_db({
+                let i = id_owned.clone();
+                let a_c = a.clone();
+                let s = status_owned.clone();
+                move |db| db.update_manual_task_status(&i, &a_c, &s)
+            })
+            .await?;
+
+        // mika#1758: emit TaskCancelled when the manual-task-status wrapper
+        // transitions to "cancelled". `Ok(Some(prior_status))` means the
+        // guarded UPDATE actually fired; `Ok(None)` = no-op.
+        if is_cancel && outcome.is_some() {
+            self.emit_task_event(TaskEventFrame::TaskCancelled {
+                task_id: id_owned,
+                agent_id: a,
+                cancelled_at: crate::timestamp::now(),
+                reason: Some("cancelled_via_update_manual_task_status".to_string()),
+            });
+        }
+
+        Ok(outcome)
     }
 
     pub async fn list_manual_tasks(
@@ -602,8 +870,27 @@ impl AsyncDatabase {
     }
 
     pub async fn mark_task_delivered(&self, task_id: &str) -> Result<bool> {
-        let i = task_id.to_owned();
-        self.with_db(move |db| db.mark_task_delivered(&i)).await
+        let id_owned = task_id.to_owned();
+        let a = self.agent_id.clone();
+        let delivered = self
+            .with_db({
+                let i = id_owned.clone();
+                move |db| db.mark_task_delivered(&i)
+            })
+            .await?;
+
+        // mika#1758: emit TaskDelivered only when the guarded UPDATE actually
+        // transitioned the row (status='completed' AND delivered_at IS NULL).
+        // `Ok(false)` = already delivered or not yet completed — no frame.
+        if delivered {
+            self.emit_task_event(TaskEventFrame::TaskDelivered {
+                task_id: id_owned,
+                agent_id: a,
+                delivered_at: crate::timestamp::now(),
+            });
+        }
+
+        Ok(delivered)
     }
 
     /// Find orphaned parent self_dev tasks whose callback subtask delivered

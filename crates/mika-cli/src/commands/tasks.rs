@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::{ForcePromoteResult, Task, format_ts};
 use serde_json::{Value, json};
@@ -262,9 +262,103 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
                 }
             }
         }
+        Some(TaskCommand::Stream { url }) => {
+            stream_task_events(url).await?;
+        }
     }
 
     Ok(())
+}
+
+/// mika#1758 stub consumer: open the mika-spirit task-events SSE stream and
+/// print each `TaskEventFrame` JSON payload to stdout (one line per frame).
+///
+/// Diagnostic — not integrated into the TUI. mika#1727 handles TUI consumption.
+async fn stream_task_events(url_override: Option<String>) -> Result<()> {
+    use std::io::Write;
+
+    let base_url = url_override.unwrap_or_else(crate::commands::dashboard::spirit_url);
+    let stream_url = format!(
+        "{}/api/v1/dashboard/tasks/stream",
+        base_url.trim_end_matches('/')
+    );
+    let token = crate::commands::dashboard::auth_token()?;
+
+    eprintln!("mika#1758 task-event stream: connecting to {stream_url}");
+    let client = reqwest::Client::new();
+    let mut resp = client
+        .get(&stream_url)
+        .header("authorization", format!("Bearer {token}"))
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .with_context(|| format!("failed to open SSE stream at {stream_url}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!(
+            "mika-spirit returned {} for {}: {}",
+            status,
+            stream_url,
+            resp.text().await.unwrap_or_default()
+        );
+    }
+    eprintln!("mika#1758 task-event stream: connected. Streaming frames (Ctrl-C to stop).");
+
+    // Minimal SSE frame parser: buffer bytes, split on double-newline event
+    // separator, extract `data: <payload>` lines. Using `Response::chunk()`
+    // avoids pulling the `futures-util` `Stream` extension (workspace dep is
+    // `default-features = false`).
+    let mut buffer: Vec<u8> = Vec::with_capacity(4096);
+    let stdout = std::io::stdout();
+
+    while let Some(chunk) = resp.chunk().await.context("SSE stream read failed")? {
+        buffer.extend_from_slice(&chunk);
+
+        // Split on SSE event separator (`\r\n\r\n` / `\n\n` / `\r\r`, spec
+        // § 9.2). Keep the trailing partial event in the buffer for the
+        // next iteration.
+        while let Some((sep_idx, sep_len)) = find_event_separator(&buffer) {
+            let event_bytes: Vec<u8> = buffer.drain(..sep_idx + sep_len).collect();
+            // Drop the trailing separator; parse the remainder line-by-line.
+            let event_str = String::from_utf8_lossy(&event_bytes[..event_bytes.len() - sep_len]);
+            for line in event_str.split(['\n', '\r']) {
+                if let Some(data) = line.strip_prefix("data:") {
+                    let data = data.trim_start();
+                    if data.is_empty() {
+                        continue;
+                    }
+                    let mut handle = stdout.lock();
+                    writeln!(handle, "{data}").ok();
+                    handle.flush().ok();
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Locate the first SSE event separator in the buffer, and return
+/// `(start_index, separator_length)`.
+///
+/// Per the SSE spec (WHATWG § Server-sent events), the field-block terminator
+/// is either `\r\n\r\n` (4 bytes), `\n\n` (2 bytes), or `\r\r` (2 bytes).
+/// axum's `Sse` currently emits `\n\n`, but any reverse proxy or TLS
+/// terminator on the path may normalise line endings — matching only `\n\n`
+/// would make the stream appear to hang indefinitely on those deployments.
+fn find_event_separator(buf: &[u8]) -> Option<(usize, usize)> {
+    // Check the 4-byte separator first so a `\r\n\r\n` is not matched as an
+    // earlier `\n\n` at offset+1.
+    if let Some(idx) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+        return Some((idx, 4));
+    }
+    if let Some(idx) = buf.windows(2).position(|w| w == b"\n\n") {
+        return Some((idx, 2));
+    }
+    if let Some(idx) = buf.windows(2).position(|w| w == b"\r\r") {
+        return Some((idx, 2));
+    }
+    None
 }
 
 fn print_task_summary(t: &Task) {

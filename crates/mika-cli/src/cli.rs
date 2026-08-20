@@ -751,6 +751,19 @@ pub enum TaskCommand {
         #[arg(long = "override")]
         r#override: bool,
     },
+    /// Subscribe to mika-spirit's task-lifecycle SSE stream and print each
+    /// TaskEventFrame as it arrives (one JSON object per line).
+    ///
+    /// mika#1758 stub consumer for `GET /api/v1/dashboard/tasks/stream`.
+    /// Requires a running mika-spirit and `MIKA_INTERNAL_TOKEN` /
+    /// `MIKA_DASHBOARD_TOKEN` in the environment. Diagnostic — not part
+    /// of the customer-facing surface.
+    Stream {
+        /// Override mika-spirit base URL (defaults to $MIKA_SPIRIT_URL /
+        /// http://localhost:$MIKA_SPIRIT_PORT / http://localhost:8080).
+        #[arg(long)]
+        url: Option<String>,
+    },
 }
 
 #[derive(clap::Args)]
