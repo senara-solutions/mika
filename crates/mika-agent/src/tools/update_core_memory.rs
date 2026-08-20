@@ -8,7 +8,13 @@ use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 use crate::db::{CORE_MEMORY_SECTIONS, core_memory_section_names, default_self_model};
 
 const MAX_TOKENS_PER_BLOCK: i32 = 500;
-const MAX_CORE_MEMORY_EDITS_PER_SESSION: u32 = 3;
+// The per-session cap counts UPDATES to already-customized blocks. First-writes
+// (writes that promote a block from its default value to a customized value) are
+// exempt from this cap AND do not increment `core_memory_edit_count` — bootstrap
+// work should always be allowed, even when it spans multiple sessions. Raised from
+// 3 to 5 (matches block count and the reflection cap) so a steady-state session
+// with genuine multi-block refinements is not truncated. See mika#1782.
+const MAX_CORE_MEMORY_EDITS_PER_SESSION: u32 = 5;
 const MAX_CORE_MEMORY_EDITS_REFLECTION: u32 = 5;
 
 pub struct UpdateCoreMemoryTool;
@@ -27,6 +33,9 @@ impl Tool for UpdateCoreMemoryTool {
             description: format!(
                 "Update your persistent core memory blocks. Core memory is always visible in your system prompt. \
                 You have {} blocks: {section_list}. Each block is limited to ~500 tokens. \
+                Rate limit: up to {MAX_CORE_MEMORY_EDITS_PER_SESSION} updates per session, plus one \
+                'first-write' per block that is still at its default value (bootstrap writes are exempt \
+                from the cap). \
                 All three parameters 'section', 'action', and 'reasoning' are REQUIRED. \
                 The 'content' parameter is also required unless action is 'reset'.",
                 section_names.len()
@@ -142,22 +151,33 @@ impl Tool for UpdateCoreMemoryTool {
             )));
         }
 
-        // Rate limit check (onboarding sessions are exempt)
+        // Get existing value (for before snapshot, action logic, and first-write detection).
+        // Fetched BEFORE the rate-limit check because first-write status gates the cap
+        // (writes that promote a default block to a customized value are exempt — mika#1782).
+        let existing = ctx.db.get_core_memory(section).await?;
+        let before_value = existing.as_ref().map(|e| e.value.as_str());
+
+        // First-write detection: a write is a "first-write" when the block is currently
+        // absent OR still holds its canonical default value. First-writes are bootstrap-shape
+        // work — they should always be allowed regardless of the per-session cap, and they
+        // do not consume the update budget. Non-first-writes (updates to already-customized
+        // blocks) are what the cap is protecting against (runaway churn on a long chat).
+        let is_first_write = is_write_from_default(ctx, section, before_value).await;
+
+        // Rate limit check (onboarding sessions and first-writes are exempt)
         let max_edits = if ctx.is_reflection {
             MAX_CORE_MEMORY_EDITS_REFLECTION
         } else {
             MAX_CORE_MEMORY_EDITS_PER_SESSION
         };
         let current_edits = ctx.core_memory_edit_count.load(Ordering::Relaxed);
-        if current_edits >= max_edits && !ctx.is_onboarding {
+        if current_edits >= max_edits && !ctx.is_onboarding && !is_first_write {
             return Ok(ToolOutput::error(format!(
-                "Core memory edit limit ({max_edits}) reached for this session. Focus on using your existing knowledge."
+                "Core memory edit limit ({max_edits}) reached for this session. \
+                You can still write to blocks that are at their default value \
+                (first-writes are exempt from the cap)."
             )));
         }
-
-        // Get existing value (for before snapshot and action logic)
-        let existing = ctx.db.get_core_memory(section).await?;
-        let before_value = existing.as_ref().map(|e| e.value.as_str());
 
         // Compute new value based on action
         let new_value = match action {
@@ -194,19 +214,7 @@ impl Tool for UpdateCoreMemoryTool {
 
                 lines.join("\n")
             }
-            "reset" => {
-                let static_default = CORE_MEMORY_SECTIONS
-                    .iter()
-                    .find(|(k, _)| *k == section)
-                    .map(|(_, v)| *v)
-                    .expect("section already validated above");
-                if section == "self_model" {
-                    let display_name = ctx.db.get_agent_display_name().await;
-                    default_self_model(&display_name)
-                } else {
-                    static_default.to_string()
-                }
-            }
+            "reset" => resolve_default_for_section(ctx, section).await,
             _ => unreachable!(), // Already validated above
         };
 
@@ -240,12 +248,69 @@ impl Tool for UpdateCoreMemoryTool {
             )
             .await?;
 
-        // Increment edit counter
-        ctx.core_memory_edit_count.fetch_add(1, Ordering::Relaxed);
+        // Increment edit counter — only for updates (writes to already-customized blocks).
+        // First-writes (block was at its default value) don't consume the per-session budget:
+        // bootstrap must be able to complete even across multiple sessions. See mika#1782.
+        if !is_first_write {
+            ctx.core_memory_edit_count.fetch_add(1, Ordering::Relaxed);
+        }
 
         Ok(ToolOutput::success(format!(
             "Updated core memory '{section}' ({action}). Block size: ~{new_tokens}/{MAX_TOKENS_PER_BLOCK} tokens."
         )))
+    }
+}
+
+/// Single source of truth for the canonical default value of a core-memory section.
+/// `self_model` is per-agent (formatted with the agent display name via
+/// `default_self_model`); all other sections read from the static `CORE_MEMORY_SECTIONS`
+/// array. Used by BOTH the `reset` action (writes the returned string) AND the
+/// first-write detector below (compares before-value against the returned string) so
+/// the two sites cannot drift.
+///
+/// Returns `None` only for section names not in `CORE_MEMORY_SECTIONS`. Upstream
+/// validation rejects that path in production code; the `Option` shape lets the
+/// first-write detector fall back safely (see `is_write_from_default`).
+async fn resolve_default_for_section_checked(
+    ctx: &ToolContext<'_>,
+    section: &str,
+) -> Option<String> {
+    if section == "self_model" {
+        let display_name = ctx.db.get_agent_display_name().await;
+        return Some(default_self_model(&display_name));
+    }
+    CORE_MEMORY_SECTIONS
+        .iter()
+        .find(|(k, _)| *k == section)
+        .map(|(_, v)| (*v).to_string())
+}
+
+/// Variant that panics on unknown section — used by the `reset` action where the
+/// section has already been validated upstream.
+async fn resolve_default_for_section(ctx: &ToolContext<'_>, section: &str) -> String {
+    resolve_default_for_section_checked(ctx, section)
+        .await
+        .expect("section already validated above")
+}
+
+/// Determine whether a pending write is a "first-write" — i.e., the target block is
+/// currently absent OR still holds its canonical default value. First-writes are exempt
+/// from the per-session cap AND do not consume the update budget (mika#1782).
+async fn is_write_from_default(
+    ctx: &ToolContext<'_>,
+    section: &str,
+    before_value: Option<&str>,
+) -> bool {
+    let Some(current) = before_value else {
+        // Block absent in DB → definitionally a first-write.
+        return true;
+    };
+
+    match resolve_default_for_section_checked(ctx, section).await {
+        Some(default) => current == default,
+        // Unknown section — validation upstream rejects this path, but be conservative:
+        // treat as non-first-write so the cap still applies.
+        None => false,
     }
 }
 
@@ -417,13 +482,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limit_triggers() {
+        // Post-mika#1782 semantics:
+        // - First-write to a block (before_value == default) is exempt from the cap AND
+        //   does not increment the edit counter.
+        // - Updates (before_value != default) count against the cap
+        //   (MAX_CORE_MEMORY_EDITS_PER_SESSION = 5).
+        //
+        // So for a single block: 1 first-write (exempt) + 5 updates all succeed, and the
+        // 6th write (which would be the 5th update) fires the cap.
         let harness = TestHarness::new();
         harness.db.seed_core_memory(None).await.unwrap();
         let ctx = harness.ctx();
         let tool = UpdateCoreMemoryTool;
 
-        // Make 3 successful edits
-        for i in 0..3 {
+        // 1 first-write + 5 updates = 6 successful writes.
+        for i in 0..6 {
             let result = tool
                 .execute(
                     make_input("self_model", "replace", &format!("Edit {i}"), "Testing"),
@@ -431,19 +504,34 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert!(!result.is_error, "Edit {i} should succeed");
+            assert!(
+                !result.is_error,
+                "Edit {i} should succeed (1 first-write + 5 updates within cap). Got: {}",
+                result.content
+            );
         }
 
-        // 4th edit should be rate limited
+        // 7th write is the 6th update; cap fires (5 updates max per session).
         let result = tool
             .execute(
-                make_input("self_model", "replace", "Edit 3", "One more"),
+                make_input("self_model", "replace", "Edit 6", "One more"),
                 &ctx,
             )
             .await
             .unwrap();
-        assert!(result.is_error);
+        assert!(
+            result.is_error,
+            "6th update should be rate limited. Got: {}",
+            result.content
+        );
         assert!(result.content.contains("edit limit"));
+        // The corrective error message must name the first-write escape hatch so the
+        // model can steer toward writing to still-default blocks.
+        assert!(
+            result.content.contains("default value"),
+            "cap-hit message should mention the first-write exemption. Got: {}",
+            result.content
+        );
     }
 
     #[tokio::test]
@@ -575,6 +663,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_reflection_edit_cap_is_five() {
+        // Post-mika#1782 semantics for reflection mode:
+        // - Reflection cap = MAX_CORE_MEMORY_EDITS_REFLECTION = 5 updates per session.
+        // - First-write to a default block is still exempt from the cap (same rule
+        //   as conversation mode) and does not increment the counter.
+        // - For a single block targeted repeatedly: 1 first-write (exempt) + 5 updates
+        //   succeed; the 7th write (6th update) fires the cap.
         let harness = TestHarness::new();
         harness.db.seed_core_memory(None).await.unwrap();
         let ctx = harness.ctx_with_reflection();
@@ -590,16 +684,32 @@ mod tests {
             })
         };
 
-        // Make 5 successful edits
-        for i in 0..5 {
+        // 1 first-write + 5 updates = 6 successful writes.
+        for i in 0..6 {
             let result = tool.execute(make_reflection_input(i), &ctx).await.unwrap();
-            assert!(!result.is_error, "Reflection edit {i} should succeed");
+            assert!(
+                !result.is_error,
+                "Reflection edit {i} should succeed (1 first-write + 5 updates within cap). Got: {}",
+                result.content
+            );
         }
 
-        // 6th edit should be rate limited
-        let result = tool.execute(make_reflection_input(5), &ctx).await.unwrap();
-        assert!(result.is_error);
+        // 7th write (6th update) fires the reflection cap.
+        let result = tool.execute(make_reflection_input(6), &ctx).await.unwrap();
+        assert!(
+            result.is_error,
+            "6th reflection update should be rate limited. Got: {}",
+            result.content
+        );
         assert!(result.content.contains("edit limit"));
+        // Reflection path shares the cap-hit error string with conversation mode; the
+        // first-write escape hatch is load-bearing in the fix design and must survive
+        // in both surfaces (mika#1782).
+        assert!(
+            result.content.contains("default value"),
+            "reflection cap-hit message should also name the first-write exemption. Got: {}",
+            result.content
+        );
     }
 
     #[tokio::test]
@@ -848,5 +958,353 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(entry.value, "No information about the user yet.");
+    }
+
+    // -- mika#1782 regression tests: first-write exemption + cap raise --
+
+    /// Reproduces the founding incident (Vincent's cloud Mika, 2026-07-17):
+    /// non-onboarding session, agent writes all 5 default core-memory blocks in one turn.
+    /// Pre-fix: 4th write fires the cap (MAX_CORE_MEMORY_EDITS_PER_SESSION = 3, and
+    /// `is_onboarding=false` because user_summary was customized in the previous
+    /// crashed session). Post-fix: all 5 first-writes succeed regardless of cap.
+    ///
+    /// Failure signal: setting `MAX_CORE_MEMORY_EDITS_PER_SESSION` back to 3 alone does
+    /// NOT re-fire this test — the first-write exemption still lets all 5 through. To
+    /// re-fire it, both changes must revert (constant + exemption).
+    #[tokio::test]
+    async fn test_bootstrap_five_blocks_from_default_succeeds() {
+        let harness = TestHarness::new();
+        harness.db.seed_core_memory(None).await.unwrap();
+        let ctx = harness.ctx(); // is_onboarding = false — the load-bearing detail
+        let tool = UpdateCoreMemoryTool;
+
+        // The five default core-memory blocks — mirrors Vincent's onboarding turn.
+        let bootstrap_writes = [
+            ("user_summary", "Vincent — the user. Speaks French."),
+            (
+                "self_model",
+                "I am Mika, Vincent's executive assistant. First contact 2026-07-17.",
+            ),
+            ("current_priorities", "Awaiting Vincent's guidance."),
+            ("key_people", "Vincent — the user. Speaks French."),
+            (
+                "workflows",
+                "Delegate-then-forget is not allowed. Any work sent to Claude Code must \
+                 have a corresponding task created first (via create_task). No exceptions.",
+            ),
+        ];
+
+        for (section, content) in &bootstrap_writes {
+            let result = tool
+                .execute(
+                    make_input(section, "replace", content, "Onboarding: seed block"),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+            assert!(
+                !result.is_error,
+                "First-write of {section} should succeed (bootstrap exemption). Got: {}",
+                result.content
+            );
+        }
+
+        // Confirm every block was actually written — the fix must not silently drop writes.
+        for (section, expected) in &bootstrap_writes {
+            let entry = harness
+                .db
+                .get_core_memory(section)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("block {section} should be present after bootstrap"));
+            assert_eq!(
+                entry.value, *expected,
+                "block {section} contents diverge from what was written"
+            );
+        }
+    }
+
+    /// After the update cap is exhausted, a subsequent write to a still-default block
+    /// should still succeed via the first-write exemption. Proves the exemption is
+    /// orthogonal to the update-cap budget.
+    #[tokio::test]
+    async fn test_first_write_exempt_after_cap_hit() {
+        let harness = TestHarness::new();
+        harness.db.seed_core_memory(None).await.unwrap();
+        let ctx = harness.ctx();
+        let tool = UpdateCoreMemoryTool;
+
+        // Burn the update cap on one block. First iteration is a first-write (exempt);
+        // remaining 5 iterations are updates. That's 5 cap-counted updates — cap now full.
+        for i in 0..6 {
+            let result = tool
+                .execute(
+                    make_input(
+                        "self_model",
+                        "replace",
+                        &format!("Iteration {i}"),
+                        "Refining",
+                    ),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+            assert!(
+                !result.is_error,
+                "iteration {i} should succeed. Got: {}",
+                result.content
+            );
+        }
+
+        // Confirm the cap is actually exhausted: another update to self_model must fail.
+        let refused = tool
+            .execute(
+                make_input("self_model", "replace", "Blocked", "Cap should fire"),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(refused.is_error, "6th update should be capped");
+        assert!(refused.content.contains("edit limit"));
+
+        // A write to workflows — still at default — must succeed via first-write exemption.
+        let first_write = tool
+            .execute(
+                make_input(
+                    "workflows",
+                    "replace",
+                    "Custom workflow instructions.",
+                    "First write to workflows",
+                ),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !first_write.is_error,
+            "first-write to still-default workflows should succeed even after cap hit. Got: {}",
+            first_write.content
+        );
+    }
+
+    /// Runaway-update protection is preserved: after 5 first-writes (which don't count),
+    /// the 6th write to an already-customized block still fires the cap after 5 updates.
+    #[tokio::test]
+    async fn test_updates_still_capped_after_bootstrap() {
+        let harness = TestHarness::new();
+        harness.db.seed_core_memory(None).await.unwrap();
+        let ctx = harness.ctx();
+        let tool = UpdateCoreMemoryTool;
+
+        // Five first-writes across the five blocks — none consume budget.
+        for (section, content) in &[
+            ("user_summary", "Vincent"),
+            ("self_model", "I am Mika. Started 2026-07-17."),
+            ("current_priorities", "Awaiting guidance"),
+            ("key_people", "Vincent"),
+            ("workflows", "Custom workflow"),
+        ] {
+            let r = tool
+                .execute(make_input(section, "replace", content, "Bootstrap"), &ctx)
+                .await
+                .unwrap();
+            assert!(!r.is_error, "bootstrap of {section} should succeed");
+        }
+
+        // Now do 5 updates (all to already-customized blocks). All should succeed
+        // because MAX_CORE_MEMORY_EDITS_PER_SESSION == 5.
+        for i in 0..5 {
+            let r = tool
+                .execute(
+                    make_input(
+                        "user_summary",
+                        "replace",
+                        &format!("Vincent — refinement {i}"),
+                        "Refining",
+                    ),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+            assert!(!r.is_error, "update #{i} should succeed within cap");
+        }
+
+        // 6th update fires the cap.
+        let capped = tool
+            .execute(
+                make_input(
+                    "user_summary",
+                    "replace",
+                    "Vincent — refinement 5",
+                    "One more",
+                ),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            capped.is_error,
+            "6th update should be capped even after bootstrap. Got: {}",
+            capped.content
+        );
+        assert!(capped.content.contains("edit limit"));
+    }
+
+    /// `reset` on a customized block counts against the cap; the re-write after reset
+    /// is a first-write (block is back at default) and is exempt. This is intentional
+    /// — the test documents the semantic so future readers don't get surprised.
+    #[tokio::test]
+    async fn test_reset_then_update_counts_as_update() {
+        let harness = TestHarness::new();
+        harness.db.seed_core_memory(None).await.unwrap();
+        let ctx = harness.ctx();
+        let tool = UpdateCoreMemoryTool;
+
+        // First-write (exempt).
+        let r = tool
+            .execute(
+                make_input("user_summary", "replace", "Vincent", "First write"),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!r.is_error);
+
+        // Reset back to default. before_value != default → is_first_write = false →
+        // counts against the cap. Counter goes to 1.
+        let r = tool
+            .execute(
+                serde_json::json!({
+                    "section": "user_summary",
+                    "action": "reset",
+                    "reasoning": "Start fresh"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!r.is_error, "reset should succeed. Got: {}", r.content);
+
+        // Now user_summary is back at default. Re-write it → treated as a first-write
+        // again (exempt from cap, does not increment counter).
+        let r = tool
+            .execute(
+                make_input("user_summary", "replace", "Vincent v2", "Second life"),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !r.is_error,
+            "re-write after reset is a first-write and should succeed. Got: {}",
+            r.content
+        );
+
+        // Counter should be at 1 (only the reset counted). We can therefore burn 4 more
+        // updates before hitting the cap of 5.
+        for i in 0..4 {
+            let r = tool
+                .execute(
+                    make_input(
+                        "user_summary",
+                        "replace",
+                        &format!("update {i}"),
+                        "Refining",
+                    ),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+            assert!(!r.is_error, "post-reset update #{i} should succeed");
+        }
+
+        // Counter is at 5 now (1 reset + 4 loop updates = 5 counted updates); this next
+        // attempt would be the 6th cap-counted operation, which fires the guard.
+        let capped = tool
+            .execute(
+                make_input("user_summary", "replace", "capped", "One more"),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            capped.is_error,
+            "6th cap-counted operation should be blocked. Got: {}",
+            capped.content
+        );
+    }
+
+    /// `self_model`'s default is formatted with the agent display name via
+    /// `default_self_model`. The first-write detector must use the same source of truth
+    /// or it will misclassify writes on agents whose display name differs from "mika".
+    #[tokio::test]
+    async fn test_first_write_detection_uses_per_agent_self_model_default() {
+        // Custom agent — display name is "operator", not "mika".
+        let harness = TestHarness::with_agent("operator");
+        harness.db.seed_core_memory(None).await.unwrap();
+        let ctx = harness.ctx();
+        let tool = UpdateCoreMemoryTool;
+
+        // The seeded self_model for "operator" should be "I am operator. No interaction
+        // history yet." — writing over it must be classified as a first-write.
+        // Verify by burning 5 non-self_model updates first (fill the cap) then writing
+        // self_model — it should still succeed via first-write exemption.
+        for i in 0..5 {
+            // Each iteration burns one cap-counted update on user_summary.
+            let payload = if i == 0 {
+                // First-write to user_summary — exempt.
+                "Custom user".to_string()
+            } else {
+                format!("Refinement {i}")
+            };
+            let r = tool
+                .execute(
+                    make_input("user_summary", "replace", &payload, "Setup"),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+            assert!(!r.is_error, "setup iteration {i} should succeed");
+        }
+        // Counter is now at 4 (i=1..=4 were updates; i=0 was first-write, exempt).
+        // Add one more update to hit exactly 5.
+        let r = tool
+            .execute(
+                make_input("user_summary", "replace", "Refinement 5", "Fill cap"),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!r.is_error);
+
+        // Cap is now at 5 (full). An update to user_summary would fail.
+        let refused = tool
+            .execute(
+                make_input("user_summary", "replace", "capped", "Should fail"),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(refused.is_error);
+
+        // But self_model is still at its per-agent default ("I am operator. …") →
+        // first-write exemption fires → succeeds.
+        let first_write = tool
+            .execute(
+                make_input(
+                    "self_model",
+                    "replace",
+                    "I am operator, tuned for calm precision.",
+                    "First-write to self_model on non-default agent",
+                ),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !first_write.is_error,
+            "first-write to self_model on custom-name agent should succeed. Got: {}",
+            first_write.content
+        );
     }
 }
