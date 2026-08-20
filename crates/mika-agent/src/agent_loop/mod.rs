@@ -698,6 +698,11 @@ async fn run_loop(
     internal: bool,
     deadline: Instant,
     scope_task_id: Option<&str>,
+    // mika#1757 — Optional broadcast context for `ToolCallStart` /
+    // `ToolCallResult` emission from `process_tool_calls`. `None` for
+    // CLI / silent / team / delegate / non-streaming A2A / gateway; `Some`
+    // for A2A `message/stream`.
+    stream_ctx: Option<&Arc<mika_a2a::streaming::ToolCallStreamContext>>,
 ) -> Result<LoopResult> {
     // Filter required_tools to only include tools that are actually available in the
     // current tool set (builtins + skill tools + MCP). See #516, #517.
@@ -1000,6 +1005,7 @@ async fn run_loop(
                         &mut suppressed_write_tools,
                         &mut send_message_text_capture,
                         mode.is_conversation(),
+                        stream_ctx,
                     )
                     .await;
                     all_tool_summaries.extend(step_summaries);
@@ -2405,6 +2411,7 @@ async fn run_loop(
                     &mut suppressed_write_tools,
                     &mut send_message_text_capture,
                     mode.is_conversation(),
+                    stream_ctx,
                 )
                 .await;
                 all_tool_summaries.extend(step_summaries);
@@ -2594,14 +2601,23 @@ pub struct AgentParams<'a> {
     /// `None` in CLI/test contexts — falls back to per-turn AtomicBool defense.
     pub pr_reviews_posted:
         Option<&'a Arc<dashmap::DashMap<String, std::collections::HashSet<String>>>>,
-    /// Optional broadcast sender for A2A SSE tool-call events (mika#1731).
-    /// When `Some`, `process_tool_calls` emits `StreamEvent::ToolCallStart` and
-    /// `StreamEvent::ToolCallResult` frames before/after each physical tool
-    /// dispatch. The A2A `handle_message_stream` handler populates this with
-    /// the per-task broadcaster it already owns; all other callers (CLI,
-    /// silent, team, delegate) pass `None`. Emission is fire-and-forget:
-    /// broadcast errors are logged at debug and never fail the tool call.
-    pub stream_tx: Option<mika_a2a::streaming::StreamEventSender>,
+    /// Optional per-turn broadcast context for A2A SSE tool-call events
+    /// (mika#1731 wire; mika#1757 emission). Bundles the sender + task_id +
+    /// optional context_id so `process_tool_calls` has one field with a
+    /// self-consistent invariant instead of three parallel `Option`s.
+    ///
+    /// When `Some`, `process_tool_calls` emits `StreamEvent::ToolCallStart`
+    /// and `StreamEvent::ToolCallResult` frames before/after each PHYSICAL
+    /// tool dispatch. The per-turn dedup replay path (mika#582) stays silent
+    /// — one Start/Result pair per real `execute_tool()` call, not per
+    /// LLM-emitted tool_use block.
+    ///
+    /// The A2A `handle_message_stream` handler populates this with the
+    /// per-task broadcaster it already owns; all other callers (CLI, silent,
+    /// team, delegate, A2A `message/send`, gateway `/message`) pass `None`.
+    /// Emission is fire-and-forget: broadcast errors are `debug!`-logged and
+    /// never fail the tool call.
+    pub stream_ctx: Option<Arc<mika_a2a::streaming::ToolCallStreamContext>>,
 }
 
 /// Run the agent loop for a single inbound message.
@@ -3159,6 +3175,7 @@ async fn run_agent_inner(
         params.internal,
         deadline,
         scope_task_id,
+        params.stream_ctx.as_ref(),
     )
     .await?;
 
@@ -4003,6 +4020,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         false, // silent mode messages are never internal
         deadline,
         scope_task_id.as_deref(),
+        None, // mika#1757: silent turns have no A2A streaming subscriber
     )
     .await?;
 
@@ -4505,6 +4523,7 @@ async fn run_team_agent_inner_impl(
         false, // team mode messages are never internal
         deadline,
         None, // team mode: no task context for parallel narrative
+        None, // mika#1757: team turns have no A2A streaming subscriber
     )
     .await?;
 

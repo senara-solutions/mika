@@ -53,6 +53,10 @@ pub struct EvalHarness {
     /// Session-scoped PR review dedup map (#821, #736).
     /// When `Some`, enables the session-scope dedup guard in the agent loop.
     pub pr_reviews_posted: Option<Arc<DashMap<String, HashSet<String>>>>,
+    /// Optional A2A streaming context (mika#1757). When `Some`, the harness
+    /// threads it into `AgentParams.stream_ctx` so `process_tool_calls`
+    /// emits `ToolCallStart` / `ToolCallResult` frames on tool dispatch.
+    pub stream_ctx: Option<Arc<mika_a2a::streaming::ToolCallStreamContext>>,
 }
 
 impl EvalHarness {
@@ -99,7 +103,7 @@ impl EvalHarness {
             correlated_task_id: None,
             internal: self.internal,
             pr_reviews_posted: self.pr_reviews_posted.as_ref(),
-            stream_tx: None,
+            stream_ctx: self.stream_ctx.clone(),
         };
 
         let output = run_agent(&params).await?;
@@ -146,7 +150,7 @@ impl EvalHarness {
             correlated_task_id: None,
             internal: self.internal,
             pr_reviews_posted: self.pr_reviews_posted.as_ref(),
-            stream_tx: None,
+            stream_ctx: self.stream_ctx.clone(),
         };
 
         let output = run_agent_with_deadline(&params, deadline).await?;
@@ -204,7 +208,7 @@ impl EvalHarness {
             correlated_task_id: None,
             internal: self.internal,
             pr_reviews_posted: self.pr_reviews_posted.as_ref(),
-            stream_tx: None,
+            stream_ctx: self.stream_ctx.clone(),
         };
 
         let output = run_agent(&params).await?;
@@ -232,6 +236,7 @@ pub struct EvalHarnessBuilder {
     github_token: Option<String>,
     mcp_manager: Option<McpManager>,
     pr_reviews_posted: Option<Arc<DashMap<String, HashSet<String>>>>,
+    stream_ctx: Option<Arc<mika_a2a::streaming::ToolCallStreamContext>>,
 }
 
 impl Default for EvalHarnessBuilder {
@@ -254,6 +259,7 @@ impl Default for EvalHarnessBuilder {
             github_token: None,
             mcp_manager: None,
             pr_reviews_posted: None,
+            stream_ctx: None,
         }
     }
 }
@@ -366,6 +372,14 @@ impl EvalHarnessBuilder {
         self
     }
 
+    /// Attach an A2A streaming context (mika#1757). When set, the harness
+    /// threads it into every `AgentParams.stream_ctx` so tool-call frames
+    /// broadcast to any subscriber of the underlying `broadcast::Sender`.
+    pub fn stream_ctx(mut self, ctx: Arc<mika_a2a::streaming::ToolCallStreamContext>) -> Self {
+        self.stream_ctx = Some(ctx);
+        self
+    }
+
     /// Build the harness, creating the in-memory DB and temp directories.
     pub async fn build(self) -> Result<EvalHarness> {
         // Create temp directory with minimal agent structure
@@ -427,6 +441,7 @@ impl EvalHarnessBuilder {
             github_token: self.github_token,
             mcp_manager: self.mcp_manager,
             pr_reviews_posted: self.pr_reviews_posted,
+            stream_ctx: self.stream_ctx,
         })
     }
 }

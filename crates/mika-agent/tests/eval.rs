@@ -69,6 +69,7 @@ mod eval {
     mod test_self_knowledge_kg;
     mod test_task_not_found_retry;
     mod test_tool_call_secret_redaction;
+    mod test_tool_call_stream_emission;
     mod test_tool_calling;
     mod test_unauthorized_webhook_dispatch_tool_boundary;
     mod test_verdict_handler;

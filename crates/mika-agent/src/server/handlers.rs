@@ -1368,7 +1368,7 @@ async fn run_agent_for_message(
         correlated_task_id: None,
         internal: false,
         pr_reviews_posted: Some(&state.pr_reviews_posted),
-        stream_tx: None,
+        stream_ctx: None,
     };
 
     match agent::run_agent(&params).await {

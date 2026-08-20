@@ -5,6 +5,7 @@
 //! image-budget accounting, and persists tool-call metadata to SQLite.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use mika_common::llm::{
     LlmContent, LlmContentBlock, LlmImage, LlmMessage, LlmRequest, LlmResponseContent, LlmRole,
@@ -39,6 +40,16 @@ pub(crate) struct ToolDispatchCtx<'a> {
 /// Execute tool-use blocks from a response and push both assistant and
 /// tool-result messages onto the request. Returns summaries of each tool call
 /// for persistence in conversation metadata.
+///
+/// `stream_ctx` (mika#1757) — when `Some`, this function emits
+/// `StreamEvent::ToolCallStart` immediately before each PHYSICAL
+/// `execute_tool()` dispatch and `StreamEvent::ToolCallResult` immediately
+/// after. The per-turn dedup replay path (cached `ToolOutput` for identical
+/// `(name, arguments)` blocks) does NOT emit — consumers see one Start +
+/// one Result per REAL dispatch, matching the `tool_calls` DB row shape.
+/// Suppressed send-message calls (intra-step boundary gate, #771) also do
+/// not emit since no `execute_tool` runs. Emission is fire-and-forget:
+/// broadcast errors are logged at `debug!` and never fail the tool call.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_tool_calls(
     response_content: Vec<LlmResponseContent>,
@@ -64,6 +75,11 @@ pub(crate) async fn process_tool_calls(
     // guard only applies in conversation mode — silent/callback modes use
     // send_message as a notification mechanism, not a user-dialog interaction.
     conversation_mode: bool,
+    // mika#1757 — Optional broadcast context for `ToolCallStart` /
+    // `ToolCallResult` emission. `None` for CLI, silent, team, delegate,
+    // A2A `message/send`, and gateway `/message`; `Some` for A2A
+    // `message/stream`. See docstring above for emission semantics.
+    stream_ctx: Option<&Arc<mika_a2a::streaming::ToolCallStreamContext>>,
 ) -> Vec<ToolCallSummary> {
     let mut tool_results: Vec<LlmContentBlock> = Vec::new();
     let mut summaries = Vec::new();
@@ -162,6 +178,16 @@ pub(crate) async fn process_tool_calls(
                     mcp_manager,
                     long_running_ctx,
                 };
+                // mika#1757 — emit ToolCallStart immediately BEFORE physical
+                // dispatch. Fire-and-forget: send errors (zero subscribers)
+                // are debug-logged and never fail the tool call. Skipped for
+                // dedup replays (this branch is the physical-dispatch path)
+                // and for suppressed send_message calls (they never enter
+                // this branch — the send-message boundary gate above uses
+                // `continue`).
+                if let Some(sc) = stream_ctx {
+                    sc.emit_start(step, name, &input_summary);
+                }
                 let tool_start = std::time::Instant::now();
                 let output = execute_tool(&dispatch, name, arguments.clone()).await;
                 let tool_latency_ms = tool_start.elapsed().as_millis() as u64;
@@ -238,6 +264,23 @@ pub(crate) async fn process_tool_calls(
                 };
                 let non_zero_exit = !output.is_error && has_non_zero_exit_prefix(&output.content);
                 let tool_succeeded = !output.is_error && !non_zero_exit;
+
+                // mika#1757 — emit ToolCallResult AFTER dispatch completes,
+                // BEFORE summary push and metadata build. Fire-and-forget:
+                // send errors (zero subscribers) are debug-logged and never
+                // fail the tool call. Carries the same-shape output_summary
+                // the summary row uses (already scrubbed + truncated above).
+                if let Some(sc) = stream_ctx {
+                    sc.emit_result(
+                        step,
+                        name,
+                        tool_succeeded,
+                        non_zero_exit,
+                        &output_summary,
+                        tool_latency_ms,
+                    );
+                }
+
                 summaries.push(ToolCallSummary {
                     step,
                     name: name.clone(),
