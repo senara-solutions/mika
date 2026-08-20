@@ -328,7 +328,7 @@ async fn spawn_agent_worker(
                         correlated_task_id: None,
                         internal: false,
                         pr_reviews_posted: None, // CLI mode: no session-scoped dedup needed
-                        stream_tx: None,         // A2A-only injection point (mika#1731)
+                        stream_ctx: None, // A2A-only injection point (mika#1731 wire, mika#1757 emission)
                     })
                     .await;
 
@@ -441,7 +441,7 @@ async fn spawn_agent_worker(
                         correlated_task_id: None,
                         internal: false,
                         pr_reviews_posted: None, // CLI mode: no session-scoped dedup needed
-                        stream_tx: None,         // A2A-only injection point (mika#1731)
+                        stream_ctx: None, // A2A-only injection point (mika#1731 wire, mika#1757 emission)
                     })
                     .await;
 
