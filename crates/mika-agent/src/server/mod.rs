@@ -1344,6 +1344,20 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     // (mika#1870). Sibling to `kg_shutdown_token`; cancelled at shutdown below.
     let webhook_queue_shutdown = CancellationToken::new();
 
+    // mika#1758: per-process task-event broadcast channel. Constructed once
+    // here (before AppState so we can hand the same handle to both AppState
+    // and every agent's AsyncDatabase). Attached to each agent's
+    // AsyncDatabase immediately below so all task-lifecycle transitions
+    // (dispatcher, engine, tools, handlers — every caller of the
+    // AsyncDatabase wrappers) fire frames on the wire.
+    let task_events_channel = Arc::new(tasks_stream::TaskEventsChannel::new());
+    for entry in agents.iter() {
+        entry
+            .value()
+            .db
+            .set_task_events_channel(task_events_channel.clone());
+    }
+
     let state = AppState {
         agents: Arc::new(agents),
         default_agent,
@@ -1372,7 +1386,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         webhook_queue_audit_last: Arc::new(dashmap::DashMap::new()),
         webhook_queue_shutdown: webhook_queue_shutdown.clone(),
         permissions_channel: Arc::new(permissions_stream::PermissionsChannel::new()),
-        task_events_channel: Arc::new(tasks_stream::TaskEventsChannel::new()),
+        task_events_channel,
     };
 
     let app = build_router(state.clone());
