@@ -163,7 +163,7 @@ Always present in the system prompt. The agent can edit these blocks via the
 
 **Constraints:**
 - Per-block limit: `MAX_TOKENS_PER_BLOCK = 500` (~2000 characters at 4 chars/token)
-- Per-session edit limit: `MAX_CORE_MEMORY_EDITS_PER_SESSION = 3` (onboarding sessions exempt)
+- Per-session edit limit: `MAX_CORE_MEMORY_EDITS_PER_SESSION = 5` updates per session (onboarding sessions exempt). **First-writes are exempt** — a write to a block currently at its default value (bootstrap-shape work) always succeeds regardless of the cap, and does not increment the counter. This lets bootstrap complete even when it spans multiple sessions (see mika#1782).
 - Actions: `replace`, `append`, `remove_line`, `reset`
 - All mutations are recorded in the `audit_events` table (with `trace_id` for correlation)
 
@@ -198,7 +198,7 @@ All 22 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 
 | Tool | Description | Category |
 |------|-------------|----------|
-| `update_core_memory` | Update persistent core memory blocks (Layer 1). Actions: replace, append, remove_line, reset. Rate limited to 3 edits/session. | Memory |
+| `update_core_memory` | Update persistent core memory blocks (Layer 1). Actions: replace, append, remove_line, reset. Rate limited to 5 updates/session; first-writes to still-default blocks are exempt (mika#1782). | Memory |
 | `store_fact` | Store a new structured fact (person, commitment, preference, or event) into Layer 2 tables. | Memory |
 | `search_memory` | Search across all Layer 2 categories (people, commitments, preferences, events). | Memory |
 | `update_fact` | Update an existing Layer 2 fact (e.g., change commitment status, update person notes). | Memory |
