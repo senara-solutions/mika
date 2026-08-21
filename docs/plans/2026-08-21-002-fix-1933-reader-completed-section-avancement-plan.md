@@ -174,11 +174,25 @@ $ cargo test -p mika-agent milestone_manager::reader::injection_tests
 
 ## 7. Injection-verified evidence
 
-Captured pre-commit (block will be pasted verbatim into PR description on ship):
+Captured pre-commit — sed-injected `"--state open"` into the issue-list call in `crates/mika-agent/src/milestone_manager/reader.rs`, ran the arg-capture guard, restored, ran again:
 
 ```
-[to be populated during implementation — the four gh-arg-capture tests fail with `--state open`, pass with `--state all`]
+# Injection (regression re-added):
+$ cargo test -p mika-agent milestone_manager::reader::injection_tests
+test milestone_manager::reader::injection_tests::reader_pr_list_uses_state_all_and_limit_100 ... ok
+test milestone_manager::reader::injection_tests::reader_issue_list_uses_state_all_and_limit_100 ... FAILED
+  panicked: expected adjacent pair (`--state`, `all`) in call args, got: [
+    "issue", "list", "--repo", "senara-solutions/mika",
+    "--milestone", "31", "--state", "open", "--json", …, "--limit", "100"]
+
+# Restore (regression removed):
+$ cargo test -p mika-agent milestone_manager::reader::injection_tests
+test milestone_manager::reader::injection_tests::reader_issue_list_uses_state_all_and_limit_100 ... ok
+test milestone_manager::reader::injection_tests::reader_pr_list_uses_state_all_and_limit_100 ... ok
+test result: ok. 2 passed; 0 failed
 ```
+
+AC6 satisfied: a regression that re-defaults the Reader to `--state open` (the ticket body's original hypothesis and the pre-PR#1932 state) is caught by the `RecordingGhRunner`-based test at the arg-list contract boundary.
 
 ## 8. Grounding footnotes
 
