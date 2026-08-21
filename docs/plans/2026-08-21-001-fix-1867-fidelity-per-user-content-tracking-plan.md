@@ -31,7 +31,7 @@ Source: Al (testeur Vietnam) via Telegram 2026-07-28. This is a P1 Couche Confia
 | RC-C | Under-constrained content requests ("un proverbe zen") collapse toward the LLM's strong prior on canonical zen quotes | Empirical LLM-behavior hypothesis; not verifiable via `grep`. Body itself declares this **hors-scope** (§ "Sous-défauts hors-scope") and defers to a follow-up if RC-C remains visible after the structural fix | **UNKNOWN by design** — hypothesis, out of scope this ticket |
 | RC-D | `prompt.rs` mentions "conversation history > search results" and "check conversation history and search_memory" as guides, but no content-serve dedup discipline | `prompt.rs:735` "conversation history > search results"; `prompt.rs:829` "Before asking a clarifying question, check conversation history and search_memory"; grep for `proverb`, `joke`, `content-request`, `content_request`, `search_content_signature`, `dedup` in `prompt.rs` → zero hits | **MATCHES** |
 
-Schema-version footnote: the body sketches a v39-scoped migration; current live schema is **v44** (see mika/CLAUDE.md § Schema Version). The plan's migration will apply at the next available version (v45) — the body's DDL shape is unchanged; only the version number binds later.
+Schema-version footnote: the body sketches a v39-scoped migration; current live schema is **v45** (see `crates/mika-agent/src/db.rs::CURRENT_SCHEMA_VERSION`, advanced from v44 in mika#1865). The plan's migration binds at the next available version (**v46**) — the body's DDL shape is unchanged; only the version number binds later. Rebase-aware: if HEAD advances again before this PR lands, the migration re-targets `HEAD+1`.
 
 ## Design shape (from body, ratified)
 
@@ -41,7 +41,7 @@ The plan adopts the body's design **as-is** (schema DDL, tool signatures, 8 AC b
 
 ## Assumptions (surface for architect if any of these are wrong)
 
-- **A1 — Category enum is stable at 7 values.** The body's `category CHECK` list — `proverb, quote, joke, poem, recommendation, story, fact` — is the initial taxonomy. Rare-category emergence (e.g., `riddle`) is a schema-migration follow-up, not a design escape hatch. Bind at v45.
+- **A1 — Category enum is stable at 7 values.** The body's `category CHECK` list — `proverb, quote, joke, poem, recommendation, story, fact` — is the initial taxonomy. Rare-category emergence (e.g., `riddle`) is a schema-migration follow-up, not a design escape hatch. Bind at v46.
 - **A2 — Tool inputs take `person_id: INTEGER`, not `person_name`.** (Revised per architect F2 first-pass ITERATE.) `record_served_content` and `check_already_served` require `person_id` and reject if the caller passes only a name — the orchestration layer at callsite already has `person_id` from the active session/person resolution. No fuzzy-name matching, no first-by-id guess, no WARN + heuristic. The old proposal (WARN + first-by-id + follow-up) silently mis-attributed 50% of the time in a multi-`Al` scenario; architect KISS-cited the reject-and-force-caller-pass path.
 - **A3 — Content-request classification stays skill-side + prompt-side, not a Rust regex.** The body notes "structural gate (pas prompt-only)" per `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`. The **structural** gate here is the ledger itself + the retry-with-avoid loop (AC5); the classifier layer is the prompt/skill instruction telling the LLM to invoke `check_already_served` before generating on content-request classes. Rust-side content classification would require an LLM-shaped classifier we do not currently have — deferring adds fragility and is not what makes the fix structural.
 - **A4 — Simple content hash sufficient for v1.** SHA-256 over `content_text.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")` (whitespace + case normalization; punctuation preserved for a fair first cut). AC6's fuzzy embedding signature is a **deferred follow-up** if AC7's post-deploy verify demonstrates hash-only insufficient.
@@ -53,13 +53,13 @@ The plan adopts the body's design **as-is** (schema DDL, tool signatures, 8 AC b
 
 ### Phase 1 — Schema migration (AC1)
 
-**Files.** `crates/mika-agent/src/db.rs` (v45 migration + `CREATE TABLE served_content`), `crates/mika-agent/src/db/kg_schema.rs` (pattern reference for shared-corpus migrations — not a target here; served_content is per-agent).
+**Files.** `crates/mika-agent/src/db.rs` (v46 migration + `CREATE TABLE served_content`), `crates/mika-agent/src/db/kg_schema.rs` (pattern reference for shared-corpus migrations — not a target here; served_content is per-agent).
 
 **Steps.**
-1. Add `SCHEMA_VERSION = 45` const bump in `db.rs`.
-2. Add v44→v45 migration branch in `apply_migrations()`. Body-provided DDL, applied verbatim (agent_id + person_id foreign keys, category CHECK enum, content_hash for exact-match dedup, optional content_signature for future fuzzy dedup, served_at ISO 8601 default, session_id soft link). Add SQL comment on `content_signature TEXT` column per architect F5: `-- Reserved for v2 fuzzy dedup (embedding cosine similarity per AC6). Format TBD — likely 384-dim float array as BLOB or hex string.`
+1. Add `CURRENT_SCHEMA_VERSION = 46` const bump in `db.rs` (from v45 baseline post-mika#1865).
+2. Add v45→v46 migration branch in `apply_migrations()`. Body-provided DDL, applied verbatim (agent_id + person_id foreign keys, category CHECK enum, content_hash for exact-match dedup, optional content_signature for future fuzzy dedup, served_at ISO 8601 default, session_id soft link). Add SQL comment on `content_signature TEXT` column per architect F5: `-- Reserved for v2 fuzzy dedup (embedding cosine similarity per AC6). Format TBD — likely 384-dim float array as BLOB or hex string.`
 3. Add both body-specified indexes: `idx_served_content_person_cat(agent_id, person_id, category, served_at DESC)` for AC3 query patterns, `idx_served_content_hash(agent_id, person_id, content_hash)` for AC2 idempotency + AC5 exact-match retry.
-4. Update mika-agent CLAUDE.md § Schema Version with the v44→v45 entry (backward-compat: read returns empty for rows pre-migration, consistent with "agent that has never served anything = no dedup, safe direction" per AC1).
+4. Update mika/CLAUDE.md § Database with the v45→v46 entry (backward-compat: read returns empty for rows pre-migration, consistent with "agent that has never served anything = no dedup, safe direction" per AC1). Rebase-aware: if `CURRENT_SCHEMA_VERSION` is not 45 at implementation time, target `HEAD+1` instead.
 
 **AC covered.** AC1 — Schéma `served_content` (migration DB).
 
@@ -144,21 +144,21 @@ The plan adopts the body's design **as-is** (schema DDL, tool signatures, 8 AC b
 
 **AC covered.** AC8 — Post-deploy verify (via synthetic reproduction).
 
-## Acceptance Criteria (verbatim from ticket body — preserved per feedback_interactive_mika_plan_needs_ac_section_no_rename)
+## Acceptance criteria (verbatim from ticket body — preserved per feedback_interactive_mika_plan_needs_ac_section_no_rename)
 
-- **AC1** — Schéma `served_content` (migration DB). Migration additive avec les colonnes + index ci-dessus. Backward compat : lecture retourne empty pour rows pré-migration.
-- **AC2** — Tool `record_served_content(person, category, content, [signature])`. Nouveau tool exposé à Mika, appelé AVANT d'émettre la réponse. Persistence idempotente : (agent_id, person_id, content_hash) UNIQUE ; on log si duplicate détecté au write.
-- **AC3** — Tool `check_already_served(person, category, [content_hash])`. Query : retourne les `served_at` timestamps + snippets pour tout content déjà servi à cette personne dans la catégorie. Utilisé PRE-génération par le prompt/skill orchestrator.
-- **AC4** — Content-request classifier (skill or prompt-layer detection). Detect si la requête utilisateur est content-request. Si oui → obligatoire de check `check_already_served` avant génération. Structural gate (pas prompt-only per `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`).
-- **AC5** — Retry-with-avoid loop. Si le contenu généré matche déjà-servi → retry génération avec instruction explicite. Max 3 retries. Si 3× échec → surface fallback ("Je n'ai plus de proverbes zen frais pour toi aujourd'hui — veux-tu que je te propose une autre tradition ?").
-- **AC6** — Fuzzy dedup (optional, follow-up si simple hash insuffisant). Embedding-based signature (content_signature). Match cosine similarity > 0.90 = déjà-servi. Deferred si simple hash suffit pour le vécu Al.
-- **AC7** — Tests. Unit : hash normalization ; Unit : check_already_served retourne items dans la fenêtre ; Integration : simulate 2 conversations 6 jours apart, verify 2e génération diverge.
-- **AC8** — Post-deploy verify (via Al ou synthetic test). Reproduire le scénario Al : "un proverbe zen" 2 fois avec 6 jours d'écart. Attendu : 2e réponse différente.
+- [ ] **AC1** — Schéma `served_content` (migration DB). Migration additive avec les colonnes + index ci-dessus. Backward compat : lecture retourne empty pour rows pré-migration.
+- [ ] **AC2** — Tool `record_served_content(person, category, content, [signature])`. Nouveau tool exposé à Mika, appelé AVANT d'émettre la réponse. Persistence idempotente : (agent_id, person_id, content_hash) UNIQUE ; on log si duplicate détecté au write.
+- [ ] **AC3** — Tool `check_already_served(person, category, [content_hash])`. Query : retourne les `served_at` timestamps + snippets pour tout content déjà servi à cette personne dans la catégorie. Utilisé PRE-génération par le prompt/skill orchestrator.
+- [ ] **AC4** — Content-request classifier (skill or prompt-layer detection). Detect si la requête utilisateur est content-request. Si oui → obligatoire de check `check_already_served` avant génération. Structural gate (pas prompt-only per `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`).
+- [ ] **AC5** — Retry-with-avoid loop. Si le contenu généré matche déjà-servi → retry génération avec instruction explicite. Max 3 retries. Si 3× échec → surface fallback ("Je n'ai plus de proverbes zen frais pour toi aujourd'hui — veux-tu que je te propose une autre tradition ?").
+- [ ] **AC6** — Fuzzy dedup (optional, follow-up si simple hash insuffisant). Embedding-based signature (content_signature). Match cosine similarity > 0.90 = déjà-servi. Deferred si simple hash suffit pour le vécu Al. **[DEFERRED — v1 ships with `content_signature TEXT NULL` column reserved; follow-up filed if AC8 signal warrants.]**
+- [ ] **AC7** — Tests. Unit : hash normalization ; Unit : check_already_served retourne items dans la fenêtre ; Integration : simulate 2 conversations 6 jours apart, verify 2e génération diverge.
+- [ ] **AC8** — Post-deploy verify (via Al ou synthetic test). Reproduire le scénario Al : "un proverbe zen" 2 fois avec 6 jours d'écart. Attendu : 2e réponse différente.
 
-## Acceptance Criteria — additions from architect first-pass review (2026-08-21)
+## Acceptance criteria — additions from architect first-pass review (2026-08-21)
 
-- **AC9 — Ledger retention: unbounded in v1 with a documented growth ceiling.** (Added per architect F1 first-pass ITERATE.) `served_content` rows are never auto-purged in v1. The growth ceiling is bounded by write-cadence: at most one row per (agent × person × distinct-content) per turn. Documented growth expectation: for a heavy personal agent (5-10 serves/active-day, 365 days, ~10 people), ≈ 2-4K rows/year ≈ 200-400 KB/year — under the noise floor of the existing DB. **Follow-up trigger:** if any customer surface demonstrates >10K rows/month/agent, file a retention/purge policy follow-up. Documented in Phase 8 § follow-up matrix.
-- **AC10 — Observability: WARN log on duplicate writes, no audit_events emission.** (Added per architect F6 first-pass ITERATE.) `record_served_content` emits a `warn!` line on `RecordOutcome::Duplicate` (grepable event `served_content.duplicate_write`, fields `agent_id`, `person_id`, `category`) and does NOT write to the `audit_events` table. Rationale: high-volume low-signal writes flood audit_events and create noise; the WARN log is sufficient for post-deploy verification (AC8) and post-incident debugging.
+- [ ] **AC9** — Ledger retention: unbounded in v1 with a documented growth ceiling. (Added per architect F1 first-pass ITERATE.) `served_content` rows are never auto-purged in v1. The growth ceiling is bounded by write-cadence: at most one row per (agent × person × distinct-content) per turn. Documented growth expectation: for a heavy personal agent (5-10 serves/active-day, 365 days, ~10 people), ≈ 2-4K rows/year ≈ 200-400 KB/year — under the noise floor of the existing DB. **Follow-up trigger:** if any customer surface demonstrates >10K rows/month/agent, file a retention/purge policy follow-up. Documented in Phase 8 § follow-up matrix.
+- [ ] **AC10** — Observability: WARN log on duplicate writes, no audit_events emission. (Added per architect F6 first-pass ITERATE.) `record_served_content` emits a `warn!` line on `RecordOutcome::Duplicate` (grepable event `served_content.duplicate_write`, fields `agent_id`, `person_id`, `category`) and does NOT write to the `audit_events` table. Rationale: high-volume low-signal writes flood audit_events and create noise; the WARN log is sufficient for post-deploy verification (AC8) and post-incident debugging.
 
 ## Out of scope (from body + architect first-pass, ratified — do NOT bundle)
 
