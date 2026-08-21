@@ -934,6 +934,70 @@ mod tests {
     }
 
     #[test]
+    fn test_content_request_fidelity_bilingual_fr_en_keywords() {
+        // mika#1867 — content-request-fidelity skill must trigger on both
+        // French and English bare-noun content requests. Al (founding
+        // incident) is francophone; the FR set is first-class, not an
+        // afterthought.
+        let skills = vec![make_entry(
+            "content-request-fidelity",
+            &[
+                "proverbe",
+                "proverb",
+                "citation",
+                "quote",
+                "joke",
+                "blague",
+                "poème",
+                "poem",
+                "histoire",
+                "story",
+                "recommandation",
+                "recommendation",
+                "fait",
+                "fact",
+                "story about",
+                "joke about",
+                "quote from",
+                "quote about",
+                "proverb about",
+                "proverbe sur",
+                "blague sur",
+                "citation de",
+                "recommande-moi",
+                "recommend me",
+                "raconte-moi",
+            ],
+            false,
+        )];
+
+        // FR bare noun
+        let matched = match_skills(&skills, "donne-moi un proverbe zen");
+        assert_eq!(matched.len(), 1, "FR bare noun 'proverbe' should trigger");
+        assert_eq!(matched[0].reason, MatchReason::Keyword);
+
+        // EN bare noun
+        let matched = match_skills(&skills, "tell me a proverb");
+        assert_eq!(matched.len(), 1, "EN bare noun 'proverb' should trigger");
+
+        // FR bare noun 'blague'
+        let matched = match_skills(&skills, "raconte-moi une blague");
+        assert_eq!(matched.len(), 1, "FR bare noun 'blague' should trigger");
+
+        // EN partial phrase 'story about'
+        let matched = match_skills(&skills, "tell me a story about the ocean");
+        assert_eq!(
+            matched.len(),
+            1,
+            "EN partial phrase 'story about' should trigger"
+        );
+
+        // Non-matching prose should not trigger
+        let matched = match_skills(&skills, "what's the weather like");
+        assert!(matched.is_empty());
+    }
+
+    #[test]
     fn test_word_boundary_empty_keyword_string_is_skipped() {
         // An empty string inside the keyword list must not create an
         // alternation entry that matches every message. This is a

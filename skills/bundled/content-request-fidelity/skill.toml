@@ -1,0 +1,37 @@
+[skill]
+name = "content-request-fidelity"
+version = "0.1.0"
+description = "Prevent re-serving the same content (proverb, quote, joke, poem, story, recommendation, fact) to the same person. Structural gate via check_already_served + record_served_content ledger. Bilingual FR/EN triggers."
+always_on = false
+
+[triggers]
+keywords = [
+    "proverbe",
+    "proverb",
+    "citation",
+    "quote",
+    "joke",
+    "blague",
+    "poème",
+    "poem",
+    "histoire",
+    "story",
+    "recommandation",
+    "recommendation",
+    "fait",
+    "fact",
+    "story about",
+    "joke about",
+    "quote from",
+    "quote about",
+    "proverb about",
+    "proverbe sur",
+    "blague sur",
+    "citation de",
+    "recommande-moi",
+    "recommend me",
+    "raconte-moi",
+]
+
+[constraints]
+required_tools = ["check_already_served"]
