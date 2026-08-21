@@ -544,6 +544,68 @@ mod tests {
     }
 
     #[test]
+    fn assess_pipeline_silence_alerts_unaffected_by_closed_count_mika_1933() {
+        // mika#1933 AC4 layer-2 coverage (paired with `silence_threshold_unaffected_by_closed_count_mika_1933`):
+        // pin the invariance property at the FULL PIPELINE layer (`Assessor::assess`),
+        // not just the internal `detect_silence` helper.
+        //
+        // The layer-1 test proves `detect_silence` reads only `last_activity_at`;
+        // this test proves the invariance survives composition with the other three
+        // rules (`detect_stale_blockers`, `detect_silent_progress`, severity/next-action)
+        // as they compose into `Assessor::assess`. A future regression that made ANY
+        // pipeline layer key its output on the closed-vs-open sub-issue mix (e.g., a
+        // change to `classify_severity` that penalized high closed count, or a
+        // `detect_silent_progress` that reversed on state) would slip past the
+        // layer-1 assertion but be caught here.
+        //
+        // Guard is scoped to the `Silence` alert kind (AC4's target) —
+        // `detect_stale_blockers` and `detect_silent_progress` legitimately DO
+        // depend on state, so a full `assessment` equality check would be wrong.
+        let now = Utc.with_ymd_and_hms(2026, 8, 20, 0, 0, 0).unwrap();
+        let clock: Box<dyn Fn() -> DateTime<Utc> + Send + Sync> = Box::new(move || now);
+        let assessor = Assessor::with_clock(AssessorConfig::default(), clock);
+
+        // Fixture B': 3 closed + 1 open, stale milestone activity.
+        let fixture_b_prime_silences: Vec<Alert> = {
+            let mut a = base_issue(1);
+            a.state = IssueState::Closed;
+            let mut b = base_issue(2);
+            b.state = IssueState::Closed;
+            let mut c = base_issue(3);
+            c.state = IssueState::Closed;
+            let d = base_issue(4);
+            let mut state = base_state(vec![a, b, c, d]);
+            state.last_activity_at = Some("2026-08-10T00:00:00Z".into());
+            assessor
+                .assess(&state)
+                .alerts
+                .into_iter()
+                .filter(|a| a.kind == AlertKind::Silence)
+                .collect()
+        };
+        // Fixture C': 0 closed + 4 open, SAME stale timestamp.
+        let fixture_c_prime_silences: Vec<Alert> = {
+            let subs: Vec<SubIssue> = (1..=4).map(base_issue).collect();
+            let mut state = base_state(subs);
+            state.last_activity_at = Some("2026-08-10T00:00:00Z".into());
+            assessor
+                .assess(&state)
+                .alerts
+                .into_iter()
+                .filter(|a| a.kind == AlertKind::Silence)
+                .collect()
+        };
+        assert_eq!(fixture_b_prime_silences.len(), 1);
+        assert_eq!(fixture_b_prime_silences[0].kind, AlertKind::Silence);
+        assert_eq!(
+            fixture_c_prime_silences, fixture_b_prime_silences,
+            "AC4 pipeline invariance: `Assessor::assess` MUST produce the same \
+             Silence alert set regardless of closed-vs-open sub-issue mix — the \
+             invariance survives composition with the other three rules"
+        );
+    }
+
+    #[test]
     fn full_assess_end_to_end() {
         let mut open_with_blocker = base_issue(1803);
         open_with_blocker.blockers = vec![1801];

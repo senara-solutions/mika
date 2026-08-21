@@ -638,7 +638,11 @@ mod tests {
     fn compose_end_to_end_mix_closed_open_blocked_locks_avancement() {
         // mika#1933 AC2 lock-in: verify Reader denominator matches
         // GitHub's `open_issues + closed_issues` (avancement, not
-        // reste-à-faire). Mix: 1 closed + 2 open + 1 blocked → 4 total.
+        // reste-à-faire). Mix: 1 closed + 3 open (of which 1 in-flight,
+        // 1 unstarted, 1 blocked-by-open-sibling) → 4 total sub-issues.
+        // Note: blocked sub-issues are still `state=OPEN` — the "blocked"
+        // classification is layered on top of open state via the blockers
+        // list; it is not a distinct GitHub issue state.
         let milestone_json = r#"{"title": "RT-005", "description": "planning tokens", "state": "open", "created_at": "2026-08-17T00:00:00Z", "due_on": null}"#;
         let issues_json = r#"[
             {"number": 1889, "title": "RT-005 brick 4", "state": "CLOSED", "body": "> - **Plan:** docs/plans/rt5-b4.md", "labels": [{"name":"p3-nice-to-have"}], "updatedAt": "2026-08-20T00:00:00Z"},
@@ -724,6 +728,16 @@ mod gh_arg_capture_tests {
     ///
     /// The composer only needs syntactically-valid JSON to run to completion —
     /// the tests do not assert on composed state, only on the captured args.
+    ///
+    /// **Extension gap (mika#1933 maintainability F1 hoist):** the `impl GhRunner`
+    /// match arm routes by the FIRST arg (`api` / `issue` / `pr`) — matching the
+    /// three current `gh` call sites in `Reader::read_with_runner`. If a future
+    /// change adds a fourth `gh` invocation (e.g., `gh auth status`, per-issue
+    /// `gh issue view`), this recorder MUST be extended with a new match arm.
+    /// The wildcard arm returns `Err(...)` and `.expect(...)` in the tests
+    /// panics — the guard fails LOUD on an unmapped call. This docstring lives
+    /// on the struct itself (not inside the match wildcard) so it surfaces at
+    /// the most likely edit surface for the maintainer wiring the new call.
     struct RecordingGhRunner {
         calls: Arc<Mutex<Vec<Vec<String>>>>,
         milestone_json: String,
