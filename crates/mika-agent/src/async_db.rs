@@ -904,6 +904,52 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Find phantom tracking rows (`action_type='none'`, `process_id IS NULL`,
+    /// `status IN ('in_progress','blocked')`, aged past `age_seconds`) for the
+    /// scoped agent. See [`Database::find_phantom_tracking_tasks`]. mika#1712.
+    pub async fn find_phantom_tracking_tasks(
+        &self,
+        age_seconds: i64,
+    ) -> Result<Vec<crate::db::PhantomTrackingTask>> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.find_phantom_tracking_tasks(&a, age_seconds))
+            .await
+    }
+
+    /// Count `audit_events` rows for the scoped agent + `tool_name`. Wraps
+    /// [`Database::count_audit_events_by_tool_name`]. Used by mika#1712
+    /// integration tests to assert the load-bearing audit-write delta on the
+    /// phantom sweep path.
+    pub async fn count_audit_events_by_tool_name(&self, tool_name: &str) -> Result<i64> {
+        let a = self.agent_id.clone();
+        let tn = tool_name.to_owned();
+        self.with_db(move |db| db.count_audit_events_by_tool_name(&a, &tn))
+            .await
+    }
+
+    /// Fetch the `target_key` values of `audit_events` rows for the scoped
+    /// agent + `tool_name`. Wraps
+    /// [`Database::get_audit_event_target_keys_by_tool_name`]. Used by mika#1712
+    /// integration tests for row-shape assertions.
+    pub async fn get_audit_event_target_keys_by_tool_name(
+        &self,
+        tool_name: &str,
+    ) -> Result<Vec<String>> {
+        let a = self.agent_id.clone();
+        let tn = tool_name.to_owned();
+        self.with_db(move |db| db.get_audit_event_target_keys_by_tool_name(&a, &tn))
+            .await
+    }
+
+    /// Test-only wrapper for [`Database::backdate_task_updated_at`] (mika#1712).
+    /// Not for production use.
+    #[doc(hidden)]
+    pub async fn backdate_task_updated_at(&self, task_id: &str, seconds_ago: i64) -> Result<()> {
+        let t = task_id.to_owned();
+        self.with_db(move |db| db.backdate_task_updated_at(&t, seconds_ago))
+            .await
+    }
+
     /// Find completable parent self_dev tasks whose callback subtask delivered
     /// WITH a `pr_url` (success indicator) but were never transitioned by the
     /// silent agent turn (mika#1162). See

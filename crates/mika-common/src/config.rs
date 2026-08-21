@@ -942,6 +942,21 @@ pub struct Settings {
     #[serde(default)]
     pub callback_watchdog_grace_period_secs: Option<u64>,
 
+    /// Phantom NULL-PID sweep grace window in seconds (mika#1712).
+    ///
+    /// The AC3 watchdog sweep in the task engine transitions
+    /// `action_type='none'` + `process_id IS NULL` + `status IN
+    /// ('in_progress','blocked')` rows to `failed` when `updated_at` is older
+    /// than this threshold. Startup sweep (AC5) is unaffected — it always
+    /// runs at age=0 (a phantom present at boot outlived a prior process by
+    /// definition).
+    ///
+    /// Env override: `MIKA_PHANTOM_SWEEP_AGE_SECONDS`.
+    ///
+    /// Default: [`DEFAULT_PHANTOM_SWEEP_AGE_SECONDS`] (3600, one hour).
+    #[serde(default)]
+    pub phantom_sweep_age_seconds: Option<u64>,
+
     /// KG docs root — absolute path to the docs directory the lexical ingestor
     /// reads (#738). Resolution chain: `MIKA_KG_DOCS_ROOT` env > `kg_docs_root`
     /// config field > `<CWD>/docs/solutions` (container-native default).
@@ -1017,6 +1032,14 @@ pub const DEFAULT_KG_BATCH_BUDGET: u32 = 500;
 /// After detecting subprocess death, wait this long before marking the callback
 /// task `failed` — allows for in-flight callback delivery that may be in transit.
 pub const DEFAULT_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS: u64 = 120;
+
+/// Default grace window (seconds) for the phantom NULL-PID sweep (mika#1712).
+///
+/// The AC3 watchdog sweep waits this long past `updated_at` before transitioning
+/// a phantom tracking row (`action_type='none'`, `process_id IS NULL`,
+/// `status IN ('in_progress','blocked')`) to `failed`. AC5 startup sweep runs
+/// at age=0 and is unaffected by this default.
+pub const DEFAULT_PHANTOM_SWEEP_AGE_SECONDS: u64 = 3600;
 
 /// Default bounded webhook-queue max depth per agent (mika#1870).
 pub const DEFAULT_WEBHOOK_QUEUE_MAX_DEPTH: usize = 64;
@@ -1386,6 +1409,14 @@ impl Settings {
             .unwrap_or(DEFAULT_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS)
     }
 
+    /// Effective phantom NULL-PID sweep grace window in seconds (mika#1712).
+    ///
+    /// Returns the configured value or [`DEFAULT_PHANTOM_SWEEP_AGE_SECONDS`] (3600s).
+    pub fn effective_phantom_sweep_age_seconds(&self) -> u64 {
+        self.phantom_sweep_age_seconds
+            .unwrap_or(DEFAULT_PHANTOM_SWEEP_AGE_SECONDS)
+    }
+
     /// Effective bounded webhook-queue max depth (mika#1870).
     ///
     /// Returns the configured value or [`DEFAULT_WEBHOOK_QUEUE_MAX_DEPTH`] (64).
@@ -1632,6 +1663,7 @@ impl Settings {
             kg_resolution_model: None,
             kg_batch_budget: None,
             callback_watchdog_grace_period_secs: None,
+            phantom_sweep_age_seconds: None,
             kg_docs_root: None,
             kg_docs_roots: None,
             operational_partner: false,
@@ -2531,6 +2563,41 @@ mod tests {
         assert_eq!(settings.effective_callback_watchdog_grace_period_secs(), 60);
 
         unsafe { std::env::remove_var("MIKA_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS") };
+    }
+
+    // -- Phantom NULL-PID sweep grace window (mika#1712) --
+
+    #[test]
+    #[serial]
+    fn phantom_sweep_age_defaults_to_3600() {
+        clean_env();
+        unsafe { std::env::remove_var("MIKA_PHANTOM_SWEEP_AGE_SECONDS") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(settings.phantom_sweep_age_seconds, None);
+        assert_eq!(
+            settings.effective_phantom_sweep_age_seconds(),
+            DEFAULT_PHANTOM_SWEEP_AGE_SECONDS
+        );
+        assert_eq!(settings.effective_phantom_sweep_age_seconds(), 3600);
+    }
+
+    #[test]
+    #[serial]
+    fn phantom_sweep_age_env_override() {
+        clean_env();
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_PHANTOM_SWEEP_AGE_SECONDS", "7200") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(settings.phantom_sweep_age_seconds, Some(7200));
+        assert_eq!(settings.effective_phantom_sweep_age_seconds(), 7200);
+
+        unsafe { std::env::remove_var("MIKA_PHANTOM_SWEEP_AGE_SECONDS") };
     }
 
     // -- Bounded webhook queue (mika#1870) --
