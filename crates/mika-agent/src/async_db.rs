@@ -6,10 +6,10 @@ use tokio::sync::oneshot;
 
 use crate::db::{
     AgentRow, AgentWithStats, AuditEvent, BackgroundTaskCounts, Commitment, CoreMemoryEntry,
-    Database, Event, FailedSend, NewTask, Person, Preference, SearchResult, Session,
-    SessionMessage, SessionWithStats, SkillOverride, Task, TaskFilters, TaskHealthSummary,
-    TaskMessage, TaskSessionRow, TeamRow, TeamRunFilters, TeamRunRow, TeamRunSummary,
-    TeamWorkspaceEntry, TimelineFilters, TimelineRow,
+    Database, Event, FailedSend, NewTask, Person, Preference, RecordOutcome, SearchResult,
+    ServedContent, Session, SessionMessage, SessionWithStats, SkillOverride, Task, TaskFilters,
+    TaskHealthSummary, TaskMessage, TaskSessionRow, TeamRow, TeamRunFilters, TeamRunRow,
+    TeamRunSummary, TeamWorkspaceEntry, TimelineFilters, TimelineRow,
 };
 use crate::server::tasks_stream::{TaskEventFrame, TaskEventsChannel};
 
@@ -1560,6 +1560,46 @@ impl AsyncDatabase {
     pub async fn search_people(&self, query: &str) -> Result<Vec<Person>> {
         let (a, q) = (self.agent_id.clone(), query.to_owned());
         self.with_db(move |db| db.search_people(&a, &q)).await
+    }
+
+    // -- Served-content ledger (mika#1867) --
+
+    /// Record that Mika has served a piece of content to a specific person
+    /// (mika#1867). See [`Database::record_served_content`].
+    pub async fn record_served_content(
+        &self,
+        person_id: i64,
+        category: String,
+        content_text: String,
+        session_id: Option<String>,
+    ) -> Result<RecordOutcome> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| {
+            db.record_served_content(
+                &a,
+                person_id,
+                &category,
+                &content_text,
+                session_id.as_deref(),
+            )
+        })
+        .await
+    }
+
+    /// List served-content rows for `(agent_id, person_id, category)` filtered
+    /// by `since` (mika#1867). See [`Database::list_served_content`].
+    pub async fn list_served_content(
+        &self,
+        person_id: i64,
+        category: String,
+        since: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<ServedContent>> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| {
+            db.list_served_content(&a, person_id, &category, since.as_deref(), limit)
+        })
+        .await
     }
 
     // -- Commitments --
