@@ -169,11 +169,15 @@ WHERE agent_id = ?1
 ORDER BY id;
 ```
 
-**Grace period:** 60 minutes default via `Settings::phantom_sweep_age_seconds`
-(new field), env override `MIKA_PHANTOM_SWEEP_AGE_SECONDS` (default `3600`). Placed
-in `Settings` alongside `callback_watchdog_grace_period_secs` (the existing operational
-watchdog knob). Passed to SQL as the negative-offset string
-`format!("-{age_seconds} seconds")` so `strftime` computes `now - age_seconds`.
+**Grace period:** 60 minutes default via
+`Settings::effective_phantom_sweep_age_seconds()` (new accessor, env override
+`MIKA_PHANTOM_SWEEP_AGE_SECONDS`, default `3600`). Placed in `Settings` alongside
+`callback_watchdog_grace_period_secs` at `config.rs:913` (the existing operational
+watchdog knob), following the same `Option<u64>` + `effective_*()` accessor pattern.
+Read at `self.dispatcher.settings.effective_phantom_sweep_age_seconds()` in
+`sweep_null_pid_phantoms()` (mirrors `engine.rs:494-498`). Passed to SQL as the
+negative-offset string `format!("-{age_seconds} seconds")` so `strftime` computes
+`now - age_seconds`.
 
 **Rationale for making it tunable (mika-arch F3):** Some tracking tasks legitimately
 represent multi-hour or multi-day work (long-running groom tickets, multi-day
@@ -408,15 +412,20 @@ Timeout: each test bounded at 5s. Pattern: `test_tick_fires_due_task` at
 
 ### Phase 3 — watchdog extension (AC3 + AC7 tick source)
 
-- File: `crates/mika-common/src/settings.rs` (or wherever `Settings` lives —
-  `Settings` currently declares `callback_watchdog_grace_period_secs`; add
-  `phantom_sweep_age_seconds: u64` right after it, defaulted to `3600`, wired to
-  `MIKA_PHANTOM_SWEEP_AGE_SECONDS` env via the existing `config-rs` prefix). Follow
-  the same defaulting pattern the callback watchdog knob uses.
+- File: `crates/mika-common/src/config.rs`. Add
+  `pub phantom_sweep_age_seconds: Option<u64>` to the `Settings` struct right after
+  the existing `callback_watchdog_grace_period_secs: Option<u64>` at `config.rs:913`.
+  Wire the env override `MIKA_PHANTOM_SWEEP_AGE_SECONDS` via the same `config-rs`
+  prefix pattern the sibling field uses. Add
+  `pub fn effective_phantom_sweep_age_seconds(&self) -> u64 { self.phantom_sweep_age_seconds.unwrap_or(3600) }`
+  right after `effective_callback_watchdog_grace_period_secs()` at `config.rs:1318`.
+  Extend the test at `config.rs:2396-2403` to cover both the None-default and the
+  env-override path (mirrors the callback watchdog test).
 - File: `crates/mika-agent/src/task_engine/engine.rs`.
-  - Remove the hardcoded `const PHANTOM_SWEEP_AGE_SECONDS: i64 = 3600;`; read the
-    value from `self.settings.phantom_sweep_age_seconds` (accessed via
-    `TaskEngine`'s existing `Settings` handle).
+  - Read the value from `self.dispatcher.settings.effective_phantom_sweep_age_seconds()`
+    inside `sweep_null_pid_phantoms()` (matches the callback watchdog pattern at
+    `engine.rs:494-498`). No new field on `TaskEngine`; the access is per-call and
+    lifetime-scoped to the sweep pass. No hardcoded const in `engine.rs`.
   - Add method `async fn sweep_null_pid_phantoms(&self)` patterned on
     `reap_orphaned_parent_tasks` (`engine.rs:661`). Implements the per-row + per-pass
     telemetry described in §5 AC3 + AC7. SOLE-WRITER contract for `phantom_aged_out`
