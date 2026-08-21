@@ -21,7 +21,10 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// Name of the authoring tool the nudge presupposes. Kept in sync with the
-/// registration in `tools/mod.rs`.
+/// registration in `tools/mod.rs`; the `skill_manage_tool_const_matches_registry`
+/// unit test asserts membership in `crate::tools::BUILTIN_TOOL_NAMES` so a
+/// rename in either file fails the build instead of silently no-op-ing every
+/// future nudge (mika#1583 post-review finding #13).
 const SKILL_MANAGE_TOOL: &str = "skill_manage";
 
 /// Cross-turn nudge counter for a single agent (mika#1583). Lives on
@@ -80,6 +83,19 @@ pub(crate) fn apply_turn_end(
     tool_use_occurred: bool,
     enabled_tool_names: &HashSet<String>,
 ) {
+    // mika#1583 post-review defense-in-depth (F2 — reviewer #2/#6): a warm
+    // agent with `nudge_enabled = false` must NOT accumulate iters across
+    // turns. Without this early return, a Phase 1 operator flipping
+    // `nudge_enabled` from false → true on a long-running agent (e.g. mika
+    // Prime with N days uptime) would fire the nudge immediately AND the
+    // rendered block would claim "Approximately N tool-invoking turns have
+    // passed" for the wrong N — the counter is a live cross-turn quantity,
+    // not a per-session one. Short-circuit here so the counter only runs
+    // while the feature is enabled; when disabled the counter stays at
+    // its previous value, so re-enabling starts a fresh interval.
+    if !ctx.enabled {
+        return;
+    }
     if tool_use_occurred {
         ctx.state
             .iters_since_skill_nudge
@@ -118,11 +134,23 @@ pub(crate) fn inject_pending_nudge(
 }
 
 /// Render the advisory `<skill-nudge>` block injected into the next turn's system
-/// prompt. Verbatim from the issue body, with `{interval}` substituted.
+/// prompt. Semantics-preserving reword of the plan verbatim (mika#1583 post-review
+/// finding #6): "You have completed roughly {N} turns" → "Approximately {N}
+/// turns have passed". The plan/issue-body verbatim contained "completed",
+/// which is one of the tokens in the #483 completion-claim guard's regex
+/// (`\b(merged|deployed|completed?|shipped)\b` at `agent_loop/mod.rs:5557`).
+/// Priming the LLM with "completed" in the system prompt biases the assistant
+/// output to use the same word, tripping the guard's false-positive path even
+/// though the nudge is not making a completion claim. The reword removes the
+/// guard-vocabulary word without changing the advisory semantics — the block
+/// still communicates "N turns have elapsed since your last skills review."
+/// If `render_nudge_block` is ever consumed by a caller that treats it as a
+/// claim (which it is not today), reintroducing "completed" needs a paired
+/// guard update.
 pub(crate) fn render_nudge_block(interval: u32) -> String {
     format!(
         "<skill-nudge priority=\"advisory\">\n\
-You have completed roughly {interval} tool-invoking turns since the last\n\
+Approximately {interval} tool-invoking turns have passed since the last\n\
 skills review. If a recent task pattern is worth extracting into a reusable\n\
 skill, consider calling `skill_manage(action=\"create\" | \"update\" | \"inspect\")`\n\
 this turn. The skill will land `staged` and require operator promotion before\n\
@@ -226,7 +254,43 @@ mod tests {
         assert!(block.contains("skill_manage"));
         assert!(block.contains("staged"));
         assert!(block.contains("operator promotion"));
-        assert!(block.contains("roughly 10 tool-invoking turns"));
+        assert!(block.contains("Approximately 10 tool-invoking turns"));
+    }
+
+    // mika#1583 post-review finding #6 — anti-regression: the nudge block MUST
+    // NOT contain any token in the #483 completion-claim guard's regex
+    // vocabulary (`\b(merged|deployed|completed?|shipped)\b`). Priming the
+    // system prompt with those tokens biases the assistant output and trips
+    // the guard's false-positive path. If a future edit reintroduces any of
+    // these words, this test fails and forces a paired guard update.
+    #[test]
+    fn nudge_block_avoids_completion_claim_vocabulary() {
+        let block = render_nudge_block(10);
+        for token in ["merged", "deployed", "completed", "complete", "shipped"] {
+            assert!(
+                !block.contains(token),
+                "nudge block contains completion-claim guard token `{token}` — \
+                 rerender_nudge_block reintroduced #483 guard-vocabulary. \
+                 Reword to a synonym or pair with a guard change."
+            );
+        }
+    }
+
+    // mika#1583 post-review finding #13 — anti-regression: the local
+    // `SKILL_MANAGE_TOOL` const MUST stay in sync with the canonical
+    // `crate::tools::BUILTIN_TOOL_NAMES` roster. Renaming `skill_manage` in
+    // `tools/mod.rs` without updating this const would silently no-op every
+    // future nudge (the authoring_usable predicate would return false for a
+    // now-nonexistent name). This test fails at build time on any rename.
+    #[test]
+    fn skill_manage_tool_const_matches_registry() {
+        assert!(
+            crate::tools::BUILTIN_TOOL_NAMES.contains(&SKILL_MANAGE_TOOL),
+            "SKILL_MANAGE_TOOL ('{SKILL_MANAGE_TOOL}') is missing from \
+             crate::tools::BUILTIN_TOOL_NAMES. Either the const drifted from \
+             the registered name, or the tool was renamed in tools/mod.rs \
+             without a paired update here (the nudge would silently no-op)."
+        );
     }
 
     // AC4 — inject appends when pending and clears the flag after.
