@@ -7,8 +7,11 @@
 //!
 //! `person_id: i64` is required — architect F2 arbitration explicitly rejects
 //! `person_name` fallback (silent mis-attribution risk in multi-`Al` scenarios).
-//! The caller resolves `person_id` via `list_people` or by upserting via
-//! `store_fact(category="person")` and reading back the row.
+//! The caller resolves `person_id` via `search_memory(query="<name>",
+//! category="person")` or by upserting via
+//! `store_fact(category="person", key="<name>", value="<name>")` and reading
+//! back the `id` with a follow-up `search_memory`. `list_people` and
+//! `upsert_person` are private DB methods, not registered LLM tools.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -25,7 +28,7 @@ fn person_id_required_error() -> ToolOutput {
     ToolOutput::error(
         serde_json::json!({
             "error": "person_id_required",
-            "hint": "Resolve person_id via list_people or upsert_person before recording served content."
+            "hint": "Resolve person_id via search_memory(query=\"<name>\", category=\"person\") — or store_fact(category=\"person\", key=\"<name>\", value=\"<name>\") then search_memory to read back the id — before recording served content."
         })
         .to_string(),
     )
@@ -44,14 +47,15 @@ impl Tool for RecordServedContentTool {
                 "Ledger a piece of content Mika has served to a specific person, keyed by \
                  exact-match hash. Prevents re-serving the same content on future requests. \
                  Categories: proverb, quote, joke, poem, recommendation, story, fact. \
-                 Requires person_id (INTEGER) — resolve via list_people or store_fact(category=\"person\") first."
+                 Requires person_id (INTEGER) — resolve via search_memory(query=\"<name>\", category=\"person\") \
+                 or store_fact(category=\"person\", key=\"<name>\", value=\"<name>\") then re-run search_memory to read back the id."
                     .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "person_id": {
                         "type": "integer",
-                        "description": "The people.id of the person the content was served to. Resolve via list_people or upsert_person."
+                        "description": "The people.id of the person the content was served to. Resolve via search_memory(query=\"<name>\", category=\"person\") or store_fact(category=\"person\", key=\"<name>\", value=\"<name>\") + follow-up search_memory."
                     },
                     "person_name": {
                         "type": "string",
@@ -132,7 +136,7 @@ impl Tool for RecordServedContentTool {
                         serde_json::json!({
                             "error": "person_not_found",
                             "person_id": person_id,
-                            "hint": "person_id does not exist in the people table. Upsert via store_fact(category=\"person\") and re-read via list_people."
+                            "hint": "person_id does not exist in the people table. Upsert via store_fact(category=\"person\", key=\"<name>\", value=\"<name>\") and re-read via search_memory(query=\"<name>\", category=\"person\")."
                         })
                         .to_string(),
                     ));

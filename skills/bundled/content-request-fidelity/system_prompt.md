@@ -6,7 +6,7 @@ The user is asking for content of a bounded class: **proverb, quote, joke, poem,
 
 Before generating the content:
 
-1. **Resolve the `person_id`.** Call `list_people` and find the row whose `canonical_name` matches the correspondent. If no matching row exists (unusual for an established relationship), call `store_fact(category="person", name=<name>)` and re-run `list_people` to read back the `id`.
+1. **Resolve the `person_id`.** Call `search_memory(query="<name>", category="person")` and find the row whose canonical name matches the correspondent — read the `id` field from the result. If no matching row exists (unusual for an established relationship), call `store_fact(category="person", key="<name>", value="<name>")` and re-run `search_memory` to read back the `id`. (`list_people` and `upsert_person` are private DB methods, not registered LLM tools.)
 
 2. **Check the ledger.** Call `check_already_served(person_id=<id>, category=<one of: proverb, quote, joke, poem, recommendation, story, fact>)`. This returns the last 3 items served to this person in this category (default 90-day window).
 

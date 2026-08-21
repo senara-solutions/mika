@@ -29,7 +29,7 @@ fn person_id_required_error() -> ToolOutput {
     ToolOutput::error(
         serde_json::json!({
             "error": "person_id_required",
-            "hint": "Resolve person_id via list_people or upsert_person before checking served content."
+            "hint": "Resolve person_id via search_memory(query=\"<name>\", category=\"person\") — or store_fact(category=\"person\", key=\"<name>\", value=\"<name>\") then search_memory to read back the id — before checking served content."
         })
         .to_string(),
     )
@@ -61,14 +61,14 @@ impl Tool for CheckAlreadyServedTool {
                  generating content (proverb, quote, joke, poem, story, recommendation, fact) \
                  to see what has already been served. Returns the last {CHECK_LIMIT} serves with \
                  {SNIPPET_MAX_CHARS}-char snippets. Requires person_id (INTEGER) — resolve via \
-                 list_people or store_fact(category=\"person\") first."
+                 search_memory(query=\"<name>\", category=\"person\") or store_fact(category=\"person\", key=\"<name>\", value=\"<name>\") + follow-up search_memory."
             ),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "person_id": {
                         "type": "integer",
-                        "description": "The people.id of the person to query. Resolve via list_people or upsert_person."
+                        "description": "The people.id of the person to query. Resolve via search_memory(query=\"<name>\", category=\"person\") or store_fact(category=\"person\", key=\"<name>\", value=\"<name>\") + follow-up search_memory."
                     },
                     "person_name": {
                         "type": "string",
