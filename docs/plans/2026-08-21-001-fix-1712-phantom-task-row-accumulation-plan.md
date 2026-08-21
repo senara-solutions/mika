@@ -159,6 +159,37 @@ Superseded (sami bearing §1):
   telemetry replaces the audit signal AC4 was reaching for, keyed to actual anomalies
   (sweeps) rather than normal writes.
 
+## Definition of Done
+
+- Schema migration `migrate_v45_to_v46` lands with marker-only body; `CURRENT_SCHEMA_VERSION` bumped 45 → 46; `PINNED_SCHEMA_VERSION` in `tests/eval/kg_fixtures/mod.rs` bumped in lockstep.
+- `Database::find_phantom_tracking_tasks(agent_id, age_seconds)` and its `AsyncDatabase` wrapper exist with unit-test coverage for the discriminating shape (matched, wrong action_type, non-NULL PID, terminal status, age-guarded).
+- `Settings::phantom_sweep_age_seconds` + `effective_phantom_sweep_age_seconds()` accessor added alongside the callback-watchdog knob, with env override `MIKA_PHANTOM_SWEEP_AGE_SECONDS` (default 3600) and a config test covering None-default + env-override paths.
+- `TaskEngine::sweep_null_pid_phantoms()` implemented with SOLE-WRITER contract for `phantom_aged_out` audit events + per-pass `phantom_sweep_complete` info line + `phantom_sweep_large_backlog` warn at count > 100 + no silent cap.
+- `TaskEngine::startup_recovery` extended with step 2b that runs the sweep with age=0, distinguished in the `reasoning` field (`startup_sweep`) with `source="startup_sweep"` on the per-pass log.
+- New integration test `crates/mika-agent/tests/eval/test_phantom_task_row_sweep.rs` covers: age-out, no-sweep-before-grace, startup-sweep, all injection-verified via baseline-then-delta `audit_events` count assertion.
+- Injection verification recorded: sed-inject a defect that skips the audit_events write and confirm the affected tests fail; restore and confirm green.
+- `crates/mika-agent/CLAUDE.md` updated with `MIKA_PHANTOM_SWEEP_AGE_SECONDS` env-var entry, v45→v46 migration-ledger entry, and "Signal P — phantom sweep telemetry" operator subsection.
+- Full multi-agent `/ce:review` completes with all P0/P1 findings resolved and P2 findings dispositioned; injection test evidence attached to review artifact.
+- `cargo fmt`, `cargo clippy --all-targets`, and `cargo test -p mika-agent` all pass locally; `bash scripts/verify-pipeline.sh` reports green.
+- PR opened against `senara-solutions/mika` with `Closes #1712`, cross-reference to mika#1934 (cause-racine follow-up), and sami bearing citation (comment #5373564110 + verbatim shape (b) rationale) in WHY-first body.
+
+## Acceptance criteria
+
+Verbatim from issue body (mika#1712 § Acceptance criteria).
+
+### Shipped (shape (b) sweep-only per sami bearing 2026-08-21)
+
+- [ ] **AC3 — watchdog aged-out policy for null-PID.** Callback watchdog sweeps rows with `status IN ('in_progress','blocked')` + `process_id IS NULL` + `action_type='none'` + `updated_at < now - 60 minutes` → mark `failed` with reason `phantom_aged_out`. Emit `audit_events` row with `tool_name='phantom_aged_out'`.
+- [ ] **AC5 — startup sweep.** On mika-spirit startup, sweep any pre-existing phantoms (same shape as AC3, zero-age at startup) as `failed` with reason `startup_sweep`. Log count.
+- [ ] **AC6 — regression test.** Integration test asserts: (a) fresh phantom rows are NOT swept before grace window; (b) aged phantom rows ARE swept + audit event emitted; (c) startup sweep clears pre-existing phantoms with `startup_sweep` reason.
+- [ ] **AC7 — sweep telemetry (mandatory per sami bearing §3).** Each sweep pass emits `audit_events` row with `tool_name='phantom_aged_out'` per row transitioned, plus an aggregate `info!` log line per pass with fields `event="phantom_sweep_complete"`, `count=<N>`, `source="startup_sweep" | "watchdog_tick"`, `agent_id=<id>`. No silent cap on count. This telemetry is the input to the cause-racine investigation in mika#1934.
+
+### Superseded (do NOT implement — shape (a)/(c) rejected by sami bearing 2026-08-21)
+
+- [ ] **~~AC1 — refuse-to-write invariant.~~** **SUPERSEDED.** Would reject every legitimate `create_task` invocation. Not implemented.
+- [ ] **~~AC2 — hydrate-or-fail lifecycle.~~** **SUPERSEDED.** Would reject every `update_task_status(id, "in_progress")` on manual tracking rows. Not implemented.
+- [ ] **~~AC4 — audit_event on phantom-creation.~~** **SUPERSEDED.** Would fire on every `create_task` call. Replaced by AC7 sweep telemetry.
+
 ## Design decisions
 
 ### AC3 — watchdog sweep for NULL-PID phantoms
