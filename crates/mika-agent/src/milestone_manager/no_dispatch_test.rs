@@ -117,6 +117,12 @@ fn walk_and_scan(dir: &Path, out: &mut Vec<(String, String)>) {
 /// string literals containing `//` unchanged is out of scope — we only
 /// need to filter the common case of documentation prose mentioning
 /// forbidden tokens.
+///
+/// **Known limitation:** block comments (`/* … */`) are NOT stripped. A
+/// docstring block-comment that mentions a forbidden token would trip the
+/// guard falsely. This is a fail-loud gap by design (safer than silent
+/// bypass) — if a future author needs to document a forbidden token in a
+/// block comment, prefer converting it to `//`-style prose lines.
 fn strip_line_comments(source: &str) -> String {
     source
         .lines()

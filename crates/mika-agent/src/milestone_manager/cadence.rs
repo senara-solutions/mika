@@ -256,6 +256,12 @@ pub async fn run_manager_cycle_with(
                         // Fall back to offline sink so nothing is lost.
                         write_offline_sink(&cfg.offline_sink_dir, &cfg.target, &body).await?;
                         delivered = true;
+                        // A Blocked severity that falls back to the sink is
+                        // still an escalation outcome from the operator's
+                        // point of view — the report was surfaced, just via
+                        // a different route. Preserving `escalated` here
+                        // keeps outcome telemetry honest (H2 review fix).
+                        escalated = severity == Severity::Blocked;
                     }
                 }
             }
@@ -300,11 +306,14 @@ enum Route {
 }
 
 fn select_route(severity: &Severity, cfg: &ManagerConfig) -> Route {
+    // H1 review fix: Blocked severity uses ONLY the escalation URL — no
+    // fallback to `delivery_url`. The escalation route is intentionally
+    // distinct so a `Blocked` report cannot silently queue behind the
+    // normal Prime→sami→Vincent relay. When the escalation URL is unset,
+    // fall through to the offline sink so the report is captured without
+    // being routed through the wrong path.
     let url = match severity {
-        Severity::Blocked => cfg
-            .escalation_url
-            .clone()
-            .or_else(|| cfg.delivery_url.clone()),
+        Severity::Blocked => cfg.escalation_url.clone(),
         _ => cfg.delivery_url.clone(),
     };
     match url {
@@ -352,10 +361,34 @@ async fn write_offline_sink(
     Ok(())
 }
 
-/// Live-runner variant: reads from `gh`, then runs the same cycle logic.
+/// Fetch executor liveness from an optional cm-style `GET /api/v1/agents/<entity>/health`
+/// endpoint. Returns `Some(true)` on 2xx, `Some(false)` on any non-2xx, `None` when the
+/// URL is unset or the request errors out (fail-open — health signal is a hint, never a
+/// gate for the Phase 1 lecture-seule cycle).
+///
+/// M4 review fix: wire the previously-declared-but-unread `health_url` config field.
+pub async fn probe_executor_health(url: Option<&str>) -> Option<bool> {
+    let url = url?;
+    if url.is_empty() {
+        return None;
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?;
+    match client.get(url).send().await {
+        Ok(res) => Some(res.status().is_success()),
+        Err(_) => None,
+    }
+}
+
+/// Live-runner variant: reads from `gh`, probes optional health endpoint,
+/// then runs the same cycle logic.
 pub async fn run_manager_cycle(cfg: &ManagerConfig) -> Result<CycleOutcome> {
     let reader = Reader::new(cfg.github_token.clone());
-    let state = reader.read(&cfg.target).await?;
+    let mut state = reader.read(&cfg.target).await?;
+    // M4 review fix: honour the health_url config surface.
+    state.executor_healthy = probe_executor_health(cfg.health_url.as_deref()).await;
     let deliverer = HttpReportDeliverer::new();
     run_manager_cycle_with(cfg, state, &deliverer, Utc::now()).await
 }
@@ -548,6 +581,74 @@ mod tests {
         assert_eq!(calls[0].0, "http://normal/deliver");
     }
 
+    /// H1 review fix regression test: a `Blocked` severity with escalation URL
+    /// unset MUST route to the offline sink, NOT fall back to the normal
+    /// delivery URL. Escalation is intentionally distinct from normal delivery.
+    #[tokio::test]
+    async fn blocked_severity_with_no_escalation_url_falls_to_offline_sink_not_delivery_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = mk_config(tmp.path());
+        cfg.escalation_url = None;
+        // delivery_url is intentionally still set — the bug would silently
+        // route the Blocked report here.
+        let rec = RecordingDeliverer::default();
+        let t0 = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
+        let mut state = base_state();
+        state.sub_issues[0].ci_state = CiState::Failed;
+        state.sub_issues[0].pr_state = Some("open".into());
+        let outcome = run_manager_cycle_with(&cfg, state, &rec, t0).await.unwrap();
+        assert_eq!(outcome.severity, Severity::Blocked);
+        assert!(outcome.escalated, "Blocked should still count as escalated");
+        // No HTTP call — routed to offline sink.
+        assert_eq!(
+            rec.calls.lock().unwrap().len(),
+            0,
+            "Blocked with no escalation URL must NOT hit the normal delivery URL"
+        );
+        // Offline sink must have the report.
+        let mut entries = tokio::fs::read_dir(tmp.path().join("sink")).await.unwrap();
+        let mut count = 0;
+        while entries.next_entry().await.unwrap().is_some() {
+            count += 1;
+        }
+        assert!(count >= 1);
+    }
+
+    /// H2 review fix regression test: HTTP delivery failure that falls back
+    /// to the offline sink MUST still set `escalated = true` when severity
+    /// is `Blocked` — telemetry integrity.
+    #[tokio::test]
+    async fn blocked_severity_escalated_flag_preserved_across_http_failure() {
+        struct FailingDeliverer;
+        #[async_trait::async_trait]
+        impl ReportDeliverer for FailingDeliverer {
+            async fn deliver(
+                &self,
+                _url: &str,
+                _token: Option<&str>,
+                _body: &DeliveryBody,
+            ) -> Result<()> {
+                Err(anyhow::anyhow!("simulated network failure"))
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_config(tmp.path());
+        let t0 = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
+        let mut state = base_state();
+        state.sub_issues[0].ci_state = CiState::Failed;
+        state.sub_issues[0].pr_state = Some("open".into());
+        let outcome = run_manager_cycle_with(&cfg, state, &FailingDeliverer, t0)
+            .await
+            .unwrap();
+        assert_eq!(outcome.severity, Severity::Blocked);
+        assert!(
+            outcome.escalated,
+            "escalated must remain true after HTTP failure fallback (H2)"
+        );
+        assert!(outcome.delivered, "sink write should succeed");
+    }
+
     #[tokio::test]
     async fn offline_sink_when_no_urls_configured() {
         let tmp = tempfile::tempdir().unwrap();
@@ -591,6 +692,19 @@ mod tests {
             .join("checkpoints")
             .join("senara-solutions-mika-1799.json");
         assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn probe_executor_health_returns_none_on_unset_url() {
+        assert_eq!(probe_executor_health(None).await, None);
+        assert_eq!(probe_executor_health(Some("")).await, None);
+    }
+
+    #[tokio::test]
+    async fn probe_executor_health_returns_none_on_bogus_host() {
+        // Non-routable RFC 5737 address — connection fails fast, fail-open to None.
+        let res = probe_executor_health(Some("http://192.0.2.1:1/health")).await;
+        assert_eq!(res, None);
     }
 
     #[test]
