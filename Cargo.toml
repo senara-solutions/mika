@@ -146,6 +146,8 @@ dialoguer = "0.11"
 # Testing
 tempfile = "3"
 serial_test = "3"
+# HTTP mock server for wiremock-style integration tests (mika-gateway egress-search)
+wiremock = "0.6"
 
 # Concurrent collections
 dashmap = "6"
@@ -160,3 +162,16 @@ mika-os = { path = "crates/mika-os" }
 lto = true
 codegen-units = 1
 strip = true
+
+# Workspace-wide clippy lints (mika#1724 — wedge-class prevention).
+#
+# `significant_drop_in_scrutinee` is a nursery lint that catches the
+# mika#1719 bug shape: a `match lock.get(...)` scrutinee holds its RAII
+# guard across every arm, deadlocking against a same-thread writer
+# reached from inside an arm. Nursery lints require explicit opt-in.
+#
+# `await_holding_invalid_types` is warn-by-default but its trigger set is
+# empty until `await-holding-invalid-types` in `clippy.toml` names the
+# guard types. The DashMap footgun list lives there.
+[workspace.lints.clippy]
+significant_drop_in_scrutinee = "warn"

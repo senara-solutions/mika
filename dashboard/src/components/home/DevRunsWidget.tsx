@@ -2,7 +2,7 @@ import { Link } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
 import { apiFetch, type PaginatedResponse } from '../../api/client.ts'
 import type { DevRun } from '../../api/devRuns.ts'
-import { TaskStatusBadge, LoadingState, ErrorState, EmptyState, formatApiError, formatRelativeTime } from '@senara-solutions/ui'
+import { TaskStatusBadge, LoadingState, ErrorState, EmptyState, formatApiError, formatRelativeTime } from '@samidarko/ui'
 import WidgetSection from './WidgetSection.tsx'
 
 interface DevRunsWidgetProps {

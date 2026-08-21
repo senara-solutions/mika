@@ -1,6 +1,44 @@
 use crate::db::{
     Commitment, CoreMemoryEntry, Preference, TaskHealthSummary, core_memory_section_names,
 };
+
+/// Preference-key prefix used for user stop-signals (mika#1813).
+///
+/// When the user asks the agent to stop bringing up a topic, the agent persists
+/// the signal via `store_fact(category='preference', key='stop_topic_<slug>', …)`.
+/// The prefix is loaded by `search_preferences(STOP_TOPIC_PREFIX)` at both
+/// conversation and silent turn assembly and injected into the system prompt as
+/// a dedicated `<stopped-topics>` block.
+///
+/// This is the structural half of the fix — the block re-appears on every
+/// future turn even if the model forgets. The prompt discipline (persist on
+/// refusal; consult before initiating) is the intent half.
+pub const STOP_TOPIC_PREFIX: &str = "stop_topic_";
+
+/// Filter a `search_preferences` result set down to strict stop-topic rows
+/// (mika#1813).
+///
+/// `db::search_preferences(query)` runs `WHERE agent_id = ?1 AND (category LIKE
+/// '%query%' OR value LIKE '%query%')`. Two ways that under-constrains for
+/// `STOP_TOPIC_PREFIX`:
+///
+/// 1. **`_` is a SQLite LIKE wildcard.** `LIKE '%stop_topic_%'` matches any
+///    `stop_topic<X>` where `X` is any character, including an unrelated key
+///    like `stop_topicalization`.
+/// 2. **OR on `value`.** A preference whose value happens to contain
+///    `stop_topic_` as a substring (a `task_policy_*` row paraphrasing the
+///    convention, a prose preference referencing it) is surfaced as a stopped
+///    topic and would mute unrelated axes (AC4 leak).
+///
+/// The load path (`AgentContext::load_agent_context`) applies this filter so
+/// only preferences whose `category` is a strict `stop_topic_` prefix are
+/// injected into `<stopped-topics>`.
+pub fn filter_stop_topic_preferences(prefs: Vec<Preference>) -> Vec<Preference> {
+    prefs
+        .into_iter()
+        .filter(|p| p.category.starts_with(STOP_TOPIC_PREFIX))
+        .collect()
+}
 use chrono::{DateTime, NaiveTime, Utc};
 use mika_common::{agent, team};
 use serde::Deserialize;
@@ -186,6 +224,39 @@ fn validate_skills_config(skills: &SkillsIdentityConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Session config from the `[session]` block in identity.toml (mika#1401).
+///
+/// Makes an agent **single-session-by-construction**: when `singleton = true`,
+/// every conversational invocation (`mika ask`, `mika chat`, HTTP `/send`) reuses
+/// one canonical session instead of minting a fresh `Uuid::new_v4()` per ask. The
+/// invariant is enforced by the engine, not by remembering to pass `--session-id`.
+///
+/// Opt-in — absent or `singleton = false` preserves the default (random UUID per
+/// ask). Explicit `--session-id` always overrides the canonical session.
+///
+/// ```toml
+/// [session]
+/// singleton = true
+/// canonical_id = "00000000-0000-0000-0000-000000000000"  # optional
+/// ```
+///
+/// **Compaction interaction:** compaction already keys on `agent_id`, not
+/// `session_id`, so a singleton agent is unaffected — the single canonical
+/// session simply accumulates all history. See mika#1401.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct SessionIdentityConfig {
+    /// When `true`, this agent uses a single canonical session for all
+    /// conversational interactions. The session persists across invocations
+    /// and is never ended by `end_session`. Default: `false`.
+    #[serde(default)]
+    pub singleton: bool,
+    /// Explicit canonical session ID. When absent and `singleton = true`,
+    /// the engine derives one as `canonical-{agent_id}`. Exists specifically
+    /// for mika-prime's operator-chosen zero-UUID.
+    #[serde(default)]
+    pub canonical_id: Option<String>,
+}
+
 /// Tool visibility config from the `[tools]` block in identity.toml.
 ///
 /// Used by well-known agents (mika-arch, etc.) to deny specific built-in tools
@@ -315,6 +386,8 @@ pub struct Identity {
     #[serde(default)]
     pub context: ContextIdentityConfig,
     #[serde(default)]
+    pub session: SessionIdentityConfig,
+    #[serde(default)]
     pub curator: Option<CuratorConfig>,
 }
 
@@ -337,6 +410,7 @@ impl Default for Identity {
             skills: SkillsIdentityConfig::default(),
             tools: ToolsIdentityConfig::default(),
             context: ContextIdentityConfig::default(),
+            session: SessionIdentityConfig::default(),
             curator: None,
         }
     }
@@ -454,8 +528,29 @@ fn fail_closed_identity() -> Identity {
                 max_tokens: None,
             },
         },
+        session: SessionIdentityConfig::default(),
         curator: None,
     }
+}
+
+/// Resolve the canonical session ID for a singleton agent (mika#1401).
+///
+/// Returns `None` when the agent is not `singleton` — callers then mint a
+/// fresh `Uuid::new_v4()` per invocation (the default behavior). When
+/// `singleton = true`, returns the operator-chosen `canonical_id` if set,
+/// else the derived `canonical-{agent_id}` (prefix-typed sibling of
+/// `system-{agent_id}`, structurally exempt from `prune_old_sessions`).
+pub fn resolve_canonical_session_id(identity: &Identity, agent_id: &str) -> Option<String> {
+    if !identity.session.singleton {
+        return None;
+    }
+    Some(
+        identity
+            .session
+            .canonical_id
+            .clone()
+            .unwrap_or_else(|| format!("canonical-{agent_id}")),
+    )
 }
 
 /// Context needed to build the system prompt.
@@ -480,6 +575,11 @@ pub struct PromptContext<'a> {
     /// When set, this is a callback result turn. Injects a guard section telling the agent
     /// to process the results directly and not spawn new long-running tasks.
     pub callback_context: Option<&'a str>,
+    /// Active stop-signals (`stop_topic_*` preferences, mika#1813).
+    /// Loaded via `db.search_preferences(STOP_TOPIC_PREFIX)` at turn assembly.
+    /// When non-empty, rendered as a `<stopped-topics>` block so the agent sees
+    /// which subjects the user has explicitly asked not to be re-raised on.
+    pub stopped_topics: &'a [Preference],
 }
 
 fn onboarding_prompt() -> String {
@@ -603,6 +703,26 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
         prompt.push_str("\n\n");
     }
 
+    // Stop-signals (mika#1813) — the user has explicitly asked NOT to be re-nagged
+    // on these subjects. Rendered as a dedicated section so the model sees the
+    // suppression list distinctly from the general core-memory context above.
+    if !ctx.stopped_topics.is_empty() {
+        prompt.push_str("## Stopped Topics\n");
+        prompt.push_str(
+            "The user has explicitly asked you NOT to re-initiate on these topics. \
+             Do NOT proactively raise any listed subject in later turns. A direct \
+             user question about a stopped topic is not a re-opening — you may still \
+             answer it. The user re-opens a topic only by explicitly bringing it back.\n",
+        );
+        prompt.push_str("<stopped-topics>\n");
+        for pref in ctx.stopped_topics {
+            let cat = sanitize_label(&pref.category);
+            let val = sanitize_label(&pref.value);
+            writeln!(prompt, "- {cat}: {val}").unwrap();
+        }
+        prompt.push_str("</stopped-topics>\n\n");
+    }
+
     // Instructions
     prompt.push_str("## Instructions\n");
     prompt.push_str("- Never fabricate information. If you don't know something, say so.\n");
@@ -638,6 +758,25 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
          and stop. Do not interpret questions as implicit requests to start multi-step \
          workflows, retry failed operations, or relaunch tasks. If a follow-up action may be \
          useful, suggest it and wait for explicit confirmation before proceeding.\n",
+    );
+    prompt.push_str(
+        "- **Respect stop signals (persist):** When the user explicitly asks you to stop \
+         bringing up a topic (words like \"stop\", \"arrête\", \"don't bring this up\", \
+         \"no more\", \"assez\", \"laisse tomber\", \"oublie ça\"), acknowledge concisely AND \
+         call `store_fact(category='preference', key='stop_topic_<short-slug>', \
+         value='<one-line: what the user asked to stop, with today's date>')` in the SAME \
+         turn. `<short-slug>` is a lowercase kebab-case identifier for the subject — for \
+         example, subject `web-config` → `key='stop_topic_web-config'`; subject \
+         `budget-review` → `key='stop_topic_budget-review'`. Choose a slug specific enough \
+         to distinguish this subject from any other `stop_topic_*` key already in the \
+         `## Stopped Topics` block. Do NOT re-initiate on that topic in later turns unless \
+         the user re-opens it themselves. A direct user question about the topic is not a \
+         re-opening — you may still answer it.\n",
+    );
+    prompt.push_str(
+        "- **Respect stop signals (consult):** If a `## Stopped Topics` section is present \
+         in this system prompt, do NOT proactively re-raise any listed subject. Direct \
+         answers to user questions about a stopped topic remain OK.\n",
     );
     prompt.push_str(
         "- **No internal tags in responses:** Never include internal XML tags like <context>, \
@@ -897,6 +1036,15 @@ Core memory tracks key people briefly — the people table is the full record.\n
 /// the MikaModel provider expects ≤5-10 tools max, so tool catalog injection
 /// is gated upstream at the call site (see `is_compact_provider` check in
 /// `agent.rs`), not inside this builder.
+///
+/// **mika#1813 carve-out (tracked in mika#1925):** the stop-signal contract
+/// (`<stopped-topics>` block + persist/consult rules) is intentionally NOT
+/// rendered here — the compact budget cannot afford it and the MikaModel
+/// provider is not currently used by family-tier or operator-tier agents in
+/// production. mika#1925 tracks wiring a size-capped variant when MikaModel
+/// goes live for real tenants. The `stopped_topics` field on `PromptContext`
+/// is accepted by this builder to keep the type signature uniform across the
+/// three builders; it is deliberately unused here.
 pub fn build_compact_system_prompt(ctx: &PromptContext<'_>) -> String {
     let mut prompt = String::with_capacity(512);
 
@@ -940,6 +1088,10 @@ pub struct SilentPromptContext<'a> {
     pub task_health: Option<&'a TaskHealthSummary>,
     /// Stored user preferences for autonomous action during heartbeat.
     pub stored_preferences: &'a [Preference],
+    /// Active stop-signals (`stop_topic_*` preferences, mika#1813).
+    /// See `STOP_TOPIC_PREFIX`. Rendered as `<stopped-topics>` block in silent
+    /// prompts so the agent does not re-initiate on user-refused topics.
+    pub stopped_topics: &'a [Preference],
 }
 
 /// Sanitize a label for prompt injection prevention: truncate to 200 chars, strip angle brackets
@@ -982,6 +1134,24 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
         ),
     );
 
+    // Stop-signals (mika#1813) — surfaces user's explicit "don't re-raise this" list
+    // BEFORE commitments so the model sees the suppression list first when scanning.
+    if !ctx.stopped_topics.is_empty() {
+        prompt.push_str("## Stopped Topics\n");
+        prompt.push_str(
+            "The user has explicitly asked you NOT to re-initiate on these topics. \
+             Do NOT proactively send_message about any listed subject. Direct user \
+             questions about a stopped topic are still fine to answer.\n",
+        );
+        prompt.push_str("<stopped-topics>\n");
+        for pref in ctx.stopped_topics {
+            let cat = sanitize_label(&pref.category);
+            let val = sanitize_label(&pref.value);
+            writeln!(prompt, "- {cat}: {val}").unwrap();
+        }
+        prompt.push_str("</stopped-topics>\n\n");
+    }
+
     // Pending commitments
     if !ctx.pending_commitments.is_empty() {
         prompt.push_str("## Pending Commitments\n");
@@ -999,7 +1169,11 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
         prompt.push_str(
             "You are in SILENT MODE. Your text output is NOT delivered to the user.\n\
              Use the send_message tool to contact the user. If you have nothing worthwhile \
-             to say, simply respond with a brief internal note and do NOT call send_message.\n\n",
+             to say, simply respond with a brief internal note and do NOT call send_message.\n\
+             **Respect stop signals (mika#1813):** Before initiating any proactive \
+             `send_message`, check the `<stopped-topics>` block above. If the subject you \
+             would raise matches an entry, DO NOT re-raise. Silence is the correct action \
+             when the user has said stop.\n\n",
         );
     } else {
         prompt.push_str(
@@ -1135,12 +1309,87 @@ mod tests {
             skills: SkillsIdentityConfig::default(),
             tools: ToolsIdentityConfig::default(),
             context: ContextIdentityConfig::default(),
+            session: SessionIdentityConfig::default(),
             curator: None,
         }
     }
 
     fn test_time() -> DateTime<Utc> {
         "2026-02-24T12:00:00Z".parse().unwrap()
+    }
+
+    // --- Canonical session resolution (mika#1401) ---
+
+    #[test]
+    fn test_resolve_canonical_session_non_singleton_returns_none() {
+        // Default identity is non-singleton — callers mint a fresh UUID per ask.
+        let identity = test_identity();
+        assert!(!identity.session.singleton);
+        assert_eq!(resolve_canonical_session_id(&identity, "mika-prime"), None);
+    }
+
+    #[test]
+    fn test_resolve_canonical_session_singleton_derives_id() {
+        // singleton = true without an explicit canonical_id derives
+        // `canonical-{agent_id}` (prefix-typed sibling of system-{agent_id}).
+        let mut identity = test_identity();
+        identity.session.singleton = true;
+        assert_eq!(
+            resolve_canonical_session_id(&identity, "mika-prime"),
+            Some("canonical-mika-prime".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_canonical_session_singleton_honors_explicit_id() {
+        // An explicit canonical_id (e.g. mika-prime's zero-UUID) wins over derivation.
+        let mut identity = test_identity();
+        identity.session.singleton = true;
+        identity.session.canonical_id = Some("00000000-0000-0000-0000-000000000000".to_string());
+        assert_eq!(
+            resolve_canonical_session_id(&identity, "mika-prime"),
+            Some("00000000-0000-0000-0000-000000000000".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_canonical_session_canonical_id_ignored_when_not_singleton() {
+        // canonical_id present but singleton = false → still None (opt-in gate).
+        let mut identity = test_identity();
+        identity.session.singleton = false;
+        identity.session.canonical_id = Some("00000000-0000-0000-0000-000000000000".to_string());
+        assert_eq!(resolve_canonical_session_id(&identity, "mika-prime"), None);
+    }
+
+    #[test]
+    fn test_session_identity_config_parses_from_toml() {
+        // The [session] block deserializes with both fields set.
+        let toml = r#"
+name = "Mika Prime"
+emoji = "✦"
+
+[session]
+singleton = true
+canonical_id = "00000000-0000-0000-0000-000000000000"
+"#;
+        let identity: Identity = toml::from_str(toml).unwrap();
+        assert!(identity.session.singleton);
+        assert_eq!(
+            identity.session.canonical_id.as_deref(),
+            Some("00000000-0000-0000-0000-000000000000")
+        );
+    }
+
+    #[test]
+    fn test_session_identity_config_defaults_when_absent() {
+        // Absent [session] block → singleton = false, canonical_id = None.
+        let toml = r#"
+name = "Mika"
+emoji = "✦"
+"#;
+        let identity: Identity = toml::from_str(toml).unwrap();
+        assert!(!identity.session.singleton);
+        assert!(identity.session.canonical_id.is_none());
     }
 
     fn test_core_memory() -> Vec<CoreMemoryEntry> {
@@ -1176,6 +1425,7 @@ mod tests {
             telegram_configured: false,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1185,8 +1435,10 @@ mod tests {
     // mika#1583 F1 — nudge_interval = 0 is rejected at the pure-validator layer.
     #[test]
     fn test_validate_skills_config_rejects_zero_interval() {
-        let mut skills = SkillsIdentityConfig::default();
-        skills.nudge_interval = Some(0);
+        let mut skills = SkillsIdentityConfig {
+            nudge_interval: Some(0),
+            ..Default::default()
+        };
         assert!(validate_skills_config(&skills).is_err());
         skills.nudge_interval = Some(5);
         assert!(validate_skills_config(&skills).is_ok());
@@ -1249,6 +1501,7 @@ mod tests {
             telegram_configured: false,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1269,6 +1522,7 @@ mod tests {
             skills: SkillsIdentityConfig::default(),
             tools: ToolsIdentityConfig::default(),
             context: ContextIdentityConfig::default(),
+            session: SessionIdentityConfig::default(),
             curator: None,
         };
         let ctx = PromptContext {
@@ -1283,6 +1537,7 @@ mod tests {
             telegram_configured: false,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1304,6 +1559,7 @@ mod tests {
             telegram_configured: false,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1326,6 +1582,7 @@ mod tests {
             telegram_configured: false,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1369,6 +1626,7 @@ mod tests {
             telegram_configured: false,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1395,6 +1653,7 @@ mod tests {
             home_dir: None,
             task_health: None,
             stored_preferences: &[],
+            stopped_topics: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1422,6 +1681,7 @@ mod tests {
             home_dir: None,
             task_health: None,
             stored_preferences: &[],
+            stopped_topics: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1457,6 +1717,7 @@ mod tests {
             home_dir: None,
             task_health: None,
             stored_preferences: &[],
+            stopped_topics: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1479,6 +1740,7 @@ mod tests {
             telegram_configured: false,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1503,6 +1765,7 @@ mod tests {
             telegram_configured: false,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1525,6 +1788,7 @@ mod tests {
             telegram_configured: false,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1559,6 +1823,7 @@ mod tests {
             telegram_configured: false,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1594,6 +1859,7 @@ mod tests {
             home_dir: None,
             task_health: None,
             stored_preferences: &[],
+            stopped_topics: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1620,6 +1886,7 @@ mod tests {
             home_dir: None,
             task_health: None,
             stored_preferences: &[],
+            stopped_topics: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1669,6 +1936,7 @@ max_iterations = 3
             telegram_configured: false,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1713,6 +1981,7 @@ max_iterations = 3
             telegram_configured: false,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1744,6 +2013,7 @@ max_iterations = 3
             telegram_configured: false,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1766,6 +2036,7 @@ max_iterations = 3
             telegram_configured: false,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1787,6 +2058,7 @@ max_iterations = 3
             telegram_configured: false,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1808,6 +2080,7 @@ max_iterations = 3
             telegram_configured: true,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1831,6 +2104,7 @@ max_iterations = 3
             telegram_configured: false,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1854,6 +2128,7 @@ max_iterations = 3
             telegram_configured: false,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1875,6 +2150,7 @@ max_iterations = 3
             telegram_configured: false,
             home_dir: Some(std::path::Path::new("/home/user/.mika/agents/mika")),
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1903,6 +2179,7 @@ max_iterations = 3
             telegram_configured: false,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1930,6 +2207,7 @@ max_iterations = 3
             home_dir: None,
             task_health: None,
             stored_preferences: &[],
+            stopped_topics: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1954,6 +2232,7 @@ max_iterations = 3
             home_dir: None,
             task_health: None,
             stored_preferences: &[],
+            stopped_topics: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1978,6 +2257,7 @@ max_iterations = 3
             home_dir: None,
             task_health: None,
             stored_preferences: &[],
+            stopped_topics: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -2145,6 +2425,7 @@ enabled = true
             home_dir: None,
             task_health: None,
             stored_preferences: &[],
+            stopped_topics: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -2172,6 +2453,7 @@ enabled = true
             home_dir: None,
             task_health: None,
             stored_preferences: &[],
+            stopped_topics: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -2242,6 +2524,7 @@ enabled = true
             home_dir: None,
             task_health: Some(&health),
             stored_preferences: &[],
+            stopped_topics: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -2274,6 +2557,7 @@ enabled = true
             home_dir: None,
             task_health: None,
             stored_preferences: &[],
+            stopped_topics: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -2304,6 +2588,7 @@ enabled = true
             home_dir: None,
             task_health: None,
             stored_preferences: &prefs,
+            stopped_topics: &[],
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -2335,6 +2620,7 @@ enabled = true
             telegram_configured: false,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("store_fact(category=\"person\")"));
@@ -2355,6 +2641,7 @@ enabled = true
             telegram_configured: false,
             home_dir: None,
             callback_context: Some("Processing callback results from a long-running task."),
+            stopped_topics: &[],
         };
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("## Callback Result Turn"));
@@ -2376,6 +2663,7 @@ enabled = true
             telegram_configured: false,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
         let prompt = build_system_prompt(&ctx);
         assert!(!prompt.contains("## Callback Result Turn"));
@@ -2396,6 +2684,7 @@ enabled = true
             telegram_configured: false,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2418,6 +2707,7 @@ enabled = true
             telegram_configured: false,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2440,6 +2730,7 @@ enabled = true
             telegram_configured: false,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2462,6 +2753,7 @@ enabled = true
             telegram_configured: false,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2486,6 +2778,7 @@ enabled = true
             telegram_configured: false,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2516,6 +2809,7 @@ enabled = true
             telegram_configured: false,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2848,6 +3142,7 @@ inject = false
             telegram_configured: true,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_compact_system_prompt(&ctx);
@@ -2895,6 +3190,7 @@ inject = false
             telegram_configured: false,
             home_dir: None,
             callback_context: None,
+            stopped_topics: &[],
         };
 
         let prompt = build_compact_system_prompt(&ctx);
@@ -2905,5 +3201,486 @@ inject = false
         assert!(prompt.contains("## Identity"));
         // Only 1 section
         assert_eq!(prompt.matches("## ").count(), 1);
+    }
+
+    // ==================================================================
+    // Stop-topic tests (mika#1813)
+    //
+    // These tests exercise the state + prompt gate that keeps Mika from
+    // re-nagging after a user says "arrête". The fix has two invariants:
+    //   1. STATE: a `stop_topic_*` preference is loaded and injected as
+    //      `<stopped-topics>` block in both silent and conversation prompts.
+    //   2. PROMPT: the conversation prompt tells the agent to persist the
+    //      stop-signal via `store_fact`; the silent prompt tells the agent
+    //      not to re-initiate on any listed subject.
+    //
+    // The load-bearing regression fixture is
+    // `test_silent_prompt_regression_stop_topic_visible_and_rule_present`.
+    // It fails on `main` (the field does not exist on `SilentPromptContext`
+    // and the rule text is not emitted), demonstrating that the fix is
+    // load-bearing per feedback_verify_pipeline_passes_without_the_fix.
+    // ==================================================================
+
+    fn stop_topic_pref(slug: &str, note: &str) -> Preference {
+        Preference {
+            category: format!("stop_topic_{slug}"),
+            value: note.to_string(),
+            updated_at: "2026-08-19T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_silent_prompt_stopped_topics_block_present_when_nonempty() {
+        let identity = test_identity();
+        let stops = vec![stop_topic_pref(
+            "web-config",
+            "user asked to stop, 2026-08-19",
+        )];
+        let ctx = SilentPromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            pending_commitments: &[],
+            trigger_context: "This is a scheduled HEARTBEAT check-in.",
+            current_utc: test_time(),
+            timezone: None,
+            telegram_configured: false,
+            has_message_sender: true,
+            recent_conversations: None,
+            recent_audit_events: None,
+            home_dir: None,
+            task_health: None,
+            stored_preferences: &[],
+            stopped_topics: &stops,
+        };
+        let prompt = build_silent_prompt(&ctx);
+        assert!(
+            prompt.contains("## Stopped Topics"),
+            "silent prompt must render the Stopped Topics section when non-empty"
+        );
+        assert!(prompt.contains("<stopped-topics>"));
+        assert!(
+            prompt.contains("stop_topic_web-config"),
+            "block must include the sanitized preference category"
+        );
+        assert!(
+            prompt.contains("user asked to stop, 2026-08-19"),
+            "block must include the preference value (context of the stop)"
+        );
+        assert!(
+            prompt.contains("Respect stop signals"),
+            "silent-mode instructions must carry the respect-stop-signals rule"
+        );
+    }
+
+    #[test]
+    fn test_silent_prompt_stopped_topics_block_absent_when_empty() {
+        let identity = test_identity();
+        let ctx = SilentPromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            pending_commitments: &[],
+            trigger_context: "This is a scheduled HEARTBEAT check-in.",
+            current_utc: test_time(),
+            timezone: None,
+            telegram_configured: false,
+            has_message_sender: true,
+            recent_conversations: None,
+            recent_audit_events: None,
+            home_dir: None,
+            task_health: None,
+            stored_preferences: &[],
+            stopped_topics: &[],
+        };
+        let prompt = build_silent_prompt(&ctx);
+        // Check for block-unique prose (silent-mode block description) — the
+        // rule text in `## Silent Mode` also mentions `<stopped-topics>` and
+        // `## Stopped Topics`, so structural substring checks would false-fire.
+        // The block's descriptive sentence appears nowhere else.
+        assert!(
+            !prompt.contains("The user has explicitly asked you NOT to re-initiate"),
+            "empty stopped_topics must not emit the block description"
+        );
+        // The rendered open-tag with trailing newline appears only inside the
+        // block itself (the rule text embeds it inline with backticks).
+        assert!(!prompt.contains("<stopped-topics>\n"));
+    }
+
+    #[test]
+    fn test_silent_prompt_stopped_topics_sanitized() {
+        // Prompt injection safety: angle brackets and newlines in preference
+        // values must be stripped by sanitize_label before appearing in the
+        // prompt. Mirrors the existing sanitize_label discipline used for
+        // task-health labels and stored-preferences (see prompt.rs).
+        let identity = test_identity();
+        let stops = vec![Preference {
+            category: "stop_topic_<script>".to_string(),
+            value: "line1\nline2 <hack>".to_string(),
+            updated_at: "2026-08-19T00:00:00Z".to_string(),
+        }];
+        let ctx = SilentPromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            pending_commitments: &[],
+            trigger_context: "This is a scheduled HEARTBEAT check-in.",
+            current_utc: test_time(),
+            timezone: None,
+            telegram_configured: false,
+            has_message_sender: true,
+            recent_conversations: None,
+            recent_audit_events: None,
+            home_dir: None,
+            task_health: None,
+            stored_preferences: &[],
+            stopped_topics: &stops,
+        };
+        let prompt = build_silent_prompt(&ctx);
+        // The literal `<script>` fragment inside the category value must be
+        // gone: sanitize_label strips `<` and `>` and newlines.
+        assert!(
+            !prompt.contains("<script>"),
+            "sanitize_label must strip angle brackets from category values"
+        );
+        // Newlines injected via value must be stripped so they don't break
+        // the enclosing `<stopped-topics>` block structure.
+        // (The block itself contains newlines by construction; what matters
+        // is that the value cannot inject a fake close-tag line.)
+        assert!(!prompt.contains("line1\nline2"));
+    }
+
+    #[test]
+    fn test_conversation_prompt_stopped_topics_block_present_when_nonempty() {
+        let identity = test_identity();
+        let stops = vec![stop_topic_pref(
+            "budget-review",
+            "user said arrête, 2026-08-19",
+        )];
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+            stopped_topics: &stops,
+        };
+        let prompt = build_system_prompt(&ctx);
+        assert!(
+            prompt.contains("## Stopped Topics"),
+            "conversation prompt must render the Stopped Topics section when non-empty"
+        );
+        assert!(prompt.contains("stop_topic_budget-review"));
+        assert!(prompt.contains("user said arrête, 2026-08-19"));
+    }
+
+    #[test]
+    fn test_conversation_prompt_stopped_topics_block_absent_when_empty() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+            stopped_topics: &[],
+        };
+        let prompt = build_system_prompt(&ctx);
+        // The "Respect stop signals (consult)" rule mentions `## Stopped
+        // Topics` inline, so structural substring checks would false-fire.
+        // Check for block-unique descriptive prose instead.
+        assert!(
+            !prompt.contains("Do NOT proactively raise any listed subject"),
+            "empty stopped_topics must not emit the block description"
+        );
+        assert!(!prompt.contains("<stopped-topics>\n"));
+    }
+
+    #[test]
+    fn test_conversation_prompt_persist_stop_rule_present() {
+        // The "Respect stop signals (persist)" rule is unconditional — it
+        // appears in every conversation prompt so the agent knows to call
+        // store_fact the first time the user says stop, even before any
+        // stop_topic_* preference exists.
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+            stopped_topics: &[],
+        };
+        let prompt = build_system_prompt(&ctx);
+        assert!(
+            prompt.contains("Respect stop signals (persist)"),
+            "persist-on-stop rule must appear in every conversation prompt"
+        );
+        assert!(
+            prompt.contains("stop_topic_"),
+            "rule must name the stop_topic_ preference-key prefix"
+        );
+        assert!(
+            prompt.contains("store_fact"),
+            "rule must instruct the agent to persist via store_fact"
+        );
+        // The rule must be careful about the AC2 distinction — a direct
+        // question is NOT a re-opening.
+        assert!(
+            prompt.contains("direct user question about the topic is not a re-opening"),
+            "rule must preserve the stop-vs-question distinction (AC2)"
+        );
+    }
+
+    #[test]
+    fn test_conversation_prompt_consult_stop_rule_present() {
+        // The "Respect stop signals (consult)" rule tells the agent to
+        // check the block that U3 renders and not re-raise anything on it.
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+            stopped_topics: &[],
+        };
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("Respect stop signals (consult)"));
+    }
+
+    /// Load-bearing regression fixture (mika#1813).
+    ///
+    /// This test asserts BOTH the state signal (the specific stopped subject
+    /// is present in the assembled silent prompt) AND the prompt signal (the
+    /// "Respect stop signals" rule text is present). It fails on `main`
+    /// because `SilentPromptContext` does not carry a `stopped_topics` field
+    /// and `build_silent_prompt` never renders the block or the rule.
+    ///
+    /// Per feedback_verify_pipeline_passes_without_the_fix, at least one
+    /// added test must fail without the code change and pass with it — this
+    /// is that test.
+    #[test]
+    fn test_silent_prompt_regression_stop_topic_visible_and_rule_present() {
+        let identity = test_identity();
+        // Al's original refusal from the ticket: web-config re-nagging.
+        let stops = vec![stop_topic_pref("web-config", "Al asked to stop 2026-07-20")];
+        let ctx = SilentPromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            pending_commitments: &[],
+            trigger_context: "This is a scheduled HEARTBEAT check-in.",
+            current_utc: test_time(),
+            timezone: None,
+            telegram_configured: false,
+            has_message_sender: true,
+            recent_conversations: None,
+            recent_audit_events: None,
+            home_dir: None,
+            task_health: None,
+            stored_preferences: &[],
+            stopped_topics: &stops,
+        };
+        let prompt = build_silent_prompt(&ctx);
+        // AC1 (state): the specific stopped topic Al refused is present.
+        assert!(
+            prompt.contains("stop_topic_web-config"),
+            "stopped topic must appear in the silent prompt so heartbeat sees it"
+        );
+        // AC1 (prompt): the respect rule is present, so the agent knows the
+        // block is a suppression directive.
+        assert!(
+            prompt.contains("Respect stop signals"),
+            "silent-mode rule text must be present so the agent knows what to do with the block"
+        );
+        // AC3 (re-test): the block must survive a second heartbeat — this
+        // is guaranteed by construction (the DB row is durable) but we assert
+        // the render is deterministic.
+        let prompt2 = build_silent_prompt(&ctx);
+        assert_eq!(prompt, prompt2, "prompt render must be deterministic");
+    }
+
+    /// AC4: no leak between axes.
+    ///
+    /// A stop_topic on X must not affect the visibility of unrelated commitments
+    /// Y. This test constructs a stop on `web-config` and an unrelated commitment
+    /// on `budget-review`; both blocks must be present with the commitment un-
+    /// touched, and the commitment text must not be muted, hidden, or filtered
+    /// by the stop-signal.
+    #[test]
+    fn test_silent_prompt_stop_signal_does_not_leak_across_axes() {
+        use crate::db::Commitment;
+        let identity = test_identity();
+        let stops = vec![stop_topic_pref(
+            "web-config",
+            "user asked to stop, 2026-08-19",
+        )];
+        let commitments = vec![Commitment {
+            id: 42,
+            description: "Prepare budget review for Q3".to_string(),
+            status: "pending".to_string(),
+            due_date: Some("2026-08-31".to_string()),
+            person_id: None,
+            created_at: "2026-08-19T00:00:00Z".to_string(),
+            completed_at: None,
+        }];
+        let ctx = SilentPromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            pending_commitments: &commitments,
+            trigger_context: "This is a scheduled HEARTBEAT check-in.",
+            current_utc: test_time(),
+            timezone: None,
+            telegram_configured: false,
+            has_message_sender: true,
+            recent_conversations: None,
+            recent_audit_events: None,
+            home_dir: None,
+            task_health: None,
+            stored_preferences: &[],
+            stopped_topics: &stops,
+        };
+        let prompt = build_silent_prompt(&ctx);
+        // Both blocks present.
+        assert!(prompt.contains("## Stopped Topics"));
+        assert!(prompt.contains("## Pending Commitments"));
+        // The unrelated commitment survives verbatim — the stop-signal does
+        // not filter, shadow, or suppress it.
+        assert!(
+            prompt.contains("Prepare budget review for Q3"),
+            "unrelated commitment must remain visible (AC4 — no leak across axes)"
+        );
+    }
+
+    #[test]
+    fn test_stop_topic_prefix_constant_is_stable() {
+        // The prefix is a public API contract — the store_fact write path
+        // (LLM prompt) and the load path (agent_loop::load_agent_context)
+        // must agree on the same string. Guarding the literal here catches
+        // an accidental rename that would silently break the coupling.
+        assert_eq!(STOP_TOPIC_PREFIX, "stop_topic_");
+    }
+
+    #[test]
+    fn test_filter_stop_topic_preferences_keeps_strict_prefix() {
+        // Baseline: a `stop_topic_<slug>` category must survive the filter.
+        let prefs = vec![Preference {
+            category: "stop_topic_web-config".to_string(),
+            value: "user asked to stop, 2026-08-19".to_string(),
+            updated_at: "2026-08-19T00:00:00Z".to_string(),
+        }];
+        let filtered = filter_stop_topic_preferences(prefs);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].category, "stop_topic_web-config");
+    }
+
+    #[test]
+    fn test_filter_stop_topic_preferences_drops_value_only_matches() {
+        // Anti-regression: `db::search_preferences('stop_topic_')` ORs on
+        // category AND value with a substring LIKE, so a row whose CATEGORY is
+        // not a stop-topic but whose VALUE happens to mention the substring
+        // would otherwise surface in `<stopped-topics>` and mute unrelated
+        // axes (AC4 leak). The filter must drop it.
+        let prefs = vec![Preference {
+            category: "task_policy_finance".to_string(),
+            value: "when user says stop_topic_x we do Y".to_string(),
+            updated_at: "2026-08-19T00:00:00Z".to_string(),
+        }];
+        let filtered = filter_stop_topic_preferences(prefs);
+        assert!(
+            filtered.is_empty(),
+            "value-only matches must not surface as stop-topics"
+        );
+    }
+
+    #[test]
+    fn test_filter_stop_topic_preferences_drops_wildcard_underscore_neighbours() {
+        // Anti-regression: SQLite LIKE treats `_` as a single-char wildcard,
+        // so `%stop_topic_%` matches `stop_topicalization` (the trailing `_`
+        // matches `a`). A non-prefix category must not be promoted to a
+        // stop-topic. `starts_with` in the filter is a byte-level literal
+        // check with no LIKE semantics — it rejects the imposter cleanly.
+        let prefs = vec![
+            Preference {
+                category: "stop_topicalization".to_string(),
+                value: "unrelated".to_string(),
+                updated_at: "2026-08-19T00:00:00Z".to_string(),
+            },
+            Preference {
+                category: "stop_topic_web-config".to_string(),
+                value: "user asked to stop, 2026-08-19".to_string(),
+                updated_at: "2026-08-19T00:00:00Z".to_string(),
+            },
+        ];
+        let filtered = filter_stop_topic_preferences(prefs);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].category, "stop_topic_web-config");
+    }
+
+    #[test]
+    fn test_compact_prompt_omits_stopped_topics_block_by_design() {
+        // The compact prompt (ProviderKind::MikaModel) is intentionally
+        // silent on stop-topics — the ≤5 KB budget cannot afford them and
+        // MikaModel is not currently used for production agents. This test
+        // pins the carve-out documented at build_compact_system_prompt so a
+        // future wire-up is deliberate (test flips) rather than accidental.
+        let identity = test_identity();
+        let stops = vec![stop_topic_pref(
+            "web-config",
+            "user asked to stop, 2026-08-19",
+        )];
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+            stopped_topics: &stops,
+        };
+        let prompt = build_compact_system_prompt(&ctx);
+        assert!(
+            !prompt.contains("<stopped-topics>"),
+            "compact prompt must not emit the stop-topics block (carve-out)"
+        );
+        assert!(
+            !prompt.contains("Stopped Topics"),
+            "compact prompt must not emit the stop-topics section header"
+        );
+        assert!(
+            !prompt.contains("Respect stop signals"),
+            "compact prompt must not carry stop-signal rules"
+        );
     }
 }

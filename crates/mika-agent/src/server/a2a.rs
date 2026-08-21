@@ -107,18 +107,18 @@ pub async fn handle_a2a_jsonrpc(
 
 /// Run the agent loop for an A2A request, similar to handle_message.
 ///
-/// `stream_tx` is the per-task broadcast sender the caller (typically
-/// `handle_message_stream`) uses to publish SSE frames. It is threaded into
-/// `AgentParams.stream_tx` so `process_tool_calls` can emit `ToolCallStart` /
-/// `ToolCallResult` frames as tools dispatch (mika#1731). Non-streaming
-/// callers (`message/send`) pass `None`.
+/// `stream_ctx` is the per-task broadcast context the caller (typically
+/// `handle_message_stream`) uses to publish SSE frames. It bundles the
+/// sender, task_id, and optional context_id so `process_tool_calls` can
+/// emit `ToolCallStart` / `ToolCallResult` frames (mika#1731 wire;
+/// mika#1757 emission). Non-streaming callers (`message/send`) pass `None`.
 async fn run_a2a_agent(
     state: &AppState,
     agent_state: &Arc<AgentState>,
     session_id: &str,
     input_text: &str,
     task_id: &str,
-    stream_tx: Option<mika_a2a::streaming::StreamEventSender>,
+    stream_ctx: Option<Arc<mika_a2a::streaming::ToolCallStreamContext>>,
 ) -> Result<Option<String>, String> {
     // Hot-reload skills if dirty
     let skills = if agent_state.skills_dirty.load(Ordering::Acquire) {
@@ -174,7 +174,7 @@ async fn run_a2a_agent(
         correlated_task_id: None,
         internal: false,
         pr_reviews_posted: Some(&state.pr_reviews_posted),
-        stream_tx,
+        stream_ctx,
     };
 
     match agent::run_agent(&params).await {
@@ -401,18 +401,24 @@ async fn handle_message_stream(
             metadata: None,
         }));
 
-        // Run the real agent loop. Streaming path (mika#1731) — pass the
-        // per-task broadcast sender so process_tool_calls can inject
-        // ToolCallStart / ToolCallResult frames as tools dispatch.
-        let stream_tx_for_agent: Option<mika_a2a::streaming::StreamEventSender> =
-            Some(Arc::new(tx.clone()));
+        // Run the real agent loop. Streaming path (mika#1731 wire, mika#1757
+        // emission) — bundle the per-task broadcaster + task_id + context_id
+        // into a ToolCallStreamContext so process_tool_calls can inject
+        // ToolCallStart / ToolCallResult frames as tools dispatch. The Arc
+        // wrapper enables cheap threading through run_loop.
+        let stream_ctx_for_agent: Option<Arc<mika_a2a::streaming::ToolCallStreamContext>> =
+            Some(Arc::new(mika_a2a::streaming::ToolCallStreamContext::new(
+                Arc::new(tx.clone()),
+                task_id_clone.clone(),
+                context_id.clone(),
+            )));
         match run_a2a_agent(
             &state_clone,
             &agent_state_clone,
             &session_id,
             &input_text,
             &task_id_clone,
-            stream_tx_for_agent,
+            stream_ctx_for_agent,
         )
         .await
         {

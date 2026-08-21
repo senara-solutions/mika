@@ -102,6 +102,28 @@ pub struct GatewaySettings {
     /// pre-cm#88. Maps to `MIKA_CM_API_URL`.
     #[serde(default)]
     pub cm_api_url: Option<String>,
+
+    /// E1 egress-search substrate upstream selector (mika#1807). One of
+    /// `"brave"`. `None` disables `POST /internal/search` (endpoint returns
+    /// 404). E2 (#1808) wires the concrete upstream call — in v1 the
+    /// endpoint returns 501 `not_implemented` when configured.
+    ///
+    /// See `crates/mika-gateway/src/egress_search.rs` module doc and
+    /// `crates/mika-gateway/docs/egress-search.md` for the Q1/Q2/Q3/Q4
+    /// tranchage.
+    #[serde(default)]
+    pub search_upstream: Option<String>,
+
+    /// Brave Search API key (mika#1807). Required when `search_upstream = "brave"`.
+    /// Maps to `MIKA_BRAVE_API_KEY`.
+    #[serde(default)]
+    pub brave_api_key: Option<SecretString>,
+
+    /// Optional override for the Brave API endpoint (mika#1807). Used by
+    /// E2 integration tests + self-hosted Brave mirrors. Defaults to
+    /// `crate::egress_search::DEFAULT_BRAVE_ENDPOINT`.
+    #[serde(default)]
+    pub brave_endpoint: Option<String>,
 }
 
 fn default_port() -> u16 {
@@ -185,6 +207,29 @@ impl GatewaySettings {
             validate_agent_base_url(url_str)?;
         }
 
+        // Validate egress-search upstream selector (mika#1807).
+        // Only `"brave"` is recognized in v1. Unknown values hard-fail so a
+        // typo doesn't silently degrade the endpoint to 404.
+        if let Some(ref kind) = self.search_upstream {
+            match kind.trim().to_ascii_lowercase().as_str() {
+                "brave" => {
+                    if self.brave_api_key.is_none() {
+                        anyhow::bail!(
+                            "MIKA_SEARCH_UPSTREAM='brave' but MIKA_BRAVE_API_KEY is not set"
+                        );
+                    }
+                }
+                "" => {
+                    // Empty value == absent; ignore.
+                }
+                other => {
+                    anyhow::bail!(
+                        "MIKA_SEARCH_UPSTREAM='{other}' is unrecognized; v1 supports only 'brave'"
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -262,6 +307,12 @@ impl std::fmt::Debug for GatewaySettings {
                 &self.orchestrator_inbox_enabled,
             )
             .field("gateway_external_url", &self.gateway_external_url)
+            .field("search_upstream", &self.search_upstream)
+            .field(
+                "brave_api_key",
+                &self.brave_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("brave_endpoint", &self.brave_endpoint)
             .finish()
     }
 }
@@ -361,6 +412,9 @@ mod tests {
                 orchestrator_inbox_enabled: None,
                 gateway_external_url: Some("https://gateway.test.example.com".to_string()),
                 cm_api_url: Some("http://127.0.0.1:8090".to_string()),
+                search_upstream: Some("brave".to_string()),
+                brave_api_key: Some(SecretString::from("brave-api-key-secret")),
+                brave_endpoint: None,
             }
         );
         assert!(!debug.contains("pass"));
@@ -368,6 +422,7 @@ mod tests {
         assert!(!debug.contains("token-123"));
         assert!(!debug.contains("gh-webhook-secret"));
         assert!(!debug.contains("super-secret-pem"));
+        assert!(!debug.contains("brave-api-key-secret"));
         assert!(debug.contains("[REDACTED]"));
     }
 
@@ -465,7 +520,57 @@ mod tests {
             orchestrator_inbox_enabled: None,
             gateway_external_url: None,
             cm_api_url: None,
+            search_upstream: None,
+            brave_api_key: None,
+            brave_endpoint: None,
         }
+    }
+
+    // -- egress-search validation contract tests (mika#1807) --
+
+    #[test]
+    fn test_validate_search_upstream_absent_succeeds() {
+        // No egress-search config at all — valid (endpoint returns 404).
+        let s = test_settings();
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_search_upstream_brave_requires_api_key() {
+        let mut s = test_settings();
+        s.search_upstream = Some("brave".to_string());
+        let err = s.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("MIKA_BRAVE_API_KEY"),
+            "expected error about missing brave api key, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_search_upstream_brave_with_key_succeeds() {
+        let mut s = test_settings();
+        s.search_upstream = Some("brave".to_string());
+        s.brave_api_key = Some(SecretString::from("k"));
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_search_upstream_rejects_unknown() {
+        let mut s = test_settings();
+        s.search_upstream = Some("google".to_string());
+        let err = s.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("unrecognized"),
+            "expected error about unknown upstream, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_search_upstream_case_insensitive() {
+        let mut s = test_settings();
+        s.search_upstream = Some("BRAVE".to_string());
+        s.brave_api_key = Some(SecretString::from("k"));
+        assert!(s.validate().is_ok());
     }
 
     #[test]

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { formatTimestamp, formatRelativeTime } from '@senara-solutions/ui'
+import { formatTimestamp, formatRelativeTime } from '@samidarko/ui'
 
 describe('formatTimestamp', () => {
   it('formats an ISO 8601 timestamp', () => {

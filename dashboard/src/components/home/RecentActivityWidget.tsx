@@ -2,7 +2,7 @@ import { Link } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
 import { apiFetch, type PaginatedResponse } from '../../api/client.ts'
 import type { TimelineRow } from '../../api/timeline.ts'
-import { LoadingState, ErrorState, EmptyState, formatApiError, formatRelativeTime, eventTypeBadge } from '@senara-solutions/ui'
+import { LoadingState, ErrorState, EmptyState, formatApiError, formatRelativeTime, eventTypeBadge } from '@samidarko/ui'
 import WidgetSection from './WidgetSection.tsx'
 
 interface RecentActivityWidgetProps {

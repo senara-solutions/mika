@@ -212,6 +212,10 @@ struct AgentContext {
     identity: prompt::Identity,
     core_memory: Vec<crate::db::CoreMemoryEntry>,
     timezone: Option<String>,
+    /// Active `stop_topic_*` preferences (mika#1813). Loaded fail-open — a query
+    /// error here must not block the turn; the `<stopped-topics>` block simply
+    /// stays empty.
+    stopped_topics: Vec<crate::db::Preference>,
 }
 
 async fn load_agent_context(db: &AsyncDatabase, home_dir: &Path) -> Result<AgentContext> {
@@ -221,11 +225,31 @@ async fn load_agent_context(db: &AsyncDatabase, home_dir: &Path) -> Result<Agent
     let identity = prompt::load_identity_async(home_dir).await;
     let core_memory = db.get_all_core_memory().await?;
     let timezone = db.get_customer_config("timezone").await?;
+    // mika#1813: load stop-signal preferences for injection into every turn.
+    //
+    // Fail-open by design (per AgentContext::stopped_topics doc). Log the error
+    // so a persistent DB failure is greppable instead of silently disabling the
+    // suppression list on every turn.
+    //
+    // Filter with `prompt::filter_stop_topic_preferences` because
+    // `search_preferences` uses a substring `LIKE '%prefix%'` on BOTH the
+    // category AND value columns (see db.rs) — so a preference whose value
+    // merely mentions the substring, or whose category matches via SQLite's
+    // single-char `_` wildcard, would otherwise be surfaced as an authoritative
+    // stop-topic and mute unrelated axes (AC4 leak).
+    let stopped_topics = match db.search_preferences(prompt::STOP_TOPIC_PREFIX).await {
+        Ok(rows) => prompt::filter_stop_topic_preferences(rows),
+        Err(e) => {
+            warn!(error = %e, "stop_topic_load_failed");
+            Vec::new()
+        }
+    };
     Ok(AgentContext {
         soul_content,
         identity,
         core_memory,
         timezone,
+        stopped_topics,
     })
 }
 
@@ -326,6 +350,7 @@ async fn attempt_continuation_turn(
     tool_call_summaries: &[ToolCallSummary],
     system_prompt_original_len: usize,
     label: &str,
+    mode_label: &str,
     deadline: Instant,
     db: &AsyncDatabase,
     session_id: &str,
@@ -333,6 +358,11 @@ async fn attempt_continuation_turn(
     store_llm_calls: bool,
     prompt_variant: Option<&str>,
 ) -> ContinuationResult {
+    // `label` (may be an operational trigger name like "heartbeat"/"callback")
+    // is preserved for the existing warn! diagnostics. `mode_label` is the
+    // stable `LoopMode::label()` value ("agent"/"silent agent"/"team agent")
+    // forwarded to the mika#1889 `turn_usage` log for vocabulary parity with
+    // the in-loop emits.
     // Strip the step-awareness nudge from the system prompt so the continuation
     // turn does not see stale "2 steps remaining" text.
     if let Some(ref mut system) = request.system {
@@ -384,23 +414,26 @@ async fn attempt_continuation_turn(
             let t = mika_common::llm::strip_internal_tags(&resp.text());
             let stop = format!("{:?}", resp.stop_reason);
             let usage = resp.usage;
-            if store_llm_calls {
-                save_continuation_llm_call(
-                    db,
-                    session_id,
-                    trace_id,
-                    llm.provider_name(),
-                    llm.model_name(),
-                    Some(&usage),
-                    Some(&stop),
-                    "success",
-                    None,
-                    latency_ms,
-                    prompt_variant,
-                    Some(system_prompt_original_len as i64),
-                )
-                .await;
-            }
+            // Always call — `save_continuation_llm_call` emits the ungated
+            // `turn_usage` log (mika#1889 R2/D2) and internally gates the DB
+            // write on `store_llm_calls`.
+            save_continuation_llm_call(
+                db,
+                session_id,
+                trace_id,
+                mode_label,
+                llm.provider_name(),
+                llm.model_name(),
+                Some(&usage),
+                Some(&stop),
+                "success",
+                None,
+                latency_ms,
+                prompt_variant,
+                Some(system_prompt_original_len as i64),
+                store_llm_calls,
+            )
+            .await;
             if t.is_empty() {
                 ContinuationResult {
                     text: format_step_exceeded_fallback(tool_call_summaries),
@@ -420,23 +453,23 @@ async fn attempt_continuation_turn(
                 label,
                 "continuation turn API error after max steps"
             );
-            if store_llm_calls {
-                save_continuation_llm_call(
-                    db,
-                    session_id,
-                    trace_id,
-                    llm.provider_name(),
-                    llm.model_name(),
-                    None,
-                    None,
-                    "error",
-                    Some(&e.to_string()),
-                    latency_ms,
-                    prompt_variant,
-                    Some(system_prompt_original_len as i64),
-                )
-                .await;
-            }
+            save_continuation_llm_call(
+                db,
+                session_id,
+                trace_id,
+                mode_label,
+                llm.provider_name(),
+                llm.model_name(),
+                None,
+                None,
+                "error",
+                Some(&e.to_string()),
+                latency_ms,
+                prompt_variant,
+                Some(system_prompt_original_len as i64),
+                store_llm_calls,
+            )
+            .await;
             ContinuationResult {
                 text: format_step_exceeded_fallback(tool_call_summaries),
                 usage: None,
@@ -449,26 +482,26 @@ async fn attempt_continuation_turn(
                 label,
                 "continuation turn timed out after max steps"
             );
-            if store_llm_calls {
-                save_continuation_llm_call(
-                    db,
-                    session_id,
-                    trace_id,
-                    llm.provider_name(),
-                    llm.model_name(),
-                    None,
-                    None,
-                    "timeout",
-                    Some(&format!(
-                        "continuation deadline-clamp timeout ({}s)",
-                        continuation_timeout.as_secs()
-                    )),
-                    latency_ms,
-                    prompt_variant,
-                    Some(system_prompt_original_len as i64),
-                )
-                .await;
-            }
+            save_continuation_llm_call(
+                db,
+                session_id,
+                trace_id,
+                mode_label,
+                llm.provider_name(),
+                llm.model_name(),
+                None,
+                None,
+                "timeout",
+                Some(&format!(
+                    "continuation deadline-clamp timeout ({}s)",
+                    continuation_timeout.as_secs()
+                )),
+                latency_ms,
+                prompt_variant,
+                Some(system_prompt_original_len as i64),
+                store_llm_calls,
+            )
+            .await;
             ContinuationResult {
                 text: format_step_exceeded_fallback(tool_call_summaries),
                 usage: None,
@@ -477,15 +510,30 @@ async fn attempt_continuation_turn(
     }
 }
 
-/// Persist an `llm_calls` row for a continuation-turn LLM call. Used in all three
-/// outcome arms (success, API error, deadline-clamped timeout) so the continuation
-/// turn is never the silent-drop variant of mika#848. Step is encoded as
-/// `u32::MAX` to distinguish continuation calls from in-loop step indices.
+/// Persist a continuation-turn `llm_calls` row (mika#848) and emit the
+/// companion `turn_usage` INFO event (mika#1889 — RT-005 brick 4/5).
+///
+/// Called in all three outcome arms (success, API error, deadline-clamped
+/// timeout) so the continuation turn is never the silent-drop variant of the
+/// in-flight-cancel bug at smaller scale. Step is encoded as `u32::MAX` in both
+/// surfaces to distinguish continuation calls from in-loop step indices.
+///
+/// **Two independent observability surfaces, one lifecycle each:**
+/// - The `emit_turn_usage` log event fires unconditionally — the RT-005
+///   planning-tokens measurement channel MUST NOT be silenced by
+///   `MIKA_STORE_LLM_CALLS` (R2/D2).
+/// - The `save_llm_call` DB write is gated by `store_llm_calls` so the dashboard
+///   LLM-calls table keeps its existing lifecycle unchanged.
+///
+/// `tool_use_in_turn` is always `false` here: the continuation turn is
+/// text-only (see `attempt_continuation_turn` which sets `request.tools = None`
+/// before the call), so no observable tool_use can ever occur.
 #[allow(clippy::too_many_arguments)]
 async fn save_continuation_llm_call(
     db: &AsyncDatabase,
     session_id: &str,
     trace_id: &str,
+    mode: &str,
     provider: &str,
     model: &str,
     usage: Option<&LlmUsage>,
@@ -495,7 +543,38 @@ async fn save_continuation_llm_call(
     latency_ms: u64,
     prompt_variant: Option<&str>,
     system_prompt_bytes: Option<i64>,
+    store_llm_calls: bool,
 ) {
+    // Emit turn_usage log FIRST and unconditionally (R2/D2 — decoupled from
+    // MIKA_STORE_LLM_CALLS). The DB write below is skipped when the flag is off.
+    //
+    // stop_reason defaults to `status` (not "") when absent, unifying the error
+    // arm sentinel ("error"/"timeout") across the in-loop and continuation
+    // surfaces so the brick 5/5 analyzer can key off one vocabulary. The DB
+    // path still stores Option<&str> unchanged — this normalization is
+    // log-surface-only.
+    let fields = build_turn_usage_fields(
+        u32::MAX,
+        usage,
+        stop_reason.unwrap_or(status),
+        false,
+        status,
+        latency_ms,
+    );
+    emit_turn_usage(
+        db.agent_id(),
+        session_id,
+        trace_id,
+        mode,
+        provider,
+        model,
+        &fields,
+    );
+
+    if !store_llm_calls {
+        return;
+    }
+
     let id = uuid::Uuid::new_v4().to_string();
     let (input, output, cache_read, cache_write) = match usage {
         Some(u) => (
@@ -680,6 +759,11 @@ async fn run_loop(
     deadline: Instant,
     scope_task_id: Option<&str>,
     skill_nudge: Option<&SkillNudgeContext<'_>>,
+    // mika#1757 — Optional broadcast context for `ToolCallStart` /
+    // `ToolCallResult` emission from `process_tool_calls`. `None` for
+    // CLI / silent / team / delegate / non-streaming A2A / gateway; `Some`
+    // for A2A `message/stream`.
+    stream_ctx: Option<&Arc<mika_a2a::streaming::ToolCallStreamContext>>,
 ) -> Result<LoopResult> {
     // Filter required_tools to only include tools that are actually available in the
     // current tool set (builtins + skill tools + MCP). See #516, #517.
@@ -931,6 +1015,55 @@ async fn run_loop(
             None
         };
 
+        // Emit per-turn `turn_usage` structured log event (mika#1889 — RT-005 brick
+        // 4/5). Placed OUTSIDE `if store_llm_calls` per D2/R2 — the RT-005
+        // planning-tokens measurement channel MUST NOT be silenced by the
+        // DB-persistence flag. Only raw dimensions are emitted (D1/R5); no
+        // planning/execution classification is baked in — that boundary is
+        // defined offline by brick 5/5.
+        match &llm_result {
+            Ok(resp) => {
+                let tool_use_in_turn =
+                    matches!(resp.stop_reason, LlmStopReason::ToolUse) || resp.has_tool_calls();
+                let fields = build_turn_usage_fields(
+                    step as u32,
+                    Some(&resp.usage),
+                    &format!("{:?}", resp.stop_reason),
+                    tool_use_in_turn,
+                    "success",
+                    llm_call_latency_ms,
+                );
+                emit_turn_usage(
+                    db.agent_id(),
+                    session_id,
+                    tool_ctx.trace_id,
+                    mode.label(),
+                    llm.provider_name(),
+                    llm.model_name(),
+                    &fields,
+                );
+            }
+            Err(_) => {
+                let fields = build_turn_usage_fields(
+                    step as u32,
+                    None,
+                    "error",
+                    false,
+                    "error",
+                    llm_call_latency_ms,
+                );
+                emit_turn_usage(
+                    db.agent_id(),
+                    session_id,
+                    tool_ctx.trace_id,
+                    mode.label(),
+                    llm.provider_name(),
+                    llm.model_name(),
+                    &fields,
+                );
+            }
+        }
+
         let response = llm_result?;
 
         if mode.is_conversation() {
@@ -991,6 +1124,7 @@ async fn run_loop(
                         &mut suppressed_write_tools,
                         &mut send_message_text_capture,
                         mode.is_conversation(),
+                        stream_ctx,
                     )
                     .await;
                     all_tool_summaries.extend(step_summaries);
@@ -2399,6 +2533,7 @@ async fn run_loop(
                     &mut suppressed_write_tools,
                     &mut send_message_text_capture,
                     mode.is_conversation(),
+                    stream_ctx,
                 )
                 .await;
                 all_tool_summaries.extend(step_summaries);
@@ -2594,14 +2729,23 @@ pub struct AgentParams<'a> {
     /// `None` in CLI/test contexts — falls back to per-turn AtomicBool defense.
     pub pr_reviews_posted:
         Option<&'a Arc<dashmap::DashMap<String, std::collections::HashSet<String>>>>,
-    /// Optional broadcast sender for A2A SSE tool-call events (mika#1731).
-    /// When `Some`, `process_tool_calls` emits `StreamEvent::ToolCallStart` and
-    /// `StreamEvent::ToolCallResult` frames before/after each physical tool
-    /// dispatch. The A2A `handle_message_stream` handler populates this with
-    /// the per-task broadcaster it already owns; all other callers (CLI,
-    /// silent, team, delegate) pass `None`. Emission is fire-and-forget:
-    /// broadcast errors are logged at debug and never fail the tool call.
-    pub stream_tx: Option<mika_a2a::streaming::StreamEventSender>,
+    /// Optional per-turn broadcast context for A2A SSE tool-call events
+    /// (mika#1731 wire; mika#1757 emission). Bundles the sender + task_id +
+    /// optional context_id so `process_tool_calls` has one field with a
+    /// self-consistent invariant instead of three parallel `Option`s.
+    ///
+    /// When `Some`, `process_tool_calls` emits `StreamEvent::ToolCallStart`
+    /// and `StreamEvent::ToolCallResult` frames before/after each PHYSICAL
+    /// tool dispatch. The per-turn dedup replay path (mika#582) stays silent
+    /// — one Start/Result pair per real `execute_tool()` call, not per
+    /// LLM-emitted tool_use block.
+    ///
+    /// The A2A `handle_message_stream` handler populates this with the
+    /// per-task broadcaster it already owns; all other callers (CLI, silent,
+    /// team, delegate, A2A `message/send`, gateway `/message`) pass `None`.
+    /// Emission is fire-and-forget: broadcast errors are `debug!`-logged and
+    /// never fail the tool call.
+    pub stream_ctx: Option<Arc<mika_a2a::streaming::ToolCallStreamContext>>,
 }
 
 /// Run the agent loop for a single inbound message.
@@ -2782,6 +2926,7 @@ async fn run_agent_inner(
         } else {
             None
         },
+        stopped_topics: &ctx.stopped_topics,
     };
     let is_compact_provider = llm.provider_name() == ProviderKind::MikaModel.config_prefix();
     let mut system = if is_compact_provider {
@@ -3183,6 +3328,7 @@ async fn run_agent_inner(
         deadline,
         scope_task_id,
         skill_nudge_ctx.as_ref(),
+        params.stream_ctx.as_ref(),
     )
     .await?;
 
@@ -3240,6 +3386,7 @@ async fn run_agent_inner(
                 llm,
                 &tool_call_summaries,
                 system_prompt_original_len,
+                "agent",
                 "agent",
                 deadline,
                 db,
@@ -3703,6 +3850,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         home_dir: Some(params.home_dir),
         task_health: task_health.as_ref(),
         stored_preferences: &stored_preferences,
+        stopped_topics: &ctx.stopped_topics,
     };
     let mut system = prompt::build_silent_prompt(&silent_ctx);
 
@@ -4027,6 +4175,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         deadline,
         scope_task_id.as_deref(),
         None, // mika#1583: silent-mode turns do not nudge
+        None, // mika#1757: silent turns have no A2A streaming subscriber
     )
     .await?;
 
@@ -4082,6 +4231,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
                 &tool_call_summaries,
                 system_prompt_original_len,
                 trigger_label,
+                "silent agent",
                 deadline,
                 db,
                 params.session_id,
@@ -4234,6 +4384,33 @@ async fn run_team_agent_inner(
         .await
 }
 
+/// Emit a stage-timing INFO event for the team-agent pre-LLM prelude.
+/// Returns the current instant so the caller can chain (`prev = emit_team_stage(...)`).
+///
+/// Delegation-hang diagnostic: when `delegate_task`'s 120s tool timeout fires
+/// with zero LLM calls in the delegate session, this trail tells the operator
+/// exactly which prelude stage stalled. Grep `event = "team_agent_stage"` in
+/// `$MIKA_SPIRIT_LOG_FILE` for stage/elapsed_ms per session.
+fn emit_team_stage(
+    stage: &'static str,
+    agent_name: &str,
+    session_id: &str,
+    prev: Instant,
+) -> Instant {
+    let now = Instant::now();
+    let elapsed_ms = now.duration_since(prev).as_millis() as u64;
+    tracing::info!(
+        target: "mika::otel",
+        event = "team_agent_stage",
+        agent = agent_name,
+        session_id = session_id,
+        stage,
+        elapsed_ms,
+        "team_agent pre-LLM stage complete"
+    );
+    now
+}
+
 async fn run_team_agent_inner_impl(
     params: &TeamAgentParams<'_>,
     deadline: Instant,
@@ -4241,7 +4418,26 @@ async fn run_team_agent_inner_impl(
     let llm = params.llm;
     let tools = params.tools;
 
+    // Pre-LLM stage-timing observability (mika delegation-hang diagnostic).
+    // The delegate_task tool has a 120s timeout; when it fires the inner
+    // `run_team_agent` future is dropped, so if the hang is in the pre-LLM
+    // prelude we see ZERO downstream events (no llm_call, no tool_call).
+    // Without checkpoints between session-create and first LLM call, the
+    // operator can't tell whether the hang was in `load_agent_context`, in
+    // `resolve_github_token` (App token exchange network), in
+    // `resolve_contexts` (per-context fetch), or in tool injection.
+    // Six checkpoints, each with elapsed_ms since the previous one, keyed
+    // on `event = "team_agent_stage"` for grep-friendly log queries.
+    let stage_start = Instant::now();
+
     let ctx = load_agent_context(params.db, params.home_dir).await?;
+    let mut stage_prev = stage_start;
+    stage_prev = emit_team_stage(
+        "load_agent_context",
+        params.agent_name,
+        params.session_id,
+        stage_prev,
+    );
 
     let prompt_ctx = prompt::PromptContext {
         soul_content: &ctx.soul_content,
@@ -4257,6 +4453,7 @@ async fn run_team_agent_inner_impl(
         telegram_configured: params.message_sender.is_some(),
         home_dir: Some(params.home_dir),
         callback_context: None,
+        stopped_topics: &ctx.stopped_topics,
     };
     let is_compact_provider = llm.provider_name() == ProviderKind::MikaModel.config_prefix();
     let mut system = if is_compact_provider {
@@ -4271,6 +4468,12 @@ async fn run_team_agent_inner_impl(
         system.push_str(params.team_context);
         system.push('\n');
     }
+    stage_prev = emit_team_stage(
+        "build_system_prompt",
+        params.agent_name,
+        params.session_id,
+        stage_prev,
+    );
 
     // Resolve GitHub token once: prefer GitHub App installation token, fall back to PAT.
     let team_resolved_github_token = if let Some(settings) = params.settings {
@@ -4278,6 +4481,12 @@ async fn run_team_agent_inner_impl(
     } else {
         params.github_token.map(String::from)
     };
+    stage_prev = emit_team_stage(
+        "resolve_github_token",
+        params.agent_name,
+        params.session_id,
+        stage_prev,
+    );
 
     // Match skills and resolve tool definitions
     let mut matched = params.skills.match_message(params.task_message);
@@ -4286,6 +4495,12 @@ async fn run_team_agent_inner_impl(
     review_filter::apply_review_filter(&mut matched, params.task_message);
 
     let matched_entries: Vec<&SkillEntry> = matched.iter().map(|m| m.entry).collect();
+    stage_prev = emit_team_stage(
+        "match_skills",
+        params.agent_name,
+        params.session_id,
+        stage_prev,
+    );
 
     // Resolve context requirements before LLM override
     let (resolved_context, context_exclude) = context::resolve_contexts(
@@ -4298,6 +4513,12 @@ async fn run_team_agent_inner_impl(
     for &idx in context_exclude.iter().rev() {
         matched.remove(idx);
     }
+    let _ = emit_team_stage(
+        "resolve_contexts",
+        params.agent_name,
+        params.session_id,
+        stage_prev,
+    );
     // Resolve per-skill LLM override (keyword-matched skills only — #463)
     let skill_llm_override = resolve_skill_llm_override(&matched, params.settings, llm);
     let matched_entries: Vec<&SkillEntry> = matched.iter().map(|m| m.entry).collect();
@@ -4459,6 +4680,7 @@ async fn run_team_agent_inner_impl(
         deadline,
         None, // team mode: no task context for parallel narrative
         None, // mika#1583: team-mode turns do not nudge
+        None, // mika#1757: team turns have no A2A streaming subscriber
     )
     .await?;
 
@@ -4522,6 +4744,7 @@ async fn run_team_agent_inner_impl(
                 llm,
                 &tool_call_summaries,
                 system_prompt_original_len,
+                "team agent",
                 "team agent",
                 deadline,
                 params.db,
@@ -5201,6 +5424,121 @@ fn emit_system_prompt_assembled(
         "system prompt assembled"
     );
     Some(total_bytes as i64)
+}
+
+/// Raw dimensions of a per-turn LLM `usage` observation, decoupled from log emission
+/// (mika#1889). Pure data — no I/O — so the `Option<u64>`-to-`0` cache mapping, the
+/// `u32::MAX` continuation sentinel, the `latency_ms` pass-through, and the
+/// `tool_use_in_turn` derivation are unit-testable without a tracing subscriber.
+///
+/// **Prime hard condition #1 (planning-tokens = SEUL primary outcome):** these
+/// fields are the RAW discriminating dimensions the RT-005 offline analyzer
+/// (brick 5/5) consumes to define the planning-vs-execution boundary. No
+/// `phase`/`is_planning`/`role` field appears here — the classification is an
+/// offline analytic decision, not baked into the thermometer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TurnUsageFields {
+    step: u32,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    latency_ms: u64,
+    stop_reason: String,
+    tool_use_in_turn: bool,
+    status: String,
+}
+
+/// Pure builder: maps a per-turn observation into `TurnUsageFields` (mika#1889).
+///
+/// `usage = None` (error/timeout arms) yields zero tokens across the board so the
+/// event still fires and the turn still counts toward the covariable "turns"
+/// count.
+///
+/// **Cache-field flatten (`Option<u64>` → `0`).** `cache_creation_input_tokens`
+/// is Anthropic-only; `cache_read_input_tokens` is Anthropic AND OpenAI-compat
+/// via `prompt_tokens_details.cached_tokens` (mika#479). We flatten `None → 0`
+/// in the log so the analyzer can `jq '.cache_read_tokens'` unconditionally.
+///
+/// **`input_tokens` provider asymmetry (RAW; analyzer normalizes per D1).**
+/// `LlmUsage.input_tokens` carries the provider's raw shape: Anthropic reports
+/// *fresh* input (excludes cache_read); OpenAI-compat reports `prompt_tokens`
+/// which *includes* `cache_read`. The plan's D1/R5 mandates raw emission — the
+/// offline analyzer (brick 5/5) applies per-family normalization keyed on the
+/// emitted `provider` field. The instrumentation MUST NOT normalize here.
+///
+/// `step = u32::MAX` is the continuation sentinel (mirrors the DB path in
+/// `save_continuation_llm_call`).
+fn build_turn_usage_fields(
+    step: u32,
+    usage: Option<&LlmUsage>,
+    stop_reason: &str,
+    tool_use_in_turn: bool,
+    status: &str,
+    latency_ms: u64,
+) -> TurnUsageFields {
+    let (input, output, cache_read, cache_write) = match usage {
+        Some(u) => (
+            u.input_tokens,
+            u.output_tokens,
+            u.cache_read_input_tokens.unwrap_or(0),
+            u.cache_creation_input_tokens.unwrap_or(0),
+        ),
+        None => (0, 0, 0, 0),
+    };
+    TurnUsageFields {
+        step,
+        input_tokens: input,
+        output_tokens: output,
+        cache_read_tokens: cache_read,
+        cache_write_tokens: cache_write,
+        latency_ms,
+        stop_reason: stop_reason.to_string(),
+        tool_use_in_turn,
+        status: status.to_string(),
+    }
+}
+
+/// Emit a structured `turn_usage` INFO event carrying per-turn LLM token
+/// `usage` (mika#1889). Mirrors `emit_system_prompt_assembled` shape.
+///
+/// **Ungated by `MIKA_STORE_LLM_CALLS`.** The event fires on every LLM call in
+/// the agent loop regardless of `store_llm_calls` — the log stream is the RT-005
+/// primary-outcome measurement channel and MUST NOT be coupled to the
+/// DB-persistence flag (R2/D2). Field names mirror the `llm_calls` columns so
+/// the offline analyzer (brick 5/5) can join or cross-check the two surfaces.
+/// `provider` + `model` are emitted so the analyzer can apply per-family
+/// input-token normalization (see the provider-asymmetry note on
+/// `build_turn_usage_fields`) from the log alone.
+fn emit_turn_usage(
+    agent_id: &str,
+    session_id: &str,
+    trace_id: &str,
+    mode: &str,
+    provider: &str,
+    model: &str,
+    fields: &TurnUsageFields,
+) {
+    info!(
+        target: "mika::otel",
+        event = "turn_usage",
+        agent_id = %agent_id,
+        session_id = %session_id,
+        trace_id = %trace_id,
+        mode = %mode,
+        provider = %provider,
+        model = %model,
+        step = fields.step,
+        stop_reason = %fields.stop_reason,
+        input_tokens = fields.input_tokens,
+        output_tokens = fields.output_tokens,
+        cache_read_tokens = fields.cache_read_tokens,
+        cache_write_tokens = fields.cache_write_tokens,
+        latency_ms = fields.latency_ms,
+        tool_use_in_turn = fields.tool_use_in_turn,
+        status = %fields.status,
+        "turn usage"
+    );
 }
 
 /// Detect whether text contains XML-formatted tool call patterns.
@@ -10410,5 +10748,122 @@ mod tests {
                  was it renamed or removed?"
             );
         }
+    }
+
+    // ===========================================================================
+    // mika#1889 — Per-turn usage/token logging (RT-005 brick 4/5)
+    //
+    // Structural coverage of the `build_turn_usage_fields` pure builder. The
+    // token/dimension mapping is tested directly here so we do not depend on a
+    // captured tracing subscriber (D5). The emission site itself is exercised
+    // no-panic by the existing eval harness in `tests/eval/`.
+    // ===========================================================================
+
+    fn usage_with_cache() -> LlmUsage {
+        LlmUsage {
+            input_tokens: 1234,
+            output_tokens: 567,
+            cache_creation_input_tokens: Some(89),
+            cache_read_input_tokens: Some(4321),
+        }
+    }
+
+    fn usage_without_cache() -> LlmUsage {
+        LlmUsage {
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        }
+    }
+
+    #[test]
+    fn build_turn_usage_success_with_cache_passes_through_tokens() {
+        let u = usage_with_cache();
+        let f = build_turn_usage_fields(3, Some(&u), "ToolUse", true, "success", 250);
+        assert_eq!(f.step, 3);
+        assert_eq!(f.input_tokens, 1234);
+        assert_eq!(f.output_tokens, 567);
+        // Anthropic-only cache fields: `Option<u64>` flattened to `0` when absent —
+        // here `Some(4321)` and `Some(89)` are preserved verbatim.
+        assert_eq!(f.cache_read_tokens, 4321);
+        assert_eq!(f.cache_write_tokens, 89);
+        assert_eq!(f.latency_ms, 250);
+        assert_eq!(f.stop_reason, "ToolUse");
+        assert!(f.tool_use_in_turn);
+        assert_eq!(f.status, "success");
+    }
+
+    #[test]
+    fn build_turn_usage_success_no_cache_flattens_option_to_zero() {
+        // Non-Anthropic providers report None for cache_creation; some
+        // OpenAI-compat providers also report None for cache_read. The log MUST
+        // still be jq-parseable unconditionally — `None` → `0`, never a missing
+        // field. This is the load-bearing analyzer-shape invariant.
+        let u = usage_without_cache();
+        let f = build_turn_usage_fields(0, Some(&u), "EndTurn", false, "success", 0);
+        assert_eq!(f.input_tokens, 10);
+        assert_eq!(f.output_tokens, 20);
+        assert_eq!(f.cache_read_tokens, 0);
+        assert_eq!(f.cache_write_tokens, 0);
+        assert_eq!(f.latency_ms, 0);
+        assert!(!f.tool_use_in_turn);
+    }
+
+    #[test]
+    fn build_turn_usage_error_arm_zeros_all_tokens() {
+        // Error/timeout arms have no `LlmUsage`. R3 mandates the event still
+        // fires so the covariable "turns" count is not silently undercounted —
+        // the tokens roll to zero but the row exists.
+        let f = build_turn_usage_fields(7, None, "error", false, "error", 42);
+        assert_eq!(f.step, 7);
+        assert_eq!(f.input_tokens, 0);
+        assert_eq!(f.output_tokens, 0);
+        assert_eq!(f.cache_read_tokens, 0);
+        assert_eq!(f.cache_write_tokens, 0);
+        // latency_ms is preserved even on the error arm — the transport spent
+        // wall-clock even if it produced no tokens.
+        assert_eq!(f.latency_ms, 42);
+        assert_eq!(f.stop_reason, "error");
+        assert!(!f.tool_use_in_turn);
+        assert_eq!(f.status, "error");
+    }
+
+    #[test]
+    fn build_turn_usage_continuation_step_sentinel_preserved() {
+        // The continuation turn uses `u32::MAX` as the step sentinel in both
+        // the DB path (`save_continuation_llm_call`) and the log surface, so
+        // the offline analyzer (brick 5/5) can distinguish continuation-turn
+        // usage from in-loop step indices without a separate flag.
+        let u = usage_without_cache();
+        let f = build_turn_usage_fields(u32::MAX, Some(&u), "EndTurn", false, "success", 100);
+        assert_eq!(f.step, u32::MAX);
+    }
+
+    #[test]
+    fn build_turn_usage_tool_use_boolean_is_raw_observation() {
+        // Prime hard condition #1 (planning-tokens = SEUL primary outcome):
+        // `tool_use_in_turn` is a RAW mechanical observation — did the model
+        // request tool calls this turn — not a graded planning/execution
+        // classification. Verified here by exercising both truth values with
+        // otherwise-identical inputs.
+        let u = usage_without_cache();
+        let f_true = build_turn_usage_fields(1, Some(&u), "ToolUse", true, "success", 0);
+        let f_false = build_turn_usage_fields(1, Some(&u), "EndTurn", false, "success", 0);
+        assert!(f_true.tool_use_in_turn);
+        assert!(!f_false.tool_use_in_turn);
+        // No `phase`/`is_planning`/`role` field exists on the struct — D1/R5
+        // enforced by absence (the field simply does not exist). This test
+        // documents that invariant structurally.
+    }
+
+    #[test]
+    fn build_turn_usage_latency_ms_is_raw_pass_through() {
+        // latency_ms is R1's turn-cost covariable. It's a raw transport
+        // measurement (wall-clock of the HTTP call), not an estimand
+        // component. Verified here as a pure pass-through.
+        let u = usage_without_cache();
+        let f = build_turn_usage_fields(0, Some(&u), "EndTurn", false, "success", 12345);
+        assert_eq!(f.latency_ms, 12345);
     }
 }

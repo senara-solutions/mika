@@ -1,13 +1,6 @@
-use anyhow::Result;
-use secrecy::ExposeSecret;
+use anyhow::{Context, Result};
 use std::io::Read;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use uuid::Uuid;
-
-use mika_agent::agent::{self, AgentParams, check_onboarding};
-use mika_agent::skills::SkillRegistry;
-use mika_agent::tools;
 
 use crate::cli::OutputFormat;
 use crate::init;
@@ -104,9 +97,22 @@ pub async fn run(
         anyhow::bail!("--session-id value must not be empty");
     }
     let reusing_session = session_id.is_some();
-    let session_id = session_id
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    // Resolve the canonical session for singleton agents (mika#1401). An explicit
+    // --session-id always wins; otherwise a singleton agent (`[session] singleton =
+    // true` in identity.toml) reuses its one canonical session and non-singleton
+    // agents mint a fresh UUID per invocation. Identity is loaded once here and
+    // reused below for the skill allowlist.
+    let identity = mika_agent::prompt::load_identity(&ctx.home_dir);
+    let canonical_session_id =
+        mika_agent::prompt::resolve_canonical_session_id(&identity, ctx.async_db.agent_id());
+    let session_id = if let Some(s) = session_id {
+        s.to_string()
+    } else if let Some(ref canonical) = canonical_session_id {
+        canonical.clone()
+    } else {
+        Uuid::new_v4().to_string()
+    };
+    let is_canonical_session = canonical_session_id.as_deref() == Some(session_id.as_str());
     // Validate session ownership if reusing an existing session
     if reusing_session
         && let Ok(Some(existing)) = ctx.async_db.get_session(&session_id).await
@@ -119,30 +125,35 @@ pub async fn run(
             ctx.async_db.agent_id()
         );
     }
-    // Store task_id in session metadata and as a first-class column for observability correlation
-    let session_metadata = task_id.map(|tid| serde_json::json!({"task_id": tid}).to_string());
-    if let Err(e) = ctx
-        .async_db
-        .create_session_with_metadata(
-            &session_id,
-            ctx.async_db.agent_id(),
-            "cli",
-            session_metadata.as_deref(),
-            task_id,
-        )
-        .await
-    {
-        tracing::warn!(error = %e, "failed to create session");
+    // Create the session. Singleton agents use an idempotent INSERT OR IGNORE on the
+    // shared canonical session — task_id correlation rides on the messages
+    // (internal-tagged via correlated_task_id), not the shared session row. All other
+    // invocations create a per-ask session carrying task_id in metadata and as a
+    // first-class column for observability correlation.
+    if is_canonical_session {
+        if let Err(e) = ctx
+            .async_db
+            .get_or_create_canonical_session(&session_id, "cli")
+            .await
+        {
+            tracing::warn!(error = %e, "failed to create canonical session");
+        }
+    } else {
+        let session_metadata = task_id.map(|tid| serde_json::json!({"task_id": tid}).to_string());
+        if let Err(e) = ctx
+            .async_db
+            .create_session_with_metadata(
+                &session_id,
+                ctx.async_db.agent_id(),
+                "cli",
+                session_metadata.as_deref(),
+                task_id,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "failed to create session");
+        }
     }
-    let http_client = reqwest::Client::new();
-    let message_sender = crate::init::make_message_sender(
-        &ctx.settings,
-        &ctx.async_db,
-        &http_client,
-        ctx.async_db.agent_id(),
-    );
-    let embedding_client = ctx.settings.make_embedding_client();
-
     // Read message from arg, or from stdin if "-"
     let user_message = if message == "-" {
         let mut buf = String::new();
@@ -216,8 +227,13 @@ pub async fn run(
                 );
             }
 
-            // End the session so the dashboard doesn't show it as "ongoing"
-            if let Err(e) = ctx.async_db.end_session(&session_id).await {
+            // End the session so the dashboard doesn't show it as "ongoing".
+            // No-op for singleton agents — the canonical session is never ended.
+            if let Err(e) = ctx
+                .async_db
+                .end_session_unless_canonical(&session_id, canonical_session_id.as_deref())
+                .await
+            {
                 tracing::warn!(error = %e, "failed to end session");
             }
             return Ok(());
@@ -260,41 +276,26 @@ pub async fn run(
         user_message
     };
 
-    // Normal ask mode — full conversation agent
-    let mut tool_registry = tools::default_tools();
-    for tool in tools::management_tools_if_needed(
-        &ctx.global_home,
-        &ctx.settings,
-        reqwest::Client::new(),
-        ctx.github_app.clone(),
-    ) {
-        tool_registry.register(tool);
-    }
-    let tool_registry = Arc::new(tool_registry);
-    let skills_dir = ctx.home_dir.join("skills");
-    // Migrate legacy .disabled marker files to DB (one-shot, idempotent).
-    if let Err(e) = mika_agent::skills::migrate_disabled_markers_async(
-        &skills_dir,
-        &ctx.async_db,
-        &ctx.async_db.agent_id,
-    )
-    .await
-    {
-        tracing::warn!(error = %e, "failed to migrate .disabled markers");
-    }
-    let mut skill_registry = SkillRegistry::from_dir(&skills_dir);
-    let identity = mika_agent::prompt::load_identity(&ctx.home_dir);
-    if let Some(ref allowlist) = identity.skills.allowlist {
-        skill_registry.apply_identity_allowlist(allowlist);
-    }
-    if let Ok(overrides) = ctx
-        .async_db
-        .get_skill_overrides(&ctx.async_db.agent_id)
-        .await
-    {
-        skill_registry.apply_overrides(&overrides);
-    }
-    // Validate --enable-skill / --disable-skill don't conflict on the same skill name.
+    // --- #1727 TUI/CLI thin-client slice ---
+    // The one-shot agent loop no longer runs in-process here. It is delegated to
+    // the local mika-spirit daemon over A2A (`message/send`), mirroring the
+    // `--remote` cloud path in `remote_ask.rs`. mika-spirit owns skills, tools,
+    // MCP, and per-run token accounting; this process is now a thin client that
+    // ships the prompt and renders the returned Task.
+    //
+    // Deferred follow-ups (flagged for MPC review, out of scope for this slice):
+    //   * `--enable-skill` / `--disable-skill` / `--model` configure the *local*
+    //     registry/LLM, which is no longer the execution surface. Their arg-level
+    //     validation is preserved, but they do not yet reach spirit — that needs
+    //     a config channel threaded through `message/send`.
+    //   * per-run token usage (verbose `tokens.*`) is not carried by the A2A
+    //     `Task`, so it degrades to absent until threaded through the protocol.
+    //   * the local bookkeeping session created above no longer records agent
+    //     turns (spirit owns the execution session); reconciling the two is a
+    //     follow-up.
+
+    // Preserve arg-level validation: --enable-skill / --disable-skill must not
+    // conflict on the same skill name.
     for enable_name in enable_skill {
         if disable_skill
             .iter()
@@ -306,90 +307,42 @@ pub async fn run(
         }
     }
 
-    // Apply transient overrides from --enable-skill / --disable-skill CLI flags.
-    // Runs after apply_overrides() so it stacks on top of DB state.
-    // Order: disable first, enable second (matches apply_overrides Phase 0/1 pattern).
-    if !disable_skill.is_empty() {
-        let result = skill_registry.apply_transient_disable(disable_skill);
-        for name in &result.not_found {
-            eprintln!("[mika] warning: --disable-skill '{name}' did not match any loaded skill");
-        }
-    }
-    if !enable_skill.is_empty() {
-        let result = skill_registry.apply_transient_always_on(enable_skill);
-        for name in &result.disabled {
-            eprintln!(
-                "[mika] warning: --enable-skill '{name}' has no effect — \
-                 skill is disabled. Run 'mika skills enable {name}' first."
-            );
-        }
-        for name in &result.not_found {
-            eprintln!("[mika] warning: --enable-skill '{name}' did not match any loaded skill");
-        }
-    }
-    skill_registry.apply_load_safety_check();
-    // Runtime allowlist↔required_tools coherence guard (mika#1576). Runs after
-    // safety check so the effective surface reflects only surviving skills.
-    skill_registry.apply_required_tools_coherence_check(agent_name);
-    skill_registry.log_summary();
-
-    // Surface validation warnings on stderr (Unit 4: #530)
-    let warn_count = skill_registry.validated_warnings().len();
-    if warn_count > 0 {
-        eprintln!(
-            "[mika] {warn_count} skill(s) loaded with validation warnings. \
-             Run 'mika skills validate' for details."
-        );
-    }
-
-    let skill_registry = Arc::new(skill_registry);
-    let is_onboarding = check_onboarding(&ctx.async_db).await;
-    let skills_dirty = AtomicBool::new(false);
-    let mcp_manager = init::connect_mcp(&ctx.home_dir).await;
-
     let started = std::time::Instant::now();
-    let output = agent::run_agent(&AgentParams {
-        db: &ctx.async_db,
-        llm: ctx.llm.as_ref(),
-        tools: &tool_registry,
-        skills: &skill_registry,
-        user_message: &user_message,
-        channel_type: "cli",
-        session_id: &session_id,
-        home_dir: &ctx.home_dir,
-        is_onboarding,
-        message_sender,
-        skip_compaction: false,
-        embedding_client: embedding_client.as_ref(),
-        thinking: None,
-        user_images: &[],
-        brave_api_key: ctx
-            .settings
-            .brave_api_key
-            .as_ref()
-            .map(|s| s.expose_secret()),
-        github_token: ctx.settings.agent_github_token(),
-        github_app: ctx.github_app.as_deref(),
-        skills_dirty: &skills_dirty,
-        skill_nudge: None, // mika#1583: nudges apply in server mode only
-        mcp_manager: mcp_manager.as_ref(),
-        global_home_dir: Some(&ctx.global_home),
-        is_callback_turn: false,
-        settings: Some(&ctx.settings),
-        trace_id: None,
-        correlated_task_id: task_id.map(|s| s.to_string()),
-        internal: task_id.is_some() && !task_complete,
-        pr_reviews_posted: None, // CLI mode: no session-scoped dedup needed
-        stream_tx: None,         // A2A-only injection point (mika#1731)
-    })
-    .await;
 
-    // End the session regardless of agent result so the dashboard shows duration
-    if let Err(e) = ctx.async_db.end_session(&session_id).await {
+    // Dispatch to the local mika-spirit A2A endpoint: {spirit_url}/a2a/{agent_name}.
+    let spirit_endpoint = format!(
+        "{}/a2a/{}",
+        crate::commands::dashboard::spirit_url(),
+        agent_name
+    );
+    let task = mika_cli::remote_ask::send_message_to_agent(&user_message, &spirit_endpoint)
+        .await
+        .with_context(|| {
+            format!("failed to reach mika-spirit over A2A at {spirit_endpoint} (is it running?)")
+        })?;
+
+    // End the local bookkeeping session regardless of outcome so the dashboard
+    // shows duration. No-op for singleton agents — the canonical session is never
+    // ended (mika#1401).
+    if let Err(e) = ctx
+        .async_db
+        .end_session_unless_canonical(&session_id, canonical_session_id.as_deref())
+        .await
+    {
         tracing::warn!(error = %e, "failed to end session");
     }
 
-    let output = output?;
+    // Extract the assistant text from the returned Task (artifacts → agent-role
+    // history → status message), reusing remote_ask's renderer. Empty output maps
+    // to `None` to preserve the text-mode fallback and JSON `content: null`.
+    let content: Option<String> = {
+        let rendered = mika_cli::remote_ask::render_task_parts(&task);
+        if rendered.is_empty() {
+            None
+        } else {
+            Some(rendered)
+        }
+    };
 
     // Check for pending callback tasks spawned during the agent loop (#265).
     // In `mika ask` there is no TaskEngine to poll for callbacks — the user needs
@@ -433,16 +386,12 @@ pub async fn run(
             None
         },
         latency_ms: if verbose { Some(elapsed_ms) } else { None },
-        tokens: if verbose {
-            output.usage.as_ref().map(|u| TokensMetadata {
-                input: Some(u.input_tokens),
-                output: Some(u.output_tokens),
-                cache_read: u.cache_read_input_tokens,
-                cache_write: u.cache_creation_input_tokens,
-            })
-        } else {
-            None
-        },
+        // #1727: per-run token usage is not carried by the A2A `Task` returned by
+        // `message/send`, so verbose `tokens.*` degrades to absent until threaded
+        // through the protocol. mika-spirit records usage server-side in the
+        // meantime. `TokensMetadata` is retained (constructed in tests + a future
+        // slice) so the JSON envelope shape stays stable for consumers.
+        tokens: None,
     };
 
     // Emit None when all fields are absent so the top-level `metadata` key
@@ -459,7 +408,7 @@ pub async fn run(
 
     match format {
         OutputFormat::Text => {
-            match output.text {
+            match content {
                 Some(text) => println!("{text}"),
                 None => eprintln!("{}", mika_agent::agent::EMPTY_RESPONSE_FALLBACK),
             }
@@ -511,7 +460,7 @@ pub async fn run(
         OutputFormat::Json => {
             let response = AskJsonResponse {
                 role: "assistant",
-                content: output.text,
+                content,
                 task_id: task_id.map(|s| s.to_string()),
                 pending_tasks: pending_callbacks,
                 metadata,
@@ -521,18 +470,13 @@ pub async fn run(
         OutputFormat::Yaml => {
             let response = AskJsonResponse {
                 role: "assistant",
-                content: output.text,
+                content,
                 task_id: task_id.map(|s| s.to_string()),
                 pending_tasks: pending_callbacks,
                 metadata,
             };
             print!("{}", serde_yaml::to_string(&response)?);
         }
-    }
-
-    // Gracefully shut down MCP server connections
-    if let Some(mcp) = mcp_manager {
-        mcp.shutdown().await;
     }
 
     // Database shutdown happens automatically via Drop on ctx

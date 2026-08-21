@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { Link } from 'react-router'
 import { useAgents } from '../api/agents.ts'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
-import { StatusBadge, EmptyState, LoadingState, ErrorState, formatApiError, formatRelativeTime } from '@senara-solutions/ui'
+import { StatusBadge, EmptyState, LoadingState, ErrorState, formatApiError, formatRelativeTime } from '@samidarko/ui'
 import { MessageSquare, Search } from 'lucide-react'
 
 export default function Agents() {

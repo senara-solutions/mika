@@ -17,6 +17,7 @@ use crate::async_db::AsyncDatabase;
 use crate::kg::config::KgAgentConfig;
 use crate::mcp::McpManager;
 use crate::server::webhook_queue::DeferredWebhook;
+use crate::server::webhook_queue_v2::WebhookQueue;
 use crate::skills::SkillRegistry;
 use crate::task_engine::{TaskDispatcher, TaskEngine};
 use crate::tools::ToolRegistry;
@@ -51,10 +52,22 @@ pub struct AgentState {
     /// Webhooks targeting a task with an in-flight callback are held here until
     /// the callback completes or the 60s timeout expires.
     pub webhook_queue: Arc<tokio::sync::Mutex<Vec<DeferredWebhook>>>,
+    /// Bounded webhook queue with backpressure + coalescing (mika#1870). The
+    /// uniform ingestion queue for `POST /message`; a single per-agent drain
+    /// worker is the sole consumer. Distinct from `webhook_queue` above (mika#528
+    /// deferral, a different mechanism). Constructed in `init_agent` from
+    /// `effective_webhook_queue_*()` config.
+    pub webhook_queue_v2: Arc<WebhookQueue>,
     /// Per-agent KG configuration resolved at init time (#778). `Disabled` skips
     /// all KG subsystem construction; `Enabled` provides the validated docs_root
     /// and precomputed docs_root_hash for the three KG startup loops.
     pub kg_config: KgAgentConfig,
+    /// Canonical session ID for singleton agents (mika#1401). `Some` when the
+    /// agent's `identity.toml` sets `[session] singleton = true` — the `/send`
+    /// handler then reuses this one session instead of minting a UUID per message.
+    /// `None` for normal agents (default: fresh session per message). Resolved
+    /// once at `init_agent` time from the agent's identity.
+    pub canonical_session_id: Option<String>,
 }
 
 /// Shared application state for the Axum HTTP server.
@@ -106,6 +119,16 @@ pub struct AppState {
     /// `RATE_LIMIT_TRIP_AUDIT_INTERVAL` so a flood does not itself write tens of
     /// thousands of audit rows.
     pub rate_limit_audit_last: Arc<DashMap<String, std::time::Instant>>,
+    /// Throttle state for the five `webhook_queue_*` audit events (mika#1870 AC5).
+    /// Keyed `"{agent}:{action}"` → last emit instant. Same 1/sec/action/agent
+    /// throttle shape as `rate_limit_audit_last` so a burst does not itself flood
+    /// the audit table.
+    pub webhook_queue_audit_last: Arc<DashMap<String, std::time::Instant>>,
+    /// Parent cancellation token for the per-agent webhook drain workers
+    /// (mika#1870). Stored here so lazy-resolved agents (`resolve_agent`, #1399)
+    /// can spawn a worker with a child token. Cancelled at server shutdown
+    /// alongside `kg_shutdown_token`.
+    pub webhook_queue_shutdown: tokio_util::sync::CancellationToken,
     /// Permission-decision coordination surface (mika#1733 sub-C AC1). Shared
     /// broadcast channel + pending-decision map. See
     /// `crates/mika-agent/docs/permission-decision-protocol-2026-07-06.md § AC1`.
@@ -169,12 +192,32 @@ impl AppState {
         .await
         {
             Ok(agent_state) => {
+                // mika#1758: attach the per-process task-event broadcast
+                // channel BEFORE inserting into the agents map so any
+                // lifecycle transition that fires immediately after (e.g.,
+                // during webhook-drain-worker spawn below) reaches the wire.
+                agent_state
+                    .db
+                    .set_task_events_channel(self.task_events_channel.clone());
                 let agent_state = Arc::new(agent_state);
                 self.agents.insert(normalized.clone(), agent_state.clone());
                 tracing::info!(
                     agent = normalized.as_str(),
                     event = "agent_resolved_lazily",
                     "lazy-constructed agent state for dashboard access"
+                );
+                // Spawn the per-agent webhook drain worker for the newly-resolved
+                // agent (mika#1870 AC4). Child of the shared parent token, so it
+                // is cancelled with the rest at shutdown.
+                crate::server::handlers::spawn_webhook_drain_worker(
+                    self.clone(),
+                    agent_state.clone(),
+                    self.webhook_queue_shutdown.child_token(),
+                );
+                tracing::info!(
+                    agent = normalized.as_str(),
+                    event = "webhook_queue_worker_spawned",
+                    "spawned webhook drain worker for lazily-resolved agent"
                 );
                 Some(agent_state)
             }

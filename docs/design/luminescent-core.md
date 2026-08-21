@@ -1,7 +1,7 @@
 # The Luminescent Core — Mika Design System
 
 **Status:** Active — the single rulebook for all Mika visual surfaces.
-**Scope:** Observability Dashboard, Cloud Console, Landing Page, and the shared `@senara-solutions/ui` component library.
+**Scope:** Observability Dashboard, Cloud Console, Landing Page, and the shared `@samidarko/ui` component library.
 **Owner:** Vincent. Updates land as direct commits to main; this rulebook is not relitigated through PRs.
 **Companion:** [`north-star.md`](./north-star.md) — the WHY this rulebook exists.
 **Origin:** Authored by Vincent during iteration on the Mika Cloud Console (Stitch project `7456518174288683643`, March 2026). Promoted to ecosystem-wide rulebook 2026-04-25.
@@ -119,7 +119,7 @@ Forbid 1px divider lines. Separate list items using the **Spacing Scale**:
 
 ### 5.1 Multi-state status grammar
 
-The active-agent chip above is the canonical surface form. For surfaces requiring multi-state status indication (success/failed operations, pending/blocked task states, info/neutral classifications), the design system declares six variants. `<StatusBadge />` from `@senara-solutions/ui` is the canonical rendering primitive for this grammar.
+The active-agent chip above is the canonical surface form. For surfaces requiring multi-state status indication (success/failed operations, pending/blocked task states, info/neutral classifications), the design system declares six variants. `<StatusBadge />` from `@samidarko/ui` is the canonical rendering primitive for this grammar.
 
 | Variant | Token | Semantic meaning |
 |---|---|---|
@@ -132,11 +132,11 @@ The active-agent chip above is the canonical surface form. For surfaces requirin
 
 Labels render UPPERCASE with `tracking-wide` (`0.05em` letter-spacing) per §3 typography. The active-agent chip above is a specialized form of `success` with the `dotPulse` modifier.
 
-**Hand-rolled status pills are forbidden.** Any new surface code rendering its own status pill (success/error inline indicators, custom colored dots with text) is a review fail. Use `<StatusBadge variant="..." label="..." />` from `@senara-solutions/ui`. For task-domain status (`pending`, `in_progress`, `completed`, etc.), use `<TaskStatusBadge status={...} />` which delegates to `<StatusBadge />` with the canonical task→variant mapping.
+**Hand-rolled status pills are forbidden.** Any new surface code rendering its own status pill (success/error inline indicators, custom colored dots with text) is a review fail. Use `<StatusBadge variant="..." label="..." />` from `@samidarko/ui`. For task-domain status (`pending`, `in_progress`, `completed`, etc.), use `<TaskStatusBadge status={...} />` which delegates to `<StatusBadge />` with the canonical task→variant mapping.
 
 ### 5.2 List row affordance grammar
 
-Tabular and list surfaces use one of three row affordances. `<ListRow />` from `@senara-solutions/ui` is the canonical rendering primitive; hand-rolling `<tr>` with row-level `onClick` outside this primitive is forbidden.
+Tabular and list surfaces use one of three row affordances. `<ListRow />` from `@samidarko/ui` is the canonical rendering primitive; hand-rolling `<tr>` with row-level `onClick` outside this primitive is forbidden.
 
 | Variant | Visual | Behavior | When to use |
 |---|---|---|---|
@@ -162,7 +162,7 @@ Tabular and list surfaces use one of three row affordances. `<ListRow />` from `
 
 ### 5.3 Filter affordance grammar
 
-Dashboard list surfaces use one of two filter primitives. `<SelectFilter />` from `@senara-solutions/ui` is the canonical primitive for categorical selection (one-of-N from a fixed or fetched option set). `<AgentFilter />` is a specialization that fetches agents via consumer-injected `agents` prop internally. Hand-rolling `<select>` or filter-shaped `<input>` with categorical options outside these primitives is forbidden.
+Dashboard list surfaces use one of two filter primitives. `<SelectFilter />` from `@samidarko/ui` is the canonical primitive for categorical selection (one-of-N from a fixed or fetched option set). `<AgentFilter />` is a specialization that fetches agents via consumer-injected `agents` prop internally. Hand-rolling `<select>` or filter-shaped `<input>` with categorical options outside these primitives is forbidden.
 
 | Primitive | Use for | Options | Example surfaces |
 |---|---|---|---|
@@ -194,7 +194,7 @@ For AI platforms, we introduce the **Console Component**: A `surface_container_h
 
 ### 5.4 Time-range filter affordance grammar
 
-Time-range filtering is the canonical observability filter. `<TimeRangeFilter />` from `@senara-solutions/ui` is the canonical primitive; hand-rolling `<input type="datetime-local">` or relative-time presets outside this primitive is forbidden on filter rows.
+Time-range filtering is the canonical observability filter. `<TimeRangeFilter />` from `@samidarko/ui` is the canonical primitive; hand-rolling `<input type="datetime-local">` or relative-time presets outside this primitive is forbidden on filter rows.
 
 **Affordance shape:**
 - Quick presets row: `15m / 1h / 24h / 7d / 30d / Custom`. Selected preset highlights with the focus ring + token color (`text-accent`).
@@ -227,7 +227,7 @@ The component's inline JSDoc must name this assumption so it's discoverable with
 
 ### 5.5 State catalog grammar (loading / empty / error)
 
-Every list and detail surface in the dashboard renders one of three lifecycle states before the happy-path content: **loading** (fetch in progress), **empty** (request succeeded, zero results), **error** (fetch failed). The canonical primitives are `<LoadingState />`, `<EmptyState />`, `<ErrorState />` from `@senara-solutions/ui`. Hand-rolling these states (raw `Loading...` text, `text-red-400` error banners, untreated `null` returns) is a review fail.
+Every list and detail surface in the dashboard renders one of three lifecycle states before the happy-path content: **loading** (fetch in progress), **empty** (request succeeded, zero results), **error** (fetch failed). The canonical primitives are `<LoadingState />`, `<EmptyState />`, `<ErrorState />` from `@samidarko/ui`. Hand-rolling these states (raw `Loading...` text, `text-red-400` error banners, untreated `null` returns) is a review fail.
 
 **Visual reference:** Stitch screen `be408326efc949e49b8ab6d7c524b5f9` ("Mika State Catalog Reference") — 6 panels showing list-context and detail-context patterns.
 
@@ -249,7 +249,7 @@ The three primitives are consumed directly. **No `<QueryStates />` or similar wr
 
 **Error-message conversion:**
 
-Consumers MUST convert raw error objects to human-shaped strings before passing to `<ErrorState message={...} />`. The canonical conversion path is `formatApiError(error: unknown): string` exported from `@senara-solutions/ui`. Three cases handled:
+Consumers MUST convert raw error objects to human-shaped strings before passing to `<ErrorState message={...} />`. The canonical conversion path is `formatApiError(error: unknown): string` exported from `@samidarko/ui`. Three cases handled:
 - Network error (`TypeError: Failed to fetch` etc.) → "Network unreachable. Check your connection."
 - Server error with `detail` field (typical FastAPI/Axum error envelope) → use the detail text
 - Error instance → use the error message
@@ -308,7 +308,7 @@ This rulebook grows as we discover patterns the existing rules don't cover. The 
 
 1. A surface needs a pattern not in this document (e.g., the Observability Dashboard needs a trace widget the Cloud Console doesn't).
 2. The pattern is proposed to Vincent — by Claude during a Stitch session, by a contributor in a brainstorm, or by Vincent himself.
-3. If accepted, the pattern is added to this document with a section identifying which surfaces consume it. **One implementation, in `@senara-solutions/ui` if shared, otherwise in the surface's local components.**
+3. If accepted, the pattern is added to this document with a section identifying which surfaces consume it. **One implementation, in `@samidarko/ui` if shared, otherwise in the surface's local components.**
 4. The pattern is now a rule. PRs that introduce the pattern reference the relevant section here.
 
 The rulebook never splits. We never have "the Dashboard's version" of a button. If a button needs a variant, the variant is added to this document and offered to all surfaces.
@@ -317,9 +317,9 @@ The rulebook never splits. We never have "the Dashboard's version" of a button. 
 
 The technical embodiment of this rulebook lives at:
 
-- **`mika/packages/ui/`** — `@senara-solutions/ui` shared component library. Tokens, primitives, components defined here are consumed by all three surfaces.
-- **`mika/dashboard/`** — Observability Dashboard. Consumes `@senara-solutions/ui`, applies surface-specific page layouts.
-- **`mika-cloud/`** — Cloud Console (frontend lives in `mika-cloud`, gateway code in `mika/crates/mika-gateway`). Consumes `@senara-solutions/ui`.
-- **Landing Page** — TBD location; will consume `@senara-solutions/ui` during its reconciliation pass.
+- **`mika/packages/ui/`** — `@samidarko/ui` shared component library. Tokens, primitives, components defined here are consumed by all three surfaces.
+- **`mika/dashboard/`** — Observability Dashboard. Consumes `@samidarko/ui`, applies surface-specific page layouts.
+- **`mika-cloud/`** — Cloud Console (frontend lives in `mika-cloud`, gateway code in `mika/crates/mika-gateway`). Consumes `@samidarko/ui`.
+- **Landing Page** — TBD location; will consume `@samidarko/ui` during its reconciliation pass.
 
-When in doubt about whether a token, primitive, or component should live in `@senara-solutions/ui` versus a surface's local components: **if more than one surface needs it, it goes in `@senara-solutions/ui`.** The default is shared.
+When in doubt about whether a token, primitive, or component should live in `@samidarko/ui` versus a surface's local components: **if more than one surface needs it, it goes in `@samidarko/ui`.** The default is shared.

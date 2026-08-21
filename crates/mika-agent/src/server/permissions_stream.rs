@@ -429,7 +429,14 @@ impl PermissionsChannel {
         let ch = Arc::clone(self);
         tokio::spawn(async move {
             tokio::time::sleep(timeout).await;
-            if let Some(entry) = ch.pending_asks.lock().await.remove(&request_id) {
+            // Release the tokio Mutex guard before firing the timeout send so
+            // the pending_asks lock is not held across the oneshot send +
+            // debug! (clippy::sig_drop, #1724).
+            let removed = {
+                let mut asks = ch.pending_asks.lock().await;
+                asks.remove(&request_id)
+            };
+            if let Some(entry) = removed {
                 // Ignore send failure — the classifier may have dropped
                 // its receiver.
                 let _ = entry.sender.send(AnswerResult::operator_timeout());

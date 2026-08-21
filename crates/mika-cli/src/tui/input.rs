@@ -1191,7 +1191,8 @@ mod tests {
             "mika".to_string(),
             global_home,
             ProviderKind::Anthropic,
-            false,
+            false, // start_in_audit_mode
+            false, // is_singleton_session (mika#1401)
         );
 
         (app, agent_rx, temp_dir)

@@ -60,3 +60,6 @@ axum.workspace = true
 # For the mika#1734 AskUserQuestion SSE stub consumer example
 tokio-util = { version = "0.7", features = ["io"] }
 futures-util.workspace = true
+
+[lints]
+workspace = true

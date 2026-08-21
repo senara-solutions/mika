@@ -50,6 +50,8 @@ Skills with `[context.*]` sections have their data pre-fetched by the engine bef
 
 **Per-agent override:** mika-arch sets `[context.summary] inject = false`, removing the *conversation summary* layer from its system prompt entirely (mika#1009 leak protection). New agents that disable summary injection should be listed here.
 
+**Stop-signal convention (mika#1813):** the `stop_topic_*` preference key prefix (`prompt::STOP_TOPIC_PREFIX`) captures user requests to stop being re-nagged on a subject. When the user says "arrête" / "stop bringing this up" on subject X, the agent persists a `store_fact(category='preference', key='stop_topic_<slug>', value=…)` in the same turn. `AgentContext::load_agent_context` (`agent_loop/mod.rs`) fetches these via `search_preferences(STOP_TOPIC_PREFIX)` on every turn, filters the result through `prompt::filter_stop_topic_preferences` (strict `category` prefix — `search_preferences` is a substring LIKE over both `category` and `value`, so an unfiltered load would surface false positives and mute unrelated axes), and threads the filtered set into `PromptContext` (conversation) and `SilentPromptContext` (silent). `build_system_prompt` and `build_silent_prompt` render them as a `<stopped-topics>` block with an explicit "do NOT re-initiate on these" instruction. The state layer is the structural gate — the block re-appears on every future turn even if the model forgets, so the pattern degrades gracefully. Direct user questions about a stopped topic remain answerable (stop = don't re-initiate; question = respond normally). DB read is fail-open with a `stop_topic_load_failed` WARN log so a persistent DB failure is greppable instead of silently disabling suppression. **Compact-provider carve-out (mika#1925):** `build_compact_system_prompt` (used for `ProviderKind::MikaModel`) does NOT render the block or rules — the ≤5 KB budget cannot afford it and MikaModel is not currently used for production family-tier or operator-tier agents. mika#1925 tracks wiring a size-capped variant when MikaModel goes live for real tenants. **Team-agent inheritance (mika#1926):** team-child prompts thread `stopped_topics` from the CHILD agent's own DB, not the orchestrator's — the decision on whether the operator's stop-signals should propagate down through team delegation is open under mika#1926.
+
 ## Context Injection Configuration
 
 `[context]` section in `identity.toml` controls prompt-assembly behavior for context blocks. Each context block has its own nested subsection.
@@ -90,6 +92,30 @@ max_tokens = 1000
 inject = true
 max_tokens = 0
 ```
+
+## Session Configuration
+
+`[session]` section in `identity.toml` makes an agent **single-session-by-nature** (mika#1401). `SessionIdentityConfig` in `prompt.rs` deserializes it.
+
+### `[session].singleton` (bool, default: `false`)
+
+When `true`, every conversational invocation (`mika ask`, `mika chat`, HTTP `/send`) reuses one canonical session instead of minting a fresh `Uuid::new_v4()` per ask. The single-session invariant is enforced by the engine, not by remembering to pass `--session-id`. Opt-in — absent or `false` preserves the default (random UUID per ask). An explicit `--session-id` always overrides the canonical session.
+
+### `[session].canonical_id` (string, optional, default: derived)
+
+The literal session ID to use. When absent and `singleton = true`, the engine derives `canonical-{agent_id}` — a prefix-typed sibling of `system-{agent_id}`, structurally exempt from `prune_old_sessions` (the `canonical-` prefix is not in its LIKE clause). `canonical_id` exists for mika-prime's operator-chosen zero-UUID (`00000000-0000-0000-0000-000000000000`), which is likewise pruning-exempt (no matching prefix).
+
+```toml
+[session]
+singleton = true
+canonical_id = "00000000-0000-0000-0000-000000000000"  # optional
+```
+
+**Mechanism:** `resolve_canonical_session_id(&Identity, agent_id) -> Option<String>` returns `None` for non-singleton agents (callers mint per-ask UUIDs), else the resolved ID. The `/send` handler caches it on `AgentState.canonical_session_id` at `init_agent` time; CLI paths resolve it per-invocation. Session creation goes through the idempotent `get_or_create_canonical_session` (`INSERT OR IGNORE`, mirroring `get_or_create_system_session`). Session teardown goes through `end_session_unless_canonical(id, canonical_id)`, which no-ops when `id == canonical_id` so the canonical session's `ended_at` stays NULL forever. In the TUI, `/clear` for a singleton agent clears only the display (gated by `App.is_singleton_session`) — the session ID and worker context are preserved.
+
+**Compaction interaction:** compaction already keys on `agent_id`, not `session_id`, so a singleton agent is unaffected — the single canonical session simply accumulates all history. The silent/callback/heartbeat paths use their own derived namespaces (`callback-*`, `heartbeat-*`) and are untouched.
+
+**Concurrency:** the singleton merges all channels into one thread. For a single-surface, zero-skill oracle (mika-prime's profile) this is the designed intent, not a defect. High-concurrency multi-surface agents should not opt in.
 
 ## Tools
 
@@ -179,9 +205,39 @@ General-purpose `gh` CLI handler. Three-tier validation: (1) global subcommand a
 
 `server::webhook_queue` — in-memory queue that holds inbound GitHub webhooks when the target task has an in-flight `run_claude_pilot` callback (#528). Prevents race conditions where a webhook (e.g. `pull_request_review.submitted`) arrives before the callback persists metadata (`pr_url`). Correlation: PR URL via `parse_pr_review_event()`, branch via check_suite regex, fallback to sole-inflight-callback heuristic. 60s per-webhook timeout with forced replay. Drain triggers: callback completion in `handle_task_complete` (Ok path only), or timeout expiry via `drain_expired()`. Emits `webhook_deferred` and `webhook_replayed` audit events. Queue is in-memory only (lost on restart; GitHub supports redelivery). See #528.
 
+### Bounded Webhook Queue (v2)
+
+`server::webhook_queue_v2` — per-agent bounded queue with backpressure + coalescing (mika#1870). **A different mechanism from the mika#528 deferral queue above** (which sequences webhooks against in-flight callbacks). This is the general-purpose ingestion queue that replaces `POST /message`'s legacy `try_lock_owned()` → 429-reject pattern. **Uniform-queue model:** every inbound `POST /message` request enqueues; a single per-agent drain worker (`handlers::spawn_webhook_drain_worker`) is the sole consumer that acquires `agent_lock` and runs `run_agent_for_message`. The mika#528 deferral check runs **before** the enqueue and is unchanged. The accepted-case HTTP response is byte-identical to the legacy path (`status: "accepted"`) — the queue is invisible to the gateway; only the busy case changes (429 → queued).
+
+**Classification + coalescing (AC2):** `classify_event(text)` maps gateway-formatted text to an exhaustive `WebhookEventKind` (`CheckSuite`/`PullRequestSync`/`Push`/`PrReview`/`IssueLabeled`/`ReadyLabel`/`Other`); `coalescing_key(&kind)` is an **exhaustive match with no wildcard arm** — a new variant fails to compile until a coalescing decision is made. Coalescing keys: `check_suite:{repo}:{branch}`, `pr_sync:{repo}:{pr}`, `push:{repo}:{branch}`, `labeled:{repo}:{issue}:{label}`; `PrReview`/`ReadyLabel`/`Other` return `None` (never coalesce — user input / dispatch trigger / order-preserving). `PR synchronize` → `PullRequestSync`; other PR actions (opened/closed/review_requested) → `Other`. Reuses `verdict::parse_pr_review_event` + sibling regexes. `Push` is reserved (the current gateway does not emit a branch-bearing push text; `classify_event` never produces it today).
+
+**Enqueue algorithm (HYBRID: coalesce → block → drop-oldest):** (1) if a queued sibling shares the coalescing key → remove it, push the new to the back (newest-wins), return `Coalesced{replaced_event_id}`; (2) else if `depth < max_depth` → push, `Enqueued{depth}`; (3) else block up to `block_timeout` (default 100ms) on a `Notify` for a drain slot, retry once; (4) still full → drop the oldest (`pop_front`), push new, `Dropped` (dead-letter surface). `dequeue()` is cancel-safe (nothing popped until an item is present), awaits an item `Notify` when empty. Two `Notify` instances separate item-available (empty→wake) from slot-available (full→wake) to avoid mixed-semantics lost wakeups.
+
+**`check_suite` SHA caveat (correctness-critical):** mika#1869 keys on `(repo, branch, head_sha)`; the gateway text carries repo+branch but **NOT** `head_sha`. v1 mitigates the same-branch-double-push missed-event hazard via **time-bounded coalescing** — only entries *still in the queue* coalesce, and the downstream `ci_success_handler` re-aggregates all required checks on every invocation, so a coalesced-away duplicate skips only a redundant walk, never a state transition. Threading `head_sha` end-to-end is a deferred cross-repo follow-up. Single FIFO priority class in v1; priority classes deferred.
+
+**Drain worker (AC4):** one `tokio::spawn` per agent (boot loop in `run_server`; lazy-resolved agents get one in `resolve_agent`, mika#1399), `select!`-ing over a parent `CancellationToken` (`AppState.webhook_queue_shutdown`, cancelled at shutdown alongside `kg_shutdown_token`), `dequeue()`, and a 5s gauge heartbeat. Processing runs in a child task so a panic never crashes the loop (captured as `JoinError`). Blocking `lock_owned().await` serialises turns — modeled exactly on `replay_deferred_webhooks`.
+
+**Audit events (AC5, throttled ≤1/sec/action/agent via `AppState.webhook_queue_audit_last`):** `webhook_queue_enqueued`, `webhook_queue_coalesced`, `webhook_queue_drop_oldest`, `webhook_queue_dequeued`, `webhook_queue_processing_error` (all `target_key = agent:{name}`). Best-effort 5s structured-log gauge `webhook_queue.gauge` (`depth`/`enqueued_total`/`coalesced_total`/`dropped_total`), emitted only when the queue is non-idle. **Config (AC6):** `MIKA_WEBHOOK_QUEUE_MAX_DEPTH` (64), `MIKA_WEBHOOK_QUEUE_BLOCK_TIMEOUT_MS` (100), `MIKA_WEBHOOK_QUEUE_ENABLED` (true; `false` = kill-switch AC9 → legacy 429-reject path verbatim, no redeploy). **Operator grep signals:** `webhook_queue_coalesced` (real coalescing volume), `webhook_queue_drop_oldest` (overflow/dead-letter — should be near-zero), `webhook_queue.gauge` (depth trend), and `rate_limit_trip` near-zero once enabled (baseline was 41/h on mika-qa). See mika#1870.
+
 ### Introspection Tools
 
 5 read-only tools: `query_timeline`, `get_session_messages`, `list_audit_events`, `search_tool_history` (30-day retention, 500-char field truncation, 10KB output cap), `query_knowledge_graph`. Non-orchestrator agents scoped to their own agent_id/sessions.
+
+## Milestone Manager (Phase 1)
+
+`src/milestone_manager/` — milestone-scope operational coordinator (`mika-manager` entity, distinct from `mika-prime`). Ratified 2026-08-21 by Vincent + Prime (5 verdicts, brief at `mika-platform/docs/brainstorms/2026-08-21-mika-manager-de-milestones-design-brief.md`). **LECTURE seule** — zero dispatch, zero ticket mutation, zero PR merge; the only outbound side effect is a report `POST` to a well-known delivery endpoint (Prime→sami→Vincent per D8 subsystem-2 pattern) or an offline sink write when the URL is unset.
+
+**Three composers + one loop.** `Reader` (`reader.rs`) wraps `gh` CLI (`api`/`issue list`/`pr list`) mirroring the `auto_pull::gh_list_open_issues` subprocess shape and composes `MilestoneState` (sub-issues + progress counts + recent activity). `Assessor` (`assessor.rs`) applies four rules (stale-blocker, silent-progress, silence-in-JOURS, priority ranking) and classifies `Severity` (Healthy/Attention/Blocked). `Reporter` (`reporter.rs`) formats the § 2d Markdown report. `run_manager_cycle` in `cadence.rs` orchestrates read→assess→deliver with hybrid cadence: event-driven trigger on `state_digest` change + 6h plancher heartbeat (« l'absence d'event EST l'event »).
+
+**Wrapper-only INV-2.** No new GitHub API client dep; `Reader` uses `tokio::process::Command::new("gh")` verbatim from `auto_pull.rs`. Delivery uses the existing workspace `reqwest` — bearer-token POST to `MIKA_MANAGER_DELIVERY_URL` (normal) or `MIKA_MANAGER_ESCALATION_URL` (Severity::Blocked → Vincent-direct route). Both URLs unset → offline sink at `MIKA_MANAGER_SINK_DIR` so nothing is lost during bring-up.
+
+**Structural LECTURE-seule enforcement.** `no_dispatch_test.rs` greps the module tree for forbidden write-authority tokens (`run_claude_pilot`, `pr_merge_with_gate`, `gh api "PATCH"`, `gh issue edit`, …) and fails the test binary if any executable code contains them. Prompt-level "no dispatch" rules are fragile per `feedback_prompt_enforcement_fragile` — this test is the structural gate. Comments are stripped before scanning so doc prose can describe what's forbidden.
+
+**CLI surface.** `mika milestone {read,assess,report} <owner/repo>#<number>` — thin adapter in `crates/mika-cli/src/commands/milestone.rs`. Report subcommand emits Markdown to stdout; `read`/`assess` default to pretty JSON (also YAML via `--format yaml`).
+
+**Env vars.** All optional with three-tier fallback: `MIKA_MANAGER_TARGET_MILESTONE` (Phase 1 single-target — loop disabled when unset), `MIKA_MANAGER_HEARTBEAT_INTERVAL_SECS` (default 21600 = 6h), `MIKA_MANAGER_SILENCE_THRESHOLD_DAYS` (default 3), `MIKA_MANAGER_DELIVERY_URL` / `MIKA_MANAGER_DELIVERY_TOKEN`, `MIKA_MANAGER_ESCALATION_URL`, `MIKA_MANAGER_HEALTH_URL` (optional cm executor liveness endpoint).
+
+**Phase 2 gates NOT wired.** Dispatch authority stays gated behind the three portes (forge-gate loop-résistance + contention exec + INTERNAL_TOKEN alignment) documented in the brief § 3. This module contains no dispatch class, no `run_claude_pilot` invocation site, no scope-approval callsite. Promotion to Phase 2 requires updating both `no_dispatch_test.rs` FORBIDDEN_TOKENS and the module docstring atomically.
 
 ## Skills System
 
@@ -567,11 +623,13 @@ Axum-based with two auth layers: mutation endpoints require `MIKA_INTERNAL_TOKEN
 
 **Lazy agent resolution (#1399):** `AppState.agents` uses `DashMap` for concurrent mutable access. `resolve_agent()` is async — on cache miss (agent created after server startup), it checks for `identity.toml` on disk + DB row, lazy-constructs the `AgentState` via the same `init_agent` factory used at startup, and inserts into the map. Subsequent calls hit the fast path. Emits `agent_resolved_lazily` INFO event on successful lazy insert. Agents whose dir is deleted while running remain in the map (orphan removal is mika#1436).
 
-**Time-range filtering (#659):** All list endpoints (timeline, sessions, llm-calls, tool-calls, team-runs, tasks, dev-runs) accept `from`/`to` ISO 8601 string query params for server-side filtering against the surface's primary timestamp column (`created_at` or `started_at`). String comparison is correct because ISO 8601 ordering matches chronological ordering. Frontend emits via `<TimeRangeFilter />` from `@senara-solutions/ui`.
+**Time-range filtering (#659):** All list endpoints (timeline, sessions, llm-calls, tool-calls, team-runs, tasks, dev-runs) accept `from`/`to` ISO 8601 string query params for server-side filtering against the surface's primary timestamp column (`created_at` or `started_at`). String comparison is correct because ISO 8601 ordering matches chronological ordering. Frontend emits via `<TimeRangeFilter />` from `@samidarko/ui`.
 
 **Request logging:** `tower_http::trace::TraceLayer` middleware. `inject_request_meta` middleware copies method+path for top-level JSON fields. `/health` logged at DEBUG. Agent lock via `tokio::sync::Mutex<()>` with non-blocking `try_lock` (429 if busy).
 
 **Failed sends flush:** Before each message processing, flushes up to 5 pending failed outbound sends from DB.
+
+**Wedge diagnostics (mika#1722):** When mika-spirit wedges (mika#1719 was n=3 in a single week), the canonical capture tool is `scripts/mika-spirit-wedge-capture.sh <pid>`. It writes three timestamp-prefixed files into `/tmp/spirit-wedge-<ts>/`: `<ts>-stacks.txt` (gdb `thread apply all bt 30` + `info registers`), `<ts>-maps.txt` (`/proc/<pid>/maps`, which IS the PIE-base artifact — the first line's start address is the load address of the main binary, never computed from stack traces), and `<ts>-status.txt` (`/proc/<pid>/status`). Captures run concurrently as background jobs so the maps snapshot is close-in-time to gdb's attach. Missing gdb is a warn-and-continue path — maps + status alone are enough to compute PIE base and thread count. Root-Claude uses this script for any post-wedge snapshot; do not run bare `gdb -p <pid>` and lose the maps snapshot.
 
 **WAL checkpoint (#636):** `server::checkpoint::spawn_dashboard_checkpoint_task()` runs `PRAGMA wal_checkpoint(PASSIVE)` on the dashboard DB connection every 60 seconds. Defense-in-depth against stale WAL snapshots: if a transaction leak pins the connection's read snapshot, the periodic checkpoint forces the connection to advance. Structured log events: `checkpoint.start`, `checkpoint.complete` (with `busy_pages`, `log_pages`, `checkpointed_pages`), `checkpoint.error`, `checkpoint.stopped`. Hard-coded 60s interval (future tunable: `MIKA_DASHBOARD_CHECKPOINT_INTERVAL_SECS`). If WAL grows despite PASSIVE checkpoints, escalate to RESTART mode per the operating-envelope trigger documented in `checkpoint.rs`.
 

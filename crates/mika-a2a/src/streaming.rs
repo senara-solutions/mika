@@ -12,6 +12,111 @@ use crate::types::{Artifact, Message, Task, TaskStatus};
 /// `broadcast::Sender` is internally reference-counted.
 pub type StreamEventSender = Arc<tokio::sync::broadcast::Sender<StreamEvent>>;
 
+/// Per-turn broadcast context for `ToolCallStart` / `ToolCallResult`
+/// emission (mika#1757).
+///
+/// Bundles the three pieces every emit call needs — sender, `task_id`,
+/// optional `context_id` — so `AgentParams.stream_ctx` carries one field
+/// with a self-consistent invariant ("if you have Some, you have the ids
+/// the frames need") instead of three parallel `Option`s that must be
+/// populated in lockstep at every construction site.
+///
+/// Constructed once per streaming A2A task in
+/// `server::a2a::handle_message_stream`, wrapped in `Arc` for cheap
+/// borrow into `run_loop` and `process_tool_calls`. Non-streaming callers
+/// (CLI, silent, team, delegate, A2A `message/send`, gateway `/message`)
+/// pass `None` and emission is a silent no-op.
+///
+/// Both emit methods are fire-and-forget: `broadcast::Sender::send`
+/// returning `Err` (zero subscribers) is not an error and does not
+/// bubble. The Err branch logs at `debug!` for operator visibility;
+/// callers must not depend on delivery.
+#[derive(Debug)]
+pub struct ToolCallStreamContext {
+    /// Per-task broadcast sender the SSE handler owns.
+    pub sender: StreamEventSender,
+    /// A2A task identifier — the ID the streaming client subscribed to.
+    pub task_id: String,
+    /// Optional A2A conversation/context identifier propagated from the
+    /// inbound `Message.contextId`. Preserved on each frame for client-side
+    /// correlation of multi-task conversations.
+    pub context_id: Option<String>,
+}
+
+impl ToolCallStreamContext {
+    /// Construct a new context bundle. Cheap — no allocation beyond the
+    /// caller-provided `task_id` / `context_id` strings.
+    pub fn new(sender: StreamEventSender, task_id: String, context_id: Option<String>) -> Self {
+        Self {
+            sender,
+            task_id,
+            context_id,
+        }
+    }
+
+    /// Emit a `ToolCallStart` frame with the current wall-clock timestamp.
+    /// Fire-and-forget: swallows `send` errors (zero subscribers) with a
+    /// `debug!` log. `args_summary` is truncated via `truncate_tool_summary`
+    /// before framing.
+    pub fn emit_start(&self, step: u32, tool_name: &str, args_summary: &str) {
+        let frame = StreamEvent::ToolCallStart(ToolCallStartEvent {
+            task_id: self.task_id.clone(),
+            context_id: self.context_id.clone(),
+            step,
+            tool_name: tool_name.to_string(),
+            args_summary: truncate_tool_summary(args_summary),
+            timestamp: now_rfc3339(),
+        });
+        if let Err(e) = self.sender.send(frame) {
+            tracing::debug!(
+                tool = tool_name,
+                step,
+                error = %e,
+                "ToolCallStart broadcast failed (zero subscribers?)"
+            );
+        }
+    }
+
+    /// Emit a `ToolCallResult` frame with the current wall-clock timestamp
+    /// and the caller-computed `duration_ms`. Fire-and-forget: same swallow
+    /// semantics as `emit_start`. `output_summary` is truncated before framing.
+    pub fn emit_result(
+        &self,
+        step: u32,
+        tool_name: &str,
+        success: bool,
+        non_zero_exit: bool,
+        output_summary: &str,
+        duration_ms: u64,
+    ) {
+        let frame = StreamEvent::ToolCallResult(ToolCallResultEvent {
+            task_id: self.task_id.clone(),
+            context_id: self.context_id.clone(),
+            step,
+            tool_name: tool_name.to_string(),
+            success,
+            non_zero_exit,
+            output_summary: truncate_tool_summary(output_summary),
+            duration_ms,
+            timestamp: now_rfc3339(),
+        });
+        if let Err(e) = self.sender.send(frame) {
+            tracing::debug!(
+                tool = tool_name,
+                step,
+                error = %e,
+                "ToolCallResult broadcast failed (zero subscribers?)"
+            );
+        }
+    }
+}
+
+/// RFC 3339 UTC timestamp used by frame construction. Extracted so the
+/// unit tests can shim time; production always calls `chrono::Utc::now`.
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
 /// Server-Sent Event from an A2A streaming response.
 ///
 /// Consumers MUST tolerate unknown `kind` values via the `Unknown` catch-all
@@ -414,5 +519,106 @@ mod tests {
         let s = "é".repeat(TOOL_CALL_SUMMARY_CAP_CHARS + 10);
         let out = truncate_tool_summary(&s);
         assert_eq!(out.chars().count(), TOOL_CALL_SUMMARY_CAP_CHARS + 1);
+    }
+
+    // ============================================================================
+    // mika#1757 — ToolCallStreamContext emit helpers
+    // ============================================================================
+
+    fn make_context(
+        task_id: &str,
+        context_id: Option<&str>,
+    ) -> (
+        ToolCallStreamContext,
+        tokio::sync::broadcast::Receiver<StreamEvent>,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let ctx = ToolCallStreamContext::new(
+            Arc::new(tx),
+            task_id.to_string(),
+            context_id.map(str::to_string),
+        );
+        (ctx, rx)
+    }
+
+    #[test]
+    fn emit_start_publishes_expected_frame() {
+        let (ctx, mut rx) = make_context("task-a", Some("ctx-a"));
+        ctx.emit_start(3, "store_fact", r#"{"key":"foo"}"#);
+
+        let frame = rx.try_recv().expect("frame should be delivered");
+        match frame {
+            StreamEvent::ToolCallStart(e) => {
+                assert_eq!(e.task_id, "task-a");
+                assert_eq!(e.context_id.as_deref(), Some("ctx-a"));
+                assert_eq!(e.step, 3);
+                assert_eq!(e.tool_name, "store_fact");
+                assert!(e.args_summary.contains("foo"));
+                assert!(!e.timestamp.is_empty());
+            }
+            other => panic!("expected ToolCallStart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn emit_result_publishes_expected_frame() {
+        let (ctx, mut rx) = make_context("task-b", None);
+        ctx.emit_result(4, "run_gh", true, false, r#"{"ok":true}"#, 42);
+
+        match rx.try_recv().expect("frame should be delivered") {
+            StreamEvent::ToolCallResult(e) => {
+                assert_eq!(e.task_id, "task-b");
+                assert!(e.context_id.is_none());
+                assert_eq!(e.step, 4);
+                assert_eq!(e.tool_name, "run_gh");
+                assert!(e.success);
+                assert!(!e.non_zero_exit);
+                assert_eq!(e.duration_ms, 42);
+                assert!(e.output_summary.contains("ok"));
+                assert!(!e.timestamp.is_empty());
+            }
+            other => panic!("expected ToolCallResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn emit_helpers_do_not_panic_with_zero_subscribers() {
+        // Drop the receiver — sender.send() returns Err. The helpers must
+        // swallow it silently. This is the fire-and-forget invariant
+        // (mika#1731 comment on AgentParams.stream_tx).
+        let (ctx, rx) = make_context("task-nosub", None);
+        drop(rx);
+        ctx.emit_start(0, "any", "{}");
+        ctx.emit_result(0, "any", true, false, "{}", 0);
+    }
+
+    #[test]
+    fn emit_helpers_truncate_oversize_summaries() {
+        let (ctx, mut rx) = make_context("task-big", None);
+        let big = "a".repeat(TOOL_CALL_SUMMARY_CAP_CHARS + 200);
+        ctx.emit_start(0, "big_tool", &big);
+        ctx.emit_result(0, "big_tool", true, false, &big, 1);
+
+        // Both frames should carry the truncated preview (cap + ellipsis).
+        match rx.try_recv().unwrap() {
+            StreamEvent::ToolCallStart(e) => {
+                assert_eq!(
+                    e.args_summary.chars().count(),
+                    TOOL_CALL_SUMMARY_CAP_CHARS + 1
+                );
+                assert!(e.args_summary.ends_with('…'));
+            }
+            other => panic!("expected ToolCallStart, got {other:?}"),
+        }
+        match rx.try_recv().unwrap() {
+            StreamEvent::ToolCallResult(e) => {
+                assert_eq!(
+                    e.output_summary.chars().count(),
+                    TOOL_CALL_SUMMARY_CAP_CHARS + 1
+                );
+                assert!(e.output_summary.ends_with('…'));
+            }
+            other => panic!("expected ToolCallResult, got {other:?}"),
+        }
     }
 }

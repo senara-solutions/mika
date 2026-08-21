@@ -1,6 +1,6 @@
 import { Link, useParams } from 'react-router'
 import { useTask, useTaskChildren, useTaskSessions } from '../api/tasks.ts'
-import { TaskStatusBadge, CopyButton, EmptyState, LoadingState, ErrorState, formatApiError, formatRelativeTime } from '@senara-solutions/ui'
+import { TaskStatusBadge, CopyButton, EmptyState, LoadingState, ErrorState, formatApiError, formatRelativeTime } from '@samidarko/ui'
 import { MetadataRow } from '../components/MetadataRow.tsx'
 
 function formatDuration(start: string, end: string): string {

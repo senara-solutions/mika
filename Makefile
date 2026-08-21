@@ -29,7 +29,7 @@ restart: ## Restart mika-spirit and mika-gateway (via OpenRC)
 		sudo rc-service "$$bin" restart || true; \
 	done
 
-install: ## Copy release binaries to INSTALL_DIR (safe while services run)
+install: ## Copy release binaries + scripts to INSTALL_DIR (safe while services run)
 	@mkdir -p $(INSTALL_DIR)
 	@for bin in $(BINARIES); do \
 		if [ ! -f target/release/$$bin ]; then \
@@ -41,6 +41,16 @@ install: ## Copy release binaries to INSTALL_DIR (safe while services run)
 		if [ "$$(uname)" = "Darwin" ]; then codesign -s - $(INSTALL_DIR)/$$bin; fi; \
 		echo "Installed $$bin -> $(INSTALL_DIR)/$$bin"; \
 	done
+	@# Ship the pilot egress proxy alongside the binaries so dispatch-lib.sh
+	@# can find it on PATH (bwrap Phase 2b — network cut + hostname allowlist).
+	@cp scripts/mika-pilot-egress-proxy $(INSTALL_DIR)/mika-pilot-egress-proxy.tmp
+	@chmod +x $(INSTALL_DIR)/mika-pilot-egress-proxy.tmp
+	@mv $(INSTALL_DIR)/mika-pilot-egress-proxy.tmp $(INSTALL_DIR)/mika-pilot-egress-proxy
+	@echo "Installed mika-pilot-egress-proxy -> $(INSTALL_DIR)/mika-pilot-egress-proxy"
+	@# addon deployed at stable path (2026-08-05).
+	@cp scripts/mika-pilot-anthropic-auth-addon.py $(INSTALL_DIR)/mika-pilot-anthropic-auth-addon.py.tmp
+	@mv $(INSTALL_DIR)/mika-pilot-anthropic-auth-addon.py.tmp $(INSTALL_DIR)/mika-pilot-anthropic-auth-addon.py
+	@echo "Installed mika-pilot-anthropic-auth-addon.py"
 
 deploy: deploy-info build-dashboard build install restart check-ngrok ## Full deploy: build, install, restart
 

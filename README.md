@@ -93,7 +93,7 @@ crates/
   mika-gateway/    Telegram + GitHub webhook router: Postgres customer registry, message routing, A2A proxy
   mika-cli/        TUI CLI (mika): ratatui chat, clap subcommands, slash commands
 dashboard/         React observability dashboard (TypeScript + Vite + Tailwind CSS v4)
-packages/ui/       @senara-solutions/ui shared React component library
+packages/ui/       @samidarko/ui shared React component library
 skills/bundled/    Engine-coupled skills discovered at build time (self-dev, qa-review, etc.)
 ```
 

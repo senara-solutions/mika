@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { CopyButton } from '@senara-solutions/ui'
+import { CopyButton } from '@samidarko/ui'
 import { Link } from 'react-router'
 
 const TRUNCATION_LIMIT = 10_000

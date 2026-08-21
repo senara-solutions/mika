@@ -20,6 +20,10 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use tracing::{debug, error, info, warn};
 
+use crate::audit_events::{
+    self, DROP_DENYLISTED_SKILL, DROP_NO_ROUTE, DROP_REVIEWER_FILTER, DROP_SYNCHRONIZE_NO_DIFF,
+    WebhookDropContext,
+};
 use crate::routes::AppState;
 
 // -- HMAC-SHA256 signature validation --
@@ -767,6 +771,10 @@ pub(crate) async fn handle_github_webhook(
         .check_suite
         .as_ref()
         .and_then(|cs| cs.conclusion.as_deref());
+    let repo_full_name = event
+        .repository
+        .as_ref()
+        .and_then(|r| r.full_name.as_deref());
     let target_agent = match route_event(event_type, event.action.as_deref(), check_conclusion) {
         Some(agent) => agent,
         None => {
@@ -776,6 +784,22 @@ pub(crate) async fn handle_github_webhook(
                 delivery_id = %delivery_id,
                 "GitHub webhook event not routable, dropping"
             );
+            // Observability-only audit_events row (mika#1774 AC1). The drop
+            // decision is unchanged; a DB failure is logged WARN inside
+            // `log_webhook_drop` and never propagates.
+            //
+            // Drop the span guard before the `.await` — `Entered` is `!Send`
+            // (see note at the top of this handler) and would make the future
+            // `!Send` if held across the DB write.
+            let drop_ctx = WebhookDropContext {
+                event_type,
+                action: event.action.as_deref(),
+                check_conclusion,
+                delivery_id: &delivery_id,
+                repo_full_name,
+            };
+            drop(_entered);
+            audit_events::log_webhook_drop(&state.pool, &drop_ctx, DROP_NO_ROUTE).await;
             return StatusCode::OK;
         }
     };
@@ -796,6 +820,17 @@ pub(crate) async fn handle_github_webhook(
             requested_reviewer = ?event.requested_reviewer.as_ref().map(|u| u.login.as_str()),
             "GitHub webhook review_requested dropped — reviewer is not the QA bot"
         );
+        // Observability-only audit_events row (mika#1774 AC1). Drop the span
+        // guard first — `Entered` is `!Send` and would poison the future.
+        let drop_ctx = WebhookDropContext {
+            event_type,
+            action: event.action.as_deref(),
+            check_conclusion,
+            delivery_id: &delivery_id,
+            repo_full_name,
+        };
+        drop(_entered);
+        audit_events::log_webhook_drop(&state.pool, &drop_ctx, DROP_REVIEWER_FILTER).await;
         return StatusCode::OK;
     }
 
@@ -812,7 +847,7 @@ pub(crate) async fn handle_github_webhook(
     // denylist. Layer 1 (well_known_agents.rs disabled_skills) is the primary
     // defense; this gateway-side guard catches routing-path additions that bypass
     // Layer 1.
-    {
+    let denylist_drop: Option<WebhookDropContext<'_>> = {
         let label_name = event.label.as_ref().and_then(|l| l.name.as_deref());
         if is_webhook_denylisted_skill(event_type, event.action.as_deref(), label_name) {
             warn!(
@@ -822,13 +857,28 @@ pub(crate) async fn handle_github_webhook(
                 label_name = ?label_name,
                 "GitHub webhook dropped by skill denylist guard (operator-only skill trigger detected)"
             );
-            return StatusCode::OK;
+            Some(WebhookDropContext {
+                event_type,
+                action: event.action.as_deref(),
+                check_conclusion,
+                delivery_id: &delivery_id,
+                repo_full_name,
+            })
+        } else {
+            None
         }
-    }
+    };
 
     // Drop the span guard before the await to keep the handler future Send.
     // Re-entered after the no-diff check for the remaining sync operations.
     drop(_entered);
+
+    if let Some(drop_ctx) = denylist_drop {
+        // Observability-only audit_events row (mika#1774 AC1). Fires AFTER
+        // the span-guard drop so the DB write's `.await` stays `Send`.
+        audit_events::log_webhook_drop(&state.pool, &drop_ctx, DROP_DENYLISTED_SKILL).await;
+        return StatusCode::OK;
+    }
 
     // 9c. Synchronize no-diff guard (#886): suppress mika-qa dispatch
     // for no-op pushes (trailer-only amend, commit-message-only change).
@@ -875,6 +925,21 @@ pub(crate) async fn handle_github_webhook(
                             repo,
                             "webhook_synchronize_no_diff_change: suppressing qa-review dispatch for no-op push"
                         );
+                        // Observability-only audit_events row (mika#1774 AC1).
+                        // Span guard was already dropped above; safe to await.
+                        let repo_opt = if repo.is_empty() { None } else { Some(repo) };
+                        audit_events::log_webhook_drop(
+                            &state.pool,
+                            &WebhookDropContext {
+                                event_type,
+                                action: event.action.as_deref(),
+                                check_conclusion,
+                                delivery_id: &delivery_id,
+                                repo_full_name: repo_opt,
+                            },
+                            DROP_SYNCHRONIZE_NO_DIFF,
+                        )
+                        .await;
                         return StatusCode::OK;
                     }
                     Ok(true) => {
@@ -2464,6 +2529,7 @@ mod tests {
             delivery_slots: Arc::new(tokio::sync::Semaphore::new(
                 crate::circuit_breaker::MAX_INFLIGHT_DELIVERIES,
             )),
+            search_egress_client: None,
         };
 
         axum::Router::new()
@@ -2584,6 +2650,7 @@ mod tests {
             delivery_slots: Arc::new(tokio::sync::Semaphore::new(
                 crate::circuit_breaker::MAX_INFLIGHT_DELIVERIES,
             )),
+            search_egress_client: None,
         };
 
         let app = axum::Router::new()
@@ -3016,6 +3083,7 @@ mod tests {
             delivery_slots: Arc::new(tokio::sync::Semaphore::new(
                 crate::circuit_breaker::MAX_INFLIGHT_DELIVERIES,
             )),
+            search_egress_client: None,
         }
     }
 
@@ -3820,6 +3888,7 @@ omInFBLWVyWK89xoc49UvUcyRcbL3iWqa+zAv7eOC5TZyy1SVJtPVw==\n\
             delivery_slots: Arc::new(tokio::sync::Semaphore::new(
                 crate::circuit_breaker::MAX_INFLIGHT_DELIVERIES,
             )),
+            search_egress_client: None,
         };
 
         axum::Router::new()

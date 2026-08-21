@@ -16,7 +16,7 @@ import {
   CostMeter,
   formatApiError,
   formatRelativeTime,
-} from '@senara-solutions/ui'
+} from '@samidarko/ui'
 import { MetadataRow } from '../components/MetadataRow.tsx'
 import { CollapsibleCard } from '../components/CollapsibleCard.tsx'
 import { PipelineTimeline, type PipelineStep } from '../components/PipelineTimeline.tsx'

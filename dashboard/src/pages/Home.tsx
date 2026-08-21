@@ -1,5 +1,5 @@
 import { useAgents } from '../api/agents.ts'
-import { StatusBadge, LoadingState, ErrorState, EmptyState, formatApiError } from '@senara-solutions/ui'
+import { StatusBadge, LoadingState, ErrorState, EmptyState, formatApiError } from '@samidarko/ui'
 import { Bot } from 'lucide-react'
 import AgentsSummaryWidget from '../components/home/AgentsSummaryWidget.tsx'
 import WorkItemsWidget from '../components/home/WorkItemsWidget.tsx'

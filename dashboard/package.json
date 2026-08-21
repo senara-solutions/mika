@@ -11,7 +11,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@senara-solutions/ui": "*",
+    "@samidarko/ui": "*",
     "@tanstack/react-query": "^5.80.7",
     "lucide-react": "^0.575.0",
     "react": "^19.2.0",

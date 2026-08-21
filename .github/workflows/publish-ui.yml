@@ -1,4 +1,4 @@
-name: Publish @senara-solutions/ui
+name: Publish @samidarko/ui
 
 on:
   push:
@@ -29,7 +29,7 @@ jobs:
       - name: Check if version changed
         id: version
         run: |
-          PUBLISHED=$(npm view @senara-solutions/ui version 2>/dev/null || echo "0.0.0")
+          PUBLISHED=$(npm view @samidarko/ui version 2>/dev/null || echo "0.0.0")
           CURRENT=$(node -p "require('./packages/ui/package.json').version")
           if [ "$PUBLISHED" = "$CURRENT" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
@@ -39,23 +39,32 @@ jobs:
 
       - name: Publish
         if: steps.version.outputs.skip != 'true'
-        run: npm publish -w packages/ui
+        run: npm publish -w packages/ui --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Verify publish
+      - name: Verify publish (with CDN-propagation retry)
         if: steps.version.outputs.skip != 'true'
         run: |
           EXPECTED=$(node -p "require('./packages/ui/package.json').version")
-          # npmjs.org can lag a few seconds after publish; retry before failing.
-          for attempt in 1 2 3 4 5; do
-            PUBLISHED=$(npm view @senara-solutions/ui version 2>/dev/null || echo "")
+          # npmjs CDN can take up to ~60s to propagate a new publish. Retry with
+          # backoff to avoid false-negative failures on successful publishes.
+          # See mika#1917 run 32160868980 — publish step succeeded (@samidarko/ui@0.3.1
+          # live), verify raced ~2s post-publish, all 5×15s attempts returned empty
+          # before propagation completed.
+          # Version-specific query (@pkg@$EXPECTED version) targets the exact version
+          # under test rather than "latest", making the assertion unambiguous even
+          # if a concurrent publish landed a newer tag.
+          MAX_ATTEMPTS=5
+          SLEEP_SECS=15
+          for attempt in $(seq 1 $MAX_ATTEMPTS); do
+            PUBLISHED=$(npm view @samidarko/ui@$EXPECTED version 2>/dev/null || echo "")
             if [ "$PUBLISHED" = "$EXPECTED" ]; then
-              echo "Verified @senara-solutions/ui@$PUBLISHED is live on the public registry."
+              echo "Verified @samidarko/ui@$PUBLISHED is live on the public registry (attempt $attempt/$MAX_ATTEMPTS)."
               exit 0
             fi
-            echo "Attempt $attempt: registry reports '$PUBLISHED', expected '$EXPECTED' — retrying in 15s."
-            sleep 15
+            echo "Attempt $attempt/$MAX_ATTEMPTS: @samidarko/ui@$EXPECTED not yet visible. Sleeping ${SLEEP_SECS}s..."
+            sleep $SLEEP_SECS
           done
-          echo "::error::Post-publish verification failed: @senara-solutions/ui@$EXPECTED not visible on the default registry."
+          echo "::error::Post-publish verification failed after $MAX_ATTEMPTS attempts: @samidarko/ui@$EXPECTED not visible on the default registry."
           exit 1

@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { Link } from 'react-router'
 import { useTasks, useTaskChildren, type TasksFilters, type TaskItem } from '../api/tasks.ts'
-import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, TaskStatusBadge, ListRow, TimeRangeFilter, LiveRefreshToggle, formatRelativeTime, type TimeRange } from '@senara-solutions/ui'
+import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, TaskStatusBadge, ListRow, TimeRangeFilter, LiveRefreshToggle, formatRelativeTime, type TimeRange } from '@samidarko/ui'
 import { useSearchParamsFilter, type SectionPageKey } from '../hooks/useSearchParamsFilter.ts'
 import { useLiveRefresh } from '../hooks/useLiveRefresh.ts'
 import { ChevronDown, ChevronRight } from 'lucide-react'

@@ -63,6 +63,7 @@ async fn spawn_agent_worker(
     String, // model
     String, // identity_name
     Arc<SkillRegistry>,
+    bool, // is_singleton_session (mika#1401)
 )> {
     let identity = prompt::load_identity(&ctx.home_dir);
     if let Some(s) = session_id
@@ -71,9 +72,19 @@ async fn spawn_agent_worker(
         anyhow::bail!("--session-id value must not be empty");
     }
     let reusing_session = session_id.is_some();
-    let session_id = session_id
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    // Resolve the canonical session for singleton agents (mika#1401). An explicit
+    // --session-id wins; otherwise a singleton agent reuses its one canonical
+    // session on launch (and `/clear` preserves it — see App.is_singleton_session).
+    let canonical_session_id =
+        prompt::resolve_canonical_session_id(&identity, ctx.async_db.agent_id());
+    let session_id = if let Some(s) = session_id {
+        s.to_string()
+    } else if let Some(ref canonical) = canonical_session_id {
+        canonical.clone()
+    } else {
+        Uuid::new_v4().to_string()
+    };
+    let is_singleton_session = canonical_session_id.as_deref() == Some(session_id.as_str());
     // Validate session ownership if reusing an existing session
     if reusing_session
         && let Ok(Some(existing)) = ctx.async_db.get_session(&session_id).await
@@ -86,7 +97,15 @@ async fn spawn_agent_worker(
             ctx.async_db.agent_id()
         );
     }
-    if let Err(e) = ctx
+    if is_singleton_session {
+        if let Err(e) = ctx
+            .async_db
+            .get_or_create_canonical_session(&session_id, "cli")
+            .await
+        {
+            tracing::warn!(error = %e, "failed to create canonical session");
+        }
+    } else if let Err(e) = ctx
         .async_db
         .create_session(&session_id, ctx.async_db.agent_id(), "cli")
         .await
@@ -310,7 +329,7 @@ async fn spawn_agent_worker(
                         correlated_task_id: None,
                         internal: false,
                         pr_reviews_posted: None, // CLI mode: no session-scoped dedup needed
-                        stream_tx: None,         // A2A-only injection point (mika#1731)
+                        stream_ctx: None, // A2A-only injection point (mika#1731 wire, mika#1757 emission)
                     })
                     .await;
 
@@ -424,7 +443,7 @@ async fn spawn_agent_worker(
                         correlated_task_id: None,
                         internal: false,
                         pr_reviews_posted: None, // CLI mode: no session-scoped dedup needed
-                        stream_tx: None,         // A2A-only injection point (mika#1731)
+                        stream_ctx: None, // A2A-only injection point (mika#1731 wire, mika#1757 emission)
                     })
                     .await;
 
@@ -542,6 +561,7 @@ async fn spawn_agent_worker(
         model,
         identity_name,
         skill_registry,
+        is_singleton_session,
     ))
 }
 
@@ -558,8 +578,16 @@ pub async fn run(
     }
 
     let http_client = reqwest::Client::new();
-    let (mut worker, user_tx, agent_rx, session_id, model, identity_name, skill_registry) =
-        spawn_agent_worker(ctx, agent_name, &http_client, session).await?;
+    let (
+        mut worker,
+        user_tx,
+        agent_rx,
+        session_id,
+        model,
+        identity_name,
+        skill_registry,
+        is_singleton_session,
+    ) = spawn_agent_worker(ctx, agent_name, &http_client, session).await?;
 
     // Build app with shared resources
     let mut app = App::new(
@@ -575,7 +603,8 @@ pub async fn run(
         agent_name.to_string(),
         worker._ctx.global_home.clone(),
         worker._ctx.settings.llm_provider,
-        start_in_audit_mode, // audit mode launch (#773)
+        start_in_audit_mode,  // audit mode launch (#773)
+        is_singleton_session, // single-session-by-nature (mika#1401)
     );
 
     // Load recent conversation history so the user sees prior messages on restart.
@@ -715,8 +744,11 @@ pub async fn run(
 
         // Handle agent switch
         if let Some(target_name) = app.pending_switch.take() {
-            // End the old session before switching agents
-            if let Err(e) = worker._ctx.async_db.end_session(&app.session_id).await {
+            // End the old session before switching agents. No-op for singleton
+            // agents — the canonical session is never ended (mika#1401).
+            if !app.is_singleton_session
+                && let Err(e) = worker._ctx.async_db.end_session(&app.session_id).await
+            {
                 tracing::warn!(error = %e, "failed to end session on agent switch");
             }
 
@@ -760,11 +792,15 @@ pub async fn run(
                             new_model,
                             new_identity,
                             new_skills,
+                            new_is_singleton_session,
                         )) => {
                             // Update app fields
                             app.agent_tx = new_tx;
                             app.agent_rx = new_rx;
                             app.session_id = new_session;
+                            // The target agent may have a different session profile
+                            // (mika#1401): switch the singleton gate to match it.
+                            app.is_singleton_session = new_is_singleton_session;
                             app.model = new_model.clone();
                             app.identity_name = new_identity;
                             app.db = new_worker._ctx.async_db.clone();
@@ -826,8 +862,11 @@ pub async fn run(
             app.pending_restart = false;
 
             // End the old session before restarting so the dashboard shows it as
-            // completed rather than ongoing.
-            if let Err(e) = worker._ctx.async_db.end_session(&app.session_id).await {
+            // completed rather than ongoing. No-op for singleton agents — the
+            // canonical session is never ended (mika#1401).
+            if !app.is_singleton_session
+                && let Err(e) = worker._ctx.async_db.end_session(&app.session_id).await
+            {
                 tracing::warn!(error = %e, "failed to end session on /restart");
             }
 
@@ -858,6 +897,8 @@ pub async fn run(
                             new_model,
                             _new_identity,
                             new_skills,
+                            // Same agent restarted — the singleton gate is invariant.
+                            _new_is_singleton_session,
                         )) => {
                             app.agent_tx = new_tx;
                             app.agent_rx = new_rx;
@@ -921,8 +962,11 @@ pub async fn run(
     // Shut down event reader thread
     events.shutdown();
 
-    // End the session so the dashboard shows duration instead of "ongoing"
-    if let Err(e) = worker._ctx.async_db.end_session(&app.session_id).await {
+    // End the session so the dashboard shows duration instead of "ongoing".
+    // No-op for singleton agents — the canonical session is never ended (mika#1401).
+    if !app.is_singleton_session
+        && let Err(e) = worker._ctx.async_db.end_session(&app.session_id).await
+    {
         tracing::warn!(error = %e, "failed to end session");
     }
 

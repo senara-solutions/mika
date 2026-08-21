@@ -86,6 +86,8 @@ pub enum Commands {
     /// Git credential helper (used by git, not directly by users)
     #[command(name = "credential-helper")]
     CredentialHelper(CredentialHelperArgs),
+    /// Milestone-scope operational coordinator (mika-manager Phase 1, LECTURE seule)
+    Milestone(MilestoneArgs),
 }
 
 impl Commands {
@@ -115,6 +117,7 @@ impl Commands {
             | Commands::Token(_)
             | Commands::Webhook(_)
             | Commands::Notify(_)
+            | Commands::Milestone(_)
             | Commands::CredentialHelper(_) => None,
         }
     }
@@ -144,6 +147,7 @@ impl Commands {
             | Commands::Kg(_)
             | Commands::Logs(_)
             | Commands::Notify(_)
+            | Commands::Milestone(_)
             | Commands::CredentialHelper(_) => false,
         }
     }
@@ -173,6 +177,7 @@ impl Commands {
             | Commands::Kg(_)
             | Commands::Logs(_)
             | Commands::Notify(_)
+            | Commands::Milestone(_)
             | Commands::CredentialHelper(_) => None,
         }
     }
@@ -717,6 +722,47 @@ pub enum ReminderCommand {
     Cancel { id: String },
 }
 
+/// `mika milestone {read,assess,report}` — Phase 1 LECTURE seule.
+///
+/// Reads milestone state via `gh` CLI (wrapper-only INV-2), assesses it
+/// (rules-driven), and reports Markdown. No dispatch, no ticket mutation,
+/// no PR merge. See `mika_agent::milestone_manager` module docstring for
+/// the full Phase 1 discipline.
+#[derive(clap::Args)]
+pub struct MilestoneArgs {
+    #[command(subcommand)]
+    pub command: MilestoneCommand,
+}
+
+#[derive(Subcommand)]
+pub enum MilestoneCommand {
+    /// Compose and print milestone state as JSON.
+    Read {
+        /// `<owner/repo>#<milestone_number>` — e.g. `senara-solutions/mika#1799`
+        target: String,
+        #[arg(long, value_enum, default_value = "json")]
+        format: OutputFormat,
+    },
+    /// Read + apply rules; print Assessment (recommendation, alerts, severity).
+    Assess {
+        /// `<owner/repo>#<milestone_number>`
+        target: String,
+        #[arg(long, value_enum, default_value = "json")]
+        format: OutputFormat,
+        /// Silence threshold in JOURS (days). Default: 3.
+        #[arg(long, default_value_t = 3)]
+        silence_threshold_days: u32,
+    },
+    /// Read + assess + render the § 2d Markdown report to stdout.
+    Report {
+        /// `<owner/repo>#<milestone_number>`
+        target: String,
+        /// Silence threshold in JOURS (days). Default: 3.
+        #[arg(long, default_value_t = 3)]
+        silence_threshold_days: u32,
+    },
+}
+
 #[derive(clap::Args)]
 pub struct TaskArgs {
     #[command(flatten)]
@@ -750,6 +796,19 @@ pub enum TaskCommand {
         /// Cancel the slot-occupying callback first, then promote
         #[arg(long = "override")]
         r#override: bool,
+    },
+    /// Subscribe to mika-spirit's task-lifecycle SSE stream and print each
+    /// TaskEventFrame as it arrives (one JSON object per line).
+    ///
+    /// mika#1758 stub consumer for `GET /api/v1/dashboard/tasks/stream`.
+    /// Requires a running mika-spirit and `MIKA_INTERNAL_TOKEN` /
+    /// `MIKA_DASHBOARD_TOKEN` in the environment. Diagnostic — not part
+    /// of the customer-facing surface.
+    Stream {
+        /// Override mika-spirit base URL (defaults to $MIKA_SPIRIT_URL /
+        /// http://localhost:$MIKA_SPIRIT_PORT / http://localhost:8080).
+        #[arg(long)]
+        url: Option<String>,
     },
 }
 

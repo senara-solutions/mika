@@ -1,8 +1,8 @@
 import { useState } from 'react'
 import { Link, useParams } from 'react-router'
 import { useLlmCall, useLlmCallToolCalls } from '../api/llmCalls.ts'
-import { CopyButton, StatusBadge, EmptyState, LoadingState, ErrorState, formatApiError, formatRelativeTime } from '@senara-solutions/ui'
-import type { StatusBadgeVariant } from '@senara-solutions/ui'
+import { CopyButton, StatusBadge, EmptyState, LoadingState, ErrorState, formatApiError, formatRelativeTime } from '@samidarko/ui'
+import type { StatusBadgeVariant } from '@samidarko/ui'
 import { MetadataRow } from '../components/MetadataRow.tsx'
 
 function formatTokens(n: number | null): string {

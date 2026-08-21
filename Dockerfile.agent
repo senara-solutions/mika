@@ -4,8 +4,8 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 COPY packages/ packages/
 COPY dashboard/ dashboard/
-# Build the @senara-solutions/ui workspace package BEFORE the dashboard: the
-# dashboard's `tsc -b` resolves `@senara-solutions/ui` to its built dist/types
+# Build the @samidarko/ui workspace package BEFORE the dashboard: the
+# dashboard's `tsc -b` resolves `@samidarko/ui` to its built dist/types
 # (packages/ui/package.json main/types), and `--ignore-scripts` suppresses any
 # prepare-hook build. Mirrors the root `dev:dashboard` order. (mika#1368)
 RUN npm ci --ignore-scripts \

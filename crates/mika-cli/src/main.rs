@@ -352,6 +352,7 @@ async fn main() -> Result<()> {
         Some(Commands::Model(args)) => commands::model::run(args, &agent_name).await,
         Some(Commands::Webhook(args)) => commands::webhook::run(args.command, &args.format).await,
         Some(Commands::Kg(args)) => commands::kg::run(args).await,
+        Some(Commands::Milestone(args)) => commands::milestone::run(args.command).await,
         Some(Commands::Logs(ref args)) => {
             let ah = agent_home
                 .ok_or_else(|| anyhow::anyhow!("Could not resolve agent home directory"))?;
@@ -581,6 +582,7 @@ mod tests {
             "credential-helper",
             "kg",
             "notify",
+            "milestone",
         ] {
             assert!(
                 markdown.contains(name),

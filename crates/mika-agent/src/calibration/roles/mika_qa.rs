@@ -66,6 +66,14 @@ pub const SCENARIOS: &[RoleScenario] = &[
         weight: 2.0,
         expected_failure_classes_absent: &["Fabrication", "EmptyResponse"],
     },
+    RoleScenario {
+        id: "verdict_format_canonical_shape",
+        description: "VERDICT line must be canonical (no `**` wrapper, no alias tokens) — drift-prevention for mika#1828 parser tolerance",
+        tags: &["verdict", "format", "canonical", "drift"],
+        flaky: false,
+        weight: 1.5,
+        expected_failure_classes_absent: &["ContractViolation", "EmptyResponse"],
+    },
 ];
 
 /// Run a single mika-qa scenario against a real provider.
@@ -79,6 +87,9 @@ pub async fn run_scenario(scenario_id: &str, provider: Arc<dyn LlmProvider>) -> 
         "wip_rescue_skip" => run_wip_rescue_skip(provider, start).await,
         "no_fabricated_fix" => run_no_fabricated_fix(provider, start).await,
         "duplicate_claim_grounded" => run_duplicate_claim_grounded(provider, start).await,
+        "verdict_format_canonical_shape" => {
+            run_verdict_format_canonical_shape(provider, start).await
+        }
         _ => RoleScenarioResult::fail(
             scenario_id,
             FailureClass::Other("unknown scenario".to_string()),
@@ -788,13 +799,152 @@ async fn run_duplicate_claim_grounded(
     }
 }
 
+/// Verdict format canonical shape (mika#1828): the VERDICT line must be
+/// canonical (no `**` markdown wrapper, no alias tokens like `REQUEST CHANGES`
+/// or `APPROVE`). Drift-prevention for the parser tolerance added in mika#1828
+/// — the parser now accepts drift, but the calibration guarantees the model
+/// still emits canonical shape at model-swap time.
+async fn run_verdict_format_canonical_shape(
+    provider: Arc<dyn LlmProvider>,
+    start: Instant,
+) -> RoleScenarioResult {
+    use mika_common::llm::types::{LlmContent, LlmMessage, LlmRequest, LlmRole};
+
+    let fixture = include_str!(
+        "../../../tests/eval/calibration_fixtures/mika-qa/verdict_format_canonical_shape.md"
+    );
+
+    let request = LlmRequest {
+        model: provider.model_name().to_string(),
+        system: Some(
+            "You are mika-qa, a specialist PR reviewer. Review the PR below and produce a \
+             structured verdict. The canonical VERDICT line format is EXACTLY one of: \
+             `VERDICT: pass`, `VERDICT: block[ac]`, `VERDICT: block[ci]`, `VERDICT: block[security]`, \
+             `VERDICT: block[pipeline]`, `VERDICT: hold[review]`. Do NOT wrap the VERDICT line in \
+             markdown emphasis (`**...**`, `__...__`, `*...*`). Do NOT use GitHub-review-state \
+             tokens like `REQUEST CHANGES`, `REQUEST_CHANGES`, `CHANGES_REQUESTED`, `APPROVE`, \
+             `APPROVED` — those are aliases the parser tolerates but the emitted shape must be \
+             canonical. Include DEPTH, REASON, DIFF ANALYSIS sections."
+                .to_string(),
+        ),
+        messages: vec![LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::Text(fixture.to_string()),
+        }],
+        tools: None,
+        max_tokens: 2000,
+        thinking: None,
+    };
+
+    match provider.send_message(&request).await {
+        Ok(response) => {
+            let text = response.text().to_string();
+            let latency = start.elapsed().as_millis() as u64;
+
+            if text.trim().is_empty() {
+                return RoleScenarioResult::fail(
+                    "verdict_format_canonical_shape",
+                    FailureClass::EmptyResponse,
+                    "Empty response".to_string(),
+                    Some(response.usage.input_tokens),
+                    Some(response.usage.output_tokens),
+                    latency,
+                );
+            }
+
+            // Locate the first line that (after trim) begins with `VERDICT:` OR
+            // any emphasis wrapper thereof — accept the widest possible drift
+            // as detection input, then classify.
+            let mut verdict_line: Option<&str> = None;
+            for line in text.lines() {
+                let trimmed = line.trim();
+                let stripped_leading = trimmed.trim_start_matches(['*', '_']);
+                if stripped_leading
+                    .to_ascii_uppercase()
+                    .starts_with("VERDICT:")
+                {
+                    verdict_line = Some(trimmed);
+                    break;
+                }
+            }
+
+            let line = match verdict_line {
+                Some(l) => l,
+                None => {
+                    return RoleScenarioResult::fail(
+                        "verdict_format_canonical_shape",
+                        FailureClass::ContractViolation,
+                        "No VERDICT line found in response".to_string(),
+                        Some(response.usage.input_tokens),
+                        Some(response.usage.output_tokens),
+                        latency,
+                    );
+                }
+            };
+
+            // Reject markdown-wrapped verdict line — must START with literal `VERDICT:`
+            if !line.starts_with("VERDICT:") {
+                return RoleScenarioResult::fail(
+                    "verdict_format_canonical_shape",
+                    FailureClass::ContractViolation,
+                    format!(
+                        "VERDICT line has markdown-emphasis wrapper (must start with literal 'VERDICT:'): {}",
+                        line
+                    ),
+                    Some(response.usage.input_tokens),
+                    Some(response.usage.output_tokens),
+                    latency,
+                );
+            }
+
+            // Extract the value after `VERDICT:` — must match exactly one of
+            // the six canonical class-detail combinations.
+            let value = line.trim_start_matches("VERDICT:").trim();
+            let canonical_forms = [
+                "pass",
+                "block[ac]",
+                "block[ci]",
+                "block[security]",
+                "block[pipeline]",
+                "hold[review]",
+            ];
+            if !canonical_forms.contains(&value) {
+                return RoleScenarioResult::fail(
+                    "verdict_format_canonical_shape",
+                    FailureClass::ContractViolation,
+                    format!(
+                        "VERDICT value not canonical ('{}'; expected one of: {})",
+                        value,
+                        canonical_forms.join(", ")
+                    ),
+                    Some(response.usage.input_tokens),
+                    Some(response.usage.output_tokens),
+                    latency,
+                );
+            }
+
+            RoleScenarioResult::pass(
+                "verdict_format_canonical_shape",
+                response.usage.input_tokens,
+                response.usage.output_tokens,
+                latency,
+            )
+        }
+        Err(e) => llm_error_result(
+            "verdict_format_canonical_shape",
+            e,
+            start.elapsed().as_millis() as u64,
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn scenario_count_is_six() {
-        assert_eq!(SCENARIOS.len(), 6);
+    fn scenario_count_is_seven() {
+        assert_eq!(SCENARIOS.len(), 7);
     }
 
     #[test]

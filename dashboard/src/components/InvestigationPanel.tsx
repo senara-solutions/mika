@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { X, Search, Send, Loader2, Wrench, Trash2, MessageSquare, Cpu } from 'lucide-react'
 import { streamInvestigation, type InvestigateEvent } from '../api/investigate.ts'
-import { CopyButton } from '@senara-solutions/ui'
+import { CopyButton } from '@samidarko/ui'
 import {
   type InvestigationScope,
   type ChatMessage,

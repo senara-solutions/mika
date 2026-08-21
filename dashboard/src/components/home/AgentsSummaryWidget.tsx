@@ -1,6 +1,6 @@
 import { Link } from 'react-router'
 import { useAgents } from '../../api/agents.ts'
-import { StatusBadge, LoadingState, ErrorState, EmptyState, formatApiError, formatRelativeTime } from '@senara-solutions/ui'
+import { StatusBadge, LoadingState, ErrorState, EmptyState, formatApiError, formatRelativeTime } from '@samidarko/ui'
 import WidgetSection from './WidgetSection.tsx'
 
 /**

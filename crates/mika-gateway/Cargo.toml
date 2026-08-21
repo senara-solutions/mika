@@ -53,3 +53,12 @@ jsonwebtoken = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
+# egress_search #1807 log-assertion test needs `Registry` + `SubscriberExt`
+# to attach a capturing Layer. Workspace features already carry json+env-filter.
+tracing-subscriber = { workspace = true, features = ["registry"] }
+# Brave client integration tests (mika#1808) use wiremock to stand in for the
+# Brave Search API — no real network calls in the test binary.
+wiremock = { workspace = true }
+
+[lints]
+workspace = true

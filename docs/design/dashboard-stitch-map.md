@@ -20,7 +20,7 @@ Each Stitch screen is one of **Relevant** (use as-is or with rulebook adjustment
 | 4 | **Agent Core Memory Widget** | `7705e941bd5d4f18adbc43e0d19cac6f` | **Relevant — canonical** | **#656** (Core Memory actionable) | Per-section blocks (USER_SUMMARY / SELF_MODEL / CURRENT_PRIORITIES / KEY_PEOPLE / WORKFLOWS) with token-usage indicators. Section labels should be uppercase tracking-wide per rulebook §3. |
 | 5 | **Tool Call Data Table View** | `7dc4112340fd432b9f1fbde1be481728` | Relevant | Tool Calls page (intersects #653 LLM Calls linked tool calls, #663 pagination) | Status / Tool Name / Input / Output / Actions columns. Keep Export CSV. Apply tonal-shift row separation. |
 | 6 | **Agents Overview & Details** | `2e9012604d5b4718b5ab7e055ebb63df` | **Relevant — canonical** | **#656** + Agents page | Split layout: agent list (left) + agent detail (right) with status pill, Core Memory raw JSON, Recent Audit Events, soul.md viewer. The Core Memory section here should consume the same widget defined in screen #4. |
-| 7 | **Navigation Sidebar Update** | `993a00f29d174072bbab8a1eb2d768aa` | Relevant | Foundational nav primitive | Nav items: Event Timeline / Agents / Sessions / Traces / Tasks (New) / Team Runs (New) / Settings. Use as the canonical sidebar shape; promote to `@senara-solutions/ui` if shared with Cloud Console. |
+| 7 | **Navigation Sidebar Update** | `993a00f29d174072bbab8a1eb2d768aa` | Relevant | Foundational nav primitive | Nav items: Event Timeline / Agents / Sessions / Traces / Tasks (New) / Team Runs (New) / Settings. Use as the canonical sidebar shape; promote to `@samidarko/ui` if shared with Cloud Console. |
 | 8 | **Team Run Debug Detail** | `abe0ec4a059d459f94220fad9404149a` | **Relevant — canonical** | **#652** (Team Runs detail) + **#661** (task tree visualization) | Iteration Timeline + per-iteration phases (Assign / Execute) + per-agent task cards + Workspace Entries Log. The Iteration Timeline IS the answer to #661 task-tree visualization. |
 | 9 | **Unified Event Timeline Dashboard** | `c5b6feddb5444f3d83a7f9b94e140bcd` | **Relevant — canonical** | Existing Event Timeline page; informs #662 (live-refresh — currently the only page with it), #659 (time range filter), #665 (copy feedback) | Live Monitor toggle, multi-filter (Agent / Event Type / Time Range / More), table with copy buttons. Most aligned today. The live-refresh + time-range patterns here are the templates for other surfaces. |
 | 10 | Session Tool Trace Detail (variant a) | `6e8b01df2a40457e876cf10c9cba40e8` | **Stale** | — | Inline pipe-separated `IN: ... | OUT: ...` is unreadable. Supplanted. |
@@ -47,7 +47,7 @@ These need design work before their tickets can ship.
 | Ticket | Gap | Why it matters | Proposed action |
 |---|---|---|---|
 | **#651 Dev Runs** | No Dev Runs page in Stitch. The Dashboard currently has a Dev Runs page that's broken (issue & PR fail to load, pipeline state inaccurate per the ticket). | Dev Runs is the second of the two big page redesigns (alongside #652 Team Runs). Without a design, the bug fixes in the ticket can't ride a coherent layout. | Stitch session to design Dev Runs detail + list. Reference patterns: Team Run Debug Detail (#8 above) shape, plus a CI-status / PR-status row. |
-| **#658 Empty / loading / error states** | No state catalog exists. | Every page in milestone #13 needs to render these states; if they're not designed once and shared, every page redesign reinvents them. Foundational primitive. | Stitch session to design the canonical state set. Promote to `@senara-solutions/ui` (`<EmptyState>` already exists; extend it; add `<LoadingState>` and `<ErrorState>`). |
+| **#658 Empty / loading / error states** | No state catalog exists. | Every page in milestone #13 needs to render these states; if they're not designed once and shared, every page redesign reinvents them. Foundational primitive. | Stitch session to design the canonical state set. Promote to `@samidarko/ui` (`<EmptyState>` already exists; extend it; add `<LoadingState>` and `<ErrorState>`). |
 | **#660 Charts / time-series** | No chart screen. | Cost/budget signals (#667), event timeline trends, latency distributions all need charts. The ticket says "decide stance and scope" — this needs a visual answer. | Stitch session to propose 2-3 chart styles aligned with The Luminescent Core (dark, soft, low-density). |
 | **#667 Cost / budget signals** | No cost-signal screen. | Hard dependency for surfacing mika-arch's Unit 8 cost-monitoring data once it lands; also surfaces general LLM cost across pages. | Stitch session to design the cost-signal pattern (threshold pill, in-page warning band, dashboard-level summary card). Hard-blocked on the chart decision (#660). |
 | **#653 LLM Calls page itself** (the primary list view) | Variant b/d cover *tool-call rendering within* the LLM Calls detail, but the LLM Calls primary list page (request/response cards/rows, latency, model) is not in Stitch. | The ticket calls out "no prompt/response content, bland metrics, no linked tool calls" — those are all on the primary page, not just the detail. | Stitch session to design the LLM Calls list page with prompt/response previews, tool-call links, and metrics. Includes #672 (LLM bodies display). |
@@ -61,10 +61,10 @@ Per the north star ("intuitive — depth one click away"), pages depend on primi
 ### Phase 1 — Foundation (already done)
 - ✅ **The Luminescent Core** — covers #657 (visual rhythm, status pills, spacing tokens). The rulebook IS the tokens layer.
 
-### Phase 2 — Primitives in `@senara-solutions/ui`
+### Phase 2 — Primitives in `@samidarko/ui`
 Extract or build, all in `packages/ui/`. These unlock every page redesign that follows.
 
-| Primitive | Tickets | Already in `@senara-solutions/ui`? |
+| Primitive | Tickets | Already in `@samidarko/ui`? |
 |---|---|---|
 | `<StatusBadge>` / `<StatusPill>` | #657 | Yes — audit against rulebook §5 chip spec. |
 | `<Pagination>` | #663 | Yes — migrate hand-rolled instances per ticket body. |
@@ -102,7 +102,7 @@ The workflow we agree on for the Dashboard becomes the template for the Cloud Co
 ### Roles
 
 - **Vincent** initiates Stitch sessions when a design gap (per the table above) is the next blocker, or when an existing screen needs revision against new context. Owns the rulebook; final say on aesthetic decisions.
-- **Claude** brings: the ticket(s) being designed for, the primitive inventory (what's in `@senara-solutions/ui`), the relevant rulebook constraints, and any prior Stitch screens to iterate from. Produces this map (and its updates).
+- **Claude** brings: the ticket(s) being designed for, the primitive inventory (what's in `@samidarko/ui`), the relevant rulebook constraints, and any prior Stitch screens to iterate from. Produces this map (and its updates).
 - **Stitch** generates and iterates screens via the MCP (`generate_screen_from_text`, `edit_screens`, `generate_variants`). Outputs are HTML + screenshots, addressable by screen ID.
 
 ### What Stitch produces
@@ -122,11 +122,11 @@ The workflow we agree on for the Dashboard becomes the template for the Cloud Co
 - The map is updated to reflect the new canonical screen. Any prior canonical for the same role is moved to **Stale**.
 - The implementation ticket can start.
 
-### When a primitive gets elevated to `@senara-solutions/ui`
+### When a primitive gets elevated to `@samidarko/ui`
 
-Default rule from the north star: **if more than one surface needs it, it goes in `@senara-solutions/ui`.** Concretely:
+Default rule from the north star: **if more than one surface needs it, it goes in `@samidarko/ui`.** Concretely:
 
-- A primitive used by the Dashboard AND the Cloud Console (or any combination of two surfaces) → `@senara-solutions/ui`.
+- A primitive used by the Dashboard AND the Cloud Console (or any combination of two surfaces) → `@samidarko/ui`.
 - A primitive used by only one surface → stays as a local component in that surface.
 - Re-evaluation happens during each subsequent reconciliation pass (Cloud Console next, Landing Page after) — primitives that were Dashboard-local may get promoted then.
 
