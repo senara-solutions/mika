@@ -386,3 +386,52 @@ Inspired by Hermes Agent's `_iters_since_skill` counter (default 10). Mika's ada
 advisory inline block in the next turn's system prompt (not a background daemon),
 identity-gated default-off (multi-tenant safety), staged-then-promote authoring
 (lifecycle_state is the load-bearing safety differentiator).
+
+## Freshness check — 2026-08-21 (main @ 75192f49)
+
+Body-vs-code drift verification performed 51 days after plan authoring. Result: **zero
+structural drift; line-number-only drift (cosmetic).** All plan-cited sites still exist
+in current main with intact shape. Prior GROOMED verdict (session
+`edae0932-e1db-4ed9-ad09-d2dafbf0be11`, 2026-06-26) remains valid — the design has not
+been invalidated by intervening main changes.
+
+Delta table (plan citation → current main line, all structural anchors preserved):
+
+- `SkillsIdentityConfig` — prompt.rs:134 → :172 (struct + `allow_authoring: Option<bool>`
+  intact; `allowlist` unchanged; no fields removed).
+- `parse_identity_or_fail_closed` — prompt.rs:338 → :412 (function shape unchanged;
+  `toml::from_str` still the parse call; fail-closed sentinel still in place).
+- `AgentState` — server/state.rs:26 → :27; `skills_dirty` — :29 → :30 (precedent for
+  the `Arc<AtomicX>` pattern the plan follows unchanged).
+- `run_loop` — agent_loop/mod.rs:654 → :733 (async fn signature grew a `stream_ctx`
+  trailing param for mika#1757, otherwise unchanged; the plan's new `skill_nudge`
+  trailing param slots alongside cleanly).
+- `AgentParams` — :2521 → :2656 (both cited borrow-precedent fields present:
+  `skills_dirty: &'a AtomicBool` and `pr_reviews_posted: Option<&'a Arc<...>>`; one
+  orthogonal addition `stream_ctx: Option<Arc<...>>` for A2A streaming, does not affect
+  the plan's proposed `skill_nudge: Option<&'a SkillNudgeState>` field).
+- `run_agent_with_deadline` — :2724 → :2841; `build_system_prompt` injection callsite —
+  :2758 → :2911 (the "append summary block after build_system_prompt" pattern the plan
+  mirrors is unchanged).
+- `apply_agent_tool_visibility` — :4972 → :5203 (still gates by identity `[tools].disabled`
+  denylist only; AC8 resolution rationale holds unchanged).
+- `skill_manage` in `default_tools` — tools/mod.rs:818 (EXACT); name at :753 (EXACT).
+- Well-known agents `allow_authoring = false`: mika-dev :134 (EXACT), mika-qa :219 (EXACT),
+  mika-arch `build_mika_arch_identity()` :388 → :389, mika-test :1332 → :1333.
+
+**Blocker check (2026-08-21):**
+- mika#1581 (parent milestone: self-improving skills) — **CLOSED**.
+- mika#1582 (skill_manage + lifecycle_state + `allow_authoring` gate — direct blocker) —
+  **CLOSED**. Primitives verified present on current main (see § Grounding above).
+- mika#1580 (guard-check assertability spike) — **OPEN**, but scopes only Phase 2
+  expansion to autonomous-loop agents; **NOT a blocker for this ticket** (Phase 1 targets
+  operator-facing agents only, per architect F2 resolution).
+
+**Dispatch history:** Two prior autonomous-loop attempts (#1848, #1872) landed as
+`wip-rescue` + `stale-against-main` drafts and were closed. The plan is unaffected —
+dispatch failed on rebase, not design. The wip commit `421952f9` on this branch contains
+~426 lines of staged implementation that follows this plan; the next dispatch will
+either rebase-forward that work or regenerate cleanly.
+
+**Verdict:** plan is freshness-verified against main @ `75192f49`. GROOMED verdict from
+session `edae0932` stands. Dispatch-ready.
