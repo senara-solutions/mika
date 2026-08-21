@@ -30,6 +30,21 @@ Sami arbitrated the shape (mécanisme, pas Prime) on 2026-08-21 (bearing
 >    un AC écrit sur un mécanisme qui n'existe pas, c'est l'inverse de la bonne
 >    direction.
 
+**Schema-version note.** Sami's bearing (§2) references schema v44 because that was the
+head at the time of the bearing (2026-08-21 14:37Z). Between the bearing and this plan's
+architect second-pass, main advanced to v45 via mika#1865 (`f58cd49a` —
+`pilot_transcripts` observability table). This plan therefore targets **v45 → v46**
+(marker migration for the phantom sweep), not v44 → v45. Sami's schema-invariant point
+still holds — new defenses land at the current schema head + 1, whatever that is at
+implementation time.
+
+**Rebase requirement.** Branch base is `b983a8ff` (pre-v45-bump). Implementer MUST rebase
+onto `origin/main` before Phase 1; without the rebase, `migrate_v45_to_v46` will not
+apply cleanly and the compile-time schema-pin at
+`crates/mika-agent/tests/eval/kg_fixtures/mod.rs:26` (`PINNED_SCHEMA_VERSION`) will need
+its own bump 45 → 46. See mika#1865's fix commit for the pattern (same file, same
+mechanism, previous PR bumped 44 → 45).
+
 **What this plan implements (shape (b)):** AC3 watchdog sweep + AC5 startup sweep + AC6
 regression test + AC7 sweep telemetry. Ships the defense that stops the observed bleed
 (24 rows / 18h → 0 rows accumulated) without changing `create_task` semantics.
@@ -369,28 +384,32 @@ Timeout: each test bounded at 5s. Pattern: `test_tick_fires_due_task` at
 
 ## Implementation steps
 
-### Phase 1 — schema migration (v44 → v45)
+### Phase 1 — schema migration (v45 → v46)
 
 - File: `crates/mika-agent/src/db.rs`.
-  - Bump `CURRENT_SCHEMA_VERSION` from 44 to 45 (`db.rs:30`).
-  - Add `fn migrate_v44_to_v45(&mut self) -> Result<()>` beneath `migrate_v43_to_v44`
+  - Bump `CURRENT_SCHEMA_VERSION` from 45 to 46 (`db.rs:30`).
+  - Add `fn migrate_v45_to_v46(&mut self) -> Result<()>` beneath `migrate_v44_to_v45`
     (`db.rs:4361`). Body: no DDL — marker-only migration to give a version anchor for
     the new watchdog sweep semantics.
     ```rust
-    // v45: behavioral change only (phantom NULL-PID sweep, mika#1712).
+    // v46: behavioral change only (phantom NULL-PID sweep, mika#1712).
     // No DDL. Reserved for future DDL if write-time enforcement (AC1/AC2) lands
     // via cause-racine investigation (mika#1934).
     let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    tx.execute("INSERT INTO schema_version (version) VALUES (45)", [])?;
+    tx.execute("INSERT INTO schema_version (version) VALUES (46)", [])?;
     tx.commit()?;
-    info!("v44→v45: no DDL; behavioral marker for mika#1712 phantom sweep");
+    info!("v45→v46: no DDL; behavioral marker for mika#1712 phantom sweep");
     Ok(())
     ```
   - Register in the migration chain block around `db.rs:1046`.
 - Update `crates/mika-agent/CLAUDE.md` migration ledger (the `Schema Version` section)
-  with a v44→v45 entry noting: "no DDL; behavioral marker for mika#1712 phantom
+  with a v45→v46 entry noting: "no DDL; behavioral marker for mika#1712 phantom
   NULL-PID sweep in `TaskEngine`. Reserved for future DDL if write-time enforcement
   lands (mika#1934)." (per mika-arch F2)
+- Bump `PINNED_SCHEMA_VERSION` in
+  `crates/mika-agent/tests/eval/kg_fixtures/mod.rs:26` from 45 to 46 (compile-time
+  assertion at line 28 will otherwise fail — same pattern as mika#1865's fix
+  commit).
 
 ### Phase 2 — new DB method for phantom detection
 
@@ -517,14 +536,14 @@ to normal usage. Sami arbitration: **AC4 dropped** — audit signal keyed to swe
   - New `test_phantom_task_row_sweep.rs` with four scenarios per §5 AC6 (three
     primary + one verify-fix-load-bearing).
 - **Migration test:** extend the migration-chain test at `db.rs:16389` to include the
-  v44→v45 step (`assert_eq!(final_version, CURRENT_SCHEMA_VERSION)`).
-- **Post-migration idempotency:** re-run `migrate_v44_to_v45` on a DB already at v45;
-  assert no-op (the `if version >= 45 { return Ok(()); }` guard).
+  v45→v46 step (`assert_eq!(final_version, CURRENT_SCHEMA_VERSION)`).
+- **Post-migration idempotency:** re-run `migrate_v45_to_v46` on a DB already at v46;
+  assert no-op (the `if version >= 46 { return Ok(()); }` guard).
 
 ## Rollback / migration safety
 
-- Schema bump v44→v45 is a marker with no DDL. Rollback = accept a DB at v45 while
-  running v44 code: safe because v44 code never queries the marker.
+- Schema bump v45→v46 is a marker with no DDL. Rollback = accept a DB at v46 while
+  running v45 code: safe because v45 code never queries the marker.
 - **Explicit rollback story (per mika-arch F7):** revert the PR. Already-swept rows
   remain `failed` — this is the terminal state and is idempotent (no data loss, no
   downstream side effects, the phantom rows were already invisible to dispatch).
