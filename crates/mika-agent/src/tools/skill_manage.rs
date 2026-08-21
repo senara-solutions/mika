@@ -75,9 +75,12 @@ impl Tool for SkillManageTool {
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
-        // Identity gate: check allow_authoring before any action.
+        // Identity gate: check allow_authoring before any action. Uses the
+        // canonical `authoring_enabled()` accessor (mika#1583) instead of the
+        // raw field so the identity-config vocabulary stays orthogonal to the
+        // Option representation.
         let identity = load_identity(ctx.home_dir);
-        if identity.skills.allow_authoring != Some(true) {
+        if !identity.skills.authoring_enabled() {
             return Ok(ToolOutput::error(
                 "Skill authoring is not enabled for this agent. \
                  Set allow_authoring = true in the [skills] section of identity.toml.",

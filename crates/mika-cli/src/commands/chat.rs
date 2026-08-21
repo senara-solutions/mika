@@ -320,6 +320,7 @@ async fn spawn_agent_worker(
                         github_token: worker_github_token.as_deref(),
                         github_app: worker_github_app.as_deref(),
                         skills_dirty: &worker_dirty,
+                        skill_nudge: None, // mika#1583: nudges apply in server mode only
                         mcp_manager: worker_mcp.as_ref(),
                         global_home_dir: Some(&worker_global_home),
                         is_callback_turn: false,
@@ -433,6 +434,7 @@ async fn spawn_agent_worker(
                         github_token: worker_github_token.as_deref(),
                         github_app: worker_github_app.as_deref(),
                         skills_dirty: &worker_dirty,
+                        skill_nudge: None, // mika#1583: nudges apply in server mode only
                         mcp_manager: worker_mcp.as_ref(),
                         global_home_dir: Some(&worker_global_home),
                         is_callback_turn: true,

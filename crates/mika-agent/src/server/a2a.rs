@@ -165,6 +165,7 @@ async fn run_a2a_agent(
         github_token: state.github_token.as_deref(),
         github_app: agent_state.github_app.as_deref(),
         skills_dirty: &agent_state.skills_dirty,
+        skill_nudge: Some(&agent_state.skill_nudge),
         mcp_manager: agent_state.mcp_manager.as_ref(),
         global_home_dir: Some(&state.global_home_dir),
         is_callback_turn: false,

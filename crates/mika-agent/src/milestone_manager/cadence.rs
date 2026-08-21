@@ -23,7 +23,6 @@ use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use tokio::io::AsyncWriteExt;
 
 /// Configuration for a single manager cycle.
 #[derive(Debug, Clone)]
@@ -342,8 +341,17 @@ pub(crate) async fn save_checkpoint(
     tokio::fs::create_dir_all(dir).await?;
     let path = dir.join(format!("{}.json", r.slug()));
     let bytes = serde_json::to_vec_pretty(c)?;
-    let mut f = tokio::fs::File::create(&path).await?;
-    f.write_all(&bytes).await?;
+    // Use `tokio::fs::write` (atomic spawn_blocking → std::fs::write) instead of
+    // `File::create` + `write_all`. The latter can return before tokio's internal
+    // blocking write task has actually drained bytes to disk — under CI blocking-pool
+    // pressure, the next `load_checkpoint` reads an empty/partial file, silently falls
+    // through to `checkpoint = None`, and both `state_changed`/`heartbeat_fired`
+    // default to `true` via `unwrap_or(true)`. See CI flake on PR#1938: the
+    // `event_driven_fires_on_state_change` test expects `heartbeat_fired = false`
+    // at t0 + 1h but got `true` because the t0 checkpoint save had not fully
+    // persisted before the t1 load. Matches the rest of the codebase
+    // (`write_workspace.rs`, `write_agent_file.rs`, `teams/engine.rs`).
+    tokio::fs::write(&path, &bytes).await?;
     Ok(())
 }
 
@@ -356,8 +364,10 @@ async fn write_offline_sink(
     // Timestamp in the filename disambiguates multi-per-day writes.
     let ts = body.generated_at.replace(':', "-");
     let path = dir.join(format!("{}-{}.md", r.slug(), ts));
-    let mut f = tokio::fs::File::create(&path).await?;
-    f.write_all(body.report_markdown.as_bytes()).await?;
+    // Same rationale as `save_checkpoint`: atomic write via `tokio::fs::write`
+    // rather than a `File::create` + `write_all` pair whose drop can race with
+    // subsequent reads under CI blocking-pool pressure.
+    tokio::fs::write(&path, body.report_markdown.as_bytes()).await?;
     Ok(())
 }
 

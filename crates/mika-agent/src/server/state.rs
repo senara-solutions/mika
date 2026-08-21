@@ -28,6 +28,11 @@ pub struct AgentState {
     pub db: AsyncDatabase,
     pub skills: std::sync::Mutex<Arc<SkillRegistry>>,
     pub skills_dirty: Arc<AtomicBool>,
+    /// Cross-turn skill-authoring nudge state (mika#1583). Shared across all of
+    /// an agent's turn types; threaded into the conversation loop by reference on
+    /// `AgentParams` (same pattern as `skills_dirty`). Phase 1 only increments/
+    /// injects in conversation mode.
+    pub skill_nudge: Arc<crate::agent_loop::skill_nudge::SkillNudgeState>,
     pub task_engine: Arc<tokio::sync::Mutex<TaskEngine>>,
     pub dispatcher: Arc<TaskDispatcher>,
     pub agent_lock: Arc<tokio::sync::Mutex<()>>,

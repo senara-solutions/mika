@@ -132,6 +132,7 @@ enabled = false\n\
 \n\
 [skills]\n\
 allow_authoring = false\n\
+nudge_enabled = false\n\
 allowlist = [\n\
   \"self-dev\",\n\
   \"self-dev-callback\",\n\
@@ -217,6 +218,7 @@ enabled = false\n\
 \n\
 [skills]\n\
 allow_authoring = false\n\
+nudge_enabled = false\n\
 allowlist = [\n\
   \"qa-review\",\n\
   \"qa-review-build-callback\",\n\
@@ -387,6 +389,7 @@ inject = false
 
 [skills]
 allow_authoring = false
+nudge_enabled = false
 allowlist = [{allowlist_block}]
 
 [tools]
@@ -464,6 +467,7 @@ pub fn well_known_skill_allowlists() -> Vec<(&'static str, Vec<String>)> {
 pub const CODE_OWNED_IDENTITY_SECTIONS: &[&str] = &[
     "skills.allowlist",
     "skills.allow_authoring",
+    "skills.nudge_enabled",
     "tools.disabled",
     "context.summary",
 ];
@@ -1331,6 +1335,7 @@ enabled = false\n\
 \n\
 [skills]\n\
 allow_authoring = false\n\
+nudge_enabled = false\n\
 allowlist = [\"__mika_test_no_skills__\"]\n";
 
 const MIKA_ARCH_SOUL: &str = r#"# Mika Architect — Plan Review Agent
@@ -2160,6 +2165,33 @@ mod tests {
             assert!(
                 identity.skills.allowlist.is_some(),
                 "well-known agent '{}' must have [skills].allowlist in identity.toml",
+                spec.name
+            );
+        }
+    }
+
+    // mika#1583 AC5 injection-detector: every well-known agent's identity template
+    // MUST resolve to `nudge_is_enabled() == false`. Flipping any hardcoded
+    // `nudge_enabled = false` to `true` (or omitting it, since the default is
+    // `false` — either way this asserts the effective-runtime property, not the
+    // literal) fails this test. Phase 1 rollout is operator-provisioned on Mika
+    // Prime / orchestrator-CC, not on the four autonomous-loop well-known agents
+    // that ride this identity path — flipping any of them here is the exact class
+    // of change the plan's F2 resolution scopes to a separate operator action.
+    #[test]
+    fn test_well_known_agents_nudge_disabled_by_default_ac5() {
+        let settings = test_settings_with_kg_roots();
+        for spec in WELL_KNOWN_AGENTS {
+            let content = render_identity_content(spec, &settings)
+                .unwrap_or_else(|e| panic!("failed to render identity for {}: {e}", spec.name));
+            let identity: crate::prompt::Identity = toml::from_str(&content)
+                .unwrap_or_else(|e| panic!("invalid identity TOML for {}: {e}", spec.name));
+            assert!(
+                !identity.skills.nudge_is_enabled(),
+                "well-known agent '{}' must ship with nudge_is_enabled() == false \
+                 (mika#1583 AC5). Flipping this to true is a Phase 1 rollout scope \
+                 change reserved for operator-provisioned agents (Prime / \
+                 orchestrator-CC), not the autonomous-loop well-known agents.",
                 spec.name
             );
         }
