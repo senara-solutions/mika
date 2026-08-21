@@ -6,6 +6,17 @@ date: 2026-06-30
 
 # Plan — fix(team-engine): team-run completes with zero delegation (mika#1676)
 
+## Freshness-check delta (2026-08-21, +52 days from initial groom)
+
+Freshness-check pass by orchestrator-CC on 2026-08-21 verified body-vs-code drift; mechanical patches applied. The three-layer root cause and A/B/C fix shape are unchanged (`parse_task_assignments` at `engine.rs:1718`, first-decompose `Conversational` short-circuit at `engine.rs:656`, re-decompose at `engine.rs:711`, `Ok`-arm status transition at `engine.rs:504-508` all line-stable; `finalize_and_shutdown` drifted 586→568 — function name stable). Changes applied:
+
+- **Schema slot moved v39→v40 ⇒ v45→v46.** The v39→v40 slot is now taken by mika#1193 (retire mika-relay), and `CURRENT_SCHEMA_VERSION = 45` (v43→v44 = mika#1733 `permission_decisions`, v44→v45 = mika#1705 `pilot_transcripts`).
+- **Migration pattern moved additive-ALTER ⇒ table-rebuild.** Introducing `status='failed_no_delegation'` requires expanding the `team_runs.status` CHECK constraint (currently pinned in v1 DDL at `crates/mika-agent/src/db.rs:1161`); the mika#1262 additive-ALTER precedent does not apply. Use the v34→v35 `kg_resolutions_log` CHECK-expansion table-rebuild pattern instead.
+- **File paths corrected.** The `db/teams.rs` / `db/migrations.rs` split referenced in the original Files-Involved list never existed; `crates/mika-agent/src/db.rs` is a single ~20K-line file.
+- **WIP pilot commit staleness noted (implementation concern).** Branch HEAD `2865191d/ffea26f3 wip(mika#1676): salvage pilot work` already implements Units A/B/C shape but pins `CURRENT_SCHEMA_VERSION = 44` (targeting the then-current v43). Implementer must rebase and re-slot the migration to v45→v46 before promoting.
+
+Architect verdict on freshness-check (2026-08-21): documented in the ticket's grooming-history callout.
+
 ## Problem
 
 A team-run can finish with `team_runs.status='completed'` while delegating to **zero** members — the orchestrator silently absorbs the whole goal and executes it alone. The completed row is indistinguishable from a fully-delegated success, so the failure is invisible without a manual audit. Founding incident: Litha's `odds-engine` team, run `team-49640b61-…`, 2026-06-29 — orchestrator session ran a 20-step agentic loop (21 llm_calls, 37 tool_calls) doing the work itself, with response_text literally saying "Now dispatching to all three specialists in parallel" before never spawning any member.
@@ -54,7 +65,7 @@ Plain prose with neither (a) nor (b) routes to `Conversational` cleanly — pres
 
 Add structural visibility so this failure mode is queryable post-hoc regardless of whether Unit A is the right call for every case:
 
-- **B1 — schema.** New columns on `team_runs`: `delegation_count INTEGER NOT NULL DEFAULT 0` (filled at execute-tasks dispatch time), `solo_absorption INTEGER NOT NULL DEFAULT 0` (boolean flag set when the run completed without delegation), `failure_context TEXT` (nullable JSON, holds `{"phase": "first_decompose"|"revision_after_critic"}` for `FailedNoDelegation` runs — architect F2). Schema migration v39→v40. Backfill pre-v40 rows with NULL (treated as "unknown" by queries).
+- **B1 — schema.** New columns on `team_runs`: `delegation_count INTEGER NOT NULL DEFAULT 0` (filled at execute-tasks dispatch time), `solo_absorption INTEGER NOT NULL DEFAULT 0` (boolean flag set when the run completed without delegation), `failure_context TEXT` (nullable JSON, holds `{"phase": "first_decompose"|"revision_after_critic"}` for `FailedNoDelegation` runs — architect F2). **Schema migration v45→v46** (freshness-check 2026-08-21: original plan slotted v39→v40, but v39→v40 is taken by mika#1193 mika-relay retirement; current `CURRENT_SCHEMA_VERSION = 45`). **Table-rebuild required** — the migration must expand the `team_runs.status` CHECK constraint to include `'failed_no_delegation'` (v1 DDL currently pins `CHECK (status IN ('running','completed','failed','cancelled','suspended'))` at `crates/mika-agent/src/db.rs:1161`). Apply the same rebuild pattern used by v34→v35 for `kg_resolutions_log.outcome` CHECK expansion: `CREATE TABLE team_runs_new`, `INSERT INTO team_runs_new SELECT …`, `DROP TABLE team_runs`, `RENAME`, recreate `idx_team_runs_team`. Backfill in the rebuild `INSERT` with `0` for the new INTEGER columns and NULL for `failure_context`.
 - **B2 — write site.** `execute_tasks()` increments `delegation_count` for each spawned member session. `finalize_and_shutdown()` sets `solo_absorption = 1` when `delegation_count == 0` and the goal was emitted as actionable (vs trivial-conversational).
 - **B3 — dashboard surface.** Existing dashboard `/api/v1/team-runs` and per-run detail surfaces should display these fields. Cheap surface: badge/icon on the run row.
 
@@ -86,9 +97,9 @@ Ship as **two PRs**:
    - Tests: 4 fixture parses (clean JSON, JSON-in-fences, JSON-in-prose, narrative-only).
 
 2. **Unit B (schema + write sites):**
-   - Schema migration v39→v40 — additive ALTER TABLE on `team_runs` for `delegation_count INTEGER NOT NULL DEFAULT 0` and `solo_absorption INTEGER NOT NULL DEFAULT 0`. Per #1262 precedent (v38→v39, additive nullable + DEFAULT, no table rebuild).
+   - **Schema migration v45→v46** (freshness-check-updated) — **table-rebuild** on `team_runs` for `delegation_count INTEGER NOT NULL DEFAULT 0`, `solo_absorption INTEGER NOT NULL DEFAULT 0`, and `failure_context TEXT` (nullable JSON) PLUS `team_runs.status` CHECK expansion to include `'failed_no_delegation'`. Bump `CURRENT_SCHEMA_VERSION = 45` → `46` in `crates/mika-agent/src/db.rs:30`, register `migrate_v45_to_v46()` in the migration chain around `crates/mika-agent/src/db.rs:1066`, mirror v1 DDL update at `crates/mika-agent/src/db.rs:1161-1175`. Table-rebuild pattern per v34→v35 kg_resolutions_log precedent (`crates/mika-agent/src/db.rs` — search `migrate_v34_to_v35`). The mika#1262 additive-ALTER precedent (v38→v39) does NOT apply here because the CHECK constraint must expand.
    - `execute_tasks()` (existing function, around `engine.rs:660-690`) — increment `delegation_count` via DB write per spawned member.
-   - `finalize_and_shutdown()` (`engine.rs:586-599`) — set `solo_absorption = 1` when delegation_count == 0 AND first-decompose returned Conversational.
+   - `finalize_and_shutdown()` (`engine.rs:568` — line drift from original 586-599 is minor; the function name is stable) — set `solo_absorption = 1` when delegation_count == 0 AND first-decompose returned Conversational.
    - Dashboard API: add `delegation_count`, `solo_absorption` fields to `TeamRunRow` serialization.
    - Tests: schema migration round-trip, write-site coverage, query exercise.
 
@@ -105,7 +116,7 @@ Ship as **two PRs**:
 
 - **AC1 — Unit C parse tolerance.** `parse_task_assignments` parses (a) markdown-fenced JSON, (b) JSON with surrounding prose, (c) prose-only narrative all without changing the `DecomposeResult::Conversational` semantic for prose-only — but lifting the rate at which valid JSON-in-prose still routes to Conversational. Fixture tests cover all three.
 
-- **AC2 — Unit B observability.** `team_runs` schema gains `delegation_count INTEGER NOT NULL DEFAULT 0` + `solo_absorption INTEGER NOT NULL DEFAULT 0` columns (v39→v40 migration). `execute_tasks()` increments `delegation_count` per spawned member. `finalize_and_shutdown()` sets `solo_absorption = 1` when first-decompose was Conversational AND delegation_count == 0. Both fields are queryable via SQL and exposed on the dashboard API.
+- **AC2 — Unit B observability.** `team_runs` schema gains `delegation_count INTEGER NOT NULL DEFAULT 0`, `solo_absorption INTEGER NOT NULL DEFAULT 0`, and `failure_context TEXT` columns (**v45→v46 migration — table-rebuild pattern per v34→v35 precedent**; CHECK constraint on `team_runs.status` expands to include `'failed_no_delegation'` in the same rebuild). `execute_tasks()` increments `delegation_count` per spawned member. `finalize_and_shutdown()` sets `solo_absorption = 1` when first-decompose was Conversational AND delegation_count == 0. All three fields are queryable via SQL and exposed on the dashboard API.
 
 - **AC3 — Unit A delegation gate.** On `Conversational` fallthrough during first-decompose for an actionable goal (actionability = response matches keyword regex `(?i)\b(dispatching?|decompos\w*|delegat\w*|assign(?:ed|ing)?\s+(?:to|for)|hand(?:ing|ed)?\s+(?:off|over)\s+to|split\w*\s+(?:work|task)|parallel\w*\s+(?:delegat|specialis|member))\b` OR contains JSON-array-shape that failed `Vec<TaskAssignment>` validation — architect F1 pinned): the engine runs one retry of decompose with prompt reinforcement. On second `Conversational`, the run transitions to terminal `RunStatus::FailedNoDelegation` (`status='failed_no_delegation'` in DB), not `Completed`. Re-decompose path uses same gate, same terminal state, with `failure_context = {"phase": "revision_after_critic"}` (architect F2 — single terminal state, phase as JSON detail).
 
@@ -125,8 +136,7 @@ Ship as **two PRs**:
 - `crates/mika-agent/src/teams/engine.rs:656-715` — Unit A short-circuit guard
 - `crates/mika-agent/src/teams/engine.rs:1718-1806` — Unit C parse tolerance
 - `crates/mika-agent/src/teams/prompt.rs:94-145` — Unit C prompt reinforcement
-- `crates/mika-agent/src/db/teams.rs` — Unit B schema migration v39→v40 + write methods
-- `crates/mika-agent/src/db/migrations.rs` — Unit B migration registration
+- `crates/mika-agent/src/db.rs` (single-file, ~20K lines; freshness-check 2026-08-21: original plan referenced a `db/teams.rs` / `db/migrations.rs` split that never existed) — Unit B write methods (~L9071 `INSERT INTO team_runs`, ~L9095 status-update; add `delegation_count`/`solo_absorption` write sites for `execute_tasks()` and `finalize_and_shutdown()`), v1 DDL update at L1161-1175, `migrate_v45_to_v46()` implementation, migration-chain registration at ~L1066, `CURRENT_SCHEMA_VERSION` bump at L30, `TeamRunRow` struct extension at ~L253.
 - `crates/mika-agent/src/server/team_runs.rs` — Unit B dashboard API serialization
 - `dashboard/src/components/team-runs/` — Unit B UI surface
 - `crates/mika-agent/tests/teams/engine_tests.rs` — Unit A/B/C tests (or co-located in engine.rs)
@@ -135,7 +145,7 @@ Ship as **two PRs**:
 
 - `cargo test -p mika-agent --test eval` — full eval matrix stays green.
 - `cargo test -p mika-agent` — team engine tests cover new parse paths + delegation gate.
-- Schema migration round-trip test: open v39 DB → apply v40 migration → verify new columns exist with correct defaults → write/read round-trip on both columns.
+- Schema migration round-trip test: open v45 DB → apply v46 migration → verify new columns exist with correct defaults AND `team_runs.status` CHECK constraint accepts `'failed_no_delegation'` → write/read round-trip on all three columns AND an insert with `status='failed_no_delegation'` succeeds.
 - Replay test: feed run #1's orchestrator decompose response_text to `parse_task_assignments` → assert outcome (Tasks if Unit C suffices, retry-then-FailedNoDelegation if it doesn't).
 - Synthetic test: zero-member-spawn run → assert `solo_absorption=1` written by `finalize_and_shutdown`.
 
