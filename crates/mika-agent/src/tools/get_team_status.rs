@@ -191,6 +191,9 @@ mod tests {
                 1,
                 Some("Done"),
                 Some("2025-02-19T15:07:40Z"),
+                0,
+                false,
+                None,
             )
             .await
             .unwrap();

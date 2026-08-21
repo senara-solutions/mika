@@ -2065,6 +2065,7 @@ fn parse_review_response(response: &str) -> Result<(bool, String)> {
 /// - For arrays (`[`/`]`): looks for `[{` as the start pattern
 /// - For objects (`{`/`}`): looks for `{"` as the start pattern
 ///   Then searches backwards from the end for the matching close bracket. (#257)
+///
 /// Strip markdown code-fence delimiter lines (```lang / ```), keeping inner
 /// content (mika#1676 Unit C). A common non-Anthropic model behavior is to wrap
 /// the decompose JSON in a fenced block; removing the delimiters lets the
@@ -2939,5 +2940,160 @@ mod tests {
             count, 1,
             "idempotent sweep must write exactly one audit event"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // mika#1676 Unit A — actionability detection tests
+    //
+    // `detect_actionability` is the load-bearing predicate that decides
+    // whether a `Conversational` decompose reply merits a gated retry vs.
+    // routing through as an honest orchestrator-solo completion. The
+    // regex + JSON-array-shape pair is architect-F1-pinned; regressions
+    // here would either (a) mute the gate on genuine intent-to-delegate
+    // replies (false negative — the mika#1676 defect returns) or
+    // (b) fire the gate on trivial conversational goals (false positive —
+    // "what time is it" now costs one extra decompose call). Both matter.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_detect_actionability_matches_delegate_verbs() {
+        // Direct evidence from run #1 (founding incident): the orchestrator
+        // said "Now dispatching to all three specialists in parallel" then
+        // never spawned anyone. The keyword regex MUST catch this shape.
+        for txt in [
+            "Now dispatching to all three specialists in parallel",
+            "I am delegating this to the CTO agent",
+            "Assigning to the quant specialist",
+            "Handing off to the CTO",
+            "I'll decompose this into three parallel tasks",
+            "Splitting work between the CFO and the quant",
+            "Parallel delegation to the three specialists",
+        ] {
+            assert!(
+                detect_actionability(txt).is_some(),
+                "actionability regex must fire on intent-to-delegate phrase: {txt:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_actionability_no_fire_on_trivial_prose() {
+        // False-positive guard: trivial conversational replies with no
+        // intent-to-delegate signal must route through cleanly. Otherwise
+        // "what time is it" costs one extra decompose call.
+        for txt in [
+            "It is 3:15 PM local time.",
+            "The team is ready.",
+            "Everything looks good.",
+            "Hello!",
+            "I do not have enough information to answer that.",
+        ] {
+            assert!(
+                detect_actionability(txt).is_none(),
+                "actionability regex must NOT fire on trivial reply: {txt:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_actionability_matches_json_array_shape() {
+        // Even without any keyword, a JSON-array-of-objects shape that
+        // failed `Vec<TaskAssignment>` validation upstream is itself
+        // intent-to-delegate-via-JSON evidence (architect F1 branch b).
+        let txt = "Sure, here's the plan:\n[{\"a\": 1}, {\"b\": 2}]\nMake sense?";
+        let signal = detect_actionability(txt).expect("json-array-shape branch must fire");
+        assert!(
+            signal.starts_with("json_array_shape@"),
+            "signal must identify the branch that fired; got {signal:?}",
+        );
+    }
+
+    #[test]
+    fn test_detect_actionability_json_array_spans_newlines() {
+        // Real orchestrator responses pretty-print JSON across newlines.
+        // The `(?s)` flag on JSON_ARRAY_RE MUST let `.` span line breaks;
+        // without it a multi-line array would silently skip the gate.
+        let txt = "Plan:\n[\n  {\n    \"agent\": \"cto\"\n  }\n]";
+        assert!(
+            detect_actionability(txt).is_some(),
+            "json-array-shape regex must span newlines (needs (?s) flag)",
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // mika#1676 Unit C — parse tolerance tests
+    //
+    // Unit C is a preprocessor that feeds the existing schema validation
+    // path (architect F3): its job is to LOWER the rate at which the
+    // Unit A gate has to fire on genuine JSON-in-prose responses. These
+    // tests pin the two helpers (`strip_markdown_fences` +
+    // `extract_first_json_array`) so a future refactor cannot silently
+    // dilute their tolerance.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_strip_markdown_fences_removes_fenced_json() {
+        let response = "```json\n[{\"agent\":\"cto\"}]\n```";
+        let stripped = strip_markdown_fences(response);
+        assert!(!stripped.contains("```"), "fence backticks must be removed");
+        assert!(stripped.contains("[{\"agent\":\"cto\"}]"));
+    }
+
+    #[test]
+    fn test_strip_markdown_fences_is_noop_on_plain_text() {
+        let response = "[{\"agent\":\"cto\",\"task\":\"go\",\"output_file\":\"o.md\"}]";
+        assert_eq!(
+            strip_markdown_fences(response),
+            response,
+            "plain text without fences must round-trip unchanged"
+        );
+    }
+
+    #[test]
+    fn test_extract_first_json_array_locates_array_in_prose() {
+        // The founding-incident shape: JSON-in-prose narration that the
+        // legacy `extract_json` regex would miss. The balanced-bracket
+        // extractor MUST recover it so `parse_task_assignments` reaches
+        // the schema validation path with clean input.
+        let text = "Here's the plan:\n[{\"agent\":\"cto\",\"task\":\"do stuff\"}]\nEnd of plan.";
+        let extracted = extract_first_json_array(text)
+            .expect("extractor must locate the array embedded in prose");
+        assert!(extracted.starts_with('['));
+        assert!(extracted.ends_with(']'));
+        assert!(extracted.contains("cto"));
+    }
+
+    #[test]
+    fn test_extract_first_json_array_returns_none_on_prose_only() {
+        // A response with no array at all must return None so the caller
+        // falls through to the legacy extractor (which will also miss)
+        // and the parser routes to `Conversational` — the correct outcome
+        // for an honest prose reply.
+        let text = "I do not have enough information to plan this.";
+        assert!(
+            extract_first_json_array(text).is_none(),
+            "prose-only text must return None so the caller can route to Conversational",
+        );
+    }
+
+    #[test]
+    fn test_parse_task_assignments_recovers_fenced_json() {
+        // End-to-end pin for Unit C: a markdown-fenced task-assignment
+        // array MUST be recovered as `DecomposeResult::Tasks` (not
+        // `Conversational`). Regression here would silently push the
+        // fenced-JSON class into the Unit A gate — costing one extra
+        // decompose call per fenced response, which glm-5.2 emits often.
+        let team = test_team();
+        let response = "```json\n[{\"agent\":\"worker\",\"task\":\"Do research\",\"output_file\":\"r.md\"}]\n```";
+        let result = parse_task_assignments(response, &team).unwrap();
+        match result {
+            DecomposeResult::Tasks(tasks) => {
+                assert_eq!(tasks.len(), 1);
+                assert_eq!(tasks[0].agent, "worker");
+            }
+            DecomposeResult::Conversational(_) => {
+                panic!("Unit C fence stripping must recover fenced JSON as Tasks");
+            }
+        }
     }
 }

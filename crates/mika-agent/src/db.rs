@@ -27,7 +27,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 46;
+pub const CURRENT_SCHEMA_VERSION: i64 = 47;
 
 /// mika#1742 Problem B: refuse-to-zombie grace window for
 /// [`Database::create_recurring_task_if_absent`]. Recent same-label recurring
@@ -1109,6 +1109,11 @@ impl Database {
             info!(version = 46, "database migrated to v46");
         }
 
+        if (3..=46).contains(&version) {
+            self.migrate_v46_to_v47()?;
+            info!(version = 47, "database migrated to v47");
+        }
+
         Ok(())
     }
 
@@ -1163,7 +1168,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (46);
+            INSERT INTO schema_version (version) VALUES (47);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -4717,7 +4722,7 @@ impl Database {
         Ok(n)
     }
 
-    /// v45→v46: team_runs delegation-visibility (mika#1676).
+    /// v46→v47: team_runs delegation-visibility (mika#1676).
     ///
     /// Two coupled schema changes, one atomic table-rebuild:
     ///
@@ -4740,15 +4745,15 @@ impl Database {
     /// Table-rebuild is mandatory here because SQLite does not support
     /// `ALTER TABLE … MODIFY CONSTRAINT` and the CHECK constraint must widen.
     /// Follows the exact shape of `migrate_v34_to_v35` (kg_resolutions_log
-    /// outcome CHECK expansion, #1154): rename existing table to `_v45_backup`,
+    /// outcome CHECK expansion, #1154): rename existing table to `_v46_backup`,
     /// create new table with expanded CHECK + new columns, INSERT SELECT
     /// (backfilling new columns with their DEFAULTs), DROP backup, recreate
     /// index. `PRAGMA foreign_keys = OFF` for the rebuild window because
     /// `tasks.team_run_id` FKs into `team_runs(id)`; the RENAME/DROP would
     /// otherwise violate FK enforcement even though row IDs are preserved.
-    fn migrate_v45_to_v46(&mut self) -> Result<()> {
+    fn migrate_v46_to_v47(&mut self) -> Result<()> {
         let version = self.schema_version()?;
-        if version >= 46 {
+        if version >= 47 {
             return Ok(());
         }
 
@@ -4757,15 +4762,37 @@ impl Database {
             .query_row("SELECT COUNT(*) FROM team_runs", [], |r| r.get(0))
             .unwrap_or(0);
 
+        // CREATE-INSERT-DROP-RENAME sequence (per the v11→v12 rebuild
+        // precedent at `crates/mika-agent/src/db.rs:2696`), NOT the
+        // RENAME-CREATE-INSERT-DROP sequence used by the v34→v35
+        // kg_resolutions_log rebuild.
+        //
+        // Rationale — child-FK preservation:
+        // Since SQLite 3.26 (2018), a plain `ALTER TABLE … RENAME TO …`
+        // rewrites referring FK metadata to track the new name. That is
+        // safe for `kg_resolutions_log` (no child table FKs into it), but
+        // catastrophic here because `tasks.team_run_id REFERENCES team_runs(id)`.
+        // A RENAME-first sequence would silently retarget the FK to
+        // `team_runs_v46_backup`, then leave it pointing at a dropped
+        // table — every subsequent `INSERT INTO tasks` would fail
+        // "no such table: team_runs_v46_backup". `PRAGMA legacy_alter_table = ON`
+        // does NOT prevent this rewrite reliably across sqlite versions.
+        //
+        // The CREATE-INSERT-DROP-RENAME sequence sidesteps the trap:
+        // the OLD `team_runs` is dropped BEFORE the new table exists under
+        // that name, and the RENAME then creates the target name fresh —
+        // so `tasks.team_run_id` continues to name `team_runs` throughout
+        // and resolves against the new table when FK checks re-enable.
+        // (Symmetric bug would have corrupted every FK-user of team_runs
+        // at first write post-deploy — caught by the
+        // `test_migrate_v46_to_v47_*` tests and `test_v1_and_incremental_schemas_converge`.)
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(
             "PRAGMA foreign_keys = OFF;
 
-             ALTER TABLE team_runs RENAME TO team_runs_v45_backup;
-
-             CREATE TABLE team_runs (
+             CREATE TABLE team_runs_new (
                  id TEXT PRIMARY KEY,
                  team_id TEXT NOT NULL REFERENCES teams(id),
                  goal TEXT NOT NULL,
@@ -4787,7 +4814,7 @@ impl Database {
                  failure_context TEXT
              );
 
-             INSERT INTO team_runs
+             INSERT INTO team_runs_new
                  (id, team_id, goal, status, failure_reason,
                   iteration, max_iterations, deliverable, checkpoint,
                   trace_id, started_at, ended_at,
@@ -4796,15 +4823,17 @@ impl Database {
                     iteration, max_iterations, deliverable, checkpoint,
                     trace_id, started_at, ended_at,
                     0, 0, NULL
-             FROM team_runs_v45_backup;
+             FROM team_runs;
 
-             DROP TABLE team_runs_v45_backup;
+             DROP TABLE team_runs;
+
+             ALTER TABLE team_runs_new RENAME TO team_runs;
 
              CREATE INDEX idx_team_runs_team ON team_runs(team_id, started_at DESC);
 
              PRAGMA foreign_keys = ON;",
         )?;
-        tx.execute("INSERT INTO schema_version (version) VALUES (46)", [])?;
+        tx.execute("INSERT INTO schema_version (version) VALUES (47)", [])?;
         tx.commit()?;
 
         let count_after: i64 = self
@@ -4815,7 +4844,7 @@ impl Database {
         info!(
             count_before = count_before,
             count_after = count_after,
-            "v45→v46: expanded team_runs.status CHECK to include 'failed_no_delegation' + added delegation_count/solo_absorption/failure_context columns (mika#1676)"
+            "v46→v47: expanded team_runs.status CHECK to include 'failed_no_delegation' + added delegation_count/solo_absorption/failure_context columns (mika#1676)"
         );
 
         Ok(())
@@ -12000,6 +12029,9 @@ mod tests {
             1,
             Some("Done!"),
             Some("2023-11-14T22:30:00Z"),
+            0,
+            false,
+            None,
         )
         .unwrap();
         let runs = db.load_team_runs("engineering", 10).unwrap();
@@ -15537,6 +15569,9 @@ mod tests {
             2,
             Some("deliverable"),
             Some("2020-01-01T00:01:00Z"),
+            0,
+            false,
+            None,
         )
         .unwrap();
 
@@ -15564,8 +15599,18 @@ mod tests {
         assert!(result.is_none());
 
         // Suspend it → still should not be returned
-        db.update_team_run("run-finished-1", "suspended", None, 1, None, None)
-            .unwrap();
+        db.update_team_run(
+            "run-finished-1",
+            "suspended",
+            None,
+            1,
+            None,
+            None,
+            0,
+            false,
+            None,
+        )
+        .unwrap();
         let result = db.get_last_finished_team_run("finished-team").unwrap();
         assert!(result.is_none());
 
@@ -15586,6 +15631,9 @@ mod tests {
             2,
             Some("done"),
             Some("2020-01-01T00:02:00Z"),
+            0,
+            false,
+            None,
         )
         .unwrap();
 
@@ -15610,6 +15658,9 @@ mod tests {
             0,
             None,
             Some("2020-01-01T00:03:30Z"),
+            0,
+            false,
+            None,
         )
         .unwrap();
 
@@ -15638,6 +15689,9 @@ mod tests {
             1,
             Some("final output"),
             Some("2020-01-01T00:01:00Z"),
+            0,
+            false,
+            None,
         )
         .unwrap();
 
@@ -17398,6 +17452,7 @@ mod tests {
         db2.migrate_v43_to_v44().unwrap();
         db2.migrate_v44_to_v45().unwrap();
         db2.migrate_v45_to_v46().unwrap();
+        db2.migrate_v46_to_v47().unwrap();
 
         let final_version: i64 = db2
             .conn
@@ -20538,5 +20593,378 @@ mod tests {
         // Query for "mika" agent — should not find the other-agent's task
         let result = db.has_completed_groom_for_issue("mika", issue_url).unwrap();
         assert!(!result);
+    }
+
+    // ------------------------------------------------------------------
+    // mika#1676 — v46→v47: team_runs delegation-visibility (Unit B + Unit A
+    // terminal state). The migration is a CHECK-expansion table-rebuild
+    // following the v34→v35 kg_resolutions_log precedent, plus three
+    // additive columns for observability. Tests below assert the migration
+    // (a) applies cleanly on a v46 DB seeded with rows, (b) preserves
+    // row-count and per-row values, (c) accepts inserts with the new
+    // `failed_no_delegation` status, (d) accepts the pre-existing status
+    // set unchanged, and (e) round-trips the three new columns.
+    //
+    // A sixth test (`test_migrate_v46_to_v47_is_idempotent`) proves the
+    // early-return guard so a crash-recovery re-run of the migration chain
+    // does not corrupt the rebuilt table.
+    //
+    // Re-slot note (post-rebase 2026-08-22): originally landed as v45→v46
+    // (mika#1676 pre-conflict). After main merged mika#1867 (`served_content`
+    // ledger) into the v46 slot first, this migration was moved to v47 to
+    // preserve the linear history. Migration semantics unchanged.
+    // ------------------------------------------------------------------
+
+    /// Build a fresh in-memory DB, rewind schema_version to 46, and
+    /// clean-slate-DDL-drop the delegation columns so `migrate_v46_to_v47`
+    /// exercises the real ALTER path. `db()` runs the full migration chain
+    /// (up to `CURRENT_SCHEMA_VERSION` = 47), so we then rebuild `team_runs`
+    /// with the pre-v47 shape (without the three new columns and without the
+    /// expanded CHECK constraint) to reproduce a v46 database exactly.
+    fn db_at_v46() -> Database {
+        let db = db();
+        db.conn
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DROP TABLE IF EXISTS team_runs;
+                 CREATE TABLE team_runs (
+                     id TEXT PRIMARY KEY,
+                     team_id TEXT NOT NULL REFERENCES teams(id),
+                     goal TEXT NOT NULL,
+                     status TEXT NOT NULL DEFAULT 'running'
+                         CHECK (status IN ('running','completed','failed','cancelled','suspended')),
+                     failure_reason TEXT,
+                     iteration INTEGER NOT NULL DEFAULT 1,
+                     max_iterations INTEGER NOT NULL DEFAULT 3,
+                     deliverable TEXT,
+                     checkpoint TEXT,
+                     trace_id TEXT,
+                     started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                     ended_at TEXT
+                 );
+                 CREATE INDEX idx_team_runs_team ON team_runs(team_id, started_at DESC);
+                 DELETE FROM schema_version WHERE version > 46;
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+        db
+    }
+
+    /// AC2 / test-coverage-mandatory line 1: v46→v47 migration applies cleanly
+    /// on a seeded v46 database, bumps the schema version, and lands the
+    /// three new columns with their DEFAULT values on pre-existing rows.
+    #[test]
+    fn test_migrate_v46_to_v47_applies_cleanly() {
+        let mut db = db_at_v46();
+        db.register_agent("mika", "Mika", "").unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO teams (id, name, config_path) VALUES ('t-1', 'alpha', '')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO team_runs (id, team_id, goal, status, iteration, max_iterations, started_at) \
+                 VALUES ('r-1', 't-1', 'g', 'completed', 1, 3, '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        db.migrate_v46_to_v47().unwrap();
+
+        let version: i64 = db
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            version, 47,
+            "schema_version must reach 47 after migrate_v46_to_v47"
+        );
+
+        let (delegation_count, solo_absorption, failure_context): (i64, i64, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT delegation_count, solo_absorption, failure_context FROM team_runs WHERE id = 'r-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            delegation_count, 0,
+            "delegation_count DEFAULT must backfill to 0"
+        );
+        assert_eq!(
+            solo_absorption, 0,
+            "solo_absorption DEFAULT must backfill to 0"
+        );
+        assert!(
+            failure_context.is_none(),
+            "failure_context must backfill to NULL"
+        );
+    }
+
+    /// AC2 / test-coverage-mandatory line 2: the v46→v47 rebuild preserves
+    /// row count and per-row values (id/team_id/goal/status/iteration/…) so
+    /// no team-run history is lost across the migration.
+    #[test]
+    fn test_migrate_v46_to_v47_preserves_row_data() {
+        let mut db = db_at_v46();
+        db.register_agent("mika", "Mika", "").unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO teams (id, name, config_path) VALUES ('t-1', 'alpha', '')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute_batch(
+                "INSERT INTO team_runs (id, team_id, goal, status, failure_reason, \
+                     iteration, max_iterations, deliverable, checkpoint, trace_id, \
+                     started_at, ended_at) \
+                 VALUES ('r-1', 't-1', 'goal A', 'completed', NULL, 2, 3, 'D', NULL, 'tr-1', \
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z'),
+                        ('r-2', 't-1', 'goal B', 'failed', 'boom', 3, 3, NULL, NULL, 'tr-2', \
+                     '2026-01-02T00:00:00Z', '2026-01-02T00:02:00Z'),
+                        ('r-3', 't-1', 'goal C', 'cancelled', NULL, 1, 3, NULL, NULL, NULL, \
+                     '2026-01-03T00:00:00Z', NULL);",
+            )
+            .unwrap();
+
+        let count_before: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM team_runs", [], |r| r.get(0))
+            .unwrap();
+
+        db.migrate_v46_to_v47().unwrap();
+
+        let count_after: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM team_runs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count_before, count_after,
+            "row count MUST be preserved through the table-rebuild migration"
+        );
+
+        // Spot-check every column on the middle row — the migration must
+        // preserve NULLs (failure_reason on r-1) and non-NULL values alike.
+        let (goal, status, failure_reason, iteration, deliverable, trace_id): (
+            String,
+            String,
+            Option<String>,
+            i64,
+            Option<String>,
+            Option<String>,
+        ) = db
+            .conn
+            .query_row(
+                "SELECT goal, status, failure_reason, iteration, deliverable, trace_id \
+                 FROM team_runs WHERE id = 'r-2'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(goal, "goal B");
+        assert_eq!(status, "failed");
+        assert_eq!(failure_reason.as_deref(), Some("boom"));
+        assert_eq!(iteration, 3);
+        assert!(deliverable.is_none());
+        assert_eq!(trace_id.as_deref(), Some("tr-2"));
+
+        // The idx_team_runs_team index MUST be recreated (dropped as a
+        // side effect of the RENAME/DROP) — otherwise queries against
+        // team_runs by (team_id, started_at) fall back to a table scan.
+        let idx_exists: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_team_runs_team'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            idx_exists, 1,
+            "idx_team_runs_team MUST be recreated after the table-rebuild"
+        );
+
+        // FK integrity — the load-bearing invariant that motivated the
+        // CREATE-INSERT-DROP-RENAME sequence in the migration (see the
+        // rationale comment on migrate_v46_to_v47 for why the naïve
+        // RENAME-first sequence would silently retarget tasks.team_run_id
+        // to a nonexistent table). First assert the FK still names
+        // `team_runs` (schema-level check), then prove writes actually
+        // work end-to-end.
+        db.register_agent("mika", "Mika", "").unwrap();
+        let fk_target: String = db
+            .conn
+            .query_row(
+                "SELECT \"table\" FROM pragma_foreign_key_list('tasks') \
+                 WHERE \"from\" = 'team_run_id'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("tasks.team_run_id FK must exist");
+        assert_eq!(
+            fk_target, "team_runs",
+            "tasks.team_run_id must still target team_runs after rebuild — \
+             a `team_runs_new` or backup target here means the migration \
+             regressed to the RENAME-first sequence"
+        );
+        db.conn
+            .execute(
+                "INSERT INTO tasks (id, agent_id, team_run_id, label, trigger_type, action_type, status) \
+                 VALUES ('task-1', 'mika', 'r-1', 'noop', 'manual', 'none', 'pending')",
+                [],
+            )
+            .expect("INSERT INTO tasks with valid team_run_id FK must succeed post-rebuild");
+    }
+
+    /// AC2 / test-coverage-mandatory line 3: the expanded CHECK constraint
+    /// accepts the new `'failed_no_delegation'` status, and the old status
+    /// set is still accepted verbatim (no CHECK regression). This is the
+    /// load-bearing assertion the plan (§ Migration pattern) demands:
+    /// widening the CHECK is the whole point of table-rebuild vs additive-
+    /// ALTER, and the invariant is only meaningful when both halves hold.
+    #[test]
+    fn test_migrate_v46_to_v47_check_expansion_accepts_new_and_old_statuses() {
+        let mut db = db_at_v46();
+        db.register_agent("mika", "Mika", "").unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO teams (id, name, config_path) VALUES ('t-1', 'alpha', '')",
+                [],
+            )
+            .unwrap();
+
+        db.migrate_v46_to_v47().unwrap();
+
+        // New status: MUST be accepted after v47.
+        db.conn
+            .execute(
+                "INSERT INTO team_runs (id, team_id, goal, status, iteration, max_iterations, started_at) \
+                 VALUES ('r-new', 't-1', 'g', 'failed_no_delegation', 1, 3, '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .expect("v47 CHECK must accept 'failed_no_delegation'");
+
+        // All pre-v47 statuses: MUST still be accepted (no regression).
+        for status in &["running", "completed", "failed", "cancelled", "suspended"] {
+            let id = format!("r-old-{status}");
+            db.conn
+                .execute(
+                    "INSERT INTO team_runs (id, team_id, goal, status, iteration, max_iterations, started_at) \
+                     VALUES (?1, 't-1', 'g', ?2, 1, 3, '2026-01-01T00:00:00Z')",
+                    params![id, status],
+                )
+                .unwrap_or_else(|e| panic!("v47 CHECK must accept legacy status '{status}': {e}"));
+        }
+
+        // A genuinely-invalid status MUST still be rejected (defense-in-depth
+        // — proves the CHECK is present and enforcing, not vacuously removed).
+        let bogus = db.conn.execute(
+            "INSERT INTO team_runs (id, team_id, goal, status, iteration, max_iterations, started_at) \
+             VALUES ('r-bogus', 't-1', 'g', 'not_a_real_status', 1, 3, '2026-01-01T00:00:00Z')",
+            [],
+        );
+        assert!(
+            bogus.is_err(),
+            "v47 CHECK must still reject arbitrary strings; got Ok — CHECK missing?"
+        );
+    }
+
+    /// AC2 / test-coverage-mandatory line 4: the three new columns
+    /// round-trip via the write API (`update_team_run` with non-default
+    /// values) and the read helpers (`row_to_team_run`).
+    #[test]
+    fn test_migrate_v46_to_v47_new_columns_round_trip() {
+        let db = db();
+        db.register_agent("mika", "Mika", "").unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO teams (id, name, config_path) VALUES ('t-1', 'alpha', '')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO team_runs (id, team_id, goal, status, iteration, max_iterations, started_at) \
+                 VALUES ('r-1', 't-1', 'g', 'running', 1, 3, '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        db.update_team_run(
+            "r-1",
+            "failed_no_delegation",
+            Some("no delegation"),
+            2,
+            None,
+            Some("2026-01-01T00:01:00Z"),
+            0,
+            true,
+            Some(r#"{"phase":"first_decompose"}"#),
+        )
+        .unwrap();
+
+        let runs = db.load_team_runs("alpha", 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        let row = &runs[0];
+        assert_eq!(row.status, "failed_no_delegation");
+        assert_eq!(row.delegation_count, 0);
+        assert!(
+            row.solo_absorption,
+            "solo_absorption must round-trip as true"
+        );
+        assert_eq!(
+            row.failure_context.as_deref(),
+            Some(r#"{"phase":"first_decompose"}"#)
+        );
+    }
+
+    /// The migration MUST be idempotent so a crash-recovery re-run of the
+    /// full chain (see `migrate()`'s `if (3..=46).contains(&version)`
+    /// guard) does not corrupt the rebuilt table. Confirms the early-return
+    /// `if version >= 47 { return Ok(()); }` protects a second application.
+    #[test]
+    fn test_migrate_v46_to_v47_is_idempotent() {
+        let mut db = db_at_v46();
+        db.register_agent("mika", "Mika", "").unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO teams (id, name, config_path) VALUES ('t-1', 'alpha', '')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO team_runs (id, team_id, goal, status, iteration, max_iterations, started_at) \
+                 VALUES ('r-1', 't-1', 'g', 'completed', 1, 3, '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        db.migrate_v46_to_v47().unwrap();
+        // Second application MUST be a no-op — the early-return guard fires.
+        db.migrate_v46_to_v47().unwrap();
+
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM team_runs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "idempotent re-run must not lose or duplicate rows"
+        );
     }
 }

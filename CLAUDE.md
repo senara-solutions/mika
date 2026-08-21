@@ -61,7 +61,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **Grounding rule:** The system prompt prohibits the agent from claiming downstream system state unless a tool result confirms it. Reinforced in `format_callback_framing` and `SilentTrigger::Callback`.
 - **Confirmation before action:** The system prompt instructs the agent to answer informational questions directly without starting multi-step workflows.
 - **Context priority:** current user message > core memory > active skill context > conversation summary > conversation history > search results. See `docs/memory-classification.md`.
-- **Database:** Case-insensitive COLLATE NOCASE on unique text columns. Schema v39. See `crates/mika-agent/CLAUDE.md` for schema details.
+- **Database:** Case-insensitive COLLATE NOCASE on unique text columns. Schema v47. See `crates/mika-agent/CLAUDE.md` for schema details.
   - v27->v28: `agent_kg_corpora` table (#798) — maps `agent_id` to `docs_root_hash` for multi-corpus query fan-out. Populated by startup lexical ingest.
   - v28->v29: Backfill migration (#908) — scrubs secret-shaped values from existing `tool_calls.input` and `tool_calls.output` rows using `secret_scrubber::scrub_secrets()`. Data-only, no DDL. New `save_tool_call()` calls also scrub before INSERT.
   - v29->v30: Expand `kg_resolutions_log.outcome` CHECK constraint to include `'matched_llm_db_fallback'` (#874). Enables DB-fallback acceptance path for LLM matches outside the in-prompt candidate window.

@@ -154,6 +154,9 @@ mod tests {
                     1,
                     Some("Done"),
                     Some(end_times[i]),
+                    0,
+                    false,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -212,6 +215,9 @@ mod tests {
                     1,
                     Some("Done"),
                     Some(end_times[i]),
+                    0,
+                    false,
+                    None,
                 )
                 .await
                 .unwrap();

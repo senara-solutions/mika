@@ -475,6 +475,9 @@ mod tests {
                 started_at: "2026-01-01T00:00:00Z".to_string(),
                 ended_at: Some("2026-01-01T00:00:01Z".to_string()),
                 trace_id: None,
+                delegation_count: 0,
+                solo_absorption: false,
+                failure_context: None,
             },
             TeamRunRow {
                 id: "run-2".to_string(),
@@ -488,6 +491,9 @@ mod tests {
                 started_at: "2026-01-01T00:00:02Z".to_string(),
                 ended_at: Some("2026-01-01T00:00:03Z".to_string()),
                 trace_id: None,
+                delegation_count: 0,
+                solo_absorption: false,
+                failure_context: None,
             },
         ];
         let ctx = build_orchestrator_context(&def, "", None, &history, None);
@@ -604,6 +610,9 @@ mod tests {
             started_at: "2026-01-01T00:00:00Z".to_string(),
             ended_at: Some("2026-01-01T00:00:01Z".to_string()),
             trace_id: None,
+            delegation_count: 0,
+            solo_absorption: false,
+            failure_context: None,
         }];
         let ctx = build_orchestrator_context(&def, "", None, &history, None);
         assert!(ctx.contains(&goal));
@@ -626,6 +635,9 @@ mod tests {
                 started_at: "2025-03-03T14:26:40Z".to_string(),
                 ended_at: Some("2025-03-03T15:26:40Z".to_string()),
                 trace_id: None,
+                delegation_count: 0,
+                solo_absorption: false,
+                failure_context: None,
             },
             agent_results: vec![
                 AgentResultSummary {
@@ -677,6 +689,9 @@ mod tests {
                 started_at: "2025-03-03T14:26:40Z".to_string(),
                 ended_at: Some("2025-03-03T15:26:40Z".to_string()),
                 trace_id: None,
+                delegation_count: 0,
+                solo_absorption: false,
+                failure_context: None,
             },
             agent_results: vec![],
             task_statuses: vec![],
@@ -713,6 +728,9 @@ mod tests {
                 started_at: "2025-03-03T14:26:40Z".to_string(),
                 ended_at: Some("2025-03-03T15:26:40Z".to_string()),
                 trace_id: None,
+                delegation_count: 0,
+                solo_absorption: false,
+                failure_context: None,
             },
             agent_results: vec![],
             task_statuses: vec![],
@@ -747,6 +765,9 @@ mod tests {
                 started_at: "2025-03-03T14:26:40Z".to_string(),
                 ended_at: Some("2025-03-03T15:26:40Z".to_string()),
                 trace_id: None,
+                delegation_count: 0,
+                solo_absorption: false,
+                failure_context: None,
             },
             agent_results: vec![],
             task_statuses: vec![],
@@ -778,6 +799,9 @@ mod tests {
                 started_at: "2026-01-01T00:00:02Z".to_string(),
                 ended_at: Some("2026-01-01T00:00:03Z".to_string()),
                 trace_id: None,
+                delegation_count: 0,
+                solo_absorption: false,
+                failure_context: None,
             },
             agent_results: vec![],
             task_statuses: vec![],
@@ -798,6 +822,9 @@ mod tests {
                 started_at: "2026-01-01T00:00:02Z".to_string(),
                 ended_at: Some("2026-01-01T00:00:03Z".to_string()),
                 trace_id: None,
+                delegation_count: 0,
+                solo_absorption: false,
+                failure_context: None,
             },
             TeamRunRow {
                 id: "run-1".to_string(),
@@ -811,6 +838,9 @@ mod tests {
                 started_at: "2026-01-01T00:00:00Z".to_string(),
                 ended_at: Some("2026-01-01T00:00:01Z".to_string()),
                 trace_id: None,
+                delegation_count: 0,
+                solo_absorption: false,
+                failure_context: None,
             },
         ];
 

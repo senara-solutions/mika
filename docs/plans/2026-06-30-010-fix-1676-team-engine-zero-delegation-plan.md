@@ -6,6 +6,16 @@ date: 2026-06-30
 
 # Plan — fix(team-engine): team-run completes with zero delegation (mika#1676)
 
+## Re-slot amendment (2026-08-22, post-rebase)
+
+After PR#1939 approval, main merged mika#1867 (`served_content` ledger) into the v46
+slot first (commit `e014e1cc`). Rebase on fresh main required moving this ticket's
+migration one slot forward: **v45→v46 ⇒ v46→v47** throughout the diff (function name,
+guard, `CURRENT_SCHEMA_VERSION`, `PINNED_SCHEMA_VERSION`, test names, backup-table
+name in code comments). No design, no logic, no test-coverage change — mechanical
+re-slot only. The plan body below is preserved as the pre-rebase historical intent;
+references to v45→v46 in it now describe the v46→v47 slot in code.
+
 ## Freshness-check delta (2026-08-21, +52 days from initial groom)
 
 Freshness-check pass by orchestrator-CC on 2026-08-21 verified body-vs-code drift; mechanical patches applied. The three-layer root cause and A/B/C fix shape are unchanged (`parse_task_assignments` at `engine.rs:1718`, first-decompose `Conversational` short-circuit at `engine.rs:656`, re-decompose at `engine.rs:711`, `Ok`-arm status transition at `engine.rs:504-508` all line-stable; `finalize_and_shutdown` drifted 586→568 — function name stable). Changes applied:
