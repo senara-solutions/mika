@@ -505,8 +505,9 @@ mod tests {
             assert!(detect_silence(&state, 3, now).is_empty());
         }
         // Fixture B: 3 closed + 1 open, but last_activity_at is old — silence
-        // fires irrespective of the closed count.
-        {
+        // fires irrespective of the closed count. Capture the full alert set.
+        let now = Utc.with_ymd_and_hms(2026, 8, 20, 0, 0, 0).unwrap();
+        let fixture_b_alerts = {
             let mut a = base_issue(1);
             a.state = IssueState::Closed;
             let mut b = base_issue(2);
@@ -516,22 +517,29 @@ mod tests {
             let d = base_issue(4);
             let mut state = base_state(vec![a, b, c, d]);
             state.last_activity_at = Some("2026-08-10T00:00:00Z".into());
-            let now = Utc.with_ymd_and_hms(2026, 8, 20, 0, 0, 0).unwrap();
             let alerts = detect_silence(&state, 3, now);
             assert_eq!(alerts.len(), 1);
             assert_eq!(alerts[0].kind, AlertKind::Silence);
-        }
+            alerts
+        };
         // Fixture C: 0 closed + 4 open with the SAME stale timestamp — the
-        // alert set must be identical to Fixture B's, proving closed count
-        // does not swap AC4 semantics.
+        // alert set must be BYTE-IDENTICAL to Fixture B's, proving closed
+        // count does not swap AC4 semantics. Full struct equality (not just
+        // len + kind) closes the false-pass gap named in mika#1933 adversarial
+        // F3 — a future regression that made `Alert.subject`/`detail` differ
+        // based on the closed-vs-open ratio would slip past a length+kind
+        // check but fail the full-equality assertion below.
         {
             let subs: Vec<SubIssue> = (1..=4).map(base_issue).collect();
             let mut state = base_state(subs);
             state.last_activity_at = Some("2026-08-10T00:00:00Z".into());
-            let now = Utc.with_ymd_and_hms(2026, 8, 20, 0, 0, 0).unwrap();
-            let alerts = detect_silence(&state, 3, now);
-            assert_eq!(alerts.len(), 1);
-            assert_eq!(alerts[0].kind, AlertKind::Silence);
+            let fixture_c_alerts = detect_silence(&state, 3, now);
+            assert_eq!(
+                fixture_c_alerts, fixture_b_alerts,
+                "AC4 invariance: Fixture C (0 closed + 4 open, stale) MUST produce \
+                 the same alert set as Fixture B (3 closed + 1 open, same stale ts) — \
+                 closed count MUST NOT influence silence-detection output"
+            );
         }
     }
 

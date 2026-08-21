@@ -147,6 +147,22 @@ $ cargo test -p mika-agent milestone_manager::reader::injection_tests
 # EXPECT: ok
 ```
 
+## Acceptance criteria
+
+Transcribed verbatim from senara-solutions/mika#1933 body (structural mika sub-repo `/mika` pipeline requirement — plan doc MUST carry an `## Acceptance criteria` section per mika#1600). The § 4 mapping below (kept unchanged) links each AC to its implementation step for reviewer traceability.
+
+- [ ] **AC1 — Reader fetches ALL sub-issues (closed + open).** `mika milestone read <repo>#<N>` returns denominator matching GitHub API's `open_issues + closed_issues`. Explicit `--state all` in the `gh issue list` invocation (or equivalent), plus pagination coverage.
+
+- [ ] **AC2 — Progress reports advancement, not reste-à-faire.** `Progress: X/Y` where `Y = total sub-issues (closed + open)`, `X = closed sub-issues`. A milestone with 4 open + 1 closed reads `1/5` not `0/2` or `0/4`.
+
+- [ ] **AC3 — CLOSED sub-issues enumerated in a distinct section.** Reporter Markdown adds `### Completed` (or equivalent) section listing closed sub-issues with their PR (via `closingIssuesReferences` or `search:"closes:#<N>"`). Rationale (Prime): CLOSED = signal fort of established work, not noise to hide.
+
+- [ ] **AC4 — Silence threshold applies to milestone activity, not sub-issue counts.** Existing silence detection should already work independent of this fix; verify no regression on milestone#30 (which surfaced 39j silence at baptism 2026-08-21).
+
+- [ ] **AC5 — Regression tests.** Fixture milestone with mix of open + closed sub-issues. Test that Reader denominator matches ground truth; that Assessor severity ranking respects the fuller enumeration; that Reporter renders both `Completed` and `In-flight`/`Unstarted` sections.
+
+- [ ] **AC6 — Injection-verified.** Sed-inject a bug that re-adds `--state open` → tests fail; restore → green.
+
 ## 4. Acceptance criteria mapping
 
 | Ticket AC | Plan step | Disposition |
@@ -193,6 +209,23 @@ test result: ok. 2 passed; 0 failed
 ```
 
 AC6 satisfied: a regression that re-defaults the Reader to `--state open` (the ticket body's original hypothesis and the pre-PR#1932 state) is caught by the `RecordingGhRunner`-based test at the arg-list contract boundary.
+
+**Second-pass injection evidence — mika#1933 adversarial F1 (duplicate-flag class):**
+
+The initial `assert_adjacent_pair` implementation was a plain `windows(2)` scan that would silently pass an arg vector containing `[..., "--state", "all", "--state", "open", ...]` — under most clap-derived CLIs (`gh` included), duplicate flags take the LAST value, so a duplicate-add mutation could revert semantics without tripping the guard. `assert_adjacent_pair` was hardened with a `count == 1` uniqueness precondition. Re-verified:
+
+```
+# Duplicate injection (added second --state open after existing --state all):
+$ cargo test -p mika-agent milestone_manager::reader::gh_arg_capture_tests
+test milestone_manager::reader::gh_arg_capture_tests::reader_issue_list_uses_state_all_and_limit_100 ... FAILED
+  panicked: expected exactly one occurrence of `--state` in call args, got 2: [...]
+
+# Restore (single --state all):
+$ cargo test -p mika-agent milestone_manager::reader::gh_arg_capture_tests
+test result: ok. 2 passed; 0 failed
+```
+
+Both mutation classes (replace-value AND add-duplicate) are now caught at the arg-list contract boundary.
 
 ## 8. Grounding footnotes
 

@@ -711,7 +711,11 @@ mod tests {
 /// `gh` availability, rate limits). Full subprocess spawn is a distinct integration
 /// concern out of scope for AC6.
 #[cfg(test)]
-mod injection_tests {
+mod gh_arg_capture_tests {
+    // Renamed from `injection_tests` (mika#1933 maintainability F1) — the new
+    // name telegraphs both mechanism (arg capture via injected `GhRunner`) and
+    // failure class (adjacent-pair arg-token drift), so future maintainers do
+    // not confuse it with dependency-injection or injection-attack testing.
     use super::*;
     use std::sync::{Arc, Mutex};
 
@@ -738,6 +742,10 @@ mod injection_tests {
                 Some("api") => Ok(self.milestone_json.clone()),
                 Some("issue") => Ok(self.issues_json.clone()),
                 Some("pr") => Ok(self.pr_json.clone()),
+                // NOTE: extending `Reader::read_with_runner` with a fourth `gh`
+                // call (e.g., `gh auth status`, per-issue `gh issue view`) also
+                // requires extending this match — the guard covers only the
+                // three current call sites' arg contracts (mika#1933 testing F1).
                 _ => Err(anyhow!(
                     "RecordingGhRunner: unexpected first arg in {:?}",
                     owned
@@ -760,8 +768,24 @@ mod injection_tests {
         (calls, runner)
     }
 
-    /// Assert `--state <expected>` appears as adjacent pair in the arg vector.
+    /// Assert `flag` appears exactly once in `call` AND is immediately followed
+    /// by `value`.
+    ///
+    /// The uniqueness check (mika#1933 adversarial F1) closes a false-pass
+    /// gap: a plain `windows(2)` scan would accept an arg vector with
+    /// `[..., "--state", "all", "--state", "open", ...]` because BOTH adjacent
+    /// pairs exist. Under most clap-derived CLIs (`gh` included), duplicate
+    /// flags silently take the LAST value, so the regression the AC6 guard
+    /// aims to catch — reverting to reste-à-faire semantics — could slip
+    /// through a duplicate-add mutation. Uniqueness + adjacency together
+    /// pin the flag to its intended single value.
     fn assert_adjacent_pair(call: &[String], flag: &str, value: &str) {
+        let occurrences = call.iter().filter(|a| a.as_str() == flag).count();
+        assert_eq!(
+            occurrences, 1,
+            "expected exactly one occurrence of `{flag}` in call args, got {occurrences}: {:?}",
+            call
+        );
         for pair in call.windows(2) {
             if pair[0] == flag && pair[1] == value {
                 return;

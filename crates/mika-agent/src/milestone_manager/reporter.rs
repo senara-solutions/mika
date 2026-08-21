@@ -26,8 +26,16 @@
 //! `Completed` → `In-flight` → `Blocked` → `Unstarted`. Rationale
 //! (Prime verbatim from mika#1933): *« l'établi qui contraint un jugement de
 //! registre A/B-jamais-C »* — established brick anchors the judgment of the rest.
-//! Do NOT reorder these four write_* calls in `Reporter::report` without an
-//! explicit Prime override captured in a follow-up plan.
+//!
+//! **Operative rule (English gloss expanded per mika#1933 maintainability F2):**
+//! the section that appears first constrains how the reader frames what follows.
+//! Placing `Completed` first anchors the reader in what has advanced BEFORE
+//! showing what remains, which is the *avancement* reading. Reordering to put
+//! `In-flight`/`Blocked` first re-anchors the reader on open work, producing
+//! the *reste-à-faire* reading — same visual data, opposite frame. That frame
+//! shift is the exact bug mika#1933 fixes; a future reorder would silently
+//! reintroduce it. Do NOT reorder these four write_* calls in `Reporter::report`
+//! without an explicit Prime override captured in a follow-up plan.
 
 use super::types::{Alert, AlertKind, Assessment, CiState, IssueState, MilestoneState, SubIssue};
 use std::fmt::Write;
@@ -487,12 +495,31 @@ mod tests {
         // Header is present.
         assert!(out.contains("- Completed:\n  - #1801"));
         // Section ordering (F2 — load-bearing): Completed appears before In-flight.
-        let completed_pos = out.find("- Completed:").expect("Completed header present");
-        let in_flight_pos = out.find("- In-flight:").expect("In-flight header present");
+        // Anchor on `\n- Header:` (mika#1933 adversarial F2) so a future fixture
+        // whose sub-issue title happens to contain `"- In-flight:"` (or another
+        // section-header substring) can't false-pass or false-fail the assertion.
+        let completed_pos = find_section_header(&out, "Completed");
+        let in_flight_pos = find_section_header(&out, "In-flight");
         assert!(
             completed_pos < in_flight_pos,
             "Completed section must precede In-flight (mika#1933 F2 Prime bearing)"
         );
+    }
+
+    /// Locate a Reporter section header (`- <Name>:`) at line-start, returning
+    /// its byte offset. Anchors on `\n- <Name>:` to distinguish from sub-issue
+    /// entry lines that could legitimately contain the same substring inside
+    /// a title. Prepends a synthetic `\n` so position 0 is coverable.
+    ///
+    /// mika#1933 adversarial F2: bare `str::find("- Completed:")` would match
+    /// any occurrence of the substring anywhere in the output including inside
+    /// a sub-issue title. The `\n` prefix pins the match to a line boundary.
+    fn find_section_header(out: &str, name: &str) -> usize {
+        let anchored = format!("\n- {name}:");
+        let augmented = format!("\n{out}");
+        augmented
+            .find(&anchored)
+            .unwrap_or_else(|| panic!("section header `- {name}:` not found in output:\n{out}"))
     }
 
     #[test]
@@ -599,10 +626,12 @@ mod tests {
             &state_with(vec![closed, in_flight, blocked, unstarted], p),
             &empty_assessment(),
         );
-        let c = out.find("- Completed:").expect("Completed section present");
-        let i = out.find("- In-flight:").expect("In-flight section present");
-        let b = out.find("- Blocked:").expect("Blocked section present");
-        let u = out.find("- Unstarted:").expect("Unstarted section present");
+        // Use the anchored helper (mika#1933 adversarial F2) so section-header
+        // positions can't be shadowed by a substring inside a sub-issue title.
+        let c = find_section_header(&out, "Completed");
+        let i = find_section_header(&out, "In-flight");
+        let b = find_section_header(&out, "Blocked");
+        let u = find_section_header(&out, "Unstarted");
         assert!(c < i, "Completed must precede In-flight");
         assert!(i < b, "In-flight must precede Blocked");
         assert!(b < u, "Blocked must precede Unstarted");
