@@ -920,6 +920,7 @@ impl AsyncDatabase {
     /// [`Database::count_audit_events_by_tool_name`]. Used by mika#1712
     /// integration tests to assert the load-bearing audit-write delta on the
     /// phantom sweep path.
+    #[doc(hidden)]
     pub async fn count_audit_events_by_tool_name(&self, tool_name: &str) -> Result<i64> {
         let a = self.agent_id.clone();
         let tn = tool_name.to_owned();
@@ -931,6 +932,7 @@ impl AsyncDatabase {
     /// agent + `tool_name`. Wraps
     /// [`Database::get_audit_event_target_keys_by_tool_name`]. Used by mika#1712
     /// integration tests for row-shape assertions.
+    #[doc(hidden)]
     pub async fn get_audit_event_target_keys_by_tool_name(
         &self,
         tool_name: &str,
@@ -938,6 +940,21 @@ impl AsyncDatabase {
         let a = self.agent_id.clone();
         let tn = tool_name.to_owned();
         self.with_db(move |db| db.get_audit_event_target_keys_by_tool_name(&a, &tn))
+            .await
+    }
+
+    /// Fetch full `audit_events` rows (target_key, before, after, reasoning)
+    /// for the scoped agent + `tool_name`. Wraps
+    /// [`Database::get_audit_event_rows_by_tool_name`]. Used by mika#1712
+    /// integration tests for the full-row-shape assertion (T-1/T-2).
+    #[doc(hidden)]
+    pub async fn get_audit_event_rows_by_tool_name(
+        &self,
+        tool_name: &str,
+    ) -> Result<Vec<crate::db::AuditEventRowTuple>> {
+        let a = self.agent_id.clone();
+        let tn = tool_name.to_owned();
+        self.with_db(move |db| db.get_audit_event_rows_by_tool_name(&a, &tn))
             .await
     }
 

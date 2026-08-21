@@ -29,6 +29,13 @@ pub fn init_sqlite_vec() {
 
 pub const CURRENT_SCHEMA_VERSION: i64 = 48;
 
+/// `(target_key, before_value, after_value, reasoning)` — return shape for
+/// [`Database::get_audit_event_rows_by_tool_name`] and its async wrapper.
+/// Test-only helper for mika#1712 integration tests; extracted to a type
+/// alias to satisfy `clippy::type_complexity`.
+#[doc(hidden)]
+pub type AuditEventRowTuple = (String, Option<String>, Option<String>, Option<String>);
+
 /// mika#1742 Problem B: refuse-to-zombie grace window for
 /// [`Database::create_recurring_task_if_absent`]. Recent same-label recurring
 /// rows in `'failed' | 'cancelled' | 'expired'` states within this window
@@ -6714,6 +6721,19 @@ impl Database {
     /// `process_id IS NOT NULL`) and the orphaned-parent reaper does not
     /// select (no `resume_agent` callback child). See mika#1712.
     ///
+    /// **Scope narrower than the ticket's Problem statement (ADV-2, 2026-08-21).**
+    /// Plan §3 (Problem) lists `status IN ('in_progress','blocked','pending')` as
+    /// the observed leak class, and one of the two cited leaked samples
+    /// (`613a996d ... | pending`) is a `pending` phantom. The mika#1712 AC
+    /// narrows to `('in_progress','blocked')` only — `pending` is deferred to
+    /// the mika#1934 cause-racine investigation. Rationale: `pending` is the
+    /// default initial state of every tracking task from `create_task`, and
+    /// sweeping it at the 3600s grace would false-positive on any newly-created
+    /// tracking row the agent hasn't yet transitioned. `in_progress` and
+    /// `blocked` are the "started but abandoned" states where the phantom
+    /// signal is unambiguous. If mika#1934's telemetry shows `pending` phantoms
+    /// remain a meaningful leak class, the predicate can be widened there.
+    ///
     /// `age_seconds = 0` matches every candidate row regardless of freshness.
     /// The comparison uses `<=` (not `<`) so a row inserted in the same
     /// second the WHERE clause evaluates is still selected — SQLite's
@@ -6764,6 +6784,7 @@ impl Database {
     /// `phantom_aged_out` audit-write path. Keeping this query as a first-class
     /// helper (not inline SQL in tests) means the load-bearing assertion has a
     /// single source of truth that survives future audit_events schema changes.
+    #[doc(hidden)]
     pub fn count_audit_events_by_tool_name(&self, agent_id: &str, tool_name: &str) -> Result<i64> {
         let n: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM audit_events
@@ -6792,6 +6813,7 @@ impl Database {
     /// Fetch the `target_key` values of `audit_events` rows for the scoped
     /// agent + tool_name — helper for mika#1712 integration tests to make the
     /// row-shape assertion (target_key must reference the injected task id).
+    #[doc(hidden)]
     pub fn get_audit_event_target_keys_by_tool_name(
         &self,
         agent_id: &str,
@@ -6804,6 +6826,38 @@ impl Database {
         )?;
         let rows = stmt
             .query_map(params![agent_id, tool_name], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Fetch `(target_key, before_value, after_value, reasoning)` tuples of
+    /// `audit_events` rows for the scoped agent + tool_name — helper for
+    /// mika#1712 integration tests to make the full-row-shape assertion
+    /// (T-1/T-2, 2026-08-21). Complements
+    /// [`Self::get_audit_event_target_keys_by_tool_name`]. Return type is a
+    /// tuple to keep the helper zero-abstraction; a caller-side struct is
+    /// unnecessary for the assertion pattern.
+    #[doc(hidden)]
+    pub fn get_audit_event_rows_by_tool_name(
+        &self,
+        agent_id: &str,
+        tool_name: &str,
+    ) -> Result<Vec<AuditEventRowTuple>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT target_key, before_value, after_value, reasoning
+             FROM audit_events
+             WHERE agent_id = ?1 AND tool_name = ?2
+             ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, tool_name], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -14056,6 +14110,29 @@ mod tests {
             phantoms.is_empty(),
             "terminal-status rows should be excluded"
         );
+    }
+
+    /// T-5 (2026-08-21): defensively verify every non-`in_progress`/`blocked`
+    /// status is excluded by the SQL predicate. Guards against a
+    /// well-meaning refactor that changes `IN ('in_progress','blocked')` to
+    /// `NOT IN (terminal_statuses)` — which would sweep `pending` rows (out
+    /// of scope per plan §7 D1 + ADV-2 deferral to mika#1934) and any other
+    /// non-terminal status the schema ever adds.
+    #[test]
+    fn test_find_phantom_tracking_tasks_all_non_matching_statuses_excluded() {
+        // pending: newly-created tracking row awaiting agent transition — must NOT be swept.
+        // failed/cancelled/expired: already terminal — no-op even if matched.
+        // delivered: callback-lifecycle status — inapplicable, must not be selected.
+        for status in ["pending", "failed", "cancelled", "expired", "delivered"] {
+            let db = db();
+            create_phantom_tracking_row(&db, "mika", "shape check", status, 7200);
+            let phantoms = db.find_phantom_tracking_tasks("mika", 3600).unwrap();
+            assert!(
+                phantoms.is_empty(),
+                "status '{status}' must be excluded from the sweep predicate — \
+                 SQL is `status IN ('in_progress', 'blocked')` per mika#1712 AC3"
+            );
+        }
     }
 
     #[test]

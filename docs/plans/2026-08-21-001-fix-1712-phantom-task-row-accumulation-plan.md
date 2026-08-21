@@ -580,9 +580,23 @@ to normal usage. Sami arbitration: **AC4 dropped** — audit signal keyed to swe
   downstream side effects, the phantom rows were already invisible to dispatch).
   New phantoms resume accumulating from the moment of revert until the fix
   re-deploys. No data migration needed. Operator SQL, if desired to un-fail a
-  false-positive row post-revert: `UPDATE tasks SET status='in_progress',
-  result=NULL WHERE id=? AND status='failed'` — but the sweep already emitted the
-  audit_event, which stays as historical record.
+  false-positive row (with the fix still deployed — post-revert the sweep is gone
+  and any UPDATE stays):
+  ```sql
+  UPDATE tasks
+     SET status = 'in_progress',
+         result = NULL,
+         updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+   WHERE id = ?
+     AND status = 'failed';
+  ```
+  The `updated_at` bump is **load-bearing** (per reliability-reviewer R1,
+  2026-08-21): without it, the stale sweep-era `updated_at` still satisfies
+  the AC3 `updated_at < now - MIKA_PHANTOM_SWEEP_AGE_SECONDS` predicate and
+  the row bounces back to `failed` within one 60-tick cycle (~60s). To buy
+  more time (e.g., during incident triage), also raise
+  `MIKA_PHANTOM_SWEEP_AGE_SECONDS` to a larger value before the UPDATE. The
+  sweep's original audit_event stays as historical record.
 - Existing-phantom handling on upgrade: **AC5 startup sweep is the answer.** First
   boot of the new binary walks the phantom set (unlimited age at startup), transitions
   all to `failed` with `phantom_aged_out` audit + `startup_sweep` reasoning, emits

@@ -173,7 +173,17 @@ impl TaskEngine {
             .unwrap_or_default();
 
         for task in in_progress {
-            // Manual (task) tasks represent human work — don't invalidate on restart
+            // Manual (task) tasks represent human work — don't invalidate on restart.
+            //
+            // NARROWED (mika#1712 step 2b, 2026-08-21): the sibling
+            // `sweep_null_pid_phantoms_at_startup()` below DOES transition a
+            // subset of manual tasks — those matching the phantom shape
+            // (`action_type='none'` + `process_id IS NULL` + status in
+            // `('in_progress','blocked')`). That is the leak class from
+            // plan §7 D2 and is intentionally excluded from this
+            // manual-preservation guard. The guard here still protects the
+            // rest of the manual task surface (any manual row with a real
+            // action_type or non-NULL process_id).
             if task.trigger_type == trigger_type::MANUAL {
                 debug!(task_id = %task.id, "skipping manual task during startup recovery");
                 continue;
@@ -798,6 +808,15 @@ impl TaskEngine {
     /// `reasoning` field carries the source discriminator; the `tool_name`
     /// stays constant so the audit-events query surface is a single predicate
     /// (`WHERE tool_name='phantom_aged_out'`) rather than a two-branch union.
+    ///
+    /// SOLE WRITER: phantom_sweep_db_error — the same two sites also emit the
+    /// distinct `phantom_sweep_db_error` audit tool_name when
+    /// `update_task_failed` returns Err. Keeping the error branch on its own
+    /// tool_name preserves the AC7 count semantics of
+    /// `SELECT COUNT(*) FROM audit_events WHERE tool_name='phantom_aged_out'`
+    /// (successful transitions only) — the sibling
+    /// `SELECT ... WHERE tool_name='phantom_sweep_db_error'` counts failures
+    /// separately. Addresses adversarial-reviewer ADV-3 (2026-08-21).
     async fn sweep_null_pid_phantoms(&self) {
         let age_seconds = self
             .dispatcher
@@ -819,16 +838,24 @@ impl TaskEngine {
         let agent_id = self.db.agent_id().to_string();
         let system_session = format!("system-{agent_id}");
         let mut swept_count: u32 = 0;
+        let mut error_count: u32 = 0;
 
         for row in phantoms {
+            // ADV-5 (2026-08-21): re-arm heartbeat every row so a large sweep
+            // pass never trips the 300s wedge watchdog. Cheap AtomicI64 store.
+            self.heartbeat.tick();
+
             match self
                 .db
                 .update_task_failed(&row.id, "phantom_aged_out")
                 .await
             {
                 Ok(true) => {
-                    swept_count = swept_count.saturating_add(1);
-                    if let Err(e) = self
+                    // ADV-4 (2026-08-21): audit-write FIRST, then increment
+                    // swept_count only on Ok. This aligns the per-pass count in
+                    // the phantom_sweep_complete log with the audit_events row
+                    // count — the two AC7 surfaces stay reconcilable.
+                    match self
                         .db
                         .log_audit_event(
                             &system_session,
@@ -844,11 +871,15 @@ impl TaskEngine {
                         )
                         .await
                     {
-                        warn!(
-                            task_id = %row.id,
-                            error = %e,
-                            "phantom_sweep: failed to write audit event"
-                        );
+                        Ok(()) => swept_count = swept_count.saturating_add(1),
+                        Err(e) => {
+                            error_count = error_count.saturating_add(1);
+                            warn!(
+                                task_id = %row.id,
+                                error = %e,
+                                "phantom_sweep: failed to write audit event (transition succeeded)"
+                            );
+                        }
                     }
                 }
                 Ok(false) => {
@@ -858,13 +889,17 @@ impl TaskEngine {
                     );
                 }
                 Err(e) => {
-                    // Mirror the reaper's F5 audit-event-on-error pattern so
-                    // operators can catch silent-sweep-failure via SQL query.
+                    // ADV-3 (2026-08-21): distinct tool_name for the error
+                    // branch so operator SQL counting swept rows via
+                    // `WHERE tool_name='phantom_aged_out'` is not polluted by
+                    // DB failures. Failures are countable separately via
+                    // `WHERE tool_name='phantom_sweep_db_error'`.
+                    error_count = error_count.saturating_add(1);
                     let _ = self
                         .db
                         .log_audit_event(
                             &system_session,
-                            "phantom_aged_out",
+                            "phantom_sweep_db_error",
                             &format!("task:{}", row.id),
                             Some(&row.status),
                             None,
@@ -881,11 +916,15 @@ impl TaskEngine {
             }
         }
 
-        if swept_count > 0 {
+        // R7/ADV-4 (2026-08-21): emit the aggregate line when EITHER
+        // successful sweeps OR errors occurred, so a silent-failure pass
+        // (many rows queried, all update_task_failed Err) still surfaces.
+        if swept_count > 0 || error_count > 0 {
             info!(
                 event = "phantom_sweep_complete",
                 source = "watchdog_tick",
                 count = swept_count,
+                error_count = error_count,
                 agent_id = %agent_id,
                 trace_id = %trace_id,
                 "phantom_sweep watchdog tick swept phantom tracking rows"
@@ -914,6 +953,21 @@ impl TaskEngine {
     /// the only two writers of the `phantom_aged_out` audit tool_name. The
     /// per-pass telemetry line uses `source="startup_sweep"` to distinguish
     /// from the watchdog tick.
+    ///
+    /// **Deliberate divergence from step 2's manual-preservation invariant
+    /// (ADV-1, 2026-08-21).** Step 2 of [`Self::startup_recovery`] explicitly
+    /// skips `trigger_type == MANUAL` in-progress rows with the comment
+    /// "Manual (task) tasks represent human work — don't invalidate on
+    /// restart". This method narrows that invariant: it DOES transition
+    /// manual/none/NULL-PID rows because per plan §7 D2 they are the phantom
+    /// shape by design — a legitimate long-running manual tracking row would
+    /// have `updated_at` bumped by any `update_task_status` write within
+    /// `MIKA_PHANTOM_SWEEP_AGE_SECONDS` (default 3600s), while a genuinely
+    /// wedged one has stale `updated_at` far past grace. AC5 at age=0 is
+    /// aggressive by intent: any phantom-shape row present at startup
+    /// outlived a prior process, which is the ticket's founding-incident
+    /// signal (24 rows/18h). If a legitimate multi-hour tracking row gets
+    /// swept, the operator un-fails it via SQL (see plan §Rollback).
     async fn sweep_null_pid_phantoms_at_startup(&self) {
         let phantoms = match self.db.find_phantom_tracking_tasks(0).await {
             Ok(p) => p,
@@ -934,12 +988,20 @@ impl TaskEngine {
         let agent_id = self.db.agent_id().to_string();
         let system_session = format!("system-{agent_id}");
         let mut swept_count: u32 = 0;
+        let mut error_count: u32 = 0;
 
         for row in phantoms {
+            // ADV-5 (2026-08-21): re-arm heartbeat every row so a large
+            // startup pass never trips the wedge watchdog (300s threshold).
+            // Watchdog isn't spawned yet at this point in startup_recovery,
+            // but the heartbeat.tick() call is cheap AtomicI64 and futureproofs
+            // against re-ordering.
+            self.heartbeat.tick();
+
             match self.db.update_task_failed(&row.id, "startup_sweep").await {
                 Ok(true) => {
-                    swept_count = swept_count.saturating_add(1);
-                    if let Err(e) = self
+                    // ADV-4 (2026-08-21): audit-write FIRST, then increment on Ok.
+                    match self
                         .db
                         .log_audit_event(
                             &system_session,
@@ -952,11 +1014,16 @@ impl TaskEngine {
                         )
                         .await
                     {
-                        warn!(
-                            task_id = %row.id,
-                            error = %e,
-                            "phantom_sweep startup: failed to write audit event"
-                        );
+                        Ok(()) => swept_count = swept_count.saturating_add(1),
+                        Err(e) => {
+                            error_count = error_count.saturating_add(1);
+                            warn!(
+                                task_id = %row.id,
+                                error = %e,
+                                "phantom_sweep startup: failed to write audit event \
+                                 (transition succeeded)"
+                            );
+                        }
                     }
                 }
                 Ok(false) => {
@@ -966,11 +1033,13 @@ impl TaskEngine {
                     );
                 }
                 Err(e) => {
+                    // ADV-3 (2026-08-21): distinct tool_name for the error branch.
+                    error_count = error_count.saturating_add(1);
                     let _ = self
                         .db
                         .log_audit_event(
                             &system_session,
-                            "phantom_aged_out",
+                            "phantom_sweep_db_error",
                             &format!("task:{}", row.id),
                             Some(&row.status),
                             None,
@@ -987,11 +1056,12 @@ impl TaskEngine {
             }
         }
 
-        if swept_count > 0 {
+        if swept_count > 0 || error_count > 0 {
             info!(
                 event = "phantom_sweep_complete",
                 source = "startup_sweep",
                 count = swept_count,
+                error_count = error_count,
                 agent_id = %agent_id,
                 reason = "phantom_signature_null_pid_manual_none",
                 trace_id = %trace_id,

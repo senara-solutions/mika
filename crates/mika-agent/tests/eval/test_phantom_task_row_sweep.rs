@@ -166,16 +166,37 @@ async fn phantom_ages_out_after_grace() {
             "AC7 load-bearing: exactly one phantom_aged_out audit event per swept row"
         );
 
-        // Row-shape assertion: target_key must reference the injected task id.
+        // Row-shape assertion (T-1/T-2, 2026-08-21): full audit-row shape.
+        // target_key references the injected task id; before_value carries the
+        // pre-sweep status; after_value == "failed"; reasoning starts with the
+        // AC3 source discriminator prefix.
         let expected_key = format!("task:{task_id}");
-        let target_keys = db
-            .get_audit_event_target_keys_by_tool_name("phantom_aged_out")
+        let rows = db
+            .get_audit_event_rows_by_tool_name("phantom_aged_out")
             .await
             .unwrap();
-        assert_eq!(target_keys.len(), 1);
+        assert_eq!(rows.len(), 1, "exactly one audit row");
+        let (target_key, before, after, reasoning) = &rows[0];
         assert_eq!(
-            target_keys[0], expected_key,
-            "audit event target_key must be {expected_key} (row-shape assertion)"
+            target_key, &expected_key,
+            "target_key must be {expected_key}"
+        );
+        assert_eq!(
+            before.as_deref(),
+            Some("in_progress"),
+            "T-1: before_value must be the pre-sweep status"
+        );
+        assert_eq!(
+            after.as_deref(),
+            Some("failed"),
+            "T-1: after_value must be 'failed'"
+        );
+        let reasoning_str = reasoning
+            .as_deref()
+            .expect("T-2: reasoning must be populated");
+        assert!(
+            reasoning_str.starts_with("phantom_aged_out:"),
+            "T-2: reasoning must carry the AC3 source discriminator prefix — got: {reasoning_str}"
         );
     })
     .await
@@ -264,6 +285,32 @@ async fn startup_sweep_clears_preexisting_phantoms() {
             count, 2,
             "AC7 load-bearing: two audit events for two swept rows"
         );
+
+        // T-2 (2026-08-21): AC5 startup-sweep reasoning discriminator must
+        // land on both rows. Distinguishes AC5 from AC3 in offline forensics.
+        let rows = db
+            .get_audit_event_rows_by_tool_name("phantom_aged_out")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        for (_, before, after, reasoning) in &rows {
+            assert!(
+                matches!(before.as_deref(), Some("in_progress" | "blocked")),
+                "T-1: before_value must be the pre-sweep status"
+            );
+            assert_eq!(
+                after.as_deref(),
+                Some("failed"),
+                "T-1: after_value must be 'failed'"
+            );
+            let reasoning_str = reasoning
+                .as_deref()
+                .expect("T-2: reasoning must be populated");
+            assert!(
+                reasoning_str.starts_with("startup_sweep:"),
+                "T-2: reasoning must carry the AC5 source discriminator prefix — got: {reasoning_str}"
+            );
+        }
     })
     .await
     .expect("startup_sweep_clears_preexisting_phantoms timed out");
