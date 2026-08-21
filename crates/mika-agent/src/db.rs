@@ -27,7 +27,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 45;
+pub const CURRENT_SCHEMA_VERSION: i64 = 46;
 
 /// mika#1742 Problem B: refuse-to-zombie grace window for
 /// [`Database::create_recurring_task_if_absent`]. Recent same-label recurring
@@ -149,6 +149,37 @@ pub struct PilotTranscriptRow {
     pub tokens_in: Option<i64>,
     pub tokens_out: Option<i64>,
     pub latency_ms: Option<i64>,
+}
+
+/// A per-(agent, person, category) content-serve ledger row (mika#1867).
+/// Populated by the `record_served_content` tool after Mika delivers content
+/// (proverb, quote, joke, poem, recommendation, story, fact) to a specific
+/// person, so future generations can dedup against exact-match hashes.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ServedContent {
+    pub id: i64,
+    pub agent_id: String,
+    pub person_id: i64,
+    pub category: String,
+    pub content_text: String,
+    pub content_hash: String,
+    pub content_signature: Option<String>,
+    pub served_at: String,
+    pub session_id: Option<String>,
+}
+
+/// Outcome of a `record_served_content` write (mika#1867). Distinct variants
+/// so the caller (the tool) can surface the duplicate-detection path to the
+/// LLM as a "retry" signal without polluting the error channel.
+#[derive(Debug, Clone, serde::Serialize)]
+pub enum RecordOutcome {
+    Inserted {
+        id: i64,
+    },
+    Duplicate {
+        existing_id: i64,
+        prior_served_at: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -1067,6 +1098,11 @@ impl Database {
             info!(version = 45, "database migrated to v45");
         }
 
+        if (3..=45).contains(&version) {
+            self.migrate_v45_to_v46()?;
+            info!(version = 46, "database migrated to v46");
+        }
+
         Ok(())
     }
 
@@ -1121,7 +1157,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (45);
+            INSERT INTO schema_version (version) VALUES (46);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -1792,6 +1828,33 @@ impl Database {
                 ON pilot_transcripts(task_id);
             CREATE INDEX idx_pilot_transcripts_created_at
                 ON pilot_transcripts(created_at DESC);
+
+            -- v46: served_content (mika#1867). Per-(agent, person, category) ledger
+            -- of content Mika has served (proverb, quote, joke, poem, recommendation,
+            -- story, fact) so re-generation on future turns can dedup. Founding
+            -- incident: Al (Vietnam tester) 2026-07-28 — same zen proverb served
+            -- twice, 6 days apart. Must be in v1 DDL so fresh installs get the
+            -- table without depending on the v45→v46 migration chain.
+            CREATE TABLE served_content (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+                category TEXT NOT NULL CHECK (category IN (
+                    'proverb','quote','joke','poem','recommendation','story','fact'
+                )),
+                content_text TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                -- Reserved for v2 fuzzy dedup (embedding cosine similarity per AC6).
+                -- Format TBD — likely 384-dim float array as BLOB or hex string.
+                content_signature TEXT,
+                served_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+                UNIQUE(agent_id, person_id, content_hash)
+            );
+            CREATE INDEX idx_served_content_person_cat
+                ON served_content(agent_id, person_id, category, served_at DESC);
+            CREATE INDEX idx_served_content_hash
+                ON served_content(agent_id, person_id, content_hash);
 
             -- Pre-register the default 'mika' agent
             INSERT INTO agents (id, name, home_dir) VALUES ('mika', 'Mika', '');
@@ -4526,6 +4589,58 @@ impl Database {
         tx.commit()?;
 
         info!("v44→v45: added pilot_transcripts table (mika#1705)");
+
+        Ok(())
+    }
+
+    /// v45→v46: additive `served_content` table (mika#1867).
+    ///
+    /// Per-(agent, person, category) ledger of content Mika has served —
+    /// proverb, quote, joke, poem, recommendation, story, fact — so that
+    /// re-generation on future turns can dedup against exact-match hashes.
+    /// Founding incident: Al (Vietnam tester) 2026-07-28 — same zen proverb
+    /// served twice, 6 days apart, because history-fetch is global-recency
+    /// (not per-user) and there was no content-serve ledger.
+    ///
+    /// Backward compat: reads return empty for rows pre-migration (agent that
+    /// has never served anything = no dedup, safe direction per AC1).
+    fn migrate_v45_to_v46(&mut self) -> Result<()> {
+        let version = self.schema_version()?;
+        if version >= 46 {
+            return Ok(());
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS served_content (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+                category TEXT NOT NULL CHECK (category IN (
+                    'proverb','quote','joke','poem','recommendation','story','fact'
+                )),
+                content_text TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                -- Reserved for v2 fuzzy dedup (embedding cosine similarity per AC6).
+                -- Format TBD — likely 384-dim float array as BLOB or hex string.
+                content_signature TEXT,
+                served_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+                UNIQUE(agent_id, person_id, content_hash)
+            );
+            CREATE INDEX IF NOT EXISTS idx_served_content_person_cat
+                ON served_content(agent_id, person_id, category, served_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_served_content_hash
+                ON served_content(agent_id, person_id, content_hash);",
+        )?;
+
+        tx.execute("INSERT INTO schema_version (version) VALUES (46)", [])?;
+        tx.commit()?;
+
+        info!("v45→v46: added served_content table (mika#1867)");
 
         Ok(())
     }
@@ -16806,6 +16921,52 @@ mod tests {
     }
 
     #[test]
+    fn test_v46_served_content_table_and_indexes() {
+        let db = db();
+        assert!(
+            table_exists(&db.conn, "served_content"),
+            "served_content table should exist after fresh DB creation (v46, mika#1867)"
+        );
+        assert!(
+            index_exists(&db.conn, "idx_served_content_person_cat"),
+            "idx_served_content_person_cat should exist"
+        );
+        assert!(
+            index_exists(&db.conn, "idx_served_content_hash"),
+            "idx_served_content_hash should exist"
+        );
+    }
+
+    #[test]
+    fn test_v46_served_content_category_check_constraint() {
+        let db = db();
+        // Register a valid person for FK
+        let pid = db
+            .upsert_person("mika", "Test", None, None)
+            .expect("insert person");
+
+        // Valid category should insert
+        db.conn
+            .execute(
+                "INSERT INTO served_content (agent_id, person_id, category, content_text, content_hash)
+                 VALUES ('mika', ?1, 'proverb', 'x', 'h')",
+                rusqlite::params![pid],
+            )
+            .expect("valid category should insert");
+
+        // Invalid category should fail CHECK constraint
+        let result = db.conn.execute(
+            "INSERT INTO served_content (agent_id, person_id, category, content_text, content_hash)
+             VALUES ('mika', ?1, 'riddle', 'y', 'h2')",
+            rusqlite::params![pid],
+        );
+        assert!(
+            result.is_err(),
+            "invalid category 'riddle' should be rejected by CHECK constraint"
+        );
+    }
+
+    #[test]
     fn test_v25_entity_key_check_constraint() {
         let db = db();
         // Valid entity — should succeed
@@ -17111,6 +17272,7 @@ mod tests {
         db2.migrate_v42_to_v43().unwrap();
         db2.migrate_v43_to_v44().unwrap();
         db2.migrate_v44_to_v45().unwrap();
+        db2.migrate_v45_to_v46().unwrap();
 
         let final_version: i64 = db2
             .conn
