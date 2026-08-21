@@ -223,6 +223,22 @@ General-purpose `gh` CLI handler. Three-tier validation: (1) global subcommand a
 
 5 read-only tools: `query_timeline`, `get_session_messages`, `list_audit_events`, `search_tool_history` (30-day retention, 500-char field truncation, 10KB output cap), `query_knowledge_graph`. Non-orchestrator agents scoped to their own agent_id/sessions.
 
+## Milestone Manager (Phase 1)
+
+`src/milestone_manager/` — milestone-scope operational coordinator (`mika-manager` entity, distinct from `mika-prime`). Ratified 2026-08-21 by Vincent + Prime (5 verdicts, brief at `mika-platform/docs/brainstorms/2026-08-21-mika-manager-de-milestones-design-brief.md`). **LECTURE seule** — zero dispatch, zero ticket mutation, zero PR merge; the only outbound side effect is a report `POST` to a well-known delivery endpoint (Prime→sami→Vincent per D8 subsystem-2 pattern) or an offline sink write when the URL is unset.
+
+**Three composers + one loop.** `Reader` (`reader.rs`) wraps `gh` CLI (`api`/`issue list`/`pr list`) mirroring the `auto_pull::gh_list_open_issues` subprocess shape and composes `MilestoneState` (sub-issues + progress counts + recent activity). `Assessor` (`assessor.rs`) applies four rules (stale-blocker, silent-progress, silence-in-JOURS, priority ranking) and classifies `Severity` (Healthy/Attention/Blocked). `Reporter` (`reporter.rs`) formats the § 2d Markdown report. `run_manager_cycle` in `cadence.rs` orchestrates read→assess→deliver with hybrid cadence: event-driven trigger on `state_digest` change + 6h plancher heartbeat (« l'absence d'event EST l'event »).
+
+**Wrapper-only INV-2.** No new GitHub API client dep; `Reader` uses `tokio::process::Command::new("gh")` verbatim from `auto_pull.rs`. Delivery uses the existing workspace `reqwest` — bearer-token POST to `MIKA_MANAGER_DELIVERY_URL` (normal) or `MIKA_MANAGER_ESCALATION_URL` (Severity::Blocked → Vincent-direct route). Both URLs unset → offline sink at `MIKA_MANAGER_SINK_DIR` so nothing is lost during bring-up.
+
+**Structural LECTURE-seule enforcement.** `no_dispatch_test.rs` greps the module tree for forbidden write-authority tokens (`run_claude_pilot`, `pr_merge_with_gate`, `gh api "PATCH"`, `gh issue edit`, …) and fails the test binary if any executable code contains them. Prompt-level "no dispatch" rules are fragile per `feedback_prompt_enforcement_fragile` — this test is the structural gate. Comments are stripped before scanning so doc prose can describe what's forbidden.
+
+**CLI surface.** `mika milestone {read,assess,report} <owner/repo>#<number>` — thin adapter in `crates/mika-cli/src/commands/milestone.rs`. Report subcommand emits Markdown to stdout; `read`/`assess` default to pretty JSON (also YAML via `--format yaml`).
+
+**Env vars.** All optional with three-tier fallback: `MIKA_MANAGER_TARGET_MILESTONE` (Phase 1 single-target — loop disabled when unset), `MIKA_MANAGER_HEARTBEAT_INTERVAL_SECS` (default 21600 = 6h), `MIKA_MANAGER_SILENCE_THRESHOLD_DAYS` (default 3), `MIKA_MANAGER_DELIVERY_URL` / `MIKA_MANAGER_DELIVERY_TOKEN`, `MIKA_MANAGER_ESCALATION_URL`, `MIKA_MANAGER_HEALTH_URL` (optional cm executor liveness endpoint).
+
+**Phase 2 gates NOT wired.** Dispatch authority stays gated behind the three portes (forge-gate loop-résistance + contention exec + INTERNAL_TOKEN alignment) documented in the brief § 3. This module contains no dispatch class, no `run_claude_pilot` invocation site, no scope-approval callsite. Promotion to Phase 2 requires updating both `no_dispatch_test.rs` FORBIDDEN_TOKENS and the module docstring atomically.
+
 ## Skills System
 
 Git-based and local skill distribution via `mika skills install/uninstall/update`. Sources: git URLs, GitHub shorthand, local paths, `file://` URIs. Optional `--link` flag creates absolute symlinks. Four-tier origin: `[built-in]`, `[marketplace]`, `[marketplace/linked]`, `[custom]`. Tracks in `marketplace.lock` (TOML).

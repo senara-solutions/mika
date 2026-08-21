@@ -18,6 +18,7 @@ pub mod kg;
 pub mod mcp;
 pub mod memory;
 pub mod messaging;
+pub mod milestone_manager;
 pub mod operational;
 pub mod panic_hook;
 pub mod perimeter;
