@@ -375,6 +375,10 @@ pub const DEFAULT_AGENT_SKILL_ALLOWLIST: &[&str] = &[
     // `tmux`, and `file-reader` above already cover the rest of the orchestrator
     // tool surface. See docs/operator/mika-orchestrator-handbook.md.
     "github",
+    // Content-request fidelity (mika#1867). Per-user content-serve ledger that
+    // prevents re-serving the same proverb/quote/joke/etc. to the same person.
+    // Founding incident: Al 2026-07-28 (zen proverb served twice, 6 days apart).
+    "content-request-fidelity",
 ];
 
 pub const DEFAULT_IDENTITY: &str = r#"name = "Mika"
@@ -402,6 +406,8 @@ allowlist = [
     # Orchestrator surface (mika#1641): full read/write GitHub. Keep in sync with
     # DEFAULT_AGENT_SKILL_ALLOWLIST above (home.rs tests assert they match).
     "github",
+    # Content-request fidelity (mika#1867): per-user content-serve ledger.
+    "content-request-fidelity",
 ]
 
 # [kg]

@@ -32,6 +32,8 @@ pub fn is_write_tool(name: &str) -> bool {
             | "store_fact"
             | "update_fact"
             | "update_core_memory"
+            // Served-content ledger write (mika#1867)
+            | "record_served_content"
             // Skill mutations
             | "create_skill"
             | "delete_skill"
@@ -85,6 +87,8 @@ pub fn is_read_tool(name: &str) -> bool {
             | "search_tool_history"
             | "query_knowledge_graph"
             | "resolve_issue_order"
+            // Served-content ledger read (mika#1867)
+            | "check_already_served"
     )
 }
 

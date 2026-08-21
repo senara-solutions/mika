@@ -934,6 +934,121 @@ mod tests {
     }
 
     #[test]
+    fn test_content_request_fidelity_bilingual_fr_en_keywords() {
+        // mika#1867 — content-request-fidelity skill must trigger on both
+        // French and English bare-noun content requests. Al (founding
+        // incident) is francophone; the FR set is first-class, not an
+        // afterthought.
+        let skills = vec![make_entry(
+            "content-request-fidelity",
+            &[
+                "proverbe",
+                "proverb",
+                "citation",
+                "quote",
+                "joke",
+                "blague",
+                "poème",
+                "poem",
+                "histoire",
+                "story",
+                "recommandation",
+                "recommendation",
+                "fait",
+                "fact",
+                "story about",
+                "joke about",
+                "quote from",
+                "quote about",
+                "proverb about",
+                "proverbe sur",
+                "blague sur",
+                "citation de",
+                "recommande-moi",
+                "recommend me",
+                "raconte-moi",
+            ],
+            false,
+        )];
+
+        // FR bare noun
+        let matched = match_skills(&skills, "donne-moi un proverbe zen");
+        assert_eq!(matched.len(), 1, "FR bare noun 'proverbe' should trigger");
+        assert_eq!(matched[0].reason, MatchReason::Keyword);
+
+        // EN bare noun
+        let matched = match_skills(&skills, "tell me a proverb");
+        assert_eq!(matched.len(), 1, "EN bare noun 'proverb' should trigger");
+
+        // FR bare noun 'blague'
+        let matched = match_skills(&skills, "raconte-moi une blague");
+        assert_eq!(matched.len(), 1, "FR bare noun 'blague' should trigger");
+
+        // EN partial phrase 'story about'
+        let matched = match_skills(&skills, "tell me a story about the ocean");
+        assert_eq!(
+            matched.len(),
+            1,
+            "EN partial phrase 'story about' should trigger"
+        );
+
+        // Non-matching prose should not trigger
+        let matched = match_skills(&skills, "what's the weather like");
+        assert!(matched.is_empty());
+    }
+
+    /// /ce:review P1-6 — parse `skills/bundled/content-request-fidelity/skill.toml`
+    /// at compile time via `include_str!` and assert the bilingual FR+EN
+    /// canonical minimum is present. Before this test, the sibling
+    /// `test_content_request_fidelity_bilingual_fr_en_keywords` hardcoded its
+    /// own copy of the keyword list, so a manifest drift would not be
+    /// detected structurally. This test binds the assertion to the actual
+    /// shipped manifest.
+    #[test]
+    fn test_content_request_fidelity_manifest_carries_bilingual_triggers() {
+        const MANIFEST_SRC: &str =
+            include_str!("../../../../skills/bundled/content-request-fidelity/skill.toml");
+        let manifest: SkillManifest = toml::from_str(MANIFEST_SRC)
+            .expect("content-request-fidelity/skill.toml must parse as a SkillManifest");
+
+        // Canonical minimum set: at least one FR bare noun AND at least one
+        // EN bare noun. A drift that drops either language head would be an
+        // Al-tier regression (Al is francophone; FR is not optional).
+        assert!(
+            manifest.triggers.keywords.iter().any(|k| k == "proverbe"),
+            "manifest MUST retain the FR canonical trigger 'proverbe'"
+        );
+        assert!(
+            manifest.triggers.keywords.iter().any(|k| k == "proverb"),
+            "manifest MUST retain the EN canonical trigger 'proverb'"
+        );
+
+        // Structural check: bare high-collision nouns that hijack francophone
+        // conversation (`fait`, `histoire`) MUST NOT appear as bare keywords
+        // — only in phrase form (`un fait`, `une histoire`). Guards P1-2.
+        assert!(
+            !manifest.triggers.keywords.iter().any(|k| k == "fait"),
+            "bare 'fait' hijacks francophone prose (c'est fait, en fait, …) — must be phrase-only"
+        );
+        assert!(
+            !manifest.triggers.keywords.iter().any(|k| k == "histoire"),
+            "bare 'histoire' hijacks francophone prose — must be phrase-only"
+        );
+
+        // required_tools MUST cover both halves of the ledger (P1-3).
+        let required = &manifest.constraints.required_tools;
+        assert!(
+            required.iter().any(|t| t == "check_already_served"),
+            "constraints.required_tools must include check_already_served"
+        );
+        assert!(
+            required.iter().any(|t| t == "record_served_content"),
+            "constraints.required_tools must include record_served_content \
+             (prompt-only enforcement fails at loop substrate per feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate)"
+        );
+    }
+
+    #[test]
     fn test_word_boundary_empty_keyword_string_is_skipped() {
         // An empty string inside the keyword list must not create an
         // alternation entry that matches every message. This is a

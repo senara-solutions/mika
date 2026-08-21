@@ -2,6 +2,7 @@ mod a2a_call;
 mod add_team_member;
 mod cancel_reminder;
 mod cancel_task;
+mod check_already_served;
 mod check_task;
 pub mod classification;
 pub(crate) use check_task::{GitHubRef, parse_github_ref};
@@ -36,6 +37,7 @@ mod query_knowledge_graph;
 mod query_timeline;
 mod read_agent_file;
 mod read_workspace;
+mod record_served_content;
 mod remove_team_member;
 mod resolve_issue_order;
 mod run_team;
@@ -767,6 +769,9 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "list_audit_events",
     "search_tool_history",
     "promote_deferred_callback",
+    // Content-serve ledger tools (mika#1867)
+    "record_served_content",
+    "check_already_served",
     // management_tools_if_needed() — always-added management tools
     "create_agent",
     "create_team",
@@ -836,6 +841,10 @@ pub fn default_tools() -> ToolRegistry {
     registry.register(Box::new(get_session_messages::GetSessionMessagesTool));
     registry.register(Box::new(list_audit_events::ListAuditEventsTool));
     registry.register(Box::new(search_tool_history::SearchToolHistoryTool));
+    // Content-serve ledger tools (mika#1867). Engine-level (all agents) —
+    // a fidelity gate is engine, not skill.
+    registry.register(Box::new(record_served_content::RecordServedContentTool));
+    registry.register(Box::new(check_already_served::CheckAlreadyServedTool));
     registry
 }
 
