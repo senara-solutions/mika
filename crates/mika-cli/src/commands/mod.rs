@@ -10,6 +10,7 @@ pub mod kg;
 pub mod logs;
 pub mod mcp;
 pub mod memory;
+pub mod milestone;
 pub mod model;
 pub mod notify;
 pub mod provider;
