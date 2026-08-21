@@ -110,6 +110,7 @@ png = "0.17"
 
 # Unicode
 unicode-width = "0.2"
+unicode-normalization = "0.1"
 
 # MCP (Model Context Protocol)
 rmcp = { version = "2.0", default-features = false, features = [

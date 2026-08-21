@@ -1587,17 +1587,29 @@ impl AsyncDatabase {
     }
 
     /// List served-content rows for `(agent_id, person_id, category)` filtered
-    /// by `since` (mika#1867). See [`Database::list_served_content`].
+    /// by `since` (mika#1867). When `content_hash` is `Some`, pushes the
+    /// exact-hash filter into SQL — /ce:review P1-7 fix for the
+    /// LIMIT-then-filter false-negative that would let a hash-targeted probe
+    /// miss a match sitting below the top-N most-recent window.
+    /// See [`Database::list_served_content`].
     pub async fn list_served_content(
         &self,
         person_id: i64,
         category: String,
         since: Option<String>,
         limit: usize,
+        content_hash: Option<String>,
     ) -> Result<Vec<ServedContent>> {
         let a = self.agent_id.clone();
         self.with_db(move |db| {
-            db.list_served_content(&a, person_id, &category, since.as_deref(), limit)
+            db.list_served_content(
+                &a,
+                person_id,
+                &category,
+                since.as_deref(),
+                limit,
+                content_hash.as_deref(),
+            )
         })
         .await
     }

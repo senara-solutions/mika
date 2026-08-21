@@ -70,6 +70,7 @@ clap.workspace = true
 serde_yaml.workspace = true
 flate2 = "1"
 tar = "0.4"
+unicode-normalization.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
