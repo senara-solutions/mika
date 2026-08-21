@@ -7,6 +7,7 @@
 //!
 //! ### État
 //! - Progress: N/M sub-issues complete (X% done)
+//! - Completed: <list of closed sub-issues with PR links (or `(no linked PR)`)>
 //! - In-flight: <list with PR links + CI state>
 //! - Blocked: <list with blockers + who could unblock>
 //! - Unstarted: <list with priority ranking>
@@ -20,6 +21,13 @@
 //! ### Cross-cutting concerns (from mika-arch-groom-milestone)
 //! <any principle-grounded pushback>
 //! ```
+//!
+//! **Section ordering is LOAD-BEARING** (mika#1933 BLOCKING F2 — Prime bearing):
+//! `Completed` → `In-flight` → `Blocked` → `Unstarted`. Rationale
+//! (Prime verbatim from mika#1933): *« l'établi qui contraint un jugement de
+//! registre A/B-jamais-C »* — established brick anchors the judgment of the rest.
+//! Do NOT reorder these four write_* calls in `Reporter::report` without an
+//! explicit Prime override captured in a follow-up plan.
 
 use super::types::{Alert, AlertKind, Assessment, CiState, IssueState, MilestoneState, SubIssue};
 use std::fmt::Write;
@@ -56,6 +64,9 @@ impl Reporter {
             "- Progress: {}/{} sub-issues complete ({}% done)",
             state.progress.completed, state.progress.total, pct
         );
+        // Section ordering: Completed → In-flight → Blocked → Unstarted.
+        // See module docstring for the load-bearing rationale (mika#1933 F2, Prime bearing).
+        write_completed(&mut out, &state.sub_issues, &state.milestone_ref.repo);
         write_in_flight(&mut out, &state.sub_issues, &state.milestone_ref.repo);
         write_blocked(&mut out, &state.sub_issues);
         write_unstarted(&mut out, &state.sub_issues);
@@ -129,6 +140,55 @@ impl Reporter {
 impl Default for Reporter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Emit the `Completed` section (mika#1933 AC3).
+///
+/// Renders CLOSED sub-issues in a distinct list — the "established brick"
+/// signal Prime asked for. Filter matches the semantic complement of
+/// `write_in_flight`/`write_blocked`/`write_unstarted` (all three of which
+/// gate on `state == IssueState::Open`), so any given sub-issue lands in
+/// exactly one section by construction.
+///
+/// **Empty-case handling (F5 explicit invariant):** when no closed
+/// sub-issues exist, emit `- Completed: (none)` — do NOT omit the section.
+/// The section is always present so downstream parsers (Assessor consumers,
+/// external `mika milestone report` clients) see a uniform shape.
+///
+/// PR-linkage: reuses `SubIssue::pr_number` populated by
+/// `Reader::compose_from_gh_outputs` via the `closingIssuesReferences`
+/// reverse index. When a closed sub-issue has no linked PR (hand-closed,
+/// or PR not tagged with the milestone), the entry reads `closed (no linked PR)`.
+fn write_completed(out: &mut String, subs: &[SubIssue], repo: &str) {
+    let completed: Vec<&SubIssue> = subs
+        .iter()
+        .filter(|s| s.state == IssueState::Closed)
+        .collect();
+    if completed.is_empty() {
+        writeln!(out, "- Completed: (none)").unwrap();
+        return;
+    }
+    writeln!(out, "- Completed:").unwrap();
+    for s in completed {
+        match s.pr_number {
+            Some(pr) => {
+                let _ = writeln!(
+                    out,
+                    "  - #{n} {title} — PR https://github.com/{repo}/pull/{pr}",
+                    n = s.number,
+                    title = s.title
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    out,
+                    "  - #{n} {title} — closed (no linked PR)",
+                    n = s.number,
+                    title = s.title
+                );
+            }
+        }
     }
 }
 
@@ -398,6 +458,154 @@ mod tests {
         let out = Reporter::new().report(&state_with(vec![], ProgressCounts::default()), &a);
         assert!(out.contains("[silent-progress] #1802 — PR merged"));
         assert!(out.contains("[silence] milestone#1799 — 5 days"));
+    }
+
+    // -----------------------------------------------------------------
+    // mika#1933 regression tests — AC3 (Completed section) + AC2 lock-in.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn report_completed_section_present_when_closed_exists() {
+        // Fixture: 1 closed + 2 open (one of which is in-flight).
+        let mut closed = base_issue(1801);
+        closed.state = IssueState::Closed;
+        let mut in_flight = base_issue(1802);
+        in_flight.pr_number = Some(2002);
+        in_flight.ci_state = CiState::Success;
+        let unstarted = base_issue(1803);
+        let p = ProgressCounts {
+            completed: 1,
+            in_flight: 1,
+            unstarted: 1,
+            total: 3,
+            ..Default::default()
+        };
+        let out = Reporter::new().report(
+            &state_with(vec![closed, in_flight, unstarted], p),
+            &empty_assessment(),
+        );
+        // Header is present.
+        assert!(out.contains("- Completed:\n  - #1801"));
+        // Section ordering (F2 — load-bearing): Completed appears before In-flight.
+        let completed_pos = out.find("- Completed:").expect("Completed header present");
+        let in_flight_pos = out.find("- In-flight:").expect("In-flight header present");
+        assert!(
+            completed_pos < in_flight_pos,
+            "Completed section must precede In-flight (mika#1933 F2 Prime bearing)"
+        );
+    }
+
+    #[test]
+    fn report_completed_section_shows_pr_link_when_available() {
+        let mut closed = base_issue(1801);
+        closed.state = IssueState::Closed;
+        closed.pr_number = Some(2001);
+        let p = ProgressCounts {
+            completed: 1,
+            total: 1,
+            ..Default::default()
+        };
+        let out = Reporter::new().report(&state_with(vec![closed], p), &empty_assessment());
+        assert!(out.contains(
+            "- #1801 issue 1801 — PR https://github.com/senara-solutions/mika/pull/2001"
+        ));
+    }
+
+    #[test]
+    fn report_completed_section_shows_no_pr_fallback_when_absent() {
+        let mut closed = base_issue(1801);
+        closed.state = IssueState::Closed;
+        // pr_number remains None — hand-closed sub-issue.
+        let p = ProgressCounts {
+            completed: 1,
+            total: 1,
+            ..Default::default()
+        };
+        let out = Reporter::new().report(&state_with(vec![closed], p), &empty_assessment());
+        assert!(out.contains("- #1801 issue 1801 — closed (no linked PR)"));
+    }
+
+    #[test]
+    fn report_completed_section_absent_message_when_no_closed() {
+        // Fixture: all-open, no closed sub-issues at all.
+        let s = base_issue(1802);
+        let p = ProgressCounts {
+            unstarted: 1,
+            total: 1,
+            ..Default::default()
+        };
+        let out = Reporter::new().report(&state_with(vec![s], p), &empty_assessment());
+        // Section MUST be present — uniform shape for downstream parsers (F5).
+        assert!(out.contains("- Completed: (none)"));
+    }
+
+    #[test]
+    fn report_progress_matches_avancement_semantics() {
+        // Fixture: 1 closed + 3 open + 1 blocked → Progress = 1/5 (20%).
+        // Prime bearing (AC2 lock-in): Progress reports *avancement* (closed / total),
+        // not *reste-à-faire* (open / total).
+        let mut closed = base_issue(1801);
+        closed.state = IssueState::Closed;
+        let in_flight = {
+            let mut s = base_issue(1802);
+            s.pr_number = Some(2002);
+            s
+        };
+        let with_plan = {
+            let mut s = base_issue(1803);
+            s.plan_present = true;
+            s
+        };
+        let unstarted = base_issue(1804);
+        let mut blocked = base_issue(1805);
+        blocked.blockers = vec![1801];
+        let p = ProgressCounts {
+            completed: 1,
+            in_flight: 2, // 1802 (PR) + 1803 (plan)
+            blocked: 1,
+            unstarted: 1,
+            total: 5,
+        };
+        let out = Reporter::new().report(
+            &state_with(vec![closed, in_flight, with_plan, unstarted, blocked], p),
+            &empty_assessment(),
+        );
+        assert!(out.contains("1/5 sub-issues complete (20% done)"));
+    }
+
+    #[test]
+    fn report_section_ordering_completed_first() {
+        // Explicit F2 guard: exercise a fixture where every section renders
+        // a non-empty entry, and assert the four write_* calls emit in the
+        // load-bearing order Completed → In-flight → Blocked → Unstarted.
+        let mut closed = base_issue(1801);
+        closed.state = IssueState::Closed;
+        let in_flight = {
+            let mut s = base_issue(1802);
+            s.pr_number = Some(2002);
+            s
+        };
+        let mut blocked = base_issue(1803);
+        blocked.blockers = vec![9999];
+        let unstarted = base_issue(1804);
+        let p = ProgressCounts {
+            completed: 1,
+            in_flight: 1,
+            blocked: 1,
+            unstarted: 1,
+            total: 4,
+        };
+        let out = Reporter::new().report(
+            &state_with(vec![closed, in_flight, blocked, unstarted], p),
+            &empty_assessment(),
+        );
+        let c = out.find("- Completed:").expect("Completed section present");
+        let i = out.find("- In-flight:").expect("In-flight section present");
+        let b = out.find("- Blocked:").expect("Blocked section present");
+        let u = out.find("- Unstarted:").expect("Unstarted section present");
+        assert!(c < i, "Completed must precede In-flight");
+        assert!(i < b, "In-flight must precede Blocked");
+        assert!(b < u, "Blocked must precede Unstarted");
     }
 
     #[test]

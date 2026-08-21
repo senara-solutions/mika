@@ -481,6 +481,61 @@ mod tests {
     }
 
     #[test]
+    fn silence_threshold_unaffected_by_closed_count_mika_1933() {
+        // mika#1933 AC4 — silence detection MUST key on `last_activity_at`
+        // (a milestone-scope activity signal), NOT on the mix of closed vs
+        // open sub-issues. Adding a Completed rendering surface (AC3) must
+        // not shift silence semantics.
+        //
+        // Fixture A: 3 closed (stale updated_at) + 1 open (also stale). The
+        // milestone's `last_activity_at` is what drives silence.
+        {
+            let mut a = base_issue(1);
+            a.state = IssueState::Closed;
+            let mut b = base_issue(2);
+            b.state = IssueState::Closed;
+            let mut c = base_issue(3);
+            c.state = IssueState::Closed;
+            let d = base_issue(4);
+            let mut state = base_state(vec![a, b, c, d]);
+            state.last_activity_at = Some("2026-08-19T00:00:00Z".into());
+            let now = Utc.with_ymd_and_hms(2026, 8, 20, 0, 0, 0).unwrap();
+            // Well within the 3-day threshold — no silence regardless of the
+            // 3-to-1 closed-to-open ratio.
+            assert!(detect_silence(&state, 3, now).is_empty());
+        }
+        // Fixture B: 3 closed + 1 open, but last_activity_at is old — silence
+        // fires irrespective of the closed count.
+        {
+            let mut a = base_issue(1);
+            a.state = IssueState::Closed;
+            let mut b = base_issue(2);
+            b.state = IssueState::Closed;
+            let mut c = base_issue(3);
+            c.state = IssueState::Closed;
+            let d = base_issue(4);
+            let mut state = base_state(vec![a, b, c, d]);
+            state.last_activity_at = Some("2026-08-10T00:00:00Z".into());
+            let now = Utc.with_ymd_and_hms(2026, 8, 20, 0, 0, 0).unwrap();
+            let alerts = detect_silence(&state, 3, now);
+            assert_eq!(alerts.len(), 1);
+            assert_eq!(alerts[0].kind, AlertKind::Silence);
+        }
+        // Fixture C: 0 closed + 4 open with the SAME stale timestamp — the
+        // alert set must be identical to Fixture B's, proving closed count
+        // does not swap AC4 semantics.
+        {
+            let subs: Vec<SubIssue> = (1..=4).map(base_issue).collect();
+            let mut state = base_state(subs);
+            state.last_activity_at = Some("2026-08-10T00:00:00Z".into());
+            let now = Utc.with_ymd_and_hms(2026, 8, 20, 0, 0, 0).unwrap();
+            let alerts = detect_silence(&state, 3, now);
+            assert_eq!(alerts.len(), 1);
+            assert_eq!(alerts[0].kind, AlertKind::Silence);
+        }
+    }
+
+    #[test]
     fn full_assess_end_to_end() {
         let mut open_with_blocker = base_issue(1803);
         open_with_blocker.blockers = vec![1801];
