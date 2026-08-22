@@ -634,6 +634,78 @@ impl SkillRegistry {
         }
     }
 
+    /// Apply the testimony-grade ban (Phase 2 of the override chain, mika#1798).
+    ///
+    /// Any skill whose manifest declares `data_grade = "testimony"` is evicted
+    /// from the registry unconditionally with a WARN log line. There is no
+    /// per-agent override surface — the ban is structural, matching Prime's
+    /// "set once" contract. Opening a testimony-grade path requires a code
+    /// change (remove the tag or add a subcommand-ban entry), which is a
+    /// review-gated commit.
+    ///
+    /// **Phase order:** runs AFTER `apply_identity_allowlist` (Phase -1) and
+    /// `apply_overrides` (Phase 0/1) so any identity allowlist or DB override
+    /// that would re-enable a testimony skill is *still* overridden by the
+    /// ban. Runs BEFORE `apply_load_safety_check` so evicted skills do not
+    /// waste validation cycles.
+    ///
+    /// **v1 observability surface:** WARN log line per eviction (`event =
+    /// "skill_testimony_ban"`). The initial spec proposed a
+    /// `banned_testimony` field on the registry, but with no described
+    /// consumer (no CLI listing, no dashboard endpoint) it would add
+    /// persistent API surface without a reader (plan F2 revision).
+    pub fn apply_testimony_grade_ban(&mut self) {
+        use crate::skills::manifest::DataGrade;
+
+        let mut evicted = Vec::new();
+        self.skills.retain(|entry| {
+            if entry.manifest.skill.data_grade == DataGrade::Testimony {
+                tracing::warn!(
+                    event = "skill_testimony_ban",
+                    skill = %entry.manifest.skill.name,
+                    doctrine = "mika#1798",
+                    "skill declares data_grade = \"testimony\" — evicted from registry \
+                     unconditionally (non-transit doctrine, no per-agent override)"
+                );
+                evicted.push(DisabledSkill {
+                    name: entry.manifest.skill.name.clone(),
+                });
+                false
+            } else {
+                true
+            }
+        });
+        self.disabled.extend(evicted);
+    }
+
+    /// Build a `HashMap<String, DataGrade>` mapping each skill tool's
+    /// Claude-facing tool name to the `data_grade` of the owning skill (mika#1798).
+    ///
+    /// Used by the execute-time guardrail in
+    /// `tool_execution::dispatch::execute_tool` to reject any skill-registered
+    /// tool whose owning skill declared `data_grade = "testimony"`. This is
+    /// Layer 4 defense-in-depth — catches:
+    /// 1. Hot-reload race windows where the old registry still has a tool
+    ///    whose new manifest is testimony-tagged.
+    /// 2. Dynamic MCP registration where the MCP server's manifest declares
+    ///    testimony (forward-compatible with future MCP support).
+    /// 3. DB overrides that re-enable a testimony skill post-Phase-2.
+    ///
+    /// Called once per `ToolDispatchCtx` construction — O(1) lookup at
+    /// execute-time.
+    pub fn tool_data_grades(&self) -> std::collections::HashMap<String, manifest::DataGrade> {
+        let mut map = std::collections::HashMap::new();
+        for entry in &self.skills {
+            for tool in &entry.skill_tools {
+                map.insert(
+                    tool.definition.name.clone(),
+                    entry.manifest.skill.data_grade,
+                );
+            }
+        }
+        map
+    }
+
     /// Apply database-backed overrides to skill entries and validate dependencies.
     ///
     /// For each override, finds the matching skill by name (case-insensitive)
@@ -986,6 +1058,22 @@ mod tests {
         enabled: bool,
         deps: &[&str],
     ) -> SkillEntry {
+        make_entry_full(
+            name,
+            always_on,
+            enabled,
+            deps,
+            crate::skills::manifest::DataGrade::Operational,
+        )
+    }
+
+    fn make_entry_full(
+        name: &str,
+        always_on: bool,
+        enabled: bool,
+        deps: &[&str],
+        data_grade: crate::skills::manifest::DataGrade,
+    ) -> SkillEntry {
         SkillEntry {
             manifest: SkillManifest {
                 skill: SkillInfo {
@@ -996,6 +1084,7 @@ mod tests {
                     timeout_secs: 30,
                     dependencies: deps.iter().map(|s| s.to_string()).collect(),
                     max_prompt_size: None,
+                    data_grade,
                 },
                 triggers: Triggers { keywords: vec![] },
                 llm: Default::default(),
@@ -1957,6 +2046,154 @@ mod tests {
         }]);
 
         assert_eq!(registry.always_on_skills().len(), 2);
+    }
+
+    // -- apply_testimony_grade_ban tests (mika#1798) --
+
+    #[test]
+    fn test_apply_testimony_grade_ban_evicts_testimony_skill() {
+        use crate::skills::manifest::DataGrade;
+
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![
+                make_entry_full("web-search", false, true, &[], DataGrade::Operational),
+                make_entry_full("gmail-full", false, true, &[], DataGrade::Testimony),
+            ],
+        };
+
+        assert_eq!(registry.skills.len(), 2);
+        assert_eq!(registry.disabled.len(), 0);
+
+        registry.apply_testimony_grade_ban();
+
+        // Testimony-tagged skill is evicted; operational one survives.
+        assert_eq!(registry.skills.len(), 1);
+        assert_eq!(registry.skills[0].manifest.skill.name, "web-search");
+        assert_eq!(registry.disabled.len(), 1);
+        assert_eq!(registry.disabled[0].name, "gmail-full");
+
+        // N1 revision (plan): no `banned_testimony` field assertion — the field
+        // was dropped in F2. The observability surface is the WARN log line
+        // (emitted from the `retain` closure above; assertion of the log line
+        // itself belongs in a tracing-collector-instrumented test; the eviction
+        // + disabled-vec growth is the structural proof.)
+    }
+
+    #[test]
+    fn test_apply_testimony_grade_ban_no_op_when_all_operational() {
+        use crate::skills::manifest::DataGrade;
+
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![
+                make_entry_full("web-search", false, true, &[], DataGrade::Operational),
+                make_entry_full("calendar-lite", false, true, &[], DataGrade::Operational),
+            ],
+        };
+
+        registry.apply_testimony_grade_ban();
+
+        // Both skills preserved.
+        assert_eq!(registry.skills.len(), 2);
+        assert_eq!(registry.disabled.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_testimony_grade_ban_composes_with_allowlist_and_overrides() {
+        use crate::db::SkillOverride;
+        use crate::skills::manifest::DataGrade;
+
+        // Even if identity allowlist AND DB overrides both re-enable a
+        // testimony skill, Phase 2 must still evict it — the ban is
+        // structural, not policy-configurable.
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![
+                make_entry_full("web-search", false, true, &[], DataGrade::Operational),
+                make_entry_full("gmail-full", false, true, &[], DataGrade::Testimony),
+            ],
+        };
+
+        // Phase -1: identity allowlist explicitly includes gmail-full.
+        registry.apply_identity_allowlist(&["web-search".to_string(), "gmail-full".to_string()]);
+        assert_eq!(registry.skills.len(), 2, "allowlist should keep both");
+
+        // Phase 0/1: DB override explicitly forces always_on = true on gmail-full.
+        registry.apply_overrides(&[SkillOverride {
+            skill_name: "gmail-full".to_string(),
+            always_on: Some(true),
+            llm_provider: None,
+            llm_model: None,
+            enabled: Some(true),
+            ..Default::default()
+        }]);
+        assert_eq!(registry.skills.len(), 2, "override must not evict");
+
+        // Phase 2: testimony-grade ban STILL evicts gmail-full despite the two
+        // prior phases re-enabling it. This is the structural invariant.
+        registry.apply_testimony_grade_ban();
+        assert_eq!(registry.skills.len(), 1);
+        assert_eq!(registry.skills[0].manifest.skill.name, "web-search");
+        assert!(
+            registry.disabled.iter().any(|d| d.name == "gmail-full"),
+            "testimony ban must appear in the disabled list"
+        );
+    }
+
+    #[test]
+    fn test_tool_data_grades_maps_owning_skill() {
+        use crate::skills::manifest::DataGrade;
+
+        let mut op_entry = make_entry_full("web-search", false, true, &[], DataGrade::Operational);
+        let mut tes_entry = make_entry_full("gmail-full", false, true, &[], DataGrade::Testimony);
+
+        // Manually attach a fake tool to each entry so tool_data_grades()
+        // has something to walk.
+        use crate::skills::index::ResolvedSkillTool;
+        use crate::skills::manifest::ToolHandler;
+        use mika_common::claude::ToolDefinition;
+
+        op_entry.skill_tools.push(ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "web_search".to_string(),
+                description: "Search the web".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+            handler: ToolHandler::Builtin {
+                function: "web_search".to_string(),
+            },
+            skill_dir: op_entry.dir.clone(),
+        });
+        tes_entry.skill_tools.push(ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "gmail_fetch".to_string(),
+                description: "Fetch gmail".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+            handler: ToolHandler::Builtin {
+                function: "gmail_fetch".to_string(),
+            },
+            skill_dir: tes_entry.dir.clone(),
+        });
+
+        let registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![op_entry, tes_entry],
+        };
+
+        let grades = registry.tool_data_grades();
+        assert_eq!(grades.get("web_search"), Some(&DataGrade::Operational));
+        assert_eq!(grades.get("gmail_fetch"), Some(&DataGrade::Testimony));
+        assert_eq!(grades.get("nonexistent"), None);
     }
 
     #[test]

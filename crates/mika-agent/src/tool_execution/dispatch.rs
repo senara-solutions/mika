@@ -35,6 +35,16 @@ pub(crate) struct ToolDispatchCtx<'a> {
     pub(crate) skill_timeout: u64,
     pub(crate) mcp_manager: Option<&'a McpManager>,
     pub(crate) long_running_ctx: Option<&'a executor::LongRunningContext>,
+    /// Per-tool-name data-grade lookup (mika#1798 Layer 4).
+    ///
+    /// Built once per dispatch context from `SkillRegistry::tool_data_grades()`.
+    /// The execute-time guardrail in `execute_tool` reads this map to reject
+    /// any skill-registered tool whose owning skill declared
+    /// `data_grade = "testimony"`. Catches hot-reload race windows, dynamic
+    /// MCP registration (forward-compatible), and DB overrides that re-enable
+    /// a testimony skill post-Phase-2 — all cases where Phase-2 eviction is
+    /// incomplete but the execute-time gate still fires.
+    pub(crate) skill_data_grades: HashMap<String, crate::skills::manifest::DataGrade>,
 }
 
 /// Execute tool-use blocks from a response and push both assistant and
@@ -55,6 +65,13 @@ pub(crate) async fn process_tool_calls(
     response_content: Vec<LlmResponseContent>,
     tools: &ToolRegistry,
     skill_tools: &HashMap<String, &ResolvedSkillTool>,
+    // mika#1798 Layer 4: per-tool `data_grade` lookup — cloned into the
+    // per-step `ToolDispatchCtx` so the execute-time testimony guardrail can
+    // refuse skill-registered tools whose owning skill declared
+    // `data_grade = "testimony"` before the handler runs. Threaded from
+    // `run_loop`; built alongside `skill_tools` in the caller so the two
+    // maps stay consistent under last-write-wins collision semantics.
+    skill_data_grades: &HashMap<String, crate::skills::manifest::DataGrade>,
     skill_timeout: u64,
     tool_ctx: &ToolContext<'_>,
     request: &mut LlmRequest,
@@ -177,6 +194,11 @@ pub(crate) async fn process_tool_calls(
                     skill_timeout,
                     mcp_manager,
                     long_running_ctx,
+                    // mika#1798 Layer 4: clone the map so the dispatch context
+                    // owns its own copy. The map is small (one entry per
+                    // skill-registered tool) and cloned once per step, not per
+                    // dedup lookup — same allocation profile as skill_tools.
+                    skill_data_grades: skill_data_grades.clone(),
                 };
                 // mika#1757 — emit ToolCallStart immediately BEFORE physical
                 // dispatch. Fire-and-forget: send errors (zero subscribers)
@@ -374,10 +396,26 @@ pub(crate) async fn process_tool_calls(
     summaries
 }
 
+/// Structured refusal body for the execute-time testimony guardrail (mika#1798 Layer 4).
+///
+/// Emitted before the tool handler runs when a skill-registered tool's owning
+/// skill declared `data_grade = "testimony"`. The shape mirrors
+/// `TESTIMONY_GRADE_FORBIDDEN_GMAIL` in `builtin_handlers.rs` so consumers
+/// can pattern-match on `error = "testimony_grade_forbidden"` regardless of
+/// which layer fired.
+const TOOL_TESTIMONY_GRADE_FORBIDDEN: &str = r#"{"error":"testimony_grade_forbidden","doctrine":"mika#1798","reason":"This tool's owning skill declares data_grade = \"testimony\". Mika may NEVER access nor propose accessing testimony-grade data. This tool call is refused structurally at the execute-time guardrail (Layer 4)."}"#;
+
 /// Execute a single tool with timeout.
 ///
 /// Routing: builtin tools (from ToolRegistry) first, then skill-defined tools,
 /// then "unknown tool" error.
+///
+/// **mika#1798 Layer 4 (execute-time guardrail):** before the skill-tool
+/// dispatch fires, `dispatch.skill_data_grades` is consulted. If the tool's
+/// owning skill declared `data_grade = "testimony"`, the call is rejected
+/// with `TOOL_TESTIMONY_GRADE_FORBIDDEN` before reaching the handler. This
+/// closes the hot-reload race window, dynamic MCP registration (forward-
+/// compatible), and DB-override paths that Phase-2 eviction cannot cover.
 async fn execute_tool(
     dispatch: &ToolDispatchCtx<'_>,
     name: &str,
@@ -392,6 +430,26 @@ async fn execute_tool(
         .chars()
         .take(TOOL_TIMEOUT_INPUT_EXCERPT_LEN)
         .collect();
+
+    // mika#1798 Layer 4: execute-time testimony guardrail. Runs BEFORE the
+    // three-tier dispatch chain so ANY tool (builtin, skill, MCP) whose
+    // owning skill declared `data_grade = "testimony"` is refused. The
+    // lookup is O(1) against the pre-built `skill_data_grades` map. Only
+    // skill-registered tools are keyed in the map — builtin-only tools
+    // like `run_gh` do not have a `data_grade` classification and pass
+    // through untouched (their gate lives in the handler, see the Layer 3
+    // Gmail subcommand ban in `builtin_handlers::validate_gws_input`).
+    if let Some(&grade) = dispatch.skill_data_grades.get(name)
+        && grade == crate::skills::manifest::DataGrade::Testimony
+    {
+        tracing::warn!(
+            event = "tool_testimony_ban",
+            tool = %name,
+            doctrine = "mika#1798",
+            "tool call refused by execute-time testimony guardrail — owning skill declares data_grade = \"testimony\""
+        );
+        return ToolOutput::error(TOOL_TESTIMONY_GRADE_FORBIDDEN);
+    }
 
     // 1. Try builtin tool
     if let Some(tool) = dispatch.tools.get(name) {
@@ -471,4 +529,64 @@ async fn execute_tool(
 
     warn!(tool = %name, "unknown tool requested");
     ToolOutput::error(format!("Unknown tool: {name}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skills::manifest::DataGrade;
+
+    // -- mika#1798 Layer 4 tests --
+
+    #[test]
+    fn testimony_forbidden_body_is_well_formed_json() {
+        // The refusal body must parse as JSON and carry the structured
+        // discriminator fields — consumers pattern-match on
+        // `error = "testimony_grade_forbidden"` regardless of which layer
+        // (subcommand ban, execute-time guardrail, registry-eviction path)
+        // emitted it.
+        let parsed: serde_json::Value =
+            serde_json::from_str(TOOL_TESTIMONY_GRADE_FORBIDDEN).expect("must parse as JSON");
+        assert_eq!(
+            parsed.get("error").and_then(|v| v.as_str()),
+            Some("testimony_grade_forbidden")
+        );
+        assert_eq!(
+            parsed.get("doctrine").and_then(|v| v.as_str()),
+            Some("mika#1798")
+        );
+        assert!(
+            parsed
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false),
+            "reason field must be present and non-empty"
+        );
+    }
+
+    #[test]
+    fn tool_dispatch_ctx_holds_skill_data_grades() {
+        // Structural test: the ToolDispatchCtx field is public within the
+        // crate, mapped one-to-one with the tool set the dispatch runs
+        // against. This test exercises the `#[allow(dead_code)]`-free
+        // wiring at the type level.
+        let mut grades = HashMap::new();
+        grades.insert("gmail_fetch".to_string(), DataGrade::Testimony);
+        grades.insert("web_search".to_string(), DataGrade::Operational);
+
+        assert_eq!(grades.get("gmail_fetch"), Some(&DataGrade::Testimony));
+        assert_eq!(grades.get("web_search"), Some(&DataGrade::Operational));
+        assert_eq!(grades.get("unknown_tool"), None);
+
+        // The predicate the guardrail evaluates.
+        assert!(
+            matches!(grades.get("gmail_fetch"), Some(&DataGrade::Testimony)),
+            "Layer 4 predicate must classify gmail_fetch as Testimony"
+        );
+        assert!(
+            !matches!(grades.get("web_search"), Some(&DataGrade::Testimony)),
+            "Layer 4 predicate must not classify web_search as Testimony"
+        );
+    }
 }

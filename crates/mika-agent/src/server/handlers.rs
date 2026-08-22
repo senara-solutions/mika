@@ -1113,6 +1113,8 @@ async fn run_agent_for_message(
         if let Ok(overrides) = a.db.get_skill_overrides(a.db.agent_id()).await {
             registry.apply_overrides(&overrides);
         }
+        // Phase 2 (mika#1798): testimony-grade ban.
+        registry.apply_testimony_grade_ban();
         registry.log_summary();
         let new = Arc::new(registry);
         *a.skills.lock().unwrap() = new.clone();

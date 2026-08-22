@@ -215,6 +215,38 @@ fn default_true() -> bool {
     true
 }
 
+/// Data-grade classification for a skill (mika#1798, non-transit doctrine).
+///
+/// Distinguishes skills that touch **operational-grade** data (calendar-like
+/// scheduling metadata, app-scoped file storage — accessible read-mostly) from
+/// skills that touch **testimony-grade** data (Gmail message content, full
+/// Drive, journals, confessional — HARD-NO access AND HARD-NO propose).
+///
+/// Default is `Operational` so every current `skill.toml` remains valid without
+/// migration. Skills that touch testimony-grade data MUST opt in explicitly via
+/// `data_grade = "testimony"` at the manifest level; the
+/// `SkillRegistry::apply_testimony_grade_ban()` Phase 2 will evict them from
+/// the registry unconditionally, and the execute-time guardrail in
+/// `execute_tool` will reject any tool call whose owning skill declared
+/// `testimony`.
+///
+/// **v1 has no per-agent override surface** — banning is structural, not
+/// policy-configurable. Opening a testimony-grade path requires a code change
+/// that removes the tag or adds a subcommand-ban entry, which is a
+/// review-gated commit. Matches Prime's "set once" contract.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DataGrade {
+    /// Operational-grade data — accessible read-mostly (calendar, app-scoped
+    /// files). Default for all skills that don't opt in.
+    #[default]
+    Operational,
+    /// Testimony-grade data — Gmail content, full Drive, journals,
+    /// confessional. Skills tagged `testimony` are evicted from the registry
+    /// by Phase 2 (see `apply_testimony_grade_ban`).
+    Testimony,
+}
+
 /// Core skill metadata from the `[skill]` section.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SkillInfo {
@@ -233,6 +265,15 @@ pub struct SkillInfo {
     /// Optional max prompt snippet size in bytes. Overrides the global 16KB default.
     #[serde(default)]
     pub max_prompt_size: Option<u64>,
+    /// Data-grade classification (mika#1798, non-transit doctrine).
+    ///
+    /// Absent field defaults to `Operational` — backward-compatible: every
+    /// current `skill.toml` remains valid. Skills that touch testimony-grade
+    /// data (Gmail content, full Drive, journals) MUST opt in via
+    /// `data_grade = "testimony"`. Testimony-tagged skills are evicted from
+    /// the registry unconditionally by `SkillRegistry::apply_testimony_grade_ban()`.
+    #[serde(default)]
+    pub data_grade: DataGrade,
 }
 
 /// Keyword triggers that control when a skill is injected into a turn.
@@ -455,6 +496,54 @@ mod tests {
         "#;
         let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
         assert_eq!(manifest.skill.max_prompt_size, Some(32768));
+    }
+
+    // -- [skill].data_grade tests (mika#1798) --
+
+    #[test]
+    fn test_parse_data_grade_defaults_operational() {
+        let toml_str = r#"
+            [skill]
+            name = "no-grade-declared"
+            description = "Backward-compat: absent field parses as Operational"
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert_eq!(manifest.skill.data_grade, DataGrade::Operational);
+    }
+
+    #[test]
+    fn test_parse_data_grade_operational_explicit() {
+        let toml_str = r#"
+            [skill]
+            name = "explicit-operational"
+            description = "Explicit operational-grade"
+            data_grade = "operational"
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert_eq!(manifest.skill.data_grade, DataGrade::Operational);
+    }
+
+    #[test]
+    fn test_parse_data_grade_testimony() {
+        let toml_str = r#"
+            [skill]
+            name = "testimony-tagged"
+            description = "Testimony-grade skill"
+            data_grade = "testimony"
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert_eq!(manifest.skill.data_grade, DataGrade::Testimony);
+    }
+
+    #[test]
+    fn test_parse_data_grade_unknown_value_rejected() {
+        let toml_str = r#"
+            [skill]
+            name = "bad-grade"
+            description = "Unknown grade string"
+            data_grade = "personal"
+        "#;
+        assert!(toml::from_str::<SkillManifest>(toml_str).is_err());
     }
 
     #[test]

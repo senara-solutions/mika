@@ -52,6 +52,7 @@ fn make_milestone_skill() -> SkillEntry {
                 timeout_secs: 30,
                 dependencies: vec![],
                 max_prompt_size: None,
+                data_grade: Default::default(),
             },
             triggers: Triggers {
                 keywords: vec![

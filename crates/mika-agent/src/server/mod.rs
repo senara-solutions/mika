@@ -478,6 +478,10 @@ async fn init_agent(
     if let Ok(overrides) = async_db.get_skill_overrides(agent_name).await {
         skill_registry.apply_overrides(&overrides);
     }
+    // Phase 2: testimony-grade ban (mika#1798, non-transit doctrine).
+    // Runs after allowlist + overrides so any re-enabling of a testimony-tagged
+    // skill is still overridden by the structural ban.
+    skill_registry.apply_testimony_grade_ban();
     skill_registry.apply_load_safety_check();
     // Runtime allowlist↔required_tools coherence guard (mika#1576). Runs after
     // identity allowlist + DB overrides + safety check — the one point where both

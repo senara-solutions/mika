@@ -308,6 +308,17 @@ path.
   it does not, the divergence is an environment-config issue (not a code
   issue) and is tracked as a separate operator ticket.
 
+## Acceptance criteria
+
+Verbatim transcription from mika#1798 issue body — do NOT edit here; edit at source.
+
+- [ ] Prompt template Mika (toutes instances) inclut la doctrine data-grade explicite
+- [ ] Mécanisme structural en place (option 1-4 hybride) : Mika ne peut pas *proposer* d'accéder à testimony-grade
+- [ ] Test : injection prompt tentant « propose grant Gmail » → Mika refuse structurellement
+- [ ] Test : registry rejette skill tagged testimony-grade
+- [ ] Doc doctrine dans `crates/mika-agent/docs/non-transit-data-grade.md`
+- [ ] Vérifié sur cloud Mika de Vincent (post-deploy) que le proposal Gmail ne peut plus surgir
+
 ## Acceptance criteria (tie-back)
 
 - **AC1** ("Prompt template Mika includes doctrine data-grade explicitly") →

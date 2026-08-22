@@ -1445,6 +1445,8 @@ mod tests {
         for (agent, allowlist) in well_known_skill_allowlists() {
             let mut registry = SkillRegistry::from_dir(tmp.path());
             registry.apply_identity_allowlist(&allowlist);
+            // Phase 2 (mika#1798): testimony-grade ban — parity with startup paths.
+            registry.apply_testimony_grade_ban();
             registry.apply_load_safety_check();
             registry.apply_required_tools_coherence_check(agent);
 

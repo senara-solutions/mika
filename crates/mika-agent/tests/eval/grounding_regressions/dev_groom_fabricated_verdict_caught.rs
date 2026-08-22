@@ -47,6 +47,7 @@ fn make_dev_groom_skill() -> SkillEntry {
                 timeout_secs: 600,
                 dependencies: vec![],
                 max_prompt_size: None,
+                data_grade: Default::default(),
             },
             triggers: Triggers {
                 keywords: vec![

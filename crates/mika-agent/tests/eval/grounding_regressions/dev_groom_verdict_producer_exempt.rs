@@ -40,6 +40,7 @@ fn make_second_review_skill() -> SkillEntry {
                 timeout_secs: 300,
                 dependencies: vec![],
                 max_prompt_size: None,
+                data_grade: Default::default(),
             },
             triggers: Triggers {
                 keywords: vec!["second review".to_string(), "second pass".to_string()],
