@@ -2562,22 +2562,30 @@ const TESTIMONY_GRADE_FORBIDDEN_DRIVE: &str = r#"{"error":"testimony_grade_forbi
 /// Return `true` when a `drive` invocation's `--params` JSON is scoped to
 /// app-created files only (mika#1798 Layer 3, Deliverable 4).
 ///
+/// **Hardened against `q`-negation and OR-branch bypass (adversarial F1
+/// finding, 2026-08-22):** the original substring gate accepted any `q`
+/// string that contained the marker text, so a trivial `not ('me' in
+/// owners)` or `(name contains 'x') or ('me' in owners)` would pass the
+/// gate but return full-scope Drive results. The tightened gate rejects
+/// any `q` that contains the boolean tokens `not`, ` or `, or bare
+/// parentheses beyond the leading marker — a `q` must be exactly a
+/// single-marker predicate (`'me' in owners` or `appProperties has ...`),
+/// optionally with trailing `and`-conjoined restrictions.
+///
+/// Non-`list` verbs (`get`/`update`/`delete`) are additionally refused
+/// unconditionally at the caller site (adversarial F2 finding) because the
+/// `q` filter is ignored by the Drive API when a fileId positional or query
+/// param is supplied; `create` and `list` with scoped `q` are the only
+/// operational-grade surfaces.
+///
 /// Conservative reject-and-surface — false positives are acceptable per the
-/// plan's Risks entry on Drive `--params` parsing. Any `drive` call that is
-/// NOT `files list|get|update|delete|create` is untouched (that shape
-/// couldn't reach the testimony surface via the current CLI wrapping).
+/// plan's Risks entry on Drive `--params` parsing.
 ///
 /// The gate accepts only when `--params` is present AND parses as JSON AND
-/// contains a `"q"` filter restricted to `"'me' in owners"` or an
-/// `"appProperties has"` marker. Missing `--params` or malformed JSON is
-/// treated as full-Drive scope and refused (fail-closed).
-///
-/// **v1 tradeoff (plan Risks entry, F4 revision):** this substring-check
-/// gate does not analyze API-layer semantics of the `q` string beyond the
-/// two accepted markers. A crafted `q` that passes the substring check but
-/// exposes broader scope is not caught here — v1 relies on Deliverable 3
-/// (skill-level ban) + operator-review-gated code changes for the broader
-/// Drive testimony surface.
+/// contains a `"q"` filter that (a) starts with an accepted marker AND
+/// (b) contains no boolean-negation or OR-branch tokens. Missing `--params`,
+/// malformed JSON, or a `q` containing `not`/`or`/leading `(` is treated as
+/// full-Drive scope and refused (fail-closed).
 fn drive_params_are_app_scoped(args: &[String]) -> bool {
     // Find `--params` and take the next token, OR find `--params=<value>`.
     let params_value: Option<&str> = args.iter().enumerate().find_map(|(i, s)| {
@@ -2599,8 +2607,31 @@ fn drive_params_are_app_scoped(args: &[String]) -> bool {
     let Some(q) = parsed.get("q").and_then(|v| v.as_str()) else {
         return false; // no `q` filter → full-Drive scope → refuse.
     };
-    // Accepted markers: 'me' in owners OR appProperties has ...
-    q.contains("'me' in owners") || q.contains("appProperties has")
+    // Trim leading whitespace; the `q` must START with an accepted marker
+    // (leading `(` or `not ` inverts scope; adversarial F1 fix).
+    let q_trimmed = q.trim_start();
+    let starts_with_marker =
+        q_trimmed.starts_with("'me' in owners") || q_trimmed.starts_with("appProperties has");
+    if !starts_with_marker {
+        return false;
+    }
+    // Reject any q containing boolean-negation or OR-branch tokens —
+    // these can invert the leading marker semantically even though it
+    // appears first lexically. Case-insensitive because Drive Query
+    // Language is case-sensitive on operators but callers may not know
+    // that; conservative reject is correct. The tokens are matched with
+    // required surrounding spaces to avoid false positives on strings
+    // like `mother` (contains `not`) or `owners` (contains `or`); the
+    // Drive Query Language requires spaces around boolean operators.
+    let q_lower = q_trimmed.to_ascii_lowercase();
+    if q_lower.contains(" not ")
+        || q_lower.starts_with("not ")
+        || q_lower.contains(" or ")
+        || q_lower.contains("(")
+    {
+        return false;
+    }
+    true
 }
 
 /// Validate and parse `run_gws` input into structured args.
@@ -2655,24 +2686,44 @@ fn validate_gws_input(input: &serde_json::Value) -> Result<Vec<String>, ToolOutp
     }
 
     // mika#1798 Layer 3: Drive scope-limit — permit only app-created files.
-    // The Drive-testimony surface reachable through `gws drive files ...` is
-    // gated to `'me' in owners` OR `appProperties has ...` markers via the
-    // required `--params` `q` filter. Any other shape is refused pre-spawn.
-    // Calendar is untouched (operational-grade, Deliverable 4 comment).
-    if subcommand == "drive"
-        && args.get(1).is_some_and(|s| s == "files")
-        && args
-            .get(2)
-            .is_some_and(|s| matches!(s.as_str(), "list" | "get" | "create" | "delete" | "update"))
-        && !drive_params_are_app_scoped(&args)
-    {
-        tracing::warn!(
-            event = "testimony_grade_forbidden",
-            surface = "run_gws.drive",
-            doctrine = "mika#1798",
-            "Drive files invocation refused — --params not scoped to app-created files"
-        );
-        return Err(ToolOutput::error(TESTIMONY_GRADE_FORBIDDEN_DRIVE));
+    //
+    // Two-part gate (adversarial F1 + F2 findings, 2026-08-22):
+    // - **`list` and `create`**: permitted when `--params` `q` filter passes
+    //   `drive_params_are_app_scoped` (hardened against negation + OR-branch
+    //   bypass). These verbs honor the `q` filter server-side.
+    // - **`get` / `update` / `delete`**: refused unconditionally in v1. The
+    //   Drive API for these verbs takes a `fileId` positional / query param
+    //   and IGNORES `--params.q`, so the L3 gate cannot verify scope. A
+    //   future opt-in that resolves the fileId via a prior scoped `list` is
+    //   the supported path; opening this surface requires a code change.
+    //
+    // Any other Drive verb (e.g., `drive about`) is untouched — those shapes
+    // don't reach the testimony surface via the current CLI wrapping.
+    if subcommand == "drive" && args.get(1).is_some_and(|s| s == "files") {
+        let verb = args.get(2).map(|s| s.as_str()).unwrap_or("");
+        let is_scoped_verb = matches!(verb, "list" | "create");
+        let is_ungated_verb = matches!(verb, "get" | "update" | "delete");
+        if is_ungated_verb {
+            // F2: fileId-addressed verbs ignore --params.q; refuse.
+            tracing::warn!(
+                event = "testimony_grade_forbidden",
+                surface = "run_gws.drive",
+                verb = %verb,
+                doctrine = "mika#1798",
+                "Drive files fileId-addressed verb refused — --params.q is ignored by Drive API for this verb"
+            );
+            return Err(ToolOutput::error(TESTIMONY_GRADE_FORBIDDEN_DRIVE));
+        }
+        if is_scoped_verb && !drive_params_are_app_scoped(&args) {
+            tracing::warn!(
+                event = "testimony_grade_forbidden",
+                surface = "run_gws.drive",
+                verb = %verb,
+                doctrine = "mika#1798",
+                "Drive files invocation refused — --params not scoped to app-created files (or q contains negation/OR/paren)"
+            );
+            return Err(ToolOutput::error(TESTIMONY_GRADE_FORBIDDEN_DRIVE));
+        }
     }
 
     Ok(args)
@@ -4028,6 +4079,130 @@ mod tests {
                 .unwrap_err()
                 .content
                 .contains("testimony_grade_forbidden")
+        );
+    }
+
+    // Adversarial F1 fix (2026-08-22): Drive q-negation bypass tests.
+
+    #[test]
+    fn test_validate_gws_input_rejects_drive_q_negation_bypass() {
+        // Payload: `not ('me' in owners)` — original substring gate would
+        // pass (contains "'me' in owners"), semantic scope is inverted to
+        // FULL Drive. Hardened gate must refuse.
+        let input = serde_json::json!({
+            "command": ["drive", "files", "list", "--params",
+                        "{\"q\":\"not ('me' in owners)\"}"]
+        });
+        let result = validate_gws_input(&input);
+        assert!(result.is_err(), "q with `not` negation must be refused");
+        assert!(
+            result
+                .unwrap_err()
+                .content
+                .contains("testimony_grade_forbidden")
+        );
+    }
+
+    #[test]
+    fn test_validate_gws_input_rejects_drive_q_or_branch_bypass() {
+        // Payload: `(name contains 'x') or ('me' in owners)` — original
+        // substring gate would pass, semantic scope is a union with an
+        // unrelated broad match. Hardened gate must refuse.
+        let input = serde_json::json!({
+            "command": ["drive", "files", "list", "--params",
+                        "{\"q\":\"(name contains 'x') or ('me' in owners)\"}"]
+        });
+        let result = validate_gws_input(&input);
+        assert!(result.is_err(), "q with OR-branch must be refused");
+    }
+
+    #[test]
+    fn test_validate_gws_input_rejects_drive_q_leading_paren() {
+        // Any leading `(` group can wrap arbitrary predicates before the
+        // marker fires. Hardened gate refuses any q containing bare `(`.
+        let input = serde_json::json!({
+            "command": ["drive", "files", "list", "--params",
+                        "{\"q\":\"('me' in owners) and (fullText contains 'anything')\"}"]
+        });
+        let result = validate_gws_input(&input);
+        assert!(result.is_err(), "q with leading paren must be refused");
+    }
+
+    #[test]
+    fn test_validate_gws_input_allows_drive_q_trailing_and_conjunction() {
+        // A trailing `and`-conjunction that restricts scope FURTHER (e.g.,
+        // narrowing to trashed=false) is still safe — the leading marker
+        // pins the base scope. This proves the hardened gate isn't
+        // overzealous on legitimate conjunctions.
+        let input = serde_json::json!({
+            "command": ["drive", "files", "list", "--params",
+                        "{\"q\":\"'me' in owners and trashed = false\"}"]
+        });
+        let result = validate_gws_input(&input);
+        assert!(
+            result.is_ok(),
+            "trailing and-conjunction that further restricts must be permitted: {:?}",
+            result.err()
+        );
+    }
+
+    // Adversarial F2 fix (2026-08-22): Drive non-list verbs refuse.
+
+    #[test]
+    fn test_validate_gws_input_rejects_drive_get_even_with_scoped_q() {
+        // Drive `get` takes a fileId and IGNORES --params.q server-side,
+        // so a scoped q cannot verify what fileId will actually be
+        // fetched. Hardened gate refuses all get/update/delete verbs.
+        let input = serde_json::json!({
+            "command": ["drive", "files", "get", "some-file-id", "--params",
+                        "{\"q\":\"'me' in owners\"}"]
+        });
+        let result = validate_gws_input(&input);
+        assert!(result.is_err(), "drive files get must be refused");
+        assert!(
+            result
+                .unwrap_err()
+                .content
+                .contains("testimony_grade_forbidden")
+        );
+    }
+
+    #[test]
+    fn test_validate_gws_input_rejects_drive_update() {
+        let input = serde_json::json!({
+            "command": ["drive", "files", "update", "some-file-id", "--params",
+                        "{\"q\":\"'me' in owners\"}"]
+        });
+        assert!(
+            validate_gws_input(&input).is_err(),
+            "drive files update must be refused"
+        );
+    }
+
+    #[test]
+    fn test_validate_gws_input_rejects_drive_delete() {
+        let input = serde_json::json!({
+            "command": ["drive", "files", "delete", "some-file-id"]
+        });
+        assert!(
+            validate_gws_input(&input).is_err(),
+            "drive files delete must be refused"
+        );
+    }
+
+    #[test]
+    fn test_validate_gws_input_allows_drive_create_with_scoped_q() {
+        // create is honored by the API's q filter for the parent-scope
+        // check; permitted alongside list.
+        let input = serde_json::json!({
+            "command": ["drive", "files", "create", "--params",
+                        "{\"q\":\"'me' in owners\"}"]
+        });
+        let result = validate_gws_input(&input);
+        assert!(
+            result.is_ok(),
+            "drive files create with scoped q must be permitted: {:?}",
+            result.err()
         );
     }
 

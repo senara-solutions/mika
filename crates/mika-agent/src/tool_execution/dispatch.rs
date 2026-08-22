@@ -40,10 +40,20 @@ pub(crate) struct ToolDispatchCtx<'a> {
     /// Built once per dispatch context from `SkillRegistry::tool_data_grades()`.
     /// The execute-time guardrail in `execute_tool` reads this map to reject
     /// any skill-registered tool whose owning skill declared
-    /// `data_grade = "testimony"`. Catches hot-reload race windows, dynamic
-    /// MCP registration (forward-compatible), and DB overrides that re-enable
-    /// a testimony skill post-Phase-2 — all cases where Phase-2 eviction is
-    /// incomplete but the execute-time gate still fires.
+    /// `data_grade = "testimony"`. Catches hot-reload race windows and DB
+    /// overrides that re-enable a testimony skill post-Phase-2 — cases
+    /// where Phase-2 eviction is incomplete but the execute-time gate still
+    /// fires.
+    ///
+    /// **MCP note (aspirational, not enforced today):** dynamically-registered
+    /// MCP tools reach `execute_tool` via the third dispatch tier (`mcp.call_tool`)
+    /// and are NOT keyed in `skill_data_grades` because they are not
+    /// `skill_tools`. The map's shape is forward-compatible: when MCP manifests
+    /// gain a `data_grade` field and MCP tools are seeded into this map, the
+    /// L4 predicate will fire on them without any change to `execute_tool`.
+    /// Until then, MCP-registered testimony tools bypass L4 and must be gated
+    /// at MCP manifest ingestion — the vigilance-surface entry documented in
+    /// `crates/mika-agent/docs/non-transit-data-grade.md`.
     pub(crate) skill_data_grades: HashMap<String, crate::skills::manifest::DataGrade>,
 }
 

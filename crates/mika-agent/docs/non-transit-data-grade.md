@@ -227,6 +227,36 @@ If a future change does NEITHER, the only remaining defense is Layer 1 (the
 prompt) — the fragile layer the doctrine explicitly distrusts. **This is
 the single axis of vigilance for every future testimony-adjacent change.**
 
+### Known bypass classes (out of scope for mika#1798, tracked separately)
+
+The four-layer defense covers the `run_gws` builtin surface + any future
+tool that declares `data_grade = "testimony"`. It does NOT cover:
+
+- **`shell-exec` command-line bypass** — the `shell-exec` skill accepts
+  shell commands and runs them via `eval`. Its per-command allowlist
+  (`awk '{print $1}'`) is trivially defeated by absolute paths (`/usr/bin/gws
+  gmail ...`), env-wrapping (`env gws ...`, `sh -c 'gws ...'`), or
+  `PATH=/tmp:$PATH` shadowing. A determined caller can invoke Gmail via
+  `shell-exec` and bypass all four L1–L4 layers because the call never
+  enters the `run_gws` builtin handler. The `shell-exec` allowlist itself
+  is orthogonal to this doctrine; hardening it (e.g., canonicalize path
+  + block `sh -c`/`eval`/`env` prefixes) is a follow-up. **Personal-tier
+  agents ship with `shell-exec` in `DEFAULT_AGENT_SKILL_ALLOWLIST` — the
+  bypass class is live in default configuration.**
+- **Registry-ban callsite drift** — the four-layer defense wires Phase 2
+  at every `SkillRegistry::from_dir` callsite via manual pairing
+  (~12 sites). Adding a new skill-loading site without pairing
+  `apply_testimony_grade_ban` silently opens the surface. A follow-up
+  should introduce a `SkillRegistry::load_for_agent(dir, identity,
+  overrides)` wrapper that atomically returns a fully-phased registry so
+  the ban cannot be forgotten.
+- **MCP-registered testimony tools** — the L4 lookup map
+  (`skill_data_grades`) is built from `skill_tools`, which excludes
+  MCP-registered tools. An MCP server that registers a `gmail_fetch` or
+  `mcp__gmail__*` tool reaches Gmail with zero doctrine layer firing.
+  Forward-compat requires MCP manifests to gain a `data_grade` field AND
+  the MCP dispatch site to consult the same map.
+
 ## Cross-references
 
 - **Sibling ticket:** mika#1783 (Salut Vincent — Mika verbalizes
