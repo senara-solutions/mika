@@ -23,7 +23,10 @@ use mika_agent::db::{CURRENT_SCHEMA_VERSION, Database};
 /// Current schema version this fixture module is pinned to.
 /// Bump this when updating fixtures for a new schema version.
 /// Type is i64 to match db.rs::CURRENT_SCHEMA_VERSION source of truth.
-const PINNED_SCHEMA_VERSION: i64 = 48;
+// v48→v49 (mika#1671) expanded the `team_runs.status` CHECK to include
+// `'failed_transport'` — a non-KG table rebuild, so no `seed_*` helper change is
+// needed (fixtures never touch `team_runs`); only the pin advances.
+const PINNED_SCHEMA_VERSION: i64 = 49;
 
 const _: () = assert!(
     CURRENT_SCHEMA_VERSION == PINNED_SCHEMA_VERSION,

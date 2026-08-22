@@ -13,7 +13,9 @@ use mika_common::llm::LlmProvider;
 use mika_common::team::TeamDefinition;
 use secrecy::ExposeSecret;
 
-use crate::agent::{TeamAgentOutcome, TeamAgentParams};
+use crate::agent::{
+    DelegationOutcome, TeamAgentOutcome, TeamAgentParams, classify_delegation_from_error,
+};
 use crate::async_db::AsyncDatabase;
 use crate::db::Database;
 use crate::skills::SkillRegistry;
@@ -120,6 +122,31 @@ pub struct TeamEngine {
     /// Session-scoped PR review dedup map (#821). Shared with `AppState`.
     /// Entries evicted at each `end_session()` callsite.
     pr_reviews_posted: Option<Arc<dashmap::DashMap<String, std::collections::HashSet<String>>>>,
+}
+
+/// Outcome of an `execute_tasks` iteration (mika#1671). Replaces the previous
+/// `bool` (suspended) return so the caller can distinguish a normal proceed, a
+/// grandchild-callback suspend, and the all-transport-failed short-circuit.
+enum ExecuteOutcome {
+    /// Proceed to the review/deliver phases (current default behavior).
+    Proceed,
+    /// Pending grandchild callbacks — the run suspended and will resume later.
+    Suspended,
+    /// Every completed delegation in this iteration failed at the transport layer;
+    /// `run.status` has been set to `RunStatus::FailedTransport` and the caller must
+    /// skip review/deliver and finalize (mika#1671 AC3/AC5).
+    AllTransportFailed,
+}
+
+/// True iff the iteration is non-empty and every delegation classified as a
+/// transport failure (mika#1671 AC3). A `None` slot (unclassified — e.g. a task
+/// that panicked into a `JoinError`) or any non-transport outcome makes this
+/// `false`, so a mixed iteration never short-circuits (AC4 invariant).
+fn all_delegations_transport_failed(outcomes: &[Option<DelegationOutcome>]) -> bool {
+    !outcomes.is_empty()
+        && outcomes
+            .iter()
+            .all(|o| matches!(o, Some(DelegationOutcome::TransportError { .. })))
 }
 
 impl TeamEngine {
@@ -370,11 +397,19 @@ impl TeamEngine {
             "execute" => {
                 // Re-execute tasks, then review, then deliver
                 self.transition_phase(TeamPhase::Execute);
-                let suspended = self.execute_tasks().await?;
-                if suspended {
-                    // Team run suspended again, will resume via invoke_orchestrator
-                    self.finalize_and_shutdown().await;
-                    return Ok(self.run);
+                match self.execute_tasks().await? {
+                    ExecuteOutcome::Suspended => {
+                        // Team run suspended again, will resume via invoke_orchestrator
+                        self.finalize_and_shutdown().await;
+                        return Ok(self.run);
+                    }
+                    ExecuteOutcome::AllTransportFailed => {
+                        // mika#1671: status set to FailedTransport inside execute_tasks;
+                        // skip review/deliver and finalize the terminal state.
+                        self.finalize_and_shutdown().await;
+                        return Ok(self.run);
+                    }
+                    ExecuteOutcome::Proceed => {}
                 }
 
                 // Fall through to review
@@ -597,6 +632,7 @@ impl TeamEngine {
             RunStatus::Suspended => ("suspended", None),
             RunStatus::Failed(reason) => ("failed", Some(reason.as_str())),
             RunStatus::FailedNoDelegation => ("failed_no_delegation", Some(no_delegation_reason)),
+            RunStatus::FailedTransport(reason) => ("failed_transport", Some(reason.as_str())),
         };
         if let Err(e) = self
             .team_db
@@ -706,9 +742,17 @@ impl TeamEngine {
         loop {
             // Step 2: Execute -- run each specialist
             self.transition_phase(TeamPhase::Execute);
-            let suspended = self.execute_tasks().await?;
-            if suspended {
-                return Ok(()); // Team run suspended, will resume via invoke_orchestrator
+            match self.execute_tasks().await? {
+                ExecuteOutcome::Suspended => {
+                    return Ok(()); // Team run suspended, will resume via invoke_orchestrator
+                }
+                ExecuteOutcome::AllTransportFailed => {
+                    // mika#1671: status already set to FailedTransport inside
+                    // execute_tasks. Skip review/deliver; `execute()` sees the
+                    // non-Running status and finalizes without overriding it.
+                    return Ok(());
+                }
+                ExecuteOutcome::Proceed => {}
             }
 
             // Step 3: Review -- critic evaluates outputs
@@ -1062,7 +1106,7 @@ impl TeamEngine {
     /// Uses `tokio::task::JoinSet` to run all specialist agents in parallel.
     /// Each agent has its own AsyncDatabase and the workspace is shared via
     /// the filesystem, so there are no shared mutable state concerns.
-    async fn execute_tasks(&mut self) -> Result<bool> {
+    async fn execute_tasks(&mut self) -> Result<ExecuteOutcome> {
         // Prepare shared resources that will be moved into spawned tasks.
         let agents = Arc::clone(&self.agents);
         let tool_registry = Arc::clone(&self.tool_registry);
@@ -1245,7 +1289,7 @@ impl TeamEngine {
                         format!("agent '{}' not found in team resources", agent_name)
                     });
 
-                    let result: Result<String> = match resources {
+                    let result: Result<(String, DelegationOutcome)> = match resources {
                         Ok(resources) => {
                             let session_id = format!("team-{}-{}", run_id, agent_name);
                             // Create per-agent session before running (idempotent for resumed runs)
@@ -1295,16 +1339,20 @@ impl TeamEngine {
                                 // events correlate with the parent team run.
                                 trace_id: Some(trace_id.clone()),
                             };
-                            crate::agent::run_team_agent(&params)
-                                .await
-                                .map(|outcome| outcome.into_text())
+                            crate::agent::run_team_agent(&params).await.map(|o| {
+                                // mika#1671: preserve the delegation classification
+                                // alongside the text so the collection loop can
+                                // evaluate the all-transport-failed short-circuit.
+                                let outcome = o.delegation_outcome();
+                                (o.into_text(), outcome)
+                            })
                         }
                         Err(e) => Err(e),
                     };
 
                     // Persist and report completion/failure for this agent.
                     match &result {
-                        Ok(response) => {
+                        Ok((response, _outcome)) => {
                             info!(agent = %agent_name, "task completed");
                             if let Some(ref cb) = callback {
                                 cb(TeamEvent::AgentCompleted {
@@ -1384,6 +1432,10 @@ impl TeamEngine {
         // user knows the run is still alive.
         let mut completed_count = 0usize;
         let total_count = self.run.tasks.len();
+        // mika#1671: per-task delegation classification, indexed by task index.
+        // Left `None` for tasks that never join cleanly (JoinError) — an unclassified
+        // slot cannot satisfy the all-transport-failed short-circuit.
+        let mut delegation_outcomes: Vec<Option<DelegationOutcome>> = vec![None; total_count];
         let start = tokio::time::Instant::now();
         let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
         heartbeat.tick().await; // skip the immediate first tick
@@ -1395,10 +1447,16 @@ impl TeamEngine {
                     match join_result {
                         Ok((index, agent_name, result)) => {
                             match result {
-                                Ok(_) => {
+                                Ok((_, outcome)) => {
                                     self.run.tasks[index].status = TaskStatus::Completed;
+                                    delegation_outcomes[index] = Some(outcome);
                                 }
                                 Err(e) => {
+                                    // A hard agent-loop error — classify its string so a
+                                    // transport-shaped failure still counts toward the
+                                    // short-circuit while other failures do not (D2/AC4).
+                                    delegation_outcomes[index] =
+                                        Some(classify_delegation_from_error(&e.to_string()));
                                     self.run.tasks[index].status =
                                         TaskStatus::Failed(e.to_string());
                                 }
@@ -1441,6 +1499,65 @@ impl TeamEngine {
             }
         }
 
+        // mika#1671 (AC3/AC5): if every completed delegation in this iteration failed
+        // at the transport layer, short-circuit to a terminal FailedTransport state
+        // rather than blocking to the full team-run timeout. Evaluated BEFORE the
+        // grandchild suspend check (D3 ordering caveat): a fully transport-failed
+        // iteration has no useful grandchildren to wait on, so fail fast wins over
+        // suspend. A mixed iteration (some transport, some business-completed) does
+        // NOT qualify (AC4) — `all_delegations_transport_failed` requires every slot
+        // to be a classified TransportError.
+        if all_delegations_transport_failed(&delegation_outcomes) {
+            let reason = "all-delegations-transport-failed".to_string();
+            warn!(
+                run_id = %self.run.run_id,
+                task_count = delegation_outcomes.len(),
+                iteration = self.run.iteration,
+                "all delegations transport-failed — short-circuiting team run (mika#1671)"
+            );
+            self.run.status = RunStatus::FailedTransport(reason.clone());
+            self.emit_event(TeamEvent::RunFailed(format!(
+                "All {} delegation(s) failed at the transport layer — short-circuited without review/deliver.",
+                delegation_outcomes.len()
+            )));
+
+            // Persist an error entry to the workspace for observability, mirroring the
+            // generic-failure path in `execute()`.
+            if let Some(goal_id) = self.goal_msg_id
+                && let Err(e) = self
+                    .team_db
+                    .insert_team_workspace_entry(
+                        &self.run.run_id,
+                        Some(goal_id),
+                        None,
+                        "error",
+                        &reason,
+                        self.run.iteration,
+                        Some(&self.trace_id),
+                    )
+                    .await
+            {
+                warn!(error = %e, "failed to persist transport-failure workspace entry");
+            }
+
+            // Cancel the parent invoke_orchestrator task so the async resume path does
+            // not later fire via sibling-completion detection (mirrors the not-suspended
+            // path below).
+            if let Err(e) = self
+                .team_db
+                .update_task_status(&parent_task_id, "cancelled")
+                .await
+            {
+                warn!(
+                    parent_task_id = %parent_task_id,
+                    error = %e,
+                    "failed to cancel parent task on transport-fail short-circuit"
+                );
+            }
+
+            return Ok(ExecuteOutcome::AllTransportFailed);
+        }
+
         // Phase 4.4: Check for pending grandchild callback tasks (long_running tools).
         // If any exist, the team run should suspend and wait for them to complete.
         let pending_grandchildren = self
@@ -1469,7 +1586,7 @@ impl TeamEngine {
             self.emit_event(TeamEvent::Progress(format!(
                 "Team run suspended — waiting for {pending_grandchildren} background task(s)"
             )));
-            return Ok(true); // suspended
+            return Ok(ExecuteOutcome::Suspended);
         }
 
         // Not suspending — cancel the parent invoke_orchestrator task to prevent it
@@ -1492,7 +1609,7 @@ impl TeamEngine {
             );
         }
 
-        Ok(false) // not suspended
+        Ok(ExecuteOutcome::Proceed)
     }
 
     /// Ask the critic agent to review the outputs.
@@ -1583,7 +1700,7 @@ impl TeamEngine {
             .await?;
 
         let response = match outcome {
-            TeamAgentOutcome::Done(text) => text.unwrap_or_default(),
+            TeamAgentOutcome::Done { text, .. } => text.unwrap_or_default(),
             TeamAgentOutcome::TimedOut(reason) => {
                 warn!(
                     target: "mika::otel",
@@ -2224,6 +2341,57 @@ mod tests {
             ],
             flow: TeamFlow { max_iterations: 3 },
         }
+    }
+
+    // =======================================================================
+    // mika#1671 (AC3/AC4) — all-transport-failed short-circuit predicate
+    //
+    // `all_delegations_transport_failed` is the gate that decides whether the
+    // iteration short-circuits to `RunStatus::FailedTransport`. AC3: fires when
+    // every completed delegation is a classified TransportError. AC4 invariant:
+    // a mixed iteration (any non-transport or unclassified slot) does NOT fire.
+    // =======================================================================
+
+    fn transport() -> Option<DelegationOutcome> {
+        Some(DelegationOutcome::TransportError {
+            reason: "503".to_string(),
+            retryable: true,
+        })
+    }
+
+    #[test]
+    fn all_transport_failed_fires_when_every_slot_is_transport() {
+        // AC3/AC5 replay shape: every member emitted 503 → all-transport → true.
+        let outcomes = vec![transport(), transport(), transport()];
+        assert!(all_delegations_transport_failed(&outcomes));
+    }
+
+    #[test]
+    fn all_transport_failed_false_on_mixed_iteration() {
+        // AC4 invariant: one transport-failed + one business-completed → false.
+        let outcomes = vec![transport(), Some(DelegationOutcome::Completed)];
+        assert!(!all_delegations_transport_failed(&outcomes));
+    }
+
+    #[test]
+    fn all_transport_failed_false_with_business_logic_failure() {
+        // A hard non-transport failure alongside a transport one is still mixed.
+        let outcomes = vec![transport(), Some(DelegationOutcome::BusinessLogicFailure)];
+        assert!(!all_delegations_transport_failed(&outcomes));
+    }
+
+    #[test]
+    fn all_transport_failed_false_on_unclassified_slot() {
+        // A `None` slot (task panicked into a JoinError, never classified) cannot
+        // satisfy the short-circuit — fail-safe toward the normal review/deliver flow.
+        let outcomes = vec![transport(), None];
+        assert!(!all_delegations_transport_failed(&outcomes));
+    }
+
+    #[test]
+    fn all_transport_failed_false_on_empty_iteration() {
+        // An empty iteration is not "all transport failed" — nothing to short-circuit.
+        assert!(!all_delegations_transport_failed(&[]));
     }
 
     #[test]

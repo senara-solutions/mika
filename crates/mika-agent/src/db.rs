@@ -27,7 +27,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 48;
+pub const CURRENT_SCHEMA_VERSION: i64 = 49;
 
 /// `(target_key, before_value, after_value, reasoning)` — return shape for
 /// [`Database::get_audit_event_rows_by_tool_name`] and its async wrapper.
@@ -1126,6 +1126,11 @@ impl Database {
             info!(version = 48, "database migrated to v48");
         }
 
+        if (3..=48).contains(&version) {
+            self.migrate_v48_to_v49()?;
+            info!(version = 49, "database migrated to v49");
+        }
+
         Ok(())
     }
 
@@ -1180,7 +1185,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (48);
+            INSERT INTO schema_version (version) VALUES (49);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -1222,7 +1227,7 @@ impl Database {
                 team_id TEXT NOT NULL REFERENCES teams(id),
                 goal TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'running'
-                    CHECK (status IN ('running','completed','failed','cancelled','suspended','failed_no_delegation')),
+                    CHECK (status IN ('running','completed','failed','cancelled','suspended','failed_no_delegation','failed_transport')),
                 failure_reason TEXT,
                 iteration INTEGER NOT NULL DEFAULT 1,
                 max_iterations INTEGER NOT NULL DEFAULT 3,
@@ -4527,6 +4532,104 @@ impl Database {
         tx.commit()?;
 
         info!("v43→v44: added permission_decisions provenance table (mika#1733 AC4)");
+
+        Ok(())
+    }
+
+    /// v48→v49: expand the `team_runs.status` CHECK constraint to include
+    /// `'failed_transport'` (mika#1671 D3). Composes on top of v46→v47's
+    /// `'failed_no_delegation'` addition (mika#1676) — both terminal states
+    /// cover different failure classes (all-transport-failed short-circuit vs
+    /// zero-delegation gate) and coexist in the CHECK; the D3 architect pin
+    /// explicitly says they're orthogonal.
+    ///
+    /// SQLite cannot alter a CHECK in place, so this is a table rebuild.
+    /// `team_runs` is FK-referenced by `tasks.team_run_id`, so the rebuild uses
+    /// the **build-new-then-swap** shape (CREATE `team_runs_new` →
+    /// INSERT SELECT → DROP `team_runs` → RENAME `team_runs_new` → `team_runs`),
+    /// NOT the rename-to-backup shape used by v34→v35. Renaming the *referenced*
+    /// table first would make SQLite (with the default `legacy_alter_table = OFF`)
+    /// rewrite `tasks.team_run_id`'s FK target to the backup name, leaving a
+    /// dangling reference after the backup is dropped (caught by
+    /// `test_v1_and_incremental_schemas_converge`). Renaming the *new* table into
+    /// place instead leaves `tasks`'s existing `team_runs` reference untouched.
+    /// Symmetric to v46→v47's shape. `foreign_keys` is toggled OFF around the
+    /// rebuild so the DROP/RENAME does not trip FK enforcement. Carries forward
+    /// the v46→v47 columns (`delegation_count`, `solo_absorption`,
+    /// `failure_context`) untouched. Row count is preserved.
+    fn migrate_v48_to_v49(&mut self) -> Result<()> {
+        let version = self.schema_version()?;
+        if version >= 49 {
+            return Ok(());
+        }
+
+        let count_before: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM team_runs", [], |r| r.get(0))
+            .unwrap_or(0);
+
+        // PRAGMA foreign_keys is a no-op inside a transaction, so it is set on
+        // the connection before BEGIN and restored after COMMIT.
+        self.conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            "CREATE TABLE team_runs_new (
+                 id TEXT PRIMARY KEY,
+                 team_id TEXT NOT NULL REFERENCES teams(id),
+                 goal TEXT NOT NULL,
+                 status TEXT NOT NULL DEFAULT 'running'
+                     CHECK (status IN (
+                         'running','completed','failed','cancelled','suspended',
+                         'failed_no_delegation','failed_transport'
+                     )),
+                 failure_reason TEXT,
+                 iteration INTEGER NOT NULL DEFAULT 1,
+                 max_iterations INTEGER NOT NULL DEFAULT 3,
+                 deliverable TEXT,
+                 checkpoint TEXT,
+                 trace_id TEXT,
+                 started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                 ended_at TEXT,
+                 delegation_count INTEGER NOT NULL DEFAULT 0,
+                 solo_absorption INTEGER NOT NULL DEFAULT 0,
+                 failure_context TEXT
+             );
+
+             INSERT INTO team_runs_new
+                 (id, team_id, goal, status, failure_reason,
+                  iteration, max_iterations, deliverable, checkpoint,
+                  trace_id, started_at, ended_at,
+                  delegation_count, solo_absorption, failure_context)
+             SELECT id, team_id, goal, status, failure_reason,
+                    iteration, max_iterations, deliverable, checkpoint,
+                    trace_id, started_at, ended_at,
+                    delegation_count, solo_absorption, failure_context
+             FROM team_runs;
+
+             DROP TABLE team_runs;
+
+             ALTER TABLE team_runs_new RENAME TO team_runs;
+
+             CREATE INDEX idx_team_runs_team ON team_runs(team_id, started_at DESC);",
+        )?;
+        tx.execute("INSERT INTO schema_version (version) VALUES (49)", [])?;
+        tx.commit()?;
+
+        self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+
+        let count_after: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM team_runs", [], |r| r.get(0))
+            .unwrap_or(0);
+
+        info!(
+            count_before = count_before,
+            count_after = count_after,
+            "v48→v49: expanded team_runs.status CHECK to include 'failed_transport' (mika#1671)"
+        );
 
         Ok(())
     }
@@ -16037,6 +16140,49 @@ mod tests {
     }
 
     #[test]
+    fn test_team_run_failed_transport_round_trips() {
+        // mika#1671 (AC3/AC5): the all-transport-failed short-circuit persists the
+        // team_run as `failed_transport`. This proves the v49 CHECK constraint accepts
+        // the new status (composed with the v46→v47 `failed_no_delegation` addition)
+        // and the read path round-trips it (the terminal state that AC5 asserts the
+        // run reaches without entering review/deliver).
+        let db = db();
+        db.insert_team_run(
+            "run-transport-1",
+            "transport-team",
+            "odds engine goal",
+            3,
+            "2020-01-01T00:00:00Z",
+            None,
+        )
+        .unwrap();
+
+        db.update_team_run(
+            "run-transport-1",
+            "failed_transport",
+            Some("all-delegations-transport-failed"),
+            1,
+            None,
+            Some("2020-01-01T00:00:05Z"),
+            0,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let row = db.load_team_run_by_id("run-transport-1").unwrap().unwrap();
+        assert_eq!(row.status, "failed_transport");
+        assert_eq!(
+            row.failure_reason.as_deref(),
+            Some("all-delegations-transport-failed")
+        );
+
+        // A failed_transport run is finished (terminal), not suspended/running.
+        let finished = db.get_last_finished_team_run("transport-team").unwrap();
+        assert_eq!(finished.unwrap().id, "run-transport-1");
+    }
+
+    #[test]
     fn test_get_team_run_summary_basic() {
         let db = db();
         let run_id = "run-summary-1";
@@ -17821,6 +17967,7 @@ mod tests {
         db2.migrate_v45_to_v46().unwrap();
         db2.migrate_v46_to_v47().unwrap();
         db2.migrate_v47_to_v48().unwrap();
+        db2.migrate_v48_to_v49().unwrap();
 
         let final_version: i64 = db2
             .conn
