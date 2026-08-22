@@ -635,6 +635,49 @@ mod tests {
     }
 
     #[test]
+    fn compose_end_to_end_mix_closed_open_blocked_locks_avancement() {
+        // mika#1933 AC2 lock-in: verify Reader denominator matches
+        // GitHub's `open_issues + closed_issues` (avancement, not
+        // reste-à-faire). Mix: 1 closed + 3 open (of which 1 in-flight,
+        // 1 unstarted, 1 blocked-by-open-sibling) → 4 total sub-issues.
+        // Note: blocked sub-issues are still `state=OPEN` — the "blocked"
+        // classification is layered on top of open state via the blockers
+        // list; it is not a distinct GitHub issue state.
+        let milestone_json = r#"{"title": "RT-005", "description": "planning tokens", "state": "open", "created_at": "2026-08-17T00:00:00Z", "due_on": null}"#;
+        let issues_json = r#"[
+            {"number": 1889, "title": "RT-005 brick 4", "state": "CLOSED", "body": "> - **Plan:** docs/plans/rt5-b4.md", "labels": [{"name":"p3-nice-to-have"}], "updatedAt": "2026-08-20T00:00:00Z"},
+            {"number": 1888, "title": "RT-005 brick 5", "state": "OPEN", "body": "> - **Plan:** docs/plans/rt5-b5.md", "labels": [{"name":"p3-nice-to-have"}], "updatedAt": "2026-08-19T00:00:00Z"},
+            {"number": 1887, "title": "RT-005 brick 1", "state": "OPEN", "body": "no plan yet", "labels": [{"name":"p3-nice-to-have"}], "updatedAt": "2026-08-18T00:00:00Z"},
+            {"number": 1890, "title": "RT-005 brick 6 (blocked)", "state": "OPEN", "body": "Blocked by #1888", "labels": [], "updatedAt": "2026-08-17T00:00:00Z"}
+        ]"#;
+        let pr_json = r#"[
+            {"number": 1929, "state": "MERGED", "closingIssuesReferences": [{"number": 1889}], "statusCheckRollup": []}
+        ]"#;
+        let r = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 31,
+        };
+        let state = compose_from_gh_outputs(&r, milestone_json, issues_json, pr_json).unwrap();
+        // Denominator is the full sub-issue count (closed + open), not open-only.
+        assert_eq!(state.sub_issues.len(), 4);
+        assert_eq!(state.progress.total, 4);
+        assert_eq!(state.progress.completed, 1); // #1889 closed
+        assert_eq!(state.progress.blocked, 1); // #1890 blocker
+        assert_eq!(state.progress.in_flight, 1); // #1888 has plan
+        assert_eq!(state.progress.unstarted, 1); // #1887 no plan
+        // The closed sub-issue is enumerated with the correct state and PR linkage
+        // (the composer's `closingIssuesReferences` reverse index must populate
+        // `pr_number` for closed sub-issues too, not just open ones).
+        let closed = state
+            .sub_issues
+            .iter()
+            .find(|s| s.number == 1889)
+            .expect("closed sub-issue present in enumeration");
+        assert_eq!(closed.state, IssueState::Closed);
+        assert_eq!(closed.pr_number, Some(1929));
+    }
+
+    #[test]
     fn compute_progress_all_completed() {
         let subs = vec![SubIssue {
             number: 1,
@@ -653,5 +696,168 @@ mod tests {
         let p = compute_progress(&subs);
         assert_eq!(p.completed, 1);
         assert_eq!(p.total, 1);
+    }
+}
+
+/// Injection-verified arg-capture guards (mika#1933 AC6, plan § S4).
+///
+/// **What this guards:** the `gh` invocation contract in `Reader::read_with_runner`.
+/// The AC1/AC2 lock-in (closed sub-issues included in the denominator) depends
+/// on TWO adjacent-pair arg tokens on the `issue list` call — `"--state", "all"`
+/// and `"--limit", "100"` — plus the matching `"--state", "all"` on the `pr list`
+/// call. A regression that reverts either token (e.g. someone re-defaulting to
+/// `--state open`, which is the ticket body's original hypothesis and the pre-PR#1932
+/// state) would silently take the Reader back to reste-à-faire semantics.
+///
+/// **Why arg-capture, not subprocess spawn:** per plan § S4 F4 architect note —
+/// arg-capture guards the failure mode named in AC6 ("sed-inject bug that re-adds
+/// `--state open` → tests fail") without external dependency flakiness (network,
+/// `gh` availability, rate limits). Full subprocess spawn is a distinct integration
+/// concern out of scope for AC6.
+#[cfg(test)]
+mod gh_arg_capture_tests {
+    // Renamed from `injection_tests` (mika#1933 maintainability F1) — the new
+    // name telegraphs both mechanism (arg capture via injected `GhRunner`) and
+    // failure class (adjacent-pair arg-token drift), so future maintainers do
+    // not confuse it with dependency-injection or injection-attack testing.
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// A `GhRunner` that captures every argument vector into a shared vec
+    /// and returns pre-canned JSON responses based on the first two args.
+    ///
+    /// The composer only needs syntactically-valid JSON to run to completion —
+    /// the tests do not assert on composed state, only on the captured args.
+    ///
+    /// **Extension gap (mika#1933 maintainability F1 hoist):** the `impl GhRunner`
+    /// match arm routes by the FIRST arg (`api` / `issue` / `pr`) — matching the
+    /// three current `gh` call sites in `Reader::read_with_runner`. If a future
+    /// change adds a fourth `gh` invocation (e.g., `gh auth status`, per-issue
+    /// `gh issue view`), this recorder MUST be extended with a new match arm.
+    /// The wildcard arm returns `Err(...)` and `.expect(...)` in the tests
+    /// panics — the guard fails LOUD on an unmapped call. This docstring lives
+    /// on the struct itself (not inside the match wildcard) so it surfaces at
+    /// the most likely edit surface for the maintainer wiring the new call.
+    struct RecordingGhRunner {
+        calls: Arc<Mutex<Vec<Vec<String>>>>,
+        milestone_json: String,
+        issues_json: String,
+        pr_json: String,
+    }
+
+    #[async_trait::async_trait]
+    impl GhRunner for RecordingGhRunner {
+        async fn run(&self, args: &[&str]) -> Result<String> {
+            let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            self.calls.lock().unwrap().push(owned.clone());
+            // Route by the first arg — matches the three call sites in
+            // `Reader::read_with_runner`.
+            match owned.first().map(String::as_str) {
+                Some("api") => Ok(self.milestone_json.clone()),
+                Some("issue") => Ok(self.issues_json.clone()),
+                Some("pr") => Ok(self.pr_json.clone()),
+                // NOTE: extending `Reader::read_with_runner` with a fourth `gh`
+                // call (e.g., `gh auth status`, per-issue `gh issue view`) also
+                // requires extending this match — the guard covers only the
+                // three current call sites' arg contracts (mika#1933 testing F1).
+                _ => Err(anyhow!(
+                    "RecordingGhRunner: unexpected first arg in {:?}",
+                    owned
+                )),
+            }
+        }
+    }
+
+    fn build_recorder() -> (Arc<Mutex<Vec<Vec<String>>>>, RecordingGhRunner) {
+        let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let runner = RecordingGhRunner {
+            calls: Arc::clone(&calls),
+            // Minimal well-shaped JSON — composer runs to completion without
+            // meaningful state, which is fine because these tests assert only
+            // on the captured argument vectors.
+            milestone_json: r#"{"title": "T", "description": "", "state": "open", "created_at": "2026-08-01T00:00:00Z", "due_on": null}"#.into(),
+            issues_json: "[]".into(),
+            pr_json: "[]".into(),
+        };
+        (calls, runner)
+    }
+
+    /// Assert `flag` appears exactly once in `call` AND is immediately followed
+    /// by `value`.
+    ///
+    /// The uniqueness check (mika#1933 adversarial F1) closes a false-pass
+    /// gap: a plain `windows(2)` scan would accept an arg vector with
+    /// `[..., "--state", "all", "--state", "open", ...]` because BOTH adjacent
+    /// pairs exist. Under most clap-derived CLIs (`gh` included), duplicate
+    /// flags silently take the LAST value, so the regression the AC6 guard
+    /// aims to catch — reverting to reste-à-faire semantics — could slip
+    /// through a duplicate-add mutation. Uniqueness + adjacency together
+    /// pin the flag to its intended single value.
+    fn assert_adjacent_pair(call: &[String], flag: &str, value: &str) {
+        let occurrences = call.iter().filter(|a| a.as_str() == flag).count();
+        assert_eq!(
+            occurrences, 1,
+            "expected exactly one occurrence of `{flag}` in call args, got {occurrences}: {:?}",
+            call
+        );
+        for pair in call.windows(2) {
+            if pair[0] == flag && pair[1] == value {
+                return;
+            }
+        }
+        panic!(
+            "expected adjacent pair (`{flag}`, `{value}`) in call args, got: {:?}",
+            call
+        );
+    }
+
+    #[tokio::test]
+    async fn reader_issue_list_uses_state_all_and_limit_100() {
+        let (calls, runner) = build_recorder();
+        let mref = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 31,
+        };
+        Reader::new(None)
+            .read_with_runner(&mref, &runner)
+            .await
+            .expect("read_with_runner should succeed on canned JSON");
+
+        let calls = calls.lock().unwrap();
+        let issue_call = calls
+            .iter()
+            .find(|c| c.first().map(String::as_str) == Some("issue"))
+            .expect("issue list call captured");
+        // Adjacent-pair assertions — a sed-inject that re-adds `--state open`
+        // or drops `--limit 100` would fail here.
+        assert_adjacent_pair(issue_call, "--state", "all");
+        assert_adjacent_pair(issue_call, "--limit", "100");
+        // Sanity: the milestone number is threaded through.
+        assert_adjacent_pair(issue_call, "--milestone", "31");
+    }
+
+    #[tokio::test]
+    async fn reader_pr_list_uses_state_all_and_limit_100() {
+        let (calls, runner) = build_recorder();
+        let mref = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 31,
+        };
+        Reader::new(None)
+            .read_with_runner(&mref, &runner)
+            .await
+            .expect("read_with_runner should succeed on canned JSON");
+
+        let calls = calls.lock().unwrap();
+        let pr_call = calls
+            .iter()
+            .find(|c| c.first().map(String::as_str) == Some("pr"))
+            .expect("pr list call captured");
+        // PR-list guards: closed/merged PRs contribute the `closingIssuesReferences`
+        // reverse index that powers the Reporter `Completed` section's PR links.
+        // Dropping `--state all` here would hide merged PRs → closed sub-issues
+        // would render `closed (no linked PR)` in every case.
+        assert_adjacent_pair(pr_call, "--state", "all");
+        assert_adjacent_pair(pr_call, "--limit", "100");
     }
 }
