@@ -27,7 +27,14 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 47;
+pub const CURRENT_SCHEMA_VERSION: i64 = 48;
+
+/// `(target_key, before_value, after_value, reasoning)` — return shape for
+/// [`Database::get_audit_event_rows_by_tool_name`] and its async wrapper.
+/// Test-only helper for mika#1712 integration tests; extracted to a type
+/// alias to satisfy `clippy::type_complexity`.
+#[doc(hidden)]
+pub type AuditEventRowTuple = (String, Option<String>, Option<String>, Option<String>);
 
 /// mika#1742 Problem B: refuse-to-zombie grace window for
 /// [`Database::create_recurring_task_if_absent`]. Recent same-label recurring
@@ -1114,6 +1121,11 @@ impl Database {
             info!(version = 47, "database migrated to v47");
         }
 
+        if (3..=47).contains(&version) {
+            self.migrate_v47_to_v48()?;
+            info!(version = 48, "database migrated to v48");
+        }
+
         Ok(())
     }
 
@@ -1168,7 +1180,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (47);
+            INSERT INTO schema_version (version) VALUES (48);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -4850,6 +4862,29 @@ impl Database {
         Ok(())
     }
 
+    /// v47→v48 (mika#1712): behavioral marker only — no DDL. Anchors the
+    /// phantom NULL-PID sweep semantics added in
+    /// [`super::task_engine::engine::TaskEngine::sweep_null_pid_phantoms`] so
+    /// operators reading the migration ledger can pinpoint the schema head at
+    /// which sweep telemetry began. Reserved for future DDL if write-time
+    /// enforcement (mika#1934 cause-racine) ever lands.
+    fn migrate_v47_to_v48(&mut self) -> Result<()> {
+        let version = self.schema_version()?;
+        if version >= 48 {
+            return Ok(());
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("INSERT INTO schema_version (version) VALUES (48)", [])?;
+        tx.commit()?;
+
+        info!("v47→v48: no DDL; behavioral marker for mika#1712 phantom sweep");
+
+        Ok(())
+    }
+
     /// Check if a column exists on a table within a transaction scope.
     fn column_exists_tx(tx: &rusqlite::Transaction<'_>, table: &str, column: &str) -> Result<bool> {
         let mut stmt = tx.prepare(&format!("PRAGMA table_info('{table}')"))?;
@@ -6674,6 +6709,154 @@ impl Database {
                     created_at: row.get(2)?,
                     callback_task_id: row.get(3)?,
                 })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Find phantom tracking rows: `action_type='none'`, `process_id IS NULL`,
+    /// `status IN ('in_progress','blocked')`, `updated_at` older than
+    /// `age_seconds` ago. These are the NULL-PID tracking-task orphans the
+    /// callback watchdog cannot see (its very first predicate is
+    /// `process_id IS NOT NULL`) and the orphaned-parent reaper does not
+    /// select (no `resume_agent` callback child). See mika#1712.
+    ///
+    /// **Scope narrower than the ticket's Problem statement (ADV-2, 2026-08-21).**
+    /// Plan §3 (Problem) lists `status IN ('in_progress','blocked','pending')` as
+    /// the observed leak class, and one of the two cited leaked samples
+    /// (`613a996d ... | pending`) is a `pending` phantom. The mika#1712 AC
+    /// narrows to `('in_progress','blocked')` only — `pending` is deferred to
+    /// the mika#1934 cause-racine investigation. Rationale: `pending` is the
+    /// default initial state of every tracking task from `create_task`, and
+    /// sweeping it at the 3600s grace would false-positive on any newly-created
+    /// tracking row the agent hasn't yet transitioned. `in_progress` and
+    /// `blocked` are the "started but abandoned" states where the phantom
+    /// signal is unambiguous. If mika#1934's telemetry shows `pending` phantoms
+    /// remain a meaningful leak class, the predicate can be widened there.
+    ///
+    /// `age_seconds = 0` matches every candidate row regardless of freshness.
+    /// The comparison uses `<=` (not `<`) so a row inserted in the same
+    /// second the WHERE clause evaluates is still selected — SQLite's
+    /// `strftime('%Y-%m-%dT%H:%M:%SZ', ...)` truncates to seconds, and a `<`
+    /// would silently miss same-second injections. `<=` is safe for the AC3
+    /// path too: the 3600s default grace has 1-second slack to spare, and a
+    /// row updated exactly at "now - grace" being caught 1s early is
+    /// behaviorally identical to being caught 1s later.
+    ///
+    /// SOLE READER — this query is the sole source of candidates for the
+    /// `phantom_aged_out` audit-event transition emitted by
+    /// [`super::task_engine::engine::TaskEngine::sweep_null_pid_phantoms`]
+    /// (AC3 watchdog) and the equivalent step inside
+    /// [`super::task_engine::engine::TaskEngine::startup_recovery`] (AC5).
+    pub fn find_phantom_tracking_tasks(
+        &self,
+        agent_id: &str,
+        age_seconds: i64,
+    ) -> Result<Vec<PhantomTrackingTask>> {
+        let age_modifier = format!("-{age_seconds} seconds");
+        let mut stmt = self.conn.prepare(
+            "SELECT id, agent_id, label, status, created_at, updated_at
+             FROM tasks
+             WHERE agent_id = ?1
+               AND action_type = 'none'
+               AND process_id IS NULL
+               AND status IN ('in_progress', 'blocked')
+               AND updated_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+             ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, age_modifier], |row| {
+                Ok(PhantomTrackingTask {
+                    id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    label: row.get(2)?,
+                    status: row.get(3)?,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Count `audit_events` rows for a given agent + tool_name — helper for
+    /// mika#1712 integration tests to assert the load-bearing delta on the
+    /// `phantom_aged_out` audit-write path. Keeping this query as a first-class
+    /// helper (not inline SQL in tests) means the load-bearing assertion has a
+    /// single source of truth that survives future audit_events schema changes.
+    #[doc(hidden)]
+    pub fn count_audit_events_by_tool_name(&self, agent_id: &str, tool_name: &str) -> Result<i64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM audit_events
+             WHERE agent_id = ?1 AND tool_name = ?2",
+            params![agent_id, tool_name],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// Test-only helper: backdate a task's `updated_at` by `seconds_ago`
+    /// seconds relative to now. Used by mika#1712 integration tests to inject
+    /// phantom-shape rows aged past the sweep grace window without waiting on
+    /// wall-clock time. Not intended for production use — timestamps are
+    /// otherwise engine-owned.
+    #[doc(hidden)]
+    pub fn backdate_task_updated_at(&self, task_id: &str, seconds_ago: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+             WHERE id = ?1",
+            params![task_id, format!("-{seconds_ago} seconds")],
+        )?;
+        Ok(())
+    }
+
+    /// Fetch the `target_key` values of `audit_events` rows for the scoped
+    /// agent + tool_name — helper for mika#1712 integration tests to make the
+    /// row-shape assertion (target_key must reference the injected task id).
+    #[doc(hidden)]
+    pub fn get_audit_event_target_keys_by_tool_name(
+        &self,
+        agent_id: &str,
+        tool_name: &str,
+    ) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT target_key FROM audit_events
+             WHERE agent_id = ?1 AND tool_name = ?2
+             ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, tool_name], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Fetch `(target_key, before_value, after_value, reasoning)` tuples of
+    /// `audit_events` rows for the scoped agent + tool_name — helper for
+    /// mika#1712 integration tests to make the full-row-shape assertion
+    /// (T-1/T-2, 2026-08-21). Complements
+    /// [`Self::get_audit_event_target_keys_by_tool_name`]. Return type is a
+    /// tuple to keep the helper zero-abstraction; a caller-side struct is
+    /// unnecessary for the assertion pattern.
+    #[doc(hidden)]
+    pub fn get_audit_event_rows_by_tool_name(
+        &self,
+        agent_id: &str,
+        tool_name: &str,
+    ) -> Result<Vec<AuditEventRowTuple>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT target_key, before_value, after_value, reasoning
+             FROM audit_events
+             WHERE agent_id = ?1 AND tool_name = ?2
+             ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, tool_name], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
@@ -13821,6 +14004,190 @@ mod tests {
         );
     }
 
+    // -- find_phantom_tracking_tasks tests (mika#1712) --
+
+    /// Insert a phantom-shape tracking row (`action_type='none'`,
+    /// `process_id IS NULL`, `status='in_progress'` by default) with
+    /// `updated_at` aged `age_secs` into the past. Returns the row id.
+    fn create_phantom_tracking_row(
+        db: &Database,
+        agent_id: &str,
+        label: &str,
+        status: &str,
+        age_secs: i64,
+    ) -> String {
+        let task = new_task(agent_id, label, "manual", "none");
+        let id = db.create_task(&task).unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = ?2,
+                 process_id = NULL,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?3)
+                 WHERE id = ?1",
+                params![id, status, format!("-{age_secs} seconds")],
+            )
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn test_find_phantom_tracking_tasks_matching_row_returned() {
+        let db = db();
+        let id = create_phantom_tracking_row(&db, "mika", "track mika#1583", "in_progress", 3700);
+
+        let phantoms = db.find_phantom_tracking_tasks("mika", 3600).unwrap();
+        assert_eq!(phantoms.len(), 1);
+        assert_eq!(phantoms[0].id, id);
+        assert_eq!(phantoms[0].agent_id, "mika");
+        assert_eq!(phantoms[0].status, "in_progress");
+        assert_eq!(phantoms[0].label, "track mika#1583");
+    }
+
+    #[test]
+    fn test_find_phantom_tracking_tasks_blocked_status_returned() {
+        let db = db();
+        create_phantom_tracking_row(&db, "mika", "blocked track", "blocked", 3700);
+
+        let phantoms = db.find_phantom_tracking_tasks("mika", 3600).unwrap();
+        assert_eq!(phantoms.len(), 1);
+        assert_eq!(phantoms[0].status, "blocked");
+    }
+
+    #[test]
+    fn test_find_phantom_tracking_tasks_mismatched_action_type_excluded() {
+        let db = db();
+        // action_type='send_message' should NOT match the phantom shape
+        let task = new_task("mika", "reminder", "manual", "send_message");
+        let id = db.create_task(&task).unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'in_progress',
+                 process_id = NULL,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-3700 seconds')
+                 WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+
+        let phantoms = db.find_phantom_tracking_tasks("mika", 3600).unwrap();
+        assert!(
+            phantoms.is_empty(),
+            "action_type != 'none' should be excluded"
+        );
+    }
+
+    #[test]
+    fn test_find_phantom_tracking_tasks_non_null_process_id_excluded() {
+        let db = db();
+        let id = create_phantom_tracking_row(&db, "mika", "live track", "in_progress", 3700);
+        db.conn
+            .execute(
+                "UPDATE tasks SET process_id = 12345 WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+
+        let phantoms = db.find_phantom_tracking_tasks("mika", 3600).unwrap();
+        assert!(
+            phantoms.is_empty(),
+            "non-NULL process_id should be excluded (watchdog owns that path)"
+        );
+    }
+
+    #[test]
+    fn test_find_phantom_tracking_tasks_terminal_status_excluded() {
+        let db = db();
+        let id = create_phantom_tracking_row(&db, "mika", "done track", "in_progress", 3700);
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'completed' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+
+        let phantoms = db.find_phantom_tracking_tasks("mika", 3600).unwrap();
+        assert!(
+            phantoms.is_empty(),
+            "terminal-status rows should be excluded"
+        );
+    }
+
+    /// T-5 (2026-08-21): defensively verify every non-`in_progress`/`blocked`
+    /// status is excluded by the SQL predicate. Guards against a
+    /// well-meaning refactor that changes `IN ('in_progress','blocked')` to
+    /// `NOT IN (terminal_statuses)` — which would sweep `pending` rows (out
+    /// of scope per plan §7 D1 + ADV-2 deferral to mika#1934) and any other
+    /// non-terminal status the schema ever adds.
+    #[test]
+    fn test_find_phantom_tracking_tasks_all_non_matching_statuses_excluded() {
+        // pending: newly-created tracking row awaiting agent transition — must NOT be swept.
+        // failed/cancelled/expired: already terminal — no-op even if matched.
+        // delivered: callback-lifecycle status — inapplicable, must not be selected.
+        for status in ["pending", "failed", "cancelled", "expired", "delivered"] {
+            let db = db();
+            create_phantom_tracking_row(&db, "mika", "shape check", status, 7200);
+            let phantoms = db.find_phantom_tracking_tasks("mika", 3600).unwrap();
+            assert!(
+                phantoms.is_empty(),
+                "status '{status}' must be excluded from the sweep predicate — \
+                 SQL is `status IN ('in_progress', 'blocked')` per mika#1712 AC3"
+            );
+        }
+    }
+
+    #[test]
+    fn test_find_phantom_tracking_tasks_age_guard_fresh_row_not_swept() {
+        let db = db();
+        // updated_at = now (age 0); grace = 60s -> should NOT match
+        create_phantom_tracking_row(&db, "mika", "fresh", "in_progress", 0);
+
+        let phantoms = db.find_phantom_tracking_tasks("mika", 60).unwrap();
+        assert!(
+            phantoms.is_empty(),
+            "row within grace window should not be selected"
+        );
+    }
+
+    #[test]
+    fn test_find_phantom_tracking_tasks_age_guard_aged_row_swept() {
+        let db = db();
+        // Row aged 3700s (past 3600s grace) -> should match
+        create_phantom_tracking_row(&db, "mika", "aged", "in_progress", 3700);
+
+        let phantoms = db.find_phantom_tracking_tasks("mika", 3600).unwrap();
+        assert_eq!(phantoms.len(), 1);
+    }
+
+    #[test]
+    fn test_find_phantom_tracking_tasks_age_zero_selects_any_age() {
+        let db = db();
+        // Fresh row (age 0) MUST be selected when age_seconds=0 (AC5 startup)
+        create_phantom_tracking_row(&db, "mika", "fresh", "in_progress", 0);
+        // Aged row also selected
+        create_phantom_tracking_row(&db, "mika", "aged", "blocked", 7200);
+
+        let phantoms = db.find_phantom_tracking_tasks("mika", 0).unwrap();
+        assert_eq!(
+            phantoms.len(),
+            2,
+            "age_seconds=0 (AC5 startup sweep) must select all matching rows"
+        );
+    }
+
+    #[test]
+    fn test_find_phantom_tracking_tasks_excludes_other_agents() {
+        let db = db();
+        db.register_agent("agent_a", "Agent A", "/tmp/a").unwrap();
+        db.register_agent("agent_b", "Agent B", "/tmp/b").unwrap();
+
+        create_phantom_tracking_row(&db, "agent_a", "a-only", "in_progress", 3700);
+
+        let a_phantoms = db.find_phantom_tracking_tasks("agent_a", 3600).unwrap();
+        assert_eq!(a_phantoms.len(), 1);
+        let b_phantoms = db.find_phantom_tracking_tasks("agent_b", 3600).unwrap();
+        assert!(b_phantoms.is_empty());
+    }
+
     // -- find_childless_stuck_parent_tasks tests (mika#1687) --
 
     /// Create a childless self_dev **issue** parent left `in_progress`, with
@@ -17453,6 +17820,7 @@ mod tests {
         db2.migrate_v44_to_v45().unwrap();
         db2.migrate_v45_to_v46().unwrap();
         db2.migrate_v46_to_v47().unwrap();
+        db2.migrate_v47_to_v48().unwrap();
 
         let final_version: i64 = db2
             .conn
@@ -20618,9 +20986,10 @@ mod tests {
     /// Build a fresh in-memory DB, rewind schema_version to 46, and
     /// clean-slate-DDL-drop the delegation columns so `migrate_v46_to_v47`
     /// exercises the real ALTER path. `db()` runs the full migration chain
-    /// (up to `CURRENT_SCHEMA_VERSION` = 47), so we then rebuild `team_runs`
-    /// with the pre-v47 shape (without the three new columns and without the
-    /// expanded CHECK constraint) to reproduce a v46 database exactly.
+    /// (up to `CURRENT_SCHEMA_VERSION` = 48 after the mika#1712 v47→v48
+    /// behavioral-marker re-slot), so we then rebuild `team_runs` with the
+    /// pre-v47 shape (without the three new columns and without the expanded
+    /// CHECK constraint) to reproduce a v46 database exactly.
     fn db_at_v46() -> Database {
         let db = db();
         db.conn

@@ -85,6 +85,20 @@ pub struct OrphanedParentTask {
     pub created_at: String,
 }
 
+/// A phantom tracking task row: `action_type='none'`, `process_id IS NULL`,
+/// `status IN ('in_progress','blocked')`, aged past the sweep grace window.
+/// Used by the NULL-PID phantom sweep (mika#1712) in both AC3 (watchdog tick)
+/// and AC5 (startup sweep) paths.
+#[derive(Debug, Clone)]
+pub struct PhantomTrackingTask {
+    pub id: String,
+    pub agent_id: String,
+    pub label: String,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// A parent self_dev task left `in_progress` after its callback subtask
 /// delivered WITH a `pr_url` (success indicator). Used by the success-side
 /// engine backstop (mika#1162) — sibling shape to `OrphanedParentTask`.
