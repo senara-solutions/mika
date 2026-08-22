@@ -32,6 +32,13 @@ pub struct ManagerConfig {
     pub github_token: Option<String>,
     /// Heartbeat interval — cycle always delivers if `now - last_delivery >= interval`.
     pub heartbeat_interval: chrono::Duration,
+    /// How often the cadence loop wakes up to check for state changes and
+    /// heartbeat expiry. Should be shorter than `heartbeat_interval` so
+    /// event-driven cycles fire promptly; the cycle itself is a no-op when
+    /// neither `state_changed` nor `heartbeat_fired` is true. Used only by
+    /// the spawn loop in `spawn.rs`; unit tests of `run_manager_cycle_with`
+    /// do not consult this field.
+    pub poll_interval: chrono::Duration,
     pub silence_threshold_days: u32,
     pub delivery_url: Option<String>,
     pub delivery_token: Option<String>,
@@ -481,6 +488,7 @@ mod tests {
             },
             github_token: None,
             heartbeat_interval: chrono::Duration::hours(6),
+            poll_interval: chrono::Duration::minutes(5),
             silence_threshold_days: 3,
             delivery_url: Some("http://normal/deliver".into()),
             delivery_token: Some("t".into()),
