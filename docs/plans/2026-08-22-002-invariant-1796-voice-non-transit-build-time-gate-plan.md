@@ -316,6 +316,32 @@ Ordered — each step is a hard gate:
 6. `cargo clippy --workspace --all-targets -- -D warnings` — no clippy regressions.
 7. `cargo fmt --check` — clean.
 
+## Definition of Done
+
+Every item observable via a command, file inspection, or CI job. All must be green before merge.
+
+- [ ] `crates/mika-gateway/src/voice/{mod,lane,provider,room,config}.rs` compile cleanly (`cargo build -p mika-gateway`).
+- [ ] `ConversationLane` / `TestimonyLane` markers + sealed `VoiceLane` trait + `VoiceRoom<L, S, T>` generic ship, with no conversion path between lanes.
+- [ ] `trybuild` compile-fail fixture in `crates/mika-gateway/tests/voice_lane_compile_fail/` produces expected trait-bound error when a cloud STT/TTS is wired into `TestimonyLane`.
+- [ ] `test_testimony_non_transit_invariant` (Rust integration test) passes and covers: type-level lane bounds, config validator loopback/LAN check, and — once #1787 lands — Python lint no-op-to-enforcing transition.
+- [ ] `mika/deny.toml [bans]` denies each named cloud STT/TTS crate identifier (elevenlabs, elevenlabs-rs, deepgram, deepgram-rs, azure-speech, google-speech, aws-sdk-transcribe, aws-sdk-polly). Escape entries in `[bans.allow]` (if any) name the extracted crate path per § Risks.
+- [ ] `cargo deny check bans` exits 0 on the branch.
+- [ ] `scripts/verify-voice-non-transit.sh` exists, is executable, mirrors `scripts/verify-egress-uniqueness.sh`, exits 0 as no-op when `skills/bundled/voice-livekit-agents/testimony/` is absent, and exits 1 on any banned import once the directory exists.
+- [ ] `voice-non-transit-lint` CI job is wired into `.github/workflows/ci.yml` next to `egress-uniqueness-lint` and runs on every PR.
+- [ ] `docs/voice-non-transit-invariant.md` exists and contains: Prime line quoted verbatim, three-gate enforcement layers with failure mode each catches, four-step recipe to add a new lane provider, three greppable audit commands, escape-hatch discipline, and cross-ref to runtime-egress companion ticket.
+- [ ] Companion ticket filed for runtime egress (`voice(p2.5-runtime): nftables egress deny for testimony ports`) and cited in `docs/voice-non-transit-invariant.md § Related`.
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo fmt --check` clean; `make verify-bundled-skills` clean.
+
+## Acceptance criteria
+
+Verbatim from `senara-solutions/mika#1796` issue body § Acceptance criteria:
+
+- [ ] AC1 — Compile fail si dev accidentellement wire cloud STT dans testimony lane
+- [ ] AC2 — Test suite : `test_testimony_non_transit_invariant` passe (vérifie types, config, egress)
+- [ ] AC3 — CI custom lint rule active
+- [ ] AC4 — Doc : `docs/voice-non-transit-invariant.md` explique la garantie et comment la maintenir
+- [ ] AC5 — Audit externe : n'importe qui peut vérifier en lisant le code que testimony ne sort pas
+
 ## Risks and open questions
 
 - **cargo-deny scope granularity.** cargo-deny does not natively scope bans to
