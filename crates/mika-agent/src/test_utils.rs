@@ -59,6 +59,7 @@ pub mod test_helpers {
             callback_task_id: None,
             required_tool_arg_suffixes: &[],
             tool_arg_suffix_rejected: &TOOL_ARG_SUFFIX_REJECTED,
+            tier: mika_common::home::AgentTier::Default,
             scope_task_id: None,
         }
     }
@@ -175,8 +176,31 @@ pub mod test_helpers {
                 callback_task_id: None,
                 required_tool_arg_suffixes: &[],
                 tool_arg_suffix_rejected: &TOOL_ARG_SUFFIX_REJECTED,
+                tier: mika_common::home::AgentTier::Default,
                 scope_task_id: None,
             }
+        }
+
+        /// Create a ToolContext for a specific agent tier (mika#1783).
+        /// Used by substrate-doctrine tests that need to exercise
+        /// tier-conditional handler behavior.
+        pub fn ctx_with_tier(&self, tier: mika_common::home::AgentTier) -> ToolContext<'_> {
+            let mut ctx = self.ctx();
+            ctx.tier = tier;
+            ctx
+        }
+
+        /// Create a ToolContext for a specific agent tier with a `brave_api_key`
+        /// slot (mika#1783). The key ref is scoped to the caller's lifetime.
+        pub fn ctx_with_tier_and_brave<'a>(
+            &'a self,
+            tier: mika_common::home::AgentTier,
+            brave_key: Option<&'a str>,
+        ) -> ToolContext<'a> {
+            let mut ctx = self.ctx();
+            ctx.tier = tier;
+            ctx.brave_api_key = brave_key;
+            ctx
         }
 
         /// Create a ToolContext with a custom home directory.
@@ -209,6 +233,7 @@ pub mod test_helpers {
                 callback_task_id: None,
                 required_tool_arg_suffixes: &[],
                 tool_arg_suffix_rejected: &TOOL_ARG_SUFFIX_REJECTED,
+                tier: mika_common::home::AgentTier::Default,
                 scope_task_id: None,
             }
         }
@@ -247,6 +272,7 @@ pub mod test_helpers {
                 callback_task_id: None,
                 required_tool_arg_suffixes: &[],
                 tool_arg_suffix_rejected: &TOOL_ARG_SUFFIX_REJECTED,
+                tier: mika_common::home::AgentTier::Default,
                 scope_task_id: None,
             }
         }

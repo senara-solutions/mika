@@ -3336,6 +3336,7 @@ async fn run_agent_inner(
         callback_task_id: None, // Conversation mode: not a callback turn
         required_tool_arg_suffixes: &required_tool_arg_suffixes,
         tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
+        tier: mika_common::home::AgentTier::from_env(),
         scope_task_id,
     };
 
@@ -4251,6 +4252,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         callback_task_id,
         required_tool_arg_suffixes: &required_tool_arg_suffixes_silent,
         tool_arg_suffix_rejected: &tool_arg_suffix_rejected_silent,
+        tier: mika_common::home::AgentTier::from_env(),
         scope_task_id: scope_task_id.as_deref(),
     };
 
@@ -4806,6 +4808,7 @@ async fn run_team_agent_inner_impl(
         callback_task_id: None,  // Team mode: not a callback turn
         required_tool_arg_suffixes: &required_tool_arg_suffixes_team,
         tool_arg_suffix_rejected: &tool_arg_suffix_rejected_team,
+        tier: mika_common::home::AgentTier::from_env(),
         scope_task_id: None, // Team mode: no task context for parallel narrative
     };
 
