@@ -75,6 +75,8 @@ pub fn is_read_tool(name: &str) -> bool {
             | "search_memory"
             | "list_skills"
             | "get_config"
+            // Runtime LLM identity introspection (mika#1815).
+            | "get_active_llm"
             | "read_agent_file"
             | "list_agent_files"
             | "list_agents"
@@ -268,6 +270,7 @@ mod tests {
             "search_memory",
             "list_skills",
             "get_config",
+            "get_active_llm",
             "read_agent_file",
             "list_agent_files",
             "list_agents",
