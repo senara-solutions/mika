@@ -3,32 +3,29 @@
 //! Asserts the three build-time gates the [`voice`](mika_gateway::voice)
 //! module ships:
 //!
-//! 1. **Type bounds** — `VoiceRoom<TestimonyLane, _, _>` requires local
-//!    providers. Negative proof lives in `tests/voice_lane_compile_fail/`
-//!    (a compile-fail fixture would corrupt this positive-path test file if
+//! 1. **Type bounds** — `VoiceRoom<TestimonyLane, _, _>` requires
+//!    `S: SttProvider<Lane = TestimonyLane>` + `T: TtsProvider<Lane = TestimonyLane>`.
+//!    Negative proof lives in `tests/voice_lane_compile_fail/` (a
+//!    compile-fail fixture would corrupt this positive-path test file if
 //!    inlined). Positive path is exercised here.
 //! 2. **Config validator** — testimony endpoints outside loopback / RFC1918
 //!    LAN are rejected at startup, fail-closed.
 //! 3. **Lane discriminant carries through the type** — `lane_name()` returns
 //!    the correct string for each ctor. External audit tools depend on it.
 //!
-//! The Python-side lint gate (`scripts/verify-voice-non-transit.sh`) is
-//! shell — not exercised here; its dedicated no-op-until-scaffold-lands
-//! semantics are exercised in the ci job and in the doctrine doc's audit
-//! recipe.
+//! Requires the `test-utils` feature (activates `voice::examples`).
+
+#![cfg(feature = "test-utils")]
 
 use mika_gateway::voice::{
-    CloudStt, CloudTts, ConversationLane, LocalStt, LocalTts, TestimonyLane, VoiceConfig,
-    VoiceConfigError, VoiceLane, VoiceRoom,
+    ConversationLane, SttProvider, TestimonyLane, TtsProvider, VoiceConfig, VoiceConfigError,
+    VoiceLane, VoiceRoom,
     examples::{DeepgramStt, ElevenLabsTts, PiperTts, WhisperCppStt},
 };
 
 #[test]
 fn test_testimony_non_transit_invariant() {
     // --- Gate 1: type bounds compose correctly on the positive path -----
-    // Unit-struct ctors: `TypeName` rather than `TypeName::default()` — the
-    // stubs are zero-sized markers and clippy's `default_constructed_unit_structs`
-    // lint rejects the latter.
     let testimony_room = VoiceRoom::testimony(WhisperCppStt, PiperTts);
     assert_eq!(testimony_room.lane_name(), TestimonyLane::NAME);
     assert_eq!(testimony_room.stt().provider_name(), "whisper-cpp");
@@ -38,6 +35,21 @@ fn test_testimony_non_transit_invariant() {
     assert_eq!(conversation_room.lane_name(), ConversationLane::NAME);
     assert_eq!(conversation_room.stt().provider_name(), "deepgram");
     assert_eq!(conversation_room.tts().provider_name(), "elevenlabs");
+
+    // Assert associated-type lane binding is what the stubs advertise.
+    assert_eq!(
+        <WhisperCppStt as SttProvider>::Lane::NAME,
+        TestimonyLane::NAME
+    );
+    assert_eq!(<PiperTts as TtsProvider>::Lane::NAME, TestimonyLane::NAME);
+    assert_eq!(
+        <DeepgramStt as SttProvider>::Lane::NAME,
+        ConversationLane::NAME
+    );
+    assert_eq!(
+        <ElevenLabsTts as TtsProvider>::Lane::NAME,
+        ConversationLane::NAME
+    );
 
     // --- Gate 2: config validator enforces loopback / RFC1918 LAN -------
     // Positive: loopback + LAN endpoints validate cleanly.
@@ -63,8 +75,7 @@ fn test_testimony_non_transit_invariant() {
     );
 
     // Negative: a hostname is rejected — DNS-time resolution is out of
-    // scope for this validator; the operator MUST use IP literals so the
-    // check is decidable without DNS at startup.
+    // scope for this validator.
     let host = VoiceConfig {
         testimony_endpoints: vec!["whisper.example.com:8080".to_string()],
     };
@@ -72,6 +83,18 @@ fn test_testimony_non_transit_invariant() {
     assert!(
         matches!(err, VoiceConfigError::TestimonyEndpointIsHostname { .. }),
         "expected TestimonyEndpointIsHostname, got {err:?}"
+    );
+
+    // Negative: garbage port is rejected.
+    let bad_port = VoiceConfig {
+        testimony_endpoints: vec!["127.0.0.1:99999".to_string()],
+    };
+    let err = bad_port
+        .validate()
+        .expect_err("out-of-range port must be rejected");
+    assert!(
+        matches!(err, VoiceConfigError::TestimonyEndpointUnparseable { .. }),
+        "expected TestimonyEndpointUnparseable, got {err:?}"
     );
 
     // --- Gate 3: lane discriminants are stable for external audit -------

@@ -25,7 +25,13 @@ pub struct TestimonyLane;
 /// **Sealed** — downstream crates cannot add new lanes. This is the invariant
 /// that makes the "two-lanes, hard boundary" doctrine of mika#1785 §
 /// non-transit into a compile-time property.
-pub trait VoiceLane: sealed::Sealed + Copy + core::fmt::Debug + 'static {
+///
+/// Supertrait bounds are minimal: only `sealed::Sealed` (the sealing contract)
+/// and `'static` (needed because `Lane` is used as an associated type in
+/// `SttProvider` / `TtsProvider`, which themselves require `'static`).
+/// `Copy` / `Debug` are impl'd on the marker types themselves via `derive`,
+/// not required here — future lane markers can carry different derives.
+pub trait VoiceLane: sealed::Sealed + 'static {
     /// Human-readable lane name for logs and audit trails.
     const NAME: &'static str;
 }

@@ -21,6 +21,14 @@ path = "src/main.rs"
 name = "mika_gateway"
 path = "src/lib.rs"
 
+[features]
+# mika#1796 — gate the stub provider types in `voice::examples` behind this
+# feature so they NEVER ship in the release surface. Test-only fixtures use
+# `#[cfg(test)]` for in-crate access; external users (trybuild fixtures under
+# `tests/voice_lane_compile_fail/`) get access when the feature is enabled.
+# Mirrors the `test-utils` feature convention in `mika-common`.
+test-utils = []
+
 [dependencies]
 mika-common = { workspace = true }
 mika-a2a = { workspace = true }

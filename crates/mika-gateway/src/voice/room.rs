@@ -4,29 +4,35 @@
 //! The type parameter `L: VoiceLane` is a phantom carrying the lane at the
 //! type level. The per-lane ctors ([`VoiceRoom::conversation`],
 //! [`VoiceRoom::testimony`]) are the *only* way to construct a room; each
-//! bounds the STT and TTS types to the traits that live in its lane.
+//! bounds the STT and TTS types to providers whose associated `Lane` type
+//! matches the room's lane. Because a concrete provider type can implement
+//! [`SttProvider`](super::SttProvider) / [`TtsProvider`](super::TtsProvider)
+//! only ONCE, it picks its lane at implementation time and cannot smuggle
+//! itself into another room.
 
 use core::marker::PhantomData;
 
 use super::lane::{ConversationLane, TestimonyLane, VoiceLane};
-use super::provider::{CloudStt, CloudTts, LocalStt, LocalTts};
+use super::provider::{SttProvider, TtsProvider};
 
 /// A voice room orchestrator, parameterized by the lane `L` and its STT/TTS
 /// provider types `S` and `T`.
 ///
 /// # Type-level invariant
 ///
-/// The struct itself is generic over any triple `(L, S, T)`, but the *only
-/// public constructors* are the per-lane ctors:
+/// The struct is generic over any triple `(L, S, T)`, but the *only public
+/// constructors* are the per-lane ctors:
 ///
-/// - [`VoiceRoom::conversation`] — requires `S: CloudStt` + `T: CloudTts`.
-/// - [`VoiceRoom::testimony`] — requires `S: LocalStt` + `T: LocalTts`.
+/// - [`VoiceRoom::conversation`] — requires `S: SttProvider<Lane = ConversationLane>` +
+///   `T: TtsProvider<Lane = ConversationLane>`.
+/// - [`VoiceRoom::testimony`] — requires `S: SttProvider<Lane = TestimonyLane>` +
+///   `T: TtsProvider<Lane = TestimonyLane>`.
 ///
 /// So while `VoiceRoom<TestimonyLane, DeepgramStt, ElevenLabsTts>` is
 /// *nameable* as a type, it cannot be *constructed*, because `DeepgramStt`
-/// (a `CloudStt`) does not satisfy the `S: LocalStt` bound on
-/// `VoiceRoom::testimony`. See `tests/voice_lane_compile_fail/` for the
-/// snapshot-tested proof.
+/// binds `type Lane = ConversationLane` — the compiler rejects the
+/// `S: SttProvider<Lane = TestimonyLane>` bound on `VoiceRoom::testimony`.
+/// See `tests/voice_lane_compile_fail/` for the snapshot-tested proof.
 #[derive(Debug)]
 pub struct VoiceRoom<L: VoiceLane, S, T> {
     _lane: PhantomData<L>,
@@ -34,9 +40,13 @@ pub struct VoiceRoom<L: VoiceLane, S, T> {
     tts: T,
 }
 
-impl<S: CloudStt, T: CloudTts> VoiceRoom<ConversationLane, S, T> {
-    /// Construct a conversation-lane room. STT and TTS must be cloud
-    /// providers — the trait bounds enforce it.
+impl<S, T> VoiceRoom<ConversationLane, S, T>
+where
+    S: SttProvider<Lane = ConversationLane>,
+    T: TtsProvider<Lane = ConversationLane>,
+{
+    /// Construct a conversation-lane room. STT and TTS must be conversation-
+    /// lane providers — the associated-type bounds enforce it.
     pub fn conversation(stt: S, tts: T) -> Self {
         Self {
             _lane: PhantomData,
@@ -46,11 +56,15 @@ impl<S: CloudStt, T: CloudTts> VoiceRoom<ConversationLane, S, T> {
     }
 }
 
-impl<S: LocalStt, T: LocalTts> VoiceRoom<TestimonyLane, S, T> {
-    /// Construct a testimony-lane room. STT and TTS must be local providers
-    /// — the trait bounds enforce it. This is the load-bearing ctor for the
-    /// non-transit invariant: a type that impls `CloudStt` but not `LocalStt`
-    /// cannot be passed here without a compile error.
+impl<S, T> VoiceRoom<TestimonyLane, S, T>
+where
+    S: SttProvider<Lane = TestimonyLane>,
+    T: TtsProvider<Lane = TestimonyLane>,
+{
+    /// Construct a testimony-lane room. STT and TTS must be testimony-lane
+    /// providers — the associated-type bounds enforce it. This is the
+    /// load-bearing ctor for the non-transit invariant: a type that binds
+    /// `type Lane = ConversationLane` cannot be passed here.
     pub fn testimony(stt: S, tts: T) -> Self {
         Self {
             _lane: PhantomData,
@@ -82,14 +96,13 @@ impl<L: VoiceLane, S, T> VoiceRoom<L, S, T> {
 mod tests {
     use super::*;
     use crate::voice::examples::{DeepgramStt, ElevenLabsTts, PiperTts, WhisperCppStt};
+    use crate::voice::provider::{SttProvider, TtsProvider};
 
     #[test]
     fn conversation_room_accepts_cloud_providers() {
         // Positive path: cloud STT + cloud TTS wire cleanly into a
-        // conversation-lane room. This exercises the ctor bounds.
-        // Unit-struct ctors: `TypeName` rather than `TypeName::default()` —
-        // clippy's `default_constructed_unit_structs` lint enforces this
-        // for zero-sized markers.
+        // conversation-lane room. Unit-struct ctors are bare per clippy's
+        // `default_constructed_unit_structs` lint.
         let room = VoiceRoom::conversation(DeepgramStt, ElevenLabsTts);
         assert_eq!(room.lane_name(), "conversation");
         assert_eq!(room.stt().provider_name(), "deepgram");

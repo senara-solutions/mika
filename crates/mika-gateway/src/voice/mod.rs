@@ -47,13 +47,22 @@
 //! # 1. The lane types exist and are sealed.
 //! rg 'pub trait VoiceLane: sealed::Sealed' crates/mika-gateway/src/voice/lane.rs
 //!
-//! # 2. Only the conversation-lane ctor accepts Cloud providers;
-//! #    only the testimony-lane ctor accepts Local providers.
-//! rg 'impl<S: CloudStt, T: CloudTts> VoiceRoom<ConversationLane' crates/mika-gateway/src/voice/room.rs
-//! rg 'impl<S: LocalStt, T: LocalTts> VoiceRoom<TestimonyLane' crates/mika-gateway/src/voice/room.rs
+//! # 2. STT and TTS providers carry the lane as an ASSOCIATED TYPE — a
+//! #    concrete type can only impl SttProvider/TtsProvider once, so it
+//! #    picks exactly one lane at implementation time.
+//! rg 'pub trait SttProvider: Send \+ Sync \+ .static' crates/mika-gateway/src/voice/provider.rs
+//! rg 'type Lane: VoiceLane' crates/mika-gateway/src/voice/provider.rs
 //!
-//! # 3. The compile-fail fixture proves the type-checker rejects mis-wiring.
-//! cargo test -p mika-gateway --test voice_lane_compile_fail
+//! # 3. The VoiceRoom ctors bind Lane = ConversationLane / TestimonyLane
+//! #    (both directions — cloud→testimony AND local→conversation are
+//! #    rejected, proving the bound is enforced symmetrically).
+//! rg 'S: SttProvider<Lane = ConversationLane>' crates/mika-gateway/src/voice/room.rs
+//! rg 'S: SttProvider<Lane = TestimonyLane>' crates/mika-gateway/src/voice/room.rs
+//!
+//! # 4. Three compile-fail fixtures prove the type-checker rejects
+//! #    wrong-lane wiring (cloud→testimony STT, cloud→testimony TTS,
+//! #    local→conversation STT).
+//! cargo test -p mika-gateway --features test-utils --test voice_lane_compile_fail
 //! ```
 //!
 //! Companion gates (outside this module):
@@ -66,6 +75,10 @@
 //! - `docs/voice-non-transit-invariant.md` — full doctrine + audit recipe.
 
 pub mod config;
+// `examples` ships only in tests and behind the `test-utils` feature — stub
+// provider types are for trybuild fixtures and internal tests, NOT for
+// production wiring. Feature-gate prevents pollution of the release surface.
+#[cfg(any(test, feature = "test-utils"))]
 pub mod examples;
 pub mod lane;
 pub mod provider;
@@ -73,5 +86,5 @@ pub mod room;
 
 pub use config::{VoiceConfig, VoiceConfigError};
 pub use lane::{ConversationLane, TestimonyLane, VoiceLane};
-pub use provider::{CloudStt, CloudTts, LocalStt, LocalTts};
+pub use provider::{CloudStt, CloudTts, LocalStt, LocalTts, SttProvider, TtsProvider};
 pub use room::VoiceRoom;

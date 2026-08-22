@@ -1,4 +1,11 @@
-//! Reference provider impls (mika#1796).
+//! Reference provider impls (mika#1796) — **test-utils only**.
+//!
+//! This module is gated behind `#[cfg(any(test, feature = "test-utils"))]`
+//! so the stub types never ship in the release surface — they exist for
+//! `trybuild` compile-fail fixtures and internal unit / integration tests.
+//! Consumers writing real providers do so in their own crate/module and
+//! impl [`SttProvider`](super::SttProvider) / [`TtsProvider`](super::TtsProvider)
+//! directly.
 //!
 //! Zero-runtime-cost stub types whose names deliberately echo well-known
 //! provider crates (`DeepgramStt`, `ElevenLabsTts`, `WhisperCppStt`,
@@ -10,53 +17,53 @@
 //!    them without requiring any real network dependency.
 //! 3. A reader auditing this module immediately recognizes the pattern.
 //!
-//! **These types are stubs, not real providers.** They implement the trait
-//! surface with no-op methods. The real provider wiring lands with mika#1787
-//! (LiveKit Agents Python scaffold) — this module is the type-safe surface
-//! that scaffold binds to.
-//!
 //! The cloud-provider crate NAMES that these types echo (`deepgram`,
-//! `elevenlabs`) are banned by `deny.toml [bans]`, so no legitimate future
-//! provider impl in this crate will pull them in — see `deny.toml` and the
-//! doctrine doc `docs/voice-non-transit-invariant.md`.
+//! `elevenlabs`) are banned by `deny.toml [bans]`, so no legitimate
+//! future provider impl in this crate will pull them in — see `deny.toml`
+//! and `docs/voice-non-transit-invariant.md`.
 
-use super::provider::{CloudStt, CloudTts, LocalStt, LocalTts};
+use super::lane::{ConversationLane, TestimonyLane};
+use super::provider::{SttProvider, TtsProvider};
 
-/// Stub cloud STT — reference impl of [`CloudStt`], modeled after Deepgram.
+/// Stub cloud STT — reference impl modeled after Deepgram.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DeepgramStt;
 
-impl CloudStt for DeepgramStt {
+impl SttProvider for DeepgramStt {
+    type Lane = ConversationLane;
     fn provider_name(&self) -> &'static str {
         "deepgram"
     }
 }
 
-/// Stub cloud TTS — reference impl of [`CloudTts`], modeled after ElevenLabs.
+/// Stub cloud TTS — reference impl modeled after ElevenLabs.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ElevenLabsTts;
 
-impl CloudTts for ElevenLabsTts {
+impl TtsProvider for ElevenLabsTts {
+    type Lane = ConversationLane;
     fn provider_name(&self) -> &'static str {
         "elevenlabs"
     }
 }
 
-/// Stub local STT — reference impl of [`LocalStt`], modeled after whisper.cpp.
+/// Stub local STT — reference impl modeled after whisper.cpp.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WhisperCppStt;
 
-impl LocalStt for WhisperCppStt {
+impl SttProvider for WhisperCppStt {
+    type Lane = TestimonyLane;
     fn provider_name(&self) -> &'static str {
         "whisper-cpp"
     }
 }
 
-/// Stub local TTS — reference impl of [`LocalTts`], modeled after Piper.
+/// Stub local TTS — reference impl modeled after Piper.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PiperTts;
 
-impl LocalTts for PiperTts {
+impl TtsProvider for PiperTts {
+    type Lane = TestimonyLane;
     fn provider_name(&self) -> &'static str {
         "piper"
     }

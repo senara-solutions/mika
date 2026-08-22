@@ -62,14 +62,45 @@ wildcards = "allow"
 #      `grep bans.allow deny.toml` must be able to audit the extraction
 #      point without following a link.
 deny = [
-    { name = "elevenlabs" },        # cloud TTS — conversation lane only
+    # cargo-deny matches crate names verbatim (hyphen vs underscore matters),
+    # so both spellings of every provider are enumerated. If a NEW cloud
+    # STT/TTS provider ships, add BOTH spellings here.
+    #
+    # ElevenLabs (cloud TTS)
+    { name = "elevenlabs" },
     { name = "elevenlabs-rs" },
-    { name = "deepgram" },          # cloud STT — conversation lane only
+    { name = "elevenlabs_rs" },
+    # Deepgram (cloud STT)
+    { name = "deepgram" },
     { name = "deepgram-rs" },
-    { name = "azure-speech" },      # Azure Cognitive Services Speech
-    { name = "google-speech" },     # Google Cloud Speech-to-Text
-    { name = "aws-sdk-transcribe" }, # AWS Transcribe
-    { name = "aws-sdk-polly" },     # AWS Polly TTS
+    { name = "deepgram_rs" },
+    # Azure Cognitive Services Speech
+    { name = "azure-speech" },
+    { name = "azure_speech" },
+    { name = "azure-cognitiveservices-speech" },
+    # Google Cloud Speech-to-Text / Text-to-Speech
+    { name = "google-speech" },
+    { name = "google-cloud-speech" },
+    { name = "google-cloud-speech-v1" },
+    { name = "google-cloud-texttospeech" },
+    { name = "google-cloud-texttospeech-v1" },
+    # AWS Transcribe / Polly
+    { name = "aws-sdk-transcribe" },
+    { name = "aws-sdk-polly" },
+    { name = "aws-sdk-transcribestreaming" },
+    # AssemblyAI (cloud STT)
+    { name = "assemblyai" },
+    { name = "assemblyai-rs" },
+    # Rev.ai (cloud STT)
+    { name = "rev_ai" },
+    { name = "rev-ai" },
+    # Speechmatics (cloud STT)
+    { name = "speechmatics" },
+    # OpenAI Whisper-API clients (cloud STT via OpenAI's Whisper endpoint —
+    # LOCAL Whisper via `whisper-cpp` / `whisper-rs` is fine and is what
+    # the testimony lane uses).
+    { name = "async-openai" },
+    { name = "openai-api-rs" },
 ]
 
 [sources]

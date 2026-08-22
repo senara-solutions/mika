@@ -7,14 +7,32 @@
 // and the non-transit invariant is no longer verified by construction.
 
 use mika_gateway::voice::{
-    VoiceRoom,
-    examples::{DeepgramStt, PiperTts},
-    lane::TestimonyLane,
+    SttProvider, TtsProvider, VoiceRoom,
+    lane::{ConversationLane, TestimonyLane},
 };
 
+// Inline stubs — kept in-fixture so `mika_gateway::voice::examples` can
+// stay feature-gated and never ship in the release surface.
+struct DeepgramStt;
+impl SttProvider for DeepgramStt {
+    type Lane = ConversationLane; // <-- binds to CONVERSATION lane
+    fn provider_name(&self) -> &'static str {
+        "deepgram"
+    }
+}
+
+struct PiperTts;
+impl TtsProvider for PiperTts {
+    type Lane = TestimonyLane;
+    fn provider_name(&self) -> &'static str {
+        "piper"
+    }
+}
+
 fn main() {
-    // DeepgramStt is a CloudStt, not a LocalStt.
-    // `VoiceRoom::testimony` requires `S: LocalStt`, so this must not compile.
+    // DeepgramStt binds `type Lane = ConversationLane`.
+    // `VoiceRoom::testimony` requires `S: SttProvider<Lane = TestimonyLane>`,
+    // so this must not compile.
     let _room: VoiceRoom<TestimonyLane, DeepgramStt, PiperTts> =
-        VoiceRoom::testimony(DeepgramStt::default(), PiperTts::default());
+        VoiceRoom::testimony(DeepgramStt, PiperTts);
 }

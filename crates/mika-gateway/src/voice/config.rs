@@ -5,13 +5,16 @@
 //! This validator addresses a *different* failure mode: an operator hand-edits
 //! a config file to point a testimony-lane provider at a cloud URL, thinking
 //! "it's just a URL, the provider is local". At startup, this check rejects
-//! anything that isn't loopback (`127.0.0.1` / `::1`) or an RFC1918 LAN
-//! address — and fails closed (gateway refuses to start, not warn+continue).
+//! anything that isn't loopback (`127.0.0.1` / `::1`), RFC1918 LAN, or IPv6
+//! ULA (`fc00::/7`) — and fails closed (gateway refuses to start, not
+//! warn+continue).
 //!
-//! The scope here is narrow: URL/endpoint literal validation, no DNS
-//! resolution. DNS-time non-transit enforcement is the runtime-egress
-//! companion ticket's job (see mika#1796 § Out of scope; the companion is
-//! `voice(p2.5-runtime): nftables egress deny for testimony ports`).
+//! The scope here is narrow: `<ip>:<port>` literal validation via
+//! [`SocketAddr::from_str`]. No DNS resolution — hostnames are rejected
+//! outright because a resolved-at-startup address does not guarantee the
+//! runtime call's target. DNS-time / packet-time non-transit enforcement is
+//! the runtime-egress companion ticket's job (mika#1961 — nftables egress
+//! deny for testimony ports).
 //!
 //! # Companion runtime gate
 //!
@@ -21,17 +24,19 @@
 //! invariant). This validator is one belt; the nftables rule is the
 //! suspenders.
 
-use core::net::IpAddr;
+use core::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 use thiserror::Error;
 
 /// Errors produced by [`VoiceConfig::validate`].
 #[derive(Debug, Error)]
 pub enum VoiceConfigError {
-    /// A testimony-lane endpoint parsed to an IP outside loopback / LAN.
+    /// A testimony-lane endpoint parsed to an IP outside loopback, RFC1918
+    /// LAN, or IPv6 ULA.
     #[error(
         "testimony endpoint '{endpoint}' resolves to non-local IP {ip} — \
-         non-transit invariant requires loopback (127.0.0.1 / ::1) or RFC1918 LAN"
+         non-transit invariant requires loopback (127.0.0.1 / ::1), RFC1918 \
+         LAN, or IPv6 ULA (fc00::/7)"
     )]
     TestimonyEndpointNotLocal { endpoint: String, ip: IpAddr },
 
@@ -41,12 +46,13 @@ pub enum VoiceConfigError {
     /// network-layer companion (nftables rule) to enforce non-transit.
     #[error(
         "testimony endpoint '{endpoint}' is a hostname; testimony configs \
-         must use an IP literal (loopback or RFC1918) so the non-transit \
-         invariant is checkable without DNS at startup"
+         must use an IP literal (loopback, RFC1918, or IPv6 ULA) so the \
+         non-transit invariant is checkable without DNS at startup"
     )]
     TestimonyEndpointIsHostname { endpoint: String },
 
-    /// The endpoint string could not be parsed as `host:port` or a URL host.
+    /// The endpoint string could not be parsed as `<ip>:<port>` — bad port,
+    /// missing port, malformed brackets, etc.
     #[error("testimony endpoint '{endpoint}' is not parseable: {reason}")]
     TestimonyEndpointUnparseable { endpoint: String, reason: String },
 }
@@ -61,19 +67,19 @@ pub enum VoiceConfigError {
 #[derive(Debug, Clone, Default)]
 pub struct VoiceConfig {
     /// STT and TTS endpoints for the testimony lane. Each entry is an
-    /// `<ip>:<port>` string (IP literal, not hostname). The validator
-    /// rejects anything outside loopback or RFC1918 LAN.
+    /// `<ip>:<port>` string. Rejected: hostnames, ports outside `1..=65535`,
+    /// malformed IP literals, IPs outside loopback / RFC1918 LAN / IPv6 ULA.
     pub testimony_endpoints: Vec<String>,
 }
 
 impl VoiceConfig {
-    /// Reject any testimony endpoint that is not loopback or RFC1918 LAN.
+    /// Reject any testimony endpoint that fails the local-address check.
     /// Fails closed on first offender — the gateway is expected to `?`-bubble
     /// the error at startup rather than log-and-continue.
     pub fn validate(&self) -> Result<(), VoiceConfigError> {
         for endpoint in &self.testimony_endpoints {
-            let ip = parse_endpoint_ip(endpoint)?;
-            if !is_loopback_or_rfc1918(ip) {
+            let ip = parse_endpoint(endpoint)?;
+            if !is_local_address(ip) {
                 return Err(VoiceConfigError::TestimonyEndpointNotLocal {
                     endpoint: endpoint.clone(),
                     ip,
@@ -84,74 +90,111 @@ impl VoiceConfig {
     }
 }
 
-/// Parse an `<ip>:<port>` endpoint string into just the [`IpAddr`].
+/// Parse an `<ip>:<port>` string using [`SocketAddr::from_str`]. This
+/// enforces port validity, bracket correctness on IPv6, and rejects garbage
+/// like `127.0.0.1:8080/path` up-front (a `SocketAddr` cannot carry a path).
 ///
-/// Accepts:
-/// - `127.0.0.1:8080`
-/// - `[::1]:8080`
-/// - `10.0.0.5:9000`
-///
-/// Rejects (returns `TestimonyEndpointIsHostname` or `TestimonyEndpointUnparseable`):
-/// - `whisper.example.com:8080` (hostname — DNS-time check is out of scope)
-/// - `not-an-endpoint`
-fn parse_endpoint_ip(endpoint: &str) -> Result<IpAddr, VoiceConfigError> {
-    // Try IPv6-with-brackets first: `[::1]:8080`.
-    if let Some(after_bracket) = endpoint.strip_prefix('[') {
-        if let Some(close) = after_bracket.find(']') {
-            let host = &after_bracket[..close];
-            return host.parse::<IpAddr>().map_err(|e| {
-                VoiceConfigError::TestimonyEndpointUnparseable {
-                    endpoint: endpoint.to_string(),
-                    reason: format!("bracketed IPv6 parse failed: {e}"),
-                }
+/// On parse failure, distinguish "hostname" (non-empty, non-IP host) from
+/// "unparseable" (missing colon, empty string, empty port, out-of-range port)
+/// so the operator gets an actionable error.
+fn parse_endpoint(endpoint: &str) -> Result<IpAddr, VoiceConfigError> {
+    // Fast path: `SocketAddr` accepts the well-formed shapes exactly.
+    if let Ok(sock) = endpoint.parse::<SocketAddr>() {
+        return Ok(unmap_v4_in_v6(sock.ip()));
+    }
+
+    // Slow path: figure out why it failed to give the operator a useful
+    // error. Split on the LAST ':' so unbracketed IPv6 (which is legal only
+    // via SocketAddr's bracketed form) is treated as unparseable, not as a
+    // hostname.
+    let (host, port_str) = match endpoint.rsplit_once(':') {
+        Some(pair) => pair,
+        None => {
+            return Err(VoiceConfigError::TestimonyEndpointUnparseable {
+                endpoint: endpoint.to_string(),
+                reason: "missing ':port' suffix".to_string(),
             });
         }
+    };
+
+    if host.is_empty() {
         return Err(VoiceConfigError::TestimonyEndpointUnparseable {
             endpoint: endpoint.to_string(),
-            reason: "opening '[' without closing ']'".to_string(),
+            reason: "empty host".to_string(),
+        });
+    }
+    if port_str.is_empty() {
+        return Err(VoiceConfigError::TestimonyEndpointUnparseable {
+            endpoint: endpoint.to_string(),
+            reason: "empty port".to_string(),
+        });
+    }
+    if port_str.parse::<u16>().is_err() {
+        return Err(VoiceConfigError::TestimonyEndpointUnparseable {
+            endpoint: endpoint.to_string(),
+            reason: format!("port '{port_str}' is not a valid u16"),
         });
     }
 
-    // IPv4-with-port form: split on the LAST ':' so we don't confuse an
-    // unbracketed IPv6 (which would fail the IP parse below anyway).
-    let host = match endpoint.rsplit_once(':') {
-        Some((h, _port)) => h,
-        None => endpoint,
-    };
+    // Strip IPv6 brackets if present (unbracketed IPv6 with port is
+    // ambiguous — SocketAddr rejects it, so did the fast path).
+    let host_clean = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
 
-    // Parse as IP. If parse fails, treat non-empty-non-IP as a hostname
-    // (the operator MUST use an IP literal for testimony configs).
-    match host.parse::<IpAddr>() {
-        Ok(ip) => Ok(ip),
-        Err(_) => {
-            if host.is_empty() {
-                Err(VoiceConfigError::TestimonyEndpointUnparseable {
-                    endpoint: endpoint.to_string(),
-                    reason: "empty host".to_string(),
-                })
-            } else {
-                Err(VoiceConfigError::TestimonyEndpointIsHostname {
-                    endpoint: endpoint.to_string(),
-                })
-            }
-        }
+    // If it parses as an IP, the port must have been the reason SocketAddr
+    // failed — but we already checked the port above. Reaching here with a
+    // valid IP means we've got a shape SocketAddr rejected for structural
+    // reasons (unbracketed IPv6-with-port). Report as unparseable.
+    if host_clean.parse::<IpAddr>().is_ok() {
+        return Err(VoiceConfigError::TestimonyEndpointUnparseable {
+            endpoint: endpoint.to_string(),
+            reason: "IPv6 addresses must be bracketed as [ipv6]:port".to_string(),
+        });
+    }
+
+    // Non-empty, non-IP host with a valid port → hostname.
+    Err(VoiceConfigError::TestimonyEndpointIsHostname {
+        endpoint: endpoint.to_string(),
+    })
+}
+
+/// If `ip` is an IPv4-mapped IPv6 address (`::ffff:0:0/96`), unmap to
+/// [`IpAddr::V4`]. Otherwise, return unchanged.
+///
+/// This matters because `[::ffff:8.8.8.8]:443` would otherwise pass the
+/// `is_local_address` check on the V6 arm (which permits nothing except
+/// loopback + ULA) and hit the V4 path only if we unmap. Unmapping first
+/// makes the WAN address land in the V4 check, where `is_private()` correctly
+/// rejects it.
+fn unmap_v4_in_v6(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        v4 => v4,
     }
 }
 
-/// `true` if the address is loopback (`127.0.0.0/8`, `::1`) or an RFC1918
-/// LAN address (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`).
-fn is_loopback_or_rfc1918(ip: IpAddr) -> bool {
+/// `true` if the address is loopback (`127.0.0.0/8`, `::1`), an RFC1918
+/// LAN address (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), or an
+/// IPv6 ULA (`fc00::/7` — RFC 4193).
+fn is_local_address(ip: IpAddr) -> bool {
     if ip.is_loopback() {
         return true;
     }
     match ip {
         IpAddr::V4(v4) => v4.is_private(),
-        // For IPv6, only loopback (::1) is treated as local by this
-        // validator. RFC4193 unique-local (`fc00::/7`) is intentionally NOT
-        // whitelisted here — the testimony lane's early deployments target
-        // IPv4 loopback/RFC1918; a v6 ULA expansion should land explicitly.
-        IpAddr::V6(_) => false,
+        IpAddr::V6(v6) => is_ipv6_ula(v6),
     }
+}
+
+/// `true` if the address is an IPv6 Unique Local Address (`fc00::/7`),
+/// per RFC 4193. Matches the top 7 bits: `1111 110x`.
+fn is_ipv6_ula(v6: Ipv6Addr) -> bool {
+    (v6.segments()[0] & 0xfe00) == 0xfc00
 }
 
 #[cfg(test)]
@@ -172,6 +215,7 @@ mod tests {
     #[test]
     fn loopback_ipv4_is_accepted() {
         assert!(cfg(&["127.0.0.1:8080"]).validate().is_ok());
+        assert!(cfg(&["127.0.0.5:1"]).validate().is_ok());
     }
 
     #[test]
@@ -187,8 +231,14 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_ula_is_accepted() {
+        // fc00::/7 covers fc00::/8 and fd00::/8.
+        assert!(cfg(&["[fd00::1]:8080"]).validate().is_ok());
+        assert!(cfg(&["[fc00::abcd]:9000"]).validate().is_ok());
+    }
+
+    #[test]
     fn cloud_ipv4_is_rejected() {
-        // 8.8.8.8 stands in for any WAN address — the invariant says NO.
         let err = cfg(&["8.8.8.8:443"]).validate().unwrap_err();
         assert!(matches!(
             err,
@@ -197,10 +247,45 @@ mod tests {
     }
 
     #[test]
+    fn ipv4_mapped_ipv6_cloud_is_rejected() {
+        // `[::ffff:8.8.8.8]:443` — must unmap and reject on the V4 path.
+        let err = cfg(&["[::ffff:8.8.8.8]:443"]).validate().unwrap_err();
+        assert!(
+            matches!(err, VoiceConfigError::TestimonyEndpointNotLocal { .. }),
+            "expected TestimonyEndpointNotLocal, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_loopback_is_accepted() {
+        // `[::ffff:127.0.0.1]:8080` — should unmap and pass.
+        assert!(cfg(&["[::ffff:127.0.0.1]:8080"]).validate().is_ok());
+    }
+
+    #[test]
+    fn unspecified_ipv4_is_rejected() {
+        // 0.0.0.0 is not loopback and not RFC1918 — reject explicitly to
+        // avoid ambiguity about "any interface". Operators must name a
+        // concrete local IP.
+        let err = cfg(&["0.0.0.0:8080"]).validate().unwrap_err();
+        assert!(matches!(
+            err,
+            VoiceConfigError::TestimonyEndpointNotLocal { .. }
+        ));
+    }
+
+    #[test]
+    fn link_local_ipv6_is_rejected() {
+        // fe80::/10 is not ULA and not loopback — reject.
+        let err = cfg(&["[fe80::1]:8080"]).validate().unwrap_err();
+        assert!(matches!(
+            err,
+            VoiceConfigError::TestimonyEndpointNotLocal { .. }
+        ));
+    }
+
+    #[test]
     fn hostname_is_rejected() {
-        // Hostnames could resolve to anything at runtime; the validator
-        // requires an IP literal so the non-transit check is decidable at
-        // startup without DNS.
         let err = cfg(&["whisper.example.com:8080"]).validate().unwrap_err();
         assert!(matches!(
             err,
@@ -209,8 +294,57 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_endpoint_is_rejected() {
-        let err = cfg(&["[oops"]).validate().unwrap_err();
+    fn empty_endpoint_is_rejected() {
+        let err = cfg(&[""]).validate().unwrap_err();
+        assert!(matches!(
+            err,
+            VoiceConfigError::TestimonyEndpointUnparseable { .. }
+        ));
+    }
+
+    #[test]
+    fn missing_port_is_rejected() {
+        let err = cfg(&["127.0.0.1"]).validate().unwrap_err();
+        assert!(matches!(
+            err,
+            VoiceConfigError::TestimonyEndpointUnparseable { .. }
+        ));
+    }
+
+    #[test]
+    fn empty_port_is_rejected() {
+        let err = cfg(&["127.0.0.1:"]).validate().unwrap_err();
+        assert!(matches!(
+            err,
+            VoiceConfigError::TestimonyEndpointUnparseable { .. }
+        ));
+    }
+
+    #[test]
+    fn out_of_range_port_is_rejected() {
+        let err = cfg(&["127.0.0.1:99999"]).validate().unwrap_err();
+        assert!(matches!(
+            err,
+            VoiceConfigError::TestimonyEndpointUnparseable { .. }
+        ));
+    }
+
+    #[test]
+    fn endpoint_with_path_is_rejected() {
+        // SocketAddr can't parse this; the slow path treats "8080/path" as
+        // an invalid port.
+        let err = cfg(&["127.0.0.1:8080/path"]).validate().unwrap_err();
+        assert!(matches!(
+            err,
+            VoiceConfigError::TestimonyEndpointUnparseable { .. }
+        ));
+    }
+
+    #[test]
+    fn unbracketed_ipv6_is_rejected() {
+        // `::1:8080` is ambiguous — SocketAddr rejects it and the slow
+        // path reports "IPv6 must be bracketed".
+        let err = cfg(&["::1:8080"]).validate().unwrap_err();
         assert!(matches!(
             err,
             VoiceConfigError::TestimonyEndpointUnparseable { .. }
@@ -220,8 +354,7 @@ mod tests {
     #[test]
     fn first_offender_stops_validation() {
         // Fail-closed on the first bad endpoint — the operator gets an
-        // actionable error rather than an aggregated list they have to
-        // walk through.
+        // actionable error rather than an aggregated list to walk through.
         let cfg = cfg(&["127.0.0.1:8080", "8.8.8.8:443", "192.168.1.1:9000"]);
         let err = cfg.validate().unwrap_err();
         match err {

@@ -3,14 +3,31 @@
 // covering the TTS half of the lane invariant.
 
 use mika_gateway::voice::{
-    VoiceRoom,
-    examples::{ElevenLabsTts, WhisperCppStt},
-    lane::TestimonyLane,
+    SttProvider, TtsProvider, VoiceRoom,
+    lane::{ConversationLane, TestimonyLane},
 };
 
+// Inline stubs — see companion fixture for the feature-gate rationale.
+struct WhisperCppStt;
+impl SttProvider for WhisperCppStt {
+    type Lane = TestimonyLane;
+    fn provider_name(&self) -> &'static str {
+        "whisper-cpp"
+    }
+}
+
+struct ElevenLabsTts;
+impl TtsProvider for ElevenLabsTts {
+    type Lane = ConversationLane; // <-- binds to CONVERSATION lane
+    fn provider_name(&self) -> &'static str {
+        "elevenlabs"
+    }
+}
+
 fn main() {
-    // ElevenLabsTts is a CloudTts, not a LocalTts.
-    // `VoiceRoom::testimony` requires `T: LocalTts`, so this must not compile.
+    // ElevenLabsTts binds `type Lane = ConversationLane`.
+    // `VoiceRoom::testimony` requires `T: TtsProvider<Lane = TestimonyLane>`,
+    // so this must not compile.
     let _room: VoiceRoom<TestimonyLane, WhisperCppStt, ElevenLabsTts> =
-        VoiceRoom::testimony(WhisperCppStt::default(), ElevenLabsTts::default());
+        VoiceRoom::testimony(WhisperCppStt, ElevenLabsTts);
 }

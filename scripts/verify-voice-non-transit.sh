@@ -23,10 +23,14 @@
 #   1 — violation(s) found
 #
 # Escape hatch (per line):
-#   Append `# voice-non-transit: safe` and cite the ticket that justifies
-#   the exception (e.g., a LOCAL LiveKit control socket that happens to
-#   use `httpx` for a loopback endpoint). The escape MUST cite a ticket
-#   and MUST NOT be used to justify a real cloud call.
+#   Append `# voice-non-transit: safe #<ticket>` (e.g., `#1787`) and use it
+#   only for a genuinely LOCAL surface — e.g., a LiveKit control socket that
+#   happens to use `httpx` for a loopback endpoint. The ticket-citation form
+#   is enforced structurally by the grep below: a bare
+#   `# voice-non-transit: safe` marker WITHOUT a `#<digits>` citation does
+#   NOT suppress the violation (protects against "add the marker to bypass
+#   the gate" as a review anti-pattern). The escape MUST NEVER be used to
+#   justify a real cloud call.
 
 set -euo pipefail
 
@@ -73,9 +77,14 @@ for pattern in "${BANNED_IMPORTS[@]}"; do
         [ -n "$line" ] || continue
         echo "ERROR: banned import '$pattern' in testimony path: $line"
         VIOLATIONS=$((VIOLATIONS + 1))
+    # Structural escape-marker enforcement: a bare
+    # `# voice-non-transit: safe` marker without a `#<digits>` ticket citation
+    # does NOT suppress the violation. `grep -Ev` filters out only correctly-
+    # cited escapes (marker followed by `#<digits>`), catching the review
+    # anti-pattern where someone adds the marker text alone to bypass the gate.
     done < <(grep -rEn "^[[:space:]]*(from|import)[[:space:]]+${escaped}" "$TESTIMONY_ROOT" \
         --include='*.py' \
-        | grep -v '# voice-non-transit: safe' \
+        | grep -Ev '# voice-non-transit: safe #[0-9]+' \
         || true)
 done
 
@@ -83,7 +92,7 @@ if [ "$VIOLATIONS" -gt 0 ]; then
     echo ""
     echo "::error::testimony lane non-transit invariant violated ($VIOLATIONS hits)."
     echo "The testimony/** subtree MUST import LOCAL-only STT/TTS (faster_whisper, whisper_cpp, piper, silero, coqui)."
-    echo "For any legitimate exception (e.g., a LOCAL LiveKit control socket), append '# voice-non-transit: safe' to the line and cite the ticket that justifies it."
+    echo "For any legitimate exception (e.g., a LOCAL LiveKit control socket), append '# voice-non-transit: safe #<ticket>' — a bare marker without a '#<digits>' ticket citation does NOT suppress the violation."
     exit 1
 fi
 

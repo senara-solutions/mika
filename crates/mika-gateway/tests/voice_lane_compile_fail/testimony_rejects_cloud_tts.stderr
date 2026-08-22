@@ -1,21 +1,21 @@
-error[E0277]: the trait bound `ElevenLabsTts: LocalTts` is not satisfied
-  --> tests/voice_lane_compile_fail/testimony_rejects_cloud_tts.rs:15:56
+error[E0271]: type mismatch resolving `<ElevenLabsTts as TtsProvider>::Lane == TestimonyLane`
+  --> tests/voice_lane_compile_fail/testimony_rejects_cloud_tts.rs:32:45
    |
-15 |         VoiceRoom::testimony(WhisperCppStt::default(), ElevenLabsTts::default());
-   |         --------------------                           ^^^^^^^^^^^^^^^^^^^^^^^^ the trait `LocalTts` is not implemented for `ElevenLabsTts`
+32 |         VoiceRoom::testimony(WhisperCppStt, ElevenLabsTts);
+   |         --------------------                ^^^^^^^^^^^^^ type mismatch resolving `<ElevenLabsTts as TtsProvider>::Lane == TestimonyLane`
    |         |
    |         required by a bound introduced by this call
    |
-help: the trait `LocalTts` is implemented for `PiperTts`
-  --> src/voice/examples.rs
+note: expected this to be `TestimonyLane`
+  --> tests/voice_lane_compile_fail/testimony_rejects_cloud_tts.rs:21:17
    |
-   | impl LocalTts for PiperTts {
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+21 |     type Lane = ConversationLane; // <-- binds to CONVERSATION lane
+   |                 ^^^^^^^^^^^^^^^^
 note: required by a bound in `VoiceRoom::<TestimonyLane, S, T>::testimony`
   --> src/voice/room.rs
    |
-   | impl<S: LocalStt, T: LocalTts> VoiceRoom<TestimonyLane, S, T> {
-   |                      ^^^^^^^^ required by this bound in `VoiceRoom::<TestimonyLane, S, T>::testimony`
+   |     T: TtsProvider<Lane = TestimonyLane>,
+   |                    ^^^^^^^^^^^^^^^^^^^^ required by this bound in `VoiceRoom::<TestimonyLane, S, T>::testimony`
 ...
    |     pub fn testimony(stt: S, tts: T) -> Self {
    |            --------- required by a bound in this associated function

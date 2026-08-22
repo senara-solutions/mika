@@ -24,8 +24,12 @@
 //! lint).
 
 #[test]
-fn testimony_lane_rejects_cloud_providers() {
+fn lane_bounds_reject_wrong_lane_providers() {
     let t = trybuild::TestCases::new();
+    // Load-bearing gates — non-transit invariant.
     t.compile_fail("tests/voice_lane_compile_fail/testimony_rejects_cloud_stt.rs");
     t.compile_fail("tests/voice_lane_compile_fail/testimony_rejects_cloud_tts.rs");
+    // Symmetry gate — conversation-lane ctor also rejects wrong-lane providers,
+    // proving the bound direction is enforced both ways.
+    t.compile_fail("tests/voice_lane_compile_fail/conversation_rejects_local_stt.rs");
 }
