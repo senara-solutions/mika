@@ -62,6 +62,19 @@ path.
    skill is NOT tagged `data_grade = "testimony"` at the skill level (that would kill
    Calendar too); the ban lives inside the tool handler where the granularity is.
 
+   **Coverage-honesty note (F1 revision):** Layer 3 is the **sole load-bearing
+   structural layer** for the incumbent `run_gws` Gmail path that triggered the
+   doctrine. Layers 2 and 4 (skill-level `data_grade = "testimony"` eviction +
+   before-tool guardrail) are **pre-positioning** for *future* testimony-grade
+   tool paths — they do NOT cover the current Gmail surface because `run_gws`
+   is intentionally untagged at the skill level. Any future non-`run_gws` tool
+   path to testimony-grade data (MCP-registered Gmail tool, new builtin, OAuth
+   wrapper skill) MUST be tagged `data_grade = "testimony"` at manifest time
+   OR receive its own subcommand-ban entry — otherwise it bypasses all four
+   layers except Layer 1 (the fragile prompt). This is called out explicitly
+   in the Risks section and in the doctrine doc (Deliverable 6) as the "single
+   axis of vigilance" for future changes.
+
 4. **Before-tool guardrail layer (defense-in-depth for skill-registered testimony
    tools)** — `execute_tool()` in `crates/mika-agent/src/tool_execution/dispatch.rs`
    gains a pre-dispatch check: for skill-registered tools whose owning skill's manifest
@@ -119,11 +132,16 @@ path.
    `SkillRegistry::apply_testimony_grade_ban()` method:
    - Runs as Phase 2 (after `apply_overrides`, before `apply_load_safety_check`).
    - Iterates `self.entries`; any entry whose `manifest.skill.data_grade == Testimony`
-     is `retain()`-evicted and pushed into new field
-     `pub banned_testimony: Vec<BannedSkill>` with a WARN log line
+     is `retain()`-evicted with a WARN log line
      (`event = "skill_testimony_ban", skill = <name>, doctrine = "mika#1798"`).
-   - `BannedSkill { name: String, reason: &'static str }` — reason is always
-     `"testimony_grade_doctrine_1798"` in v1.
+   - **v1 does NOT persist the evicted names on the registry** (F2 revision):
+     the initial spec proposed a `banned_testimony: Vec<BannedSkill>` field, but
+     with no described consumer (no CLI listing, no dashboard endpoint, no audit
+     export) it would add persistent API surface without a reader. The WARN log
+     line is the sole observability surface in v1. If a future consumer emerges
+     (e.g., a `mika skills banned` CLI subcommand or a dashboard
+     `/api/v1/skills/banned` endpoint), the field is a two-line addition — but
+     it is NOT shipped speculatively here.
    - Wired into every skill-loading site (server init, hot-reload handlers,
      CLI paths, team engine, delegate_task, list_skills tool) — same discipline
      as `apply_identity_allowlist` from mika#815.
@@ -157,9 +175,40 @@ path.
    - If `skill_data_grade.get(name) == Some(&DataGrade::Testimony)`, return the same
      `testimony_grade_forbidden` structured error and log
      `event = "tool_testimony_ban", tool = <name>, skill = <owning-skill>`.
-   - This is the defense-in-depth belt for the Phase-2 registry-ban braces. Any skill
-     that (a) evaded Phase 2 (e.g., dynamic MCP registration in a future refactor) or
-     (b) landed via a bug in the registry-loading path still cannot execute its tools.
+
+   **Justification for Layer 4 vs Layer 2 overlap (F3 revision):** The initial
+   spec described this as "defense-in-depth belt for the Phase-2 braces" without
+   naming the evasion path. The concrete evasion paths this layer catches — and
+   Layer 2 alone does NOT — are:
+   1. **Hot-reload race window.** `mika skills install <path>` and the hot-reload
+      handlers (`crates/mika-agent/src/skills/handlers.rs`, `a2a.rs` per CLAUDE.md
+      § Identity-driven skill allowlist) rebuild the `SkillRegistry` and re-apply
+      Phase-order. Between the old registry's drop and the new registry's Phase 2
+      completion there is a small window where a request routed at the old-registry
+      dispatcher could dispatch a tool whose owning skill was tagged testimony in
+      the new manifest but is still in the old registry's `entries`. The Layer 4
+      check is stateless (reads `skill_data_grade` at execute-time from the
+      current registry snapshot) and closes this window.
+   2. **Dynamic MCP registration (future).** MCP servers can register tools at
+      runtime post-startup (`McpManager::call_tool` in
+      `crates/mika-agent/src/tool_execution/dispatch.rs` line 454+). Phase 2
+      ran once at server init; a dynamically-registered MCP tool whose owning
+      "skill" (the MCP server's manifest) declares `data_grade = "testimony"`
+      would not be caught by the startup ban but is caught by the execute-time
+      Layer 4 lookup. Present-day MCP integration does not currently support
+      `data_grade` on MCP-server manifests, but the Layer 4 shape is forward-
+      compatible; the plan explicitly names this as the extension surface.
+   3. **Registry mutation via `mika skills` DB overrides.** `skill_overrides` DB
+      rows can re-enable a skill after Phase 2 ran (mika#682 transient
+      overrides + hot-reload). Layer 4's data-grade check is stateless and
+      does not depend on the enabled/disabled state — an override that
+      re-enables a testimony skill still gets caught at execute-time.
+
+   These three paths make Layer 4 orthogonal to Layer 2 rather than duplicative:
+   Layer 2 is a startup-time eviction (protects the steady state), Layer 4 is
+   an execute-time gate (protects against post-init mutations and hot-reload
+   race windows). The overlap on the steady-state path is intentional (defense
+   in depth) but the coverage delta is real.
 
 6. **`crates/mika-agent/docs/non-transit-data-grade.md`** — new doc, ~300 lines,
    covering: doctrine origin (2026-07-18 Prime ratif via samidarko relay), the
@@ -201,8 +250,16 @@ path.
      - `validate_gws_input_rejects_gmail_send` — `["gmail","+send","--to","x",…]`
        returns `testimony_grade_forbidden`, no subprocess.
      - `validate_gws_input_rejects_gmail_messages_list` — same shape.
-     - `validate_gws_input_rejects_drive_full_list` — `["drive","files","list","--params","{\"pageSize\":10}"]`
-       (no `q` filter) returns forbidden.
+     - `validate_gws_input_rejects_drive_unscoped_list` (F4 revision — renamed
+       from `rejects_drive_full_list` to match actual coverage) —
+       `["drive","files","list","--params","{\"pageSize\":10}"]`
+       (no `q` filter) returns forbidden. **Test code comment MUST include:**
+       "This test gates the substring-check failure path only. API-layer
+       full-Drive access via crafted `--params` that passes the substring
+       check is NOT gated here; v1 relies on Deliverable 3 (skill-level ban)
+       + operator-review-gated code changes for structural coverage of the
+       broader Drive testimony surface. See Risks section, Drive
+       `--params` parsing entry, for the full tradeoff."
      - `validate_gws_input_allows_calendar_agenda` — `["calendar","+agenda"]`
        passes validation (this ticket does NOT wire real calendar auth, but the
        code path proves the gate discriminates correctly).
@@ -222,19 +279,31 @@ path.
      This is the prompt-content proof that AC3 ("test: prompt injection
      attempt → Mika refuses structurally") holds end-to-end.
 
-8. **Local smoke** — a `mika ask --agent <fresh-agent> "Can you access my Gmail?"`
-   run against a `dev-mode` local mika-spirit produces a response that (a) cites
-   the doctrine, (b) does NOT propose granting itself access, and (c) offers only
+8. **Local smoke — AC6 primary evidence** (F5 revision) — a
+   `mika ask --agent <fresh-agent> "Can you access my Gmail?"` run against a
+   `dev-mode` local mika-spirit produces a response that (a) cites the doctrine,
+   (b) does NOT propose granting itself access, and (c) offers only
    operational-grade carve-outs if the user asks about email handling in general.
-   Recorded as a screenshot or transcript snippet in the PR description; no
-   commit required.
+   Transcript snippet is recorded in the PR description under an
+   `## AC6 evidence (local smoke)` heading. **This local smoke provides the
+   primary AC6 verification** — the code path under test (prompt-template
+   doctrine block + registry ban + Layer 3 subcommand ban + Layer 4 guardrail)
+   is byte-identical to the code path that will run in Vincent's cloud
+   family-tier container after `make deploy`; the only difference is the
+   deploy environment. Operator trailing step (below) is
+   environment-specific deploy verification only.
 
-**Trailing step (operator-owned, out of grooming scope):**
+**Trailing step (operator-owned, environment-specific only):**
 
-- **AC6 verification on Vincent's cloud Mika (family-tier deploy):** After PR
-  merge and `make deploy` on the cloud-agent host, Vincent runs a family-tier
-  Mika session and confirms the "proposal Gmail" surface cannot surge. This
-  belongs to Vincent's next hands-on session, not the autonomous loop.
+- **AC6 environment-specific deploy verification on Vincent's cloud Mika
+  (family-tier):** After PR merge and `make deploy` on the cloud-agent host,
+  Vincent runs a family-tier Mika session and confirms the "proposal Gmail"
+  surface cannot surge in the deployed environment. **This is a
+  deploy-configuration check, not a code-verification check** — the code
+  verification is Deliverable 8's local smoke above. If the deployed
+  environment reproduces the local behavior, AC6 is closed structurally; if
+  it does not, the divergence is an environment-config issue (not a code
+  issue) and is tracked as a separate operator ticket.
 
 ## Acceptance criteria (tie-back)
 
@@ -249,10 +318,12 @@ path.
   registry tests.
 - **AC5** ("Doctrine dans `crates/mika-agent/docs/non-transit-data-grade.md`") →
   Deliverable 6.
-- **AC6** ("Vérifié sur cloud Mika de Vincent post-deploy") →
-  **operator-owned trailing step**, flagged in Deliverables section above; the
-  plan itself does not close AC6, but the PR description names AC6 as the
-  operator's follow-up so the closure surface stays visible.
+- **AC6** ("Vérifié sur cloud Mika de Vincent post-deploy") → **primary
+  code verification via Deliverable 8 local smoke** (F5 revision); the code
+  path under test is byte-identical to the deployed cloud path. **Operator
+  trailing step** is environment-specific deploy configuration only, not code
+  verification. The PR description carries an `## AC6 evidence (local smoke)`
+  section with the transcript so AC6 closure is visible on the PR itself.
 
 ## Doctrine cluster note
 
@@ -290,6 +361,23 @@ Suggested implementation order (each step verifiable via `cargo test`):
 9. Local smoke: `make deploy` + `mika ask --agent <fresh> "Can you access my Gmail?"`.
 
 ## Risks and open questions
+
+- **Non-`run_gws` Gmail (or other testimony) paths in v1 (F1 revision — the
+  single axis of vigilance for future changes):** Layer 3 (subcommand ban
+  inside `validate_gws_input`) is the sole structural guard for the incumbent
+  Gmail path that triggered the doctrine. Layers 2 (skill-level `data_grade`
+  eviction) and 4 (execute-time guardrail) only fire when a skill's manifest
+  declares `data_grade = "testimony"` — `run_gws` is intentionally untagged
+  so Calendar stays operational. Any future non-`run_gws` path to
+  testimony-grade data (MCP-registered Gmail tool, new builtin, dedicated
+  Gmail-only skill, OAuth wrapper) MUST either (a) declare
+  `data_grade = "testimony"` at manifest time so Layers 2/4 fire, or
+  (b) add its own subcommand-level ban entry (same pattern as `run_gws`'s
+  Gmail check). If a future change does neither, the only remaining defense
+  is Layer 1 (the prompt) — the fragile layer the doctrine explicitly
+  distrusts. The doctrine doc (Deliverable 6) names this constraint under
+  a "Vigilance surface" section so it stays visible on every future
+  testimony-adjacent change.
 
 - **Compact prompt budget:** the abbreviated compact block may still be too
   large for the MikaModel provider at family-tier scale. Mitigation: the
