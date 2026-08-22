@@ -237,9 +237,12 @@ path.
        matters for prompt-priority — see CLAUDE.md § Context priority rule).
    - `crates/mika-agent/src/skills/mod.rs` (or `registry.rs`) tests (add ~3):
      - `apply_testimony_grade_ban_evicts_testimony_skill` — build a fake
-       `SkillRegistry` with two entries (one Operational, one Testimony); after
-       `apply_testimony_grade_ban`, the Testimony entry is in `banned_testimony`
-       and NOT in `entries`.
+       `SkillRegistry` with two entries (one Operational, one Testimony);
+       after `apply_testimony_grade_ban`, assert (a) the Testimony entry
+       is NOT present in `entries` and (b) a WARN log line with `event =
+       "skill_testimony_ban"` was emitted (capture via `tracing::subscriber::
+       with_default` + a test collector). N1 revision: no `banned_testimony`
+       field assertion — the field was dropped in F2.
      - `apply_testimony_grade_ban_no_op_when_all_operational` — sanity: ordinary
        registries are unaffected.
      - `apply_testimony_grade_ban_composes_with_allowlist_and_overrides` —
@@ -310,8 +313,13 @@ path.
 - **AC1** ("Prompt template Mika includes doctrine data-grade explicitly") →
   Deliverable 1 + tests 4 & scenario.
 - **AC2** ("Mécanisme structural en place — Mika ne peut pas *proposer* d'accéder
-  à testimony-grade") → Deliverables 1 + 2 + 4 + 5 combined; the prompt block
-  covers *proposer*, the guardrail+registry-ban cover *accéder* structurally.
+  à testimony-grade") → Deliverables 1 + 2 + 4 + 5 combined. **Coverage-honest
+  split (N2 revision):** the prompt block (Deliverable 1) covers *proposer*;
+  the Layer 3 subcommand ban (Deliverable 4) covers *accéder* structurally
+  for the incumbent `run_gws` Gmail path; Layers 2 and 5 (skill-level
+  eviction + execute-time guardrail) pre-position for *future* testimony-
+  grade skills but do NOT cover the current Gmail surface (see coverage-
+  honesty note in Deliverable 3 and Risks entry on non-`run_gws` paths).
 - **AC3** ("Test: prompt injection tentant grant Gmail → Mika refuse
   structurellement") → Deliverable 7 scenario + `run_gws` Gmail rejection tests.
 - **AC4** ("Test: registry rejette skill tagged testimony-grade") → Deliverable 7
