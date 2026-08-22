@@ -143,6 +143,14 @@ pub enum RunStatus {
     /// Unit A). Persisted as `status='failed_no_delegation'`; the failing
     /// decompose phase is carried in `TeamRun::failure_context`.
     FailedNoDelegation,
+    /// Terminal state (mika#1671 D3): every completed delegation in an iteration
+    /// failed at the transport layer, so the run short-circuited without entering
+    /// review/deliver. Distinct from `Failed(String)` so dashboards and metrics can
+    /// tell "all-members-transport-error (retryable in principle)" apart from a
+    /// mixed/business-logic failure. Carries a human-readable reason, mirroring
+    /// `Failed(String)`. Composes independently with `FailedNoDelegation` — the two
+    /// terminal states cover different failure classes at different layers.
+    FailedTransport(String),
 }
 
 /// A task delegated to a specialist agent.
@@ -268,6 +276,7 @@ impl std::fmt::Display for RunStatus {
             RunStatus::Suspended => write!(f, "suspended"),
             RunStatus::Failed(msg) => write!(f, "failed: {msg}"),
             RunStatus::FailedNoDelegation => write!(f, "failed_no_delegation"),
+            RunStatus::FailedTransport(msg) => write!(f, "failed_transport: {msg}"),
         }
     }
 }

@@ -311,9 +311,9 @@ impl Tool for DelegateTaskTool {
             Ok(outcome) => {
                 // Persist non-empty text responses; skip empty (tool-use-only turns)
                 let text = match outcome {
-                    crate::agent::TeamAgentOutcome::Done(Some(t)) => Some(t.as_str()),
+                    crate::agent::TeamAgentOutcome::Done { text: Some(t), .. } => Some(t.as_str()),
                     crate::agent::TeamAgentOutcome::TimedOut(t) => Some(t.as_str()),
-                    crate::agent::TeamAgentOutcome::Done(None) => None,
+                    crate::agent::TeamAgentOutcome::Done { text: None, .. } => None,
                 };
                 if let Some(text) = text
                     && let Err(e) = async_db

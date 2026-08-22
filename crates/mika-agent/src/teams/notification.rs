@@ -65,6 +65,17 @@ pub(crate) fn build_run_completion_message(run: &TeamRun) -> Option<CompletionMe
             deliverable_chars: 0,
             truncated: false,
         }),
+        // mika#1671: terminal transport-fail short-circuit — notify like a failure
+        // but with a transport-specific kind for dashboards/metrics.
+        RunStatus::FailedTransport(reason) => Some(CompletionMessage {
+            text: format!(
+                "Team '{}' failed at the transport layer: {}",
+                run.team_name, reason
+            ),
+            notification_kind: "transport_failure",
+            deliverable_chars: 0,
+            truncated: false,
+        }),
         // Running and Suspended are non-terminal — no notification.
         RunStatus::Running | RunStatus::Suspended => None,
     }
@@ -102,6 +113,22 @@ pub(crate) fn build_run_completion_message_from_row(run: &TeamRunRow) -> Option<
             Some(CompletionMessage {
                 text: format!("Team '{}' failed: {}", run.team_name, reason),
                 notification_kind: "failure",
+                deliverable_chars: 0,
+                truncated: false,
+            })
+        }
+        // mika#1671: terminal transport-fail short-circuit (async resume path).
+        "failed_transport" => {
+            let reason = run
+                .failure_reason
+                .as_deref()
+                .unwrap_or("all-delegations-transport-failed");
+            Some(CompletionMessage {
+                text: format!(
+                    "Team '{}' failed at the transport layer: {}",
+                    run.team_name, reason
+                ),
+                notification_kind: "transport_failure",
                 deliverable_chars: 0,
                 truncated: false,
             })
@@ -258,6 +285,22 @@ mod tests {
     }
 
     #[test]
+    fn test_failed_transport() {
+        // mika#1671: the all-transport-failed short-circuit surfaces as a
+        // transport-specific notification kind (distinct from generic "failure").
+        let run = make_run(
+            RunStatus::FailedTransport("all-delegations-transport-failed".to_string()),
+            None,
+        );
+        let msg = build_run_completion_message(&run).unwrap();
+        assert_eq!(
+            msg.text,
+            "Team 'alpha' failed at the transport layer: all-delegations-transport-failed"
+        );
+        assert_eq!(msg.notification_kind, "transport_failure");
+    }
+
+    #[test]
     fn test_non_terminal_running() {
         let run = make_run(RunStatus::Running, None);
         assert!(build_run_completion_message(&run).is_none());
@@ -295,6 +338,33 @@ mod tests {
         let row = make_row("failed", None, None);
         let msg = build_run_completion_message_from_row(&row).unwrap();
         assert_eq!(msg.text, "Team 'alpha' failed: unknown error");
+    }
+
+    #[test]
+    fn test_row_failed_transport() {
+        // mika#1671: async resume path reads the persisted "failed_transport" status.
+        let row = make_row(
+            "failed_transport",
+            Some("all-delegations-transport-failed".to_string()),
+            None,
+        );
+        let msg = build_run_completion_message_from_row(&row).unwrap();
+        assert_eq!(
+            msg.text,
+            "Team 'alpha' failed at the transport layer: all-delegations-transport-failed"
+        );
+        assert_eq!(msg.notification_kind, "transport_failure");
+    }
+
+    #[test]
+    fn test_row_failed_transport_no_reason() {
+        // Missing failure_reason falls back to the canonical short-circuit reason.
+        let row = make_row("failed_transport", None, None);
+        let msg = build_run_completion_message_from_row(&row).unwrap();
+        assert_eq!(
+            msg.text,
+            "Team 'alpha' failed at the transport layer: all-delegations-transport-failed"
+        );
     }
 
     #[test]

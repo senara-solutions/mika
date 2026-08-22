@@ -70,12 +70,93 @@ pub const EMPTY_RESPONSE_FALLBACK: &str = "Done.";
 /// Fallback message used when a failed callback task has no error details in its result.
 pub const FAILED_TASK_FALLBACK: &str = "Task failed with no error details.";
 
+/// Delegation-layer classification at the agent→team-engine boundary (mika#1671 D1).
+///
+/// Produced by `run_team_agent`'s post-loop classifier and consumed by the team
+/// engine's all-transport-failed short-circuit. Typed rather than string-sniffed so
+/// the contract survives model-version drift.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DelegationOutcome {
+    /// Delegation completed cleanly (includes business-logic apologies that arrive
+    /// as a successful `Ok(response)` — those are NOT transport failures, mika#1671 D2).
+    Completed,
+    /// Delegation failed at the transport layer (HTTP 503, transport/connection/dns
+    /// error, or a hard agent-loop deadline). `retryable` is advisory metadata for
+    /// dashboards; the short-circuit fires regardless.
+    TransportError { reason: String, retryable: bool },
+    /// A hard, non-transport failure of the delegation (e.g. the agent loop returned
+    /// `Err` for a reason that is not transport-shaped). Kept distinct from
+    /// `TransportError` so a mixed iteration does not short-circuit (mika#1671 AC4).
+    BusinessLogicFailure,
+}
+
+/// Transport-error signatures scanned in failed tool-call outputs (mika#1671 D2 —
+/// strict transport-only). `"503"` catches the founding-incident `a2a_call` shape
+/// (`... HTTP status server error (503 Service Unavailable) ...`); the remaining
+/// substrings cover the transport error classes D2 enumerates. Lower-cased before
+/// comparison.
+const TRANSPORT_ERROR_SIGNATURES: &[&str] = &[
+    "503",
+    "transport error",
+    "connection refused",
+    "timeout",
+    "dns error",
+];
+
+/// Classify a completed delegation from its accumulated tool-call summaries
+/// (mika#1671 D2). Only failed calls (`success == false`, i.e. `ToolOutput::error`)
+/// are inspected — a business-logic apology that arrives as a successful result never
+/// qualifies as transport failure, preserving the AC4 mixed-iteration invariant.
+pub(crate) fn classify_delegation_from_summaries(
+    summaries: &[ToolCallSummary],
+) -> DelegationOutcome {
+    for s in summaries {
+        if s.success {
+            continue;
+        }
+        let lower = s.output_summary.to_lowercase();
+        if let Some(sig) = TRANSPORT_ERROR_SIGNATURES
+            .iter()
+            .find(|sig| lower.contains(*sig))
+        {
+            return DelegationOutcome::TransportError {
+                reason: format!("{} failed ({sig}): {}", s.name, s.output_summary),
+                retryable: true,
+            };
+        }
+    }
+    DelegationOutcome::Completed
+}
+
+/// Classify a hard agent-loop `Err` string for delegations that never produced a
+/// `TeamAgentOutcome` (mika#1671). A transport-shaped error string still counts as a
+/// transport failure; anything else is a non-transport hard failure that must NOT
+/// contribute to the all-transport short-circuit (AC4).
+pub(crate) fn classify_delegation_from_error(error: &str) -> DelegationOutcome {
+    let lower = error.to_lowercase();
+    if let Some(sig) = TRANSPORT_ERROR_SIGNATURES
+        .iter()
+        .find(|sig| lower.contains(*sig))
+    {
+        DelegationOutcome::TransportError {
+            reason: format!("delegation error ({sig}): {error}"),
+            retryable: true,
+        }
+    } else {
+        DelegationOutcome::BusinessLogicFailure
+    }
+}
+
 /// Outcome of a team agent run. Typed to distinguish timeout from success
 /// so callers can make informed fallback decisions (#1128).
 #[derive(Debug)]
 pub enum TeamAgentOutcome {
-    /// Agent completed and produced text (or None for tool-use-only turns).
-    Done(Option<String>),
+    /// Agent completed and produced text (or None for tool-use-only turns). Carries
+    /// the delegation-layer classification (mika#1671 D1).
+    Done {
+        text: Option<String>,
+        outcome: DelegationOutcome,
+    },
     /// Agent hit the per-agent deadline. The string describes which timeout path fired.
     TimedOut(String),
 }
@@ -86,8 +167,21 @@ impl TeamAgentOutcome {
     /// Use this for callers that don't need to distinguish timeout from success.
     pub fn into_text(self) -> String {
         match self {
-            Self::Done(text) => text.unwrap_or_default(),
+            Self::Done { text, .. } => text.unwrap_or_default(),
             Self::TimedOut(reason) => reason,
+        }
+    }
+
+    /// Delegation-layer classification for the team engine's all-transport-failed
+    /// short-circuit (mika#1671). A `TimedOut` maps to a retryable transport error —
+    /// `LoopResult::DeadlineExceeded` is a transport-class signal per D2.
+    pub fn delegation_outcome(&self) -> DelegationOutcome {
+        match self {
+            Self::Done { outcome, .. } => outcome.clone(),
+            Self::TimedOut(reason) => DelegationOutcome::TransportError {
+                reason: reason.clone(),
+                retryable: true,
+            },
         }
     }
 }
@@ -4696,7 +4790,14 @@ async fn run_team_agent_inner_impl(
     }
 
     match result {
-        LoopResult::Done { text, .. } => {
+        LoopResult::Done {
+            text,
+            tool_call_summaries,
+            ..
+        } => {
+            // mika#1671 D1/D2: classify the delegation from its tool-call trail so the
+            // team engine can short-circuit an all-transport-failed iteration.
+            let outcome = classify_delegation_from_summaries(&tool_call_summaries);
             if let Some(task_id) = params.child_task_id {
                 let result_text = text.as_deref().unwrap_or("");
                 match params
@@ -4712,7 +4813,7 @@ async fn run_team_agent_inner_impl(
                     Ok(true) => {}
                 }
             }
-            Ok(TeamAgentOutcome::Done(text))
+            Ok(TeamAgentOutcome::Done { text, outcome })
         }
         LoopResult::MaxStepsExceeded {
             tool_call_summaries,
@@ -4738,6 +4839,10 @@ async fn run_team_agent_inner_impl(
                 }
                 return Ok(TeamAgentOutcome::TimedOut(fallback.to_string()));
             }
+
+            // mika#1671 D1/D2: classify from the pre-continuation tool trail before
+            // `tool_call_summaries` is borrowed by the continuation turn.
+            let outcome = classify_delegation_from_summaries(&tool_call_summaries);
 
             let cont = attempt_continuation_turn(
                 &mut request,
@@ -4770,7 +4875,10 @@ async fn run_team_agent_inner_impl(
                 }
             }
 
-            Ok(TeamAgentOutcome::Done(Some(cont.text)))
+            Ok(TeamAgentOutcome::Done {
+                text: Some(cont.text),
+                outcome,
+            })
         }
         LoopResult::DeadlineExceeded { .. } => {
             warn!(
@@ -10865,5 +10973,153 @@ mod tests {
         let u = usage_without_cache();
         let f = build_turn_usage_fields(0, Some(&u), "EndTurn", false, "success", 12345);
         assert_eq!(f.latency_ms, 12345);
+    }
+
+    // ===========================================================================
+    // mika#1671 (AC2) — delegation-outcome classifier ruleset
+    //
+    // D2 is strict transport-only. The classifier must qualify: HTTP 503 (founding
+    // incident), transport/connection/dns error substrings, and deadline-exceeded
+    // (mapped from `TeamAgentOutcome::TimedOut`). It must NOT qualify: apologetic
+    // business responses that arrive as a successful `Ok(response)`, and clean
+    // successes — those route to `Completed`/`BusinessLogicFailure` so a mixed
+    // iteration never short-circuits (AC4).
+    // ===========================================================================
+
+    /// Build a `ToolCallSummary` stub for classifier tests. `success == false`
+    /// mirrors a `ToolOutput::error` result (the only shape the classifier inspects).
+    fn summary(name: &str, output: &str, success: bool) -> ToolCallSummary {
+        ToolCallSummary {
+            step: 0,
+            name: name.to_string(),
+            input_summary: String::new(),
+            output_summary: output.to_string(),
+            success,
+            non_zero_exit: false,
+        }
+    }
+
+    #[test]
+    fn classify_503_from_a2a_call_qualifies() {
+        // Founding-incident shape: a2a_call 503 surfaced as a failed tool result.
+        let summaries = vec![summary(
+            "a2a_call",
+            "HTTP status server error (503 Service Unavailable) for url (...)",
+            false,
+        )];
+        assert!(matches!(
+            classify_delegation_from_summaries(&summaries),
+            DelegationOutcome::TransportError { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_transport_error_substring_qualifies() {
+        let summaries = vec![summary("a2a_call", "transport error: broken pipe", false)];
+        assert!(matches!(
+            classify_delegation_from_summaries(&summaries),
+            DelegationOutcome::TransportError { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_connection_refused_and_dns_error_qualify() {
+        for sig in ["connection refused", "dns error while resolving host"] {
+            let summaries = vec![summary("a2a_call", sig, false)];
+            assert!(
+                matches!(
+                    classify_delegation_from_summaries(&summaries),
+                    DelegationOutcome::TransportError { .. }
+                ),
+                "signature {sig:?} must qualify as transport failure"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_deadline_exceeded_qualifies_via_timed_out() {
+        // A hard agent-loop deadline surfaces as `TeamAgentOutcome::TimedOut`, which
+        // maps to a retryable transport error per D2 (deadline-exceeded qualifies).
+        let outcome = TeamAgentOutcome::TimedOut(
+            "Agent timed out while processing team task (deadline exceeded in run_loop)."
+                .to_string(),
+        );
+        assert!(matches!(
+            outcome.delegation_outcome(),
+            DelegationOutcome::TransportError {
+                retryable: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn classify_apologetic_business_response_does_not_qualify() {
+        // The model said "I can't" but every tool call succeeded — a business-logic
+        // apology arrives as `Ok(response)` and must NOT be a transport failure (AC4).
+        let summaries = vec![
+            summary("read_file", "file contents ...", true),
+            summary(
+                "send_message",
+                "I'm sorry, I can't complete this task with the available data.",
+                true,
+            ),
+        ];
+        assert_eq!(
+            classify_delegation_from_summaries(&summaries),
+            DelegationOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn classify_clean_success_does_not_qualify() {
+        let summaries = vec![summary("read_file", "ok", true)];
+        assert_eq!(
+            classify_delegation_from_summaries(&summaries),
+            DelegationOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn classify_empty_summaries_is_completed() {
+        assert_eq!(
+            classify_delegation_from_summaries(&[]),
+            DelegationOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn classify_successful_call_with_503_in_output_does_not_qualify() {
+        // Only FAILED calls are inspected: a successful result that merely mentions
+        // "503" in prose (e.g. the agent describing a status code) is not a transport
+        // failure — guards against false positives on business content.
+        let summaries = vec![summary(
+            "send_message",
+            "The upstream returned 503 earlier but recovered; here is the summary.",
+            true,
+        )];
+        assert_eq!(
+            classify_delegation_from_summaries(&summaries),
+            DelegationOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn classify_error_string_transport_shaped_qualifies() {
+        // Hard agent-loop `Err` with a transport-shaped string still counts.
+        assert!(matches!(
+            classify_delegation_from_error("connection refused by peer"),
+            DelegationOutcome::TransportError { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_error_string_non_transport_is_business_failure() {
+        // A hard `Err` that is not transport-shaped must NOT contribute to the
+        // all-transport short-circuit (AC4) — it maps to BusinessLogicFailure.
+        assert_eq!(
+            classify_delegation_from_error("agent 'foo' not found in team resources"),
+            DelegationOutcome::BusinessLogicFailure
+        );
     }
 }
