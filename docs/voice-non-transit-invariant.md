@@ -1,3 +1,8 @@
+---
+title: Voice Non-Transit Invariant
+description: Build-time invariant for the voice testimony lane — no cloud STT/TTS reachable by construction (mika#1796).
+---
+
 # Voice testimony lane — non-transit invariant
 
 > **Prime line — non-negotiable.**
