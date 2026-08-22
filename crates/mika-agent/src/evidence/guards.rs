@@ -484,6 +484,91 @@ pub(crate) fn equivalence_claim_satisfied(
     })
 }
 
+// ---------------------------------------------------------------------------
+// mika#1814 — Distribution Doctrine (public-promo) guard
+// ---------------------------------------------------------------------------
+
+/// Label used for `intent_guard_retries` tracking of the Distribution Doctrine
+/// public-promo guard (mika#1814). Inline guard (not in `INTENT_GUARDS` const
+/// array) because it checks *assistant* text and needs a dynamic correction
+/// message. Sibling of `dev_groom_fabrication` (5b) and
+/// `fabricated_action_claim` (5) — all three catch doctrine violations expressed
+/// in a proposal / drafting shape.
+pub const DOCTRINE_PUBLIC_PROMO_LABEL: &str = "doctrine_public_promo";
+
+/// Structured result from Distribution Doctrine public-promo detection.
+pub struct DoctrinePublicPromoMatch {
+    /// The prohibited-surface keyword captured by Layer A (e.g. `Show HN`).
+    pub subject: String,
+    /// The proposal / drafting verb captured by Layer B (e.g. `let's`, `rédiger`).
+    pub verb: String,
+}
+
+/// Layer A — prohibited public-launch surfaces (Show HN, Product Hunt, etc.).
+/// Word-bounded so ambient prose ("I read a Reddit post about X") does not
+/// trigger without the qualifying `launch` keyword.
+static DOCTRINE_SUBJECT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)\b(show\s*hn|hacker\s*news\s+launch|product\s*hunt|reddit\s+launch|twitter\s+(?:promo|launch|thread\s+promo)|growth[\s-]*hack)\b",
+    )
+    .expect("doctrine subject regex must compile")
+});
+
+/// Layer B — first-person / second-person proposal, drafting, or planning
+/// verb. Bilingual (French for family-tier Al re-play + English for
+/// operator-tier). Requires both layers to fire so an educational answer
+/// ("Mika does not do Show HN — she grows by invitation") does not match.
+static DOCTRINE_PROPOSAL_VERB_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
+    || {
+        regex::Regex::new(
+            r"(?i)\b(?:let'?s|on\s+va|on\s+peut|je\s+peux|i\s+can|we\s+can|drafting|r[eé]dig(?:er|eons|eant)|prepare|plan\s+(?:for|the)|next\s+step\s+(?:is|would\s+be)|prochaine\s+[eé]tape|brouillon)\b",
+        )
+        .expect("doctrine proposal-verb regex must compile")
+    },
+);
+
+/// Detects Distribution Doctrine violations — assistant text that proposes,
+/// drafts, or plans one of the prohibited public-launch surfaces (Show HN,
+/// Product Hunt, Reddit launch, Twitter promo thread, growth-hack tactics).
+///
+/// Two-layer AND filter (mirror of `asserted_unavailability` shape):
+/// - **Layer A (subject match):** one of the prohibited-surface keywords.
+/// - **Layer B (verb match):** a first-person / second-person proposal or
+///   drafting verb (bilingual FR + EN so Al's family-tier French Mika and
+///   Vincent's operator-tier English Mika both trip the guard).
+///
+/// Both layers must match. Layer A alone (educational answer) does NOT fire;
+/// Layer B alone (proposal verb about something else) does NOT fire.
+///
+/// Fast path: skip both regex compiles when the cheap `contains` check finds
+/// no candidate substring in the lowercased text.
+pub(crate) fn detect_doctrine_public_promo(text: &str) -> Option<DoctrinePublicPromoMatch> {
+    // Fast path: none of the surface names present → return early.
+    let lower = text.to_lowercase();
+    let has_candidate = lower.contains("show hn")
+        || lower.contains("showhn")
+        || lower.contains("hacker news launch")
+        || lower.contains("product hunt")
+        || lower.contains("producthunt")
+        || lower.contains("reddit launch")
+        || lower.contains("twitter promo")
+        || lower.contains("twitter launch")
+        || lower.contains("twitter thread promo")
+        || lower.contains("growth hack")
+        || lower.contains("growth-hack")
+        || lower.contains("growthhack");
+    if !has_candidate {
+        return None;
+    }
+
+    let subject_match = DOCTRINE_SUBJECT_RE.find(text)?;
+    let verb_match = DOCTRINE_PROPOSAL_VERB_RE.find(text)?;
+    Some(DoctrinePublicPromoMatch {
+        subject: subject_match.as_str().to_string(),
+        verb: verb_match.as_str().to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1447,5 +1532,88 @@ mod tests {
             equivalence_claim_satisfied(&claim, &summaries),
             "failed attempt to fetch the compared artifact should satisfy"
         );
+    }
+
+    // -- detect_doctrine_public_promo tests (mika#1814) --
+
+    #[test]
+    fn test_doctrine_public_promo_show_hn_french_proposal() {
+        // Founding incident (Al B, 2026-07-20) verbatim shape.
+        let text = "on avait convenu que la prochaine étape était de rédiger le \
+                    brouillon pour Show HN — tu veux qu'on s'y attaque ensemble ?";
+        let m = detect_doctrine_public_promo(text).expect("should fire on FR proposal");
+        assert!(
+            m.subject.to_lowercase().contains("show hn"),
+            "expected 'Show HN' subject, got {:?}",
+            m.subject
+        );
+        assert!(
+            !m.verb.is_empty(),
+            "expected non-empty proposal verb, got {:?}",
+            m.verb
+        );
+    }
+
+    #[test]
+    fn test_doctrine_public_promo_product_hunt_english_proposal() {
+        let text = "Let's draft a Product Hunt launch post — I'll write the first pass now.";
+        let m = detect_doctrine_public_promo(text).expect("should fire on EN proposal");
+        assert!(m.subject.to_lowercase().contains("product hunt"));
+        assert!(m.verb.to_lowercase().starts_with("let"));
+    }
+
+    #[test]
+    fn test_doctrine_public_promo_reddit_growth_hack_shape() {
+        let text = "I can help you with a Reddit launch thread and a growth-hack angle for it.";
+        let m = detect_doctrine_public_promo(text).expect("should fire on Reddit-launch proposal");
+        // Layer A can pick either surface — assert the shape catches SOMETHING
+        // rather than the specific first-match ordering.
+        let subj = m.subject.to_lowercase();
+        assert!(
+            subj.contains("reddit launch") || subj.contains("growth"),
+            "expected reddit-launch or growth-hack subject, got {:?}",
+            m.subject
+        );
+    }
+
+    #[test]
+    fn test_doctrine_public_promo_educational_answer_does_not_fire() {
+        // Layer A hit ("Show HN") but no proposal verb — legitimate education.
+        let text = "Mika does not do Show HN; she grows via personal invitation.";
+        assert!(
+            detect_doctrine_public_promo(text).is_none(),
+            "educational answer should NOT fire the guard"
+        );
+    }
+
+    #[test]
+    fn test_doctrine_public_promo_no_subject_match_does_not_fire() {
+        // Layer B hit ("let's draft") but no prohibited surface — legitimate.
+        let text = "Let's draft the PR description together — I can start now.";
+        assert!(
+            detect_doctrine_public_promo(text).is_none(),
+            "proposal verb without prohibited surface should NOT fire the guard"
+        );
+    }
+
+    #[test]
+    fn test_doctrine_public_promo_ambient_reddit_does_not_fire() {
+        // Common false-positive class: "Reddit" without "launch" is not a
+        // prohibited surface (Reddit search discussion, Reddit article link,
+        // etc.).
+        let text = "We were discussing how the Reddit search algorithm works — \
+                    can you look it up in memory?";
+        assert!(
+            detect_doctrine_public_promo(text).is_none(),
+            "ambient Reddit mention should NOT fire the guard"
+        );
+    }
+
+    #[test]
+    fn test_doctrine_public_promo_case_insensitive() {
+        let text = "on va rédiger un post SHOW HN dès que possible.";
+        let m =
+            detect_doctrine_public_promo(text).expect("should fire regardless of subject casing");
+        assert_eq!(m.subject.to_lowercase().replace(' ', ""), "showhn");
     }
 }

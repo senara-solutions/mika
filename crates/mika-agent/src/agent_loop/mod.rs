@@ -20,9 +20,10 @@ use tracing::{Instrument, debug, error, info, info_span, warn};
 use crate::async_db::AsyncDatabase;
 use crate::compaction;
 use crate::evidence::guards::{
-    ASSERT_GROUNDED_LABEL, ASSERTED_UNAVAILABILITY_LABEL, EQUIVALENCE_CLAIM_LABEL,
-    assert_grounded_satisfied, asserted_unavailability_satisfied, detect_affirmative_state_claim,
-    detect_asserted_unavailability, detect_equivalence_claim, detect_fabricated_action_claim,
+    ASSERT_GROUNDED_LABEL, ASSERTED_UNAVAILABILITY_LABEL, DOCTRINE_PUBLIC_PROMO_LABEL,
+    EQUIVALENCE_CLAIM_LABEL, assert_grounded_satisfied, asserted_unavailability_satisfied,
+    detect_affirmative_state_claim, detect_asserted_unavailability, detect_doctrine_public_promo,
+    detect_equivalence_claim, detect_fabricated_action_claim,
     detect_unverified_callback_state_claim, equivalence_claim_satisfied,
 };
 use crate::mcp::McpManager;
@@ -1767,6 +1768,71 @@ async fn run_loop(
                             });
                             continue;
                         }
+                    }
+
+                    // mika#1814 — Distribution Doctrine public-promo guard (5c).
+                    // Same fabrication-class family as guard 5 (fabricated_action_claim)
+                    // and 5b (dev_groom_fabrication) — catches assistant text that
+                    // proposes / drafts / plans a prohibited public-launch surface
+                    // (Show HN, Product Hunt, Reddit launch, Twitter promo thread,
+                    // growth-hack). Two-layer regex (subject AND proposal verb) so
+                    // educational answers do NOT fire. Applies uniformly across
+                    // modes (conversation, silent, team) and both tiers
+                    // (family/operator) — a heartbeat that spontaneously drafts a
+                    // Show HN is exactly as bad as a conversation-mode one.
+                    // Single-retry via intent_guard_retries, same tracking as the
+                    // asserted_unavailability / assert_grounded inline siblings.
+                    // Not skipped by `skip_remaining_guards` (#1178) — a completed
+                    // PR review does not grant license to draft a public launch.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !intent_guard_retries.contains(DOCTRINE_PUBLIC_PROMO_LABEL)
+                        && let Some(promo) = detect_doctrine_public_promo(&text)
+                    {
+                        intent_guard_retries.insert(DOCTRINE_PUBLIC_PROMO_LABEL);
+                        let corr_id =
+                            format!("{}:{}:doctrine_public_promo", tool_ctx.trace_id, step);
+                        guard_correlation = Some(GuardCorrelation {
+                            correlation_id: corr_id.clone(),
+                            guard_label: "doctrine_public_promo",
+                            step,
+                        });
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
+                            matched_subject = %promo.subject,
+                            matched_verb = %promo.verb,
+                            guard_correlation_id = %corr_id,
+                            label = mode.label(),
+                            event = "guard.doctrine_public_promo",
+                            "Distribution Doctrine public-promo guard fired — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(
+                                "[mika-engine] Your response proposes or drafts a \
+                                 public-launch artifact (Show HN, Product Hunt, \
+                                 Reddit launch, Twitter promo thread, growth-hack, \
+                                 etc.). This violates Mika's invitation-only \
+                                 distribution doctrine — see the `## Distribution \
+                                 Doctrine` section of your system prompt. \
+                                 Rewrite your response now: decline the proposal \
+                                 and gently redirect to the invitation-chain \
+                                 suggestion. Do NOT plan, draft, or offer to help \
+                                 with any public-promotion artifact. A brief \
+                                 redirect is enough — do not moralise or over-explain."
+                                    .to_string(),
+                            ),
+                        });
+                        continue;
                     }
 
                     // Intent-precondition registry (#702): iterate INTENT_GUARDS

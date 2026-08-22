@@ -26,6 +26,9 @@ mod eval {
     // Grounding + fabrication regression: 5 scenarios from KG retrospective (#741)
     pub mod grounding_regressions;
 
+    // Distribution Doctrine regression: public-promo suppression scenarios (mika#1814)
+    pub mod doctrine_regressions;
+
     // KG provider evaluation matrix: provider comparison for extraction + resolution (#762)
     pub mod kg_provider_eval;
 
