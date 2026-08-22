@@ -12,6 +12,15 @@ publish = false
 name = "mika-gateway"
 path = "src/main.rs"
 
+# mika#1796 — expose the `voice` module (build-time non-transit invariant) as a
+# library surface so trybuild compile-fail fixtures under
+# `tests/voice_lane_compile_fail/` can `use mika_gateway::voice::...`. Bin and
+# lib share `src/`; main.rs remains the sole binary entry point and continues
+# to declare its own private modules.
+[lib]
+name = "mika_gateway"
+path = "src/lib.rs"
+
 [dependencies]
 mika-common = { workspace = true }
 mika-a2a = { workspace = true }
@@ -59,6 +68,12 @@ tracing-subscriber = { workspace = true, features = ["registry"] }
 # Brave client integration tests (mika#1808) use wiremock to stand in for the
 # Brave Search API — no real network calls in the test binary.
 wiremock = { workspace = true }
+# mika#1796 — voice-lane compile-fail fixtures. Asserts that wiring a cloud
+# STT/TTS type into `VoiceRoom<TestimonyLane, _, _>` is rejected by the
+# type-checker (the build-time non-transit invariant). Snapshot .stderr is
+# pinned to the toolchain in `rust-toolchain.toml` (1.93); a toolchain bump
+# refreshes it via `TRYBUILD=overwrite cargo test -p mika-gateway --test voice_lane_compile_fail`.
+trybuild = "1"
 
 [lints]
 workspace = true

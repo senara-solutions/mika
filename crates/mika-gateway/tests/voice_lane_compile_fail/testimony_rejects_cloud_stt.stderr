@@ -1,0 +1,21 @@
+error[E0277]: the trait bound `DeepgramStt: LocalStt` is not satisfied
+  --> tests/voice_lane_compile_fail/testimony_rejects_cloud_stt.rs:19:30
+   |
+19 |         VoiceRoom::testimony(DeepgramStt::default(), PiperTts::default());
+   |         -------------------- ^^^^^^^^^^^^^^^^^^^^^^ the trait `LocalStt` is not implemented for `DeepgramStt`
+   |         |
+   |         required by a bound introduced by this call
+   |
+help: the trait `LocalStt` is implemented for `WhisperCppStt`
+  --> src/voice/examples.rs
+   |
+   | impl LocalStt for WhisperCppStt {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `VoiceRoom::<TestimonyLane, S, T>::testimony`
+  --> src/voice/room.rs
+   |
+   | impl<S: LocalStt, T: LocalTts> VoiceRoom<TestimonyLane, S, T> {
+   |         ^^^^^^^^ required by this bound in `VoiceRoom::<TestimonyLane, S, T>::testimony`
+...
+   |     pub fn testimony(stt: S, tts: T) -> Self {
+   |            --------- required by a bound in this associated function
