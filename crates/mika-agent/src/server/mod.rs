@@ -1345,6 +1345,39 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     // (mika#1870). Sibling to `kg_shutdown_token`; cancelled at shutdown below.
     let webhook_queue_shutdown = CancellationToken::new();
 
+    // Parent cancellation token for the mika-manager cadence loop (Phase 1
+    // follow-up to PR#1932). Sibling to `kg_shutdown_token` and
+    // `webhook_queue_shutdown`; cancelled at shutdown below. The spawn is
+    // env-gated on `MIKA_MANAGER_TARGET_MILESTONE` — unset → no spawn.
+    let manager_shutdown_token = CancellationToken::new();
+    let manager_handle: Option<tokio::task::JoinHandle<()>> =
+        match crate::milestone_manager::manager_config_from_env() {
+            Ok(Some(cfg)) => {
+                let handle = crate::milestone_manager::spawn_manager_cycle_task(
+                    cfg,
+                    manager_shutdown_token.child_token(),
+                );
+                Some(handle)
+            }
+            Ok(None) => {
+                info!(
+                    target: "mika::milestone_manager",
+                    event = "manager_cadence_disabled",
+                    "mika-manager cadence disabled — MIKA_MANAGER_TARGET_MILESTONE unset"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "mika::milestone_manager",
+                    event = "manager_cadence_config_invalid",
+                    error = %e,
+                    "mika-manager cadence config invalid — spawn skipped, startup continues"
+                );
+                None
+            }
+        };
+
     // mika#1758: per-process task-event broadcast channel. Constructed once
     // here (before AppState so we can hand the same handle to both AppState
     // and every agent's AsyncDatabase). Attached to each agent's
@@ -1616,11 +1649,18 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
             // Cancel the webhook drain workers cooperatively (mika#1870); their
             // select! loops break on the next poll.
             webhook_queue_shutdown.cancel();
+            // Cancel the mika-manager cadence loop (Phase 1 follow-up to
+            // PR#1932). The select! loop exits within one poll interval; if
+            // the task was never spawned (env-gate off), the cancel is a no-op.
+            manager_shutdown_token.cancel();
             for handle in &tick_handles {
                 handle.abort();
             }
             for handle in &kg_tick_handles {
                 handle.abort();
+            }
+            if let Some(h) = manager_handle.as_ref() {
+                h.abort();
             }
         })
         .await?;
