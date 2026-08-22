@@ -1,0 +1,57 @@
+#!/bin/bash
+# finalize-pr — CLI wrapper for dispatch-lib.sh's mika#1941 finalize gate.
+#
+# Applies AC6+AC7+AC8 checks to a PR before it may leave draft/wip-rescue:
+#   AC6 — appends verbatim git-stat + `gh pr view --json` block to PR body
+#   AC7 — checks for formal multi-agent review; adds `needs-multi-agent-review`
+#         label + exits 1 when missing
+#   AC8 — rewrites PR title to most-recent conventional-commit subject
+#
+# Usage:
+#   finalize-pr <repo> <pr_num> [worktree_dir]
+#
+# Example:
+#   finalize-pr mika 1947 /path/to/mika/checkout
+#
+# Exit codes:
+#   0 — all gates green (AC6+AC8 applied, AC7 present)
+#   1 — AC7 review missing (AC6+AC8 still applied)
+#   2 — invalid args
+#   3 — gh CLI failure on title/body update
+#
+# Rooted in mika#1941 — n=3 (2026-08-21..22 nuit):
+#   - mika#1676: dispatch Agent skipped `/ce:review` (AC7 root cause)
+#   - mika#1712 PR#1935: stale `docs(plans): DoD` title (AC8 root cause)
+#   - PR#1939: hand-listed 10 files, actual 13 → 700-line under-count (AC6 root cause)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DISPATCH_LIB="$SCRIPT_DIR/dispatch-lib.sh"
+
+if [ ! -f "$DISPATCH_LIB" ]; then
+    echo "finalize-pr: dispatch-lib.sh not found at $DISPATCH_LIB" >&2
+    exit 2
+fi
+
+# shellcheck source=./dispatch-lib.sh
+source "$DISPATCH_LIB"
+
+if [ $# -lt 2 ] || [ $# -gt 3 ]; then
+    cat >&2 <<USAGE
+Usage: finalize-pr <repo> <pr_num> [worktree_dir]
+
+  repo          — short repo name (e.g. "mika", not "senara-solutions/mika")
+  pr_num        — PR number
+  worktree_dir  — path to local git checkout (defaults to \$PWD)
+
+Applies mika#1941 finalize gate (AC6 verbatim stats + AC7 review + AC8 title).
+USAGE
+    exit 2
+fi
+
+REPO="$1"
+PR_NUM="$2"
+WT_DIR="${3:-$PWD}"
+
+_finalize_pr_gate "$REPO" "$PR_NUM" "$WT_DIR"
