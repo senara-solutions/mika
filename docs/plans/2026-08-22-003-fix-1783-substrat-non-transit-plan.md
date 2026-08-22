@@ -169,6 +169,27 @@ Trade-off:
 
 The two designs are compatible: land the runtime split as the general-case defense (protects future tools that touch substrate config) AND land the boot gate as the specific-case defense for `web_search` (protects THIS tool with maximum paranoia). Belt-and-suspenders is my recommendation, but I want the architect to weigh in — see Open Question 5.
 
+## Acceptance criteria
+
+Verbatim from mika#1783 issue body (canonical criteria — HOW section AC1-AC5 provides the mechanism mapping):
+
+- [ ] Un Mika instancié face à un besoin config-substrat (clé manquante, quota upstream, etc.) **ne verbalise plus** le besoin dans la conv user
+- [ ] La télémétrie substrat va sur un canal opérateur privé (à définir : audit_event, log stream, notification ops — mécanisme laissé au cercle mika-cloud)
+- [ ] Le vaisseau arrive pré-configuré (hors-bande) — le Mika ne « demande » jamais une clé infra
+- [ ] Distinction structurelle **substrat (Vincent maintient, invisible au Mika)** vs **prefs personne (utilisateur choisit, adressé à lui)** vérifiée par construction
+- [ ] Test : forcer une clé manquante côté substrat → Mika ne mentionne pas Vincent, ne suggère pas de relais ; télémétrie ops émise
+
+## Definition of Done
+
+- All Acceptance Criteria above satisfied by construction (structural), not policy
+- `cargo test -p mika-agent skills::builtin_handlers::tests::web_search_family_tier_no_leak` passes
+- `cargo test -p mika-agent skills::builtin_handlers::tests::web_search_family_tier_audit_event` passes
+- `cargo test -p mika-common home::tests::family_soul_no_operator_name` passes
+- `cargo clippy --workspace --all-targets -- -D warnings` clean
+- `cargo fmt --all -- --check` clean
+- Docs: tool-authoring guide (or `crates/mika-agent/docs/configuration.md`) documents the two-channel substrate rule
+- Cross-repo companion ticket filed on `senara-solutions/mika-cloud` for ops sink
+
 ## VERIFICATION
 
 - `cargo test -p mika-agent skills::builtin_handlers::tests::web_search_family_tier_no_leak` — new unit, passes.
