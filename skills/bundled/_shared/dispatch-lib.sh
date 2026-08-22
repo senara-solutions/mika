@@ -2929,6 +2929,290 @@ _detect_plan_on_branch() {
     fi
 }
 
+# =============================================================================
+# mika#1941 — PR finalize gate (structural invariant on out-of-draft transitions)
+#
+# Sami directive 2026-08-22 (verbatim):
+#   « fais de la preuve de review un INVARIANT DE SORTIE de lane, pas une
+#   instruction de brief — concrètement : aucun PR ne quitte wip-rescue/draft
+#   tant que la review multi-agent formelle n'est pas POSTÉE sur GH... Une
+#   instruction se réinterprète ; un invariant structurel non. »
+#
+# Three checks compose the gate:
+#   AC6 — Verbatim `git diff --stat origin/main..HEAD` + `gh pr view --json`
+#         appended to PR body. Reviewer-authoritative ground truth. Rooted
+#         in PR#1939 hand-listed-10-files → actual-13 under-count (~700
+#         lines mis-reported), which triggered 30 min of sami-MPC roundtrip.
+#   AC7 — Formal multi-agent review posted on GH. Rooted in mika#1676 n=1
+#         signal (dispatch Agent skipped `/ce:review` despite explicit brief
+#         instruction) plus the wip-rescue class (mika#1935/#1936). Structural
+#         gate replaces prompt-level instruction that reinterprets under load.
+#   AC8 — PR title matches fix intent (rewrites to most-recent conventional-
+#         commit subject). Rooted in PR#1935 shipping as
+#         `docs(plans): DoD... (#1935)` when actual content was `fix(engine):
+#         phantom sweep` — squash-merge picked stale title from 2nd commit.
+#
+# Companion feedback memories:
+#   - feedback_never_skip_ce_review
+#   - feedback_prompt_enforcement_fragile
+#   - feedback_estimated_counts_undercount_measured
+#   - feedback_claim_type_stratifies_verification_reliability
+#
+# Callers: standalone via `finalize-pr` CLI wrapper (see
+# `_shared/finalize-pr`), or by sourcing `dispatch-lib.sh` and invoking
+# `_finalize_pr_gate <repo> <pr_num> [wt_dir]`.
+# =============================================================================
+
+# _ac8_recent_conventional_commit_title — Find the most recent commit whose
+# subject matches conventional-commit format (fix|feat|refactor|chore|perf|
+# test|docs|ci|build|style|revert with optional scope + optional bang). Skips
+# non-conforming subjects (including `wip(...)` and `Merge ...` lines).
+#
+# Args:
+#   $1 — worktree dir (must be a git checkout)
+#
+# Outputs: commit subject line on stdout, or empty when no match in last 30
+# commits.
+_ac8_recent_conventional_commit_title() {
+    local wt_dir="$1"
+    { [ -d "$wt_dir/.git" ] || [ -f "$wt_dir/.git" ]; } || return 0
+    # `|| true` so grep no-match doesn't propagate through pipefail in callers
+    git -C "$wt_dir" log -30 --format='%s' HEAD 2>/dev/null | \
+        { grep -E '^(fix|feat|refactor|chore|perf|test|docs|ci|build|style|revert)(\([^)]+\))?!?: ' || true; } | \
+        head -1
+}
+
+# _ac6_verbatim_stats_block — Produce ground-truth diff-stat + PR-view JSON
+# markdown block. This is what AC6 requires in the PR body so reviewers and
+# sami read measured (not recalled) file/line counts.
+#
+# The block is signed by a stable header line
+# (`## AC6 verbatim ground truth (dispatch-lib finalize gate, mika#1941)`)
+# which the gate uses for idempotency.
+#
+# Args:
+#   $1 — worktree dir
+#   $2 — PR number
+#   $3 — repo (short form, e.g. "mika")
+#
+# Outputs: markdown block on stdout. Never fails — falls back to sentinel
+# strings when git or gh commands fail (so the block is always emitted).
+_ac6_verbatim_stats_block() {
+    local wt_dir="$1" pr_num="$2" repo="$3"
+    local stat_output pr_json
+    if { [ -d "$wt_dir/.git" ] || [ -f "$wt_dir/.git" ]; }; then
+        stat_output=$(git -C "$wt_dir" diff --stat origin/main..HEAD 2>&1) || \
+            stat_output='<git diff --stat failed>'
+    else
+        stat_output='<worktree not a git repo>'
+    fi
+    if [ -n "$pr_num" ] && [ -n "$repo" ]; then
+        pr_json=$(gh pr view "$pr_num" --repo "senara-solutions/$repo" \
+            --json changedFiles,additions,deletions 2>&1) || \
+            pr_json='{"error":"gh pr view failed"}'
+    else
+        pr_json='{"error":"pr_num or repo missing"}'
+    fi
+    cat <<AC6BLOCK
+## AC6 verbatim ground truth (dispatch-lib finalize gate, mika#1941)
+
+Measured — NOT recalled/estimated. Reviewers: treat these two blocks as
+authoritative; any hand-listed \`Files changed\` counts elsewhere in this PR
+body are informal excerpts.
+
+### \`git diff --stat origin/main..HEAD\`
+
+\`\`\`
+$stat_output
+\`\`\`
+
+### \`gh pr view $pr_num --repo senara-solutions/$repo --json changedFiles,additions,deletions\`
+
+\`\`\`json
+$pr_json
+\`\`\`
+AC6BLOCK
+}
+
+# _ac7_has_formal_multi_agent_review — Detect whether a PR carries a formal
+# multi-agent review posted on GitHub.
+#
+# Formal review detection (either path counts):
+#   (a) Any review body contains one of the signature keywords (case-insensitive
+#       substring): "/ce:review", "p1/p2/p3", "adversarial", "multi-agent",
+#       "multi agent".
+#   (b) A review is authored by a trusted reviewer identity: mika-platform-qa,
+#       ce-code-review-bot, mika-arch, mika-qa (plus [bot] suffixed variants).
+#
+# Args:
+#   $1 — repo (short form)
+#   $2 — pr_num
+#
+# Returns:
+#   0 — formal multi-agent review present
+#   1 — no formal review found
+#   2 — gh/jq error or invalid args
+_ac7_has_formal_multi_agent_review() {
+    local repo="$1" pr_num="$2"
+    if [ -z "$repo" ] || [ -z "$pr_num" ]; then
+        echo "_ac7_has_formal_multi_agent_review: missing repo or pr_num" >&2
+        return 2
+    fi
+    local reviews_json
+    reviews_json=$(gh api "repos/senara-solutions/${repo}/pulls/${pr_num}/reviews" 2>/dev/null) || {
+        echo "_ac7_has_formal_multi_agent_review: gh api failed for repo=$repo pr=$pr_num" >&2
+        return 2
+    }
+    if ! printf '%s' "$reviews_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+        echo "_ac7_has_formal_multi_agent_review: unexpected reviews payload shape" >&2
+        return 2
+    fi
+    # Path (a): signature keyword in body (case-insensitive substring)
+    if printf '%s' "$reviews_json" | jq -e '
+        map(select(
+            ((.body // "") | ascii_downcase) as $b |
+            ($b | contains("/ce:review")) or
+            ($b | contains("p1/p2/p3")) or
+            ($b | contains("adversarial")) or
+            ($b | contains("multi-agent")) or
+            ($b | contains("multi agent"))
+        )) | length > 0
+    ' >/dev/null 2>&1; then
+        return 0
+    fi
+    # Path (b): trusted reviewer identity
+    if printf '%s' "$reviews_json" | jq -e '
+        map(select([
+            (.user.login // "")
+        ] | inside([
+            "mika-platform-qa", "ce-code-review-bot",
+            "mika-arch", "mika-qa",
+            "mika-arch[bot]", "mika-qa[bot]",
+            "mika-platform-qa[bot]"
+        ]))) | length > 0
+    ' >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+# _finalize_pr_gate — Structural invariant gate on PR-out-of-draft transitions
+# (mika#1941). Applies AC6+AC7+AC8 before a PR may leave draft/wip-rescue.
+#
+# Behavior:
+#   AC8 — rewrite PR title to most-recent conventional-commit subject when it
+#         differs from the current title. No-op when no conv-commit is found in
+#         the last 30 commits.
+#   AC6 — append the verbatim git-stat + gh pr view JSON block to the PR body.
+#         Idempotent: skips re-append when the AC6 header signature is already
+#         present in the body.
+#   AC7 — check for formal multi-agent review; when absent, add the
+#         `needs-multi-agent-review` label + return exit 1 so the caller
+#         (wip_rescue auto-resume, correctif Agent, operator) can auto-heal
+#         or bail-to-human. When present, remove the label if it was set.
+#
+# Args:
+#   $1 — repo (short form)
+#   $2 — pr_num
+#   $3 — worktree dir (default: $PWD)
+#
+# Exit codes:
+#   0 — all three gates green (AC6+AC8 applied, AC7 present)
+#   1 — AC7 review missing (AC6+AC8 still applied; caller must gate un-draft)
+#   2 — invalid args
+#   3 — gh CLI failure on title/body update
+_finalize_pr_gate() {
+    local repo="$1" pr_num="$2" wt_dir="${3:-$PWD}"
+    if [ -z "$repo" ] || [ -z "$pr_num" ]; then
+        echo "_finalize_pr_gate: missing repo or pr_num" >&2
+        return 2
+    fi
+
+    # AC8 — title-gate
+    local new_title current_title
+    new_title=$(_ac8_recent_conventional_commit_title "$wt_dir")
+    current_title=$(gh pr view "$pr_num" --repo "senara-solutions/$repo" \
+        --json title --jq '.title' 2>/dev/null) || {
+        echo "_finalize_pr_gate: gh pr view (title) failed for repo=$repo pr=$pr_num" >&2
+        return 3
+    }
+    if [ -n "$new_title" ] && [ "$new_title" != "$current_title" ]; then
+        echo "_finalize_pr_gate: AC8 rewriting title: '$current_title' -> '$new_title'" >&2
+        gh pr edit "$pr_num" --repo "senara-solutions/$repo" --title "$new_title" >/dev/null 2>&1 || {
+            echo "_finalize_pr_gate: AC8 title update failed" >&2
+            return 3
+        }
+    fi
+
+    # AC6 — verbatim stats footer (refresh-in-place: strip stale block if
+    # present, then append fresh. Idempotent on unchanged git-stat content;
+    # correctly refreshes after rebase / new commits — the founding-incident
+    # class this gate exists to prevent.)
+    local current_body
+    current_body=$(gh pr view "$pr_num" --repo "senara-solutions/$repo" \
+        --json body --jq '.body' 2>/dev/null) || {
+        echo "_finalize_pr_gate: gh pr view (body) failed for repo=$repo pr=$pr_num" >&2
+        return 3
+    }
+    # Strip any prior AC6 block by finding the horizontal-rule separator that
+    # immediately precedes the AC6 header and cutting from there to end.
+    # The gate always appends its block LAST, so end-cut is safe.
+    local stripped_body
+    if printf '%s' "$current_body" | grep -qF 'AC6 verbatim ground truth (dispatch-lib finalize gate, mika#1941)'; then
+        # Two-pass strip:
+        #   1. awk exit-on-marker cuts everything from the AC6 header line to EOF
+        #   2. awk end-trim removes trailing blank lines + trailing `---` separator
+        # The gate always appends the block LAST, so end-cut is safe.
+        stripped_body=$(printf '%s' "$current_body" | awk '
+            /^## AC6 verbatim ground truth \(dispatch-lib finalize gate, mika#1941\)$/ { exit }
+            { print }
+        ' | awk '
+            { lines[NR] = $0 }
+            END {
+                n = NR
+                while (n > 0 && (lines[n] ~ /^[[:space:]]*$/ || lines[n] == "---")) n--
+                for (i = 1; i <= n; i++) print lines[i]
+            }
+        ')
+    else
+        stripped_body="$current_body"
+    fi
+    local stats_block new_body
+    stats_block=$(_ac6_verbatim_stats_block "$wt_dir" "$pr_num" "$repo")
+    new_body="${stripped_body}
+
+---
+
+${stats_block}"
+    echo "_finalize_pr_gate: AC6 refreshing verbatim ground-truth block" >&2
+    gh pr edit "$pr_num" --repo "senara-solutions/$repo" --body "$new_body" >/dev/null 2>&1 || {
+        echo "_finalize_pr_gate: AC6 body update failed" >&2
+        return 3
+    }
+
+    # AC7 — formal multi-agent review presence gate
+    _ac7_has_formal_multi_agent_review "$repo" "$pr_num"
+    local ac7_rc=$?
+    case "$ac7_rc" in
+        0)
+            # Green — remove `needs-multi-agent-review` if previously added
+            gh pr edit "$pr_num" --repo "senara-solutions/$repo" \
+                --remove-label "needs-multi-agent-review" >/dev/null 2>&1 || true
+            return 0
+            ;;
+        1)
+            echo "_finalize_pr_gate: AC7 formal multi-agent review MISSING on PR #$pr_num — adding needs-multi-agent-review label" >&2
+            gh pr edit "$pr_num" --repo "senara-solutions/$repo" \
+                --add-label "needs-multi-agent-review" >/dev/null 2>&1 || true
+            return 1
+            ;;
+        *)
+            echo "_finalize_pr_gate: AC7 check errored (rc=$ac7_rc)" >&2
+            return 3
+            ;;
+    esac
+}
+
 # --- Public API ---
 
 # Single entrypoint. No args — entry command is derived from the $SKILL field
