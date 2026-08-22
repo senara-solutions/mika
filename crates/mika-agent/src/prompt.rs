@@ -1701,11 +1701,15 @@ emoji = "✦"
         // (mika#1814) when soul is empty — the doctrine section renders
         // between soul and identity and is code-managed (not tied to soul
         // content). Identity follows immediately after.
+        // safe-byte-slice: DISTRIBUTION_DOCTRINE_HEADING is a compile-time
+        // ASCII-only const ("## Distribution Doctrine") — byte offsets equal
+        // char boundaries by construction, no multi-byte UTF-8 risk.
+        let prefix_end = DISTRIBUTION_DOCTRINE_HEADING.len().min(prompt.len());
         assert!(
             prompt.starts_with(DISTRIBUTION_DOCTRINE_HEADING),
             "empty-soul prompt should start with the Distribution Doctrine \
              heading (soul absent → doctrine is first). Actual prefix: {:?}",
-            &prompt[..DISTRIBUTION_DOCTRINE_HEADING.len().min(prompt.len())]
+            &prompt[..prefix_end] // safe-byte-slice: ASCII-only heading (see comment above)
         );
         assert!(
             prompt.contains("## Identity"),
