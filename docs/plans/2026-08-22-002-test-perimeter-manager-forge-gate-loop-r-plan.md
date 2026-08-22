@@ -186,6 +186,21 @@ scaffolding block), grouping four new `#[test]` functions:
    (`crates/mika-agent/src/milestone_manager/reader.rs` only) classifies as
    DECISION-CORE and returns the file in `decision_core_files`. Sanity companion
    to test #2.
+5. `milestone_manager_absent_from_all_mechanical_tables` — **F2 architect
+   first-pass concern.** Reads `include_str!("rules.rs")` and asserts the
+   substring `milestone_manager` does NOT appear in the file at all — a
+   negative-space assertion complementing tests #1–#4 (which prove positive
+   DECISION-CORE classification). Rationale (per review-guide.md § Orthogonality):
+   a future well-intentioned diff could add a `milestone_manager` entry to any of
+   the four MECHANICAL tables (`MECHANICAL_PREFIXES` / `MECHANICAL_EXACT` /
+   `MECHANICAL_CONTAINS` / `MECHANICAL_SUFFIXES`) — this test catches that
+   whole-file class regardless of which table receives the entry. Distinct from
+   test #3 (which parses only the four table literals): test #5 is a
+   whole-file scan. The pair is redundant-on-purpose — if a future refactor
+   restructures the const tables, test #3 might silently pass a
+   `milestone_manager` entry that test #5 catches (or vice-versa on a rename
+   that hides substring `milestone_manager` behind an alias). Fail-loud on any
+   drift.
 
 **Note on the ticket's suggested `perimeter_boundary_test.rs` sibling.** The ticket
 offers a sibling file as an alternative. This plan places the coverage in the
@@ -363,6 +378,21 @@ five-step cascade named in the ticket:
    that `milestone_manager/**` contains no dispatch-authority tokens (already
    asserted by `no_dispatch_test.rs`). Reference-and-assert-still-passing shape.
 
+**F1 architect first-pass concern — AC5 literal divergence from ticket
+("Uses EvalHarness"):** the ticket's AC5 language names `EvalHarness`, but
+`EvalHarness` is the LLM-eval integration harness (`MockLlmProvider` seeded
+scenarios in `tests/eval/harness.rs`) — it exists to exercise the agent-loop
+`run_agent()` path deterministically without network. mika-manager Phase 1 has
+no LLM turn: `Reader`, `Assessor`, and `Reporter` are all pure code, and the
+perimeter classifier is a pure function. Wrapping any of them in `EvalHarness`
+would add scaffolding without adding assertion power (per review-guide.md § KISS
+— match test tool to system under test). This plan uses direct
+`Reader`/`Assessor`/`classify_pr_files`/`handler` calls instead. If Porte 2
+promotion later adds an LLM turn to mika-manager (dispatch-verdict shape), that
+future test would legitimately need `EvalHarness` — Porte 1 does not. The
+cascade test's first `#[doc]` comment block explicitly names this justification
+so a future reader arriving via the AC-text trail lands on the reasoning.
+
 **Rationale for `#[ignore]` + env-var gate:** the ticket calls for this to run
 pre-Phase-2-cut, not on every PR CI. The gate serves two purposes:
 - Prevents accidental CI runtime cost (the test does non-trivial DB setup and
@@ -403,7 +433,8 @@ Porte 1 discharge condition and lists the five test artifacts as proof:
 //!   `milestone_manager_files_are_decision_core`,
 //!   `milestone_manager_file_taints_pr_batch`,
 //!   `milestone_manager_prefix_not_in_mechanical_tables`,
-//!   `milestone_manager_solo_pr_is_decision_core` (AC1 + AC2).
+//!   `milestone_manager_solo_pr_is_decision_core`,
+//!   `milestone_manager_absent_from_all_mechanical_tables` (AC1 + AC2).
 //! - `crates/mika-agent/tests/eval/test_verdict_handler.rs::verdict_pass_milestone_manager_pr_holds_for_operator` (AC3).
 //! - `crates/mika-agent/tests/eval/test_ci_success_handler.rs::ci_success_milestone_manager_pr_holds_for_operator` (AC4).
 //! - `crates/mika-agent/tests/eval/manager_loop_resistance.rs::cascade_never_dispatches_into_milestone_manager`
@@ -424,7 +455,7 @@ shipped …` line:
 **Statut : DISCHARGED** (mika#1947 landed <YYYY-MM-DD>, PR #<n>, merge SHA `<sha>`).
 Proof in-tree at (mika repo):
 
-- `crates/mika-agent/src/perimeter/tests.rs` — `milestone_manager_*` tests (AC1/AC2).
+- `crates/mika-agent/src/perimeter/tests.rs` — five `milestone_manager_*` tests: `milestone_manager_files_are_decision_core`, `milestone_manager_file_taints_pr_batch`, `milestone_manager_prefix_not_in_mechanical_tables`, `milestone_manager_solo_pr_is_decision_core`, `milestone_manager_absent_from_all_mechanical_tables` (AC1/AC2).
 - `crates/mika-agent/tests/eval/test_verdict_handler.rs::verdict_pass_milestone_manager_pr_holds_for_operator` (AC3).
 - `crates/mika-agent/tests/eval/test_ci_success_handler.rs::ci_success_milestone_manager_pr_holds_for_operator` (AC4).
 - `crates/mika-agent/tests/eval/manager_loop_resistance.rs::cascade_never_dispatches_into_milestone_manager`
@@ -462,7 +493,7 @@ Companion PR: senara-solutions/mika-platform#<N> (§ 3 Porte 1 status update, AC
 
 | AC  | Deliverable                                                                                                                                                       | Plan step | File(s) touched                                                                          |
 |-----|-------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------|------------------------------------------------------------------------------------------|
-| AC1 | Test asserts `MECHANICAL_PREFIXES` / `MECHANICAL_EXACT` do NOT cover `src/milestone_manager/` (structural + positive classification form)                          | Step 1    | `crates/mika-agent/src/perimeter/tests.rs`                                                |
+| AC1 | Test asserts `MECHANICAL_PREFIXES` / `MECHANICAL_EXACT` do NOT cover `src/milestone_manager/` (structural + positive classification form; test #3 parses only the const tables, test #5 scans the whole file — redundant-on-purpose per F2 first-pass architect concern) | Step 1    | `crates/mika-agent/src/perimeter/tests.rs`                                                |
 | AC2 | Unit test: `classify_pr_files(&["crates/mika-agent/src/milestone_manager/reader.rs"])` returns `Classification::DecisionCore` with file in `decision_core_files`   | Step 1    | `crates/mika-agent/src/perimeter/tests.rs`                                                |
 | AC3 | Unit test in `verdict_handler`: milestone_manager PR + APPROVED VERDICT: pass returns `hold` action, writes audit_events row, hold-metadata note                   | Step 2    | `crates/mika-agent/tests/eval/test_verdict_handler.rs`                                    |
 | AC4 | Unit test in `ci_success_handler`: `check_suite.completed(success)` on milestone_manager PR blocks auto-merge with same audit-event shape                          | Step 3    | `crates/mika-agent/tests/eval/test_ci_success_handler.rs` (NEW), `tests/eval.rs`          |
@@ -506,6 +537,20 @@ Mitigation available.
 **R5:** AC7 is a cross-repo doc change (mika-platform). It requires a companion PR
 on `mika-platform`. The meta-repo CLAUDE.md covers this pattern; execution risk is
 low but non-zero (two PRs must land in sequence, mika first for the SHA).
+
+**R6 (RESOLVED — first-pass architect concerns applied).** Two mika-arch
+first-pass concerns were folded into the plan verbatim:
+- **F1 (AC5 divergence justification):** step 4 now includes a dedicated
+  "F1 architect first-pass concern" paragraph explaining WHY `EvalHarness` is
+  inappropriate for a pure-code cascade (per review-guide.md § KISS), and the
+  cascade-test file will include the same reasoning in its first `#[doc]`
+  comment block so a future reader arriving via the AC-text trail lands on the
+  reasoning.
+- **F2 (negative-space assertion on all four MECHANICAL tables):** step 1 gains
+  a fifth test `milestone_manager_absent_from_all_mechanical_tables` that scans
+  the whole `rules.rs` file for the substring `milestone_manager`,
+  redundant-on-purpose with test #3 (const-table-literal scan) — the pair
+  covers table-literal drift AND whole-file introduction paths.
 
 ## 7. Sequencing
 
