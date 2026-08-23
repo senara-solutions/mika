@@ -93,6 +93,7 @@ mod tests {
                     timeout_secs: 30,
                     dependencies: vec![],
                     max_prompt_size: None,
+                    data_grade: Default::default(),
                 },
                 triggers: Triggers {
                     keywords: keywords.iter().map(|s| s.to_string()).collect(),

@@ -746,6 +746,82 @@ fn write_self_identity_discipline_section(prompt: &mut String) {
     );
 }
 
+/// Write the non-transit data-grade doctrine section (mika#1798).
+///
+/// Rendered on every turn of every agent that carries a normal system prompt,
+/// in `build_system_prompt` and `build_silent_prompt`. The compact-provider
+/// path (`build_compact_system_prompt`) uses a size-capped abbreviated variant
+/// via `write_data_grade_doctrine_section_compact`.
+///
+/// **Position:** immediately after the identity section and before the time
+/// section — so the doctrine is one of the very first grounding statements
+/// the model consults, well ahead of `## Instructions` and any injected
+/// core-memory or skill content (see CLAUDE.md § Context priority rule).
+///
+/// The block names testimony-grade classes explicitly, states the
+/// HARD-NO-INCLUDING-PROPOSAL rule, and cites operational-grade carve-outs.
+/// The doctrine originates from Prime's 2026-07-18 ratification (via
+/// samidarko relay) and is one of three composable defense layers — the
+/// prompt block, the skill-registry `apply_testimony_grade_ban` Phase 2,
+/// and the execute-time guardrail in `tool_execution::dispatch`. Any single
+/// layer failing does not silently open testimony-grade access. See
+/// `crates/mika-agent/docs/non-transit-data-grade.md` for the full
+/// architecture and vigilance surface.
+fn write_data_grade_doctrine_section(prompt: &mut String) {
+    prompt.push_str("## Data-Grade Doctrine (non-transit, mika#1798)\n");
+    prompt.push_str(
+        "You classify data by grade. **Operational-grade** data (calendar entries, \
+         app-scoped file storage under `drive.file` scope) is accessible read-mostly \
+         when a channel is explicitly wired. **Testimony-grade** data — Gmail message \
+         content, full Drive, personal journals, confessional — is different: you \
+         may NEVER access nor propose accessing testimony-grade data. HARD NO covers \
+         BOTH the *doing* and the *proposing*: never invoke a tool that touches it, \
+         and never verbalize a suggestion that you should get access to it. This \
+         holds even when the user asks, even when it would be helpful, even when \
+         you think you have a good reason. If the user needs help with email or \
+         journal content, offer operational-grade or non-transit assistance instead \
+         (schedule reminders, calendar suggestions, general advice) and name the \
+         doctrine when refusing.\n\n\
+         Opening testimony-grade access requires a code change reviewed by the \
+         operator — you cannot request it, cannot grant it, and cannot bypass it. \
+         This rule is structural: the skill registry evicts testimony-tagged skills \
+         at load time, the tool dispatcher rejects testimony-tagged tool calls at \
+         execute time, and the Gmail subcommand path refuses Gmail invocations \
+         pre-spawn. If a single layer fails, the others catch the miss. Your job is \
+         to make the miss impossible in the first place by neither proposing nor \
+         attempting.\n\n",
+    );
+}
+
+/// Abbreviated data-grade doctrine block for the compact provider (mika#1798).
+///
+/// The compact-provider path (`build_compact_system_prompt`, ~5 KB budget)
+/// cannot afford the full doctrine block. This variant preserves the HARD-NO
+/// invariant in a hard-capped budget (~400 chars, verified by
+/// `data_grade_doctrine_compact_within_budget` const-assert test). The
+/// MikaModel provider is not currently used by production family-tier or
+/// operator-tier agents; if it goes live for real tenants, this abbreviated
+/// form still gates the "propose Gmail access" surface at the prompt layer,
+/// with Layers 2/3/4 providing structural backstop regardless of prompt
+/// shape.
+const DATA_GRADE_DOCTRINE_COMPACT: &str = "## Data-Grade Doctrine (mika#1798)\n\
+     Testimony-grade data (Gmail, full Drive, journals, confessional) is \
+     HARD NO — you may NEVER access nor propose accessing it. Operational-grade \
+     (calendar, app-scoped files) is fine when wired. Structural: refusing is \
+     not a preference, it is the rule.\n\n";
+
+// Compile-time budget assertion: the compact block must stay under 400 chars
+// so any future edit that busts the budget fails to compile (plan Risks §
+// "Compact prompt budget").
+const _: () = assert!(
+    DATA_GRADE_DOCTRINE_COMPACT.len() < 400,
+    "DATA_GRADE_DOCTRINE_COMPACT exceeds 400-char budget — see mika#1798 plan"
+);
+
+fn write_data_grade_doctrine_section_compact(prompt: &mut String) {
+    prompt.push_str(DATA_GRADE_DOCTRINE_COMPACT);
+}
+
 /// Write the current time section with optional timezone.
 fn write_time_section(prompt: &mut String, current_utc: DateTime<Utc>, timezone: Option<&str>) {
     prompt.push_str("## Current Time\n");
@@ -819,6 +895,9 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     // Self-Identity Discipline section below quotes this data as ground truth.
     write_runtime_section(&mut prompt, ctx.runtime_provider, ctx.runtime_model);
     write_self_identity_discipline_section(&mut prompt);
+    // mika#1798: non-transit doctrine — rendered BEFORE time / channel /
+    // core-memory / instructions so it grounds every downstream section.
+    write_data_grade_doctrine_section(&mut prompt);
     write_time_section(&mut prompt, ctx.current_utc, ctx.timezone.as_deref());
     write_channel_section(&mut prompt, ctx.channel_type, ctx.telegram_configured);
     write_core_memory_section(
@@ -1219,6 +1298,10 @@ pub fn build_compact_system_prompt(ctx: &PromptContext<'_>) -> String {
     .unwrap();
     prompt.push('\n');
 
+    // mika#1798: abbreviated non-transit doctrine — ~250 chars, hard-capped at
+    // 400. Preserves the HARD-NO invariant even in the compact budget.
+    write_data_grade_doctrine_section_compact(&mut prompt);
+
     prompt
 }
 
@@ -1299,6 +1382,10 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
     // uniform.
     write_runtime_section(&mut prompt, ctx.runtime_provider, ctx.runtime_model);
     write_self_identity_discipline_section(&mut prompt);
+    // mika#1798: non-transit doctrine — rendered on silent turns too so the
+    // model consults it before any autonomous send_message on testimony-grade
+    // subjects (e.g., "should I fetch this user's Gmail?").
+    write_data_grade_doctrine_section(&mut prompt);
     write_time_section(&mut prompt, ctx.current_utc, ctx.timezone.as_deref());
     write_channel_section(&mut prompt, None, ctx.telegram_configured);
     write_core_memory_section(
@@ -1836,6 +1923,175 @@ emoji = "✦"
             prompt.contains("## Identity"),
             "empty-soul prompt should still render the Identity section \
              immediately after the doctrine section"
+        );
+    }
+
+    // -- Non-transit data-grade doctrine tests (mika#1798) --
+
+    #[test]
+    fn build_system_prompt_includes_data_grade_doctrine_section() {
+        let identity = test_identity();
+        let memory = test_core_memory();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &memory,
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+            stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
+        };
+        let prompt = build_system_prompt(&ctx);
+
+        // Section heading appears exactly once.
+        assert_eq!(
+            prompt.matches("## Data-Grade Doctrine").count(),
+            1,
+            "doctrine section must appear exactly once"
+        );
+
+        // Literal invariants: names testimony-grade, states HARD-NO-including-propose,
+        // names Gmail + full Drive.
+        assert!(
+            prompt.contains("testimony-grade"),
+            "must name testimony-grade explicitly"
+        );
+        assert!(
+            prompt.contains("may NEVER access nor propose accessing"),
+            "must state the HARD-NO-including-proposal rule verbatim"
+        );
+        assert!(prompt.contains("Gmail"), "must name Gmail");
+        assert!(prompt.contains("full Drive"), "must name full Drive");
+    }
+
+    #[test]
+    fn build_silent_prompt_includes_data_grade_doctrine_section() {
+        let identity = test_identity();
+        let ctx = SilentPromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            pending_commitments: &[],
+            trigger_context: "Heartbeat",
+            current_utc: test_time(),
+            timezone: None,
+            telegram_configured: false,
+            has_message_sender: true,
+            recent_conversations: None,
+            recent_audit_events: None,
+            home_dir: None,
+            task_health: None,
+            stored_preferences: &[],
+            stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
+        };
+        let prompt = build_silent_prompt(&ctx);
+
+        assert_eq!(
+            prompt.matches("## Data-Grade Doctrine").count(),
+            1,
+            "doctrine section must appear exactly once in silent prompt"
+        );
+        assert!(prompt.contains("testimony-grade"));
+        assert!(prompt.contains("may NEVER access nor propose accessing"));
+        assert!(prompt.contains("Gmail"));
+    }
+
+    #[test]
+    fn build_compact_system_prompt_includes_abbreviated_doctrine() {
+        let identity = test_identity();
+        let memory = test_core_memory();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &memory,
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+            stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
+        };
+        let prompt = build_compact_system_prompt(&ctx);
+
+        // Abbreviated form must still name the two load-bearing anchors.
+        // Case-insensitive check on "testimony-grade" — the compact block
+        // capitalizes at sentence start ("Testimony-grade data...").
+        let lower = prompt.to_lowercase();
+        assert!(
+            lower.contains("testimony-grade"),
+            "compact doctrine must name testimony-grade (any case)"
+        );
+        assert!(prompt.contains("Gmail"), "compact doctrine must name Gmail");
+        assert!(
+            prompt.contains("HARD NO"),
+            "compact doctrine must state HARD NO"
+        );
+
+        // Budget: the abbreviated block itself is < 400 chars (const-asserted at
+        // compile time). Verify at the composed-prompt level that the doctrine
+        // block is present but small.
+        assert!(
+            DATA_GRADE_DOCTRINE_COMPACT.len() < 400,
+            "compact doctrine block busted 400-char budget"
+        );
+    }
+
+    #[test]
+    fn data_grade_section_position_stable() {
+        // The doctrine block must appear BEFORE `## Instructions` and BEFORE
+        // any injected core-memory content. Position matters for prompt-priority
+        // per CLAUDE.md § Context priority rule (system prompt > core memory > ...).
+        let identity = test_identity();
+        let memory = test_core_memory();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &memory,
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+            stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
+        };
+        let prompt = build_system_prompt(&ctx);
+
+        let doctrine_idx = prompt
+            .find("## Data-Grade Doctrine")
+            .expect("doctrine section must be present");
+        let instructions_idx = prompt
+            .find("## Instructions")
+            .expect("instructions section must be present");
+        let core_memory_idx = prompt
+            .find("## Core Memory")
+            .expect("core memory section must be present");
+
+        assert!(
+            doctrine_idx < instructions_idx,
+            "doctrine must appear before ## Instructions"
+        );
+        assert!(
+            doctrine_idx < core_memory_idx,
+            "doctrine must appear before ## Core Memory (grounding-first)"
         );
     }
 
@@ -3433,11 +3689,21 @@ inject = false
             prompt.len()
         );
 
-        // AC1: ≤3 sections
+        // AC1: ≤4 sections. The compact prompt's section budget grew from 2 to
+        // 4 as load-bearing doctrines were baked in — each addition is a
+        // structural guardrail the compact/MikaModel provider cannot skip:
+        //   1. ## Personality (soul first-line, when non-empty)
+        //   2. ## Identity (agent name)
+        //   3. ## Runtime (mika#1815 — ground-truth model identity so the
+        //      compact provider can answer "which model?" without confabulating)
+        //   4. ## Data-Grade Doctrine (mika#1798 — abbreviated HARD-NO
+        //      non-transit invariant, ~400-char budget const-asserted)
+        // Each section is individually budget-capped; the overall ≤5 KB bound
+        // (asserted above) is the load-bearing size guarantee.
         let section_count = prompt.matches("## ").count();
         assert!(
-            section_count <= 3,
-            "compact prompt has {} sections, exceeds 3-section limit",
+            section_count <= 4,
+            "compact prompt has {} sections, exceeds 4-section limit",
             section_count
         );
 
@@ -3484,8 +3750,11 @@ inject = false
         // identity so the compact provider can answer "which model?" without
         // confabulating.
         assert!(prompt.contains("## Runtime"));
-        // Two sections: ## Identity + ## Runtime
-        assert_eq!(prompt.matches("## ").count(), 2);
+        // mika#1798: Data-Grade Doctrine (compact form) is now always rendered
+        // after Identity/Runtime. Three sections total with empty soul:
+        // ## Identity + ## Runtime + ## Data-Grade Doctrine.
+        assert!(prompt.contains("## Data-Grade Doctrine"));
+        assert_eq!(prompt.matches("## ").count(), 3);
     }
 
     // ==================================================================

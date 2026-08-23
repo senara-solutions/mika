@@ -813,6 +813,7 @@ mod tests {
                     timeout_secs: 30,
                     dependencies,
                     max_prompt_size: None,
+                    data_grade: Default::default(),
                 },
                 triggers: Triggers {
                     keywords: vec![name.to_string()],

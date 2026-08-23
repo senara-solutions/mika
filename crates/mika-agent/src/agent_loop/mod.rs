@@ -834,6 +834,11 @@ async fn run_loop(
     llm: &dyn LlmProvider,
     tools: &ToolRegistry,
     skill_tool_map: &HashMap<String, &ResolvedSkillTool>,
+    // mika#1798 Layer 4: per-tool `data_grade` lookup, built from the same
+    // matched-skill list as `skill_tool_map`. Threaded verbatim into every
+    // `process_tool_calls` invocation so the execute-time testimony
+    // guardrail fires uniformly across all agent-loop entry points.
+    skill_data_grades: &HashMap<String, crate::skills::manifest::DataGrade>,
     skill_timeout: u64,
     tool_ctx: &ToolContext<'_>,
     request: &mut LlmRequest,
@@ -1205,6 +1210,7 @@ async fn run_loop(
                         response.content.clone(),
                         tools,
                         skill_tool_map,
+                        skill_data_grades,
                         skill_timeout,
                         tool_ctx,
                         request,
@@ -2679,6 +2685,7 @@ async fn run_loop(
                     response.content,
                     tools,
                     skill_tool_map,
+                    skill_data_grades,
                     skill_timeout,
                     tool_ctx,
                     request,
@@ -3189,6 +3196,9 @@ async fn run_agent_inner(
         skill_tool_defs.len(),
     );
     let skill_tool_map = build_skill_tool_map(&matched_entries);
+    // mika#1798 Layer 4: build the per-tool data_grade lookup alongside the
+    // tool map so both stay consistent under the same last-write-wins rule.
+    let skill_data_grades = build_skill_data_grades(&matched_entries);
     let skill_timeout = max_skill_timeout(&matched_entries, provider, model);
     let required_tools = collect_required_tools(&matched, params.user_message);
     let required_suffix_lines = collect_required_suffix_lines(&matched);
@@ -3476,6 +3486,7 @@ async fn run_agent_inner(
         effective_llm,
         tools,
         &skill_tool_map,
+        &skill_data_grades,
         skill_timeout,
         &tool_ctx,
         &mut request,
@@ -4077,6 +4088,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         false, // Silent mode: never compact (engine-driven triggers, not MikaModel targets)
     );
     let skill_tool_map = build_skill_tool_map(&matched);
+    // mika#1798 Layer 4 (silent mode).
+    let skill_data_grades = build_skill_data_grades(&matched);
     let skill_timeout = max_skill_timeout(&matched, provider, model);
     // Tool-arg suffix validation fires in silent mode too — qa-review runs
     // in callback turns and must still validate verdict trailers before GitHub
@@ -4331,6 +4344,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         llm,
         tools,
         &skill_tool_map,
+        &skill_data_grades,
         skill_timeout,
         &tool_ctx,
         &mut request,
@@ -4722,6 +4736,9 @@ async fn run_team_agent_inner_impl(
         false, // Team mode: never compact (engine-driven, not MikaModel targets)
     );
     let skill_tool_map = build_skill_tool_map(&matched_entries);
+    // mika#1798 Layer 4: build the per-tool data_grade lookup alongside the
+    // tool map so both stay consistent under the same last-write-wins rule.
+    let skill_data_grades = build_skill_data_grades(&matched_entries);
     let skill_timeout = max_skill_timeout(&matched_entries, provider, model);
     let required_tools = collect_required_tools(&matched, params.task_message);
     let required_suffix_lines = collect_required_suffix_lines(&matched);
@@ -4842,6 +4859,7 @@ async fn run_team_agent_inner_impl(
         effective_llm,
         tools,
         &skill_tool_map,
+        &skill_data_grades,
         skill_timeout,
         &tool_ctx,
         &mut request,
@@ -4988,6 +5006,27 @@ async fn run_team_agent_inner_impl(
 }
 
 // -- Skill helpers --
+
+/// Build a per-tool-name lookup of the owning skill's `data_grade` for matched
+/// skills (mika#1798 Layer 4, execute-time testimony guardrail).
+///
+/// Consumed by `process_tool_calls` / `execute_tool` — for each dispatched
+/// tool name, the map returns the `DataGrade` declared by the skill that
+/// owns the tool. `execute_tool` refuses any lookup that returns
+/// `DataGrade::Testimony`. Same last-write-wins semantics as
+/// `build_skill_tool_map` on tool-name collisions (the two maps stay
+/// consistent because they iterate the same `matched` list).
+fn build_skill_data_grades(
+    matched: &[&SkillEntry],
+) -> HashMap<String, crate::skills::manifest::DataGrade> {
+    let mut map = HashMap::new();
+    for entry in matched {
+        for st in &entry.skill_tools {
+            map.insert(st.definition.name.clone(), entry.manifest.skill.data_grade);
+        }
+    }
+    map
+}
 
 /// Build a lookup map from tool name → ResolvedSkillTool for matched skills.
 ///
@@ -7033,6 +7072,7 @@ mod tests {
                     timeout_secs: timeout,
                     dependencies: vec![],
                     max_prompt_size: None,
+                    data_grade: Default::default(),
                 },
                 triggers: Triggers {
                     keywords: vec![name.to_string()],

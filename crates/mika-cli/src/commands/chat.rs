@@ -144,6 +144,8 @@ async fn spawn_agent_worker(
     {
         skill_registry.apply_overrides(&overrides);
     }
+    // Phase 2 (mika#1798): testimony-grade ban.
+    skill_registry.apply_testimony_grade_ban();
     skill_registry.apply_load_safety_check();
     // Runtime allowlist↔required_tools coherence guard (mika#1576).
     skill_registry.apply_required_tools_coherence_check(ctx.async_db.agent_id());
@@ -282,6 +284,8 @@ async fn spawn_agent_worker(
                         {
                             registry.apply_overrides(&overrides);
                         }
+                        // Phase 2 (mika#1798): testimony-grade ban.
+                        registry.apply_testimony_grade_ban();
                         registry.log_summary();
                         worker_skills = Arc::new(registry);
                         skills_reloaded = true;
@@ -347,6 +351,8 @@ async fn spawn_agent_worker(
                         {
                             registry.apply_overrides(&overrides);
                         }
+                        // Phase 2 (mika#1798): testimony-grade ban.
+                        registry.apply_testimony_grade_ban();
                         registry.log_summary();
                         worker_skills = Arc::new(registry);
                         skills_reloaded = true;

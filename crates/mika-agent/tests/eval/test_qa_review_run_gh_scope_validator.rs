@@ -91,6 +91,7 @@ fn make_qa_review_skill(dir: PathBuf) -> SkillEntry {
                 timeout_secs: 30,
                 dependencies: vec![],
                 max_prompt_size: None,
+                data_grade: Default::default(),
             },
             triggers: Triggers {
                 keywords: vec![

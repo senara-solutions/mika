@@ -193,6 +193,8 @@ impl TeamEngine {
             if let Ok(overrides) = db.get_skill_overrides(&ta.name) {
                 skills.apply_overrides(&overrides);
             }
+            // Phase 2 (mika#1798): testimony-grade ban.
+            skills.apply_testimony_grade_ban();
             skills.log_summary();
             let async_db = AsyncDatabase::new_with_agent(db, &ta.name);
 

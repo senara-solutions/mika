@@ -135,6 +135,8 @@ impl Tool for DelegateTaskTool {
         if let Ok(overrides) = async_db.get_skill_overrides(agent_name).await {
             skills.apply_overrides(&overrides);
         }
+        // Phase 2 (mika#1798): testimony-grade ban.
+        skills.apply_testimony_grade_ban();
         skills.log_summary();
 
         // Register delegate agent so sessions FK constraint is satisfied.

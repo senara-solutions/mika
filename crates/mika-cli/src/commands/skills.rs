@@ -324,6 +324,8 @@ fn apply_db_overrides_if_available(
         return;
     };
     registry.apply_overrides(&overrides);
+    // Phase 2 (mika#1798): testimony-grade ban.
+    registry.apply_testimony_grade_ban();
 }
 
 fn list_skills(

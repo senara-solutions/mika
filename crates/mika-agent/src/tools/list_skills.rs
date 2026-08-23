@@ -53,6 +53,8 @@ impl Tool for ListSkillsTool {
         if let Ok(overrides) = ctx.db.get_skill_overrides(ctx.db.agent_id()).await {
             registry.apply_overrides(&overrides);
         }
+        // Phase 2 (mika#1798): testimony-grade ban — keep listing in parity with startup paths.
+        registry.apply_testimony_grade_ban();
 
         // Run load-time crash-protection to promote broken-handler/tools.json skills to skipped,
         // matching the startup paths (chat.rs, ask.rs, server/mod.rs).

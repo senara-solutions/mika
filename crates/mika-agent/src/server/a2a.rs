@@ -136,6 +136,8 @@ async fn run_a2a_agent(
         {
             registry.apply_overrides(&overrides);
         }
+        // Phase 2 (mika#1798): testimony-grade ban.
+        registry.apply_testimony_grade_ban();
         registry.log_summary();
         let new = Arc::new(registry);
         *agent_state.skills.lock().unwrap() = new.clone();
