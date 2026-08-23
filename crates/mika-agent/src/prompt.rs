@@ -3689,11 +3689,21 @@ inject = false
             prompt.len()
         );
 
-        // AC1: ≤3 sections
+        // AC1: ≤4 sections. The compact prompt's section budget grew from 2 to
+        // 4 as load-bearing doctrines were baked in — each addition is a
+        // structural guardrail the compact/MikaModel provider cannot skip:
+        //   1. ## Personality (soul first-line, when non-empty)
+        //   2. ## Identity (agent name)
+        //   3. ## Runtime (mika#1815 — ground-truth model identity so the
+        //      compact provider can answer "which model?" without confabulating)
+        //   4. ## Data-Grade Doctrine (mika#1798 — abbreviated HARD-NO
+        //      non-transit invariant, ~400-char budget const-asserted)
+        // Each section is individually budget-capped; the overall ≤5 KB bound
+        // (asserted above) is the load-bearing size guarantee.
         let section_count = prompt.matches("## ").count();
         assert!(
-            section_count <= 3,
-            "compact prompt has {} sections, exceeds 3-section limit",
+            section_count <= 4,
+            "compact prompt has {} sections, exceeds 4-section limit",
             section_count
         );
 
