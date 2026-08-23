@@ -94,6 +94,11 @@ html {
 }
 
 select option {
-  background: #171a1d; /* surface_container (rulebook §2) */
-  color: #aaabaf;      /* on_surface_variant (rulebook §2) */
+  /* Reference canonical tokens directly so a future rulebook §2 shift
+     stays coherent with this fallback style (no silent-desync).
+     Note: browsers vary in whether they honor CSS variables inside
+     `<option>` (some render OS-native popups that bypass author styles).
+     Provide a raw fallback via CSS var default for maximum compatibility. */
+  background: var(--color-surface-container, #171a1d);
+  color: var(--color-on-surface-variant, #aaabaf);
 }

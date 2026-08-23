@@ -29,9 +29,25 @@ const THEME_CSS_RAW = readFileSync(join(HERE, 'theme.css'), 'utf8')
 const THEME_CSS = THEME_CSS_RAW.replace(/\/\*[\s\S]*?\*\//g, '')
 
 // Collapse whitespace runs so `--color-bg:  var(--color-background)  ;` and
-// `--color-bg: var(--color-background);` both match the same probe.
+// `--color-bg: var(--color-background);` both match the same shape.
 const collapse = (s: string) => s.replace(/\s+/g, ' ').toLowerCase()
-const NORMALIZED = collapse(THEME_CSS)
+
+/**
+ * Parse `--<name>: <value>;` declarations into a `Map<name, value>` with
+ * last-wins semantics — mirrors CSS cascade so a future PR that accidentally
+ * duplicates a token declaration is caught (the earlier declaration would be
+ * shadowed and pass a simple `includes()` sensor, letting silent drift through).
+ * Values are collapsed + lowercased for match stability.
+ */
+const declarationMap: Map<string, string> = (() => {
+  const map = new Map<string, string>()
+  const re = /(--[a-z0-9-]+)\s*:\s*([^;]+);/gi
+  let m: RegExpExecArray | null
+  while ((m = re.exec(THEME_CSS)) !== null) {
+    map.set(m[1].toLowerCase(), collapse(m[2]).trim())
+  }
+  return map
+})()
 
 const canonicalTokens: Array<[name: string, hex: string, source: string]> = [
   // Surface hierarchy — rulebook §2 Full Token Reference
@@ -97,16 +113,21 @@ describe('theme.css — LC.1 (mika#1800) rulebook §2 alignment', () => {
   it.each(canonicalTokens)(
     'defines canonical token %s = %s (%s)',
     (name, hex) => {
-      const probe = collapse(`${name}: ${hex};`)
-      expect(NORMALIZED.includes(probe)).toBe(true)
+      // `.toBe()` on the final value (not `.includes()` on a substring)
+      // so a failure prints "expected <hex>, received <actual>" pointing
+      // straight at the drift. Also catches a *duplicate* declaration with
+      // a different hex — `declarationMap` uses last-wins, mirroring CSS
+      // cascade; the sensor's presence in the map is uniqueness + value.
+      expect(declarationMap.get(name.toLowerCase())).toBe(hex.toLowerCase())
     },
   )
 
   it.each(backwardCompatAliases)(
     'preserves backward-compat alias %s → %s',
     (legacy, canonical) => {
-      const probe = collapse(`${legacy}: ${canonical};`)
-      expect(NORMALIZED.includes(probe)).toBe(true)
+      expect(declarationMap.get(legacy.toLowerCase())).toBe(
+        collapse(canonical).trim(),
+      )
     },
   )
 
