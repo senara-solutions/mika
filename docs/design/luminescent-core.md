@@ -267,7 +267,7 @@ Consumers MUST convert raw error objects to human-shaped strings before passing 
 - `action?: { label, onClick }` renders a primary-colored tertiary text button (e.g., "Clear filters", "Try a wider time range").
 
 **Error state contract:**
-- Error icon uses `--color-error` (#ef4444) at low opacity — never raw red Tailwind classes (`text-red-400`).
+- Error icon uses `--color-error` (#ff6e84) at low opacity — never raw red Tailwind classes (`text-red-400`).
 - Error wording is human-shaped: "Failed to load sessions. The dashboard server returned 500." NOT raw error.message dumps. The component accepts a `message?: string` override; if absent, renders a generic-but-context-appropriate fallback.
 - `retry: () => void` wires to the consumer's `useQuery` `refetch` function — primary gradient button per rulebook §5.
 - `detailsHref?: string` opens an error-details surface (initially: log viewer URL or trace ID search). Optional; if absent, no secondary link rendered.
