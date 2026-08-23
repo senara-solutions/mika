@@ -241,21 +241,26 @@ pub fn spawn_manager_cycle_task(
             "mika-manager cadence started"
         );
 
-        // mika#1968 AC5 (change 5b) — boot-time GitHub auth sanity call.
-        // Runs before the cycle loop starts so any 401 is surfaced with a
-        // loud, actionable message at startup rather than showing up as
-        // cycle_error spam every poll_interval. Best-effort: log-and-continue
-        // on failure (substrate-reliability class — cadence is best-effort,
-        // never panic).
+        // mika#1968 AC5 + mika#1974 — boot-time GitHub auth sanity call.
+        // Runs before the cycle loop starts so any auth/scope failure is
+        // surfaced with a loud, actionable message at startup rather than
+        // showing up as cycle_error spam every poll_interval.
+        //
+        // Probes the target milestone endpoint (mika#1974) rather than
+        // `/rate_limit` (the pre-#1974 shape) — success proves both token
+        // validity AND scope for the target milestone, catching the
+        // wrong-user-PAT class that `/rate_limit` silently accepted.
+        //
+        // Best-effort: log-and-continue on failure (substrate-reliability
+        // class — cadence is best-effort, never panic).
         let runner = ProcessGhRunner::new(cfg.github_token.clone());
-        match verify_gh_auth(&runner).await {
-            Ok(rate_limit_remaining) => {
+        match verify_gh_auth(&runner, &cfg.target).await {
+            Ok(()) => {
                 info!(
                     target: "mika::milestone_manager",
                     event = "manager_gh_auth_check_ok",
                     milestone = %cfg.target.as_display(),
-                    rate_limit_remaining,
-                    "mika-manager GitHub auth verified"
+                    "mika-manager GitHub auth verified (milestone-scoped probe)"
                 );
             }
             Err(GhAuthError {
@@ -263,6 +268,24 @@ pub fn spawn_manager_cycle_task(
                 stderr_head,
                 exit_code,
             }) => {
+                // mika#1974 AC2 — per-class operator hint. Named class
+                // discrimination via structured `auth_class` field remains
+                // the primary greppable signal; hints add the human touch.
+                let hint = match auth_class {
+                    AuthClass::Unauthorized => {
+                        "token missing/invalid/expired — check `tr '\\0' '\\n' < /proc/$(pidof mika-spirit)/environ | grep MIKA_GITHUB_TOKEN`"
+                    }
+                    AuthClass::Forbidden => {
+                        "token authenticated but lacks scope for target repo — check GitHub App installation on the org or PAT org access"
+                    }
+                    AuthClass::MilestoneNotFound => {
+                        "target milestone not found — check `MIKA_MANAGER_TARGET_MILESTONE` value or milestone existence on GitHub"
+                    }
+                    AuthClass::Network => {
+                        "gh cannot reach GitHub — check network/DNS/TLS from daemon host"
+                    }
+                    AuthClass::Other => "unexpected failure — see stderr_head for details",
+                };
                 error!(
                     target: "mika::milestone_manager",
                     event = "manager_gh_auth_check_failed",
@@ -270,8 +293,8 @@ pub fn spawn_manager_cycle_task(
                     auth_class = auth_class.as_str(),
                     exit_code,
                     stderr_head = %stderr_head,
-                    hint = "check `tr '\\0' '\\n' < /proc/$(pidof mika-spirit)/environ | grep MIKA_GITHUB_TOKEN` — token likely missing/invalid in daemon env",
-                    "mika-manager GitHub auth check failed — cycles will 401 until fixed"
+                    hint,
+                    "mika-manager GitHub auth check failed — cycles will fail until fixed"
                 );
             }
         }
@@ -355,6 +378,15 @@ pub enum AuthClass {
     Unauthorized,
     /// HTTP 403 — token present but insufficient scope, or rate-limit exhaustion.
     Forbidden,
+    /// HTTP 404 on the milestone probe — target milestone gone / wrong repo /
+    /// wrong milestone number (mika#1974). Distinct from generic `Other`
+    /// server failures because the operator remediation is different: check
+    /// `MIKA_MANAGER_TARGET_MILESTONE` value / milestone existence, not the
+    /// token itself. Only fires from `classify_milestone_probe_error`; the
+    /// cycle-body `classify_cycle_error` leaves 404 as `Other` because a 404
+    /// mid-cycle (e.g., an issue that got deleted) is not a milestone-scope
+    /// signal.
+    MilestoneNotFound,
     /// Network-layer failure (connection refused, DNS, TLS, transport reset).
     Network,
     /// Anything else — genuine server-side or parsing failures.
@@ -366,6 +398,7 @@ impl AuthClass {
         match self {
             Self::Unauthorized => "401",
             Self::Forbidden => "403",
+            Self::MilestoneNotFound => "404_milestone_not_found",
             Self::Network => "network",
             Self::Other => "other",
         }
@@ -375,6 +408,12 @@ impl AuthClass {
 /// Classify a cycle error string emitted by the `Reader` path into one of
 /// four operator-relevant buckets. String-based because the underlying
 /// `gh` subprocess surface is a string.
+///
+/// **404 handling:** intentionally not surfaced here — a 404 mid-cycle (an
+/// issue that got deleted, an artifact URL that went stale) is orthogonal to
+/// milestone-scope auth. Only the boot-time milestone probe uses
+/// `classify_milestone_probe_error` which adds 404 discrimination on top of
+/// this classifier's four-bucket base.
 fn classify_cycle_error(err_text: &str) -> AuthClass {
     let lower = err_text.to_ascii_lowercase();
     if lower.contains("401") || lower.contains("unauthorized") || lower.contains("bad credentials")
@@ -395,6 +434,23 @@ fn classify_cycle_error(err_text: &str) -> AuthClass {
     }
 }
 
+/// Classify a `verify_gh_auth` milestone-probe error string. Adds 404
+/// discrimination on top of `classify_cycle_error` (mika#1974 AC2). Kept
+/// separate from the cycle classifier so the two contexts stay decoupled —
+/// 404 during the boot-time milestone probe means "target milestone gone /
+/// wrong repo" (a distinct operator remediation from a mid-cycle 404).
+fn classify_milestone_probe_error(err_text: &str) -> AuthClass {
+    let lower = err_text.to_ascii_lowercase();
+    // Check 404 BEFORE delegating so `MilestoneNotFound` wins over `Other`.
+    // The `not found` phrasing catches gh's default 404 stderr shape as well
+    // as the raw HTTP status token.
+    if lower.contains("404") || lower.contains("not found") {
+        AuthClass::MilestoneNotFound
+    } else {
+        classify_cycle_error(err_text)
+    }
+}
+
 /// Failure detail from `verify_gh_auth` — mirrors the discriminator shape
 /// of `classify_cycle_error` so the boot-time and cycle-time surfaces stay
 /// in lockstep.
@@ -405,54 +461,70 @@ pub struct GhAuthError {
     pub exit_code: i32,
 }
 
-/// mika#1968 AC5 (change 5b) — call `gh api /rate_limit` via the provided
-/// `GhRunner` and return `Ok(rate_limit_remaining)` on success, or an
-/// error carrying the auth-class discriminator on failure. Exercises the
-/// exact same code path (`ProcessGhRunner`) the cycle loop uses so a
-/// success here means the loop's `gh` calls will also authenticate.
+/// mika#1974 (mika#1968 A4 P1 deferred) — call
+/// `gh api /repos/{owner}/{repo}/milestones/{number}` via the provided
+/// `GhRunner` and return `Ok(())` on success, or an error carrying the
+/// auth-class discriminator on failure. Probes the exact target milestone
+/// so success proves BOTH token validity AND scope/reachability for the
+/// specific milestone the cadence loop reads on every cycle.
 ///
-/// The primary_rate object shape follows the GitHub REST API's
-/// `/rate_limit` response (`resources.core.remaining`).
+/// **Superset check (replaces mika#1968 `/rate_limit` probe):** the previous
+/// probe called `/rate_limit`, which passes on any authenticated PAT even
+/// when the token belongs to a wrong user with no access to the target
+/// milestone repo. The verifier's job — surface auth gaps loudly at boot
+/// before cycle-error spam accumulates — is exactly the failure mode
+/// `/rate_limit` could not catch. Every cycle then 403s on the actual
+/// milestone read (the silent-degradation class the boot check exists to
+/// prevent). Replacing with the milestone endpoint is a strict fidelity
+/// upgrade: success proves the concrete access the cycle needs; failure
+/// gives four-way discrimination (401/403/404/network) instead of two-way
+/// (auth/network).
 ///
-/// **A2 P1 fix** — Malformed / empty / schema-drift response bodies are
-/// treated as failure (`AuthClass::Other`), NOT as `Ok(0)`. A successful
-/// HTTP response with unparseable body is a fidelity gap for a verifier
-/// whose job is to catch bad auth loudly at boot: `Ok(0)` would log
-/// `manager_gh_auth_check_ok rate_limit_remaining=0` which is impossible
-/// on healthy authenticated accounts (5000/hr baseline) and would mask a
-/// silent degradation. We fail-loud with a distinct `parse_failure:` prefix
-/// on `stderr_head` so operators can grep for the schema-drift class
-/// without confusing it with a genuine 401/403/network failure.
+/// **Replace, not compose:** two-probe composition (rate_limit + milestone)
+/// would add one API call for zero fidelity gain — a healthy milestone probe
+/// implies a healthy `/rate_limit`. Cost matters less than the noise-floor
+/// of a second failure surface interleaving with the first.
 ///
-/// **Fidelity boundary (A4 deferred):** `/rate_limit` validates the token
-/// authenticates against GitHub but does NOT confirm the token has
-/// scope/reachability for the specific target milestone repo. A
-/// wrong-user PAT or a valid-but-wrong-org App installation token would
-/// pass this check and then 403 on every cycle. Target-repo probe is a
-/// follow-up (see plan §5c non-goals + `docs/solutions/best-practices/
-/// app-owned-env-vs-init-owned-env-2026-08-23.md`).
-pub async fn verify_gh_auth<R: GhRunner>(runner: &R) -> Result<u64, GhAuthError> {
-    match runner.run(&["api", "/rate_limit"]).await {
+/// **A2 P1 discipline preserved** — Malformed / empty / schema-drift or
+/// number-mismatched response bodies are treated as failure
+/// (`AuthClass::Other`) with a `parse_failure:` prefix on `stderr_head`,
+/// NOT as silent success. A successful HTTP 200 whose body lacks a
+/// `number` field or returns a number different from the requested one
+/// is a fidelity gap (proxy interposition, schema drift, silently-followed
+/// redirect) the verifier must surface loudly.
+pub async fn verify_gh_auth<R: GhRunner>(
+    runner: &R,
+    target: &MilestoneRef,
+) -> Result<(), GhAuthError> {
+    let path = format!("/repos/{}/milestones/{}", target.repo, target.number);
+    match runner.run(&["api", &path]).await {
         Ok(body) => {
-            // A2 P1 fix — parse-or-fail. A successful HTTP response without a
-            // usable `resources.core.remaining` is a fidelity gap the verifier
-            // must surface, not paper over with `unwrap_or(0)`.
-            let remaining = serde_json::from_str::<serde_json::Value>(&body)
+            // Parse-or-fail: a successful HTTP response must contain the
+            // milestone with the EXPECTED number. Mismatched number implies
+            // the URL was rewritten (proxy, redirect) — a fidelity gap the
+            // verifier surfaces rather than silently trusting.
+            let number = serde_json::from_str::<serde_json::Value>(&body)
                 .ok()
-                .and_then(|v| {
-                    v.get("resources")
-                        .and_then(|r| r.get("core"))
-                        .and_then(|c| c.get("remaining"))
-                        .and_then(|n| n.as_u64())
-                });
-            match remaining {
-                Some(n) => Ok(n),
+                .and_then(|v| v.get("number").and_then(|n| n.as_u64()));
+            match number {
+                Some(n) if n == target.number => Ok(()),
+                Some(other) => {
+                    let snippet: String = body.chars().take(160).collect();
+                    Err(GhAuthError {
+                        auth_class: AuthClass::Other,
+                        stderr_head: format!(
+                            "parse_failure: milestone endpoint returned number={other} (expected {}) — snippet={snippet:?}",
+                            target.number
+                        ),
+                        exit_code: -1,
+                    })
+                }
                 None => {
                     let snippet: String = body.chars().take(160).collect();
                     Err(GhAuthError {
                         auth_class: AuthClass::Other,
                         stderr_head: format!(
-                            "parse_failure: body missing resources.core.remaining — snippet={snippet:?}"
+                            "parse_failure: milestone endpoint response missing 'number' field — snippet={snippet:?}"
                         ),
                         exit_code: -1,
                     })
@@ -461,7 +533,7 @@ pub async fn verify_gh_auth<R: GhRunner>(runner: &R) -> Result<u64, GhAuthError>
         }
         Err(e) => {
             let raw = format!("{e}");
-            let auth_class = classify_cycle_error(&raw);
+            let auth_class = classify_milestone_probe_error(&raw);
             // The `ProcessGhRunner` error format is `gh <args> failed: <stderr>`.
             // Take the first ~200 chars for the log line.
             let stderr_head = raw.chars().take(200).collect();
@@ -954,6 +1026,13 @@ mod tests {
     /// succeeding here (it will fail because there's no live `gh` for this
     /// synthetic milestone) — we assert only that the cancel path drops the
     /// task promptly. This is AC7.
+    ///
+    /// **Timeout slack (mika#1974):** the boot-time `verify_gh_auth` probe
+    /// now hits the milestone endpoint (`/repos/{repo}/milestones/{n}`)
+    /// rather than `/rate_limit` — a marginally slower call over the wire.
+    /// The 10s bound accommodates parallel-test-load latency variance while
+    /// still catching a truly wedged cancel path (real loop-cancel exits in
+    /// tens of milliseconds, not seconds).
     #[tokio::test]
     #[serial]
     async fn spawn_respects_cancel_token() {
@@ -975,11 +1054,14 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         cancel.cancel();
 
-        // Wait for the task to exit — should be well under 1s given the 50ms poll.
-        let join = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        // Wait for the task to exit — cancel-response is sub-second on a healthy
+        // loop, but the boot-time verify_gh_auth probe (milestone endpoint,
+        // real network call) precedes loop-entry and takes 200-500ms
+        // depending on load. 10s bound absorbs parallel-test contention.
+        let join = tokio::time::timeout(Duration::from_secs(10), handle).await;
         assert!(
             join.is_ok(),
-            "spawn task must exit within 2s of cancel — got timeout"
+            "spawn task must exit within 10s of cancel — got timeout"
         );
         join.unwrap().expect("join should not panic");
     }
@@ -1071,18 +1153,32 @@ mod tests {
         }
     }
 
-    /// mika#1968 AC5 test — `verify_gh_auth` returns `Err` with `Unauthorized`
-    /// discriminator when the runner emits a `gh` failure containing 401 /
-    /// "Unauthorized". This locks the classifier's grep contract that the
-    /// operator log message depends on.
+    /// Canonical test target — matches the mock success body's `number`.
+    fn test_target() -> MilestoneRef {
+        MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 30,
+        }
+    }
+
+    /// Valid milestone JSON body with `number = 30` — success arm for
+    /// `verify_gh_auth`.
+    fn milestone_success_body() -> String {
+        r#"{"number":30,"title":"test milestone","state":"open","open_issues":5,"closed_issues":25}"#.to_string()
+    }
+
+    /// mika#1974 AC1 companion — `verify_gh_auth` returns `Err` with
+    /// `Unauthorized` discriminator when the runner emits a `gh` failure
+    /// containing 401 / "Unauthorized". Locks the classifier's grep contract
+    /// that the operator log message depends on.
     #[tokio::test]
     async fn verify_gh_auth_401_returns_err_unauthorized() {
         let runner = MockGhRunner {
             result: Err(anyhow::anyhow!(
-                "gh api /rate_limit failed: HTTP 401: Bad credentials"
+                "gh api /repos/senara-solutions/mika/milestones/30 failed: HTTP 401: Bad credentials"
             )),
         };
-        let err = verify_gh_auth(&runner)
+        let err = verify_gh_auth(&runner, &test_target())
             .await
             .expect_err("401 must return Err");
         assert_eq!(
@@ -1097,40 +1193,34 @@ mod tests {
         );
     }
 
-    /// mika#1968 AC5 test — success path returns the parsed
-    /// `resources.core.remaining` value.
+    /// mika#1974 AC1 companion — success path returns `Ok(())` when the
+    /// milestone endpoint returns a JSON body whose `number` matches the
+    /// requested target.
     #[tokio::test]
-    async fn verify_gh_auth_success_returns_ok_with_remaining() {
+    async fn verify_gh_auth_success_returns_ok() {
         let runner = MockGhRunner {
-            result: Ok(
-                r#"{"resources":{"core":{"limit":5000,"remaining":4321,"reset":123}}}"#.to_string(),
-            ),
+            result: Ok(milestone_success_body()),
         };
-        let remaining = verify_gh_auth(&runner)
+        verify_gh_auth(&runner, &test_target())
             .await
-            .expect("valid rate_limit body must return Ok");
-        assert_eq!(remaining, 4321);
+            .expect("valid milestone body with matching number must return Ok(())");
     }
 
-    /// mika#1968 T4 P2 (A2 P1 companion) — malformed / empty / schema-drift
-    /// success bodies MUST be treated as failure, not `Ok(0)`. Locks the
-    /// A2 P1 fix: a HTTP 200 whose body lacks `resources.core.remaining`
-    /// is a fidelity gap the verifier must surface loudly (else `check_ok
-    /// remaining=0` would print on healthy accounts that always have 5000
-    /// baseline — an operator would misread it as OK when auth is
-    /// silently degraded).
-    ///
-    /// Also protects against a regression to `unwrap_or(0)` — that shape
-    /// would return `Ok(0)` here and fail the assertion.
+    /// mika#1974 — malformed / empty / schema-drift / number-mismatched
+    /// success bodies MUST be treated as failure. Locks the A2 P1 discipline
+    /// carried forward from mika#1968: a HTTP 200 whose body lacks the
+    /// expected `number` field (or returns a different number, implying URL
+    /// rewrite by a proxy/redirect) is a fidelity gap the verifier surfaces
+    /// loudly.
     #[tokio::test]
     async fn verify_gh_auth_malformed_body_returns_err_other() {
         // Case 1: empty JSON object — valid JSON but missing schema.
         let runner = MockGhRunner {
             result: Ok("{}".to_string()),
         };
-        let err = verify_gh_auth(&runner)
+        let err = verify_gh_auth(&runner, &test_target())
             .await
-            .expect_err("empty body must not silently pass as Ok(0)");
+            .expect_err("empty body must not silently pass");
         assert_eq!(err.auth_class, AuthClass::Other);
         assert!(
             err.stderr_head.contains("parse_failure"),
@@ -1142,24 +1232,40 @@ mod tests {
         let runner = MockGhRunner {
             result: Ok("".to_string()),
         };
-        let err = verify_gh_auth(&runner)
+        let err = verify_gh_auth(&runner, &test_target())
             .await
-            .expect_err("empty string body must not silently pass as Ok(0)");
+            .expect_err("empty string body must not silently pass");
         assert_eq!(err.auth_class, AuthClass::Other);
 
-        // Case 3: schema-drift — resources present but no core.remaining.
+        // Case 3: schema-drift — no `number` field.
         let runner = MockGhRunner {
-            result: Ok(r#"{"resources":{"other":{}}}"#.to_string()),
+            result: Ok(r#"{"title":"drift","state":"open"}"#.to_string()),
         };
-        let err = verify_gh_auth(&runner)
+        let err = verify_gh_auth(&runner, &test_target())
             .await
-            .expect_err("schema-drift body must not silently pass as Ok(0)");
+            .expect_err("schema-drift body must not silently pass");
         assert_eq!(err.auth_class, AuthClass::Other);
+        assert!(err.stderr_head.contains("missing 'number'"));
+
+        // Case 4: mismatched number — proxy/redirect signal.
+        let runner = MockGhRunner {
+            result: Ok(r#"{"number":42,"title":"wrong"}"#.to_string()),
+        };
+        let err = verify_gh_auth(&runner, &test_target())
+            .await
+            .expect_err("mismatched number must not silently pass");
+        assert_eq!(err.auth_class, AuthClass::Other);
+        assert!(
+            err.stderr_head.contains("number=42") && err.stderr_head.contains("expected 30"),
+            "stderr_head must expose the mismatch: {}",
+            err.stderr_head
+        );
     }
 
     /// mika#1968 AC5 test — 403 and network-class errors classify separately
     /// from Unauthorized so `manager_cycle_error auth_class=…` grep isolates
-    /// distinct failure classes.
+    /// distinct failure classes. Cycle classifier unchanged in mika#1974 —
+    /// 404 stays `Other` here (the milestone probe uses its own classifier).
     #[tokio::test]
     async fn classify_cycle_error_discriminates_403_and_network() {
         assert_eq!(
@@ -1175,6 +1281,202 @@ mod tests {
         assert_eq!(
             classify_cycle_error("gh api foo failed: HTTP 500: Internal Server Error"),
             AuthClass::Other
+        );
+        // 404 mid-cycle stays Other (orthogonal to milestone-scope auth).
+        assert_eq!(
+            classify_cycle_error("gh api foo failed: HTTP 404: Not Found"),
+            AuthClass::Other,
+            "cycle-body 404s must remain Other — the milestone-probe classifier owns 404-discrimination"
+        );
+    }
+
+    /// mika#1974 AC2 — `classify_milestone_probe_error` adds 404 discrimination
+    /// on top of the four-bucket base. 404 → `MilestoneNotFound`; all other
+    /// shapes delegate to `classify_cycle_error` unchanged.
+    #[tokio::test]
+    async fn classify_milestone_probe_error_discriminates_404() {
+        // 404 → MilestoneNotFound (the new class).
+        assert_eq!(
+            classify_milestone_probe_error(
+                "gh api /repos/senara-solutions/mika/milestones/999 failed: HTTP 404: Not Found"
+            ),
+            AuthClass::MilestoneNotFound
+        );
+        // Bare "not found" string (belt-and-braces phrasing).
+        assert_eq!(
+            classify_milestone_probe_error("gh api foo failed: milestone not found"),
+            AuthClass::MilestoneNotFound
+        );
+        // 401 still classifies as Unauthorized (delegated).
+        assert_eq!(
+            classify_milestone_probe_error("gh api foo failed: HTTP 401: Bad credentials"),
+            AuthClass::Unauthorized
+        );
+        // 403 still classifies as Forbidden (delegated).
+        assert_eq!(
+            classify_milestone_probe_error("gh api foo failed: HTTP 403: Forbidden"),
+            AuthClass::Forbidden
+        );
+        // Network still classifies as Network (delegated).
+        assert_eq!(
+            classify_milestone_probe_error("gh api foo failed: dial tcp: dns lookup failed"),
+            AuthClass::Network
+        );
+    }
+
+    /// mika#1974 AC2 — 404 on the milestone endpoint surfaces as
+    /// `MilestoneNotFound` so operators can distinguish target-milestone-gone
+    /// from token-invalid remediation paths without regex-parsing stderr.
+    #[tokio::test]
+    async fn verify_gh_auth_404_returns_err_milestone_not_found() {
+        let runner = MockGhRunner {
+            result: Err(anyhow::anyhow!(
+                "gh api /repos/senara-solutions/mika/milestones/30 failed: HTTP 404: Not Found"
+            )),
+        };
+        let err = verify_gh_auth(&runner, &test_target())
+            .await
+            .expect_err("404 must return Err");
+        assert_eq!(
+            err.auth_class,
+            AuthClass::MilestoneNotFound,
+            "404 body must classify as MilestoneNotFound"
+        );
+        assert_eq!(
+            err.auth_class.as_str(),
+            "404_milestone_not_found",
+            "as_str() must expose the discriminator suffix so grep can distinguish it"
+        );
+    }
+
+    /// mika#1974 AC2 — 403 on the milestone endpoint surfaces as `Forbidden`
+    /// (the class that catches the wrong-org App installation / PAT-org-access
+    /// remediation path).
+    #[tokio::test]
+    async fn verify_gh_auth_403_returns_err_forbidden() {
+        let runner = MockGhRunner {
+            result: Err(anyhow::anyhow!(
+                "gh api /repos/senara-solutions/mika/milestones/30 failed: HTTP 403: Resource not accessible by integration"
+            )),
+        };
+        let err = verify_gh_auth(&runner, &test_target())
+            .await
+            .expect_err("403 must return Err");
+        assert_eq!(err.auth_class, AuthClass::Forbidden);
+    }
+
+    /// `GhRunner` mock that inspects the argument list and returns different
+    /// responses for `/rate_limit` vs milestone-scoped paths. Used to prove
+    /// the AC3 regression scenario: a PAT that succeeds on `/rate_limit` but
+    /// lacks scope for the target milestone.
+    struct ArgAwareRunner {
+        rate_limit_response: Result<String>,
+        milestone_response: Result<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl GhRunner for ArgAwareRunner {
+        async fn run(&self, args: &[&str]) -> Result<String> {
+            // Path is always the last arg after `api`.
+            let path = args.last().copied().unwrap_or("");
+            if path == "/rate_limit" {
+                match &self.rate_limit_response {
+                    Ok(b) => Ok(b.clone()),
+                    Err(e) => Err(anyhow::anyhow!("{}", e)),
+                }
+            } else if path.starts_with("/repos/") && path.contains("/milestones/") {
+                match &self.milestone_response {
+                    Ok(b) => Ok(b.clone()),
+                    Err(e) => Err(anyhow::anyhow!("{}", e)),
+                }
+            } else {
+                Err(anyhow::anyhow!(
+                    "ArgAwareRunner: unexpected path {path:?} in args {args:?}"
+                ))
+            }
+        }
+    }
+
+    /// mika#1974 AC3 — regression test for the wrong-user-PAT class. Locks
+    /// the founding-incident shape: a PAT that would pass the pre-#1974
+    /// `/rate_limit` probe (rate-limit endpoint is user-scoped, not
+    /// milestone-scoped) but has no access to the target milestone repo
+    /// MUST be caught by the new milestone-scoped probe.
+    ///
+    /// Any regression that reverts `verify_gh_auth` to call `/rate_limit`
+    /// will fail this test — the mock returns success on `/rate_limit` and
+    /// 403 on the milestone endpoint. A `/rate_limit`-only probe would
+    /// return `Ok(_)`; the milestone-scoped probe correctly returns
+    /// `Err(Forbidden)`.
+    #[tokio::test]
+    async fn verify_gh_auth_catches_wrong_user_pat_class() {
+        let runner = ArgAwareRunner {
+            // Pre-#1974 probe would succeed on this — user-scoped rate limit
+            // ignores the target repo entirely.
+            rate_limit_response: Ok(
+                r#"{"resources":{"core":{"limit":5000,"remaining":4999,"reset":123}}}"#.to_string(),
+            ),
+            // Milestone-scoped probe correctly surfaces the scope gap.
+            milestone_response: Err(anyhow::anyhow!(
+                "gh api /repos/senara-solutions/mika/milestones/30 failed: HTTP 403: Resource not accessible by integration"
+            )),
+        };
+        let err = verify_gh_auth(&runner, &test_target()).await.expect_err(
+            "wrong-user PAT with valid /rate_limit but no milestone scope MUST return Err — \
+                 a regression to /rate_limit-only probe would return Ok here",
+        );
+        assert_eq!(
+            err.auth_class,
+            AuthClass::Forbidden,
+            "wrong-user PAT scope failure classifies as Forbidden (403)"
+        );
+    }
+
+    /// `GhRunner` mock that records the args passed to each `run()` call.
+    /// Used to prove AC1 structurally — the probe uses the milestone-scoped
+    /// endpoint, not `/rate_limit`.
+    struct RecordingArgRunner {
+        calls: Arc<Mutex<Vec<Vec<String>>>>,
+        response: String,
+    }
+
+    #[async_trait::async_trait]
+    impl GhRunner for RecordingArgRunner {
+        async fn run(&self, args: &[&str]) -> Result<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(args.iter().map(|s| s.to_string()).collect());
+            Ok(self.response.clone())
+        }
+    }
+
+    /// mika#1974 AC1 — structural assertion that `verify_gh_auth` probes
+    /// the milestone-scoped endpoint (not `/rate_limit`). Any regression
+    /// that reverts the probe path will fail this test.
+    #[tokio::test]
+    async fn verify_gh_auth_probes_milestone_scoped_endpoint() {
+        let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let runner = RecordingArgRunner {
+            calls: calls.clone(),
+            response: milestone_success_body(),
+        };
+        verify_gh_auth(&runner, &test_target())
+            .await
+            .expect("valid success body");
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1, "verifier must issue exactly one probe");
+        let args = &recorded[0];
+        assert_eq!(args[0], "api", "first arg must be `api`");
+        assert_eq!(
+            args[1], "/repos/senara-solutions/mika/milestones/30",
+            "second arg must be the milestone-scoped path, NOT /rate_limit — \
+             this test locks mika#1974 AC1 against regression"
+        );
+        assert!(
+            !args.iter().any(|a| a == "/rate_limit"),
+            "verifier must NOT probe /rate_limit (mika#1974 replaces it)"
         );
     }
 
