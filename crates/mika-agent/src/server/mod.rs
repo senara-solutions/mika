@@ -1350,15 +1350,24 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     // `webhook_queue_shutdown`; cancelled at shutdown below. The spawn is
     // env-gated on `MIKA_MANAGER_TARGET_MILESTONE` — unset → no spawn.
     let manager_shutdown_token = CancellationToken::new();
+    // mika#1968 AC5: `manager_config_from_env` now takes `&Settings` + optional
+    // `GitHubApp` and routes token acquisition through `Settings::resolve_github_token`
+    // (PAT first, App fallback). `global_github_app` is constructed above at this
+    // scope; pass it as `Option<&_>` so the App installation-token fallback fires
+    // when `MIKA_GITHUB_TOKEN` is unset in the daemon env.
+    // mika#1968 AC6: `spawn_manager_cycle_task` now returns `Option<JoinHandle>` —
+    // the guard rejects duplicate calls within the same process.
     let manager_handle: Option<tokio::task::JoinHandle<()>> =
-        match crate::milestone_manager::manager_config_from_env() {
-            Ok(Some(cfg)) => {
-                let handle = crate::milestone_manager::spawn_manager_cycle_task(
-                    cfg,
-                    manager_shutdown_token.child_token(),
-                );
-                Some(handle)
-            }
+        match crate::milestone_manager::manager_config_from_env(
+            settings,
+            global_github_app.as_deref(),
+        )
+        .await
+        {
+            Ok(Some(cfg)) => crate::milestone_manager::spawn_manager_cycle_task(
+                cfg,
+                manager_shutdown_token.child_token(),
+            ),
             Ok(None) => {
                 info!(
                     target: "mika::milestone_manager",
