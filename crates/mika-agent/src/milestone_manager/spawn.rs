@@ -141,6 +141,19 @@ pub async fn manager_config_from_env(
     // The `agent_github_token()` accessor is the same MIKA_GITHUB_TOKEN the rest
     // of the crate uses; if the PAT is unset, the App fallback resolves via
     // the injected GitHubApp handle.
+    //
+    // **A3 P1 note — App token lifetime hazard (deferred per plan §5c).**
+    // When this path returns an App installation token (PAT is unset,
+    // GitHubApp resolved), the token has a ~1h TTL. `ManagerConfig.github_token`
+    // is populated ONCE at spawn time and forwarded verbatim to `gh` on every
+    // cycle. After 1h the manager cycles silently 401 until the process
+    // restarts, even though `verify_gh_auth` passed at boot. This is the same
+    // shape as the founding incident from the operator's log-grep perspective
+    // (401s buried in cycle_error spam), scoped to App-path deployments only.
+    // The `auth_class=401` field on `manager_cycle_error` (change 5c) is the
+    // primary diagnostic surface — sustained hits >1h post-boot on an
+    // App-auth deployment signal this class. Follow-up ticket needed to
+    // periodically refresh via `resolve_github_token` inside the cycle loop.
     let github_token = settings.resolve_github_token(github_app).await;
 
     let checkpoint_dir = read_path_env(ENV_CHECKPOINT_DIR)
@@ -400,13 +413,30 @@ pub struct GhAuthError {
 ///
 /// The primary_rate object shape follows the GitHub REST API's
 /// `/rate_limit` response (`resources.core.remaining`).
+///
+/// **A2 P1 fix** — Malformed / empty / schema-drift response bodies are
+/// treated as failure (`AuthClass::Other`), NOT as `Ok(0)`. A successful
+/// HTTP response with unparseable body is a fidelity gap for a verifier
+/// whose job is to catch bad auth loudly at boot: `Ok(0)` would log
+/// `manager_gh_auth_check_ok rate_limit_remaining=0` which is impossible
+/// on healthy authenticated accounts (5000/hr baseline) and would mask a
+/// silent degradation. We fail-loud with a distinct `parse_failure:` prefix
+/// on `stderr_head` so operators can grep for the schema-drift class
+/// without confusing it with a genuine 401/403/network failure.
+///
+/// **Fidelity boundary (A4 deferred):** `/rate_limit` validates the token
+/// authenticates against GitHub but does NOT confirm the token has
+/// scope/reachability for the specific target milestone repo. A
+/// wrong-user PAT or a valid-but-wrong-org App installation token would
+/// pass this check and then 403 on every cycle. Target-repo probe is a
+/// follow-up (see plan §5c non-goals + `docs/solutions/best-practices/
+/// app-owned-env-vs-init-owned-env-2026-08-23.md`).
 pub async fn verify_gh_auth<R: GhRunner>(runner: &R) -> Result<u64, GhAuthError> {
     match runner.run(&["api", "/rate_limit"]).await {
         Ok(body) => {
-            // Parse `resources.core.remaining` best-effort. A malformed body
-            // is not a failure — the call succeeded (2xx or `gh` would have
-            // errored). Return 0 as a defensive default so operators still
-            // see the OK line even if parsing regressed.
+            // A2 P1 fix — parse-or-fail. A successful HTTP response without a
+            // usable `resources.core.remaining` is a fidelity gap the verifier
+            // must surface, not paper over with `unwrap_or(0)`.
             let remaining = serde_json::from_str::<serde_json::Value>(&body)
                 .ok()
                 .and_then(|v| {
@@ -414,9 +444,20 @@ pub async fn verify_gh_auth<R: GhRunner>(runner: &R) -> Result<u64, GhAuthError>
                         .and_then(|r| r.get("core"))
                         .and_then(|c| c.get("remaining"))
                         .and_then(|n| n.as_u64())
-                })
-                .unwrap_or(0);
-            Ok(remaining)
+                });
+            match remaining {
+                Some(n) => Ok(n),
+                None => {
+                    let snippet: String = body.chars().take(160).collect();
+                    Err(GhAuthError {
+                        auth_class: AuthClass::Other,
+                        stderr_head: format!(
+                            "parse_failure: body missing resources.core.remaining — snippet={snippet:?}"
+                        ),
+                        exit_code: -1,
+                    })
+                }
+            }
         }
         Err(e) => {
             let raw = format!("{e}");
@@ -964,6 +1005,54 @@ mod tests {
         }
     }
 
+    // ---- mika#1968 AC5 config-routing tests ----------------------------
+
+    /// mika#1968 AC5 test — locks the load-bearing routing invariant: when
+    /// `Settings.github_token` is set, the resulting `ManagerConfig.github_token`
+    /// MUST reflect the Settings value, NOT the raw `MIKA_GITHUB_TOKEN` env
+    /// var. A future refactor that reverts to `read_string_env("MIKA_GITHUB_TOKEN")`
+    /// — the pre-fix bypass this ticket exists to close — would fail here.
+    ///
+    /// This is the T2 P1 gap the code-review flagged: `verify_gh_auth_*`
+    /// mocks GhRunner and never exercises `manager_config_from_env`'s token
+    /// wiring at all. Without this test, a re-introduction of the bypass
+    /// class would ship green.
+    ///
+    /// Sets both env var and Settings.github_token to DIFFERENT values;
+    /// asserts the resulting ManagerConfig carries the Settings value.
+    #[tokio::test]
+    #[serial]
+    async fn manager_config_from_env_routes_through_settings_not_raw_env() {
+        use mika_common::config::Settings;
+        use secrecy::SecretString;
+
+        clear_manager_env();
+        set_env(ENV_TARGET_MILESTONE, "senara-solutions/mika#1968");
+
+        // Env value the bypass path (raw read_string_env) would return.
+        set_env("MIKA_GITHUB_TOKEN", "env_value_should_NOT_appear");
+
+        // Settings value the Settings-routing path should return.
+        let mut settings = Settings::test_defaults();
+        settings.github_token = Some(SecretString::from("settings_value_MUST_win".to_string()));
+
+        let cfg = manager_config_from_env(&settings, None)
+            .await
+            .expect("no parse error")
+            .expect("Some when target set");
+
+        assert_eq!(
+            cfg.github_token.as_deref(),
+            Some("settings_value_MUST_win"),
+            "manager_config_from_env MUST route through Settings::resolve_github_token \
+             — a regression to raw env read (the pre-fix bypass) would fail this test. \
+             Founding incident: mika#1968 (bypass meant App-token fallback was unreachable)."
+        );
+
+        // Cleanup env leak.
+        unsafe { env::remove_var("MIKA_GITHUB_TOKEN") };
+    }
+
     // ---- mika#1968 AC5 GitHub auth tests -------------------------------
 
     /// Mock `GhRunner` that always returns a given result — used to exercise
@@ -1021,6 +1110,51 @@ mod tests {
             .await
             .expect("valid rate_limit body must return Ok");
         assert_eq!(remaining, 4321);
+    }
+
+    /// mika#1968 T4 P2 (A2 P1 companion) — malformed / empty / schema-drift
+    /// success bodies MUST be treated as failure, not `Ok(0)`. Locks the
+    /// A2 P1 fix: a HTTP 200 whose body lacks `resources.core.remaining`
+    /// is a fidelity gap the verifier must surface loudly (else `check_ok
+    /// remaining=0` would print on healthy accounts that always have 5000
+    /// baseline — an operator would misread it as OK when auth is
+    /// silently degraded).
+    ///
+    /// Also protects against a regression to `unwrap_or(0)` — that shape
+    /// would return `Ok(0)` here and fail the assertion.
+    #[tokio::test]
+    async fn verify_gh_auth_malformed_body_returns_err_other() {
+        // Case 1: empty JSON object — valid JSON but missing schema.
+        let runner = MockGhRunner {
+            result: Ok("{}".to_string()),
+        };
+        let err = verify_gh_auth(&runner)
+            .await
+            .expect_err("empty body must not silently pass as Ok(0)");
+        assert_eq!(err.auth_class, AuthClass::Other);
+        assert!(
+            err.stderr_head.contains("parse_failure"),
+            "stderr_head must carry parse_failure prefix: {}",
+            err.stderr_head
+        );
+
+        // Case 2: garbage body (not JSON).
+        let runner = MockGhRunner {
+            result: Ok("".to_string()),
+        };
+        let err = verify_gh_auth(&runner)
+            .await
+            .expect_err("empty string body must not silently pass as Ok(0)");
+        assert_eq!(err.auth_class, AuthClass::Other);
+
+        // Case 3: schema-drift — resources present but no core.remaining.
+        let runner = MockGhRunner {
+            result: Ok(r#"{"resources":{"other":{}}}"#.to_string()),
+        };
+        let err = verify_gh_auth(&runner)
+            .await
+            .expect_err("schema-drift body must not silently pass as Ok(0)");
+        assert_eq!(err.auth_class, AuthClass::Other);
     }
 
     /// mika#1968 AC5 test — 403 and network-class errors classify separately

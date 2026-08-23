@@ -99,16 +99,31 @@ The mika#1968 additions turn this from "indirect subprocess inspection"
 to "direct boot-line grep":
 
 ```
-$ grep 'mika_spirit_home_resolved\|dotenv_' /var/log/mika/server.log
+$ grep 'mika_spirit_home_resolved\|mika_spirit_env_check\|dotenv_' /var/log/mika/server.log
 mika_spirit_home_resolved home=/root/.mika mika_home_env=<unset> home_env=/root
-mika_spirit_env_check env_file_keys=12 manager_target_set=true github_token_set=true
-{"event":"dotenv_loaded","path":"/root/.mika/.env","keys_from_file":12}
+dotenv_loaded path=/root/.mika/.env keys_from_file=12
+mika_spirit_env_check env_file_present=true env_file_keys=12 manager_target_set=true github_token_set=true
 ```
 
-Three lines that tell you: (a) which home dir the binary picked, (b) how
-many keys the file had, (c) whether the load-bearing vars are visible to
-the process. If any of those disagree with expectations, the failure
-class is immediately obvious.
+Three plain-text stderr lines that tell you: (a) which home dir the
+binary picked, (b) whether the .env file was actually found and how many
+keys it had (dotenv_loaded / dotenv_absent / dotenv_load_error — one of
+these fires per boot), (c) whether the load-bearing vars are visible to
+the process (env_file_present distinguishes "wrong home dir" from
+"empty file at right dir"; manager_target_set + github_token_set
+confirm the load-bearing MIKA_* vars reached the process env). If any
+of those disagree with expectations, the failure class is immediately
+obvious.
+
+**Why plain-text stderr (not structured JSON):** these lines fire in
+`main()` BEFORE `logging::init()` installs a JSON subscriber, so
+`tracing::info!` calls would be silently dropped. `eprintln!` to stderr
+is captured by OpenRC/systemd into the service log unconditionally.
+Downstream aggregators that want structured events can also grep for
+the `{"event":"dotenv_loaded",...}` JSON lines emitted post-init in
+paths where a subscriber exists (mika CLI's per-invocation init;
+`load_dotenv` calls made after `logging::init` on any future path);
+both channels use the same event names + field names.
 
 ## When to use
 

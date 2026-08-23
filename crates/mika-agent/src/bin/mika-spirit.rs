@@ -26,12 +26,19 @@ async fn main() -> Result<()> {
     // mika#1968 AC2 — post-load-dotenv boot line summarizing what landed on
     // disk vs what the process env now sees for the load-bearing vars. Same
     // eprintln! reasoning as home_resolved above.
+    //
+    // **A9 P3 fix** — `env_file_present` disambiguates "wrong home dir → no
+    // file" from "right home dir but empty file". Both would produce
+    // `env_file_keys=0` alone; the boolean lets an operator resolving a
+    // silent-load blackout distinguish sub-cause #2 (wrong home) from a
+    // configuration mistake (empty file).
     let env_file_key_count = mika_common::dotenv::parse_dotenv(&home_dir).len();
+    let env_file_present = home_dir.join(".env").exists();
     let manager_target_set = std::env::var("MIKA_MANAGER_TARGET_MILESTONE").is_ok();
     let github_token_set = std::env::var("MIKA_GITHUB_TOKEN").is_ok();
     eprintln!(
-        "mika_spirit_env_check env_file_keys={} manager_target_set={} github_token_set={}",
-        env_file_key_count, manager_target_set, github_token_set
+        "mika_spirit_env_check env_file_present={} env_file_keys={} manager_target_set={} github_token_set={}",
+        env_file_present, env_file_key_count, manager_target_set, github_token_set
     );
 
     if !mika_common::home::is_initialized(&home_dir) {

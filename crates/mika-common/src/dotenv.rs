@@ -6,10 +6,23 @@ use tracing::{error, info, warn};
 /// Load `.env` from `{home_dir}/.env` into process environment variables.
 ///
 /// Uses `dotenvy::from_path()` which does NOT override existing env vars —
-/// shell-set `MIKA_*` variables always win. Emits a structured `info!` on
-/// success (with `keys_from_file` count), on absent file, and an `error!`
-/// on parse/IO failure so operators can distinguish the three states in
-/// production logs (mika#1968 AC1/AC2 observability).
+/// shell-set `MIKA_*` variables always win. Emits observability for the
+/// three states (loaded / absent / load_error) via TWO channels (mika#1968
+/// AC1/AC2 + adversarial review A1 P0):
+/// - `eprintln!` to stderr — durable across subscriber init state, so
+///   supervise-daemon/OpenRC boot lines fire BEFORE `logging::init()`
+///   installs a tracing subscriber. Captured by the service log.
+/// - `info!/error!` structured events — silent when no subscriber is
+///   installed (mika-spirit boot), visible when one is (post-init paths,
+///   CLI callers that init logging before load_dotenv, tests with a
+///   subscriber).
+///
+/// Both channels use the same event names (`dotenv_loaded`, `dotenv_absent`,
+/// `dotenv_load_error`) and field names (`path`, `keys_from_file`) so a
+/// single grep hits either sink. This defends the founding-incident
+/// observability contract for supervised binaries where `logging::init()`
+/// legitimately runs after `load_dotenv()` (the Settings-then-init ordering
+/// enforced by `mika-spirit::main`).
 pub fn load_dotenv(home_dir: &Path) {
     let env_path = home_dir.join(".env");
 
@@ -20,6 +33,12 @@ pub fn load_dotenv(home_dir: &Path) {
     match dotenvy::from_path(&env_path) {
         Ok(()) => {
             let keys_from_file = parse_dotenv(home_dir).len();
+            // Pre-init durable channel (see fn docstring — A1 P0 fix).
+            eprintln!(
+                "dotenv_loaded path={} keys_from_file={}",
+                env_path.display(),
+                keys_from_file
+            );
             info!(
                 target: "mika::env",
                 event = "dotenv_loaded",
@@ -29,6 +48,8 @@ pub fn load_dotenv(home_dir: &Path) {
             );
         }
         Err(dotenvy::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Pre-init durable channel (see fn docstring — A1 P0 fix).
+            eprintln!("dotenv_absent path={}", env_path.display());
             info!(
                 target: "mika::env",
                 event = "dotenv_absent",
@@ -37,7 +58,10 @@ pub fn load_dotenv(home_dir: &Path) {
             );
         }
         Err(e) => {
-            // Log but don't fail — env vars or config files may still provide values
+            // Pre-init durable channel (see fn docstring — A1 P0 fix).
+            // Errors are the highest-signal state — operators MUST see this
+            // even when no subscriber exists.
+            eprintln!("dotenv_load_error path={} error={}", env_path.display(), e);
             error!(
                 target: "mika::env",
                 event = "dotenv_load_error",
@@ -252,6 +276,44 @@ mod tests {
         // Parse-dotenv API surface confirms the "loaded" count is 0 for the same path
         let parsed = parse_dotenv(tmp.path());
         assert_eq!(parsed.len(), 0);
+    }
+
+    /// mika#1968 T5 P3 — empty-file canary. Locks the "file present but
+    /// empty" state that the `keys_from_file=0` observability count is
+    /// meant to distinguish from `dotenv_absent`. A regression that
+    /// silently reports non-zero for an empty file (e.g., `values().count()`
+    /// dropping empty-string values) would break this canary. See
+    /// `docs/solutions/best-practices/app-owned-env-vs-init-owned-env-2026-08-23.md`.
+    #[test]
+    fn load_dotenv_reports_zero_keys_for_empty_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".env"), "").unwrap();
+        load_dotenv(tmp.path());
+        assert_eq!(
+            parse_dotenv(tmp.path()).len(),
+            0,
+            "empty .env file must report 0 keys — the canary distinguishes 'present but empty' from 'absent'"
+        );
+    }
+
+    /// mika#1968 T3 P2 — dotenv_load_error arm. Locks the third
+    /// observability state: file present but unparseable → `dotenvy` returns
+    /// `Err(LineParse)`, code emits `dotenv_load_error` structured event
+    /// (and pre-init `eprintln!` per A1 P0 fix). Regression that swallows
+    /// the error or panics would fail here. Structural check on the code
+    /// path — does not attempt to capture log/eprintln output (that requires
+    /// a subscriber install + stderr redirect setup we don't want to force
+    /// on unit-test scope).
+    #[test]
+    fn load_dotenv_handles_parse_error_without_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        // dotenvy 0.15's parser accepts most inputs — the reliably-rejected
+        // shape is a line without an `=` that also doesn't look like a
+        // comment. `KEY_WITHOUT_EQUALS` (bare identifier) triggers LineParse.
+        std::fs::write(tmp.path().join(".env"), "KEY_WITHOUT_EQUALS\n").unwrap();
+        // MUST complete without panic — the log-and-continue posture is
+        // load-bearing (env vars or config files may still provide values).
+        load_dotenv(tmp.path());
     }
 
     /// mika#1968 AC1/AC2 — presence with N keys. Locks the structural
