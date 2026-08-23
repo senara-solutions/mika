@@ -63,6 +63,11 @@ fn make_ctx<'a>(soul_content: &'a str, identity: &'a Identity) -> PromptContext<
         runtime_provider: "test-provider",
         runtime_model: "test-model",
         stopped_topics: &[],
+        // mika#1815 companion — runtime section fields required by PromptContext.
+        // Empty strings are fine here: this scenario asserts on the Distribution
+        // Doctrine section shape (mika#1814 AC1/AC9/AC11), not the runtime section.
+        runtime_provider: "",
+        runtime_model: "",
     }
 }
 
