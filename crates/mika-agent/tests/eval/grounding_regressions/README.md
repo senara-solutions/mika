@@ -104,6 +104,7 @@ Scenario 5 sits on the boundary — it uses `#740`'s KG fixture helpers but tags
 | 42. qa_review_required_tools_retry_duplicate (post-fix) | | | | | `duplicate-side-effect-suppressed` |
 | 43. asserted_unavailability_pr_review_composition | | V | | | `unavailability-asserted-without-attempt` (failure), `verification-before-claim` |
 | 44. assert_grounded_pr_review_composition | | V | | | `affirmative-claim-ungrounded` (failure), `verification-before-claim` |
+| 45. mixed_verification_qualification | | | | V | `mixed-verification-per-line-qualified`, `merged-verified-and-inferred` (failure) |
 
 *Scenario 4 accepts either a verification tool call OR a question mark in response (asking for evidence).
 
@@ -133,7 +134,7 @@ Scenario 5 sits on the boundary — it uses `#740`'s KG fixture helpers but tags
 | 41-42. qa_review_required_tools_retry_duplicate | V | - | - |
 | 43. asserted_unavailability_pr_review_composition | V | - | - |
 | 44. assert_grounded_pr_review_composition | V | - | - |
-| 45. mixed_verification_qualification | | | | V | `mixed-verification-per-line-qualified`, `merged-verified-and-inferred` (failure) |
+| 45. mixed_verification_qualification | V | - | - |
 
 ## Frozen Regression Fixtures
 
