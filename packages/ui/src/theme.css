@@ -1,17 +1,66 @@
 @theme {
   --font-sans: "Plus Jakarta Sans", system-ui, -apple-system, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, monospace;
-  --color-bg: #0d0f12;
-  --color-bg-card: #151820;
-  --color-accent: #7c6af7;
-  --color-accent-light: #9d8fff;
-  --color-heading: #e8ecf2;
-  --color-muted: #a0a8b8;
+
+  /* Rulebook §2 canonical surface hierarchy — luminescent-core.md:50-58 (Full Token Reference)
+     Supersedes the "Override neutrals" override row at §2 bottom (#0d0f12). LC.1 alignment. */
+  --color-background: #0c0e11;
+  --color-surface: #0c0e11;
+  --color-surface-dim: #0c0e11;
+  --color-surface-container-lowest: #000000;
+  --color-surface-container-low: #111317;
+  --color-surface-container: #171a1d;
+  --color-surface-container-high: #1d2024;
+  --color-surface-container-highest: #23262a;
+  --color-surface-variant: #23262a;
+  --color-surface-bright: #292c31;
+
+  /* Rulebook §2 canonical on-surface + outline */
+  --color-on-background: #e8e8ec;
+  --color-on-surface: #e8e8ec;
+  --color-on-surface-variant: #aaabaf;
+  --color-outline: #747579;
+  --color-outline-variant: #46484b;
+
+  /* Rulebook §2 canonical primary + secondary + tertiary + surface-tint + inverse.
+     Supersedes the "Override primary" row (#7c6af7) and "Override tertiary" (#e8ecf2). */
+  --color-primary: #ada3ff;
+  --color-primary-dim: #715eeb;
+  --color-primary-container: #9f93ff;
+  --color-primary-fixed: #9f93ff;
+  --color-primary-fixed-dim: #9182ff;
+  --color-secondary: #9d8fff;
+  --color-secondary-dim: #9d8fff;
+  --color-secondary-container: #4434a0;
+  --color-tertiary: #f6f9ff;
+  --color-surface-tint: #ada3ff;
+  --color-inverse-surface: #f9f9fd;
+
+  /* Rulebook §2 canonical error triad.
+     §5.5 line 270 references #ef4444 (contradiction with §2's #ff6e84).
+     Implementation adopts §2 (canonical Full Token Reference table). Rulebook
+     doc-side reconciliation surfaced to Vincent as operator follow-up per
+     `mika/CLAUDE.md § docs/design` (rulebook is Vincent-owned direct-commit). */
+  --color-error: #ff6e84;
+  --color-error-dim: #d73357;
+  --color-error-container: #a70138;
+
+  /* Semantic status tokens (non-rulebook — no §2 counterpart; kept from prior theme) */
   --color-success: #10b981;
   --color-warning: #f59e0b;
-  --color-error: #ef4444;
   --color-blocked: #f97316;
-  --color-surface-container-high: #1e2130;
+
+  /* Backward-compat aliases (legacy names → canonical values).
+     Ensures any consumer missed by the packages/ui + dashboard grep sweep
+     continues to render (with the new canonical color — the intended fix).
+     Remove once a cross-repo grep sweep (cloud-console, landing-page) confirms
+     zero legacy references. Tracked in plan § Out of scope. */
+  --color-bg: var(--color-background);
+  --color-bg-card: var(--color-surface-container);
+  --color-accent: var(--color-primary);
+  --color-accent-light: var(--color-secondary);
+  --color-heading: var(--color-on-surface);
+  --color-muted: var(--color-on-surface-variant);
 
   /* Spacing scale per luminescent-core §6 (8px base, doubled rhythm) */
   --spacing-1: 0.25rem;   /*  4px */
@@ -45,6 +94,11 @@ html {
 }
 
 select option {
-  background: #151820;
-  color: #a0a8b8;
+  /* Reference canonical tokens directly so a future rulebook §2 shift
+     stays coherent with this fallback style (no silent-desync).
+     Note: browsers vary in whether they honor CSS variables inside
+     `<option>` (some render OS-native popups that bypass author styles).
+     Provide a raw fallback via CSS var default for maximum compatibility. */
+  background: var(--color-surface-container, #171a1d);
+  color: var(--color-on-surface-variant, #aaabaf);
 }

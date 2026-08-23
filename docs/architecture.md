@@ -763,7 +763,9 @@ The Vite dev server proxies `/api` requests to `http://localhost:8080`
 
 ### Design System
 
-Dark theme: `#0d0f12` background, `#151820` cards, `#7c6af7` accent.
+Dark theme (Luminescent Core rulebook §2, mika#1800): `#0c0e11` background,
+`#171a1d` surface_container (cards), `#ada3ff` primary (accent). Full palette
+in `packages/ui/src/theme.css`; rulebook in `docs/design/luminescent-core.md`.
 Fonts: Plus Jakarta Sans (UI), JetBrains Mono (code/IDs).
 Subsystem colors: blue (messages), amber (audit), emerald (tasks).
 
