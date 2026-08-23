@@ -580,6 +580,17 @@ pub struct PromptContext<'a> {
     /// When non-empty, rendered as a `<stopped-topics>` block so the agent sees
     /// which subjects the user has explicitly asked not to be re-raised on.
     pub stopped_topics: &'a [Preference],
+    /// Runtime LLM provider name (e.g. `"anthropic"`, `"zai"`) — ground truth
+    /// for "which model am I?" questions. Sourced from `llm.provider_name()` at
+    /// turn-start; same source that populates `ToolContext.provider_name`, so
+    /// the prompt-injected `## Runtime` section and the `get_active_llm` tool
+    /// cannot drift. Consumed by `write_runtime_section` (`build_system_prompt`
+    /// and `build_compact_system_prompt`). See mika#1815.
+    pub runtime_provider: &'a str,
+    /// Runtime LLM model name (e.g. `"claude-sonnet-4-6"`, `"glm-5.2"`).
+    /// See `runtime_provider` for the ground-truth contract. Consumed by
+    /// `write_runtime_section`. See mika#1815.
+    pub runtime_model: &'a str,
 }
 
 fn onboarding_prompt() -> String {
@@ -609,6 +620,72 @@ fn write_soul_section(prompt: &mut String, soul_content: &str) {
 /// Write the identity section.
 fn write_identity_section(prompt: &mut String, identity: &Identity) {
     write!(prompt, "## Identity\nYou are {}.\n\n", identity.name).unwrap();
+}
+
+/// Write the runtime LLM identity section (mika#1815).
+///
+/// Populated from the live `LlmProvider` instance at turn-start (same source
+/// as `ToolContext.provider_name` / `model_name`), this is ground truth for
+/// "which model / LLM are you?" questions. The Self-Identity Discipline
+/// section directs the agent to quote this section verbatim (rule 1) and
+/// forbids inferring the model from commented-out config lines or defaults.
+fn write_runtime_section(prompt: &mut String, provider: &str, model: &str) {
+    prompt.push_str("## Runtime\n");
+    writeln!(
+        prompt,
+        "You are currently running on provider `{provider}` model `{model}`."
+    )
+    .unwrap();
+    prompt.push_str(
+        "This is the ground truth for questions about your own LLM/model. \
+         Do NOT infer your model from commented-out config lines, defaults, or \"probably\" reasoning. \
+         If a user asks which model you use, quote this line verbatim.\n\n",
+    );
+}
+
+/// Write the self-identity discipline section (mika#1815).
+///
+/// Directive-shaped rules that anchor on the `## Runtime` block above. Placed
+/// after Runtime so rule 1 ("Quote, don't infer") has the ground-truth data
+/// already in scope. Contrast anchor is mika#1784 (image-ingestion honesty)
+/// — the same anti-fabrication virtue must apply self-referentially.
+fn write_self_identity_discipline_section(prompt: &mut String) {
+    prompt.push_str("## Self-Identity Discipline\n");
+    prompt.push_str(
+        "When a user asks about YOU — which model you are, which provider powers you, \
+         your configuration, your capabilities — the ground truth is the `## Runtime` \
+         section above, populated from your live LLM instance. Follow these rules:\n\n",
+    );
+    prompt.push_str(
+        "1. **Quote, don't infer.** For \"which model / LLM are you?\" quote the Runtime \
+         section (or call `get_active_llm`). Do NOT reason from commented-out config \
+         lines, \"probably\", \"vu le contexte\", or default fallbacks.\n\n",
+    );
+    prompt.push_str(
+        "2. **Verb discipline.** \"I will VERIFY\" implies reading the source of truth \
+         (Runtime section, `get_active_llm`, `get_config`, `read_agent_file`). \"I will \
+         GUESS / INFER\" implies reasoning without a read. Never say VERIFY and then \
+         deliver an INFERENCE.\n\n",
+    );
+    prompt.push_str(
+        "3. **Fallback honestly.** If ground truth is genuinely unavailable \
+         (Runtime section absent AND `get_active_llm` errors), say \"I cannot \
+         reliably determine my model\" and point at where the configuration \
+         lives (e.g. `~/.mika/config.toml`). Never fabricate a confident answer.\n\n",
+    );
+    prompt.push_str(
+        "4. **Consistency across a single turn.** You may not say \"I don't know \
+         with certainty\" and then in the next paragraph assert a model with \
+         confidence. Uncertainty at t=0 and confidence at t=1 within the same \
+         response is confabulation.\n\n",
+    );
+    prompt.push_str(
+        "This applies self-referentially: the anti-fabrication virtue you extend to \
+         user-facing tasks (phone numbers, image contents, file paths) MUST also \
+         apply to facts about yourself. Contrast reference: mika#1784 (you correctly \
+         refused to fabricate what an unseen image contained — apply the same \
+         integrity to self-identity questions).\n\n",
+    );
 }
 
 /// Write the current time section with optional timezone.
@@ -674,6 +751,11 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
 
     write_soul_section(&mut prompt, ctx.soul_content);
     write_identity_section(&mut prompt, ctx.identity);
+    // Runtime ground truth (mika#1815) — placed between Identity and Current Time
+    // so the "who am I / what am I running on" block reads coherently. The
+    // Self-Identity Discipline section below quotes this data as ground truth.
+    write_runtime_section(&mut prompt, ctx.runtime_provider, ctx.runtime_model);
+    write_self_identity_discipline_section(&mut prompt);
     write_time_section(&mut prompt, ctx.current_utc, ctx.timezone.as_deref());
     write_channel_section(&mut prompt, ctx.channel_type, ctx.telegram_configured);
     write_core_memory_section(
@@ -1061,6 +1143,19 @@ pub fn build_compact_system_prompt(ctx: &PromptContext<'_>) -> String {
     prompt.push_str("## Identity\n");
     write!(prompt, "You are {}.\n\n", ctx.identity.name).unwrap();
 
+    // ## Runtime — compact one-line variant (mika#1815). The MikaModel compact
+    // budget cannot afford the full Self-Identity Discipline block, but the
+    // ground-truth line itself is ~50 bytes and pays for itself the first time
+    // a user asks "which model?" — quoting the line beats confabulating.
+    prompt.push_str("## Runtime\n");
+    writeln!(
+        prompt,
+        "Provider `{}`, model `{}`.",
+        ctx.runtime_provider, ctx.runtime_model
+    )
+    .unwrap();
+    prompt.push('\n');
+
     prompt
 }
 
@@ -1092,6 +1187,13 @@ pub struct SilentPromptContext<'a> {
     /// See `STOP_TOPIC_PREFIX`. Rendered as `<stopped-topics>` block in silent
     /// prompts so the agent does not re-initiate on user-refused topics.
     pub stopped_topics: &'a [Preference],
+    /// Runtime LLM provider name (mika#1815) — same contract as
+    /// `PromptContext.runtime_provider`. Heartbeat/callback/reflection turns
+    /// also carry the ground-truth `## Runtime` section so a self-identity
+    /// question during a background turn hits the same guardrail.
+    pub runtime_provider: &'a str,
+    /// Runtime LLM model name (mika#1815) — companion to `runtime_provider`.
+    pub runtime_model: &'a str,
 }
 
 /// Sanitize a label for prompt injection prevention: truncate to 200 chars, strip angle brackets
@@ -1123,6 +1225,13 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
 
     write_soul_section(&mut prompt, ctx.soul_content);
     write_identity_section(&mut prompt, ctx.identity);
+    // Runtime ground truth (mika#1815) — heartbeat/callback/reflection turns
+    // may still be asked "which model are you?" via a subsequent user message
+    // or in the compacted history the next conversation-mode turn inherits.
+    // Same section shape as `build_system_prompt` so downstream discipline is
+    // uniform.
+    write_runtime_section(&mut prompt, ctx.runtime_provider, ctx.runtime_model);
+    write_self_identity_discipline_section(&mut prompt);
     write_time_section(&mut prompt, ctx.current_utc, ctx.timezone.as_deref());
     write_channel_section(&mut prompt, None, ctx.telegram_configured);
     write_core_memory_section(
@@ -1426,6 +1535,8 @@ emoji = "✦"
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1502,6 +1613,8 @@ emoji = "✦"
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1538,6 +1651,8 @@ emoji = "✦"
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1560,6 +1675,8 @@ emoji = "✦"
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1583,6 +1700,8 @@ emoji = "✦"
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1627,6 +1746,8 @@ emoji = "✦"
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1654,6 +1775,8 @@ emoji = "✦"
             task_health: None,
             stored_preferences: &[],
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1682,6 +1805,8 @@ emoji = "✦"
             task_health: None,
             stored_preferences: &[],
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1718,6 +1843,8 @@ emoji = "✦"
             task_health: None,
             stored_preferences: &[],
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1741,6 +1868,8 @@ emoji = "✦"
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1766,6 +1895,8 @@ emoji = "✦"
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1789,6 +1920,8 @@ emoji = "✦"
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1824,6 +1957,8 @@ emoji = "✦"
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1860,6 +1995,8 @@ emoji = "✦"
             task_health: None,
             stored_preferences: &[],
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1887,6 +2024,8 @@ emoji = "✦"
             task_health: None,
             stored_preferences: &[],
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -1937,6 +2076,8 @@ max_iterations = 3
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -1982,6 +2123,8 @@ max_iterations = 3
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2014,6 +2157,8 @@ max_iterations = 3
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2037,6 +2182,8 @@ max_iterations = 3
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2059,6 +2206,8 @@ max_iterations = 3
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2081,6 +2230,8 @@ max_iterations = 3
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2105,6 +2256,8 @@ max_iterations = 3
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2129,6 +2282,8 @@ max_iterations = 3
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2151,6 +2306,8 @@ max_iterations = 3
             home_dir: Some(std::path::Path::new("/home/user/.mika/agents/mika")),
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2180,6 +2337,8 @@ max_iterations = 3
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2208,6 +2367,8 @@ max_iterations = 3
             task_health: None,
             stored_preferences: &[],
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -2233,6 +2394,8 @@ max_iterations = 3
             task_health: None,
             stored_preferences: &[],
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -2258,6 +2421,8 @@ max_iterations = 3
             task_health: None,
             stored_preferences: &[],
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -2426,6 +2591,8 @@ enabled = true
             task_health: None,
             stored_preferences: &[],
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -2454,6 +2621,8 @@ enabled = true
             task_health: None,
             stored_preferences: &[],
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -2525,6 +2694,8 @@ enabled = true
             task_health: Some(&health),
             stored_preferences: &[],
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -2558,6 +2729,8 @@ enabled = true
             task_health: None,
             stored_preferences: &[],
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -2589,6 +2762,8 @@ enabled = true
             task_health: None,
             stored_preferences: &prefs,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -2621,6 +2796,8 @@ enabled = true
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("store_fact(category=\"person\")"));
@@ -2642,6 +2819,8 @@ enabled = true
             home_dir: None,
             callback_context: Some("Processing callback results from a long-running task."),
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("## Callback Result Turn"));
@@ -2664,6 +2843,8 @@ enabled = true
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
         let prompt = build_system_prompt(&ctx);
         assert!(!prompt.contains("## Callback Result Turn"));
@@ -2685,6 +2866,8 @@ enabled = true
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2708,6 +2891,8 @@ enabled = true
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2731,6 +2916,8 @@ enabled = true
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2754,6 +2941,8 @@ enabled = true
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2779,6 +2968,8 @@ enabled = true
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2810,6 +3001,8 @@ enabled = true
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3143,6 +3336,8 @@ inject = false
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_compact_system_prompt(&ctx);
@@ -3191,6 +3386,8 @@ inject = false
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
 
         let prompt = build_compact_system_prompt(&ctx);
@@ -3199,8 +3396,12 @@ inject = false
         assert!(!prompt.contains("## Personality"));
         // Identity section still present
         assert!(prompt.contains("## Identity"));
-        // Only 1 section
-        assert_eq!(prompt.matches("## ").count(), 1);
+        // Runtime section added (mika#1815) — carries ground-truth model
+        // identity so the compact provider can answer "which model?" without
+        // confabulating.
+        assert!(prompt.contains("## Runtime"));
+        // Two sections: ## Identity + ## Runtime
+        assert_eq!(prompt.matches("## ").count(), 2);
     }
 
     // ==================================================================
@@ -3252,6 +3453,8 @@ inject = false
             task_health: None,
             stored_preferences: &[],
             stopped_topics: &stops,
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
         let prompt = build_silent_prompt(&ctx);
         assert!(
@@ -3292,6 +3495,8 @@ inject = false
             task_health: None,
             stored_preferences: &[],
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
         let prompt = build_silent_prompt(&ctx);
         // Check for block-unique prose (silent-mode block description) — the
@@ -3335,6 +3540,8 @@ inject = false
             task_health: None,
             stored_preferences: &[],
             stopped_topics: &stops,
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
         let prompt = build_silent_prompt(&ctx);
         // The literal `<script>` fragment inside the category value must be
@@ -3370,6 +3577,8 @@ inject = false
             home_dir: None,
             callback_context: None,
             stopped_topics: &stops,
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
         let prompt = build_system_prompt(&ctx);
         assert!(
@@ -3396,6 +3605,8 @@ inject = false
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
         let prompt = build_system_prompt(&ctx);
         // The "Respect stop signals (consult)" rule mentions `## Stopped
@@ -3428,6 +3639,8 @@ inject = false
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
         let prompt = build_system_prompt(&ctx);
         assert!(
@@ -3468,6 +3681,8 @@ inject = false
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("Respect stop signals (consult)"));
@@ -3505,6 +3720,8 @@ inject = false
             task_health: None,
             stored_preferences: &[],
             stopped_topics: &stops,
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
         let prompt = build_silent_prompt(&ctx);
         // AC1 (state): the specific stopped topic Al refused is present.
@@ -3565,6 +3782,8 @@ inject = false
             task_health: None,
             stored_preferences: &[],
             stopped_topics: &stops,
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
         let prompt = build_silent_prompt(&ctx);
         // Both blocks present.
@@ -3668,6 +3887,8 @@ inject = false
             home_dir: None,
             callback_context: None,
             stopped_topics: &stops,
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
         let prompt = build_compact_system_prompt(&ctx);
         assert!(
@@ -3681,6 +3902,195 @@ inject = false
         assert!(
             !prompt.contains("Respect stop signals"),
             "compact prompt must not carry stop-signal rules"
+        );
+    }
+
+    // === mika#1815 — Self-identity / anti-confabulation tests ===
+    //
+    // The three tests below pin the shape of the Runtime + Self-Identity
+    // Discipline sections that fix the "Mika confabule son propre modèle"
+    // failure (Al testeur, 2026-07-20). Each is written to fail if the
+    // ground-truth channel drifts from what the tool + prompt promise.
+
+    #[test]
+    fn mika1815_runtime_section_carries_ground_truth_from_context() {
+        let identity = test_identity();
+        let memory = test_core_memory();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &memory,
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+            stopped_topics: &[],
+            runtime_provider: "zai",
+            runtime_model: "glm-5.2",
+        };
+        let prompt = build_system_prompt(&ctx);
+        assert!(
+            prompt.contains("## Runtime"),
+            "Runtime section header must be present"
+        );
+        assert!(
+            prompt.contains("provider `zai`"),
+            "Runtime section must quote the provider verbatim, got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("model `glm-5.2`"),
+            "Runtime section must quote the model verbatim, got:\n{prompt}"
+        );
+        // The rule text is present (structural, not paraphrase-tolerant).
+        assert!(
+            prompt.contains("ground truth for questions about your own LLM/model"),
+            "Runtime section must state the ground-truth contract"
+        );
+        assert!(
+            prompt.contains("Do NOT infer your model from commented-out config lines"),
+            "Runtime section must forbid inference from commented-out config"
+        );
+    }
+
+    #[test]
+    fn mika1815_self_identity_discipline_section_present_and_ordered_after_runtime() {
+        let identity = test_identity();
+        let memory = test_core_memory();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &memory,
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+            stopped_topics: &[],
+            runtime_provider: "anthropic",
+            runtime_model: "claude-sonnet-4-6",
+        };
+        let prompt = build_system_prompt(&ctx);
+        let runtime_pos = prompt
+            .find("## Runtime")
+            .expect("Runtime section must be present");
+        let discipline_pos = prompt
+            .find("## Self-Identity Discipline")
+            .expect("Self-Identity Discipline section must be present");
+        assert!(
+            runtime_pos < discipline_pos,
+            "Runtime must precede Self-Identity Discipline (rules quote Runtime data)"
+        );
+        // All four rule anchors present verbatim.
+        assert!(
+            prompt.contains("Quote, don't infer"),
+            "Rule 1 (Quote don't infer) must be present"
+        );
+        assert!(
+            prompt.contains("Verb discipline"),
+            "Rule 2 (Verb discipline VERIFY vs INFER) must be present"
+        );
+        assert!(
+            prompt.contains("Fallback honestly"),
+            "Rule 3 (Fallback honestly) must be present"
+        );
+        assert!(
+            prompt.contains("Consistency across a single turn"),
+            "Rule 4 (Consistency across a single turn) must be present"
+        );
+        // Anchor on the contrast reference so the section keeps its
+        // documentary link to the founding-incident cross-ticket.
+        assert!(
+            prompt.contains("mika#1784"),
+            "Section must reference mika#1784 as the contrast anchor"
+        );
+    }
+
+    #[test]
+    fn mika1815_compact_prompt_carries_runtime_line() {
+        let identity = test_identity();
+        let memory = test_core_memory();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &memory,
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+            stopped_topics: &[],
+            runtime_provider: "mikamodel",
+            runtime_model: "wizzard-v1",
+        };
+        let prompt = build_compact_system_prompt(&ctx);
+        assert!(
+            prompt.contains("## Runtime"),
+            "Compact prompt must include the Runtime header"
+        );
+        assert!(
+            prompt.contains("`mikamodel`"),
+            "Compact prompt must quote the provider verbatim, got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("`wizzard-v1`"),
+            "Compact prompt must quote the model verbatim, got:\n{prompt}"
+        );
+        // Compact-budget carve-out: the discipline block is intentionally
+        // omitted. Regression guard.
+        assert!(
+            !prompt.contains("Self-Identity Discipline"),
+            "Compact prompt must NOT include the full Self-Identity Discipline block \
+             (budget carve-out, mika#1815)"
+        );
+    }
+
+    #[test]
+    fn mika1815_silent_prompt_carries_runtime_and_discipline() {
+        let identity = test_identity();
+        let memory = test_core_memory();
+        let ctx = SilentPromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &memory,
+            pending_commitments: &[],
+            trigger_context: "heartbeat",
+            current_utc: test_time(),
+            timezone: None,
+            telegram_configured: false,
+            has_message_sender: false,
+            recent_conversations: None,
+            recent_audit_events: None,
+            home_dir: None,
+            task_health: None,
+            stored_preferences: &[],
+            stopped_topics: &[],
+            runtime_provider: "zai",
+            runtime_model: "glm-5.2",
+        };
+        let prompt = build_silent_prompt(&ctx);
+        // Silent mode carries the same ground-truth block as conversation
+        // mode — self-identity honesty must be uniform.
+        assert!(
+            prompt.contains("## Runtime"),
+            "Silent prompt must include the Runtime header"
+        );
+        assert!(
+            prompt.contains("provider `zai`") && prompt.contains("model `glm-5.2`"),
+            "Silent prompt Runtime section must carry ground truth verbatim, got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("## Self-Identity Discipline"),
+            "Silent prompt must include the Self-Identity Discipline block"
         );
     }
 }

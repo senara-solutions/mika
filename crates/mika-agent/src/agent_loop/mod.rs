@@ -3004,6 +3004,12 @@ async fn run_agent_inner(
     let ctx = load_agent_context(db, params.home_dir).await?;
 
     let chat_id = db.get_customer_config("chat_id").await?;
+    // Ground-truth LLM identity carried through prompt assembly (mika#1815).
+    // Same source that populates `ToolContext.provider_name` / `model_name`,
+    // so the `## Runtime` prompt section and the `get_active_llm` tool cannot
+    // drift on the "which model am I?" answer.
+    let runtime_provider = llm.provider_name();
+    let runtime_model = llm.model_name();
     let prompt_ctx = prompt::PromptContext {
         soul_content: &ctx.soul_content,
         identity: &ctx.identity,
@@ -3021,6 +3027,8 @@ async fn run_agent_inner(
             None
         },
         stopped_topics: &ctx.stopped_topics,
+        runtime_provider,
+        runtime_model,
     };
     let is_compact_provider = llm.provider_name() == ProviderKind::MikaModel.config_prefix();
     let mut system = if is_compact_provider {
@@ -3929,6 +3937,12 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         (None, vec![])
     };
     let chat_id = db.get_customer_config("chat_id").await?;
+    // Ground-truth LLM identity for silent turns (mika#1815). Silent-mode
+    // callback turns can still be asked "which model?" via inherited
+    // conversation context, and the Self-Identity Discipline section is
+    // uniform across conversation and silent paths.
+    let silent_runtime_provider = llm.provider_name();
+    let silent_runtime_model = llm.model_name();
     let silent_ctx = prompt::SilentPromptContext {
         soul_content: &ctx.soul_content,
         identity: &ctx.identity,
@@ -3945,6 +3959,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         task_health: task_health.as_ref(),
         stored_preferences: &stored_preferences,
         stopped_topics: &ctx.stopped_topics,
+        runtime_provider: silent_runtime_provider,
+        runtime_model: silent_runtime_model,
     };
     let mut system = prompt::build_silent_prompt(&silent_ctx);
 
@@ -4533,6 +4549,10 @@ async fn run_team_agent_inner_impl(
         stage_prev,
     );
 
+    // Ground-truth LLM identity for team-child turns (mika#1815). Team members
+    // share the same Self-Identity Discipline contract as conversation-mode.
+    let team_runtime_provider = llm.provider_name();
+    let team_runtime_model = llm.model_name();
     let prompt_ctx = prompt::PromptContext {
         soul_content: &ctx.soul_content,
         identity: &ctx.identity,
@@ -4548,6 +4568,8 @@ async fn run_team_agent_inner_impl(
         home_dir: Some(params.home_dir),
         callback_context: None,
         stopped_topics: &ctx.stopped_topics,
+        runtime_provider: team_runtime_provider,
+        runtime_model: team_runtime_model,
     };
     let is_compact_provider = llm.provider_name() == ProviderKind::MikaModel.config_prefix();
     let mut system = if is_compact_provider {

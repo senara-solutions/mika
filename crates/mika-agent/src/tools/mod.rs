@@ -16,6 +16,7 @@ mod create_team;
 mod delegate_task;
 mod delete_skill;
 mod delete_team;
+mod get_active_llm;
 mod get_config;
 mod get_session_messages;
 mod get_task;
@@ -754,6 +755,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "update_skill",
     "skill_manage",
     "get_config",
+    "get_active_llm",
     "set_config",
     "write_agent_file",
     "read_agent_file",
@@ -822,6 +824,10 @@ pub fn default_tools() -> ToolRegistry {
     registry.register(Box::new(update_skill::UpdateSkillTool));
     registry.register(Box::new(skill_manage::SkillManageTool));
     registry.register(Box::new(get_config::GetConfigTool));
+    // Runtime LLM identity introspection (mika#1815) — on-demand ground truth
+    // for "which model / LLM are you?" so the agent can VERIFY instead of
+    // INFER. Companion to the `## Runtime` prompt section.
+    registry.register(Box::new(get_active_llm::GetActiveLlmTool));
     registry.register(Box::new(set_config::SetConfigTool));
     registry.register(Box::new(write_agent_file::WriteAgentFileTool));
     registry.register(Box::new(read_agent_file::ReadAgentFileTool));

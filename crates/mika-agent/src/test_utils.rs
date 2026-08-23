@@ -109,6 +109,42 @@ pub mod test_helpers {
             test_ctx_with_onboarding(&self.db, &self.counter, is_onboarding)
         }
 
+        /// Create a ToolContext with explicit provider/model overrides
+        /// (mika#1815). Uses `'static` string literals so the returned
+        /// context is 'static-safe for provider/model fields.
+        pub fn ctx_with_llm(&self, provider: &'static str, model: &'static str) -> ToolContext<'_> {
+            static SKILLS_DIRTY: AtomicBool = AtomicBool::new(false);
+            static PR_REVIEW_POSTED: AtomicBool = AtomicBool::new(false);
+            static TOOL_ARG_SUFFIX_REJECTED: AtomicBool = AtomicBool::new(false);
+            ToolContext {
+                db: &self.db,
+                session_id: "test-session",
+                trace_id: "00000000000000000000000000000000",
+                home_dir: std::path::Path::new("/tmp/mika-test"),
+                global_home_dir: None,
+                core_memory_edit_count: &self.counter,
+                is_onboarding: false,
+                message_sender: None,
+                embedding_client: None,
+                brave_api_key: None,
+                github_token: None,
+                skills_dirty: &SKILLS_DIRTY,
+                is_reflection: false,
+                is_task_context: false,
+                is_callback_turn: false,
+                provider_name: provider,
+                model_name: model,
+                active_skill_paths: &[],
+                max_tasks_per_session: 25,
+                pr_review_posted: &PR_REVIEW_POSTED,
+                pr_reviews_posted: None,
+                callback_task_id: None,
+                required_tool_arg_suffixes: &[],
+                tool_arg_suffix_rejected: &TOOL_ARG_SUFFIX_REJECTED,
+                scope_task_id: None,
+            }
+        }
+
         /// Create a ToolContext in reflection mode.
         pub fn ctx_with_reflection(&self) -> ToolContext<'_> {
             static SKILLS_DIRTY: AtomicBool = AtomicBool::new(false);
