@@ -160,3 +160,91 @@ user-invoked ones.
   `crates/mika-agent/src/bin/mika-spirit.rs::main`.
 - Verification pattern: `tr '\0' '\n' < /proc/<pid>/environ | grep <VAR>`
   is Linux-only. On macOS use `ps eww <pid>`.
+
+---
+
+## Sibling pattern 1 — Dual-channel observability for pre-init boot events
+
+**Class:** Silent event drop across the boot-time subscriber-install
+boundary.
+
+**Failure family:** Any binary that emits `tracing::info!/error!` events
+BEFORE `logging::init()` installs a subscriber will have those events
+silently dropped. This most commonly happens when logging config depends
+on settings that themselves depend on env vars loaded from the filesystem
+— the ordering `load_dotenv → Settings::load → logging::init` is correct
+for correctness reasons (settings needs env, log-format needs settings)
+but wrong for observability if load-side events use `tracing!`.
+
+**Rule:** boot-time state that fires before the subscriber must go to a
+subscriber-independent sink. In Rust that's `eprintln!` (or `println!`);
+stderr is captured by OpenRC / systemd / Docker log drivers
+unconditionally. Structured `tracing!` events remain valuable for
+post-init paths (aggregation, JSON logs), so the shape that survives
+review is **dual-channel emission**: emit both, with the same event names
+and field names, so a single operator grep hits either sink.
+
+**mika's implementation:** `mika_common::dotenv::load_dotenv` emits the
+same three states (`dotenv_loaded` / `dotenv_absent` / `dotenv_load_error`)
+via both `eprintln!` (durable pre-subscriber) and `info!/error!`
+(structured post-subscriber). Same event names + field names on both
+channels. `mika-spirit::main` also emits `mika_spirit_home_resolved`
+and `mika_spirit_env_check` via `eprintln!` for the same reason (they
+fire before the subscriber exists, and no post-init duplicate is
+warranted for those single-emission boot lines).
+
+**When to use:** every long-running service binary that has state to
+observe before `logging::init()`. If your service currently uses only
+`tracing!` in `main()` before subscriber install, its pre-init events
+are silently lost.
+
+**When not to use:** short-lived CLIs that install a subscriber
+per-invocation don't need the `eprintln!` channel — the subscriber is
+up before any interesting state fires. Adding `eprintln!` there would
+just be noise on stderr.
+
+---
+
+## Sibling pattern 2 — Verifier fidelity: fail-loud on parse errors
+
+**Class:** Silent-pass by inversion — a boot-time verifier whose job is
+to catch a bad state falls back to a "default" success value on parse
+failure, effectively hiding the exact class of failure it exists to
+detect.
+
+**Founding incident:** mika#1968 verify_gh_auth initially did
+`serde_json::from_str(...).and_then(...).unwrap_or(0)` on the GitHub
+`/rate_limit` response. Empty body / malformed JSON / schema drift all
+returned `Ok(0)` — which then logged as `manager_gh_auth_check_ok
+rate_limit_remaining=0`. On a healthy authenticated account,
+`remaining=0` is impossible (5000/hr baseline). An operator seeing
+`check_ok` would assume auth is live when it may be silently degraded —
+the exact silent-pass class the verifier was written to prevent.
+
+**Rule:** for a boot-time verifier, treat any deviation from the
+expected shape as failure, not as a defaulted success. `unwrap_or(sentinel)`
+in a verifier IS the class the verifier exists to catch. The verifier
+should return `Err(discriminator)` with a distinct classification (e.g.,
+`parse_failure:` prefix on the error snippet) so operators can grep for
+the schema-drift class without confusing it with genuine 401/403/network
+errors.
+
+**Analog in test discipline:** the same shape appears in tests as
+"assertion elided into the expected path" — a test that swallows a
+`.unwrap_err()` into the success arm hides the very regression it was
+written to catch. Never fall-back to success in a verifier or a
+regression test.
+
+**When to use:** every boot-time sanity check, every pre-flight gate,
+every "can this false-pass?" surface (CI/CD gates, merge-blockers,
+build/deploy verification steps, health probes). If the mechanism's job
+is to catch a class of bad state, its parse-error path must be fail-loud.
+
+**When not to use:** best-effort optional data fetch where partial data
+is genuinely useful (e.g., an analytics counter that's OK to be
+approximate). But that's not a verifier — that's a data collection path.
+The distinction matters.
+
+**Cross-reference:** this pattern generalizes the pre-existing memory
+`feedback_prompt_enforcement_fragile` from the code-review discipline
+domain to the boot-time gate discipline.
