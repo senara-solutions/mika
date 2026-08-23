@@ -3,8 +3,43 @@ use anyhow::{Context, Result};
 #[tokio::main]
 async fn main() -> Result<()> {
     let home_dir = mika_common::home::resolve_home_dir()?;
+
+    // mika#1968 AC1/AC2 — pre-logging::init boot line surfacing the resolved
+    // home dir and the env vars that drove the resolution. Uses eprintln!
+    // (not tracing) because the JSON subscriber isn't installed yet — stderr
+    // is captured by OpenRC/systemd into the service log where an operator
+    // can grep for `mika_spirit_home_resolved` without needing to run
+    // subprocess-inspection diagnostics against a live `mika-arch` process.
+    // See docs/solutions/best-practices/app-owned-env-vs-init-owned-env-2026-08-23.md.
+    let mika_home_env = std::env::var("MIKA_HOME").unwrap_or_else(|_| "<unset>".to_string());
+    let home_env = std::env::var("HOME").unwrap_or_else(|_| "<unset>".to_string());
+    eprintln!(
+        "mika_spirit_home_resolved home={} mika_home_env={} home_env={}",
+        home_dir.display(),
+        mika_home_env,
+        home_env
+    );
+
     mika_common::dotenv::load_dotenv(&home_dir);
     mika_common::dotenv::check_env_warnings(&home_dir);
+
+    // mika#1968 AC2 — post-load-dotenv boot line summarizing what landed on
+    // disk vs what the process env now sees for the load-bearing vars. Same
+    // eprintln! reasoning as home_resolved above.
+    //
+    // **A9 P3 fix** — `env_file_present` disambiguates "wrong home dir → no
+    // file" from "right home dir but empty file". Both would produce
+    // `env_file_keys=0` alone; the boolean lets an operator resolving a
+    // silent-load blackout distinguish sub-cause #2 (wrong home) from a
+    // configuration mistake (empty file).
+    let env_file_key_count = mika_common::dotenv::parse_dotenv(&home_dir).len();
+    let env_file_present = home_dir.join(".env").exists();
+    let manager_target_set = std::env::var("MIKA_MANAGER_TARGET_MILESTONE").is_ok();
+    let github_token_set = std::env::var("MIKA_GITHUB_TOKEN").is_ok();
+    eprintln!(
+        "mika_spirit_env_check env_file_present={} env_file_keys={} manager_target_set={} github_token_set={}",
+        env_file_present, env_file_key_count, manager_target_set, github_token_set
+    );
 
     if !mika_common::home::is_initialized(&home_dir) {
         mika_common::home::bootstrap_fresh_install(&home_dir)?;
