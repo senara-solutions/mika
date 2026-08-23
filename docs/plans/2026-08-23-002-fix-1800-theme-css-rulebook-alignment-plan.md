@@ -151,7 +151,17 @@ Ratifies ticket AC2 ("Résoudre l'internal error-color contradiction du rulebook
 
 The ticket's spirit ("2-primaries bug disparaît") is achieved by defining the canonical tokens + aliasing legacy names. Aggressive rewrites of hand-rolled color usages (e.g. `bg-[#7c6af7]/20` hard-codes across dashboard components) are **out of scope** — LC.2+ tickets in milestone #1799 address those component-by-component. This ticket is foundation-only.
 
-## Acceptance Criteria (verbatim from ticket, mapped to changes)
+## Acceptance criteria
+
+Checkbox summary (per `mika.md` § Pipeline step 2 — AC section must carry at least one `- [ ]` item):
+
+- [ ] AC1 — `packages/ui/src/theme.css` matches rulebook §2 (primary, bg, surface hierarchy 7 niveaux, semantic names).
+- [ ] AC2 — Implementation side adopts §2's `#ff6e84`; rulebook §2-vs-§5.5 contradiction surfaced to Vincent as operator-input follow-up (rulebook edit is Vincent-owned per `CLAUDE.md § docs/design`). **Partial** — implementation half closes on merge; doc-side closes when Vincent lands the direct-commit.
+- [ ] AC3 — PR body carries Dashboard before/after evidence (2-primaries bug resolved, visual coherence). Since the PR runs headlessly with no browser access, we substitute a computed-hex evidence table (before/after `--color-primary`, `--color-accent`, `--color-bg`, `--color-error` values) plus a `grep` witness that `TimeRangeFilter.tsx`'s `,#ada3ff` fallbacks now resolve against a defined token — flagged in PR body as substitute per operator sign-off.
+- [ ] AC4 — Existing tests green: `cd packages/ui && npm test`; `cd dashboard && npm run test`. No component breaks (backward-compat aliases guarantee resolvability).
+- [ ] AC5 — New tokens auto-consumable via Tailwind CSS v4 `@theme` block (no `tailwind.config.js` in tree — verified). If a shared config surfaces later, mirror there in that PR.
+
+Detailed mapping (verbatim from ticket, prose expansion of each checkbox):
 
 1. **AC1: `packages/ui/src/theme.css` matches rulebook §2 (primary, bg, surface hierarchy 7 niveaux, semantic names).**
    - Satisfied by § 1. Full 7-level surface hierarchy + semantic tokens (on_surface, outline, primary_dim, etc.) added. Verified by comparing `theme.css`'s new @theme block against `luminescent-core.md:50-70` — every canonical token from §2's Full Token Reference table present.
