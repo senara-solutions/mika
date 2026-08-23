@@ -60,6 +60,8 @@ fn make_ctx<'a>(soul_content: &'a str, identity: &'a Identity) -> PromptContext<
         telegram_configured: false,
         home_dir: None,
         callback_context: None,
+        runtime_provider: "test-provider",
+        runtime_model: "test-model",
         stopped_topics: &[],
     }
 }
