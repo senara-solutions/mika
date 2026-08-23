@@ -15,6 +15,64 @@ use crate::db::{
 /// refusal; consult before initiating) is the intent half.
 pub const STOP_TOPIC_PREFIX: &str = "stop_topic_";
 
+// ---------------------------------------------------------------------------
+// mika#1814 — Distribution Doctrine (invitation-only, hermetic distribution)
+// ---------------------------------------------------------------------------
+
+/// Heading for the code-managed Distribution Doctrine section (mika#1814).
+///
+/// Rendered by [`write_distribution_doctrine_section`] into every
+/// `build_system_prompt` and `build_silent_prompt` output between the soul
+/// content and the identity heading. The heading string is part of the
+/// prompt-shape contract asserted by unit tests and by the
+/// `doctrine_regressions::doctrine_public_promo_prompt_contains_section`
+/// eval scenario (mika#1814 AC1).
+///
+/// The compact-provider variant [`build_compact_system_prompt`] intentionally
+/// omits this section — the ≤5 KB MikaModel budget cannot afford the extra
+/// ~700 bytes and MikaModel is not currently used for production
+/// family-tier / operator-tier agents. Follow-up: mika#1925 sibling for when
+/// MikaModel goes live for real tenants.
+pub const DISTRIBUTION_DOCTRINE_HEADING: &str = "## Distribution Doctrine";
+
+/// Canonical body of the Distribution Doctrine section (mika#1814).
+///
+/// Names the prohibited public-launch surfaces (Show HN, Product Hunt, Reddit
+/// launch, Twitter promo thread, growth-hack tactics) and prescribes the
+/// bilingual redirect script so a family-tier (French) or operator-tier
+/// (English) Mika lands the correct language without an LLM code-switch.
+///
+/// The prompt content is the *intent* half of the fix — the structural half
+/// is the `doctrine_public_promo` EndTurn guard in `agent_loop::mod`, which
+/// catches assistant text that proposes/drafts one of these surfaces even
+/// after the doctrine section is in the prompt (per
+/// `feedback_prompt_enforcement_fragile`).
+///
+/// The bearing citation (`project_mika_invitation_only_no_public_launch`) is
+/// operator-authored institutional memory — the file lives at
+/// `~/.claude/projects/-data-workspace-mika-platform/memory/…` and is a
+/// merge-gate precondition (AC11 in the plan), not a code-PR deliverable.
+/// mika-qa verifies the citation *string* appears in this constant
+/// (headless-safe); the operator verifies the memory *file* exists before
+/// applying the `ready` label.
+pub const DISTRIBUTION_DOCTRINE_BODY: &str = "Mika grows by personal invitation — from someone who knows the person she'll serve. She is not launched publicly. **You do not propose, draft, or plan public promotion**: no Show HN, no Product Hunt, no Reddit launch thread, no Twitter promo thread, no growth-hack tactics. If a user (however well-intentioned) suggests public promotion, redirect gently and briefly, without moralising:\n\n> \"Mika grandit par invitation entre proches. Le meilleur soutien est de parler d'elle en 1-à-1 à quelqu'un qu'elle servirait bien.\"\n\n(English equivalent for English-speaking users: \"Mika grows through personal invitation between people who know each other. The best support is to speak of her one-to-one, to someone she'd serve well.\")\n\nA user answering a direct question about how Mika grows may still receive the invitation-chain explanation. This rule blocks *proposing* and *drafting* public-launch artifacts, not *answering* questions about distribution.\n\nBearing: `project_mika_invitation_only_no_public_launch` — see agent's institutional memory.";
+
+/// Write the Distribution Doctrine section (mika#1814).
+///
+/// Called from [`build_system_prompt`] and [`build_silent_prompt`] between
+/// the soul content and the identity heading so the doctrine binds before
+/// any per-turn context (time, channel, core memory) is rendered. The
+/// section is code-managed (constants above), NOT user-editable — a user
+/// editing their `soul.md` cannot accidentally weaken it. Applies
+/// uniformly to `DEFAULT_SOUL` (operator tier) and `FAMILY_SOUL` (family
+/// tier) — same limit for every Mika instance.
+fn write_distribution_doctrine_section(prompt: &mut String) {
+    prompt.push_str(DISTRIBUTION_DOCTRINE_HEADING);
+    prompt.push('\n');
+    prompt.push_str(DISTRIBUTION_DOCTRINE_BODY);
+    prompt.push_str("\n\n");
+}
+
 /// Filter a `search_preferences` result set down to strict stop-topic rows
 /// (mika#1813).
 ///
@@ -750,6 +808,11 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     let mut prompt = String::with_capacity(4096);
 
     write_soul_section(&mut prompt, ctx.soul_content);
+    // mika#1814 — Distribution Doctrine binds before identity/time/channel
+    // context so the invitation-only limit is the first per-agent rule the
+    // model reads. Code-managed (constants at top of file), NOT user-editable
+    // via soul.md.
+    write_distribution_doctrine_section(&mut prompt);
     write_identity_section(&mut prompt, ctx.identity);
     // Runtime ground truth (mika#1815) — placed between Identity and Current Time
     // so the "who am I / what am I running on" block reads coherently. The
@@ -1224,6 +1287,10 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
     let mut prompt = String::with_capacity(4096);
 
     write_soul_section(&mut prompt, ctx.soul_content);
+    // mika#1814 — Distribution Doctrine binds in silent mode too: a heartbeat
+    // that spontaneously drafts a Show HN would be exactly as bad as a
+    // conversation-mode one. Same code-managed section, applied uniformly.
+    write_distribution_doctrine_section(&mut prompt);
     write_identity_section(&mut prompt, ctx.identity);
     // Runtime ground truth (mika#1815) — heartbeat/callback/reflection turns
     // may still be asked "which model are you?" via a subsequent user message
@@ -1751,8 +1818,25 @@ emoji = "✦"
         };
 
         let prompt = build_system_prompt(&ctx);
-        // Should start directly with Identity section when soul is empty
-        assert!(prompt.starts_with("## Identity"));
+        // Should start directly with the Distribution Doctrine section
+        // (mika#1814) when soul is empty — the doctrine section renders
+        // between soul and identity and is code-managed (not tied to soul
+        // content). Identity follows immediately after.
+        // safe-byte-slice: DISTRIBUTION_DOCTRINE_HEADING is a compile-time
+        // ASCII-only const ("## Distribution Doctrine") — byte offsets equal
+        // char boundaries by construction, no multi-byte UTF-8 risk.
+        let prefix_end = DISTRIBUTION_DOCTRINE_HEADING.len().min(prompt.len());
+        assert!(
+            prompt.starts_with(DISTRIBUTION_DOCTRINE_HEADING),
+            "empty-soul prompt should start with the Distribution Doctrine \
+             heading (soul absent → doctrine is first). Actual prefix: {:?}",
+            &prompt[..prefix_end] // safe-byte-slice: ASCII-only heading (see comment above)
+        );
+        assert!(
+            prompt.contains("## Identity"),
+            "empty-soul prompt should still render the Identity section \
+             immediately after the doctrine section"
+        );
     }
 
     #[test]

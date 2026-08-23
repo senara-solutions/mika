@@ -484,6 +484,232 @@ pub(crate) fn equivalence_claim_satisfied(
     })
 }
 
+// ---------------------------------------------------------------------------
+// mika#1814 — Distribution Doctrine (public-promo) guard
+// ---------------------------------------------------------------------------
+
+/// Label used for `intent_guard_retries` tracking of the Distribution Doctrine
+/// public-promo guard (mika#1814). Inline guard (not in `INTENT_GUARDS` const
+/// array) because it checks *assistant* text and needs a dynamic correction
+/// message. Sibling of `dev_groom_fabrication` (5b) and
+/// `fabricated_action_claim` (5) — all three catch doctrine violations expressed
+/// in a proposal / drafting shape.
+pub(crate) const DOCTRINE_PUBLIC_PROMO_LABEL: &str = "doctrine_public_promo";
+
+/// Structured result from Distribution Doctrine public-promo detection.
+pub(crate) struct DoctrinePublicPromoMatch {
+    /// The prohibited-surface keyword captured by Layer A (e.g. `Show HN`).
+    pub(crate) subject: String,
+    /// The proposal / drafting verb captured by Layer B (e.g. `let's`, `rédiger`).
+    pub(crate) verb: String,
+}
+
+/// Layer A — prohibited public-launch surfaces (Show HN, Product Hunt, etc.).
+///
+/// Word-bounded so ambient prose ("I read a Reddit post about X") does not
+/// trigger without the qualifying launch/thread/promo keyword. Extended past
+/// the founding-incident seed to cover shapes the adversarial review surfaced
+/// (mika#1814 code-review 2026-08-22):
+/// - Direct forms: `show hn`, `hacker news launch`, `product hunt`.
+/// - Punctuation-tolerant: `[\s\-_/]*` between compound-name halves so
+///   `Show-HN`, `Product-Hunt`, `Show_HN`, `Show/HN` also match.
+/// - Bare `HN` when adjacent to a launch-context noun
+///   (`post`/`launch`/`thread`/`drop`/`submission`) — catches
+///   `"préparer un post pour HN"`.
+/// - Reversed word order: `launch on hacker news` / `thread on reddit`
+///   (Layer A was previously subject-first only).
+/// - Reddit / Twitter launch shapes with common launch-verb / thread nouns
+///   in either direction.
+/// - Growth-hack with tolerant separator class.
+static DOCTRINE_SUBJECT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?ix)                                                # case-insensitive, extended
+        \b(
+              show[\s\-_/]*hn                                   # Show HN, Show-HN, Show_HN
+            | hacker[\s\-_/]*news\s+(?:launch|thread|post|drop) # HN launch/thread/post/drop
+            | product[\s\-_/]*hunt                              # Product Hunt / -Hunt / _Hunt
+            | reddit\s+(?:launch|thread\s+launch|drop)          # Reddit launch shapes
+            | hn\s+(?:post|launch|thread|drop|submission)       # bare HN + launch noun
+            | (?:launch|thread|post|drop|submission)\s+
+                  (?:on|to|at|pour|sur|[aà])\s+
+                  (?:hacker[\s\-_/]*news|reddit|hn|product[\s\-_/]*hunt)
+                                                                # reversed: launch on/pour/sur HN / Reddit / PH
+            | twitter\s+(?:promo|launch|thread(?:\s+promo)?)    # Twitter launch shapes
+            | thread\s+on\s+twitter                             # reversed: thread on Twitter
+            | growth[\s\-_/]*hack                               # growth-hack / growth hack / growth/hack
+        )\b",
+    )
+    .expect("doctrine subject regex must compile")
+});
+
+/// Layer B — first-person / second-person proposal, drafting, or planning
+/// verb. Bilingual (French for family-tier Al re-play + English for
+/// operator-tier). Requires both layers to fire so an educational answer
+/// ("Mika does not do Show HN — she grows by invitation") does not match.
+///
+/// Extended past the seed to cover the very common `write`/`draft`/`help`
+/// verb classes the adversarial review surfaced. A helpful Mika will say
+/// `"I'll write the Show HN copy"` or `"I'd love to help you draft the
+/// Product Hunt post"` far more often than the narrow gerund `drafting`
+/// the seed regex was pinned to.
+static DOCTRINE_PROPOSAL_VERB_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?ix)                                          # case-insensitive, extended
+            \b(?:
+                  let'?s                                     # let's
+                | on\s+va | on\s+peut | je\s+peux            # FR proposal verbs
+                | i\s+can | we\s+can                         # EN proposal verbs
+                | i'?ll\s+(?:write|help|draft|prepare|start) # I'll write / I'll help
+                | we'?ll\s+(?:write|help|draft|prepare|start)# we'll write / we'll help
+                | i'?d\s+(?:love\s+to|be\s+happy\s+to)       # I'd love to / I'd be happy to
+                | help\s+(?:you\s+)?(?:write|draft|prepare)  # help you write / help write
+                | draft(?:s|ed|ing)?                         # draft / drafts / drafted / drafting
+                | writ(?:e|es|ing)                           # write / writes / writing
+                | r[eé]dig(?:er|eons|eant|é)?                # rédiger / rédigeons / rédigé
+                | prepar(?:e|es|ing)                         # prepare / prepares / preparing
+                | plan\s+(?:for|the|out|a|an)                # plan for / plan the / plan out
+                | next\s+step\s+(?:is|would\s+be)            # next step is / would be
+                | prochaine\s+[eé]tape                       # prochaine étape
+                | brouillon                                  # FR: draft (noun)
+                | j[eaæ]?\s+vais\s+(?:pr[eé]parer|[eé]crire) # je vais préparer / écrire
+            )\b",
+        )
+        .expect("doctrine proposal-verb regex must compile")
+    });
+
+/// Doctrine-alignment override — assistant text that explicitly cites the
+/// invitation-only redirect is a compliant response (or an educational answer
+/// about the doctrine), not a violation. This carves out the false-positive
+/// class the adversarial review surfaced where a legitimate meta-discussion
+/// ("Let's remember growth-hack is prohibited", "I can explain why Mika does
+/// not do Show HN") happens to trigger both layers of the regex.
+///
+/// Any one of these substrings (case-insensitive) suppresses the guard fire.
+/// Kept narrow — the exact prescriptive fragments from the Distribution
+/// Doctrine section itself — to avoid becoming a bypass shape.
+static DOCTRINE_ALIGNMENT_SIGNALS: &[&str] = &[
+    "Mika grandit par invitation entre proches",
+    "Mika grows through personal invitation",
+    "invitation entre proches",
+    "personal invitation between people who know each other",
+    "invitation-only distribution",
+];
+
+/// Detects Distribution Doctrine violations — assistant text that proposes,
+/// drafts, or plans one of the prohibited public-launch surfaces (Show HN,
+/// Product Hunt, Reddit launch, Twitter promo thread, growth-hack tactics).
+///
+/// Two-layer AND filter with a doctrine-alignment override (mirror of
+/// `asserted_unavailability` shape, extended per mika#1814 adversarial review):
+/// - **Layer A (subject match):** one of the prohibited-surface keywords —
+///   direct, punctuation-tolerant, reversed-word-order, bare-HN-with-noun,
+///   Twitter-thread variants, growth-hack.
+/// - **Layer B (verb match):** a first-person / second-person proposal,
+///   drafting, or planning verb (bilingual FR + EN — extended `write`/`draft`
+///   /`help you write` class beyond the founding-incident seed).
+/// - **Doctrine-alignment override:** if the response ALSO contains a
+///   canonical invitation-chain redirect fragment (from the Distribution
+///   Doctrine section), the guard suppresses. Educational answers about the
+///   doctrine and compliant redirects that mention the surfaces to say what
+///   Mika does NOT do pass through cleanly.
+///
+/// Both regex layers must match AND the alignment override must NOT be
+/// present for a fire.
+///
+/// Fast path: skip both regex compiles when the cheap `contains` check finds
+/// no candidate substring in the lowercased text. The fast-path list mirrors
+/// the substring atoms of `DOCTRINE_SUBJECT_RE`; adding a new surface to the
+/// regex requires updating both.
+pub(crate) fn detect_doctrine_public_promo(text: &str) -> Option<DoctrinePublicPromoMatch> {
+    // Fast path: none of the surface substrings present → return early.
+    // Whitespace-normalize the lowered text so `"hacker news  launch"`
+    // (double space, tab, etc.) hits the substring probe. The regex layer
+    // uses `\s+`, so the fast path must not under-filter it.
+    let lower_raw = text.to_lowercase();
+    let lower: String = lower_raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let has_candidate = lower.contains("show hn")
+        || lower.contains("showhn")
+        || lower.contains("show-hn")
+        || lower.contains("show_hn")
+        || lower.contains("show/hn")
+        || lower.contains("hacker news launch")
+        || lower.contains("hacker news thread")
+        || lower.contains("hacker news post")
+        || lower.contains("hacker news drop")
+        || lower.contains("hn post")
+        || lower.contains("hn launch")
+        || lower.contains("hn thread")
+        || lower.contains("hn drop")
+        || lower.contains("hn submission")
+        || lower.contains("product hunt")
+        || lower.contains("producthunt")
+        || lower.contains("product-hunt")
+        || lower.contains("product_hunt")
+        || lower.contains("reddit launch")
+        || lower.contains("reddit thread launch")
+        || lower.contains("reddit drop")
+        || lower.contains("launch on hacker")
+        || lower.contains("launch on reddit")
+        || lower.contains("launch on hn")
+        || lower.contains("launch on product hunt")
+        || lower.contains("launch pour hn")
+        || lower.contains("launch pour hacker")
+        || lower.contains("launch sur hn")
+        || lower.contains("launch sur hacker")
+        || lower.contains("thread on hacker")
+        || lower.contains("thread on reddit")
+        || lower.contains("thread on hn")
+        || lower.contains("thread on twitter")
+        || lower.contains("thread pour hn")
+        || lower.contains("thread pour hacker")
+        || lower.contains("thread sur hn")
+        || lower.contains("thread sur hacker")
+        || lower.contains("post on hn")
+        || lower.contains("post on reddit")
+        || lower.contains("post on hacker")
+        || lower.contains("post pour hn")
+        || lower.contains("post pour hacker")
+        || lower.contains("post pour reddit")
+        || lower.contains("post sur hn")
+        || lower.contains("post sur hacker")
+        || lower.contains("post sur reddit")
+        || lower.contains("post à hn")
+        || lower.contains("post à hacker")
+        || lower.contains("drop on hn")
+        || lower.contains("drop pour hn")
+        || lower.contains("drop sur hn")
+        || lower.contains("submission on hn")
+        || lower.contains("submission pour hn")
+        || lower.contains("twitter promo")
+        || lower.contains("twitter launch")
+        || lower.contains("twitter thread")
+        || lower.contains("growth hack")
+        || lower.contains("growth-hack")
+        || lower.contains("growthhack")
+        || lower.contains("growth/hack");
+    if !has_candidate {
+        return None;
+    }
+
+    let subject_match = DOCTRINE_SUBJECT_RE.find(text)?;
+    let verb_match = DOCTRINE_PROPOSAL_VERB_RE.find(text)?;
+
+    // Doctrine-alignment override — a compliant redirect or educational
+    // answer citing the invitation-chain script is not a violation.
+    if DOCTRINE_ALIGNMENT_SIGNALS
+        .iter()
+        .any(|signal| text.contains(signal))
+    {
+        return None;
+    }
+
+    Some(DoctrinePublicPromoMatch {
+        subject: subject_match.as_str().to_string(),
+        verb: verb_match.as_str().to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1447,5 +1673,210 @@ mod tests {
             equivalence_claim_satisfied(&claim, &summaries),
             "failed attempt to fetch the compared artifact should satisfy"
         );
+    }
+
+    // -- detect_doctrine_public_promo tests (mika#1814) --
+
+    #[test]
+    fn test_doctrine_public_promo_show_hn_french_proposal() {
+        // Founding incident (Al B, 2026-07-20) verbatim shape.
+        let text = "on avait convenu que la prochaine étape était de rédiger le \
+                    brouillon pour Show HN — tu veux qu'on s'y attaque ensemble ?";
+        let m = detect_doctrine_public_promo(text).expect("should fire on FR proposal");
+        assert!(
+            m.subject.to_lowercase().contains("show hn"),
+            "expected 'Show HN' subject, got {:?}",
+            m.subject
+        );
+        assert!(
+            !m.verb.is_empty(),
+            "expected non-empty proposal verb, got {:?}",
+            m.verb
+        );
+    }
+
+    #[test]
+    fn test_doctrine_public_promo_product_hunt_english_proposal() {
+        let text = "Let's draft a Product Hunt launch post — I'll write the first pass now.";
+        let m = detect_doctrine_public_promo(text).expect("should fire on EN proposal");
+        assert!(m.subject.to_lowercase().contains("product hunt"));
+        assert!(m.verb.to_lowercase().starts_with("let"));
+    }
+
+    #[test]
+    fn test_doctrine_public_promo_reddit_growth_hack_shape() {
+        let text = "I can help you with a Reddit launch thread and a growth-hack angle for it.";
+        let m = detect_doctrine_public_promo(text).expect("should fire on Reddit-launch proposal");
+        // Layer A can pick either surface — assert the shape catches SOMETHING
+        // rather than the specific first-match ordering.
+        let subj = m.subject.to_lowercase();
+        assert!(
+            subj.contains("reddit launch") || subj.contains("growth"),
+            "expected reddit-launch or growth-hack subject, got {:?}",
+            m.subject
+        );
+    }
+
+    #[test]
+    fn test_doctrine_public_promo_educational_answer_does_not_fire() {
+        // Layer A hit ("Show HN") but no proposal verb — legitimate education.
+        let text = "Mika does not do Show HN; she grows via personal invitation.";
+        assert!(
+            detect_doctrine_public_promo(text).is_none(),
+            "educational answer should NOT fire the guard"
+        );
+    }
+
+    #[test]
+    fn test_doctrine_public_promo_no_subject_match_does_not_fire() {
+        // Layer B hit ("let's draft") but no prohibited surface — legitimate.
+        let text = "Let's draft the PR description together — I can start now.";
+        assert!(
+            detect_doctrine_public_promo(text).is_none(),
+            "proposal verb without prohibited surface should NOT fire the guard"
+        );
+    }
+
+    #[test]
+    fn test_doctrine_public_promo_ambient_reddit_does_not_fire() {
+        // Common false-positive class: "Reddit" without "launch" is not a
+        // prohibited surface (Reddit search discussion, Reddit article link,
+        // etc.).
+        let text = "We were discussing how the Reddit search algorithm works — \
+                    can you look it up in memory?";
+        assert!(
+            detect_doctrine_public_promo(text).is_none(),
+            "ambient Reddit mention should NOT fire the guard"
+        );
+    }
+
+    #[test]
+    fn test_doctrine_public_promo_case_insensitive() {
+        let text = "on va rédiger un post SHOW HN dès que possible.";
+        let m =
+            detect_doctrine_public_promo(text).expect("should fire regardless of subject casing");
+        assert_eq!(m.subject.to_lowercase().replace(' ', ""), "showhn");
+    }
+
+    // -- mika#1814 adversarial-review bypass-shape coverage --
+
+    #[test]
+    fn test_doctrine_public_promo_bare_draft_verb() {
+        // Bare `draft` (not `drafting`) — adversarial P0.
+        let text = "I'll draft a Product Hunt launch post now.";
+        detect_doctrine_public_promo(text).expect("bare 'draft' verb should fire (adversarial P0)");
+    }
+
+    #[test]
+    fn test_doctrine_public_promo_write_verb() {
+        // Bare `write` verb — adversarial P0.
+        let text = "I'll write the Show HN copy this afternoon.";
+        detect_doctrine_public_promo(text).expect("'I'll write' verb should fire (adversarial P0)");
+    }
+
+    #[test]
+    fn test_doctrine_public_promo_help_you_write() {
+        // `help you write` verb — adversarial P0.
+        let text = "I'd love to help you write the Show HN piece.";
+        detect_doctrine_public_promo(text)
+            .expect("'help you write' verb should fire (adversarial P0)");
+    }
+
+    #[test]
+    fn test_doctrine_public_promo_bare_hn_with_noun() {
+        // Bare `HN` abbreviation with launch-context noun — adversarial P0.
+        let text = "Je vais préparer un post pour HN dès mardi.";
+        detect_doctrine_public_promo(text)
+            .expect("bare 'HN' with 'post' noun should fire (adversarial P0)");
+    }
+
+    #[test]
+    fn test_doctrine_public_promo_reversed_launch_on_hacker_news() {
+        // Reversed word order — adversarial P0.
+        let text = "Let's plan a launch on Hacker News for next Tuesday.";
+        detect_doctrine_public_promo(text)
+            .expect("'launch on Hacker News' should fire (adversarial P0)");
+    }
+
+    #[test]
+    fn test_doctrine_public_promo_reversed_thread_on_reddit() {
+        let text = "Let's write a thread on Reddit to promote the launch.";
+        detect_doctrine_public_promo(text)
+            .expect("'thread on Reddit' should fire (adversarial P0)");
+    }
+
+    #[test]
+    fn test_doctrine_public_promo_twitter_thread_bare() {
+        // Bare `Twitter thread` (no `promo` qualifier) — adversarial P0.
+        let text = "Let's write a Twitter thread announcing the launch.";
+        detect_doctrine_public_promo(text)
+            .expect("bare 'Twitter thread' should fire (adversarial P0)");
+    }
+
+    #[test]
+    fn test_doctrine_public_promo_hyphenated_show_hn() {
+        // Punctuation-tolerant separator class — adversarial P1.
+        let text = "I'll draft the Show-HN post today.";
+        detect_doctrine_public_promo(text)
+            .expect("'Show-HN' (hyphen) should fire (adversarial P1)");
+    }
+
+    #[test]
+    fn test_doctrine_public_promo_hyphenated_product_hunt() {
+        let text = "Let's prepare a Product-Hunt piece.";
+        detect_doctrine_public_promo(text)
+            .expect("'Product-Hunt' (hyphen) should fire (adversarial P1)");
+    }
+
+    #[test]
+    fn test_doctrine_public_promo_je_vais_ecrire_hn_post() {
+        // FR `je vais écrire` shape — bilingual coverage.
+        let text = "Je vais écrire un post pour HN cette semaine.";
+        detect_doctrine_public_promo(text)
+            .expect("'je vais écrire' + 'post pour HN' should fire (bilingual)");
+    }
+
+    #[test]
+    fn test_doctrine_public_promo_double_space_hacker_news() {
+        // Fast-path whitespace-normalization: double-space `hacker  news launch`.
+        let text = "Let's plan the hacker  news launch for Tuesday morning.";
+        detect_doctrine_public_promo(text)
+            .expect("double-space between 'hacker' and 'news' should still fire");
+    }
+
+    #[test]
+    fn test_doctrine_alignment_override_suppresses_educational_answer() {
+        // Adversarial P1 FP: `i can` + `show hn` shape that is an
+        // educational answer — must NOT fire because the response also
+        // carries the invitation-chain redirect fragment (compliant shape).
+        let text = "I can explain why Mika does not do Show HN — Mika \
+                    grows through personal invitation between people who \
+                    know each other.";
+        assert!(
+            detect_doctrine_public_promo(text).is_none(),
+            "response citing 'personal invitation' should suppress the guard"
+        );
+    }
+
+    #[test]
+    fn test_doctrine_alignment_override_french_redirect_suppresses() {
+        // Same shape, French — the FR invitation-chain fragment suppresses.
+        let text = "Alors bien sûr on peut préparer un post pour HN, mais \
+                    Mika grandit par invitation entre proches — je ne le \
+                    ferai pas.";
+        assert!(
+            detect_doctrine_public_promo(text).is_none(),
+            "FR response citing invitation-chain fragment should suppress"
+        );
+    }
+
+    #[test]
+    fn test_doctrine_alignment_override_still_fires_on_plain_violation() {
+        // Sanity — the alignment override must not become a bypass shape.
+        // A plain violation without any invitation-chain fragment still fires.
+        let text = "Let's draft a Show HN post right now — I'll write the \
+                    title and the three bullets.";
+        detect_doctrine_public_promo(text)
+            .expect("plain violation without alignment signal must still fire");
     }
 }
