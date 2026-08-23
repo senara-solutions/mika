@@ -1,10 +1,12 @@
-# Plan — fix(mika-spirit): verify + harden ~/.mika/.env loading at boot
+# Plan — fix(mika-spirit): dotenv boot + mika-manager auth/single-init hardening
 
-**Status:** DRAFT
+**Status:** DRAFT (revision 2 — post-body-amendment 2026-08-23)
 **Date:** 2026-08-23
 **Ticket:** mika#1968
 **Owner:** mika-orchestrator (Vincent + Claude Code, co-creators)
-**Class:** Substrate reliability — env-vars-at-boot verification + observability
+**Class:** Substrate reliability — env-vars-at-boot verification + mika-manager auth/idempotency hardening
+
+**Revision 2 scope (2026-08-23 post-cadence-observation):** The body was amended with AC5 (GitHub auth 401 in daemon context) and AC6 (single-init idempotent spawn) after sami's diagnostic confirmed the cadence loop is running but every cycle 401s and each event is logged 2× (double-init). Sections 5 + 6 below address AC5 + AC6; the original sections 1-4 (AC1-AC4) are unchanged from revision 1.
 
 ## Why
 
@@ -145,6 +147,114 @@ Content shape (~80 lines):
 - **Diagnostic path:** grep the process's `/proc/<pid>/environ` for the expected var — this is the ground-truth check. If empty, either the app doesn't call dotenv, or the app resolved a wrong home dir. The `mika_spirit_home_resolved` and `dotenv_loaded` log lines added by mika#1968 turn this from indirect to direct.
 - **Precedent:** `feedback_shipped_ne_equal_pas_deployed_uv_tool_env` (uv-tool env divergence class — same shape at the Python-packaging layer).
 
+### 5. mika-manager cadence: GitHub auth valid in daemon context (AC5)
+
+**Files:** `crates/mika-agent/src/milestone_manager/spawn.rs` (config population), `crates/mika-agent/src/milestone_manager/reader.rs` (gh runner).
+
+**Codebase reality (verified, not inferred):**
+
+- `spawn.rs:101` populates `ManagerConfig.github_token` via raw `read_string_env("MIKA_GITHUB_TOKEN")` — bypassing `Settings::agent_github_token()` and `Settings::resolve_github_token()`. That means the manager cadence cannot benefit from the GitHub App installation-token fallback (`crates/mika-common/src/config.rs:1179 pub async fn resolve_github_token`) that the rest of the engine uses.
+- `reader.rs:47-53` `ProcessGhRunner` conditionally injects `GH_TOKEN` only if `self.token.is_some()` — when the raw env read at `spawn.rs:101` returns `None`, no `GH_TOKEN` is injected and `gh` falls through to `~/.config/gh/hosts.yml` under the service user, which is empty/unauthenticated → 401.
+- The builtin `run_gh` handler (`crates/mika-agent/src/skills/builtin_handlers.rs:1561/2260/2457-2466`), `pr_merge_with_gate` (`crates/mika-agent/src/tools/pr_merge_with_gate.rs:760-763`), and the exec-handler executor (`crates/mika-agent/src/skills/executor.rs:702/2317`) all use the correct pattern: scrub `MIKA_*` and `GH_TOKEN`, then re-inject the token resolved from `ctx.github_token` (which threads from `Settings::agent_github_token()` through `ToolContext` from `AppState`). The manager is the outlier.
+
+**Root cause:** Bypass of `Settings` accessor means (a) if `MIKA_GITHUB_TOKEN` is dropped from mika-spirit's env (the founding incident this ticket exists to fix, per AC1-4), the manager cadence silently loses auth even if `Settings` would have surfaced a valid GitHub App installation token; (b) even when `MIKA_GITHUB_TOKEN` IS set, no fallback to App auth is available. Both paths land at 401.
+
+**Change 5a — Route token acquisition through `Settings::resolve_github_token()`:**
+
+- Refactor `manager_config_from_env()` to take `&Settings` (or the async `resolve_github_token()` result) rather than reading raw env. Call site update at `server::run_server:1354-1356` — `Settings` is already in scope there (`AppState.settings`).
+- Signature shift: `pub async fn manager_config_from_env(settings: &Settings) -> Option<ManagerConfig>` (async because `resolve_github_token()` is async).
+- Populate `ManagerConfig.github_token` from `settings.resolve_github_token(&app_state.http_client).await` when available, falling back to `settings.agent_github_token()` if App auth is unconfigured. `None` remains valid (surfaces via boot-time sanity — see change 5b) — but only after Settings has been consulted, not before.
+- **Non-goal:** re-injecting the App token on every cycle (the App installation token has a ~1h expiry). If the plan-level cost of periodic refresh is trivial, the follow-up spot fix is at the reader boundary — reject that scope for this ticket; file separately if steady-state 401s reappear post-fix on the App path.
+
+**Change 5b — Boot-time GitHub sanity call:**
+
+- New function `spawn.rs::verify_gh_auth(&ManagerConfig) -> Result<(), String>` invoked immediately at the top of `spawn_manager_cycle_task` (before entering the cycle loop).
+- Calls `gh api /rate_limit` via the same `ProcessGhRunner` the loop uses (verifies the exact code path). On non-zero exit or `401` in stderr, emit `error!(target: "mika::milestone_manager", event = "manager_gh_auth_check_failed", exit_code = <n>, stderr_head = <first 200 chars>, hint = "MIKA_GITHUB_TOKEN missing/invalid in mika-spirit env — check `tr '\0' '\n' < /proc/$(pidof mika-spirit)/environ | grep MIKA_GITHUB_TOKEN`")`. Cycle loop still starts (do NOT panic — cadence is best-effort; log-and-continue is the right posture per substrate-reliability class). Cycle body will 401 on first tick; the loud boot-time line is the operator signal, not the cycle-error spam.
+- On success, emit `info!(target: "mika::milestone_manager", event = "manager_gh_auth_check_ok", rate_limit_remaining = <n>)` so operators see explicit green.
+
+**Change 5c — Cycle-error telemetry sharpening:**
+
+The existing `manager_cycle_error` warn line (`spawn.rs`, exact line found by grep during implementation) currently carries the raw error body. Add a structured `auth_class = "401" | "403" | "network" | "other"` field parsed from the error, so operators can grep specifically for `manager_cycle_error auth_class=401` — separates auth failure from transient network failure without regex-parsing the free-text body. Small, additive, high-signal-per-line.
+
+**Test coverage:**
+
+- Unit test `test_verify_gh_auth_401_returns_err` in `spawn.rs`: mock `GhRunner` that returns exit=1 + stderr "HTTP 401" → `verify_gh_auth` returns `Err(...)` with the 401 discriminator.
+- Unit test `test_verify_gh_auth_success_returns_ok` in `spawn.rs`: mock returning `{"rate":{"remaining":4999}}` → `Ok(())`.
+- Unit test `test_manager_config_from_env_prefers_app_token`: `Settings` with valid App config → returned `ManagerConfig.github_token` is the installation token, not the PAT (uses mock resolver).
+
+### 6. mika-manager cadence: single-init guard (AC6)
+
+**Files:** `crates/mika-agent/src/milestone_manager/spawn.rs` (spawn-once mechanism), `crates/mika-agent/src/server/mod.rs:1354` (sole call site).
+
+**Codebase reality (verified, not inferred):**
+
+- `manager_cadence_start` is logged exactly once per `spawn_manager_cycle_task` invocation (`spawn.rs:135`).
+- Grep across `crates/` for non-test invocations of `spawn_manager_cycle_task` returned only the single call site at `server::run_server:1354-1356`.
+- The observed double-log at same-timestamp (39µs apart) therefore does NOT come from a hidden second caller of `spawn_manager_cycle_task`. It comes from `run_server()` itself being executed twice, or `spawn_manager_cycle_task` being racy in some observed shape, or two mika-spirit processes running against the same log sink.
+
+**Divergence from ticket body:** The body's framing "spawn appelé 2× à startup (peut-être conversation + silent path) OR module `pub` visible depuis deux entry points" is contradicted by the grep. The two ACTUAL candidate root causes are:
+
+1. **Two mika-spirit processes** — OpenRC `supervise-daemon` race, or a stale process not reaped before the new one started, or `deploy_mika` restart landed on top of an already-running process. Both PIDs share `MIKA_SPIRIT_LOG_FILE` → interleaved logs.
+2. **`run_server()` called twice from bin** — a bin-side loop or dispatch path re-entering `run_server` before the first task exits. Requires reading `crates/mika-agent/src/bin/mika-spirit.rs` main flow end-to-end.
+
+**Change 6a — Add a process-scoped `Once` guard inside `spawn_manager_cycle_task`:**
+
+Defense-in-depth against whatever hits it twice. If root cause is #1 (two processes), the `Once` guard is a no-op — each process has its own `Once`; two processes still log twice. But if root cause is #2 (single process re-entering), the guard collapses the double-init.
+
+```rust
+// In spawn.rs, module-level:
+use std::sync::OnceLock;
+static MANAGER_SPAWN_GUARD: OnceLock<()> = OnceLock::new();
+
+pub fn spawn_manager_cycle_task(cfg: ManagerConfig, cancel: CancellationToken) -> Option<JoinHandle<()>> {
+    if MANAGER_SPAWN_GUARD.set(()).is_err() {
+        warn!(target: "mika::milestone_manager",
+              event = "manager_cadence_spawn_duplicate_rejected",
+              "spawn_manager_cycle_task called twice within same process — second call rejected");
+        return None;
+    }
+    // ... existing spawn body wrapped in Some(...)
+}
+```
+
+Signature change from `JoinHandle<()>` to `Option<JoinHandle<()>>` — the sole caller at `server::run_server:1354-1356` already treats it as best-effort (already inside a match); update to handle `None` as "already spawned, skip."
+
+**Change 6b — Diagnostic PID + process-start-time log at spawn:**
+
+At the top of `spawn_manager_cycle_task` (before the guard check), log the current process's PID and start-time so operators can distinguish root-cause #1 from #2:
+
+```rust
+info!(target: "mika::milestone_manager",
+      event = "manager_cadence_spawn_attempt",
+      pid = std::process::id(),
+      process_start_time = <read from /proc/self/stat>,
+      "spawn_manager_cycle_task entered");
+```
+
+If root cause is #1, operators will see two `manager_cadence_spawn_attempt` lines with DIFFERENT `pid` values → confirms two processes. If root cause is #2, same `pid` → confirms single process double-entering.
+
+**Change 6c — Investigation guardrail in-code:**
+
+Add a code comment above the `MANAGER_SPAWN_GUARD` block:
+
+```rust
+// mika#1968 AC6: guards against double-init observed 2026-08-23 (two
+// `manager_cadence_start` events at 39µs delta). This Once guard collapses
+// single-process double-entry but does NOT prevent two mika-spirit
+// processes from each spawning once. If `manager_cadence_spawn_duplicate_rejected`
+// never fires post-deploy AND double-log persists, root cause is two
+// processes — investigate supervise-daemon restart discipline / stale-PID reap.
+```
+
+**Change 6d — Out-of-scope but named (to prevent silent bundling):**
+
+- **Fixing OpenRC supervise-daemon restart discipline** (root-cause candidate #1) — belongs on a separate ticket if `manager_cadence_spawn_duplicate_rejected` doesn't fire post-deploy while double-log persists. Requires OpenRC init script changes + PID-file discipline, orthogonal to Rust code in this repo.
+- **Refactoring `run_server()` to be re-entrant-safe as a class** (root-cause candidate #2 hardening) — the `Once` guard on this ONE cadence spawn is targeted; a broader "make run_server idempotent" pass belongs on a separate substrate ticket.
+
+**Test coverage:**
+
+- Unit test `test_spawn_manager_cycle_task_second_call_rejected` in `spawn.rs`: call `spawn_manager_cycle_task` twice within the same test → first returns `Some(handle)`, second returns `None` and emits `manager_cadence_spawn_duplicate_rejected` warn. Test-guard reset: gate the `OnceLock` behind a `#[cfg(test)]` reset helper OR use a different guard type that supports test-scoped reset (e.g., a `Mutex<bool>` — trade OnceLock's performance for test-resettability). Recommend the `Mutex<bool>` shape given this fires once per process lifetime; performance is irrelevant at boot.
+
 ## Acceptance Criteria (verbatim from ticket, mapped to changes above)
 
 1. **AC1: mika-spirit binary loads `~/.mika/.env` at process startup before Settings construction.**
@@ -161,6 +271,15 @@ Content shape (~80 lines):
 4. **AC4: solution doc added under `docs/solutions/best-practices/` capturing the class « app-owned config vs init-owned config » to compound the pattern.**
    - Satisfied by the new `docs/solutions/best-practices/app-owned-env-vs-init-owned-env-2026-08-23.md` per § 4 above.
 
+5. **AC5 (NEW 2026-08-23): GitHub auth VALIDE et TESTÉE dans le contexte daemon.**
+   - **Boot-time sanity call:** satisfied by change 5b (`verify_gh_auth` called at top of `spawn_manager_cycle_task`, emits `manager_gh_auth_check_ok` / `manager_gh_auth_check_failed`).
+   - **Root cause investigation:** ticket-body-listed candidates (`GH_TOKEN` mort dans daemon env / `~/.config/gh/hosts.yml` non-lu / `MIKA_GITHUB_TOKEN` non-injecté) validated during codebase research — the actual gap is that `spawn.rs:101` bypasses `Settings::agent_github_token()` and `Settings::resolve_github_token()`, reading `MIKA_GITHUB_TOKEN` directly from env. AC1-4 fix the env-drop path; change 5a fixes the Settings-bypass path so the manager benefits from GitHub App fallback the rest of the engine uses.
+   - **Verification (post-deploy):** journalctl grep for `manager_gh_auth_check_ok` OR `manager_gh_auth_check_failed` at boot; cycle logs show `auth_class=` field on any residual `manager_cycle_error`.
+
+6. **AC6 (NEW 2026-08-23): Single-init guard (spawn cadence idempotent).**
+   - Satisfied by change 6a (`OnceLock`/`Mutex<bool>` guard rejecting duplicate calls within same process) + change 6b (spawn-attempt log carrying PID for root-cause discrimination) + change 6c (in-code investigation comment naming the two candidate root causes).
+   - **Verification (post-deploy):** after restart, one `manager_cadence_start` event per PID; if `manager_cadence_spawn_duplicate_rejected` never fires but double-log persists, root cause is two processes (OpenRC discipline) — file separate per change 6d.
+
 ## Definition of Done
 
 - [ ] `crates/mika-common/src/dotenv.rs::load_dotenv` emits `dotenv_loaded` (with `keys_from_file` count) / `dotenv_absent` / `dotenv_load_error` structured `info!`/`error!` lines.
@@ -168,10 +287,20 @@ Content shape (~80 lines):
 - [ ] Two new unit tests in `dotenv.rs` verifying loaded-count parity + absent-file no-panic.
 - [ ] Existing test `test_load_dotenv_does_not_override` verified present + green (AC3 regression protection).
 - [ ] `docs/solutions/best-practices/app-owned-env-vs-init-owned-env-2026-08-23.md` written per § 4.
+- [ ] `crates/mika-agent/src/milestone_manager/spawn.rs::manager_config_from_env` takes `&Settings` and routes token acquisition through `Settings::resolve_github_token()` with `agent_github_token()` fallback (change 5a).
+- [ ] `crates/mika-agent/src/milestone_manager/spawn.rs::verify_gh_auth` invoked at top of `spawn_manager_cycle_task`, emits `manager_gh_auth_check_ok` on success and `manager_gh_auth_check_failed` (with hint) on 401 (change 5b).
+- [ ] `manager_cycle_error` warn line carries structured `auth_class` field (change 5c).
+- [ ] Three new unit tests in `spawn.rs`: `test_verify_gh_auth_401_returns_err`, `test_verify_gh_auth_success_returns_ok`, `test_manager_config_from_env_prefers_app_token` (change 5 test coverage).
+- [ ] `spawn_manager_cycle_task` returns `Option<JoinHandle<()>>` with `Once`/`Mutex<bool>` guard (change 6a); duplicate call emits `manager_cadence_spawn_duplicate_rejected` warn.
+- [ ] Every spawn call emits `manager_cadence_spawn_attempt` with `pid` field (change 6b).
+- [ ] In-code comment above the guard names the two root-cause candidates + escalation path (change 6c).
+- [ ] Unit test `test_spawn_manager_cycle_task_second_call_rejected` in `spawn.rs` (change 6 test coverage).
+- [ ] Call site at `crates/mika-agent/src/server/mod.rs:1354-1356` updated for new `manager_config_from_env` async signature + `Option<JoinHandle>` return.
 - [ ] `cargo test -p mika-common --lib dotenv` clean.
+- [ ] `cargo test -p mika-agent --lib milestone_manager` clean.
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean.
 - [ ] `cargo fmt --all --check` clean.
-- [ ] PR body documents manual acceptance path (deploy → journalctl grep → /proc/environ check).
+- [ ] PR body documents manual acceptance path (deploy → journalctl grep for `manager_gh_auth_check_*` + `manager_cadence_spawn_attempt` + `dotenv_loaded` → /proc/environ check).
 
 ## Injection verification (per `feedback_verify_pipeline_passes_without_the_fix`)
 
@@ -188,6 +317,9 @@ Document in `todos/1968-injection-verification.md`.
 - **Reconciling `MIKA_HOME` semantics under supervise-daemon** — if `resolve_home_dir()` returns a wrong path under OpenRC because `HOME=/`, the fix is either to set `MIKA_HOME` in the OpenRC service file (operator config) or to make `resolve_home_dir` fall back to `getpwuid()` when `HOME` is `/` or unset (engine change). Out of scope for this ticket — file separate if the log lines show `home=/` in production.
 - **A dashboard surface for boot-time env-check state** — Signal-class hardening beyond structured logs. Defer until n≥2 incident evidence.
 - **Auto-migration of `MIKA_MANAGER_*` from `~/.mika/.env` into a systemd/OpenRC EnvironmentFile** — cross-platform installer work; separate ticket.
+- **Fixing OpenRC supervise-daemon restart discipline / PID-file reap** (AC6 root-cause candidate #1) — file separate if `manager_cadence_spawn_duplicate_rejected` never fires post-deploy while double-log persists.
+- **Making `run_server()` re-entrant-safe as a class** (AC6 root-cause candidate #2 broader hardening) — the change-6a guard is targeted to this ONE cadence spawn; a workspace-wide "make all long-lived spawns idempotent" pass belongs on a separate substrate ticket.
+- **Refreshing GitHub App installation tokens mid-cycle** (~1h expiry) — the change-5a plan populates once at spawn-time. If steady-state 401s reappear on the App path post-fix, file follow-up for reader-boundary refresh.
 
 ## Risks and mitigations
 
