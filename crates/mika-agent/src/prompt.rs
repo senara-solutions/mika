@@ -1945,6 +1945,8 @@ emoji = "✦"
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
         let prompt = build_system_prompt(&ctx);
 
@@ -1988,6 +1990,8 @@ emoji = "✦"
             task_health: None,
             stored_preferences: &[],
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
         let prompt = build_silent_prompt(&ctx);
 
@@ -2018,6 +2022,8 @@ emoji = "✦"
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
         let prompt = build_compact_system_prompt(&ctx);
 
@@ -2064,6 +2070,8 @@ emoji = "✦"
             home_dir: None,
             callback_context: None,
             stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
         };
         let prompt = build_system_prompt(&ctx);
 
