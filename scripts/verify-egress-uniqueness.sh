@@ -84,6 +84,12 @@ AUTHORIZED_PATHS=(
     "scripts/verify-egress-request-shape.sh"
     "scripts/verify-egress-no-log.sh"
     "scripts/audit-egress-no-log.sh"
+    # Test fixtures (mika#1970) — grounding_regressions eval scenarios use
+    # "service-public.fr" as prose payload text in a mock LLM response; the
+    # tests never egress. Post-#1978 merge these files landed on main; the
+    # lint substring-match flags them until authorized.
+    "crates/mika-agent/tests/eval/grounding_regressions/mixed_verification_qualification.rs"
+    "crates/mika-agent/tests/eval/grounding_assertions/mod.rs"
 )
 
 # Legacy allowlist — code paths that ship this identifier pre-E1 and are
