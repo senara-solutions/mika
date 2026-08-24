@@ -337,22 +337,32 @@ async fn fetch_url(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutp
     let gateway_url = match ctx.gateway_url {
         Some(g) if !g.trim().is_empty() => g.trim().trim_end_matches('/').to_string(),
         _ => {
-            return ToolOutput::error(
+            // Substrate config missing — route by tier (mika#1783 doctrine).
+            // Family tier: sealed being sees only the neutral fallback; the
+            //   operator-shaped detail (`MIKA_ROUTING_URL`) goes to audit
+            //   events and never enters the LLM context. Default (operator)
+            //   tier: diagnostic folds back into tool-result content.
+            let mut out = ToolOutput::substrate_unavailable(
+                "La récupération de contenu web n'est pas disponible pour le moment.",
                 "fetch_url is not configured for this agent (missing gateway URL). \
-                 Set MIKA_ROUTING_URL for the agent."
-                    .to_string(),
+                 Set MIKA_ROUTING_URL for the agent.",
             );
+            crate::tools::dispatch_substrate_diagnostic(&mut out, "fetch_url", ctx).await;
+            return out;
         }
     };
 
     let internal_token = match ctx.internal_token {
         Some(t) if !t.trim().is_empty() => t.to_string(),
         _ => {
-            return ToolOutput::error(
+            // mika#1783 doctrine — same tier-routing for internal_token missing.
+            let mut out = ToolOutput::substrate_unavailable(
+                "La récupération de contenu web n'est pas disponible pour le moment.",
                 "fetch_url is not configured for this agent (missing internal token). \
-                 Set MIKA_INTERNAL_TOKEN for the agent."
-                    .to_string(),
+                 Set MIKA_INTERNAL_TOKEN for the agent.",
             );
+            crate::tools::dispatch_substrate_diagnostic(&mut out, "fetch_url", ctx).await;
+            return out;
         }
     };
 
@@ -3879,6 +3889,7 @@ mod tests {
             callback_task_id: None,
             required_tool_arg_suffixes: &[],
             tool_arg_suffix_rejected: &TOOL_ARG_SUFFIX_REJECTED,
+            tier: mika_common::home::AgentTier::Default,
             scope_task_id: None,
         }
     }
@@ -3920,6 +3931,7 @@ mod tests {
             callback_task_id: None,
             required_tool_arg_suffixes: &[],
             tool_arg_suffix_rejected: &TOOL_ARG_SUFFIX_REJECTED,
+            tier: mika_common::home::AgentTier::Default,
             scope_task_id: None,
         }
     }
