@@ -1827,6 +1827,7 @@ mod tests {
             callback_task_id,
             required_tool_arg_suffixes: &[],
             tool_arg_suffix_rejected,
+            tier: mika_common::home::AgentTier::Default,
             scope_task_id: None,
         }
     }

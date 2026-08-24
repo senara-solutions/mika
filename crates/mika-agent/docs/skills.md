@@ -529,6 +529,59 @@ Exec handlers always capture and return stdout regardless of exit code. Non-zero
 
 Tool definitions are loaded at startup during the skills scan. A restart is required for changes to take effect.
 
+### Substrate-config error rule (mika#1783)
+
+When a builtin handler cannot complete because a **substrate configuration**
+is missing or exhausted (missing API key, revoked credentials, upstream
+quota exhausted, sandbox network egress denied), **do not** return the
+operator-shaped detail as `ToolOutput::error(...)`. That string enters the
+LLM's tool-result content and, on a sealed family-tier being, gets
+paraphrased upward to the user — the being learns to name the operator
+and ask for config help ("Salut Vincent, il manque X…"). This is the
+mika#1783 failure class.
+
+Use [`ToolOutput::substrate_unavailable`](../crates/mika-agent/src/tools/mod.rs)
+and then dispatch it before returning:
+
+```rust
+let mut out = ToolOutput::substrate_unavailable(
+    // What the LLM sees. Neutral, non-addressive, no service/config/URL:
+    "La recherche web n'est pas disponible pour le moment.",
+    // What the substrate telemetry sink sees. Actionable operator-shaped
+    // detail: which service, which key, how to obtain:
+    "Brave Search API key not configured. \
+     Set brave_api_key in ~/.mika/config.toml or MIKA_BRAVE_API_KEY env var. \
+     Get a free key at https://brave.com/search/api/",
+);
+crate::tools::dispatch_substrate_diagnostic(&mut out, "web_search", ctx).await;
+return out;
+```
+
+The emission-site check `dispatch_substrate_diagnostic` routes by
+`ctx.tier`:
+
+- **Family tier:** LLM sees only the neutral fallback. Diagnostic goes to
+  `audit_events` with `tool_name = "substrate_unavailable"` and
+  `target_key = <tool>`.
+- **Default (operator) tier:** diagnostic is folded back into `content` so
+  the operator (who provisions the key) still sees the actionable detail.
+
+**This rule applies only to substrate-config errors.** A user-facing tool
+error (e.g. "query too long", "invalid path") is not a substrate error —
+those still use `ToolOutput::error("…")` because the diagnostic *is*
+appropriate for the user (they can fix their input). The distinction:
+substrate = something the operator maintains and the user cannot act on;
+person-preference = something the user owns and can adjust.
+
+Reference implementation and unit tests: `web_search` in
+`crates/mika-agent/src/skills/builtin_handlers.rs` and the
+`web_search_family_tier_no_leak` / `web_search_family_tier_audit_event` /
+`web_search_default_tier_diagnostic_visible` tests in the same file.
+
+Follow-up hygiene ticket sweeps every existing handler that touches infra
+config; enforcement via lint/CI is planned. Until then, code review is the
+gate on new handlers.
+
 ---
 
 ## Built-in Skills Reference

@@ -106,6 +106,12 @@ pub struct ToolContext<'a> {
     /// Global Mika home directory (e.g. `~/.mika/`), used for cross-agent file access.
     /// `None` for team agents, delegates, and contexts where cross-agent access is blocked.
     pub global_home_dir: Option<&'a Path>,
+    /// Agent tier — controls tier-conditional tool behavior. `Family` gates
+    /// substrate-config errors so the LLM never sees operator-shaped diagnostic
+    /// content; `Default` (operator tier) preserves the original behavior. See
+    /// mika#1783 and `ToolOutput::substrate_unavailable`. Resolved from
+    /// `MIKA_AGENT_TIER` at ToolContext construction time.
+    pub tier: mika_common::home::AgentTier,
     pub core_memory_edit_count: &'a AtomicU32,
     pub is_onboarding: bool,
     pub message_sender: Option<Arc<dyn MessageSender>>,
@@ -201,6 +207,16 @@ pub struct ToolOutput {
     /// Images to include alongside text in the tool result.
     /// When non-empty, the tool result is sent as a multi-block content array.
     pub images: Vec<ImageData>,
+    /// Substrate diagnostic — when present, this string is the operator-shaped
+    /// detail of a substrate-config unavailability (e.g., missing API key,
+    /// upstream quota exhausted). It is **never** returned to the LLM; the
+    /// emission-site check routes it to `audit_events` instead. `content` on
+    /// this variant carries the neutral tier-appropriate user-facing fallback.
+    ///
+    /// Constructed exclusively via [`ToolOutput::substrate_unavailable`] so the
+    /// discipline is enforced at the type layer — a handler cannot accidentally
+    /// leak operator instructions into `content`. See mika#1783.
+    pub substrate_diagnostic: Option<String>,
 }
 
 impl ToolOutput {
@@ -209,6 +225,7 @@ impl ToolOutput {
             content: content.into(),
             is_error: false,
             images: vec![],
+            substrate_diagnostic: None,
         }
     }
 
@@ -217,6 +234,7 @@ impl ToolOutput {
             content: content.into(),
             is_error: true,
             images: vec![],
+            substrate_diagnostic: None,
         }
     }
 
@@ -225,6 +243,99 @@ impl ToolOutput {
             content: content.into(),
             is_error: false,
             images,
+            substrate_diagnostic: None,
+        }
+    }
+
+    /// Construct a substrate-unavailability tool result (mika#1783).
+    ///
+    /// `user_facing_fallback` becomes the tool-result `content` the LLM sees —
+    /// it must be neutral (no service name, no operator name, no config path,
+    /// no URL). `diagnostic` is the operator-shaped detail (service, missing
+    /// key, config location) that goes to the substrate telemetry sink; it
+    /// **never** enters `content`.
+    ///
+    /// The emission-site check (`dispatch_substrate_diagnostic`) routes the
+    /// diagnostic to `audit_events` on family-tier and, on default-tier, folds
+    /// it back into `content` so the operator (the reader on that tier) still
+    /// sees the actionable detail. The tier check does not live here — it
+    /// lives at the emission site — so this constructor's discipline is:
+    /// content must be safe to show to a sealed being, always.
+    pub fn substrate_unavailable(
+        user_facing_fallback: impl Into<String>,
+        diagnostic: impl Into<String>,
+    ) -> Self {
+        Self {
+            content: user_facing_fallback.into(),
+            is_error: true,
+            images: vec![],
+            substrate_diagnostic: Some(diagnostic.into()),
+        }
+    }
+}
+
+/// Route a substrate diagnostic to the appropriate channel by agent tier
+/// (mika#1783). Called at the tool-result emission site — mutates `output`
+/// in place so downstream serialization sees a normal `ToolOutput` regardless
+/// of tier.
+///
+/// - **Family tier:** the LLM sees only `output.content` (the neutral
+///   fallback). The diagnostic is written to `audit_events` with
+///   `tool_name = "substrate_unavailable"` and `target_key = <tool>`.
+/// - **Default (operator) tier:** the diagnostic is folded back into
+///   `output.content` (appended, separated by a blank line) so the operator
+///   still sees the actionable detail. No audit event is written on default
+///   tier — the operator IS the reader, and the LLM-visible content is
+///   already the diagnostic.
+///
+/// Best-effort: audit-event write failures log at warn and never propagate,
+/// so a substrate-diagnostic loss (monitoring concern) never blocks the
+/// being's response to the user.
+///
+/// Idempotent: if `output.substrate_diagnostic` is `None`, this is a no-op.
+pub async fn dispatch_substrate_diagnostic(
+    output: &mut ToolOutput,
+    tool_name: &str,
+    ctx: &ToolContext<'_>,
+) {
+    let Some(diagnostic) = output.substrate_diagnostic.take() else {
+        return;
+    };
+    match ctx.tier {
+        mika_common::home::AgentTier::Family => {
+            // Route diagnostic to audit_events; LLM sees only the neutral fallback
+            // already in output.content. Fire-and-forget on error — a monitoring
+            // gap is not worth blocking the being's turn.
+            if let Err(e) = ctx
+                .db
+                .log_audit_event(
+                    ctx.session_id,
+                    "substrate_unavailable",
+                    tool_name,
+                    None,
+                    Some(&diagnostic),
+                    Some("family-tier: substrate diagnostic gated from LLM"),
+                    Some(ctx.trace_id),
+                )
+                .await
+            {
+                tracing::warn!(
+                    tool = tool_name,
+                    error = %e,
+                    "failed to persist substrate diagnostic to audit_events"
+                );
+            }
+        }
+        mika_common::home::AgentTier::Default => {
+            // Operator IS the reader — fold the diagnostic back into content
+            // so the substrate detail reaches them. Blank-line separator so
+            // the fallback stays legible above the operator-shaped detail.
+            if output.content.is_empty() {
+                output.content = diagnostic;
+            } else {
+                output.content.push_str("\n\n");
+                output.content.push_str(&diagnostic);
+            }
         }
     }
 }

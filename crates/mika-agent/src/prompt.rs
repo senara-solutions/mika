@@ -653,13 +653,23 @@ pub struct PromptContext<'a> {
 
 fn onboarding_prompt() -> String {
     let section_names = core_memory_section_names();
+    // Example name is deliberately generic (mika#1783 — flagged by adversarial
+    // reviewer). The prior example named the platform operator ("Vincent"),
+    // which taught every sealed being — including family-tier — the operator's
+    // identity as an example person record. On the family-tier doctrine that
+    // "the being does not have a maker it knows about," a persona-scrubbed
+    // being would still learn the operator's name from this instruction and
+    // reconstruct the same addressee-shaped leak. `Alex` (or any equally
+    // generic placeholder) preserves the shape of the example without
+    // seeding the referent. Enforced by `onboarding_prompt_no_operator_name`
+    // unit test below.
     format!(
         "## First Session\n\
          This is your first conversation with the user. Introduce yourself briefly and warmly. \
          Ask who they are and what they're working on. Use update_core_memory to seed all \
          {} blocks ({}) from their \
          responses. Also use store_fact(category=\"person\") to create a record for the user \
-         with just their first name (e.g. name=\"Vincent\") and relationship \"The user\". \
+         with just their first name (e.g. name=\"Alex\") and relationship \"The user\". \
          Keep it to 2-3 natural exchanges, then transition to being helpful \
          with whatever they need.",
         section_names.len(),
@@ -3118,6 +3128,35 @@ enabled = true
         assert!(prompt.contains("store_fact"));
         assert!(prompt.contains("person"));
         assert!(prompt.contains("The user"));
+    }
+
+    /// mika#1783 addendum — persona reconstruction via onboarding prompt.
+    ///
+    /// The onboarding prompt is loaded on every fresh install regardless of
+    /// tier. An operator-identity example name here nullifies FAMILY_SOUL
+    /// scrubbing: the sealed being's very first system prompt seeds the
+    /// operator's identity into its person-record space via example.
+    /// Adversarial review flagged this as an IN-SCOPE HIGH finding.
+    ///
+    /// This test locks in the generic-placeholder rule: the example name
+    /// must not name any known operator identity.
+    #[test]
+    fn onboarding_prompt_no_operator_name() {
+        let prompt = onboarding_prompt();
+        // Same operator-identity token set as FAMILY_SOUL's invariant test
+        // in mika-common::home. If this list grows, keep the two in sync.
+        const FORBIDDEN_TOKENS: &[&str] = &["Vincent", "vincent"];
+        for token in FORBIDDEN_TOKENS {
+            assert!(
+                !prompt.contains(token),
+                "onboarding_prompt() must not contain operator-identity \
+                 token {token:?} — the example name is loaded into every \
+                 fresh install regardless of tier and would seed the \
+                 operator's identity into a sealed family-tier being's \
+                 person-record space. See mika#1783 (adversarial review \
+                 F2). Prompt was: {prompt:?}"
+            );
+        }
     }
 
     #[test]

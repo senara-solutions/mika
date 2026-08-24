@@ -773,6 +773,7 @@ async fn run_investigation(
         callback_task_id: None,  // Investigation: not a callback turn
         required_tool_arg_suffixes: &[],
         tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
+        tier: mika_common::home::AgentTier::from_env(),
         scope_task_id: None, // Investigation: no task context for parallel narrative
     };
 

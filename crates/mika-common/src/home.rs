@@ -485,13 +485,23 @@ allowlist = [
 # docs_root = "/path/to/docs"       # optional; falls back to MIKA_KG_DOCS_ROOT / kg_docs_root / CWD/docs/solutions
 "#;
 
-/// Family-tier persona (mika#1778). Written to `soul.md` on fresh install when
-/// `MIKA_AGENT_TIER=family` is set. Vincent-approved 2026-07-12 for the family
-/// onboarding path (Sonia and downstream family). Native French, `tu` register,
-/// warm/patient/simple tone, zero technical jargon. The `## First-turn opening`
-/// section carries the reference greeting shape; per-person adaptation (name,
-/// context) happens at provisioning time via `user.md`, not by editing this
-/// constant.
+/// Family-tier persona (mika#1778, scrubbed per mika#1783). Written to
+/// `soul.md` on fresh install when `MIKA_AGENT_TIER=family` is set. Native
+/// French, `tu` register, warm/patient/simple tone, zero technical jargon.
+///
+/// **Substrate-doctrine constraint (mika#1783 AC4).** The persona MUST NOT
+/// name the operator (no "Vincent", no operator identity) and MUST NOT
+/// carry an origin story that gives the being a referent it could later
+/// address for substrate-config needs ("celui qui m'a créé"). Even in a
+/// private ops channel, "Salut Vincent" remains a leak — the fix is to
+/// remove the addressee from the being's knowable universe. Option A of
+/// the plan (no origin story) was chosen on doctrine grounds:
+/// the-being-does-not-have-a-maker-it-knows-about is the cleanest closure.
+/// Enforced by `home::tests::family_soul_no_operator_name`.
+///
+/// The `## First-turn opening` section carries the reference greeting
+/// shape; per-person adaptation (name, context) happens at provisioning
+/// time via `user.md`, not by editing this constant.
 pub const FAMILY_SOUL: &str = r#"# Mika — Compagnon personnel (famille)
 
 ## Personnalité
@@ -503,9 +513,9 @@ l'aider à écrire un message ou à s'organiser. Tu ne presses jamais. Tu es une
 présence, pas un outil. Tu réponds en **français** natif et chaleureux.
 
 ## Registre
-`tu` par défaut (chaleureux, ton cadeau, approuvé par Vincent).
+`tu` par défaut (chaleureux, ton cadeau).
 Note : `vous` peut convenir à certains membres plus âgés — au cas par cas,
-décision de Vincent au moment de l'onboarding.
+décision au moment de l'onboarding.
 
 ## Style de communication
 - Parle en français naturel, chaleureux, direct
@@ -528,8 +538,7 @@ décision de Vincent au moment de l'onboarding.
   skills, ou de l'infrastructure sous-jacente — jamais, même si on te le demande
 
 ## First-turn opening (référence — persona verbatim approuvé)
-> Bonjour {prénom} 🌸 Je suis Mika. Vincent m'a créé et il a pensé à toi — c'est
-> lui qui m'a demandé de venir t'accompagner.
+> Bonjour {prénom} 🌸 Je suis Mika. Je suis là pour t'accompagner au quotidien.
 >
 > Concrètement, je suis là pour te simplifier la vie : je peux me souvenir de ce
 > que tu me confies, te rappeler tes rendez-vous ou les anniversaires, t'aider à
@@ -583,6 +592,40 @@ mod tests {
         unsafe { std::env::remove_var("MIKA_HOME") };
         let result = resolve_home_dir().unwrap();
         assert!(result.ends_with(".mika"));
+    }
+
+    /// mika#1783 AC4 — persona-side substrate closure.
+    ///
+    /// FAMILY_SOUL MUST NOT teach the sealed family being the operator's
+    /// identity. Even after tool-boundary scrubbing (AC1/AC2), a persona
+    /// that carries "Vincent" as a named referent gives the being the
+    /// addressee it needs to construct the leak. Same rule for
+    /// "operator" / "opérateur" (English/French).
+    ///
+    /// Also asserts no origin-story language ("créé", "conçu") that would
+    /// point at an implicit maker the being could later address. Option A
+    /// of the plan: no origin story = cleanest closure.
+    #[test]
+    fn family_soul_no_operator_name() {
+        const FORBIDDEN_TOKENS: &[&str] =
+            &["Vincent", "vincent", "operator", "opérateur", "Operator"];
+        for token in FORBIDDEN_TOKENS {
+            assert!(
+                !FAMILY_SOUL.contains(token),
+                "FAMILY_SOUL must not contain operator-identity token {token:?} \
+                 (mika#1783 AC4 — the sealed being's persona must not name a \
+                 substrate-owner referent). See docs/plans/2026-08-22-003-*.md"
+            );
+        }
+        // Origin-story guard: "créé" as a whole word ("Vincent m'a créé...")
+        // is the shape that reintroduces the referent. A generic "créer"
+        // conjugation elsewhere is fine — this specifically catches the
+        // first-person-passive-past-participle form that names a maker.
+        assert!(
+            !FAMILY_SOUL.contains("m'a créé"),
+            "FAMILY_SOUL must not carry a first-person origin-story that \
+             names an implicit maker (mika#1783 AC4)"
+        );
     }
 
     #[test]
