@@ -94,6 +94,13 @@ AUTHORIZED_PATHS=(
     # lint substring-match flags them until authorized.
     "crates/mika-agent/tests/eval/grounding_regressions/mixed_verification_qualification.rs"
     "crates/mika-agent/tests/eval/grounding_assertions/mod.rs"
+    # fetch-url skill prompt (mika#1988) — enumerates the compile-time
+    # gouv.fr allowlist in prose so the LLM knows which hosts fetch_url
+    # accepts. The skill itself never egresses — it declares the builtin
+    # `fetch_url` which delegates to /internal/fetch on the gateway. The
+    # substrate-side allowlist in `crates/mika-gateway/src/egress_fetch/`
+    # remains the sole enforcement point.
+    "crates/mika-agent/templates/skills/fetch-url/system_prompt.md"
 )
 
 # Legacy allowlist — code paths that ship this identifier pre-E1 and are

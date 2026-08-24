@@ -363,6 +363,11 @@ pub const DEFAULT_AGENT_SKILL_ALLOWLIST: &[&str] = &[
     "file-reader",
     "mcp",
     "web-search",
+    // fetch-url (mika#1988, closing mika#1969 AC gap): exposes the fetch_url
+    // builtin as a callable tool to the operator agent. The handler and gateway
+    // substrate shipped in PR#1981 but no skill declared the tool, so the LLM
+    // never saw it (MSC retained T1 on this gap 2026-08-24).
+    "fetch-url",
     "self-knowledge",
     "shell-exec",
     "tmux",
@@ -398,6 +403,9 @@ allowlist = [
     "file-reader",
     "mcp",
     "web-search",
+    # fetch-url (mika#1988, closing mika#1969 AC gap): exposes the fetch_url
+    # builtin as a callable tool. Keep in sync with DEFAULT_AGENT_SKILL_ALLOWLIST.
+    "fetch-url",
     "self-knowledge",
     "shell-exec",
     "tmux",
