@@ -78,6 +78,11 @@ AUTHORIZED_PATHS_LAYER_A=(
     "crates/mika-gateway/docs/egress-search-threat-model.md"
     "crates/mika-gateway/tests/egress_search"
     "docs/plans/2026-08-18-1807-e1-egress-substrate-plan.md"
+    # mika#1971 web_search substrate-routing plan — describes what the
+    # consumer-side migration removes; must cite the pre-migration
+    # X-Subscription-Token header to document the fix. Same shape as the
+    # E1 plan above.
+    "docs/plans/2026-08-23-003-fix-1971-web-search-substrate-routing-plan.md"
     "scripts/verify-egress-request-shape.sh"
     "scripts/verify-egress-uniqueness.sh"
 )
