@@ -1,0 +1,9 @@
+[skill]
+name = "fetch-url"
+description = "Fetch a URL from the gouv.fr allowlist via the mika-gateway substrate"
+version = "0.1.0"
+always_on = true
+timeout_secs = 30
+
+[triggers]
+keywords = ["fetch", "retrieve", "read url", "récupère", "va chercher", "lis la page"]

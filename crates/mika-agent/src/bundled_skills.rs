@@ -114,6 +114,12 @@ static WEB_SEARCH_SKILL: BundledSkill = skill!("web-search", [
     ("tools.json" => "../templates/skills/web-search/tools.json"),
 ]);
 
+static FETCH_URL_SKILL: BundledSkill = skill!("fetch-url", [
+    ("skill.toml" => "../templates/skills/fetch-url/skill.toml"),
+    ("system_prompt.md" => "../templates/skills/fetch-url/system_prompt.md"),
+    ("tools.json" => "../templates/skills/fetch-url/tools.json"),
+]);
+
 static FILE_READER_SKILL: BundledSkill = skill!("file-reader", [
     ("skill.toml" => "../templates/skills/file-reader/skill.toml"),
     ("system_prompt.md" => "../templates/skills/file-reader/system_prompt.md"),
@@ -170,6 +176,7 @@ static BUNDLED_SKILLS: &[&BundledSkill] = &[
     &TMUX_SKILL,
     &SHELL_EXEC_SKILL,
     &WEB_SEARCH_SKILL,
+    &FETCH_URL_SKILL,
     &FILE_READER_SKILL,
     &SELF_KNOWLEDGE_SKILL,
     &GIT_OPS_SKILL,
