@@ -2862,6 +2862,14 @@ pub struct AgentParams<'a> {
     pub brave_api_key: Option<&'a str>,
     /// GitHub token for checking PR/issue status on tasks (optional).
     pub github_token: Option<&'a str>,
+    /// Gateway base URL for builtins that call substrate endpoints on
+    /// the gateway (mika#1969 — `fetch_url` calls
+    /// `POST /internal/fetch`). Optional; `None` in tests / CLI
+    /// contexts where no gateway is reachable.
+    pub gateway_url: Option<&'a str>,
+    /// Shared bearer token for internal substrate endpoints.
+    /// Companion to `gateway_url` (mika#1969).
+    pub internal_token: Option<&'a str>,
     /// GitHub App authentication manager (optional). When present, installation
     /// tokens are preferred over `github_token` PAT via `resolve_github_token()`.
     pub github_app: Option<&'a mika_common::github_app::GitHubApp>,
@@ -3321,6 +3329,8 @@ async fn run_agent_inner(
         embedding_client: params.embedding_client,
         brave_api_key: params.brave_api_key,
         github_token: resolved_github_token.as_deref(),
+        gateway_url: params.gateway_url,
+        internal_token: params.internal_token,
         skills_dirty: params.skills_dirty,
         is_reflection: false,
         is_task_context: false,
@@ -3770,6 +3780,12 @@ pub struct SilentAgentParams<'a> {
     pub embedding_client: Option<&'a EmbeddingClient>,
     pub brave_api_key: Option<&'a str>,
     pub github_token: Option<&'a str>,
+    /// Gateway base URL for builtins that call substrate endpoints
+    /// on the gateway (mika#1969). Optional.
+    pub gateway_url: Option<&'a str>,
+    /// Shared bearer token for internal substrate endpoints
+    /// (mika#1969). Companion to `gateway_url`.
+    pub internal_token: Option<&'a str>,
     /// GitHub App authentication manager (optional).
     pub github_app: Option<&'a mika_common::github_app::GitHubApp>,
     /// Shared dirty flag for skill hot-reload.
@@ -4227,6 +4243,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         embedding_client: params.embedding_client,
         brave_api_key: params.brave_api_key,
         github_token: resolved_github_token.as_deref(),
+        gateway_url: params.gateway_url,
+        internal_token: params.internal_token,
         skills_dirty: params.skills_dirty,
         is_reflection,
         is_task_context: true,
@@ -4516,6 +4534,12 @@ pub struct TeamAgentParams<'a> {
     pub embedding_client: Option<&'a EmbeddingClient>,
     pub brave_api_key: Option<&'a str>,
     pub github_token: Option<&'a str>,
+    /// Gateway base URL for builtins that call substrate endpoints
+    /// on the gateway (mika#1969). Optional.
+    pub gateway_url: Option<&'a str>,
+    /// Shared bearer token for internal substrate endpoints
+    /// (mika#1969). Companion to `gateway_url`.
+    pub internal_token: Option<&'a str>,
     /// GitHub App authentication manager (optional).
     pub github_app: Option<&'a mika_common::github_app::GitHubApp>,
     /// Shared dirty flag for skill hot-reload.
@@ -4793,6 +4817,8 @@ async fn run_team_agent_inner_impl(
         embedding_client: params.embedding_client,
         brave_api_key: params.brave_api_key,
         github_token: team_resolved_github_token.as_deref(),
+        gateway_url: params.gateway_url,
+        internal_token: params.internal_token,
         skills_dirty: params.skills_dirty,
         is_reflection: false,
         is_task_context: true,

@@ -110,6 +110,11 @@ pub struct TeamEngine {
     callback: Option<Arc<TeamEventCallback>>,
     brave_api_key: Option<String>,
     github_token: Option<String>,
+    /// Gateway base URL for builtins that call substrate endpoints
+    /// (mika#1969). Threaded into every team-member `TeamAgentParams`.
+    gateway_url: Option<String>,
+    /// Bearer token companion to `gateway_url` (mika#1969).
+    internal_token: Option<String>,
     github_app: Option<Arc<mika_common::github_app::GitHubApp>>,
     /// Team-level database for persisting runs and messages.
     team_db: AsyncDatabase,
@@ -288,6 +293,11 @@ impl TeamEngine {
                 .as_ref()
                 .map(|s| s.expose_secret().to_string()),
             github_token: settings.agent_github_token().map(String::from),
+            gateway_url: settings.routing_url.clone(),
+            internal_token: settings
+                .internal_token
+                .as_ref()
+                .map(|s| s.expose_secret().to_string()),
             github_app,
             team_db,
             goal_msg_id: None,
@@ -335,6 +345,11 @@ impl TeamEngine {
                 .as_ref()
                 .map(|s| s.expose_secret().to_string()),
             github_token: settings.agent_github_token().map(String::from),
+            gateway_url: settings.routing_url.clone(),
+            internal_token: settings
+                .internal_token
+                .as_ref()
+                .map(|s| s.expose_secret().to_string()),
             github_app,
             team_db,
             goal_msg_id: None,
@@ -1117,6 +1132,8 @@ impl TeamEngine {
         let team_name = self.run.team_name.clone();
         let brave_api_key = self.brave_api_key.clone();
         let github_token = self.github_token.clone();
+        let gateway_url = self.gateway_url.clone();
+        let internal_token = self.internal_token.clone();
         let github_app = self.github_app.clone();
         let team_db = self.team_db.clone();
 
@@ -1271,6 +1288,8 @@ impl TeamEngine {
             let team_name = team_name.clone();
             let brave_api_key = brave_api_key.clone();
             let github_token = github_token.clone();
+            let gateway_url = gateway_url.clone();
+            let internal_token = internal_token.clone();
             let github_app = github_app.clone();
             let team_db = team_db.clone();
             let trace_id = self.trace_id.clone();
@@ -1327,6 +1346,8 @@ impl TeamEngine {
                                 embedding_client: resources.embedding_client.as_ref(),
                                 brave_api_key: brave_api_key.as_deref(),
                                 github_token: github_token.as_deref(),
+                                gateway_url: gateway_url.as_deref(),
+                                internal_token: internal_token.as_deref(),
                                 github_app: github_app.as_deref(),
                                 skills_dirty: &skills_dirty,
                                 settings: Some(&resources.settings),
@@ -1777,6 +1798,8 @@ impl TeamEngine {
             embedding_client: resources.embedding_client.as_ref(),
             brave_api_key: self.brave_api_key.as_deref(),
             github_token: self.github_token.as_deref(),
+            gateway_url: self.gateway_url.as_deref(),
+            internal_token: self.internal_token.as_deref(),
             github_app: self.github_app.as_deref(),
             skills_dirty: &skills_dirty,
             settings: Some(&resources.settings),

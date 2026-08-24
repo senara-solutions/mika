@@ -1813,6 +1813,8 @@ mod tests {
             message_sender: None,
             embedding_client: None,
             brave_api_key: None,
+            gateway_url: None,
+            internal_token: None,
             github_token: None,
             skills_dirty,
             is_reflection: false,

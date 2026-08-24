@@ -2530,6 +2530,7 @@ mod tests {
                 crate::circuit_breaker::MAX_INFLIGHT_DELIVERIES,
             )),
             search_egress_client: None,
+            fetch_egress_client: None,
         };
 
         axum::Router::new()
@@ -2651,6 +2652,7 @@ mod tests {
                 crate::circuit_breaker::MAX_INFLIGHT_DELIVERIES,
             )),
             search_egress_client: None,
+            fetch_egress_client: None,
         };
 
         let app = axum::Router::new()
@@ -3084,6 +3086,7 @@ mod tests {
                 crate::circuit_breaker::MAX_INFLIGHT_DELIVERIES,
             )),
             search_egress_client: None,
+            fetch_egress_client: None,
         }
     }
 
@@ -3889,6 +3892,7 @@ omInFBLWVyWK89xoc49UvUcyRcbL3iWqa+zAv7eOC5TZyy1SVJtPVw==\n\
                 crate::circuit_breaker::MAX_INFLIGHT_DELIVERIES,
             )),
             search_egress_client: None,
+            fetch_egress_client: None,
         };
 
         axum::Router::new()

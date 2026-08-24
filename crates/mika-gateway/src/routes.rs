@@ -21,6 +21,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::a2a_routes;
+use crate::egress_fetch;
 use crate::egress_search;
 use crate::github;
 use crate::orchestrator_inbox;
@@ -150,6 +151,14 @@ pub struct AppState {
     /// tenant per Q3 partagé no-log (see
     /// `crates/mika-gateway/src/egress_search.rs`).
     pub(crate) search_egress_client: Option<egress_search::SharedSearchEgressClient>,
+
+    /// Egress-fetch substrate (mika#1969). `Some` when the substrate is
+    /// wired (default — no upstream selection knob per KTD2), `None`
+    /// otherwise — `POST /internal/fetch` returns 404 when absent.
+    /// Shared across every tenant per the same Q3 partagé no-log
+    /// invariant as the search substrate (see
+    /// `crates/mika-gateway/src/egress_fetch/`).
+    pub(crate) fetch_egress_client: Option<egress_fetch::SharedFetchEgressClient>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -257,6 +266,19 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/internal/search",
             post(egress_search::handle_internal_search)
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    require_bearer_token,
+                ))
+                .layer(RequestBodyLimitLayer::new(16 * 1024)),
+        )
+        // Egress-fetch substrate (mika#1969) — GET-only lecture-seule
+        // against a compile-time gouv.fr allowlist. Bearer-token auth
+        // (same as /send). Body limit at 16 KB — the request payload
+        // is a single URL, not a document.
+        .route(
+            "/internal/fetch",
+            post(egress_fetch::handle_internal_fetch)
                 .route_layer(middleware::from_fn_with_state(
                     state.clone(),
                     require_bearer_token,

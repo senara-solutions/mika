@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
 };
 use dashmap::DashMap;
+use secrecy::ExposeSecret;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing::Instrument;
@@ -1360,6 +1361,8 @@ async fn run_agent_for_message(
         user_images: &user_images,
         brave_api_key: state.brave_api_key.as_deref(),
         github_token: a.settings.agent_github_token(),
+        gateway_url: Some(state.gateway_url.as_str()),
+        internal_token: Some(state.internal_token.expose_secret()),
         github_app: a.github_app.as_deref(),
         skills_dirty: &a.skills_dirty,
         skill_nudge: Some(&a.skill_nudge),

@@ -1,16 +1,26 @@
 #!/usr/bin/env bash
-# CI lint (mika#1807 AC4 — build-time invariant, Q2 point 3): the
-# egress-search substrate at `crates/mika-gateway/src/egress_search*` is
-# the ONLY place in the platform allowed to reference a search-upstream
-# identifier. Any hit outside the authorized path fails the build.
+# CI lint (mika#1807 AC4 + mika#1969 — build-time invariant, Q2 point 3):
+# each controlled-egress substrate at `crates/mika-gateway/src/egress_*`
+# is the ONLY place in the platform allowed to reference the upstream
+# identifier tokens for that class. Any hit outside the authorized
+# path fails the build.
+#
+# Currently guards two egress classes:
+#   - egress_search (mika#1807 E1) — Brave Search API
+#   - egress_fetch  (mika#1969)    — gouv.fr GET-only allowlist
+#
+# The mirror-substrate-module pattern for adding a third class is
+# documented in:
+#   docs/solutions/best-practices/mirror-substrate-module-for-new-egress-class-2026-08-23.md
 #
 # Discipline analog: `scripts/check-byte-slices.sh` (#764) — construct
 # the incapacity, don't promise the restraint. Same shape as
 # `scripts/check-loop-select.sh` (#848).
 #
-# What we grep for: well-known search-upstream domain + path identifiers.
-# If a future E2 / E6 ticket adds another upstream (SearXNG, etc.), extend
-# the PATTERNS array below AND add the arm to `SearchUpstream`.
+# What we grep for: well-known upstream domain + path identifiers. If a
+# future ticket adds another upstream, extend the PATTERNS array below
+# AND add the module arm (or a sibling substrate module per the
+# mirror-module pattern).
 #
 # Exit codes:
 #   0 — clean
@@ -20,8 +30,14 @@
 #   `crates/mika-agent/src/skills/builtin_handlers.rs` currently owns the
 #   pre-E1 `web_search` builtin that talks to Brave directly. E2 (#1808)
 #   migrates it to `POST /internal/search` on the gateway. Until then
-#   this file is explicitly allowlisted below. Any OTHER hit is a hard
-#   failure.
+#   this file is explicitly allowlisted for the Brave identifier below.
+#
+#   The `fetch_url` builtin added in mika#1969 does NOT name the gouv.fr
+#   hosts — it delegates to `POST /internal/fetch` on the gateway. It
+#   therefore does NOT get a LEGACY_ALLOWLIST entry: absence of that
+#   entry is load-bearing, since a future reviewer might add one
+#   defensively. If you find yourself adding an allowlist for the fetch
+#   builtin, the delegation shape has regressed — fix that instead.
 
 set -euo pipefail
 
@@ -38,10 +54,15 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # their presence in docs is legitimate.
 PATTERNS=(
     "api.search.brave.com"
-    # Future upstreams — extend as `SearchUpstream` variants are added:
-    #   "searx"
-    #   "duckduckgo.com/api"
-    #   "google.com/customsearch"
+    # egress_fetch (mika#1969) — gouv.fr allowlist. Each substring must
+    # match ALLOWED_HOSTS in `crates/mika-gateway/src/egress_fetch/mod.rs`.
+    # Extension is a code change + deploy per KTD2 — do not turn into
+    # an env var.
+    "service-public.fr"
+    "ants.gouv.fr"
+    "impots.gouv.fr"
+    "data.gouv.fr"
+    # Future upstreams — extend as new egress classes are added.
 )
 
 # Files/dirs allowed to contain these identifiers. Substring match.
@@ -53,6 +74,12 @@ AUTHORIZED_PATHS=(
     "crates/mika-gateway/docs/egress-search-no-log-audit.md"
     "crates/mika-gateway/tests/egress_search"
     "docs/plans/2026-08-18-1807-e1-egress-substrate-plan.md"
+    # egress_fetch (mika#1969)
+    "crates/mika-gateway/src/egress_fetch/"
+    "crates/mika-gateway/src/egress_fetch.rs"
+    "crates/mika-gateway/tests/egress_fetch"
+    "docs/plans/1969-egress-fetch-fetch-url-builtin.md"
+    "docs/solutions/best-practices/mirror-substrate-module-for-new-egress-class-2026-08-23.md"
     "scripts/verify-egress-uniqueness.sh"
     "scripts/verify-egress-request-shape.sh"
     "scripts/verify-egress-no-log.sh"

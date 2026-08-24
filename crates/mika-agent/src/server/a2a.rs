@@ -7,6 +7,7 @@ use axum::extract::{Path, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
+use secrecy::ExposeSecret;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info};
 use uuid::Uuid;
@@ -165,6 +166,8 @@ async fn run_a2a_agent(
         user_images: &[],
         brave_api_key: state.brave_api_key.as_deref(),
         github_token: state.github_token.as_deref(),
+        gateway_url: Some(state.gateway_url.as_str()),
+        internal_token: Some(state.internal_token.expose_secret()),
         github_app: agent_state.github_app.as_deref(),
         skills_dirty: &agent_state.skills_dirty,
         skill_nudge: Some(&agent_state.skill_nudge),

@@ -60,6 +60,7 @@ rand = { workspace = true }
 chrono = { workspace = true }
 async-stream = { workspace = true }
 futures-util = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true }

@@ -44,6 +44,14 @@ pub struct TaskDispatcher {
     pub embedding_client: Option<EmbeddingClient>,
     pub brave_api_key: Option<String>,
     pub github_token: Option<String>,
+    /// Gateway base URL for builtins that call substrate endpoints on
+    /// the gateway (mika#1969 — `fetch_url` delegates to
+    /// `POST /internal/fetch`). Populated from `AppState.gateway_url`
+    /// at construction; `None` in tests.
+    pub gateway_url: Option<String>,
+    /// Shared bearer token for internal substrate endpoints
+    /// (mika#1969). Populated from `AppState.internal_token`.
+    pub internal_token: Option<String>,
     /// GitHub App authentication manager (optional).
     pub github_app: Option<Arc<mika_common::github_app::GitHubApp>>,
     pub skills_dirty: Arc<AtomicBool>,
@@ -268,6 +276,8 @@ impl TaskDispatcher {
             message_sender: self.message_sender.clone(),
             embedding_client: self.embedding_client.as_ref(),
             brave_api_key: self.brave_api_key.as_deref(),
+            gateway_url: self.gateway_url.as_deref(),
+            internal_token: self.internal_token.as_deref(),
             github_token: self.github_token.as_deref(),
             github_app: self.github_app.as_deref(),
             skills_dirty: &self.skills_dirty,
@@ -467,6 +477,8 @@ impl TaskDispatcher {
             message_sender,
             embedding_client: self.embedding_client.as_ref(),
             brave_api_key: self.brave_api_key.as_deref(),
+            gateway_url: self.gateway_url.as_deref(),
+            internal_token: self.internal_token.as_deref(),
             github_token: self.github_token.as_deref(),
             github_app: self.github_app.as_deref(),
             skills_dirty: &self.skills_dirty,
@@ -818,6 +830,8 @@ impl TaskDispatcher {
             message_sender: self.message_sender.clone(),
             embedding_client: self.embedding_client.as_ref(),
             brave_api_key: self.brave_api_key.as_deref(),
+            gateway_url: self.gateway_url.as_deref(),
+            internal_token: self.internal_token.as_deref(),
             github_token: self.github_token.as_deref(),
             github_app: self.github_app.as_deref(),
             skills_dirty: &self.skills_dirty,
@@ -1115,6 +1129,8 @@ impl TaskDispatcher {
             message_sender: self.message_sender.clone(),
             embedding_client: self.embedding_client.as_ref(),
             brave_api_key: self.brave_api_key.as_deref(),
+            gateway_url: self.gateway_url.as_deref(),
+            internal_token: self.internal_token.as_deref(),
             github_token: self.github_token.as_deref(),
             github_app: self.github_app.as_deref(),
             skills_dirty: &self.skills_dirty,
@@ -1400,6 +1416,8 @@ impl TaskDispatcher {
             message_sender: self.message_sender.clone(),
             embedding_client: self.embedding_client.as_ref(),
             brave_api_key: self.brave_api_key.as_deref(),
+            gateway_url: self.gateway_url.as_deref(),
+            internal_token: self.internal_token.as_deref(),
             github_token: self.github_token.as_deref(),
             github_app: self.github_app.as_deref(),
             skills_dirty: &self.skills_dirty,
@@ -2280,6 +2298,8 @@ mod tests {
             embedding_client: None,
             brave_api_key: None,
             github_token: None,
+            gateway_url: None,
+            internal_token: None,
             github_app: None,
             skills_dirty: Arc::new(AtomicBool::new(false)),
             agent_lock: None,

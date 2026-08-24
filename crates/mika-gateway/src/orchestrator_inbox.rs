@@ -555,6 +555,7 @@ mod tests {
                 crate::circuit_breaker::MAX_INFLIGHT_DELIVERIES,
             )),
             search_egress_client: None,
+            fetch_egress_client: None,
         }
     }
 
