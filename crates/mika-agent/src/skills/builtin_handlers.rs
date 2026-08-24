@@ -37,6 +37,7 @@ static DOC_TASK_SYSTEM: &str = include_str!(concat!(env!("OUT_DIR"), "/docs/task
 
 /// Known builtin function names, used for startup validation.
 pub const KNOWN_BUILTINS: &[&str] = &[
+    "fetch_url",
     "get_documentation",
     "gh_read",
     "git_ops",
@@ -70,6 +71,7 @@ pub async fn execute(
     ctx: &ToolContext<'_>,
 ) -> ToolOutput {
     let mut output = match function {
+        "fetch_url" => fetch_url(&input, ctx).await,
         "get_documentation" => get_documentation(&input, ctx).await,
         "gh_read" => gh_read(&input, ctx).await,
         "git_ops" => git_ops(&input, ctx).await,
@@ -306,6 +308,128 @@ fn format_brave_results(body: &serde_json::Value, query: &str) -> ToolOutput {
     }
 
     ToolOutput::success(out)
+}
+
+/// Fetch a URL through the gateway's controlled-egress substrate (mika#1969).
+///
+/// Input: `{"url": "https://service-public.fr/..."}`
+///
+/// This builtin does NOT perform outbound HTTP itself. It calls
+/// `POST /internal/fetch` on the gateway (`ctx.gateway_url` +
+/// `ctx.internal_token`), which enforces the compile-time gouv.fr
+/// allowlist + Q4 STRIP TOTAL log discipline. Fail-closed: when either
+/// gateway URL or internal token is absent, return a configuration
+/// error rather than falling back to direct egress (the substrate
+/// invariant lives in one place — the gateway).
+async fn fetch_url(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput {
+    let url = match input.get("url").and_then(|v| v.as_str()) {
+        Some(u) if !u.trim().is_empty() => u.trim().to_string(),
+        _ => return ToolOutput::error("Missing or empty 'url' parameter.".to_string()),
+    };
+
+    // Length guard — RFC-guidance ceiling. Bounded input keeps the
+    // gateway request body small and short-circuits pathological URLs
+    // before crossing the wire.
+    if url.len() > 2048 {
+        return ToolOutput::error("URL too long (max 2048 characters).".to_string());
+    }
+
+    let gateway_url = match ctx.gateway_url {
+        Some(g) if !g.trim().is_empty() => g.trim().trim_end_matches('/').to_string(),
+        _ => {
+            // Substrate config missing — route by tier (mika#1783 doctrine).
+            // Family tier: sealed being sees only the neutral fallback; the
+            //   operator-shaped detail (`MIKA_ROUTING_URL`) goes to audit
+            //   events and never enters the LLM context. Default (operator)
+            //   tier: diagnostic folds back into tool-result content.
+            let mut out = ToolOutput::substrate_unavailable(
+                "La récupération de contenu web n'est pas disponible pour le moment.",
+                "fetch_url is not configured for this agent (missing gateway URL). \
+                 Set MIKA_ROUTING_URL for the agent.",
+            );
+            crate::tools::dispatch_substrate_diagnostic(&mut out, "fetch_url", ctx).await;
+            return out;
+        }
+    };
+
+    let internal_token = match ctx.internal_token {
+        Some(t) if !t.trim().is_empty() => t.to_string(),
+        _ => {
+            // mika#1783 doctrine — same tier-routing for internal_token missing.
+            let mut out = ToolOutput::substrate_unavailable(
+                "La récupération de contenu web n'est pas disponible pour le moment.",
+                "fetch_url is not configured for this agent (missing internal token). \
+                 Set MIKA_INTERNAL_TOKEN for the agent.",
+            );
+            crate::tools::dispatch_substrate_diagnostic(&mut out, "fetch_url", ctx).await;
+            return out;
+        }
+    };
+
+    let endpoint = format!("{gateway_url}/internal/fetch");
+    let payload = serde_json::json!({ "url": url });
+
+    let resp = match HTTP_CLIENT
+        .post(&endpoint)
+        .bearer_auth(&internal_token)
+        .header("Accept", "application/json")
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) if e.is_timeout() => {
+            return ToolOutput::error("Fetch request timed out.".to_string());
+        }
+        Err(_) => {
+            // Do NOT leak transport error detail — Q4 discipline extends
+            // to the LLM-visible surface (a prompt-injection attacker
+            // could use error messages as an oracle).
+            return ToolOutput::error("Fetch upstream unavailable.".to_string());
+        }
+    };
+
+    let status = resp.status();
+
+    if status.is_success() {
+        // Parse the substrate's FetchResponse shape and hand the body
+        // to the LLM. The outer `execute()` wrapper caps output at
+        // MAX_OUTPUT_LEN — no per-handler cap needed.
+        #[derive(serde::Deserialize)]
+        struct FetchResponseBody {
+            body: String,
+            #[allow(dead_code)]
+            content_type: String,
+            #[allow(dead_code)]
+            bytes_read: u32,
+        }
+        let parsed: FetchResponseBody = match resp.json().await {
+            Ok(v) => v,
+            Err(_) => {
+                return ToolOutput::error("Fetch response could not be parsed.".to_string());
+            }
+        };
+        return ToolOutput::success(parsed.body);
+    }
+
+    // 4xx — surface the substrate's taxonomy label verbatim so the
+    // LLM can back off intelligently (host not allowed → try a
+    // different URL; invalid URL → repair; response too large → skip).
+    if status.is_client_error() {
+        let label = match resp.json::<serde_json::Value>().await {
+            Ok(v) => v
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("client_error")
+                .to_string(),
+            Err(_) => "client_error".to_string(),
+        };
+        return ToolOutput::error(format!("Fetch rejected: {label}"));
+    }
+
+    // 5xx / anything else — generic "unavailable". Do NOT leak upstream
+    // detail. See Q4 discipline note above.
+    ToolOutput::error("Fetch upstream unavailable.".to_string())
 }
 
 // -- Shared CLI helpers --
@@ -3675,6 +3799,239 @@ mod tests {
     #[test]
     fn test_web_search_in_known_builtins() {
         assert!(KNOWN_BUILTINS.contains(&"web_search"));
+    }
+
+    // ---- fetch_url tests (mika#1969) ----
+
+    #[test]
+    fn test_fetch_url_in_known_builtins() {
+        assert!(KNOWN_BUILTINS.contains(&"fetch_url"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_url_missing_url() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let output = fetch_url(&serde_json::json!({}), &ctx).await;
+        assert!(output.is_error);
+        assert!(output.content.contains("Missing or empty"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_url_empty_url() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let output = fetch_url(&serde_json::json!({"url": "   "}), &ctx).await;
+        assert!(output.is_error);
+        assert!(output.content.contains("Missing or empty"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_url_too_long() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let long_url = "x".repeat(3000);
+        let output = fetch_url(&serde_json::json!({"url": long_url}), &ctx).await;
+        assert!(output.is_error);
+        assert!(output.content.contains("too long"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_url_no_gateway_configured() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        // Default test context has gateway_url: None
+        let output = fetch_url(
+            &serde_json::json!({"url": "https://service-public.fr/"}),
+            &ctx,
+        )
+        .await;
+        assert!(output.is_error);
+        assert!(output.content.contains("not configured"));
+        assert!(output.content.contains("gateway"));
+    }
+
+    /// Build a ToolContext with gateway_url set but internal_token
+    /// missing — exercises the fail-closed configuration branch.
+    fn ctx_with_gateway_no_token<'a>(
+        db: &'a crate::async_db::AsyncDatabase,
+        counter: &'a std::sync::atomic::AtomicU32,
+        gateway_url: &'a str,
+    ) -> ToolContext<'a> {
+        use std::sync::atomic::AtomicBool;
+        static SKILLS_DIRTY: AtomicBool = AtomicBool::new(false);
+        static PR_REVIEW_POSTED: AtomicBool = AtomicBool::new(false);
+        static TOOL_ARG_SUFFIX_REJECTED: AtomicBool = AtomicBool::new(false);
+        ToolContext {
+            db,
+            session_id: "test-session",
+            trace_id: "00000000000000000000000000000000",
+            home_dir: std::path::Path::new("/tmp/mika-test"),
+            global_home_dir: None,
+            core_memory_edit_count: counter,
+            is_onboarding: false,
+            message_sender: None,
+            embedding_client: None,
+            brave_api_key: None,
+            github_token: None,
+            gateway_url: Some(gateway_url),
+            internal_token: None,
+            skills_dirty: &SKILLS_DIRTY,
+            is_reflection: false,
+            is_task_context: false,
+            is_callback_turn: false,
+            provider_name: "anthropic",
+            model_name: "claude-sonnet-4-6",
+            active_skill_paths: &[],
+            max_tasks_per_session: 25,
+            pr_review_posted: &PR_REVIEW_POSTED,
+            pr_reviews_posted: None,
+            callback_task_id: None,
+            required_tool_arg_suffixes: &[],
+            tool_arg_suffix_rejected: &TOOL_ARG_SUFFIX_REJECTED,
+            tier: mika_common::home::AgentTier::Default,
+            scope_task_id: None,
+        }
+    }
+
+    fn ctx_with_gateway_and_token<'a>(
+        db: &'a crate::async_db::AsyncDatabase,
+        counter: &'a std::sync::atomic::AtomicU32,
+        gateway_url: &'a str,
+        token: &'a str,
+    ) -> ToolContext<'a> {
+        use std::sync::atomic::AtomicBool;
+        static SKILLS_DIRTY: AtomicBool = AtomicBool::new(false);
+        static PR_REVIEW_POSTED: AtomicBool = AtomicBool::new(false);
+        static TOOL_ARG_SUFFIX_REJECTED: AtomicBool = AtomicBool::new(false);
+        ToolContext {
+            db,
+            session_id: "test-session",
+            trace_id: "00000000000000000000000000000000",
+            home_dir: std::path::Path::new("/tmp/mika-test"),
+            global_home_dir: None,
+            core_memory_edit_count: counter,
+            is_onboarding: false,
+            message_sender: None,
+            embedding_client: None,
+            brave_api_key: None,
+            github_token: None,
+            gateway_url: Some(gateway_url),
+            internal_token: Some(token),
+            skills_dirty: &SKILLS_DIRTY,
+            is_reflection: false,
+            is_task_context: false,
+            is_callback_turn: false,
+            provider_name: "anthropic",
+            model_name: "claude-sonnet-4-6",
+            active_skill_paths: &[],
+            max_tasks_per_session: 25,
+            pr_review_posted: &PR_REVIEW_POSTED,
+            pr_reviews_posted: None,
+            callback_task_id: None,
+            required_tool_arg_suffixes: &[],
+            tool_arg_suffix_rejected: &TOOL_ARG_SUFFIX_REJECTED,
+            tier: mika_common::home::AgentTier::Default,
+            scope_task_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_url_no_internal_token_configured() {
+        let harness = TestHarness::new();
+        let ctx = ctx_with_gateway_no_token(&harness.db, &harness.counter, "http://gateway:9999");
+        let output = fetch_url(
+            &serde_json::json!({"url": "https://service-public.fr/"}),
+            &ctx,
+        )
+        .await;
+        assert!(output.is_error);
+        assert!(output.content.contains("not configured"));
+        assert!(output.content.contains("token"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_url_success_returns_body() {
+        use wiremock::matchers::{bearer_token, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/internal/fetch"))
+            .and(bearer_token("test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "body": "hello from service-public.fr",
+                "content_type": "text/html; charset=utf-8",
+                "bytes_read": 28
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let harness = TestHarness::new();
+        let server_uri = server.uri();
+        let ctx =
+            ctx_with_gateway_and_token(&harness.db, &harness.counter, &server_uri, "test-token");
+        let output = fetch_url(
+            &serde_json::json!({"url": "https://service-public.fr/"}),
+            &ctx,
+        )
+        .await;
+        assert!(!output.is_error, "expected success, got {:?}", output);
+        assert!(output.content.contains("hello from service-public.fr"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_url_forwards_host_not_allowed() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/internal/fetch"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": "host_not_allowed"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let harness = TestHarness::new();
+        let server_uri = server.uri();
+        let ctx =
+            ctx_with_gateway_and_token(&harness.db, &harness.counter, &server_uri, "test-token");
+        let output = fetch_url(&serde_json::json!({"url": "https://evil.com/"}), &ctx).await;
+        assert!(output.is_error);
+        assert!(output.content.contains("host_not_allowed"));
+        assert!(output.content.contains("Fetch rejected"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_url_returns_generic_error_on_5xx() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/internal/fetch"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("upstream_error"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let harness = TestHarness::new();
+        let server_uri = server.uri();
+        let ctx =
+            ctx_with_gateway_and_token(&harness.db, &harness.counter, &server_uri, "test-token");
+        let output = fetch_url(
+            &serde_json::json!({"url": "https://service-public.fr/"}),
+            &ctx,
+        )
+        .await;
+        assert!(output.is_error);
+        // Generic message — no upstream detail leaks.
+        assert!(output.content.contains("Fetch upstream unavailable"));
+        assert!(!output.content.contains("upstream_error"));
     }
 
     #[test]

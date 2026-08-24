@@ -115,7 +115,14 @@ pub fn is_write_tool_call(name: &str, input_summary: &str) -> bool {
     // Handler builtins with known read-only behavior
     if matches!(
         name,
-        "get_documentation" | "gh_read" | "web_search" | "review_skill" | "git_ops"
+        "get_documentation"
+            | "gh_read"
+            | "web_search"
+            | "review_skill"
+            | "git_ops"
+            // fetch_url (mika#1969) — GET-only lecture-seule against gouv.fr
+            // allowlist; no state mutation on the caller's side.
+            | "fetch_url"
     ) {
         return false;
     }
@@ -305,7 +312,8 @@ mod tests {
             let is_write = is_write_tool(name);
             let is_handler = matches!(
                 *name,
-                "get_documentation"
+                "fetch_url"
+                    | "get_documentation"
                     | "gh_read"
                     | "git_ops"
                     | "review_skill"
