@@ -80,6 +80,10 @@ AUTHORIZED_PATHS=(
     "crates/mika-gateway/tests/egress_fetch"
     "docs/plans/1969-egress-fetch-fetch-url-builtin.md"
     "docs/solutions/best-practices/mirror-substrate-module-for-new-egress-class-2026-08-23.md"
+    # mika#1971 web_search substrate-routing plan — describes what the
+    # consumer-side migration removes; must cite the pre-migration Brave
+    # URL to document the fix. Same shape as the E1 plan above.
+    "docs/plans/2026-08-23-003-fix-1971-web-search-substrate-routing-plan.md"
     "scripts/verify-egress-uniqueness.sh"
     "scripts/verify-egress-request-shape.sh"
     "scripts/verify-egress-no-log.sh"

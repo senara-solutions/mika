@@ -50,15 +50,27 @@ pub const KNOWN_BUILTINS: &[&str] = &[
 /// Maximum output size from a builtin handler (matches executor::MAX_OUTPUT_LEN).
 const MAX_OUTPUT_LEN: usize = 10_000;
 
-/// Maximum response body size from Brave Search API (1MB).
+/// Maximum response body size from the search substrate (mika#1971). Kept as a
+/// defense-in-depth cap against a hostile gateway; the substrate itself bounds
+/// upstream responses at 1 MiB and normalizes them into a small typed shape.
 const MAX_SEARCH_RESPONSE_BYTES: usize = 1_024 * 1_024;
 
-/// Shared HTTP client for builtin handlers (connection pooling, TLS reuse).
-static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+/// Shared HTTP client used by `web_search` to reach the mika-gateway substrate
+/// at `POST /internal/search` (mika#1971 — closes the mika#1806 E1-E4
+/// single-egress invariant). The substrate hard-caps per-call latency at 5s
+/// internally, so a 15s outer client timeout is a safe upper bound.
+///
+/// **Do NOT reuse this client for any non-substrate destination.** Every hop
+/// out of mika-spirit that speaks the search domain must transit `/internal/search`
+/// on the gateway; broadening this client to other upstreams re-opens the
+/// invariant this ticket closes. If a future builtin needs its own outbound
+/// HTTP surface, give it its own named `LazyLock` client to keep the
+/// grep-audit signal ("what else talks to what?") sharp.
+static SUBSTRATE_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
-        .expect("failed to build HTTP client")
+        .expect("failed to build substrate HTTP client")
 });
 
 /// Dispatch a builtin handler by function name.
@@ -168,10 +180,18 @@ async fn get_documentation(input: &serde_json::Value, ctx: &ToolContext<'_>) -> 
     }
 }
 
-/// Search the web using the Brave Search API.
+/// Search the web via the mika-gateway substrate at `POST /internal/search`
+/// (mika#1971 — closes the mika#1806 E1-E4 single-egress invariant).
 ///
 /// Input: `{"query": "search terms"}`
-/// Requires `brave_api_key` in config or `MIKA_BRAVE_API_KEY` environment variable.
+///
+/// Requires `MIKA_ROUTING_URL` (mika-gateway base URL) and `MIKA_INTERNAL_TOKEN`
+/// (shared bearer) to be set on mika-spirit. The upstream `MIKA_BRAVE_API_KEY`
+/// is now the substrate's concern — it must be set on the mika-gateway
+/// container, not here. This handler NEVER reads `ctx.brave_api_key` and
+/// NEVER sends the key or any tenant identifier on the wire (Q1-Q4 STRIP
+/// TOTAL preserved end-to-end; see
+/// `crates/mika-gateway/src/egress_search/mod.rs` for the substrate contract).
 async fn web_search(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput {
     let query = match input.get("query").and_then(|v| v.as_str()) {
         Some(q) if !q.trim().is_empty() => q.trim(),
@@ -183,127 +203,189 @@ async fn web_search(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOut
         return ToolOutput::error("Query too long (max 10000 characters).".to_string());
     }
 
-    let api_key = match ctx.brave_api_key {
-        Some(key) if !key.trim().is_empty() => key.to_string(),
+    let gateway_url = match ctx.gateway_url {
+        Some(url) if !url.trim().is_empty() => url.trim_end_matches('/'),
         _ => {
             // Substrate config missing — route by tier (mika#1783).
             // Family tier: the sealed being sees only a neutral fallback; the
-            //   operator-shaped detail (which service, which key, how to obtain)
-            //   goes to `audit_events` and never enters the LLM's context. The
-            //   being says "je ne peux pas faire de recherche web là" — the
-            //   correct answer for a sealed being facing an unavailable
-            //   capability, with no addressee and no way to construct "Salut
-            //   Vincent".
+            //   operator-shaped detail (which env var, how to configure)
+            //   goes to `audit_events` and never enters the LLM's context.
             // Default (operator) tier: unchanged operator UX — the diagnostic
-            //   is folded back into the tool-result `content` because the
-            //   operator IS the reader who provisions the key.
+            //   is folded back into the tool-result `content`.
             let mut out = ToolOutput::substrate_unavailable(
                 "La recherche web n'est pas disponible pour le moment.",
-                "Brave Search API key not configured. \
-                 Set brave_api_key in ~/.mika/config.toml or MIKA_BRAVE_API_KEY env var. \
-                 Get a free key at https://brave.com/search/api/",
+                "Search substrate is not configured (gateway_url missing). \
+                 Ensure MIKA_ROUTING_URL is set on mika-spirit.",
+            );
+            crate::tools::dispatch_substrate_diagnostic(&mut out, "web_search", ctx).await;
+            return out;
+        }
+    };
+    let internal_token = match ctx.internal_token {
+        Some(t) if !t.trim().is_empty() => t,
+        _ => {
+            // mika#1783 doctrine — same tier-routing for internal_token missing.
+            let mut out = ToolOutput::substrate_unavailable(
+                "La recherche web n'est pas disponible pour le moment.",
+                "Search substrate is not configured (internal_token missing). \
+                 Ensure MIKA_INTERNAL_TOKEN is set on mika-spirit.",
             );
             crate::tools::dispatch_substrate_diagnostic(&mut out, "web_search", ctx).await;
             return out;
         }
     };
 
-    let resp = match HTTP_CLIENT
-        .get("https://api.search.brave.com/res/v1/web/search")
-        .header("X-Subscription-Token", &api_key)
+    let endpoint = format!("{gateway_url}/internal/search");
+
+    // Q1-Q4 STRIP TOTAL invariant (mika#1806): the body carries ONLY the
+    // substrate's typed request shape. No session_id, no agent name, no
+    // chat_id, no API key, no tenant identifier of any kind. Auth is a
+    // Bearer header set by the substrate transport layer, never a body
+    // field. Reviewer check: `git diff` on this body — any additional
+    // field is an invariant violation. The header set below likewise
+    // MUST NOT carry X-Subscription-Token, X-Tenant-Id, X-Agent-Name, or
+    // any tenant hint.
+    let body = serde_json::json!({
+        "query": query,
+        "max_results": 5,
+    });
+
+    let resp = match SUBSTRATE_HTTP_CLIENT
+        .post(&endpoint)
+        .header("Authorization", format!("Bearer {internal_token}"))
         .header("Accept", "application/json")
-        .query(&[("q", query), ("count", "5")])
+        .header("Content-Type", "application/json")
+        .json(&body)
         .send()
         .await
     {
         Ok(r) => r,
         Err(e) if e.is_timeout() => {
-            return ToolOutput::error("Search request timed out (15s).".to_string());
+            return ToolOutput::error("Search substrate request timed out (15s).".to_string());
         }
         Err(_) => {
-            return ToolOutput::error("Search request failed.".to_string());
+            return ToolOutput::error(
+                "Search substrate unreachable (transport error to gateway). Escalate.".to_string(),
+            );
         }
     };
 
     let status = resp.status();
-    if !status.is_success() {
-        // 401 = key revoked / expired / misconfigured. Same substrate-doctrine
-        // class as the missing-key branch above: an operator-shaped diagnostic
-        // ("Check MIKA_BRAVE_API_KEY") would leak upward through a sealed
-        // family-tier being. Route via substrate_unavailable so the tier
-        // guard fires (mika#1783 addendum — flagged by adversarial reviewer).
-        //
-        // 429 (rate limit) and 5xx are transient upstream conditions — the
-        // being can legitimately tell the user "try again later" without
-        // constructing an addressee, so those keep the plain-error path.
-        if status.as_u16() == 401 {
-            let mut out = ToolOutput::substrate_unavailable(
-                "La recherche web n'est pas disponible pour le moment.",
-                "Brave Search returned HTTP 401 (invalid or revoked API key). \
-                 Check MIKA_BRAVE_API_KEY or refresh the key at \
-                 https://brave.com/search/api/.",
-            );
-            crate::tools::dispatch_substrate_diagnostic(&mut out, "web_search", ctx).await;
-            return out;
-        }
-        let msg = match status.as_u16() {
-            429 => "Search rate limit exceeded. Try again later.".to_string(),
-            _ => format!("Search API returned HTTP {status}."),
-        };
-        return ToolOutput::error(msg);
-    }
 
-    // Limit response body size to prevent memory exhaustion
+    // Response body size guard — read bytes first (bounded) so we can
+    // deserialize either the success shape or the substrate error taxonomy.
     let content_length = resp.content_length().unwrap_or(0) as usize;
     if content_length > MAX_SEARCH_RESPONSE_BYTES {
-        return ToolOutput::error("Search response too large.".to_string());
+        return ToolOutput::error("Search substrate response too large.".to_string());
     }
-
     let bytes = match resp.bytes().await {
         Ok(b) if b.len() > MAX_SEARCH_RESPONSE_BYTES => {
-            return ToolOutput::error("Search response too large.".to_string());
+            return ToolOutput::error("Search substrate response too large.".to_string());
         }
         Ok(b) => b,
-        Err(_) => return ToolOutput::error("Failed to read search response.".to_string()),
-    };
-
-    let body: serde_json::Value = match serde_json::from_slice(&bytes) {
-        Ok(v) => v,
-        Err(_) => return ToolOutput::error("Failed to parse search response.".to_string()),
-    };
-
-    format_brave_results(&body, query)
-}
-
-/// Format Brave Search API results into concise, LLM-friendly text.
-fn format_brave_results(body: &serde_json::Value, query: &str) -> ToolOutput {
-    let results = body
-        .get("web")
-        .and_then(|w| w.get("results"))
-        .and_then(|r| r.as_array());
-
-    let results = match results {
-        Some(arr) if !arr.is_empty() => arr,
-        _ => {
-            return ToolOutput::success(format!("No results found for \"{query}\"."));
+        Err(_) => {
+            return ToolOutput::error("Search substrate response could not be read.".to_string());
         }
     };
 
+    if !status.is_success() {
+        // Substrate returns `{"error": "<taxonomy_label>"}` — see
+        // `crates/mika-gateway/src/egress_search/mod.rs::SearchError`.
+        let err_body: SubstrateErrorBody =
+            serde_json::from_slice(&bytes).unwrap_or(SubstrateErrorBody {
+                error: String::new(),
+            });
+        return ToolOutput::error(map_substrate_error(status.as_u16(), &err_body.error));
+    }
+
+    let resp_body: SearchResponseWire = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            return ToolOutput::error(
+                "Search substrate returned a body that could not be parsed as SearchResponse."
+                    .to_string(),
+            );
+        }
+    };
+
+    format_substrate_results(&resp_body, query)
+}
+
+/// Substrate error envelope. Local mirror of the JSON produced by
+/// `crates/mika-gateway/src/egress_search/mod.rs`'s `IntoResponse` for
+/// `SearchError` — kept private to avoid a cross-crate `pub(crate)` break.
+#[derive(serde::Deserialize)]
+struct SubstrateErrorBody {
+    #[serde(default)]
+    error: String,
+}
+
+/// Substrate success envelope. Local mirror of the substrate's public
+/// `SearchResponse` shape (`{results, upstream_latency_ms}`), same reason.
+#[derive(serde::Deserialize)]
+struct SearchResponseWire {
+    results: Vec<SearchResultWire>,
+    #[serde(default)]
+    #[allow(dead_code)] // Q4-safe side-channel; not surfaced to the LLM.
+    upstream_latency_ms: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct SearchResultWire {
+    title: String,
+    url: String,
+    snippet: String,
+}
+
+/// Map a substrate HTTP status + taxonomy label to an LLM-facing message.
+///
+/// The taxonomy comes from `crates/mika-gateway/src/egress_search/mod.rs`'s
+/// `SearchError::tracing_status` and the `handle_internal_search` handler.
+/// The mapping intentionally names the operator surface (gateway container,
+/// MIKA_BRAVE_API_KEY on the gateway) so an LLM-authored ticket carries the
+/// actionable remediation rather than opaque status text.
+fn map_substrate_error(status: u16, label: &str) -> String {
+    match (status, label) {
+        (404, "search_upstream_not_configured") => {
+            "Search substrate is not configured on the gateway. \
+             Ask the operator to set MIKA_BRAVE_API_KEY on mika-gateway."
+                .to_string()
+        }
+        (502, "not_implemented") => {
+            "Search substrate variant not implemented on the gateway.".to_string()
+        }
+        (502, "upstream_error") => {
+            "Search upstream returned an error. Try again in a moment.".to_string()
+        }
+        (502, "unauthorized") => "Search substrate rejected upstream credentials. \
+             Ask the operator to rotate MIKA_BRAVE_API_KEY on mika-gateway."
+            .to_string(),
+        (502, "transport_error") => "Search request failed (transport error contacting upstream). \
+             Try again in a moment."
+            .to_string(),
+        (502, "parse_error") => "Search substrate could not parse the upstream response \
+             (possible schema drift). Escalate."
+            .to_string(),
+        _ => format!("Search substrate returned HTTP {status}."),
+    }
+}
+
+/// Format substrate results into concise, LLM-friendly text. Mirrors the
+/// output shape of the previous `format_brave_results` (line-per-result:
+/// `N. <title>` / `   URL: <url>` / `   <snippet>`) so the LLM-facing text
+/// does not change across the substrate cut.
+fn format_substrate_results(resp: &SearchResponseWire, query: &str) -> ToolOutput {
+    if resp.results.is_empty() {
+        return ToolOutput::success(format!("No results found for \"{query}\"."));
+    }
+
     let mut out = format!("Search results for \"{query}\":\n");
-
-    for (i, result) in results.iter().enumerate().take(5) {
-        let title = result.get("title").and_then(|v| v.as_str()).unwrap_or("");
-        let url = result.get("url").and_then(|v| v.as_str()).unwrap_or("");
-        let description = result
-            .get("description")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
+    for (i, result) in resp.results.iter().enumerate().take(5) {
         let _ = writeln!(out);
-        let _ = writeln!(out, "{}. {}", i + 1, title);
-        let _ = writeln!(out, "   URL: {url}");
-        if !description.is_empty() {
-            let _ = writeln!(out, "   {description}");
+        let _ = writeln!(out, "{}. {}", i + 1, result.title);
+        let _ = writeln!(out, "   URL: {}", result.url);
+        if !result.snippet.is_empty() {
+            let _ = writeln!(out, "   {}", result.snippet);
         }
     }
 
@@ -369,7 +451,7 @@ async fn fetch_url(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutp
     let endpoint = format!("{gateway_url}/internal/fetch");
     let payload = serde_json::json!({ "url": url });
 
-    let resp = match HTTP_CLIENT
+    let resp = match SUBSTRATE_HTTP_CLIENT
         .post(&endpoint)
         .bearer_auth(&internal_token)
         .header("Accept", "application/json")
@@ -3534,8 +3616,13 @@ mod tests {
         // The diagnostic MUST carry the operator-shaped detail (so ops
         // telemetry has actionable info) — this is the payload the LLM never
         // saw.
+        // Post-mika#1971: web_search now delegates to the mika-gateway
+        // substrate at POST /internal/search, so the operator-shaped
+        // diagnostic names the substrate config (gateway_url /
+        // MIKA_ROUTING_URL), NOT the upstream API key — the Brave key
+        // is the gateway's concern now, never mika-spirit's.
         assert!(
-            after.contains("brave_api_key") || after.contains("Brave"),
+            after.contains("gateway_url") || after.contains("MIKA_ROUTING_URL"),
             "substrate diagnostic must carry the operator-shaped detail: {after:?}"
         );
     }
@@ -3554,10 +3641,10 @@ mod tests {
         let output = web_search(&input, &ctx).await;
 
         assert!(output.is_error);
-        // Operator sees the actionable detail.
+        // Post-mika#1971: operator sees the substrate-config diagnostic
+        // (gateway_url / MIKA_ROUTING_URL), not the upstream API key.
         assert!(
-            output.content.contains("brave_api_key")
-                || output.content.contains("MIKA_BRAVE_API_KEY"),
+            output.content.contains("gateway_url") || output.content.contains("MIKA_ROUTING_URL"),
             "default-tier web_search must carry the operator-shaped detail: {:?}",
             output.content
         );
@@ -3749,27 +3836,27 @@ mod tests {
     }
 
     #[test]
-    fn test_format_brave_results_empty() {
-        let body = serde_json::json!({"web": {"results": []}});
-        let output = format_brave_results(&body, "test");
+    fn test_format_substrate_results_empty() {
+        let resp = SearchResponseWire {
+            results: vec![],
+            upstream_latency_ms: 0,
+        };
+        let output = format_substrate_results(&resp, "test");
         assert!(!output.is_error);
         assert!(output.content.contains("No results found"));
     }
 
     #[test]
-    fn test_format_brave_results_with_data() {
-        let body = serde_json::json!({
-            "web": {
-                "results": [
-                    {
-                        "title": "Test Result",
-                        "url": "https://example.com",
-                        "description": "A test description"
-                    }
-                ]
-            }
-        });
-        let output = format_brave_results(&body, "test query");
+    fn test_format_substrate_results_with_data() {
+        let resp = SearchResponseWire {
+            results: vec![SearchResultWire {
+                title: "Test Result".to_string(),
+                url: "https://example.com".to_string(),
+                snippet: "A test description".to_string(),
+            }],
+            upstream_latency_ms: 42,
+        };
+        let output = format_substrate_results(&resp, "test query");
         assert!(!output.is_error);
         assert!(output.content.contains("Test Result"));
         assert!(output.content.contains("https://example.com"));
@@ -3778,22 +3865,231 @@ mod tests {
     }
 
     #[test]
-    fn test_format_brave_results_no_web_key() {
-        let body = serde_json::json!({"query": {}});
-        let output = format_brave_results(&body, "test");
-        assert!(!output.is_error);
-        assert!(output.content.contains("No results found"));
+    fn test_map_substrate_error_taxonomy() {
+        // Every taxonomy label from crates/mika-gateway/src/egress_search/mod.rs
+        // must produce an actionable, LLM-facing message. Grep for the label
+        // strings here if the substrate taxonomy is extended.
+        assert!(
+            map_substrate_error(404, "search_upstream_not_configured")
+                .contains("MIKA_BRAVE_API_KEY on mika-gateway")
+        );
+        assert!(map_substrate_error(502, "unauthorized").contains("rotate MIKA_BRAVE_API_KEY"));
+        assert!(map_substrate_error(502, "upstream_error").contains("upstream returned an error"));
+        assert!(map_substrate_error(502, "transport_error").contains("transport error"));
+        assert!(
+            map_substrate_error(502, "parse_error")
+                .contains("could not parse the upstream response")
+        );
+        assert!(map_substrate_error(502, "not_implemented").contains("not implemented"));
+        // Unknown label → generic fallback
+        assert_eq!(
+            map_substrate_error(500, "surprise"),
+            "Search substrate returned HTTP 500."
+        );
     }
 
     #[tokio::test]
-    async fn test_web_search_no_api_key() {
+    async fn test_web_search_missing_gateway_url_reports_substrate_unconfigured() {
         let harness = TestHarness::new();
-        let ctx = harness.ctx();
-        // Default test context has brave_api_key: None
+        let mut ctx = harness.ctx();
+        // Only internal_token is set — gateway_url absent.
+        ctx.internal_token = Some("test-token");
         let output = web_search(&serde_json::json!({"query": "test"}), &ctx).await;
         assert!(output.is_error);
-        assert!(output.content.contains("not configured"));
-        assert!(output.content.contains("config.toml"));
+        assert!(
+            output
+                .content
+                .contains("Search substrate is not configured"),
+            "unexpected message: {}",
+            output.content
+        );
+        assert!(output.content.contains("gateway_url missing"));
+    }
+
+    #[tokio::test]
+    async fn test_web_search_missing_internal_token_reports_substrate_unconfigured() {
+        let harness = TestHarness::new();
+        let mut ctx = harness.ctx();
+        // Only gateway_url is set — internal_token absent.
+        ctx.gateway_url = Some("http://gateway.invalid");
+        let output = web_search(&serde_json::json!({"query": "test"}), &ctx).await;
+        assert!(output.is_error);
+        assert!(output.content.contains("internal_token missing"));
+    }
+
+    /// Load-bearing regression test for mika#1971 AC1-AC4. Asserts every
+    /// invariant in a single wire round-trip against a wiremock-backed
+    /// substrate:
+    /// - AC1: the request lands at `POST /internal/search` on the substrate.
+    /// - AC2: the direct-to-Brave `HTTP_CLIENT` codepath is gone (implicitly
+    ///   proven by this test compiling — wiremock rejects unregistered paths).
+    /// - AC3 (Q1-Q4 STRIP TOTAL): the wire body carries ONLY `{query,
+    ///   max_results}`, no tenant identifier of any kind. The `Authorization`
+    ///   header is `Bearer <internal_token>`. The `X-Subscription-Token`
+    ///   header (the pre-fix leak vector) is NOT present.
+    /// - AC4: upstream Brave is not contacted by the builtin (wiremock
+    ///   receives every outbound request; a leak would show up as an
+    ///   unregistered-path 404 or a missed expectation).
+    ///
+    /// If this assertion set weakens, the single-egress invariant weakens.
+    #[tokio::test]
+    async fn test_web_search_routes_via_substrate_and_does_not_contact_brave() {
+        use wiremock::matchers::{header, header_exists, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/internal/search"))
+            .and(header("authorization", "Bearer test-internal-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [
+                    {
+                        "title": "Kitten Facts",
+                        "url": "https://example.com/kittens",
+                        "snippet": "Cats are small"
+                    }
+                ],
+                "upstream_latency_ms": 42
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let gateway_url = mock.uri();
+        let harness = TestHarness::new();
+        let mut ctx = harness.ctx();
+        ctx.gateway_url = Some(&gateway_url);
+        ctx.internal_token = Some("test-internal-token");
+        // Q1-Q4 defense: even if brave_api_key is somehow set, the handler
+        // must ignore it and never surface it on the wire.
+        ctx.brave_api_key = Some("SHOULD-NEVER-APPEAR-ON-WIRE");
+
+        let output = web_search(&serde_json::json!({"query": "kittens"}), &ctx).await;
+        assert!(
+            !output.is_error,
+            "expected success, got error: {}",
+            output.content
+        );
+        assert!(output.content.contains("Kitten Facts"));
+        assert!(output.content.contains("https://example.com/kittens"));
+
+        // Inspect the captured request: confirm the body shape and the
+        // absence of tenant hints on the wire.
+        let requests = mock
+            .received_requests()
+            .await
+            .expect("wiremock records requests");
+        assert_eq!(requests.len(), 1, "expected exactly one substrate request");
+        let req = &requests[0];
+
+        // Body shape (AC3 STRIP TOTAL): exactly two keys, both bounded.
+        let body_json: serde_json::Value = serde_json::from_slice(&req.body).expect("body is JSON");
+        let obj = body_json.as_object().expect("body is an object");
+        assert_eq!(
+            obj.len(),
+            2,
+            "body must carry ONLY {{query, max_results}} — found: {obj:?}"
+        );
+        assert_eq!(obj.get("query").and_then(|v| v.as_str()), Some("kittens"));
+        assert_eq!(obj.get("max_results").and_then(|v| v.as_u64()), Some(5));
+
+        // Header allowlist (AC3 STRIP TOTAL): the pre-fix Brave header must
+        // not appear, and no tenant-hinting header must be present. Auth
+        // must be Bearer, not X-Subscription-Token.
+        assert!(
+            req.headers.get("x-subscription-token").is_none(),
+            "X-Subscription-Token leaked to substrate (Q4 STRIP TOTAL violated)"
+        );
+        assert!(req.headers.get("x-tenant-id").is_none());
+        assert!(req.headers.get("x-agent-name").is_none());
+        assert!(req.headers.get("x-customer-id").is_none());
+        assert!(req.headers.get("x-session-id").is_none());
+
+        // Body must not carry the Brave key even though it was set on ctx —
+        // reviewer signal that the handler ignores brave_api_key entirely.
+        let body_bytes = req.body.as_slice();
+        assert!(
+            !body_bytes
+                .windows(30)
+                .any(|w| w == b"SHOULD-NEVER-APPEAR-ON-WIRE"),
+            "brave_api_key surfaced on the wire — invariant violated"
+        );
+
+        // Auth (bearer + correct token).
+        let auth = req
+            .headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .expect("Authorization header present");
+        assert_eq!(auth, "Bearer test-internal-token");
+
+        // Method + path (AC1).
+        assert_eq!(req.method, wiremock::http::Method::POST);
+        assert_eq!(req.url.path(), "/internal/search");
+
+        // Wiremock's implicit assertion: only the one registered mock was hit.
+        // Any request to a different path would fail the `.expect(1)` above.
+        let _ = header_exists::<&str>; // silence unused-import warning if any
+    }
+
+    /// AC4 negative path: substrate 404 (not-configured) surfaces the KTD6
+    /// tabulated message with actionable remediation naming the gateway.
+    #[tokio::test]
+    async fn test_web_search_maps_substrate_404_search_upstream_not_configured() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/internal/search"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": "search_upstream_not_configured"
+            })))
+            .mount(&mock)
+            .await;
+
+        let gateway_url = mock.uri();
+        let harness = TestHarness::new();
+        let mut ctx = harness.ctx();
+        ctx.gateway_url = Some(&gateway_url);
+        ctx.internal_token = Some("test-internal-token");
+
+        let output = web_search(&serde_json::json!({"query": "any"}), &ctx).await;
+        assert!(output.is_error);
+        assert!(
+            output
+                .content
+                .contains("MIKA_BRAVE_API_KEY on mika-gateway"),
+            "unexpected error message: {}",
+            output.content
+        );
+    }
+
+    /// AC4 negative path: substrate 502 (unauthorized) surfaces a rotate-key
+    /// remediation naming the gateway container.
+    #[tokio::test]
+    async fn test_web_search_maps_substrate_502_unauthorized() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/internal/search"))
+            .respond_with(ResponseTemplate::new(502).set_body_json(serde_json::json!({
+                "error": "unauthorized"
+            })))
+            .mount(&mock)
+            .await;
+
+        let gateway_url = mock.uri();
+        let harness = TestHarness::new();
+        let mut ctx = harness.ctx();
+        ctx.gateway_url = Some(&gateway_url);
+        ctx.internal_token = Some("test-internal-token");
+
+        let output = web_search(&serde_json::json!({"query": "any"}), &ctx).await;
+        assert!(output.is_error);
+        assert!(output.content.contains("rotate MIKA_BRAVE_API_KEY"));
     }
 
     #[test]

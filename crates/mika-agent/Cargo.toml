@@ -83,9 +83,10 @@ http-body-util.workspace = true
 mika-common = { workspace = true, features = ["test-utils"] }
 serial_test.workspace = true
 tracing-subscriber.workspace = true
-# fetch_url builtin (mika#1969) — wiremock-backed tests for the gateway
-# substrate delegation. Matches the mika-gateway dev-dep.
-wiremock = { workspace = true }
+# wiremock-backed dev-dep for gateway substrate delegation tests.
+# Consumers: mika#1969 (fetch_url builtin) + mika#1971 (web_search substrate cut).
+# Reuses the workspace pin also used by mika-gateway's egress-search/egress-fetch tests.
+wiremock.workspace = true
 
 [lints]
 workspace = true
