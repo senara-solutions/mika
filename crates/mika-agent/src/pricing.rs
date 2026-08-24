@@ -45,6 +45,16 @@ struct PricingEntry {
 }
 
 const ANTHROPIC_MODELS: &[PricingEntry] = &[
+    // Mythos tier (Fable 5) — 2× Opus base pricing across all categories.
+    // Source: https://platform.claude.com/docs/en/about-claude/pricing
+    // (checked 2026-08-24). Cache multipliers unchanged (5m write 1.25× base,
+    // 1h write 2× base, cache read 0.1× base) — the multipliers apply to the
+    // base input rate, so cache economics are proportional.
+    PricingEntry {
+        models: &["claude-fable-5"],
+        input_per_mtok: 10.0,
+        output_per_mtok: 50.0,
+    },
     PricingEntry {
         models: &["claude-opus-4", "claude-opus-4-0520"],
         input_per_mtok: 15.0,
@@ -333,6 +343,21 @@ fn find_model_in_entries<'a>(entries: &'a [PricingEntry], model: &str) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anthropic_fable_5_basic_cost() {
+        let pricing = get_pricing("anthropic", "claude-fable-5");
+        assert_eq!(pricing.input_per_mtok, 10.0);
+        assert_eq!(pricing.output_per_mtok, 50.0);
+
+        let cost = estimate_call_cost(&pricing, 1000, 500, None, None);
+        // (1000 * 10.0 + 500 * 50.0) / 1_000_000 = (10000 + 25000) / 1_000_000 = 0.000035
+        let expected = (1000.0 * 10.0 + 500.0 * 50.0) / 1_000_000.0;
+        assert!(
+            (cost - expected).abs() < 1e-12,
+            "cost={cost}, expected={expected}"
+        );
+    }
 
     #[test]
     fn anthropic_sonnet_46_basic_cost() {
