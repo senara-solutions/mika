@@ -3,6 +3,7 @@ mod a2a_routes;
 pub(crate) mod audit_events;
 pub(crate) mod circuit_breaker;
 pub(crate) mod dlq;
+pub(crate) mod egress_fetch;
 pub(crate) mod egress_search;
 pub mod github;
 pub mod openapi;
@@ -21,6 +22,7 @@ use secrecy::ExposeSecret;
 use tokio::net::TcpListener;
 use tracing::info;
 
+use egress_fetch::{FetchEgressClient, FetchUpstream, GouvFrConfig};
 use egress_search::{BraveConfig, SearchEgressClient, SearchUpstream};
 use routes::{AppState, build_router};
 use settings::GatewaySettings;
@@ -192,6 +194,16 @@ async fn main() -> Result<()> {
         Some(_) => unreachable!("validated in GatewaySettings::load"),
     };
 
+    // Build the egress-fetch substrate client (mika#1969) — always
+    // constructed. There is no upstream selection env var per KTD2;
+    // extending the allowlist is a code change. Shared across every
+    // tenant per the same Q3 partagé no-log invariant as the search
+    // substrate.
+    let fetch_egress_client = Some(Arc::new(FetchEgressClient::new(FetchUpstream::GouvFr(
+        GouvFrConfig {},
+    ))));
+    info!("egress-fetch substrate configured (upstream=gouv_fr)");
+
     // Build app state
     let state = AppState {
         pool,
@@ -219,6 +231,7 @@ async fn main() -> Result<()> {
             circuit_breaker::MAX_INFLIGHT_DELIVERIES,
         )),
         search_egress_client,
+        fetch_egress_client,
     };
 
     // Spawn DLQ background worker (retries pending deliveries every 30s)

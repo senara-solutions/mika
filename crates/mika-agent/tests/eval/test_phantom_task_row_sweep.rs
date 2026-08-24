@@ -61,6 +61,8 @@ fn test_dispatcher(db: AsyncDatabase) -> Arc<TaskDispatcher> {
         home_dir: PathBuf::from("/tmp"),
         embedding_client: None,
         brave_api_key: None,
+        gateway_url: None,
+        internal_token: None,
         github_token: None,
         github_app: None,
         skills_dirty: Arc::new(AtomicBool::new(false)),

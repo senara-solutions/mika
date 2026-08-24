@@ -181,6 +181,12 @@ async fn spawn_agent_worker(
         embedding_client: embedding_client.clone(),
         brave_api_key: brave_api_key.clone(),
         github_token: github_token.clone(),
+        gateway_url: ctx.settings.routing_url.clone(),
+        internal_token: ctx
+            .settings
+            .internal_token
+            .as_ref()
+            .map(|s| s.expose_secret().to_string()),
         github_app: ctx.github_app.clone(),
         skills_dirty: skills_dirty.clone(),
         // CLI mode: no agent_lock passed. The task engine may run heartbeat/reflection
@@ -257,6 +263,12 @@ async fn spawn_agent_worker(
     let worker_embedding = embedding_client;
     let worker_brave_key = brave_api_key;
     let worker_github_token = github_token;
+    let worker_gateway_url = ctx.settings.routing_url.clone();
+    let worker_internal_token = ctx
+        .settings
+        .internal_token
+        .as_ref()
+        .map(|s| s.expose_secret().to_string());
     let worker_github_app = ctx.github_app.clone();
     let worker_sender = message_sender;
     let worker_dirty = skills_dirty.clone();
@@ -322,6 +334,8 @@ async fn spawn_agent_worker(
                         user_images: &image_sources,
                         brave_api_key: worker_brave_key.as_deref(),
                         github_token: worker_github_token.as_deref(),
+                        gateway_url: worker_gateway_url.as_deref(),
+                        internal_token: worker_internal_token.as_deref(),
                         github_app: worker_github_app.as_deref(),
                         skills_dirty: &worker_dirty,
                         skill_nudge: None, // mika#1583: nudges apply in server mode only
@@ -438,6 +452,8 @@ async fn spawn_agent_worker(
                         user_images: &[],
                         brave_api_key: worker_brave_key.as_deref(),
                         github_token: worker_github_token.as_deref(),
+                        gateway_url: worker_gateway_url.as_deref(),
+                        internal_token: worker_internal_token.as_deref(),
                         github_app: worker_github_app.as_deref(),
                         skills_dirty: &worker_dirty,
                         skill_nudge: None, // mika#1583: nudges apply in server mode only

@@ -295,6 +295,12 @@ impl Tool for DelegateTaskTool {
                 .as_ref()
                 .map(|s| s.expose_secret()),
             github_token: self.settings.agent_github_token(),
+            gateway_url: self.settings.routing_url.as_deref(),
+            internal_token: self
+                .settings
+                .internal_token
+                .as_ref()
+                .map(|s| s.expose_secret()),
             github_app: self.github_app.as_deref(),
             skills_dirty: &skills_dirty,
             settings: Some(&self.settings),

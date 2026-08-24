@@ -118,6 +118,18 @@ pub struct ToolContext<'a> {
     pub embedding_client: Option<&'a EmbeddingClient>,
     pub brave_api_key: Option<&'a str>,
     pub github_token: Option<&'a str>,
+    /// Gateway base URL for builtins that call substrate endpoints on
+    /// the gateway (mika#1969 — `fetch_url` calls
+    /// `POST /internal/fetch`). Populated from `settings.routing_url`
+    /// in production; `None` in tests and CLI contexts where no
+    /// gateway is reachable — dependent builtins return a
+    /// configuration error rather than falling back to direct egress
+    /// (fail-closed matches the substrate invariant).
+    pub gateway_url: Option<&'a str>,
+    /// Shared bearer token authenticating agent-to-gateway calls to
+    /// internal substrate endpoints. Companion to `gateway_url`.
+    /// Populated from `settings.internal_token` in production.
+    pub internal_token: Option<&'a str>,
     /// Shared flag: set to `true` by skill-modifying tools after successful writes.
     /// The agent loop coordinator checks this before each turn and rebuilds the
     /// SkillRegistry if set, enabling hot-reload without restart.
@@ -902,6 +914,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "create_task",
     "update_task_status",
     // skills::builtin_handlers::KNOWN_BUILTINS — handler-builtins
+    "fetch_url",
     "get_documentation",
     "gh_read",
     "git_ops",
