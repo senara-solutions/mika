@@ -52,6 +52,10 @@ fn hardcoded_models(provider: ProviderKind) -> Vec<ModelInfo> {
     match provider {
         ProviderKind::Anthropic => vec![
             ModelInfo {
+                id: "claude-fable-5".into(),
+                name: Some("Claude Fable 5 (Mythos tier)".into()),
+            },
+            ModelInfo {
                 id: "claude-sonnet-4-6".into(),
                 name: Some("Claude Sonnet 4.6".into()),
             },
