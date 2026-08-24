@@ -142,6 +142,7 @@ pub mod test_helpers {
                 callback_task_id: None,
                 required_tool_arg_suffixes: &[],
                 tool_arg_suffix_rejected: &TOOL_ARG_SUFFIX_REJECTED,
+                tier: mika_common::home::AgentTier::Default,
                 scope_task_id: None,
             }
         }
