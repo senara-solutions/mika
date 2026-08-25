@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::io::Read;
 use uuid::Uuid;
 
@@ -56,6 +56,22 @@ struct TokensMetadata {
     cache_read: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_write: Option<u64>,
+}
+
+/// Wrap a `send_message_to_agent` failure into an operator-facing error that
+/// surfaces the underlying `A2aError` chain (mika#1985).
+///
+/// The alternate `Display` format (`{err:#}`) walks the anyhow source chain and
+/// concatenates each layer with `: ` — so a chain like
+/// `A2aError::ClientError` → `anyhow!("connection error: HTTP 500 ...")` becomes
+/// visible in the CLI's `eprintln!("Error: {err}")` printer rather than being
+/// masked by a single top-level context layer.
+///
+/// The endpoint URL is preserved so operators can still recognise a wrong-URL
+/// misconfiguration; the pre-fix "(is it running?)" hint is dropped because it
+/// was actively misleading in the founding incident (spirit *was* running).
+fn wrap_send_error(err: &anyhow::Error, spirit_endpoint: &str) -> anyhow::Error {
+    anyhow::anyhow!("mika ask to {spirit_endpoint} failed: {err:#}")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -315,11 +331,16 @@ pub async fn run(
         crate::commands::dashboard::spirit_url(),
         agent_name
     );
+    // mika#1985: route the failure through `wrap_send_error` so the underlying
+    // A2aError message reaches stdout. The old `.with_context(...)` added a new
+    // top context; `{err}` in the outer CLI printer prints only the top layer,
+    // hiding HTTP status, reqwest transport errors, A2A state transitions, and
+    // server-side LLM/OAuth errors. The 2026-08-24 Prime OAuth incident cost ~2h
+    // of duo diag under this masking. See `wrap_send_error` for the shape and
+    // the test `test_wrap_send_error_preserves_underlying_a2a_error_chain`.
     let task = mika_cli::remote_ask::send_message_to_agent(&user_message, &spirit_endpoint)
         .await
-        .with_context(|| {
-            format!("failed to reach mika-spirit over A2A at {spirit_endpoint} (is it running?)")
-        })?;
+        .map_err(|e| wrap_send_error(&e, &spirit_endpoint))?;
 
     // End the local bookkeeping session regardless of outcome so the dashboard
     // shows duration. No-op for singleton agents — the canonical session is never
@@ -687,6 +708,63 @@ mod tests {
         };
         let json = serde_json::to_string(&response).unwrap();
         assert_eq!(json, r#"{"role":"assistant","content":null}"#);
+    }
+
+    /// mika#1985 regression: the CLI wrapper around `send_message_to_agent` must
+    /// surface the underlying `A2aError` message text in the visible error, not just
+    /// the generic "failed to reach mika-spirit" wrapper.
+    ///
+    /// The founding incident (2026-08-24 Prime OAuth loss) hid a server-side
+    /// `LLM provider error: OAuth token resolution failed` under a bare
+    /// "failed to reach mika-spirit... is it running?" for ~2h of duo diag. This
+    /// test locks in the mask-through fix: the visible message must contain
+    /// (a) the underlying reason string (e.g. `connection error`) and
+    /// (b) the endpoint URL (actionable context).
+    ///
+    /// The test exercises the real `wrap_send_error` helper (the production
+    /// wrapper used at commands/ask.rs:~320) against a synthetic anyhow error
+    /// shaped like what `send_message_to_agent` returns on `A2aError::ClientError`
+    /// — no real A2A server, no reqwest — so failure of this test proves the
+    /// production wrapper regressed, independent of any live-endpoint state.
+    #[test]
+    fn test_wrap_send_error_preserves_underlying_a2a_error_chain() {
+        // Shape mirrors `send_message_to_agent`'s `A2aError::ClientError` arm at
+        // crates/mika-cli/src/remote_ask.rs:136 — `anyhow::bail!("connection error: {e}")`.
+        let underlying: anyhow::Error =
+            anyhow::anyhow!("connection error: HTTP 500 Internal Server Error <body preview>");
+        let spirit_endpoint = "http://test.local/a2a/test-agent";
+
+        // Exercise the real production helper — a regression that reverts to
+        // `.with_context()` (or any wrapper using `{e}` instead of `{e:#}`) will
+        // make this test fail.
+        let wrapped: anyhow::Error = wrap_send_error(&underlying, spirit_endpoint);
+
+        let visible = format!("{wrapped}");
+
+        // (a) Mask-through: the underlying reason must appear in the visible message.
+        assert!(
+            visible.contains("connection error"),
+            "visible error must surface underlying A2aError reason; got: {visible}"
+        );
+        assert!(
+            visible.contains("HTTP 500"),
+            "visible error must surface underlying HTTP status; got: {visible}"
+        );
+
+        // (b) Endpoint context preserved: the wrapper still names the URL for
+        // actionable "wrong endpoint" diagnosis.
+        assert!(
+            visible.contains(spirit_endpoint),
+            "visible error must surface endpoint URL; got: {visible}"
+        );
+
+        // (c) Anti-regression: the misleading pre-fix wrapper text must NOT appear.
+        // If a future change re-introduces `.with_context(|| "failed to reach mika-spirit... (is it running?)")`
+        // the substring below will show up in `visible` and this assertion will fail.
+        assert!(
+            !visible.contains("is it running?"),
+            "the misleading pre-fix 'is it running?' wrapper must not resurface; got: {visible}"
+        );
     }
 
     #[test]
