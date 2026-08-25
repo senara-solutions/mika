@@ -46,6 +46,32 @@ pub fn load_dotenv(home_dir: &Path) {
                 keys_from_file,
                 "loaded .env"
             );
+
+            // mika#1986 AC2 — silent-doublon detection. dotenvy loads
+            // last-wins on duplicate keys; the founding incident (2026-08-24
+            // Prime OAuth invalidation → 4h downtime) was a two-line
+            // `MIKA_ANTHROPIC_API_KEY` doublon (Rail A `sk-ant-api*` on
+            // line 2, Rail B `sk-ant-oat*` on line 3) that silently promoted
+            // the OAuth token and took the whole spirit down when the
+            // subscription grant was revoked. Emit a WARN per duplicate key
+            // so operators have a greppable signal — value NEVER logged
+            // (would leak the secret).
+            for (key, count) in count_duplicate_keys(&env_path) {
+                eprintln!(
+                    "dotenv_duplicate_key path={} key={} count={}",
+                    env_path.display(),
+                    key,
+                    count
+                );
+                warn!(
+                    target: "mika::env",
+                    event = "dotenv_duplicate_key",
+                    key = %key,
+                    count,
+                    path = %env_path.display(),
+                    "duplicate .env key — dotenvy last-wins may select unintended value"
+                );
+            }
         }
         Err(dotenvy::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
             // Pre-init durable channel (see fn docstring — A1 P0 fix).
@@ -187,8 +213,51 @@ fn env_file_contains_key(home_dir: &Path, key: &str) -> bool {
     false
 }
 
+/// Count non-comment lines with the same key. Returns a map of key → count
+/// containing ONLY keys that appear more than once (i.e. duplicates).
+///
+/// Parses the file as text (mirrors `env_file_contains_key`'s parser: strip
+/// whitespace, skip comments, split on first `=`, tolerate optional
+/// `export ` prefix). Returns an empty map if the file is missing or
+/// unreadable.
+///
+/// **Secret hygiene:** returns key + count only, never the value — used by
+/// `load_dotenv` to emit `dotenv_duplicate_key` WARN events that must not
+/// leak `.env` secrets into log sinks. (mika#1986 AC2)
+fn count_duplicate_keys(env_path: &Path) -> HashMap<String, usize> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let content = match std::fs::read_to_string(env_path) {
+        Ok(c) => c,
+        Err(_) => return HashMap::new(),
+    };
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        // Strip optional "export " prefix (dotenvy supports this syntax)
+        let trimmed = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+        if let Some((k, _)) = trimmed.split_once('=') {
+            *counts.entry(k.trim().to_string()).or_insert(0) += 1;
+        }
+    }
+    counts.retain(|_, count| *count > 1);
+    counts
+}
+
 /// Write or update a key in `{home_dir}/.env`. Creates the file if it doesn't exist.
 /// Sets file permissions to 0600 on Unix (secrets file).
+///
+/// **Dedup guarantee (mika#1986 AC1):** the output file contains AT MOST ONE
+/// line per key, regardless of the input file's state. If the input already
+/// has ≥2 lines matching `key`, the first is rewritten with the new value
+/// and the rest are dropped silently. This is defense-in-depth against the
+/// 2026-08-24 Prime OAuth founding incident: `~/.mika/.env` silently held
+/// a two-line `MIKA_ANTHROPIC_API_KEY` doublon (Rail A `sk-ant-api*` +
+/// Rail B `sk-ant-oat*`); `dotenvy` last-wins promoted the OAuth token,
+/// and when Anthropic revoked the subscription grant Prime went KO for ~4h.
+/// The single-key-case output is byte-identical to the pre-1986 impl —
+/// locked by `test_set_env_var_updates_existing`.
 pub fn set_env_var(home_dir: &Path, key: &str, value: &str) -> Result<()> {
     // Validate key: non-empty, ASCII alphanumeric or underscore
     if key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
@@ -201,7 +270,7 @@ pub fn set_env_var(home_dir: &Path, key: &str, value: &str) -> Result<()> {
 
     let env_path = home_dir.join(".env");
     let mut lines: Vec<String> = Vec::new();
-    let mut found = false;
+    let mut written = false;
 
     if let Ok(content) = std::fs::read_to_string(&env_path) {
         for line in content.lines() {
@@ -211,16 +280,22 @@ pub fn set_env_var(home_dir: &Path, key: &str, value: &str) -> Result<()> {
                 && let Some((k, _)) = trimmed.split_once('=')
                 && k.trim() == key
             {
-                let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
-                lines.push(format!("{key}=\"{escaped}\""));
-                found = true;
+                if !written {
+                    // First matching line → replace with new value.
+                    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+                    lines.push(format!("{key}=\"{escaped}\""));
+                    written = true;
+                }
+                // Subsequent matching lines → drop silently (dedup).
+                // Guarantees at-most-one line per key on write, closing the
+                // mika#1986 silent-doublon vector against future writes.
                 continue;
             }
             lines.push(line.to_string());
         }
     }
 
-    if !found {
+    if !written {
         let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
         lines.push(format!("{key}=\"{escaped}\""));
     }
@@ -423,6 +498,128 @@ mod tests {
         assert!(content.contains("# Comment"));
         // Should not have duplicate FOO
         assert_eq!(content.matches("FOO=").count(), 1);
+    }
+
+    /// mika#1986 AC1 — dedup pass in `set_env_var`. Founding-incident-shape
+    /// input: two lines for the same key with DIFFERENT values (the
+    /// 2026-08-24 Prime OAuth doublon carried Rail A `sk-ant-api*` on one
+    /// line and Rail B `sk-ant-oat*` on another; `dotenvy` last-wins
+    /// promoted the OAuth token silently). After a `set_env_var` write the
+    /// output MUST contain exactly ONE line for the key, carrying the new
+    /// value. Regression that pushes N replacements for N matching input
+    /// lines (the pre-fix behavior) would fail here.
+    #[test]
+    fn test_set_env_var_dedups_existing_duplicates() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".env"),
+            "MIKA_ANTHROPIC_API_KEY=old-a\nMIKA_ANTHROPIC_API_KEY=old-b\n",
+        )
+        .unwrap();
+
+        set_env_var(tmp.path(), "MIKA_ANTHROPIC_API_KEY", "new-value").unwrap();
+
+        let content = std::fs::read_to_string(tmp.path().join(".env")).unwrap();
+        assert_eq!(
+            content.matches("MIKA_ANTHROPIC_API_KEY=").count(),
+            1,
+            "set_env_var must dedup — exactly one line per key on write \
+             (got: {content:?})"
+        );
+        assert!(
+            content.contains("MIKA_ANTHROPIC_API_KEY=\"new-value\""),
+            "the surviving line must carry the new value (got: {content:?})"
+        );
+        assert!(
+            !content.contains("old-a") && !content.contains("old-b"),
+            "the dropped duplicate lines' old values must not appear \
+             (got: {content:?})"
+        );
+    }
+
+    /// mika#1986 AC3 — three-line duplicate + unrelated key + comment.
+    /// Locks the invariant that dedup only affects the target key: other
+    /// keys and comments are preserved verbatim.
+    #[test]
+    fn test_set_env_var_dedups_three_duplicates_preserves_others() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".env"),
+            "# Header comment\nDUPED=v1\nOTHER=untouched\nDUPED=v2\nDUPED=v3\n",
+        )
+        .unwrap();
+
+        set_env_var(tmp.path(), "DUPED", "final").unwrap();
+
+        let content = std::fs::read_to_string(tmp.path().join(".env")).unwrap();
+        assert_eq!(
+            content.matches("DUPED=").count(),
+            1,
+            "three duplicates must collapse to one (got: {content:?})"
+        );
+        assert!(
+            content.contains("DUPED=\"final\""),
+            "surviving line carries new value (got: {content:?})"
+        );
+        assert!(
+            content.contains("OTHER=untouched"),
+            "unrelated key must be preserved verbatim (got: {content:?})"
+        );
+        assert!(
+            content.contains("# Header comment"),
+            "comment must be preserved (got: {content:?})"
+        );
+    }
+
+    /// mika#1986 AC2/AC3 — `count_duplicate_keys` helper. The load-time
+    /// WARN emitter iterates this map; the helper must (a) detect the
+    /// doublon shape, (b) NOT emit unique keys, (c) skip comments and
+    /// blank lines, (d) tolerate the optional `export ` prefix.
+    #[test]
+    fn test_count_duplicate_keys_detects_multi_line_same_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env_path = tmp.path().join(".env");
+        std::fs::write(
+            &env_path,
+            "# comment\n\
+             MIKA_ANTHROPIC_API_KEY=one\n\
+             UNIQUE_KEY=single\n\
+             MIKA_ANTHROPIC_API_KEY=two\n\
+             export EXPORTED_DUP=a\n\
+             EXPORTED_DUP=b\n\
+             \n\
+             # trailing comment\n",
+        )
+        .unwrap();
+
+        let dups = count_duplicate_keys(&env_path);
+        assert_eq!(
+            dups.get("MIKA_ANTHROPIC_API_KEY").copied(),
+            Some(2),
+            "two-line doublon must be detected as count=2 (got: {dups:?})"
+        );
+        assert_eq!(
+            dups.get("EXPORTED_DUP").copied(),
+            Some(2),
+            "export prefix must not defeat detection (got: {dups:?})"
+        );
+        assert!(
+            !dups.contains_key("UNIQUE_KEY"),
+            "unique keys must NOT appear in the duplicates map \
+             (got: {dups:?})"
+        );
+    }
+
+    /// mika#1986 — `count_duplicate_keys` on a missing file is a silent
+    /// empty map (never panics, no I/O error propagated). Guards against
+    /// `load_dotenv` regressing to blow up on the AC2 path when
+    /// `dotenvy::from_path` succeeded but the file was raced out of
+    /// existence before the helper's own read.
+    #[test]
+    fn test_count_duplicate_keys_missing_file_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dups = count_duplicate_keys(&tmp.path().join(".env"));
+        assert!(dups.is_empty());
     }
 
     #[cfg(unix)]
