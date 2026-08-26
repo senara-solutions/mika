@@ -81,6 +81,14 @@ pub const SCENARIOS: &[RoleScenario] = &[
         weight: 1.0,
         expected_failure_classes_absent: &["ContractViolation"],
     },
+    RoleScenario {
+        id: "fire_disposition_gate",
+        description: "Detector-class plan missing `## Fire-Disposition` must produce ITERATE/ESCALATE with a finding citing the missing section (mika#1574)",
+        tags: &["contract", "fire-disposition-gate"],
+        flaky: false,
+        weight: 1.0,
+        expected_failure_classes_absent: &["ContractViolation"],
+    },
 ];
 
 /// Run a single mika-arch scenario against a real provider.
@@ -98,6 +106,7 @@ pub async fn run_scenario(scenario_id: &str, provider: Arc<dyn LlmProvider>) -> 
         "groomed_with_placeholder_path_rejected" => {
             run_groomed_with_placeholder_path_rejected(provider, start).await
         }
+        "fire_disposition_gate" => run_fire_disposition_gate(provider, start).await,
         _ => RoleScenarioResult::fail(
             scenario_id,
             FailureClass::Other("unknown scenario".to_string()),
@@ -785,6 +794,148 @@ async fn run_groomed_with_placeholder_path_rejected(
     }
 }
 
+/// Fire-Disposition Gate (mika#1574) — plan with a detector-class deliverable
+/// but no `## Fire-Disposition` section: the live architect must produce a
+/// blocking disposition (ITERATE/ESCALATE) with a finding naming the missing
+/// section. This is the durable prompt-adherence backstop the `MockLlmProvider`
+/// eval tests (Units 5–7) structurally cannot provide.
+async fn run_fire_disposition_gate(
+    provider: Arc<dyn LlmProvider>,
+    start: Instant,
+) -> RoleScenarioResult {
+    use mika_common::llm::types::{LlmContent, LlmMessage, LlmRequest, LlmRole};
+
+    let fixture =
+        include_str!("../../../tests/eval/calibration_fixtures/mika-arch/fire_disposition_gate.md");
+
+    let system =
+        include_str!("../../../../../skills/bundled/mika-arch-groom-ticket/system_prompt.md");
+
+    let request = LlmRequest {
+        model: provider.model_name().to_string(),
+        system: Some(system.to_string()),
+        messages: vec![LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::Text(format!(
+                "Review this plan for ticket mika#1574-test:\n\n{}",
+                fixture
+            )),
+        }],
+        tools: None,
+        max_tokens: 2000,
+        thinking: None,
+    };
+
+    match provider.send_message(&request).await {
+        Ok(response) => {
+            let text = response.text().to_string();
+            let latency = start.elapsed().as_millis() as u64;
+
+            if text.trim().is_empty() {
+                return RoleScenarioResult::fail(
+                    "fire_disposition_gate",
+                    FailureClass::EmptyResponse,
+                    "Empty response".to_string(),
+                    Some(response.usage.input_tokens),
+                    Some(response.usage.output_tokens),
+                    latency,
+                );
+            }
+
+            // Must NOT produce READY — the plan has a detector-class deliverable
+            // (a CI lint) but omits the `## Fire-Disposition` section.
+            let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+            let last_lines = &lines[lines.len().saturating_sub(3)..];
+            let has_ready = last_lines
+                .iter()
+                .any(|line| line.trim() == "Disposition: READY" || line.trim() == "Verdict: READY");
+
+            if has_ready {
+                return RoleScenarioResult::fail(
+                    "fire_disposition_gate",
+                    FailureClass::ContractViolation,
+                    "Detector plan missing `## Fire-Disposition` was approved as READY — \
+                     Fire-Disposition Gate failed"
+                        .to_string(),
+                    Some(response.usage.input_tokens),
+                    Some(response.usage.output_tokens),
+                    latency,
+                );
+            }
+
+            // Must produce ITERATE or ESCALATE (both are valid blocking dispositions).
+            let has_iterate_or_escalate = last_lines.iter().any(|line| {
+                let trimmed = line.trim();
+                trimmed == "Disposition: ITERATE"
+                    || trimmed == "Verdict: ITERATE"
+                    || trimmed == "Disposition: ESCALATE"
+                    || trimmed == "Verdict: ESCALATE"
+            });
+
+            if !has_iterate_or_escalate {
+                return RoleScenarioResult::fail(
+                    "fire_disposition_gate",
+                    FailureClass::ContractViolation,
+                    format!(
+                        "Expected ITERATE or ESCALATE for detector plan missing fire-disposition, \
+                         got last lines: {:?}",
+                        last_lines
+                    ),
+                    Some(response.usage.input_tokens),
+                    Some(response.usage.output_tokens),
+                    latency,
+                );
+            }
+
+            // Must have at least one finding (F1:) naming the missing section.
+            let has_findings = text.contains("F1:");
+            if !has_findings {
+                return RoleScenarioResult::fail(
+                    "fire_disposition_gate",
+                    FailureClass::ContractViolation,
+                    "ITERATE/ESCALATE without an F-list finding naming the missing \
+                     `## Fire-Disposition` section"
+                        .to_string(),
+                    Some(response.usage.input_tokens),
+                    Some(response.usage.output_tokens),
+                    latency,
+                );
+            }
+
+            // The finding must reference the fire-disposition concern (keys off the
+            // concept, not free-text wording — non-flaky per the same standard as
+            // `tbd_rejection_scenarios_are_not_flaky`).
+            let lower = text.to_lowercase();
+            let cites_fire_disposition =
+                lower.contains("fire-disposition") || lower.contains("fire disposition");
+
+            if !cites_fire_disposition {
+                return RoleScenarioResult::fail(
+                    "fire_disposition_gate",
+                    FailureClass::ContractViolation,
+                    "Blocking disposition without a finding citing the fire-disposition concern"
+                        .to_string(),
+                    Some(response.usage.input_tokens),
+                    Some(response.usage.output_tokens),
+                    latency,
+                );
+            }
+
+            RoleScenarioResult::pass(
+                "fire_disposition_gate",
+                response.usage.input_tokens,
+                response.usage.output_tokens,
+                latency,
+            )
+        }
+        Err(e) => llm_error_result(
+            "fire_disposition_gate",
+            e,
+            start.elapsed().as_millis() as u64,
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -929,11 +1080,11 @@ mod tests {
     // --- Scenario metadata ---
 
     #[test]
-    fn scenario_count_is_eight() {
+    fn scenario_count_is_nine() {
         assert_eq!(
             SCENARIOS.len(),
-            8,
-            "mika-arch should have 8 calibration scenarios (5 original + 3 TBD-gate)"
+            9,
+            "mika-arch should have 9 calibration scenarios (5 original + 3 TBD-gate + 1 fire-disposition-gate)"
         );
     }
 
@@ -964,5 +1115,74 @@ mod tests {
                 scenario.id
             );
         }
+    }
+
+    // --- Fire-Disposition Gate (mika#1574) ---
+
+    #[test]
+    fn fire_disposition_gate_scenario_present_with_correct_tags() {
+        let scenarios: Vec<_> = SCENARIOS
+            .iter()
+            .filter(|s| s.tags.contains(&"fire-disposition-gate"))
+            .collect();
+        assert_eq!(
+            scenarios.len(),
+            1,
+            "Expected exactly 1 fire-disposition-gate tagged scenario"
+        );
+        assert_eq!(scenarios[0].id, "fire_disposition_gate");
+        assert!(
+            !scenarios[0].flaky,
+            "Fire-disposition-gate scenario must not be marked flaky — it's a hard contract"
+        );
+    }
+
+    #[test]
+    fn fixture_fire_disposition_gate_has_detector_and_no_section() {
+        let fixture = include_str!(
+            "../../../tests/eval/calibration_fixtures/mika-arch/fire_disposition_gate.md"
+        );
+        // The fixture must describe a detector-class deliverable (a lint) ...
+        assert!(
+            fixture.to_lowercase().contains("lint"),
+            "Fire-disposition fixture must describe a detector-class deliverable"
+        );
+        // ... and must NOT already carry the section under test.
+        assert!(
+            !fixture.contains("## Fire-Disposition"),
+            "Fire-disposition fixture must omit the `## Fire-Disposition` section \
+             so the gate has something to catch"
+        );
+        // Must carry an Acceptance criteria section so the AC gate (mika#1559) does
+        // not confound the scenario's blocking disposition.
+        assert!(
+            fixture.contains("## Acceptance criteria"),
+            "Fire-disposition fixture must carry an `## Acceptance criteria` section"
+        );
+        // Must be TBD-free so the Unresolved-Decision gate (mika#1244) does not confound.
+        assert!(
+            !fixture.contains("TBD") && !fixture.contains("<path>"),
+            "Fire-disposition fixture must be free of TBDs and placeholder paths"
+        );
+    }
+
+    #[test]
+    fn groom_ticket_prompt_contains_fire_disposition_gate() {
+        let prompt =
+            include_str!("../../../../../skills/bundled/mika-arch-groom-ticket/system_prompt.md");
+        assert!(
+            prompt.contains("Fire-Disposition Gate (mika#1574)"),
+            "groom-ticket system prompt must contain the Fire-Disposition Gate section (mika#1574)"
+        );
+    }
+
+    #[test]
+    fn second_review_prompt_contains_fire_disposition_gate() {
+        let prompt =
+            include_str!("../../../../../skills/bundled/mika-arch-second-review/system_prompt.md");
+        assert!(
+            prompt.contains("Fire-Disposition Gate (mika#1574)"),
+            "second-review system prompt must contain the Fire-Disposition Gate section (mika#1574)"
+        );
     }
 }

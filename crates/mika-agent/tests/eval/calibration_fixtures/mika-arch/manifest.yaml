@@ -103,3 +103,17 @@ scenarios:
       - false_approval
       - missing_disposition
       - missing_findings
+
+  - id: fire_disposition_gate
+    fixture: fire_disposition_gate.md
+    tags: [grooming, fire-disposition-gate, single-ticket]
+    flaky: false
+    weight: 2.0
+    description: >
+      Plan with a detector-class deliverable (a CI lint) but no
+      "## Fire-Disposition" section. Model must produce a blocking disposition
+      (ITERATE/ESCALATE) with a finding citing the missing section (mika#1574).
+    expected_failure_classes_absent:
+      - false_approval
+      - missing_disposition
+      - missing_findings
