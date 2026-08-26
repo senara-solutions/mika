@@ -63,6 +63,7 @@ fn make_groom_ticket_skill() -> SkillEntry {
                 timeout_secs: 120,
                 dependencies: vec![],
                 max_prompt_size: None,
+                data_grade: Default::default(),
             },
             triggers: Triggers {
                 keywords: vec![
