@@ -381,6 +381,58 @@ fn cpp_root_artifacts_are_mechanical() {
 }
 
 #[test]
+fn mika_root_dependency_manifests_are_mechanical() {
+    // mika#1729: Dependabot-managed workspace-root manifests — Rust equivalents
+    // of cpp's pyproject.toml / uv.lock. Exact-match (root-only) so the
+    // autonomous Dependabot review chain clears the forge-gate for a root
+    // dependency bump (AC4).
+    for path in ["Cargo.toml", "Cargo.lock"] {
+        assert_eq!(classify_path(path), Classification::Mechanical, "{path}");
+    }
+}
+
+#[test]
+fn mika_nested_cargo_manifests_stay_decision_core() {
+    // mika#1729: exact-match is deliberately root-only. A member-crate manifest
+    // (or any nested Cargo.toml/Cargo.lock) must fail-closed to DECISION-CORE —
+    // a prefix/suffix rule would open an auto-merge bypass for decision-core PRs.
+    for path in [
+        "crates/mika-agent/Cargo.toml",
+        "crates/mika-common/Cargo.toml",
+        "crates/mika-agent/Cargo.lock",
+    ] {
+        assert_eq!(
+            classify_path(path),
+            Classification::DecisionCore,
+            "nested manifest must fail-closed to DECISION-CORE: {path}"
+        );
+    }
+}
+
+#[test]
+fn mika_root_cargo_bump_pr_classifies_mechanical() {
+    // The common grouped-minor/patch Dependabot shape on a
+    // `[workspace.dependencies]`-centric workspace: root manifest + lockfile
+    // only. This is the AC4 happy path — auto-merge clears the forge-gate.
+    let files = vec!["Cargo.toml".to_string(), "Cargo.lock".to_string()];
+    let result = classify_pr_files(&files);
+    assert_eq!(result.verdict, Classification::Mechanical);
+    assert_eq!(result.mechanical_files.len(), 2);
+    assert!(result.decision_core_files.is_empty());
+}
+
+#[test]
+fn mika_dependabot_workflow_bump_stays_decision_core() {
+    // github-actions ecosystem Dependabot PRs touch `.github/workflows/*.yml`,
+    // which is NOT on the MECHANICAL allowlist (workflows carry secrets /
+    // permissions surface). Deliberately operator-gated (mika#1729): a workflow
+    // bump routes to the operator rather than auto-merging.
+    let files = vec![".github/workflows/ci.yml".to_string()];
+    let result = classify_pr_files(&files);
+    assert_eq!(result.verdict, Classification::DecisionCore);
+}
+
+#[test]
 fn cpp_docs_solutions_and_plans_are_mechanical() {
     // cpp shares `docs/solutions/` and `docs/plans/` with mika; already
     // covered by the shared MECHANICAL_PREFIXES. Assert cpp paths get the
