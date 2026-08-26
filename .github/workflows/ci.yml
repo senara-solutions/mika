@@ -53,7 +53,7 @@ jobs:
             pgrep -af 'Runner\.|actions-runner' 2>&1 | head -5 || true
           } 2>&1
         continue-on-error: true
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - name: Install rustup if missing (self-hosted runner)
         run: |
           if ! command -v rustup &>/dev/null; then
@@ -95,7 +95,7 @@ jobs:
     name: Dashboard
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f  # v6
         with:
           node-version-file: '.node-version'
@@ -115,7 +115,7 @@ jobs:
       run:
         working-directory: docs-site
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f  # v6
         with:
           node-version-file: '.node-version'
@@ -133,7 +133,7 @@ jobs:
        !startsWith(github.head_ref, 'release/') &&
        !startsWith(github.head_ref, 'release-please--'))
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - name: Check crate-local docs are in sync
         run: |
           bash scripts/sync-agent-docs.sh
@@ -149,7 +149,7 @@ jobs:
     name: Byte Slice Lint
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - name: Check for unsafe byte-slice patterns
         run: bash scripts/check-byte-slices.sh
 
@@ -157,7 +157,7 @@ jobs:
     name: Loop Select Lint
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - name: Reject tokio::select! inside run_loop (mika#848)
         run: bash scripts/check-loop-select.sh
 
@@ -165,7 +165,7 @@ jobs:
     name: Egress Uniqueness Lint
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - name: Enforce single-controlled search egress (mika#1807 AC4)
         run: bash scripts/verify-egress-uniqueness.sh
 
@@ -173,7 +173,7 @@ jobs:
     name: Voice Non-Transit Lint
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - name: Enforce testimony-lane non-transit invariant (mika#1796)
         # No-op until mika#1787 lands the testimony subtree; enforcing on
         # every subsequent PR. Same shape as egress-uniqueness-lint above.
@@ -183,7 +183,7 @@ jobs:
     name: Egress Request Shape Lint
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - name: Enforce E3 dé-liage identité↔requête (mika#1809)
         run: bash scripts/verify-egress-request-shape.sh
 
@@ -191,7 +191,7 @@ jobs:
     name: Egress No-Log Lint
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - name: Enforce no-log discipline on egress substrate (mika#1810 E4)
         run: bash scripts/verify-egress-no-log.sh
 
@@ -203,7 +203,7 @@ jobs:
       !startsWith(github.head_ref, 'release/') &&
       !startsWith(github.head_ref, 'release-please--')
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
         with:
           fetch-depth: 0
       - name: Verify pipeline artifacts
@@ -224,7 +224,7 @@ jobs:
       images-relevant: ${{ steps.filter.outputs.images-relevant }}
       os-relevant: ${{ steps.filter.outputs.os-relevant }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - uses: dorny/paths-filter@v3
         id: filter
         with:
@@ -253,7 +253,7 @@ jobs:
           - dockerfile: Dockerfile.gateway
             tag: mika-gateway
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2  # v3
       - name: Build ${{ matrix.tag }}
@@ -294,7 +294,7 @@ jobs:
             target: mika-runtime-all
             tag: mika-runtime-all
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2  # v3
       - name: Build ${{ matrix.tag }}
@@ -330,7 +330,7 @@ jobs:
       group: docker-canari-cli-${{ github.ref }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2  # v3
       - name: Login to GHCR
@@ -367,7 +367,7 @@ jobs:
     name: Security
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - name: Install Rust toolchain
         run: rustup show  # reads rust-toolchain.toml
       - name: Install security tools
