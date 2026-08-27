@@ -862,15 +862,29 @@ _committed_plan_on_branch() {
         | sed -n 's/^> - \*\*Plan:\*\* *`\([^`]*\)`.*/\1/p' | head -1)
     [ -n "$plan_path" ] || return 1
 
-    # Fetch the dispatch branch itself. A branch that does not exist on the
-    # remote cannot carry a committed plan — grooming is legitimate.
-    git -C "$sub_repo_dir" fetch --quiet origin "refs/heads/${branch}" 2>/dev/null || return 1
+    # Fetch the dispatch branch into a BRANCH-NAMED ref, never FETCH_HEAD.
+    #
+    # FETCH_HEAD is a single file in $GIT_DIR shared by every process touching
+    # this checkout. mika#1001 allows one `implement` and one `groom` dispatch to
+    # run concurrently per agent against the same sub-repo, so a sibling fetch
+    # can overwrite FETCH_HEAD between our fetch and our cat-file. We would then
+    # test the plan against the WRONG branch's tree — and the dangerous direction
+    # is the false positive: refusing a legitimate grooming because some other
+    # branch happens to carry a file at that path strands the ticket entirely.
+    # A ref keyed on the branch name is deterministic; two dispatches on the same
+    # branch write the same ref with the same content, which is benign.
+    #
+    # A branch that does not exist on the remote cannot carry a committed plan —
+    # grooming is legitimate, so return 1.
+    local gate_ref="refs/dispatch-gate/${branch}"
+    git -C "$sub_repo_dir" fetch --quiet --force origin \
+        "refs/heads/${branch}:${gate_ref}" 2>/dev/null || return 1
 
     # The callout carries two historical shapes: repo-prefixed
     # (`mika/docs/plans/…`) and repo-relative (`docs/plans/…`). Try both — U3
     # normalizes new writes, but tickets groomed before it keep the old form.
     for candidate in "$plan_path" "${plan_path#"${repo}/"}"; do
-        if git -C "$sub_repo_dir" cat-file -e "FETCH_HEAD:${candidate}" 2>/dev/null; then
+        if git -C "$sub_repo_dir" cat-file -e "${gate_ref}:${candidate}" 2>/dev/null; then
             printf '%s' "$candidate"
             return 0
         fi
@@ -2660,7 +2674,11 @@ _write_canonical_callout() {
     # on mika#1962 (2 blocks) — the previous `\(GROOMED\)` required an immediate
     # closing paren and therefore missed the canonical
     # `second-pass (GROOMED — session-id: …)` shape the writer itself emits.
-    has_verdict=$(printf '%s' "$current_body" | grep -cE 'second-pass \(GROOMED[[:space:])._,;:—-]|second-pass \(READY, paraphrased GROOMED|first-pass \(READY, single-pass GROOMED' || true)
+    # Character class mirrors Rust's `[\s\)\.,;:—-]` exactly — no member added,
+    # none dropped. (`—` is multi-byte: under a UTF-8 locale it is one class
+    # member; under LC_ALL=C its three bytes become three members, which only
+    # widens acceptance and so cannot produce a false negative.)
+    has_verdict=$(printf '%s' "$current_body" | grep -cE 'second-pass \(GROOMED[[:space:]).,;:—-]|second-pass \(READY, paraphrased GROOMED|first-pass \(READY, single-pass GROOMED' || true)
 
     if [ "$has_branch" -gt 0 ] && [ "$has_plan" -gt 0 ] && [ "$has_verdict" -gt 0 ]; then
         echo "write_canonical_callout: dispatch-gate signals already present in $REPO#$ISSUE_NUM body — skipping (idempotent)" >&2
@@ -2687,12 +2705,24 @@ CALLOUT_EOF
     # named. Measured on mika#1962: 2 stacked blocks, the older one carrying no
     # verdict at all.
     #
-    # Strip any existing callout lines first, then drop the blank lines they
-    # leave behind at the top, then prepend the single authoritative block.
+    # Strip existing callout lines from the PREAMBLE ONLY, then prepend the
+    # single authoritative block.
+    #
+    # Preamble-scoped, not whole-body: a callout line is structurally always at
+    # the top of the body, but the same text can legitimately appear lower down
+    # inside a fenced block — a ticket that documents the callout format quotes
+    # these exact lines. mika#2012's own issue body does. A body-wide `grep -v`
+    # would silently delete that documentation while "fixing" a formatting bug.
+    # We stop stripping at the first line that is neither a callout nor blank,
+    # which also absorbs the blank lines between stacked blocks.
     local stripped_body
-    stripped_body=$(printf '%s' "$current_body" \
-        | grep -vE '^> - \*\*(Branch|Plan|Grooming history):\*\*' \
-        | sed '/./,$!d')
+    stripped_body=$(printf '%s' "$current_body" | awk '
+        BEGIN { preamble = 1 }
+        preamble && /^> - \*\*(Branch|Plan|Grooming history):\*\*/ { next }
+        preamble && /^[[:space:]]*$/ { next }
+        { preamble = 0 }
+        { print }
+    ')
 
     local new_body
     new_body=$(printf '%s\n\n%s' "$callout_block" "$stripped_body")

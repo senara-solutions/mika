@@ -794,7 +794,7 @@ rm -rf "$CC_UNKNOWN_TMP"
 # Pin: the writer's idempotency pattern must stay in lockstep with executor.rs's
 # three verdict regexes. Drift is not cosmetic — a form the gate accepts but this
 # check misses makes the writer prepend a SECOND callout on every pass.
-assert_contains "idempotency check knows canonical GROOMED (delimiter-tolerant)" 'second-pass \(GROOMED[[:space:])._,;:—-]' "$WRITER_SRC"
+assert_contains "idempotency check knows canonical GROOMED (delimiter-tolerant)" 'second-pass \(GROOMED[[:space:]).,;:—-]' "$WRITER_SRC"
 assert_contains "idempotency check knows paraphrased GROOMED" 'second-pass \(READY, paraphrased GROOMED' "$WRITER_SRC"
 assert_contains "idempotency check knows single-pass GROOMED" 'first-pass \(READY, single-pass GROOMED' "$WRITER_SRC"
 
@@ -839,6 +839,62 @@ assert_not_contains "stripping drops the stale plan path" 'stale-plan.md' "$STRI
 # Path discipline: the body must carry a repo-relative path that exists.
 assert_contains "writer refuses a plan outside the worktree" 'write_canonical_callout_plan_outside_worktree' "$WRITER_SRC"
 assert_contains "writer refuses a plan file that is absent" 'write_canonical_callout_plan_missing' "$WRITER_SRC"
+
+# Review finding: the character class must mirror Rust's exactly. An extra
+# member is not harmless — a body the writer thinks is stamped but the gate
+# rejects re-groom-loops the ticket, which is #2012 in mirror image.
+assert_not_contains "verdict class carries no member Rust lacks (underscore)" 'GROOMED[[:space:])._' "$WRITER_SRC"
+
+# Review finding: the strip is preamble-scoped. A ticket that DOCUMENTS the
+# callout format quotes these exact lines lower in the body — mika#2012's own
+# issue does. A body-wide grep -v would delete that documentation.
+DOCUMENTING_BODY='> - **Branch:** `fix/2012/gate`
+> - **Plan:** `docs/plans/p.md` (committed on branch @ `abc1234`)
+> - **Grooming history:** first-pass (READY, single-pass GROOMED) — session-id: x
+
+## Symptom
+The writer emits this shape:
+
+```
+> - **Branch:** `<branch>`
+> - **Plan:** `<path>`
+> - **Grooming history:** <verdict>
+```
+
+That block must survive body rewrites.'
+PREAMBLE_STRIPPED=$(printf '%s' "$DOCUMENTING_BODY" | awk '
+    BEGIN { preamble = 1 }
+    preamble && /^> - \*\*(Branch|Plan|Grooming history):\*\*/ { next }
+    preamble && /^[[:space:]]*$/ { next }
+    { preamble = 0 }
+    { print }
+')
+assert_eq "fixture carries 6 callout-shaped lines (3 preamble + 3 documented)" "6" \
+    "$(printf '%s' "$DOCUMENTING_BODY" | grep -cE '^> - \*\*(Branch|Plan|Grooming history):\*\*' || true)"
+assert_eq "documented callout lines inside the body SURVIVE the strip" "3" \
+    "$(printf '%s' "$PREAMBLE_STRIPPED" | grep -cE '^> - \*\*(Branch|Plan|Grooming history):\*\*' || true)"
+assert_contains "documenting body keeps its prose" 'must survive body rewrites' "$PREAMBLE_STRIPPED"
+assert_contains "writer uses the preamble-scoped strip" 'preamble = 1' "$WRITER_SRC"
+
+# The stacked-body case must still fully strip under the preamble-scoped rule.
+STACKED_PREAMBLE_OUT=$(printf '%s' "$STACKED_BODY" | awk '
+    BEGIN { preamble = 1 }
+    preamble && /^> - \*\*(Branch|Plan|Grooming history):\*\*/ { next }
+    preamble && /^[[:space:]]*$/ { next }
+    { preamble = 0 }
+    { print }
+')
+assert_eq "preamble strip still clears BOTH stacked blocks" "0" \
+    "$(printf '%s' "$STACKED_PREAMBLE_OUT" | grep -cE '^> - \*\*(Branch|Plan|Grooming history):\*\*' || true)"
+assert_contains "preamble strip preserves content after stacked blocks" '## Symptom' "$STACKED_PREAMBLE_OUT"
+
+# Review finding: the gate must not read FETCH_HEAD. It is a single file shared
+# by every process on the checkout, and mika#1001 allows a concurrent
+# implement+groom pair on the same sub-repo. A sibling fetch between our fetch
+# and our cat-file would test the wrong branch's tree.
+PLAN_GATE_SRC=$(declare -f _committed_plan_on_branch)
+assert_not_contains "gate does not read the shared FETCH_HEAD" 'FETCH_HEAD' "$PLAN_GATE_SRC"
+assert_contains "gate fetches into a branch-named ref" 'refs/dispatch-gate/' "$PLAN_GATE_SRC"
 
 # ----------------------------------------------------------------------------
 # Redundant-groom refusal gate (mika#2012)
