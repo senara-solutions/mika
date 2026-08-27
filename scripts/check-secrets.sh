@@ -65,9 +65,13 @@ if [[ "${1:-}" == "--changed" ]]; then
         exit 2
     fi
     merge_base="$(git merge-base "$base_ref" HEAD)"
-    while IFS= read -r f; do
+    # `-z` (NUL-delimited) is load-bearing, not style: without it git renders a
+    # non-ASCII path as a C-quoted string (`"s\303\251cret.rs"`), which no longer
+    # names a file on disk. The scanner would then skip it as "not present" and
+    # report the change set clean — a silent miss in a security net (mika#1689).
+    while IFS= read -r -d '' f; do
         [[ -n "$f" ]] && FILES+=("$f")
-    done < <(git diff --name-only --diff-filter=ACM "$merge_base"..HEAD)
+    done < <(git diff -z --name-only --diff-filter=ACM "$merge_base"..HEAD)
 else
     FILES=("$@")
 fi
@@ -79,6 +83,7 @@ if [[ ${#FILES[@]} -eq 0 ]]; then
 fi
 
 VIOLATIONS=0
+SCANNED=0
 
 # Secret glob scope — parity with lefthook's no-secrets glob (excludes lefthook*.yml).
 is_secret_scannable() {
@@ -94,15 +99,30 @@ is_secret_scannable() {
 
 for f in "${FILES[@]}"; do
     # Deleted files can surface in a raw diff even with --diff-filter=ACM guarding
-    # (belt & suspenders). Skip anything not present on disk.
-    [[ -f "$f" ]] || continue
+    # (belt & suspenders). Skip anything not present on disk, but say so — a
+    # silent skip in a security net reads as "scanned and clean".
+    if [[ ! -f "$f" ]]; then
+        echo "check-secrets: skipping $f — not a regular file on disk"
+        continue
+    fi
+    SCANNED=$((SCANNED + 1))
 
     # --- Secret check (glob-scoped, allowlist-filtered) ---
     if is_secret_scannable "$f"; then
-        match="$(grep -nE "$SECRET_REGEX" "$f" 2>/dev/null | grep -v 'TEST_RSA_PEM' | grep -v 'secret_scrubber' || true)"
+        # The `grep -v` excludes run against `<path>:<line>:<content>` — the exact
+        # shape lefthook's `grep -rn ... {staged_files}` produced. That matters:
+        # the excludes were path-scoped as well as content-scoped, so
+        # `crates/mika-agent/src/secret_scrubber.rs` (whose test fixtures are
+        # deliberately secret-shaped) passed as a whole. Scanning file-by-file
+        # drops the path from grep's output, so it is re-prefixed here; without
+        # that, every PR touching the scrubber's own tests fails the gate.
+        match="$(grep -nE "$SECRET_REGEX" "$f" 2>/dev/null \
+            | sed "s|^|$f:|" \
+            | grep -v 'TEST_RSA_PEM' \
+            | grep -v 'secret_scrubber' || true)"
         if [[ -n "$match" ]]; then
             while IFS= read -r hit; do
-                echo "ERROR: potential secret in $f:$hit"
+                echo "ERROR: potential secret in $hit"
             done <<< "$match"
             VIOLATIONS=$((VIOLATIONS + 1))
         fi
@@ -120,10 +140,10 @@ done
 
 if [[ $VIOLATIONS -gt 0 ]]; then
     echo ""
-    echo "check-secrets: found $VIOLATIONS violation(s) — see errors above."
+    echo "check-secrets: $VIOLATIONS of $SCANNED scanned file(s) carry violations — see errors above."
     echo "Secret patterns and the 1MB cap are defined in scripts/check-secrets.sh (single source of truth)."
     exit 1
 fi
 
-echo "check-secrets: scanned ${#FILES[@]} file(s) — clean."
+echo "check-secrets: scanned $SCANNED of ${#FILES[@]} file(s) in the set — clean."
 exit 0
