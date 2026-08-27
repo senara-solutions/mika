@@ -110,6 +110,52 @@ have a single home.
 
 ---
 
+## Fire-Disposition
+
+This plan ships **detector-class deliverables** — a secret scanner and a 1 MB large-file scanner
+(`scripts/check-secrets.sh`) wired into a new CI `secret-scan` job. Per the Fire-Disposition Gate
+(mika#1574), the disposition when a detector fires must be declared against the canonical three-option
+schema: **(a) named allowlist exception**, **(b) land-disabled**, **(c) halt-and-surface**. The two
+detectors have deliberately *different* dispositions because their false-positive economics differ:
+
+**Rollout-firing is structurally prevented, not merely mitigated.** Both detectors are diff-scoped
+(D3/R4): they scan only the PR's changed set (`--diff-filter=ACM` vs merge-base with `origin/main`),
+never the pre-existing tree. A secret or oversized blob already committed to `main` therefore *cannot*
+fire on an unrelated PR — the class of false positive the gate is most concerned about (detector firing
+on legacy data) is closed by construction. The dispositions below govern the residual case: a detector
+firing on a file the PR itself adds/modifies.
+
+- **Secret detector → (c) halt-and-surface.** A secret in a *changed* file is the exact event this net
+  exists to catch; failing the CI job (`exit 1`, R6) is the intended outcome, not a false positive.
+  There is **no content allowlist for real secrets** — the only excludes are the two lefthook-parity
+  pattern excludes (`TEST_RSA_PEM`, `secret_scrubber`, D6/R5), which suppress *known test/scrubber
+  fixtures*, not live credentials. If a genuine secret is flagged, the author rotates the credential and
+  removes it; the gate does not offer a bypass. This is a `halt-and-surface` posture: block the PR,
+  surface the offending `file:line` and pattern class, require human remediation.
+
+- **Large-file detector → (a) named allowlist exception.** Unlike secrets, a legitimately-large file
+  (e.g. a test fixture, a golden binary) is a real, occasionally-valid need. The disposition is an
+  **explicit, named allowlist**, not a blanket bypass:
+  - The script carries a `LARGE_FILE_ALLOWLIST` array, **empty at rollout** (diff-scoping means no
+    existing fixture forces an entry on the first PR through the gate — see D3).
+  - When a PR legitimately needs a file over the 1 MB cap, the author adds that file's exact path to
+    the array as a **named** entry with an inline comment stating *why* it is exempt and a tracker
+    reference. A path not in the array still halts (`exit 1`). This keeps every exception auditable in
+    one reviewed place rather than via an ad-hoc `--no-verify`-style escape.
+  - **Follow-up tracker:** no allowlist entry exists or is required at rollout, so no tracker is filed
+    now (filing a placeholder issue for a not-yet-needed exception would violate the filing-discipline
+    invariant). The **first** PR that adds an allowlist entry MUST accompany it with a one-line
+    follow-up issue naming the file and the reason, referenced in the inline comment — the exception is
+    never silent. The separately-deferred whole-tree secret sweep (D3) remains the standing posture
+    follow-up if a stronger net is ever wanted.
+
+**Why not land-disabled (b):** neither detector is speculative or high-churn — both replicate a net that
+already ran per-commit via lefthook and was proven stable there. Landing them disabled would recreate
+the exact gap mika#1689 closes (a net that exists but does not run on the rescue path). They land
+**active**.
+
+---
+
 ## Implementation steps
 
 1. **Create `scripts/check-secrets.sh`** (`chmod +x`, `#!/usr/bin/env bash`, `set -euo pipefail`),
@@ -121,8 +167,13 @@ have a single home.
      .env`), drop `lefthook*.yml`; `grep -nE '<regex>'` over the survivors, pipe through
      `grep -v 'TEST_RSA_PEM' | grep -v 'secret_scrubber'`; any surviving match → print
      `ERROR: potential secret in <file>:<line>` and set a violation flag.
-   - **Large-file check:** for every file in the set, `wc -c`; `> 1048576` → print
-     `ERROR: <file> is <N>KB — exceeds 1MB limit` and set the flag.
+   - **Large-file check:** declare a `LARGE_FILE_ALLOWLIST` array near the top of the script, **empty at
+     rollout** with a header comment documenting the named-exception contract (Fire-Disposition (a): each
+     entry is an exact path + inline `# why + tracker` comment). For every file in the set, skip it if
+     its path is a member of `LARGE_FILE_ALLOWLIST`; otherwise `wc -c` and, if `> 1048576`, print
+     `ERROR: <file> is <N>KB — exceeds 1MB limit (add to LARGE_FILE_ALLOWLIST with a named reason if legitimate)`
+     and set the flag. The allowlist is consulted identically in explicit-file and `--changed` modes, so
+     lefthook and CI honor the same named exceptions (single-source, R3/D1).
    - Skip non-existent paths (deleted files can appear in a raw diff even with `ACM` guarding — belt &
      suspenders). Exit 1 if any violation, else 0. Print a one-line "clean" summary on success.
 
@@ -175,6 +226,10 @@ have a single home.
 - **VC8 — workflow parses:** `actionlint .github/workflows/ci.yml` (if available) or a YAML load of the
   job; confirm `secret-scan` appears and uses the pinned checkout SHA.
 - **VC9 — shellcheck clean** on `scripts/check-secrets.sh`.
+- **VC10 — large-file allowlist honored (Fire-Disposition (a)):** with a temporary `LARGE_FILE_ALLOWLIST`
+  entry for `/tmp/big.json`, re-running VC4's oversized-file scan → exit 0 (the named exception passes);
+  removing the entry restores exit 1. Confirms the exception path is exact-path-scoped and not a blanket
+  size bypass.
 
 ---
 
@@ -209,6 +264,10 @@ issue body has no `## Acceptance criteria` section.
 - **AC6** — `lefthook run pre-commit` remains green after the refactor. (VC7)
 - **AC7** — No new third-party GitHub Action dependency; the job matches the repo's existing
   `scripts/check-*.sh` lint-job pattern. (R7, D4/D5, VC8)
+- **AC8** — Fire-Disposition honored: a real secret in a changed file halts the job with no content
+  allowlist (halt-and-surface); an oversized changed file halts *unless* its exact path is a named
+  `LARGE_FILE_ALLOWLIST` entry (named-exception), which is empty at rollout. (Fire-Disposition section,
+  VC10)
 
 ---
 
@@ -221,3 +280,17 @@ issue body has no `## Acceptance criteria` section.
 - **`origin/main` unresolvable in CI** — mitigated by `fetch-depth: 0` (same as `pipeline-artifacts`).
 - **Whole-tree secrets not scanned** — accepted non-goal (D3); the pre-commit hook has kept the tree
   clean historically, and a full sweep is a separable follow-up if posture demands it.
+
+---
+
+## Revision history
+
+- rev 2 (2026-08-04): addressed F1 (BLOCKING, Fire-Disposition Gate mika#1574) by adding a
+  `## Fire-Disposition` section declaring both detectors against the canonical three-option schema —
+  secret detector = **(c) halt-and-surface** (no content allowlist for live credentials), large-file
+  detector = **(a) named allowlist exception** via a `LARGE_FILE_ALLOWLIST` array (empty at rollout,
+  each entry an exact path + inline reason + tracker), with rollout-firing shown to be structurally
+  prevented by the existing diff-scoping (D3/R4) rather than merely mitigated. Anchored the allowlist
+  mechanism concretely in Implementation step 1, added VC10 (allowlist-honored test) and AC8
+  (fire-disposition parity), and recorded that no follow-up tracker is filed until the first real
+  allowlist entry is added (filing-discipline: no placeholder issues).
