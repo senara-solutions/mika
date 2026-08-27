@@ -35,6 +35,7 @@ pass-through path.
 from __future__ import annotations
 
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -146,3 +147,64 @@ def requestheaders(flow: http.HTTPFlow) -> None:
         flow.request.headers["anthropic-beta"] = ",".join(beta_values)
     else:
         flow.request.headers["anthropic-beta"] = _OAUTH_BETA
+
+
+# ---------------------------------------------------------------------------
+# Upstream-status visibility on the CONNECT path (mika#1901)
+#
+# The egress-proxy front sees only ciphertext for a CONNECT-tunnelled request,
+# so this addon is the ONLY place a status code is readable on this path.
+# Without the hook below, a 429 arriving here reproduces exactly the silence
+# that cost a day on 2026-08-06: the pilot stalls, the guardrail kills it as an
+# idle timeout, and nothing in any log says why.
+#
+# The line shapes match scripts/mika-pilot-egress-proxy deliberately — one grep
+# for RATE_LIMITED covers both doors to Anthropic.
+# ---------------------------------------------------------------------------
+
+# Same allowlist as the reverse proxy. Duplicated rather than imported because
+# mitmproxy loads this file as a standalone script with no package context.
+_QUOTA_HEADER_NAMES = frozenset({"retry-after", "request-id"})
+_QUOTA_HEADER_PREFIX = "anthropic-ratelimit-"
+
+
+def _select_quota_headers(headers) -> list[tuple[str, str]]:
+    """Allowlisted quota headers, in upstream order and upstream casing.
+
+    Allowlist-driven: a header this function does not name can never reach a
+    log line, so an Authorization value cannot leak through a future upstream
+    change.
+    """
+    selected: list[tuple[str, str]] = []
+    for name, value in headers.items():
+        lowered = name.lower()
+        if lowered in _QUOTA_HEADER_NAMES or lowered.startswith(_QUOTA_HEADER_PREFIX):
+            selected.append((name, value))
+    return selected
+
+
+def responseheaders(flow: http.HTTPFlow) -> None:
+    """Called when response HEADERS arrive — before the body is read.
+
+    Read-only by contract: this hook inspects the status line and a fixed set
+    of quota headers, and touches neither `flow.response.content` nor
+    `flow.response.stream`. Using `responseheaders` rather than `response` is
+    what keeps that true — the `response` hook would force the body into
+    memory and change the streaming behaviour this path depends on.
+    """
+    if flow.request.host != _ANTHROPIC_HOST or flow.response is None:
+        return
+    method = flow.request.method
+    path = flow.request.path
+    status = flow.response.status_code
+    print(
+        f"[anthropic-proxy] ALLOW {method} {path} -> {status}",
+        file=sys.stderr, flush=True,
+    )
+    if status == 429:
+        detail = " ".join(
+            f"{name}={value}"
+            for name, value in _select_quota_headers(flow.response.headers)
+        )
+        line = f"[anthropic-proxy] RATE_LIMITED {method} {path}"
+        print(f"{line} {detail}" if detail else line, file=sys.stderr, flush=True)

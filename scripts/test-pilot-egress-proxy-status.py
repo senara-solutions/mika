@@ -24,6 +24,7 @@ import importlib.util
 import io
 import pathlib
 import sys
+import types
 import unittest
 from importlib.machinery import SourceFileLoader
 
@@ -284,6 +285,126 @@ class LogSecrecyTests(unittest.TestCase):
         self.assertNotIn("Bearer", emitted)
         self.assertNotIn("set-cookie", emitted)
         self.assertNotIn(body.decode(), emitted)
+
+
+# ---------------------------------------------------------------------------
+# mitmproxy addon (the CONNECT path)
+#
+# The addon imports `mitmproxy`, which is a pilot-host dependency and is not
+# installed where the test suite runs. Stub the two names it touches so the
+# module is importable here; the stub is never used by the addon's logic, only
+# by its import line.
+# ---------------------------------------------------------------------------
+
+_MITM_STUB = types.ModuleType("mitmproxy")
+_MITM_HTTP_STUB = types.ModuleType("mitmproxy.http")
+_MITM_HTTP_STUB.HTTPFlow = type("HTTPFlow", (), {})
+_MITM_HTTP_STUB.Response = type("Response", (), {"make": staticmethod(lambda *a, **k: None)})
+_MITM_STUB.http = _MITM_HTTP_STUB
+sys.modules.setdefault("mitmproxy", _MITM_STUB)
+sys.modules.setdefault("mitmproxy.http", _MITM_HTTP_STUB)
+
+_ADDON_PATH = pathlib.Path(__file__).resolve().parent / "mika-pilot-anthropic-auth-addon.py"
+_ADDON_LOADER = SourceFileLoader("mika_pilot_anthropic_auth_addon", str(_ADDON_PATH))
+_ADDON_SPEC = importlib.util.spec_from_loader(_ADDON_LOADER.name, _ADDON_LOADER)
+addon = importlib.util.module_from_spec(_ADDON_SPEC)
+_ADDON_LOADER.exec_module(addon)
+
+
+class _FakeHeaders:
+    """Case-insensitive header view with the two methods the addon may use."""
+
+    def __init__(self, pairs: list[tuple[str, str]]) -> None:
+        self._pairs = pairs
+
+    def items(self):
+        return list(self._pairs)
+
+    def get(self, name, default=None):
+        for key, value in self._pairs:
+            if key.lower() == name.lower():
+                return value
+        return default
+
+
+class _TripwireResponse:
+    """A response whose body access is a test failure.
+
+    R9 says the addon must not read, buffer, or alter the body. Making
+    `.content` raise turns that from a review promise into a test.
+    """
+
+    def __init__(self, status_code: int, headers: list[tuple[str, str]]) -> None:
+        self.status_code = status_code
+        self.headers = _FakeHeaders(headers)
+        self.stream = False
+
+    @property
+    def content(self):  # pragma: no cover - the raise IS the assertion
+        raise AssertionError("addon touched flow.response.content (violates R9)")
+
+    @property
+    def text(self):  # pragma: no cover - same
+        raise AssertionError("addon touched flow.response.text (violates R9)")
+
+
+class _FakeFlow:
+    def __init__(self, host: str, response: _TripwireResponse | None) -> None:
+        self.request = types.SimpleNamespace(
+            host=host, method="POST", path="/v1/messages?beta=true"
+        )
+        self.response = response
+
+
+class AddonResponseLoggingTests(unittest.TestCase):
+    def _emit(self, host: str, response: _TripwireResponse | None) -> list[str]:
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            addon.responseheaders(_FakeFlow(host, response))
+        return buffer.getvalue().splitlines()
+
+    def test_success_logs_the_status(self) -> None:
+        lines = self._emit(
+            "api.anthropic.com", _TripwireResponse(200, [("content-type", "text/json")])
+        )
+        self.assertEqual(
+            lines, ["[anthropic-proxy] ALLOW POST /v1/messages?beta=true -> 200"]
+        )
+
+    def test_throttle_logs_the_same_class_line_as_the_reverse_proxy(self) -> None:
+        lines = self._emit(
+            "api.anthropic.com",
+            _TripwireResponse(
+                429,
+                [
+                    ("Retry-After", "30"),
+                    ("anthropic-ratelimit-requests-remaining", "0"),
+                    ("authorization", "Bearer sk-ant-oat01-SECRET"),
+                ],
+            ),
+        )
+        self.assertEqual(lines[0].split(" -> ")[-1], "429")
+        self.assertTrue(lines[1].startswith("[anthropic-proxy] RATE_LIMITED POST "))
+        self.assertIn("Retry-After=30", lines[1])
+        self.assertIn("anthropic-ratelimit-requests-remaining=0", lines[1])
+        self.assertNotIn("SECRET", lines[1])
+        self.assertNotIn("Bearer", lines[1])
+
+    def test_non_anthropic_flow_logs_nothing(self) -> None:
+        self.assertEqual(
+            self._emit("github.com", _TripwireResponse(429, [("Retry-After", "1")])), []
+        )
+
+    def test_missing_response_is_survivable(self) -> None:
+        self.assertEqual(self._emit("api.anthropic.com", None), [])
+
+    def test_addon_does_not_enable_response_streaming(self) -> None:
+        # Setting flow.response.stream here would change mitmproxy's body
+        # handling — the thing R9 exists to prevent.
+        response = _TripwireResponse(200, [])
+        with contextlib.redirect_stderr(io.StringIO()):
+            addon.responseheaders(_FakeFlow("api.anthropic.com", response))
+        self.assertFalse(response.stream)
 
 
 if __name__ == "__main__":
