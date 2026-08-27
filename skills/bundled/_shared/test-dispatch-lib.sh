@@ -768,6 +768,27 @@ assert_contains "writer reuses Pin B has_branch signal" 'has_branch=' "$WRITER_S
 assert_contains "writer reuses Pin B has_plan signal" 'has_plan=' "$WRITER_SRC"
 assert_contains "writer reuses Pin B has_verdict signal" 'has_verdict=' "$WRITER_SRC"
 
+# --- Single-pass grooming exit (mika#2012) ---
+#
+# The first-pass READY disposition is a legitimate grooming exit
+# (/mika-groom-ticket Phase 3 step 10) that had no stage before mika#2012:
+# _write_canonical_callout fell into `*)` and returned 1 silently, so no verdict
+# was written and the ticket re-groomed forever. The history line deliberately
+# does NOT claim `second-pass (GROOMED)` — no second pass ran, and a body that
+# lies is a debt the next reader inherits. executor.rs::SINGLE_PASS_GROOMED_RE
+# is the paired recognizer.
+assert_contains "ready-single-pass stage exists" 'ready-single-pass)' "$WRITER_SRC"
+assert_contains "ready-single-pass produces truthful single-pass history" 'first-pass (READY, single-pass GROOMED)' "$WRITER_SRC"
+assert_contains "ready-single-pass does not fabricate a second pass" 'no second pass required' "$WRITER_SRC"
+
+# Unknown stage must be operator-visible, not a silent return 1 — the silent
+# failure IS the mika#2012 root cause.
+CC_UNKNOWN_TMP=$(mktemp -d)
+unknown_stderr=$( (WORKTREE_DIR="$CC_UNKNOWN_TMP" REPO="mika" ISSUE_NUM="999" BRANCH="test/branch" _write_canonical_callout "bogus-stage" "sess-unknown" 2>&1 >/dev/null) || true )
+assert_contains "unknown stage emits greppable operator diagnostic" 'write_canonical_callout_unknown_stage' "$unknown_stderr"
+assert_contains "unknown stage diagnostic names the consequence" 'NO VERDICT WRITTEN' "$unknown_stderr"
+rm -rf "$CC_UNKNOWN_TMP"
+
 # --- Test: Auto-rescue scaffold exclusion (mika#1288) ---
 
 echo ""
