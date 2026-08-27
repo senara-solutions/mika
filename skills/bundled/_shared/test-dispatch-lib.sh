@@ -789,6 +789,128 @@ assert_contains "unknown stage emits greppable operator diagnostic" 'write_canon
 assert_contains "unknown stage diagnostic names the consequence" 'NO VERDICT WRITTEN' "$unknown_stderr"
 rm -rf "$CC_UNKNOWN_TMP"
 
+# ----------------------------------------------------------------------------
+# Redundant-groom refusal gate (mika#2012)
+# ----------------------------------------------------------------------------
+# _committed_plan_on_branch is the gate's evidence step: it answers "is there a
+# committed plan on the dispatch branch?", NOT "does the body mention a plan?".
+# The distinction is the whole ticket. A body-only grep would refuse grooming
+# for a ticket whose plan was never pushed or was deleted — stranding it
+# forever, which is a worse failure than the loop it fixes.
+
+# The five cases below are DEFINED here next to the gate's code-shape
+# assertions, but INVOKED near the end of this file — they need
+# `_fixture_setup`, which is defined further down.
+CALLOUT_PRESENT_BODY='## Symptom
+Some text.
+
+> - **Branch:** `fix/2012/plan-gate`
+> - **Plan:** `docs/plans/2026-08-27-001-plan.md` (committed on branch @ `deadbeef`)
+> - **Grooming history:** first-pass (READY, single-pass GROOMED) — no second pass required — session-id: t1
+'
+
+# --- Case 1 (the discriminating one): callout present, file ABSENT on branch.
+# The gate must NOT fire — this ticket genuinely needs grooming.
+test_groom_gate_callout_present_file_absent() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    # Branch exists on the remote but carries NO plan file.
+    git -C "$FIXTURE_CLONE" checkout -q -b fix/2012/plan-gate
+    echo "code" > "$FIXTURE_CLONE/src.txt"
+    git -C "$FIXTURE_CLONE" add src.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "work, no plan"
+    git -C "$FIXTURE_CLONE" push -q origin fix/2012/plan-gate
+
+    local rc=0
+    _committed_plan_on_branch "$FIXTURE_CLONE" "fix/2012/plan-gate" "$CALLOUT_PRESENT_BODY" "mika" >/dev/null 2>&1 || rc=$?
+
+    _fixture_cleanup
+    if [ "$rc" -ne 0 ]; then echo "PASS"; else echo "FAIL: gate fired on a callout whose plan file is absent — would strand the ticket"; fi
+}
+
+# --- Case 2: callout present AND file committed on branch → gate fires.
+test_groom_gate_plan_committed() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    git -C "$FIXTURE_CLONE" checkout -q -b fix/2012/plan-gate
+    mkdir -p "$FIXTURE_CLONE/docs/plans"
+    echo "# plan" > "$FIXTURE_CLONE/docs/plans/2026-08-27-001-plan.md"
+    git -C "$FIXTURE_CLONE" add docs/plans/2026-08-27-001-plan.md
+    git -C "$FIXTURE_CLONE" commit -q -m "commit plan"
+    git -C "$FIXTURE_CLONE" push -q origin fix/2012/plan-gate
+
+    local out rc=0
+    out=$(_committed_plan_on_branch "$FIXTURE_CLONE" "fix/2012/plan-gate" "$CALLOUT_PRESENT_BODY" "mika" 2>/dev/null) || rc=$?
+
+    _fixture_cleanup
+    if [ "$rc" -eq 0 ] && [ "$out" = "docs/plans/2026-08-27-001-plan.md" ]; then
+        echo "PASS"
+    else
+        echo "FAIL: expected rc=0 and the plan path, got rc=$rc out='$out'"
+    fi
+}
+
+# --- Case 3: repo-prefixed callout form (`mika/docs/plans/...`) still resolves.
+# Tickets groomed before U3's path normalization carry this shape.
+test_groom_gate_repo_prefixed_path() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    git -C "$FIXTURE_CLONE" checkout -q -b fix/2012/prefixed
+    mkdir -p "$FIXTURE_CLONE/docs/plans"
+    echo "# plan" > "$FIXTURE_CLONE/docs/plans/legacy-plan.md"
+    git -C "$FIXTURE_CLONE" add docs/plans/legacy-plan.md
+    git -C "$FIXTURE_CLONE" commit -q -m "commit plan"
+    git -C "$FIXTURE_CLONE" push -q origin fix/2012/prefixed
+
+    local prefixed_body out rc=0
+    prefixed_body='> - **Plan:** `mika/docs/plans/legacy-plan.md` (committed on branch @ `abc1234`)'
+    out=$(_committed_plan_on_branch "$FIXTURE_CLONE" "fix/2012/prefixed" "$prefixed_body" "mika" 2>/dev/null) || rc=$?
+
+    _fixture_cleanup
+    if [ "$rc" -eq 0 ] && [ "$out" = "docs/plans/legacy-plan.md" ]; then
+        echo "PASS"
+    else
+        echo "FAIL: repo-prefixed callout should resolve to the relative path, got rc=$rc out='$out'"
+    fi
+}
+
+# --- Case 4: no Plan callout at all → gate never fires (ungroomed ticket).
+test_groom_gate_no_callout() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    local rc=0
+    _committed_plan_on_branch "$FIXTURE_CLONE" "main" "## Symptom
+Plain ungroomed body, no callout." "mika" >/dev/null 2>&1 || rc=$?
+
+    _fixture_cleanup
+    if [ "$rc" -ne 0 ]; then echo "PASS"; else echo "FAIL: gate fired on a body with no Plan callout"; fi
+}
+
+# --- Case 5: branch does not exist on the remote → gate must not fire.
+test_groom_gate_branch_absent() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    local rc=0
+    _committed_plan_on_branch "$FIXTURE_CLONE" "fix/2012/never-pushed" "$CALLOUT_PRESENT_BODY" "mika" >/dev/null 2>&1 || rc=$?
+
+    _fixture_cleanup
+    if [ "$rc" -ne 0 ]; then echo "PASS"; else echo "FAIL: gate fired although the dispatch branch does not exist on the remote"; fi
+}
+
+# Code-shape: the gate must use mika#988 exit semantics — _deliver_callback +
+# exit 0, never exit 1. An `exit 1` here is wrapped as HANDLER CRASH by the EXIT
+# trap and stalls the loop (7 h on 2026-05-06).
+SETUP_WT_SRC=$(declare -f _set_up_worktree)
+assert_contains "groom refusal gate is scoped to dev-groom" '[ "$SKILL" = "dev-groom" ]' "$SETUP_WT_SRC"
+assert_contains "groom refusal gate calls _committed_plan_on_branch" '_committed_plan_on_branch' "$SETUP_WT_SRC"
+assert_contains "groom refusal delivers a structured callback" 'already_groomed' "$SETUP_WT_SRC"
+assert_contains "groom refusal emits a greppable operator diagnostic" 'dispatch_gate_groom_refused' "$SETUP_WT_SRC"
+
 # --- Test: Auto-rescue scaffold exclusion (mika#1288) ---
 
 echo ""
@@ -2912,6 +3034,31 @@ else
     [ -n "$BARE_REPO_HITS" ] && echo "$BARE_REPO_HITS"
     [ -n "$BARE_REPO_HITS_UNQUOTED" ] && echo "$BARE_REPO_HITS_UNQUOTED"
 fi
+
+# --- Redundant-groom refusal gate: functional cases (mika#2012) ---
+# Defined above next to the gate's code-shape assertions; invoked here because
+# they depend on _fixture_setup.
+
+echo ""
+echo "Test: redundant-groom refusal gate (mika#2012)"
+echo "-----------------------------------------------"
+
+for gate_case in \
+    "test_groom_gate_callout_present_file_absent|callout present but plan file ABSENT → gate does NOT fire" \
+    "test_groom_gate_plan_committed|plan committed on branch → gate fires with the path" \
+    "test_groom_gate_repo_prefixed_path|repo-prefixed callout resolves to relative path" \
+    "test_groom_gate_no_callout|no Plan callout → gate does NOT fire" \
+    "test_groom_gate_branch_absent|branch absent from remote → gate does NOT fire"
+do
+    gate_fn="${gate_case%%|*}"
+    gate_label="${gate_case#*|}"
+    gate_result=$("$gate_fn" 2>/dev/null) || gate_result="ABORTED (rc=$?)"
+    if [ "$gate_result" = "PASS" ]; then
+        PASS=$((PASS + 1)); echo "  ✓ $gate_label"
+    else
+        FAIL=$((FAIL + 1)); echo "  ✗ $gate_label: $gate_result"
+    fi
+done
 
 # --- Summary ---
 

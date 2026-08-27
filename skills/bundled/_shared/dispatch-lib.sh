@@ -843,6 +843,41 @@ _seed_worktree_slash_commands() {
 # silent-failure defense — siblings: mika#1364 (force-with-lease gap), #1407
 # (stale-main mis-diagnosis), #1414 (dirty-worktree on resume), #1415 (worktree-
 # setup clobbers .claude/commands).
+# Evidence step for the redundant-groom refusal gate (mika#2012).
+#
+# Prints the plan path and returns 0 ONLY when the issue body carries a canonical
+# Plan callout AND that file is actually committed on the dispatch branch.
+# Returns 1 in every other case.
+#
+# The file check — not the body grep — is the entire point. A body-only test
+# would refuse grooming for a ticket whose plan was never pushed, was deleted, or
+# whose path drifted, stranding it forever. That is a strictly worse failure than
+# the loop this gate closes: the loop wastes dispatches, a stranded ticket is
+# never worked at all. When in doubt, this function returns 1 and grooming runs.
+_committed_plan_on_branch() {
+    local sub_repo_dir="$1" branch="$2" issue_body="$3" repo="$4"
+    local plan_path candidate
+
+    plan_path=$(printf '%s\n' "$issue_body" \
+        | sed -n 's/^> - \*\*Plan:\*\* *`\([^`]*\)`.*/\1/p' | head -1)
+    [ -n "$plan_path" ] || return 1
+
+    # Fetch the dispatch branch itself. A branch that does not exist on the
+    # remote cannot carry a committed plan — grooming is legitimate.
+    git -C "$sub_repo_dir" fetch --quiet origin "refs/heads/${branch}" 2>/dev/null || return 1
+
+    # The callout carries two historical shapes: repo-prefixed
+    # (`mika/docs/plans/…`) and repo-relative (`docs/plans/…`). Try both — U3
+    # normalizes new writes, but tickets groomed before it keep the old form.
+    for candidate in "$plan_path" "${plan_path#"${repo}/"}"; do
+        if git -C "$sub_repo_dir" cat-file -e "FETCH_HEAD:${candidate}" 2>/dev/null; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
 _set_up_worktree() {
     # --- Parse repo#number format ---
     # Matches: mika#214, mika-skills#8, mika-cloud#50, and an optional owner/
@@ -913,6 +948,31 @@ _set_up_worktree() {
             --issue "$ISSUE_NUM" \
             --labels "$LABELS" \
             --body-callout "$ISSUE_BODY")
+
+        # --- Gate: refuse a redundant dev-groom re-dispatch (mika#2012) ---
+        #
+        # A ticket whose plan is already committed on the dispatch branch does
+        # not need grooming. Before this gate, mika-dev (an LLM) chose the
+        # `skill` field with nothing deterministic behind it, so an already-
+        # groomed ticket could be re-dispatched as dev-groom; the run re-derived
+        # the plan, stacked a second body callout, and the ticket came back
+        # around — 25 measured requeues across 5 tickets in 13 h, producing 6
+        # branches containing only markdown.
+        #
+        # Exit semantics are mika#988's: _deliver_callback + exit 0. An `exit 1`
+        # on a foreseeable condition is wrapped as HANDLER CRASH by the EXIT
+        # trap; mika-dev then reads a crash envelope and idles (7 h stall,
+        # 2026-05-06). This is a foreseeable condition, so it exits 0.
+        if [ "$SKILL" = "dev-groom" ]; then
+            local existing_plan
+            if existing_plan=$(_committed_plan_on_branch "$SUB_REPO_DIR" "$BRANCH" "$ISSUE_BODY" "$REPO"); then
+                echo "dispatch_gate_groom_refused: repo=${REPO} issue=${ISSUE_NUM} branch=${BRANCH} plan=${existing_plan} — plan already committed on branch, re-grooming would loop (mika#2012)" >&2
+                RESULT=$(printf '{"status":"auto_skipped","reason":"already_groomed","issue":"senara-solutions/%s#%s","branch":"%s","plan":"%s","note":"A committed plan already exists on the dispatch branch. Re-grooming would re-derive it and stack a second body callout. Dispatch dev-pilot to implement, or remove the plan from the branch to force a fresh groom."}' \
+                    "$REPO" "$ISSUE_NUM" "$BRANCH" "$existing_plan")
+                _deliver_callback
+                exit 0
+            fi
+        fi
 
         # Sync main before branching to avoid stale worktrees.
         git -C "$SUB_REPO_DIR" fetch origin main 2>/dev/null || true
