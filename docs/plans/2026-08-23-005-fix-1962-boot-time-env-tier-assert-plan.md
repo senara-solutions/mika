@@ -1,11 +1,11 @@
 # Plan — fix(agent-core): boot-time assert env-tier consistency for family agents
 
-**Status:** DRAFT
-**Date:** 2026-08-23
+**Status:** IMPLEMENTATION-READY (Path A gate lifted 2026-08-27)
+**Date:** 2026-08-23 (deepened 2026-08-27)
 **Ticket:** mika#1962
 **Owner:** mika-orchestrator (Vincent + Claude Code, co-creators)
 **Class:** Substrate reliability hygiene — env-drift silent policy inversion prevention
-**Cross-refs:** mika#1783 (founding fix — PR#1965 OPEN), correctness F2, adversarial F3
+**Cross-refs:** mika#1783 (founding fix — PR#1965 **MERGED** 2026-08-24 @ `82245af6`), correctness F2, adversarial F3
 
 ## Why
 
@@ -15,10 +15,13 @@ mika#1783 (PR#1965 OPEN) threads `ToolContext.tier` via `AgentTier::from_env()` 
 
 **Class:** silent policy inversion — env-drift becomes silent-persona-drift. Real vectors: K8s ConfigMap edit, Helm value change, systemd drop-in change, `docker exec` into a running container, manual `mika-spirit` restart from a shell missing the env var. mika-cloud has form here (per adversarial reviewer's specific callout).
 
-**Verified against current `main` state:**
-- `AgentTier` enum + `AgentTier::from_env()` are defined in `crates/mika-common/src/home.rs:13-45`.
+**Verified against current `main` state (re-verified 2026-08-27, post-PR#1965-merge):**
+- `AgentTier` enum + `AgentTier::from_env()` are defined in `crates/mika-common/src/home.rs:13-46`.
 - `MIKA_AGENT_TIER` env var recognized values: `"default"` (unset/empty/literal → operator persona), `"family"` (case-insensitive). Unknown values fall through to `Default` with a WARN log.
-- `FAMILY_AGENT_SKILL_ALLOWLIST` and `FAMILY_SOUL` — **verified NOT in current main** (`grep -rn 'FAMILY_AGENT_SKILL_ALLOWLIST\|FAMILY_SOUL' crates/` returns zero hits). These constants + `dispatch_substrate_diagnostic` + `ToolContext.tier` field are all defined in **PR#1965** (`fix/1783/...`), not merged yet.
+- `FAMILY_AGENT_SKILL_ALLOWLIST` — **now on main** at `crates/mika-common/src/home.rs:461`. `FAMILY_SOUL` — **now on main** at `crates/mika-common/src/home.rs:513`. `FAMILY_IDENTITY` at `home.rs:472`. All landed via PR#1965 (merged 2026-08-24 @ `82245af6`).
+- The four production `ToolContext` tier-construction sites are on main: `crates/mika-agent/src/agent_loop/mod.rs:3349`, `:4273`, `:4837`, and `crates/mika-agent/src/server/investigate.rs:778` — each currently `tier: mika_common::home::AgentTier::from_env()`.
+- `AgentState` is defined at `crates/mika-agent/src/server/state.rs:27` (**not** `crates/mika-agent/src/agent_state.rs` — that path does not exist; corrected 2026-08-27). It is constructed at `crates/mika-agent/src/server/mod.rs:566` (inside `init_agent`, declared at `:419`) and at `crates/mika-agent/src/server/mod.rs:1761` (test fixture).
+- `FAMILY_SOUL_MARKER` — **confirmed absent from main.** PR#1965 did not ship a sentinel. Per this plan's own directive (§1), this ticket adds it as a companion change.
 
 **Priority (from ticket):** p2-normal. Detection: no telemetry today; no alarm; the leak surfaces only via user complaint (the exact shape of mika#1783's founding incident).
 
@@ -28,19 +31,32 @@ Three coordinated changes (Options A + B from ticket; C deferred). Option A fail
 
 ### 1. Option A — Boot-time assertion in mika-spirit startup (`family_provisioning_consistency_check`)
 
-**File:** `crates/mika-agent/src/server/mod.rs` (in the agent-init path called at startup for each agent in `~/.mika/agents/`).
+**File:** new module `crates/mika-agent/src/server/tier_guard.rs`, invoked from `run_server` (`crates/mika-agent/src/server/mod.rs:682`).
+
+**Callsite decision (pinned 2026-08-27).** The original plan said "after `Settings::load`, before `run_server`" — i.e. in `crates/mika-agent/src/bin/mika-spirit.rs` main. **Superseded:** the check runs *inside* `run_server`, immediately after `home::migrate_to_multi_agent(global_home)?` (`server/mod.rs:691`) and before agent discovery/init. Two reasons, both load-bearing:
+
+1. **Post-migration layout.** `migrate_to_multi_agent` is what establishes `~/.mika/agents/<name>/`. Scanning for family provisioning before it runs would read a pre-migration layout and miss agents entirely — a false-negative in the exact direction the check exists to prevent.
+2. **No bypass surface.** `run_server` has exactly one production caller (`bin/mika-spirit.rs:71`) and zero test callers (tests use `test_app`, `server/mod.rs:102`). Putting the guard inside `run_server` means any future binary entry point inherits it, rather than each having to remember to call it. Placing it in `main` would make the guard opt-in per-binary — the structural-vs-prompt distinction from `feedback_prompt_enforcement_fragile` applied to callsites.
+
+Settings are already loaded by the time `run_server` is entered (`mika-spirit.rs:50`), and `load_dotenv` has already run (`mika-spirit.rs:23`), so the env is fully materialized — the ordering constraint the original wording was protecting is satisfied.
 
 **Change shape:** for every agent that shows evidence of family-tier provisioning, assert `AgentTier::from_env() == AgentTier::Family`. On mismatch: hard-fail startup with an actionable error naming the agent, the detected provisioning state, and the missing env var.
 
-**Detection criteria for "family-provisioned":**
-- `soul.md` starts with `FAMILY_SOUL` sentinel marker (a `<!-- MIKA_FAMILY_SOUL_MARKER -->` line inserted at bootstrap time by `write_family_soul_if_missing`).
-- OR `identity.toml`'s `[skills].allowlist` matches `FAMILY_AGENT_SKILL_ALLOWLIST` exactly.
+**Detection criteria for "family-provisioned" (two independent axes, OR-combined):**
+- **Axis 1 — soul marker.** `soul.md` contains the `FAMILY_SOUL_MARKER` sentinel.
+- **Axis 2 — identity allowlist.** `identity.toml`'s `[skills].allowlist` matches `FAMILY_AGENT_SKILL_ALLOWLIST` exactly (as a set).
+
+**Marker design + backward-compat consequence (pinned 2026-08-27).** `FAMILY_SOUL_MARKER` does not exist on main; this ticket adds it to `crates/mika-common/src/home.rs` as `<!-- MIKA_FAMILY_SOUL_MARKER -->` and prepends it to the `FAMILY_SOUL` constant. Two consequences to hold explicitly:
+
+- **It is not retroactive.** `write_default_if_missing` never rewrites an existing `soul.md` (contract preserved). Any family agent bootstrapped *before* this ticket ships has a marker-less `soul.md`, so **axis 1 returns false for every already-provisioned family agent**. Axis 2 (identity allowlist) is therefore the load-bearing detector for the installed base, and axis 1 only becomes load-bearing for agents bootstrapped after this ships. This is not a defect — it is why the plan carries two axes — but a single-axis implementation would silently fail to protect exactly the agents that already exist.
+- **The marker is inert in the prompt.** `soul.md` is read into the system prompt, so the marker becomes prompt text. An HTML comment is the right shape: it carries no instruction the model would act on. It must also not trip the `family_soul_no_operator_name` invariant test (`home.rs:607`) — it carries no operator-identity token.
 
 **Structural implementation:**
 
 ```rust
-// crates/mika-agent/src/server/mod.rs, called inside init_all_agents()
-fn assert_family_tier_env_consistency(
+// crates/mika-agent/src/server/tier_guard.rs, called from run_server()
+// after home::migrate_to_multi_agent(), before agent discovery.
+pub fn assert_family_tier_env_consistency(
     home_dir: &Path,
     tier: AgentTier,
 ) -> Result<()> {
@@ -75,15 +91,27 @@ fn assert_family_tier_env_consistency(
 }
 ```
 
-**Ordering:** runs AFTER `Settings::load` (so env is fully loaded) and BEFORE `run_server` (so the assertion fails startup, not runtime). Requires the two helpers `soul_starts_with_family_marker` and `identity_allowlist_matches_family` — both simple file reads with fail-loud error propagation on IO errors (do NOT silently skip an agent whose files can't be read — that could hide a genuine drift; instead, propagate the error, which is what `anyhow::Result` does).
+**Ordering:** runs inside `run_server` after `migrate_to_multi_agent` and before agent discovery/init, so the assertion fails startup rather than surfacing at runtime. Requires the two helpers `soul_has_family_marker` and `identity_allowlist_matches_family` — both simple file reads.
 
-**FAMILY_SOUL marker helper (`crates/mika-common/src/home.rs`):** requires PR#1965 to have added a `FAMILY_SOUL_MARKER` const (a string like `"<!-- MIKA_FAMILY_SOUL_MARKER -->"`). If PR#1965 does NOT ship the marker, this ticket needs to add it — coordinate with Vincent to include in PR#1965 or add here as a companion change.
+**Missing-file semantics (pinned 2026-08-27).** The two failure modes are NOT symmetric and must not be collapsed:
+
+- **File absent** (`soul.md` or `identity.toml` does not exist) → that axis reports `false`, no error. An agent directory mid-bootstrap legitimately has no `soul.md` yet; treating absence as fatal would make the guard refuse startup on a fresh install, which is a self-inflicted outage with no drift behind it.
+- **File present but unreadable** (permissions, IO error, malformed TOML) → propagate via `anyhow::Result`, failing startup. Do NOT silently skip an agent whose files exist but can't be read — that is exactly where a genuine drift could hide.
+
+**FAMILY_SOUL_MARKER const (`crates/mika-common/src/home.rs`):** PR#1965 merged without it (verified 2026-08-27). This ticket adds it, per the disposition this plan already pre-specified. Marker value `<!-- MIKA_FAMILY_SOUL_MARKER -->`, prepended to `FAMILY_SOUL`; detection is `contains`, not `starts_with`, so a hand-edit that adds a leading blank line or title does not defeat axis 1.
 
 ### 2. Option B — Cache tier on `AgentState` (defense in depth)
 
-**Files:** `crates/mika-agent/src/server/state.rs` (or wherever `AgentState` is defined), + all 4 production `ToolContext` construction sites in `crates/mika-agent/src/agent_loop/mod.rs` (line 3007, line 4536) + `crates/mika-agent/src/server/investigate.rs`.
+**Files (line numbers verified against main 2026-08-27):**
+- `crates/mika-agent/src/server/state.rs:27` — `AgentState` definition (add the field).
+- `crates/mika-agent/src/server/mod.rs:566` — `AgentState` construction inside `init_agent` (populate the field once).
+- `crates/mika-agent/src/server/mod.rs:1761` — test-fixture `AgentState` construction (must also populate the field or the crate will not compile).
+- `crates/mika-agent/src/agent_loop/mod.rs:3349`, `:4273`, `:4837` — three of the four `ToolContext` tier sites.
+- `crates/mika-agent/src/server/investigate.rs:778` — the fourth.
 
-**Change shape:** add `tier: AgentTier` field to `AgentState`. Populate once at `init_agent` (or wherever `AgentState` is constructed) by calling `AgentTier::from_env()`. Change all 4 `ToolContext` construction sites from `tier: AgentTier::from_env()` to `tier: agent_state.tier`.
+**Change shape:** add `tier: AgentTier` field to `AgentState`. Populate once in `init_agent` by calling `AgentTier::from_env()`. Change all 4 `ToolContext` construction sites from `tier: mika_common::home::AgentTier::from_env()` to read the cached `AgentState.tier`.
+
+**Reachability caveat (surfaced 2026-08-27).** The four sites must each be checked for whether an `AgentState` is actually in scope at that point. Where one is not, the tier has to be threaded in through the existing params struct rather than conjured — and a site that cannot reach `AgentState` without a signature change is a finding to record, not a reason to leave `from_env()` in place. `/ce:work` resolves this per-site against the real code; the AC ("all 4 production construction sites, not `AgentTier::from_env()`") is the contract regardless of how the threading lands.
 
 ```rust
 pub struct AgentState {
@@ -107,7 +135,9 @@ pub struct AgentState {
 
 ### 4. Tests
 
-**Unit test (`crates/mika-agent/src/agent_state.rs` `#[cfg(test)] mod tests`):**
+**Env-var test hygiene (pinned 2026-08-27).** `AgentTier::from_env()` reads process-global state. Rust runs tests multi-threaded within a binary, so any test that sets or unsets `MIKA_AGENT_TIER` races every other test that reads it — including the existing `home.rs:1116-1142` tier tests. Follow whatever serialization the existing `home.rs` tier tests already use (they mutate the same var); do not introduce a second, divergent mechanism. If they rely on being in a separate binary or on a mutex, match it.
+
+**Unit test (`crates/mika-agent/src/server/state.rs` `#[cfg(test)] mod tests`):**
 
 ```rust
 #[test]
@@ -159,20 +189,20 @@ fn identity_allowlist_matches_family_detects_family_allowlist() { ... }
 - Deploy-time discipline: set `MIKA_AGENT_TIER=family` in service EnvironmentFile / K8s ConfigMap BEFORE first startup. Missing env at restart is a hard failure, not a silent downgrade.
 - Diagnostic path: on assertion failure, error message names the affected agents + the missing env var. Operator remediation: set the env, restart.
 
-## Dependency on PR#1965 (mika#1783)
+## Dependency on PR#1965 (mika#1783) — RESOLVED
 
-PR#1965 is OPEN and closes mika#1783. This plan depends on:
+**Status 2026-08-27: gate LIFTED.** PR#1965 merged 2026-08-24T11:38:02Z as `82245af6` (base `main`, head `fix/1783/agent-doctrine-l-tre-scell-demande-de-la`). This branch was rebased onto `origin/main` (`5db56354`) on 2026-08-27, so every reference below is now concrete against the working tree. **Path A is satisfied — implementation proceeds.** Path B (companion branch) is moot and requires no operator consent.
+
+The one carve-out: PR#1965 did NOT ship `FAMILY_SOUL_MARKER`. This plan pre-specified the disposition for that case ("add here as a companion change"), so no re-grooming round is needed — see §1.
+
+PR#1965 supplied:
 - `FAMILY_AGENT_SKILL_ALLOWLIST` const (PR#1965 §2)
 - `FAMILY_SOUL` template (PR#1965 §1)
 - `ToolContext.tier` field (PR#1965 core change)
 - 4 production ctx-construction sites (PR#1965 threading changes)
 - `dispatch_substrate_diagnostic` fold-back path (PR#1965 gate)
 
-**Path A (recommended):** ship this ticket AFTER PR#1965 merges. All references become concrete against post-merge main.
-
-**Path B (companion branch):** rebase this ticket onto `fix/1783/agent-doctrine-l-tre-scell-demande-de-la`, add `> **Companion PR:** #1965` callout to issue body, re-run /mika-groom-ticket. Requires operator consent.
-
-Plan commits to **Path A**. Implementation gated on PR#1965 merge; the plan itself is committable now.
+Plan committed to **Path A**; Path A has now happened. No residual dependency.
 
 ## Acceptance Criteria (verbatim from ticket)
 
@@ -184,10 +214,11 @@ Plan commits to **Path A**. Implementation gated on PR#1965 merge; the plan itse
 
 ## Definition of Done
 
-- [ ] `crates/mika-agent/src/server/mod.rs`: `assert_family_tier_env_consistency()` implemented + called at init.
-- [ ] `crates/mika-agent/src/agent_state.rs` (or wherever `AgentState` is defined): `tier: AgentTier` field added; init sets it once.
-- [ ] All 4 `ToolContext` construction sites in `agent_loop/mod.rs` + `server/investigate.rs` thread `tier` from `AgentState`, not `AgentTier::from_env()`.
-- [ ] `crates/mika-common/src/home.rs`: `soul_starts_with_family_marker()` + `identity_allowlist_matches_family()` helpers (+ `FAMILY_SOUL_MARKER` const if not shipped by PR#1965).
+- [ ] `crates/mika-agent/src/server/tier_guard.rs`: `assert_family_tier_env_consistency()` implemented; called from `run_server` after `migrate_to_multi_agent`, before agent discovery.
+- [ ] `crates/mika-agent/src/server/state.rs`: `tier: AgentTier` field added to `AgentState`; `init_agent` (`server/mod.rs:566`) sets it once; the test fixture at `server/mod.rs:1761` populates it too.
+- [ ] All 4 `ToolContext` construction sites (`agent_loop/mod.rs:3349`, `:4273`, `:4837`, `server/investigate.rs:778`) thread `tier` from the cached `AgentState.tier`, not `AgentTier::from_env()`.
+- [ ] `crates/mika-common/src/home.rs`: `FAMILY_SOUL_MARKER` const added and prepended to `FAMILY_SOUL`; `soul_has_family_marker()` + `identity_allowlist_matches_family()` helpers.
+- [ ] `grep -rn 'AgentTier::from_env()' crates/mika-agent/` returns zero hits outside the single `init_agent` callsite (structural proof the hot path no longer reads env — per `feedback_structural_gate_audit_grep_all_callsites`).
 - [ ] Tests per § 4 (1 unit test on `AgentState`, 2 integration tests on assertion helper, 2 unit tests on marker helpers).
 - [ ] Docs per § 5.
 - [ ] `cargo test --workspace` clean.
