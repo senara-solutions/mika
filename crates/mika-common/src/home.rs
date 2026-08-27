@@ -510,7 +510,12 @@ allowlist = [
 /// The `## First-turn opening` section carries the reference greeting
 /// shape; per-person adaptation (name, context) happens at provisioning
 /// time via `user.md`, not by editing this constant.
-pub const FAMILY_SOUL: &str = r#"# Mika — Compagnon personnel (famille)
+///
+/// The leading `FAMILY_SOUL_MARKER` line is the on-disk provisioning
+/// sentinel read by the boot-time tier guard (mika#1962). It is an HTML
+/// comment so it carries no instruction into the system prompt.
+pub const FAMILY_SOUL: &str = r#"<!-- MIKA_FAMILY_SOUL_MARKER -->
+# Mika — Compagnon personnel (famille)
 
 ## Personnalité
 Tu es Mika, un compagnon personnel — chaleureux, patient, simple. **Jamais de
@@ -561,6 +566,94 @@ décision au moment de l'onboarding.
 Cette ouverture est une référence — le prénom et le contexte de la personne sont
 adaptés à l'onboarding via `user.md`, pas dans ce fichier.
 "#;
+
+/// On-disk sentinel proving an agent's `soul.md` was provisioned from
+/// [`FAMILY_SOUL`] (mika#1962).
+///
+/// Written as the first line of `FAMILY_SOUL` and read back by
+/// [`soul_has_family_marker`]. An HTML comment by construction: `soul.md` is
+/// loaded into the system prompt, so the sentinel must carry no instruction
+/// the model could act on. The `MIKA_FAMILY_SOUL_MARKER` token is unique by
+/// construction, so a false positive on an operator soul is not reachable.
+///
+/// **Not retroactive.** `write_default_if_missing` never rewrites an existing
+/// `soul.md`, so every family agent bootstrapped before mika#1962 has a
+/// marker-less soul. For those agents this axis returns `false` and
+/// [`identity_allowlist_matches_family`] is the load-bearing detector. That is
+/// why the tier guard ORs two independent axes rather than trusting this one.
+pub const FAMILY_SOUL_MARKER: &str = "<!-- MIKA_FAMILY_SOUL_MARKER -->";
+
+/// Detection axis 1 — does this agent's `soul.md` carry the family sentinel?
+///
+/// `agent_home` is an agent's resolved home (see [`resolve_agent_home`]), not
+/// the container home.
+///
+/// Error semantics are deliberately asymmetric (mika#1962):
+/// - **Absent** `soul.md` → `Ok(false)`. An agent directory mid-bootstrap
+///   legitimately has no soul yet; treating that as fatal would refuse startup
+///   on a fresh install with no drift behind it.
+/// - **Present but unreadable** (permissions, IO error) → `Err`. A file that
+///   exists but cannot be read is exactly where a genuine drift could hide, so
+///   it must not be silently skipped.
+///
+/// Matches on `contains`, not `starts_with`: a hand-edit that prepends a blank
+/// line or a title must not defeat detection.
+pub fn soul_has_family_marker(agent_home: &Path) -> Result<bool> {
+    let path = agent_home.join("soul.md");
+    if !path.exists() {
+        return Ok(false);
+    }
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(content.contains(FAMILY_SOUL_MARKER))
+}
+
+/// Detection axis 2 — does this agent's `identity.toml` carry exactly the
+/// family-tier skill allowlist?
+///
+/// Compared as a set (order- and duplicate-insensitive) against
+/// [`FAMILY_AGENT_SKILL_ALLOWLIST`], because the allowlist's meaning is the set
+/// of permitted skills, not the order they were written in.
+///
+/// Error semantics mirror [`soul_has_family_marker`], with one addition:
+/// **malformed TOML is an error, not a `false`.** Today a malformed
+/// `identity.toml` on a user-defined agent falls back to a default-permissive
+/// identity (`mika-agent`'s `parse_identity_or_fail_closed`), so a corrupted
+/// family identity would both widen the agent's skills and hide it from this
+/// guard. Refusing startup with a named file is the correct end of that.
+pub fn identity_allowlist_matches_family(agent_home: &Path) -> Result<bool> {
+    /// Minimal projection of `identity.toml` — the guard needs one field and
+    /// must fail loudly on a malformed file, which the full `Identity` loader
+    /// in `mika-agent` deliberately does not do.
+    #[derive(serde::Deserialize)]
+    struct IdentityProjection {
+        #[serde(default)]
+        skills: SkillsProjection,
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct SkillsProjection {
+        #[serde(default)]
+        allowlist: Option<Vec<String>>,
+    }
+
+    let path = agent_home.join("identity.toml");
+    if !path.exists() {
+        return Ok(false);
+    }
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let parsed: IdentityProjection =
+        toml::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))?;
+
+    let Some(allowlist) = parsed.skills.allowlist else {
+        return Ok(false);
+    };
+
+    let found: std::collections::BTreeSet<&str> = allowlist.iter().map(|s| s.as_str()).collect();
+    let family: std::collections::BTreeSet<&str> =
+        FAMILY_AGENT_SKILL_ALLOWLIST.iter().copied().collect();
+    Ok(found == family)
+}
 
 pub const DEFAULT_HEARTBEAT: &str = r#"# Heartbeat Checklist
 
@@ -1069,6 +1162,114 @@ mod tests {
         assert!(
             soul.contains("senior executive assistant"),
             "unknown tier must fall through to the default operator persona"
+        );
+    }
+
+    /// mika#1962 axis 1 — a soul written from `FAMILY_SOUL` is detected.
+    #[test]
+    fn soul_has_family_marker_detects_family_soul() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("soul.md"), FAMILY_SOUL).unwrap();
+        assert!(soul_has_family_marker(tmp.path()).unwrap());
+    }
+
+    /// The operator soul must never trip axis 1.
+    #[test]
+    fn soul_has_family_marker_rejects_default_soul() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("soul.md"), DEFAULT_SOUL).unwrap();
+        assert!(!soul_has_family_marker(tmp.path()).unwrap());
+    }
+
+    /// A missing `soul.md` is not an error — an agent dir mid-bootstrap
+    /// legitimately has none, and failing there would refuse startup on a
+    /// fresh install with no drift behind it.
+    #[test]
+    fn soul_has_family_marker_absent_file_is_false_not_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!soul_has_family_marker(tmp.path()).unwrap());
+    }
+
+    /// A hand-edit that prepends content must not defeat detection — this is
+    /// why the check is `contains`, not `starts_with`.
+    #[test]
+    fn soul_has_family_marker_survives_prepended_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("soul.md"),
+            format!("\n# Notes de Vincent\n\n{FAMILY_SOUL}"),
+        )
+        .unwrap();
+        assert!(soul_has_family_marker(tmp.path()).unwrap());
+    }
+
+    /// mika#1962 axis 2 — the load-bearing detector for family agents
+    /// provisioned before the marker existed.
+    #[test]
+    fn identity_allowlist_matches_family_detects_family_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("identity.toml"), FAMILY_IDENTITY).unwrap();
+        assert!(identity_allowlist_matches_family(tmp.path()).unwrap());
+    }
+
+    #[test]
+    fn identity_allowlist_matches_family_rejects_default_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("identity.toml"), DEFAULT_IDENTITY).unwrap();
+        assert!(!identity_allowlist_matches_family(tmp.path()).unwrap());
+    }
+
+    /// Set comparison, not sequence comparison — a reordered allowlist is the
+    /// same set of permitted skills and must still be detected as family.
+    #[test]
+    fn identity_allowlist_matches_family_is_order_insensitive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut reversed: Vec<&str> = FAMILY_AGENT_SKILL_ALLOWLIST.to_vec();
+        reversed.reverse();
+        let entries = reversed
+            .iter()
+            .map(|s| format!("    \"{s}\","))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(
+            tmp.path().join("identity.toml"),
+            format!("name = \"Mika\"\n\n[skills]\nallowlist = [\n{entries}\n]\n"),
+        )
+        .unwrap();
+        assert!(identity_allowlist_matches_family(tmp.path()).unwrap());
+    }
+
+    /// An identity with no `[skills].allowlist` is default-permissive, which
+    /// is not the family shape.
+    #[test]
+    fn identity_allowlist_matches_family_absent_allowlist_is_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("identity.toml"), "name = \"Mika\"\n").unwrap();
+        assert!(!identity_allowlist_matches_family(tmp.path()).unwrap());
+    }
+
+    #[test]
+    fn identity_allowlist_matches_family_absent_file_is_false_not_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!identity_allowlist_matches_family(tmp.path()).unwrap());
+    }
+
+    /// Malformed TOML must NOT read as "not family". A corrupted family
+    /// identity today falls back to a default-permissive identity in
+    /// `mika-agent`, so silently answering `false` here would both widen the
+    /// agent's skills and hide it from the guard.
+    #[test]
+    fn identity_allowlist_matches_family_malformed_toml_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("identity.toml"),
+            "name = \"Mika\"\n[skills\n",
+        )
+        .unwrap();
+        let err = identity_allowlist_matches_family(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("identity.toml"),
+            "error must name the offending file, got: {err}"
         );
     }
 

@@ -18,6 +18,7 @@ pub mod ready_label_handler;
 pub mod rewind;
 pub mod state;
 pub mod tasks_stream;
+pub mod tier_guard;
 pub mod types;
 pub mod variants;
 pub(crate) mod verdict;
@@ -506,8 +507,15 @@ async fn init_agent(
     let agent_lock = Arc::new(tokio::sync::Mutex::new(()));
     let github_app = mika_common::github_app::GitHubApp::from_settings(&agent_settings);
 
+    // mika#1962 — the single authorized `from_env()` read on the server side.
+    // Every downstream consumer (ToolContext, TaskDispatcher, team runs) reads
+    // this cached value instead, so a mid-runtime env change cannot flip the
+    // tier of an already-running agent.
+    let tier = mika_common::home::AgentTier::from_env();
+
     let dispatcher = Arc::new(TaskDispatcher {
         db: async_db.clone(),
+        tier,
         llm: agent_llm.clone(),
         tools: tool_registry.clone(),
         skills: skill_registry.clone(),
@@ -565,6 +573,7 @@ async fn init_agent(
 
     let agent_state = AgentState {
         db: async_db,
+        tier,
         skills: std::sync::Mutex::new(skill_registry),
         skills_dirty,
         skill_nudge: Arc::new(crate::agent_loop::skill_nudge::SkillNudgeState::default()),
@@ -689,6 +698,16 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
 
     // Auto-migrate to multi-agent layout if needed
     home::migrate_to_multi_agent(global_home)?;
+
+    // mika#1962 — boot-time assertion that on-disk family provisioning agrees
+    // with the process tier env. Runs here, after the migration that creates
+    // `agents/<name>/` and before any agent is initialized: scanning earlier
+    // would read a pre-migration layout and find nothing. Fails startup rather
+    // than letting a family being run under operator semantics silently.
+    tier_guard::assert_family_tier_env_consistency(
+        global_home,
+        mika_common::home::AgentTier::from_env(),
+    )?;
 
     // Auto-provision well-known dev agents if dev_mode is enabled
     if settings.dev_mode {
@@ -1715,6 +1734,7 @@ mod tests {
     ) -> (Arc<tokio::sync::Mutex<TaskEngine>>, Arc<TaskDispatcher>) {
         let llm = mika_common::llm::dummy_provider();
         let dispatcher = Arc::new(TaskDispatcher {
+            tier: mika_common::home::AgentTier::Default,
             db: db.clone(),
             llm,
             tools: Arc::new(tools::default_tools()),
@@ -1744,11 +1764,61 @@ mod tests {
         test_state_with_settings(test_settings())
     }
 
+    /// mika#1962 AC3 — a tier cached on `AgentState` at init survives an
+    /// env-drift that happens mid-runtime.
+    ///
+    /// This is the defense-in-depth half of the fix. `server::tier_guard`
+    /// refuses startup when disk and env disagree at boot; this cache is what
+    /// guarantees an agent that *did* start cannot be flipped afterwards by a
+    /// ConfigMap edit, a systemd drop-in change, or a `docker exec` that
+    /// rewrites the process environment.
+    ///
+    /// The middle assertion is load-bearing: without it the test would pass
+    /// even if the env never actually drifted, proving nothing.
+    #[test]
+    #[serial_test::serial]
+    fn agent_state_tier_survives_env_drift() {
+        use mika_common::home::AgentTier;
+
+        // Safety: serialized against every other MIKA_AGENT_TIER test.
+        unsafe { std::env::set_var("MIKA_AGENT_TIER", "family") };
+
+        // Mirrors the single authorized `from_env()` read in `init_agent`.
+        let state = test_state_with_settings_and_tier(test_settings(), AgentTier::from_env());
+        let agent = state.agents.get("mika").expect("test agent must exist");
+        assert_eq!(agent.tier, AgentTier::Family, "tier must be cached at init");
+
+        // Env-drift mid-runtime — the restart-without-the-var / ConfigMap edit.
+        unsafe { std::env::remove_var("MIKA_AGENT_TIER") };
+
+        assert_eq!(
+            AgentTier::from_env(),
+            AgentTier::Default,
+            "the env must actually have drifted, or this test proves nothing"
+        );
+        assert_eq!(
+            agent.tier,
+            AgentTier::Family,
+            "cached tier must NOT follow the environment — a running family \
+             being must not silently become an operator being"
+        );
+    }
+
     /// Build a test `AppState` whose single "mika" agent carries the given
     /// per-agent `Settings`. Lets tests flip the mika#1870 webhook-queue
     /// kill-switch (`webhook_queue_enabled = Some(false)`) to exercise the legacy
     /// 429-reject path.
     fn test_state_with_settings(agent_settings: Settings) -> AppState {
+        test_state_with_settings_and_tier(agent_settings, mika_common::home::AgentTier::Default)
+    }
+
+    /// Same as [`test_state_with_settings`] but lets the caller pin the agent's
+    /// cached tier — used by the mika#1962 env-drift test, which must capture
+    /// `AgentTier::from_env()` at construction the way `init_agent` does.
+    fn test_state_with_settings_and_tier(
+        agent_settings: Settings,
+        tier: mika_common::home::AgentTier,
+    ) -> AppState {
         let db = test_async_db();
         let dashboard_db = db.clone();
         let llm = mika_common::llm::dummy_provider();
@@ -1759,6 +1829,7 @@ mod tests {
         let (task_engine, dispatcher) = test_task_engine(db.clone());
 
         let agent_state = AgentState {
+            tier,
             db,
             skills: std::sync::Mutex::new(skills_reg),
             skills_dirty,

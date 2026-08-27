@@ -62,6 +62,26 @@ pub struct AgentState {
     /// all KG subsystem construction; `Enabled` provides the validated docs_root
     /// and precomputed docs_root_hash for the three KG startup loops.
     pub kg_config: KgAgentConfig,
+    /// Agent tier resolved ONCE at `init_agent` time from `MIKA_AGENT_TIER`
+    /// (mika#1962). Every `ToolContext` for this agent reads the tier from
+    /// here rather than calling `AgentTier::from_env()` per construction.
+    ///
+    /// **Why cached.** The env var is process-global and mutable: a K8s
+    /// ConfigMap edit, a systemd drop-in change, or a `docker exec` can change
+    /// what `from_env()` returns while agents are running. Re-reading it per
+    /// turn would let a family being silently start answering under operator
+    /// semantics mid-lifetime, while its on-disk persona and allowlist still
+    /// say family. Reading once at init fixes the tier for the container's
+    /// lifetime, which is the contract the provisioning model already assumes
+    /// (`write_default_if_missing` never rewrites a persona either).
+    ///
+    /// Composes with `server::tier_guard`: the guard fails startup when disk
+    /// and env disagree at boot; this field guarantees the agents that did
+    /// start stay consistent afterwards.
+    ///
+    /// Setting `MIKA_AGENT_TIER` on an already-running process has no effect
+    /// by design. Deploy discipline is to set it before first startup.
+    pub tier: mika_common::home::AgentTier,
     /// Canonical session ID for singleton agents (mika#1401). `Some` when the
     /// agent's `identity.toml` sets `[session] singleton = true` — the `/send`
     /// handler then reuses this one session instead of minting a UUID per message.

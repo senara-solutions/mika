@@ -720,6 +720,9 @@ struct InvestigationParams {
     db: AsyncDatabase,
     session_id: String,
     trace_id: String,
+    /// Agent tier borrowed from the default agent's cached `AgentState.tier`
+    /// (mika#1962).
+    tier: mika_common::home::AgentTier,
 }
 
 /// Run the investigation agent loop, sending SSE events via the channel.
@@ -735,6 +738,7 @@ async fn run_investigation(
         db,
         session_id: investigation_session_id,
         trace_id: investigation_trace_id,
+        tier,
     } = params;
     let tool_defs: Vec<_> = tools
         .definitions()
@@ -775,7 +779,7 @@ async fn run_investigation(
         callback_task_id: None,  // Investigation: not a callback turn
         required_tool_arg_suffixes: &[],
         tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
-        tier: mika_common::home::AgentTier::from_env(),
+        tier,
         scope_task_id: None, // Investigation: no task context for parallel narrative
     };
 
@@ -1122,12 +1126,17 @@ pub async fn handle_investigate(
     let (tx, rx) = mpsc::channel::<Result<sse::Event, Infallible>>(64);
     // Investigation panel is not agent-scoped — use the default agent's LLM provider.
     // The default agent is guaranteed to exist (validated in run_server).
-    let llm = state
+    let default_agent = state
         .resolve_agent(&state.default_agent)
         .await
-        .expect("default agent must exist")
-        .llm
-        .clone();
+        .expect("default agent must exist");
+    let llm = default_agent.llm.clone();
+    // mika#1962 — investigation is not agent-scoped, so it borrows the default
+    // agent's tier, cached at that agent's init. Never re-read from the env
+    // here: an investigation started after an env change must not run under a
+    // different tier than the agents it is investigating.
+    let tier = default_agent.tier;
+    drop(default_agent);
     let db = state.dashboard_db.clone();
     let agents = state.agents.clone();
     let investigation_session_id = message.session_id.clone();
@@ -1150,6 +1159,7 @@ pub async fn handle_investigate(
                 db,
                 session_id: investigation_session_id,
                 trace_id: investigation_trace_id,
+                tier,
             },
         )
         .await;

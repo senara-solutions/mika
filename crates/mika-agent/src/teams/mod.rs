@@ -35,6 +35,9 @@ pub async fn run_team(
     reference_run_id: Option<&str>,
     github_app: Option<Arc<GitHubApp>>,
     pr_reviews_posted: Option<Arc<dashmap::DashMap<String, std::collections::HashSet<String>>>>,
+    // Agent tier, supplied by the caller from its own cached authority
+    // (mika#1962) rather than re-read from the environment here.
+    tier: mika_common::home::AgentTier,
 ) -> Result<TeamRun> {
     let def = team::load_team(global_home, team_name)?;
     team::validate_team(global_home, &def)?;
@@ -49,6 +52,7 @@ pub async fn run_team(
         reference_run_id,
         github_app,
         pr_reviews_posted,
+        tier,
     )?;
     engine.execute().await
 }
@@ -70,6 +74,9 @@ pub async fn resume_team_run(
     db: &AsyncDatabase,
     github_app: Option<Arc<GitHubApp>>,
     pr_reviews_posted: Option<Arc<dashmap::DashMap<String, std::collections::HashSet<String>>>>,
+    // Agent tier, supplied by the caller from its own cached authority
+    // (mika#1962) rather than re-read from the environment here.
+    tier: mika_common::home::AgentTier,
 ) -> Result<()> {
     tracing::info!(
         team_name = team_name,
@@ -100,6 +107,7 @@ pub async fn resume_team_run(
         team_db,
         github_app,
         pr_reviews_posted,
+        tier,
     )
     .await?;
     let _run = engine.execute_from_phase(next_phase, child_results).await?;

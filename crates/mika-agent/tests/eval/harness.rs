@@ -77,6 +77,7 @@ impl EvalHarness {
     /// Run the agent loop with a user message and return the execution trace.
     pub async fn run(&self, message: &str) -> Result<AgentTrace> {
         let params = AgentParams {
+            tier: mika_common::home::AgentTier::Default,
             db: &self.db,
             llm: self.llm.as_ref(),
             tools: &self.tools,
@@ -127,6 +128,7 @@ impl EvalHarness {
     /// `deadline_in_flight_llm_call` eval scenario for the canonical pattern.
     pub async fn run_with_deadline(&self, message: &str, deadline: Instant) -> Result<AgentTrace> {
         let params = AgentParams {
+            tier: mika_common::home::AgentTier::Default,
             db: &self.db,
             llm: self.llm.as_ref(),
             tools: &self.tools,
@@ -188,6 +190,7 @@ impl EvalHarness {
         let turn_trace_id = uuid::Uuid::new_v4().as_simple().to_string();
 
         let params = AgentParams {
+            tier: mika_common::home::AgentTier::Default,
             db: &self.db,
             llm: self.llm.as_ref(),
             tools: &self.tools,

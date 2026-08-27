@@ -218,7 +218,7 @@ Plan committed to **Path A**; Path A has now happened. No residual dependency.
 - [ ] `crates/mika-agent/src/server/state.rs`: `tier: AgentTier` field added to `AgentState`; `init_agent` (`server/mod.rs:566`) sets it once; the test fixture at `server/mod.rs:1761` populates it too.
 - [ ] All 4 `ToolContext` construction sites (`agent_loop/mod.rs:3349`, `:4273`, `:4837`, `server/investigate.rs:778`) thread `tier` from the cached `AgentState.tier`, not `AgentTier::from_env()`.
 - [ ] `crates/mika-common/src/home.rs`: `FAMILY_SOUL_MARKER` const added and prepended to `FAMILY_SOUL`; `soul_has_family_marker()` + `identity_allowlist_matches_family()` helpers.
-- [ ] `grep -rn 'AgentTier::from_env()' crates/mika-agent/` returns zero hits outside the single `init_agent` callsite (structural proof the hot path no longer reads env — per `feedback_structural_gate_audit_grep_all_callsites`).
+- [ ] `grep -rn 'AgentTier::from_env()' crates/mika-agent/src/` returns no production hit outside `server/mod.rs`. **Corrected during implementation:** the original wording ("outside the single `init_agent` callsite") would have failed on the correct implementation — this ticket adds a legitimate second read at the `run_server` guard callsite, whose whole job is to compare env against disk. Authorized: `server/mod.rs:514` (init_agent, populates the cache) and `server/mod.rs:709` (guard callsite). Any hit in `agent_loop/`, `teams/`, `task_engine/`, or `server/investigate.rs` is a regression. See `todos/1962-injection-verification.md` § I3.
 - [ ] Tests per § 4 (1 unit test on `AgentState`, 2 integration tests on assertion helper, 2 unit tests on marker helpers).
 - [ ] Docs per § 5.
 - [ ] `cargo test --workspace` clean.

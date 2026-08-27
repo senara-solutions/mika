@@ -633,6 +633,8 @@ pub async fn run_team_ask(
         run_id,
         github_app,
         None, // CLI: no AppState for session-scoped dedup (#821)
+        // mika#1962 — CLI process start is the tier init boundary.
+        mika_common::home::AgentTier::from_env(),
     )
     .await?;
     team_db.shutdown();
