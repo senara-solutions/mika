@@ -962,6 +962,28 @@ assert_contains "groom refusal gate calls _committed_plan_on_branch" '_committed
 assert_contains "groom refusal delivers a structured callback" 'already_groomed' "$SETUP_WT_SRC"
 assert_contains "groom refusal emits a greppable operator diagnostic" 'dispatch_gate_groom_refused' "$SETUP_WT_SRC"
 
+# --- Re-grooming visibility (mika#2012 U4) ---
+# A second grooming of the same ticket must not read like a first one. When the
+# gate correctly declines to fire but the body still carries a Plan callout, the
+# run is a RE-groom on a stale claim — it proceeds, but says so distinctly so a
+# grep separates the two populations.
+assert_contains "allowed-but-stale re-groom emits its own signal" 'dispatch_gate_groom_allowed_stale_callout' "$SETUP_WT_SRC"
+assert_not_contains "the stale-callout signal is not the refusal signal reused" \
+    'dispatch_gate_groom_refused: repo=${REPO} issue=${ISSUE_NUM} branch=${BRANCH} — issue body carries' "$SETUP_WT_SRC"
+
+# The refusal RESULT must be machine-readable: mika-dev's callback turn and the
+# audit dashboard both consume it. Rebuild it with the same printf and prove jq
+# can reach every field.
+REFUSAL_JSON=$(printf '{"status":"auto_skipped","reason":"already_groomed","issue":"senara-solutions/%s#%s","branch":"%s","plan":"%s","note":"A committed plan already exists on the dispatch branch. Re-grooming would re-derive it and stack a second body callout. Dispatch dev-pilot to implement, or remove the plan from the branch to force a fresh groom."}' \
+    "mika" "2012" "fix/2012/plan-gate" "docs/plans/2026-08-27-001-plan.md")
+assert_eq "refusal RESULT is valid JSON" "0" "$(printf '%s' "$REFUSAL_JSON" | jq -e . >/dev/null 2>&1; echo $?)"
+assert_eq "refusal RESULT exposes .reason to jq" "already_groomed" "$(printf '%s' "$REFUSAL_JSON" | jq -r '.reason')"
+assert_eq "refusal RESULT exposes .status to jq" "auto_skipped" "$(printf '%s' "$REFUSAL_JSON" | jq -r '.status')"
+assert_eq "refusal RESULT exposes .plan to jq" "docs/plans/2026-08-27-001-plan.md" "$(printf '%s' "$REFUSAL_JSON" | jq -r '.plan')"
+assert_eq "refusal RESULT exposes .branch to jq" "fix/2012/plan-gate" "$(printf '%s' "$REFUSAL_JSON" | jq -r '.branch')"
+assert_contains "the refusal printf in the source matches the shape tested here" \
+    '{"status":"auto_skipped","reason":"already_groomed"' "$SETUP_WT_SRC"
+
 # --- Test: Auto-rescue scaffold exclusion (mika#1288) ---
 
 echo ""

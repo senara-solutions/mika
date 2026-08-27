@@ -971,6 +971,16 @@ _set_up_worktree() {
                     "$REPO" "$ISSUE_NUM" "$BRANCH" "$existing_plan")
                 _deliver_callback
                 exit 0
+            elif printf '%s\n' "$ISSUE_BODY" | grep -qE '^> - \*\*Plan:\*\*'; then
+                # Grooming is ALLOWED here — the gate correctly declined to fire
+                # because no plan is committed on the branch. But this is not a
+                # first grooming either: the body claims a plan that isn't there
+                # (never pushed, deleted, or the path drifted). Left silent, a
+                # second grooming of the same ticket is indistinguishable from a
+                # first one, which is how #2012 ran three hours unnoticed. Say so
+                # in terms distinct from the refusal, so a `grep` separates the
+                # two populations (mika#2012 U4).
+                echo "dispatch_gate_groom_allowed_stale_callout: repo=${REPO} issue=${ISSUE_NUM} branch=${BRANCH} — issue body carries a Plan callout but no plan file is committed on the branch; re-grooming proceeds (mika#2012)" >&2
             fi
         fi
 
