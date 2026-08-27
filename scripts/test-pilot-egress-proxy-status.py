@@ -19,7 +19,9 @@ existing script-test convention in the `test` target.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
+import io
 import pathlib
 import sys
 import unittest
@@ -198,6 +200,90 @@ class RelayTapTests(unittest.IsolatedAsyncioTestCase):
         await proxy._relay_response_with_status_tap(_reader_of(*chunks), writer)
         self.assertEqual(writer.drains, len(writer.chunks))
         self.assertGreaterEqual(writer.drains, 1)
+
+
+class UpstreamOutcomeLoggingTests(unittest.TestCase):
+    """The lines an operator greps. These are the product of mika#1901."""
+
+    def _emit(self, status, quota=()) -> list[str]:
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            proxy._log_upstream_outcome("POST", "/v1/messages?beta=true", status, list(quota))
+        return buffer.getvalue().splitlines()
+
+    def test_success_logs_one_allow_line_carrying_the_status(self) -> None:
+        lines = self._emit(200)
+        self.assertEqual(
+            lines, ["[anthropic-proxy] ALLOW POST /v1/messages?beta=true -> 200"]
+        )
+
+    def test_throttle_logs_allow_plus_a_distinct_rate_limited_line(self) -> None:
+        lines = self._emit(
+            429,
+            [("Retry-After", "42"), ("request-id", "req_011CdmbTL5FH62zfwP7ieMhu")],
+        )
+        self.assertEqual(
+            lines,
+            [
+                "[anthropic-proxy] ALLOW POST /v1/messages?beta=true -> 429",
+                "[anthropic-proxy] RATE_LIMITED POST /v1/messages?beta=true "
+                "Retry-After=42 request-id=req_011CdmbTL5FH62zfwP7ieMhu",
+            ],
+        )
+
+    def test_throttle_without_quota_headers_still_names_the_class(self) -> None:
+        lines = self._emit(429)
+        self.assertEqual(
+            lines[1], "[anthropic-proxy] RATE_LIMITED POST /v1/messages?beta=true"
+        )
+        self.assertFalse(lines[1].endswith(" "))
+
+    def test_other_error_statuses_surface_without_a_rate_limited_line(self) -> None:
+        for status in (401, 500, 529):
+            with self.subTest(status=status):
+                lines = self._emit(status)
+                self.assertEqual(len(lines), 1)
+                self.assertTrue(lines[0].endswith(f"-> {status}"))
+
+    def test_upstream_that_never_answered_is_not_reported_as_allowed(self) -> None:
+        # The 2026-08-06 shape: STREAM_START with no STREAM_END. Reporting this
+        # as ALLOW is what sent the investigation toward the streaming layer.
+        lines = self._emit(None)
+        self.assertEqual(
+            lines,
+            ["[anthropic-proxy] UPSTREAM_NO_RESPONSE POST /v1/messages?beta=true"],
+        )
+        self.assertNotIn("ALLOW", lines[0])
+
+
+class LogSecrecyTests(unittest.TestCase):
+    """R10: no log line may carry the token, an auth header, or a body byte."""
+
+    SECRET = "sk-ant-oat01-DO-NOT-LOG-ME"
+
+    def test_no_emitted_line_can_carry_upstream_secrets_or_body(self) -> None:
+        head = (
+            b"HTTP/1.1 429 Too Many Requests\r\n"
+            b"authorization: Bearer " + self.SECRET.encode() + b"\r\n"
+            b"set-cookie: session=abc\r\n"
+            b"Retry-After: 9\r\n"
+            b"\r\n"
+        )
+        body = b'{"error":{"message":"' + self.SECRET.encode() + b'"}}'
+        status = proxy._parse_status_line(head)
+        quota = proxy._select_quota_headers(head)
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            proxy._log_upstream_outcome("POST", "/v1/messages", status, quota)
+        emitted = buffer.getvalue()
+
+        self.assertIn("RATE_LIMITED", emitted)
+        self.assertIn("Retry-After=9", emitted)
+        self.assertNotIn(self.SECRET, emitted)
+        self.assertNotIn("Bearer", emitted)
+        self.assertNotIn("set-cookie", emitted)
+        self.assertNotIn(body.decode(), emitted)
 
 
 if __name__ == "__main__":

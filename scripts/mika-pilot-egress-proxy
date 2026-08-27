@@ -329,6 +329,39 @@ def _format_quota_headers(pairs: list[tuple[str, str]]) -> str:
     return " ".join(f"{name}={value}" for name, value in pairs)
 
 
+def _log_upstream_outcome(
+    method: str,
+    path: str,
+    status: int | None,
+    quota_headers: list[tuple[str, str]],
+) -> None:
+    """Emit the operator-facing verdict for one forwarded Anthropic request.
+
+    `ALLOW` keeps its meaning — the egress allowlist permitted the call — and
+    now carries what the upstream answered, so 401 / 429 / 5xx stop hiding
+    behind a line that reads like success. A throttle also gets its own
+    greppable class line: `RATE_LIMITED` is the one word an operator needs to
+    reach the 2026-08-06 conclusion without writing a probe.
+
+    A status of None means the upstream closed without ever answering. That is
+    a distinct outcome, not an allowed call, and is reported as such.
+    """
+    if status is None:
+        print(
+            f"[anthropic-proxy] UPSTREAM_NO_RESPONSE {method} {path}",
+            file=sys.stderr, flush=True,
+        )
+        return
+    print(
+        f"[anthropic-proxy] ALLOW {method} {path} -> {status}",
+        file=sys.stderr, flush=True,
+    )
+    if status == 429:
+        detail = _format_quota_headers(quota_headers)
+        line = f"[anthropic-proxy] RATE_LIMITED {method} {path}"
+        print(f"{line} {detail}" if detail else line, file=sys.stderr, flush=True)
+
+
 async def _relay_response_with_status_tap(
     up_reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
@@ -501,17 +534,17 @@ async def handle_anthropic_reverse_proxy(
                 up_writer.write(chunk)
                 await up_writer.drain()
                 remaining -= len(chunk)
-        # Stream response upstream → client until upstream closes.
-        while True:
-            chunk = await up_reader.read(BUFFER_SIZE)
-            if not chunk:
-                break
-            writer.write(chunk)
-            await writer.drain()
-        print(
-            f"[anthropic-proxy] ALLOW {method.decode('ascii')} "
-            f"{new_path.decode('ascii', 'replace')}",
-            file=sys.stderr, flush=True,
+        # Stream response upstream → client until upstream closes, reading the
+        # status line off the stream on the way past (mika#1901). The tap never
+        # holds a byte back — see _relay_response_with_status_tap.
+        status, quota_headers = await _relay_response_with_status_tap(
+            up_reader, writer,
+        )
+        _log_upstream_outcome(
+            method.decode("ascii"),
+            new_path.decode("ascii", "replace"),
+            status,
+            quota_headers,
         )
     finally:
         try:
