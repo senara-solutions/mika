@@ -951,6 +951,25 @@ static PARAPHRASED_GROOMED_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"second-pass \(READY, paraphrased GROOMED")
         .expect("paraphrased groomed regex must compile")
 });
+/// Single-pass grooming verdict (mika#2012).
+///
+/// The first-pass READY disposition is a legitimate grooming exit — see
+/// `/mika-groom-ticket` Phase 3 step 10: "Disposition: READY — plan is sound.
+/// Commit the staged plan […] and skip to Phase 5". No second pass runs, so the
+/// body must not claim one; `write_canonical_callout`'s `ready-single-pass`
+/// stage emits this truthful marker instead.
+///
+/// Before mika#2012 this shape had no stage and no regex: a ticket groomed in
+/// one pass stayed permanently invisible to the dispatch gate, was re-dispatched
+/// as `dev-groom`, re-groomed, and looped — 25 measured requeues across 5
+/// tickets in 13 h, producing 6 branches containing only markdown plans.
+///
+/// Anchored on the `first-pass (` prefix for the same reason as
+/// `GROOMED_VERDICT_RE`: it distinguishes the verdict-line callout from prose.
+static SINGLE_PASS_GROOMED_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"first-pass \(READY, single-pass GROOMED")
+        .expect("single-pass groomed regex must compile")
+});
 
 pub fn check_grooming_markers(issue_body: &str) -> Vec<&'static str> {
     let mut missing = Vec::new();
@@ -960,8 +979,9 @@ pub fn check_grooming_markers(issue_body: &str) -> Vec<&'static str> {
     if !issue_body.contains("docs/plans/") {
         missing.push("plan_callout");
     }
-    let has_groomed_marker =
-        GROOMED_VERDICT_RE.is_match(issue_body) || PARAPHRASED_GROOMED_RE.is_match(issue_body);
+    let has_groomed_marker = GROOMED_VERDICT_RE.is_match(issue_body)
+        || PARAPHRASED_GROOMED_RE.is_match(issue_body)
+        || SINGLE_PASS_GROOMED_RE.is_match(issue_body);
     if !has_groomed_marker {
         missing.push("groomed_verdict");
     }

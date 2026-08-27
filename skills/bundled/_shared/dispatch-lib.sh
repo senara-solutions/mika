@@ -2510,8 +2510,21 @@ _write_canonical_callout() {
     [ -n "$REPO" ] && [ -n "$ISSUE_NUM" ] && [ -n "$BRANCH" ] || {
         echo "WARN: write_canonical_callout: REPO/ISSUE_NUM/BRANCH unset" >&2; return 1; }
 
-    # Compose the Grooming history line per stage. Both forms include
-    # "second-pass (GROOMED)" to satisfy the dispatch-gate has_verdict regex.
+    # Compose the Grooming history line per stage. Every form must carry a
+    # verdict marker that `executor.rs::check_grooming_markers` recognises,
+    # otherwise the ticket stays structurally invisible to the dispatch gate and
+    # gets re-groomed forever (mika#2012).
+    #
+    # `ready-single-pass` exists because the first-pass READY disposition is a
+    # LEGITIMATE grooming exit (/mika-groom-ticket Phase 3 step 10: "Disposition:
+    # READY — plan is sound. Commit the staged plan […] and skip to Phase 5").
+    # Before mika#2012 it had no stage at all, so this function returned 1, no
+    # verdict was written, and the gate never saw the ticket as groomed.
+    #
+    # Its line must NOT claim "second-pass (GROOMED)" — no second pass ran, and a
+    # body that says otherwise is a lie the next reader inherits. It carries its
+    # own truthful marker instead, mirroring the shape of the existing
+    # "second-pass (READY, paraphrased GROOMED" variant.
     local history_line
     case "$stage" in
         ready-to-groomed)
@@ -2520,8 +2533,14 @@ _write_canonical_callout() {
         iterate-to-groomed)
             history_line="> - **Grooming history:** first-pass (ITERATE) → revised → second-pass (GROOMED) — session-id: ${session_id}"
             ;;
+        ready-single-pass)
+            history_line="> - **Grooming history:** first-pass (READY, single-pass GROOMED) — no second pass required — session-id: ${session_id}"
+            ;;
         *)
-            echo "WARN: write_canonical_callout: unknown stage \"$stage\"" >&2
+            # Operator-visible, not just a stderr WARN: an unknown stage means a
+            # grooming run produced no verdict marker, which is exactly the
+            # silent failure mode mika#2012 was filed for. Make it greppable.
+            echo "write_canonical_callout_unknown_stage: stage=\"$stage\" repo=${REPO} issue=${ISSUE_NUM} — NO VERDICT WRITTEN, ticket will re-groom (mika#2012)" >&2
             return 1
             ;;
     esac
