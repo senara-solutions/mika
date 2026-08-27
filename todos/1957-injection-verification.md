@@ -46,3 +46,21 @@ narrower class.
 ```
 test result: ok. 20 passed; 0 failed
 ```
+
+## Inversion 3 — remove the pre-existing `FIRST_WORD` case block
+
+Added during `/ce:review`. The two first-word regression tests originally asserted only
+that *some* error appeared on stderr, so they passed whether the old gate or the new L3
+scan refused the command — meaning they would have kept passing if the `FIRST_WORD`
+block were deleted, and were not the regression guard they claimed to be. They now match
+the first-word gate's own message.
+
+Before the fix, with the `FIRST_WORD` block deleted: 20 passed, 0 failed.
+After the fix, same deletion:
+
+```
+test result: FAILED. 18 passed; 2 failed
+```
+
+Failures: `shell_exec_first_word_gws_still_blocked`, `shell_exec_first_word_gh_still_blocked`.
+Both gates are now independently pinned.

@@ -262,12 +262,24 @@ the single axis of vigilance for every future testimony-adjacent change.**
   regressed mika#1641 for no added coverage, since the `run.sh` scan fires for
   every tier regardless of which allowlist granted the skill.
 
-  **Deliberately not closed** (defense-in-depth, not a sole gate): renamed or
-  aliased binaries (`gws-alias`), base64/obfuscated payloads
-  (`echo … | base64 -d | sh`), and raw-HTTP calls to the underlying APIs
-  (`curl https://gmail.googleapis.com/...`). The first two are still caught by
-  L2 and L4 at the real tool call; the third is covered by no layer and remains
-  listed below.
+  **Deliberately not closed.** The scan is lexical, so any shape that hides the
+  literal token from a byte-level match still reaches the CLI. That class is
+  wider than encoding tricks, and the measured members are:
+
+  | Shape | Example |
+  |---|---|
+  | Token splitting | `g""ws gmail …`, `g''ws gmail …`, `gw\s gmail …` |
+  | Glob expansion | `/usr/bin/gw[s] gmail …`, `/usr/bin/gw? gmail …` |
+  | Variable assembly | `A=g; B=ws; $A$B gmail …` |
+  | Encoded payload | `echo <base64> \| base64 -d \| sh` |
+  | Renamed / aliased binary | `PATH=/tmp:$PATH gws-alias gmail …` |
+
+  Closing these would require parsing shell grammar, which is an arms race with
+  no fixed point — so the scan is scoped to the casual and incidental path,
+  which is where observed traffic sits. For every row above, the registry ban
+  (L2) and the execute-time guard (L4) still fire at the real tool call, after
+  the command has resolved. **This layer narrows the surface; it does not
+  eliminate it, and it must not be cited as though it did.**
 
 - **Deliberate false-positive.** The scan is lexical, so a command that merely
   *mentions* `gws` or `gh` on an identifier boundary is refused too — e.g.

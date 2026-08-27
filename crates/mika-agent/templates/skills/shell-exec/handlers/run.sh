@@ -45,10 +45,21 @@ esac
 # Excluding `.` and `-` from the boundary keeps ordinary paths and flags usable:
 # `.github/...`, `gh-pages`, and `/tmp/gws.log` are not matches.
 #
-# Defense-in-depth, not a sole gate. Known gaps, deliberately not chased here:
-# renamed/aliased binaries, base64-obfuscated payloads, and raw-HTTP calls to
-# the underlying APIs. The registry ban (L2) and the execute-time guard (L4)
-# from mika#1798 remain the last-mile checks.
+# Defense-in-depth, NOT a sole gate. The scan is lexical, so anything that
+# hides the literal token from a byte-level match still gets through, and that
+# is broader than obfuscation-by-encoding. Measured gaps, deliberately not
+# chased here (arms race with no fixed point short of parsing shell grammar):
+#   - token splitting:        g""ws gmail ...   g''ws gmail ...   gw\s gmail ...
+#   - glob expansion:         /usr/bin/gw[s] gmail ...   /usr/bin/gw? gmail ...
+#   - variable assembly:      A=g; B=ws; $A$B gmail ...
+#   - encoded payloads:       echo <base64> | base64 -d | sh
+#   - renamed/aliased binary: PATH=/tmp:$PATH gws-alias gmail ...
+# For all of the above, the registry ban (L2) and the execute-time guard (L4)
+# from mika#1798 remain the last-mile checks — they fire at the real tool call,
+# where the command has already been resolved. What this scan buys is the
+# casual and the incidental path, which is where the observed traffic is.
+# A raw-HTTP call to the underlying API (curl https://gmail.googleapis.com/...)
+# is covered by no layer at all; see the doctrine doc's bypass-class list.
 if printf '%s\n' "$COMMAND" | grep -Eq '(^|[^A-Za-z0-9_.-])(gws|gh)([^A-Za-z0-9_.-]|$)'; then
     echo "Error: shell-exec refuses commands that route to skill-gated CLIs (gws, gh). Use the dedicated run_gws or run_gh skill instead." >&2
     exit 1

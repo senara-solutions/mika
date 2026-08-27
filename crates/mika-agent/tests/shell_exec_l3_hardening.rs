@@ -81,17 +81,22 @@ fn assert_blocked_by_l3(command: &str) {
     );
 }
 
-/// Assert the handler refused `command`, without caring which gate fired.
-fn assert_refused(command: &str) {
+/// Assert the handler refused `command` via the pre-existing first-word gate,
+/// identified by its own distinct message. Matching on the specific string
+/// matters: the L3 scan would refuse these commands too, so a test that only
+/// asserted "some error" would keep passing if the first-word block were
+/// deleted — and would stop being the regression guard it claims to be.
+fn assert_blocked_by_first_word(command: &str, skill: &str) {
     let out = run_handler(command);
     assert!(
         !out.success,
         "expected refusal for {command:?}, but the handler succeeded with stdout: {}",
         out.stdout
     );
+    let expected = format!("Use the dedicated {skill} skill instead of run_shell");
     assert!(
-        out.stderr.contains("Error:"),
-        "expected an error on stderr for {command:?}, got: {}",
+        out.stderr.contains(&expected),
+        "expected the first-word refusal ({expected:?}) for {command:?}, got stderr: {}",
         out.stderr
     );
 }
@@ -182,12 +187,12 @@ fn shell_exec_rejects_newline_separated_statement() {
 
 #[test]
 fn shell_exec_first_word_gws_still_blocked() {
-    assert_refused("gws gmail messages list");
+    assert_blocked_by_first_word("gws gmail messages list", "run_gws");
 }
 
 #[test]
 fn shell_exec_first_word_gh_still_blocked() {
-    assert_refused("gh pr list");
+    assert_blocked_by_first_word("gh pr list", "run_gh");
 }
 
 // --- False-positive guards: ordinary commands must keep working ---------------
