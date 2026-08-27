@@ -194,6 +194,24 @@ impl AppState {
             .ok()
             .flatten()?;
 
+        // mika#1962 — the boot guard scanned `agents/` once, in `run_server`;
+        // this agent may have appeared since. Re-check it before constructing,
+        // or an agent bootstrapped from a shell carrying MIKA_AGENT_TIER=family
+        // gets served under this process's (operator) tier, silently. Decline
+        // the agent rather than propagating: one drifted agent is not a reason
+        // to stop serving the healthy ones.
+        let tier = mika_common::home::AgentTier::from_env();
+        if let Err(e) =
+            crate::server::tier_guard::check_agent_tier_consistency(&agent_home, &normalized, tier)
+        {
+            tracing::error!(
+                agent = %normalized,
+                error = %e,
+                "refusing to lazy-resolve agent: family-tier provisioning drift"
+            );
+            return None;
+        }
+
         // Construct via the same factory as startup.
         let embedding_client = self.settings.make_embedding_client();
         match super::init_agent(

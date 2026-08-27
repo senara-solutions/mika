@@ -116,3 +116,41 @@ during the plan-deepen would have **failed on the correct implementation** —
 gate that fires on correct code gets disabled the first time it fires, so the
 wording was corrected here and in the plan's Definition of Done rather than left
 to be discovered by whoever next touches this file.
+
+
+---
+
+## Post-review re-run (2026-08-27)
+
+`/ce:review` produced six findings; five were fixed in-ticket (see the plan's
+§ Review findings and resolutions). Those fixes changed the guard's body — new
+enumeration (`servable_agent_names`), a narrowed malformed-TOML path, a derived
+error message, and a new per-agent entry point — so I1 was re-run against the
+corrected code rather than assumed to still hold.
+
+**I1 re-run, same inversion (both detection axes short-circuited to `false`):**
+
+| | Before fixes | After fixes |
+|---|---|---|
+| Baseline | 9 passed, 0 failed | **16 passed, 0 failed** |
+| Detection disabled | 4 passed, 5 failed | **8 passed, 8 failed** |
+
+Eight tests now fail where five did before, because the tests added for F1, F3
+and F4 also depend on detection actually firing. The tree was restored and
+re-verified at 16/16 green.
+
+**Gate wording, corrected a second time.** The authorized-read set grew again
+with the F1 fix (`server/state.rs`, the lazy-resolve callsite) and the F5 fix
+(`server/tier_guard.rs`, the message-coherence comparison). The gate is now
+stated by *role* rather than by file list, so it stops needing an amendment
+every time the tier-resolution surface legitimately gains a member:
+
+> No production `AgentTier::from_env()` hit outside the tier-resolution surface
+> — `server/mod.rs` (init + boot guard), `server/state.rs` (lazy-resolve guard),
+> `server/tier_guard.rs` (message coherence). A hit in `agent_loop/`, `teams/`,
+> `task_engine/`, or `server/investigate.rs` is a regression: those are the
+> per-turn consumers that must read the cache.
+
+That this gate needed correcting twice, in the same ticket, is the finding worth
+carrying forward — a structural gate written as a file whitelist ages badly
+against its own feature. Written as "which *role* may read this", it does not.
