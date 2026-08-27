@@ -237,10 +237,38 @@ impl OpenAiCompatibleProvider {
         // for four months described as an "upstream flake" — nobody could tell
         // whether it was a truncated stream, an HTML error page, or a schema the
         // provider changed.
-        let body = response
-            .text()
-            .await
-            .map_err(|e| LlmError::ParseError(format!("failed to read response body: {e}")))?;
+        // A failure HERE is a transport failure, not a parse failure: the bytes
+        // never arrived. Within the first hour of #2015's diagnostics being
+        // deployed (2026-08-27 09:52Z), 48 of 48 parse-error occurrences were
+        // body-read failures — the serde branch below never fired once. Mapping
+        // this to ParseError (non-retryable) is what made every mid-body network
+        // hiccup kill a whole pilot cycle for four months; Transport routes it
+        // through the existing fast-retry path (#1744) instead.
+        //
+        // reqwest's Display for this error is the opaque "error decoding
+        // response body" — the cause (unexpected EOF, decompression error,
+        // reset) lives in the source chain, so walk it into the message.
+        let body = match response.text().await {
+            Ok(b) => b,
+            Err(e) => {
+                let mut chain = e.to_string();
+                let mut src = std::error::Error::source(&e);
+                while let Some(s) = src {
+                    chain.push_str(": ");
+                    chain.push_str(&s.to_string());
+                    src = s.source();
+                }
+                warn!(
+                    target: "mika::llm",
+                    provider = %self.provider_kind,
+                    error = %chain,
+                    "LLM response body read failed mid-stream (retryable transport)"
+                );
+                return Err(LlmError::Transport(format!(
+                    "failed to read response body: {chain}"
+                )));
+            }
+        };
 
         let resp: OpenAiResponse = serde_json::from_str(&body).map_err(|e| {
             // serde_json names the offending line, column and field — unlike the
