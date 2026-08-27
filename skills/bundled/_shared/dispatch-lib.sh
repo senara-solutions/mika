@@ -2612,7 +2612,22 @@ _write_canonical_callout() {
         echo "WARN: write_canonical_callout: no issue-scoped plan file for $REPO#$ISSUE_NUM" >&2
         return 1
     }
+    # The body must carry a REPO-RELATIVE path: it is read by humans on GitHub
+    # and by the dispatch gate against the branch, neither of which can resolve
+    # a machine-local absolute path. If the strip below is a no-op the plan is
+    # not under the worktree, and writing it verbatim would put an absolute path
+    # into a public issue body (mika#2012 U3).
     local plan_relpath="${plan_path#"$WORKTREE_DIR/"}"
+    case "$plan_relpath" in
+        /*)
+            echo "write_canonical_callout_plan_outside_worktree: repo=${REPO} issue=${ISSUE_NUM} plan=${plan_path} worktree=${WORKTREE_DIR} — refusing to write an absolute path into the issue body" >&2
+            return 1
+            ;;
+    esac
+    [ -f "$WORKTREE_DIR/$plan_relpath" ] || {
+        echo "write_canonical_callout_plan_missing: repo=${REPO} issue=${ISSUE_NUM} plan=${plan_relpath} — file not present in worktree" >&2
+        return 1
+    }
 
     # Fetch current body for idempotency check.
     local current_body
@@ -2627,7 +2642,15 @@ _write_canonical_callout() {
     local has_branch has_plan has_verdict
     has_branch=$(printf '%s' "$current_body" | grep -cF '> - **Branch:**' || true)
     has_plan=$(printf '%s' "$current_body" | grep -cF 'docs/plans/' || true)
-    has_verdict=$(printf '%s' "$current_body" | grep -cE 'second-pass \(GROOMED\)|second-pass \(READY, paraphrased GROOMED' || true)
+    # This pattern MUST stay in lockstep with executor.rs's three verdict regexes
+    # (GROOMED_VERDICT_RE, PARAPHRASED_GROOMED_RE, SINGLE_PASS_GROOMED_RE).
+    # Drift between them is not cosmetic: a form the gate accepts but this check
+    # misses makes the writer believe the body is unstamped, so it prepends a
+    # SECOND callout block on every pass. That is the callout stacking measured
+    # on mika#1962 (2 blocks) — the previous `\(GROOMED\)` required an immediate
+    # closing paren and therefore missed the canonical
+    # `second-pass (GROOMED — session-id: …)` shape the writer itself emits.
+    has_verdict=$(printf '%s' "$current_body" | grep -cE 'second-pass \(GROOMED[[:space:])._,;:—-]|second-pass \(READY, paraphrased GROOMED|first-pass \(READY, single-pass GROOMED' || true)
 
     if [ "$has_branch" -gt 0 ] && [ "$has_plan" -gt 0 ] && [ "$has_verdict" -gt 0 ]; then
         echo "write_canonical_callout: dispatch-gate signals already present in $REPO#$ISSUE_NUM body — skipping (idempotent)" >&2
@@ -2645,8 +2668,24 @@ ${history_line}
 CALLOUT_EOF
     )
 
+    # REPLACE, never stack (mika#2012 U3). We only reach here when at least one
+    # of the three signals was missing, which means the body may still carry a
+    # PARTIAL callout — a Branch line with no verdict, a stale Plan path from a
+    # prior branch, a recovery callout from mika#1123. Prepending on top of that
+    # leaves two callout blocks in the body: the reader cannot tell which is
+    # authoritative, and the older block's stale plan path outlives the branch it
+    # named. Measured on mika#1962: 2 stacked blocks, the older one carrying no
+    # verdict at all.
+    #
+    # Strip any existing callout lines first, then drop the blank lines they
+    # leave behind at the top, then prepend the single authoritative block.
+    local stripped_body
+    stripped_body=$(printf '%s' "$current_body" \
+        | grep -vE '^> - \*\*(Branch|Plan|Grooming history):\*\*' \
+        | sed '/./,$!d')
+
     local new_body
-    new_body=$(printf '%s\n\n%s' "$callout_block" "$current_body")
+    new_body=$(printf '%s\n\n%s' "$callout_block" "$stripped_body")
     local tmpfile
     tmpfile=$(mktemp /tmp/canonical-callout-XXXXXX.md)
     printf '%s' "$new_body" > "$tmpfile"

@@ -789,6 +789,57 @@ assert_contains "unknown stage emits greppable operator diagnostic" 'write_canon
 assert_contains "unknown stage diagnostic names the consequence" 'NO VERDICT WRITTEN' "$unknown_stderr"
 rm -rf "$CC_UNKNOWN_TMP"
 
+# --- Callout replacement + path discipline (mika#2012 U3) ---
+
+# Pin: the writer's idempotency pattern must stay in lockstep with executor.rs's
+# three verdict regexes. Drift is not cosmetic — a form the gate accepts but this
+# check misses makes the writer prepend a SECOND callout on every pass.
+assert_contains "idempotency check knows canonical GROOMED (delimiter-tolerant)" 'second-pass \(GROOMED[[:space:])._,;:—-]' "$WRITER_SRC"
+assert_contains "idempotency check knows paraphrased GROOMED" 'second-pass \(READY, paraphrased GROOMED' "$WRITER_SRC"
+assert_contains "idempotency check knows single-pass GROOMED" 'first-pass \(READY, single-pass GROOMED' "$WRITER_SRC"
+
+# The delimiter-tolerant form is the load-bearing fix: the OLD pattern was
+# `second-pass \(GROOMED\)`, which required an immediate closing paren and so
+# missed `second-pass (GROOMED — session-id: …)` — the exact shape this same
+# function emits. That mismatch is the callout-stacking mechanism.
+VERDICT_RE='second-pass \(GROOMED[[:space:])._,;:—-]|second-pass \(READY, paraphrased GROOMED|first-pass \(READY, single-pass GROOMED'
+assert_eq "verdict pattern matches canonical em-dash session-id shape" "1" \
+    "$(printf '%s' '> - **Grooming history:** first-pass (READY) → second-pass (GROOMED — session-id: abc)' | grep -cE "$VERDICT_RE" || true)"
+assert_eq "verdict pattern matches single-pass shape" "1" \
+    "$(printf '%s' '> - **Grooming history:** first-pass (READY, single-pass GROOMED) — no second pass required' | grep -cE "$VERDICT_RE" || true)"
+assert_eq "verdict pattern does not match bare first-pass READY" "0" \
+    "$(printf '%s' '> - **Grooming history:** first-pass (READY) — awaiting second pass' | grep -cE "$VERDICT_RE" || true)"
+assert_eq "old pattern would have MISSED the em-dash shape (regression witness)" "0" \
+    "$(printf '%s' '> - **Grooming history:** second-pass (GROOMED — session-id: abc)' | grep -cE 'second-pass \(GROOMED\)' || true)"
+
+# Replacement, not stacking: existing callout lines are stripped before prepend.
+assert_contains "writer strips existing callout lines" 'stripped_body=' "$WRITER_SRC"
+assert_contains "writer strips all three callout line kinds" 'Branch|Plan|Grooming history' "$WRITER_SRC"
+assert_contains "writer prepends onto the STRIPPED body, not the raw one" 'new_body=$(printf '"'"'%s\n\n%s'"'"' "$callout_block" "$stripped_body")' "$WRITER_SRC"
+
+# Functional: a body carrying TWO stacked callout blocks (the mika#1962 shape)
+# must come out with zero callout lines left.
+STACKED_BODY='> - **Branch:** `fix/1962/new`
+> - **Plan:** `docs/plans/new-plan.md` (committed on branch @ `bbb2222`)
+> - **Grooming history:** first-pass (READY) → second-pass (GROOMED — session-id: two)
+
+> - **Branch:** `fix/1962/old`
+> - **Plan:** `docs/plans/stale-plan.md` (committed on branch @ `aaa1111`)
+> - **Grooming history:** body callout recovered by post-flight (mika#1123)
+
+## Symptom
+Real content that must survive.'
+STRIPPED_OUT=$(printf '%s' "$STACKED_BODY" | grep -vE '^> - \*\*(Branch|Plan|Grooming history):\*\*' | sed '/./,$!d')
+assert_eq "stripping removes every callout line from a stacked body" "0" \
+    "$(printf '%s' "$STRIPPED_OUT" | grep -cE '^> - \*\*(Branch|Plan|Grooming history):\*\*' || true)"
+assert_contains "stripping preserves the real issue content" '## Symptom' "$STRIPPED_OUT"
+assert_contains "stripping preserves body prose" 'Real content that must survive.' "$STRIPPED_OUT"
+assert_not_contains "stripping drops the stale plan path" 'stale-plan.md' "$STRIPPED_OUT"
+
+# Path discipline: the body must carry a repo-relative path that exists.
+assert_contains "writer refuses a plan outside the worktree" 'write_canonical_callout_plan_outside_worktree' "$WRITER_SRC"
+assert_contains "writer refuses a plan file that is absent" 'write_canonical_callout_plan_missing' "$WRITER_SRC"
+
 # ----------------------------------------------------------------------------
 # Redundant-groom refusal gate (mika#2012)
 # ----------------------------------------------------------------------------
