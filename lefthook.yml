@@ -37,21 +37,10 @@ pre-commit:
           python3 -c "import tomllib; tomllib.load(open('$f','rb'))" 2>&1 || exit 1;
         done
 
-    no-secrets:
-      glob: "*.{rs,ts,tsx,js,jsx,toml,json,sh,env}"
-      exclude: "lefthook*.yml"
-      run: >
-        grep -rn -E '(sk-ant-api[0-9]+-[A-Za-z0-9_-]{20,}|sk-ant-oat[0-9]+-[A-Za-z0-9_-]{20,}|AKIA[A-Z0-9]{16}|-----BEGIN (RSA |EC )?PRIVATE KEY)' {staged_files}
-        | grep -v 'TEST_RSA_PEM'
-        | grep -v 'secret_scrubber'
-        && echo "Potential secret detected!" && exit 1 || true
-
-    no-large-files:
-      run: >
-        for f in {staged_files}; do
-          size=$(wc -c < "$f" 2>/dev/null || echo 0);
-          if [ "$size" -gt 1048576 ]; then
-            echo "File $f is $(( size / 1024 ))KB — exceeds 1MB limit";
-            exit 1;
-          fi;
-        done
+    # Secret scan + 1MB large-file cap — both delegate to the shared scanner
+    # (scripts/check-secrets.sh), the single source of truth also consumed by the
+    # CI `secret-scan` job. The `--no-verify` rescue path (mika#1685) bypasses this
+    # whole pre-commit block, so CI carries the same net; keeping the regex + 1MB
+    # threshold in one script means the two nets cannot drift (mika#1689).
+    no-secrets-and-large-files:
+      run: bash scripts/check-secrets.sh {staged_files}
