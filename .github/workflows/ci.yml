@@ -205,6 +205,14 @@ jobs:
       - name: Scan changed files for secrets and oversized blobs (mika#1689)
         run: bash scripts/check-secrets.sh --changed origin/main
 
+  pilot-egress-status-tap:
+    name: Pilot Egress Status Tap
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      - name: Verify the pilot egress-proxy upstream-status tap (mika#1901)
+        run: python3 -B scripts/test-pilot-egress-proxy-status.py
+
   pipeline-artifacts:
     name: Pipeline Artifacts
     runs-on: ubuntu-22.04

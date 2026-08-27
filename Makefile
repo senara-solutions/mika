@@ -124,7 +124,7 @@ test: ## Run all tests
 	cargo test
 	@bash scripts/test-dispatch-symmetry.sh
 	@bash scripts/deploy-info-test.sh
-	@python3 scripts/test-pilot-egress-proxy-status.py
+	@python3 -B scripts/test-pilot-egress-proxy-status.py
 
 test-async-db-saturation: ## Run async DB channel saturation regression test (mika#1258)
 	cargo test -p mika-agent --lib -- async_db::tests::test_async_db_saturated_channel_does_not_pin_workers --nocapture
@@ -133,7 +133,7 @@ test-dispatch-symmetry: ## Verify dev-pilot and dev-groom handlers are structura
 	@bash scripts/test-dispatch-symmetry.sh
 
 test-pilot-egress-proxy: ## Verify the pilot egress-proxy upstream-status tap (mika#1901)
-	@python3 scripts/test-pilot-egress-proxy-status.py
+	@python3 -B scripts/test-pilot-egress-proxy-status.py
 
 verify-bundled-skills: ## Verify structural invariants on bundled skills — pre-merge counterpart to AC2 (mika#1575)
 	cargo run -q --bin verify-bundled-skills

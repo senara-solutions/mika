@@ -84,9 +84,21 @@ class ParseStatusLineTests(unittest.TestCase):
         self.assertIsNone(proxy._parse_status_line(b"\x00\x01garbage\r\n"))
         self.assertIsNone(proxy._parse_status_line(b""))
 
-    def test_head_without_terminator_yields_no_status(self) -> None:
-        # A single CRLF-less fragment is not yet a status line.
-        self.assertIsNone(proxy._parse_status_line(b"HTTP/1.1 200 OK"))
+    def test_unterminated_first_line_still_yields_its_code(self) -> None:
+        # The code is readable before the CRLF arrives; requiring the CRLF is
+        # what made a headerless response report as UPSTREAM_NO_RESPONSE.
+        self.assertEqual(proxy._parse_status_line(b"HTTP/1.1 200 OK"), 200)
+
+    def test_status_line_with_no_headers_at_all_is_read(self) -> None:
+        tap = proxy._ResponseHeadTap()
+        tap.feed(b"HTTP/1.1 429 Too Many Requests\r\n\r\n")
+        self.assertEqual(proxy._parse_status_line(tap.head), 429)
+
+    def test_partially_arrived_code_is_not_guessed(self) -> None:
+        self.assertIsNone(proxy._parse_status_line(b"HTTP/1.1 4"))
+        self.assertIsNone(proxy._parse_status_line(b"HTTP/1.1 42"))
+        # A prefix of a longer number must not be read as a 3-digit code.
+        self.assertIsNone(proxy._parse_status_line(b"HTTP/1.1 4299 Weird"))
 
 
 class ResponseHeadTapTests(unittest.TestCase):
@@ -98,6 +110,26 @@ class ResponseHeadTapTests(unittest.TestCase):
         self.assertFalse(tap.complete)
         self.assertEqual(tap.head, b"")
         self.assertIsNone(proxy._parse_status_line(tap.head))
+
+    def test_interim_1xx_head_does_not_become_the_verdict(self) -> None:
+        # 100 Continue / 103 Early Hints are preambles. Latching on one would
+        # log `-> 100` and hide the real answer behind it.
+        tap = proxy._ResponseHeadTap()
+        tap.feed(
+            b"HTTP/1.1 100 Continue\r\n\r\n"
+            b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 5\r\n\r\n"
+        )
+        self.assertTrue(tap.complete)
+        self.assertEqual(proxy._parse_status_line(tap.head), 429)
+        self.assertEqual(proxy._select_quota_headers(tap.head), [("Retry-After", "5")])
+
+    def test_interim_head_split_across_chunks_is_skipped(self) -> None:
+        tap = proxy._ResponseHeadTap()
+        tap.feed(b"HTTP/1.1 103 Early Hints\r\nlink: </x>\r\n\r")
+        self.assertFalse(tap.complete)
+        tap.feed(b"\nHTTP/1.1 200 OK\r\n\r\n")
+        self.assertTrue(tap.complete)
+        self.assertEqual(proxy._parse_status_line(tap.head), 200)
 
     def test_ignores_body_bytes_after_the_head_completes(self) -> None:
         tap = proxy._ResponseHeadTap()
@@ -154,6 +186,16 @@ class QuotaHeaderSelectionTests(unittest.TestCase):
 
 
 class RelayTapTests(unittest.IsolatedAsyncioTestCase):
+    """The relay owns byte fidelity AND the one-line-per-request guarantee."""
+
+    async def _relay(self, reader, writer):
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            await proxy._relay_response_with_status_tap(
+                reader, writer, "POST", "/v1/messages?beta=true"
+            )
+        return buffer.getvalue().splitlines()
+
     async def test_relays_multi_chunk_sse_byte_identically(self) -> None:
         chunks = [
             b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n",
@@ -162,31 +204,27 @@ class RelayTapTests(unittest.IsolatedAsyncioTestCase):
             b"event: message_stop\r\ndata: {}\r\n\r\n",
         ]
         writer = _CapturingWriter()
-        status, headers = await proxy._relay_response_with_status_tap(
-            _reader_of(*chunks), writer
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(headers, [])
+        lines = await self._relay(_reader_of(*chunks), writer)
         self.assertEqual(writer.payload, b"".join(chunks))
+        self.assertEqual(
+            lines, ["[anthropic-proxy] ALLOW POST /v1/messages?beta=true -> 200"]
+        )
 
     async def test_head_split_mid_status_line_still_relays_intact(self) -> None:
         chunks = [b"HTTP/1.", b"1 429 Too Many\r\nRetry-After: 7\r\n\r\n", b"{}"]
         writer = _CapturingWriter()
-        status, headers = await proxy._relay_response_with_status_tap(
-            _reader_of(*chunks), writer
-        )
-        self.assertEqual(status, 429)
-        self.assertEqual(headers, [("Retry-After", "7")])
+        lines = await self._relay(_reader_of(*chunks), writer)
         self.assertEqual(writer.payload, b"".join(chunks))
+        self.assertIn("Retry-After=7", lines[1])
 
     async def test_upstream_closing_with_no_bytes_reports_no_status(self) -> None:
         writer = _CapturingWriter()
-        status, headers = await proxy._relay_response_with_status_tap(
-            _reader_of(), writer
-        )
-        self.assertIsNone(status)
-        self.assertEqual(headers, [])
+        lines = await self._relay(_reader_of(), writer)
         self.assertEqual(writer.payload, b"")
+        self.assertEqual(
+            lines,
+            ["[anthropic-proxy] UPSTREAM_NO_RESPONSE POST /v1/messages?beta=true"],
+        )
 
     async def test_client_receives_each_chunk_before_the_next_is_read(self) -> None:
         # The tap must not batch: a streamed response has to reach the client
@@ -198,9 +236,73 @@ class RelayTapTests(unittest.IsolatedAsyncioTestCase):
             b"data: two\r\n\r\n",
         ]
         writer = _CapturingWriter()
-        await proxy._relay_response_with_status_tap(_reader_of(*chunks), writer)
+        await self._relay(_reader_of(*chunks), writer)
         self.assertEqual(writer.drains, len(writer.chunks))
         self.assertGreaterEqual(writer.drains, 1)
+
+    async def test_verdict_survives_a_client_that_dies_mid_body(self) -> None:
+        # The founding incident's real shape: upstream answers 429, the pilot
+        # stalls, the guardrail kills it, the client socket closes. Logging
+        # only after a clean EOF loses the verdict exactly here.
+        class DyingWriter(_CapturingWriter):
+            def __init__(self, die_after: int) -> None:
+                super().__init__()
+                self._die_after = die_after
+
+            async def drain(self) -> None:
+                await super().drain()
+                if self.drains > self._die_after:
+                    raise ConnectionResetError("client gone")
+
+        writer = DyingWriter(die_after=1)
+        reader = _reader_of(
+            b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\n\r\n",
+            b'{"error":"rate_limit"}',
+        )
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            with contextlib.suppress(ConnectionResetError):
+                await proxy._relay_response_with_status_tap(
+                    reader, writer, "POST", "/v1/messages"
+                )
+        lines = buffer.getvalue().splitlines()
+        self.assertTrue(any("RATE_LIMITED" in line for line in lines), lines)
+
+    async def test_stalled_stream_reports_before_the_body_ends(self) -> None:
+        # The verdict is emitted at the head, so a response that never
+        # completes is still diagnosed.
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\n\r\n")
+        writer = _CapturingWriter()
+        buffer = io.StringIO()
+
+        async def relay():
+            with contextlib.redirect_stderr(buffer):
+                await proxy._relay_response_with_status_tap(
+                    reader, writer, "POST", "/v1/messages"
+                )
+
+        task = asyncio.create_task(relay())
+        await asyncio.sleep(0.05)  # upstream is still "thinking"; no EOF yet
+        self.assertIn("RATE_LIMITED", buffer.getvalue())
+        reader.feed_eof()
+        await task
+        # And exactly one verdict, not one per phase.
+        self.assertEqual(buffer.getvalue().count("RATE_LIMITED"), 1)
+        self.assertEqual(buffer.getvalue().count("ALLOW"), 1)
+
+    async def test_interim_response_does_not_produce_an_early_verdict(self) -> None:
+        chunks = [
+            b"HTTP/1.1 100 Continue\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n",
+            b"data: one\r\n\r\n",
+        ]
+        writer = _CapturingWriter()
+        lines = await self._relay(_reader_of(*chunks), writer)
+        self.assertEqual(writer.payload, b"".join(chunks))
+        self.assertEqual(
+            lines, ["[anthropic-proxy] ALLOW POST /v1/messages?beta=true -> 200"]
+        )
 
 
 class UpstreamOutcomeLoggingTests(unittest.TestCase):

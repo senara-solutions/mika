@@ -244,7 +244,12 @@ def read_subscription_token() -> tuple[str | None, float | None]:
 
 _HEAD_TERMINATOR = b"\r\n\r\n"
 RESPONSE_HEAD_CAP = 65536
-_STATUS_LINE_RE = re.compile(rb"^HTTP/\d\.\d[ \t]+(\d{3})", re.ASCII)
+# The trailing (?:[ \t]|$) keeps a still-arriving code from being misread: it
+# matches a completed 3-digit code followed by the reason phrase, or one that
+# ends the buffer, but not a prefix of a longer number.
+_STATUS_LINE_RE = re.compile(rb"^HTTP/\d\.\d[ \t]+(\d{3})(?:[ \t]|$)", re.ASCII)
+# 1xx is a preamble (100 Continue, 103 Early Hints), never the verdict.
+_INTERIM_STATUS_CEILING = 200
 
 # Quota metadata Anthropic returns alongside a throttle verdict. `request-id`
 # is an opaque upstream correlation id — the 2026-08-06 investigation quoted
@@ -273,15 +278,26 @@ class _ResponseHeadTap:
         if self.complete or self.overflowed:
             return
         self._buf += chunk
-        if _HEAD_TERMINATOR in self._buf:
-            self.complete = True
-        elif len(self._buf) > self._cap:
-            self.overflowed = True
-            self._buf = bytearray()
+        while True:
+            idx = self._buf.find(_HEAD_TERMINATOR)
+            if idx < 0:
+                if len(self._buf) > self._cap:
+                    self.overflowed = True
+                    self._buf = bytearray()
+                return
+            status = _parse_status_line(bytes(self._buf[:idx]))
+            if status is None or status >= _INTERIM_STATUS_CEILING:
+                self.complete = True
+                del self._buf[idx:]  # keep the head, drop the body
+                return
+            # An interim 1xx head is a preamble, not the answer. Drop it and
+            # keep reading, or the log would report `-> 100` and hide the real
+            # verdict behind a status that merely looks like one.
+            del self._buf[: idx + len(_HEAD_TERMINATOR)]
 
     @property
     def head(self) -> bytes:
-        """Bytes up to (not including) the head terminator, or b'' on overflow.
+        """The response head, or b'' on overflow.
 
         Returns whatever has accumulated so far when the head is still open —
         the status line is usually readable well before the last header.
@@ -295,13 +311,16 @@ class _ResponseHeadTap:
 def _parse_status_line(head: bytes) -> int | None:
     """Integer status code from a response head, or None if not yet readable.
 
-    None covers all three "we cannot say" cases the log must not report as a
-    verdict: no bytes at all, a first line that is not a status line, and a
-    status line that has not finished arriving.
+    None covers the cases the log must not report as a verdict: no bytes at
+    all, a first line that is not a status line, and a status code that has not
+    finished arriving.
+
+    The first line is read whether or not a CRLF has terminated it yet. A
+    response whose head is a bare status line with no headers is legal, and
+    requiring the CRLF made the proxy call it `UPSTREAM_NO_RESPONSE` — claiming
+    silence from an upstream that had in fact answered.
     """
-    line, sep, _rest = head.partition(b"\r\n")
-    if not sep:
-        return None
+    line = head.partition(b"\r\n")[0]
     match = _STATUS_LINE_RE.match(line)
     return int(match.group(1)) if match else None
 
@@ -365,23 +384,51 @@ def _log_upstream_outcome(
 async def _relay_response_with_status_tap(
     up_reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
-) -> tuple[int | None, list[tuple[str, str]]]:
-    """Stream upstream → client, reporting the status and quota headers seen.
+    method: str,
+    path: str,
+) -> None:
+    """Stream upstream → client, logging the verdict exactly once.
 
-    Write-then-tap ordering is load-bearing: the client gets every chunk at the
-    moment it arrives, exactly as before this tap existed. The accumulator only
-    ever sees a copy of bytes already sent.
+    Two properties this function owns:
+
+    **Write-then-tap.** The client gets every chunk at the moment it arrives,
+    exactly as before this tap existed. The accumulator only ever sees a copy
+    of bytes already sent.
+
+    **Log at the head, not at the end.** The verdict is emitted as soon as the
+    response head is complete, and the `finally` guarantees a line even when
+    the relay dies mid-body. Logging only after a clean EOF loses the verdict
+    in precisely the shape this instrumentation exists for: upstream answers
+    429, the pilot stalls, the guardrail kills it, the client socket closes,
+    `drain()` raises — and the proxy prints nothing at all.
     """
     tap = _ResponseHeadTap()
-    while True:
-        chunk = await up_reader.read(BUFFER_SIZE)
-        if not chunk:
-            break
-        writer.write(chunk)
-        await writer.drain()
-        tap.feed(chunk)
-    head = tap.head
-    return _parse_status_line(head), _select_quota_headers(head)
+    reported = False
+    try:
+        while True:
+            chunk = await up_reader.read(BUFFER_SIZE)
+            if not chunk:
+                break
+            writer.write(chunk)
+            await writer.drain()
+            if reported:
+                continue
+            tap.feed(chunk)
+            if tap.complete:
+                _log_upstream_outcome(
+                    method, path,
+                    _parse_status_line(tap.head),
+                    _select_quota_headers(tap.head),
+                )
+                reported = True
+    finally:
+        if not reported:
+            head = tap.head
+            _log_upstream_outcome(
+                method, path,
+                _parse_status_line(head),
+                _select_quota_headers(head),
+            )
 
 
 async def pipe_bytes(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -535,16 +582,13 @@ async def handle_anthropic_reverse_proxy(
                 await up_writer.drain()
                 remaining -= len(chunk)
         # Stream response upstream → client until upstream closes, reading the
-        # status line off the stream on the way past (mika#1901). The tap never
-        # holds a byte back — see _relay_response_with_status_tap.
-        status, quota_headers = await _relay_response_with_status_tap(
+        # status line off the stream on the way past and logging the verdict
+        # (mika#1901). The tap never holds a byte back and always logs exactly
+        # once — see _relay_response_with_status_tap.
+        await _relay_response_with_status_tap(
             up_reader, writer,
-        )
-        _log_upstream_outcome(
             method.decode("ascii"),
             new_path.decode("ascii", "replace"),
-            status,
-            quota_headers,
         )
     finally:
         try:
