@@ -31,6 +31,30 @@ case "$FIRST_WORD" in
     gh)   echo "Error: Use the dedicated run_gh skill instead of run_shell for security." >&2; exit 1 ;;
 esac
 
+# --- shell-exec L3 hardening (mika#1957, F3 from mika#1798) ---
+# The FIRST_WORD case above only inspects the first token, so every shape that
+# reaches a gated CLI through a subshell, a path prefix, or a statement
+# separator walks straight past it: `sh -c 'gws ...'`, `bash -c "gws ..."`,
+# `eval "gws ..."`, `echo 'gws ...' | sh`, `/usr/bin/gws ...`, `pwd; gws ...`,
+# `$(gws ...)`. Those calls never enter the run_gws/run_gh builtin handler, so
+# none of the non-transit doctrine's L1-L4 layers fire either.
+#
+# Lexical scan of the whole command string closes the class. The boundary is
+# "any character that cannot be part of a command identifier", which subsumes
+# whitespace, both quote characters, `;`, `|`, `&`, backtick, `$`, `(`, and `/`.
+# Excluding `.` and `-` from the boundary keeps ordinary paths and flags usable:
+# `.github/...`, `gh-pages`, and `/tmp/gws.log` are not matches.
+#
+# Defense-in-depth, not a sole gate. Known gaps, deliberately not chased here:
+# renamed/aliased binaries, base64-obfuscated payloads, and raw-HTTP calls to
+# the underlying APIs. The registry ban (L2) and the execute-time guard (L4)
+# from mika#1798 remain the last-mile checks.
+if printf '%s\n' "$COMMAND" | grep -Eq '(^|[^A-Za-z0-9_.-])(gws|gh)([^A-Za-z0-9_.-]|$)'; then
+    echo "Error: shell-exec refuses commands that route to skill-gated CLIs (gws, gh). Use the dedicated run_gws or run_gh skill instead." >&2
+    exit 1
+fi
+# --- end shell-exec L3 hardening ---
+
 if [ -n "$WORKDIR" ] && [ -d "$WORKDIR" ]; then
     cd "$WORKDIR" || exit 1
 fi
