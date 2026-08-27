@@ -224,6 +224,133 @@ def read_subscription_token() -> tuple[str | None, float | None]:
     return token, expires_at
 
 
+# ---------------------------------------------------------------------------
+# Upstream response-status tap (mika#1901)
+#
+# WHY: the reverse-proxy used to relay the upstream response as an opaque byte
+# loop and then print `ALLOW <method> <path>` unconditionally. A 429, a 401, a
+# 500 and a 200 all produced the same line — so on 2026-08-06 a pilot session
+# that Anthropic was throttling looked, in the log, exactly like a healthy one.
+# It stalled 606s, the guardrail killed it as an idle timeout, and establishing
+# the real cause needed an instrumented copy of this file plus a host-side curl.
+#
+# The tap below reads the status line off the stream WITHOUT owning it: the
+# relay writes each chunk to the client first and only then hands a copy to the
+# accumulator. Nothing is buffered ahead of the client, so SSE timing is
+# unchanged. Only the response HEAD is retained, capped, and only allowlisted
+# header names are ever eligible for logging — a wildcard dump would eventually
+# print an Authorization value after some upstream change.
+# ---------------------------------------------------------------------------
+
+_HEAD_TERMINATOR = b"\r\n\r\n"
+RESPONSE_HEAD_CAP = 65536
+_STATUS_LINE_RE = re.compile(rb"^HTTP/\d\.\d[ \t]+(\d{3})", re.ASCII)
+
+# Quota metadata Anthropic returns alongside a throttle verdict. `request-id`
+# is an opaque upstream correlation id — the 2026-08-06 investigation quoted
+# one (req_011CdmbTL5FH62zfwP7ieMhu) and it is what a support thread asks for.
+# Nothing here carries request or response content.
+_QUOTA_HEADER_NAMES = frozenset({"retry-after", "request-id"})
+_QUOTA_HEADER_PREFIX = "anthropic-ratelimit-"
+
+
+class _ResponseHeadTap:
+    """Bounded, passive accumulator for an upstream HTTP response head.
+
+    Fed a copy of each relayed chunk. Stops accumulating once the head
+    terminator arrives, so a long body costs nothing, and gives up entirely
+    past `cap` so a malformed or hostile upstream cannot grow proxy memory
+    per connection.
+    """
+
+    def __init__(self, cap: int = RESPONSE_HEAD_CAP) -> None:
+        self._buf = bytearray()
+        self._cap = cap
+        self.complete = False
+        self.overflowed = False
+
+    def feed(self, chunk: bytes) -> None:
+        if self.complete or self.overflowed:
+            return
+        self._buf += chunk
+        if _HEAD_TERMINATOR in self._buf:
+            self.complete = True
+        elif len(self._buf) > self._cap:
+            self.overflowed = True
+            self._buf = bytearray()
+
+    @property
+    def head(self) -> bytes:
+        """Bytes up to (not including) the head terminator, or b'' on overflow.
+
+        Returns whatever has accumulated so far when the head is still open —
+        the status line is usually readable well before the last header.
+        """
+        if self.overflowed:
+            return b""
+        idx = self._buf.find(_HEAD_TERMINATOR)
+        return bytes(self._buf if idx < 0 else self._buf[:idx])
+
+
+def _parse_status_line(head: bytes) -> int | None:
+    """Integer status code from a response head, or None if not yet readable.
+
+    None covers all three "we cannot say" cases the log must not report as a
+    verdict: no bytes at all, a first line that is not a status line, and a
+    status line that has not finished arriving.
+    """
+    line, sep, _rest = head.partition(b"\r\n")
+    if not sep:
+        return None
+    match = _STATUS_LINE_RE.match(line)
+    return int(match.group(1)) if match else None
+
+
+def _select_quota_headers(head: bytes) -> list[tuple[str, str]]:
+    """Allowlisted quota headers from a response head, in upstream order.
+
+    Allowlist-driven by construction: a header this function does not name can
+    never reach a log line, whatever the upstream starts returning.
+    """
+    selected: list[tuple[str, str]] = []
+    for raw in head.split(b"\r\n")[1:]:  # [0] is the status line
+        name, sep, value = raw.partition(b":")
+        if not sep:
+            continue
+        decoded = name.decode("ascii", "replace").strip()
+        lowered = decoded.lower()
+        if lowered in _QUOTA_HEADER_NAMES or lowered.startswith(_QUOTA_HEADER_PREFIX):
+            selected.append((decoded, value.decode("ascii", "replace").strip()))
+    return selected
+
+
+def _format_quota_headers(pairs: list[tuple[str, str]]) -> str:
+    """Render selected headers as `name=value` pairs for one log line."""
+    return " ".join(f"{name}={value}" for name, value in pairs)
+
+
+async def _relay_response_with_status_tap(
+    up_reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+) -> tuple[int | None, list[tuple[str, str]]]:
+    """Stream upstream → client, reporting the status and quota headers seen.
+
+    Write-then-tap ordering is load-bearing: the client gets every chunk at the
+    moment it arrives, exactly as before this tap existed. The accumulator only
+    ever sees a copy of bytes already sent.
+    """
+    tap = _ResponseHeadTap()
+    while True:
+        chunk = await up_reader.read(BUFFER_SIZE)
+        if not chunk:
+            break
+        writer.write(chunk)
+        await writer.drain()
+        tap.feed(chunk)
+    head = tap.head
+    return _parse_status_line(head), _select_quota_headers(head)
+
+
 async def pipe_bytes(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     """Forward reader → writer until either side closes. Silent on error."""
     try:
