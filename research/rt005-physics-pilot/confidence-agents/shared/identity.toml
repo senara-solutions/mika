@@ -1,0 +1,20 @@
+# Shared identity template for both mika-dev-confidence-{high,low} agents.
+# provision.sh substitutes __EMOJI__ and __NAME__ per level. Everything
+# else is byte-identical. The display `name` necessarily differs (so
+# `mika agents list` stays unambiguous) — it is metadata, not the
+# behavioral prior, and is documented as the AC1 display-name exception.
+emoji = "__EMOJI__"
+name = "__NAME__"
+
+# KG disabled — research probe, no corpus (matches mika-dev topology, mika#800).
+[kg]
+enabled = false
+
+# Reflection disabled — a clean, deterministic scaffold for the pilot.
+[reflection]
+enabled = false
+
+# Same allowlist as mika-dev — both agents get the identical tool surface.
+[skills]
+allow_authoring = false
+allowlist = ["self-dev", "self-dev-callback", "self-dev-iterate", "self-dev-webhook-qa", "self-dev-webhook-ci", "self-dev-webhook-ready-label", "dev-pilot", "dev-groom", "build-mika", "deploy-mika", "agents-teams", "skill-review", "address-pr-comments", "resolve-pr-conflicts", "self-check", "dev-handsoff", "tmux", "shell-exec", "web-search", "file-reader", "self-knowledge", "git-ops", "google-workspace", "github", "mcp", "browser-control"]
