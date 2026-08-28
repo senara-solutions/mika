@@ -127,6 +127,11 @@ pub struct TeamEngine {
     /// Session-scoped PR review dedup map (#821). Shared with `AppState`.
     /// Entries evicted at each `end_session()` callsite.
     pr_reviews_posted: Option<Arc<dashmap::DashMap<String, std::collections::HashSet<String>>>>,
+    /// Agent tier for this team run, supplied by the caller from its own
+    /// cached authority (mika#1962) — `AgentState.tier` on the server side,
+    /// a single process-start read in CLI mode. Threaded into every member's
+    /// `TeamAgentParams` so no team turn re-reads the environment.
+    tier: mika_common::home::AgentTier,
 }
 
 /// Outcome of an `execute_tasks` iteration (mika#1671). Replaces the previous
@@ -248,6 +253,7 @@ impl TeamEngine {
         reference_run_id: Option<&str>,
         github_app: Option<Arc<mika_common::github_app::GitHubApp>>,
         pr_reviews_posted: Option<Arc<dashmap::DashMap<String, std::collections::HashSet<String>>>>,
+        tier: mika_common::home::AgentTier,
     ) -> Result<Self> {
         let run_id = uuid::Uuid::new_v4().to_string();
 
@@ -304,10 +310,12 @@ impl TeamEngine {
             trace_id: mika_common::trace::generate_trace_id(),
             reference_run_id: reference_run_id.map(|s| s.to_string()),
             pr_reviews_posted,
+            tier,
         })
     }
 
     /// Create an engine for resuming a suspended team run.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new_for_resume(
         team: TeamDefinition,
         run: TeamRun,
@@ -316,6 +324,7 @@ impl TeamEngine {
         team_db: AsyncDatabase,
         github_app: Option<Arc<mika_common::github_app::GitHubApp>>,
         pr_reviews_posted: Option<Arc<dashmap::DashMap<String, std::collections::HashSet<String>>>>,
+        tier: mika_common::home::AgentTier,
     ) -> Result<Self> {
         let res = Self::init_resources(&team, global_home, settings, &run.run_id, None)?;
 
@@ -356,6 +365,7 @@ impl TeamEngine {
             trace_id,
             reference_run_id: None,
             pr_reviews_posted,
+            tier,
         })
     }
 
@@ -1294,6 +1304,7 @@ impl TeamEngine {
             let team_db = team_db.clone();
             let trace_id = self.trace_id.clone();
             let pr_reviews_posted = self.pr_reviews_posted.clone();
+            let tier = self.tier;
 
             let agent_span = info_span!("team_agent_task", agent = %input.agent_name);
             join_set.spawn(
@@ -1336,6 +1347,7 @@ impl TeamEngine {
                             let child_task_id_ref = input.child_task_id.as_deref();
                             let params = TeamAgentParams {
                                 db: &resources.db,
+                                tier,
                                 llm: resources.llm.as_ref(),
                                 tools: &tool_registry,
                                 skills: &resources.skills,
@@ -1788,6 +1800,7 @@ impl TeamEngine {
         let skills_dirty = AtomicBool::new(false);
         let params = TeamAgentParams {
             db: &resources.db,
+            tier: self.tier,
             llm: resources.llm.as_ref(),
             tools: &self.tool_registry,
             skills: &resources.skills,

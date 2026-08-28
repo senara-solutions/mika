@@ -1346,6 +1346,7 @@ async fn run_agent_for_message(
 
     let params = agent::AgentParams {
         db: &a.db,
+        tier: a.tier,
         llm: a.llm.as_ref(),
         tools: &state.tools,
         skills: &skills,
