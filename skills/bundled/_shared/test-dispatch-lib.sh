@@ -3189,6 +3189,315 @@ do
     fi
 done
 
+# ===========================================================================
+# mika#1772 — an honest dev-groom callback
+#
+# Founding incident: tasks f4fff3ff-4e57-4005-b4b6-bda13d68872d (2026-08-28
+# 18:08Z) and 74504478-184d-4af4-8d1f-cadb1b1fdce9 (19:08Z), both dispatched
+# on mika#2013. claude-pilot returned `status: terminated` at Turns 2 after
+# `[guardrail] idle_timeout: No meaningful progress for 300s`, having made
+# zero write tool calls. dispatch-lib ran the whole content-validation chain
+# on that empty session and emitted a callback with THREE false statements
+# ahead of the one true one:
+#   1. "Plan exists on branch but architect verdict is missing" — no plan
+#      existed and the architect was never reached.
+#   2. "no /ce:plan invocation detected in session log" — the session log
+#      file did not exist, so nothing was detected either way.
+#   3. "plan already committed from prior run" — the guard matched ANY
+#      *-plan.md in docs/plans/, of which main carries 769.
+# These assertions lock each one shut.
+# ===========================================================================
+
+echo ""
+echo "Test: dev-groom callback honesty (mika#1772)"
+echo "---------------------------------------------"
+
+ITERATE_SRC_1772=$(
+    # shellcheck disable=SC1090
+    source "$DISPATCH_LIB" 2>/dev/null || true
+    declare -f _iterate_groom_loop
+)
+DISPATCH_SRC_1772=$(
+    # shellcheck disable=SC1090
+    source "$DISPATCH_LIB" 2>/dev/null || true
+    declare -f dispatch_claude_pilot
+)
+RCP_SRC_1772=$(
+    # shellcheck disable=SC1090
+    source "$DISPATCH_LIB" 2>/dev/null || true
+    declare -f _run_claude_pilot
+)
+PFR_SRC_1772=$(
+    # shellcheck disable=SC1090
+    source "$DISPATCH_LIB" 2>/dev/null || true
+    declare -f _post_flight_recovery
+)
+
+# --- U1: the loop names its own failure reason -----------------------------
+
+assert_contains "U1: _iterate_groom_loop initializes GROOM_LOOP_FAILURE_REASON" \
+    'GROOM_LOOP_FAILURE_REASON=' "$ITERATE_SRC_1772"
+
+# KTD1: the reason must reach the caller, so the variable is global. A `local`
+# declaration would silently restore the "no reason recorded" fallback on
+# every failure.
+assert_not_contains "U1: GROOM_LOOP_FAILURE_REASON is not declared local" \
+    'local GROOM_LOOP_FAILURE_REASON' "$ITERATE_SRC_1772"
+
+# Structural invariant: every `return 1` in the loop is preceded by a reason
+# setter. `_groom_warn` records and mirrors to stderr in one act; the three
+# `_escalate_groom` exits carry an explicit assignment because they have no
+# WARN line of their own. Counting both against `return 1` keeps a future
+# 19th exit from silently reintroducing an unnamed failure.
+ITERATE_RETURN1_COUNT=$(printf '%s\n' "$ITERATE_SRC_1772" | grep -c 'return 1' || true)
+ITERATE_REASON_COUNT=$(printf '%s\n' "$ITERATE_SRC_1772" \
+    | grep -cE '_groom_warn |GROOM_LOOP_FAILURE_REASON=' || true)
+if [ "$ITERATE_REASON_COUNT" -ge "$ITERATE_RETURN1_COUNT" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ U1: reason setters ($ITERATE_REASON_COUNT) cover every return 1 ($ITERATE_RETURN1_COUNT)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ U1: reason setters ($ITERATE_REASON_COUNT) do not cover every return 1 ($ITERATE_RETURN1_COUNT)"
+fi
+
+# The three _escalate_groom exits are the cases where the architect genuinely
+# refused the plan — the class R2 must keep distinguishable from a guard trip.
+assert_contains "U1: first-pass ESCALATE exit records an architect-refusal reason" \
+    'architect ESCALATE (first-pass)' "$ITERATE_SRC_1772"
+
+# --- U1: the caller stops inventing a diagnosis ----------------------------
+
+assert_not_contains "U1: dispatch_claude_pilot no longer asserts a plan on the branch" \
+    'Plan exists on branch' "$DISPATCH_SRC_1772"
+assert_not_contains "U1: dispatch_claude_pilot no longer hardcodes the convergence phrase" \
+    'architect convergence did not complete' "$DISPATCH_SRC_1772"
+assert_contains "U1: dispatch_claude_pilot emits the recorded reason" \
+    'GROOM_LOOP_FAILURE_REASON' "$DISPATCH_SRC_1772"
+assert_contains "U1: dispatch_claude_pilot has a fallback when no reason was recorded" \
+    'no reason recorded' "$DISPATCH_SRC_1772"
+
+# R2 wants the plan-on-branch claim MEASURED, not deleted: on the 2026-07-04
+# class (mika#1723) a plan really was on the branch and that fact is the most
+# useful line in the message. _committed_plan_on_branch is the file's existing
+# authority for the question.
+assert_contains "U1: plan-on-branch is measured via _committed_plan_on_branch" \
+    '_committed_plan_on_branch' "$DISPATCH_SRC_1772"
+
+# Behavioral: a guard trip records a reason naming the guard, not convergence.
+_iterate_reason_probe() {
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        WORKTREE_DIR="" ISSUE_NUM="1267" REPO="mika"
+        _iterate_groom_loop >/dev/null 2>&1
+        printf '%s' "$GROOM_LOOP_FAILURE_REASON"
+    )
+}
+ITERATE_REASON_1772=$(_iterate_reason_probe) || ITERATE_REASON_1772=""
+assert_contains "U1: WORKTREE_DIR guard trip records a guard reason" \
+    "WORKTREE_DIR" "$ITERATE_REASON_1772"
+assert_not_contains "U1: guard trip does not blame architect convergence" \
+    "architect convergence" "$ITERATE_REASON_1772"
+
+# Behavioral: no issue-scoped plan names the plan lookup, not the architect.
+_iterate_noplan_probe() {
+    local tmp
+    tmp=$(mktemp -d)
+    mkdir -p "$tmp/docs/plans"
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        WORKTREE_DIR="$tmp" ISSUE_NUM="1267" REPO="mika"
+        _iterate_groom_loop >/dev/null 2>&1
+        printf '%s' "$GROOM_LOOP_FAILURE_REASON"
+    )
+    rm -rf "$tmp"
+}
+ITERATE_NOPLAN_1772=$(_iterate_noplan_probe) || ITERATE_NOPLAN_1772=""
+assert_contains "U1: missing issue plan names the plan lookup" \
+    "plan" "$ITERATE_NOPLAN_1772"
+assert_not_contains "U1: missing issue plan does not blame architect convergence" \
+    "architect convergence" "$ITERATE_NOPLAN_1772"
+
+# --- U2: a terminated session is classified before content validation ------
+
+# KTD5: dispatch_claude_pilot and _run_claude_pilot need a real pilot and CLI,
+# so the classification lives in its own callable function the harness can run
+# with an injected environment — the same shape as _find_issue_plan's probes.
+_classify_probe() {
+    local guardrail_line="$1" turns="${2:-2}"
+    local tmp log_id
+    tmp=$(mktemp -d)
+    log_id="probe-1772"
+    if [ -n "$guardrail_line" ]; then
+        printf '%s\n' "$guardrail_line" > "$tmp/${log_id}.stderr"
+    fi
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        STATUS="terminated"
+        TURNS="$turns"
+        DURATION="602410"
+        SESSION_ID="0dab1700-5ca9-4145-87b0-6f618a047220"
+        LOG_ID="$log_id"
+        PILOT_LOG_DIR="$tmp"
+        _classify_terminated_session 2>/dev/null
+    )
+    rm -rf "$tmp"
+}
+
+CLASSIFY_WITH_GUARDRAIL=$(_classify_probe '[guardrail] idle_timeout: No meaningful progress for 300s') || CLASSIFY_WITH_GUARDRAIL=""
+assert_contains "U2: terminated classification names the termination" \
+    "terminated" "$CLASSIFY_WITH_GUARDRAIL"
+assert_contains "U2: terminated classification names the guardrail" \
+    "idle_timeout" "$CLASSIFY_WITH_GUARDRAIL"
+assert_contains "U2: terminated classification names the turn count" \
+    "Turns: 2" "$CLASSIFY_WITH_GUARDRAIL"
+assert_not_contains "U2: terminated classification carries no plan-lookup diagnosis" \
+    "_find_issue_plan" "$CLASSIFY_WITH_GUARDRAIL"
+assert_not_contains "U2: terminated classification carries no convergence diagnosis" \
+    "architect convergence" "$CLASSIFY_WITH_GUARDRAIL"
+assert_contains "U2: terminated classification points at the upstream stall lineage" \
+    "dispatch-lib.sh:325" "$CLASSIFY_WITH_GUARDRAIL"
+
+# R7: one Outcome line. The old path could stack two — _post_flight_recovery
+# appended one and the iterate-loop else-branch rewrote another.
+CLASSIFY_OUTCOME_COUNT=$(printf '%s\n' "$CLASSIFY_WITH_GUARDRAIL" | grep -c '^Outcome:' || true)
+assert_eq "U2: terminated classification carries exactly one Outcome line" \
+    "1" "$CLASSIFY_OUTCOME_COUNT"
+assert_contains "U2: terminated classification is PIPELINE_INCOMPLETE" \
+    "Outcome: PIPELINE_INCOMPLETE" "$CLASSIFY_WITH_GUARDRAIL"
+
+# KTD3: stderr only enriches. A missing file degrades the text, never the
+# classification — the 2026-08-28 tasks had no .log file at all, and a
+# fail-closed read there would have hidden the whole class.
+CLASSIFY_NO_STDERR=$(_classify_probe '') || CLASSIFY_NO_STDERR=""
+assert_contains "U2: classification still fires when stderr is absent" \
+    "terminated" "$CLASSIFY_NO_STDERR"
+assert_contains "U2: classification without stderr is still PIPELINE_INCOMPLETE" \
+    "Outcome: PIPELINE_INCOMPLETE" "$CLASSIFY_NO_STDERR"
+
+# Structural: the guard has to sit INSIDE _run_claude_pilot, because
+# _post_flight_recovery is called from there (dispatch-lib.sh:1280) and not
+# from dispatch_claude_pilot. A guard placed after _run_claude_pilot returns
+# can only prefix text that is already false.
+RCP_FIRST_1772=$(printf '%s\n' "$RCP_SRC_1772" \
+    | grep -nE '_classify_terminated_session|_post_flight_recovery' | head -1)
+assert_contains "U2: terminated guard precedes _post_flight_recovery in _run_claude_pilot" \
+    "_classify_terminated_session" "$RCP_FIRST_1772"
+
+# The mika#1615 invariant stays: the recovery call remains in _run_claude_pilot,
+# it only becomes conditional.
+assert_contains "U2: _post_flight_recovery is still called from _run_claude_pilot" \
+    "_post_flight_recovery" "$RCP_SRC_1772"
+
+# Structural: in dispatch_claude_pilot the terminated short-circuit precedes
+# the force-push guard and the iterate loop.
+DISPATCH_FIRST_1772=$(printf '%s\n' "$DISPATCH_SRC_1772" \
+    | grep -nE 'PILOT_SESSION_TERMINATED|_check_pilot_force_push|_iterate_groom_loop' | head -1)
+assert_contains "U2: PILOT_SESSION_TERMINATED is tested before the force-push guard and iterate loop" \
+    "PILOT_SESSION_TERMINATED" "$DISPATCH_FIRST_1772"
+
+# R6: skip the push only when the branch carries nothing. _push_branch pushes
+# "any local-ahead commits regardless of pilot exit code" (dispatch-lib.sh:1801)
+# and the worktree is force-removed on the next dispatch, so a blanket skip
+# would destroy the work of a session killed AFTER committing — the late-hang
+# shape mika#1901 describes.
+assert_contains "U2: the push skip is conditioned on an empty branch, not on termination alone" \
+    'PRE_RUN_HEAD' "$DISPATCH_SRC_1772"
+
+# --- U3: the remaining false statements ------------------------------------
+
+# (a) "unknown" means the log could not be read. Claiming a detection was made
+# is a different statement from making one and coming up empty.
+assert_contains "U3a: an unreadable session log gets its own message" \
+    'session log was not readable' "$PFR_SRC_1772"
+
+# (b) the re-dispatch note must key on THIS issue's plan. The old glob matched
+# any *-plan.md, and main carries 769 of them, so the note always fired.
+assert_not_contains "U3b: the re-dispatch note no longer globs for any plan file" \
+    'find "$WORKTREE_DIR/docs/plans" -name "*-plan.md" -size +500c 2>/dev/null | grep -q .' \
+    "$PFR_SRC_1772"
+
+# (c) the zero-commit message must not assert an exit code it never read.
+# Both 2026-08-28 tasks carried PILOT_EXIT=1.
+assert_not_contains "U3c: the zero-commit message no longer hardcodes 'exited 0'" \
+    'claude-pilot exited 0 but HEAD unchanged' "$PFR_SRC_1772"
+assert_contains "U3c: the zero-commit message reads the real exit code" \
+    'PILOT_EXIT' "$PFR_SRC_1772"
+
+# Behavioral fixture — the 2026-08-28 class end to end: a worktree whose
+# docs/plans/ holds other tickets' plans and none for this issue, HEAD
+# unchanged, PILOT_EXIT=1.
+_pfr_probe_1772() {
+    local issue_num="$1" plant_own_plan="$2" pilot_exit="$3"
+    local base wt head
+    base=$(mktemp -d)
+    wt="$base/worktree"
+    git init -q "$wt" 2>/dev/null
+    git -C "$wt" config user.email "test@test.com"
+    git -C "$wt" config user.name "Test"
+    mkdir -p "$wt/docs/plans"
+    # Other tickets' plans — the 769-file condition on main, in miniature.
+    for other in 1111 2222; do
+        {
+            echo "# Plan for another ticket"
+            echo "**Ticket:** mika issue#${other}"
+            for i in $(seq 1 12); do
+                echo "Body line $i — padding padding padding padding padding."
+            done
+        } > "$wt/docs/plans/2026-08-01-001-fix-${other}-other-plan.md"
+    done
+    if [ "$plant_own_plan" = "yes" ]; then
+        {
+            echo "# Plan for this ticket"
+            echo "**Ticket:** mika issue#${issue_num}"
+            for i in $(seq 1 12); do
+                echo "Body line $i — padding padding padding padding padding."
+            done
+        } > "$wt/docs/plans/2026-08-29-001-fix-${issue_num}-own-plan.md"
+    fi
+    echo "initial" > "$wt/file.txt"
+    git -C "$wt" add -A 2>/dev/null
+    git -C "$wt" commit -q -m "initial" 2>/dev/null
+    head=$(git -C "$wt" rev-parse HEAD)
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        PRE_RUN_HEAD="$head"
+        POST_RUN_HEAD="$head"
+        WORKTREE_DIR="$wt"
+        SKILL="dev-groom"
+        REPO="mika"
+        BRANCH="test-branch"
+        ISSUE_NUM="$issue_num"
+        SESSION_ID="s"
+        LOG_ID="probe-1772-absent-log"
+        PILOT_EXIT="$pilot_exit"
+        STATUS="terminated"
+        RESULT="claude-pilot completed (status: terminated)."
+        RESCUED_DIRTY_WORKTREE=0
+        exec 9>&2
+        _post_flight_recovery 2>/dev/null
+        printf '%s' "$RESULT"
+    )
+    rm -rf "$base"
+}
+
+PFR_NO_OWN_PLAN=$(_pfr_probe_1772 2013 no 1) || PFR_NO_OWN_PLAN=""
+assert_not_contains "U3b: no plan for this issue → no re-dispatch note" \
+    "HEAD unchanged on dev-groom re-dispatch" "$PFR_NO_OWN_PLAN"
+assert_not_contains "U3c: PILOT_EXIT=1 → the message does not claim 'exited 0'" \
+    "exited 0" "$PFR_NO_OWN_PLAN"
+assert_not_contains "U3a: an absent session log → no claim that /ce:plan was undetected" \
+    "no /ce:plan invocation detected in session log" "$PFR_NO_OWN_PLAN"
+
+PFR_OWN_PLAN=$(_pfr_probe_1772 2013 yes 1) || PFR_OWN_PLAN=""
+assert_contains "U3b: a plan for this issue → the re-dispatch note fires" \
+    "HEAD unchanged on dev-groom re-dispatch" "$PFR_OWN_PLAN"
+assert_contains "U3b: the re-dispatch note names the plan it found" \
+    "2026-08-29-001-fix-2013-own-plan.md" "$PFR_OWN_PLAN"
+
 # --- Summary ---
 
 echo ""
