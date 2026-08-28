@@ -843,6 +843,55 @@ _seed_worktree_slash_commands() {
 # silent-failure defense — siblings: mika#1364 (force-with-lease gap), #1407
 # (stale-main mis-diagnosis), #1414 (dirty-worktree on resume), #1415 (worktree-
 # setup clobbers .claude/commands).
+# Evidence step for the redundant-groom refusal gate (mika#2012).
+#
+# Prints the plan path and returns 0 ONLY when the issue body carries a canonical
+# Plan callout AND that file is actually committed on the dispatch branch.
+# Returns 1 in every other case.
+#
+# The file check — not the body grep — is the entire point. A body-only test
+# would refuse grooming for a ticket whose plan was never pushed, was deleted, or
+# whose path drifted, stranding it forever. That is a strictly worse failure than
+# the loop this gate closes: the loop wastes dispatches, a stranded ticket is
+# never worked at all. When in doubt, this function returns 1 and grooming runs.
+_committed_plan_on_branch() {
+    local sub_repo_dir="$1" branch="$2" issue_body="$3" repo="$4"
+    local plan_path candidate
+
+    plan_path=$(printf '%s\n' "$issue_body" \
+        | sed -n 's/^> - \*\*Plan:\*\* *`\([^`]*\)`.*/\1/p' | head -1)
+    [ -n "$plan_path" ] || return 1
+
+    # Fetch the dispatch branch into a BRANCH-NAMED ref, never FETCH_HEAD.
+    #
+    # FETCH_HEAD is a single file in $GIT_DIR shared by every process touching
+    # this checkout. mika#1001 allows one `implement` and one `groom` dispatch to
+    # run concurrently per agent against the same sub-repo, so a sibling fetch
+    # can overwrite FETCH_HEAD between our fetch and our cat-file. We would then
+    # test the plan against the WRONG branch's tree — and the dangerous direction
+    # is the false positive: refusing a legitimate grooming because some other
+    # branch happens to carry a file at that path strands the ticket entirely.
+    # A ref keyed on the branch name is deterministic; two dispatches on the same
+    # branch write the same ref with the same content, which is benign.
+    #
+    # A branch that does not exist on the remote cannot carry a committed plan —
+    # grooming is legitimate, so return 1.
+    local gate_ref="refs/dispatch-gate/${branch}"
+    git -C "$sub_repo_dir" fetch --quiet --force origin \
+        "refs/heads/${branch}:${gate_ref}" 2>/dev/null || return 1
+
+    # The callout carries two historical shapes: repo-prefixed
+    # (`mika/docs/plans/…`) and repo-relative (`docs/plans/…`). Try both — U3
+    # normalizes new writes, but tickets groomed before it keep the old form.
+    for candidate in "$plan_path" "${plan_path#"${repo}/"}"; do
+        if git -C "$sub_repo_dir" cat-file -e "${gate_ref}:${candidate}" 2>/dev/null; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
 _set_up_worktree() {
     # --- Parse repo#number format ---
     # Matches: mika#214, mika-skills#8, mika-cloud#50, and an optional owner/
@@ -913,6 +962,41 @@ _set_up_worktree() {
             --issue "$ISSUE_NUM" \
             --labels "$LABELS" \
             --body-callout "$ISSUE_BODY")
+
+        # --- Gate: refuse a redundant dev-groom re-dispatch (mika#2012) ---
+        #
+        # A ticket whose plan is already committed on the dispatch branch does
+        # not need grooming. Before this gate, mika-dev (an LLM) chose the
+        # `skill` field with nothing deterministic behind it, so an already-
+        # groomed ticket could be re-dispatched as dev-groom; the run re-derived
+        # the plan, stacked a second body callout, and the ticket came back
+        # around — 25 measured requeues across 5 tickets in 13 h, producing 6
+        # branches containing only markdown.
+        #
+        # Exit semantics are mika#988's: _deliver_callback + exit 0. An `exit 1`
+        # on a foreseeable condition is wrapped as HANDLER CRASH by the EXIT
+        # trap; mika-dev then reads a crash envelope and idles (7 h stall,
+        # 2026-05-06). This is a foreseeable condition, so it exits 0.
+        if [ "$SKILL" = "dev-groom" ]; then
+            local existing_plan
+            if existing_plan=$(_committed_plan_on_branch "$SUB_REPO_DIR" "$BRANCH" "$ISSUE_BODY" "$REPO"); then
+                echo "dispatch_gate_groom_refused: repo=${REPO} issue=${ISSUE_NUM} branch=${BRANCH} plan=${existing_plan} — plan already committed on branch, re-grooming would loop (mika#2012)" >&2
+                RESULT=$(printf '{"status":"auto_skipped","reason":"already_groomed","issue":"senara-solutions/%s#%s","branch":"%s","plan":"%s","note":"A committed plan already exists on the dispatch branch. Re-grooming would re-derive it and stack a second body callout. Dispatch dev-pilot to implement, or remove the plan from the branch to force a fresh groom."}' \
+                    "$REPO" "$ISSUE_NUM" "$BRANCH" "$existing_plan")
+                _deliver_callback
+                exit 0
+            elif printf '%s\n' "$ISSUE_BODY" | grep -qE '^> - \*\*Plan:\*\*'; then
+                # Grooming is ALLOWED here — the gate correctly declined to fire
+                # because no plan is committed on the branch. But this is not a
+                # first grooming either: the body claims a plan that isn't there
+                # (never pushed, deleted, or the path drifted). Left silent, a
+                # second grooming of the same ticket is indistinguishable from a
+                # first one, which is how #2012 ran three hours unnoticed. Say so
+                # in terms distinct from the refusal, so a `grep` separates the
+                # two populations (mika#2012 U4).
+                echo "dispatch_gate_groom_allowed_stale_callout: repo=${REPO} issue=${ISSUE_NUM} branch=${BRANCH} — issue body carries a Plan callout but no plan file is committed on the branch; re-grooming proceeds (mika#2012)" >&2
+            fi
+        fi
 
         # Sync main before branching to avoid stale worktrees.
         git -C "$SUB_REPO_DIR" fetch origin main 2>/dev/null || true
@@ -2510,8 +2594,21 @@ _write_canonical_callout() {
     [ -n "$REPO" ] && [ -n "$ISSUE_NUM" ] && [ -n "$BRANCH" ] || {
         echo "WARN: write_canonical_callout: REPO/ISSUE_NUM/BRANCH unset" >&2; return 1; }
 
-    # Compose the Grooming history line per stage. Both forms include
-    # "second-pass (GROOMED)" to satisfy the dispatch-gate has_verdict regex.
+    # Compose the Grooming history line per stage. Every form must carry a
+    # verdict marker that `executor.rs::check_grooming_markers` recognises,
+    # otherwise the ticket stays structurally invisible to the dispatch gate and
+    # gets re-groomed forever (mika#2012).
+    #
+    # `ready-single-pass` exists because the first-pass READY disposition is a
+    # LEGITIMATE grooming exit (/mika-groom-ticket Phase 3 step 10: "Disposition:
+    # READY — plan is sound. Commit the staged plan […] and skip to Phase 5").
+    # Before mika#2012 it had no stage at all, so this function returned 1, no
+    # verdict was written, and the gate never saw the ticket as groomed.
+    #
+    # Its line must NOT claim "second-pass (GROOMED)" — no second pass ran, and a
+    # body that says otherwise is a lie the next reader inherits. It carries its
+    # own truthful marker instead, mirroring the shape of the existing
+    # "second-pass (READY, paraphrased GROOMED" variant.
     local history_line
     case "$stage" in
         ready-to-groomed)
@@ -2520,8 +2617,14 @@ _write_canonical_callout() {
         iterate-to-groomed)
             history_line="> - **Grooming history:** first-pass (ITERATE) → revised → second-pass (GROOMED) — session-id: ${session_id}"
             ;;
+        ready-single-pass)
+            history_line="> - **Grooming history:** first-pass (READY, single-pass GROOMED) — no second pass required — session-id: ${session_id}"
+            ;;
         *)
-            echo "WARN: write_canonical_callout: unknown stage \"$stage\"" >&2
+            # Operator-visible, not just a stderr WARN: an unknown stage means a
+            # grooming run produced no verdict marker, which is exactly the
+            # silent failure mode mika#2012 was filed for. Make it greppable.
+            echo "write_canonical_callout_unknown_stage: stage=\"$stage\" repo=${REPO} issue=${ISSUE_NUM} — NO VERDICT WRITTEN, ticket will re-groom (mika#2012)" >&2
             return 1
             ;;
     esac
@@ -2533,7 +2636,22 @@ _write_canonical_callout() {
         echo "WARN: write_canonical_callout: no issue-scoped plan file for $REPO#$ISSUE_NUM" >&2
         return 1
     }
+    # The body must carry a REPO-RELATIVE path: it is read by humans on GitHub
+    # and by the dispatch gate against the branch, neither of which can resolve
+    # a machine-local absolute path. If the strip below is a no-op the plan is
+    # not under the worktree, and writing it verbatim would put an absolute path
+    # into a public issue body (mika#2012 U3).
     local plan_relpath="${plan_path#"$WORKTREE_DIR/"}"
+    case "$plan_relpath" in
+        /*)
+            echo "write_canonical_callout_plan_outside_worktree: repo=${REPO} issue=${ISSUE_NUM} plan=${plan_path} worktree=${WORKTREE_DIR} — refusing to write an absolute path into the issue body" >&2
+            return 1
+            ;;
+    esac
+    [ -f "$WORKTREE_DIR/$plan_relpath" ] || {
+        echo "write_canonical_callout_plan_missing: repo=${REPO} issue=${ISSUE_NUM} plan=${plan_relpath} — file not present in worktree" >&2
+        return 1
+    }
 
     # Fetch current body for idempotency check.
     local current_body
@@ -2548,7 +2666,19 @@ _write_canonical_callout() {
     local has_branch has_plan has_verdict
     has_branch=$(printf '%s' "$current_body" | grep -cF '> - **Branch:**' || true)
     has_plan=$(printf '%s' "$current_body" | grep -cF 'docs/plans/' || true)
-    has_verdict=$(printf '%s' "$current_body" | grep -cE 'second-pass \(GROOMED\)|second-pass \(READY, paraphrased GROOMED' || true)
+    # This pattern MUST stay in lockstep with executor.rs's three verdict regexes
+    # (GROOMED_VERDICT_RE, PARAPHRASED_GROOMED_RE, SINGLE_PASS_GROOMED_RE).
+    # Drift between them is not cosmetic: a form the gate accepts but this check
+    # misses makes the writer believe the body is unstamped, so it prepends a
+    # SECOND callout block on every pass. That is the callout stacking measured
+    # on mika#1962 (2 blocks) — the previous `\(GROOMED\)` required an immediate
+    # closing paren and therefore missed the canonical
+    # `second-pass (GROOMED — session-id: …)` shape the writer itself emits.
+    # Character class mirrors Rust's `[\s\)\.,;:—-]` exactly — no member added,
+    # none dropped. (`—` is multi-byte: under a UTF-8 locale it is one class
+    # member; under LC_ALL=C its three bytes become three members, which only
+    # widens acceptance and so cannot produce a false negative.)
+    has_verdict=$(printf '%s' "$current_body" | grep -cE 'second-pass \(GROOMED[[:space:]).,;:—-]|second-pass \(READY, paraphrased GROOMED|first-pass \(READY, single-pass GROOMED' || true)
 
     if [ "$has_branch" -gt 0 ] && [ "$has_plan" -gt 0 ] && [ "$has_verdict" -gt 0 ]; then
         echo "write_canonical_callout: dispatch-gate signals already present in $REPO#$ISSUE_NUM body — skipping (idempotent)" >&2
@@ -2566,8 +2696,36 @@ ${history_line}
 CALLOUT_EOF
     )
 
+    # REPLACE, never stack (mika#2012 U3). We only reach here when at least one
+    # of the three signals was missing, which means the body may still carry a
+    # PARTIAL callout — a Branch line with no verdict, a stale Plan path from a
+    # prior branch, a recovery callout from mika#1123. Prepending on top of that
+    # leaves two callout blocks in the body: the reader cannot tell which is
+    # authoritative, and the older block's stale plan path outlives the branch it
+    # named. Measured on mika#1962: 2 stacked blocks, the older one carrying no
+    # verdict at all.
+    #
+    # Strip existing callout lines from the PREAMBLE ONLY, then prepend the
+    # single authoritative block.
+    #
+    # Preamble-scoped, not whole-body: a callout line is structurally always at
+    # the top of the body, but the same text can legitimately appear lower down
+    # inside a fenced block — a ticket that documents the callout format quotes
+    # these exact lines. mika#2012's own issue body does. A body-wide `grep -v`
+    # would silently delete that documentation while "fixing" a formatting bug.
+    # We stop stripping at the first line that is neither a callout nor blank,
+    # which also absorbs the blank lines between stacked blocks.
+    local stripped_body
+    stripped_body=$(printf '%s' "$current_body" | awk '
+        BEGIN { preamble = 1 }
+        preamble && /^> - \*\*(Branch|Plan|Grooming history):\*\*/ { next }
+        preamble && /^[[:space:]]*$/ { next }
+        { preamble = 0 }
+        { print }
+    ')
+
     local new_body
-    new_body=$(printf '%s\n\n%s' "$callout_block" "$current_body")
+    new_body=$(printf '%s\n\n%s' "$callout_block" "$stripped_body")
     local tmpfile
     tmpfile=$(mktemp /tmp/canonical-callout-XXXXXX.md)
     printf '%s' "$new_body" > "$tmpfile"

@@ -951,6 +951,25 @@ static PARAPHRASED_GROOMED_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"second-pass \(READY, paraphrased GROOMED")
         .expect("paraphrased groomed regex must compile")
 });
+/// Single-pass grooming verdict (mika#2012).
+///
+/// The first-pass READY disposition is a legitimate grooming exit — see
+/// `/mika-groom-ticket` Phase 3 step 10: "Disposition: READY — plan is sound.
+/// Commit the staged plan […] and skip to Phase 5". No second pass runs, so the
+/// body must not claim one; `write_canonical_callout`'s `ready-single-pass`
+/// stage emits this truthful marker instead.
+///
+/// Before mika#2012 this shape had no stage and no regex: a ticket groomed in
+/// one pass stayed permanently invisible to the dispatch gate, was re-dispatched
+/// as `dev-groom`, re-groomed, and looped — 25 measured requeues across 5
+/// tickets in 13 h, producing 6 branches containing only markdown plans.
+///
+/// Anchored on the `first-pass (` prefix for the same reason as
+/// `GROOMED_VERDICT_RE`: it distinguishes the verdict-line callout from prose.
+static SINGLE_PASS_GROOMED_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"first-pass \(READY, single-pass GROOMED")
+        .expect("single-pass groomed regex must compile")
+});
 
 pub fn check_grooming_markers(issue_body: &str) -> Vec<&'static str> {
     let mut missing = Vec::new();
@@ -960,8 +979,9 @@ pub fn check_grooming_markers(issue_body: &str) -> Vec<&'static str> {
     if !issue_body.contains("docs/plans/") {
         missing.push("plan_callout");
     }
-    let has_groomed_marker =
-        GROOMED_VERDICT_RE.is_match(issue_body) || PARAPHRASED_GROOMED_RE.is_match(issue_body);
+    let has_groomed_marker = GROOMED_VERDICT_RE.is_match(issue_body)
+        || PARAPHRASED_GROOMED_RE.is_match(issue_body)
+        || SINGLE_PASS_GROOMED_RE.is_match(issue_body);
     if !has_groomed_marker {
         missing.push("groomed_verdict");
     }
@@ -6015,6 +6035,97 @@ GROOMED status pending in another ticket.
         assert!(
             missing.is_empty(),
             "Organic callout with all three signals should pass: {missing:?}"
+        );
+    }
+
+    // --- check_grooming_markers single-pass verdict tests (mika#2012) ---
+
+    /// The exact line `write_canonical_callout`'s `ready-single-pass` stage
+    /// emits. Before mika#2012 this body had no recognized verdict, so the
+    /// ticket stayed invisible to the gate and was re-dispatched as `dev-groom`
+    /// forever.
+    #[test]
+    fn test_grooming_markers_accepts_single_pass_ready() {
+        let body = r#"
+> - **Branch:** `fix/2012/dispatch-le-loop-re-groome-des-tickets-d`
+> - **Plan:** `docs/plans/2026-08-27-001-fix-2012-regroom-loop-verdict-gate-plan.md` (committed on branch @ `d2bd0ed2`)
+> - **Grooming history:** first-pass (READY, single-pass GROOMED) — no second pass required — session-id: 66811de9
+"#;
+        let missing = check_grooming_markers(body);
+        assert!(
+            missing.is_empty(),
+            "single-pass READY grooming exit must pass, got: {missing:?}"
+        );
+    }
+
+    /// Load-bearing false-positive guard: a **bare** `first-pass (READY)` must
+    /// still fail. It is the disposition the architect emits mid-grooming,
+    /// before `write_canonical_callout` has committed the plan and stamped the
+    /// callout — accepting it would dispatch tickets whose plan is not on the
+    /// branch. Only the explicit `single-pass GROOMED` annotation, which only
+    /// the writer emits, closes the gate.
+    #[test]
+    fn test_grooming_markers_rejects_bare_first_pass_ready() {
+        let body = r#"
+> - **Branch:** `feat/something`
+> - **Plan:** `docs/plans/some-plan.md`
+> - **Grooming history:** first-pass (READY) — awaiting second pass
+"#;
+        let missing = check_grooming_markers(body);
+        assert_eq!(
+            missing,
+            vec!["groomed_verdict"],
+            "bare first-pass (READY) must not satisfy the verdict signal"
+        );
+    }
+
+    /// False-positive guard: prose mentioning the annotation without the
+    /// `first-pass (` prefix anchor must not match.
+    #[test]
+    fn test_grooming_markers_rejects_prose_single_pass_groomed() {
+        let body = r#"
+> - **Branch:** `feat/something`
+> - **Plan:** `docs/plans/some-plan.md`
+
+Discussion: this one was a single-pass GROOMED case, unlike the others.
+"#;
+        let missing = check_grooming_markers(body);
+        assert_eq!(
+            missing,
+            vec!["groomed_verdict"],
+            "prose `single-pass GROOMED` without the first-pass anchor must not match"
+        );
+    }
+
+    /// Non-regression: the spec-tolerated paraphrase (#1108) still passes after
+    /// the mika#2012 widening.
+    #[test]
+    fn test_grooming_markers_paraphrased_still_passes() {
+        let body = r#"
+> - **Branch:** `feat/something`
+> - **Plan:** `docs/plans/some-plan.md`
+> - **Grooming history:** first-pass (ITERATE) → second-pass (READY, paraphrased GROOMED — plan sound)
+"#;
+        let missing = check_grooming_markers(body);
+        assert!(
+            missing.is_empty(),
+            "paraphrased GROOMED must still pass after #2012, got: {missing:?}"
+        );
+    }
+
+    /// Non-regression: the canonical two-pass verdict is unaffected by the
+    /// added alternative.
+    #[test]
+    fn test_grooming_markers_two_pass_still_passes_after_2012() {
+        let body = r#"
+> - **Branch:** `feat/something`
+> - **Plan:** `docs/plans/some-plan.md`
+> - **Grooming history:** first-pass (ITERATE) → revisions → second-pass (GROOMED — session-id: abc123)
+"#;
+        let missing = check_grooming_markers(body);
+        assert!(
+            missing.is_empty(),
+            "canonical two-pass GROOMED must still pass, got: {missing:?}"
         );
     }
 
