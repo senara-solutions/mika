@@ -224,6 +224,213 @@ def read_subscription_token() -> tuple[str | None, float | None]:
     return token, expires_at
 
 
+# ---------------------------------------------------------------------------
+# Upstream response-status tap (mika#1901)
+#
+# WHY: the reverse-proxy used to relay the upstream response as an opaque byte
+# loop and then print `ALLOW <method> <path>` unconditionally. A 429, a 401, a
+# 500 and a 200 all produced the same line — so on 2026-08-06 a pilot session
+# that Anthropic was throttling looked, in the log, exactly like a healthy one.
+# It stalled 606s, the guardrail killed it as an idle timeout, and establishing
+# the real cause needed an instrumented copy of this file plus a host-side curl.
+#
+# The tap below reads the status line off the stream WITHOUT owning it: the
+# relay writes each chunk to the client first and only then hands a copy to the
+# accumulator. Nothing is buffered ahead of the client, so SSE timing is
+# unchanged. Only the response HEAD is retained, capped, and only allowlisted
+# header names are ever eligible for logging — a wildcard dump would eventually
+# print an Authorization value after some upstream change.
+# ---------------------------------------------------------------------------
+
+_HEAD_TERMINATOR = b"\r\n\r\n"
+RESPONSE_HEAD_CAP = 65536
+# The trailing (?:[ \t]|$) keeps a still-arriving code from being misread: it
+# matches a completed 3-digit code followed by the reason phrase, or one that
+# ends the buffer, but not a prefix of a longer number.
+_STATUS_LINE_RE = re.compile(rb"^HTTP/\d\.\d[ \t]+(\d{3})(?:[ \t]|$)", re.ASCII)
+# 1xx is a preamble (100 Continue, 103 Early Hints), never the verdict.
+_INTERIM_STATUS_CEILING = 200
+
+# Quota metadata Anthropic returns alongside a throttle verdict. `request-id`
+# is an opaque upstream correlation id — the 2026-08-06 investigation quoted
+# one (req_011CdmbTL5FH62zfwP7ieMhu) and it is what a support thread asks for.
+# Nothing here carries request or response content.
+_QUOTA_HEADER_NAMES = frozenset({"retry-after", "request-id"})
+_QUOTA_HEADER_PREFIX = "anthropic-ratelimit-"
+
+
+class _ResponseHeadTap:
+    """Bounded, passive accumulator for an upstream HTTP response head.
+
+    Fed a copy of each relayed chunk. Stops accumulating once the head
+    terminator arrives, so a long body costs nothing, and gives up entirely
+    past `cap` so a malformed or hostile upstream cannot grow proxy memory
+    per connection.
+    """
+
+    def __init__(self, cap: int = RESPONSE_HEAD_CAP) -> None:
+        self._buf = bytearray()
+        self._cap = cap
+        self.complete = False
+        self.overflowed = False
+
+    def feed(self, chunk: bytes) -> None:
+        if self.complete or self.overflowed:
+            return
+        self._buf += chunk
+        while True:
+            idx = self._buf.find(_HEAD_TERMINATOR)
+            if idx < 0:
+                if len(self._buf) > self._cap:
+                    self.overflowed = True
+                    self._buf = bytearray()
+                return
+            status = _parse_status_line(bytes(self._buf[:idx]))
+            if status is None or status >= _INTERIM_STATUS_CEILING:
+                self.complete = True
+                del self._buf[idx:]  # keep the head, drop the body
+                return
+            # An interim 1xx head is a preamble, not the answer. Drop it and
+            # keep reading, or the log would report `-> 100` and hide the real
+            # verdict behind a status that merely looks like one.
+            del self._buf[: idx + len(_HEAD_TERMINATOR)]
+
+    @property
+    def head(self) -> bytes:
+        """The response head, or b'' on overflow.
+
+        Returns whatever has accumulated so far when the head is still open —
+        the status line is usually readable well before the last header.
+        """
+        if self.overflowed:
+            return b""
+        idx = self._buf.find(_HEAD_TERMINATOR)
+        return bytes(self._buf if idx < 0 else self._buf[:idx])
+
+
+def _parse_status_line(head: bytes) -> int | None:
+    """Integer status code from a response head, or None if not yet readable.
+
+    None covers the cases the log must not report as a verdict: no bytes at
+    all, a first line that is not a status line, and a status code that has not
+    finished arriving.
+
+    The first line is read whether or not a CRLF has terminated it yet. A
+    response whose head is a bare status line with no headers is legal, and
+    requiring the CRLF made the proxy call it `UPSTREAM_NO_RESPONSE` — claiming
+    silence from an upstream that had in fact answered.
+    """
+    line = head.partition(b"\r\n")[0]
+    match = _STATUS_LINE_RE.match(line)
+    return int(match.group(1)) if match else None
+
+
+def _select_quota_headers(head: bytes) -> list[tuple[str, str]]:
+    """Allowlisted quota headers from a response head, in upstream order.
+
+    Allowlist-driven by construction: a header this function does not name can
+    never reach a log line, whatever the upstream starts returning.
+    """
+    selected: list[tuple[str, str]] = []
+    for raw in head.split(b"\r\n")[1:]:  # [0] is the status line
+        name, sep, value = raw.partition(b":")
+        if not sep:
+            continue
+        decoded = name.decode("ascii", "replace").strip()
+        lowered = decoded.lower()
+        if lowered in _QUOTA_HEADER_NAMES or lowered.startswith(_QUOTA_HEADER_PREFIX):
+            selected.append((decoded, value.decode("ascii", "replace").strip()))
+    return selected
+
+
+def _format_quota_headers(pairs: list[tuple[str, str]]) -> str:
+    """Render selected headers as `name=value` pairs for one log line."""
+    return " ".join(f"{name}={value}" for name, value in pairs)
+
+
+def _log_upstream_outcome(
+    method: str,
+    path: str,
+    status: int | None,
+    quota_headers: list[tuple[str, str]],
+) -> None:
+    """Emit the operator-facing verdict for one forwarded Anthropic request.
+
+    `ALLOW` keeps its meaning — the egress allowlist permitted the call — and
+    now carries what the upstream answered, so 401 / 429 / 5xx stop hiding
+    behind a line that reads like success. A throttle also gets its own
+    greppable class line: `RATE_LIMITED` is the one word an operator needs to
+    reach the 2026-08-06 conclusion without writing a probe.
+
+    A status of None means the upstream closed without ever answering. That is
+    a distinct outcome, not an allowed call, and is reported as such.
+    """
+    if status is None:
+        print(
+            f"[anthropic-proxy] UPSTREAM_NO_RESPONSE {method} {path}",
+            file=sys.stderr, flush=True,
+        )
+        return
+    print(
+        f"[anthropic-proxy] ALLOW {method} {path} -> {status}",
+        file=sys.stderr, flush=True,
+    )
+    if status == 429:
+        detail = _format_quota_headers(quota_headers)
+        line = f"[anthropic-proxy] RATE_LIMITED {method} {path}"
+        print(f"{line} {detail}" if detail else line, file=sys.stderr, flush=True)
+
+
+async def _relay_response_with_status_tap(
+    up_reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    method: str,
+    path: str,
+) -> None:
+    """Stream upstream → client, logging the verdict exactly once.
+
+    Two properties this function owns:
+
+    **Write-then-tap.** The client gets every chunk at the moment it arrives,
+    exactly as before this tap existed. The accumulator only ever sees a copy
+    of bytes already sent.
+
+    **Log at the head, not at the end.** The verdict is emitted as soon as the
+    response head is complete, and the `finally` guarantees a line even when
+    the relay dies mid-body. Logging only after a clean EOF loses the verdict
+    in precisely the shape this instrumentation exists for: upstream answers
+    429, the pilot stalls, the guardrail kills it, the client socket closes,
+    `drain()` raises — and the proxy prints nothing at all.
+    """
+    tap = _ResponseHeadTap()
+    reported = False
+    try:
+        while True:
+            chunk = await up_reader.read(BUFFER_SIZE)
+            if not chunk:
+                break
+            writer.write(chunk)
+            await writer.drain()
+            if reported:
+                continue
+            tap.feed(chunk)
+            if tap.complete:
+                _log_upstream_outcome(
+                    method, path,
+                    _parse_status_line(tap.head),
+                    _select_quota_headers(tap.head),
+                )
+                reported = True
+    finally:
+        if not reported:
+            head = tap.head
+            _log_upstream_outcome(
+                method, path,
+                _parse_status_line(head),
+                _select_quota_headers(head),
+            )
+
+
 async def pipe_bytes(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     """Forward reader → writer until either side closes. Silent on error."""
     try:
@@ -374,17 +581,14 @@ async def handle_anthropic_reverse_proxy(
                 up_writer.write(chunk)
                 await up_writer.drain()
                 remaining -= len(chunk)
-        # Stream response upstream → client until upstream closes.
-        while True:
-            chunk = await up_reader.read(BUFFER_SIZE)
-            if not chunk:
-                break
-            writer.write(chunk)
-            await writer.drain()
-        print(
-            f"[anthropic-proxy] ALLOW {method.decode('ascii')} "
-            f"{new_path.decode('ascii', 'replace')}",
-            file=sys.stderr, flush=True,
+        # Stream response upstream → client until upstream closes, reading the
+        # status line off the stream on the way past and logging the verdict
+        # (mika#1901). The tap never holds a byte back and always logs exactly
+        # once — see _relay_response_with_status_tap.
+        await _relay_response_with_status_tap(
+            up_reader, writer,
+            method.decode("ascii"),
+            new_path.decode("ascii", "replace"),
         )
     finally:
         try:
