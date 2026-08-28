@@ -13,6 +13,31 @@
 
 set -euo pipefail
 
+# Hermeticity (mika#1772): the probes below run `git init` + `git commit` in temp
+# dirs and inherit the host's git config. On a machine whose global config sets
+# `commit.gpgsign = true` the suite aborts partway with exit 128 and leaks its
+# temp dirs (measured). Now that CI gates on this suite — on a shared
+# self-hosted runner — that ambient coupling is a merge blocker waiting to happen.
+#
+# Override the signing keys only. Nulling GIT_CONFIG_GLOBAL instead strips the
+# committer identity several existing fixtures rely on: measured, that produces
+# 8 failures at rc=128 across the mika#1341/#1364/#1407/#1414 fixtures.
+# `init.defaultBranch` is the second coupling: the fixtures `git init` and then
+# reference `main`. A host without it gets `master` and seven rebase fixtures
+# fail at rc=128. It is set on this developer machine, which is why the suite
+# passed here while never having been run anywhere else.
+export GIT_CONFIG_COUNT=5
+export GIT_CONFIG_KEY_3=user.name
+export GIT_CONFIG_VALUE_3=dispatch-lib test suite
+export GIT_CONFIG_KEY_4=user.email
+export GIT_CONFIG_VALUE_4=test@localhost
+export GIT_CONFIG_KEY_0=commit.gpgsign
+export GIT_CONFIG_VALUE_0=false
+export GIT_CONFIG_KEY_1=tag.gpgsign
+export GIT_CONFIG_VALUE_1=false
+export GIT_CONFIG_KEY_2=init.defaultBranch
+export GIT_CONFIG_VALUE_2=main
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISPATCH_LIB="$SCRIPT_DIR/dispatch-lib.sh"
 
@@ -34,7 +59,7 @@ assert_eq() {
 
 assert_contains() {
     local label="$1" needle="$2" haystack="$3"
-    if printf '%s' "$haystack" | grep -qF "$needle"; then
+    if grep -qF -- "$needle" <<<"$haystack"; then
         PASS=$((PASS + 1))
         echo "  ✓ $label"
     else
@@ -47,7 +72,7 @@ assert_contains() {
 
 assert_not_contains() {
     local label="$1" needle="$2" haystack="$3"
-    if ! printf '%s' "$haystack" | grep -qF "$needle"; then
+    if ! grep -qF -- "$needle" <<<"$haystack"; then
         PASS=$((PASS + 1))
         echo "  ✓ $label"
     else
@@ -2496,7 +2521,7 @@ DRIFT_BLOCK=$(sed -n '/Post-flight plan validation/,/Issue #138: Discover/p' "$D
 assert_contains "POLICY_DENY variable initialized" \
     'POLICY_DENY=""' "$DRIFT_BLOCK"
 assert_contains "PERSISTENT_STDERR_PATH uses LOG_ID convention" \
-    'PERSISTENT_STDERR_PATH="/var/log/claude-pilot/${LOG_ID}.stderr"' "$DRIFT_BLOCK"
+    'PERSISTENT_STDERR_PATH="${PILOT_LOG_DIR:-/var/log/claude-pilot}/${LOG_ID}.stderr"' "$DRIFT_BLOCK"
 assert_contains "Reads from persistent stderr (mika#1097 channel)" \
     '"$PERSISTENT_STDERR_PATH"' "$DRIFT_BLOCK"
 assert_contains "Strips ANSI before grep (UI ANSI shouldn't break match)" \
@@ -2592,7 +2617,7 @@ assert_contains "Class C check fires on HEAD-unchanged for ALL skills (not just 
 assert_contains "POLICY_DENY variable set in HEAD-unchanged path" \
     'POLICY_DENY=""' "$POSTFLIGHT_BLOCK"
 assert_contains "Reads persistent stderr at LOG_ID path" \
-    'PERSISTENT_STDERR_PATH="/var/log/claude-pilot/${LOG_ID}.stderr"' "$POSTFLIGHT_BLOCK"
+    'PERSISTENT_STDERR_PATH="${PILOT_LOG_DIR:-/var/log/claude-pilot}/${LOG_ID}.stderr"' "$POSTFLIGHT_BLOCK"
 assert_contains "Strips ANSI before grep" \
     'sed' "$POSTFLIGHT_BLOCK"
 assert_contains "Searches for [policy:deny] marker" \
@@ -3244,21 +3269,9 @@ assert_contains "U1: _iterate_groom_loop initializes GROOM_LOOP_FAILURE_REASON" 
 assert_not_contains "U1: GROOM_LOOP_FAILURE_REASON is not declared local" \
     'local GROOM_LOOP_FAILURE_REASON' "$ITERATE_SRC_1772"
 
-# Structural invariant: every `return 1` in the loop is preceded by a reason
-# setter. `_groom_warn` records and mirrors to stderr in one act; the three
-# `_escalate_groom` exits carry an explicit assignment because they have no
-# WARN line of their own. Counting both against `return 1` keeps a future
-# 19th exit from silently reintroducing an unnamed failure.
-ITERATE_RETURN1_COUNT=$(printf '%s\n' "$ITERATE_SRC_1772" | grep -c 'return 1' || true)
-ITERATE_REASON_COUNT=$(printf '%s\n' "$ITERATE_SRC_1772" \
-    | grep -cE '_groom_warn |GROOM_LOOP_FAILURE_REASON=' || true)
-if [ "$ITERATE_REASON_COUNT" -ge "$ITERATE_RETURN1_COUNT" ]; then
-    PASS=$((PASS + 1))
-    echo "  ✓ U1: reason setters ($ITERATE_REASON_COUNT) cover every return 1 ($ITERATE_RETURN1_COUNT)"
-else
-    FAIL=$((FAIL + 1))
-    echo "  ✗ U1: reason setters ($ITERATE_REASON_COUNT) do not cover every return 1 ($ITERATE_RETURN1_COUNT)"
-fi
+# The invariant that every `return 1` carries a reason is asserted per site,
+# further down. A totals comparison was tried first and proved complaisant:
+# with one reason setter deleted it still reported 21 >= 18 and passed.
 
 # The three _escalate_groom exits are the cases where the architect genuinely
 # refused the plan — the class R2 must keep distinguishable from a guard trip.
@@ -3325,7 +3338,7 @@ assert_not_contains "U1: missing issue plan does not blame architect convergence
 # so the classification lives in its own callable function the harness can run
 # with an injected environment — the same shape as _find_issue_plan's probes.
 _classify_probe() {
-    local guardrail_line="$1" turns="${2:-2}"
+    local guardrail_line="$1" turns="${2:-2}" subtype="${3:-}" reason="${4:-}" mode="${5:-full}"
     local tmp log_id
     tmp=$(mktemp -d)
     log_id="probe-1772"
@@ -3341,7 +3354,10 @@ _classify_probe() {
         SESSION_ID="0dab1700-5ca9-4145-87b0-6f618a047220"
         LOG_ID="$log_id"
         PILOT_LOG_DIR="$tmp"
-        _classify_terminated_session 2>/dev/null
+        STDERR_FILE=""
+        SUBTYPE="$subtype"
+        TERMINATION_REASON="$reason"
+        _classify_terminated_session "$mode" 2>/dev/null
     )
     rm -rf "$tmp"
 }
@@ -3358,7 +3374,7 @@ assert_not_contains "U2: terminated classification carries no plan-lookup diagno
 assert_not_contains "U2: terminated classification carries no convergence diagnosis" \
     "architect convergence" "$CLASSIFY_WITH_GUARDRAIL"
 assert_contains "U2: terminated classification points at the upstream stall lineage" \
-    "dispatch-lib.sh:325" "$CLASSIFY_WITH_GUARDRAIL"
+    "mika#1901" "$CLASSIFY_WITH_GUARDRAIL"
 
 # R7: one Outcome line. The old path could stack two — _post_flight_recovery
 # appended one and the iterate-loop else-branch rewrote another.
@@ -3391,12 +3407,18 @@ assert_contains "U2: terminated guard precedes _post_flight_recovery in _run_cla
 assert_contains "U2: _post_flight_recovery is still called from _run_claude_pilot" \
     "_post_flight_recovery" "$RCP_SRC_1772"
 
-# Structural: in dispatch_claude_pilot the terminated short-circuit precedes
-# the force-push guard and the iterate loop.
+# Structural: the terminated short-circuit precedes convergence.
 DISPATCH_FIRST_1772=$(printf '%s\n' "$DISPATCH_SRC_1772" \
-    | grep -nE 'PILOT_SESSION_TERMINATED|_check_pilot_force_push|_iterate_groom_loop' | head -1)
-assert_contains "U2: PILOT_SESSION_TERMINATED is tested before the force-push guard and iterate loop" \
+    | grep -nE 'PILOT_SESSION_TERMINATED|_iterate_groom_loop' | head -1)
+assert_contains "U2: PILOT_SESSION_TERMINATED is tested before the iterate loop" \
     "PILOT_SESSION_TERMINATED" "$DISPATCH_FIRST_1772"
+
+# The pilot push guard must NOT be gated on termination: it compares the remote
+# ref before and after and already returns 0 when nothing moved, so gating it
+# bought a no-op and blinded the one check that catches a terminated pilot which
+# had already pushed.
+assert_not_contains "U2: the pilot push guard is not gated on PILOT_SESSION_TERMINATED" \
+    'PILOT_SESSION_TERMINATED:-0}" != "1" ] && ! _check_pilot_force_push' "$DISPATCH_SRC_1772"
 
 # R6: skip the push only when the branch carries nothing. _push_branch pushes
 # "any local-ahead commits regardless of pilot exit code" (dispatch-lib.sh:1801)
@@ -3416,7 +3438,7 @@ assert_contains "U3a: an unreadable session log gets its own message" \
 # (b) the re-dispatch note must key on THIS issue's plan. The old glob matched
 # any *-plan.md, and main carries 769 of them, so the note always fired.
 assert_not_contains "U3b: the re-dispatch note no longer globs for any plan file" \
-    'find "$WORKTREE_DIR/docs/plans" -name "*-plan.md" -size +500c 2>/dev/null | grep -q .' \
+    'find "$WORKTREE_DIR/docs/plans" -name "*-plan.md"' \
     "$PFR_SRC_1772"
 
 # (c) the zero-commit message must not assert an exit code it never read.
@@ -3485,6 +3507,10 @@ _pfr_probe_1772() {
 }
 
 PFR_NO_OWN_PLAN=$(_pfr_probe_1772 2013 no 1) || PFR_NO_OWN_PLAN=""
+# Positive anchor first: without it the three assert_not_contains below would all
+# pass on an empty string if the probe ever failed to run.
+assert_contains "U3: the probe produced a real callback to assert against" \
+    "PIPELINE FAILURE" "$PFR_NO_OWN_PLAN"
 assert_not_contains "U3b: no plan for this issue → no re-dispatch note" \
     "HEAD unchanged on dev-groom re-dispatch" "$PFR_NO_OWN_PLAN"
 assert_not_contains "U3c: PILOT_EXIT=1 → the message does not claim 'exited 0'" \
@@ -3497,6 +3523,125 @@ assert_contains "U3b: a plan for this issue → the re-dispatch note fires" \
     "HEAD unchanged on dev-groom re-dispatch" "$PFR_OWN_PLAN"
 assert_contains "U3b: the re-dispatch note names the plan it found" \
     "2026-08-29-001-fix-2013-own-plan.md" "$PFR_OWN_PLAN"
+
+# --- mika#1772 review round: the two populations of `terminated` -----------
+#
+# `status: terminated` is set both by a guardrail abort (subtype in
+# stall_detected|empty_response|idle_timeout) and by an SDK limit
+# (error_max_turns|error_max_budget_usd). The first usually kills a session that
+# did nothing; the second often kills one that did a great deal. Treating them
+# alike would skip the mika#1282 dirty-worktree rescue for the second and tell
+# the operator "nothing was written" about a branch carrying commits — the exact
+# defect class this ticket closes, reintroduced by its own fix.
+
+echo ""
+echo "Test: terminated sessions that left work behind (mika#1772 review)"
+echo "-------------------------------------------------------------------"
+
+# _pilot_left_no_work is the measurement the split turns on.
+_left_no_work_probe() {
+    local dirty="$1" moved="$2"
+    local base wt pre post
+    base=$(mktemp -d); wt="$base/wt"
+    git init -q "$wt" 2>/dev/null
+    echo initial > "$wt/f"; git -C "$wt" add -A 2>/dev/null
+    git -C "$wt" commit -q -m initial --no-verify 2>/dev/null
+    pre=$(git -C "$wt" rev-parse HEAD)
+    post="$pre"
+    if [ "$moved" = "yes" ]; then
+        echo more > "$wt/g"; git -C "$wt" add -A 2>/dev/null
+        git -C "$wt" commit -q -m second --no-verify 2>/dev/null
+        post=$(git -C "$wt" rev-parse HEAD)
+    fi
+    [ "$dirty" = "yes" ] && echo uncommitted > "$wt/pilot-wrote-this.rs"
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        WORKTREE_DIR="$wt" PRE_RUN_HEAD="$pre" POST_RUN_HEAD="$post"
+        if _pilot_left_no_work; then echo "NO_WORK"; else echo "HAS_WORK"; fi
+    )
+    rm -rf "$base"
+}
+
+assert_eq "clean tree, HEAD unmoved -> no work (the 2026-08-28 shape)" \
+    "NO_WORK" "$(_left_no_work_probe no no)"
+# The mika#1282 rescue exists for exactly this state; skipping it would lose the
+# files, and the worktree is force-removed on the next dispatch.
+assert_eq "dirty tree, HEAD unmoved -> work present" \
+    "HAS_WORK" "$(_left_no_work_probe yes no)"
+assert_eq "HEAD moved -> work present (the mika#1901 late-hang shape)" \
+    "HAS_WORK" "$(_left_no_work_probe no yes)"
+assert_eq "dirty AND moved -> work present" \
+    "HAS_WORK" "$(_left_no_work_probe yes yes)"
+
+# Banner mode: says only what was measured, and carries NO Outcome line — the
+# recovery chain ran and owns that.
+CLASSIFY_BANNER=$(_classify_probe '' 12 'error_max_turns' 'SDK limit reached: error_max_turns' 'banner') \
+    || CLASSIFY_BANNER=""
+assert_contains "banner names the SDK limit, not a guardrail" \
+    "error_max_turns" "$CLASSIFY_BANNER"
+assert_contains "banner names the commit range it measured" \
+    "Commits:" "$CLASSIFY_BANNER"
+assert_not_contains "banner never claims nothing was written" \
+    "nothing was written to the branch" "$CLASSIFY_BANNER"
+BANNER_OUTCOME_COUNT=$(printf '%s\n' "$CLASSIFY_BANNER" | grep -c '^Outcome:' || true)
+assert_eq "banner carries no Outcome line (recovery owns it)" "0" "$BANNER_OUTCOME_COUNT"
+
+# Full mode still earns its absolute claim, because the caller only reaches it
+# when _pilot_left_no_work said so.
+CLASSIFY_SDK_FULL=$(_classify_probe '' 2 'idle_timeout' 'No meaningful progress for 300s' 'full') \
+    || CLASSIFY_SDK_FULL=""
+assert_contains "full mode prefers the structured subtype over the stderr scrape" \
+    "idle_timeout" "$CLASSIFY_SDK_FULL"
+assert_contains "full mode states the measurement behind its claim" \
+    "HEAD did not move and the worktree is clean" "$CLASSIFY_SDK_FULL"
+
+# No subtype and no stderr: the message must say the cause is unrecorded rather
+# than name one it did not read.
+CLASSIFY_NO_CAUSE=$(_classify_probe '' 2 '' '' 'full') || CLASSIFY_NO_CAUSE=""
+assert_contains "an unrecorded cause is reported as unrecorded" \
+    "cause not recorded" "$CLASSIFY_NO_CAUSE"
+
+# The caller must route on the measurement, not on STATUS alone.
+assert_contains "the terminated branch is gated on _pilot_left_no_work" \
+    "_pilot_left_no_work" "$RCP_SRC_1772"
+assert_contains "a terminated session with work still runs _post_flight_recovery" \
+    "_post_flight_recovery" "$RCP_SRC_1772"
+
+# The plan line prefers the measurement that can answer on a first grooming.
+# _committed_plan_on_branch asks the remote AND needs a body callout, so on the
+# run this line exists for it is silent; VALID_PLAN is the worktree answer.
+VALID_FIRST=$(printf '%s\n' "$DISPATCH_SRC_1772" \
+    | grep -nE 'VALID_PLAN:-|_committed_plan_on_branch' | head -1)
+assert_contains "plan line consults the worktree measurement before the remote one" \
+    "VALID_PLAN" "$VALID_FIRST"
+
+# Reason coverage, per site rather than by total. The earlier count comparison
+# carried four units of slack, so four future un-reasoned exits could land
+# without tripping it.
+_reason_pairing_check() {
+    local body line prev1="" prev2="" bad=0 n=0
+    body=$(printf '%s\n' "$ITERATE_SRC_1772")
+    while IFS= read -r line; do
+        case "$line" in
+            *"return 1"*)
+                n=$((n + 1))
+                case "$line$prev1$prev2" in
+                    *_groom_warn\ *|*GROOM_LOOP_FAILURE_REASON=*) ;;
+                    *) bad=$((bad + 1)); echo "    unreasoned exit: $(printf '%s' "$line" | sed 's/^ *//')" >&2 ;;
+                esac
+                ;;
+        esac
+        case "$line" in
+            "") ;;
+            *) prev2="$prev1"; prev1="$line" ;;
+        esac
+    done <<<"$body"
+    echo "${bad}/${n}"
+}
+REASON_PAIRING=$(_reason_pairing_check 2>/dev/null)
+assert_eq "every return 1 in the loop has a reason setter within two lines" \
+    "0/${REASON_PAIRING#*/}" "$REASON_PAIRING"
 
 # --- Summary ---
 

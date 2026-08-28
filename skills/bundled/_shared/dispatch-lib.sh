@@ -1238,6 +1238,16 @@ _run_claude_pilot() {
     STATUS=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.status // empty' 2>/dev/null)
     SESSION_ID=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.session_id // empty' 2>/dev/null)
     TURNS=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.turns // empty' 2>/dev/null)
+    # mika#1772: `status: terminated` covers TWO populations, and they need
+    # different handling. claude-pilot sets it both for a guardrail abort
+    # (subtype is one of stall_detected / empty_response / idle_timeout,
+    # claude-pilot/src/claude_pilot/types.py:154) and for an SDK limit
+    # (SDK_TERMINATION_SUBTYPES = {error_max_turns, error_max_budget_usd},
+    # agent.py:43). The first kills a session that has usually done nothing;
+    # the second kills one that has often done a great deal. Reading the
+    # subtype is how this file tells them apart instead of guessing.
+    SUBTYPE=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.subtype // empty' 2>/dev/null)
+    TERMINATION_REASON=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.termination_reason // empty' 2>/dev/null)
     COST=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.cost_usd // empty' 2>/dev/null)
     DURATION=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.duration_ms // empty' 2>/dev/null)
 
@@ -1286,11 +1296,26 @@ ${PILOT_OUTPUT_RAW}"
     # classification. Previously this logic lived inside the if [ -n "$STATUS" ]
     # branch only — Branch B (exit 0, non-JSON) and Branch C (non-zero exit)
     # silently skipped all recovery, losing uncommitted work.
+    local _terminated_empty=0 _terminated_with_work=0
     if [ "$STATUS" = "terminated" ]; then
+        if _pilot_left_no_work; then _terminated_empty=1; else _terminated_with_work=1; fi
+    fi
+
+    if [ "$_terminated_empty" = "1" ]; then
         PILOT_SESSION_TERMINATED=1
         RESULT=$(_classify_terminated_session)
     else
         _post_flight_recovery
+        if [ "$_terminated_with_work" = "1" ]; then
+            # A session killed AFTER producing work still needs every recovery
+            # step above — the mika#1282 dirty-worktree rescue most of all, since
+            # the next dispatch force-removes this worktree. It only needs the
+            # operator to know the session did not finish, so the banner leads
+            # and the measured recovery output follows.
+            RESULT="$(_classify_terminated_session banner)
+
+${RESULT}"
+        fi
     fi
 
     # Append stderr tail for debugging context (last 10KB)
@@ -1307,7 +1332,25 @@ ${STDERR_TAIL}"
     RESULT=$(printf '%s' "$RESULT" | head -c 92000)
 }
 
-# Compose the callback for a pilot session a claude-pilot guardrail killed.
+# Did the finished pilot session leave anything behind?
+#
+# mika#1772. This is the measurement that separates the two populations
+# `status: terminated` covers. A guardrail kill at turn 1 leaves no commit and a
+# clean tree; an SDK-limit kill at turn 40 can leave both. Only the first may
+# skip the recovery chain, and only the first may be told "nothing was written".
+#
+# Returns 0 (no work) when HEAD did not move AND the worktree is clean. A worktree
+# that cannot be inspected counts as no work — the caller then reports a session
+# failure rather than inventing a content diagnosis, which is the conservative
+# direction for a tree nobody can read.
+_pilot_left_no_work() {
+    [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ] || return 0
+    [ "${PRE_RUN_HEAD:-}" = "${POST_RUN_HEAD:-}" ] || return 1
+    [ -z "$(git -C "$WORKTREE_DIR" status --porcelain 2>/dev/null)" ] || return 1
+    return 0
+}
+
+# Compose the callback for a pilot session claude-pilot terminated.
 #
 # mika#1772. On 2026-08-28 two dev-groom dispatches of mika#2013 came back with
 # `status: terminated`, `Turns: 2`, and `[guardrail] idle_timeout: No meaningful
@@ -1317,29 +1360,55 @@ ${STDERR_TAIL}"
 # callback whose first three statements were all false, the loudest of them
 # telling the operator to go find a missing architect verdict.
 #
-# The fix is to classify the session before anything judges its content. This
-# lives in its own function for two reasons: `_run_claude_pilot` and
-# `dispatch_claude_pilot` both need a real pilot and CLI to run, so neither is
-# testable, and the honesty guarantee is worth an assertion (KTD5).
+# Two modes, because `terminated` covers two populations (see _pilot_left_no_work):
+#   full   — the session left nothing. The message says so, and carries the
+#            Outcome line, because the caller skipped the recovery chain.
+#   banner — the session left work. Says only what was measured and carries NO
+#            Outcome line; the recovery chain ran and owns that.
 #
-# Reads STATUS, SESSION_ID, TURNS, DURATION, LOG_ID. Prints the callback body.
-# PILOT_LOG_DIR exists so a test can point the stderr lookup at a fixture.
+# Reads STATUS, SUBTYPE, TERMINATION_REASON, SESSION_ID, TURNS, DURATION,
+# PRE_RUN_HEAD, POST_RUN_HEAD, LOG_ID, STDERR_FILE. Prints the callback body.
 _classify_terminated_session() {
-    local stderr_path guardrail="" cause
-    stderr_path="${PILOT_LOG_DIR:-/var/log/claude-pilot}/${LOG_ID}.stderr"
+    local mode="${1:-full}"
+    local cause guardrail="" stderr_path _candidate
 
-    # KTD3: stderr only enriches the message. STATUS is the classification, so a
-    # missing or unreadable copy degrades the text and never the verdict — both
-    # 2026-08-28 tasks had no .log file at all, and a fail-closed read here
-    # would have hidden the entire class.
-    if [ -f "$stderr_path" ] && [ -r "$stderr_path" ]; then
-        guardrail=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$stderr_path" 2>/dev/null \
-            | grep -m1 '\[guardrail\]' || true)
-    fi
-    if [ -n "$guardrail" ]; then
-        cause="Halt event: ${guardrail}"
+    # The halt cause comes from the structured result first. claude-pilot puts
+    # the guardrail name in `.subtype` and its detail in `.termination_reason`
+    # (agent.py:155-162), which is more reliable than scraping stderr and is the
+    # only signal that distinguishes a guardrail abort from an SDK limit.
+    if [ -n "${SUBTYPE:-}" ]; then
+        cause="Halt: ${SUBTYPE}${TERMINATION_REASON:+ — ${TERMINATION_REASON}}"
     else
-        cause="Halt event: not recorded — no [guardrail] line in ${stderr_path}."
+        # Fallback for a result without a subtype: scrape the `[guardrail]` line.
+        # Prefer the stderr still in hand; the persisted copy may not exist yet
+        # if the mkdir/scrub at the top of this run failed.
+        # KTD3: stderr only enriches. STATUS is the classification, so a missing
+        # or unreadable copy degrades the text and never the verdict — both
+        # 2026-08-28 tasks had no .log file at all, and a fail-closed read here
+        # would have hidden the entire class.
+        stderr_path="${PILOT_LOG_DIR:-/var/log/claude-pilot}/${LOG_ID}.stderr"
+        for _candidate in "${STDERR_FILE:-}" "$stderr_path"; do
+            [ -n "$_candidate" ] && [ -f "$_candidate" ] && [ -r "$_candidate" ] || continue
+            guardrail=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$_candidate" 2>/dev/null \
+                | grep -m1 '\[guardrail\]' || true)
+            [ -n "$guardrail" ] && break
+        done
+        if [ -n "$guardrail" ]; then
+            cause="Halt: ${guardrail}"
+        else
+            cause="Halt: cause not recorded — no subtype on the result and no [guardrail] line in stderr."
+        fi
+    fi
+
+    if [ "$mode" = "banner" ]; then
+        printf '%s' "PIPELINE FAILURE: the claude-pilot session was terminated before it finished, but it left work behind. Everything below was produced by an incomplete session — treat it as unvalidated.
+
+Session: ${SESSION_ID:-unknown}
+Turns: ${TURNS:-unknown}
+Duration: ${DURATION:-unknown}ms
+${cause}
+Commits: ${PRE_RUN_HEAD:-unknown}..${POST_RUN_HEAD:-unknown}"
+        return 0
     fi
 
     printf '%s' "PIPELINE FAILURE: the claude-pilot session was terminated before it produced any work. This is a session failure, not a content failure.
@@ -1349,9 +1418,9 @@ Turns: ${TURNS:-unknown}
 Duration: ${DURATION:-unknown}ms
 ${cause}
 
-Nothing was written to the branch and the architect was never invoked, so there is no plan and no verdict to go looking for. The cause is upstream of grooming: see the same signature documented at dispatch-lib.sh:325 (Anthropic 401 / SDK stall -> guardrail idle_timeout 300s -> pilot dies at Turns:1 with HEAD unchanged).
+HEAD did not move and the worktree is clean, so nothing was written to the branch and the architect was never invoked. There is no plan and no verdict to go looking for. The cause is upstream of grooming — the pilot never got far enough to do its work. See the stall lineage on mika#1901 and the note above _run_pilot_sandboxed on the Anthropic 401 / SDK-stall chain that ends in exactly this shape.
 
-Outcome: PIPELINE_INCOMPLETE — pilot session terminated by a claude-pilot guardrail."
+Outcome: PIPELINE_INCOMPLETE — pilot session terminated by claude-pilot before producing work."
 }
 
 _post_flight_recovery() {
@@ -1388,7 +1457,7 @@ _post_flight_recovery() {
             # See: docs/solutions/workflow-issues/
             #      2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md
             POLICY_DENY=""
-            PERSISTENT_STDERR_PATH="/var/log/claude-pilot/${LOG_ID}.stderr"
+            PERSISTENT_STDERR_PATH="${PILOT_LOG_DIR:-/var/log/claude-pilot}/${LOG_ID}.stderr"
             if [ -f "$PERSISTENT_STDERR_PATH" ] && [ -r "$PERSISTENT_STDERR_PATH" ]; then
                 POLICY_DENY=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$PERSISTENT_STDERR_PATH" 2>/dev/null \
                     | grep -m1 '\[policy:deny\]' || true)
@@ -1712,7 +1781,7 @@ dispatch-lib (mika#1383): rescued trailing dirty content into wip() commit; PR c
         # Check session log for /ce:plan invocation (mika#1032).
         # Broad pattern covers Skill tool call JSON, command strings, etc.
         # Fail-open: if log is unavailable, skip the check with a warning.
-        SESSION_LOG="/var/log/claude-pilot/${LOG_ID}.log"
+        SESSION_LOG="${PILOT_LOG_DIR:-/var/log/claude-pilot}/${LOG_ID}.log"
         CE_PLAN_INVOKED=""
         if [ -f "$SESSION_LOG" ] && [ -r "$SESSION_LOG" ]; then
             if grep -qiE 'ce[.:\-_]plan' "$SESSION_LOG" 2>/dev/null; then
@@ -1733,7 +1802,7 @@ dispatch-lib (mika#1383): rescued trailing dirty content into wip() commit; PR c
         # Fail-open: if stderr is unavailable, fall through to the
         # existing drift messages.
         POLICY_DENY=""
-        PERSISTENT_STDERR_PATH="/var/log/claude-pilot/${LOG_ID}.stderr"
+        PERSISTENT_STDERR_PATH="${PILOT_LOG_DIR:-/var/log/claude-pilot}/${LOG_ID}.stderr"
         if [ -f "$PERSISTENT_STDERR_PATH" ] && [ -r "$PERSISTENT_STDERR_PATH" ]; then
             # Strip ANSI color codes, then extract the first [policy:deny] line.
             # The line shape is `[policy:deny] <Tool>: <command>[ \[rule-id\]]`.
@@ -3607,9 +3676,7 @@ EOF
     # skill-scoping is internal (early-return for non-dev-groom). If violation
     # detected, poison RESULT and skip iterate loop + push — deliver callback
     # immediately so mika-dev receives the violation.
-    # mika#1772: a terminated session pushed nothing, so there is no violation to
-    # detect and nothing for the guard to compare.
-    if [ "${PILOT_SESSION_TERMINATED:-0}" != "1" ] && ! _check_pilot_force_push; then
+    if ! _check_pilot_force_push; then
         RESULT="STRUCTURAL VIOLATION: pilot push detected (mika#1318). The dev-groom pilot pushed to the remote during its session — this is a scope-of-authority violation. Push is dispatch-lib's responsibility, not the pilot's.
 
 Evidence: ${PUSH_VIOLATION_EVIDENCE}
@@ -3668,17 +3735,22 @@ Outcome: PLAN_GROOMED"
             _groom_reason_sed="${_groom_reason_sed//\//\\/}"
             _groom_reason_sed="${_groom_reason_sed//&/\\&}"
 
-            # The plan-on-branch claim is measured, not asserted. On the
-            # 2026-08-28 class the branch tip equals origin/main and this call
-            # fails, so the line disappears; on the mika#1723 class a plan
-            # really is committed and naming it is the most useful thing the
-            # message can say. _committed_plan_on_branch is the same authority
-            # the redundant-groom gate uses (mika#2012).
+            # The plan claim is measured, not asserted — but by the measurement
+            # that can actually answer on this run. `_committed_plan_on_branch`
+            # asks the REMOTE, and needs a `> - **Plan:**` callout in the issue
+            # body to ask at all; on a first grooming neither holds — the plan is
+            # committed locally and the push happens further down — so it would
+            # stay silent in exactly the case the line exists for. VALID_PLAN is
+            # the worktree answer `_find_issue_plan` already resolved this run.
+            # Two measurements, two sentences; never one sentence for both.
             local _groom_plan_line=""
             local _groom_plan_path
-            if _groom_plan_path=$(_committed_plan_on_branch "$SUB_REPO_DIR" "$BRANCH" "$ISSUE_BODY" "$REPO" 2>/dev/null); then
+            if [ -n "${VALID_PLAN:-}" ]; then
                 _groom_plan_line="
-Plan on branch: ${_groom_plan_path} (committed) — the architect verdict is what is missing."
+Plan in worktree: ${VALID_PLAN} — the architect verdict is what is missing, not the plan."
+            elif _groom_plan_path=$(_committed_plan_on_branch "$SUB_REPO_DIR" "$BRANCH" "$ISSUE_BODY" "$REPO" 2>/dev/null); then
+                _groom_plan_line="
+Plan on remote branch: ${_groom_plan_path} — the architect verdict is what is missing, not the plan."
             fi
 
             # mika#1394: match any Outcome: line (not just PLAN_COMMITTED) to
@@ -3698,13 +3770,13 @@ ${RESULT}"
 
     # mika#1772 (R6): suppress only the EMPTY-branch push a terminated session
     # produces — the `mode=first-push` that put a plan-less branch on origin for
-    # mika#2013. Never suppress on termination alone: _push_branch publishes any
-    # local-ahead commits regardless of exit code (see its header) and the next
-    # dispatch force-removes the worktree, so a blanket skip would destroy the
-    # work of a session killed AFTER committing — the late-hang shape mika#1901
-    # describes.
-    if [ "${PILOT_SESSION_TERMINATED:-0}" = "1" ] \
-       && [ -n "$PRE_RUN_HEAD" ] && [ "$PRE_RUN_HEAD" = "$POST_RUN_HEAD" ]; then
+    # mika#2013. The flag alone is sufficient because _pilot_left_no_work already
+    # gated it on a clean tree and an unmoved HEAD: a session killed AFTER
+    # committing never sets it, so its work still reaches origin. That matters —
+    # _push_branch publishes any local-ahead commits regardless of exit code, and
+    # the next dispatch force-removes this worktree, so a blanket skip on
+    # termination would destroy the late-hang work mika#1901 describes.
+    if [ "${PILOT_SESSION_TERMINATED:-0}" = "1" ]; then
         RESULT="${RESULT}
 
 Push: SKIPPED — session terminated with no new commits; there is nothing to publish."
