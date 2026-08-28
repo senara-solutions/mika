@@ -2840,6 +2840,10 @@ async fn seed_user_person(db: &AsyncDatabase) -> Result<()> {
 
 /// Parameters for running the agent loop.
 pub struct AgentParams<'a> {
+    /// Agent tier for this turn, resolved once at agent init (mika#1962).
+    /// Threaded from `AgentState.tier` — never re-read from the environment
+    /// here, so a mid-runtime env change cannot flip a running agent's tier.
+    pub tier: mika_common::home::AgentTier,
     pub db: &'a AsyncDatabase,
     pub llm: &'a dyn LlmProvider,
     pub tools: &'a ToolRegistry,
@@ -3346,7 +3350,7 @@ async fn run_agent_inner(
         callback_task_id: None, // Conversation mode: not a callback turn
         required_tool_arg_suffixes: &required_tool_arg_suffixes,
         tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
-        tier: mika_common::home::AgentTier::from_env(),
+        tier: params.tier,
         scope_task_id,
     };
 
@@ -3769,6 +3773,10 @@ impl SilentTrigger {
 
 /// Parameters for running the silent agent loop (heartbeat/reminders).
 pub struct SilentAgentParams<'a> {
+    /// Agent tier for this turn, resolved once at agent init (mika#1962).
+    /// Threaded from `AgentState.tier` — never re-read from the environment
+    /// here, so a mid-runtime env change cannot flip a running agent's tier.
+    pub tier: mika_common::home::AgentTier,
     pub db: &'a AsyncDatabase,
     pub llm: &'a dyn LlmProvider,
     pub tools: &'a ToolRegistry,
@@ -4270,7 +4278,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         callback_task_id,
         required_tool_arg_suffixes: &required_tool_arg_suffixes_silent,
         tool_arg_suffix_rejected: &tool_arg_suffix_rejected_silent,
-        tier: mika_common::home::AgentTier::from_env(),
+        tier: params.tier,
         scope_task_id: scope_task_id.as_deref(),
     };
 
@@ -4523,6 +4531,10 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
 
 /// Parameters for running an agent within a team execution context.
 pub struct TeamAgentParams<'a> {
+    /// Agent tier for this turn, resolved once at agent init (mika#1962).
+    /// Threaded from `AgentState.tier` — never re-read from the environment
+    /// here, so a mid-runtime env change cannot flip a running agent's tier.
+    pub tier: mika_common::home::AgentTier,
     pub db: &'a AsyncDatabase,
     pub llm: &'a dyn LlmProvider,
     pub tools: &'a ToolRegistry,
@@ -4834,7 +4846,7 @@ async fn run_team_agent_inner_impl(
         callback_task_id: None,  // Team mode: not a callback turn
         required_tool_arg_suffixes: &required_tool_arg_suffixes_team,
         tool_arg_suffix_rejected: &tool_arg_suffix_rejected_team,
-        tier: mika_common::home::AgentTier::from_env(),
+        tier: params.tier,
         scope_task_id: None, // Team mode: no task context for parallel narrative
     };
 
