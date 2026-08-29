@@ -227,10 +227,70 @@ impl OpenAiCompatibleProvider {
             });
         }
 
-        let resp: OpenAiResponse = response
-            .json()
-            .await
-            .map_err(|e| LlmError::ParseError(format!("failed to parse response: {e}")))?;
+        // Read the body as text before deserializing, so a parse failure can say
+        // WHAT failed to parse (mika#1781).
+        //
+        // `response.json()` consumes the body to deserialize it; when that fails,
+        // reqwest reports only "error decoding response body" and the bytes are
+        // gone. That error has fired 7138 times since 2026-04-06 without ever
+        // leaving behind anything to diagnose, which is why the ticket sat in p2
+        // for four months described as an "upstream flake" — nobody could tell
+        // whether it was a truncated stream, an HTML error page, or a schema the
+        // provider changed.
+        // A failure HERE is a transport failure, not a parse failure: the bytes
+        // never arrived. Within the first hour of #2015's diagnostics being
+        // deployed (2026-08-27 09:52Z), 48 of 48 parse-error occurrences were
+        // body-read failures — the serde branch below never fired once. Mapping
+        // this to ParseError (non-retryable) is what made every mid-body network
+        // hiccup kill a whole pilot cycle for four months; Transport routes it
+        // through the existing fast-retry path (#1744) instead.
+        //
+        // reqwest's Display for this error is the opaque "error decoding
+        // response body" — the cause (unexpected EOF, decompression error,
+        // reset) lives in the source chain, so walk it into the message.
+        let body = match response.text().await {
+            Ok(b) => b,
+            Err(e) => {
+                let mut chain = e.to_string();
+                let mut src = std::error::Error::source(&e);
+                while let Some(s) = src {
+                    chain.push_str(": ");
+                    chain.push_str(&s.to_string());
+                    src = s.source();
+                }
+                warn!(
+                    target: "mika::llm",
+                    provider = %self.provider_kind,
+                    error = %chain,
+                    "LLM response body read failed mid-stream (retryable transport)"
+                );
+                return Err(LlmError::Transport(format!(
+                    "failed to read response body: {chain}"
+                )));
+            }
+        };
+
+        let resp: OpenAiResponse = serde_json::from_str(&body).map_err(|e| {
+            // serde_json names the offending line, column and field — unlike the
+            // reqwest error this replaces. The excerpt is capped and only emitted
+            // on failure: for an OpenAI-compatible response the head is metadata
+            // (`id`, `object`, `model`), and when the body is an error page or an
+            // upstream JSON error it is exactly what needs reading.
+            let excerpt: String = body.chars().take(400).collect();
+            warn!(
+                target: "mika::llm",
+                provider = %self.provider_kind,
+                error = %e,
+                body_len = body.len(),
+                body_excerpt = %excerpt,
+                "LLM response body did not parse"
+            );
+            LlmError::ParseError(format!(
+                "failed to parse response: {e} (body {} bytes, starts: {})",
+                body.len(),
+                excerpt.chars().take(120).collect::<String>()
+            ))
+        })?;
 
         // Dev-mode body logging
         if tracing::enabled!(target: "mika::llm_debug", tracing::Level::DEBUG) {

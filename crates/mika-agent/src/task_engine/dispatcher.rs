@@ -36,6 +36,10 @@ use super::types::action_type;
 /// `run_skill` is implemented for "heartbeat" and "reflection" triggers.
 pub struct TaskDispatcher {
     pub db: AsyncDatabase,
+    /// Agent tier, threaded from `AgentState.tier` at construction (mika#1962).
+    /// Silent turns read this instead of `AgentTier::from_env()` so a
+    /// mid-runtime env change cannot flip the tier of a running dispatcher.
+    pub tier: mika_common::home::AgentTier,
     pub llm: Arc<dyn LlmProvider>,
     pub tools: Arc<ToolRegistry>,
     pub skills: Arc<SkillRegistry>,
@@ -265,6 +269,7 @@ impl TaskDispatcher {
 
         let params = SilentAgentParams {
             db: &self.db,
+            tier: self.tier,
             llm: self.llm.as_ref(),
             tools: &self.tools,
             skills: &self.skills,
@@ -468,6 +473,7 @@ impl TaskDispatcher {
 
         let params = SilentAgentParams {
             db: &self.db,
+            tier: self.tier,
             llm: self.llm.as_ref(),
             tools: &self.tools,
             skills: &self.skills,
@@ -703,6 +709,7 @@ impl TaskDispatcher {
             &self.db,
             self.github_app.clone(),
             self.pr_reviews_posted.clone(),
+            self.tier, // mika#1962 — cached at agent init, never re-read here
         )
         .await
         .with_context(|| format!("resuming team_run_id={team_run_id}"))?;
@@ -821,6 +828,7 @@ impl TaskDispatcher {
 
         let params = SilentAgentParams {
             db: &self.db,
+            tier: self.tier,
             llm: self.llm.as_ref(),
             tools: &self.tools,
             skills: &self.skills,
@@ -1120,6 +1128,7 @@ impl TaskDispatcher {
 
         let params = SilentAgentParams {
             db: &self.db,
+            tier: self.tier,
             llm: self.llm.as_ref(),
             tools: &self.tools,
             skills: &self.skills,
@@ -1407,6 +1416,7 @@ impl TaskDispatcher {
 
         let params = SilentAgentParams {
             db: &self.db,
+            tier: self.tier,
             llm: self.llm.as_ref(),
             tools: &self.tools,
             skills: &self.skills,
@@ -2290,6 +2300,7 @@ mod tests {
         let settings = Settings::load(tmp.path()).unwrap();
         TaskDispatcher {
             db,
+            tier: mika_common::home::AgentTier::Default,
             llm: mika_common::llm::dummy_provider(),
             tools: Arc::new(crate::tools::default_tools()),
             skills: Arc::new(crate::skills::SkillRegistry::empty()),

@@ -17,6 +17,12 @@
 .DS_Store
 Thumbs.db
 
+# Python — `scripts/` carries executable Python; running any of it
+# writes bytecode next to the source. The make targets pass -B, but a
+# direct `python3 scripts/...` invocation still would.
+__pycache__/
+*.pyc
+
 # Node
 node_modules/
 # dashboard/dist/ is a build artifact — embedded into mika-server via rust-embed at compile time.

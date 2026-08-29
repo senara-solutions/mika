@@ -54,6 +54,7 @@ fn test_dispatcher(db: AsyncDatabase) -> Arc<TaskDispatcher> {
     let settings = mika_common::config::Settings::load(tmp.path()).expect("load settings");
     Arc::new(TaskDispatcher {
         db,
+        tier: mika_common::home::AgentTier::Default,
         llm: mika_common::llm::dummy_provider(),
         tools: Arc::new(default_tools()),
         skills: Arc::new(SkillRegistry::empty()),
