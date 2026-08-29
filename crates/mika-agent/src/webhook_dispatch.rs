@@ -89,6 +89,13 @@ pub(crate) const DEFAULT_DISPATCH_OWNER: &str = "senara-solutions";
 /// in exactly one place and every refusal quotes it — see
 /// [`dispatchable_repos_display`].
 ///
+/// **`wizzard` is deliberately absent.** It is a read-write controlled repo, but
+/// the loop has never dispatched into it and the 2026-08-29 arbitrage named these
+/// four. Listing a repo the loop cannot actually drive would be the same
+/// permitted-versus-exists confusion in the other direction. Because refusal is
+/// noisy and named, the first `ready` label on a wizzard issue reports itself
+/// rather than failing quietly — that is the intended way to revisit this.
+///
 /// Churn here is rare and a rebuild is the accepted cost, per the same reasoning
 /// recorded for `DISPATCH_TRIGGER_ALLOWLIST` in
 /// `docs/solutions/1053-dispatch-trigger-allowlist-config-constant.md`.
@@ -136,15 +143,35 @@ pub(crate) fn is_dispatchable_repo(repo_ref: &str) -> bool {
 
 /// Extract the repository reference from a dispatch `prompt` argument.
 ///
-/// Recognizes exactly the anchored `[owner/]repo#number` shape that
-/// `dispatch-lib.sh`'s worktree-setup parser accepts, so the tool-boundary gate
-/// and the shell agree on which prompts are repository references at all.
+/// Recognizes the anchored `[owner/]repo#number` shape that `dispatch-lib.sh`'s
+/// worktree-setup parser accepts, so the tool-boundary gate and the shell agree
+/// on which prompts are repository references at all.
 ///
-/// Returns `None` for free-text prompts — including free text that merely
+/// **This must never be stricter than the shell**, because the shell is what
+/// actually creates the worktree. Anything this returns `None` for is a prompt
+/// the allowlist never judges — so a prompt the shell routes into worktree mode
+/// but this reads as free text walks straight past the gate. Two places where
+/// the shell is laxer than a naive reading, both covered here:
+///
+/// * **Surrounding whitespace.** `dispatch-lib.sh:769` reads the prompt as
+///   `PROMPT=$(… jq -r '.prompt')`, and command substitution strips trailing
+///   newlines. `"control-monitor#159\n"` therefore reaches the shell's regex as
+///   `control-monitor#159` and matches. Hence the trim.
+/// * **Multi-line prompts.** The shell test is `grep -qE '^…$'`, which succeeds
+///   when *any* line matches, not only when the whole string does. Hence the
+///   per-line scan: the first line that is a repository reference is the one the
+///   allowlist judges.
+///
+/// Returns `None` for genuine free text — including free text that merely
 /// contains a `#`. A free-text dispatch resolves no repository, so the allowlist
 /// has nothing to judge and must not refuse it.
 pub(crate) fn parse_repo_ref_from_dispatch_prompt(prompt: &str) -> Option<&str> {
-    let (repo_ref, number) = prompt.split_once('#')?;
+    prompt.lines().find_map(parse_repo_ref_line)
+}
+
+/// The single-reference form, applied to one already-split line.
+fn parse_repo_ref_line(line: &str) -> Option<&str> {
+    let (repo_ref, number) = line.trim().split_once('#')?;
     if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -387,6 +414,49 @@ mod tests {
         );
     }
 
+    /// Regression for the bypass found in review of mika#2046: the tool-boundary
+    /// gate is only load-bearing if it is at least as permissive as the shell
+    /// that actually creates the worktree. `dispatch-lib.sh:769` reads the
+    /// prompt through command substitution, which strips trailing newlines, so
+    /// this exact string reaches the shell regex as `control-monitor#159` and
+    /// matches. A parser that returned `None` here would let it through.
+    #[test]
+    fn test_parse_repo_ref_from_dispatch_prompt_survives_surrounding_whitespace() {
+        for prompt in [
+            "control-monitor#159\n",
+            "  control-monitor#159  ",
+            "\tcontrol-monitor#159\n\n",
+            "control-monitor#159\r\n",
+        ] {
+            assert_eq!(
+                parse_repo_ref_from_dispatch_prompt(prompt),
+                Some("control-monitor"),
+                "{prompt:?} reaches dispatch-lib as a repo reference and must be judged"
+            );
+            assert!(!is_dispatchable_repo(
+                parse_repo_ref_from_dispatch_prompt(prompt).unwrap()
+            ));
+        }
+        assert_eq!(
+            parse_repo_ref_from_dispatch_prompt("mika#2046\n"),
+            Some("mika")
+        );
+    }
+
+    /// The shell's `grep -qE` succeeds when any line matches, so a multi-line
+    /// prompt whose first line is a repo reference still routes into worktree
+    /// mode. The gate must see it too.
+    #[test]
+    fn test_parse_repo_ref_from_dispatch_prompt_reads_multiline_prompts() {
+        let iteration = "control-monitor#159\n\nITERATION CONTEXT:\nfix the thing";
+        assert_eq!(
+            parse_repo_ref_from_dispatch_prompt(iteration),
+            Some("control-monitor")
+        );
+        let legit = "mika#2046\n\nITERATION CONTEXT:\nfix the thing";
+        assert_eq!(parse_repo_ref_from_dispatch_prompt(legit), Some("mika"));
+    }
+
     #[test]
     fn test_parse_repo_ref_from_dispatch_prompt_ignores_free_text() {
         // Free text resolves no repository, so the allowlist must not judge it.
@@ -399,6 +469,7 @@ mod tests {
             "#2046",
             "",
             "a/b/c#1",
+            "please look at control-monitor#159 when you get a chance",
         ] {
             assert_eq!(
                 parse_repo_ref_from_dispatch_prompt(prompt),

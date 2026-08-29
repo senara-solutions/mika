@@ -547,6 +547,16 @@ async fn fetch_issue_body(loc: &ReadyLabelLocation, token: &str) -> Result<Strin
 /// `webhook_ready_label_dispatch` INTENT_GUARD trigger — otherwise the guard
 /// would demand the dispatch this refusal exists to prevent. Quotes the
 /// allowlist so the operator reading it learns what would have been accepted.
+///
+/// **The `send_message` instruction below is advisory, not enforced.** Replacing
+/// `req.text` also takes the message out of the `[GitHub]` prefix domain, so
+/// `webhook_zero_tools` does not fire either: an LLM that reads this and ends
+/// its turn with no tool call is not re-prompted, and the operator learns of the
+/// refusal only from the audit event and the structured warning above. That is a
+/// degraded notification, not a silent dispatch — the refusal itself is
+/// structural and already happened. Making the notification structural too would
+/// mean an engine-side send or label removal; deliberately not done here, since
+/// it widens this gate into notification policy.
 fn format_repo_not_dispatchable_pre_digest(loc: &ReadyLabelLocation, allowed: &str) -> String {
     format!(
         "<ready_label_handler>\n\
