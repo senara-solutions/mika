@@ -6,4 +6,5 @@
 //! They carry no API stability promise, are not registered as agent tools, and
 //! must not be wired into the agent loop.
 
+pub mod mechanism_analyzer;
 pub mod peer_b;
