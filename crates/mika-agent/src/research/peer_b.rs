@@ -206,7 +206,8 @@ pub struct PeerB {
     seed: u64,
     /// Parallel to `fixture`: the answer this instance will give for each item.
     answers: Vec<&'static str>,
-    /// Ids whose answer differs from ground truth, in fixture order.
+    /// Ids whose answer differs from ground truth, sorted so the set is
+    /// canonical regardless of draw order.
     perturbed_ids: Vec<&'static str>,
 }
 
@@ -232,6 +233,17 @@ impl PeerB {
     ) -> Result<Self> {
         if fixture.is_empty() {
             bail!("peer_b fixture is empty");
+        }
+        // A degraded arm that perturbs nothing would make every downstream
+        // measurement noise, so refuse a fixture too small to carry the rate
+        // rather than silently answering everything correctly.
+        if reliability == Reliability::Degradee && perturbed_count(fixture.len()) == 0 {
+            bail!(
+                "peer_b fixture of {} items cannot be degraded at the {DEGRADED_NUM}/{DEGRADED_DEN} rate \
+                 (needs at least {} items)",
+                fixture.len(),
+                DEGRADED_DEN.div_ceil(DEGRADED_NUM)
+            );
         }
 
         let mut answers: Vec<&'static str> = fixture.iter().map(|i| i.truth).collect();
@@ -266,6 +278,11 @@ impl PeerB {
     /// The head is peer B's committed answer — ground truth under `Fiable`, and
     /// under `Degradee` a wrong answer for the seeded subset. `k = 0` is
     /// clamped to 1. Distractors are deterministic and never equal the head.
+    ///
+    /// For a perturbed item the distractors also exclude that item's ground
+    /// truth. Offering the correct answer alongside the wrong one would let a
+    /// consumer recover it at any `k > 1` and collapse the manipulation the
+    /// experiment rests on.
     pub fn peer_b_solve(&self, item_id: &str, k: usize) -> Result<PeerBResponse> {
         let index = self
             .fixture
@@ -275,6 +292,10 @@ impl PeerB {
 
         let head = self.answers[index];
         let mut candidates = vec![head.to_string()];
+        // `None` for a correctly-answered item; the item's own truth when the
+        // knob perturbed it.
+        let withheld_truth =
+            (head != self.fixture[index].truth).then_some(self.fixture[index].truth);
 
         // Derived per-item so distractors do not depend on how many solves ran
         // before this one. Call order must not change any answer.
@@ -287,6 +308,9 @@ impl PeerB {
                 break;
             }
             let candidate = self.fixture[(start + offset) % self.fixture.len()].truth;
+            if withheld_truth == Some(candidate) {
+                continue;
+            }
             if !candidates.iter().any(|c| c == candidate) {
                 candidates.push(candidate.to_string());
             }
@@ -311,8 +335,9 @@ impl PeerB {
         self.fixture
     }
 
-    /// Ids this instance actually answers incorrectly. Empty under `Fiable`.
-    /// Run records should carry this realised set, not the nominal rate.
+    /// Ids this instance actually answers incorrectly, sorted. Empty under
+    /// `Fiable`. Run records should carry this realised set, not the nominal
+    /// rate.
     pub fn perturbed_ids(&self) -> &[&'static str] {
         &self.perturbed_ids
     }
@@ -585,5 +610,61 @@ mod tests {
     #[test]
     fn empty_fixture_is_rejected() {
         assert!(PeerB::with_fixture(&[], Reliability::Fiable, 1).is_err());
+    }
+
+    #[test]
+    fn fixture_too_small_to_degrade_is_rejected() {
+        // Under the 2/6 rate a 2-item fixture yields zero perturbations. A
+        // degraded arm that degrades nothing must fail loudly, not answer
+        // everything correctly while claiming to be degraded.
+        const TWO: &[Item] = &[
+            Item {
+                id: "two-1",
+                prompt: "1+1",
+                truth: "2",
+            },
+            Item {
+                id: "two-2",
+                prompt: "2+2",
+                truth: "4",
+            },
+        ];
+        assert_eq!(perturbed_count(2), 0);
+        assert!(PeerB::with_fixture(TWO, Reliability::Degradee, 1).is_err());
+        // The same fixture is legitimate under Fiable — nothing needs perturbing.
+        assert!(PeerB::with_fixture(TWO, Reliability::Fiable, 1).is_ok());
+        // Three items is the smallest fixture the rate can degrade.
+        assert_eq!(perturbed_count(3), 1);
+    }
+
+    #[test]
+    fn distractors_never_hand_back_a_perturbed_item_truth() {
+        // At k > 1 the candidate list must not contain the correct answer for
+        // an item the knob perturbed, or a consumer could recover it and the
+        // manipulation collapses.
+        for seed in 0..32u64 {
+            let peer = PeerB::new(Reliability::Degradee, seed).expect("builds");
+            for id in peer.perturbed_ids() {
+                let truth = peer
+                    .ground_truth(id)
+                    .expect("perturbed id is in the fixture");
+                let got = peer.peer_b_solve(id, FIXTURE.len()).expect("resolves");
+                assert!(
+                    !got.candidates.iter().any(|c| c == truth),
+                    "seed {seed}: item {id} leaked its ground truth '{truth}' as a distractor"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn distractors_do_include_truth_for_a_correctly_answered_item() {
+        // The withholding is scoped to perturbed items only — it must not
+        // quietly shrink the candidate pool everywhere.
+        let peer = PeerB::new(Reliability::Fiable, 5).expect("builds");
+        let got = peer
+            .peer_b_solve("rt005-01", FIXTURE.len())
+            .expect("resolves");
+        assert_eq!(got.candidates.len(), FIXTURE.len());
     }
 }
