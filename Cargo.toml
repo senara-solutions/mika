@@ -52,7 +52,7 @@ tracing-appender = "0.2"
 
 # OpenTelemetry (optional per-crate via "telemetry" feature)
 opentelemetry = "0.31"
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.31", features = ["http-proto"] }
 tracing-opentelemetry = "0.32"
 
