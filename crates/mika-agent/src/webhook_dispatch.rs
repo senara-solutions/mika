@@ -64,6 +64,108 @@ pub(crate) fn is_ready_label_dispatch_marker(msg: &str) -> bool {
     msg.starts_with(READY_LABEL_DISPATCH_MARKER)
 }
 
+/// Owner applied to a bare `<repo>` reference. The loop only ever operates on
+/// `senara-solutions` repositories; a marker that omits the owner is a gateway
+/// short-form, not an invitation to guess another org.
+pub(crate) const DEFAULT_DISPATCH_OWNER: &str = "senara-solutions";
+
+/// The repositories the autonomous loop is allowed to dispatch into, fully
+/// qualified as `owner/repo` (mika#2046).
+///
+/// **Default-deny.** Before this list existed the effective policy was "whatever
+/// the webhook names": every link from the `ready` label to a worktree — the
+/// marker parse, `ReadyLabelLocation::repo_name`, dispatch-lib's `repo#number`
+/// parse, and its `SUB_REPO_DIR` resolution — is pure string handling, so a
+/// `ready` label on any repository reachable from the workspace would have
+/// created a worktree there and run the pipeline in it.
+///
+/// **Why this is a hand-held constant and not derived from the workspace.**
+/// Deriving the list from "which directories are git repositories" is precisely
+/// the predicate that fails: `control-monitor` and `claude-pilot` *are* git
+/// repositories sitting next to `mika` in the workspace, and the 2026-08-29
+/// operator decision is that they are spawn-CC-only and must never be reached by
+/// the loop. Presence describes what exists, not what is permitted; the two are
+/// different questions and only one of them is the policy. So the list is held
+/// in exactly one place and every refusal quotes it — see
+/// [`dispatchable_repos_display`].
+///
+/// Churn here is rare and a rebuild is the accepted cost, per the same reasoning
+/// recorded for `DISPATCH_TRIGGER_ALLOWLIST` in
+/// `docs/solutions/1053-dispatch-trigger-allowlist-config-constant.md`.
+pub(crate) const DISPATCHABLE_REPOS: &[&str] = &[
+    "senara-solutions/mika",
+    "senara-solutions/mika-cloud",
+    "senara-solutions/mika-skills",
+    "senara-solutions/mika-platform",
+];
+
+/// Normalize a repository reference to its fully-qualified `owner/repo` form,
+/// applying [`DEFAULT_DISPATCH_OWNER`] when the reference carries no owner.
+///
+/// Single source of truth for the defaulting rule: `ReadyLabelLocation::owner_repo`
+/// delegates here so the handler and the tool-boundary gate cannot drift on what
+/// `mika#2046` means.
+pub(crate) fn normalize_owner_repo(repo_ref: &str) -> String {
+    if repo_ref.contains('/') {
+        repo_ref.to_string()
+    } else {
+        format!("{DEFAULT_DISPATCH_OWNER}/{repo_ref}")
+    }
+}
+
+/// True when `repo_ref` names a repository the loop may dispatch into.
+///
+/// Accepts either form — `mika` or `senara-solutions/mika` — and compares the
+/// **owner-qualified** result against [`DISPATCHABLE_REPOS`]. Matching on the
+/// bare basename would accept `another-org/mika`, whose basename is `mika` but
+/// which is not our repository.
+///
+// DOCTRINE: pre-classifier structural gate (mika#2046)
+// Applies per crates/mika-agent/docs/permission-decision-protocol-2026-07-06.md §AC2:
+// "This agent structurally cannot do X" applies to pre-classifier engine gates
+// only, NEVER to LLM classifier decisions. This predicate is such a gate — which
+// repository a dispatch targets is a structural fact read off the trigger, not a
+// judgement the LLM classifier is asked to make.
+pub(crate) fn is_dispatchable_repo(repo_ref: &str) -> bool {
+    if repo_ref.is_empty() {
+        return false;
+    }
+    let owner_repo = normalize_owner_repo(repo_ref);
+    DISPATCHABLE_REPOS.contains(&owner_repo.as_str())
+}
+
+/// Extract the repository reference from a dispatch `prompt` argument.
+///
+/// Recognizes exactly the anchored `[owner/]repo#number` shape that
+/// `dispatch-lib.sh`'s worktree-setup parser accepts, so the tool-boundary gate
+/// and the shell agree on which prompts are repository references at all.
+///
+/// Returns `None` for free-text prompts — including free text that merely
+/// contains a `#`. A free-text dispatch resolves no repository, so the allowlist
+/// has nothing to judge and must not refuse it.
+pub(crate) fn parse_repo_ref_from_dispatch_prompt(prompt: &str) -> Option<&str> {
+    let (repo_ref, number) = prompt.split_once('#')?;
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let segment_ok = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    };
+    let shape_ok = match repo_ref.split_once('/') {
+        Some((owner, repo)) => segment_ok(owner) && segment_ok(repo),
+        None => segment_ok(repo_ref),
+    };
+    shape_ok.then_some(repo_ref)
+}
+
+/// The allowlist rendered for a refusal message, so every refusal states what
+/// would have been accepted instead of only what was denied (mika#2046).
+pub(crate) fn dispatchable_repos_display() -> String {
+    DISPATCHABLE_REPOS.join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +295,127 @@ mod tests {
             "[GitHub] New comment on senara-solutions/mika#933"
         ));
         assert!(!is_ready_label_dispatch_marker("not a github event"));
+    }
+
+    /// mika#2046 — both directions. The negative half alone would also be
+    /// satisfied by a predicate that refuses everything, so the positive half is
+    /// what makes this suite non-vacuous.
+    #[test]
+    fn test_is_dispatchable_repo_accepts_the_four_loop_repos() {
+        for repo in [
+            "senara-solutions/mika",
+            "senara-solutions/mika-cloud",
+            "senara-solutions/mika-skills",
+            "senara-solutions/mika-platform",
+        ] {
+            assert!(
+                is_dispatchable_repo(repo),
+                "{repo} is a loop repository and must stay dispatchable"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_dispatchable_repo_accepts_the_bare_short_form() {
+        // The gateway emits short references for some event shapes; they resolve
+        // under the default owner rather than being refused.
+        for repo in ["mika", "mika-cloud", "mika-skills", "mika-platform"] {
+            assert!(
+                is_dispatchable_repo(repo),
+                "bare {repo} must resolve under the default owner and stay dispatchable"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_dispatchable_repo_refuses_spawn_cc_only_repos() {
+        // 2026-08-29 operator decision: control-monitor and claude-pilot are
+        // spawn-CC-only. Both are git repositories in the workspace, which is why
+        // presence cannot be the predicate.
+        for repo in [
+            "control-monitor",
+            "claude-pilot",
+            "senara-solutions/control-monitor",
+            "senara-solutions/claude-pilot",
+        ] {
+            assert!(
+                !is_dispatchable_repo(repo),
+                "{repo} is spawn-CC-only and must never be dispatchable"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_dispatchable_repo_refuses_a_foreign_owner_with_a_familiar_basename() {
+        // Matching on the basename alone would accept these: their basenames are
+        // exactly the allowlisted names.
+        assert!(!is_dispatchable_repo("another-org/mika"));
+        assert!(!is_dispatchable_repo("attacker/mika-cloud"));
+        assert!(!is_dispatchable_repo("senara-solutions-evil/mika"));
+    }
+
+    #[test]
+    fn test_is_dispatchable_repo_refuses_empty_and_unknown() {
+        assert!(!is_dispatchable_repo(""));
+        assert!(!is_dispatchable_repo("wizzard"));
+        assert!(!is_dispatchable_repo("senara-solutions/wizzard"));
+    }
+
+    #[test]
+    fn test_normalize_owner_repo_applies_the_default_owner_once() {
+        assert_eq!(normalize_owner_repo("mika"), "senara-solutions/mika");
+        assert_eq!(
+            normalize_owner_repo("senara-solutions/mika"),
+            "senara-solutions/mika"
+        );
+        assert_eq!(normalize_owner_repo("another-org/mika"), "another-org/mika");
+    }
+
+    #[test]
+    fn test_parse_repo_ref_from_dispatch_prompt_reads_both_forms() {
+        assert_eq!(
+            parse_repo_ref_from_dispatch_prompt("mika#2046"),
+            Some("mika")
+        );
+        assert_eq!(
+            parse_repo_ref_from_dispatch_prompt("senara-solutions/mika#2046"),
+            Some("senara-solutions/mika")
+        );
+        assert_eq!(
+            parse_repo_ref_from_dispatch_prompt("control-monitor#159"),
+            Some("control-monitor")
+        );
+    }
+
+    #[test]
+    fn test_parse_repo_ref_from_dispatch_prompt_ignores_free_text() {
+        // Free text resolves no repository, so the allowlist must not judge it.
+        for prompt in [
+            "fix the ready-label handler",
+            "implement mika#2046 with care",
+            "see #2046",
+            "mika#",
+            "mika#abc",
+            "#2046",
+            "",
+            "a/b/c#1",
+        ] {
+            assert_eq!(
+                parse_repo_ref_from_dispatch_prompt(prompt),
+                None,
+                "{prompt:?} is not an anchored repo#number reference"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dispatchable_repos_display_names_every_allowed_repo() {
+        let shown = dispatchable_repos_display();
+        for repo in DISPATCHABLE_REPOS {
+            assert!(
+                shown.contains(repo),
+                "a refusal must be able to quote {repo}; display was {shown}"
+            );
+        }
     }
 }

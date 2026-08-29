@@ -1056,6 +1056,40 @@ pub(crate) async fn validate_dispatch_readiness(
         return Err(rejection.to_string());
     }
 
+    // mika#2046 — Tool-boundary gate for the dispatchable-repository allowlist.
+    // Pure string handling, no DB access, so it sits with the other cheap checks
+    // ahead of the task fetch.
+    //
+    // This is the load-bearing layer. `run_claude_pilot` spawns a subprocess and
+    // creates a worktree, so a guard that only fires after the tool has run
+    // detects the violation without preventing it
+    // (docs/solutions/architecture-patterns/post-hoc-vs-tool-boundary-guard-placement-2026-05-13.md).
+    // The pre-LLM ready-label handler refuses the webhook path; this refuses
+    // every path, whatever originated the turn.
+    if let Some(prompt) = tool_input
+        .and_then(|input| input.get("prompt"))
+        .and_then(|v| v.as_str())
+        && let Some(repo_ref) = crate::webhook_dispatch::parse_repo_ref_from_dispatch_prompt(prompt)
+        && !crate::webhook_dispatch::is_dispatchable_repo(repo_ref)
+    {
+        let owner_repo = crate::webhook_dispatch::normalize_owner_repo(repo_ref);
+        let allowed = crate::webhook_dispatch::dispatchable_repos_display();
+        let rejection = serde_json::json!({
+            "error": "repo_not_dispatchable",
+            "task_id": task_id,
+            "repo": owner_repo,
+            "reason": format!(
+                "`{owner_repo}` is not a repository the autonomous loop may dispatch \
+                 into. Dispatchable repositories: {allowed}. Repositories outside \
+                 this list are Claude Code spawn territory and are never reached by \
+                 the loop; this is a structural gate, not a transient failure, so \
+                 retrying the dispatch will not clear it (mika#2046)."
+            )
+        });
+        record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+        return Err(rejection.to_string());
+    }
+
     // Re-fetch the task to get the full struct (validate_task confirmed existence)
     let task = match db.get_task(task_id).await {
         Ok(Some(t)) => t,
