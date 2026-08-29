@@ -3643,6 +3643,168 @@ REASON_PAIRING=$(_reason_pairing_check 2>/dev/null)
 assert_eq "every return 1 in the loop has a reason setter within two lines" \
     "0/${REASON_PAIRING#*/}" "$REASON_PAIRING"
 
+# --- Test: the egress launch guard must constate, not affirm (mika#2041) ---
+#
+# Founding incident (2026-08-29 06:07-06:11 CEST): the host egress proxy was
+# killed. A kill does not unlink a unix socket, so the path survived as an
+# orphan. dispatch-lib respawned a proxy on every dispatch, every proxy died,
+# and dispatch-lib reported success each time -- the pilot went out with no
+# egress and no `fs-only` line to say so.
+#
+# The wait guard asked `[ -S "$sock" ]` -- "is there a file of type socket" --
+# where the question is "is anyone listening". An orphan satisfies the first
+# and fails the second, so the loop exited on its first iteration and the
+# fs-only fallback became unreachable in exactly the scenario that needs it.
+#
+# ANTI-VACUITY (plan KTD6): the `ghost` assertions below FAIL against the
+# pre-fix guard -- measured rc=0 / launched-ok where the fix gives rc=1 /
+# fs-only. A structural grep would have passed over dead code; this exercises
+# the real `_ensure_pilot_egress_proxy`.
+
+echo ""
+echo "Test: egress launch guard tests connectability, not file existence (mika#2041)"
+echo "------------------------------------------------------------"
+
+# The operational proxy log is the diagnostic surface this whole ticket rests
+# on. A suite that appends fake-proxy output into it destroys the evidence it
+# exists to make legible, so the probe redirects the log and we assert the real
+# file never grew (plan R8).
+#
+# Assert on the fixture's own line, not on the file's size: on a host where the
+# proxy is alive and serving, the log grows from real traffic while the suite
+# runs, so a size comparison would fail for reasons that have nothing to do
+# with this test. The fixture string can only appear there if the override broke.
+_REAL_EGRESS_LOG="/var/log/mika/pilot-egress-proxy.log"
+_egress_log_fixture_hits() {
+    [ -f "$_REAL_EGRESS_LOG" ] || { echo 0; return 0; }
+    # `grep -c` already prints 0 on no-match and exits 1; `|| true` swallows the
+    # status without printing a second count.
+    grep -c "mika#2041 test fixture" "$_REAL_EGRESS_LOG" 2>/dev/null || true
+}
+
+# _egress_guard_probe <sock_state> <bin_state> [sock_basename]
+#   sock_state: ghost  -- bind then close without unlink (the orphan shape)
+#               live   -- a real listener held open
+#               absent -- nothing at the path
+#   bin_state:  dies   -- an executable proxy that exits before binding
+#               missing-- no proxy binary at all
+# Echoes "rc=<n> launched=<yes|no> msg=<fs-only|phase2b|launched-ok|none>".
+_egress_guard_probe() {
+    local sock_state="$1" bin_state="$2" sock_name="${3:-mika-pilot-egress.sock}"
+    local tmp sock bin logdir marker out rc listener_pid launched msg i
+    tmp=$(mktemp -d)
+    sock="$tmp/$sock_name"
+    bin="$tmp/fake-proxy"
+    logdir="$tmp/logs"
+    marker="$tmp/launched"
+    mkdir -p "$logdir"
+
+    # A proxy that records its own launch and then dies WITHOUT binding --
+    # the incident shape. Why it died is still unknown (mika#2041 comment);
+    # the guard must notice either way.
+    cat > "$bin" <<'FAKE_PROXY'
+#!/bin/bash
+touch "$MIKA_TEST_LAUNCH_MARKER"
+# Noisy on purpose: a proxy dying before bind() prints a traceback, and that
+# output goes wherever the launcher points its log. If the log override ever
+# regresses, this line lands in the operational log and the size assertion at
+# the end of the block catches it. A silent fake would make that check vacuous.
+echo "fake-proxy: dying before bind (mika#2041 test fixture)" >&2
+exit 1
+FAKE_PROXY
+    chmod +x "$bin"
+    [ "$bin_state" = "missing" ] && rm -f "$bin"
+
+    listener_pid=""
+    case "$sock_state" in
+        ghost)
+            python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[1])
+s.close()
+' "$sock"
+            ;;
+        live)
+            python3 -c '
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[1])
+s.listen(1)
+time.sleep(30)
+' "$sock" &
+            listener_pid=$!
+            i=0
+            while [ $i -lt 50 ] && [ ! -S "$sock" ]; do sleep 0.1; i=$((i + 1)); done
+            ;;
+    esac
+
+    out=$(
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB"
+        _PILOT_EGRESS_SOCK="$sock"
+        _PILOT_EGRESS_PROXY_BIN="$bin"
+        MIKA_PILOT_EGRESS_LOG_DIR="$logdir"
+        export MIKA_TEST_LAUNCH_MARKER="$marker"
+        _ensure_pilot_egress_proxy 2>&1 >/dev/null
+    ) && rc=0 || rc=$?
+
+    [ -n "$listener_pid" ] && kill "$listener_pid" 2>/dev/null
+    [ -n "$listener_pid" ] && wait "$listener_pid" 2>/dev/null
+
+    # The launch is a detached `nohup ... &`, so the marker can land after the
+    # guard returns. Without this bounded wait the assertion races the fork and
+    # reports launched=no for a proxy that did start.
+    launched=no
+    i=0
+    while [ $i -lt 20 ] && [ ! -f "$marker" ]; do sleep 0.05; i=$((i + 1)); done
+    [ -f "$marker" ] && launched=yes
+    # Order matters: the missing-binary line ends in "(falling back to fs-only)",
+    # so matching fs-only first would swallow it and make the two fallbacks
+    # indistinguishable -- the exact confusion the last assertion guards against.
+    case "$out" in
+        *"Phase 2b network cut disabled"*) msg=phase2b ;;
+        *"falling back to fs-only"*) msg=fs-only ;;
+        *"pilot-egress-proxy launched"*) msg=launched-ok ;;
+        *) msg=none ;;
+    esac
+    rm -rf "$tmp"
+    printf 'rc=%s launched=%s msg=%s' "$rc" "$launched" "$msg"
+}
+
+# THE regression. Pre-fix this is "rc=0 launched=yes msg=launched-ok": the
+# orphan file satisfies [ -S ], the guard affirms a launch that never happened.
+assert_eq "orphan socket + proxy that dies before binding => fs-only fallback fires" \
+    "rc=1 launched=yes msg=fs-only" \
+    "$(_egress_guard_probe ghost dies)"
+
+# The liveness probe must still recognise a real listener after the probe was
+# factored out -- and must not relaunch behind its back.
+assert_eq "live listener => already-alive, proxy not relaunched" \
+    "rc=0 launched=no msg=none" \
+    "$(_egress_guard_probe live dies)"
+
+# No file at the path: this already worked pre-fix. Locks it against regression.
+assert_eq "no socket at path + proxy that dies => fs-only fallback fires" \
+    "rc=1 launched=yes msg=fs-only" \
+    "$(_egress_guard_probe absent dies)"
+
+# The two fallbacks must stay distinguishable: a missing binary is a deploy
+# state, an unreachable socket is a runtime failure. Same rc, different line.
+assert_eq "missing proxy binary => Phase 2b disabled, not fs-only" \
+    "rc=1 launched=no msg=phase2b" \
+    "$(_egress_guard_probe ghost missing)"
+
+# The probe passes the path as argv, never interpolated into python source
+# (plan KTD2). A quote in the path used to be a syntax error waiting to happen.
+assert_eq "socket path containing a single quote does not break the probe" \
+    "rc=1 launched=yes msg=fs-only" \
+    "$(_egress_guard_probe ghost dies "mika'\''egress.sock")"
+
+# R8: no fake-proxy output may reach the operational proxy log.
+assert_eq "fake-proxy output never reaches the operational proxy log" \
+    "0" "$(_egress_log_fixture_hits)"
+
 # --- Summary ---
 
 echo ""
