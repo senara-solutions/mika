@@ -26,6 +26,7 @@ pub mod planning;
 pub mod post_condition;
 pub mod pricing;
 pub mod prompt;
+pub mod research;
 pub mod rewind;
 pub mod secret_scrubber;
 pub mod server;
