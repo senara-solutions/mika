@@ -1389,9 +1389,17 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         )
         .await
         {
+            // mika#2013: the loop now re-resolves the GitHub token before every
+            // cycle via this resolver, instead of reusing the value frozen at
+            // spawn. Without it an App installation token (~1h TTL) left the
+            // manager cycling 401 until the process restarted.
             Ok(Some(cfg)) => crate::milestone_manager::spawn_manager_cycle_task(
                 cfg,
                 manager_shutdown_token.child_token(),
+                std::sync::Arc::new(crate::milestone_manager::SettingsTokenResolver::new(
+                    settings.clone(),
+                    global_github_app.clone(),
+                )),
             ),
             Ok(None) => {
                 info!(
