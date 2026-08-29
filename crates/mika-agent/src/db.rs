@@ -7085,6 +7085,216 @@ impl Database {
         Ok(rows)
     }
 
+    /// True when `parent_task_id` still has a `pending` deferred-dispatch
+    /// wrapper representing it in the queue (mika#2045).
+    ///
+    /// This is the task-scoped answer to the question `mika tasks
+    /// promote-deferred` answers per dispatch class. The class-scoped answer
+    /// cannot distinguish "this task is queued" from "some other task is
+    /// queued"; `register_deferred_callback` sets `parent_task_id` on the
+    /// wrapper, so the task-scoped predicate is exact.
+    pub fn has_pending_deferred_wrapper_child(
+        &self,
+        agent_id: &str,
+        parent_task_id: &str,
+    ) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks
+             WHERE agent_id = ?1
+               AND parent_task_id = ?2
+               AND trigger_type = 'callback'
+               AND status = 'pending'
+               AND label = ?3",
+            params![
+                agent_id,
+                parent_task_id,
+                crate::agent::DEFERRED_DISPATCH_LABEL
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Find `pending` self_dev issue parents older than `grace_seconds` that no
+    /// callback child represents any more (mika#2045).
+    ///
+    /// Two `NOT EXISTS` clauses, and both are load-bearing:
+    /// 1. no `pending` deferred wrapper — the task is not queued behind a busy
+    ///    dispatch slot;
+    /// 2. no active non-deferred callback — the task's real dispatch is not in
+    ///    flight.
+    ///
+    /// Dropping (2) would classify a parent whose pilot is actually running as
+    /// orphaned during the window before the parent reaches `in_progress`.
+    ///
+    /// Age is measured on `created_at`, not `updated_at`: a re-armed parent
+    /// regains a `pending` wrapper, so clause (1) already protects it and the
+    /// grace window has no reason to restart.
+    ///
+    /// `rearm_count` reads `metadata.stuck_rearm_count` through a `json_valid`
+    /// guard so unreadable metadata yields 0 instead of raising.
+    pub fn find_orphaned_pending_issue_tasks(
+        &self,
+        agent_id: &str,
+        grace_seconds: i64,
+    ) -> Result<Vec<OrphanedPendingTask>> {
+        let grace_modifier = format!("-{grace_seconds} seconds");
+        let mut stmt = self.conn.prepare(
+            "SELECT parent.id,
+                    parent.reference_url,
+                    parent.created_at,
+                    CAST(strftime('%s', 'now') - strftime('%s', parent.created_at) AS INTEGER),
+                    COALESCE(
+                      CASE WHEN json_valid(parent.metadata)
+                           THEN CAST(json_extract(parent.metadata, '$.stuck_rearm_count') AS INTEGER)
+                      END, 0),
+                    COALESCE(parent.dispatch_class, 'implement')
+             FROM tasks parent
+             WHERE parent.agent_id = ?1
+               AND parent.status = 'pending'
+               AND parent.source = 'self_dev'
+               AND parent.trigger_type = 'manual'
+               AND parent.type = 'issue'
+               AND parent.reference_url IS NOT NULL
+               AND parent.created_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+               AND NOT EXISTS (
+                 SELECT 1 FROM tasks w
+                 WHERE w.parent_task_id = parent.id
+                   AND w.trigger_type = 'callback'
+                   AND w.status = 'pending'
+                   AND w.label = ?3
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM tasks c
+                 WHERE c.parent_task_id = parent.id
+                   AND c.trigger_type = 'callback'
+                   AND c.status IN ('pending', 'in_progress')
+                   AND c.label != ?3
+               )
+             ORDER BY parent.id",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    agent_id,
+                    grace_modifier,
+                    crate::agent::DEFERRED_DISPATCH_LABEL
+                ],
+                |row| {
+                    Ok(OrphanedPendingTask {
+                        id: row.get(0)?,
+                        reference_url: row.get(1)?,
+                        created_at: row.get(2)?,
+                        age_seconds: row.get(3)?,
+                        rearm_count: row.get(4)?,
+                        dispatch_class: row.get(5)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Read `metadata.stuck_rearm_count` for a task, tolerating absent or
+    /// unreadable metadata as 0 (mika#2045).
+    ///
+    /// This counter records *repairs* only — the deferred wrappers this task
+    /// needed because an earlier one was consumed without dispatching. It is
+    /// deliberately not the count of all wrappers ever registered for the task:
+    /// the ordinary rejection path registers those, and conflating the two
+    /// would spend the repair budget on healthy queueing.
+    pub fn get_stuck_rearm_count(&self, task_id: &str) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COALESCE(
+                      CASE WHEN json_valid(metadata)
+                           THEN CAST(json_extract(metadata, '$.stuck_rearm_count') AS INTEGER)
+                      END, 0)
+             FROM tasks WHERE id = ?1",
+            params![task_id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Increment `metadata.stuck_rearm_count`, returning the new value
+    /// (mika#2045). Unreadable metadata is replaced by a fresh object rather
+    /// than raising, so a corrupt row still repairs and still terminates.
+    pub fn increment_stuck_rearm_count(&self, task_id: &str) -> Result<i64> {
+        self.conn.execute(
+            "UPDATE tasks SET
+                metadata = json_set(
+                  CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                  '$.stuck_rearm_count',
+                  COALESCE(
+                    CASE WHEN json_valid(metadata)
+                         THEN CAST(json_extract(metadata, '$.stuck_rearm_count') AS INTEGER)
+                    END, 0) + 1),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?1",
+            params![task_id],
+        )?;
+        self.get_stuck_rearm_count(task_id)
+    }
+
+    /// Cancel every deferred wrapper of a parent that is not already terminal
+    /// (mika#2045). Called immediately before expiring the parent: a wrapper
+    /// that survives the expiry can still be promoted, and would then replay a
+    /// dispatch against a dead parent while the `ready` sweep has already
+    /// created a live replacement for the same issue — a double dispatch.
+    /// Returns the number of wrappers cancelled.
+    pub fn cancel_deferred_wrappers_of_parent(
+        &self,
+        agent_id: &str,
+        parent_task_id: &str,
+    ) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE tasks
+             SET status = 'cancelled',
+                 result = 'parent expired by the stuck-pending reaper (mika#2045)',
+                 completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE agent_id = ?1
+               AND parent_task_id = ?2
+               AND label = ?3
+               AND status NOT IN ('completed', 'cancelled', 'failed', 'delivered')",
+            params![
+                agent_id,
+                parent_task_id,
+                crate::agent::DEFERRED_DISPATCH_LABEL
+            ],
+        )?;
+        Ok(n)
+    }
+
+    /// The `action_config` of a parent's most recent deferred wrapper, whatever
+    /// its status (mika#2045). The reaper replays this so a repaired dispatch is
+    /// byte-identical to the one that was refused. `None` when the parent never
+    /// had a wrapper — the reaper then rebuilds the call from the parent's own
+    /// columns.
+    pub fn latest_deferred_wrapper_action_config(
+        &self,
+        agent_id: &str,
+        parent_task_id: &str,
+    ) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT action_config FROM tasks
+                 WHERE agent_id = ?1
+                   AND parent_task_id = ?2
+                   AND label = ?3
+                 ORDER BY created_at DESC
+                 LIMIT 1",
+                params![
+                    agent_id,
+                    parent_task_id,
+                    crate::agent::DEFERRED_DISPATCH_LABEL
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// Return ALL children of a parent task for the reaper's structured log event
     /// (`task_engine_reaper.evaluated`). Captures a point-in-time snapshot at kill
     /// time so post-incident diagnosis can see what the reaper saw (mika#1126).
@@ -14289,6 +14499,247 @@ mod tests {
         assert_eq!(a_phantoms.len(), 1);
         let b_phantoms = db.find_phantom_tracking_tasks("agent_b", 3600).unwrap();
         assert!(b_phantoms.is_empty());
+    }
+
+    // -- find_orphaned_pending_issue_tasks tests (mika#2045) --
+
+    /// Create a `pending` self_dev **issue** parent with a `reference_url`,
+    /// backdated `age_secs` into the past. This is the shape `ready_label_handler`
+    /// pre-creates before it asks `validate_dispatch_readiness` for the slot.
+    fn create_pending_issue_parent(db: &Database, issue: u32, age_secs: i64) -> String {
+        let mut parent = new_task(
+            "mika",
+            &format!("ready-label: x/y#{issue}"),
+            "manual",
+            "none",
+        );
+        parent.source = Some("self_dev".to_string());
+        parent.reference_url = Some(format!("https://github.com/x/y/issues/{issue}"));
+        parent.dispatch_class = Some("implement".to_string());
+        let parent_id = db.create_task(&parent).unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+                 WHERE id = ?1",
+                params![parent_id, format!("-{age_secs} seconds")],
+            )
+            .unwrap();
+        parent_id
+    }
+
+    /// Attach a deferred-dispatch wrapper child in the given status.
+    fn attach_deferred_wrapper(db: &Database, parent_id: &str, status: &str) -> String {
+        let mut child = callback_task("mika");
+        child.parent_task_id = Some(parent_id.to_string());
+        child.label = crate::agent::DEFERRED_DISPATCH_LABEL.to_string();
+        child.dispatch_class = Some("implement".to_string());
+        let id = db.create_task(&child).unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = ?2 WHERE id = ?1",
+                params![id, status],
+            )
+            .unwrap();
+        id
+    }
+
+    /// Attach a real (non-deferred) callback child in the given status.
+    fn attach_real_callback(db: &Database, parent_id: &str, status: &str) -> String {
+        let mut child = callback_task("mika");
+        child.parent_task_id = Some(parent_id.to_string());
+        child.label = "long_running:run_claude_pilot".to_string();
+        child.dispatch_class = Some("implement".to_string());
+        let id = db.create_task(&child).unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = ?2 WHERE id = ?1",
+                params![id, status],
+            )
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn test_find_orphaned_pending_selects_qualifying() {
+        let db = db();
+        let parent_id = create_pending_issue_parent(&db, 2013, 3600);
+
+        let orphans = db.find_orphaned_pending_issue_tasks("mika", 2700).unwrap();
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].id, parent_id);
+        assert_eq!(
+            orphans[0].reference_url,
+            "https://github.com/x/y/issues/2013"
+        );
+        assert!(orphans[0].age_seconds >= 3600);
+        assert_eq!(orphans[0].rearm_count, 0);
+    }
+
+    /// R2 anti-vacuity: a task waiting behind a busy dispatch slot is old AND
+    /// healthy. Age alone would kill it. This test fails if the wrapper clause
+    /// is dropped from the predicate.
+    #[test]
+    fn test_find_orphaned_pending_excludes_task_with_pending_wrapper() {
+        let db = db();
+        let parent_id = create_pending_issue_parent(&db, 2013, 3600);
+        attach_deferred_wrapper(&db, &parent_id, "pending");
+
+        let orphans = db.find_orphaned_pending_issue_tasks("mika", 2700).unwrap();
+        assert!(
+            orphans.is_empty(),
+            "a task with a pending deferred wrapper is queued, not orphaned"
+        );
+    }
+
+    /// The wrapper was promoted (`completed`) and its turn never dispatched —
+    /// exactly the mika#2045 shape.
+    #[test]
+    fn test_find_orphaned_pending_selects_when_wrapper_was_consumed() {
+        let db = db();
+        let parent_id = create_pending_issue_parent(&db, 2013, 3600);
+        attach_deferred_wrapper(&db, &parent_id, "completed");
+
+        let orphans = db.find_orphaned_pending_issue_tasks("mika", 2700).unwrap();
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].id, parent_id);
+    }
+
+    /// Second anti-vacuity clause: the real dispatch is in flight. Without the
+    /// non-deferred `NOT EXISTS`, this parent is classified orphaned during the
+    /// window before it reaches `in_progress`.
+    #[test]
+    fn test_find_orphaned_pending_excludes_task_with_active_real_callback() {
+        let db = db();
+        let parent_id = create_pending_issue_parent(&db, 2013, 3600);
+        attach_real_callback(&db, &parent_id, "in_progress");
+
+        let orphans = db.find_orphaned_pending_issue_tasks("mika", 2700).unwrap();
+        assert!(
+            orphans.is_empty(),
+            "a task whose real dispatch is in flight is not orphaned"
+        );
+    }
+
+    #[test]
+    fn test_find_orphaned_pending_excludes_younger_than_grace() {
+        let db = db();
+        create_pending_issue_parent(&db, 2013, 600);
+
+        let orphans = db.find_orphaned_pending_issue_tasks("mika", 2700).unwrap();
+        assert!(orphans.is_empty(), "10 minutes is inside the normal window");
+    }
+
+    #[test]
+    fn test_find_orphaned_pending_excludes_non_pending_status() {
+        let db = db();
+        let parent_id = create_pending_issue_parent(&db, 2013, 3600);
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'in_progress' WHERE id = ?1",
+                params![parent_id],
+            )
+            .unwrap();
+
+        let orphans = db.find_orphaned_pending_issue_tasks("mika", 2700).unwrap();
+        assert!(
+            orphans.is_empty(),
+            "in_progress parents belong to the #871/#1687 reapers"
+        );
+    }
+
+    #[test]
+    fn test_find_orphaned_pending_excludes_other_agents() {
+        let db = db();
+        db.register_agent("agent_b", "Agent B", "/tmp/b").unwrap();
+        create_pending_issue_parent(&db, 2013, 3600);
+
+        assert!(
+            db.find_orphaned_pending_issue_tasks("agent_b", 2700)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.find_orphaned_pending_issue_tasks("mika", 2700)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_find_orphaned_pending_reads_rearm_count_from_metadata() {
+        let db = db();
+        let parent_id = create_pending_issue_parent(&db, 2013, 3600);
+        db.set_task_metadata_field(&parent_id, "stuck_rearm_count", "2")
+            .unwrap();
+
+        let orphans = db.find_orphaned_pending_issue_tasks("mika", 2700).unwrap();
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].rearm_count, 2);
+    }
+
+    /// Tolerant read: unreadable metadata must not raise, it reads as 0.
+    #[test]
+    fn test_find_orphaned_pending_tolerates_malformed_metadata() {
+        let db = db();
+        let parent_id = create_pending_issue_parent(&db, 2013, 3600);
+        db.conn
+            .execute(
+                "UPDATE tasks SET metadata = 'not json at all' WHERE id = ?1",
+                params![parent_id],
+            )
+            .unwrap();
+
+        let orphans = db.find_orphaned_pending_issue_tasks("mika", 2700).unwrap();
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].rearm_count, 0);
+    }
+
+    /// Backs the `loop_stuck_pending_tasks` event and the probe: several stuck
+    /// issues are reported together, each with its own url and age.
+    #[test]
+    fn test_find_orphaned_pending_reports_every_stuck_issue() {
+        let db = db();
+        create_pending_issue_parent(&db, 2013, 3600);
+        create_pending_issue_parent(&db, 1887, 4200);
+        // A healthy neighbour must not inflate the count.
+        let queued = create_pending_issue_parent(&db, 1664, 3600);
+        attach_deferred_wrapper(&db, &queued, "pending");
+
+        let orphans = db.find_orphaned_pending_issue_tasks("mika", 2700).unwrap();
+        assert_eq!(orphans.len(), 2);
+        let urls: Vec<&str> = orphans.iter().map(|o| o.reference_url.as_str()).collect();
+        assert!(urls.contains(&"https://github.com/x/y/issues/2013"));
+        assert!(urls.contains(&"https://github.com/x/y/issues/1887"));
+        assert!(!urls.contains(&"https://github.com/x/y/issues/1664"));
+    }
+
+    #[test]
+    fn test_has_pending_deferred_wrapper_child() {
+        let db = db();
+        let parent_id = create_pending_issue_parent(&db, 2013, 100);
+        assert!(
+            !db.has_pending_deferred_wrapper_child("mika", &parent_id)
+                .unwrap()
+        );
+
+        let wrapper_id = attach_deferred_wrapper(&db, &parent_id, "pending");
+        assert!(
+            db.has_pending_deferred_wrapper_child("mika", &parent_id)
+                .unwrap()
+        );
+
+        // Promotion consumes the wrapper — the parent stops being represented.
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'completed' WHERE id = ?1",
+                params![wrapper_id],
+            )
+            .unwrap();
+        assert!(
+            !db.has_pending_deferred_wrapper_child("mika", &parent_id)
+                .unwrap()
+        );
     }
 
     // -- find_childless_stuck_parent_tasks tests (mika#1687) --

@@ -992,6 +992,62 @@ impl AsyncDatabase {
             .await
     }
 
+    /// True when the parent still has a `pending` deferred wrapper representing
+    /// it (mika#2045). See [`Database::has_pending_deferred_wrapper_child`].
+    pub async fn has_pending_deferred_wrapper_child(&self, parent_task_id: &str) -> Result<bool> {
+        let a = self.agent_id.clone();
+        let p = parent_task_id.to_owned();
+        self.with_db(move |db| db.has_pending_deferred_wrapper_child(&a, &p))
+            .await
+    }
+
+    /// Find `pending` self_dev issue parents that no callback child represents
+    /// any more (mika#2045). See [`Database::find_orphaned_pending_issue_tasks`].
+    pub async fn find_orphaned_pending_issue_tasks(
+        &self,
+        grace_seconds: i64,
+    ) -> Result<Vec<crate::db::OrphanedPendingTask>> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.find_orphaned_pending_issue_tasks(&a, grace_seconds))
+            .await
+    }
+
+    /// Read `metadata.stuck_rearm_count` (mika#2045).
+    /// See [`Database::get_stuck_rearm_count`].
+    pub async fn get_stuck_rearm_count(&self, task_id: &str) -> Result<i64> {
+        let t = task_id.to_owned();
+        self.with_db(move |db| db.get_stuck_rearm_count(&t)).await
+    }
+
+    /// Increment `metadata.stuck_rearm_count` (mika#2045).
+    /// See [`Database::increment_stuck_rearm_count`].
+    pub async fn increment_stuck_rearm_count(&self, task_id: &str) -> Result<i64> {
+        let t = task_id.to_owned();
+        self.with_db(move |db| db.increment_stuck_rearm_count(&t))
+            .await
+    }
+
+    /// Cancel a parent's surviving deferred wrappers before expiry (mika#2045).
+    /// See [`Database::cancel_deferred_wrappers_of_parent`].
+    pub async fn cancel_deferred_wrappers_of_parent(&self, parent_task_id: &str) -> Result<usize> {
+        let a = self.agent_id.clone();
+        let p = parent_task_id.to_owned();
+        self.with_db(move |db| db.cancel_deferred_wrappers_of_parent(&a, &p))
+            .await
+    }
+
+    /// The `action_config` of a parent's most recent deferred wrapper
+    /// (mika#2045). See [`Database::latest_deferred_wrapper_action_config`].
+    pub async fn latest_deferred_wrapper_action_config(
+        &self,
+        parent_task_id: &str,
+    ) -> Result<Option<String>> {
+        let a = self.agent_id.clone();
+        let p = parent_task_id.to_owned();
+        self.with_db(move |db| db.latest_deferred_wrapper_action_config(&a, &p))
+            .await
+    }
+
     /// Return ALL children of a parent task for the reaper's structured log
     /// event. See [`Database::get_reaper_child_snapshot`].
     pub async fn get_reaper_child_snapshot(

@@ -797,6 +797,16 @@ pub enum TaskCommand {
         #[arg(long = "override")]
         r#override: bool,
     },
+    /// List `ready` issues whose task is stuck: `pending` past the reaper's
+    /// grace window with nothing in the dispatch queue representing it.
+    ///
+    /// This is the silence-breaker for mika#2045 — such an issue carries
+    /// `ready`, the queue counts it, and nothing ever picks it up. Exit code is
+    /// always 0: this is a probe, not a gate.
+    Stuck {
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
     /// Subscribe to mika-spirit's task-lifecycle SSE stream and print each
     /// TaskEventFrame as it arrives (one JSON object per line).
     ///

@@ -193,10 +193,21 @@ pub async fn try_handle_ready_label_dispatch(
     let task_id = match db.create_task(new_task).await {
         Ok(id) => id,
         Err(e) => {
+            // mika#2045 — name the victim. The overwhelming cause here is a
+            // collision on `idx_tasks_manual_active_ref_url`: an existing active
+            // task already holds this issue's slot. Logging the raw SQL error
+            // said so 1966 times without ever naming which issue was refused or
+            // how old the task refusing it was, so the log could not be turned
+            // into a list of blocked issues.
+            let blocker = describe_blocking_task(db, &issue_url).await;
             warn!(
                 event = "ready_label_task_create_failed",
                 repo = %location.owner_repo(),
                 num = location.number,
+                issue_url = %issue_url,
+                blocking_task_id = blocker.as_ref().map(|b| b.id.as_str()),
+                blocking_task_status = blocker.as_ref().map(|b| b.status.as_str()),
+                blocking_task_age_secs = blocker.as_ref().map(|b| b.age_secs),
                 error = %e,
                 "ready_label_handler: failed to pre-create task — passthrough"
             );
@@ -585,9 +596,149 @@ fn format_engine_dispatch_pre_digest(
     )
 }
 
+/// The active task holding an issue's slot in `idx_tasks_manual_active_ref_url`
+/// (mika#2045), reduced to the three fields the failure log needs.
+struct BlockingTask {
+    id: String,
+    status: String,
+    age_secs: i64,
+}
+
+/// Identify the task refusing a `ready-label` task creation, for the failure log.
+///
+/// Reuses [`AsyncDatabase::find_active_task_by_ref_url`] — the same lookup
+/// `create_task` uses for dedup, so the answer is the actual blocker rather than
+/// a guess. Returns `None` when there is no blocker or the lookup itself fails:
+/// the diagnostic must not depend on a second query succeeding, so the enriched
+/// event is emitted either way, with the blocker fields simply absent.
+async fn describe_blocking_task(db: &AsyncDatabase, issue_url: &str) -> Option<BlockingTask> {
+    let task = match db.find_active_task_by_ref_url(issue_url).await {
+        Ok(t) => t?,
+        Err(e) => {
+            warn!(issue_url, error = %e, "failed to look up the blocking task for the failure log");
+            return None;
+        }
+    };
+    Some(BlockingTask {
+        age_secs: task_age_secs(&task.created_at),
+        id: task.id,
+        status: task.status,
+    })
+}
+
+/// Seconds since `created_at`, or 0 when the timestamp cannot be parsed.
+/// Conservative: an unparseable timestamp must not report a huge age and send an
+/// operator chasing a task that is actually fresh.
+fn task_age_secs(created_at: &str) -> i64 {
+    crate::timestamp::parse(created_at)
+        .map(|dt| (chrono::Utc::now() - dt).num_seconds())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- blocking-task identification for the failure log (mika#2045) --
+
+    fn stuck_parent(issue_url: &str) -> NewTask {
+        NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "ready-label: senara-solutions/mika#2013".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: Some(issue_url.to_string()),
+            source: Some("self_dev".to_string()),
+            metadata: None,
+            r#type: Some("issue".to_string()),
+            dispatch_class: Some("implement".to_string()),
+        }
+    }
+
+    /// The whole point of the enrichment: turn `UNIQUE constraint failed` into a
+    /// row an operator can act on.
+    #[tokio::test]
+    async fn names_the_task_holding_the_issue_slot() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new(db);
+        let issue_url = "https://github.com/senara-solutions/mika/issues/2013";
+
+        let blocker_id = async_db.create_task(stuck_parent(issue_url)).await.unwrap();
+        async_db
+            .with_db({
+                let id = blocker_id.clone();
+                move |d| {
+                    d.conn.execute(
+                        "UPDATE tasks SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-3600 seconds')
+                         WHERE id = ?1",
+                        rusqlite::params![id],
+                    )?;
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+
+        let blocker = describe_blocking_task(&async_db, issue_url)
+            .await
+            .expect("the colliding task must be named");
+
+        assert_eq!(blocker.id, blocker_id);
+        assert_eq!(blocker.status, "pending");
+        assert!(
+            blocker.age_secs >= 3600,
+            "the age is what tells the operator this is stuck, not merely busy"
+        );
+    }
+
+    /// A creation failure for any other reason still emits the enriched event —
+    /// the blocker fields are simply absent, and nothing panics.
+    #[tokio::test]
+    async fn reports_no_blocker_when_the_slot_is_free() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new(db);
+
+        assert!(
+            describe_blocking_task(
+                &async_db,
+                "https://github.com/senara-solutions/mika/issues/9999"
+            )
+            .await
+            .is_none()
+        );
+    }
+
+    /// A terminal task released the slot, so it is not the blocker.
+    #[tokio::test]
+    async fn ignores_a_terminal_task_on_the_same_issue() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new(db);
+        let issue_url = "https://github.com/senara-solutions/mika/issues/2013";
+
+        let id = async_db.create_task(stuck_parent(issue_url)).await.unwrap();
+        async_db.update_task_status(&id, "failed").await.unwrap();
+
+        assert!(describe_blocking_task(&async_db, issue_url).await.is_none());
+    }
+
+    #[test]
+    fn unparseable_created_at_reports_zero_age() {
+        assert_eq!(task_age_secs("not a timestamp"), 0);
+        assert!(task_age_secs("2020-01-01T00:00:00Z") > 0);
+    }
 
     #[test]
     fn parses_owner_repo_form() {

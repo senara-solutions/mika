@@ -139,6 +139,38 @@ pub struct ChildlessStuckParent {
     pub updated_at: String,
 }
 
+/// A `pending` self_dev issue parent that nothing in the dispatch queue
+/// represents any more (mika#2045).
+///
+/// The `ready-label` path pre-creates this parent, then registers a deferred
+/// wrapper child when the per-class dispatch slot is busy. Promotion consumes
+/// that wrapper destructively (`promote_next_deferred_callback` sets it
+/// `completed`), so a wrapper whose silent turn never dispatched leaves the
+/// parent `pending` with nothing representing it — and the partial unique index
+/// `idx_tasks_manual_active_ref_url` then forbids a replacement from being
+/// created for the same issue. The parent is *orphaned*.
+///
+/// Age alone does not identify this shape: a parent waiting behind a busy slot
+/// is also old and still has its wrapper. `find_orphaned_pending_issue_tasks`
+/// therefore requires BOTH the age and the absence of any callback child that
+/// still represents the task.
+#[derive(Debug, Clone)]
+pub struct OrphanedPendingTask {
+    pub id: String,
+    pub reference_url: String,
+    pub created_at: String,
+    pub age_seconds: i64,
+    /// Repairs already attempted for this parent, read from
+    /// `metadata.stuck_rearm_count`. Absent or unreadable metadata reads as 0.
+    pub rearm_count: i64,
+    /// The parent's own dispatch class, `implement` when NULL (matching
+    /// `has_active_callback_tasks_excluding`). A repair must re-enter the class
+    /// the task actually belongs to: re-arming an ungroomed issue as
+    /// `implement` would queue a `dev-pilot` run for work that still needs
+    /// `dev-groom`, and would occupy the wrong slot doing it.
+    pub dispatch_class: String,
+}
+
 /// Snapshot of a child task for the orphaned-parent reaper's structured log
 /// event (`task_engine_reaper.evaluated`). Captures all children of a candidate
 /// parent at kill time for post-incident diagnosis (mika#1126).
