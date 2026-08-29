@@ -126,10 +126,27 @@ _PILOT_HELPER_CA_SANDBOX_PATH="/tmp/mika-pilot-ca/ca.pem"
 _PILOT_SECRET_DIR_SANDBOX="/run/mika-pilot-secrets"
 
 # Sandbox entrypoint prologue: re-export each secret file as an env var named
-# after the file. POSIX sh only — /bin/sh is dash on the dispatch host, so no
-# arrays and no `[[`. Deriving the export name from the basename is what makes
+# after the file. Deriving the export name from the basename is what makes
 # adding a second secret a zero-change operation here.
-_PILOT_SECRET_PROLOGUE="for _s in $_PILOT_SECRET_DIR_SANDBOX/*; do [ -r \"\$_s\" ] || continue; export \"\$(basename \"\$_s\")=\$(cat \"\$_s\")\"; done; unset _s"
+#
+# POSIX sh only — no arrays, no `[[`. The constraint is portability, not a
+# claim about this host: the string is executed by whatever `/bin/sh` resolves
+# to inside the sandbox, which is bound from the host's /bin and can differ
+# between deploy targets.
+#
+# Values round-trip byte-exactly EXCEPT for trailing newlines, which `$(cat)`
+# strips. A GitHub PAT has none, so nothing is affected today — but a secret
+# whose trailing newline is load-bearing (a PEM key, some base64 blobs) cannot
+# use this channel unchanged, which qualifies the zero-change promise above.
+#
+# It names what it drops rather than continuing mutely. Under `--setenv` a
+# missing token was visible in the launch argv; moving it into an in-sandbox
+# loop would otherwise trade a launch-time failure for a silent one that only
+# surfaces minutes later at `git push`. The stderr this writes is persisted by
+# _dispatch_lib_exit_trap and folded into the callback, so the operator sees
+# it. Posture stays fail-forward: a tokenless pilot can still do useful work
+# up to the push, so this diagnoses rather than aborts.
+_PILOT_SECRET_PROLOGUE="for _s in $_PILOT_SECRET_DIR_SANDBOX/*; do [ -e \"\$_s\" ] || continue; _n=\$(basename \"\$_s\"); if [ ! -r \"\$_s\" ]; then echo \"dispatch-lib: sandbox secret \$_n is unreadable — the pilot starts without it\" >&2; continue; fi; _v=\$(cat \"\$_s\"); [ -n \"\$_v\" ] || echo \"dispatch-lib: sandbox secret \$_n is empty — the pilot starts without it\" >&2; export \"\$_n=\$_v\"; done; unset _s _n _v"
 
 # Idempotent helper daemon launcher for the anthropic api chain
 # (2026-08-05, Vincent-authorized). Chained from the front egress proxy
@@ -320,6 +337,12 @@ _run_pilot_sandboxed() {
         "$@"
         return $?
     fi
+    # Version floor (mika#2039): the secret channel uses `--perms` and
+    # `--ro-bind-data`, which need bubblewrap >= 0.5.0. This probe only detects
+    # bwrap's ABSENCE; an older bwrap is present, passes here, and then fails
+    # the launch loudly on an unknown option rather than degrading. That is the
+    # safe direction — fail closed, no leak — but it is a hard floor, not a
+    # fallback.
     if ! command -v bwrap >/dev/null 2>&1; then
         echo "dispatch-lib: MIKA_PILOT_SANDBOX enabled but bwrap not installed on PATH — falling back to direct invocation" >&2
         "$@"
@@ -423,7 +446,10 @@ _run_pilot_sandboxed() {
         )
         # sh -c wrapper that starts the shim, waits for it, execs the pilot,
         # cleans up on exit. `exec` in the final position ensures the pilot's
-        # exit status becomes the sh's.
+        # exit status becomes the sh's. $_PILOT_SECRET_PROLOGUE is prepended to
+        # that script (mika#2039) so the bwrap-materialised secret files are
+        # re-exported before anything else runs; dropping it leaves the pilot
+        # without GH_TOKEN on the path every real dispatch takes.
         sandbox_entrypoint_prefix="/bin/sh"
     fi
 
@@ -556,6 +582,14 @@ $quoted_argv
 " || _sandbox_rc=$?
     else
         # Phase 2a fallback: fs cut only, network unrestricted.
+        #
+        # The `/bin/sh -c` entrypoint at the end of this block exists solely to
+        # run $_PILOT_SECRET_PROLOGUE before the pilot (mika#2039). The
+        # original argv rides through as positional parameters, so no second
+        # `printf '%q'` quoting layer is introduced, and `exec` in final
+        # position keeps the pilot's argv, pid and exit status identical to the
+        # bare `-- "$@"` this replaced. Reverting it to `-- "$@"` looks like a
+        # simplification and silently removes GH_TOKEN from this sandbox.
         bwrap \
             --as-pid-1 \
             --unshare-user \

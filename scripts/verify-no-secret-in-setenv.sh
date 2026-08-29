@@ -86,19 +86,77 @@ fi
 
 VIOLATIONS=0
 
+# Code-only view of the file. Every rule below greps this, never $TARGET
+# directly: a future comment such as `never write --setenv GH_TOKEN` would
+# otherwise fail CI on prose, and prose is where this file explains itself.
+CODE_ONLY="$(mktemp "${TMPDIR:-/tmp}/verify-no-secret-in-setenv-code.XXXXXX")"
+trap 'rm -f "$CODE_ONLY"' EXIT
+sed -E 's/(^|[[:space:]])#.*$//' "$TARGET" > "$CODE_ONLY"
+
 # Extract a bash array literal's contents by name: everything between
 # `NAME=(` and the first closing `)` on its own line.
+#
+# This parser is deliberately narrow, and Rule 0b below makes that narrowness
+# safe: it rejects any array form this function cannot model, rather than
+# quietly returning a partial list. Deny-by-default only denies what the
+# parser can see — an append on the next line would otherwise be invisible.
 extract_array() {
     local name="$1"
     awk -v n="$name" '
         $0 ~ "^" n "=\\(" { inside = 1; next }
         inside && /^\)/    { inside = 0; exit }
         inside             { print }
-    ' "$TARGET" | tr -s ' \t' '\n' | grep -v '^$' || true
+    ' "$CODE_ONLY" | tr -s ' \t' '\n' | grep -v '^$' || true
 }
 
+# --- Rule 0b: the arrays must appear in exactly the one form we can parse --
+for _arr in _PILOT_SANDBOX_ENV_ALLOWLIST _PILOT_SANDBOX_SECRET_ALLOWLIST; do
+    _opens=$(grep -cE "^${_arr}=\\(" "$CODE_ONLY" || true)
+    _touches=$(grep -cE "^[[:space:]]*(declare[[:space:]]+-[a-zA-Z]+[[:space:]]+)?${_arr}\\+?=" "$CODE_ONLY" || true)
+    if [[ "$_opens" -ne 1 || "$_touches" -ne 1 ]]; then
+        echo "VIOLATION: $_arr is written in a form this lint cannot audit."
+        echo "  Found $_opens plain \`NAME=(\` opener(s) and $_touches total"
+        echo "  assignment(s). Exactly one of each is required."
+        echo "  An append (\`NAME+=(...)\`), a second assignment, a one-line"
+        echo "  literal, or a \`declare\` form would leave part of the list"
+        echo "  invisible to the audit — and an invisible entry is how a"
+        echo "  secret gets back into the world-readable argv (mika#2039)."
+        VIOLATIONS=$((VIOLATIONS + 1))
+    fi
+done
+
+# --- Rule 0c: every `--setenv` must name a literal we can audit ------------
+#
+# Rule 2's name check is a text scan, so `--setenv "$var"` and a backslash
+# line-continuation before the name are both invisible to it. Exactly one
+# dynamic producer is sanctioned — the audited allowlist loop — and it is
+# pinned by count. Anything else fails closed.
+_DYNAMIC_SANCTIONED='setenv_args+=(--setenv "$var" "${!var}")'
+_dynamic_count=$(grep -cF -- "$_DYNAMIC_SANCTIONED" "$CODE_ONLY" || true)
+if [[ "$_dynamic_count" -ne 1 ]]; then
+    echo "VIOLATION: expected exactly one sanctioned dynamic --setenv producer,"
+    echo "  found $_dynamic_count occurrence(s) of:"
+    echo "    $_DYNAMIC_SANCTIONED"
+    echo "  A second loop over a different array would emit --setenv names this"
+    echo "  lint cannot see. Route its secrets through"
+    echo "  _PILOT_SANDBOX_SECRET_ALLOWLIST instead (mika#2039)."
+    VIOLATIONS=$((VIOLATIONS + 1))
+fi
+
+while IFS= read -r _line; do
+    [[ -z "$_line" ]] && continue
+    if [[ "$_line" == *"$_DYNAMIC_SANCTIONED"* ]]; then
+        continue
+    fi
+    echo "VIOLATION: a --setenv whose name is not a bare literal cannot be audited:"
+    echo "    $_line"
+    echo "  Use a literal name, or route the value through"
+    echo "  _PILOT_SANDBOX_SECRET_ALLOWLIST (mika#2039)."
+    VIOLATIONS=$((VIOLATIONS + 1))
+done < <(grep -nE -- '--setenv([[:space:]]*\\$|[[:space:]]+["'"'"'$]|[[:space:]]*$)' "$CODE_ONLY" || true)
+
 # --- Rule 0: the secret allowlist must exist -------------------------------
-if ! grep -q '^_PILOT_SANDBOX_SECRET_ALLOWLIST=(' "$TARGET"; then
+if ! grep -q '^_PILOT_SANDBOX_SECRET_ALLOWLIST=(' "$CODE_ONLY"; then
     echo "VIOLATION: _PILOT_SANDBOX_SECRET_ALLOWLIST is missing from $TARGET"
     echo "  Secrets must be declared there and delivered through the"
     echo "  --ro-bind-data file channel, never through --setenv (mika#2039)."
@@ -130,7 +188,11 @@ fi
 # --- Rule 1b: a secret must not appear in both lists -----------------------
 while IFS= read -r secret; do
     [[ -z "$secret" ]] && continue
-    if printf '%s\n' "$ACTUAL_SORTED" | grep -qx "$secret"; then
+    # Herestring, not a pipe: `grep -q` exits at the first match and closes the
+    # pipe, `printf` takes SIGPIPE, and `pipefail` promotes 141 to the
+    # pipeline's status — reporting "absent" for a value that is present.
+    # See docs/solutions/test-failures/bash-assert-sigpipe-and-host-coupling-before-ci-gate-2026-08-29.md
+    if grep -qx -- "$secret" <<<"$ACTUAL_SORTED"; then
         echo "VIOLATION: '$secret' is in BOTH the --setenv allowlist and the"
         echo "  secret allowlist. The --setenv copy puts it back in the argv."
         VIOLATIONS=$((VIOLATIONS + 1))
@@ -141,11 +203,17 @@ done < <(extract_array _PILOT_SANDBOX_SECRET_ALLOWLIST)
 while IFS= read -r name; do
     [[ -z "$name" ]] && continue
     if [[ "$name" == "$EXEMPT_SETENV_NAME" ]]; then
-        if grep -qF -- "--setenv $EXEMPT_SETENV_NAME \"$EXEMPT_SETENV_VALUE\"" "$TARGET"; then
+        # Per-occurrence, not file-global: a whole-file `grep -q` for the
+        # placeholder would still pass if a SECOND `--setenv ANTHROPIC_API_KEY`
+        # carrying a real key were added alongside it. Every occurrence must
+        # carry the placeholder.
+        _total=$(grep -cE -- "--setenv[[:space:]]+$EXEMPT_SETENV_NAME" "$CODE_ONLY" || true)
+        _placeheld=$(grep -cF -- "--setenv $EXEMPT_SETENV_NAME \"$EXEMPT_SETENV_VALUE\"" "$CODE_ONLY" || true)
+        if [[ "$_total" -eq "$_placeheld" && "$_total" -ge 1 ]]; then
             continue
         fi
-        echo "VIOLATION: --setenv $EXEMPT_SETENV_NAME no longer carries the"
-        echo "  placeholder '$EXEMPT_SETENV_VALUE'."
+        echo "VIOLATION: $_total --setenv $EXEMPT_SETENV_NAME occurrence(s), only"
+        echo "  $_placeheld carrying the placeholder '$EXEMPT_SETENV_VALUE'."
         echo "  Its exemption held only because the real key is injected"
         echo "  host-side by the egress proxy. A real key here would be"
         echo "  readable in the sandbox argv by any local user (mika#2039)."
@@ -158,7 +226,7 @@ while IFS= read -r name; do
         echo "  --ro-bind-data file channel instead (mika#2039)."
         VIOLATIONS=$((VIOLATIONS + 1))
     fi
-done < <(grep -oE -- '--setenv [A-Za-z_][A-Za-z0-9_]*' "$TARGET" | awk '{print $2}' | sort -u)
+done < <(grep -oE -- '--setenv [A-Za-z_][A-Za-z0-9_]*' "$CODE_ONLY" | awk '{print $2}' | sort -u)
 
 if [[ "$VIOLATIONS" -gt 0 ]]; then
     echo ""

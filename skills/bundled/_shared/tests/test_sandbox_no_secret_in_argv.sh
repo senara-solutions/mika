@@ -99,8 +99,47 @@ captured_args() {
 }
 
 # Does the captured argv contain a credential-shaped value anywhere?
+#
+# This is the WEAKER of the two value-side checks. A shape denylist can never
+# be complete — npm, Atlassian, Slack and opaque hex secrets all slip past it.
+# `assert_setenv_channel_closed` below is the primary check: it asserts the
+# CHANNEL (which names may be emitted at all) rather than guessing at shapes.
 captured_has_credential() {
     grep -qzE "$CRED_PATTERN" "$CAPTURE"
+}
+
+# Every name emitted as `--setenv <NAME>` in the captured argv.
+setenv_names() {
+    local -a a=()
+    local x i
+    while IFS= read -r x; do a+=("$x"); done < <(captured_args)
+    for ((i = 0; i < ${#a[@]} - 1; i++)); do
+        if [ "${a[$i]}" = "--setenv" ]; then
+            printf '%s\n' "${a[$((i + 1))]}"
+        fi
+    done
+}
+
+# The complete audited set of names allowed to travel by --setenv: the
+# non-secret passthrough allowlist, plus the Phase 2b network vars. Anything
+# else appearing is a violation regardless of what its value looks like — this
+# is the deny-by-default posture the `--clearenv` invariant already uses,
+# applied to the value guard so it does not depend on recognising a vendor.
+AUDITED_SETENV_NAMES="ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_LOG_FILE \
+CLAUDE_CODE_API_BASE_URL HOME HOSTNAME HTTPS_PROXY HTTP_PROXY LANG LC_ALL \
+LOGNAME MIKA_LOG_PILOT_TRANSCRIPTS MIKA_PILOT_CONTAINED NODE_EXTRA_CA_CERTS \
+NO_PROXY PATH SHELL TERM TMPDIR USER"
+
+assert_setenv_channel_closed() {
+    local label="$1" unexpected="" n
+    while IFS= read -r n; do
+        [ -z "$n" ] && continue
+        case " $AUDITED_SETENV_NAMES " in
+            *" $n "*) ;;
+            *) unexpected="$unexpected $n" ;;
+        esac
+    done < <(setenv_names)
+    assert_eq "$label" "" "$unexpected"
 }
 
 # Index (0-based) of the first occurrence of an exact argument, or -1.
@@ -148,6 +187,7 @@ assert_eq "2a: argv contains no credential-shaped value" "1" "$rc"
 
 rc=1; [ "$(arg_index '--ro-bind-data')" != "-1" ] && rc=0
 assert_true "2a: argv carries --ro-bind-data (secret channel present)" "$rc"
+assert_setenv_channel_closed "2a: no unaudited name travels by --setenv"
 
 # ============================================================================
 # Test 2: Phase 2b — no credential value in the bwrap argv
@@ -164,6 +204,23 @@ assert_eq "2b: argv contains no credential-shaped value" "1" "$rc"
 
 rc=1; [ "$(arg_index '--ro-bind-data')" != "-1" ] && rc=0
 assert_true "2b: argv carries --ro-bind-data (secret channel present)" "$rc"
+assert_setenv_channel_closed "2b: no unaudited name travels by --setenv"
+
+# The Phase 2b entrypoint is a multi-line `sh -c` script that also launches the
+# egress shim. The prologue is prepended to it, and nothing else in the suite
+# looks at that string — removing it leaves every other assertion green.
+# Scan the raw NUL-separated capture: the entrypoint is a multi-line script,
+# so a line-oriented view of the argv would only ever see its last line.
+rc=1; grep -qzF -- "$_PILOT_SECRET_PROLOGUE" "$CAPTURE" && rc=0
+assert_true "2b: entrypoint script carries the secret prologue" "$rc"
+
+# A credential that is NOT one of the shapes CRED_PATTERN knows. It must never
+# reach --setenv either; the channel assertion is what catches it.
+export NPM_TOKEN="npm_notarealtokenjustashape000000000000"
+export ATLASSIAN_API_TOKEN="ATATT3xFfGF0notarealtokenjustashape"
+run_sandboxed /bin/true >/dev/null
+assert_setenv_channel_closed "2b: an unknown-vendor secret cannot ride --setenv"
+unset NPM_TOKEN ATLASSIAN_API_TOKEN
 
 MOCK_EGRESS_RC=1
 
@@ -287,9 +344,9 @@ assert_eq "two --ro-bind-data arguments emitted" "2" "$bd_count"
 dest_count=$(secret_destinations | sort -u | wc -l | tr -d ' ')
 assert_eq "two distinct secret destinations emitted" "2" "$dest_count"
 
-rc=1; secret_destinations | grep -qx "/run/mika-pilot-secrets/GH_TOKEN" && rc=0
+rc=1; grep -qx -- "/run/mika-pilot-secrets/GH_TOKEN" <<<"$(secret_destinations)" && rc=0
 assert_true "first secret keeps its own destination path" "$rc"
-rc=1; secret_destinations | grep -qx "/run/mika-pilot-secrets/MIKA_TEST_SECOND_SECRET" && rc=0
+rc=1; grep -qx -- "/run/mika-pilot-secrets/MIKA_TEST_SECOND_SECRET" <<<"$(secret_destinations)" && rc=0
 assert_true "second secret gets its own destination path" "$rc"
 
 rc=1; captured_has_credential && rc=0
@@ -371,7 +428,31 @@ else
     got_perms=$(GH_TOKEN="$FAKE_TOKEN" _run_pilot_sandboxed \
         /bin/sh -c 'ls -l /run/mika-pilot-secrets/GH_TOKEN | cut -c1-10' 2>/dev/null)
     assert_eq "secret file is mode 0600 inside the sandbox" "-rw-------" "$got_perms"
+
+    # Phase 2b is the branch every real dispatch takes when the egress proxy is
+    # up, and its entrypoint is a materially different string — the prologue is
+    # concatenated with the shim launch and a printf '%q'-quoted argv. Running
+    # it for real is the only way a quoting fault in that composition surfaces
+    # before production.
+    if [ -x "$_PILOT_EGRESS_PROXY_BIN" ] && [ -S "$_PILOT_EGRESS_SOCK" ]; then
+        MOCK_EGRESS_RC=0
+        got_2b=$(GH_TOKEN="$FAKE_TOKEN" _run_pilot_sandboxed \
+            /bin/sh -c 'printf %s "${GH_TOKEN:-<absent>}"' 2>/dev/null)
+        assert_eq "Phase 2b: sandbox sees the token via the file channel" \
+            "$FAKE_TOKEN" "$got_2b"
+        MOCK_EGRESS_RC=1
+    else
+        echo "  ⊘ Phase 2b real-bwrap run skipped — egress proxy not running"
+        echo "    (argv-level Phase 2b coverage above still applies)"
+    fi
 fi
+
+# Restore the mock: anything appended after this point must not reach the real
+# binary with $HOME pointed at the temp root.
+bwrap() {
+    printf '%s\0' "$@" > "$CAPTURE"
+    return "$MOCK_BWRAP_RC"
+}
 
 # ============================================================================
 echo ""
