@@ -15,8 +15,9 @@ semaine.
 
 Ce chemin a déjà une histoire longue, compoundée dans
 `docs/solutions/ci-cd/release-automation-chronic-drift-2026-04-23.md` : quatre étapes de dérive
-(classes A à D, puis migration git-cliff → release-please en mai 2026). Ce plan est la cinquième
-étape, et la première qui ne tente pas de réparer.
+— quatre classes de panne (A à D) traversant quatre outils successifs, jusqu'à la migration
+git-cliff → release-please du 2026-05-09 (mika#1049). Ce plan ajoute la première entrée qui ne tente
+pas de réparer.
 
 ## Preuves
 
@@ -31,13 +32,19 @@ config manifest faute de `config-file` / `manifest-file`. C'est faux, pour deux 
 1. Ces deux entrées valent `default: ''` dans l'`action.yml` du SHA épinglé `5c625bfb` ; release-please
    retombe alors sur ses propres constantes, `release-please-config.json` et
    `.release-please-manifest.json` — exactement les fichiers présents à la racine.
-2. Le log prouve que la config **a été lue**. Ces trois lignes ne peuvent venir que d'elle :
+2. Le log montre la lecture **directement** :
 
 ```
+❯ Fetching release-please-config.json from branch main
+❯ Fetching .release-please-manifest.json from branch main
 ✔ Building candidate release pull request for path: .        ← packages { "." }
 ❯ type: rust                                                  ← "release-type": "rust"
-❯ …release-please--branches--main--components--mika…          ← "component": "mika"
 ```
+
+(Les deux premières lignes sont la preuve forte ; les deux suivantes montrent que le contenu lu est
+bien le nôtre. À noter, un contre-signal apparent : le log affiche plus loin `component: ` vide. Il
+n'invalide rien — la branche visée reste `release-please--branches--main--components--mika` — mais
+c'est une ligne à ne pas citer comme preuve.)
 
 Ajouter les deux entrées écrirait explicitement ce que l'action fait déjà. Le run échouerait à
 l'identique.
@@ -51,7 +58,8 @@ l'identique.
 ✔ Considering: 1190 commits
 ```
 
-3 commits sautés sur 1190 considérés, et le run continue. Bruit de log, pas la cause de l'échec.
+Trois commits sautés — le compte exact dans le log — et le run continue, jusqu'à considérer 1190
+commits. Bruit de log, pas la cause de l'échec.
 
 ### La vraie cause fatale — la stratégie `rust` face à un workspace virtuel
 
@@ -79,8 +87,19 @@ Deux défauts enchaînés, tous deux dans la stratégie `rust` :
 
 ### Décision opérateur amont
 
-Personne ne consomme les releases de ce dépôt : dernière étiquette `v0.12.2`, quatre mois ; le
-déploiement se fait depuis `main` via `make deploy`. Réparer coûterait un changement de stratégie
+Aucun consommateur connu de ce canal : dernière étiquette `v0.12.2` du **2026-05-09**, et le
+déploiement se fait depuis `main` via `make deploy`.
+
+**Mesure à charge, relevée en relecture, qui ne renverse pas la décision.** « Personne ne consomme »
+est faux au sens littéral : les assets portent 38 téléchargements sur `v0.12.2` et 132 toutes releases
+confondues, et `install.sh` — proposé en voie d'installation principale dans le README — tire depuis
+GitHub Releases. Ce qui reste vrai, et qui est le point qui compte : **ce workflow ne produit plus
+rien depuis le 2026-05-09**. 300 runs relevés entre le 2026-06-05 et le 2026-08-29, 300 en échec.
+L'éteindre ne retire donc à ces consommateurs résiduels rien qu'ils obtenaient encore ; ils sont figés
+sur `v0.12.2` depuis mai, et le resteront — c'est un état antérieur à ce changement, pas un effet de
+ce changement. Le fait est reporté dans mika#2048.
+
+Réparer coûterait un changement de stratégie
 release-please **plus** une boucle de vérification qui n'existe pas sans salir `main` ou fabriquer de
 fausses PR de release. La décision est prise en amont de ce plan et n'est pas rouverte ici :
 désactivation propre, reprise fichée en mika#2048.
@@ -90,8 +109,17 @@ désactivation propre, reprise fichée en mika#2048.
 **Dans le périmètre :**
 - `.github/workflows/release-pr.yml` — désactivation du déclencheur automatique et rédaction de la
   raison dans le fichier.
-- `docs/deployment.md` § « Release PR » — le document décrit un workflow actif ; il doit décrire
-  l'état réel.
+- `docs/deployment.md` § « Release PR » et « Release Binaries » — le document décrit un workflow
+  actif ; il doit décrire l'état réel.
+- `crates/mika-agent/docs/deployment.md` — copie miroir embarquée dans le binaire
+  (`scripts/sync-agent-docs.sh:13-23`, `crates/mika-agent/build.rs:16-26`). **Le contrôle requis
+  `Docs Sync` échoue si elle n'est pas resynchronisée**, et le binaire embarquerait sinon une doc
+  décrivant un canal de release encore actif.
+- `README.md`, `CONTRIBUTING.md`, `CLAUDE.md` — quatre affirmations y promettent des releases
+  automatiques. Extension de périmètre assumée : ce sont les mêmes prétentions que celles corrigées
+  dans `deployment.md`, et les laisser reviendrait à remplacer un rouge visible par une doc fausse.
+  (Deux d'entre elles étaient déjà obsolètes avant ce changement : `README.md` et `CONTRIBUTING.md`
+  promettaient des releases via **release-plz**, outil remplacé le 2026-05-09.)
 - `docs/solutions/ci-cd/release-automation-chronic-drift-2026-04-23.md` — ajout de l'étape 5, à
   l'étape `/ce:compound`.
 
@@ -117,10 +145,17 @@ désactivation propre, reprise fichée en mika#2048.
 workflow ne s'exécute plus jamais tout seul, et `main` ne peut plus être teint par ce chemin — ce qui
 est exactement le critère de succès du ticket.
 
-`workflow_dispatch` est conservé délibérément, et c'est un choix, pas un oubli : mika#2048 aura besoin
-d'un moyen de vérifier une réparation **sans** pousser sur `main`. Un dispatch manuel sur un `ref` de
-test est ce moyen. Un dispatch manuel qui échoue est un acte volontaire d'un mainteneur, pas un rouge
-subi.
+`workflow_dispatch` est conservé délibérément, et c'est un choix, pas un oubli : il reste le point
+d'entrée manuel de la reprise, et un dispatch qui échoue est un acte volontaire d'un mainteneur, pas
+un rouge subi.
+
+**Ce n'est pas pour autant un bac à sable, et l'en-tête le dit.** L'action est invoquée sans
+`target-branch` (`release-pr.yml`, job `release-please`), donc elle cible la branche par défaut quel
+que soit le `ref` choisi au dispatch : un dispatch « depuis un ref de test » créerait une vraie PR de
+release sur `main` et, si `release-please` réussissait, `update-lockfile` pousserait sur la branche
+`release-please--…`. mika#2048 doit ajouter `target-branch` **avant** de s'en servir pour vérifier
+quoi que ce soit. Constat de relecture ; l'affirmation initiale de ce plan (« vérifier sans pousser
+sur `main` ») était plus forte que la preuve.
 
 **Alternatives rejetées :**
 - **`if: false` sur le job.** Explicitement écarté par le ticket : « pas un `if: false` muet ». Même
@@ -186,8 +221,10 @@ le même dégât, en moins détectable.
 - [ ] Le fichier porte, en en-tête, la raison de la désactivation, la cause technique avec ses preuves,
       et les renvois vers mika#2047 et mika#2048.
 - [ ] Le `name:` du workflow signale l'état désactivé.
-- [ ] `docs/deployment.md` décrit l'état réel du chemin release.
-- [ ] Aucun autre fichier n'est modifié — en particulier ni `Cargo.toml`, ni
+- [ ] `docs/deployment.md` décrit l'état réel du chemin release, et `crates/mika-agent/docs/deployment.md`
+      est resynchronisé (contrôle requis `Docs Sync`).
+- [ ] `README.md`, `CONTRIBUTING.md` et `CLAUDE.md` ne promettent plus de releases automatiques.
+- [ ] Aucun fichier hors des deux listes du périmètre n'est modifié — en particulier ni `Cargo.toml`, ni
       `release-please-config.json`, ni `.release-please-manifest.json`, ni un autre workflow.
 - [ ] Le YAML est valide (parse sans erreur) et `on:` ne contient plus que `workflow_dispatch`.
 - [ ] `docs/solutions/ci-cd/release-automation-chronic-drift-2026-04-23.md` gagne son étape 5.
@@ -215,11 +252,19 @@ Transcrits verbatim de la section « Critères d'acceptation » de senara-soluti
   retenue. Son contenu est reporté dans mika#2048 comme critère de succès de la reprise.
 - Critère 3 — satisfait par D1 + D2 (raison dans le fichier, pas d'`if: false`) et par le commentaire
   de vérification déjà posté sur mika#2047 (décision tracée dans le ticket).
-- Critère 4 — satisfait par **tolérance silencieuse**, et c'est une constatation, pas un changement :
-  le log prouve que les 3 commits à parenthèses sont sautés sans faire échouer le run
-  (`Considering: 1190 commits`), et qu'un commit conventionnel valide reste compté. Le test
-  anti-vacuité est donc déjà passé par le run `33245981885` lui-même. Aucune convention de message
-  n'est introduite : elle contraindrait 1190 commits d'historique pour un chemin qu'on éteint.
+- Critère 4 — satisfait par **tolérance silencieuse**, et c'est une constatation, pas un changement.
+  Le test anti-vacuité a deux moitiés, et il faut être exact sur laquelle est prouvée :
+  - « un commit à parenthèses ne doit pas faire échouer le run » → **prouvé** par le run
+    `33245981885` : les trois commits concernés sont sautés et le run continue jusqu'à
+    `Considering: 1190 commits`.
+  - « un commit conventionnel valide doit toujours produire son entrée de changelog » → **non
+    observable, et il ne le sera pas.** Le run est mort sur `Fetching Cargo.toml` avant toute
+    génération de changelog ; aucune entrée n'a été produite, donc rien n'atteste cette moitié. Et
+    sous la branche « abandonnées » elle devient sans objet : plus aucun changelog n'est généré.
+    Elle est reportée dans mika#2048, où elle redevient vérifiable.
+
+  Aucune convention de message n'est introduite : elle contraindrait 1190 commits d'historique pour
+  un chemin qu'on éteint.
 
 ## Vérification
 
@@ -229,9 +274,11 @@ Transcrits verbatim de la section « Critères d'acceptation » de senara-soluti
 | 2 | Plus de déclencheur `push` | `yaml.safe_load(...)['on']` (ou `[True]`, YAML 1.1 interprète `on` en booléen) | `{'workflow_dispatch': None}` seul |
 | 3 | Raison présente | `grep -c 'mika#2048' .github/workflows/release-pr.yml` | ≥ 1 |
 | 4 | Pas d'`if: false` | `grep -n 'if: false' .github/workflows/release-pr.yml` | aucune correspondance |
-| 5 | Périmètre respecté | `git diff --name-only main...HEAD` | uniquement le workflow + `docs/` |
+| 5 | Périmètre respecté | `git diff --name-only origin/main...HEAD` — **pas** `main`, qui peut être périmé en local | uniquement les fichiers des deux listes du périmètre |
 | 6 | Contrôles requis intacts | ruleset 13380969 (relevé en D3) | aucun contexte `release-pr` |
-| 7 | Critère de succès final | après merge, `gh run list --workflow=release-pr.yml` | aucun run nouveau sur `main` |
+| 7 | Copie miroir synchronisée | `bash scripts/sync-agent-docs.sh && git diff --exit-code crates/mika-agent/docs/` | pas de diff (contrôle requis `Docs Sync`) |
+| 8 | Plus de prétention fausse | `grep -rn "automated release\|release-plz" README.md CONTRIBUTING.md CLAUDE.md` | aucune affirmation de release automatique active |
+| 9 | Critère de succès final | après merge, `gh run list --workflow=release-pr.yml` | aucun run nouveau sur `main` |
 
-Le contrôle 7 ne peut se faire qu'après merge — c'est la nature du critère. Il appartient à la
+Le contrôle 9 ne peut se faire qu'après merge — c'est la nature du critère. Il appartient à la
 vérification post-merge, pas au pipeline de cette PR.

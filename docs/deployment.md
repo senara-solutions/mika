@@ -118,9 +118,14 @@ There is currently **no automated release, no automated tag, and no automated ch
 
 Why: release-please failed on every merge and kept `main` permanently red. Its `rust` strategy cannot
 handle our virtual workspace — it does not expand the `members = ["crates/*"]` glob, then hands the
-root `Cargo.toml` (which has no `[package]` section) to a package updater and throws. Nobody consumes
-this repo's releases — last tag `v0.12.2`, four months old — and deployment happens from `main` via
-`make deploy`. The full reasoning lives in the workflow file's header comment.
+root `Cargo.toml` (which has no `[package]` section) to a package updater and throws. 300 runs between
+2026-06-05 and 2026-08-29, 300 failures, zero successes.
+
+There is no known consumer of this release channel — last tag `v0.12.2` (2026-05-09) — and deployment
+happens from `main` via `make deploy`. Release assets do still see residual downloads (38 on `v0.12.2`,
+132 across all releases), and `install.sh` below pulls from GitHub Releases; but this workflow has
+produced nothing since 2026-05-09, so turning it off takes away nothing those users were still getting.
+They are pinned to `v0.12.2` regardless. The full reasoning lives in the workflow file's header comment.
 
 - Diagnosis: mika#2047
 - Resume ticket (what it would take to turn it back on): mika#2048

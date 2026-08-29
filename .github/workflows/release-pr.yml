@@ -1,19 +1,28 @@
 # DÉSACTIVÉ le 2026-08-29 — ce workflow ne se déclenche plus sur `push: main`.
 #
-# POURQUOI. Il échouait à chaque merge et teignait `main` en rouge en continu
-# (runs 2d7dfc74, 3c9149a9, b84fdbc8 et les précédents). Un `main` durablement
-# rouge apprend à ignorer le rouge : le signal était devenu un coût, pas une
-# alerte. Personne ne consomme les releases de ce dépôt — dernière étiquette
-# `v0.12.2`, quatre mois — et le déploiement se fait depuis `main` via
-# `make deploy`. Éteindre un canal de publication inutilisé coûte moins que
-# maintenir un rouge permanent qui masque les vrais.
+# POURQUOI. Il échouait à CHAQUE merge : 300 runs relevés entre le 2026-06-05 et
+# le 2026-08-29, 300 en échec, aucun succès. `main` était donc rouge en
+# permanence, et un `main` durablement rouge apprend à ignorer le rouge — le
+# signal était devenu un coût, pas une alerte.
 #
-# LA CAUSE, EXACTEMENT. Ce n'est PAS un défaut de configuration manifest :
-# release-please v4 retombe sur `release-please-config.json` et
-# `.release-please-manifest.json` par défaut, et le log du run 33245981885
-# prouve que la config est bien lue (« Building candidate release pull request
-# for path: . », « type: rust »). Ce n'est pas non plus les commits non
-# parsables : ils sont sautés sans faire échouer le run (3 sur 1190 considérés).
+# Aucun consommateur connu de ce canal de publication : dernière étiquette
+# `v0.12.2` du 2026-05-09, et le déploiement se fait depuis `main` via
+# `make deploy`. Les assets gardent des téléchargements résiduels (38 sur
+# v0.12.2, 132 toutes releases confondues) et `install.sh` tire bien depuis
+# GitHub Releases — mais ce workflow ne produit plus rien depuis le 2026-05-09,
+# donc l'éteindre ne retire à personne ce qu'il n'obtenait déjà plus.
+#
+# LA CAUSE, EXACTEMENT. Ce n'est PAS un défaut de configuration manifest.
+# release-please v4 retombe sur ses fichiers par défaut quand `config-file` et
+# `manifest-file` sont vides, et le log du run 33245981885 le montre :
+#
+#     ❯ Fetching release-please-config.json from branch main
+#     ❯ Fetching .release-please-manifest.json from branch main
+#     ✔ Building candidate release pull request for path: .
+#     ❯ type: rust
+#
+# La config était donc bien lue. Ce n'est pas non plus les commits non
+# parsables : 3 sont sautés et le run continue (`Considering: 1190 commits`).
 #
 # La cause fatale est la stratégie `rust` face à notre workspace virtuel :
 #
@@ -22,12 +31,16 @@
 #     ✖ is not a package manifest (might be a cargo workspace)
 #       → le Cargo.toml racine n'a pas de section [package], exception fatale
 #
-# CE QUI RESTE. `workflow_dispatch` est conservé DÉLIBÉRÉMENT, pas par oubli :
-# la reprise (mika#2048) aura besoin de vérifier une réparation sur un `ref` de
-# test sans pousser sur `main`. Un dispatch manuel qui échoue est un acte
-# volontaire, pas un rouge subi. Le job `update-lockfile` est laissé intact —
-# il ne peut pas devenir orphelin (`needs:` le marque *skipped*, jamais
-# *failed*) et il encode du contexte dont la reprise a besoin.
+# CE QUI RESTE. `workflow_dispatch` est conservé DÉLIBÉRÉMENT, comme point
+# d'entrée manuel pour la reprise. ATTENTION, ce n'est PAS un bac à sable :
+# l'action est invoquée sans `target-branch` (voir le job ci-dessous), donc elle
+# cible la branche par défaut quel que soit le `ref` choisi au dispatch — un
+# dispatch créerait une vraie PR de release sur `main`. mika#2048 doit ajouter
+# `target-branch` AVANT de s'en servir pour vérifier quoi que ce soit.
+#
+# Le job `update-lockfile` est laissé intact : il ne peut pas devenir orphelin
+# (`needs:` le marque *skipped*, jamais *failed*) et il encode du contexte dont
+# la reprise a besoin.
 #
 # POUR RALLUMER. mika#2048 énonce la condition (quelqu'un consomme-t-il les
 # releases ?) et les étapes. Diagnostic complet : mika#2047.
