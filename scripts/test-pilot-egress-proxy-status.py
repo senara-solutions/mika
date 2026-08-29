@@ -22,7 +22,13 @@ import asyncio
 import contextlib
 import importlib.util
 import io
+import os
 import pathlib
+import signal
+import socket
+import subprocess
+import tempfile
+import time
 import sys
 import types
 import unittest
@@ -507,6 +513,220 @@ class AddonResponseLoggingTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             addon.responseheaders(_FakeFlow("api.anthropic.com", response))
         self.assertFalse(response.stream)
+
+
+# ---------------------------------------------------------------------------
+# Socket lifecycle in host mode (mika#2041)
+#
+# A kill does not unlink a unix socket. The orphaned path is what armed the
+# launcher's broken guard during the 2026-08-29 incident, so the proxy owes two
+# things: clear a stale path on the way in, and clear its own on the way out.
+#
+# The inbound half already existed (e4f24677 / #1894) and was measured deployed
+# during the incident -- these tests lock it rather than reimplement it. The
+# outbound half is new.
+#
+# Driven as real subprocesses: signal delivery and process teardown are the
+# behaviour under test, and neither survives being simulated in-process.
+# ---------------------------------------------------------------------------
+
+
+class HostSocketLifecycleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._dir = tempfile.mkdtemp(prefix="mika-egress-lifecycle-")
+        # Never the real /tmp/mika-pilot-egress.sock: a live host proxy owns
+        # that path, and a test that unlinks it takes egress down.
+        self.sock = os.path.join(self._dir, "egress.sock")
+        self._procs: list[subprocess.Popen] = []
+
+    def tearDown(self) -> None:
+        for proc in self._procs:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+        for name in os.listdir(self._dir):
+            os.unlink(os.path.join(self._dir, name))
+        os.rmdir(self._dir)
+
+    def _spawn_host(self) -> subprocess.Popen:
+        proc = subprocess.Popen(
+            [sys.executable, str(_PROXY_PATH), "--host-unix", "--socket", self.sock],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        self._procs.append(proc)
+        return proc
+
+    def _connectable(self) -> bool:
+        if not os.path.exists(self.sock):
+            return False
+        client = socket.socket(socket.AF_UNIX)
+        client.settimeout(1)
+        try:
+            client.connect(self.sock)
+            return True
+        except OSError:
+            return False
+        finally:
+            client.close()
+
+    def _wait_connectable(self, timeout: float = 10.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._connectable():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def _wait_tcp(self, port: int, timeout: float = 10.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            probe = socket.socket(socket.AF_INET)
+            probe.settimeout(1)
+            try:
+                probe.connect(("127.0.0.1", port))
+                return True
+            except OSError:
+                time.sleep(0.05)
+            finally:
+                probe.close()
+        return False
+
+    def _make_orphan(self) -> None:
+        """Bind then close without unlinking — the shape a kill leaves behind."""
+        ghost = socket.socket(socket.AF_UNIX)
+        ghost.bind(self.sock)
+        ghost.close()
+        self.assertTrue(os.path.exists(self.sock))
+        self.assertFalse(self._connectable())
+
+    def test_orphaned_socket_is_cleared_before_bind(self) -> None:
+        # The regression lock for the behaviour mika#2041's body mistakenly
+        # reported as missing. It is not missing; it must not be removed.
+        self._make_orphan()
+        self._spawn_host()
+        self.assertTrue(self._wait_connectable(), "proxy failed to bind over an orphan")
+
+    def test_non_socket_at_path_is_refused_not_unlinked(self) -> None:
+        with open(self.sock, "w", encoding="utf-8") as handle:
+            handle.write("not a socket")
+        proc = self._spawn_host()
+        proc.wait(timeout=10)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertTrue(os.path.exists(self.sock), "refused path must survive")
+
+    def test_sigterm_unlinks_the_socket(self) -> None:
+        proc = self._spawn_host()
+        self.assertTrue(self._wait_connectable())
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=10)
+        self.assertFalse(
+            os.path.exists(self.sock),
+            "SIGTERM left the socket behind — the orphan that arms the launcher guard",
+        )
+
+    def test_sigterm_terminates_promptly_with_a_live_client(self) -> None:
+        # The regression that the first shape of this fix introduced: awaiting
+        # the server's close (via `async with server` / `wait_closed()`) blocks
+        # on every live client handler. An idle client holds one for the
+        # 10s header-read timeout; a real CONNECT tunnel holds one for the
+        # whole pilot session. Either way the operator's `kill` appears to do
+        # nothing and the next move is `kill -9` -- which orphans the socket
+        # and re-creates the class this file exists to close.
+        #
+        # An idle client is used deliberately: it needs no network, so the
+        # bound is deterministic in CI, and it still reproduces the hang.
+        proc = self._spawn_host()
+        self.assertTrue(self._wait_connectable())
+        client = socket.socket(socket.AF_UNIX)
+        client.connect(self.sock)
+        try:
+            proc.send_signal(signal.SIGTERM)
+            proc.wait(timeout=4)
+        except subprocess.TimeoutExpired:
+            self.fail(
+                "SIGTERM did not terminate the proxy within 4s while a client "
+                "was connected -- shutdown is waiting on live handlers"
+            )
+        finally:
+            client.close()
+        self.assertFalse(os.path.exists(self.sock))
+
+    def test_sigint_unlinks_the_socket(self) -> None:
+        proc = self._spawn_host()
+        self.assertTrue(self._wait_connectable())
+        proc.send_signal(signal.SIGINT)
+        proc.wait(timeout=10)
+        self.assertFalse(os.path.exists(self.sock))
+
+    def test_shutdown_does_not_unlink_a_successors_socket(self) -> None:
+        # The property the inode comparison buys, and the reason an
+        # `is_socket()` check is not enough: it is equally true of a DIFFERENT
+        # proxy's live socket. A launcher that starts a replacement while the
+        # old one is still winding down must not end up with a running proxy
+        # whose path was deleted underneath it -- that state is invisible to
+        # every liveness probe and makes the launcher spawn a new proxy on
+        # every subsequent dispatch.
+        first = self._spawn_host()
+        self.assertTrue(self._wait_connectable())
+        first_ino = os.stat(self.sock).st_ino
+
+        second = self._spawn_host()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                if os.stat(self.sock).st_ino != first_ino:
+                    break
+            except FileNotFoundError:
+                pass
+            time.sleep(0.05)
+        else:
+            self.fail("successor proxy never took over the path")
+        self.assertTrue(self._wait_connectable())
+
+        first.send_signal(signal.SIGTERM)
+        first.wait(timeout=10)
+        self.assertTrue(
+            self._connectable(),
+            "the retiring proxy deleted its successor's live socket",
+        )
+        self.assertIsNone(second.poll())
+
+    def test_sandbox_mode_never_unlinks_the_unix_socket(self) -> None:
+        # The sandbox side connects to the socket; it does not own it. A shutdown
+        # there must leave the host's socket standing.
+        host = self._spawn_host()
+        self.assertTrue(self._wait_connectable())
+        with socket.socket(socket.AF_INET) as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        shim = subprocess.Popen(
+            [
+                sys.executable,
+                str(_PROXY_PATH),
+                "--sandbox-tcp",
+                str(port),
+                "--socket",
+                self.sock,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self._procs.append(shim)
+        # The port was picked by binding and releasing, so another process can
+        # claim it in between and the shim dies at bind time. Assert it is
+        # actually listening before signalling it -- otherwise a shim that
+        # never started satisfies both assertions below and the test proves
+        # nothing.
+        self.assertTrue(
+            self._wait_tcp(port), f"sandbox shim never came up on port {port}"
+        )
+        shim.send_signal(signal.SIGTERM)
+        shim.wait(timeout=10)
+        self.assertTrue(
+            self._connectable(), "sandbox shutdown took the host socket with it"
+        )
+        self.assertIsNone(host.poll(), "host proxy should still be running")
 
 
 if __name__ == "__main__":

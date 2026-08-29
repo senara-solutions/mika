@@ -173,6 +173,34 @@ except Exception:
 }
 
 
+# True when something is actually listening on the unix socket at $1.
+#
+# Neither the file's existence nor its type is enough. A kill does not unlink a
+# unix socket, so the path survives its owner as an orphan that satisfies
+# `[ -S ]` and refuses connect(). Asking the file-type question where the
+# question is "is anyone listening" is what let mika#2041's incident run silent:
+# the launcher affirmed a proxy that had already died.
+#
+# The path goes through argv, never interpolated into the python source -- a
+# quote in the path would otherwise be a syntax error in the probe itself.
+# $2 is the connect timeout in seconds (default 1). The wait loop below passes
+# a short one: an orphan refuses instantly, but a socket whose owner is wedged
+# or whose listen backlog is full blocks for the whole timeout, and this runs
+# on the critical path of every dispatch.
+_pilot_egress_sock_connectable() {
+    [ -S "$1" ] || return 1
+    python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(float(sys.argv[2]))
+try:
+    s.connect(sys.argv[1])
+    s.close()
+except OSError:
+    sys.exit(1)
+' "$1" "${2:-1}" 2>/dev/null
+}
+
 # Idempotent host-side egress proxy launcher. Runs once per host; on subsequent
 # calls, verifies the daemon is alive and returns. Fail-open on missing binary
 # (Phase 2b not yet deployed) — sandbox falls back to Phase 2a (fs cut only,
@@ -182,22 +210,16 @@ _ensure_pilot_egress_proxy() {
         echo "dispatch-lib: mika-pilot-egress-proxy not found at $_PILOT_EGRESS_PROXY_BIN — Phase 2b network cut disabled (falling back to fs-only)" >&2
         return 1
     fi
-    # Liveness probe: socket exists + accepts a connection.
-    if [ -S "$_PILOT_EGRESS_SOCK" ] && python3 -c "
-import socket, sys
-s = socket.socket(socket.AF_UNIX)
-s.settimeout(1)
-try:
-    s.connect('$_PILOT_EGRESS_SOCK')
-    s.close()
-    sys.exit(0)
-except OSError:
-    sys.exit(1)
-" 2>/dev/null; then
+    # Liveness probe: is anyone actually listening?
+    if _pilot_egress_sock_connectable "$_PILOT_EGRESS_SOCK"; then
         return 0  # already alive
     fi
-    # Launch as detached daemon. Log to /var/log/mika/ if writable, else stderr.
-    local log_dir="/var/log/mika"
+    # Launch as detached daemon. Log to /var/log/mika/ if writable, else to
+    # /tmp -- never to stderr, whatever the previous comment here claimed.
+    # Overridable so a test run cannot append fake-proxy output into the
+    # operational log -- that file is the incident-diagnosis surface, and
+    # mika#2041 was diagnosed by reading it. Default is unchanged.
+    local log_dir="${MIKA_PILOT_EGRESS_LOG_DIR:-/var/log/mika}"
     local log_file
     if [ -w "$log_dir" ] || mkdir -p "$log_dir" 2>/dev/null; then
         log_file="$log_dir/pilot-egress-proxy.log"
@@ -207,14 +229,23 @@ except OSError:
     nohup "$_PILOT_EGRESS_PROXY_BIN" --host-unix --socket "$_PILOT_EGRESS_SOCK" \
         >>"$log_file" 2>&1 </dev/null &
     disown 2>/dev/null || true
-    # Wait for socket to appear (bounded).
-    local i=0
-    while [ $i -lt 20 ] && [ ! -S "$_PILOT_EGRESS_SOCK" ]; do
+    # Wait for the proxy to actually accept a connection (bounded). Testing
+    # for the socket FILE here is what made the fallback below unreachable in
+    # the one scenario that needs it: an orphaned path satisfies `[ -S ]`
+    # immediately, so the loop exited on its first iteration and the launcher
+    # declared success over a proxy that was already dead (mika#2041).
+    #
+    # Bounded on wall clock, not on an iteration count: each probe can itself
+    # block for its connect timeout, so counting iterations would let the real
+    # budget drift far past what the failure message claims -- and this sits on
+    # the critical path of every dispatch.
+    local deadline=$((SECONDS + 3))
+    while [ "$SECONDS" -lt "$deadline" ] \
+        && ! _pilot_egress_sock_connectable "$_PILOT_EGRESS_SOCK" 0.25; do
         sleep 0.1
-        i=$((i + 1))
     done
-    if [ ! -S "$_PILOT_EGRESS_SOCK" ]; then
-        echo "dispatch-lib: pilot-egress-proxy failed to bind $_PILOT_EGRESS_SOCK within 2s — falling back to fs-only" >&2
+    if ! _pilot_egress_sock_connectable "$_PILOT_EGRESS_SOCK" 0.25; then
+        echo "dispatch-lib: pilot_egress_guard.unreachable pilot-egress-proxy failed to bind $_PILOT_EGRESS_SOCK within 3s — falling back to fs-only" >&2
         return 1
     fi
     echo "dispatch-lib: pilot-egress-proxy launched (pid $!, log $log_file)" >&2
