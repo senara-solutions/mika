@@ -183,18 +183,22 @@ except Exception:
 #
 # The path goes through argv, never interpolated into the python source -- a
 # quote in the path would otherwise be a syntax error in the probe itself.
+# $2 is the connect timeout in seconds (default 1). The wait loop below passes
+# a short one: an orphan refuses instantly, but a socket whose owner is wedged
+# or whose listen backlog is full blocks for the whole timeout, and this runs
+# on the critical path of every dispatch.
 _pilot_egress_sock_connectable() {
     [ -S "$1" ] || return 1
     python3 -c '
 import socket, sys
 s = socket.socket(socket.AF_UNIX)
-s.settimeout(1)
+s.settimeout(float(sys.argv[2]))
 try:
     s.connect(sys.argv[1])
     s.close()
 except OSError:
     sys.exit(1)
-' "$1" 2>/dev/null
+' "$1" "${2:-1}" 2>/dev/null
 }
 
 # Idempotent host-side egress proxy launcher. Runs once per host; on subsequent
@@ -210,7 +214,8 @@ _ensure_pilot_egress_proxy() {
     if _pilot_egress_sock_connectable "$_PILOT_EGRESS_SOCK"; then
         return 0  # already alive
     fi
-    # Launch as detached daemon. Log to /var/log/mika/ if writable, else stderr.
+    # Launch as detached daemon. Log to /var/log/mika/ if writable, else to
+    # /tmp -- never to stderr, whatever the previous comment here claimed.
     # Overridable so a test run cannot append fake-proxy output into the
     # operational log -- that file is the incident-diagnosis surface, and
     # mika#2041 was diagnosed by reading it. Default is unchanged.
@@ -230,15 +235,17 @@ _ensure_pilot_egress_proxy() {
     # immediately, so the loop exited on its first iteration and the launcher
     # declared success over a proxy that was already dead (mika#2041).
     #
-    # On an orphan, connect() is refused outright rather than timing out, so
-    # the failure path stays fast despite probing on every iteration.
-    local i=0
-    while [ $i -lt 20 ] && ! _pilot_egress_sock_connectable "$_PILOT_EGRESS_SOCK"; do
+    # Bounded on wall clock, not on an iteration count: each probe can itself
+    # block for its connect timeout, so counting iterations would let the real
+    # budget drift far past what the failure message claims -- and this sits on
+    # the critical path of every dispatch.
+    local deadline=$((SECONDS + 3))
+    while [ "$SECONDS" -lt "$deadline" ] \
+        && ! _pilot_egress_sock_connectable "$_PILOT_EGRESS_SOCK" 0.25; do
         sleep 0.1
-        i=$((i + 1))
     done
-    if ! _pilot_egress_sock_connectable "$_PILOT_EGRESS_SOCK"; then
-        echo "dispatch-lib: pilot_egress_guard.unreachable pilot-egress-proxy failed to bind $_PILOT_EGRESS_SOCK within 2s — falling back to fs-only" >&2
+    if ! _pilot_egress_sock_connectable "$_PILOT_EGRESS_SOCK" 0.25; then
+        echo "dispatch-lib: pilot_egress_guard.unreachable pilot-egress-proxy failed to bind $_PILOT_EGRESS_SOCK within 3s — falling back to fs-only" >&2
         return 1
     fi
     echo "dispatch-lib: pilot-egress-proxy launched (pid $!, log $log_file)" >&2

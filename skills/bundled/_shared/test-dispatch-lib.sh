@@ -3676,7 +3676,10 @@ echo "------------------------------------------------------------"
 # with this test. The fixture string can only appear there if the override broke.
 _REAL_EGRESS_LOG="/var/log/mika/pilot-egress-proxy.log"
 _egress_log_fixture_hits() {
-    [ -f "$_REAL_EGRESS_LOG" ] || { echo 0; return 0; }
+    # -r, not -f: a deploy run as root leaves a log this suite cannot read, and
+    # `grep -c` then exits 2 printing nothing, so the assertion would compare
+    # "0" against "" and fail for a reason unrelated to the test.
+    [ -r "$_REAL_EGRESS_LOG" ] || { echo 0; return 0; }
     # `grep -c` already prints 0 on no-match and exits 1; `|| true` swallows the
     # status without printing a second count.
     grep -c "mika#2041 test fixture" "$_REAL_EGRESS_LOG" 2>/dev/null || true

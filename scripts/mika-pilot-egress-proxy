@@ -778,17 +778,21 @@ async def run_host_mode(unix_sock_path: str) -> None:
         loop.add_signal_handler(sig, _request_stop)
 
     try:
-        async with server:
-            await stop
+        await stop
     finally:
-        # Backstop for the paths asyncio's own cleanup does not cover. Only
-        # unlink while the path is still a socket: if another proxy has already
-        # taken it, that one is not ours to remove.
-        try:
-            if sock_path.is_socket():
-                sock_path.unlink()
-        except OSError:
-            pass
+        # `close()` alone. NOT `async with server`, and not
+        # `await server.wait_closed()`: since CPython 3.12.1 wait_closed()
+        # blocks until every live client handler detaches, and a CONNECT tunnel
+        # lasts as long as the pilot session holding it. Measured on this host:
+        # with one established tunnel, SIGTERM left the proxy running past 15s.
+        # An operator would then reach for `kill -9` -- which is precisely how
+        # the orphaned socket this whole change exists to prevent gets made.
+        #
+        # No manual unlink either. asyncio's own unix cleanup runs inside
+        # close() and guards with an inode comparison, so it never removes a
+        # SUCCESSOR proxy's socket. A hand-rolled `is_socket()` check cannot
+        # tell our socket from someone else's and would delete a live one.
+        server.close()
 
 
 async def run_sandbox_mode(port: int, unix_sock_path: str) -> None:

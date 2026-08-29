@@ -578,6 +578,20 @@ class HostSocketLifecycleTests(unittest.TestCase):
             time.sleep(0.05)
         return False
 
+    def _wait_tcp(self, port: int, timeout: float = 10.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            probe = socket.socket(socket.AF_INET)
+            probe.settimeout(1)
+            try:
+                probe.connect(("127.0.0.1", port))
+                return True
+            except OSError:
+                time.sleep(0.05)
+            finally:
+                probe.close()
+        return False
+
     def _make_orphan(self) -> None:
         """Bind then close without unlinking — the shape a kill leaves behind."""
         ghost = socket.socket(socket.AF_UNIX)
@@ -611,6 +625,33 @@ class HostSocketLifecycleTests(unittest.TestCase):
             "SIGTERM left the socket behind — the orphan that arms the launcher guard",
         )
 
+    def test_sigterm_terminates_promptly_with_a_live_client(self) -> None:
+        # The regression that the first shape of this fix introduced: awaiting
+        # the server's close (via `async with server` / `wait_closed()`) blocks
+        # on every live client handler. An idle client holds one for the
+        # 10s header-read timeout; a real CONNECT tunnel holds one for the
+        # whole pilot session. Either way the operator's `kill` appears to do
+        # nothing and the next move is `kill -9` -- which orphans the socket
+        # and re-creates the class this file exists to close.
+        #
+        # An idle client is used deliberately: it needs no network, so the
+        # bound is deterministic in CI, and it still reproduces the hang.
+        proc = self._spawn_host()
+        self.assertTrue(self._wait_connectable())
+        client = socket.socket(socket.AF_UNIX)
+        client.connect(self.sock)
+        try:
+            proc.send_signal(signal.SIGTERM)
+            proc.wait(timeout=4)
+        except subprocess.TimeoutExpired:
+            self.fail(
+                "SIGTERM did not terminate the proxy within 4s while a client "
+                "was connected -- shutdown is waiting on live handlers"
+            )
+        finally:
+            client.close()
+        self.assertFalse(os.path.exists(self.sock))
+
     def test_sigint_unlinks_the_socket(self) -> None:
         proc = self._spawn_host()
         self.assertTrue(self._wait_connectable())
@@ -639,7 +680,14 @@ class HostSocketLifecycleTests(unittest.TestCase):
             stderr=subprocess.DEVNULL,
         )
         self._procs.append(shim)
-        time.sleep(1)
+        # The port was picked by binding and releasing, so another process can
+        # claim it in between and the shim dies at bind time. Assert it is
+        # actually listening before signalling it -- otherwise a shim that
+        # never started satisfies both assertions below and the test proves
+        # nothing.
+        self.assertTrue(
+            self._wait_tcp(port), f"sandbox shim never came up on port {port}"
+        )
         shim.send_signal(signal.SIGTERM)
         shim.wait(timeout=10)
         self.assertTrue(
