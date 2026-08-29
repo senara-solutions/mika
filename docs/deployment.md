@@ -110,17 +110,33 @@ Runs on every PR and push to `main`:
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test`
 
-### Release PR (`release-pr.yml`)
+### Release PR (`release-pr.yml`) — **DISABLED since 2026-08-29**
 
-Runs on push to `main` (after CI passes):
-- Uses `googleapis/release-please-action` to maintain a persistent Release PR with version bumps and changelog
-- On merge of the Release PR: creates a git tag (`v{version}`) and GitHub Release
-- No crates.io publishing — all crates are `publish = false`
-- Requires `RELEASE_PLZ_TOKEN` (PAT with `contents: write` and `pull-requests: write`)
+**This workflow no longer runs.** The `push: main` trigger was removed (mika#2047); only
+`workflow_dispatch` remains, as a manual verification path for whoever picks up the resume ticket.
+There is currently **no automated release, no automated tag, and no automated changelog** in this repo.
 
-**Important:** Uses a PAT (`RELEASE_PLZ_TOKEN`) instead of `GITHUB_TOKEN` so that the tag push triggers the release binary workflow.
+Why: release-please failed on every merge and kept `main` permanently red. Its `rust` strategy cannot
+handle our virtual workspace — it does not expand the `members = ["crates/*"]` glob, then hands the
+root `Cargo.toml` (which has no `[package]` section) to a package updater and throws. Nobody consumes
+this repo's releases — last tag `v0.12.2`, four months old — and deployment happens from `main` via
+`make deploy`. The full reasoning lives in the workflow file's header comment.
 
-### Release Binaries (`release.yml`)
+- Diagnosis: mika#2047
+- Resume ticket (what it would take to turn it back on): mika#2048
+- History of this failure class: `docs/solutions/ci-cd/release-automation-chronic-drift-2026-04-23.md`
+
+When it was live, it used `googleapis/release-please-action` to maintain a persistent Release PR with
+version bumps and changelog; merging that PR created the `v{version}` tag and GitHub Release. It never
+published to crates.io — all crates are `publish = false`. It required `RELEASE_PLZ_TOKEN` (a PAT with
+`contents: write` and `pull-requests: write`) rather than `GITHUB_TOKEN`, so that the tag push would
+trigger the release binary workflow.
+
+### Release Binaries (`release.yml`) — dormant
+
+Still enabled, but **dormant in practice**: nothing produces `v*` tags automatically since
+`release-pr.yml` was disabled (see above). It is deliberately left in place so that a manually pushed
+tag still produces binaries.
 
 Triggered by `v*` tag push:
 - Builds cross-platform binaries with `--features telemetry`: x86_64-linux, aarch64-linux (cross-compiled), x86_64-macos, aarch64-macos

@@ -1,9 +1,40 @@
-name: Release
+# DÉSACTIVÉ le 2026-08-29 — ce workflow ne se déclenche plus sur `push: main`.
+#
+# POURQUOI. Il échouait à chaque merge et teignait `main` en rouge en continu
+# (runs 2d7dfc74, 3c9149a9, b84fdbc8 et les précédents). Un `main` durablement
+# rouge apprend à ignorer le rouge : le signal était devenu un coût, pas une
+# alerte. Personne ne consomme les releases de ce dépôt — dernière étiquette
+# `v0.12.2`, quatre mois — et le déploiement se fait depuis `main` via
+# `make deploy`. Éteindre un canal de publication inutilisé coûte moins que
+# maintenir un rouge permanent qui masque les vrais.
+#
+# LA CAUSE, EXACTEMENT. Ce n'est PAS un défaut de configuration manifest :
+# release-please v4 retombe sur `release-please-config.json` et
+# `.release-please-manifest.json` par défaut, et le log du run 33245981885
+# prouve que la config est bien lue (« Building candidate release pull request
+# for path: . », « type: rust »). Ce n'est pas non plus les commits non
+# parsables : ils sont sautés sans faire échouer le run (3 sur 1190 considérés).
+#
+# La cause fatale est la stratégie `rust` face à notre workspace virtuel :
+#
+#     ⚠ member crates/* declared but did not find Cargo.toml
+#       → le glob de `members` n'est pas développé, aucun membre résolu
+#     ✖ is not a package manifest (might be a cargo workspace)
+#       → le Cargo.toml racine n'a pas de section [package], exception fatale
+#
+# CE QUI RESTE. `workflow_dispatch` est conservé DÉLIBÉRÉMENT, pas par oubli :
+# la reprise (mika#2048) aura besoin de vérifier une réparation sur un `ref` de
+# test sans pousser sur `main`. Un dispatch manuel qui échoue est un acte
+# volontaire, pas un rouge subi. Le job `update-lockfile` est laissé intact —
+# il ne peut pas devenir orphelin (`needs:` le marque *skipped*, jamais
+# *failed*) et il encode du contexte dont la reprise a besoin.
+#
+# POUR RALLUMER. mika#2048 énonce la condition (quelqu'un consomme-t-il les
+# releases ?) et les étapes. Diagnostic complet : mika#2047.
+
+name: Release (disabled — see mika#2048)
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
 permissions:
