@@ -494,6 +494,18 @@ impl TaskDispatcher {
 
         if let Err(e) = run_silent_agent(&params).await {
             warn!(task_id = %task.id, error = %e, "resume_agent run failed");
+
+            // mika#2045 — a deferred wrapper whose turn errored is consumed all
+            // the same: promotion already set it `completed`, so it has left the
+            // pending queue for good. This branch used to do nothing at all — no
+            // mark_delivered, no R9 detection, no event — which is why the
+            // 2026-08-29 09:10-09:51Z occurrence stranded four tasks without a
+            // single `deferred_dispatch_noop_completion` in the log. Re-arm here
+            // too, or the loudest failure mode stays the silent one.
+            if is_callback && task.label == crate::agent::DEFERRED_DISPATCH_LABEL {
+                self.rearm_consumed_deferred_wrapper(task, "silent_turn_error")
+                    .await;
+            }
         } else if is_callback {
             // Mark delivered so TUI polling doesn't re-process this callback.
             // Only for callbacks — reminder lifecycle is managed by fire_task().
@@ -580,6 +592,13 @@ impl TaskDispatcher {
                             {
                                 warn!(error = %e, "failed to write deferred_dispatch_noop_completion audit event");
                             }
+
+                            // mika#2045 — R9 detected the no-op but stopped at
+                            // the warning. Detection without repair is why the
+                            // 792 occurrences of this event never healed
+                            // anything. Re-arm so the parent stays dispatchable.
+                            self.rearm_consumed_deferred_wrapper(task, "noop_completion")
+                                .await;
                         }
                         Ok(true) => {
                             debug!(
@@ -1227,6 +1246,27 @@ impl TaskDispatcher {
         }
 
         true
+    }
+
+    /// mika#2045 — Replace a deferred wrapper that was consumed without
+    /// producing a real dispatch, so its parent stays dispatchable.
+    ///
+    /// `rearm_deferred_callback` owns the "did this turn actually dispatch?"
+    /// guard, so both this call site and the reaper's inherit it.
+    async fn rearm_consumed_deferred_wrapper(&self, task: &Task, cause: &str) {
+        let Some(parent_id) = task.parent_task_id.as_deref() else {
+            return;
+        };
+
+        let dispatch_class = task.dispatch_class.as_deref().unwrap_or("implement");
+        crate::skills::executor::rearm_deferred_callback(
+            &self.db,
+            parent_id,
+            &task.action_config,
+            dispatch_class,
+            cause,
+        )
+        .await;
     }
 
     /// mika#1011 — Promote the next pending deferred-dispatch callback to `completed`.

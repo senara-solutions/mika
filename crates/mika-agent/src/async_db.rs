@@ -1012,6 +1012,30 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Read `metadata.stuck_rearm_count` (mika#2045).
+    /// See [`Database::get_stuck_rearm_count`].
+    pub async fn get_stuck_rearm_count(&self, task_id: &str) -> Result<i64> {
+        let t = task_id.to_owned();
+        self.with_db(move |db| db.get_stuck_rearm_count(&t)).await
+    }
+
+    /// Increment `metadata.stuck_rearm_count` (mika#2045).
+    /// See [`Database::increment_stuck_rearm_count`].
+    pub async fn increment_stuck_rearm_count(&self, task_id: &str) -> Result<i64> {
+        let t = task_id.to_owned();
+        self.with_db(move |db| db.increment_stuck_rearm_count(&t))
+            .await
+    }
+
+    /// Cancel a parent's surviving deferred wrappers before expiry (mika#2045).
+    /// See [`Database::cancel_deferred_wrappers_of_parent`].
+    pub async fn cancel_deferred_wrappers_of_parent(&self, parent_task_id: &str) -> Result<usize> {
+        let a = self.agent_id.clone();
+        let p = parent_task_id.to_owned();
+        self.with_db(move |db| db.cancel_deferred_wrappers_of_parent(&a, &p))
+            .await
+    }
+
     /// Return ALL children of a parent task for the reaper's structured log
     /// event. See [`Database::get_reaper_child_snapshot`].
     pub async fn get_reaper_child_snapshot(

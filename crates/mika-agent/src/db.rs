@@ -7193,6 +7193,77 @@ impl Database {
         Ok(rows)
     }
 
+    /// Read `metadata.stuck_rearm_count` for a task, tolerating absent or
+    /// unreadable metadata as 0 (mika#2045).
+    ///
+    /// This counter records *repairs* only — the deferred wrappers this task
+    /// needed because an earlier one was consumed without dispatching. It is
+    /// deliberately not the count of all wrappers ever registered for the task:
+    /// the ordinary rejection path registers those, and conflating the two
+    /// would spend the repair budget on healthy queueing.
+    pub fn get_stuck_rearm_count(&self, task_id: &str) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COALESCE(
+                      CASE WHEN json_valid(metadata)
+                           THEN CAST(json_extract(metadata, '$.stuck_rearm_count') AS INTEGER)
+                      END, 0)
+             FROM tasks WHERE id = ?1",
+            params![task_id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Increment `metadata.stuck_rearm_count`, returning the new value
+    /// (mika#2045). Unreadable metadata is replaced by a fresh object rather
+    /// than raising, so a corrupt row still repairs and still terminates.
+    pub fn increment_stuck_rearm_count(&self, task_id: &str) -> Result<i64> {
+        self.conn.execute(
+            "UPDATE tasks SET
+                metadata = json_set(
+                  CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                  '$.stuck_rearm_count',
+                  COALESCE(
+                    CASE WHEN json_valid(metadata)
+                         THEN CAST(json_extract(metadata, '$.stuck_rearm_count') AS INTEGER)
+                    END, 0) + 1),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?1",
+            params![task_id],
+        )?;
+        self.get_stuck_rearm_count(task_id)
+    }
+
+    /// Cancel every deferred wrapper of a parent that is not already terminal
+    /// (mika#2045). Called immediately before expiring the parent: a wrapper
+    /// that survives the expiry can still be promoted, and would then replay a
+    /// dispatch against a dead parent while the `ready` sweep has already
+    /// created a live replacement for the same issue — a double dispatch.
+    /// Returns the number of wrappers cancelled.
+    pub fn cancel_deferred_wrappers_of_parent(
+        &self,
+        agent_id: &str,
+        parent_task_id: &str,
+    ) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE tasks
+             SET status = 'cancelled',
+                 result = 'parent expired by the stuck-pending reaper (mika#2045)',
+                 completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE agent_id = ?1
+               AND parent_task_id = ?2
+               AND label = ?3
+               AND status NOT IN ('completed', 'cancelled', 'failed', 'delivered')",
+            params![
+                agent_id,
+                parent_task_id,
+                crate::agent::DEFERRED_DISPATCH_LABEL
+            ],
+        )?;
+        Ok(n)
+    }
+
     /// Return ALL children of a parent task for the reaper's structured log event
     /// (`task_engine_reaper.evaluated`). Captures a point-in-time snapshot at kill
     /// time so post-incident diagnosis can see what the reaper saw (mika#1126).

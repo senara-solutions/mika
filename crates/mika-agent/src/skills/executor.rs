@@ -1876,6 +1876,18 @@ fn extract_dispatch_tuple(task: &crate::db::Task) -> Option<(String, i64, String
 /// Prevents unbounded queue growth from buggy or malicious dispatch loops.
 const MAX_PENDING_DEFERRED_CALLBACKS: i64 = 10;
 
+/// Repair budget per parent task (mika#2045).
+///
+/// A deferred wrapper consumed without dispatching leaves its parent orphaned.
+/// Re-arming replaces the wrapper instead of throwing the work away, but a
+/// parent whose turns never dispatch must still terminate: after this many
+/// repairs the reaper expires the task and frees its slot in
+/// `idx_tasks_manual_active_ref_url` so the `ready` sweep can create a fresh one.
+///
+/// The counter is shared by both repair paths — the inline re-arm at wrapper
+/// consumption and the reaper's — so the budget bounds the total, not each path.
+pub(crate) const MAX_STUCK_REARMS: i64 = 2;
+
 /// Register a deferred-dispatch callback when `global_dispatch_active` fires (mika#1011).
 ///
 /// Creates a `pending` callback task with `label = "long_running:run_claude_pilot:deferred"`
@@ -1986,6 +1998,157 @@ pub(crate) async fn register_deferred_callback(
             false
         }
     }
+}
+
+/// Re-arm a parent whose deferred wrapper was consumed without dispatching
+/// (mika#2045).
+///
+/// `promote_next_deferred_callback` sets the wrapper `completed`, so promotion
+/// is destructive: the wrapper leaves the `pending` queue and nothing brings it
+/// back. When the promoted turn produces no real dispatch — it errored, or it
+/// ran and called no tool — the parent is left `pending` with nothing
+/// representing it, and the partial unique index forbids a replacement.
+///
+/// This inserts a fresh `pending` wrapper and returns. It deliberately does NOT
+/// promote anything inline. That is not timidity about mika#1124's anti-cascade
+/// guard, it is the same discipline: the cascade that guard closed promoted the
+/// *next* wrapper — another task's — N times in one call stack. Re-arming
+/// inserts one row for *this* parent and hands the promotion decision back to
+/// `promote_pending_deferred_if_idle`, which checks the class slot first.
+///
+/// Returns `true` when a replacement wrapper now exists.
+pub(crate) async fn rearm_deferred_callback(
+    db: &AsyncDatabase,
+    parent_task_id: &str,
+    action_config: &str,
+    dispatch_class: &str,
+    cause: &str,
+) -> bool {
+    // Guard: if the parent already has an active non-deferred callback, the
+    // turn did dispatch and there is nothing to repair. Fail-closed on a query
+    // error — a spurious re-arm would double-dispatch, and the reaper is the
+    // backstop either way.
+    match db
+        .has_non_deferred_active_callback_child(parent_task_id)
+        .await
+    {
+        Ok(false) => {}
+        Ok(true) => return false,
+        Err(e) => {
+            warn!(
+                parent_task_id,
+                error = %e,
+                "failed to check for non-deferred callback children — not re-arming"
+            );
+            return false;
+        }
+    }
+
+    match db.get_stuck_rearm_count(parent_task_id).await {
+        Ok(count) if count >= MAX_STUCK_REARMS => {
+            warn!(
+                event = "deferred_dispatch_rearm_budget_exhausted",
+                parent_task_id,
+                rearm_count = count,
+                budget = MAX_STUCK_REARMS,
+                cause,
+                "repair budget exhausted — leaving the task for the reaper to expire"
+            );
+            return false;
+        }
+        Err(e) => {
+            warn!(parent_task_id, error = %e, "failed to read stuck_rearm_count — not re-arming");
+            return false;
+        }
+        _ => {}
+    }
+
+    match db.count_pending_deferred_callbacks().await {
+        Ok(count) if count >= MAX_PENDING_DEFERRED_CALLBACKS => {
+            warn!(
+                parent_task_id,
+                pending_count = count,
+                cap = MAX_PENDING_DEFERRED_CALLBACKS,
+                "deferred_dispatch_cap_exceeded — not re-arming"
+            );
+            return false;
+        }
+        Err(e) => {
+            warn!(parent_task_id, error = %e, "failed to count deferred callbacks — not re-arming");
+            return false;
+        }
+        _ => {}
+    }
+
+    let task = NewTask {
+        agent_id: db.agent_id().to_string(),
+        team_run_id: None,
+        parent_task_id: Some(parent_task_id.to_string()),
+        depth: 0,
+        label: crate::agent::DEFERRED_DISPATCH_LABEL.to_string(),
+        trigger_type: trigger_type::CALLBACK.to_string(),
+        cron_expr: None,
+        event_source: None,
+        event_offset_secs: None,
+        condition_expr: None,
+        next_fire_at: None,
+        timeout_at: None,
+        action_type: action_type::RESUME_AGENT.to_string(),
+        action_config: action_config.to_string(),
+        input_context: None,
+        created_by_session: None,
+        created_trace_id: None,
+        reference_url: None,
+        source: Some("deferred_dispatch_rearm".to_string()),
+        metadata: None,
+        r#type: None,
+        dispatch_class: Some(dispatch_class.to_string()),
+    };
+
+    let rearmed_id = match db.create_task(task).await {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(parent_task_id, error = %e, "failed to re-arm deferred callback");
+            return false;
+        }
+    };
+
+    let rearm_count = db
+        .increment_stuck_rearm_count(parent_task_id)
+        .await
+        .unwrap_or_else(|e| {
+            warn!(parent_task_id, error = %e, "failed to increment stuck_rearm_count");
+            0
+        });
+
+    info!(
+        event = "deferred_dispatch_rearmed",
+        parent_task_id,
+        rearmed_task_id = %rearmed_id,
+        rearm_count,
+        dispatch_class,
+        cause,
+        "deferred wrapper consumed without dispatching — replacement registered"
+    );
+
+    if let Err(e) = db
+        .log_audit_event(
+            "system",
+            "deferred_dispatch_rearmed",
+            &format!("task:{parent_task_id}"),
+            None,
+            Some("rearmed"),
+            Some(&format!(
+                "cause:{cause}, rearmed:{rearmed_id}, rearm_count:{rearm_count}"
+            )),
+            None,
+        )
+        .await
+    {
+        warn!(error = %e, "failed to write deferred_dispatch_rearmed audit event");
+    }
+
+    true
 }
 
 /// Extract `pr_url` from a task's metadata JSON.
@@ -5685,6 +5848,190 @@ mod tests {
             "expected original gate error, got: {}",
             output.content
         );
+    }
+
+    // -- rearm_deferred_callback tests (mika#2045) --
+
+    /// A `pending` self_dev issue parent plus a consumed deferred wrapper —
+    /// the shape left behind when promotion fires and the turn never dispatches.
+    async fn rearm_fixture() -> (crate::async_db::AsyncDatabase, String, String) {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        db.create_session("test-session", "mika", "cli").unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new(db);
+
+        let mut parent = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "ready-label: x/y#2045".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: Some("https://github.com/x/y/issues/2045".to_string()),
+            source: Some("self_dev".to_string()),
+            metadata: None,
+            r#type: Some("issue".to_string()),
+            dispatch_class: Some("implement".to_string()),
+        };
+        parent.depth = 0;
+        let parent_id = async_db.create_task(parent).await.unwrap();
+
+        let action_config = serde_json::json!({
+            "trigger_kind": "deferred_dispatch",
+            "original_call": {
+                "skill": "dev-pilot",
+                "prompt": "mika#2045",
+                "task_id": parent_id,
+                INTERNAL_DEFERRED_DISPATCH_FIELD: true,
+            }
+        })
+        .to_string();
+
+        (async_db, parent_id, action_config)
+    }
+
+    async fn pending_wrappers_of(db: &crate::async_db::AsyncDatabase, parent_id: &str) -> usize {
+        db.get_child_tasks(parent_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.label == crate::agent::DEFERRED_DISPATCH_LABEL && c.status == "pending")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn test_rearm_registers_replacement_wrapper() {
+        let (db, parent_id, action_config) = rearm_fixture().await;
+
+        let ok = rearm_deferred_callback(
+            &db,
+            &parent_id,
+            &action_config,
+            "implement",
+            "noop_completion",
+        )
+        .await;
+
+        assert!(ok, "re-arm must succeed with budget available");
+        assert_eq!(pending_wrappers_of(&db, &parent_id).await, 1);
+        assert_eq!(db.get_stuck_rearm_count(&parent_id).await.unwrap(), 1);
+    }
+
+    /// The replacement replays the same dispatch — including the sentinel that
+    /// keeps the open-PR guard (mika#920) from livelocking the replay.
+    #[tokio::test]
+    async fn test_rearm_preserves_action_config_and_class() {
+        let (db, parent_id, action_config) = rearm_fixture().await;
+
+        assert!(
+            rearm_deferred_callback(
+                &db,
+                &parent_id,
+                &action_config,
+                "groom",
+                "silent_turn_error"
+            )
+            .await
+        );
+
+        let wrapper = db
+            .get_child_tasks(&parent_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.label == crate::agent::DEFERRED_DISPATCH_LABEL)
+            .expect("replacement wrapper");
+
+        assert_eq!(wrapper.action_config, action_config);
+        assert_eq!(wrapper.dispatch_class.as_deref(), Some("groom"));
+        assert!(
+            wrapper
+                .action_config
+                .contains(INTERNAL_DEFERRED_DISPATCH_FIELD)
+        );
+        assert_eq!(
+            wrapper.reference_url, None,
+            "wrappers must not take the index slot"
+        );
+    }
+
+    /// Termination: the budget bounds the total repairs, so a parent whose turns
+    /// never dispatch stops being re-armed and falls to the reaper.
+    #[tokio::test]
+    async fn test_rearm_refuses_once_budget_is_exhausted() {
+        let (db, parent_id, action_config) = rearm_fixture().await;
+
+        for _ in 0..MAX_STUCK_REARMS {
+            assert!(
+                rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop").await
+            );
+            // Consume the wrapper the way promotion does.
+            for child in db.get_child_tasks(&parent_id).await.unwrap() {
+                if child.label == crate::agent::DEFERRED_DISPATCH_LABEL && child.status == "pending"
+                {
+                    db.update_task_status(&child.id, "completed").await.unwrap();
+                }
+            }
+        }
+
+        assert_eq!(
+            db.get_stuck_rearm_count(&parent_id).await.unwrap(),
+            MAX_STUCK_REARMS
+        );
+        assert!(
+            !rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop").await,
+            "budget exhausted — must refuse"
+        );
+        assert_eq!(pending_wrappers_of(&db, &parent_id).await, 0);
+    }
+
+    /// Anti-vacuity: the turn DID dispatch. Re-arming here would double-dispatch.
+    #[tokio::test]
+    async fn test_rearm_declines_when_parent_already_dispatched() {
+        let (db, parent_id, action_config) = rearm_fixture().await;
+
+        let real_callback = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: "long_running:run_claude_pilot".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        db.create_task(real_callback).await.unwrap();
+
+        assert!(
+            !rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop").await,
+            "a parent with a live dispatch must not be re-armed"
+        );
+        assert_eq!(pending_wrappers_of(&db, &parent_id).await, 0);
+        assert_eq!(db.get_stuck_rearm_count(&parent_id).await.unwrap(), 0);
     }
 
     #[tokio::test]
