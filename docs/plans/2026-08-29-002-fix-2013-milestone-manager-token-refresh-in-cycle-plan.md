@@ -147,6 +147,32 @@ variable d'environnement en v1 — décision explicite, pas une omission (voir H
   l'état persiste.
 - **AC5** — `cargo test -p mika-agent`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` verts.
 
+## Acceptance criteria
+
+<!-- Transcription des « Critères d'acceptation » ci-dessus sous la forme de cases
+     à cocher exigée par `scripts/verify-pipeline.sh` (mika#1600). La section
+     française reste la version de référence ; celle-ci ne la remplace pas. -->
+
+- [x] **AC1** — Le token du manager est re-résolu à chaque cycle, pas une seule fois au spawn.
+      Couvert par `refresh_cycle_token_swaps_in_the_new_value` (le seam) et
+      `spawn_loop_re_resolves_token_on_every_cycle` (la boucle réelle). Anti-vacuité :
+      `refresh_cycle_token_is_a_noop_when_value_is_unchanged`.
+- [x] **AC2** — `run_manager_cycle` / `run_manager_cycle_with` gardent leur signature ; les
+      tests existants de `cadence.rs` passent sans modification. Le changement de signature est
+      confiné à `spawn_manager_cycle_task`.
+- [x] **AC3** — Un `AuthClass::Unauthorized` continu depuis plus de 30 minutes produit un
+      `manager_auth_persistent_failure` en ERROR **et** une escalade sur `escalation_url` quand
+      elle est configurée, horloge injectée. Couvert par `auth_alarm_fires_after_threshold` et
+      `emit_auth_alarm_posts_to_escalation_url`. Anti-vacuité :
+      `auth_alarm_never_fires_for_non_unauthorized_classes` (dont `Other` à 31 min), le cas 29 min
+      dans `auth_alarm_fires_after_threshold`, et `emit_auth_alarm_without_escalation_url_posts_nothing`.
+- [x] **AC4** — Un cycle réussi efface l'instant de départ : 29 min + succès + 29 min ne déclenche
+      pas. Couvert par `successful_cycle_clears_the_failure_window`.
+- [x] **AC4b** — L'alarme franchie ne se ré-émet qu'au plus une fois par heure. Couvert par
+      `alarm_does_not_reemit_within_the_cooldown`.
+- [x] **AC5** — `cargo test -p mika-agent`, `cargo clippy --all-targets -- -D warnings`,
+      `cargo fmt --check` verts.
+
 ## Hors périmètre
 
 - **Les caches `github_app_token.json` par agent.** Ils se renouvellent déjà ; la mitigation manuelle
