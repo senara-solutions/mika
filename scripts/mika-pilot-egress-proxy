@@ -61,6 +61,7 @@ import asyncio
 import json
 import os
 import re
+import signal
 import socket
 import ssl
 import stat
@@ -759,8 +760,35 @@ async def run_host_mode(unix_sock_path: str) -> None:
         file=sys.stderr,
         flush=True,
     )
-    async with server:
-        await server.serve_forever()
+    # A kill does not unlink a unix socket. Without this, SIGTERM -- the default
+    # kill, and the one that took the proxy down on 2026-08-29 -- leaves the path
+    # behind as an orphan: a file that still satisfies `[ -S ]` and refuses
+    # connect(), which is exactly what armed the launcher's broken guard in
+    # dispatch-lib (mika#2041). SIGINT already unwound cleanly through
+    # KeyboardInterrupt; routing both through the same stop future makes the two
+    # signals behave alike instead of by accident.
+    loop = asyncio.get_running_loop()
+    stop = loop.create_future()
+
+    def _request_stop() -> None:
+        if not stop.done():
+            stop.set_result(None)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, _request_stop)
+
+    try:
+        async with server:
+            await stop
+    finally:
+        # Backstop for the paths asyncio's own cleanup does not cover. Only
+        # unlink while the path is still a socket: if another proxy has already
+        # taken it, that one is not ours to remove.
+        try:
+            if sock_path.is_socket():
+                sock_path.unlink()
+        except OSError:
+            pass
 
 
 async def run_sandbox_mode(port: int, unix_sock_path: str) -> None:
