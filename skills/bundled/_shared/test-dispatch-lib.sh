@@ -2898,6 +2898,28 @@ assert_eq "Negative: **Issue:** mika#9999 not matched for ISSUE_NUM=1602" \
     "NOTFOUND" \
     "$(_fip_probe 1602 '**Issue:** mika#9999' '2026-06-27-008-wrong-number-plan.md')"
 
+# mika#2038 — tier 1 refutes a candidate whose header names another issue.
+# The founding incident, verbatim: the glob `*-2026-*-plan.md` matches the
+# RustSec advisory id in this filename, and the old tier 1 returned it first,
+# so a pilot dispatched for mika#2026 ran /ce-work on an April `rand` bump.
+# The header says #539, so the candidate is refuted and no tier picks it up.
+assert_eq "mika#2038: rustsec-2026-0097 filename not returned for ISSUE_NUM=2026" \
+    "NOTFOUND" \
+    "$(_fip_probe 2026 '**Issue:** #539' '2026-04-11-003-chore-deps-bump-rand-clear-rustsec-2026-0097-plan.md')"
+
+# mika#2038 — a header-less, off-slot filename must STILL resolve at tier 1.
+# 95 of 745 real plans carry no issue marker and 490 do not honour the
+# `<date>-<NNN>-<type>-<issue>-` slot; refutation must not turn one false
+# positive into that many false negatives (mika#1421 / #1602 / #1617 lineage).
+assert_eq "mika#2038: header-less 'mika-' prefixed filename still found" \
+    "FOUND 2026-06-10-001-fix-mika-1475-deploy-info-off-main-abort-plan.md" \
+    "$(_fip_probe 1475 '## No matching header here' '2026-06-10-001-fix-mika-1475-deploy-info-off-main-abort-plan.md')"
+
+# mika#2038 — a plan whose slug cites another ticket is refuted by its header.
+assert_eq "mika#2038: plan for #1679 not returned for the #1383 it merely cites" \
+    "NOTFOUND" \
+    "$(_fip_probe 1383 'issue: 1679' '2026-06-30-011-fix-1679-dispatch-lib-mika-1383-recovery-guards-plan.md')"
+
 # Negative — header below the 50-line zone must NOT match (tier-3 zone boundary).
 # Pre-mika#1617 this was offset 30 (tier-2's 20-line zone); now tier 3 extends
 # the scan to 50 lines, so the offset must be past 50 to remain a negative case.
