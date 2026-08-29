@@ -10,11 +10,15 @@ A check that makes a forbidden pattern impossible to merge rather than discourag
 
 A structural guard is deny-by-default only to the extent its parser can model the source it reads. When it meets a form it was not built to parse it must fail closed and say so, because a partial audit and a complete one produce the same green check. A guard that can be wrong quietly is a claim, not a guard.
 
+Where the guard and the component that acts on the value parse it separately, deny-by-default binds the *detection* step too, and in the opposite direction: the guard must read at least as permissively as that component, and may be strict only in what it then allows. A guard stricter than its consumer does not fail closed, because from its own side there is nothing to judge — it stays silent while the consumer proceeds. That gap has no rejection event and no red test by construction, so it is closed by tracing the value into the consumer, not by re-reading the guard.
+
 ### Anti-vacuity assertion
 
 An assertion that proves a guard is capable of failing, by exercising it against a deliberately broken form and observing it go red. A guard that has only ever been observed passing has not been shown to test anything.
 
 The broken form is synthesized — built by mutating the current source — rather than fetched from version history, because a reference to a branch stops naming the broken state once the fix merges. A case that cannot be constructed is reported as a failure, never as a skip: a silently skipped anti-vacuity assertion is the exact condition it exists to detect.
+
+It proves the predicate that was written, not the perimeter that was intended. Every input reaching the mutated predicate had already been admitted as something to judge, so going red establishes that the decision is load-bearing and says nothing about what never got that far. Coverage of the detection step is a separate question, asked against the consumer rather than against the guard.
 
 ## Pilot containment
 

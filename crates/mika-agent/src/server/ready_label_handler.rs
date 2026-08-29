@@ -47,11 +47,11 @@ impl ReadyLabelLocation {
     /// Returns the fully-qualified `owner/repo` form, applying the
     /// `senara-solutions` default owner when the marker omits it.
     pub fn owner_repo(&self) -> String {
-        if self.repo_ref.contains('/') {
-            self.repo_ref.clone()
-        } else {
-            format!("senara-solutions/{}", self.repo_ref)
-        }
+        // Delegates so the defaulting rule lives in exactly one place — the same
+        // module that owns the dispatchable-repo allowlist (mika#2046). Two
+        // copies of "what does a bare `mika#N` mean" is how the handler and the
+        // tool-boundary gate would drift apart.
+        crate::webhook_dispatch::normalize_owner_repo(&self.repo_ref)
     }
 
     /// Returns the bare repo basename (e.g. `mika`), stripping any `owner/`
@@ -109,6 +109,62 @@ pub async fn try_handle_ready_label_dispatch(
             return VerdictAction::Passthrough { enrichment: None };
         }
     };
+
+    // 2b. Repository allowlist (mika#2046). The earliest point at which the
+    //     target repository is known, and deliberately ahead of every side
+    //     effect: no task is pre-created, no `gh issue view` subprocess runs.
+    //
+    //     The refusal returns `Handled`, never `Passthrough`. `Passthrough`
+    //     would leave `req.text` as the raw ready-label marker, which is exactly
+    //     what `webhook_ready_label_dispatch`'s trigger matches — the guard
+    //     would then re-prompt the LLM until it called `run_claude_pilot`,
+    //     dispatching the very repository this gate just refused. The pre-digest
+    //     below opens with `<ready_label_handler>` for the same reason the
+    //     prescriptive and post-dispatch digests do: it does not match the
+    //     trigger, so the guard composes by construction.
+    if !crate::webhook_dispatch::is_dispatchable_repo(&location.repo_ref) {
+        let owner_repo = location.owner_repo();
+        let allowed = crate::webhook_dispatch::dispatchable_repos_display();
+        warn!(
+            event = "ready_label_repo_not_dispatchable",
+            repo = %owner_repo,
+            num = location.number,
+            allowed = %allowed,
+            "ready_label_handler: `ready` label on a repository the loop may not \
+             dispatch into — refused before task creation"
+        );
+
+        // Operator-visible record. No `task_id` exists yet by construction —
+        // refusing before the pre-create is the point — so the audit target is
+        // the issue reference itself.
+        if let Err(e) = db
+            .log_audit_event(
+                session_id,
+                "ready_label_repo_not_dispatchable",
+                &format!("{}#{}", owner_repo, location.number),
+                None,
+                Some("dispatch_refused"),
+                Some(&format!(
+                    "repo={} number={} refused=not_in_dispatchable_repos allowed={}",
+                    owner_repo, location.number, allowed
+                )),
+                Some(trace_id),
+            )
+            .await
+        {
+            warn!(
+                event = "ready_label_audit_log_failed",
+                repo = %owner_repo,
+                num = location.number,
+                error = %e,
+                "ready_label_handler: failed to write refusal audit event (non-fatal)"
+            );
+        }
+
+        return VerdictAction::Handled {
+            pre_digest: format_repo_not_dispatchable_pre_digest(&location, &allowed),
+        };
+    }
 
     // 3. Need a GitHub token to fetch the issue body. Without it we cannot
     //    determine groomed-state, so degrade to passthrough.
@@ -484,6 +540,47 @@ async fn fetch_issue_body(loc: &ReadyLabelLocation, token: &str) -> Result<Strin
     Ok(stdout)
 }
 
+/// Pre-digest for a `ready` label on a repository outside the dispatchable
+/// allowlist (mika#2046).
+///
+/// Opens with `<ready_label_handler>` so it does not match the
+/// `webhook_ready_label_dispatch` INTENT_GUARD trigger — otherwise the guard
+/// would demand the dispatch this refusal exists to prevent. Quotes the
+/// allowlist so the operator reading it learns what would have been accepted.
+///
+/// **The `send_message` instruction below is advisory, not enforced.** Replacing
+/// `req.text` also takes the message out of the `[GitHub]` prefix domain, so
+/// `webhook_zero_tools` does not fire either: an LLM that reads this and ends
+/// its turn with no tool call is not re-prompted, and the operator learns of the
+/// refusal only from the audit event and the structured warning above. That is a
+/// degraded notification, not a silent dispatch — the refusal itself is
+/// structural and already happened. Making the notification structural too would
+/// mean an engine-side send or label removal; deliberately not done here, since
+/// it widens this gate into notification policy.
+fn format_repo_not_dispatchable_pre_digest(loc: &ReadyLabelLocation, allowed: &str) -> String {
+    format!(
+        "<ready_label_handler>\n\
+         [GitHub] Issue labeled ready on {}#{} — DISPATCH REFUSED by engine.\n\n\
+         Reason: `{}` is not a repository the autonomous loop may dispatch into.\n\
+         Dispatchable repositories: {}\n\n\
+         No task was created and no dispatch was prepared. You MUST NOT:\n\
+         - call `run_claude_pilot` or `run_claude_pilot_groom` for this issue\n\
+         - call `create_task` for this issue\n\
+         - re-add or re-trigger the `ready` label\n\n\
+         REQUIRED next action: call `send_message` once to tell the operator that \
+         `ready` was set on {}#{}, that this repository is outside the loop's \
+         allowlist, and that the work must be started as a Claude Code spawn \
+         instead. Then EndTurn.\n\
+         </ready_label_handler>",
+        loc.owner_repo(),
+        loc.number,
+        loc.owner_repo(),
+        allowed,
+        loc.owner_repo(),
+        loc.number,
+    )
+}
+
 /// Build the prescriptive pre-digest delivered to the LLM in place of the raw
 /// ready-label marker text.
 ///
@@ -738,6 +835,83 @@ mod tests {
     fn unparseable_created_at_reports_zero_age() {
         assert_eq!(task_age_secs("not a timestamp"), 0);
         assert!(task_age_secs("2020-01-01T00:00:00Z") > 0);
+    }
+
+    /// mika#2046 — the refusal digest must not re-arm the intent guard it is
+    /// meant to sidestep. Asserted through the predicate the guard actually
+    /// calls, not by eyeballing the string.
+    #[test]
+    fn refusal_pre_digest_does_not_trigger_the_ready_label_intent_guard() {
+        let loc = ReadyLabelLocation {
+            repo_ref: "senara-solutions/control-monitor".to_string(),
+            number: 159,
+        };
+        let digest = format_repo_not_dispatchable_pre_digest(
+            &loc,
+            &crate::webhook_dispatch::dispatchable_repos_display(),
+        );
+        assert!(digest.starts_with("<ready_label_handler>"));
+        assert!(
+            !crate::webhook_dispatch::is_ready_label_dispatch_marker(&digest),
+            "refusal digest must not match the ready-label trigger, or the guard \
+             would demand the dispatch this refusal prevents"
+        );
+    }
+
+    #[test]
+    fn refusal_pre_digest_names_the_repo_and_quotes_the_allowlist() {
+        let loc = ReadyLabelLocation {
+            repo_ref: "senara-solutions/claude-pilot".to_string(),
+            number: 119,
+        };
+        let allowed = crate::webhook_dispatch::dispatchable_repos_display();
+        let digest = format_repo_not_dispatchable_pre_digest(&loc, &allowed);
+        assert!(digest.contains("senara-solutions/claude-pilot"));
+        assert!(digest.contains("119"));
+        assert!(digest.contains("DISPATCH REFUSED"));
+        for repo in crate::webhook_dispatch::DISPATCHABLE_REPOS {
+            assert!(
+                digest.contains(repo),
+                "refusal must quote {repo} so the operator sees what is allowed"
+            );
+        }
+        assert!(digest.contains("send_message"));
+    }
+
+    /// The positive half of the anti-vacuity requirement: a gate that refused
+    /// everything would pass the negative tests above.
+    #[test]
+    fn loop_repos_are_not_caught_by_the_allowlist_gate() {
+        for marker in [
+            "[GitHub] Issue labeled ready on senara-solutions/mika#2046 — title",
+            "[GitHub] Issue labeled ready on mika#2046 — title",
+            "[GitHub] Issue labeled ready on senara-solutions/mika-cloud#127 — title",
+            "[GitHub] Issue labeled ready on mika-skills#8 — title",
+            "[GitHub] Issue labeled ready on mika-platform#58 — title",
+        ] {
+            let loc = parse_ready_label_location(marker).expect("marker should parse");
+            assert!(
+                crate::webhook_dispatch::is_dispatchable_repo(&loc.repo_ref),
+                "{marker} must still reach dispatch"
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_cc_only_repos_are_caught_by_the_allowlist_gate() {
+        for marker in [
+            "[GitHub] Issue labeled ready on senara-solutions/control-monitor#159 — title",
+            "[GitHub] Issue labeled ready on control-monitor#159 — title",
+            "[GitHub] Issue labeled ready on senara-solutions/claude-pilot#119 — title",
+            "[GitHub] Issue labeled ready on claude-pilot#119 — title",
+            "[GitHub] Issue labeled ready on another-org/mika#1 — title",
+        ] {
+            let loc = parse_ready_label_location(marker).expect("marker should parse");
+            assert!(
+                !crate::webhook_dispatch::is_dispatchable_repo(&loc.repo_ref),
+                "{marker} must be refused before task creation"
+            );
+        }
     }
 
     #[test]

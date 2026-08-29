@@ -1056,6 +1056,40 @@ pub(crate) async fn validate_dispatch_readiness(
         return Err(rejection.to_string());
     }
 
+    // mika#2046 — Tool-boundary gate for the dispatchable-repository allowlist.
+    // Pure string handling, no DB access, so it sits with the other cheap checks
+    // ahead of the task fetch.
+    //
+    // This is the load-bearing layer. `run_claude_pilot` spawns a subprocess and
+    // creates a worktree, so a guard that only fires after the tool has run
+    // detects the violation without preventing it
+    // (docs/solutions/architecture-patterns/post-hoc-vs-tool-boundary-guard-placement-2026-05-13.md).
+    // The pre-LLM ready-label handler refuses the webhook path; this refuses
+    // every path, whatever originated the turn.
+    if let Some(prompt) = tool_input
+        .and_then(|input| input.get("prompt"))
+        .and_then(|v| v.as_str())
+        && let Some(repo_ref) = crate::webhook_dispatch::parse_repo_ref_from_dispatch_prompt(prompt)
+        && !crate::webhook_dispatch::is_dispatchable_repo(repo_ref)
+    {
+        let owner_repo = crate::webhook_dispatch::normalize_owner_repo(repo_ref);
+        let allowed = crate::webhook_dispatch::dispatchable_repos_display();
+        let rejection = serde_json::json!({
+            "error": "repo_not_dispatchable",
+            "task_id": task_id,
+            "repo": owner_repo,
+            "reason": format!(
+                "`{owner_repo}` is not a repository the autonomous loop may dispatch \
+                 into. Dispatchable repositories: {allowed}. Repositories outside \
+                 this list are Claude Code spawn territory and are never reached by \
+                 the loop; this is a structural gate, not a transient failure, so \
+                 retrying the dispatch will not clear it (mika#2046)."
+            )
+        });
+        record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+        return Err(rejection.to_string());
+    }
+
     // Re-fetch the task to get the full struct (validate_task confirmed existence)
     let task = match db.get_task(task_id).await {
         Ok(Some(t)) => t,
@@ -5192,6 +5226,144 @@ mod tests {
             "prompt": prompt,
             "task_id": task_id,
         })
+    }
+
+    // ---- mika#2046: the dispatchable-repository allowlist, tool-boundary layer ----
+
+    /// A spawn-CC-only repository is refused before the subprocess can spawn,
+    /// with the named error and the allowlist quoted, and the refusal is written
+    /// to `tasks.result` for operator visibility.
+    #[tokio::test]
+    async fn test_repo_allowlist_refuses_control_monitor() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+
+        let input = pilot_input("dev-pilot", "control-monitor#159", &wi_id);
+        let result = validate_dispatch_readiness(&async_db, &wi_id, None, Some(&input), None).await;
+
+        let err = result.expect_err("control-monitor must be refused");
+        let parsed: serde_json::Value = serde_json::from_str(&err).unwrap();
+        assert_eq!(parsed["error"], "repo_not_dispatchable");
+        assert_eq!(parsed["repo"], "senara-solutions/control-monitor");
+        assert_eq!(parsed["task_id"], wi_id);
+        let reason = parsed["reason"].as_str().unwrap();
+        for repo in crate::webhook_dispatch::DISPATCHABLE_REPOS {
+            assert!(reason.contains(repo), "refusal must quote {repo}");
+        }
+
+        let task = async_db.get_task(&wi_id).await.unwrap().unwrap();
+        let stored = task
+            .result
+            .expect("rejection should be written to tasks.result");
+        assert!(stored.contains("repo_not_dispatchable"));
+    }
+
+    #[tokio::test]
+    async fn test_repo_allowlist_refuses_claude_pilot_and_foreign_owner() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        for prompt in ["claude-pilot#119", "another-org/mika#1"] {
+            let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+            let input = pilot_input("dev-pilot", prompt, &wi_id);
+            let result =
+                validate_dispatch_readiness(&async_db, &wi_id, None, Some(&input), None).await;
+            let err = result.expect_err("{prompt} must be refused");
+            assert!(
+                err.contains("repo_not_dispatchable"),
+                "{prompt} should hit the allowlist gate, got: {err}"
+            );
+        }
+    }
+
+    /// The positive half. These must not be refused *by this gate* — they may
+    /// still be rejected downstream for unrelated reasons, so the assertion is
+    /// specifically about `repo_not_dispatchable`.
+    #[tokio::test]
+    async fn test_repo_allowlist_lets_the_loop_repos_through() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        for prompt in [
+            "mika#2046",
+            "mika-cloud#50",
+            "mika-skills#8",
+            "mika-platform#58",
+            "senara-solutions/mika#2046",
+        ] {
+            let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+            let input = pilot_input("dev-pilot", prompt, &wi_id);
+            let result =
+                validate_dispatch_readiness(&async_db, &wi_id, None, Some(&input), None).await;
+            if let Err(err) = result {
+                assert!(
+                    !err.contains("repo_not_dispatchable"),
+                    "{prompt} must not be caught by the allowlist gate, got: {err}"
+                );
+            }
+        }
+    }
+
+    /// A free-text dispatch resolves no repository, so the gate has nothing to
+    /// judge and must not refuse it — including free text containing a `#`.
+    #[tokio::test]
+    async fn test_repo_allowlist_ignores_free_text_prompts() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        for prompt in [
+            "fix the ready-label handler",
+            "please look at control-monitor#159 when you get a chance",
+        ] {
+            let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+            let input = pilot_input("dev-pilot", prompt, &wi_id);
+            let result =
+                validate_dispatch_readiness(&async_db, &wi_id, None, Some(&input), None).await;
+            if let Err(err) = result {
+                assert!(
+                    !err.contains("repo_not_dispatchable"),
+                    "free text must not hit the allowlist gate, got: {err}"
+                );
+            }
+        }
+    }
+
+    /// Regression for the review finding on mika#2046: `dispatch-lib.sh:769`
+    /// reads the prompt through command substitution, which strips the trailing
+    /// newline — so this string reaches the shell as `control-monitor#159` and
+    /// creates a worktree there. The gate must refuse it too.
+    #[tokio::test]
+    async fn test_repo_allowlist_refuses_a_trailing_newline_prompt() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+
+        let input = pilot_input("dev-pilot", "control-monitor#159\n", &wi_id);
+        let result = validate_dispatch_readiness(&async_db, &wi_id, None, Some(&input), None).await;
+
+        let err = result.expect_err("a trailing newline must not bypass the gate");
+        assert!(err.contains("repo_not_dispatchable"), "got: {err}");
+    }
+
+    /// Locks the check ordering: the allowlist gate runs before the task fetch,
+    /// so it does not silently become dependent on task existence. A refactor
+    /// that moved it below `get_task` would surface here as `task_not_found`.
+    #[tokio::test]
+    async fn test_repo_allowlist_runs_before_the_task_fetch() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let input = pilot_input("dev-pilot", "control-monitor#159", "no-such-task-id");
+        let result =
+            validate_dispatch_readiness(&async_db, "no-such-task-id", None, Some(&input), None)
+                .await;
+
+        let err = result.expect_err("must be refused");
+        assert!(
+            err.contains("repo_not_dispatchable"),
+            "the allowlist gate must fire before the task fetch, got: {err}"
+        );
     }
 
     /// Scenario 1: Re-dispatch with open PR and no `iteration_context` → rejection.
