@@ -401,8 +401,6 @@ pub struct Report {
 pub fn analyze(log: &str, manifest: &HashMap<String, Reliability>) -> Report {
     let events = parse_turn_usage_lines(log);
 
-    // Group by run, preserving log order within a run (`recalculations` reads
-    // adjacency).
     let mut by_run: HashMap<&str, Vec<&TurnUsage>> = HashMap::new();
     for e in &events {
         by_run.entry(&e.session_id).or_default().push(e);
@@ -412,16 +410,31 @@ pub fn analyze(log: &str, manifest: &HashMap<String, Reliability>) -> Report {
     let mut covariates: HashMap<Cell, Vec<Covariates>> = HashMap::new();
     let mut runs_analyzed = 0;
 
-    for (session, turns) in &by_run {
-        let Some(confidence) = turns
-            .first()
-            .and_then(|t| Confidence::from_agent_id(&t.agent_id))
-        else {
+    for (session, turns) in &mut by_run {
+        // A run is one session of one agent. A session carrying events from
+        // more than one agent is not an RT-005 run — reading the arm off the
+        // first event would silently assign a mixed run to a cell, so drop it.
+        let Some(agent) = turns.first().map(|t| t.agent_id.as_str()) else {
+            continue;
+        };
+        if turns.iter().any(|t| t.agent_id != agent) {
+            continue;
+        }
+        let Some(confidence) = Confidence::from_agent_id(agent) else {
             continue;
         };
         let Some(&reliability) = manifest.get(*session) else {
             continue;
         };
+
+        // Order by `step`, the emitter's own turn index, rather than by
+        // position in the file: nothing guarantees a multi-threaded writer
+        // appends a session's lines in turn order, and `recalculations` reads
+        // adjacency. The `u32::MAX` continuation sentinel sorts last, which is
+        // where the continuation turn belongs. The estimand is a sum and does
+        // not depend on order — only the covariate does.
+        turns.sort_by_key(|t| t.step);
+
         let cell = (confidence, reliability);
         planning
             .entry(cell)
@@ -722,6 +735,36 @@ mod tests {
             event("s1", HIGH, 2, 10, false), // re-deliberate  <- 1
             event("s1", HIGH, 3, 10, true),  // act
             event("s1", HIGH, 4, 10, false), // re-deliberate  <- 2
+        ]
+        .join("\n");
+        let report = analyze(&log, &manifest(&[("s1", Reliability::Fiable)]));
+        let (turns, handshakes, recalcs, _) =
+            report.covariates.cells[&(Confidence::High, Reliability::Fiable)];
+        assert_eq!((turns, handshakes, recalcs), (5.0, 2.0, 2.0));
+    }
+
+    #[test]
+    fn a_session_mixing_two_agents_is_dropped_not_assigned_by_its_first_event() {
+        let log = [
+            event("s1", HIGH, 0, 100, false),
+            event("s1", LOW, 1, 900, false),
+        ]
+        .join("\n");
+        let report = analyze(&log, &manifest(&[("s1", Reliability::Fiable)]));
+        assert_eq!(report.runs_analyzed(), 0);
+        assert_eq!(report.interaction().high.value(), None);
+    }
+
+    #[test]
+    fn covariates_read_turn_order_from_step_not_from_line_order() {
+        // Same five turns as the recalculations test, written out of order.
+        // Nothing guarantees a multi-threaded writer appends in turn order.
+        let log = [
+            event("s1", HIGH, 4, 10, false),
+            event("s1", HIGH, 1, 10, true),
+            event("s1", HIGH, 3, 10, true),
+            event("s1", HIGH, 0, 10, false),
+            event("s1", HIGH, 2, 10, false),
         ]
         .join("\n");
         let report = analyze(&log, &manifest(&[("s1", Reliability::Fiable)]));
