@@ -659,6 +659,39 @@ class HostSocketLifecycleTests(unittest.TestCase):
         proc.wait(timeout=10)
         self.assertFalse(os.path.exists(self.sock))
 
+    def test_shutdown_does_not_unlink_a_successors_socket(self) -> None:
+        # The property the inode comparison buys, and the reason an
+        # `is_socket()` check is not enough: it is equally true of a DIFFERENT
+        # proxy's live socket. A launcher that starts a replacement while the
+        # old one is still winding down must not end up with a running proxy
+        # whose path was deleted underneath it -- that state is invisible to
+        # every liveness probe and makes the launcher spawn a new proxy on
+        # every subsequent dispatch.
+        first = self._spawn_host()
+        self.assertTrue(self._wait_connectable())
+        first_ino = os.stat(self.sock).st_ino
+
+        second = self._spawn_host()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                if os.stat(self.sock).st_ino != first_ino:
+                    break
+            except FileNotFoundError:
+                pass
+            time.sleep(0.05)
+        else:
+            self.fail("successor proxy never took over the path")
+        self.assertTrue(self._wait_connectable())
+
+        first.send_signal(signal.SIGTERM)
+        first.wait(timeout=10)
+        self.assertTrue(
+            self._connectable(),
+            "the retiring proxy deleted its successor's live socket",
+        )
+        self.assertIsNone(second.poll())
+
     def test_sandbox_mode_never_unlinks_the_unix_socket(self) -> None:
         # The sandbox side connects to the socket; it does not own it. A shutdown
         # there must leave the host's socket standing.

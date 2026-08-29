@@ -32,13 +32,15 @@ Two independent mistakes, both invisible from reading the diff alone.
 
 Even with no tunnel, an idle connected client holds a handler for the 10s header-read timeout, which is what makes this reproducible in CI without network.
 
-**2. The hand-rolled `finally` unlink was not a backstop but a strictly worse duplicate.** It guarded with `sock_path.is_socket()`, which is equally true of a *different* proxy's live socket. asyncio's own unix cleanup already runs inside `close()` and guards correctly, by inode:
+**2. The hand-rolled `finally` unlink guarded with `sock_path.is_socket()`, which is equally true of a *different* proxy's live socket.** The right guard is the one asyncio itself uses from 3.13 — compare the inode captured at bind time:
 
 ```python
 # CPython asyncio/unix_events.py, _UnixSelectorEventLoop._stop_serving
 if os.stat(path).st_ino == prev_ino:
     os.unlink(path)
 ```
+
+**Do not conclude from that snippet that the runtime handles it for you.** That bookkeeping arrived with `create_unix_server`'s `cleanup_socket` parameter in **Python 3.13**. Older interpreters never unlink the socket file at all. Deleting the manual cleanup because the local interpreter (3.14) covered the gap turned every shutdown path into an orphan on 3.12 and on CI's ubuntu-22.04 / 3.10 — three test failures that were green locally. The correct shape keeps the unlink and borrows 3.13's *guard*, tolerating `FileNotFoundError` for the versions that got there first.
 
 Combined with defect 1 the two compose into a concrete failure: proxy A wedges in `wait_closed`, the launcher starts proxy B, B binds a fresh socket at the same path, A's tunnel eventually closes, and A's `finally` deletes B's live socket — leaving a running proxy with no path and a launcher that spawns another one on every dispatch.
 
@@ -47,10 +49,18 @@ Combined with defect 1 the two compose into a concrete failure: proxy A wedges i
 `close()` alone. No context manager, no `wait_closed()`, no manual unlink:
 
 ```python
+    # after start_unix_server + chmod
+    bound_ino = os.stat(sock_path).st_ino
+    ...
     try:
         await stop
     finally:
         server.close()
+        try:
+            if os.stat(sock_path).st_ino == bound_ino:
+                os.unlink(sock_path)
+        except FileNotFoundError:
+            pass   # 3.13+ already removed it
 ```
 
 `close()` runs asyncio's inode-guarded unix cleanup synchronously, so the socket is unlinked and a successor's is never touched. Returning from the coroutine lets `asyncio.run()` cancel the remaining handler tasks. Measured after the fix: the same established-tunnel scenario terminates in 1s with no residual socket, and the suite's own runtime dropped from 1.6s to 0.8s.
@@ -60,4 +70,5 @@ Combined with defect 1 the two compose into a concrete failure: proxy A wedges i
 - **`async with server:` is not free.** On any server whose handlers are long-lived — tunnels, streams, websockets, SSE — it converts shutdown into "wait for every client to leave". Use it only where handlers are short and bounded.
 - **Test shutdown with a connection open.** A shutdown test against an idle server exercises the one path that was never in question. The regression test here connects a client and asserts termination within 4s; it fails against the defective shape and passes after.
 - **Before hand-rolling cleanup next to a library's own, read the library's.** The manual unlink was written from the assumption that asyncio might not cover the case. Reading `_stop_serving` would have shown it covers the case *better*, with a check the hand-rolled version could not express.
+- **A green local suite on one interpreter is not a green suite.** The whole shutdown path is version-sensitive here — `wait_closed()` semantics changed in 3.12.1, socket cleanup in 3.13 — and the local 3.14 masked a defect that CI's 3.10 caught immediately. Running the suite under the oldest interpreter that is actually in the matrix takes seconds and would have caught it before the push.
 - Both defects were found by code review, not by the tests written alongside the change — the tests asserted the socket was gone, which was true, while the process stayed alive. **"The artifact is in the expected state" is not "the operation completed."**

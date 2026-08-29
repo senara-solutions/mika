@@ -754,6 +754,14 @@ async def run_host_mode(unix_sock_path: str) -> None:
     # World-writable so the sandbox (running as same uid, but env-cleared) can
     # still connect through the bwrap-mounted socket path.
     sock_path.chmod(0o666)
+
+    # Remember the inode we just bound. Shutdown uses it to tell OUR socket from
+    # a successor proxy's: `is_socket()` is equally true of someone else's live
+    # path, and deleting that leaves a running proxy unreachable.
+    try:
+        bound_ino = os.stat(sock_path).st_ino
+    except OSError:
+        bound_ino = None
     print(
         f"[egress] host-unix listening on {sock_path} (allowlist: "
         f"{len(HOST_ALLOWLIST)} hosts)",
@@ -780,19 +788,29 @@ async def run_host_mode(unix_sock_path: str) -> None:
     try:
         await stop
     finally:
-        # `close()` alone. NOT `async with server`, and not
-        # `await server.wait_closed()`: since CPython 3.12.1 wait_closed()
-        # blocks until every live client handler detaches, and a CONNECT tunnel
-        # lasts as long as the pilot session holding it. Measured on this host:
-        # with one established tunnel, SIGTERM left the proxy running past 15s.
-        # An operator would then reach for `kill -9` -- which is precisely how
-        # the orphaned socket this whole change exists to prevent gets made.
-        #
-        # No manual unlink either. asyncio's own unix cleanup runs inside
-        # close() and guards with an inode comparison, so it never removes a
-        # SUCCESSOR proxy's socket. A hand-rolled `is_socket()` check cannot
-        # tell our socket from someone else's and would delete a live one.
+        # `close()`, and NOT `async with server` / `await server.wait_closed()`:
+        # since CPython 3.12.1 wait_closed() blocks until every live client
+        # handler detaches, and a CONNECT tunnel lasts as long as the pilot
+        # session holding it. Measured: with one established tunnel, SIGTERM
+        # left the proxy running past 15s. An operator whose kill does nothing
+        # reaches for `kill -9` -- which is precisely how the orphaned socket
+        # this whole change exists to prevent gets made.
         server.close()
+
+        # asyncio removes the socket file itself only from 3.13, where
+        # create_unix_server grew `cleanup_socket` and the inode bookkeeping
+        # behind it. Older interpreters never unlink -- measured on 3.12 and on
+        # CI's ubuntu-22.04/3.10, where every shutdown path left the socket
+        # behind. So do it here, with the same inode comparison 3.13+ uses, and
+        # tolerate the file already being gone when the runtime got there first.
+        if bound_ino is not None:
+            try:
+                if os.stat(sock_path).st_ino == bound_ino:
+                    os.unlink(sock_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
 
 
 async def run_sandbox_mode(port: int, unix_sock_path: str) -> None:
