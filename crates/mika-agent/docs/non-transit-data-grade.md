@@ -227,22 +227,78 @@ If a future change does NEITHER, the only remaining defense is Layer 1 (the
 prompt) — the fragile layer the doctrine explicitly distrusts. **This is
 the single axis of vigilance for every future testimony-adjacent change.**
 
+### Applied hardening (closed after mika#1798)
+
+- **`shell-exec` command-line bypass — CLOSED by mika#1957.** The `shell-exec`
+  skill accepts shell commands and runs them via `eval`. Its original
+  per-command block-list inspected only the first token
+  (`awk '{print $1}'`), so every shape that reached `gws`/`gh` through a
+  subshell (`sh -c 'gws ...'`, `bash -c "gws ..."`, `eval "gws ..."`), a pipe
+  into a shell (`echo 'gws ...' | sh`), a path prefix (`/usr/bin/gws ...`), a
+  statement separator (`pwd; gws ...`, `true && gws ...`, a newline), or a
+  command substitution (`` `gws ...` ``, `$(gws ...)`) walked past it — and
+  bypassed all four L1–L4 layers with it, because the call never entered the
+  `run_gws` builtin handler.
+
+  `crates/mika-agent/templates/skills/shell-exec/handlers/run.sh` now runs a
+  lexical scan of the whole command string on an identifier boundary
+  (`(^|[^A-Za-z0-9_.-])(gws|gh)([^A-Za-z0-9_.-]|$)`), which subsumes
+  whitespace, both quote characters, `;`, `|`, `&`, backtick, `$`, `(`, and
+  `/`. Regression suite:
+  `crates/mika-agent/tests/shell_exec_l3_hardening.rs` (20 cases — every
+  bypass shape above, the two first-word regressions, and six
+  false-positive guards).
+
+  **Tier characterisation, corrected.** The pre-mika#1957 text in this section
+  said "personal-tier agents ship with `shell-exec` in
+  `DEFAULT_AGENT_SKILL_ALLOWLIST`". That conflated two things.
+  `DEFAULT_AGENT_SKILL_ALLOWLIST` backs `AgentTier::Default`, the
+  **operator/orchestrator** persona, where `shell-exec` is load-bearing for the
+  orchestrator seat (mika#1641). The **family** tier — the population this
+  doctrine exists to protect — is `FAMILY_AGENT_SKILL_ALLOWLIST` (mika#1778),
+  which has never contained `shell-exec`, with a test in
+  `crates/mika-common/src/home.rs` asserting the exclusion. Removing
+  `shell-exec` from the Default allowlist was therefore rejected: it would have
+  regressed mika#1641 for no added coverage, since the `run.sh` scan fires for
+  every tier regardless of which allowlist granted the skill.
+
+  **Deliberately not closed.** The scan is lexical, so any shape that hides the
+  literal token from a byte-level match still reaches the CLI. That class is
+  wider than encoding tricks, and the measured members are:
+
+  | Shape | Example |
+  |---|---|
+  | Token splitting | `g""ws gmail …`, `g''ws gmail …`, `gw\s gmail …` |
+  | Glob expansion | `/usr/bin/gw[s] gmail …`, `/usr/bin/gw? gmail …` |
+  | Variable assembly | `A=g; B=ws; $A$B gmail …` |
+  | Encoded payload | `echo <base64> \| base64 -d \| sh` |
+  | Renamed / aliased binary | `PATH=/tmp:$PATH gws-alias gmail …` |
+
+  Closing these would require parsing shell grammar, which is an arms race with
+  no fixed point — so the scan is scoped to the casual and incidental path,
+  which is where observed traffic sits. For every row above, the registry ban
+  (L2) and the execute-time guard (L4) still fire at the real tool call, after
+  the command has resolved. **This layer narrows the surface; it does not
+  eliminate it, and it must not be cited as though it did.**
+
+- **Deliberate false-positive.** The scan is lexical, so a command that merely
+  *mentions* `gws` or `gh` on an identifier boundary is refused too — e.g.
+  `grep gws /etc/services`. Accepted: `shell-exec` is a command-execution
+  surface, and separating "mention" from "invoke" would require parsing the
+  shell grammar. Ordinary paths and refs are unaffected (`.github/...`,
+  `gh-pages`, `/tmp/gws.log` all pass), because `.` and `-` are excluded from
+  the boundary class.
+
 ### Known bypass classes (out of scope for mika#1798, tracked separately)
 
 The four-layer defense covers the `run_gws` builtin surface + any future
-tool that declares `data_grade = "testimony"`. It does NOT cover:
+tool that declares `data_grade = "testimony"`. With the `shell-exec` class
+closed above, it still does NOT cover:
 
-- **`shell-exec` command-line bypass** — the `shell-exec` skill accepts
-  shell commands and runs them via `eval`. Its per-command allowlist
-  (`awk '{print $1}'`) is trivially defeated by absolute paths (`/usr/bin/gws
-  gmail ...`), env-wrapping (`env gws ...`, `sh -c 'gws ...'`), or
-  `PATH=/tmp:$PATH` shadowing. A determined caller can invoke Gmail via
-  `shell-exec` and bypass all four L1–L4 layers because the call never
-  enters the `run_gws` builtin handler. The `shell-exec` allowlist itself
-  is orthogonal to this doctrine; hardening it (e.g., canonicalize path
-  + block `sh -c`/`eval`/`env` prefixes) is a follow-up. **Personal-tier
-  agents ship with `shell-exec` in `DEFAULT_AGENT_SKILL_ALLOWLIST` — the
-  bypass class is live in default configuration.**
+- **Raw-HTTP API surfaces** — a direct
+  `curl -X POST https://gmail.googleapis.com/...` reaches testimony data
+  without touching the `gws` CLI, so neither the mika#1957 scan nor L1–L4
+  fires. Closing this needs the doctrine extended to the HTTP egress surface.
 - **Registry-ban callsite drift** — the four-layer defense wires Phase 2
   at every `SkillRegistry::from_dir` callsite via manual pairing
   (~12 sites). Adding a new skill-loading site without pairing
@@ -264,6 +320,7 @@ tool that declares `data_grade = "testimony"`. It does NOT cover:
   shares the "Mika ne doit pas verbaliser/proposer certaines choses"
   surface.
 - **Companion class:** mika#1814 (companion class per issue body).
+- **Follow-up (F3, closed):** mika#1957 — `shell-exec` L3 hardening.
 - **Memory anchors:** `feedback_prompt_enforcement_fragile`,
   `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`,
   `project_mika_prime_self_model_bounds`.
@@ -282,6 +339,13 @@ tool that declares `data_grade = "testimony"`. It does NOT cover:
 
 ## Change log
 
+- **2026-08-27** — mika#1957: `shell-exec` bypass class closed by a lexical
+  command-string scan in the skill's `run.sh`; moved from § Known bypass
+  classes to § Applied hardening. Corrected this document's own tier
+  characterisation (Default = operator/orchestrator, not personal; the family
+  tier never carried `shell-exec`). Tier-1 removal of `shell-exec` from
+  `DEFAULT_AGENT_SKILL_ALLOWLIST` was proposed and rejected — it would have
+  regressed the mika#1641 orchestrator seat for no added coverage.
 - **2026-08-22** — Initial doctrine baked in mika#1798 across four
   structural layers plus this doc. Trigger incident: 2026-07-18 Prime
   ratification via samidarko relay (Vincent-ratified).

@@ -134,7 +134,8 @@ impl Tool for RunTeamTool {
             team_db.clone(),
             None,
             self.github_app.clone(),
-            None, // run_team tool: no AppState access for session-scoped dedup (#821)
+            None,     // run_team tool: no AppState access for session-scoped dedup (#821)
+            ctx.tier, // mika#1962 — cached at agent init, never re-read here
         )
         .await;
         team_db.shutdown();

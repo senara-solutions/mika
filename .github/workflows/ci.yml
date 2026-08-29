@@ -81,6 +81,9 @@ jobs:
       - name: Verify bundled skills structural invariants (mika#1575)
         run: make verify-bundled-skills
 
+      - name: Dispatch-lib assertion suite (mika#1772)
+        run: make test-dispatch-lib
+
       - name: Test (with telemetry feature)
         run: cargo test --workspace --features telemetry
 
@@ -195,13 +198,38 @@ jobs:
       - name: Enforce no-log discipline on egress substrate (mika#1810 E4)
         run: bash scripts/verify-egress-no-log.sh
 
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+        with:
+          fetch-depth: 0
+      - name: Scan changed files for secrets and oversized blobs (mika#1689)
+        run: bash scripts/check-secrets.sh --changed origin/main
+
+  pilot-egress-status-tap:
+    name: Pilot Egress Status Tap
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      - name: Verify the pilot egress-proxy upstream-status tap (mika#1901)
+        run: python3 -B scripts/test-pilot-egress-proxy-status.py
+
   pipeline-artifacts:
     name: Pipeline Artifacts
     runs-on: ubuntu-22.04
+    # Exclusions de branche : ces auteurs automatiques ne peuvent structurellement
+    # pas produire l'artefact que le gate exige. Dependabot n'écrit ni plan doc ni
+    # trailer `Pipeline-Exempt:` (mika#860) — activer dependabot.yml sans cette
+    # ligne a bloqué 11 PRs vertes par ailleurs (mika#2010).
+    # Le gate reste entier pour tout le reste : un head_ref hors de ces préfixes
+    # continue de REJECT sur une PR code-only sans plan.
     if: >-
       github.event_name == 'pull_request' &&
       !startsWith(github.head_ref, 'release/') &&
-      !startsWith(github.head_ref, 'release-please--')
+      !startsWith(github.head_ref, 'release-please--') &&
+      !startsWith(github.head_ref, 'dependabot/')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
         with:
@@ -257,7 +285,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2  # v3
       - name: Build ${{ matrix.tag }}
-        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83  # v6
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v6
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -298,7 +326,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2  # v3
       - name: Build ${{ matrix.tag }}
-        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83  # v6
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v6
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -345,7 +373,7 @@ jobs:
           df -h /
           docker system df
       - name: Build mika-runtime-cli
-        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83  # v6
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v6
         with:
           context: .
           file: os/Dockerfile

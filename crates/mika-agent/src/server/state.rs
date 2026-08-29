@@ -62,6 +62,26 @@ pub struct AgentState {
     /// all KG subsystem construction; `Enabled` provides the validated docs_root
     /// and precomputed docs_root_hash for the three KG startup loops.
     pub kg_config: KgAgentConfig,
+    /// Agent tier resolved ONCE at `init_agent` time from `MIKA_AGENT_TIER`
+    /// (mika#1962). Every `ToolContext` for this agent reads the tier from
+    /// here rather than calling `AgentTier::from_env()` per construction.
+    ///
+    /// **Why cached.** The env var is process-global and mutable: a K8s
+    /// ConfigMap edit, a systemd drop-in change, or a `docker exec` can change
+    /// what `from_env()` returns while agents are running. Re-reading it per
+    /// turn would let a family being silently start answering under operator
+    /// semantics mid-lifetime, while its on-disk persona and allowlist still
+    /// say family. Reading once at init fixes the tier for the container's
+    /// lifetime, which is the contract the provisioning model already assumes
+    /// (`write_default_if_missing` never rewrites a persona either).
+    ///
+    /// Composes with `server::tier_guard`: the guard fails startup when disk
+    /// and env disagree at boot; this field guarantees the agents that did
+    /// start stay consistent afterwards.
+    ///
+    /// Setting `MIKA_AGENT_TIER` on an already-running process has no effect
+    /// by design. Deploy discipline is to set it before first startup.
+    pub tier: mika_common::home::AgentTier,
     /// Canonical session ID for singleton agents (mika#1401). `Some` when the
     /// agent's `identity.toml` sets `[session] singleton = true` — the `/send`
     /// handler then reuses this one session instead of minting a UUID per message.
@@ -173,6 +193,24 @@ impl AppState {
             .await
             .ok()
             .flatten()?;
+
+        // mika#1962 — the boot guard scanned `agents/` once, in `run_server`;
+        // this agent may have appeared since. Re-check it before constructing,
+        // or an agent bootstrapped from a shell carrying MIKA_AGENT_TIER=family
+        // gets served under this process's (operator) tier, silently. Decline
+        // the agent rather than propagating: one drifted agent is not a reason
+        // to stop serving the healthy ones.
+        let tier = mika_common::home::AgentTier::from_env();
+        if let Err(e) =
+            crate::server::tier_guard::check_agent_tier_consistency(&agent_home, &normalized, tier)
+        {
+            tracing::error!(
+                agent = %normalized,
+                error = %e,
+                "refusing to lazy-resolve agent: family-tier provisioning drift"
+            );
+            return None;
+        }
 
         // Construct via the same factory as startup.
         let embedding_client = self.settings.make_embedding_client();
