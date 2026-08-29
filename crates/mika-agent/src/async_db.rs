@@ -992,6 +992,26 @@ impl AsyncDatabase {
             .await
     }
 
+    /// True when the parent still has a `pending` deferred wrapper representing
+    /// it (mika#2045). See [`Database::has_pending_deferred_wrapper_child`].
+    pub async fn has_pending_deferred_wrapper_child(&self, parent_task_id: &str) -> Result<bool> {
+        let a = self.agent_id.clone();
+        let p = parent_task_id.to_owned();
+        self.with_db(move |db| db.has_pending_deferred_wrapper_child(&a, &p))
+            .await
+    }
+
+    /// Find `pending` self_dev issue parents that no callback child represents
+    /// any more (mika#2045). See [`Database::find_orphaned_pending_issue_tasks`].
+    pub async fn find_orphaned_pending_issue_tasks(
+        &self,
+        grace_seconds: i64,
+    ) -> Result<Vec<crate::db::OrphanedPendingTask>> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.find_orphaned_pending_issue_tasks(&a, grace_seconds))
+            .await
+    }
+
     /// Return ALL children of a parent task for the reaper's structured log
     /// event. See [`Database::get_reaper_child_snapshot`].
     pub async fn get_reaper_child_snapshot(
