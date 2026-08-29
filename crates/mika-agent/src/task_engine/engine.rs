@@ -6,6 +6,8 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use crate::skills::executor::RearmOutcome;
+
 use crate::async_db::AsyncDatabase;
 use crate::db::NewTask;
 
@@ -654,7 +656,7 @@ impl TaskEngine {
                 Ok(None) => rebuild_deferred_action_config(
                     &candidate.id,
                     &candidate.reference_url,
-                    "implement",
+                    &candidate.dispatch_class,
                 ),
                 Err(e) => {
                     warn!(
@@ -666,21 +668,32 @@ impl TaskEngine {
                 }
             };
 
-            let rearmed = match action_config {
+            let outcome = match action_config {
                 Some(config) => {
                     crate::skills::executor::rearm_deferred_callback(
                         &self.db,
                         &candidate.id,
                         &config,
-                        "implement",
+                        &candidate.dispatch_class,
                         "stuck_pending_reaper",
                     )
                     .await
                 }
-                None => false,
+                // The dispatch cannot be reconstructed at all, so no future tick
+                // will do better. Expiring frees the slot for a fresh task.
+                None => RearmOutcome::Unrepairable,
             };
 
-            if rearmed {
+            if outcome == RearmOutcome::NotNow {
+                debug!(
+                    task_id = %candidate.id,
+                    issue = %candidate.reference_url,
+                    "stuck-pending reaper: repair refused for a transient reason — retrying next tick"
+                );
+                continue;
+            }
+
+            if outcome == RearmOutcome::Rearmed {
                 info!(
                     event = "stuck_pending_task_rearmed",
                     task_id = %candidate.id,
@@ -3077,6 +3090,35 @@ mod tests {
         assert!(
             wrappers[0].action_config.contains("\"mika#2013\""),
             "prompt must be the bare <repo>#<num> form (mika#1593)"
+        );
+    }
+
+    /// An ungroomed issue belongs to the `groom` class. Repairing it as
+    /// `implement` would queue a `dev-pilot` run for work that still needs
+    /// `dev-groom`, and would occupy the wrong slot doing it.
+    #[tokio::test]
+    async fn test_stuck_pending_reaper_repairs_into_the_parents_own_class() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2026, 3600).await;
+        db.update_task_dispatch_class(&parent_id, "groom")
+            .await
+            .unwrap();
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        let wrappers = wrappers_of(&db, &parent_id).await;
+        assert_eq!(wrappers.len(), 1);
+        assert_eq!(
+            wrappers[0].dispatch_class.as_deref(),
+            Some("groom"),
+            "the replacement must occupy the class the task belongs to"
+        );
+        assert!(
+            wrappers[0].action_config.contains("dev-groom"),
+            "an ungroomed issue must be re-armed as a grooming dispatch"
         );
     }
 

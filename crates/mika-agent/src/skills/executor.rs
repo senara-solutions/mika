@@ -2000,6 +2000,24 @@ pub(crate) async fn register_deferred_callback(
     }
 }
 
+/// Result of a repair attempt (mika#2045).
+///
+/// `NotNow` and `Unrepairable` are both refusals, and collapsing them into one
+/// boolean is the bug this enum exists to prevent: the reaper expires a task it
+/// cannot repair, and a full deferred-callback queue is not that. It is a
+/// transient condition that clears on its own, so a task refused for capacity
+/// must be left alone and retried, not destroyed with repair budget still on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RearmOutcome {
+    /// A replacement wrapper now exists.
+    Rearmed,
+    /// Refused for a condition that clears by itself — try again next tick.
+    NotNow,
+    /// Refused for good: the repair budget is spent, or the dispatch cannot be
+    /// reconstructed. Only this warrants expiring the task.
+    Unrepairable,
+}
+
 /// Re-arm a parent whose deferred wrapper was consumed without dispatching
 /// (mika#2045).
 ///
@@ -2016,14 +2034,15 @@ pub(crate) async fn register_deferred_callback(
 /// inserts one row for *this* parent and hands the promotion decision back to
 /// `promote_pending_deferred_if_idle`, which checks the class slot first.
 ///
-/// Returns `true` when a replacement wrapper now exists.
+/// The caller must distinguish the two ways a repair can be refused, because
+/// only one of them justifies destroying the task. See [`RearmOutcome`].
 pub(crate) async fn rearm_deferred_callback(
     db: &AsyncDatabase,
     parent_task_id: &str,
     action_config: &str,
     dispatch_class: &str,
     cause: &str,
-) -> bool {
+) -> RearmOutcome {
     // Guard: if the parent already has an active non-deferred callback, the
     // turn did dispatch and there is nothing to repair. Fail-closed on a query
     // error — a spurious re-arm would double-dispatch, and the reaper is the
@@ -2033,14 +2052,14 @@ pub(crate) async fn rearm_deferred_callback(
         .await
     {
         Ok(false) => {}
-        Ok(true) => return false,
+        Ok(true) => return RearmOutcome::NotNow, // The turn dispatched — healthy.
         Err(e) => {
             warn!(
                 parent_task_id,
                 error = %e,
                 "failed to check for non-deferred callback children — not re-arming"
             );
-            return false;
+            return RearmOutcome::NotNow;
         }
     }
 
@@ -2054,11 +2073,11 @@ pub(crate) async fn rearm_deferred_callback(
                 cause,
                 "repair budget exhausted — leaving the task for the reaper to expire"
             );
-            return false;
+            return RearmOutcome::Unrepairable;
         }
         Err(e) => {
             warn!(parent_task_id, error = %e, "failed to read stuck_rearm_count — not re-arming");
-            return false;
+            return RearmOutcome::NotNow;
         }
         _ => {}
     }
@@ -2069,13 +2088,13 @@ pub(crate) async fn rearm_deferred_callback(
                 parent_task_id,
                 pending_count = count,
                 cap = MAX_PENDING_DEFERRED_CALLBACKS,
-                "deferred_dispatch_cap_exceeded — not re-arming"
+                "deferred_dispatch_cap_exceeded — not re-arming yet"
             );
-            return false;
+            return RearmOutcome::NotNow;
         }
         Err(e) => {
             warn!(parent_task_id, error = %e, "failed to count deferred callbacks — not re-arming");
-            return false;
+            return RearmOutcome::NotNow;
         }
         _ => {}
     }
@@ -2109,7 +2128,7 @@ pub(crate) async fn rearm_deferred_callback(
         Ok(id) => id,
         Err(e) => {
             warn!(parent_task_id, error = %e, "failed to re-arm deferred callback");
-            return false;
+            return RearmOutcome::NotNow;
         }
     };
 
@@ -2148,7 +2167,7 @@ pub(crate) async fn rearm_deferred_callback(
         warn!(error = %e, "failed to write deferred_dispatch_rearmed audit event");
     }
 
-    true
+    RearmOutcome::Rearmed
 }
 
 /// Extract `pr_url` from a task's metadata JSON.
@@ -5913,7 +5932,7 @@ mod tests {
     async fn test_rearm_registers_replacement_wrapper() {
         let (db, parent_id, action_config) = rearm_fixture().await;
 
-        let ok = rearm_deferred_callback(
+        let outcome = rearm_deferred_callback(
             &db,
             &parent_id,
             &action_config,
@@ -5922,7 +5941,11 @@ mod tests {
         )
         .await;
 
-        assert!(ok, "re-arm must succeed with budget available");
+        assert_eq!(
+            outcome,
+            RearmOutcome::Rearmed,
+            "re-arm must succeed with budget available"
+        );
         assert_eq!(pending_wrappers_of(&db, &parent_id).await, 1);
         assert_eq!(db.get_stuck_rearm_count(&parent_id).await.unwrap(), 1);
     }
@@ -5933,7 +5956,7 @@ mod tests {
     async fn test_rearm_preserves_action_config_and_class() {
         let (db, parent_id, action_config) = rearm_fixture().await;
 
-        assert!(
+        assert_eq!(
             rearm_deferred_callback(
                 &db,
                 &parent_id,
@@ -5941,7 +5964,8 @@ mod tests {
                 "groom",
                 "silent_turn_error"
             )
-            .await
+            .await,
+            RearmOutcome::Rearmed
         );
 
         let wrapper = db
@@ -5972,8 +5996,9 @@ mod tests {
         let (db, parent_id, action_config) = rearm_fixture().await;
 
         for _ in 0..MAX_STUCK_REARMS {
-            assert!(
-                rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop").await
+            assert_eq!(
+                rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop").await,
+                RearmOutcome::Rearmed
             );
             // Consume the wrapper the way promotion does.
             for child in db.get_child_tasks(&parent_id).await.unwrap() {
@@ -5988,11 +6013,59 @@ mod tests {
             db.get_stuck_rearm_count(&parent_id).await.unwrap(),
             MAX_STUCK_REARMS
         );
-        assert!(
-            !rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop").await,
-            "budget exhausted — must refuse"
+        assert_eq!(
+            rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop").await,
+            RearmOutcome::Unrepairable,
+            "budget exhausted is terminal — the reaper may expire the task"
         );
         assert_eq!(pending_wrappers_of(&db, &parent_id).await, 0);
+    }
+
+    /// A full deferred-callback queue is a passing condition, not a verdict on
+    /// this task. Reporting it as terminal would let the reaper destroy a task
+    /// that still had repair budget left.
+    #[tokio::test]
+    async fn test_rearm_reports_flood_cap_as_transient_not_terminal() {
+        let (db, parent_id, action_config) = rearm_fixture().await;
+
+        for i in 0..MAX_PENDING_DEFERRED_CALLBACKS {
+            let other = NewTask {
+                agent_id: "mika".to_string(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: crate::agent::DEFERRED_DISPATCH_LABEL.to_string(),
+                trigger_type: trigger_type::CALLBACK.to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: action_type::RESUME_AGENT.to_string(),
+                action_config: format!("{{\"n\":{i}}}"),
+                input_context: None,
+                created_by_session: None,
+                created_trace_id: None,
+                reference_url: None,
+                source: None,
+                metadata: None,
+                r#type: None,
+                dispatch_class: Some("implement".to_string()),
+            };
+            db.create_task(other).await.unwrap();
+        }
+
+        assert_eq!(
+            rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop").await,
+            RearmOutcome::NotNow,
+            "a full queue clears on its own — the task must survive to be retried"
+        );
+        assert_eq!(
+            db.get_stuck_rearm_count(&parent_id).await.unwrap(),
+            0,
+            "a refusal for capacity must not spend repair budget"
+        );
     }
 
     /// Anti-vacuity: the turn DID dispatch. Re-arming here would double-dispatch.
@@ -6026,9 +6099,10 @@ mod tests {
         };
         db.create_task(real_callback).await.unwrap();
 
-        assert!(
-            !rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop").await,
-            "a parent with a live dispatch must not be re-armed"
+        assert_eq!(
+            rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop").await,
+            RearmOutcome::NotNow,
+            "a live dispatch means nothing to repair — and nothing to expire either"
         );
         assert_eq!(pending_wrappers_of(&db, &parent_id).await, 0);
         assert_eq!(db.get_stuck_rearm_count(&parent_id).await.unwrap(), 0);

@@ -526,6 +526,7 @@ mod tests {
             created_at: "2026-08-29T09:12:22Z".to_string(),
             age_seconds,
             rearm_count,
+            dispatch_class: "implement".to_string(),
         }
     }
 

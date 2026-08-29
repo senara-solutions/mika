@@ -163,6 +163,12 @@ pub struct OrphanedPendingTask {
     /// Repairs already attempted for this parent, read from
     /// `metadata.stuck_rearm_count`. Absent or unreadable metadata reads as 0.
     pub rearm_count: i64,
+    /// The parent's own dispatch class, `implement` when NULL (matching
+    /// `has_active_callback_tasks_excluding`). A repair must re-enter the class
+    /// the task actually belongs to: re-arming an ungroomed issue as
+    /// `implement` would queue a `dev-pilot` run for work that still needs
+    /// `dev-groom`, and would occupy the wrong slot doing it.
+    pub dispatch_class: String,
 }
 
 /// Snapshot of a child task for the orphaned-parent reaper's structured log

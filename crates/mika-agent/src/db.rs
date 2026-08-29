@@ -7147,7 +7147,8 @@ impl Database {
                     COALESCE(
                       CASE WHEN json_valid(parent.metadata)
                            THEN CAST(json_extract(parent.metadata, '$.stuck_rearm_count') AS INTEGER)
-                      END, 0)
+                      END, 0),
+                    COALESCE(parent.dispatch_class, 'implement')
              FROM tasks parent
              WHERE parent.agent_id = ?1
                AND parent.status = 'pending'
@@ -7186,6 +7187,7 @@ impl Database {
                         created_at: row.get(2)?,
                         age_seconds: row.get(3)?,
                         rearm_count: row.get(4)?,
+                        dispatch_class: row.get(5)?,
                     })
                 },
             )?
