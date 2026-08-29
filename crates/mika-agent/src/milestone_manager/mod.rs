@@ -48,7 +48,10 @@ pub use cadence::{
 };
 pub use reader::{GhRunner, ProcessGhRunner, Reader, compose_from_gh_outputs};
 pub use reporter::Reporter;
-pub use spawn::{manager_config_from_env, spawn_manager_cycle_task};
+pub use spawn::{
+    AuthAlarmBody, AuthAlarmSink, HttpAuthAlarmSink, SettingsTokenResolver, TokenResolver,
+    manager_config_from_env, spawn_manager_cycle_task,
+};
 pub use types::{
     Alert, AlertKind, Assessment, CiState, CycleOutcome, IssueState, MilestoneRef, MilestoneState,
     ProgressCounts, RecentActivity, Recommendation, Severity, SubIssue,

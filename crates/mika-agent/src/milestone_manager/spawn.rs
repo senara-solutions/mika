@@ -32,10 +32,11 @@ use super::reader::{GhRunner, ProcessGhRunner};
 use super::types::MilestoneRef;
 use mika_common::config::Settings;
 use mika_common::github_app::GitHubApp;
+use serde::Serialize;
 use std::env;
 use std::path::PathBuf;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -194,9 +195,16 @@ pub async fn manager_config_from_env(
 /// mika-spirit processes would each pass their own guard — for that class,
 /// the `manager_cadence_spawn_attempt` log carries the PID so operators can
 /// discriminate between the two root-cause candidates.
+///
+/// **mika#2013 — `token_resolver`.** The loop re-resolves the GitHub token
+/// before every cycle through this handle instead of reusing the value frozen
+/// at spawn. See `TokenResolver` for why the once-at-spawn shape was the
+/// founding bug. Production passes `SettingsTokenResolver`; tests inject a
+/// static or counting resolver.
 pub fn spawn_manager_cycle_task(
-    cfg: ManagerConfig,
+    mut cfg: ManagerConfig,
     cancel: CancellationToken,
+    token_resolver: Arc<dyn TokenResolver>,
 ) -> Option<JoinHandle<()>> {
     // mika#1968 AC6 (change 6b) — diagnostic PID log emitted BEFORE the guard
     // check so operators can distinguish "two mika-spirit processes" (two
@@ -299,6 +307,11 @@ pub fn spawn_manager_cycle_task(
             }
         }
 
+        // mika#2013 volet B — state for the persistent-auth-failure alarm.
+        // Lives across cycles; reset by any successful cycle.
+        let mut auth_tracker = AuthFailureTracker::default();
+        let alarm_sink = HttpAuthAlarmSink::new();
+
         let poll = duration_from_chrono(cfg.poll_interval);
         let mut interval = tokio::time::interval(poll);
         // Skip the first immediate fire so we don't cycle before the server
@@ -324,8 +337,16 @@ pub fn spawn_manager_cycle_task(
                 return;
             }
 
+            // mika#2013 volet A — re-resolve the token before EVERY cycle.
+            // This is the whole fix: the renewal already existed inside
+            // `installation_token()`, we simply never asked for it again.
+            refresh_cycle_token(&mut cfg, token_resolver.as_ref()).await;
+
             match run_manager_cycle(&cfg).await {
                 Ok(outcome) => {
+                    // A successful cycle proves auth works — close any open
+                    // failure window (mika#2013 volet B).
+                    auth_tracker.on_success();
                     if outcome.delivered {
                         info!(
                             target: "mika::milestone_manager",
@@ -358,6 +379,13 @@ pub fn spawn_manager_cycle_task(
                         error = %e,
                         "manager cycle failed — continuing loop"
                     );
+
+                    // mika#2013 volet B — "fail and continue in silence" is the
+                    // disease this ticket names (RT#009). A sustained 401 run
+                    // now escalates instead of scrolling past as another WARN.
+                    if let Some(alarm) = auth_tracker.on_failure(auth_class, Instant::now()) {
+                        emit_auth_alarm(&cfg, &alarm, &alarm_sink).await;
+                    }
                 }
             }
         }
@@ -416,7 +444,18 @@ impl AuthClass {
 /// this classifier's four-bucket base.
 fn classify_cycle_error(err_text: &str) -> AuthClass {
     let lower = err_text.to_ascii_lowercase();
-    if lower.contains("401") || lower.contains("unauthorized") || lower.contains("bad credentials")
+    // mika#2013 — `Unauthorized` means "token missing/invalid/expired" per this
+    // enum's own docstring, and *missing* has a shape that carries no 401 at
+    // all: with no `GH_TOKEN` set, `gh` never reaches the API and prints its
+    // own onboarding text instead. Without these two patterns a manager running
+    // with no resolvable token classifies as `Other`, which the persistent-auth
+    // tracker deliberately ignores — leaving exactly the silent blindness this
+    // ticket exists to end.
+    if lower.contains("401")
+        || lower.contains("unauthorized")
+        || lower.contains("bad credentials")
+        || lower.contains("gh auth login")
+        || lower.contains("authentication token not found")
     {
         AuthClass::Unauthorized
     } else if lower.contains("403") || lower.contains("forbidden") || lower.contains("rate limit") {
@@ -440,14 +479,23 @@ fn classify_cycle_error(err_text: &str) -> AuthClass {
 /// 404 during the boot-time milestone probe means "target milestone gone /
 /// wrong repo" (a distinct operator remediation from a mid-cycle 404).
 fn classify_milestone_probe_error(err_text: &str) -> AuthClass {
+    // mika#2013 — delegate FIRST, then apply the 404 discrimination only to
+    // what the base classifier could not place. The previous order tested
+    // `not found` up front, which swallowed the auth shape
+    // `authentication token not found` and reported a missing credential as a
+    // missing milestone — sending the operator to check
+    // `MIKA_MANAGER_TARGET_MILESTONE` for what is actually a token problem.
+    // A genuine 404 (`gh: Not Found (HTTP 404)`) still lands here, because the
+    // base classifier returns `Other` for it.
+    let base = classify_cycle_error(err_text);
+    if base != AuthClass::Other {
+        return base;
+    }
     let lower = err_text.to_ascii_lowercase();
-    // Check 404 BEFORE delegating so `MilestoneNotFound` wins over `Other`.
-    // The `not found` phrasing catches gh's default 404 stderr shape as well
-    // as the raw HTTP status token.
     if lower.contains("404") || lower.contains("not found") {
         AuthClass::MilestoneNotFound
     } else {
-        classify_cycle_error(err_text)
+        AuthClass::Other
     }
 }
 
@@ -544,6 +592,350 @@ pub async fn verify_gh_auth<R: GhRunner>(
                 stderr_head,
                 exit_code: -1,
             })
+        }
+    }
+}
+
+// ---- mika#2013 volet A — renewable token resolution -----------------------
+
+/// Renewable source of the GitHub token the cadence loop hands to `gh`.
+///
+/// **Why a trait and not the plain `String` we had.** mika#2013:
+/// `ManagerConfig.github_token` was resolved ONCE at spawn time (in
+/// `manager_config_from_env`) and forwarded verbatim to every `gh` subprocess
+/// for the life of the process. When that value is a GitHub App installation
+/// token (~1h TTL), the manager cycles 401 forever once the hour is up — the
+/// founding incident: 16 `manager_cycle_error auth_class=401` in a single
+/// night, the milestone unreadable until someone restarted the daemon.
+///
+/// The renewal machinery already existed inside `GitHubApp::installation_token()`
+/// (in-memory cache + 5-minute expiry buffer). The defect was purely that we
+/// called it once instead of once per cycle. This trait is that "once per
+/// cycle" seam, and it doubles as the injection point that makes the behaviour
+/// testable without a live GitHub App.
+#[async_trait::async_trait]
+pub trait TokenResolver: Send + Sync {
+    /// Resolve the token to use for the next cycle. `None` stays a valid
+    /// outcome (no PAT, no App configured) — `gh` then runs with whatever
+    /// ambient credentials the environment provides.
+    async fn resolve(&self) -> Option<String>;
+}
+
+/// Production `TokenResolver` — delegates to `Settings::resolve_github_token`
+/// (PAT first per ADR-008, GitHub App installation token as fallback).
+///
+/// Cost per cycle is nil in the common cases: a configured PAT returns
+/// immediately, and the App path is served by the in-memory token cache until
+/// the token is genuinely near expiry. Only then does a JWT exchange occur.
+pub struct SettingsTokenResolver {
+    settings: Settings,
+    github_app: Option<Arc<GitHubApp>>,
+}
+
+impl SettingsTokenResolver {
+    pub fn new(settings: Settings, github_app: Option<Arc<GitHubApp>>) -> Self {
+        Self {
+            settings,
+            github_app,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl TokenResolver for SettingsTokenResolver {
+    async fn resolve(&self) -> Option<String> {
+        self.settings
+            .resolve_github_token(self.github_app.as_deref())
+            .await
+    }
+}
+
+/// Upper bound on a single token re-resolution.
+///
+/// The refresh sits in the cadence loop OUTSIDE the `tokio::select!` on the
+/// cancellation token, and `GitHubApp` builds its HTTP client without a timeout
+/// (`mika-common/src/github_app.rs`) while holding its cache write-lock across
+/// the JWT exchange. An unbounded stall would therefore hold the manager loop
+/// past graceful shutdown *and* block every other consumer of the shared
+/// `Arc<GitHubApp>`. 15s matches the timeout the sibling delivery client uses.
+const TOKEN_REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Re-resolve the cycle token and swap it into `cfg` when it changed.
+///
+/// Emits `manager_token_refreshed` (INFO) only on an actual change, so the
+/// renewal is observable rather than assumed — the founding incident was
+/// invisible precisely because nothing said what token was in play. The event
+/// carries presence booleans ONLY: token material never reaches the log.
+///
+/// **A failed resolution must never destroy a working credential.**
+/// `Settings::resolve_github_token` returns `None` whenever the App
+/// installation-token exchange errors — one network blip or GitHub 5xx is
+/// enough. Overwriting with that `None` would drop `GH_TOKEN` from the next
+/// `gh` invocation entirely (`reader.rs` only sets it when `Some`), so the
+/// cycle would silently run under whatever ambient credential the daemon host
+/// happens to carry — a different identity than the ADR-008 per-agent one, or
+/// none at all. The old frozen-token code could not produce that; this one
+/// could, so it is guarded: an empty resolution keeps the previous value and
+/// says so at WARN.
+async fn refresh_cycle_token(cfg: &mut ManagerConfig, resolver: &dyn TokenResolver) {
+    let fresh = match tokio::time::timeout(TOKEN_REFRESH_TIMEOUT, resolver.resolve()).await {
+        Ok(v) => v,
+        Err(_) => {
+            warn!(
+                target: "mika::milestone_manager",
+                event = "manager_token_refresh_timeout",
+                milestone = %cfg.target.as_display(),
+                timeout_secs = TOKEN_REFRESH_TIMEOUT.as_secs(),
+                kept_previous = cfg.github_token.is_some(),
+                "GitHub token re-resolution timed out — keeping the previous token for this cycle"
+            );
+            return;
+        }
+    };
+
+    if fresh.is_none() && cfg.github_token.is_some() {
+        warn!(
+            target: "mika::milestone_manager",
+            event = "manager_token_refresh_failed_keeping_previous",
+            milestone = %cfg.target.as_display(),
+            "GitHub token re-resolution returned nothing — keeping the previous token rather than falling back to ambient credentials"
+        );
+        return;
+    }
+
+    if fresh == cfg.github_token {
+        return;
+    }
+    info!(
+        target: "mika::milestone_manager",
+        event = "manager_token_refreshed",
+        milestone = %cfg.target.as_display(),
+        had_token = cfg.github_token.is_some(),
+        has_token = fresh.is_some(),
+        "mika-manager GitHub token changed on re-resolution"
+    );
+    cfg.github_token = fresh;
+}
+
+// ---- mika#2013 volet B — persistent-auth-failure alarm --------------------
+
+/// How long a continuous run of `AuthClass::Unauthorized` cycles must persist
+/// before the loop stops merely warning and raises an ERROR + escalation.
+///
+/// **Why a duration and not a cycle count.** `poll_interval` is operator-
+/// configurable (`MIKA_MANAGER_POLL_INTERVAL_SECS`), so "N failed cycles" has
+/// no stable temporal meaning — N=3 is fifteen minutes at one cadence and three
+/// hours at another. What an operator actually cares about is how long the
+/// manager has been blind.
+///
+/// 30 minutes sits far below the ~14h of silence observed in the founding
+/// incident and comfortably above any plausible transient. Deliberately NOT
+/// env-configurable in v1 (YAGNI — see the plan's "Hors périmètre"; a named
+/// constant suffices until an operator expresses the need to tune it).
+const AUTH_PERSISTENT_FAILURE_THRESHOLD: Duration = Duration::from_secs(30 * 60);
+
+/// Minimum spacing between two alarm emissions while the failure persists.
+/// Without it the alarm would re-fire every `poll_interval` once the threshold
+/// is crossed — reproducing exactly the log-spam this ticket exists to cure.
+const AUTH_ALARM_REEMIT_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// A fired alarm — the payload of "auth has been broken for too long".
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthAlarm {
+    /// Wall-clock span since the first cycle of the current unbroken 401 run.
+    elapsed: Duration,
+    /// Number of consecutive `Unauthorized` cycles in that run.
+    consecutive_cycles: u32,
+}
+
+/// Tracks an unbroken run of authentication failures across cycles.
+///
+/// Pure and clock-injected: every transition takes `now` as a parameter, so the
+/// 30-minute threshold and the 1-hour re-emission cooldown are unit-testable
+/// without sleeping through them.
+#[derive(Debug, Default)]
+struct AuthFailureTracker {
+    first_unauthorized_at: Option<Instant>,
+    consecutive_unauthorized: u32,
+    last_alarm_at: Option<Instant>,
+}
+
+impl AuthFailureTracker {
+    /// A cycle succeeded — auth demonstrably works, so the run is over and the
+    /// window resets completely, cooldown included.
+    fn on_success(&mut self) {
+        *self = Self::default();
+    }
+
+    /// A cycle failed. Returns `Some(alarm)` only on a cycle where the alarm
+    /// must actually be emitted.
+    ///
+    /// **Non-401 failures neither advance nor clear the window.** A network
+    /// blip is not evidence that auth recovered — resetting on it would let a
+    /// real outage evade the threshold indefinitely by interleaving transient
+    /// failures. Nor is it evidence of auth failure, so it must not count
+    /// toward the run either. Only a successful cycle proves recovery.
+    ///
+    /// **`Forbidden` (403) is deliberately excluded, and that is a known gap.**
+    /// A revoked App installation or a token that lost a scope 403s forever and
+    /// leaves the manager just as blind as a 401 does, with no alarm. The plan
+    /// for mika#2013 scoped volet B to `Unauthorized` and the architect signed
+    /// that scope; AC3's anti-vacuity test asserts 403 does NOT fire, so
+    /// widening it here would silently overturn a ratified acceptance
+    /// criterion. Tracked as mika#2063 rather than smuggled in.
+    fn on_failure(&mut self, class: AuthClass, now: Instant) -> Option<AuthAlarm> {
+        if class != AuthClass::Unauthorized {
+            return None;
+        }
+        let first = *self.first_unauthorized_at.get_or_insert(now);
+        self.consecutive_unauthorized = self.consecutive_unauthorized.saturating_add(1);
+
+        let elapsed = now.saturating_duration_since(first);
+        if elapsed < AUTH_PERSISTENT_FAILURE_THRESHOLD {
+            return None;
+        }
+        if let Some(last) = self.last_alarm_at
+            && now.saturating_duration_since(last) < AUTH_ALARM_REEMIT_INTERVAL
+        {
+            return None;
+        }
+        self.last_alarm_at = Some(now);
+        Some(AuthAlarm {
+            elapsed,
+            consecutive_cycles: self.consecutive_unauthorized,
+        })
+    }
+}
+
+/// Wire body for a persistent-auth-failure escalation.
+///
+/// **Why not `DeliveryBody`.** The normal report schema carries a full
+/// `Assessment` of the milestone. This alarm fires precisely BECAUSE the
+/// milestone could not be read — populating an `Assessment` here would put
+/// fabricated milestone state on the wire and defeat the point of alarming. A
+/// distinct, self-describing payload is the honest shape; it travels over the
+/// same `escalation_url` surface the ticket asked us to reuse, and the `event`
+/// field lets a receiver discriminate it from a `DeliveryBody`.
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthAlarmBody {
+    /// Always `"manager_auth_persistent_failure"`.
+    pub event: &'static str,
+    pub milestone_ref: MilestoneRef,
+    pub auth_class: &'static str,
+    pub elapsed_secs: u64,
+    pub consecutive_cycles: u32,
+    pub generated_at: String,
+}
+
+/// Transport boundary for the alarm — HTTP in production, in-memory in tests.
+/// Mirrors the `ReportDeliverer` shape already used by `cadence.rs` so the two
+/// outbound surfaces stay structurally alike.
+#[async_trait::async_trait]
+pub trait AuthAlarmSink: Send + Sync {
+    async fn send(
+        &self,
+        url: &str,
+        token: Option<&str>,
+        body: &AuthAlarmBody,
+    ) -> anyhow::Result<()>;
+}
+
+/// Production alarm sink — bearer-authenticated JSON POST, same wrapper-only
+/// discipline (workspace `reqwest`, no new dep) as `HttpReportDeliverer`.
+pub struct HttpAuthAlarmSink {
+    client: reqwest::Client,
+}
+
+impl HttpAuthAlarmSink {
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+        }
+    }
+}
+
+impl Default for HttpAuthAlarmSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl AuthAlarmSink for HttpAuthAlarmSink {
+    async fn send(
+        &self,
+        url: &str,
+        token: Option<&str>,
+        body: &AuthAlarmBody,
+    ) -> anyhow::Result<()> {
+        let mut req = self.client.post(url).json(body);
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        let res = req.send().await?;
+        if !res.status().is_success() {
+            let status = res.status();
+            let text = res.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "auth alarm escalation failed: {status} — {text}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Emit a fired alarm: ERROR log always, escalation POST when
+/// `escalation_url` is configured. Returns whether the escalation was
+/// delivered (`false` when unset or when the POST failed — the ERROR log is
+/// the floor, the escalation is the amplifier).
+async fn emit_auth_alarm(cfg: &ManagerConfig, alarm: &AuthAlarm, sink: &dyn AuthAlarmSink) -> bool {
+    error!(
+        target: "mika::milestone_manager",
+        event = "manager_auth_persistent_failure",
+        milestone = %cfg.target.as_display(),
+        auth_class = AuthClass::Unauthorized.as_str(),
+        elapsed_secs = alarm.elapsed.as_secs(),
+        consecutive_cycles = alarm.consecutive_cycles,
+        escalation_url_set = cfg.escalation_url.is_some(),
+        "mika-manager could not authenticate to GitHub for longer than the threshold — milestone unreadable, cycles are failing silently"
+    );
+
+    let url = match cfg.escalation_url.as_deref() {
+        Some(u) if !u.is_empty() => u,
+        _ => return false,
+    };
+
+    let body = AuthAlarmBody {
+        event: "manager_auth_persistent_failure",
+        milestone_ref: cfg.target.clone(),
+        auth_class: AuthClass::Unauthorized.as_str(),
+        elapsed_secs: alarm.elapsed.as_secs(),
+        consecutive_cycles: alarm.consecutive_cycles,
+        generated_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    match sink.send(url, cfg.delivery_token.as_deref(), &body).await {
+        Ok(()) => {
+            info!(
+                target: "mika::milestone_manager",
+                event = "manager_auth_alarm_escalated",
+                milestone = %cfg.target.as_display(),
+                "persistent-auth-failure alarm escalated"
+            );
+            true
+        }
+        Err(e) => {
+            warn!(
+                target: "mika::milestone_manager",
+                event = "manager_auth_alarm_escalation_failed",
+                milestone = %cfg.target.as_display(),
+                error = %e,
+                "persistent-auth-failure alarm could not be escalated — ERROR log stands as the record"
+            );
+            false
         }
     }
 }
@@ -1047,7 +1439,7 @@ mod tests {
             chrono::Duration::milliseconds(50),
         );
         let cancel = CancellationToken::new();
-        let handle = spawn_manager_cycle_task(cfg, cancel.clone())
+        let handle = spawn_manager_cycle_task(cfg, cancel.clone(), static_resolver(None))
             .expect("first spawn returns Some(handle)");
 
         // Let the loop tick at least once.
@@ -1500,12 +1892,12 @@ mod tests {
         let cfg2 = cfg1.clone();
 
         let cancel = CancellationToken::new();
-        let first = spawn_manager_cycle_task(cfg1, cancel.clone());
+        let first = spawn_manager_cycle_task(cfg1, cancel.clone(), static_resolver(None));
         assert!(first.is_some(), "first spawn must return Some(handle)");
 
         // Second call MUST be rejected — regardless of whether the first
         // task is still running.
-        let second = spawn_manager_cycle_task(cfg2, cancel.clone());
+        let second = spawn_manager_cycle_task(cfg2, cancel.clone(), static_resolver(None));
         assert!(
             second.is_none(),
             "second spawn within same process must be rejected"
@@ -1516,5 +1908,427 @@ mod tests {
         cancel.cancel();
         let handle = first.unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    // ---- mika#2013 test helpers -----------------------------------------
+
+    /// A `TokenResolver` that always returns the same value.
+    struct StaticTokenResolver(Option<String>);
+
+    #[async_trait::async_trait]
+    impl TokenResolver for StaticTokenResolver {
+        async fn resolve(&self) -> Option<String> {
+            self.0.clone()
+        }
+    }
+
+    fn static_resolver(v: Option<&str>) -> Arc<dyn TokenResolver> {
+        Arc::new(StaticTokenResolver(v.map(str::to_string)))
+    }
+
+    /// A `TokenResolver` that hands out a different token on every call and
+    /// counts how many times it was asked. Stands in for a GitHub App whose
+    /// installation token rolls over between cycles.
+    #[derive(Default)]
+    struct CountingTokenResolver {
+        calls: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TokenResolver for CountingTokenResolver {
+        async fn resolve(&self) -> Option<String> {
+            let mut n = self.calls.lock().unwrap();
+            *n += 1;
+            Some(format!("token-{n}"))
+        }
+    }
+
+    /// An `AuthAlarmSink` that records what it was asked to send.
+    #[derive(Default, Clone)]
+    struct RecordingAlarmSink {
+        sent: Arc<Mutex<Vec<(String, AuthAlarmBody)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AuthAlarmSink for RecordingAlarmSink {
+        async fn send(
+            &self,
+            url: &str,
+            _token: Option<&str>,
+            body: &AuthAlarmBody,
+        ) -> anyhow::Result<()> {
+            self.sent
+                .lock()
+                .unwrap()
+                .push((url.to_string(), body.clone()));
+            Ok(())
+        }
+    }
+
+    // ---- mika#2013 AC1 — the token is re-resolved, not frozen -------------
+
+    /// AC1. The seam that carries the fix: a resolver whose value changed
+    /// between cycles must be reflected in the config the next `gh` call uses.
+    /// Before mika#2013 the value was captured once at spawn and this swap
+    /// never happened — the manager kept presenting an expired App token.
+    #[tokio::test]
+    async fn refresh_cycle_token_swaps_in_the_new_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = mk_test_cfg(
+            tmp.path(),
+            chrono::Duration::hours(6),
+            chrono::Duration::seconds(30),
+        );
+        let resolver = CountingTokenResolver::default();
+
+        refresh_cycle_token(&mut cfg, &resolver).await;
+        assert_eq!(cfg.github_token.as_deref(), Some("token-1"));
+
+        refresh_cycle_token(&mut cfg, &resolver).await;
+        assert_eq!(
+            cfg.github_token.as_deref(),
+            Some("token-2"),
+            "second resolution must replace the first — a frozen token is the bug"
+        );
+    }
+
+    /// AC1 anti-vacuity. An unchanged token must NOT be reported as a refresh
+    /// and must leave the config untouched — otherwise the `manager_token_refreshed`
+    /// event would fire on every cycle and mean nothing.
+    #[tokio::test]
+    async fn refresh_cycle_token_is_a_noop_when_value_is_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = mk_test_cfg(
+            tmp.path(),
+            chrono::Duration::hours(6),
+            chrono::Duration::seconds(30),
+        );
+        cfg.github_token = Some("stable".into());
+
+        refresh_cycle_token(&mut cfg, &StaticTokenResolver(Some("stable".into()))).await;
+        assert_eq!(cfg.github_token.as_deref(), Some("stable"));
+    }
+
+    /// AC1, at the loop level. Proves the resolver is consulted per CYCLE, not
+    /// once at spawn: with a 50ms poll the loop must ask more than once. This
+    /// is the test that would have failed before the fix — the pre-#2013 loop
+    /// never called a resolver at all.
+    #[tokio::test]
+    #[serial]
+    async fn spawn_loop_re_resolves_token_on_every_cycle() {
+        reset_spawn_guard_for_test();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_test_cfg(
+            tmp.path(),
+            chrono::Duration::seconds(1),
+            chrono::Duration::milliseconds(50),
+        );
+        let resolver = CountingTokenResolver::default();
+        let calls = resolver.calls.clone();
+
+        let cancel = CancellationToken::new();
+        let handle = spawn_manager_cycle_task(cfg, cancel.clone(), Arc::new(resolver))
+            .expect("spawn returns Some(handle)");
+
+        // Wait for the CONDITION, not a fixed duration: the boot-time
+        // `verify_gh_auth` probe is a real `gh` subprocess call that precedes
+        // loop entry and dominates the wall clock here (the sibling
+        // `spawn_respects_cancel_token` budgets 10s for the same reason). A
+        // fixed sleep makes this test a latency measurement instead of a
+        // behaviour assertion.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if *calls.lock().unwrap() >= 2 || Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+
+        let n = *calls.lock().unwrap();
+        assert!(
+            n >= 2,
+            "resolver must be consulted once per cycle, got {n} call(s) — a single call means the token is still frozen at spawn"
+        );
+    }
+
+    // ---- mika#2013 AC3/AC4/AC4b — the 401 must cry -----------------------
+
+    const MIN: Duration = Duration::from_secs(60);
+
+    /// AC3. A continuous `Unauthorized` run longer than the threshold fires.
+    #[test]
+    fn auth_alarm_fires_after_threshold() {
+        let t0 = Instant::now();
+        let mut tracker = AuthFailureTracker::default();
+
+        assert!(tracker.on_failure(AuthClass::Unauthorized, t0).is_none());
+        assert!(
+            tracker
+                .on_failure(AuthClass::Unauthorized, t0 + 29 * MIN)
+                .is_none(),
+            "29 minutes is below the 30-minute threshold"
+        );
+
+        let alarm = tracker
+            .on_failure(AuthClass::Unauthorized, t0 + 31 * MIN)
+            .expect("31 minutes of continuous 401 must fire the alarm");
+        assert_eq!(alarm.consecutive_cycles, 3);
+        assert!(alarm.elapsed >= 31 * MIN);
+    }
+
+    /// AC3 anti-vacuity. The same sequence over the same span, but classified
+    /// `Other`, must fire nothing — otherwise the alarm is just "a failure
+    /// happened" wearing an auth label.
+    #[test]
+    fn auth_alarm_never_fires_for_non_unauthorized_classes() {
+        let t0 = Instant::now();
+        for class in [
+            AuthClass::Other,
+            AuthClass::Network,
+            AuthClass::Forbidden,
+            AuthClass::MilestoneNotFound,
+        ] {
+            let mut tracker = AuthFailureTracker::default();
+            assert!(tracker.on_failure(class, t0).is_none());
+            assert!(
+                tracker.on_failure(class, t0 + 31 * MIN).is_none(),
+                "{class:?} must never raise the auth alarm"
+            );
+        }
+    }
+
+    /// AC4. A successful cycle clears the window — cumulative time across a
+    /// recovery does not add up to the threshold.
+    #[test]
+    fn successful_cycle_clears_the_failure_window() {
+        let t0 = Instant::now();
+        let mut tracker = AuthFailureTracker::default();
+
+        tracker.on_failure(AuthClass::Unauthorized, t0);
+        assert!(
+            tracker
+                .on_failure(AuthClass::Unauthorized, t0 + 29 * MIN)
+                .is_none()
+        );
+
+        tracker.on_success();
+
+        tracker.on_failure(AuthClass::Unauthorized, t0 + 30 * MIN);
+        assert!(
+            tracker
+                .on_failure(AuthClass::Unauthorized, t0 + 59 * MIN)
+                .is_none(),
+            "29 + 29 minutes either side of a success must NOT fire — the window restarts"
+        );
+    }
+
+    /// AC4b. Once crossed, the alarm re-emits at most hourly — the loop must
+    /// not reproduce the per-cycle spam this ticket exists to cure.
+    #[test]
+    fn alarm_does_not_reemit_within_the_cooldown() {
+        let t0 = Instant::now();
+        let mut tracker = AuthFailureTracker::default();
+
+        tracker.on_failure(AuthClass::Unauthorized, t0);
+        assert!(
+            tracker
+                .on_failure(AuthClass::Unauthorized, t0 + 31 * MIN)
+                .is_some(),
+            "first crossing fires"
+        );
+        assert!(
+            tracker
+                .on_failure(AuthClass::Unauthorized, t0 + 45 * MIN)
+                .is_none(),
+            "14 minutes later is inside the 1h cooldown"
+        );
+        assert!(
+            tracker
+                .on_failure(AuthClass::Unauthorized, t0 + 89 * MIN)
+                .is_none(),
+            "58 minutes after the first alarm is still inside the cooldown"
+        );
+        assert!(
+            tracker
+                .on_failure(AuthClass::Unauthorized, t0 + 92 * MIN)
+                .is_some(),
+            "past the 1h cooldown the persisting failure is re-announced"
+        );
+    }
+
+    /// AC3, escalation half. A fired alarm reaches `escalation_url` with a
+    /// self-describing payload — not a fabricated milestone report.
+    #[tokio::test]
+    async fn emit_auth_alarm_posts_to_escalation_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_test_cfg(
+            tmp.path(),
+            chrono::Duration::hours(6),
+            chrono::Duration::seconds(30),
+        );
+        let sink = RecordingAlarmSink::default();
+        let alarm = AuthAlarm {
+            elapsed: 31 * MIN,
+            consecutive_cycles: 7,
+        };
+
+        let escalated = emit_auth_alarm(&cfg, &alarm, &sink).await;
+        assert!(escalated, "configured escalation_url must be used");
+
+        let sent = sink.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "http://vincent/direct");
+        assert_eq!(sent[0].1.event, "manager_auth_persistent_failure");
+        assert_eq!(sent[0].1.auth_class, "401");
+        assert_eq!(sent[0].1.consecutive_cycles, 7);
+        assert_eq!(sent[0].1.elapsed_secs, 31 * 60);
+    }
+
+    /// AC3 anti-vacuity, escalation half. With no `escalation_url` the ERROR
+    /// log stands alone and nothing is posted — the alarm must not invent a
+    /// destination.
+    #[tokio::test]
+    async fn emit_auth_alarm_without_escalation_url_posts_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = mk_test_cfg(
+            tmp.path(),
+            chrono::Duration::hours(6),
+            chrono::Duration::seconds(30),
+        );
+        cfg.escalation_url = None;
+        let sink = RecordingAlarmSink::default();
+        let alarm = AuthAlarm {
+            elapsed: 31 * MIN,
+            consecutive_cycles: 7,
+        };
+
+        let escalated = emit_auth_alarm(&cfg, &alarm, &sink).await;
+        assert!(!escalated);
+        assert!(sink.sent.lock().unwrap().is_empty());
+    }
+
+    // ---- mika#2013 review follow-ups -------------------------------------
+
+    /// A `TokenResolver` that never returns — stands in for a stalled
+    /// connection to `api.github.com` during the JWT exchange.
+    struct HangingTokenResolver;
+
+    #[async_trait::async_trait]
+    impl TokenResolver for HangingTokenResolver {
+        async fn resolve(&self) -> Option<String> {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            Some("never-arrives".into())
+        }
+    }
+
+    /// Review finding 1. A failed resolution must NOT destroy a working
+    /// credential. `Settings::resolve_github_token` returns `None` whenever the
+    /// App token exchange errors, and `reader.rs` only sets `GH_TOKEN` when the
+    /// value is `Some` — so overwriting would silently drop the cycle onto the
+    /// host's ambient credentials (a different identity than ADR-008 mandates)
+    /// or onto none at all.
+    #[tokio::test]
+    async fn refresh_cycle_token_keeps_previous_token_when_resolution_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = mk_test_cfg(
+            tmp.path(),
+            chrono::Duration::hours(6),
+            chrono::Duration::seconds(30),
+        );
+        cfg.github_token = Some("working-token".into());
+
+        refresh_cycle_token(&mut cfg, &StaticTokenResolver(None)).await;
+
+        assert_eq!(
+            cfg.github_token.as_deref(),
+            Some("working-token"),
+            "a transient resolution failure must not clear a credential that works"
+        );
+    }
+
+    /// Anti-vacuity for the guard above: when there was nothing to preserve,
+    /// `None` is simply the honest outcome and must not be spun into a
+    /// retention.
+    #[tokio::test]
+    async fn refresh_cycle_token_accepts_none_when_there_was_no_previous_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = mk_test_cfg(
+            tmp.path(),
+            chrono::Duration::hours(6),
+            chrono::Duration::seconds(30),
+        );
+        cfg.github_token = None;
+
+        refresh_cycle_token(&mut cfg, &StaticTokenResolver(None)).await;
+        assert_eq!(cfg.github_token, None);
+    }
+
+    /// Review finding 4. The per-cycle refresh sits outside the `select!` on
+    /// the cancellation token and `GitHubApp`'s HTTP client carries no timeout,
+    /// so an unbounded stall would hold the loop past graceful shutdown. The
+    /// clock is paused: this asserts the bound, it does not wait 15 seconds.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_cycle_token_times_out_and_keeps_previous_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = mk_test_cfg(
+            tmp.path(),
+            chrono::Duration::hours(6),
+            chrono::Duration::seconds(30),
+        );
+        cfg.github_token = Some("working-token".into());
+
+        refresh_cycle_token(&mut cfg, &HangingTokenResolver).await;
+
+        assert_eq!(
+            cfg.github_token.as_deref(),
+            Some("working-token"),
+            "a stalled resolution must bail out and leave the previous token in place"
+        );
+    }
+
+    /// Review finding 2. "Token missing" has a shape that carries no 401 at
+    /// all — `gh` prints its own onboarding text instead. Classifying that as
+    /// `Other` left it invisible to the persistent-auth tracker, which is the
+    /// exact silence this ticket exists to end.
+    #[test]
+    fn classify_cycle_error_treats_gh_unauthenticated_shapes_as_unauthorized() {
+        for text in [
+            "gh api /repos/x/milestones/1 failed: To get started with GitHub CLI, please run: gh auth login",
+            "authentication token not found for host github.com",
+        ] {
+            assert_eq!(
+                classify_cycle_error(text),
+                AuthClass::Unauthorized,
+                "unauthenticated gh shape must reach the auth alarm: {text}"
+            );
+        }
+    }
+
+    /// Review finding 2, ordering half. `authentication token not found`
+    /// contains the substring `not found`, which the probe classifier used to
+    /// test first — reporting a missing credential as a missing milestone and
+    /// pointing the operator at `MIKA_MANAGER_TARGET_MILESTONE` for a token
+    /// problem. The auth shape must win.
+    #[test]
+    fn classify_milestone_probe_error_prefers_auth_shape_over_not_found() {
+        assert_eq!(
+            classify_milestone_probe_error("authentication token not found for host github.com"),
+            AuthClass::Unauthorized
+        );
+        // Anti-vacuity: a genuine 404 must still classify as a missing
+        // milestone, otherwise the reordering traded one misdiagnosis for
+        // another.
+        assert_eq!(
+            classify_milestone_probe_error(
+                "gh api /repos/x/milestones/9 failed: gh: Not Found (HTTP 404)"
+            ),
+            AuthClass::MilestoneNotFound
+        );
+        assert_eq!(
+            classify_milestone_probe_error("gh: Bad credentials (HTTP 401)"),
+            AuthClass::Unauthorized
+        );
     }
 }
