@@ -45,8 +45,17 @@
 #                              to host, /proc shows only sandbox processes
 #     * `--new-session --die-with-parent` — no controlling tty, sandbox dies
 #                              with parent
-#     * `--clearenv` + `--setenv ...` — env allowlist (no ANTHROPIC_API_KEY /
-#                              AWS_* / NPM_TOKEN inheritance)
+#     * `--clearenv` + `--setenv ...` — env allowlist for NON-SECRET vars
+#                              only (no ANTHROPIC_API_KEY / AWS_* / NPM_TOKEN
+#                              inheritance)
+#     * `--perms 0600 --ro-bind-data <fd> ...` — secret channel (mika#2039).
+#                              A `--setenv` value lands in bwrap's argv, which
+#                              /proc/<pid>/cmdline exposes to every local user;
+#                              secrets are handed over on a file descriptor
+#                              instead and re-exported by the entrypoint
+#                              prologue. Enforced by
+#                              scripts/verify-no-secret-in-setenv.sh and
+#                              tests/test_sandbox_no_secret_in_argv.sh.
 #
 #   Filesystem allowlist (no `--ro-bind / /` — that would expose /var, /srv,
 #                        cross-worktree /data/workspace paths):
@@ -65,7 +74,8 @@
 #     * ~/.cargo/credentials.toml (cargo publish secret — dev-pilot never
 #                                  publishes; safe to omit)
 #     * ~/.config/gh (contains hosts.yml with gh token) — gh CLI uses the
-#                     GH_TOKEN env var re-injected below
+#                     GH_TOKEN delivered through the secret-file channel below
+#                     (mika#2039), not `--setenv`
 #     * $SSH_AUTH_SOCK, docker.sock, dbus, cm/NATS unix sockets
 #     * /data/workspace outside the branch worktree (other worktrees + repos)
 #
@@ -108,6 +118,35 @@ _PILOT_HELPER_LOG="/var/log/mika/pilot-helper.log"
 # (already ro-bound before net_bwrap_args, so binds inside it fail with
 # EROFS). See coherence audit Bug B (2026-08-05).
 _PILOT_HELPER_CA_SANDBOX_PATH="/tmp/mika-pilot-ca/ca.pem"
+
+# mika#2039: in-sandbox directory holding one 0600 file per secret. Under
+# /run — a tmpfs the sandbox mounts — rather than /etc, which is already
+# ro-bound by the time the secret args are expanded, so a nested bind there
+# fails EROFS (same coherence-audit Bug B that put the helper CA under /tmp).
+_PILOT_SECRET_DIR_SANDBOX="/run/mika-pilot-secrets"
+
+# Sandbox entrypoint prologue: re-export each secret file as an env var named
+# after the file. Deriving the export name from the basename is what makes
+# adding a second secret a zero-change operation here.
+#
+# POSIX sh only — no arrays, no `[[`. The constraint is portability, not a
+# claim about this host: the string is executed by whatever `/bin/sh` resolves
+# to inside the sandbox, which is bound from the host's /bin and can differ
+# between deploy targets.
+#
+# Values round-trip byte-exactly EXCEPT for trailing newlines, which `$(cat)`
+# strips. A GitHub PAT has none, so nothing is affected today — but a secret
+# whose trailing newline is load-bearing (a PEM key, some base64 blobs) cannot
+# use this channel unchanged, which qualifies the zero-change promise above.
+#
+# It names what it drops rather than continuing mutely. Under `--setenv` a
+# missing token was visible in the launch argv; moving it into an in-sandbox
+# loop would otherwise trade a launch-time failure for a silent one that only
+# surfaces minutes later at `git push`. The stderr this writes is persisted by
+# _dispatch_lib_exit_trap and folded into the callback, so the operator sees
+# it. Posture stays fail-forward: a tokenless pilot can still do useful work
+# up to the push, so this diagnoses rather than aborts.
+_PILOT_SECRET_PROLOGUE="for _s in $_PILOT_SECRET_DIR_SANDBOX/*; do [ -e \"\$_s\" ] || continue; _n=\$(basename \"\$_s\"); if [ ! -r \"\$_s\" ]; then echo \"dispatch-lib: sandbox secret \$_n is unreadable — the pilot starts without it\" >&2; continue; fi; _v=\$(cat \"\$_s\"); [ -n \"\$_v\" ] || echo \"dispatch-lib: sandbox secret \$_n is empty — the pilot starts without it\" >&2; export \"\$_n=\$_v\"; done; unset _s _n _v"
 
 # Idempotent helper daemon launcher for the anthropic api chain
 # (2026-08-05, Vincent-authorized). Chained from the front egress proxy
@@ -256,12 +295,39 @@ _ensure_pilot_egress_proxy() {
 # via `--setenv` when present in the parent env. Deliberately narrow — any
 # non-listed var (AWS_*, NPM_TOKEN, ATLASSIAN_API_TOKEN, non-MIKA_
 # OPENAI_/ANTHROPIC_, etc.) is DROPPED by --clearenv and does not reach the
-# sandbox. `GH_TOKEN` is passed through so `gh` works without needing
-# ~/.config/gh (which stays hidden). `ANTHROPIC_LOG_FILE` is the pilot
-# transcript hook (mika#1705). `MIKA_LOG_PILOT_TRANSCRIPTS` gates transcript.
+# sandbox. `ANTHROPIC_LOG_FILE` is the pilot transcript hook (mika#1705).
+# `MIKA_LOG_PILOT_TRANSCRIPTS` gates transcript.
+#
+# NOTHING SECRET GOES IN THIS LIST (mika#2039). `--setenv NAME VALUE` puts the
+# value in bwrap's argv, and /proc/<pid>/cmdline is world-readable — `ps` is
+# enough. A secret belongs in _PILOT_SANDBOX_SECRET_ALLOWLIST below.
+#
+# Audit of every value still reaching `--setenv`, so a future addition is
+# weighed rather than assumed (mika#2039 R6):
+#   * HOME PATH USER LOGNAME SHELL TERM LANG LC_ALL TMPDIR HOSTNAME
+#       — POSIX environment, non-secret by definition.
+#   * ANTHROPIC_LOG_FILE, MIKA_LOG_PILOT_TRANSCRIPTS
+#       — a path and a boolean gate. No credential material.
+#   * the `net_setenv_args` producer below adds HTTPS_PROXY / HTTP_PROXY /
+#     NO_PROXY / ANTHROPIC_BASE_URL / CLAUDE_CODE_API_BASE_URL (localhost
+#     URLs), MIKA_PILOT_CONTAINED ("1"), NODE_EXTRA_CA_CERTS (a path), and
+#     ANTHROPIC_API_KEY. That last one is safe ONLY because it carries the
+#     literal placeholder `proxy-managed-no-secret` — the real key is injected
+#     host-side by the egress proxy and never crosses the bwrap boundary.
+#     Replacing that placeholder with a real key would re-open this defect;
+#     scripts/verify-no-secret-in-setenv.sh fails if it ever changes.
 _PILOT_SANDBOX_ENV_ALLOWLIST=(
     HOME PATH USER LOGNAME SHELL TERM LANG LC_ALL TMPDIR HOSTNAME
-    GH_TOKEN ANTHROPIC_LOG_FILE MIKA_LOG_PILOT_TRANSCRIPTS
+    ANTHROPIC_LOG_FILE MIKA_LOG_PILOT_TRANSCRIPTS
+)
+
+# Secret passthrough allowlist (mika#2039). These NEVER travel via `--setenv`.
+# Each one is handed to bwrap on a file descriptor and materialised as a 0600
+# read-only file under $_PILOT_SECRET_DIR_SANDBOX; $_PILOT_SECRET_PROLOGUE
+# re-exports it inside the sandbox. `GH_TOKEN` is passed through so `gh` works
+# without needing ~/.config/gh (which stays hidden).
+_PILOT_SANDBOX_SECRET_ALLOWLIST=(
+    GH_TOKEN
 )
 
 _run_pilot_sandboxed() {
@@ -271,6 +337,12 @@ _run_pilot_sandboxed() {
         "$@"
         return $?
     fi
+    # Version floor (mika#2039): the secret channel uses `--perms` and
+    # `--ro-bind-data`, which need bubblewrap >= 0.5.0. This probe only detects
+    # bwrap's ABSENCE; an older bwrap is present, passes here, and then fails
+    # the launch loudly on an unknown option rather than degrading. That is the
+    # safe direction — fail closed, no leak — but it is a hard floor, not a
+    # fallback.
     if ! command -v bwrap >/dev/null 2>&1; then
         echo "dispatch-lib: MIKA_PILOT_SANDBOX enabled but bwrap not installed on PATH — falling back to direct invocation" >&2
         "$@"
@@ -374,7 +446,10 @@ _run_pilot_sandboxed() {
         )
         # sh -c wrapper that starts the shim, waits for it, execs the pilot,
         # cleans up on exit. `exec` in the final position ensures the pilot's
-        # exit status becomes the sh's.
+        # exit status becomes the sh's. $_PILOT_SECRET_PROLOGUE is prepended to
+        # that script (mika#2039) so the bwrap-materialised secret files are
+        # re-exported before anything else runs; dropping it leaves the pilot
+        # without GH_TOKEN on the path every real dispatch takes.
         sandbox_entrypoint_prefix="/bin/sh"
     fi
 
@@ -385,6 +460,48 @@ _run_pilot_sandboxed() {
             setenv_args+=(--setenv "$var" "${!var}")
         fi
     done
+
+    # mika#2039: secret channel. bwrap reads each value from a file descriptor
+    # and materialises it as a 0600 read-only file inside the sandbox, so no
+    # secret value ever enters the argv that /proc/<pid>/cmdline exposes.
+    #
+    # Two properties of this block are load-bearing:
+    #
+    #   1. xtrace is suppressed around it. `dispatch_claude_pilot` runs the
+    #      whole dispatch under `set -x` with BASH_XTRACEFD pointed at
+    #      $TRACE_FILE, and xtrace expands process substitutions — an
+    #      unbracketed `printf` here writes `++ printf %s <token>` into that
+    #      file, which _emit_callback tails back to the caller and whose
+    #      NAME=value redaction does not match that line shape. Same bracket
+    #      as _setup_gh_auth (mika#903), but the prior state is restored
+    #      rather than force-enabled: this function also runs from contexts
+    #      with no xtrace (the canary, the test suite).
+    #
+    #   2. the descriptor is allocated by bash (`{var}<`), not hardcoded.
+    #      Bash guarantees a number >= 10, which structurally keeps the
+    #      channel off fd 9 — already taken by BASH_XTRACEFD for the whole
+    #      dispatch — and gives each secret its own descriptor with no
+    #      arithmetic and no `eval`. The fd is inherited across exec into
+    #      bwrap; it is closed again after the call returns.
+    #
+    # `printf` is the bash builtin. /usr/bin/printf would put the value back
+    # into an argv, which is exactly the defect this closes.
+    local -a secret_args=()
+    local -a secret_fds=()
+    local _sfd _xtrace_was_on=0
+    case "$-" in *x*) _xtrace_was_on=1 ;; esac
+    { set +x; } 2>/dev/null
+    for var in "${_PILOT_SANDBOX_SECRET_ALLOWLIST[@]}"; do
+        if [ -n "${!var:-}" ]; then
+            unset _sfd
+            exec {_sfd}< <(printf '%s' "${!var}")
+            secret_args+=(--perms 0600 --ro-bind-data "$_sfd" "$_PILOT_SECRET_DIR_SANDBOX/$var")
+            secret_fds+=("$_sfd")
+        fi
+    done
+    if [ "$_xtrace_was_on" -eq 1 ]; then
+        set -x
+    fi
     # HOME bind property: EACH bind-in HOME must not carry any credential
     # or session token. Enforced by narrow subpaths per family — never bind
     # a whole family directory (~/.claude, ~/.local, ~/.mika) because those
@@ -392,6 +509,7 @@ _run_pilot_sandboxed() {
     # share/uv/credentials/ / .env respectively. Adding a new bind requires
     # confirming its subtree carries no cred-shaped file (see
     # coherence audit 2026-08-04).
+    local _sandbox_rc=0
     if [ -n "$sandbox_entrypoint_prefix" ]; then
         # Phase 2b mode: quote the original argv so the sh -c can re-exec it
         # verbatim. Uses `printf '%q'` for shell-safe re-quoting.
@@ -437,8 +555,10 @@ _run_pilot_sandboxed() {
             "${net_bwrap_args[@]}" \
             "${setenv_args[@]}" \
             "${net_setenv_args[@]}" \
+            ${secret_args[@]+"${secret_args[@]}"} \
             --chdir "$WORKTREE_DIR" \
             -- "$sandbox_entrypoint_prefix" -c "
+$_PILOT_SECRET_PROLOGUE
 python3 '$_PILOT_EGRESS_PROXY_BIN' --sandbox-tcp $_PILOT_EGRESS_TCP_PORT --socket '$_PILOT_EGRESS_SOCK' >&2 &
 _shim_pid=\$!
 # Bounded wait for shim to listen (max ~1s).
@@ -459,9 +579,17 @@ except Exception:
 done
 trap 'kill \$_shim_pid 2>/dev/null' EXIT
 $quoted_argv
-"
+" || _sandbox_rc=$?
     else
         # Phase 2a fallback: fs cut only, network unrestricted.
+        #
+        # The `/bin/sh -c` entrypoint at the end of this block exists solely to
+        # run $_PILOT_SECRET_PROLOGUE before the pilot (mika#2039). The
+        # original argv rides through as positional parameters, so no second
+        # `printf '%q'` quoting layer is introduced, and `exec` in final
+        # position keeps the pilot's argv, pid and exit status identical to the
+        # bare `-- "$@"` this replaced. Reverting it to `-- "$@"` looks like a
+        # simplification and silently removes GH_TOKEN from this sandbox.
         bwrap \
             --as-pid-1 \
             --unshare-user \
@@ -500,9 +628,21 @@ $quoted_argv
             --ro-bind-try "$HOME/.rustup" "$HOME/.rustup" \
             --bind "$HOME/.mika/data/pilot-transcripts" "$HOME/.mika/data/pilot-transcripts" \
             "${setenv_args[@]}" \
+            ${secret_args[@]+"${secret_args[@]}"} \
             --chdir "$WORKTREE_DIR" \
-            -- "$@"
+            -- /bin/sh -c "$_PILOT_SECRET_PROLOGUE
+exec \"\$@\"" mika-pilot-sandbox "$@" || _sandbox_rc=$?
     fi
+
+    # mika#2039: close the secret descriptors, then return the status bwrap
+    # actually produced. The order matters — closing first would overwrite
+    # `$?` and break the invariant that the pilot's exit status is this
+    # function's exit status.
+    local _cfd
+    for _cfd in ${secret_fds[@]+"${secret_fds[@]}"}; do
+        exec {_cfd}<&-
+    done
+    return "$_sandbox_rc"
 }
 
 # mika#749: TERM trap writes cancel discriminator before exit.
@@ -1472,7 +1612,24 @@ _post_flight_recovery() {
     # all, which main satisfies 769 times over, so the note always fired.
     VALID_PLAN=""
     if [ "$SKILL" = "dev-groom" ] && [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ]; then
-        VALID_PLAN=$(_find_issue_plan 2>/dev/null) || VALID_PLAN=""
+        # mika#2038: stderr is NOT redirected. The three `find` calls inside
+        # _find_issue_plan already redirect their own stderr, so before mika#2038
+        # the function wrote nothing there and the outer `2>/dev/null` covered no
+        # real noise — it only stood ready to swallow the tier-1 selection log
+        # that mika#2038 added. The `|| VALID_PLAN=""` fallback is unchanged: a
+        # non-zero return still yields an empty string for the recovery logic below.
+        VALID_PLAN=$(_find_issue_plan) || VALID_PLAN=""
+        # mika#2038: a plan can now be found AND deliberately discarded, so the
+        # failure text below must not tell the operator that nothing matched and
+        # send them hunting a discovery bug or pilot drift. The most likely real
+        # cause of a refusal is a plan whose header names the wrong ticket —
+        # a milestone parent instead of the sub-issue, say — and that is fixed
+        # in the header, not by widening discovery.
+        if [ -n "${FIND_ISSUE_PLAN_REFUTED:-}" ]; then
+            PLAN_REFUTED_NOTE=". NOTE: a plan file DID match and was deliberately discarded because its header names a different issue: ${FIND_ISSUE_PLAN_REFUTED}. If one of those is the right plan, correct its ticket header rather than the discovery logic"
+        else
+            PLAN_REFUTED_NOTE=""
+        fi
     fi
 
     # Post-flight diff check: detect zero-commit "success" in repo#number mode.
@@ -1860,17 +2017,17 @@ ${RESULT}"
             # either way. Saying "no /ce:plan invocation detected" here reports a
             # search that never happened — the shape both 2026-08-28 callbacks
             # took, since neither session ever created its .log file.
-            RESULT="PIPELINE FAILURE: dev-groom: _find_issue_plan returned empty for $REPO#$ISSUE_NUM (no filename match *-${ISSUE_NUM}-*-plan.md, no anchored header match in first 20 lines, and no broad issue-number reference in first 50 lines). The session log was not readable at ${SESSION_LOG}, so whether /ce:plan ran is unknown. Inspect \${WORKTREE_DIR}/docs/plans/*-plan.md >500 bytes directly — if a plan exists, this is a _find_issue_plan discovery bug (see mika#1617 class); if no plan exists, the session produced nothing.
+            RESULT="PIPELINE FAILURE: dev-groom: _find_issue_plan returned empty for $REPO#$ISSUE_NUM (no filename match *-${ISSUE_NUM}-*-plan.md, no anchored header match in first 20 lines, and no broad issue-number reference in first 50 lines)${PLAN_REFUTED_NOTE}. The session log was not readable at ${SESSION_LOG}, so whether /ce:plan ran is unknown. Inspect \${WORKTREE_DIR}/docs/plans/*-plan.md >500 bytes directly — if a plan exists, this is a _find_issue_plan discovery bug (see mika#1617 class); if no plan exists, the session produced nothing.
 
 ${RESULT}"
         elif [ -z "$VALID_PLAN" ] && [ "$CE_PLAN_INVOKED" != "1" ]; then
             # Both checks failed: no plan file AND /ce:plan never called
-            RESULT="PIPELINE FAILURE: dev-groom: _find_issue_plan returned empty for $REPO#$ISSUE_NUM (no filename match *-${ISSUE_NUM}-*-plan.md, no anchored header match in first 20 lines, and no broad issue-number reference in first 50 lines) and no /ce:plan invocation detected in session log. Likely causes: (a) pilot drifted into executor mode without writing a plan, (b) plan was written but _find_issue_plan's three-tier discovery didn't match — check \${WORKTREE_DIR}/docs/plans/*-plan.md >500 bytes to distinguish (see mika#1617 class).
+            RESULT="PIPELINE FAILURE: dev-groom: _find_issue_plan returned empty for $REPO#$ISSUE_NUM (no filename match *-${ISSUE_NUM}-*-plan.md, no anchored header match in first 20 lines, and no broad issue-number reference in first 50 lines)${PLAN_REFUTED_NOTE} and no /ce:plan invocation detected in session log. Likely causes: (a) pilot drifted into executor mode without writing a plan, (b) plan was written but _find_issue_plan's three-tier discovery didn't match — check \${WORKTREE_DIR}/docs/plans/*-plan.md >500 bytes to distinguish (see mika#1617 class).
 
 ${RESULT}"
         elif [ -z "$VALID_PLAN" ]; then
             # Plan file missing but /ce:plan was called (or log unavailable)
-            RESULT="PIPELINE FAILURE: dev-groom: _find_issue_plan returned empty for $REPO#$ISSUE_NUM (no filename match *-${ISSUE_NUM}-*-plan.md, no anchored header match in first 20 lines, and no broad issue-number reference in first 50 lines). Inspect \${WORKTREE_DIR}/docs/plans/*-plan.md >500 bytes directly — if a plan exists, this is a _find_issue_plan discovery bug (see mika#1617 class); if no plan exists, the pilot drifted into executor mode.
+            RESULT="PIPELINE FAILURE: dev-groom: _find_issue_plan returned empty for $REPO#$ISSUE_NUM (no filename match *-${ISSUE_NUM}-*-plan.md, no anchored header match in first 20 lines, and no broad issue-number reference in first 50 lines)${PLAN_REFUTED_NOTE}. Inspect \${WORKTREE_DIR}/docs/plans/*-plan.md >500 bytes directly — if a plan exists, this is a _find_issue_plan discovery bug (see mika#1617 class); if no plan exists, the pilot drifted into executor mode.
 
 ${RESULT}"
         elif [ "$CE_PLAN_INVOKED" != "1" ] && [ "$CE_PLAN_INVOKED" != "unknown" ]; then
@@ -2259,20 +2416,129 @@ Dedup-rebase failed (${dedup_conflicts:+conflict: $dedup_conflicts}${dedup_confl
 # ============================================================================
 # Iterate-loop primitives (mika#1271 contract refactor — Phase A/B/C).
 #
-# These helpers will be wired into a state machine (`_iterate_groom_loop`) in a
-# follow-up PR. v1 ships the primitives only — defined and unit-testable, no
-# call sites in the live dispatch path. See
+# These helpers are wired into `_iterate_groom_loop` and into
+# `_post_flight_recovery`, which calls `_find_issue_plan` on every dev-groom
+# dispatch — they are NOT dormant. The original v1 note claiming "no call
+# sites in the live dispatch path" was left behind when the wiring landed, and
+# it hid the blast radius of mika#2038: the plan this function picks is written
+# into the issue body as the `> - **Plan:**` callout, which `_detect_plan_on_branch`
+# later reads back to build the pilot's entry command. See
 # docs/plans/2026-05-25-003-feat-1271-iterate-loop-state-machine-plan.md.
 # ============================================================================
+
+_plan_header_claimed_issues() {
+    # mika#2038: every issue number the plan's header zone claims, one per line
+    # (empty when it claims none).
+    #
+    # The claim pattern is deliberately WIDER than tier 2's match pattern.
+    # Tier 2 requires `mika[[:space:]]?(issue)?#N`; the founding incident's
+    # header is `**Issue:** #539` — no `mika` prefix — so a tier-2-shaped probe
+    # would not see it and the bug would have survived the fix. It also reads
+    # the bare-numeric YAML shapes (`issue: 1679`, `number: 3030`) that
+    # mika#1617 taught tier 3, and tolerates an org/repo prefix
+    # (`issue: senara-solutions/mika#1772`).
+    #
+    # Three deliberate narrowings, each found by probing real plans rather than
+    # fixtures — every one of them costs a false negative when it is missing:
+    #   - The label starts the line (optionally after a list dash and bold
+    #     markers), exactly as tier 2 anchors its own match. Unanchored, `id`
+    #     matched inside `groom_session_id: 557a7808-…` and refuted mika#1469's
+    #     own plan with a claim of "issue 557"; `Related issue: #456` was read
+    #     as ownership rather than as the cross-reference it is; and the prose
+    #     `The issue: 3 phases remain` claimed issue 3.
+    #   - `id` is not a refuting label at all. `session_id`, `run_id` and friends
+    #     are common in plan frontmatter and almost never carry an issue number,
+    #     so reading them as claims costs false negatives and buys nothing.
+    #   - Every `#N` on a label line counts, not just the last one: a greedy
+    #     single-match read of `**Ticket:** mika#1772/#1773` saw only 1773 and
+    #     would have refuted that plan for its own issue 1772.
+    # Tier 3's broad scan still reads `id:` and unanchored prose — it is looking
+    # for a reason to ACCEPT, where a wrong guess is recoverable and the
+    # refutation below is the compensating guard. Refutation looks for a reason
+    # to REJECT, where a wrong guess hides a plan that exists.
+    #
+    # Header zone is the first 20 lines, the same scope tier 2 uses: body prose
+    # quoting another ticket's header must not be read as a claim (the
+    # false-positive mika#1421's v1 self-test hit).
+    local candidate="$1"
+    [ -n "$candidate" ] && [ -r "$candidate" ] || return 0
+    local label_lines
+    label_lines=$(head -n 20 "$candidate" 2>/dev/null \
+        | grep -iE '^[[:space:]]*(-[[:space:]]+)?(\*\*)?(ticket|issue|number)(:\*\*|:)')
+    [ -n "$label_lines" ] || return 0
+    {
+        # Every `#N` on a label line, not just the last: a header may name two
+        # tickets in one field (`**Ticket:** mika#1772/#1773`).
+        printf '%s\n' "$label_lines" | grep -oE '#[0-9]+' | tr -d '#'
+        # A bare numeric value sitting directly after the label (`issue: 1679`).
+        printf '%s\n' "$label_lines" \
+            | sed -E 's/^[[:space:]]*(-[[:space:]]+)?(\*\*)?[A-Za-z]+(:\*\*|:)[[:space:]]*//' \
+            | grep -oE '^[0-9]+'
+    } | sort -u
+}
+
+_plan_header_refutes_issue() {
+    # mika#2038: does this plan's header claim an issue OTHER than $2?
+    #
+    # Refutation, not confirmation. A candidate is rejected only on positive
+    # evidence that it belongs to a different ticket. Silence is NOT evidence:
+    # 95 of the 745 plans in docs/plans/ carry no issue marker at all, and
+    # requiring a positive header match would make every one of them
+    # undiscoverable at tier 1 — reopening the false-negative class bound by
+    # mika#1421 (n=2), mika#1602 (n=3) and mika#1617 (N=5).
+    #
+    # A header naming several issues refutes only when NONE of them is the
+    # target: a plan for one ticket may legitimately cite others in its title.
+    #
+    # Args: $1 = candidate path, $2 = target issue number.
+    # Returns 0 when refuted, 1 otherwise (including on unreadable input —
+    # fail-open, because acceptance is the safe direction here).
+    local candidate="$1" issue_num="$2"
+    [ -n "$candidate" ] && [ -n "$issue_num" ] || return 1
+
+    local claimed
+    claimed=$(_plan_header_claimed_issues "$candidate")
+    [ -n "$claimed" ] || return 1
+
+    local n
+    while IFS= read -r n; do
+        [ "$n" = "$issue_num" ] && return 1
+    done <<< "$claimed"
+
+    return 0
+}
+
+_plan_filename_issue_slot() {
+    # mika#2038: the issue number sitting in the canonical filename slot of
+    # `<date>-<NNN>-<type>-<issue>-<slug>-plan.md`, or empty when the name does
+    # not honour that shape. Only 255 of 745 real plans do, which is why this
+    # ranks survivors (KTD4) and never filters candidates.
+    printf '%s' "${1##*/}" \
+        | sed -nE 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]+-[a-z]+-([0-9]+)-.*/\1/p'
+}
 
 _find_issue_plan() {
     # Locate the plan file for $REPO#$ISSUE_NUM in $WORKTREE_DIR/docs/plans.
     #
     # Three-tier discovery, evaluated in strict order (first match wins):
     #
-    # Tier 1 (filename): glob `*-${ISSUE_NUM}-*-plan.md` — fast, exact.
+    # Tier 1 (filename): glob `*-${ISSUE_NUM}-*-plan.md`, then refute and rank
     #          (the convention most existing plans follow:
     #          e.g. `2026-06-05-001-fix-1407-pilot-push-diagnosis-plan.md`).
+    #          mika#2038: the glob matches ANY hyphen-delimited 4-digit run,
+    #          wherever it sits in the name — a RustSec advisory id, a year in
+    #          a slug, another ticket cited in the plan's title. For
+    #          ISSUE_NUM=2026 it matched `rustsec-2026-0097` and a pilot
+    #          dispatched for mika#2026 was launched on an April plan about
+    #          bumping `rand`. Tier 1 returned first, so tiers 2 and 3 — which
+    #          read the header and would have found the right plan — never ran.
+    #          The tier now collects every candidate, discards the ones whose
+    #          header names a DIFFERENT issue, and ranks the survivors by
+    #          filename slot position. The glob stays permissive on purpose:
+    #          only 255 of the 745 plans in docs/plans/ honour the
+    #          `<date>-<NNN>-<type>-<issue>-` slot, so an exclusive positional
+    #          filter would trade this one false positive for ~490 false
+    #          negatives — the very class tiers 2 and 3 exist to catch.
     #
     # Tier 2 (anchored header): grep first 20 lines for four prefixes
     #          (`**Ticket:**`, `**Issue:**`, `ticket:`, `issue:`) followed
@@ -2300,13 +2566,42 @@ _find_issue_plan() {
     # most-recent match. Prints the absolute plan path on success; returns
     # non-zero with no stdout on failure. Callers must check `[ -n ... ]`
     # AND `[ -r ... ]` exactly as before.
+    # Cleared on entry, deliberately WITHOUT `local` (same contract as
+    # GROOM_LOOP_FAILURE_REASON below): callers read it after the function
+    # returns, to tell "no candidate existed" apart from "a candidate existed
+    # and was deliberately discarded". Those two states need different operator
+    # advice and used to be reported identically. mika#2038.
+    FIND_ISSUE_PLAN_REFUTED=""
+
     [ -n "$WORKTREE_DIR" ] && [ -n "$ISSUE_NUM" ] || return 1
 
-    # Primary: filename-embedded issue number
-    local plan_path
-    plan_path=$(find "$WORKTREE_DIR/docs/plans" \
+    # Primary: filename-embedded issue number, refuted by header, ranked by slot
+    local plan_path candidate claimed
+    local in_slot="" off_slot=""
+    while IFS= read -r candidate; do
+        [ -n "$candidate" ] && [ -r "$candidate" ] || continue
+        if _plan_header_refutes_issue "$candidate" "$ISSUE_NUM"; then
+            claimed=$(_plan_header_claimed_issues "$candidate" | tr '\n' ' ')
+            echo "_find_issue_plan: tier 1 discarded ${candidate} — its header claims issue ${claimed% } not ${ISSUE_NUM}" >&2
+            FIND_ISSUE_PLAN_REFUTED="${FIND_ISSUE_PLAN_REFUTED}${FIND_ISSUE_PLAN_REFUTED:+, }${candidate##*/} (claims ${claimed% })"
+            continue
+        fi
+        if [ "$(_plan_filename_issue_slot "$candidate")" = "$ISSUE_NUM" ]; then
+            in_slot="${in_slot}${candidate}"$'\n'
+        else
+            off_slot="${off_slot}${candidate}"$'\n'
+        fi
+    done < <(find "$WORKTREE_DIR/docs/plans" \
         -name "*-${ISSUE_NUM}-*-plan.md" -size +500c 2>/dev/null \
-        | sort -r | head -1)
+        | sort -r)
+
+    plan_path=$(printf '%s' "$in_slot" | head -1)
+    if [ -n "$plan_path" ]; then
+        echo "_find_issue_plan: tier 1 selected ${plan_path} (issue number in the canonical filename slot)" >&2
+    else
+        plan_path=$(printf '%s' "$off_slot" | head -1)
+        [ -n "$plan_path" ] && echo "_find_issue_plan: tier 1 selected ${plan_path} (most recent surviving candidate; none carries the issue number in the canonical filename slot)" >&2
+    fi
     if [ -n "$plan_path" ] && [ -r "$plan_path" ]; then
         printf '%s' "$plan_path"
         return 0
@@ -2352,6 +2647,22 @@ _find_issue_plan() {
         [ -r "$candidate" ] || continue
         if head -n 50 "$candidate" 2>/dev/null \
             | grep -qE "(#${ISSUE_NUM}\b|(issue|ticket|number|id):[[:space:]]*${ISSUE_NUM}\b)"; then
+            # mika#2038: tier 3 matches a plan that merely MENTIONS the number
+            # anywhere in its first 50 lines — a Problem Frame naming the
+            # incident it fixes, a Sources list, a lineage note. Refuting only
+            # at tier 1 moved the bug rather than closing it: for ISSUE_NUM=2026
+            # tier 1 correctly discarded the April `rand` plan and tier 3 then
+            # handed back a plan belonging to mika#2038, so the pilot was still
+            # launched on a foreign plan. Same shape for #1383 → the #1685 plan.
+            # Tier 2 needs no such guard: it matches an anchored header that
+            # names THIS issue, so a candidate it accepts can never be refuted.
+            if _plan_header_refutes_issue "$candidate" "$ISSUE_NUM"; then
+                claimed=$(_plan_header_claimed_issues "$candidate" | tr '\n' ' ')
+                echo "_find_issue_plan: tier 3 discarded ${candidate} — it mentions ${ISSUE_NUM} but its header claims issue ${claimed% }" >&2
+                FIND_ISSUE_PLAN_REFUTED="${FIND_ISSUE_PLAN_REFUTED}${FIND_ISSUE_PLAN_REFUTED:+, }${candidate##*/} (claims ${claimed% })"
+                continue
+            fi
+            echo "_find_issue_plan: tier 3 selected ${candidate} (broad issue-number reference in the first 50 lines)" >&2
             printf '%s' "$candidate"
             return 0
         fi

@@ -1,7 +1,7 @@
 INSTALL_DIR ?= $(HOME)/.local/bin
 BINARIES := mika mika-spirit mika-gateway
 
-.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-dispatch-symmetry test-pilot-egress-proxy verify-bundled-skills lint fmt check check-ngrok deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
+.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv verify-no-secret-in-setenv verify-bundled-skills lint fmt check check-ngrok deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -123,6 +123,10 @@ calibrate-mika-orchestrator: ## Pre-swap calibration gate for mika-orchestrator 
 test: ## Run all tests
 	cargo test
 	@bash skills/bundled/_shared/test-dispatch-lib.sh
+	@bash skills/bundled/_shared/tests/test_find_issue_plan.sh
+	@bash skills/bundled/_shared/tests/test_sandbox_no_secret_in_argv.sh
+	@bash scripts/verify-no-secret-in-setenv.sh
+	@bash scripts/test-verify-no-secret-in-setenv.sh
 	@bash scripts/test-dispatch-symmetry.sh
 	@bash scripts/deploy-info-test.sh
 	@python3 -B scripts/test-pilot-egress-proxy-status.py
@@ -132,6 +136,16 @@ test-async-db-saturation: ## Run async DB channel saturation regression test (mi
 
 test-dispatch-lib: ## Run the dispatch-lib assertion suite (mika#1772 wired it into CI)
 	@bash skills/bundled/_shared/test-dispatch-lib.sh
+
+test-find-issue-plan: ## Run the plan-discovery suite (mika#2038 wired it into CI)
+	@bash skills/bundled/_shared/tests/test_find_issue_plan.sh
+
+test-sandbox-secret-argv: ## Verify no credential value reaches the pilot sandbox argv or trace (mika#2039 R8)
+	@bash skills/bundled/_shared/tests/test_sandbox_no_secret_in_argv.sh
+
+verify-no-secret-in-setenv: ## Verify no secret-shaped var reaches bwrap via --setenv (mika#2039 R7/R14/R15)
+	@bash scripts/verify-no-secret-in-setenv.sh
+	@bash scripts/test-verify-no-secret-in-setenv.sh
 
 test-dispatch-symmetry: ## Verify dev-pilot and dev-groom handlers are structurally symmetric (mika#893 R5)
 	@bash scripts/test-dispatch-symmetry.sh
