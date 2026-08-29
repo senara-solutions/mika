@@ -84,6 +84,9 @@ jobs:
       - name: Dispatch-lib assertion suite (mika#1772)
         run: make test-dispatch-lib
 
+      - name: Plan-discovery suite (mika#2038)
+        run: make test-find-issue-plan
+
       - name: Test (with telemetry feature)
         run: cargo test --workspace --features telemetry
 
