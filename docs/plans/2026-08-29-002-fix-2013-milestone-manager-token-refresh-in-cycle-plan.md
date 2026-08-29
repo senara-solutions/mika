@@ -175,6 +175,13 @@ clôture sur l'issue.
   périmètre des caches par agent). Point 3 : le seuil non fixé est une décision chargeante non
   résolue ; trancher pour une durée plutôt que des cycles, `poll_interval` étant configurable.
   Appliqué ci-dessus.
+- Passe architecte 2 (`mika-arch`, 2026-08-29T03:21:03Z) — **GROOMED**. Les trois incertitudes
+  soumises validées : 30 minutes retenu, anti-répétition horaire retenue, absence de variable
+  d'environnement retenue (YAGNI). Point 3 déclaré résolu, aucune décision non résolue ne subsiste.
+- Déviation déclarée : les deux réponses de l'architecte ont été générées puis **perdues au
+  transport** (`mika ask` → « connection error » sur payload > ~8 Ko) et récupérées depuis
+  `/var/log/mika/server.log`. La seconde passe a donc tourné sans `--session-id` — le `session_id`
+  voyageait dans l'enveloppe perdue — avec la première passe réinjectée verbatim dans le brief.
 
 ## Lié
 
