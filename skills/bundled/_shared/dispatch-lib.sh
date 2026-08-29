@@ -1194,6 +1194,8 @@ _run_claude_pilot() {
     # Unit 3 (mika#1282): flag for dirty-worktree rescue, checked by Unit 2.
     RESCUED_DIRTY_WORKTREE=0
     POST_RUN_HEAD=""
+    # mika#1772: set when a guardrail killed the session, read by the caller.
+    PILOT_SESSION_TERMINATED=0
 
     STDERR_FILE=$(mktemp)
     STDOUT_FILE=$(mktemp)
@@ -1236,6 +1238,16 @@ _run_claude_pilot() {
     STATUS=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.status // empty' 2>/dev/null)
     SESSION_ID=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.session_id // empty' 2>/dev/null)
     TURNS=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.turns // empty' 2>/dev/null)
+    # mika#1772: `status: terminated` covers TWO populations, and they need
+    # different handling. claude-pilot sets it both for a guardrail abort
+    # (subtype is one of stall_detected / empty_response / idle_timeout,
+    # claude-pilot/src/claude_pilot/types.py:154) and for an SDK limit
+    # (SDK_TERMINATION_SUBTYPES = {error_max_turns, error_max_budget_usd},
+    # agent.py:43). The first kills a session that has usually done nothing;
+    # the second kills one that has often done a great deal. Reading the
+    # subtype is how this file tells them apart instead of guessing.
+    SUBTYPE=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.subtype // empty' 2>/dev/null)
+    TERMINATION_REASON=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.termination_reason // empty' 2>/dev/null)
     COST=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.cost_usd // empty' 2>/dev/null)
     DURATION=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.duration_ms // empty' 2>/dev/null)
 
@@ -1273,11 +1285,38 @@ Stdout:
 ${PILOT_OUTPUT_RAW}"
     fi
 
-    # Post-flight recovery (mika#1615): runs unconditionally after exit
+    # mika#1772: a session a guardrail killed never ran, so every downstream
+    # check would be judging an empty worktree and reporting what it invented.
+    # This guard has to live here rather than in dispatch_claude_pilot, because
+    # _post_flight_recovery is called from THIS function — by the time control
+    # returns to the caller, the false content diagnoses are already in RESULT
+    # and a guard there could only prefix text that is already wrong.
+    #
+    # Post-flight recovery (mika#1615): otherwise runs unconditionally after exit
     # classification. Previously this logic lived inside the if [ -n "$STATUS" ]
     # branch only — Branch B (exit 0, non-JSON) and Branch C (non-zero exit)
     # silently skipped all recovery, losing uncommitted work.
-    _post_flight_recovery
+    local _terminated_empty=0 _terminated_with_work=0
+    if [ "$STATUS" = "terminated" ]; then
+        if _pilot_left_no_work; then _terminated_empty=1; else _terminated_with_work=1; fi
+    fi
+
+    if [ "$_terminated_empty" = "1" ]; then
+        PILOT_SESSION_TERMINATED=1
+        RESULT=$(_classify_terminated_session)
+    else
+        _post_flight_recovery
+        if [ "$_terminated_with_work" = "1" ]; then
+            # A session killed AFTER producing work still needs every recovery
+            # step above — the mika#1282 dirty-worktree rescue most of all, since
+            # the next dispatch force-removes this worktree. It only needs the
+            # operator to know the session did not finish, so the banner leads
+            # and the measured recovery output follows.
+            RESULT="$(_classify_terminated_session banner)
+
+${RESULT}"
+        fi
+    fi
 
     # Append stderr tail for debugging context (last 10KB)
     if [ -s "$STDERR_FILE" ]; then
@@ -1293,6 +1332,97 @@ ${STDERR_TAIL}"
     RESULT=$(printf '%s' "$RESULT" | head -c 92000)
 }
 
+# Did the finished pilot session leave anything behind?
+#
+# mika#1772. This is the measurement that separates the two populations
+# `status: terminated` covers. A guardrail kill at turn 1 leaves no commit and a
+# clean tree; an SDK-limit kill at turn 40 can leave both. Only the first may
+# skip the recovery chain, and only the first may be told "nothing was written".
+#
+# Returns 0 (no work) when HEAD did not move AND the worktree is clean. A worktree
+# that cannot be inspected counts as no work — the caller then reports a session
+# failure rather than inventing a content diagnosis, which is the conservative
+# direction for a tree nobody can read.
+_pilot_left_no_work() {
+    [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ] || return 0
+    [ "${PRE_RUN_HEAD:-}" = "${POST_RUN_HEAD:-}" ] || return 1
+    [ -z "$(git -C "$WORKTREE_DIR" status --porcelain 2>/dev/null)" ] || return 1
+    return 0
+}
+
+# Compose the callback for a pilot session claude-pilot terminated.
+#
+# mika#1772. On 2026-08-28 two dev-groom dispatches of mika#2013 came back with
+# `status: terminated`, `Turns: 2`, and `[guardrail] idle_timeout: No meaningful
+# progress for 300s` — the first made zero tool calls, the second made one. No
+# plan was written and the architect was never reached. dispatch-lib ran the
+# whole content-validation chain over that empty session anyway and produced a
+# callback whose first three statements were all false, the loudest of them
+# telling the operator to go find a missing architect verdict.
+#
+# Two modes, because `terminated` covers two populations (see _pilot_left_no_work):
+#   full   — the session left nothing. The message says so, and carries the
+#            Outcome line, because the caller skipped the recovery chain.
+#   banner — the session left work. Says only what was measured and carries NO
+#            Outcome line; the recovery chain ran and owns that.
+#
+# Reads STATUS, SUBTYPE, TERMINATION_REASON, SESSION_ID, TURNS, DURATION,
+# PRE_RUN_HEAD, POST_RUN_HEAD, LOG_ID, STDERR_FILE. Prints the callback body.
+_classify_terminated_session() {
+    local mode="${1:-full}"
+    local cause guardrail="" stderr_path _candidate
+
+    # The halt cause comes from the structured result first. claude-pilot puts
+    # the guardrail name in `.subtype` and its detail in `.termination_reason`
+    # (agent.py:155-162), which is more reliable than scraping stderr and is the
+    # only signal that distinguishes a guardrail abort from an SDK limit.
+    if [ -n "${SUBTYPE:-}" ]; then
+        cause="Halt: ${SUBTYPE}${TERMINATION_REASON:+ — ${TERMINATION_REASON}}"
+    else
+        # Fallback for a result without a subtype: scrape the `[guardrail]` line.
+        # Prefer the stderr still in hand; the persisted copy may not exist yet
+        # if the mkdir/scrub at the top of this run failed.
+        # KTD3: stderr only enriches. STATUS is the classification, so a missing
+        # or unreadable copy degrades the text and never the verdict — both
+        # 2026-08-28 tasks had no .log file at all, and a fail-closed read here
+        # would have hidden the entire class.
+        stderr_path="${PILOT_LOG_DIR:-/var/log/claude-pilot}/${LOG_ID}.stderr"
+        for _candidate in "${STDERR_FILE:-}" "$stderr_path"; do
+            [ -n "$_candidate" ] && [ -f "$_candidate" ] && [ -r "$_candidate" ] || continue
+            guardrail=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$_candidate" 2>/dev/null \
+                | grep -m1 '\[guardrail\]' || true)
+            [ -n "$guardrail" ] && break
+        done
+        if [ -n "$guardrail" ]; then
+            cause="Halt: ${guardrail}"
+        else
+            cause="Halt: cause not recorded — no subtype on the result and no [guardrail] line in stderr."
+        fi
+    fi
+
+    if [ "$mode" = "banner" ]; then
+        printf '%s' "PIPELINE FAILURE: the claude-pilot session was terminated before it finished, but it left work behind. Everything below was produced by an incomplete session — treat it as unvalidated.
+
+Session: ${SESSION_ID:-unknown}
+Turns: ${TURNS:-unknown}
+Duration: ${DURATION:-unknown}ms
+${cause}
+Commits: ${PRE_RUN_HEAD:-unknown}..${POST_RUN_HEAD:-unknown}"
+        return 0
+    fi
+
+    printf '%s' "PIPELINE FAILURE: the claude-pilot session was terminated before it produced any work. This is a session failure, not a content failure.
+
+Session: ${SESSION_ID:-unknown}
+Turns: ${TURNS:-unknown}
+Duration: ${DURATION:-unknown}ms
+${cause}
+
+HEAD did not move and the worktree is clean, so nothing was written to the branch and the architect was never invoked. There is no plan and no verdict to go looking for. The cause is upstream of grooming — the pilot never got far enough to do its work. See the stall lineage on mika#1901 and the note above _run_pilot_sandboxed on the Anthropic 401 / SDK-stall chain that ends in exactly this shape.
+
+Outcome: PIPELINE_INCOMPLETE — pilot session terminated by claude-pilot before producing work."
+}
+
 _post_flight_recovery() {
     # Post-flight recovery (mika#1615): extracted from the if [ -n "$STATUS" ]
     # branch so recovery fires on ALL exit paths — structured JSON output,
@@ -1304,6 +1434,15 @@ _post_flight_recovery() {
     # Variables read/written: PRE_RUN_HEAD, POST_RUN_HEAD, WORKTREE_DIR, SKILL,
     # REPO, BRANCH, ISSUE_NUM, SESSION_ID, LOG_ID, RESULT, STATUS,
     # RESCUED_DIRTY_WORKTREE, PR_URL, VALID_PLAN (all global/caller-scoped).
+
+    # mika#1772: resolve THIS issue's plan once, up front. Both the re-dispatch
+    # note below and the plan validation further down need the same answer, and
+    # the note used to ask a different question — a glob for any *-plan.md at
+    # all, which main satisfies 769 times over, so the note always fired.
+    VALID_PLAN=""
+    if [ "$SKILL" = "dev-groom" ] && [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ]; then
+        VALID_PLAN=$(_find_issue_plan 2>/dev/null) || VALID_PLAN=""
+    fi
 
     # Post-flight diff check: detect zero-commit "success" in repo#number mode.
     if [ -n "$PRE_RUN_HEAD" ] && [ -n "$REPO" ]; then
@@ -1318,7 +1457,7 @@ _post_flight_recovery() {
             # See: docs/solutions/workflow-issues/
             #      2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md
             POLICY_DENY=""
-            PERSISTENT_STDERR_PATH="/var/log/claude-pilot/${LOG_ID}.stderr"
+            PERSISTENT_STDERR_PATH="${PILOT_LOG_DIR:-/var/log/claude-pilot}/${LOG_ID}.stderr"
             if [ -f "$PERSISTENT_STDERR_PATH" ] && [ -r "$PERSISTENT_STDERR_PATH" ]; then
                 POLICY_DENY=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$PERSISTENT_STDERR_PATH" 2>/dev/null \
                     | grep -m1 '\[policy:deny\]' || true)
@@ -1341,13 +1480,19 @@ Likely a tier1 or tier2 allow-list gap in claude-pilot-py. Investigate the deny 
 See: docs/solutions/workflow-issues/2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md
 
 ${RESULT}"
-            elif [ "$SKILL" = "dev-groom" ] && [ -n "$WORKTREE_DIR" ] && \
-               find "$WORKTREE_DIR/docs/plans" -name "*-plan.md" -size +500c 2>/dev/null | grep -q .; then
-                RESULT="Note: HEAD unchanged on dev-groom re-dispatch — plan already committed from prior run. Architect pass will determine outcome.
+            elif [ "$SKILL" = "dev-groom" ] && [ -n "$VALID_PLAN" ]; then
+                # mika#1772: keyed on a plan for THIS issue, not on any plan file
+                # in the worktree. The old glob made this note unconditional for
+                # dev-groom, so a first dispatch that wrote nothing was reported
+                # as a re-dispatch whose plan had already landed.
+                RESULT="Note: HEAD unchanged on dev-groom re-dispatch — the plan for ${REPO}#${ISSUE_NUM} is already committed (${VALID_PLAN}). Architect pass will determine outcome.
 
 ${RESULT}"
             else
-                RESULT="PIPELINE FAILURE: claude-pilot exited 0 but HEAD unchanged (pre: ${PRE_RUN_HEAD}, post: ${POST_RUN_HEAD}). Zero new commits produced.
+                # mika#1772: name the exit code that was actually observed. This
+                # branch asserted "exited 0" unconditionally, and the 2026-08-28
+                # sessions reached it carrying PILOT_EXIT=1.
+                RESULT="PIPELINE FAILURE: claude-pilot exited ${PILOT_EXIT:-unknown} (status ${STATUS:-unknown}) but HEAD unchanged (pre: ${PRE_RUN_HEAD}, post: ${POST_RUN_HEAD}). Zero new commits produced.
 
 ${RESULT}"
             fi
@@ -1464,7 +1609,7 @@ Scaffold paths excluded (mika#1288, mika#1419)." --no-verify > "$RESCUE_COMMIT_E
                         POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
 
                         # Amend the PIPELINE FAILURE message (already set above) with rescue note
-                        RESULT="PIPELINE FAILURE: claude-pilot exited 0 but HEAD unchanged — dirty worktree detected and auto-committed (mika#1282 recovery).
+                        RESULT="PIPELINE FAILURE: claude-pilot exited ${PILOT_EXIT:-unknown} with HEAD unchanged — dirty worktree detected and auto-committed (mika#1282 recovery).
 Files rescued:
 ${RESCUED_FILES}
 
@@ -1502,7 +1647,7 @@ Scaffold paths excluded (mika#1288, mika#1419)." --no-verify > "$RESCUE_COMMIT_E
 
                             POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
 
-                            RESULT="PIPELINE FAILURE: claude-pilot exited 0 but HEAD unchanged — dirty worktree detected and auto-committed after cargo fmt (mika#1282 + mika#1296 recovery).
+                            RESULT="PIPELINE FAILURE: claude-pilot exited ${PILOT_EXIT:-unknown} with HEAD unchanged — dirty worktree detected and auto-committed after cargo fmt (mika#1282 + mika#1296 recovery).
 Files rescued:
 ${RESCUED_FILES}
 
@@ -1631,12 +1776,12 @@ dispatch-lib (mika#1383): rescued trailing dirty content into wip() commit; PR c
     # committed on a prior day, poisoning RESULT with PIPELINE_INCOMPLETE
     # and preventing the GROOMED outcome from reaching mika-dev.
     if [ "$SKILL" = "dev-groom" ] && [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ]; then
-        VALID_PLAN=$(_find_issue_plan 2>/dev/null) || VALID_PLAN=""
+        # VALID_PLAN was resolved at the top of this function (mika#1772).
 
         # Check session log for /ce:plan invocation (mika#1032).
         # Broad pattern covers Skill tool call JSON, command strings, etc.
         # Fail-open: if log is unavailable, skip the check with a warning.
-        SESSION_LOG="/var/log/claude-pilot/${LOG_ID}.log"
+        SESSION_LOG="${PILOT_LOG_DIR:-/var/log/claude-pilot}/${LOG_ID}.log"
         CE_PLAN_INVOKED=""
         if [ -f "$SESSION_LOG" ] && [ -r "$SESSION_LOG" ]; then
             if grep -qiE 'ce[.:\-_]plan' "$SESSION_LOG" 2>/dev/null; then
@@ -1657,7 +1802,7 @@ dispatch-lib (mika#1383): rescued trailing dirty content into wip() commit; PR c
         # Fail-open: if stderr is unavailable, fall through to the
         # existing drift messages.
         POLICY_DENY=""
-        PERSISTENT_STDERR_PATH="/var/log/claude-pilot/${LOG_ID}.stderr"
+        PERSISTENT_STDERR_PATH="${PILOT_LOG_DIR:-/var/log/claude-pilot}/${LOG_ID}.stderr"
         if [ -f "$PERSISTENT_STDERR_PATH" ] && [ -r "$PERSISTENT_STDERR_PATH" ]; then
             # Strip ANSI color codes, then extract the first [policy:deny] line.
             # The line shape is `[policy:deny] <Tool>: <command>[ \[rule-id\]]`.
@@ -1677,6 +1822,14 @@ Halt event: ${POLICY_DENY}
 Likely a tier1 or tier2 allow-list gap in claude-pilot-py. Investigate the deny rule and either (a) widen the policy to include the legitimate research command shape, or (b) rewrite the dispatch context so the pilot avoids the denied command. The pilot was prevented from completing its work — re-grooming this ticket without addressing the substrate gap will hit the same wall.
 
 See: docs/solutions/workflow-issues/2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md
+
+${RESULT}"
+        elif [ -z "$VALID_PLAN" ] && [ "$CE_PLAN_INVOKED" = "unknown" ]; then
+            # mika#1772: the log could not be read, so nothing was detected in it
+            # either way. Saying "no /ce:plan invocation detected" here reports a
+            # search that never happened — the shape both 2026-08-28 callbacks
+            # took, since neither session ever created its .log file.
+            RESULT="PIPELINE FAILURE: dev-groom: _find_issue_plan returned empty for $REPO#$ISSUE_NUM (no filename match *-${ISSUE_NUM}-*-plan.md, no anchored header match in first 20 lines, and no broad issue-number reference in first 50 lines). The session log was not readable at ${SESSION_LOG}, so whether /ce:plan ran is unknown. Inspect \${WORKTREE_DIR}/docs/plans/*-plan.md >500 bytes directly — if a plan exists, this is a _find_issue_plan discovery bug (see mika#1617 class); if no plan exists, the session produced nothing.
 
 ${RESULT}"
         elif [ -z "$VALID_PLAN" ] && [ "$CE_PLAN_INVOKED" != "1" ]; then
@@ -2751,6 +2904,27 @@ CALLOUT_EOF
     fi
 }
 
+# Records why _iterate_groom_loop is about to fail, and mirrors it to stderr.
+#
+# mika#1772: the loop has 18 `return 1` sites — guard trips, a missing plan, a
+# failed architect call, a response with no content, three architect refusals,
+# an unconverged revise pilot, an unparsable disposition — and every one of
+# them used to collapse into the same hardcoded sentence at the call site:
+# "architect convergence did not complete … Plan exists on branch but architect
+# verdict is missing." On the 2026-08-28 dispatches of mika#2013 the loop never
+# reached the architect and no plan existed, so that sentence sent the operator
+# hunting a verdict for a file that was never written.
+#
+# Recording and warning in one act is what keeps the invariant true: a future
+# `return 1` copied from a neighbouring site brings its reason with it. The
+# variable is global by design (KTD1) — `_iterate_groom_loop` is called
+# directly, not in a subshell or pipeline, so the value reaches the caller.
+# Same shape as PUSH_VIOLATION_EVIDENCE.
+_groom_warn() {
+    GROOM_LOOP_FAILURE_REASON="$1"
+    echo "WARN: iterate_groom_loop: $1" >&2
+}
+
 _iterate_groom_loop() {
     # Phase D — the iterate-loop state machine (mika#1271).
     #
@@ -2776,16 +2950,20 @@ _iterate_groom_loop() {
     # fallback for date-prefix slug-tail filenames per mika#1421).
     # Returns 1 if any guard fails.
 
+    # Cleared on entry, deliberately WITHOUT `local`: the caller reads it after
+    # a non-zero return, and a local would restore the old unnamed failure.
+    GROOM_LOOP_FAILURE_REASON=""
+
     [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ] || {
-        echo "WARN: iterate_groom_loop: WORKTREE_DIR unset or missing" >&2; return 1; }
+        _groom_warn "WORKTREE_DIR unset or missing"; return 1; }
     [ -n "$ISSUE_NUM" ] && [ -n "$REPO" ] || {
-        echo "WARN: iterate_groom_loop: ISSUE_NUM or REPO unset" >&2; return 1; }
+        _groom_warn "ISSUE_NUM or REPO unset"; return 1; }
 
     # Locate the plan file via _find_issue_plan (mika#1421 — filename pattern
     # with content-fallback for date-prefix slug-tail filenames).
     local plan_path
     plan_path=$(_find_issue_plan) || {
-        echo "WARN: iterate_groom_loop: no issue-scoped plan file for $REPO#$ISSUE_NUM" >&2
+        _groom_warn "no issue-scoped plan file for $REPO#$ISSUE_NUM"
         return 1
     }
 
@@ -2809,7 +2987,7 @@ _iterate_groom_loop() {
     for attempt in 1 2; do
         if [ "$attempt" -eq 1 ]; then
             resp1=$(_arch_ask "mika-arch-groom-ticket" "$plan_path" 2>/dev/null) || {
-                echo "WARN: iterate_groom_loop: first-pass _arch_ask failed" >&2
+                _groom_warn "first-pass _arch_ask failed"
                 return 1
             }
         else
@@ -2817,7 +2995,7 @@ _iterate_groom_loop() {
             # verbatim. Session preserved so the architect sees its own prior
             # response and can complete it in-place.
             local retry_prompt; retry_prompt=$(mktemp -t mika-arch-retry-XXXXXX.md 2>/dev/null) || {
-                echo "WARN: iterate_groom_loop: mktemp failed for retry prompt" >&2
+                _groom_warn "mktemp failed for retry prompt"
                 return 1
             }
             {
@@ -2832,14 +3010,14 @@ _iterate_groom_loop() {
             local _retry_status=$?
             rm -f "$retry_prompt"
             [ "$_retry_status" -eq 0 ] || {
-                echo "WARN: iterate_groom_loop: retry _arch_ask failed" >&2
+                _groom_warn "retry _arch_ask failed"
                 return 1
             }
         fi
         content1=$(printf '%s' "$resp1" | jq -r '.content // empty' 2>/dev/null)
         session_id=$(printf '%s' "$resp1" | jq -r '.metadata.session_id // empty' 2>/dev/null)
         [ -n "$content1" ] && [ -n "$session_id" ] || {
-            echo "WARN: iterate_groom_loop: first-pass response missing .content or .metadata.session_id" >&2
+            _groom_warn "first-pass response missing .content or .metadata.session_id"
             return 1
         }
         disposition=$(printf '%s' "$content1" | _parse_disposition)
@@ -2855,7 +3033,7 @@ _iterate_groom_loop() {
                 ;;
         esac
         if [ "$attempt" -eq 1 ]; then
-            echo "WARN: iterate_groom_loop: first-pass disposition UNPARSED; retrying _arch_ask once with corrective prompt (mika#1823)" >&2
+            _groom_warn "first-pass disposition UNPARSED; retrying _arch_ask once with corrective prompt (mika#1823)"
         fi
     done
 
@@ -2864,10 +3042,10 @@ _iterate_groom_loop() {
             echo "iterate_groom_loop: first-pass READY; invoking mika-arch second-pass" >&2
             # Phase 2 — second-pass, continuing the architect session
             local resp2; resp2=$(_arch_ask "mika-arch-second-review" "$plan_path" "$session_id" 2>/dev/null) || {
-                echo "WARN: iterate_groom_loop: second-pass _arch_ask failed" >&2; return 1; }
+                _groom_warn "second-pass _arch_ask failed"; return 1; }
             local content2; content2=$(printf '%s' "$resp2" | jq -r '.content // empty' 2>/dev/null)
             [ -n "$content2" ] || {
-                echo "WARN: iterate_groom_loop: second-pass response missing .content" >&2; return 1; }
+                _groom_warn "second-pass response missing .content"; return 1; }
             local verdict; verdict=$(printf '%s' "$content2" | _parse_verdict)
             local _trail_suffix_v=""
             _disposition_was_fuzzy && _trail_suffix_v=" (fuzzy)"
@@ -2879,9 +3057,11 @@ _iterate_groom_loop() {
                     _write_canonical_callout "ready-to-groomed" "$session_id" || \
                         echo "WARN: canonical_callout_failed — dispatch gate will reject next ready unless pilot organic write or operator-direct rescue fills the body callout" >&2
                     _cleanup_iterate_findings
+                    GROOM_LOOP_FAILURE_REASON=""
                     return 0
                     ;;
                 *)
+                    GROOM_LOOP_FAILURE_REASON="architect refused on second pass after a READY first pass"
                     _escalate_groom "second-pass-after-ready" "$content2" "$session_id"
                     return 1
                     ;;
@@ -2894,15 +3074,15 @@ _iterate_groom_loop() {
             # slash-command snapshot that _set_up_worktree copies in).
             local findings_dir="$WORKTREE_DIR/.iterate"
             mkdir -p "$findings_dir" 2>/dev/null || {
-                echo "WARN: iterate_groom_loop: cannot create $findings_dir" >&2; return 1; }
+                _groom_warn "cannot create $findings_dir"; return 1; }
             local findings_file="$findings_dir/findings-1.md"
             printf '%s\n' "$content1" > "$findings_file" || {
-                echo "WARN: iterate_groom_loop: cannot write $findings_file" >&2; return 1; }
+                _groom_warn "cannot write $findings_file"; return 1; }
 
             # Launch revise pilot with the findings as @-file payload. Pilot
             # revises plan on disk; we detect via sha256.
             _launch_revise_pilot "$findings_file" || {
-                echo "WARN: iterate_groom_loop: revise pilot did not converge — preserving $findings_file for forensics" >&2
+                _groom_warn "revise pilot did not converge — preserving $findings_file for forensics"
                 return 1
             }
 
@@ -2911,12 +3091,12 @@ _iterate_groom_loop() {
             # memory (per mika-arch-second-review session-continuity contract).
             echo "iterate_groom_loop: invoking mika-arch second-pass on revised plan" >&2
             local resp2_iter; resp2_iter=$(_arch_ask "mika-arch-second-review" "$plan_path" "$session_id" 2>/dev/null) || {
-                echo "WARN: iterate_groom_loop: second-pass _arch_ask failed (after revise)" >&2
+                _groom_warn "second-pass _arch_ask failed (after revise)"
                 return 1
             }
             local content2_iter; content2_iter=$(printf '%s' "$resp2_iter" | jq -r '.content // empty' 2>/dev/null)
             [ -n "$content2_iter" ] || {
-                echo "WARN: iterate_groom_loop: second-pass response missing .content (after revise)" >&2
+                _groom_warn "second-pass response missing .content (after revise)"
                 return 1
             }
             local verdict_iter; verdict_iter=$(printf '%s' "$content2_iter" | _parse_verdict)
@@ -2930,15 +3110,18 @@ _iterate_groom_loop() {
                     _write_canonical_callout "iterate-to-groomed" "$session_id" || \
                         echo "WARN: canonical_callout_failed — dispatch gate will reject next ready unless pilot organic write or operator-direct rescue fills the body callout" >&2
                     _cleanup_iterate_findings
+                    GROOM_LOOP_FAILURE_REASON=""
                     return 0
                     ;;
                 *)
+                    GROOM_LOOP_FAILURE_REASON="architect refused on second pass after an ITERATE revise"
                     _escalate_groom "second-pass-after-iterate" "$content2_iter" "$session_id"
                     return 1
                     ;;
             esac
             ;;
         ESCALATE)
+            GROOM_LOOP_FAILURE_REASON="architect ESCALATE (first-pass)"
             _escalate_groom "first-pass" "$content1" "$session_id"
             return 1
             ;;
@@ -2946,7 +3129,7 @@ _iterate_groom_loop() {
             # Unreachable after the retry loop above (mika#1823), which returns
             # 1 explicitly on double-UNPARSED. Kept for safety — invariant
             # violation if reached.
-            echo "WARN: iterate_groom_loop: first-pass disposition unparsed after retry loop (invariant violation — see mika#1272 / #1823)" >&2
+            _groom_warn "first-pass disposition unparsed after retry loop (invariant violation — see mika#1272 / #1823)"
             return 1
             ;;
     esac
@@ -3516,7 +3699,11 @@ ${RESULT}"
     # body callout. The pilot's organic write in the dev-groom skill prompt
     # remains as a fallback until the dev-groom-prompt-update follow-up
     # ships. See docs/plans/2026-05-25-009-feat-1271-class-d-shim-retire-plan.md.
-    if [ "$SKILL" = "dev-groom" ]; then
+    # mika#1772: skip convergence entirely on a terminated session — there is no
+    # plan on the branch to hand the architect, and running it anyway is what
+    # manufactured the "architect convergence did not complete" callback on the
+    # 2026-08-28 dispatches of mika#2013.
+    if [ "$SKILL" = "dev-groom" ] && [ "${PILOT_SESSION_TERMINATED:-0}" != "1" ]; then
         if _iterate_groom_loop; then
             # mika#1394: Architect converged on GROOMED — unconditionally override
             # the outcome to PLAN_GROOMED. The previous sed only matched
@@ -3537,22 +3724,65 @@ Outcome: PLAN_GROOMED"
             # mika#1333: propagate architect-convergence failure into RESULT.
             # Replaces the silent-tolerance pattern that caused mid-flow
             # short-circuit (plan committed but architect never ran/failed).
+            # mika#1772: the reason comes from the loop, which is the only thing
+            # that knows which of its 18 exits fired. The sentence that used to
+            # sit here named architect convergence for all of them, including
+            # the guard trips that never reach the architect.
+            local _groom_reason="${GROOM_LOOP_FAILURE_REASON:-no reason recorded}"
+            # Escaped for use as a sed replacement below: backslash first, then
+            # the delimiter and `&` (which sed expands to the whole match).
+            local _groom_reason_sed="${_groom_reason//\\/\\\\}"
+            _groom_reason_sed="${_groom_reason_sed//\//\\/}"
+            _groom_reason_sed="${_groom_reason_sed//&/\\&}"
+
+            # The plan claim is measured, not asserted — but by the measurement
+            # that can actually answer on this run. `_committed_plan_on_branch`
+            # asks the REMOTE, and needs a `> - **Plan:**` callout in the issue
+            # body to ask at all; on a first grooming neither holds — the plan is
+            # committed locally and the push happens further down — so it would
+            # stay silent in exactly the case the line exists for. VALID_PLAN is
+            # the worktree answer `_find_issue_plan` already resolved this run.
+            # Two measurements, two sentences; never one sentence for both.
+            local _groom_plan_line=""
+            local _groom_plan_path
+            if [ -n "${VALID_PLAN:-}" ]; then
+                _groom_plan_line="
+Plan in worktree: ${VALID_PLAN} — the architect verdict is what is missing, not the plan."
+            elif _groom_plan_path=$(_committed_plan_on_branch "$SUB_REPO_DIR" "$BRANCH" "$ISSUE_BODY" "$REPO" 2>/dev/null); then
+                _groom_plan_line="
+Plan on remote branch: ${_groom_plan_path} — the architect verdict is what is missing, not the plan."
+            fi
+
             # mika#1394: match any Outcome: line (not just PLAN_COMMITTED) to
             # handle re-dispatch where PIPELINE_INCOMPLETE was already set.
-            RESULT=$(printf '%s' "$RESULT" | sed 's/Outcome: .*/Outcome: PIPELINE_INCOMPLETE — architect convergence did not complete./')
+            RESULT=$(printf '%s' "$RESULT" | sed "s/Outcome: .*/Outcome: PIPELINE_INCOMPLETE — ${_groom_reason_sed}/")
             # If no Outcome: line existed, append one.
             if ! printf '%s' "$RESULT" | grep -qF 'Outcome: PIPELINE_INCOMPLETE'; then
                 RESULT="${RESULT}
 
-Outcome: PIPELINE_INCOMPLETE — architect convergence did not complete."
+Outcome: PIPELINE_INCOMPLETE — ${_groom_reason}"
             fi
-            RESULT="PIPELINE FAILURE: architect convergence did not complete (_iterate_groom_loop returned non-zero). Plan exists on branch but architect verdict is missing.
+            RESULT="PIPELINE FAILURE: grooming did not converge — ${_groom_reason} (_iterate_groom_loop returned non-zero).${_groom_plan_line}
 
 ${RESULT}"
         fi
     fi
 
-    _push_branch
+    # mika#1772 (R6): suppress only the EMPTY-branch push a terminated session
+    # produces — the `mode=first-push` that put a plan-less branch on origin for
+    # mika#2013. The flag alone is sufficient because _pilot_left_no_work already
+    # gated it on a clean tree and an unmoved HEAD: a session killed AFTER
+    # committing never sets it, so its work still reaches origin. That matters —
+    # _push_branch publishes any local-ahead commits regardless of exit code, and
+    # the next dispatch force-removes this worktree, so a blanket skip on
+    # termination would destroy the late-hang work mika#1901 describes.
+    if [ "${PILOT_SESSION_TERMINATED:-0}" = "1" ]; then
+        RESULT="${RESULT}
+
+Push: SKIPPED — session terminated with no new commits; there is nothing to publish."
+    else
+        _push_branch
+    fi
 
     # Unit 2 (mika#1282 + mika#1396): open a draft PR when content was rescued
     # by dispatch-lib's git-workflow ownership.

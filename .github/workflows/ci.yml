@@ -81,6 +81,9 @@ jobs:
       - name: Verify bundled skills structural invariants (mika#1575)
         run: make verify-bundled-skills
 
+      - name: Dispatch-lib assertion suite (mika#1772)
+        run: make test-dispatch-lib
+
       - name: Test (with telemetry feature)
         run: cargo test --workspace --features telemetry
 
