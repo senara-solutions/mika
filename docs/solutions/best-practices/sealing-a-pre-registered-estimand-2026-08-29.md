@@ -1,7 +1,7 @@
 ---
-title: "Sealing a pre-registered estimand: one constructor, and pick the field that has no asymmetry"
+title: "Sealing a pre-registered estimand: one constructor, one unavoidable pair, and a field with no asymmetry"
 module: mika-agent::research
-tags: [measurement, pre-registration, newtype, structural-guard, token-accounting, rt-005]
+tags: [measurement, pre-registration, newtype, structural-guard, token-accounting, reporting-rule, rt-005]
 problem_type: bug-class-prevention
 category: best-practices
 date: 2026-08-29
@@ -10,8 +10,10 @@ issue: 1891
 
 # Sealing a pre-registered estimand
 
-Two lessons from building the RT-005 offline analyzer (mika#1891), both about
-protecting a *measurement definition* rather than a security boundary.
+Three lessons from building the RT-005 offline analyzer (mika#1891), all about
+protecting a *measurement definition* rather than a security boundary. The
+common shape: the protocol document already said the right thing, and the code
+was changed so the wrong thing stopped being expressible.
 
 ## 1. A pre-registered definition needs one constructor, not a convention
 
@@ -81,8 +83,8 @@ does not quietly lapse:
 ```rust
 #[test]
 fn input_tokens_never_reach_the_estimand() {
-    let inflated = baseline.replace(r#""input_tokens":9999"#, r#""input_tokens":999999"#);
-    assert_eq!(analyze(&baseline, &m)…, analyze(&inflated, &m)…);
+    let inflated = base.replace(r#""input_tokens":9999"#, r#""input_tokens":999999"#);
+    assert_eq!(analyze(&[run(base)])…, analyze(&[run(inflated)])…);
 }
 ```
 
@@ -91,6 +93,48 @@ disagreement, check first whether the metric can be defined off a field that
 does not carry it. A normalization you don't have to write is one that cannot
 drift, and the compensating code is where the drift lives — someone extends the
 metric, forgets the correction, and the miscount returns silently.
+
+## 3. When the protocol says "report both", make one-alone unreachable
+
+RT-005's pre-registration names two contrasts on the same metric — the labelled
+arm (intention-to-treat) and the realised perturbation — and adds a rule:
+
+> Reporting only one is a protocol violation, whichever one it is.
+
+The rule exists because the design is balanced on the *label*, not on the
+*manipulation*: `peer_b` perturbs 3 of 10 items, so 14 of the 20 runs in a
+degraded cell are byte-identical in input to their fiable counterparts. The
+primary contrast is diluted by construction and the secondary is not. Whoever
+reports one alone gets to pick the more favourable answer, which is the
+garden-fork the pre-registration was written to close.
+
+Naming both in a document closes it for an honest reader. Closing it in the code
+means the API cannot express the violation:
+
+```rust
+impl Report {
+    /// Both verdicts, as a pair: primary first, pre-specified secondary second.
+    pub fn verdicts(&self) -> (Verdict, Verdict) { … }   // the ONLY accessor
+    pub fn render(&self) -> String { /* emits both, primary first */ }
+}
+```
+
+No `primary()`. No `secondary()`. `render()` has no flag selecting one. A test
+exists whose only job is to fail if someone adds a single-contrast accessor.
+
+**The distinction that keeps this legal.** A guardrail on this pilot forbids "a
+family of tests" — and two contrasts could look like the start of one. They are
+not, on two counts: both were named before any data existed, and they share one
+metric and one interaction form, differing only in which runs enter. What makes
+a family dangerous is *choosing among its members after seeing the results*, and
+that choice is exactly what has been removed. Pre-registering two and emitting
+both is the opposite of a garden fork; pre-registering one and quietly computing
+a second is the fork.
+
+**Generalizes to:** any reporting duty phrased as "always report X alongside Y" —
+a fairness metric beside an accuracy metric, a p-value beside an effect size, a
+cost beside a latency. If the code can hand back one, someone eventually will,
+and the omission will not look like an omission.
 
 ## Where this lives
 

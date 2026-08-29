@@ -403,3 +403,72 @@ interaction on planning tokens, and whose covariates cannot reach that claim.
 - [ ] Calcule le terme d'interaction confiance×fiabilité sur les tokens-planification.
 - [ ] Rapporte les covariables séparément, sans les mélanger à l'estimand.
 - [ ] Output = preuve d'existence (signe/bascule) + disclaimer magnitude.
+
+---
+
+## Amendment — 2026-08-30: brick 3/5's actual contract
+
+Brick 3/5 landed as PR #2071 while this plan's implementation was in review. It
+records something structurally different from the manifest this plan assumed,
+and it carries a second pre-registered contrast. Both are folded in. This
+amendment is appended rather than edited into the body above so the change is
+legible: the estimand did not move, the input contract and the reporting duty
+did.
+
+**A1 — The input is a batch directory, not a `session_id -> reliability` map.**
+Each run writes `runs/<run_id>.json` (status, confidence, reliability, item_id,
+`perturbed`, `spirit_session_id`) and `logs/<run_id>.turn_usage.jsonl` (that
+run's raw lines, verbatim). Both factors are in the record, so KTD3's "confidence
+from the log, reliability from the manifest" becomes a **cross-check**: the
+capture's `agent_id` and `session_id` must match what the record claims, and a
+run whose slice carries anything else is excluded as unattributable rather than
+analysed.
+
+**A2 — `status` is a filter, and `contaminated` is its load-bearing value.**
+Only `status == "success"` is an observation. `contaminated` means the log slice
+held more than one spirit session for that agent, so its lines are not
+attributable. Counting a contaminated run would import another conversation's
+tokens into a cell mean. Excluded runs are counted and reported by reason.
+
+**A3 — Two contrasts, both pre-registered, both always reported.** `peer_b`
+perturbs 3 of 10 items, and a run's prompt carries only its item and peer_b's
+answer, so the arms are byte-identical on the other 7: the design is balanced on
+the *label*, not on the *manipulation*.
+`research/rt005-physics-pilot/orchestration/PREREGISTRATION.md` (operator
+decision, 2026-08-29, before any data) fixes the primary contrast as the
+labelled arm (intention-to-treat) and the realised perturbation as a
+**pre-specified secondary**, with the rule: *reporting only one is a protocol
+violation, whichever one it is.*
+
+This does not breach R1 (guardrail 1). It is still **one metric and one
+interaction form**; the two contrasts differ only in which runs enter. What R1
+forbids is a family of tests to choose among after seeing data — and the choice
+is precisely what is unavailable here, because both were named before the data
+and both are always emitted.
+
+The reporting rule gets the same treatment as guardrail 2: structural, not
+conventional. `Report` exposes no accessor yielding one contrast alone —
+`verdicts()` returns the pair, `render()` emits both, and a test exists to fail
+if someone adds a `primary()`.
+
+**A4 — The measurement channel.** Since mika#1727 `mika ask` is an A2A client:
+mika-spirit owns the execution session, so `turn_usage` is emitted under
+spirit's session id and the per-agent `~/.mika/agents/<name>/logs/` files carry
+none of it. `mika/CLAUDE.md` Signal O still describes the pre-#1727 topology.
+This module never goes looking for lines itself — the orchestrator slices them —
+but the module docs record the fact so a future reader does not follow the stale
+doc.
+
+**A5 — Fixtures now come from production, not from a reading of the emitter.**
+The parser's tests pin three lines copied verbatim from `/var/log/mika/server.log`
+(an EndTurn turn, a ToolUse turn, and a `step == 4294967295` continuation). The
+hand-authored fixture omitted the `message`, `span` and `spans` keys the emitter
+actually writes. It passed anyway — which is the point: a fixture written from a
+reading of the code can only confirm that reading. See
+`docs/solutions/best-practices/stale-doc-plus-matching-stub-hides-a-dead-measurement-channel-2026-08-30.md`
+(mika#1890) for the same failure class caught the expensive way.
+
+**A6 — `load_batch`.** Reading the batch directory is the one filesystem
+touch, isolated in a single read-only function so `analyze` stays a pure
+function of values. "Offline" continues to mean *runs no part of the protocol*;
+reading files the orchestrator already wrote is not running anything.
