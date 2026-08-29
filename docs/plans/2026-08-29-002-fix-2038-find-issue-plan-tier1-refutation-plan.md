@@ -20,7 +20,7 @@ execution: code
 - **Objective.** Un pilote dispatché pour un ticket travaille sur le plan de ce ticket. Un opérateur qui lit la commande d'entrée du pilote, ou le callout `> - **Plan:**` du corps de l'issue, voit un plan qui appartient à cette issue — sans avoir à ouvrir `dispatch-lib.sh`.
 - **Means.** Le palier 1 collecte tous les candidats du glob, puis écarte ceux dont l'en-tête nomme une autre issue, au lieu de retourner le premier résultat (KTD1, KTD2).
 - **Authority.** Le corps de mika#2038 fixe les critères d'acceptation. Ce plan fixe le mécanisme. Là où la lettre du ticket et le corpus mesuré divergent, KTD1 porte la résolution.
-- **Stop conditions.** Ne pas modifier la sémantique de correspondance des paliers 2 et 3. Ne pas prétendre corriger mika#2029. Arrêter et remonter si la correction demande de toucher `_detect_plan_on_branch` ou le contrat de convergence architecte.
+- **Stop conditions.** Ne pas modifier la **sémantique de correspondance** des paliers 2 et 3 — leurs motifs, leurs zones et leur ordre restent tels quels ; la réfutation est une garde ajoutée après leur correspondance, pas une correspondance différente. Ne pas prétendre corriger mika#2029. Arrêter et remonter si la correction demande de toucher `_detect_plan_on_branch` ou le contrat de convergence architecte.
 - **Execution profile.** Bash uniquement (`skills/bundled/_shared/`) plus deux suites de tests. Aucun changement Rust, aucun build, aucun déploiement.
 - **Tail ownership.** PR sur `bug/2038/dispatch-le-glob-de-s-lection-de-plan`, **`Closes #2038`**. Les quatre critères d'acceptation du ticket sont couverts par ce PR.
 
@@ -55,6 +55,8 @@ Le dégât survit à la session. `_iterate_groom_loop` écrit le chemin sélecti
 
 - R5. Le palier 1 écrit sur stderr le plan retenu et la raison de sa victoire, ainsi que la raison de l'écartement de chaque candidat rejeté.
 - R6. Ce stderr atteint l'opérateur au point d'appel vivant, au lieu d'être jeté.
+- R7. Un candidat réfuté n'est pas rendu par un palier ultérieur : la garde tient au palier qui lit les corps, pas seulement au palier 1.
+- R8. Quand un candidat a été écarté, le message d'échec du pipeline le dit, au lieu d'affirmer que rien n'a matché.
 
 ### Key Decisions
 
@@ -69,7 +71,6 @@ Le dégât survit à la session. `_iterate_groom_loop` écrit le chemin sélecti
 #### Deferred to Follow-Up Work
 
 - Le corps de mika#2026 porte encore le chemin du plan d'avril dans son callout `> - **Plan:**`. Réparer ce corps est une remédiation opérateur sur un objet GitHub vivant, pas un changement de code, et n'appartient pas à ce PR.
-- La même classe de faux positif existe au palier 3, dont le motif large (`#N` dans les 50 premières lignes) peut matcher un plan qui ne fait que citer l'issue en passant. Ce plan ne l'étend pas : le ticket vise le palier 1, et élargir la réfutation aux paliers 2 et 3 change leur sémantique — ce que les Stop conditions interdisent. Voir le risque nommé en Planning Contract.
 - Une garde qui validerait le callout à la lecture dans `_detect_plan_on_branch` (confronter l'en-tête du plan cité à l'issue qui le porte) rattraperait un corps déjà empoisonné. Hors scope ici : ce plan corrige l'écrivain, pas le lecteur.
 
 ### Sources
@@ -109,6 +110,10 @@ Les noms de fichier portant un nombre à quatre chiffres hors du créneau d'issu
 
 - KTD4. **La position dans le créneau classe les survivants ; elle n'en élimine aucun.** Après réfutation, préférer un candidat dont le numéro occupe le créneau `<date>-<NNN>-<type>-<issue>-` ; à défaut, retomber sur l'ordre de tri inverse. C'est ce qui rend l'intention positionnelle du ticket porteuse sans la rendre excluante. Governs R4.
 
+- KTD6. **La réfutation tient aussi au palier 3, pas seulement au palier 1.** Mesuré sur le corpus réel après la première implémentation : réfuter au seul palier 1 déplace le défaut au lieu de le fermer. Pour `ISSUE_NUM=2026` le palier 1 écartait bien le plan d'avril, puis le palier 3 rendait un plan appartenant à mika#2038 — dont le Problem Frame nomme mika#2026 — et le pilote repartait sur un plan étranger. Même forme pour #1383, qui recevait le plan de #1685. Le palier 3 matche une simple mention du numéro dans les 50 premières lignes ; c'est un motif conçu pour trouver une raison d'**accepter**, où l'erreur est rattrapable, et la réfutation en est la garde compensatoire. Le palier 2 n'a pas besoin de garde : il matche un en-tête ancré qui nomme CETTE issue, donc un candidat qu'il accepte ne peut pas être réfuté. Governs R7.
+
+- KTD7. **Une réfutation doit remonter jusqu'au message d'échec.** Les trois chaînes `PIPELINE FAILURE` affirment « no filename match … no anchored header match … » et orientent l'opérateur vers un bug de découverte ou une dérive du pilote. Après une réfutation, c'est faux : un plan a matché et a été écarté délibérément. La cause réelle la plus probable est un en-tête qui nomme le mauvais ticket — un parent de milestone au lieu de la sous-issue — et cela se corrige dans l'en-tête, pas en élargissant la découverte. `_find_issue_plan` publie donc ses écartements dans `FIND_ISSUE_PLAN_REFUTED`, sur le même contrat de globale non-`local` que `GROOM_LOOP_FAILURE_REASON`. Governs R8.
+
 - KTD5. **Journaliser sur stderr, garder stdout propre.** `_find_issue_plan` communique en imprimant le chemin sur stdout ; les appelants le capturent par substitution de commande. Les diagnostics vont sur stderr, dans la forme `echo ... >&2` que `_detect_plan_on_branch` utilise déjà. Governs R5.
 
 ### High-Level Technical Design
@@ -142,7 +147,6 @@ flowchart TB
 
 ### Risques
 
-- **Un candidat réfuté au palier 1 peut être repris au palier 3.** Le palier 3 scanne tous les `*-plan.md` et matche un `#N` nu dans les 50 premières lignes ; il ignore la réfutation. Pour le cas fondateur, le risque ne se matérialise pas — le plan d'avril ne contient ni `#2026` ni `issue: 2026`, seulement `RUSTSEC-2026-0097` — donc la correction du palier 1 suffit à fermer l'incident. Vérifier ce point en fixture pendant U4 plutôt que de le supposer. Le cas général est nommé en Deferred to Follow-Up Work.
 - **Sur-déclenchement de la réfutation.** Un motif de réfutation trop large rejetterait des candidats valides et rouvrirait la classe faux-négatif. La preuve exigée est le diff de corpus de la note d'exécution de U2, pas la lecture du code.
 
 ### Assumptions
@@ -280,6 +284,35 @@ flowchart TB
 
 ---
 
+### U5. Fermer la classe au palier 3 et rendre l'échec honnête
+
+**Goal:** un candidat réfuté n'est rendu par aucun palier, et l'opérateur apprend qu'un plan a été écarté.
+
+**Requirements:** R7, R8
+
+**Dependencies:** U1, U2
+
+**Files:**
+- `skills/bundled/_shared/dispatch-lib.sh` (boucle du palier 3 ; les trois chaînes `PIPELINE FAILURE` ; le point d'appel de `_post_flight_recovery`)
+- `skills/bundled/_shared/tests/test_find_issue_plan.sh`
+
+**Approach:**
+1. Consulter `_plan_header_refutes_issue` dans la boucle du palier 3, après sa correspondance et avant de retenir le candidat. Ne pas toucher au motif de correspondance lui-même.
+2. Ne pas ajouter la garde au palier 2 : il matche un en-tête ancré qui nomme la cible, donc il est immunisé par construction. Une garde y serait du code mort.
+3. Publier les écartements dans `FIND_ISSUE_PLAN_REFUTED`, vidée à l'entrée de `_find_issue_plan`, sur le contrat de globale non-`local` déjà utilisé par `GROOM_LOOP_FAILURE_REASON`.
+4. Faire porter aux trois messages `PIPELINE FAILURE` une note conditionnelle nommant les candidats écartés et l'issue que leur en-tête revendique.
+
+**Execution note:** les fixtures des unités précédentes remplissent leurs corps de texte de remplissage qui ne cite jamais le numéro cible — le palier 3 ne peut donc structurellement pas s'y déclencher, et une assertion « non retourné » y est verte sans rien prouver. Écrire d'abord une fixture dont le corps cite `mika#<cible>` dans les 50 premières lignes ; elle doit échouer avant la correction.
+
+**Test scenarios:**
+- Un candidat réfuté au palier 1 dont un autre plan, appartenant à une autre issue, cite la cible dans son corps → aucun plan retourné.
+- Après une réfutation, `FIND_ISSUE_PLAN_REFUTED` nomme le candidat écarté et l'issue que son en-tête revendique.
+- Un appel propre après un appel réfutant → `FIND_ISSUE_PLAN_REFUTED` vide (pas de revendication périmée héritée).
+
+**Verification:** le diff de corpus montre `(none)` pour #2026 au lieu d'un plan étranger, et aucun `(none)` ne correspond à une issue qui possède réellement un plan.
+
+---
+
 ## Verification Contract
 
 | Porte | Commande | Porte sur |
@@ -298,7 +331,9 @@ Les deux suites doivent sortir en 0. Le diff de corpus est une preuve attachée 
 
 - Le palier 1 ne retourne plus un plan dont l'en-tête nomme une autre issue, prouvé par la fixture littérale `rustsec-2026-0097`.
 - Le palier 1 retourne toujours les plans hors créneau et les plans sans en-tête, prouvé par les fixtures de non-régression.
-- Le palier 3 ne reprend pas le plan d'avril pour la cible 2026, prouvé par fixture et non supposé.
+- Aucun palier ne rend un candidat réfuté, prouvé par une fixture dont le corps cite la cible — la forme que les fixtures de remplissage ne peuvent pas produire.
+- Sur le corpus réel, `ISSUE_NUM=2026` ne rend plus aucun plan au lieu d'un plan étranger.
+- Après une réfutation, le message d'échec nomme le candidat écarté au lieu d'affirmer que rien n'a matché.
 - Chaque assertion préexistante des deux suites passe toujours, sans modification.
 - Le commentaire périmé « no call sites in the live dispatch path » est corrigé.
 - Le journal de sélection du palier 1 atteint stderr au point d'appel vivant, après vérification de ce que la redirection couvrait.

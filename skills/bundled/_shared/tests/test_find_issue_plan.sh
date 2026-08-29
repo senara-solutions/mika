@@ -431,9 +431,8 @@ fi
 {
     echo "# Plan: something"
     echo ""
-    echo "**Ticket:** mika issue#2038"
-    echo ""
-    echo "Also relates to **Issue:** #2026 which it does not fix."
+    echo "- **Ticket:** mika issue#2038"
+    echo "- **Issue:** #2026"
     echo ""
     for i in $(seq 1 30); do echo "Body padding line $i for size."; done
 } > "$HELPER_ROOT/docs/plans/two-claims.md"
@@ -485,6 +484,59 @@ else
     PASS=$((PASS + 1)); echo "  ✓ 'groom_session_id: 557a…' is not an issue claim (label is anchored)"
 fi
 
+# A cross-reference is not an ownership claim. `Related issue: #456` names an
+# issue the plan RELATES to; reading it as ownership refutes the plan for its
+# own ticket and drops it out of tier 1.
+{
+    echo "# Plan — mika#852 follow-up"
+    echo ""
+    echo "Related issue: #456"
+    echo ""
+    for i in $(seq 1 30); do echo "Body padding line $i for size."; done
+} > "$HELPER_ROOT/docs/plans/cross-reference.md"
+
+if _plan_header_refutes_issue "$HELPER_ROOT/docs/plans/cross-reference.md" 852; then
+    FAIL=$((FAIL + 1)); echo "  ✗ 'Related issue: #456' must NOT be read as an ownership claim"
+else
+    PASS=$((PASS + 1)); echo "  ✓ 'Related issue: #456' is a cross-reference, not a claim"
+fi
+
+# Prose that happens to contain a label word is not a claim either.
+{
+    echo "# Plan: something"
+    echo ""
+    echo "The issue: 3 phases remain before this lands."
+    echo ""
+    for i in $(seq 1 30); do echo "Body padding line $i for size."; done
+} > "$HELPER_ROOT/docs/plans/prose-label.md"
+
+if _plan_header_refutes_issue "$HELPER_ROOT/docs/plans/prose-label.md" 852; then
+    FAIL=$((FAIL + 1)); echo "  ✗ prose 'The issue: 3 phases' must NOT be read as a claim"
+else
+    PASS=$((PASS + 1)); echo "  ✓ prose 'The issue: 3 phases' is not a claim"
+fi
+
+# Two issue numbers in one label line: both are claims, not just the last.
+{
+    echo "# Plan: something"
+    echo ""
+    echo "**Ticket:** mika#1772/#1773"
+    echo ""
+    for i in $(seq 1 30); do echo "Body padding line $i for size."; done
+} > "$HELPER_ROOT/docs/plans/two-numbers-one-line.md"
+
+if _plan_header_refutes_issue "$HELPER_ROOT/docs/plans/two-numbers-one-line.md" 1772; then
+    FAIL=$((FAIL + 1)); echo "  ✗ 'mika#1772/#1773' must claim BOTH numbers, not only the last"
+else
+    PASS=$((PASS + 1)); echo "  ✓ 'mika#1772/#1773' claims both numbers"
+fi
+
+if _plan_header_refutes_issue "$HELPER_ROOT/docs/plans/two-numbers-one-line.md" 1773; then
+    FAIL=$((FAIL + 1)); echo "  ✗ 'mika#1772/#1773' must not refute its own second number"
+else
+    PASS=$((PASS + 1)); echo "  ✓ 'mika#1772/#1773' does not refute 1773 either"
+fi
+
 
 if _plan_header_refutes_issue "$HELPER_ROOT/docs/plans/deep-claim.md" 2026; then
     FAIL=$((FAIL + 1)); echo "  ✗ a claim past line 20 must NOT refute (header-zone scope)"
@@ -511,8 +563,9 @@ ISSUE_NUM=2026
 RESULT=$(_find_issue_plan 2>/dev/null || true)
 assert_empty "the April rustsec-2026-0097 plan is not returned for #2026" "$RESULT"
 
-# The plan carries neither `#2026` nor `issue: 2026`, so tier 3's broad scan
-# must not pick it back up either. Verified, not assumed.
+# Tier 3 is exercised for real below: a body that cites the target number is
+# the shape the real corpus has, and the shape that made the first draft of
+# this fix return a foreign plan for #2026.
 echo
 echo "mika#2038 — the correct plan still wins when both are present:"
 CORRECT_PLAN="$CASE_ROOT/docs/plans/2026-08-29-004-obs-loop-pr-origin-plan.md"
@@ -527,6 +580,37 @@ CORRECT_PLAN="$CASE_ROOT/docs/plans/2026-08-29-004-obs-loop-pr-origin-plan.md"
 RESULT=$(_find_issue_plan 2>/dev/null)
 assert_eq "correct #2026 plan is found via tier 2 once tier 1 refutes the April one" \
     "$CORRECT_PLAN" "$RESULT"
+
+echo
+echo "mika#2038 — a refuted candidate is not handed back by tier 3:"
+
+# Every fixture above pads its body with text that never mentions the target,
+# so tier 3 structurally cannot fire and a green "not returned" assertion
+# proves nothing about it. Real plans cite other tickets in their prose all
+# the time — this plan's own Problem Frame names mika#2026 nine times. The
+# refutation has to hold at the tier that reads bodies, not just at tier 1.
+CASE_ROOT=$(fresh_root)
+{
+    echo "# Plan: Bump rand to 0.9.3+ to clear RUSTSEC-2026-0097"
+    echo ""
+    echo "**Issue:** #539"
+    echo ""
+    for i in $(seq 1 30); do echo "Body padding line $i for size."; done
+} > "$CASE_ROOT/docs/plans/2026-04-11-003-chore-deps-bump-rand-clear-rustsec-2026-0097-plan.md"
+{
+    echo "# Plan: an unrelated ticket that merely discusses mika#2026"
+    echo ""
+    echo "**Ticket:** mika issue#2038"
+    echo ""
+    echo "A pilot dispatched for mika#2026 was launched on the wrong plan."
+    echo ""
+    for i in $(seq 1 30); do echo "Body padding line $i for size."; done
+} > "$CASE_ROOT/docs/plans/2026-08-29-002-fix-2038-tier1-refutation-plan.md"
+
+WORKTREE_DIR="$CASE_ROOT"
+ISSUE_NUM=2026
+RESULT=$(_find_issue_plan 2>/dev/null || true)
+assert_empty "no plan is returned for #2026 when every candidate belongs to another issue" "$RESULT"
 
 echo
 echo "mika#2038 — off-slot filenames still resolve at tier 1 (no false negatives):"
@@ -624,6 +708,45 @@ case "$STDERR" in
     *2026-08-29-005-obs-2026-real-plan.md*) PASS=$((PASS + 1)); echo "  ✓ selection is logged with the chosen path" ;;
     *) FAIL=$((FAIL + 1)); echo "  ✗ selection line missing the chosen path; got: $STDERR" ;;
 esac
+
+echo
+echo "mika#2038 — the refutation ledger tells callers WHY nothing was returned (R6):"
+
+# The three PIPELINE FAILURE strings used to assert "no filename match" and send
+# the operator after a discovery bug or pilot drift. After a refutation that is
+# false: a plan matched and was discarded on purpose. Callers read this global.
+CASE_ROOT=$(fresh_root)
+{
+    echo "# Plan: Bump rand"
+    echo ""
+    echo "**Issue:** #539"
+    echo ""
+    for i in $(seq 1 30); do echo "Body padding line $i for size."; done
+} > "$CASE_ROOT/docs/plans/2026-04-11-003-chore-deps-bump-rand-clear-rustsec-2026-0097-plan.md"
+
+WORKTREE_DIR="$CASE_ROOT"
+ISSUE_NUM=2026
+_find_issue_plan >/dev/null 2>&1 || true
+case "${FIND_ISSUE_PLAN_REFUTED:-}" in
+    *rustsec-2026-0097*539*) PASS=$((PASS + 1)); echo "  ✓ the discarded candidate and its claimed issue reach the caller" ;;
+    *) FAIL=$((FAIL + 1)); echo "  ✗ FIND_ISSUE_PLAN_REFUTED did not name the discard; got: '${FIND_ISSUE_PLAN_REFUTED:-}'" ;;
+esac
+
+# And it is cleared on entry, so a later clean call cannot inherit a stale claim.
+CASE_ROOT=$(fresh_root)
+GOOD="$CASE_ROOT/docs/plans/2026-08-29-006-fix-4242-clean-plan.md"
+{
+    echo "# Plan: clean"; echo ""
+    for i in $(seq 1 30); do echo "Body padding line $i for size."; done
+} > "$GOOD"
+WORKTREE_DIR="$CASE_ROOT"
+ISSUE_NUM=4242
+_find_issue_plan >/dev/null 2>&1 || true
+if [ -z "${FIND_ISSUE_PLAN_REFUTED:-}" ]; then
+    PASS=$((PASS + 1)); echo "  ✓ the ledger is cleared on entry (no stale claim carried forward)"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ stale refutation carried into a clean call: '${FIND_ISSUE_PLAN_REFUTED}'"
+fi
 
 echo
 echo "mika#2038 — empty plans dir is unchanged:"

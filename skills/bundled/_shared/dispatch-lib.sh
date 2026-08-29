@@ -1479,6 +1479,17 @@ _post_flight_recovery() {
         # that mika#2038 added. The `|| VALID_PLAN=""` fallback is unchanged: a
         # non-zero return still yields an empty string for the recovery logic below.
         VALID_PLAN=$(_find_issue_plan) || VALID_PLAN=""
+        # mika#2038: a plan can now be found AND deliberately discarded, so the
+        # failure text below must not tell the operator that nothing matched and
+        # send them hunting a discovery bug or pilot drift. The most likely real
+        # cause of a refusal is a plan whose header names the wrong ticket —
+        # a milestone parent instead of the sub-issue, say — and that is fixed
+        # in the header, not by widening discovery.
+        if [ -n "${FIND_ISSUE_PLAN_REFUTED:-}" ]; then
+            PLAN_REFUTED_NOTE=". NOTE: a plan file DID match and was deliberately discarded because its header names a different issue: ${FIND_ISSUE_PLAN_REFUTED}. If one of those is the right plan, correct its ticket header rather than the discovery logic"
+        else
+            PLAN_REFUTED_NOTE=""
+        fi
     fi
 
     # Post-flight diff check: detect zero-commit "success" in repo#number mode.
@@ -1866,17 +1877,17 @@ ${RESULT}"
             # either way. Saying "no /ce:plan invocation detected" here reports a
             # search that never happened — the shape both 2026-08-28 callbacks
             # took, since neither session ever created its .log file.
-            RESULT="PIPELINE FAILURE: dev-groom: _find_issue_plan returned empty for $REPO#$ISSUE_NUM (no filename match *-${ISSUE_NUM}-*-plan.md, no anchored header match in first 20 lines, and no broad issue-number reference in first 50 lines). The session log was not readable at ${SESSION_LOG}, so whether /ce:plan ran is unknown. Inspect \${WORKTREE_DIR}/docs/plans/*-plan.md >500 bytes directly — if a plan exists, this is a _find_issue_plan discovery bug (see mika#1617 class); if no plan exists, the session produced nothing.
+            RESULT="PIPELINE FAILURE: dev-groom: _find_issue_plan returned empty for $REPO#$ISSUE_NUM (no filename match *-${ISSUE_NUM}-*-plan.md, no anchored header match in first 20 lines, and no broad issue-number reference in first 50 lines)${PLAN_REFUTED_NOTE}. The session log was not readable at ${SESSION_LOG}, so whether /ce:plan ran is unknown. Inspect \${WORKTREE_DIR}/docs/plans/*-plan.md >500 bytes directly — if a plan exists, this is a _find_issue_plan discovery bug (see mika#1617 class); if no plan exists, the session produced nothing.
 
 ${RESULT}"
         elif [ -z "$VALID_PLAN" ] && [ "$CE_PLAN_INVOKED" != "1" ]; then
             # Both checks failed: no plan file AND /ce:plan never called
-            RESULT="PIPELINE FAILURE: dev-groom: _find_issue_plan returned empty for $REPO#$ISSUE_NUM (no filename match *-${ISSUE_NUM}-*-plan.md, no anchored header match in first 20 lines, and no broad issue-number reference in first 50 lines) and no /ce:plan invocation detected in session log. Likely causes: (a) pilot drifted into executor mode without writing a plan, (b) plan was written but _find_issue_plan's three-tier discovery didn't match — check \${WORKTREE_DIR}/docs/plans/*-plan.md >500 bytes to distinguish (see mika#1617 class).
+            RESULT="PIPELINE FAILURE: dev-groom: _find_issue_plan returned empty for $REPO#$ISSUE_NUM (no filename match *-${ISSUE_NUM}-*-plan.md, no anchored header match in first 20 lines, and no broad issue-number reference in first 50 lines)${PLAN_REFUTED_NOTE} and no /ce:plan invocation detected in session log. Likely causes: (a) pilot drifted into executor mode without writing a plan, (b) plan was written but _find_issue_plan's three-tier discovery didn't match — check \${WORKTREE_DIR}/docs/plans/*-plan.md >500 bytes to distinguish (see mika#1617 class).
 
 ${RESULT}"
         elif [ -z "$VALID_PLAN" ]; then
             # Plan file missing but /ce:plan was called (or log unavailable)
-            RESULT="PIPELINE FAILURE: dev-groom: _find_issue_plan returned empty for $REPO#$ISSUE_NUM (no filename match *-${ISSUE_NUM}-*-plan.md, no anchored header match in first 20 lines, and no broad issue-number reference in first 50 lines). Inspect \${WORKTREE_DIR}/docs/plans/*-plan.md >500 bytes directly — if a plan exists, this is a _find_issue_plan discovery bug (see mika#1617 class); if no plan exists, the pilot drifted into executor mode.
+            RESULT="PIPELINE FAILURE: dev-groom: _find_issue_plan returned empty for $REPO#$ISSUE_NUM (no filename match *-${ISSUE_NUM}-*-plan.md, no anchored header match in first 20 lines, and no broad issue-number reference in first 50 lines)${PLAN_REFUTED_NOTE}. Inspect \${WORKTREE_DIR}/docs/plans/*-plan.md >500 bytes directly — if a plan exists, this is a _find_issue_plan discovery bug (see mika#1617 class); if no plan exists, the pilot drifted into executor mode.
 
 ${RESULT}"
         elif [ "$CE_PLAN_INVOKED" != "1" ] && [ "$CE_PLAN_INVOKED" != "unknown" ]; then
@@ -2287,16 +2298,23 @@ _plan_header_claimed_issues() {
     # mika#1617 taught tier 3, and tolerates an org/repo prefix
     # (`issue: senara-solutions/mika#1772`).
     #
-    # Two deliberate narrowings, both found by the mika#2038 corpus diff after
-    # the first draft refuted real plans:
-    #   - The label is anchored to a non-word boundary. Unanchored, `id` matched
-    #     inside `groom_session_id: 557a7808-…` and refuted mika#1469's own plan
-    #     with a claim of "issue 557".
+    # Three deliberate narrowings, each found by probing real plans rather than
+    # fixtures — every one of them costs a false negative when it is missing:
+    #   - The label starts the line (optionally after a list dash and bold
+    #     markers), exactly as tier 2 anchors its own match. Unanchored, `id`
+    #     matched inside `groom_session_id: 557a7808-…` and refuted mika#1469's
+    #     own plan with a claim of "issue 557"; `Related issue: #456` was read
+    #     as ownership rather than as the cross-reference it is; and the prose
+    #     `The issue: 3 phases remain` claimed issue 3.
     #   - `id` is not a refuting label at all. `session_id`, `run_id` and friends
     #     are common in plan frontmatter and almost never carry an issue number,
     #     so reading them as claims costs false negatives and buys nothing.
-    # Tier 3's broad scan still reads `id:` — it is looking for a reason to
-    # ACCEPT, where a wrong guess is recoverable. Refutation looks for a reason
+    #   - Every `#N` on a label line counts, not just the last one: a greedy
+    #     single-match read of `**Ticket:** mika#1772/#1773` saw only 1773 and
+    #     would have refuted that plan for its own issue 1772.
+    # Tier 3's broad scan still reads `id:` and unanchored prose — it is looking
+    # for a reason to ACCEPT, where a wrong guess is recoverable and the
+    # refutation below is the compensating guard. Refutation looks for a reason
     # to REJECT, where a wrong guess hides a plan that exists.
     #
     # Header zone is the first 20 lines, the same scope tier 2 uses: body prose
@@ -2304,9 +2322,19 @@ _plan_header_claimed_issues() {
     # false-positive mika#1421's v1 self-test hit).
     local candidate="$1"
     [ -n "$candidate" ] && [ -r "$candidate" ] || return 0
-    head -n 20 "$candidate" 2>/dev/null | grep -oiE \
-        '(^|[^[:alnum:]_])(\*\*)?(ticket|issue)(:\*\*|:)[[:space:]]*(mika[[:space:]])?[^[:space:]]*#[0-9]+|(^|[^[:alnum:]_])(\*\*)?(ticket|issue|number)(:\*\*|:)[[:space:]]*[0-9]+' \
-        | grep -oE '[0-9]+$'
+    local label_lines
+    label_lines=$(head -n 20 "$candidate" 2>/dev/null \
+        | grep -iE '^[[:space:]]*(-[[:space:]]+)?(\*\*)?(ticket|issue|number)(:\*\*|:)')
+    [ -n "$label_lines" ] || return 0
+    {
+        # Every `#N` on a label line, not just the last: a header may name two
+        # tickets in one field (`**Ticket:** mika#1772/#1773`).
+        printf '%s\n' "$label_lines" | grep -oE '#[0-9]+' | tr -d '#'
+        # A bare numeric value sitting directly after the label (`issue: 1679`).
+        printf '%s\n' "$label_lines" \
+            | sed -E 's/^[[:space:]]*(-[[:space:]]+)?(\*\*)?[A-Za-z]+(:\*\*|:)[[:space:]]*//' \
+            | grep -oE '^[0-9]+'
+    } | sort -u
 }
 
 _plan_header_refutes_issue() {
@@ -2398,6 +2426,13 @@ _find_issue_plan() {
     # most-recent match. Prints the absolute plan path on success; returns
     # non-zero with no stdout on failure. Callers must check `[ -n ... ]`
     # AND `[ -r ... ]` exactly as before.
+    # Cleared on entry, deliberately WITHOUT `local` (same contract as
+    # GROOM_LOOP_FAILURE_REASON below): callers read it after the function
+    # returns, to tell "no candidate existed" apart from "a candidate existed
+    # and was deliberately discarded". Those two states need different operator
+    # advice and used to be reported identically. mika#2038.
+    FIND_ISSUE_PLAN_REFUTED=""
+
     [ -n "$WORKTREE_DIR" ] && [ -n "$ISSUE_NUM" ] || return 1
 
     # Primary: filename-embedded issue number, refuted by header, ranked by slot
@@ -2408,6 +2443,7 @@ _find_issue_plan() {
         if _plan_header_refutes_issue "$candidate" "$ISSUE_NUM"; then
             claimed=$(_plan_header_claimed_issues "$candidate" | tr '\n' ' ')
             echo "_find_issue_plan: tier 1 discarded ${candidate} — its header claims issue ${claimed% } not ${ISSUE_NUM}" >&2
+            FIND_ISSUE_PLAN_REFUTED="${FIND_ISSUE_PLAN_REFUTED}${FIND_ISSUE_PLAN_REFUTED:+, }${candidate##*/} (claims ${claimed% })"
             continue
         fi
         if [ "$(_plan_filename_issue_slot "$candidate")" = "$ISSUE_NUM" ]; then
@@ -2471,6 +2507,22 @@ _find_issue_plan() {
         [ -r "$candidate" ] || continue
         if head -n 50 "$candidate" 2>/dev/null \
             | grep -qE "(#${ISSUE_NUM}\b|(issue|ticket|number|id):[[:space:]]*${ISSUE_NUM}\b)"; then
+            # mika#2038: tier 3 matches a plan that merely MENTIONS the number
+            # anywhere in its first 50 lines — a Problem Frame naming the
+            # incident it fixes, a Sources list, a lineage note. Refuting only
+            # at tier 1 moved the bug rather than closing it: for ISSUE_NUM=2026
+            # tier 1 correctly discarded the April `rand` plan and tier 3 then
+            # handed back a plan belonging to mika#2038, so the pilot was still
+            # launched on a foreign plan. Same shape for #1383 → the #1685 plan.
+            # Tier 2 needs no such guard: it matches an anchored header that
+            # names THIS issue, so a candidate it accepts can never be refuted.
+            if _plan_header_refutes_issue "$candidate" "$ISSUE_NUM"; then
+                claimed=$(_plan_header_claimed_issues "$candidate" | tr '\n' ' ')
+                echo "_find_issue_plan: tier 3 discarded ${candidate} — it mentions ${ISSUE_NUM} but its header claims issue ${claimed% }" >&2
+                FIND_ISSUE_PLAN_REFUTED="${FIND_ISSUE_PLAN_REFUTED}${FIND_ISSUE_PLAN_REFUTED:+, }${candidate##*/} (claims ${claimed% })"
+                continue
+            fi
+            echo "_find_issue_plan: tier 3 selected ${candidate} (broad issue-number reference in the first 50 lines)" >&2
             printf '%s' "$candidate"
             return 0
         fi
