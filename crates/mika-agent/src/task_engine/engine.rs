@@ -2181,7 +2181,11 @@ fn parse_stuck_pending_reaper_grace(raw: Option<&str>) -> i64 {
 }
 
 /// Resolve the stuck-pending reaper grace window (mika#2045).
-fn stuck_pending_reaper_grace_secs() -> i64 {
+///
+/// `pub` so the `mika tasks stuck` probe reports on exactly the population the
+/// reaper acts on. A probe with its own threshold would drift from the engine
+/// and answer a different question than the one the operator is asking.
+pub fn stuck_pending_reaper_grace_secs() -> i64 {
     parse_stuck_pending_reaper_grace(
         std::env::var(STUCK_PENDING_REAPER_GRACE_ENV)
             .ok()

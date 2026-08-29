@@ -138,6 +138,46 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
                 }
             }
         }
+        Some(TaskCommand::Stuck { format }) => {
+            let grace = mika_agent::task_engine::stuck_pending_reaper_grace_secs();
+            let stuck = db.find_orphaned_pending_issue_tasks(grace).await?;
+
+            match format {
+                OutputFormat::Text => {
+                    if stuck.is_empty() {
+                        println!(
+                            "\n  No stuck pending tasks (grace {} min). Every `ready` issue is \
+                             either working or queued.\n",
+                            grace / 60
+                        );
+                    } else {
+                        println!(
+                            "\n  Stuck pending tasks ({}, grace {} min):",
+                            stuck.len(),
+                            grace / 60
+                        );
+                        for s in &stuck {
+                            println!(
+                                "    {}: {} — pending {} min, {} repair(s) attempted",
+                                &s.id[..12.min(s.id.len())],
+                                s.reference_url,
+                                s.age_seconds / 60,
+                                s.rearm_count
+                            );
+                        }
+                        println!();
+                    }
+                }
+                OutputFormat::Json => {
+                    let rows: Vec<Value> = stuck.iter().map(stuck_task_to_json).collect();
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                }
+                OutputFormat::Yaml => {
+                    let rows: Vec<Value> = stuck.iter().map(stuck_task_to_json).collect();
+                    print!("{}", serde_yaml::to_string(&rows)?);
+                }
+            }
+        }
         Some(TaskCommand::PromoteDeferred { class, r#override }) => {
             if !VALID_DISPATCH_CLASSES.contains(&class.as_str()) {
                 eprintln!(
@@ -435,6 +475,18 @@ fn print_task_detail(t: &Task) {
     println!();
 }
 
+/// Machine-readable shape for `mika tasks stuck` (mika#2045). Kept flat so a
+/// watcher can count rows and read `age_seconds` without walking a nested task.
+fn stuck_task_to_json(t: &mika_agent::db::OrphanedPendingTask) -> Value {
+    json!({
+        "id": t.id,
+        "reference_url": t.reference_url,
+        "created_at": t.created_at,
+        "age_seconds": t.age_seconds,
+        "rearm_count": t.rearm_count,
+    })
+}
+
 fn task_to_json(t: &Task) -> Value {
     json!({
         "id": t.id,
@@ -463,6 +515,60 @@ fn task_to_json(t: &Task) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mika_agent::db::OrphanedPendingTask;
+
+    // -- `mika tasks stuck` probe shape (mika#2045) --
+
+    fn stuck_row(issue: u32, age_seconds: i64, rearm_count: i64) -> OrphanedPendingTask {
+        OrphanedPendingTask {
+            id: format!("ad399d69-0000-0000-0000-{issue:012}"),
+            reference_url: format!("https://github.com/senara-solutions/mika/issues/{issue}"),
+            created_at: "2026-08-29T09:12:22Z".to_string(),
+            age_seconds,
+            rearm_count,
+        }
+    }
+
+    /// A watcher counts rows and reads `age_seconds` — both must be present and
+    /// flat, with no nested task to walk.
+    #[test]
+    fn test_stuck_task_to_json_shape() {
+        let row = stuck_row(2013, 2280, 1);
+        let json = stuck_task_to_json(&row);
+
+        assert_eq!(
+            json["reference_url"],
+            "https://github.com/senara-solutions/mika/issues/2013"
+        );
+        assert_eq!(json["age_seconds"], 2280);
+        assert_eq!(json["rearm_count"], 1);
+        assert_eq!(json["created_at"], "2026-08-29T09:12:22Z");
+        assert!(json["id"].as_str().unwrap().starts_with("ad399d69"));
+    }
+
+    /// Anti-vacuity for the probe: with nothing stuck it must render an empty
+    /// array, not a placeholder row. A probe that always says something is a
+    /// probe nobody reads.
+    #[test]
+    fn test_stuck_probe_renders_empty_array_when_nothing_is_stuck() {
+        let rows: Vec<Value> = Vec::<OrphanedPendingTask>::new()
+            .iter()
+            .map(stuck_task_to_json)
+            .collect();
+        assert_eq!(serde_json::to_string(&rows).unwrap(), "[]");
+    }
+
+    #[test]
+    fn test_stuck_probe_renders_one_row_per_issue() {
+        let rows: Vec<Value> = [stuck_row(2013, 2280, 0), stuck_row(1887, 2340, 2)]
+            .iter()
+            .map(stuck_task_to_json)
+            .collect();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1]["rearm_count"], 2);
+        assert_ne!(rows[0]["reference_url"], rows[1]["reference_url"]);
+    }
 
     fn make_task(id: &str, label: &str, status: &str) -> Task {
         Task {

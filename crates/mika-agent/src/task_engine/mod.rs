@@ -8,7 +8,7 @@ pub mod queue;
 pub mod types;
 
 pub use dispatcher::{DispatchError, TaskDispatcher};
-pub use engine::TaskEngine;
+pub use engine::{TaskEngine, stuck_pending_reaper_grace_secs};
 pub use queue::QueuedTask;
 pub use types::{action_type, task_status, trigger_type};
 

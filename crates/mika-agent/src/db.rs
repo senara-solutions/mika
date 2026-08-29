@@ -14693,6 +14693,25 @@ mod tests {
         assert_eq!(orphans[0].rearm_count, 0);
     }
 
+    /// Backs the `loop_stuck_pending_tasks` event and the probe: several stuck
+    /// issues are reported together, each with its own url and age.
+    #[test]
+    fn test_find_orphaned_pending_reports_every_stuck_issue() {
+        let db = db();
+        create_pending_issue_parent(&db, 2013, 3600);
+        create_pending_issue_parent(&db, 1887, 4200);
+        // A healthy neighbour must not inflate the count.
+        let queued = create_pending_issue_parent(&db, 1664, 3600);
+        attach_deferred_wrapper(&db, &queued, "pending");
+
+        let orphans = db.find_orphaned_pending_issue_tasks("mika", 2700).unwrap();
+        assert_eq!(orphans.len(), 2);
+        let urls: Vec<&str> = orphans.iter().map(|o| o.reference_url.as_str()).collect();
+        assert!(urls.contains(&"https://github.com/x/y/issues/2013"));
+        assert!(urls.contains(&"https://github.com/x/y/issues/1887"));
+        assert!(!urls.contains(&"https://github.com/x/y/issues/1664"));
+    }
+
     #[test]
     fn test_has_pending_deferred_wrapper_child() {
         let db = db();
