@@ -1,7 +1,7 @@
 ---
 issue: senara-solutions/mika#2036
 type: fix
-status: draft
+status: groomed
 branch: bug/2036/a2a-cli-une-r-ponse-g-n-r-e-est-perdue
 date: 2026-08-29
 ---
@@ -85,9 +85,13 @@ serveur**. C'est le volet le moins cher et celui qui a le plus coûté cette nui
 
 ### Volet B — un timeout explicite (indépendant)
 
-Remplacer `reqwest::Client::new()` par un `ClientBuilder` avec un timeout **choisi**, généreux et
-adapté à une génération LLM longue. Aujourd'hui le comportement est celui du défaut de la
-bibliothèque, ce qui n'est pas une décision.
+Remplacer `reqwest::Client::new()` par un `ClientBuilder` avec un timeout **choisi**. Aujourd'hui le
+comportement est celui du défaut de la bibliothèque, ce qui n'est pas une décision.
+
+**Valeur retenue : 300 secondes**, en constante nommée. Justification : la seule génération longue
+livrée avec succès cette nuit a duré **114 s** ; 300 s laisse une marge de 2,6× pour un réseau
+dégradé ou une génération plus lourde, tout en restant très en deçà d'une attente que l'appelant
+prendrait pour un blocage. Ce n'est pas « généreux » : c'est 300, mesuré contre 114.
 
 **Compatibilité ascendante** (passe architecte 1, F2). `A2aClient::new` **garde sa signature
 actuelle** et gagne un timeout par défaut généreux ; un constructeur `with_timeout(dur)` est ajouté
@@ -139,7 +143,8 @@ modifiée pour les appelants existants, et un identifiant que le client choisit 
 - **AC1** — Un délai dépassé et une connexion refusée produisent des messages **distincts**, chacun
   nommant l'URL ; le message de délai nomme la durée attendue. Test anti-vacuité : les deux cas
   vérifiés, et l'assertion échoue si les deux messages sont identiques.
-- **AC2** — Le timeout du client A2A est explicite dans le code, pas hérité du défaut de `reqwest`.
+- **AC2** — Le timeout par défaut du client A2A vaut **300 s**, explicite dans le code en constante
+  nommée, pas hérité du défaut de `reqwest`.
   `A2aClient::new` **garde sa signature** ; `with_timeout` permet de le surcharger. Test : deux
   clients construits avec des budgets différents les portent effectivement, et les deux call sites
   existants (`remote_ask.rs:131`, `a2a_call.rs:123`) compilent sans changement.
@@ -180,6 +185,15 @@ réflexe : il lit « connection error » et conclut à un échec.
   - **F2 (affinage)** : compatibilité ascendante du timeout. Appliquée — `new()` garde sa signature,
     `with_timeout` ajouté, et les **deux** call sites sont énumérés.
   - Point 2 (testabilité d'AC3) validé, avec la forme de test reprise dans l'AC.
+- Passe architecte 2 (`mika-arch`, 2026-08-29) — **ESCALATE**. Points 1 et 2 levés (le chemin de
+  lecture serveur relève de l'implémentation ; `context_id` n'est pas détourné). Motif unique et
+  juste : le timeout par défaut était décrit comme « généreux » **sans chiffre** — décision chargeée
+  non résolue, et la seconde passe n'admet pas de retour ITERATE.
+- Valeur tranchée par l'opérateur : **300 s**. Écrite ci-dessus. Le trou est rempli par une décision
+  nommée et justifiée contre la mesure des 114 s, pas par un remplissage de commodité.
+- Passe architecte 2 (reprise, 2026-08-29) — **GROOMED**. « Le plan est complet, mesurable, et sans
+  décision en suspens. » Les quatre décisions (timeout 300 s, corrélation C3, compatibilité
+  ascendante, forme du test) sont validées une à une.
 
 ## Lié
 
