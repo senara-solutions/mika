@@ -45,8 +45,17 @@
 #                              to host, /proc shows only sandbox processes
 #     * `--new-session --die-with-parent` — no controlling tty, sandbox dies
 #                              with parent
-#     * `--clearenv` + `--setenv ...` — env allowlist (no ANTHROPIC_API_KEY /
-#                              AWS_* / NPM_TOKEN inheritance)
+#     * `--clearenv` + `--setenv ...` — env allowlist for NON-SECRET vars
+#                              only (no ANTHROPIC_API_KEY / AWS_* / NPM_TOKEN
+#                              inheritance)
+#     * `--perms 0600 --ro-bind-data <fd> ...` — secret channel (mika#2039).
+#                              A `--setenv` value lands in bwrap's argv, which
+#                              /proc/<pid>/cmdline exposes to every local user;
+#                              secrets are handed over on a file descriptor
+#                              instead and re-exported by the entrypoint
+#                              prologue. Enforced by
+#                              scripts/verify-no-secret-in-setenv.sh and
+#                              tests/test_sandbox_no_secret_in_argv.sh.
 #
 #   Filesystem allowlist (no `--ro-bind / /` — that would expose /var, /srv,
 #                        cross-worktree /data/workspace paths):
@@ -65,7 +74,8 @@
 #     * ~/.cargo/credentials.toml (cargo publish secret — dev-pilot never
 #                                  publishes; safe to omit)
 #     * ~/.config/gh (contains hosts.yml with gh token) — gh CLI uses the
-#                     GH_TOKEN env var re-injected below
+#                     GH_TOKEN delivered through the secret-file channel below
+#                     (mika#2039), not `--setenv`
 #     * $SSH_AUTH_SOCK, docker.sock, dbus, cm/NATS unix sockets
 #     * /data/workspace outside the branch worktree (other worktrees + repos)
 #
@@ -108,6 +118,35 @@ _PILOT_HELPER_LOG="/var/log/mika/pilot-helper.log"
 # (already ro-bound before net_bwrap_args, so binds inside it fail with
 # EROFS). See coherence audit Bug B (2026-08-05).
 _PILOT_HELPER_CA_SANDBOX_PATH="/tmp/mika-pilot-ca/ca.pem"
+
+# mika#2039: in-sandbox directory holding one 0600 file per secret. Under
+# /run — a tmpfs the sandbox mounts — rather than /etc, which is already
+# ro-bound by the time the secret args are expanded, so a nested bind there
+# fails EROFS (same coherence-audit Bug B that put the helper CA under /tmp).
+_PILOT_SECRET_DIR_SANDBOX="/run/mika-pilot-secrets"
+
+# Sandbox entrypoint prologue: re-export each secret file as an env var named
+# after the file. Deriving the export name from the basename is what makes
+# adding a second secret a zero-change operation here.
+#
+# POSIX sh only — no arrays, no `[[`. The constraint is portability, not a
+# claim about this host: the string is executed by whatever `/bin/sh` resolves
+# to inside the sandbox, which is bound from the host's /bin and can differ
+# between deploy targets.
+#
+# Values round-trip byte-exactly EXCEPT for trailing newlines, which `$(cat)`
+# strips. A GitHub PAT has none, so nothing is affected today — but a secret
+# whose trailing newline is load-bearing (a PEM key, some base64 blobs) cannot
+# use this channel unchanged, which qualifies the zero-change promise above.
+#
+# It names what it drops rather than continuing mutely. Under `--setenv` a
+# missing token was visible in the launch argv; moving it into an in-sandbox
+# loop would otherwise trade a launch-time failure for a silent one that only
+# surfaces minutes later at `git push`. The stderr this writes is persisted by
+# _dispatch_lib_exit_trap and folded into the callback, so the operator sees
+# it. Posture stays fail-forward: a tokenless pilot can still do useful work
+# up to the push, so this diagnoses rather than aborts.
+_PILOT_SECRET_PROLOGUE="for _s in $_PILOT_SECRET_DIR_SANDBOX/*; do [ -e \"\$_s\" ] || continue; _n=\$(basename \"\$_s\"); if [ ! -r \"\$_s\" ]; then echo \"dispatch-lib: sandbox secret \$_n is unreadable — the pilot starts without it\" >&2; continue; fi; _v=\$(cat \"\$_s\"); [ -n \"\$_v\" ] || echo \"dispatch-lib: sandbox secret \$_n is empty — the pilot starts without it\" >&2; export \"\$_n=\$_v\"; done; unset _s _n _v"
 
 # Idempotent helper daemon launcher for the anthropic api chain
 # (2026-08-05, Vincent-authorized). Chained from the front egress proxy
@@ -256,12 +295,39 @@ _ensure_pilot_egress_proxy() {
 # via `--setenv` when present in the parent env. Deliberately narrow — any
 # non-listed var (AWS_*, NPM_TOKEN, ATLASSIAN_API_TOKEN, non-MIKA_
 # OPENAI_/ANTHROPIC_, etc.) is DROPPED by --clearenv and does not reach the
-# sandbox. `GH_TOKEN` is passed through so `gh` works without needing
-# ~/.config/gh (which stays hidden). `ANTHROPIC_LOG_FILE` is the pilot
-# transcript hook (mika#1705). `MIKA_LOG_PILOT_TRANSCRIPTS` gates transcript.
+# sandbox. `ANTHROPIC_LOG_FILE` is the pilot transcript hook (mika#1705).
+# `MIKA_LOG_PILOT_TRANSCRIPTS` gates transcript.
+#
+# NOTHING SECRET GOES IN THIS LIST (mika#2039). `--setenv NAME VALUE` puts the
+# value in bwrap's argv, and /proc/<pid>/cmdline is world-readable — `ps` is
+# enough. A secret belongs in _PILOT_SANDBOX_SECRET_ALLOWLIST below.
+#
+# Audit of every value still reaching `--setenv`, so a future addition is
+# weighed rather than assumed (mika#2039 R6):
+#   * HOME PATH USER LOGNAME SHELL TERM LANG LC_ALL TMPDIR HOSTNAME
+#       — POSIX environment, non-secret by definition.
+#   * ANTHROPIC_LOG_FILE, MIKA_LOG_PILOT_TRANSCRIPTS
+#       — a path and a boolean gate. No credential material.
+#   * the `net_setenv_args` producer below adds HTTPS_PROXY / HTTP_PROXY /
+#     NO_PROXY / ANTHROPIC_BASE_URL / CLAUDE_CODE_API_BASE_URL (localhost
+#     URLs), MIKA_PILOT_CONTAINED ("1"), NODE_EXTRA_CA_CERTS (a path), and
+#     ANTHROPIC_API_KEY. That last one is safe ONLY because it carries the
+#     literal placeholder `proxy-managed-no-secret` — the real key is injected
+#     host-side by the egress proxy and never crosses the bwrap boundary.
+#     Replacing that placeholder with a real key would re-open this defect;
+#     scripts/verify-no-secret-in-setenv.sh fails if it ever changes.
 _PILOT_SANDBOX_ENV_ALLOWLIST=(
     HOME PATH USER LOGNAME SHELL TERM LANG LC_ALL TMPDIR HOSTNAME
-    GH_TOKEN ANTHROPIC_LOG_FILE MIKA_LOG_PILOT_TRANSCRIPTS
+    ANTHROPIC_LOG_FILE MIKA_LOG_PILOT_TRANSCRIPTS
+)
+
+# Secret passthrough allowlist (mika#2039). These NEVER travel via `--setenv`.
+# Each one is handed to bwrap on a file descriptor and materialised as a 0600
+# read-only file under $_PILOT_SECRET_DIR_SANDBOX; $_PILOT_SECRET_PROLOGUE
+# re-exports it inside the sandbox. `GH_TOKEN` is passed through so `gh` works
+# without needing ~/.config/gh (which stays hidden).
+_PILOT_SANDBOX_SECRET_ALLOWLIST=(
+    GH_TOKEN
 )
 
 _run_pilot_sandboxed() {
@@ -271,6 +337,12 @@ _run_pilot_sandboxed() {
         "$@"
         return $?
     fi
+    # Version floor (mika#2039): the secret channel uses `--perms` and
+    # `--ro-bind-data`, which need bubblewrap >= 0.5.0. This probe only detects
+    # bwrap's ABSENCE; an older bwrap is present, passes here, and then fails
+    # the launch loudly on an unknown option rather than degrading. That is the
+    # safe direction — fail closed, no leak — but it is a hard floor, not a
+    # fallback.
     if ! command -v bwrap >/dev/null 2>&1; then
         echo "dispatch-lib: MIKA_PILOT_SANDBOX enabled but bwrap not installed on PATH — falling back to direct invocation" >&2
         "$@"
@@ -374,7 +446,10 @@ _run_pilot_sandboxed() {
         )
         # sh -c wrapper that starts the shim, waits for it, execs the pilot,
         # cleans up on exit. `exec` in the final position ensures the pilot's
-        # exit status becomes the sh's.
+        # exit status becomes the sh's. $_PILOT_SECRET_PROLOGUE is prepended to
+        # that script (mika#2039) so the bwrap-materialised secret files are
+        # re-exported before anything else runs; dropping it leaves the pilot
+        # without GH_TOKEN on the path every real dispatch takes.
         sandbox_entrypoint_prefix="/bin/sh"
     fi
 
@@ -385,6 +460,48 @@ _run_pilot_sandboxed() {
             setenv_args+=(--setenv "$var" "${!var}")
         fi
     done
+
+    # mika#2039: secret channel. bwrap reads each value from a file descriptor
+    # and materialises it as a 0600 read-only file inside the sandbox, so no
+    # secret value ever enters the argv that /proc/<pid>/cmdline exposes.
+    #
+    # Two properties of this block are load-bearing:
+    #
+    #   1. xtrace is suppressed around it. `dispatch_claude_pilot` runs the
+    #      whole dispatch under `set -x` with BASH_XTRACEFD pointed at
+    #      $TRACE_FILE, and xtrace expands process substitutions — an
+    #      unbracketed `printf` here writes `++ printf %s <token>` into that
+    #      file, which _emit_callback tails back to the caller and whose
+    #      NAME=value redaction does not match that line shape. Same bracket
+    #      as _setup_gh_auth (mika#903), but the prior state is restored
+    #      rather than force-enabled: this function also runs from contexts
+    #      with no xtrace (the canary, the test suite).
+    #
+    #   2. the descriptor is allocated by bash (`{var}<`), not hardcoded.
+    #      Bash guarantees a number >= 10, which structurally keeps the
+    #      channel off fd 9 — already taken by BASH_XTRACEFD for the whole
+    #      dispatch — and gives each secret its own descriptor with no
+    #      arithmetic and no `eval`. The fd is inherited across exec into
+    #      bwrap; it is closed again after the call returns.
+    #
+    # `printf` is the bash builtin. /usr/bin/printf would put the value back
+    # into an argv, which is exactly the defect this closes.
+    local -a secret_args=()
+    local -a secret_fds=()
+    local _sfd _xtrace_was_on=0
+    case "$-" in *x*) _xtrace_was_on=1 ;; esac
+    { set +x; } 2>/dev/null
+    for var in "${_PILOT_SANDBOX_SECRET_ALLOWLIST[@]}"; do
+        if [ -n "${!var:-}" ]; then
+            unset _sfd
+            exec {_sfd}< <(printf '%s' "${!var}")
+            secret_args+=(--perms 0600 --ro-bind-data "$_sfd" "$_PILOT_SECRET_DIR_SANDBOX/$var")
+            secret_fds+=("$_sfd")
+        fi
+    done
+    if [ "$_xtrace_was_on" -eq 1 ]; then
+        set -x
+    fi
     # HOME bind property: EACH bind-in HOME must not carry any credential
     # or session token. Enforced by narrow subpaths per family — never bind
     # a whole family directory (~/.claude, ~/.local, ~/.mika) because those
@@ -392,6 +509,7 @@ _run_pilot_sandboxed() {
     # share/uv/credentials/ / .env respectively. Adding a new bind requires
     # confirming its subtree carries no cred-shaped file (see
     # coherence audit 2026-08-04).
+    local _sandbox_rc=0
     if [ -n "$sandbox_entrypoint_prefix" ]; then
         # Phase 2b mode: quote the original argv so the sh -c can re-exec it
         # verbatim. Uses `printf '%q'` for shell-safe re-quoting.
@@ -437,8 +555,10 @@ _run_pilot_sandboxed() {
             "${net_bwrap_args[@]}" \
             "${setenv_args[@]}" \
             "${net_setenv_args[@]}" \
+            ${secret_args[@]+"${secret_args[@]}"} \
             --chdir "$WORKTREE_DIR" \
             -- "$sandbox_entrypoint_prefix" -c "
+$_PILOT_SECRET_PROLOGUE
 python3 '$_PILOT_EGRESS_PROXY_BIN' --sandbox-tcp $_PILOT_EGRESS_TCP_PORT --socket '$_PILOT_EGRESS_SOCK' >&2 &
 _shim_pid=\$!
 # Bounded wait for shim to listen (max ~1s).
@@ -459,9 +579,17 @@ except Exception:
 done
 trap 'kill \$_shim_pid 2>/dev/null' EXIT
 $quoted_argv
-"
+" || _sandbox_rc=$?
     else
         # Phase 2a fallback: fs cut only, network unrestricted.
+        #
+        # The `/bin/sh -c` entrypoint at the end of this block exists solely to
+        # run $_PILOT_SECRET_PROLOGUE before the pilot (mika#2039). The
+        # original argv rides through as positional parameters, so no second
+        # `printf '%q'` quoting layer is introduced, and `exec` in final
+        # position keeps the pilot's argv, pid and exit status identical to the
+        # bare `-- "$@"` this replaced. Reverting it to `-- "$@"` looks like a
+        # simplification and silently removes GH_TOKEN from this sandbox.
         bwrap \
             --as-pid-1 \
             --unshare-user \
@@ -500,9 +628,21 @@ $quoted_argv
             --ro-bind-try "$HOME/.rustup" "$HOME/.rustup" \
             --bind "$HOME/.mika/data/pilot-transcripts" "$HOME/.mika/data/pilot-transcripts" \
             "${setenv_args[@]}" \
+            ${secret_args[@]+"${secret_args[@]}"} \
             --chdir "$WORKTREE_DIR" \
-            -- "$@"
+            -- /bin/sh -c "$_PILOT_SECRET_PROLOGUE
+exec \"\$@\"" mika-pilot-sandbox "$@" || _sandbox_rc=$?
     fi
+
+    # mika#2039: close the secret descriptors, then return the status bwrap
+    # actually produced. The order matters — closing first would overwrite
+    # `$?` and break the invariant that the pilot's exit status is this
+    # function's exit status.
+    local _cfd
+    for _cfd in ${secret_fds[@]+"${secret_fds[@]}"}; do
+        exec {_cfd}<&-
+    done
+    return "$_sandbox_rc"
 }
 
 # mika#749: TERM trap writes cancel discriminator before exit.

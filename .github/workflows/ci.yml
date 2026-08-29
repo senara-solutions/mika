@@ -87,6 +87,11 @@ jobs:
       - name: Plan-discovery suite (mika#2038)
         run: make test-find-issue-plan
 
+      - name: Pilot sandbox secret-channel guards (mika#2039)
+        run: |
+          make test-sandbox-secret-argv
+          make verify-no-secret-in-setenv
+
       - name: Test (with telemetry feature)
         run: cargo test --workspace --features telemetry
 
