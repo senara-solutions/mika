@@ -43,6 +43,18 @@ const CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS: i64 = 1800;
 /// Env var overriding [`CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS`].
 const CHILDLESS_PARENT_REAPER_GRACE_ENV: &str = "MIKA_CHILDLESS_PARENT_REAPER_GRACE_SECS";
 
+/// Default grace window (seconds) before the stuck-pending reaper acts on a
+/// `pending` self_dev issue parent that nothing represents any more (mika#2045).
+///
+/// The nominal `pending → failed` transition was measured at 17–25 minutes over
+/// the full history of mika#1887. 45 minutes sits at 1.8x the top of that window
+/// and stays under the hour, so a task that is merely slow is never touched.
+/// Overridable via `MIKA_STUCK_PENDING_REAPER_GRACE_SECS`.
+const STUCK_PENDING_REAPER_GRACE_DEFAULT_SECS: i64 = 2700;
+
+/// Env var overriding [`STUCK_PENDING_REAPER_GRACE_DEFAULT_SECS`].
+const STUCK_PENDING_REAPER_GRACE_ENV: &str = "MIKA_STUCK_PENDING_REAPER_GRACE_SECS";
+
 /// Ticks between pilot-transcript retention sweeps (mika#1705 AC6). At the 1s
 /// tick cadence, 86_400 ticks ≈ 24h — a daily prune, matching the plan's
 /// "daily tick deletes rows older than N days". Startup also runs one sweep.
@@ -373,6 +385,12 @@ impl TaskEngine {
             // genuinely childless parents reach here.
             self.reap_childless_stuck_parent_tasks().await;
 
+            // Reap `pending` self_dev issue parents that no callback child
+            // represents any more (mika#2045). Runs AFTER the three
+            // `in_progress` reapers above so any task that can still resolve
+            // through them does; this one owns the population none of them see.
+            self.reap_orphaned_pending_issue_tasks().await;
+
             // Reap orphaned team runs left in `status='running'` when no
             // terminal-state writer ran (mika#1652). Failure-path sibling of
             // the parent-task reaper above, for the `team_runs` lifecycle:
@@ -572,6 +590,201 @@ impl TaskEngine {
 
         if stale_skipped > 0 {
             info!(count = stale_skipped, "cleared stale failed callback tasks");
+        }
+    }
+
+    /// mika#2045 — Repair, then expire, `pending` self_dev issue parents that no
+    /// callback child represents any more.
+    ///
+    /// The ladder, in order, and the order is the point:
+    /// 1. the parent still has a `pending` deferred wrapper, or a live real
+    ///    callback -> it is queued or working. `find_orphaned_pending_issue_tasks`
+    ///    never returns it, and nothing here touches it.
+    /// 2. orphaned with repair budget left -> re-arm. A promoted task resumes its
+    ///    work; an expired one loses it, so repair comes first.
+    /// 3. orphaned with the budget spent, or repair refused -> cancel any
+    ///    surviving wrapper, then transition the parent to `failed`. That drops
+    ///    it out of `idx_tasks_manual_active_ref_url` (the index excludes
+    ///    `failed`), and the next `ready` sweep creates a fresh task for the
+    ///    issue.
+    async fn reap_orphaned_pending_issue_tasks(&self) {
+        let grace_seconds = stuck_pending_reaper_grace_secs();
+        let candidates = match self
+            .db
+            .find_orphaned_pending_issue_tasks(grace_seconds)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "task_engine_stuck_pending_reaper: failed to query orphaned pending tasks"
+                );
+                return;
+            }
+        };
+
+        if candidates.is_empty() {
+            return;
+        }
+
+        // R9/R10 — break the silence before repairing anything. An issue that is
+        // `ready` and never picked does not cry on its own; this is the event the
+        // watcher counts.
+        warn!(
+            event = "loop_stuck_pending_tasks",
+            count = candidates.len(),
+            issues = ?candidates
+                .iter()
+                .map(|c| c.reference_url.as_str())
+                .collect::<Vec<_>>(),
+            grace_seconds,
+            "issues are `ready` with a pending task nothing represents any more"
+        );
+
+        for candidate in candidates {
+            let system_session = format!("system-{}", self.db.agent_id());
+
+            let action_config = match self
+                .db
+                .latest_deferred_wrapper_action_config(&candidate.id)
+                .await
+            {
+                Ok(Some(config)) => Some(config),
+                Ok(None) => rebuild_deferred_action_config(
+                    &candidate.id,
+                    &candidate.reference_url,
+                    "implement",
+                ),
+                Err(e) => {
+                    warn!(
+                        task_id = %candidate.id,
+                        error = %e,
+                        "task_engine_stuck_pending_reaper: failed to read the last wrapper config"
+                    );
+                    None
+                }
+            };
+
+            let rearmed = match action_config {
+                Some(config) => {
+                    crate::skills::executor::rearm_deferred_callback(
+                        &self.db,
+                        &candidate.id,
+                        &config,
+                        "implement",
+                        "stuck_pending_reaper",
+                    )
+                    .await
+                }
+                None => false,
+            };
+
+            if rearmed {
+                info!(
+                    event = "stuck_pending_task_rearmed",
+                    task_id = %candidate.id,
+                    issue = %candidate.reference_url,
+                    age_seconds = candidate.age_seconds,
+                    previous_rearm_count = candidate.rearm_count,
+                    "orphaned pending task re-armed instead of expired"
+                );
+                if let Err(e) = self
+                    .db
+                    .log_audit_event(
+                        &system_session,
+                        "stuck_pending_task_rearmed",
+                        &format!("task:{}", candidate.id),
+                        Some("pending"),
+                        Some("pending"),
+                        Some(&format!(
+                            "issue:{} age_seconds:{} rearm_count:{}",
+                            candidate.reference_url, candidate.age_seconds, candidate.rearm_count
+                        )),
+                        None,
+                    )
+                    .await
+                {
+                    warn!(error = %e, "failed to write stuck_pending_task_rearmed audit event");
+                }
+                continue;
+            }
+
+            // Repair is not available any more. Cancel surviving wrappers FIRST:
+            // one promoted after the expiry would replay a dispatch against a
+            // dead parent while the `ready` sweep has already created a live
+            // replacement for the same issue.
+            match self
+                .db
+                .cancel_deferred_wrappers_of_parent(&candidate.id)
+                .await
+            {
+                Ok(n) if n > 0 => {
+                    info!(
+                        task_id = %candidate.id,
+                        cancelled_wrappers = n,
+                        "cancelled surviving deferred wrappers before expiring the parent"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(
+                        task_id = %candidate.id,
+                        error = %e,
+                        "task_engine_stuck_pending_reaper: failed to cancel surviving wrappers"
+                    );
+                }
+            }
+
+            match self
+                .db
+                .update_task_failed(&candidate.id, "stuck_pending_no_deferred_wrapper")
+                .await
+            {
+                Ok(true) => {
+                    warn!(
+                        event = "stuck_pending_task_expired",
+                        task_id = %candidate.id,
+                        issue = %candidate.reference_url,
+                        age_seconds = candidate.age_seconds,
+                        rearm_count = candidate.rearm_count,
+                        "orphaned pending task expired — slot freed for the ready sweep"
+                    );
+                    if let Err(e) = self
+                        .db
+                        .log_audit_event(
+                            &system_session,
+                            "stuck_pending_task_expired",
+                            &format!("task:{}", candidate.id),
+                            Some("pending"),
+                            Some("failed"),
+                            Some(&format!(
+                                "issue:{} age_seconds:{} rearm_count:{}",
+                                candidate.reference_url,
+                                candidate.age_seconds,
+                                candidate.rearm_count
+                            )),
+                            None,
+                        )
+                        .await
+                    {
+                        warn!(error = %e, "failed to write stuck_pending_task_expired audit event");
+                    }
+                }
+                Ok(false) => {
+                    debug!(
+                        task_id = %candidate.id,
+                        "stuck-pending reaper: task left pending state before expiry — no-op"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        task_id = %candidate.id,
+                        error = %e,
+                        "task_engine_stuck_pending_reaper: failed to expire the task"
+                    );
+                }
+            }
         }
     }
 
@@ -1946,6 +2159,82 @@ fn childless_parent_reaper_grace_secs() -> i64 {
     )
 }
 
+/// Pure parse of the stuck-pending reaper grace window (mika#2045). Same shape
+/// as [`parse_childless_parent_reaper_grace`]: absent, empty, unparseable, or
+/// non-positive falls back to the default with a WARN.
+fn parse_stuck_pending_reaper_grace(raw: Option<&str>) -> i64 {
+    match raw {
+        Some(v) if !v.trim().is_empty() => match v.trim().parse::<i64>() {
+            Ok(secs) if secs > 0 => secs,
+            _ => {
+                warn!(
+                    env = STUCK_PENDING_REAPER_GRACE_ENV,
+                    value = %v,
+                    default = STUCK_PENDING_REAPER_GRACE_DEFAULT_SECS,
+                    "invalid stuck-pending reaper grace value; falling back to default"
+                );
+                STUCK_PENDING_REAPER_GRACE_DEFAULT_SECS
+            }
+        },
+        _ => STUCK_PENDING_REAPER_GRACE_DEFAULT_SECS,
+    }
+}
+
+/// Resolve the stuck-pending reaper grace window (mika#2045).
+fn stuck_pending_reaper_grace_secs() -> i64 {
+    parse_stuck_pending_reaper_grace(
+        std::env::var(STUCK_PENDING_REAPER_GRACE_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Rebuild the deferred-dispatch `action_config` for a parent that never had a
+/// wrapper to copy (mika#2045).
+///
+/// This reproduces the `dispatch_input` `ready_label_handler` builds
+/// (`crates/mika-agent/src/server/ready_label_handler.rs:294`), plus the
+/// `__internal_deferred_dispatch` sentinel `register_deferred_callback` injects
+/// so the replay does not livelock against the open-PR guard (mika#920).
+/// `prompt` must stay the bare `<repo>#<num>` form: an owner-qualified prompt
+/// silently routes the dispatch into no-worktree free-text mode (mika#1593).
+fn rebuild_deferred_action_config(
+    parent_task_id: &str,
+    reference_url: &str,
+    dispatch_class: &str,
+) -> Option<String> {
+    // https://github.com/<owner>/<repo>/issues/<num>
+    let rest = reference_url.strip_prefix("https://github.com/")?;
+    let mut parts = rest.split('/');
+    let _owner = parts.next()?;
+    let repo = parts.next()?;
+    if parts.next()? != "issues" {
+        return None;
+    }
+    let number = parts.next()?;
+    if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+
+    let skill = match dispatch_class {
+        "groom" => "dev-groom",
+        _ => "dev-pilot",
+    };
+
+    Some(
+        serde_json::json!({
+            "trigger_kind": "deferred_dispatch",
+            "original_call": {
+                "skill": skill,
+                "prompt": format!("{repo}#{number}"),
+                "task_id": parent_task_id,
+                crate::skills::executor::INTERNAL_DEFERRED_DISPATCH_FIELD: true,
+            }
+        })
+        .to_string(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2691,6 +2980,327 @@ mod tests {
         assert_eq!(
             p_reaper.status, "failed",
             "parent without pr_url goes to reaper"
+        );
+    }
+
+    // -- reap_orphaned_pending_issue_tasks tests (mika#2045) --
+
+    /// Seed the `ready-label` shape: a `pending` self_dev issue parent carrying a
+    /// `reference_url`, backdated `age_secs` into the past.
+    async fn seed_pending_issue_parent(db: &AsyncDatabase, issue: u32, age_secs: i64) -> String {
+        let parent = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: format!("ready-label: senara-solutions/mika#{issue}"),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: Some(format!(
+                "https://github.com/senara-solutions/mika/issues/{issue}"
+            )),
+            source: Some("self_dev".to_string()),
+            metadata: None,
+            r#type: Some("issue".to_string()),
+            dispatch_class: Some("implement".to_string()),
+        };
+        let parent_id = db.create_task(parent).await.unwrap();
+        backdate_created_at(db, &parent_id, age_secs).await;
+        parent_id
+    }
+
+    async fn backdate_created_at(db: &AsyncDatabase, task_id: &str, age_secs: i64) {
+        let id = task_id.to_string();
+        db.with_db(move |d| {
+            d.conn.execute(
+                "UPDATE tasks SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+                 WHERE id = ?1",
+                rusqlite::params![id, format!("-{age_secs} seconds")],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn wrappers_of(
+        db: &AsyncDatabase,
+        parent_id: &str,
+    ) -> Vec<crate::task_state::tasks::Task> {
+        db.get_child_tasks(parent_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.label == crate::agent::DEFERRED_DISPATCH_LABEL)
+            .collect()
+    }
+
+    /// Rung 2: orphaned with budget left -> re-armed, still `pending`, and a
+    /// fresh wrapper now represents it.
+    #[tokio::test]
+    async fn test_stuck_pending_reaper_rearms_before_expiring() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2013, 3600).await;
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        let parent = db.get_task(&parent_id).await.unwrap().unwrap();
+        assert_eq!(parent.status, "pending", "repair must not throw work away");
+        assert_eq!(db.get_stuck_rearm_count(&parent_id).await.unwrap(), 1);
+
+        let wrappers = wrappers_of(&db, &parent_id).await;
+        assert_eq!(wrappers.len(), 1);
+        assert_eq!(wrappers[0].status, "pending");
+        assert!(
+            wrappers[0]
+                .action_config
+                .contains(crate::skills::executor::INTERNAL_DEFERRED_DISPATCH_FIELD),
+            "the rebuilt call must keep the sentinel that stops the open-PR livelock"
+        );
+        assert!(
+            wrappers[0].action_config.contains("\"mika#2013\""),
+            "prompt must be the bare <repo>#<num> form (mika#1593)"
+        );
+    }
+
+    /// Rung 3: budget spent -> expired, and the freed slot lets the `ready`
+    /// sweep create a replacement for the same issue.
+    #[tokio::test]
+    async fn test_stuck_pending_reaper_expires_once_budget_is_spent() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2013, 3600).await;
+        for _ in 0..crate::skills::executor::MAX_STUCK_REARMS {
+            db.increment_stuck_rearm_count(&parent_id).await.unwrap();
+        }
+        // increment touches updated_at, not created_at — the task is still aged.
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        let parent = db.get_task(&parent_id).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "failed",
+            "budget spent — the task must expire"
+        );
+
+        // R7: the partial unique index excludes `failed`, so the sweep can
+        // create a fresh task for the same issue.
+        let replacement = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "ready-label: senara-solutions/mika#2013".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: Some("https://github.com/senara-solutions/mika/issues/2013".to_string()),
+            source: Some("self_dev".to_string()),
+            metadata: None,
+            r#type: Some("issue".to_string()),
+            dispatch_class: Some("implement".to_string()),
+        };
+        assert!(
+            db.create_task(replacement).await.is_ok(),
+            "expiring must free the idx_tasks_manual_active_ref_url slot"
+        );
+    }
+
+    /// A wrapper that survives the expiry could still be promoted and would
+    /// replay a dispatch against a dead parent while a live replacement exists
+    /// for the same issue. It must be cancelled first.
+    #[tokio::test]
+    async fn test_stuck_pending_reaper_cancels_surviving_wrappers_on_expiry() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2013, 3600).await;
+        for _ in 0..crate::skills::executor::MAX_STUCK_REARMS {
+            db.increment_stuck_rearm_count(&parent_id).await.unwrap();
+        }
+
+        // A wrapper left `in_progress`: not `pending`, so the parent still reads
+        // as orphaned, yet it is not terminal either.
+        let wrapper = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: crate::agent::DEFERRED_DISPATCH_LABEL.to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        let wrapper_id = db.create_task(wrapper).await.unwrap();
+        db.update_task_status(&wrapper_id, "in_progress")
+            .await
+            .unwrap();
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        let parent = db.get_task(&parent_id).await.unwrap().unwrap();
+        assert_eq!(parent.status, "failed");
+        let wrapper = db.get_task(&wrapper_id).await.unwrap().unwrap();
+        assert_eq!(
+            wrapper.status, "cancelled",
+            "a surviving wrapper would double-dispatch after the replacement is created"
+        );
+    }
+
+    /// Anti-vacuity for R2: a task waiting behind a busy dispatch slot is old and
+    /// healthy. This test fails the moment the reaper decides on age alone.
+    #[tokio::test]
+    async fn test_stuck_pending_reaper_spares_task_queued_behind_busy_slot() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2013, 3600).await;
+        let wrapper = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: crate::agent::DEFERRED_DISPATCH_LABEL.to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        let wrapper_id = db.create_task(wrapper).await.unwrap();
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        let parent = db.get_task(&parent_id).await.unwrap().unwrap();
+        assert_eq!(parent.status, "pending", "a queued task must be left alone");
+        assert_eq!(db.get_stuck_rearm_count(&parent_id).await.unwrap(), 0);
+        let wrapper = db.get_task(&wrapper_id).await.unwrap().unwrap();
+        assert_eq!(wrapper.status, "pending");
+    }
+
+    #[tokio::test]
+    async fn test_stuck_pending_reaper_spares_task_inside_the_grace_window() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2013, 600).await;
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        let parent = db.get_task(&parent_id).await.unwrap().unwrap();
+        assert_eq!(parent.status, "pending");
+        assert!(wrappers_of(&db, &parent_id).await.is_empty());
+    }
+
+    #[test]
+    fn test_parse_stuck_pending_reaper_grace() {
+        assert_eq!(
+            parse_stuck_pending_reaper_grace(None),
+            STUCK_PENDING_REAPER_GRACE_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_stuck_pending_reaper_grace(Some("  ")),
+            STUCK_PENDING_REAPER_GRACE_DEFAULT_SECS
+        );
+        assert_eq!(parse_stuck_pending_reaper_grace(Some("60")), 60);
+        assert_eq!(
+            parse_stuck_pending_reaper_grace(Some("0")),
+            STUCK_PENDING_REAPER_GRACE_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_stuck_pending_reaper_grace(Some("nonsense")),
+            STUCK_PENDING_REAPER_GRACE_DEFAULT_SECS
+        );
+        assert_eq!(STUCK_PENDING_REAPER_GRACE_DEFAULT_SECS, 2700);
+    }
+
+    #[test]
+    fn test_rebuild_deferred_action_config() {
+        let config = rebuild_deferred_action_config(
+            "parent-1",
+            "https://github.com/senara-solutions/mika/issues/2013",
+            "implement",
+        )
+        .expect("well-formed issue url");
+        let parsed: serde_json::Value = serde_json::from_str(&config).unwrap();
+        assert_eq!(parsed["trigger_kind"], "deferred_dispatch");
+        assert_eq!(parsed["original_call"]["skill"], "dev-pilot");
+        assert_eq!(parsed["original_call"]["prompt"], "mika#2013");
+        assert_eq!(parsed["original_call"]["task_id"], "parent-1");
+        assert_eq!(
+            parsed["original_call"][crate::skills::executor::INTERNAL_DEFERRED_DISPATCH_FIELD],
+            true
+        );
+
+        let groom = rebuild_deferred_action_config(
+            "parent-1",
+            "https://github.com/senara-solutions/mika/issues/7",
+            "groom",
+        )
+        .unwrap();
+        assert!(groom.contains("dev-groom"));
+
+        assert!(rebuild_deferred_action_config("p", "not a url", "implement").is_none());
+        assert!(
+            rebuild_deferred_action_config(
+                "p",
+                "https://github.com/senara-solutions/mika/pull/7",
+                "implement"
+            )
+            .is_none()
         );
     }
 

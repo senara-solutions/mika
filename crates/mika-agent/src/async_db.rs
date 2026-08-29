@@ -1036,6 +1036,18 @@ impl AsyncDatabase {
             .await
     }
 
+    /// The `action_config` of a parent's most recent deferred wrapper
+    /// (mika#2045). See [`Database::latest_deferred_wrapper_action_config`].
+    pub async fn latest_deferred_wrapper_action_config(
+        &self,
+        parent_task_id: &str,
+    ) -> Result<Option<String>> {
+        let a = self.agent_id.clone();
+        let p = parent_task_id.to_owned();
+        self.with_db(move |db| db.latest_deferred_wrapper_action_config(&a, &p))
+            .await
+    }
+
     /// Return ALL children of a parent task for the reaper's structured log
     /// event. See [`Database::get_reaper_child_snapshot`].
     pub async fn get_reaper_child_snapshot(

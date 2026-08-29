@@ -7264,6 +7264,35 @@ impl Database {
         Ok(n)
     }
 
+    /// The `action_config` of a parent's most recent deferred wrapper, whatever
+    /// its status (mika#2045). The reaper replays this so a repaired dispatch is
+    /// byte-identical to the one that was refused. `None` when the parent never
+    /// had a wrapper — the reaper then rebuilds the call from the parent's own
+    /// columns.
+    pub fn latest_deferred_wrapper_action_config(
+        &self,
+        agent_id: &str,
+        parent_task_id: &str,
+    ) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT action_config FROM tasks
+                 WHERE agent_id = ?1
+                   AND parent_task_id = ?2
+                   AND label = ?3
+                 ORDER BY created_at DESC
+                 LIMIT 1",
+                params![
+                    agent_id,
+                    parent_task_id,
+                    crate::agent::DEFERRED_DISPATCH_LABEL
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// Return ALL children of a parent task for the reaper's structured log event
     /// (`task_engine_reaper.evaluated`). Captures a point-in-time snapshot at kill
     /// time so post-incident diagnosis can see what the reaper saw (mika#1126).
