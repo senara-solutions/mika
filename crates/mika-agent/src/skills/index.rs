@@ -8,7 +8,8 @@ use mika_common::llm::ProviderKind;
 
 use super::builtin_handlers::KNOWN_BUILTINS;
 use super::manifest::{
-    ProviderSkillFields, ProviderSkillOverride, SkillManifest, SkillToolDef, ToolHandler,
+    MIN_REVIEW_ANCHOR_QUOTE_CHARS_FLOOR, ProviderSkillFields, ProviderSkillOverride, SkillManifest,
+    SkillToolDef, ToolHandler,
 };
 
 /// Maximum size for skill.toml files (64 KB).
@@ -1050,6 +1051,54 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
                 "[output] required_finding_list_prefixes is an explicit empty list — \
                  this means no finding-list constraint will be enforced. \
                  If this is unintentional, add the expected F-list prefixes."
+                    .to_string(),
+            ));
+        }
+    }
+
+    // 5e-ter. Validate [output] review-anchor contract (mika#2037)
+    if !manifest.output.required_review_anchor_prefixes.is_empty() {
+        for (i, prefix) in manifest
+            .output
+            .required_review_anchor_prefixes
+            .iter()
+            .enumerate()
+        {
+            if prefix.trim().is_empty() {
+                diags.push(SkillDiagnostic::fail(format!(
+                    "[output] required_review_anchor_prefixes[{i}] is empty or whitespace-only — \
+                     each entry must be a non-empty literal prefix"
+                )));
+            }
+        }
+        if manifest.output.review_anchor_min_count == 0 {
+            diags.push(SkillDiagnostic::fail(
+                "[output] review_anchor_min_count is 0 — the review-anchor guard would \
+                 accept a disposition with no attestation at all, which is the failure \
+                 class it exists to close (mika#2037). Set it to 1 or more."
+                    .to_string(),
+            ));
+        }
+        if manifest.output.review_anchor_min_quote_chars < MIN_REVIEW_ANCHOR_QUOTE_CHARS_FLOOR {
+            diags.push(SkillDiagnostic::fail(format!(
+                "[output] review_anchor_min_quote_chars is {} — below the floor of {}. \
+                 A short quote threshold is satisfied by any common word of the brief, \
+                 which neutralizes the guard while leaving it declared (mika#2037).",
+                manifest.output.review_anchor_min_quote_chars, MIN_REVIEW_ANCHOR_QUOTE_CHARS_FLOOR
+            )));
+        }
+    } else if skill_dir.join("skill.toml").exists() {
+        // Explicit empty list — same shape as the two guards above.
+        if let Ok(raw) = std::fs::read_to_string(skill_dir.join("skill.toml"))
+            && let Ok(raw_table) = raw.parse::<toml::Table>()
+            && let Some(output_section) = raw_table.get("output")
+            && let Some(prefixes) = output_section.get("required_review_anchor_prefixes")
+            && prefixes.as_array().is_some_and(|a| a.is_empty())
+        {
+            diags.push(SkillDiagnostic::warn(
+                "[output] required_review_anchor_prefixes is an explicit empty list — \
+                 this means no review-anchor constraint will be enforced. \
+                 If this is unintentional, add the expected anchor prefixes."
                     .to_string(),
             ));
         }
@@ -4428,6 +4477,106 @@ mod tests {
     }
 
     // -- [context] validation tests --
+
+    /// Build a skill dir whose `[output]` carries the given body, for the
+    /// review-anchor validation tests (mika#2037).
+    fn review_anchor_skill_dir(tmp: &tempfile::TempDir, output_body: &str) -> PathBuf {
+        let skill_dir = tmp.path().join("arch-groom");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            format!(
+                r#"
+            [skill]
+            name = "arch-groom"
+            description = "First-pass plan review"
+
+            [output]
+            {output_body}
+            "#
+            ),
+        )
+        .unwrap();
+        fs::write(skill_dir.join("system_prompt.md"), "Review the plan.").unwrap();
+        skill_dir
+    }
+
+    #[test]
+    fn test_validate_review_anchor_empty_prefix_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = review_anchor_skill_dir(
+            &tmp,
+            r#"required_review_anchor_prefixes = ["A1:", "  ", "A3:"]"#,
+        );
+        let diags = validate_skill(&skill_dir);
+        assert!(
+            diags.iter().any(|d| d.level == DiagnosticLevel::Fail
+                && d.message.contains("required_review_anchor_prefixes[1]")),
+            "Expected FAIL naming the offending index. Got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_review_anchor_explicit_empty_list_warns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = review_anchor_skill_dir(&tmp, "required_review_anchor_prefixes = []");
+        let diags = validate_skill(&skill_dir);
+        assert!(
+            diags.iter().any(|d| d.level == DiagnosticLevel::Warn
+                && d.message
+                    .contains("required_review_anchor_prefixes is an explicit empty list")),
+            "Expected WARN for explicit empty list. Got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_review_anchor_zero_min_count_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = review_anchor_skill_dir(
+            &tmp,
+            "required_review_anchor_prefixes = [\"A1:\"]\n            review_anchor_min_count = 0",
+        );
+        let diags = validate_skill(&skill_dir);
+        assert!(
+            diags.iter().any(|d| d.level == DiagnosticLevel::Fail
+                && d.message.contains("review_anchor_min_count is 0")),
+            "Expected FAIL for zero min_count. Got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_review_anchor_quote_chars_below_floor_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = review_anchor_skill_dir(
+            &tmp,
+            "required_review_anchor_prefixes = [\"A1:\"]\n            review_anchor_min_quote_chars = 4",
+        );
+        let diags = validate_skill(&skill_dir);
+        assert!(
+            diags.iter().any(|d| d.level == DiagnosticLevel::Fail
+                && d.message.contains("review_anchor_min_quote_chars is 4")
+                && d.message
+                    .contains(&MIN_REVIEW_ANCHOR_QUOTE_CHARS_FLOOR.to_string())),
+            "Expected FAIL naming the value and the floor. Got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_review_anchor_coherent_declaration_passes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = review_anchor_skill_dir(
+            &tmp,
+            "required_review_anchor_prefixes = [\"A1:\", \"A2:\", \"A3:\"]\n            \
+             review_anchor_min_count = 3\n            review_anchor_min_quote_chars = 40",
+        );
+        let diags = validate_skill(&skill_dir);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.level == DiagnosticLevel::Fail && d.message.contains("review_anchor")),
+            "Unexpected FAIL for coherent declaration. Got: {diags:?}"
+        );
+    }
 
     #[test]
     fn test_validate_skill_context_known_type_ok() {
