@@ -823,6 +823,42 @@ impl TaskEngine {
                     continue; // Fail-closed for this class — try the others
                 }
             }
+
+            // Operator priority (mika#1948 AC3). Three dispatchers share these
+            // slots — the autonomous loop, the milestone manager, and the
+            // operator — and they are not peers. When the operator has drafted
+            // work in this class, an automatic wrapper promotion must not take
+            // the slot out from under it: the operator cannot see the queue and
+            // would simply find their dispatch refused.
+            //
+            // Ordering is deliberate: this runs AFTER the slot-occupancy check,
+            // so it only ever suppresses a promotion that would otherwise have
+            // happened, and never masks the reason a class is busy.
+            //
+            // Fail-OPEN on error, unlike the check above. The distinction is the
+            // one mika#2084 already had to make: a busy slot is information we
+            // must have (fail-closed), whereas priority is a preference — a
+            // stray DB error must not strand deferred wrappers forever. Losing
+            // the preference costs the operator one contended dispatch;
+            // fail-closing here would cost the loop its recovery path.
+            match self.db.has_pending_operator_task_for_class(class).await {
+                Ok(true) => {
+                    debug!(
+                        dispatch_class = class,
+                        "deferred promotion skipped — an operator task holds priority in this class"
+                    );
+                    continue;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        dispatch_class = class,
+                        "operator-priority check failed — promoting anyway (fail-open)"
+                    );
+                }
+            }
+
             self.dispatcher
                 .dispatch_next_deferred_callback_for_class(class)
                 .await;
@@ -3471,6 +3507,109 @@ mod tests {
             dispatch_class: dispatch_class.map(str::to_string),
         };
         db.create_task(child).await.unwrap();
+    }
+
+    // -- operator-priority in deferred promotion (mika#1948 AC3) --
+
+    /// Seed a `pending` operator-sourced task in the given class.
+    async fn seed_pending_operator_task(
+        db: &AsyncDatabase,
+        label: &str,
+        dispatch_class: &str,
+    ) -> String {
+        let t = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: label.to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some(dispatch_class.to_string()),
+        };
+        let id = db.create_task(t).await.unwrap();
+        db.set_task_dispatcher_source(&id, "operator")
+            .await
+            .unwrap();
+        id
+    }
+
+    /// AC3 — an operator task waiting in a class holds priority: the automatic
+    /// wrapper promotion must stand down rather than take the slot out from
+    /// under work the operator has already drafted.
+    #[tokio::test]
+    async fn test_promote_defers_to_pending_operator_task() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let (_, w_impl) = seed_deferred_wrapper(&db, "p_impl", Some("implement")).await;
+        seed_pending_operator_task(&db, "operator drafted work", "implement").await;
+
+        engine.promote_pending_deferred_if_idle().await;
+
+        let t_impl = db.get_task(&w_impl).await.unwrap().unwrap();
+        assert_eq!(
+            t_impl.status, "pending",
+            "the wrapper must NOT promote while an operator task waits in the \
+             same class — operator outranks the automatic promoter (mika#1948)"
+        );
+    }
+
+    /// The anti-vacuity twin. Without it, "never promote" would satisfy the
+    /// test above; this pins that the slot is idle, the wrapper is promotable,
+    /// and it is ONLY the operator task that held it back.
+    #[tokio::test]
+    async fn test_promote_proceeds_when_no_operator_task_pending() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let (_, w_impl) = seed_deferred_wrapper(&db, "p_impl", Some("implement")).await;
+
+        engine.promote_pending_deferred_if_idle().await;
+
+        let t_impl = db.get_task(&w_impl).await.unwrap().unwrap();
+        assert_eq!(
+            t_impl.status, "completed",
+            "with no operator task pending the wrapper must promote normally — \
+             operator-priority must not become a blanket stall"
+        );
+    }
+
+    /// Priority is class-scoped, like the slot it protects. An operator task
+    /// waiting to groom must not freeze the implement class.
+    #[tokio::test]
+    async fn test_operator_priority_is_class_scoped() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let (_, w_impl) = seed_deferred_wrapper(&db, "p_impl", Some("implement")).await;
+        seed_pending_operator_task(&db, "operator groom work", "groom").await;
+
+        engine.promote_pending_deferred_if_idle().await;
+
+        let t_impl = db.get_task(&w_impl).await.unwrap().unwrap();
+        assert_eq!(
+            t_impl.status, "completed",
+            "an operator task in the groom class must not hold back the \
+             implement class — priority is scoped to the contended slot"
+        );
     }
 
     /// R1: two cross-class deferred wrappers, both class slots idle → both

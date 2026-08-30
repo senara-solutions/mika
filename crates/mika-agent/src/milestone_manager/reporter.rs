@@ -141,6 +141,26 @@ impl Reporter {
             }
         }
 
+        // Dispatch contention (mika#1948). Rendered ONLY when there is
+        // contention to report — an always-present "(none)" line would train the
+        // reader to skip the section, and this one matters precisely because it
+        // is rare. Silence here means the manager was never blocked.
+        if !assessment.contention_events.is_empty() {
+            writeln!(out).unwrap();
+            writeln!(out, "### Dispatch contention").unwrap();
+            for e in &assessment.contention_events {
+                let source = e
+                    .blocking_dispatcher_source
+                    .as_deref()
+                    .unwrap_or("unknown (pre-v51 row)");
+                let _ = writeln!(
+                    out,
+                    "- `{}` slot held by `{}` (dispatched by {source}) — {}",
+                    e.dispatch_class, e.blocking_task_id, e.reason
+                );
+            }
+        }
+
         out
     }
 }
@@ -310,7 +330,7 @@ fn alert_kind_label(k: &AlertKind) -> &'static str {
 mod tests {
     use super::*;
     use crate::milestone_manager::types::{
-        MilestoneRef, ProgressCounts, Recommendation, Severity, SubIssue,
+        ContentionEvent, MilestoneRef, ProgressCounts, Recommendation, Severity, SubIssue,
     };
 
     fn base_issue(n: u64) -> SubIssue {
@@ -358,7 +378,60 @@ mod tests {
             },
             alerts: vec![],
             cross_cutting: vec![],
+            contention_events: vec![],
         }
+    }
+
+    // -- mika#1948 AC6: the Dispatch contention section --
+
+    fn contention(source: Option<&str>) -> ContentionEvent {
+        ContentionEvent {
+            dispatch_class: "implement".into(),
+            blocking_task_id: "task-holder".into(),
+            blocking_dispatcher_source: source.map(str::to_string),
+            reason: "slot held by another dispatcher".into(),
+        }
+    }
+
+    #[test]
+    fn report_renders_dispatch_contention_when_present() {
+        let mut a = empty_assessment();
+        a.contention_events = vec![contention(Some("mika_dev"))];
+        let out = Reporter::new().report(&state_with(vec![], ProgressCounts::default()), &a);
+        assert!(
+            out.contains("### Dispatch contention"),
+            "the section must appear when there is contention to report"
+        );
+        assert!(
+            out.contains("task-holder") && out.contains("mika_dev"),
+            "the entry must name the holder AND which dispatcher it was — \
+             that is the whole point of the section. Got:\n{out}"
+        );
+    }
+
+    /// Anti-vacuity twin: with no contention the section must be ABSENT, not
+    /// rendered with a "(none)" line. A section that is always there is a
+    /// section the reader learns to skip.
+    #[test]
+    fn report_omits_dispatch_contention_when_empty() {
+        let a = empty_assessment();
+        let out = Reporter::new().report(&state_with(vec![], ProgressCounts::default()), &a);
+        assert!(
+            !out.contains("Dispatch contention"),
+            "silence when there is nothing to report. Got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn report_contention_names_unknown_source_honestly() {
+        let mut a = empty_assessment();
+        a.contention_events = vec![contention(None)];
+        let out = Reporter::new().report(&state_with(vec![], ProgressCounts::default()), &a);
+        assert!(
+            out.contains("unknown (pre-v51 row)"),
+            "a NULL source must read as unknown, never be defaulted to a \
+             dispatcher we did not observe. Got:\n{out}"
+        );
     }
 
     #[test]

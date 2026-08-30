@@ -42,6 +42,18 @@ const FORBIDDEN_TOKENS: &[&str] = &[
     "\"POST\"",
     "\"DELETE\"",
     "\"PUT\"",
+    // Porte 2 (mika#1948) — the Phase-2-promotion lock. No file under
+    // `milestone_manager/**` may WRITE the `dispatcher_source = 'mika_manager'`
+    // metadata: doing so is what turns the read-only manager into a dispatcher.
+    // Both literal shapes are listed because the token can appear as SQL
+    // (single-quoted) or as a Rust string (double-quoted), and matching only one
+    // would leave the other as a silent way through.
+    //
+    // When Phase 2 lands, this token moves to a dispatch-wire file OUTSIDE this
+    // subtree and this list is updated in the same commit — never loosened
+    // ahead of it.
+    "dispatcher_source = 'mika_manager'",
+    "dispatcher_source=\"mika_manager\"",
 ];
 
 /// Files exempt from the grep — this test file itself contains the tokens as literals.
