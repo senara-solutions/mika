@@ -3830,6 +3830,98 @@ assert_eq "socket path containing a single quote does not break the probe" \
 assert_eq "fake-proxy output never reaches the operational proxy log" \
     "0" "$(_egress_log_fixture_hits)"
 
+# ============================================================================
+# Dispatchable-repo allowlist: shell defense in depth (mika#2062)
+# ============================================================================
+# Follow-up of #2046 (KTD5). The Rust tool-boundary guard is load-bearing on the
+# nominal loop path; _set_up_worktree adds a shell copy of the same allowlist for
+# out-of-engine callers (manual runs, scripts, recovery paths) that never reach
+# the Rust guard. These tests are anti-vacuity in both directions: an allowlisted
+# repo must pass the gate, a non-allowlisted one must be refused.
+
+echo ""
+echo "Test: dispatchable-repo allowlist gate (mika#2062)"
+echo "--------------------------------------------------"
+
+# --- Predicate _is_dispatchable_repo: pure, both directions ---
+assert_eq "_is_dispatchable_repo accepts mika"          "0" "$(_is_dispatchable_repo mika; echo $?)"
+assert_eq "_is_dispatchable_repo accepts mika-cloud"    "0" "$(_is_dispatchable_repo mika-cloud; echo $?)"
+assert_eq "_is_dispatchable_repo accepts mika-skills"   "0" "$(_is_dispatchable_repo mika-skills; echo $?)"
+assert_eq "_is_dispatchable_repo accepts mika-platform" "0" "$(_is_dispatchable_repo mika-platform; echo $?)"
+assert_eq "_is_dispatchable_repo refuses control-monitor" "1" "$(_is_dispatchable_repo control-monitor; echo $?)"
+assert_eq "_is_dispatchable_repo refuses claude-pilot"    "1" "$(_is_dispatchable_repo claude-pilot; echo $?)"
+assert_eq "_is_dispatchable_repo refuses empty"           "1" "$(_is_dispatchable_repo '' 2>/dev/null; echo $?)"
+
+# --- Integration: the gate inside _set_up_worktree, both directions ---
+# Hermetic probe (no gh, no network). PLATFORM_DIR is an EMPTY temp dir, so an
+# allowlisted repo clears the gate and then trips the "is not a git repository"
+# check that immediately follows SUB_REPO_DIR resolution — proof it got past the
+# gate. A non-allowlisted repo is refused AT the gate with `repo_not_dispatchable`
+# and never reaches that check. Were the gate removed, control-monitor would also
+# reach the git check (verdict "passed-gate") and this test would fail — which is
+# the anti-vacuity guarantee.
+PROBE_PLATFORM=$(mktemp -d)
+
+_repo_gate_verdict() {
+    local out
+    out=$(
+        (
+            PROMPT="$1"
+            PLATFORM_DIR="$PROBE_PLATFORM"
+            PLATFORM_REPO_NAME="mika-platform"  # so the PLATFORM_DIR self-branch is not taken for mika/mika-cloud
+            TASK_ID="probe-2062"
+            _set_up_worktree
+        ) 2>&1 || true
+    )
+    if printf '%s' "$out" | grep -q 'repo_not_dispatchable'; then
+        printf 'refused'
+    elif printf '%s' "$out" | grep -q 'is not a git repository'; then
+        printf 'passed-gate'
+    else
+        printf 'unexpected'
+    fi
+}
+
+assert_eq "mika#N clears the gate, reaches worktree setup"       "passed-gate" "$(_repo_gate_verdict 'mika#214')"
+assert_eq "mika-cloud#N clears the gate, reaches worktree setup" "passed-gate" "$(_repo_gate_verdict 'mika-cloud#50')"
+assert_eq "control-monitor#N is refused at the gate"             "refused"     "$(_repo_gate_verdict 'control-monitor#159')"
+assert_eq "claude-pilot#N is refused at the gate"                "refused"     "$(_repo_gate_verdict 'claude-pilot#119')"
+
+# The refusal names the repo in a machine-readable field (mika#2062), consistent
+# with `repo_not_dispatchable` on the Rust side.
+REFUSAL_OUT=$(
+    (
+        PROMPT="control-monitor#159"
+        PLATFORM_DIR="$PROBE_PLATFORM"
+        PLATFORM_REPO_NAME="mika-platform"
+        TASK_ID="probe-2062"
+        _set_up_worktree
+    ) 2>&1 || true
+)
+assert_contains "refusal is named repo_not_dispatchable" 'repo_not_dispatchable' "$REFUSAL_OUT"
+assert_contains "refusal carries the repo in a machine-readable field" '"repo":"senara-solutions/control-monitor"' "$REFUSAL_OUT"
+
+rm -rf "$PROBE_PLATFORM"
+
+# --- Drift guard: the shell copy must equal the Rust DISPATCHABLE_REPOS ---
+# The list is duplicated across two languages by necessity (the Rust side is a
+# compile-time &[&str], not a runtime-readable data file). Two mute copies are
+# exactly the drift webhook_dispatch.rs exists to prevent, so this fails if they
+# diverge (mika#2062).
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+RUST_SRC="$REPO_ROOT/crates/mika-agent/src/webhook_dispatch.rs"
+if [ -f "$RUST_SRC" ]; then
+    RUST_LIST=$(sed -n '/const DISPATCHABLE_REPOS/,/\];/p' "$RUST_SRC" \
+        | grep -oE '"senara-solutions/[^"]+"' \
+        | sed 's#"senara-solutions/##; s#"##' \
+        | sort | paste -sd' ' -)
+    SHELL_LIST=$(printf '%s\n' "${DISPATCHABLE_REPO_BASENAMES[@]}" | sort | paste -sd' ' -)
+    assert_eq "shell allowlist matches Rust DISPATCHABLE_REPOS (no drift)" "$RUST_LIST" "$SHELL_LIST"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ Rust source not found at $RUST_SRC — cannot verify allowlist drift"
+fi
+
 # --- Summary ---
 
 echo ""
