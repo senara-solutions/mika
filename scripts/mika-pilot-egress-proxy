@@ -349,6 +349,42 @@ def _format_quota_headers(pairs: list[tuple[str, str]]) -> str:
     return " ".join(f"{name}={value}" for name, value in pairs)
 
 
+# Opt-in debug gate for benign, high-frequency egress events. Off by default;
+# an operator sets MIKA_EGRESS_DEBUG=1 to see the aggregate. It gates ONLY the
+# benign classes below — a real error is never gated, it always prints.
+_EGRESS_DEBUG = os.environ.get("MIKA_EGRESS_DEBUG", "").strip().lower() not in (
+    "", "0", "false", "no", "off",
+)
+
+# Running count of benign readiness probes: a peer that connected and closed
+# without ever sending a CONNECT line. dispatch-lib.sh's
+# `_pilot_egress_sock_connectable` and the sandbox's bounded --sandbox-tcp wait
+# loop do exactly this before every dispatch to confirm the proxy is alive, so
+# it is expected and benign. It used to reach the `except Exception` sink as
+# `[egress] ERROR unknown: Connection lost` (the 400-to-a-gone-peer drain
+# raised): 1045 of 2747 [egress] lines were this one non-event, and they were
+# then misread as a broken transport during mika#2029 (mika#2042). Counted at
+# debug, never cried as error.
+_readiness_probe_count = 0
+
+
+def _note_readiness_probe() -> None:
+    """Record one benign readiness probe (connect + close, no CONNECT line).
+
+    Emits at most a debug-level aggregate line — the running count, not one
+    line per occurrence — and only when MIKA_EGRESS_DEBUG is set. Default is
+    silence. Never emits ERROR: that is the whole point of mika#2042.
+    """
+    global _readiness_probe_count
+    _readiness_probe_count += 1
+    if _EGRESS_DEBUG:
+        print(
+            "[egress] DEBUG readiness-probe (connect+close, no CONNECT) "
+            f"count={_readiness_probe_count}",
+            file=sys.stderr, flush=True,
+        )
+
+
 def _log_upstream_outcome(
     method: str,
     path: str,
@@ -610,7 +646,27 @@ async def handle_host_client(
             request = await asyncio.wait_for(
                 reader.readuntil(b"\r\n\r\n"), timeout=10.0
             )
-        except (asyncio.TimeoutError, asyncio.IncompleteReadError):
+        except asyncio.IncompleteReadError as exc:
+            # A peer that closed before sending a single request byte is the
+            # readiness/availability probe, not a transport failure:
+            # dispatch-lib.sh's `_pilot_egress_sock_connectable` (and the
+            # sandbox's bounded --sandbox-tcp wait loop) open the socket and
+            # close it, WITHOUT ever sending a CONNECT line, before every
+            # dispatch. `peer` is still "unknown" here for that very reason —
+            # nothing was read to name. Answering a peer that is already gone
+            # is what raised `Connection lost` into the `except Exception` sink
+            # below and cried ERROR 1045 times (mika#2042). Count it; stay
+            # silent to the wire.
+            if not exc.partial:
+                _note_readiness_probe()
+                return
+            # Bytes arrived and the stream then truncated mid-request: a real
+            # malformed request, not the probe. Answer it; a reset while doing
+            # so still surfaces as ERROR below (anti-vacuity).
+            writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+            await writer.drain()
+            return
+        except asyncio.TimeoutError:
             writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
             await writer.drain()
             return
