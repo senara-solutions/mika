@@ -1,7 +1,7 @@
 INSTALL_DIR ?= $(HOME)/.local/bin
 BINARIES := mika mika-spirit mika-gateway
 
-.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan test-pr-origin test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv verify-no-secret-in-setenv verify-no-sigpipe-grep verify-bundled-skills lint fmt check check-ngrok deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
+.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan test-pr-origin test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv verify-no-secret-in-setenv verify-no-sigpipe-grep verify-egress-no-log verify-bundled-skills lint fmt check check-ngrok deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -130,6 +130,8 @@ test: ## Run all tests
 	@bash skills/bundled/_shared/tests/test_sandbox_no_secret_in_argv.sh
 	@bash scripts/verify-no-secret-in-setenv.sh
 	@bash scripts/test-verify-no-secret-in-setenv.sh
+	@bash scripts/verify-egress-no-log.sh
+	@bash scripts/test-verify-egress-no-log.sh
 	@bash scripts/test-dispatch-symmetry.sh
 	@bash scripts/deploy-info-test.sh
 	@bash scripts/verify-no-sigpipe-grep.sh
@@ -156,6 +158,10 @@ test-sandbox-secret-argv: ## Verify no credential value reaches the pilot sandbo
 verify-no-secret-in-setenv: ## Verify no secret-shaped var reaches bwrap via --setenv (mika#2039 R7/R14/R15)
 	@bash scripts/verify-no-secret-in-setenv.sh
 	@bash scripts/test-verify-no-secret-in-setenv.sh
+
+verify-egress-no-log: ## Enforce no-log discipline on the egress substrate + pin the guard's negative behaviour (mika#1810 E4 / mika#2054)
+	@bash scripts/verify-egress-no-log.sh
+	@bash scripts/test-verify-egress-no-log.sh
 
 test-dispatch-symmetry: ## Verify dev-pilot and dev-groom handlers are structurally symmetric (mika#893 R5)
 	@bash scripts/test-dispatch-symmetry.sh
