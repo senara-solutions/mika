@@ -87,6 +87,9 @@ jobs:
       - name: Plan-discovery suite (mika#2038)
         run: make test-find-issue-plan
 
+      - name: PR-origin marker + report suites (mika#2026)
+        run: make test-pr-origin
+
       - name: Pilot sandbox secret-channel guards (mika#2039)
         run: |
           make test-sandbox-secret-argv
@@ -163,6 +166,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - name: Check for unsafe byte-slice patterns
         run: bash scripts/check-byte-slices.sh
+      # A guard nobody has watched go red is a decoration — mika#2103 is the
+      # incident where this very lint stayed green through 26 panics.
+      - name: Pin the guard's negative behaviour
+        run: bash scripts/test-check-byte-slices.sh
 
   loop-select-lint:
     name: Loop Select Lint
@@ -205,6 +212,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - name: Enforce no-log discipline on egress substrate (mika#1810 E4)
         run: bash scripts/verify-egress-no-log.sh
+      - name: Pin the egress no-log guard's negative behaviour (mika#2054)
+        run: bash scripts/test-verify-egress-no-log.sh
 
   sigpipe-grep-lint:
     name: SIGPIPE grep-q Lint

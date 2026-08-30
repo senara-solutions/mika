@@ -864,18 +864,16 @@ async fn execute_http(url: &str, method: &str, input: serde_json::Value) -> Resu
     }
 }
 
-/// Truncate output to MAX_OUTPUT_LEN characters.
+/// Truncate output to at most `MAX_OUTPUT_LEN` **bytes**, floored to a char
+/// boundary (mika#2103 — delegates to the canonical helper rather than
+/// re-deriving the boundary walk locally).
 fn truncate_output(s: &str) -> String {
     if s.len() <= MAX_OUTPUT_LEN {
         s.to_string()
     } else {
-        let mut boundary = MAX_OUTPUT_LEN;
-        while boundary > 0 && !s.is_char_boundary(boundary) {
-            boundary -= 1;
-        }
         format!(
-            "{}\n... (truncated at {MAX_OUTPUT_LEN} chars)",
-            &s[..boundary]
+            "{}\n... (truncated at {MAX_OUTPUT_LEN} bytes)",
+            mika_common::text::safe_truncate(s, MAX_OUTPUT_LEN)
         )
     }
 }
@@ -1001,6 +999,45 @@ async fn record_dispatch_rejection(db: &AsyncDatabase, task_id: &str, reason_jso
             "failed to write dispatch-rejection reason to tasks.result"
         );
     }
+}
+
+/// The tool-boundary seat refusal, as the JSON the caller records and returns
+/// (mika#2084). `None` when the verdict does not refuse.
+///
+/// Pure, and separated from the `gh` call above so the decision can be tested
+/// without a network or a token — the refusal wording is what an operator and
+/// the LLM both read, so it is worth asserting on directly.
+fn seat_rejection_json(
+    task_id: &str,
+    owner_repo: &str,
+    number: u64,
+    verdict: &crate::webhook_dispatch::SeatVerdict,
+) -> Option<String> {
+    if !verdict.refuses() {
+        return None;
+    }
+    let found = verdict.label().unwrap_or("<none>");
+    let current = crate::webhook_dispatch::CURRENT_DISPATCH_SEAT;
+    let known = crate::webhook_dispatch::known_dispatch_seats_display();
+    Some(
+        serde_json::json!({
+            "error": "dispatch_seat_mismatch",
+            "task_id": task_id,
+            "issue": format!("{owner_repo}#{number}"),
+            "found_label": found,
+            "current_seat": current,
+            "reason": format!(
+                "`{owner_repo}#{number}` carries the seat label `{found}`, and this \
+                 engine dispatches as seat `{current}`. One dispatcher per ticket: \
+                 another seat already owns this issue, and dispatching would put a \
+                 second writer on its branch. Known seats: {known}. This is a \
+                 structural gate, not a transient failure — retrying will not clear \
+                 it. Only the operator removing or correcting the `dispatch:*` label \
+                 changes this (mika#2084)."
+            )
+        })
+        .to_string(),
+    )
 }
 
 /// Validate that a task is in a dispatchable state for long-running execution.
@@ -1168,6 +1205,181 @@ pub(crate) async fn validate_dispatch_readiness(
         }
     }
 
+    // The seat gate runs HERE, ahead of the global/per-class dispatch guards,
+    // and not further down where it first compiled. Those guards enqueue a
+    // deferred callback when a slot is busy (mika#1011); a foreign-seat dispatch
+    // refused only after that enqueue would be re-armed and re-refused on every
+    // replay, burning a wrapper each time on a ticket that can never go out.
+    // Refuse before the queue, not after it.
+    //
+    // `github_ref` is parsed here rather than at its original site further down
+    // so this gate and the grooming check still share one binding.
+    let github_ref = task.reference_url.as_deref().and_then(parse_github_ref);
+
+    // mika#2084 — Tool-boundary gate for the dispatch seat label.
+    //
+    // THIS IS THE LOAD-BEARING LAYER for #2084, and the reason is empirical.
+    // The 2026-08-30 collision (mika#2055 held `dispatch:ssc`, SSC had PR#2082
+    // open, the loop created a second writer on the same branch) came in as a
+    // task with `source: self_dev`, `trigger: manual` — a CI-fix dispatch, NOT
+    // an `issues.labeled` webhook. The pre-LLM gate in
+    // `server/ready_label_handler.rs` would never have seen it. This gate sees
+    // every dispatch path whatever originated the turn, exactly as the #2046
+    // allowlist gate above does.
+    //
+    // Placed here, sharing the `github_ref` binding, for two reasons: it is the
+    // first point where the target issue is known, and every cheap check
+    // (pure predicates, task state, open-PR) has already run — so a dispatch
+    // that was going to be rejected anyway never spends a `gh` call.
+    //
+    // Issue resolution order — `reference_url` first, dispatch prompt second.
+    // `reference_url` is what the engine itself recorded for the task and is
+    // what the incident task carried
+    // (`https://github.com/senara-solutions/mika/issues/2055`); the prompt is
+    // what `dispatch-lib.sh` actually reads to create the worktree.
+    //
+    // BOTH are checked, and they are not redundant. `reference_url` says what
+    // the engine thinks the task is about; the prompt says which branch the
+    // pilot will actually write to. When they disagree — a task referencing
+    // issue A dispatched with `{"prompt": "mika#B"}` — consulting only one of
+    // them leaves the other unguarded, and it is the prompt that determines
+    // where the second writer would land. Any refusal refuses.
+    //
+    // A `reference_url` naming a PULL REQUEST is deliberately not a seat
+    // subject: `gh issue view <n>` silently resolves a PR number and would hand
+    // back the PR's labels, which never carry `dispatch:*` — reading them as an
+    // issue's labels would be a confident wrong answer. `fetch_issue_labels`
+    // detects that and declines to judge (see there).
+    {
+        let mut subjects: Vec<(String, u64)> = Vec::new();
+        if let Some(GitHubRef::Issue {
+            ref owner,
+            ref repo,
+            number,
+        }) = github_ref
+        {
+            subjects.push((format!("{owner}/{repo}"), number));
+        }
+        if let Some((repo_ref, number)) = tool_input
+            .and_then(|input| input.get("prompt"))
+            .and_then(|v| v.as_str())
+            .and_then(crate::webhook_dispatch::parse_issue_ref_from_dispatch_prompt)
+        {
+            let from_prompt = (
+                crate::webhook_dispatch::normalize_owner_repo(repo_ref),
+                number,
+            );
+            if !subjects.contains(&from_prompt) {
+                subjects.push(from_prompt);
+            }
+        }
+
+        let token = match github_token {
+            Some(t) => Some(t),
+            None => {
+                if !subjects.is_empty() {
+                    warn!(
+                        event = "dispatch_seat_labels_unavailable",
+                        task_id = task_id,
+                        reason = "no_github_token",
+                        "tool-boundary: no GitHub token — seat gate not applied"
+                    );
+                }
+                None
+            }
+        };
+
+        for (owner_repo, number) in token.map(|_| subjects).unwrap_or_default() {
+            let token = github_token.expect("token presence checked above");
+            let (subject_owner, subject_repo) = match owner_repo.split_once('/') {
+                Some(pair) => pair,
+                None => continue,
+            };
+            match crate::github_graphql::fetch_issue_labels_unless_pull_request(
+                token,
+                subject_owner,
+                subject_repo,
+                number,
+            )
+            .await
+            {
+                Ok(None) => {
+                    // The reference resolves to a pull request, not an issue.
+                    // Seat ownership lives on issues; refusing on a PR's (empty)
+                    // label set would be a guess, so this declines to judge —
+                    // fail-open, and noisy about it.
+                    warn!(
+                        event = "dispatch_seat_subject_is_pull_request",
+                        task_id = task_id,
+                        subject = %format!("{owner_repo}#{number}"),
+                        "tool-boundary: dispatch subject is a PR — seat gate not applied to it"
+                    );
+                }
+                Ok(Some(labels)) => {
+                    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+                    let verdict = crate::webhook_dispatch::classify_dispatch_seat(label_refs);
+                    if let Some(rejection) =
+                        seat_rejection_json(task_id, &owner_repo, number, &verdict)
+                    {
+                        let found = verdict.label().unwrap_or("<none>").to_string();
+                        let why = verdict.refusal_reason().unwrap_or("seat_refused");
+                        let current = crate::webhook_dispatch::CURRENT_DISPATCH_SEAT;
+                        warn!(
+                            event = "dispatch_seat_mismatch",
+                            task_id = task_id,
+                            issue = %format!("{owner_repo}#{number}"),
+                            found_label = %found,
+                            current_seat = current,
+                            reason = why,
+                            "tool-boundary: dispatch refused — issue belongs to another seat"
+                        );
+                        if let Err(e) = db
+                            .log_audit_event(
+                                // No session id reaches this gate; the task id is
+                                // the stable identifier of the refused dispatch and
+                                // is what an operator counts collisions by.
+                                task_id,
+                                "dispatch_seat_mismatch",
+                                &format!("{owner_repo}#{number}"),
+                                None,
+                                Some("dispatch_refused"),
+                                Some(&format!(
+                                    "issue={owner_repo}#{number} found_label={found} \
+                                     current_seat={current} reason={why}"
+                                )),
+                                None,
+                            )
+                            .await
+                        {
+                            warn!(
+                                event = "dispatch_seat_audit_log_failed",
+                                error = %e,
+                                "failed to write dispatch_seat_mismatch audit event (non-fatal)"
+                            );
+                        }
+                        record_dispatch_rejection(db, task_id, &rejection).await;
+                        return Err(rejection);
+                    }
+                }
+                Err(e) => {
+                    // mika#2084 D2 — fail-OPEN on missing information, which is a
+                    // different case from an unresolvable seat label. A `gh`
+                    // hiccup, an expired token, or a rate limit must not stop the
+                    // loop: turning every transient GitHub failure into a refused
+                    // dispatch would break far more than the defect this gate
+                    // repairs (#2084 AC3). The window is noisy, not silent.
+                    warn!(
+                        event = "dispatch_seat_labels_unavailable",
+                        task_id = task_id,
+                        issue = %format!("{owner_repo}#{number}"),
+                        error = %e,
+                        "tool-boundary: could not read issue labels — seat gate not applied"
+                    );
+                }
+            }
+        }
+    }
+
     // Per-class dispatch guard (#583, #1001): reject if another task of the
     // SAME dispatch class has an active callback child. The slot split allows
     // one 'implement' + one 'groom' dispatch concurrently per agent.
@@ -1256,10 +1468,6 @@ pub(crate) async fn validate_dispatch_readiness(
         record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
         return Err(rejection.to_string());
     }
-
-    // Hoist the GitHub ref parse above both the grooming-marker check (#919)
-    // and the blocked-by check (#713) so they share the binding.
-    let github_ref = task.reference_url.as_deref().and_then(parse_github_ref);
 
     // Grooming-marker check (#919): reject dev-pilot dispatch when the target
     // issue body lacks the three canonical grooming callouts (Branch + Plan +
@@ -6741,5 +6949,77 @@ Discussion: this one was a single-pass GROOMED case, unlike the others.
     fn test_extract_skill_missing() {
         let input = serde_json::json!({"prompt": "mika#919"});
         assert_eq!(extract_skill_from_input(&input), None);
+    }
+
+    // ─────────── Dispatch seat gate, tool boundary (mika#2084) ───────────
+    //
+    // This is the layer that would have stopped the 2026-08-30 collision: the
+    // task that raced SSC on mika#2055 arrived as `source: self_dev`,
+    // `trigger: manual`, so the ready-label handler never saw it.
+    //
+    // The `gh` call that reads the labels needs a network and a token, so what
+    // is asserted here is the decision and its wording — the part an operator
+    // and the LLM actually read. Both directions, as everywhere in this fix.
+
+    /// AC1 + AC5 — a refused dispatch says which issue, which label, which seat.
+    #[test]
+    fn test_seat_rejection_names_issue_label_and_seat() {
+        let verdict = crate::webhook_dispatch::classify_dispatch_seat(["dispatch:ssc"]);
+        let rejection = seat_rejection_json("task-abc", "senara-solutions/mika", 2055, &verdict)
+            .expect("a foreign seat must be refused");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&rejection).expect("rejection must be valid JSON");
+        assert_eq!(parsed["error"], "dispatch_seat_mismatch");
+        assert_eq!(parsed["task_id"], "task-abc");
+        assert_eq!(parsed["issue"], "senara-solutions/mika#2055");
+        assert_eq!(parsed["found_label"], "dispatch:ssc");
+        assert_eq!(
+            parsed["current_seat"],
+            crate::webhook_dispatch::CURRENT_DISPATCH_SEAT
+        );
+
+        let reason = parsed["reason"].as_str().expect("reason is a string");
+        // Structural, not transient — an LLM that reads this must not retry.
+        assert!(reason.contains("structural gate"));
+        assert!(reason.contains("retrying will not clear it"));
+        assert!(reason.contains("2084"));
+    }
+
+    /// AC2 — an unresolvable seat refuses too, and says so in its own terms.
+    #[test]
+    fn test_seat_rejection_covers_unresolvable_seats() {
+        for labels in [
+            vec!["dispatch:zorglub"],
+            vec!["dispatch:"],
+            vec!["dispatch:ssc", "dispatch:mpc"],
+        ] {
+            let verdict = crate::webhook_dispatch::classify_dispatch_seat(labels.clone());
+            assert!(
+                seat_rejection_json("t", "senara-solutions/mika", 1, &verdict).is_some(),
+                "{labels:?} must be refused — an unidentifiable seat is not an authorization"
+            );
+        }
+    }
+
+    /// AC3 + AC4 positive half — the test that catches a gate that over-reaches.
+    ///
+    /// Delete the `verdict.refuses()` early-return in `seat_rejection_json` and
+    /// this goes red while the two tests above stay green; that asymmetry is
+    /// the whole point of keeping it.
+    #[test]
+    fn test_no_seat_label_produces_no_rejection() {
+        for labels in [
+            vec!["bug", "p1-important", "ready"],
+            vec![],
+            vec!["dispatched", "dispatch-ready"],
+            vec!["dispatch:loop"],
+        ] {
+            let verdict = crate::webhook_dispatch::classify_dispatch_seat(labels.clone());
+            assert!(
+                seat_rejection_json("t", "senara-solutions/mika", 2055, &verdict).is_none(),
+                "{labels:?} must still dispatch — refusing it would stop the loop"
+            );
+        }
     }
 }

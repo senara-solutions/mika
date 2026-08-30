@@ -6586,7 +6586,7 @@ impl Database {
         }
 
         // Cap total anomalies
-        anomalies.truncate(health_thresholds::MAX_ANOMALIES);
+        anomalies.truncate(health_thresholds::MAX_ANOMALIES); // safe-byte-slice: Vec<TaskHealthAnomaly> — element count, no char boundary
 
         Ok(TaskHealthSummary {
             active_tasks,
@@ -8079,16 +8079,18 @@ impl Database {
     const TOOL_CALL_MAX_BYTES: usize = 50_000;
 
     /// Truncate a string at a UTF-8 safe boundary, avoiding panics on multi-byte characters.
+    ///
+    /// mika#2103: the boundary walk lives in `mika_common::text::safe_truncate`;
+    /// this wrapper only adds the "truncated" suffix.
     fn truncate_utf8_safe(s: &str, max_bytes: usize) -> String {
         if s.len() <= max_bytes {
             return s.to_string();
         }
-        // Walk backwards from max_bytes to find a valid char boundary
-        let mut end = max_bytes;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}... (truncated at {} bytes)", &s[..end], max_bytes)
+        format!(
+            "{}... (truncated at {} bytes)",
+            mika_common::text::safe_truncate(s, max_bytes),
+            max_bytes
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8227,6 +8229,61 @@ impl Database {
             params![cutoff],
         )?;
         Ok(n)
+    }
+
+    /// Prior `gh` close calls against the same target, inside a time window
+    /// (mika#1646 Layer B / AC2).
+    ///
+    /// Scoped to the **agent**, not the session or the trace: the founding
+    /// incident's second close came from a deferred webhook replay, i.e. a
+    /// different execution context than the first. A session-scoped query
+    /// would have found nothing and waved it through. Repeat detection is only
+    /// meaningful if it outlives the process that took the first action.
+    ///
+    /// `target_fragment` is the action's identity as it appears in the
+    /// serialized `run_gh` input (e.g. `"pr","close"` plus the number); the
+    /// caller passes the pieces and the LIKE patterns are anchored on both so
+    /// a close of #164 does not match a close of #1644.
+    ///
+    /// `exclude_id` drops the current call's own row when it has already been
+    /// persisted (it has not, at gate time — the gate runs before execution —
+    /// but the parameter keeps the query honest for post-hoc callers).
+    pub fn find_recent_destructive_actions(
+        &self,
+        agent_id: &str,
+        noun: &str,
+        number: &str,
+        window_secs: i64,
+        exclude_id: Option<&str>,
+    ) -> Result<Vec<ToolCallRow>> {
+        let cutoff = timestamp::now_minus(Duration::seconds(window_secs));
+        // The `input` column holds the serialized tool arguments, e.g.
+        // {"command":["pr","close","1644","--comment","..."]}. Match the noun
+        // and the verb adjacently, and the number as a whole JSON array
+        // element, so neither a substring number nor a `pr view` slips in.
+        let noun_verb = format!(r#"%"{noun}","close"%"#);
+        let number_exact = format!(r#"%"{number}"%"#);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, agent_id, session_id, trace_id, llm_call_id,
+                    step, tool_name, tool_source, skill_name,
+                    input, output, success, non_zero_exit,
+                    latency_ms, error_message, created_at
+             FROM tool_calls
+             WHERE agent_id = ?1
+               AND tool_name = 'run_gh'
+               AND created_at >= ?2
+               AND input LIKE ?3
+               AND input LIKE ?4
+               AND (?5 IS NULL OR id != ?5)
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![agent_id, cutoff, noun_verb, number_exact, exclude_id],
+                Self::row_to_tool_call,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     // ===== LLM Call Queries (Dashboard) =====
@@ -10268,7 +10325,7 @@ impl Database {
         }
 
         // Cap at 5 agents to keep context concise
-        agent_results.truncate(5);
+        agent_results.truncate(5); // safe-byte-slice: Vec — element count, no char boundary
 
         // Get task statuses
         let all_tasks: Vec<TaskStatusSummary> = {
@@ -17609,6 +17666,123 @@ mod tests {
                 params![id, agent_id, session_id, tool_name, success as i32, created_at],
             )
             .unwrap();
+    }
+
+    // -- mika#1646: destructive-action repeat detection --
+
+    /// Helper: insert a `run_gh` row with a real serialized argv, the shape the
+    /// repeat query actually matches against.
+    fn insert_run_gh(db: &Database, agent_id: &str, session_id: &str, argv: &[&str], at: &str) {
+        let id = uuid::Uuid::new_v4().to_string();
+        let input = serde_json::json!({ "command": argv }).to_string();
+        db.conn
+            .execute(
+                "INSERT INTO tool_calls (id, agent_id, session_id, tool_name, tool_source, input, success, created_at)
+                 VALUES (?1, ?2, ?3, 'run_gh', 'builtin', ?4, 1, ?5)",
+                params![id, agent_id, session_id, input, at],
+            )
+            .unwrap();
+    }
+
+    /// The founding incident: two closes of PR #1644 seven minutes apart, from
+    /// two DIFFERENT sessions (the second came from a deferred webhook replay).
+    /// The query is agent-scoped precisely so the second one can see the first.
+    #[test]
+    fn test_repeat_close_found_across_sessions() {
+        let db = db();
+        db.create_session("s1", "mika", "cli").unwrap();
+        db.create_session("s2", "mika", "cli").unwrap();
+
+        let earlier = timestamp::format(&(Utc::now() - Duration::seconds(415)));
+        insert_run_gh(&db, "mika", "s1", &["pr", "close", "1644"], &earlier);
+
+        let found = db
+            .find_recent_destructive_actions("mika", "pr", "1644", 1800, None)
+            .unwrap();
+        assert_eq!(found.len(), 1, "second execution must see the first");
+    }
+
+    #[test]
+    fn test_repeat_close_outside_window_not_found() {
+        let db = db();
+        db.create_session("s1", "mika", "cli").unwrap();
+
+        let long_ago = timestamp::format(&(Utc::now() - Duration::seconds(7200)));
+        insert_run_gh(&db, "mika", "s1", &["pr", "close", "1644"], &long_ago);
+
+        let found = db
+            .find_recent_destructive_actions("mika", "pr", "1644", 1800, None)
+            .unwrap();
+        assert!(
+            found.is_empty(),
+            "a close 2h old is outside the 30min window"
+        );
+    }
+
+    /// A read of the target is not a close of it.
+    #[test]
+    fn test_view_of_target_is_not_a_repeat() {
+        let db = db();
+        db.create_session("s1", "mika", "cli").unwrap();
+
+        let recent = timestamp::format(&(Utc::now() - Duration::seconds(60)));
+        insert_run_gh(
+            &db,
+            "mika",
+            "s1",
+            &["pr", "view", "1644", "--json", "files"],
+            &recent,
+        );
+
+        let found = db
+            .find_recent_destructive_actions("mika", "pr", "1644", 1800, None)
+            .unwrap();
+        assert!(found.is_empty());
+    }
+
+    /// Closing issue #164 must not read as a repeat of closing issue #1644.
+    #[test]
+    fn test_substring_number_is_not_a_repeat() {
+        let db = db();
+        db.create_session("s1", "mika", "cli").unwrap();
+
+        let recent = timestamp::format(&(Utc::now() - Duration::seconds(60)));
+        insert_run_gh(&db, "mika", "s1", &["issue", "close", "1644"], &recent);
+
+        let found = db
+            .find_recent_destructive_actions("mika", "issue", "164", 1800, None)
+            .unwrap();
+        assert!(found.is_empty(), "#164 must not match #1644");
+    }
+
+    /// A PR close and an issue close of the same number are different actions.
+    #[test]
+    fn test_pr_close_is_not_an_issue_close_repeat() {
+        let db = db();
+        db.create_session("s1", "mika", "cli").unwrap();
+
+        let recent = timestamp::format(&(Utc::now() - Duration::seconds(60)));
+        insert_run_gh(&db, "mika", "s1", &["pr", "close", "1644"], &recent);
+
+        let found = db
+            .find_recent_destructive_actions("mika", "issue", "1644", 1800, None)
+            .unwrap();
+        assert!(found.is_empty());
+    }
+
+    /// Another agent's close is not this agent's repeat.
+    #[test]
+    fn test_other_agent_close_is_not_a_repeat() {
+        let db = db();
+        db.create_session("s1", "mika", "cli").unwrap();
+
+        let recent = timestamp::format(&(Utc::now() - Duration::seconds(60)));
+        insert_run_gh(&db, "mika", "s1", &["pr", "close", "1644"], &recent);
+
+        let found = db
+            .find_recent_destructive_actions("mika-qa", "pr", "1644", 1800, None)
+            .unwrap();
+        assert!(found.is_empty());
     }
 
     #[test]

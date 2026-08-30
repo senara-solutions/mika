@@ -96,6 +96,39 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `make calibrate-mika-dev MODEL=anthropic/claude-sonnet-4-6` — Run mika-dev calibration suite
 - `make calibrate-mika-arch MODEL=anthropic/claude-opus-4-6` — Run mika-arch calibration suite
 - `make calibrate-mika-qa MODEL=anthropic/claude-sonnet-4-6` — Run mika-qa calibration suite
+- `scripts/pr-origin-report.sh --since <date> --until <date>` — Merged PRs over a window, split by origin (see below)
+
+### PR origin (mika#2026)
+
+Whether a merged PR came out of the autonomous loop or was opened by hand is a
+**fact stamped by its producer**, never reconstructed afterwards. `dispatch-lib.sh`
+applies `origin:loop` in shell (`_stamp_pr_origin`) at each of the three points
+where it holds a PR it just produced. Branch name, author, and merge time are all
+identical between the loop and by-hand work — inferring from them fails exactly on
+the day the answer matters.
+
+Read it with `scripts/pr-origin-report.sh`. Two rules govern the reading:
+
+- **An unmarked PR reads "unknown", never "by hand."** A default that looks like an
+  answer is how an instrument lies.
+- **Absence of the label only means something after the marker went live.** The
+  cut-off is the instant the producer first stamped anything, recorded once by
+  `_record_pr_origin_epoch` in `~/.mika/state/pr-origin-epoch`; override with
+  `MIKA_PR_ORIGIN_EPOCH`. With no cut-off, the report classifies nothing and says
+  so — and the cut-off is born of the first real stamp, not of `make deploy`. It is deliberately *not* a file mtime: `seed_support_dirs` rewrites the
+  installed `dispatch-lib.sh` on every daemon start, so an mtime would track the
+  last restart and walk the cut-off forward all day. The test is on a PR's
+  **opening** date, not its merge — a PR in flight across the cutover could never
+  have been stamped, so it reads unknown rather than not-loop.
+
+Bounds: `--since`/`--until` take `YYYY-MM-DD` (whole days, UTC) or a full
+`YYYY-MM-DDTHH:MM:SSZ` instant; anything else is refused rather than silently
+mis-answered. The report also refuses (exit 3) when `--limit` filled the page, so
+a truncated fetch can never read as a real count.
+
+When opening a PR by hand — orchestrator or spawn — apply `origin:manual` or
+`origin:spawn` yourself (`gh pr edit <n> --add-label origin:manual`). Nothing does
+it for you: only the loop half has a structural producer.
 
 ## Architecture Summary
 
@@ -222,6 +255,9 @@ Optional (bounded webhook queue — mika#1870):
 - `MIKA_WEBHOOK_QUEUE_MAX_DEPTH` — Per-agent queue depth cap for distinct (non-coalescing) events before the oldest is dropped (dead-letter). Default `64`. Invalid/`0` falls back to the default (WARN-logged). Redundant same-key bursts (e.g. N `check_suite.completed` on one branch) **coalesce** into a single queued entry and do not count against the depth.
 - `MIKA_WEBHOOK_QUEUE_BLOCK_TIMEOUT_MS` — When the queue is full, `enqueue` blocks up to this long waiting for the drain worker to free a slot before dropping the oldest entry (backpressure). Default `100`.
 - **Operator grep signals** (`$MIKA_SPIRIT_LOG_FILE`, all throttled ≤1/sec/action/agent): `webhook_queue_coalesced` (real coalescing volume — the burst-collapse working), `webhook_queue_drop_oldest` (queue overflow / dead-letter — should be near-zero; sustained hits mean an agent is saturated), `webhook_queue_dequeued` (carries `wait_ms` — backlog latency), `webhook_queue_processing_error` (a drain-worker panic was isolated), and `webhook_queue.gauge` (5s depth/counter heartbeat, emitted only when non-idle). Post-deploy (AC8): `rate_limit_trip` should drop to near-zero (baseline 41/h on mika-qa).
+
+Optional (destructive-action grounding gate — mika#1646):
+- `MIKA_DEV_REPEAT_ACTION_WINDOW_SECS` — Window (seconds) within which a second `gh pr close` / `gh issue close` on the same target counts as a **repeat** and must acknowledge the prior one in its `--comment` (default `1800` = 30 min). Absent/empty → default; unparseable, `0`, or negative → default with a `destructive_window_invalid` WARN. Note `0` does **not** disable the check: on a destructive action an operator typo must not silently reopen the hole. Repeat detection reads the persisted `tool_calls` table scoped to the agent, so it survives a process restart and a deferred webhook replay — the founding incident's second close came from exactly such a replay, from a context sharing no memory with the first. Operator grep signal: `destructive_action_blocked` in `$MIKA_SPIRIT_LOG_FILE`; SQL surface: `SELECT * FROM audit_events WHERE tool_name = 'destructive_action_grounding'`.
 
 Optional (dispatch grooming gate):
 - `MIKA_DISPATCH_BYPASS_GROOMING_CHECK` — Emergency bypass for the grooming-marker dispatch gate (#919). When `1` or `true` (case-insensitive), `validate_dispatch_readiness()` skips the three-signal grooming check on `dev-pilot` dispatches. Logged at WARN on every hit. Default: unset (gate active).

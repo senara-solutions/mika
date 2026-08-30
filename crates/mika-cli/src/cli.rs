@@ -1,7 +1,15 @@
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
-#[command(name = "mika", version, about = "Mika — AI Executive Assistant")]
+// mika#2066 AC1 — `--version` names the commit: `mika 0.12.2 (968dbe94)`. The
+// stamp is sourced from the shared `mika_common::build_info` capture, not a
+// per-crate `build.rs`. clap prints "{bin} {version}" and short-circuits before
+// any config load, so an unconfigured install can still state its provenance.
+#[command(
+    name = "mika",
+    version = mika_common::build_info::version_static(),
+    about = "Mika — AI Executive Assistant"
+)]
 pub struct Cli {
     /// Agent to use (overrides active agent)
     #[arg(long)]

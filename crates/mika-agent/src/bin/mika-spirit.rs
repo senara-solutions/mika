@@ -2,6 +2,11 @@ use anyhow::{Context, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // mika#2066 AC2 — answer `--version`/`-V` before resolving home, loading
+    // dotenv, or reading settings. A freshly installed, not-yet-configured
+    // mika-spirit must still be able to state the commit it was built from.
+    mika_common::build_info::print_version_if_requested("mika-spirit");
+
     let home_dir = mika_common::home::resolve_home_dir()?;
 
     // mika#1968 AC1/AC2 — pre-logging::init boot line surfacing the resolved
