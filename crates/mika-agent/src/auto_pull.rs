@@ -420,15 +420,20 @@ enum StuckReadyVerdict {
 /// costs no DB round-trip, and again from [`classify_stuck_ready`] so the pure
 /// decision stays whole and testable in one place.
 fn classify_stuck_ready_in_memory(issue: &Issue) -> Option<StuckReadyVerdict> {
-    // Filter A0: another dispatch seat owns this ticket (mika#2084).
+    // Filter A0: this ticket is not ours to take — another seat owns it, or its
+    // seat label cannot be resolved at all (mika#2084).
     //
     // Checked ahead of filter A even though `is_feeder_excluded` would also
     // catch it: the skip reason is the operator-visible record of an avoided
     // collision (AC5), and `operator_review_or_blocked` would name the wrong
     // cause. Same decision, honest label.
-    if seat_refusal(issue).is_some() {
+    if let Some(verdict) = seat_refusal(issue) {
+        // The reason is the operator's tally of avoided collisions, so it must
+        // distinguish "another seat owns this" from "nobody could be resolved as
+        // the owner". Counting a `dispatch:zorglub` typo as a collision would
+        // inflate the very number this record exists to make trustworthy.
         return Some(StuckReadyVerdict::Skip {
-            reason: "seat_owned_by_other",
+            reason: verdict.refusal_reason().unwrap_or("seat_refused"),
         });
     }
 
@@ -525,8 +530,11 @@ fn select_stuck_ready_candidates(
 // ───────────────────── Phase 0 feeder selection (mika#1863) ─────────────────────
 
 /// Returns `true` if `issue` carries a label that structurally excludes it from
-/// the pullable pool AND the feeder backlog (mika#1863 R3/R4): `blocked` or
-/// `operator-review`. Both mean "not dispatchable regardless of grooming state".
+/// the pullable pool AND the feeder backlog: `blocked` or `operator-review`
+/// (mika#1863 R3/R4), or a `dispatch:*` seat label this engine cannot act on
+/// (mika#2084). All of them mean "not dispatchable regardless of grooming
+/// state" — the first two because someone else is holding the ticket, the third
+/// because some other seat is.
 fn is_feeder_excluded(issue: &Issue) -> bool {
     if issue
         .labels
@@ -2851,14 +2859,23 @@ This ticket has been GROOMED and is ready.
     /// names the real cause so an avoided collision is countable (AC5).
     #[test]
     fn test_issue_owned_by_other_seat_is_skipped() {
-        for label in ["dispatch:ssc", "dispatch:mpc", "dispatch:zorglub"] {
+        // The reason must name the ACTUAL cause: a foreign seat is a collision,
+        // an unresolvable label is not. Collapsing both into
+        // `seat_owned_by_other` would inflate the operator's collision tally
+        // with label typos.
+        for (label, expected_reason) in [
+            ("dispatch:ssc", "seat_owned_by_other"),
+            ("dispatch:mpc", "seat_owned_by_other"),
+            ("dispatch:zorglub", "unknown_seat"),
+            ("dispatch:", "empty_seat"),
+        ] {
             let issue = make_issue(2055, GROOMED_BODY, &["ready", label], "t");
             assert_eq!(
                 classify_stuck_ready(&issue, &facts(0), 3),
                 StuckReadyVerdict::Skip {
-                    reason: "seat_owned_by_other",
+                    reason: expected_reason,
                 },
-                "{label} must not be re-driven"
+                "{label} must not be re-driven, and must say why"
             );
             assert!(
                 is_feeder_excluded(&issue),

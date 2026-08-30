@@ -326,6 +326,50 @@ async fn try_phase_cascade(
 
     let mut issues_labeled = 0u32;
     for issue_number in &next_phase_issues {
+        // mika#2084 — the phase cascade is the fourth site in this repo that
+        // applies `ready`, and the only one outside `auto_pull.rs`. Applying it
+        // to a ticket another dispatch seat owns would be refused downstream at
+        // the dispatch gates, but the label would stay on the issue forever:
+        // nothing removes a `ready` that was never consumed. Refuse to apply it
+        // here instead of manufacturing that residue.
+        //
+        // Fail-open on an unreadable label set, as everywhere else in this fix
+        // (#2084 D2): a GitHub hiccup must not stall a phase cascade.
+        match crate::github_graphql::fetch_issue_labels_unless_pull_request(
+            token,
+            owner,
+            repo,
+            *issue_number,
+        )
+        .await
+        {
+            Ok(Some(labels)) => {
+                let names: Vec<&str> = labels.iter().map(String::as_str).collect();
+                let verdict = crate::webhook_dispatch::classify_dispatch_seat(names);
+                if verdict.refuses() {
+                    warn!(
+                        event = "phase_cascade_seat_mismatch",
+                        issue_number = issue_number,
+                        milestone_number = milestone_number,
+                        found_label = %verdict.label().unwrap_or("<none>"),
+                        current_seat = crate::webhook_dispatch::CURRENT_DISPATCH_SEAT,
+                        reason = verdict.refusal_reason().unwrap_or("seat_refused"),
+                        "milestone_context: not labelling ready — another dispatch seat owns \
+                         this issue"
+                    );
+                    continue;
+                }
+            }
+            Ok(None) => { /* a PR, not an issue — no seat to read */ }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    issue_number = issue_number,
+                    "milestone_context: could not read labels — seat gate not applied"
+                );
+            }
+        }
+
         match add_label_to_issue(token, owner, repo, *issue_number, "ready").await {
             Ok(()) => {
                 issues_labeled += 1;

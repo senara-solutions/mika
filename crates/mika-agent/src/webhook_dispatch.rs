@@ -364,6 +364,39 @@ pub(crate) fn classify_dispatch_seat<'a>(labels: impl IntoIterator<Item = &'a st
     SeatVerdict::OwnedByOtherSeat { label, seat }
 }
 
+/// One sentence naming why a verdict refuses, in the operator's terms.
+///
+/// `Unresolvable` is NOT "another seat owns this". A `dispatch:zorglub` typo, a
+/// bare `dispatch:`, or two seat labels means nobody could be identified as the
+/// owner — saying otherwise sends the operator looking for a colliding seat that
+/// does not exist. The audit events already carried the distinction; this makes
+/// the human-facing text carry it too.
+pub(crate) fn seat_refusal_sentence(verdict: &SeatVerdict) -> String {
+    match verdict {
+        SeatVerdict::OwnedByOtherSeat { label, seat } => format!(
+            "this issue carries the seat label `{label}`, so dispatch seat \
+             `{seat}` owns it — dispatching would put a second writer on its branch."
+        ),
+        SeatVerdict::Unresolvable { label, why } => {
+            let detail = match *why {
+                "multiple_seat_labels" => {
+                    "it carries more than one seat label, \
+                     so no single seat can be resolved as the owner"
+                }
+                "empty_seat" => "its seat label names no seat at all",
+                _ => "its seat label names a seat this engine does not know",
+            };
+            format!(
+                "the seat label `{label}` could not be resolved to a known seat: \
+                 {detail}. A seat that cannot be identified is not an authorization."
+            )
+        }
+        SeatVerdict::NoSeatLabel | SeatVerdict::OwnedByCurrentSeat { .. } => {
+            "no refusal applies".to_string()
+        }
+    }
+}
+
 /// The known-seat list rendered for a refusal message, so a refusal states what
 /// would have been accepted and not only what was denied (same discipline as
 /// [`dispatchable_repos_display`]).
@@ -835,5 +868,39 @@ mod tests {
         let overflow = "mika#99999999999999999999999";
         assert_eq!(parse_repo_ref_from_dispatch_prompt(overflow), Some("mika"));
         assert_eq!(parse_issue_ref_from_dispatch_prompt(overflow), None);
+    }
+
+    /// AC5 — the refusal sentence must not claim an owner that does not exist.
+    ///
+    /// `dispatch:zorglub` is a typo, not a collision. Telling the operator that
+    /// "another seat already owns this" sends them looking for a colliding seat
+    /// that was never there, and inflates any tally of avoided collisions.
+    #[test]
+    fn refusal_sentence_distinguishes_a_foreign_seat_from_an_unresolved_one() {
+        let foreign = classify_dispatch_seat(["dispatch:ssc"]);
+        let sentence = seat_refusal_sentence(&foreign);
+        assert!(sentence.contains("dispatch:ssc"));
+        assert!(sentence.contains("owns it"));
+
+        for (labels, expected_fragment) in [
+            (vec!["dispatch:zorglub"], "does not know"),
+            (vec!["dispatch:"], "names no seat"),
+            (
+                vec!["dispatch:ssc", "dispatch:mpc"],
+                "more than one seat label",
+            ),
+        ] {
+            let verdict = classify_dispatch_seat(labels.clone());
+            let sentence = seat_refusal_sentence(&verdict);
+            assert!(
+                sentence.contains(expected_fragment),
+                "{labels:?} should say {expected_fragment:?}, got: {sentence}"
+            );
+            assert!(
+                !sentence.contains("owns it"),
+                "{labels:?} has no identified owner — claiming one misleads the \
+                 operator: {sentence}"
+            );
+        }
     }
 }

@@ -255,7 +255,7 @@ pub async fn try_handle_ready_label_dispatch(
         }
 
         return VerdictAction::Handled {
-            pre_digest: format_seat_mismatch_pre_digest(&location, found, current),
+            pre_digest: format_seat_mismatch_pre_digest(&location, &seat_verdict, current),
         };
     }
 
@@ -638,16 +638,16 @@ async fn fetch_issue_body_and_labels(
 /// legible without cross-referencing anything.
 fn format_seat_mismatch_pre_digest(
     loc: &ReadyLabelLocation,
-    found_label: &str,
+    verdict: &crate::webhook_dispatch::SeatVerdict,
     current_seat: &str,
 ) -> String {
+    let found_label = verdict.label().unwrap_or("<none>");
     format!(
         "<ready_label_handler>\n\
          [GitHub] Issue labeled ready on {}#{} — DISPATCH REFUSED by engine.\n\n\
-         Reason: this issue carries the seat label `{}`, and this engine \
-         dispatches as seat `{}`.\n\
-         One dispatcher per ticket: another seat already owns it, and \
-         dispatching would put a second writer on its branch.\n\
+         Reason: {}\n\
+         This engine dispatches as seat `{}`. One dispatcher per ticket, so a \
+         ticket this engine cannot claim is not dispatched.\n\
          Known seats: {}\n\n\
          No task was created and no dispatch was prepared. You MUST NOT:\n\
          - call `run_claude_pilot` or `run_claude_pilot_groom` for this issue\n\
@@ -655,10 +655,12 @@ fn format_seat_mismatch_pre_digest(
          - re-add or re-trigger the `ready` label\n\
          - remove or edit the `{}` label to get around this\n\n\
          REQUIRED next action: call `send_message` once to tell the operator \
-         that {}#{} was refused because seat `{}` owns it, then end the turn.",
+         that {}#{} was refused because of its `{}` seat label, then end the \
+         turn.\n\
+         </ready_label_handler>",
         loc.owner_repo(),
         loc.number,
-        found_label,
+        crate::webhook_dispatch::seat_refusal_sentence(verdict),
         current_seat,
         crate::webhook_dispatch::known_dispatch_seats_display(),
         found_label,
@@ -1325,9 +1327,10 @@ mod tests {
             repo_ref: "senara-solutions/mika".to_string(),
             number: 2055,
         };
+        let verdict = crate::webhook_dispatch::classify_dispatch_seat(["dispatch:ssc"]);
         let digest = format_seat_mismatch_pre_digest(
             &loc,
-            "dispatch:ssc",
+            &verdict,
             crate::webhook_dispatch::CURRENT_DISPATCH_SEAT,
         );
         assert!(digest.contains("senara-solutions/mika"));
@@ -1344,6 +1347,13 @@ mod tests {
         // Must not match the `webhook_ready_label_dispatch` trigger, or the
         // guard would demand the dispatch this refusal prevents.
         assert!(digest.starts_with("<ready_label_handler>"));
+        // The block must close, like every other pre-digest in this file. The
+        // tag delimits engine territory in the LLM's context, and `starts_with`
+        // alone would not have caught an unclosed one.
+        assert!(
+            digest.trim_end().ends_with("</ready_label_handler>"),
+            "pre-digest must close its block"
+        );
         assert!(!crate::webhook_dispatch::is_ready_label_dispatch_marker(
             &digest
         ));
