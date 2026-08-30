@@ -415,7 +415,7 @@ pub fn compose_from_gh_outputs(
     }
     // Sort desc, keep 10 most recent.
     recent_activity.sort_by(|a, b| b.at.cmp(&a.at));
-    recent_activity.truncate(10);
+    recent_activity.truncate(10); // safe-byte-slice: Vec<RecentActivity> — element count, no char boundary
 
     let progress = compute_progress(&sub_issues);
 

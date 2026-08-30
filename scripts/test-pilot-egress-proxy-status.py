@@ -655,11 +655,16 @@ class HostSocketLifecycleTests(unittest.TestCase):
             os.unlink(os.path.join(self._dir, name))
         os.rmdir(self._dir)
 
-    def _spawn_host(self) -> subprocess.Popen:
+    def _spawn_host(self, env: dict | None = None) -> subprocess.Popen:
+        child_env = None
+        if env is not None:
+            child_env = os.environ.copy()
+            child_env.update(env)
         proc = subprocess.Popen(
             [sys.executable, str(_PROXY_PATH), "--host-unix", "--socket", self.sock],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
+            env=child_env,
         )
         self._procs.append(proc)
         return proc
@@ -817,6 +822,55 @@ class HostSocketLifecycleTests(unittest.TestCase):
             "the retiring proxy deleted its successor's live socket",
         )
         self.assertIsNone(second.poll())
+
+    def test_startup_emits_a_begin_breadcrumb_before_bind(self) -> None:
+        # mika#2051: the 2026-08-29 incident left 1569 log lines with nothing
+        # from the two dead proxies. The proxy must announce its own arrival so
+        # a future pre-bind death is bounded from below: if even this line is
+        # missing, the process died before Python ran (exec failure); if it is
+        # present but `listening` is not, the death is inside the pre-bind
+        # window. The line is emitted before bind, so it is here the moment the
+        # socket is connectable.
+        proc = self._spawn_host()
+        self.assertTrue(self._wait_connectable())
+        line = proc.stderr.readline().decode().rstrip("\n")
+        # The breadcrumb is an operator-log line, so it must carry mika#2030's
+        # timestamp like every other; strip it before the message assertions.
+        rest = _strip_ts(self, [line])[0]
+        self.assertIn("pilot_egress_startup.begin", rest)
+        self.assertIn(f"pid={proc.pid}", rest)
+
+    def test_pre_bind_signal_names_its_cause(self) -> None:
+        # The core regression lock for mika#2051. A SIGTERM landing in the
+        # pre-bind window used to kill the proxy mutely: the graceful handlers
+        # are armed only after bind. Park the proxy deterministically inside
+        # that window and signal it -- the death must now NAME its cause rather
+        # than vanish. This is the trace the incident ticket was filed to
+        # receive.
+        proc = self._spawn_host(env={"_MIKA_EGRESS_PREBIND_TEST_BARRIER": "5"})
+        # The `.begin` breadcrumb proves we are past the early handler install
+        # and parked before bind -- exactly where the incident struck.
+        begin = proc.stderr.readline().decode().rstrip("\n")
+        self.assertIn("pilot_egress_startup.begin", _strip_ts(self, [begin])[0])
+        self.assertFalse(
+            self._connectable(), "proxy bound despite the pre-bind barrier"
+        )
+        proc.send_signal(signal.SIGTERM)
+        _, stderr = proc.communicate(timeout=10)
+        self.assertEqual(
+            proc.returncode, 3, "a signalled-before-bind exit must be distinguishable"
+        )
+        # Every emitted line stays timestamped (mika#2030) through the abort
+        # path too; strip-and-assert as the shared helpers do.
+        lines = _strip_ts(self, stderr.decode().splitlines())
+        text = "\n".join(lines)
+        self.assertIn("pilot_egress_startup.signalled", text)
+        self.assertIn("SIGTERM", text)
+        self.assertNotIn("host-unix listening", text)
+        self.assertFalse(
+            os.path.exists(self.sock),
+            "an aborted startup must not leave a socket behind",
+        )
 
     def test_sandbox_mode_never_unlinks_the_unix_socket(self) -> None:
         # The sandbox side connects to the socket; it does not own it. A shutdown

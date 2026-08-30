@@ -461,7 +461,7 @@ async fn attempt_continuation_turn(
     // Strip the step-awareness nudge from the system prompt so the continuation
     // turn does not see stale "2 steps remaining" text.
     if let Some(ref mut system) = request.system {
-        system.truncate(system_prompt_original_len);
+        system.truncate(system_prompt_original_len); // safe-byte-slice: String, but the index is a String::len() recorded at mod.rs:980 before the nudge was appended — a real length, hence always a char boundary
     }
     request.tools = None;
     request.thinking = None;
