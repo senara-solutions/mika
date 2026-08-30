@@ -720,6 +720,9 @@ ${_TRACE_TAIL}"
     if [ -n "$REPO" ] && [ -n "$BRANCH" ]; then
         _PR_URL=$(gh pr list --repo "senara-solutions/$REPO" --head "$BRANCH" --json url --jq '.[0].url' 2>/dev/null || true)
         if [ -n "$_PR_URL" ]; then
+            # mika#2026: stamp origin on the artefact itself. Fail-open — a
+            # missing marker costs an `unknown` row in the report, never a dispatch.
+            _stamp_pr_origin "$REPO" "$_PR_URL" loop || true
             RESULT="${RESULT}
 PR: ${_PR_URL}"
         fi
@@ -2096,6 +2099,9 @@ ${RESULT}"
     if [ -n "$REPO" ] && [ -n "$BRANCH" ]; then
         PR_URL=$(gh pr list --repo "senara-solutions/$REPO" --head "$BRANCH" --json url --jq '.[0].url' 2>/dev/null || true)
         if [ -n "$PR_URL" ]; then
+            # mika#2026: stamp origin on the artefact itself. Fail-open — a
+            # missing marker costs an `unknown` row in the report, never a dispatch.
+            _stamp_pr_origin "$REPO" "$PR_URL" loop || true
             RESULT="${RESULT}
 PR: ${PR_URL}"
         fi
@@ -3540,6 +3546,120 @@ _label_to_type() {
     esac
 }
 
+# ── PR origin marker (mika#2026) ──────────────────────────────────────────────
+#
+# The origin of a PR — produced by the autonomous loop, or opened by hand — had
+# no instrument. The only existing trace, `tasks.metadata.$.claude_pilot.pr_url`,
+# rides a four-link text channel (dispatch-lib discovers the PR → `PR: <url>` in
+# RESULT → callback traverses mika-dev + task-engine → regex in dispatcher.rs →
+# DB write). Measured 2026-08-30: 43 rows carry a `pr_url` across all repos since
+# forever, and the five loop PRs merged 2026-08-27 (#2014–#2018) have none. That
+# counter measures well-formed callbacks reaching the engine, not PRs the loop
+# produced.
+#
+# The fix is not to harden four links of a channel that has no PR for a subject:
+# the fact lives on the artefact. dispatch-lib — the producer — stamps the PR at
+# the moment of production, in shell, never through the pilot's prompt (prompt
+# enforcement is exactly what fails at loop substrate).
+#
+# Read side: `scripts/pr-origin-report.sh`. Absence of the label reads "unknown",
+# never "by hand" — a default that looks like an answer is how an instrument lies.
+MIKA_PR_ORIGIN_LABEL_COLOR="1d76db"
+
+# Where the producer records the instant it first stamped anything. Absence of the
+# label only becomes informative from that instant onward, so the reader needs it —
+# and it must be a fact the producer wrote, not a date inferred from a file's mtime:
+# `seed_support_dirs` rewrites the installed dispatch-lib.sh unconditionally on
+# every daemon start (bundled_skills.rs, `std::fs::write` with no hash gate), so an
+# mtime tracks the last restart, not the first stamp. Written exactly once; never
+# refreshed, or the cut-off would walk forward and quietly re-open the blind window.
+MIKA_PR_ORIGIN_EPOCH_FILE="${MIKA_HOME:-$HOME/.mika}/state/pr-origin-epoch"
+
+# The closed vocabulary. It must stay in step with the reader's buckets in
+# scripts/pr-origin-report.sh — a value the producer stamps but the reader does
+# not know would vanish into "not-loop" or "unknown" without a word, which is the
+# very silence this ticket exists to end. test_stamp_pr_origin.sh parses the
+# reader and FAILS if the two drift.
+MIKA_PR_ORIGIN_VALUES=(loop spawn manual)
+
+# _stamp_pr_origin <repo> <pr_ref> [origin] — label a PR with its origin.
+#
+# `pr_ref` is anything `gh pr edit` accepts (URL or number). `origin` defaults to
+# `loop`; the label applied is `origin:<origin>`.
+#
+# The label may not exist yet on repos outside `mika` (dispatch-lib also targets
+# mika-cloud, mika-skills, mika-platform, none of which run mika's label-sync
+# workflow), so a failed edit is retried once behind an idempotent `label create`.
+#
+# Returns 0 when the PR carries the label, 1 when it could not be applied — with
+# a named line on stderr. Callers MUST invoke with `|| true`: a missing marker
+# costs one `unknown` row in a report; it must never cost a dispatch.
+_stamp_pr_origin() {
+    local repo="$1" pr_ref="$2" origin="${3:-loop}" label known=0 v existing
+    [ -n "$repo" ] && [ -n "$pr_ref" ] || return 0
+
+    for v in "${MIKA_PR_ORIGIN_VALUES[@]}"; do
+        [ "$origin" = "$v" ] && { known=1; break; }
+    done
+    if [ "$known" -ne 1 ]; then
+        echo "pr_origin.unknown_value: refusing to stamp 'origin:${origin}' on ${repo} PR ${pr_ref} — not in the vocabulary the reader understands (${MIKA_PR_ORIGIN_VALUES[*]}); the PR would read as unclassified instead" >&2
+        return 1
+    fi
+
+    label="origin:${origin}"
+
+    # Two of the three callsites reach a PR they DISCOVERED on the branch rather
+    # than created, and the orchestrator derives branch names with the same script
+    # the loop uses. So a by-hand PR can be sitting on this branch already. Never
+    # overwrite an origin someone else asserted: claim only an unclaimed PR.
+    #
+    # Every gh call here is bounded. One of the callsites is the crash/cancel exit
+    # trap, whose job is to get RESULT back to mika-dev; a hanging GitHub API must
+    # not delay the news that a dispatch died.
+    existing=$(timeout 15 gh pr view "$pr_ref" --repo "senara-solutions/${repo}" \
+        --json labels --jq '.labels[].name' 2>/dev/null | grep '^origin:' || true)
+    if [ -n "$existing" ]; then
+        if [ "$existing" = "$label" ]; then
+            return 0
+        fi
+        echo "pr_origin.already_claimed: ${repo} PR ${pr_ref} already carries '${existing}'; not overwriting with '${label}'" >&2
+        return 0
+    fi
+
+    if timeout 15 gh pr edit "$pr_ref" --repo "senara-solutions/${repo}" --add-label "$label" >/dev/null 2>&1; then
+        _record_pr_origin_epoch
+        return 0
+    fi
+
+    timeout 15 gh label create "$label" \
+        --repo "senara-solutions/${repo}" \
+        --color "$MIKA_PR_ORIGIN_LABEL_COLOR" \
+        --description "Origin of this PR, stamped by its producer (mika#2026)" \
+        >/dev/null 2>&1 || true
+
+    if timeout 15 gh pr edit "$pr_ref" --repo "senara-solutions/${repo}" --add-label "$label" >/dev/null 2>&1; then
+        _record_pr_origin_epoch
+        return 0
+    fi
+
+    echo "pr_origin.stamp_failed: could not apply '${label}' to ${repo} PR ${pr_ref} — this PR will read as unclassified in scripts/pr-origin-report.sh" >&2
+    return 1
+}
+
+# _record_pr_origin_epoch — write the first-stamp instant, exactly once.
+#
+# The reader treats "no origin label" as informative only from this instant on.
+# Writing it here — in the producer, on the first successful stamp — makes the
+# cut-off a fact someone recorded rather than a date someone guessed. Best-effort:
+# a failure to record leaves the epoch undetermined, and an undetermined epoch
+# makes the reader classify nothing, which is the safe direction.
+_record_pr_origin_epoch() {
+    [ -f "$MIKA_PR_ORIGIN_EPOCH_FILE" ] && return 0
+    mkdir -p "$(dirname "$MIKA_PR_ORIGIN_EPOCH_FILE")" 2>/dev/null || return 0
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$MIKA_PR_ORIGIN_EPOCH_FILE" 2>/dev/null || true
+    return 0
+}
+
 # _derive_recovery_pr_title — Compute a conventional-commit PR title for
 # recovery-class PRs. Called by the recovery block (mika#1282 + mika#1396).
 #
@@ -4272,6 +4392,9 @@ RESCUEBODY
 
         if [ -n "$RESCUED_PR_URL" ]; then
             PR_URL="$RESCUED_PR_URL"
+            # mika#2026: this PR was opened by dispatch-lib itself — the most
+            # direct producer there is. Stamp origin on the artefact. Fail-open.
+            _stamp_pr_origin "$REPO" "$RESCUED_PR_URL" loop || true
             # mika#1631: tag rescued PRs for staleness-probe targeting
             gh pr edit "$RESCUED_PR_URL" --add-label "wip-rescue" 2>&9 || true
             # mika#1352: emit canonical `PR:` line alongside the descriptive
