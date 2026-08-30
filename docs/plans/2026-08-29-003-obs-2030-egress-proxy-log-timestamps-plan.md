@@ -95,7 +95,7 @@ supposition :
 - Les douze autres (`:371`, `:376`, `:489`, `:557`, `:654`, `:658`, `:680`, `:691`, `:696`, `:705`,
   `:759`, `:774`) sont des chaînes unitaires, constantes ou f-strings simples.
 
-## Critères d'acceptation
+## Acceptance criteria
 
 - **AC1** — Chaque ligne écrite sur stderr par le script commence par un horodatage
   `YYYY-MM-DDTHH:MM:SS.sssZ`. Test : capturer stderr sur un démarrage et vérifier que **toutes** les
