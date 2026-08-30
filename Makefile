@@ -127,6 +127,7 @@ calibrate-mika-orchestrator: ## Pre-swap calibration gate for mika-orchestrator 
 test: ## Run all tests
 	cargo test
 	@bash skills/bundled/_shared/test-dispatch-lib.sh
+	@bash skills/bundled/_shared/tests/test_dev_groom_dirty_rescue.sh
 	@bash skills/bundled/_shared/tests/test_find_issue_plan.sh
 	@bash skills/bundled/_shared/tests/test_stamp_pr_origin.sh
 	@bash scripts/test-pr-origin-report.sh
@@ -145,8 +146,9 @@ test: ## Run all tests
 test-async-db-saturation: ## Run async DB channel saturation regression test (mika#1258)
 	cargo test -p mika-agent --lib -- async_db::tests::test_async_db_saturated_channel_does_not_pin_workers --nocapture
 
-test-dispatch-lib: ## Run the dispatch-lib assertion suite (mika#1772 wired it into CI)
+test-dispatch-lib: ## Run the dispatch-lib assertion suites (mika#1772 wired it into CI)
 	@bash skills/bundled/_shared/test-dispatch-lib.sh
+	@bash skills/bundled/_shared/tests/test_dev_groom_dirty_rescue.sh
 
 test-find-issue-plan: ## Run the plan-discovery suite (mika#2038 wired it into CI)
 	@bash skills/bundled/_shared/tests/test_find_issue_plan.sh

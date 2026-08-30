@@ -2114,6 +2114,295 @@ HEAD did not move and the worktree is clean, so nothing was written to the branc
 Outcome: PIPELINE_INCOMPLETE — pilot session terminated by claude-pilot before producing work."
 }
 
+# Compose the note a successful rescue commit leaves behind (mika#2031 R6).
+#
+# A rescue that preserves the content but says nothing is nearly as bad as a
+# deletion: `Saved working directory and index state WIP on main` tells nobody
+# there is anything to go and get. So the note names all three of what, where,
+# and how to reach it — the files that were staged, the rescue commit's sha, and
+# the branch it sits on. `_push_branch` reports the remote leg separately.
+#
+# Args: $1 = newline-separated rescued file list
+#       $2 = "" | " + mika#1296" (the cargo-fmt retry path's provenance)
+# Reads: SKILL, WORKTREE_DIR, BRANCH, PILOT_EXIT.
+_compose_rescue_note() {
+    local _files="$1" _extra="${2:-}" _sha
+    _sha=$(git -C "$WORKTREE_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)
+
+    if [ "$SKILL" = "dev-groom" ]; then
+        # NOT a PIPELINE FAILURE (mika#2031 R7): the rescue did its job and the
+        # architect pass can still run against the now-committed plan. Preserve
+        # first, unblock second — this is the second half reporting the first.
+        printf '%s' "dispatch-lib (mika#2031${_extra}): uncommitted grooming content preserved before anything else ran.
+Rescued into commit ${_sha} on branch ${BRANCH:-<unknown>}.
+Files rescued:
+${_files}
+The pilot wrote this and never committed it, so no branch and no remote held a
+copy — the next dispatch's worktree removal would have destroyed it. It is on
+the branch now; _push_branch publishes it and grooming continues from there."
+    else
+        printf '%s' "PIPELINE FAILURE: claude-pilot exited ${PILOT_EXIT:-unknown} with HEAD unchanged — dirty worktree detected and auto-committed (mika#1282${_extra} recovery).
+Rescued into commit ${_sha} on branch ${BRANCH:-<unknown>}.
+Files rescued:
+${_files}"
+    fi
+}
+
+# Preserve a zero-commit session's uncommitted content, then let the caller
+# unblock on it (mika#1282; opened to dev-groom by mika#2031).
+#
+# WHY dev-groom belongs here. A dev-groom pilot killed after writing its plan but
+# before `git commit` has nothing staged, nothing committed, nothing pushed —
+# and `_set_up_worktree` force-removes the worktree on the next dispatch of the
+# same branch. Uncommitted work is the most fragile form the loss takes: it
+# exists in exactly one place. `_find_issue_plan` searches the worktree
+# filesystem, so within a single run the plan is still *found*; the loss happens
+# between runs. Grooming is also the phase most exposed — first dispatch on a
+# fresh branch, whole output one markdown file, ~45 minutes and an architect
+# pass to redo.
+#
+# ORDER IS THE POINT: preserve first, unblock second. This runs from
+# _post_flight_recovery, ahead of _check_pilot_force_push, _iterate_groom_loop
+# and _push_branch, and the destructive worktree removal is a *next*-dispatch
+# event. A rescue that started by cleaning up so it could carry on would have
+# inverted the priority.
+#
+# No-op on a clean tree — for every skill. A rescue that fires unconditionally is
+# indistinguishable from one that never fires, so the clean-tree case is asserted
+# in tests/test_dev_groom_dirty_rescue.sh alongside the dirty-tree case.
+#
+# Reads: WORKTREE_DIR, SKILL, PRE_RUN_HEAD, POST_RUN_HEAD, REPO, ISSUE_NUM,
+#        BRANCH, SESSION_ID, PILOT_EXIT.
+# Writes: POST_RUN_HEAD (advanced past the rescue commit so _push_branch sees
+#         it), RESULT, RESCUED_DIRTY_WORKTREE (dev-pilot only).
+_rescue_dirty_worktree() {
+    # This is dispatch-lib exercising its structural git-workflow ownership per
+    # the content/workflow split (mika#1271 architect verdict;
+    # pilot-vs-substrate-contract-split-2026-05-25.md).
+    # repo#number mode only — the commit subject interpolates REPO/ISSUE_NUM,
+    # and free-text dispatches have no worktree to rescue from anyway.
+    [ -n "$WORKTREE_DIR" ] && [ -n "$REPO" ] || return 0
+    case "$SKILL" in
+        dev-pilot|dev-groom) ;;
+        *) return 0 ;;
+    esac
+    # Zero-commit sessions only. A session that did commit is the mika#1383
+    # trailing-content path's business, not this one's.
+    [ "${PRE_RUN_HEAD:-}" = "${POST_RUN_HEAD:-}" ] || return 0
+
+    DIRTY_FILES=$(git -C "$WORKTREE_DIR" status --porcelain 2>/dev/null | head -20)
+    [ -n "$DIRTY_FILES" ] || return 0
+
+    # Commit subject names what was salvaged. The `commit -m "wip(` literal on
+    # both sites below is load-bearing for test_rescue_commit_no_verify.sh's
+    # static guard — keep the interpolation after it, not around it.
+    local _rescue_what
+    if [ "$SKILL" = "dev-groom" ]; then
+        _rescue_what="plan staged by post-flight recovery (mika#2031)"
+    else
+        _rescue_what="impl staged by post-flight recovery (mika#1282)"
+    fi
+
+    # Stage all dirty files EXCEPT worktree-scaffold paths copied by
+    # _set_up_worktree (mika#1288, mika#1419, mika#1552):
+    #   - .claude/commands/         slash-command snapshots from mika-platform
+    #   - .claude/claude-pilot.json relay config cp'd from $PLATFORM_DIR at :489
+    #   - .claude/settings.local.json  permission allowlist cp'd at :490 (mika#1552)
+    #   - .claude/*.local.*          general guard for any future Claude-local
+    #                                files (.env-class — operator-machine-specific)
+    # None is pilot-authored content. Without the second exclusion, the rescue
+    # commit re-introduces .claude/claude-pilot.json whose intentional deletion
+    # shipped in PR #1348 (mika#1193 Phase C) — the founding incident for
+    # mika#1419. The third + fourth catch the .claude/settings.local.json class
+    # — cm#5 dispatch (2026-06-16) produced PR #16 whose only "rescued" content
+    # was a 143-line operator allowlist leak (mika#1552 founding incident).
+    git -C "$WORKTREE_DIR" add -A -- ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9
+
+    # Guard: if pathspec exclusion left nothing staged, skip the rescue
+    # commit. Handles the edge case where the pilot wrote ONLY to scaffold
+    # paths (mika#1288, mika#1419).
+    if git -C "$WORKTREE_DIR" diff --cached --quiet 2>&9; then
+        echo "NOTE: dirty worktree contained only scaffold paths (.claude/commands/, .claude/claude-pilot.json) — no pilot content to rescue" >&2
+        RESCUED_DIRTY_WORKTREE=0
+    else
+        # Compute accurate rescued-files list for the rescue note.
+        # DIRTY_FILES (from git status --porcelain) includes
+        # excluded scaffold paths; RESCUED_FILES reflects what was actually
+        # staged and will be committed.
+        RESCUED_FILES=$(git -C "$WORKTREE_DIR" diff --cached --name-only 2>&9)
+
+        # Proactive formatting (mika#1336): the dominant rescue-failure class is
+        # pilot-authored Rust that was never `cargo fmt`-ed, so the first commit
+        # trips the lefthook rust-fmt gate. Formatting up front makes the first
+        # commit succeed, halves wall-clock (one clippy compile, not two), and
+        # removes reliance on parsing lefthook stdout to detect a fmt rejection.
+        # The reactive rust-fmt retry below remains as belt-and-suspenders.
+        # Gated on staged *.rs so docs-only / non-Rust pilots don't pay cargo startup.
+        if git -C "$WORKTREE_DIR" diff --cached --name-only 2>&9 | grep -q '\.rs$'; then
+            PROACTIVE_FMT_ERR=$( (cd "$WORKTREE_DIR" && cargo fmt --all) 2>&1 ) || true
+            [ -n "$PROACTIVE_FMT_ERR" ] && echo "NOTE: proactive cargo fmt: ${PROACTIVE_FMT_ERR}" >&2
+            # Same exclusion pathspec as the initial `git add -A` above
+            # (mika#1288, mika#1419) — keeps scaffold paths out of the
+            # post-fmt re-add.
+            git -C "$WORKTREE_DIR" add -u -- ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9
+        fi
+
+        # Attempt rescue commit — capture stderr for hook-failure diagnosis (mika#1296).
+        # mika#1341: scratch file MUST live outside the worktree tree, NOT under
+        # "$WORKTREE_DIR/.git/". In a linked worktree (every autonomous dev-pilot run)
+        # ".git" is a FILE (a `gitdir:` pointer), not a directory — so a redirect into
+        # "$WORKTREE_DIR/.git/<name>" fails to OPEN (ENOTDIR). A failed output redirect
+        # means `git commit` never runs and exits non-zero with no captured output,
+        # producing the "non-rustfmt empty-capture" PIPELINE FAILURE with HEAD unchanged.
+        # `mktemp` keeps the original intent (off the working tree, away from .iterate/)
+        # while guaranteeing a real, writable path in both linked and non-linked checkouts.
+        # Named template preserves the descriptive "mika-rescue-commit-err" scratch name.
+        # NOTE: the literal token "mika-rescue-commit-err" is also a sed anchor in
+        # test-dispatch-lib.sh (rescue-block extraction); renaming it breaks those tests.
+        RESCUE_COMMIT_ERR="$(mktemp "${TMPDIR:-/tmp}/mika-rescue-commit-err.XXXXXX")"
+
+        # mika#1310: capture BOTH stdout and stderr. Lefthook
+        # pre-commit hooks print their summary + failure marks
+        # to stdout (not stderr); a `2>` redirect alone captured
+        # an empty file and the operator saw "Hook output:"
+        # blank on every false-positive rejection. Combined
+        # `>file 2>&1` captures the full lefthook decoration
+        # block including ⛔ failure lines.
+        #
+        # mika#1685: rescue commits bypass the pre-commit hook
+        # (--no-verify) BY DESIGN. The rescue path's purpose is to
+        # SALVAGE pilot work for operator review, not to gate it on
+        # lint. lefthook runs rust-clippy on pre-commit; a single
+        # clippy nit (one-line typo like `repeat().collect()`) would
+        # otherwise reject the rescue commit and strand a 29-turn,
+        # $4-cost pilot's work as a dead block (modal loop-wedge
+        # cause, n=3+ on 2026-06-30). CI re-runs cargo fmt --check +
+        # clippy on the resulting draft PR (ci.yml; wip-staleness-check
+        # re-clippies wip-rescue drafts when main moves), so the LINT
+        # signal still surfaces at the right layer — for the operator
+        # and the autonomous-loop's clippy-fix-retry path, not as a
+        # hard pre-commit block.
+        #
+        # TRADE-OFF, by design: --no-verify is all-or-nothing, so it
+        # ALSO skips lefthook's no-secrets + no-large-files gates,
+        # which CI does NOT replicate today (mika#1689 tracks adding a
+        # CI secret-scan net). Accepted because the rescue output is a
+        # DRAFT PR (operator-gated, never auto-merged), the secret-prone
+        # scaffold paths are already excluded from staging above, and
+        # secrets are scrubbed at the DB/tool-call layer. Do NOT remove
+        # --no-verify here without first moving the LINT gate somewhere
+        # the rescue path can still open its draft PR.
+        # Mika Prime bearing 2026-06-30 ~16:32Z ratified this as the
+        # wedge-cause fix (Concern 2, ahead of mika#1058).
+        if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): ${_rescue_what}
+
+Content written by pilot session ${SESSION_ID:-unknown} but git commit was never invoked.
+Auto-rescued by dispatch-lib dirty-worktree detection.
+Scaffold paths excluded (mika#1288, mika#1419)." --no-verify > "$RESCUE_COMMIT_ERR" 2>&1; then
+            # Commit succeeded on first try — proceed normally
+            rm -f "$RESCUE_COMMIT_ERR"
+
+            # Update POST_RUN_HEAD so _push_branch sees new commits
+            POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
+
+            # Name what was preserved and where (mika#2031 R6): a silent
+            # rescue is nearly as bad as a deletion — nobody knows there is
+            # anything to recover.
+            RESULT="$(_compose_rescue_note "$RESCUED_FILES" "")
+
+${RESULT}"
+
+            # Mark for draft PR creation in Unit 2 — dev-pilot only.
+            # dev-groom's output is a plan on the branch, not a PR (mika#2031 R4).
+            case "$SKILL" in dev-pilot) RESCUED_DIRTY_WORKTREE=1 ;; esac
+        elif grep -q "rust-fmt\|cargo fmt\|rustfmt" "$RESCUE_COMMIT_ERR" 2>/dev/null; then
+            # mika#1685 (AC4, kept-and-noted): with --no-verify on the
+            # initial commit above, the pre-commit hook no longer runs,
+            # so this fmt-rejection branch is now effectively unreachable
+            # on hook grounds. Retained defensively rather than removed —
+            # the retry commit below also carries --no-verify so the path
+            # stays consistent if a future change reintroduces a hook.
+            # Pre-commit rust-fmt hook rejected — auto-fix and retry (mika#1296).
+            # Capture cargo fmt stderr so it surfaces in the PIPELINE FAILURE message
+            # if the retry also fails (review-guide.md § Single Responsibility — failure
+            # paths must surface all available diagnostic information).
+            CARGO_FMT_ERR=""
+            echo "NOTE: rescue commit rejected by rust-fmt hook — running cargo fmt and retrying" >&2
+            CARGO_FMT_ERR=$( (cd "$WORKTREE_DIR" && cargo fmt --all) 2>&1 ) || true
+            # Same exclusion pathspec as the initial `git add -A` above
+            # (mika#1288, mika#1419) — scaffold paths stay excluded on the
+            # post-fmt retry path too.
+            git -C "$WORKTREE_DIR" add -A -- ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9
+
+            # mika#1310: capture both stdout+stderr (see above).
+            if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): ${_rescue_what}
+
+Content written by pilot session ${SESSION_ID:-unknown} but git commit was never invoked.
+Auto-rescued by dispatch-lib dirty-worktree detection (cargo fmt applied).
+Scaffold paths excluded (mika#1288, mika#1419)." --no-verify > "$RESCUE_COMMIT_ERR" 2>&1; then
+                # Retry succeeded after cargo fmt
+                rm -f "$RESCUE_COMMIT_ERR"
+
+                POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
+
+                RESULT="$(_compose_rescue_note "$RESCUED_FILES" " + mika#1296")
+
+${RESULT}"
+
+                case "$SKILL" in dev-pilot) RESCUED_DIRTY_WORKTREE=1 ;; esac
+            else
+                # Retry also failed — abort rescue, leave dirty.
+                # Surface the full diagnostic chain: cargo fmt output + retry commit
+                # hook output, so the operator can diagnose from the message alone
+                # (mika#1296 acceptance criteria).
+                RESCUE_ERR_CONTENT=$(cat "$RESCUE_COMMIT_ERR" 2>/dev/null | head -50)
+                # mika#1310: if captured output is empty, dump git
+                # diagnostic state as fallback so PIPELINE FAILURE
+                # carries SOMETHING the operator can act on.
+                if [ -z "$(printf '%s' "$RESCUE_ERR_CONTENT" | tr -d '[:space:]')" ]; then
+                    RESCUE_ERR_CONTENT="<rescue capture was empty — likely no hook output, falling back to git diagnostic>
+git status:
+$(git -C "$WORKTREE_DIR" status --short 2>&1 | head -10)
+git diff --cached --name-only:
+$(git -C "$WORKTREE_DIR" diff --cached --name-only 2>&1 | head -10)"
+                fi
+                RESULT="PIPELINE FAILURE: auto-rescue commit rejected by pre-commit hook after cargo-fmt retry.
+cargo fmt stderr: ${CARGO_FMT_ERR:-<empty>}
+Hook output: ${RESCUE_ERR_CONTENT}
+Worktree left dirty for operator inspection: ${WORKTREE_DIR}
+Still uncommitted there (nothing else holds a copy):
+${RESCUED_FILES}
+
+${RESULT}"
+                # Do NOT set RESCUED_DIRTY_WORKTREE — prevents empty draft PR
+                rm -f "$RESCUE_COMMIT_ERR"
+            fi
+        else
+            # Unknown hook failure — abort rescue, leave dirty
+            RESCUE_ERR_CONTENT=$(cat "$RESCUE_COMMIT_ERR" 2>/dev/null | head -50)
+            # mika#1310: if captured output is empty, dump git
+            # diagnostic state as fallback so PIPELINE FAILURE
+            # carries SOMETHING the operator can act on.
+            if [ -z "$(printf '%s' "$RESCUE_ERR_CONTENT" | tr -d '[:space:]')" ]; then
+                RESCUE_ERR_CONTENT="<rescue capture was empty — likely no hook output, falling back to git diagnostic>
+git status:
+$(git -C "$WORKTREE_DIR" status --short 2>&1 | head -10)
+git diff --cached --name-only:
+$(git -C "$WORKTREE_DIR" diff --cached --name-only 2>&1 | head -10)"
+            fi
+            RESULT="PIPELINE FAILURE: auto-rescue commit rejected by pre-commit hook (non-rustfmt).
+Hook output: ${RESCUE_ERR_CONTENT}
+Worktree left dirty for operator inspection: ${WORKTREE_DIR}
+Still uncommitted there (nothing else holds a copy):
+${RESCUED_FILES}
+
+${RESULT}"
+            # Do NOT set RESCUED_DIRTY_WORKTREE — prevents empty draft PR
+            rm -f "$RESCUE_COMMIT_ERR"
+        fi
+    fi
+}
+
 _post_flight_recovery() {
     # Post-flight recovery (mika#1615): extracted from the if [ -n "$STATUS" ]
     # branch so recovery fires on ALL exit paths — structured JSON output,
@@ -2193,9 +2482,22 @@ ${RESULT}"
                 # in the worktree. The old glob made this note unconditional for
                 # dev-groom, so a first dispatch that wrote nothing was reported
                 # as a re-dispatch whose plan had already landed.
-                RESULT="Note: HEAD unchanged on dev-groom re-dispatch — the plan for ${REPO}#${ISSUE_NUM} is already committed (${VALID_PLAN}). Architect pass will determine outcome.
+                #
+                # mika#2031: "already committed" is a claim about git, and
+                # VALID_PLAN is an answer from the filesystem — _find_issue_plan
+                # walks the worktree, so it finds an UNCOMMITTED plan just as
+                # readily. Asserting the commit on that evidence was false in
+                # exactly the case the rescue below exists for. Measure it.
+                if git -C "$WORKTREE_DIR" ls-files --error-unmatch -- "$VALID_PLAN" >/dev/null 2>&1 \
+                   && [ -z "$(git -C "$WORKTREE_DIR" status --porcelain -- "$VALID_PLAN" 2>/dev/null)" ]; then
+                    RESULT="Note: HEAD unchanged on dev-groom re-dispatch — the plan for ${REPO}#${ISSUE_NUM} is already committed (${VALID_PLAN}). Architect pass will determine outcome.
 
 ${RESULT}"
+                else
+                    RESULT="Note: HEAD unchanged on dev-groom — the plan for ${REPO}#${ISSUE_NUM} is present in the worktree (${VALID_PLAN}) but NOT committed. dispatch-lib's dirty-worktree rescue preserves it (mika#2031).
+
+${RESULT}"
+                fi
             else
                 # mika#1772: name the exit code that was actually observed. This
                 # branch asserted "exited 0" unconditionally, and the 2026-08-28
@@ -2206,211 +2508,11 @@ ${RESULT}"
             fi
         fi
 
-        # Unit 1 (mika#1282): detect dirty worktree on zero-commit dev-pilot.
-        # If the pilot wrote files but never committed, auto-rescue the content
-        # so it isn't lost with the worktree. This is dispatch-lib exercising its
-        # structural git-workflow ownership per the content/workflow split
-        # (mika#1271 architect verdict; pilot-vs-substrate-contract-split-2026-05-25.md).
-        if [ "$PRE_RUN_HEAD" = "$POST_RUN_HEAD" ] && [ "$SKILL" = "dev-pilot" ] && [ -n "$WORKTREE_DIR" ]; then
-            DIRTY_FILES=$(git -C "$WORKTREE_DIR" status --porcelain 2>/dev/null | head -20)
-            if [ -n "$DIRTY_FILES" ]; then
-                # Stage all dirty files EXCEPT worktree-scaffold paths copied by
-                # _set_up_worktree (mika#1288, mika#1419, mika#1552):
-                #   - .claude/commands/         slash-command snapshots from mika-platform
-                #   - .claude/claude-pilot.json relay config cp'd from $PLATFORM_DIR at :489
-                #   - .claude/settings.local.json  permission allowlist cp'd at :490 (mika#1552)
-                #   - .claude/*.local.*          general guard for any future Claude-local
-                #                                files (.env-class — operator-machine-specific)
-                # None is pilot-authored content. Without the second exclusion, the rescue
-                # commit re-introduces .claude/claude-pilot.json whose intentional deletion
-                # shipped in PR #1348 (mika#1193 Phase C) — the founding incident for
-                # mika#1419. The third + fourth catch the .claude/settings.local.json class
-                # — cm#5 dispatch (2026-06-16) produced PR #16 whose only "rescued" content
-                # was a 143-line operator allowlist leak (mika#1552 founding incident).
-                git -C "$WORKTREE_DIR" add -A -- ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9
-
-                # Guard: if pathspec exclusion left nothing staged, skip the rescue
-                # commit. Handles the edge case where the pilot wrote ONLY to scaffold
-                # paths (mika#1288, mika#1419).
-                if git -C "$WORKTREE_DIR" diff --cached --quiet 2>&9; then
-                    echo "NOTE: dirty worktree contained only scaffold paths (.claude/commands/, .claude/claude-pilot.json) — no pilot content to rescue" >&2
-                    RESCUED_DIRTY_WORKTREE=0
-                else
-                    # Compute accurate rescued-files list for the PIPELINE FAILURE
-                    # message. DIRTY_FILES (from git status --porcelain) includes
-                    # excluded scaffold paths; RESCUED_FILES reflects what was actually
-                    # staged and will be committed.
-                    RESCUED_FILES=$(git -C "$WORKTREE_DIR" diff --cached --name-only 2>&9)
-
-                    # Proactive formatting (mika#1336): the dominant rescue-failure class is
-                    # pilot-authored Rust that was never `cargo fmt`-ed, so the first commit
-                    # trips the lefthook rust-fmt gate. Formatting up front makes the first
-                    # commit succeed, halves wall-clock (one clippy compile, not two), and
-                    # removes reliance on parsing lefthook stdout to detect a fmt rejection.
-                    # The reactive rust-fmt retry below remains as belt-and-suspenders.
-                    # Gated on staged *.rs so docs-only / non-Rust pilots don't pay cargo startup.
-                    if git -C "$WORKTREE_DIR" diff --cached --name-only 2>&9 | grep -q '\.rs$'; then
-                        PROACTIVE_FMT_ERR=$( (cd "$WORKTREE_DIR" && cargo fmt --all) 2>&1 ) || true
-                        [ -n "$PROACTIVE_FMT_ERR" ] && echo "NOTE: proactive cargo fmt: ${PROACTIVE_FMT_ERR}" >&2
-                        # Same exclusion pathspec as the initial `git add -A` above
-                        # (mika#1288, mika#1419) — keeps scaffold paths out of the
-                        # post-fmt re-add.
-                        git -C "$WORKTREE_DIR" add -u -- ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9
-                    fi
-
-                    # Attempt rescue commit — capture stderr for hook-failure diagnosis (mika#1296).
-                    # mika#1341: scratch file MUST live outside the worktree tree, NOT under
-                    # "$WORKTREE_DIR/.git/". In a linked worktree (every autonomous dev-pilot run)
-                    # ".git" is a FILE (a `gitdir:` pointer), not a directory — so a redirect into
-                    # "$WORKTREE_DIR/.git/<name>" fails to OPEN (ENOTDIR). A failed output redirect
-                    # means `git commit` never runs and exits non-zero with no captured output,
-                    # producing the "non-rustfmt empty-capture" PIPELINE FAILURE with HEAD unchanged.
-                    # `mktemp` keeps the original intent (off the working tree, away from .iterate/)
-                    # while guaranteeing a real, writable path in both linked and non-linked checkouts.
-                    # Named template preserves the descriptive "mika-rescue-commit-err" scratch name.
-                    # NOTE: the literal token "mika-rescue-commit-err" is also a sed anchor in
-                    # test-dispatch-lib.sh (rescue-block extraction); renaming it breaks those tests.
-                    RESCUE_COMMIT_ERR="$(mktemp "${TMPDIR:-/tmp}/mika-rescue-commit-err.XXXXXX")"
-
-                    # mika#1310: capture BOTH stdout and stderr. Lefthook
-                    # pre-commit hooks print their summary + failure marks
-                    # to stdout (not stderr); a `2>` redirect alone captured
-                    # an empty file and the operator saw "Hook output:"
-                    # blank on every false-positive rejection. Combined
-                    # `>file 2>&1` captures the full lefthook decoration
-                    # block including ⛔ failure lines.
-                    #
-                    # mika#1685: rescue commits bypass the pre-commit hook
-                    # (--no-verify) BY DESIGN. The rescue path's purpose is to
-                    # SALVAGE pilot work for operator review, not to gate it on
-                    # lint. lefthook runs rust-clippy on pre-commit; a single
-                    # clippy nit (one-line typo like `repeat().collect()`) would
-                    # otherwise reject the rescue commit and strand a 29-turn,
-                    # $4-cost pilot's work as a dead block (modal loop-wedge
-                    # cause, n=3+ on 2026-06-30). CI re-runs cargo fmt --check +
-                    # clippy on the resulting draft PR (ci.yml; wip-staleness-check
-                    # re-clippies wip-rescue drafts when main moves), so the LINT
-                    # signal still surfaces at the right layer — for the operator
-                    # and the autonomous-loop's clippy-fix-retry path, not as a
-                    # hard pre-commit block.
-                    #
-                    # TRADE-OFF, by design: --no-verify is all-or-nothing, so it
-                    # ALSO skips lefthook's no-secrets + no-large-files gates,
-                    # which CI does NOT replicate today (mika#1689 tracks adding a
-                    # CI secret-scan net). Accepted because the rescue output is a
-                    # DRAFT PR (operator-gated, never auto-merged), the secret-prone
-                    # scaffold paths are already excluded from staging above, and
-                    # secrets are scrubbed at the DB/tool-call layer. Do NOT remove
-                    # --no-verify here without first moving the LINT gate somewhere
-                    # the rescue path can still open its draft PR.
-                    # Mika Prime bearing 2026-06-30 ~16:32Z ratified this as the
-                    # wedge-cause fix (Concern 2, ahead of mika#1058).
-                    if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): impl staged by post-flight recovery (mika#1282)
-
-Content written by pilot session ${SESSION_ID:-unknown} but git commit was never invoked.
-Auto-rescued by dispatch-lib dirty-worktree detection.
-Scaffold paths excluded (mika#1288, mika#1419)." --no-verify > "$RESCUE_COMMIT_ERR" 2>&1; then
-                        # Commit succeeded on first try — proceed normally
-                        rm -f "$RESCUE_COMMIT_ERR"
-
-                        # Update POST_RUN_HEAD so _push_branch sees new commits
-                        POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
-
-                        # Amend the PIPELINE FAILURE message (already set above) with rescue note
-                        RESULT="PIPELINE FAILURE: claude-pilot exited ${PILOT_EXIT:-unknown} with HEAD unchanged — dirty worktree detected and auto-committed (mika#1282 recovery).
-Files rescued:
-${RESCUED_FILES}
-
-${RESULT}"
-
-                        # Mark for draft PR creation in Unit 2
-                        RESCUED_DIRTY_WORKTREE=1
-                    elif grep -q "rust-fmt\|cargo fmt\|rustfmt" "$RESCUE_COMMIT_ERR" 2>/dev/null; then
-                        # mika#1685 (AC4, kept-and-noted): with --no-verify on the
-                        # initial commit above, the pre-commit hook no longer runs,
-                        # so this fmt-rejection branch is now effectively unreachable
-                        # on hook grounds. Retained defensively rather than removed —
-                        # the retry commit below also carries --no-verify so the path
-                        # stays consistent if a future change reintroduces a hook.
-                        # Pre-commit rust-fmt hook rejected — auto-fix and retry (mika#1296).
-                        # Capture cargo fmt stderr so it surfaces in the PIPELINE FAILURE message
-                        # if the retry also fails (review-guide.md § Single Responsibility — failure
-                        # paths must surface all available diagnostic information).
-                        CARGO_FMT_ERR=""
-                        echo "NOTE: rescue commit rejected by rust-fmt hook — running cargo fmt and retrying" >&2
-                        CARGO_FMT_ERR=$( (cd "$WORKTREE_DIR" && cargo fmt --all) 2>&1 ) || true
-                        # Same exclusion pathspec as the initial `git add -A` above
-                        # (mika#1288, mika#1419) — scaffold paths stay excluded on the
-                        # post-fmt retry path too.
-                        git -C "$WORKTREE_DIR" add -A -- ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9
-
-                        # mika#1310: capture both stdout+stderr (see above).
-                        if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): impl staged by post-flight recovery (mika#1282)
-
-Content written by pilot session ${SESSION_ID:-unknown} but git commit was never invoked.
-Auto-rescued by dispatch-lib dirty-worktree detection (cargo fmt applied).
-Scaffold paths excluded (mika#1288, mika#1419)." --no-verify > "$RESCUE_COMMIT_ERR" 2>&1; then
-                            # Retry succeeded after cargo fmt
-                            rm -f "$RESCUE_COMMIT_ERR"
-
-                            POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
-
-                            RESULT="PIPELINE FAILURE: claude-pilot exited ${PILOT_EXIT:-unknown} with HEAD unchanged — dirty worktree detected and auto-committed after cargo fmt (mika#1282 + mika#1296 recovery).
-Files rescued:
-${RESCUED_FILES}
-
-${RESULT}"
-
-                            RESCUED_DIRTY_WORKTREE=1
-                        else
-                            # Retry also failed — abort rescue, leave dirty.
-                            # Surface the full diagnostic chain: cargo fmt output + retry commit
-                            # hook output, so the operator can diagnose from the message alone
-                            # (mika#1296 acceptance criteria).
-                            RESCUE_ERR_CONTENT=$(cat "$RESCUE_COMMIT_ERR" 2>/dev/null | head -50)
-                        # mika#1310: if captured output is empty, dump git
-                        # diagnostic state as fallback so PIPELINE FAILURE
-                        # carries SOMETHING the operator can act on.
-                        if [ -z "$(printf '%s' "$RESCUE_ERR_CONTENT" | tr -d '[:space:]')" ]; then
-                            RESCUE_ERR_CONTENT="<rescue capture was empty — likely no hook output, falling back to git diagnostic>
-git status:
-$(git -C "$WORKTREE_DIR" status --short 2>&1 | head -10)
-git diff --cached --name-only:
-$(git -C "$WORKTREE_DIR" diff --cached --name-only 2>&1 | head -10)"
-                        fi
-                            RESULT="PIPELINE FAILURE: auto-rescue commit rejected by pre-commit hook after cargo-fmt retry.
-cargo fmt stderr: ${CARGO_FMT_ERR:-<empty>}
-Hook output: ${RESCUE_ERR_CONTENT}
-Worktree left dirty for operator inspection: ${WORKTREE_DIR}
-
-${RESULT}"
-                            # Do NOT set RESCUED_DIRTY_WORKTREE — prevents empty draft PR
-                            rm -f "$RESCUE_COMMIT_ERR"
-                        fi
-                    else
-                        # Unknown hook failure — abort rescue, leave dirty
-                        RESCUE_ERR_CONTENT=$(cat "$RESCUE_COMMIT_ERR" 2>/dev/null | head -50)
-                        # mika#1310: if captured output is empty, dump git
-                        # diagnostic state as fallback so PIPELINE FAILURE
-                        # carries SOMETHING the operator can act on.
-                        if [ -z "$(printf '%s' "$RESCUE_ERR_CONTENT" | tr -d '[:space:]')" ]; then
-                            RESCUE_ERR_CONTENT="<rescue capture was empty — likely no hook output, falling back to git diagnostic>
-git status:
-$(git -C "$WORKTREE_DIR" status --short 2>&1 | head -10)
-git diff --cached --name-only:
-$(git -C "$WORKTREE_DIR" diff --cached --name-only 2>&1 | head -10)"
-                        fi
-                        RESULT="PIPELINE FAILURE: auto-rescue commit rejected by pre-commit hook (non-rustfmt).
-Hook output: ${RESCUE_ERR_CONTENT}
-Worktree left dirty for operator inspection: ${WORKTREE_DIR}
-
-${RESULT}"
-                        # Do NOT set RESCUED_DIRTY_WORKTREE — prevents empty draft PR
-                        rm -f "$RESCUE_COMMIT_ERR"
-                    fi
-                fi
-            fi
-        fi
+        # Unit 1 (mika#1282): detect dirty worktree on a zero-commit session and
+        # preserve its content before anything else runs. Opened to dev-groom by
+        # mika#2031; the body lives in _rescue_dirty_worktree() so a test can
+        # exercise it directly instead of reimplementing it.
+        _rescue_dirty_worktree
 
         # mika#1383: structural completion gate for HEAD-advanced-no-PR.
         # The pilot session ran content and committed, but ended its turn
