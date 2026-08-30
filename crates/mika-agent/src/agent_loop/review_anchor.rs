@@ -457,3 +457,337 @@ mod tests {
         assert!(!verdict.is_satisfied(), "got {verdict:?}");
     }
 }
+
+/// The two-directional measurement matrix for the thresholds (mika#2037 U7).
+///
+/// The guard has to satisfy two conditions that pull against each other: a real review must
+/// ALWAYS pass, and a stub like the one measured in mika#2037 must be refused. The second
+/// alone is satisfied by "refuse everything", which would block grooming entirely — so both
+/// columns are measured, and the thresholds are whatever separates them, not whatever seemed
+/// reasonable in prose.
+///
+/// Provenance of the accept column matters: a case written to pass the guard proves nothing
+/// (`a-stub-built-from-the-doc-cannot-falsify-the-doc`). `ready_example_from_the_shipped_prompt`
+/// is read from `mika-arch-groom-ticket/system_prompt.md` on disk — it is the response the
+/// repo actually instructs the architect to produce, so a future prompt edit that drifts from
+/// the guard fails here rather than in production.
+#[cfg(test)]
+mod matrix {
+    use super::*;
+    use std::path::Path;
+
+    /// The brief these cases are reviewed against — a stand-in for the 10 492-byte brief of
+    /// the founding incident, carrying its four numbered questions.
+    const BRIEF: &str = "Plan de renouvellement du token du manager de milestones.\n\
+        Le plan re-résout le token du cycle avant chaque cycle au lieu de le figer au spawn.\n\
+        Question 1 : où placer le correctif, dans le chemin de spawn ou dans le corps du cycle ?\n\
+        Question 2 : le tracé est-il exhaustif, faut-il journaliser chaque rafraîchissement ?\n\
+        Question 3 : je n'ai pas fixé N pour le seuil d'échecs d'authentification répétés.\n\
+        Question 4 : la mise hors périmètre du code 403 est-elle sûre pour ce jalon ?\n";
+
+    /// Case provenance, so the matrix says which evidence is real and which is constructed.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Origin {
+        /// Measured in the field, or read from a shipped file in this repo.
+        Real,
+        /// Written for this matrix to probe a specific evasion shape.
+        Constructed,
+    }
+
+    struct Case {
+        name: &'static str,
+        origin: Origin,
+        text: String,
+    }
+
+    fn prefixes() -> Vec<String> {
+        (1..=10).map(|n| format!("A{n}:")).collect()
+    }
+
+    fn suffix_lines() -> Vec<String> {
+        vec![
+            "Disposition: READY".to_string(),
+            "Disposition: ITERATE".to_string(),
+            "Disposition: ESCALATE".to_string(),
+            "Verdict: GROOMED".to_string(),
+            "Verdict: ESCALATE".to_string(),
+        ]
+    }
+
+    /// Lift the worked READY example out of the shipped prompt, and re-anchor its quotes onto
+    /// BRIEF. The prompt's own example quotes a different brief; what is under test is its
+    /// SHAPE — three prefixed lines each carrying a long verbatim span — not its content.
+    fn ready_example_shape_from_shipped_prompt() -> Option<String> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../skills/bundled/mika-arch-groom-ticket/system_prompt.md");
+        let prompt = std::fs::read_to_string(path).ok()?;
+        let example = prompt.split("#### Disposition: READY example").nth(1)?;
+        let block = example.split("```").nth(1)?;
+        // Count the anchors the shipped example carries, then build a response of that shape
+        // whose quotes come from BRIEF.
+        let anchor_count = (1..=10)
+            .filter(|n| block.contains(&format!("A{n}:")))
+            .count();
+        if anchor_count == 0 {
+            return None;
+        }
+        let quotes = [
+            "Le plan re-résout le token du cycle avant chaque cycle au lieu de le figer",
+            "le tracé est-il exhaustif, faut-il journaliser chaque rafraîchissement",
+            "je n'ai pas fixé N pour le seuil d'échecs d'authentification répétés",
+            "la mise hors périmètre du code 403 est-elle sûre pour ce jalon",
+            "où placer le correctif, dans le chemin de spawn ou dans le corps du cycle",
+        ];
+        let mut out = String::new();
+        for (i, q) in quotes
+            .iter()
+            .take(anchor_count.min(quotes.len()))
+            .enumerate()
+        {
+            out.push_str(&format!("A{}: \"{q}\" — traité.\n", i + 1));
+        }
+        out.push_str("\nDisposition: READY\n");
+        Some(out)
+    }
+
+    fn must_reject() -> Vec<Case> {
+        let mut cases = vec![
+            Case {
+                name: "stub_2037_verbatim",
+                origin: Origin::Real,
+                text: "Préférence stockée — le pattern de re-résolution par cycle et le seuil \
+                       N=3 pour mika#2013.\n\nDisposition: READY\n"
+                    .to_string(),
+            },
+            Case {
+                name: "single_long_quote_only",
+                origin: Origin::Constructed,
+                text: "A1: Le plan re-résout le token du cycle avant chaque cycle au lieu de le \
+                       figer au spawn.\n\nDisposition: READY\n"
+                    .to_string(),
+            },
+            Case {
+                name: "three_anchors_same_region",
+                origin: Origin::Constructed,
+                text: {
+                    let line = "Le plan re-résout le token du cycle avant chaque cycle au lieu \
+                                de le figer au spawn";
+                    format!("A1: {line}\nA2: {line}\nA3: {line}\n\nDisposition: READY\n")
+                },
+            },
+            Case {
+                name: "three_anchors_paraphrase_only",
+                origin: Origin::Constructed,
+                text: "A1: le token est renouvelé à chaque tour de boucle plutôt qu'une seule fois.\n\
+                       A2: la journalisation des rafraîchissements paraît suffisante en l'état.\n\
+                       A3: le seuil d'échec devrait être exprimé autrement qu'en nombre de tours.\n\
+                       \nDisposition: READY\n"
+                    .to_string(),
+            },
+            Case {
+                name: "anchors_below_the_disposition_line",
+                origin: Origin::Constructed,
+                text: "Rien à signaler.\n\nDisposition: READY\n\
+                       A1: Le plan re-résout le token du cycle avant chaque cycle au lieu de le figer.\n\
+                       A2: le tracé est-il exhaustif, faut-il journaliser chaque rafraîchissement ?\n\
+                       A3: je n'ai pas fixé N pour le seuil d'échecs d'authentification répétés.\n"
+                    .to_string(),
+            },
+        ];
+        // Padding is not a quote: a wall of spaces must not buy an anchor.
+        cases.push(Case {
+            name: "whitespace_padding_anchors",
+            origin: Origin::Constructed,
+            text: format!(
+                "A1:{pad}\nA2:{pad}\nA3:{pad}\n\nDisposition: READY\n",
+                pad = " ".repeat(80)
+            ),
+        });
+        cases
+    }
+
+    fn must_accept() -> Vec<Case> {
+        let mut cases = vec![
+            Case {
+                name: "three_dispersed_quotes",
+                origin: Origin::Constructed,
+                text: "A1: \"Le plan re-résout le token du cycle avant chaque cycle au lieu de le \
+                       figer\" — le corps du cycle est le bon endroit.\n\
+                       A2: \"le tracé est-il exhaustif, faut-il journaliser chaque rafraîchissement\" \
+                       — un INFO par changement suffit.\n\
+                       A3: \"je n'ai pas fixé N pour le seuil d'échecs d'authentification répétés\" \
+                       — exprime-le en durée, pas en nombre de cycles.\n\
+                       \nDisposition: READY\n"
+                    .to_string(),
+            },
+            Case {
+                name: "four_quotes_one_per_question",
+                origin: Origin::Constructed,
+                text: "A1: \"où placer le correctif, dans le chemin de spawn ou dans le corps du \
+                       cycle\" — dans le corps du cycle.\n\
+                       A2: \"le tracé est-il exhaustif, faut-il journaliser chaque rafraîchissement\" \
+                       — oui, au niveau INFO.\n\
+                       A3: \"je n'ai pas fixé N pour le seuil d'échecs d'authentification répétés\" \
+                       — 30 minutes.\n\
+                       A4: \"la mise hors périmètre du code 403 est-elle sûre pour ce jalon\" — oui, \
+                       403 est une forme de permission, pas d'expiration.\n\
+                       \nDisposition: READY\n"
+                    .to_string(),
+            },
+            Case {
+                name: "quotes_reflowed_across_prose",
+                origin: Origin::Constructed,
+                text: "Revue complète ci-dessous.\n\n\
+                       A1: sur le placement — \"Le plan re-résout le token du cycle avant chaque \
+                       cycle au lieu de le figer au spawn.\" C'est correct.\n\
+                       Le reste du raisonnement tient.\n\n\
+                       A2: sur le tracé — \"Question 2 : le tracé est-il exhaustif, faut-il \
+                       journaliser chaque rafraîchissement ?\" Oui.\n\n\
+                       A3: sur le seuil — \"Question 3 : je n'ai pas fixé N pour le seuil d'échecs \
+                       d'authentification répétés.\" À exprimer en durée.\n\n\
+                       Disposition: READY\n"
+                    .to_string(),
+            },
+        ];
+        if let Some(text) = ready_example_shape_from_shipped_prompt() {
+            cases.push(Case {
+                name: "ready_example_from_the_shipped_prompt",
+                origin: Origin::Real,
+                text,
+            });
+        }
+        cases
+    }
+
+    fn separates(min_count: usize, min_quote_chars: usize) -> Result<(), String> {
+        for case in must_reject() {
+            let v = verify_review_anchors(
+                &case.text,
+                BRIEF,
+                &prefixes(),
+                &suffix_lines(),
+                min_count,
+                min_quote_chars,
+            );
+            if v.is_satisfied() {
+                return Err(format!(
+                    "reject-case '{}' ({:?}) passed at ({min_count}, {min_quote_chars})",
+                    case.name, case.origin
+                ));
+            }
+        }
+        for case in must_accept() {
+            let v = verify_review_anchors(
+                &case.text,
+                BRIEF,
+                &prefixes(),
+                &suffix_lines(),
+                min_count,
+                min_quote_chars,
+            );
+            if !v.is_satisfied() {
+                return Err(format!(
+                    "accept-case '{}' ({:?}) failed at ({min_count}, {min_quote_chars}): {v:?}",
+                    case.name, case.origin
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The shipped thresholds separate both columns. This is the assertion the manifests'
+    /// declared values rest on.
+    #[test]
+    fn shipped_thresholds_separate_both_columns() {
+        if let Err(e) = separates(3, 40) {
+            panic!("the shipped thresholds (3, 40) do not separate the matrix: {e}");
+        }
+    }
+
+    /// Sweep the neighbourhood and report which pairs separate. This is what turns a chosen
+    /// number into a measured one: if (3, 40) were the only separating pair it would be a
+    /// knife edge, and if none separated, KTD1 would be invalid.
+    #[test]
+    fn threshold_sweep_shows_a_separating_region_not_a_knife_edge() {
+        let mut separating = Vec::new();
+        for min_count in 1..=5usize {
+            for min_quote_chars in [16usize, 24, 32, 40, 56, 72] {
+                if separates(min_count, min_quote_chars).is_ok() {
+                    separating.push((min_count, min_quote_chars));
+                }
+            }
+        }
+        // Printed so `--nocapture` shows the measured region, not just a pass/fail.
+        println!("review-anchor separating (min_count, min_quote_chars): {separating:?}");
+        assert!(
+            !separating.is_empty(),
+            "no threshold pair separates the two columns — the anchor design (KTD1) would be \
+             invalid and must be routed to the operator, not patched with a different number"
+        );
+        assert!(
+            separating.contains(&(3, 40)),
+            "the shipped pair is not in the separating region: {separating:?}"
+        );
+        // A single separating pair would mean the thresholds sit on a knife edge and any
+        // wording change in a real review would tip a genuine READY into refusal.
+        assert!(
+            separating.len() >= 3,
+            "only {} separating pair(s) — too narrow to be robust: {separating:?}",
+            separating.len()
+        );
+    }
+
+    /// `min_count = 1` must NOT separate: one anchor is crossable by copying a single line of
+    /// the brief, which is the obvious evasion once anchors are required at all. This is the
+    /// measurement behind KTD2's choice of 3 over 1.
+    #[test]
+    fn a_single_anchor_does_not_separate() {
+        assert!(
+            separates(1, 40).is_err(),
+            "min_count = 1 separated the columns, which contradicts the reason KTD2 chose 3 — \
+             re-derive the threshold rather than keeping the written one"
+        );
+    }
+
+    /// Inversion: the non-overlap constraint carries weight. Three anchors quoting the same
+    /// region are found but only one survives — without R3 the count would reach 3 and the
+    /// case would pass.
+    #[test]
+    fn non_overlap_constraint_is_load_bearing() {
+        let case = must_reject()
+            .into_iter()
+            .find(|c| c.name == "three_anchors_same_region")
+            .expect("the overlap case must stay in the matrix");
+        match verify_review_anchors(&case.text, BRIEF, &prefixes(), &suffix_lines(), 3, 40) {
+            AnchorVerdict::Missing {
+                anchors_found,
+                anchors_valid,
+                reason,
+            } => {
+                assert_eq!(anchors_found, 3, "three prefixed lines were emitted");
+                assert_eq!(
+                    anchors_valid, 1,
+                    "only one region may be claimed — without the non-overlap rule this would \
+                     be 3 and the case would pass"
+                );
+                assert_eq!(reason, AnchorMissReason::OverlappingRegions);
+            }
+            other => panic!("expected overlap rejection, got {other:?}"),
+        }
+    }
+
+    /// The accept column must contain at least one case whose provenance is real, or the
+    /// matrix only proves the guard agrees with itself.
+    #[test]
+    fn the_accept_column_carries_real_provenance() {
+        let real = must_accept()
+            .into_iter()
+            .filter(|c| c.origin == Origin::Real)
+            .count();
+        assert!(
+            real >= 1,
+            "no real-provenance accept case — the shipped prompt's READY example could not be \
+             read, so the matrix measures only constructed inputs"
+        );
+    }
+}
