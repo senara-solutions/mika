@@ -420,6 +420,23 @@ enum StuckReadyVerdict {
 /// costs no DB round-trip, and again from [`classify_stuck_ready`] so the pure
 /// decision stays whole and testable in one place.
 fn classify_stuck_ready_in_memory(issue: &Issue) -> Option<StuckReadyVerdict> {
+    // Filter A0: this ticket is not ours to take — another seat owns it, or its
+    // seat label cannot be resolved at all (mika#2084).
+    //
+    // Checked ahead of filter A even though `is_feeder_excluded` would also
+    // catch it: the skip reason is the operator-visible record of an avoided
+    // collision (AC5), and `operator_review_or_blocked` would name the wrong
+    // cause. Same decision, honest label.
+    if let Some(verdict) = seat_refusal(issue) {
+        // The reason is the operator's tally of avoided collisions, so it must
+        // distinguish "another seat owns this" from "nobody could be resolved as
+        // the owner". Counting a `dispatch:zorglub` typo as a collision would
+        // inflate the very number this record exists to make trustworthy.
+        return Some(StuckReadyVerdict::Skip {
+            reason: verdict.refusal_reason().unwrap_or("seat_refused"),
+        });
+    }
+
     // Filter A: the ticket is already in the operator's hands (or blocked).
     if is_feeder_excluded(issue) {
         return Some(StuckReadyVerdict::Skip {
@@ -513,13 +530,43 @@ fn select_stuck_ready_candidates(
 // ───────────────────── Phase 0 feeder selection (mika#1863) ─────────────────────
 
 /// Returns `true` if `issue` carries a label that structurally excludes it from
-/// the pullable pool AND the feeder backlog (mika#1863 R3/R4): `blocked` or
-/// `operator-review`. Both mean "not dispatchable regardless of grooming state".
+/// the pullable pool AND the feeder backlog: `blocked` or `operator-review`
+/// (mika#1863 R3/R4), or a `dispatch:*` seat label this engine cannot act on
+/// (mika#2084). All of them mean "not dispatchable regardless of grooming
+/// state" — the first two because someone else is holding the ticket, the third
+/// because some other seat is.
 fn is_feeder_excluded(issue: &Issue) -> bool {
-    issue
+    if issue
         .labels
         .iter()
         .any(|l| l.name == "blocked" || l.name == "operator-review")
+    {
+        return true;
+    }
+    // mika#2084 — a ticket another dispatch seat owns is not ours to feed.
+    //
+    // This lives in the shared predicate, not in one caller, because all three
+    // sites that apply the `ready` label filter through here: the feeder
+    // (`select_feeder_candidates`), the auto-pull selection, and the phase-2
+    // stuck-rescue classifier. A guard in only one of them would leave the other
+    // two labelling tickets that the dispatch path then refuses three layers
+    // later — `ready` applied and never consumed, which is precisely the kind of
+    // silent loop this module exists to remove.
+    //
+    // Free: the labels are already in memory, so this costs no round trip.
+    // Unlabelled issues take the `NoSeatLabel` branch and are untouched (AC3).
+    seat_refusal(issue).is_some()
+}
+
+/// The seat verdict for one issue when — and only when — it refuses (mika#2084).
+///
+/// Returns `None` for the overwhelmingly common no-seat-label case and for a
+/// ticket labelled for this engine's own seat, so callers read as "is there a
+/// reason to stand down", never "is there permission to proceed".
+fn seat_refusal(issue: &Issue) -> Option<crate::webhook_dispatch::SeatVerdict> {
+    let names: Vec<&str> = issue.labels.iter().map(|l| l.name.as_str()).collect();
+    let verdict = crate::webhook_dispatch::classify_dispatch_seat(names);
+    verdict.refuses().then_some(verdict)
 }
 
 /// Count the **pullable**-ready tickets — the threshold signal for the feeder
@@ -2804,5 +2851,73 @@ This ticket has been GROOMED and is ready.
             classify_stuck_ready(&ready_issue, &facts(0), 3),
             StuckReadyVerdict::Eligible
         );
+    }
+
+    // ─────────────── Dispatch seat gate (mika#2084) ───────────────
+
+    /// AC1 — a ticket another seat owns is not selected, and the skip reason
+    /// names the real cause so an avoided collision is countable (AC5).
+    #[test]
+    fn test_issue_owned_by_other_seat_is_skipped() {
+        // The reason must name the ACTUAL cause: a foreign seat is a collision,
+        // an unresolvable label is not. Collapsing both into
+        // `seat_owned_by_other` would inflate the operator's collision tally
+        // with label typos.
+        for (label, expected_reason) in [
+            ("dispatch:ssc", "seat_owned_by_other"),
+            ("dispatch:mpc", "seat_owned_by_other"),
+            ("dispatch:zorglub", "unknown_seat"),
+            ("dispatch:", "empty_seat"),
+        ] {
+            let issue = make_issue(2055, GROOMED_BODY, &["ready", label], "t");
+            assert_eq!(
+                classify_stuck_ready(&issue, &facts(0), 3),
+                StuckReadyVerdict::Skip {
+                    reason: expected_reason,
+                },
+                "{label} must not be re-driven, and must say why"
+            );
+            assert!(
+                is_feeder_excluded(&issue),
+                "{label} must also be excluded from the feeder — all three \
+                 `ready`-applying paths filter through this predicate"
+            );
+        }
+    }
+
+    /// AC3 / AC4 positive half — the test that fails if the gate over-reaches.
+    ///
+    /// Without this, "refuse everything" would satisfy the test above while
+    /// silently stopping the loop.
+    #[test]
+    fn test_unlabelled_issue_remains_eligible() {
+        let issue = make_issue(2055, GROOMED_BODY, &["ready", "p1-important"], "t");
+        assert_eq!(
+            classify_stuck_ready(&issue, &facts(0), 3),
+            StuckReadyVerdict::Eligible,
+            "an issue with no seat label must behave exactly as before #2084"
+        );
+        assert!(!is_feeder_excluded(&issue));
+
+        // Our own seat is a pass, not merely an absence.
+        let ours = format!(
+            "{}{}",
+            crate::webhook_dispatch::DISPATCH_SEAT_LABEL_PREFIX,
+            crate::webhook_dispatch::CURRENT_DISPATCH_SEAT
+        );
+        let mine = make_issue(2056, GROOMED_BODY, &["ready", &ours], "t");
+        assert_eq!(
+            classify_stuck_ready(&mine, &facts(0), 3),
+            StuckReadyVerdict::Eligible
+        );
+        assert!(!is_feeder_excluded(&mine));
+
+        // And a near-miss label name is not a seat claim (AC3).
+        let near = make_issue(2057, GROOMED_BODY, &["ready", "dispatched"], "t");
+        assert_eq!(
+            classify_stuck_ready(&near, &facts(0), 3),
+            StuckReadyVerdict::Eligible
+        );
+        assert!(!is_feeder_excluded(&near));
     }
 }
