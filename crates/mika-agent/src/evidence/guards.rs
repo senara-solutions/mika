@@ -710,6 +710,326 @@ pub(crate) fn detect_doctrine_public_promo(text: &str) -> Option<DoctrinePublicP
     })
 }
 
+// ---------------------------------------------------------------------------
+// mika#1646 — Destructive-action grounding guard (pre-execution)
+// ---------------------------------------------------------------------------
+//
+// Sibling of assert-grounded (mika#1331) and equivalence-claim (mika#1645),
+// with one structural difference that governs everything below: **those guards
+// fire at EndTurn, this one cannot**.
+//
+// The other two inspect assistant *text* and re-prompt. mika#1646's defect is
+// not a sentence — it is a tool call. `gh pr close 1644` leaves at step 3 of
+// the tool loop; by the time the EndTurn arm runs, the PR is already closed and
+// a re-prompt can only comment on an accomplished fact. So the predicates here
+// are consumed by a **pre-subprocess gate** in `run_gh`
+// (`skills::builtin_handlers`), alongside the mika#1682 / mika#1196 / mika#1167
+// gates that already refuse `gh` calls before any side effect.
+//
+// Founding incident: mika-dev closed PR #1644 twice in 9 minutes on the same
+// fabricated "duplicate of mika#1638" rationale, the second time with a
+// human's diff-grounded contradiction sitting in the thread. The second close
+// came from a *deferred webhook replay* — a context sharing no in-memory state
+// with the first. That is why repeat detection reads the persisted `tool_calls`
+// table rather than any turn- or session-local state: the second execution has
+// to KNOW it is a second execution, which is a property of the record, not of
+// the process that happens to be running.
+
+/// Audit-event `tool_name` for every destructive-action decision (AC3).
+///
+/// `audit_events` has no `event_type` column — the schema is free-form
+/// `tool_name TEXT NOT NULL` — so this follows the established convention of
+/// `phantom_aged_out` (mika#1712) and `wip_rescue` (mika#1852). No migration.
+pub const DESTRUCTIVE_ACTION_AUDIT_TOOL: &str = "destructive_action_grounding";
+
+/// Env var tuning the repeat-detection window, in seconds (architect F1).
+pub const REPEAT_ACTION_WINDOW_ENV: &str = "MIKA_DEV_REPEAT_ACTION_WINDOW_SECS";
+
+/// Default repeat-detection window: 30 minutes.
+///
+/// The founding incident's two closes were 6m55s apart; the window has to be
+/// comfortably wider than the observed gap without reaching so far back that
+/// an unrelated legitimate close on the same target is caught.
+pub const REPEAT_ACTION_WINDOW_DEFAULT_SECS: i64 = 1800;
+
+/// Tools whose call can ground a destructive action by fetching the target's
+/// current state. Mirrors `GROUNDING_TOOLS` (mika#1331) plus the qa read path.
+pub const DESTRUCTIVE_GROUNDING_TOOLS: &[&str] = &["run_gh", "qa_pr_view", "gh_read"];
+
+/// The kind of resource a destructive action terminates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DestructiveTargetKind {
+    Pr,
+    Issue,
+}
+
+impl DestructiveTargetKind {
+    /// The `gh` noun, as it appears in the command.
+    pub fn noun(self) -> &'static str {
+        match self {
+            DestructiveTargetKind::Pr => "pr",
+            DestructiveTargetKind::Issue => "issue",
+        }
+    }
+}
+
+/// A recognized destructive action: `gh pr close <N>` or `gh issue close <N>`.
+#[derive(Debug, Clone)]
+pub struct DestructiveAction {
+    pub kind: DestructiveTargetKind,
+    /// Bare target number, no `#` prefix (e.g. `1644`).
+    pub number: String,
+    /// `--comment` / `--body` text supplied with the close, when present. This
+    /// is the text AC1 requires to carry the file-list justification and AC2
+    /// requires to acknowledge a prior action.
+    pub comment: Option<String>,
+}
+
+impl DestructiveAction {
+    /// Stable identity of the *action*, used as the audit `target_key` and as
+    /// the repeat-detection key: `pr:close:1644`.
+    pub fn target_key(&self) -> String {
+        format!("{}:close:{}", self.kind.noun(), self.number)
+    }
+}
+
+/// Recognizes a destructive close in a `gh` argv.
+///
+/// Bounded on purpose to `pr close` / `issue close` (plan § Future expansion):
+/// detection is **fail-open**, because a gate that cannot tell what it is
+/// looking at must not turn into a blanket refusal of `gh`. Everything AFTER
+/// recognition is fail-closed — see `run_gh`'s gate.
+///
+/// The noun and verb are matched positionally (`args[0]`, `args[1]`) because
+/// that is the only shape `gh` accepts, and the target number is taken as the
+/// first subsequent bare argument that parses as a number — flags and their
+/// values are skipped, so `gh pr close --comment "see #99" 1644` yields 1644
+/// and not 99.
+pub fn detect_destructive_action(args: &[String]) -> Option<DestructiveAction> {
+    let kind = match args.first().map(String::as_str) {
+        Some("pr") => DestructiveTargetKind::Pr,
+        Some("issue") => DestructiveTargetKind::Issue,
+        _ => return None,
+    };
+    if args.get(1).map(String::as_str) != Some("close") {
+        return None;
+    }
+
+    // Flags that take a separate value; their value must not be mistaken for
+    // the target number.
+    // Flags that consume a SEPARATE following argument. Boolean flags must NOT
+    // be listed here: skipping two positions past one swallows the argument
+    // after it, and if that argument is the target number the action stops
+    // being recognized at all — a fail-open hole exactly where the gate is
+    // supposed to bite (`gh pr close --delete-branch 1644`).
+    const VALUE_FLAGS: &[&str] = &[
+        "--comment",
+        "-c",
+        "--body",
+        "-b",
+        "--repo",
+        "-R",
+        "--reason",
+    ];
+
+    let mut number: Option<String> = None;
+    let mut comment: Option<String> = None;
+    let mut i = 2usize;
+    while i < args.len() {
+        let arg = &args[i];
+        if let Some((flag, inline)) = arg.split_once('=')
+            && flag.starts_with("--")
+        {
+            if matches!(flag, "--comment" | "--body") {
+                comment = Some(inline.to_string());
+            }
+            i += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            if VALUE_FLAGS.contains(&arg.as_str()) {
+                if matches!(arg.as_str(), "--comment" | "-c" | "--body" | "-b")
+                    && let Some(v) = args.get(i + 1)
+                {
+                    comment = Some(v.clone());
+                }
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if number.is_none() {
+            let bare = arg.trim_start_matches('#');
+            if !bare.is_empty() && bare.chars().all(|c| c.is_ascii_digit()) {
+                number = Some(bare.to_string());
+            }
+        }
+        i += 1;
+    }
+
+    number.map(|number| DestructiveAction {
+        kind,
+        number,
+        comment,
+    })
+}
+
+/// Layer A — is the destructive action grounded in the target's current state?
+///
+/// Satisfied when the current turn contains a call to a grounding tool whose
+/// input names BOTH this target and a state-reading verb (`view` / `diff`).
+/// `rows` are this turn's tool calls, read from `tool_calls` by `trace_id`.
+///
+/// Requiring the *verb* matters: a turn that only ran `gh pr close 1644` would
+/// otherwise satisfy a bare "any run_gh mentioning 1644" check with the
+/// destructive call itself.
+pub fn destructive_grounding_satisfied<'a>(
+    action: &DestructiveAction,
+    tool_inputs: impl Iterator<Item = (&'a str, &'a str)>,
+) -> bool {
+    let needle = &action.number;
+    tool_inputs.into_iter().any(|(name, input)| {
+        if !DESTRUCTIVE_GROUNDING_TOOLS.contains(&name) {
+            return false;
+        }
+        // Anchor on the JSON quoting of the serialized argv, so #1644 does not
+        // match #16440 (the DB-side repeat query is anchored the same way).
+        if !input.contains(&format!("\"{needle}\"")) {
+            return false;
+        }
+        let lower = input.to_lowercase();
+        // A read of the target: `pr view`, `pr diff`, `issue view`, or the
+        // qa/arch read paths (whose whole purpose is reading).
+        lower.contains("view") || lower.contains("diff") || name != "run_gh"
+    })
+}
+
+/// Layer A, second half — does the close comment cite the grounding it claims?
+///
+/// AC1 requires the close comment to cite the file-list comparison, not just
+/// that a read happened somewhere in the turn. A close whose comment carries no
+/// evidence is the exact shape of the founding incident: mika-dev's two
+/// comments both paraphrased qa's rationale and cited nothing.
+///
+/// Deliberately generous about *form* (any of several evidence markers) and
+/// strict about *presence* — the point is to force the author to look at the
+/// diff and say what they saw, not to impose a template.
+pub fn destructive_comment_cites_evidence(comment: Option<&str>) -> bool {
+    let Some(text) = comment else { return false };
+    let lower = text.to_lowercase();
+    // Two families, both describing something the author SAW.
+    //
+    // Naming another ticket is deliberately NOT enough: "duplicate of
+    // mika#1638" is verbatim the rationale that got replayed twice in the
+    // founding incident, and admitting it would defeat the guard. What counts
+    // is an observation — a file, a diff, a read-back state — that a reviewer
+    // can check against the artifact.
+    const EVIDENCE_MARKERS: &[&str] = &[
+        // Family 1 — the diff / file-list comparison (AC1's named form).
+        "--json files",
+        "json files",
+        "file list",
+        "files changed",
+        "changed files",
+        "file diff",
+        "pr diff",
+        "diff shows",
+        "diff confirms",
+        "intersection",
+        "no overlap",
+        "zero overlap",
+        "overlap:",
+        "no commits",
+        "no changes",
+        "empty diff",
+        "crates/",
+        "skills/",
+        "docs/",
+        "scripts/",
+        ".rs",
+        ".toml",
+        ".yaml",
+        ".yml",
+        // Family 2 — a read-back state, for the legitimate administrative
+        // close that has no diff to cite (obsolete ticket, superseded scope).
+        // These describe what `gh issue view` / `gh pr view` returned, not what
+        // someone else concluded.
+        "closed as",
+        "state:",
+        "labels:",
+        "merged at",
+        "merged_at",
+        "already merged",
+        "branch deleted",
+    ];
+    EVIDENCE_MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// Layer B — does a repeated action's comment acknowledge the prior one?
+///
+/// Presence of a prior identical action inside the window makes this a *second
+/// execution*. AC2 requires the new action's body to say so explicitly, which
+/// is what distinguishes idempotence by intention from idempotence by accident:
+/// a replayed rationale cannot accidentally contain an acknowledgment it was
+/// never written with.
+pub fn destructive_repeat_acknowledged(comment: Option<&str>) -> bool {
+    let Some(text) = comment else { return false };
+    let lower = text.to_lowercase();
+    const ACK_MARKERS: &[&str] = &[
+        "previously closed",
+        "prior close",
+        "closed before",
+        "closed earlier",
+        "re-close",
+        "reclose",
+        "reclosing",
+        "re-closing",
+        "closing again",
+        "second close",
+        "reopened",
+        "re-opened",
+        "reviewed the comments since",
+        "comments since the prior",
+        "prior action",
+        "earlier close",
+        "after reviewing the reopen",
+    ];
+    ACK_MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// Reads the repeat-detection window from the environment (architect F1).
+///
+/// Absent / empty → default. Unparseable or non-positive → default, WARN-logged
+/// (same three-tier shape as `MIKA_WIP_RESCUE_MIN_AGE_SECS`, mika#1852). A `0`
+/// does NOT disable the guard: on a destructive action the safe default is to
+/// keep checking, so an operator typo cannot silently reopen the hole.
+pub fn repeat_action_window_secs() -> i64 {
+    parse_repeat_window(std::env::var(REPEAT_ACTION_WINDOW_ENV).ok().as_deref())
+}
+
+/// Pure half of `repeat_action_window_secs`, split out so the three-tier
+/// fallback is testable without mutating process env (edition 2024 makes
+/// `set_var` unsafe, and parallel tests would race on it).
+pub fn parse_repeat_window(raw: Option<&str>) -> i64 {
+    match raw {
+        None => REPEAT_ACTION_WINDOW_DEFAULT_SECS,
+        Some(s) if s.trim().is_empty() => REPEAT_ACTION_WINDOW_DEFAULT_SECS,
+        Some(s) => match s.trim().parse::<i64>() {
+            Ok(v) if v > 0 => v,
+            _ => {
+                tracing::warn!(
+                    event = "destructive_window_invalid",
+                    raw = %s,
+                    default_secs = REPEAT_ACTION_WINDOW_DEFAULT_SECS,
+                    "invalid MIKA_DEV_REPEAT_ACTION_WINDOW_SECS; falling back to default"
+                );
+                REPEAT_ACTION_WINDOW_DEFAULT_SECS
+            }
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1878,5 +2198,232 @@ mod tests {
                     title and the three bullets.";
         detect_doctrine_public_promo(text)
             .expect("plain violation without alignment signal must still fire");
+    }
+
+    // -- mika#1646 destructive-action grounding tests --
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn detects_pr_close_with_number() {
+        let a = detect_destructive_action(&argv(&["pr", "close", "1644"])).expect("detected");
+        assert_eq!(a.kind, DestructiveTargetKind::Pr);
+        assert_eq!(a.number, "1644");
+        assert_eq!(a.target_key(), "pr:close:1644");
+    }
+
+    #[test]
+    fn detects_issue_close_with_hash_prefix() {
+        let a = detect_destructive_action(&argv(&["issue", "close", "#42"])).expect("detected");
+        assert_eq!(a.kind, DestructiveTargetKind::Issue);
+        assert_eq!(a.number, "42");
+        assert_eq!(a.target_key(), "issue:close:42");
+    }
+
+    #[test]
+    fn captures_comment_from_separate_flag() {
+        let a = detect_destructive_action(&argv(&[
+            "pr",
+            "close",
+            "1644",
+            "--comment",
+            "duplicate of #1638",
+        ]))
+        .expect("detected");
+        assert_eq!(a.comment.as_deref(), Some("duplicate of #1638"));
+    }
+
+    #[test]
+    fn captures_comment_from_inline_equals() {
+        let a = detect_destructive_action(&argv(&["pr", "close", "7", "--comment=see the diff"]))
+            .expect("detected");
+        assert_eq!(a.comment.as_deref(), Some("see the diff"));
+    }
+
+    /// The founding-incident shape: a number inside the comment must not be
+    /// mistaken for the target when the target comes later in the argv.
+    #[test]
+    fn comment_number_is_not_mistaken_for_target() {
+        let a = detect_destructive_action(&argv(&[
+            "pr",
+            "close",
+            "--comment",
+            "duplicate of 1638",
+            "1644",
+        ]))
+        .expect("detected");
+        assert_eq!(a.number, "1644");
+    }
+
+    #[test]
+    fn repo_flag_value_is_not_the_target() {
+        let a = detect_destructive_action(&argv(&[
+            "issue",
+            "close",
+            "--repo",
+            "senara-solutions/mika",
+            "1646",
+        ]))
+        .expect("detected");
+        assert_eq!(a.number, "1646");
+    }
+
+    /// Detection is fail-open: anything not recognized as a close is none of
+    /// the gate's business, so `gh` at large keeps working.
+    #[test]
+    fn non_close_commands_are_ignored() {
+        for cmd in [
+            argv(&["pr", "view", "1644", "--json", "files"]),
+            argv(&["pr", "list", "--state", "open"]),
+            argv(&["issue", "comment", "10", "--body", "hi"]),
+            argv(&["pr", "merge", "12"]),
+            argv(&["api", "repos/x/y"]),
+        ] {
+            assert!(
+                detect_destructive_action(&cmd).is_none(),
+                "should not detect: {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn close_without_a_number_is_not_detected() {
+        assert!(detect_destructive_action(&argv(&["pr", "close"])).is_none());
+    }
+
+    #[test]
+    fn grounding_satisfied_by_a_view_of_the_target() {
+        let action = detect_destructive_action(&argv(&["pr", "close", "1644"])).expect("detected");
+        let calls = vec![(
+            "run_gh",
+            r#"{"command":["pr","view","1644","--json","files"]}"#,
+        )];
+        assert!(destructive_grounding_satisfied(&action, calls.into_iter()));
+    }
+
+    /// The close call itself must not satisfy the guard that governs it.
+    #[test]
+    fn grounding_not_satisfied_by_the_close_call_itself() {
+        let action = detect_destructive_action(&argv(&["pr", "close", "1644"])).expect("detected");
+        let calls = vec![("run_gh", r#"{"command":["pr","close","1644"]}"#)];
+        assert!(!destructive_grounding_satisfied(&action, calls.into_iter()));
+    }
+
+    /// Reading a *different* PR does not ground closing this one.
+    #[test]
+    fn grounding_not_satisfied_by_a_view_of_another_target() {
+        let action = detect_destructive_action(&argv(&["pr", "close", "1644"])).expect("detected");
+        let calls = vec![(
+            "run_gh",
+            r#"{"command":["pr","view","1638","--json","files"]}"#,
+        )];
+        assert!(!destructive_grounding_satisfied(&action, calls.into_iter()));
+    }
+
+    #[test]
+    fn grounding_not_satisfied_by_an_empty_turn() {
+        let action = detect_destructive_action(&argv(&["pr", "close", "1644"])).expect("detected");
+        assert!(!destructive_grounding_satisfied(
+            &action,
+            std::iter::empty()
+        ));
+    }
+
+    #[test]
+    fn comment_evidence_requires_something_checkable() {
+        assert!(destructive_comment_cites_evidence(Some(
+            "File list shows crates/mika-agent/src/calibration/roles/mika_qa.rs — zero overlap."
+        )));
+        assert!(destructive_comment_cites_evidence(Some(
+            "gh pr view --json files: no overlap with #1638"
+        )));
+        // The founding incident's actual comment: a paraphrase of an upstream
+        // verdict, citing nothing checkable.
+        assert!(!destructive_comment_cites_evidence(Some(
+            "Closing as duplicate of mika#1638 (merged 2026-06-29T09:58Z). \
+             QA review confirmed content is identical."
+        )));
+        assert!(!destructive_comment_cites_evidence(None));
+    }
+
+    #[test]
+    fn repeat_acknowledgment_requires_naming_the_prior_action() {
+        assert!(destructive_repeat_acknowledged(Some(
+            "This PR was reopened after my earlier close; I reviewed the comments since then."
+        )));
+        assert!(destructive_repeat_acknowledged(Some(
+            "Re-closing after reviewing the prior close."
+        )));
+        // The founding incident's second comment — byte-identical rationale to
+        // the first, no acknowledgment that a first even happened.
+        assert!(!destructive_repeat_acknowledged(Some(
+            "Closing as duplicate of mika#1638 (merged 2026-06-29T09:58Z). \
+             All content identical — calibration scenarios, fixtures, and \
+             source changes already on main via PR #1638."
+        )));
+        assert!(!destructive_repeat_acknowledged(None));
+    }
+
+    /// `--delete-branch` takes no value. Treating it as value-taking swallowed
+    /// the target number and silently disabled the gate.
+    #[test]
+    fn boolean_flag_does_not_swallow_the_target() {
+        let a = detect_destructive_action(&argv(&["pr", "close", "--delete-branch", "1644"]))
+            .expect("detected");
+        assert_eq!(a.number, "1644");
+    }
+
+    /// #1644 must not be grounded by a read of #16440.
+    #[test]
+    fn grounding_not_satisfied_by_a_superstring_number() {
+        let action = detect_destructive_action(&argv(&["pr", "close", "1644"])).expect("detected");
+        let calls = vec![(
+            "run_gh",
+            r#"{"command":["pr","view","16440","--json","files"]}"#,
+        )];
+        assert!(!destructive_grounding_satisfied(&action, calls.into_iter()));
+    }
+
+    /// An administrative close with no diff to cite is still allowed — as long
+    /// as it reports an observed state rather than paraphrasing a verdict.
+    #[test]
+    fn read_back_state_counts_as_evidence() {
+        assert!(destructive_comment_cites_evidence(Some(
+            "gh issue view: state: OPEN, labels: p3-nice-to-have — superseded, closing."
+        )));
+        assert!(destructive_comment_cites_evidence(Some(
+            "PR already merged at 2026-06-29T09:58Z; branch deleted."
+        )));
+        // Still not enough: naming another ticket is the founding-incident shape.
+        assert!(!destructive_comment_cites_evidence(Some(
+            "Closing as duplicate of mika#1638."
+        )));
+    }
+
+    #[test]
+    fn window_parse_is_three_tier() {
+        assert_eq!(parse_repeat_window(None), REPEAT_ACTION_WINDOW_DEFAULT_SECS);
+        assert_eq!(
+            parse_repeat_window(Some("  ")),
+            REPEAT_ACTION_WINDOW_DEFAULT_SECS
+        );
+        assert_eq!(parse_repeat_window(Some("10")), 10);
+        assert_eq!(parse_repeat_window(Some(" 45 ")), 45);
+        assert_eq!(
+            parse_repeat_window(Some("banana")),
+            REPEAT_ACTION_WINDOW_DEFAULT_SECS
+        );
+        // A non-positive value must NOT disable the check — on a destructive
+        // action an operator typo cannot be allowed to reopen the hole.
+        assert_eq!(
+            parse_repeat_window(Some("0")),
+            REPEAT_ACTION_WINDOW_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_repeat_window(Some("-1")),
+            REPEAT_ACTION_WINDOW_DEFAULT_SECS
+        );
     }
 }
