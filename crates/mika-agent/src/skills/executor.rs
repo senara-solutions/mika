@@ -2165,6 +2165,14 @@ async fn check_lineage_cycle(
         return Ok(());
     }
 
+    // mika#1948 — the dispatch being proposed inherits the source of the task
+    // proposing it. Read once, before the walk, so every ancestor comparison
+    // uses the same subject.
+    let proposed_source = match db.get_task_unscoped(parent_task_id).await {
+        Ok(Some(t)) => t.dispatcher_source,
+        _ => None,
+    };
+
     let mut current_id = parent_task_id.to_string();
     for _depth in 0..4 {
         let task = match db.get_task_unscoped(&current_id).await {
@@ -2172,17 +2180,60 @@ async fn check_lineage_cycle(
             _ => break, // task not found or DB error → stop walking (fail-open)
         };
 
-        // Extract (repo, issue, skill) from this ancestor
-        if let Some((ancestor_repo, ancestor_issue, ancestor_skill)) = extract_dispatch_tuple(&task)
-            && proposed_skill == Some(ancestor_skill.as_str())
-            && proposed_repo == Some(ancestor_repo.as_str())
-            && proposed_issue == Some(ancestor_issue)
+        // Extract (repo, issue, skill, source) from this ancestor
+        if let Some((ancestor_repo, ancestor_issue, ancestor_skill, ancestor_source)) =
+            extract_dispatch_tuple_with_source(&task)
         {
-            return Err(format!(
-                "Cycle detected: ancestor task {} has same dispatch tuple \
-                 ({}, #{}, skill={}). Refusing to enqueue.",
-                task.id, ancestor_repo, ancestor_issue, ancestor_skill
-            ));
+            // Rule 1 (pre-existing): the exact same (repo, issue, skill) tuple
+            // already appears in the lineage. Checked first and unchanged, so
+            // the mika-dev-only case behaves exactly as it did.
+            if proposed_skill == Some(ancestor_skill.as_str())
+                && proposed_repo == Some(ancestor_repo.as_str())
+                && proposed_issue == Some(ancestor_issue)
+            {
+                return Err(format!(
+                    "Cycle detected: ancestor task {} has same dispatch tuple \
+                     ({}, #{}, skill={}). Refusing to enqueue.",
+                    task.id, ancestor_repo, ancestor_issue, ancestor_skill
+                ));
+            }
+
+            // Rule 2 (mika#1948) — SOURCE ESCALATION, regardless of skill.
+            //
+            // A mika-manager dispatch on (repo, issue) that re-enters
+            // mika-manager on the SAME (repo, issue) further down its own
+            // lineage is the deadlock shape Porte 2 exists to prevent: the
+            // manager would be queueing behind work it started itself, and the
+            // exact-tuple rule above misses it because the skill differs
+            // (dev-pilot → callback → dev-groom).
+            //
+            // Deliberately narrow. It fires only when BOTH sides are explicitly
+            // `mika_manager`, so:
+            //   - NULL on either side (pre-v51 rows) is a no-op — the check
+            //     degrades cleanly to Rule 1, which is the whole
+            //     backward-compatibility contract;
+            //   - mika-dev and operator lineages are untouched. Widening this to
+            //     "any matching source" would refuse the ordinary
+            //     dev-pilot → dev-groom chain, which is legitimate work.
+            let both_manager = proposed_source.as_deref() == Some("mika_manager")
+                && ancestor_source.as_deref() == Some("mika_manager");
+            if both_manager
+                && proposed_repo == Some(ancestor_repo.as_str())
+                && proposed_issue == Some(ancestor_issue)
+            {
+                return Err(format!(
+                    "Cycle detected: ancestor task {} is a mika_manager dispatch on \
+                     the same target ({}, #{}), and this dispatch is also \
+                     mika_manager (skill={} → {}). A manager re-entering its own \
+                     lineage on one ticket would queue behind itself. \
+                     Refusing to enqueue.",
+                    task.id,
+                    ancestor_repo,
+                    ancestor_issue,
+                    ancestor_skill,
+                    proposed_skill.unwrap_or("<unknown>")
+                ));
+            }
         }
 
         // Walk up
@@ -2218,6 +2269,17 @@ fn parse_repo_issue(prompt: Option<&str>) -> (Option<&str>, Option<i64>) {
         }
     }
     (None, None)
+}
+
+/// `(repo, issue, skill, dispatcher_source)` for one task (mika#1948).
+///
+/// Wraps [`extract_dispatch_tuple`] to also report which dispatcher initiated
+/// the task, so the cycle check can reason about a source escalation and not
+/// only an exact tuple repeat.
+fn extract_dispatch_tuple_with_source(
+    task: &crate::db::Task,
+) -> Option<(String, i64, String, Option<String>)> {
+    extract_dispatch_tuple(task).map(|(r, i, s)| (r, i, s, task.dispatcher_source.clone()))
 }
 
 /// Extract `(repo, issue_number, skill)` tuple from a task's metadata/action_config.
@@ -6253,6 +6315,201 @@ mod tests {
         assert_eq!(repo, "mika");
         assert_eq!(issue, 159);
         assert_eq!(skill, "dev-groom");
+    }
+
+    // -- dispatcher-source axis on the cycle check (mika#1948 AC4) --
+
+    /// Build a lineage of two tasks on the same `(repo, issue)` but DIFFERENT
+    /// skills, with the given dispatcher sources. Returns the child id, which
+    /// is what a proposed dispatch would hang off.
+    async fn seed_source_lineage(
+        async_db: &crate::async_db::AsyncDatabase,
+        ancestor_skill: &str,
+        ancestor_source: Option<&str>,
+        child_source: Option<&str>,
+    ) -> String {
+        let ancestor = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "long_running:run_claude_pilot".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: serde_json::json!({
+                "trigger_kind": "deferred_dispatch",
+                "original_call": { "skill": ancestor_skill, "prompt": "mika#159" }
+            })
+            .to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: Some("deferred_dispatch".to_string()),
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let ancestor_id = async_db.create_task(ancestor).await.unwrap();
+        if let Some(src) = ancestor_source {
+            async_db
+                .set_task_dispatcher_source(&ancestor_id, src)
+                .await
+                .unwrap();
+        }
+
+        let child = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(ancestor_id.clone()),
+            depth: 1,
+            label: "callback".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let child_id = async_db.create_task(child).await.unwrap();
+        if let Some(src) = child_source {
+            async_db
+                .set_task_dispatcher_source(&child_id, src)
+                .await
+                .unwrap();
+        }
+        child_id
+    }
+
+    async fn cycle_test_db() -> crate::async_db::AsyncDatabase {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        db.create_session("test-session", "mika", "cli").unwrap();
+        crate::async_db::AsyncDatabase::new(db)
+    }
+
+    /// AC4 — a manager re-entering its own lineage on the same ticket is
+    /// refused even though the skill differs, which is exactly what the
+    /// exact-tuple rule cannot see.
+    #[tokio::test]
+    async fn test_check_lineage_cycle_rejects_mika_manager_source_escalation() {
+        let async_db = cycle_test_db().await;
+        let child_id = seed_source_lineage(
+            &async_db,
+            "dev-pilot",
+            Some("mika_manager"),
+            Some("mika_manager"),
+        )
+        .await;
+
+        // Different skill, same (repo, issue) — Rule 1 does not fire.
+        let proposed = serde_json::json!({ "skill": "dev-groom", "prompt": "mika#159" });
+        let result = check_lineage_cycle(&async_db, &child_id, &proposed).await;
+        assert!(
+            result.is_err(),
+            "a mika_manager dispatch re-entering a mika_manager lineage on the \
+             same ticket must be refused"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("mika_manager"),
+            "the refusal must name the source escalation — got: {err}"
+        );
+    }
+
+    /// AC4 fail-open — pre-v51 rows carry NULL on both sides. The new rule must
+    /// be a no-op there, degrading cleanly to the pre-existing exact-tuple
+    /// behaviour. This is the backward-compatibility contract.
+    #[tokio::test]
+    async fn test_check_lineage_cycle_null_dispatcher_source_fail_open() {
+        let async_db = cycle_test_db().await;
+        let child_id = seed_source_lineage(&async_db, "dev-pilot", None, None).await;
+
+        let proposed = serde_json::json!({ "skill": "dev-groom", "prompt": "mika#159" });
+        let result = check_lineage_cycle(&async_db, &child_id, &proposed).await;
+        assert!(
+            result.is_ok(),
+            "NULL sources on both sides must not trip the new rule — a pre-v51 \
+             dev-pilot → dev-groom chain is legitimate work"
+        );
+    }
+
+    /// The rule is narrow on purpose: it must NOT fire for the autonomous loop.
+    /// Widening it to "any matching source" would refuse the ordinary
+    /// dev-pilot → dev-groom chain that the loop runs constantly.
+    #[tokio::test]
+    async fn test_check_lineage_cycle_does_not_fire_for_mika_dev_lineage() {
+        let async_db = cycle_test_db().await;
+        let child_id =
+            seed_source_lineage(&async_db, "dev-pilot", Some("mika_dev"), Some("mika_dev")).await;
+
+        let proposed = serde_json::json!({ "skill": "dev-groom", "prompt": "mika#159" });
+        let result = check_lineage_cycle(&async_db, &child_id, &proposed).await;
+        assert!(
+            result.is_ok(),
+            "a mika_dev dev-pilot → dev-groom chain is the loop's normal shape \
+             and must not be refused"
+        );
+    }
+
+    /// Mixed sources must not trip either — only a manager re-entering its own
+    /// lineage is the deadlock shape.
+    #[tokio::test]
+    async fn test_check_lineage_cycle_does_not_fire_on_mixed_sources() {
+        let async_db = cycle_test_db().await;
+        let child_id = seed_source_lineage(
+            &async_db,
+            "dev-pilot",
+            Some("mika_dev"),
+            Some("mika_manager"),
+        )
+        .await;
+
+        let proposed = serde_json::json!({ "skill": "dev-groom", "prompt": "mika#159" });
+        let result = check_lineage_cycle(&async_db, &child_id, &proposed).await;
+        assert!(
+            result.is_ok(),
+            "a manager dispatch following a mika_dev ancestor is an escalation \
+             the loop is allowed to make"
+        );
+    }
+
+    /// Source escalation is target-scoped: a manager lineage on a DIFFERENT
+    /// ticket must not block.
+    #[tokio::test]
+    async fn test_check_lineage_cycle_source_rule_is_target_scoped() {
+        let async_db = cycle_test_db().await;
+        let child_id = seed_source_lineage(
+            &async_db,
+            "dev-pilot",
+            Some("mika_manager"),
+            Some("mika_manager"),
+        )
+        .await;
+
+        // Same sources, different issue.
+        let proposed = serde_json::json!({ "skill": "dev-groom", "prompt": "mika#777" });
+        let result = check_lineage_cycle(&async_db, &child_id, &proposed).await;
+        assert!(
+            result.is_ok(),
+            "the manager may dispatch a different ticket within the same lineage"
+        );
     }
 
     #[tokio::test]

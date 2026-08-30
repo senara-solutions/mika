@@ -7815,6 +7815,37 @@ impl Database {
         }
     }
 
+    /// Record which dispatcher initiated a task (mika#1948).
+    ///
+    /// A separate write rather than a `NewTask` field on purpose: `NewTask` has
+    /// 175 construction sites, and all but a handful are the autonomous loop,
+    /// whose correct value is exactly the NULL default. Making every one of them
+    /// restate "mika_dev" would be churn that buries the few sites where the
+    /// answer is genuinely something else.
+    ///
+    /// Callers pass the value they mean; leaving it unset keeps the row NULL,
+    /// which reads as `mika_dev`. Rejects unknown values rather than storing
+    /// them — the CHECK constraint would too, but failing here names the
+    /// offending value.
+    pub fn set_task_dispatcher_source(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        dispatcher_source: &str,
+    ) -> Result<bool> {
+        if !matches!(dispatcher_source, "mika_dev" | "mika_manager" | "operator") {
+            anyhow::bail!(
+                "unknown dispatcher_source '{dispatcher_source}' — \
+                 expected one of: mika_dev, mika_manager, operator"
+            );
+        }
+        let n = self.conn.execute(
+            "UPDATE tasks SET dispatcher_source = ?3 WHERE id = ?1 AND agent_id = ?2",
+            params![task_id, agent_id, dispatcher_source],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Whether an operator-sourced task is waiting to run in this dispatch class
     /// (mika#1948 AC3).
     ///
@@ -12631,6 +12662,365 @@ mod tests {
         let session_id = "test-session".to_string();
         db.create_session(&session_id, "mika", "cli").unwrap();
         (db, session_id)
+    }
+
+    // ── mika#1948 Porte 2: exec-slot arbitration ──
+
+    /// A fresh DB must carry the v51 surface without any migration running —
+    /// `migrate_v1` builds the schema directly, so a column added only to the
+    /// migration would be missing on every new install.
+    #[test]
+    fn test_fresh_db_has_dispatcher_source_and_lease_table() {
+        let db = db();
+        let cols: Vec<String> = db
+            .conn
+            .prepare("PRAGMA table_info(tasks)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(
+            cols.iter().any(|c| c == "dispatcher_source"),
+            "fresh DB must have tasks.dispatcher_source — got {cols:?}"
+        );
+        db.conn
+            .query_row("SELECT COUNT(*) FROM dispatch_slot_leases", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .expect("fresh DB must have the dispatch_slot_leases table");
+    }
+
+    #[test]
+    fn test_migrate_v50_to_v51_is_idempotent() {
+        let mut db = db();
+        // Already at CURRENT (>=51) — must no-op rather than double-apply.
+        db.migrate_v50_to_v51().unwrap();
+        db.migrate_v50_to_v51().unwrap();
+        let version: i64 = db
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_migrate_v50_to_v51_bails_on_unexpected_baseline() {
+        let mut db = db();
+        // Forge a baseline the migration must refuse: below 50, so the
+        // idempotency guard does not return, but not the expected 50 either.
+        db.conn.execute("DELETE FROM schema_version", []).unwrap();
+        db.conn
+            .execute("INSERT INTO schema_version (version) VALUES (48)", [])
+            .unwrap();
+        let err = db.migrate_v50_to_v51().unwrap_err();
+        assert!(
+            err.to_string().contains("unexpected baseline version 48"),
+            "bail must name the offending baseline — got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_set_task_dispatcher_source_roundtrips() {
+        let db = db();
+        let id = db
+            .create_task(&new_task("mika", "op work", "manual", "none"))
+            .unwrap();
+
+        // Default is NULL — the pre-v51 / autonomous-loop case.
+        let t = db.get_task(&id, "mika").unwrap().unwrap();
+        assert_eq!(t.dispatcher_source, None, "default must stay NULL");
+
+        assert!(
+            db.set_task_dispatcher_source(&id, "mika", "operator")
+                .unwrap()
+        );
+        let t = db.get_task(&id, "mika").unwrap().unwrap();
+        assert_eq!(t.dispatcher_source.as_deref(), Some("operator"));
+    }
+
+    #[test]
+    fn test_set_task_dispatcher_source_rejects_unknown_value() {
+        let db = db();
+        let id = db
+            .create_task(&new_task("mika", "op work", "manual", "none"))
+            .unwrap();
+        let err = db
+            .set_task_dispatcher_source(&id, "mika", "zorglub")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown dispatcher_source"),
+            "must name the rejected value — got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_has_pending_operator_task_for_class() {
+        let db = db();
+        // Anti-vacuity: no operator task → false. Without this the assertion
+        // below is satisfied by a function that always returns true.
+        assert!(
+            !db.has_pending_operator_task_for_class("mika", "implement")
+                .unwrap(),
+            "no operator task seeded — must be false"
+        );
+
+        let id = db
+            .create_task(&new_task("mika", "operator work", "manual", "none"))
+            .unwrap();
+        db.set_task_dispatcher_source(&id, "mika", "operator")
+            .unwrap();
+        assert!(
+            db.has_pending_operator_task_for_class("mika", "implement")
+                .unwrap(),
+            "pending operator task in the implement class must be seen"
+        );
+        // Class-scoped: the same task must not register in the other class.
+        assert!(
+            !db.has_pending_operator_task_for_class("mika", "groom")
+                .unwrap(),
+            "operator task defaults to the implement class, not groom"
+        );
+    }
+
+    #[test]
+    fn test_has_pending_operator_task_ignores_non_operator_sources() {
+        let db = db();
+        let id = db
+            .create_task(&new_task("mika", "manager work", "manual", "none"))
+            .unwrap();
+        db.set_task_dispatcher_source(&id, "mika", "mika_manager")
+            .unwrap();
+        assert!(
+            !db.has_pending_operator_task_for_class("mika", "implement")
+                .unwrap(),
+            "only 'operator' confers priority — mika_manager must not"
+        );
+    }
+
+    // --- the atomic claim itself ---
+
+    #[test]
+    fn test_slot_claim_first_wins_second_is_refused() {
+        let mut db = db();
+        let a = db
+            .try_acquire_dispatch_slot("mika", "implement", "task-a", Some("mika_dev"), 120)
+            .unwrap();
+        assert_eq!(a, SlotClaim::Acquired, "first claimant takes the slot");
+
+        let b = db
+            .try_acquire_dispatch_slot("mika", "implement", "task-b", Some("mika_manager"), 120)
+            .unwrap();
+        match b {
+            SlotClaim::Held {
+                holder_task_id,
+                dispatcher_source,
+                ..
+            } => {
+                assert_eq!(holder_task_id, "task-a");
+                assert_eq!(
+                    dispatcher_source.as_deref(),
+                    Some("mika_dev"),
+                    "the refusal must name WHO holds the slot"
+                );
+            }
+            other => panic!("second claimant must be refused, got {other:?}"),
+        }
+    }
+
+    /// Anti-vacuity twin of the test above: a guard that refused everything
+    /// would satisfy "second claimant refused". The slot split must still hold,
+    /// so a different class is free while `implement` is taken.
+    #[test]
+    fn test_slot_claim_is_per_class_not_global() {
+        let mut db = db();
+        db.try_acquire_dispatch_slot("mika", "implement", "task-a", None, 120)
+            .unwrap();
+        let groom = db
+            .try_acquire_dispatch_slot("mika", "groom", "task-b", None, 120)
+            .unwrap();
+        assert_eq!(
+            groom,
+            SlotClaim::Acquired,
+            "the groom slot is a separate slot — taking implement must not close it"
+        );
+    }
+
+    /// And per-agent: one agent's busy slot must not block another's.
+    #[test]
+    fn test_slot_claim_is_per_agent() {
+        let mut db = db();
+        db.try_acquire_dispatch_slot("mika", "implement", "task-a", None, 120)
+            .unwrap();
+        let other = db
+            .try_acquire_dispatch_slot("mika-qa", "implement", "task-b", None, 120)
+            .unwrap();
+        assert_eq!(other, SlotClaim::Acquired, "slots are scoped per agent");
+    }
+
+    /// Re-entrancy: the same task re-validating refreshes its own lease rather
+    /// than deadlocking against itself. Without this, any retry of a dispatch
+    /// that already claimed the slot would be permanently refused.
+    #[test]
+    fn test_slot_claim_is_reentrant_for_same_holder() {
+        let mut db = db();
+        db.try_acquire_dispatch_slot("mika", "implement", "task-a", None, 120)
+            .unwrap();
+        let again = db
+            .try_acquire_dispatch_slot("mika", "implement", "task-a", None, 120)
+            .unwrap();
+        assert_eq!(
+            again,
+            SlotClaim::Acquired,
+            "a task must be able to re-claim the slot it already holds"
+        );
+    }
+
+    /// Expiry is what keeps fail-closed from becoming loop-breaking: a
+    /// dispatcher that dies mid-claim must stall its class for one TTL, not
+    /// forever. A zero TTL makes the lease born expired, so the next claimant
+    /// reclaims it.
+    #[test]
+    fn test_expired_lease_is_reclaimable() {
+        let mut db = db();
+        db.try_acquire_dispatch_slot("mika", "implement", "dead-task", None, 0)
+            .unwrap();
+        let next = db
+            .try_acquire_dispatch_slot("mika", "implement", "live-task", None, 120)
+            .unwrap();
+        assert_eq!(
+            next,
+            SlotClaim::Acquired,
+            "an expired lease must not strand the slot"
+        );
+        let holder = db.dispatch_slot_lease_holder("mika", "implement").unwrap();
+        assert_eq!(
+            holder.map(|h| h.0),
+            Some("live-task".to_string()),
+            "the reclaiming task becomes the holder"
+        );
+    }
+
+    #[test]
+    fn test_expired_lease_reads_as_free() {
+        let mut db = db();
+        db.try_acquire_dispatch_slot("mika", "implement", "dead-task", None, 0)
+            .unwrap();
+        assert_eq!(
+            db.dispatch_slot_lease_holder("mika", "implement").unwrap(),
+            None,
+            "an expired lease must read as free, not as held"
+        );
+    }
+
+    #[test]
+    fn test_release_frees_the_slot_for_another_dispatcher() {
+        let mut db = db();
+        db.try_acquire_dispatch_slot("mika", "implement", "task-a", None, 120)
+            .unwrap();
+        assert!(
+            db.release_dispatch_slot("mika", "implement", "task-a")
+                .unwrap()
+        );
+        let b = db
+            .try_acquire_dispatch_slot("mika", "implement", "task-b", None, 120)
+            .unwrap();
+        assert_eq!(b, SlotClaim::Acquired, "released slot must be claimable");
+    }
+
+    /// A release from a task that no longer owns the lease must not free it.
+    /// Otherwise a dispatcher whose lease expired and was re-taken could, on a
+    /// late cleanup, hand the slot away from its current holder.
+    #[test]
+    fn test_release_by_non_holder_is_a_noop() {
+        let mut db = db();
+        db.try_acquire_dispatch_slot("mika", "implement", "task-a", None, 120)
+            .unwrap();
+        assert!(
+            !db.release_dispatch_slot("mika", "implement", "task-b")
+                .unwrap(),
+            "a non-holder must not be able to release the lease"
+        );
+        let holder = db.dispatch_slot_lease_holder("mika", "implement").unwrap();
+        assert_eq!(
+            holder.map(|h| h.0),
+            Some("task-a".to_string()),
+            "the original holder must still hold it"
+        );
+    }
+
+    /// The blocking-dispatch report must carry the source so a rejection can
+    /// name who holds the slot (AC2).
+    #[test]
+    fn test_blocking_dispatch_carries_dispatcher_source() {
+        let db = db();
+        let parent = db
+            .create_task(&new_task("mika", "blocking parent", "manual", "none"))
+            .unwrap();
+        db.set_task_dispatcher_source(&parent, "mika", "mika_dev")
+            .unwrap();
+        let mut cb = new_task(
+            "mika",
+            "long_running:run_claude_pilot",
+            "callback",
+            "resume_agent",
+        );
+        cb.parent_task_id = Some(parent.clone());
+        cb.dispatch_class = Some("implement".to_string());
+        db.create_task(&cb).unwrap();
+
+        let blocking = db
+            .has_active_callback_tasks_excluding("other-task", "mika", "implement")
+            .unwrap()
+            .expect("the active callback must be seen as blocking");
+        assert_eq!(blocking.parent_task_id, parent);
+        assert_eq!(
+            blocking.dispatcher_source.as_deref(),
+            Some("mika_dev"),
+            "the blocker's dispatcher must be reported"
+        );
+    }
+
+    /// A pre-v51 blocker (NULL source) must report `None`, NOT a defaulted
+    /// "mika_dev". The read site applies the COALESCE; manufacturing the
+    /// default this deep would turn "we don't know" into a positive claim.
+    #[test]
+    fn test_blocking_dispatch_null_source_is_reported_as_unknown() {
+        let db = db();
+        let parent = db
+            .create_task(&new_task("mika", "legacy parent", "manual", "none"))
+            .unwrap();
+        let mut cb = new_task(
+            "mika",
+            "long_running:run_claude_pilot",
+            "callback",
+            "resume_agent",
+        );
+        cb.parent_task_id = Some(parent.clone());
+        cb.dispatch_class = Some("implement".to_string());
+        db.create_task(&cb).unwrap();
+
+        let blocking = db
+            .has_active_callback_tasks_excluding("other-task", "mika", "implement")
+            .unwrap()
+            .expect("blocking callback must be seen");
+        assert_eq!(
+            blocking.dispatcher_source, None,
+            "a pre-v51 row must stay unknown rather than be defaulted here"
+        );
+    }
+
+    #[test]
+    fn test_lease_ttl_env_override_rejects_non_positive() {
+        // A zero or negative TTL would make every lease born expired, silently
+        // disabling the guard — the override must fall back instead.
+        unsafe { std::env::set_var("MIKA_DISPATCH_SLOT_LEASE_TTL_SECS", "0") };
+        assert_eq!(dispatch_slot_lease_ttl_secs(), DISPATCH_SLOT_LEASE_TTL_SECS);
+        unsafe { std::env::set_var("MIKA_DISPATCH_SLOT_LEASE_TTL_SECS", "-5") };
+        assert_eq!(dispatch_slot_lease_ttl_secs(), DISPATCH_SLOT_LEASE_TTL_SECS);
+        unsafe { std::env::set_var("MIKA_DISPATCH_SLOT_LEASE_TTL_SECS", "45") };
+        assert_eq!(dispatch_slot_lease_ttl_secs(), 45);
+        unsafe { std::env::remove_var("MIKA_DISPATCH_SLOT_LEASE_TTL_SECS") };
     }
 
     // ── mika#2020: re-drive budget on auto_pull_stats ──

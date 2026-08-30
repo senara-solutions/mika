@@ -1193,6 +1193,19 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Record which dispatcher initiated a task (mika#1948).
+    pub async fn set_task_dispatcher_source(
+        &self,
+        task_id: &str,
+        dispatcher_source: &str,
+    ) -> Result<bool> {
+        let t = task_id.to_owned();
+        let a = self.agent_id.clone();
+        let d = dispatcher_source.to_owned();
+        self.with_db(move |db| db.set_task_dispatcher_source(&t, &a, &d))
+            .await
+    }
+
     /// Whether an operator-sourced task is waiting to run in this class
     /// (mika#1948 AC3).
     pub async fn has_pending_operator_task_for_class(&self, dispatch_class: &str) -> Result<bool> {
