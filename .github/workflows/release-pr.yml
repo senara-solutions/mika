@@ -1,53 +1,33 @@
-# DÉSACTIVÉ le 2026-08-29 — ce workflow ne se déclenche plus sur `push: main`.
+# Release PR automation (release-please v4, manifest mode).
 #
-# POURQUOI. Il échouait à CHAQUE merge : 300 runs relevés entre le 2026-06-05 et
-# le 2026-08-29, 300 en échec, aucun succès. `main` était donc rouge en
-# permanence, et un `main` durablement rouge apprend à ignorer le rouge — le
-# signal était devenu un coût, pas une alerte.
+# RALLUMÉ le 2026-08-30 par mika#2048 (reprise de mika#2047). Il était éteint
+# parce que la stratégie `rust` échoue sur notre workspace virtuel : elle tente
+# de lire le `Cargo.toml` racine comme un manifeste de paquet (`✖ is not a
+# package manifest`) et de développer le glob `members = ["crates/*"]`, ce que
+# notre racine sans section [package] ne permet pas.
 #
-# Aucun consommateur connu de ce canal de publication : dernière étiquette
-# `v0.12.2` du 2026-05-09, et le déploiement se fait depuis `main` via
-# `make deploy`. Les assets gardent des téléchargements résiduels (38 sur
-# v0.12.2, 132 toutes releases confondues) et `install.sh` tire bien depuis
-# GitHub Releases — mais ce workflow ne produit plus rien depuis le 2026-05-09,
-# donc l'éteindre ne retire à personne ce qu'il n'obtenait déjà plus.
+# LE FIX (release-please-config.json) : `release-type: "simple"` sur le paquet
+# `"."` au lieu de `"rust"`. La stratégie `simple` ne parse aucun manifeste de
+# paquet ; la version du workspace est propagée par l'`extra-files` toml générique
+# (`jsonpath: $.workspace.package.version`), qui navigue l'arbre TOML sans exiger
+# de section [package]. `simple` gère aussi un fichier `version.txt` à la racine
+# (ancre de version de l'action). Le tag et le nom de branche restent inchangés
+# (component "mika", include-component-in-tag: false) — le job `update-lockfile`
+# ci-dessous garde donc sa `ref` valide.
 #
-# LA CAUSE, EXACTEMENT. Ce n'est PAS un défaut de configuration manifest.
-# release-please v4 retombe sur ses fichiers par défaut quand `config-file` et
-# `manifest-file` sont vides, et le log du run 33245981885 le montre :
+# Cargo.lock : la stratégie `simple` ne touche pas au lockfile ; le job
+# `update-lockfile` le régénère via `cargo update --workspace` après coup.
 #
-#     ❯ Fetching release-please-config.json from branch main
-#     ❯ Fetching .release-please-manifest.json from branch main
-#     ✔ Building candidate release pull request for path: .
-#     ❯ type: rust
-#
-# La config était donc bien lue. Ce n'est pas non plus les commits non
-# parsables : 3 sont sautés et le run continue (`Considering: 1190 commits`).
-#
-# La cause fatale est la stratégie `rust` face à notre workspace virtuel :
-#
-#     ⚠ member crates/* declared but did not find Cargo.toml
-#       → le glob de `members` n'est pas développé, aucun membre résolu
-#     ✖ is not a package manifest (might be a cargo workspace)
-#       → le Cargo.toml racine n'a pas de section [package], exception fatale
-#
-# CE QUI RESTE. `workflow_dispatch` est conservé DÉLIBÉRÉMENT, comme point
-# d'entrée manuel pour la reprise. ATTENTION, ce n'est PAS un bac à sable :
-# l'action est invoquée sans `target-branch` (voir le job ci-dessous), donc elle
-# cible la branche par défaut quel que soit le `ref` choisi au dispatch — un
-# dispatch créerait une vraie PR de release sur `main`. mika#2048 doit ajouter
-# `target-branch` AVANT de s'en servir pour vérifier quoi que ce soit.
-#
-# Le job `update-lockfile` est laissé intact : il ne peut pas devenir orphelin
-# (`needs:` le marque *skipped*, jamais *failed*) et il encode du contexte dont
-# la reprise a besoin.
-#
-# POUR RALLUMER. mika#2048 énonce la condition (quelqu'un consomme-t-il les
-# releases ?) et les étapes. Diagnostic complet : mika#2047.
+# Validé par un dry-run local (`release-please release-pr --dry-run`) contre
+# `main` : plus d'exception fatale, PR de release candidate construite. Voir
+# mika#2048.
 
-name: Release (disabled — see mika#2048)
+name: Release
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
