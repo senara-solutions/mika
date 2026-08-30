@@ -116,6 +116,10 @@
   color: "5319e7"
   description: "Routage : ce ticket est pris par SSC (senara-solutions-claude). Un seul dispatcher par ticket."
 
+- name: "dispatch:mpc"
+  color: "0e8a16"
+  description: "Routage : ce ticket est pris par MPC (mika-platform-claude). Un seul dispatcher par ticket."
+
 # ── Sprint Hooks ───────────────────────────────────────��─────────────────────
 - name: needs-build
   color: "d97706"
