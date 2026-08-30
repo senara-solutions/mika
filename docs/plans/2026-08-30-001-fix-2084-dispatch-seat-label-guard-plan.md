@@ -2,6 +2,7 @@
 title: "fix(dispatch): lire l'étiquette de siège `dispatch:*` dans le chemin de dispatch"
 type: fix
 status: active
+review: three-reviewer pass 2026-08-30 — seven findings applied
 date: 2026-08-30
 origin: senara-solutions/mika#2084
 artifact_contract: ce-unified-plan/v1
@@ -355,3 +356,62 @@ passage. Un test qui ne mesure que le refus est vert même si la garde refuse to
 - [ ] **AC5** — Le refus laisse une trace exploitable (événement ou ligne de journal nommant
       l'issue et le siège), pour qu'une collision évitée soit comptable au lieu d'être
       invisible.
+
+## Addendum — ce que la revue a changé (2026-08-30)
+
+Trois relecteurs. AC3 déclaré propre sur les quatre axes cherchés, parse partagé
+strictement neutre, audit correct, pré-digest sûr sur les deux surfaces de garde.
+Sept correctifs appliqués, dont trois qui invalident une décision du plan ci-dessus.
+
+**Le plan avait tort sur le sujet du siège (U2).** Il désignait `reference_url`
+comme source autoritaire. La revue a montré que `dispatch-lib.sh` ne lit jamais
+`reference_url` : il lit `.prompt` (`dispatch-lib.sh:769`), en dérive le dépôt et
+le numéro (`:1076-1080`), la branche (`:1131`) et le worktree (`:1176`). C'est
+donc le prompt qui détermine où un second écrivain atterrirait. Une tâche
+référençant l'issue A dispatchée avec `{"prompt": "mika#B"}` passait la garde.
+**Les deux sujets sont désormais interrogés, et un refus de l'un refuse.**
+
+**`gh issue view <n>` résout les numéros de PR.** Mesuré : `gh issue view 2082`
+rend `{"labels":[]}` avec code 0 alors que 2082 est une PR. La garde ne
+tombait donc pas en fail-open bruyant — elle rendait un verdict `NoSeatLabel`
+confiant sur le mauvais objet, précisément sur la paire issue/PR de l'incident.
+Passage au client REST borné (`github_graphql`, timeout 10 s), qui expose le
+discriminant `pull_request` et supprime au passage un sous-processus `gh` sans
+timeout du chemin chaud du dispatch.
+
+**Le plan sous-estimait le nombre de sites qui posent `ready`.** U4 en comptait
+trois, tous dans `auto_pull.rs`, et l'hypothèse « ils passent tous par
+`is_feeder_excluded` » s'est vérifiée. Mais un **quatrième** existe hors de ce
+fichier : `server/milestone_context_handler.rs:329`, la cascade de phase de
+milestone, qui étiquette `ready` tous les tickets de la phase suivante sans lire
+un seul label. Un `ready` posé là sur un ticket d'un autre siège serait refusé en
+aval et **resterait posé pour toujours** — rien ne nettoie un `ready` non
+consommé. Site fermé.
+
+Autres correctifs : la garde remonte au-dessus du garde de dispatch global (une
+refus après la mise en file brûlait un wrapper à chaque rejeu de la machinerie
+de re-arm mika#2045) ; le motif de skip distinguait mal un siège étranger d'un
+siège irrésolu, comptant un typo `dispatch:zorglub` comme une collision évitée —
+et un test gravait l'erreur ; les messages opérateur affirmaient « un autre siège
+possède ce ticket » là où aucun siège n'était identifiable ; balise
+`</ready_label_handler>` non fermée ; liste des rejets terminaux de
+`validate_dispatch_readiness` passée de huit à neuf.
+
+**Vérification anti-vacuité, mesurée sur le code final** : garde neutralisée →
+9 tests rougissent ; garde élargie à un refus universel → 32 rougissent.
+
+### Reste ouvert, hors périmètre de ce ticket
+
+- `.github/labels.yml` ne déclare aucune étiquette `dispatch:*` et
+  `.github/workflows/labels.yml:21` lance `label-sync` avec
+  `delete-other-labels: true`. À la prochaine synchro, les étiquettes de siège
+  disparaissent de toutes les issues et cette garde se désarme **en silence**.
+  Ticket de suivi ouvert ; c'est le risque dominant restant.
+- `dispatch:loop` n'existe sur aucun dépôt, donc la revendication explicite d'un
+  ticket par la boucle est aujourd'hui impossible. Même ticket de suivi.
+- `select_stuck_ready_candidates` (`auto_pull.rs:502-527`) ne porte aucun filtre
+  propre ; il n'est protégé que parce que `ages_by_issue` n'est peuplé que pour
+  les survivants. Correct aujourd'hui, fragile demain.
+- Le chemin LLM `gh issue edit --add-label ready`
+  (`skills/bundled/self-dev-callback/system_prompt.md:25`) n'est pas contrôlable
+  structurellement ici ; il est rattrapé en aval par les gardes de dispatch.
