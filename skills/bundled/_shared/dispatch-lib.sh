@@ -727,6 +727,14 @@ ${_TRACE_TAIL}"
 PR: ${_PR_URL}"
         fi
     fi
+    # mika#1996: this trap delivers its own callback instead of calling
+    # _deliver_callback, so the gate has to be applied here too — otherwise the
+    # crash path is a hole in a control that only counts if it has none. It runs
+    # AFTER the PR discovery above (whose `PR:` line is production evidence) and
+    # BEFORE the cancel prefix below, which must stay the first line the mika-dev
+    # parser sees. Same rule as in _deliver_callback: delivery outranks measurement.
+    _gate_non_empty_cycle || echo "cycle_output.gate_error: the non-empty-output gate failed (rc=$?) — delivering the crash callback unchanged" >&2
+
     # --- Cancel discriminator envelope prefix (mika#749) ---
     # Read the reason file written by cancel_task (CANCELLED_BY_OPERATOR) or
     # the TERM trap (CANCELLED_BY_SIGNAL). Prefix the RESULT so the consumer
@@ -1441,6 +1449,10 @@ _run_claude_pilot() {
     # tick then ingests finished files into the pilot_transcripts table. Nothing
     # to do here except NOT clobber the inherited env before the run below.
     set +e
+    # mika#1996: from here on there is a pilot cycle to judge. Sole writer —
+    # the non-empty-output gate reads this to tell "the cycle produced nothing"
+    # apart from "no cycle ran", and a second writer would blur the two.
+    PILOT_RAN=1
     # CWD_ARGS is intentionally word-split (multiple flags)
     # shellcheck disable=SC2086
     _run_pilot_sandboxed claude-pilot --verbose --log-dir --task-id "$LOG_ID" --command "$ENTRY_COMMAND" $TRACE_FLAG $CWD_ARGS -- "$PROMPT" >"$STDOUT_FILE" 2>"$STDERR_FILE"
@@ -1571,6 +1583,238 @@ _pilot_left_no_work() {
     [ "${PRE_RUN_HEAD:-}" = "${POST_RUN_HEAD:-}" ] || return 1
     [ -z "$(git -C "$WORKTREE_DIR" status --porcelain 2>/dev/null)" ] || return 1
     return 0
+}
+
+# Did this cycle produce anything at all? (mika#1996)
+#
+# The measurement `_pilot_left_no_work` performs is the right one, but it is
+# reachable from a single branch — `STATUS = terminated`. Every other exit path
+# (status: success with zero tool_use, exit 0 with unstructured output, non-zero
+# exit, handler crash) delivers a verdict without anyone having looked at what
+# the cycle produced. Measured on 2026-08-29: of the 120 most recent pilot
+# sessions, 102 made ZERO tool calls and none exceeded 2; the last session above
+# 10 tool calls was 2026-07-29. Every one of them reported success.
+#
+# NON-EMPTY is defined as: the cycle left at least one trace of production
+# observable OUTSIDE its own process. Four proofs, first hit wins:
+#
+#   P1  a PR belongs to it                      (PR_URL)
+#   P2  the branch advanced WITH content        (PRE..POST, non-empty diff)
+#   P3  the worktree carries written files      (git status --porcelain)
+#   P4  a MOTIVATED terminal disposition        (conclusive Outcome: AND >=1 tool call)
+#
+# What this explicitly does NOT count, because each one is what the loop used to
+# accept instead of looking:
+#   - process signals: exit code 0, `status: success`, callback delivered, a
+#     task_id coming back;
+#   - the model's output volume: turns, text length, cost, duration;
+#   - files outside the repository (logs, /tmp, trace artifacts) — writing to
+#     your own log is not producing;
+#   - commits with no content: an --allow-empty marker (the wip(mika#1383)
+#     rescue marker is one by construction) moves HEAD without producing
+#     anything, so P2 requires a non-empty diff, not a moved HEAD;
+#   - a disposition on its own: P4 is a conjunction, never an alternative. An
+#     `Outcome:` line with zero tool calls is text about work, not work.
+#   - reading: a session that made 40 read-only tool calls and left no P1-P3 and
+#     no conclusive disposition is empty.
+#
+# Note the asymmetry, which is deliberate: the tool-call count is NOT the
+# non-emptiness criterion. It qualifies P4 and enriches the message. It can
+# neither rescue a cycle that produced nothing nor condemn one that produced
+# something — it is read from a file that can be missing, and a criterion that
+# depends on a missing file manufactures false reds.
+#
+# Three verdicts, not two. `undetermined` exists because a detector forced to
+# choose between green and red when it has no ground to measure will always
+# choose wrong: fail-closed manufactures false reds (and a false red trains
+# people to ignore red), fail-open reproduces the original silence.
+#
+# Pure measurement: this function NEVER touches RESULT. Sets
+# CYCLE_OUTPUT_VERDICT (produced|empty|undetermined), CYCLE_OUTPUT_EVIDENCE
+# (what was measured, never what was assumed) and CYCLE_TOOL_CALLS.
+_measure_cycle_output() {
+    CYCLE_OUTPUT_VERDICT=""
+    CYCLE_OUTPUT_EVIDENCE=""
+    CYCLE_TOOL_CALLS=""
+
+    local _wt_readable=0
+    if [ -n "${WORKTREE_DIR:-}" ] && [ -d "${WORKTREE_DIR:-}" ] \
+       && git -C "$WORKTREE_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+        _wt_readable=1
+    fi
+
+    # Tool-call count. `[tool:request]` is the first statement of claude-pilot's
+    # canUseTool handler (claude-pilot/src/claude_pilot/permissions.py), so zero
+    # means the SDK never invoked the callback — the model emitted no tool_use
+    # at all. KTD3 of mika#1772 applies: stderr only enriches. An absent or
+    # unreadable copy leaves the count empty and never decides a verdict.
+    local _stderr_path="${PILOT_LOG_DIR:-/var/log/claude-pilot}/${LOG_ID:-}.stderr"
+    if [ -n "${LOG_ID:-}" ] && [ -r "$_stderr_path" ]; then
+        CYCLE_TOOL_CALLS=$(grep -c '\[tool:request\]' "$_stderr_path" 2>/dev/null || true)
+        case "${CYCLE_TOOL_CALLS}" in
+            ''|*[!0-9]*) CYCLE_TOOL_CALLS="" ;;
+        esac
+    fi
+
+    # --- P1: a PR belongs to this cycle. Measurable without a worktree.
+    # The RESULT fallback matters on the crash path: the EXIT trap discovers the
+    # PR with `gh pr list` and writes it as a `PR:` line without ever setting
+    # PR_URL, so reading the variable alone would call a cycle with an open PR
+    # empty.
+    local _pr_line
+    _pr_line=$(grep -m1 -E '^PR: http' <<<"${RESULT:-}" || true)
+    if [ -n "${PR_URL:-}" ] || [ -n "$_pr_line" ]; then
+        CYCLE_OUTPUT_VERDICT="produced"
+        CYCLE_OUTPUT_EVIDENCE="PR ${PR_URL:-${_pr_line#PR: }}"
+        return 0
+    fi
+
+    if [ "$_wt_readable" = "1" ]; then
+        # --- P2: the branch advanced AND the advance carries content.
+        # Both endpoints are verified to exist first: a stale SHA (worktree
+        # recreated between runs) would make `git diff` exit 128, which reads
+        # identically to "there is a diff" and would fabricate a produced verdict.
+        if [ -n "${PRE_RUN_HEAD:-}" ] && [ -n "${POST_RUN_HEAD:-}" ] \
+           && [ "${PRE_RUN_HEAD}" != "${POST_RUN_HEAD}" ] \
+           && git -C "$WORKTREE_DIR" cat-file -e "${PRE_RUN_HEAD}^{commit}" 2>/dev/null \
+           && git -C "$WORKTREE_DIR" cat-file -e "${POST_RUN_HEAD}^{commit}" 2>/dev/null \
+           && ! git -C "$WORKTREE_DIR" diff --quiet "$PRE_RUN_HEAD" "$POST_RUN_HEAD" 2>/dev/null; then
+            local _commit_count
+            _commit_count=$(git -C "$WORKTREE_DIR" rev-list --count "${PRE_RUN_HEAD}..${POST_RUN_HEAD}" 2>/dev/null || true)
+            CYCLE_OUTPUT_VERDICT="produced"
+            CYCLE_OUTPUT_EVIDENCE="${_commit_count:-?} commit(s) carrying a non-empty diff (${PRE_RUN_HEAD}..${POST_RUN_HEAD})"
+            return 0
+        fi
+
+        # --- P3: the worktree carries written files.
+        if [ -n "$(git -C "$WORKTREE_DIR" status --porcelain 2>/dev/null)" ]; then
+            CYCLE_OUTPUT_VERDICT="produced"
+            CYCLE_OUTPUT_EVIDENCE="worktree carries uncommitted file changes"
+            return 0
+        fi
+    fi
+
+    # --- P4: a motivated terminal disposition. The conjunction is the point:
+    # this is the clause that keeps a legitimately short cycle — a grooming that
+    # escalates with a reason, a run that finds the work already done and says
+    # so — out of the failure column, WITHOUT letting a silent session buy its
+    # way out with a line of text.
+    local _disposition
+    _disposition=$(grep -m1 -E '^Outcome: (PR_OPENED|PLAN_COMMITTED|PLAN_GROOMED|ESCALATE)' <<<"${RESULT:-}" || true)
+    if [ -n "$_disposition" ] && [ -n "$CYCLE_TOOL_CALLS" ] && [ "$CYCLE_TOOL_CALLS" -ge 1 ]; then
+        CYCLE_OUTPUT_VERDICT="produced"
+        CYCLE_OUTPUT_EVIDENCE="terminal disposition '${_disposition#Outcome: }' after ${CYCLE_TOOL_CALLS} tool call(s)"
+        return 0
+    fi
+
+    # --- No ground to measure. Not a content verdict.
+    if [ "$_wt_readable" != "1" ]; then
+        CYCLE_OUTPUT_VERDICT="undetermined"
+        CYCLE_OUTPUT_EVIDENCE="no readable git worktree at '${WORKTREE_DIR:-<unset>}'"
+        return 0
+    fi
+
+    # --- Empty. Say what was measured, never more than was measured.
+    local _head_fact
+    if [ -z "${PRE_RUN_HEAD:-}" ] || [ -z "${POST_RUN_HEAD:-}" ]; then
+        _head_fact="no HEAD range recorded"
+    elif [ "${PRE_RUN_HEAD}" = "${POST_RUN_HEAD}" ]; then
+        _head_fact="HEAD did not move"
+    else
+        _head_fact="HEAD moved but the commit range has an empty diff"
+    fi
+    CYCLE_OUTPUT_VERDICT="empty"
+    CYCLE_OUTPUT_EVIDENCE="${_head_fact}, worktree clean, no PR, no motivated terminal disposition; tool calls: ${CYCLE_TOOL_CALLS:-unmeasured}"
+    return 0
+}
+
+# The gate. A cycle that produced nothing may no longer report success.
+#
+# mika#1996, born from mika#1910. Bearing Prime 2026-08-26:
+# CONTROL-MUST-BE-UNAVOIDABLE — a guarantee exists only if EVERY path producing
+# the guarded effect crosses the control point. The guarded effect here is "a
+# cycle verdict reaches mika-dev", and it has two producers: _deliver_callback
+# and the EXIT trap, which sends its own callback rather than calling it. Both
+# call this function; test-dispatch-lib.sh holds a static guard that fails if a
+# third delivery site ever appears without it.
+#
+# Anti-vacuity runs BOTH ways, and the positive direction is the load-bearing
+# one: on `produced` this function leaves RESULT byte-for-byte identical. A gate
+# that only ever fails would be satisfied by "always fail", which is worth
+# exactly as much as the silent success it replaces.
+_gate_non_empty_cycle() {
+    # No pilot session ran, so there is no cycle to judge. This covers the
+    # dispatcher's own deliberate exits — the mika#988 closed-issue auto-skip,
+    # the mika#2012 already-groomed refusal, a dry run, a crash before launch.
+    # Their callbacks are structured decisions (the auto-skip ones are a JSON
+    # document mika-dev and the audit dashboard parse), not prose to annotate,
+    # and calling a deliberate decision "empty" would be exactly the false red
+    # this gate exists to avoid — a false red trains people to ignore red.
+    if [ "${PILOT_RAN:-0}" != "1" ]; then
+        echo "cycle_output.not_applicable: no pilot session ran — nothing to judge (task=${TASK_ID:-unknown} skill=${SKILL:-unknown})" >&2
+        return 0
+    fi
+
+    _measure_cycle_output
+
+    echo "cycle_output.${CYCLE_OUTPUT_VERDICT}: ${CYCLE_OUTPUT_EVIDENCE} (task=${TASK_ID:-unknown} skill=${SKILL:-unknown} session=${SESSION_ID:-unknown})" >&2
+
+    case "$CYCLE_OUTPUT_VERDICT" in
+        produced)
+            # RESULT untouched. This is an invariant, not an optimisation.
+            return 0
+            ;;
+        undetermined)
+            if ! grep -qF -- 'Measurement: cycle output undetermined' <<<"${RESULT:-}"; then
+                RESULT="${RESULT}
+
+Measurement: cycle output undetermined — ${CYCLE_OUTPUT_EVIDENCE}. This is NOT a content verdict: the non-empty-output gate (mika#1996) had no ground to measure. The outcome above is the cycle's own."
+            fi
+            return 0
+            ;;
+    esac
+
+    # --- empty ---
+
+    # Idempotent: _deliver_callback and the EXIT trap can both run in one
+    # process. One banner, not two.
+    if grep -qF -- 'PIPELINE FAILURE: empty_completion' <<<"${RESULT:-}"; then
+        return 0
+    fi
+
+    # A cycle already classified as failed or cancelled keeps its own diagnosis.
+    # Stacking a second one is the surest way to make red unreadable, and the
+    # first diagnosis is always the more specific: a terminated session, a push
+    # violation (mika#1318), a handler crash, an operator cancel (mika#749) each
+    # name a cause this gate could only describe as an absence. `STATUS=CANCELLED*`
+    # additionally has to lead the callback for mika-dev's parser, which a
+    # prefixed banner would break.
+    if grep -qE '(PIPELINE FAILURE:|STRUCTURAL VIOLATION:|HANDLER CRASH|^STATUS=CANCELLED|^Outcome: PIPELINE_INCOMPLETE)' <<<"${RESULT:-}"; then
+        echo "cycle_output.empty.banner_skipped: callback already carries a terminal classification — not stacking a second diagnosis" >&2
+        return 0
+    fi
+
+    RESULT="PIPELINE FAILURE: empty_completion — this cycle produced nothing, and a cycle that produces nothing does not succeed (mika#1996).
+
+Measured: ${CYCLE_OUTPUT_EVIDENCE}
+Applied definition: a cycle is non-empty when it left a trace of production observable outside its own process — a PR, commits carrying a non-empty diff, written files in the worktree, or a conclusive disposition backed by at least one tool call. Exit code 0, \`status: success\`, a delivered callback and a returned task_id are NOT production signals; neither are turns, cost or duration.
+What this is not: this is a session-level verdict, not a review of content quality. The pilot did not fail at the work — it did not do any.
+
+${RESULT}"
+
+    local _outcome_line="Outcome: PIPELINE_INCOMPLETE — empty_completion: ${CYCLE_OUTPUT_EVIDENCE}"
+    if grep -qE '^Outcome: ' <<<"$RESULT"; then
+        # First `Outcome:`-anchored line only. awk rather than sed: the evidence
+        # string is data and must not be re-read as a replacement pattern.
+        RESULT=$(awk -v repl="$_outcome_line" \
+            'BEGIN { done = 0 }
+             /^Outcome: / && !done { print repl; done = 1; next }
+             { print }' <<<"$RESULT")
+    else
+        RESULT="${RESULT}
+
+${_outcome_line}"
+    fi
 }
 
 # Compose the callback for a pilot session claude-pilot terminated.
@@ -3723,6 +3967,12 @@ _derive_recovery_pr_title() {
 }
 
 _deliver_callback() {
+    # mika#1996: every delivery path crosses the non-empty-output gate. First
+    # executable statement, so no future early-return above it can skip it.
+    # Delivery outranks measurement: a gate that failed must never be the reason
+    # a callback does not arrive. Its own failure is announced rather than
+    # swallowed — a silent gate is the defect this ticket exists to remove.
+    _gate_non_empty_cycle || echo "cycle_output.gate_error: the non-empty-output gate failed (rc=$?) — delivering the callback unchanged" >&2
     set +e
     if [ -n "$AGENT" ]; then
         mika ask --task-id "$TASK_ID" --task-complete --agent "$AGENT" -- "$RESULT"
