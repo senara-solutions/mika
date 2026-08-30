@@ -381,8 +381,9 @@ pub fn spawn_manager_cycle_task(
                     );
 
                     // mika#2013 volet B — "fail and continue in silence" is the
-                    // disease this ticket names (RT#009). A sustained 401 run
-                    // now escalates instead of scrolling past as another WARN.
+                    // disease this ticket names (RT#009). A sustained auth-failure
+                    // run — 401 or, since mika#2063, 403 — now escalates instead of
+                    // scrolling past as another WARN.
                     if let Some(alarm) = auth_tracker.on_failure(auth_class, Instant::now()) {
                         emit_auth_alarm(&cfg, &alarm, &alarm_sink).await;
                     }
@@ -719,8 +720,9 @@ async fn refresh_cycle_token(cfg: &mut ManagerConfig, resolver: &dyn TokenResolv
 
 // ---- mika#2013 volet B — persistent-auth-failure alarm --------------------
 
-/// How long a continuous run of `AuthClass::Unauthorized` cycles must persist
-/// before the loop stops merely warning and raises an ERROR + escalation.
+/// How long a continuous run of auth-failure cycles (`Unauthorized` or, since
+/// mika#2063, `Forbidden` — see `is_auth_failure`) must persist before the loop
+/// stops merely warning and raises an ERROR + escalation.
 ///
 /// **Why a duration and not a cycle count.** `poll_interval` is operator-
 /// configurable (`MIKA_MANAGER_POLL_INTERVAL_SECS`), so "N failed cycles" has
@@ -742,10 +744,46 @@ const AUTH_ALARM_REEMIT_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// A fired alarm — the payload of "auth has been broken for too long".
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AuthAlarm {
-    /// Wall-clock span since the first cycle of the current unbroken 401 run.
+    /// The auth-failure class that carried this run (mika#2063). Either
+    /// `Unauthorized` (401) or `Forbidden` (403) — the two classes
+    /// `is_auth_failure` admits. Carried onto the wire so the operator sees
+    /// *which* door is shut: a 401 says "token missing/invalid/expired", a 403
+    /// says "authenticated but access revoked / scope lost". The value is the
+    /// class of the cycle that tripped the threshold; a run that flips between
+    /// the two reports whichever it ended on.
+    auth_class: AuthClass,
+    /// Wall-clock span since the first cycle of the current unbroken
+    /// auth-failure run.
     elapsed: Duration,
-    /// Number of consecutive `Unauthorized` cycles in that run.
+    /// Number of consecutive auth-failure cycles in that run.
     consecutive_cycles: u32,
+}
+
+/// The `AuthClass` values that count as "authentication did not pass" and so
+/// advance the persistent-failure window.
+///
+/// **mika#2063 — 403 joins 401 here.** mika#2013 scoped the alarm to
+/// `Unauthorized` alone and deliberately left `Forbidden` out (its AC3
+/// anti-vacuity test asserted 403 fires nothing), routing the gap to this
+/// ticket rather than smuggling the widening into a ratified acceptance
+/// criterion. A revoked GitHub App installation, or a token that lost a scope,
+/// 403s indefinitely and leaves the manager exactly as blind as a sustained
+/// 401 — the disease RT#009 names (the failure does not cry) on a second door.
+/// So both classes now share one window: the operator-observable symptom is
+/// identical, and one shared window matches the operator's mental model
+/// ("auth is not passing") better than two parallel 30-minute timers would.
+///
+/// **`Network` and `Other` stay out — by scope, not by omission** (ticket
+/// "Hors périmètre"). A transport hiccup is not an auth failure; folding it in
+/// would make the auth signal unreadable. `MilestoneNotFound` never reaches
+/// this path either: `classify_cycle_error` maps a mid-cycle 404 to `Other`,
+/// and only the boot-time milestone probe raises `MilestoneNotFound`. So the
+/// widening is bounded to exactly the two genuine "auth doesn't pass" classes —
+/// it does not enlarge the surface the way an unbounded "any failure" tracker
+/// (option 3 taken literally) would. The `auth_alarm_never_fires_for_non_auth_classes`
+/// test pins that boundary.
+fn is_auth_failure(class: AuthClass) -> bool {
+    matches!(class, AuthClass::Unauthorized | AuthClass::Forbidden)
 }
 
 /// Tracks an unbroken run of authentication failures across cycles.
@@ -755,8 +793,8 @@ struct AuthAlarm {
 /// without sleeping through them.
 #[derive(Debug, Default)]
 struct AuthFailureTracker {
-    first_unauthorized_at: Option<Instant>,
-    consecutive_unauthorized: u32,
+    first_failure_at: Option<Instant>,
+    consecutive_failures: u32,
     last_alarm_at: Option<Instant>,
 }
 
@@ -770,25 +808,24 @@ impl AuthFailureTracker {
     /// A cycle failed. Returns `Some(alarm)` only on a cycle where the alarm
     /// must actually be emitted.
     ///
-    /// **Non-401 failures neither advance nor clear the window.** A network
+    /// **Non-auth failures neither advance nor clear the window.** A network
     /// blip is not evidence that auth recovered — resetting on it would let a
     /// real outage evade the threshold indefinitely by interleaving transient
     /// failures. Nor is it evidence of auth failure, so it must not count
     /// toward the run either. Only a successful cycle proves recovery.
     ///
-    /// **`Forbidden` (403) is deliberately excluded, and that is a known gap.**
-    /// A revoked App installation or a token that lost a scope 403s forever and
-    /// leaves the manager just as blind as a 401 does, with no alarm. The plan
-    /// for mika#2013 scoped volet B to `Unauthorized` and the architect signed
-    /// that scope; AC3's anti-vacuity test asserts 403 does NOT fire, so
-    /// widening it here would silently overturn a ratified acceptance
-    /// criterion. Tracked as mika#2063 rather than smuggled in.
+    /// **Which classes count is `is_auth_failure`** — `Unauthorized` (401) and
+    /// `Forbidden` (403) since mika#2063; see that helper for why the sustained
+    /// 403 belongs here and why `Network`/`Other` stay out. A run that flips
+    /// between 401 and 403 without a successful cycle in between is one
+    /// continuous window (the manager was blind throughout); the emitted alarm
+    /// carries the class of the cycle that tripped the threshold.
     fn on_failure(&mut self, class: AuthClass, now: Instant) -> Option<AuthAlarm> {
-        if class != AuthClass::Unauthorized {
+        if !is_auth_failure(class) {
             return None;
         }
-        let first = *self.first_unauthorized_at.get_or_insert(now);
-        self.consecutive_unauthorized = self.consecutive_unauthorized.saturating_add(1);
+        let first = *self.first_failure_at.get_or_insert(now);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
 
         let elapsed = now.saturating_duration_since(first);
         if elapsed < AUTH_PERSISTENT_FAILURE_THRESHOLD {
@@ -801,8 +838,9 @@ impl AuthFailureTracker {
         }
         self.last_alarm_at = Some(now);
         Some(AuthAlarm {
+            auth_class: class,
             elapsed,
-            consecutive_cycles: self.consecutive_unauthorized,
+            consecutive_cycles: self.consecutive_failures,
         })
     }
 }
@@ -896,7 +934,7 @@ async fn emit_auth_alarm(cfg: &ManagerConfig, alarm: &AuthAlarm, sink: &dyn Auth
         target: "mika::milestone_manager",
         event = "manager_auth_persistent_failure",
         milestone = %cfg.target.as_display(),
-        auth_class = AuthClass::Unauthorized.as_str(),
+        auth_class = alarm.auth_class.as_str(),
         elapsed_secs = alarm.elapsed.as_secs(),
         consecutive_cycles = alarm.consecutive_cycles,
         escalation_url_set = cfg.escalation_url.is_some(),
@@ -911,7 +949,7 @@ async fn emit_auth_alarm(cfg: &ManagerConfig, alarm: &AuthAlarm, sink: &dyn Auth
     let body = AuthAlarmBody {
         event: "manager_auth_persistent_failure",
         milestone_ref: cfg.target.clone(),
-        auth_class: AuthClass::Unauthorized.as_str(),
+        auth_class: alarm.auth_class.as_str(),
         elapsed_secs: alarm.elapsed.as_secs(),
         consecutive_cycles: alarm.consecutive_cycles,
         generated_at: chrono::Utc::now().to_rfc3339(),
@@ -2076,18 +2114,95 @@ mod tests {
             .expect("31 minutes of continuous 401 must fire the alarm");
         assert_eq!(alarm.consecutive_cycles, 3);
         assert!(alarm.elapsed >= 31 * MIN);
+        assert_eq!(
+            alarm.auth_class,
+            AuthClass::Unauthorized,
+            "a 401 run must report itself as 401 on the wire"
+        );
+    }
+
+    /// mika#2063. The whole ticket: a continuous `Forbidden` run longer than the
+    /// threshold must fire, exactly as the sibling 401 does. A revoked GitHub
+    /// App installation 403s indefinitely and leaves the manager just as blind —
+    /// before this ticket the run stayed at zero forever and the alarm never
+    /// came. The fired alarm reports `403` so the operator sees which door shut.
+    #[test]
+    fn auth_alarm_fires_for_sustained_forbidden() {
+        let t0 = Instant::now();
+        let mut tracker = AuthFailureTracker::default();
+
+        assert!(
+            tracker.on_failure(AuthClass::Forbidden, t0).is_none(),
+            "the first 403 opens the window but is well below threshold"
+        );
+        assert!(
+            tracker
+                .on_failure(AuthClass::Forbidden, t0 + 29 * MIN)
+                .is_none(),
+            "29 minutes of 403 is still below the 30-minute threshold"
+        );
+
+        let alarm = tracker
+            .on_failure(AuthClass::Forbidden, t0 + 31 * MIN)
+            .expect("31 minutes of continuous 403 must fire the alarm — the mika#2063 fix");
+        assert_eq!(alarm.consecutive_cycles, 3);
+        assert!(alarm.elapsed >= 31 * MIN);
+        assert_eq!(
+            alarm.auth_class,
+            AuthClass::Forbidden,
+            "a 403 run must report itself as 403, not masquerade as the 401 the code used to hardcode"
+        );
+    }
+
+    /// mika#2063. A run that flips between 401 and 403 without an intervening
+    /// success is ONE window — the manager was blind the whole time regardless
+    /// of which auth error each cycle drew. The alarm reports the class of the
+    /// cycle that tripped the threshold.
+    #[test]
+    fn mixed_auth_failure_run_is_one_continuous_window() {
+        let t0 = Instant::now();
+        let mut tracker = AuthFailureTracker::default();
+
+        assert!(tracker.on_failure(AuthClass::Unauthorized, t0).is_none());
+        assert!(
+            tracker
+                .on_failure(AuthClass::Forbidden, t0 + 20 * MIN)
+                .is_none(),
+            "20 minutes in, still below threshold — but the 403 did not reset the 401's window"
+        );
+
+        let alarm = tracker
+            .on_failure(AuthClass::Forbidden, t0 + 31 * MIN)
+            .expect("a mixed 401/403 run must accumulate across both classes and fire");
+        assert_eq!(
+            alarm.consecutive_cycles, 3,
+            "all three failing cycles count toward the one window"
+        );
+        assert_eq!(
+            alarm.auth_class,
+            AuthClass::Forbidden,
+            "the alarm reports the class of the tripping cycle"
+        );
     }
 
     /// AC3 anti-vacuity. The same sequence over the same span, but classified
-    /// `Other`, must fire nothing — otherwise the alarm is just "a failure
-    /// happened" wearing an auth label.
+    /// as a NON-auth class, must fire nothing — otherwise the alarm is just "a
+    /// failure happened" wearing an auth label.
+    ///
+    /// **mika#2063 narrowed this set.** mika#2013's version listed `Forbidden`
+    /// here (403 was out of scope then). This ticket moves 403 onto the alarm
+    /// path — `is_auth_failure` now admits it — so `Forbidden` is deliberately
+    /// dropped from this "never fires" set and gets its own firing test below
+    /// (`auth_alarm_fires_for_sustained_forbidden`). What remains here is the
+    /// bounded exclusion the ticket's "Hors périmètre" ratifies: `Network` and
+    /// `Other` are not auth failures, and `MilestoneNotFound` never reaches the
+    /// cycle path (a mid-cycle 404 classifies as `Other`).
     #[test]
-    fn auth_alarm_never_fires_for_non_unauthorized_classes() {
+    fn auth_alarm_never_fires_for_non_auth_classes() {
         let t0 = Instant::now();
         for class in [
             AuthClass::Other,
             AuthClass::Network,
-            AuthClass::Forbidden,
             AuthClass::MilestoneNotFound,
         ] {
             let mut tracker = AuthFailureTracker::default();
@@ -2170,6 +2285,7 @@ mod tests {
         );
         let sink = RecordingAlarmSink::default();
         let alarm = AuthAlarm {
+            auth_class: AuthClass::Unauthorized,
             elapsed: 31 * MIN,
             consecutive_cycles: 7,
         };
@@ -2186,6 +2302,36 @@ mod tests {
         assert_eq!(sent[0].1.elapsed_secs, 31 * 60);
     }
 
+    /// mika#2063, escalation half. A fired 403 alarm reaches `escalation_url`
+    /// carrying `auth_class: "403"` — proving the payload class is no longer the
+    /// `Unauthorized` constant the emitter used to hardcode, but the actual
+    /// class of the run.
+    #[tokio::test]
+    async fn emit_auth_alarm_carries_forbidden_class_on_the_wire() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_test_cfg(
+            tmp.path(),
+            chrono::Duration::hours(6),
+            chrono::Duration::seconds(30),
+        );
+        let sink = RecordingAlarmSink::default();
+        let alarm = AuthAlarm {
+            auth_class: AuthClass::Forbidden,
+            elapsed: 31 * MIN,
+            consecutive_cycles: 7,
+        };
+
+        let escalated = emit_auth_alarm(&cfg, &alarm, &sink).await;
+        assert!(escalated, "configured escalation_url must be used");
+
+        let sent = sink.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].1.auth_class, "403",
+            "the escalation payload must name 403, not the old hardcoded 401"
+        );
+    }
+
     /// AC3 anti-vacuity, escalation half. With no `escalation_url` the ERROR
     /// log stands alone and nothing is posted — the alarm must not invent a
     /// destination.
@@ -2200,6 +2346,7 @@ mod tests {
         cfg.escalation_url = None;
         let sink = RecordingAlarmSink::default();
         let alarm = AuthAlarm {
+            auth_class: AuthClass::Unauthorized,
             elapsed: 31 * MIN,
             consecutive_cycles: 7,
         };
