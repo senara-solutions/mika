@@ -97,11 +97,20 @@ pub async fn execute(
     output
 }
 
-/// Truncate output content to MAX_OUTPUT_LEN characters.
+/// Truncate output content to at most `MAX_OUTPUT_LEN` **bytes**, rounding
+/// down to the nearest char boundary.
+///
+/// The budget is in bytes, not characters — `MAX_OUTPUT_LEN` bounds the
+/// payload we hand back to the model, and a byte budget is what bounds a
+/// payload. Cutting at a raw byte offset panics whenever that offset lands
+/// inside a multi-byte character (mika#2103), so the cut is delegated to
+/// `safe_truncate`, which floors to a boundary and never panics.
 fn truncate_output(output: &mut ToolOutput) {
     if output.content.len() > MAX_OUTPUT_LEN {
-        output.content.truncate(MAX_OUTPUT_LEN);
-        output.content.push_str("\n... (truncated at 10000 chars)");
+        output.content = format!(
+            "{}\n... (truncated at {MAX_OUTPUT_LEN} bytes)",
+            mika_common::text::safe_truncate(&output.content, MAX_OUTPUT_LEN)
+        );
     }
 }
 
@@ -3791,6 +3800,73 @@ mod tests {
         truncate_output(&mut output);
         assert!(output.content.contains("truncated"));
         assert!(output.content.len() < MAX_OUTPUT_LEN + 100);
+    }
+
+    // ── mika#2103: byte-budget truncation on a char boundary ──────────────
+
+    /// AC2 — the exact shape that panicked in production: the byte budget
+    /// lands *inside* a multi-byte character. An all-ASCII case cannot
+    /// reach this assertion, which is why the old test never caught it.
+    #[test]
+    fn test_truncate_output_multibyte_split_at_limit() {
+        // 'é' is 2 bytes. MAX_OUTPUT_LEN-1 ASCII bytes, then 'é' straddling
+        // bytes MAX_OUTPUT_LEN-1..MAX_OUTPUT_LEN+1 — byte MAX_OUTPUT_LEN is
+        // the character's *second* byte, never a valid boundary.
+        let mut content = "x".repeat(MAX_OUTPUT_LEN - 1);
+        content.push('\u{e9}');
+        content.push_str(&"y".repeat(600));
+        assert!(!content.is_char_boundary(MAX_OUTPUT_LEN));
+
+        let mut output = ToolOutput::success(content);
+        truncate_output(&mut output); // panicked before mika#2103
+
+        // Floored to the boundary *below* the budget: the straddling 'é' is
+        // dropped whole rather than cut in half.
+        assert!(output.content.starts_with(&"x".repeat(MAX_OUTPUT_LEN - 1)));
+        assert!(!output.content.contains('\u{e9}'));
+        assert!(output.content.contains("truncated"));
+    }
+
+    /// A 4-byte character straddling the budget — the emoji case.
+    #[test]
+    fn test_truncate_output_four_byte_char_at_limit() {
+        let mut content = "x".repeat(MAX_OUTPUT_LEN - 2);
+        content.push('\u{1F600}'); // 4 bytes: budget lands mid-character
+        content.push_str(&"y".repeat(600));
+        assert!(!content.is_char_boundary(MAX_OUTPUT_LEN));
+
+        let mut output = ToolOutput::success(content);
+        truncate_output(&mut output);
+
+        assert!(!output.content.contains('\u{1F600}'));
+        assert!(output.content.contains("truncated"));
+    }
+
+    /// AC3 (anti-vacuity) — content *under* the budget comes back byte-for-byte
+    /// with no suffix appended. Without this dual, an implementation that
+    /// truncated everything to zero would satisfy AC1 and AC2.
+    #[test]
+    fn test_truncate_output_under_limit_left_intact() {
+        // Multi-byte content, deliberately: proves the short path does not
+        // route through any boundary logic either.
+        let content = format!("caf\u{e9} \u{2014} r\u{e9}sum\u{e9} {}", "z".repeat(100));
+        let mut output = ToolOutput::success(content.clone());
+        truncate_output(&mut output);
+
+        assert_eq!(output.content, content);
+        assert!(!output.content.contains("truncated"));
+    }
+
+    /// Content exactly at the budget is also left intact — the boundary case
+    /// between the two branches.
+    #[test]
+    fn test_truncate_output_exactly_at_limit_left_intact() {
+        let content = "x".repeat(MAX_OUTPUT_LEN);
+        let mut output = ToolOutput::success(content.clone());
+        truncate_output(&mut output);
+
+        assert_eq!(output.content, content);
+        assert!(!output.content.contains("truncated"));
     }
 
     // ── mika#1746 SIGPIPE-drain regression ────────────────────────────────

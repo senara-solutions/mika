@@ -6586,7 +6586,7 @@ impl Database {
         }
 
         // Cap total anomalies
-        anomalies.truncate(health_thresholds::MAX_ANOMALIES);
+        anomalies.truncate(health_thresholds::MAX_ANOMALIES); // safe-byte-slice: Vec<TaskHealthAnomaly> — element count, no char boundary
 
         Ok(TaskHealthSummary {
             active_tasks,
@@ -8079,16 +8079,18 @@ impl Database {
     const TOOL_CALL_MAX_BYTES: usize = 50_000;
 
     /// Truncate a string at a UTF-8 safe boundary, avoiding panics on multi-byte characters.
+    ///
+    /// mika#2103: the boundary walk lives in `mika_common::text::safe_truncate`;
+    /// this wrapper only adds the "truncated" suffix.
     fn truncate_utf8_safe(s: &str, max_bytes: usize) -> String {
         if s.len() <= max_bytes {
             return s.to_string();
         }
-        // Walk backwards from max_bytes to find a valid char boundary
-        let mut end = max_bytes;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}... (truncated at {} bytes)", &s[..end], max_bytes)
+        format!(
+            "{}... (truncated at {} bytes)",
+            mika_common::text::safe_truncate(s, max_bytes),
+            max_bytes
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -10268,7 +10270,7 @@ impl Database {
         }
 
         // Cap at 5 agents to keep context concise
-        agent_results.truncate(5);
+        agent_results.truncate(5); // safe-byte-slice: Vec — element count, no char boundary
 
         // Get task statuses
         let all_tasks: Vec<TaskStatusSummary> = {
