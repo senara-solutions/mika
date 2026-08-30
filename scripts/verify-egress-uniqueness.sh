@@ -101,6 +101,15 @@ AUTHORIZED_PATHS=(
     # substrate-side allowlist in `crates/mika-gateway/src/egress_fetch/`
     # remains the sole enforcement point.
     "crates/mika-agent/templates/skills/fetch-url/system_prompt.md"
+    # shell-exec egress-containment doctrine (mika#1991) — cites the T1
+    # measurement, which names the gouv.fr hosts reached (and not reached) in
+    # prose to explain WHY run_shell+curl had to be closed. Documentation only;
+    # names no enforcement path. Same category as the fetch-url prompt and the
+    # grounding-regression fixtures above. The shell-exec handler itself and
+    # its test deliberately do NOT name these hosts — the gate is host-agnostic
+    # (it refuses all direct egress), so the allowlist stays the sole property
+    # of crates/mika-gateway/src/egress_fetch/.
+    "docs/solutions/best-practices/optional-path-is-no-guarantee-2026-08-30.md"
 )
 
 # Legacy allowlist — code paths that ship this identifier pre-E1 and are
