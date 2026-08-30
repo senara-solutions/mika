@@ -454,6 +454,15 @@ pub fn is_skip_worthy_failure(diag: &SkillDiagnostic) -> bool {
     // Oversized prompt on always_on skill — skill will be functionally broken
     // (validate_skill emits this AFTER Ok diagnostics, so all_fail_no_ok won't catch it)
     || msg.contains("— skill will be SKIPPED at startup")
+    // Incoherent review-anchor thresholds (mika#2037). A Fail diagnostic alone let the skill
+    // load anyway, and both incoherent values are silent: `review_anchor_min_count = 0` makes
+    // the count check trivially true, so the guard is declared but inert — precisely the
+    // failure class it exists to close; `review_anchor_min_quote_chars` below the floor makes
+    // every anchor unmatchable, so every non-terminal disposition is withheld and the
+    // misconfiguration presents as model misbehaviour. Skip the skill instead.
+    || msg.starts_with("[output] review_anchor_min_count")
+    || msg.starts_with("[output] review_anchor_min_quote_chars")
+    || msg.starts_with("[output] review_anchor_min_brief_chars")
 }
 
 /// Result of scanning a skills directory.
@@ -1078,6 +1087,22 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
                  class it exists to close (mika#2037). Set it to 1 or more."
                     .to_string(),
             ));
+        }
+        let required_brief = manifest
+            .output
+            .review_anchor_min_count
+            .saturating_mul(manifest.output.review_anchor_min_quote_chars);
+        if manifest.output.review_anchor_min_brief_chars < required_brief {
+            diags.push(SkillDiagnostic::fail(format!(
+                "[output] review_anchor_min_brief_chars is {} but the contract demands {} \
+                 characters of quotes ({} anchors x {} chars) — the guard would arm on briefs \
+                 that cannot contain the proof it requires, and withhold every disposition \
+                 (mika#2037).",
+                manifest.output.review_anchor_min_brief_chars,
+                required_brief,
+                manifest.output.review_anchor_min_count,
+                manifest.output.review_anchor_min_quote_chars
+            )));
         }
         if manifest.output.review_anchor_min_quote_chars < MIN_REVIEW_ANCHOR_QUOTE_CHARS_FLOOR {
             diags.push(SkillDiagnostic::fail(format!(

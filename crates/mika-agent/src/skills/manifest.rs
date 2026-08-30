@@ -183,6 +183,19 @@ pub struct Output {
     #[serde(default = "default_review_anchor_min_quote_chars")]
     pub review_anchor_min_quote_chars: usize,
 
+    /// Minimum brief length, in characters, below which the review-anchor guard does not fire.
+    /// Only read when `required_review_anchor_prefixes` is non-empty.
+    ///
+    /// The guard's arming condition cannot be skill-match alone. The three mika-arch skills are
+    /// `always_on`, so the contract is collected on EVERY turn of that agent — including an
+    /// ad-hoc `mika ask --agent mika-arch "<short question>"`, and including the mika#1823
+    /// UNPARSED-recovery re-ask, whose user message is a ~480-character corrective prompt
+    /// rather than the plan. In both, no answer can carry three non-overlapping 40-character
+    /// quotes, because the brief does not contain them. Demanding proof that cannot exist is
+    /// the false-positive direction the guard is explicitly forbidden to take. See mika#2037.
+    #[serde(default = "default_review_anchor_min_brief_chars")]
+    pub review_anchor_min_brief_chars: usize,
+
     /// Per-tool argument-level required suffixes (mika#899). Skills opt in via
     /// `[[output.required_tool_arg_suffixes]]` entries in `skill.toml`. Each entry
     /// declares: tool name, logical argument key (must exist in the engine's
@@ -233,6 +246,16 @@ fn default_review_anchor_min_quote_chars() -> usize {
     40
 }
 
+/// Default minimum brief length that arms the guard.
+///
+/// Measured against the three shapes that reach a verdict-producer's turn: the mika#2037
+/// grooming brief was 10 492 bytes; the mika#1823 corrective re-ask prompt is ~480; an ad-hoc
+/// question to mika-arch is typically under 500. 2000 sits well above the two that must not
+/// arm the guard and far below the one that must. See mika#2037.
+fn default_review_anchor_min_brief_chars() -> usize {
+    2000
+}
+
 /// Floor below which `review_anchor_min_quote_chars` is rejected at manifest validation.
 ///
 /// A threshold of a few characters is satisfied by any common word of the brief, which
@@ -248,6 +271,7 @@ impl Default for Output {
             required_review_anchor_prefixes: Vec::new(),
             review_anchor_min_count: default_review_anchor_min_count(),
             review_anchor_min_quote_chars: default_review_anchor_min_quote_chars(),
+            review_anchor_min_brief_chars: default_review_anchor_min_brief_chars(),
             required_tool_arg_suffixes: Vec::new(),
         }
     }

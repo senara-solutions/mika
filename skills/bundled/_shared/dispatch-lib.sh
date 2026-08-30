@@ -2893,8 +2893,13 @@ _parse_disposition() {
     # disposition line was merely removed could still yield READY out of its own body. Tier 0
     # runs first so the engine's refusal cannot be undone downstream. Keep the literal in sync
     # with DISPOSITION_WITHHELD_MARKER in crates/mika-agent/src/agent_loop/mod.rs.
+    # Matched at the START OF A LINE, not anywhere in the text. The three arch prompts now
+    # teach this literal to the model ("replaced with `Disposition-Withheld: ...`"), so a
+    # response that QUOTES the marker while carrying a genuine ITERATE or GROOMED must not be
+    # suppressed. Only the engine writes it as a line of its own.
     case "$text" in
-        *"Disposition-Withheld: REVIEW-ANCHOR-MISSING"*)
+        "Disposition-Withheld: REVIEW-ANCHOR-MISSING"*|*"
+Disposition-Withheld: REVIEW-ANCHOR-MISSING"*)
             echo "_parse_disposition: tier 0 — disposition withheld by the engine (review-anchor attestation missing, mika#2037); emitting nothing" >&2
             return
             ;;
@@ -2964,8 +2969,13 @@ _parse_verdict() {
     # disposition line was merely removed could still yield READY out of its own body. Tier 0
     # runs first so the engine's refusal cannot be undone downstream. Keep the literal in sync
     # with DISPOSITION_WITHHELD_MARKER in crates/mika-agent/src/agent_loop/mod.rs.
+    # Matched at the START OF A LINE, not anywhere in the text. The three arch prompts now
+    # teach this literal to the model ("replaced with `Disposition-Withheld: ...`"), so a
+    # response that QUOTES the marker while carrying a genuine ITERATE or GROOMED must not be
+    # suppressed. Only the engine writes it as a line of its own.
     case "$text" in
-        *"Disposition-Withheld: REVIEW-ANCHOR-MISSING"*)
+        "Disposition-Withheld: REVIEW-ANCHOR-MISSING"*|*"
+Disposition-Withheld: REVIEW-ANCHOR-MISSING"*)
             echo "_parse_verdict: tier 0 — disposition withheld by the engine (review-anchor attestation missing, mika#2037); emitting nothing" >&2
             return
             ;;

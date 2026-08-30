@@ -104,7 +104,12 @@ fn normalize_whitespace(text: &str) -> String {
 /// count — otherwise the contract could be satisfied below the line the operator reads.
 fn body_lines<'a>(text: &'a str, required_suffix_lines: &[String]) -> Vec<&'a str> {
     let lines: Vec<&str> = text.lines().collect();
-    let suffix_line_idx = lines.iter().position(|line| {
+    // The LAST matching line, not the first. The effective disposition is the one at the end
+    // of the message — that is the line the #864 guard and `has_declared_disposition` read.
+    // Truncating at the first occurrence would drop the whole body of a response that quotes
+    // the contract early (the shipped prompt now shows a worked example containing
+    // `Disposition: READY`), and report `NoAnchorLine` for a fully anchored review.
+    let suffix_line_idx = lines.iter().rposition(|line| {
         let trimmed = line.trim();
         required_suffix_lines
             .iter()
@@ -128,24 +133,60 @@ fn find_brief_quote_range(
     line: &str,
     brief: &str,
     min_quote_chars: usize,
-) -> Option<std::ops::Range<usize>> {
+    claimed: &[std::ops::Range<usize>],
+) -> QuoteSearch {
     if min_quote_chars == 0 {
-        return None;
+        return QuoteSearch::NoQuote;
     }
     let chars: Vec<char> = line.chars().collect();
     if chars.len() < min_quote_chars {
-        return None;
+        return QuoteSearch::TooShort;
     }
+    let mut saw_quote_in_claimed_region = false;
     for start in 0..=(chars.len() - min_quote_chars) {
         let window: String = chars[start..start + min_quote_chars].iter().collect();
         if window.trim().is_empty() {
             continue;
         }
-        if let Some(pos) = brief.find(&window) {
-            return Some(pos..pos + window.len());
+        // Every occurrence of this window, not just the first: an early anchor whose first
+        // match happens to land in a region a later anchor genuinely quotes would otherwise
+        // steal it, and this guard is fail-closed — a false rejection costs a real review.
+        // `match_indices` walks occurrences without hand-rolled slicing. Advancing a byte
+        // cursor by `pos + 1` would land inside a multi-byte character and panic — measured,
+        // on the first accented brief in the test suite. See `scripts/check-byte-slices.sh`.
+        for (pos, _) in brief.match_indices(&window) {
+            let range = pos..pos + window.len();
+            if overlaps_any(&range, claimed) {
+                saw_quote_in_claimed_region = true;
+                continue;
+            }
+            return QuoteSearch::Found(range);
         }
     }
-    None
+    if saw_quote_in_claimed_region {
+        QuoteSearch::OnlyClaimedRegions
+    } else {
+        QuoteSearch::NoQuote
+    }
+}
+
+/// Whether `range` overlaps any already-claimed region of the brief.
+fn overlaps_any(range: &std::ops::Range<usize>, claimed: &[std::ops::Range<usize>]) -> bool {
+    claimed
+        .iter()
+        .any(|c| range.start < c.end && c.start < range.end)
+}
+
+/// Outcome of looking for one anchor's quote in the brief.
+enum QuoteSearch {
+    /// A usable quote at this byte range of the brief.
+    Found(std::ops::Range<usize>),
+    /// The anchor line is shorter than the quote threshold.
+    TooShort,
+    /// The line quotes the brief, but only in regions an earlier anchor already claimed.
+    OnlyClaimedRegions,
+    /// No span of this line occurs in the brief at all.
+    NoQuote,
 }
 
 /// Verify a response against a skill's review-anchor contract.
@@ -200,28 +241,31 @@ pub(crate) fn verify_review_anchors(
     let mut not_in_brief = 0usize;
     let mut overlapping = 0usize;
     let mut claimed: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut seen_lines: Vec<String> = Vec::new();
 
     for line in &anchor_lines {
         let normalized_line = normalize_whitespace(line);
-        if normalized_line.chars().count() < min_quote_chars {
-            too_short += 1;
+        // A repeated anchor line is one read of the brief, however many times it is pasted.
+        // Region disjointness alone does not catch this: a single line longer than
+        // `2 * min_quote_chars` yields non-overlapping windows, so copying one long sentence
+        // three times would otherwise satisfy a contract that exists to require three reads.
+        if seen_lines.contains(&normalized_line) {
+            overlapping += 1;
             continue;
         }
-        match find_brief_quote_range(&normalized_line, &normalized_brief, min_quote_chars) {
-            None => not_in_brief += 1,
-            Some(range) => {
-                // Greedy non-overlap: an anchor may not re-use a region an earlier anchor
-                // already claimed. This is what makes three anchors mean three reads of the
-                // brief rather than one line copied three times.
-                if claimed
-                    .iter()
-                    .any(|c| range.start < c.end && c.start < range.end)
-                {
-                    overlapping += 1;
-                } else {
-                    claimed.push(range);
-                }
-            }
+        seen_lines.push(normalized_line.clone());
+        match find_brief_quote_range(
+            &normalized_line,
+            &normalized_brief,
+            min_quote_chars,
+            &claimed,
+        ) {
+            QuoteSearch::Found(range) => claimed.push(range),
+            // The line quotes the brief only where an earlier anchor already did. Three
+            // anchors must mean three reads of the brief, not one line copied three times.
+            QuoteSearch::OnlyClaimedRegions => overlapping += 1,
+            QuoteSearch::TooShort => too_short += 1,
+            QuoteSearch::NoQuote => not_in_brief += 1,
         }
     }
 
@@ -443,6 +487,111 @@ mod tests {
         let verdict =
             verify_review_anchors(text, unicode_brief, &prefixes(), &suffix_lines(), 1, 40);
         assert!(verdict.is_satisfied(), "got {verdict:?}");
+    }
+
+    /// The guard runs on every non-terminal EndTurn of a verdict producer, so its cost has to
+    /// be measured rather than assumed. Worst realistic shape: a 10 KB brief (the size of the
+    /// one in mika#2037), the maximum ten anchor lines, and none of them quoting it — the path
+    /// that scans every window of every line against the whole brief before giving up.
+    ///
+    /// The bound is deliberately loose. This is a guard against an algorithmic regression
+    /// (someone reaching for a longest-common-substring scan), not a latency SLO, and a tight
+    /// bound would be flaky on a loaded CI runner.
+    #[test]
+    fn worst_case_cost_is_bounded() {
+        let brief: String = std::iter::repeat_n(
+            "Le plan re-résout le token du cycle avant chaque cycle au lieu de le figer au spawn. ",
+            120,
+        )
+        .collect();
+        assert!(
+            brief.len() > 10_000,
+            "brief should be ~10 KB, got {}",
+            brief.len()
+        );
+
+        let mut text = String::new();
+        for n in 1..=10 {
+            text.push_str(&format!(
+                "A{n}: cette ligne d'ancrage ne cite rien du brief et doit donc être parcourue \
+                 en entier avant d'être rejetée, fenêtre par fenêtre.\n"
+            ));
+        }
+        text.push_str("\nDisposition: READY\n");
+
+        let start = std::time::Instant::now();
+        let verdict = verify_review_anchors(&text, &brief, &prefixes(), &suffix_lines(), 3, 40);
+        let elapsed = start.elapsed();
+
+        assert!(!verdict.is_satisfied());
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "worst-case verification took {elapsed:?} — an algorithmic regression, not a slow \
+             machine, is the thing this bound catches"
+        );
+        println!("review-anchor worst case (10 KB brief, 10 non-quoting anchors): {elapsed:?}");
+    }
+
+    /// Region disjointness alone is not enough. A brief sentence longer than twice the quote
+    /// threshold yields non-overlapping windows, so pasting ONE long line three times would
+    /// otherwise clear a contract that exists to require three reads of the document.
+    #[test]
+    fn one_long_line_pasted_three_times_is_rejected() {
+        // 96 characters lifted from the brief — well over 2 x 40, so its windows can land on
+        // disjoint regions.
+        let long = "Le plan propose de re-résoudre le token avant chaque cycle du manager de milestones. La question 2";
+        assert!(long.chars().count() > 80);
+        let text = format!("A1: {long}\nA2: {long}\nA3: {long}\n\nDisposition: READY\n");
+        match verify(&text) {
+            AnchorVerdict::Missing {
+                anchors_valid,
+                reason,
+                ..
+            } => {
+                assert_eq!(anchors_valid, 1, "one read of the brief is one anchor");
+                assert_eq!(reason, AnchorMissReason::OverlappingRegions);
+            }
+            other => panic!("expected rejection of the paste-three-times shape, got {other:?}"),
+        }
+    }
+
+    /// The complement of the rule above: an early anchor must not be able to steal the region
+    /// a later one genuinely quotes. Before the fix, the first matching window was claimed
+    /// unconditionally, so a legitimate three-anchor review could be rejected.
+    #[test]
+    fn an_early_anchor_does_not_steal_a_later_anchors_region() {
+        // A1 quotes a span that also occurs inside the region A2 needs; A1 has another
+        // usable window, so both must resolve.
+        let text = "A1: La question 2 porte sur l'exhaustivité du tracé : faut-il journaliser chaque rafraîchissement ? Le plan propose de re-résoudre le token avant chaque cycle.\n\
+                    A2: Le plan propose de re-résoudre le token avant chaque cycle du manager de milestones.\n\
+                    A3: Je n'ai pas fixé N pour le seuil de détection des échecs d'authentification.\n\
+                    \n\
+                    Disposition: READY\n";
+        assert_eq!(
+            verify(text),
+            AnchorVerdict::Satisfied,
+            "three genuine anchors must not be rejected because of claim ordering"
+        );
+    }
+
+    /// The body window ends at the LAST disposition line, not the first. The shipped prompt
+    /// now shows a worked READY example, so a response that quotes the contract before
+    /// answering is an ordinary shape — truncating at the first occurrence would drop every
+    /// anchor of a fully anchored review.
+    #[test]
+    fn a_disposition_quoted_early_does_not_truncate_the_body() {
+        let text = "Le contrat demande de terminer par `Disposition: READY`. Voici la revue.\n\
+                    Disposition: READY\n\
+                    A1: \"Le plan propose de re-résoudre le token avant chaque cycle du manager\" — correct.\n\
+                    A2: \"l'exhaustivité du tracé : faut-il journaliser chaque rafraîchissement\" — oui.\n\
+                    A3: \"Je n'ai pas fixé N pour le seuil de détection des échecs\" — en durée.\n\
+                    \n\
+                    Disposition: READY\n";
+        assert_eq!(
+            verify(text),
+            AnchorVerdict::Satisfied,
+            "an early echo of the disposition must not hide the body from the guard"
+        );
     }
 
     #[test]

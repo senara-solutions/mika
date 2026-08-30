@@ -2437,6 +2437,12 @@ async fn run_loop(
                         && matches!(response.stop_reason, LlmStopReason::EndTurn)
                         && !review_anchor.is_empty()
                         && let Some(brief) = review_brief
+                        // A brief too short to contain the proof cannot be reviewed into
+                        // one. Demanding evidence that cannot exist is the false-positive
+                        // direction this guard is forbidden to take: it would break both
+                        // `/mika-ask-arch` and the mika#1823 UNPARSED recovery, whose user
+                        // message is a corrective prompt rather than the plan (mika#2037).
+                        && brief.chars().count() >= review_anchor.min_brief_chars
                         && !is_terminal_disposition(&text, required_suffix_lines)
                         && has_declared_disposition(&text, required_suffix_lines)
                     {
@@ -2521,6 +2527,16 @@ async fn run_loop(
                             }
 
                             // Second failure: withhold rather than accept.
+                            //
+                            // Take the correlation rather than leaving it set: the #953
+                            // block below emits `guard.correction_accepted` for whatever is
+                            // still pending, and a withheld attestation is the opposite of a
+                            // correction. Leaving it would count a refused forgery as a
+                            // successful repair on the Signal K surface operators read.
+                            let withheld_correlation_id = guard_correlation
+                                .take()
+                                .map(|c| c.correlation_id)
+                                .unwrap_or_default();
                             error!(
                                 target: "mika::otel",
                                 trace_id = %tool_ctx.trace_id,
@@ -2528,6 +2544,7 @@ async fn run_loop(
                                 session_id,
                                 step,
                                 label = mode.label(),
+                                guard_correlation_id = %withheld_correlation_id,
                                 anchors_found,
                                 anchors_valid,
                                 miss_reason = ?reason,
@@ -5479,6 +5496,10 @@ struct ReviewAnchorContract {
     prefixes: Vec<String>,
     min_count: usize,
     min_quote_chars: usize,
+    /// Below this brief length the guard does not fire. See mika#2037 — the three arch
+    /// skills are `always_on`, so skill-match alone would arm the guard on every turn of
+    /// that agent, including ad-hoc questions and the mika#1823 corrective re-ask.
+    min_brief_chars: usize,
 }
 
 impl ReviewAnchorContract {
@@ -5501,13 +5522,28 @@ fn collect_review_anchor_contract(matched: &[MatchedSkill<'_>]) -> ReviewAnchorC
         if output.required_review_anchor_prefixes.is_empty() {
             continue;
         }
-        contract
-            .prefixes
-            .extend(output.required_review_anchor_prefixes.iter().cloned());
+        // Dedup: all three arch skills are always-on and declare the same alphabet, so a
+        // plain extend would build a 30-entry list and render every prefix three times in
+        // the corrective re-prompt meant to teach the contract.
+        for prefix in &output.required_review_anchor_prefixes {
+            if !contract.prefixes.contains(prefix) {
+                contract.prefixes.push(prefix.clone());
+            }
+        }
         contract.min_count = contract.min_count.max(output.review_anchor_min_count);
         contract.min_quote_chars = contract
             .min_quote_chars
             .max(output.review_anchor_min_quote_chars);
+        // Strictest-wins on the two proof thresholds, but the arming threshold takes the
+        // LOWEST declared value: it decides whether the guard applies at all, and a skill
+        // that arms earlier must not be silenced by a more permissive sibling.
+        contract.min_brief_chars = if contract.min_brief_chars == 0 {
+            output.review_anchor_min_brief_chars
+        } else {
+            contract
+                .min_brief_chars
+                .min(output.review_anchor_min_brief_chars)
+        };
     }
     contract
 }

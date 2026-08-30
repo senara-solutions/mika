@@ -505,6 +505,16 @@ assert_eq "verdict tier 0 beats tier 1b" "" \
 assert_eq "verdict tier 0 beats tier 2 (fuzzy GROOMED paraphrases)" "" \
     "$(printf 'Approved, no remaining concerns, ship it.\n%s\n' "$WITHHELD_MARKER" | _parse_verdict 2>/dev/null)"
 
+# A response that QUOTES the marker mid-line must not be suppressed: the three arch prompts
+# now teach the literal to the model, so an echo is an ordinary shape. Only a line the engine
+# wrote counts (mika#2037 F4).
+assert_eq "quoted marker mid-line does not suppress a genuine ITERATE" "ITERATE" \
+    "$(printf 'If the attestation were missing the engine would emit %s here.\nDisposition: ITERATE\n' "$WITHHELD_MARKER" | _parse_disposition 2>/dev/null)"
+assert_eq "quoted marker mid-line does not suppress a genuine GROOMED" "GROOMED" \
+    "$(printf 'The engine substitutes %s in that case.\nVerdict: GROOMED\n' "$WITHHELD_MARKER" | _parse_verdict 2>/dev/null)"
+assert_eq "marker at the very start of the response still suppresses" "" \
+    "$(printf '%s\nDisposition: READY\n' "$WITHHELD_MARKER" | _parse_disposition 2>/dev/null)"
+
 # Non-regression: without the marker every tier behaves exactly as before.
 assert_eq "no marker — tier 1a still returns READY" "READY" \
     "$(printf 'Some review prose.\nDisposition: READY\n' | _parse_disposition 2>/dev/null)"
