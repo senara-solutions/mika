@@ -3010,6 +3010,23 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Async wrapper for `Database::find_recent_destructive_actions` (mika#1646).
+    pub async fn find_recent_destructive_actions(
+        &self,
+        agent_id: &str,
+        noun: &str,
+        number: &str,
+        window_secs: i64,
+    ) -> Result<Vec<crate::db::ToolCallRow>> {
+        let agent_id = agent_id.to_owned();
+        let noun = noun.to_owned();
+        let number = number.to_owned();
+        self.with_db(move |db| {
+            db.find_recent_destructive_actions(&agent_id, &noun, &number, window_secs, None)
+        })
+        .await
+    }
+
     pub async fn query_llm_calls_by_session(
         &self,
         session_id: &str,
