@@ -1434,12 +1434,27 @@ _run_claude_pilot() {
     # The mktemp file above is deleted after callback delivery; this copy persists
     # alongside the claude-pilot log file so operators can inspect it independently.
     PERSISTENT_STDERR="/var/log/claude-pilot/${LOG_ID}.stderr"
-    # --trace flag for full event-stream capture (mika#1097 Step 0-B).
-    # Enabled via CLAUDE_PILOT_TRACE env var (set per-skill in the case switch below).
-    local TRACE_FLAG=""
-    if [ "${CLAUDE_PILOT_TRACE:-}" = "1" ] || [ "${CLAUDE_PILOT_TRACE:-}" = "true" ]; then
-        TRACE_FLAG="--trace"
-    fi
+    # Event-stream capture is `--verbose`, passed unconditionally on the run
+    # below — there is no trace flag to add, and adding one would abort the
+    # launch (mika#2043).
+    #
+    # This spot used to build a `--trace` flag from CLAUDE_PILOT_TRACE, citing
+    # mika#1097 Step 0-B. Only Step 0-B's dispatch-lib half ever shipped:
+    # claude-pilot has never accepted `--trace` (no such argument in
+    # `_build_parser`, and `git log -S` finds no commit that ever added one).
+    # Measured against the installed CLI with this exact argv, an unknown flag
+    # is NOT swallowed — argparse exits 2 with `unrecognized arguments` before
+    # the session starts, so arming the old env var would have killed every
+    # dispatch of the skill that set it.
+    #
+    # What `--verbose` gives you, for the zero-artifact diagnosis Step 0-B was
+    # written for: every text content block (`log_text`), the init event's
+    # session_id and model (`log_init`), a marker for turns that produced
+    # nothing observable (`log_turn_summary`, cpp#10), any unhandled SDK message
+    # type (`log_unhandled_message`, cpp#123), and the raw stream — StreamEvent
+    # plus tool-result UserMessage (`log_verbose`, cpp#125). Raw `thinking`
+    # blocks are the one thing it does not surface; that needs a ticket on
+    # claude-pilot, not a flag here.
     # mika#1705: pilot-transcript capture. When MIKA_LOG_PILOT_TRANSCRIPTS is on,
     # the mika-spirit executor injects ANTHROPIC_LOG_FILE into this handler's env
     # (AFTER its MIKA_* scrub, since this handler cannot read MIKA_* itself), and
@@ -1455,7 +1470,7 @@ _run_claude_pilot() {
     PILOT_RAN=1
     # CWD_ARGS is intentionally word-split (multiple flags)
     # shellcheck disable=SC2086
-    _run_pilot_sandboxed claude-pilot --verbose --log-dir --task-id "$LOG_ID" --command "$ENTRY_COMMAND" $TRACE_FLAG $CWD_ARGS -- "$PROMPT" >"$STDOUT_FILE" 2>"$STDERR_FILE"
+    _run_pilot_sandboxed claude-pilot --verbose --log-dir --task-id "$LOG_ID" --command "$ENTRY_COMMAND" $CWD_ARGS -- "$PROMPT" >"$STDOUT_FILE" 2>"$STDERR_FILE"
     PILOT_EXIT=$?
     # Persist stderr to durable file before any processing (mika#1097).
     # Scrub secrets from the persistent copy to prevent durable secret retention (mika#903).
