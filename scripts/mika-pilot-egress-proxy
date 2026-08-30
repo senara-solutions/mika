@@ -117,9 +117,13 @@ HOST_ALLOWLIST = frozenset({
     "api.openai.com",
     "api.z.ai",
     "openrouter.ai",
-    # GitHub — pilot uses gh CLI + git push/fetch.
-    "api.github.com",
-    "github.com",
+    # GitHub — the two credential-bearing hosts (api.github.com for the gh CLI,
+    # github.com for git smart-HTTP push/fetch) are deliberately ABSENT here:
+    # like api.anthropic.com, they are MITM-FORWARDED (see MITM_FORWARD_HOSTS)
+    # so the token is injected host-side and the sandbox never holds it
+    # (mika#2056). The remaining GitHub hosts carry no credential — codeload
+    # (public archives) and objects (LFS blobs) are unauthenticated, ssh is a
+    # separate transport — so they stay on the plain encrypted-tunnel path.
     "ssh.github.com",
     "codeload.github.com",
     "objects.githubusercontent.com",
@@ -144,10 +148,23 @@ CONNECT_RE = re.compile(rb"^CONNECT ([^:\s]+):(\d+) HTTP/1\.[01]\r\n", re.ASCII)
 # auth rewrite (see scripts/mika-pilot-anthropic-auth-addon.py) + upstream
 # re-TLS. Kept narrow — api.anthropic.com is the sole host where the
 # sandbox has no real credential to present (only a placeholder). Other
-# LLM providers / github / registries stay on the plain CONNECT allowlist
-# path where the sandbox carries its own real credentials through the
-# encrypted tunnel (GH_TOKEN etc.).
-MITM_FORWARD_HOSTS = frozenset({"api.anthropic.com"})
+# LLM providers / registries stay on the plain CONNECT allowlist path where
+# the sandbox carries its own credentials (or none) through the encrypted
+# tunnel.
+#
+# mika#2056: api.github.com + github.com JOIN this set. The pilot used to carry
+# GH_TOKEN inside the sandbox and present it through the encrypted tunnel — the
+# same rejected shape the Anthropic --setenv key once used. Now the sandbox
+# holds no GitHub token; mitmdump terminates TLS with its own CA (which the
+# sandbox trusts via the combined bundle in dispatch-lib.sh) and
+# mika-pilot-github-auth-addon.py injects the credential host-side. The
+# addon rewrites ONLY these hosts; every other MITM'd host passes through
+# untouched.
+MITM_FORWARD_HOSTS = frozenset({
+    "api.anthropic.com",
+    "api.github.com",
+    "github.com",
+})
 MITM_UPSTREAM_PORT = 8892  # mitmdump --listen-port (managed by dispatch-lib)
 
 # Q3 auth-injection reverse-proxy — path prefix stripped, forwarded to
