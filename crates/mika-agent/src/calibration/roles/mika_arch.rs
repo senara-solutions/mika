@@ -58,6 +58,15 @@ pub const SCENARIOS: &[RoleScenario] = &[
         expected_failure_classes_absent: &["ContractViolation"],
     },
     RoleScenario {
+        id: "review_anchor_attestation",
+        description: "A clean plan must produce an ANCHORED READY — three verbatim quotes of \
+                      the brief at distinct positions, not a short acknowledgement",
+        tags: &["contract", "review-anchor"],
+        flaky: false,
+        weight: 1.5,
+        expected_failure_classes_absent: &["ContractViolation"],
+    },
+    RoleScenario {
         id: "groomed_no_tbds_passes",
         description: "Clean plan with no TBDs must produce READY (TBD gate does not fire)",
         tags: &["contract", "tbd-gate"],
@@ -101,6 +110,7 @@ pub async fn run_scenario(scenario_id: &str, provider: Arc<dyn LlmProvider>) -> 
         "citation_discipline" => run_citation_discipline(provider, start).await,
         "disposition_keyword_discipline" => run_disposition_keyword(provider, start).await,
         "required_finding_list" => run_required_finding_list(provider, start).await,
+        "review_anchor_attestation" => run_review_anchor_attestation(provider, start).await,
         "groomed_no_tbds_passes" => run_groomed_no_tbds_passes(provider, start).await,
         "groomed_with_tbd_rejected" => run_groomed_with_tbd_rejected(provider, start).await,
         "groomed_with_placeholder_path_rejected" => {
@@ -936,6 +946,112 @@ async fn run_fire_disposition_gate(
     }
 }
 
+/// Review-anchor attestation: a clean plan must produce an ANCHORED READY (mika#2037).
+///
+/// This measures the anti-vacuity direction — the one a "refuse everything" guard would fail.
+/// The refusal direction is covered structurally by the matcher's matrix
+/// (`agent_loop::review_anchor::matrix`) and by the eval scenarios; it is not expressible as a
+/// model behaviour, since one cannot ask a model to produce a stub.
+///
+/// Scoring calls the engine's own `verify_review_anchors`, so the calibration measures exactly
+/// what the guard measures — a model that passes here cannot trip the guard in production, and
+/// the two cannot drift apart.
+async fn run_review_anchor_attestation(
+    provider: Arc<dyn LlmProvider>,
+    start: Instant,
+) -> RoleScenarioResult {
+    use crate::agent_loop::review_anchor::{AnchorVerdict, verify_review_anchors};
+    use mika_common::llm::types::{LlmContent, LlmMessage, LlmRequest, LlmRole};
+
+    const SCENARIO: &str = "review_anchor_attestation";
+
+    let fixture = include_str!(
+        "../../../tests/eval/calibration_fixtures/mika-arch/review_anchor_attestation.md"
+    );
+
+    let anchor_prefixes: Vec<String> = (1..=10).map(|n| format!("A{n}:")).collect();
+    let suffix_lines: Vec<String> = vec![
+        "Disposition: READY".to_string(),
+        "Disposition: ITERATE".to_string(),
+        "Disposition: ESCALATE".to_string(),
+    ];
+
+    let request = LlmRequest {
+        model: provider.model_name().to_string(),
+        system: Some(
+            "You are mika-arch reviewing a plan. The plan is sound, so your disposition is \
+             READY. A disposition keyword is not an attestation: before the disposition line, \
+             emit at least 3 anchor lines starting with `A1:`, `A2:`, `A3:`. Each anchor must \
+             quote at least 40 characters of the plan above VERBATIM — copied exactly, not \
+             paraphrased — and each must quote a DIFFERENT part of it. Answer the numbered \
+             questions in those anchors. End with the literal line `Disposition: READY`."
+                .to_string(),
+        ),
+        messages: vec![LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::Text(fixture.to_string()),
+        }],
+        tools: None,
+        max_tokens: 2000,
+        thinking: None,
+    };
+
+    match provider.send_message(&request).await {
+        Ok(response) => {
+            let text = response.text().to_string();
+            let latency = start.elapsed().as_millis() as u64;
+
+            if text.trim().is_empty() {
+                return RoleScenarioResult::fail(
+                    SCENARIO,
+                    FailureClass::EmptyResponse,
+                    "Empty response".to_string(),
+                    Some(response.usage.input_tokens),
+                    Some(response.usage.output_tokens),
+                    latency,
+                );
+            }
+
+            if !text.contains("Disposition: READY") {
+                return RoleScenarioResult::fail(
+                    SCENARIO,
+                    FailureClass::ContractViolation,
+                    "Clean plan did not produce Disposition: READY".to_string(),
+                    Some(response.usage.input_tokens),
+                    Some(response.usage.output_tokens),
+                    latency,
+                );
+            }
+
+            match verify_review_anchors(&text, fixture, &anchor_prefixes, &suffix_lines, 3, 40) {
+                AnchorVerdict::Satisfied => RoleScenarioResult::pass(
+                    SCENARIO,
+                    response.usage.input_tokens,
+                    response.usage.output_tokens,
+                    latency,
+                ),
+                AnchorVerdict::Missing {
+                    anchors_found,
+                    anchors_valid,
+                    reason,
+                } => RoleScenarioResult::fail(
+                    SCENARIO,
+                    FailureClass::ContractViolation,
+                    format!(
+                        "READY without a valid attestation: {} (anchors found {anchors_found}, \
+                         valid {anchors_valid})",
+                        reason.describe()
+                    ),
+                    Some(response.usage.input_tokens),
+                    Some(response.usage.output_tokens),
+                    latency,
+                ),
+            }
+        }
+        Err(e) => llm_error_result(SCENARIO, e, start.elapsed().as_millis() as u64),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1080,11 +1196,23 @@ mod tests {
     // --- Scenario metadata ---
 
     #[test]
-    fn scenario_count_is_nine() {
+    fn scenario_count_is_ten() {
         assert_eq!(
             SCENARIOS.len(),
-            9,
-            "mika-arch should have 9 calibration scenarios (5 original + 3 TBD-gate + 1 fire-disposition-gate)"
+            10,
+            "mika-arch should have 10 calibration scenarios (5 original + 3 TBD-gate + 1 fire-disposition-gate + 1 review-anchor)"
+        );
+    }
+
+    #[test]
+    fn review_anchor_scenario_is_registered() {
+        let scenario = SCENARIOS
+            .iter()
+            .find(|s| s.id == "review_anchor_attestation")
+            .expect("mika#2037 review-anchor scenario must stay registered");
+        assert!(
+            scenario.tags.contains(&"review-anchor"),
+            "the scenario must carry its tag so a model swap can be filtered on it"
         );
     }
 
