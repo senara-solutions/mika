@@ -111,6 +111,11 @@
   color: "bfdadc"
   description: "Docs-only or non-code PR exempt from pipeline gates"
 
+# ── Dispatch / Routing ────────────────────────────────────────────────────────
+- name: "dispatch:ssc"
+  color: "5319e7"
+  description: "Routage : ce ticket est pris par SSC (senara-solutions-claude). Un seul dispatcher par ticket."
+
 # ── Sprint Hooks ───────────────────────────────────────��─────────────────────
 - name: needs-build
   color: "d97706"
