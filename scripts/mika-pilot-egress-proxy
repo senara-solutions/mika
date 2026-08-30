@@ -58,6 +58,7 @@ Failure modes:
 
 import argparse
 import asyncio
+import datetime
 import json
 import os
 import re
@@ -68,6 +69,29 @@ import stat
 import sys
 import time
 from pathlib import Path
+
+
+def _log(msg: str) -> None:
+    """Sole operator-log emitter for this daemon.
+
+    Prefixes every line with an ISO-8601 UTC timestamp (millisecond
+    precision, `Z` suffix) so entries in `/var/log/mika/pilot-egress-proxy.log`
+    can be correlated by time against the sibling logs — `server.log` stamps
+    its JSON `timestamp` field in the same RFC3339-UTC shape
+    (`2026-08-29T03:17:58.081902Z`), and a date grep (`grep 2026-08-28`) now
+    composes across both files. Before mika#2030 these lines carried no time
+    field, which stalled the mika#1772 / #2029 pilot-stall diagnosis.
+
+    Every stderr line MUST go through here — no bare `print(..., file=sys.stderr)`
+    elsewhere — so the timestamp invariant holds for the whole file. `flush=True`
+    is preserved: line-by-line ordering is what makes this log readable during
+    an incident.
+    """
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S.%f"
+    )[:-3] + "Z"
+    print(f"{ts} {msg}", file=sys.stderr, flush=True)
+
 
 # Sole security boundary — every entry is a decision.
 #
@@ -378,10 +402,9 @@ def _note_readiness_probe() -> None:
     global _readiness_probe_count
     _readiness_probe_count += 1
     if _EGRESS_DEBUG:
-        print(
+        _log(
             "[egress] DEBUG readiness-probe (connect+close, no CONNECT) "
-            f"count={_readiness_probe_count}",
-            file=sys.stderr, flush=True,
+            f"count={_readiness_probe_count}"
         )
 
 
@@ -403,19 +426,13 @@ def _log_upstream_outcome(
     a distinct outcome, not an allowed call, and is reported as such.
     """
     if status is None:
-        print(
-            f"[anthropic-proxy] UPSTREAM_NO_RESPONSE {method} {path}",
-            file=sys.stderr, flush=True,
-        )
+        _log(f"[anthropic-proxy] UPSTREAM_NO_RESPONSE {method} {path}")
         return
-    print(
-        f"[anthropic-proxy] ALLOW {method} {path} -> {status}",
-        file=sys.stderr, flush=True,
-    )
+    _log(f"[anthropic-proxy] ALLOW {method} {path} -> {status}")
     if status == 429:
         detail = _format_quota_headers(quota_headers)
         line = f"[anthropic-proxy] RATE_LIMITED {method} {path}"
-        print(f"{line} {detail}" if detail else line, file=sys.stderr, flush=True)
+        _log(f"{line} {detail}" if detail else line)
 
 
 async def _relay_response_with_status_tap(
@@ -522,17 +539,15 @@ async def handle_anthropic_reverse_proxy(
             b"\r\n" + body
         )
         await writer.drain()
-        print(f"[anthropic-proxy] DENY no-token path={path.decode('ascii', 'replace')}",
-              file=sys.stderr, flush=True)
+        _log(f"[anthropic-proxy] DENY no-token path={path.decode('ascii', 'replace')}")
         return
     # Soft-warn if the token appears expired — Anthropic will 401 anyway,
     # this makes debugging easier from the proxy log.
     if expires_at is not None and expires_at < time.time():
-        print(
+        _log(
             f"[anthropic-proxy] WARN token appears expired "
             f"({int(time.time() - expires_at)}s ago) — Anthropic will 401. "
-            f"Refresh via a Claude Code CLI call on the host.",
-            file=sys.stderr, flush=True,
+            f"Refresh via a Claude Code CLI call on the host."
         )
 
     # Split request into request-line + headers. body follows blank line.
@@ -590,8 +605,7 @@ async def handle_anthropic_reverse_proxy(
     except (asyncio.TimeoutError, OSError, ssl.SSLError) as exc:
         writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
         await writer.drain()
-        print(f"[anthropic-proxy] UPSTREAM_FAIL: {exc}",
-              file=sys.stderr, flush=True)
+        _log(f"[anthropic-proxy] UPSTREAM_FAIL: {exc}")
         return
 
     try:
@@ -707,12 +721,11 @@ async def handle_host_client(
             except (asyncio.TimeoutError, OSError) as exc:
                 writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                 await writer.drain()
-                print(f"[mitm-forward] MITMDUMP_DOWN {peer}: {exc}",
-                      file=sys.stderr, flush=True)
+                _log(f"[mitm-forward] MITMDUMP_DOWN {peer}: {exc}")
                 return
             up_writer.write(request)
             await up_writer.drain()
-            print(f"[mitm-forward] {peer} → mitmdump", file=sys.stderr, flush=True)
+            _log(f"[mitm-forward] {peer} → mitmdump")
             await asyncio.gather(
                 pipe_bytes(reader, up_writer),
                 pipe_bytes(up_reader, writer),
@@ -734,7 +747,7 @@ async def handle_host_client(
                 + body
             )
             await writer.drain()
-            print(f"[egress] DENY {peer}", file=sys.stderr, flush=True)
+            _log(f"[egress] DENY {peer}")
             return
 
         # Upstream connect. Bounded timeout so a dead upstream can't wedge.
@@ -745,12 +758,12 @@ async def handle_host_client(
         except (asyncio.TimeoutError, OSError) as exc:
             writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
             await writer.drain()
-            print(f"[egress] FAIL {peer}: {exc}", file=sys.stderr, flush=True)
+            _log(f"[egress] FAIL {peer}: {exc}")
             return
 
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await writer.drain()
-        print(f"[egress] ALLOW {peer}", file=sys.stderr, flush=True)
+        _log(f"[egress] ALLOW {peer}")
 
         # Bidirectional relay. Either side closing tears down both.
         await asyncio.gather(
@@ -759,7 +772,7 @@ async def handle_host_client(
             return_exceptions=True,
         )
     except Exception as exc:  # noqa: BLE001 — proxy must not crash on bad clients
-        print(f"[egress] ERROR {peer}: {exc}", file=sys.stderr, flush=True)
+        _log(f"[egress] ERROR {peer}: {exc}")
     finally:
         try:
             writer.close()
@@ -802,9 +815,15 @@ async def run_host_mode(unix_sock_path: str) -> None:
             if stat.S_ISSOCK(sock_path.stat().st_mode):
                 sock_path.unlink()
             else:
-                sys.exit(f"refusing to unlink non-socket: {sock_path}")
+                # These fatal-startup diagnostics reach the same log file as the
+                # rest (stderr → pilot-egress-proxy.log), so they carry the
+                # mika#2030 timestamp too — a bare `sys.exit(msg)` would land an
+                # un-stamped line in the middle of a stamped log.
+                _log(f"[egress] FATAL refusing to unlink non-socket: {sock_path}")
+                sys.exit(1)
         except OSError as exc:
-            sys.exit(f"stale-socket cleanup failed: {exc}")
+            _log(f"[egress] FATAL stale-socket cleanup failed: {exc}")
+            sys.exit(1)
 
     server = await asyncio.start_unix_server(handle_host_client, str(sock_path))
     # World-writable so the sandbox (running as same uid, but env-cleared) can
@@ -818,11 +837,9 @@ async def run_host_mode(unix_sock_path: str) -> None:
         bound_ino = os.stat(sock_path).st_ino
     except OSError:
         bound_ino = None
-    print(
+    _log(
         f"[egress] host-unix listening on {sock_path} (allowlist: "
-        f"{len(HOST_ALLOWLIST)} hosts)",
-        file=sys.stderr,
-        flush=True,
+        f"{len(HOST_ALLOWLIST)} hosts)"
     )
     # A kill does not unlink a unix socket. Without this, SIGTERM -- the default
     # kill, and the one that took the proxy down on 2026-08-29 -- leaves the path
@@ -875,11 +892,7 @@ async def run_sandbox_mode(port: int, unix_sock_path: str) -> None:
         host="127.0.0.1",
         port=port,
     )
-    print(
-        f"[egress-shim] tcp 127.0.0.1:{port} → {unix_sock_path}",
-        file=sys.stderr,
-        flush=True,
-    )
+    _log(f"[egress-shim] tcp 127.0.0.1:{port} → {unix_sock_path}")
     async with server:
         await server.serve_forever()
 
