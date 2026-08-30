@@ -50,7 +50,7 @@ Today's failures muddle the diagnostic vocabulary. The doctrine should treat the
 
 - **Symptom**: session exits `Success` with **zero** tool calls (no `[tool:request]` lines), zero content blocks, ~12 turns of empty SDK turns.
 - **Cause**: prompt block position confusing the model into inhibiting tool use entirely.
-- **Existing guard**: `--trace` diagnostic instrumentation; structural plan-file check.
+- **Existing guard**: unconditional diagnostic instrumentation — `log_turn_summary` (cpp#10) marks a turn that produced nothing observable, `log_unhandled_message` (cpp#123) names an SDK message type falling off the loop; structural plan-file check. *Corrected 2026-08-30 (mika#2043): this line said `--trace`, a flag claude-pilot never accepted — the guard it named did not exist. No flag conditions the instrumentation that does.*
 - **Detection signal**: zero rows in `tool_calls` for the session_id.
 
 ### Class C — Policy-deny-induced early halt (today's pattern, undiagnosed)
