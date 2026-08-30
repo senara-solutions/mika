@@ -42,7 +42,7 @@ assert_eq() {
 
 assert_contains() {
     local label="$1" needle="$2" haystack="$3"
-    if printf '%s' "$haystack" | grep -qF "$needle"; then
+    if grep -qF -- "$needle" <<<"$haystack"; then
         PASS=$((PASS + 1))
         echo "  ✓ $label"
     else
@@ -209,14 +209,14 @@ stripped=$(printf '%s' "$BODY_WITH_AC6" | awk '
     }
 ')
 assert_contains "strip: pre-block content preserved" 'Closes #1941' "$stripped"
-if printf '%s' "$stripped" | grep -qF 'AC6 verbatim ground truth'; then
+if grep -qF -- 'AC6 verbatim ground truth' <<<"$stripped"; then
     FAIL=$((FAIL + 1))
     echo "  ✗ strip: AC6 block should be removed (still present)"
 else
     PASS=$((PASS + 1))
     echo "  ✓ strip: AC6 block removed"
 fi
-if printf '%s' "$stripped" | grep -qF 'STALE stats block'; then
+if grep -qF -- 'STALE stats block' <<<"$stripped"; then
     FAIL=$((FAIL + 1))
     echo "  ✗ strip: STALE content should be removed"
 else

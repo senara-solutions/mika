@@ -54,14 +54,14 @@ RESULT=$(echo "$TEST_INPUT" | _scrub_secrets_from_output)
 
 PASS=true
 for pattern in "${EXPECTED_PATTERNS[@]}"; do
-    if ! echo "$RESULT" | grep -qF "$pattern"; then
+    if ! grep -qF -- "$pattern" <<<"$RESULT"; then
         echo "FAIL: expected pattern not found: $pattern"
         PASS=false
     fi
 done
 
 for pattern in "${FORBIDDEN_PATTERNS[@]}"; do
-    if echo "$RESULT" | grep -qF "$pattern"; then
+    if grep -qF -- "$pattern" <<<"$RESULT"; then
         echo "FAIL: secret not redacted: $pattern"
         PASS=false
     fi
