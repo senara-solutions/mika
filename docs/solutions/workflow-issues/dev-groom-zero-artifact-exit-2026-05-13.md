@@ -36,17 +36,19 @@ The issue body originally attributed the failure to kimi-k2.5 (mika-dev's base m
 
 ### Evidence shape
 
-All 6 failing sessions shared the same signature: 12 turns of SDK-level "turns" (likely thinking blocks or empty content) followed by `stop_reason=end_turn`. Without `--trace` logging, the actual content of those 12 turns was invisible — neither `log_text` (requires text blocks) nor `log_tool_request` (requires permission callbacks) fired.
+All 6 failing sessions shared the same signature: 12 turns of SDK-level "turns" (likely thinking blocks or empty content) followed by `stop_reason=end_turn`. At the time, the content of those 12 turns was invisible — neither `log_text` (requires text blocks) nor `log_tool_request` (requires permission callbacks) fired.
 
-### Phase 0 diagnostic instrumentation (deployed)
+### Phase 0 diagnostic instrumentation
 
-Three diagnostic capabilities were added to close the visibility gap:
+> **Corrected 2026-08-30 (mika#2043).** Items 2 and 3 below were written as shipped and were not. Only item 1 ever landed. `claude-pilot` has never accepted a `--trace` flag — no such argument exists in `_build_parser` (`src/claude_pilot/cli.py`), and `git log -S` finds no commit that ever added one. Step 0-B shipped its dispatch-lib half only; the claude-pilot half was never written. The dead flag sat in `dispatch-lib.sh` for three months, and this document is what kept pointing people at it. Recording an intention as a deliverable is the defect; the entries are kept struck-through rather than deleted so the trail stays readable.
 
-1. **Persistent stderr** (`dispatch-lib.sh`): stderr is now copied to `/var/log/claude-pilot/<task_id>.stderr` before processing, surviving callback delivery cleanup.
+1. **Persistent stderr** (`dispatch-lib.sh`): stderr is now copied to `/var/log/claude-pilot/<task_id>.stderr` before processing, surviving callback delivery cleanup. **This one shipped.**
 
-2. **`--trace` flag** (`claude-pilot`): Logs every `AssistantMessage` content block (text, thinking, tool_use, tool_result) to the file sink. Also logs `repr(SystemMessage)` for init events to diagnose the empty session_id / unknown model signal.
+2. ~~**`--trace` flag** (`claude-pilot`): Logs every `AssistantMessage` content block (text, thinking, tool_use, tool_result) to the file sink. Also logs `repr(SystemMessage)` for init events to diagnose the empty session_id / unknown model signal.~~ **Never implemented.**
 
-3. **Environment wire**: `CLAUDE_PILOT_TRACE=1` in dispatch-lib enables trace for specific skills.
+3. ~~**Environment wire**: `CLAUDE_PILOT_TRACE=1` in dispatch-lib enables trace for specific skills.~~ **Removed in mika#2043.** The flag reached the CLI as an unrecognized argument; measured, argparse exits 2 before the session starts, so arming it would have killed every dispatch of the skill that set it.
+
+**What to use instead:** `--verbose`, which `dispatch-lib` already passes on every dispatch. It surfaces every text content block (`log_text`), the init event's session_id and model (`log_init` — the signal item 2 was meant to answer), a marker for turns that produced nothing observable (`log_turn_summary`, cpp#10), any unhandled SDK message type (`log_unhandled_message`, cpp#123), and the raw stream: StreamEvent plus tool-result UserMessage (`log_verbose`, cpp#125). Raw `thinking` blocks remain unsurfaced — the one real gap left by Step 0-B, and a ticket on `claude-pilot` if it is ever needed.
 
 ### Phase 0 outcome
 
@@ -118,7 +120,7 @@ Together, the layers provide defense-in-depth: Layer A prevents, Layer B detects
 
 2. **Prompt-first actions should be tool calls, not reasoning.** When a skill's first phase requires fetching external data (issue metadata, branch state), make the fetch the mandatory first action with explicit "before any reasoning" language.
 
-3. **Use `--trace` for debugging zero-artifact sessions.** Set `CLAUDE_PILOT_TRACE=1` before dispatch to get full content-block logs. The trace file lives alongside the regular log at `/var/log/claude-pilot/<task_id>.log`.
+3. **Use `--verbose` for debugging zero-artifact sessions.** `dispatch-lib` already passes it on every dispatch, so the content-block logs are in `/var/log/claude-pilot/<task_id>.log` without doing anything. (This step previously said to set `CLAUDE_PILOT_TRACE=1`; that flag never existed on the CLI side and was removed in mika#2043 — see the correction note above.)
 
 4. **Never mass-dispatch grooming tasks** until the queue-depth variable is resolved. Single-dispatch one at a time. The 2026-05-13 incident had 8 concurrent grooms in 3 minutes; 6 of 8 failed.
 
