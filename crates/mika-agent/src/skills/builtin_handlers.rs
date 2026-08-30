@@ -2596,6 +2596,283 @@ async fn validate_pr_ready_undraft_scope(
     decision
 }
 
+/// Destructive-action grounding gate (mika#1646) — refuses `gh pr close` /
+/// `gh issue close` that cannot show it is founded on the target's CURRENT
+/// state, and refuses a *repeat* close that does not acknowledge the prior one.
+///
+/// # Why this runs here and not at EndTurn
+///
+/// Its two siblings — assert-grounded (mika#1331) and equivalence-claim
+/// (mika#1645) — are EndTurn guards: they read assistant text and re-prompt.
+/// That works when the defect is a sentence. Here the defect is the call
+/// itself. `gh pr close 1644` leaves at step 3 of the tool loop; at EndTurn the
+/// PR is already closed and re-prompting can only annotate an accomplished
+/// fact. So this gate sits in `run_gh`'s pre-subprocess chain, next to
+/// mika#1196 / mika#1682 / mika#1167, and refuses before any side effect.
+///
+/// # The two layers
+///
+/// **Layer A (AC1)** — the turn must contain a read of the target
+/// (`gh pr view --json files`, `gh pr diff`, `gh issue view`, or a qa/arch read
+/// path), and the close comment must cite what that read showed. Both halves
+/// are needed: a read nobody cites is a read nobody performed, as far as the
+/// record is concerned, and the founding incident's two close comments cited
+/// nothing while paraphrasing an upstream verdict.
+///
+/// **Layer B (AC2)** — if the same close ran against the same target inside
+/// `MIKA_DEV_REPEAT_ACTION_WINDOW_SECS`, this is a *second execution*, and the
+/// comment must say so. Detection reads the persisted `tool_calls` table scoped
+/// to the agent, not to the turn or the session: the founding incident's second
+/// close came from a deferred webhook replay at 11:12:11Z — a context sharing
+/// no in-memory state with the first close at 11:08:54Z. A session-scoped check
+/// would have found nothing and let it through. This is what makes the action
+/// idempotent *by intention* rather than by luck: the second execution knows it
+/// is a second execution because the record says so, not because it happens to
+/// remember.
+///
+/// # Which way it fails
+///
+/// Detection is **fail-open**: an argv this does not recognize as a close is
+/// none of its business, so the gate never becomes a blanket refusal of `gh`.
+/// Everything after recognition is **fail-closed**: once the call IS a
+/// recognized destructive action, any inability to prove it founded — missing
+/// grounding, unreadable history, tool-call persistence disabled, DB error —
+/// yields a refusal. That inverts the deliberately fail-open policy of
+/// `assert_grounded` (see `evidence::guards`), and the inversion is the point.
+/// A ticket left open in error is visible and gets corrected; a ticket closed
+/// in error drops out of the count and nobody goes looking for it. The costs
+/// are asymmetric, so the default is too.
+///
+/// Every decision — refusal or authorization — writes an `audit_events` row
+/// (AC3) under `tool_name = "destructive_action_grounding"`.
+async fn validate_destructive_action_grounding(
+    args: &[String],
+    repo: Option<&str>,
+    ctx: &ToolContext<'_>,
+) -> Result<(), ToolOutput> {
+    use crate::evidence::guards::{
+        DESTRUCTIVE_ACTION_AUDIT_TOOL, destructive_comment_cites_evidence,
+        destructive_grounding_satisfied, destructive_repeat_acknowledged,
+        detect_destructive_action, repeat_action_window_secs,
+    };
+
+    // Fail-open detection: not a recognized close → not our business.
+    let Some(action) = detect_destructive_action(args) else {
+        return Ok(());
+    };
+
+    let target_key = action.target_key();
+    let window_secs = repeat_action_window_secs();
+
+    // Emits the AC3 audit row, then returns the refusal. Audit failures are
+    // warn-and-continue: losing the ledger row must not turn a refusal into an
+    // authorization.
+    async fn refuse(
+        ctx: &ToolContext<'_>,
+        target_key: &str,
+        block_label: &str,
+        reason: &str,
+        remedy: &str,
+    ) -> Result<(), ToolOutput> {
+        tracing::warn!(
+            event = "destructive_action_blocked",
+            agent_id = %ctx.db.agent_id(),
+            session_id = %ctx.session_id,
+            target = %target_key,
+            block = %block_label,
+            reason = %reason,
+            "refused destructive action — grounding not established (mika#1646)"
+        );
+        if let Err(e) = ctx
+            .db
+            .log_audit_event(
+                ctx.session_id,
+                DESTRUCTIVE_ACTION_AUDIT_TOOL,
+                target_key,
+                None,
+                Some(block_label),
+                Some(reason),
+                Some(ctx.trace_id),
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "failed to write destructive-action audit row");
+        }
+        let body = serde_json::json!({
+            "error": block_label,
+            "doctrine": "mika#1646",
+            "target": target_key,
+            "reason": reason,
+            "remedy": remedy,
+        });
+        Err(ToolOutput::error(body.to_string()))
+    }
+
+    // --- Layer B first: "you are repeating yourself" is the more specific and
+    // more urgent thing to say when both layers would fire. ---
+    let prior = match ctx
+        .db
+        .find_recent_destructive_actions(
+            ctx.db.agent_id(),
+            action.kind.noun(),
+            &action.number,
+            window_secs,
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            // Fail-closed: we cannot tell whether this is a repeat.
+            return refuse(
+                ctx,
+                &target_key,
+                "block[destructive_repeat_unreviewed]",
+                &format!("could not read prior-action history: {e}"),
+                "The repeat-action history is unreadable, so this close cannot be \
+                 shown to be a first execution. Surface to the operator rather \
+                 than retrying — closing on an unverifiable history is exactly \
+                 the failure this gate exists to prevent.",
+            )
+            .await;
+        }
+    };
+
+    if !prior.is_empty() {
+        let last = &prior[0];
+        if !destructive_repeat_acknowledged(action.comment.as_deref()) {
+            return refuse(
+                ctx,
+                &target_key,
+                "block[destructive_repeat_unreviewed]",
+                &format!(
+                    "same close already ran against this target at {} ({} prior call(s) within {}s)",
+                    last.created_at,
+                    prior.len(),
+                    window_secs
+                ),
+                &format!(
+                    "This is a SECOND execution, not a first. Someone may have reopened \
+                     {target_key} since {prior_at}. Read the comments posted since then \
+                     (`gh {noun} view {number} --json comments`), and if the close is still \
+                     correct, say so explicitly in --comment: name the prior close and what \
+                     the new comments contain. If a comment contradicts your rationale, do \
+                     NOT close — surface to the operator.",
+                    target_key = target_key,
+                    prior_at = last.created_at,
+                    noun = action.kind.noun(),
+                    number = action.number,
+                ),
+            )
+            .await;
+        }
+    }
+
+    // --- Layer A: grounded in the target's current state, and said so. ---
+    let turn_calls = match ctx.db.query_tool_calls_by_trace(ctx.trace_id).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            return refuse(
+                ctx,
+                &target_key,
+                "block[destructive_grounding]",
+                &format!("could not read this turn's tool calls: {e}"),
+                "The grounding record is unreadable, so this close cannot be shown \
+                 to rest on the target's current state. Surface to the operator.",
+            )
+            .await;
+        }
+    };
+
+    let grounded = destructive_grounding_satisfied(
+        &action,
+        turn_calls
+            .iter()
+            .map(|r| (r.tool_name.as_str(), r.input.as_deref().unwrap_or(""))),
+    );
+
+    if !grounded {
+        // Distinguish "read something, but not the target" from "this turn has
+        // no recorded tool calls at all" — the latter usually means tool-call
+        // persistence is off (MIKA_STORE_TOOL_CALLS=false), and reporting it as
+        // a missing read would send the agent into a loop re-reading a target
+        // whose read can never be observed.
+        let (reason, extra) = if turn_calls.is_empty() {
+            (
+                "no tool calls recorded for this turn — grounding cannot be established",
+                " NOTE: this turn has NO recorded tool calls at all. If tool-call \
+                 persistence is disabled (MIKA_STORE_TOOL_CALLS=false), this gate cannot \
+                 observe your read and will keep refusing. Surface to the operator rather \
+                 than retrying.",
+            )
+        } else {
+            ("no read of the target in this turn", "")
+        };
+        return refuse(
+            ctx,
+            &target_key,
+            "block[destructive_grounding]",
+            reason,
+            &format!(
+                "Before closing {target_key}, read its current state in this same turn \
+                 (`gh {noun} view {number} --json files` or `gh {noun} diff {number}`). \
+                 A close founded on an upstream verdict rather than on the artifact is \
+                 how mika#1646 happened: the verdict was wrong and the diff would have \
+                 said so. If the read contradicts the reason for closing, do not close.{extra}",
+                target_key = target_key,
+                noun = action.kind.noun(),
+                number = action.number,
+                extra = extra,
+            ),
+        )
+        .await;
+    }
+
+    if !destructive_comment_cites_evidence(action.comment.as_deref()) {
+        return refuse(
+            ctx,
+            &target_key,
+            "block[destructive_grounding]",
+            "close comment cites no evidence from the read",
+            "You read the target but the close comment does not say what you saw. \
+             Cite it in --comment: the file list, the diff, the overlap (or absence \
+             of overlap) that makes this close correct. A rationale nobody can check \
+             is what got replayed twice in the founding incident.",
+        )
+        .await;
+    }
+
+    // Authorized — record why (AC3: allowed actions are auditable too).
+    if let Err(e) = ctx
+        .db
+        .log_audit_event(
+            ctx.session_id,
+            DESTRUCTIVE_ACTION_AUDIT_TOOL,
+            &target_key,
+            None,
+            Some("allowed"),
+            Some(&format!(
+                "grounded in {} tool call(s) this turn; comment cites evidence; \
+                 {} prior action(s) within {}s{}; repo={}",
+                turn_calls.len(),
+                prior.len(),
+                window_secs,
+                if prior.is_empty() {
+                    ""
+                } else {
+                    " (acknowledged)"
+                },
+                repo.unwrap_or("unspecified"),
+            )),
+            Some(ctx.trace_id),
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "failed to write destructive-action audit row");
+    }
+
+    Ok(())
+}
+
 /// Execute a GitHub CLI (`gh`) command with safe argument passing.
 ///
 /// Input: `{"command": ["pr", "list", "--state", "open"], "repo": "owner/repo"}`
@@ -2619,6 +2896,16 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
     // operator-review contract that mika-dev was silently bypassing (layer-2).
     if let Err(err) =
         validate_pr_ready_undraft_scope(&gh_args.args, gh_args.repo.as_deref(), ctx).await
+    {
+        return err;
+    }
+
+    // Destructive-action grounding gate (mika#1646): refuse `gh pr close` /
+    // `gh issue close` that is not grounded in the target's current state, or
+    // that repeats a prior close without acknowledging it. Runs before any
+    // side effect — an EndTurn guard would arrive after the close landed.
+    if let Err(err) =
+        validate_destructive_action_grounding(&gh_args.args, gh_args.repo.as_deref(), ctx).await
     {
         return err;
     }
