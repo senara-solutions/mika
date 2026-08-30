@@ -1034,6 +1034,230 @@ test_groom_gate_branch_absent() {
     if [ "$rc" -ne 0 ]; then echo "PASS"; else echo "FAIL: gate fired although the dispatch branch does not exist on the remote"; fi
 }
 
+# ----------------------------------------------------------------------------
+# Issue binding in the dispatch gate (mika#2034)
+# ----------------------------------------------------------------------------
+# Cases 1–5 above all run against a fixture whose `main` carries no plan files.
+# That is precisely why they were green while the defect was live: the fixture
+# could not express the production shape, where every dispatch branch descends
+# from a `main` carrying 769 plans and therefore resolves ANY valid plan path.
+# The gate read the path out of the ticket's own callout and asked only whether
+# it resolved — an attestation produced by the claim it was meant to check.
+#
+# Measured 2026-08-30, both stranded by that gate:
+#   mika#1887 → a plan whose header reads `issue: senara-solutions/mika#1933`
+#   mika#2026 → a plan whose header reads `**Issue:** #539`
+#
+# Case 6 is the one that would have caught them.
+
+# Writes a plan file on `main` whose header claims $2, and pushes. The branch in
+# $3 is then created on top and adds NOTHING — so the plan resolves on it purely
+# by inheritance, exactly as in production.
+_fixture_foreign_plan_on_main() {
+    local plan_rel="$1" claims_issue="$2" branch="$3"
+    mkdir -p "$FIXTURE_CLONE/docs/plans"
+    {
+        printf -- '---\n'
+        printf 'issue: senara-solutions/mika#%s\n' "$claims_issue"
+        printf 'type: fix\n'
+        printf -- '---\n\n'
+        printf '# Plan — a plan belonging to another ticket\n\n'
+        printf 'Padding so the file clears any size filter. %s\n' \
+            "$(head -c 600 /dev/zero | tr '\0' 'x')"
+    } > "$FIXTURE_CLONE/$plan_rel"
+    git -C "$FIXTURE_CLONE" add "$plan_rel"
+    git -C "$FIXTURE_CLONE" commit -q -m "plan for another ticket, on main"
+    git -C "$FIXTURE_CLONE" push -q origin main
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$branch"
+    echo "code" > "$FIXTURE_CLONE/src.txt"
+    git -C "$FIXTURE_CLONE" add src.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "work, no plan of its own"
+    git -C "$FIXTURE_CLONE" push -q origin "$branch"
+}
+
+FOREIGN_PLAN_REL='docs/plans/2026-08-21-002-fix-1933-reader-completed-section-plan.md'
+FOREIGN_PLAN_BODY='## Symptom
+Some text.
+
+> - **Branch:** `feat/1887/research-peer-b`
+> - **Plan:** `docs/plans/2026-08-21-002-fix-1933-reader-completed-section-plan.md` (committed on branch @ `deadbeef`)
+'
+
+# --- Case 6 (the discriminating one): the plan the body names belongs to
+# ANOTHER ticket and the branch merely inherited it from main. The gate must NOT
+# fire — this ticket has never been groomed.
+test_groom_gate_foreign_plan_inherited_from_main() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    _fixture_foreign_plan_on_main "$FOREIGN_PLAN_REL" 1933 "feat/1887/research-peer-b"
+
+    local rc=0 err
+    err=$(_committed_plan_on_branch "$FIXTURE_CLONE" "feat/1887/research-peer-b" \
+        "$FOREIGN_PLAN_BODY" "mika" 1887 2>&1 >/dev/null) || rc=$?
+
+    _fixture_cleanup
+    if [ "$rc" -eq 0 ]; then
+        echo "FAIL: gate fired on a plan whose header claims issue 1933 while grooming 1887 — this is the mika#1887 / mika#2026 strand"
+    elif ! grep -q -- 'dispatch_gate_groom_plan_refuted' <<<"$err"; then
+        echo "FAIL: gate declined but emitted no greppable refusal diagnostic; got: $err"
+    elif ! grep -q -- '1933' <<<"$err"; then
+        echo "FAIL: refusal diagnostic does not name the issue the plan claims; got: $err"
+    else
+        echo "PASS"
+    fi
+}
+
+# --- Case 7: same file, but its header claims the TARGET issue → gate fires.
+# Without this, case 6 could be satisfied by refusing everything.
+test_groom_gate_plan_header_claims_target_issue() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    _fixture_foreign_plan_on_main "$FOREIGN_PLAN_REL" 1887 "feat/1887/research-peer-b"
+
+    local out rc=0
+    out=$(_committed_plan_on_branch "$FIXTURE_CLONE" "feat/1887/research-peer-b" \
+        "$FOREIGN_PLAN_BODY" "mika" 1887 2>/dev/null) || rc=$?
+
+    _fixture_cleanup
+    if [ "$rc" -eq 0 ] && [ "$out" = "$FOREIGN_PLAN_REL" ]; then
+        echo "PASS"
+    else
+        echo "FAIL: a plan whose header claims the target issue must still fire the gate, got rc=$rc out='$out'"
+    fi
+}
+
+# --- Case 8: the plan carries NO issue marker at all → gate still fires.
+# Refutation, not confirmation: 95 of the 745 plans in docs/plans/ name no
+# issue, and demanding a positive match would strand every one of them.
+test_groom_gate_plan_without_issue_marker_still_fires() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    mkdir -p "$FIXTURE_CLONE/docs/plans"
+    printf '# Plan — no issue marker anywhere in this header\n\nBody.\n' \
+        > "$FIXTURE_CLONE/$FOREIGN_PLAN_REL"
+    git -C "$FIXTURE_CLONE" add "$FOREIGN_PLAN_REL"
+    git -C "$FIXTURE_CLONE" commit -q -m "markerless plan on main"
+    git -C "$FIXTURE_CLONE" push -q origin main
+    git -C "$FIXTURE_CLONE" checkout -q -b feat/1887/research-peer-b
+    git -C "$FIXTURE_CLONE" push -q origin feat/1887/research-peer-b
+
+    local out rc=0
+    out=$(_committed_plan_on_branch "$FIXTURE_CLONE" "feat/1887/research-peer-b" \
+        "$FOREIGN_PLAN_BODY" "mika" 1887 2>/dev/null) || rc=$?
+
+    _fixture_cleanup
+    if [ "$rc" -eq 0 ] && [ "$out" = "$FOREIGN_PLAN_REL" ]; then
+        echo "PASS"
+    else
+        echo "FAIL: silence is not refutation — a markerless plan must still fire the gate, got rc=$rc out='$out'"
+    fi
+}
+
+# --- Case 9: the four existing call shapes keep working with no 5th argument.
+# KTD2 — the parameter is optional; a required one would break all five cases
+# above and both production call sites.
+test_groom_gate_issue_arg_is_optional() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    _fixture_foreign_plan_on_main "$FOREIGN_PLAN_REL" 1933 "feat/1887/research-peer-b"
+
+    # No 5th argument and no ambient ISSUE_NUM: the binding check is skipped
+    # rather than guessed, so the gate behaves exactly as it did before mika#2034.
+    local out rc=0
+    out=$(ISSUE_NUM='' _committed_plan_on_branch "$FIXTURE_CLONE" "feat/1887/research-peer-b" \
+        "$FOREIGN_PLAN_BODY" "mika" 2>/dev/null) || rc=$?
+
+    _fixture_cleanup
+    if [ "$rc" -eq 0 ] && [ "$out" = "$FOREIGN_PLAN_REL" ]; then
+        echo "PASS"
+    else
+        echo "FAIL: the 5th argument must be optional, got rc=$rc out='$out'"
+    fi
+}
+
+# --- Case 10: provenance is measured, not asserted. A blob identical to main's
+# is reported as inherited; one the branch actually added is reported as
+# committed. This is the sentence the operator reads.
+test_plan_provenance_distinguishes_inherited_from_committed() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    _fixture_foreign_plan_on_main "$FOREIGN_PLAN_REL" 1933 "feat/1887/research-peer-b"
+
+    # Prime the gate ref the same way _committed_plan_on_branch does.
+    git -C "$FIXTURE_CLONE" fetch --quiet --force origin \
+        "refs/heads/feat/1887/research-peer-b:refs/dispatch-gate/feat/1887/research-peer-b" 2>/dev/null
+
+    local inherited committed own_plan='docs/plans/2026-08-30-001-fix-2034-own-plan.md'
+    inherited=$(_plan_provenance "$FIXTURE_CLONE" "feat/1887/research-peer-b" "$FOREIGN_PLAN_REL")
+
+    printf -- '---\nissue: senara-solutions/mika#1887\n---\n\nOwn plan.\n' \
+        > "$FIXTURE_CLONE/$own_plan"
+    git -C "$FIXTURE_CLONE" add "$own_plan"
+    git -C "$FIXTURE_CLONE" commit -q -m "this branch's own plan"
+    git -C "$FIXTURE_CLONE" push -q origin feat/1887/research-peer-b
+    git -C "$FIXTURE_CLONE" fetch --quiet --force origin \
+        "refs/heads/feat/1887/research-peer-b:refs/dispatch-gate/feat/1887/research-peer-b" 2>/dev/null
+    committed=$(_plan_provenance "$FIXTURE_CLONE" "feat/1887/research-peer-b" "$own_plan")
+
+    _fixture_cleanup
+    if ! grep -q -- 'inherited unchanged from main' <<<"$inherited"; then
+        echo "FAIL: a blob identical to main's must be reported as inherited, got '$inherited'"
+    elif ! grep -q -- 'committed on the dispatch branch' <<<"$committed"; then
+        echo "FAIL: a blob the branch added must be reported as committed, got '$committed'"
+    else
+        echo "PASS"
+    fi
+}
+
+# --- Case 11: a callout naming a DIRECTORY must not fire the gate.
+# Written to pin the unbindable-candidate path and it found a real one instead:
+# `cat-file -e` is satisfied by a tree, and `git show` on a tree prints a
+# listing — non-empty, carrying no issue header, therefore "not refuted". A
+# ticket whose callout said `docs/plans` was refused grooming on the strength of
+# a directory. The gate now demands a blob.
+test_groom_gate_declines_on_directory_candidate() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    _fixture_foreign_plan_on_main "$FOREIGN_PLAN_REL" 1933 "feat/1887/research-peer-b"
+
+    local rc=0
+    _committed_plan_on_branch "$FIXTURE_CLONE" "feat/1887/research-peer-b" \
+        "> - **Plan:** \`docs/plans\` (committed on branch @ \`deadbeef\`)" \
+        "mika" 1887 >/dev/null 2>&1 || rc=$?
+
+    _fixture_cleanup
+    if [ "$rc" -ne 0 ]; then
+        echo "PASS"
+    else
+        echo "FAIL: a directory is not a plan — the gate must not fire on one"
+    fi
+}
+
+# Code-shape: the binding must not be quietly dropped by a later edit. The gate
+# is the only thing standing between a false body callout and a permanent
+# strand, so its call to the refutation helper is an assertion of its own.
+PLAN_GATE_SRC_2034=$(declare -f _committed_plan_on_branch)
+assert_contains "gate binds the candidate to the issue before believing it" \
+    '_plan_header_refutes_issue' "$PLAN_GATE_SRC_2034"
+assert_contains "gate names the issue the refuted plan claims" \
+    '_plan_header_claimed_issues' "$PLAN_GATE_SRC_2034"
+assert_contains "gate emits a greppable refusal diagnostic" \
+    'dispatch_gate_groom_plan_refuted' "$PLAN_GATE_SRC_2034"
+# Provenance lives outside the gate on purpose: every call site invokes the gate
+# in a command substitution, and a subshell cannot set a variable in its parent.
+assert_not_contains "gate keeps stdout to the plan path alone" \
+    'COMMITTED_PLAN_PROVENANCE=' "$PLAN_GATE_SRC_2034"
+PLAN_PROVENANCE_SRC=$(declare -f _plan_provenance)
+assert_contains "provenance compares the branch blob against main's" \
+    'origin/main:' "$PLAN_PROVENANCE_SRC"
+
 # Code-shape: the gate must use mika#988 exit semantics — _deliver_callback +
 # exit 0, never exit 1. An `exit 1` here is wrapped as HANDLER CRASH by the EXIT
 # trap and stalls the loop (7 h on 2026-05-06).
@@ -1331,7 +1555,10 @@ else
 fi
 
 # Test C: Structural — dispatch-lib uses pathspec exclusion (not bare git add -A)
-RESCUE_BLOCK=$(sed -n '/Unit 1 (mika#1282)/,/^[[:space:]]*fi$/p' "$DISPATCH_LIB" | head -120)
+# mika#2031 moved the rescue body out of _post_flight_recovery into
+# _rescue_dirty_worktree(), so the extraction anchors on the function rather than
+# on the inline `Unit 1` comment. Same assertions, same block — new address.
+RESCUE_BLOCK=$(sed -n '/^_rescue_dirty_worktree() {/,/^}$/p' "$DISPATCH_LIB")
 assert_contains "Rescue uses pathspec exclusion :!.claude/commands/" ":!.claude/commands/" "$RESCUE_BLOCK"
 assert_contains "Rescue has empty-index guard (diff --cached --quiet)" "diff --cached --quiet" "$RESCUE_BLOCK"
 assert_contains "Rescue uses RESCUED_FILES for message" 'RESCUED_FILES' "$RESCUE_BLOCK"
@@ -3224,7 +3451,13 @@ for gate_case in \
     "test_groom_gate_plan_committed|plan committed on branch → gate fires with the path" \
     "test_groom_gate_repo_prefixed_path|repo-prefixed callout resolves to relative path" \
     "test_groom_gate_no_callout|no Plan callout → gate does NOT fire" \
-    "test_groom_gate_branch_absent|branch absent from remote → gate does NOT fire"
+    "test_groom_gate_branch_absent|branch absent from remote → gate does NOT fire" \
+    "test_groom_gate_foreign_plan_inherited_from_main|mika#2034: plan claims another issue, inherited from main → gate does NOT fire" \
+    "test_groom_gate_plan_header_claims_target_issue|mika#2034: plan header claims the target issue → gate fires" \
+    "test_groom_gate_plan_without_issue_marker_still_fires|mika#2034: plan with no issue marker → gate still fires" \
+    "test_groom_gate_issue_arg_is_optional|mika#2034: the 5th argument is optional" \
+    "test_plan_provenance_distinguishes_inherited_from_committed|mika#2034: provenance separates inherited from committed" \
+    "test_groom_gate_declines_on_directory_candidate|mika#2034: callout naming a directory → gate does NOT fire"
 do
     gate_fn="${gate_case%%|*}"
     gate_label="${gate_case#*|}"
@@ -4232,6 +4465,154 @@ TRAP_ORDER=$(sed -n '/^_dispatch_lib_exit_trap() {/,/^}/p' "$DISPATCH_LIB" \
     | grep -nE '_gate_non_empty_cycle|Cancel discriminator envelope prefix' | head -1)
 assert_contains "in the EXIT trap the gate precedes the cancel prefix" \
     "_gate_non_empty_cycle" "$TRAP_ORDER"
+
+
+# --- Unknown-flag guard: dispatch-lib may only build flags claude-pilot accepts (mika#2043) ---
+#
+# Founding defect: dispatch-lib built a `--trace` flag from CLAUDE_PILOT_TRACE
+# citing mika#1097 Step 0-B, but claude-pilot never accepted `--trace` — only
+# Step 0-B's dispatch-lib half ever shipped. Measured against the installed CLI
+# with dispatch-lib's exact argv, an unknown flag is NOT swallowed by the
+# REMAINDER positional: argparse exits 2 with `unrecognized arguments` before
+# the session starts. Nothing broke only because no skill ever set the env var;
+# the first one to follow the comment's invitation would have killed every
+# dispatch of that skill.
+#
+# Two passes, and the second is what keeps the first honest:
+#   A. every flag dispatch-lib builds is in the accepted list  — hermetic, always runs
+#   B. every entry of that list is really in `claude-pilot --help` — needs the binary
+# Without B, pass A is just another unverified claim about claude-pilot's
+# interface, written once and never reconfronted with the world — which is
+# exactly the defect being closed here.
+
+echo ""
+echo "Test: claude-pilot flag-surface guard (mika#2043)"
+echo "-------------------------------------------------"
+
+# Flags accepted by claude-pilot's `_build_parser` (src/claude_pilot/cli.py).
+# Pass B below is what keeps this list from drifting into a lie.
+CP_ACCEPTED_FLAGS="--task-id --no-relay --relay-config --cwd --log-dir --command --verbose -i --interactive --max-turns --max-budget --stall-threshold --empty-threshold --idle-timeout --min-detection-turns --no-guardrails -h --help"
+
+# A flag is anchored on any non-word character, NOT just whitespace: dispatch-lib
+# writes `CWD_ARGS="--cwd $DIR"` and the dead flag was `TRACE_FLAG="--trace"`, both
+# glued to `="`. A whitespace-only anchor silently missed both — caught by running
+# the guard against a deliberately reintroduced --trace, not by reading it.
+#
+# Short flags count too: `-X` aborts argparse exactly like `--trace`. They are
+# only safe to extract AFTER quoted segments are stripped (see CP_UNQUOTED
+# below) — an earlier version scanned raw text, where `"${LOG_ID}-revise-$(date
+# +%s)"` reads as a flag named `-revise-`.
+CP_FLAG_RE='(^|[^A-Za-z0-9_-])--?[A-Za-z][A-Za-z0-9-]*'
+
+# Every capture below ends in `|| true`: the suite runs under `set -euo pipefail`,
+# where a grep that matches nothing kills the whole run. Measured — breaking the
+# invocation pattern on purpose ended the suite mid-section with no summary and
+# no failure. A guard that vanishes when its subject changes shape is worse than
+# no guard: the run goes quiet exactly when it should be shouting. The
+# site-count assertion below is what turns an empty capture into a failure.
+
+# Join backslash continuations (the revise-pilot invocation spans four lines),
+# then drop comment lines (the mika#2043 comment names --trace on purpose, as a
+# warning).
+CP_JOINED=$(awk '
+    { line = line $0 }
+    /\\$/ { sub(/\\$/, " ", line); next }
+    { print line; line = "" }
+' "$DISPATCH_LIB" | grep -v '^[[:space:]]*#' || true)
+
+# Anchor on the launcher, NOT on the shape of the argv. Anchoring on
+# `claude-pilot -...` looked equivalent and was not: moving $CWD_ARGS ahead of
+# the first literal flag — an unremarkable reordering — dropped the main
+# dispatch invocation out of the guard's sight entirely, silently, while all
+# three assertions stayed green (measured). Every real launch goes through
+# `_run_pilot_sandboxed`, plus the venv smoke test; that is the chokepoint.
+CP_INVOCATIONS=$(printf '%s\n' "$CP_JOINED" \
+    | grep -E '^[[:space:]]*(_run_pilot_sandboxed[[:space:]]+claude-pilot|(if ! )?timeout[[:space:]]+[0-9]+[[:space:]]+claude-pilot)([[:space:]]|$)' || true)
+
+# Quoted segments carry payload, not argv words: `ENTRY_COMMAND="/mika"` and the
+# prompt text cannot word-split into flags. Scanning them made the guard accuse
+# claude-pilot of `--no-verify` when the inner slash-command grew an argument
+# (measured). Only unquoted interpolation can inject a flag, so strip quotes
+# before looking for either flags or variables.
+CP_UNQUOTED=$(printf '%s\n' "$CP_INVOCATIONS" | sed -E 's/"[^"]*"//g; s/'"'"'[^'"'"']*'"'"'//g' || true)
+
+# Literal flags on those lines.
+CP_LITERAL_FLAGS=$(printf '%s\n' "$CP_UNQUOTED" | grep -oE -- "$CP_FLAG_RE" | sed -E 's/^[^-]*//' | sort -u || true)
+
+# Flags reaching the CLI through an interpolated variable. This half is not
+# optional: $TRACE_FLAG is exactly how the dead flag got in, and a guard reading
+# only literals would have missed it. The assignment pattern is anchored on a
+# word boundary rather than start-of-line, so `export`/`declare`/`readonly`, a
+# mid-line `[ cond ] && VAR=--flag`, and `VAR+=` are all covered — the one-line
+# conditional being the most natural rewrite of the five lines just deleted, and
+# invisible to a start-of-line anchor (measured).
+CP_VARS=$(printf '%s\n' "$CP_UNQUOTED" | grep -oE '\$\{?[A-Za-z_][A-Za-z0-9_]*\}?' | tr -d '${}' | sort -u || true)
+CP_VAR_FLAGS=""
+for v in $CP_VARS; do
+    _assigns=$(grep -E "(^|[^A-Za-z0-9_-])${v}\+?=" "$DISPATCH_LIB" || true)
+    _found=$(printf '%s\n' "$_assigns" | grep -oE -- "$CP_FLAG_RE" | sed -E 's/^[^-]*//' || true)
+    [ -n "$_found" ] && CP_VAR_FLAGS="$CP_VAR_FLAGS $_found"
+done
+CP_VAR_FLAGS=$(printf '%s\n' $CP_VAR_FLAGS | sort -u || true)
+
+# `--` is the prompt separator, not a flag.
+CP_BUILT_FLAGS=$(printf '%s\n%s\n' "$CP_LITERAL_FLAGS" "$CP_VAR_FLAGS" | grep -vE '^(--)?$' | sort -u || true)
+
+# Known limit, stated rather than coded around: one level of indirection
+# (`A="--trace"; B="$A"`) and a composed flag (`F="--$name"`) both slip through.
+# Closing them would mean evaluating shell, which changes what this guard is.
+
+# Count SITES, not flags. A flag floor cannot notice a lost invocation — the
+# surviving one carries seven flags on its own, so the total never drops
+# (measured). Pinning the site count means a renamed, reordered, or added
+# launch point turns red instead of evaporating.
+CP_SITE_COUNT=$(printf '%s\n' "$CP_INVOCATIONS" | grep -c . || true)
+if [ "$CP_SITE_COUNT" -eq 3 ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ all 3 claude-pilot launch sites are in the guard's sight"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ expected 3 claude-pilot launch sites, saw $CP_SITE_COUNT"
+    echo "    A site the guard cannot see is a site it cannot police. If a launch"
+    echo "    point was legitimately added or removed, update this count."
+fi
+
+# --- Pass A: every built flag is accepted (hermetic) ---
+CP_UNKNOWN=""
+for f in $CP_BUILT_FLAGS; do
+    case " $CP_ACCEPTED_FLAGS " in
+        *" $f "*) ;;
+        *) CP_UNKNOWN="$CP_UNKNOWN $f" ;;
+    esac
+done
+if [ -z "$CP_UNKNOWN" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ every flag dispatch-lib builds is accepted by claude-pilot"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ dispatch-lib builds flag(s) claude-pilot does not accept:$CP_UNKNOWN"
+    echo "    claude-pilot exits 2 on an unrecognized argument, before the session starts."
+    echo "    Either the flag is wrong, or claude-pilot gained it and this list is stale."
+fi
+
+# --- Pass B: the accepted list is not stale (needs the binary) ---
+if command -v claude-pilot >/dev/null 2>&1 && CP_HELP=$(timeout 20 claude-pilot --help 2>&1); then
+    CP_MISSING=""
+    for f in $CP_ACCEPTED_FLAGS; do
+        grep -qE -- "(^|[^A-Za-z0-9-])${f}([^A-Za-z0-9-]|$)" <<<"$CP_HELP" || CP_MISSING="$CP_MISSING $f"
+    done
+    if [ -z "$CP_MISSING" ]; then
+        PASS=$((PASS + 1))
+        echo "  ✓ the accepted-flag list matches the installed claude-pilot --help"
+    else
+        FAIL=$((FAIL + 1))
+        echo "  ✗ accepted-flag list is stale — not in claude-pilot --help:$CP_MISSING"
+        echo "    Pass A is now asserting against a list the CLI does not back."
+    fi
+else
+    echo "  - skipped: claude-pilot not runnable here, cannot confirm the accepted-flag list"
+    echo "    (pass A still ran; only the freshness check of the list is skipped)"
+fi
 
 # --- Summary ---
 

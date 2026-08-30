@@ -391,14 +391,13 @@ fn convert_mcp_result(result: &rmcp::model::CallToolResult, tool_name: &str) -> 
         }
     }
 
-    // Truncate text output (char-boundary-safe)
+    // Truncate text output to a byte budget, floored to a char boundary
+    // (mika#2103 — one canonical implementation, not a local re-derivation).
     if text.len() > MAX_OUTPUT_LEN {
-        let mut boundary = MAX_OUTPUT_LEN;
-        while boundary > 0 && !text.is_char_boundary(boundary) {
-            boundary -= 1;
-        }
-        text.truncate(boundary);
-        text.push_str("\n... (truncated at 10000 chars)");
+        text = format!(
+            "{}\n... (truncated at {MAX_OUTPUT_LEN} bytes)",
+            mika_common::text::safe_truncate(&text, MAX_OUTPUT_LEN)
+        );
     }
 
     if text.is_empty() && images.is_empty() {

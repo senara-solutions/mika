@@ -261,9 +261,17 @@ pub fn parse_time_expr(input: &str) -> Result<String> {
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
     }
 
-    // Try Nm, Nh, Nd patterns
-    if input.len() >= 2 {
-        let (num_part, suffix) = input.split_at(input.len() - 1);
+    // Try Nm, Nh, Nd patterns.
+    //
+    // mika#2103: split on the last *character*, not the last byte —
+    // `split_at(input.len() - 1)` panics whenever the trailing character is
+    // multi-byte, and `input` here is an unvalidated CLI argument. A
+    // non-ASCII suffix must fall through to the "Unknown time expression"
+    // error below, not abort the process.
+    if let Some(last) = input.chars().next_back()
+        && input.len() > last.len_utf8()
+    {
+        let (num_part, suffix) = input.split_at(input.len() - last.len_utf8()); // safe-byte-slice: len() - last char's UTF-8 width is exactly that char's start offset, always a boundary
         if let Ok(n) = num_part.parse::<i64>() {
             let duration = match suffix {
                 "m" => chrono::Duration::minutes(n),
@@ -497,7 +505,7 @@ pub async fn run_activity(args: &LogsActivityArgs, agent_name: &str) -> Result<(
     events.sort_by(|a, b| a.timestamp().cmp(b.timestamp()));
 
     // Truncate to --limit
-    events.truncate(args.limit);
+    events.truncate(args.limit); // safe-byte-slice: Vec<LogEvent> — element count, no char boundary
 
     // Render
     match args.format {
@@ -642,6 +650,41 @@ fn truncate_content(content: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── mika#2103: parse_time_expr splits on chars, not bytes ─────────────
+
+    /// The exact panic shape: a trailing multi-byte character made
+    /// `split_at(input.len() - 1)` cut inside it. `input` is an unvalidated
+    /// CLI argument (`mika logs --since ...`), so this was reachable from
+    /// the command line.
+    #[test]
+    fn test_parse_time_expr_multibyte_suffix_errors_not_panics() {
+        // 'é' is 2 bytes; byte len()-1 is its second byte.
+        let err = parse_time_expr("30\u{e9}").unwrap_err();
+        assert!(
+            err.to_string().contains("Unknown time expression"),
+            "expected the existing parse error, got: {err}"
+        );
+    }
+
+    /// A single multi-byte character: `len() >= 2` in bytes but one char.
+    /// The old guard let this through to `split_at(1)` — mid-character.
+    #[test]
+    fn test_parse_time_expr_lone_multibyte_char_errors_not_panics() {
+        assert!(parse_time_expr("\u{e9}").is_err());
+        assert!(parse_time_expr("\u{1F600}").is_err());
+    }
+
+    /// Anti-vacuity dual — the fix must not break the ASCII forms it guards.
+    #[test]
+    fn test_parse_time_expr_ascii_forms_still_parse() {
+        for expr in ["30m", "2h", "1d", "120m"] {
+            assert!(
+                parse_time_expr(expr).is_ok(),
+                "{expr} should still parse after the mika#2103 fix"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_time_expr_minutes() {
