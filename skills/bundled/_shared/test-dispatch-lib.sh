@@ -1100,9 +1100,9 @@ test_groom_gate_foreign_plan_inherited_from_main() {
     _fixture_cleanup
     if [ "$rc" -eq 0 ]; then
         echo "FAIL: gate fired on a plan whose header claims issue 1933 while grooming 1887 — this is the mika#1887 / mika#2026 strand"
-    elif ! printf '%s' "$err" | grep -q 'dispatch_gate_groom_plan_refuted'; then
+    elif ! grep -q -- 'dispatch_gate_groom_plan_refuted' <<<"$err"; then
         echo "FAIL: gate declined but emitted no greppable refusal diagnostic; got: $err"
-    elif ! printf '%s' "$err" | grep -q '1933'; then
+    elif ! grep -q -- '1933' <<<"$err"; then
         echo "FAIL: refusal diagnostic does not name the issue the plan claims; got: $err"
     else
         echo "PASS"
@@ -1206,9 +1206,9 @@ test_plan_provenance_distinguishes_inherited_from_committed() {
     committed=$(_plan_provenance "$FIXTURE_CLONE" "feat/1887/research-peer-b" "$own_plan")
 
     _fixture_cleanup
-    if ! printf '%s' "$inherited" | grep -q 'inherited unchanged from main'; then
+    if ! grep -q -- 'inherited unchanged from main' <<<"$inherited"; then
         echo "FAIL: a blob identical to main's must be reported as inherited, got '$inherited'"
-    elif ! printf '%s' "$committed" | grep -q 'committed on the dispatch branch'; then
+    elif ! grep -q -- 'committed on the dispatch branch' <<<"$committed"; then
         echo "FAIL: a blob the branch added must be reported as committed, got '$committed'"
     else
         echo "PASS"
