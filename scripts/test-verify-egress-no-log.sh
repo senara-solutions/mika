@@ -51,7 +51,12 @@ assert_exit() {
 
 assert_mentions() {
     local label="$1" needle="$2" result="$3"
-    if printf '%s' "${result#*|}" | grep -q -- "$needle"; then
+    # Herestring, NOT `printf … | grep -q`: under `pipefail` the pipe form is a
+    # SIGPIPE trap (grep -q exits at the first match, printf takes 141, pipefail
+    # promotes it, and a PRESENT needle reads as absent). This is the exact
+    # shape the compound doc for this work argues is owed a lint; the guard's
+    # own header preaches the same, so the test honours it.
+    if grep -q -- "$needle" <<< "${result#*|}"; then
         PASS=$((PASS + 1)); echo "  ok $label"
     else
         FAIL=$((FAIL + 1)); echo "  XX $label -- output does not mention '$needle'"
