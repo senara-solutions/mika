@@ -1063,6 +1063,41 @@ _committed_plan_on_branch() {
     return 1
 }
 
+# --- Dispatchable-repo allowlist: shell defense in depth (mika#2062) ---
+#
+# Shell mirror of DISPATCHABLE_REPOS in
+# crates/mika-agent/src/webhook_dispatch.rs. That Rust constant plus the
+# tool-boundary guard in crates/mika-agent/src/skills/executor.rs (mika#2046)
+# are the load-bearing layer: on the nominal loop path a non-allowlisted repo is
+# refused before run_claude_pilot ever runs, so _set_up_worktree is not reached
+# there. But dispatch-lib.sh is ALSO invoked outside the engine — manual runs,
+# scripts, recovery paths — none of which pass through that Rust guard. This is
+# the shell layer for those callers: it fails closed on any non-allowlisted repo
+# (mika#2046 KTD5, deliberately deferred out of #2046's Rust suite).
+#
+# The list is duplicated across two languages by necessity: the Rust side is a
+# compile-time `&[&str]`, not a runtime-readable data file the shell could
+# source. test-dispatch-lib.sh parses the Rust source and FAILS if the two lists
+# diverge — two mute copies are exactly the drift webhook_dispatch.rs exists to
+# prevent (mika#1053 doctrine).
+#
+# Bare basenames only: _set_up_worktree strips any owner/ prefix and hardcodes
+# the senara-solutions owner on every gh call, so the owner is never
+# caller-controlled at the point this is checked.
+DISPATCHABLE_REPO_BASENAMES=(mika mika-cloud mika-skills mika-platform)
+
+# _is_dispatchable_repo <repo> — return 0 if <repo> is an allowlisted basename,
+# 1 otherwise. Pure predicate: no output, no exit; the caller decides how to
+# fail so the same check is reusable from tests without side effects.
+_is_dispatchable_repo() {
+    local candidate="$1" repo
+    [ -n "$candidate" ] || return 1
+    for repo in "${DISPATCHABLE_REPO_BASENAMES[@]}"; do
+        [ "$candidate" = "$repo" ] && return 0
+    done
+    return 1
+}
+
 _set_up_worktree() {
     # --- Parse repo#number format ---
     # Matches: mika#214, mika-skills#8, mika-cloud#50, and an optional owner/
@@ -1082,6 +1117,20 @@ _set_up_worktree() {
     if [ -n "$REPO" ] && [ -n "$ISSUE_NUM" ]; then
         # --- repo#number mode: derive everything from the issue ---
         LOG_ID="$TASK_ID"
+
+        # Defense-in-depth allowlist gate (mika#2062, follow-up of #2046).
+        # Runs BEFORE SUB_REPO_DIR is resolved: the bare `.git` presence test
+        # below would otherwise wave through any co-located checkout (e.g.
+        # control-monitor, claude-pilot — spawn-CC-only per the 2026-08-29
+        # operator decision), since those repos exist in the same workspace.
+        # Fail closed, loudly and named, with the repo in a machine-readable
+        # field, mirroring `repo_not_dispatchable` on the Rust side. This is a
+        # structural gate, not a transient failure — retrying will not clear it.
+        if ! _is_dispatchable_repo "$REPO"; then
+            echo "Error: repo_not_dispatchable — 'senara-solutions/${REPO}' is not a repository the autonomous loop may dispatch into. Dispatchable: ${DISPATCHABLE_REPO_BASENAMES[*]}. This is a structural gate (mika#2046/#2062), not a transient failure; retrying will not clear it." >&2
+            printf '{"error":"repo_not_dispatchable","repo":"senara-solutions/%s","reason":"repository outside the dispatch allowlist"}\n' "$REPO" >&2
+            exit 1
+        fi
 
         # Validate repo directory exists (mika-platform itself IS PLATFORM_DIR)
         if [ "$REPO" = "$PLATFORM_REPO_NAME" ]; then
