@@ -27,7 +27,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 50;
+pub const CURRENT_SCHEMA_VERSION: i64 = 51;
 
 /// `(target_key, before_value, after_value, reasoning)` — return shape for
 /// [`Database::get_audit_event_rows_by_tool_name`] and its async wrapper.
@@ -124,6 +124,70 @@ pub fn default_self_model(display_name: &str) -> String {
 }
 
 // ===== Public Types =====
+
+/// The dispatch that currently holds an exec-slot, as reported by
+/// [`Database::has_active_callback_tasks_excluding`] (mika#1948).
+///
+/// Replaces the previous bare `(String, String, String)` tuple. The fourth
+/// field is the reason for the change: a rejection that cannot name WHICH
+/// dispatcher holds the slot leaves an operator guessing at a throughput
+/// bottleneck.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockingDispatch {
+    /// The task whose dispatch occupies the slot.
+    pub parent_task_id: String,
+    /// The active callback child that makes the occupancy observable.
+    pub callback_task_id: String,
+    /// That callback's label — also how `blocker_kind` is derived (mika#1172).
+    pub label: String,
+    /// Which dispatcher initiated the blocking task. `None` for a row written
+    /// before the column existed (pre-v51): genuinely unknown, and deliberately
+    /// not defaulted here. See mika#1948.
+    pub dispatcher_source: Option<String>,
+}
+
+/// Outcome of an atomic exec-slot claim (mika#1948).
+///
+/// See [`Database::try_acquire_dispatch_slot`] for why claiming — rather than
+/// checking — is what makes the arbitration real.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotClaim {
+    /// The caller now holds the slot and may dispatch.
+    Acquired,
+    /// Another live lease holds the slot. The caller must not dispatch.
+    Held {
+        holder_task_id: String,
+        dispatcher_source: Option<String>,
+        expires_at: String,
+    },
+}
+
+impl SlotClaim {
+    /// Whether the claim succeeded.
+    pub fn acquired(&self) -> bool {
+        matches!(self, SlotClaim::Acquired)
+    }
+}
+
+/// Default lifetime of an exec-slot lease, in seconds (mika#1948).
+///
+/// Sized to comfortably cover the window it guards — validation completing to
+/// the callback row existing, i.e. a process spawn — while staying far below
+/// the duration of a real dispatch, so a lease can never outlive its work and
+/// block a slot that has legitimately freed. Overridable via
+/// `MIKA_DISPATCH_SLOT_LEASE_TTL_SECS` for operational tuning.
+pub const DISPATCH_SLOT_LEASE_TTL_SECS: i64 = 120;
+
+/// Effective lease TTL, honouring the env override. Falls back to the default
+/// on an unset, unparseable, or non-positive value — a zero or negative TTL
+/// would make every lease born expired, disabling the guard silently.
+pub fn dispatch_slot_lease_ttl_secs() -> i64 {
+    std::env::var("MIKA_DISPATCH_SLOT_LEASE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DISPATCH_SLOT_LEASE_TTL_SECS)
+}
 
 #[derive(Debug, Clone)]
 pub struct AgentRow {
@@ -1136,6 +1200,11 @@ impl Database {
             info!(version = 50, "database migrated to v50");
         }
 
+        if (3..=50).contains(&version) {
+            self.migrate_v50_to_v51()?;
+            info!(version = 51, "database migrated to v51");
+        }
+
         Ok(())
     }
 
@@ -1190,7 +1259,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (50);
+            INSERT INTO schema_version (version) VALUES (51);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -1286,6 +1355,12 @@ impl Database {
                 dispatch_class TEXT CHECK (
                     dispatch_class IS NULL OR dispatch_class IN ('implement', 'groom')
                 ),
+                -- mika#1948 Porte 2: which dispatcher inside this engine
+                -- initiated the task. NULL = pre-v51 row, read as 'mika_dev'.
+                dispatcher_source TEXT CHECK (
+                    dispatcher_source IS NULL
+                    OR dispatcher_source IN ('mika_dev', 'mika_manager', 'operator')
+                ),
                 created_by_session TEXT,
                 created_trace_id TEXT,
                 execution_trace_id TEXT,
@@ -1295,6 +1370,25 @@ impl Database {
                 completed_at TEXT
             );
             CREATE INDEX idx_tasks_agent_status ON tasks(agent_id, status);
+            CREATE INDEX idx_tasks_dispatcher_source
+                ON tasks(agent_id, dispatcher_source, status)
+                WHERE dispatcher_source IS NOT NULL;
+
+            -- mika#1948 Porte 2 — one row per (agent, class) = one exec slot.
+            -- The PRIMARY KEY is what makes the claim atomic: a second
+            -- claimant's INSERT collides instead of racing a SELECT.
+            CREATE TABLE dispatch_slot_leases (
+                agent_id TEXT NOT NULL,
+                dispatch_class TEXT NOT NULL,
+                holder_task_id TEXT NOT NULL,
+                dispatcher_source TEXT CHECK (
+                    dispatcher_source IS NULL
+                    OR dispatcher_source IN ('mika_dev', 'mika_manager', 'operator')
+                ),
+                acquired_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                PRIMARY KEY (agent_id, dispatch_class)
+            );
             CREATE INDEX idx_tasks_next_fire ON tasks(next_fire_at)
                 WHERE status IN ('pending','recurring_active');
             CREATE INDEX idx_tasks_schedulable
@@ -4685,6 +4779,103 @@ impl Database {
         Ok(())
     }
 
+    /// v50 → v51 (mika#1948, Porte 2) — three-dispatcher exec-slot arbitration.
+    ///
+    /// Two additions, one axis each:
+    ///
+    /// 1. `tasks.dispatcher_source` — WHICH dispatcher inside this engine
+    ///    initiated a task (`mika_dev` | `mika_manager` | `operator`). Nullable:
+    ///    pre-v51 rows are all mika-dev by definition (the autonomous loop was
+    ///    the only dispatcher), so NULL is an unambiguous "pre-v51, therefore
+    ///    mika_dev" sentinel read through `COALESCE(dispatcher_source,
+    ///    'mika_dev')`. That keeps the migration O(1) instead of rewriting every
+    ///    existing row, and preserves the forensic distinction between "pre-v51
+    ///    row" and "post-v51 row explicitly written by mika-dev".
+    ///
+    /// 2. `dispatch_slot_leases` — makes an assigned exec slot an OBSERVABLE
+    ///    FACT rather than a convention. See `try_acquire_dispatch_slot` for the
+    ///    full reasoning; the short version is that
+    ///    `has_active_callback_tasks_excluding` only ever *checked* the slot, and
+    ///    the row that makes it held is written seconds later, so two dispatchers
+    ///    could both read "free" and both proceed.
+    ///
+    /// NOTE: this is a DIFFERENT axis from the `dispatch:*` seat label (mika#2084,
+    /// `webhook_dispatch::CURRENT_DISPATCH_SEAT`). The seat says which *engine*
+    /// owns a TICKET and is carried on the GitHub issue; `dispatcher_source` says
+    /// which *role inside this engine* initiated a TASK. The seat gate refuses a
+    /// ticket that belongs to another engine; this arbitrates the exec slot among
+    /// the dispatchers of one engine. Neither subsumes the other, and they are
+    /// deliberately not merged into one column.
+    fn migrate_v50_to_v51(&mut self) -> Result<()> {
+        let version = self.schema_version()?;
+        if version >= 51 {
+            return Ok(());
+        }
+        // Fail fast on an unexpected baseline. The idempotency guard above
+        // already returned for >=51, so reaching here with anything but v50
+        // means the migration-order assumption is broken — applying anyway
+        // would corrupt the chain silently.
+        if version != 50 {
+            anyhow::bail!(
+                "migrate_v50_to_v51 called with unexpected baseline version {version} \
+                 (expected 50) — refusing to apply migration; investigate migration order"
+            );
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        // The column may already exist if a previous run was interrupted
+        // between the ALTER and the version bump; PRAGMA-detect, do not assume.
+        let has_col: bool = {
+            let mut stmt = tx.prepare("PRAGMA table_info(tasks)")?;
+            let names: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .collect();
+            names.iter().any(|n| n == "dispatcher_source")
+        };
+        if !has_col {
+            tx.execute_batch(
+                "ALTER TABLE tasks ADD COLUMN dispatcher_source TEXT CHECK (
+                     dispatcher_source IS NULL
+                     OR dispatcher_source IN ('mika_dev', 'mika_manager', 'operator')
+                 );",
+            )?;
+        }
+
+        tx.execute_batch(
+            "-- v51: mika#1948 Porte 2 — 3-dispatcher exec-slot arbitration.
+             CREATE INDEX IF NOT EXISTS idx_tasks_dispatcher_source
+                 ON tasks(agent_id, dispatcher_source, status)
+                 WHERE dispatcher_source IS NOT NULL;
+
+             -- One row per (agent, class) = one exec slot. The PRIMARY KEY is
+             -- what makes the claim atomic: a second claimant's INSERT collides
+             -- instead of racing a SELECT.
+             CREATE TABLE IF NOT EXISTS dispatch_slot_leases (
+                 agent_id TEXT NOT NULL,
+                 dispatch_class TEXT NOT NULL,
+                 holder_task_id TEXT NOT NULL,
+                 dispatcher_source TEXT CHECK (
+                     dispatcher_source IS NULL
+                     OR dispatcher_source IN ('mika_dev', 'mika_manager', 'operator')
+                 ),
+                 acquired_at TEXT NOT NULL,
+                 expires_at TEXT NOT NULL,
+                 PRIMARY KEY (agent_id, dispatch_class)
+             );",
+        )?;
+
+        tx.execute("INSERT INTO schema_version (version) VALUES (51)", [])?;
+        tx.commit()?;
+
+        info!("v50→v51: added tasks.dispatcher_source + dispatch_slot_leases (mika#1948 Porte 2)");
+
+        Ok(())
+    }
+
     /// Insert a permission-decision provenance record (mika#1733 AC4). All
     /// fields correspond 1:1 to the v44 schema columns. `override_used` is
     /// derived by the caller and asserted at the CHECK constraint here as
@@ -5756,6 +5947,7 @@ impl Database {
             metadata: r.get(28)?,
             r#type: r.get(29)?,
             dispatch_class: r.get(30)?,
+            dispatcher_source: r.get(31)?,
         })
     }
 
@@ -5764,7 +5956,7 @@ impl Database {
          next_fire_at, timeout_at, action_type, action_config,
          status, process_id, input_context, result, created_by_session,
          created_trace_id, execution_trace_id, created_at, updated_at, fired_at, completed_at,
-         reference_url, source, metadata, type, dispatch_class";
+         reference_url, source, metadata, type, dispatch_class, dispatcher_source";
 
     pub fn get_task(&self, id: &str, agent_id: &str) -> Result<Option<Task>> {
         let sql = format!(
@@ -6093,7 +6285,8 @@ impl Database {
     }
 
     /// Number of columns in TASK_COLUMNS (used for child_count ordinal in list_manual_tasks).
-    const TASK_COLUMN_COUNT: usize = 31;
+    /// Bumped to 32 in mika#1948 for `dispatcher_source`.
+    const TASK_COLUMN_COUNT: usize = 32;
 
     /// List manual (task) tasks for an agent with optional filters.
     /// Uses parameterized NULL checks to avoid dynamic SQL construction.
@@ -7588,24 +7781,220 @@ impl Database {
         excluded_parent_id: &str,
         agent_id: &str,
         dispatch_class: &str,
-    ) -> Result<Option<(String, String, String)>> {
+    ) -> Result<Option<BlockingDispatch>> {
         let mut stmt = self.conn.prepare(
-            "SELECT parent_task_id, id, label FROM tasks
-             WHERE trigger_type = 'callback'
-               AND status IN ('pending', 'in_progress')
-               AND parent_task_id IS NOT NULL
-               AND parent_task_id != ?1
-               AND agent_id = ?2
-               AND COALESCE(dispatch_class, 'implement') = ?3
-               AND label NOT LIKE '%:deferred'
+            // mika#1948: the blocking row's `dispatcher_source` rides along so a
+            // rejection can name WHO holds the slot, not just that it is held.
+            // Deliberately NOT wrapped in COALESCE here — the on-disk NULL of a
+            // pre-v51 row is a real distinction ("unknown, predates the column")
+            // and collapsing it to 'mika_dev' at this depth would manufacture a
+            // certainty the row does not carry. Callers that need a default
+            // apply it themselves.
+            "SELECT t.parent_task_id, t.id, t.label, p.dispatcher_source
+             FROM tasks t
+             LEFT JOIN tasks p ON p.id = t.parent_task_id
+             WHERE t.trigger_type = 'callback'
+               AND t.status IN ('pending', 'in_progress')
+               AND t.parent_task_id IS NOT NULL
+               AND t.parent_task_id != ?1
+               AND t.agent_id = ?2
+               AND COALESCE(t.dispatch_class, 'implement') = ?3
+               AND t.label NOT LIKE '%:deferred'
              LIMIT 1",
         )?;
         let mut rows = stmt.query(params![excluded_parent_id, agent_id, dispatch_class])?;
         if let Some(row) = rows.next()? {
-            Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?)))
+            Ok(Some(BlockingDispatch {
+                parent_task_id: row.get(0)?,
+                callback_task_id: row.get(1)?,
+                label: row.get(2)?,
+                dispatcher_source: row.get(3)?,
+            }))
         } else {
             Ok(None)
         }
+    }
+
+    /// Whether an operator-sourced task is waiting to run in this dispatch class
+    /// (mika#1948 AC3).
+    ///
+    /// Backs the operator-priority rule in `promote_pending_deferred_if_idle`:
+    /// when the operator has drafted work in a class, an automatic
+    /// deferred-wrapper promotion must not take the slot out from under it.
+    /// Scoped to `pending` — an operator task that is already `in_progress`
+    /// holds the slot through the ordinary active-callback check instead.
+    pub fn has_pending_operator_task_for_class(
+        &self,
+        agent_id: &str,
+        dispatch_class: &str,
+    ) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks
+             WHERE agent_id = ?1
+               AND status = 'pending'
+               AND dispatcher_source = 'operator'
+               AND COALESCE(dispatch_class, 'implement') = ?2",
+            params![agent_id, dispatch_class],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Atomically claim the exec slot for `(agent_id, dispatch_class)`
+    /// (mika#1948 — Porte 2).
+    ///
+    /// # Why a lease exists at all
+    ///
+    /// `has_active_callback_tasks_excluding` only ever *checked* the slot. It is
+    /// a bare SELECT, and on `None` the dispatch path simply proceeds — the row
+    /// that makes the slot observably held (the callback task) is written much
+    /// later, by the caller. In between, `validate_dispatch_readiness` performs
+    /// several GitHub round-trips (issue body, open-PR check, grooming markers),
+    /// each with a 10s timeout. So the gap between "the slot looked free" and
+    /// "the slot is held" is measured in seconds, and there are four production
+    /// entry points into that function.
+    ///
+    /// Two dispatchers could therefore both read "free" and both proceed. A slot
+    /// that two claimants can simultaneously believe they hold is not
+    /// arbitration — it is a convention. This makes the claim a FACT: the
+    /// PRIMARY KEY on `(agent_id, dispatch_class)` means a second claimant's
+    /// INSERT collides rather than races.
+    ///
+    /// # Semantics
+    ///
+    /// One statement, inside an IMMEDIATE transaction. The lease is taken when
+    /// no row exists, when the existing row has expired, or when the caller is
+    /// re-entering with its own `holder_task_id` (a retry refreshes its own
+    /// lease instead of deadlocking against itself). Otherwise the current
+    /// holder is returned and the caller must not dispatch.
+    ///
+    /// # On the TTL, and why it is short
+    ///
+    /// The lease guards one narrow window: from the moment validation completes
+    /// to the moment the callback row exists. That is a process spawn — seconds.
+    /// The TTL must exceed that, and must stay far below the duration of a real
+    /// dispatch (minutes), so that a lease can never outlive the work it
+    /// guarded and block a slot that has legitimately freed. Once the callback
+    /// row exists, the ordinary active-callback check is the durable holder and
+    /// the lease is redundant; letting it lapse is the intended end of life.
+    ///
+    /// Expiry is what keeps this fail-closed without being loop-breaking: a
+    /// dispatcher that dies mid-claim stalls its class for at most one TTL
+    /// rather than forever.
+    pub fn try_acquire_dispatch_slot(
+        &mut self,
+        agent_id: &str,
+        dispatch_class: &str,
+        holder_task_id: &str,
+        dispatcher_source: Option<&str>,
+        ttl_secs: i64,
+    ) -> Result<SlotClaim> {
+        let now = Utc::now();
+        let now_s = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let expires_s = (now + Duration::seconds(ttl_secs))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let changed = tx.execute(
+            "INSERT INTO dispatch_slot_leases
+                 (agent_id, dispatch_class, holder_task_id, dispatcher_source,
+                  acquired_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(agent_id, dispatch_class) DO UPDATE SET
+                 holder_task_id    = excluded.holder_task_id,
+                 dispatcher_source = excluded.dispatcher_source,
+                 acquired_at       = excluded.acquired_at,
+                 expires_at        = excluded.expires_at
+             WHERE dispatch_slot_leases.expires_at <= ?5
+                OR dispatch_slot_leases.holder_task_id = ?3",
+            params![
+                agent_id,
+                dispatch_class,
+                holder_task_id,
+                dispatcher_source,
+                now_s,
+                expires_s
+            ],
+        )?;
+
+        if changed > 0 {
+            tx.commit()?;
+            return Ok(SlotClaim::Acquired);
+        }
+
+        // The claim collided with a live lease. Read the holder inside the same
+        // transaction so the reported blocker is the one we actually lost to.
+        let held = tx
+            .query_row(
+                "SELECT holder_task_id, dispatcher_source, expires_at
+                 FROM dispatch_slot_leases
+                 WHERE agent_id = ?1 AND dispatch_class = ?2",
+                params![agent_id, dispatch_class],
+                |row| {
+                    Ok(SlotClaim::Held {
+                        holder_task_id: row.get(0)?,
+                        dispatcher_source: row.get(1)?,
+                        expires_at: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        tx.commit()?;
+
+        // A row that vanished between the failed INSERT and this SELECT cannot
+        // happen inside one IMMEDIATE transaction, but the query is fallible in
+        // principle. Report contention rather than inventing a free slot —
+        // fail-closed is the whole point of the lease.
+        Ok(held.unwrap_or(SlotClaim::Held {
+            holder_task_id: "<unknown>".to_string(),
+            dispatcher_source: None,
+            expires_at: expires_s,
+        }))
+    }
+
+    /// Release a slot lease, but only if `holder_task_id` still owns it
+    /// (mika#1948).
+    ///
+    /// The holder predicate matters: without it, a late release from a
+    /// dispatcher whose lease already expired and was re-taken by someone else
+    /// would free a slot it no longer owns. Returns whether a row was removed.
+    pub fn release_dispatch_slot(
+        &self,
+        agent_id: &str,
+        dispatch_class: &str,
+        holder_task_id: &str,
+    ) -> Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM dispatch_slot_leases
+             WHERE agent_id = ?1 AND dispatch_class = ?2 AND holder_task_id = ?3",
+            params![agent_id, dispatch_class, holder_task_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The current live holder of a slot lease, if any (mika#1948).
+    /// Expired leases read as free — they are reclaimable by definition.
+    pub fn dispatch_slot_lease_holder(
+        &self,
+        agent_id: &str,
+        dispatch_class: &str,
+    ) -> Result<Option<(String, Option<String>)>> {
+        let now_s = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let row = self
+            .conn
+            .query_row(
+                "SELECT holder_task_id, dispatcher_source
+                 FROM dispatch_slot_leases
+                 WHERE agent_id = ?1 AND dispatch_class = ?2 AND expires_at > ?3",
+                params![agent_id, dispatch_class, now_s],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(row)
     }
 
     /// Check whether the given parent task has any active (pending/in_progress)
@@ -18709,6 +19098,7 @@ mod tests {
         db2.migrate_v47_to_v48().unwrap();
         db2.migrate_v48_to_v49().unwrap();
         db2.migrate_v49_to_v50().unwrap();
+        db2.migrate_v50_to_v51().unwrap();
 
         let final_version: i64 = db2
             .conn
@@ -20188,13 +20578,16 @@ mod tests {
         let result = db
             .has_active_callback_tasks_excluding("other-task", "mika", "implement")
             .unwrap();
-        let (parent_id, callback_id, callback_label) = result.expect(
+        let blocking = result.expect(
             "real (non-deferred) pending callback MUST still be detected as an \
              active dispatch — exclusion is narrowly scoped to :deferred wrappers",
         );
-        assert_eq!(parent_id, p_b, "should match Parent B (the real dispatch)");
-        assert_eq!(callback_id, real_b_id);
-        assert_eq!(callback_label, "long_running:run_claude_pilot");
+        assert_eq!(
+            blocking.parent_task_id, p_b,
+            "should match Parent B (the real dispatch)"
+        );
+        assert_eq!(blocking.callback_task_id, real_b_id);
+        assert_eq!(blocking.label, "long_running:run_claude_pilot");
 
         // Mixed-state: querying from Parent B itself excludes B's own callback
         // via the parent_task_id != ?1 clause, and the only remaining row is
@@ -20231,12 +20624,15 @@ mod tests {
         let result = db
             .has_active_callback_tasks_excluding("other-task", "mika", "implement")
             .unwrap();
-        let (parent_id, callback_id, _callback_label) = result.expect(
+        let blocking = result.expect(
             "label `:deferred:retry` is NOT a suffix match for `%:deferred` — \
              must still be counted as an active dispatch",
         );
-        assert_eq!(parent_id, p_d, "suffix-variant row should be the blocker");
-        assert_eq!(callback_id, suffix_variant_id);
+        assert_eq!(
+            blocking.parent_task_id, p_d,
+            "suffix-variant row should be the blocker"
+        );
+        assert_eq!(blocking.callback_task_id, suffix_variant_id);
 
         // Forward-compat for in_progress deferred wrappers: today no code path
         // sets a `:deferred` row to `in_progress`, but the SQL `status IN

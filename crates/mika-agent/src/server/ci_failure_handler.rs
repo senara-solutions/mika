@@ -312,14 +312,16 @@ pub async fn try_handle_ci_failure(
         .has_active_callback_tasks_excluding(&task.id, "implement")
         .await
     {
-        Ok(Some((parent_id, callback_id, _label))) => {
+        Ok(Some(blocking)) => {
             info!(
                 task_id = %task.id,
-                blocking_parent = %parent_id,
-                blocking_callback = %callback_id,
+                blocking_parent = %blocking.parent_task_id,
+                blocking_callback = %blocking.callback_task_id,
+                blocking_dispatcher_source =
+                    blocking.dispatcher_source.as_deref().unwrap_or("unknown"),
                 "Global dispatch guard: another task has an active callback"
             );
-            Some((parent_id, callback_id))
+            Some((blocking.parent_task_id, blocking.callback_task_id))
         }
         Ok(None) => None,
         Err(e) => {

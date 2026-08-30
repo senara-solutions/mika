@@ -50,6 +50,15 @@ pub struct Task {
     /// guard via `COALESCE`). Set on callback task creation based on the dispatched
     /// skill (#1001).
     pub dispatch_class: Option<String>,
+    /// Which dispatcher inside this engine initiated the task: `"mika_dev"`,
+    /// `"mika_manager"`, or `"operator"` (mika#1948, Porte 2). Nullable — pre-v51
+    /// rows have `NULL` and are read as `"mika_dev"` via `COALESCE`, since the
+    /// autonomous loop was the only dispatcher before the column existed.
+    ///
+    /// Distinct from the `dispatch:*` SEAT label (mika#2084), which says which
+    /// *engine* owns a ticket. This says which *role inside one engine* asked
+    /// for the work.
+    pub dispatcher_source: Option<String>,
 }
 
 /// Result of a force-promote attempt on a deferred dispatch wrapper (mika#1453).

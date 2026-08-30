@@ -1178,17 +1178,68 @@ impl AsyncDatabase {
         self.with_db(move |db| db.get_task_descendants(&r)).await
     }
 
-    /// Returns `(parent_task_id, callback_id, callback_label)` of the blocking
-    /// callback, or `None` if no conflicting dispatch exists (#1172 W3).
+    /// Returns the blocking dispatch (parent, callback, label, and which
+    /// dispatcher initiated it), or `None` if no conflicting dispatch exists
+    /// (#1172 W3; widened to carry `dispatcher_source` in mika#1948).
     pub async fn has_active_callback_tasks_excluding(
         &self,
         excluded_parent_id: &str,
         dispatch_class: &str,
-    ) -> Result<Option<(String, String, String)>> {
+    ) -> Result<Option<crate::db::BlockingDispatch>> {
         let p = excluded_parent_id.to_owned();
         let a = self.agent_id.clone();
         let c = dispatch_class.to_owned();
         self.with_db(move |db| db.has_active_callback_tasks_excluding(&p, &a, &c))
+            .await
+    }
+
+    /// Whether an operator-sourced task is waiting to run in this class
+    /// (mika#1948 AC3).
+    pub async fn has_pending_operator_task_for_class(&self, dispatch_class: &str) -> Result<bool> {
+        let a = self.agent_id.clone();
+        let c = dispatch_class.to_owned();
+        self.with_db(move |db| db.has_pending_operator_task_for_class(&a, &c))
+            .await
+    }
+
+    /// Atomically claim the exec slot for this agent and dispatch class
+    /// (mika#1948 — Porte 2). See `Database::try_acquire_dispatch_slot`.
+    pub async fn try_acquire_dispatch_slot(
+        &self,
+        dispatch_class: &str,
+        holder_task_id: &str,
+        dispatcher_source: Option<&str>,
+        ttl_secs: i64,
+    ) -> Result<crate::db::SlotClaim> {
+        let a = self.agent_id.clone();
+        let c = dispatch_class.to_owned();
+        let h = holder_task_id.to_owned();
+        let src = dispatcher_source.map(str::to_owned);
+        self.with_db(move |db| db.try_acquire_dispatch_slot(&a, &c, &h, src.as_deref(), ttl_secs))
+            .await
+    }
+
+    /// Release a slot lease held by `holder_task_id` (mika#1948).
+    pub async fn release_dispatch_slot(
+        &self,
+        dispatch_class: &str,
+        holder_task_id: &str,
+    ) -> Result<bool> {
+        let a = self.agent_id.clone();
+        let c = dispatch_class.to_owned();
+        let h = holder_task_id.to_owned();
+        self.with_db(move |db| db.release_dispatch_slot(&a, &c, &h))
+            .await
+    }
+
+    /// The current live holder of this class's slot lease, if any (mika#1948).
+    pub async fn dispatch_slot_lease_holder(
+        &self,
+        dispatch_class: &str,
+    ) -> Result<Option<(String, Option<String>)>> {
+        let a = self.agent_id.clone();
+        let c = dispatch_class.to_owned();
+        self.with_db(move |db| db.dispatch_slot_lease_holder(&a, &c))
             .await
     }
 

@@ -1388,7 +1388,13 @@ pub(crate) async fn validate_dispatch_readiness(
     let dispatch_class = tool_input.and_then(extract_skill_from_input);
     let class = derive_dispatch_class(dispatch_class);
     match db.has_active_callback_tasks_excluding(task_id, class).await {
-        Ok(Some((blocking_parent_id, blocking_callback_id, blocking_label))) => {
+        Ok(Some(blocking)) => {
+            let crate::db::BlockingDispatch {
+                parent_task_id: blocking_parent_id,
+                callback_task_id: blocking_callback_id,
+                label: blocking_label,
+                dispatcher_source: blocking_dispatcher_source,
+            } = blocking;
             // mika#1011 — Register a deferred-dispatch callback so the engine
             // auto-retries when the blocking dispatch completes. The LLM still
             // sees the rejection (γ composition) and may call send_message;
@@ -1407,6 +1413,14 @@ pub(crate) async fn validate_dispatch_readiness(
                 "real_callback"
             };
 
+            // mika#1948 — name WHICH dispatcher holds the slot. `None` means the
+            // blocking row predates the column (pre-v51) and is genuinely
+            // unknown; it is passed through as JSON `null` rather than
+            // defaulted, so a consumer cannot mistake "we don't know" for "it
+            // was mika-dev".
+            let blocking_source_display = blocking_dispatcher_source
+                .as_deref()
+                .unwrap_or("unknown (pre-v51 row)");
             let mut rejection = serde_json::json!({
                 "error": "global_dispatch_active",
                 "task_id": task_id,
@@ -1415,12 +1429,13 @@ pub(crate) async fn validate_dispatch_readiness(
                 "blocking_callback_id": blocking_callback_id,
                 "blocking_label": blocking_label,
                 "blocker_kind": blocker_kind,
+                "blocking_dispatcher_source": blocking_dispatcher_source,
                 "reason": format!(
                     "Another task ('{}') already has an active {} dispatch \
-                     (callback task '{}'). Only one long-running dispatch per class may be \
-                     active at a time. Wait for it to complete or cancel it before \
-                     dispatching again.",
-                    blocking_parent_id, class, blocking_callback_id
+                     (callback task '{}', dispatched by {}). Only one long-running \
+                     dispatch per class may be active at a time. Wait for it to \
+                     complete or cancel it before dispatching again.",
+                    blocking_parent_id, class, blocking_callback_id, blocking_source_display
                 )
             });
             if deferred_registered {
@@ -1793,6 +1808,138 @@ pub(crate) async fn validate_dispatch_readiness(
                     "Skipping blocked-by check: no GitHub token configured"
                 );
             }
+        }
+    }
+
+    // mika#1948 (Porte 2) — ATOMIC EXEC-SLOT CLAIM. This is the last gate, and
+    // it is last on purpose.
+    //
+    // Everything above only ever *checked* the slot. The per-class guard is a
+    // bare SELECT: on `None` it proceeds, and the callback row that makes the
+    // slot observably held is written later, by the caller. Between that check
+    // and that row this function performs several GitHub round-trips (issue
+    // body, open-PR, grooming markers — 10s timeout each), and four production
+    // callers enter here (`ready_label_handler`, the tool boundary,
+    // `task_engine::dispatcher`, `verdict_handler`). So two dispatchers could
+    // both read "free", both spend seconds in validation, and both proceed.
+    //
+    // A slot two claimants can simultaneously believe they hold is not
+    // arbitration, it is a convention. The claim below is a FACT: the PRIMARY
+    // KEY on (agent_id, dispatch_class) means the second claimant's INSERT
+    // collides rather than races, and exactly one caller leaves here holding
+    // the slot.
+    //
+    // Placed LAST so that no fallible step follows it — every rejection above
+    // returns before a lease is ever taken, which is why no error path needs to
+    // release one. The only thing between this claim and the callback row is
+    // the caller's own dispatch.
+    //
+    // Fail-closed on contention, per the ticket: a missed dispatch is
+    // recoverable (the deferred wrapper re-drives it), two writers on one
+    // branch are not. The bounded TTL is what keeps fail-closed from becoming
+    // loop-breaking — a dispatcher that dies mid-claim stalls its class for one
+    // TTL, not forever.
+    let dispatcher_source = task.dispatcher_source.as_deref();
+    match db
+        .try_acquire_dispatch_slot(
+            class,
+            task_id,
+            dispatcher_source,
+            crate::db::dispatch_slot_lease_ttl_secs(),
+        )
+        .await
+    {
+        Ok(crate::db::SlotClaim::Acquired) => {
+            debug!(
+                event = "dispatch_slot_acquired",
+                task_id = task_id,
+                dispatch_class = class,
+                dispatcher_source = dispatcher_source.unwrap_or("mika_dev"),
+                "exec slot claimed"
+            );
+        }
+        Ok(crate::db::SlotClaim::Held {
+            holder_task_id,
+            dispatcher_source: holder_source,
+            expires_at,
+        }) => {
+            let holder_source_display = holder_source.as_deref().unwrap_or("unknown (pre-v51 row)");
+            warn!(
+                event = "dispatch_slot_contended",
+                task_id = task_id,
+                dispatch_class = class,
+                holder_task_id = %holder_task_id,
+                holder_dispatcher_source = holder_source_display,
+                "exec slot already claimed by another dispatcher — refusing"
+            );
+
+            // Register a deferred wrapper exactly as the per-class guard does,
+            // so a dispatch that lost the claim is re-driven rather than lost.
+            let deferred_registered = if let Some(input) = tool_input {
+                register_deferred_callback(db, task_id, input).await
+            } else {
+                false
+            };
+
+            let mut rejection = serde_json::json!({
+                "error": "dispatch_slot_contended",
+                "task_id": task_id,
+                "dispatch_class": class,
+                "holder_task_id": holder_task_id,
+                "holder_dispatcher_source": holder_source,
+                "lease_expires_at": expires_at,
+                "reason": format!(
+                    "The `{class}` exec slot is claimed by task '{holder_task_id}' \
+                     (dispatched by {holder_source_display}), whose lease runs to \
+                     {expires_at}. Another dispatcher won the slot while this \
+                     dispatch was being validated. Only one dispatcher may hold a \
+                     class slot at a time — dispatching anyway would put a second \
+                     writer on the same branch (mika#1948)."
+                ),
+            });
+            if deferred_registered {
+                rejection["deferred_dispatch_registered"] = serde_json::json!(true);
+            }
+
+            if let Err(e) = db
+                .log_audit_event(
+                    task_id,
+                    "dispatch_slot_contended",
+                    &format!("class:{class}"),
+                    None,
+                    Some("dispatch_refused"),
+                    Some(&format!(
+                        "holder={holder_task_id} holder_source={holder_source_display} \
+                         expires_at={expires_at}"
+                    )),
+                    None,
+                )
+                .await
+            {
+                warn!(error = %e, "failed to write dispatch_slot_contended audit event");
+            }
+
+            record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+            return Err(rejection.to_string());
+        }
+        Err(e) => {
+            // Fail-closed, matching the per-class guard directly above: if we
+            // cannot establish who holds the slot, we do not dispatch. "In
+            // doubt about who holds the slot, don't dispatch" is the whole
+            // discipline — a lease we failed to take is not a lease we hold.
+            warn!(
+                task_id = task_id,
+                dispatch_class = class,
+                error = %e,
+                "exec-slot claim failed — refusing dispatch"
+            );
+            return Err(serde_json::json!({
+                "error": "dispatch_check_failed",
+                "task_id": task_id,
+                "dispatch_class": class,
+                "reason": format!("Failed to claim the {class} exec slot: {e}")
+            })
+            .to_string());
         }
     }
 
@@ -4976,7 +5123,8 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_some());
-        let (parent_id, found_callback_id, _label) = result.unwrap();
+        let blocking = result.unwrap();
+        let (parent_id, found_callback_id) = (blocking.parent_task_id, blocking.callback_task_id);
         assert_eq!(parent_id, wi);
         assert_eq!(found_callback_id, callback_id);
     }
@@ -5059,7 +5207,8 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_some(), "same-class dispatch should be blocked");
-        let (parent_id, found_id, _label) = result.unwrap();
+        let blocking = result.unwrap();
+        let (parent_id, found_id) = (blocking.parent_task_id, blocking.callback_task_id);
         assert_eq!(parent_id, wi1);
         assert_eq!(found_id, callback_id);
     }
@@ -5203,11 +5352,14 @@ mod tests {
             .has_active_callback_tasks_excluding(&parent_a, "implement")
             .await
             .unwrap();
-        let (blocking_parent, blocking_callback, _label) = result.expect(
+        let blocking = result.expect(
             "real pending callback MUST still block — only :deferred wrappers are excluded",
         );
-        assert_eq!(blocking_parent, parent_c, "real dispatch is the blocker");
-        assert_eq!(blocking_callback, real_c);
+        assert_eq!(
+            blocking.parent_task_id, parent_c,
+            "real dispatch is the blocker"
+        );
+        assert_eq!(blocking.callback_task_id, real_c);
     }
 
     /// mika#1163 — Pre-v34 NULL dispatch_class deferred wrapper must also be
@@ -6092,6 +6244,7 @@ mod tests {
             metadata: None,
             r#type: "issue".to_string(),
             dispatch_class: Some("groom".to_string()),
+            dispatcher_source: None,
         };
 
         let result = extract_dispatch_tuple(&task);

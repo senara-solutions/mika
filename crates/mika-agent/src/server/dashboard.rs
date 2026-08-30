@@ -1459,6 +1459,7 @@ mod tests {
             metadata: None,
             r#type: t.to_string(),
             dispatch_class: None,
+            dispatcher_source: None,
         }
     }
 
