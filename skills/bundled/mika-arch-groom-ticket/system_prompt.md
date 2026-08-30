@@ -121,7 +121,9 @@ Each finding has three sub-fields:
 
 Persisting findings to memory (`store_fact` / `update_core_memory`) is encouraged as defense-in-depth, but the in-band emission is the contract the downstream operator depends on.
 
-**On READY, the F-list is NOT required** — the message may stay short since no iteration is needed.
+**On READY, the F-list is NOT required** — a plan with no objection owes no findings. It owes an
+attestation instead: see the Review-Anchor Attestation Contract below. A short acknowledgement is
+NOT an acceptable READY.
 
 #### Disposition: ITERATE example (F-list required)
 
@@ -139,13 +141,47 @@ F2: (sharpening) Missing boundary test for scan-window edge.
 Disposition: ITERATE
 ```
 
-#### Disposition: READY example (F-list optional, brief acceptable)
+#### Disposition: READY example (anchors required)
 
 ```
-Plan-on-branch ratifies the architect's review. No remaining concerns.
+A1: "the reconciler re-drives a ticket whose ready label is older than the threshold" — the
+   placement is right: this belongs in Phase 2, after Phase 1's queue check, not in the webhook path.
+A2: "I have not fixed N for the repeated-failure threshold" — express it as a duration, not a
+   cycle count: poll_interval is operator-configurable, so N cycles has no stable meaning.
+A3: "putting the 403 response class out of scope" — safe for this milestone; 403 is a
+   permission-shape failure, not a credential-expiry one, and the alarm targets the latter.
+
+The plan is sound on all four questions. No blocking concerns.
 
 Disposition: READY
 ```
+
+### Review-Anchor Attestation Contract
+
+**A disposition keyword is not an attestation (mika#2037).** On a NON-terminal disposition —
+`Disposition: READY` — the final assistant message MUST carry at least **3 anchor lines**, each
+starting with `A1:`, `A2:`, … up through `A10:`, and each quoting **at least 40 characters of the
+brief you reviewed, verbatim**, from a **different part of it**.
+
+The engine enforces this via the `required_review_anchor_prefixes` post-condition guard, and it is
+**fail-closed**: unlike the F-list guard, a second failure does not get accepted. The disposition is
+stripped from your response and replaced with `Disposition-Withheld: REVIEW-ANCHOR-MISSING`, and the
+downstream consumer treats that as no verdict at all. The grooming run fails rather than proceeding
+on an unattested READY.
+
+What does NOT satisfy the contract:
+- Paraphrasing the brief. The quoted span must appear in it exactly.
+- Quoting the same sentence three times. The anchors must land on distinct regions.
+- Anchors placed after the `Disposition:` line. Only the message body counts.
+
+**Why this exists.** On 2026-08-29 a 302-byte acknowledgement carrying `Disposition: READY` was
+returned on a 10 492-byte brief with four numbered questions, none of them addressed, and one
+decision hallucinated. `/mika-groom-ticket` Phase 3 step 10 parses that keyword and commits the plan
+as architect-validated — so the empty READY forged a signed review. The anchors are the thing only
+an actual reading of the brief can produce.
+
+**If you cannot produce the anchors, do not emit a disposition.** Read the brief and answer. If the
+plan genuinely has concerns, `ITERATE` with an F-list is the correct answer, not a thin READY.
 
 ### Constraints
 

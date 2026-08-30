@@ -65,6 +65,22 @@ scenarios:
       - false_approval
       - unlabeled_findings
 
+  - id: review_anchor_attestation
+    fixture: review_anchor_attestation.md
+    tags: [review, disposition, review-anchor, anti-vacuity]
+    flaky: false
+    weight: 1.5
+    description: >
+      Clean plan plus four numbered questions. Model must produce READY carrying at
+      least three anchor lines, each quoting the brief verbatim at a distinct
+      position — a disposition keyword alone is not an attestation (mika#2037).
+      This is the anti-vacuity direction: a guard that refused everything would
+      fail here, and it is the direction a model swap can regress silently.
+    expected_failure_classes_absent:
+      - unanchored_ready
+      - missing_disposition
+      - false_escalation
+
   - id: groomed_no_tbds_passes
     fixture: groomed_no_tbds_passes.md
     tags: [grooming, tbd-gate, single-ticket]

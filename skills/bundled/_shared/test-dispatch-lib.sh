@@ -473,6 +473,56 @@ assert_eq "_parse_verdict ESCALATE" "ESCALATE" \
 assert_eq "_parse_verdict empty on no match" "" \
     "$(printf 'no verdict\n' | _parse_verdict)"
 
+# ---------------------------------------------------------------------------
+# Tier 0 — withheld disposition (mika#2037)
+#
+# The engine strips a disposition it refused to let stand and substitutes this
+# literal marker. No tier may then derive a verdict from the response: it is an
+# absence of verdict, not an approval.
+#
+# The tier-0 POSITION is what these assertions actually guard. After tier 1a the
+# marker would still be honoured; after tier 2 it would not, because the fuzzy pass
+# matches paraphrases anywhere in the text — so a response whose disposition line
+# was merely removed could still yield READY out of its own body. The third and
+# sixth assertions below are the ones that fail if tier 0 ever moves down.
+#
+# The literal must stay in sync with DISPOSITION_WITHHELD_MARKER in
+# crates/mika-agent/src/agent_loop/mod.rs.
+# ---------------------------------------------------------------------------
+WITHHELD_MARKER="Disposition-Withheld: REVIEW-ANCHOR-MISSING"
+
+assert_eq "tier 0 beats tier 1a (literal Disposition present)" "" \
+    "$(printf 'Some review prose.\n%s\nDisposition: READY\n' "$WITHHELD_MARKER" | _parse_disposition 2>/dev/null)"
+assert_eq "tier 0 beats tier 1b (Verdict carry-over present)" "" \
+    "$(printf '%s\nVerdict: GROOMED\n' "$WITHHELD_MARKER" | _parse_disposition 2>/dev/null)"
+assert_eq "tier 0 beats tier 2 (fuzzy READY paraphrases in the body)" "" \
+    "$(printf 'The plan is clean, good to go — proceed with the dispatch.\n%s\n' "$WITHHELD_MARKER" | _parse_disposition 2>/dev/null)"
+
+assert_eq "verdict tier 0 beats tier 1a" "" \
+    "$(printf '%s\nVerdict: GROOMED\n' "$WITHHELD_MARKER" | _parse_verdict 2>/dev/null)"
+assert_eq "verdict tier 0 beats tier 1b" "" \
+    "$(printf '%s\nDisposition: READY\n' "$WITHHELD_MARKER" | _parse_verdict 2>/dev/null)"
+assert_eq "verdict tier 0 beats tier 2 (fuzzy GROOMED paraphrases)" "" \
+    "$(printf 'Approved, no remaining concerns, ship it.\n%s\n' "$WITHHELD_MARKER" | _parse_verdict 2>/dev/null)"
+
+# A response that QUOTES the marker mid-line must not be suppressed: the three arch prompts
+# now teach the literal to the model, so an echo is an ordinary shape. Only a line the engine
+# wrote counts (mika#2037 F4).
+assert_eq "quoted marker mid-line does not suppress a genuine ITERATE" "ITERATE" \
+    "$(printf 'If the attestation were missing the engine would emit %s here.\nDisposition: ITERATE\n' "$WITHHELD_MARKER" | _parse_disposition 2>/dev/null)"
+assert_eq "quoted marker mid-line does not suppress a genuine GROOMED" "GROOMED" \
+    "$(printf 'The engine substitutes %s in that case.\nVerdict: GROOMED\n' "$WITHHELD_MARKER" | _parse_verdict 2>/dev/null)"
+assert_eq "marker at the very start of the response still suppresses" "" \
+    "$(printf '%s\nDisposition: READY\n' "$WITHHELD_MARKER" | _parse_disposition 2>/dev/null)"
+
+# Non-regression: without the marker every tier behaves exactly as before.
+assert_eq "no marker — tier 1a still returns READY" "READY" \
+    "$(printf 'Some review prose.\nDisposition: READY\n' | _parse_disposition 2>/dev/null)"
+assert_eq "no marker — tier 2 still returns READY" "READY" \
+    "$(printf 'The plan is clean, good to go — proceed.\n' | _parse_disposition 2>/dev/null)"
+assert_eq "no marker — verdict tier 1a still returns GROOMED" "GROOMED" \
+    "$(printf 'Verdict: GROOMED\n' | _parse_verdict 2>/dev/null)"
+
 # _trail_append + _trail_read — round-trip
 TRAIL_TMP=$(mktemp -d)
 WORKTREE_DIR="$TRAIL_TMP" _trail_append "groom-ticket" "session-abc" "READY"
@@ -4150,6 +4200,28 @@ if [ -f "$RUST_SRC" ]; then
         | sort | paste -sd' ' -)
     SHELL_LIST=$(printf '%s\n' "${DISPATCHABLE_REPO_BASENAMES[@]}" | sort | paste -sd' ' -)
     assert_eq "shell allowlist matches Rust DISPATCHABLE_REPOS (no drift)" "$RUST_LIST" "$SHELL_LIST"
+fi
+
+# --- Drift guard: the withheld-disposition marker must equal the Rust constant ---
+# Same necessity as the list above: the engine side is a compile-time `&str`, not a
+# runtime-readable data file, so the literal exists in both languages. Here the stakes
+# are higher than drift-as-noise — if the two copies diverge, the engine still strips
+# the disposition but tier 0 stops recognizing the substitute, and every tier below it
+# resumes deriving a verdict from the body. The refusal would fail OPEN, silently
+# (mika#2037).
+ANCHOR_RUST_SRC="$REPO_ROOT/crates/mika-agent/src/agent_loop/mod.rs"
+if [ -f "$ANCHOR_RUST_SRC" ]; then
+    RUST_MARKER=$(grep -oE 'const DISPOSITION_WITHHELD_MARKER: &str = "[^"]+"' "$ANCHOR_RUST_SRC" \
+        | sed 's/.*= "//; s/"$//')
+    assert_eq "shell tier-0 marker matches Rust DISPOSITION_WITHHELD_MARKER (no drift)" \
+        "$RUST_MARKER" "$WITHHELD_MARKER"
+    # The shell parser must actually contain the literal, not merely compare equal to a
+    # variable this test defined.
+    if grep -qF "$RUST_MARKER" "$DISPATCH_LIB"; then
+        assert_eq "dispatch-lib carries the marker literal" "yes" "yes"
+    else
+        assert_eq "dispatch-lib carries the marker literal" "yes" "no"
+    fi
 else
     FAIL=$((FAIL + 1))
     echo "  ✗ Rust source not found at $RUST_SRC — cannot verify allowlist drift"
