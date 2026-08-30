@@ -29,6 +29,19 @@ const STUCK_READY_THRESHOLD_ENV: &str = "MIKA_AUTO_PULL_STUCK_READY_THRESHOLD_SE
 /// Overflow is logged and left for the next tick.
 const MAX_STUCK_RESCUE_PER_TICK: usize = 5;
 
+// ───────────────────── Re-drive budget consts (mika#2020) ─────────────────────
+
+/// Default per-ticket re-drive budget before Phase 2 gives up and says so
+/// (mika#2020). Three, for parity with [`CIRCUIT_BREAKER_THRESHOLD`] and because
+/// at the 900 s age threshold three re-drives span at least ~45 min — well past
+/// a dropped webhook or a mika-dev that was busy at fire time.
+const MAX_REDRIVES_DEFAULT: i64 = 3;
+
+/// Env override for the re-drive budget (mika#2020). The literal `0` disables
+/// the budget (unbounded re-drives — the pre-fix behaviour), mirroring the
+/// disable sentinel of [`AUTO_FEEDER_MIN_READY_ENV`].
+const MAX_REDRIVES_ENV: &str = "MIKA_AUTO_PULL_MAX_REDRIVES";
+
 // ───────────────────── Phase 0 auto-feeder consts (mika#1863) ─────────────────────
 
 /// Env override for the auto-feeder ready-pool target (mika#1863 R2/AC1).
@@ -78,6 +91,32 @@ fn parse_stuck_ready_threshold(raw: Option<&str>) -> i64 {
 /// falling back to [`STUCK_READY_THRESHOLD_DEFAULT_SECS`] (mika#1824 R3).
 fn stuck_ready_threshold_secs() -> i64 {
     parse_stuck_ready_threshold(std::env::var(STUCK_READY_THRESHOLD_ENV).ok().as_deref())
+}
+
+/// Pure parse of the re-drive budget from an optional env value (mika#2020 R14).
+/// Same three-tier contract as [`parse_stuck_ready_threshold`]: absent/empty →
+/// default; unparseable/negative → default with a WARN; `0` → unbounded.
+fn parse_max_redrives(raw: Option<&str>) -> i64 {
+    match raw {
+        Some(v) if !v.trim().is_empty() => match v.trim().parse::<i64>() {
+            Ok(n) if n >= 0 => n,
+            _ => {
+                warn!(
+                    value = %v,
+                    default = MAX_REDRIVES_DEFAULT,
+                    "auto_pull: invalid {MAX_REDRIVES_ENV}, using default"
+                );
+                MAX_REDRIVES_DEFAULT
+            }
+        },
+        _ => MAX_REDRIVES_DEFAULT,
+    }
+}
+
+/// Read the per-ticket re-drive budget from the environment (mika#2020 R14).
+/// `0` means unbounded.
+fn max_redrives() -> i64 {
+    parse_max_redrives(std::env::var(MAX_REDRIVES_ENV).ok().as_deref())
 }
 
 /// Pure parse of the auto-feeder pool target from an optional env value
@@ -153,6 +192,100 @@ pub fn is_groomed(body: &str) -> bool {
         && body.contains("> - **Plan:** `docs/plans/")
 }
 
+// ───────────────────── Plan ownership (mika#2020) ─────────────────────
+
+/// Verdict on whether the plan a ticket's callout points at belongs to that
+/// ticket (mika#2020).
+///
+/// [`is_groomed`] answers a different question — whether the callout has the
+/// canonical *shape*. It never checks who the plan belongs to, which is how
+/// mika#1887 came to carry a callout pointing at
+/// `docs/plans/2026-08-21-002-fix-1933-reader-completed-section-avancement-plan.md`:
+/// a real file, a real plan, another ticket's intent. The pilot opened it, read
+/// it, and had no way to know it was implementing #1933.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanOwnership {
+    /// The plan filename's canonical issue slot carries this ticket's number.
+    Owned,
+    /// The slot carries a *different* issue number — positive evidence of
+    /// misattribution. The only verdict that refuses.
+    OwnedByOther(u64),
+    /// No callout, or a filename with no canonical issue slot (historical plan
+    /// names like `918-eval-kg-fixtures-…md`). We cannot tell, so we do not
+    /// accuse — dev-groom's `_find_issue_plan` has a content fallback on an
+    /// `**Issue:**` header that auto-pull cannot evaluate without per-ticket
+    /// I/O.
+    Unattributable,
+}
+
+/// Extract the plan path from a ticket's grooming callout, if it has one.
+fn extract_plan_path(body: &str) -> Option<String> {
+    static PLAN_CALLOUT_RE: OnceLock<Regex> = OnceLock::new();
+    let callout_re = PLAN_CALLOUT_RE.get_or_init(|| {
+        Regex::new(r"(?m)^> - \*\*Plan:\*\* `(docs/plans/[^`]+)`")
+            .expect("plan callout regex must compile")
+    });
+    callout_re.captures(body).map(|c| c[1].to_string())
+}
+
+/// Decide whether the plan named in a ticket's grooming callout belongs to that
+/// ticket, from the issue body alone (mika#2020 R1/R2).
+///
+/// Fail-open on ambiguity, fail-closed on contradiction. The canonical plan
+/// name is `<YYYY-MM-DD>-<seq>-<type>-<issue>-<slug>-plan.md`, and the issue
+/// slot is read **anchored at that position** — never searched freely. The
+/// anchor is the point: mika#2038 documented a permissive `*-2026-*` glob
+/// matching `rustsec-2026-0097` and sending a pilot to an April plan. An
+/// unanchored pattern here would commit the mirror-image fault — refusing a
+/// ticket because some number in its slug resembles an issue number.
+pub fn plan_ownership(body: &str, issue_number: u64) -> PlanOwnership {
+    let Some(path) = extract_plan_path(body) else {
+        return PlanOwnership::Unattributable;
+    };
+    let basename = path.rsplit('/').next().unwrap_or(&path);
+
+    static ISSUE_SLOT_RE: OnceLock<Regex> = OnceLock::new();
+    let slot_re = ISSUE_SLOT_RE.get_or_init(|| {
+        // `2026-08-29-002-fix-2038-…` → 2038. The `\d{3,4}` sequence field also
+        // covers the 4-digit time-style variant (`2026-08-29-1249-security-2039-…`).
+        Regex::new(r"^\d{4}-\d{2}-\d{2}-\d{3,4}-[a-z]+-(\d+)-")
+            .expect("plan issue-slot regex must compile")
+    });
+
+    match slot_re
+        .captures(basename)
+        .and_then(|c| c[1].parse::<u64>().ok())
+    {
+        Some(slot) if slot == issue_number => PlanOwnership::Owned,
+        Some(slot) => PlanOwnership::OwnedByOther(slot),
+        None => PlanOwnership::Unattributable,
+    }
+}
+
+/// Phase 0/Phase 1 candidate filter (mika#2020 R1, KTD7): `true` when the
+/// ticket's plan is positively attributed to a *different* issue, in which case
+/// the ticket is dropped from the candidate set and the mismatch is logged.
+///
+/// Phase 0 and Phase 1 pick one candidate out of many, so a ticket they drop is
+/// not an announced dead end — it simply is not this tick's pick, and a `warn!`
+/// is the proportionate signal. The full gesture (remove `ready`, apply
+/// `operator-review`, comment) belongs to Phase 2, where the ticket already
+/// carries `ready` and a dispatch is imminent.
+fn warn_and_reject_foreign_plan(issue: &Issue) -> bool {
+    match plan_ownership(&issue.body, issue.number) {
+        PlanOwnership::OwnedByOther(owner) => {
+            warn!(
+                issue = issue.number,
+                plan = %extract_plan_path(&issue.body).unwrap_or_else(|| "<unparseable>".to_string()),
+                owner,
+                "auto_pull_plan_ownership_mismatch"
+            );
+            true
+        }
+        PlanOwnership::Owned | PlanOwnership::Unattributable => false,
+    }
+}
+
 // ───────────────────── Priority ranking ─────────────────────
 
 /// Returns a numeric rank for priority labels: p0=4, p1=3, p2=2, p3=1, unlabelled=0.
@@ -213,7 +346,14 @@ pub fn select_best_candidate(
         .into_iter()
         .filter(|i| !i.labels.iter().any(|l| l.name == "ready"))
         .filter(|i| !open_pr_issue_numbers.contains(&i.number))
+        // mika#2020 R11: `blocked`/`operator-review` are structural exclusions,
+        // as Phase 0 has always treated them. Phase 1 did not, which left the
+        // abandonment leaking: a groomed ticket handed to the operator could be
+        // re-promoted to `ready` here on the very next idle tick, and the
+        // `ready` webhook would dispatch it again.
+        .filter(|i| !is_feeder_excluded(i))
         .filter(|i| is_groomed(&i.body))
+        .filter(|i| !warn_and_reject_foreign_plan(i))
         .collect();
 
     if candidates.is_empty() {
@@ -241,6 +381,112 @@ pub fn select_best_candidate(
 /// The per-issue circuit breaker (D4, step 4 of the D2 ordering) is applied by
 /// the async caller *before* ages are fetched, so it does not appear here — a
 /// circuit-broken ticket simply never gets an `ages_by_issue` entry.
+/// The per-ticket state Phase 2 resolves from GitHub + the DB before deciding
+/// (mika#2020). Split from the decision itself so the decision is pure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StuckReadyFacts {
+    /// An open PR closes this ticket.
+    has_open_pr: bool,
+    /// A self_dev task is in flight for this ticket.
+    in_flight: bool,
+    /// `auto_pull_stats.failure_count` is at or past the circuit-breaker threshold.
+    circuit_broken: bool,
+    /// Successful re-drives since the last observed progress.
+    redrive_count: i64,
+    /// `redrive_abandoned_at` is set — this ticket was handed to the operator.
+    abandoned: bool,
+}
+
+/// What Phase 2 should do with one `ready` ticket (mika#2020).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StuckReadyVerdict {
+    /// Eligible for a re-drive, pending the label-age check.
+    Eligible,
+    /// Not this tick. `reason` is the value of the existing
+    /// `stuck_ready_reconcile_skipped` DEBUG field.
+    Skip { reason: &'static str },
+    /// Not this tick, and the re-drive budget goes back to zero — the ticket
+    /// shows observable progress (mika#2020 R6).
+    SkipAndResetBudget { reason: &'static str },
+    /// The operator lifted an abandonment by removing `operator-review`: clear
+    /// the budget and let the ticket back in (mika#2020 R12).
+    ReEntry,
+    /// Stop re-driving, and say so (mika#2020 R3, R5).
+    Abandon(AbandonReason),
+}
+
+/// The in-memory half of the Phase 2 decision — the two checks that need no I/O
+/// (mika#2020 KTD6). Called first by the async wrapper so a ticket refused here
+/// costs no DB round-trip, and again from [`classify_stuck_ready`] so the pure
+/// decision stays whole and testable in one place.
+fn classify_stuck_ready_in_memory(issue: &Issue) -> Option<StuckReadyVerdict> {
+    // Filter A: the ticket is already in the operator's hands (or blocked).
+    if is_feeder_excluded(issue) {
+        return Some(StuckReadyVerdict::Skip {
+            reason: "operator_review_or_blocked",
+        });
+    }
+
+    // Filter B: the plan belongs to another issue. Refused on sight, without
+    // spending a re-drive — `is_groomed` says `true` here, so a re-drive would
+    // send dev-groom straight past grooming into implementing the wrong plan.
+    if let PlanOwnership::OwnedByOther(owner) = plan_ownership(&issue.body, issue.number) {
+        let plan = extract_plan_path(&issue.body).unwrap_or_else(|| "<unparseable>".to_string());
+        return Some(StuckReadyVerdict::Abandon(
+            AbandonReason::PlanOwnedByOtherIssue { plan, owner },
+        ));
+    }
+
+    None
+}
+
+/// The whole Phase 2 decision for one ticket (mika#2020). Pure — every input is
+/// already resolved.
+fn classify_stuck_ready(
+    issue: &Issue,
+    facts: &StuckReadyFacts,
+    redrive_budget: i64,
+) -> StuckReadyVerdict {
+    if let Some(verdict) = classify_stuck_ready_in_memory(issue) {
+        return verdict;
+    }
+
+    // Progress: an open PR or a live dispatch means the re-drives worked. Both
+    // are already-computed filters, so the reset costs nothing extra (KTD5).
+    if facts.has_open_pr {
+        return StuckReadyVerdict::SkipAndResetBudget {
+            reason: "open_pr_closing",
+        };
+    }
+    if facts.in_flight {
+        return StuckReadyVerdict::SkipAndResetBudget {
+            reason: "in_flight_self_dev",
+        };
+    }
+
+    // Past filter A, a ticket carrying an abandonment stamp no longer carries
+    // `operator-review` — the operator removed it. That is the re-entry gesture.
+    if facts.abandoned {
+        return StuckReadyVerdict::ReEntry;
+    }
+
+    if facts.circuit_broken {
+        return StuckReadyVerdict::Skip {
+            reason: "circuit_breaker",
+        };
+    }
+
+    // `0` disables the budget (pre-fix behaviour, kept as an escape hatch).
+    if redrive_budget > 0 && facts.redrive_count >= redrive_budget {
+        return StuckReadyVerdict::Abandon(AbandonReason::RedriveBudgetExhausted {
+            redrives: facts.redrive_count,
+            budget: redrive_budget,
+        });
+    }
+
+    StuckReadyVerdict::Eligible
+}
+
 fn select_stuck_ready_candidates(
     issues: &[Issue],
     open_pr_issue_numbers: &HashSet<u64>,
@@ -322,6 +568,7 @@ fn select_feeder_candidates(
         .filter(|i| !in_flight_issue_numbers.contains(&i.number))
         .filter(|i| !is_feeder_excluded(i))
         .filter(|i| is_groomed(&i.body))
+        .filter(|i| !warn_and_reject_foreign_plan(i))
         .collect();
 
     // Rank DESC, then oldest `updated_at` first within a rank tier.
@@ -523,6 +770,213 @@ async fn gh_remove_label(github_token: &str, issue_number: u64, label: &str) -> 
     Ok(())
 }
 
+/// Post a comment on a GitHub issue (mika#2020). Mirrors [`gh_apply_label`]'s
+/// process setup.
+///
+/// This is the channel that makes an abandonment reach a human. A `debug!` line
+/// is not a refusal anyone reads — mika#1901 was re-driven 16 times, and the
+/// only way to notice was to count timeline events by hand.
+async fn gh_comment_issue(github_token: &str, issue_number: u64, body: &str) -> Result<()> {
+    let mut cmd = tokio::process::Command::new("gh");
+    cmd.args([
+        "issue",
+        "comment",
+        &issue_number.to_string(),
+        "--repo",
+        DEFAULT_REPO,
+        "--body",
+        body,
+    ]);
+    cmd.env("GH_TOKEN", github_token);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    let output = cmd.output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "gh issue comment failed for #{}: {}",
+            issue_number,
+            stderr
+        ));
+    }
+    Ok(())
+}
+
+// ───────────────────── Named abandonment (mika#2020) ─────────────────────
+
+/// Why the reconciler stopped re-driving a ticket (mika#2020).
+///
+/// The two variants carry different urgency by design. A ticket whose plan
+/// belongs to another issue is abandoned on sight, because re-driving it is
+/// *actively harmful*: [`is_groomed`] answers `true`, so dev-groom skips
+/// grooming and dispatches straight into implementing the wrong plan. Every
+/// other dead end — including a ticket with no callout at all, the mika#1901
+/// case — spends its budget first, because a `ready` label on an ungroomed
+/// ticket is the pipeline's *nominal* entry state and re-driving it is how
+/// dev-groom gets another chance to produce the plan.
+///
+/// A ticket with no plan is less dangerous than a ticket with the wrong plan.
+/// Both are refused; they are not refused at the same speed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AbandonReason {
+    /// The body's plan callout points at a plan belonging to another issue.
+    PlanOwnedByOtherIssue { plan: String, owner: u64 },
+    /// The per-ticket re-drive budget is spent with no observable progress.
+    RedriveBudgetExhausted { redrives: i64, budget: i64 },
+}
+
+impl AbandonReason {
+    /// Stable short slug for structured logs and audit events.
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::PlanOwnedByOtherIssue { .. } => "plan_owned_by_other_issue",
+            Self::RedriveBudgetExhausted { .. } => "redrive_budget_exhausted",
+        }
+    }
+
+    /// Human-readable statement of what went wrong.
+    fn reason(&self, issue_number: u64) -> String {
+        match self {
+            Self::PlanOwnedByOtherIssue { plan, owner } => format!(
+                "Le callout `> - **Plan:**` de #{issue_number} désigne `{plan}`, \
+                 dont le créneau d'issue porte **#{owner}** — le plan d'un autre ticket. \
+                 Un pilote dispatché ici implémenterait l'intention de #{owner} \
+                 en croyant travailler sur #{issue_number}."
+            ),
+            Self::RedriveBudgetExhausted { redrives, budget } => format!(
+                "L'auto-pull a re-drivé #{issue_number} **{redrives} fois** \
+                 (budget : {budget}) sans progrès observable — aucune PR ouverte \
+                 fermant ce ticket, aucune tâche `self_dev` en vol. \
+                 Chaque re-drive consomme un créneau de dispatch."
+            ),
+        }
+    }
+
+    /// What it would take to pass.
+    fn remedy(&self, issue_number: u64) -> String {
+        match self {
+            Self::PlanOwnedByOtherIssue { owner, .. } => format!(
+                "corrige le callout `> - **Plan:**` du corps de #{issue_number} \
+                 pour qu'il désigne un plan de #{issue_number} (ou re-groome le ticket \
+                 pour en produire un), et vérifie que le plan de #{owner} n'a pas été \
+                 écrasé au passage"
+            ),
+            Self::RedriveBudgetExhausted { .. } => format!(
+                "groome #{issue_number} jusqu'à ce que son corps porte un callout complet \
+                 (`Branch:` + `Plan:` + `second-pass (GROOMED)`), ou détermine ce qui \
+                 empêche le dispatch de démarrer"
+            ),
+        }
+    }
+
+    /// The comment body posted on the abandoned ticket. Names the three things a
+    /// predictable refusal owes its reader: the ticket, the reason, the remedy.
+    fn comment_body(&self, issue_number: u64) -> String {
+        format!(
+            "## Auto-pull : re-drive abandonné pour #{issue_number}\n\n\
+             **Raison.** {}\n\n\
+             **Ce qu'il faudrait pour passer.** Pour remettre ce ticket en jeu : {}, \
+             puis retire le label `operator-review`.\n\n\
+             Le label `ready` a été retiré et `operator-review` posé — l'auto-pull ne \
+             re-drivera plus ce ticket tant qu'il porte ce label. Retirer `operator-review` \
+             remet son compteur de re-drives à zéro.\n\n\
+             <sub>Émis par le reconciler stuck-ready (mika#1824), borné par mika#2020. \
+             Événement : `auto_pull_redrive_abandoned` (`reason={}`).</sub>",
+            self.reason(issue_number),
+            self.remedy(issue_number),
+            self.slug(),
+        )
+    }
+}
+
+/// Stop re-driving a ticket, and say so where a human will see it (mika#2020
+/// R8–R10, R13).
+///
+/// Order matters: `ready` comes off first because that is what actually stops
+/// the loop; everything after it is visibility layered on top of an arrest
+/// already secured. A failure to comment degrades the refusal's reach, not its
+/// effect.
+async fn abandon_stuck_ready(
+    db: &AsyncDatabase,
+    github_token: &str,
+    issue_number: u64,
+    reason: AbandonReason,
+    trace_id: &str,
+    session_id: &str,
+) {
+    // `operator-review` goes on FIRST, and a failure to apply it aborts the
+    // abandonment. It — not the absence of `ready` — is what structurally
+    // excludes the ticket from all three phases, so it must be the label that
+    // lands. Removing `ready` first and then failing here would leave the ticket
+    // with neither label but with an abandonment stamp: Phase 1 would re-promote
+    // it, Phase 2 would read the stamp-without-label as the operator's re-entry
+    // gesture, and the budget would reset — a fresh loop every N re-drives.
+    // Aborting instead is convergent: the counter is still past the budget, so
+    // the next tick simply retries the abandonment.
+    if let Err(e) = gh_apply_label(github_token, issue_number, "operator-review").await {
+        warn!(error = %e, issue = issue_number, "auto_pull: abandon could not apply operator-review label; leaving ticket untouched for the next tick");
+        if let Err(e2) = db
+            .increment_auto_pull_failure(DEFAULT_REPO, issue_number)
+            .await
+        {
+            warn!(error = %e2, "auto_pull: failed to increment failure counter");
+        }
+        return;
+    }
+
+    // Past this point the ticket is already excluded from every phase, so a
+    // failure below degrades the refusal's reach, never its effect.
+    if let Err(e) = gh_remove_label(github_token, issue_number, "ready").await {
+        warn!(error = %e, issue = issue_number, "auto_pull: abandon could not remove ready label");
+    }
+
+    if let Err(e) = gh_comment_issue(
+        github_token,
+        issue_number,
+        &reason.comment_body(issue_number),
+    )
+    .await
+    {
+        warn!(error = %e, issue = issue_number, "auto_pull: abandon could not post comment");
+    }
+
+    if let Err(e) = db
+        .mark_auto_pull_redrive_abandoned(DEFAULT_REPO, issue_number)
+        .await
+    {
+        warn!(error = %e, issue = issue_number, "auto_pull: failed to stamp abandonment");
+    }
+
+    warn!(
+        issue = issue_number,
+        reason = reason.slug(),
+        detail = %reason.reason(issue_number),
+        "auto_pull_redrive_abandoned"
+    );
+
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            "auto_pull",
+            "auto_pull_redrive_abandoned",
+            None,
+            Some(&format!(
+                "#{} abandoned: reason={}",
+                issue_number,
+                reason.slug()
+            )),
+            None,
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(error = %e, "auto_pull: failed to write abandonment audit event");
+    }
+}
+
 /// Parse an issue-timeline JSON array and return the `created_at` of the LAST
 /// `labeled` event whose label name is `ready` (mika#1824 D1). A remove→add
 /// cycle appends a fresh `labeled` event, so `last` is the authoritative
@@ -653,8 +1107,15 @@ pub async fn auto_pull_groomed_ticket(
     .await;
 
     // Phase 2 — reconcile stuck-ready tickets, independent of queue depth (mika#1824).
-    let rescued =
-        phase2_reconcile_stuck_ready(db, github_token, &issues, &open_pr_issue_numbers).await;
+    let rescued = phase2_reconcile_stuck_ready(
+        db,
+        github_token,
+        &issues,
+        &open_pr_issue_numbers,
+        trace_id,
+        session_id,
+    )
+    .await;
     debug!(
         rescued,
         "auto_pull: phase 2 stuck-ready reconciler complete"
@@ -1009,8 +1470,11 @@ async fn phase2_reconcile_stuck_ready(
     github_token: &str,
     issues: &[Issue],
     open_pr_issue_numbers: &HashSet<u64>,
+    trace_id: &str,
+    session_id: &str,
 ) -> usize {
     let threshold = stuck_ready_threshold_secs();
+    let redrive_budget = max_redrives();
 
     // Filter 1 (in-mem): keep only tickets WITH the `ready` label (inverse of
     // Phase 1's filter). Everything without `ready` is Phase 1 territory.
@@ -1022,62 +1486,105 @@ async fn phase2_reconcile_stuck_ready(
         return 0;
     }
 
-    // Filters 2–4 (in-mem open-PR, DB in-flight, DB circuit-breaker). Build the
-    // in-flight set (for the pure predicate) and the survivor list (for the
-    // age-fetch step). Ordering is cheapest-first so the API call in step 5
-    // fires for as few tickets as possible.
+    // Filters 2–8. Ordering is cheapest-first (in-mem → DB → GitHub API), so the
+    // timeline call in the age step fires for as few tickets as possible. The
+    // decision itself is the pure `classify_stuck_ready`; this loop only
+    // resolves its inputs and enacts its verdict.
     let mut in_flight_issue_numbers: HashSet<u64> = HashSet::new();
     let mut survivors: Vec<u64> = Vec::new();
     for issue in &ready {
         let n = issue.number;
 
-        // Filter 2: open PR closing this issue (in-memory, already fetched).
-        if open_pr_issue_numbers.contains(&n) {
-            debug!(
-                issue = n,
-                reason = "open_pr_closing",
-                "stuck_ready_reconcile_skipped"
-            );
+        // Filters 2–3 (in-mem): operator-held tickets and misattributed plans.
+        // Decided before any I/O (mika#2020 KTD6).
+        if let Some(verdict) = classify_stuck_ready_in_memory(issue) {
+            match verdict {
+                StuckReadyVerdict::Skip { reason } => {
+                    debug!(issue = n, reason, "stuck_ready_reconcile_skipped");
+                }
+                StuckReadyVerdict::Abandon(reason) => {
+                    abandon_stuck_ready(db, github_token, n, reason, trace_id, session_id).await;
+                }
+                // `classify_stuck_ready_in_memory` yields only those two.
+                other => debug!(
+                    issue = n,
+                    ?other,
+                    "stuck_ready_reconcile_unexpected_verdict"
+                ),
+            }
             continue;
         }
 
-        // Filter 3: in-flight self_dev task for this issue (DB, cheap).
+        // Filter 4 (DB, cheap): in-flight self_dev task for this issue.
         let issue_url = format!("https://github.com/{}/issues/{}", DEFAULT_REPO, n);
-        match db.has_active_self_dev_task_for_issue(&issue_url).await {
-            Ok(true) => {
-                in_flight_issue_numbers.insert(n);
-                debug!(
-                    issue = n,
-                    reason = "in_flight_self_dev",
-                    "stuck_ready_reconcile_skipped"
-                );
-                continue;
-            }
-            Ok(false) => {}
+        let in_flight = match db.has_active_self_dev_task_for_issue(&issue_url).await {
+            Ok(v) => v,
             Err(e) => {
                 warn!(error = %e, issue = n, "auto_pull: phase 2 in-flight check failed; skipping ticket");
                 continue;
             }
+        };
+        if in_flight {
+            in_flight_issue_numbers.insert(n);
         }
 
-        // Filter 4: circuit-breaker (DB, cheap). Fail-open on error.
-        match db.get_auto_pull_failure_count(DEFAULT_REPO, n).await {
-            Ok(count) if count >= CIRCUIT_BREAKER_THRESHOLD => {
-                debug!(
-                    issue = n,
-                    reason = "circuit_breaker",
-                    failure_count = count,
-                    "stuck_ready_reconcile_skipped"
-                );
-                continue;
-            }
-            Ok(_) => {}
+        // Filter 5 (DB, cheap): circuit-breaker. Fail-open on error.
+        let circuit_broken = match db.get_auto_pull_failure_count(DEFAULT_REPO, n).await {
+            Ok(count) => count >= CIRCUIT_BREAKER_THRESHOLD,
             Err(e) => {
                 warn!(error = %e, issue = n, "auto_pull: phase 2 circuit-breaker check failed; proceeding");
+                false
+            }
+        };
+
+        // Filter 6 (DB, cheap): re-drive budget + abandonment stamp (mika#2020).
+        // Fail-open on error — an unreadable counter must not strand a ticket.
+        let (redrive_count, abandoned) = match db.get_auto_pull_redrive_state(DEFAULT_REPO, n).await
+        {
+            Ok(state) => state,
+            Err(e) => {
+                warn!(error = %e, issue = n, "auto_pull: phase 2 re-drive state read failed; proceeding");
+                (0, false)
+            }
+        };
+
+        let facts = StuckReadyFacts {
+            has_open_pr: open_pr_issue_numbers.contains(&n),
+            in_flight,
+            circuit_broken,
+            redrive_count,
+            abandoned,
+        };
+
+        match classify_stuck_ready(issue, &facts, redrive_budget) {
+            StuckReadyVerdict::Eligible => survivors.push(n),
+            StuckReadyVerdict::Skip { reason } => {
+                debug!(issue = n, reason, "stuck_ready_reconcile_skipped");
+            }
+            StuckReadyVerdict::SkipAndResetBudget { reason } => {
+                debug!(issue = n, reason, "stuck_ready_reconcile_skipped");
+                if redrive_count > 0
+                    && let Err(e) = db.reset_auto_pull_redrive(DEFAULT_REPO, n).await
+                {
+                    warn!(error = %e, issue = n, "auto_pull: failed to reset re-drive budget on progress");
+                }
+            }
+            StuckReadyVerdict::ReEntry => {
+                if let Err(e) = db.reset_auto_pull_redrive(DEFAULT_REPO, n).await {
+                    warn!(error = %e, issue = n, "auto_pull: failed to clear abandonment on re-entry");
+                    continue;
+                }
+                info!(
+                    issue = n,
+                    prior_redrives = redrive_count,
+                    "auto_pull_redrive_reentry"
+                );
+                survivors.push(n);
+            }
+            StuckReadyVerdict::Abandon(reason) => {
+                abandon_stuck_ready(db, github_token, n, reason, trace_id, session_id).await;
             }
         }
-
-        survivors.push(n);
     }
 
     if survivors.is_empty() {
@@ -1167,6 +1674,14 @@ async fn phase2_reconcile_stuck_ready(
         }
         if let Err(e) = db.reset_auto_pull_failure(DEFAULT_REPO, n).await {
             warn!(error = %e, "auto_pull: failed to reset failure counter");
+        }
+        // mika#2020: the line above is exactly where the loop used to erase its
+        // own memory. `failure_count` going back to zero is correct — the API
+        // call succeeded — but it left nothing counting the rescues themselves,
+        // so #1901 could be re-driven 16 times and look brand new each round.
+        // The re-drive budget increments on the same successful event.
+        if let Err(e) = db.increment_auto_pull_redrive(DEFAULT_REPO, n).await {
+            warn!(error = %e, issue = n, "auto_pull: failed to increment re-drive counter");
         }
         info!(issue = n, "stuck_ready_reconciled");
         rescued += 1;
@@ -1933,6 +2448,361 @@ This ticket has been GROOMED and is ready.
             selected,
             vec![2, 4, 5],
             "top 3 by rank: p0-critical(#2) > p1-important(#4) > agent-core(#5)"
+        );
+    }
+
+    // ── mika#2020: plan ownership ──
+
+    /// Body shape whose plan callout carries a canonical issue slot.
+    fn body_with_plan(plan_basename: &str) -> String {
+        format!(
+            "> - **Branch:** `fix/1/x`\n\
+             > - **Plan:** `docs/plans/{plan_basename}` (committed on branch @ abc1234)\n\
+             > - **Grooming history:** first-pass (READY) → second-pass (GROOMED) — session-id: 550e8400"
+        )
+    }
+
+    #[test]
+    fn test_plan_ownership_owned() {
+        let body =
+            body_with_plan("2026-08-29-002-fix-2038-find-issue-plan-tier1-refutation-plan.md");
+        assert_eq!(plan_ownership(&body, 2038), PlanOwnership::Owned);
+    }
+
+    #[test]
+    fn test_plan_ownership_owned_by_other_the_1887_incident() {
+        // The literal callout mika#1887 carried: a real plan file belonging to
+        // #1933. The pilot opened it and had no way to know.
+        let body =
+            body_with_plan("2026-08-21-002-fix-1933-reader-completed-section-avancement-plan.md");
+        assert_eq!(
+            plan_ownership(&body, 1887),
+            PlanOwnership::OwnedByOther(1933),
+            "a plan positively attributed to another issue must be refused"
+        );
+    }
+
+    #[test]
+    fn test_plan_ownership_four_digit_sequence_field() {
+        // `1249` is the sequence field, `2039` the issue slot — the regex must
+        // not mistake one for the other.
+        let body =
+            body_with_plan("2026-08-29-1249-security-2039-pat-github-hors-argv-bwrap-plan.md");
+        assert_eq!(plan_ownership(&body, 2039), PlanOwnership::Owned);
+        assert_eq!(
+            plan_ownership(&body, 1249),
+            PlanOwnership::OwnedByOther(2039)
+        );
+    }
+
+    #[test]
+    fn test_plan_ownership_historical_names_are_unattributable() {
+        for name in [
+            "2047-disable-release-please-workflow.md",
+            "918-eval-kg-fixtures-schema-pin-v29-const-assert-e2e-test.md",
+            "mika-1221-pre-fix-self-model-backup.txt",
+        ] {
+            let body = body_with_plan(name);
+            assert_eq!(
+                plan_ownership(&body, 1),
+                PlanOwnership::Unattributable,
+                "{name} has no canonical issue slot — ambiguity must fail open"
+            );
+        }
+    }
+
+    #[test]
+    fn test_plan_ownership_no_callout_is_unattributable() {
+        assert_eq!(
+            plan_ownership(UNGROOMED_BODY, 1901),
+            PlanOwnership::Unattributable,
+            "mika#1901 carried no callout at all"
+        );
+    }
+
+    #[test]
+    fn test_plan_ownership_anchored_against_the_2038_glob_trap() {
+        // mika#2038: a permissive `*-2026-*` glob matched `rustsec-2026-0097`.
+        // The anchored slot regex must not read a slug number as an issue slot.
+        let body =
+            body_with_plan("2026-04-11-003-chore-deps-bump-rand-clear-rustsec-2026-0097-plan.md");
+        // `chore` is the type field, `deps` is not a number → no slot at the
+        // canonical position, so no accusation.
+        assert_eq!(plan_ownership(&body, 2026), PlanOwnership::Unattributable);
+    }
+
+    #[test]
+    fn test_plan_ownership_path_outside_docs_plans_is_unattributable() {
+        let body = "> - **Plan:** `notes/2026-08-29-002-fix-2038-x-plan.md`";
+        assert_eq!(plan_ownership(body, 2038), PlanOwnership::Unattributable);
+    }
+
+    // ── mika#2020: re-drive budget parsing ──
+
+    #[test]
+    fn test_max_redrives_parse_contract() {
+        assert_eq!(parse_max_redrives(None), MAX_REDRIVES_DEFAULT);
+        assert_eq!(parse_max_redrives(Some("")), MAX_REDRIVES_DEFAULT);
+        assert_eq!(parse_max_redrives(Some("   ")), MAX_REDRIVES_DEFAULT);
+        assert_eq!(parse_max_redrives(Some("-1")), MAX_REDRIVES_DEFAULT);
+        assert_eq!(parse_max_redrives(Some("abc")), MAX_REDRIVES_DEFAULT);
+        assert_eq!(parse_max_redrives(Some("7")), 7);
+        assert_eq!(
+            parse_max_redrives(Some("0")),
+            0,
+            "0 is the disable sentinel"
+        );
+    }
+
+    // ── mika#2020: Phase 2 classification ──
+
+    fn facts(redrive_count: i64) -> StuckReadyFacts {
+        StuckReadyFacts {
+            has_open_pr: false,
+            in_flight: false,
+            circuit_broken: false,
+            redrive_count,
+            abandoned: false,
+        }
+    }
+
+    #[test]
+    fn test_classify_operator_review_is_skipped_never_abandoned() {
+        let issue = make_issue(1, UNGROOMED_BODY, &["ready", "operator-review"], "t");
+        assert_eq!(
+            classify_stuck_ready(&issue, &facts(99), 3),
+            StuckReadyVerdict::Skip {
+                reason: "operator_review_or_blocked"
+            },
+            "a ticket already in the operator's hands gets no second gesture"
+        );
+    }
+
+    #[test]
+    fn test_classify_foreign_plan_abandons_without_spending_budget() {
+        let body =
+            body_with_plan("2026-08-21-002-fix-1933-reader-completed-section-avancement-plan.md");
+        let issue = make_issue(1887, &body, &["ready"], "t");
+        match classify_stuck_ready(&issue, &facts(0), 3) {
+            StuckReadyVerdict::Abandon(AbandonReason::PlanOwnedByOtherIssue { plan, owner }) => {
+                assert_eq!(owner, 1933);
+                assert!(plan.contains("fix-1933"));
+            }
+            other => panic!("expected immediate abandon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_ungroomed_ticket_spends_budget_then_abandons() {
+        // The mika#1901 shape: `ready` on a ticket with no callout at all.
+        // `ready` on an ungroomed ticket is the pipeline's NOMINAL entry state
+        // — re-driving it is how dev-groom gets another chance — so it is
+        // bounded, not refused on sight.
+        let issue = make_issue(1901, UNGROOMED_BODY, &["ready"], "t");
+        for count in 0..3 {
+            assert_eq!(
+                classify_stuck_ready(&issue, &facts(count), 3),
+                StuckReadyVerdict::Eligible,
+                "re-drive {count} is still within budget"
+            );
+        }
+        assert_eq!(
+            classify_stuck_ready(&issue, &facts(3), 3),
+            StuckReadyVerdict::Abandon(AbandonReason::RedriveBudgetExhausted {
+                redrives: 3,
+                budget: 3,
+            }),
+            "16 re-drives becomes 3"
+        );
+    }
+
+    #[test]
+    fn test_classify_zero_budget_never_abandons_for_budget() {
+        let issue = make_issue(1901, UNGROOMED_BODY, &["ready"], "t");
+        assert_eq!(
+            classify_stuck_ready(&issue, &facts(999), 0),
+            StuckReadyVerdict::Eligible,
+            "budget 0 restores the pre-fix unbounded behaviour"
+        );
+    }
+
+    #[test]
+    fn test_classify_progress_resets_budget() {
+        let issue = make_issue(1, UNGROOMED_BODY, &["ready"], "t");
+
+        let mut f = facts(2);
+        f.has_open_pr = true;
+        assert_eq!(
+            classify_stuck_ready(&issue, &f, 3),
+            StuckReadyVerdict::SkipAndResetBudget {
+                reason: "open_pr_closing"
+            }
+        );
+
+        let mut f = facts(2);
+        f.in_flight = true;
+        assert_eq!(
+            classify_stuck_ready(&issue, &f, 3),
+            StuckReadyVerdict::SkipAndResetBudget {
+                reason: "in_flight_self_dev"
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_progress_outranks_an_exhausted_budget() {
+        // A ticket that produced a PR must not be abandoned for a stale count.
+        let issue = make_issue(1, UNGROOMED_BODY, &["ready"], "t");
+        let mut f = facts(3);
+        f.has_open_pr = true;
+        assert_eq!(
+            classify_stuck_ready(&issue, &f, 3),
+            StuckReadyVerdict::SkipAndResetBudget {
+                reason: "open_pr_closing"
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_reentry_when_operator_lifts_the_label() {
+        // Abandoned earlier (stamp set), `operator-review` no longer present →
+        // the operator put it back in play.
+        let issue = make_issue(1901, UNGROOMED_BODY, &["ready"], "t");
+        let mut f = facts(3);
+        f.abandoned = true;
+        assert_eq!(
+            classify_stuck_ready(&issue, &f, 3),
+            StuckReadyVerdict::ReEntry
+        );
+    }
+
+    #[test]
+    fn test_classify_abandoned_and_still_labelled_stays_silent() {
+        // R13: no second comment on subsequent ticks.
+        let issue = make_issue(1901, UNGROOMED_BODY, &["ready", "operator-review"], "t");
+        let mut f = facts(3);
+        f.abandoned = true;
+        assert_eq!(
+            classify_stuck_ready(&issue, &f, 3),
+            StuckReadyVerdict::Skip {
+                reason: "operator_review_or_blocked"
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_circuit_breaker_still_wins_over_budget() {
+        let issue = make_issue(1, UNGROOMED_BODY, &["ready"], "t");
+        let mut f = facts(0);
+        f.circuit_broken = true;
+        assert_eq!(
+            classify_stuck_ready(&issue, &f, 3),
+            StuckReadyVerdict::Skip {
+                reason: "circuit_breaker"
+            },
+            "the mika#1363 breaker keeps its own semantics (R7)"
+        );
+    }
+
+    // ── mika#2020: abandonment message contract ──
+
+    #[test]
+    fn test_abandon_reason_names_ticket_reason_and_remedy() {
+        let reason = AbandonReason::PlanOwnedByOtherIssue {
+            plan: "docs/plans/2026-08-21-002-fix-1933-x-plan.md".to_string(),
+            owner: 1933,
+        };
+        let body = reason.comment_body(1887);
+        assert!(body.contains("#1887"), "names the ticket");
+        assert!(body.contains("fix-1933"), "names the offending plan");
+        assert!(body.contains("#1933"), "names the plan's real owner");
+        assert!(
+            body.contains("operator-review"),
+            "names the re-entry gesture — R12's remedy must survive rewrites"
+        );
+        assert!(body.contains("auto_pull_redrive_abandoned"));
+    }
+
+    #[test]
+    fn test_abandon_reason_budget_names_counts() {
+        let reason = AbandonReason::RedriveBudgetExhausted {
+            redrives: 3,
+            budget: 3,
+        };
+        let body = reason.comment_body(1901);
+        assert!(body.contains("#1901"));
+        assert!(body.contains("3 fois"), "names the measured count");
+        assert!(body.contains("operator-review"));
+        assert_eq!(reason.slug(), "redrive_budget_exhausted");
+    }
+
+    // ── mika#2020: Phase 0 / Phase 1 tightening ──
+
+    #[test]
+    fn test_select_best_candidate_rejects_foreign_plan() {
+        let foreign =
+            body_with_plan("2026-08-21-002-fix-1933-reader-completed-section-avancement-plan.md");
+        let issues = vec![
+            // Higher priority, but its plan belongs to #1933.
+            make_issue(1887, &foreign, &["p0"], "2026-08-01T00:00:00Z"),
+            make_issue(2, GROOMED_BODY, &["p1"], "2026-08-01T00:00:00Z"),
+        ];
+        let selected = select_best_candidate(issues, &HashSet::new()).unwrap();
+        assert_eq!(
+            selected.number, 2,
+            "a misattributed plan loses to a correctly-attributed one, whatever its priority"
+        );
+    }
+
+    #[test]
+    fn test_select_feeder_candidates_rejects_foreign_plan() {
+        let foreign =
+            body_with_plan("2026-08-21-002-fix-1933-reader-completed-section-avancement-plan.md");
+        let issues = vec![
+            make_issue(1887, &foreign, &["p0-critical"], "2026-08-01T00:00:00Z"),
+            make_issue(2, GROOMED_BODY, &["p2-normal"], "2026-08-01T00:00:00Z"),
+        ];
+        let selected = select_feeder_candidates(&issues, &HashSet::new(), &HashSet::new(), 5);
+        assert_eq!(selected, vec![2]);
+    }
+
+    #[test]
+    fn test_phase1_does_not_repromote_an_abandoned_ticket() {
+        // R11: without this filter the abandonment leaks — Phase 1 would put
+        // `ready` back on a ticket the reconciler just handed to the operator,
+        // and the ready-label webhook would dispatch it again.
+        let issues = vec![
+            make_issue(1901, GROOMED_BODY, &["p0", "operator-review"], "t"),
+            make_issue(2, GROOMED_BODY, &["p3"], "t"),
+        ];
+        let selected = select_best_candidate(issues, &HashSet::new()).unwrap();
+        assert_eq!(
+            selected.number, 2,
+            "an operator-held ticket is not promotable, whatever its priority"
+        );
+    }
+
+    #[test]
+    fn test_phase1_does_not_promote_a_blocked_ticket() {
+        let issues = vec![make_issue(1, GROOMED_BODY, &["p0", "blocked"], "t")];
+        assert!(select_best_candidate(issues, &HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn test_unattributable_plan_still_passes_every_phase() {
+        // R2: the guard accuses on contradiction, never on ambiguity.
+        let historical = body_with_plan("918-eval-kg-fixtures-schema-pin.md");
+        let issues = vec![make_issue(1, &historical, &["p1-important"], "t")];
+        assert_eq!(
+            select_feeder_candidates(&issues, &HashSet::new(), &HashSet::new(), 5),
+            vec![1]
+        );
+        assert!(select_best_candidate(issues, &HashSet::new()).is_some());
+
+        let ready_issue = make_issue(1, &historical, &["ready"], "t");
+        assert_eq!(
+            classify_stuck_ready(&ready_issue, &facts(0), 3),
+            StuckReadyVerdict::Eligible
         );
     }
 }

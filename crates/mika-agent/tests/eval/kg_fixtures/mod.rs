@@ -26,7 +26,7 @@ use mika_agent::db::{CURRENT_SCHEMA_VERSION, Database};
 // v48→v49 (mika#1671) expanded the `team_runs.status` CHECK to include
 // `'failed_transport'` — a non-KG table rebuild, so no `seed_*` helper change is
 // needed (fixtures never touch `team_runs`); only the pin advances.
-const PINNED_SCHEMA_VERSION: i64 = 49;
+const PINNED_SCHEMA_VERSION: i64 = 50;
 
 const _: () = assert!(
     CURRENT_SCHEMA_VERSION == PINNED_SCHEMA_VERSION,
