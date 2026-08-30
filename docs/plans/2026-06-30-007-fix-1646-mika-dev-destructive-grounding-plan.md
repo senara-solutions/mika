@@ -114,3 +114,134 @@ Out-of-scope unless n≥2 occurrences emerge per evidence-gated-expansion discip
 - Mika Prime bearing 2026-06-29 ~11:25Z
 - mika-arch grooming session `676e9497-b971-4fbd-9d6a-ab85694bcd98` (ITERATE → 3 architect concerns applied → GROOMED)
 - PR #1644 — founding incident
+
+---
+
+## Révision d'implémentation — 2026-08-30
+
+Le plan ci-dessus a été groomé le 2026-06-30. Deux mois de dérive séparent ses
+présomptions d'architecture du code réel. Cette section enregistre ce qui a été
+**mesuré** dans l'arbre au moment d'implémenter, et ce qui change en conséquence.
+Les acceptance criteria AC1–AC5 sont **inchangés** — seule la localisation du
+mécanisme bouge.
+
+### Étape 0 (prérequis BLOQUANT architecte F3) — RÉSOLUE
+
+```
+sqlite3 ~/.mika/data/mika.db "SELECT sql FROM sqlite_master WHERE name='audit_events';"
+```
+
+`audit_events` n'a **pas** de colonne `event_type`. Le schéma réel est
+`(id, agent_id, session_id, tool_name, target_key, before_value, after_value,
+reasoning, trace_id, rewound_by_trace_id, created_at)`, avec `tool_name TEXT NOT NULL`
+libre — aucun ENUM, aucun CHECK.
+
+**Conséquence : aucune migration.** Le nouveau type d'événement s'écrit
+`tool_name = "destructive_action_grounding"`, exactement comme les précédents
+déjà en place (`tool_name='phantom_aged_out'` mika#1712, `tool_name="wip_rescue"`
+mika#1852). Le plan parlait d'un `event_type` qui n'existe pas ; AC3 est servi
+tel quel par la colonne `tool_name`.
+
+### Écart 1 — le guard ne peut pas vivre à EndTurn
+
+Le plan situe les deux couches dans un « EndTurn engine guard », par analogie
+avec assert-grounded (mika#1331). La mesure contredit l'analogie :
+
+- `crates/mika-agent/src/agent_loop/guards/` **n'existe pas**. Les prédicats
+  vivent dans `crates/mika-agent/src/evidence/guards.rs` ; l'enforcement est
+  inline dans l'arm `EndTurn` de `agent_loop/mod.rs:2038` (assert-grounded) et
+  `:2103` (equivalence-claim).
+- Ces guards inspectent le **texte** de l'assistant et **re-promptent**. Ils
+  sont conçus pour la fabrication énonciative.
+
+Or le défaut de mika#1646 n'est pas une phrase : c'est un **appel d'outil**.
+`gh pr close 1644` part au step 3 de la boucle d'outils. Quand l'arm EndTurn
+s'exécute, la PR est déjà fermée. Un guard EndTurn ne peut ni l'empêcher ni la
+défaire — il peut seulement commenter une fermeture accomplie. Sur une action
+destructrice, c'est précisément le mode d'échec que le ticket décrit : « le
+système rend un état plausible, et personne ne sait qu'il a été écrasé ».
+
+**Résolution : le gate se place avant l'exécution**, dans la chaîne de
+validation pré-subprocess de `run_gh` (`skills/builtin_handlers.rs:2596`), là où
+le moteur refuse déjà des appels `gh` :
+
+- `validate_qa_review_gh_scope` (mika#1196)
+- `validate_pr_ready_undraft_scope` (mika#1682) — **patron direct** : `async`,
+  prend `&ToolContext`, rend `Result<(), ToolOutput>`, journalise un événement
+  de refus, et refuse une action `gh pr` avant tout effet de bord
+- `validate_gh_api_scope` (mika#1167)
+
+Le commentaire du guardrail Layer 4 (mika#1798, `tool_execution/dispatch.rs:444`)
+nomme cette règle explicitement : les builtins comme `run_gh` n'ont pas de
+`data_grade` et « leur gate vit dans le handler ».
+
+Ce déplacement **porte** l'intention ratifiée par l'architecte — bloquer une
+fermeture non fondée — au lieu de la contredire. EndTurn ne pouvait pas la
+servir. Aucun critère d'acceptation n'est renversé ; c'est le lieu du mécanisme
+qui est corrigé par la mesure.
+
+### Écart 2 — le frère mika#1645 a shippé
+
+`EQUIVALENCE_CLAIM_LABEL` + `detect_equivalence_claim` + `equivalence_claim_satisfied`
+sont en place (`evidence/guards.rs:366`, câblés `agent_loop/mod.rs:2103`). Le
+côté **émission** (qa n'énonce plus « duplicate of #X » sans fondement) est
+couvert. Ce ticket reste entièrement nécessaire : il couvre le côté **action**,
+et le ticket le dit — « either fix alone closes the incident; both together
+close the class ». Rien à re-livrer, rien à retirer.
+
+### Exigence opérateur (2026-08-30) — deux ajouts qui ne relâchent rien
+
+**1. Idempotence par intention, pas par hasard.** Vérifier l'état avant d'agir
+ne suffit pas : entre la lecture et l'écriture, quelqu'un a pu rouvrir. Ce qu'il
+faut, c'est que **la seconde exécution sache qu'elle est une seconde exécution**.
+
+Conséquence de conception : la détection d'action répétée interroge la table
+`tool_calls` **persistée** (`agent_id` + `tool_name='run_gh'` + `input LIKE` +
+fenêtre sur `created_at`), et non un état en mémoire du tour ou de la session.
+Une reprise après redémarrage du process, une relecture de webhook différée, une
+nouvelle session sur la même cible — toutes voient la trace de la première
+exécution. C'est ce qui distingue « je vérifie l'état » de « je sais que je
+rejoue ». L'incident fondateur est exactement ce cas : le second close est venu
+d'un **replay de webhook différé** (11:12:11Z), donc d'un contexte qui ne
+partageait aucune mémoire de tour avec le premier.
+
+**2. Sens du fail : dans le doute, ne pas fermer.** Un ticket resté ouvert à
+tort se voit et se corrige ; un ticket fermé à tort disparaît du compte et
+personne ne le cherche. L'asymétrie des coûts commande l'asymétrie du défaut.
+
+Cela se décline en deux directions **opposées**, et la distinction est
+load-bearing :
+
+- **Détection : fail-open.** Si l'on ne reconnaît pas l'appel comme destructeur,
+  on ne bloque pas. Le gate ne doit pas se transformer en refus général de `gh` ;
+  il est borné à `pr close` / `issue close` (périmètre du plan, § Future
+  expansion).
+- **Fondation : fail-closed.** Une fois l'appel **reconnu** comme destructeur,
+  toute incapacité à prouver qu'il est fondé — grounding absent, historique
+  illisible, persistance des tool-calls désactivée, erreur DB — donne un
+  **refus**, jamais un laissez-passer. C'est l'inverse du réflexe habituel des
+  guards de fabrication (`assert_grounded` est délibérément « lean-narrow
+  fail-open », cf. `evidence/guards.rs:269`), et l'inversion est voulue : le coût
+  d'un faux positif est un refus visible et réparable, le coût d'un faux négatif
+  est un travail défait en silence.
+
+Le message de refus doit donc être **actionnable** : nommer la cause précise et
+le geste qui débloque.
+
+### Fichiers réellement touchés (remplace la liste § Files involved)
+
+- `crates/mika-agent/src/evidence/guards.rs` — prédicats purs : détection de
+  l'action destructrice, extraction de la cible, prédicats de satisfaction
+  (Layer A / Layer B). Même module que ses frères mika#1331 / mika#1645.
+- `crates/mika-agent/src/evidence/mod.rs` — ré-exports.
+- `crates/mika-agent/src/skills/builtin_handlers.rs` — le gate `async` dans la
+  chaîne pré-subprocess de `run_gh`, patron `validate_pr_ready_undraft_scope`.
+- `crates/mika-agent/src/db.rs` + `src/async_db.rs` — requête d'historique des
+  actions destructrices récentes sur une cible (fenêtre paramétrée).
+- `crates/mika-agent/tests/eval/calibration_fixtures/mika-dev/destructive_action_thread_reground.md`
+  — fixture AC5.
+- `crates/mika-agent/tests/eval/calibration_fixtures/mika-dev/manifest.yaml` +
+  `src/calibration/roles/mika_dev.rs` — enregistrement explicite (AC5).
+
+Pas de `agent_loop/guards/destructive_grounding.rs` (le dossier n'existe pas),
+pas de migration `audit_events` (étape 0).
