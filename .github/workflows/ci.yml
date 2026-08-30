@@ -206,6 +206,16 @@ jobs:
       - name: Enforce no-log discipline on egress substrate (mika#1810 E4)
         run: bash scripts/verify-egress-no-log.sh
 
+  sigpipe-grep-lint:
+    name: SIGPIPE grep-q Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      - name: Reject `printf|echo | grep -q` under pipefail (mika#2055)
+        run: bash scripts/verify-no-sigpipe-grep.sh
+      - name: Anti-vacuity — the guard must be able to fail (mika#2055)
+        run: bash scripts/test-verify-no-sigpipe-grep.sh
+
   secret-scan:
     name: Secret Scan
     runs-on: ubuntu-22.04

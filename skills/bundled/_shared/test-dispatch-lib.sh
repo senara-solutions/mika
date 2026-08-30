@@ -1103,19 +1103,19 @@ test_auto_rescue_excludes_scaffold_files() {
     staged=$(git -C "$test_dir" diff --cached --name-only)
 
     # Scaffold file must NOT appear in staged files
-    if echo "$staged" | grep -q '.claude/commands/'; then
+    if grep -q -- '.claude/commands/' <<<"$staged"; then
         echo "FAIL: scaffold file was staged"
         return 1
     fi
 
     # Pilot-authored new file must be staged
-    if ! echo "$staged" | grep -q 'src/new_feature.rs'; then
+    if ! grep -q -- 'src/new_feature.rs' <<<"$staged"; then
         echo "FAIL: pilot-authored new file was not staged"
         return 1
     fi
 
     # Modified tracked file must be staged
-    if ! echo "$staged" | grep -q 'tracked.rs'; then
+    if ! grep -q -- 'tracked.rs' <<<"$staged"; then
         echo "FAIL: modified tracked file was not staged"
         return 1
     fi
@@ -1193,19 +1193,19 @@ test_auto_rescue_excludes_claude_pilot_json() {
     staged=$(git -C "$test_dir" diff --cached --name-only)
 
     # claude-pilot.json must NOT appear in staged files (mika#1419 regression).
-    if echo "$staged" | grep -q '.claude/claude-pilot.json'; then
+    if grep -q -- '.claude/claude-pilot.json' <<<"$staged"; then
         echo "FAIL: .claude/claude-pilot.json was staged (mika#1419 ping-pong reintroduced)"
         return 1
     fi
 
     # .claude/commands/ scaffold must NOT appear (mika#1288 regression).
-    if echo "$staged" | grep -q '.claude/commands/'; then
+    if grep -q -- '.claude/commands/' <<<"$staged"; then
         echo "FAIL: .claude/commands/ scaffold was staged (mika#1288 regression)"
         return 1
     fi
 
     # Pilot-authored file MUST be staged.
-    if ! echo "$staged" | grep -q 'src/new_feature.rs'; then
+    if ! grep -q -- 'src/new_feature.rs' <<<"$staged"; then
         echo "FAIL: pilot-authored file was not staged"
         return 1
     fi
@@ -1292,19 +1292,19 @@ test_auto_rescue_excludes_settings_local_json() {
     staged=$(git -C "$test_dir" diff --cached --name-only)
 
     # settings.local.json must NOT appear (mika#1552 explicit exclusion).
-    if echo "$staged" | grep -q '.claude/settings.local.json'; then
+    if grep -q -- '.claude/settings.local.json' <<<"$staged"; then
         echo "FAIL: .claude/settings.local.json was staged (mika#1552 leak)"
         return 1
     fi
 
     # hooks.local.json must NOT appear (mika#1552 wildcard exclusion).
-    if echo "$staged" | grep -q '.claude/hooks.local.json'; then
+    if grep -q -- '.claude/hooks.local.json' <<<"$staged"; then
         echo "FAIL: .claude/hooks.local.json was staged (mika#1552 wildcard gap)"
         return 1
     fi
 
     # Pilot-authored file MUST be staged.
-    if ! echo "$staged" | grep -q 'src/new_feature.rs'; then
+    if ! grep -q -- 'src/new_feature.rs' <<<"$staged"; then
         echo "FAIL: pilot-authored file was not staged"
         return 1
     fi
@@ -1445,10 +1445,10 @@ ${RESULT}"
     if [ "$RESCUED_DIRTY_WORKTREE" != "0" ]; then
         failures="${failures}RESCUED_DIRTY_WORKTREE should be 0 but is $RESCUED_DIRTY_WORKTREE; "
     fi
-    if ! printf '%s' "$RESULT" | grep -qF "PIPELINE FAILURE"; then
+    if ! grep -qF -- "PIPELINE FAILURE" <<<"$RESULT"; then
         failures="${failures}RESULT missing PIPELINE FAILURE; "
     fi
-    if ! printf '%s' "$RESULT" | grep -qF "cargo fmt stderr:"; then
+    if ! grep -qF -- "cargo fmt stderr:" <<<"$RESULT"; then
         failures="${failures}RESULT missing cargo fmt diagnostic; "
     fi
     if [ -f "$RESCUE_COMMIT_ERR" ]; then
@@ -1616,7 +1616,7 @@ _fixture_cleanup() {
 _assert_fixture_is_local() {
     local remote_url
     remote_url=$(git -C "$FIXTURE_CLONE" remote get-url origin 2>/dev/null)
-    if ! printf '%s' "$remote_url" | grep -q "^file://\|^/"; then
+    if ! grep -q -- "^file://\|^/" <<<"$remote_url"; then
         echo "SAFETY ABORT: fixture remote is not local: $remote_url" >&2
         _fixture_cleanup
         return 1
@@ -1644,11 +1644,11 @@ test_first_push() {
 
     local failures=""
     # Assert: push succeeded.
-    if ! printf '%s' "$RESULT" | grep -qF "Push: pushed"; then
+    if ! grep -qF -- "Push: pushed" <<<"$RESULT"; then
         failures="${failures}RESULT missing 'Push: pushed'; "
     fi
     # Assert: mode is first-push (not diverged).
-    if printf '%s' "$RESULT" | grep -qF "mode=diverged"; then
+    if grep -qF -- "mode=diverged" <<<"$RESULT"; then
         failures="${failures}should not be diverged mode for first push; "
     fi
     # Assert: remote ref now exists.
@@ -1691,10 +1691,10 @@ test_fast_forward_push() {
     _push_branch
 
     local failures=""
-    if ! printf '%s' "$RESULT" | grep -qF "Push: pushed"; then
+    if ! grep -qF -- "Push: pushed" <<<"$RESULT"; then
         failures="${failures}RESULT missing 'Push: pushed'; "
     fi
-    if ! printf '%s' "$RESULT" | grep -qF "mode=fast-forward"; then
+    if ! grep -qF -- "mode=fast-forward" <<<"$RESULT"; then
         failures="${failures}should be fast-forward mode; "
     fi
     # Remote should match local HEAD.
@@ -1756,10 +1756,10 @@ test_diverged_force_with_lease() {
     _push_branch
 
     local failures=""
-    if ! printf '%s' "$RESULT" | grep -qF "Push: pushed"; then
+    if ! grep -qF -- "Push: pushed" <<<"$RESULT"; then
         failures="${failures}RESULT missing 'Push: pushed'; "
     fi
-    if ! printf '%s' "$RESULT" | grep -qF "mode=diverged"; then
+    if ! grep -qF -- "mode=diverged" <<<"$RESULT"; then
         failures="${failures}should be diverged mode; "
     fi
     # Remote should match local HEAD.
@@ -1798,13 +1798,13 @@ fi
 PUSH_FUNC_SRC="$(declare -f _push_branch)
 $(declare -f _push_with_rebase_retry)"
 # Verify explicit lease form (pins expected remote SHA)
-if printf '%s' "$PUSH_FUNC_SRC" | grep -q 'force-with-lease=.*BRANCH.*origin.*BRANCH'; then
+if grep -q -- 'force-with-lease=.*BRANCH.*origin.*BRANCH' <<<"$PUSH_FUNC_SRC"; then
     PASS=$((PASS + 1)); echo "  ✓ Lease form: --force-with-lease uses explicit ref pinning"
 else
     FAIL=$((FAIL + 1)); echo "  ✗ Lease form: should use --force-with-lease=\$BRANCH:origin/\$BRANCH"
 fi
 # Verify no blind --force (without -with-lease)
-if printf '%s' "$PUSH_FUNC_SRC" | grep -q -- '--force[^-]'; then
+if grep -q -- '--force[^-]' <<<"$PUSH_FUNC_SRC"; then
     FAIL=$((FAIL + 1)); echo "  ✗ Lease safety: found bare --force (should be --force-with-lease only)"
 else
     PASS=$((PASS + 1)); echo "  ✓ Lease safety: no bare --force (only --force-with-lease)"
@@ -1876,19 +1876,19 @@ Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
 
     local failures=""
     # Assert: STATUS=REBASE_CONFLICT present.
-    if ! printf '%s' "$RESULT" | grep -qF "STATUS=REBASE_CONFLICT"; then
+    if ! grep -qF -- "STATUS=REBASE_CONFLICT" <<<"$RESULT"; then
         failures="${failures}RESULT missing STATUS=REBASE_CONFLICT; "
     fi
     # Assert: conflict mode token present (AC#4).
-    if ! printf '%s' "$RESULT" | grep -qF "Rebase failure mode: conflict"; then
+    if ! grep -qF -- "Rebase failure mode: conflict" <<<"$RESULT"; then
         failures="${failures}RESULT missing 'Rebase failure mode: conflict'; "
     fi
     # Assert: conflicted filename present.
-    if ! printf '%s' "$RESULT" | grep -qF "file.txt"; then
+    if ! grep -qF -- "file.txt" <<<"$RESULT"; then
         failures="${failures}RESULT missing conflicted filename 'file.txt'; "
     fi
     # Assert: rebase stderr is non-empty (AC#4 — not /dev/null).
-    if printf '%s' "$RESULT" | grep -qF "Rebase stderr: <empty>"; then
+    if grep -qF -- "Rebase stderr: <empty>" <<<"$RESULT"; then
         failures="${failures}RESULT has empty rebase stderr (should be surfaced); "
     fi
 
@@ -1951,7 +1951,7 @@ test_dedup_rebase_diverged_force() {
     _push_branch
 
     local failures=""
-    if ! printf '%s' "$RESULT" | grep -qF "Push: pushed"; then
+    if ! grep -qF -- "Push: pushed" <<<"$RESULT"; then
         failures="${failures}RESULT missing 'Push: pushed'; "
     fi
     # Remote should match local HEAD.
@@ -2065,7 +2065,7 @@ test_noop_when_head_equals_remote_stale_main() {
     [ "$rc" -eq 0 ] || failures="${failures}expected return 0 (no-op), got $rc; "
     [ "${behind:-0}" -ge 1 ] || failures="${failures}fixture should leave local main behind origin/main; "
     [ "$remote_before" = "$remote_after" ] || failures="${failures}remote HEAD must be unchanged (nothing pushed); "
-    if printf '%s' "$RESULT" | grep -qiE "divergence|abort|reconciliation|Push: pushed|Push: FAILED"; then
+    if grep -qiE -- "divergence|abort|reconciliation|Push: pushed|Push: FAILED" <<<"$RESULT"; then
         failures="${failures}RESULT must contain no push/abort/divergence text; "
     fi
 
@@ -2800,7 +2800,7 @@ assert_contains "Parser strips the owner/ prefix to the bare basename" \
 #     (the full dispatch_claude_pilot needs git/gh/claude-pilot).
 _parse_prompt() {
     local PROMPT="$1" REPO="" ISSUE_NUM=""
-    if printf '%s' "$PROMPT" | grep -qE '^([a-zA-Z0-9_-]+/)?[a-zA-Z0-9_-]+#[0-9]+$'; then
+    if grep -qE -- '^([a-zA-Z0-9_-]+/)?[a-zA-Z0-9_-]+#[0-9]+$' <<<"$PROMPT"; then
         REPO=$(printf '%s' "$PROMPT" | sed 's/#.*//' | sed 's#.*/##')
         ISSUE_NUM=$(printf '%s' "$PROMPT" | sed 's/.*#//')
     fi
@@ -3149,7 +3149,7 @@ test_outcome_emitted_on_branch_b() {
         _post_flight_recovery 2>/dev/null
 
         # Outcome classification should have run (PIPELINE_INCOMPLETE for zero-commit)
-        if printf '%s' "$RESULT" | grep -qF "Outcome:"; then
+        if grep -qF -- "Outcome:" <<<"$RESULT"; then
             echo "OK"
         else
             echo "FAIL: no Outcome line in RESULT"
@@ -3873,9 +3873,9 @@ _repo_gate_verdict() {
             _set_up_worktree
         ) 2>&1 || true
     )
-    if printf '%s' "$out" | grep -q 'repo_not_dispatchable'; then
+    if grep -q -- 'repo_not_dispatchable' <<<"$out"; then
         printf 'refused'
-    elif printf '%s' "$out" | grep -q 'is not a git repository'; then
+    elif grep -q -- 'is not a git repository' <<<"$out"; then
         printf 'passed-gate'
     else
         printf 'unexpected'

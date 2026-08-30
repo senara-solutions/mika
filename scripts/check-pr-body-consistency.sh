@@ -145,9 +145,9 @@ if [[ -n "$CLOSE_REFS" ]]; then
         while IFS= read -r sub_number; do
             [[ -z "$sub_number" ]] && continue
             # Match: "Tracked in: #N" or "Tracked in: owner/repo#N"
-            if ! echo "$PR_BODY" | grep -qiE "Tracked in:.*#${sub_number}(\\b|$)"; then
+            if ! grep -qiE -- "Tracked in:.*#${sub_number}(\\b|$)" <<<"$PR_BODY"; then
                 # Also check if the PR itself closes the sub-issue.
-                if ! echo "$CLOSE_REFS" | grep -qx "$sub_number"; then
+                if ! grep -qx -- "$sub_number" <<<"$CLOSE_REFS"; then
                     unacked+="  - #${sub_number}"$'\n'
                 fi
             fi
@@ -179,9 +179,9 @@ MATCHED_TRIGGER="$(echo "$PR_BODY" | grep -oiE "$TRIGGER_PATTERN" | head -1)" ||
 if [[ -n "$MATCHED_TRIGGER" ]]; then
     # Check for a valid Tracked in: line with a GitHub ref pattern.
     # Valid: "Tracked in: #N" or "Tracked in: owner/repo#N"
-    if ! echo "$PR_BODY" | grep -qiE 'Tracked in:.*#[0-9]+'; then
+    if ! grep -qiE -- 'Tracked in:.*#[0-9]+' <<<"$PR_BODY"; then
         # Check if there's a malformed Tracked in: line (no #N).
-        if echo "$PR_BODY" | grep -qiE 'Tracked in:'; then
+        if grep -qiE -- 'Tracked in:' <<<"$PR_BODY"; then
             add_error "$(cat <<EOF
 ERROR: PR body has a \`Tracked in:\` line but the reference does not match \`#N\` or \`<owner>/<repo>#N\` form.
 
