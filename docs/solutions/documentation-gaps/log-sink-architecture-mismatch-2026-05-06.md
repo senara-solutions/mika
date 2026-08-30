@@ -28,6 +28,16 @@ mika has **two distinct log sinks**, each written by a different process:
 | Server log | `mika-spirit` (long-running daemon) | `MIKA_SPIRIT_LOG_FILE` (default: `/var/log/mika/server.log`) | All runtime events: skill execution, task engine, callbacks, autonomous-loop lifecycle |
 | Per-agent CLI log | `mika` CLI (`mika ask`, `mika chat`) | `~/.mika/agents/<name>/logs/mika.log.YYYY-MM-DD` | Events from discrete CLI invocations only |
 
+> **Update 2026-08-30 (mika#2069) — the `mika ask` row above is stale.** Since
+> mika#1727, `mika ask` is a thin A2A client: it ships the prompt to mika-spirit,
+> which owns the execution session. A `mika ask` invocation's **agent turns**
+> (`turn_usage`, `llm_call`, tool events) are therefore emitted by the spirit
+> process and land in `MIKA_SPIRIT_LOG_FILE`; only its client-side events reach
+> the per-agent file. What that file genuinely holds today: `mika chat` (TUI)
+> turns, which still run in-process, and silent-mode background turns
+> (`heartbeat-…`, `reflection-…`, `reminder-…`). Canonical statement:
+> `crates/mika-agent/CLAUDE.md` § Log Sinks.
+
 **The key insight:** Both sinks write the same structured JSON with an `agent_id` field. The CLI log is per-agent by path; the server log is per-agent by filter. They are not duplicates — they capture events from different processes.
 
 **Query patterns:**
