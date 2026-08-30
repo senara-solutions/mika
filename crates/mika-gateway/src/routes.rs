@@ -76,7 +76,9 @@ pub(crate) struct VersionInfo {
 pub(crate) async fn handle_version() -> Json<VersionInfo> {
     Json(VersionInfo {
         version: env!("CARGO_PKG_VERSION"),
-        git_hash: option_env!("GIT_HASH").unwrap_or("unknown"),
+        // mika#2066 AC3 — the commit stamp now comes from the single shared
+        // capture in mika-common, not this crate's build.rs.
+        git_hash: mika_common::build_info::GIT_HASH,
     })
 }
 

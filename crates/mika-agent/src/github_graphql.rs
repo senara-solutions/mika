@@ -203,6 +203,76 @@ pub(crate) async fn fetch_issue_body(
         .ok_or_else(|| "issue body field missing or null".to_string())
 }
 
+/// Fetch an issue's label names (mika#2084).
+///
+/// Returns `Ok(None)` when the number resolves to a **pull request** rather than
+/// an issue. GitHub shares one numbering space between the two and the REST
+/// issues endpoint serves both, distinguishing them only by the presence of a
+/// `pull_request` key — and `gh issue view <pr-number>` resolves silently, with
+/// exit code 0 and an empty label list. A caller that treats that as "this
+/// ticket carries no seat label" gets a confident wrong answer, so the
+/// discriminant is returned rather than swallowed.
+///
+/// Uses the same bounded REST client as [`fetch_issue_body`]: a 10-second
+/// timeout, no subprocess. This sits on the dispatch hot path, where an
+/// unbounded `gh` child would be a new way for the loop to hang.
+pub(crate) async fn fetch_issue_labels_unless_pull_request(
+    token: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Result<Option<Vec<String>>, String> {
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/issues/{number}");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))?;
+
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("User-Agent", "mika-agent")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("GitHub API request failed: {e}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let msg = match status.as_u16() {
+            401 => "token invalid or expired".to_string(),
+            403 => "token lacks required permissions".to_string(),
+            404 => "not found or not accessible".to_string(),
+            429 => "rate limit exceeded".to_string(),
+            _ => format!("HTTP {status}"),
+        };
+        return Err(format!("GitHub API error: {msg}"));
+    }
+
+    let payload: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("failed to parse response: {e}"))?;
+
+    if payload.get("pull_request").is_some() {
+        return Ok(None);
+    }
+
+    Ok(Some(
+        payload
+            .get("labels")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|l| l.get("name").and_then(|n| n.as_str()))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    ))
+}
+
 /// Query GitHub's GraphQL API for `blockedBy` edges on an issue.
 ///
 /// Returns the issue numbers of any open (non-CLOSED) blockers. Returns an empty

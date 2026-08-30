@@ -6440,7 +6440,7 @@ fn ready_label_dispatch_trigger(msg: &str) -> bool {
 /// Returns `true` when `run_claude_pilot` or `run_claude_pilot_groom` was
 /// attempted on this turn (success or failure). The
 /// `webhook_ready_label_dispatch` intent-guard satisfies on **attempts**, not
-/// **successes**, because the eight terminal rejections from
+/// **successes**, because the nine terminal rejections from
 /// `validate_dispatch_readiness` (`crates/mika-agent/src/skills/executor.rs`)
 /// are structural and not recoverable by re-prompting the LLM:
 ///
@@ -6452,6 +6452,7 @@ fn ready_label_dispatch_trigger(msg: &str) -> bool {
 ///   6. `dispatch_no_grooming_marker` — ungroomed issue rejected at the gate (mika#919)
 ///   7. `dispatch_blocked_by` — open GitHub blockers remain (mika#713)
 ///   8. `repo_not_dispatchable` — target repo outside the allowlist (mika#2046)
+///   9. `dispatch_seat_mismatch` — the issue carries a `dispatch:*` seat label this engine cannot act on (mika#2084)
 ///
 /// Re-prompting the LLM after any of these would loop (the LLM cannot dissolve
 /// a structural rejection); the operator-notification path

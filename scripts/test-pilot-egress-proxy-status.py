@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime
 import importlib.util
 import io
 import os
 import pathlib
+import re
 import signal
 import socket
 import subprocess
@@ -33,6 +35,34 @@ import sys
 import types
 import unittest
 from importlib.machinery import SourceFileLoader
+
+# mika#2030: every line the proxy writes to `pilot-egress-proxy.log` now leads
+# with an ISO-8601 UTC millisecond stamp + a single space. This is the shape
+# `server.log`'s JSON `timestamp` uses (RFC3339 UTC), truncated to ms, so a
+# `grep 2026-08-28` composes across both files. The tests below assert the
+# stamp is present and parseable, then strip it so the message-shape assertions
+# established by mika#1901 keep reading against the un-prefixed text.
+_TS_PREFIX_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z) (?P<rest>.*)$"
+)
+
+
+def _strip_ts(test: unittest.TestCase, lines: list[str]) -> list[str]:
+    """Assert every non-empty line is timestamped + parseable, return the
+    message bodies with the stamp removed. Enforcing this on the shared test
+    helpers makes AC1 (all lines stamped) hold across every logging path these
+    tests already exercise, not just the ones that name the timestamp."""
+    stripped: list[str] = []
+    for line in lines:
+        if not line:
+            continue
+        match = _TS_PREFIX_RE.match(line)
+        test.assertIsNotNone(match, f"log line is not timestamped: {line!r}")
+        assert match is not None  # for type-checkers; assertIsNotNone already failed
+        # A stamp that is merely shaped right is not enough — it must parse.
+        datetime.datetime.strptime(match.group("ts"), "%Y-%m-%dT%H:%M:%S.%fZ")
+        stripped.append(match.group("rest"))
+    return stripped
 
 # `scripts/mika-pilot-egress-proxy` has no .py extension (it is installed as a
 # binary on PATH by `make install`), so it cannot be imported by name.
@@ -200,7 +230,7 @@ class RelayTapTests(unittest.IsolatedAsyncioTestCase):
             await proxy._relay_response_with_status_tap(
                 reader, writer, "POST", "/v1/messages?beta=true"
             )
-        return buffer.getvalue().splitlines()
+        return _strip_ts(self, buffer.getvalue().splitlines())
 
     async def test_relays_multi_chunk_sse_byte_identically(self) -> None:
         chunks = [
@@ -318,7 +348,7 @@ class UpstreamOutcomeLoggingTests(unittest.TestCase):
         buffer = io.StringIO()
         with contextlib.redirect_stderr(buffer):
             proxy._log_upstream_outcome("POST", "/v1/messages?beta=true", status, list(quota))
-        return buffer.getvalue().splitlines()
+        return _strip_ts(self, buffer.getvalue().splitlines())
 
     def test_success_logs_one_allow_line_carrying_the_status(self) -> None:
         lines = self._emit(200)
@@ -393,6 +423,83 @@ class LogSecrecyTests(unittest.TestCase):
         self.assertNotIn("Bearer", emitted)
         self.assertNotIn("set-cookie", emitted)
         self.assertNotIn(body.decode(), emitted)
+
+
+class TimestampTests(unittest.TestCase):
+    """mika#2030 — every proxy log line leads with one ISO-8601 UTC ms stamp.
+
+    The founding gap: `/var/log/mika/pilot-egress-proxy.log` carried no time
+    field, so `grep -c '2026-08-28'` returned 0 and the mika#1772 / #2029
+    pilot-stall windows could not be correlated to upstream statuses. These
+    tests fence the fix: `_log` is the sole emitter, and it stamps every line.
+    """
+
+    def _raw(self, fn, *args) -> list[str]:
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            fn(*args)
+        return buffer.getvalue().splitlines()
+
+    def test_helper_prefixes_a_parseable_iso_utc_millisecond_stamp(self) -> None:
+        lines = self._raw(proxy._log, "[egress] ALLOW 127.0.0.1:0")
+        self.assertEqual(len(lines), 1)
+        match = _TS_PREFIX_RE.match(lines[0])
+        self.assertIsNotNone(match, lines[0])
+        assert match is not None
+        # Parses as a real UTC instant, not just a stamp-shaped string.
+        parsed = datetime.datetime.strptime(
+            match.group("ts"), "%Y-%m-%dT%H:%M:%S.%fZ"
+        )
+        self.assertIsNotNone(parsed)
+        # The message body is preserved verbatim after the stamp (AC2).
+        self.assertEqual(match.group("rest"), "[egress] ALLOW 127.0.0.1:0")
+
+    def test_stamp_answers_the_date_grep_that_returned_zero_before_2030(self) -> None:
+        # The ticket's exact reproducer: `grep -c '<today>'` returned 0. A
+        # date-prefixed line now matches, so a date grep composes with the
+        # sibling logs.
+        today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+        lines = self._raw(proxy._log, "[egress] host-unix listening")
+        self.assertTrue(lines[0].startswith(today), lines[0])
+
+    def test_429_line_carries_exactly_one_stamp_at_the_head(self) -> None:
+        # The plan's trap (AC3): `_log_upstream_outcome` composes the 429 line
+        # in two pieces (`{line} {detail}`). The stamp must land once, at the
+        # head, never in the middle of the RATE_LIMITED line, and the quota
+        # detail must stay on that same line.
+        lines = self._raw(
+            proxy._log_upstream_outcome,
+            "POST", "/v1/messages?beta=true", 429,
+            [("Retry-After", "42"), ("request-id", "req_abc")],
+        )
+        self.assertEqual(len(lines), 2)
+        rate_line = lines[1]
+        match = _TS_PREFIX_RE.match(rate_line)
+        self.assertIsNotNone(match, rate_line)
+        assert match is not None
+        rest = match.group("rest")
+        # Exactly one stamp: no second stamp embedded in the remainder.
+        self.assertIsNone(_TS_PREFIX_RE.match(rest))
+        self.assertEqual(
+            rest,
+            "[anthropic-proxy] RATE_LIMITED POST /v1/messages?beta=true "
+            "Retry-After=42 request-id=req_abc",
+        )
+
+    def test_429_without_quota_headers_is_one_clean_stamped_line(self) -> None:
+        # AC3 anti-vacuity: the same line with no quota detail is still one
+        # stamped line, RATE_LIMITED intact, no dangling trailing space.
+        lines = self._raw(
+            proxy._log_upstream_outcome, "POST", "/v1/messages", 429, [],
+        )
+        self.assertEqual(len(lines), 2)
+        match = _TS_PREFIX_RE.match(lines[1])
+        self.assertIsNotNone(match, lines[1])
+        assert match is not None
+        self.assertEqual(
+            match.group("rest"), "[anthropic-proxy] RATE_LIMITED POST /v1/messages"
+        )
+        self.assertFalse(lines[1].endswith(" "))
 
 
 # ---------------------------------------------------------------------------
@@ -615,6 +722,25 @@ class HostSocketLifecycleTests(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertTrue(os.path.exists(self.sock), "refused path must survive")
 
+    def test_fatal_refusal_diagnostic_is_timestamped(self) -> None:
+        # mika#2030: the fatal non-socket refusal reaches pilot-egress-proxy.log
+        # via stderr, so it must carry a timestamp like every other line — a
+        # bare `sys.exit(msg)` would drop an un-stamped line into a stamped log.
+        with open(self.sock, "w", encoding="utf-8") as handle:
+            handle.write("not a socket")
+        proc = self._spawn_host()
+        _, stderr = proc.communicate(timeout=10)
+        self.assertNotEqual(proc.returncode, 0)
+        text = stderr.decode()
+        lines = [line for line in text.splitlines() if line.strip()]
+        self.assertTrue(lines, "expected a fatal diagnostic on stderr")
+        for line in lines:
+            match = _TS_PREFIX_RE.match(line)
+            self.assertIsNotNone(match, f"fatal line not timestamped: {line!r}")
+            assert match is not None
+            datetime.datetime.strptime(match.group("ts"), "%Y-%m-%dT%H:%M:%S.%fZ")
+        self.assertIn("refusing to unlink non-socket", text)
+
     def test_sigterm_unlinks_the_socket(self) -> None:
         proc = self._spawn_host()
         self.assertTrue(self._wait_connectable())
@@ -767,7 +893,10 @@ class ReadinessProbeVsErrorTests(unittest.IsolatedAsyncioTestCase):
         buffer = io.StringIO()
         with contextlib.redirect_stderr(buffer):
             await proxy.handle_host_client(reader, writer)
-        return buffer.getvalue().splitlines()
+        # mika#2030: strip (and assert) the ISO-8601 stamp `_log` prepends, so
+        # these `startswith("[egress] ...")` classifications read against the
+        # message body — and AC1 (every line stamped) is enforced here too.
+        return _strip_ts(self, buffer.getvalue().splitlines())
 
     async def test_connect_then_close_emits_no_error(self) -> None:
         # The exact 1045-line shape: EOF before a single request byte, and a
