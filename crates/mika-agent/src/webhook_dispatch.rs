@@ -667,4 +667,173 @@ mod tests {
             );
         }
     }
+
+    // ─────────────── Dispatch seat gate (mika#2084) ───────────────
+    //
+    // Anti-vacuity runs in BOTH directions here, deliberately. A gate that
+    // refused every issue would satisfy every refusal test below on its own —
+    // and it would also stop the entire loop, which is a worse outcome than the
+    // collision the gate prevents. So each refusal case is paired with a pass
+    // case, and the pass cases are the ones to look at first when this module
+    // is edited.
+
+    /// AC3 / AC4 positive half — the load-bearing case.
+    ///
+    /// The overwhelming majority of tickets carry no seat label at all. If this
+    /// test ever goes red, the loop has stopped dispatching.
+    #[test]
+    fn no_seat_label_still_dispatches() {
+        let verdict = classify_dispatch_seat(["bug", "p1-important", "ready"]);
+        assert_eq!(verdict, SeatVerdict::NoSeatLabel);
+        assert!(
+            !verdict.refuses(),
+            "an unlabelled issue must still dispatch"
+        );
+        assert_eq!(verdict.refusal_reason(), None);
+
+        // The empty label set is the same case.
+        let empty = classify_dispatch_seat(std::iter::empty::<&str>());
+        assert_eq!(empty, SeatVerdict::NoSeatLabel);
+        assert!(!empty.refuses());
+    }
+
+    /// AC4 positive half — a ticket labelled for our own seat proceeds.
+    #[test]
+    fn current_seat_label_still_dispatches() {
+        let label = format!("{DISPATCH_SEAT_LABEL_PREFIX}{CURRENT_DISPATCH_SEAT}");
+        let verdict = classify_dispatch_seat([label.as_str(), "bug"]);
+        assert_eq!(
+            verdict,
+            SeatVerdict::OwnedByCurrentSeat {
+                label: label.clone()
+            }
+        );
+        assert!(!verdict.refuses(), "our own seat must not be refused");
+    }
+
+    /// AC1 — the 2026-08-30 collision. mika#2055 carried `dispatch:ssc` while
+    /// SSC had PR#2082 open; the loop dispatched anyway.
+    #[test]
+    fn other_seat_label_is_refused() {
+        for (label, seat) in [("dispatch:ssc", "ssc"), ("dispatch:mpc", "mpc")] {
+            let verdict = classify_dispatch_seat([label, "bug", "ready"]);
+            assert_eq!(
+                verdict,
+                SeatVerdict::OwnedByOtherSeat {
+                    label: label.to_string(),
+                    seat: seat.to_string(),
+                },
+                "{label} must be refused"
+            );
+            assert!(verdict.refuses());
+            assert_eq!(verdict.refusal_reason(), Some("seat_owned_by_other"));
+            assert_eq!(verdict.label(), Some(label));
+        }
+    }
+
+    /// AC2 — fail-closed. A seat we cannot resolve is not an authorization.
+    #[test]
+    fn unknown_seat_label_is_refused() {
+        let verdict = classify_dispatch_seat(["dispatch:zorglub"]);
+        assert!(
+            verdict.refuses(),
+            "an unknown seat must not be waved through"
+        );
+        assert_eq!(verdict.refusal_reason(), Some("unknown_seat"));
+    }
+
+    /// AC2 — a bare `dispatch:` names no seat, so it resolves to none.
+    #[test]
+    fn empty_seat_label_is_refused() {
+        for label in ["dispatch:", "dispatch:   "] {
+            let verdict = classify_dispatch_seat([label]);
+            assert!(verdict.refuses(), "{label} must be refused");
+            assert_eq!(verdict.refusal_reason(), Some("empty_seat"));
+        }
+    }
+
+    /// AC2 — two seats claimed, neither wins. Picking one would invent an owner.
+    #[test]
+    fn multiple_seat_labels_are_refused() {
+        let verdict = classify_dispatch_seat(["dispatch:ssc", "dispatch:mpc", "bug"]);
+        assert!(verdict.refuses());
+        assert_eq!(verdict.refusal_reason(), Some("multiple_seat_labels"));
+
+        // Even two labels naming our own seat are ambiguous, not permission.
+        let ours = format!("{DISPATCH_SEAT_LABEL_PREFIX}{CURRENT_DISPATCH_SEAT}");
+        let dup = classify_dispatch_seat([ours.as_str(), "dispatch:ssc"]);
+        assert!(dup.refuses());
+    }
+
+    /// A label typed in the GitHub UI with different casing claims the same seat.
+    #[test]
+    fn seat_label_is_case_insensitive() {
+        let verdict = classify_dispatch_seat(["Dispatch:SSC"]);
+        assert_eq!(
+            verdict,
+            SeatVerdict::OwnedByOtherSeat {
+                label: "dispatch:ssc".to_string(),
+                seat: "ssc".to_string(),
+            }
+        );
+        assert!(verdict.refuses());
+    }
+
+    /// AC3 — the false-positive that would stop the loop.
+    ///
+    /// The prefix is `dispatch:` exactly. Labels that merely begin with the
+    /// letters `dispatch` are ordinary labels; reading them as seat claims would
+    /// refuse tickets nobody ever claimed.
+    #[test]
+    fn labels_merely_starting_with_dispatch_are_not_seat_labels() {
+        let verdict = classify_dispatch_seat([
+            "dispatched",
+            "dispatch-ready",
+            "dispatch",
+            "wip-rescue-dispatch",
+        ]);
+        assert_eq!(verdict, SeatVerdict::NoSeatLabel);
+        assert!(
+            !verdict.refuses(),
+            "near-miss names must not enter the gate"
+        );
+    }
+
+    /// D4 anti-drift — the two prompt parses must agree on what a repository
+    /// reference is. Two independent parses of the same string is the drift
+    /// this shared implementation exists to prevent.
+    #[test]
+    fn parse_issue_ref_agrees_with_parse_repo_ref() {
+        for prompt in [
+            "mika#2055",
+            "senara-solutions/mika#2055",
+            "control-monitor#159\n",
+            "  mika-cloud#127  ",
+            "first line is prose\nmika-skills#8\nmore prose",
+            "free text with a # in it",
+            "mika#",
+            "#123",
+        ] {
+            let repo_only = parse_repo_ref_from_dispatch_prompt(prompt);
+            let with_number = parse_issue_ref_from_dispatch_prompt(prompt);
+            assert_eq!(
+                repo_only,
+                with_number.map(|(r, _)| r),
+                "parses disagree on {prompt:?}"
+            );
+        }
+
+        assert_eq!(
+            parse_issue_ref_from_dispatch_prompt("senara-solutions/mika#2055"),
+            Some(("senara-solutions/mika", 2055))
+        );
+
+        // The single deliberate asymmetry: a number too large for `u64` still
+        // parses as a repository reference but yields no issue, so the seat gate
+        // simply has nothing to look up (mika#2084 D2 — missing information
+        // lets the dispatch through rather than refusing it).
+        let overflow = "mika#99999999999999999999999";
+        assert_eq!(parse_repo_ref_from_dispatch_prompt(overflow), Some("mika"));
+        assert_eq!(parse_issue_ref_from_dispatch_prompt(overflow), None);
+    }
 }

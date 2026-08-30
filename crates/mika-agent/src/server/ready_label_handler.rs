@@ -183,8 +183,8 @@ pub async fn try_handle_ready_label_dispatch(
 
     // 4. Fetch issue body via `gh issue view`. Used to determine groomed-state
     //    via the same predicate the dispatch gate uses (#919, #1108).
-    let body = match fetch_issue_body(&location, token).await {
-        Ok(b) => b,
+    let (body, labels) = match fetch_issue_body_and_labels(&location, token).await {
+        Ok(pair) => pair,
         Err(e) => {
             warn!(
                 event = "ready_label_body_fetch_failed",
@@ -196,6 +196,68 @@ pub async fn try_handle_ready_label_dispatch(
             return VerdictAction::Passthrough { enrichment: None };
         }
     };
+
+    // 4b. Dispatch-seat gate (mika#2084). Placed here because it is the first
+    //     point at which the issue's labels are known — they ride along on the
+    //     step-4 `gh` call, so the gate costs no extra round trip — and still
+    //     ahead of the step-7 task pre-create, which is what AC1 requires.
+    //
+    //     Refusal returns `Handled`, never `Passthrough`, for the same reason
+    //     spelled out at the repo-allowlist gate above: `Passthrough` leaves
+    //     `req.text` on the ready-label marker, which is exactly what
+    //     `webhook_ready_label_dispatch` triggers on — the guard would re-prompt
+    //     the LLM until it dispatched the very issue this gate just refused.
+    //
+    //     A missing/unreadable label set never reaches here: step 4 already
+    //     passthrough'd on fetch failure, unchanged from before #2084 (AC3).
+    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let seat_verdict = crate::webhook_dispatch::classify_dispatch_seat(label_refs);
+    if seat_verdict.refuses() {
+        let owner_repo = location.owner_repo();
+        let found = seat_verdict.label().unwrap_or("<none>");
+        let why = seat_verdict.refusal_reason().unwrap_or("seat_refused");
+        let current = crate::webhook_dispatch::CURRENT_DISPATCH_SEAT;
+        warn!(
+            event = "ready_label_seat_mismatch",
+            repo = %owner_repo,
+            num = location.number,
+            found_label = %found,
+            current_seat = current,
+            reason = why,
+            "ready_label_handler: `ready` label on an issue another dispatch seat \
+             owns — refused before task creation"
+        );
+
+        // Operator-visible record. As at the allowlist gate, no `task_id` exists
+        // yet by construction, so the audit target is the issue reference.
+        if let Err(e) = db
+            .log_audit_event(
+                session_id,
+                "ready_label_seat_mismatch",
+                &format!("{}#{}", owner_repo, location.number),
+                None,
+                Some("dispatch_refused"),
+                Some(&format!(
+                    "repo={} number={} found_label={} current_seat={} reason={}",
+                    owner_repo, location.number, found, current, why
+                )),
+                Some(trace_id),
+            )
+            .await
+        {
+            warn!(
+                event = "ready_label_audit_log_failed",
+                repo = %owner_repo,
+                num = location.number,
+                error = %e,
+                "ready_label_handler: failed to write seat-refusal audit event (non-fatal)"
+            );
+        }
+
+        return VerdictAction::Handled {
+            pre_digest: format_seat_mismatch_pre_digest(&location, found, current),
+        };
+    }
 
     // 5. Determine groomed-state via the canonical predicate. Same code path as
     //    `validate_dispatch_readiness` gate (#919) — drift between the two
@@ -520,9 +582,17 @@ pub(crate) fn parse_ready_label_location(text: &str) -> Option<ReadyLabelLocatio
     })
 }
 
-/// Fetch the issue body via `gh issue view --json body`. Returns the `body`
-/// field on success or a descriptive error string on failure.
-async fn fetch_issue_body(loc: &ReadyLabelLocation, token: &str) -> Result<String, String> {
+/// Fetch the issue body **and its label names** via one `gh issue view
+/// --json body,labels` call.
+///
+/// The labels ride along on the call the handler already makes for the body, so
+/// the mika#2084 seat gate costs no extra round trip. Returns a descriptive
+/// error string on failure — which the caller turns into a passthrough, exactly
+/// as it did before the labels were added.
+async fn fetch_issue_body_and_labels(
+    loc: &ReadyLabelLocation,
+    token: &str,
+) -> Result<(String, Vec<String>), String> {
     let owner_repo = loc.owner_repo();
     let number_str = loc.number.to_string();
     let args = [
@@ -532,12 +602,70 @@ async fn fetch_issue_body(loc: &ReadyLabelLocation, token: &str) -> Result<Strin
         "--repo",
         &owner_repo,
         "--json",
-        "body",
-        "-q",
-        ".body",
+        "body,labels",
     ];
     let stdout = run_gh_subprocess(&args, token).await?;
-    Ok(stdout)
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .map_err(|e| format!("gh issue view returned non-JSON: {e}"))?;
+    let body = parsed
+        .get("body")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let labels = parsed
+        .get("labels")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|l| l.get("name").and_then(|n| n.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((body, labels))
+}
+
+/// Pre-digest for a `ready` label on an issue another dispatch seat owns
+/// (mika#2084).
+///
+/// Opens with `<ready_label_handler>` for the same load-bearing reason as the
+/// allowlist pre-digest above: any text that still matches the
+/// `webhook_ready_label_dispatch` trigger would have the guard demand the very
+/// dispatch this refusal exists to prevent.
+///
+/// Names the issue, the seat label found, and the seat this engine dispatches
+/// as — mika#2084 AC1 requires all three, so that an avoided collision is
+/// legible without cross-referencing anything.
+fn format_seat_mismatch_pre_digest(
+    loc: &ReadyLabelLocation,
+    found_label: &str,
+    current_seat: &str,
+) -> String {
+    format!(
+        "<ready_label_handler>\n\
+         [GitHub] Issue labeled ready on {}#{} — DISPATCH REFUSED by engine.\n\n\
+         Reason: this issue carries the seat label `{}`, and this engine \
+         dispatches as seat `{}`.\n\
+         One dispatcher per ticket: another seat already owns it, and \
+         dispatching would put a second writer on its branch.\n\
+         Known seats: {}\n\n\
+         No task was created and no dispatch was prepared. You MUST NOT:\n\
+         - call `run_claude_pilot` or `run_claude_pilot_groom` for this issue\n\
+         - call `create_task` for this issue\n\
+         - re-add or re-trigger the `ready` label\n\
+         - remove or edit the `{}` label to get around this\n\n\
+         REQUIRED next action: call `send_message` once to tell the operator \
+         that {}#{} was refused because seat `{}` owns it, then end the turn.",
+        loc.owner_repo(),
+        loc.number,
+        found_label,
+        current_seat,
+        crate::webhook_dispatch::known_dispatch_seats_display(),
+        found_label,
+        loc.owner_repo(),
+        loc.number,
+        found_label,
+    )
 }
 
 /// Pre-digest for a `ready` label on a repository outside the dispatchable
@@ -1187,5 +1315,38 @@ mod tests {
         assert!(!crate::webhook_dispatch::is_ready_label_dispatch_marker(
             &dispatched
         ));
+    }
+
+    /// AC1 + AC5 — the refusal names the issue, the label found, and the seat
+    /// this engine dispatches as, so an avoided collision reads on its own.
+    #[test]
+    fn seat_mismatch_pre_digest_names_issue_label_and_current_seat() {
+        let loc = ReadyLabelLocation {
+            repo_ref: "senara-solutions/mika".to_string(),
+            number: 2055,
+        };
+        let digest = format_seat_mismatch_pre_digest(
+            &loc,
+            "dispatch:ssc",
+            crate::webhook_dispatch::CURRENT_DISPATCH_SEAT,
+        );
+        assert!(digest.contains("senara-solutions/mika"));
+        assert!(digest.contains("2055"));
+        assert!(digest.contains("dispatch:ssc"));
+        assert!(digest.contains(crate::webhook_dispatch::CURRENT_DISPATCH_SEAT));
+        assert!(digest.contains("DISPATCH REFUSED"));
+        for seat in crate::webhook_dispatch::KNOWN_DISPATCH_SEATS {
+            assert!(
+                digest.contains(seat),
+                "refusal must quote {seat} so the operator sees the seat vocabulary"
+            );
+        }
+        // Must not match the `webhook_ready_label_dispatch` trigger, or the
+        // guard would demand the dispatch this refusal prevents.
+        assert!(digest.starts_with("<ready_label_handler>"));
+        assert!(!crate::webhook_dispatch::is_ready_label_dispatch_marker(
+            &digest
+        ));
+        assert!(digest.contains("send_message"));
     }
 }

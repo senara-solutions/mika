@@ -1003,6 +1003,45 @@ async fn record_dispatch_rejection(db: &AsyncDatabase, task_id: &str, reason_jso
     }
 }
 
+/// The tool-boundary seat refusal, as the JSON the caller records and returns
+/// (mika#2084). `None` when the verdict does not refuse.
+///
+/// Pure, and separated from the `gh` call above so the decision can be tested
+/// without a network or a token — the refusal wording is what an operator and
+/// the LLM both read, so it is worth asserting on directly.
+fn seat_rejection_json(
+    task_id: &str,
+    owner_repo: &str,
+    number: u64,
+    verdict: &crate::webhook_dispatch::SeatVerdict,
+) -> Option<String> {
+    if !verdict.refuses() {
+        return None;
+    }
+    let found = verdict.label().unwrap_or("<none>");
+    let current = crate::webhook_dispatch::CURRENT_DISPATCH_SEAT;
+    let known = crate::webhook_dispatch::known_dispatch_seats_display();
+    Some(
+        serde_json::json!({
+            "error": "dispatch_seat_mismatch",
+            "task_id": task_id,
+            "issue": format!("{owner_repo}#{number}"),
+            "found_label": found,
+            "current_seat": current,
+            "reason": format!(
+                "`{owner_repo}#{number}` carries the seat label `{found}`, and this \
+                 engine dispatches as seat `{current}`. One dispatcher per ticket: \
+                 another seat already owns this issue, and dispatching would put a \
+                 second writer on its branch. Known seats: {known}. This is a \
+                 structural gate, not a transient failure — retrying will not clear \
+                 it. Only the operator removing or correcting the `dispatch:*` label \
+                 changes this (mika#2084)."
+            )
+        })
+        .to_string(),
+    )
+}
+
 /// Read an issue's label names via `gh` (mika#2084).
 ///
 /// One subprocess, `--json labels`, one name per line. Kept next to
@@ -1340,10 +1379,11 @@ pub(crate) async fn validate_dispatch_readiness(
                 Ok(labels) => {
                     let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
                     let verdict = crate::webhook_dispatch::classify_dispatch_seat(label_refs);
-                    if verdict.refuses() {
+                    if let Some(rejection) =
+                        seat_rejection_json(task_id, &owner_repo, number, &verdict)
+                    {
                         let found = verdict.label().unwrap_or("<none>").to_string();
                         let why = verdict.refusal_reason().unwrap_or("seat_refused");
-                        let known = crate::webhook_dispatch::known_dispatch_seats_display();
                         let current = crate::webhook_dispatch::CURRENT_DISPATCH_SEAT;
                         warn!(
                             event = "dispatch_seat_mismatch",
@@ -1378,25 +1418,8 @@ pub(crate) async fn validate_dispatch_readiness(
                                 "failed to write dispatch_seat_mismatch audit event (non-fatal)"
                             );
                         }
-                        let rejection = serde_json::json!({
-                            "error": "dispatch_seat_mismatch",
-                            "task_id": task_id,
-                            "issue": format!("{owner_repo}#{number}"),
-                            "found_label": found,
-                            "current_seat": current,
-                            "reason": format!(
-                                "`{owner_repo}#{number}` carries the seat label `{found}`, \
-                                 and this engine dispatches as seat `{current}`. One \
-                                 dispatcher per ticket: another seat already owns this \
-                                 issue, and dispatching would put a second writer on its \
-                                 branch. Known seats: {known}. This is a structural gate, \
-                                 not a transient failure — retrying will not clear it. \
-                                 Only the operator removing or correcting the \
-                                 `dispatch:*` label changes this (mika#2084)."
-                            )
-                        });
-                        record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
-                        return Err(rejection.to_string());
+                        record_dispatch_rejection(db, task_id, &rejection).await;
+                        return Err(rejection);
                     }
                 }
                 Err(e) => {
@@ -6898,5 +6921,77 @@ Discussion: this one was a single-pass GROOMED case, unlike the others.
     fn test_extract_skill_missing() {
         let input = serde_json::json!({"prompt": "mika#919"});
         assert_eq!(extract_skill_from_input(&input), None);
+    }
+
+    // ─────────── Dispatch seat gate, tool boundary (mika#2084) ───────────
+    //
+    // This is the layer that would have stopped the 2026-08-30 collision: the
+    // task that raced SSC on mika#2055 arrived as `source: self_dev`,
+    // `trigger: manual`, so the ready-label handler never saw it.
+    //
+    // The `gh` call that reads the labels needs a network and a token, so what
+    // is asserted here is the decision and its wording — the part an operator
+    // and the LLM actually read. Both directions, as everywhere in this fix.
+
+    /// AC1 + AC5 — a refused dispatch says which issue, which label, which seat.
+    #[test]
+    fn test_seat_rejection_names_issue_label_and_seat() {
+        let verdict = crate::webhook_dispatch::classify_dispatch_seat(["dispatch:ssc"]);
+        let rejection = seat_rejection_json("task-abc", "senara-solutions/mika", 2055, &verdict)
+            .expect("a foreign seat must be refused");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&rejection).expect("rejection must be valid JSON");
+        assert_eq!(parsed["error"], "dispatch_seat_mismatch");
+        assert_eq!(parsed["task_id"], "task-abc");
+        assert_eq!(parsed["issue"], "senara-solutions/mika#2055");
+        assert_eq!(parsed["found_label"], "dispatch:ssc");
+        assert_eq!(
+            parsed["current_seat"],
+            crate::webhook_dispatch::CURRENT_DISPATCH_SEAT
+        );
+
+        let reason = parsed["reason"].as_str().expect("reason is a string");
+        // Structural, not transient — an LLM that reads this must not retry.
+        assert!(reason.contains("structural gate"));
+        assert!(reason.contains("retrying will not clear it"));
+        assert!(reason.contains("2084"));
+    }
+
+    /// AC2 — an unresolvable seat refuses too, and says so in its own terms.
+    #[test]
+    fn test_seat_rejection_covers_unresolvable_seats() {
+        for labels in [
+            vec!["dispatch:zorglub"],
+            vec!["dispatch:"],
+            vec!["dispatch:ssc", "dispatch:mpc"],
+        ] {
+            let verdict = crate::webhook_dispatch::classify_dispatch_seat(labels.clone());
+            assert!(
+                seat_rejection_json("t", "senara-solutions/mika", 1, &verdict).is_some(),
+                "{labels:?} must be refused — an unidentifiable seat is not an authorization"
+            );
+        }
+    }
+
+    /// AC3 + AC4 positive half — the test that catches a gate that over-reaches.
+    ///
+    /// Delete the `verdict.refuses()` early-return in `seat_rejection_json` and
+    /// this goes red while the two tests above stay green; that asymmetry is
+    /// the whole point of keeping it.
+    #[test]
+    fn test_no_seat_label_produces_no_rejection() {
+        for labels in [
+            vec!["bug", "p1-important", "ready"],
+            vec![],
+            vec!["dispatched", "dispatch-ready"],
+            vec!["dispatch:loop"],
+        ] {
+            let verdict = crate::webhook_dispatch::classify_dispatch_seat(labels.clone());
+            assert!(
+                seat_rejection_json("t", "senara-solutions/mika", 2055, &verdict).is_none(),
+                "{labels:?} must still dispatch — refusing it would stop the loop"
+            );
+        }
     }
 }
