@@ -1898,6 +1898,188 @@ mod tests {
         build_router(state)
     }
 
+    // --- mika#2070: the caller's session id survives the whole server hop ------
+    //
+    // The unit tests on either side of this — metadata extraction in
+    // `server::a2a`, adoption in `a2a_db` — both pass with the two call sites in
+    // `handle_message_send` / `handle_message_stream` passing `None`. That is the
+    // seam a refactor removing an "unused" parameter would silently cut, with CI
+    // green and the measurement channel dead again. These tests POST a real
+    // JSON-RPC body through the router and read back the session the task was
+    // actually bound to.
+    //
+    // `returnImmediately` keeps the agent loop (and any LLM call) out of it: the
+    // binding happens in `a2a_create_task`, before the loop would start.
+
+    async fn a2a_post(app: Router, method: &str, params: serde_json::Value) -> serde_json::Value {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/a2a/mika")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a2a request should be accepted"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn send_params(text: &str, caller_session_id: Option<&str>) -> serde_json::Value {
+        let mut params = serde_json::json!({
+            "message": {
+                "messageId": "msg-1",
+                "role": "user",
+                "parts": [{"kind": "text", "text": text}],
+                "kind": "message",
+            },
+            "configuration": {"returnImmediately": true},
+        });
+        if let Some(sid) = caller_session_id {
+            params["metadata"] = serde_json::json!({
+                mika_a2a::CALLER_SESSION_ID_KEY: sid,
+            });
+        }
+        params
+    }
+
+    #[tokio::test]
+    async fn message_send_binds_the_task_to_the_caller_session() {
+        let state = test_state();
+        let db = state.agents.get("mika").unwrap().db.clone();
+        db.create_session("probe-a", "mika", "cli").await.unwrap();
+
+        let resp = a2a_post(
+            test_app(state),
+            "message/send",
+            send_params("hi", Some("probe-a")),
+        )
+        .await;
+
+        let task_id = resp["result"]["id"].as_str().expect("task id in result");
+        assert_eq!(
+            db.a2a_get_session_id(task_id).await.unwrap(),
+            Some("probe-a".to_string()),
+            "the turn must run under the caller's session, not a minted one"
+        );
+    }
+
+    #[tokio::test]
+    async fn message_stream_binds_the_task_to_the_caller_session() {
+        // `message/stream` has its own `a2a_create_task` call site, so the
+        // parameter can go missing there while `message/send` still works.
+        let state = test_state();
+        let db = state.agents.get("mika").unwrap().db.clone();
+        db.create_session("probe-b", "mika", "cli").await.unwrap();
+
+        let resp = test_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/a2a/mika")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "id": 1,
+                            "method": "message/stream",
+                            "params": send_params("hi", Some("probe-b")),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The first SSE frame carries the Task, whose id names the binding.
+        let bytes = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            axum::body::to_bytes(resp.into_body(), 1 << 20),
+        )
+        .await
+        .expect("stream should terminate")
+        .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        let task_id = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+            .find_map(|v| {
+                // The first frame is the Task itself (`/result/id`); later
+                // status-update frames name it as `taskId`. Either identifies
+                // the binding.
+                ["/result/id", "/result/taskId", "/id", "/taskId"]
+                    .iter()
+                    .find_map(|ptr| v.pointer(ptr).and_then(|i| i.as_str()))
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| panic!("no task id in stream body: {text}"));
+
+        assert_eq!(
+            db.a2a_get_session_id(&task_id).await.unwrap(),
+            Some("probe-b".to_string()),
+            "the streaming path must bind to the caller's session too"
+        );
+    }
+
+    #[tokio::test]
+    async fn message_send_without_a_caller_session_mints_its_own() {
+        // AC3 through the real server hop: no metadata key, no failure, and the
+        // task is bound to a minted session exactly as before mika#2070.
+        let state = test_state();
+        let db = state.agents.get("mika").unwrap().db.clone();
+
+        let resp = a2a_post(test_app(state), "message/send", send_params("hi", None)).await;
+
+        let task_id = resp["result"]["id"].as_str().expect("task id in result");
+        assert_eq!(
+            db.a2a_get_session_id(task_id).await.unwrap(),
+            Some(format!("a2a-{task_id}"))
+        );
+    }
+
+    #[tokio::test]
+    async fn message_send_refuses_a_session_this_agent_does_not_own() {
+        let state = test_state();
+        let db = state.agents.get("mika").unwrap().db.clone();
+        db.register_agent("mika-dev", "mika-dev", "").await.unwrap();
+        db.create_session("dev-owned", "mika-dev", "cli")
+            .await
+            .unwrap();
+
+        let resp = a2a_post(
+            test_app(state),
+            "message/send",
+            send_params("hi", Some("dev-owned")),
+        )
+        .await;
+
+        let task_id = resp["result"]["id"].as_str().expect("task id in result");
+        assert_eq!(
+            db.a2a_get_session_id(task_id).await.unwrap(),
+            Some(format!("a2a-{task_id}")),
+            "a session owned by another agent must not be adopted"
+        );
+    }
+
     #[tokio::test]
     async fn test_health_returns_503_before_ready() {
         let state = test_state();

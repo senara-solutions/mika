@@ -22,13 +22,15 @@
 #
 # This script NEVER writes an AUTHORIZATION file, in any mode.
 #
-# WHERE THE TOKENS LIVE (mika#1727). `mika ask` is an A2A client: it posts the
-# prompt to mika-spirit, which owns the execution session. The CLI's
-# --session-id never crosses the wire, and the per-agent CLI log carries no
-# turn_usage for an `ask`. The measurement channel is spirit's own log, and runs
-# are correlated to it by (agent_id, byte-offset slice) because the batch is
-# strictly sequential. mika/CLAUDE.md Signal O still documents the pre-#1727
-# per-agent path; it is stale, and following it captures nothing.
+# WHERE THE TOKENS LIVE (mika#1727, mika#2070). `mika ask` is an A2A client: it
+# posts the prompt to mika-spirit, which owns the execution session, and the
+# per-agent CLI log carries no turn_usage for an `ask`. The measurement channel
+# is spirit's own log. Since mika#2070 --session-id crosses the wire in
+# message/send metadata and spirit runs the turn under it, so a turn_usage event
+# names its own run; the (agent_id, byte-offset slice) correlation below is kept
+# as the fallback for a deployment where that fix is not yet live.
+# mika/CLAUDE.md Signal O still documents the pre-#1727 per-agent path; it is
+# stale, and following it captures nothing.
 
 set -euo pipefail
 
@@ -412,10 +414,12 @@ next_attempt() {
 
 spirit_log_size() { [ -f "$SPIRIT_LOG" ] && wc -c < "$SPIRIT_LOG" || echo 0; }
 
-# Correlates by (agent_id, byte-offset slice) because --session-id does not
-# reach the agent loop since mika#1727 and spirit mints its own session id.
-# Safe because the batch is strictly sequential; the caller checks that the
-# slice carries exactly one spirit session for this agent.
+# Correlates by (agent_id, byte-offset slice). Since mika#2070 --session-id does
+# reach the agent loop, so the slice should carry exactly the run's own session;
+# the slice remains the capture mechanism so this script still works against a
+# spirit that predates that fix. Safe because the batch is strictly sequential;
+# the caller checks that the slice carries exactly one spirit session for this
+# agent, which is now also a check that the fix is live.
 capture_turn_usage() {
     local agent="$1" offset="$2" dest="$3" tries=0 size
     : > "$dest"

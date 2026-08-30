@@ -8,7 +8,10 @@ pub mod types;
 
 pub use error::A2aError;
 pub use jsonrpc::{A2aMethod, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse};
-pub use params::{MessageSendParams, SendMessageConfiguration, TaskIdParams, TaskQueryParams};
+pub use params::{
+    CALLER_SESSION_ID_KEY, MessageSendParams, SendMessageConfiguration, TaskIdParams,
+    TaskQueryParams,
+};
 pub use state_machine::TaskStateMachine;
 pub use streaming::{
     StreamEvent, StreamEventSender, TaskArtifactUpdateEvent, TaskStatusUpdateEvent,

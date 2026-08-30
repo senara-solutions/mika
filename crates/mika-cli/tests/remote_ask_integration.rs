@@ -9,7 +9,9 @@
 //! Unit: U2 (Remote-mode dispatch via A2aClient).
 
 use axum::{Json, Router, http::StatusCode, routing::post};
-use mika_cli::remote_ask::{OutputFormat, dispatch_remote};
+use mika_cli::remote_ask::{
+    CALLER_SESSION_ID_KEY, OutputFormat, dispatch_remote, send_message_to_agent,
+};
 use serde_json::Value;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -292,4 +294,52 @@ async fn dispatch_renders_file_part_as_placeholder() {
         .await
         .expect("dispatch should succeed");
     assert_eq!(out, "[file: foo.txt]");
+}
+
+// --- mika#2070: caller session id on the wire ---------------------------------
+
+#[tokio::test]
+async fn remote_dispatch_sends_no_caller_session_id() {
+    // `--remote` holds no session row the remote agent's database could own, so
+    // it must leave the request body in its pre-mika#2070 shape.
+    let (addr, capture) = spawn_mock(|cap, Json(body)| {
+        cap.lock().unwrap().last_body = Some(body);
+        (StatusCode::OK, Json(ok_task_with_text("reply")))
+    })
+    .await;
+
+    let url = format!("http://{addr}/a2a/cust-9/mika-prime");
+    let _ = dispatch_remote("hi", &url, OutputFormat::Text, false)
+        .await
+        .expect("dispatch should succeed");
+
+    let body = capture.lock().unwrap().last_body.clone().unwrap();
+    assert!(
+        body["params"].get("metadata").is_none(),
+        "remote dispatch should send no request metadata, got {}",
+        body["params"]
+    );
+}
+
+#[tokio::test]
+async fn spirit_dispatch_carries_the_caller_session_id_over_the_wire() {
+    // The thin-client path (`mika ask` → local spirit) names its own session so
+    // spirit can run the turn under it and `turn_usage` carries the caller's id.
+    let (addr, capture) = spawn_mock(|cap, Json(body)| {
+        cap.lock().unwrap().last_body = Some(body);
+        (StatusCode::OK, Json(ok_task_with_text("reply")))
+    })
+    .await;
+
+    let url = format!("http://{addr}/a2a/cust-9/mika-prime");
+    let _ = send_message_to_agent("hi", &url, Some("rt005-c1-r7"))
+        .await
+        .expect("send should succeed");
+
+    let body = capture.lock().unwrap().last_body.clone().unwrap();
+    assert_eq!(
+        body["params"]["metadata"][CALLER_SESSION_ID_KEY], "rt005-c1-r7",
+        "caller session id missing from {}",
+        body["params"]
+    );
 }
