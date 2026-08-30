@@ -88,17 +88,30 @@ Three rules generalise:
    `contaminated` when its slice carries more than one producer session, rather
    than attributing it.
 
-## The doc is still stale
+## The doc is no longer stale (mika#2069, 2026-08-30)
 
-`mika/CLAUDE.md` Signal O still names the per-agent path. This brick did not
-change it — out of scope for mika#1890, and surfaced to the operator instead.
-Anyone measuring tokens from a `mika ask` should read spirit's log
-(`MIKA_SPIRIT_LOG_FILE`, else `/var/log/mika/server.log`) until that line is
-corrected.
+`mika/CLAUDE.md` Signal O named the per-agent path until mika#2069 corrected it.
+The correction is not just the path: it writes down **why** the path is what it
+is (since mika#1727 spirit owns the execution session, so the event is born
+server-side whatever the entry door) and **what the per-agent sink genuinely
+holds** (heartbeat / reflection / reminder silent turns and in-process
+`mika chat` sessions). Both were deliberate — a corrected path with no reason
+attached is a sentence the next well-meaning reader re-breaks, and a sink
+described only by what it lacks gets reported as empty or broken.
 
-The durable fix is upstream of both: thread the caller's session id through
-`message/send` into `AgentParams.session_id`, so correlation becomes exact
-instead of inferred.
+The same claim was carried by three further surfaces and was corrected with it:
+`crates/mika-agent/CLAUDE.md` § Log Sinks (the section Signal O cross-references),
+`docs/solutions/best-practices/cross-provider-input-tokens-cache-inclusion-asymmetry-2026-08-20.md`
+§ Detection, and this store's own
+`docs/solutions/documentation-gaps/log-sink-architecture-mismatch-2026-05-06.md`.
+**Fixing the sentence you were sent to is not fixing the claim.** A wrong claim
+about a runtime path propagates into whatever the knowledge store hands the next
+agent, so grep the claim, not the file.
+
+The durable fix remains upstream of all of it: thread the caller's session id
+through `message/send` into `AgentParams.session_id`, so correlation becomes
+exact instead of inferred. That is a code defect, tracked separately, and
+explicitly out of scope for mika#2069.
 
 ## Related
 

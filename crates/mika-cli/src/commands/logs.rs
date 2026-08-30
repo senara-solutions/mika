@@ -14,7 +14,11 @@ use crate::init;
 /// - **Server log:** `MIKA_SPIRIT_LOG_FILE` (or `/var/log/mika/server.log` fallback) — contains
 ///   all runtime events from the long-running mika-spirit daemon, filterable by `agent_id`.
 /// - **Per-agent CLI log:** `~/.mika/agents/<name>/logs/mika.log.YYYY-MM-DD` — contains events
-///   from discrete CLI invocations (`mika ask`, `mika chat`, etc.) for that agent only.
+///   from what still runs inside the CLI process for that agent: `mika chat` (TUI) turns and
+///   its silent-mode background turns (heartbeat, reflection, reminder). Since mika#1727
+///   `mika ask` is a thin A2A client — spirit owns the execution session, so an `ask`'s agent
+///   turns (`turn_usage`, `llm_call`, tool events) land in the server log, and only its
+///   client-side events reach this file (mika#2069).
 pub fn run(agent_name: &str, agent_home: &Path, format: &OutputFormat) -> Result<()> {
     let today = Local::now().format("%Y-%m-%d").to_string();
 

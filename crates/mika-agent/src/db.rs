@@ -27,7 +27,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 49;
+pub const CURRENT_SCHEMA_VERSION: i64 = 50;
 
 /// `(target_key, before_value, after_value, reasoning)` — return shape for
 /// [`Database::get_audit_event_rows_by_tool_name`] and its async wrapper.
@@ -1131,6 +1131,11 @@ impl Database {
             info!(version = 49, "database migrated to v49");
         }
 
+        if (3..=49).contains(&version) {
+            self.migrate_v49_to_v50()?;
+            info!(version = 50, "database migrated to v50");
+        }
+
         Ok(())
     }
 
@@ -1185,7 +1190,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (49);
+            INSERT INTO schema_version (version) VALUES (50);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -1805,13 +1810,16 @@ impl Database {
                 ON operational_items(agent_id, source_table, source_id)
                 WHERE source_table IS NOT NULL AND source_id IS NOT NULL;
 
-            -- Auto-pull circuit-breaker stats (mika#1363)
+            -- Auto-pull circuit-breaker stats (mika#1363) + re-drive budget (mika#2020)
             CREATE TABLE auto_pull_stats (
                 repo_full_name TEXT NOT NULL,
                 issue_number INTEGER NOT NULL,
                 failure_count INTEGER NOT NULL DEFAULT 0,
                 last_auto_pull_at TEXT,
                 last_failure_at TEXT,
+                redrive_count INTEGER NOT NULL DEFAULT 0,
+                last_redrive_at TEXT,
+                redrive_abandoned_at TEXT,
                 PRIMARY KEY (repo_full_name, issue_number)
             );
 
@@ -4630,6 +4638,49 @@ impl Database {
             count_after = count_after,
             "v48→v49: expanded team_runs.status CHECK to include 'failed_transport' (mika#1671)"
         );
+
+        Ok(())
+    }
+
+    /// v49→v50: additive re-drive accounting on `auto_pull_stats` (mika#2020).
+    ///
+    /// `failure_count` means "the `gh` call failed" and is reset on **every**
+    /// successful Phase 2 rescue and Phase 1 promotion. A re-drive counter has
+    /// to increment on exactly that event. The two semantics are opposed at the
+    /// same point in the code, which is why mika#1901 could be re-driven 16
+    /// times in 19 h without the circuit breaker ever seeing it: each rescue
+    /// succeeded at the API, so each rescue zeroed the only counter that
+    /// existed. Three additive columns, no table rebuild:
+    ///
+    /// - `redrive_count` — successful Phase 2 re-drives since the last observed
+    ///   progress (an open PR closing the ticket, or an in-flight self_dev task).
+    /// - `last_redrive_at` — timestamp of the most recent re-drive.
+    /// - `redrive_abandoned_at` — set when the budget is exhausted and the
+    ///   ticket is handed to the operator. Its presence is what distinguishes
+    ///   "the budget just ran out, the label is not posted yet" from "the budget
+    ///   ran out earlier and the operator has since removed the label", which is
+    ///   the re-entry gesture.
+    fn migrate_v49_to_v50(&mut self) -> Result<()> {
+        let version = self.schema_version()?;
+        if version >= 50 {
+            return Ok(());
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        tx.execute_batch(
+            "-- v50: mika#2020 per-ticket re-drive budget + named abandonment.
+            ALTER TABLE auto_pull_stats ADD COLUMN redrive_count INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE auto_pull_stats ADD COLUMN last_redrive_at TEXT;
+            ALTER TABLE auto_pull_stats ADD COLUMN redrive_abandoned_at TEXT;",
+        )?;
+
+        tx.execute("INSERT INTO schema_version (version) VALUES (50)", [])?;
+        tx.commit()?;
+
+        info!("v49→v50: added re-drive accounting to auto_pull_stats (mika#2020)");
 
         Ok(())
     }
@@ -9461,11 +9512,86 @@ impl Database {
     }
 
     /// Reset the failure counter for a ticket (on success or operator-driven ready).
+    ///
+    /// Deliberately leaves `redrive_count` alone (mika#2020): this runs on every
+    /// successful rescue, which is precisely the event the re-drive budget must
+    /// count. Merging the two counters would rebuild the bug that budget closes.
     pub fn reset_auto_pull_failure(&self, repo_full_name: &str, issue_number: u64) -> Result<()> {
         self.conn.execute(
             "UPDATE auto_pull_stats SET failure_count = 0, last_failure_at = NULL
              WHERE repo_full_name = ?1 AND issue_number = ?2",
             params![repo_full_name, issue_number as i64],
+        )?;
+        Ok(())
+    }
+
+    // ===== Auto-Pull Re-Drive Budget (mika#2020) =====
+
+    /// Read a ticket's re-drive state: `(redrive_count, abandoned)`.
+    /// Returns `(0, false)` when no row exists.
+    pub fn get_auto_pull_redrive_state(
+        &self,
+        repo_full_name: &str,
+        issue_number: u64,
+    ) -> Result<(i64, bool)> {
+        let state = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(redrive_count, 0), redrive_abandoned_at IS NOT NULL
+                 FROM auto_pull_stats
+                 WHERE repo_full_name = ?1 AND issue_number = ?2",
+                params![repo_full_name, issue_number as i64],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, bool>(1)?)),
+            )
+            .unwrap_or((0, false));
+        Ok(state)
+    }
+
+    /// Increment a ticket's re-drive counter after a successful Phase 2 rescue.
+    pub fn increment_auto_pull_redrive(
+        &self,
+        repo_full_name: &str,
+        issue_number: u64,
+    ) -> Result<()> {
+        let now = crate::timestamp::now();
+        self.conn.execute(
+            "INSERT INTO auto_pull_stats (repo_full_name, issue_number, redrive_count, last_redrive_at)
+             VALUES (?1, ?2, 1, ?3)
+             ON CONFLICT(repo_full_name, issue_number)
+             DO UPDATE SET redrive_count = redrive_count + 1, last_redrive_at = ?3",
+            params![repo_full_name, issue_number as i64, now],
+        )?;
+        Ok(())
+    }
+
+    /// Clear a ticket's re-drive budget — on observed progress (an open PR
+    /// closing it, or an in-flight self_dev task), or when the operator lifts an
+    /// abandonment by removing the `operator-review` label.
+    pub fn reset_auto_pull_redrive(&self, repo_full_name: &str, issue_number: u64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE auto_pull_stats
+             SET redrive_count = 0, redrive_abandoned_at = NULL
+             WHERE repo_full_name = ?1 AND issue_number = ?2",
+            params![repo_full_name, issue_number as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Stamp a ticket as abandoned by the re-drive reconciler. The stamp is what
+    /// makes the abandonment a one-shot gesture per lifecycle, and what lets a
+    /// later tick recognize the operator's re-entry.
+    pub fn mark_auto_pull_redrive_abandoned(
+        &self,
+        repo_full_name: &str,
+        issue_number: u64,
+    ) -> Result<()> {
+        let now = crate::timestamp::now();
+        self.conn.execute(
+            "INSERT INTO auto_pull_stats (repo_full_name, issue_number, redrive_abandoned_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(repo_full_name, issue_number)
+             DO UPDATE SET redrive_abandoned_at = ?3",
+            params![repo_full_name, issue_number as i64, now],
         )?;
         Ok(())
     }
@@ -12116,6 +12242,169 @@ mod tests {
         let session_id = "test-session".to_string();
         db.create_session(&session_id, "mika", "cli").unwrap();
         (db, session_id)
+    }
+
+    // ── mika#2020: re-drive budget on auto_pull_stats ──
+
+    #[test]
+    fn test_auto_pull_redrive_state_defaults_to_zero() {
+        let db = db();
+        assert_eq!(
+            db.get_auto_pull_redrive_state("senara-solutions/mika", 1901)
+                .unwrap(),
+            (0, false),
+            "a ticket with no row has spent no budget and is not abandoned"
+        );
+    }
+
+    #[test]
+    fn test_auto_pull_redrive_increment_and_reset() {
+        let db = db();
+        let repo = "senara-solutions/mika";
+        for _ in 0..3 {
+            db.increment_auto_pull_redrive(repo, 1901).unwrap();
+        }
+        assert_eq!(
+            db.get_auto_pull_redrive_state(repo, 1901).unwrap(),
+            (3, false)
+        );
+
+        db.reset_auto_pull_redrive(repo, 1901).unwrap();
+        assert_eq!(
+            db.get_auto_pull_redrive_state(repo, 1901).unwrap(),
+            (0, false)
+        );
+    }
+
+    #[test]
+    fn test_auto_pull_redrive_survives_failure_counter_reset() {
+        // The load-bearing test for mika#2020 KTD1: `reset_auto_pull_failure`
+        // runs on EVERY successful rescue. If it also cleared the re-drive
+        // budget, the 16-requeue loop on mika#1901 would be rebuilt exactly.
+        let db = db();
+        let repo = "senara-solutions/mika";
+
+        db.increment_auto_pull_failure(repo, 1901).unwrap();
+        db.increment_auto_pull_redrive(repo, 1901).unwrap();
+        db.increment_auto_pull_redrive(repo, 1901).unwrap();
+
+        db.reset_auto_pull_failure(repo, 1901).unwrap();
+
+        assert_eq!(db.get_auto_pull_failure_count(repo, 1901).unwrap(), 0);
+        assert_eq!(
+            db.get_auto_pull_redrive_state(repo, 1901).unwrap(),
+            (2, false),
+            "the re-drive budget must NOT be cleared by the failure-counter reset"
+        );
+    }
+
+    #[test]
+    fn test_auto_pull_redrive_abandonment_stamp_round_trip() {
+        let db = db();
+        let repo = "senara-solutions/mika";
+
+        db.increment_auto_pull_redrive(repo, 1901).unwrap();
+        db.mark_auto_pull_redrive_abandoned(repo, 1901).unwrap();
+        assert_eq!(
+            db.get_auto_pull_redrive_state(repo, 1901).unwrap(),
+            (1, true)
+        );
+
+        // The operator lifts the abandonment.
+        db.reset_auto_pull_redrive(repo, 1901).unwrap();
+        assert_eq!(
+            db.get_auto_pull_redrive_state(repo, 1901).unwrap(),
+            (0, false),
+            "re-entry clears both the count and the stamp"
+        );
+    }
+
+    #[test]
+    fn test_auto_pull_redrive_abandon_on_a_ticket_with_no_prior_row() {
+        // The plan-ownership abandonment path stamps without ever incrementing.
+        let db = db();
+        let repo = "senara-solutions/mika";
+        db.mark_auto_pull_redrive_abandoned(repo, 1887).unwrap();
+        assert_eq!(
+            db.get_auto_pull_redrive_state(repo, 1887).unwrap(),
+            (0, true)
+        );
+    }
+
+    #[test]
+    fn test_migrate_v49_to_v50_alters_a_real_v49_table_and_preserves_rows() {
+        // The idempotence test below runs against a fresh DB, which the v1
+        // inline schema already builds at v50 — so it exercises the no-op
+        // branch, not the ALTER. This one builds the actual v49 shape, puts a
+        // row in it, and proves the upgrade path keeps existing circuit-breaker
+        // state while defaulting the new counters.
+        let mut db = db();
+        db.conn
+            .execute_batch(
+                "DROP TABLE auto_pull_stats;
+                 CREATE TABLE auto_pull_stats (
+                     repo_full_name TEXT NOT NULL,
+                     issue_number INTEGER NOT NULL,
+                     failure_count INTEGER NOT NULL DEFAULT 0,
+                     last_auto_pull_at TEXT,
+                     last_failure_at TEXT,
+                     PRIMARY KEY (repo_full_name, issue_number)
+                 );
+                 INSERT INTO auto_pull_stats
+                     (repo_full_name, issue_number, failure_count, last_auto_pull_at)
+                 VALUES ('senara-solutions/mika', 1901, 2, '2026-08-29T00:00:00Z');
+                 DELETE FROM schema_version;
+                 INSERT INTO schema_version (version) VALUES (49);",
+            )
+            .unwrap();
+        assert_eq!(db.schema_version().unwrap(), 49);
+        assert!(
+            !db.column_exists("auto_pull_stats", "redrive_count")
+                .unwrap(),
+            "precondition: the v49 shape has no re-drive columns"
+        );
+
+        db.migrate_v49_to_v50().unwrap();
+
+        assert_eq!(db.schema_version().unwrap(), 50);
+        assert_eq!(
+            db.get_auto_pull_failure_count("senara-solutions/mika", 1901)
+                .unwrap(),
+            2,
+            "existing circuit-breaker state survives the upgrade"
+        );
+        assert_eq!(
+            db.get_auto_pull_redrive_state("senara-solutions/mika", 1901)
+                .unwrap(),
+            (0, false),
+            "a pre-existing row starts with a clean re-drive budget"
+        );
+
+        // Second call must recognise v50 and no-op rather than re-ALTER.
+        db.migrate_v49_to_v50().unwrap();
+        assert_eq!(db.schema_version().unwrap(), 50);
+    }
+
+    #[test]
+    fn test_migrate_v49_to_v50_is_idempotent() {
+        let mut db = db();
+        // A fresh DB is already at v50 via the v1 inline schema; the migration
+        // must recognise that and no-op rather than re-ALTER.
+        db.migrate_v49_to_v50().unwrap();
+        db.migrate_v49_to_v50().unwrap();
+        assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        assert!(
+            db.column_exists("auto_pull_stats", "redrive_count")
+                .unwrap()
+        );
+        assert!(
+            db.column_exists("auto_pull_stats", "last_redrive_at")
+                .unwrap()
+        );
+        assert!(
+            db.column_exists("auto_pull_stats", "redrive_abandoned_at")
+                .unwrap()
+        );
     }
 
     #[test]
@@ -18419,6 +18708,7 @@ mod tests {
         db2.migrate_v46_to_v47().unwrap();
         db2.migrate_v47_to_v48().unwrap();
         db2.migrate_v48_to_v49().unwrap();
+        db2.migrate_v49_to_v50().unwrap();
 
         let final_version: i64 = db2
             .conn

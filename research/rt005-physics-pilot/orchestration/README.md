@@ -179,11 +179,12 @@ id, and correlation no longer has to be inferred. The byte-offset slice below
 predates that fix and is kept as the belt to its braces — it is what catches a
 deployment where the fix is not yet live.
 
-`mika/CLAUDE.md` Signal O still says to read
+`mika/CLAUDE.md` Signal O used to say to read
 `~/.mika/agents/<name>/logs/mika.log.$(date +%F)` for a `mika ask`. That was true
-before #1727 and is stale now; following it captures nothing. The measurement
-channel is spirit's own log (`MIKA_SPIRIT_LOG_FILE`, else
-`/var/log/mika/server.log`).
+before #1727 and stale afterwards; following it captured nothing. **mika#2069
+corrected it** — Signal O now names `$MIKA_SPIRIT_LOG_FILE` as the sink for every
+`turn_usage`, entry door included, and states the reason. The measurement channel
+is spirit's own log (`MIKA_SPIRIT_LOG_FILE`, else `/var/log/mika/server.log`).
 
 So each run is still correlated by **(agent_id, byte-offset slice)**: the script notes
 the log size before the call and reads only what was appended after it. This is

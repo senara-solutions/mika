@@ -93,8 +93,11 @@ silently treated as one family.
 
 ## Detection
 
-Two greps against `$MIKA_SPIRIT_LOG_FILE` (or the CLI per-agent log at
-`~/.mika/agents/<name>/logs/mika.log.YYYY-MM-DD`):
+Two greps against `$MIKA_SPIRIT_LOG_FILE` — the only sink that carries execution
+`turn_usage`, whatever the entry door. Do not fall back to the per-agent CLI log
+`~/.mika/agents/<name>/logs/mika.log.YYYY-MM-DD`: since mika#1727 spirit owns the
+execution session, so even a `mika ask` emits its turns server-side, and that file
+holds only heartbeat / reflection / reminder / `mika chat` turns (mika#2069):
 
 ```bash
 # Confirm Anthropic events have input_tokens ~= fresh (input excludes cache):
