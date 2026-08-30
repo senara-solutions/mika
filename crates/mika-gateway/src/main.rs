@@ -30,6 +30,12 @@ use telegram::TelegramClient;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // mika#2066 AC2 — answer `--version`/`-V` before loading settings. The
+    // gateway otherwise dies on `missing configuration field "database_url"`
+    // before it can state the commit it was built from; an unconfigured binary
+    // must still be interrogable for its provenance.
+    mika_common::build_info::print_version_if_requested("mika-gateway");
+
     // Install rustls aws-lc-rs CryptoProvider before any TLS operation. Both
     // aws-lc-rs and ring are compiled in transitively (sqlx via tls-rustls-aws-lc-rs
     // and reqwest via rustls-tls-native-roots), so rustls cannot auto-select a
