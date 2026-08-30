@@ -1,0 +1,122 @@
+# Auto-build + ECR-push of the mika-agent image on merge to main (mika#1619).
+#
+# Before this workflow, every customer-side fix reaching the cluster required a
+# manual operator "ascension": docker build -> ECR login -> docker push -> helm
+# values bump. That gated every rollout on operator hands and let mika main drift
+# from what the agent pods actually ran. This job automates the build+push half;
+# the downstream tag-rotation PR on mika-cloud/helm values.yaml stays a separate,
+# out-of-scope concern (a 1-line bump that reads the tag emitted below).
+#
+# Auth: OIDC-federated role-assume, no long-lived AWS creds — same id-token
+# mechanism release.yml already uses for build provenance. The single required
+# repo secret is ECR_PUSH_ROLE_ARN (the ARN of the ECR-push role whose trust
+# policy allows this repo's GitHub OIDC subject; provisioned in mika-cloud
+# Terraform per mika#1619). No AWS access keys are stored.
+#
+# Tags pushed (AC: SHA + moving tag):
+#   - <full github.sha>  immutable, the deploy target downstream PRs pin
+#   - latest             moving convenience tag for the newest main build
+# Downstream consumers derive the short-sha (first 8) from the full sha.
+name: Agent Image Build & Push
+
+on:
+  push:
+    branches: [main]
+    # Only rebuild+push when something that actually goes into the agent image
+    # changes — mirrors ci.yml's `images-relevant` paths-filter so docs-only or
+    # unrelated merges don't spend an ECR push. Keep in sync with Dockerfile.agent
+    # COPY inputs and with the CI filter.
+    paths:
+      - 'Dockerfile.agent'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - 'skills/**'
+      - 'packages/**'
+      - 'dashboard/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/agent-image-build-push.yml'
+
+# OIDC needs id-token: write; contents: read for checkout. Nothing else.
+permissions:
+  contents: read
+  id-token: write
+
+# One in-flight build per ref. Do NOT cancel a mid-push run: each main commit is
+# a distinct immutable artifact and a cancelled push could leave the moving
+# `latest` tag lagging the just-merged commit.
+concurrency:
+  group: agent-image-build-push-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-west-3
+  ECR_REGISTRY: 043025085284.dkr.ecr.eu-west-3.amazonaws.com
+  ECR_REPOSITORY: mika-agent
+
+jobs:
+  build-push:
+    name: Build & push mika-agent to ECR
+    runs-on: ubuntu-22.04
+    # Never run on a fork: the OIDC role trusts only the canonical repo, and a
+    # fork has no business pushing production artifacts. Matches release.yml.
+    if: github.repository_owner == 'senara-solutions'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+
+      # Fail loudly and early with a human-readable reason if the deploy role is
+      # not configured, instead of a cryptic AssumeRoleWithWebIdentity error.
+      - name: Verify ECR push role is configured
+        env:
+          ECR_PUSH_ROLE_ARN: ${{ secrets.ECR_PUSH_ROLE_ARN }}
+        run: |
+          if [ -z "$ECR_PUSH_ROLE_ARN" ]; then
+            echo "::error::Secret ECR_PUSH_ROLE_ARN is not set. Provision the OIDC ECR-push role (mika-cloud Terraform, mika#1619) and add its ARN as the repo secret ECR_PUSH_ROLE_ARN."
+            exit 1
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a  # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.ECR_PUSH_ROLE_ARN }}
+          role-session-name: mika-agent-image-push-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076  # v2.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2  # v3
+
+      - name: Build and push mika-agent image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v6
+        with:
+          context: .
+          file: Dockerfile.agent
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+          # Share the same gha cache scope as ci.yml's PR-side docker-build so the
+          # merge build reuses layers already warmed during PR validation.
+          cache-from: type=gha,scope=mika-agent
+          cache-to: type=gha,scope=mika-agent,mode=max
+          platforms: linux/amd64
+
+      # Emit the immutable tag so a downstream reconciler / rotation PR can pin it
+      # without re-deriving it (ticket: "Outputs the new tag to a workflow summary").
+      - name: Publish pushed tag to workflow summary
+        run: |
+          {
+            echo "### mika-agent image pushed to ECR"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| registry | \`${ECR_REGISTRY}\` |"
+            echo "| repository | \`${ECR_REPOSITORY}\` |"
+            echo "| immutable tag | \`${GITHUB_SHA}\` |"
+            echo "| moving tag | \`latest\` |"
+            echo "| full ref | \`${ECR_REGISTRY}/${ECR_REPOSITORY}:${GITHUB_SHA}\` |"
+            echo "| short-sha | \`${GITHUB_SHA:0:8}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
