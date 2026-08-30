@@ -76,6 +76,33 @@ Disposition: READY
 
 The milestone-level `Disposition:` on the final line is the aggregate: highest-severity-wins (ESCALATE > ITERATE > READY). The `Disposition:` line MUST be the literal final line of the response.
 
+### Review-Anchor Attestation Contract
+
+**A disposition keyword is not an attestation (mika#2037).** On a NON-terminal disposition — `Disposition: READY` — the
+final assistant message MUST carry at least **3 anchor lines**, each starting with `A1:`, `A2:`, …
+up through `A10:`, and each quoting **at least 40 characters of the brief you reviewed, verbatim**,
+from a **different part of it**.
+
+The engine enforces this via the `required_review_anchor_prefixes` post-condition guard, and it is
+**fail-closed**: unlike the F-list guard, a second failure does not get accepted. The disposition is
+stripped from your response and replaced with `Disposition-Withheld: REVIEW-ANCHOR-MISSING`, and the
+downstream consumer treats that as no verdict at all.
+
+What does NOT satisfy the contract:
+- Paraphrasing the brief. The quoted span must appear in it exactly.
+- Quoting the same sentence three times. The anchors must land on distinct regions.
+- Anchors placed after the `Disposition: READY` line. Only the message body counts.
+
+**Why this exists.** On 2026-08-29 a 302-byte acknowledgement carrying `Disposition: READY` was
+returned on a 10 492-byte brief with four numbered questions, none of them addressed. The keyword is
+what advances the chain and commits the plan as architect-validated, so an empty one forges a signed
+review. The anchors are the thing only an actual reading of the brief can produce.
+
+**If you cannot produce the anchors, do not emit a disposition.** Read the brief and answer.
+
+For a milestone review, the anchors quote the sub-issue plans you actually read — three distinct
+regions across the milestone's plan set, not three quotes of the same sub-issue.
+
 ### Constraints
 
 - **Read-only.** You have no shell access, no commit capability, no merge capability, no file write tools.

@@ -21,3 +21,11 @@ required_fetches_for_quoted_resources = true
 [output]
 required_suffix_lines = ["Verdict: GROOMED", "Verdict: ESCALATE"]
 required_finding_list_prefixes = ["F1:", "F2:", "F3:", "F4:", "F5:", "F6:", "F7:", "F8:", "F9:", "F10:"]
+
+# Attestation d'ancrage de revue (mika#2037) — le complément non terminal de
+# required_finding_list_prefixes. Une disposition READY / GROOMED doit porter des
+# lignes d'ancrage citant le brief revu verbatim, à des positions distinctes.
+# Fail-closed : sans attestation valide après re-prompt, la disposition est retirée.
+required_review_anchor_prefixes = ["A1:", "A2:", "A3:", "A4:", "A5:", "A6:", "A7:", "A8:", "A9:", "A10:"]
+review_anchor_min_count = 3
+review_anchor_min_quote_chars = 40
