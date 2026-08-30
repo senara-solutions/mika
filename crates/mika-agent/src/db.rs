@@ -12332,6 +12332,60 @@ mod tests {
     }
 
     #[test]
+    fn test_migrate_v49_to_v50_alters_a_real_v49_table_and_preserves_rows() {
+        // The idempotence test below runs against a fresh DB, which the v1
+        // inline schema already builds at v50 — so it exercises the no-op
+        // branch, not the ALTER. This one builds the actual v49 shape, puts a
+        // row in it, and proves the upgrade path keeps existing circuit-breaker
+        // state while defaulting the new counters.
+        let mut db = db();
+        db.conn
+            .execute_batch(
+                "DROP TABLE auto_pull_stats;
+                 CREATE TABLE auto_pull_stats (
+                     repo_full_name TEXT NOT NULL,
+                     issue_number INTEGER NOT NULL,
+                     failure_count INTEGER NOT NULL DEFAULT 0,
+                     last_auto_pull_at TEXT,
+                     last_failure_at TEXT,
+                     PRIMARY KEY (repo_full_name, issue_number)
+                 );
+                 INSERT INTO auto_pull_stats
+                     (repo_full_name, issue_number, failure_count, last_auto_pull_at)
+                 VALUES ('senara-solutions/mika', 1901, 2, '2026-08-29T00:00:00Z');
+                 DELETE FROM schema_version;
+                 INSERT INTO schema_version (version) VALUES (49);",
+            )
+            .unwrap();
+        assert_eq!(db.schema_version().unwrap(), 49);
+        assert!(
+            !db.column_exists("auto_pull_stats", "redrive_count")
+                .unwrap(),
+            "precondition: the v49 shape has no re-drive columns"
+        );
+
+        db.migrate_v49_to_v50().unwrap();
+
+        assert_eq!(db.schema_version().unwrap(), 50);
+        assert_eq!(
+            db.get_auto_pull_failure_count("senara-solutions/mika", 1901)
+                .unwrap(),
+            2,
+            "existing circuit-breaker state survives the upgrade"
+        );
+        assert_eq!(
+            db.get_auto_pull_redrive_state("senara-solutions/mika", 1901)
+                .unwrap(),
+            (0, false),
+            "a pre-existing row starts with a clean re-drive budget"
+        );
+
+        // Second call must recognise v50 and no-op rather than re-ALTER.
+        db.migrate_v49_to_v50().unwrap();
+        assert_eq!(db.schema_version().unwrap(), 50);
+    }
+
+    #[test]
     fn test_migrate_v49_to_v50_is_idempotent() {
         let mut db = db();
         // A fresh DB is already at v50 via the v1 inline schema; the migration

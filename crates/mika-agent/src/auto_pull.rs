@@ -346,6 +346,12 @@ pub fn select_best_candidate(
         .into_iter()
         .filter(|i| !i.labels.iter().any(|l| l.name == "ready"))
         .filter(|i| !open_pr_issue_numbers.contains(&i.number))
+        // mika#2020 R11: `blocked`/`operator-review` are structural exclusions,
+        // as Phase 0 has always treated them. Phase 1 did not, which left the
+        // abandonment leaking: a groomed ticket handed to the operator could be
+        // re-promoted to `ready` here on the very next idle tick, and the
+        // `ready` webhook would dispatch it again.
+        .filter(|i| !is_feeder_excluded(i))
         .filter(|i| is_groomed(&i.body))
         .filter(|i| !warn_and_reject_foreign_plan(i))
         .collect();
@@ -901,8 +907,17 @@ async fn abandon_stuck_ready(
     trace_id: &str,
     session_id: &str,
 ) {
-    if let Err(e) = gh_remove_label(github_token, issue_number, "ready").await {
-        warn!(error = %e, issue = issue_number, "auto_pull: abandon could not remove ready label");
+    // `operator-review` goes on FIRST, and a failure to apply it aborts the
+    // abandonment. It — not the absence of `ready` — is what structurally
+    // excludes the ticket from all three phases, so it must be the label that
+    // lands. Removing `ready` first and then failing here would leave the ticket
+    // with neither label but with an abandonment stamp: Phase 1 would re-promote
+    // it, Phase 2 would read the stamp-without-label as the operator's re-entry
+    // gesture, and the budget would reset — a fresh loop every N re-drives.
+    // Aborting instead is convergent: the counter is still past the budget, so
+    // the next tick simply retries the abandonment.
+    if let Err(e) = gh_apply_label(github_token, issue_number, "operator-review").await {
+        warn!(error = %e, issue = issue_number, "auto_pull: abandon could not apply operator-review label; leaving ticket untouched for the next tick");
         if let Err(e2) = db
             .increment_auto_pull_failure(DEFAULT_REPO, issue_number)
             .await
@@ -912,8 +927,10 @@ async fn abandon_stuck_ready(
         return;
     }
 
-    if let Err(e) = gh_apply_label(github_token, issue_number, "operator-review").await {
-        warn!(error = %e, issue = issue_number, "auto_pull: abandon could not apply operator-review label");
+    // Past this point the ticket is already excluded from every phase, so a
+    // failure below degrades the refusal's reach, never its effect.
+    if let Err(e) = gh_remove_label(github_token, issue_number, "ready").await {
+        warn!(error = %e, issue = issue_number, "auto_pull: abandon could not remove ready label");
     }
 
     if let Err(e) = gh_comment_issue(
@@ -2747,6 +2764,28 @@ This ticket has been GROOMED and is ready.
         ];
         let selected = select_feeder_candidates(&issues, &HashSet::new(), &HashSet::new(), 5);
         assert_eq!(selected, vec![2]);
+    }
+
+    #[test]
+    fn test_phase1_does_not_repromote_an_abandoned_ticket() {
+        // R11: without this filter the abandonment leaks — Phase 1 would put
+        // `ready` back on a ticket the reconciler just handed to the operator,
+        // and the ready-label webhook would dispatch it again.
+        let issues = vec![
+            make_issue(1901, GROOMED_BODY, &["p0", "operator-review"], "t"),
+            make_issue(2, GROOMED_BODY, &["p3"], "t"),
+        ];
+        let selected = select_best_candidate(issues, &HashSet::new()).unwrap();
+        assert_eq!(
+            selected.number, 2,
+            "an operator-held ticket is not promotable, whatever its priority"
+        );
+    }
+
+    #[test]
+    fn test_phase1_does_not_promote_a_blocked_ticket() {
+        let issues = vec![make_issue(1, GROOMED_BODY, &["p0", "blocked"], "t")];
+        assert!(select_best_candidate(issues, &HashSet::new()).is_none());
     }
 
     #[test]
