@@ -827,6 +827,50 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Read a ticket's re-drive state `(count, abandoned)` (mika#2020).
+    pub async fn get_auto_pull_redrive_state(
+        &self,
+        repo_full_name: &str,
+        issue_number: u64,
+    ) -> Result<(i64, bool)> {
+        let repo = repo_full_name.to_owned();
+        self.with_db(move |db| db.get_auto_pull_redrive_state(&repo, issue_number))
+            .await
+    }
+
+    /// Increment a ticket's re-drive counter (mika#2020).
+    pub async fn increment_auto_pull_redrive(
+        &self,
+        repo_full_name: &str,
+        issue_number: u64,
+    ) -> Result<()> {
+        let repo = repo_full_name.to_owned();
+        self.with_db(move |db| db.increment_auto_pull_redrive(&repo, issue_number))
+            .await
+    }
+
+    /// Clear a ticket's re-drive budget (mika#2020).
+    pub async fn reset_auto_pull_redrive(
+        &self,
+        repo_full_name: &str,
+        issue_number: u64,
+    ) -> Result<()> {
+        let repo = repo_full_name.to_owned();
+        self.with_db(move |db| db.reset_auto_pull_redrive(&repo, issue_number))
+            .await
+    }
+
+    /// Stamp a ticket as abandoned by the re-drive reconciler (mika#2020).
+    pub async fn mark_auto_pull_redrive_abandoned(
+        &self,
+        repo_full_name: &str,
+        issue_number: u64,
+    ) -> Result<()> {
+        let repo = repo_full_name.to_owned();
+        self.with_db(move |db| db.mark_auto_pull_redrive_abandoned(&repo, issue_number))
+            .await
+    }
+
     pub async fn get_user_visible_tasks(&self) -> Result<Vec<Task>> {
         let id = self.agent_id.clone();
         self.with_db(move |db| db.get_user_visible_tasks(&id)).await
