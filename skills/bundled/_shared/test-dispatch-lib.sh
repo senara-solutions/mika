@@ -1331,7 +1331,10 @@ else
 fi
 
 # Test C: Structural — dispatch-lib uses pathspec exclusion (not bare git add -A)
-RESCUE_BLOCK=$(sed -n '/Unit 1 (mika#1282)/,/^[[:space:]]*fi$/p' "$DISPATCH_LIB" | head -120)
+# mika#2031 moved the rescue body out of _post_flight_recovery into
+# _rescue_dirty_worktree(), so the extraction anchors on the function rather than
+# on the inline `Unit 1` comment. Same assertions, same block — new address.
+RESCUE_BLOCK=$(sed -n '/^_rescue_dirty_worktree() {/,/^}$/p' "$DISPATCH_LIB")
 assert_contains "Rescue uses pathspec exclusion :!.claude/commands/" ":!.claude/commands/" "$RESCUE_BLOCK"
 assert_contains "Rescue has empty-index guard (diff --cached --quiet)" "diff --cached --quiet" "$RESCUE_BLOCK"
 assert_contains "Rescue uses RESCUED_FILES for message" 'RESCUED_FILES' "$RESCUE_BLOCK"
