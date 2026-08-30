@@ -191,3 +191,23 @@
 - name: calibration-reset
   color: "d93f0b"
   description: "Baseline reset due to judge model deprecation"
+
+# ── Origin (mika#2026) ───────────────────────────────────────────────────────
+# Who produced this PR. Stamped by the producer at the moment of production —
+# never reconstructed after the fact from a branch name, an author, or a time
+# window (all three are indistinguishable between the loop and by-hand work).
+# Only `origin:loop` has a structural producer today: dispatch-lib's
+# `_stamp_pr_origin`. The other two are vocabulary the reader understands and a
+# human or spawn may apply. Absence of every `origin:*` label reads "unknown" —
+# read side: scripts/pr-origin-report.sh.
+- name: "origin:loop"
+  color: "1d76db"
+  description: "PR produced by the autonomous loop — stamped by dispatch-lib at production (mika#2026)"
+
+- name: "origin:spawn"
+  color: "1d76db"
+  description: "PR produced by a spawned tenant session (mika#2026)"
+
+- name: "origin:manual"
+  color: "1d76db"
+  description: "PR opened by hand in an interactive session (mika#2026)"
