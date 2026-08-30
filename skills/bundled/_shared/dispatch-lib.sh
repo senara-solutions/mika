@@ -1036,8 +1036,65 @@ _seed_worktree_slash_commands() {
 # whose path drifted, stranding it forever. That is a strictly worse failure than
 # the loop this gate closes: the loop wastes dispatches, a stranded ticket is
 # never worked at all. When in doubt, this function returns 1 and grooming runs.
+#
+# _plan_provenance — did this branch commit the plan, or inherit it from main?
+#
+# mika#2034. A separate function on purpose: every caller of
+# `_committed_plan_on_branch` invokes it in a command substitution, and a
+# subshell cannot set a variable in its parent — the trap this file already
+# documents for `_DISPOSITION_FUZZY`. A global set inside the gate would read
+# back empty at exactly the site that needs it, so the measurement is a value
+# the caller asks for by name instead.
+#
+# Describes, never decides. Deliberately NOT a gate condition: a ticket that was
+# legitimately groomed and whose PR merged also carries its plan on `main`, so
+# blocking on inheritance would re-strand the tickets the gate exists to protect
+# (KTD1). Its only job is to stop the caller claiming the branch committed
+# something it inherited.
+#
+# Args: $1 = sub-repo dir, $2 = branch, $3 = plan path (repo-relative).
+_plan_provenance() {
+    local sub_repo_dir="$1" branch="$2" candidate="$3"
+    local gate_ref="refs/dispatch-gate/${branch}" branch_blob main_blob
+
+    branch_blob=$(git -C "$sub_repo_dir" rev-parse "${gate_ref}:${candidate}" 2>/dev/null)
+    main_blob=$(git -C "$sub_repo_dir" rev-parse "origin/main:${candidate}" 2>/dev/null)
+
+    if [ -z "$branch_blob" ]; then
+        # The ref is gone or the path no longer resolves. Say that, rather than
+        # pick one of the two claims at random.
+        printf 'provenance unmeasured — the plan no longer resolves on %s' "$gate_ref"
+    elif [ "$branch_blob" = "$main_blob" ]; then
+        printf 'inherited unchanged from main, not committed on this branch'
+    else
+        printf 'committed on the dispatch branch'
+    fi
+}
+
+# mika#2034 — the path comes out of the ticket's OWN callout, so resolving it is
+# not yet evidence about this ticket. Every dispatch branch descends from `main`
+# and `main` carries 769 plan files, so any valid plan path resolves whatever
+# ticket it belongs to: the attestation was being produced by the very claim it
+# is supposed to check, against a tree that cannot refute it. Measured
+# 2026-08-30, both stranded — the gate refused their grooming permanently:
+#
+#   mika#1887 → `…-fix-1933-reader-completed-section-avancement-plan.md`
+#               whose header reads `issue: senara-solutions/mika#1933`
+#   mika#2026 → `…-chore-deps-bump-rand-clear-rustsec-2026-0097-plan.md`
+#               whose header reads `**Issue:** #539`
+#
+# Both files sit on `origin/main`; those branches inherited them and committed
+# nothing. So the candidate is now bound to the issue before it is believed, and
+# provenance is measured before it is described. Same class as mika#2028's
+# fourth false statement, a different site — #2028 fixed the failure callback's
+# guard, never this one.
 _committed_plan_on_branch() {
     local sub_repo_dir="$1" branch="$2" issue_body="$3" repo="$4"
+    # mika#2034: the target issue, optional and defaulted, so the four existing
+    # call sites and the five fixture cases keep working unchanged (KTD2). When
+    # neither is available the binding check is skipped rather than guessed —
+    # refute on evidence, never on absence (KTD3).
+    local issue_num="${5:-${ISSUE_NUM:-}}"
     local plan_path candidate
 
     plan_path=$(printf '%s\n' "$issue_body" \
@@ -1065,11 +1122,57 @@ _committed_plan_on_branch() {
     # The callout carries two historical shapes: repo-prefixed
     # (`mika/docs/plans/…`) and repo-relative (`docs/plans/…`). Try both — U3
     # normalizes new writes, but tickets groomed before it keep the old form.
+    local tmp_plan claimed
     for candidate in "$plan_path" "${plan_path#"${repo}/"}"; do
-        if git -C "$sub_repo_dir" cat-file -e "${gate_ref}:${candidate}" 2>/dev/null; then
-            printf '%s' "$candidate"
-            return 0
+        # `cat-file -e` answers "does this path resolve", which a DIRECTORY also
+        # satisfies — and `git show` on a tree prints a listing, so a callout
+        # naming `docs/plans` would have been read as a plan with no issue
+        # header and fired the gate. Demand a blob (mika#2034, found by the
+        # unbindable-candidate test below).
+        [ "$(git -C "$sub_repo_dir" cat-file -t "${gate_ref}:${candidate}" 2>/dev/null)" = "blob" ] || continue
+
+        # --- Issue binding (mika#2034). The gate decision. ---
+        #
+        # `_plan_header_refutes_issue` takes a readable path and the candidate
+        # lives in a git object, so materialize it (KTD4). Its contract is
+        # refutation, not confirmation, and it is reused verbatim: a header that
+        # claims nothing does NOT refute. 95 of the 745 plans in docs/plans/
+        # carry no issue marker, and demanding a positive match would strand
+        # every one of them — the false-negative class mika#1421, #1602 and
+        # #1617 were each opened to close.
+        # When the binding cannot be PERFORMED — mktemp fails, `git show` cannot
+        # write the blob — the check must not be silently skipped. Skipping it
+        # fires the gate on an unbound candidate, which is the defect this whole
+        # change exists to close, arrived at by a different road. Decline
+        # instead: an extra grooming costs one dispatch, a strand costs the
+        # ticket. That is this function's stated doctrine ("when in doubt,
+        # returns 1 and grooming runs"), applied to its own failure modes.
+        if [ -n "$issue_num" ]; then
+            tmp_plan=$(mktemp -t mika-gate-plan-XXXXXX.md 2>/dev/null) || {
+                echo "dispatch_gate_groom_bind_unavailable: repo=${repo} issue=${issue_num} branch=${branch} plan=${candidate} — mktemp failed, cannot bind the plan to the issue; declining rather than firing on an unbound candidate (mika#2034)" >&2
+                return 1
+            }
+            if ! git -C "$sub_repo_dir" show "${gate_ref}:${candidate}" > "$tmp_plan" 2>/dev/null \
+               || [ ! -s "$tmp_plan" ]; then
+                echo "dispatch_gate_groom_bind_unavailable: repo=${repo} issue=${issue_num} branch=${branch} plan=${candidate} — could not read the plan blob from ${gate_ref}, cannot bind it to the issue; declining rather than firing on an unbound candidate (mika#2034)" >&2
+                rm -f "$tmp_plan"
+                return 1
+            fi
+            if _plan_header_refutes_issue "$tmp_plan" "$issue_num"; then
+                claimed=$(_plan_header_claimed_issues "$tmp_plan" | tr '\n' ' ')
+                echo "dispatch_gate_groom_plan_refuted: repo=${repo} issue=${issue_num} branch=${branch} plan=${candidate} — the plan's own header claims issue ${claimed% }, not ${issue_num}; the body callout names a plan belonging to another ticket, so this ticket is NOT groomed and grooming proceeds (mika#2034)" >&2
+                rm -f "$tmp_plan"
+                return 1
+            fi
+            rm -f "$tmp_plan"
         fi
+
+        # Provenance is NOT measured here: this function runs inside a command
+        # substitution at every call site, so it must keep stdout to the plan
+        # path alone. Callers that describe the plan ask `_plan_provenance` for
+        # it by name.
+        printf '%s' "$candidate"
+        return 0
     done
     return 1
 }
@@ -1209,11 +1312,16 @@ _set_up_worktree() {
         # trap; mika-dev then reads a crash envelope and idles (7 h stall,
         # 2026-05-06). This is a foreseeable condition, so it exits 0.
         if [ "$SKILL" = "dev-groom" ]; then
-            local existing_plan
-            if existing_plan=$(_committed_plan_on_branch "$SUB_REPO_DIR" "$BRANCH" "$ISSUE_BODY" "$REPO"); then
-                echo "dispatch_gate_groom_refused: repo=${REPO} issue=${ISSUE_NUM} branch=${BRANCH} plan=${existing_plan} — plan already committed on branch, re-grooming would loop (mika#2012)" >&2
-                RESULT=$(printf '{"status":"auto_skipped","reason":"already_groomed","issue":"senara-solutions/%s#%s","branch":"%s","plan":"%s","note":"A committed plan already exists on the dispatch branch. Re-grooming would re-derive it and stack a second body callout. Dispatch dev-pilot to implement, or remove the plan from the branch to force a fresh groom."}' \
-                    "$REPO" "$ISSUE_NUM" "$BRANCH" "$existing_plan")
+            local existing_plan plan_provenance
+            if existing_plan=$(_committed_plan_on_branch "$SUB_REPO_DIR" "$BRANCH" "$ISSUE_BODY" "$REPO" "$ISSUE_NUM"); then
+                # mika#2034: say what was measured. The old wording asserted
+                # "already committed on branch" for a blob the branch had merely
+                # inherited from main — an attestation produced beside the thing
+                # it attests.
+                plan_provenance=$(_plan_provenance "$SUB_REPO_DIR" "$BRANCH" "$existing_plan")
+                echo "dispatch_gate_groom_refused: repo=${REPO} issue=${ISSUE_NUM} branch=${BRANCH} plan=${existing_plan} — plan resolves on the branch (${plan_provenance}) and its header does not claim another ticket; re-grooming would loop (mika#2012, provenance mika#2034)" >&2
+                RESULT=$(printf '{"status":"auto_skipped","reason":"already_groomed","issue":"senara-solutions/%s#%s","branch":"%s","plan":"%s","provenance":"%s","note":"The plan named by this ticket resolves on the dispatch branch (%s) and its header does not claim a different ticket. Re-grooming would re-derive it and stack a second body callout. Dispatch dev-pilot to implement, or remove the plan from the branch to force a fresh groom."}' \
+                    "$REPO" "$ISSUE_NUM" "$BRANCH" "$existing_plan" "$plan_provenance" "$plan_provenance")
                 _deliver_callback
                 exit 0
             elif grep -qE -- '^> - \*\*Plan:\*\*' <<<"$ISSUE_BODY"; then
@@ -4509,7 +4617,7 @@ Outcome: PLAN_GROOMED"
             if [ -n "${VALID_PLAN:-}" ]; then
                 _groom_plan_line="
 Plan in worktree: ${VALID_PLAN} — the architect verdict is what is missing, not the plan."
-            elif _groom_plan_path=$(_committed_plan_on_branch "$SUB_REPO_DIR" "$BRANCH" "$ISSUE_BODY" "$REPO" 2>/dev/null); then
+            elif _groom_plan_path=$(_committed_plan_on_branch "$SUB_REPO_DIR" "$BRANCH" "$ISSUE_BODY" "$REPO" "$ISSUE_NUM" 2>/dev/null); then
                 _groom_plan_line="
 Plan on remote branch: ${_groom_plan_path} — the architect verdict is what is missing, not the plan."
             fi
