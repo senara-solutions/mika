@@ -208,6 +208,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - name: Enforce no-log discipline on egress substrate (mika#1810 E4)
         run: bash scripts/verify-egress-no-log.sh
+      - name: Pin the egress no-log guard's negative behaviour (mika#2054)
+        run: bash scripts/test-verify-egress-no-log.sh
 
   sigpipe-grep-lint:
     name: SIGPIPE grep-q Lint
