@@ -722,6 +722,25 @@ class HostSocketLifecycleTests(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertTrue(os.path.exists(self.sock), "refused path must survive")
 
+    def test_fatal_refusal_diagnostic_is_timestamped(self) -> None:
+        # mika#2030: the fatal non-socket refusal reaches pilot-egress-proxy.log
+        # via stderr, so it must carry a timestamp like every other line — a
+        # bare `sys.exit(msg)` would drop an un-stamped line into a stamped log.
+        with open(self.sock, "w", encoding="utf-8") as handle:
+            handle.write("not a socket")
+        proc = self._spawn_host()
+        _, stderr = proc.communicate(timeout=10)
+        self.assertNotEqual(proc.returncode, 0)
+        text = stderr.decode()
+        lines = [line for line in text.splitlines() if line.strip()]
+        self.assertTrue(lines, "expected a fatal diagnostic on stderr")
+        for line in lines:
+            match = _TS_PREFIX_RE.match(line)
+            self.assertIsNotNone(match, f"fatal line not timestamped: {line!r}")
+            assert match is not None
+            datetime.datetime.strptime(match.group("ts"), "%Y-%m-%dT%H:%M:%S.%fZ")
+        self.assertIn("refusing to unlink non-socket", text)
+
     def test_sigterm_unlinks_the_socket(self) -> None:
         proc = self._spawn_host()
         self.assertTrue(self._wait_connectable())

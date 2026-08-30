@@ -760,9 +760,15 @@ async def run_host_mode(unix_sock_path: str) -> None:
             if stat.S_ISSOCK(sock_path.stat().st_mode):
                 sock_path.unlink()
             else:
-                sys.exit(f"refusing to unlink non-socket: {sock_path}")
+                # These fatal-startup diagnostics reach the same log file as the
+                # rest (stderr → pilot-egress-proxy.log), so they carry the
+                # mika#2030 timestamp too — a bare `sys.exit(msg)` would land an
+                # un-stamped line in the middle of a stamped log.
+                _log(f"[egress] FATAL refusing to unlink non-socket: {sock_path}")
+                sys.exit(1)
         except OSError as exc:
-            sys.exit(f"stale-socket cleanup failed: {exc}")
+            _log(f"[egress] FATAL stale-socket cleanup failed: {exc}")
+            sys.exit(1)
 
     server = await asyncio.start_unix_server(handle_host_client, str(sock_path))
     # World-writable so the sandbox (running as same uid, but env-cleared) can
