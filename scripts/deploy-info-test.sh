@@ -107,7 +107,7 @@ run_recipe() {
 
 assert_contains() {
   local name="$1" expected="$2" output="$3"
-  if echo "$output" | grep -qF -- "$expected"; then
+  if grep -qF -- "$expected" <<<"$output"; then
     echo "PASS: $name"
     PASS=$((PASS + 1))
   else
@@ -120,7 +120,7 @@ assert_contains() {
 
 assert_not_contains() {
   local name="$1" unexpected="$2" output="$3"
-  if echo "$output" | grep -qF -- "$unexpected"; then
+  if grep -qF -- "$unexpected" <<<"$output"; then
     echo "FAIL: $name"
     echo "  expected NOT to contain: $unexpected"
     echo "  output: $output"

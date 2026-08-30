@@ -796,7 +796,7 @@ _validate_inputs() {
     fi
 
     # Reject non-UUID task_id at the handler boundary (#958)
-    if ! printf '%s' "$USER_TASK_ID" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+    if ! grep -qiE -- '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' <<<"$USER_TASK_ID"; then
         # Sanitize value for JSON safety: escape backslashes and double-quotes.
         _sanitized_tid=$(printf '%s' "$USER_TASK_ID" | sed 's/\\/\\\\/g; s/"/\\"/g' | head -c 200)
         printf 'DISPATCH_VALIDATION_ERROR: {"error":"invalid_uuid","field":"task_id","value":"%s","reason":"task_id must be a valid UUID (36-char format like 15383984-a3e7-41bf-ac6f-630ba9a89d63). Got a non-UUID string — this is likely an unsubstituted template placeholder."}\n' "$_sanitized_tid" >&2
@@ -1109,7 +1109,7 @@ _set_up_worktree() {
     # free-text prompts with an embedded '#' still fall through as before.
     REPO=""
     ISSUE_NUM=""
-    if printf '%s' "$PROMPT" | grep -qE '^([a-zA-Z0-9_-]+/)?[a-zA-Z0-9_-]+#[0-9]+$'; then
+    if grep -qE -- '^([a-zA-Z0-9_-]+/)?[a-zA-Z0-9_-]+#[0-9]+$' <<<"$PROMPT"; then
         REPO=$(printf '%s' "$PROMPT" | sed 's/#.*//' | sed 's#.*/##')
         ISSUE_NUM=$(printf '%s' "$PROMPT" | sed 's/.*#//')
     fi
@@ -1205,7 +1205,7 @@ _set_up_worktree() {
                     "$REPO" "$ISSUE_NUM" "$BRANCH" "$existing_plan")
                 _deliver_callback
                 exit 0
-            elif printf '%s\n' "$ISSUE_BODY" | grep -qE '^> - \*\*Plan:\*\*'; then
+            elif grep -qE -- '^> - \*\*Plan:\*\*' <<<"$ISSUE_BODY"; then
                 # Grooming is ALLOWED here — the gate correctly declined to fire
                 # because no plan is committed on the branch. But this is not a
                 # first grooming either: the body claims a plan that isn't there
@@ -2126,7 +2126,7 @@ ${RESULT}"
     # consumption. Replaces heuristic log inspection with a single
     # structured marker. Order matters: pipeline failure wins over any
     # success-shape outcome.
-    if echo "$RESULT" | grep -qF "PIPELINE FAILURE:"; then
+    if grep -qF -- "PIPELINE FAILURE:" <<<"$RESULT"; then
         RESULT="${RESULT}
 
 Outcome: PIPELINE_INCOMPLETE — manual recovery needed."
@@ -2293,7 +2293,7 @@ Push: pushed to origin/$BRANCH (mode=$push_mode)"
         # After the retry-with-rebase loop, if we still see race-shaped errors,
         # the retry either exhausted or the rebase failed — either way, the
         # commits are stranded and the FAILED semantics stand.
-        if printf '%s' "$push_err_content" | grep -q "stale info\|expected old/new\|failed to push"; then
+        if grep -q -- "stale info\|expected old/new\|failed to push" <<<"$push_err_content"; then
             RESULT="${RESULT}
 Push: FAILED — remote advanced since fetch (lease aborted); commits remain local-only on $BRANCH"
         else
@@ -3585,7 +3585,7 @@ _derive_recovery_pr_title() {
         plan_h1=$(head -5 "$plan_file" | grep -m1 '^# ' | sed 's/^# //')
         if [ -n "$plan_h1" ]; then
             # Check if H1 already has conventional-commit format
-            if echo "$plan_h1" | grep -qE '^(feat|fix|chore|docs|refactor|test|perf|ci)[:(]'; then
+            if grep -qE -- '^(feat|fix|chore|docs|refactor|test|perf|ci)[:(]' <<<"$plan_h1"; then
                 echo "$plan_h1"
                 return
             fi
@@ -3595,7 +3595,7 @@ _derive_recovery_pr_title() {
     fi
 
     # Final fallback: issue title
-    if echo "$issue_title" | grep -qE '^(feat|fix|chore|docs|refactor|test|perf|ci)[:(]'; then
+    if grep -qE -- '^(feat|fix|chore|docs|refactor|test|perf|ci)[:(]' <<<"$issue_title"; then
         echo "$issue_title"
         return
     fi
@@ -3890,7 +3890,7 @@ _finalize_pr_gate() {
     # immediately precedes the AC6 header and cutting from there to end.
     # The gate always appends its block LAST, so end-cut is safe.
     local stripped_body
-    if printf '%s' "$current_body" | grep -qF 'AC6 verbatim ground truth (dispatch-lib finalize gate, mika#1941)'; then
+    if grep -qF -- 'AC6 verbatim ground truth (dispatch-lib finalize gate, mika#1941)' <<<"$current_body"; then
         # Two-pass strip:
         #   1. awk exit-on-marker cuts everything from the AC6 header line to EOF
         #   2. awk end-trim removes trailing blank lines + trailing `---` separator
@@ -4106,7 +4106,7 @@ ${RESULT}"
             RESULT=$(printf '%s' "$RESULT" | sed '/^PIPELINE FAILURE:/d')
             RESULT=$(printf '%s' "$RESULT" | sed 's/Outcome: .*/Outcome: PLAN_GROOMED/')
             # Safety net: if no Outcome: line existed (edge case), append one.
-            if ! printf '%s' "$RESULT" | grep -qF 'Outcome: PLAN_GROOMED'; then
+            if ! grep -qF -- 'Outcome: PLAN_GROOMED' <<<"$RESULT"; then
                 RESULT="${RESULT}
 
 Outcome: PLAN_GROOMED"
@@ -4148,7 +4148,7 @@ Plan on remote branch: ${_groom_plan_path} — the architect verdict is what is 
             # handle re-dispatch where PIPELINE_INCOMPLETE was already set.
             RESULT=$(printf '%s' "$RESULT" | sed "s/Outcome: .*/Outcome: PIPELINE_INCOMPLETE — ${_groom_reason_sed}/")
             # If no Outcome: line existed, append one.
-            if ! printf '%s' "$RESULT" | grep -qF 'Outcome: PIPELINE_INCOMPLETE'; then
+            if ! grep -qF -- 'Outcome: PIPELINE_INCOMPLETE' <<<"$RESULT"; then
                 RESULT="${RESULT}
 
 Outcome: PIPELINE_INCOMPLETE — ${_groom_reason}"
