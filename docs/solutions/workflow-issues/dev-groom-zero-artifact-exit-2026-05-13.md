@@ -48,7 +48,16 @@ All 6 failing sessions shared the same signature: 12 turns of SDK-level "turns" 
 
 3. ~~**Environment wire**: `CLAUDE_PILOT_TRACE=1` in dispatch-lib enables trace for specific skills.~~ **Removed in mika#2043.** The flag reached the CLI as an unrecognized argument; measured, argparse exits 2 before the session starts, so arming it would have killed every dispatch of the skill that set it.
 
-**What to use instead:** `--verbose`, which `dispatch-lib` already passes on every dispatch. It surfaces every text content block (`log_text`), the init event's session_id and model (`log_init` — the signal item 2 was meant to answer), a marker for turns that produced nothing observable (`log_turn_summary`, cpp#10), any unhandled SDK message type (`log_unhandled_message`, cpp#123), and the raw stream: StreamEvent plus tool-result UserMessage (`log_verbose`, cpp#125). Raw `thinking` blocks remain unsurfaced — the one real gap left by Step 0-B, and a ticket on `claude-pilot` if it is ever needed.
+**What to use instead.** Most of what item 2 promised is already logged **unconditionally** — no flag involved. `ui.py`'s writers all go through `write_log`, which is never gated; the log *file* exists because `dispatch-lib` passes `--log-dir` (`cli.py:216-219`), not because of `--verbose`. Always on, whatever the flags:
+
+- every text content block — `log_text` (`agent.py:312`)
+- the init event's session_id and model — `log_init` (`agent.py:256`)
+- a marker for turns that produced nothing observable — `log_turn_summary` (cpp#10)
+- any unhandled SDK message type — `log_unhandled_message` (cpp#123)
+
+`--verbose` adds only two markers, and they are markers, not content: the **type** of each StreamEvent, and a fixed "user message (tool result) received" line — no tool-result payload (`log_verbose`, `agent.py:233,248`, cpp#125).
+
+**What is still not surfaced,** of the four block kinds item 2 named: raw `thinking` blocks (nothing logs their content — only the `had_thinking_block` flag in `guardrails.py`), `tool_result` content, and `tool_use` as a raw block — the latter only reachable indirectly, by name and detail, through the permission path's `log_tool` / `log_tool_request`. And `log_init` is the *source* of item 2's open question, not its answer: it prints `model or "unknown"` and `session_id or ""`, which is exactly the ambiguous line that prompted the `repr(SystemMessage)` request. Distinguishing "attribute absent" from "value is unknown" is still open — a ticket on `claude-pilot` if it is ever needed.
 
 ### Phase 0 outcome
 
@@ -120,7 +129,7 @@ Together, the layers provide defense-in-depth: Layer A prevents, Layer B detects
 
 2. **Prompt-first actions should be tool calls, not reasoning.** When a skill's first phase requires fetching external data (issue metadata, branch state), make the fetch the mandatory first action with explicit "before any reasoning" language.
 
-3. **Use `--verbose` for debugging zero-artifact sessions.** `dispatch-lib` already passes it on every dispatch, so the content-block logs are in `/var/log/claude-pilot/<task_id>.log` without doing anything. (This step previously said to set `CLAUDE_PILOT_TRACE=1`; that flag never existed on the CLI side and was removed in mika#2043 — see the correction note above.)
+3. **Just read the log for zero-artifact sessions — no flag to set.** The content-block logs are in `/var/log/claude-pilot/<task_id>.log` because `dispatch-lib` passes `--log-dir`, and they are written unconditionally. (This step previously said to set `CLAUDE_PILOT_TRACE=1`; that flag never existed on the CLI side and was removed in mika#2043 — see the correction note above.)
 
 4. **Never mass-dispatch grooming tasks** until the queue-depth variable is resolved. Single-dispatch one at a time. The 2026-05-13 incident had 8 concurrent grooms in 3 minutes; 6 of 8 failed.
 

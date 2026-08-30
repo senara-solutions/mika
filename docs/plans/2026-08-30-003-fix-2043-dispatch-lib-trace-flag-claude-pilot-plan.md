@@ -13,7 +13,7 @@ execution: code
 
 **Objectif.** `dispatch-lib.sh` ne construit plus aucun drapeau que le CLI de `claude-pilot` refuse, et un test structurel empêche qu'un tel drapeau réapparaisse.
 
-**Moyen retenu.** Retirer `TRACE_FLAG` et le commentaire qui invite à l'armer ; le remplacer par un commentaire qui nomme la voie de capture réellement disponible (`--verbose`, déjà passé à chaque dispatch) ; corriger les deux documents de solutions qui décrivent `--trace` comme livré ; ajouter à `test-dispatch-lib.sh` une garde à deux passes sur les drapeaux.
+**Moyen retenu.** Retirer `TRACE_FLAG` et le commentaire qui invite à l'armer ; le remplacer par un commentaire qui dit exactement ce qui est loggé et sous quelle condition — l'essentiel l'étant sans aucun drapeau ; corriger les deux documents de solutions qui décrivent `--trace` comme livré ; ajouter à `test-dispatch-lib.sh` une garde à deux passes sur les drapeaux.
 
 **Hiérarchie d'autorité.** Le corps de mika#2043 fixe les trois critères d'acceptation. Là où le ticket et la mesure divergent (le mécanisme d'échec supposé), la mesure prime et la divergence est écrite dans la PR — c'est une exigence explicite du dispatch.
 
@@ -57,7 +57,7 @@ Personne n'arme le drapeau aujourd'hui : `grep -rn "CLAUDE_PILOT_TRACE"` sur `mi
 ### Requirements
 
 - R1. `dispatch-lib.sh` ne construit plus le drapeau `--trace`, et le commentaire qui invitait à l'armer disparaît avec lui.
-- R2. Le commentaire de remplacement nomme la voie de capture d'événements réellement disponible et dit ce qu'elle couvre, pour que la question ne se repose pas.
+- R2. Le commentaire de remplacement dit la voie de capture réellement disponible et **ce qu'elle couvre exactement**, en distinguant l'inconditionnel de ce qu'un drapeau ajoute, pour que la question ne se repose pas — et pour ne pas remplacer une affirmation fausse sur `claude-pilot` par une autre.
 - R3. Les documents de solutions qui décrivent `--trace` comme un livrable sont corrigés — ce sont eux qui ont produit la mine.
 - R4. Une garde structurelle empêche `dispatch-lib` de construire un drapeau que le CLI de `claude-pilot` ne connaît pas, et empêche cette garde elle-même de dériver en une croyance non vérifiée.
 - R5. La PR énonce le mécanisme mesuré (échec bruyant à `exit 2`, pas ignoré en silence), et dit si la trace était utile et par quoi elle est remplacée.
@@ -67,23 +67,32 @@ Personne n'arme le drapeau aujourd'hui : `grep -rn "CLAUDE_PILOT_TRACE"` sur `mi
 - AE1. `grep -c TRACE_FLAG skills/bundled/_shared/dispatch-lib.sh` rend `0` : plus aucun code ne construit le drapeau. `CLAUDE_PILOT_TRACE` ne subsiste que dans le commentaire de remplacement, qui *dissuade* de le remettre — l'inverse d'une invitation, et la réponse que trouvera quiconque grep ce nom.
 - AE2. `bash skills/bundled/_shared/test-dispatch-lib.sh` passe, garde comprise.
 - AE3. La garde est prouvée dans le sens positif sur quatre réintroductions distinctes, chacune devant faire rougir la suite : drapeau inconnu littéral ; drapeau inconnu via variable interpolée (la forme exacte du bug) ; sa forme conditionnelle d'origine ; liste blanche périmée. Plus une cinquième : extraction cassée, qui doit produire un échec et non une disparition silencieuse.
-- AE4. `grep -rn '\-\-trace' docs/solutions/` ne rend plus aucune ligne présentant le drapeau comme disponible.
+- AE4. `grep -rn -- '--trace' docs/solutions/` ne rend plus aucune ligne présentant le drapeau comme disponible. Les lignes attendues sont les corrections mika#2043 elles-mêmes et `best-practices/flag-semantics-…-2026-04-27.md:99`, qui cite `--trace` comme exemple générique de nom de drapeau — zéro ligne n'est pas le résultat attendu.
 
 ## Planning Contract
 
 ### KTD1 — Retirer le drapeau plutôt qu'implémenter `--trace`
 
-Le ticket demande de trancher dans un sens ou dans l'autre. **On retire.** Le besoin qui a motivé Step 0-B était réel — voir les blocs de contenu et l'événement `init` pour diagnostiquer les sessions à zéro artefact (`docs/solutions/workflow-issues/dev-groom-zero-artifact-exit-2026-05-13.md`) — mais il est aujourd'hui couvert, sous le `--verbose` que `dispatch-lib` passe **déjà** à chaque dispatch (ligne 1458) :
+Le ticket demande de trancher dans un sens ou dans l'autre. **On retire.** Le besoin qui a motivé Step 0-B était réel — voir les blocs de contenu et l'événement `init` pour diagnostiquer les sessions à zéro artefact (`docs/solutions/workflow-issues/dev-groom-zero-artifact-exit-2026-05-13.md`) — et **l'essentiel est aujourd'hui couvert sans aucun drapeau**.
 
-| Besoin de Step 0-B | Couverture actuelle |
-|---|---|
-| blocs de contenu texte de chaque `AssistantMessage` | `log_text` sur chaque bloc (`agent.py:309-312`, via `_content_blocks`) |
-| OQ1 : `session_id` vide / `model = "unknown"` sur l'événement init | `log_init(session_id, model)` (`agent.py:250-259`) |
-| tours qui ne produisent rien d'observable | `log_turn_summary` (cpp#10) |
-| type de message SDK tombant hors de la boucle | `log_unhandled_message` (cpp#123) |
-| flux d'événements brut (le « event-stream » du nom du drapeau) | `log_verbose` sur `StreamEvent` (type + progression) et sur `UserMessage`/résultat d'outil (cpp#125, mergé le matin même — `agent.py:225-249`) |
+Point mesuré, et corrigé après revue : la première rédaction de ce plan attribuait cette couverture à `--verbose`. C'est faux, et c'était la faute même que ce ticket ferme, reproduite dans le correctif. Les writers de `ui.py` passent tous par `write_log` (`logger.py:39-43`), qui n'est jamais gardé ; le puits fichier existe parce que `dispatch-lib` passe `--log-dir` (`cli.py:216-219`). Les seuls `if verbose:` du chemin de session sont `agent.py:233` et `agent.py:248`.
 
-**Reste non couvert, à dire honnêtement :** le contenu brut des blocs `thinking`. C'est le seul écart réel entre l'intention de Step 0-B et ce qui existe. Il ne justifie pas de porter un drapeau mort dans `dispatch-lib` en attendant : si ce besoin redevient concret, il se fiche sur `claude-pilot` comme un ticket à lui.
+| Besoin de Step 0-B | Couverture actuelle | Conditionné ? |
+|---|---|---|
+| blocs de contenu texte de chaque `AssistantMessage` | `log_text` (`agent.py:312`) | non — toujours |
+| tours qui ne produisent rien d'observable | `log_turn_summary` (cpp#10, `agent.py:567`) | non — toujours |
+| type de message SDK tombant hors de la boucle | `log_unhandled_message` (cpp#123, `agent.py:418`) | non — toujours |
+| flux d'événements | `log_verbose` : **type** du StreamEvent, et une ligne fixe sur `UserMessage`/résultat d'outil (cpp#125, `agent.py:233,248`) | oui — `--verbose` |
+
+**Restes non couverts, à dire honnêtement.** Des quatre sortes de blocs que Step 0-B nommait :
+
+- `thinking` — aucun contenu loggé nulle part (seul le drapeau `had_thinking_block` de `guardrails.py` existe) ;
+- `tool_result` — `log_verbose` n'émet qu'un marqueur d'arrivée à texte fixe, sans charge utile ;
+- `tool_use` — atteignable seulement indirectement, par nom et détail, via `log_tool` / `log_tool_request` du chemin permissions.
+
+Et l'OQ1 de Step 0-B (`session_id` vide / `model = "unknown"`) reste **ouverte** : `log_init` est la *source* de cette question, pas sa réponse — il imprime `model or "unknown"`, c'est-à-dire précisément la ligne ambiguë qui avait motivé la demande de `repr(SystemMessage)`. Distinguer « attribut absent » de « valeur unknown » n'est toujours pas possible.
+
+Rien de tout cela ne justifie de porter un drapeau mort dans `dispatch-lib` en attendant : si l'un de ces besoins redevient concret, il se fiche sur `claude-pilot` comme un ticket à lui.
 
 Second motif, structurel : `claude-pilot` est un dépôt séparé, CC-spawns-only, hors du périmètre de dispatch de ce ticket (`.claude/commands/mika.md` § sub-repo path claude-pilot). Étendre ce ticket jusqu'à lui serait un élargissement de périmètre, pas une correction.
 
@@ -102,10 +111,10 @@ La passe B est ce qui empêche la passe A de devenir exactement le défaut qu'on
 
 C'est précisément par une variable interpolée (`$TRACE_FLAG`) que le drapeau mort est entré. Une garde qui ne lirait que les littéraux de la ligne d'invocation ne l'aurait pas attrapé. L'extraction couvre donc :
 
-1. les tokens `--flag` littéraux sur les lignes d'invocation de `claude-pilot` (lignes 1458 et 3298) ;
+1. les tokens `--flag` littéraux sur les lignes d'invocation de `claude-pilot` (1473 et 3313 après correction ; 1458 et 3298 avant) ;
 2. les tokens `$VAR` de ces mêmes lignes, résolus en cherchant les assignations `VAR=...` dans le fichier et en extrayant les `--flag` qu'elles contiennent.
 
-Après correction, la seule variable restante est `CWD_ARGS` (lignes 1369-1373, 1396), qui porte `--cwd` et `--relay-config` — tous deux valides.
+Après correction, la seule variable restante est `CWD_ARGS` (lignes 1369-1373, 1396), qui porte `--cwd` et `--relay-config` — tous deux valides. Seuls les drapeaux **longs** sont extraits : élargis aux formes courtes, le motif capte du bruit shell (`"${LOG_ID}-revise-$(date +%s)"` rend un « drapeau » `-revise-`), et une garde qui crie au loup finit désarmée. `dispatch-lib` ne passe que des drapeaux longs.
 
 Le style suit celui de la suite existante : lecture du **source** de `dispatch-lib.sh` par `grep`/`sed`/`awk` et assertions dessus, sans exécuter le dispatch (`test-dispatch-lib.sh:1-13`).
 
@@ -120,7 +129,7 @@ Le style suit celui de la suite existante : lecture du **source** de `dispatch-l
 
 Fichier : `skills/bundled/_shared/dispatch-lib.sh` (lignes 1437-1441 et 1458).
 
-Supprimer le bloc `TRACE_FLAG` en entier, commentaire compris, et retirer `$TRACE_FLAG` de l'invocation ligne 1458. À la place, un commentaire court sur l'invocation qui dit ce que `--verbose` couvre et pourquoi il n'y a pas de drapeau de trace à ajouter — le lecteur qui cherchera un instrument de diagnostic doit tomber sur la réponse, pas sur un chemin qui ne mène nulle part (R2). Mentionner mika#2043 pour l'ancrage.
+Supprimer le bloc `TRACE_FLAG` en entier, commentaire compris, et retirer `$TRACE_FLAG` de l'invocation. À la place, un commentaire qui dit **exactement** ce qui est loggé et sous quelle condition, selon le tableau de KTD1 — l'inconditionnel annoncé comme tel, `--verbose` crédité des deux seuls marqueurs qu'il ajoute, et les restes non couverts nommés. Le lecteur qui cherche un instrument de diagnostic doit tomber sur la réponse juste, pas sur un chemin qui ne mène nulle part (R2) ni sur une nouvelle approximation. Mentionner mika#2043 pour l'ancrage.
 
 Sert R1, R2.
 
@@ -149,10 +158,15 @@ Sert R4.
 # La suite de tests, garde comprise (CI lance la même chose via make test-dispatch-lib)
 bash skills/bundled/_shared/test-dispatch-lib.sh
 
-# AE1 — plus aucune trace du drapeau mort
-grep -c 'TRACE_FLAG\|CLAUDE_PILOT_TRACE' skills/bundled/_shared/dispatch-lib.sh   # attendu: 0
+# AE1 — plus aucun code ne construit le drapeau
+grep -c TRACE_FLAG skills/bundled/_shared/dispatch-lib.sh          # attendu: 0
+grep -c CLAUDE_PILOT_TRACE skills/bundled/_shared/dispatch-lib.sh  # attendu: 1 — le commentaire dissuasif
 
-# AE4 — plus aucun document ne présente --trace comme disponible
+# AE4 — plus aucun document ne présente --trace comme disponible.
+# Attendu: uniquement les corrections mika#2043 elles-mêmes, plus
+# best-practices/flag-semantics-…-2026-04-27.md:99 qui cite `--trace` comme
+# exemple générique de nom de drapeau d'observabilité — pas comme un drapeau
+# de claude-pilot. Zéro ligne n'est PAS le résultat attendu.
 grep -rn -- '--trace' docs/solutions/
 
 # Le reste de la chaîne qualité inchangé
@@ -171,13 +185,13 @@ Les deux auraient survécu à une relecture. Aucun n'a survécu à la mesure.
 
 ## Definition of Done
 
-- [ ] `TRACE_FLAG` et `CLAUDE_PILOT_TRACE` ont disparu de `dispatch-lib.sh`, invocation ligne 1458 comprise.
-- [ ] Le commentaire de remplacement nomme `--verbose` et ce qu'il couvre.
+- [ ] `TRACE_FLAG` a disparu de `dispatch-lib.sh`, invocation comprise ; `CLAUDE_PILOT_TRACE` ne subsiste que dans le commentaire dissuasif, qui est ce que trouvera quiconque grep ce nom.
+- [ ] Le commentaire de remplacement dit **exactement** ce qui est loggé et sous quelle condition — ce qui est inconditionnel l'est dit comme tel, et `--verbose` n'est crédité que des deux marqueurs qu'il ajoute réellement.
 - [ ] Les deux documents de solutions ne décrivent plus `--trace` comme livré.
 - [ ] La garde à deux passes est dans `test-dispatch-lib.sh` et la suite passe.
 - [ ] La garde a été vue échouer sur un drapeau inconnu introduit exprès, puis la modification annulée.
 - [ ] `make verify-bundled-skills` passe.
-- [ ] La PR énonce le mécanisme mesuré (`exit 2`, bruyant) et la couverture de remplacement, y compris l'écart restant sur les blocs `thinking`.
+- [ ] La PR énonce le mécanisme mesuré (`exit 2`, bruyant) et la couverture de remplacement — en distinguant l'inconditionnel de ce que `--verbose` ajoute, et en nommant les restes : `thinking`, `tool_result`, `tool_use` brut, et l'OQ1 toujours ouverte.
 - [ ] La PR porte `mika-platform-qa` comme reviewer.
 
 ## Acceptance criteria

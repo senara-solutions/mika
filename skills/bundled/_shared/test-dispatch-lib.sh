@@ -4264,53 +4264,84 @@ CP_ACCEPTED_FLAGS="--task-id --no-relay --relay-config --cwd --log-dir --command
 # writes `CWD_ARGS="--cwd $DIR"` and the dead flag was `TRACE_FLAG="--trace"`, both
 # glued to `="`. A whitespace-only anchor silently missed both — caught by running
 # the guard against a deliberately reintroduced --trace, not by reading it.
-# Long flags only. Extending this to short `-x` forms drags in shell noise —
-# measured, `"${LOG_ID}-revise-$(date +%s)"` yields a `-revise-` "flag" — and a
-# guard that cries wolf is a guard someone eventually disarms. dispatch-lib
-# passes only long flags; that is the surface worth policing.
+#
+# Short flags count too: `-X` aborts argparse exactly like `--trace`. They are
+# only safe to extract AFTER quoted segments are stripped (see CP_UNQUOTED
+# below) — an earlier version scanned raw text, where `"${LOG_ID}-revise-$(date
+# +%s)"` reads as a flag named `-revise-`.
+CP_FLAG_RE='(^|[^A-Za-z0-9_-])--?[A-Za-z][A-Za-z0-9-]*'
+
 # Every capture below ends in `|| true`: the suite runs under `set -euo pipefail`,
 # where a grep that matches nothing kills the whole run. Measured — breaking the
 # invocation pattern on purpose ended the suite mid-section with no summary and
 # no failure. A guard that vanishes when its subject changes shape is worse than
 # no guard: the run goes quiet exactly when it should be shouting. The
-# extraction-count assertion below is what turns an empty capture into a failure.
-CP_FLAG_RE='(^|[^A-Za-z0-9_-])--[A-Za-z][A-Za-z0-9-]*'
+# site-count assertion below is what turns an empty capture into a failure.
 
 # Join backslash continuations (the revise-pilot invocation spans four lines),
-# drop comment lines (the mika#2043 comment names --trace on purpose, as a
-# warning), then keep the lines that actually invoke the CLI.
-CP_INVOCATIONS=$(awk '
+# then drop comment lines (the mika#2043 comment names --trace on purpose, as a
+# warning).
+CP_JOINED=$(awk '
     { line = line $0 }
     /\\$/ { sub(/\\$/, " ", line); next }
     { print line; line = "" }
-' "$DISPATCH_LIB" | grep -v '^[[:space:]]*#' | grep -E '(^|[[:space:]])claude-pilot[[:space:]]+-' || true)
+' "$DISPATCH_LIB" | grep -v '^[[:space:]]*#' || true)
+
+# Anchor on the launcher, NOT on the shape of the argv. Anchoring on
+# `claude-pilot -...` looked equivalent and was not: moving $CWD_ARGS ahead of
+# the first literal flag — an unremarkable reordering — dropped the main
+# dispatch invocation out of the guard's sight entirely, silently, while all
+# three assertions stayed green (measured). Every real launch goes through
+# `_run_pilot_sandboxed`, plus the venv smoke test; that is the chokepoint.
+CP_INVOCATIONS=$(printf '%s\n' "$CP_JOINED" \
+    | grep -E '^[[:space:]]*(_run_pilot_sandboxed[[:space:]]+claude-pilot|(if ! )?timeout[[:space:]]+[0-9]+[[:space:]]+claude-pilot)([[:space:]]|$)' || true)
+
+# Quoted segments carry payload, not argv words: `ENTRY_COMMAND="/mika"` and the
+# prompt text cannot word-split into flags. Scanning them made the guard accuse
+# claude-pilot of `--no-verify` when the inner slash-command grew an argument
+# (measured). Only unquoted interpolation can inject a flag, so strip quotes
+# before looking for either flags or variables.
+CP_UNQUOTED=$(printf '%s\n' "$CP_INVOCATIONS" | sed -E 's/"[^"]*"//g; s/'"'"'[^'"'"']*'"'"'//g' || true)
 
 # Literal flags on those lines.
-CP_LITERAL_FLAGS=$(printf '%s\n' "$CP_INVOCATIONS" | grep -oE -- "$CP_FLAG_RE" | sed -E 's/^[^-]*//' | sort -u || true)
+CP_LITERAL_FLAGS=$(printf '%s\n' "$CP_UNQUOTED" | grep -oE -- "$CP_FLAG_RE" | sed -E 's/^[^-]*//' | sort -u || true)
 
 # Flags reaching the CLI through an interpolated variable. This half is not
 # optional: $TRACE_FLAG is exactly how the dead flag got in, and a guard reading
-# only literals would have missed it.
-CP_VARS=$(printf '%s\n' "$CP_INVOCATIONS" | grep -oE '\$\{?[A-Za-z_][A-Za-z0-9_]*\}?' | tr -d '${}' | sort -u || true)
+# only literals would have missed it. The assignment pattern is anchored on a
+# word boundary rather than start-of-line, so `export`/`declare`/`readonly`, a
+# mid-line `[ cond ] && VAR=--flag`, and `VAR+=` are all covered — the one-line
+# conditional being the most natural rewrite of the five lines just deleted, and
+# invisible to a start-of-line anchor (measured).
+CP_VARS=$(printf '%s\n' "$CP_UNQUOTED" | grep -oE '\$\{?[A-Za-z_][A-Za-z0-9_]*\}?' | tr -d '${}' | sort -u || true)
 CP_VAR_FLAGS=""
 for v in $CP_VARS; do
-    _assigns=$(grep -E "^[[:space:]]*(local[[:space:]]+)?${v}=" "$DISPATCH_LIB" || true)
+    _assigns=$(grep -E "(^|[^A-Za-z0-9_-])${v}\+?=" "$DISPATCH_LIB" || true)
     _found=$(printf '%s\n' "$_assigns" | grep -oE -- "$CP_FLAG_RE" | sed -E 's/^[^-]*//' || true)
     [ -n "$_found" ] && CP_VAR_FLAGS="$CP_VAR_FLAGS $_found"
 done
-CP_VAR_FLAGS=$(printf '%s\n' $CP_VAR_FLAGS | sort -u)
+CP_VAR_FLAGS=$(printf '%s\n' $CP_VAR_FLAGS | sort -u || true)
 
 # `--` is the prompt separator, not a flag.
 CP_BUILT_FLAGS=$(printf '%s\n%s\n' "$CP_LITERAL_FLAGS" "$CP_VAR_FLAGS" | grep -vE '^(--)?$' | sort -u || true)
 
-# The extraction has to actually find something, or both passes pass vacuously.
-CP_BUILT_COUNT=$(printf '%s\n' "$CP_BUILT_FLAGS" | grep -c . || true)
-if [ "$CP_BUILT_COUNT" -ge 4 ]; then
+# Known limit, stated rather than coded around: one level of indirection
+# (`A="--trace"; B="$A"`) and a composed flag (`F="--$name"`) both slip through.
+# Closing them would mean evaluating shell, which changes what this guard is.
+
+# Count SITES, not flags. A flag floor cannot notice a lost invocation — the
+# surviving one carries seven flags on its own, so the total never drops
+# (measured). Pinning the site count means a renamed, reordered, or added
+# launch point turns red instead of evaporating.
+CP_SITE_COUNT=$(printf '%s\n' "$CP_INVOCATIONS" | grep -c . || true)
+if [ "$CP_SITE_COUNT" -eq 3 ]; then
     PASS=$((PASS + 1))
-    echo "  ✓ flag extraction found $CP_BUILT_COUNT flags on claude-pilot invocations"
+    echo "  ✓ all 3 claude-pilot launch sites are in the guard's sight"
 else
     FAIL=$((FAIL + 1))
-    echo "  ✗ flag extraction found only $CP_BUILT_COUNT flags — the guard is not looking at anything"
+    echo "  ✗ expected 3 claude-pilot launch sites, saw $CP_SITE_COUNT"
+    echo "    A site the guard cannot see is a site it cannot police. If a launch"
+    echo "    point was legitimately added or removed, update this count."
 fi
 
 # --- Pass A: every built flag is accepted (hermetic) ---
