@@ -7,6 +7,14 @@ category: best-practices
 
 # A stale doc plus a stub that agrees with it hides a dead measurement channel
 
+> **State note (mika#2070, 2026-08-30).** The topology described below is the one
+> that existed when this was written, and the lesson is unchanged. One fact has
+> since moved: the CLI's `--session-id` now *does* cross the wire, in
+> `message/send` request metadata, and spirit runs the turn under the caller's
+> session when it owns that session row — so a `turn_usage` event names its own
+> run. The rest holds: the measurement channel is still spirit's log, not the
+> per-agent CLI log, and Signal O in `mika/CLAUDE.md` is still stale.
+
 ## Problem (mika#1890)
 
 RT-005's brick 3/5 orchestrates 80 paid LLM sessions and captures each run's

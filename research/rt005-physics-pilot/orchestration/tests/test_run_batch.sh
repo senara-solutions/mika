@@ -4,9 +4,11 @@
 # NO TEST MAKES AN LLM CALL. `mika` is replaced by a stub, and the measurement
 # channel is a temp file standing in for mika-spirit's log.
 #
-# The stub models the POST-mika#1727 topology, which is the one that exists:
-# `mika ask` is an A2A client, the CLI's --session-id never reaches the agent
-# loop, and spirit writes turn_usage under its OWN session id into its own log.
+# The stub models the POST-mika#1727 topology: `mika ask` is an A2A client and
+# spirit writes turn_usage into its own log. The stub keeps spirit minting its
+# own session id (`a2a-<task>`) rather than adopting the caller's, which is the
+# pre-mika#2070 shape — deliberately the pessimistic case, because the capture
+# must keep working against a spirit that predates that fix.
 # An earlier version of this suite modelled the pre-1727 wiring and passed 120
 # assertions against a channel that captures nothing in reality.
 #

@@ -169,9 +169,15 @@ rather than truncating its destination.
 
 **Where the tokens actually live — read this before changing the capture.**
 Since mika#1727 `mika ask` does not run the agent loop in process. It is an A2A
-client that posts the prompt to mika-spirit, which owns the execution session.
-The CLI's `--session-id` **never crosses the wire**, spirit mints its own
-session id, and the per-agent CLI log carries no `turn_usage` for an `ask`.
+client that posts the prompt to mika-spirit, which owns the execution session,
+and the per-agent CLI log carries no `turn_usage` for an `ask`.
+
+Since mika#2070 the CLI's `--session-id` **does** cross the wire, in
+`message/send` request metadata, and spirit runs the turn under it when it owns
+that session row. A `turn_usage` event therefore carries the run's own session
+id, and correlation no longer has to be inferred. The byte-offset slice below
+predates that fix and is kept as the belt to its braces — it is what catches a
+deployment where the fix is not yet live.
 
 `mika/CLAUDE.md` Signal O used to say to read
 `~/.mika/agents/<name>/logs/mika.log.$(date +%F)` for a `mika ask`. That was true
@@ -180,7 +186,7 @@ corrected it** — Signal O now names `$MIKA_SPIRIT_LOG_FILE` as the sink for ev
 `turn_usage`, entry door included, and states the reason. The measurement channel
 is spirit's own log (`MIKA_SPIRIT_LOG_FILE`, else `/var/log/mika/server.log`).
 
-So each run is correlated by **(agent_id, byte-offset slice)**: the script notes
+So each run is still correlated by **(agent_id, byte-offset slice)**: the script notes
 the log size before the call and reads only what was appended after it. This is
 sound because the batch is strictly sequential and these two agents exist only
 for this experiment. It is also checked rather than assumed — if the slice

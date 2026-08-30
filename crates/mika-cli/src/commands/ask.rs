@@ -306,9 +306,13 @@ pub async fn run(
     //     a config channel threaded through `message/send`.
     //   * per-run token usage (verbose `tokens.*`) is not carried by the A2A
     //     `Task`, so it degrades to absent until threaded through the protocol.
-    //   * the local bookkeeping session created above no longer records agent
-    //     turns (spirit owns the execution session); reconciling the two is a
-    //     follow-up.
+    //
+    // Resolved (mika#2070): the local bookkeeping session is no longer orphaned.
+    // Its id travels to spirit in `message/send` request metadata, and spirit runs
+    // the turn under it whenever it already owns that session row — so the agent
+    // turns and the `turn_usage` events land on the session this process created.
+    // An id spirit cannot own is refused silently and it mints `a2a-<task_id>` as
+    // before.
 
     // Preserve arg-level validation: --enable-skill / --disable-skill must not
     // conflict on the same skill name.
@@ -338,9 +342,27 @@ pub async fn run(
     // server-side LLM/OAuth errors. The 2026-08-24 Prime OAuth incident cost ~2h
     // of duo diag under this masking. See `wrap_send_error` for the shape and
     // the test `test_wrap_send_error_preserves_underlying_a2a_error_chain`.
-    let task = mika_cli::remote_ask::send_message_to_agent(&user_message, &spirit_endpoint)
-        .await
-        .map_err(|e| wrap_send_error(&e, &spirit_endpoint))?;
+    // mika#2070: carry this invocation's session id to spirit. Spirit adopts it as
+    // the agent-loop session when it already owns the row, so `turn_usage` is
+    // emitted under the caller's session instead of spirit's `a2a-<task_id>`.
+    //
+    // Two limits worth knowing before using this to attribute cost:
+    //   * The id we send is whatever this invocation resolved — an explicit
+    //     `--session-id`, else a singleton agent's canonical session, else a
+    //     fresh UUID. Callers that share a session id deliberately (a singleton
+    //     agent, a retry that wants the agent to see its own prior turn) share
+    //     their `turn_usage` too. Per-run attribution means a per-run
+    //     `--session-id`.
+    //   * A turn that delegates (`delegate_task`) or starts a team run spends
+    //     tokens under `delegate-*` / `team-*` sessions of its own. Filtering on
+    //     this id captures the turn, not the work it fanned out.
+    let task = mika_cli::remote_ask::send_message_to_agent(
+        &user_message,
+        &spirit_endpoint,
+        Some(session_id.as_str()),
+    )
+    .await
+    .map_err(|e| wrap_send_error(&e, &spirit_endpoint))?;
 
     // End the local bookkeeping session regardless of outcome so the dashboard
     // shows duration. No-op for singleton agents — the canonical session is never

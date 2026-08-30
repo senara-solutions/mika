@@ -14,6 +14,7 @@
 //! the broader context — local↔cloud Mika portability, R1 daily-use unblock slice.
 
 use anyhow::{Context, Result};
+pub use mika_a2a::CALLER_SESSION_ID_KEY;
 use mika_a2a::client::A2aClient;
 use mika_a2a::{A2aError, Message, MessageSendParams, Part, Role, Task, TaskState};
 use uuid::Uuid;
@@ -84,7 +85,17 @@ fn push_rendered_part(part: &Part, out: &mut Vec<String>) {
 }
 
 /// Build a `MessageSendParams` containing the user's single text prompt.
-fn build_send_params(message: &str) -> MessageSendParams {
+///
+/// `caller_session_id` is the sender's own session id, carried in request
+/// metadata under [`CALLER_SESSION_ID_KEY`]. `None` leaves `metadata` absent so
+/// the serialized body is byte-identical to the pre-mika#2070 shape.
+fn build_send_params(message: &str, caller_session_id: Option<&str>) -> MessageSendParams {
+    let metadata = caller_session_id.map(|sid| {
+        std::collections::HashMap::from([(
+            CALLER_SESSION_ID_KEY.to_string(),
+            serde_json::Value::String(sid.to_string()),
+        )])
+    });
     MessageSendParams {
         message: Message {
             message_id: Uuid::new_v4().to_string(),
@@ -101,7 +112,7 @@ fn build_send_params(message: &str) -> MessageSendParams {
             kind: "message".to_string(),
         },
         configuration: None,
-        metadata: None,
+        metadata,
     }
 }
 
@@ -124,13 +135,20 @@ fn build_send_params(message: &str) -> MessageSendParams {
 ///
 /// The caller is responsible for URL validation with a surface-appropriate error
 /// message (e.g. `--remote` vs. the local spirit endpoint).
-pub async fn send_message_to_agent(message: &str, url: &str) -> Result<Task> {
+pub async fn send_message_to_agent(
+    message: &str,
+    url: &str,
+    caller_session_id: Option<&str>,
+) -> Result<Task> {
     let auth_token = std::env::var("MIKA_INTERNAL_TOKEN")
         .ok()
         .filter(|t| !t.is_empty());
     let client = A2aClient::new(url, auth_token);
 
-    let task = match client.send_message(build_send_params(message)).await {
+    let task = match client
+        .send_message(build_send_params(message, caller_session_id))
+        .await
+    {
         Ok(task) => task,
         Err(A2aError::InvalidJsonRpc(msg)) => anyhow::bail!("remote error: {msg}"),
         Err(A2aError::ClientError(e)) => anyhow::bail!("connection error: {e}"),
@@ -189,7 +207,13 @@ pub async fn dispatch_remote(
     reqwest::Url::parse(remote_url)
         .with_context(|| format!("invalid --remote URL: {remote_url}"))?;
 
-    let task = send_message_to_agent(message, remote_url).await?;
+    // `--remote` sends no caller session id (mika#2070). The local bookkeeping
+    // session lives in this machine's database; a remote agent normally holds a
+    // different one and would refuse the id. A single-host deployment where the
+    // gateway proxies back to this same spirit is the exception — correlation
+    // would work there — but `--remote` is not the measured path, so we do not
+    // count on it.
+    let task = send_message_to_agent(message, remote_url, None).await?;
     render(&task, format, verbose)
 }
 
@@ -445,5 +469,32 @@ mod tests {
         assert_eq!(v["role"], "assistant");
         assert_eq!(v["content"], "hi");
         assert_eq!(v["metadata"]["remote_task_id"], "task-test");
+    }
+
+    // --- mika#2070: caller session id on the wire ------------------------------
+
+    #[test]
+    fn send_params_carry_the_caller_session_id() {
+        let params = build_send_params("hello", Some("rt005-c1-r7"));
+        let metadata = params.metadata.expect("metadata should be present");
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(
+            metadata.get(CALLER_SESSION_ID_KEY).and_then(|v| v.as_str()),
+            Some("rt005-c1-r7")
+        );
+    }
+
+    #[test]
+    fn send_params_without_a_session_serialize_without_metadata() {
+        let params = build_send_params("hello", None);
+        assert!(params.metadata.is_none());
+        // The pre-mika#2070 body shape is preserved byte-for-byte: `metadata` is
+        // `skip_serializing_if = "Option::is_none"`, so the key must be absent
+        // rather than null. Servers that never read it see no change at all.
+        let body = serde_json::to_value(&params).unwrap();
+        assert!(
+            body.get("metadata").is_none(),
+            "unexpected metadata key in {body}"
+        );
     }
 }

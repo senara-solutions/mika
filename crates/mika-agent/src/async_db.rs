@@ -2753,17 +2753,23 @@ impl AsyncDatabase {
 
     /// Create an A2A task (creates entries in tasks, sessions, and a2a_task_map).
     /// Returns the session_id for use with the agent loop.
+    ///
+    /// `caller_session_id` is the sender's own session id (mika#2070). It is
+    /// adopted as the returned session only when this agent already owns that
+    /// session row; see `Database::a2a_create_task`.
     pub async fn a2a_create_task(
         &self,
         a2a_task_id: &str,
         context_id: Option<&str>,
+        caller_session_id: Option<&str>,
     ) -> Result<String> {
-        let (i, a, c) = (
+        let (i, a, c, s) = (
             a2a_task_id.to_owned(),
             self.agent_id.clone(),
             context_id.map(|s| s.to_owned()),
+            caller_session_id.map(|s| s.to_owned()),
         );
-        self.with_db(move |db| db.a2a_create_task(&i, &a, c.as_deref()))
+        self.with_db(move |db| db.a2a_create_task(&i, &a, c.as_deref(), s.as_deref()))
             .await
     }
 
