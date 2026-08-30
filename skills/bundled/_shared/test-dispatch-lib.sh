@@ -473,6 +473,46 @@ assert_eq "_parse_verdict ESCALATE" "ESCALATE" \
 assert_eq "_parse_verdict empty on no match" "" \
     "$(printf 'no verdict\n' | _parse_verdict)"
 
+# ---------------------------------------------------------------------------
+# Tier 0 — withheld disposition (mika#2037)
+#
+# The engine strips a disposition it refused to let stand and substitutes this
+# literal marker. No tier may then derive a verdict from the response: it is an
+# absence of verdict, not an approval.
+#
+# The tier-0 POSITION is what these assertions actually guard. After tier 1a the
+# marker would still be honoured; after tier 2 it would not, because the fuzzy pass
+# matches paraphrases anywhere in the text — so a response whose disposition line
+# was merely removed could still yield READY out of its own body. The third and
+# sixth assertions below are the ones that fail if tier 0 ever moves down.
+#
+# The literal must stay in sync with DISPOSITION_WITHHELD_MARKER in
+# crates/mika-agent/src/agent_loop/mod.rs.
+# ---------------------------------------------------------------------------
+WITHHELD_MARKER="Disposition-Withheld: REVIEW-ANCHOR-MISSING"
+
+assert_eq "tier 0 beats tier 1a (literal Disposition present)" "" \
+    "$(printf 'Some review prose.\n%s\nDisposition: READY\n' "$WITHHELD_MARKER" | _parse_disposition 2>/dev/null)"
+assert_eq "tier 0 beats tier 1b (Verdict carry-over present)" "" \
+    "$(printf '%s\nVerdict: GROOMED\n' "$WITHHELD_MARKER" | _parse_disposition 2>/dev/null)"
+assert_eq "tier 0 beats tier 2 (fuzzy READY paraphrases in the body)" "" \
+    "$(printf 'The plan is clean, good to go — proceed with the dispatch.\n%s\n' "$WITHHELD_MARKER" | _parse_disposition 2>/dev/null)"
+
+assert_eq "verdict tier 0 beats tier 1a" "" \
+    "$(printf '%s\nVerdict: GROOMED\n' "$WITHHELD_MARKER" | _parse_verdict 2>/dev/null)"
+assert_eq "verdict tier 0 beats tier 1b" "" \
+    "$(printf '%s\nDisposition: READY\n' "$WITHHELD_MARKER" | _parse_verdict 2>/dev/null)"
+assert_eq "verdict tier 0 beats tier 2 (fuzzy GROOMED paraphrases)" "" \
+    "$(printf 'Approved, no remaining concerns, ship it.\n%s\n' "$WITHHELD_MARKER" | _parse_verdict 2>/dev/null)"
+
+# Non-regression: without the marker every tier behaves exactly as before.
+assert_eq "no marker — tier 1a still returns READY" "READY" \
+    "$(printf 'Some review prose.\nDisposition: READY\n' | _parse_disposition 2>/dev/null)"
+assert_eq "no marker — tier 2 still returns READY" "READY" \
+    "$(printf 'The plan is clean, good to go — proceed.\n' | _parse_disposition 2>/dev/null)"
+assert_eq "no marker — verdict tier 1a still returns GROOMED" "GROOMED" \
+    "$(printf 'Verdict: GROOMED\n' | _parse_verdict 2>/dev/null)"
+
 # _trail_append + _trail_read — round-trip
 TRAIL_TMP=$(mktemp -d)
 WORKTREE_DIR="$TRAIL_TMP" _trail_append "groom-ticket" "session-abc" "READY"
