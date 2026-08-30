@@ -166,11 +166,36 @@ pub(crate) fn is_dispatchable_repo(repo_ref: &str) -> bool {
 /// contains a `#`. A free-text dispatch resolves no repository, so the allowlist
 /// has nothing to judge and must not refuse it.
 pub(crate) fn parse_repo_ref_from_dispatch_prompt(prompt: &str) -> Option<&str> {
+    parse_issue_ref_line_from_prompt(prompt).map(|(repo_ref, _)| repo_ref)
+}
+
+/// Extract the repository reference **and issue number** from a dispatch
+/// `prompt` argument (mika#2084).
+///
+/// The seat gate needs the issue number, not just the repository — a seat label
+/// lives on one issue. This shares [`parse_repo_ref_line`] with
+/// [`parse_repo_ref_from_dispatch_prompt`] rather than parsing the prompt a
+/// second time: two independent parses of the same string is precisely the
+/// drift the "must never be stricter than the shell" note above guards against.
+///
+/// The single added strictness is numeric overflow — a `#` number too large for
+/// `u64` yields `None` here while the repo-level parse still accepts it. That
+/// direction is deliberate: an unparseable number means the seat gate has no
+/// issue to look up, and per mika#2084 D2 missing information lets the dispatch
+/// through rather than refusing it.
+pub(crate) fn parse_issue_ref_from_dispatch_prompt(prompt: &str) -> Option<(&str, u64)> {
+    let (repo_ref, number) = parse_issue_ref_line_from_prompt(prompt)?;
+    Some((repo_ref, number.parse::<u64>().ok()?))
+}
+
+/// First line of `prompt` that is a repository reference, as `(repo_ref, number)`
+/// with the number still in its unparsed textual form.
+fn parse_issue_ref_line_from_prompt(prompt: &str) -> Option<(&str, &str)> {
     prompt.lines().find_map(parse_repo_ref_line)
 }
 
 /// The single-reference form, applied to one already-split line.
-fn parse_repo_ref_line(line: &str) -> Option<&str> {
+fn parse_repo_ref_line(line: &str) -> Option<(&str, &str)> {
     let (repo_ref, number) = line.trim().split_once('#')?;
     if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -184,13 +209,166 @@ fn parse_repo_ref_line(line: &str) -> Option<&str> {
         Some((owner, repo)) => segment_ok(owner) && segment_ok(repo),
         None => segment_ok(repo_ref),
     };
-    shape_ok.then_some(repo_ref)
+    shape_ok.then_some((repo_ref, number))
 }
 
 /// The allowlist rendered for a refusal message, so every refusal states what
 /// would have been accepted instead of only what was denied (mika#2046).
 pub(crate) fn dispatchable_repos_display() -> String {
     DISPATCHABLE_REPOS.join(", ")
+}
+
+// ───────────────────────── Dispatch seat (mika#2084) ─────────────────────────
+
+/// Prefix of the label that names which dispatcher owns a ticket (mika#2084).
+///
+/// The match is on this **exact** prefix. `dispatched`, `dispatch-ready`, and
+/// any other label that merely starts with the letters `dispatch` are ordinary
+/// labels and must not enter the seat gate — treating them as seat labels would
+/// refuse tickets nobody claimed, which is the failure mode that stops the loop
+/// rather than protecting it.
+pub(crate) const DISPATCH_SEAT_LABEL_PREFIX: &str = "dispatch:";
+
+/// The seat this engine dispatches as.
+///
+/// `dispatch:ssc` and `dispatch:mpc` name interactive Claude Code seats. The
+/// autonomous loop is neither: it is a third seat, `loop`. The direct and
+/// intended consequence is that a ticket labelled for *either* interactive seat
+/// is refused here — which is exactly the 2026-08-30 collision this constant
+/// exists to prevent.
+pub(crate) const CURRENT_DISPATCH_SEAT: &str = "loop";
+
+/// Every seat this engine knows how to resolve (mika#2084).
+///
+/// **Hand-held, like [`DISPATCHABLE_REPOS`], and for the same reason.** A list
+/// derived from "seats we have seen on tickets" would turn observation into
+/// authorization: the first typo'd label would mint a seat and the gate would
+/// wave it through. What exists and what is permitted are different questions,
+/// and only the second one is the policy. A seat absent from this list is
+/// refused (see [`classify_dispatch_seat`]), so the first ticket carrying a new
+/// seat reports itself loudly instead of failing quietly — that is the intended
+/// way to add one.
+pub(crate) const KNOWN_DISPATCH_SEATS: &[&str] = &["loop", "ssc", "mpc"];
+
+/// What the seat labels on one issue say about whether this engine may take it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SeatVerdict {
+    /// No `dispatch:*` label at all — the overwhelmingly common case, and the
+    /// load-bearing one. Behaviour must be **identical** to the pre-#2084 path
+    /// (mika#2084 AC3): a fix that turns "unlabelled" into "refused" stops the
+    /// whole loop, which is worse than the defect it repairs.
+    NoSeatLabel,
+    /// Labelled for this engine's own seat — dispatch proceeds.
+    OwnedByCurrentSeat { label: String },
+    /// Labelled for a different, known seat — refused (mika#2084 AC1).
+    OwnedByOtherSeat { label: String, seat: String },
+    /// A seat label is present but cannot be resolved to exactly one known seat
+    /// — refused (mika#2084 AC2). Fail-closed: a seat we cannot identify is not
+    /// an authorization.
+    Unresolvable { label: String, why: &'static str },
+}
+
+impl SeatVerdict {
+    /// True when this verdict must stop the dispatch.
+    ///
+    /// Refusal is the *narrow* case by construction: only a resolved foreign
+    /// seat or an unresolvable seat label refuses. Absence of a label never
+    /// does (AC3).
+    pub(crate) fn refuses(&self) -> bool {
+        matches!(
+            self,
+            SeatVerdict::OwnedByOtherSeat { .. } | SeatVerdict::Unresolvable { .. }
+        )
+    }
+
+    /// The label text that drove the verdict, for refusal messages and audit
+    /// events. `None` when no seat label was involved.
+    pub(crate) fn label(&self) -> Option<&str> {
+        match self {
+            SeatVerdict::NoSeatLabel => None,
+            SeatVerdict::OwnedByCurrentSeat { label }
+            | SeatVerdict::OwnedByOtherSeat { label, .. }
+            | SeatVerdict::Unresolvable { label, .. } => Some(label),
+        }
+    }
+
+    /// Why the dispatch was refused, as a stable snake_case reason code for the
+    /// audit trail (mika#2084 AC5). `None` when the verdict does not refuse.
+    pub(crate) fn refusal_reason(&self) -> Option<&'static str> {
+        match self {
+            SeatVerdict::OwnedByOtherSeat { .. } => Some("seat_owned_by_other"),
+            SeatVerdict::Unresolvable { why, .. } => Some(why),
+            _ => None,
+        }
+    }
+}
+
+/// Classify the `dispatch:*` labels on one issue against [`CURRENT_DISPATCH_SEAT`].
+///
+/// Pure — the caller supplies the label names, however it obtained them. That
+/// keeps the decision testable without a network, and lets the three call sites
+/// (`auto_pull` selection, the ready-label handler, the tool boundary) share one
+/// rule instead of three that drift.
+///
+/// Matching is case-insensitive on both the prefix and the seat: a label typed
+/// `Dispatch:SSC` in the GitHub UI claims the same seat as `dispatch:ssc`.
+///
+// DOCTRINE: pre-classifier structural gate (mika#2084)
+// Applies per crates/mika-agent/docs/permission-decision-protocol-2026-07-06.md §AC2:
+// "This agent structurally cannot do X" applies to pre-classifier engine gates
+// only, NEVER to LLM classifier decisions. This predicate is such a gate — which
+// seat owns a ticket is a structural fact read off the issue's labels, not a
+// judgement the LLM classifier is asked to make.
+pub(crate) fn classify_dispatch_seat<'a>(labels: impl IntoIterator<Item = &'a str>) -> SeatVerdict {
+    let seat_labels: Vec<String> = labels
+        .into_iter()
+        .map(|l| l.trim().to_ascii_lowercase())
+        .filter(|l| l.starts_with(DISPATCH_SEAT_LABEL_PREFIX))
+        .collect();
+
+    // AC3. The common path, and the one that must not change.
+    let label = match seat_labels.len() {
+        0 => return SeatVerdict::NoSeatLabel,
+        1 => seat_labels.into_iter().next().expect("len checked as 1"),
+        // Two seats claimed, neither wins. Ambiguity is an unresolved seat, not
+        // a tie to break — resolving it either way would invent an owner.
+        _ => {
+            return SeatVerdict::Unresolvable {
+                label: seat_labels.join(", "),
+                why: "multiple_seat_labels",
+            };
+        }
+    };
+
+    let seat = label
+        .strip_prefix(DISPATCH_SEAT_LABEL_PREFIX)
+        .expect("filtered on this prefix")
+        .trim()
+        .to_string();
+
+    if seat.is_empty() {
+        return SeatVerdict::Unresolvable {
+            label,
+            why: "empty_seat",
+        };
+    }
+    if !KNOWN_DISPATCH_SEATS.contains(&seat.as_str()) {
+        return SeatVerdict::Unresolvable {
+            label,
+            why: "unknown_seat",
+        };
+    }
+    if seat == CURRENT_DISPATCH_SEAT {
+        return SeatVerdict::OwnedByCurrentSeat { label };
+    }
+    SeatVerdict::OwnedByOtherSeat { label, seat }
+}
+
+/// The known-seat list rendered for a refusal message, so a refusal states what
+/// would have been accepted and not only what was denied (same discipline as
+/// [`dispatchable_repos_display`]).
+pub(crate) fn known_dispatch_seats_display() -> String {
+    KNOWN_DISPATCH_SEATS.join(", ")
 }
 
 #[cfg(test)]
