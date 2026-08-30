@@ -73,9 +73,11 @@
 #     * ~/.ssh, ~/.aws, ~/.config, ~/.mika (except /data), /var/spool/*
 #     * ~/.cargo/credentials.toml (cargo publish secret — dev-pilot never
 #                                  publishes; safe to omit)
-#     * ~/.config/gh (contains hosts.yml with gh token) — gh CLI uses the
-#                     GH_TOKEN delivered through the secret-file channel below
-#                     (mika#2039), not `--setenv`
+#     * ~/.config/gh (contains hosts.yml with gh token) — the gh CLI does NOT
+#                     get a token inside the sandbox at all (mika#2056): its
+#                     api.github.com calls are MITM'd by the egress proxy, which
+#                     injects the credential host-side. The sandbox holds no
+#                     GitHub token in env or on disk.
 #     * $SSH_AUTH_SOCK, docker.sock, dbus, cm/NATS unix sockets
 #     * /data/workspace outside the branch worktree (other worktrees + repos)
 #
@@ -111,6 +113,14 @@ _PILOT_EGRESS_PROXY_BIN="$HOME/.local/bin/mika-pilot-egress-proxy"
 _PILOT_HELPER_BIN="$HOME/.local/bin/mitmdump"
 _PILOT_HELPER_PORT="8892"
 _PILOT_HELPER_ADDON="$HOME/.local/bin/mika-pilot-anthropic-auth-addon.py"
+# mika#2056: second mitmdump addon — injects the GitHub credential host-side on
+# api.github.com / github.com so the sandbox never holds GH_TOKEN. Installed
+# alongside the proxy + Anthropic addon by `make install`.
+_PILOT_GH_HELPER_ADDON="$HOME/.local/bin/mika-pilot-github-auth-addon.py"
+# mika#2056: host-only file the dispatcher rewrites with the current GitHub
+# token before each spawn, for the github addon to read host-side. NEVER bound
+# into the sandbox (not among the --ro-bind paths below). 0600.
+_PILOT_GH_TOKEN_FILE="$HOME/.mika/pilot-gh-token"
 _PILOT_HELPER_CA="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
 _PILOT_HELPER_LOG="/var/log/mika/pilot-helper.log"
 # Bind target for the helper CA inside the sandbox. MUST be under /tmp
@@ -118,6 +128,16 @@ _PILOT_HELPER_LOG="/var/log/mika/pilot-helper.log"
 # (already ro-bound before net_bwrap_args, so binds inside it fail with
 # EROFS). See coherence audit Bug B (2026-08-05).
 _PILOT_HELPER_CA_SANDBOX_PATH="/tmp/mika-pilot-ca/ca.pem"
+
+# mika#2056: in-sandbox path for the COMBINED CA bundle (system trust store +
+# mitmproxy CA), built by the entrypoint prologue and pointed at by
+# GIT_SSL_CAINFO / SSL_CERT_FILE / CURL_CA_BUNDLE / REQUESTS_CA_BUNDLE. It is a
+# SUPERSET of the system store — so ordinary verification of every non-MITM'd
+# host (registries, LFS, codeload) is unchanged — with the mitmproxy CA added
+# so git / gh / curl accept the host-side GitHub auth-injection MITM. This is
+# why SSL_CERT_FILE is now safe to set (the mika#2039 warning against it was
+# about REPLACING the system store; a superset does not).
+_PILOT_COMBINED_CA_SANDBOX_PATH="/tmp/mika-pilot-ca/combined.pem"
 
 # mika#2039: in-sandbox directory holding one 0600 file per secret. Under
 # /run — a tmpfs the sandbox mounts — rather than /etc, which is already
@@ -146,7 +166,15 @@ _PILOT_SECRET_DIR_SANDBOX="/run/mika-pilot-secrets"
 # _dispatch_lib_exit_trap and folded into the callback, so the operator sees
 # it. Posture stays fail-forward: a tokenless pilot can still do useful work
 # up to the push, so this diagnoses rather than aborts.
-_PILOT_SECRET_PROLOGUE="for _s in $_PILOT_SECRET_DIR_SANDBOX/*; do [ -e \"\$_s\" ] || continue; _n=\$(basename \"\$_s\"); if [ ! -r \"\$_s\" ]; then echo \"dispatch-lib: sandbox secret \$_n is unreadable — the pilot starts without it\" >&2; continue; fi; _v=\$(cat \"\$_s\"); [ -n \"\$_v\" ] || echo \"dispatch-lib: sandbox secret \$_n is empty — the pilot starts without it\" >&2; export \"\$_n=\$_v\"; done; unset _s _n _v"
+#
+# mika#2056 CA tail: when the mitmproxy CA is present (Phase 2b, GitHub auth
+# injection active), build the combined CA bundle (system store + mitm CA) and
+# point git / gh / curl / python at it. Guarded on the CA file so Phase 2a (no
+# MITM) is untouched. The system store is discovered by probing the common
+# distro locations; if none is found the mitm CA alone still lets git/gh reach
+# GitHub through the MITM (the only host that presents the mitm cert), and the
+# unset of the vars is skipped so nothing points at a partial bundle. POSIX sh.
+_PILOT_SECRET_PROLOGUE="for _s in $_PILOT_SECRET_DIR_SANDBOX/*; do [ -e \"\$_s\" ] || continue; _n=\$(basename \"\$_s\"); if [ ! -r \"\$_s\" ]; then echo \"dispatch-lib: sandbox secret \$_n is unreadable — the pilot starts without it\" >&2; continue; fi; _v=\$(cat \"\$_s\"); [ -n \"\$_v\" ] || echo \"dispatch-lib: sandbox secret \$_n is empty — the pilot starts without it\" >&2; export \"\$_n=\$_v\"; done; unset _s _n _v; if [ -f $_PILOT_HELPER_CA_SANDBOX_PATH ]; then _sysca=''; for _c in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem /etc/ssl/ca-bundle.pem; do [ -f \"\$_c\" ] && { _sysca=\"\$_c\"; break; }; done; if [ -n \"\$_sysca\" ] && cat \"\$_sysca\" $_PILOT_HELPER_CA_SANDBOX_PATH > $_PILOT_COMBINED_CA_SANDBOX_PATH 2>/dev/null; then export GIT_SSL_CAINFO=$_PILOT_COMBINED_CA_SANDBOX_PATH CURL_CA_BUNDLE=$_PILOT_COMBINED_CA_SANDBOX_PATH SSL_CERT_FILE=$_PILOT_COMBINED_CA_SANDBOX_PATH REQUESTS_CA_BUNDLE=$_PILOT_COMBINED_CA_SANDBOX_PATH; else export GIT_SSL_CAINFO=$_PILOT_HELPER_CA_SANDBOX_PATH; fi; unset _sysca _c; fi"
 
 # Idempotent helper daemon launcher for the anthropic api chain
 # (2026-08-05, Vincent-authorized). Chained from the front egress proxy
@@ -159,6 +187,14 @@ _ensure_pilot_helper() {
     if [ ! -f "$_PILOT_HELPER_ADDON" ]; then
         echo "dispatch-lib: pilot helper addon not found at $_PILOT_HELPER_ADDON" >&2
         return 1
+    fi
+    # mika#2056: the GitHub auth-injection addon is loaded into the SAME
+    # mitmdump. Missing it would silently drop back to a sandbox with no way to
+    # authenticate to GitHub (the token is gone), so surface it loudly — but do
+    # not abort: an Anthropic-only run is still useful, and the pilot's GitHub
+    # calls will 503 visibly at the addon rather than hang.
+    if [ ! -f "$_PILOT_GH_HELPER_ADDON" ]; then
+        echo "dispatch-lib: github auth addon not found at $_PILOT_GH_HELPER_ADDON — GitHub host-side injection disabled (run 'make install')" >&2
     fi
     # Liveness probe: TCP port accepts a connection.
     if python3 -c "
@@ -174,9 +210,16 @@ except OSError:
         return 0
     fi
     mkdir -p "$(dirname "$_PILOT_HELPER_LOG")" 2>/dev/null || true
+    # mika#2056: load the GitHub addon too, when present. mitmdump accepts
+    # repeated --scripts; each addon inspects flow.request.host and ignores
+    # what is not its own, so the two never collide.
+    local -a _helper_addon_args=(--scripts "$_PILOT_HELPER_ADDON")
+    if [ -f "$_PILOT_GH_HELPER_ADDON" ]; then
+        _helper_addon_args+=(--scripts "$_PILOT_GH_HELPER_ADDON")
+    fi
     nohup "$_PILOT_HELPER_BIN" \
         --listen-host 127.0.0.1 --listen-port "$_PILOT_HELPER_PORT" \
-        --scripts "$_PILOT_HELPER_ADDON" \
+        "${_helper_addon_args[@]}" \
         --set stream_large_bodies=10m \
         --set http2=true \
         --set flow_detail=0 \
@@ -324,11 +367,53 @@ _PILOT_SANDBOX_ENV_ALLOWLIST=(
 # Secret passthrough allowlist (mika#2039). These NEVER travel via `--setenv`.
 # Each one is handed to bwrap on a file descriptor and materialised as a 0600
 # read-only file under $_PILOT_SECRET_DIR_SANDBOX; $_PILOT_SECRET_PROLOGUE
-# re-exports it inside the sandbox. `GH_TOKEN` is passed through so `gh` works
-# without needing ~/.config/gh (which stays hidden).
+# re-exports it inside the sandbox.
+#
+# mika#2056: this list is now EMPTY. `GH_TOKEN` was the sole entry, and it is
+# removed — the file channel it used is deleted, not stacked beside the new
+# mechanism. The sandbox no longer holds any GitHub credential in its
+# environment or on its filesystem; `git push` and the `gh` CLI reach GitHub
+# through the egress-proxy MITM, which injects the credential host-side
+# (mika-pilot-github-auth-addon.py). This is the same invariant the Anthropic
+# key already has — "the sandbox NEVER holds secret material" — now extended to
+# GitHub. A compromised in-sandbox dependency can no longer read the PAT,
+# exfiltrate it to an allowlisted host, or push to arbitrary repos with it.
+#
+# The channel MACHINERY below is kept intact and generic (it still fires for
+# any name added here) — mika#2039's --ro-bind-data secret-file path is not
+# removed, only unused by default. Adding a genuinely sandbox-held secret in
+# future is still a one-line change here.
 _PILOT_SANDBOX_SECRET_ALLOWLIST=(
-    GH_TOKEN
 )
+
+# mika#2056: stage the current GitHub token host-side for the egress-proxy
+# MITM addon to inject. Written 0600 to a host-only path that is NEVER bound
+# into the sandbox — the sandbox reaches GitHub through the proxy and never
+# holds the token itself. Refreshed on every dispatch so a rotated
+# App-installation token reaches the (long-lived, shared) mitmdump daemon: the
+# addon mtime-caches this file, exactly as the Anthropic addon mtime-caches the
+# CLI-refreshed ~/.claude/.credentials.json.
+#
+# xtrace is suppressed around the write and restored after — the whole dispatch
+# runs under `set -x` with BASH_XTRACEFD, and an unbracketed `printf` of the
+# token would otherwise land `+ printf %s <token>` in the trace file that
+# _emit_callback tails back to the caller (same discipline as the secret
+# block). `printf` is the bash builtin; /usr/bin/printf would put the value in
+# an argv. Fail-open: a write failure degrades to the addon's env fallback, it
+# never aborts the dispatch.
+_stage_pilot_gh_token() {
+    local _xtrace_was_on=0
+    case "$-" in *x*) _xtrace_was_on=1 ;; esac
+    { set +x; } 2>/dev/null
+    if [ -n "${GH_TOKEN:-}" ]; then
+        mkdir -p "$(dirname "$_PILOT_GH_TOKEN_FILE")" 2>/dev/null || true
+        ( umask 077; printf '%s' "$GH_TOKEN" > "$_PILOT_GH_TOKEN_FILE" ) 2>/dev/null || \
+            echo "dispatch-lib: could not stage GitHub token to $_PILOT_GH_TOKEN_FILE — github auth injection falls back to the mitmdump process env" >&2
+    fi
+    if [ "$_xtrace_was_on" -eq 1 ]; then
+        set -x
+    fi
+}
 
 _run_pilot_sandboxed() {
     # Runs "$@" (the full claude-pilot invocation) under bwrap when enabled,
@@ -360,6 +445,10 @@ _run_pilot_sandboxed() {
     local -a net_bwrap_args=()
     local -a net_setenv_args=()
     local sandbox_entrypoint_prefix=""
+    # mika#2056: stage the token host-side BEFORE the helper daemon is ensured,
+    # so the mitmdump github addon has a fresh credential to inject on its very
+    # first request.
+    _stage_pilot_gh_token
     _ensure_pilot_helper || true
 
     if _ensure_pilot_egress_proxy; then
@@ -437,19 +526,28 @@ _run_pilot_sandboxed() {
             --setenv ANTHROPIC_API_KEY "proxy-managed-no-secret"
             # γ trust for the helper CA (Vincent-authorized 2026-08-05).
             # NODE_EXTRA_CA_CERTS is ADDITIVE (adds to Node's built-in trust)
-            # so bundled claude keeps trusting the system CA for anything else.
-            # SSL_CERT_FILE / REQUESTS_CA_BUNDLE deliberately NOT set — they
-            # would REPLACE (not extend) the system trust bundle, breaking
-            # Python/curl verification of github.com etc. Bundled claude is
-            # Node — NODE_EXTRA_CA_CERTS suffices for our api.anthropic.com path.
+            # so bundled claude keeps trusting the system CA for anything else;
+            # it covers our api.anthropic.com Node path.
+            #
+            # mika#2056: GitHub is now MITM'd too, and git / gh / curl / python
+            # must trust the mitmproxy CA for github.com + api.github.com. Unlike
+            # NODE_EXTRA_CA_CERTS those tools honour GIT_SSL_CAINFO /
+            # SSL_CERT_FILE / CURL_CA_BUNDLE / REQUESTS_CA_BUNDLE, which REPLACE
+            # the trust store. The old warning here — "do not set SSL_CERT_FILE,
+            # it would break github.com verification" — is answered by pointing
+            # them at a SUPERSET (system store + mitm CA) that the prologue
+            # builds, so nothing loses system trust. Those exports live in
+            # $_PILOT_SECRET_PROLOGUE (they depend on a file assembled inside the
+            # sandbox), not here.
             --setenv NODE_EXTRA_CA_CERTS "$_PILOT_HELPER_CA_SANDBOX_PATH"
         )
         # sh -c wrapper that starts the shim, waits for it, execs the pilot,
         # cleans up on exit. `exec` in the final position ensures the pilot's
         # exit status becomes the sh's. $_PILOT_SECRET_PROLOGUE is prepended to
-        # that script (mika#2039) so the bwrap-materialised secret files are
-        # re-exported before anything else runs; dropping it leaves the pilot
-        # without GH_TOKEN on the path every real dispatch takes.
+        # that script (mika#2039) so any bwrap-materialised secret files are
+        # re-exported before anything else runs, and (mika#2056) so the combined
+        # CA bundle is assembled and GIT_SSL_CAINFO / SSL_CERT_FILE et al. are
+        # exported before the pilot's first `git push` / `gh` call.
         sandbox_entrypoint_prefix="/bin/sh"
     fi
 
@@ -583,13 +681,16 @@ $quoted_argv
     else
         # Phase 2a fallback: fs cut only, network unrestricted.
         #
-        # The `/bin/sh -c` entrypoint at the end of this block exists solely to
-        # run $_PILOT_SECRET_PROLOGUE before the pilot (mika#2039). The
-        # original argv rides through as positional parameters, so no second
-        # `printf '%q'` quoting layer is introduced, and `exec` in final
-        # position keeps the pilot's argv, pid and exit status identical to the
-        # bare `-- "$@"` this replaced. Reverting it to `-- "$@"` looks like a
-        # simplification and silently removes GH_TOKEN from this sandbox.
+        # The `/bin/sh -c` entrypoint at the end of this block exists to run
+        # $_PILOT_SECRET_PROLOGUE before the pilot (mika#2039 secret-file
+        # re-export + mika#2056 CA-bundle assembly). The original argv rides
+        # through as positional parameters, so no second `printf '%q'` quoting
+        # layer is introduced, and `exec` in final position keeps the pilot's
+        # argv, pid and exit status identical to the bare `-- "$@"` this
+        # replaced. Reverting it to `-- "$@"` looks like a simplification and
+        # silently drops the prologue. (Phase 2a has no egress proxy, so GitHub
+        # auth injection is inactive here — the pilot reaches GitHub tokenless,
+        # fail-closed; this is the degraded fallback, same as Anthropic.)
         bwrap \
             --as-pid-1 \
             --unshare-user \

@@ -1,7 +1,7 @@
 INSTALL_DIR ?= $(HOME)/.local/bin
 BINARIES := mika mika-spirit mika-gateway
 
-.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan test-pr-origin test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv verify-no-secret-in-setenv verify-no-sigpipe-grep check-byte-slices verify-egress-no-log verify-bundled-skills lint fmt check check-ngrok deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
+.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan test-pr-origin test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv test-github-token-not-in-sandbox verify-no-secret-in-setenv verify-no-sigpipe-grep check-byte-slices verify-egress-no-log verify-bundled-skills lint fmt check check-ngrok deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -51,6 +51,10 @@ install: ## Copy release binaries + scripts to INSTALL_DIR (safe while services 
 	@cp scripts/mika-pilot-anthropic-auth-addon.py $(INSTALL_DIR)/mika-pilot-anthropic-auth-addon.py.tmp
 	@mv $(INSTALL_DIR)/mika-pilot-anthropic-auth-addon.py.tmp $(INSTALL_DIR)/mika-pilot-anthropic-auth-addon.py
 	@echo "Installed mika-pilot-anthropic-auth-addon.py"
+	@# github auth-injection addon — host-side GitHub token injection (mika#2056).
+	@cp scripts/mika-pilot-github-auth-addon.py $(INSTALL_DIR)/mika-pilot-github-auth-addon.py.tmp
+	@mv $(INSTALL_DIR)/mika-pilot-github-auth-addon.py.tmp $(INSTALL_DIR)/mika-pilot-github-auth-addon.py
+	@echo "Installed mika-pilot-github-auth-addon.py"
 
 deploy: deploy-info build-dashboard build install restart check-ngrok ## Full deploy: build, install, restart
 
@@ -127,6 +131,7 @@ test: ## Run all tests
 	@bash skills/bundled/_shared/tests/test_stamp_pr_origin.sh
 	@bash scripts/test-pr-origin-report.sh
 	@bash skills/bundled/_shared/tests/test_sandbox_no_secret_in_argv.sh
+	@bash skills/bundled/_shared/tests/test-pilot-github-token-not-in-sandbox.sh
 	@bash scripts/verify-no-secret-in-setenv.sh
 	@bash scripts/test-verify-no-secret-in-setenv.sh
 	@bash scripts/verify-egress-no-log.sh
@@ -152,6 +157,9 @@ test-pr-origin: ## Run the PR-origin marker + report suites (mika#2026)
 
 test-sandbox-secret-argv: ## Verify no credential value reaches the pilot sandbox argv or trace (mika#2039 R8)
 	@bash skills/bundled/_shared/tests/test_sandbox_no_secret_in_argv.sh
+
+test-github-token-not-in-sandbox: ## Verify the GitHub token is host-reachable but sandbox-absent (mika#2056)
+	@bash skills/bundled/_shared/tests/test-pilot-github-token-not-in-sandbox.sh
 
 verify-no-secret-in-setenv: ## Verify no secret-shaped var reaches bwrap via --setenv (mika#2039 R7/R14/R15)
 	@bash scripts/verify-no-secret-in-setenv.sh
