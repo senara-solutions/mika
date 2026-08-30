@@ -39,7 +39,13 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-EGRESS_DIR="$REPO_ROOT/crates/mika-gateway/src/egress_search"
+SCRIPT_PATH="$0"
+
+# The E1 substrate directory. CI passes no argument and the default path is
+# scanned. The test harness (`scripts/test-verify-egress-no-log.sh`) passes a
+# fixture directory as $1 so the lint's negative behaviour can be pinned
+# against synthesized source it never touches in production.
+EGRESS_DIR="${1:-$REPO_ROOT/crates/mika-gateway/src/egress_search}"
 
 if [[ ! -d "$EGRESS_DIR" ]]; then
     echo "ERROR: egress_search directory not found at $EGRESS_DIR"
@@ -113,13 +119,18 @@ violations=0
 # inline-test scope; the scan skips every line until the matching closing
 # brace, then resumes.
 #
-# Any other `#[cfg(test)]` (bare `fn`, other item forms) also opens a
-# skip-until-end-of-item scope — we stop the scan there because the E1/E2
-# substrate does not use those forms today and adding one would need a
-# lint update anyway.
+# Any other `#[cfg(test)]` form (bare `fn`, `impl`, `struct`, …) is a shape
+# this parser does NOT model. It cannot delimit the test scope, so it cannot
+# know where production code resumes. Rather than silently drop the rest of
+# the file from the scan — which turns every egress violation below that point
+# into a false green — the parser FAILS CLOSED: it prints a diagnostic that
+# names the offending line and says what to add to the parser, then exits
+# non-zero so the whole guard fails. Construct the incapacity, don't promise
+# the restraint (header, :8-11). This is the same class as mika#2039's parser,
+# which returned a partial audit indistinguishable from a complete one.
 production_lines() {
     local file="$1"
-    awk '
+    awk -v script="$SCRIPT_PATH" '
         BEGIN { pending_cfg_test = 0; brace_depth = 0; in_inline_test = 0 }
 
         # Skip anything inside an inline test module (tracked via brace depth).
@@ -153,11 +164,15 @@ production_lines() {
                 brace_depth = 1
                 next
             }
-            # Anything else after `#[cfg(test)]` — bare fn, other item — is
-            # test-scoped. Stop scanning the file (defensive: adding a
-            # `#[cfg(test)] fn` next to production code is unusual and worth
-            # a manual lint revisit).
-            exit
+            # Anything else after `#[cfg(test)]` — bare `fn`, `impl`, `struct`,
+            # a `mod` written on the same line, etc. — is a form this parser
+            # cannot delimit. Do NOT abandon the file silently: name the line,
+            # say what to add, and fail non-zero so the guard fails closed.
+            printf("ERROR (egress-no-log, parser): unmodeled `#[cfg(test)]` form at %s:%d: %s\n", FILENAME, FNR, $0) > "/dev/stderr"
+            printf("  production_lines() models only `#[cfg(test)] mod NAME;` and `#[cfg(test)] mod NAME {`.\n") > "/dev/stderr"
+            printf("  It cannot delimit this item, so the remainder of the file would go unscanned — a partial audit that reads exactly like a clean one.\n") > "/dev/stderr"
+            printf("  Refusing to emit it. Either wrap the test code in a `#[cfg(test)] mod NAME { ... }` block, or extend production_lines() in %s to model this form (skip-until-end-of-item), then re-run.\n", script) > "/dev/stderr"
+            exit 3
         }
 
         { printf("%s:%d:%s\n", FILENAME, FNR, $0) }
@@ -186,9 +201,22 @@ report_violation() {
 # ------------------------------------------------------------------
 
 # All production lines across every source file in egress_search/.
+#
+# `production_lines` fails closed (exit != 0) when it meets a `#[cfg(test)]`
+# form it cannot model. Capture that per-file: a parser failure on ANY file is
+# a hard guard failure — a lint that stops modelling a file must stop LOUDLY,
+# never pass a partial audit.
 prod_lines=""
 while IFS= read -r file; do
-    prod_lines+="$(production_lines "$file")"$'\n'
+    file_prod=""
+    parse_rc=0
+    file_prod="$(production_lines "$file")" || parse_rc=$?
+    if [[ $parse_rc -ne 0 ]]; then
+        report_violation "parser" "unmodeled #[cfg(test)] form" "$file"
+        echo "  the file above could not be fully modelled; the guard refuses to"
+        echo "  pass a partial audit (see the parser diagnostic printed above)."
+    fi
+    prod_lines+="$file_prod"$'\n'
 done < <(find "$EGRESS_DIR" -type f -name '*.rs' | sort)
 
 # Live (non-comment-line) production lines — the surface the lint operates on.
@@ -210,11 +238,55 @@ for pat in "${FORBIDDEN_LOG_QUALIFIED_MACROS[@]}"; do
     done < <(printf "%s\n" "$live_lines" | grep -F "${pat}(" || true)
 done
 
-# 1c — `info!` calls must belong to the Q4 allowlist. Build the set of
-# allowed line numbers per file by finding `info!(` invocations whose block
-# (the call itself + the following 8 lines) contains one of the allowed
-# `event = "<name>"` tokens.
+# 1c — `info!` calls must belong to the Q4 allowlist. For each `info!(`
+# invocation, read its ACTUAL macro block — from the opening line until the
+# `)` that balances the `(` opened by `info!(` — and require an allowlisted
+# `event = "<name>"` token inside that exact span.
+#
+# The old form read a fixed 8-line window below the call (`line_no + 8`). That
+# is a fail-open parser: a non-allowlisted `info!` passed whenever an
+# allowlisted `event = "…"` token merely happened to sit within 8 lines below
+# it, in an unrelated statement. `macro_block` (below) attaches to the call's
+# own parenthesised argument list instead, and if it cannot balance the parens
+# — a truncated file, a macro it cannot delimit — it FAILS CLOSED (exit != 0)
+# and the guard fails, rather than judging the call on an arbitrary window.
 info_hits=$(printf "%s\n" "$live_lines" | grep -F "info!(" || true)
+
+# Print the lines of the `info!(` macro invocation that begins at line `start`
+# of `file` — the opener through the line whose closing `)` returns paren
+# depth to zero. Parens inside `//` line comments and double-quoted strings do
+# not count. Exit 2 if the block never closes (parens cannot be balanced).
+macro_block() {
+    local file="$1" start="$2"
+    awk -v start="$start" '
+        function sanitize(s,   out, i, c, n, instr, prev) {
+            out = ""; instr = 0; prev = ""
+            n = length(s)
+            for (i = 1; i <= n; i++) {
+                c = substr(s, i, 1)
+                if (instr) {
+                    if (c == "\"" && prev != "\\") instr = 0
+                    prev = c; continue
+                }
+                if (c == "\"") { instr = 1; prev = c; continue }
+                if (c == "/" && substr(s, i + 1, 1) == "/") break
+                out = out c; prev = c
+            }
+            return out
+        }
+        NR < start { next }
+        {
+            print
+            s = sanitize($0)
+            t = s; opens = gsub(/\(/, "", t)
+            t = s; closes = gsub(/\)/, "", t)
+            depth += opens - closes
+            started = 1
+            if (depth <= 0) exit 0
+        }
+        END { if (started && depth > 0) exit 2 }
+    ' "$file"
+}
 
 if [[ -n "$info_hits" ]]; then
     while IFS= read -r hit; do
@@ -223,15 +295,21 @@ if [[ -n "$info_hits" ]]; then
         rest="${hit#*:}"
         line_no="${rest%%:*}"
 
-        # Read a small window of the source file to see whether this info!
-        # call belongs to an allowlisted audit event. The E1 events open the
-        # macro on one line and name `event = "…"` within the following few.
-        window_end=$((line_no + 8))
-        window=$(sed -n "${line_no},${window_end}p" "$file")
+        block=""
+        block_rc=0
+        block=$(macro_block "$file" "$line_no") || block_rc=$?
+
+        if [[ $block_rc -ne 0 ]]; then
+            report_violation "layer-1" "info! (block undeterminable)" "$hit"
+            echo "  the info! invocation above could not be delimited (its"
+            echo "  parentheses do not balance before end-of-file); the guard"
+            echo "  refuses to judge it on an incomplete block."
+            continue
+        fi
 
         matched=0
         for allowed in "${ALLOWED_EVENT_NAMES[@]}"; do
-            if grep -qF "event = \"${allowed}\"" <<< "$window"; then
+            if grep -qF "event = \"${allowed}\"" <<< "$block"; then
                 matched=1
                 break
             fi
