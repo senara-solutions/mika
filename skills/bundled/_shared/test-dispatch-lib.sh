@@ -3922,6 +3922,317 @@ else
     echo "  ✗ Rust source not found at $RUST_SRC — cannot verify allowlist drift"
 fi
 
+# ============================================================================
+# Non-empty output gate (mika#1996)
+# ============================================================================
+#
+# A cycle that produced nothing may no longer report success — and, just as
+# load-bearing, a cycle that produced something must come through the gate
+# untouched. A gate that only ever fails is satisfied by "always fail", which
+# is worth exactly as much as the silent success it replaces. Both directions
+# are asserted below, plus the third verdict (`undetermined`) that keeps the
+# gate from inventing a red when it has no ground to measure.
+
+echo ""
+echo "Test: non-empty output gate — measurement (mika#1996)"
+echo "-------------------------------------------------------------------"
+
+# Builds the exact state the gate reads: a real git worktree, a real HEAD range,
+# a real stderr file with a real number of `[tool:request]` lines. Echoes either
+# the verdict (mode=verdict) or the resulting RESULT (mode=result).
+_gate_probe() {
+    local mode="$1" dirty="$2" moved="$3" pr="$4" tools="$5" result_in="$6" wt_mode="${7:-real}" pilot_ran="${8:-1}"
+    local base wt logdir pre post i
+    base=$(mktemp -d "${TMPDIR:-/tmp}/mika-1996-test.XXXXXX")
+    wt="$base/wt"; logdir="$base/logs"
+    mkdir -p "$logdir"
+    git init -q "$wt" 2>/dev/null
+    echo initial > "$wt/f"
+    git -C "$wt" add -A 2>/dev/null
+    git -C "$wt" commit -q -m initial --no-verify 2>/dev/null
+    pre=$(git -C "$wt" rev-parse HEAD)
+    post="$pre"
+    case "$moved" in
+        content)
+            echo more > "$wt/g"
+            git -C "$wt" add -A 2>/dev/null
+            git -C "$wt" commit -q -m "feat: real work" --no-verify 2>/dev/null
+            post=$(git -C "$wt" rev-parse HEAD)
+            ;;
+        empty)
+            # The wip(mika#1383) rescue marker is an --allow-empty commit by
+            # construction: it moves HEAD without producing anything.
+            git -C "$wt" commit -q --allow-empty --no-verify \
+                -m "wip(mika#1383): auto-PR-create rescue" 2>/dev/null
+            post=$(git -C "$wt" rev-parse HEAD)
+            ;;
+    esac
+    if [ "$dirty" = "yes" ]; then
+        echo uncommitted > "$wt/pilot-wrote-this.rs"
+    fi
+    if [ "$tools" != "none" ]; then
+        : > "$logdir/probe-1996.stderr"
+        i=0
+        while [ "$i" -lt "$tools" ]; do
+            echo "[tool:request] Bash {\"command\":\"ls\"}" >> "$logdir/probe-1996.stderr"
+            i=$((i + 1))
+        done
+    fi
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        WORKTREE_DIR="$wt"
+        [ "$wt_mode" = "absent" ] && WORKTREE_DIR="$base/never-created"
+        PRE_RUN_HEAD="$pre"
+        POST_RUN_HEAD="$post"
+        PR_URL="$pr"
+        LOG_ID="probe-1996"
+        PILOT_LOG_DIR="$logdir"
+        RESULT="$result_in"
+        TASK_ID="task-1996"
+        SKILL="dev-pilot"
+        SESSION_ID="sess-1996"
+        PILOT_RAN="$pilot_ran"
+        if [ "$mode" = "verdict" ]; then
+            _measure_cycle_output 2>/dev/null
+            printf '%s' "$CYCLE_OUTPUT_VERDICT"
+        else
+            _gate_non_empty_cycle 2>/dev/null
+            printf '%s' "$RESULT"
+        fi
+    )
+    rm -rf "$base"
+}
+
+SUCCESS_RESULT="claude-pilot completed (status: success).
+Session: sess-1996
+Turns: 2
+Cost: \$0.31
+Duration: 600000ms"
+
+# --- Direction 1: producing nothing is no longer a success -------------------
+
+assert_eq "clean tree, HEAD unmoved, zero tool calls -> empty (the 102-of-120 shape)" \
+    "empty" "$(_gate_probe verdict no none "" 0 "$SUCCESS_RESULT")"
+assert_eq "an --allow-empty commit moves HEAD but produces nothing -> empty" \
+    "empty" "$(_gate_probe verdict no empty "" 0 "$SUCCESS_RESULT")"
+# Reading is not producing: the tool-call count can never rescue a cycle that
+# left no trace outside its own process.
+assert_eq "40 tool calls with nothing written -> empty" \
+    "empty" "$(_gate_probe verdict no none "" 40 "$SUCCESS_RESULT")"
+# PIPELINE_INCOMPLETE is a non-conclusion, not a terminal disposition.
+assert_eq "a non-conclusive Outcome does not satisfy P4" \
+    "empty" "$(_gate_probe verdict no none "" 5 "Outcome: PIPELINE_INCOMPLETE — manual recovery needed.")"
+# P4 is a conjunction. A disposition with no tool call is text about work.
+assert_eq "a terminal disposition with zero tool calls -> empty" \
+    "empty" "$(_gate_probe verdict no none "" 0 "Outcome: PLAN_GROOMED")"
+
+# --- Direction 2: producing something still succeeds -------------------------
+
+assert_eq "commits carrying a non-empty diff -> produced" \
+    "produced" "$(_gate_probe verdict no content "" 0 "$SUCCESS_RESULT")"
+assert_eq "a dirty worktree -> produced (the mika#1282 rescue shape)" \
+    "produced" "$(_gate_probe verdict yes none "" 0 "$SUCCESS_RESULT")"
+assert_eq "an open PR -> produced" \
+    "produced" "$(_gate_probe verdict no none "https://github.com/senara-solutions/mika/pull/1" 0 "$SUCCESS_RESULT")"
+# The legitimately short cycle: a grooming that concludes, having actually acted.
+assert_eq "a terminal disposition backed by tool calls -> produced (no false red)" \
+    "produced" "$(_gate_probe verdict no none "" 3 "Outcome: PLAN_GROOMED")"
+assert_eq "the crash path's PR: line is read when PR_URL was never set" \
+    "produced" "$(_gate_probe verdict no none "" 0 "HANDLER CRASH (exit code 1).
+PR: https://github.com/senara-solutions/mika/pull/2")"
+
+# --- Third verdict: no ground to measure is not a failure --------------------
+
+assert_eq "an unreadable worktree -> undetermined, never empty" \
+    "undetermined" "$(_gate_probe verdict no none "" 0 "$SUCCESS_RESULT" absent)"
+
+echo ""
+echo "Test: non-empty output gate — effect on the callback (mika#1996)"
+echo "-------------------------------------------------------------------"
+
+GATE_EMPTY_OUT=$(_gate_probe result no none "" 0 "$SUCCESS_RESULT")
+assert_contains "an empty cycle is banner-marked as a pipeline failure" \
+    "PIPELINE FAILURE: empty_completion" "$GATE_EMPTY_OUT"
+assert_contains "the banner carries the measurement, not an assertion" \
+    "HEAD did not move" "$GATE_EMPTY_OUT"
+assert_contains "the banner names the tool-call count it read" \
+    "tool calls: 0" "$GATE_EMPTY_OUT"
+assert_contains "the banner states the definition it applied" \
+    "observable outside its own process" "$GATE_EMPTY_OUT"
+assert_contains "an empty cycle gets a PIPELINE_INCOMPLETE outcome" \
+    "Outcome: PIPELINE_INCOMPLETE — empty_completion:" "$GATE_EMPTY_OUT"
+GATE_EMPTY_OUTCOMES=$(grep -c '^Outcome: ' <<<"$GATE_EMPTY_OUT" || true)
+assert_eq "an empty cycle carries exactly one Outcome line" "1" "$GATE_EMPTY_OUTCOMES"
+
+# The positive direction is an invariant, not an optimisation: byte for byte.
+for _case in "no content  0" "yes none  0" "no none  3"; do
+    set -- $_case
+    _d="$1"; _m="$2"; _t="$3"
+    GATE_PRODUCED_IN="$SUCCESS_RESULT
+Outcome: PR_OPENED — https://github.com/senara-solutions/mika/pull/3"
+    GATE_PRODUCED_OUT=$(_gate_probe result "$_d" "$_m" "" "$_t" "$GATE_PRODUCED_IN")
+    assert_eq "a producing cycle leaves RESULT byte-for-byte identical (dirty=$_d moved=$_m tools=$_t)" \
+        "$GATE_PRODUCED_IN" "$GATE_PRODUCED_OUT"
+done
+
+# Undetermined says so and leaves the cycle's own outcome alone.
+GATE_UNDET_OUT=$(_gate_probe result no none "" 0 "$SUCCESS_RESULT
+Outcome: PLAN_COMMITTED — docs/plans/x.md" absent)
+assert_contains "an undetermined measurement is reported as such" \
+    "Measurement: cycle output undetermined" "$GATE_UNDET_OUT"
+assert_not_contains "an undetermined measurement never fabricates a failure" \
+    "PIPELINE FAILURE" "$GATE_UNDET_OUT"
+assert_contains "an undetermined measurement leaves the cycle's outcome intact" \
+    "Outcome: PLAN_COMMITTED" "$GATE_UNDET_OUT"
+
+# A cycle that is already red keeps its own, more specific diagnosis.
+ALREADY_RED="PIPELINE FAILURE: the claude-pilot session was terminated before it produced any work.
+
+Outcome: PIPELINE_INCOMPLETE — pilot session terminated by claude-pilot before producing work."
+GATE_RED_OUT=$(_gate_probe result no none "" 0 "$ALREADY_RED")
+GATE_RED_COUNT=$(grep -c 'PIPELINE FAILURE:' <<<"$GATE_RED_OUT" || true)
+assert_eq "an already-red callback does not get a second banner stacked on it" \
+    "1" "$GATE_RED_COUNT"
+assert_contains "an already-red callback keeps its own diagnosis" \
+    "terminated before it produced any work" "$GATE_RED_OUT"
+
+# Idempotence: _deliver_callback and the EXIT trap can both fire in one process.
+_gate_twice_probe() {
+    local base wt logdir pre
+    base=$(mktemp -d "${TMPDIR:-/tmp}/mika-1996-twice.XXXXXX")
+    wt="$base/wt"; logdir="$base/logs"; mkdir -p "$logdir"
+    git init -q "$wt" 2>/dev/null
+    echo initial > "$wt/f"; git -C "$wt" add -A 2>/dev/null
+    git -C "$wt" commit -q -m initial --no-verify 2>/dev/null
+    pre=$(git -C "$wt" rev-parse HEAD)
+    : > "$logdir/probe-1996.stderr"
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        WORKTREE_DIR="$wt" PRE_RUN_HEAD="$pre" POST_RUN_HEAD="$pre" PR_URL=""
+        LOG_ID="probe-1996" PILOT_LOG_DIR="$logdir"
+        RESULT="claude-pilot completed (status: success)."
+        PILOT_RAN=1
+        _gate_non_empty_cycle 2>/dev/null
+        _gate_non_empty_cycle 2>/dev/null
+        printf '%s' "$RESULT"
+    )
+    rm -rf "$base"
+}
+GATE_TWICE_OUT=$(_gate_twice_probe)
+GATE_TWICE_COUNT=$(grep -c 'PIPELINE FAILURE: empty_completion' <<<"$GATE_TWICE_OUT" || true)
+assert_eq "two gate passes produce exactly one banner" "1" "$GATE_TWICE_COUNT"
+
+# The rewrite is line-anchored and hits the first Outcome only: a quoted
+# `Outcome:` inside the pilot's own text is data, not the cycle's verdict.
+GATE_QUOTED_OUT=$(_gate_probe result no none "" 0 "claude-pilot completed (status: success).
+    Outcome: PLAN_GROOMED   <- quoted from the transcript, not the verdict
+Outcome: UNKNOWN — inspect worktree manually.")
+assert_contains "the quoted Outcome line survives the rewrite" \
+    "    Outcome: PLAN_GROOMED   <- quoted from the transcript" "$GATE_QUOTED_OUT"
+assert_not_contains "the cycle's own UNKNOWN outcome is replaced" \
+    "Outcome: UNKNOWN" "$GATE_QUOTED_OUT"
+
+# No Outcome line at all: one is appended rather than silently dropped.
+GATE_NOOUTCOME_OUT=$(_gate_probe result no none "" 0 "claude-pilot completed (exit 0) but output was not structured JSON.")
+assert_contains "a callback with no Outcome line gets one" \
+    "Outcome: PIPELINE_INCOMPLETE — empty_completion:" "$GATE_NOOUTCOME_OUT"
+
+# The dispatcher's own deliberate exits are decisions, not cycles. Their
+# callbacks are a JSON document mika-dev and the audit dashboard parse; a banner
+# prefixed onto one would both invent a failure and break the parse.
+AUTOSKIP_IN='{"status":"auto_skipped","reason":"issue_closed","issue":"senara-solutions/mika#1","note":"Issue was already closed before dispatch fired."}'
+AUTOSKIP_OUT=$(_gate_probe result no none "" 0 "$AUTOSKIP_IN" real 0)
+assert_eq "an auto-skip callback (no pilot ran) is left byte-for-byte identical" \
+    "$AUTOSKIP_IN" "$AUTOSKIP_OUT"
+if jq -e . >/dev/null 2>&1 <<<"$AUTOSKIP_OUT"; then
+    PASS=$((PASS + 1)); echo "  ✓ the auto-skip callback is still valid JSON after the gate"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ the auto-skip callback is still valid JSON after the gate"
+fi
+
+# A push violation already names a more specific cause than "nothing produced".
+PUSHVIOL_IN="STRUCTURAL VIOLATION: pilot push detected (mika#1318).
+
+Outcome: PIPELINE_INCOMPLETE — push violation"
+PUSHVIOL_OUT=$(_gate_probe result no none "" 0 "$PUSHVIOL_IN")
+assert_eq "a push-violation callback keeps its own diagnosis untouched" \
+    "$PUSHVIOL_IN" "$PUSHVIOL_OUT"
+
+# An operator cancel must keep STATUS= as the first line the parser sees.
+CANCEL_OUT=$(_gate_probe result no none "" 0 "STATUS=CANCELLED_BY_OPERATOR
+
+Original exit code: 143
+claude-pilot completed (status: success).")
+assert_eq "a cancelled cycle still leads with its STATUS= line (mika#749 parser contract)" \
+    "STATUS=CANCELLED_BY_OPERATOR" "$(head -1 <<<"$CANCEL_OUT")"
+assert_not_contains "a cancelled cycle is not relabelled as an empty completion" \
+    "empty_completion" "$CANCEL_OUT"
+
+echo ""
+echo "Test: the gate cannot be bypassed (mika#1996, CONTROL-MUST-BE-UNAVOIDABLE)"
+echo "-------------------------------------------------------------------"
+
+# A guarantee exists only if EVERY path producing the guarded effect crosses the
+# control point. The guarded effect is "a cycle verdict reaches mika-dev". This
+# guard fails if a future delivery site is ever added without the gate — the
+# exact way an invariant of this shape gets lost.
+_delivery_blocks() {
+    local want="$1"   # all | ungated
+    awk -v want="$want" '
+        /^[A-Za-z_][A-Za-z0-9_]*\(\)[[:space:]]*\{/ {
+            fn = $1; sub(/\(\).*/, "", fn); body = ""; inbody = 1; next
+        }
+        inbody && /^\}/ {
+            if (body ~ /--task-complete/) {
+                if (want == "all") print fn
+                else if (body !~ /_gate_non_empty_cycle/) print fn
+            }
+            inbody = 0; body = ""; next
+        }
+        inbody { body = body "\n" $0 }
+    ' "$DISPATCH_LIB"
+}
+UNGATED=$(_delivery_blocks ungated)
+assert_eq "every function that delivers a callback calls the gate" "" "$UNGATED"
+DELIVERY_FNS=$(_delivery_blocks all | sort | paste -sd' ' -)
+assert_eq "the delivery sites are the two we know about" \
+    "_deliver_callback _dispatch_lib_exit_trap" "$DELIVERY_FNS"
+
+# The gate must be the FIRST executable statement of _deliver_callback: an early
+# return added above it would be a hole opened without anyone noticing.
+DELIVER_FIRST=$(sed -n '/^_deliver_callback() {/,/^}/p' "$DISPATCH_LIB" \
+    | sed '1d' | grep -vE '^[[:space:]]*(#|$)' | head -1)
+assert_contains "the gate is the first executable statement of _deliver_callback" \
+    "_gate_non_empty_cycle" "$DELIVER_FIRST"
+
+# The measurement stays side-effect free: it is what makes the positive
+# direction provable. If it ever writes RESULT, the byte-for-byte invariant
+# above becomes untestable rather than false, which is worse.
+MEASURE_SRC=$(sed -n '/^_measure_cycle_output() {/,/^}/p' "$DISPATCH_LIB")
+assert_not_contains "the measurement never writes RESULT" \
+    "RESULT=" "$MEASURE_SRC"
+
+# PILOT_RAN is what separates "the cycle produced nothing" from "no cycle ran".
+# A second writer would blur the two, which is how a gate starts excusing the
+# population it exists to catch.
+PILOT_RAN_WRITERS=$(grep -c '^[[:space:]]*PILOT_RAN=1[[:space:]]*$' "$DISPATCH_LIB" || true)
+assert_eq "PILOT_RAN has exactly one writer" "1" "$PILOT_RAN_WRITERS"
+PILOT_RAN_FN=$(awk '
+    /^[A-Za-z_][A-Za-z0-9_]*\(\)[[:space:]]*\{/ { fn = $1; sub(/\(\).*/, "", fn); next }
+    /^[[:space:]]*PILOT_RAN=1[[:space:]]*$/ { print fn }
+' "$DISPATCH_LIB")
+assert_eq "PILOT_RAN is set by the function that launches the pilot" \
+    "_run_claude_pilot" "$PILOT_RAN_FN"
+
+# In the EXIT trap the gate has to run BEFORE the cancel prefix, or the banner
+# displaces the STATUS= line mika-dev's parser reads first (mika#749).
+TRAP_ORDER=$(sed -n '/^_dispatch_lib_exit_trap() {/,/^}/p' "$DISPATCH_LIB" \
+    | grep -nE '_gate_non_empty_cycle|Cancel discriminator envelope prefix' | head -1)
+assert_contains "in the EXIT trap the gate precedes the cancel prefix" \
+    "_gate_non_empty_cycle" "$TRAP_ORDER"
+
 # --- Summary ---
 
 echo ""

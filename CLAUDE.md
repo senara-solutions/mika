@@ -96,6 +96,39 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `make calibrate-mika-dev MODEL=anthropic/claude-sonnet-4-6` — Run mika-dev calibration suite
 - `make calibrate-mika-arch MODEL=anthropic/claude-opus-4-6` — Run mika-arch calibration suite
 - `make calibrate-mika-qa MODEL=anthropic/claude-sonnet-4-6` — Run mika-qa calibration suite
+- `scripts/pr-origin-report.sh --since <date> --until <date>` — Merged PRs over a window, split by origin (see below)
+
+### PR origin (mika#2026)
+
+Whether a merged PR came out of the autonomous loop or was opened by hand is a
+**fact stamped by its producer**, never reconstructed afterwards. `dispatch-lib.sh`
+applies `origin:loop` in shell (`_stamp_pr_origin`) at each of the three points
+where it holds a PR it just produced. Branch name, author, and merge time are all
+identical between the loop and by-hand work — inferring from them fails exactly on
+the day the answer matters.
+
+Read it with `scripts/pr-origin-report.sh`. Two rules govern the reading:
+
+- **An unmarked PR reads "unknown", never "by hand."** A default that looks like an
+  answer is how an instrument lies.
+- **Absence of the label only means something after the marker went live.** The
+  cut-off is the instant the producer first stamped anything, recorded once by
+  `_record_pr_origin_epoch` in `~/.mika/state/pr-origin-epoch`; override with
+  `MIKA_PR_ORIGIN_EPOCH`. With no cut-off, the report classifies nothing and says
+  so — and the cut-off is born of the first real stamp, not of `make deploy`. It is deliberately *not* a file mtime: `seed_support_dirs` rewrites the
+  installed `dispatch-lib.sh` on every daemon start, so an mtime would track the
+  last restart and walk the cut-off forward all day. The test is on a PR's
+  **opening** date, not its merge — a PR in flight across the cutover could never
+  have been stamped, so it reads unknown rather than not-loop.
+
+Bounds: `--since`/`--until` take `YYYY-MM-DD` (whole days, UTC) or a full
+`YYYY-MM-DDTHH:MM:SSZ` instant; anything else is refused rather than silently
+mis-answered. The report also refuses (exit 3) when `--limit` filled the page, so
+a truncated fetch can never read as a real count.
+
+When opening a PR by hand — orchestrator or spawn — apply `origin:manual` or
+`origin:spawn` yourself (`gh pr edit <n> --add-label origin:manual`). Nothing does
+it for you: only the loop half has a structural producer.
 
 ## Architecture Summary
 

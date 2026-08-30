@@ -87,6 +87,9 @@ jobs:
       - name: Plan-discovery suite (mika#2038)
         run: make test-find-issue-plan
 
+      - name: PR-origin marker + report suites (mika#2026)
+        run: make test-pr-origin
+
       - name: Pilot sandbox secret-channel guards (mika#2039)
         run: |
           make test-sandbox-secret-argv
