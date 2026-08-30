@@ -809,6 +809,58 @@ async def handle_sandbox_client(
 
 async def run_host_mode(unix_sock_path: str) -> None:
     sock_path = Path(unix_sock_path)
+
+    # --- Pre-bind observability (mika#2051) --------------------------------
+    # On 2026-08-29 two proxies died between exec and bind() and left NOTHING
+    # in the log, though dispatch-lib captures stderr (`nohup ... 2>&1`). A
+    # Python exception would have printed a traceback there, so a *silent*
+    # pre-bind death is a signal with its default disposition, not a raise.
+    # And the graceful SIGTERM/SIGINT handlers further down are installed only
+    # AFTER bind: throughout startup the process carried the default
+    # dispositions, so a SIGTERM in that window terminated it mutely -- the
+    # very "the one that took the proxy down on 2026-08-29" the shutdown block
+    # names. This closes that blind window at the source: announce arrival so
+    # the log shows the proxy reached its own main, and arm early handlers
+    # that NAME a pre-bind signal instead of dying without a word.
+    loop = asyncio.get_running_loop()
+
+    def _abort_on_startup_signal(signum: int) -> None:
+        # A catchable signal reached us before bind() completed. Name it, then
+        # exit hard -- we own no socket to unwind yet. A SIGKILL / OOM-kill
+        # cannot be caught, so on the next incident its signature is this
+        # line's ABSENCE while the `.begin` breadcrumb is present: begin + no
+        # `.signalled` + no `listening` == uncatchable kill (SIGKILL/OOM);
+        # begin + `.signalled` == a SIGTERM/SIGINT that landed during startup.
+        # Routed through `_log` so it carries the timestamp every operator-log
+        # line must (mika#2030): `_log` stays the sole stderr emitter.
+        _log(
+            f"[egress] pilot_egress_startup.signalled "
+            f"{signal.Signals(signum).name} before bind on {sock_path} "
+            f"(pid {os.getpid()}) -- aborting startup"
+        )
+        os._exit(3)
+
+    for _startup_sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(_startup_sig, _abort_on_startup_signal, _startup_sig)
+
+    # Emitted only AFTER the early handlers are armed, so this line doubles as
+    # proof the pre-bind window is now guarded: a signal arriving from here on
+    # is named by `_abort_on_startup_signal`, not swallowed by a default kill.
+    # Through `_log` (the sole stderr emitter) so it is timestamped like every
+    # other operator-log line (mika#2030) and a date grep composes across them.
+    _log(
+        f"[egress] pilot_egress_startup.begin pid={os.getpid()} "
+        f"binding {sock_path}"
+    )
+
+    # Test-only seam (mika#2051): park deterministically inside the pre-bind
+    # window -- still under the early handlers, before bind -- so the
+    # regression test can land a signal in exactly the window the incident
+    # occupied. Never set in production (the launcher does not export it).
+    _prebind_barrier = os.environ.get("_MIKA_EGRESS_PREBIND_TEST_BARRIER")
+    if _prebind_barrier:
+        await asyncio.sleep(float(_prebind_barrier))
+
     # Remove stale socket if present.
     if sock_path.exists():
         try:
@@ -848,7 +900,11 @@ async def run_host_mode(unix_sock_path: str) -> None:
     # dispatch-lib (mika#2041). SIGINT already unwound cleanly through
     # KeyboardInterrupt; routing both through the same stop future makes the two
     # signals behave alike instead of by accident.
-    loop = asyncio.get_running_loop()
+    #
+    # These REPLACE the early pre-bind handlers armed at the top of this
+    # function (add_signal_handler is last-writer-wins per signal): now that a
+    # socket exists, a SIGTERM must unwind gracefully and unlink it rather than
+    # abort hard.
     stop = loop.create_future()
 
     def _request_stop() -> None:
