@@ -864,18 +864,16 @@ async fn execute_http(url: &str, method: &str, input: serde_json::Value) -> Resu
     }
 }
 
-/// Truncate output to MAX_OUTPUT_LEN characters.
+/// Truncate output to at most `MAX_OUTPUT_LEN` **bytes**, floored to a char
+/// boundary (mika#2103 — delegates to the canonical helper rather than
+/// re-deriving the boundary walk locally).
 fn truncate_output(s: &str) -> String {
     if s.len() <= MAX_OUTPUT_LEN {
         s.to_string()
     } else {
-        let mut boundary = MAX_OUTPUT_LEN;
-        while boundary > 0 && !s.is_char_boundary(boundary) {
-            boundary -= 1;
-        }
         format!(
-            "{}\n... (truncated at {MAX_OUTPUT_LEN} chars)",
-            &s[..boundary]
+            "{}\n... (truncated at {MAX_OUTPUT_LEN} bytes)",
+            mika_common::text::safe_truncate(s, MAX_OUTPUT_LEN)
         )
     }
 }
