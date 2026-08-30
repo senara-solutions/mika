@@ -5528,6 +5528,192 @@ mod tests {
         id
     }
 
+    // -- mika#1948: the exec-slot claim at the real dispatch boundary --
+
+    /// The load-bearing test for this ticket. Two dispatchers validate the same
+    /// class; exactly ONE may leave holding the slot.
+    ///
+    /// Before this change both calls returned `Ok` — the per-class guard is a
+    /// bare SELECT and neither task had yet created the callback row that would
+    /// have made the slot look busy to the other. That is the 2026-08-30 shape:
+    /// two writers, one branch.
+    #[tokio::test]
+    async fn test_second_dispatcher_cannot_also_claim_the_slot() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let first = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        let second = create_task_with_ref_url(&async_db, "in_progress", None).await;
+
+        let a =
+            validate_dispatch_readiness(&async_db, &first, Some("fake-token"), None, None).await;
+        assert!(a.is_ok(), "the first dispatcher must be allowed: {a:?}");
+
+        let b =
+            validate_dispatch_readiness(&async_db, &second, Some("fake-token"), None, None).await;
+        let err = b.expect_err(
+            "the second dispatcher must be refused — a slot two claimants can \
+             both believe they hold is not arbitration",
+        );
+        let v: serde_json::Value = serde_json::from_str(&err).unwrap();
+        assert_eq!(
+            v["error"], "dispatch_slot_contended",
+            "the refusal must name slot contention, not a generic failure: {err}"
+        );
+        assert_eq!(
+            v["holder_task_id"], first,
+            "the refusal must name WHO holds the slot"
+        );
+    }
+
+    /// Anti-vacuity twin. A guard that refused every second dispatch would
+    /// satisfy the test above; this pins that the OTHER class is still free, so
+    /// the per-class slot split (mika#1001) survives the new claim.
+    #[tokio::test]
+    async fn test_slot_claim_leaves_the_other_class_dispatchable() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let implementer = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        let groomer = create_task_with_ref_url(&async_db, "in_progress", None).await;
+
+        let a =
+            validate_dispatch_readiness(&async_db, &implementer, Some("fake-token"), None, None)
+                .await;
+        assert!(a.is_ok(), "implement dispatch must be allowed: {a:?}");
+
+        // `dev-groom` derives the `groom` class, which is a different slot.
+        let groom_input = serde_json::json!({ "skill": "dev-groom" });
+        let b = validate_dispatch_readiness(
+            &async_db,
+            &groomer,
+            Some("fake-token"),
+            Some(&groom_input),
+            None,
+        )
+        .await;
+        assert!(
+            b.is_ok(),
+            "the groom slot is independent — claiming implement must not close \
+             it, or the mika#1001 split is undone: {b:?}"
+        );
+    }
+
+    /// A dispatcher re-validating its own task must not be refused by its own
+    /// lease. Without re-entrancy, any retry after a transient failure would be
+    /// permanently locked out by the claim it made itself.
+    #[tokio::test]
+    async fn test_same_task_revalidating_is_not_blocked_by_its_own_lease() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi = create_task_with_ref_url(&async_db, "in_progress", None).await;
+
+        let a = validate_dispatch_readiness(&async_db, &wi, Some("fake-token"), None, None).await;
+        assert!(a.is_ok(), "first validation: {a:?}");
+        let b = validate_dispatch_readiness(&async_db, &wi, Some("fake-token"), None, None).await;
+        assert!(
+            b.is_ok(),
+            "a task must be able to re-validate against the lease it holds: {b:?}"
+        );
+    }
+
+    /// AC2 — when a REAL active callback holds the class, the rejection names
+    /// which dispatcher owns it. The per-class guard fires before the lease, so
+    /// this exercises the `global_dispatch_active` payload specifically.
+    #[tokio::test]
+    async fn test_global_dispatch_rejection_names_blocking_dispatcher_source() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let blocker = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        async_db
+            .set_task_dispatcher_source(&blocker, "operator")
+            .await
+            .unwrap();
+        let mut cb = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(blocker.clone()),
+            depth: 1,
+            label: "long_running:run_claude_pilot".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        cb.dispatch_class = Some("implement".to_string());
+        async_db.create_task(cb).await.unwrap();
+
+        let contender = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        let err =
+            validate_dispatch_readiness(&async_db, &contender, Some("fake-token"), None, None)
+                .await
+                .expect_err("an active callback in the class must block");
+        let v: serde_json::Value = serde_json::from_str(&err).unwrap();
+        assert_eq!(v["error"], "global_dispatch_active");
+        assert_eq!(
+            v["blocking_dispatcher_source"], "operator",
+            "the rejection must name which dispatcher holds the slot: {err}"
+        );
+    }
+
+    /// And a pre-v51 blocker must report JSON `null`, not a fabricated
+    /// "mika_dev". A consumer must be able to tell "unknown" from "observed".
+    #[tokio::test]
+    async fn test_global_dispatch_rejection_reports_null_source_as_null() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let blocker = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        let cb = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(blocker.clone()),
+            depth: 1,
+            label: "long_running:run_claude_pilot".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        async_db.create_task(cb).await.unwrap();
+
+        let contender = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        let err =
+            validate_dispatch_readiness(&async_db, &contender, Some("fake-token"), None, None)
+                .await
+                .expect_err("an active callback in the class must block");
+        let v: serde_json::Value = serde_json::from_str(&err).unwrap();
+        assert!(
+            v["blocking_dispatcher_source"].is_null(),
+            "an unset source must stay null, never be defaulted: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn test_blocked_by_guard_skips_when_no_reference_url() {
         let db = crate::db::Database::open_in_memory().unwrap();

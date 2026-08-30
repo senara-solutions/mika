@@ -355,3 +355,85 @@ Each phase self-tests via `cargo test -p mika-agent <module>::` before moving on
 - Prior art tickets: mika#583, mika#1001, mika#1011, mika#1163, mika#1172, mika#1453, mika#1852, mika#1863, mika#1824.
 - Founding incident: 2026-07-27→28 11h idle (auto-feeder motivator, mika#1863).
 - Sibling ticket grooming: Porte 1 mika#1947 (in flight), Porte 3 mika#1949.
+
+## 11. Addendum — deltas from the groomed plan (implementation, 2026-08-30)
+
+The plan was groomed 2026-08-22. mika#2084 (the `dispatch:*` seat guard) shipped
+2026-08-30, eight days later, and the tree moved. Four deviations, each recorded
+with its reason.
+
+**D1 — schema is v50 → v51, not v49 → v50.** `v50` was taken on 2026-08-27 by
+mika#2020 (`auto_pull_stats` re-drive accounting). AC1's version numbers are
+therefore not implementable as written. Intent carried (a nullable, CHECK-pinned
+`dispatcher_source` column added by one O(1) migration), numbers advanced by one.
+Not an arbitration — reality moved the number.
+
+**D2 — the arbitration is a CLAIM, not a widened rejection payload.** Plan § 2.b
+committed to "No behavioral change to the guard itself… Adding the source field
+is observability, not policy." Implementation goes further, deliberately.
+
+Measured in the tree: `has_active_callback_tasks_excluding` (`db.rs`) is a bare
+SELECT, and `validate_dispatch_readiness` proceeds on `None` while the callback
+row that makes the slot observably held is written much later by the caller.
+Between those two points the same function performs several GitHub round-trips
+(issue body, open-PR, grooming markers — 10s timeout each), and **four**
+production callers enter it: `server/ready_label_handler.rs`,
+`skills/executor.rs` (tool boundary), `task_engine/dispatcher.rs`,
+`server/verdict_handler.rs`. The check-to-claim window is therefore seconds wide
+with four entry points, and two dispatchers can both read "free" and both
+proceed.
+
+That is the operator's stated bar for this ticket — *a slot two dispatchers can
+simultaneously believe they hold is not arbitration* — so shipping only the
+observability half would have left the ticket's own title undelivered. Added:
+`dispatch_slot_leases` with PRIMARY KEY `(agent_id, dispatch_class)`, claimed via
+one `INSERT … ON CONFLICT … WHERE expired OR same-holder` inside an IMMEDIATE
+transaction. Routed to the operator by `cm` before implementation, non-blocking.
+
+**D3 — `dispatcher_source` is a separate axis from the mika#2084 seat, not an
+extension of it.** The seat (`CURRENT_DISPATCH_SEAT`, `loop|ssc|mpc`) says which
+*engine* owns a TICKET and lives on the GitHub issue. `dispatcher_source` says
+which *role inside one engine* initiated a TASK. The seat gate refuses a ticket
+owned by another engine; this arbitrates the exec slot among one engine's
+dispatchers. They are not merged, and the shipped code reuses #2084's established
+shapes rather than re-deriving them: refuse before the queue (its Leçon 7), name
+the holder in the refusal, write an audit event, and distinguish "information
+absent" (fail-open) from "information unresolvable" (fail-closed) (its Leçon 3).
+
+**D4 — `dispatcher_source` is written by `set_task_dispatcher_source()`, not a
+`NewTask` field.** `NewTask` has ~175 construction sites, and all but a handful
+are the autonomous loop, whose correct value is exactly the NULL default. A
+required field would have meant 175 edits restating `mika_dev` and would have
+buried the few sites where the answer is genuinely different. No production path
+writes `'mika_manager'` or `'operator'` yet — both land with the Phase 2 wiring,
+per this plan's § 9 non-goals. The primitive, the policy that reads it, and the
+tests ship now.
+
+**Mutation evidence (per `docs/solutions/best-practices/a-guard-must-sit-where-the-incident-actually-passed-2026-08-30.md` Leçon 4).**
+The claim was broken in both directions and the reddening counted:
+
+- Neutralised (claim always succeeds) → **2 tests fail**, both refusal tests. The
+  refusal is measured.
+- Over-broadened (claim always refuses) → **26 tests fail**, 24 of them written
+  months earlier for unrelated reasons (`blocked_by` guards, open-PR guards, the
+  per-turn dispatch counter, `long_running` dispatch). The nominal path is
+  genuinely covered — an over-refusing claim gets caught by other people's tests.
+
+AC7's token gate was checked the same way: a planted `//` comment does NOT trip
+it (line comments are stripped by design), a planted code literal DOES.
+
+## Acceptance criteria
+
+Verbatim from the ticket body (§ 3 above maps each to its implementation).
+Version numbers in AC1 reflect D1.
+
+- [x] **AC1** — Schema migration adds `tasks.dispatcher_source TEXT` nullable with CHECK constraint `IN ('mika_dev', 'mika_manager', 'operator')`. Pre-migration rows stay NULL (treated as `'mika_dev'` via `COALESCE` for backward compat with existing autonomous-loop invocations). *(v50 → v51 per D1; fresh-DB `CREATE TABLE` carries the column; idempotency + baseline-bail tested.)*
+- [x] **AC2** — `has_active_callback_tasks_excluding` rejection payload gains a `blocking_dispatcher_source` field. Test verifies: given two tasks in the same class with sources `mika_dev` and `mika_manager`, the second-attempted dispatch is rejected naming the blocking source. *(Plus: a NULL source reports as JSON `null`, never a fabricated default.)*
+- [x] **AC3** — `promote_pending_deferred_if_idle()` skips promotion when a pending task with `dispatcher_source = 'operator'` exists in the same class. Test seeds a deferred wrapper + a pending operator task and asserts the wrapper is NOT promoted; the anti-vacuity twin asserts it IS promoted with no operator task pending.
+- [x] **AC4** — `check_lineage_cycle()` extension: a `mika_manager` dispatch re-entering a `mika_manager` lineage on the same `(repo, issue)` is rejected regardless of skill. Includes `test_check_lineage_cycle_null_dispatcher_source_fail_open` (F2) and twins proving `mika_dev` and mixed-source lineages are untouched.
+- [x] **AC5** — Contention observability is threaded into the manager's `Assessment` via a typed `contention_events` list, with `#[serde(default)]` (F3) so pre-Porte-2 blobs still deserialize and an empty list serializes as `[]`, not `null`. Scaffolding-only: Phase 1 never populates it.
+- [x] **AC6** — `Reporter` renders a `### Dispatch contention` section when `contention_events` is non-empty, silent otherwise. Tests cover rendered, silent, and unknown-source cases.
+- [x] **AC7** — `no_dispatch_test.rs` FORBIDDEN_TOKENS forbids writing `dispatcher_source = 'mika_manager'` from any file under `milestone_manager/**`, in both SQL and Rust literal forms — the Phase-2-promotion invariant lock. Verified non-vacuous by planting a violation.
+- [x] **AC8** — Integration test (`tests/dispatcher_contention.rs`, gated behind `#[ignore]` + `MIKA_MANAGER_CONTENTION_TEST=1`): three dispatchers race for the same slot across seeded tickets; asserts no double-dispatch, no deadlock, each ticket claimed exactly once, and that the loser learns who holds the slot.
+- [x] **AC9** — `crates/mika-agent/CLAUDE.md § Unified Task Engine` gains a "Dispatcher-source arbitration" subsection documenting the three sources, the claim-vs-check distinction, the operator-priority rule, the cycle-check extension, and the explicit contrast with the mika#2084 seat label.
+- [ ] **AC10** — `mika-platform/docs/brainstorms/2026-08-21-mika-manager-de-milestones-design-brief.md` § 3 Porte 2 updated to `**Statut : DISCHARGED**`. **POST-MERGE, cross-repo** — that file lives in the meta-repo, outside this worktree. Reminder carried by the PR title and a `// FIXME(mika#1948-AC10)` marker beside `migrate_v50_to_v51` (F4).

@@ -4806,6 +4806,12 @@ impl Database {
     /// ticket that belongs to another engine; this arbitrates the exec slot among
     /// the dispatchers of one engine. Neither subsumes the other, and they are
     /// deliberately not merged into one column.
+    // FIXME(mika#1948-AC10): once this PR merges, update
+    // `mika-platform/docs/brainstorms/2026-08-21-mika-manager-de-milestones-design-brief.md`
+    // § 3 Porte 2 to `**Statut : DISCHARGED**`, naming this ticket and PR. That
+    // file lives in the meta-repo, outside this worktree, so it cannot be
+    // touched here — this marker is the searchable reminder that survives the
+    // squash. Remove it in the follow-up commit that lands the doc update.
     fn migrate_v50_to_v51(&mut self) -> Result<()> {
         let version = self.schema_version()?;
         if version >= 51 {
