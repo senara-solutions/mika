@@ -855,5 +855,99 @@ class HostSocketLifecycleTests(unittest.TestCase):
         self.assertIsNone(host.poll(), "host proxy should still be running")
 
 
+# ---------------------------------------------------------------------------
+# Readiness-probe vs. genuine error (mika#2042)
+#
+# dispatch-lib.sh's `_pilot_egress_sock_connectable` (and the sandbox's bounded
+# --sandbox-tcp wait loop) probe the proxy before every dispatch with a bare
+# connect + close: no CONNECT line is ever sent. The proxy answered that
+# already-gone peer with a 400, the write's drain raised `Connection lost`, and
+# the `except Exception` sink logged `[egress] ERROR unknown: Connection lost`.
+# 1045 of 2747 [egress] lines were this one benign non-event, and they were
+# read as a broken transport during mika#2029. These tests fence both halves of
+# the fix: the probe stops crying ERROR, and a peer that DID speak still does.
+# ---------------------------------------------------------------------------
+
+
+class ReadinessProbeVsErrorTests(unittest.IsolatedAsyncioTestCase):
+    class _Writer:
+        """StreamWriter stand-in. `fail_drain` reproduces a peer that has
+        already closed: the 400 write lands, the drain that follows raises."""
+
+        def __init__(self, fail_drain: bool = False) -> None:
+            self.chunks: list[bytes] = []
+            self._fail_drain = fail_drain
+            self.closed = False
+
+        def write(self, data: bytes) -> None:
+            self.chunks.append(bytes(data))
+
+        async def drain(self) -> None:
+            if self._fail_drain:
+                raise ConnectionResetError("Connection lost")
+
+        def close(self) -> None:
+            self.closed = True
+
+    async def _run(self, reader, writer) -> list[str]:
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            await proxy.handle_host_client(reader, writer)
+        return buffer.getvalue().splitlines()
+
+    async def test_connect_then_close_emits_no_error(self) -> None:
+        # The exact 1045-line shape: EOF before a single request byte, and a
+        # peer already gone so even the 400 cannot be delivered.
+        before = proxy._readiness_probe_count
+        lines = await self._run(_reader_of(), self._Writer(fail_drain=True))
+        self.assertEqual(lines, [], f"benign probe must be silent, got {lines}")
+        # Silenced, but not swallowed: it is counted, so the fix is not merely
+        # taping over the log. (Anti-vacuity, counter half.)
+        self.assertEqual(proxy._readiness_probe_count, before + 1)
+
+    async def test_malformed_connect_still_emits_one_error(self) -> None:
+        # A peer that DID speak — a malformed CONNECT line — then dropped. A
+        # genuine client/transport error: it must keep its single ERROR line,
+        # or the fix would just be silencing everything. (Anti-vacuity.)
+        before = proxy._readiness_probe_count
+        lines = await self._run(
+            _reader_of(b"CONNECT nonsense\r\n\r\n"),
+            self._Writer(fail_drain=True),
+        )
+        errors = [line for line in lines if line.startswith("[egress] ERROR")]
+        self.assertEqual(len(errors), 1, f"expected one ERROR, got {lines}")
+        # And it was NOT miscounted as a readiness probe.
+        self.assertEqual(proxy._readiness_probe_count, before)
+
+    async def test_truncated_request_after_bytes_is_not_the_probe(self) -> None:
+        # Bytes arrived and then the stream truncated before the blank line:
+        # the peer spoke, so this is not the no-CONNECT probe. It must not be
+        # counted as one; a reset while answering still surfaces as ERROR.
+        before = proxy._readiness_probe_count
+        lines = await self._run(
+            _reader_of(b"CONNECT api.github.com:443\r\nHost: x"),
+            self._Writer(fail_drain=True),
+        )
+        self.assertEqual(proxy._readiness_probe_count, before)
+        self.assertTrue(
+            any(line.startswith("[egress] ERROR") for line in lines), lines
+        )
+
+    async def test_probe_is_surfaced_as_debug_never_error(self) -> None:
+        # With the debug gate on, the same benign event is visible as a DEBUG
+        # aggregate carrying the running count — never as ERROR.
+        before_count = proxy._readiness_probe_count
+        before_flag = proxy._EGRESS_DEBUG
+        proxy._EGRESS_DEBUG = True
+        try:
+            lines = await self._run(_reader_of(), self._Writer())
+        finally:
+            proxy._EGRESS_DEBUG = before_flag
+        joined = "\n".join(lines)
+        self.assertIn("[egress] DEBUG readiness-probe", joined)
+        self.assertNotIn("ERROR", joined)
+        self.assertEqual(proxy._readiness_probe_count, before_count + 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, argv=[sys.argv[0]])
