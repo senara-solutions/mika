@@ -893,7 +893,10 @@ class ReadinessProbeVsErrorTests(unittest.IsolatedAsyncioTestCase):
         buffer = io.StringIO()
         with contextlib.redirect_stderr(buffer):
             await proxy.handle_host_client(reader, writer)
-        return buffer.getvalue().splitlines()
+        # mika#2030: strip (and assert) the ISO-8601 stamp `_log` prepends, so
+        # these `startswith("[egress] ...")` classifications read against the
+        # message body — and AC1 (every line stamped) is enforced here too.
+        return _strip_ts(self, buffer.getvalue().splitlines())
 
     async def test_connect_then_close_emits_no_error(self) -> None:
         # The exact 1045-line shape: EOF before a single request byte, and a

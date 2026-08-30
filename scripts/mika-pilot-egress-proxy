@@ -402,10 +402,9 @@ def _note_readiness_probe() -> None:
     global _readiness_probe_count
     _readiness_probe_count += 1
     if _EGRESS_DEBUG:
-        print(
+        _log(
             "[egress] DEBUG readiness-probe (connect+close, no CONNECT) "
-            f"count={_readiness_probe_count}",
-            file=sys.stderr, flush=True,
+            f"count={_readiness_probe_count}"
         )
 
 
