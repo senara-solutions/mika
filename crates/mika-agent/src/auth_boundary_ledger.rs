@@ -55,26 +55,52 @@ impl DbAuthBoundaryLedger {
     }
 }
 
+/// Perform the write and swallow its failure. The whole body of
+/// [`DbAuthBoundaryLedger::record`], factored out so a test can drive it
+/// deterministically instead of racing a detached task.
+pub async fn write_and_swallow(db: &AsyncDatabase, err: &AuthBoundaryError) {
+    if let Err(e) = db.record_auth_boundary(err).await {
+        // WARN, not ERROR: the request outcome is correct either way. What is
+        // lost is one row of operator visibility, and this line is the record
+        // that it was lost.
+        warn!(
+            target: "mika::auth_boundary",
+            event = "auth_boundary_audit_write_failed",
+            token_name = %err.token_name,
+            boundary = %err.boundary_key(),
+            kind = %err.kind,
+            error = %e,
+            "could not record auth-boundary failure in audit_events — the refusal itself stands"
+        );
+    }
+}
+
 impl AuthBoundaryLedger for DbAuthBoundaryLedger {
     fn record(&self, err: AuthBoundaryError) {
+        // `tokio::spawn` PANICS outside a runtime, and `record` is a plain sync
+        // `fn` whose contract says it never fails visibly. Every call site
+        // today is inside an async fn, so an unguarded spawn would be correct
+        // by circumstance — and the first synchronous caller (config
+        // validation, a non-async refusal path) would turn an audit write into
+        // a process panic on an authentication path. The guard makes the
+        // structural claim in this module's docs true rather than lucky.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            warn!(
+                target: "mika::auth_boundary",
+                event = "auth_boundary_audit_write_skipped",
+                token_name = %err.token_name,
+                boundary = %err.boundary_key(),
+                kind = %err.kind,
+                reason = "no_tokio_runtime",
+                "no async runtime on this thread — auth-boundary row not written; the refusal itself stands"
+            );
+            return;
+        };
         let db = self.db.clone();
         // Detached on purpose. The caller is on an authentication path; the
         // row is bookkeeping about a decision already made.
-        tokio::spawn(async move {
-            if let Err(e) = db.record_auth_boundary(&err).await {
-                // WARN, not ERROR: the request outcome is correct either way.
-                // What is lost is one row of operator visibility, and this line
-                // is the record that it was lost.
-                warn!(
-                    target: "mika::auth_boundary",
-                    event = "auth_boundary_audit_write_failed",
-                    token_name = %err.token_name,
-                    boundary = %err.boundary_key(),
-                    kind = %err.kind,
-                    error = %e,
-                    "could not record auth-boundary failure in audit_events — the refusal itself stands"
-                );
-            }
+        handle.spawn(async move {
+            write_and_swallow(&db, &err).await;
         });
     }
 }
@@ -140,26 +166,50 @@ mod tests {
 
     /// R5, with the failure actually injected rather than argued.
     ///
-    /// The real ledger is pointed at an `agent_id` with no row in `agents`, so
-    /// the INSERT trips the foreign key and the audit write genuinely fails.
-    /// The caller must still return normally, and the process must not panic —
-    /// which is what the join on the detached task confirms.
+    /// The ledger is pointed at an `agent_id` with no row in `agents`, so the
+    /// INSERT trips the foreign key and the audit write genuinely fails.
+    ///
+    /// This drives `write_and_swallow` — the *whole body* of the detached task
+    /// — directly, and awaits it. An earlier version spawned through `record`
+    /// and relied on a single `yield_now`, which proved nothing: the write is
+    /// dispatched to the dedicated `mika-db` OS thread, so one yield normally
+    /// returns long before the failing code runs, and a panic inside a
+    /// detached `tokio::spawn` is captured in the dropped `JoinHandle` and
+    /// never surfaces. A test that cannot fail is not a test.
     #[tokio::test]
-    async fn an_audit_write_failure_does_not_reach_the_caller() {
+    async fn an_audit_write_failure_is_swallowed_not_propagated() {
         let db = crate::async_db::AsyncDatabase::new_with_agent(
             crate::db::Database::open_in_memory().unwrap(),
             "no-such-agent",
         );
-        // The write itself must fail — otherwise this test proves nothing.
+        // Precondition: without this the rest asserts nothing.
         assert!(
             db.record_auth_boundary(&err()).await.is_err(),
-            "precondition: the FK violation must make the audit write fail"
+            "the FK violation must make the audit write fail"
         );
 
+        // The real body, awaited to completion. It returns `()`; there is no
+        // error for a caller to receive, and no panic escapes.
+        write_and_swallow(&db, &err()).await;
+    }
+
+    /// The sync contract holds off-runtime too: `record` must not panic when
+    /// there is no Tokio runtime on the thread.
+    ///
+    /// Uses a plain `#[test]` deliberately — `#[tokio::test]` would install the
+    /// very runtime whose absence is the thing under test.
+    #[test]
+    fn record_outside_a_runtime_warns_instead_of_panicking() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = rt.block_on(async {
+            crate::async_db::AsyncDatabase::new_with_agent(
+                crate::db::Database::open_in_memory().unwrap(),
+                "mika",
+            )
+        });
         let ledger: Arc<dyn AuthBoundaryLedger> = Arc::new(DbAuthBoundaryLedger::new(db));
+        // No runtime entered here. Before the `Handle::try_current` guard this
+        // line panicked.
         record_if_wired(Some(&ledger), &err());
-        // Let the detached task run to completion; a panic there would abort
-        // the test runtime.
-        tokio::task::yield_now().await;
     }
 }

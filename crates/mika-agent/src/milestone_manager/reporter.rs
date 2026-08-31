@@ -49,6 +49,26 @@ use std::fmt::Write;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthBoundaryNote {
     pub error: AuthBoundaryError,
+    /// How loudly this note reads — and **only** that.
+    ///
+    /// # This does not re-route the report
+    ///
+    /// A note at `Blocked` does not set `CycleOutcome::severity`, does not
+    /// reach `select_route`, and does not send the report to
+    /// `MIKA_MANAGER_ESCALATION_URL`. Said plainly so no reader mistakes the
+    /// label for a routing effect.
+    ///
+    /// The reason is not an oversight: `select_route` authenticates the
+    /// escalation route with **the same** `cfg.delivery_token` as the normal
+    /// route (`cadence.rs`). When the note says that credential is dead,
+    /// re-routing on it would send the escalation through the identical closed
+    /// door — a louder report delivered to nobody, plus the false impression
+    /// that Vincent's direct channel had fired. The escalation that *is*
+    /// wired for a persistent auth failure is `emit_auth_alarm`
+    /// (mika#2013 volet B), which carries its own ERROR log as the floor.
+    ///
+    /// Giving a dead credential its own route means giving that route its own
+    /// credential; that is a Phase 3 question, not a rendering one.
     pub severity: Severity,
 }
 

@@ -138,6 +138,19 @@ pub enum DeliveryFailureKind {
 pub struct DeliveryError {
     pub kind: DeliveryFailureKind,
     pub message: String,
+    /// The underlying transport error, kept as a `source` rather than flattened
+    /// into `message`.
+    ///
+    /// `reqwest::Error`'s own `Display` is generic — "error sending request for
+    /// url (...)" — and the actionable half (DNS failure, TLS handshake,
+    /// connection refused) lives in *its* source chain. Before mika#1949 the
+    /// `?` operator carried that chain into `anyhow` for free; flattening it
+    /// with `format!` would have thrown away exactly the transport
+    /// diagnosability this ticket exists to add, on the way to adding
+    /// credential diagnosability. `{:#}` on the resulting `anyhow::Error` now
+    /// renders both halves.
+    #[source]
+    pub source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
 }
 
 impl DeliveryError {
@@ -149,6 +162,20 @@ impl DeliveryError {
         anyhow::Error::new(Self {
             kind,
             message: message.into(),
+            source: None,
+        })
+    }
+
+    /// As [`DeliveryError::raise`], preserving the underlying transport error.
+    pub fn raise_from(
+        kind: DeliveryFailureKind,
+        message: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            kind,
+            message: message.into(),
+            source: Some(Box::new(source)),
         })
     }
 }
@@ -166,15 +193,33 @@ impl DeliveryError {
 /// distinction is drawn where it is actually diagnostic: the far side refused
 /// us, and the reason is that we presented nothing, presented blank, or
 /// presented something it did not accept.
+///
+/// # Why `var_is_set` is a separate argument
+///
+/// `ManagerConfig::delivery_token` cannot tell unset from set-and-blank:
+/// `read_string_env` (`spawn.rs`) maps `Ok(v) if !v.trim().is_empty()` and
+/// collapses everything else to `None`. Reading only that field would report a
+/// `MIKA_MANAGER_DELIVERY_TOKEN=""` as `Missing` — telling the operator the
+/// variable is not configured when in fact it is configured with a lost value.
+/// Those are two different fixes, which is the entire reason `Empty` is a
+/// distinct kind. The caller supplies the raw presence of the variable so the
+/// distinction survives; passing it in rather than reading the environment
+/// here keeps the function pure and testable.
 pub(crate) fn classify_delivery_auth(
     token: Option<&str>,
+    var_is_set: bool,
     outcome: &Result<()>,
 ) -> Option<AuthBoundaryError> {
     let err = outcome.as_ref().err()?;
     let delivery = err.downcast_ref::<DeliveryError>()?;
     let kind = match delivery.kind {
         DeliveryFailureKind::CredentialRefused => match token {
+            // The config dropped it. Set-but-blank is `Empty`; genuinely
+            // absent is `Missing`.
+            None if var_is_set => AuthBoundaryKind::Empty,
             None => AuthBoundaryKind::Missing,
+            // Defensive: a `ManagerConfig` built directly (tests, future
+            // callers) can still carry a blank string.
             Some(t) if t.trim().is_empty() => AuthBoundaryKind::Empty,
             Some(_) => AuthBoundaryKind::Rejected,
         },
@@ -219,9 +264,11 @@ impl ReportDeliverer for HttpReportDeliverer {
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
-        // mika#1949 U3: the failure keeps its class. The message text is
-        // unchanged from before this ticket — only a downcastable cause was
-        // added underneath it.
+        // mika#1949 U3: the failure keeps its class, and the transport error
+        // keeps its own source chain. The non-2xx message text is unchanged
+        // from before this ticket; the transport arm gains a `delivery failed:`
+        // prefix it did not have, because it previously travelled as a bare
+        // `?`-propagated `reqwest::Error`.
         let res = match req.send().await {
             Ok(r) => r,
             Err(e) => {
@@ -230,7 +277,11 @@ impl ReportDeliverer for HttpReportDeliverer {
                 } else {
                     DeliveryFailureKind::Other
                 };
-                return Err(DeliveryError::raise(kind, format!("delivery failed: {e}")));
+                return Err(DeliveryError::raise_from(
+                    kind,
+                    format!("delivery failed: {e}"),
+                    e,
+                ));
             }
         };
         if !res.status().is_success() {
@@ -420,7 +471,11 @@ pub async fn run_manager_cycle_in(
                 // mika#1949 U3 — read the outcome as an auth-boundary event
                 // before consuming it, and record it. Fire-and-forget: the
                 // delivery's own handling below is untouched by this.
-                if let Some(err) = classify_delivery_auth(token.as_deref(), &outcome) {
+                if let Some(err) = classify_delivery_auth(
+                    token.as_deref(),
+                    std::env::var(crate::milestone_manager::spawn::ENV_DELIVERY_TOKEN).is_ok(),
+                    &outcome,
+                ) {
                     crate::auth_boundary_ledger::record_if_wired(ctx.auth_ledger, &err);
                     auth_boundary = Some(err);
                 }
@@ -966,7 +1021,7 @@ mod tests {
 
     #[test]
     fn a_refusal_with_no_token_reads_as_missing() {
-        let got = classify_delivery_auth(None, &refused()).expect("an auth event");
+        let got = classify_delivery_auth(None, false, &refused()).expect("an auth event");
         assert_eq!(got.kind, AuthBoundaryKind::Missing);
         assert_eq!(got.token_name, "MIKA_MANAGER_DELIVERY_TOKEN");
         assert_eq!(got.boundary_key(), "manager_to_delivery");
@@ -974,7 +1029,7 @@ mod tests {
 
     #[test]
     fn a_refusal_with_a_blank_token_reads_as_empty() {
-        let got = classify_delivery_auth(Some("   "), &refused()).expect("an auth event");
+        let got = classify_delivery_auth(Some("   "), true, &refused()).expect("an auth event");
         assert_eq!(
             got.kind,
             AuthBoundaryKind::Empty,
@@ -984,7 +1039,8 @@ mod tests {
 
     #[test]
     fn a_refusal_with_a_real_token_reads_as_rejected() {
-        let got = classify_delivery_auth(Some("something"), &refused()).expect("an auth event");
+        let got =
+            classify_delivery_auth(Some("something"), true, &refused()).expect("an auth event");
         assert_eq!(got.kind, AuthBoundaryKind::Rejected);
     }
 
@@ -998,7 +1054,9 @@ mod tests {
             "delivery failed: 403 Forbidden — ",
         ));
         assert_eq!(
-            classify_delivery_auth(Some("t"), &outcome).unwrap().kind,
+            classify_delivery_auth(Some("t"), true, &outcome)
+                .unwrap()
+                .kind,
             AuthBoundaryKind::Rejected
         );
     }
@@ -1009,7 +1067,7 @@ mod tests {
             DeliveryFailureKind::Unreachable,
             "delivery failed: connection refused",
         ));
-        let got = classify_delivery_auth(None, &outcome).expect("an auth event");
+        let got = classify_delivery_auth(None, false, &outcome).expect("an auth event");
         assert_eq!(
             got.kind,
             AuthBoundaryKind::Unreachable,
@@ -1024,19 +1082,19 @@ mod tests {
     /// it looks like coverage.
     #[test]
     fn success_and_non_auth_failures_produce_no_row() {
-        assert!(classify_delivery_auth(None, &Ok(())).is_none());
-        assert!(classify_delivery_auth(Some("t"), &Ok(())).is_none());
+        assert!(classify_delivery_auth(None, false, &Ok(())).is_none());
+        assert!(classify_delivery_auth(Some("t"), true, &Ok(())).is_none());
 
         let five_hundred: Result<()> = Err(DeliveryError::raise(
             DeliveryFailureKind::Other,
             "delivery failed: 500 Internal Server Error — ",
         ));
-        assert!(classify_delivery_auth(Some("t"), &five_hundred).is_none());
+        assert!(classify_delivery_auth(Some("t"), true, &five_hundred).is_none());
 
         // An error that is not a DeliveryError at all — e.g. raised upstream of
         // the sink — carries no class and must not be guessed at.
         let untyped: Result<()> = Err(anyhow::anyhow!("something else entirely"));
-        assert!(classify_delivery_auth(Some("t"), &untyped).is_none());
+        assert!(classify_delivery_auth(Some("t"), true, &untyped).is_none());
     }
 
     /// `Invalid` is a real kind of [`AuthBoundaryKind`] and this boundary never
@@ -1055,7 +1113,7 @@ mod tests {
                 Err(DeliveryError::raise(DeliveryFailureKind::Other, "x")),
                 Ok(()),
             ] {
-                if let Some(got) = classify_delivery_auth(token, &outcome) {
+                if let Some(got) = classify_delivery_auth(token, true, &outcome) {
                     assert_ne!(got.kind, AuthBoundaryKind::Invalid);
                 }
             }
@@ -1147,6 +1205,73 @@ mod tests {
         assert!(
             !outcome.auth_attempted,
             "writing to a local directory presents no token"
+        );
+    }
+
+    /// Finding from review: `Empty` was unreachable on the only production
+    /// path, because `read_string_env` collapses a blank variable to `None`
+    /// before the config is built. The operator was then told the variable is
+    /// **not configured** when it is configured with a lost value — two
+    /// different fixes, which is the entire reason `Empty` exists as a kind.
+    #[test]
+    fn a_blank_variable_dropped_by_the_config_still_reads_as_empty() {
+        // What `manager_config_from_env` actually produces for
+        // `MIKA_MANAGER_DELIVERY_TOKEN=""`: token `None`, variable present.
+        let got = classify_delivery_auth(None, true, &refused()).expect("an auth event");
+        assert_eq!(
+            got.kind,
+            AuthBoundaryKind::Empty,
+            "set-but-blank must not be reported as never-set"
+        );
+
+        // And the genuinely-unset case is still `Missing`.
+        assert_eq!(
+            classify_delivery_auth(None, false, &refused())
+                .unwrap()
+                .kind,
+            AuthBoundaryKind::Missing
+        );
+    }
+
+    /// Finding from review: flattening `reqwest::Error` into the message threw
+    /// away its source chain — the half that names DNS vs TLS vs connection
+    /// refused. On a ticket about telling transport apart from credential,
+    /// that was the transport half.
+    #[tokio::test]
+    async fn a_transport_failure_keeps_its_source_chain() {
+        let deliverer = HttpReportDeliverer::new();
+        let body = DeliveryBody {
+            milestone_ref: base_state().milestone_ref.clone(),
+            severity: Severity::Healthy,
+            report_markdown: String::new(),
+            assessment: crate::milestone_manager::types::Assessment {
+                severity: Severity::Healthy,
+                recommendation: crate::milestone_manager::types::Recommendation {
+                    next_sub_issue: None,
+                    rationale: String::new(),
+                },
+                alerts: vec![],
+                cross_cutting: vec![],
+                contention_events: vec![],
+            },
+            generated_at: String::new(),
+            cycle_kind: CycleKind::Event,
+        };
+        // Port 1 on loopback: nothing listens, so this is a connect failure.
+        let err = deliverer
+            .deliver("http://127.0.0.1:1/report", Some("t"), &body)
+            .await
+            .expect_err("nothing listens on port 1");
+
+        let flat = format!("{err}");
+        let chained = format!("{err:#}");
+        assert!(
+            chained.len() > flat.len(),
+            "the transport cause must survive as a source: flat={flat:?} chained={chained:?}"
+        );
+        assert_eq!(
+            err.downcast_ref::<DeliveryError>().map(|d| d.kind),
+            Some(DeliveryFailureKind::Unreachable)
         );
     }
 }

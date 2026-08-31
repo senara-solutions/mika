@@ -35,6 +35,7 @@ use super::reader::{GhRunner, ProcessGhRunner};
 use super::reporter::{AuthBoundaryNote, AuthBoundaryTracker};
 use super::types::MilestoneRef;
 use crate::auth_boundary_ledger::AuthBoundaryLedger;
+use mika_common::auth_boundary::AuthBoundaryError;
 use mika_common::config::Settings;
 use mika_common::github_app::GitHubApp;
 use serde::Serialize;
@@ -423,7 +424,29 @@ pub fn spawn_manager_cycle_task(
                     // run — 401 or, since mika#2063, 403 — now escalates instead of
                     // scrolling past as another WARN.
                     if let Some(alarm) = auth_tracker.on_failure(auth_class, Instant::now()) {
-                        emit_auth_alarm(&cfg, &alarm, &alarm_sink, auth_ledger.as_ref()).await;
+                        let emission =
+                            emit_auth_alarm(&cfg, &alarm, &alarm_sink, auth_ledger.as_ref()).await;
+                        // The escalation channel must be able to escalate about
+                        // itself: fold its own auth failure into the same
+                        // counter and the same report the report-delivery path
+                        // uses.
+                        if let Some(err) = emission.auth_boundary {
+                            pending_auth_notes.push(boundary_tracker.observe(err));
+                        }
+                        // Whether the alarm actually left the box was returned
+                        // and discarded before mika#1949. `emit_auth_alarm`
+                        // already logs both arms, but neither line carries the
+                        // cycle's `auth_class`, so a reader grepping
+                        // `manager_cycle_error` could not tell a surfaced alarm
+                        // from one that only reached the local log.
+                        info!(
+                            target: "mika::milestone_manager",
+                            event = "manager_auth_alarm_emitted",
+                            milestone = %cfg.target.as_display(),
+                            auth_class = auth_class.as_str(),
+                            escalated = emission.escalated,
+                            "persistent-auth-failure alarm emitted"
+                        );
                     }
                 }
             }
@@ -989,12 +1012,26 @@ impl AuthAlarmSink for HttpAuthAlarmSink {
 /// `escalation_url` is configured. Returns whether the escalation was
 /// delivered (`false` when unset or when the POST failed — the ERROR log is
 /// the floor, the escalation is the amplifier).
+/// Outcome of an alarm emission: whether the escalation was delivered, and any
+/// auth-boundary failure the attempt itself ran into (mika#1949 U3).
+///
+/// The second half exists because the escalation channel is the one place this
+/// module argues silence is worst — and before it, a refused escalation
+/// credential wrote an audit row and nothing else: the repeat counter never
+/// advanced, no note ever reached a report, and the failure was visible only to
+/// someone who thought to run the SQL by hand. The channel that escalates for
+/// everyone else could not escalate about itself.
+pub(crate) struct AlarmEmission {
+    pub escalated: bool,
+    pub auth_boundary: Option<AuthBoundaryError>,
+}
+
 async fn emit_auth_alarm(
     cfg: &ManagerConfig,
     alarm: &AuthAlarm,
     sink: &dyn AuthAlarmSink,
     auth_ledger: Option<&Arc<dyn AuthBoundaryLedger>>,
-) -> bool {
+) -> AlarmEmission {
     error!(
         target: "mika::milestone_manager",
         event = "manager_auth_persistent_failure",
@@ -1008,7 +1045,12 @@ async fn emit_auth_alarm(
 
     let url = match cfg.escalation_url.as_deref() {
         Some(u) if !u.is_empty() => u,
-        _ => return false,
+        _ => {
+            return AlarmEmission {
+                escalated: false,
+                auth_boundary: None,
+            };
+        }
     };
 
     let body = AuthAlarmBody {
@@ -1024,10 +1066,15 @@ async fn emit_auth_alarm(
     // mika#1949 U3 — the alarm escalation crosses the same manager-to-delivery
     // boundary as the report, on the same credential. An escalation that
     // itself failed to authenticate is the worst place for silence.
-    if let Some(err) = classify_delivery_auth(cfg.delivery_token.as_deref(), &outcome) {
-        crate::auth_boundary_ledger::record_if_wired(auth_ledger, &err);
+    let auth_boundary = classify_delivery_auth(
+        cfg.delivery_token.as_deref(),
+        env::var(ENV_DELIVERY_TOKEN).is_ok(),
+        &outcome,
+    );
+    if let Some(err) = auth_boundary.as_ref() {
+        crate::auth_boundary_ledger::record_if_wired(auth_ledger, err);
     }
-    match outcome {
+    let escalated = match outcome {
         Ok(()) => {
             info!(
                 target: "mika::milestone_manager",
@@ -1047,6 +1094,10 @@ async fn emit_auth_alarm(
             );
             false
         }
+    };
+    AlarmEmission {
+        escalated,
+        auth_boundary,
     }
 }
 
@@ -2362,7 +2413,7 @@ mod tests {
             consecutive_cycles: 7,
         };
 
-        let escalated = emit_auth_alarm(&cfg, &alarm, &sink, None).await;
+        let escalated = emit_auth_alarm(&cfg, &alarm, &sink, None).await.escalated;
         assert!(escalated, "configured escalation_url must be used");
 
         let sent = sink.sent.lock().unwrap();
@@ -2393,7 +2444,7 @@ mod tests {
             consecutive_cycles: 7,
         };
 
-        let escalated = emit_auth_alarm(&cfg, &alarm, &sink, None).await;
+        let escalated = emit_auth_alarm(&cfg, &alarm, &sink, None).await.escalated;
         assert!(escalated, "configured escalation_url must be used");
 
         let sent = sink.sent.lock().unwrap();
@@ -2423,7 +2474,7 @@ mod tests {
             consecutive_cycles: 7,
         };
 
-        let escalated = emit_auth_alarm(&cfg, &alarm, &sink, None).await;
+        let escalated = emit_auth_alarm(&cfg, &alarm, &sink, None).await.escalated;
         assert!(!escalated);
         assert!(sink.sent.lock().unwrap().is_empty());
     }
