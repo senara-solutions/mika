@@ -593,3 +593,62 @@ test_ci_success_handler). The cascade test (step 4) does NOT run on CI (gated
   `main` today because the fail-closed default already treats
   `milestone_manager/**` as DECISION-CORE. Removing the fail-closed default (a
   regression) would flip them red.
+
+## 9. Decisions taken at implementation time
+
+The plan flagged three open points and left one class of question to the
+implementer. All four were resolved without a route-back; recording them here so
+the reasoning travels with the plan rather than living only in the PR.
+
+- **R1 / § 2 option A vs B — resolved as A (plan default).** AC3/AC4 assert the
+  audit-event names the code actually emits (`verdict_handler_human_gate_required`,
+  `ci_success_handler_human_gate_required`), not the ticket body's idealised
+  `tool_name = 'perimeter_gate'` / `target_key = 'decision_core_block'`. Option B
+  would rename two constants and break any operator grep standing on them, for a
+  literal-string match that adds no gate strength.
+- **R2 — moot.** `ci_success_handler::try_handle_ci_success` is already `pub`
+  (`ci_success_handler.rs:109`). No API promotion was needed.
+- **R3 — resolved.** `AsyncDatabase::count_audit_events_by_tool_name`
+  (`async_db.rs:968`) is the accessor; no new DB method.
+- **AC4's Layer B is not reachable from the eval environment.** `try_handle_ci_success`
+  resolves the open PR (`find_open_pr`, step 2) *before* the perimeter block at step
+  5c, and `gh` does not resolve in tests, so the handler returns `Passthrough` before
+  the classifier is consulted. Reaching the branch means injecting a seam into
+  `perimeter::fetch`, which § 3 excludes. AC4 therefore asserts (a) the classifier
+  verdict on the manager surface, (b) that the handler issues no merge on this path,
+  and (c) **structurally, against the pinned source**, that `classify_pr_files`, the
+  fail-closed clause, and the gate's audit row all precede `run_gh_merge(` inside the
+  function body. (c) is the invariant AC4 is really about: mika#1851 was not a wrong
+  verdict, it was a merge that ran before any verdict existed.
+
+## 10. Finding surfaced during implementation
+
+`MECHANICAL_CONTAINS` grants MECHANICAL to any path containing `/tests/`
+(`perimeter/rules.rs`). A future `crates/mika-agent/src/milestone_manager/tests/foo.rs`
+would therefore classify MECHANICAL and be auto-mergeable — inside the exact module
+Porte 1 exists to gate. Narrowing the `/tests/` rule is out of scope (`rules.rs` is
+DECISION-CORE and § 3 excludes reworking the classifier), so the hole is closed
+structurally instead: `milestone_manager_has_no_nested_tests_directory` asserts no such
+directory exists, and pins the `/tests/` rule it depends on so the test announces itself
+as obsolete if that rule ever changes. The manager's test code lives beside the module
+files (`no_dispatch_test.rs`), which is what the assertion keeps true.
+
+## Acceptance criteria
+
+Transcribed verbatim from the mika#1947 issue body.
+
+- [ ] **AC1** — `no_dispatch_test.rs` (or new `perimeter_boundary_test.rs`) asserts NONE of `MECHANICAL_PREFIXES` / `MECHANICAL_EXACT` covers `src/milestone_manager/` or any subpath. Test is added to the standard `cargo test -p mika-agent` invocation (no `#[ignore]`).
+- [ ] **AC2** — Unit test in `crates/mika-agent/src/perimeter/tests.rs`: `classify_pr_files(&["crates/mika-agent/src/milestone_manager/reader.rs"])` returns `Classification::DecisionCore` with the file listed in `decision_core_files`.
+- [ ] **AC3** — Unit test in `crates/mika-agent/src/server/verdict_handler.rs` (`tests/eval/test_verdict_handler.rs`): given a mock PR touching `src/milestone_manager/**` + APPROVED review with `VERDICT: pass`, `handle_pass_verdict` returns `hold` action (not `merge`), writes `audit_events` with `target_key = 'decision_core_block'`, and posts a `hold[human_review]` metadata note.
+- [ ] **AC4** — Unit test in `crates/mika-agent/src/server/ci_success_handler.rs`: given a mock `check_suite.completed(success)` for a PR touching `src/milestone_manager/**`, `ci_success_handler` blocks auto-merge with the same audit-event shape as AC3.
+- [ ] **AC5** — Integration test `crates/mika-agent/tests/eval/manager_loop_resistance.rs` (gated `#[ignore]` + `MIKA_MANAGER_LOOP_RESISTANCE_TEST=1`): simulates the full cascade `milestone_manager_report → hypothetical_dispatch → PR_open → CI_success → callback` and asserts the callback CANNOT enqueue a follow-up dispatch targeting `src/milestone_manager/**`. Uses `EvalHarness`.
+- [ ] **AC6** — `crates/mika-agent/src/milestone_manager/mod.rs` docstring updated: the Phase 2 gate note (`Phase 2 promotion (NOT wired here)`) explicitly names this ticket as the Porte 1 discharge condition, and lists the three test artifacts (AC1/AC5) as proof.
+- [ ] **AC7** — `mika-platform/docs/brainstorms/2026-08-21-mika-manager-de-milestones-design-brief.md § 3 Porte 1` updated with a "**Statut : DISCHARGED**" line naming this ticket + PR + test-file paths.
+- [ ] **AC8** — Post-merge verification (operator-driven, listed in PR body): `cargo test -p mika-agent perimeter` and `cargo test -p mika-agent no_dispatch` both pass on `main`; grep `audit_events` post-deploy for at least one `decision_core_block` row (may be zero if no PR touched `milestone_manager/**` post-deploy; log the query used so operator can rerun).
+
+**Deviations, named.** AC3/AC4 assert the emitted audit-event names rather than the
+literal `decision_core_block` / `hold[human_review]` strings (§ 9, R1). AC4's handler
+branch is asserted structurally rather than behaviourally (§ 9). AC5 does not use
+`EvalHarness` (§ 4 step 4, F1 — ratified in the first architect pass). AC7 lands as the
+companion mika-platform PR once this PR merges and the SHA is known (§ 7 sequencing).
+AC8 is operator-run post-merge; the commands are in the PR body.

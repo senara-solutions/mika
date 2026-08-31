@@ -28,8 +28,39 @@
 //! ## Phase 2 promotion (NOT wired here)
 //!
 //! Phase 2 (dispatch authority — recommend + auto-execute) is gated behind the three
-//! portes documented in the brief § 3: forge-gate loop-résistance, contention exec, and
-//! `INTERNAL_TOKEN` alignment. None of that surface is wired in this module.
+//! portes documented in the brief § 3: forge-gate loop-résistance (Porte 1), contention
+//! exec (Porte 2), and `INTERNAL_TOKEN` alignment (Porte 3). None of that surface is
+//! wired in this module.
+//!
+//! **Porte 1 discharge condition (mika#1947).** Dispatch authority is DECISION-CORE by
+//! construction, so the forge-gate perimeter classifier must fail-closed to
+//! `DecisionCore` on every path under `crates/mika-agent/src/milestone_manager/**`, at
+//! every merge-authority callsite. Today that holds only via the classifier's
+//! fail-closed default — no rule in `perimeter/rules.rs` names this module. The tests
+//! below make it hold structurally, so a future diff that adds the manager surface to a
+//! MECHANICAL table fails a test instead of quietly opening an auto-merge path into the
+//! manager's own code. In-tree proof:
+//!
+//! - `crates/mika-agent/src/perimeter/tests.rs` —
+//!   `milestone_manager_files_are_decision_core`,
+//!   `milestone_manager_solo_pr_is_decision_core`,
+//!   `milestone_manager_file_taints_pr_batch`,
+//!   `milestone_manager_prefix_not_in_mechanical_tables`,
+//!   `milestone_manager_absent_from_all_mechanical_tables`,
+//!   `milestone_manager_has_no_nested_tests_directory` (AC1 + AC2).
+//! - `crates/mika-agent/tests/eval/test_verdict_handler.rs` —
+//!   `verdict_pass_milestone_manager_pr_holds_for_operator` (AC3).
+//! - `crates/mika-agent/tests/eval/test_ci_success_handler.rs` —
+//!   `ci_success_milestone_manager_pr_holds_for_operator` (AC4).
+//! - `crates/mika-agent/tests/eval/manager_loop_resistance.rs` —
+//!   `cascade_never_dispatches_into_milestone_manager` (AC5, gated `#[ignore]` +
+//!   `MIKA_MANAGER_LOOP_RESISTANCE_TEST=1`).
+//!
+//! `milestone_manager_has_no_nested_tests_directory` is the one to read before adding
+//! files here: `MECHANICAL_CONTAINS` grants MECHANICAL to any path containing
+//! `/tests/`, so a `src/milestone_manager/tests/` directory would be auto-mergeable
+//! inside the very module Porte 1 gates. The manager's own test code belongs beside the
+//! module files, as `no_dispatch_test.rs` does.
 
 pub mod assessor;
 pub mod cadence;
