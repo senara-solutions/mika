@@ -362,14 +362,28 @@ pub fn spawn_manager_cycle_task(
                     // failure window (mika#2013 volet B).
                     auth_tracker.on_success();
 
-                    // mika#1949 U3/U4 — the notes just rendered have been
-                    // delivered; drop them so the next report does not repeat
-                    // them. Then fold whatever this cycle's own delivery
-                    // observed, so it reaches the operator next time.
-                    pending_auth_notes.clear();
+                    // mika#1949 U3/U4 — drop the carried notes ONLY if the
+                    // report they were rendered into actually went out. A
+                    // no-op cycle composes and delivers nothing, and clearing
+                    // there would drop an auth failure before any operator
+                    // ever saw it — the exact silence this ticket exists to
+                    // close.
+                    if outcome.delivered {
+                        pending_auth_notes.clear();
+                    }
+
+                    // Three states, not two. `auth_boundary: None` covers a
+                    // delivery that authenticated, an offline-sink write, and
+                    // a cycle that attempted nothing — and only the first is
+                    // evidence the credential works. `auth_attempted`
+                    // separates them. Reading a no-op as success would reset
+                    // the repeat counter between almost every pair of real
+                    // failures (5-min poll against a 6 h heartbeat) and make
+                    // the `Blocked` escalation unreachable in practice.
                     match outcome.auth_boundary.clone() {
                         Some(err) => pending_auth_notes.push(boundary_tracker.observe(err)),
-                        None => boundary_tracker.reset(),
+                        None if outcome.auth_attempted => boundary_tracker.reset(),
+                        None => {}
                     }
                     if outcome.delivered {
                         info!(

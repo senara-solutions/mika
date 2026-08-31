@@ -399,6 +399,7 @@ pub async fn run_manager_cycle_in(
     let mut escalated = false;
     let mut delivered = false;
     let mut auth_boundary: Option<AuthBoundaryError> = None;
+    let mut auth_attempted = false;
 
     if should_deliver {
         let body = DeliveryBody {
@@ -412,6 +413,9 @@ pub async fn run_manager_cycle_in(
         let route = select_route(&severity, cfg);
         match route {
             Route::Http { url, token } => {
+                // A credential was presented at a boundary — whatever the
+                // outcome, this cycle is evidence about it.
+                auth_attempted = true;
                 let outcome = deliverer.deliver(&url, token.as_deref(), &body).await;
                 // mika#1949 U3 — read the outcome as an auth-boundary event
                 // before consuming it, and record it. Fire-and-forget: the
@@ -485,6 +489,7 @@ pub async fn run_manager_cycle_in(
         severity,
         generated_at,
         auth_boundary,
+        auth_attempted,
     })
 }
 
@@ -1087,5 +1092,61 @@ mod tests {
         // The report still reached the operator — via the offline sink. A
         // failed credential must not also lose the report.
         assert!(outcome.delivered);
+    }
+
+    /// A no-op cycle presents no credential, so it is evidence about nothing.
+    ///
+    /// This is the distinction that keeps the `Blocked` escalation alive: with
+    /// `poll_interval` at 5 min against a 6 h heartbeat, no-op cycles are the
+    /// common case, and a loop that read them as "auth works" would reset the
+    /// repeat counter between almost every pair of real failures.
+    #[tokio::test]
+    async fn a_no_op_cycle_reports_no_authentication_attempt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = mk_config(tmp.path());
+        let rec = RecordingDeliverer::default();
+        let now = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
+
+        // First cycle always delivers and writes the checkpoint.
+        let first = run_manager_cycle_with(&cfg, base_state(), &rec, now)
+            .await
+            .unwrap();
+        assert!(first.delivered);
+        assert!(first.auth_attempted, "a delivery presents the credential");
+
+        // Second cycle, same state, well inside the heartbeat window: no-op.
+        let later = now + chrono::Duration::minutes(5);
+        let second = run_manager_cycle_with(&cfg, base_state(), &rec, later)
+            .await
+            .unwrap();
+        assert!(
+            !second.delivered,
+            "precondition: this cycle must be a no-op"
+        );
+        assert!(
+            !second.auth_attempted,
+            "a cycle that delivered nothing proves nothing about the credential"
+        );
+        assert!(second.auth_boundary.is_none());
+    }
+
+    /// An offline-sink write delivers the report without presenting any
+    /// credential, so it is not evidence either.
+    #[tokio::test]
+    async fn an_offline_sink_write_reports_no_authentication_attempt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = mk_config(tmp.path());
+        cfg.delivery_url = None;
+        cfg.escalation_url = None;
+        let rec = RecordingDeliverer::default();
+
+        let outcome = run_manager_cycle_with(&cfg, base_state(), &rec, Utc::now())
+            .await
+            .unwrap();
+        assert!(outcome.delivered, "the sink still captures the report");
+        assert!(
+            !outcome.auth_attempted,
+            "writing to a local directory presents no token"
+        );
     }
 }
