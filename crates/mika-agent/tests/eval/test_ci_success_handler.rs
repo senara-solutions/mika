@@ -54,6 +54,22 @@ fn try_handle_ci_success_body() -> &'static str {
     &rest[..end]
 }
 
+/// Assert an audit-event name is one the handler can actually emit.
+///
+/// Without this, `count_audit_events_by_tool_name("<name nothing writes>")`
+/// returns 0 and the assertion passes for the wrong reason — a guaranteed green
+/// that proves nothing. Found exactly that way in review on this file's first
+/// draft, which asserted zero rows for `ci_success_handler_merge_initiated`, a
+/// name no code writes.
+pub fn assert_audit_event_name_is_real(name: &str) {
+    assert!(
+        CI_SUCCESS_HANDLER_SRC.contains(&format!("\"{name}\"")),
+        "audit-event name `{name}` appears nowhere in ci_success_handler.rs — \
+         a count assertion on it is vacuous. The emitted names are the string \
+         literals passed to `db.log_audit_event`."
+    );
+}
+
 #[tokio::test]
 async fn ci_success_milestone_manager_pr_holds_for_operator() -> Result<()> {
     // Layer A — the classifier verdict on the mika-manager surface. Shared with
@@ -100,12 +116,19 @@ async fn ci_success_milestone_manager_pr_holds_for_operator() -> Result<()> {
         }
         other => panic!("CI success on an unresolvable PR must not dispatch: {other:?}"),
     }
-    assert_eq!(
-        db.count_audit_events_by_tool_name("ci_success_handler_merge_initiated")
-            .await?,
-        0,
-        "no merge may be initiated for a mika-manager PR"
-    );
+    // `ci_success_merge` is the row the handler writes after `run_gh_merge`
+    // (`after = "merge_initiated"`); `ci_success_handler_human_gate_required` is
+    // the DECISION-CORE hold. Both are zero here because the handler bailed at
+    // `find_open_pr` — which is the point: this path did nothing, and in
+    // particular did not merge.
+    for event in ["ci_success_merge", "ci_success_handler_human_gate_required"] {
+        assert_audit_event_name_is_real(event);
+        assert_eq!(
+            db.count_audit_events_by_tool_name(event).await?,
+            0,
+            "{event}: the handler must take no action on an unresolvable PR"
+        );
+    }
 
     // Layer C — the ordering invariant, asserted against the source. This is the
     // shape of the mika#1851 breach: the merge call ran and the classifier never did.

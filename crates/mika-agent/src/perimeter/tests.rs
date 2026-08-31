@@ -739,7 +739,15 @@ fn milestone_manager_absent_from_all_mechanical_tables() {
         !RULES_SRC.contains("milestone_manager"),
         "rules.rs must not mention `milestone_manager` anywhere — the manager surface \
          is DECISION-CORE via the fail-closed default and must stay unenumerated \
-         (mika#1947 Porte 1)"
+         (mika#1947 Porte 1).\n\
+         \n\
+         If a MECHANICAL table gained the entry: that is the regression this test \
+         exists for. Remove it.\n\
+         If you were only documenting the module in the `What is explicitly \
+         DECISION-CORE` prose: that list is grep-anchored on paths absent from the \
+         rules, so naming this one there is self-defeating — put the note in \
+         `milestone_manager/mod.rs` instead, where the Porte 1 proof already lives. \
+         Do not delete this assertion to make the prose fit."
     );
 }
 

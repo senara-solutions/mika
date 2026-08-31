@@ -633,6 +633,40 @@ directory exists, and pins the `/tests/` rule it depends on so the test announce
 as obsolete if that rule ever changes. The manager's test code lives beside the module
 files (`no_dispatch_test.rs`), which is what the assertion keeps true.
 
+## 11. Review pass — what it caught
+
+The review was run against the first implementation commit. Two changes came out
+of it; both are in the branch.
+
+**A vacuous assertion (fixed).** `test_ci_success_handler.rs` asserted zero
+`audit_events` rows for `ci_success_handler_merge_initiated` as its "no merge was
+issued" check. **That name is written nowhere in the codebase.**
+`count_audit_events_by_tool_name` on a name nothing emits returns 0 unconditionally,
+so the assertion was a guaranteed green that proved nothing — a test asserting the
+absence of an event that could never be present. The real names the handler writes
+are `ci_success_merge` (after `run_gh_merge`, `after = "merge_initiated"`),
+`ci_success_handler_human_gate_required`, and `ci_success_handler_processed`. The
+assertion now names the real ones, and — so the class cannot recur — a helper
+`assert_audit_event_name_is_real` checks each cited name against the pinned handler
+source before counting. Verified: re-injecting the invented name turns the test red
+with a message naming the problem. `manager_loop_resistance.rs` carried the same
+assertion and got the same fix.
+
+**A false-red risk (message hardened).** `milestone_manager_absent_from_all_mechanical_tables`
+scans the whole of `rules.rs`, so it also fires on a *comment* mentioning the module
+— and `rules.rs` has a "What is explicitly DECISION-CORE (grep-anchored)" prose list
+that someone could reasonably want to add the manager to. The assertion is correct to
+be that wide (F2), but a red with no remedy invites deletion. Its failure message now
+distinguishes the two causes and points the documentation case at
+`milestone_manager/mod.rs`, where the Porte 1 note already lives.
+
+**On the review route.** The `/ce:review` multi-agent roster dispatches sub-agents;
+this dispatch's terms forbade opening new sessions, so the harness's built-in
+`/code-review` was used instead. It did not return within ~75 minutes (no findings,
+no partial output), so it was stopped and the review was conducted directly against
+the diff. Both findings above come from that pass. The quality gate was not skipped;
+the route it took is named here rather than left to be inferred.
+
 ## Acceptance criteria
 
 Transcribed verbatim from the mika#1947 issue body.
