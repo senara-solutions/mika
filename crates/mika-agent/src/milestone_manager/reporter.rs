@@ -37,8 +37,88 @@
 //! reintroduce it. Do NOT reorder these four write_* calls in `Reporter::report`
 //! without an explicit Prime override captured in a follow-up plan.
 
-use super::types::{Alert, AlertKind, Assessment, CiState, IssueState, MilestoneState, SubIssue};
+use super::types::{
+    Alert, AlertKind, Assessment, CiState, IssueState, MilestoneState, Severity, SubIssue,
+};
+use mika_common::auth_boundary::AuthBoundaryError;
 use std::fmt::Write;
+
+// ---- mika#1949 U4 — auth-boundary failures in the report -------------------
+
+/// One auth-boundary failure, as it will appear in a report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthBoundaryNote {
+    pub error: AuthBoundaryError,
+    pub severity: Severity,
+}
+
+/// Counts consecutive failures on the *same* `(token_name, boundary)` pair, so
+/// a repeated one escalates.
+///
+/// # Why repetition is the signal
+///
+/// One refusal is worth an operator's attention; it is also what a restart
+/// mid-rotation looks like. Three in a row on the same credential is not a
+/// transient — it is a credential that will not come back on its own, and it
+/// is exactly the shape mika#2013 produced sixteen times in one night while
+/// reporting nothing.
+///
+/// # Why the counter does not persist
+///
+/// It is in-memory, per-process, and reset by any successful cycle. A
+/// persisted counter would carry a stale escalation across a restart that had
+/// already fixed the token — the failure mode of a watchdog that cannot be
+/// told the problem is over.
+#[derive(Debug, Default)]
+pub struct AuthBoundaryTracker {
+    /// The pair last observed and its consecutive count.
+    last: Option<(String, u32)>,
+}
+
+/// Consecutive occurrences of one pair before the note escalates to `Blocked`.
+pub const AUTH_BOUNDARY_ESCALATION_THRESHOLD: u32 = 3;
+
+impl AuthBoundaryTracker {
+    /// Observe one failure and produce the note the next report will carry.
+    pub fn observe(&mut self, error: AuthBoundaryError) -> AuthBoundaryNote {
+        let key = format!("{}@{}", error.token_name, error.boundary_key());
+        let count = match self.last.take() {
+            Some((seen, n)) if seen == key => n.saturating_add(1),
+            // A different pair breaks the run: two boundaries each failing once
+            // is two problems, not one escalating problem.
+            _ => 1,
+        };
+        self.last = Some((key, count));
+        let severity = if count >= AUTH_BOUNDARY_ESCALATION_THRESHOLD {
+            Severity::Blocked
+        } else {
+            Severity::Attention
+        };
+        AuthBoundaryNote { error, severity }
+    }
+
+    /// A cycle that authenticated closes the window.
+    pub fn reset(&mut self) {
+        self.last = None;
+    }
+}
+
+/// Render one note as the line an operator reads.
+pub fn render_auth_boundary_note(note: &AuthBoundaryNote) -> String {
+    format!(
+        "- [{}] Auth failure: {}",
+        severity_label(&note.severity),
+        note.error
+    )
+}
+
+fn severity_label(s: &Severity) -> &'static str {
+    match s {
+        Severity::Healthy => "healthy",
+        Severity::Attention => "attention",
+        Severity::Blocked => "blocked",
+    }
+}
 
 /// Reporter — composes a Markdown report from a `MilestoneState` + `Assessment`.
 pub struct Reporter;
@@ -50,6 +130,18 @@ impl Reporter {
 
     /// Compose the full report as a single Markdown string.
     pub fn report(&self, state: &MilestoneState, assessment: &Assessment) -> String {
+        self.report_with_auth_notes(state, assessment, &[])
+    }
+
+    /// As [`Reporter::report`], plus any auth-boundary failures observed since
+    /// the last report (mika#1949 U4). An empty slice renders identically to
+    /// `report`.
+    pub fn report_with_auth_notes(
+        &self,
+        state: &MilestoneState,
+        assessment: &Assessment,
+        auth_notes: &[AuthBoundaryNote],
+    ) -> String {
         let mut out = String::new();
         // Header.
         let _ = writeln!(
@@ -158,6 +250,18 @@ impl Reporter {
                     "- `{}` slot held by `{}` (dispatched by {source}) — {}",
                     e.dispatch_class, e.blocking_task_id, e.reason
                 );
+            }
+        }
+
+        // Auth boundary (mika#1949 U4). Same silence rule as Dispatch
+        // contention above, and for the same reason: a permanent "(none)" line
+        // teaches the reader to skip past it, and this section only ever
+        // appears when a credential is actually failing.
+        if !auth_notes.is_empty() {
+            writeln!(out).unwrap();
+            writeln!(out, "### Auth boundary").unwrap();
+            for note in auth_notes {
+                let _ = writeln!(out, "{}", render_auth_boundary_note(note));
             }
         }
 
@@ -330,7 +434,7 @@ fn alert_kind_label(k: &AlertKind) -> &'static str {
 mod tests {
     use super::*;
     use crate::milestone_manager::types::{
-        ContentionEvent, MilestoneRef, ProgressCounts, Recommendation, Severity, SubIssue,
+        ContentionEvent, MilestoneRef, ProgressCounts, Recommendation, SubIssue,
     };
 
     fn base_issue(n: u64) -> SubIssue {
@@ -727,5 +831,90 @@ mod tests {
         };
         let out2 = Reporter::new().report(&state_with(vec![], ProgressCounts::default()), &a2);
         assert!(out2.contains("Next: — all clear"));
+    }
+
+    // ---- mika#1949 U4 — auth-boundary rendering + escalation ---------------
+
+    use mika_common::auth_boundary::AuthBoundaryKind;
+
+    fn delivery_err(kind: AuthBoundaryKind) -> AuthBoundaryError {
+        AuthBoundaryError::new("MIKA_MANAGER_DELIVERY_TOKEN", "manager", "delivery", kind)
+    }
+
+    #[test]
+    fn one_auth_failure_renders_at_attention() {
+        let mut t = AuthBoundaryTracker::default();
+        let note = t.observe(delivery_err(AuthBoundaryKind::Rejected));
+        assert_eq!(note.severity, Severity::Attention);
+        assert_eq!(
+            render_auth_boundary_note(&note),
+            "- [attention] Auth failure: rejected at manager->delivery boundary (token: MIKA_MANAGER_DELIVERY_TOKEN)"
+        );
+    }
+
+    #[test]
+    fn three_consecutive_on_the_same_pair_escalate_to_blocked() {
+        let mut t = AuthBoundaryTracker::default();
+        assert_eq!(
+            t.observe(delivery_err(AuthBoundaryKind::Rejected)).severity,
+            Severity::Attention
+        );
+        assert_eq!(
+            t.observe(delivery_err(AuthBoundaryKind::Rejected)).severity,
+            Severity::Attention
+        );
+        let third = t.observe(delivery_err(AuthBoundaryKind::Rejected));
+        assert_eq!(third.severity, Severity::Blocked);
+        assert!(render_auth_boundary_note(&third).contains("MIKA_MANAGER_DELIVERY_TOKEN"));
+    }
+
+    #[test]
+    fn two_failures_on_different_boundaries_do_not_escalate() {
+        let mut t = AuthBoundaryTracker::default();
+        let a = t.observe(delivery_err(AuthBoundaryKind::Rejected));
+        let b = t.observe(AuthBoundaryError::new(
+            "MIKA_INTERNAL_TOKEN",
+            "gateway",
+            "spirit",
+            AuthBoundaryKind::Rejected,
+        ));
+        let c = t.observe(delivery_err(AuthBoundaryKind::Rejected));
+        for note in [&a, &b, &c] {
+            assert_eq!(
+                note.severity,
+                Severity::Attention,
+                "a run broken by a different pair is not a run"
+            );
+        }
+    }
+
+    #[test]
+    fn a_successful_cycle_closes_the_escalation_window() {
+        let mut t = AuthBoundaryTracker::default();
+        t.observe(delivery_err(AuthBoundaryKind::Rejected));
+        t.observe(delivery_err(AuthBoundaryKind::Rejected));
+        t.reset();
+        assert_eq!(
+            t.observe(delivery_err(AuthBoundaryKind::Rejected)).severity,
+            Severity::Attention,
+            "a cycle that authenticated must not leave a half-built escalation behind"
+        );
+    }
+
+    #[test]
+    fn the_auth_boundary_section_appears_only_when_there_is_one() {
+        let state = state_with(vec![base_issue(1)], ProgressCounts::default());
+        let assessment = empty_assessment();
+        let without = Reporter::new().report(&state, &assessment);
+        assert!(!without.contains("### Auth boundary"));
+
+        let mut t = AuthBoundaryTracker::default();
+        let notes = vec![t.observe(delivery_err(AuthBoundaryKind::Missing))];
+        let with = Reporter::new().report_with_auth_notes(&state, &assessment, &notes);
+        assert!(with.contains("### Auth boundary"));
+        assert!(with.contains("missing at manager->delivery boundary"));
+        // The name, never a value — there is no value to leak, and this is the
+        // assertion that says so at the surface an operator actually reads.
+        assert!(with.contains("token: MIKA_MANAGER_DELIVERY_TOKEN"));
     }
 }

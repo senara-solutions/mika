@@ -536,3 +536,23 @@ file and arm, and the issue stays open with the remaining ACs named. A partial
 Porte 3 is honest; a Porte 3 marked DISCHARGED with U5 blocked is not — U8's
 brief edit must not be written until U5 has landed or been explicitly waived by
 the operator.
+
+## Acceptance criteria
+
+Transcribed verbatim from `senara-solutions/mika#1949` § Acceptance criteria.
+The plan's Definition of Done above stands separately and is not a rename of
+this section.
+
+- [ ] **AC1** — cm scope test in `control-monitor/backend/crates/cm-api/src/scope.rs` explicitly asserts what `Role::CommandPlane` allows for a hypothetical `manager-status` write path. If insufficient, adds `Role::Manager` variant with the allowlist above; if sufficient, documents the decision in `scope.rs` module docstring.
+- [ ] **AC2** — Auth-boundary audit ledger: new `audit_events` writes with `tool_name = 'auth_boundary'` fire on every cross-boundary call from the four sites. Structured event schema documented in `crates/mika-agent/CLAUDE.md § Audit Log`. Unit tests in each of the four writer sites.
+- [ ] **AC3** — `AuthBoundaryError` type in `mika-common/src/errors.rs` (or equivalent shared location) with the five kinds. All four boundary sites return it on auth failure. Serialization test.
+- [ ] **AC4** — mika-manager `Reporter` renders `AuthBoundaryError` in reports at severity `Severity::Attention` (or `Blocked` if repeated), with the token name + boundary named. Unit test in `reporter.rs`.
+- [ ] **AC5** — Operator runbook `mika-platform/docs/operator/token-rotation-procedure.md` documents rotation for all four tokens with the "symptom-per-skipped-step" table.
+- [ ] **AC6** — `mika/crates/mika-agent/src/milestone_manager/mod.rs` docstring updated: the Phase 2 gate note names Porte 3 discharge condition + points at this doc + this ticket + the audit query pattern for post-deploy verification.
+- [ ] **AC7** — `mika-platform/docs/brainstorms/2026-08-21-mika-manager-de-milestones-design-brief.md § 3 Porte 3` updated with "**Statut : DISCHARGED**" naming this ticket + the AC surface + role decision + link to the rotation runbook.
+- [ ] **AC8** — Post-deploy verification (operator-driven, listed in PR body): (a) trigger a mika-manager Phase 1 cadence cycle with each of the four tokens intentionally unset one-at-a-time; confirm each surfaces a distinguishable audit_events row with the correct `token_name`; confirm the report renders the `AuthBoundaryError` at correct severity. (b) `grep 'tool_name = "auth_boundary"' audit_events` returns non-zero rows post-cycle.
+- [ ] **AC9** — `no_dispatch_test.rs` FORBIDDEN_TOKENS unchanged — this ticket adds READ + audit surface, no write authority to mika-manager. Phase 1 LECTURE-seule invariant preserved. Reviewer verifies grep-diff is empty for this file.
+
+**AC7 is gated on U5.** Per the Blocked-unit protocol above, the brief's
+`Statut : DISCHARGED` line is not written while U5 is blocked; the brief
+records the partial state instead, and AC7 stays open on the issue.

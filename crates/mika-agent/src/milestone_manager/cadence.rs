@@ -19,10 +19,13 @@ use super::{
     reporter::Reporter,
     types::{Assessment, CycleOutcome, MilestoneRef, MilestoneState, Severity},
 };
-use anyhow::{Result, anyhow};
+use crate::auth_boundary_ledger::AuthBoundaryLedger;
+use anyhow::Result;
 use chrono::{DateTime, Utc};
+use mika_common::auth_boundary::{AuthBoundaryError, AuthBoundaryKind};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Configuration for a single manager cycle.
 #[derive(Debug, Clone)]
@@ -93,6 +96,99 @@ pub struct MilestoneCheckpoint {
     pub last_observed_at: Option<String>,
 }
 
+// ---- mika#1949 U3 — the manager delivery boundary -------------------------
+
+/// The entity names carried by every `manager_to_delivery` audit row. Held as
+/// constants so the row's `target_key` and the runbook agree by construction.
+pub const DELIVERY_BOUNDARY_FROM: &str = "manager";
+pub const DELIVERY_BOUNDARY_TO: &str = "delivery";
+
+/// What a delivery attempt did, in the only terms the auth boundary cares
+/// about.
+///
+/// Deliberately three variants, not a status code. The boundary's question is
+/// "was this a credential problem, a reachability problem, or neither" — and a
+/// caller handed a `u16` would have to re-derive that answer, differently, at
+/// each site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryFailureKind {
+    /// The far side answered and refused the credential (401 or 403).
+    ///
+    /// Both codes, on purpose: mika answers 401 and cm answers 403 on a token
+    /// refusal, and mika#1949 KTD2 arbitrated that divergence rather than
+    /// retrofitting it. A classifier that recognised only one would go blind
+    /// against whichever peer it was not written for.
+    CredentialRefused,
+    /// The far side never answered, so no authentication verdict exists.
+    Unreachable,
+    /// Anything else — a 500, a malformed body. Not an authentication signal,
+    /// and deliberately not reported as one.
+    Other,
+}
+
+/// A delivery failure that still remembers which of the three it was.
+///
+/// Carried inside `anyhow::Error` rather than widening the `ReportDeliverer`
+/// trait: every test double in this module returns `anyhow::Result<()>`, and a
+/// signature change would have rewritten them all to gain nothing. Callers
+/// that care downcast; callers that do not see the same message they saw
+/// before mika#1949.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct DeliveryError {
+    pub kind: DeliveryFailureKind,
+    pub message: String,
+}
+
+impl DeliveryError {
+    /// Build the failure already boxed as an `anyhow::Error`, which is what
+    /// every call site wants. Named `raise` rather than `new` because it does
+    /// not return `Self` — clippy is right that a `new` returning something
+    /// else reads as a mistake.
+    pub fn raise(kind: DeliveryFailureKind, message: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            kind,
+            message: message.into(),
+        })
+    }
+}
+
+/// Read a delivery outcome as an auth-boundary observation, or `None` when it
+/// was not an authentication event.
+///
+/// # Why the token is inspected only on a refusal
+///
+/// The plan phrases the mapping as "absent token to `Missing`, empty to
+/// `Empty`". Applied unconditionally that would fire on every *successful*
+/// delivery to an endpoint that requires no bearer at all — the offline-sink
+/// and open-endpoint configurations both do — and an alarm that fires when
+/// nothing is wrong is how a ledger stops being read. So the absent/empty
+/// distinction is drawn where it is actually diagnostic: the far side refused
+/// us, and the reason is that we presented nothing, presented blank, or
+/// presented something it did not accept.
+pub(crate) fn classify_delivery_auth(
+    token: Option<&str>,
+    outcome: &Result<()>,
+) -> Option<AuthBoundaryError> {
+    let err = outcome.as_ref().err()?;
+    let delivery = err.downcast_ref::<DeliveryError>()?;
+    let kind = match delivery.kind {
+        DeliveryFailureKind::CredentialRefused => match token {
+            None => AuthBoundaryKind::Missing,
+            Some(t) if t.trim().is_empty() => AuthBoundaryKind::Empty,
+            Some(_) => AuthBoundaryKind::Rejected,
+        },
+        DeliveryFailureKind::Unreachable => AuthBoundaryKind::Unreachable,
+        DeliveryFailureKind::Other => return None,
+    };
+    Some(AuthBoundaryError::new(
+        crate::milestone_manager::spawn::ENV_DELIVERY_TOKEN,
+        DELIVERY_BOUNDARY_FROM,
+        DELIVERY_BOUNDARY_TO,
+        kind,
+    ))
+}
+
 /// Reqwest-backed HTTP deliverer. Fire-and-forget with warn-on-failure —
 /// the parent cycle propagates the error but does not retry.
 pub struct HttpReportDeliverer {
@@ -123,11 +219,33 @@ impl ReportDeliverer for HttpReportDeliverer {
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
-        let res = req.send().await?;
+        // mika#1949 U3: the failure keeps its class. The message text is
+        // unchanged from before this ticket — only a downcastable cause was
+        // added underneath it.
+        let res = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                let kind = if e.is_connect() || e.is_timeout() {
+                    DeliveryFailureKind::Unreachable
+                } else {
+                    DeliveryFailureKind::Other
+                };
+                return Err(DeliveryError::raise(kind, format!("delivery failed: {e}")));
+            }
+        };
         if !res.status().is_success() {
             let status = res.status();
+            let refused = matches!(status.as_u16(), 401 | 403);
             let text = res.text().await.unwrap_or_default();
-            return Err(anyhow!("delivery failed: {status} — {text}"));
+            let kind = if refused {
+                DeliveryFailureKind::CredentialRefused
+            } else {
+                DeliveryFailureKind::Other
+            };
+            return Err(DeliveryError::raise(
+                kind,
+                format!("delivery failed: {status} — {text}"),
+            ));
         }
         Ok(())
     }
@@ -188,6 +306,60 @@ pub async fn run_manager_cycle_with(
     deliverer: &dyn ReportDeliverer,
     now: DateTime<Utc>,
 ) -> Result<CycleOutcome> {
+    run_manager_cycle_in(cfg, state, &CycleContext::new(deliverer, now)).await
+}
+
+/// Everything a cycle needs that is neither its config nor the state it read
+/// from GitHub (mika#1949 U3/U4).
+///
+/// Added as a struct rather than four more positional parameters: the two
+/// mika#1949 additions are optional wiring, and `run_manager_cycle_with`'s
+/// existing four-argument shape is called from a dozen tests that have no
+/// ledger and no notes to supply.
+pub struct CycleContext<'a> {
+    pub deliverer: &'a dyn ReportDeliverer,
+    pub now: DateTime<Utc>,
+    /// Where an observed auth-boundary failure is recorded. `None` = not wired.
+    pub auth_ledger: Option<&'a Arc<dyn AuthBoundaryLedger>>,
+    /// Auth-boundary failures observed on *previous* cycles, for this report to
+    /// carry. A failure observed on this cycle's delivery cannot appear in the
+    /// report it was delivering — the report is composed first — so the loop
+    /// hands them forward.
+    pub auth_notes: &'a [crate::milestone_manager::reporter::AuthBoundaryNote],
+}
+
+impl<'a> CycleContext<'a> {
+    pub fn new(deliverer: &'a dyn ReportDeliverer, now: DateTime<Utc>) -> Self {
+        Self {
+            deliverer,
+            now,
+            auth_ledger: None,
+            auth_notes: &[],
+        }
+    }
+
+    pub fn with_auth_ledger(mut self, ledger: Option<&'a Arc<dyn AuthBoundaryLedger>>) -> Self {
+        self.auth_ledger = ledger;
+        self
+    }
+
+    pub fn with_auth_notes(
+        mut self,
+        notes: &'a [crate::milestone_manager::reporter::AuthBoundaryNote],
+    ) -> Self {
+        self.auth_notes = notes;
+        self
+    }
+}
+
+/// The cycle body. See [`run_manager_cycle_with`] for the four-argument form.
+pub async fn run_manager_cycle_in(
+    cfg: &ManagerConfig,
+    state: MilestoneState,
+    ctx: &CycleContext<'_>,
+) -> Result<CycleOutcome> {
+    let now = ctx.now;
+    let deliverer = ctx.deliverer;
     let generated_at = now.to_rfc3339();
     let digest = state_digest(&state);
     let checkpoint = load_checkpoint(&cfg.checkpoint_dir, &cfg.target).await;
@@ -214,7 +386,7 @@ pub async fn run_manager_cycle_with(
     });
     let assessment = assessor.assess(&state);
     let severity = assessment.severity.clone();
-    let report = Reporter::new().report(&state, &assessment);
+    let report = Reporter::new().report_with_auth_notes(&state, &assessment, ctx.auth_notes);
 
     let should_deliver = state_changed || heartbeat_fired;
     let cycle_kind = match (state_changed, heartbeat_fired) {
@@ -226,6 +398,7 @@ pub async fn run_manager_cycle_with(
 
     let mut escalated = false;
     let mut delivered = false;
+    let mut auth_boundary: Option<AuthBoundaryError> = None;
 
     if should_deliver {
         let body = DeliveryBody {
@@ -239,7 +412,15 @@ pub async fn run_manager_cycle_with(
         let route = select_route(&severity, cfg);
         match route {
             Route::Http { url, token } => {
-                match deliverer.deliver(&url, token.as_deref(), &body).await {
+                let outcome = deliverer.deliver(&url, token.as_deref(), &body).await;
+                // mika#1949 U3 — read the outcome as an auth-boundary event
+                // before consuming it, and record it. Fire-and-forget: the
+                // delivery's own handling below is untouched by this.
+                if let Some(err) = classify_delivery_auth(token.as_deref(), &outcome) {
+                    crate::auth_boundary_ledger::record_if_wired(ctx.auth_ledger, &err);
+                    auth_boundary = Some(err);
+                }
+                match outcome {
                     Ok(()) => {
                         delivered = true;
                         escalated = severity == Severity::Blocked;
@@ -303,6 +484,7 @@ pub async fn run_manager_cycle_with(
         heartbeat_fired,
         severity,
         generated_at,
+        auth_boundary,
     })
 }
 
@@ -402,12 +584,26 @@ pub async fn probe_executor_health(url: Option<&str>) -> Option<bool> {
 /// Live-runner variant: reads from `gh`, probes optional health endpoint,
 /// then runs the same cycle logic.
 pub async fn run_manager_cycle(cfg: &ManagerConfig) -> Result<CycleOutcome> {
+    run_manager_cycle_with_auth(cfg, None, &[]).await
+}
+
+/// As [`run_manager_cycle`], with the mika#1949 auth-boundary wiring: where to
+/// record an observed failure, and which failures the report should carry
+/// forward from previous cycles.
+pub async fn run_manager_cycle_with_auth(
+    cfg: &ManagerConfig,
+    auth_ledger: Option<&Arc<dyn AuthBoundaryLedger>>,
+    auth_notes: &[crate::milestone_manager::reporter::AuthBoundaryNote],
+) -> Result<CycleOutcome> {
     let reader = Reader::new(cfg.github_token.clone());
     let mut state = reader.read(&cfg.target).await?;
     // M4 review fix: honour the health_url config surface.
     state.executor_healthy = probe_executor_health(cfg.health_url.as_deref()).await;
     let deliverer = HttpReportDeliverer::new();
-    run_manager_cycle_with(cfg, state, &deliverer, Utc::now()).await
+    let ctx = CycleContext::new(&deliverer, Utc::now())
+        .with_auth_ledger(auth_ledger)
+        .with_auth_notes(auth_notes);
+    run_manager_cycle_in(cfg, state, &ctx).await
 }
 
 #[cfg(test)]
@@ -752,5 +948,144 @@ mod tests {
         let d3 = state_digest(&s);
         assert_ne!(d1, d2);
         assert_eq!(d2, d3);
+    }
+
+    // ---- mika#1949 U3 — the delivery boundary, classified ------------------
+
+    fn refused() -> Result<()> {
+        Err(DeliveryError::raise(
+            DeliveryFailureKind::CredentialRefused,
+            "delivery failed: 401 Unauthorized — ",
+        ))
+    }
+
+    #[test]
+    fn a_refusal_with_no_token_reads_as_missing() {
+        let got = classify_delivery_auth(None, &refused()).expect("an auth event");
+        assert_eq!(got.kind, AuthBoundaryKind::Missing);
+        assert_eq!(got.token_name, "MIKA_MANAGER_DELIVERY_TOKEN");
+        assert_eq!(got.boundary_key(), "manager_to_delivery");
+    }
+
+    #[test]
+    fn a_refusal_with_a_blank_token_reads_as_empty() {
+        let got = classify_delivery_auth(Some("   "), &refused()).expect("an auth event");
+        assert_eq!(
+            got.kind,
+            AuthBoundaryKind::Empty,
+            "a variable set to blank is a different operator fix from a variable never set"
+        );
+    }
+
+    #[test]
+    fn a_refusal_with_a_real_token_reads_as_rejected() {
+        let got = classify_delivery_auth(Some("something"), &refused()).expect("an auth event");
+        assert_eq!(got.kind, AuthBoundaryKind::Rejected);
+    }
+
+    #[test]
+    fn a_403_is_classified_alongside_401() {
+        // KTD2: cm answers 403 where mika answers 401, and both stand. A
+        // classifier that recognised only one would go blind against whichever
+        // peer it was not written for.
+        let outcome: Result<()> = Err(DeliveryError::raise(
+            DeliveryFailureKind::CredentialRefused,
+            "delivery failed: 403 Forbidden — ",
+        ));
+        assert_eq!(
+            classify_delivery_auth(Some("t"), &outcome).unwrap().kind,
+            AuthBoundaryKind::Rejected
+        );
+    }
+
+    #[test]
+    fn an_unreachable_endpoint_is_not_reported_as_a_bad_token() {
+        let outcome: Result<()> = Err(DeliveryError::raise(
+            DeliveryFailureKind::Unreachable,
+            "delivery failed: connection refused",
+        ));
+        let got = classify_delivery_auth(None, &outcome).expect("an auth event");
+        assert_eq!(
+            got.kind,
+            AuthBoundaryKind::Unreachable,
+            "no verdict exists when nobody answered — the operator must not be sent after the token"
+        );
+    }
+
+    /// The two outcomes that must produce **no** row.
+    ///
+    /// A ledger that fired on every successful delivery, or on every 500, would
+    /// stop being read — and a ledger nobody reads is worse than none, because
+    /// it looks like coverage.
+    #[test]
+    fn success_and_non_auth_failures_produce_no_row() {
+        assert!(classify_delivery_auth(None, &Ok(())).is_none());
+        assert!(classify_delivery_auth(Some("t"), &Ok(())).is_none());
+
+        let five_hundred: Result<()> = Err(DeliveryError::raise(
+            DeliveryFailureKind::Other,
+            "delivery failed: 500 Internal Server Error — ",
+        ));
+        assert!(classify_delivery_auth(Some("t"), &five_hundred).is_none());
+
+        // An error that is not a DeliveryError at all — e.g. raised upstream of
+        // the sink — carries no class and must not be guessed at.
+        let untyped: Result<()> = Err(anyhow::anyhow!("something else entirely"));
+        assert!(classify_delivery_auth(Some("t"), &untyped).is_none());
+    }
+
+    /// `Invalid` is a real kind of [`AuthBoundaryKind`] and this boundary never
+    /// produces it — stated as a test so the absence reads as a decision.
+    ///
+    /// `Invalid` means "present but structurally malformed", which requires a
+    /// shape check. The gateway applies one (hex validation on
+    /// `MIKA_INTERNAL_TOKEN`); the delivery boundary applies none, and inventing
+    /// a shape rule here would refuse tokens the endpoint would have accepted.
+    #[test]
+    fn the_delivery_boundary_never_claims_invalid() {
+        for token in [None, Some(""), Some("   "), Some("whatever")] {
+            for outcome in [
+                refused(),
+                Err(DeliveryError::raise(DeliveryFailureKind::Unreachable, "x")),
+                Err(DeliveryError::raise(DeliveryFailureKind::Other, "x")),
+                Ok(()),
+            ] {
+                if let Some(got) = classify_delivery_auth(token, &outcome) {
+                    assert_ne!(got.kind, AuthBoundaryKind::Invalid);
+                }
+            }
+        }
+    }
+
+    /// The delivery outcome reaches the cycle's caller, so the loop can count
+    /// consecutive failures without re-deriving them.
+    #[tokio::test]
+    async fn the_cycle_reports_the_auth_boundary_it_observed() {
+        struct RefusingDeliverer;
+        #[async_trait::async_trait]
+        impl ReportDeliverer for RefusingDeliverer {
+            async fn deliver(&self, _: &str, _: Option<&str>, _: &DeliveryBody) -> Result<()> {
+                Err(DeliveryError::raise(
+                    DeliveryFailureKind::CredentialRefused,
+                    "delivery failed: 401 Unauthorized — ",
+                ))
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = mk_config(tmp.path());
+        cfg.delivery_url = Some("http://127.0.0.1:1/report".into());
+        cfg.delivery_token = Some("a-token".into());
+
+        let outcome = run_manager_cycle_with(&cfg, base_state(), &RefusingDeliverer, Utc::now())
+            .await
+            .unwrap();
+
+        let observed = outcome.auth_boundary.expect("the cycle must surface it");
+        assert_eq!(observed.kind, AuthBoundaryKind::Rejected);
+        assert_eq!(observed.boundary_key(), "manager_to_delivery");
+        // The report still reached the operator — via the offline sink. A
+        // failed credential must not also lose the report.
+        assert!(outcome.delivered);
     }
 }

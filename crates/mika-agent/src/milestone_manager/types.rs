@@ -250,6 +250,15 @@ pub struct CycleOutcome {
     pub heartbeat_fired: bool,
     pub severity: Severity,
     pub generated_at: String,
+    /// The auth-boundary failure this cycle observed on its delivery attempt,
+    /// if any (mika#1949 U3).
+    ///
+    /// `#[serde(default)]` because the offline sink holds outcome blobs
+    /// written before this field existed, and an upgrade that could not read
+    /// its own backlog would lose it — same reasoning as
+    /// `Assessment::contention_events`.
+    #[serde(default)]
+    pub auth_boundary: Option<mika_common::auth_boundary::AuthBoundaryError>,
 }
 
 #[cfg(test)]
