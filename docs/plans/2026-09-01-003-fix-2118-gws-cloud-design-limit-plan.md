@@ -148,6 +148,16 @@ sait faux. La phase 3.3 les marque.
 skill et on ne touche pas à `validate_gws_input`. Le comportement du moteur est
 inchangé ; seul le prompt cesse de le contredire.
 
+**Statut : extension acceptée** (mika-arch, premier passage, F3). Elle reste
+hors AC et le plan ne prétend pas le contraire ; elle est retenue parce que
+corriger la taxonomie du code 2 (AC2) tout en laissant, dans le **même
+fichier**, trente lignes d'instructions que le moteur refuse reviendrait à
+livrer un prompt qu'on sait faux — c'est-à-dire à reproduire, un cran en amont,
+le défaut exact que ce ticket corrige. Si la revue de PR juge le diff prompt
+trop large, la réduction convenue est la section
+`## What this skill cannot do` **seule**, sans suppression des sections mortes :
+elle porte l'interdiction, qui est la partie liante.
+
 ### Hors périmètre
 
 - **Donner aux tenants cloud un accès aux credentials Google.** C'est la
@@ -218,6 +228,43 @@ le test échoue si la branche « expiré » diverge d'un caractère.
 → *Unité :* § Décision AC5 (maintenu) + Phase 4 (le commentaire dans
 `skill.toml` et la section correspondante de `system_prompt.md`).
 → *Preuve :* revue de diff — AC documentaire, pas testable.
+
+## Fire-Disposition
+
+Ce plan livre des **détecteurs** : les tests de la phase 5, dont deux gardent un
+contrat de préservation (5.4, identité octet-à-octet du message « expiré » ;
+5.6, non-fuite du diagnostic opérateur). Par le Fire-Disposition Gate
+(mika#1574), la disposition à la mise à feu se déclare contre le schéma
+canonique — **(a) exception nommée**, **(b) livré désactivé**,
+**(c) halte-et-remontée**.
+
+**Le tir au déploiement est structurellement impossible, pas seulement
+improbable.** Aucun de ces détecteurs ne balaie l'arbre existant : chacun
+s'exerce sur une fonction ou une sortie que **cette PR introduit ou modifie**.
+Il n'existe donc pas de classe « violation préexistante ailleurs dans le dépôt »
+susceptible de faire échouer une PR sans rapport. Les dispositions ci-dessous
+gouvernent le seul cas résiduel : un détecteur qui tire sur le code de cette PR.
+
+- **5.1, 5.2, 5.3, 5.5 (détecteurs de comportement neuf) → (c)
+  halte-et-remontée.** Ils décrivent ce que le correctif doit faire. Un tir est
+  la preuve que le correctif ne le fait pas. Pas d'exception, pas de
+  désactivation : on corrige le code, jamais le test.
+
+- **5.4 (contrat de préservation, AC4) → (c) halte-et-remontée, sans
+  exception possible.** Ce test assert que la branche « credentials présents
+  mais refusés » rend **exactement** la sortie actuelle. Un tir signifie que le
+  correctif a modifié le chemin qu'AC4 exige de ne pas toucher — c'est
+  précisément l'échec que le contrôle négatif existe pour attraper. Aucune
+  allowlist n'est offerte : une exception ici viderait AC4 de son sens.
+
+- **5.6 (non-fuite du diagnostic, mika#1783) → (c) halte-et-remontée.** Un tir
+  signifie que `dispatch_substrate_diagnostic` n'a pas été appelé au site
+  d'émission et que le détail opérateur part au modèle sur le tier famille.
+  C'est un défaut de confidentialité de tier, pas un faux positif.
+
+**Aucun détecteur n'est livré désactivé (b), et aucun ne porte d'allowlist
+(a).** Le motif est le même pour tous : leur domaine est le diff de cette PR,
+donc un tir désigne toujours un défaut du correctif, jamais un héritage.
 
 ## Phases
 
