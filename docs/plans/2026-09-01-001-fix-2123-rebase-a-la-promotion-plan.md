@@ -125,11 +125,13 @@ attempts a late rebase on a weeks-old branch and gives up.
 
 ### Key Technical Decisions
 
-- KTD1. **The gate lives in `auto_pull`, and it reuses the gesture that exists.**
-  `operator-review` is already a structural exclusion in `is_feeder_excluded`
-  (`auto_pull.rs:349`), and `gh_apply_label(.., "operator-review")` is already
-  called at `:966` for the abandonment path. Applying it is therefore enough to
-  withdraw a ticket without inventing a state. Governs R3.
+- KTD1. **The gate lives in `auto_pull` and withdraws a ticket with a label.**
+  ~~It reuses the gesture that exists: `operator-review`, already a structural
+  exclusion in `is_feeder_excluded` and already applied at `:966`.~~
+  **Corrected during implementation, 2026-09-01 — see Verified constraints C5.**
+  That gesture has never worked: `operator-review` is declared nowhere and does
+  not exist. The gate refuses with `operator-gated`, which does, and
+  `is_feeder_excluded` learns it so the refusal persists. Governs R3.
 - KTD2. **The promotion-time measurement is an API call, not a git call.**
   `auto_pull` has no checkout (see Verified constraints), so it cannot run
   `rev-list`. It calls `gh api .../compare/main...<branch>` and reads `behind_by`,
@@ -181,6 +183,40 @@ attempts a late rebase on a weeks-old branch and gives up.
 | `feat/1403/…` | 120 | 3 | `diverged` | `REBASE_CONFLICT` |
 | `design/1651/…` | 109 | 6 | `diverged` | `REBASE_CONFLICT` |
 | `feat/1949/…` | **0** | 5 | `ahead` | PR ouverte, `MERGEABLE` |
+
+- **C5 (added 2026-09-01, during implementation). The hand-back label does not
+  exist, and the existing hand-back has never fired.** Measured, three ways:
+  `gh label list --repo senara-solutions/mika` does not list `operator-review`;
+  `.github/labels.yml` does not declare it — with the control that it *does*
+  declare `ready` (`:102`) and `operator-gated` (`:106`), so the file is the
+  source of truth; and `server.log` carries **48** occurrences of
+
+  ```text
+  gh issue edit --add-label failed for #2117:
+    'operator-review' not found
+  ```
+
+  `blocked`, the module's other exclusion label, is equally absent. The
+  consequence is worse than a failed label: `abandon_stuck_ready` removes
+  `ready` only *after* the label lands, so when the label fails the ticket keeps
+  `ready` and stays in the pool permanently. The mika#2020 arrest is inert.
+
+  **What this changes for U2.** Refusing with `operator-review` would have
+  reproduced that failure exactly — refusing to promote while marking nothing,
+  leaving the ticket promotable on the next tick. The gate therefore (a) refuses
+  with `operator-gated`, whose declared description is already the state a
+  refusal creates ("Groomed work requiring operator-host-time… No ready label"),
+  (b) teaches `is_feeder_excluded` that label so the refusal persists, (c)
+  **checks** the apply result and escalates a failure to `ERROR` under its own
+  event key `auto_pull_refusal_marker_unavailable` instead of one WARN among
+  thousands, and (d) carries a test that reads `.github/labels.yml` and fails if
+  the gate's label is not declared there.
+
+  **Explicitly NOT in this lot:** declaring `operator-review`/`blocked`, and
+  repairing `abandon_stuck_ready`'s inert arrest. Distinct defect, distinct
+  blast radius (it strands `ready` forever on disjuncted tickets — #2117, #1651,
+  #1403 observed). Filed separately rather than fixed silently inside a
+  rebase-gate change.
 
 ### Sequencing
 
@@ -325,10 +361,10 @@ world with nothing to refresh look identical from the dispatch side without it.
 
 Transcribed from the issue, with the unit that satisfies each.
 
-- **AC1** — Le retard d'une branche sur `origin/main` est mesuré et journalisé
+- [x] **AC1** — Le retard d'une branche sur `origin/main` est mesuré et journalisé
   **avant** la promotion, dans un champ structuré (pas un substring de message).
   → **U1**.
-- **AC2** — Une tentative de rafraîchissement a lieu à la promotion ; si elle
+- [x] **AC2** — Une tentative de rafraîchissement a lieu à la promotion ; si elle
   échoue, le ticket n'est pas promu, l'échec est nommé, une trace d'audit est
   écrite, aucun dispatch n'est consommé. → **U2**, avec une **rectification que le
   ticket ne pouvait pas connaître** : `auto_pull` n'a pas de checkout, donc aucune
@@ -338,18 +374,18 @@ Transcribed from the issue, with the unit that satisfies each.
   (pas de promotion, échec nommé, audit, dispatch préservé) est satisfait tel
   quel. La rectification est signalée ici plutôt que l'AC réputé satisfait en
   silence.
-- **AC3** — Contrôle négatif : une branche à retard 0 et une branche en retard
+- [x] **AC3** — Contrôle négatif : une branche à retard 0 et une branche en retard
   mais rebasable doivent **toutes deux passer**. → **U2**, test nommé, avec la
   démonstration qu'il vire au rouge si la branche de refus est rendue
   inconditionnelle.
-- **AC4** — Preuve de non-vacuité : rejouer la promotion de #1680 doit produire un
+- [x] **AC4** — Preuve de non-vacuité : rejouer la promotion de #1680 doit produire un
   refus **nommé**, pas un dispatch. Fixture figée sur l'état du 2026-08-31.
   → **U4**.
-- **AC5** — Le sort des commits `wip(...)` est décidé et écrit ; une branche qui
+- [x] **AC5** — Le sort des commits `wip(...)` est décidé et écrit ; une branche qui
   en porte est traitée différemment d'une branche qui ne porte qu'un plan, et la
   règle est explicite. → **U3**, tranché : `ahead_by > 1` et `behind_by > 0` →
   jamais auto-promue.
-- **AC6** — Mesure post-correctif du taux `STATUS=REBASE_CONFLICT` **par
+- [x] **AC6** — Mesure post-correctif du taux `STATUS=REBASE_CONFLICT` **par
   dispatch**, jamais en compte brut. → Verification Contract.
 
 ## Definition of Done

@@ -1523,6 +1523,21 @@ _set_up_worktree() {
             rm -f "$wt_err_1" "$wt_err_2"
         fi
 
+        # mika#2123 kept this rebase deliberately, and it is worth saying why: the
+        # promotion-time gate added in `auto_pull` has no checkout, so it only
+        # ever *measures*. This is still the only place anything is rebased.
+        #
+        # Every outcome is emitted under one greppable `rebase_gate` key, because
+        # the question the gate cannot answer from its own side — is the loop
+        # still refreshing anything, or has the gate grown so strict that nothing
+        # reaches here? — needs a number. A gate refusing everything and a world
+        # with nothing left to refresh look identical from this side without it.
+        #
+        # The rationale sits ABOVE the anchor line on purpose: test 12g reads the
+        # region from `Rebase-or-abort guard` to the first `fi`, and both the
+        # comment length and any extra `if` block in between would silently
+        # shrink what that guard can see.
+        #
         # Rebase-or-abort guard
         BEHIND=$(git -C "$WORKTREE_DIR" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
         if [ "$BEHIND" -gt 0 ]; then
@@ -1538,6 +1553,7 @@ _set_up_worktree() {
             rebase_err=$(mktemp "${TMPDIR:-/tmp}/dispatch-lib-rebase-err.XXXXXX")
             if git -C "$WORKTREE_DIR" rebase origin/main 2>"$rebase_err"; then
                 echo "Rebased ${BRANCH} onto origin/main (${BEHIND} commits caught up)." >&2
+                echo "[dispatch-lib] rebase_gate: branch=${BRANCH} behind=${BEHIND} ran=1 result=ok" >&2
                 rm -f "$rebase_err"
             else
                 # Capture conflict list and rebase reason BEFORE --abort resets the index.
@@ -1551,6 +1567,7 @@ _set_up_worktree() {
                 fi
                 git -C "$WORKTREE_DIR" rebase --abort 2>/dev/null || true
                 rm -f "$rebase_err"
+                echo "[dispatch-lib] rebase_gate: branch=${BRANCH} behind=${BEHIND} ran=1 result=${rebase_mode}" >&2
                 RESULT="STATUS=REBASE_CONFLICT
 Branch ${BRANCH} is ${BEHIND} commits behind origin/main.
 Rebase failure mode: ${rebase_mode}
@@ -1559,6 +1576,8 @@ Rebase stderr: ${rebase_reason:-<empty>}
 Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
                 exit 1
             fi
+        else
+            echo "[dispatch-lib] rebase_gate: branch=${BRANCH} behind=0 ran=0 result=skipped" >&2
         fi
 
         # Copy gitignored .claude/ config into worktree (relay + permissions only)
