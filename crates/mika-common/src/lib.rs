@@ -14,6 +14,7 @@ pub mod mcp_config_path;
 pub mod oauth;
 pub mod permission_authority;
 pub mod team;
+pub mod telegram;
 pub mod telemetry;
 pub mod text;
 pub mod trace;
