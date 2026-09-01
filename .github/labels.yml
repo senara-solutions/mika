@@ -109,11 +109,11 @@
 
 - name: operator-review
   color: "b60205"
-  description: "Auto-pull abandoned this ticket: the loop gave up and an operator must look. Applied by auto_pull; a structural feeder exclusion."
+  description: "Auto-pull gave up; an operator must look. A structural feeder exclusion."
 
 - name: blocked
   color: "b60205"
-  description: "Not dispatchable until something outside the ticket changes. A structural feeder exclusion, like operator-review."
+  description: "Not dispatchable until something outside the ticket changes. Feeder exclusion."
 
 - name: pipeline-exempt
   color: "bfdadc"
