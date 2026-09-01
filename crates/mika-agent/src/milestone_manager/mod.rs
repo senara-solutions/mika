@@ -61,6 +61,45 @@
 //! `/tests/`, so a `src/milestone_manager/tests/` directory would be auto-mergeable
 //! inside the very module Porte 1 gates. The manager's own test code belongs beside the
 //! module files, as `no_dispatch_test.rs` does.
+//!
+//! ### Porte 3 — `INTERNAL_TOKEN` alignment (mika#1949)
+//!
+//! **Discharge condition:** every cross-boundary authentication failure on the
+//! manager write path is *distinguishable* — the operator can tell which of the
+//! four tokens failed, at which boundary, and why, from the report and from
+//! `audit_events`, without reading a log. It is **not** that the four tokens
+//! become one; unification is deferred to a Phase 3 refactor.
+//!
+//! What Porte 3 does **not** ask for: that a write proceed past a failed
+//! credential. Fail-closed is the property being protected. What changes is
+//! that the closure is now named instead of silent.
+//!
+//! **Status: NOT discharged.** The `gateway_to_spirit` boundary
+//! (`crate::server::auth`) is not yet instrumented — that unit edits
+//! authentication-decision code and is blocked pending operator review. The
+//! other three boundaries are. See `senara-solutions/mika#1949`.
+//!
+//! **Post-deploy verification** — after a cadence cycle:
+//!
+//! ```sql
+//! SELECT target_key, after_value, count(*)
+//! FROM audit_events
+//! WHERE tool_name = 'auth_boundary'
+//! GROUP BY 1, 2;
+//! ```
+//!
+//! `target_key` is `<from>_to_<to>`; `after_value` is the failure kind
+//! (`missing`/`empty`/`invalid`/`rejected`/`unreachable`). Row shape documented
+//! in `crates/mika-agent/CLAUDE.md § Audit Log`; operator rotation procedure in
+//! `mika-platform/docs/operator/token-rotation-procedure.md`.
+//!
+//! **The role question is settled and does not need re-deriving.** The manager
+//! authenticates to cm as `Role::CommandPlane`. No `Role::Manager` variant was
+//! created: `/messages/dispatch` was already permitted to the command plane, and
+//! `/permission-events` is deliberately refused to it (an audit corpus a caller
+//! could otherwise forge). The manager's audit trail is mika's own
+//! `audit_events`, never cm's. Pinned by `manager_write_path_needs_no_new_role`
+//! in `control-monitor/backend/crates/cm-api/src/scope.rs`.
 
 pub mod assessor;
 pub mod cadence;
@@ -74,11 +113,12 @@ mod no_dispatch_test;
 
 pub use assessor::{Assessor, AssessorConfig};
 pub use cadence::{
-    CycleKind, DeliveryBody, HttpReportDeliverer, ManagerConfig, MilestoneCheckpoint,
-    ReportDeliverer, run_manager_cycle, run_manager_cycle_with, state_digest,
+    CycleContext, CycleKind, DeliveryBody, DeliveryError, DeliveryFailureKind, HttpReportDeliverer,
+    ManagerConfig, MilestoneCheckpoint, ReportDeliverer, run_manager_cycle, run_manager_cycle_in,
+    run_manager_cycle_with, run_manager_cycle_with_auth, state_digest,
 };
 pub use reader::{GhRunner, ProcessGhRunner, Reader, compose_from_gh_outputs};
-pub use reporter::Reporter;
+pub use reporter::{AuthBoundaryNote, AuthBoundaryTracker, Reporter};
 pub use spawn::{
     AuthAlarmBody, AuthAlarmSink, HttpAuthAlarmSink, SettingsTokenResolver, TokenResolver,
     manager_config_from_env, spawn_manager_cycle_task,

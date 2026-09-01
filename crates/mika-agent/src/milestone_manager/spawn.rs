@@ -27,9 +27,15 @@
 //! (fail-open). Graceful shutdown responds to SIGTERM within one poll
 //! interval.
 
-use super::cadence::{ManagerConfig, run_manager_cycle};
+use super::cadence::{
+    DeliveryError, DeliveryFailureKind, ManagerConfig, classify_delivery_auth,
+    run_manager_cycle_with_auth,
+};
 use super::reader::{GhRunner, ProcessGhRunner};
+use super::reporter::{AuthBoundaryNote, AuthBoundaryTracker};
 use super::types::MilestoneRef;
+use crate::auth_boundary_ledger::AuthBoundaryLedger;
+use mika_common::auth_boundary::AuthBoundaryError;
 use mika_common::config::Settings;
 use mika_common::github_app::GitHubApp;
 use serde::Serialize;
@@ -205,6 +211,7 @@ pub fn spawn_manager_cycle_task(
     mut cfg: ManagerConfig,
     cancel: CancellationToken,
     token_resolver: Arc<dyn TokenResolver>,
+    auth_ledger: Option<Arc<dyn AuthBoundaryLedger>>,
 ) -> Option<JoinHandle<()>> {
     // mika#1968 AC6 (change 6b) — diagnostic PID log emitted BEFORE the guard
     // check so operators can distinguish "two mika-spirit processes" (two
@@ -312,6 +319,13 @@ pub fn spawn_manager_cycle_task(
         let mut auth_tracker = AuthFailureTracker::default();
         let alarm_sink = HttpAuthAlarmSink::new();
 
+        // mika#1949 U3/U4 — auth-boundary observation state. `boundary_tracker`
+        // counts consecutive failures on one credential; `pending_auth_notes`
+        // carries them into the NEXT report, because a failure observed while
+        // delivering a report cannot appear in the report it was delivering.
+        let mut boundary_tracker = AuthBoundaryTracker::default();
+        let mut pending_auth_notes: Vec<AuthBoundaryNote> = Vec::new();
+
         let poll = duration_from_chrono(cfg.poll_interval);
         let mut interval = tokio::time::interval(poll);
         // Skip the first immediate fire so we don't cycle before the server
@@ -342,11 +356,36 @@ pub fn spawn_manager_cycle_task(
             // `installation_token()`, we simply never asked for it again.
             refresh_cycle_token(&mut cfg, token_resolver.as_ref()).await;
 
-            match run_manager_cycle(&cfg).await {
+            match run_manager_cycle_with_auth(&cfg, auth_ledger.as_ref(), &pending_auth_notes).await
+            {
                 Ok(outcome) => {
                     // A successful cycle proves auth works — close any open
                     // failure window (mika#2013 volet B).
                     auth_tracker.on_success();
+
+                    // mika#1949 U3/U4 — drop the carried notes ONLY if the
+                    // report they were rendered into actually went out. A
+                    // no-op cycle composes and delivers nothing, and clearing
+                    // there would drop an auth failure before any operator
+                    // ever saw it — the exact silence this ticket exists to
+                    // close.
+                    if outcome.delivered {
+                        pending_auth_notes.clear();
+                    }
+
+                    // Three states, not two. `auth_boundary: None` covers a
+                    // delivery that authenticated, an offline-sink write, and
+                    // a cycle that attempted nothing — and only the first is
+                    // evidence the credential works. `auth_attempted`
+                    // separates them. Reading a no-op as success would reset
+                    // the repeat counter between almost every pair of real
+                    // failures (5-min poll against a 6 h heartbeat) and make
+                    // the `Blocked` escalation unreachable in practice.
+                    match outcome.auth_boundary.clone() {
+                        Some(err) => pending_auth_notes.push(boundary_tracker.observe(err)),
+                        None if outcome.auth_attempted => boundary_tracker.reset(),
+                        None => {}
+                    }
                     if outcome.delivered {
                         info!(
                             target: "mika::milestone_manager",
@@ -385,7 +424,29 @@ pub fn spawn_manager_cycle_task(
                     // run — 401 or, since mika#2063, 403 — now escalates instead of
                     // scrolling past as another WARN.
                     if let Some(alarm) = auth_tracker.on_failure(auth_class, Instant::now()) {
-                        emit_auth_alarm(&cfg, &alarm, &alarm_sink).await;
+                        let emission =
+                            emit_auth_alarm(&cfg, &alarm, &alarm_sink, auth_ledger.as_ref()).await;
+                        // The escalation channel must be able to escalate about
+                        // itself: fold its own auth failure into the same
+                        // counter and the same report the report-delivery path
+                        // uses.
+                        if let Some(err) = emission.auth_boundary {
+                            pending_auth_notes.push(boundary_tracker.observe(err));
+                        }
+                        // Whether the alarm actually left the box was returned
+                        // and discarded before mika#1949. `emit_auth_alarm`
+                        // already logs both arms, but neither line carries the
+                        // cycle's `auth_class`, so a reader grepping
+                        // `manager_cycle_error` could not tell a surfaced alarm
+                        // from one that only reached the local log.
+                        info!(
+                            target: "mika::milestone_manager",
+                            event = "manager_auth_alarm_emitted",
+                            milestone = %cfg.target.as_display(),
+                            auth_class = auth_class.as_str(),
+                            escalated = emission.escalated,
+                            "persistent-auth-failure alarm emitted"
+                        );
                     }
                 }
             }
@@ -913,12 +974,34 @@ impl AuthAlarmSink for HttpAuthAlarmSink {
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
-        let res = req.send().await?;
+        // mika#1949 U3: same typed-cause treatment as `HttpReportDeliverer` —
+        // the message text is unchanged, a downcastable cause was added under
+        // it so the boundary can be classified.
+        let res = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                let kind = if e.is_connect() || e.is_timeout() {
+                    DeliveryFailureKind::Unreachable
+                } else {
+                    DeliveryFailureKind::Other
+                };
+                return Err(DeliveryError::raise(
+                    kind,
+                    format!("auth alarm escalation failed: {e}"),
+                ));
+            }
+        };
         if !res.status().is_success() {
             let status = res.status();
+            let refused = matches!(status.as_u16(), 401 | 403);
             let text = res.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!(
-                "auth alarm escalation failed: {status} — {text}"
+            return Err(DeliveryError::raise(
+                if refused {
+                    DeliveryFailureKind::CredentialRefused
+                } else {
+                    DeliveryFailureKind::Other
+                },
+                format!("auth alarm escalation failed: {status} — {text}"),
             ));
         }
         Ok(())
@@ -929,7 +1012,26 @@ impl AuthAlarmSink for HttpAuthAlarmSink {
 /// `escalation_url` is configured. Returns whether the escalation was
 /// delivered (`false` when unset or when the POST failed — the ERROR log is
 /// the floor, the escalation is the amplifier).
-async fn emit_auth_alarm(cfg: &ManagerConfig, alarm: &AuthAlarm, sink: &dyn AuthAlarmSink) -> bool {
+/// Outcome of an alarm emission: whether the escalation was delivered, and any
+/// auth-boundary failure the attempt itself ran into (mika#1949 U3).
+///
+/// The second half exists because the escalation channel is the one place this
+/// module argues silence is worst — and before it, a refused escalation
+/// credential wrote an audit row and nothing else: the repeat counter never
+/// advanced, no note ever reached a report, and the failure was visible only to
+/// someone who thought to run the SQL by hand. The channel that escalates for
+/// everyone else could not escalate about itself.
+pub(crate) struct AlarmEmission {
+    pub escalated: bool,
+    pub auth_boundary: Option<AuthBoundaryError>,
+}
+
+async fn emit_auth_alarm(
+    cfg: &ManagerConfig,
+    alarm: &AuthAlarm,
+    sink: &dyn AuthAlarmSink,
+    auth_ledger: Option<&Arc<dyn AuthBoundaryLedger>>,
+) -> AlarmEmission {
     error!(
         target: "mika::milestone_manager",
         event = "manager_auth_persistent_failure",
@@ -943,7 +1045,12 @@ async fn emit_auth_alarm(cfg: &ManagerConfig, alarm: &AuthAlarm, sink: &dyn Auth
 
     let url = match cfg.escalation_url.as_deref() {
         Some(u) if !u.is_empty() => u,
-        _ => return false,
+        _ => {
+            return AlarmEmission {
+                escalated: false,
+                auth_boundary: None,
+            };
+        }
     };
 
     let body = AuthAlarmBody {
@@ -955,7 +1062,19 @@ async fn emit_auth_alarm(cfg: &ManagerConfig, alarm: &AuthAlarm, sink: &dyn Auth
         generated_at: chrono::Utc::now().to_rfc3339(),
     };
 
-    match sink.send(url, cfg.delivery_token.as_deref(), &body).await {
+    let outcome = sink.send(url, cfg.delivery_token.as_deref(), &body).await;
+    // mika#1949 U3 — the alarm escalation crosses the same manager-to-delivery
+    // boundary as the report, on the same credential. An escalation that
+    // itself failed to authenticate is the worst place for silence.
+    let auth_boundary = classify_delivery_auth(
+        cfg.delivery_token.as_deref(),
+        env::var(ENV_DELIVERY_TOKEN).is_ok(),
+        &outcome,
+    );
+    if let Some(err) = auth_boundary.as_ref() {
+        crate::auth_boundary_ledger::record_if_wired(auth_ledger, err);
+    }
+    let escalated = match outcome {
         Ok(()) => {
             info!(
                 target: "mika::milestone_manager",
@@ -975,6 +1094,10 @@ async fn emit_auth_alarm(cfg: &ManagerConfig, alarm: &AuthAlarm, sink: &dyn Auth
             );
             false
         }
+    };
+    AlarmEmission {
+        escalated,
+        auth_boundary,
     }
 }
 
@@ -1477,7 +1600,7 @@ mod tests {
             chrono::Duration::milliseconds(50),
         );
         let cancel = CancellationToken::new();
-        let handle = spawn_manager_cycle_task(cfg, cancel.clone(), static_resolver(None))
+        let handle = spawn_manager_cycle_task(cfg, cancel.clone(), static_resolver(None), None)
             .expect("first spawn returns Some(handle)");
 
         // Let the loop tick at least once.
@@ -1930,12 +2053,12 @@ mod tests {
         let cfg2 = cfg1.clone();
 
         let cancel = CancellationToken::new();
-        let first = spawn_manager_cycle_task(cfg1, cancel.clone(), static_resolver(None));
+        let first = spawn_manager_cycle_task(cfg1, cancel.clone(), static_resolver(None), None);
         assert!(first.is_some(), "first spawn must return Some(handle)");
 
         // Second call MUST be rejected — regardless of whether the first
         // task is still running.
-        let second = spawn_manager_cycle_task(cfg2, cancel.clone(), static_resolver(None));
+        let second = spawn_manager_cycle_task(cfg2, cancel.clone(), static_resolver(None), None);
         assert!(
             second.is_none(),
             "second spawn within same process must be rejected"
@@ -2065,7 +2188,7 @@ mod tests {
         let calls = resolver.calls.clone();
 
         let cancel = CancellationToken::new();
-        let handle = spawn_manager_cycle_task(cfg, cancel.clone(), Arc::new(resolver))
+        let handle = spawn_manager_cycle_task(cfg, cancel.clone(), Arc::new(resolver), None)
             .expect("spawn returns Some(handle)");
 
         // Wait for the CONDITION, not a fixed duration: the boot-time
@@ -2290,7 +2413,7 @@ mod tests {
             consecutive_cycles: 7,
         };
 
-        let escalated = emit_auth_alarm(&cfg, &alarm, &sink).await;
+        let escalated = emit_auth_alarm(&cfg, &alarm, &sink, None).await.escalated;
         assert!(escalated, "configured escalation_url must be used");
 
         let sent = sink.sent.lock().unwrap();
@@ -2321,7 +2444,7 @@ mod tests {
             consecutive_cycles: 7,
         };
 
-        let escalated = emit_auth_alarm(&cfg, &alarm, &sink).await;
+        let escalated = emit_auth_alarm(&cfg, &alarm, &sink, None).await.escalated;
         assert!(escalated, "configured escalation_url must be used");
 
         let sent = sink.sent.lock().unwrap();
@@ -2351,7 +2474,7 @@ mod tests {
             consecutive_cycles: 7,
         };
 
-        let escalated = emit_auth_alarm(&cfg, &alarm, &sink).await;
+        let escalated = emit_auth_alarm(&cfg, &alarm, &sink, None).await.escalated;
         assert!(!escalated);
         assert!(sink.sent.lock().unwrap().is_empty());
     }
