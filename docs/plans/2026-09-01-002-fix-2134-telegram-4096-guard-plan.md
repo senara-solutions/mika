@@ -130,16 +130,51 @@ refus lui-même**, qui dit au modèle que la découpe lui revient.
   touche pas : c'est déjà sous la limite. La faire pointer sur la nouvelle
   constante serait du bundling.
 
-## Acceptance Criteria (repris du ticket, tie-back)
+## Acceptance criteria
 
-| AC | Engagement du plan |
-|---|---|
-| **AC1** — la limite appliquée est celle du transport (4096), pas `MAX_INPUT_LEN` | Phase 1 + Phase 2, étape 2.2 |
-| **AC2** — le refus nomme le transport et sa limite | Phase 2, étape 2.3 |
-| **AC3** — contrôle négatif : 4095 passe | Phase 4, test `refuse_...` / `accepte_4095` |
-| **AC4** — un test couvre la fenêtre 4096–10 000 (5000 refusé par l'outil) | Phase 4, test `fenetre_5000_refusee_par_l_outil` |
-| **AC5** — la propriété de la découpe est décidée et écrite | § Décision AC5 + Phase 1 (doc constante), Phase 2.3 (message), Phase 3.1 (commentaire gateway) |
-| **AC6** — preuve de non-vacuité : rejouer 12 000 et 5000 | Phase 4, test `rejeu_2026_09_01` + § Preuve |
+Transcrits depuis le corps de mika#2134, chacun avec l'unité d'implementation
+qui le satisfait et l'artefact qui le prouve.
+
+**AC1** — La limite appliquée à un envoi Telegram est celle du transport
+(**4096**), pas une constante générique d'outil. Si `MAX_INPUT_LEN` doit rester
+à 10 000 pour d'autres champs, `send_message` porte sa propre borne.
+→ *Unité :* Phase 1.1 (`mika_common::telegram::MAX_TEXT_UTF16_UNITS`) + Phase 2.2
+(`send_message.rs` mesure contre elle, `MAX_INPUT_LEN` retiré de l'import).
+→ *Preuve :* tests 4.2 et 4.3.
+
+**AC2** — Le message de refus **nomme le transport et sa limite**, pas une
+constante interne.
+→ *Unité :* Phase 2.3 (chaîne de refus citant « Telegram », « 4096 » et la
+longueur mesurée) + Phase 2.4 (la description de l'outil l'annonce avant l'appel).
+→ *Preuve :* tests 4.3 et 4.4 assertent la présence de `4096` et de la longueur
+dans le contenu de l'erreur.
+
+**AC3** — **Contrôle négatif obligatoire** : un message de 4095 caractères doit
+**passer**.
+→ *Unité :* Phase 2.2 (comparaison stricte `>`, pas `>=`).
+→ *Preuve :* test 4.1 `accepte_4095_controle_negatif` — assertion sur
+`mock.sent()`, donc sur la **livraison** et pas seulement sur l'absence
+d'erreur ; renforcé par 4.2 (4096 exactement) et 4.5 (4000 caractères accentués).
+
+**AC4** — Un test couvre explicitement la **fenêtre 4096–10 000** : 5000
+caractères refusés **par l'outil**, avec leur raison, et non partis puis morts au
+transport.
+→ *Unité :* Phase 2.1 (garde avant l'envoi et avant la persistance) + Phase 2.2.
+→ *Preuve :* test 4.3 `fenetre_5000_refusee_par_l_outil`, dont l'assertion
+décisive est `mock.sent().is_empty()`.
+
+**AC5** — Décider et écrire si la découpe appartient à l'agent ou au gateway.
+→ *Unité :* § Décision AC5 (la découpe reste à l'agent, raison :
+relation 1:1 avec `outbound_messages`) + Phase 1.1 (doc du module),
+Phase 2.3 (le refus le dit au modèle), Phase 3.2 (le commentaire du gateway
+porte la décision au lieu de la sous-entendre).
+→ *Preuve :* revue de diff — c'est un AC documentaire, pas testable.
+
+**AC6** — Preuve de non-vacuité : rejouer 12 000 et 5000, les deux refusés avec
+une raison exploitable, avant le transport.
+→ *Unité :* Phases 2.1–2.3.
+→ *Preuve :* test 4.4 `rejeu_2026_09_01` + § Preuve de non-vacuité (les tests
+4.3/4.4 doivent **échouer sur `main`** avant d'être verts avec le correctif).
 
 ## Phases
 
@@ -227,10 +262,26 @@ la résolution du client Telegram, refuser si
 send as-is)` par une version qui porte la décision AC5 et sa raison (relation
 1:1 avec `outbound_messages`, cf. § Décision AC5), en citant mika#2134.
 
-**Pourquoi cette phase existe.** C'est la seule couche qui mesure le texte
-**préfixé**, et c'est le seul point que les ~15 appelants non-outil traversent
-tous. Elle transforme un `502 BAD_GATEWAY` opaque en une raison nommée qui
-remonte telle quelle : `messaging.rs:150` inclut déjà le corps de la réponse
+**Extension de périmètre — revendiquée, pas subie.** Aucun AC ne demande cette
+phase ; AC1 porte sur la garde de l'outil. Je la retiens quand même, et je le
+dis ici plutôt que de la faire passer pour une conséquence des ACs. Trois
+raisons : (a) c'est la seule couche qui mesure le texte **préfixé**, donc la
+seule qui puisse fermer la fenêtre résiduelle des agents nommés — l'agent ne
+peut pas la fermer, il ne connaît pas le préfixe ; (b) AC5 exige que le choix
+`send as-is` du gateway « reste explicite ou change », ce qui met le fichier du
+gateway dans le périmètre de toute façon ; (c) le ticket est classé dans le
+milestone « Passerelle et cloud ».
+
+**Ce qu'elle ne remplace pas.** Elle ne clôt PAS la question des ~15 appelants
+non-outil. Ils continuent d'envoyer un texte non borné ; le gateway leur rendra
+désormais une raison nommée au lieu d'un 502 opaque, ce qui rend leur défaut
+**visible**, pas corrigé. Chacun devra décider ce qu'il fait d'un texte trop
+long (découper, tronquer, escalader) — travail à ficher séparément, par
+appelant, et explicitement hors de ce ticket. Si un implémenteur lit cette
+phase comme « les appelants sont couverts », il l'a mal lue.
+
+**Le mécanisme.** Elle transforme un `502 BAD_GATEWAY` opaque en une raison
+nommée qui remonte telle quelle : `messaging.rs:150` inclut déjà le corps de la réponse
 dans le `bail!` (`gateway /send returned {status}: {body_snippet}`, 200
 caractères), donc la phrase arrive au modèle via `SendOutcome::Failed { reason }`
 puis `ToolOutput::error`. Aucune plomberie supplémentaire.
