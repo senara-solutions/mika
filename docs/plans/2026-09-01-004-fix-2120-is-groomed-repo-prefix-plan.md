@@ -72,14 +72,43 @@ Relevé à `origin/main = 50d969a7` :
 | `dispatch-lib.sh:3851` idempotence du writer | `grep -cF 'docs/plans/'` | tolérant |
 | `dispatch-lib.sh:1227` porte de dispatch | essaie `$plan_path` **et** `${plan_path#repo/}` | tolérant, **explicitement** |
 
-Deux choses en découlent :
+**Et le chemin de plan n'est pas le seul axe où `is_groomed` est plus étroit que
+ses voisins.** Le verdict de grooming existe en **trois** formes reconnues par
+`executor.rs` (`:946`, `:949`, `:968`) :
+
+| forme | `executor.rs` | `dispatch-lib.sh:3865` | `auto_pull::is_groomed` |
+|---|---|---|---|
+| `second-pass (GROOMED…` | oui | oui | **oui** |
+| `second-pass (READY, paraphrased GROOMED` | oui | oui | **non** |
+| `first-pass (READY, single-pass GROOMED` (mika#2012) | oui | oui | **non** |
+
+`dispatch-lib.sh:3865` porte l'instruction en toutes lettres — « This pattern
+MUST stay in lockstep with executor.rs's three verdict regexes » — et l'honore.
+`is_groomed` ne connaît que la première. **Un grooming qui converge en un seul
+passage produit donc un ticket que l'alimenteur ne voit pas**, exactement comme
+le préfixe de dépôt.
+
+Ce n'est pas une hypothèse : **ce ticket-ci en est le cas.** Son grooming a
+reçu `Disposition: READY` au premier passage, son callout porte donc la forme
+canonique `first-pass (READY, single-pass GROOMED)` — véridique, acceptée par la
+porte de dispatch, et **invisible à l'alimenteur**. Le p1 qui décrit
+l'invisibilité est lui-même invisible, par une seconde voie que le corps du
+ticket ne nommait pas. (Il reste dispatchable : le label `ready` passe par
+`executor.rs::check_grooming_markers`, qui accepte les trois formes.)
+
+Trois choses en découlent :
 
 1. **Le dépôt sait déjà que les deux formes existent.** Le commentaire de
    `dispatch-lib.sh:1224` le dit mot pour mot : « The callout carries two
    historical shapes: repo-prefixed (`mika/docs/plans/…`) and repo-relative
    (`docs/plans/…`). Try both ». Un lecteur qui n'en accepte qu'une n'applique
    pas une règle, il en ignore une déjà écrite ailleurs.
-2. **Corriger `is_groomed` seul déplace la panne.** Un ticket à callout préfixé
+2. **`is_groomed` est étroit sur deux axes, pas un.** Le corps du ticket a
+   trouvé le premier (le chemin) ; le second (le verdict) a la même forme et la
+   même cause — un lecteur plus strict que ses écrivains légitimes — et se
+   corrige dans la même fonction, au même endroit. Les traiter séparément
+   ferait rejouer le p1 au premier grooming convergent.
+3. **Corriger `is_groomed` seul déplace la panne.** Un ticket à callout préfixé
    passerait alors la promotion, puis `PLAN_PATH` rendrait vide en `:4405` et le
    chemin `/ce-work` serait sauté sans un mot. C'est exactement le « il mourrait
    plus loin, après avoir consommé un créneau » du commentaire du 18:13Z. La
@@ -143,6 +172,26 @@ donné par l'issue, pas par le chemin.
 
 Les lecteurs restent permissifs **pour l'historique**, pas pour légitimer les
 deux formes : détection permissive, écriture unique.
+
+### Extension de périmètre — revendiquée : l'axe du verdict
+
+Aucun AC ne nomme le verdict ; AC1 à AC3 portent sur le chemin de plan. Je la
+retiens et je le dis, plutôt que de la faire passer pour une conséquence des ACs.
+
+Trois appuis. **Même défaut, même fonction, même ligne** : `is_groomed` a trois
+prédicats, deux sont trop étroits, et les deux se corrigent dans le même
+`OnceLock`. **L'instruction existe déjà et n'est pas honorée** : `dispatch-lib.sh:3865`
+prescrit le lockstep avec les trois regex d'`executor.rs`, et
+`is_groomed` est le seul des trois lecteurs à ne pas le tenir. **Le coût de
+l'omission est mesuré sur ce ticket même** : livrer le correctif du chemin sans
+celui du verdict rendrait visible un ticket groomé en deux passages et laisserait
+invisible tout ticket groomé en un — c'est-à-dire rouvrirait le p1 par la porte
+d'à côté, au premier grooming convergent.
+
+**Bornes :** on aligne `is_groomed` sur les trois formes déjà reconnues par
+`executor.rs`. On n'invente aucune forme, on n'en retire aucune, et on ne touche
+ni à `executor.rs` ni à `dispatch-lib.sh:3865` — qui sont, sur cet axe, la
+référence à rejoindre.
 
 ### Hors périmètre
 
@@ -250,6 +299,9 @@ préexistante ailleurs » capable de faire échouer une PR sans rapport.
   ouvrir. Offrir une allowlist ici viderait AC2 de son sens.
 - **4.5 (bloc de code, AC6) → (c) halte-et-remontée.** Un tir signifie que le
   garde est de nouveau piégeable par un ticket qui parle du garde.
+- **4.7b (contrôle négatif du verdict) → (c) halte-et-remontée, sans
+  exception.** Un tir signifie que l'alternance élargie accepte un verdict qui
+  n'en est pas un — la porte que l'extension ne doit pas ouvrir.
 - **3.3 (parité shell) → (c) halte-et-remontée.** Un tir signifie que les deux
   lecteurs ont divergé — la cause racine même de ce ticket, rejouée.
 
@@ -295,6 +347,16 @@ r"(?m)^> - \*\*Plan:\*\* `(?:[A-Za-z0-9_-][A-Za-z0-9._-]*/)?docs/plans/[^`]+`"
 **1.3 — Ancrer les deux prédicats restants** en `(?m)^> - \*\*Branch:\*\* ` et
 en réutilisant 1.2 pour le plan, comme l'est déjà `GROOMING_HISTORY_RE` (AC6).
 Toutes les regex derrière un `OnceLock`, comme l'existante.
+
+**1.5 — Aligner le verdict sur les trois formes** (extension revendiquée,
+§ ci-dessus). `GROOMING_HISTORY_RE` garde son ancrage `(?m)^> - \*\*Grooming
+history:\*\*.+` et son alternance couvre les trois queues reconnues par
+`executor.rs` :
+`second-pass \(GROOMED[\s\)\.,;:—-]`, `second-pass \(READY, paraphrased GROOMED`,
+`first-pass \(READY, single-pass GROOMED`. Les trois littéraux sont **copiés
+depuis `executor.rs:946/949/968`**, pas retranscrits de mémoire : c'est la seule
+manière de ne pas rouvrir la divergence en la corrigeant. Un commentaire renvoie
+au lockstep de `dispatch-lib.sh:3865`.
 
 **1.4 — Recomposer `is_groomed`** : `strip_fenced_blocks` une fois, puis les
 trois `is_match` sur la vue nettoyée. La doc de la fonction gagne les deux
@@ -342,6 +404,16 @@ Dans le module `tests` de `auto_pull.rs`.
   motifs n'apparaissent **que** dans une fence → `false`.
   **4.5b `fence_non_fermee_evalue_le_corps_entier`** — le repli permissif est
   testé, pas seulement documenté.
+- **4.7 `is_groomed_accepte_les_trois_formes_de_verdict`** (extension). Un cas
+  par forme, chacun **copié depuis `executor.rs`**. Plus
+  `4.7b is_groomed_refuse_un_verdict_inconnu` : `second-pass (ITERATE)` et
+  `first-pass (ESCALATE)` rendent `false` — élargir l'alternance ne doit pas
+  transformer le prédicat en « contient le mot grooming ».
+- **4.8 `le_corps_de_ce_ticket_est_vu`** (preuve de bouclage). Le corps de
+  mika#2120 tel que ce grooming l'a écrit — callout nu **et** verdict
+  `first-pass (READY, single-pass GROOMED)` — rend `true`. Il rend `false` sur
+  `main` pour la raison du verdict, pas du chemin : le test le dit en
+  commentaire, sinon il atteste le mauvais axe.
 - **4.6 `select_feeder_candidates_retient_un_callout_prefixe` (AC5).** Bassin
   sous le plancher, un seul éligible, callout préfixé : il est retenu.
 
@@ -371,7 +443,8 @@ récidive du 2026-09-01 montre que le rappel par prose ne tient pas.
 
 Le correctif n'est pas vide si, et seulement si, la suite **échoue sur `main`** :
 4.2 et 4.4 doivent y échouer (le préfixe n'est pas accepté), 4.5a aussi
-(les fences ne sont pas retirées). Et **4.1 et 4.3 doivent passer sur `main`
+(les fences ne sont pas retirées) ; 4.7 et 4.8 également (le verdict
+single-pass n'est pas reconnu). Et **4.1 et 4.3 doivent passer sur `main`
 comme après** — c'est ce qui prouve que la forme nue n'a pas régressé et que le
 contrôle négatif n'a pas été écrit pour être vert.
 
@@ -391,5 +464,6 @@ bash skills/bundled/_shared/test-dispatch-lib.sh
 | Le prédicat permissif ouvre un faux positif | Ancrage (AC6) + retrait des fences + contrôle négatif 4.3 ; coût borné à un créneau de dispatch |
 | `strip_fenced_blocks` ampute un corps légitime sur une fence non fermée | Repli explicite : on n'ampute pas ; testé en 4.5b |
 | La moitié `mika-platform` n'atterrit jamais et la spec continue d'écrire le préfixe | AC4 déclaré non satisfait tant que les deux PR ne sont pas là ; garde `grep` en 5.3 |
+| L'axe du verdict redivergerait si `executor.rs` gagnait une quatrième forme | Les trois littéraux sont copiés depuis `executor.rs`, avec un commentaire de lockstep aux deux endroits ; test 4.7b borne l'élargissement |
 | Les deux lecteurs redivergent plus tard | Test de parité 3.3 + note croisée dans la doc de `is_groomed` (phase 2) |
 | Fixtures AC3 rendues vaines par la réparation manuelle | Fixtures figées et re-préfixées ; la non-vacuité est vérifiée dans les deux sens |
