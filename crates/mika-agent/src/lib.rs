@@ -6,6 +6,7 @@ pub mod agent {
     pub use crate::agent_loop::*;
 }
 pub mod async_db;
+pub mod auth_boundary_ledger;
 pub mod auto_pull;
 pub mod bundled_skills;
 pub mod calibration;

@@ -250,6 +250,28 @@ pub struct CycleOutcome {
     pub heartbeat_fired: bool,
     pub severity: Severity,
     pub generated_at: String,
+    /// The auth-boundary failure this cycle observed on its delivery attempt,
+    /// if any (mika#1949 U3).
+    ///
+    /// `#[serde(default)]` because the offline sink holds outcome blobs
+    /// written before this field existed, and an upgrade that could not read
+    /// its own backlog would lose it — same reasoning as
+    /// `Assessment::contention_events`.
+    #[serde(default)]
+    pub auth_boundary: Option<mika_common::auth_boundary::AuthBoundaryError>,
+    /// Whether this cycle actually presented a credential at a boundary
+    /// (mika#1949 U4).
+    ///
+    /// Needed because `auth_boundary: None` conflates three different things:
+    /// a delivery that authenticated, a cycle that wrote to the offline sink,
+    /// and a no-op cycle that delivered nothing at all. Only the first is
+    /// evidence the credential works, and only evidence should close an
+    /// escalation window. With `poll_interval` at 5 min against a 6 h
+    /// heartbeat, no-op cycles are the *common* case — reading them as
+    /// success would reset the repeat counter between almost every pair of
+    /// real failures and make the `Blocked` escalation unreachable.
+    #[serde(default)]
+    pub auth_attempted: bool,
 }
 
 #[cfg(test)]
