@@ -1,0 +1,9 @@
+{
+  "run_id": "001-hi-fi-pert",
+  "status": "success",
+  "confidence": "high",
+  "reliability": "fiable",
+  "item_id": "i-pert",
+  "perturbed": false,
+  "spirit_session_id": "sess-001"
+}

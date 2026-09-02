@@ -1,0 +1,9 @@
+{
+  "run_id": "008-lo-de-ctrl",
+  "status": "success",
+  "confidence": "low",
+  "reliability": "degradee",
+  "item_id": "i-ctrl",
+  "perturbed": false,
+  "spirit_session_id": "sess-008"
+}

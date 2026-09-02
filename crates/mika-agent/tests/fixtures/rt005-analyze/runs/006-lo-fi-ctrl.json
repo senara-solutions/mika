@@ -1,0 +1,9 @@
+{
+  "run_id": "006-lo-fi-ctrl",
+  "status": "success",
+  "confidence": "low",
+  "reliability": "fiable",
+  "item_id": "i-ctrl",
+  "perturbed": false,
+  "spirit_session_id": "sess-006"
+}
