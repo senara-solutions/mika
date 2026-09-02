@@ -194,6 +194,32 @@ Le corps revendique `p0 — casseur de boucle, le plus haut` ; les étiquettes p
 
 ---
 
+## Definition of Done
+
+- [ ] `_pilot_gitdir_bind_args` existe dans `dispatch-lib.sh`, dérive `$PARENT_GIT` via `commondir` (jamais `../..` présumé), et rend un tableau vide quand `$WORKTREE_DIR/.git` est un répertoire.
+- [ ] Les répertoires `refs/heads/<dirname>` et `logs/refs/heads/<dirname>` sont créés côté hôte avant la construction de l'argv (M8, `bwrap --bind` exige une source existante).
+- [ ] La garde « branche sans slash » abandonne le dispatch avec un message nommant la branche, au lieu d'élargir le bind à `refs/heads` entier.
+- [ ] Les **deux** constructions `bwrap` — Phase 2b (`:639`) et repli Phase 2a (`:717`) — reçoivent les binds gitdir.
+- [ ] `GIT_CONFIG_COUNT`/`KEY_0`/`VALUE_0` réécrivent `git@github.com:` en `https://github.com/`, en composition et non en écrasement si `GIT_CONFIG_COUNT` est déjà posé ; `GIT_TERMINAL_PROMPT=0` est exporté.
+- [ ] L'en-tête du modèle de menace (`:60-83`) ne dit plus « NOT bound … /data/workspace outside the branch worktree » : il énonce ce qui est monté, pourquoi, et ce qui reste fermé.
+- [ ] `scripts/canary-pilot-containment` ne prouve plus git par `git --version` : la suite « must-work » exécute `rev-parse`/`status`/`log`/`add`/`commit`/`ls-remote --get-url` dans le confinement, et la suite « must-fail » porte les quatre contrôles négatifs de M6+M5.
+- [ ] `tests/test_sandbox_git_usable.sh` lance un `bwrap` réel via `_run_pilot_sandboxed` sur un worktree jetable et le détruit ensuite.
+- [ ] `git diff` prouve qu'aucun point de déclenchement de la récupération post-vol (mika#1282) n'est touché.
+- [ ] Les cinq questions non tranchées du § Registre de grooming sont arbitrées **par mesure** pendant l'implémentation, et l'arbitrage est consigné.
+
+## Acceptance criteria
+
+Transcrits verbatim du corps de mika#2141.
+
+- [ ] **AC1** — Dans le bac à sable, `git status`, `git rev-parse --show-toplevel`, `git log`, `git add`, `git commit` et `git push` réussissent sur la branche du worktree. Vérifié par une commande réellement exécutée dans le confinement, pas par lecture des binds.
+- [ ] **AC2** — Contrôle négatif, non négociable : depuis le bac à sable, un accès à un **autre** worktree ou à un **autre** dépôt sous `/data/workspace` échoue toujours. Prouvé par un test qui tente l'accès et exige l'échec. Élargir le bind ne doit pas rouvrir la surface que le confinement existe pour fermer — c'est la moitié du ticket, pas une précaution.
+- [ ] **AC3** — Aucun secret n'entre par le nouveau bind : ni `~/.gitconfig` porteur de credential helper, ni `.git/config` contenant une URL à jeton, ni `~/.config/gh`. Le modèle de `mika#2056` (jeton injecté côté hôte par le proxy) reste intact.
+- [ ] **AC4** — Test de non-régression exécuté dans le confinement réel, pas contre un `bwrap` simulé. Un test qui construit l'argv sans lancer le bac à sable ne peut pas falsifier ce défaut — c'est précisément ce qui l'a laissé passer un mois.
+- [ ] **AC5** — Preuve de bout en bout : un dispatch complet sur un ticket réel produit une PR portant `origin:loop` **sans** `wip-rescue`. C'est le seul critère qui distingue « le pilote peut commiter » de « le secours a rattrapé ».
+- [ ] **AC6** — La récupération post-vol (mika#1282) **reste en place**. Elle n'est pas le défaut ; elle est le filet qui a sauvé un mois de travail. Elle ne doit ni être retirée ni voir son déclenchement modifié par ce correctif.
+
+> **AC5 se vérifie après le merge et le déploiement**, pas dans la PR : il exige un dispatch réel sous le binaire corrigé. La PR porte AC1–AC4 et AC6 ; AC5 est la Phase 4, cochée sur le ticket une fois la preuve produite. Fermer le ticket sans elle rejouerait exactement l'erreur que ce ticket documente — prendre le filet pour le moteur.
+
 ## Rattachement aux critères d'acceptation
 
 | AC | Traité par | Preuve exigée |
