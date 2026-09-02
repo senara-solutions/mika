@@ -224,3 +224,25 @@ Repris du ticket, sans extension : le statut de sortie `Success` sur session blo
 - `scripts/mika-pilot-github-auth-addon.py:15-16` — l'injection host-side visant `github.com` en smart-HTTP
 - `e4f24677` / PR#1894 — l'introduction du confinement, 2026-08-04
 - mika#1282 (récupération post-vol, AC6), mika#2090 (étiquette `origin:*`), mika#2056 (jeton host-side), cpp#144, mika#2125
+
+---
+
+## Registre de grooming — ce que l'architecte a signé, et ce qu'il n'a pas tranché
+
+Consigné après le commit du plan, pour que la lignée reste lisible : le commit précédent porte l'état signé ; celui-ci porte le compte rendu de la signature.
+
+**Premier appel** (session `9c974b42-ebed-4d62-a876-d9caf7621608`) — rejeté par le garde moteur `required_review_anchor_prefixes` : `Disposition-Withheld: REVIEW-ANCHOR-MISSING`. Les trois ancres citaient le **corps du ticket GitHub**, que l'architecte n'avait pas reçu, et non le brief. La réponse mentionnait en outre une « Phase 1.5 ajoutant la reconnaissance des trois formes de verdict », absente du plan comme du brief — contamination d'un autre sujet. Le garde a fait exactement son travail.
+
+**Second appel** (session `d61ac474-190f-49ab-b10c-9a61d3dfe8cc`), même brief plus un rappel du contrat d'ancrage — `Disposition: READY`, ancres cette fois verbatim et sur trois régions distinctes.
+
+**Ce que ce READY n'atteste pas.** La réponse fait environ 900 octets sur un brief d'environ 14 Ko, elle restitue le tableau de décision du brief sans le contredire ni l'étendre, elle ouvre par « toutes les trouvailles de la première passe sont résolues » alors que la première passe n'a produit aucune trouvaille — et **aucune des cinq incertitudes numérotées du brief n'est arbitrée**. Le garde vérifie l'attestation mécanique, pas la substance.
+
+**Conséquence pour l'implémenteur : les cinq questions restent ouvertes.** Elles ne sont pas tranchées par l'architecte ; elles sont à traiter comme des décisions de conception à prendre pendant l'implémentation, avec mesure à l'appui.
+
+1. **La surface résiduelle satisfait-elle l'AC2 ?** L'accès *fichier* aux autres worktrees est fermé (M6), mais `git show <autre-branche>:fichier` réussira. Arbitrage au jugement, non confirmé.
+2. **La garde « branche sans slash » abandonne le dispatch.** Fail-closed volontaire, mais il suppose que seul le chemin canonique `derive-branch-name` est en usage — supposition non prouvée.
+3. **`refs/remotes` en rw entier** n'a pas été resserré (`refs/remotes/origin` seul ?). Seul bind du tableau non minimisé.
+4. **`objects` en rw** : la variante `objects` ro + `objects/info/alternates` a été écartée par raisonnement, pas par mesure. Si le raisonnement AC6 est faux, elle serait strictement meilleure.
+5. **Ce que `push` exige réellement** n'a pas été mesuré — aucun `push` réel n'a été exécuté. C'est le trou le plus large de la preuve, et c'est précisément l'objet de l'AC5.
+
+Cette classe de défaut (verdict mécaniquement attesté, substantiellement vide) est celle que suit mika#2037 ; cet échange en est une occurrence datée, pas un nouveau ticket.
