@@ -1,3 +1,4 @@
+use mika_common::text::safe_truncate;
 use std::fmt::Write;
 use std::path::Path;
 
@@ -225,15 +226,10 @@ pub fn build_previous_run_context(summary: &TeamRunSummary) -> String {
 
     buf.push_str("</context>\n");
 
-    // Enforce 2500-char budget
+    // Enforce a 2500-byte budget (mika#2103: `String::len` is bytes, so the
+    // budget it guards is one; `safe_truncate` floors to a char boundary).
     if buf.len() > 2500 {
-        // Find a safe char boundary to avoid panicking on multi-byte UTF-8
-        let mut end = 2490;
-        while !buf.is_char_boundary(end) && end > 0 {
-            end -= 1;
-        }
-        buf.truncate(end);
-        buf.push_str("...\n</context>\n");
+        buf = format!("{}...\n</context>\n", safe_truncate(&buf, 2490));
     }
 
     buf

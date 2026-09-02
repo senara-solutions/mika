@@ -304,20 +304,30 @@ curl -sS -m 4 -o /dev/null -w "curl_evil=%{http_code}\n" https://evil.example.co
     || echo "ok:   curl_evil_error (expected — 403 via proxy)"
 
 echo
-echo "--- must-work: allowlisted egress ---"
+echo "--- must-work: allowlisted egress (api.github.com now MITM-injected) ---"
+# mika#2056: api.github.com is no longer a plain CONNECT allowlist host — it is
+# MITM-forwarded, and the github auth addon injects the credential host-side.
+# An authenticated 200 here therefore also proves the host-side injection path
+# is intact end-to-end (curl carries no token itself).
 curl -sS -m 8 -o /dev/null -w "curl_github=%{http_code}\n" https://api.github.com/ 2>&1 | head -1
 
 echo
-echo "--- must-work: secret channel delivered (mika#2039) ---"
-# Arrival, not declaration. PART 0 proves the token is absent from the host
-# argv; this proves it is present in the sandbox environment. Both are needed:
-# a prologue that silently failed would satisfy PART 0 perfectly and leave the
-# pilot unable to push, which surfaces only minutes later as a pipeline
-# failure. This runs on the real Phase 2b entrypoint.
+echo "--- must-fail: GH_TOKEN absent from the sandbox (mika#2056) ---"
+# mika#2056 inverted the old mika#2039 must-work check. The pilot no longer
+# holds any GitHub token inside the sandbox: git push and gh reach GitHub
+# through the egress-proxy MITM, which injects the credential HOST-SIDE. So the
+# token MUST be absent here — in the environment and on the filesystem. A
+# regression that put it back would read as "ok:" under the old check and as a
+# LEAK under this one.
 if [ -n "${GH_TOKEN:-}" ]; then
-    echo "ok:   gh_token_delivered (len=${#GH_TOKEN})"
+    echo "LEAK: GH_TOKEN is present in the sandbox environment (mika#2056 regressed)"
 else
-    echo "FAIL: GH_TOKEN absent inside the sandbox — the secret channel did not deliver"
+    echo "ok:   gh_token_absent_env"
+fi
+if [ -e /run/mika-pilot-secrets/GH_TOKEN ]; then
+    echo "LEAK: /run/mika-pilot-secrets/GH_TOKEN exists (secret file channel not removed)"
+else
+    echo "ok:   gh_token_absent_fs"
 fi
 
 echo
@@ -367,5 +377,7 @@ echo "============================================================"
 echo "canary complete — coherence review:"
 echo "  every must-fail line MUST be 'ok:' or 'blocked'"
 echo "  every must-work line MUST succeed (version string)"
-echo "  proxy log MUST show DENY on evil.example.com + ALLOW on api.github.com"
+echo "  GH_TOKEN MUST be absent from the sandbox env + fs (mika#2056)"
+echo "  proxy log MUST show DENY on evil.example.com, mitm-forward on"
+echo "    api.github.com, and [github-proxy] ALLOW (host-side auth injection)"
 echo "============================================================"

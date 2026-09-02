@@ -1373,3 +1373,75 @@ async fn non_approved_review_passes_through() -> Result<()> {
     }
     Ok(())
 }
+
+// -------------------------------------------------------------------------
+// mika#1947 (Porte 1) — a VERDICT: pass on a PR touching the mika-manager
+// surface must land on the forge-gate hold branch, never on the merge branch.
+// -------------------------------------------------------------------------
+
+#[tokio::test]
+async fn verdict_pass_milestone_manager_pr_holds_for_operator() -> Result<()> {
+    // Layer A — the classifier's verdict on the file set a Phase-2 mika-manager
+    // dispatch would produce. This is the fact the handler branches on.
+    let files = vec!["crates/mika-agent/src/milestone_manager/reader.rs".to_string()];
+    let classification = mika_agent::perimeter::classify_pr_files(&files);
+    assert_eq!(
+        classification.verdict,
+        mika_agent::perimeter::Classification::DecisionCore,
+        "mika-manager surface must classify DECISION-CORE before the handler is even consulted"
+    );
+    assert_eq!(classification.decision_core_files, files);
+
+    // Layer B — the handler's DECISION-CORE branch. `fetch_pr_files` shells out to
+    // `gh`, which does not resolve in the eval environment, so the classifier verdict
+    // is reached through the fail-closed clause rather than through the file list
+    // above. Both routes converge on the same branch of `handle_pass_verdict`, which
+    // is what this asserts: an APPROVED review carrying `VERDICT: pass` is Handled
+    // (held for the operator), not merged.
+    let db = test_db().await;
+    let text = pr_review_text(
+        "approved",
+        "senara-solutions/mika",
+        1947,
+        "mika-qa",
+        "VERDICT: pass\n\nAll good.",
+    );
+
+    let action = try_handle_pr_review_verdict(
+        &text,
+        &db,
+        Some("fake-token"),
+        None,
+        SESSION_ID,
+        "trace-porte1",
+        &test_skills(),
+    )
+    .await;
+
+    match action {
+        VerdictAction::Handled { pre_digest } => {
+            assert!(
+                pre_digest.contains("forge-gate") || pre_digest.contains("DECISION-CORE"),
+                "hold pre-digest must name the gate: {pre_digest}"
+            );
+        }
+        other => panic!(
+            "a milestone_manager PR must hold at the forge-gate, got {other:?} \
+             (Passthrough would hand the merge decision to the LLM; \
+              Dispatched would start a fix loop on a gated PR)"
+        ),
+    }
+
+    // Layer C — the audit trail an operator greps for. Asserts the string the code
+    // actually emits (`verdict_handler.rs`), not the idealised `decision_core_block`
+    // name in the ticket body; see the PR body for that reconciliation.
+    let count = db
+        .count_audit_events_by_tool_name("verdict_handler_human_gate_required")
+        .await?;
+    assert_eq!(
+        count, 1,
+        "the DECISION-CORE hold must leave exactly one greppable audit row"
+    );
+
+    Ok(())
+}

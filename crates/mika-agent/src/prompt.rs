@@ -3017,6 +3017,7 @@ enabled = true
                 metadata: None,
                 r#type: "issue".to_string(),
                 dispatch_class: None,
+                dispatcher_source: None,
             }],
             anomalies: vec![TaskHealthAnomaly {
                 task_id: "def-456".to_string(),

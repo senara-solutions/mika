@@ -12,8 +12,18 @@
 # allowlist, this suite catches a regression of the mechanism itself.
 #
 # Anti-vacuity: this suite MUST fail on the pre-mika#2039 form of
-# dispatch-lib.sh (where GH_TOKEN is passed via --setenv) and pass on the
+# dispatch-lib.sh (where a secret is passed via --setenv) and pass on the
 # corrected form. A guard never seen failing is not a guard.
+#
+# mika#2056 note: `GH_TOKEN` is no longer a member of
+# `_PILOT_SANDBOX_SECRET_ALLOWLIST` — the sandbox holds no GitHub token at all;
+# it is injected host-side by the egress-proxy MITM. So the CHANNEL-mechanism
+# tests below exercise the still-generic --ro-bind-data machinery with a
+# SYNTHETIC secret (`MIKA_TEST_SECRET`), and dedicated tests assert the
+# mika#2056 invariant directly: GH_TOKEN never reaches the argv, the --setenv
+# list, or the real sandbox env/filesystem. The sandbox-absent-but-host-present
+# anti-vacuity proof lives in the sibling
+# test-pilot-github-token-not-in-sandbox.sh.
 #
 # Source isolation audit: dispatch-lib.sh has no top-level imperative code —
 # all `set -e`, `trap`, and env var references are inside function bodies.
@@ -82,6 +92,12 @@ mkdir -p "$HOME" "$WORKTREE_DIR"
 
 MOCK_EGRESS_RC=1   # 1 → Phase 2a (fs cut only); 0 → Phase 2b (full)
 MOCK_BWRAP_RC=0
+
+# mika#2056: the production _PILOT_SANDBOX_SECRET_ALLOWLIST is now empty (no
+# GitHub token enters the sandbox). To keep exercising the generic mika#2039
+# --ro-bind-data channel machinery, inject a SYNTHETIC secret for the
+# mechanism tests. GH_TOKEN-specific absence is asserted separately below.
+_PILOT_SANDBOX_SECRET_ALLOWLIST=(MIKA_TEST_SECRET)
 
 bwrap() {
     printf '%s\0' "$@" > "$CAPTURE"
@@ -168,7 +184,7 @@ secret_destinations() {
 
 run_sandboxed() {
     local rc=0
-    GH_TOKEN="$FAKE_TOKEN" _run_pilot_sandboxed "$@" >/dev/null 2>&1 || rc=$?
+    MIKA_TEST_SECRET="$FAKE_TOKEN" _run_pilot_sandboxed "$@" >/dev/null 2>&1 || rc=$?
     echo "$rc"
 }
 
@@ -276,7 +292,7 @@ TRACE="$TMPROOT/trace.log"
 # Production shape: the token is already in the environment when the traced
 # region starts. Assigning it as a per-call prefix instead would make bash
 # trace `+ GH_TOKEN=<value>` — the harness leaking, not the function.
-export GH_TOKEN="$FAKE_TOKEN"
+export MIKA_TEST_SECRET="$FAKE_TOKEN"
 exec 9>>"$TRACE"
 BASH_XTRACEFD=9
 set -x
@@ -284,7 +300,7 @@ _run_pilot_sandboxed /bin/true >/dev/null 2>&1 || true
 echo "sentinel-after-sandbox-call" >/dev/null
 set +x
 exec 9>&-
-unset GH_TOKEN
+unset MIKA_TEST_SECRET
 
 rc=1; grep -qE "$CRED_PATTERN" "$TRACE" && rc=0
 assert_eq "trace file contains no credential-shaped value" "1" "$rc"
@@ -333,7 +349,7 @@ echo "Test: a second secret gets its own descriptor and destination"
 echo "--------------------------------------------------------------"
 
 SECOND_TOKEN="ghp_1111111111111111111111111111111111"
-_PILOT_SANDBOX_SECRET_ALLOWLIST=(GH_TOKEN MIKA_TEST_SECOND_SECRET)
+_PILOT_SANDBOX_SECRET_ALLOWLIST=(MIKA_TEST_SECRET MIKA_TEST_SECOND_SECRET)
 export MIKA_TEST_SECOND_SECRET="$SECOND_TOKEN"
 
 run_sandboxed /bin/true >/dev/null
@@ -344,7 +360,7 @@ assert_eq "two --ro-bind-data arguments emitted" "2" "$bd_count"
 dest_count=$(secret_destinations | sort -u | wc -l | tr -d ' ')
 assert_eq "two distinct secret destinations emitted" "2" "$dest_count"
 
-rc=1; grep -qx -- "/run/mika-pilot-secrets/GH_TOKEN" <<<"$(secret_destinations)" && rc=0
+rc=1; grep -qx -- "/run/mika-pilot-secrets/MIKA_TEST_SECRET" <<<"$(secret_destinations)" && rc=0
 assert_true "first secret keeps its own destination path" "$rc"
 rc=1; grep -qx -- "/run/mika-pilot-secrets/MIKA_TEST_SECOND_SECRET" <<<"$(secret_destinations)" && rc=0
 assert_true "second secret gets its own destination path" "$rc"
@@ -353,17 +369,17 @@ rc=1; captured_has_credential && rc=0
 assert_eq "neither secret value reaches the argv" "1" "$rc"
 
 unset MIKA_TEST_SECOND_SECRET
-_PILOT_SANDBOX_SECRET_ALLOWLIST=(GH_TOKEN)
+_PILOT_SANDBOX_SECRET_ALLOWLIST=(MIKA_TEST_SECRET)
 
 # ============================================================================
 # Test 9: no secret set → no secret channel, invocation still valid
 # ============================================================================
 echo ""
-echo "Test: unset GH_TOKEN emits no secret channel"
+echo "Test: unset secret emits no secret channel"
 echo "---------------------------------------------"
 
 rc=0
-( unset GH_TOKEN; _run_pilot_sandboxed /bin/true ) >/dev/null 2>&1 || rc=$?
+( unset MIKA_TEST_SECRET; _run_pilot_sandboxed /bin/true ) >/dev/null 2>&1 || rc=$?
 assert_eq "unset token: invocation succeeds" "0" "$rc"
 
 bd_idx_unset=$(arg_index '--ro-bind-data')
@@ -385,13 +401,49 @@ while IFS= read -r a; do
 done < <(captured_args)
 assert_true "HOME is still passed via --setenv" "$has_home"
 
-gh_via_setenv=1
+secret_via_setenv=1
 prev=""
 while IFS= read -r a; do
-    if [ "$prev" = "--setenv" ] && [ "$a" = "GH_TOKEN" ]; then gh_via_setenv=0; fi
+    if [ "$prev" = "--setenv" ] && [ "$a" = "MIKA_TEST_SECRET" ]; then secret_via_setenv=0; fi
     prev="$a"
 done < <(captured_args)
-assert_eq "GH_TOKEN is NOT passed via --setenv" "1" "$gh_via_setenv"
+assert_eq "the secret is NOT passed via --setenv" "1" "$secret_via_setenv"
+
+# ============================================================================
+# Test 10b (mika#2056): GH_TOKEN present in the parent env NEVER reaches the
+# sandbox argv, --setenv list, or --ro-bind-data channel, under the PRODUCTION
+# (empty) secret allowlist. This is the argv-side of the mika#2056 invariant;
+# the real-sandbox env/fs absence is Test 12 + the sibling suite.
+# ============================================================================
+echo ""
+echo "Test: GH_TOKEN in parent env does not enter the sandbox (mika#2056)"
+echo "-------------------------------------------------------------------"
+
+GH_LEAK_TOKEN="ghp_2056205620562056205620562056205620562056"
+# Save/restore the harness-injected synthetic allowlist around the check.
+_SAVED_ALLOWLIST=("${_PILOT_SANDBOX_SECRET_ALLOWLIST[@]}")
+_PILOT_SANDBOX_SECRET_ALLOWLIST=()   # production shape: no sandbox-held secret
+: > "$CAPTURE"
+( export GH_TOKEN="$GH_LEAK_TOKEN"; _run_pilot_sandboxed /bin/true ) >/dev/null 2>&1 || true
+
+rc=1; grep -qzF -- "$GH_LEAK_TOKEN" "$CAPTURE" && rc=0
+assert_eq "GH_TOKEN value is absent from the bwrap argv" "1" "$rc"
+
+gh_tok_setenv=1
+prev=""
+while IFS= read -r a; do
+    if [ "$prev" = "--setenv" ] && [ "$a" = "GH_TOKEN" ]; then gh_tok_setenv=0; fi
+    prev="$a"
+done < <(captured_args)
+assert_eq "GH_TOKEN is NOT passed via --setenv" "1" "$gh_tok_setenv"
+
+rc=1; grep -qzx -- "/run/mika-pilot-secrets/GH_TOKEN" "$CAPTURE" && rc=0
+assert_eq "no /run/mika-pilot-secrets/GH_TOKEN file channel is created" "1" "$rc"
+
+bd_idx_prod=$(arg_index '--ro-bind-data')
+assert_eq "empty allowlist emits no --ro-bind-data secret channel" "-1" "$bd_idx_prod"
+
+_PILOT_SANDBOX_SECRET_ALLOWLIST=("${_SAVED_ALLOWLIST[@]}")
 
 # ============================================================================
 # Test 11: sandbox disabled → direct invocation, no bwrap argv at all
@@ -407,27 +459,46 @@ assert_eq "disabled: direct invocation succeeds" "0" "$rc"
 assert_eq "disabled: no bwrap argv captured" "0" "$(wc -c < "$CAPTURE" | tr -d ' ')"
 
 # ============================================================================
-# Test 12: real bwrap — the descriptor is inherited and the token arrives
+# Test 12: real bwrap — the generic secret channel still delivers, AND (the
+# mika#2056 core) GH_TOKEN in the parent env NEVER reaches the real sandbox.
 # ============================================================================
 # This is the ONLY scenario that starts a real process. It restores the real
 # bwrap binary first; the daemon stubs stay in place so no egress proxy or
 # mitmproxy helper is launched. Skipped when bwrap is not installed.
 echo ""
-echo "Test: real bwrap — token reaches the sandbox environment"
-echo "---------------------------------------------------------"
+echo "Test: real bwrap — channel delivers a synthetic secret; GH_TOKEN stays out"
+echo "--------------------------------------------------------------------------"
 
 unset -f bwrap
 if ! command -v bwrap >/dev/null 2>&1; then
     echo "  ⊘ skipped — bwrap not installed on PATH"
 else
     mkdir -p "$HOME/.mika/data/pilot-transcripts"
-    got_token=$(GH_TOKEN="$FAKE_TOKEN" _run_pilot_sandboxed \
-        /bin/sh -c 'printf %s "${GH_TOKEN:-<absent>}"' 2>/dev/null)
-    assert_eq "sandbox sees the token value via the file channel" "$FAKE_TOKEN" "$got_token"
+    # (a) The generic mika#2039 channel still works, proven with a SYNTHETIC
+    #     secret in the allowlist (harness set _PILOT_SANDBOX_SECRET_ALLOWLIST
+    #     = (MIKA_TEST_SECRET)).
+    got_token=$(MIKA_TEST_SECRET="$FAKE_TOKEN" _run_pilot_sandboxed \
+        /bin/sh -c 'printf %s "${MIKA_TEST_SECRET:-<absent>}"' 2>/dev/null)
+    assert_eq "sandbox sees a listed secret via the file channel" "$FAKE_TOKEN" "$got_token"
 
-    got_perms=$(GH_TOKEN="$FAKE_TOKEN" _run_pilot_sandboxed \
-        /bin/sh -c 'ls -l /run/mika-pilot-secrets/GH_TOKEN | cut -c1-10' 2>/dev/null)
+    got_perms=$(MIKA_TEST_SECRET="$FAKE_TOKEN" _run_pilot_sandboxed \
+        /bin/sh -c 'ls -l /run/mika-pilot-secrets/MIKA_TEST_SECRET | cut -c1-10' 2>/dev/null)
     assert_eq "secret file is mode 0600 inside the sandbox" "-rw-------" "$got_perms"
+
+    # (b) mika#2056: with the PRODUCTION (empty) allowlist, GH_TOKEN present in
+    #     the parent env is ABSENT from the real sandbox environment, and no
+    #     file materialises under /run/mika-pilot-secrets. This is the real
+    #     end-to-end proof the token cannot be read from inside the sandbox.
+    _SAVED_ALLOWLIST=("${_PILOT_SANDBOX_SECRET_ALLOWLIST[@]}")
+    _PILOT_SANDBOX_SECRET_ALLOWLIST=()
+    got_gh=$(GH_TOKEN="$FAKE_TOKEN" _run_pilot_sandboxed \
+        /bin/sh -c 'printf %s "${GH_TOKEN:-<absent>}"' 2>/dev/null)
+    assert_eq "GH_TOKEN is ABSENT from the real sandbox environment" "<absent>" "$got_gh"
+
+    got_gh_file=$(GH_TOKEN="$FAKE_TOKEN" _run_pilot_sandboxed \
+        /bin/sh -c '[ -e /run/mika-pilot-secrets/GH_TOKEN ] && echo present || echo missing' 2>/dev/null)
+    assert_eq "no /run/mika-pilot-secrets/GH_TOKEN inside the real sandbox" "missing" "$got_gh_file"
+    _PILOT_SANDBOX_SECRET_ALLOWLIST=("${_SAVED_ALLOWLIST[@]}")
 
     # Phase 2b is the branch every real dispatch takes when the egress proxy is
     # up, and its entrypoint is a materially different string — the prologue is
@@ -436,9 +507,9 @@ else
     # before production.
     if [ -x "$_PILOT_EGRESS_PROXY_BIN" ] && [ -S "$_PILOT_EGRESS_SOCK" ]; then
         MOCK_EGRESS_RC=0
-        got_2b=$(GH_TOKEN="$FAKE_TOKEN" _run_pilot_sandboxed \
-            /bin/sh -c 'printf %s "${GH_TOKEN:-<absent>}"' 2>/dev/null)
-        assert_eq "Phase 2b: sandbox sees the token via the file channel" \
+        got_2b=$(MIKA_TEST_SECRET="$FAKE_TOKEN" _run_pilot_sandboxed \
+            /bin/sh -c 'printf %s "${MIKA_TEST_SECRET:-<absent>}"' 2>/dev/null)
+        assert_eq "Phase 2b: sandbox sees a listed secret via the file channel" \
             "$FAKE_TOKEN" "$got_2b"
         MOCK_EGRESS_RC=1
     else

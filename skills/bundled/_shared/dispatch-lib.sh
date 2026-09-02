@@ -73,9 +73,11 @@
 #     * ~/.ssh, ~/.aws, ~/.config, ~/.mika (except /data), /var/spool/*
 #     * ~/.cargo/credentials.toml (cargo publish secret — dev-pilot never
 #                                  publishes; safe to omit)
-#     * ~/.config/gh (contains hosts.yml with gh token) — gh CLI uses the
-#                     GH_TOKEN delivered through the secret-file channel below
-#                     (mika#2039), not `--setenv`
+#     * ~/.config/gh (contains hosts.yml with gh token) — the gh CLI does NOT
+#                     get a token inside the sandbox at all (mika#2056): its
+#                     api.github.com calls are MITM'd by the egress proxy, which
+#                     injects the credential host-side. The sandbox holds no
+#                     GitHub token in env or on disk.
 #     * $SSH_AUTH_SOCK, docker.sock, dbus, cm/NATS unix sockets
 #     * /data/workspace outside the branch worktree (other worktrees + repos)
 #
@@ -111,6 +113,14 @@ _PILOT_EGRESS_PROXY_BIN="$HOME/.local/bin/mika-pilot-egress-proxy"
 _PILOT_HELPER_BIN="$HOME/.local/bin/mitmdump"
 _PILOT_HELPER_PORT="8892"
 _PILOT_HELPER_ADDON="$HOME/.local/bin/mika-pilot-anthropic-auth-addon.py"
+# mika#2056: second mitmdump addon — injects the GitHub credential host-side on
+# api.github.com / github.com so the sandbox never holds GH_TOKEN. Installed
+# alongside the proxy + Anthropic addon by `make install`.
+_PILOT_GH_HELPER_ADDON="$HOME/.local/bin/mika-pilot-github-auth-addon.py"
+# mika#2056: host-only file the dispatcher rewrites with the current GitHub
+# token before each spawn, for the github addon to read host-side. NEVER bound
+# into the sandbox (not among the --ro-bind paths below). 0600.
+_PILOT_GH_TOKEN_FILE="$HOME/.mika/pilot-gh-token"
 _PILOT_HELPER_CA="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
 _PILOT_HELPER_LOG="/var/log/mika/pilot-helper.log"
 # Bind target for the helper CA inside the sandbox. MUST be under /tmp
@@ -118,6 +128,16 @@ _PILOT_HELPER_LOG="/var/log/mika/pilot-helper.log"
 # (already ro-bound before net_bwrap_args, so binds inside it fail with
 # EROFS). See coherence audit Bug B (2026-08-05).
 _PILOT_HELPER_CA_SANDBOX_PATH="/tmp/mika-pilot-ca/ca.pem"
+
+# mika#2056: in-sandbox path for the COMBINED CA bundle (system trust store +
+# mitmproxy CA), built by the entrypoint prologue and pointed at by
+# GIT_SSL_CAINFO / SSL_CERT_FILE / CURL_CA_BUNDLE / REQUESTS_CA_BUNDLE. It is a
+# SUPERSET of the system store — so ordinary verification of every non-MITM'd
+# host (registries, LFS, codeload) is unchanged — with the mitmproxy CA added
+# so git / gh / curl accept the host-side GitHub auth-injection MITM. This is
+# why SSL_CERT_FILE is now safe to set (the mika#2039 warning against it was
+# about REPLACING the system store; a superset does not).
+_PILOT_COMBINED_CA_SANDBOX_PATH="/tmp/mika-pilot-ca/combined.pem"
 
 # mika#2039: in-sandbox directory holding one 0600 file per secret. Under
 # /run — a tmpfs the sandbox mounts — rather than /etc, which is already
@@ -146,7 +166,15 @@ _PILOT_SECRET_DIR_SANDBOX="/run/mika-pilot-secrets"
 # _dispatch_lib_exit_trap and folded into the callback, so the operator sees
 # it. Posture stays fail-forward: a tokenless pilot can still do useful work
 # up to the push, so this diagnoses rather than aborts.
-_PILOT_SECRET_PROLOGUE="for _s in $_PILOT_SECRET_DIR_SANDBOX/*; do [ -e \"\$_s\" ] || continue; _n=\$(basename \"\$_s\"); if [ ! -r \"\$_s\" ]; then echo \"dispatch-lib: sandbox secret \$_n is unreadable — the pilot starts without it\" >&2; continue; fi; _v=\$(cat \"\$_s\"); [ -n \"\$_v\" ] || echo \"dispatch-lib: sandbox secret \$_n is empty — the pilot starts without it\" >&2; export \"\$_n=\$_v\"; done; unset _s _n _v"
+#
+# mika#2056 CA tail: when the mitmproxy CA is present (Phase 2b, GitHub auth
+# injection active), build the combined CA bundle (system store + mitm CA) and
+# point git / gh / curl / python at it. Guarded on the CA file so Phase 2a (no
+# MITM) is untouched. The system store is discovered by probing the common
+# distro locations; if none is found the mitm CA alone still lets git/gh reach
+# GitHub through the MITM (the only host that presents the mitm cert), and the
+# unset of the vars is skipped so nothing points at a partial bundle. POSIX sh.
+_PILOT_SECRET_PROLOGUE="for _s in $_PILOT_SECRET_DIR_SANDBOX/*; do [ -e \"\$_s\" ] || continue; _n=\$(basename \"\$_s\"); if [ ! -r \"\$_s\" ]; then echo \"dispatch-lib: sandbox secret \$_n is unreadable — the pilot starts without it\" >&2; continue; fi; _v=\$(cat \"\$_s\"); [ -n \"\$_v\" ] || echo \"dispatch-lib: sandbox secret \$_n is empty — the pilot starts without it\" >&2; export \"\$_n=\$_v\"; done; unset _s _n _v; if [ -f $_PILOT_HELPER_CA_SANDBOX_PATH ]; then _sysca=''; for _c in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem /etc/ssl/ca-bundle.pem; do [ -f \"\$_c\" ] && { _sysca=\"\$_c\"; break; }; done; if [ -n \"\$_sysca\" ] && cat \"\$_sysca\" $_PILOT_HELPER_CA_SANDBOX_PATH > $_PILOT_COMBINED_CA_SANDBOX_PATH 2>/dev/null; then export GIT_SSL_CAINFO=$_PILOT_COMBINED_CA_SANDBOX_PATH CURL_CA_BUNDLE=$_PILOT_COMBINED_CA_SANDBOX_PATH SSL_CERT_FILE=$_PILOT_COMBINED_CA_SANDBOX_PATH REQUESTS_CA_BUNDLE=$_PILOT_COMBINED_CA_SANDBOX_PATH; else export GIT_SSL_CAINFO=$_PILOT_HELPER_CA_SANDBOX_PATH; fi; unset _sysca _c; fi"
 
 # Idempotent helper daemon launcher for the anthropic api chain
 # (2026-08-05, Vincent-authorized). Chained from the front egress proxy
@@ -159,6 +187,14 @@ _ensure_pilot_helper() {
     if [ ! -f "$_PILOT_HELPER_ADDON" ]; then
         echo "dispatch-lib: pilot helper addon not found at $_PILOT_HELPER_ADDON" >&2
         return 1
+    fi
+    # mika#2056: the GitHub auth-injection addon is loaded into the SAME
+    # mitmdump. Missing it would silently drop back to a sandbox with no way to
+    # authenticate to GitHub (the token is gone), so surface it loudly — but do
+    # not abort: an Anthropic-only run is still useful, and the pilot's GitHub
+    # calls will 503 visibly at the addon rather than hang.
+    if [ ! -f "$_PILOT_GH_HELPER_ADDON" ]; then
+        echo "dispatch-lib: github auth addon not found at $_PILOT_GH_HELPER_ADDON — GitHub host-side injection disabled (run 'make install')" >&2
     fi
     # Liveness probe: TCP port accepts a connection.
     if python3 -c "
@@ -174,9 +210,16 @@ except OSError:
         return 0
     fi
     mkdir -p "$(dirname "$_PILOT_HELPER_LOG")" 2>/dev/null || true
+    # mika#2056: load the GitHub addon too, when present. mitmdump accepts
+    # repeated --scripts; each addon inspects flow.request.host and ignores
+    # what is not its own, so the two never collide.
+    local -a _helper_addon_args=(--scripts "$_PILOT_HELPER_ADDON")
+    if [ -f "$_PILOT_GH_HELPER_ADDON" ]; then
+        _helper_addon_args+=(--scripts "$_PILOT_GH_HELPER_ADDON")
+    fi
     nohup "$_PILOT_HELPER_BIN" \
         --listen-host 127.0.0.1 --listen-port "$_PILOT_HELPER_PORT" \
-        --scripts "$_PILOT_HELPER_ADDON" \
+        "${_helper_addon_args[@]}" \
         --set stream_large_bodies=10m \
         --set http2=true \
         --set flow_detail=0 \
@@ -324,11 +367,53 @@ _PILOT_SANDBOX_ENV_ALLOWLIST=(
 # Secret passthrough allowlist (mika#2039). These NEVER travel via `--setenv`.
 # Each one is handed to bwrap on a file descriptor and materialised as a 0600
 # read-only file under $_PILOT_SECRET_DIR_SANDBOX; $_PILOT_SECRET_PROLOGUE
-# re-exports it inside the sandbox. `GH_TOKEN` is passed through so `gh` works
-# without needing ~/.config/gh (which stays hidden).
+# re-exports it inside the sandbox.
+#
+# mika#2056: this list is now EMPTY. `GH_TOKEN` was the sole entry, and it is
+# removed — the file channel it used is deleted, not stacked beside the new
+# mechanism. The sandbox no longer holds any GitHub credential in its
+# environment or on its filesystem; `git push` and the `gh` CLI reach GitHub
+# through the egress-proxy MITM, which injects the credential host-side
+# (mika-pilot-github-auth-addon.py). This is the same invariant the Anthropic
+# key already has — "the sandbox NEVER holds secret material" — now extended to
+# GitHub. A compromised in-sandbox dependency can no longer read the PAT,
+# exfiltrate it to an allowlisted host, or push to arbitrary repos with it.
+#
+# The channel MACHINERY below is kept intact and generic (it still fires for
+# any name added here) — mika#2039's --ro-bind-data secret-file path is not
+# removed, only unused by default. Adding a genuinely sandbox-held secret in
+# future is still a one-line change here.
 _PILOT_SANDBOX_SECRET_ALLOWLIST=(
-    GH_TOKEN
 )
+
+# mika#2056: stage the current GitHub token host-side for the egress-proxy
+# MITM addon to inject. Written 0600 to a host-only path that is NEVER bound
+# into the sandbox — the sandbox reaches GitHub through the proxy and never
+# holds the token itself. Refreshed on every dispatch so a rotated
+# App-installation token reaches the (long-lived, shared) mitmdump daemon: the
+# addon mtime-caches this file, exactly as the Anthropic addon mtime-caches the
+# CLI-refreshed ~/.claude/.credentials.json.
+#
+# xtrace is suppressed around the write and restored after — the whole dispatch
+# runs under `set -x` with BASH_XTRACEFD, and an unbracketed `printf` of the
+# token would otherwise land `+ printf %s <token>` in the trace file that
+# _emit_callback tails back to the caller (same discipline as the secret
+# block). `printf` is the bash builtin; /usr/bin/printf would put the value in
+# an argv. Fail-open: a write failure degrades to the addon's env fallback, it
+# never aborts the dispatch.
+_stage_pilot_gh_token() {
+    local _xtrace_was_on=0
+    case "$-" in *x*) _xtrace_was_on=1 ;; esac
+    { set +x; } 2>/dev/null
+    if [ -n "${GH_TOKEN:-}" ]; then
+        mkdir -p "$(dirname "$_PILOT_GH_TOKEN_FILE")" 2>/dev/null || true
+        ( umask 077; printf '%s' "$GH_TOKEN" > "$_PILOT_GH_TOKEN_FILE" ) 2>/dev/null || \
+            echo "dispatch-lib: could not stage GitHub token to $_PILOT_GH_TOKEN_FILE — github auth injection falls back to the mitmdump process env" >&2
+    fi
+    if [ "$_xtrace_was_on" -eq 1 ]; then
+        set -x
+    fi
+}
 
 _run_pilot_sandboxed() {
     # Runs "$@" (the full claude-pilot invocation) under bwrap when enabled,
@@ -360,6 +445,10 @@ _run_pilot_sandboxed() {
     local -a net_bwrap_args=()
     local -a net_setenv_args=()
     local sandbox_entrypoint_prefix=""
+    # mika#2056: stage the token host-side BEFORE the helper daemon is ensured,
+    # so the mitmdump github addon has a fresh credential to inject on its very
+    # first request.
+    _stage_pilot_gh_token
     _ensure_pilot_helper || true
 
     if _ensure_pilot_egress_proxy; then
@@ -437,19 +526,28 @@ _run_pilot_sandboxed() {
             --setenv ANTHROPIC_API_KEY "proxy-managed-no-secret"
             # γ trust for the helper CA (Vincent-authorized 2026-08-05).
             # NODE_EXTRA_CA_CERTS is ADDITIVE (adds to Node's built-in trust)
-            # so bundled claude keeps trusting the system CA for anything else.
-            # SSL_CERT_FILE / REQUESTS_CA_BUNDLE deliberately NOT set — they
-            # would REPLACE (not extend) the system trust bundle, breaking
-            # Python/curl verification of github.com etc. Bundled claude is
-            # Node — NODE_EXTRA_CA_CERTS suffices for our api.anthropic.com path.
+            # so bundled claude keeps trusting the system CA for anything else;
+            # it covers our api.anthropic.com Node path.
+            #
+            # mika#2056: GitHub is now MITM'd too, and git / gh / curl / python
+            # must trust the mitmproxy CA for github.com + api.github.com. Unlike
+            # NODE_EXTRA_CA_CERTS those tools honour GIT_SSL_CAINFO /
+            # SSL_CERT_FILE / CURL_CA_BUNDLE / REQUESTS_CA_BUNDLE, which REPLACE
+            # the trust store. The old warning here — "do not set SSL_CERT_FILE,
+            # it would break github.com verification" — is answered by pointing
+            # them at a SUPERSET (system store + mitm CA) that the prologue
+            # builds, so nothing loses system trust. Those exports live in
+            # $_PILOT_SECRET_PROLOGUE (they depend on a file assembled inside the
+            # sandbox), not here.
             --setenv NODE_EXTRA_CA_CERTS "$_PILOT_HELPER_CA_SANDBOX_PATH"
         )
         # sh -c wrapper that starts the shim, waits for it, execs the pilot,
         # cleans up on exit. `exec` in the final position ensures the pilot's
         # exit status becomes the sh's. $_PILOT_SECRET_PROLOGUE is prepended to
-        # that script (mika#2039) so the bwrap-materialised secret files are
-        # re-exported before anything else runs; dropping it leaves the pilot
-        # without GH_TOKEN on the path every real dispatch takes.
+        # that script (mika#2039) so any bwrap-materialised secret files are
+        # re-exported before anything else runs, and (mika#2056) so the combined
+        # CA bundle is assembled and GIT_SSL_CAINFO / SSL_CERT_FILE et al. are
+        # exported before the pilot's first `git push` / `gh` call.
         sandbox_entrypoint_prefix="/bin/sh"
     fi
 
@@ -583,13 +681,16 @@ $quoted_argv
     else
         # Phase 2a fallback: fs cut only, network unrestricted.
         #
-        # The `/bin/sh -c` entrypoint at the end of this block exists solely to
-        # run $_PILOT_SECRET_PROLOGUE before the pilot (mika#2039). The
-        # original argv rides through as positional parameters, so no second
-        # `printf '%q'` quoting layer is introduced, and `exec` in final
-        # position keeps the pilot's argv, pid and exit status identical to the
-        # bare `-- "$@"` this replaced. Reverting it to `-- "$@"` looks like a
-        # simplification and silently removes GH_TOKEN from this sandbox.
+        # The `/bin/sh -c` entrypoint at the end of this block exists to run
+        # $_PILOT_SECRET_PROLOGUE before the pilot (mika#2039 secret-file
+        # re-export + mika#2056 CA-bundle assembly). The original argv rides
+        # through as positional parameters, so no second `printf '%q'` quoting
+        # layer is introduced, and `exec` in final position keeps the pilot's
+        # argv, pid and exit status identical to the bare `-- "$@"` this
+        # replaced. Reverting it to `-- "$@"` looks like a simplification and
+        # silently drops the prologue. (Phase 2a has no egress proxy, so GitHub
+        # auth injection is inactive here — the pilot reaches GitHub tokenless,
+        # fail-closed; this is the degraded fallback, same as Anthropic.)
         bwrap \
             --as-pid-1 \
             --unshare-user \
@@ -1036,8 +1137,65 @@ _seed_worktree_slash_commands() {
 # whose path drifted, stranding it forever. That is a strictly worse failure than
 # the loop this gate closes: the loop wastes dispatches, a stranded ticket is
 # never worked at all. When in doubt, this function returns 1 and grooming runs.
+#
+# _plan_provenance — did this branch commit the plan, or inherit it from main?
+#
+# mika#2034. A separate function on purpose: every caller of
+# `_committed_plan_on_branch` invokes it in a command substitution, and a
+# subshell cannot set a variable in its parent — the trap this file already
+# documents for `_DISPOSITION_FUZZY`. A global set inside the gate would read
+# back empty at exactly the site that needs it, so the measurement is a value
+# the caller asks for by name instead.
+#
+# Describes, never decides. Deliberately NOT a gate condition: a ticket that was
+# legitimately groomed and whose PR merged also carries its plan on `main`, so
+# blocking on inheritance would re-strand the tickets the gate exists to protect
+# (KTD1). Its only job is to stop the caller claiming the branch committed
+# something it inherited.
+#
+# Args: $1 = sub-repo dir, $2 = branch, $3 = plan path (repo-relative).
+_plan_provenance() {
+    local sub_repo_dir="$1" branch="$2" candidate="$3"
+    local gate_ref="refs/dispatch-gate/${branch}" branch_blob main_blob
+
+    branch_blob=$(git -C "$sub_repo_dir" rev-parse "${gate_ref}:${candidate}" 2>/dev/null)
+    main_blob=$(git -C "$sub_repo_dir" rev-parse "origin/main:${candidate}" 2>/dev/null)
+
+    if [ -z "$branch_blob" ]; then
+        # The ref is gone or the path no longer resolves. Say that, rather than
+        # pick one of the two claims at random.
+        printf 'provenance unmeasured — the plan no longer resolves on %s' "$gate_ref"
+    elif [ "$branch_blob" = "$main_blob" ]; then
+        printf 'inherited unchanged from main, not committed on this branch'
+    else
+        printf 'committed on the dispatch branch'
+    fi
+}
+
+# mika#2034 — the path comes out of the ticket's OWN callout, so resolving it is
+# not yet evidence about this ticket. Every dispatch branch descends from `main`
+# and `main` carries 769 plan files, so any valid plan path resolves whatever
+# ticket it belongs to: the attestation was being produced by the very claim it
+# is supposed to check, against a tree that cannot refute it. Measured
+# 2026-08-30, both stranded — the gate refused their grooming permanently:
+#
+#   mika#1887 → `…-fix-1933-reader-completed-section-avancement-plan.md`
+#               whose header reads `issue: senara-solutions/mika#1933`
+#   mika#2026 → `…-chore-deps-bump-rand-clear-rustsec-2026-0097-plan.md`
+#               whose header reads `**Issue:** #539`
+#
+# Both files sit on `origin/main`; those branches inherited them and committed
+# nothing. So the candidate is now bound to the issue before it is believed, and
+# provenance is measured before it is described. Same class as mika#2028's
+# fourth false statement, a different site — #2028 fixed the failure callback's
+# guard, never this one.
 _committed_plan_on_branch() {
     local sub_repo_dir="$1" branch="$2" issue_body="$3" repo="$4"
+    # mika#2034: the target issue, optional and defaulted, so the four existing
+    # call sites and the five fixture cases keep working unchanged (KTD2). When
+    # neither is available the binding check is skipped rather than guessed —
+    # refute on evidence, never on absence (KTD3).
+    local issue_num="${5:-${ISSUE_NUM:-}}"
     local plan_path candidate
 
     plan_path=$(printf '%s\n' "$issue_body" \
@@ -1065,11 +1223,57 @@ _committed_plan_on_branch() {
     # The callout carries two historical shapes: repo-prefixed
     # (`mika/docs/plans/…`) and repo-relative (`docs/plans/…`). Try both — U3
     # normalizes new writes, but tickets groomed before it keep the old form.
+    local tmp_plan claimed
     for candidate in "$plan_path" "${plan_path#"${repo}/"}"; do
-        if git -C "$sub_repo_dir" cat-file -e "${gate_ref}:${candidate}" 2>/dev/null; then
-            printf '%s' "$candidate"
-            return 0
+        # `cat-file -e` answers "does this path resolve", which a DIRECTORY also
+        # satisfies — and `git show` on a tree prints a listing, so a callout
+        # naming `docs/plans` would have been read as a plan with no issue
+        # header and fired the gate. Demand a blob (mika#2034, found by the
+        # unbindable-candidate test below).
+        [ "$(git -C "$sub_repo_dir" cat-file -t "${gate_ref}:${candidate}" 2>/dev/null)" = "blob" ] || continue
+
+        # --- Issue binding (mika#2034). The gate decision. ---
+        #
+        # `_plan_header_refutes_issue` takes a readable path and the candidate
+        # lives in a git object, so materialize it (KTD4). Its contract is
+        # refutation, not confirmation, and it is reused verbatim: a header that
+        # claims nothing does NOT refute. 95 of the 745 plans in docs/plans/
+        # carry no issue marker, and demanding a positive match would strand
+        # every one of them — the false-negative class mika#1421, #1602 and
+        # #1617 were each opened to close.
+        # When the binding cannot be PERFORMED — mktemp fails, `git show` cannot
+        # write the blob — the check must not be silently skipped. Skipping it
+        # fires the gate on an unbound candidate, which is the defect this whole
+        # change exists to close, arrived at by a different road. Decline
+        # instead: an extra grooming costs one dispatch, a strand costs the
+        # ticket. That is this function's stated doctrine ("when in doubt,
+        # returns 1 and grooming runs"), applied to its own failure modes.
+        if [ -n "$issue_num" ]; then
+            tmp_plan=$(mktemp -t mika-gate-plan-XXXXXX.md 2>/dev/null) || {
+                echo "dispatch_gate_groom_bind_unavailable: repo=${repo} issue=${issue_num} branch=${branch} plan=${candidate} — mktemp failed, cannot bind the plan to the issue; declining rather than firing on an unbound candidate (mika#2034)" >&2
+                return 1
+            }
+            if ! git -C "$sub_repo_dir" show "${gate_ref}:${candidate}" > "$tmp_plan" 2>/dev/null \
+               || [ ! -s "$tmp_plan" ]; then
+                echo "dispatch_gate_groom_bind_unavailable: repo=${repo} issue=${issue_num} branch=${branch} plan=${candidate} — could not read the plan blob from ${gate_ref}, cannot bind it to the issue; declining rather than firing on an unbound candidate (mika#2034)" >&2
+                rm -f "$tmp_plan"
+                return 1
+            fi
+            if _plan_header_refutes_issue "$tmp_plan" "$issue_num"; then
+                claimed=$(_plan_header_claimed_issues "$tmp_plan" | tr '\n' ' ')
+                echo "dispatch_gate_groom_plan_refuted: repo=${repo} issue=${issue_num} branch=${branch} plan=${candidate} — the plan's own header claims issue ${claimed% }, not ${issue_num}; the body callout names a plan belonging to another ticket, so this ticket is NOT groomed and grooming proceeds (mika#2034)" >&2
+                rm -f "$tmp_plan"
+                return 1
+            fi
+            rm -f "$tmp_plan"
         fi
+
+        # Provenance is NOT measured here: this function runs inside a command
+        # substitution at every call site, so it must keep stdout to the plan
+        # path alone. Callers that describe the plan ask `_plan_provenance` for
+        # it by name.
+        printf '%s' "$candidate"
+        return 0
     done
     return 1
 }
@@ -1209,11 +1413,16 @@ _set_up_worktree() {
         # trap; mika-dev then reads a crash envelope and idles (7 h stall,
         # 2026-05-06). This is a foreseeable condition, so it exits 0.
         if [ "$SKILL" = "dev-groom" ]; then
-            local existing_plan
-            if existing_plan=$(_committed_plan_on_branch "$SUB_REPO_DIR" "$BRANCH" "$ISSUE_BODY" "$REPO"); then
-                echo "dispatch_gate_groom_refused: repo=${REPO} issue=${ISSUE_NUM} branch=${BRANCH} plan=${existing_plan} — plan already committed on branch, re-grooming would loop (mika#2012)" >&2
-                RESULT=$(printf '{"status":"auto_skipped","reason":"already_groomed","issue":"senara-solutions/%s#%s","branch":"%s","plan":"%s","note":"A committed plan already exists on the dispatch branch. Re-grooming would re-derive it and stack a second body callout. Dispatch dev-pilot to implement, or remove the plan from the branch to force a fresh groom."}' \
-                    "$REPO" "$ISSUE_NUM" "$BRANCH" "$existing_plan")
+            local existing_plan plan_provenance
+            if existing_plan=$(_committed_plan_on_branch "$SUB_REPO_DIR" "$BRANCH" "$ISSUE_BODY" "$REPO" "$ISSUE_NUM"); then
+                # mika#2034: say what was measured. The old wording asserted
+                # "already committed on branch" for a blob the branch had merely
+                # inherited from main — an attestation produced beside the thing
+                # it attests.
+                plan_provenance=$(_plan_provenance "$SUB_REPO_DIR" "$BRANCH" "$existing_plan")
+                echo "dispatch_gate_groom_refused: repo=${REPO} issue=${ISSUE_NUM} branch=${BRANCH} plan=${existing_plan} — plan resolves on the branch (${plan_provenance}) and its header does not claim another ticket; re-grooming would loop (mika#2012, provenance mika#2034)" >&2
+                RESULT=$(printf '{"status":"auto_skipped","reason":"already_groomed","issue":"senara-solutions/%s#%s","branch":"%s","plan":"%s","provenance":"%s","note":"The plan named by this ticket resolves on the dispatch branch (%s) and its header does not claim a different ticket. Re-grooming would re-derive it and stack a second body callout. Dispatch dev-pilot to implement, or remove the plan from the branch to force a fresh groom."}' \
+                    "$REPO" "$ISSUE_NUM" "$BRANCH" "$existing_plan" "$plan_provenance" "$plan_provenance")
                 _deliver_callback
                 exit 0
             elif grep -qE -- '^> - \*\*Plan:\*\*' <<<"$ISSUE_BODY"; then
@@ -1314,6 +1523,21 @@ _set_up_worktree() {
             rm -f "$wt_err_1" "$wt_err_2"
         fi
 
+        # mika#2123 kept this rebase deliberately, and it is worth saying why: the
+        # promotion-time gate added in `auto_pull` has no checkout, so it only
+        # ever *measures*. This is still the only place anything is rebased.
+        #
+        # Every outcome is emitted under one greppable `rebase_gate` key, because
+        # the question the gate cannot answer from its own side — is the loop
+        # still refreshing anything, or has the gate grown so strict that nothing
+        # reaches here? — needs a number. A gate refusing everything and a world
+        # with nothing left to refresh look identical from this side without it.
+        #
+        # The rationale sits ABOVE the anchor line on purpose: test 12g reads the
+        # region from `Rebase-or-abort guard` to the first `fi`, and both the
+        # comment length and any extra `if` block in between would silently
+        # shrink what that guard can see.
+        #
         # Rebase-or-abort guard
         BEHIND=$(git -C "$WORKTREE_DIR" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
         if [ "$BEHIND" -gt 0 ]; then
@@ -1329,6 +1553,7 @@ _set_up_worktree() {
             rebase_err=$(mktemp "${TMPDIR:-/tmp}/dispatch-lib-rebase-err.XXXXXX")
             if git -C "$WORKTREE_DIR" rebase origin/main 2>"$rebase_err"; then
                 echo "Rebased ${BRANCH} onto origin/main (${BEHIND} commits caught up)." >&2
+                echo "[dispatch-lib] rebase_gate: branch=${BRANCH} behind=${BEHIND} ran=1 result=ok" >&2
                 rm -f "$rebase_err"
             else
                 # Capture conflict list and rebase reason BEFORE --abort resets the index.
@@ -1342,6 +1567,7 @@ _set_up_worktree() {
                 fi
                 git -C "$WORKTREE_DIR" rebase --abort 2>/dev/null || true
                 rm -f "$rebase_err"
+                echo "[dispatch-lib] rebase_gate: branch=${BRANCH} behind=${BEHIND} ran=1 result=${rebase_mode}" >&2
                 RESULT="STATUS=REBASE_CONFLICT
 Branch ${BRANCH} is ${BEHIND} commits behind origin/main.
 Rebase failure mode: ${rebase_mode}
@@ -1350,6 +1576,8 @@ Rebase stderr: ${rebase_reason:-<empty>}
 Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
                 exit 1
             fi
+        else
+            echo "[dispatch-lib] rebase_gate: branch=${BRANCH} behind=0 ran=0 result=skipped" >&2
         fi
 
         # Copy gitignored .claude/ config into worktree (relay + permissions only)
@@ -1434,12 +1662,27 @@ _run_claude_pilot() {
     # The mktemp file above is deleted after callback delivery; this copy persists
     # alongside the claude-pilot log file so operators can inspect it independently.
     PERSISTENT_STDERR="/var/log/claude-pilot/${LOG_ID}.stderr"
-    # --trace flag for full event-stream capture (mika#1097 Step 0-B).
-    # Enabled via CLAUDE_PILOT_TRACE env var (set per-skill in the case switch below).
-    local TRACE_FLAG=""
-    if [ "${CLAUDE_PILOT_TRACE:-}" = "1" ] || [ "${CLAUDE_PILOT_TRACE:-}" = "true" ]; then
-        TRACE_FLAG="--trace"
-    fi
+    # Event-stream capture is `--verbose`, passed unconditionally on the run
+    # below — there is no trace flag to add, and adding one would abort the
+    # launch (mika#2043).
+    #
+    # This spot used to build a `--trace` flag from CLAUDE_PILOT_TRACE, citing
+    # mika#1097 Step 0-B. Only Step 0-B's dispatch-lib half ever shipped:
+    # claude-pilot has never accepted `--trace` (no such argument in
+    # `_build_parser`, and `git log -S` finds no commit that ever added one).
+    # Measured against the installed CLI with this exact argv, an unknown flag
+    # is NOT swallowed — argparse exits 2 with `unrecognized arguments` before
+    # the session starts, so arming the old env var would have killed every
+    # dispatch of the skill that set it.
+    #
+    # What `--verbose` gives you, for the zero-artifact diagnosis Step 0-B was
+    # written for: every text content block (`log_text`), the init event's
+    # session_id and model (`log_init`), a marker for turns that produced
+    # nothing observable (`log_turn_summary`, cpp#10), any unhandled SDK message
+    # type (`log_unhandled_message`, cpp#123), and the raw stream — StreamEvent
+    # plus tool-result UserMessage (`log_verbose`, cpp#125). Raw `thinking`
+    # blocks are the one thing it does not surface; that needs a ticket on
+    # claude-pilot, not a flag here.
     # mika#1705: pilot-transcript capture. When MIKA_LOG_PILOT_TRANSCRIPTS is on,
     # the mika-spirit executor injects ANTHROPIC_LOG_FILE into this handler's env
     # (AFTER its MIKA_* scrub, since this handler cannot read MIKA_* itself), and
@@ -1455,7 +1698,7 @@ _run_claude_pilot() {
     PILOT_RAN=1
     # CWD_ARGS is intentionally word-split (multiple flags)
     # shellcheck disable=SC2086
-    _run_pilot_sandboxed claude-pilot --verbose --log-dir --task-id "$LOG_ID" --command "$ENTRY_COMMAND" $TRACE_FLAG $CWD_ARGS -- "$PROMPT" >"$STDOUT_FILE" 2>"$STDERR_FILE"
+    _run_pilot_sandboxed claude-pilot --verbose --log-dir --task-id "$LOG_ID" --command "$ENTRY_COMMAND" $CWD_ARGS -- "$PROMPT" >"$STDOUT_FILE" 2>"$STDERR_FILE"
     PILOT_EXIT=$?
     # Persist stderr to durable file before any processing (mika#1097).
     # Scrub secrets from the persistent copy to prevent durable secret retention (mika#903).
@@ -1890,6 +2133,295 @@ HEAD did not move and the worktree is clean, so nothing was written to the branc
 Outcome: PIPELINE_INCOMPLETE — pilot session terminated by claude-pilot before producing work."
 }
 
+# Compose the note a successful rescue commit leaves behind (mika#2031 R6).
+#
+# A rescue that preserves the content but says nothing is nearly as bad as a
+# deletion: `Saved working directory and index state WIP on main` tells nobody
+# there is anything to go and get. So the note names all three of what, where,
+# and how to reach it — the files that were staged, the rescue commit's sha, and
+# the branch it sits on. `_push_branch` reports the remote leg separately.
+#
+# Args: $1 = newline-separated rescued file list
+#       $2 = "" | " + mika#1296" (the cargo-fmt retry path's provenance)
+# Reads: SKILL, WORKTREE_DIR, BRANCH, PILOT_EXIT.
+_compose_rescue_note() {
+    local _files="$1" _extra="${2:-}" _sha
+    _sha=$(git -C "$WORKTREE_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)
+
+    if [ "$SKILL" = "dev-groom" ]; then
+        # NOT a PIPELINE FAILURE (mika#2031 R7): the rescue did its job and the
+        # architect pass can still run against the now-committed plan. Preserve
+        # first, unblock second — this is the second half reporting the first.
+        printf '%s' "dispatch-lib (mika#2031${_extra}): uncommitted grooming content preserved before anything else ran.
+Rescued into commit ${_sha} on branch ${BRANCH:-<unknown>}.
+Files rescued:
+${_files}
+The pilot wrote this and never committed it, so no branch and no remote held a
+copy — the next dispatch's worktree removal would have destroyed it. It is on
+the branch now; _push_branch publishes it and grooming continues from there."
+    else
+        printf '%s' "PIPELINE FAILURE: claude-pilot exited ${PILOT_EXIT:-unknown} with HEAD unchanged — dirty worktree detected and auto-committed (mika#1282${_extra} recovery).
+Rescued into commit ${_sha} on branch ${BRANCH:-<unknown>}.
+Files rescued:
+${_files}"
+    fi
+}
+
+# Preserve a zero-commit session's uncommitted content, then let the caller
+# unblock on it (mika#1282; opened to dev-groom by mika#2031).
+#
+# WHY dev-groom belongs here. A dev-groom pilot killed after writing its plan but
+# before `git commit` has nothing staged, nothing committed, nothing pushed —
+# and `_set_up_worktree` force-removes the worktree on the next dispatch of the
+# same branch. Uncommitted work is the most fragile form the loss takes: it
+# exists in exactly one place. `_find_issue_plan` searches the worktree
+# filesystem, so within a single run the plan is still *found*; the loss happens
+# between runs. Grooming is also the phase most exposed — first dispatch on a
+# fresh branch, whole output one markdown file, ~45 minutes and an architect
+# pass to redo.
+#
+# ORDER IS THE POINT: preserve first, unblock second. This runs from
+# _post_flight_recovery, ahead of _check_pilot_force_push, _iterate_groom_loop
+# and _push_branch, and the destructive worktree removal is a *next*-dispatch
+# event. A rescue that started by cleaning up so it could carry on would have
+# inverted the priority.
+#
+# No-op on a clean tree — for every skill. A rescue that fires unconditionally is
+# indistinguishable from one that never fires, so the clean-tree case is asserted
+# in tests/test_dev_groom_dirty_rescue.sh alongside the dirty-tree case.
+#
+# Reads: WORKTREE_DIR, SKILL, PRE_RUN_HEAD, POST_RUN_HEAD, REPO, ISSUE_NUM,
+#        BRANCH, SESSION_ID, PILOT_EXIT.
+# Writes: POST_RUN_HEAD (advanced past the rescue commit so _push_branch sees
+#         it), RESULT, RESCUED_DIRTY_WORKTREE (dev-pilot only).
+_rescue_dirty_worktree() {
+    # This is dispatch-lib exercising its structural git-workflow ownership per
+    # the content/workflow split (mika#1271 architect verdict;
+    # pilot-vs-substrate-contract-split-2026-05-25.md).
+    # repo#number mode only — the commit subject interpolates REPO/ISSUE_NUM,
+    # and free-text dispatches have no worktree to rescue from anyway.
+    [ -n "$WORKTREE_DIR" ] && [ -n "$REPO" ] || return 0
+    case "$SKILL" in
+        dev-pilot|dev-groom) ;;
+        *) return 0 ;;
+    esac
+    # Zero-commit sessions only. A session that did commit is the mika#1383
+    # trailing-content path's business, not this one's.
+    [ "${PRE_RUN_HEAD:-}" = "${POST_RUN_HEAD:-}" ] || return 0
+
+    DIRTY_FILES=$(git -C "$WORKTREE_DIR" status --porcelain 2>/dev/null | head -20)
+    [ -n "$DIRTY_FILES" ] || return 0
+
+    # Commit subject names what was salvaged. The `commit -m "wip(` literal on
+    # both sites below is load-bearing for test_rescue_commit_no_verify.sh's
+    # static guard — keep the interpolation after it, not around it.
+    local _rescue_what
+    if [ "$SKILL" = "dev-groom" ]; then
+        _rescue_what="plan staged by post-flight recovery (mika#2031)"
+    else
+        _rescue_what="impl staged by post-flight recovery (mika#1282)"
+    fi
+
+    # Stage all dirty files EXCEPT worktree-scaffold paths copied by
+    # _set_up_worktree (mika#1288, mika#1419, mika#1552):
+    #   - .claude/commands/         slash-command snapshots from mika-platform
+    #   - .claude/claude-pilot.json relay config cp'd from $PLATFORM_DIR at :489
+    #   - .claude/settings.local.json  permission allowlist cp'd at :490 (mika#1552)
+    #   - .claude/*.local.*          general guard for any future Claude-local
+    #                                files (.env-class — operator-machine-specific)
+    # None is pilot-authored content. Without the second exclusion, the rescue
+    # commit re-introduces .claude/claude-pilot.json whose intentional deletion
+    # shipped in PR #1348 (mika#1193 Phase C) — the founding incident for
+    # mika#1419. The third + fourth catch the .claude/settings.local.json class
+    # — cm#5 dispatch (2026-06-16) produced PR #16 whose only "rescued" content
+    # was a 143-line operator allowlist leak (mika#1552 founding incident).
+    git -C "$WORKTREE_DIR" add -A -- ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9
+
+    # Guard: if pathspec exclusion left nothing staged, skip the rescue
+    # commit. Handles the edge case where the pilot wrote ONLY to scaffold
+    # paths (mika#1288, mika#1419).
+    if git -C "$WORKTREE_DIR" diff --cached --quiet 2>&9; then
+        echo "NOTE: dirty worktree contained only scaffold paths (.claude/commands/, .claude/claude-pilot.json) — no pilot content to rescue" >&2
+        RESCUED_DIRTY_WORKTREE=0
+    else
+        # Compute accurate rescued-files list for the rescue note.
+        # DIRTY_FILES (from git status --porcelain) includes
+        # excluded scaffold paths; RESCUED_FILES reflects what was actually
+        # staged and will be committed.
+        RESCUED_FILES=$(git -C "$WORKTREE_DIR" diff --cached --name-only 2>&9)
+
+        # Proactive formatting (mika#1336): the dominant rescue-failure class is
+        # pilot-authored Rust that was never `cargo fmt`-ed, so the first commit
+        # trips the lefthook rust-fmt gate. Formatting up front makes the first
+        # commit succeed, halves wall-clock (one clippy compile, not two), and
+        # removes reliance on parsing lefthook stdout to detect a fmt rejection.
+        # The reactive rust-fmt retry below remains as belt-and-suspenders.
+        # Gated on staged *.rs so docs-only / non-Rust pilots don't pay cargo startup.
+        if git -C "$WORKTREE_DIR" diff --cached --name-only 2>&9 | grep -q '\.rs$'; then
+            PROACTIVE_FMT_ERR=$( (cd "$WORKTREE_DIR" && cargo fmt --all) 2>&1 ) || true
+            [ -n "$PROACTIVE_FMT_ERR" ] && echo "NOTE: proactive cargo fmt: ${PROACTIVE_FMT_ERR}" >&2
+            # Same exclusion pathspec as the initial `git add -A` above
+            # (mika#1288, mika#1419) — keeps scaffold paths out of the
+            # post-fmt re-add.
+            git -C "$WORKTREE_DIR" add -u -- ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9
+        fi
+
+        # Attempt rescue commit — capture stderr for hook-failure diagnosis (mika#1296).
+        # mika#1341: scratch file MUST live outside the worktree tree, NOT under
+        # "$WORKTREE_DIR/.git/". In a linked worktree (every autonomous dev-pilot run)
+        # ".git" is a FILE (a `gitdir:` pointer), not a directory — so a redirect into
+        # "$WORKTREE_DIR/.git/<name>" fails to OPEN (ENOTDIR). A failed output redirect
+        # means `git commit` never runs and exits non-zero with no captured output,
+        # producing the "non-rustfmt empty-capture" PIPELINE FAILURE with HEAD unchanged.
+        # `mktemp` keeps the original intent (off the working tree, away from .iterate/)
+        # while guaranteeing a real, writable path in both linked and non-linked checkouts.
+        # Named template preserves the descriptive "mika-rescue-commit-err" scratch name.
+        # NOTE: the literal token "mika-rescue-commit-err" is also a sed anchor in
+        # test-dispatch-lib.sh (rescue-block extraction); renaming it breaks those tests.
+        RESCUE_COMMIT_ERR="$(mktemp "${TMPDIR:-/tmp}/mika-rescue-commit-err.XXXXXX")"
+
+        # mika#1310: capture BOTH stdout and stderr. Lefthook
+        # pre-commit hooks print their summary + failure marks
+        # to stdout (not stderr); a `2>` redirect alone captured
+        # an empty file and the operator saw "Hook output:"
+        # blank on every false-positive rejection. Combined
+        # `>file 2>&1` captures the full lefthook decoration
+        # block including ⛔ failure lines.
+        #
+        # mika#1685: rescue commits bypass the pre-commit hook
+        # (--no-verify) BY DESIGN. The rescue path's purpose is to
+        # SALVAGE pilot work for operator review, not to gate it on
+        # lint. lefthook runs rust-clippy on pre-commit; a single
+        # clippy nit (one-line typo like `repeat().collect()`) would
+        # otherwise reject the rescue commit and strand a 29-turn,
+        # $4-cost pilot's work as a dead block (modal loop-wedge
+        # cause, n=3+ on 2026-06-30). CI re-runs cargo fmt --check +
+        # clippy on the resulting draft PR (ci.yml; wip-staleness-check
+        # re-clippies wip-rescue drafts when main moves), so the LINT
+        # signal still surfaces at the right layer — for the operator
+        # and the autonomous-loop's clippy-fix-retry path, not as a
+        # hard pre-commit block.
+        #
+        # TRADE-OFF, by design: --no-verify is all-or-nothing, so it
+        # ALSO skips lefthook's no-secrets + no-large-files gates,
+        # which CI does NOT replicate today (mika#1689 tracks adding a
+        # CI secret-scan net). Accepted because the rescue output is a
+        # DRAFT PR (operator-gated, never auto-merged), the secret-prone
+        # scaffold paths are already excluded from staging above, and
+        # secrets are scrubbed at the DB/tool-call layer. Do NOT remove
+        # --no-verify here without first moving the LINT gate somewhere
+        # the rescue path can still open its draft PR.
+        # Mika Prime bearing 2026-06-30 ~16:32Z ratified this as the
+        # wedge-cause fix (Concern 2, ahead of mika#1058).
+        if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): ${_rescue_what}
+
+Content written by pilot session ${SESSION_ID:-unknown} but git commit was never invoked.
+Auto-rescued by dispatch-lib dirty-worktree detection.
+Scaffold paths excluded (mika#1288, mika#1419)." --no-verify > "$RESCUE_COMMIT_ERR" 2>&1; then
+            # Commit succeeded on first try — proceed normally
+            rm -f "$RESCUE_COMMIT_ERR"
+
+            # Update POST_RUN_HEAD so _push_branch sees new commits
+            POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
+
+            # Name what was preserved and where (mika#2031 R6): a silent
+            # rescue is nearly as bad as a deletion — nobody knows there is
+            # anything to recover.
+            RESULT="$(_compose_rescue_note "$RESCUED_FILES" "")
+
+${RESULT}"
+
+            # Mark for draft PR creation in Unit 2 — dev-pilot only.
+            # dev-groom's output is a plan on the branch, not a PR (mika#2031 R4).
+            case "$SKILL" in dev-pilot) RESCUED_DIRTY_WORKTREE=1 ;; esac
+        elif grep -q "rust-fmt\|cargo fmt\|rustfmt" "$RESCUE_COMMIT_ERR" 2>/dev/null; then
+            # mika#1685 (AC4, kept-and-noted): with --no-verify on the
+            # initial commit above, the pre-commit hook no longer runs,
+            # so this fmt-rejection branch is now effectively unreachable
+            # on hook grounds. Retained defensively rather than removed —
+            # the retry commit below also carries --no-verify so the path
+            # stays consistent if a future change reintroduces a hook.
+            # Pre-commit rust-fmt hook rejected — auto-fix and retry (mika#1296).
+            # Capture cargo fmt stderr so it surfaces in the PIPELINE FAILURE message
+            # if the retry also fails (review-guide.md § Single Responsibility — failure
+            # paths must surface all available diagnostic information).
+            CARGO_FMT_ERR=""
+            echo "NOTE: rescue commit rejected by rust-fmt hook — running cargo fmt and retrying" >&2
+            CARGO_FMT_ERR=$( (cd "$WORKTREE_DIR" && cargo fmt --all) 2>&1 ) || true
+            # Same exclusion pathspec as the initial `git add -A` above
+            # (mika#1288, mika#1419) — scaffold paths stay excluded on the
+            # post-fmt retry path too.
+            git -C "$WORKTREE_DIR" add -A -- ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9
+
+            # mika#1310: capture both stdout+stderr (see above).
+            if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): ${_rescue_what}
+
+Content written by pilot session ${SESSION_ID:-unknown} but git commit was never invoked.
+Auto-rescued by dispatch-lib dirty-worktree detection (cargo fmt applied).
+Scaffold paths excluded (mika#1288, mika#1419)." --no-verify > "$RESCUE_COMMIT_ERR" 2>&1; then
+                # Retry succeeded after cargo fmt
+                rm -f "$RESCUE_COMMIT_ERR"
+
+                POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
+
+                RESULT="$(_compose_rescue_note "$RESCUED_FILES" " + mika#1296")
+
+${RESULT}"
+
+                case "$SKILL" in dev-pilot) RESCUED_DIRTY_WORKTREE=1 ;; esac
+            else
+                # Retry also failed — abort rescue, leave dirty.
+                # Surface the full diagnostic chain: cargo fmt output + retry commit
+                # hook output, so the operator can diagnose from the message alone
+                # (mika#1296 acceptance criteria).
+                RESCUE_ERR_CONTENT=$(cat "$RESCUE_COMMIT_ERR" 2>/dev/null | head -50)
+                # mika#1310: if captured output is empty, dump git
+                # diagnostic state as fallback so PIPELINE FAILURE
+                # carries SOMETHING the operator can act on.
+                if [ -z "$(printf '%s' "$RESCUE_ERR_CONTENT" | tr -d '[:space:]')" ]; then
+                    RESCUE_ERR_CONTENT="<rescue capture was empty — likely no hook output, falling back to git diagnostic>
+git status:
+$(git -C "$WORKTREE_DIR" status --short 2>&1 | head -10)
+git diff --cached --name-only:
+$(git -C "$WORKTREE_DIR" diff --cached --name-only 2>&1 | head -10)"
+                fi
+                RESULT="PIPELINE FAILURE: auto-rescue commit rejected by pre-commit hook after cargo-fmt retry.
+cargo fmt stderr: ${CARGO_FMT_ERR:-<empty>}
+Hook output: ${RESCUE_ERR_CONTENT}
+Worktree left dirty for operator inspection: ${WORKTREE_DIR}
+Still uncommitted there (nothing else holds a copy):
+${RESCUED_FILES}
+
+${RESULT}"
+                # Do NOT set RESCUED_DIRTY_WORKTREE — prevents empty draft PR
+                rm -f "$RESCUE_COMMIT_ERR"
+            fi
+        else
+            # Unknown hook failure — abort rescue, leave dirty
+            RESCUE_ERR_CONTENT=$(cat "$RESCUE_COMMIT_ERR" 2>/dev/null | head -50)
+            # mika#1310: if captured output is empty, dump git
+            # diagnostic state as fallback so PIPELINE FAILURE
+            # carries SOMETHING the operator can act on.
+            if [ -z "$(printf '%s' "$RESCUE_ERR_CONTENT" | tr -d '[:space:]')" ]; then
+                RESCUE_ERR_CONTENT="<rescue capture was empty — likely no hook output, falling back to git diagnostic>
+git status:
+$(git -C "$WORKTREE_DIR" status --short 2>&1 | head -10)
+git diff --cached --name-only:
+$(git -C "$WORKTREE_DIR" diff --cached --name-only 2>&1 | head -10)"
+            fi
+            RESULT="PIPELINE FAILURE: auto-rescue commit rejected by pre-commit hook (non-rustfmt).
+Hook output: ${RESCUE_ERR_CONTENT}
+Worktree left dirty for operator inspection: ${WORKTREE_DIR}
+Still uncommitted there (nothing else holds a copy):
+${RESCUED_FILES}
+
+${RESULT}"
+            # Do NOT set RESCUED_DIRTY_WORKTREE — prevents empty draft PR
+            rm -f "$RESCUE_COMMIT_ERR"
+        fi
+    fi
+}
+
 _post_flight_recovery() {
     # Post-flight recovery (mika#1615): extracted from the if [ -n "$STATUS" ]
     # branch so recovery fires on ALL exit paths — structured JSON output,
@@ -1969,9 +2501,22 @@ ${RESULT}"
                 # in the worktree. The old glob made this note unconditional for
                 # dev-groom, so a first dispatch that wrote nothing was reported
                 # as a re-dispatch whose plan had already landed.
-                RESULT="Note: HEAD unchanged on dev-groom re-dispatch — the plan for ${REPO}#${ISSUE_NUM} is already committed (${VALID_PLAN}). Architect pass will determine outcome.
+                #
+                # mika#2031: "already committed" is a claim about git, and
+                # VALID_PLAN is an answer from the filesystem — _find_issue_plan
+                # walks the worktree, so it finds an UNCOMMITTED plan just as
+                # readily. Asserting the commit on that evidence was false in
+                # exactly the case the rescue below exists for. Measure it.
+                if git -C "$WORKTREE_DIR" ls-files --error-unmatch -- "$VALID_PLAN" >/dev/null 2>&1 \
+                   && [ -z "$(git -C "$WORKTREE_DIR" status --porcelain -- "$VALID_PLAN" 2>/dev/null)" ]; then
+                    RESULT="Note: HEAD unchanged on dev-groom re-dispatch — the plan for ${REPO}#${ISSUE_NUM} is already committed (${VALID_PLAN}). Architect pass will determine outcome.
 
 ${RESULT}"
+                else
+                    RESULT="Note: HEAD unchanged on dev-groom — the plan for ${REPO}#${ISSUE_NUM} is present in the worktree (${VALID_PLAN}) but NOT committed. dispatch-lib's dirty-worktree rescue preserves it (mika#2031).
+
+${RESULT}"
+                fi
             else
                 # mika#1772: name the exit code that was actually observed. This
                 # branch asserted "exited 0" unconditionally, and the 2026-08-28
@@ -1982,211 +2527,11 @@ ${RESULT}"
             fi
         fi
 
-        # Unit 1 (mika#1282): detect dirty worktree on zero-commit dev-pilot.
-        # If the pilot wrote files but never committed, auto-rescue the content
-        # so it isn't lost with the worktree. This is dispatch-lib exercising its
-        # structural git-workflow ownership per the content/workflow split
-        # (mika#1271 architect verdict; pilot-vs-substrate-contract-split-2026-05-25.md).
-        if [ "$PRE_RUN_HEAD" = "$POST_RUN_HEAD" ] && [ "$SKILL" = "dev-pilot" ] && [ -n "$WORKTREE_DIR" ]; then
-            DIRTY_FILES=$(git -C "$WORKTREE_DIR" status --porcelain 2>/dev/null | head -20)
-            if [ -n "$DIRTY_FILES" ]; then
-                # Stage all dirty files EXCEPT worktree-scaffold paths copied by
-                # _set_up_worktree (mika#1288, mika#1419, mika#1552):
-                #   - .claude/commands/         slash-command snapshots from mika-platform
-                #   - .claude/claude-pilot.json relay config cp'd from $PLATFORM_DIR at :489
-                #   - .claude/settings.local.json  permission allowlist cp'd at :490 (mika#1552)
-                #   - .claude/*.local.*          general guard for any future Claude-local
-                #                                files (.env-class — operator-machine-specific)
-                # None is pilot-authored content. Without the second exclusion, the rescue
-                # commit re-introduces .claude/claude-pilot.json whose intentional deletion
-                # shipped in PR #1348 (mika#1193 Phase C) — the founding incident for
-                # mika#1419. The third + fourth catch the .claude/settings.local.json class
-                # — cm#5 dispatch (2026-06-16) produced PR #16 whose only "rescued" content
-                # was a 143-line operator allowlist leak (mika#1552 founding incident).
-                git -C "$WORKTREE_DIR" add -A -- ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9
-
-                # Guard: if pathspec exclusion left nothing staged, skip the rescue
-                # commit. Handles the edge case where the pilot wrote ONLY to scaffold
-                # paths (mika#1288, mika#1419).
-                if git -C "$WORKTREE_DIR" diff --cached --quiet 2>&9; then
-                    echo "NOTE: dirty worktree contained only scaffold paths (.claude/commands/, .claude/claude-pilot.json) — no pilot content to rescue" >&2
-                    RESCUED_DIRTY_WORKTREE=0
-                else
-                    # Compute accurate rescued-files list for the PIPELINE FAILURE
-                    # message. DIRTY_FILES (from git status --porcelain) includes
-                    # excluded scaffold paths; RESCUED_FILES reflects what was actually
-                    # staged and will be committed.
-                    RESCUED_FILES=$(git -C "$WORKTREE_DIR" diff --cached --name-only 2>&9)
-
-                    # Proactive formatting (mika#1336): the dominant rescue-failure class is
-                    # pilot-authored Rust that was never `cargo fmt`-ed, so the first commit
-                    # trips the lefthook rust-fmt gate. Formatting up front makes the first
-                    # commit succeed, halves wall-clock (one clippy compile, not two), and
-                    # removes reliance on parsing lefthook stdout to detect a fmt rejection.
-                    # The reactive rust-fmt retry below remains as belt-and-suspenders.
-                    # Gated on staged *.rs so docs-only / non-Rust pilots don't pay cargo startup.
-                    if git -C "$WORKTREE_DIR" diff --cached --name-only 2>&9 | grep -q '\.rs$'; then
-                        PROACTIVE_FMT_ERR=$( (cd "$WORKTREE_DIR" && cargo fmt --all) 2>&1 ) || true
-                        [ -n "$PROACTIVE_FMT_ERR" ] && echo "NOTE: proactive cargo fmt: ${PROACTIVE_FMT_ERR}" >&2
-                        # Same exclusion pathspec as the initial `git add -A` above
-                        # (mika#1288, mika#1419) — keeps scaffold paths out of the
-                        # post-fmt re-add.
-                        git -C "$WORKTREE_DIR" add -u -- ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9
-                    fi
-
-                    # Attempt rescue commit — capture stderr for hook-failure diagnosis (mika#1296).
-                    # mika#1341: scratch file MUST live outside the worktree tree, NOT under
-                    # "$WORKTREE_DIR/.git/". In a linked worktree (every autonomous dev-pilot run)
-                    # ".git" is a FILE (a `gitdir:` pointer), not a directory — so a redirect into
-                    # "$WORKTREE_DIR/.git/<name>" fails to OPEN (ENOTDIR). A failed output redirect
-                    # means `git commit` never runs and exits non-zero with no captured output,
-                    # producing the "non-rustfmt empty-capture" PIPELINE FAILURE with HEAD unchanged.
-                    # `mktemp` keeps the original intent (off the working tree, away from .iterate/)
-                    # while guaranteeing a real, writable path in both linked and non-linked checkouts.
-                    # Named template preserves the descriptive "mika-rescue-commit-err" scratch name.
-                    # NOTE: the literal token "mika-rescue-commit-err" is also a sed anchor in
-                    # test-dispatch-lib.sh (rescue-block extraction); renaming it breaks those tests.
-                    RESCUE_COMMIT_ERR="$(mktemp "${TMPDIR:-/tmp}/mika-rescue-commit-err.XXXXXX")"
-
-                    # mika#1310: capture BOTH stdout and stderr. Lefthook
-                    # pre-commit hooks print their summary + failure marks
-                    # to stdout (not stderr); a `2>` redirect alone captured
-                    # an empty file and the operator saw "Hook output:"
-                    # blank on every false-positive rejection. Combined
-                    # `>file 2>&1` captures the full lefthook decoration
-                    # block including ⛔ failure lines.
-                    #
-                    # mika#1685: rescue commits bypass the pre-commit hook
-                    # (--no-verify) BY DESIGN. The rescue path's purpose is to
-                    # SALVAGE pilot work for operator review, not to gate it on
-                    # lint. lefthook runs rust-clippy on pre-commit; a single
-                    # clippy nit (one-line typo like `repeat().collect()`) would
-                    # otherwise reject the rescue commit and strand a 29-turn,
-                    # $4-cost pilot's work as a dead block (modal loop-wedge
-                    # cause, n=3+ on 2026-06-30). CI re-runs cargo fmt --check +
-                    # clippy on the resulting draft PR (ci.yml; wip-staleness-check
-                    # re-clippies wip-rescue drafts when main moves), so the LINT
-                    # signal still surfaces at the right layer — for the operator
-                    # and the autonomous-loop's clippy-fix-retry path, not as a
-                    # hard pre-commit block.
-                    #
-                    # TRADE-OFF, by design: --no-verify is all-or-nothing, so it
-                    # ALSO skips lefthook's no-secrets + no-large-files gates,
-                    # which CI does NOT replicate today (mika#1689 tracks adding a
-                    # CI secret-scan net). Accepted because the rescue output is a
-                    # DRAFT PR (operator-gated, never auto-merged), the secret-prone
-                    # scaffold paths are already excluded from staging above, and
-                    # secrets are scrubbed at the DB/tool-call layer. Do NOT remove
-                    # --no-verify here without first moving the LINT gate somewhere
-                    # the rescue path can still open its draft PR.
-                    # Mika Prime bearing 2026-06-30 ~16:32Z ratified this as the
-                    # wedge-cause fix (Concern 2, ahead of mika#1058).
-                    if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): impl staged by post-flight recovery (mika#1282)
-
-Content written by pilot session ${SESSION_ID:-unknown} but git commit was never invoked.
-Auto-rescued by dispatch-lib dirty-worktree detection.
-Scaffold paths excluded (mika#1288, mika#1419)." --no-verify > "$RESCUE_COMMIT_ERR" 2>&1; then
-                        # Commit succeeded on first try — proceed normally
-                        rm -f "$RESCUE_COMMIT_ERR"
-
-                        # Update POST_RUN_HEAD so _push_branch sees new commits
-                        POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
-
-                        # Amend the PIPELINE FAILURE message (already set above) with rescue note
-                        RESULT="PIPELINE FAILURE: claude-pilot exited ${PILOT_EXIT:-unknown} with HEAD unchanged — dirty worktree detected and auto-committed (mika#1282 recovery).
-Files rescued:
-${RESCUED_FILES}
-
-${RESULT}"
-
-                        # Mark for draft PR creation in Unit 2
-                        RESCUED_DIRTY_WORKTREE=1
-                    elif grep -q "rust-fmt\|cargo fmt\|rustfmt" "$RESCUE_COMMIT_ERR" 2>/dev/null; then
-                        # mika#1685 (AC4, kept-and-noted): with --no-verify on the
-                        # initial commit above, the pre-commit hook no longer runs,
-                        # so this fmt-rejection branch is now effectively unreachable
-                        # on hook grounds. Retained defensively rather than removed —
-                        # the retry commit below also carries --no-verify so the path
-                        # stays consistent if a future change reintroduces a hook.
-                        # Pre-commit rust-fmt hook rejected — auto-fix and retry (mika#1296).
-                        # Capture cargo fmt stderr so it surfaces in the PIPELINE FAILURE message
-                        # if the retry also fails (review-guide.md § Single Responsibility — failure
-                        # paths must surface all available diagnostic information).
-                        CARGO_FMT_ERR=""
-                        echo "NOTE: rescue commit rejected by rust-fmt hook — running cargo fmt and retrying" >&2
-                        CARGO_FMT_ERR=$( (cd "$WORKTREE_DIR" && cargo fmt --all) 2>&1 ) || true
-                        # Same exclusion pathspec as the initial `git add -A` above
-                        # (mika#1288, mika#1419) — scaffold paths stay excluded on the
-                        # post-fmt retry path too.
-                        git -C "$WORKTREE_DIR" add -A -- ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9
-
-                        # mika#1310: capture both stdout+stderr (see above).
-                        if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): impl staged by post-flight recovery (mika#1282)
-
-Content written by pilot session ${SESSION_ID:-unknown} but git commit was never invoked.
-Auto-rescued by dispatch-lib dirty-worktree detection (cargo fmt applied).
-Scaffold paths excluded (mika#1288, mika#1419)." --no-verify > "$RESCUE_COMMIT_ERR" 2>&1; then
-                            # Retry succeeded after cargo fmt
-                            rm -f "$RESCUE_COMMIT_ERR"
-
-                            POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
-
-                            RESULT="PIPELINE FAILURE: claude-pilot exited ${PILOT_EXIT:-unknown} with HEAD unchanged — dirty worktree detected and auto-committed after cargo fmt (mika#1282 + mika#1296 recovery).
-Files rescued:
-${RESCUED_FILES}
-
-${RESULT}"
-
-                            RESCUED_DIRTY_WORKTREE=1
-                        else
-                            # Retry also failed — abort rescue, leave dirty.
-                            # Surface the full diagnostic chain: cargo fmt output + retry commit
-                            # hook output, so the operator can diagnose from the message alone
-                            # (mika#1296 acceptance criteria).
-                            RESCUE_ERR_CONTENT=$(cat "$RESCUE_COMMIT_ERR" 2>/dev/null | head -50)
-                        # mika#1310: if captured output is empty, dump git
-                        # diagnostic state as fallback so PIPELINE FAILURE
-                        # carries SOMETHING the operator can act on.
-                        if [ -z "$(printf '%s' "$RESCUE_ERR_CONTENT" | tr -d '[:space:]')" ]; then
-                            RESCUE_ERR_CONTENT="<rescue capture was empty — likely no hook output, falling back to git diagnostic>
-git status:
-$(git -C "$WORKTREE_DIR" status --short 2>&1 | head -10)
-git diff --cached --name-only:
-$(git -C "$WORKTREE_DIR" diff --cached --name-only 2>&1 | head -10)"
-                        fi
-                            RESULT="PIPELINE FAILURE: auto-rescue commit rejected by pre-commit hook after cargo-fmt retry.
-cargo fmt stderr: ${CARGO_FMT_ERR:-<empty>}
-Hook output: ${RESCUE_ERR_CONTENT}
-Worktree left dirty for operator inspection: ${WORKTREE_DIR}
-
-${RESULT}"
-                            # Do NOT set RESCUED_DIRTY_WORKTREE — prevents empty draft PR
-                            rm -f "$RESCUE_COMMIT_ERR"
-                        fi
-                    else
-                        # Unknown hook failure — abort rescue, leave dirty
-                        RESCUE_ERR_CONTENT=$(cat "$RESCUE_COMMIT_ERR" 2>/dev/null | head -50)
-                        # mika#1310: if captured output is empty, dump git
-                        # diagnostic state as fallback so PIPELINE FAILURE
-                        # carries SOMETHING the operator can act on.
-                        if [ -z "$(printf '%s' "$RESCUE_ERR_CONTENT" | tr -d '[:space:]')" ]; then
-                            RESCUE_ERR_CONTENT="<rescue capture was empty — likely no hook output, falling back to git diagnostic>
-git status:
-$(git -C "$WORKTREE_DIR" status --short 2>&1 | head -10)
-git diff --cached --name-only:
-$(git -C "$WORKTREE_DIR" diff --cached --name-only 2>&1 | head -10)"
-                        fi
-                        RESULT="PIPELINE FAILURE: auto-rescue commit rejected by pre-commit hook (non-rustfmt).
-Hook output: ${RESCUE_ERR_CONTENT}
-Worktree left dirty for operator inspection: ${WORKTREE_DIR}
-
-${RESULT}"
-                        # Do NOT set RESCUED_DIRTY_WORKTREE — prevents empty draft PR
-                        rm -f "$RESCUE_COMMIT_ERR"
-                    fi
-                fi
-            fi
-        fi
+        # Unit 1 (mika#1282): detect dirty worktree on a zero-commit session and
+        # preserve its content before anything else runs. Opened to dev-groom by
+        # mika#2031; the body lives in _rescue_dirty_worktree() so a test can
+        # exercise it directly instead of reimplementing it.
+        _rescue_dirty_worktree
 
         # mika#1383: structural completion gate for HEAD-advanced-no-PR.
         # The pilot session ran content and committed, but ended its turn
@@ -3132,6 +3477,28 @@ _parse_disposition() {
     local text
     text=$(cat)
     local result
+    # Tier 0 — withheld-disposition short-circuit (mika#2037). The engine strips a
+    # disposition it refused to let stand and substitutes this literal marker. When it is
+    # present, NO tier may derive a verdict: the response is an absence of verdict, not an
+    # approval.
+    #
+    # The position is load-bearing, not stylistic. After tier 1a the marker would still be
+    # honoured, but after tier 2 it would not: the fuzzy pass matches paraphrases
+    # ("proceed", "good to go", "plan is clean") anywhere in the text, so a response whose
+    # disposition line was merely removed could still yield READY out of its own body. Tier 0
+    # runs first so the engine's refusal cannot be undone downstream. Keep the literal in sync
+    # with DISPOSITION_WITHHELD_MARKER in crates/mika-agent/src/agent_loop/mod.rs.
+    # Matched at the START OF A LINE, not anywhere in the text. The three arch prompts now
+    # teach this literal to the model ("replaced with `Disposition-Withheld: ...`"), so a
+    # response that QUOTES the marker while carrying a genuine ITERATE or GROOMED must not be
+    # suppressed. Only the engine writes it as a line of its own.
+    case "$text" in
+        "Disposition-Withheld: REVIEW-ANCHOR-MISSING"*|*"
+Disposition-Withheld: REVIEW-ANCHOR-MISSING"*)
+            echo "_parse_disposition: tier 0 — disposition withheld by the engine (review-anchor attestation missing, mika#2037); emitting nothing" >&2
+            return
+            ;;
+    esac
     # Tier 1a — canonical first-pass shape
     result=$(printf '%s' "$text" | grep -oE 'Disposition:[[:space:]]*(READY|ITERATE|ESCALATE)' \
         | grep -oE '(READY|ITERATE|ESCALATE)' \
@@ -3186,6 +3553,28 @@ _parse_verdict() {
     local text
     text=$(cat)
     local result
+    # Tier 0 — withheld-disposition short-circuit (mika#2037). The engine strips a
+    # disposition it refused to let stand and substitutes this literal marker. When it is
+    # present, NO tier may derive a verdict: the response is an absence of verdict, not an
+    # approval.
+    #
+    # The position is load-bearing, not stylistic. After tier 1a the marker would still be
+    # honoured, but after tier 2 it would not: the fuzzy pass matches paraphrases
+    # ("proceed", "good to go", "plan is clean") anywhere in the text, so a response whose
+    # disposition line was merely removed could still yield READY out of its own body. Tier 0
+    # runs first so the engine's refusal cannot be undone downstream. Keep the literal in sync
+    # with DISPOSITION_WITHHELD_MARKER in crates/mika-agent/src/agent_loop/mod.rs.
+    # Matched at the START OF A LINE, not anywhere in the text. The three arch prompts now
+    # teach this literal to the model ("replaced with `Disposition-Withheld: ...`"), so a
+    # response that QUOTES the marker while carrying a genuine ITERATE or GROOMED must not be
+    # suppressed. Only the engine writes it as a line of its own.
+    case "$text" in
+        "Disposition-Withheld: REVIEW-ANCHOR-MISSING"*|*"
+Disposition-Withheld: REVIEW-ANCHOR-MISSING"*)
+            echo "_parse_verdict: tier 0 — disposition withheld by the engine (review-anchor attestation missing, mika#2037); emitting nothing" >&2
+            return
+            ;;
+    esac
     result=$(printf '%s' "$text" | grep -oE 'Verdict:[[:space:]]*(GROOMED|ESCALATE)' \
         | grep -oE '(GROOMED|ESCALATE)' \
         | head -1)
@@ -4509,7 +4898,7 @@ Outcome: PLAN_GROOMED"
             if [ -n "${VALID_PLAN:-}" ]; then
                 _groom_plan_line="
 Plan in worktree: ${VALID_PLAN} — the architect verdict is what is missing, not the plan."
-            elif _groom_plan_path=$(_committed_plan_on_branch "$SUB_REPO_DIR" "$BRANCH" "$ISSUE_BODY" "$REPO" 2>/dev/null); then
+            elif _groom_plan_path=$(_committed_plan_on_branch "$SUB_REPO_DIR" "$BRANCH" "$ISSUE_BODY" "$REPO" "$ISSUE_NUM" 2>/dev/null); then
                 _groom_plan_line="
 Plan on remote branch: ${_groom_plan_path} — the architect verdict is what is missing, not the plan."
             fi
