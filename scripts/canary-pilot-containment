@@ -257,18 +257,68 @@ _run_pilot_sandboxed sh -c '
 ' || echo "PART 1 exit=$?"
 echo
 
-# mika#2141 negative control. A must-fail probe against a path that does not
-# exist on this host proves nothing, so the control is picked from the live
-# worktree list and its host-side presence is asserted before the sandbox runs.
-CANARY_OTHER_WORKTREE=$(git worktree list --porcelain 2>/dev/null \
-    | awk '/^worktree /{print $2}' \
-    | grep -v -x -F "$WORKTREE_DIR" | head -1)
-if [ -n "$CANARY_OTHER_WORKTREE" ] && [ -d "$CANARY_OTHER_WORKTREE" ]; then
-    echo "negative control (exists host-side): $CANARY_OTHER_WORKTREE"
+# mika#2141. The git blocks in PART 2 only mean something when this checkout is
+# a LINKED worktree — the shape where `.git` is a file pointing outside the
+# bind, which is the entire defect. On a plain clone the whole `.git` directory
+# sits inside the rw `--bind "$WORKTREE_DIR"`, so a must-work probe passes for
+# the wrong reason and a must-fail probe would DESTROY the operator's real refs.
+# Detect the shape once and say so; the falsifying gate for a plain checkout is
+# `make test-sandbox-git-usable`, which builds its own disposable worktree.
+CANARY_LINKED_WORKTREE=0
+if [ -f "$WORKTREE_DIR/.git" ]; then
+    CANARY_LINKED_WORKTREE=1
+    echo "checkout shape: LINKED worktree — the mika#2141 git blocks are meaningful here"
 else
-    CANARY_OTHER_WORKTREE=""
+    echo "checkout shape: PLAIN clone — the mika#2141 git blocks will be SKIPPED."
+    echo "  On a plain clone .git is inside the worktree bind, so those probes would"
+    echo "  pass for the wrong reason and the must-fail half would delete real refs."
+    echo "  Run 'make test-sandbox-git-usable' for the falsifying version."
+fi
+
+# Negative control for AC2: a must-fail probe against a path that does not exist
+# on this host proves nothing, so the control is picked from the live worktree
+# list and its host-side presence is asserted before the sandbox runs. Read with
+# `read -r` on the porcelain stream rather than awk field-splitting, which
+# truncates any path containing a space, and compare resolved paths so a
+# trailing slash or a symlinked component cannot make the canary select ITSELF
+# and report a false LEAK.
+CANARY_OTHER_WORKTREE=""
+if [ "$CANARY_LINKED_WORKTREE" -eq 1 ]; then
+    _canary_self=$(git -C "$WORKTREE_DIR" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$WORKTREE_DIR")
+    while IFS= read -r _line; do
+        case "$_line" in
+            "worktree "*)
+                _cand="${_line#worktree }"
+                _cand_real=$(cd "$_cand" 2>/dev/null && pwd) || continue
+                [ "$_cand_real" = "$_canary_self" ] && continue
+                CANARY_OTHER_WORKTREE="$_cand_real"
+                break
+                ;;
+        esac
+    done < <(git -C "$WORKTREE_DIR" worktree list --porcelain 2>/dev/null)
+fi
+if [ -n "$CANARY_OTHER_WORKTREE" ]; then
+    echo "negative control (exists host-side): $CANARY_OTHER_WORKTREE"
+elif [ "$CANARY_LINKED_WORKTREE" -eq 1 ]; then
     echo "negative control: NONE — only one worktree on this host, the cross-worktree"
     echo "  probe below will report 'skipped' rather than a vacuous pass."
+fi
+
+# A disposable victim ref for the delete probe. NEVER refs/heads/main: on any
+# shape where the delete succeeds, the probe would destroy the operator's local
+# main with no restore path. This ref lives under a prefix that is deliberately
+# NOT the dispatch branch's dirname, so a correct bind set refuses it — and if
+# something does delete it, nothing of value is lost.
+CANARY_VICTIM_REF=""
+if [ "$CANARY_LINKED_WORKTREE" -eq 1 ]; then
+    CANARY_VICTIM_REF="refs/heads/canary-victim/mika2141-$$"
+    if git -C "$WORKTREE_DIR" update-ref "$CANARY_VICTIM_REF" HEAD 2>/dev/null; then
+        # shellcheck disable=SC2064
+        trap "git -C '$WORKTREE_DIR' update-ref -d '$CANARY_VICTIM_REF' >/dev/null 2>&1 || true" EXIT
+    else
+        CANARY_VICTIM_REF=""
+        echo "negative control: could not create a victim ref — the delete probe will report 'skipped'"
+    fi
 fi
 echo
 
@@ -364,10 +414,17 @@ git --version 2>&1 | head -1 || echo "FAIL: git missing"
 
 echo
 echo "--- must-work: git repository operations (mika#2141) ---"
-# Deliberately non-mutating: this canary runs against the operator'"'"'s live
-# checkout, so it proves write CAPABILITY (a new object, a scratch ref under
-# this branch'"'"'s own directory) without moving HEAD. The full add/commit path
-# runs on a disposable worktree in
+if [ "'"$CANARY_LINKED_WORKTREE"'" != "1" ]; then
+    echo "skip: this checkout is a plain clone, not a linked worktree. Its whole .git"
+    echo "      is inside the worktree bind, so these probes would pass without"
+    echo "      exercising anything mika#2141 fixed. Run make test-sandbox-git-usable."
+else
+# This canary runs against the operator'"'"'s live checkout, so it proves write
+# CAPABILITY without moving HEAD or any existing branch: one loose object
+# (unreferenced, collected by the next gc) and one scratch ref under this
+# branch'"'"'s own directory, deleted immediately. It is not side-effect free —
+# saying so plainly is the point — but nothing it writes is reachable or
+# destructive. The full add/commit path runs on a disposable worktree in
 # skills/bundled/_shared/tests/test_sandbox_git_usable.sh.
 if git rev-parse --show-toplevel >/dev/null 2>&1; then
     echo "ok:   git_rev_parse ($(git rev-parse --show-toplevel))"
@@ -410,17 +467,34 @@ else
         echo "FAIL: cannot write a ref under this branch'"'"'s directory — commit would fail"
     fi
 fi
+fi
 
 echo
 echo "--- must-fail: git containment still closed (mika#2141 AC2) ---"
-_canary_other="'"'"'"$CANARY_OTHER_WORKTREE"'"'"'"
+if [ "'"$CANARY_LINKED_WORKTREE"'" != "1" ]; then
+    echo "skip: plain clone — refs are inside the rw worktree bind here, so a delete"
+    echo "      probe would DESTROY real refs rather than prove containment."
+else
+_canary_other="'"$CANARY_OTHER_WORKTREE"'"
 if [ -z "$_canary_other" ]; then
     echo "skip: cross-worktree probe (no second worktree on this host)"
 else
-    if ls "$_canary_other" >/dev/null 2>&1; then
-        echo "LEAK: another worktree is visible at $_canary_other"
+    # Test CONTENT reachability, not path existence. Mounting paths beneath the
+    # parent repository necessarily materialises its directory as an empty
+    # skeleton holding only the bound .git entries — measured: no Cargo.toml,
+    # no crates/, no working tree at all. Asserting non-existence here would
+    # report a LEAK for a directory that exposes nothing, and asserting it for
+    # a path that never existed would be vacuous. AC2 is about file access.
+    _canary_leaked=""
+    for _f in .git/config Cargo.toml crates README.md package.json; do
+        if [ -e "$_canary_other/$_f" ] && [ "$_f" != ".git/config" ]; then
+            _canary_leaked="$_canary_leaked $_f"
+        fi
+    done
+    if [ -n "$_canary_leaked" ]; then
+        echo "LEAK: content of another worktree is readable at $_canary_other —$_canary_leaked"
     else
-        echo "ok:   other_worktree_hidden"
+        echo "ok:   other_worktree_content_unreachable"
     fi
     if git -C "$_canary_other" status -sb >/dev/null 2>&1; then
         echo "LEAK: another worktree is readable through git -C"
@@ -428,21 +502,27 @@ else
         echo "ok:   other_worktree_git_blocked"
     fi
 fi
-_canary_del=$(git update-ref -d refs/heads/main 2>&1)
-if echo "$_canary_del" | grep -qi "not a git repository"; then
-    echo "FAIL: git is not working at all — this probe cannot judge containment"
-elif echo "$_canary_del" | grep -qi "read-only\|cannot lock\|permission denied"; then
-    echo "ok:   unrelated_branch_delete_refused"
-elif git rev-parse --verify --quiet refs/heads/main >/dev/null 2>&1; then
-    echo "ok:   unrelated_branch_delete_refused"
+_canary_victim="'"$CANARY_VICTIM_REF"'"
+if [ -z "$_canary_victim" ]; then
+    echo "skip: branch-delete probe (no victim ref could be created host-side)"
 else
-    echo "LEAK: deleted refs/heads/main from inside the sandbox"
+    _canary_del=$(git update-ref -d "$_canary_victim" 2>&1)
+    if echo "$_canary_del" | grep -qi "not a git repository"; then
+        echo "FAIL: git is not working at all — this probe cannot judge containment"
+    elif echo "$_canary_del" | grep -qi "read-only\|cannot lock\|permission denied"; then
+        echo "ok:   unrelated_branch_delete_refused"
+    elif git rev-parse --verify --quiet "$_canary_victim" >/dev/null 2>&1; then
+        echo "ok:   unrelated_branch_delete_refused"
+    else
+        echo "LEAK: deleted $_canary_victim from inside the sandbox"
+    fi
 fi
 if git config --local --add canary.mika2141 1 >/dev/null 2>&1; then
     echo "LEAK: the parent repo config is writable from the sandbox"
     git config --local --unset canary.mika2141 >/dev/null 2>&1 || true
 else
     echo "ok:   parent_config_readonly"
+fi
 fi
 
 echo

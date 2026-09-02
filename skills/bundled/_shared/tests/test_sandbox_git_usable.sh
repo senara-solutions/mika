@@ -75,6 +75,11 @@ fi
 STAMP="$$-$(date +%s)"
 PROBE_BRANCH="probe/2141/sandbox-git-usable-$STAMP"
 OTHER_BRANCH="probe/2141/negative-control-$STAMP"
+# A disposable deletion target. NEVER refs/heads/main: this assertion exists to
+# catch a regression to a wider bind, and on that regression the first `make
+# test` run would delete the operator live main with no restore path. Its prefix
+# is deliberately NOT the probe branch dirname, so a correct bind refuses it.
+VICTIM_BRANCH="victim/2141/$STAMP"
 
 TMPROOT=$(mktemp -d "${TMPDIR:-/tmp}/mika2141-XXXXXX")
 WORKTREE_DIR="$TMPROOT/worktree"
@@ -85,6 +90,15 @@ cleanup() {
     git -C "$REPO_ROOT" worktree remove --force "$OTHER_WORKTREE" >/dev/null 2>&1 || true
     git -C "$REPO_ROOT" branch -D "$PROBE_BRANCH" >/dev/null 2>&1 || true
     git -C "$REPO_ROOT" branch -D "$OTHER_BRANCH" >/dev/null 2>&1 || true
+    git -C "$REPO_ROOT" branch -D "$VICTIM_BRANCH" >/dev/null 2>&1 || true
+    # The helper mkdir -p's these under the parent repo; leaving them behind
+    # would litter the operator repository on every run.
+    if [ -n "${PARENT_GIT_DIR:-}" ]; then
+        rmdir "$PARENT_GIT_DIR/refs/heads/probe/2141" "$PARENT_GIT_DIR/refs/heads/probe" \
+              "$PARENT_GIT_DIR/logs/refs/heads/probe/2141" "$PARENT_GIT_DIR/logs/refs/heads/probe" \
+              "$PARENT_GIT_DIR/refs/heads/victim/2141" "$PARENT_GIT_DIR/refs/heads/victim" \
+              >/dev/null 2>&1 || true
+    fi
     git -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
     rm -rf "$TMPROOT"
 }
@@ -96,6 +110,7 @@ if ! git -C "$REPO_ROOT" worktree add --quiet -b "$PROBE_BRANCH" "$WORKTREE_DIR"
     exit 0
 fi
 git -C "$REPO_ROOT" worktree add --quiet -b "$OTHER_BRANCH" "$OTHER_WORKTREE" "$BASE_REF" 2>/dev/null || true
+git -C "$REPO_ROOT" branch --quiet "$VICTIM_BRANCH" "$BASE_REF" 2>/dev/null || true
 
 # The probe worktree must have the defect's shape, or this suite proves nothing.
 dotgit_kind="missing"
@@ -181,11 +196,36 @@ echo "-------------------------------------------------------------"
 # inside the sandbox is isolation and not a path that simply does not exist.
 host_other=$( [ -d "$OTHER_WORKTREE" ] && echo present || echo missing )
 assert_eq "control: the other worktree exists host-side" "present" "$host_other"
-host_main=$(git -C "$REPO_ROOT" rev-parse --verify --quiet main >/dev/null 2>&1 && echo yes || echo no)
-assert_eq "control: refs/heads/main exists host-side" "yes" "$host_main"
+host_victim=$(git -C "$REPO_ROOT" rev-parse --verify --quiet "$VICTIM_BRANCH" >/dev/null 2>&1 && echo yes || echo no)
+assert_eq "control: the victim branch exists host-side" "yes" "$host_victim"
 
 got_other_ls=$(_run_pilot_sandboxed /bin/sh -c "[ -e '$OTHER_WORKTREE' ] && echo visible || echo hidden" 2>/dev/null)
 assert_eq "another worktree is not visible by path" "hidden" "$got_other_ls"
+
+# The PARENT repository's own checkout is a different case, and the distinction
+# is load-bearing. Mounting paths under its .git necessarily materialises its
+# directory as a skeleton, so its PATH exists inside the sandbox. What must not
+# exist is its content — AC2 is about file access, not about path visibility,
+# and a probe that confused the two would report a leak that is not one (or,
+# worse, pass because the path it named never existed).
+# The PARENT repository, not this checkout: $REPO_ROOT is itself a linked
+# worktree, so its .git is a file and its path is not what gets materialised.
+PARENT_GIT_DIR=$(git -C "$WORKTREE_DIR" rev-parse --path-format=absolute --git-common-dir)
+PARENT_CHECKOUT=$(dirname "$PARENT_GIT_DIR")
+got_parent_content=$(_run_pilot_sandboxed /bin/sh -c "
+    leaked=
+    for f in Cargo.toml crates README.md Makefile; do
+        [ -e '$PARENT_CHECKOUT'/\$f ] && leaked=\"\$leaked \$f\"
+    done
+    [ -n \"\$leaked\" ] && echo \"leaked:\$leaked\" || echo unreachable" 2>/dev/null)
+got_skeleton=$(_run_pilot_sandboxed /bin/sh -c "[ -d '$PARENT_CHECKOUT' ] && echo present || echo absent" 2>/dev/null)
+assert_eq "control: the parent checkout path IS materialised (else the next two are vacuous)" "present" "$got_skeleton"
+assert_eq "the parent checkout's working tree is unreachable" "unreachable" "$got_parent_content"
+
+# And only this worktree is listed under the parent's worktrees/ — bwrap
+# materialises the intermediate directory without revealing its siblings.
+got_wt_siblings=$(_run_pilot_sandboxed /bin/sh -c "ls '$PARENT_CHECKOUT'/.git/worktrees 2>/dev/null | wc -l" 2>/dev/null)
+assert_eq "only this worktree is listed under the parent's worktrees/" "1" "$got_wt_siblings"
 
 got_other_git=$(_run_pilot_sandboxed /bin/sh -c "git -C '$OTHER_WORKTREE' status -sb >/dev/null 2>&1 && echo readable || echo blocked" 2>/dev/null)
 assert_eq "another worktree is not readable through git -C" "blocked" "$got_other_git"
@@ -198,20 +238,20 @@ assert_eq "another worktree is not readable through git -C" "blocked" "$got_othe
 # sandbox — the pre-fix state — read as a passing containment check on one run
 # and as a spurious DELETED on another; neither is the truth.
 got_delete=$(_run_pilot_sandboxed /bin/sh -c '
-    out=$(git update-ref -d refs/heads/main 2>&1)
+    out=$(git update-ref -d refs/heads/'"$VICTIM_BRANCH"' 2>&1)
     if echo "$out" | grep -qi "not a git repository"; then
         echo git-broken
     elif echo "$out" | grep -qi "read-only\|cannot lock\|permission denied"; then
         echo refused
-    elif git rev-parse --verify --quiet refs/heads/main >/dev/null 2>&1; then
+    elif git rev-parse --verify --quiet refs/heads/'"$VICTIM_BRANCH"' >/dev/null 2>&1; then
         echo refused
     else
         echo DELETED
     fi' 2>/dev/null)
 assert_eq "deleting an unrelated branch head is refused (refs is read-only)" "refused" "$got_delete"
 
-host_main_after=$(git -C "$REPO_ROOT" rev-parse --verify --quiet main >/dev/null 2>&1 && echo yes || echo no)
-assert_eq "refs/heads/main still exists host-side after the attempt" "yes" "$host_main_after"
+host_victim_after=$(git -C "$REPO_ROOT" rev-parse --verify --quiet "$VICTIM_BRANCH" >/dev/null 2>&1 && echo yes || echo no)
+assert_eq "the victim branch still exists host-side after the attempt" "yes" "$host_victim_after"
 
 # AC3 — the new bind must not carry a credential in either direction.
 got_gitconfig_home=$(_run_pilot_sandboxed /bin/sh -c '[ -e "$HOME/.gitconfig" ] && echo present || echo missing' 2>/dev/null)

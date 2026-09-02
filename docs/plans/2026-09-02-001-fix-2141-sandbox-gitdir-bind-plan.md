@@ -358,3 +358,52 @@ dans `HEAD` aurait fait monter au dispatch suivant un répertoire hôte arbitrai
 **Et un piège dans le traitement lui-même.** `git symbolic-ref --quiet` rend vide pour un `HEAD` trafiqué **comme** pour un `HEAD` détaché légitime. Confondre les deux ne montait aucun chemin dangereux — mais dégradait en silence vers un état où le pilote tourne et ne peut pas commiter : exactement la forme d'échec que ce ticket existe pour finir. Un `HEAD` qui annonce `ref:` alors que git refuse de le résoudre abandonne désormais le dispatch en le disant.
 
 Cinq assertions couvrent ces chemins, dont deux contrôles positifs — le worktree restauré résout toujours et émet toujours des binds — sans quoi les refus seraient indiscernables d'une fonction qui refuse tout.
+
+---
+
+## Résolution de la revue de code (2026-09-02)
+
+Douze constats. Onze corrigés, un rejeté **par mesure**. Deux d'entre eux étaient des défauts que j'avais introduits et qui allaient plus loin que ce que la revue avait vu.
+
+### Le plus grave — le canary détruisait des refs réelles
+
+`scripts/canary-pilot-containment` pose `WORKTREE_DIR="$REPO_ROOT"`, c'est-à-dire le checkout depuis lequel on l'invoque. Dans le clone principal, `.git` est un **répertoire** : il est donc entièrement dans le bind rw du worktree, `_pilot_gitdir_bind_args` rend la main sans rien monter, et mon `git update-ref -d refs/heads/main` **réussissait** — le `main` local de l'opérateur détruit, sans chemin de restauration, sous un en-tête qui annonçait « non-mutating ».
+
+Corrigé en trois temps : les deux blocs git ne s'exécutent que si le checkout est un worktree **lié** (la seule forme où la propriété est sous test) et disent pourquoi ils sautent sinon ; la cible de suppression est une ref jetable créée côté hôte sous un préfixe volontairement hors du bind ; et l'en-tête dit maintenant ce que la sonde écrit vraiment (un objet lâche non référencé, une ref éphémère) plutôt que de se déclarer sans effet.
+
+Le test avait la même faute sous une forme atténuée — la suppression visait `refs/heads/main`, refusée aujourd'hui, mais qui aurait supprimé `main` au premier `make test` suivant une régression vers un bind plus large. Même correctif : branche victime `victim/2141/<stamp>`.
+
+### Deux défauts que la revue n'a pas vus, trouvés en corrigeant les siens
+
+**Mes contrôles négatifs passaient pour la mauvaise raison.** L'injection d'une valeur hôte dans le payload `sh -c '…'` s'écrivait `'"'"'"$VAR"'"'"'`, ce qui produit la valeur **entourée de guillemets simples littéraux** : `'/data/…'`. Le chemin n'existait donc jamais, `ls` échouait, et la sonde annonçait `ok: other_worktree_hidden`. Vacuité exacte de la classe que ce ticket traite — un contrôle vert qui ne mesurait rien. La forme correcte est `'"$VAR"'`. Quatre occurrences corrigées.
+
+**Une fois l'injection réparée, la sonde a rendu `LEAK`** sur le checkout parent. Mesure avant conclusion : le chemin du dépôt parent **existe** dans le bac à sable — bwrap matérialise les répertoires intermédiaires de chaque bind — mais il ne contient que `.git`, lui-même réduit aux entrées montées. Ni `Cargo.toml`, ni `crates/`, ni `mika-cloud`, ni les fichiers du méta-dépôt. L'AC2 tient ; c'est la sonde qui testait l'existence d'un chemin au lieu de l'accès au contenu. Corrigée dans le canary et dans le test, avec un contrôle positif exigeant que le squelette existe — sans quoi les deux assertions suivantes porteraient sur un chemin absent.
+
+### Le constat rejeté — par mesure
+
+La revue proposait de binder le **fichier** de ref plutôt que son répertoire, ce qui supprimerait à la fois l'écriture sur les branches sœurs et la garde « branche sans slash ». Mesuré :
+
+```
+fatal: cannot lock ref 'HEAD': Unable to create
+       '…/refs/heads/probe/2141/r-…lock': Read-only file system
+```
+
+`git` crée un `.lock` **frère** dans le répertoire puis renomme : un bind de fichier unique interdit tout commit. La proposition est donc inapplicable, le bind de répertoire reste, et l'en-tête énonce désormais la granularité réelle — écriture et suppression sur toute branche partageant le préfixe `<type>/<issue>/` — au lieu de prétendre « cette tête de branche seulement ».
+
+### Les autres, corrigés
+
+| Constat | Traitement |
+|---|---|
+| `--ro-bind` du gitconfig contredisait le « fail-open » annoncé — un échec d'écriture tuait tout dispatch par un abort `bwrap` muet | Échec **fermé et bruyant** : `return 78` avec le motif nommé. Un dispatch qui meurt sans raison est ce qui a coûté un mois |
+| Le commentaire affirmait que le fichier généré est la **seule** config git vue ; le `config` du dépôt est lu à précédence **supérieure** | Commentaire corrigé, résiduel nommé (`credential.helper`, `core.sshCommand`, `insteadOf` concurrent) et vérifié absent du dépôt — vérifié, pas supposé |
+| `refs/tags` en ro : un `fetch` découvrant un nouveau tag échoue et emporte le rebase | Mesuré (`cannot lock ref 'refs/tags/…': Read-only file system`), `refs/tags` monté rw. Un tag n'est ni une cible de push ni une entrée du gate de rebase |
+| `user.name`/`user.email` non validés, interpolés dans un fichier de config | Refus sur tout caractère de contrôle. Un `\n[url …]\n insteadOf` détournerait le push. Refus et non nettoyage silencieux : le nettoyage cacherait la falsification |
+| Sortie 78 rendue à l'opérateur en « FAILED (exit code 78) » avec stdout vide | Motif porté par une variable **non locale** (`local` est invisible à l'appelant) jusqu'au `RESULT`, qui dit « CONTAINMENT REFUSAL … le pilote n'a jamais été lancé ». Vérifié de bout en bout : `rc=78` et motif présent chez l'appelant |
+| `mkdir … \|\| true` suivi d'un bind non-`try` | Refus expliqué au lieu de `bwrap: Can't find source path` |
+| Répertoires de refs laissés à demeure dans le dépôt de l'opérateur | Le test nettoie ceux qu'il a fait créer |
+| `git` côté hôte lisait une config inscriptible par le bac à sable avant toute garde | Les trois sondes tournent sous `GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null --no-optional-locks` |
+| Sélection du contrôle négatif fragile (`awk` coupe sur l'espace, auto-sélection possible) | Lecture `read -r` du flux porcelain, comparaison de chemins résolus |
+
+### Contrôle de falsification, refait après la refonte
+
+Fonction neutralisée : **16 assertions sur 30 tombent**, dont `rev-parse`, `status`, `commit`, la visibilité du commit côté hôte et les trois refus adverses. Rétablie : 30/30. Treize suites voisines vertes, canary compris.
