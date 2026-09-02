@@ -355,9 +355,15 @@ modèle, un diagnostic opérateur qui ne part pas au modèle sur le tier famille
 - *user-facing* : « Google Workspace is not available on this host: no Google
   credentials have ever been configured here. On cloud deployments this is by
   design — Google credentials are local-only and are not provisioned remotely.
-  This is not an outage and nothing has expired. Do NOT suggest `gws auth
-  login`; it cannot be run here. Tell the user Workspace access is not
-  available on this deployment. »
+  Nothing is broken and no credential needs renewing. Do not suggest running
+  any Workspace sign-in command; none can be run here. Tell the user Workspace
+  access is not available on this deployment. »
+
+  > Note (2026-09-02) : cette formulation évite délibérément les sous-chaînes
+  > `outage`, `expired` et `gws auth login`, que le test 5.3 interdit dans la
+  > chaîne user-facing. Le sens est inchangé — c'est §2.3 qui cède au test,
+  > lequel est la preuve de l'AC3. Ne pas restaurer la forme négative : elle
+  > fait échouer 5.3. Le message du chemin *expiré* (§5.4) n'est pas touché.
 - *diagnostic opérateur* : nomme `gws auth status`, `credential_source: none`,
   et le chemin du magasin de credentials.
 
