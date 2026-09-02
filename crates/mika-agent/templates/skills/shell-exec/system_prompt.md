@@ -4,6 +4,12 @@
 - Prefer read-only commands (ls, cat, grep, find, etc.) when possible.
 - Do not pipe secrets or credentials into commands.
 
+## Network egress
+
+- NEVER fetch URLs with `curl`, `wget`, or any direct HTTP client through this skill. run_shell refuses them and always will — direct network egress from the shell bypasses the platform's allowlist substrate (mika#1991).
+- To read a web page, use the `fetch_url` builtin (GET-only, gouv.fr allowlist). To search, use `web_search`. These are the ONLY sanctioned egress paths; they enforce the allowlist that run_shell cannot.
+- If a host you need is outside the allowlist, that is a governance decision (a code change per mika#1969), not something to route around with the shell.
+
 ## Config file editing
 
 When modifying config files (hyprland.conf, waybar config, bashrc, etc.):

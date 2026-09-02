@@ -66,6 +66,50 @@ if printf '%s\n' "$COMMAND" | grep -Eq '(^|[^A-Za-z0-9_.-])(gws|gh)([^A-Za-z0-9_
 fi
 # --- end shell-exec L3 hardening ---
 
+# --- shell-exec egress containment (mika#1991) ---
+# T1 mission-passeport (2026-08-24) measured the bypass this block closes:
+# over one shot, fetch_url was called 0 times and run_shell+curl 78 times,
+# and www.bouscat.fr — a host NOT on the fetch_url allowlist — was reached
+# with no obstacle. The compile-time gouv.fr allowlist that made fetch_url
+# acceptable under single-controlled-egress constrained NONE of that traffic:
+# it walked past the allowlisted door through run_shell.
+#
+# Doctrine (docs/solutions/best-practices/optional-path-is-no-guarantee-2026-08-30.md):
+# a guarantee carried by an OPTIONAL path is not a guarantee. The allowlist
+# only describes the traffic of callers who choose the enforced door. The fix
+# is to construct the incapacity, not to persuade the model: run_shell must be
+# unable to reach the network directly, so egress is FORCED onto the substrate
+# (fetch_url / web_search), which is the single allowlist-enforcing path.
+#
+# We do NOT re-implement the allowlist here. Duplicating the four gouv.fr hosts
+# into this handler would create a second source of truth — the very
+# scattered-guarantee anti-pattern this ticket is about — and would trip
+# scripts/verify-egress-uniqueness.sh, whose whole job is to keep the allowlist
+# the sole property of crates/mika-gateway/src/egress_fetch/. So this gate is
+# unconditional: any direct HTTP fetcher is refused, allowlisted host or not.
+# An off-allowlist host is therefore refused (bypass closed); an allowlisted
+# host is still reachable — through fetch_url, which enforces the allowlist.
+#
+# Boundary-aware lexical scan, same class as the L3 block above: the boundary
+# is "any character that cannot be part of a command identifier", so `/`
+# (path-qualified `/usr/bin/curl`), whitespace, quotes, `;`, `|`, `&`,
+# backtick, `$`, `(` all delimit a real invocation, while `.` and `-` are
+# excluded so `curl.log`, `wget.txt`, and `libcurl-dev` are not matches.
+#
+# Defense-in-depth, NOT a sole gate — identical stance to the L3 block. The
+# scan is lexical, so token-splitting, glob/variable assembly, base64-then-sh,
+# and non-curl transports (nc, /dev/tcp, a python urllib one-liner) still slip
+# a byte-level match. The complete closure is the network layer: a fresh
+# network namespace with no route plus a forced redirect to the substrate
+# gateway (mika#1969 AC5 iptables policy / the bwrap `--unshare-net` +
+# unix-socket proxy the dev-pilot already uses). This block buys the casual
+# and incidental path, which is exactly where the measured traffic lived.
+if printf '%s\n' "$COMMAND" | grep -Eq '(^|[^A-Za-z0-9_.-])(curl|wget)([^A-Za-z0-9_.-]|$)'; then
+    echo "Error: shell-exec refuses direct network egress (curl, wget). Agent egress MUST go through the allowlist-enforcing substrate: use the fetch_url builtin to GET a page, or web_search to search. This closes the run_shell egress bypass (mika#1991)." >&2
+    exit 1
+fi
+# --- end shell-exec egress containment ---
+
 if [ -n "$WORKDIR" ] && [ -d "$WORKDIR" ]; then
     cd "$WORKDIR" || exit 1
 fi
