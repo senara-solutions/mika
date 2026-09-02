@@ -16,7 +16,7 @@ use mika_a2a::jsonrpc::{
     A2aMethod, INTERNAL_ERROR, INVALID_PARAMS, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
     METHOD_NOT_FOUND, TASK_NOT_CANCELABLE, TASK_NOT_FOUND,
 };
-use mika_a2a::params::{MessageSendParams, TaskIdParams, TaskQueryParams};
+use mika_a2a::params::{CALLER_SESSION_ID_KEY, MessageSendParams, TaskIdParams, TaskQueryParams};
 use mika_a2a::state_machine::TaskStateMachine;
 use mika_a2a::streaming::{StreamEvent, TaskStatusUpdateEvent};
 use mika_a2a::types::{Message, Part, Role, TaskState, TaskStatus};
@@ -189,6 +189,22 @@ async fn run_a2a_agent(
     }
 }
 
+/// Extract the caller's session id from `message/send` request metadata
+/// (mika#2070).
+///
+/// The key is the protocol crate's `CALLER_SESSION_ID_KEY`. It is advisory: a missing
+/// key, a null, or a non-string value all yield `None`, and the caller then
+/// mints its own session. Validation of the value itself belongs to
+/// `Database::a2a_create_task`, which is the only layer that can check whether
+/// this agent owns the named session.
+fn caller_session_id(params: &MessageSendParams) -> Option<&str> {
+    params
+        .metadata
+        .as_ref()?
+        .get(CALLER_SESSION_ID_KEY)?
+        .as_str()
+}
+
 /// Handle `message/send` — synchronous message processing via the real agent loop.
 async fn handle_message_send(
     state: &AppState,
@@ -220,6 +236,7 @@ async fn handle_message_send(
 
     let task_id = Uuid::new_v4().to_string();
     let context_id = params.message.context_id.clone();
+    let caller_session = caller_session_id(&params).map(str::to_string);
     let return_immediately = params
         .configuration
         .as_ref()
@@ -229,7 +246,7 @@ async fn handle_message_send(
     // Create task in DB (creates task row, session, and mapping)
     let session_id = match agent_state
         .db
-        .a2a_create_task(&task_id, context_id.as_deref())
+        .a2a_create_task(&task_id, context_id.as_deref(), caller_session.as_deref())
         .await
     {
         Ok(sid) => sid,
@@ -353,11 +370,12 @@ async fn handle_message_stream(
 
     let task_id = Uuid::new_v4().to_string();
     let context_id = params.message.context_id.clone();
+    let caller_session = caller_session_id(&params).map(str::to_string);
 
     // Create task in DB
     let session_id = match agent_state
         .db
-        .a2a_create_task(&task_id, context_id.as_deref())
+        .a2a_create_task(&task_id, context_id.as_deref(), caller_session.as_deref())
         .await
     {
         Ok(sid) => sid,
@@ -864,4 +882,74 @@ pub async fn handle_agent_card(
     let card = build_agent_card(&agent_name, "Mika AI Agent", &skills, &state.gateway_url);
 
     Json(card).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mika_a2a::types::{Message, Part, Role};
+    use std::collections::HashMap;
+
+    fn params_with_metadata(
+        metadata: Option<HashMap<String, serde_json::Value>>,
+    ) -> MessageSendParams {
+        MessageSendParams {
+            message: Message {
+                message_id: "msg-1".to_string(),
+                role: Role::User,
+                parts: vec![Part::Text {
+                    text: "hello".to_string(),
+                    metadata: None,
+                }],
+                context_id: None,
+                task_id: None,
+                metadata: None,
+                reference_task_ids: None,
+                extensions: None,
+                kind: "message".to_string(),
+            },
+            configuration: None,
+            metadata,
+        }
+    }
+
+    fn with_key(value: serde_json::Value) -> MessageSendParams {
+        params_with_metadata(Some(HashMap::from([(
+            CALLER_SESSION_ID_KEY.to_string(),
+            value,
+        )])))
+    }
+
+    #[test]
+    fn caller_session_id_is_read_from_request_metadata() {
+        let params = with_key(serde_json::Value::String("rt005-c1-r7".to_string()));
+        assert_eq!(caller_session_id(&params), Some("rt005-c1-r7"));
+    }
+
+    #[test]
+    fn caller_session_id_is_absent_without_metadata() {
+        assert_eq!(caller_session_id(&params_with_metadata(None)), None);
+    }
+
+    #[test]
+    fn caller_session_id_is_absent_when_the_key_is_missing() {
+        let params = params_with_metadata(Some(HashMap::from([(
+            "something.else".to_string(),
+            serde_json::Value::String("s1".to_string()),
+        )])));
+        assert_eq!(caller_session_id(&params), None);
+    }
+
+    #[test]
+    fn non_string_caller_session_ids_are_ignored() {
+        // A client sending the wrong JSON type must degrade to a minted session,
+        // never fail the turn (mika#2070 AC3).
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(42),
+            serde_json::json!(["s1"]),
+        ] {
+            assert_eq!(caller_session_id(&with_key(value)), None);
+        }
+    }
 }

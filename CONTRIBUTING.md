@@ -82,7 +82,7 @@ Branch types: `feat/`, `fix/`, `refactor/`, `docs/`, `chore/`.
 
 ## Commit Conventions
 
-We use [Conventional Commits](https://www.conventionalcommits.org/) for automated changelog generation via [release-plz](https://release-plz.ieni.dev/). Use these prefixes:
+We use [Conventional Commits](https://www.conventionalcommits.org/). Automated changelog generation is currently **disabled** (see `docs/deployment.md` and mika#2048); the convention still governs commit messages here. Use these prefixes:
 
 **Appears in changelog:**
 

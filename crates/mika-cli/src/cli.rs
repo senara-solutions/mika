@@ -1,7 +1,15 @@
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
-#[command(name = "mika", version, about = "Mika — AI Executive Assistant")]
+// mika#2066 AC1 — `--version` names the commit: `mika 0.12.2 (968dbe94)`. The
+// stamp is sourced from the shared `mika_common::build_info` capture, not a
+// per-crate `build.rs`. clap prints "{bin} {version}" and short-circuits before
+// any config load, so an unconfigured install can still state its provenance.
+#[command(
+    name = "mika",
+    version = mika_common::build_info::version_static(),
+    about = "Mika — AI Executive Assistant"
+)]
 pub struct Cli {
     /// Agent to use (overrides active agent)
     #[arg(long)]
@@ -796,6 +804,16 @@ pub enum TaskCommand {
         /// Cancel the slot-occupying callback first, then promote
         #[arg(long = "override")]
         r#override: bool,
+    },
+    /// List `ready` issues whose task is stuck: `pending` past the reaper's
+    /// grace window with nothing in the dispatch queue representing it.
+    ///
+    /// This is the silence-breaker for mika#2045 — such an issue carries
+    /// `ready`, the queue counts it, and nothing ever picks it up. Exit code is
+    /// always 0: this is a probe, not a gate.
+    Stuck {
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
     },
     /// Subscribe to mika-spirit's task-lifecycle SSE stream and print each
     /// TaskEventFrame as it arrives (one JSON object per line).

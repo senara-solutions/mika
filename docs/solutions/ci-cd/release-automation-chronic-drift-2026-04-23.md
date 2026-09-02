@@ -1,7 +1,7 @@
 ---
 title: "Release automation chronic drift — failure classes that outlive tool choice"
 date: 2026-04-23
-last_updated: 2026-05-09
+last_updated: 2026-08-29
 category: ci-cd
 problem_type: operational-pattern
 severity: medium
@@ -12,6 +12,7 @@ tags:
   - chronic-drift
   - institutional-memory
   - rust-workspace
+  - disabled-channel
 modules:
   - .github/workflows/release-pr.yml
   - .github/workflows/release.yml
@@ -36,7 +37,7 @@ Zero impact on the CI gate (`CI` workflow is green on the same commits). The `Re
 
 ## Failure classes that survive tool choice
 
-The 14+ historical fix commits cluster into **four root causes**. Each has outlasted at least one tool migration. Name these explicitly when diagnosing the next failure:
+The 14+ historical fix commits cluster into **four root causes**, plus a fifth that no fix commit could reach (Class E, added 2026-08-29). Each has outlasted at least one tool migration. Name these explicitly when diagnosing the next failure:
 
 ### Class A — Workspace dep resolution with mixed publish-status crates
 
@@ -119,9 +120,34 @@ Cluster trajectory: **one-off fixes, each distinct**. These are the kind of fixe
 
 **For future fixes:** anything in Class D is a one-off; anything in A/B/C is chronic-drift and needs compound-doc discipline.
 
-## Current failure (Class C, fix in validation)
+### Class E — the tool's strategy does not match the repo's shape
 
-Symptom on every merge to `main` from 2026-04-23 through 2026-05-06: `release/v0.6.0` non-fast-forward. Tracked as **mika#775** — see Stage 3 below for the resolution. Validation gate (10 consecutive clean merges OR 14 days, whichever comes first) is still in flight; the fix is provisional until the gate passes and the frontmatter flips from `resolved: pending-validation` to `resolved: true`.
+Added 2026-08-29 (mika#2047). Not a thing we are doing to the tool, and not fixable by configuration:
+the tool's internal model of a repository disagrees with ours. release-please's `rust` strategy
+assumes a crate — it does not expand a `members = ["crates/*"]` glob, and it hands the root
+`Cargo.toml` to a package updater that requires a `[package]` section our virtual workspace does not
+have. See Stage 5.
+
+**Tell it apart from A–D by where the error lives.** A–D produce errors about *our* state: a
+dependency that cannot resolve, a branch that will not fast-forward, a missing label. Class E produces
+errors about the tool's own assumptions — the fix is a different strategy or a different tool, never a
+different config value. If two consecutive plausible config fixes have failed, stop and ask which
+class you are in.
+
+**Class E is the class that justifies turning a channel off** rather than iterating, when the channel
+is not delivering anything and every iteration costs a red `main`.
+
+## Current state (2026-08-29): channel disabled
+
+**There is no current failure, because there is no longer a running release workflow.** See Stage 5 —
+the `push: main` trigger was removed under mika#2047; resume conditions are in mika#2048.
+
+<details>
+<summary>Historical: current failure as of 2026-05-06 (Class C, fix in validation)</summary>
+
+Symptom on every merge to `main` from 2026-04-23 through 2026-05-06: `release/v0.6.0` non-fast-forward. Tracked as **mika#775** — see Stage 3 below for the resolution. Validation gate (10 consecutive clean merges OR 14 days, whichever comes first) was still in flight at the time of writing.
+
+</details>
 
 ## Stage 3 — Class C resolution (mika#775, 2026-05-06)
 
@@ -153,6 +179,80 @@ Symptom on every merge to `main` from 2026-04-23 through 2026-05-06: `release/v0
 - **Class C (branch state):** Eliminated. release-please manages branch lifecycle internally.
 - **Class D (packaging/identity):** Only risk is action-version-specific quirks. Mitigated by SHA-pinning.
 
+## Stage 5 — turned off (mika#2047, 2026-08-29)
+
+**Outcome: the release channel is disabled, not fixed.** `push: main` was removed from
+`.github/workflows/release-pr.yml`; only `workflow_dispatch` remains. Resume ticket: mika#2048.
+
+### Class E — the tool's strategy does not match the repo's shape
+
+This is a fifth failure class, and the first that no point-fix can reach. release-please's `rust`
+strategy assumes a crate, not a virtual workspace:
+
+```
+⚠ member crates/* declared but did not find Cargo.toml   ← the members glob is never expanded
+✖ is not a package manifest (might be a cargo workspace) ← root Cargo.toml has no [package]
+```
+
+Both are inside the strategy, not in our configuration. Classes A–D were all things we were doing to
+the tool; Class E is the tool's model of the world disagreeing with ours. Escaping it means changing
+`release-type` (candidate: `simple` plus the existing `extra-files` toml updater on
+`$.workspace.package.version`) — a redesign, not a fix.
+
+### The diagnostic trap this class sets
+
+The ticket's own first hypothesis was wrong, and wrong in an instructive way: it read the workflow's
+`with:` block (only `token`), saw no `config-file` / `manifest-file`, and concluded release-please was
+running in non-manifest mode. Both inputs default to `''` in the action, and release-please then falls
+back to `release-please-config.json` / `.release-please-manifest.json` on its own. The log said so
+plainly — `Fetching release-please-config.json from branch main` — 70 lines above the fatal error.
+
+**Rule: in a release-automation log, read past the first plausible-looking anomaly to the line that
+carries the non-zero exit.** These logs are full of warnings that are genuinely harmless — three
+unparseable commits here, skipped without consequence out of 1190 considered. Diagnosing from the
+first anomaly instead of the last one produces a confident fix for a non-problem. Config-shaped
+hypotheses are especially seductive because they are cheap to test; that is exactly why they get
+tested first and believed too early.
+
+### Why "turn it off" was the right call here, and when it is not
+
+The two hazards named under *Meta* below — failures only manifest on the next push to `main`, and
+there is no local reproduction — are not just slow. They mean **every verification attempt costs a red
+`main`**. Once that is true, the cost of iterating on the fix is paid in the credibility of the CI
+signal for everything else in the repo. Weigh that against what the channel delivers: here, nothing
+since 2026-05-09, across 300 consecutive failed runs.
+
+The honest version of the consumption argument matters. "Nobody consumes the releases" was the
+operator's premise; measured, it is false in the letter — 38 downloads on `v0.12.2`, 132 across all
+releases, and `install.sh` pulls from GitHub Releases. What holds is narrower and sufficient: the
+workflow has produced nothing for those users since May, so disabling it changes nothing for them.
+**State the narrow true version, not the sweeping one** — a decision resting on a claim that a
+five-minute check refutes will be reopened by the next person who runs that check.
+
+Disabling is the wrong call when the channel has live consumers who would notice, when a required
+status check depends on it (verified here: it does not — ruleset `main protection` requires only
+`Check`, `Dashboard`, `Docs Site`, `Docs Sync`, `Pipeline Artifacts`, `Security`), or when the red is
+new rather than chronic. A red that started this week is a regression to fix; a red that has run 300
+for 300 is a channel to decide about.
+
+### Disable it so the next person can read the decision
+
+- **The reason lives in the file**, as a header comment: what is off, since when, the exact cause with
+  the two log lines that prove it, the operator decision, and pointers to mika#2047 and mika#2048. An
+  `if: false` would have been technically sufficient and institutionally useless.
+- **The `name:` carries the state** (`Release (disabled — see mika#2048)`), so the Actions tab tells
+  the truth to someone who never opens the file.
+- **Every doc that promised automated releases was corrected** — `docs/deployment.md`, `README.md`,
+  `CONTRIBUTING.md`, `CLAUDE.md`. Two of them were *already* wrong, still crediting release-plz,
+  replaced back in Stage 4. Replacing a visible red with quietly false documentation is the same
+  damage in a less detectable form.
+- **`workflow_dispatch` was kept, with its limit written down.** It is the resume path's manual entry
+  point — but the action carries no `target-branch`, so it targets the default branch whatever `ref`
+  is dispatched. It is not a sandbox, and mika#2048 must add `target-branch` before using it to verify
+  anything.
+- **Nothing was half-repaired.** `Cargo.toml`, `release-please-config.json` and
+  `.release-please-manifest.json` are untouched: they are the resume ticket's raw material.
+
 ## Operational workaround
 
 ### Stage 4 (release-please) reset procedure
@@ -182,9 +282,10 @@ Failure classes are the primary axis of this doc. Tool chronology is here as sec
 - **Stage 0 — semantic-release** (pre-2026-03). No surviving config; replaced because of Rust-workspace integration issues. Primary failures were Class A.
 - **Stage 1 — release-plz** (2026-03-01 → 2026-04-03). Setup captured in [`rust-workspace-release-plz-github-actions.md`](./rust-workspace-release-plz-github-actions.md) (now historical). 10+ fixes, all in Classes A, B, D. Migration driven by Class A.
 - **Stage 2 — git-cliff** (2026-04-03 → 2026-05-09). Migration commit `4825e7ae`. Fixes in Classes C, D. Replaced due to Class C variant ("No commits between" on release PR merge).
-- **Stage 3 — release-please** (2026-05-09 → present). Migration in mika#1049. `googleapis/release-please-action` v4 with persistent Release PR branch. Structurally avoids Classes A, B, C.
+- **Stage 4 — release-please** (2026-05-09 → 2026-08-29). Migration in mika#1049. `googleapis/release-please-action` v4 with persistent Release PR branch. Structurally avoided Classes A, B, C — and was killed by Class E. (This entry was numbered "Stage 3" until 2026-08-29, contradicting the "Stage 4" heading above; the headings are authoritative.)
+- **Stage 5 — disabled** (2026-08-29 → present). mika#2047. No automated release channel; `workflow_dispatch` only. Resume conditions in mika#2048.
 
-The workflow file is `.github/workflows/release-pr.yml`; the tool is `googleapis/release-please-action`.
+The workflow file is `.github/workflows/release-pr.yml`; the tool is `googleapis/release-please-action`. As of Stage 5 the workflow is disabled and the tool does not run.
 
 ## Meta — why release automation drifts chronically
 

@@ -58,15 +58,40 @@ Failure modes:
 
 import argparse
 import asyncio
+import datetime
 import json
 import os
 import re
+import signal
 import socket
 import ssl
 import stat
 import sys
 import time
 from pathlib import Path
+
+
+def _log(msg: str) -> None:
+    """Sole operator-log emitter for this daemon.
+
+    Prefixes every line with an ISO-8601 UTC timestamp (millisecond
+    precision, `Z` suffix) so entries in `/var/log/mika/pilot-egress-proxy.log`
+    can be correlated by time against the sibling logs — `server.log` stamps
+    its JSON `timestamp` field in the same RFC3339-UTC shape
+    (`2026-08-29T03:17:58.081902Z`), and a date grep (`grep 2026-08-28`) now
+    composes across both files. Before mika#2030 these lines carried no time
+    field, which stalled the mika#1772 / #2029 pilot-stall diagnosis.
+
+    Every stderr line MUST go through here — no bare `print(..., file=sys.stderr)`
+    elsewhere — so the timestamp invariant holds for the whole file. `flush=True`
+    is preserved: line-by-line ordering is what makes this log readable during
+    an incident.
+    """
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S.%f"
+    )[:-3] + "Z"
+    print(f"{ts} {msg}", file=sys.stderr, flush=True)
+
 
 # Sole security boundary — every entry is a decision.
 #
@@ -92,9 +117,13 @@ HOST_ALLOWLIST = frozenset({
     "api.openai.com",
     "api.z.ai",
     "openrouter.ai",
-    # GitHub — pilot uses gh CLI + git push/fetch.
-    "api.github.com",
-    "github.com",
+    # GitHub — the two credential-bearing hosts (api.github.com for the gh CLI,
+    # github.com for git smart-HTTP push/fetch) are deliberately ABSENT here:
+    # like api.anthropic.com, they are MITM-FORWARDED (see MITM_FORWARD_HOSTS)
+    # so the token is injected host-side and the sandbox never holds it
+    # (mika#2056). The remaining GitHub hosts carry no credential — codeload
+    # (public archives) and objects (LFS blobs) are unauthenticated, ssh is a
+    # separate transport — so they stay on the plain encrypted-tunnel path.
     "ssh.github.com",
     "codeload.github.com",
     "objects.githubusercontent.com",
@@ -119,10 +148,23 @@ CONNECT_RE = re.compile(rb"^CONNECT ([^:\s]+):(\d+) HTTP/1\.[01]\r\n", re.ASCII)
 # auth rewrite (see scripts/mika-pilot-anthropic-auth-addon.py) + upstream
 # re-TLS. Kept narrow — api.anthropic.com is the sole host where the
 # sandbox has no real credential to present (only a placeholder). Other
-# LLM providers / github / registries stay on the plain CONNECT allowlist
-# path where the sandbox carries its own real credentials through the
-# encrypted tunnel (GH_TOKEN etc.).
-MITM_FORWARD_HOSTS = frozenset({"api.anthropic.com"})
+# LLM providers / registries stay on the plain CONNECT allowlist path where
+# the sandbox carries its own credentials (or none) through the encrypted
+# tunnel.
+#
+# mika#2056: api.github.com + github.com JOIN this set. The pilot used to carry
+# GH_TOKEN inside the sandbox and present it through the encrypted tunnel — the
+# same rejected shape the Anthropic --setenv key once used. Now the sandbox
+# holds no GitHub token; mitmdump terminates TLS with its own CA (which the
+# sandbox trusts via the combined bundle in dispatch-lib.sh) and
+# mika-pilot-github-auth-addon.py injects the credential host-side. The
+# addon rewrites ONLY these hosts; every other MITM'd host passes through
+# untouched.
+MITM_FORWARD_HOSTS = frozenset({
+    "api.anthropic.com",
+    "api.github.com",
+    "github.com",
+})
 MITM_UPSTREAM_PORT = 8892  # mitmdump --listen-port (managed by dispatch-lib)
 
 # Q3 auth-injection reverse-proxy — path prefix stripped, forwarded to
@@ -348,6 +390,41 @@ def _format_quota_headers(pairs: list[tuple[str, str]]) -> str:
     return " ".join(f"{name}={value}" for name, value in pairs)
 
 
+# Opt-in debug gate for benign, high-frequency egress events. Off by default;
+# an operator sets MIKA_EGRESS_DEBUG=1 to see the aggregate. It gates ONLY the
+# benign classes below — a real error is never gated, it always prints.
+_EGRESS_DEBUG = os.environ.get("MIKA_EGRESS_DEBUG", "").strip().lower() not in (
+    "", "0", "false", "no", "off",
+)
+
+# Running count of benign readiness probes: a peer that connected and closed
+# without ever sending a CONNECT line. dispatch-lib.sh's
+# `_pilot_egress_sock_connectable` and the sandbox's bounded --sandbox-tcp wait
+# loop do exactly this before every dispatch to confirm the proxy is alive, so
+# it is expected and benign. It used to reach the `except Exception` sink as
+# `[egress] ERROR unknown: Connection lost` (the 400-to-a-gone-peer drain
+# raised): 1045 of 2747 [egress] lines were this one non-event, and they were
+# then misread as a broken transport during mika#2029 (mika#2042). Counted at
+# debug, never cried as error.
+_readiness_probe_count = 0
+
+
+def _note_readiness_probe() -> None:
+    """Record one benign readiness probe (connect + close, no CONNECT line).
+
+    Emits at most a debug-level aggregate line — the running count, not one
+    line per occurrence — and only when MIKA_EGRESS_DEBUG is set. Default is
+    silence. Never emits ERROR: that is the whole point of mika#2042.
+    """
+    global _readiness_probe_count
+    _readiness_probe_count += 1
+    if _EGRESS_DEBUG:
+        _log(
+            "[egress] DEBUG readiness-probe (connect+close, no CONNECT) "
+            f"count={_readiness_probe_count}"
+        )
+
+
 def _log_upstream_outcome(
     method: str,
     path: str,
@@ -366,19 +443,13 @@ def _log_upstream_outcome(
     a distinct outcome, not an allowed call, and is reported as such.
     """
     if status is None:
-        print(
-            f"[anthropic-proxy] UPSTREAM_NO_RESPONSE {method} {path}",
-            file=sys.stderr, flush=True,
-        )
+        _log(f"[anthropic-proxy] UPSTREAM_NO_RESPONSE {method} {path}")
         return
-    print(
-        f"[anthropic-proxy] ALLOW {method} {path} -> {status}",
-        file=sys.stderr, flush=True,
-    )
+    _log(f"[anthropic-proxy] ALLOW {method} {path} -> {status}")
     if status == 429:
         detail = _format_quota_headers(quota_headers)
         line = f"[anthropic-proxy] RATE_LIMITED {method} {path}"
-        print(f"{line} {detail}" if detail else line, file=sys.stderr, flush=True)
+        _log(f"{line} {detail}" if detail else line)
 
 
 async def _relay_response_with_status_tap(
@@ -485,17 +556,15 @@ async def handle_anthropic_reverse_proxy(
             b"\r\n" + body
         )
         await writer.drain()
-        print(f"[anthropic-proxy] DENY no-token path={path.decode('ascii', 'replace')}",
-              file=sys.stderr, flush=True)
+        _log(f"[anthropic-proxy] DENY no-token path={path.decode('ascii', 'replace')}")
         return
     # Soft-warn if the token appears expired — Anthropic will 401 anyway,
     # this makes debugging easier from the proxy log.
     if expires_at is not None and expires_at < time.time():
-        print(
+        _log(
             f"[anthropic-proxy] WARN token appears expired "
             f"({int(time.time() - expires_at)}s ago) — Anthropic will 401. "
-            f"Refresh via a Claude Code CLI call on the host.",
-            file=sys.stderr, flush=True,
+            f"Refresh via a Claude Code CLI call on the host."
         )
 
     # Split request into request-line + headers. body follows blank line.
@@ -553,8 +622,7 @@ async def handle_anthropic_reverse_proxy(
     except (asyncio.TimeoutError, OSError, ssl.SSLError) as exc:
         writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
         await writer.drain()
-        print(f"[anthropic-proxy] UPSTREAM_FAIL: {exc}",
-              file=sys.stderr, flush=True)
+        _log(f"[anthropic-proxy] UPSTREAM_FAIL: {exc}")
         return
 
     try:
@@ -609,7 +677,27 @@ async def handle_host_client(
             request = await asyncio.wait_for(
                 reader.readuntil(b"\r\n\r\n"), timeout=10.0
             )
-        except (asyncio.TimeoutError, asyncio.IncompleteReadError):
+        except asyncio.IncompleteReadError as exc:
+            # A peer that closed before sending a single request byte is the
+            # readiness/availability probe, not a transport failure:
+            # dispatch-lib.sh's `_pilot_egress_sock_connectable` (and the
+            # sandbox's bounded --sandbox-tcp wait loop) open the socket and
+            # close it, WITHOUT ever sending a CONNECT line, before every
+            # dispatch. `peer` is still "unknown" here for that very reason —
+            # nothing was read to name. Answering a peer that is already gone
+            # is what raised `Connection lost` into the `except Exception` sink
+            # below and cried ERROR 1045 times (mika#2042). Count it; stay
+            # silent to the wire.
+            if not exc.partial:
+                _note_readiness_probe()
+                return
+            # Bytes arrived and the stream then truncated mid-request: a real
+            # malformed request, not the probe. Answer it; a reset while doing
+            # so still surfaces as ERROR below (anti-vacuity).
+            writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+            await writer.drain()
+            return
+        except asyncio.TimeoutError:
             writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
             await writer.drain()
             return
@@ -650,12 +738,11 @@ async def handle_host_client(
             except (asyncio.TimeoutError, OSError) as exc:
                 writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                 await writer.drain()
-                print(f"[mitm-forward] MITMDUMP_DOWN {peer}: {exc}",
-                      file=sys.stderr, flush=True)
+                _log(f"[mitm-forward] MITMDUMP_DOWN {peer}: {exc}")
                 return
             up_writer.write(request)
             await up_writer.drain()
-            print(f"[mitm-forward] {peer} → mitmdump", file=sys.stderr, flush=True)
+            _log(f"[mitm-forward] {peer} → mitmdump")
             await asyncio.gather(
                 pipe_bytes(reader, up_writer),
                 pipe_bytes(up_reader, writer),
@@ -677,7 +764,7 @@ async def handle_host_client(
                 + body
             )
             await writer.drain()
-            print(f"[egress] DENY {peer}", file=sys.stderr, flush=True)
+            _log(f"[egress] DENY {peer}")
             return
 
         # Upstream connect. Bounded timeout so a dead upstream can't wedge.
@@ -688,12 +775,12 @@ async def handle_host_client(
         except (asyncio.TimeoutError, OSError) as exc:
             writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
             await writer.drain()
-            print(f"[egress] FAIL {peer}: {exc}", file=sys.stderr, flush=True)
+            _log(f"[egress] FAIL {peer}: {exc}")
             return
 
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await writer.drain()
-        print(f"[egress] ALLOW {peer}", file=sys.stderr, flush=True)
+        _log(f"[egress] ALLOW {peer}")
 
         # Bidirectional relay. Either side closing tears down both.
         await asyncio.gather(
@@ -702,7 +789,7 @@ async def handle_host_client(
             return_exceptions=True,
         )
     except Exception as exc:  # noqa: BLE001 — proxy must not crash on bad clients
-        print(f"[egress] ERROR {peer}: {exc}", file=sys.stderr, flush=True)
+        _log(f"[egress] ERROR {peer}: {exc}")
     finally:
         try:
             writer.close()
@@ -739,28 +826,137 @@ async def handle_sandbox_client(
 
 async def run_host_mode(unix_sock_path: str) -> None:
     sock_path = Path(unix_sock_path)
+
+    # --- Pre-bind observability (mika#2051) --------------------------------
+    # On 2026-08-29 two proxies died between exec and bind() and left NOTHING
+    # in the log, though dispatch-lib captures stderr (`nohup ... 2>&1`). A
+    # Python exception would have printed a traceback there, so a *silent*
+    # pre-bind death is a signal with its default disposition, not a raise.
+    # And the graceful SIGTERM/SIGINT handlers further down are installed only
+    # AFTER bind: throughout startup the process carried the default
+    # dispositions, so a SIGTERM in that window terminated it mutely -- the
+    # very "the one that took the proxy down on 2026-08-29" the shutdown block
+    # names. This closes that blind window at the source: announce arrival so
+    # the log shows the proxy reached its own main, and arm early handlers
+    # that NAME a pre-bind signal instead of dying without a word.
+    loop = asyncio.get_running_loop()
+
+    def _abort_on_startup_signal(signum: int) -> None:
+        # A catchable signal reached us before bind() completed. Name it, then
+        # exit hard -- we own no socket to unwind yet. A SIGKILL / OOM-kill
+        # cannot be caught, so on the next incident its signature is this
+        # line's ABSENCE while the `.begin` breadcrumb is present: begin + no
+        # `.signalled` + no `listening` == uncatchable kill (SIGKILL/OOM);
+        # begin + `.signalled` == a SIGTERM/SIGINT that landed during startup.
+        # Routed through `_log` so it carries the timestamp every operator-log
+        # line must (mika#2030): `_log` stays the sole stderr emitter.
+        _log(
+            f"[egress] pilot_egress_startup.signalled "
+            f"{signal.Signals(signum).name} before bind on {sock_path} "
+            f"(pid {os.getpid()}) -- aborting startup"
+        )
+        os._exit(3)
+
+    for _startup_sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(_startup_sig, _abort_on_startup_signal, _startup_sig)
+
+    # Emitted only AFTER the early handlers are armed, so this line doubles as
+    # proof the pre-bind window is now guarded: a signal arriving from here on
+    # is named by `_abort_on_startup_signal`, not swallowed by a default kill.
+    # Through `_log` (the sole stderr emitter) so it is timestamped like every
+    # other operator-log line (mika#2030) and a date grep composes across them.
+    _log(
+        f"[egress] pilot_egress_startup.begin pid={os.getpid()} "
+        f"binding {sock_path}"
+    )
+
+    # Test-only seam (mika#2051): park deterministically inside the pre-bind
+    # window -- still under the early handlers, before bind -- so the
+    # regression test can land a signal in exactly the window the incident
+    # occupied. Never set in production (the launcher does not export it).
+    _prebind_barrier = os.environ.get("_MIKA_EGRESS_PREBIND_TEST_BARRIER")
+    if _prebind_barrier:
+        await asyncio.sleep(float(_prebind_barrier))
+
     # Remove stale socket if present.
     if sock_path.exists():
         try:
             if stat.S_ISSOCK(sock_path.stat().st_mode):
                 sock_path.unlink()
             else:
-                sys.exit(f"refusing to unlink non-socket: {sock_path}")
+                # These fatal-startup diagnostics reach the same log file as the
+                # rest (stderr → pilot-egress-proxy.log), so they carry the
+                # mika#2030 timestamp too — a bare `sys.exit(msg)` would land an
+                # un-stamped line in the middle of a stamped log.
+                _log(f"[egress] FATAL refusing to unlink non-socket: {sock_path}")
+                sys.exit(1)
         except OSError as exc:
-            sys.exit(f"stale-socket cleanup failed: {exc}")
+            _log(f"[egress] FATAL stale-socket cleanup failed: {exc}")
+            sys.exit(1)
 
     server = await asyncio.start_unix_server(handle_host_client, str(sock_path))
     # World-writable so the sandbox (running as same uid, but env-cleared) can
     # still connect through the bwrap-mounted socket path.
     sock_path.chmod(0o666)
-    print(
+
+    # Remember the inode we just bound. Shutdown uses it to tell OUR socket from
+    # a successor proxy's: `is_socket()` is equally true of someone else's live
+    # path, and deleting that leaves a running proxy unreachable.
+    try:
+        bound_ino = os.stat(sock_path).st_ino
+    except OSError:
+        bound_ino = None
+    _log(
         f"[egress] host-unix listening on {sock_path} (allowlist: "
-        f"{len(HOST_ALLOWLIST)} hosts)",
-        file=sys.stderr,
-        flush=True,
+        f"{len(HOST_ALLOWLIST)} hosts)"
     )
-    async with server:
-        await server.serve_forever()
+    # A kill does not unlink a unix socket. Without this, SIGTERM -- the default
+    # kill, and the one that took the proxy down on 2026-08-29 -- leaves the path
+    # behind as an orphan: a file that still satisfies `[ -S ]` and refuses
+    # connect(), which is exactly what armed the launcher's broken guard in
+    # dispatch-lib (mika#2041). SIGINT already unwound cleanly through
+    # KeyboardInterrupt; routing both through the same stop future makes the two
+    # signals behave alike instead of by accident.
+    #
+    # These REPLACE the early pre-bind handlers armed at the top of this
+    # function (add_signal_handler is last-writer-wins per signal): now that a
+    # socket exists, a SIGTERM must unwind gracefully and unlink it rather than
+    # abort hard.
+    stop = loop.create_future()
+
+    def _request_stop() -> None:
+        if not stop.done():
+            stop.set_result(None)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, _request_stop)
+
+    try:
+        await stop
+    finally:
+        # `close()`, and NOT `async with server` / `await server.wait_closed()`:
+        # since CPython 3.12.1 wait_closed() blocks until every live client
+        # handler detaches, and a CONNECT tunnel lasts as long as the pilot
+        # session holding it. Measured: with one established tunnel, SIGTERM
+        # left the proxy running past 15s. An operator whose kill does nothing
+        # reaches for `kill -9` -- which is precisely how the orphaned socket
+        # this whole change exists to prevent gets made.
+        server.close()
+
+        # asyncio removes the socket file itself only from 3.13, where
+        # create_unix_server grew `cleanup_socket` and the inode bookkeeping
+        # behind it. Older interpreters never unlink -- measured on 3.12 and on
+        # CI's ubuntu-22.04/3.10, where every shutdown path left the socket
+        # behind. So do it here, with the same inode comparison 3.13+ uses, and
+        # tolerate the file already being gone when the runtime got there first.
+        if bound_ino is not None:
+            try:
+                if os.stat(sock_path).st_ino == bound_ino:
+                    os.unlink(sock_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
 
 
 async def run_sandbox_mode(port: int, unix_sock_path: str) -> None:
@@ -769,11 +965,7 @@ async def run_sandbox_mode(port: int, unix_sock_path: str) -> None:
         host="127.0.0.1",
         port=port,
     )
-    print(
-        f"[egress-shim] tcp 127.0.0.1:{port} → {unix_sock_path}",
-        file=sys.stderr,
-        flush=True,
-    )
+    _log(f"[egress-shim] tcp 127.0.0.1:{port} → {unix_sock_path}")
     async with server:
         await server.serve_forever()
 

@@ -113,7 +113,7 @@ assert_pass() {
     return
   fi
   if [ -n "$expected_pattern" ]; then
-    if ! echo "$output" | grep -qF "$expected_pattern"; then
+    if ! grep -qF -- "$expected_pattern" <<<"$output"; then
       echo "FAIL: $test_name (expected pattern '$expected_pattern' not found in output)"
       echo "  output: $output"
       FAIL=$((FAIL + 1))
@@ -137,7 +137,7 @@ assert_fail() {
     return
   fi
   if [ -n "$expected_pattern" ]; then
-    if ! echo "$output" | grep -qF "$expected_pattern"; then
+    if ! grep -qF -- "$expected_pattern" <<<"$output"; then
       echo "FAIL: $test_name (expected pattern '$expected_pattern' not found in output)"
       echo "  output: $output"
       FAIL=$((FAIL + 1))
@@ -332,7 +332,7 @@ output=$(run_verify "Closes #42") || exit_code=$?
 assert_pass "Priority: label wins over trailer" "$exit_code" "$output" "[pipeline-exempt: issue-label]"
 # Should NOT contain trailer message since label takes priority
 TOTAL=$((TOTAL + 1))
-if echo "$output" | grep -qF "[pipeline-exempt: trailer]"; then
+if grep -qF -- "[pipeline-exempt: trailer]" <<<"$output"; then
   echo "FAIL: Priority test — trailer message should not appear when label exempts"
   FAIL=$((FAIL + 1))
 else

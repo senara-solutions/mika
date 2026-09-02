@@ -72,6 +72,9 @@ impl Assessor {
             recommendation,
             alerts,
             cross_cutting: Vec::new(),
+            // Phase 1 is read-only, so there is nothing to contend for yet.
+            // Populated by the Phase 2 dispatch path (mika#1948).
+            contention_events: Vec::new(),
         }
     }
 }

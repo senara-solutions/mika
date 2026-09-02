@@ -827,6 +827,50 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Read a ticket's re-drive state `(count, abandoned)` (mika#2020).
+    pub async fn get_auto_pull_redrive_state(
+        &self,
+        repo_full_name: &str,
+        issue_number: u64,
+    ) -> Result<(i64, bool)> {
+        let repo = repo_full_name.to_owned();
+        self.with_db(move |db| db.get_auto_pull_redrive_state(&repo, issue_number))
+            .await
+    }
+
+    /// Increment a ticket's re-drive counter (mika#2020).
+    pub async fn increment_auto_pull_redrive(
+        &self,
+        repo_full_name: &str,
+        issue_number: u64,
+    ) -> Result<()> {
+        let repo = repo_full_name.to_owned();
+        self.with_db(move |db| db.increment_auto_pull_redrive(&repo, issue_number))
+            .await
+    }
+
+    /// Clear a ticket's re-drive budget (mika#2020).
+    pub async fn reset_auto_pull_redrive(
+        &self,
+        repo_full_name: &str,
+        issue_number: u64,
+    ) -> Result<()> {
+        let repo = repo_full_name.to_owned();
+        self.with_db(move |db| db.reset_auto_pull_redrive(&repo, issue_number))
+            .await
+    }
+
+    /// Stamp a ticket as abandoned by the re-drive reconciler (mika#2020).
+    pub async fn mark_auto_pull_redrive_abandoned(
+        &self,
+        repo_full_name: &str,
+        issue_number: u64,
+    ) -> Result<()> {
+        let repo = repo_full_name.to_owned();
+        self.with_db(move |db| db.mark_auto_pull_redrive_abandoned(&repo, issue_number))
+            .await
+    }
+
     pub async fn get_user_visible_tasks(&self) -> Result<Vec<Task>> {
         let id = self.agent_id.clone();
         self.with_db(move |db| db.get_user_visible_tasks(&id)).await
@@ -992,6 +1036,62 @@ impl AsyncDatabase {
             .await
     }
 
+    /// True when the parent still has a `pending` deferred wrapper representing
+    /// it (mika#2045). See [`Database::has_pending_deferred_wrapper_child`].
+    pub async fn has_pending_deferred_wrapper_child(&self, parent_task_id: &str) -> Result<bool> {
+        let a = self.agent_id.clone();
+        let p = parent_task_id.to_owned();
+        self.with_db(move |db| db.has_pending_deferred_wrapper_child(&a, &p))
+            .await
+    }
+
+    /// Find `pending` self_dev issue parents that no callback child represents
+    /// any more (mika#2045). See [`Database::find_orphaned_pending_issue_tasks`].
+    pub async fn find_orphaned_pending_issue_tasks(
+        &self,
+        grace_seconds: i64,
+    ) -> Result<Vec<crate::db::OrphanedPendingTask>> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.find_orphaned_pending_issue_tasks(&a, grace_seconds))
+            .await
+    }
+
+    /// Read `metadata.stuck_rearm_count` (mika#2045).
+    /// See [`Database::get_stuck_rearm_count`].
+    pub async fn get_stuck_rearm_count(&self, task_id: &str) -> Result<i64> {
+        let t = task_id.to_owned();
+        self.with_db(move |db| db.get_stuck_rearm_count(&t)).await
+    }
+
+    /// Increment `metadata.stuck_rearm_count` (mika#2045).
+    /// See [`Database::increment_stuck_rearm_count`].
+    pub async fn increment_stuck_rearm_count(&self, task_id: &str) -> Result<i64> {
+        let t = task_id.to_owned();
+        self.with_db(move |db| db.increment_stuck_rearm_count(&t))
+            .await
+    }
+
+    /// Cancel a parent's surviving deferred wrappers before expiry (mika#2045).
+    /// See [`Database::cancel_deferred_wrappers_of_parent`].
+    pub async fn cancel_deferred_wrappers_of_parent(&self, parent_task_id: &str) -> Result<usize> {
+        let a = self.agent_id.clone();
+        let p = parent_task_id.to_owned();
+        self.with_db(move |db| db.cancel_deferred_wrappers_of_parent(&a, &p))
+            .await
+    }
+
+    /// The `action_config` of a parent's most recent deferred wrapper
+    /// (mika#2045). See [`Database::latest_deferred_wrapper_action_config`].
+    pub async fn latest_deferred_wrapper_action_config(
+        &self,
+        parent_task_id: &str,
+    ) -> Result<Option<String>> {
+        let a = self.agent_id.clone();
+        let p = parent_task_id.to_owned();
+        self.with_db(move |db| db.latest_deferred_wrapper_action_config(&a, &p))
+            .await
+    }
+
     /// Return ALL children of a parent task for the reaper's structured log
     /// event. See [`Database::get_reaper_child_snapshot`].
     pub async fn get_reaper_child_snapshot(
@@ -1078,17 +1178,81 @@ impl AsyncDatabase {
         self.with_db(move |db| db.get_task_descendants(&r)).await
     }
 
-    /// Returns `(parent_task_id, callback_id, callback_label)` of the blocking
-    /// callback, or `None` if no conflicting dispatch exists (#1172 W3).
+    /// Returns the blocking dispatch (parent, callback, label, and which
+    /// dispatcher initiated it), or `None` if no conflicting dispatch exists
+    /// (#1172 W3; widened to carry `dispatcher_source` in mika#1948).
     pub async fn has_active_callback_tasks_excluding(
         &self,
         excluded_parent_id: &str,
         dispatch_class: &str,
-    ) -> Result<Option<(String, String, String)>> {
+    ) -> Result<Option<crate::db::BlockingDispatch>> {
         let p = excluded_parent_id.to_owned();
         let a = self.agent_id.clone();
         let c = dispatch_class.to_owned();
         self.with_db(move |db| db.has_active_callback_tasks_excluding(&p, &a, &c))
+            .await
+    }
+
+    /// Record which dispatcher initiated a task (mika#1948).
+    pub async fn set_task_dispatcher_source(
+        &self,
+        task_id: &str,
+        dispatcher_source: &str,
+    ) -> Result<bool> {
+        let t = task_id.to_owned();
+        let a = self.agent_id.clone();
+        let d = dispatcher_source.to_owned();
+        self.with_db(move |db| db.set_task_dispatcher_source(&t, &a, &d))
+            .await
+    }
+
+    /// Whether an operator-sourced task is waiting to run in this class
+    /// (mika#1948 AC3).
+    pub async fn has_pending_operator_task_for_class(&self, dispatch_class: &str) -> Result<bool> {
+        let a = self.agent_id.clone();
+        let c = dispatch_class.to_owned();
+        self.with_db(move |db| db.has_pending_operator_task_for_class(&a, &c))
+            .await
+    }
+
+    /// Atomically claim the exec slot for this agent and dispatch class
+    /// (mika#1948 — Porte 2). See `Database::try_acquire_dispatch_slot`.
+    pub async fn try_acquire_dispatch_slot(
+        &self,
+        dispatch_class: &str,
+        holder_task_id: &str,
+        dispatcher_source: Option<&str>,
+        ttl_secs: i64,
+    ) -> Result<crate::db::SlotClaim> {
+        let a = self.agent_id.clone();
+        let c = dispatch_class.to_owned();
+        let h = holder_task_id.to_owned();
+        let src = dispatcher_source.map(str::to_owned);
+        self.with_db(move |db| db.try_acquire_dispatch_slot(&a, &c, &h, src.as_deref(), ttl_secs))
+            .await
+    }
+
+    /// Release a slot lease held by `holder_task_id` (mika#1948).
+    pub async fn release_dispatch_slot(
+        &self,
+        dispatch_class: &str,
+        holder_task_id: &str,
+    ) -> Result<bool> {
+        let a = self.agent_id.clone();
+        let c = dispatch_class.to_owned();
+        let h = holder_task_id.to_owned();
+        self.with_db(move |db| db.release_dispatch_slot(&a, &c, &h))
+            .await
+    }
+
+    /// The current live holder of this class's slot lease, if any (mika#1948).
+    pub async fn dispatch_slot_lease_holder(
+        &self,
+        dispatch_class: &str,
+    ) -> Result<Option<(String, Option<String>)>> {
+        let a = self.agent_id.clone();
+        let c = dispatch_class.to_owned();
+        self.with_db(move |db| db.dispatch_slot_lease_holder(&a, &c))
             .await
     }
 
@@ -1921,6 +2085,22 @@ impl AsyncDatabase {
         .await
     }
 
+    /// Write one `auth_boundary` audit row (mika#1949 AC2). Agent-scoped and
+    /// session-less by construction — see
+    /// [`crate::evidence::audit::AUTH_BOUNDARY_SESSION_ID`].
+    ///
+    /// Prefer [`crate::auth_boundary_ledger::AuthBoundaryLedger`] at call
+    /// sites: an authentication path must not `await` its own audit write, and
+    /// must not change its verdict when the write fails.
+    pub async fn record_auth_boundary(
+        &self,
+        err: &mika_common::auth_boundary::AuthBoundaryError,
+    ) -> Result<()> {
+        let (a, e) = (self.agent_id.clone(), err.clone());
+        self.with_db(move |db| db.record_auth_boundary(&a, &e))
+            .await
+    }
+
     pub async fn get_audit_events(&self, session_id: &str) -> Result<Vec<AuditEvent>> {
         let (a, s) = (self.agent_id.clone(), session_id.to_owned());
         self.with_db(move |db| db.get_audit_events(&a, &s)).await
@@ -2653,17 +2833,23 @@ impl AsyncDatabase {
 
     /// Create an A2A task (creates entries in tasks, sessions, and a2a_task_map).
     /// Returns the session_id for use with the agent loop.
+    ///
+    /// `caller_session_id` is the sender's own session id (mika#2070). It is
+    /// adopted as the returned session only when this agent already owns that
+    /// session row; see `Database::a2a_create_task`.
     pub async fn a2a_create_task(
         &self,
         a2a_task_id: &str,
         context_id: Option<&str>,
+        caller_session_id: Option<&str>,
     ) -> Result<String> {
-        let (i, a, c) = (
+        let (i, a, c, s) = (
             a2a_task_id.to_owned(),
             self.agent_id.clone(),
             context_id.map(|s| s.to_owned()),
+            caller_session_id.map(|s| s.to_owned()),
         );
-        self.with_db(move |db| db.a2a_create_task(&i, &a, c.as_deref()))
+        self.with_db(move |db| db.a2a_create_task(&i, &a, c.as_deref(), s.as_deref()))
             .await
     }
 
@@ -2902,6 +3088,23 @@ impl AsyncDatabase {
         let t = trace_id.to_owned();
         self.with_db(move |db| db.query_tool_calls_by_trace(&t))
             .await
+    }
+
+    /// Async wrapper for `Database::find_recent_destructive_actions` (mika#1646).
+    pub async fn find_recent_destructive_actions(
+        &self,
+        agent_id: &str,
+        noun: &str,
+        number: &str,
+        window_secs: i64,
+    ) -> Result<Vec<crate::db::ToolCallRow>> {
+        let agent_id = agent_id.to_owned();
+        let noun = noun.to_owned();
+        let number = number.to_owned();
+        self.with_db(move |db| {
+            db.find_recent_destructive_actions(&agent_id, &noun, &number, window_secs, None)
+        })
+        .await
     }
 
     pub async fn query_llm_calls_by_session(
