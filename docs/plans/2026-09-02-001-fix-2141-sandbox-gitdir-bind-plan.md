@@ -334,3 +334,27 @@ La sonde tourne en Phase 2a, sans relais d'egress, donc sans l'injection `Author
 Traitée dans le même mécanisme : `_stage_pilot_gitconfig` écrit un `gitconfig` complet côté hôte à chaque dispatch — réécriture d'URL **et** identité lue sur l'hôte — monté en lecture seule et désigné par `GIT_CONFIG_GLOBAL`, avec `GIT_CONFIG_NOSYSTEM=1`. Écrit de zéro, jamais copié depuis `~/.gitconfig`, donc un credential helper ajouté plus tard chez l'opérateur ne peut pas y dériver (AC3).
 
 Le mécanisme retenu n'est pas celui du plan (`GIT_CONFIG_COUNT`/`KEY_0`/`VALUE_0`) : `GIT_CONFIG_KEY_0` contient `KEY` et serait rejeté par la règle 2 de `scripts/verify-no-secret-in-setenv.sh`. Faire une exemption dans un lint de sécurité pour une raison qui n'en est pas une aurait été le mauvais échange ; un fichier généré et un nom auditable coûtent moins et disent plus.
+
+---
+
+## Trouvaille de revue — les entrées du calcul de binds sont inscriptibles par le pilote
+
+Repérée en relisant le correctif contre son propre modèle de menace, pas dans le plan.
+
+`_pilot_gitdir_bind_args` s'exécute **côté hôte** et décide de ce qui sera monté en écriture dans le bac à sable suivant. Or ses deux entrées vivent dans la surface inscriptible du bac à sable précédent : `.git` est dans `$WORKTREE_DIR`, et `worktrees/<name>/HEAD` est monté rw **par ce correctif lui-même**. Les worktrees persistent entre dispatches. Un pilote compromis écrivant
+
+```
+ref: refs/heads/../../../../../../home/<user>/.ssh
+```
+
+dans `HEAD` aurait fait monter au dispatch suivant un répertoire hôte arbitraire en rw — une élévation de privilège introduite par le correctif censé resserrer le confinement.
+
+**Traitement, en trois couches qui ne se font pas confiance mutuellement :**
+
+1. La résolution passe par `git rev-parse --path-format=absolute --git-dir/--git-common-dir` et `git symbolic-ref` au lieu d'un parse maison : git valide la grammaire des noms de refs et le rattachement du worktree.
+2. L'invariant de liaison de git est ré-affirmé explicitement : le gitdir doit être sous `$PARENT_GIT/worktrees/`, et son fichier `gitdir` doit désigner en retour le `.git` de ce worktree. Un `.git` repointé qui ressemble à un gitdir échoue ici.
+3. Ceinture et bretelles sur le nom de ref, qui devient un segment de chemin sous `$PARENT_GIT` : refus de `..`, de `//`, d'un saut de ligne, et de tout caractère hors `[A-Za-z0-9._/-]`.
+
+**Et un piège dans le traitement lui-même.** `git symbolic-ref --quiet` rend vide pour un `HEAD` trafiqué **comme** pour un `HEAD` détaché légitime. Confondre les deux ne montait aucun chemin dangereux — mais dégradait en silence vers un état où le pilote tourne et ne peut pas commiter : exactement la forme d'échec que ce ticket existe pour finir. Un `HEAD` qui annonce `ref:` alors que git refuse de le résoudre abandonne désormais le dispatch en le disant.
+
+Cinq assertions couvrent ces chemins, dont deux contrôles positifs — le worktree restauré résout toujours et émet toujours des binds — sans quoi les refus seraient indiscernables d'une fonction qui refuse tout.

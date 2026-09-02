@@ -563,36 +563,43 @@ _pilot_gitdir_bind_args() {
     [ -e "$dotgit" ] || return 0
     [ -f "$dotgit" ] || return 0
 
-    local gitdir_line
-    gitdir_line=$(sed -n 's/^gitdir: *//p' "$dotgit" 2>/dev/null | head -1)
-    if [ -z "$gitdir_line" ]; then
-        _PILOT_GITDIR_BIND_ABORT="$dotgit is a file but carries no 'gitdir:' line"
+    # EVERY INPUT BELOW IS ATTACKER-WRITABLE. This function runs HOST-side and
+    # decides what gets bind-mounted read-write into the next sandbox, but its
+    # inputs live inside the previous sandbox's writable surface: `.git` sits in
+    # $WORKTREE_DIR, and `worktrees/<name>/HEAD` is bound rw by this very
+    # function. Worktrees persist across dispatches. A pilot that wrote
+    # `ref: refs/heads/../../../../home/<user>/.ssh` into HEAD, or repointed the
+    # `.git` file, would otherwise have the NEXT dispatch mount an arbitrary
+    # host path rw for it. So: resolve through git, which validates the
+    # worktree linkage and the refname grammar, and then re-check the results
+    # here rather than trusting either layer alone.
+    local wt_gitdir parent_git
+    wt_gitdir=$(git -C "$worktree_dir" rev-parse --path-format=absolute --git-dir 2>/dev/null)
+    parent_git=$(git -C "$worktree_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+    if [ -z "$wt_gitdir" ] || [ -z "$parent_git" ]; then
+        _PILOT_GITDIR_BIND_ABORT="git cannot resolve a gitdir for $worktree_dir — the worktree is broken or its .git file has been tampered with"
         return 1
     fi
-    case "$gitdir_line" in
-        /*) : ;;
-        *) gitdir_line="$worktree_dir/$gitdir_line" ;;
-    esac
-    local wt_gitdir
-    if ! wt_gitdir=$(cd "$gitdir_line" 2>/dev/null && pwd); then
-        _PILOT_GITDIR_BIND_ABORT="gitdir '$gitdir_line' (from $dotgit) does not exist"
+    if ! wt_gitdir=$(cd "$wt_gitdir" 2>/dev/null && pwd) || ! parent_git=$(cd "$parent_git" 2>/dev/null && pwd); then
+        _PILOT_GITDIR_BIND_ABORT="the resolved gitdir or common dir does not exist"
         return 1
     fi
 
-    # Resolve commondir rather than assuming ../.. — a worktree may be attached
-    # to a repository whose layout is not the default.
-    local parent_git="$wt_gitdir"
-    if [ -f "$wt_gitdir/commondir" ]; then
-        local common_rel
-        common_rel=$(head -1 "$wt_gitdir/commondir" 2>/dev/null)
-        case "$common_rel" in
-            /*) : ;;
-            *) common_rel="$wt_gitdir/$common_rel" ;;
-        esac
-        if ! parent_git=$(cd "$common_rel" 2>/dev/null && pwd); then
-            _PILOT_GITDIR_BIND_ABORT="commondir '$common_rel' (from $wt_gitdir/commondir) does not exist"
+    # git's own linkage invariant, asserted explicitly: the parent must know
+    # this worktree, and its back-pointer must name this worktree's .git file.
+    # A repointed .git that happens to look like a gitdir fails here.
+    case "$wt_gitdir" in
+        "$parent_git"/worktrees/*) : ;;
+        *)
+            _PILOT_GITDIR_BIND_ABORT="gitdir '$wt_gitdir' is not registered under '$parent_git/worktrees/' — refusing to mount it"
             return 1
-        fi
+            ;;
+    esac
+    local backlink=""
+    [ -f "$wt_gitdir/gitdir" ] && backlink=$(head -1 "$wt_gitdir/gitdir" 2>/dev/null)
+    if [ "$backlink" != "$dotgit" ]; then
+        _PILOT_GITDIR_BIND_ABORT="worktree back-pointer mismatch: $wt_gitdir/gitdir names '$backlink', not '$dotgit'"
+        return 1
     fi
 
     # Everything already inside the worktree bind needs no extra mount.
@@ -622,9 +629,50 @@ _pilot_gitdir_bind_args() {
     # The branch head and its reflog. Derived from the worktree's own HEAD, not
     # from the caller's $BRANCH: the guard below must hold for whatever branch
     # is actually checked out, however the worktree was created.
+    # Read through git, which enforces the refname grammar, and then re-check
+    # the result: this string becomes a path segment under $PARENT_GIT.
     local head_ref=""
-    if [ -f "$wt_gitdir/HEAD" ]; then
-        head_ref=$(sed -n 's/^ref: *//p' "$wt_gitdir/HEAD" 2>/dev/null | head -1)
+    head_ref=$(git -C "$worktree_dir" symbolic-ref --quiet HEAD 2>/dev/null || true)
+
+    # An empty answer means one of two very different things, and they must not
+    # be collapsed. A genuinely detached HEAD has no branch ref to update and is
+    # fine — commits still work, HEAD lives in the worktree gitdir. A HEAD FILE
+    # that says `ref:` while git refuses to resolve it is malformed, which on
+    # this attacker-writable surface means tampered. Degrading that to the
+    # detached path would be silent: the dispatch would run and the pilot would
+    # simply fail to commit, which is the exact failure shape mika#2141 exists
+    # to end.
+    if [ -z "$head_ref" ] && [ -f "$wt_gitdir/HEAD" ] \
+       && grep -q '^ref:' "$wt_gitdir/HEAD" 2>/dev/null; then
+        _PILOT_GITDIR_BIND_ABORT="$wt_gitdir/HEAD claims a symbolic ref that git refuses to resolve — the file is malformed or has been tampered with"
+        _PILOT_GITDIR_BIND_ARGS=()
+        return 1
+    fi
+
+    if [ -n "$head_ref" ]; then
+        case "$head_ref" in
+            refs/heads/*) : ;;
+            *)
+                _PILOT_GITDIR_BIND_ABORT="HEAD names '$head_ref', which is not under refs/heads/ — refusing to derive a bind path from it"
+                _PILOT_GITDIR_BIND_ARGS=()
+                return 1
+                ;;
+        esac
+        # Belt and braces over git's own validation. `..` is the one that turns
+        # a ref name into a path traversal, and a traversal here is a rw mount
+        # of an arbitrary host directory.
+        case "$head_ref" in
+            *..*|*//*|*$'\n'*)
+                _PILOT_GITDIR_BIND_ABORT="HEAD ref '$head_ref' contains a path-traversal or newline sequence — refusing to derive a bind path from it"
+                _PILOT_GITDIR_BIND_ARGS=()
+                return 1
+                ;;
+        esac
+        if ! printf '%s' "$head_ref" | grep -qE '^refs/heads/[A-Za-z0-9._/-]+$'; then
+            _PILOT_GITDIR_BIND_ABORT="HEAD ref '$head_ref' contains characters outside [A-Za-z0-9._/-] — refusing to derive a bind path from it"
+            _PILOT_GITDIR_BIND_ARGS=()
+            return 1
+        fi
     fi
 
     # Detached HEAD: there is no branch ref to update. Commits still work —

@@ -240,6 +240,57 @@ assert_contains "the refusal names the branch and the reason" "noslashbranch" "$
 assert_eq "no bind args are emitted on refusal" "0" "${#_PILOT_GITDIR_BIND_ARGS[@]}"
 
 echo ""
+echo "ADVERSARIAL — attacker-writable inputs cannot widen the bind set"
+echo "---------------------------------------------------------------"
+# This helper runs HOST-side and decides what gets mounted rw into the NEXT
+# sandbox, but every input it reads lives inside the PREVIOUS sandbox's
+# writable surface: `.git` is in $WORKTREE_DIR, and worktrees/<name>/HEAD is
+# bound rw by the helper itself. Worktrees persist between dispatches, so a
+# pilot that tampered with either would be choosing the next dispatch's mounts.
+# Each probe restores what it changed.
+WT_GITDIR=$(git -C "$WORKTREE_DIR" rev-parse --path-format=absolute --git-dir 2>/dev/null)
+SAVED_HEAD=$(cat "$WT_GITDIR/HEAD")
+SAVED_DOTGIT=$(cat "$WORKTREE_DIR/.git")
+
+probe_refuses() {
+    local label="$1"
+    _PILOT_GITDIR_BIND_ARGS=()
+    _PILOT_GITDIR_BIND_ABORT=""
+    _pilot_gitdir_bind_args "$WORKTREE_DIR"; local rc=$?
+    if [ "$rc" -ne 0 ] && [ -n "$_PILOT_GITDIR_BIND_ABORT" ] && [ "${#_PILOT_GITDIR_BIND_ARGS[@]}" -eq 0 ]; then
+        PASS=$((PASS + 1)); echo "  ✓ $label"
+    else
+        FAIL=$((FAIL + 1)); echo "  ✗ $label"
+        echo "    rc=$rc abort='$_PILOT_GITDIR_BIND_ABORT' args=${#_PILOT_GITDIR_BIND_ARGS[@]}"
+        local i
+        for ((i = 0; i < ${#_PILOT_GITDIR_BIND_ARGS[@]}; i++)); do
+            echo "      arg[$i]=${_PILOT_GITDIR_BIND_ARGS[$i]}"
+        done
+    fi
+}
+
+printf 'ref: refs/heads/../../../../../../tmp\n' > "$WT_GITDIR/HEAD"
+probe_refuses "a path-traversal in HEAD is refused, not turned into a rw mount"
+printf '%s\n' "$SAVED_HEAD" > "$WT_GITDIR/HEAD"
+
+printf 'ref: refs/tags/v1\n' > "$WT_GITDIR/HEAD"
+probe_refuses "a HEAD outside refs/heads/ is refused"
+printf '%s\n' "$SAVED_HEAD" > "$WT_GITDIR/HEAD"
+
+printf 'gitdir: /tmp\n' > "$WORKTREE_DIR/.git"
+probe_refuses "a .git repointed outside the parent's worktrees/ is refused"
+printf '%s\n' "$SAVED_DOTGIT" > "$WORKTREE_DIR/.git"
+
+# And the un-tampered worktree still resolves — otherwise the four refusals
+# above would be indistinguishable from a helper that refuses everything.
+_PILOT_GITDIR_BIND_ARGS=()
+_PILOT_GITDIR_BIND_ABORT=""
+_pilot_gitdir_bind_args "$WORKTREE_DIR"; restore_rc=$?
+assert_eq "control: the restored worktree still resolves" "0" "$restore_rc"
+nonzero=0; [ "${#_PILOT_GITDIR_BIND_ARGS[@]}" -gt 0 ] && nonzero=1
+assert_eq "control: it still emits bind args" "1" "$nonzero"
+
+echo ""
 echo "===================================================="
 echo "Results: $PASS passed, $FAIL failed"
 echo "===================================================="
