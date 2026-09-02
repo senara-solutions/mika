@@ -1400,6 +1400,18 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                     settings.clone(),
                     global_github_app.clone(),
                 )),
+                // mika#1949 U3 — auth-boundary ledger. Scoped to the default
+                // agent's database because `audit_events.agent_id` is a foreign
+                // key into `agents`, and the manager cadence is a process-level
+                // task with no agent of its own. `None` when the default agent
+                // is somehow absent: a missing ledger must never stop the
+                // cadence from running.
+                agents.get(&default_agent).map(|entry| {
+                    std::sync::Arc::new(crate::auth_boundary_ledger::DbAuthBoundaryLedger::new(
+                        entry.value().db.clone(),
+                    ))
+                        as std::sync::Arc<dyn crate::auth_boundary_ledger::AuthBoundaryLedger>
+                }),
             ),
             Ok(None) => {
                 info!(

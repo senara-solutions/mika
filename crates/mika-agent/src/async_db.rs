@@ -2085,6 +2085,22 @@ impl AsyncDatabase {
         .await
     }
 
+    /// Write one `auth_boundary` audit row (mika#1949 AC2). Agent-scoped and
+    /// session-less by construction — see
+    /// [`crate::evidence::audit::AUTH_BOUNDARY_SESSION_ID`].
+    ///
+    /// Prefer [`crate::auth_boundary_ledger::AuthBoundaryLedger`] at call
+    /// sites: an authentication path must not `await` its own audit write, and
+    /// must not change its verdict when the write fails.
+    pub async fn record_auth_boundary(
+        &self,
+        err: &mika_common::auth_boundary::AuthBoundaryError,
+    ) -> Result<()> {
+        let (a, e) = (self.agent_id.clone(), err.clone());
+        self.with_db(move |db| db.record_auth_boundary(&a, &e))
+            .await
+    }
+
     pub async fn get_audit_events(&self, session_id: &str) -> Result<Vec<AuditEvent>> {
         let (a, s) = (self.agent_id.clone(), session_id.to_owned());
         self.with_db(move |db| db.get_audit_events(&a, &s)).await

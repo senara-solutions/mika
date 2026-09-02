@@ -750,6 +750,59 @@ Two distinct sinks carry per-agent runtime log events (team runs have a third �
 
 `audit_events` table tracks all memory mutations per session. All writes include `trace_id`.
 
+### `tool_name = 'auth_boundary'` — cross-boundary authentication failures (mika#1949, Porte 3)
+
+The mika-manager write path crosses four boundaries, each guarded by a different
+env-var-backed token. Before mika#1949 a failure at any of them was
+indistinguishable from a network error — mika#2013 is the measured precedent:
+a frozen installation token cycled `auth_class=401` sixteen times in one night
+without naming itself. These rows are the fix: one per observed authentication
+failure, naming the token and the boundary.
+
+**Row shape** (written only by `Database::record_auth_boundary`, `evidence/audit.rs`):
+
+| column | value |
+|---|---|
+| `tool_name` | `auth_boundary` (`evidence::audit::AUTH_BOUNDARY_TOOL_NAME`) |
+| `session_id` | `auth-boundary` (`AUTH_BOUNDARY_SESSION_ID`) — a boundary failure belongs to no conversation |
+| `target_key` | `<from>_to_<to>` |
+| `after_value` | the failure kind — `missing` \| `empty` \| `invalid` \| `rejected` \| `unreachable` |
+| `reasoning` | JSON `{"token_name","kind","from","to"}` |
+| `before_value` | always `NULL` — there is no prior state to name |
+
+**The four boundary pairs `target_key` can take:**
+
+| `target_key` | token | site |
+|---|---|---|
+| `gateway_to_spirit` | `MIKA_INTERNAL_TOKEN` | `server/auth.rs` refusal arms |
+| `cm_to_spirit` | `INTERNAL_TOKEN` | control-monitor `A2aAdapter` (mirrored shape, cm's own ledger) |
+| `cm_to_content_plane` | `CM_FULL_ACCESS_TOKEN` | cm `scope::check` |
+| `manager_to_delivery` | `MIKA_MANAGER_DELIVERY_TOKEN` | `milestone_manager` report + alarm delivery |
+
+**Two properties, both load-bearing:**
+
+- **A token NAME, never a token VALUE.** `AuthBoundaryError` (in
+  `mika-common::auth_boundary`) has no field that can hold a secret, and both
+  it and this writer carry a negative-control test built with a secret-shaped
+  *name* to pin that.
+- **Fire-and-forget.** Call sites go through
+  `crate::auth_boundary_ledger::AuthBoundaryLedger`, whose `record` returns
+  `()`. An audit failure cannot change an authentication verdict, because the
+  signature offers no way to propagate one. A failed authentication still drops
+  the request exactly as before; only the drop became visible.
+
+**Operator query:**
+
+```sql
+SELECT target_key, after_value, count(*)
+FROM audit_events
+WHERE tool_name = 'auth_boundary'
+GROUP BY 1, 2;
+```
+
+Rotation procedure for all four tokens (and the deliberate 401/403 divergence
+between mika and cm): `mika-platform/docs/operator/token-rotation-procedure.md`.
+
 ## Timestamps
 
 All SQLite timestamp columns use ISO 8601 TEXT format (`%Y-%m-%dT%H:%M:%SZ`). The `crate::timestamp` module provides centralized helpers: `now()`, `format()`, `parse()`, `now_plus()`, `now_minus()`. Fixed-width UTC format ensures correct lexicographic ordering.

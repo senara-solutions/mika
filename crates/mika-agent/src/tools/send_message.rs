@@ -6,7 +6,7 @@ use tracing::{debug, error, warn};
 
 use crate::messaging::SendOutcome;
 
-use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
+use super::{Tool, ToolContext, ToolOutput};
 
 pub struct SendMessageTool;
 
@@ -30,7 +30,7 @@ impl Tool for SendMessageTool {
                 "properties": {
                     "text": {
                         "type": "string",
-                        "description": "The message to send to the user"
+                        "description": "The message to send (max 4096 characters — Telegram's per-message limit). Longer content must be split by you and sent as several calls; nothing downstream splits it."
                     }
                 },
                 "required": ["text"]
@@ -43,17 +43,27 @@ impl Tool for SendMessageTool {
         if text.is_empty() {
             return Ok(ToolOutput::error("'text' is required."));
         }
-        if text.len() > MAX_INPUT_LEN {
-            return Ok(ToolOutput::error(format!(
-                "'text' too long: {} characters (max: {MAX_INPUT_LEN})",
-                text.len()
-            )));
-        }
 
         // Strip any internal metadata tags the LLM may have echoed
         let cleaned = mika_common::llm::strip_internal_tags(text);
         if cleaned.is_empty() {
             return Ok(ToolOutput::success("Message was empty after processing."));
+        }
+
+        // Enforce Telegram's per-message ceiling on the text as it will actually be
+        // sent (`cleaned`, after tag-stripping), measured in UTF-16 units the way
+        // Telegram counts — not bytes. This runs before persistence so a message we
+        // refuse to send never enters conversation history (mika#2134).
+        let len_utf16 = mika_common::telegram::text_len_utf16(&cleaned);
+        if len_utf16 > mika_common::telegram::MAX_TEXT_UTF16_UNITS {
+            return Ok(ToolOutput::error(format!(
+                "Telegram accepts at most {} characters per message; this text is {len_utf16}. \
+                 The gateway does not split messages — split it yourself into chunks under \
+                 {} characters and send them in order, and tell the user you are sending \
+                 it in parts.",
+                mika_common::telegram::MAX_TEXT_UTF16_UNITS,
+                mika_common::telegram::MAX_TEXT_UTF16_UNITS,
+            )));
         }
 
         // Persist the outbound message for conversation history.
@@ -267,19 +277,248 @@ mod tests {
         assert!(result.content.contains("required"));
     }
 
+    /// Build a `ToolContext` wired to a `MockSender` so tests can assert on
+    /// **delivery** (`mock.sent()`), not just on the absence of an error.
+    /// Mirrors the full construction used by the sender-based tests above.
+    fn ctx_with_sender<'a>(
+        harness: &'a TestHarness,
+        sender: Arc<MockSender>,
+        skills_dirty: &'a std::sync::atomic::AtomicBool,
+        pr_review_posted: &'a std::sync::atomic::AtomicBool,
+        tool_arg_suffix_rejected: &'a std::sync::atomic::AtomicBool,
+    ) -> crate::tools::ToolContext<'a> {
+        crate::tools::ToolContext {
+            db: &harness.db,
+            session_id: "test-session",
+            trace_id: "00000000000000000000000000000000",
+            home_dir: std::path::Path::new("/tmp"),
+            global_home_dir: None,
+            core_memory_edit_count: &harness.counter,
+            is_onboarding: false,
+            message_sender: Some(sender),
+            embedding_client: None,
+            brave_api_key: None,
+            gateway_url: None,
+            internal_token: None,
+            github_token: None,
+            skills_dirty,
+            is_reflection: false,
+            is_task_context: false,
+            is_callback_turn: false,
+            provider_name: "anthropic",
+            model_name: "claude-sonnet-4-6",
+            active_skill_paths: &[],
+            max_tasks_per_session: 25,
+            pr_review_posted,
+            pr_reviews_posted: None,
+            callback_task_id: None,
+            required_tool_arg_suffixes: &[],
+            tool_arg_suffix_rejected,
+            tier: mika_common::home::AgentTier::Default,
+            scope_task_id: None,
+        }
+    }
+
+    /// AC3 — contrôle négatif obligatoire : 4095 caractères doivent **passer**,
+    /// et l'assertion porte sur la livraison (`mock.sent()`), pas seulement sur
+    /// l'absence d'erreur.
     #[tokio::test]
-    async fn test_send_message_too_long() {
+    async fn accepte_4095_controle_negatif() {
         let harness = TestHarness::new();
-        let ctx = harness.ctx();
+        let mock = Arc::new(MockSender::new());
+        let skills_dirty = std::sync::atomic::AtomicBool::new(false);
+        let pr_review_posted = std::sync::atomic::AtomicBool::new(false);
+        let tool_arg_suffix_rejected = std::sync::atomic::AtomicBool::new(false);
+        let ctx = ctx_with_sender(
+            &harness,
+            mock.clone(),
+            &skills_dirty,
+            &pr_review_posted,
+            &tool_arg_suffix_rejected,
+        );
         let tool = SendMessageTool;
 
-        let long_text = "x".repeat(MAX_INPUT_LEN + 1);
+        let text = "a".repeat(4095);
         let result = tool
-            .execute(serde_json::json!({"text": long_text}), &ctx)
+            .execute(serde_json::json!({ "text": text.clone() }), &ctx)
             .await
             .unwrap();
-        assert!(result.is_error);
-        assert!(result.content.contains("too long"));
+        assert!(!result.is_error, "4095 should pass: {}", result.content);
+        assert_eq!(mock.sent(), vec![text], "4095 must actually be delivered");
+    }
+
+    /// La borne est inclusive : exactement 4096 passe (`>` et non `>=`).
+    #[tokio::test]
+    async fn accepte_4096_a_la_borne() {
+        let harness = TestHarness::new();
+        let mock = Arc::new(MockSender::new());
+        let skills_dirty = std::sync::atomic::AtomicBool::new(false);
+        let pr_review_posted = std::sync::atomic::AtomicBool::new(false);
+        let tool_arg_suffix_rejected = std::sync::atomic::AtomicBool::new(false);
+        let ctx = ctx_with_sender(
+            &harness,
+            mock.clone(),
+            &skills_dirty,
+            &pr_review_posted,
+            &tool_arg_suffix_rejected,
+        );
+        let tool = SendMessageTool;
+
+        let text = "a".repeat(4096);
+        let result = tool
+            .execute(serde_json::json!({ "text": text.clone() }), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error, "4096 should pass (inclusive bound)");
+        assert_eq!(mock.sent(), vec![text]);
+    }
+
+    /// AC4 — la fenêtre 4096–10 000 : 5000 caractères refusés **par l'outil**,
+    /// avec leur raison, et jamais atteignant le transport (`mock.sent()` vide).
+    #[tokio::test]
+    async fn fenetre_5000_refusee_par_l_outil() {
+        let harness = TestHarness::new();
+        let mock = Arc::new(MockSender::new());
+        let skills_dirty = std::sync::atomic::AtomicBool::new(false);
+        let pr_review_posted = std::sync::atomic::AtomicBool::new(false);
+        let tool_arg_suffix_rejected = std::sync::atomic::AtomicBool::new(false);
+        let ctx = ctx_with_sender(
+            &harness,
+            mock.clone(),
+            &skills_dirty,
+            &pr_review_posted,
+            &tool_arg_suffix_rejected,
+        );
+        let tool = SendMessageTool;
+
+        let result = tool
+            .execute(serde_json::json!({ "text": "a".repeat(5000) }), &ctx)
+            .await
+            .unwrap();
+        assert!(result.is_error, "5000 must be refused by the tool");
+        assert!(
+            result.content.contains("4096"),
+            "refusal must name the limit: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("5000"),
+            "refusal must name the measured length: {}",
+            result.content
+        );
+        assert!(mock.sent().is_empty(), "5000 must NOT reach the transport");
+    }
+
+    /// AC6 — preuve de non-vacuité : rejouer les deux longueurs du jour même
+    /// (12 000 et 5000), les deux refusées avec une raison citant Telegram et
+    /// 4096, aucune n'atteignant le `MockSender`.
+    #[tokio::test]
+    async fn rejeu_2026_09_01() {
+        let harness = TestHarness::new();
+        let mock = Arc::new(MockSender::new());
+        let skills_dirty = std::sync::atomic::AtomicBool::new(false);
+        let pr_review_posted = std::sync::atomic::AtomicBool::new(false);
+        let tool_arg_suffix_rejected = std::sync::atomic::AtomicBool::new(false);
+        let ctx = ctx_with_sender(
+            &harness,
+            mock.clone(),
+            &skills_dirty,
+            &pr_review_posted,
+            &tool_arg_suffix_rejected,
+        );
+        let tool = SendMessageTool;
+
+        for (len, needle) in [(12_000usize, "12000"), (5_000usize, "5000")] {
+            let result = tool
+                .execute(serde_json::json!({ "text": "a".repeat(len) }), &ctx)
+                .await
+                .unwrap();
+            assert!(result.is_error, "{len} must be refused");
+            assert!(
+                result.content.contains("Telegram") && result.content.contains("4096"),
+                "refusal must name Telegram and 4096 for {len}: {}",
+                result.content
+            );
+            assert!(
+                result.content.contains(needle),
+                "refusal must name the measured length {needle}: {}",
+                result.content
+            );
+        }
+        assert!(mock.sent().is_empty(), "neither length may reach transport");
+    }
+
+    /// La mesure est en unités UTF-16, pas en octets : `"é".repeat(4000)`
+    /// (8000 octets, 4000 unités UTF-16) **passe**. C'est le test qui échoue si
+    /// quelqu'un remet `text.len()`.
+    #[tokio::test]
+    async fn accentue_sous_la_limite_passe() {
+        let harness = TestHarness::new();
+        let mock = Arc::new(MockSender::new());
+        let skills_dirty = std::sync::atomic::AtomicBool::new(false);
+        let pr_review_posted = std::sync::atomic::AtomicBool::new(false);
+        let tool_arg_suffix_rejected = std::sync::atomic::AtomicBool::new(false);
+        let ctx = ctx_with_sender(
+            &harness,
+            mock.clone(),
+            &skills_dirty,
+            &pr_review_posted,
+            &tool_arg_suffix_rejected,
+        );
+        let tool = SendMessageTool;
+
+        let text = "é".repeat(4000);
+        assert_eq!(text.len(), 8000, "sanity: 8000 bytes");
+        let result = tool
+            .execute(serde_json::json!({ "text": text.clone() }), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error,
+            "4000 accented chars (4000 UTF-16 units) must pass: {}",
+            result.content
+        );
+        assert_eq!(mock.sent(), vec![text]);
+    }
+
+    /// Les tags internes ne comptent pas : un texte dont le brut dépasse 4096
+    /// mais dont la version nettoyée est en dessous **passe**. Prouve que la
+    /// garde s'applique après `strip_internal_tags`.
+    #[tokio::test]
+    async fn tags_internes_ne_comptent_pas() {
+        let harness = TestHarness::new();
+        let mock = Arc::new(MockSender::new());
+        let skills_dirty = std::sync::atomic::AtomicBool::new(false);
+        let pr_review_posted = std::sync::atomic::AtomicBool::new(false);
+        let tool_arg_suffix_rejected = std::sync::atomic::AtomicBool::new(false);
+        let ctx = ctx_with_sender(
+            &harness,
+            mock.clone(),
+            &skills_dirty,
+            &pr_review_posted,
+            &tool_arg_suffix_rejected,
+        );
+        let tool = SendMessageTool;
+
+        // A short deliverable body wrapped in a large internal tag block whose
+        // raw length exceeds 4096 but whose cleaned length is tiny.
+        let filler = "x".repeat(5000);
+        let raw = format!("<context>{filler}</context>Voici le résumé.");
+        assert!(raw.len() > 4096, "sanity: raw exceeds the limit");
+        let result = tool
+            .execute(serde_json::json!({ "text": raw }), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error,
+            "cleaned text is under the limit and must pass: {}",
+            result.content
+        );
+        assert_eq!(
+            mock.sent(),
+            vec!["Voici le résumé.".to_string()],
+            "only the cleaned text is delivered"
+        );
     }
 
     #[tokio::test]

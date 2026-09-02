@@ -579,3 +579,203 @@ fn gitignore_plus_decision_core_taints() {
         vec!["crates/mika-agent/src/foo.rs"]
     );
 }
+
+// ---------------------------------------------------------------------------
+// mika-manager Phase 2 dispatch surface (mika#1947 — Porte 1).
+//
+// `crates/mika-agent/src/milestone_manager/**` is DECISION-CORE by construction:
+// Phase 2 promotion grants that module dispatch authority, and dispatch-authority
+// sits on the DECISION-CORE side of Vincent's 2026-07-25 forge-gate bearing.
+//
+// Today the classification is correct only by the fail-closed default — no rule
+// in `rules.rs` mentions the module, so `classify_path` falls through to
+// DECISION-CORE. That is right, but it was untested: nothing stopped a future
+// well-intentioned diff from adding a `milestone_manager` entry to a MECHANICAL
+// table and silently opening an auto-merge path into the manager's own surface.
+// The tests below make the invariant structural.
+// ---------------------------------------------------------------------------
+
+/// Absolute path to `crates/mika-agent/src/milestone_manager/`.
+fn milestone_manager_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/milestone_manager")
+}
+
+/// Repo-relative paths of every `.rs` file currently under `src/milestone_manager/`.
+///
+/// Enumerated from the filesystem rather than hard-coded so a newly added module
+/// file is covered the moment it lands — a hard-coded list would silently stop
+/// protecting the surface it is meant to protect.
+fn milestone_manager_source_paths() -> Vec<String> {
+    let dir = milestone_manager_dir();
+    let mut paths: Vec<String> = std::fs::read_dir(&dir)
+        .expect("milestone_manager module directory must exist")
+        .map(|entry| entry.expect("readable dir entry").path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "rs"))
+        .map(|p| {
+            format!(
+                "crates/mika-agent/src/milestone_manager/{}",
+                p.file_name()
+                    .expect("file name")
+                    .to_str()
+                    .expect("utf-8 file name")
+            )
+        })
+        .collect();
+    paths.sort();
+    assert!(
+        !paths.is_empty(),
+        "expected at least one .rs file under {}",
+        dir.display()
+    );
+    paths
+}
+
+#[test]
+fn milestone_manager_files_are_decision_core() {
+    // AC1 (mika#1947) — every current module file classifies DECISION-CORE.
+    for path in milestone_manager_source_paths() {
+        assert_eq!(
+            classify_path(&path),
+            Classification::DecisionCore,
+            "mika-manager surface: {path} must be DECISION-CORE (mika#1947 Porte 1)"
+        );
+    }
+
+    // Representative future paths — a file that does not exist yet must gate too,
+    // otherwise Phase 2 could land new dispatch code on an unguarded path.
+    for path in [
+        "crates/mika-agent/src/milestone_manager/dispatcher.rs",
+        "crates/mika-agent/src/milestone_manager/sub/bar.rs",
+    ] {
+        assert_eq!(
+            classify_path(path),
+            Classification::DecisionCore,
+            "future mika-manager path {path} must be DECISION-CORE (mika#1947 Porte 1)"
+        );
+    }
+}
+
+#[test]
+fn milestone_manager_solo_pr_is_decision_core() {
+    // AC2 (mika#1947) — a single-file PR touching only the manager gates.
+    let files = vec!["crates/mika-agent/src/milestone_manager/reader.rs".to_string()];
+    let result = classify_pr_files(&files);
+    assert_eq!(result.verdict, Classification::DecisionCore);
+    assert_eq!(result.decision_core_files, files);
+    assert!(result.mechanical_files.is_empty());
+}
+
+#[test]
+fn milestone_manager_file_taints_pr_batch() {
+    // AC2 (mika#1947) — the taint invariant holds for the manager surface: an
+    // otherwise-MECHANICAL PR that also touches one manager file gates as a whole.
+    // This is the shape a Phase-2 dispatch would most plausibly take (a docs +
+    // tests + manager-code change), so the batch rule is the load-bearing one.
+    let files = vec![
+        "docs/logs/2026-08-22-note.md".to_string(),
+        "crates/mika-agent/tests/eval/harness.rs".to_string(),
+        "crates/mika-agent/src/milestone_manager/assessor.rs".to_string(),
+    ];
+    let result = classify_pr_files(&files);
+    assert_eq!(result.verdict, Classification::DecisionCore);
+    assert_eq!(
+        result.decision_core_files,
+        vec!["crates/mika-agent/src/milestone_manager/assessor.rs"]
+    );
+    assert_eq!(result.mechanical_files.len(), 2);
+}
+
+/// Source text of `rules.rs`, read at compile time.
+///
+/// `include_str!` (not `fs::read_to_string`) so the assertion is pinned to the
+/// exact file the classifier was compiled from — a stale on-disk copy cannot
+/// make these tests pass against different rules than the ones in force.
+const RULES_SRC: &str = include_str!("rules.rs");
+
+/// Extract the body of a `const <NAME>: &[&str] = &[ ... ];` slice literal.
+fn mechanical_table_body(name: &str) -> &'static str {
+    let needle = format!("const {name}: &[&str] = &[");
+    let start = RULES_SRC
+        .find(&needle)
+        .unwrap_or_else(|| panic!("rules.rs must declare {name} — table renamed or removed?"))
+        + needle.len();
+    let rest = &RULES_SRC[start..];
+    // Matches both the multi-line tables and the empty single-line
+    // `= &[];` form (MECHANICAL_SUFFIXES today).
+    let end = rest
+        .find("];")
+        .unwrap_or_else(|| panic!("unterminated slice literal for {name}"));
+    &rest[..end]
+}
+
+#[test]
+fn milestone_manager_prefix_not_in_mechanical_tables() {
+    // AC1 (mika#1947), table-literal form — parses each MECHANICAL table body and
+    // asserts none of them enumerates the manager surface. Adding
+    // `crates/mika-agent/src/milestone_manager/` to any table fails here.
+    for table in [
+        "MECHANICAL_PREFIXES",
+        "MECHANICAL_EXACT",
+        "MECHANICAL_CONTAINS",
+        "MECHANICAL_SUFFIXES",
+    ] {
+        let body = mechanical_table_body(table);
+        assert!(
+            !body.contains("milestone_manager"),
+            "{table} must not enumerate the mika-manager surface — Phase 2 dispatch \
+             authority is DECISION-CORE by construction (mika#1947 Porte 1)"
+        );
+    }
+}
+
+#[test]
+fn milestone_manager_absent_from_all_mechanical_tables() {
+    // AC1 (mika#1947), whole-file form — redundant-on-purpose with the table-literal
+    // test above (F2, mika-arch first pass). The pair covers two distinct drift
+    // paths: a restructure that renames the const tables would blind the parser
+    // above, while an entry hidden outside a recognised table body would slip past
+    // it. A whole-file scan catches both. Fail-loud is the point.
+    assert!(
+        !RULES_SRC.contains("milestone_manager"),
+        "rules.rs must not mention `milestone_manager` anywhere — the manager surface \
+         is DECISION-CORE via the fail-closed default and must stay unenumerated \
+         (mika#1947 Porte 1).\n\
+         \n\
+         If a MECHANICAL table gained the entry: that is the regression this test \
+         exists for. Remove it.\n\
+         If you were only documenting the module in the `What is explicitly \
+         DECISION-CORE` prose: that list is grep-anchored on paths absent from the \
+         rules, so naming this one there is self-defeating — put the note in \
+         `milestone_manager/mod.rs` instead, where the Porte 1 proof already lives. \
+         Do not delete this assertion to make the prose fit."
+    );
+}
+
+#[test]
+fn milestone_manager_has_no_nested_tests_directory() {
+    // AC1 (mika#1947), the hole this ticket surfaced. `MECHANICAL_CONTAINS` grants
+    // MECHANICAL to any path containing `/tests/`, so a future
+    // `src/milestone_manager/tests/foo.rs` would classify MECHANICAL and become
+    // auto-mergeable — inside the very module Porte 1 exists to gate.
+    //
+    // Closing that by editing `rules.rs` is out of scope here (that file is
+    // DECISION-CORE and the ticket explicitly excludes reworking the classifier).
+    // Closing it structurally is not: the manager's own test code lives in
+    // `no_dispatch_test.rs` beside the module files, and this test keeps it that
+    // way. If a nested `tests/` directory is ever genuinely needed, the fix is to
+    // narrow the `/tests/` rule first — never to delete this assertion.
+    let nested = milestone_manager_dir().join("tests");
+    assert!(
+        !nested.exists(),
+        "src/milestone_manager/tests/ must not exist: MECHANICAL_CONTAINS `/tests/` \
+         would classify everything under it as auto-mergeable, opening a merge path \
+         into the mika-manager surface (mika#1947 Porte 1)"
+    );
+    // Guard the rule this test depends on: if `/tests/` ever leaves
+    // MECHANICAL_CONTAINS, this test is obsolete and should be revisited.
+    assert!(
+        mechanical_table_body("MECHANICAL_CONTAINS").contains("\"/tests/\""),
+        "MECHANICAL_CONTAINS no longer carries `/tests/` — re-evaluate whether the \
+         nested-directory guard above is still the right shape (mika#1947)"
+    );
+}
