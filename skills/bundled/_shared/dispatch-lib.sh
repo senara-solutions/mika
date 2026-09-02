@@ -729,7 +729,7 @@ _run_pilot_sandboxed() {
     _stage_pilot_gitconfig || true
     local -a _PILOT_GITDIR_BIND_ARGS=()
     local _PILOT_GITDIR_BIND_ABORT=""
-    if ! _pilot_gitdir_bind_args "$WORKTREE_DIR"; then
+    if ! _pilot_gitdir_bind_args "${WORKTREE_DIR:-}"; then
         echo "dispatch-lib: refusing to launch the pilot — $_PILOT_GITDIR_BIND_ABORT (mika#2141)" >&2
         return 78
     fi
