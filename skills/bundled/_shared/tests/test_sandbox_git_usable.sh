@@ -239,9 +239,14 @@ assert_eq "another worktree is not readable through git -C" "blocked" "$got_othe
 # and as a spurious DELETED on another; neither is the truth.
 got_delete=$(_run_pilot_sandboxed /bin/sh -c '
     out=$(git update-ref -d refs/heads/'"$VICTIM_BRANCH"' 2>&1)
-    if echo "$out" | grep -qi "not a git repository"; then
+    case "$out" in
+      *"not a git repository"*) cls=broken ;;
+      *"Read-only file system"*|*"read-only file system"*|*"cannot lock"*|*"Permission denied"*|*"permission denied"*) cls=refused ;;
+      *) cls=unknown ;;
+    esac
+    if [ "$cls" = broken ]; then
         echo git-broken
-    elif echo "$out" | grep -qi "read-only\|cannot lock\|permission denied"; then
+    elif [ "$cls" = refused ]; then
         echo refused
     elif git rev-parse --verify --quiet refs/heads/'"$VICTIM_BRANCH"' >/dev/null 2>&1; then
         echo refused

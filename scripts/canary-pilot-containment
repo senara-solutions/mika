@@ -507,9 +507,14 @@ if [ -z "$_canary_victim" ]; then
     echo "skip: branch-delete probe (no victim ref could be created host-side)"
 else
     _canary_del=$(git update-ref -d "$_canary_victim" 2>&1)
-    if echo "$_canary_del" | grep -qi "not a git repository"; then
+    case "$_canary_del" in
+        *"not a git repository"*) _canary_cls=broken ;;
+        *"Read-only file system"*|*"read-only file system"*|*"cannot lock"*|*"Permission denied"*|*"permission denied"*) _canary_cls=refused ;;
+        *) _canary_cls=unknown ;;
+    esac
+    if [ "$_canary_cls" = broken ]; then
         echo "FAIL: git is not working at all — this probe cannot judge containment"
-    elif echo "$_canary_del" | grep -qi "read-only\|cannot lock\|permission denied"; then
+    elif [ "$_canary_cls" = refused ]; then
         echo "ok:   unrelated_branch_delete_refused"
     elif git rev-parse --verify --quiet "$_canary_victim" >/dev/null 2>&1; then
         echo "ok:   unrelated_branch_delete_refused"

@@ -753,11 +753,16 @@ _pilot_gitdir_bind_args() {
                 return 1
                 ;;
         esac
-        if ! printf '%s' "$head_ref" | grep -qE '^refs/heads/[A-Za-z0-9._/-]+$'; then
-            _PILOT_GITDIR_BIND_ABORT="HEAD ref '$head_ref' contains characters outside [A-Za-z0-9._/-] — refusing to derive a bind path from it"
-            _PILOT_GITDIR_BIND_ARGS=()
-            return 1
-        fi
+        # `case`, not `printf | grep -q`: the pipeline form takes SIGPIPE under
+        # pipefail and is rejected by scripts/verify-no-sigpipe-grep.sh (mika#2055).
+        # The glob rejects the whole string if ANY character falls outside the set.
+        case "$head_ref" in
+            *[!A-Za-z0-9._/-]*)
+                _PILOT_GITDIR_BIND_ABORT="HEAD ref '$head_ref' contains characters outside [A-Za-z0-9._/-] — refusing to derive a bind path from it"
+                _PILOT_GITDIR_BIND_ARGS=()
+                return 1
+                ;;
+        esac
     fi
 
     # Detached HEAD: there is no branch ref to update. Commits still work —
