@@ -116,6 +116,15 @@ impl LlmResponse {
             .join("")
     }
 
+    /// Extended thinking / reasoning text, if the provider surfaced any.
+    ///
+    /// Populated from a dedicated `reasoning_content` field (reasoning-mode
+    /// models on OpenAI-compatible APIs) or from `<think>…</think>` extraction;
+    /// `None` when the provider surfaced no reasoning.
+    pub fn reasoning(&self) -> Option<&str> {
+        self.reasoning.as_deref()
+    }
+
     /// Extract all tool call content blocks.
     pub fn tool_calls(&self) -> Vec<&LlmResponseContent> {
         self.content
