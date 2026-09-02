@@ -1,0 +1,9 @@
+{
+  "run_id": "003-hi-de-pert",
+  "status": "success",
+  "confidence": "high",
+  "reliability": "degradee",
+  "item_id": "i-pert",
+  "perturbed": true,
+  "spirit_session_id": "sess-003"
+}
