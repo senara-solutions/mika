@@ -212,6 +212,41 @@ description — a pointer, not a second explanation.
 
 **Verification.** The command in the README runs as written.
 
+## Acceptance criteria
+
+Restated from R1–R6, AE1–AE2 and the Definition of Done below, under the section
+name the pipeline gate requires (mika#1600). No criterion here is new: each one
+names the requirement it restates.
+
+- **AC1** (R1, R2, AE1) — `crates/mika-agent/examples/rt005_analyze.rs` exists,
+  takes one positional batch-directory path, and prints `Report::render()`
+  verbatim to stdout via the `load_batch → analyze → render` chain.
+- **AC2** (R3, R5) — The runner computes nothing: no arithmetic, aggregation,
+  filtering or reformatting of any value the report carries, and
+  `git diff main -- crates/mika-agent/src/research/mechanism_analyzer.rs` is
+  empty. The estimand keeps exactly one definition.
+- **AC3** (R4) — No `Cargo.toml` entry, no CLI subcommand, no tool registration,
+  no agent-loop wiring. The example is reached by Cargo's `examples/`
+  auto-discovery and deletes with the rest of the RT-005 scaffold.
+- **AC4** (R6, AE2) — A batch that fails to load, or loads zero runs, stops
+  loudly: the message names the directory and the reason, and the process exits
+  non-zero. **Negative control, demonstrated not claimed:** running the example
+  against a directory that is not a batch must fail visibly. A silent or
+  zero-exit failure would let a caller read an empty report as a result.
+- **AC5** (U2) — A frozen fixture under
+  `crates/mika-agent/tests/fixtures/rt005-analyze/` pins the exact text
+  `render()` produces, and `tests/rt005_analyze.rs` runs in CI. The rule in AC2
+  is guarded **by effect**: arithmetic added anywhere on the path changes the
+  output and turns the test red.
+- **AC6** (U2 non-vacuity) — The fixture batch is not degenerate: eight success
+  runs analysed, three exclusions, both pre-registered contrasts non-degenerate.
+  **Demonstrated not claimed:** a self-computed value introduced on the path must
+  turn the fixture test red. A frozen fixture that passes whatever it is given
+  would guard nothing.
+- **AC7** — No guard on this path depends on a directory outside the repository.
+  AE1's comparison against `~/.mika/rt005/rt005-20260831-analysis/` is a local
+  check and cannot run in CI; that is precisely why AC5 exists.
+
 ## Verification Contract
 
 - `cargo build -p mika-agent --all-targets` — the example is an `--all-targets`
