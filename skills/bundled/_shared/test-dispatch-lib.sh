@@ -473,6 +473,56 @@ assert_eq "_parse_verdict ESCALATE" "ESCALATE" \
 assert_eq "_parse_verdict empty on no match" "" \
     "$(printf 'no verdict\n' | _parse_verdict)"
 
+# ---------------------------------------------------------------------------
+# Tier 0 — withheld disposition (mika#2037)
+#
+# The engine strips a disposition it refused to let stand and substitutes this
+# literal marker. No tier may then derive a verdict from the response: it is an
+# absence of verdict, not an approval.
+#
+# The tier-0 POSITION is what these assertions actually guard. After tier 1a the
+# marker would still be honoured; after tier 2 it would not, because the fuzzy pass
+# matches paraphrases anywhere in the text — so a response whose disposition line
+# was merely removed could still yield READY out of its own body. The third and
+# sixth assertions below are the ones that fail if tier 0 ever moves down.
+#
+# The literal must stay in sync with DISPOSITION_WITHHELD_MARKER in
+# crates/mika-agent/src/agent_loop/mod.rs.
+# ---------------------------------------------------------------------------
+WITHHELD_MARKER="Disposition-Withheld: REVIEW-ANCHOR-MISSING"
+
+assert_eq "tier 0 beats tier 1a (literal Disposition present)" "" \
+    "$(printf 'Some review prose.\n%s\nDisposition: READY\n' "$WITHHELD_MARKER" | _parse_disposition 2>/dev/null)"
+assert_eq "tier 0 beats tier 1b (Verdict carry-over present)" "" \
+    "$(printf '%s\nVerdict: GROOMED\n' "$WITHHELD_MARKER" | _parse_disposition 2>/dev/null)"
+assert_eq "tier 0 beats tier 2 (fuzzy READY paraphrases in the body)" "" \
+    "$(printf 'The plan is clean, good to go — proceed with the dispatch.\n%s\n' "$WITHHELD_MARKER" | _parse_disposition 2>/dev/null)"
+
+assert_eq "verdict tier 0 beats tier 1a" "" \
+    "$(printf '%s\nVerdict: GROOMED\n' "$WITHHELD_MARKER" | _parse_verdict 2>/dev/null)"
+assert_eq "verdict tier 0 beats tier 1b" "" \
+    "$(printf '%s\nDisposition: READY\n' "$WITHHELD_MARKER" | _parse_verdict 2>/dev/null)"
+assert_eq "verdict tier 0 beats tier 2 (fuzzy GROOMED paraphrases)" "" \
+    "$(printf 'Approved, no remaining concerns, ship it.\n%s\n' "$WITHHELD_MARKER" | _parse_verdict 2>/dev/null)"
+
+# A response that QUOTES the marker mid-line must not be suppressed: the three arch prompts
+# now teach the literal to the model, so an echo is an ordinary shape. Only a line the engine
+# wrote counts (mika#2037 F4).
+assert_eq "quoted marker mid-line does not suppress a genuine ITERATE" "ITERATE" \
+    "$(printf 'If the attestation were missing the engine would emit %s here.\nDisposition: ITERATE\n' "$WITHHELD_MARKER" | _parse_disposition 2>/dev/null)"
+assert_eq "quoted marker mid-line does not suppress a genuine GROOMED" "GROOMED" \
+    "$(printf 'The engine substitutes %s in that case.\nVerdict: GROOMED\n' "$WITHHELD_MARKER" | _parse_verdict 2>/dev/null)"
+assert_eq "marker at the very start of the response still suppresses" "" \
+    "$(printf '%s\nDisposition: READY\n' "$WITHHELD_MARKER" | _parse_disposition 2>/dev/null)"
+
+# Non-regression: without the marker every tier behaves exactly as before.
+assert_eq "no marker — tier 1a still returns READY" "READY" \
+    "$(printf 'Some review prose.\nDisposition: READY\n' | _parse_disposition 2>/dev/null)"
+assert_eq "no marker — tier 2 still returns READY" "READY" \
+    "$(printf 'The plan is clean, good to go — proceed.\n' | _parse_disposition 2>/dev/null)"
+assert_eq "no marker — verdict tier 1a still returns GROOMED" "GROOMED" \
+    "$(printf 'Verdict: GROOMED\n' | _parse_verdict 2>/dev/null)"
+
 # _trail_append + _trail_read — round-trip
 TRAIL_TMP=$(mktemp -d)
 WORKTREE_DIR="$TRAIL_TMP" _trail_append "groom-ticket" "session-abc" "READY"
@@ -1034,6 +1084,230 @@ test_groom_gate_branch_absent() {
     if [ "$rc" -ne 0 ]; then echo "PASS"; else echo "FAIL: gate fired although the dispatch branch does not exist on the remote"; fi
 }
 
+# ----------------------------------------------------------------------------
+# Issue binding in the dispatch gate (mika#2034)
+# ----------------------------------------------------------------------------
+# Cases 1–5 above all run against a fixture whose `main` carries no plan files.
+# That is precisely why they were green while the defect was live: the fixture
+# could not express the production shape, where every dispatch branch descends
+# from a `main` carrying 769 plans and therefore resolves ANY valid plan path.
+# The gate read the path out of the ticket's own callout and asked only whether
+# it resolved — an attestation produced by the claim it was meant to check.
+#
+# Measured 2026-08-30, both stranded by that gate:
+#   mika#1887 → a plan whose header reads `issue: senara-solutions/mika#1933`
+#   mika#2026 → a plan whose header reads `**Issue:** #539`
+#
+# Case 6 is the one that would have caught them.
+
+# Writes a plan file on `main` whose header claims $2, and pushes. The branch in
+# $3 is then created on top and adds NOTHING — so the plan resolves on it purely
+# by inheritance, exactly as in production.
+_fixture_foreign_plan_on_main() {
+    local plan_rel="$1" claims_issue="$2" branch="$3"
+    mkdir -p "$FIXTURE_CLONE/docs/plans"
+    {
+        printf -- '---\n'
+        printf 'issue: senara-solutions/mika#%s\n' "$claims_issue"
+        printf 'type: fix\n'
+        printf -- '---\n\n'
+        printf '# Plan — a plan belonging to another ticket\n\n'
+        printf 'Padding so the file clears any size filter. %s\n' \
+            "$(head -c 600 /dev/zero | tr '\0' 'x')"
+    } > "$FIXTURE_CLONE/$plan_rel"
+    git -C "$FIXTURE_CLONE" add "$plan_rel"
+    git -C "$FIXTURE_CLONE" commit -q -m "plan for another ticket, on main"
+    git -C "$FIXTURE_CLONE" push -q origin main
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$branch"
+    echo "code" > "$FIXTURE_CLONE/src.txt"
+    git -C "$FIXTURE_CLONE" add src.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "work, no plan of its own"
+    git -C "$FIXTURE_CLONE" push -q origin "$branch"
+}
+
+FOREIGN_PLAN_REL='docs/plans/2026-08-21-002-fix-1933-reader-completed-section-plan.md'
+FOREIGN_PLAN_BODY='## Symptom
+Some text.
+
+> - **Branch:** `feat/1887/research-peer-b`
+> - **Plan:** `docs/plans/2026-08-21-002-fix-1933-reader-completed-section-plan.md` (committed on branch @ `deadbeef`)
+'
+
+# --- Case 6 (the discriminating one): the plan the body names belongs to
+# ANOTHER ticket and the branch merely inherited it from main. The gate must NOT
+# fire — this ticket has never been groomed.
+test_groom_gate_foreign_plan_inherited_from_main() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    _fixture_foreign_plan_on_main "$FOREIGN_PLAN_REL" 1933 "feat/1887/research-peer-b"
+
+    local rc=0 err
+    err=$(_committed_plan_on_branch "$FIXTURE_CLONE" "feat/1887/research-peer-b" \
+        "$FOREIGN_PLAN_BODY" "mika" 1887 2>&1 >/dev/null) || rc=$?
+
+    _fixture_cleanup
+    if [ "$rc" -eq 0 ]; then
+        echo "FAIL: gate fired on a plan whose header claims issue 1933 while grooming 1887 — this is the mika#1887 / mika#2026 strand"
+    elif ! grep -q -- 'dispatch_gate_groom_plan_refuted' <<<"$err"; then
+        echo "FAIL: gate declined but emitted no greppable refusal diagnostic; got: $err"
+    elif ! grep -q -- '1933' <<<"$err"; then
+        echo "FAIL: refusal diagnostic does not name the issue the plan claims; got: $err"
+    else
+        echo "PASS"
+    fi
+}
+
+# --- Case 7: same file, but its header claims the TARGET issue → gate fires.
+# Without this, case 6 could be satisfied by refusing everything.
+test_groom_gate_plan_header_claims_target_issue() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    _fixture_foreign_plan_on_main "$FOREIGN_PLAN_REL" 1887 "feat/1887/research-peer-b"
+
+    local out rc=0
+    out=$(_committed_plan_on_branch "$FIXTURE_CLONE" "feat/1887/research-peer-b" \
+        "$FOREIGN_PLAN_BODY" "mika" 1887 2>/dev/null) || rc=$?
+
+    _fixture_cleanup
+    if [ "$rc" -eq 0 ] && [ "$out" = "$FOREIGN_PLAN_REL" ]; then
+        echo "PASS"
+    else
+        echo "FAIL: a plan whose header claims the target issue must still fire the gate, got rc=$rc out='$out'"
+    fi
+}
+
+# --- Case 8: the plan carries NO issue marker at all → gate still fires.
+# Refutation, not confirmation: 95 of the 745 plans in docs/plans/ name no
+# issue, and demanding a positive match would strand every one of them.
+test_groom_gate_plan_without_issue_marker_still_fires() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    mkdir -p "$FIXTURE_CLONE/docs/plans"
+    printf '# Plan — no issue marker anywhere in this header\n\nBody.\n' \
+        > "$FIXTURE_CLONE/$FOREIGN_PLAN_REL"
+    git -C "$FIXTURE_CLONE" add "$FOREIGN_PLAN_REL"
+    git -C "$FIXTURE_CLONE" commit -q -m "markerless plan on main"
+    git -C "$FIXTURE_CLONE" push -q origin main
+    git -C "$FIXTURE_CLONE" checkout -q -b feat/1887/research-peer-b
+    git -C "$FIXTURE_CLONE" push -q origin feat/1887/research-peer-b
+
+    local out rc=0
+    out=$(_committed_plan_on_branch "$FIXTURE_CLONE" "feat/1887/research-peer-b" \
+        "$FOREIGN_PLAN_BODY" "mika" 1887 2>/dev/null) || rc=$?
+
+    _fixture_cleanup
+    if [ "$rc" -eq 0 ] && [ "$out" = "$FOREIGN_PLAN_REL" ]; then
+        echo "PASS"
+    else
+        echo "FAIL: silence is not refutation — a markerless plan must still fire the gate, got rc=$rc out='$out'"
+    fi
+}
+
+# --- Case 9: the four existing call shapes keep working with no 5th argument.
+# KTD2 — the parameter is optional; a required one would break all five cases
+# above and both production call sites.
+test_groom_gate_issue_arg_is_optional() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    _fixture_foreign_plan_on_main "$FOREIGN_PLAN_REL" 1933 "feat/1887/research-peer-b"
+
+    # No 5th argument and no ambient ISSUE_NUM: the binding check is skipped
+    # rather than guessed, so the gate behaves exactly as it did before mika#2034.
+    local out rc=0
+    out=$(ISSUE_NUM='' _committed_plan_on_branch "$FIXTURE_CLONE" "feat/1887/research-peer-b" \
+        "$FOREIGN_PLAN_BODY" "mika" 2>/dev/null) || rc=$?
+
+    _fixture_cleanup
+    if [ "$rc" -eq 0 ] && [ "$out" = "$FOREIGN_PLAN_REL" ]; then
+        echo "PASS"
+    else
+        echo "FAIL: the 5th argument must be optional, got rc=$rc out='$out'"
+    fi
+}
+
+# --- Case 10: provenance is measured, not asserted. A blob identical to main's
+# is reported as inherited; one the branch actually added is reported as
+# committed. This is the sentence the operator reads.
+test_plan_provenance_distinguishes_inherited_from_committed() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    _fixture_foreign_plan_on_main "$FOREIGN_PLAN_REL" 1933 "feat/1887/research-peer-b"
+
+    # Prime the gate ref the same way _committed_plan_on_branch does.
+    git -C "$FIXTURE_CLONE" fetch --quiet --force origin \
+        "refs/heads/feat/1887/research-peer-b:refs/dispatch-gate/feat/1887/research-peer-b" 2>/dev/null
+
+    local inherited committed own_plan='docs/plans/2026-08-30-001-fix-2034-own-plan.md'
+    inherited=$(_plan_provenance "$FIXTURE_CLONE" "feat/1887/research-peer-b" "$FOREIGN_PLAN_REL")
+
+    printf -- '---\nissue: senara-solutions/mika#1887\n---\n\nOwn plan.\n' \
+        > "$FIXTURE_CLONE/$own_plan"
+    git -C "$FIXTURE_CLONE" add "$own_plan"
+    git -C "$FIXTURE_CLONE" commit -q -m "this branch's own plan"
+    git -C "$FIXTURE_CLONE" push -q origin feat/1887/research-peer-b
+    git -C "$FIXTURE_CLONE" fetch --quiet --force origin \
+        "refs/heads/feat/1887/research-peer-b:refs/dispatch-gate/feat/1887/research-peer-b" 2>/dev/null
+    committed=$(_plan_provenance "$FIXTURE_CLONE" "feat/1887/research-peer-b" "$own_plan")
+
+    _fixture_cleanup
+    if ! grep -q -- 'inherited unchanged from main' <<<"$inherited"; then
+        echo "FAIL: a blob identical to main's must be reported as inherited, got '$inherited'"
+    elif ! grep -q -- 'committed on the dispatch branch' <<<"$committed"; then
+        echo "FAIL: a blob the branch added must be reported as committed, got '$committed'"
+    else
+        echo "PASS"
+    fi
+}
+
+# --- Case 11: a callout naming a DIRECTORY must not fire the gate.
+# Written to pin the unbindable-candidate path and it found a real one instead:
+# `cat-file -e` is satisfied by a tree, and `git show` on a tree prints a
+# listing — non-empty, carrying no issue header, therefore "not refuted". A
+# ticket whose callout said `docs/plans` was refused grooming on the strength of
+# a directory. The gate now demands a blob.
+test_groom_gate_declines_on_directory_candidate() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    _fixture_foreign_plan_on_main "$FOREIGN_PLAN_REL" 1933 "feat/1887/research-peer-b"
+
+    local rc=0
+    _committed_plan_on_branch "$FIXTURE_CLONE" "feat/1887/research-peer-b" \
+        "> - **Plan:** \`docs/plans\` (committed on branch @ \`deadbeef\`)" \
+        "mika" 1887 >/dev/null 2>&1 || rc=$?
+
+    _fixture_cleanup
+    if [ "$rc" -ne 0 ]; then
+        echo "PASS"
+    else
+        echo "FAIL: a directory is not a plan — the gate must not fire on one"
+    fi
+}
+
+# Code-shape: the binding must not be quietly dropped by a later edit. The gate
+# is the only thing standing between a false body callout and a permanent
+# strand, so its call to the refutation helper is an assertion of its own.
+PLAN_GATE_SRC_2034=$(declare -f _committed_plan_on_branch)
+assert_contains "gate binds the candidate to the issue before believing it" \
+    '_plan_header_refutes_issue' "$PLAN_GATE_SRC_2034"
+assert_contains "gate names the issue the refuted plan claims" \
+    '_plan_header_claimed_issues' "$PLAN_GATE_SRC_2034"
+assert_contains "gate emits a greppable refusal diagnostic" \
+    'dispatch_gate_groom_plan_refuted' "$PLAN_GATE_SRC_2034"
+# Provenance lives outside the gate on purpose: every call site invokes the gate
+# in a command substitution, and a subshell cannot set a variable in its parent.
+assert_not_contains "gate keeps stdout to the plan path alone" \
+    'COMMITTED_PLAN_PROVENANCE=' "$PLAN_GATE_SRC_2034"
+PLAN_PROVENANCE_SRC=$(declare -f _plan_provenance)
+assert_contains "provenance compares the branch blob against main's" \
+    'origin/main:' "$PLAN_PROVENANCE_SRC"
+
 # Code-shape: the gate must use mika#988 exit semantics — _deliver_callback +
 # exit 0, never exit 1. An `exit 1` here is wrapped as HANDLER CRASH by the EXIT
 # trap and stalls the loop (7 h on 2026-05-06).
@@ -1331,7 +1605,10 @@ else
 fi
 
 # Test C: Structural — dispatch-lib uses pathspec exclusion (not bare git add -A)
-RESCUE_BLOCK=$(sed -n '/Unit 1 (mika#1282)/,/^[[:space:]]*fi$/p' "$DISPATCH_LIB" | head -120)
+# mika#2031 moved the rescue body out of _post_flight_recovery into
+# _rescue_dirty_worktree(), so the extraction anchors on the function rather than
+# on the inline `Unit 1` comment. Same assertions, same block — new address.
+RESCUE_BLOCK=$(sed -n '/^_rescue_dirty_worktree() {/,/^}$/p' "$DISPATCH_LIB")
 assert_contains "Rescue uses pathspec exclusion :!.claude/commands/" ":!.claude/commands/" "$RESCUE_BLOCK"
 assert_contains "Rescue has empty-index guard (diff --cached --quiet)" "diff --cached --quiet" "$RESCUE_BLOCK"
 assert_contains "Rescue uses RESCUED_FILES for message" 'RESCUED_FILES' "$RESCUE_BLOCK"
@@ -3224,7 +3501,13 @@ for gate_case in \
     "test_groom_gate_plan_committed|plan committed on branch → gate fires with the path" \
     "test_groom_gate_repo_prefixed_path|repo-prefixed callout resolves to relative path" \
     "test_groom_gate_no_callout|no Plan callout → gate does NOT fire" \
-    "test_groom_gate_branch_absent|branch absent from remote → gate does NOT fire"
+    "test_groom_gate_branch_absent|branch absent from remote → gate does NOT fire" \
+    "test_groom_gate_foreign_plan_inherited_from_main|mika#2034: plan claims another issue, inherited from main → gate does NOT fire" \
+    "test_groom_gate_plan_header_claims_target_issue|mika#2034: plan header claims the target issue → gate fires" \
+    "test_groom_gate_plan_without_issue_marker_still_fires|mika#2034: plan with no issue marker → gate still fires" \
+    "test_groom_gate_issue_arg_is_optional|mika#2034: the 5th argument is optional" \
+    "test_plan_provenance_distinguishes_inherited_from_committed|mika#2034: provenance separates inherited from committed" \
+    "test_groom_gate_declines_on_directory_candidate|mika#2034: callout naming a directory → gate does NOT fire"
 do
     gate_fn="${gate_case%%|*}"
     gate_label="${gate_case#*|}"
@@ -3917,6 +4200,28 @@ if [ -f "$RUST_SRC" ]; then
         | sort | paste -sd' ' -)
     SHELL_LIST=$(printf '%s\n' "${DISPATCHABLE_REPO_BASENAMES[@]}" | sort | paste -sd' ' -)
     assert_eq "shell allowlist matches Rust DISPATCHABLE_REPOS (no drift)" "$RUST_LIST" "$SHELL_LIST"
+fi
+
+# --- Drift guard: the withheld-disposition marker must equal the Rust constant ---
+# Same necessity as the list above: the engine side is a compile-time `&str`, not a
+# runtime-readable data file, so the literal exists in both languages. Here the stakes
+# are higher than drift-as-noise — if the two copies diverge, the engine still strips
+# the disposition but tier 0 stops recognizing the substitute, and every tier below it
+# resumes deriving a verdict from the body. The refusal would fail OPEN, silently
+# (mika#2037).
+ANCHOR_RUST_SRC="$REPO_ROOT/crates/mika-agent/src/agent_loop/mod.rs"
+if [ -f "$ANCHOR_RUST_SRC" ]; then
+    RUST_MARKER=$(grep -oE 'const DISPOSITION_WITHHELD_MARKER: &str = "[^"]+"' "$ANCHOR_RUST_SRC" \
+        | sed 's/.*= "//; s/"$//')
+    assert_eq "shell tier-0 marker matches Rust DISPOSITION_WITHHELD_MARKER (no drift)" \
+        "$RUST_MARKER" "$WITHHELD_MARKER"
+    # The shell parser must actually contain the literal, not merely compare equal to a
+    # variable this test defined.
+    if grep -qF "$RUST_MARKER" "$DISPATCH_LIB"; then
+        assert_eq "dispatch-lib carries the marker literal" "yes" "yes"
+    else
+        assert_eq "dispatch-lib carries the marker literal" "yes" "no"
+    fi
 else
     FAIL=$((FAIL + 1))
     echo "  ✗ Rust source not found at $RUST_SRC — cannot verify allowlist drift"

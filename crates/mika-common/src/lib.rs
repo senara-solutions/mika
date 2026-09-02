@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod auth_boundary;
 pub mod build_info;
 pub mod claude;
 pub mod config;
@@ -13,6 +14,7 @@ pub mod mcp_config_path;
 pub mod oauth;
 pub mod permission_authority;
 pub mod team;
+pub mod telegram;
 pub mod telemetry;
 pub mod text;
 pub mod trace;

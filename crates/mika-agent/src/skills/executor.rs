@@ -1386,7 +1386,13 @@ pub(crate) async fn validate_dispatch_readiness(
     let dispatch_class = tool_input.and_then(extract_skill_from_input);
     let class = derive_dispatch_class(dispatch_class);
     match db.has_active_callback_tasks_excluding(task_id, class).await {
-        Ok(Some((blocking_parent_id, blocking_callback_id, blocking_label))) => {
+        Ok(Some(blocking)) => {
+            let crate::db::BlockingDispatch {
+                parent_task_id: blocking_parent_id,
+                callback_task_id: blocking_callback_id,
+                label: blocking_label,
+                dispatcher_source: blocking_dispatcher_source,
+            } = blocking;
             // mika#1011 — Register a deferred-dispatch callback so the engine
             // auto-retries when the blocking dispatch completes. The LLM still
             // sees the rejection (γ composition) and may call send_message;
@@ -1405,6 +1411,14 @@ pub(crate) async fn validate_dispatch_readiness(
                 "real_callback"
             };
 
+            // mika#1948 — name WHICH dispatcher holds the slot. `None` means the
+            // blocking row predates the column (pre-v51) and is genuinely
+            // unknown; it is passed through as JSON `null` rather than
+            // defaulted, so a consumer cannot mistake "we don't know" for "it
+            // was mika-dev".
+            let blocking_source_display = blocking_dispatcher_source
+                .as_deref()
+                .unwrap_or("unknown (pre-v51 row)");
             let mut rejection = serde_json::json!({
                 "error": "global_dispatch_active",
                 "task_id": task_id,
@@ -1413,12 +1427,13 @@ pub(crate) async fn validate_dispatch_readiness(
                 "blocking_callback_id": blocking_callback_id,
                 "blocking_label": blocking_label,
                 "blocker_kind": blocker_kind,
+                "blocking_dispatcher_source": blocking_dispatcher_source,
                 "reason": format!(
                     "Another task ('{}') already has an active {} dispatch \
-                     (callback task '{}'). Only one long-running dispatch per class may be \
-                     active at a time. Wait for it to complete or cancel it before \
-                     dispatching again.",
-                    blocking_parent_id, class, blocking_callback_id
+                     (callback task '{}', dispatched by {}). Only one long-running \
+                     dispatch per class may be active at a time. Wait for it to \
+                     complete or cancel it before dispatching again.",
+                    blocking_parent_id, class, blocking_callback_id, blocking_source_display
                 )
             });
             if deferred_registered {
@@ -1794,6 +1809,138 @@ pub(crate) async fn validate_dispatch_readiness(
         }
     }
 
+    // mika#1948 (Porte 2) — ATOMIC EXEC-SLOT CLAIM. This is the last gate, and
+    // it is last on purpose.
+    //
+    // Everything above only ever *checked* the slot. The per-class guard is a
+    // bare SELECT: on `None` it proceeds, and the callback row that makes the
+    // slot observably held is written later, by the caller. Between that check
+    // and that row this function performs several GitHub round-trips (issue
+    // body, open-PR, grooming markers — 10s timeout each), and four production
+    // callers enter here (`ready_label_handler`, the tool boundary,
+    // `task_engine::dispatcher`, `verdict_handler`). So two dispatchers could
+    // both read "free", both spend seconds in validation, and both proceed.
+    //
+    // A slot two claimants can simultaneously believe they hold is not
+    // arbitration, it is a convention. The claim below is a FACT: the PRIMARY
+    // KEY on (agent_id, dispatch_class) means the second claimant's INSERT
+    // collides rather than races, and exactly one caller leaves here holding
+    // the slot.
+    //
+    // Placed LAST so that no fallible step follows it — every rejection above
+    // returns before a lease is ever taken, which is why no error path needs to
+    // release one. The only thing between this claim and the callback row is
+    // the caller's own dispatch.
+    //
+    // Fail-closed on contention, per the ticket: a missed dispatch is
+    // recoverable (the deferred wrapper re-drives it), two writers on one
+    // branch are not. The bounded TTL is what keeps fail-closed from becoming
+    // loop-breaking — a dispatcher that dies mid-claim stalls its class for one
+    // TTL, not forever.
+    let dispatcher_source = task.dispatcher_source.as_deref();
+    match db
+        .try_acquire_dispatch_slot(
+            class,
+            task_id,
+            dispatcher_source,
+            crate::db::dispatch_slot_lease_ttl_secs(),
+        )
+        .await
+    {
+        Ok(crate::db::SlotClaim::Acquired) => {
+            debug!(
+                event = "dispatch_slot_acquired",
+                task_id = task_id,
+                dispatch_class = class,
+                dispatcher_source = dispatcher_source.unwrap_or("mika_dev"),
+                "exec slot claimed"
+            );
+        }
+        Ok(crate::db::SlotClaim::Held {
+            holder_task_id,
+            dispatcher_source: holder_source,
+            expires_at,
+        }) => {
+            let holder_source_display = holder_source.as_deref().unwrap_or("unknown (pre-v51 row)");
+            warn!(
+                event = "dispatch_slot_contended",
+                task_id = task_id,
+                dispatch_class = class,
+                holder_task_id = %holder_task_id,
+                holder_dispatcher_source = holder_source_display,
+                "exec slot already claimed by another dispatcher — refusing"
+            );
+
+            // Register a deferred wrapper exactly as the per-class guard does,
+            // so a dispatch that lost the claim is re-driven rather than lost.
+            let deferred_registered = if let Some(input) = tool_input {
+                register_deferred_callback(db, task_id, input).await
+            } else {
+                false
+            };
+
+            let mut rejection = serde_json::json!({
+                "error": "dispatch_slot_contended",
+                "task_id": task_id,
+                "dispatch_class": class,
+                "holder_task_id": holder_task_id,
+                "holder_dispatcher_source": holder_source,
+                "lease_expires_at": expires_at,
+                "reason": format!(
+                    "The `{class}` exec slot is claimed by task '{holder_task_id}' \
+                     (dispatched by {holder_source_display}), whose lease runs to \
+                     {expires_at}. Another dispatcher won the slot while this \
+                     dispatch was being validated. Only one dispatcher may hold a \
+                     class slot at a time — dispatching anyway would put a second \
+                     writer on the same branch (mika#1948)."
+                ),
+            });
+            if deferred_registered {
+                rejection["deferred_dispatch_registered"] = serde_json::json!(true);
+            }
+
+            if let Err(e) = db
+                .log_audit_event(
+                    task_id,
+                    "dispatch_slot_contended",
+                    &format!("class:{class}"),
+                    None,
+                    Some("dispatch_refused"),
+                    Some(&format!(
+                        "holder={holder_task_id} holder_source={holder_source_display} \
+                         expires_at={expires_at}"
+                    )),
+                    None,
+                )
+                .await
+            {
+                warn!(error = %e, "failed to write dispatch_slot_contended audit event");
+            }
+
+            record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+            return Err(rejection.to_string());
+        }
+        Err(e) => {
+            // Fail-closed, matching the per-class guard directly above: if we
+            // cannot establish who holds the slot, we do not dispatch. "In
+            // doubt about who holds the slot, don't dispatch" is the whole
+            // discipline — a lease we failed to take is not a lease we hold.
+            warn!(
+                task_id = task_id,
+                dispatch_class = class,
+                error = %e,
+                "exec-slot claim failed — refusing dispatch"
+            );
+            return Err(serde_json::json!({
+                "error": "dispatch_check_failed",
+                "task_id": task_id,
+                "dispatch_class": class,
+                "reason": format!("Failed to claim the {class} exec slot: {e}")
+            })
+            .to_string());
+        }
+    }
+
     Ok(task.status.clone())
 }
 
@@ -2016,6 +2163,14 @@ async fn check_lineage_cycle(
         return Ok(());
     }
 
+    // mika#1948 — the dispatch being proposed inherits the source of the task
+    // proposing it. Read once, before the walk, so every ancestor comparison
+    // uses the same subject.
+    let proposed_source = match db.get_task_unscoped(parent_task_id).await {
+        Ok(Some(t)) => t.dispatcher_source,
+        _ => None,
+    };
+
     let mut current_id = parent_task_id.to_string();
     for _depth in 0..4 {
         let task = match db.get_task_unscoped(&current_id).await {
@@ -2023,17 +2178,60 @@ async fn check_lineage_cycle(
             _ => break, // task not found or DB error → stop walking (fail-open)
         };
 
-        // Extract (repo, issue, skill) from this ancestor
-        if let Some((ancestor_repo, ancestor_issue, ancestor_skill)) = extract_dispatch_tuple(&task)
-            && proposed_skill == Some(ancestor_skill.as_str())
-            && proposed_repo == Some(ancestor_repo.as_str())
-            && proposed_issue == Some(ancestor_issue)
+        // Extract (repo, issue, skill, source) from this ancestor
+        if let Some((ancestor_repo, ancestor_issue, ancestor_skill, ancestor_source)) =
+            extract_dispatch_tuple_with_source(&task)
         {
-            return Err(format!(
-                "Cycle detected: ancestor task {} has same dispatch tuple \
-                 ({}, #{}, skill={}). Refusing to enqueue.",
-                task.id, ancestor_repo, ancestor_issue, ancestor_skill
-            ));
+            // Rule 1 (pre-existing): the exact same (repo, issue, skill) tuple
+            // already appears in the lineage. Checked first and unchanged, so
+            // the mika-dev-only case behaves exactly as it did.
+            if proposed_skill == Some(ancestor_skill.as_str())
+                && proposed_repo == Some(ancestor_repo.as_str())
+                && proposed_issue == Some(ancestor_issue)
+            {
+                return Err(format!(
+                    "Cycle detected: ancestor task {} has same dispatch tuple \
+                     ({}, #{}, skill={}). Refusing to enqueue.",
+                    task.id, ancestor_repo, ancestor_issue, ancestor_skill
+                ));
+            }
+
+            // Rule 2 (mika#1948) — SOURCE ESCALATION, regardless of skill.
+            //
+            // A mika-manager dispatch on (repo, issue) that re-enters
+            // mika-manager on the SAME (repo, issue) further down its own
+            // lineage is the deadlock shape Porte 2 exists to prevent: the
+            // manager would be queueing behind work it started itself, and the
+            // exact-tuple rule above misses it because the skill differs
+            // (dev-pilot → callback → dev-groom).
+            //
+            // Deliberately narrow. It fires only when BOTH sides are explicitly
+            // `mika_manager`, so:
+            //   - NULL on either side (pre-v51 rows) is a no-op — the check
+            //     degrades cleanly to Rule 1, which is the whole
+            //     backward-compatibility contract;
+            //   - mika-dev and operator lineages are untouched. Widening this to
+            //     "any matching source" would refuse the ordinary
+            //     dev-pilot → dev-groom chain, which is legitimate work.
+            let both_manager = proposed_source.as_deref() == Some("mika_manager")
+                && ancestor_source.as_deref() == Some("mika_manager");
+            if both_manager
+                && proposed_repo == Some(ancestor_repo.as_str())
+                && proposed_issue == Some(ancestor_issue)
+            {
+                return Err(format!(
+                    "Cycle detected: ancestor task {} is a mika_manager dispatch on \
+                     the same target ({}, #{}), and this dispatch is also \
+                     mika_manager (skill={} → {}). A manager re-entering its own \
+                     lineage on one ticket would queue behind itself. \
+                     Refusing to enqueue.",
+                    task.id,
+                    ancestor_repo,
+                    ancestor_issue,
+                    ancestor_skill,
+                    proposed_skill.unwrap_or("<unknown>")
+                ));
+            }
         }
 
         // Walk up
@@ -2069,6 +2267,17 @@ fn parse_repo_issue(prompt: Option<&str>) -> (Option<&str>, Option<i64>) {
         }
     }
     (None, None)
+}
+
+/// `(repo, issue, skill, dispatcher_source)` for one task (mika#1948).
+///
+/// Wraps [`extract_dispatch_tuple`] to also report which dispatcher initiated
+/// the task, so the cycle check can reason about a source escalation and not
+/// only an exact tuple repeat.
+fn extract_dispatch_tuple_with_source(
+    task: &crate::db::Task,
+) -> Option<(String, i64, String, Option<String>)> {
+    extract_dispatch_tuple(task).map(|(r, i, s)| (r, i, s, task.dispatcher_source.clone()))
 }
 
 /// Extract `(repo, issue_number, skill)` tuple from a task's metadata/action_config.
@@ -4974,7 +5183,8 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_some());
-        let (parent_id, found_callback_id, _label) = result.unwrap();
+        let blocking = result.unwrap();
+        let (parent_id, found_callback_id) = (blocking.parent_task_id, blocking.callback_task_id);
         assert_eq!(parent_id, wi);
         assert_eq!(found_callback_id, callback_id);
     }
@@ -5057,7 +5267,8 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_some(), "same-class dispatch should be blocked");
-        let (parent_id, found_id, _label) = result.unwrap();
+        let blocking = result.unwrap();
+        let (parent_id, found_id) = (blocking.parent_task_id, blocking.callback_task_id);
         assert_eq!(parent_id, wi1);
         assert_eq!(found_id, callback_id);
     }
@@ -5201,11 +5412,14 @@ mod tests {
             .has_active_callback_tasks_excluding(&parent_a, "implement")
             .await
             .unwrap();
-        let (blocking_parent, blocking_callback, _label) = result.expect(
+        let blocking = result.expect(
             "real pending callback MUST still block — only :deferred wrappers are excluded",
         );
-        assert_eq!(blocking_parent, parent_c, "real dispatch is the blocker");
-        assert_eq!(blocking_callback, real_c);
+        assert_eq!(
+            blocking.parent_task_id, parent_c,
+            "real dispatch is the blocker"
+        );
+        assert_eq!(blocking.callback_task_id, real_c);
     }
 
     /// mika#1163 — Pre-v34 NULL dispatch_class deferred wrapper must also be
@@ -5310,6 +5524,192 @@ mod tests {
             db.update_manual_task_status(&id, status).await.unwrap();
         }
         id
+    }
+
+    // -- mika#1948: the exec-slot claim at the real dispatch boundary --
+
+    /// The load-bearing test for this ticket. Two dispatchers validate the same
+    /// class; exactly ONE may leave holding the slot.
+    ///
+    /// Before this change both calls returned `Ok` — the per-class guard is a
+    /// bare SELECT and neither task had yet created the callback row that would
+    /// have made the slot look busy to the other. That is the 2026-08-30 shape:
+    /// two writers, one branch.
+    #[tokio::test]
+    async fn test_second_dispatcher_cannot_also_claim_the_slot() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let first = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        let second = create_task_with_ref_url(&async_db, "in_progress", None).await;
+
+        let a =
+            validate_dispatch_readiness(&async_db, &first, Some("fake-token"), None, None).await;
+        assert!(a.is_ok(), "the first dispatcher must be allowed: {a:?}");
+
+        let b =
+            validate_dispatch_readiness(&async_db, &second, Some("fake-token"), None, None).await;
+        let err = b.expect_err(
+            "the second dispatcher must be refused — a slot two claimants can \
+             both believe they hold is not arbitration",
+        );
+        let v: serde_json::Value = serde_json::from_str(&err).unwrap();
+        assert_eq!(
+            v["error"], "dispatch_slot_contended",
+            "the refusal must name slot contention, not a generic failure: {err}"
+        );
+        assert_eq!(
+            v["holder_task_id"], first,
+            "the refusal must name WHO holds the slot"
+        );
+    }
+
+    /// Anti-vacuity twin. A guard that refused every second dispatch would
+    /// satisfy the test above; this pins that the OTHER class is still free, so
+    /// the per-class slot split (mika#1001) survives the new claim.
+    #[tokio::test]
+    async fn test_slot_claim_leaves_the_other_class_dispatchable() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let implementer = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        let groomer = create_task_with_ref_url(&async_db, "in_progress", None).await;
+
+        let a =
+            validate_dispatch_readiness(&async_db, &implementer, Some("fake-token"), None, None)
+                .await;
+        assert!(a.is_ok(), "implement dispatch must be allowed: {a:?}");
+
+        // `dev-groom` derives the `groom` class, which is a different slot.
+        let groom_input = serde_json::json!({ "skill": "dev-groom" });
+        let b = validate_dispatch_readiness(
+            &async_db,
+            &groomer,
+            Some("fake-token"),
+            Some(&groom_input),
+            None,
+        )
+        .await;
+        assert!(
+            b.is_ok(),
+            "the groom slot is independent — claiming implement must not close \
+             it, or the mika#1001 split is undone: {b:?}"
+        );
+    }
+
+    /// A dispatcher re-validating its own task must not be refused by its own
+    /// lease. Without re-entrancy, any retry after a transient failure would be
+    /// permanently locked out by the claim it made itself.
+    #[tokio::test]
+    async fn test_same_task_revalidating_is_not_blocked_by_its_own_lease() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi = create_task_with_ref_url(&async_db, "in_progress", None).await;
+
+        let a = validate_dispatch_readiness(&async_db, &wi, Some("fake-token"), None, None).await;
+        assert!(a.is_ok(), "first validation: {a:?}");
+        let b = validate_dispatch_readiness(&async_db, &wi, Some("fake-token"), None, None).await;
+        assert!(
+            b.is_ok(),
+            "a task must be able to re-validate against the lease it holds: {b:?}"
+        );
+    }
+
+    /// AC2 — when a REAL active callback holds the class, the rejection names
+    /// which dispatcher owns it. The per-class guard fires before the lease, so
+    /// this exercises the `global_dispatch_active` payload specifically.
+    #[tokio::test]
+    async fn test_global_dispatch_rejection_names_blocking_dispatcher_source() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let blocker = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        async_db
+            .set_task_dispatcher_source(&blocker, "operator")
+            .await
+            .unwrap();
+        let mut cb = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(blocker.clone()),
+            depth: 1,
+            label: "long_running:run_claude_pilot".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        cb.dispatch_class = Some("implement".to_string());
+        async_db.create_task(cb).await.unwrap();
+
+        let contender = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        let err =
+            validate_dispatch_readiness(&async_db, &contender, Some("fake-token"), None, None)
+                .await
+                .expect_err("an active callback in the class must block");
+        let v: serde_json::Value = serde_json::from_str(&err).unwrap();
+        assert_eq!(v["error"], "global_dispatch_active");
+        assert_eq!(
+            v["blocking_dispatcher_source"], "operator",
+            "the rejection must name which dispatcher holds the slot: {err}"
+        );
+    }
+
+    /// And a pre-v51 blocker must report JSON `null`, not a fabricated
+    /// "mika_dev". A consumer must be able to tell "unknown" from "observed".
+    #[tokio::test]
+    async fn test_global_dispatch_rejection_reports_null_source_as_null() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let blocker = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        let cb = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(blocker.clone()),
+            depth: 1,
+            label: "long_running:run_claude_pilot".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        async_db.create_task(cb).await.unwrap();
+
+        let contender = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        let err =
+            validate_dispatch_readiness(&async_db, &contender, Some("fake-token"), None, None)
+                .await
+                .expect_err("an active callback in the class must block");
+        let v: serde_json::Value = serde_json::from_str(&err).unwrap();
+        assert!(
+            v["blocking_dispatcher_source"].is_null(),
+            "an unset source must stay null, never be defaulted: {err}"
+        );
     }
 
     #[tokio::test]
@@ -6090,6 +6490,7 @@ mod tests {
             metadata: None,
             r#type: "issue".to_string(),
             dispatch_class: Some("groom".to_string()),
+            dispatcher_source: None,
         };
 
         let result = extract_dispatch_tuple(&task);
@@ -6098,6 +6499,201 @@ mod tests {
         assert_eq!(repo, "mika");
         assert_eq!(issue, 159);
         assert_eq!(skill, "dev-groom");
+    }
+
+    // -- dispatcher-source axis on the cycle check (mika#1948 AC4) --
+
+    /// Build a lineage of two tasks on the same `(repo, issue)` but DIFFERENT
+    /// skills, with the given dispatcher sources. Returns the child id, which
+    /// is what a proposed dispatch would hang off.
+    async fn seed_source_lineage(
+        async_db: &crate::async_db::AsyncDatabase,
+        ancestor_skill: &str,
+        ancestor_source: Option<&str>,
+        child_source: Option<&str>,
+    ) -> String {
+        let ancestor = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "long_running:run_claude_pilot".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: serde_json::json!({
+                "trigger_kind": "deferred_dispatch",
+                "original_call": { "skill": ancestor_skill, "prompt": "mika#159" }
+            })
+            .to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: Some("deferred_dispatch".to_string()),
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let ancestor_id = async_db.create_task(ancestor).await.unwrap();
+        if let Some(src) = ancestor_source {
+            async_db
+                .set_task_dispatcher_source(&ancestor_id, src)
+                .await
+                .unwrap();
+        }
+
+        let child = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(ancestor_id.clone()),
+            depth: 1,
+            label: "callback".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let child_id = async_db.create_task(child).await.unwrap();
+        if let Some(src) = child_source {
+            async_db
+                .set_task_dispatcher_source(&child_id, src)
+                .await
+                .unwrap();
+        }
+        child_id
+    }
+
+    async fn cycle_test_db() -> crate::async_db::AsyncDatabase {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        db.create_session("test-session", "mika", "cli").unwrap();
+        crate::async_db::AsyncDatabase::new(db)
+    }
+
+    /// AC4 — a manager re-entering its own lineage on the same ticket is
+    /// refused even though the skill differs, which is exactly what the
+    /// exact-tuple rule cannot see.
+    #[tokio::test]
+    async fn test_check_lineage_cycle_rejects_mika_manager_source_escalation() {
+        let async_db = cycle_test_db().await;
+        let child_id = seed_source_lineage(
+            &async_db,
+            "dev-pilot",
+            Some("mika_manager"),
+            Some("mika_manager"),
+        )
+        .await;
+
+        // Different skill, same (repo, issue) — Rule 1 does not fire.
+        let proposed = serde_json::json!({ "skill": "dev-groom", "prompt": "mika#159" });
+        let result = check_lineage_cycle(&async_db, &child_id, &proposed).await;
+        assert!(
+            result.is_err(),
+            "a mika_manager dispatch re-entering a mika_manager lineage on the \
+             same ticket must be refused"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("mika_manager"),
+            "the refusal must name the source escalation — got: {err}"
+        );
+    }
+
+    /// AC4 fail-open — pre-v51 rows carry NULL on both sides. The new rule must
+    /// be a no-op there, degrading cleanly to the pre-existing exact-tuple
+    /// behaviour. This is the backward-compatibility contract.
+    #[tokio::test]
+    async fn test_check_lineage_cycle_null_dispatcher_source_fail_open() {
+        let async_db = cycle_test_db().await;
+        let child_id = seed_source_lineage(&async_db, "dev-pilot", None, None).await;
+
+        let proposed = serde_json::json!({ "skill": "dev-groom", "prompt": "mika#159" });
+        let result = check_lineage_cycle(&async_db, &child_id, &proposed).await;
+        assert!(
+            result.is_ok(),
+            "NULL sources on both sides must not trip the new rule — a pre-v51 \
+             dev-pilot → dev-groom chain is legitimate work"
+        );
+    }
+
+    /// The rule is narrow on purpose: it must NOT fire for the autonomous loop.
+    /// Widening it to "any matching source" would refuse the ordinary
+    /// dev-pilot → dev-groom chain that the loop runs constantly.
+    #[tokio::test]
+    async fn test_check_lineage_cycle_does_not_fire_for_mika_dev_lineage() {
+        let async_db = cycle_test_db().await;
+        let child_id =
+            seed_source_lineage(&async_db, "dev-pilot", Some("mika_dev"), Some("mika_dev")).await;
+
+        let proposed = serde_json::json!({ "skill": "dev-groom", "prompt": "mika#159" });
+        let result = check_lineage_cycle(&async_db, &child_id, &proposed).await;
+        assert!(
+            result.is_ok(),
+            "a mika_dev dev-pilot → dev-groom chain is the loop's normal shape \
+             and must not be refused"
+        );
+    }
+
+    /// Mixed sources must not trip either — only a manager re-entering its own
+    /// lineage is the deadlock shape.
+    #[tokio::test]
+    async fn test_check_lineage_cycle_does_not_fire_on_mixed_sources() {
+        let async_db = cycle_test_db().await;
+        let child_id = seed_source_lineage(
+            &async_db,
+            "dev-pilot",
+            Some("mika_dev"),
+            Some("mika_manager"),
+        )
+        .await;
+
+        let proposed = serde_json::json!({ "skill": "dev-groom", "prompt": "mika#159" });
+        let result = check_lineage_cycle(&async_db, &child_id, &proposed).await;
+        assert!(
+            result.is_ok(),
+            "a manager dispatch following a mika_dev ancestor is an escalation \
+             the loop is allowed to make"
+        );
+    }
+
+    /// Source escalation is target-scoped: a manager lineage on a DIFFERENT
+    /// ticket must not block.
+    #[tokio::test]
+    async fn test_check_lineage_cycle_source_rule_is_target_scoped() {
+        let async_db = cycle_test_db().await;
+        let child_id = seed_source_lineage(
+            &async_db,
+            "dev-pilot",
+            Some("mika_manager"),
+            Some("mika_manager"),
+        )
+        .await;
+
+        // Same sources, different issue.
+        let proposed = serde_json::json!({ "skill": "dev-groom", "prompt": "mika#777" });
+        let result = check_lineage_cycle(&async_db, &child_id, &proposed).await;
+        assert!(
+            result.is_ok(),
+            "the manager may dispatch a different ticket within the same lineage"
+        );
     }
 
     #[tokio::test]

@@ -111,7 +111,9 @@ Each finding has three sub-fields:
 
 Persisting findings to memory (`store_fact` / `update_core_memory`) is encouraged as defense-in-depth, but the in-band emission is the contract the downstream operator depends on.
 
-**On GROOMED, the F-list is NOT required** — the message may stay short since no iteration is needed.
+**On GROOMED, the F-list is NOT required** — a plan with all findings resolved owes no new
+findings. It owes an attestation instead: see the Review-Anchor Attestation Contract below. A short
+acknowledgement is NOT an acceptable GROOMED.
 
 #### Verdict: ESCALATE example (F-list required)
 
@@ -131,6 +133,30 @@ All prior findings resolved. The plan is ready for implementation.
 
 Verdict: GROOMED
 ```
+
+### Review-Anchor Attestation Contract
+
+**A verdict keyword is not an attestation (mika#2037).** On a NON-terminal verdict — `Verdict: GROOMED` — the
+final assistant message MUST carry at least **3 anchor lines**, each starting with `A1:`, `A2:`, …
+up through `A10:`, and each quoting **at least 40 characters of the brief you reviewed, verbatim**,
+from a **different part of it**.
+
+The engine enforces this via the `required_review_anchor_prefixes` post-condition guard, and it is
+**fail-closed**: unlike the F-list guard, a second failure does not get accepted. The verdict is
+stripped from your response and replaced with `Disposition-Withheld: REVIEW-ANCHOR-MISSING`, and the
+downstream consumer treats that as no verdict at all.
+
+What does NOT satisfy the contract:
+- Paraphrasing the brief. The quoted span must appear in it exactly.
+- Quoting the same sentence three times. The anchors must land on distinct regions.
+- Anchors placed after the `Verdict: GROOMED` line. Only the message body counts.
+
+**Why this exists.** On 2026-08-29 a 302-byte acknowledgement carrying `Disposition: READY` was
+returned on a 10 492-byte brief with four numbered questions, none of them addressed. The keyword is
+what advances the chain and commits the plan as architect-validated, so an empty one forges a signed
+review. The anchors are the thing only an actual reading of the brief can produce.
+
+**If you cannot produce the anchors, do not emit a verdict.** Read the brief and answer.
 
 ### Constraints
 
