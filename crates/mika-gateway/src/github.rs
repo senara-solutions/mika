@@ -14,7 +14,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use bytes::Bytes;
 use hmac::{Hmac, Mac};
-use rand::Rng;
+use rand::RngExt;
 use secrecy::ExposeSecret;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
