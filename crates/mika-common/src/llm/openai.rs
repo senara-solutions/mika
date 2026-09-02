@@ -32,6 +32,16 @@ struct OpenAiMessage {
     tool_calls: Option<Vec<OpenAiToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+    /// Chain-of-thought text returned by reasoning-mode models on
+    /// OpenAI-compatible APIs (e.g. Z.AI GLM-5.2) in a dedicated
+    /// `message.reasoning_content` field, distinct from `message.content`.
+    ///
+    /// Response-only field on a struct shared with request serialization:
+    /// `#[serde(default)]` tolerates its absence on every provider that never
+    /// emits it, and `skip_serializing_if = "Option::is_none"` guarantees it is
+    /// never sent back in an outbound request (it is not a valid request field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
 }
 
 /// OpenAI content can be a plain string or an array of content parts.
@@ -563,6 +573,7 @@ fn to_openai_request(req: &LlmRequest) -> OpenAiRequest {
             content: Some(OpenAiContent::Text(system.clone())),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         });
     }
 
@@ -605,6 +616,7 @@ fn to_openai_messages(msg: &LlmMessage) -> Vec<OpenAiMessage> {
                 content: Some(to_openai_content(&msg.content)),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             }]
         }
         LlmRole::Assistant => {
@@ -655,6 +667,7 @@ fn to_openai_messages(msg: &LlmMessage) -> Vec<OpenAiMessage> {
                         content,
                         tool_calls,
                         tool_call_id: None,
+                        reasoning_content: None,
                     }]
                 }
                 LlmContent::Text(t) => {
@@ -663,6 +676,7 @@ fn to_openai_messages(msg: &LlmMessage) -> Vec<OpenAiMessage> {
                         content: Some(OpenAiContent::Text(t.clone())),
                         tool_calls: None,
                         tool_call_id: None,
+                        reasoning_content: None,
                     }]
                 }
             }
@@ -700,6 +714,7 @@ fn to_openai_messages(msg: &LlmMessage) -> Vec<OpenAiMessage> {
                                 content: Some(OpenAiContent::Text(text)),
                                 tool_calls: None,
                                 tool_call_id: Some(tool_call_id.clone()),
+                                reasoning_content: None,
                             })
                         }
                         _ => None,
@@ -711,6 +726,7 @@ fn to_openai_messages(msg: &LlmMessage) -> Vec<OpenAiMessage> {
                         content: Some(OpenAiContent::Text(t.clone())),
                         tool_calls: None,
                         tool_call_id: None,
+                        reasoning_content: None,
                     }]
                 }
             }
@@ -857,16 +873,34 @@ fn from_openai_response(resp: OpenAiResponse) -> Result<LlmResponse, LlmError> {
         }
     });
 
-    // Extract <think>…</think> blocks as reasoning (e.g. MiniMax, DeepSeek).
-    let mut reasoning: Option<String> = None;
-    for item in &mut content {
-        if let LlmResponseContent::Text(text) = item
-            && let Some((think_text, stripped)) = extract_think_block(text)
-        {
-            reasoning = Some(think_text);
-            *text = stripped;
+    // Determine reasoning text. The dedicated `reasoning_content` field
+    // (reasoning-mode models on OpenAI-compatible APIs, e.g. Z.AI GLM-5.2) is
+    // authoritative when present; a whitespace-only value is treated as absent
+    // (matching how `extract_think_block` rejects an empty think body). When it
+    // is absent, fall back to `<think>…</think>` extraction from the content
+    // text (DeepSeek-R1, MiniMax) — preserving the prior behaviour byte-for-byte.
+    let reasoning_content = choice
+        .message
+        .reasoning_content
+        .filter(|s| !s.trim().is_empty());
+
+    let reasoning = if let Some(reasoning_content) = reasoning_content {
+        // Structured field wins and short-circuits `<think>` stripping, so a
+        // provider that somehow emits both channels cannot double-capture.
+        Some(reasoning_content)
+    } else {
+        // Fallback: extract <think>…</think> blocks as reasoning.
+        let mut think_reasoning: Option<String> = None;
+        for item in &mut content {
+            if let LlmResponseContent::Text(text) = item
+                && let Some((think_text, stripped)) = extract_think_block(text)
+            {
+                think_reasoning = Some(think_text);
+                *text = stripped;
+            }
         }
-    }
+        think_reasoning
+    };
     // Remove empty text entries left after stripping
     content.retain(|c| !matches!(c, LlmResponseContent::Text(t) if t.is_empty()));
 
@@ -1176,6 +1210,7 @@ mod tests {
                     content: Some(OpenAiContent::Text("Hello!".into())),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
                 finish_reason: Some("stop".into()),
             }],
@@ -1210,6 +1245,7 @@ mod tests {
                         },
                     }]),
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
                 finish_reason: Some("tool_calls".into()),
             }],
@@ -1251,6 +1287,7 @@ mod tests {
                         },
                     }]),
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
                 finish_reason: Some("tool_calls".into()),
             }],
@@ -1295,6 +1332,7 @@ mod tests {
                         content: Some(OpenAiContent::Text("hi".into())),
                         tool_calls: None,
                         tool_call_id: None,
+                        reasoning_content: None,
                     },
                     finish_reason: input.map(String::from),
                 }],
@@ -1314,6 +1352,7 @@ mod tests {
                 content: Some(OpenAiContent::Text("Hello".into())),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             }],
             tools: None,
             max_tokens: 4096,
@@ -1363,6 +1402,7 @@ mod tests {
                     )),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
                 finish_reason: Some("stop".into()),
             }],
@@ -1387,6 +1427,7 @@ mod tests {
                     content: Some(OpenAiContent::Text("Hello!".into())),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
                 finish_reason: Some("stop".into()),
             }],
@@ -1541,6 +1582,7 @@ mod tests {
                     )),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
                 finish_reason: Some("stop".into()),
             }],
@@ -1575,6 +1617,7 @@ mod tests {
                         },
                     }]),
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
                 finish_reason: Some("tool_calls".into()),
             }],
@@ -1607,6 +1650,7 @@ mod tests {
                     )),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
                 finish_reason: Some("stop".into()),
             }],
@@ -1628,6 +1672,7 @@ mod tests {
                     content: Some(OpenAiContent::Text("Hello!".into())),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
                 finish_reason: Some("stop".into()),
             }],

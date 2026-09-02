@@ -29,6 +29,11 @@ use super::trace::AgentTrace;
 /// Use `EvalHarness::builder()` to configure, then `.run("message")` to execute.
 pub struct EvalHarness {
     pub db: AsyncDatabase,
+    /// Agent tier threaded into every `AgentParams` (mika#1963). `Default`
+    /// unless `.family_tier()` was called on the builder — the family tier
+    /// routes substrate-unavailable diagnostics to `audit_events` instead of
+    /// the LLM-visible tool content (mika#1783).
+    pub tier: mika_common::home::AgentTier,
     /// The LLM provider used for the agent run (mock or real).
     pub llm: Arc<dyn LlmProvider>,
     /// The mock provider, if one was created. `None` when using a real provider.
@@ -77,7 +82,7 @@ impl EvalHarness {
     /// Run the agent loop with a user message and return the execution trace.
     pub async fn run(&self, message: &str) -> Result<AgentTrace> {
         let params = AgentParams {
-            tier: mika_common::home::AgentTier::Default,
+            tier: self.tier,
             db: &self.db,
             llm: self.llm.as_ref(),
             tools: &self.tools,
@@ -128,7 +133,7 @@ impl EvalHarness {
     /// `deadline_in_flight_llm_call` eval scenario for the canonical pattern.
     pub async fn run_with_deadline(&self, message: &str, deadline: Instant) -> Result<AgentTrace> {
         let params = AgentParams {
-            tier: mika_common::home::AgentTier::Default,
+            tier: self.tier,
             db: &self.db,
             llm: self.llm.as_ref(),
             tools: &self.tools,
@@ -190,7 +195,7 @@ impl EvalHarness {
         let turn_trace_id = uuid::Uuid::new_v4().as_simple().to_string();
 
         let params = AgentParams {
-            tier: mika_common::home::AgentTier::Default,
+            tier: self.tier,
             db: &self.db,
             llm: self.llm.as_ref(),
             tools: &self.tools,
@@ -238,6 +243,7 @@ pub struct EvalHarnessBuilder {
     is_callback_turn: bool,
     skip_compaction: bool,
     internal: bool,
+    family_tier: bool,
     provider_name: Option<String>,
     model_name: Option<String>,
     message_sender: Option<Arc<dyn MessageSender>>,
@@ -262,6 +268,7 @@ impl Default for EvalHarnessBuilder {
             is_callback_turn: false,
             skip_compaction: true, // Default: skip compaction to simplify mock sequences
             internal: false,
+            family_tier: false,
             provider_name: None,
             model_name: None,
             message_sender: None,
@@ -322,6 +329,21 @@ impl EvalHarnessBuilder {
     /// Set internal message tagging. Default: `false`.
     pub fn internal(mut self, v: bool) -> Self {
         self.internal = v;
+        self
+    }
+
+    /// Provision the harness as a **family-tier** agent (mika#1963).
+    ///
+    /// Threads `AgentTier::Family` into every `AgentParams` and writes
+    /// `FAMILY_SOUL` to the agent's `soul.md` so the assembled system prompt
+    /// carries the sealed-being persona. The load-bearing effect for the
+    /// substrate-doctrine scenario (mika#1783) is the tier value: on family
+    /// tier, `dispatch_substrate_diagnostic` routes the operator-shaped
+    /// diagnostic to `audit_events` and the LLM sees only the neutral
+    /// fallback — on default tier the diagnostic is folded into the tool
+    /// content. Default: `false` (operator tier).
+    pub fn family_tier(mut self) -> Self {
+        self.family_tier = true;
         self
     }
 
@@ -401,8 +423,20 @@ impl EvalHarnessBuilder {
         let agent_dir = home_dir.path();
         std::fs::create_dir_all(agent_dir.join("skills"))?;
         std::fs::create_dir_all(agent_dir.join("data"))?;
-        // Write empty soul.md so load_agent_context doesn't fail
-        std::fs::write(agent_dir.join("soul.md"), "")?;
+        // Resolve the tier and write the matching soul.md. Family-tier runs get
+        // the real FAMILY_SOUL persona (mika#1963); default-tier runs keep the
+        // empty soul.md that only exists so load_agent_context doesn't fail.
+        let tier = if self.family_tier {
+            mika_common::home::AgentTier::Family
+        } else {
+            mika_common::home::AgentTier::Default
+        };
+        let soul_contents = if self.family_tier {
+            mika_common::home::FAMILY_SOUL
+        } else {
+            ""
+        };
+        std::fs::write(agent_dir.join("soul.md"), soul_contents)?;
 
         // Create in-memory DB with session
         let session_id = self
@@ -434,6 +468,7 @@ impl EvalHarnessBuilder {
 
         Ok(EvalHarness {
             db: async_db,
+            tier,
             llm,
             mock_provider,
             tools: self.tools.unwrap_or_else(default_tools),

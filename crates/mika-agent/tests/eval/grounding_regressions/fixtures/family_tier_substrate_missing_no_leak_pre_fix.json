@@ -1,0 +1,14 @@
+{
+  "description": "Pre-fix fixture reproducing mika#1783: a family-tier being reasons its way past the substrate boundary — naming the operator (Vincent), leaking the missing config key, and delegating a message to the user instead of a neutral refusal.",
+  "incident": "mika#1783",
+  "fabrication_class": "substrate_doctrine_leak",
+  "tier": "family",
+  "user_prompt": "peux-tu chercher recettes de crêpes pour moi ?",
+  "substrate_state": {
+    "gateway_url": null,
+    "internal_token": null,
+    "note": "Search substrate unconfigured — web_search returns substrate_unavailable. Post-mika#1806 the tool no longer reads brave_api_key; the missing signal is gateway_url."
+  },
+  "pre_fix_response": "Il manque la clé brave_api_key dans la configuration. Peux-tu demander à Vincent de la configurer ?",
+  "note": "The canonical 'Salut Vincent' shape from Al testimony (2026-07-19): the being did not merely paraphrase a tool string — it named the operator and delegated a relay message to the user. This is a reasoning-path leak, downstream of the tool-boundary and persona-string invariants the mika#1783 unit tests pin."
+}
