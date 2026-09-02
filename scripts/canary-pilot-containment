@@ -26,6 +26,8 @@
 #   * bwrap shape shown by `ps` matches the documented shape
 #   * every must-fail line is "ok:" (no LEAK)
 #   * every must-work line succeeds (gh, node, cargo, rustc, python3, git)
+#   * every git repository line is "ok:" — `git --version` alone is NOT a
+#     git check; it was this suite's only one while mika#2141 was open
 #   * env_ok + proc_ok
 #   * curl exfil returns 403 (proxy DENY) or blocked_direct
 #   * curl allowlisted returns 200
@@ -255,6 +257,21 @@ _run_pilot_sandboxed sh -c '
 ' || echo "PART 1 exit=$?"
 echo
 
+# mika#2141 negative control. A must-fail probe against a path that does not
+# exist on this host proves nothing, so the control is picked from the live
+# worktree list and its host-side presence is asserted before the sandbox runs.
+CANARY_OTHER_WORKTREE=$(git worktree list --porcelain 2>/dev/null \
+    | awk '/^worktree /{print $2}' \
+    | grep -v -x -F "$WORKTREE_DIR" | head -1)
+if [ -n "$CANARY_OTHER_WORKTREE" ] && [ -d "$CANARY_OTHER_WORKTREE" ]; then
+    echo "negative control (exists host-side): $CANARY_OTHER_WORKTREE"
+else
+    CANARY_OTHER_WORKTREE=""
+    echo "negative control: NONE — only one worktree on this host, the cross-worktree"
+    echo "  probe below will report 'skipped' rather than a vacuous pass."
+fi
+echo
+
 echo "============================================================"
 echo "PART 2 — coherence adversarial hole-hunt (must-fail + must-work)"
 echo "============================================================"
@@ -340,6 +357,93 @@ cargo --version 2>&1 | head -1 || echo "FAIL: cargo missing"
 rustc --version 2>&1 | head -1 || echo "FAIL: rustc missing"
 python3 --version 2>&1 | head -1 || echo "FAIL: python3 missing"
 git --version 2>&1 | head -1 || echo "FAIL: git missing"
+# NOTE: the line above proves a BINARY is present, nothing more. It was this
+# suite'"'"'s only git check from 2026-08-04 to 2026-09-02 and stayed green for a
+# month inside a namespace where no repository operation worked at all
+# (mika#2141). The block below is the check that can actually fail.
+
+echo
+echo "--- must-work: git repository operations (mika#2141) ---"
+# Deliberately non-mutating: this canary runs against the operator'"'"'s live
+# checkout, so it proves write CAPABILITY (a new object, a scratch ref under
+# this branch'"'"'s own directory) without moving HEAD. The full add/commit path
+# runs on a disposable worktree in
+# skills/bundled/_shared/tests/test_sandbox_git_usable.sh.
+if git rev-parse --show-toplevel >/dev/null 2>&1; then
+    echo "ok:   git_rev_parse ($(git rev-parse --show-toplevel))"
+else
+    echo "FAIL: git rev-parse — not a git repository inside the sandbox"
+fi
+git status -sb 2>&1 | head -1 | sed "s/^/ok:   git_status /" || echo "FAIL: git status"
+git log --oneline -1 2>&1 | head -1 | sed "s/^/ok:   git_log /" || echo "FAIL: git log"
+_canary_email=$(git config --get user.email 2>/dev/null)
+if [ -n "$_canary_email" ]; then
+    echo "ok:   git_identity ($_canary_email)"
+else
+    echo "FAIL: git has no user.email — commit would fail (mika#2141)"
+fi
+# The single check that separates "status works" from "the pilot can deliver":
+# the parent remote is SSH and the sandbox has no key, by design.
+_canary_url=$(git ls-remote --get-url origin 2>/dev/null)
+case "$_canary_url" in
+    https://*) echo "ok:   git_remote_https ($_canary_url)" ;;
+    "")        echo "FAIL: no origin remote resolved inside the sandbox" ;;
+    *)         echo "FAIL: origin resolves to $_canary_url — push cannot work without an SSH key" ;;
+esac
+_canary_obj=$(echo "mika2141-canary" | git hash-object -w --stdin 2>/dev/null)
+if [ -n "$_canary_obj" ]; then
+    echo "ok:   git_object_write ($_canary_obj)"
+else
+    echo "FAIL: cannot write to the object store — commit would fail"
+fi
+_canary_head=$(git symbolic-ref --quiet HEAD 2>/dev/null)
+if [ -z "$_canary_head" ]; then
+    echo "ok:   git_ref_write skipped (detached HEAD — no branch ref to update)"
+elif [ -z "$_canary_obj" ]; then
+    echo "FAIL: git_ref_write not attempted (no object to point at)"
+else
+    _canary_ref="$(dirname "$_canary_head")/mika2141-canary-probe"
+    if git update-ref "$_canary_ref" "$(git rev-parse HEAD)" 2>/dev/null; then
+        echo "ok:   git_ref_write ($_canary_ref)"
+        git update-ref -d "$_canary_ref" 2>/dev/null || echo "WARN: could not clean up $_canary_ref"
+    else
+        echo "FAIL: cannot write a ref under this branch'"'"'s directory — commit would fail"
+    fi
+fi
+
+echo
+echo "--- must-fail: git containment still closed (mika#2141 AC2) ---"
+_canary_other="'"'"'"$CANARY_OTHER_WORKTREE"'"'"'"
+if [ -z "$_canary_other" ]; then
+    echo "skip: cross-worktree probe (no second worktree on this host)"
+else
+    if ls "$_canary_other" >/dev/null 2>&1; then
+        echo "LEAK: another worktree is visible at $_canary_other"
+    else
+        echo "ok:   other_worktree_hidden"
+    fi
+    if git -C "$_canary_other" status -sb >/dev/null 2>&1; then
+        echo "LEAK: another worktree is readable through git -C"
+    else
+        echo "ok:   other_worktree_git_blocked"
+    fi
+fi
+_canary_del=$(git update-ref -d refs/heads/main 2>&1)
+if echo "$_canary_del" | grep -qi "not a git repository"; then
+    echo "FAIL: git is not working at all — this probe cannot judge containment"
+elif echo "$_canary_del" | grep -qi "read-only\|cannot lock\|permission denied"; then
+    echo "ok:   unrelated_branch_delete_refused"
+elif git rev-parse --verify --quiet refs/heads/main >/dev/null 2>&1; then
+    echo "ok:   unrelated_branch_delete_refused"
+else
+    echo "LEAK: deleted refs/heads/main from inside the sandbox"
+fi
+if git config --local --add canary.mika2141 1 >/dev/null 2>&1; then
+    echo "LEAK: the parent repo config is writable from the sandbox"
+    git config --local --unset canary.mika2141 >/dev/null 2>&1 || true
+else
+    echo "ok:   parent_config_readonly"
+fi
 
 echo
 echo "--- must-work: worktree R/W + pilot-transcripts R/W ---"

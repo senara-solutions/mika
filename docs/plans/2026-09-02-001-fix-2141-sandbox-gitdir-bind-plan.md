@@ -272,3 +272,65 @@ Consigné après le commit du plan, pour que la lignée reste lisible : le commi
 5. **Ce que `push` exige réellement** n'a pas été mesuré — aucun `push` réel n'a été exécuté. C'est le trou le plus large de la preuve, et c'est précisément l'objet de l'AC5.
 
 Cette classe de défaut (verdict mécaniquement attesté, substantiellement vide) est celle que suit mika#2037 ; cet échange en est une occurrence datée, pas un nouveau ticket.
+
+---
+
+## Arbitrage des cinq questions — par mesure, pendant l'implémentation (2026-09-02)
+
+Le `READY` de l'architecte était mécaniquement attesté et substantiellement mince ; les cinq incertitudes ci-dessus lui étaient donc renvoyées comme décisions de conception. Chacune est tranchée ci-dessous par une commande réellement exécutée dans un `bwrap` réel, sur un worktree lié jetable du dépôt. Deux des cinq ont fait bouger le code.
+
+### Q1 — la surface résiduelle satisfait-elle l'AC2 ? **Oui, telle que l'AC2 est écrite.** Nommée dans l'en-tête.
+
+Mesuré : depuis le bac à sable, `git show main:Cargo.toml` rend le fichier, et `git log --oneline -1 main` rend `15795b66`. La lecture du contenu de toutes les branches est donc bien ouverte, comme le plan l'annonçait.
+
+L'AC2 porte sur « un accès à un **autre** worktree ou à un **autre** dépôt » — un accès *fichier*, et il reste fermé : quatre sondes l'exigent à chaque exécution du test. La lecture par le store d'objets partagé est inhérente à tout partage d'objets, forme B comprise dès que le clone est complet. Retenue, et écrite dans l'en-tête du modèle de menace pour être arbitrée par le prochain lecteur au lieu d'être redécouverte.
+
+### Q2 — la garde « branche sans slash » suppose-t-elle le chemin canonique ? **La supposition est supprimée.**
+
+Le plan dérivait la branche de `$BRANCH`, l'état de l'appelant. L'implémentation la lit dans le `HEAD` du worktree lui-même : la garde tient donc pour la branche réellement extraite, quelle que soit la façon dont le worktree a été créé. Un `HEAD` détaché n'abandonne plus — il n'y a pas de ref de branche à mettre à jour, et le commit fonctionne quand même (le `HEAD` vit dans `worktrees/<name>`, déjà monté rw). Trois assertions du test couvrent le refus.
+
+### Q3 — `refs/remotes` peut-il être resserré ? **Oui. Resserré à `refs/remotes/origin`.**
+
+Mesuré sous la forme resserrée :
+
+```
+origin-writable      : OUI
+autre-remote-writable: NON — cannot lock ref 'refs/remotes/upstream/probe-q':
+                       unable to create directory for …/refs/remotes/upstream/probe-q
+```
+
+Le suivi d'`origin` reste inscriptible, l'espace de nommage de tout autre remote est refusé par le système de fichiers. C'était le seul bind du tableau non minimisé ; il l'est maintenant. Un dépôt dont le remote ne s'appelle pas `origin` échoue bruyamment au `fetch` plutôt que de se voir remettre l'espace entier — tous les chemins de push de cette bibliothèque visent `origin`.
+
+### Q4 — `objects` en ro + `alternates` serait-il strictement meilleur ? **Non. Mesuré nuisible.**
+
+La variante a été construite et exécutée : `objects` en ro, objets neufs redirigés par `GIT_OBJECT_DIRECTORY` vers un répertoire inscriptible du worktree, parent déclaré en `GIT_ALTERNATE_OBJECT_DIRECTORIES`.
+
+```
+in-sandbox HEAD                : 5bdf15f8 probe q4        ← le commit réussit
+côté hôte, git log <branche>   : fatal: bad object …      ← l'objet est introuvable
+côté hôte, git rev-parse       : 5bdf15f8…                ← la ref a bougé
+côté hôte, git cat-file -t     : could not get object info
+```
+
+La ref avance côté hôte vers un objet que le dépôt parent ne possède pas : un **dépôt corrompu, ref pendante comprise**. Ce n'est pas « moins bien », c'est destructeur — et ça casserait précisément l'AC6, la récupération post-vol lisant la branche côté hôte. Le raisonnement du plan était juste ; il est désormais adossé à une mesure. `objects` reste rw.
+
+### Q5 — que `push` exige-t-il réellement ? **Mesuré. Le transport est réparé ; l'authentification est celle déjà conçue.**
+
+```
+git push --dry-run origin HEAD
+→ fatal: could not read Username for 'https://github.com': terminal prompts disabled
+```
+
+Trois faits dans cette seule ligne. Le transport est passé en **https** (il était `git@github.com:` en SSH, sans clé possible dans le bac à sable) : la réécriture d'URL fait son travail. La commande atteint l'étape d'**authentification**, ce qui était inatteignable auparavant. Et elle **échoue vite** au lieu d'attendre sur un terminal absent — `GIT_TERMINAL_PROMPT=0`, exactement la classe de blocage silencieux décrite au § « Pourquoi ça a été si long à voir ».
+
+La sonde tourne en Phase 2a, sans relais d'egress, donc sans l'injection `Authorization: Basic` côté hôte de `mika-pilot-github-auth-addon.py` — c'est le comportement voulu du chemin dégradé, sans jeton et fermé par défaut. Ce que Q5 laissait ouvert est donc réduit à un seul reste : la réussite d'un `push` authentifié en Phase 2b, qui **est** l'AC5 et se vérifie après déploiement.
+
+---
+
+## Trouvaille non prévue par le plan — l'identité committer
+
+`git commit` échouait dans le bac à sable pour une **seconde raison, indépendante du gitdir**. `user.name`/`user.email` ne vivent que dans le `~/.gitconfig` de l'opérateur, que `--tmpfs /home` efface ; ni le `config` du dépôt ni `/etc/gitconfig` ne portent de section `[user]` (vérifié : `git config --show-origin --get user.email` → `file:/home/samidarko/.gitconfig`). Un correctif ne montant que le gitdir aurait réparé `status`, `log` et `add`, puis buté sur `commit` — la troisième instance, dans ce seul ticket, du mode d'échec que M3 et M4 décrivent.
+
+Traitée dans le même mécanisme : `_stage_pilot_gitconfig` écrit un `gitconfig` complet côté hôte à chaque dispatch — réécriture d'URL **et** identité lue sur l'hôte — monté en lecture seule et désigné par `GIT_CONFIG_GLOBAL`, avec `GIT_CONFIG_NOSYSTEM=1`. Écrit de zéro, jamais copié depuis `~/.gitconfig`, donc un credential helper ajouté plus tard chez l'opérateur ne peut pas y dériver (AC3).
+
+Le mécanisme retenu n'est pas celui du plan (`GIT_CONFIG_COUNT`/`KEY_0`/`VALUE_0`) : `GIT_CONFIG_KEY_0` contient `KEY` et serait rejeté par la règle 2 de `scripts/verify-no-secret-in-setenv.sh`. Faire une exemption dans un lint de sécurité pour une raison qui n'en est pas une aurait été le mauvais échange ; un fichier généré et un nom auditable coûtent moins et disent plus.
