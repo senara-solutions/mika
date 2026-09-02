@@ -25,6 +25,21 @@ pub struct AuditEvent {
     pub created_at: String,
 }
 
+/// `tool_name` carried by every auth-boundary audit row (mika#1949 AC2).
+///
+/// One literal, one place. A call site that spelled it by hand would be
+/// invisible to `WHERE tool_name = 'auth_boundary'` on the day it mattered.
+pub const AUTH_BOUNDARY_TOOL_NAME: &str = "auth_boundary";
+
+/// `session_id` carried by auth-boundary rows.
+///
+/// A boundary failure belongs to no conversation — it happens on the wire,
+/// often before any session exists. `audit_events.session_id` is `NOT NULL`
+/// with no foreign key, so a well-known constant is the honest filler: it
+/// says "not session-scoped" instead of borrowing an unrelated session id and
+/// making the row look like it came from a turn.
+pub const AUTH_BOUNDARY_SESSION_ID: &str = "auth-boundary";
+
 impl Database {
     // ===== Audit Events =====
 
@@ -56,6 +71,60 @@ impl Database {
             ],
         )?;
         Ok(())
+    }
+
+    /// Record one cross-boundary authentication failure in the audit ledger
+    /// (mika#1949, Porte 3).
+    ///
+    /// # Row shape
+    ///
+    /// | column | value |
+    /// |---|---|
+    /// | `tool_name` | [`AUTH_BOUNDARY_TOOL_NAME`] — always `auth_boundary` |
+    /// | `session_id` | [`AUTH_BOUNDARY_SESSION_ID`] |
+    /// | `target_key` | `<from>_to_<to>`, from [`AuthBoundaryError::boundary_key`] |
+    /// | `after_value` | the failure kind: `missing`/`empty`/`invalid`/`rejected`/`unreachable` |
+    /// | `reasoning` | JSON `{"token_name","kind","from","to"}` |
+    /// | `before_value` | always `NULL` — there is no prior state to name |
+    ///
+    /// # Why callers ignore the `Result`
+    ///
+    /// This returns `Result` so that a test can assert the write happened, and
+    /// so a caller can log the failure. **No caller may let it change the
+    /// request's outcome** (mika#1949 R5): the authentication verdict is
+    /// already decided by the time this runs, and an audit ledger that could
+    /// turn a refusal into a 500 would be a new failure mode bolted onto an
+    /// observability feature. Call sites log at `warn` and continue —
+    /// `crate::auth_boundary_ledger` is the fire-and-forget wrapper that does
+    /// exactly that.
+    ///
+    /// # No token value, ever
+    ///
+    /// Every field written here comes from [`AuthBoundaryError`], which has no
+    /// field that can hold a secret. See its module docs for the invariant and
+    /// the test that pins it.
+    pub fn record_auth_boundary(
+        &self,
+        agent_id: &str,
+        err: &mika_common::auth_boundary::AuthBoundaryError,
+    ) -> Result<()> {
+        let reasoning = serde_json::json!({
+            "token_name": err.token_name,
+            "kind": err.kind.as_str(),
+            "from": err.from,
+            "to": err.to,
+        })
+        .to_string();
+        self.log_audit_event(
+            agent_id,
+            AUTH_BOUNDARY_SESSION_ID,
+            AUTH_BOUNDARY_TOOL_NAME,
+            &err.boundary_key(),
+            None,
+            Some(err.kind.as_str()),
+            Some(&reasoning),
+            None,
+        )
     }
 
     /// Standard column list for audit event queries.
@@ -230,6 +299,7 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use crate::db::Database;
+    use mika_common::auth_boundary::{AuthBoundaryError, AuthBoundaryKind};
 
     fn db() -> Database {
         Database::open_in_memory().unwrap()
@@ -300,5 +370,66 @@ mod tests {
         // Old events gone, recent one stays
         let recent = db.get_audit_events("mika", "s2").unwrap();
         assert_eq!(recent.len(), 1);
+    }
+
+    #[test]
+    fn auth_boundary_row_carries_the_documented_tool_name_and_target_key() {
+        let db = db();
+        let err = AuthBoundaryError::new(
+            "MIKA_INTERNAL_TOKEN",
+            "gateway",
+            "spirit",
+            AuthBoundaryKind::Rejected,
+        );
+        db.record_auth_boundary("mika", &err).unwrap();
+
+        let events = db
+            .get_audit_events("mika", super::AUTH_BOUNDARY_SESSION_ID)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tool_name, super::AUTH_BOUNDARY_TOOL_NAME);
+        assert_eq!(events[0].target_key, "gateway_to_spirit");
+        assert_eq!(events[0].after_value.as_deref(), Some("rejected"));
+    }
+
+    #[test]
+    fn auth_boundary_reasoning_names_the_token_and_the_outcome() {
+        let db = db();
+        let err = AuthBoundaryError::new("INTERNAL_TOKEN", "cm", "spirit", AuthBoundaryKind::Empty);
+        db.record_auth_boundary("mika", &err).unwrap();
+
+        let events = db
+            .get_audit_events("mika", super::AUTH_BOUNDARY_SESSION_ID)
+            .unwrap();
+        let reasoning = events[0].reasoning.clone().expect("reasoning present");
+        let parsed: serde_json::Value = serde_json::from_str(&reasoning).unwrap();
+        assert_eq!(parsed["token_name"], "INTERNAL_TOKEN");
+        assert_eq!(parsed["kind"], "empty");
+        assert_eq!(parsed["from"], "cm");
+        assert_eq!(parsed["to"], "spirit");
+    }
+
+    /// Negative control for the one invariant of mika#1949: the row names the
+    /// token but can never carry its value. Built with a secret-shaped *name*
+    /// so any extra copy of it in the row would show up as a second match.
+    #[test]
+    fn auth_boundary_row_never_carries_a_token_value() {
+        let db = db();
+        let secret_shaped = "b".repeat(64);
+        let err = AuthBoundaryError::new(
+            secret_shaped.clone(),
+            "manager",
+            "delivery",
+            AuthBoundaryKind::Missing,
+        );
+        db.record_auth_boundary("mika", &err).unwrap();
+
+        let events = db
+            .get_audit_events("mika", super::AUTH_BOUNDARY_SESSION_ID)
+            .unwrap();
+        let row = serde_json::to_string(&events[0]).unwrap();
+        // Exactly one occurrence: the `token_name` slot inside `reasoning`.
+        assert_eq!(row.matches(&secret_shaped).count(), 1, "{row}");
+        assert_eq!(events[0].before_value, None);
     }
 }

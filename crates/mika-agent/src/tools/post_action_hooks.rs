@@ -241,6 +241,7 @@ mod tests {
             ),
             r#type: "issue".to_string(),
             dispatch_class: None,
+            dispatcher_source: None,
         };
 
         let desc = build_completion_fact_description(&task);
@@ -286,6 +287,7 @@ mod tests {
             metadata: None,
             r#type: "issue".to_string(),
             dispatch_class: None,
+            dispatcher_source: None,
         };
 
         let desc = build_completion_fact_description(&task);

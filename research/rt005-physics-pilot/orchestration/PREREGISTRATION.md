@@ -142,3 +142,78 @@ peer_b's realised `perturbed_ids`, not a measurement.
 
 The manip-check produces evidence. It does not decide. The operator decides, and
 records that decision in the authorization's `verdict` field.
+
+## Amendment 1 — 2026-08-31: how question 1 is read
+
+**This is an amendment, and it is labelled as one.** It was written after the
+manipulation check produced data and **before any batch run existed**. That is the
+only window in which an analysis rule may still be fixed without being a rule
+written after the data — and it is the window a manip-check exists to occupy: it
+produces evidence precisely so the operator can decide how, and whether, to spend
+the 80 runs. Folding this into the sections above, as if it had been there since
+2026-08-29, would have been the dishonest form of the same act.
+
+Nothing else in this document changes: not the contrasts, not the dilution, not
+the claim boundary, not the scaling rule.
+
+### The rule
+
+Manipulation-check question 1 — *does the 0.95 / 0.55 injection move the agent's
+behavior?* — is read on **`out_tokens`**, the primary outcome's own scale.
+
+1. **Never on string equality of the outputs.** The `outputs_identical` flag stays
+   recorded on the artifact, and carries **no conclusion** on question 1.
+2. **On the direction within a matched order**, never on raw magnitudes compared
+   across runs of different cache warmth.
+
+### The evidence that forced it
+
+Item `rt005-01`, fiable arm, prompts byte-identical between the two agents:
+
+| order | high | low | cache_read (high / low) |
+|---|---|---|---|
+| original — high cold, low warm | 18 | **69** | 0 / 12288 |
+| inverted — low cold, high warm | 3 | **38** | 12288 / 9920 |
+
+Both agents emitted the same text, `115`. The `outputs_identical` flag therefore
+reads **true** at the fiable arm — and would, read alone, license the conclusion
+that the confidence knob does nothing there. On the primary outcome's own scale
+the low-confidence agent deliberated roughly four times as much and arrived at the
+same answer. **A flag that answers a different question than the one asked is a
+false negative on a gate factor**, which is the one direction a manipulation check
+must not fail in.
+
+The inverted pair separates the knob from the cache. In the inverted order the
+low-confidence agent ran with **less** cache than the high-confidence one (9920 vs
+12288) and still emitted more output tokens. Had the gap been a warmth artifact,
+reversing the warmth would have reversed the gap. It did not.
+
+### Why the seeded random order is a conscious protection
+
+The same two runs show that **magnitude is not robust to warmth while direction
+is**: the ratio is 3.8x in the original order and 12.7x in the inverted one, same
+sign, very different size. The second run of each order — the warmer one — emitted
+less in **both** arms (high 18→3, low 69→38).
+
+A batch executing its cells in a **fixed** order would therefore bias later cells
+systematically downward. This protocol's seeded random ordering already prevents
+that. It is recorded here so the protection is held knowingly rather than by luck,
+and so that a future reader who is tempted to "simplify" the ordering knows what it
+was buying.
+
+### Provenance and hash lineage
+
+Evidence: batch `rt005-manipcheck-20260831`, artifact sha256
+`23fddab14041f9b3ddcefdaeea36ea200cf8c966619aa4db491e0230fd762b95`, design
+fingerprint `28bdf138f1c5c2c1e754879ab766062676a5ceee30771f54226258cb3f7c3474`. The
+inverted pair was run **outside** any batch (sessions `rt005-inv-*`), wrote nothing
+into a batch directory, and changed neither the design nor the fingerprint.
+
+This document's sha256 before this amendment was
+`da8e6432ed1e5c455473d6a7771de4244f723b6081caefb474b7bccb36272a56` — the value
+recorded in the manip-check batch's manifest. The 80-run batch will record the new
+value. The two differing hashes are the lineage, not a discrepancy: any reader
+comparing them lands here.
+
+Amendment settled by the operator (samidarko seat), 2026-08-31, on evidence
+produced and reported the same day. The 80 runs remain behind Vincent's go.

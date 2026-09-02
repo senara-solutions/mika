@@ -23,3 +23,17 @@ required_fetches_for_quoted_resources = true
 [output]
 required_suffix_lines = ["Disposition: READY", "Disposition: ITERATE", "Disposition: ESCALATE"]
 required_finding_list_prefixes = ["F1:", "F2:", "F3:", "F4:", "F5:", "F6:", "F7:", "F8:", "F9:", "F10:"]
+
+# Attestation d'ancrage de revue (mika#2037) — le complément non terminal de
+# required_finding_list_prefixes. Une disposition READY / GROOMED doit porter des
+# lignes d'ancrage citant le brief revu verbatim, à des positions distinctes.
+# Fail-closed : sans attestation valide après re-prompt, la disposition est retirée.
+required_review_anchor_prefixes = ["A1:", "A2:", "A3:", "A4:", "A5:", "A6:", "A7:", "A8:", "A9:", "A10:"]
+review_anchor_min_count = 3
+review_anchor_min_quote_chars = 40
+# Seuil d'armement : en dessous, la garde ne fire pas. Les trois skills arch sont
+# always_on, donc le seul match de skill armerait la garde sur TOUS les tours de
+# mika-arch — questions ad-hoc via /mika-ask-arch, et le re-prompt correctif de la
+# récupération UNPARSED (mika#1823), dont le message utilisateur fait ~480 caractères.
+# Aucun des deux ne peut porter la preuve exigée. Le brief de mika#2037 faisait 10 492.
+review_anchor_min_brief_chars = 2000
