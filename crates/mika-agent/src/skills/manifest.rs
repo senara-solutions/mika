@@ -128,8 +128,13 @@ impl Constraints {
 /// line starting with a declared prefix; enforced only on terminal dispositions
 /// (ITERATE/ESCALATE). See mika#901.
 ///
+/// Skills that need to enforce a *reviewed* non-terminal disposition opt in via
+/// `required_review_anchor_prefixes` plus its two thresholds. The guard is the
+/// complement of `required_finding_list_prefixes`: it fires only on non-terminal
+/// dispositions (READY/GROOMED), the half mika#901 exempts. See mika#2037.
+///
 /// See mika#864 for the verdict-ghosting failure mode this addresses.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Output {
     /// Exhaustive list of literal lines, one of which must appear as one of the
     /// assistant's last 3 non-empty lines (after trimming whitespace) in any turn
@@ -144,6 +149,52 @@ pub struct Output {
     /// See mika#901 for the conditional-disclosure-evasion failure class this addresses.
     #[serde(default)]
     pub required_finding_list_prefixes: Vec<String>,
+
+    /// Closed-alphabet list of review-anchor line prefixes (e.g., `["A1:", ..., "A10:"]`).
+    /// When non-empty AND the assistant's disposition is NON-terminal (READY / Verdict:
+    /// GROOMED), the message body must carry at least `review_anchor_min_count` lines
+    /// starting with one of these prefixes, each quoting the brief verbatim per
+    /// `review_anchor_min_quote_chars`, at non-overlapping brief regions.
+    ///
+    /// This is the complement of `required_finding_list_prefixes`. Together the two
+    /// guards cover the whole disposition space: no disposition leaves the turn without
+    /// evidence of its own class. Empty list = no constraint.
+    ///
+    /// Unlike its siblings, this guard is fail-CLOSED: when the corrective re-prompt
+    /// does not produce an attestation, the disposition line is withheld from the final
+    /// text rather than accepted. See mika#2037 for the forged-attestation failure class.
+    #[serde(default)]
+    pub required_review_anchor_prefixes: Vec<String>,
+
+    /// Minimum number of valid anchor lines required to satisfy the review-anchor
+    /// contract. Only read when `required_review_anchor_prefixes` is non-empty.
+    ///
+    /// A single anchor is crossable by copying one line of the brief; the bite comes
+    /// from dispersion across the reviewed document, not from volume. See mika#2037.
+    #[serde(default = "default_review_anchor_min_count")]
+    pub review_anchor_min_count: usize,
+
+    /// Minimum length, in characters, of the verbatim brief quote each anchor line must
+    /// carry. Only read when `required_review_anchor_prefixes` is non-empty.
+    ///
+    /// Validation rejects a value below `MIN_REVIEW_ANCHOR_QUOTE_CHARS_FLOOR`: a short
+    /// threshold is satisfiable by any common word of the brief, which neutralizes the
+    /// guard without visibly disabling it. See mika#2037.
+    #[serde(default = "default_review_anchor_min_quote_chars")]
+    pub review_anchor_min_quote_chars: usize,
+
+    /// Minimum brief length, in characters, below which the review-anchor guard does not fire.
+    /// Only read when `required_review_anchor_prefixes` is non-empty.
+    ///
+    /// The guard's arming condition cannot be skill-match alone. The three mika-arch skills are
+    /// `always_on`, so the contract is collected on EVERY turn of that agent — including an
+    /// ad-hoc `mika ask --agent mika-arch "<short question>"`, and including the mika#1823
+    /// UNPARSED-recovery re-ask, whose user message is a ~480-character corrective prompt
+    /// rather than the plan. In both, no answer can carry three non-overlapping 40-character
+    /// quotes, because the brief does not contain them. Demanding proof that cannot exist is
+    /// the false-positive direction the guard is explicitly forbidden to take. See mika#2037.
+    #[serde(default = "default_review_anchor_min_brief_chars")]
+    pub review_anchor_min_brief_chars: usize,
 
     /// Per-tool argument-level required suffixes (mika#899). Skills opt in via
     /// `[[output.required_tool_arg_suffixes]]` entries in `skill.toml`. Each entry
@@ -179,11 +230,59 @@ pub struct RequiredToolArgSuffix {
     pub required_lines: Vec<String>,
 }
 
+/// Default anchor count when `[output]` declares the prefixes but not the threshold.
+///
+/// Three, not one: a single anchor is satisfiable by copying one line of the brief,
+/// while three quotes at non-overlapping positions of a multi-kilobyte brief are not a
+/// by-product of an acknowledgement. Measured in
+/// `agent_loop::tests::review_anchor_matrix`. See mika#2037 KTD2.
+fn default_review_anchor_min_count() -> usize {
+    3
+}
+
+/// Default verbatim-quote length when `[output]` declares the prefixes but not the
+/// threshold. See mika#2037 KTD2.
+fn default_review_anchor_min_quote_chars() -> usize {
+    40
+}
+
+/// Default minimum brief length that arms the guard.
+///
+/// Measured against the three shapes that reach a verdict-producer's turn: the mika#2037
+/// grooming brief was 10 492 bytes; the mika#1823 corrective re-ask prompt is ~480; an ad-hoc
+/// question to mika-arch is typically under 500. 2000 sits well above the two that must not
+/// arm the guard and far below the one that must. See mika#2037.
+fn default_review_anchor_min_brief_chars() -> usize {
+    2000
+}
+
+/// Floor below which `review_anchor_min_quote_chars` is rejected at manifest validation.
+///
+/// A threshold of a few characters is satisfied by any common word of the brief, which
+/// neutralizes the guard while leaving it declared — the failure mode this floor exists
+/// to make loud. See mika#2037 R11.
+pub const MIN_REVIEW_ANCHOR_QUOTE_CHARS_FLOOR: usize = 16;
+
+impl Default for Output {
+    fn default() -> Self {
+        Self {
+            required_suffix_lines: Vec::new(),
+            required_finding_list_prefixes: Vec::new(),
+            required_review_anchor_prefixes: Vec::new(),
+            review_anchor_min_count: default_review_anchor_min_count(),
+            review_anchor_min_quote_chars: default_review_anchor_min_quote_chars(),
+            review_anchor_min_brief_chars: default_review_anchor_min_brief_chars(),
+            required_tool_arg_suffixes: Vec::new(),
+        }
+    }
+}
+
 impl Output {
     /// Returns `true` if no output constraints are configured.
     pub fn is_empty(&self) -> bool {
         self.required_suffix_lines.is_empty()
             && self.required_finding_list_prefixes.is_empty()
+            && self.required_review_anchor_prefixes.is_empty()
             && self.required_tool_arg_suffixes.is_empty()
     }
 }
@@ -989,6 +1088,105 @@ mod tests {
         "#;
         let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
         assert!(manifest.output.required_finding_list_prefixes.is_empty());
+    }
+
+    // -- [output] review-anchor contract tests (mika#2037) --
+
+    #[test]
+    fn test_parse_output_review_anchor_contract() {
+        let toml_str = r#"
+            [skill]
+            name = "arch-groom-ticket"
+            description = "First-pass plan review"
+
+            [output]
+            required_suffix_lines = ["Disposition: READY", "Disposition: ITERATE", "Disposition: ESCALATE"]
+            required_review_anchor_prefixes = ["A1:", "A2:", "A3:", "A4:", "A5:"]
+            review_anchor_min_count = 3
+            review_anchor_min_quote_chars = 40
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert!(!manifest.output.is_empty());
+        assert_eq!(manifest.output.required_review_anchor_prefixes.len(), 5);
+        assert_eq!(manifest.output.required_review_anchor_prefixes[0], "A1:");
+        assert_eq!(manifest.output.review_anchor_min_count, 3);
+        assert_eq!(manifest.output.review_anchor_min_quote_chars, 40);
+    }
+
+    #[test]
+    fn test_review_anchor_thresholds_fall_back_to_defaults() {
+        let toml_str = r#"
+            [skill]
+            name = "arch-groom-ticket"
+            description = "Prefixes declared, thresholds omitted"
+
+            [output]
+            required_review_anchor_prefixes = ["A1:", "A2:", "A3:"]
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert_eq!(manifest.output.review_anchor_min_count, 3);
+        assert_eq!(manifest.output.review_anchor_min_quote_chars, 40);
+    }
+
+    #[test]
+    fn test_output_is_empty_with_only_review_anchor() {
+        let toml_str = r#"
+            [skill]
+            name = "test-skill"
+            description = "Only review anchor"
+
+            [output]
+            required_review_anchor_prefixes = ["A1:", "A2:"]
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert!(!manifest.output.is_empty());
+        assert!(manifest.output.required_suffix_lines.is_empty());
+        assert!(manifest.output.required_finding_list_prefixes.is_empty());
+    }
+
+    #[test]
+    fn test_no_review_anchor_leaves_existing_manifests_unconstrained() {
+        // The guard is opt-in: a manifest that predates mika#2037 declares no anchor
+        // prefixes, so the guard can never fire for it.
+        let toml_str = r#"
+            [skill]
+            name = "simple"
+            description = "No review anchor"
+
+            [output]
+            required_suffix_lines = ["Verdict: GROOMED"]
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert!(manifest.output.required_review_anchor_prefixes.is_empty());
+        assert!(!manifest.output.is_empty());
+    }
+
+    #[test]
+    fn test_full_arch_manifest_with_four_output_contracts() {
+        // The real shape after mika#2037: [constraints] plus three [output] contracts
+        // coexisting in one manifest.
+        let toml_str = r#"
+            [skill]
+            name = "mika-arch-groom-ticket"
+            description = "First-pass principle-grounded plan review"
+
+            [constraints]
+            required_tools = ["gh_read"]
+            required_fetches_for_quoted_resources = true
+
+            [output]
+            required_suffix_lines = ["Disposition: READY", "Disposition: ITERATE", "Disposition: ESCALATE"]
+            required_finding_list_prefixes = ["F1:", "F2:", "F3:"]
+            required_review_anchor_prefixes = ["A1:", "A2:", "A3:"]
+            review_anchor_min_count = 3
+            review_anchor_min_quote_chars = 40
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert_eq!(manifest.constraints.required_tools, vec!["gh_read"]);
+        assert!(manifest.constraints.required_fetches_for_quoted_resources);
+        assert_eq!(manifest.output.required_suffix_lines.len(), 3);
+        assert_eq!(manifest.output.required_finding_list_prefixes.len(), 3);
+        assert_eq!(manifest.output.required_review_anchor_prefixes.len(), 3);
     }
 
     // -- [context] section tests --

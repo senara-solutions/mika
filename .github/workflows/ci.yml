@@ -84,6 +84,17 @@ jobs:
       - name: Dispatch-lib assertion suite (mika#1772)
         run: make test-dispatch-lib
 
+      - name: Plan-discovery suite (mika#2038)
+        run: make test-find-issue-plan
+
+      - name: PR-origin marker + report suites (mika#2026)
+        run: make test-pr-origin
+
+      - name: Pilot sandbox secret-channel guards (mika#2039)
+        run: |
+          make test-sandbox-secret-argv
+          make verify-no-secret-in-setenv
+
       - name: Test (with telemetry feature)
         run: cargo test --workspace --features telemetry
 
@@ -99,7 +110,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
-      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f  # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v6
         with:
           node-version-file: '.node-version'
           cache: npm
@@ -119,7 +130,7 @@ jobs:
         working-directory: docs-site
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
-      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f  # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v6
         with:
           node-version-file: '.node-version'
           cache: npm
@@ -155,6 +166,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - name: Check for unsafe byte-slice patterns
         run: bash scripts/check-byte-slices.sh
+      # A guard nobody has watched go red is a decoration — mika#2103 is the
+      # incident where this very lint stayed green through 26 panics.
+      - name: Pin the guard's negative behaviour
+        run: bash scripts/test-check-byte-slices.sh
 
   loop-select-lint:
     name: Loop Select Lint
@@ -197,6 +212,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - name: Enforce no-log discipline on egress substrate (mika#1810 E4)
         run: bash scripts/verify-egress-no-log.sh
+      - name: Pin the egress no-log guard's negative behaviour (mika#2054)
+        run: bash scripts/test-verify-egress-no-log.sh
+
+  sigpipe-grep-lint:
+    name: SIGPIPE grep-q Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      - name: Reject `printf|echo | grep -q` under pipefail (mika#2055)
+        run: bash scripts/verify-no-sigpipe-grep.sh
+      - name: Anti-vacuity — the guard must be able to fail (mika#2055)
+        run: bash scripts/test-verify-no-sigpipe-grep.sh
 
   secret-scan:
     name: Secret Scan
@@ -253,7 +280,7 @@ jobs:
       os-relevant: ${{ steps.filter.outputs.os-relevant }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
-      - uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@v4
         id: filter
         with:
           filters: |
@@ -283,7 +310,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2  # v3
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v3
       - name: Build ${{ matrix.tag }}
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v6
         with:
@@ -324,7 +351,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2  # v3
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v3
       - name: Build ${{ matrix.tag }}
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v6
         with:
@@ -360,7 +387,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2  # v3
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v3
       - name: Login to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v3
         with:

@@ -46,6 +46,7 @@ use mika_common::llm::ProviderKind;
 
 /// Nudge-driven skill creation (mika#1583) — turn-end counter + advisory
 /// prompt-injection helpers. Co-located with the loop that reads them.
+pub mod review_anchor;
 pub mod skill_nudge;
 use skill_nudge::{SkillNudgeContext, SkillNudgeState, apply_turn_end, inject_pending_nudge};
 
@@ -461,7 +462,7 @@ async fn attempt_continuation_turn(
     // Strip the step-awareness nudge from the system prompt so the continuation
     // turn does not see stale "2 steps remaining" text.
     if let Some(ref mut system) = request.system {
-        system.truncate(system_prompt_original_len);
+        system.truncate(system_prompt_original_len); // safe-byte-slice: String, but the index is a String::len() recorded at mod.rs:980 before the nudge was appended — a real length, hence always a char boundary
     }
     request.tools = None;
     request.thinking = None;
@@ -850,6 +851,10 @@ async fn run_loop(
     required_tools: &HashSet<String>,
     required_suffix_lines: &[String],
     required_finding_list_prefixes: &[String],
+    review_anchor: &ReviewAnchorContract,
+    // The reviewed brief, for the mika#2037 review-anchor guard. `None` outside
+    // conversation mode, where no brief exists to anchor against.
+    review_brief: Option<&str>,
     enabled_tool_names: &HashSet<String>,
     is_verdict_producer: bool,
     store_llm_calls: bool,
@@ -947,6 +952,9 @@ async fn run_loop(
     // Guards against thin-emission: skills declaring `[output] required_finding_list_prefixes`
     // must have at least one F-list line in the message body on terminal dispositions. See #901.
     let mut required_finding_list_retry_done = false;
+    // mika#2037 — review-anchor guard. Independent of the flags above: an F-list
+    // re-prompt must not consume the anchor guard's single corrective attempt.
+    let mut review_anchor_retry_done = false;
     // Guard telemetry correlation (#953). Set by any fabrication-class guard firing
     // (last-writer-wins); consumed on the next successful EndTurn to emit a paired
     // `guard.correction_accepted` event with `corrected_content`.
@@ -1231,7 +1239,9 @@ async fn run_loop(
                     all_tool_summaries.extend(step_summaries);
                 }
 
-                let text = mika_common::llm::strip_internal_tags(&response.text());
+                // `mut`: the mika#2037 review-anchor guard withholds an unattested
+                // disposition from the final text rather than accepting it (fail-closed).
+                let mut text = mika_common::llm::strip_internal_tags(&response.text());
 
                 // mika#1168 — refusal-detection telemetry (Phase C Step 10).
                 //
@@ -2410,6 +2420,143 @@ async fn run_loop(
                         }
                     }
 
+                    // #2037 — Review-anchor guard. The complement of #901: that guard
+                    // requires an F-list on TERMINAL dispositions and exempts the rest,
+                    // which left READY / Verdict: GROOMED — the dispositions that advance
+                    // the chain — as the only ones owing no evidence. A 302-byte
+                    // acknowledgement carrying the keyword forged an architect attestation
+                    // on a 10 KB brief it had not read. Together the two guards cover the
+                    // whole disposition space.
+                    //
+                    // Unlike every sibling in this chain, this guard is fail-CLOSED. The
+                    // others re-prompt once then accept; accepting here would restore the
+                    // exact hole being closed, so a second failure withholds the
+                    // disposition instead. A response the engine cannot validate as a
+                    // review is an absence of verdict, never an approval.
+                    if !skip_remaining_guards
+                        && matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !review_anchor.is_empty()
+                        && let Some(brief) = review_brief
+                        // A brief too short to contain the proof cannot be reviewed into
+                        // one. Demanding evidence that cannot exist is the false-positive
+                        // direction this guard is forbidden to take: it would break both
+                        // `/mika-ask-arch` and the mika#1823 UNPARSED recovery, whose user
+                        // message is a corrective prompt rather than the plan (mika#2037).
+                        && brief.chars().count() >= review_anchor.min_brief_chars
+                        && !is_terminal_disposition(&text, required_suffix_lines)
+                        && has_declared_disposition(&text, required_suffix_lines)
+                    {
+                        let verdict = review_anchor::verify_review_anchors(
+                            &text,
+                            brief,
+                            &review_anchor.prefixes,
+                            required_suffix_lines,
+                            review_anchor.min_count,
+                            review_anchor.min_quote_chars,
+                        );
+
+                        if let review_anchor::AnchorVerdict::Missing {
+                            anchors_found,
+                            anchors_valid,
+                            reason,
+                        } = verdict
+                        {
+                            if !review_anchor_retry_done {
+                                review_anchor_retry_done = true;
+                                let correlation_id = format!(
+                                    "{}:{}:{}",
+                                    tool_ctx.trace_id, step, REVIEW_ANCHOR_GUARD_LABEL
+                                );
+                                guard_correlation = Some(GuardCorrelation {
+                                    correlation_id: correlation_id.clone(),
+                                    guard_label: REVIEW_ANCHOR_GUARD_LABEL,
+                                    step,
+                                });
+                                warn!(
+                                    target: "mika::otel",
+                                    trace_id = %tool_ctx.trace_id,
+                                    agent_id = %db.agent_id(),
+                                    session_id,
+                                    step,
+                                    guard_correlation_id = %correlation_id,
+                                    label = mode.label(),
+                                    anchors_found,
+                                    anchors_valid,
+                                    miss_reason = ?reason,
+                                    event = "guard.review_anchor",
+                                    "Review-anchor guard: non-terminal disposition without \
+                                     a verifiable attestation — re-prompting (#2037)"
+                                );
+                                request.messages.push(LlmMessage {
+                                    role: LlmRole::Assistant,
+                                    content: LlmContent::Blocks(
+                                        mika_common::llm::response_content_to_blocks(
+                                            &response.content,
+                                        ),
+                                    ),
+                                });
+                                request.messages.push(LlmMessage {
+                                    role: LlmRole::User,
+                                    content: LlmContent::Text(format!(
+                                        "[mika-engine] The previous response carries a \
+                                         non-terminal disposition without the review \
+                                         attestation required by the skill's \
+                                         `[output] required_review_anchor_prefixes` \
+                                         contract.\n\n\
+                                         What blocked it: {}.\n\n\
+                                         A disposition keyword is not an attestation. To \
+                                         return READY (or Verdict: GROOMED), the message \
+                                         body must carry at least {} anchor lines starting \
+                                         with {}, and each one must quote at least {} \
+                                         characters of the brief you reviewed, **verbatim**, \
+                                         from a different part of it. Paraphrase does not \
+                                         satisfy this; quoting the same sentence {} times \
+                                         does not either.\n\n\
+                                         If you cannot produce those anchors because you did \
+                                         not review the brief, do not emit a disposition — \
+                                         review it now and then answer. If the plan genuinely \
+                                         has concerns, return ITERATE with an F-list instead.",
+                                        reason.describe(),
+                                        review_anchor.min_count,
+                                        review_anchor.prefixes.join(", "),
+                                        review_anchor.min_quote_chars,
+                                        review_anchor.min_count,
+                                    )),
+                                });
+                                continue;
+                            }
+
+                            // Second failure: withhold rather than accept.
+                            //
+                            // Take the correlation rather than leaving it set: the #953
+                            // block below emits `guard.correction_accepted` for whatever is
+                            // still pending, and a withheld attestation is the opposite of a
+                            // correction. Leaving it would count a refused forgery as a
+                            // successful repair on the Signal K surface operators read.
+                            let withheld_correlation_id = guard_correlation
+                                .take()
+                                .map(|c| c.correlation_id)
+                                .unwrap_or_default();
+                            error!(
+                                target: "mika::otel",
+                                trace_id = %tool_ctx.trace_id,
+                                agent_id = %db.agent_id(),
+                                session_id,
+                                step,
+                                label = mode.label(),
+                                guard_correlation_id = %withheld_correlation_id,
+                                anchors_found,
+                                anchors_valid,
+                                miss_reason = ?reason,
+                                event = "guard.review_anchor_withheld",
+                                "Review-anchor guard: attestation still absent after the \
+                                 corrective re-prompt — disposition withheld from the final \
+                                 response (#2037)"
+                            );
+                            text = withhold_disposition(&text, required_suffix_lines);
+                        }
+                    }
+
                     // #846 + #907 + #1089 — operator notification when the
                     // ready-label dispatch guard fired but run_claude_pilot was
                     // not called after the retry.  Without this the failure is
@@ -3215,6 +3362,7 @@ async fn run_agent_inner(
     let required_tools = collect_required_tools(&matched, params.user_message);
     let required_suffix_lines = collect_required_suffix_lines(&matched);
     let required_finding_list_prefixes = collect_required_finding_list_prefixes(&matched);
+    let review_anchor_contract = collect_review_anchor_contract(&matched);
     let required_tool_arg_suffixes = collect_required_tool_arg_suffixes(&matched);
     let tool_arg_suffix_rejected = AtomicBool::new(false);
 
@@ -3513,6 +3661,8 @@ async fn run_agent_inner(
         &required_tools,
         &required_suffix_lines,
         &required_finding_list_prefixes,
+        &review_anchor_contract,
+        Some(params.user_message),
         &enabled_tool_names,
         is_verdict_producer,
         store_llm,
@@ -4368,6 +4518,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
 
     let no_required_suffix_lines: Vec<String> = Vec::new();
     let no_required_finding_list_prefixes: Vec<String> = Vec::new();
+    let no_review_anchor_contract = ReviewAnchorContract::default();
     let result = run_loop(
         llm,
         tools,
@@ -4384,6 +4535,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         &no_required_tools,
         &no_required_suffix_lines,
         &no_required_finding_list_prefixes,
+        &no_review_anchor_contract,
+        None, // mika#2037: silent turns review no brief
         &enabled_tool_names,
         false, // silent mode: mode.is_conversation() gate handles callback turns (#1254)
         store_llm,
@@ -4781,6 +4934,7 @@ async fn run_team_agent_inner_impl(
     let required_tools = collect_required_tools(&matched, params.task_message);
     let required_suffix_lines = collect_required_suffix_lines(&matched);
     let required_finding_list_prefixes = collect_required_finding_list_prefixes(&matched);
+    let team_review_anchor_contract = ReviewAnchorContract::default();
     let required_tool_arg_suffixes_team = collect_required_tool_arg_suffixes(&matched);
     let tool_arg_suffix_rejected_team = AtomicBool::new(false);
 
@@ -4912,6 +5066,8 @@ async fn run_team_agent_inner_impl(
         &required_tools,
         &required_suffix_lines,
         &required_finding_list_prefixes,
+        &team_review_anchor_contract,
+        None, // mika#2037: team turns review no brief
         &enabled_tool_names,
         has_verdict_producer_skill(params.skills.skills()),
         store_llm,
@@ -5329,6 +5485,106 @@ fn collect_required_finding_list_prefixes(matched: &[MatchedSkill<'_>]) -> Vec<S
         .collect()
 }
 
+/// The review-anchor contract in force for a turn (mika#2037).
+///
+/// Union of the declared prefixes across matched skills, with the **strictest** thresholds
+/// among the skills that declared one. Strictest-wins is the fail-closed reading: when two
+/// skills disagree on how much evidence a non-terminal disposition owes, taking the looser
+/// bar would let the weaker contract dissolve the stronger one.
+#[derive(Debug, Default, Clone)]
+struct ReviewAnchorContract {
+    prefixes: Vec<String>,
+    min_count: usize,
+    min_quote_chars: usize,
+    /// Below this brief length the guard does not fire. See mika#2037 — the three arch
+    /// skills are `always_on`, so skill-match alone would arm the guard on every turn of
+    /// that agent, including ad-hoc questions and the mika#1823 corrective re-ask.
+    min_brief_chars: usize,
+}
+
+impl ReviewAnchorContract {
+    /// No skill in this turn declared the contract, so the guard never fires.
+    fn is_empty(&self) -> bool {
+        self.prefixes.is_empty()
+    }
+}
+
+/// Collect the review-anchor contract from keyword-matched and always-on skills' `[output]`
+/// sections. Same match-reason policy as `collect_required_finding_list_prefixes` — the two
+/// guards are halves of one contract and must not disagree about which skills bind a turn.
+fn collect_review_anchor_contract(matched: &[MatchedSkill<'_>]) -> ReviewAnchorContract {
+    let mut contract = ReviewAnchorContract::default();
+    for m in matched
+        .iter()
+        .filter(|m| matches!(m.reason, MatchReason::Keyword | MatchReason::AlwaysOn))
+    {
+        let output = &m.entry.manifest.output;
+        if output.required_review_anchor_prefixes.is_empty() {
+            continue;
+        }
+        // Dedup: all three arch skills are always-on and declare the same alphabet, so a
+        // plain extend would build a 30-entry list and render every prefix three times in
+        // the corrective re-prompt meant to teach the contract.
+        for prefix in &output.required_review_anchor_prefixes {
+            if !contract.prefixes.contains(prefix) {
+                contract.prefixes.push(prefix.clone());
+            }
+        }
+        contract.min_count = contract.min_count.max(output.review_anchor_min_count);
+        contract.min_quote_chars = contract
+            .min_quote_chars
+            .max(output.review_anchor_min_quote_chars);
+        // Strictest-wins on the two proof thresholds, but the arming threshold takes the
+        // LOWEST declared value: it decides whether the guard applies at all, and a skill
+        // that arms earlier must not be silenced by a more permissive sibling.
+        contract.min_brief_chars = if contract.min_brief_chars == 0 {
+            output.review_anchor_min_brief_chars
+        } else {
+            contract
+                .min_brief_chars
+                .min(output.review_anchor_min_brief_chars)
+        };
+    }
+    contract
+}
+
+/// Withhold an unattested disposition from the final text (mika#2037).
+///
+/// Replaces the disposition line with `DISPOSITION_WITHHELD_MARKER` and leaves the rest of
+/// the response intact. Nothing the model wrote is lost — only the attestation it did not
+/// earn is removed, and the marker names why.
+///
+/// Rewriting the text rather than failing the turn is deliberate. The guard chain has no
+/// hard-refusal mechanism (no `bail!` anywhere in it), and adding one would mean a new
+/// `LoopResult` variant handled at all three call sites for no gain: the shell consumer
+/// already treats a response with no derivable disposition as `UNPARSED`, which is a bounded
+/// retry then a pipeline failure. This reaches the same fail-closed end by touching one layer.
+fn withhold_disposition(text: &str, required_suffix_lines: &[String]) -> String {
+    text.lines()
+        .map(|line| {
+            let trimmed = line.trim();
+            if required_suffix_lines
+                .iter()
+                .any(|req| trimmed == req.as_str())
+            {
+                DISPOSITION_WITHHELD_MARKER
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Literal marker the engine substitutes for a disposition it refused to let stand.
+///
+/// `dispatch-lib`'s `_parse_disposition` / `_parse_verdict` short-circuit on this string
+/// **before** any tier of matching. That ordering is load-bearing: their tier-2 fuzzy pass
+/// matches paraphrases (`proceed`, `good to go`) anywhere in the text, so a response whose
+/// disposition line was merely deleted could still yield READY from its own body. Keep this
+/// literal in sync with the tier-0 check in `skills/bundled/_shared/dispatch-lib.sh`.
+const DISPOSITION_WITHHELD_MARKER: &str = "Disposition-Withheld: REVIEW-ANCHOR-MISSING";
+
 /// Collect tool-argument suffix constraints from keyword-matched and always-on skills'
 /// `[output]` sections. Returns the union of all declared `required_tool_arg_suffixes`
 /// entries. Both `Keyword` and `AlwaysOn` matched skills contribute (same policy as
@@ -5342,6 +5598,27 @@ fn collect_required_tool_arg_suffixes(
         .flat_map(|m| m.entry.manifest.output.required_tool_arg_suffixes.iter())
         .cloned()
         .collect()
+}
+
+/// Guard label for the review-anchor telemetry correlation id (mika#2037).
+const REVIEW_ANCHOR_GUARD_LABEL: &str = "review_anchor";
+
+/// Whether the response ends on a disposition line the skill declared.
+///
+/// The review-anchor guard fires on a *non-terminal* disposition, and "not terminal" alone is
+/// not the same as "non-terminal": a response with no disposition at all is also not terminal.
+/// That case belongs to the mika#864 suffix-line guard, which runs earlier in this chain; the
+/// anchor guard must not fire on it and demand an attestation for a verdict that was never
+/// claimed. Same last-3-non-empty-lines window as its siblings.
+fn has_declared_disposition(text: &str, required_suffix_lines: &[String]) -> bool {
+    text.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .take(3)
+        .any(|line| required_suffix_lines.iter().any(|req| line == req.as_str()))
 }
 
 /// Determine whether the assistant's disposition/verdict is "terminal" (requires F-list).
@@ -6440,7 +6717,7 @@ fn ready_label_dispatch_trigger(msg: &str) -> bool {
 /// Returns `true` when `run_claude_pilot` or `run_claude_pilot_groom` was
 /// attempted on this turn (success or failure). The
 /// `webhook_ready_label_dispatch` intent-guard satisfies on **attempts**, not
-/// **successes**, because the seven terminal rejections from
+/// **successes**, because the nine terminal rejections from
 /// `validate_dispatch_readiness` (`crates/mika-agent/src/skills/executor.rs`)
 /// are structural and not recoverable by re-prompting the LLM:
 ///
@@ -6451,6 +6728,8 @@ fn ready_label_dispatch_trigger(msg: &str) -> bool {
 ///   5. `dispatch_limit_exceeded` — per-turn dispatch counter already at the limit (mika#583)
 ///   6. `dispatch_no_grooming_marker` — ungroomed issue rejected at the gate (mika#919)
 ///   7. `dispatch_blocked_by` — open GitHub blockers remain (mika#713)
+///   8. `repo_not_dispatchable` — target repo outside the allowlist (mika#2046)
+///   9. `dispatch_seat_mismatch` — the issue carries a `dispatch:*` seat label this engine cannot act on (mika#2084)
 ///
 /// Re-prompting the LLM after any of these would loop (the LLM cannot dissolve
 /// a structural rejection); the operator-notification path

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use mika_common::llm::{LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmRole};
+use mika_common::text::safe_truncate;
 use tracing::{debug, info, warn};
 
 use crate::async_db::AsyncDatabase;
@@ -8,7 +9,9 @@ use crate::db::SessionMessage;
 const COMPACTION_THRESHOLD: usize = 50;
 const CONTEXT_WINDOW: usize = 20;
 const MAX_COMPACTION_BATCH: usize = 100;
-const MAX_SUMMARY_CHARS: usize = 4000;
+/// Maximum summary size, in **bytes** — `String::len()` is a byte count,
+/// so the budget it is compared against is one too (mika#2103).
+const MAX_SUMMARY_BYTES: usize = 4000;
 const MAX_COMPACTION_INPUT_CHARS: usize = 50_000;
 
 const SUMMARIZATION_SYSTEM_PROMPT: &str = "\
@@ -67,27 +70,38 @@ pub async fn maybe_compact(db: &AsyncDatabase, llm: &dyn LlmProvider) -> Result<
 
     info!(old_count = batch.len(), total, "compacting conversation");
 
-    let mut summary_text = summarize_messages(llm, batch, existing_summary.as_ref()).await?;
+    let summary_text = summarize_messages(llm, batch, existing_summary.as_ref()).await?;
 
-    // Truncate summary if it exceeds the size guard
-    if summary_text.len() > MAX_SUMMARY_CHARS {
-        warn!(
-            len = summary_text.len(),
-            max = MAX_SUMMARY_CHARS,
-            "truncating oversized summary"
-        );
-        summary_text.truncate(MAX_SUMMARY_CHARS);
-        // Ensure we don't cut in the middle of a multi-byte char
-        while !summary_text.is_char_boundary(summary_text.len()) {
-            summary_text.pop();
-        }
-    }
+    let summary_text = cap_summary(summary_text);
 
     let highest_id = batch.last().map(|m| m.id).unwrap_or(0);
     db.replace_with_summary(&summary_text, highest_id).await?;
 
     info!(compacted_through_id = highest_id, "compaction complete");
     Ok(())
+}
+
+/// Cap a summary at `MAX_SUMMARY_BYTES`, floored to a char boundary.
+///
+/// mika#2103: the guard this replaces called `String::truncate` and *then*
+/// walked back with `pop()`. That walk was unreachable — `truncate` asserts
+/// `is_char_boundary` and panics before any later statement runs — and
+/// vacuous besides, since `s.is_char_boundary(s.len())` is always true for
+/// the end of a `String`. Two defects stacked into the appearance of a
+/// guard. `safe_truncate` floors to a boundary *before* the cut.
+///
+/// Extracted as a pure function so the byte-boundary behaviour is testable
+/// without an LLM or a database.
+fn cap_summary(summary_text: String) -> String {
+    if summary_text.len() <= MAX_SUMMARY_BYTES {
+        return summary_text;
+    }
+    warn!(
+        len = summary_text.len(),
+        max = MAX_SUMMARY_BYTES,
+        "truncating oversized summary"
+    );
+    safe_truncate(&summary_text, MAX_SUMMARY_BYTES).to_string()
 }
 
 /// Call Claude to summarize a batch of old messages, optionally merging with
@@ -395,5 +409,36 @@ mod tests {
             SUMMARIZATION_SYSTEM_PROMPT.contains("Conversational verbs"),
             "load-bearing invariant: conversational-verbs prohibition must be present"
         );
+    }
+
+    // ── mika#2103: summary cap floors to a char boundary ──────────────────
+
+    /// AC2-shape — the byte budget lands inside a multi-byte character.
+    #[test]
+    fn cap_summary_multibyte_at_limit_does_not_panic() {
+        let mut s = "x".repeat(MAX_SUMMARY_BYTES - 1);
+        s.push('\u{e9}'); // 2 bytes: byte MAX_SUMMARY_BYTES is its second
+        s.push_str(&"y".repeat(100));
+        assert!(!s.is_char_boundary(MAX_SUMMARY_BYTES));
+
+        let out = cap_summary(s); // panicked before mika#2103
+
+        assert!(out.len() <= MAX_SUMMARY_BYTES);
+        assert!(!out.contains('\u{e9}'));
+    }
+
+    /// AC3-shape (anti-vacuity) — a summary under the cap is returned
+    /// byte-for-byte, so "always truncate to zero" cannot pass.
+    #[test]
+    fn cap_summary_under_limit_left_intact() {
+        let s = "r\u{e9}sum\u{e9} \u{2014} caf\u{e9}".to_string();
+        assert_eq!(cap_summary(s.clone()), s);
+    }
+
+    /// A summary exactly at the cap is left intact.
+    #[test]
+    fn cap_summary_exactly_at_limit_left_intact() {
+        let s = "x".repeat(MAX_SUMMARY_BYTES);
+        assert_eq!(cap_summary(s.clone()), s);
     }
 }

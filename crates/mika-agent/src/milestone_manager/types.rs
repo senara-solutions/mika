@@ -193,6 +193,28 @@ pub struct Recommendation {
     pub rationale: String,
 }
 
+/// One dispatch the manager wanted to make and could not, because another
+/// dispatcher held the exec slot (mika#1948, Porte 2).
+///
+/// Exists so contention is *reportable*. A manager whose dispatch silently
+/// defers looks identical to a manager with nothing to do; the operator then
+/// sees a throughput bottleneck with no name on it. Phase 1 never produces
+/// these — the manager is read-only — but the channel ships now so Phase 2 has
+/// a landing spot that is already rendered and already tested.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentionEvent {
+    /// The exec-slot class that was busy: `"implement"` or `"groom"`.
+    pub dispatch_class: String,
+    /// The task holding the slot.
+    pub blocking_task_id: String,
+    /// Which dispatcher initiated the blocking task. `None` means the row
+    /// predates the column (pre-v51) and is genuinely unknown — deliberately
+    /// not defaulted, so a reader cannot mistake it for a positive attribution.
+    pub blocking_dispatcher_source: Option<String>,
+    /// Rejection reason as the dispatch path reported it.
+    pub reason: String,
+}
+
 /// The composed assessment — output of `Assessor::assess`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Assessment {
@@ -202,6 +224,16 @@ pub struct Assessment {
     /// Optional cross-cutting concerns from `mika-arch-groom-milestone`.
     /// Phase 1: always empty (hydration deferred to Phase 1.5).
     pub cross_cutting: Vec<String>,
+    /// Dispatch contention observed during this cycle (mika#1948).
+    /// Phase 1: always empty — the manager does not dispatch yet.
+    ///
+    /// `#[serde(default)]` is load-bearing, not decoration. It buys two things:
+    /// a report blob written before this field existed still deserializes (the
+    /// offline sink holds such files), and an empty list serializes as `[]`
+    /// rather than `null`, so a Phase 2 consumer can type it `Vec<_>` instead of
+    /// `Option<Vec<_>>`.
+    #[serde(default)]
+    pub contention_events: Vec<ContentionEvent>,
 }
 
 /// Outcome of a single `run_manager_cycle` invocation.
@@ -218,11 +250,99 @@ pub struct CycleOutcome {
     pub heartbeat_fired: bool,
     pub severity: Severity,
     pub generated_at: String,
+    /// The auth-boundary failure this cycle observed on its delivery attempt,
+    /// if any (mika#1949 U3).
+    ///
+    /// `#[serde(default)]` because the offline sink holds outcome blobs
+    /// written before this field existed, and an upgrade that could not read
+    /// its own backlog would lose it — same reasoning as
+    /// `Assessment::contention_events`.
+    #[serde(default)]
+    pub auth_boundary: Option<mika_common::auth_boundary::AuthBoundaryError>,
+    /// Whether this cycle actually presented a credential at a boundary
+    /// (mika#1949 U4).
+    ///
+    /// Needed because `auth_boundary: None` conflates three different things:
+    /// a delivery that authenticated, a cycle that wrote to the offline sink,
+    /// and a no-op cycle that delivered nothing at all. Only the first is
+    /// evidence the credential works, and only evidence should close an
+    /// escalation window. With `poll_interval` at 5 min against a 6 h
+    /// heartbeat, no-op cycles are the *common* case — reading them as
+    /// success would reset the repeat counter between almost every pair of
+    /// real failures and make the `Blocked` escalation unreachable.
+    #[serde(default)]
+    pub auth_attempted: bool,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- mika#1948: contention_events wire format --
+
+    fn assessment_json_without_contention() -> String {
+        serde_json::json!({
+            "severity": "healthy",
+            "recommendation": { "next_sub_issue": null, "rationale": "nothing to do" },
+            "alerts": [],
+            "cross_cutting": []
+        })
+        .to_string()
+    }
+
+    /// A report blob written before `contention_events` existed must still
+    /// deserialize. The offline sink holds such files, and an upgrade that
+    /// could not read its own backlog would lose it.
+    #[test]
+    fn test_assessment_serde_default_empty_contention() {
+        let a: Assessment = serde_json::from_str(&assessment_json_without_contention())
+            .expect("pre-Porte-2 JSON must still parse after the field is added");
+        assert!(
+            a.contention_events.is_empty(),
+            "a missing field must read as an empty list, not fail"
+        );
+    }
+
+    /// And the field must serialize as `[]`, never `null`, so a Phase 2 consumer
+    /// can type it `Vec<_>` rather than `Option<Vec<_>>`.
+    #[test]
+    fn test_assessment_serde_roundtrip_empty_contention() {
+        let a = Assessment {
+            severity: Severity::Healthy,
+            recommendation: Recommendation {
+                next_sub_issue: None,
+                rationale: "nothing to do".into(),
+            },
+            alerts: vec![],
+            cross_cutting: vec![],
+            contention_events: vec![],
+        };
+        let out = serde_json::to_string(&a).unwrap();
+        assert!(
+            out.contains(r#""contention_events":[]"#),
+            "empty contention must serialize as [] — got: {out}"
+        );
+        assert!(
+            !out.contains(r#""contention_events":null"#),
+            "must never serialize as null"
+        );
+    }
+
+    #[test]
+    fn test_contention_event_roundtrips_with_unknown_source() {
+        let e = ContentionEvent {
+            dispatch_class: "implement".into(),
+            blocking_task_id: "task-a".into(),
+            blocking_dispatcher_source: None,
+            reason: "slot held".into(),
+        };
+        let back: ContentionEvent =
+            serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+        assert_eq!(
+            back, e,
+            "an unknown source must survive a roundtrip as None"
+        );
+    }
 
     #[test]
     fn parses_valid_milestone_ref() {

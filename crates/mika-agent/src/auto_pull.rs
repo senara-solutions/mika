@@ -3,12 +3,51 @@
 //! When mika-dev's dispatch queue is idle, this module selects the
 //! highest-priority groomed-not-ready ticket and applies the `ready`
 //! label to trigger the webhook-driven dispatch flow.
+//!
+//! # Promotion staleness gate (mika#2123)
+//!
+//! Promotion is not free to the loop even though it is free to withdraw. A
+//! ticket promoted onto a branch weeks behind `main` dies at the dispatch-time
+//! rebase *before claude-pilot is launched* — seven times in a row on
+//! 2026-08-31, and at a double-digit daily rate since 2026-08-26. So the
+//! distance is measured **here**, where a refusal costs a label, rather than at
+//! dispatch, where it costs the dispatch.
+//!
+//! Three things this gate is not, stated because each is easy to assume:
+//!
+//! 1. **It does not rebase.** It cannot: this module is a pure GitHub API
+//!    client with no checkout. The real rebase stays in `dispatch-lib.sh` and
+//!    is now the only one.
+//! 2. **It does not predict conflicts.** Only a real rebase decides whether a
+//!    branch merges. The threshold answers a policy question — is this branch
+//!    old enough that a human should look before a dispatch is spent? — and a
+//!    number chosen to predict conflicts would be pretending to knowledge
+//!    nobody has.
+//! 3. **It does not narrow the accept path.** Every "could not measure"
+//!    outcome promotes. A gate that refuses whenever GitHub hiccups would close
+//!    the loop as effectively as the wedge it exists to remove.
+//!
+//! ## The `wip(...)` disposition (AC5)
+//!
+//! A stale branch carrying more than its plan commit — partial work from a
+//! pilot that died — is **never auto-promoted**, whatever the distance. Not
+//! because such branches conflict more often (that would be point 2 again), but
+//! because they have *two* legitimate resolutions — rebase the work, or abandon
+//! it — and choosing between them is a judgement about work, not about git. The
+//! loop should not make that choice silently by rebasing over it. `ahead_by`
+//! separates the two populations for free: a branch carrying only its plan has
+//! `ahead_by == 1`; every branch that died on 2026-08-31 carried more.
+//!
+//! The stated cost: this refuses some branches that would have rebased fine —
+//! `feat/1959/…` in the frozen fixtures is exactly that case, measured. The
+//! alternative is an autonomous loop disposing of a dead pilot's work with
+//! nobody reading it.
 
 use anyhow::{Result, anyhow};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::async_db::AsyncDatabase;
 
@@ -28,6 +67,19 @@ const STUCK_READY_THRESHOLD_ENV: &str = "MIKA_AUTO_PULL_STUCK_READY_THRESHOLD_SE
 /// Defensive cap on the number of stuck-ready rescues per tick (mika#1824 D3).
 /// Overflow is logged and left for the next tick.
 const MAX_STUCK_RESCUE_PER_TICK: usize = 5;
+
+// ───────────────────── Re-drive budget consts (mika#2020) ─────────────────────
+
+/// Default per-ticket re-drive budget before Phase 2 gives up and says so
+/// (mika#2020). Three, for parity with [`CIRCUIT_BREAKER_THRESHOLD`] and because
+/// at the 900 s age threshold three re-drives span at least ~45 min — well past
+/// a dropped webhook or a mika-dev that was busy at fire time.
+const MAX_REDRIVES_DEFAULT: i64 = 3;
+
+/// Env override for the re-drive budget (mika#2020). The literal `0` disables
+/// the budget (unbounded re-drives — the pre-fix behaviour), mirroring the
+/// disable sentinel of [`AUTO_FEEDER_MIN_READY_ENV`].
+const MAX_REDRIVES_ENV: &str = "MIKA_AUTO_PULL_MAX_REDRIVES";
 
 // ───────────────────── Phase 0 auto-feeder consts (mika#1863) ─────────────────────
 
@@ -78,6 +130,114 @@ fn parse_stuck_ready_threshold(raw: Option<&str>) -> i64 {
 /// falling back to [`STUCK_READY_THRESHOLD_DEFAULT_SECS`] (mika#1824 R3).
 fn stuck_ready_threshold_secs() -> i64 {
     parse_stuck_ready_threshold(std::env::var(STUCK_READY_THRESHOLD_ENV).ok().as_deref())
+}
+
+/// Pure parse of the re-drive budget from an optional env value (mika#2020 R14).
+/// Same three-tier contract as [`parse_stuck_ready_threshold`]: absent/empty →
+/// default; unparseable/negative → default with a WARN; `0` → unbounded.
+fn parse_max_redrives(raw: Option<&str>) -> i64 {
+    match raw {
+        Some(v) if !v.trim().is_empty() => match v.trim().parse::<i64>() {
+            Ok(n) if n >= 0 => n,
+            _ => {
+                warn!(
+                    value = %v,
+                    default = MAX_REDRIVES_DEFAULT,
+                    "auto_pull: invalid {MAX_REDRIVES_ENV}, using default"
+                );
+                MAX_REDRIVES_DEFAULT
+            }
+        },
+        _ => MAX_REDRIVES_DEFAULT,
+    }
+}
+
+/// Read the per-ticket re-drive budget from the environment (mika#2020 R14).
+/// `0` means unbounded.
+fn max_redrives() -> i64 {
+    parse_max_redrives(std::env::var(MAX_REDRIVES_ENV).ok().as_deref())
+}
+
+// ───────────────────── Promotion staleness gate (mika#2123) ─────────────────────
+
+/// Default `behind_by` beyond which a branch is handed to the operator instead
+/// of being promoted (mika#2123 KTD2c).
+///
+/// **Provisional by construction, and the code says so rather than pretending
+/// otherwise.** Measured on 2026-09-01 against `origin/main`: every branch at
+/// `behind_by = 0` that was dispatched produced a mergeable PR, and the four
+/// branches that died at the dispatch-time rebase were 109, 120, 173 and 180
+/// behind. Any cut in `(0, 109]` fits that evidence — which means the evidence
+/// does **not** determine one. Fifty is a starting point, not a finding.
+///
+/// This is a *policy* threshold, not a prediction (KTD2b). It cannot know
+/// whether a branch will rebase; only a real rebase decides that, and this
+/// module has no checkout to run one in. It answers a different question: is
+/// this branch old enough that a human should look before a dispatch is spent
+/// on it? Every promotion decision logs `behind_by`, `ahead_by` and `status`
+/// whether it promotes or refuses, so the number becomes tunable from a real
+/// distribution instead of from this paragraph.
+/// The label the promotion gate applies when it refuses (mika#2123).
+///
+/// **Not `operator-review`, and that is a measured constraint, not a style
+/// choice.** `operator-review` does not exist: it is absent from
+/// `gh label list` and undeclared in `.github/labels.yml` — verified
+/// 2026-09-01, alongside the control that `ready` (`labels.yml:102`) and
+/// `operator-gated` (`:106`) *are* declared, so the file is the source of
+/// truth. `blocked`, the module's other exclusion label, is equally absent.
+///
+/// The consequence is in production, 48 times in `server.log`:
+///
+/// ```text
+/// gh issue edit --add-label failed for #2117:
+///   'operator-review' not found
+/// ```
+///
+/// Every one of those is an [`abandon_stuck_ready`] that never abandoned. That
+/// path applies the label *before* removing `ready`, so when the label fails
+/// the ticket keeps `ready` forever and stays in the pool — the arrest is a
+/// no-op and nothing says so above WARN.
+///
+/// This gate therefore refuses with `operator-gated`, whose declared
+/// description is already exactly the state a refusal creates: *"Groomed work
+/// requiring operator-host-time. Distinct from parked/blocked. No ready
+/// label."* Repairing `operator-review` itself belongs to the mika#2020 path,
+/// not to this ticket.
+const REFUSAL_LABEL: &str = "operator-gated";
+
+const MAX_BEHIND_DEFAULT: i64 = 50;
+
+/// Env override for the promotion staleness threshold (mika#2123). The literal
+/// `0` disables the distance check entirely (pre-fix behaviour), mirroring the
+/// disable sentinel of [`MAX_REDRIVES_ENV`] and [`AUTO_FEEDER_MIN_READY_ENV`].
+/// The salvage-work rule ([`RefusalReason::SalvageWorkOnStaleBranch`]) is
+/// independent and is **not** disabled by it.
+const MAX_BEHIND_ENV: &str = "MIKA_AUTO_PULL_MAX_BEHIND";
+
+/// Pure parse of the staleness threshold from an optional env value (mika#2123).
+/// Same three-tier contract as [`parse_max_redrives`]: absent/empty → default;
+/// unparseable/negative → default with a WARN; `0` → distance check disabled.
+fn parse_max_behind(raw: Option<&str>) -> i64 {
+    match raw {
+        Some(v) if !v.trim().is_empty() => match v.trim().parse::<i64>() {
+            Ok(n) if n >= 0 => n,
+            _ => {
+                warn!(
+                    value = %v,
+                    default = MAX_BEHIND_DEFAULT,
+                    "auto_pull: invalid {MAX_BEHIND_ENV}, using default"
+                );
+                MAX_BEHIND_DEFAULT
+            }
+        },
+        _ => MAX_BEHIND_DEFAULT,
+    }
+}
+
+/// Read the promotion staleness threshold from the environment (mika#2123).
+/// `0` disables the distance check.
+fn max_behind() -> i64 {
+    parse_max_behind(std::env::var(MAX_BEHIND_ENV).ok().as_deref())
 }
 
 /// Pure parse of the auto-feeder pool target from an optional env value
@@ -153,6 +313,442 @@ pub fn is_groomed(body: &str) -> bool {
         && body.contains("> - **Plan:** `docs/plans/")
 }
 
+// ───────────────────── Plan ownership (mika#2020) ─────────────────────
+
+/// Verdict on whether the plan a ticket's callout points at belongs to that
+/// ticket (mika#2020).
+///
+/// [`is_groomed`] answers a different question — whether the callout has the
+/// canonical *shape*. It never checks who the plan belongs to, which is how
+/// mika#1887 came to carry a callout pointing at
+/// `docs/plans/2026-08-21-002-fix-1933-reader-completed-section-avancement-plan.md`:
+/// a real file, a real plan, another ticket's intent. The pilot opened it, read
+/// it, and had no way to know it was implementing #1933.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanOwnership {
+    /// The plan filename's canonical issue slot carries this ticket's number.
+    Owned,
+    /// The slot carries a *different* issue number — positive evidence of
+    /// misattribution. The only verdict that refuses.
+    OwnedByOther(u64),
+    /// No callout, or a filename with no canonical issue slot (historical plan
+    /// names like `918-eval-kg-fixtures-…md`). We cannot tell, so we do not
+    /// accuse — dev-groom's `_find_issue_plan` has a content fallback on an
+    /// `**Issue:**` header that auto-pull cannot evaluate without per-ticket
+    /// I/O.
+    Unattributable,
+}
+
+/// Extract the plan path from a ticket's grooming callout, if it has one.
+fn extract_plan_path(body: &str) -> Option<String> {
+    static PLAN_CALLOUT_RE: OnceLock<Regex> = OnceLock::new();
+    let callout_re = PLAN_CALLOUT_RE.get_or_init(|| {
+        Regex::new(r"(?m)^> - \*\*Plan:\*\* `(docs/plans/[^`]+)`")
+            .expect("plan callout regex must compile")
+    });
+    callout_re.captures(body).map(|c| c[1].to_string())
+}
+
+/// Decide whether the plan named in a ticket's grooming callout belongs to that
+/// ticket, from the issue body alone (mika#2020 R1/R2).
+///
+/// Fail-open on ambiguity, fail-closed on contradiction. The canonical plan
+/// name is `<YYYY-MM-DD>-<seq>-<type>-<issue>-<slug>-plan.md`, and the issue
+/// slot is read **anchored at that position** — never searched freely. The
+/// anchor is the point: mika#2038 documented a permissive `*-2026-*` glob
+/// matching `rustsec-2026-0097` and sending a pilot to an April plan. An
+/// unanchored pattern here would commit the mirror-image fault — refusing a
+/// ticket because some number in its slug resembles an issue number.
+pub fn plan_ownership(body: &str, issue_number: u64) -> PlanOwnership {
+    let Some(path) = extract_plan_path(body) else {
+        return PlanOwnership::Unattributable;
+    };
+    let basename = path.rsplit('/').next().unwrap_or(&path);
+
+    static ISSUE_SLOT_RE: OnceLock<Regex> = OnceLock::new();
+    let slot_re = ISSUE_SLOT_RE.get_or_init(|| {
+        // `2026-08-29-002-fix-2038-…` → 2038. The `\d{3,4}` sequence field also
+        // covers the 4-digit time-style variant (`2026-08-29-1249-security-2039-…`).
+        Regex::new(r"^\d{4}-\d{2}-\d{2}-\d{3,4}-[a-z]+-(\d+)-")
+            .expect("plan issue-slot regex must compile")
+    });
+
+    match slot_re
+        .captures(basename)
+        .and_then(|c| c[1].parse::<u64>().ok())
+    {
+        Some(slot) if slot == issue_number => PlanOwnership::Owned,
+        Some(slot) => PlanOwnership::OwnedByOther(slot),
+        None => PlanOwnership::Unattributable,
+    }
+}
+
+/// Phase 0/Phase 1 candidate filter (mika#2020 R1, KTD7): `true` when the
+/// ticket's plan is positively attributed to a *different* issue, in which case
+/// the ticket is dropped from the candidate set and the mismatch is logged.
+///
+/// Phase 0 and Phase 1 pick one candidate out of many, so a ticket they drop is
+/// not an announced dead end — it simply is not this tick's pick, and a `warn!`
+/// is the proportionate signal. The full gesture (remove `ready`, apply
+/// `operator-review`, comment) belongs to Phase 2, where the ticket already
+/// carries `ready` and a dispatch is imminent.
+fn warn_and_reject_foreign_plan(issue: &Issue) -> bool {
+    match plan_ownership(&issue.body, issue.number) {
+        PlanOwnership::OwnedByOther(owner) => {
+            warn!(
+                issue = issue.number,
+                plan = %extract_plan_path(&issue.body).unwrap_or_else(|| "<unparseable>".to_string()),
+                owner,
+                "auto_pull_plan_ownership_mismatch"
+            );
+            true
+        }
+        PlanOwnership::Owned | PlanOwnership::Unattributable => false,
+    }
+}
+
+// ───────────────────── Promotion staleness gate (mika#2123) ─────────────────────
+
+/// How far a branch has drifted from `origin/main`, as GitHub's compare
+/// endpoint reports it (mika#2123 R1).
+///
+/// This is the same quantity `dispatch-lib.sh` computes with
+/// `git rev-list --count HEAD..origin/main` — obtained by the only means
+/// available at the promotion site, which has no checkout to run git in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchStaleness {
+    /// Commits on `main` that the branch does not have.
+    pub behind_by: i64,
+    /// Commits on the branch that `main` does not have.
+    pub ahead_by: i64,
+    /// GitHub's own word: `identical`, `ahead`, `behind`, or `diverged`.
+    pub status: String,
+}
+
+/// The outcome of trying to measure a branch (mika#2123 U1).
+///
+/// Four outcomes, not two, because "I could not measure" and "I measured zero"
+/// are different facts and collapsing them is how a gate starts lying. A `404`
+/// in particular is **not** a distance of zero — it says the branch named in
+/// the callout is not on the remote at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StalenessMeasurement {
+    /// The compare endpoint answered.
+    Measured(BranchStaleness),
+    /// The compare endpoint returned `404`: the branch is absent from origin.
+    BranchAbsent,
+    /// The issue body carries no `> - **Branch:**` callout, so there is nothing
+    /// to measure. Not an error — Phase 2 reconciles ungroomed tickets too.
+    NoBranchCallout,
+    /// The call failed for any other reason (network, rate limit, auth). The
+    /// gate has no opinion, and says so rather than inventing one.
+    Unavailable,
+}
+
+/// Why the gate refused to promote a ticket (mika#2123 R3).
+///
+/// Modelled on [`AbandonReason`]: a refusal owes its reader three things — the
+/// ticket, the reason, and what it would take to pass. A refusal nobody can act
+/// on is a silent stall wearing a label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefusalReason {
+    /// The branch is further behind `main` than the policy threshold allows.
+    TooFarBehind {
+        branch: String,
+        behind_by: i64,
+        ahead_by: i64,
+        threshold: i64,
+    },
+    /// The branch is stale **and** carries more than its plan commit — partial
+    /// work from an earlier pilot. See [`RefusalReason::remedy`] for why this is
+    /// a separate refusal and not just a stricter threshold.
+    SalvageWorkOnStaleBranch {
+        branch: String,
+        behind_by: i64,
+        ahead_by: i64,
+    },
+    /// The branch named in the ticket's callout does not exist on origin.
+    BranchAbsent { branch: String },
+}
+
+impl RefusalReason {
+    /// Stable short slug for structured logs and audit events.
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Self::TooFarBehind { .. } => "branch_too_far_behind",
+            Self::SalvageWorkOnStaleBranch { .. } => "salvage_work_on_stale_branch",
+            Self::BranchAbsent { .. } => "branch_absent_on_origin",
+        }
+    }
+
+    /// The branch this refusal is about.
+    fn branch(&self) -> &str {
+        match self {
+            Self::TooFarBehind { branch, .. }
+            | Self::SalvageWorkOnStaleBranch { branch, .. }
+            | Self::BranchAbsent { branch } => branch,
+        }
+    }
+
+    /// Human-readable statement of what was measured.
+    fn reason(&self, issue_number: u64) -> String {
+        match self {
+            Self::TooFarBehind {
+                branch,
+                behind_by,
+                ahead_by,
+                threshold,
+            } => format!(
+                "La branche `{branch}` de #{issue_number} est à **{behind_by} commits de retard** \
+                 sur `main` (avance : {ahead_by}), au-delà du seuil de promotion ({threshold}). \
+                 Le rebase du dispatch se ferait sur une branche vieille de plusieurs semaines ; \
+                 sept dispatches sont morts exactement là le 2026-08-31."
+            ),
+            Self::SalvageWorkOnStaleBranch {
+                branch,
+                behind_by,
+                ahead_by,
+            } => format!(
+                "La branche `{branch}` de #{issue_number} est en retard de **{behind_by} commits** \
+                 et porte **{ahead_by} commits** — donc plus que son seul commit de plan : \
+                 du travail partiel laissé par un pilote antérieur."
+            ),
+            Self::BranchAbsent { branch } => format!(
+                "La branche `{branch}` désignée par le callout de #{issue_number} \
+                 n'existe pas sur `origin`. Le plan est annoncé comme commité dessus ; \
+                 un pilote dispatché ici repartirait de `main` sans son plan."
+            ),
+        }
+    }
+
+    /// What it would take to pass.
+    fn remedy(&self, issue_number: u64) -> String {
+        match self {
+            Self::TooFarBehind { branch, .. } => format!(
+                "rebase `{branch}` sur `origin/main` à la main (le conflit, s'il y en a un, \
+                 se résout une fois ici plutôt qu'à chaque dispatch), ou re-groome #{issue_number} \
+                 sur une branche neuve"
+            ),
+            Self::SalvageWorkOnStaleBranch { branch, .. } => format!(
+                "décide du sort du travail partiel porté par `{branch}` : le rebaser et le garder, \
+                 ou l'abandonner explicitement en re-groomant #{issue_number} sur une branche neuve. \
+                 Ce choix porte sur du **travail**, pas sur git — c'est pour ça que la boucle ne le \
+                 prend pas toute seule en rebasant par-dessus"
+            ),
+            Self::BranchAbsent { branch } => format!(
+                "pousse `{branch}`, ou corrige le callout `> - **Branch:**` de #{issue_number} \
+                 pour qu'il désigne une branche qui existe (et vérifie au passage que le plan \
+                 annoncé n'a pas disparu avec elle)"
+            ),
+        }
+    }
+
+    /// The comment posted on the refused ticket — the channel that makes the
+    /// refusal reach a human, per the mika#2020 precedent.
+    fn comment_body(&self, issue_number: u64) -> String {
+        format!(
+            "## Auto-pull : promotion refusée pour #{issue_number}\n\n\
+             **Raison.** {}\n\n\
+             **Ce que cette porte ne fait pas.** Elle ne prédit **pas** un conflit de rebase. \
+             Elle ne peut pas : seul un vrai rebase tranche, et l'auto-pull n'a pas de checkout \
+             pour en lancer un. Elle répond à une question de politique — cette branche est-elle \
+             assez vieille pour qu'un humain regarde avant qu'un dispatch soit dépensé dessus ?\n\n\
+             **Ce qu'il faudrait pour passer.** {}, puis retire le label `{REFUSAL_LABEL}`.\n\n\
+             Aucun dispatch n'a été consommé. Le label `{REFUSAL_LABEL}` a été posé — l'auto-pull \
+             ne promouvra plus ce ticket tant qu'il le porte.\n\n\
+             <sub>Émis par la porte de promotion (mika#2123). \
+             Événement : `auto_pull_promotion_refused` (`reason={}`). \
+             Seuil réglable via `{MAX_BEHIND_ENV}`.</sub>",
+            self.reason(issue_number),
+            self.remedy(issue_number),
+            self.slug(),
+        )
+    }
+}
+
+/// The gate's verdict on one ticket (mika#2123 U2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromotionGate {
+    /// Promote. The `detail` names *why* it passed, so a promotion is as
+    /// legible in the log as a refusal.
+    Promote { detail: &'static str },
+    /// Do not promote; hand the ticket to the operator.
+    Refuse(RefusalReason),
+}
+
+/// Extract the branch name from a ticket's grooming callout (mika#2123 U1).
+///
+/// Mirrors [`extract_plan_path`], including its anchoring: the callout is
+/// matched at line start, never searched freely.
+pub fn extract_branch_name(body: &str) -> Option<String> {
+    static BRANCH_CALLOUT_RE: OnceLock<Regex> = OnceLock::new();
+    let re = BRANCH_CALLOUT_RE.get_or_init(|| {
+        Regex::new(r"(?m)^> - \*\*Branch:\*\* `([^`]+)`")
+            .expect("branch callout regex must compile")
+    });
+    re.captures(body).map(|c| c[1].to_string())
+}
+
+/// Parse GitHub's compare payload into a [`BranchStaleness`] (mika#2123 U1).
+///
+/// Split from the subprocess call so the whole decision path is testable
+/// against frozen payloads with no network — see
+/// `tests/auto_pull_promotion_gate.rs`.
+pub fn parse_compare_payload(stdout: &str) -> Result<BranchStaleness> {
+    let v: serde_json::Value = serde_json::from_str(stdout)?;
+    let behind_by = v["behind_by"]
+        .as_i64()
+        .ok_or_else(|| anyhow!("compare payload has no numeric behind_by"))?;
+    let ahead_by = v["ahead_by"]
+        .as_i64()
+        .ok_or_else(|| anyhow!("compare payload has no numeric ahead_by"))?;
+    let status = v["status"]
+        .as_str()
+        .ok_or_else(|| anyhow!("compare payload has no status"))?
+        .to_string();
+    Ok(BranchStaleness {
+        behind_by,
+        ahead_by,
+        status,
+    })
+}
+
+/// The whole promotion decision for one ticket. Pure — every input is already
+/// resolved (mika#2123 U2/U3).
+///
+/// **Fail-open on ambiguity, fail-closed on measurement.** The three
+/// "could not measure" outcomes all promote, because R5 is explicit that this
+/// gate adds a refusal path and must not narrow the existing accept path. A
+/// gate that refuses whenever GitHub hiccups would close the loop just as
+/// effectively as the wedge it exists to remove.
+///
+/// Rule order matters and is the plan's (U2), not an accident: the salvage rule
+/// is checked before the distance rule because it is the more specific fact
+/// about the same branch, and its remedy is different.
+pub fn classify_promotion(
+    measurement: &StalenessMeasurement,
+    branch: Option<&str>,
+    max_behind: i64,
+) -> PromotionGate {
+    let staleness = match measurement {
+        StalenessMeasurement::NoBranchCallout => {
+            return PromotionGate::Promote {
+                detail: "no_branch_callout",
+            };
+        }
+        StalenessMeasurement::Unavailable => {
+            return PromotionGate::Promote {
+                detail: "staleness_unavailable",
+            };
+        }
+        StalenessMeasurement::BranchAbsent => {
+            return PromotionGate::Refuse(RefusalReason::BranchAbsent {
+                branch: branch.unwrap_or("<unknown>").to_string(),
+            });
+        }
+        StalenessMeasurement::Measured(s) => s,
+    };
+
+    let branch = branch.unwrap_or("<unknown>").to_string();
+
+    // Up to date (`identical` or `ahead`): promote, no further check. This is
+    // the shape every hand-dispatched ticket had on 2026-08-31, and every one
+    // of them produced a mergeable PR.
+    if staleness.behind_by == 0 {
+        return PromotionGate::Promote {
+            detail: "up_to_date",
+        };
+    }
+
+    // U3 / AC5 — the `wip(...)` disposition, decided rather than carried.
+    //
+    // `ahead_by` separates the two populations for free: a branch carrying only
+    // its plan commit has `ahead_by == 1`; every branch that died at the rebase
+    // on 2026-08-31 carried more (2, 3, 5 and 6, measured).
+    //
+    // The reason is *not* that such branches conflict more often — that would be
+    // predicting a conflict, which this gate is forbidden to pretend to do
+    // (KTD2b). It is that a stale branch carrying unpushed partial work from a
+    // dead pilot has **two** legitimate resolutions — rebase the work, or
+    // abandon it — and choosing between them is a judgement about *work*, not
+    // about git. The loop should not make that choice silently by rebasing over
+    // it.
+    //
+    // Cost, stated plainly: this refuses some branches that would have rebased
+    // fine. That is accepted. The alternative is an autonomous loop deciding the
+    // fate of a dead pilot's partial work with nobody reading it.
+    if staleness.ahead_by > 1 {
+        return PromotionGate::Refuse(RefusalReason::SalvageWorkOnStaleBranch {
+            branch,
+            behind_by: staleness.behind_by,
+            ahead_by: staleness.ahead_by,
+        });
+    }
+
+    // `0` disables the distance check (pre-fix behaviour, kept as an escape
+    // hatch — the salvage rule above is independent and stays live).
+    if max_behind > 0 && staleness.behind_by > max_behind {
+        return PromotionGate::Refuse(RefusalReason::TooFarBehind {
+            branch,
+            behind_by: staleness.behind_by,
+            ahead_by: staleness.ahead_by,
+            threshold: max_behind,
+        });
+    }
+
+    // Behind, but within the threshold and carrying only its plan: promote. The
+    // real rebase still happens at dispatch (KTD3) — this gate never rebases
+    // anything, and moving the measurement here did not move the rebase.
+    PromotionGate::Promote {
+        detail: "behind_within_threshold",
+    }
+}
+
+/// The three measured values as a queryable JSON object for the audit trail
+/// (mika#2123 AC1).
+///
+/// AC1 asks for a *structured field*, not a substring of a message, and the
+/// reason is [`MAX_BEHIND_DEFAULT`]'s: the threshold is provisional and only a
+/// real distribution can revise it. A number embedded in prose cannot be
+/// aggregated later, so the promise to revise would be unkeepable. Emitted on
+/// **every** decision, promote or refuse.
+fn staleness_audit_json(
+    issue_number: u64,
+    branch: Option<&str>,
+    measurement: &StalenessMeasurement,
+    decision: &PromotionGate,
+    threshold: i64,
+) -> String {
+    let (behind_by, ahead_by, status) = match measurement {
+        StalenessMeasurement::Measured(s) => {
+            (Some(s.behind_by), Some(s.ahead_by), Some(s.status.as_str()))
+        }
+        _ => (None, None, None),
+    };
+    let (outcome, reason) = match decision {
+        PromotionGate::Promote { detail } => ("promote", *detail),
+        PromotionGate::Refuse(r) => ("refuse", r.slug()),
+    };
+    let measurement_slug = match measurement {
+        StalenessMeasurement::Measured(_) => "measured",
+        StalenessMeasurement::BranchAbsent => "branch_absent",
+        StalenessMeasurement::NoBranchCallout => "no_branch_callout",
+        StalenessMeasurement::Unavailable => "unavailable",
+    };
+    serde_json::json!({
+        "issue": issue_number,
+        "branch": branch,
+        "measurement": measurement_slug,
+        "behind_by": behind_by,
+        "ahead_by": ahead_by,
+        "status": status,
+        "outcome": outcome,
+        "reason": reason,
+        "threshold": threshold,
+    })
+    .to_string()
+}
+
 // ───────────────────── Priority ranking ─────────────────────
 
 /// Returns a numeric rank for priority labels: p0=4, p1=3, p2=2, p3=1, unlabelled=0.
@@ -213,7 +809,14 @@ pub fn select_best_candidate(
         .into_iter()
         .filter(|i| !i.labels.iter().any(|l| l.name == "ready"))
         .filter(|i| !open_pr_issue_numbers.contains(&i.number))
+        // mika#2020 R11: `blocked`/`operator-review` are structural exclusions,
+        // as Phase 0 has always treated them. Phase 1 did not, which left the
+        // abandonment leaking: a groomed ticket handed to the operator could be
+        // re-promoted to `ready` here on the very next idle tick, and the
+        // `ready` webhook would dispatch it again.
+        .filter(|i| !is_feeder_excluded(i))
         .filter(|i| is_groomed(&i.body))
+        .filter(|i| !warn_and_reject_foreign_plan(i))
         .collect();
 
     if candidates.is_empty() {
@@ -241,6 +844,129 @@ pub fn select_best_candidate(
 /// The per-issue circuit breaker (D4, step 4 of the D2 ordering) is applied by
 /// the async caller *before* ages are fetched, so it does not appear here — a
 /// circuit-broken ticket simply never gets an `ages_by_issue` entry.
+/// The per-ticket state Phase 2 resolves from GitHub + the DB before deciding
+/// (mika#2020). Split from the decision itself so the decision is pure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StuckReadyFacts {
+    /// An open PR closes this ticket.
+    has_open_pr: bool,
+    /// A self_dev task is in flight for this ticket.
+    in_flight: bool,
+    /// `auto_pull_stats.failure_count` is at or past the circuit-breaker threshold.
+    circuit_broken: bool,
+    /// Successful re-drives since the last observed progress.
+    redrive_count: i64,
+    /// `redrive_abandoned_at` is set — this ticket was handed to the operator.
+    abandoned: bool,
+}
+
+/// What Phase 2 should do with one `ready` ticket (mika#2020).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StuckReadyVerdict {
+    /// Eligible for a re-drive, pending the label-age check.
+    Eligible,
+    /// Not this tick. `reason` is the value of the existing
+    /// `stuck_ready_reconcile_skipped` DEBUG field.
+    Skip { reason: &'static str },
+    /// Not this tick, and the re-drive budget goes back to zero — the ticket
+    /// shows observable progress (mika#2020 R6).
+    SkipAndResetBudget { reason: &'static str },
+    /// The operator lifted an abandonment by removing `operator-review`: clear
+    /// the budget and let the ticket back in (mika#2020 R12).
+    ReEntry,
+    /// Stop re-driving, and say so (mika#2020 R3, R5).
+    Abandon(AbandonReason),
+}
+
+/// The in-memory half of the Phase 2 decision — the two checks that need no I/O
+/// (mika#2020 KTD6). Called first by the async wrapper so a ticket refused here
+/// costs no DB round-trip, and again from [`classify_stuck_ready`] so the pure
+/// decision stays whole and testable in one place.
+fn classify_stuck_ready_in_memory(issue: &Issue) -> Option<StuckReadyVerdict> {
+    // Filter A0: this ticket is not ours to take — another seat owns it, or its
+    // seat label cannot be resolved at all (mika#2084).
+    //
+    // Checked ahead of filter A even though `is_feeder_excluded` would also
+    // catch it: the skip reason is the operator-visible record of an avoided
+    // collision (AC5), and `operator_review_or_blocked` would name the wrong
+    // cause. Same decision, honest label.
+    if let Some(verdict) = seat_refusal(issue) {
+        // The reason is the operator's tally of avoided collisions, so it must
+        // distinguish "another seat owns this" from "nobody could be resolved as
+        // the owner". Counting a `dispatch:zorglub` typo as a collision would
+        // inflate the very number this record exists to make trustworthy.
+        return Some(StuckReadyVerdict::Skip {
+            reason: verdict.refusal_reason().unwrap_or("seat_refused"),
+        });
+    }
+
+    // Filter A: the ticket is already in the operator's hands (or blocked).
+    if is_feeder_excluded(issue) {
+        return Some(StuckReadyVerdict::Skip {
+            reason: "operator_review_or_blocked",
+        });
+    }
+
+    // Filter B: the plan belongs to another issue. Refused on sight, without
+    // spending a re-drive — `is_groomed` says `true` here, so a re-drive would
+    // send dev-groom straight past grooming into implementing the wrong plan.
+    if let PlanOwnership::OwnedByOther(owner) = plan_ownership(&issue.body, issue.number) {
+        let plan = extract_plan_path(&issue.body).unwrap_or_else(|| "<unparseable>".to_string());
+        return Some(StuckReadyVerdict::Abandon(
+            AbandonReason::PlanOwnedByOtherIssue { plan, owner },
+        ));
+    }
+
+    None
+}
+
+/// The whole Phase 2 decision for one ticket (mika#2020). Pure — every input is
+/// already resolved.
+fn classify_stuck_ready(
+    issue: &Issue,
+    facts: &StuckReadyFacts,
+    redrive_budget: i64,
+) -> StuckReadyVerdict {
+    if let Some(verdict) = classify_stuck_ready_in_memory(issue) {
+        return verdict;
+    }
+
+    // Progress: an open PR or a live dispatch means the re-drives worked. Both
+    // are already-computed filters, so the reset costs nothing extra (KTD5).
+    if facts.has_open_pr {
+        return StuckReadyVerdict::SkipAndResetBudget {
+            reason: "open_pr_closing",
+        };
+    }
+    if facts.in_flight {
+        return StuckReadyVerdict::SkipAndResetBudget {
+            reason: "in_flight_self_dev",
+        };
+    }
+
+    // Past filter A, a ticket carrying an abandonment stamp no longer carries
+    // `operator-review` — the operator removed it. That is the re-entry gesture.
+    if facts.abandoned {
+        return StuckReadyVerdict::ReEntry;
+    }
+
+    if facts.circuit_broken {
+        return StuckReadyVerdict::Skip {
+            reason: "circuit_breaker",
+        };
+    }
+
+    // `0` disables the budget (pre-fix behaviour, kept as an escape hatch).
+    if redrive_budget > 0 && facts.redrive_count >= redrive_budget {
+        return StuckReadyVerdict::Abandon(AbandonReason::RedriveBudgetExhausted {
+            redrives: facts.redrive_count,
+            budget: redrive_budget,
+        });
+    }
+
+    StuckReadyVerdict::Eligible
+}
+
 fn select_stuck_ready_candidates(
     issues: &[Issue],
     open_pr_issue_numbers: &HashSet<u64>,
@@ -267,13 +993,50 @@ fn select_stuck_ready_candidates(
 // ───────────────────── Phase 0 feeder selection (mika#1863) ─────────────────────
 
 /// Returns `true` if `issue` carries a label that structurally excludes it from
-/// the pullable pool AND the feeder backlog (mika#1863 R3/R4): `blocked` or
-/// `operator-review`. Both mean "not dispatchable regardless of grooming state".
+/// the pullable pool AND the feeder backlog: `blocked` or `operator-review`
+/// (mika#1863 R3/R4), [`REFUSAL_LABEL`] (mika#2123), or a `dispatch:*` seat
+/// label this engine cannot act on (mika#2084). All of them mean "not
+/// dispatchable regardless of grooming state" — the first three because someone
+/// else is holding the ticket, the last because some other seat is.
+///
+/// mika#2123 added `operator-gated` here, and it is load-bearing rather than
+/// cosmetic: it is what makes a promotion refusal *persist*. Without it the gate
+/// would refuse, apply the label, and then measure the same branch again on the
+/// next tick, forever. It is also what the label already promised on its own —
+/// `.github/labels.yml:106` reads "No ready label" — so the exclusion is the
+/// declared meaning finally being enforced, not a new policy.
 fn is_feeder_excluded(issue: &Issue) -> bool {
-    issue
+    if issue
         .labels
         .iter()
-        .any(|l| l.name == "blocked" || l.name == "operator-review")
+        .any(|l| l.name == "blocked" || l.name == "operator-review" || l.name == REFUSAL_LABEL)
+    {
+        return true;
+    }
+    // mika#2084 — a ticket another dispatch seat owns is not ours to feed.
+    //
+    // This lives in the shared predicate, not in one caller, because all three
+    // sites that apply the `ready` label filter through here: the feeder
+    // (`select_feeder_candidates`), the auto-pull selection, and the phase-2
+    // stuck-rescue classifier. A guard in only one of them would leave the other
+    // two labelling tickets that the dispatch path then refuses three layers
+    // later — `ready` applied and never consumed, which is precisely the kind of
+    // silent loop this module exists to remove.
+    //
+    // Free: the labels are already in memory, so this costs no round trip.
+    // Unlabelled issues take the `NoSeatLabel` branch and are untouched (AC3).
+    seat_refusal(issue).is_some()
+}
+
+/// The seat verdict for one issue when — and only when — it refuses (mika#2084).
+///
+/// Returns `None` for the overwhelmingly common no-seat-label case and for a
+/// ticket labelled for this engine's own seat, so callers read as "is there a
+/// reason to stand down", never "is there permission to proceed".
+fn seat_refusal(issue: &Issue) -> Option<crate::webhook_dispatch::SeatVerdict> {
+    let names: Vec<&str> = issue.labels.iter().map(|l| l.name.as_str()).collect();
+    let verdict = crate::webhook_dispatch::classify_dispatch_seat(names);
+    verdict.refuses().then_some(verdict)
 }
 
 /// Count the **pullable**-ready tickets — the threshold signal for the feeder
@@ -322,6 +1085,7 @@ fn select_feeder_candidates(
         .filter(|i| !in_flight_issue_numbers.contains(&i.number))
         .filter(|i| !is_feeder_excluded(i))
         .filter(|i| is_groomed(&i.body))
+        .filter(|i| !warn_and_reject_foreign_plan(i))
         .collect();
 
     // Rank DESC, then oldest `updated_at` first within a rank tier.
@@ -523,6 +1287,461 @@ async fn gh_remove_label(github_token: &str, issue_number: u64, label: &str) -> 
     Ok(())
 }
 
+/// Post a comment on a GitHub issue (mika#2020). Mirrors [`gh_apply_label`]'s
+/// process setup.
+///
+/// This is the channel that makes an abandonment reach a human. A `debug!` line
+/// is not a refusal anyone reads — mika#1901 was re-driven 16 times, and the
+/// only way to notice was to count timeline events by hand.
+async fn gh_comment_issue(github_token: &str, issue_number: u64, body: &str) -> Result<()> {
+    let mut cmd = tokio::process::Command::new("gh");
+    cmd.args([
+        "issue",
+        "comment",
+        &issue_number.to_string(),
+        "--repo",
+        DEFAULT_REPO,
+        "--body",
+        body,
+    ]);
+    cmd.env("GH_TOKEN", github_token);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    let output = cmd.output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "gh issue comment failed for #{}: {}",
+            issue_number,
+            stderr
+        ));
+    }
+    Ok(())
+}
+
+// ───────────────────── Promotion gate I/O (mika#2123) ─────────────────────
+
+/// Measure a branch against `main` via GitHub's compare endpoint (mika#2123 U1).
+///
+/// **Why an API call and not `git rev-list`.** This module has no local
+/// checkout — measured, not assumed: it holds a repo *slug*
+/// ([`DEFAULT_REPO`], 28 references) and no repo *path* whatsoever. `gh` needs
+/// no working tree; `git rebase` does. That single fact is why the measurement
+/// moves to promotion and the rebase itself stays at dispatch (KTD3).
+///
+/// A `404` is reported as [`StalenessMeasurement::BranchAbsent`], never as a
+/// distance of zero. Every other failure is [`StalenessMeasurement::Unavailable`],
+/// which promotes — the gate refuses on what it measured, never on what it
+/// failed to measure.
+async fn gh_compare_branch(github_token: &str, branch: &str) -> StalenessMeasurement {
+    let mut cmd = tokio::process::Command::new("gh");
+    cmd.args([
+        "api",
+        &format!("repos/{DEFAULT_REPO}/compare/main...{branch}"),
+    ]);
+    cmd.env("GH_TOKEN", github_token);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    let output = match cmd.output().await {
+        Ok(o) => o,
+        Err(e) => {
+            warn!(error = %e, branch, "auto_pull: gh api compare failed to spawn");
+            return StalenessMeasurement::Unavailable;
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("HTTP 404") || stderr.contains("Not Found") {
+            return StalenessMeasurement::BranchAbsent;
+        }
+        warn!(branch, stderr = %stderr, "auto_pull: gh api compare failed");
+        return StalenessMeasurement::Unavailable;
+    }
+
+    match parse_compare_payload(&String::from_utf8_lossy(&output.stdout)) {
+        Ok(s) => StalenessMeasurement::Measured(s),
+        Err(e) => {
+            warn!(error = %e, branch, "auto_pull: gh api compare returned unparseable payload");
+            StalenessMeasurement::Unavailable
+        }
+    }
+}
+
+/// The promotion gate (mika#2123 R1–R5). Returns `true` when the ticket may be
+/// promoted; on `false` the ticket has already been handed to the operator.
+///
+/// Called from **all three** sites that apply the `ready` label — the Phase 0
+/// feeder, the Phase 1 idle pull, and the Phase 2 stuck-ready rescue. The
+/// mika#2084 comment on [`is_feeder_excluded`] states the reason better than a
+/// new one would: a guard in only one of them leaves the other two labelling
+/// tickets the dispatch path then refuses three layers later. Phase 2's
+/// remove→add is a re-promotion with exactly the same consequence — a dispatch
+/// consumed — so R3's "no dispatch is consumed" binds it too.
+///
+/// A refusal costs one label and one comment. A promotion that should not have
+/// happened costs a dispatch, and on 2026-08-31 seven of them died in a row.
+async fn promotion_gate_allows(
+    db: &AsyncDatabase,
+    github_token: &str,
+    issue: &Issue,
+    phase: &str,
+    trace_id: &str,
+    session_id: &str,
+) -> bool {
+    let branch = extract_branch_name(&issue.body);
+    let measurement = match branch.as_deref() {
+        Some(b) => gh_compare_branch(github_token, b).await,
+        None => StalenessMeasurement::NoBranchCallout,
+    };
+    let threshold = max_behind();
+    let decision = classify_promotion(&measurement, branch.as_deref(), threshold);
+    let audit = staleness_audit_json(
+        issue.number,
+        branch.as_deref(),
+        &measurement,
+        &decision,
+        threshold,
+    );
+
+    // AC1: emitted on EVERY decision, promote or refuse, as a structured field.
+    // The threshold is provisional (KTD2c) and only a real distribution can
+    // revise it — which requires the promotions to be on record too, not just
+    // the refusals.
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            "auto_pull",
+            "auto_pull_staleness_measured",
+            None,
+            Some(&audit),
+            Some(phase),
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(error = %e, issue = issue.number, "auto_pull: failed to write staleness audit event");
+    }
+
+    match decision {
+        PromotionGate::Promote { detail } => {
+            info!(
+                issue = issue.number,
+                phase,
+                detail,
+                staleness = %audit,
+                "auto_pull_promotion_allowed"
+            );
+            true
+        }
+        PromotionGate::Refuse(reason) => {
+            refuse_promotion(
+                db,
+                github_token,
+                issue.number,
+                reason,
+                phase,
+                &audit,
+                trace_id,
+                session_id,
+            )
+            .await;
+            false
+        }
+    }
+}
+
+/// Hand a ticket back to the operator instead of promoting it (mika#2123 R3).
+///
+/// Gesture order is [`abandon_stuck_ready`]'s — the marker goes on **first**,
+/// because it, not the absence of `ready`, is what structurally excludes the
+/// ticket from all three phases ([`is_feeder_excluded`]).
+///
+/// The plan's KTD1 said this path could simply "reuse the gesture that exists".
+/// It could not: that gesture has never worked (see [`REFUSAL_LABEL`]). So the
+/// order is kept and the *silence* is removed — the marker's outcome is checked,
+/// and a failure to apply it is escalated under its own event key rather than
+/// logged as one WARN among thousands.
+///
+/// `ready` is removed for the Phase 2 case, where the ticket already carries it.
+/// [`gh_remove_label`] is idempotent, so the Phase 0/1 case where it was never
+/// applied is a no-op that exits 0.
+#[allow(clippy::too_many_arguments)]
+async fn refuse_promotion(
+    db: &AsyncDatabase,
+    github_token: &str,
+    issue_number: u64,
+    reason: RefusalReason,
+    phase: &str,
+    audit: &str,
+    trace_id: &str,
+    session_id: &str,
+) {
+    // The marker is applied FIRST and its outcome is **checked**, because a
+    // refusal that cannot mark the ticket does not persist: the next tick
+    // measures the same branch and refuses again, forever, and nobody is told.
+    //
+    // This is the mika#2020 failure mode, and it is not hypothetical — 48
+    // `'operator-review' not found` lines in `server.log` (see
+    // [`REFUSAL_LABEL`]). What went wrong there was not the ordering but the
+    // silence: a WARN among thousands, on a path whose whole job is to reach a
+    // human. So this branch escalates to ERROR under its own event key, writes
+    // its own audit row, and posts no comment — with no marker to back it, a
+    // comment would repeat on every tick and become the second kind of noise.
+    if let Err(e) = gh_apply_label(github_token, issue_number, REFUSAL_LABEL).await {
+        error!(
+            error = %e,
+            issue = issue_number,
+            phase,
+            label = REFUSAL_LABEL,
+            reason = reason.slug(),
+            staleness = %audit,
+            "auto_pull_refusal_marker_unavailable"
+        );
+        if let Err(e2) = db
+            .log_audit_event(
+                session_id,
+                "auto_pull",
+                "auto_pull_refusal_marker_unavailable",
+                None,
+                Some(audit),
+                Some(&format!(
+                    "could not apply `{REFUSAL_LABEL}` to #{issue_number}: {e}. \
+                     The promotion is still refused — no dispatch is consumed — but the \
+                     refusal does not persist and will be re-taken next tick."
+                )),
+                Some(trace_id),
+            )
+            .await
+        {
+            warn!(error = %e2, issue = issue_number, "auto_pull: failed to write marker-unavailable audit event");
+        }
+        // The caller still gets `false`: the promotion does not happen. The
+        // refusal loses its memory, never its effect.
+        return;
+    }
+
+    // Past this point the ticket is excluded from every phase
+    // ([`is_feeder_excluded`] knows `REFUSAL_LABEL`), so a failure below
+    // degrades the refusal's reach, never its effect.
+    if let Err(e) = gh_remove_label(github_token, issue_number, "ready").await {
+        warn!(error = %e, issue = issue_number, "auto_pull: promotion refusal could not remove ready label");
+    }
+
+    if let Err(e) = gh_comment_issue(
+        github_token,
+        issue_number,
+        &reason.comment_body(issue_number),
+    )
+    .await
+    {
+        warn!(error = %e, issue = issue_number, "auto_pull: promotion refusal could not post comment");
+    }
+
+    warn!(
+        issue = issue_number,
+        phase,
+        reason = reason.slug(),
+        branch = reason.branch(),
+        staleness = %audit,
+        detail = %reason.reason(issue_number),
+        "auto_pull_promotion_refused"
+    );
+
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            "auto_pull",
+            "auto_pull_promotion_refused",
+            None,
+            Some(audit),
+            Some(&reason.reason(issue_number)),
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(error = %e, issue = issue_number, "auto_pull: failed to write promotion-refusal audit event");
+    }
+}
+
+// ───────────────────── Named abandonment (mika#2020) ─────────────────────
+
+/// Why the reconciler stopped re-driving a ticket (mika#2020).
+///
+/// The two variants carry different urgency by design. A ticket whose plan
+/// belongs to another issue is abandoned on sight, because re-driving it is
+/// *actively harmful*: [`is_groomed`] answers `true`, so dev-groom skips
+/// grooming and dispatches straight into implementing the wrong plan. Every
+/// other dead end — including a ticket with no callout at all, the mika#1901
+/// case — spends its budget first, because a `ready` label on an ungroomed
+/// ticket is the pipeline's *nominal* entry state and re-driving it is how
+/// dev-groom gets another chance to produce the plan.
+///
+/// A ticket with no plan is less dangerous than a ticket with the wrong plan.
+/// Both are refused; they are not refused at the same speed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AbandonReason {
+    /// The body's plan callout points at a plan belonging to another issue.
+    PlanOwnedByOtherIssue { plan: String, owner: u64 },
+    /// The per-ticket re-drive budget is spent with no observable progress.
+    RedriveBudgetExhausted { redrives: i64, budget: i64 },
+}
+
+impl AbandonReason {
+    /// Stable short slug for structured logs and audit events.
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::PlanOwnedByOtherIssue { .. } => "plan_owned_by_other_issue",
+            Self::RedriveBudgetExhausted { .. } => "redrive_budget_exhausted",
+        }
+    }
+
+    /// Human-readable statement of what went wrong.
+    fn reason(&self, issue_number: u64) -> String {
+        match self {
+            Self::PlanOwnedByOtherIssue { plan, owner } => format!(
+                "Le callout `> - **Plan:**` de #{issue_number} désigne `{plan}`, \
+                 dont le créneau d'issue porte **#{owner}** — le plan d'un autre ticket. \
+                 Un pilote dispatché ici implémenterait l'intention de #{owner} \
+                 en croyant travailler sur #{issue_number}."
+            ),
+            Self::RedriveBudgetExhausted { redrives, budget } => format!(
+                "L'auto-pull a re-drivé #{issue_number} **{redrives} fois** \
+                 (budget : {budget}) sans progrès observable — aucune PR ouverte \
+                 fermant ce ticket, aucune tâche `self_dev` en vol. \
+                 Chaque re-drive consomme un créneau de dispatch."
+            ),
+        }
+    }
+
+    /// What it would take to pass.
+    fn remedy(&self, issue_number: u64) -> String {
+        match self {
+            Self::PlanOwnedByOtherIssue { owner, .. } => format!(
+                "corrige le callout `> - **Plan:**` du corps de #{issue_number} \
+                 pour qu'il désigne un plan de #{issue_number} (ou re-groome le ticket \
+                 pour en produire un), et vérifie que le plan de #{owner} n'a pas été \
+                 écrasé au passage"
+            ),
+            Self::RedriveBudgetExhausted { .. } => format!(
+                "groome #{issue_number} jusqu'à ce que son corps porte un callout complet \
+                 (`Branch:` + `Plan:` + `second-pass (GROOMED)`), ou détermine ce qui \
+                 empêche le dispatch de démarrer"
+            ),
+        }
+    }
+
+    /// The comment body posted on the abandoned ticket. Names the three things a
+    /// predictable refusal owes its reader: the ticket, the reason, the remedy.
+    fn comment_body(&self, issue_number: u64) -> String {
+        format!(
+            "## Auto-pull : re-drive abandonné pour #{issue_number}\n\n\
+             **Raison.** {}\n\n\
+             **Ce qu'il faudrait pour passer.** Pour remettre ce ticket en jeu : {}, \
+             puis retire le label `operator-review`.\n\n\
+             Le label `ready` a été retiré et `operator-review` posé — l'auto-pull ne \
+             re-drivera plus ce ticket tant qu'il porte ce label. Retirer `operator-review` \
+             remet son compteur de re-drives à zéro.\n\n\
+             <sub>Émis par le reconciler stuck-ready (mika#1824), borné par mika#2020. \
+             Événement : `auto_pull_redrive_abandoned` (`reason={}`).</sub>",
+            self.reason(issue_number),
+            self.remedy(issue_number),
+            self.slug(),
+        )
+    }
+}
+
+/// Stop re-driving a ticket, and say so where a human will see it (mika#2020
+/// R8–R10, R13).
+///
+/// Order matters: `ready` comes off first because that is what actually stops
+/// the loop; everything after it is visibility layered on top of an arrest
+/// already secured. A failure to comment degrades the refusal's reach, not its
+/// effect.
+async fn abandon_stuck_ready(
+    db: &AsyncDatabase,
+    github_token: &str,
+    issue_number: u64,
+    reason: AbandonReason,
+    trace_id: &str,
+    session_id: &str,
+) {
+    // `operator-review` goes on FIRST, and a failure to apply it aborts the
+    // abandonment. It — not the absence of `ready` — is what structurally
+    // excludes the ticket from all three phases, so it must be the label that
+    // lands. Removing `ready` first and then failing here would leave the ticket
+    // with neither label but with an abandonment stamp: Phase 1 would re-promote
+    // it, Phase 2 would read the stamp-without-label as the operator's re-entry
+    // gesture, and the budget would reset — a fresh loop every N re-drives.
+    // Aborting instead is convergent: the counter is still past the budget, so
+    // the next tick simply retries the abandonment.
+    if let Err(e) = gh_apply_label(github_token, issue_number, "operator-review").await {
+        warn!(error = %e, issue = issue_number, "auto_pull: abandon could not apply operator-review label; leaving ticket untouched for the next tick");
+        if let Err(e2) = db
+            .increment_auto_pull_failure(DEFAULT_REPO, issue_number)
+            .await
+        {
+            warn!(error = %e2, "auto_pull: failed to increment failure counter");
+        }
+        return;
+    }
+
+    // Past this point the ticket is already excluded from every phase, so a
+    // failure below degrades the refusal's reach, never its effect.
+    if let Err(e) = gh_remove_label(github_token, issue_number, "ready").await {
+        warn!(error = %e, issue = issue_number, "auto_pull: abandon could not remove ready label");
+    }
+
+    if let Err(e) = gh_comment_issue(
+        github_token,
+        issue_number,
+        &reason.comment_body(issue_number),
+    )
+    .await
+    {
+        warn!(error = %e, issue = issue_number, "auto_pull: abandon could not post comment");
+    }
+
+    if let Err(e) = db
+        .mark_auto_pull_redrive_abandoned(DEFAULT_REPO, issue_number)
+        .await
+    {
+        warn!(error = %e, issue = issue_number, "auto_pull: failed to stamp abandonment");
+    }
+
+    warn!(
+        issue = issue_number,
+        reason = reason.slug(),
+        detail = %reason.reason(issue_number),
+        "auto_pull_redrive_abandoned"
+    );
+
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            "auto_pull",
+            "auto_pull_redrive_abandoned",
+            None,
+            Some(&format!(
+                "#{} abandoned: reason={}",
+                issue_number,
+                reason.slug()
+            )),
+            None,
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(error = %e, "auto_pull: failed to write abandonment audit event");
+    }
+}
+
 /// Parse an issue-timeline JSON array and return the `created_at` of the LAST
 /// `labeled` event whose label name is `ready` (mika#1824 D1). A remove→add
 /// cycle appends a fresh `labeled` event, so `last` is the authoritative
@@ -653,8 +1872,15 @@ pub async fn auto_pull_groomed_ticket(
     .await;
 
     // Phase 2 — reconcile stuck-ready tickets, independent of queue depth (mika#1824).
-    let rescued =
-        phase2_reconcile_stuck_ready(db, github_token, &issues, &open_pr_issue_numbers).await;
+    let rescued = phase2_reconcile_stuck_ready(
+        db,
+        github_token,
+        &issues,
+        &open_pr_issue_numbers,
+        trace_id,
+        session_id,
+    )
+    .await;
     debug!(
         rescued,
         "auto_pull: phase 2 stuck-ready reconciler complete"
@@ -816,6 +2042,34 @@ async fn phase0_feed_ready_pool(
             .map(|i| feeder_rank(&i.labels))
             .unwrap_or(0);
 
+        // mika#2123: measure the branch before spending a dispatch on it. A
+        // refusal here costs a label; a promotion that dies at the dispatch-time
+        // rebase costs the dispatch itself.
+        //
+        // The candidate always comes from `issues`, so the lookup cannot miss —
+        // but a gate silently skipped when it does would be this very ticket's
+        // failure class wearing a different hat. It gets a WARN, not a shrug.
+        match issues.iter().find(|i| i.number == n) {
+            Some(issue) => {
+                if !promotion_gate_allows(
+                    db,
+                    github_token,
+                    issue,
+                    "phase0_feeder",
+                    trace_id,
+                    session_id,
+                )
+                .await
+                {
+                    continue;
+                }
+            }
+            None => warn!(
+                issue = n,
+                "auto_pull: candidate absent from the issue list; staleness gate skipped"
+            ),
+        }
+
         if let Err(e) = gh_apply_label(github_token, n, "ready").await {
             warn!(error = %e, issue = n, "auto_feeder: failed to apply ready label");
             if let Err(e2) = db.increment_auto_pull_failure(DEFAULT_REPO, n).await {
@@ -935,6 +2189,29 @@ async fn phase1_promote_groomed(
 
     let rank = priority_rank(&candidate.labels);
 
+    // 4b. mika#2123: the promotion staleness gate. Same gate as Phase 0 and
+    // Phase 2 — all three apply `ready`, so all three must pass through it.
+    //
+    // Phase 1 picks exactly one candidate, so a refusal here costs the whole
+    // tick: nothing is promoted even if a healthy candidate ranked just below.
+    // Left that way deliberately. The refused ticket now carries
+    // [`REFUSAL_LABEL`], `is_feeder_excluded` drops it, and the next tick
+    // reaches the next-best candidate — one idle tick, self-healing, against the
+    // complexity of a retry loop inside a phase whose whole shape is "one pick
+    // when the queue is idle".
+    if !promotion_gate_allows(
+        db,
+        github_token,
+        &candidate,
+        "phase1_idle_pull",
+        trace_id,
+        session_id,
+    )
+    .await
+    {
+        return None;
+    }
+
     // 5. Apply the `ready` label to trigger webhook-driven dispatch.
     if let Err(e) = gh_apply_label(github_token, candidate.number, "ready").await {
         warn!(
@@ -1009,8 +2286,11 @@ async fn phase2_reconcile_stuck_ready(
     github_token: &str,
     issues: &[Issue],
     open_pr_issue_numbers: &HashSet<u64>,
+    trace_id: &str,
+    session_id: &str,
 ) -> usize {
     let threshold = stuck_ready_threshold_secs();
+    let redrive_budget = max_redrives();
 
     // Filter 1 (in-mem): keep only tickets WITH the `ready` label (inverse of
     // Phase 1's filter). Everything without `ready` is Phase 1 territory.
@@ -1022,62 +2302,105 @@ async fn phase2_reconcile_stuck_ready(
         return 0;
     }
 
-    // Filters 2–4 (in-mem open-PR, DB in-flight, DB circuit-breaker). Build the
-    // in-flight set (for the pure predicate) and the survivor list (for the
-    // age-fetch step). Ordering is cheapest-first so the API call in step 5
-    // fires for as few tickets as possible.
+    // Filters 2–8. Ordering is cheapest-first (in-mem → DB → GitHub API), so the
+    // timeline call in the age step fires for as few tickets as possible. The
+    // decision itself is the pure `classify_stuck_ready`; this loop only
+    // resolves its inputs and enacts its verdict.
     let mut in_flight_issue_numbers: HashSet<u64> = HashSet::new();
     let mut survivors: Vec<u64> = Vec::new();
     for issue in &ready {
         let n = issue.number;
 
-        // Filter 2: open PR closing this issue (in-memory, already fetched).
-        if open_pr_issue_numbers.contains(&n) {
-            debug!(
-                issue = n,
-                reason = "open_pr_closing",
-                "stuck_ready_reconcile_skipped"
-            );
+        // Filters 2–3 (in-mem): operator-held tickets and misattributed plans.
+        // Decided before any I/O (mika#2020 KTD6).
+        if let Some(verdict) = classify_stuck_ready_in_memory(issue) {
+            match verdict {
+                StuckReadyVerdict::Skip { reason } => {
+                    debug!(issue = n, reason, "stuck_ready_reconcile_skipped");
+                }
+                StuckReadyVerdict::Abandon(reason) => {
+                    abandon_stuck_ready(db, github_token, n, reason, trace_id, session_id).await;
+                }
+                // `classify_stuck_ready_in_memory` yields only those two.
+                other => debug!(
+                    issue = n,
+                    ?other,
+                    "stuck_ready_reconcile_unexpected_verdict"
+                ),
+            }
             continue;
         }
 
-        // Filter 3: in-flight self_dev task for this issue (DB, cheap).
+        // Filter 4 (DB, cheap): in-flight self_dev task for this issue.
         let issue_url = format!("https://github.com/{}/issues/{}", DEFAULT_REPO, n);
-        match db.has_active_self_dev_task_for_issue(&issue_url).await {
-            Ok(true) => {
-                in_flight_issue_numbers.insert(n);
-                debug!(
-                    issue = n,
-                    reason = "in_flight_self_dev",
-                    "stuck_ready_reconcile_skipped"
-                );
-                continue;
-            }
-            Ok(false) => {}
+        let in_flight = match db.has_active_self_dev_task_for_issue(&issue_url).await {
+            Ok(v) => v,
             Err(e) => {
                 warn!(error = %e, issue = n, "auto_pull: phase 2 in-flight check failed; skipping ticket");
                 continue;
             }
+        };
+        if in_flight {
+            in_flight_issue_numbers.insert(n);
         }
 
-        // Filter 4: circuit-breaker (DB, cheap). Fail-open on error.
-        match db.get_auto_pull_failure_count(DEFAULT_REPO, n).await {
-            Ok(count) if count >= CIRCUIT_BREAKER_THRESHOLD => {
-                debug!(
-                    issue = n,
-                    reason = "circuit_breaker",
-                    failure_count = count,
-                    "stuck_ready_reconcile_skipped"
-                );
-                continue;
-            }
-            Ok(_) => {}
+        // Filter 5 (DB, cheap): circuit-breaker. Fail-open on error.
+        let circuit_broken = match db.get_auto_pull_failure_count(DEFAULT_REPO, n).await {
+            Ok(count) => count >= CIRCUIT_BREAKER_THRESHOLD,
             Err(e) => {
                 warn!(error = %e, issue = n, "auto_pull: phase 2 circuit-breaker check failed; proceeding");
+                false
+            }
+        };
+
+        // Filter 6 (DB, cheap): re-drive budget + abandonment stamp (mika#2020).
+        // Fail-open on error — an unreadable counter must not strand a ticket.
+        let (redrive_count, abandoned) = match db.get_auto_pull_redrive_state(DEFAULT_REPO, n).await
+        {
+            Ok(state) => state,
+            Err(e) => {
+                warn!(error = %e, issue = n, "auto_pull: phase 2 re-drive state read failed; proceeding");
+                (0, false)
+            }
+        };
+
+        let facts = StuckReadyFacts {
+            has_open_pr: open_pr_issue_numbers.contains(&n),
+            in_flight,
+            circuit_broken,
+            redrive_count,
+            abandoned,
+        };
+
+        match classify_stuck_ready(issue, &facts, redrive_budget) {
+            StuckReadyVerdict::Eligible => survivors.push(n),
+            StuckReadyVerdict::Skip { reason } => {
+                debug!(issue = n, reason, "stuck_ready_reconcile_skipped");
+            }
+            StuckReadyVerdict::SkipAndResetBudget { reason } => {
+                debug!(issue = n, reason, "stuck_ready_reconcile_skipped");
+                if redrive_count > 0
+                    && let Err(e) = db.reset_auto_pull_redrive(DEFAULT_REPO, n).await
+                {
+                    warn!(error = %e, issue = n, "auto_pull: failed to reset re-drive budget on progress");
+                }
+            }
+            StuckReadyVerdict::ReEntry => {
+                if let Err(e) = db.reset_auto_pull_redrive(DEFAULT_REPO, n).await {
+                    warn!(error = %e, issue = n, "auto_pull: failed to clear abandonment on re-entry");
+                    continue;
+                }
+                info!(
+                    issue = n,
+                    prior_redrives = redrive_count,
+                    "auto_pull_redrive_reentry"
+                );
+                survivors.push(n);
+            }
+            StuckReadyVerdict::Abandon(reason) => {
+                abandon_stuck_ready(db, github_token, n, reason, trace_id, session_id).await;
             }
         }
-
-        survivors.push(n);
     }
 
     if survivors.is_empty() {
@@ -1147,6 +2470,33 @@ async fn phase2_reconcile_stuck_ready(
             break;
         }
 
+        // mika#2123: a remove→add rescue is a re-promotion — it fires the same
+        // `ready` webhook and consumes the same dispatch. R3 binds it too.
+        //
+        // A refusal `continue`s *before* `rescued` is incremented, so a refused
+        // ticket never eats one of the tick's rescue slots. And a lookup miss is
+        // a WARN, not a silently skipped gate.
+        match issues.iter().find(|i| i.number == n) {
+            Some(issue) => {
+                if !promotion_gate_allows(
+                    db,
+                    github_token,
+                    issue,
+                    "phase2_stuck_rescue",
+                    trace_id,
+                    session_id,
+                )
+                .await
+                {
+                    continue;
+                }
+            }
+            None => warn!(
+                issue = n,
+                "auto_pull: candidate absent from the issue list; staleness gate skipped"
+            ),
+        }
+
         if let Err(e) = gh_remove_label(github_token, n, "ready").await {
             warn!(error = %e, issue = n, "auto_pull: phase 2 remove ready label failed");
             if let Err(e2) = db.increment_auto_pull_failure(DEFAULT_REPO, n).await {
@@ -1168,6 +2518,14 @@ async fn phase2_reconcile_stuck_ready(
         if let Err(e) = db.reset_auto_pull_failure(DEFAULT_REPO, n).await {
             warn!(error = %e, "auto_pull: failed to reset failure counter");
         }
+        // mika#2020: the line above is exactly where the loop used to erase its
+        // own memory. `failure_count` going back to zero is correct — the API
+        // call succeeded — but it left nothing counting the rescues themselves,
+        // so #1901 could be re-driven 16 times and look brand new each round.
+        // The re-drive budget increments on the same successful event.
+        if let Err(e) = db.increment_auto_pull_redrive(DEFAULT_REPO, n).await {
+            warn!(error = %e, issue = n, "auto_pull: failed to increment re-drive counter");
+        }
         info!(issue = n, "stuck_ready_reconciled");
         rescued += 1;
     }
@@ -1180,6 +2538,320 @@ async fn phase2_reconcile_stuck_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── mika#2123 promotion staleness gate ──
+
+    fn measured(behind_by: i64, ahead_by: i64, status: &str) -> StalenessMeasurement {
+        StalenessMeasurement::Measured(BranchStaleness {
+            behind_by,
+            ahead_by,
+            status: status.to_string(),
+        })
+    }
+
+    #[test]
+    fn test_parse_max_behind_default_and_overrides() {
+        assert_eq!(parse_max_behind(None), MAX_BEHIND_DEFAULT);
+        assert_eq!(parse_max_behind(Some("")), MAX_BEHIND_DEFAULT);
+        assert_eq!(parse_max_behind(Some("  ")), MAX_BEHIND_DEFAULT);
+        assert_eq!(parse_max_behind(Some("not-a-number")), MAX_BEHIND_DEFAULT);
+        assert_eq!(parse_max_behind(Some("-5")), MAX_BEHIND_DEFAULT);
+        assert_eq!(parse_max_behind(Some("120")), 120);
+        // `0` is the disable sentinel, not an invalid value — same contract as
+        // MIKA_AUTO_PULL_MAX_REDRIVES.
+        assert_eq!(parse_max_behind(Some("0")), 0);
+    }
+
+    #[test]
+    fn test_extract_branch_name_from_callout() {
+        let body = "> - **Branch:** `fix/2123/dispatch-lib-le-rebase-est-tent-au`\n\
+                    > - **Plan:** `docs/plans/2026-09-01-001-fix-2123-x-plan.md` (committed on branch @ abc1234)\n";
+        assert_eq!(
+            extract_branch_name(body).as_deref(),
+            Some("fix/2123/dispatch-lib-le-rebase-est-tent-au")
+        );
+    }
+
+    #[test]
+    fn test_extract_branch_name_absent_and_unanchored() {
+        assert_eq!(extract_branch_name(""), None);
+        assert_eq!(extract_branch_name("no callout here"), None);
+        // Anchored at line start, like extract_plan_path: prose that merely
+        // mentions the callout shape must not be read as one.
+        assert_eq!(
+            extract_branch_name("see the > - **Branch:** `feat/x` line in the body"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_compare_payload_reads_the_three_values() {
+        let s = parse_compare_payload(r#"{"status":"diverged","ahead_by":2,"behind_by":180}"#)
+            .expect("valid payload parses");
+        assert_eq!(
+            (s.behind_by, s.ahead_by, s.status.as_str()),
+            (180, 2, "diverged")
+        );
+    }
+
+    #[test]
+    fn test_parse_compare_payload_rejects_missing_fields() {
+        assert!(parse_compare_payload(r#"{"status":"ahead"}"#).is_err());
+        assert!(parse_compare_payload("not json").is_err());
+    }
+
+    /// AE3 — distance 0 promotes with no further check.
+    #[test]
+    fn test_promotion_gate_up_to_date_promotes() {
+        assert!(matches!(
+            classify_promotion(&measured(0, 1, "ahead"), Some("feat/x"), 50),
+            PromotionGate::Promote {
+                detail: "up_to_date"
+            }
+        ));
+        assert!(matches!(
+            classify_promotion(&measured(0, 0, "identical"), Some("feat/x"), 50),
+            PromotionGate::Promote {
+                detail: "up_to_date"
+            }
+        ));
+        // Distance 0 wins over the salvage rule: a branch carrying salvage work
+        // that is already current has nothing to rebase and nothing to decide.
+        assert!(matches!(
+            classify_promotion(&measured(0, 7, "ahead"), Some("feat/x"), 50),
+            PromotionGate::Promote {
+                detail: "up_to_date"
+            }
+        ));
+    }
+
+    /// AC3 — the negative control. A branch behind but within the threshold,
+    /// carrying only its plan commit, **must** be promoted.
+    ///
+    /// This is the assertion that distinguishes a working gate from a gate that
+    /// refuses everything. Make the refusal branch in `classify_promotion`
+    /// unconditional and this test goes red — demonstrated in the PR body.
+    #[test]
+    fn test_promotion_gate_behind_but_within_threshold_promotes() {
+        for behind in [1, 17, 49, 50] {
+            assert!(
+                matches!(
+                    classify_promotion(&measured(behind, 1, "diverged"), Some("feat/x"), 50),
+                    PromotionGate::Promote {
+                        detail: "behind_within_threshold"
+                    }
+                ),
+                "behind={behind} must be promoted"
+            );
+        }
+    }
+
+    /// AC1/AC4 — past the threshold, with only a plan commit, the distance rule
+    /// refuses on its own.
+    #[test]
+    fn test_promotion_gate_too_far_behind_refuses() {
+        match classify_promotion(&measured(75, 1, "diverged"), Some("feat/x"), 50) {
+            PromotionGate::Refuse(r @ RefusalReason::TooFarBehind { .. }) => {
+                assert_eq!(r.slug(), "branch_too_far_behind");
+                // The refusal states what it is and is not: a policy call, never
+                // a conflict prediction (KTD2b).
+                assert!(
+                    r.comment_body(1959)
+                        .contains("ne prédit **pas** un conflit")
+                );
+                assert!(r.remedy(1959).contains("rebase"));
+            }
+            other => panic!("expected TooFarBehind, got {other:?}"),
+        }
+    }
+
+    /// AC5 / U3 — the `wip(...)` disposition. A stale branch carrying more than
+    /// its plan commit is never auto-promoted, whatever the distance.
+    #[test]
+    fn test_promotion_gate_salvage_work_refuses_independently_of_threshold() {
+        // One commit behind, two ahead: far under any threshold, still refused.
+        match classify_promotion(&measured(1, 2, "diverged"), Some("fix/1680/x"), 50) {
+            PromotionGate::Refuse(r @ RefusalReason::SalvageWorkOnStaleBranch { .. }) => {
+                assert_eq!(r.slug(), "salvage_work_on_stale_branch");
+                // The remedy names the real choice: what to do with the *work*.
+                assert!(r.remedy(1680).contains("travail partiel"));
+            }
+            other => panic!("expected SalvageWorkOnStaleBranch, got {other:?}"),
+        }
+        // And it survives the threshold being disabled — the two rules are
+        // independent, which is exactly why no single mutation can flip #1680.
+        assert!(matches!(
+            classify_promotion(&measured(180, 2, "diverged"), Some("fix/1680/x"), 0),
+            PromotionGate::Refuse(RefusalReason::SalvageWorkOnStaleBranch { .. })
+        ));
+    }
+
+    /// The disable sentinel: `0` switches the distance rule off entirely.
+    #[test]
+    fn test_promotion_gate_threshold_zero_disables_distance_rule() {
+        assert!(matches!(
+            classify_promotion(&measured(989, 1, "diverged"), Some("docs/x"), 0),
+            PromotionGate::Promote {
+                detail: "behind_within_threshold"
+            }
+        ));
+    }
+
+    /// R5 — fail-open on ambiguity. Neither "no callout" nor "the API did not
+    /// answer" is a reason to refuse: the gate refuses on what it measured,
+    /// never on what it failed to measure.
+    #[test]
+    fn test_promotion_gate_fails_open_when_it_cannot_measure() {
+        assert!(matches!(
+            classify_promotion(&StalenessMeasurement::NoBranchCallout, None, 50),
+            PromotionGate::Promote {
+                detail: "no_branch_callout"
+            }
+        ));
+        assert!(matches!(
+            classify_promotion(&StalenessMeasurement::Unavailable, Some("feat/x"), 50),
+            PromotionGate::Promote {
+                detail: "staleness_unavailable"
+            }
+        ));
+    }
+
+    /// U1 — a `404` is not a distance of zero. The branch named in the callout
+    /// is not on the remote, and the plan announced as committed on it is not
+    /// there either.
+    #[test]
+    fn test_promotion_gate_absent_branch_is_its_own_outcome() {
+        match classify_promotion(&StalenessMeasurement::BranchAbsent, Some("feat/gone"), 50) {
+            PromotionGate::Refuse(r @ RefusalReason::BranchAbsent { .. }) => {
+                assert_eq!(r.slug(), "branch_absent_on_origin");
+                assert!(r.reason(42).contains("n'existe pas sur `origin`"));
+            }
+            other => panic!("expected BranchAbsent, got {other:?}"),
+        }
+    }
+
+    /// AC1 — the three measured values reach the audit trail as queryable JSON
+    /// fields, not as a substring of a prose message, and they are emitted on a
+    /// **promotion** too. KTD2c's promise to revise the threshold from a real
+    /// distribution is unkeepable if only refusals are on record.
+    #[test]
+    fn test_staleness_audit_json_is_structured_on_promote_and_refuse() {
+        let m = measured(17, 1, "diverged");
+        let promote = classify_promotion(&m, Some("ci/2048-x"), 50);
+        let json: serde_json::Value = serde_json::from_str(&staleness_audit_json(
+            2048,
+            Some("ci/2048-x"),
+            &m,
+            &promote,
+            50,
+        ))
+        .expect("audit payload is valid JSON");
+        assert_eq!(json["behind_by"], 17);
+        assert_eq!(json["ahead_by"], 1);
+        assert_eq!(json["status"], "diverged");
+        assert_eq!(json["outcome"], "promote");
+        assert_eq!(json["threshold"], 50);
+
+        let m = measured(180, 2, "diverged");
+        let refuse = classify_promotion(&m, Some("fix/1680/x"), 50);
+        let json: serde_json::Value = serde_json::from_str(&staleness_audit_json(
+            1680,
+            Some("fix/1680/x"),
+            &m,
+            &refuse,
+            50,
+        ))
+        .expect("audit payload is valid JSON");
+        assert_eq!(json["outcome"], "refuse");
+        assert_eq!(json["reason"], "salvage_work_on_stale_branch");
+        assert_eq!(json["behind_by"], 180);
+
+        // Unmeasurable outcomes carry nulls, never a fabricated zero.
+        let m = StalenessMeasurement::Unavailable;
+        let d = classify_promotion(&m, Some("feat/x"), 50);
+        let json: serde_json::Value =
+            serde_json::from_str(&staleness_audit_json(1, Some("feat/x"), &m, &d, 50)).unwrap();
+        assert!(json["behind_by"].is_null());
+        assert_eq!(json["measurement"], "unavailable");
+    }
+
+    /// The label the gate applies must actually exist.
+    ///
+    /// This is mika#2123's own correction, made structural. `operator-review` is
+    /// referenced a dozen times in this module and declared nowhere; 48
+    /// production lines say `'operator-review' not found`. Prose cannot prevent
+    /// the next instance — reading the declaration file can.
+    #[test]
+    fn test_refusal_label_is_declared_in_labels_yml() {
+        let yml = include_str!("../../../.github/labels.yml");
+        let declared = |name: &str| yml.contains(&format!("- name: {name}"));
+
+        // Positive control: the guard can see a label that IS declared.
+        assert!(declared("ready"), "labels.yml must declare `ready`");
+        // Negative control: the guard can see a label that is NOT declared. A
+        // check that answers `true` for everything proves nothing.
+        assert!(
+            !declared("a-label-nobody-has-ever-declared"),
+            "the guard must be able to detect an undeclared label"
+        );
+
+        assert!(
+            declared(REFUSAL_LABEL),
+            "the promotion gate applies `{REFUSAL_LABEL}`, which .github/labels.yml does not \
+             declare — the refusal would fail exactly as `operator-review` does today"
+        );
+    }
+
+    /// The refusal must **persist**. A marker the exclusion predicate does not
+    /// know is a marker that changes nothing: the gate would re-measure and
+    /// re-refuse the same branch on every tick.
+    #[test]
+    fn test_refusal_label_excludes_the_ticket_from_every_phase() {
+        let issue = Issue {
+            number: 1680,
+            body: String::new(),
+            labels: vec![IssueLabel {
+                name: REFUSAL_LABEL.to_string(),
+            }],
+            updated_at: "2026-09-01T00:00:00Z".to_string(),
+        };
+        assert!(
+            is_feeder_excluded(&issue),
+            "a ticket carrying `{REFUSAL_LABEL}` must be excluded from the pool"
+        );
+    }
+
+    /// R4 / DoD — no content conflict is ever auto-resolved. The gate has no
+    /// merge strategy because it performs no merge; this asserts the module
+    /// never grew one.
+    #[test]
+    fn test_promotion_gate_never_resolves_conflicts() {
+        // Scan the production half only: the needles below appear verbatim in
+        // this test, so scanning the whole file would make the guard fail on
+        // itself. Splitting on the first `cfg(test)` attribute cuts exactly
+        // there — everything before it is production.
+        let src = include_str!("auto_pull.rs");
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("split always yields a first element");
+
+        // Positive control: a bad split would hand us an empty slice, and every
+        // assertion below would pass for the wrong reason. This is what makes
+        // the guard a probe rather than a decoration.
+        assert!(
+            production.contains("fn classify_promotion"),
+            "production slice must actually contain the gate ({} bytes)",
+            production.len()
+        );
+
+        for forbidden in ["-X ours", "-X theirs", "--strategy"] {
+            assert!(
+                !production.contains(forbidden),
+                "auto_pull must never carry a merge strategy flag ({forbidden})"
+            );
+        }
+    }
 
     // ── is_groomed tests ──
 
@@ -1934,5 +3606,428 @@ This ticket has been GROOMED and is ready.
             vec![2, 4, 5],
             "top 3 by rank: p0-critical(#2) > p1-important(#4) > agent-core(#5)"
         );
+    }
+
+    // ── mika#2020: plan ownership ──
+
+    /// Body shape whose plan callout carries a canonical issue slot.
+    fn body_with_plan(plan_basename: &str) -> String {
+        format!(
+            "> - **Branch:** `fix/1/x`\n\
+             > - **Plan:** `docs/plans/{plan_basename}` (committed on branch @ abc1234)\n\
+             > - **Grooming history:** first-pass (READY) → second-pass (GROOMED) — session-id: 550e8400"
+        )
+    }
+
+    #[test]
+    fn test_plan_ownership_owned() {
+        let body =
+            body_with_plan("2026-08-29-002-fix-2038-find-issue-plan-tier1-refutation-plan.md");
+        assert_eq!(plan_ownership(&body, 2038), PlanOwnership::Owned);
+    }
+
+    #[test]
+    fn test_plan_ownership_owned_by_other_the_1887_incident() {
+        // The literal callout mika#1887 carried: a real plan file belonging to
+        // #1933. The pilot opened it and had no way to know.
+        let body =
+            body_with_plan("2026-08-21-002-fix-1933-reader-completed-section-avancement-plan.md");
+        assert_eq!(
+            plan_ownership(&body, 1887),
+            PlanOwnership::OwnedByOther(1933),
+            "a plan positively attributed to another issue must be refused"
+        );
+    }
+
+    #[test]
+    fn test_plan_ownership_four_digit_sequence_field() {
+        // `1249` is the sequence field, `2039` the issue slot — the regex must
+        // not mistake one for the other.
+        let body =
+            body_with_plan("2026-08-29-1249-security-2039-pat-github-hors-argv-bwrap-plan.md");
+        assert_eq!(plan_ownership(&body, 2039), PlanOwnership::Owned);
+        assert_eq!(
+            plan_ownership(&body, 1249),
+            PlanOwnership::OwnedByOther(2039)
+        );
+    }
+
+    #[test]
+    fn test_plan_ownership_historical_names_are_unattributable() {
+        for name in [
+            "2047-disable-release-please-workflow.md",
+            "918-eval-kg-fixtures-schema-pin-v29-const-assert-e2e-test.md",
+            "mika-1221-pre-fix-self-model-backup.txt",
+        ] {
+            let body = body_with_plan(name);
+            assert_eq!(
+                plan_ownership(&body, 1),
+                PlanOwnership::Unattributable,
+                "{name} has no canonical issue slot — ambiguity must fail open"
+            );
+        }
+    }
+
+    #[test]
+    fn test_plan_ownership_no_callout_is_unattributable() {
+        assert_eq!(
+            plan_ownership(UNGROOMED_BODY, 1901),
+            PlanOwnership::Unattributable,
+            "mika#1901 carried no callout at all"
+        );
+    }
+
+    #[test]
+    fn test_plan_ownership_anchored_against_the_2038_glob_trap() {
+        // mika#2038: a permissive `*-2026-*` glob matched `rustsec-2026-0097`.
+        // The anchored slot regex must not read a slug number as an issue slot.
+        let body =
+            body_with_plan("2026-04-11-003-chore-deps-bump-rand-clear-rustsec-2026-0097-plan.md");
+        // `chore` is the type field, `deps` is not a number → no slot at the
+        // canonical position, so no accusation.
+        assert_eq!(plan_ownership(&body, 2026), PlanOwnership::Unattributable);
+    }
+
+    #[test]
+    fn test_plan_ownership_path_outside_docs_plans_is_unattributable() {
+        let body = "> - **Plan:** `notes/2026-08-29-002-fix-2038-x-plan.md`";
+        assert_eq!(plan_ownership(body, 2038), PlanOwnership::Unattributable);
+    }
+
+    // ── mika#2020: re-drive budget parsing ──
+
+    #[test]
+    fn test_max_redrives_parse_contract() {
+        assert_eq!(parse_max_redrives(None), MAX_REDRIVES_DEFAULT);
+        assert_eq!(parse_max_redrives(Some("")), MAX_REDRIVES_DEFAULT);
+        assert_eq!(parse_max_redrives(Some("   ")), MAX_REDRIVES_DEFAULT);
+        assert_eq!(parse_max_redrives(Some("-1")), MAX_REDRIVES_DEFAULT);
+        assert_eq!(parse_max_redrives(Some("abc")), MAX_REDRIVES_DEFAULT);
+        assert_eq!(parse_max_redrives(Some("7")), 7);
+        assert_eq!(
+            parse_max_redrives(Some("0")),
+            0,
+            "0 is the disable sentinel"
+        );
+    }
+
+    // ── mika#2020: Phase 2 classification ──
+
+    fn facts(redrive_count: i64) -> StuckReadyFacts {
+        StuckReadyFacts {
+            has_open_pr: false,
+            in_flight: false,
+            circuit_broken: false,
+            redrive_count,
+            abandoned: false,
+        }
+    }
+
+    #[test]
+    fn test_classify_operator_review_is_skipped_never_abandoned() {
+        let issue = make_issue(1, UNGROOMED_BODY, &["ready", "operator-review"], "t");
+        assert_eq!(
+            classify_stuck_ready(&issue, &facts(99), 3),
+            StuckReadyVerdict::Skip {
+                reason: "operator_review_or_blocked"
+            },
+            "a ticket already in the operator's hands gets no second gesture"
+        );
+    }
+
+    #[test]
+    fn test_classify_foreign_plan_abandons_without_spending_budget() {
+        let body =
+            body_with_plan("2026-08-21-002-fix-1933-reader-completed-section-avancement-plan.md");
+        let issue = make_issue(1887, &body, &["ready"], "t");
+        match classify_stuck_ready(&issue, &facts(0), 3) {
+            StuckReadyVerdict::Abandon(AbandonReason::PlanOwnedByOtherIssue { plan, owner }) => {
+                assert_eq!(owner, 1933);
+                assert!(plan.contains("fix-1933"));
+            }
+            other => panic!("expected immediate abandon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_ungroomed_ticket_spends_budget_then_abandons() {
+        // The mika#1901 shape: `ready` on a ticket with no callout at all.
+        // `ready` on an ungroomed ticket is the pipeline's NOMINAL entry state
+        // — re-driving it is how dev-groom gets another chance — so it is
+        // bounded, not refused on sight.
+        let issue = make_issue(1901, UNGROOMED_BODY, &["ready"], "t");
+        for count in 0..3 {
+            assert_eq!(
+                classify_stuck_ready(&issue, &facts(count), 3),
+                StuckReadyVerdict::Eligible,
+                "re-drive {count} is still within budget"
+            );
+        }
+        assert_eq!(
+            classify_stuck_ready(&issue, &facts(3), 3),
+            StuckReadyVerdict::Abandon(AbandonReason::RedriveBudgetExhausted {
+                redrives: 3,
+                budget: 3,
+            }),
+            "16 re-drives becomes 3"
+        );
+    }
+
+    #[test]
+    fn test_classify_zero_budget_never_abandons_for_budget() {
+        let issue = make_issue(1901, UNGROOMED_BODY, &["ready"], "t");
+        assert_eq!(
+            classify_stuck_ready(&issue, &facts(999), 0),
+            StuckReadyVerdict::Eligible,
+            "budget 0 restores the pre-fix unbounded behaviour"
+        );
+    }
+
+    #[test]
+    fn test_classify_progress_resets_budget() {
+        let issue = make_issue(1, UNGROOMED_BODY, &["ready"], "t");
+
+        let mut f = facts(2);
+        f.has_open_pr = true;
+        assert_eq!(
+            classify_stuck_ready(&issue, &f, 3),
+            StuckReadyVerdict::SkipAndResetBudget {
+                reason: "open_pr_closing"
+            }
+        );
+
+        let mut f = facts(2);
+        f.in_flight = true;
+        assert_eq!(
+            classify_stuck_ready(&issue, &f, 3),
+            StuckReadyVerdict::SkipAndResetBudget {
+                reason: "in_flight_self_dev"
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_progress_outranks_an_exhausted_budget() {
+        // A ticket that produced a PR must not be abandoned for a stale count.
+        let issue = make_issue(1, UNGROOMED_BODY, &["ready"], "t");
+        let mut f = facts(3);
+        f.has_open_pr = true;
+        assert_eq!(
+            classify_stuck_ready(&issue, &f, 3),
+            StuckReadyVerdict::SkipAndResetBudget {
+                reason: "open_pr_closing"
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_reentry_when_operator_lifts_the_label() {
+        // Abandoned earlier (stamp set), `operator-review` no longer present →
+        // the operator put it back in play.
+        let issue = make_issue(1901, UNGROOMED_BODY, &["ready"], "t");
+        let mut f = facts(3);
+        f.abandoned = true;
+        assert_eq!(
+            classify_stuck_ready(&issue, &f, 3),
+            StuckReadyVerdict::ReEntry
+        );
+    }
+
+    #[test]
+    fn test_classify_abandoned_and_still_labelled_stays_silent() {
+        // R13: no second comment on subsequent ticks.
+        let issue = make_issue(1901, UNGROOMED_BODY, &["ready", "operator-review"], "t");
+        let mut f = facts(3);
+        f.abandoned = true;
+        assert_eq!(
+            classify_stuck_ready(&issue, &f, 3),
+            StuckReadyVerdict::Skip {
+                reason: "operator_review_or_blocked"
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_circuit_breaker_still_wins_over_budget() {
+        let issue = make_issue(1, UNGROOMED_BODY, &["ready"], "t");
+        let mut f = facts(0);
+        f.circuit_broken = true;
+        assert_eq!(
+            classify_stuck_ready(&issue, &f, 3),
+            StuckReadyVerdict::Skip {
+                reason: "circuit_breaker"
+            },
+            "the mika#1363 breaker keeps its own semantics (R7)"
+        );
+    }
+
+    // ── mika#2020: abandonment message contract ──
+
+    #[test]
+    fn test_abandon_reason_names_ticket_reason_and_remedy() {
+        let reason = AbandonReason::PlanOwnedByOtherIssue {
+            plan: "docs/plans/2026-08-21-002-fix-1933-x-plan.md".to_string(),
+            owner: 1933,
+        };
+        let body = reason.comment_body(1887);
+        assert!(body.contains("#1887"), "names the ticket");
+        assert!(body.contains("fix-1933"), "names the offending plan");
+        assert!(body.contains("#1933"), "names the plan's real owner");
+        assert!(
+            body.contains("operator-review"),
+            "names the re-entry gesture — R12's remedy must survive rewrites"
+        );
+        assert!(body.contains("auto_pull_redrive_abandoned"));
+    }
+
+    #[test]
+    fn test_abandon_reason_budget_names_counts() {
+        let reason = AbandonReason::RedriveBudgetExhausted {
+            redrives: 3,
+            budget: 3,
+        };
+        let body = reason.comment_body(1901);
+        assert!(body.contains("#1901"));
+        assert!(body.contains("3 fois"), "names the measured count");
+        assert!(body.contains("operator-review"));
+        assert_eq!(reason.slug(), "redrive_budget_exhausted");
+    }
+
+    // ── mika#2020: Phase 0 / Phase 1 tightening ──
+
+    #[test]
+    fn test_select_best_candidate_rejects_foreign_plan() {
+        let foreign =
+            body_with_plan("2026-08-21-002-fix-1933-reader-completed-section-avancement-plan.md");
+        let issues = vec![
+            // Higher priority, but its plan belongs to #1933.
+            make_issue(1887, &foreign, &["p0"], "2026-08-01T00:00:00Z"),
+            make_issue(2, GROOMED_BODY, &["p1"], "2026-08-01T00:00:00Z"),
+        ];
+        let selected = select_best_candidate(issues, &HashSet::new()).unwrap();
+        assert_eq!(
+            selected.number, 2,
+            "a misattributed plan loses to a correctly-attributed one, whatever its priority"
+        );
+    }
+
+    #[test]
+    fn test_select_feeder_candidates_rejects_foreign_plan() {
+        let foreign =
+            body_with_plan("2026-08-21-002-fix-1933-reader-completed-section-avancement-plan.md");
+        let issues = vec![
+            make_issue(1887, &foreign, &["p0-critical"], "2026-08-01T00:00:00Z"),
+            make_issue(2, GROOMED_BODY, &["p2-normal"], "2026-08-01T00:00:00Z"),
+        ];
+        let selected = select_feeder_candidates(&issues, &HashSet::new(), &HashSet::new(), 5);
+        assert_eq!(selected, vec![2]);
+    }
+
+    #[test]
+    fn test_phase1_does_not_repromote_an_abandoned_ticket() {
+        // R11: without this filter the abandonment leaks — Phase 1 would put
+        // `ready` back on a ticket the reconciler just handed to the operator,
+        // and the ready-label webhook would dispatch it again.
+        let issues = vec![
+            make_issue(1901, GROOMED_BODY, &["p0", "operator-review"], "t"),
+            make_issue(2, GROOMED_BODY, &["p3"], "t"),
+        ];
+        let selected = select_best_candidate(issues, &HashSet::new()).unwrap();
+        assert_eq!(
+            selected.number, 2,
+            "an operator-held ticket is not promotable, whatever its priority"
+        );
+    }
+
+    #[test]
+    fn test_phase1_does_not_promote_a_blocked_ticket() {
+        let issues = vec![make_issue(1, GROOMED_BODY, &["p0", "blocked"], "t")];
+        assert!(select_best_candidate(issues, &HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn test_unattributable_plan_still_passes_every_phase() {
+        // R2: the guard accuses on contradiction, never on ambiguity.
+        let historical = body_with_plan("918-eval-kg-fixtures-schema-pin.md");
+        let issues = vec![make_issue(1, &historical, &["p1-important"], "t")];
+        assert_eq!(
+            select_feeder_candidates(&issues, &HashSet::new(), &HashSet::new(), 5),
+            vec![1]
+        );
+        assert!(select_best_candidate(issues, &HashSet::new()).is_some());
+
+        let ready_issue = make_issue(1, &historical, &["ready"], "t");
+        assert_eq!(
+            classify_stuck_ready(&ready_issue, &facts(0), 3),
+            StuckReadyVerdict::Eligible
+        );
+    }
+
+    // ─────────────── Dispatch seat gate (mika#2084) ───────────────
+
+    /// AC1 — a ticket another seat owns is not selected, and the skip reason
+    /// names the real cause so an avoided collision is countable (AC5).
+    #[test]
+    fn test_issue_owned_by_other_seat_is_skipped() {
+        // The reason must name the ACTUAL cause: a foreign seat is a collision,
+        // an unresolvable label is not. Collapsing both into
+        // `seat_owned_by_other` would inflate the operator's collision tally
+        // with label typos.
+        for (label, expected_reason) in [
+            ("dispatch:ssc", "seat_owned_by_other"),
+            ("dispatch:mpc", "seat_owned_by_other"),
+            ("dispatch:zorglub", "unknown_seat"),
+            ("dispatch:", "empty_seat"),
+        ] {
+            let issue = make_issue(2055, GROOMED_BODY, &["ready", label], "t");
+            assert_eq!(
+                classify_stuck_ready(&issue, &facts(0), 3),
+                StuckReadyVerdict::Skip {
+                    reason: expected_reason,
+                },
+                "{label} must not be re-driven, and must say why"
+            );
+            assert!(
+                is_feeder_excluded(&issue),
+                "{label} must also be excluded from the feeder — all three \
+                 `ready`-applying paths filter through this predicate"
+            );
+        }
+    }
+
+    /// AC3 / AC4 positive half — the test that fails if the gate over-reaches.
+    ///
+    /// Without this, "refuse everything" would satisfy the test above while
+    /// silently stopping the loop.
+    #[test]
+    fn test_unlabelled_issue_remains_eligible() {
+        let issue = make_issue(2055, GROOMED_BODY, &["ready", "p1-important"], "t");
+        assert_eq!(
+            classify_stuck_ready(&issue, &facts(0), 3),
+            StuckReadyVerdict::Eligible,
+            "an issue with no seat label must behave exactly as before #2084"
+        );
+        assert!(!is_feeder_excluded(&issue));
+
+        // Our own seat is a pass, not merely an absence.
+        let ours = format!(
+            "{}{}",
+            crate::webhook_dispatch::DISPATCH_SEAT_LABEL_PREFIX,
+            crate::webhook_dispatch::CURRENT_DISPATCH_SEAT
+        );
+        let mine = make_issue(2056, GROOMED_BODY, &["ready", &ours], "t");
+        assert_eq!(
+            classify_stuck_ready(&mine, &facts(0), 3),
+            StuckReadyVerdict::Eligible
+        );
+        assert!(!is_feeder_excluded(&mine));
+
+        // And a near-miss label name is not a seat claim (AC3).
+        let near = make_issue(2057, GROOMED_BODY, &["ready", "dispatched"], "t");
+        assert_eq!(
+            classify_stuck_ready(&near, &facts(0), 3),
+            StuckReadyVerdict::Eligible
+        );
+        assert!(!is_feeder_excluded(&near));
     }
 }

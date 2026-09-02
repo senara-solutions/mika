@@ -59,6 +59,10 @@ fn make_groom_skill(
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                required_review_anchor_prefixes: vec![],
+                review_anchor_min_count: 3,
+                review_anchor_min_quote_chars: 40,
+                review_anchor_min_brief_chars: 2000,
                 required_tool_arg_suffixes: vec![],
             },
             context: HashMap::new(),

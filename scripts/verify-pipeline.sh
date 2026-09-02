@@ -177,7 +177,7 @@ if [ -n "$LINKED_ISSUE" ]; then
   _repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || echo "")
   if [ -n "$_repo" ]; then
     _labels=$(gh api "repos/$_repo/issues/$LINKED_ISSUE" --jq '.labels[].name' 2>/dev/null || echo "")
-    if echo "$_labels" | grep -qx "documentation"; then
+    if grep -qx -- "documentation" <<<"$_labels"; then
       ISSUE_HAS_DOCUMENTATION_LABEL=true
     fi
   fi
@@ -191,18 +191,18 @@ EXEMPT_DOCS_REASON=""
 EXEMPT_CODE_REASON=""
 
 # Dual-form matching: with-reason (preferred) vs bare (backwards compat, warns)
-if echo "$COMMIT_BODIES" | grep -qE '^Pipeline-Exempt: docs-only[[:space:]]+.+$'; then
+if grep -qE -- '^Pipeline-Exempt: docs-only[[:space:]]+.+$' <<<"$COMMIT_BODIES"; then
   EXEMPT_DOCS_ONLY=1
   EXEMPT_DOCS_REASON=$(echo "$COMMIT_BODIES" | grep -oE '^Pipeline-Exempt: docs-only[[:space:]]+.+$' | head -1 | sed 's/^Pipeline-Exempt: docs-only[[:space:]]*//')
-elif echo "$COMMIT_BODIES" | grep -qE '^Pipeline-Exempt: docs-only[[:space:]]*$'; then
+elif grep -qE -- '^Pipeline-Exempt: docs-only[[:space:]]*$' <<<"$COMMIT_BODIES"; then
   EXEMPT_DOCS_ONLY=1
   EXEMPT_DOCS_REASON=""
 fi
 
-if echo "$COMMIT_BODIES" | grep -qE '^Pipeline-Exempt: code-only[[:space:]]+.+$'; then
+if grep -qE -- '^Pipeline-Exempt: code-only[[:space:]]+.+$' <<<"$COMMIT_BODIES"; then
   EXEMPT_CODE_ONLY=1
   EXEMPT_CODE_REASON=$(echo "$COMMIT_BODIES" | grep -oE '^Pipeline-Exempt: code-only[[:space:]]+.+$' | head -1 | sed 's/^Pipeline-Exempt: code-only[[:space:]]*//')
-elif echo "$COMMIT_BODIES" | grep -qE '^Pipeline-Exempt: code-only[[:space:]]*$'; then
+elif grep -qE -- '^Pipeline-Exempt: code-only[[:space:]]*$' <<<"$COMMIT_BODIES"; then
   EXEMPT_CODE_ONLY=1
   EXEMPT_CODE_REASON=""
 fi

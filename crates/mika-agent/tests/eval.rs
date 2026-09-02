@@ -39,11 +39,16 @@ mod eval {
     // v26->v27 KG migration invariant tests: coalesce per-agent data (#787)
     mod kg_v27_migration;
 
+    // Porte 1 cascade probe (mika#1947) — gated #[ignore] +
+    // MIKA_MANAGER_LOOP_RESISTANCE_TEST=1; pre-Phase-2-cut, not per-PR CI weight.
+    mod manager_loop_resistance;
+
     mod test_auto_groom_dispatch;
     mod test_basic_conversation;
     mod test_callback_milestone_advance;
     mod test_callback_terminal_action;
     mod test_callback_turn;
+    mod test_ci_success_handler;
     mod test_completion_claim_guard;
     mod test_context_summary_inject;
     mod test_correction_message_classifier_guard;

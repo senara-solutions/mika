@@ -476,7 +476,7 @@ async fn resolve_entry_paths(
             .partial_cmp(&a.confidence)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    deduped.truncate(DEFAULT_ENTRY_TOP_K);
+    deduped.truncate(DEFAULT_ENTRY_TOP_K); // safe-byte-slice: Vec<EntryEntity> — element count, no char boundary
 
     let method = deduped.first().map(|e| e.entry_method);
     Ok((deduped, method))
@@ -1106,7 +1106,7 @@ fn rank_and_budget(mut entities: Vec<TraversedEntity>, limit: usize) -> Vec<Trav
         })
     });
 
-    entities.truncate(limit.min(MAX_RESULT_ENTITIES));
+    entities.truncate(limit.min(MAX_RESULT_ENTITIES)); // safe-byte-slice: Vec<TraversedEntity> — element count, no char boundary
     entities
 }
 

@@ -26,7 +26,12 @@ use mika_agent::db::{CURRENT_SCHEMA_VERSION, Database};
 // v48→v49 (mika#1671) expanded the `team_runs.status` CHECK to include
 // `'failed_transport'` — a non-KG table rebuild, so no `seed_*` helper change is
 // needed (fixtures never touch `team_runs`); only the pin advances.
-const PINNED_SCHEMA_VERSION: i64 = 49;
+//
+// v50→v51 (mika#1948) added `tasks.dispatcher_source` and the
+// `dispatch_slot_leases` table — both outside the KG surface, and the new column
+// is nullable, so `seed_*` helpers (which never touch `tasks`) are unaffected;
+// only the pin advances.
+const PINNED_SCHEMA_VERSION: i64 = 51;
 
 const _: () = assert!(
     CURRENT_SCHEMA_VERSION == PINNED_SCHEMA_VERSION,

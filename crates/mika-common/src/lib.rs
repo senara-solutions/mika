@@ -1,4 +1,6 @@
 pub mod agent;
+pub mod auth_boundary;
+pub mod build_info;
 pub mod claude;
 pub mod config;
 pub mod dotenv;
