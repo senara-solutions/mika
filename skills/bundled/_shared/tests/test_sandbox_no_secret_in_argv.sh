@@ -141,8 +141,22 @@ setenv_names() {
 # else appearing is a violation regardless of what its value looks like — this
 # is the deny-by-default posture the `--clearenv` invariant already uses,
 # applied to the value guard so it does not depend on recognising a vendor.
+#
+# mika#2141 added three git names. Each was audited on the same terms as the
+# rest — a name is added here only after confirming its VALUE carries no
+# credential material, since every value lands in a world-readable argv:
+#   GIT_CONFIG_GLOBAL    a path (/run/mika-pilot-git/config). The file it names
+#                        is generated host-side and holds only an https URL
+#                        rewrite and the committer identity; it is never copied
+#                        from ~/.gitconfig, so a credential helper there cannot
+#                        drift into it.
+#   GIT_CONFIG_NOSYSTEM  the literal "1".
+#   GIT_TERMINAL_PROMPT  the literal "0". Its absence is what turns a failed
+#                        credential injection into a silent hang instead of a
+#                        fast, traceable error.
 AUDITED_SETENV_NAMES="ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_LOG_FILE \
-CLAUDE_CODE_API_BASE_URL HOME HOSTNAME HTTPS_PROXY HTTP_PROXY LANG LC_ALL \
+CLAUDE_CODE_API_BASE_URL GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM \
+GIT_TERMINAL_PROMPT HOME HOSTNAME HTTPS_PROXY HTTP_PROXY LANG LC_ALL \
 LOGNAME MIKA_LOG_PILOT_TRANSCRIPTS MIKA_PILOT_CONTAINED NODE_EXTRA_CA_CERTS \
 NO_PROXY PATH SHELL TERM TMPDIR USER"
 

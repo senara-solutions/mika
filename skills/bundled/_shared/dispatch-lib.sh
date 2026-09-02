@@ -68,6 +68,18 @@
 #                 ~/.nvm (node runtime), ~/.cargo/{registry,config.toml,bin}
 #                 (crate cache + config — NOT credentials.toml)
 #     * rw binds: $WORKTREE_DIR (branch worktree), ~/.mika/data (transcripts)
+#     * git binds (mika#2141), derived by path from the worktree's own
+#       gitdir + commondir — never /data/workspace in bulk:
+#         rw  $PARENT_GIT/worktrees/<this worktree>   HEAD, index, per-worktree refs
+#         rw  $PARENT_GIT/objects                     commit writes objects here
+#         rw  $PARENT_GIT/refs/heads/<dirname>        see the granularity note
+#         rw  $PARENT_GIT/logs/refs/heads/<dirname>   its reflog
+#         rw  $PARENT_GIT/refs/remotes/origin         fetch updates tracking refs
+#         rw  $PARENT_GIT/refs/tags                   fetch auto-follows new tags
+#         ro  $PARENT_GIT/refs                        read every ref, delete none
+#         ro  $PARENT_GIT/config                      resolve the remote
+#         ro  $PARENT_GIT/packed-refs, info/          316 packed refs; info/exclude
+#         ro  the generated pilot gitconfig           identity + https rewrite
 #
 #   NOT bound (per coherence threat-model review):
 #     * ~/.ssh, ~/.aws, ~/.config, ~/.mika (except /data), /var/spool/*
@@ -79,7 +91,59 @@
 #                     injects the credential host-side. The sandbox holds no
 #                     GitHub token in env or on disk.
 #     * $SSH_AUTH_SOCK, docker.sock, dbus, cm/NATS unix sockets
-#     * /data/workspace outside the branch worktree (other worktrees + repos)
+#     * /data/workspace outside the branch worktree and the narrow git
+#       paths listed above (other worktrees, other repositories)
+#     * $PARENT_GIT/hooks — the sandbox runs no repository hooks; CI is the
+#                           gate, and the rescue path already used --no-verify
+#
+#   Read this next paragraph before narrowing or widening anything above.
+#
+#   Until mika#2141 this section read "NOT bound: /data/workspace outside the
+#   branch worktree" with no git exception, and that line was load-bearing in
+#   the worst way: a linked worktree's `.git` is a FILE holding an absolute
+#   path into the parent repository, so binding only $WORKTREE_DIR left the
+#   sandbox with no gitdir at all. Every git command returned `fatal: not a
+#   git repository`, and for the month from 2026-08-04 no pilot could commit.
+#   The stated doctrine made the breakage read as a decision. Whoever edits
+#   this list next: change the binds and this text in the same commit.
+#
+#   What the git binds do NOT close, stated so it is arbitrated rather than
+#   discovered. None of these is what AC2 closes — file access to other
+#   worktrees and other repositories, which stays closed and is proven closed on
+#   every run by skills/bundled/_shared/tests/test_sandbox_git_usable.sh.
+#
+#     * The object store is shared, so `git show <other branch>:<file>` succeeds
+#       from inside. Inherent to sharing objects; a full clone grants the same.
+#
+#     * The branch-ref bind is a DIRECTORY, not a single ref file. It grants
+#       write and delete on every branch sharing this branch's <type>/<issue>/
+#       prefix. Binding the single file was MEASURED and does not work: git
+#       creates `<ref>.lock` as a sibling and renames it, so a file bind yields
+#       `cannot lock ref 'HEAD': Read-only file system` and no commit at all.
+#       That is also why the slashless-branch guard below cannot be swapped for
+#       a narrower bind — `dirname` collapsing to `refs/heads` is a real
+#       widening with no narrower alternative, so it aborts instead.
+#
+#     * `refs/remotes/origin` is writable in full. An in-sandbox process can
+#       set `refs/remotes/origin/main` to any commit, and the host-side rebase
+#       gate reads exactly those refs to decide `behind=`. A poisoned tracking
+#       ref makes the host skip a rebase it should have run. Accepted: the
+#       pilot already holds the branch it is about to push, and CI on the PR is
+#       the gate a stale base cannot pass silently.
+#
+#     * The repository's own `config` is bound read-only, and git reads
+#       repo-local config at HIGHER precedence than the staged global one. See
+#       the note above _PILOT_GITCONFIG_HOST.
+#
+#     * The PARENT CHECKOUT's directory PATH exists inside the sandbox, because
+#       bwrap materialises the intermediate directories of every bind. Measured,
+#       so that "visible" is not confused with "readable": it holds `.git` and
+#       nothing else — no Cargo.toml, no crates/, no working tree — and that
+#       `.git` shows exactly the entries bound above. Sibling worktrees are NOT
+#       listed under it, other repositories in /data/workspace are absent, and
+#       the meta-repo's own files are absent. A containment probe here must
+#       assert content unreachability, not path non-existence; asserting the
+#       latter reports a leak that is not one.
 #
 # NOT included in Phase 2a: network cut (`--unshare-net` + egress relay).
 # Phase 2b tracks that separately — until it lands, an in-sandbox process
@@ -144,6 +208,27 @@ _PILOT_COMBINED_CA_SANDBOX_PATH="/tmp/mika-pilot-ca/combined.pem"
 # ro-bound by the time the secret args are expanded, so a nested bind there
 # fails EROFS (same coherence-audit Bug B that put the helper CA under /tmp).
 _PILOT_SECRET_DIR_SANDBOX="/run/mika-pilot-secrets"
+
+# mika#2141: the pilot's git configuration, generated host-side and bound
+# read-only into the sandbox. Under /run for the same reason as the secret dir
+# above — /etc is already ro-bound when these args expand.
+#
+# This is the only GLOBAL git configuration the sandbox sees: `--tmpfs /home`
+# blanks ~/.gitconfig and GIT_CONFIG_NOSYSTEM drops /etc/gitconfig. Keep that —
+# the operator's real ~/.gitconfig may carry a credential helper, and AC3
+# forbids one entering.
+#
+# It is NOT the only configuration git reads. `$PARENT_GIT/config` is bound
+# read-only (it is what resolves the remote) and git reads repo-local config at
+# HIGHER precedence than GIT_CONFIG_GLOBAL. So a `credential.helper`,
+# `core.sshCommand`, or a competing `url.*.insteadOf` placed in the repository
+# config would reach the sandbox and could override the rewrite written here.
+# Today this repository's config carries none — checked, not assumed — and it
+# is operator-owned and read-only from inside. Stating the boundary precisely
+# matters more than stating it flatteringly: the flattering version of this
+# comment is what let mika#2141 read as a decision for a month.
+_PILOT_GITCONFIG_HOST="$HOME/.mika/state/pilot-gitconfig"
+_PILOT_GITCONFIG_SANDBOX="/run/mika-pilot-git/config"
 
 # Sandbox entrypoint prologue: re-export each secret file as an env var named
 # after the file. Deriving the export name from the basename is what makes
@@ -415,6 +500,299 @@ _stage_pilot_gh_token() {
     fi
 }
 
+# mika#2141: generate the sandbox's git configuration host-side.
+#
+# Three things must be written, and each was measured to be independently
+# load-bearing — a fix carrying only one or two of them repairs `git status`
+# and leaves the pilot unable to deliver, which is the exact shape of the
+# defect this ticket closes:
+#
+#   1. url.insteadOf — the parent repo's remote is `git@github.com:...` (SSH).
+#      The sandbox has neither ~/.ssh nor $SSH_AUTH_SOCK, deliberately, so an
+#      SSH push cannot work and must not be made to work. The design already
+#      aimed at git-over-HTTPS: mika-pilot-github-auth-addon.py injects
+#      `Authorization: Basic` for github.com host-side (mika#2056), and the
+#      secret prologue already exports GIT_SSL_CAINFO. Only the URL rewrite was
+#      missing.
+#
+#   2. user.name / user.email — these live ONLY in the operator's
+#      ~/.gitconfig, which `--tmpfs /home` blanks. Neither the repo config nor
+#      /etc/gitconfig carries a [user] section. Without them `git commit` fails
+#      with "unable to auto-detect email address" even once the gitdir is
+#      mounted. Read from the host at stage time so the pilot's commits carry
+#      the same authorship as the operator's.
+#
+#   3. Nothing else. The file is written from scratch on every dispatch, never
+#      appended to and never copied from ~/.gitconfig, so a credential helper
+#      added to the operator's config later cannot drift into the sandbox.
+#
+# Fail-open on a write error (same posture as _stage_pilot_gh_token): the
+# dispatch proceeds and git fails loudly inside, rather than the whole dispatch
+# dying on a config file.
+_stage_pilot_gitconfig() {
+    local name email
+    name=$(git config --get user.name 2>/dev/null || true)
+    email=$(git config --get user.email 2>/dev/null || true)
+
+    # `git config --get` returns real newlines for a stored `\n` escape, and this
+    # value is interpolated into a config file. A name of the form
+    # `Vincent<newline>[url "https://attacker.example"]<newline>insteadOf = ...`
+    # would inject a section that redirects the pilot's push. Reject rather than
+    # strip: a control character in a committer name is never legitimate, and a
+    # silent strip would hide the tampering.
+    case "$name$email" in
+        *[[:cntrl:]]*)
+            echo "dispatch-lib: host git user.name/user.email contains a control character — refusing to write it into the pilot gitconfig (mika#2141)" >&2
+            name=""
+            email=""
+            ;;
+    esac
+
+    mkdir -p "$(dirname "$_PILOT_GITCONFIG_HOST")" 2>/dev/null || true
+    {
+        printf '[url "https://github.com/"]\n'
+        printf '\tinsteadOf = git@github.com:\n'
+        printf '\tinsteadOf = ssh://git@github.com/\n'
+        if [ -n "$name" ] && [ -n "$email" ]; then
+            printf '[user]\n\tname = %s\n\temail = %s\n' "$name" "$email"
+        fi
+    } > "$_PILOT_GITCONFIG_HOST" 2>/dev/null || {
+        echo "dispatch-lib: could not write $_PILOT_GITCONFIG_HOST" >&2
+        return 1
+    }
+    [ -s "$_PILOT_GITCONFIG_HOST" ] || {
+        echo "dispatch-lib: $_PILOT_GITCONFIG_HOST is empty after staging" >&2
+        return 1
+    }
+    if [ -z "$name" ] || [ -z "$email" ]; then
+        echo "dispatch-lib: host git has no usable user.name/user.email — the pilot cannot commit (mika#2141)" >&2
+    fi
+    return 0
+}
+
+# mika#2141: emit the bwrap arguments that make git usable inside the sandbox.
+#
+# THE DEFECT. `--bind "$WORKTREE_DIR" "$WORKTREE_DIR"` mounts the worktree and
+# nothing else. But a linked worktree's `.git` is not a directory — it is a
+# file holding an absolute path into the parent repository:
+#
+#     gitdir: /data/workspace/mika-platform/mika/.git/worktrees/mika24
+#
+# That path is outside the bind. It does not exist in the namespace, so git
+# finds no gitdir, no commondir and no object store, and EVERY git command
+# returns `fatal: not a git repository`. Introduced 2026-08-04 by the
+# containment layer (e4f24677 / PR#1894); for the month that followed, no pilot
+# could commit and every apparent delivery came through the mika#1282
+# wip-rescue net, which commits host-side.
+#
+# THE SHAPE OF THE FIX. Bind the strict minimum, derived by path — never
+# /data/workspace in bulk, which is what the threat model exists to keep out.
+# Results are populated into two globals rather than printed, so no path has to
+# survive a round-trip through word splitting:
+#
+#     _PILOT_GITDIR_BIND_ARGS   the bwrap arguments (may be empty)
+#     _PILOT_GITDIR_BIND_ABORT  non-empty means: do not launch, explain this
+#
+# ORDER IS LOAD-BEARING. `--ro-bind refs` comes before the two writable binds
+# nested inside it. bwrap applies mounts in argument order, and a bind over an
+# existing directory inside a read-only mount succeeds — what fails is bind to
+# a path that must first be CREATED there (the Bug B that put the helper CA
+# under /tmp). Hence the mkdir below: the mountpoint must exist host-side, and
+# `refs/heads/<type>/<issue>/` frequently does not, because 316 refs live in
+# packed-refs rather than on disk.
+#
+# WHAT IS DELIBERATELY NOT BOUND. `hooks/` — the sandbox runs no repo hooks,
+# which is narrower and matches the `--no-verify` the rescue path already uses;
+# CI remains the real gate. The parent `config` is bound READ-ONLY: it resolves
+# the remote (without it the repo has no origin and push is impossible) and
+# nothing in the sandbox may rewrite it.
+_pilot_gitdir_bind_args() {
+    local worktree_dir="$1"
+    _PILOT_GITDIR_BIND_ARGS=()
+    _PILOT_GITDIR_BIND_ABORT=""
+
+    local dotgit="$worktree_dir/.git"
+
+    # A plain checkout (.git is a directory) is already fully inside the
+    # worktree bind — nothing to add. A path with no .git at all is not a
+    # repository; the sandbox test harnesses run in exactly that shape, and
+    # they must keep working.
+    [ -e "$dotgit" ] || return 0
+    [ -f "$dotgit" ] || return 0
+
+    # EVERY INPUT BELOW IS ATTACKER-WRITABLE. This function runs HOST-side and
+    # decides what gets bind-mounted read-write into the next sandbox, but its
+    # inputs live inside the previous sandbox's writable surface: `.git` sits in
+    # $WORKTREE_DIR, and `worktrees/<name>/HEAD` is bound rw by this very
+    # function. Worktrees persist across dispatches. A pilot that wrote
+    # `ref: refs/heads/../../../../home/<user>/.ssh` into HEAD, or repointed the
+    # `.git` file, would otherwise have the NEXT dispatch mount an arbitrary
+    # host path rw for it. So: resolve through git, which validates the
+    # worktree linkage and the refname grammar, and then re-check the results
+    # here rather than trusting either layer alone.
+    #
+    # These three probes run as the operator against a repository the previous
+    # sandbox could write, so they are the one place a crafted `include.path` or
+    # `core.*` hook would fire host-side. Neutralise system and global config for
+    # the probes: they need nothing from either.
+    local -a _gitq=(env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --no-optional-locks)
+    local wt_gitdir parent_git
+    wt_gitdir=$("${_gitq[@]}" -C "$worktree_dir" rev-parse --path-format=absolute --git-dir 2>/dev/null)
+    parent_git=$("${_gitq[@]}" -C "$worktree_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+    if [ -z "$wt_gitdir" ] || [ -z "$parent_git" ]; then
+        _PILOT_GITDIR_BIND_ABORT="git cannot resolve a gitdir for $worktree_dir — the worktree is broken or its .git file has been tampered with"
+        return 1
+    fi
+    if ! wt_gitdir=$(cd "$wt_gitdir" 2>/dev/null && pwd) || ! parent_git=$(cd "$parent_git" 2>/dev/null && pwd); then
+        _PILOT_GITDIR_BIND_ABORT="the resolved gitdir or common dir does not exist"
+        return 1
+    fi
+
+    # git's own linkage invariant, asserted explicitly: the parent must know
+    # this worktree, and its back-pointer must name this worktree's .git file.
+    # A repointed .git that happens to look like a gitdir fails here.
+    case "$wt_gitdir" in
+        "$parent_git"/worktrees/*) : ;;
+        *)
+            _PILOT_GITDIR_BIND_ABORT="gitdir '$wt_gitdir' is not registered under '$parent_git/worktrees/' — refusing to mount it"
+            return 1
+            ;;
+    esac
+    local backlink=""
+    [ -f "$wt_gitdir/gitdir" ] && backlink=$(head -1 "$wt_gitdir/gitdir" 2>/dev/null)
+    if [ "$backlink" != "$dotgit" ]; then
+        _PILOT_GITDIR_BIND_ABORT="worktree back-pointer mismatch: $wt_gitdir/gitdir names '$backlink', not '$dotgit'"
+        return 1
+    fi
+
+    # Everything already inside the worktree bind needs no extra mount.
+    case "$parent_git/" in
+        "$worktree_dir"/*) return 0 ;;
+    esac
+
+    _PILOT_GITDIR_BIND_ARGS=(
+        --bind "$wt_gitdir" "$wt_gitdir"
+        --bind "$parent_git/objects" "$parent_git/objects"
+        --ro-bind "$parent_git/refs" "$parent_git/refs"
+        --ro-bind "$parent_git/config" "$parent_git/config"
+        --ro-bind-try "$parent_git/packed-refs" "$parent_git/packed-refs"
+        --ro-bind-try "$parent_git/info" "$parent_git/info"
+    )
+
+    # `fetch` updates remote-tracking refs; without this any rebase onto main
+    # from inside the sandbox fails on a read-only ref store. Scoped to
+    # `origin` rather than all of `refs/remotes`, which was measured to be
+    # sufficient: origin's tracking refs stay writable, and a write to any
+    # other remote's namespace is refused by the filesystem. Every push path in
+    # this library targets origin; a repository with a differently-named remote
+    # fails loudly on fetch rather than being handed the whole namespace.
+    # Each mkdir below is paired with a NON-try bind, so a failure here becomes
+    # `bwrap: Can't find source path` — a launch abort with no explanation. Fail
+    # with the reason instead: an unexplained containment abort is the shape
+    # that cost this ticket a month of misdirected diagnosis.
+    if ! mkdir -p "$parent_git/refs/remotes/origin" 2>/dev/null; then
+        _PILOT_GITDIR_BIND_ABORT="cannot create $parent_git/refs/remotes/origin — the bind source must exist before bwrap runs (permissions, or a read-only filesystem)"
+        _PILOT_GITDIR_BIND_ARGS=()
+        return 1
+    fi
+    _PILOT_GITDIR_BIND_ARGS+=(--bind "$parent_git/refs/remotes/origin" "$parent_git/refs/remotes/origin")
+
+    # Tags, writable. `git fetch` auto-follows tags reachable from what it
+    # fetches, so the first fetch after a release tag lands would otherwise die
+    # on `cannot lock ref 'refs/tags/<new>': Read-only file system` — measured —
+    # and take the in-sandbox rebase down with it. That is this ticket's own
+    # failure shape reappearing one release later. A tag is not a branch head:
+    # it is not a push target and the host-side rebase gate does not read it,
+    # so the widening buys correctness at a cost the threat model can carry.
+    if ! mkdir -p "$parent_git/refs/tags" 2>/dev/null; then
+        _PILOT_GITDIR_BIND_ABORT="cannot create $parent_git/refs/tags — the bind source must exist before bwrap runs"
+        _PILOT_GITDIR_BIND_ARGS=()
+        return 1
+    fi
+    _PILOT_GITDIR_BIND_ARGS+=(--bind "$parent_git/refs/tags" "$parent_git/refs/tags")
+
+    # The branch head and its reflog. Derived from the worktree's own HEAD, not
+    # from the caller's $BRANCH: the guard below must hold for whatever branch
+    # is actually checked out, however the worktree was created.
+    # Read through git, which enforces the refname grammar, and then re-check
+    # the result: this string becomes a path segment under $PARENT_GIT.
+    local head_ref=""
+    head_ref=$("${_gitq[@]}" -C "$worktree_dir" symbolic-ref --quiet HEAD 2>/dev/null || true)
+
+    # An empty answer means one of two very different things, and they must not
+    # be collapsed. A genuinely detached HEAD has no branch ref to update and is
+    # fine — commits still work, HEAD lives in the worktree gitdir. A HEAD FILE
+    # that says `ref:` while git refuses to resolve it is malformed, which on
+    # this attacker-writable surface means tampered. Degrading that to the
+    # detached path would be silent: the dispatch would run and the pilot would
+    # simply fail to commit, which is the exact failure shape mika#2141 exists
+    # to end.
+    if [ -z "$head_ref" ] && [ -f "$wt_gitdir/HEAD" ] \
+       && grep -q '^ref:' "$wt_gitdir/HEAD" 2>/dev/null; then
+        _PILOT_GITDIR_BIND_ABORT="$wt_gitdir/HEAD claims a symbolic ref that git refuses to resolve — the file is malformed or has been tampered with"
+        _PILOT_GITDIR_BIND_ARGS=()
+        return 1
+    fi
+
+    if [ -n "$head_ref" ]; then
+        case "$head_ref" in
+            refs/heads/*) : ;;
+            *)
+                _PILOT_GITDIR_BIND_ABORT="HEAD names '$head_ref', which is not under refs/heads/ — refusing to derive a bind path from it"
+                _PILOT_GITDIR_BIND_ARGS=()
+                return 1
+                ;;
+        esac
+        # Belt and braces over git's own validation. `..` is the one that turns
+        # a ref name into a path traversal, and a traversal here is a rw mount
+        # of an arbitrary host directory.
+        case "$head_ref" in
+            *..*|*//*|*$'\n'*)
+                _PILOT_GITDIR_BIND_ABORT="HEAD ref '$head_ref' contains a path-traversal or newline sequence — refusing to derive a bind path from it"
+                _PILOT_GITDIR_BIND_ARGS=()
+                return 1
+                ;;
+        esac
+        # `case`, not `printf | grep -q`: the pipeline form takes SIGPIPE under
+        # pipefail and is rejected by scripts/verify-no-sigpipe-grep.sh (mika#2055).
+        # The glob rejects the whole string if ANY character falls outside the set.
+        case "$head_ref" in
+            *[!A-Za-z0-9._/-]*)
+                _PILOT_GITDIR_BIND_ABORT="HEAD ref '$head_ref' contains characters outside [A-Za-z0-9._/-] — refusing to derive a bind path from it"
+                _PILOT_GITDIR_BIND_ARGS=()
+                return 1
+                ;;
+        esac
+    fi
+
+    # Detached HEAD: there is no branch ref to update. Commits still work —
+    # HEAD lives in the worktree gitdir, already bound rw above.
+    if [ -n "$head_ref" ]; then
+        local ref_dir
+        ref_dir=$(dirname "$head_ref")
+        # A branch with no slash makes dirname() collapse to `refs/heads`, and
+        # binding THAT read-write would hand the pilot every head in the
+        # repository — the precise opposite of AC2. Abandon the dispatch and say
+        # why. Widening silently is the failure this guard exists to prevent.
+        if [ "$ref_dir" = "refs/heads" ]; then
+            _PILOT_GITDIR_BIND_ABORT="worktree is on branch '${head_ref#refs/heads/}', which has no '/' in its name. Binding its ref directory would grant the sandbox write access to every branch head in the repository (AC2 violation). Dispatch worktrees use <type>/<issue>/<slug>; re-create this one with scripts/derive-branch-name."
+            _PILOT_GITDIR_BIND_ARGS=()
+            return 1
+        fi
+        if ! mkdir -p "$parent_git/$ref_dir" "$parent_git/logs/$ref_dir" 2>/dev/null; then
+            _PILOT_GITDIR_BIND_ABORT="cannot create $parent_git/$ref_dir or its log directory — the bind source must exist before bwrap runs"
+            _PILOT_GITDIR_BIND_ARGS=()
+            return 1
+        fi
+        _PILOT_GITDIR_BIND_ARGS+=(
+            --bind "$parent_git/$ref_dir" "$parent_git/$ref_dir"
+            --bind "$parent_git/logs/$ref_dir" "$parent_git/logs/$ref_dir"
+        )
+    fi
+
+    return 0
+}
+
 _run_pilot_sandboxed() {
     # Runs "$@" (the full claude-pilot invocation) under bwrap when enabled,
     # or direct-exec otherwise. Preserves stdin/stdout/stderr semantics.
@@ -438,6 +816,25 @@ _run_pilot_sandboxed() {
     # mika#1705 anyway when the first transcript flushes; we create it eagerly
     # here so the bind is stable even on a fresh install.
     mkdir -p "$HOME/.mika/data/pilot-transcripts" 2>/dev/null || true
+
+    # mika#2141: make git usable inside the sandbox. Both halves are required —
+    # the binds give git a repository, the config gives it an identity and an
+    # HTTPS remote. Either one alone leaves the pilot unable to deliver.
+    # $_PILOT_SANDBOX_REFUSAL is deliberately NOT local: bash `local` is invisible
+    # to the caller, and the caller is where the operator-facing RESULT is built.
+    _PILOT_SANDBOX_REFUSAL=""
+    if ! _stage_pilot_gitconfig; then
+        _PILOT_SANDBOX_REFUSAL="the sandbox git config could not be staged at $_PILOT_GITCONFIG_HOST, so the pilot would have had no committer identity and no https remote"
+        echo "dispatch-lib: refusing to launch the pilot — $_PILOT_SANDBOX_REFUSAL (mika#2141)" >&2
+        return 78
+    fi
+    local -a _PILOT_GITDIR_BIND_ARGS=()
+    local _PILOT_GITDIR_BIND_ABORT=""
+    if ! _pilot_gitdir_bind_args "${WORKTREE_DIR:-}"; then
+        _PILOT_SANDBOX_REFUSAL="$_PILOT_GITDIR_BIND_ABORT"
+        echo "dispatch-lib: refusing to launch the pilot — $_PILOT_SANDBOX_REFUSAL (mika#2141)" >&2
+        return 78
+    fi
 
     # Phase 2b: launch host-side egress proxy (idempotent). If it's not
     # available (binary missing, first deploy), returns non-zero and we run
@@ -637,6 +1034,11 @@ _run_pilot_sandboxed() {
             --tmpfs /run \
             --tmpfs /home \
             --bind "$WORKTREE_DIR" "$WORKTREE_DIR" \
+            ${_PILOT_GITDIR_BIND_ARGS[@]+"${_PILOT_GITDIR_BIND_ARGS[@]}"} \
+            --ro-bind "$_PILOT_GITCONFIG_HOST" "$_PILOT_GITCONFIG_SANDBOX" \
+            --setenv GIT_CONFIG_GLOBAL "$_PILOT_GITCONFIG_SANDBOX" \
+            --setenv GIT_CONFIG_NOSYSTEM "1" \
+            --setenv GIT_TERMINAL_PROMPT "0" \
             --ro-bind-try "$HOME/.local/bin/claude-pilot" "$HOME/.local/bin/claude-pilot" \
             --ro-bind-try "$HOME/.local/share/uv/tools/claude-pilot" "$HOME/.local/share/uv/tools/claude-pilot" \
             --ro-bind-try "/data/workspace/mika-platform/claude-pilot/src" "/data/workspace/mika-platform/claude-pilot/src" \
@@ -715,6 +1117,11 @@ $quoted_argv
             --tmpfs /run \
             --tmpfs /home \
             --bind "$WORKTREE_DIR" "$WORKTREE_DIR" \
+            ${_PILOT_GITDIR_BIND_ARGS[@]+"${_PILOT_GITDIR_BIND_ARGS[@]}"} \
+            --ro-bind "$_PILOT_GITCONFIG_HOST" "$_PILOT_GITCONFIG_SANDBOX" \
+            --setenv GIT_CONFIG_GLOBAL "$_PILOT_GITCONFIG_SANDBOX" \
+            --setenv GIT_CONFIG_NOSYSTEM "1" \
+            --setenv GIT_TERMINAL_PROMPT "0" \
             --ro-bind-try "$HOME/.local/bin/claude-pilot" "$HOME/.local/bin/claude-pilot" \
             --ro-bind-try "$HOME/.local/share/uv/tools/claude-pilot" "$HOME/.local/share/uv/tools/claude-pilot" \
             --ro-bind-try "/data/workspace/mika-platform/claude-pilot/src" "/data/workspace/mika-platform/claude-pilot/src" \
@@ -1754,6 +2161,20 @@ Note: process exited with code ${PILOT_EXIT} after session completed — result 
 
 Stdout:
 ${PILOT_OUTPUT_RAW}"
+    elif [ "$PILOT_EXIT" -eq 78 ]; then
+        # mika#2141: 78 is _run_pilot_sandboxed refusing to launch. No pilot
+        # process ever existed, so "FAILED (exit code 78)" with an empty stdout
+        # would send the operator hunting for pilot drift that cannot be there.
+        # The reason lives in $_PILOT_GITDIR_BIND_ABORT and on stderr; carry it.
+        RESULT="Log path: /var/log/claude-pilot/${LOG_ID}.log
+
+CONTAINMENT REFUSAL (exit 78) — the pilot was never launched.
+
+${_PILOT_SANDBOX_REFUSAL:-The sandbox git setup could not be built safely; see the stderr log.}
+
+This is not pilot drift and not a pipeline failure: dispatch-lib declined to
+build the sandbox rather than mount something it could not justify (mika#2141).
+Fix the worktree, then re-dispatch."
     else
         RESULT="Log path: /var/log/claude-pilot/${LOG_ID}.log
 
