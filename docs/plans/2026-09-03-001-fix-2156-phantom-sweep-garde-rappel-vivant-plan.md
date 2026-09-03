@@ -149,6 +149,55 @@ d0913636  ready-label: mika#1772  in_progress  created 21:24:34  updated 21:24:3
 Deux lignes en cours de dispatch, `updated_at` figé à une seconde après la création. C'est la
 cause profonde énoncée dans le Problème, mesurée plutôt que déduite.
 
+### M8 — l'ascendance réelle du pilote (réponse à F2 de la première passe)
+
+L'architecte a refusé la prémisse que D5 avançait sans preuve. Mesure directe, sur le pilote du
+ticket **encore vivant au moment du grooming** (PID 365667, `etimes=14903` — 4 h 08) :
+
+```
+PID     PPID     PGID     SID       COMMAND
+365667  3649327  365667   3649327   run.sh          ← le pilote
+366201  365667   365667   3649327   bwrap
+3649327 3649326  3649327  3649327   mika-spirit     ← le moteur
+3649326 1        3636914  3636914   supervise-daemon
+```
+
+**La prémisse que j'avais écrite était fausse** : le pilote *est* un enfant direct du moteur.
+Ce n'est pas ce qui le fait survivre.
+
+Ce qui le fait survivre est visible sur la colonne `PGID` : `run.sh` porte **son propre PGID
+(365667)**, distinct de celui du moteur (3649327). C'est délibéré —
+`crates/mika-agent/src/skills/executor.rs:2962` :
+
+```rust
+.process_group(0); // Make child a process group leader (#855)
+```
+
+Conséquences, qui sont celles qui comptent pour D5 :
+
+1. un signal de groupe adressé au moteur (`kill -TERM -3649327`) **n'atteint pas** le pilote ;
+2. `supervise-daemon` vit dans un troisième groupe encore (3636914) et redémarre le moteur sans
+   toucher au groupe du pilote ;
+3. à la mort du moteur, `run.sh` est réparenté à PID 1 et continue.
+
+**Le pilote survit donc bien au redémarrage du moteur — mais parce qu'il est son propre leader de
+groupe, pas parce qu'il ne serait pas un enfant.** D5 tient ; sa justification est réécrite.
+
+### M9 — le doc-comment du balayage au démarrage affirme le contraire de M7
+
+`crates/mika-agent/src/task_engine/engine.rs:1226-1233` justifie l'agressivité de `age=0` ainsi :
+
+> *a legitimate long-running manual tracking row would have `updated_at` bumped by any
+> `update_task_status` write within `MIKA_PHANTOM_SWEEP_AGE_SECONDS`* […]
+> *any phantom-shape row present at startup outlived a prior process*
+
+Les deux propositions sont contredites par la mesure : M7 montre que `updated_at` n'est jamais
+rafraîchi pendant le dispatch, et M8 montre qu'une ligne présente au démarrage peut parfaitement
+porter un processus toujours vivant.
+
+**D5 n'est donc pas du poids mort — c'est le chemin où le défaut est le plus aigu**, puisque
+`age=0` ne laisse aucune marge d'âge pour l'absorber.
+
 ### Contrôles de la mesure
 
 - **Positif** — `grep -rn "is_same_process_alive" crates --include='*.rs'` → 6 occurrences dans
@@ -298,11 +347,32 @@ de `swept_count` et `error_count`, pour que la passe se lise d'un seul champ.
 
 ### D5 — le même garde sur le chemin de démarrage *(AC1, AC3)*
 
-`startup_recovery` step 2b (`engine.rs:1234`) appelle la même requête à `age=0`. Un pilote lancé
-sous `bwrap` **survit au redémarrage du moteur** — le processus n'est pas un enfant du moteur.
-Sans le garde ici, tout redémarrage tuerait l'état de tous les dispatchs en vol, ce qui est le
-défaut du ticket sous une autre horloge. Le garde s'applique donc aux deux appelants via la même
-fonction privée (D3).
+`sweep_null_pid_phantoms_at_startup` (`engine.rs:1233`) appelle la même requête à `age=0`. Le
+garde s'y applique via la même fonction privée que D3 — un seul prédicat, deux appelants.
+
+**Justification, réécrite sur M8** (la première rédaction avançait une prémisse fausse, relevée
+par l'architecte en première passe) : le pilote est bien un enfant direct du moteur, mais il est
+son **propre leader de groupe de processus** (`executor.rs:2962`, `.process_group(0)`, mika#855).
+Un signal de groupe adressé au moteur ne l'atteint pas, `supervise-daemon` redémarre le moteur
+depuis un troisième groupe, et le pilote est réparenté à PID 1. Il survit.
+
+Sans le garde à `age=0`, tout redémarrage du moteur marquerait donc `failed` l'intégralité des
+dispatchs réellement en vol — le défaut du ticket, sous une horloge plus brutale, puisque `age=0`
+n'offre aucune marge.
+
+### D8 — le doc-comment qui justifie `age=0` cesse d'affirmer une chose fausse *(AC1)*
+
+`crates/mika-agent/src/task_engine/engine.rs:1226-1233` appuie l'agressivité du balayage au
+démarrage sur deux propositions que M7 et M9 mesurent comme fausses : que `updated_at` serait
+rafraîchi pendant un dispatch légitime, et qu'une ligne présente au démarrage a forcément
+survécu à son processus.
+
+Laisser ce commentaire en place pendant qu'on ajoute le garde qu'il déclare inutile produirait un
+fichier qui se contredit. Il est réécrit pour dire ce qui est vrai : les lignes de suivi n'ont pas
+de battement de cœur (M7), un pilote survit au redémarrage (M8), et c'est **le garde de vivacité**
+— non l'âge — qui distingue désormais l'orpheline du travail en cours.
+
+Périmètre strict : le texte du doc-comment, pas le comportement, qui est déjà couvert par D5.
 
 ### D6 — la constante et sa raison *(AC5)*
 
@@ -357,15 +427,43 @@ Repris du ticket, et deux ajouts nommés pour qu'ils ne soient pas confondus ave
   pourrait porter une forme voisine du même défaut sur les lignes `pending`. Le plan ne le touche
   pas : ce serait du périmètre non demandé. Nommé ici pour qu'un lecteur sache qu'il a été vu et
   laissé.
+- **`kill_orphan_processes`** (`engine.rs:473`) — chemin distinct : il tue les processus des tâches
+  *expirées* par `timeout_at`, pas ceux du balayage phantom. Nommé pour qu'il ne soit pas confondu
+  avec la surface traitée ici. Non modifié.
 - **Rafraîchir `updated_at` de la ligne de suivi pendant le dispatch** (M7) — corrigerait la cause
   profonde à la racine, mais change la sémantique d'un champ lu ailleurs. Le garde par vivacité
   résout l'AC sans ce risque ; le battement de cœur reste une option ultérieure.
 
-## Tie-back aux critères d'acceptation
+## Acceptance criteria
+
+Repris intégralement du ticket mika#2156, dans leur formulation d'origine.
+
+- **AC1** — Avant de marquer une ligne de suivi `failed/phantom_aged_out`, le balayage vérifie
+  qu'**aucune ligne de rappel active ne lui est rattachée** ; s'il en existe une dont le
+  `process_id` correspond à un processus vivant, la ligne de suivi n'est pas balayée.
+- **AC2** — Un test couvre exactement le cas mesuré ici : ligne de suivi `action_type='none'`,
+  `process_id IS NULL`, `in_progress`, `updated_at` vieux de 2 h, **avec** une ligne de rappel
+  vivante → la ligne de suivi survit.
+- **AC3** — Le cas symétrique reste couvert : même ligne de suivi **sans** rappel vivant →
+  toujours balayée (le correctif ne doit pas désarmer le balayeur, dont la raison d'être — les
+  vraies orphelines — reste valide).
+- **AC4** — Quand le balayage épargne une ligne parce qu'un rappel est vivant, il l'écrit dans le
+  journal avec l'identifiant du rappel et le `process_id` retenu, pour que la décision soit
+  lisible après coup.
+- **AC5** — La valeur `DEFAULT_PHANTOM_SWEEP_AGE_SECONDS` est réexaminée à la lumière des durées
+  réelles observées après mika#2146 / claude-pilot#147, et la raison du chiffre retenu est écrite
+  à côté de la constante.
+
+**Lecture retenue pour AC1** (validée par l'architecte en première passe, Q1) : « rappel actif »
+est défini par la seconde moitié de la phrase — *processus vivant* — et non par le statut de la
+ligne. Voir D-2 et la mesure M2, qui montre qu'une lecture par statut désarmerait le balayeur
+à 98 %.
+
+### Tie-back
 
 | AC | Deliverable | Vérification |
 |---|---|---|
-| AC1 — vérifier l'absence de rappel actif vivant avant de marquer `failed` | D1, D2, D3, D5 | D7-1 |
+| AC1 — vérifier l'absence de rappel actif vivant avant de marquer `failed` | D1, D2, D3, D5, D8 | D7-1 |
 | AC2 — test du cas mesuré : suivi vieux de 2 h + rappel vivant → survit | D7-1 | `cargo test` |
 | AC3 — cas symétrique : sans rappel vivant → toujours balayée | D7-2, D7-3 | `cargo test` |
 | AC4 — journaliser l'épargne avec l'identifiant du rappel et le `process_id` | D4 | D7-1 (assertion sur l'absence d'audit `phantom_aged_out`) + lecture du log |
