@@ -52,6 +52,16 @@ const RECORD_REJECTION_SQL: &str = "UPDATE customers \
 
 const REASON_ALREADY_LINKED: &str = "telegram_already_linked";
 
+/// The `provisioned` branch of the customer upsert in `handle_create_customer`,
+/// reduced to the columns this test cares about: a new token, and the verdict
+/// clearing that must ride with it.
+const REISSUE_TOKEN_SQL: &str = "UPDATE customers \
+                                 SET pairing_token = $1, \
+                                     pairing_expires_at = now() + interval '48 hours', \
+                                     pairing_rejected_at = NULL, \
+                                     pairing_rejection_reason = NULL \
+                                 WHERE id = $2 AND status = 'provisioned'";
+
 #[tokio::test]
 #[ignore = "requires a live Postgres at MIKA_DATABASE_URL / DATABASE_URL"]
 async fn pairing_rejection_verdict_is_recorded_and_cleared() {
@@ -285,6 +295,39 @@ async fn run_rejection_flows(pool: &sqlx::PgPool) -> Result<(), String> {
         .await;
     if half_set.is_ok() {
         return Err("case 4: a timestamp with no reason was accepted".to_string());
+    }
+
+    // --- Case 5: a fresh pairing token clears a spent verdict. ---
+    // A refused customer stays `provisioned`, which is the branch that gets a
+    // new token on re-provisioning. Leaving the old verdict there would show
+    // the console a refusal the user has not made yet.
+    sqlx::query(
+        "UPDATE customers SET pairing_rejected_at = now(), \
+             pairing_rejection_reason = $1 WHERE id = $2",
+    )
+    .bind(REASON_ALREADY_LINKED)
+    .bind(bystander)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("case 5: seeding a verdict failed: {e}"))?;
+
+    sqlx::query(REISSUE_TOKEN_SQL)
+        .bind("c".repeat(64))
+        .bind(bystander)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("case 5: token re-issue failed: {e}"))?;
+
+    let reason: Option<String> =
+        sqlx::query_scalar("SELECT pairing_rejection_reason FROM customers WHERE id = $1")
+            .bind(bystander)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("case 5: re-read bystander failed: {e}"))?;
+    if reason.is_some() {
+        return Err(format!(
+            "case 5: a spent verdict survived a fresh token: {reason:?}"
+        ));
     }
 
     Ok(())

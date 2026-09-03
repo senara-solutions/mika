@@ -1121,36 +1121,22 @@ async fn handle_register_customer(
     let timezone = payload.timezone.as_deref().unwrap_or("UTC");
 
     // Upsert customer row
-    let upsert_result = sqlx::query_as::<_, UpsertCustomerRow>(
-        r#"INSERT INTO customers (id, name, plan, timezone, status, bot_token, bot_username, webhook_secret, pairing_token, pairing_expires_at)
-           VALUES ($1, $2, $3, $4, 'provisioned', $5, $6, $7, $8, now() + make_interval(hours => $9))
-           ON CONFLICT (id) DO UPDATE SET
-               name = EXCLUDED.name,
-               bot_token = EXCLUDED.bot_token,
-               bot_username = EXCLUDED.bot_username,
-               -- Preserve the existing secret for active customers so the DB never
-               -- holds a secret Telegram doesn't yet have. The new secret is only
-               -- promoted after a successful setWebhook below (mika#1612).
-               webhook_secret = CASE WHEN customers.status = 'provisioned' THEN EXCLUDED.webhook_secret ELSE customers.webhook_secret END,
-               pairing_token = CASE WHEN customers.status = 'provisioned' THEN EXCLUDED.pairing_token ELSE customers.pairing_token END,
-               pairing_expires_at = CASE WHEN customers.status = 'provisioned' THEN EXCLUDED.pairing_expires_at ELSE customers.pairing_expires_at END
-           RETURNING status, pairing_token, (xmax = 0) AS was_inserted"#,
-    )
-    .bind(payload.customer_id)
-    .bind(&payload.name)
-    .bind(plan)
-    .bind(timezone)
-    .bind(payload.bot_token.expose_secret())
-    .bind(&payload.bot_username)
-    .bind(&webhook_secret)
-    .bind(&pairing_token)
-    // Postgres `make_interval(hours => $N)` expects int4; binding f64 (float8) is
-    // only an assignment cast and fails function resolution (mika#1612). Out-of-i32
-    // values fall back to the 48h default; `.max(1)` then floors zero/negative inputs
-    // to 1h so a nonsensical TTL can't mint an already-expired (unpairable) token.
-    .bind(i32::try_from(ttl_hours).unwrap_or(48).max(1))
-    .fetch_one(&state.pool)
-    .await;
+    let upsert_result = sqlx::query_as::<_, UpsertCustomerRow>(UPSERT_CUSTOMER_SQL)
+        .bind(payload.customer_id)
+        .bind(&payload.name)
+        .bind(plan)
+        .bind(timezone)
+        .bind(payload.bot_token.expose_secret())
+        .bind(&payload.bot_username)
+        .bind(&webhook_secret)
+        .bind(&pairing_token)
+        // Postgres `make_interval(hours => $N)` expects int4; binding f64 (float8) is
+        // only an assignment cast and fails function resolution (mika#1612). Out-of-i32
+        // values fall back to the 48h default; `.max(1)` then floors zero/negative inputs
+        // to 1h so a nonsensical TTL can't mint an already-expired (unpairable) token.
+        .bind(i32::try_from(ttl_hours).unwrap_or(48).max(1))
+        .fetch_one(&state.pool)
+        .await;
 
     let row = match upsert_result {
         Ok(row) => row,
@@ -1634,6 +1620,34 @@ async fn handle_list_customers(
 }
 
 // -- Token generation --
+
+/// Customer upsert used by `POST /admin/customers`.
+///
+/// Named so the mika-cloud#208 regression test can assert on it: the
+/// `provisioned` branch that mints a fresh pairing token must also clear any
+/// refusal verdict recorded against the previous one.
+const UPSERT_CUSTOMER_SQL: &str = r#"INSERT INTO customers (id, name, plan, timezone, status, bot_token, bot_username, webhook_secret, pairing_token, pairing_expires_at)
+           VALUES ($1, $2, $3, $4, 'provisioned', $5, $6, $7, $8, now() + make_interval(hours => $9))
+           ON CONFLICT (id) DO UPDATE SET
+               name = EXCLUDED.name,
+               bot_token = EXCLUDED.bot_token,
+               bot_username = EXCLUDED.bot_username,
+               -- Preserve the existing secret for active customers so the DB never
+               -- holds a secret Telegram doesn't yet have. The new secret is only
+               -- promoted after a successful setWebhook below (mika#1612).
+               webhook_secret = CASE WHEN customers.status = 'provisioned' THEN EXCLUDED.webhook_secret ELSE customers.webhook_secret END,
+               pairing_token = CASE WHEN customers.status = 'provisioned' THEN EXCLUDED.pairing_token ELSE customers.pairing_token END,
+               pairing_expires_at = CASE WHEN customers.status = 'provisioned' THEN EXCLUDED.pairing_expires_at ELSE customers.pairing_expires_at END,
+               -- A fresh pairing token starts a fresh attempt, so any refusal
+               -- recorded against the previous one is spent (mika-cloud#208).
+               -- Leaving it would show the console a refusal the user has not
+               -- made yet — the same class of stale-state lie this ticket
+               -- exists to remove. Cleared under the same condition that
+               -- promotes the new token, so an active customer's row is
+               -- untouched here.
+               pairing_rejected_at = CASE WHEN customers.status = 'provisioned' THEN NULL ELSE customers.pairing_rejected_at END,
+               pairing_rejection_reason = CASE WHEN customers.status = 'provisioned' THEN NULL ELSE customers.pairing_rejection_reason END
+           RETURNING status, pairing_token, (xmax = 0) AS was_inserted"#;
 
 /// Generate a cryptographic pairing token (32 random bytes, hex-encoded → 64 chars).
 fn generate_pairing_token() -> String {
@@ -2861,6 +2875,31 @@ mod tests {
         assert!(
             !RECORD_PAIRING_REJECTION_SQL.contains("status"),
             "the verdict write must never change customer status"
+        );
+    }
+
+    #[test]
+    fn reissuing_a_pairing_token_clears_a_spent_verdict() {
+        // A refused customer stays `provisioned`, which is exactly the branch
+        // that mints a fresh pairing token on re-provisioning. Keeping the old
+        // verdict there would make the console report a refusal the user has
+        // not made yet — the same stale-state lie this ticket exists to remove.
+        assert!(
+            UPSERT_CUSTOMER_SQL.contains(
+                "pairing_rejected_at = CASE WHEN customers.status = 'provisioned' THEN NULL"
+            ),
+            "the customer upsert must clear a spent rejection verdict"
+        );
+        assert!(
+            UPSERT_CUSTOMER_SQL.contains(
+                "pairing_rejection_reason = CASE WHEN customers.status = 'provisioned' THEN NULL"
+            ),
+            "the customer upsert must clear the spent reason too"
+        );
+        // An active customer's row is never touched by this branch.
+        assert!(
+            UPSERT_CUSTOMER_SQL.contains("ELSE customers.pairing_rejected_at END"),
+            "a non-provisioned customer must keep its verdict columns"
         );
     }
 
