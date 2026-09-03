@@ -318,3 +318,10 @@ opérateur n'est supprimé : les commentaires restent la trace.
   (c) ; F2 — AC6 faisait modifier le corps du ticket par l'implémenteur → retiré du périmètre
   implémenteur, reclassé geste opérateur ; F3 — la branche β fermait sans mémoire → conditionnée au
   document de la Phase 5 et à sa citation dans le commentaire de fermeture.
+- **2026-09-03 — mika-arch seconde passe : `Verdict: GROOMED`**, même session
+  `2b9b6ec9-b673-4154-8b74-4bf7ae8b0dc5`. Aucun constat résiduel ; les trois ancres retenues portent
+  sur la Fire-Disposition (le détecteur ne balaie aucune donnée préexistante), la mémoire exigée
+  d'une fermeture sans changement de code, et l'établissement par sonde de l'absence de preuve
+  historique. Les quatre incertitudes portées en seconde passe restent non arbitrées et sont donc
+  laissées telles quelles dans le plan : elles appartiennent à l'implémenteur ou à l'opérateur, pas
+  à l'architecte.
