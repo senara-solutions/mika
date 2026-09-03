@@ -24,6 +24,11 @@ L'hypothèse est écrite au module (`auto_pull.rs:37-39`) :
 
 Elle est fausse sur le **chemin nominal** du grooming. `.claude/commands/mika-groom-ticket.md` commite le plan à trois sites distincts — Phase 3 étape 10, Phase 4 étape 12, Phase 5 étape 17 — et c'est délibéré : la lignée doit rester lisible entre « l'architecte a signé » et « l'opérateur a rédigé » (Phase 2 étape 7). Tout ticket ayant demandé un aller-retour architecte porte donc `ahead_by ∈ {2,3}` sans qu'aucun pilote ne l'ait touché.
 
+**L'énoncé le plus court du défaut**, tel que le commentaire du 2026-09-02 12:08Z le formule :
+*le prédicat pénalise exactement la propriété qu'il devrait récompenser.* Plus un plan est
+retravaillé, plus il porte de commits, plus la porte le classe « travail partiel d'un pilote mort ».
+Un ticket groomé en une passe passe ; un ticket groomé en trois est gaté à vie.
+
 C'est la troisième récidive en 48 h de la même forme — *un garde encode une hypothèse sur ce que son producteur produit, et le producteur produit légitimement autre chose* — après `is_groomed` et `dispatch-lib.sh:4405` (mika#2120). Précédent applicable : `docs/solutions/architecture-patterns/guard-parser-must-be-as-permissive-as-downstream-consumer-2026-08-29.md`.
 
 ## Mesures — exécutées le 2026-09-03, pas déduites
@@ -122,6 +127,48 @@ Les deux `BranchAbsent` (#2121, #1949) désignent des branches qui n'existent pl
 C'est le troisième chemin de refus, inchangé par ce ticket, et ce n'est pas son sujet — noté ici
 pour que la table soit complète, pas pour élargir le périmètre.
 
+### M7 — deux mesures venues des commentaires du ticket, et ce qu'elles changent
+
+Les commentaires du 2026-09-02 (10:14Z et 12:08Z) portent deux mesures que le corps n'a pas, et qui
+touchent l'une le périmètre, l'autre AC6. Elles sont reprises ici parce qu'un plan qui ne les
+nomme pas laisse son implémenteur les redécouvrir.
+
+**M7a — le faux positif est auto-régénérant ; un correctif manuel ne tient pas.** Le 2026-09-02, les
+deux branches ont été rebasées à la main (`behind_by = 0`, donc promotion par le court-circuit
+d'amont `up_to_date`), `ready` reposé, `operator-gated` retiré. Les deux ont été re-gatées dans
+l'heure : `#2120` à 11:10:02Z (**63 min** de survie), `#2118` à 11:20:09Z (~73 min). La raison est
+mécanique : le rebase met `behind_by` à zéro *à cet instant* ; dès qu'un commit atterrit sur `main`,
+`behind_by` repasse au-dessus de zéro, le court-circuit ne s'applique plus, et `ahead_by > 1`
+reprend la main. Un ticket groomé en deux passes oscille donc entre `ready` et `operator-gated` au
+rythme des merges, sans jamais être dispatché. Le bassin `ready` était à **2** à 12:10Z, sous le
+plancher de 3, avec trois candidats groomés dehors.
+
+**M7b — le prédicat `ahead_by` est faux dans les deux sens, et le nouveau ne corrige qu'un sens.**
+Un pilote tué avant son premier commit ne modifie pas `ahead_by` : le travail partiel qu'il laisse,
+s'il en laisse, est **non commité**, donc invisible à un compte de commits — et tout aussi invisible
+à une liste de fichiers `compare`, qui ne lit que ce qui est commité. Mesuré : deux dispatches ont
+réellement travaillé sur `fix/2118/…` le 2026-09-02 (sessions `16e51db9`, 31 appels d'outils ;
+`478b7b1c`, 34 appels), tous deux tués par `idle_timeout`, et le `reflog` montre que `HEAD` n'a
+jamais bougé — huit `checkout`, zéro `commit`.
+
+| population | `ahead_by > 1` | prédicat par fichiers |
+|---|---|---|
+| branche groomée en 2–3 passes, sans pilote | **refuse** (faux positif) | promeut ✔ |
+| branche portant du travail de pilote **commité** | refuse ✔ | refuse ✔ |
+| pilote mort **avant** son premier commit | promeut (faux négatif) | promeut (faux négatif, inchangé) |
+
+Ce ticket ferme la première ligne. Il ne ferme pas la troisième, et ne le prétend pas : une porte
+qui verrait le travail non commité devrait lire un état git local que ce module n'a pas (il n'a
+aucun checkout — c'est `auto_pull.rs:1327-1333`). Le faux négatif reste ouvert, hors périmètre.
+
+**Et il est aujourd'hui sans sujet.** Tant que mika#2141 tient — le bac à sable ne monte pas le
+gitdir, donc aucune commande git ne fonctionne à l'intérieur d'un pilote — la population « travail
+partiel **commité** par un pilote » que cette porte existe pour protéger **n'existe pas du tout**.
+Cela ne justifie pas de retirer la règle `salvage` (elle protège des branches historiques comme
+#1680 et #1727, qui sont réelles), mais cela borne le coût accepté en § Décision de conception : la
+branche-à-liste-`files`-indisponible qui promeut désormais devrait, pour nuire, porter du travail de
+pilote commité — ce qu'aucun pilote ne peut produire tant que #2141 n'est pas résolu.
+
 ## Décision de conception
 
 **Le prédicat de `salvage` devient : « la branche modifie au moins un fichier hors `docs/plans/` par rapport à `main` ».** `ahead_by` cesse d'être le discriminant et redevient ce qu'il est — une distance, journalisée, jamais interprétée.
@@ -150,6 +197,25 @@ Trois raisons, dont deux sont structurelles :
 1. **L'auto-levée s'auto-contredit.** `is_feeder_excluded` (`auto_pull.rs`) exclut tout ticket portant `operator-gated` des **trois** phases. Une porte qui se relit elle-même devrait d'abord ré-évaluer des tickets que sa propre exclusion lui interdit de regarder — c'est-à-dire retourner l'exclusion contre son objet.
 2. **La machine ne peut pas distinguer son label de celui de l'opérateur.** `operator-gated` n'est pas un label machine : sa description déclarée (`.github/labels.yml:106`) est *« Groomed work requiring operator-host-time. Distinct from parked/blocked. No ready label. »* — un geste d'opérateur légitime. Une porte qui le retirerait dé-gaterait silencieusement du travail qu'un humain a gaté. Ce serait très exactement la faute que ce ticket corrige : un lecteur qui suppose ce que son producteur a produit.
 3. **Le canal existe déjà.** Le commentaire de refus dit déjà *« puis retire le label `operator-gated` »* (`RefusalReason::comment_body`). Ce qui manquait n'était pas le geste mais sa *raison lisible* — AC5 la fournit en nommant les fichiers.
+
+**L'objection d'idempotence, et sa réponse.** Le commentaire du 2026-09-02 12:08Z pose la seule
+condition qui rende une levée manuelle acceptable : *« si la levée reste manuelle, elle doit au
+moins être **idempotente vis-à-vis de l'avancée de `main`**, sinon elle est un travail de Sisyphe
+déguisé en remède. »* La condition est juste, et elle est **remplie par le correctif lui-même** —
+pas par une garantie ajoutée à côté :
+
+- **Avant.** La levée manuelle passait par un rebase mettant `behind_by` à `0`, donc par le
+  court-circuit `up_to_date`. Elle survivait jusqu'au prochain merge sur `main` : 63 minutes,
+  mesurées (M7a). Sisyphe, exactement.
+- **Après.** Une branche ne portant que son plan n'entre plus jamais dans `SalvageWorkOnStaleBranch`,
+  quel que soit `behind_by`. La levée ne dépend donc plus d'une valeur que l'avancée de `main`
+  détruit. Elle tient **tant que la branche reste sous le seuil de distance** — et si elle le
+  franchit un jour, le refus qui arrive est `TooFarBehind`, un motif différent, avec un remède
+  différent et légitime (rebaser). Ce n'est pas la même levée à refaire : c'est une autre question.
+
+C'est ce qui rend le choix « manuel » tenable ici alors qu'il ne l'était pas hier. Dit autrement :
+l'auto-levée serait un remède au symptôme d'un prédicat faux ; le prédicat corrigé retire le
+symptôme.
 
 Ce choix est écrit **dans le module**, à côté de `REFUSAL_LABEL`, pas seulement ici : un label posé par la machine et levable seulement à la main est une dette d'opérateur silencieuse tant qu'elle n'est pas nommée à l'endroit où on la lit.
 
@@ -310,7 +376,7 @@ Le paragraphe `auto_pull.rs:37-39` (*« `ahead_by` separates the two populations
 | `1959-diverged-75-behind-1-ahead.json` | enrichir | 1 `docs/plans/**` |
 | `2048-diverged-17-behind-1-ahead.json` | enrichir | liste réelle capturée |
 | `2123-ahead-0-behind-1-ahead.json` | enrichir | liste réelle capturée |
-| `2118-diverged-8-behind-3-ahead.json` | **nouvelle** | 1 `docs/plans/**` (M1) |
+| `2118-diverged-8-behind-3-ahead.json` | **nouvelle** | 1 `docs/plans/**` (M1) — **trois** commits de plan, le cas « plusieurs passes architecte » explicitement demandé par le commentaire du 2026-09-02 12:08Z |
 | `2120-diverged-8-behind-2-ahead.json` | **nouvelle** | 1 `docs/plans/**` (M1) |
 | `1727-diverged-185-behind-3-ahead.json` | **nouvelle** | 1 `docs/plans/**` + 1 doc hors plan (M6, cas-limite) |
 
@@ -356,6 +422,10 @@ Repris du ticket, sans extension :
 - `MAX_BEHIND` et `TooFarBehind` — hors cause, les deux branches sont à 8 de retard.
 - L'aveuglement de préfixe d'`is_groomed` — c'est mika#2120, déjà groomé.
 - Le fait que `/mika-groom-ticket` produise plusieurs commits de plan — **pas** un défaut : c'est le lecteur qui doit tolérer ce que son producteur produit.
+- **Le faux négatif symétrique** — un pilote tué avant son premier commit laisse du travail non
+  commité, invisible au compte de commits comme à la liste `compare` (M7b). Le fermer demanderait un
+  état git local que ce module n'a pas. Reste ouvert, hors de ce ticket, et sans sujet tant que
+  mika#2141 tient.
 - La réparation de `operator-review` (48 lignes `not found` en production) — chemin mika#2020, cité par `REFUSAL_LABEL` et laissé où il est.
 
 ## Risques et contre-mesures
@@ -378,7 +448,7 @@ Repris du ticket, sans extension :
 | AC4 — liste tronquée/indisponible → promotion | D1, D2, D5 | `test_promotion_gate_missing_file_list_promotes` ; `non_plan_files(None) == []` par construction |
 | AC5 — le refus nomme les fichiers hors plan | D4 | `test_salvage_refusal_names_the_offending_files` (+ troncature à 10) |
 | Fire-Disposition (mika#1574, F1 première passe) | § Fire-Disposition ; D7, D8 | surface 1 → réparation dans le périmètre ; surface 2 → n=0 mesuré + fixture #1727 auto-nettoyante + déclencheur (c) |
-| AC6 — levée choisie et écrite | Décision de conception ; D6 | la levée est **manuelle**, justifiée en trois points et écrite dans le module à côté de `REFUSAL_LABEL` |
+| AC6 — levée choisie et écrite | Décision de conception ; D6 | la levée est **manuelle**, justifiée en trois points, écrite dans le module à côté de `REFUSAL_LABEL` — et l'objection d'idempotence du commentaire 2026-09-02 12:08Z est traitée : le correctif rend la levée idempotente vis-à-vis de l'avancée de `main`, là où elle survivait 63 min avant (M7a) |
 
 ## Suite opératoire (hors diff, après merge)
 
