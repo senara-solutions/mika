@@ -45,6 +45,20 @@ Deux exigences, au-delà de la correction de la regex :
 
 Le plus troublant : le refus **contenait déjà le remède**, en toutes lettres dans sa propre note — *« Dispatch dev-pilot to implement, or remove the plan from the branch to force a fresh groom. »* Le système savait quoi faire. Il n'avait aucun chemin entre ce qu'il sait à un endroit et ce qu'il décide à l'autre.
 
+## Trois instances dans la même nuit — le motif, pas l'anecdote
+
+Le 2026-09-03, **trois** couples de composants ont été mesurés en désaccord sur une même question, chacun dans un mécanisme différent de la boucle :
+
+| question | qui répond A | qui répond B | écart mesuré |
+|---|---|---|---|
+| « ce ticket est-il groomé ? » | `is_groomed()` lit la **prose** du callout → non | garde de `dispatch-lib` résout le **fichier de plan** → oui | 12 refus en 3 h 30, 3 `p1` jamais implémentés (mika#2158) |
+| « le grooming est-il le goulot ? » | le journal l'**affirme** (`// R7`) | le code ne peut pas le savoir : `candidates.is_empty()` couvre deux cas opposés | a produit l'action inverse de celle qui était due (mika#2161) |
+| « le créneau est-il libre ? » | le **bail** expire en 120 s → libre | la **garde** lit le rappel actif → occupé | 4 h 12 de divergence, 8 réveils pour rien (mika#2162) |
+
+Aucune des six moitiés n'est buggée prise isolément. Chacune fait ce que son commentaire annonce. Ce qui manque à chaque fois est le **même** : rien ne réconcilie les deux réponses, et rien ne casse quand elles divergent.
+
+C'est pour ça que le motif se répète : il ne laisse pas de trace d'erreur à corriger. On ne le trouve qu'en comptant des répétitions dans un journal — douze refus, huit réveils — c'est-à-dire en cherchant une régularité, pas une panne.
+
 ## La classe, réutilisable
 
 **Un prédicat qui teste une formulation déguisée en test d'état.** Le signe distinctif : il exige une chaîne de caractères produite par un humain ou un agent, alors que la propriété qu'il prétend mesurer a une trace matérielle ailleurs (un fichier, une ligne en base, un ref git). À chaque fois que la formulation change légitimement — une langue, un chemin plus court, une étape sautée parce qu'elle était inutile — le prédicat rend faux sur un état vrai.
@@ -65,3 +79,5 @@ La première hypothèse — « ce défaut fabrique les onze sessions de grooming
 - mika#2158 — le ticket, avec le tableau des six corps mesurés
 - mika#2120 — le frère sur l'autre axe du même prédicat (préfixe du chemin de plan)
 - mika#2020 / mika#1887 — `PlanOwnership`, la classe voisine : un callout qui pointe vers le plan d'un autre ticket
+- mika#2161 — deuxième instance : le journal du feeder affirme un goulot qu'il ne peut pas connaître
+- mika#2162 — troisième instance : le bail de créneau expire en 120 s quand la garde tient 4 h
