@@ -56,7 +56,7 @@ L'inventaire de départ, établi par la lecture faite pendant le grooming (à co
 | helper mitmdump `:8892` | `dispatch-lib.sh:178`, `:306` — daemon hôte long-vivant, partagé, déjà multi-clients | **partageable en l'état** — mais le fichier de jeton `_PILOT_GH_TOKEN_FILE` (`:186`) est réécrit **avant chaque spawn** (`:846`) : deux spawns rapprochés se marchent dessus. **Changement nommé requis.** |
 | rappel `canUseTool` → mika-dev | `a2a.rs:226`/`:360` `try_lock_owned()` → `"Agent is busy"` ; relais `.claude/claude-pilot.json` timeout 120 000 ms | **bloquante en l'état** — c'est *la* trouvaille de l'inventaire |
 
-Le document doit aussi dire ce que devient une escalade refusée côté pilote : `claude-pilot` reçoit `"Agent is busy"` — le comportement observé (retry ? échec de l'outil ? abandon de session ?) se mesure, il ne se devine pas.
+Le document doit aussi dire ce que devient une escalade refusée côté pilote : `claude-pilot` reçoit `"Agent is busy"` — le comportement observé (retry ? échec de l'outil ? abandon de session ?) se mesure, il ne se devine pas. La remédiation de cette ligne bloquante est fichée en **mika#2163** (file bornée sur le chemin A2A, l'équivalent de mika#1870 pour `/message`) ; l'inventaire la référence, il ne la réimplémente pas.
 
 ### Phase 2 — Borne matérielle chiffrée (AC2)
 
@@ -132,6 +132,32 @@ Un commentaire sur mika#2160 qui écrit : la borne matérielle chiffrée, le ver
 
 ---
 
+## Fire-Disposition
+
+Trois livrables de ce plan sont de classe détecteur : le test à N=2 (Phase 4), le test de
+non-régression à N=1 (Phase 5), et la garde de configuration à trois paliers (Phase 3a), dont le
+palier « valeur illisible » est une détection au sens strict — il observe une entrée invalide et
+émet un WARN.
+
+**Disposition retenue : (c) halte-et-remontée à l'opérateur.** Pas (a) — il n'y a pas d'exception
+nommée à porter dans une liste blanche, ces détecteurs n'ont pas de population de faux positifs
+connue à amnistier. Pas (b) — livrer les tests `#[ignore]` reviendrait à livrer un réglage de
+concurrence sans filet, ce qui est exactement ce que KTD1 et le risque « un réglage qui ment »
+cherchent à empêcher.
+
+Ce que « tire » veut dire pour chacun, et ce qui arrive alors :
+
+| détecteur | ce qui le fait tirer | disposition |
+|---|---|---|
+| test N=2 (AC4) | un des deux baux n'est pas `Acquired`, ou le troisième dispatch n'est pas refusé | **échec CI, halte.** Le réglage est décoratif — c'est la régression que KTD1 nomme. Rien ne se livre, l'opérateur tranche. |
+| test N=1 (AC5) | le second dispatch n'est plus refusé `global_dispatch_active`, ou son rappel différé n'est plus enregistré | **échec CI, halte.** C'est une régression du défaut, donc du comportement de production actuel. Priorité sur tout le reste du ticket. |
+| garde de config (Phase 3a) | `MIKA_DISPATCH_MAX_CONCURRENT_IMPLEMENT` illisible ou négatif | **WARN + repli sur le défaut 1, sans halte.** Le repli est le comportement voulu (c'est le palier 2 de la forme à trois paliers) ; un réglage mal tapé ne doit pas arrêter la boucle. C'est le seul des trois qui ne halte pas, et c'est délibéré. |
+
+Aucun de ces détecteurs n'a de sortie « ignorer et continuer ». Une CI rouge sur AC4 ou AC5 remonte
+à l'opérateur avec la mesure, jamais avec un contournement.
+
+---
+
 ## Décisions clés
 
 **KTD1 — Le plafond bouge à deux endroits ou nulle part.** Le prédicat d'existence (§2) et la clé primaire du bail (§1) sont deux plafonds à 1 indépendants. Écarté : ne toucher que le prédicat, parce que le bail sérialiserait quand même et le réglage serait un mensonge lisible dans `--help`.
@@ -144,7 +170,7 @@ Un commentaire sur mika#2160 qui écrit : la borne matérielle chiffrée, le ver
 
 **KTD5 — `count_*` est un compagnon, pas une mutation de signature.** `has_active_callback_tasks_excluding` a six appelants dont un jumeau async ; changer sa forme ferait de ce ticket un refactor.
 
-**KTD6 — Le rappel `canUseTool` est classé bloquant, et ce classement n'est pas réparé ici.** Poser une file bornée sur le chemin A2A (l'équivalent de mika#1870 pour `/message`) est un ticket séparé, que la Phase 1 doit **ficher** avec sa preuve `a2a.rs:226`. Écarté : l'inclure au périmètre — c'est un changement du chemin de permission, la surface de sûreté délibérée, et il ne se glisse pas dans une étude de concurrence.
+**KTD6 — Le rappel `canUseTool` est classé bloquant, et le ticket de remédiation est fiché : mika#2163.** Une classification « bloquante » sans plan de remédiation est une dette documentée et non résolue ; le ticket existe donc avant que ce plan sorte du grooming, avec sa preuve (`a2a.rs:226`/`:360` en `try_lock_owned()`) et une mesure directe — la première passe architecte de ce grooming s'est fait refuser **cinq fois de suite** avec `"Agent is busy"` avant de passer à la sixième tentative, le 2026-09-03 entre 23:43 et 23:46 CEST. mika#2163 est un prérequis d'**exploitation** de N>1, pas un prérequis de **livraison** : ce plan livre son réglage à défaut 1 sans lui. Écarté : l'inclure au périmètre — c'est un changement du chemin de permission, la surface de sûreté délibérée, et il ne se glisse pas dans une étude de concurrence.
 
 ---
 
@@ -169,4 +195,4 @@ Un commentaire sur mika#2160 qui écrit : la borne matérielle chiffrée, le ver
 
 ## Hors périmètre — confirmé
 
-La classe `groom` (déjà parallèle). Le balayage phantom (mika#2156). Le livelock de grooming (mika#2158). La file bornée du chemin A2A (à ficher en Phase 1, KTD6).
+La classe `groom` (déjà parallèle). Le balayage phantom (mika#2156). Le livelock de grooming (mika#2158). La file bornée du chemin A2A — **fichée en mika#2163**, référencée par KTD6, non traitée ici.
