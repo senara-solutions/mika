@@ -206,6 +206,23 @@ Repli obligatoire pour les PR antérieures au correctif (aucun marqueur) : mesur
 - `qa-review/system_prompt.md` porte l'item d'incident dans l'étape 1.5, et aucune référence « Step 1.6 »/« Step 2.5 » n'a bougé.
 - `bash -n skills/bundled/_shared/dispatch-lib.sh` passe ; `shellcheck` ne régresse pas sur le fichier.
 
+## Fire-Disposition
+
+Ce plan livre des artefacts de classe détecteur — la suite T1–T6 et le contrôle de contrat de prompt de la Phase 3.7 — dont le chemin de succès est « aucune violation trouvée ». La porte de mika#1574 exige de dire ce que fait l'implémentation quand un détecteur tire sur des données **préexistantes**, et non sur le code que la PR ajoute. Les trois détecteurs de ce plan n'ont pas le même rapport à l'existant ; ils sont traités séparément plutôt que sous une disposition unique qui en masquerait deux.
+
+**Détecteur 1 — la suite T1–T6 : disposition (c) halte-et-remontée, sans exception nommée.**
+Chaque cas construit son propre dépôt git temporaire (D4) et n'inspecte aucun corpus du dépôt. Il n'existe donc **aucune donnée préexistante** sur laquelle ces tests puissent tirer : l'option (a) est vide de contenu ici, et l'option (b) n'aurait rien à protéger. Un échec de T1–T6 signale une régression du prédicat ou de la composition du corps, jamais une violation héritée. Il fait échouer la CI, sans exception nommée et sans `#[ignore]`. La liste d'allowlist attendue par (a) est vide **par construction**, pas par indulgence.
+
+**Détecteur 2 — le contrôle de contrat de prompt (Phase 3.7) : disposition (c), même raison.**
+Il lit `qa-review/system_prompt.md` et exige la présence de `rescue-diff: incident-only` et de `block[ac]`. La conformité qu'il vérifie est **créée par la même PR** (Phase 3.6) : au moment où il atterrit, l'artefact qu'il scanne est déjà conforme. Il ne peut donc pas tirer sur de l'existant non conforme. Son tir futur signifie une seule chose — quelqu'un a retiré l'étape 1.5 item 3 — et c'est exactement ce contre quoi il existe. Échec de CI, pas d'exception.
+
+**Détecteur 3 — `_rescue_diff_carries_work` en production : ne peut pas tirer sur l'existant.**
+C'est le seul des trois qui a un corpus réel — les PR de récupération déjà ouvertes. Il ne tire pas dessus, et pas par choix de ce plan : le prédicat n'est appelé **qu'au moment de composer le corps d'une PR nouvellement créée** (Phase 1.3, site `gh pr create`). Rien dans ce plan ne relit ni ne réécrit un corps de PR existant. Les PR déjà ouvertes gardent le corps qu'elles portent.
+
+La mesure borne la conséquence de ce choix : le balayage de l'opérateur (62 PR de récupération, quatre dépôts, tous états) a trouvé **une seule** PR creuse, `mika-cloud#202`, déjà fermée non mergée, et la plus petite PR de récupération **mergée** est `mika#1637` (+163, 2 fichiers). L'ensemble d'exceptions que l'option (a) demanderait est donc vide **par mesure**, pas par hypothèse. Le désarmement rétroactif reste hors périmètre pour cette raison, et non par omission.
+
+**Ce qui ferait bouger cette disposition.** Si une PR de récupération creuse est trouvée ouverte après ce correctif, la disposition ne tient plus et le traitement rétroactif devient dû — avec son propre ticket, sa propre mesure, et une exception nommée par PR concernée. La condition est datable et vérifiable : `gh pr list --search "Auto-rescued in:body" --state open` sur les quatre dépôts, croisé avec un diff entièrement incident.
+
 ## Acceptance criteria
 
 Transcrits du corps de mika#2157. AC5 porte la liaison de vocabulaire décidée en D5 — l'intention du ticket, dans le jeton qui existe (M5).
@@ -252,3 +269,23 @@ Ce que la structure porte réellement, c'est AC1 : après ce correctif, même si
 - mika#1282 (classe `dirty-worktree`), mika#1396 (classe `commit-pushed-no-pr`), mika#1618 (le marqueur lisible par machine dont D7 reprend la forme).
 - mika#1713, mika#2151, mika#2146 — les trois tickets voisins que le corps met hors périmètre.
 - Commentaire de l'opérateur du 2026-09-03T21:05:59Z sur mika#2157 — le balayage 62 PR qui borne le dégât à zéro fermeture silencieuse et établit que ce ticket est de la prévention.
+
+## Registre de grooming — ce que l'architecte a signé, et ce qu'il n'a pas vu
+
+Première passe `mika-arch`, session `5a0533d8-f80f-44ea-8a14-8de116af3805`, disposition **ITERATE**, deux trouvailles bloquantes.
+
+**F2 — `## Fire-Disposition` absente (mika#1574). Fondée, appliquée.** La section ci-dessus est la réponse. L'architecte suggérait la disposition (c) en bloc ; le plan la retient pour les détecteurs 1 et 2, et documente séparément le détecteur 3, qui ne peut pas tirer sur l'existant par construction. Découper plutôt que signer une disposition unique : trois détecteurs sous une seule ligne auraient caché que deux d'entre eux n'ont aucun corpus et que le troisième n'est jamais rejoué.
+
+**F1 — « section `## Acceptance criteria` absente ». Réfutée, et la cause est de mon côté.** Le plan porte cette section depuis sa première rédaction, avec les cinq AC en puces `- [ ] **ACn**`. L'architecte ne l'a pas vue parce que **je ne lui ai pas envoyé le plan** : la première passe ne transportait que le brief de revue par les pairs, qui résume les décisions sans reproduire la section d'AC. La trouvaille mesure fidèlement ce qu'il avait sous les yeux ; elle ne mesure pas le plan. Correction de procédure, pas de contenu : la seconde passe transporte le fichier de plan intégral. Aucune modification n'est faite au plan au titre de F1 — ajouter une section qui existe déjà aurait gravé l'erreur de mesure dans l'artefact.
+
+**Les cinq incertitudes du brief, tranchées.**
+
+| # | Incertitude | Réponse de l'architecte | Effet sur le plan |
+|---|---|---|---|
+| U1 | La liste `case` est-elle au bon niveau de fermeture ? | Le raisonnement par conséquence tient : ces artefacts sont éphémères (le rebase les écrase), donc jamais des livrables légitimes. `:1475-1478` est l'autorité établie. | D1 inchangée, confirmée |
+| U2 | D6 contourne l'étape 1.5 au lieu de la réparer | Découpage acceptable — défense en profondeur valable sur un mécanisme qui a échoué ; réparer 1.5 mérite son ticket si la cause est complexe | D6 inchangée ; hors-périmètre confirmé |
+| U3 | AC5 reste une garde de prompt | D7 (marqueur lisible par machine) **est** la bonne réponse structurelle : après le correctif, une revue défaillante ne peut plus merger un `Closes #N` puisque l'instruction n'est plus là. Webhook hors périmètre acceptable à ce stade. | D7 confirmée comme le porteur structurel ; R2 inchangé |
+| U4 | Trois-points vs deux-points | Divergence acceptable ; la forme trois-points mesure bien « ce que la PR introduit relativement à la base ». Citer le risque sur branche en retard suffit. | D3 inchangée |
+| U5 | Duplication `_clean_worktree_for_rebase` ↔ liste `case` | Le commentaire croisé est la bonne réponse minimale ; la fusion créerait une mauvaise abstraction (nettoyer vs classifier) | R3 inchangé |
+
+**Ce que l'architecte n'a pas tranché**, et qui reste donc au jugement de l'implémenteur : rien sur le fond n'a été renvoyé. Les deux trouvailles portaient sur la forme du plan (une section due, une section crue absente). Le contenu technique — D1 à D7 — est passé sans contestation, U1 à U5 comprises.
