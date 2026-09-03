@@ -42,6 +42,7 @@ son historique) et retirer la ligne d'ici.
 | [#2119](https://github.com/senara-solutions/mika/issues/2119) | un tenant cloud ne peut lire aucune page hors des quatre hôtes gouv.fr | `git merge-base --is-ancestor fb2f01a4 <sha de l'image déployée>` rend **vrai** — c'est-à-dire quand un tenant exécute une image postérieure à `fetch_url` (bloqué derrière mika-cloud#216) |
 | [#2139](https://github.com/senara-solutions/mika/issues/2139) | migration de la famille `opentelemetry` d'un seul bloc (0.31 → 0.32) | quand `opentelemetry`, `opentelemetry_sdk` et `opentelemetry-otlp` ont une version **mutuellement alignée** publiée sur crates.io |
 | [#2150](https://github.com/senara-solutions/mika/issues/2150) | vérifier que le sweep des lignes fantômes tend vers zéro (AC6 de #1934) | **le 2026-09-10 ou après**, soit sept jours pleins après le déploiement du correctif de #1934 |
+| [#1812](https://github.com/senara-solutions/mika/issues/1812) | SearXNG auto-hébergé comme chemin d'escalade pour la recherche sous contrôle d'egress (design-only) | quand le **trigger E6** de mika#1806 est activé — c'est-à-dire quand une décision opérateur ouvre la contingence « backend de recherche sous contrôle d'egress ». Aucun build avant. |
 
 ## Ce qui n'entre pas ici
 
