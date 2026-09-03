@@ -739,6 +739,42 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Async wrapper for [`Database::find_active_tracking_rows_by_reference_url_and_variants`]
+    /// (mika#1934 AC2.2 / AC4.b). `base_url` MUST be canonical (no `?phase=groom`).
+    pub async fn find_active_tracking_rows_by_reference_url_and_variants(
+        &self,
+        base_url: &str,
+    ) -> Result<Vec<Task>> {
+        let a = self.agent_id.clone();
+        let url = base_url.to_owned();
+        self.with_db(move |db| db.find_active_tracking_rows_by_reference_url_and_variants(&a, &url))
+            .await
+    }
+
+    /// Async wrapper for [`Database::cancel_task_superseded`] (mika#1934 AC2).
+    pub async fn cancel_task_superseded(&self, id: &str) -> Result<bool> {
+        let a = self.agent_id.clone();
+        let i = id.to_owned();
+        self.with_db(move |db| db.cancel_task_superseded(&i, &a))
+            .await
+    }
+
+    /// Async wrapper for [`Database::terminal_mark_tracking_row_upstream_closed`]
+    /// (mika#1934 AC4).
+    pub async fn terminal_mark_tracking_row_upstream_closed(
+        &self,
+        id: &str,
+        new_status: &str,
+        result: &str,
+    ) -> Result<bool> {
+        let a = self.agent_id.clone();
+        let i = id.to_owned();
+        let s = new_status.to_owned();
+        let r = result.to_owned();
+        self.with_db(move |db| db.terminal_mark_tracking_row_upstream_closed(&i, &a, &s, &r))
+            .await
+    }
+
     pub async fn get_task_depth(&self, task_id: &str) -> Result<Option<i64>> {
         let a = self.agent_id.clone();
         let i = task_id.to_owned();

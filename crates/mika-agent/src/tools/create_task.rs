@@ -6,6 +6,7 @@ use serde_json::Value;
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 use crate::db::{NewTask, TASK_TYPE_ISSUE, Task, VALID_TASK_TYPES, is_unique_violation};
 use crate::task_engine::types::{action_type, trigger_type};
+use crate::task_state::tasks::GROOM_PHASE_SUFFIX;
 
 /// Format a success response for a deduplicated task (already exists).
 fn format_dedup_response(existing: &Task) -> String {
@@ -180,6 +181,27 @@ impl Tool for CreateTaskTool {
         } else {
             0
         };
+
+        // Supersede-on-new-dispatch (mika#1934 AC2) — grooming branch. When the
+        // LLM-driven grooming path creates a tracking row (its reference_url
+        // carries the `?phase=groom` suffix), cancel any phantom rows
+        // (blocked/in_progress, no process) left behind for the same underlying
+        // issue — both the base ready-label URL and the groom variant. Runs
+        // BEFORE the dedup pre-check so a superseded phantom no longer counts as
+        // an active row to reuse. Fail-open; never blocks creation. Mirrors the
+        // engine-side `ready_label_handler` guard (mika#1934 sequencing step 4).
+        if let Some(url) = reference_url
+            && url.contains(GROOM_PHASE_SUFFIX)
+        {
+            crate::tracking_cleanup::supersede_prior_tracking_rows(
+                ctx.db,
+                ctx.session_id,
+                Some(ctx.trace_id),
+                url,
+                label,
+            )
+            .await;
+        }
 
         // Dedup: check for existing active tasks before session cap and INSERT.
         // Dedup returns existing items as success — it's not a "new creation" so it
