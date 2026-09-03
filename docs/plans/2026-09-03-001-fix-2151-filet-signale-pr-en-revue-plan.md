@@ -75,11 +75,40 @@ Le ticket propose trois formes et laisse le choix à la conception. Décision : 
 
 **Pourquoi pas C (refuser le redispatch).** Le ticket la qualifie lui-même de « plus large, touche une autre surface — à peser », et « pas présupposée » dans le hors-périmètre. Elle *empêche* du travail là où le ticket demande de *rendre visible*. Candidate à un ticket distinct ; pas ici.
 
+**Pourquoi pas la comparaison générale `commit_id` ↔ `head_sha` (arbitrage explicite, F2).** `find_pass_verdict()` (`ci_success_handler.rs:683`) lit déjà `commit_id` sur la revue retenue, et `PrInfo` porte `head_sha`. Refuser le merge automatique quand les deux diffèrent fermerait la porte pour **toute** avance post-revue, pas seulement celle du filet — c'est strictement plus général que ce plan. Écartée, pour trois raisons nommées :
+
+1. **Elle ne satisfait pas AC1.** Le critère exige qu'« un opérateur qui regarde la PR » voie le changement. Une garde de merge ne s'écrit nulle part sur la PR : elle refuse, en silence, dans le moteur. C'est l'exacte forme de silence que le ticket condamne.
+2. **Elle n'aurait pas tiré sur l'incident.** Mesuré : à `04:40:45Z`, aucune revue à l'état `APPROVED` n'existait. `find_pass_verdict()` aurait rendu `None` et la comparaison n'aurait eu aucun `commit_id` à comparer. La solution « plus structurelle » est, sur le cas réel, **moins couvrante** que le signal local.
+3. **Autre surface, autre chemin de livraison.** Moteur Rust (`crates/mika-agent`) contre script empaqueté (`skills/bundled/`), avec un déploiement et un périmètre de test disjoints. Les mêler dans un ticket p2 gonfle le rayon d'action sans rien fermer de plus.
+
+Elle reste une bonne garde en soi — d'où la ligne « piste notée, non construite » du hors-périmètre, à ficher séparément avec la preuve ci-dessus.
+
 **Pourquoi pas « repasser la PR en brouillon » (`gh pr ready --undo`).** Envisagé — c'est le signal le plus fort, GitHub refusant de merger un brouillon. Rejeté : `wip_rescue.rs` scanne les brouillons portant `wip-rescue` et les **re-sort du brouillon** automatiquement après 15 min (`MIN_AGE_DEFAULT_SECS = 900`, chaîne rebase → clippy → `gh pr ready`). Un re-brouillon sur une PR de sauvetage serait donc silencieusement défait par notre propre moteur : le signal serait *moins* durable qu'un congédiement, qui n'a pas d'adversaire. Le retenir imposerait en plus une étiquette d'exclusion à câbler dans `wip_rescue.rs` — deux fichiers, deux couches, pour un signal plus fragile.
 
 ---
 
 ## Ce qui est construit
+
+### Étape 0 — sonde du droit du jeton, **avant** d'écrire le congédiement
+
+*(F3 de la revue architecte de premier passage — le congédiement ne doit pas dépendre d'une permission non vérifiée.)*
+
+Le congédiement exige `pull_requests: write` sur l'installation GitHub App `mika-platform-bot[bot]` (`_setup_gh_auth`, `:1337`, bascule `gh auth switch --user "mika-platform-bot[bot]"`). Cette permission n'est **pas** vérifiée aujourd'hui.
+
+Sonde, exécutée en premier pas de l'implémentation, **sous le jeton bot** (une sonde sous `samidarko` ne prouverait rien : propriétaire du dépôt, elle réussirait de toute façon — cf. `feedback_a_probe_needs_both_controls_in_the_same_call`) :
+
+1. ouvrir une PR de rebut sur une branche jetable ;
+2. la faire approuver ;
+3. `gh api --method PUT /repos/senara-solutions/mika/pulls/<n>/reviews/<id>/dismissals -f message=probe -f event=DISMISS` ;
+4. relire `state` de la revue : `DISMISSED` attendu ;
+5. fermer la PR, supprimer la branche.
+
+**Disposition selon le résultat, pré-spécifiée :**
+
+| Résultat | Suite |
+|---|---|
+| `DISMISSED` | Étape 2 (c) est construite telle que décrite. |
+| `403` / autre échec | Étape 2 (c) est **retirée du périmètre**. Le commentaire et l'étiquette restent — AC1 tient sur eux. Un ticket de suite est fiché pour demander la permission à l'installation, avec la sortie de la sonde comme preuve. Le plan n'est pas re-groomé pour autant : le repli est déjà décidé ici. |
 
 ### Étape 1 — accumuler les commits de sauvetage
 
@@ -100,6 +129,15 @@ Producteurs (append du `rev-parse HEAD` après un commit réussi) :
 Nouvelle fonction, placée juste après `_push_with_rebase_retry` (voisinage thématique : tout ce qui suit la poussée).
 
 Garde d'entrée — retour `0` immédiat si `REPO`, `BRANCH` ou `WORKTREE_DIR` est vide, ou si l'ensemble non-signalé est vide.
+
+**Cette garde précède l'appel réseau, et c'est ce qui répond à F4 de la revue architecte.** Il y a deux cas « nominaux » et le plan les confondait :
+
+| Cas | Fréquence | Coût ajouté |
+|---|---|---|
+| **N1 — aucun sauvetage n'a eu lieu** (le pilote a commité lui-même) | le cas majoritaire d'une boucle saine | **zéro** : la garde rend `0` avant tout appel `gh`. Aucune latence, aucune dépendance réseau, aucun quota consommé. |
+| **N2 — un sauvetage a eu lieu, aucune PR n'est ouverte** | le cas nominal que décrit AC2 | **une lecture** `gh pr list`, zéro mutation. |
+
+Le coût de N2 est irréductible : on ne peut pas répondre à « une PR est-elle ouverte ? » sans le demander. Il est aussi proportionné — il ne se paie que sur un dispatch qui vient déjà de commiter du travail rescapé, jamais sur un dispatch sain.
 
 Interrogation :
 
@@ -155,6 +193,26 @@ Ajouter `rescue-after-review` à `.github/labels.yml` (voisine de `wip-rescue`, 
 
 ---
 
+## Fire-Disposition
+
+*(F1, bloquant, de la revue architecte de premier passage — un détecteur qui entre en service doit dire à l'avance ce que signifie son premier tir.)*
+
+**Ce détecteur n'a pas d'arriéré.** `RESCUE_COMMITS` est vide au démarrage de chaque dispatch et n'est alimenté que par des commits produits **pendant ce dispatch**. Il ne balaye ni l'historique, ni les PR ouvertes, ni les branches existantes. Il n'y a donc aucun tir rétrospectif possible sur des données préexistantes : le premier tir sera un événement vivant.
+
+**Chemin de succès :** un commit de sauvetage atterrit sur une branche portant une PR ouverte → **un commentaire est posté sur cette PR**. C'est l'unique marqueur de succès. Son absence, sur une PR dont la branche a reçu un commit `wip(` après l'ouverture de la PR, est une **violation** — pas un silence acceptable.
+
+**Dispositions par classe de tir, décidées d'avance :**
+
+| Classe | Attendu | Disposition |
+|---|---|---|
+| Sauvetage → PR ouverte **non** approuvée (le cas de l'incident) | commentaire + étiquette, **pas** de congédiement | vrai positif. Rien à trier. |
+| Sauvetage → PR ouverte approuvée | commentaire + étiquette + congédiement | vrai positif. Le congédiement referme aussi `ci_success_handler.rs:716`. |
+| Sauvetage → PR ouverte **en brouillon** que la boucle alimente encore (`wip-rescue`) | commentaire + étiquette, pas de congédiement (rien à congédier sur un brouillon en cours) | **Attendu, et volontairement non exempté.** Un commentaire sur un brouillon coûte une ligne et n'a aucun effet bloquant ; l'exempter demanderait de distinguer « brouillon que la boucle nourrit » de « brouillon qu'un humain relit », distinction que rien dans l'état GitHub ne porte. Un bruit inoffensif vaut mieux qu'une exemption qui rouvre le silence. |
+| Sauvetage → aucune PR | rien | AC2. Zéro écriture. |
+| Aucun sauvetage | rien, et **aucun appel réseau** | cas N1 ci-dessus. |
+
+**Aucune exemption nommée n'est nécessaire**, et c'est la conclusion de fond : la seule classe de tir qu'on pourrait vouloir taire — le brouillon nourri par la boucle — est précisément celle où le tir est gratuit. Si l'exploitation montre que ce bruit gêne (mesure : nombre de commentaires par semaine sur des brouillons `wip-rescue`), l'exemption se décidera alors, sur des chiffres, dans un ticket qui les porte.
+
 ## Tests
 
 Nouveau fichier `skills/bundled/_shared/tests/test_rescue_signal_open_pr.sh`, hors-ligne, sans `cargo`. Idiome : source direct de `dispatch-lib.sh` (`test_push_with_rebase_retry.sh` en atteste : la bibliothèque n'a pas de code impératif au niveau supérieur) + stub `gh()` en fonction shell enregistrant ses appels (idiome de `test_finalize_pr_gate.sh:149`) + dépôt git temporaire réel.
@@ -162,6 +220,7 @@ Nouveau fichier `skills/bundled/_shared/tests/test_rescue_signal_open_pr.sh`, ho
 | # | Ce qui est prouvé | AC |
 |---|---|---|
 | T1 | `gh pr list` rend `[]` → **aucun** appel `gh pr comment` / `gh pr edit` / `gh api` enregistré, `RESULT` inchangé, retour 0 | AC2 |
+| T1b | `RESCUE_COMMITS` vide (cas N1) → **aucun appel `gh` du tout**, pas même `pr list` ; le stub enregistre zéro invocation | AC2 (F4) |
 | T2 | PR ouverte → un commentaire posté contenant le SHA du sauvetage et son `--shortstat` | AC1 |
 | T3 | `reviewDecision == APPROVED` → un `PUT …/dismissals` par revue `APPROVED` | AC1 |
 | T4 | PR ouverte mais non approuvée → commentaire posté, **aucun** congédiement | AC1 |
@@ -180,7 +239,7 @@ Câblage `Makefile` : ligne dans la cible `test:` (auprès de `:130`) et cible n
 ## Critères d'acceptation
 
 - **AC1** — Étape 2, cas défaut : commentaire sur la PR + étiquette + congédiement de l'approbation. Visible sur la PR elle-même, pas seulement dans un journal. Bloquant : le congédiement referme aussi la porte machine (`ci_success_handler.rs:716` rejette tout `state != "APPROVED"`). Étape 4 couvre le troisième silence. Prouvé par T2, T3, T4, T8.
-- **AC2** — Étape 2, garde `_open_pr` vide : zéro mutation GitHub, `RESULT` inchangé, une ligne stderr. Prouvé par T1, qui assert l'**absence** d'appels mutants, pas seulement la présence du bon comportement.
+- **AC2** — Deux paliers, tous deux tenus (F4) : **N1**, aucun sauvetage → la garde d'entrée rend `0` avant tout appel `gh`, coût strictement nul ; **N2**, sauvetage sans PR ouverte → une lecture `gh pr list`, zéro mutation, `RESULT` inchangé, une ligne stderr. Prouvé par T1, qui assert l'**absence** d'appels mutants — et par T1b, qui assert l'absence de **tout** appel `gh` quand `RESCUE_COMMITS` est vide.
 - **AC3** — Les trois gestes de signalement sont *fail-open* et s'exécutent **après** que le commit est sur la branche et poussé. Aucun chemin ne peut perdre le travail. Prouvé par T6.
 - **AC4** — `RESCUE_COMMITS` est un accumulateur, pas un booléen ; le second sauvetage d'un même dispatch entre dans le même commentaire, et le second sauvetage d'un dispatch **ultérieur** repart d'un `SIGNALLED` vide et signale à nouveau. Prouvé par T5.
 - **AC5** — Scénario réel figé en table, dans son état **mesuré** : `reviewDecision` absent au moment du sauvetage. T7 fige ce cas-là ; T7b fige sa variante `APPROVED`. Le déclencheur testé est « PR ouverte », jamais « PR approuvée » — c'est la correction que la mesure du relevé horaire a imposée au plan.
@@ -195,12 +254,13 @@ Câblage `Makefile` : ligne dans la cible `test:` (auprès de `:130`) et cible n
 
 ---
 
-## Risque à lever pendant l'implémentation
+## Risques
 
-Le congédiement exige `pull_requests: write` sur l'installation GitHub App `mika-platform-bot[bot]` (`_setup_gh_auth`, `:1337`, bascule `gh auth switch --user "mika-platform-bot[bot]"`). Si le droit manque, l'appel rend 403.
+**1. Droit du jeton pour le congédiement — levé par l'Étape 0.** La sonde et sa disposition de repli sont pré-spécifiées ci-dessus ; ce n'est plus un risque ouvert mais une étape avec deux issues décidées. En complément, le chemin reste *fail-open* à l'exécution : le commentaire est posté **avant** le congédiement, donc un 403 en production n'emporte pas AC1.
 
-- **Conception :** le chemin est *fail-open* — le commentaire est posté avant le congédiement, donc AC1 tient partiellement même en 403, et stderr nomme le code.
-- **Vérification :** une sonde `gh api --method PUT …/dismissals` sur une PR de rebut, exécutée pendant l'implémentation, avant de déclarer AC1 rempli. Une sonde qui ne teste que le succès ne prouve rien : elle doit être exécutée sous le jeton **bot**, pas sous `samidarko` (qui est propriétaire et réussirait de toute façon).
+**2. Le tampon en prose n'est pas neutralisé.** Le tampon réel de l'incident était un commentaire (« Revue QA formelle — APPROUVÉE »), et ce plan ne cherche pas à le détecter : un grep de prose sur des commentaires est fragile et se périmerait au premier changement de formulation QA. Conséquence assumée et nommée : le signal **informe** l'opérateur, il ne **retire** pas ce tampon-là. Ce qu'il retire, c'est l'état GitHub `APPROVED` quand il existe, et c'est le seul des deux que la machine lit.
+
+**3. Le correctif n'est pas déployé par son merge.** Étape 6. Le corps de la PR doit le dire ; sans `make -C mika deploy`, le code est mergé et le filet reste muet.
 
 ---
 
