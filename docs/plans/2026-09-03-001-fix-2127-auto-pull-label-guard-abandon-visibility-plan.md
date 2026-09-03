@@ -151,7 +151,9 @@ La garde d'AC2 n'a donc pas à inventer sa technique : elle a un modèle dans le
 
 4. **AC5 n'est pas un rattrapage manuel — c'est la porte à rouvrir.** Poser `operator-review` à la main sur `#2117` réglerait un ticket et laisserait la classe intacte : à la prochaine disjonction, un autre ticket se scellera de la même façon, silencieusement. Le correctif de classe est que **`circuit_broken` ne doit pas court-circuiter un abandon déjà dû**. Un ticket dont le budget de re-drive est épuisé doit être abandonné *même* — et surtout — quand le disjoncteur a sauté, puisque c'est précisément l'échec d'abandon qui l'a fait sauter.
 
-   → **Question ouverte à l'architecte, formulée en §Questions.** Ce quatrième point touche la logique de sélection, pas la seule visibilité. Il est ici parce qu'AC5 est insatisfaisable sans lui ; s'il doit vivre dans son propre ticket, le plan cède et AC5 se réduit au geste opérateur nommé.
+   Deux gestes, pas un. Le **découplage** du compteur (étape 11) empêche tout scellement futur — la branche qui scelle cesse d'être alimentée par le geste qu'elle bloque, et l'abandon redevient ré-essayable à chaque tick. Le **verdict** (étape 12) rouvre la porte pour les tickets déjà scellés, dont `#2117`. L'un sans l'autre laisserait soit l'état résiduel, soit la classe.
+
+   → **Périmètre tranché** — voir §Arbitrage de périmètre. La question a été routée après l'`ESCALATE` de seconde passe et rendue : garder ici, le test étant la relation causale et non la forme du diff.
 
 **Ce que le plan ne fait pas :** il ne réordonne pas `abandon_stuck_ready` (appliquer avant retirer). Ce choix est délibéré, documenté, et il **redevient** convergent dès lors que le label existe et que la porte est rouverte. Le hors-périmètre du ticket est respecté à la lettre.
 
@@ -176,19 +178,32 @@ La garde d'AC2 n'a donc pas à inventer sa technique : elle a un modèle dans le
 9. Le passer au niveau `error!` plutôt que `warn!`, ou justifier le maintien en `warn!` dans le plan. Dix-huit lignes ont crié pendant trois jours sans que quiconque agisse : le niveau n'est pas ce qui a manqué, mais l'événement d'audit ne remplace pas un niveau juste.
 10. Test : un abandon dont l'application de label échoue écrit la ligne d'audit. Contrôle négatif : un abandon qui réussit n'en écrit pas.
 
-### Phase 4 — Rouvrir la porte, et mesurer le bassin (AC5)
+### Phase 4 — Découpler, rouvrir, rendre visible, rattraper (AC5)
 
-*Conditionnelle à l'arbitrage de la question Q1.*
+*Périmètre tranché par Mika Prime le 2026-09-03 — voir §Arbitrage de périmètre.*
 
-11. Dans `classify_stuck_ready`, faire que le budget épuisé l'emporte sur le disjoncteur — un abandon dû reste dû quand le disjoncteur a sauté, puisque c'est l'échec d'abandon qui l'a fait sauter. Ne pas toucher aux autres branches (`ReEntry`, `SkipAndResetBudget`, `in_flight`), qui protègent des états différents.
-12. Test de régression reproduisant M5 : `circuit_broken = true`, `redrive_count >= budget`, `abandoned = false` → verdict `Abandon`, pas `Skip`. C'est le test qui aurait vu le défaut.
-13. **Mesure avant/après du bassin.** Compter `pullable` avant, appliquer, redéployer, recompter, et vérifier sur `#2117` que `ready` est retiré, `operator-review` posé, `redrive_abandoned_at` non-NULL. Consigner les deux comptes.
-14. Consigner `#1651` et `#1403` comme CLOSED-par-la-main portant `blocked` (M7) — hors rattrapage, et pourquoi.
+11. **Découpler le compteur du disjoncteur de l'échec d'application du label — chirurgicalement.** Dans la branche d'erreur de `abandon_stuck_ready` (`:1685-1692`), cesser d'appeler `increment_auto_pull_failure`. La branche qui scelle ne doit pas être alimentée par le geste qu'elle bloque.
+
+    **`increment_auto_pull_failure` a cinq appelants dans ce module** — `:1687` (abandon), `:2075`, `:2224`, `:2502`, `:2509` (chemins de promotion). **Seul `:1687` change.** Sur les quatre autres, le disjoncteur compte ce qu'il doit compter : des échecs de promotion, où le ticket est bien la source du problème. Les désarmer transformerait un correctif en régression silencieuse du disjoncteur. Le `git diff` doit montrer un seul site touché.
+
+    Effet : l'abandon redevient ré-essayable à chaque tick, indéfiniment. La convergence que le commentaire de `:1682-1684` promettait devient réelle au lieu d'être théorique — et la porte ne se scelle plus jamais.
+
+12. **Le budget épuisé l'emporte sur le disjoncteur.** Dans `classify_stuck_ready`, un ticket dont le budget de re-drive est épuisé doit être abandonné même quand le disjoncteur a sauté. L'étape 11 empêche le scellement à l'avenir ; celle-ci rouvre la porte pour les tickets **déjà** scellés, dont `#2117`. Ne pas toucher aux autres branches — `ReEntry` (`:947-951`), `SkipAndResetBudget`, `in_flight` — qui protègent des états différents.
+
+    **L'ordre appliquer-puis-retirer de `abandon_stuck_ready` reste inchangé**, et ce n'est pas de la déférence au hors-périmètre : inverser l'ordre produirait l'état estampille-sans-label, que `classify_stuck_ready:947-951` lit comme le geste de ré-entrée de l'opérateur — `ReEntry`, reset du budget, ticket re-promu. On échangerait un ticket collé avec `ready`, visible, contre une boucle de re-promotion tous les N re-drives qui ressemble à du travail. Voir §Arbitrage de périmètre.
+
+13. **Le verdict `Skip` cesse de vivre en `debug!`.** `:2378` et `:2381` journalisent en `debug!` un verdict qui décide du sort d'un ticket, à un niveau que la configuration de production ne montre pas. C'est ce qui a rendu `#2117` invisible pendant deux jours après que ses `warn!` se sont tus. Un `Skip { reason: "circuit_breaker" }` doit écrire un `audit_events` interrogeable — pas seulement passer le niveau de log, qui déplacerait le bruit sans créer l'action.
+
+14. **Test de régression reproduisant M5** : `circuit_broken = true`, `redrive_count >= budget`, `abandoned = false` → verdict `Abandon`, pas `Skip`. C'est le test qui aurait vu le défaut. Plus un test qui vérifie qu'un échec d'application de label **n'incrémente plus** le compteur, et un contrôle négatif : un échec de promotion l'incrémente toujours.
+
+15. **Rattrapage vérifié par reproduce→observe-gone, pas par geste nommé.** Le critère n'est pas « l'opérateur a posé le label à la main » mais « l'état ne se reproduit plus ». Reproduire : un ticket satisfaisant `failure_count >= 3 ∧ redrive_abandoned_at IS NULL ∧ ready posé` est-il abandonné au tick suivant ? Observer disparu : après déploiement, `#2117` porte `operator-review`, ne porte plus `ready`, et son `redrive_abandoned_at` est non-NULL. **Mesure avant/après du compte `pullable`**, les deux consignés.
+
+16. Consigner `#1651` et `#1403` comme CLOSED-par-la-main portant `blocked` (M7) — hors rattrapage, et pourquoi.
 
 ### Phase 5 — La prose cesse de mentir (AC6)
 
-15. Réécrire `:180-205` : garder l'incident comme **histoire datée** (« au 2026-09-01, `operator-review` n'existait pas ; 18 lignes en production ; déclaré depuis par #2128/#2130 »), retirer l'affirmation au présent, et redire pourquoi `REFUSAL_LABEL` reste `operator-gated` — parce que sa description déclarée *est* l'état qu'un refus crée, ce qui reste vrai indépendamment de l'existence de l'autre label.
-16. Corriger le doc-comment de `abandon_stuck_ready` (`:1660-1666`, M4) pour qu'il décrive l'ordre réel : le marqueur d'abord, son échec avorte. Ne **pas** changer l'ordre lui-même.
+17. Réécrire `:180-205` : garder l'incident comme **histoire datée** (« au 2026-09-01, `operator-review` n'existait pas ; 18 lignes en production ; déclaré depuis par #2128/#2130 »), retirer l'affirmation au présent, et redire pourquoi `REFUSAL_LABEL` reste `operator-gated` — parce que sa description déclarée *est* l'état qu'un refus crée, ce qui reste vrai indépendamment de l'existence de l'autre label.
+18. Corriger le doc-comment de `abandon_stuck_ready` (`:1660-1666`, M4) pour qu'il décrive l'ordre réel : le marqueur d'abord, son échec avorte. Ne **pas** changer l'ordre lui-même.
 
 ## Definition of Done
 
@@ -206,7 +221,11 @@ La garde d'AC2 n'a donc pas à inventer sa technique : elle a un modèle dans le
 - [ ] Chaque détecteur de test (D1-D5) halte la CI en tirant, avec le message que le tableau §Fire-Disposition exige.
 - [ ] D6 remonte sans halter, et sa remontée est une ligne `audit_events` interrogeable, pas seulement un log.
 - [ ] Le commentaire au-dessus de D1 nomme les formes syntaxiques que le scan reconnaît, pour que R1 soit lisible depuis le code.
-- [ ] *(si Q1 → dans ce ticket)* `classify_stuck_ready` rend `Abandon` quand le budget est épuisé même si le disjoncteur a sauté, avec le test de régression de M5.
+- [ ] `abandon_stuck_ready` n'incrémente plus le compteur du disjoncteur sur échec d'application de label, et le `git diff` ne touche **qu'un seul** des cinq `increment_auto_pull_failure` (`:1687`).
+- [ ] `classify_stuck_ready` rend `Abandon` quand le budget est épuisé même si le disjoncteur a sauté, avec le test de régression de M5.
+- [ ] Les branches `ReEntry`, `SkipAndResetBudget` et `in_flight` de `classify_stuck_ready` sont inchangées.
+- [ ] Le verdict `Skip` écrit un `audit_events`, et ne vit plus seulement en `debug!` (`:2378`).
+- [ ] AC5 est vérifié par reproduce→observe-gone, pas par un geste manuel : `#2117` porte `operator-review`, ne porte plus `ready`, `redrive_abandoned_at` non-NULL, comptes `pullable` avant/après consignés.
 
 ## Acceptance criteria
 
@@ -216,7 +235,7 @@ Transcrits du corps réconcilié de mika#2127.
 - [ ] **AC2** — Garde structurelle exhaustive : un test échoue si un quelconque littéral de label employé par `auto_pull.rs` n'est pas déclaré dans `labels.yml`. Couvre au minimum `operator-review`, `blocked`, `ready`, `operator-gated`.
 - [ ] **AC3** — Contrôle négatif obligatoire : le test échoue si l'on retire `ready` de `labels.yml`. Démontré et consigné dans la PR.
 - [ ] **AC4** — L'échec d'application du label d'abandon remonte au-delà du journal : un `audit_events` dédié, interrogeable.
-- [ ] **AC5** — Rattrapage de l'état résiduel, mesuré : établir si le chemin d'abandon peut atteindre `#2117` (M5 : **non**), livrer le rattrapage, mesurer `pullable` avant/après.
+- [ ] **AC5** — Rattrapage de l'état résiduel, mesuré : le chemin d'abandon ne peut pas atteindre `#2117` (M5). Livrer le découplage (étape 11) **et** le verdict (étape 12), puis vérifier par reproduce→observe-gone — pas par geste manuel nommé. Mesurer `pullable` avant/après.
 - [ ] **AC6** — Le doc-comment de `REFUSAL_LABEL` cesse d'affirmer au présent une absence qui n'est plus.
 
 ## Rattachement aux critères d'acceptation
@@ -227,14 +246,14 @@ Transcrits du corps réconcilié de mika#2127.
 | AC2 | Phase 2 (étapes 2-6) | Test rouge sur label non déclaré, nommant le label |
 | AC3 | Phase 2 (étapes 4, 7) | Sortie d'échec après retrait de `ready`, collée dans la PR ; plus le contrôle de non-vacuité |
 | AC4 | Phase 3 (étapes 8-10) | Ligne `audit_events` en cas d'échec, absente en cas de succès |
-| AC5 | Phase 4 (étapes 11-14) | Verdict `Abandon` sous disjoncteur (test) ; `#2117` désétiqueté ; comptes `pullable` avant/après |
+| AC5 | Phase 4 (étapes 11-16) | D5 vert ; D8 vert (un seul site d'incrément touché) ; `#2117` désétiqueté avec `redrive_abandoned_at` non-NULL ; comptes `pullable` avant/après |
 | AC6 | Phase 5 (étapes 15-16) | `:180-205` et `:1660-1666` relus contre le code |
 
 ## Fire-Disposition
 
-Ce plan introduit six détecteurs. Chacun doit dire, **avant d'exister**, ce qui se passe quand il tire — sinon un détecteur qui trouve quelque chose devient une ligne que personne ne traite, ce qui est exactement le défaut de ce ticket (dix-huit `warn!` en trois jours, aucune action). Citation : mika#1574, porte Fire-Disposition.
+Ce plan introduit huit détecteurs. Chacun doit dire, **avant d'exister**, ce qui se passe quand il tire — sinon un détecteur qui trouve quelque chose devient une ligne que personne ne traite, ce qui est exactement le défaut de ce ticket (dix-huit `warn!` en trois jours, aucune action). Citation : mika#1574, porte Fire-Disposition.
 
-**Disposition retenue pour les cinq détecteurs de test : (c) halte-et-remontée.** Ils vivent dans `cargo test`, donc dans la CI, donc dans la porte de merge. Un tir arrête la PR. Aucun n'a de mode « avertir et continuer » — un détecteur de cohérence qu'on peut ignorer ne vérifie rien, ce que l'AC3 dit déjà de son côté.
+**Disposition retenue pour les six détecteurs de test (D1-D5, D8) : (c) halte-et-remontée.** Ils vivent dans `cargo test`, donc dans la CI, donc dans la porte de merge. Un tir arrête la PR. Aucun n'a de mode « avertir et continuer » — un détecteur de cohérence qu'on peut ignorer ne vérifie rien, ce que l'AC3 dit déjà de son côté.
 
 | # | Détecteur | Condition de tir | Disposition | Message exigé |
 |---|---|---|---|---|
@@ -242,10 +261,12 @@ Ce plan introduit six détecteurs. Chacun doit dire, **avant d'exister**, ce qui
 | D2 | contrôle de non-vacuité | l'extraction rend moins que `operator-review`, `blocked`, `ready` | **halte** | dit que l'extraction est cassée, pas que les labels manquent — la confusion entre les deux est ce qui rendrait D1 vert pour la mauvaise raison |
 | D3 | contrôle négatif (nom inventé) | un nom jamais déclaré est vu comme déclaré | **halte** | dit que le prédicat `declared()` ne discrimine plus |
 | D4 | contrôle de coupe production/test | la tranche production ne contient pas `fn abandon_stuck_ready` | **halte** | donne la taille de la tranche obtenue, sur le modèle de `:2841-2845` |
-| D5 | test de régression disjoncteur→abandon *(si Q1 → dans ce ticket)* | `circuit_broken && redrive_count >= budget && !abandoned` ne rend pas `Abandon` | **halte** | nomme le verdict obtenu et rappelle M5 |
-| D6 | `auto_pull_abandon_marker_unavailable` (production, pas test) | l'application du label d'abandon échoue en production | **remontée sans halte** — la boucle continue | ligne `audit_events` interrogeable + log au niveau tranché en Q3 |
+| D5 | test de régression disjoncteur→abandon | `circuit_broken && redrive_count >= budget && !abandoned` ne rend pas `Abandon` | **halte** | nomme le verdict obtenu et rappelle M5 |
+| D6 | `auto_pull_abandon_marker_unavailable` (production, pas test) | l'application du label d'abandon échoue en production | **remontée sans halte** — la boucle continue | ligne `audit_events` interrogeable + `warn!` conservé (§Arbitrage, Q3) |
+| D7 | audit event du verdict `Skip` (production, pas test) | `classify_stuck_ready` écarte un ticket sous disjoncteur | **remontée sans halte** | ligne `audit_events` nommant l'issue et la raison — remplace le `debug!` de `:2378` que la config de production ne montre pas |
+| D8 | non-régression du disjoncteur | le `git diff` touche un `increment_auto_pull_failure` autre que `:1687` | **halte** | nomme le site touché et rappelle que quatre appelants comptent des échecs de promotion légitimes |
 
-**D6 est délibérément le seul qui ne halte pas.** C'est un détecteur d'exécution, pas de merge : arrêter `auto_pull` parce qu'un abandon a échoué punirait tous les autres tickets pour un seul. Il remonte, il ne bloque pas. Mais « remonte » a désormais un sens vérifiable — une ligne d'audit qu'on peut interroger — au lieu d'un `warn!` que personne ne lit. C'est la totalité d'AC4.
+**D6 et D7 sont délibérément les seuls qui ne haltent pas.** Ce sont des détecteurs d'exécution, pas de merge : arrêter `auto_pull` parce qu'un abandon a échoué punirait tous les autres tickets pour un seul. Ils remontent, ils ne bloquent pas. Mais « remonte » a désormais un sens vérifiable — une ligne d'audit qu'on peut interroger — au lieu d'un `warn!` que personne ne lit. C'est la totalité d'AC4, et D7 est ce qui aurait rendu `#2117` visible.
 
 ### Faux positifs — ce qui est traité, et ce qui reste ouvert
 
@@ -256,16 +277,31 @@ Le seul détecteur qui peut tirer à tort est **D1**, par sa technique de scan.
 
 Ce choix d'accepter R1 plutôt que de le fermer est délibéré : la fermer exigerait de passer par l'AST (`syn`) plutôt que par le texte, ce qui ajoute une dépendance de test et une complexité sans commune mesure avec la classe de défaut visée — un label appliqué et jamais déclaré. Si un faux négatif se produit réellement, il devient l'incident qui justifie l'AST ; l'anticiper aujourd'hui serait construire la garde de la garde avant d'avoir mesuré qu'elle manque.
 
-## Questions pour l'architecte
+## Arbitrage de périmètre — tranché, pas laissé ouvert (2026-09-03)
 
-**Q1 — Le correctif de la porte scellée (Phase 4, étape 11) appartient-il à ce ticket ?**
-Pour : AC5 est insatisfaisable sans lui, et le rattrapage manuel laisse la classe intacte — la prochaine disjonction rescellera un autre ticket, en silence. Contre : c'est un changement de la logique de sélection, tandis que le reste du ticket est garde + visibilité ; la discipline maison sépare le travail adjacent dans son propre ticket. **Position du plan : le garder ici**, parce que la porte a été scellée *par le défaut que ce ticket traite*, ce qui en fait sa conséquence et non son voisin. Si l'architecte tranche autrement, AC5 se réduit au geste opérateur nommé et un ticket suiveur porte l'étape 11.
+La première passe architecte a rendu `ITERATE` sur une finding (Fire-Disposition manquante, appliquée). La seconde a rendu `ESCALATE` sur une seule question : **le correctif de la porte scellée appartient-il à ce ticket ?** L'architecte a refusé de trancher un périmètre depuis son siège — à juste titre — et l'a nommé décision opérateur. La question a été routée à Mika Prime.
 
-**Q2 — L'extraction par scan de source est-elle la bonne forme, ou faut-il des constantes nommées ?**
-Alternative : convertir `"operator-review"` et `"blocked"` en `const EXCLUSION_LABELS: &[&str]` et faire porter la garde sur ce tableau. Plus lisible et robuste au refactoring ; mais rien n'empêche alors un futur littéral d'échapper au tableau — l'exhaustivité redevient déclarative. **Position du plan : le scan**, parce que le module en a déjà le précédent (M8) et parce que l'AC2 dit « un littéral … qui n'est pas déclaré », pas « un membre du tableau ». Une troisième voie — constantes **plus** scan vérifiant qu'il ne reste aucun littéral hors constantes — est plus forte que les deux et coûte une assertion ; à trancher.
+**Tranchage : garder dans #2127.** Le test qui départage n'est pas « est-ce de la logique de sélection du bassin » — vrai, mais c'est la forme du diff, pas la cause. Le test est la **relation causale** : la porte a été scellée par le défaut même que ce ticket traite. Ce n'est pas du travail adjacent, c'est sa conséquence directe, mesurée. La discipline « adjacent → suiveur » sépare le voisin, pas la conséquence ; ici la distance causale est nulle. Un suiveur qui hériterait de cet état naîtrait dormant sans condition de réveil autre que « la prochaine fois, en silence » — or l'invisibilité *est* le coût.
 
-**Q3 — `error!` ou `warn!` pour la branche d'échec d'abandon ?**
-Dix-huit lignes `warn!` en trois jours n'ont déclenché aucune action. L'audit event d'AC4 est la réponse structurelle ; monter le niveau est la réponse cosmétique. Faut-il les deux, ou l'audit event suffit-il ?
+**Le coût du tranchage, nommé :** le ticket s'élargit au-delà de garde-structurelle + visibilité, vers un correctif de sélection de bassin. C'est réel. Le prix de l'inverse — AC5 réduit au geste manuel, D5 hors tableau, classe intacte — est plus lourd. Le périmètre suit la causalité, pas la taxonomie du diff.
+
+### Une prescription reçue puis corrigée — par un fait du code
+
+Le tranchage initial demandait aussi de **retirer `ready` avant de tenter `operator-review`**, pour que l'abandon ne dépende pas de l'application réussie du label. L'intention est juste ; le mécanisme rouvrait un défaut documenté à l'endroit exact (`:1677-1684`, confirmé dans `classify_stuck_ready:947-951`) :
+
+> Removing `ready` first and then failing here would leave the ticket with neither label but with an abandonment stamp: Phase 1 would re-promote it, Phase 2 would read the stamp-without-label as **the operator's re-entry gesture**, and the budget would reset — a fresh loop every N re-drives.
+
+`facts.abandoned` sans `operator-review` rend `StuckReadyVerdict::ReEntry`, qui appelle `reset_auto_pull_redrive` et remet le ticket dans les survivants. Inverser l'ordre échangerait un ticket collé avec `ready` — visible — contre une boucle de re-promotion tous les N re-drives, budget remis à zéro à chaque tour. **Le second est plus difficile à voir que le premier, parce qu'il ressemble à du travail.**
+
+Le fait a été remonté plutôt qu'exécuté, et la prescription a été retirée : **le découplage du compteur (étape 11) atteint la même convergence sans produire l'état estampille-sans-label.** L'abandon cesse d'être définitivement bloqué par l'échec du label, ce qui était l'intention, sans inverser un ordre dont le code explique la raison. C'est une correction, pas un compromis.
+
+L'ordre appliquer-puis-retirer reste donc inchangé — décision tranchée sur mesure, non par déférence au hors-périmètre.
+
+### Les deux autres questions
+
+**Q2 — scan de source contre tableau de constantes : tranché par l'orchestrateur, scan seul.** Ni l'architecte ni le bearing-keeper ne l'ont relevée ; c'est une décision d'implémentation, réversible, et j'ai une position argumentée. Le module a déjà le précédent (`:2828`), et l'AC2 dit « un littéral … qui n'est pas déclaré », pas « un membre du tableau ». Un tableau de constantes rendrait l'exhaustivité déclarative — la même classe de défaut déplacée d'un cran. R1 est le prix, assumé et nommé (§Fire-Disposition).
+
+**Q3 — `warn!` conservé.** Dix-huit `warn!` en trois jours sans action ne disent pas « niveau trop bas », ils disent « personne ne lit ce flux ». Monter en `error!` déplacerait le bruit sans créer l'action. La réponse est l'audit event, traçable et requêtable, qui survit à la configuration de log. Le vrai trou n'était pas là : il était dans le `debug!` du verdict `Skip` (étape 13), où un ticket disparaît sans qu'aucun niveau visible ne le dise.
 
 ## Hors périmètre
 
@@ -277,6 +313,7 @@ Repris du ticket, sans extension :
 ## Risques
 
 - **R1 — Le scan de source est fragile au reformatage.** *(disposition et traitement : §Fire-Disposition → Faux positifs.)* Un `rustfmt` qui casse un appel sur plusieurs lignes peut faire échapper un littéral au regex, rendant la garde silencieusement partielle. Le contrôle de non-vacuité (étape 4) le détecte pour les trois labels connus, pas pour un quatrième ajouté plus tard. Surface résiduelle assumée et à nommer dans le code.
+- **R4 — Le découplage peut déborder.** `increment_auto_pull_failure` a cinq appelants ; désarmer les quatre autres transformerait le correctif en régression silencieuse du disjoncteur sur les chemins de promotion. D8 le garde, et la DoD exige que le `git diff` montre un seul site.
 - **R2 — Phase 4 touche la logique de sélection du bassin.** Un verdict `Abandon` élargi désétiquette des tickets ; si le prédicat est trop large, il retire `ready` à des tickets vivants. Le test de l'étape 12 borne le cas exact (budget épuisé **et** non déjà abandonné) ; les autres branches restent intactes.
 - **R3 — AC5 se vérifie après déploiement, pas dans la PR.** Le compte `pullable` avant/après exige le binaire corrigé en production. La PR porte AC1-AC4 et AC6 ; AC5 se coche sur le ticket une fois la mesure produite. Fermer le ticket avant rejouerait l'erreur qu'il documente.
 
