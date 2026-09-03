@@ -4686,6 +4686,59 @@ else
     echo "    (pass A still ran; only the freshness check of the list is skipped)"
 fi
 
+# ============================================================================
+# mika#2121 (U1): the callback always names its PR state
+# ============================================================================
+
+echo ""
+echo "Test: NO_PR total-output contract (mika#2121 U1)"
+echo "------------------------------------------------"
+
+# The lib was sourced at the iterate-loop section above, so the helpers are
+# callable here. _classify_no_pr_reason is pure; _set_pr_status_line mutates the
+# global RESULT, so every call below runs inside a subshell that owns its own
+# RESULT — the mutation never escapes the assertion.
+
+# --- _classify_no_pr_reason: one token per state, unset diagnosed first ---
+assert_eq "reason: repo unset (before exit code)" "repo_unset" \
+    "$(_classify_no_pr_reason '' 'some-branch' 1)"
+assert_eq "reason: branch unset (before exit code)" "branch_unset" \
+    "$(_classify_no_pr_reason 'mika' '' 1)"
+assert_eq "reason: gh query failed" "gh_query_failed" \
+    "$(_classify_no_pr_reason 'mika' 'some-branch' 1)"
+assert_eq "reason: no pr on branch (clean query, empty result)" "no_pr_on_branch" \
+    "$(_classify_no_pr_reason 'mika' 'some-branch' 0)"
+
+# --- _set_pr_status_line: exactly one PR-status line, never two ---
+# The site-2-then-site-3 sequence: main path finds no PR (writes NO_PR), the
+# rescue then opens one (writes PR). The delivered callback must carry ONLY the
+# later, truer line.
+assert_eq "totality: NO_PR then PR keeps only PR" "PR: https://github.com/x/pull/1" \
+    "$(RESULT='some prefix line'; _set_pr_status_line 'NO_PR: no_pr_on_branch'; _set_pr_status_line 'PR: https://github.com/x/pull/1'; printf '%s' "$RESULT" | grep -E '^(PR|NO_PR): ' || true)"
+assert_eq "totality: exactly one PR-status line after two emissions" "1" \
+    "$(RESULT='some prefix line'; _set_pr_status_line 'NO_PR: no_pr_on_branch'; _set_pr_status_line 'PR: https://github.com/x/pull/1'; printf '%s' "$RESULT" | grep -cE '^(PR|NO_PR): ' || true)"
+# The reverse (rescue-fail supersedes site-2 no_pr_on_branch with the specific
+# rescue_pr_create_failed) must also leave exactly one line.
+assert_eq "totality: NO_PR then more-specific NO_PR keeps only the latter" "NO_PR: rescue_pr_create_failed" \
+    "$(RESULT='x'; _set_pr_status_line 'NO_PR: no_pr_on_branch'; _set_pr_status_line 'NO_PR: rescue_pr_create_failed'; printf '%s' "$RESULT" | grep -E '^(PR|NO_PR): ' || true)"
+# A non-status prefix line survives untouched (the strip is anchored, not greedy).
+assert_contains "totality: strip does not eat non-status lines" "Outcome: PR_OPENED" \
+    "$(RESULT='Outcome: PR_OPENED'; _set_pr_status_line 'PR: https://github.com/x/pull/1'; printf '%s' "$RESULT")"
+
+# --- Structural guard: no emission site can go silent (jamais zéro) ---
+# Each of the three sites must be able to emit a NO_PR line. If a future edit
+# drops an `else`, the corresponding assert turns red instead of the site
+# silently reverting to the pre-mika#2121 absence-means-no-PR behaviour that
+# produced 306 mute failures.
+TRAP_SRC=$(sed -n '/^_dispatch_lib_exit_trap() {/,/^}/p' "$DISPATCH_LIB")
+assert_contains "site 1 (crash trap) can emit NO_PR" 'NO_PR:' "$TRAP_SRC"
+
+PFR_SRC=$(sed -n '/^_post_flight_recovery() {/,/^}/p' "$DISPATCH_LIB")
+assert_contains "site 2 (main path) can emit NO_PR" 'NO_PR:' "$PFR_SRC"
+
+DCP_SRC=$(sed -n '/^dispatch_claude_pilot() {/,/^}/p' "$DISPATCH_LIB")
+assert_contains "site 3 (rescue) can emit NO_PR: rescue_pr_create_failed" 'rescue_pr_create_failed' "$DCP_SRC"
+
 # --- Summary ---
 
 echo ""

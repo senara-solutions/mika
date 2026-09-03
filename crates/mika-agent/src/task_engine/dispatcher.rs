@@ -2313,6 +2313,23 @@ fn extract_callback_fields(result: &str) -> serde_json::Value {
     }
 }
 
+/// Parse an anchored `NO_PR: <reason>` line from a callback result (mika#2121 U2).
+///
+/// Mirror of `RE_PR_URL` above: `(?m)^NO_PR:` is line-anchored so a free-text
+/// mention never matches, and the reason is constrained to the lowercase-token
+/// charset the three `dispatch-lib.sh` emission sites produce (`no_pr_on_branch`,
+/// `gh_query_failed`, `branch_unset`, `repo_unset`, `rescue_pr_create_failed` —
+/// KTD2). Returns `None` when no `NO_PR:` line is present, which is the AC-G2
+/// contract: a callback carrying neither `PR:` nor `NO_PR:` (a producer that
+/// predates U1) leaves the generic `callback_delivered_without_pr_url` motif
+/// intact. The reaper (`engine::reap_orphaned_parent_tasks`) calls this to
+/// decide between the generic motif and `callback_no_pr_<reason>`.
+pub(crate) fn parse_no_pr_reason(result: &str) -> Option<String> {
+    static RE_NO_PR: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?m)^NO_PR:\s+([a-z_]+)").unwrap());
+    RE_NO_PR.captures(result).map(|cap| cap[1].to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2620,6 +2637,50 @@ mod tests {
     #[test]
     fn test_extract_empty_returns_null() {
         assert!(extract_callback_fields("").is_null());
+    }
+
+    // --- mika#2121 U2: NO_PR reason parser (mirror of the ^PR: parser) ---
+
+    #[test]
+    fn test_parse_no_pr_reason_known_reasons() {
+        // All five reasons U1 emits across the three dispatch-lib sites.
+        for reason in [
+            "no_pr_on_branch",
+            "gh_query_failed",
+            "branch_unset",
+            "repo_unset",
+            "rescue_pr_create_failed",
+        ] {
+            let result = format!("Outcome: PIPELINE_INCOMPLETE\nNO_PR: {reason}");
+            assert_eq!(parse_no_pr_reason(&result).as_deref(), Some(reason));
+        }
+    }
+
+    #[test]
+    fn test_parse_no_pr_reason_anchored_not_free_text() {
+        // A free-text mention that is not line-anchored must not match.
+        let result = "the run produced NO_PR: no_pr_on_branch inline in prose";
+        assert_eq!(parse_no_pr_reason(result), None);
+    }
+
+    #[test]
+    fn test_parse_no_pr_reason_absent_is_none() {
+        // AC-G2 negative control: a callback carrying neither PR: nor NO_PR:
+        // (a producer that predates U1) yields None so the reaper keeps the
+        // generic motif.
+        assert_eq!(
+            parse_no_pr_reason("claude-pilot completed.\nTurns: 3"),
+            None
+        );
+        assert_eq!(parse_no_pr_reason(""), None);
+    }
+
+    #[test]
+    fn test_parse_no_pr_reason_ignores_pr_line() {
+        // A PR: line is not a NO_PR: line — the reaper would not even fire in
+        // this case (parent has a pr_url), but the parser must not confuse them.
+        let result = "PR: https://github.com/senara-solutions/mika/pull/42";
+        assert_eq!(parse_no_pr_reason(result), None);
     }
 
     #[tokio::test]

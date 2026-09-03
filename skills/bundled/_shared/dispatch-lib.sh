@@ -1153,6 +1153,59 @@ exec \"\$@\"" mika-pilot-sandbox "$@" || _sandbox_rc=$?
     return "$_sandbox_rc"
 }
 
+# --- mika#2121 (U1): the callback always names its PR state ------------------
+# Before mika#2121 the three PR-emission sites communicated "no PR" by the
+# ABSENCE of a `PR:` line. Four distinct states — no PR on the branch, the `gh`
+# query itself failed, $REPO unset, $BRANCH unset — all produced identical
+# silence, and the reaper (task_engine/engine.rs) could only write the generic
+# `callback_delivered_without_pr_url` motif. That motif is exact on the symptom
+# and mute on the cause: 306 parent tasks failed with it and nothing could tell
+# a dead pilot from a `gh` outage. These helpers make the contract TOTAL —
+# every delivered callback carries exactly one `PR:` or `NO_PR: <reason>` line.
+
+# Classify why a `gh pr list` branch query yielded no PR URL. Pure function.
+# Args: $1 repo  $2 branch  $3 gh-exit-code (0 = query ran clean, non-zero = failed)
+# Echoes exactly one reason token:
+#   repo_unset | branch_unset | gh_query_failed | no_pr_on_branch
+# Order matters: an unset repo/branch is diagnosed before the exit code, because
+# a query that never had a target to run against tells us nothing about `gh`.
+_classify_no_pr_reason() {
+    if [ -z "${1:-}" ]; then echo "repo_unset"; return 0; fi
+    if [ -z "${2:-}" ]; then echo "branch_unset"; return 0; fi
+    if [ "${3:-0}" -ne 0 ]; then echo "gh_query_failed"; return 0; fi
+    echo "no_pr_on_branch"
+}
+
+# Run `gh pr list` for a branch and echo the PR URL (empty when none). The gh
+# exit code is preserved in the global $_LAST_PR_QUERY_RC for _classify_no_pr_reason,
+# and on a genuine query failure the (secret-scrubbed) gh stderr is forwarded to
+# fd 2 rather than swallowed — the mika#2121 point is that a `gh` outage stops
+# being indistinguishable from "no PR on the branch". Sites 1 & 2 (both use
+# `gh pr list`) share this; site 3 is a `gh pr create` and is handled inline.
+_LAST_PR_QUERY_RC=0
+_pr_list_url() {
+    local _repo="$1" _branch="$2" _err _url
+    _err=$(mktemp "${TMPDIR:-/tmp}/mika-pr-query-err.XXXXXX" 2>/dev/null || echo /dev/null)
+    _url=$(gh pr list --repo "senara-solutions/$_repo" --head "$_branch" --json url --jq '.[0].url' 2>"$_err")
+    _LAST_PR_QUERY_RC=$?
+    if [ "$_LAST_PR_QUERY_RC" -ne 0 ] && [ -s "$_err" ]; then
+        echo "dispatch-lib: gh pr list failed (rc=$_LAST_PR_QUERY_RC) for ${_repo} head=${_branch}: $(_scrub_secrets_from_output < "$_err" | tr '\n' ' ' | tail -c 500)" >&2
+    fi
+    [ "$_err" != /dev/null ] && rm -f "$_err"
+    printf '%s' "$_url"
+}
+
+# Append exactly one canonical PR-status line to RESULT, stripping any prior
+# line-anchored `PR:`/`NO_PR:` first. This keeps the total-output contract true
+# BY CONSTRUCTION even when two sites run on one delivery path — site 2 finds no
+# PR and writes `NO_PR:`, then the site-3 rescue opens one and writes `PR:`; the
+# strip guarantees the delivered callback carries the later, truer line alone
+# (never both). $1 is the full line body, e.g. "PR: <url>" or "NO_PR: <reason>".
+_set_pr_status_line() {
+    RESULT="$(printf '%s' "$RESULT" | sed '/^PR: /d; /^NO_PR: /d')
+${1}"
+}
+
 # mika#749: TERM trap writes cancel discriminator before exit.
 # Convention: reason file at /tmp/mika-cancel-reason-$$ (PID-based).
 # cancel_task pre-writes CANCELLED_BY_OPERATOR before SIGTERM; this trap
@@ -1225,15 +1278,21 @@ ${_TRACE_TAIL}"
         esac
     fi
     # Issue #138: best-effort PR URL discovery on crash recovery path.
+    # mika#2121 (U1): even the crash path now names its PR state. An else on both
+    # guards means a crash callback carries `NO_PR: <reason>` instead of silence,
+    # so the reaper can tell a crashed-with-no-PR run from a `gh` outage.
     if [ -n "$REPO" ] && [ -n "$BRANCH" ]; then
-        _PR_URL=$(gh pr list --repo "senara-solutions/$REPO" --head "$BRANCH" --json url --jq '.[0].url' 2>/dev/null || true)
+        _PR_URL=$(_pr_list_url "$REPO" "$BRANCH")
         if [ -n "$_PR_URL" ]; then
             # mika#2026: stamp origin on the artefact itself. Fail-open — a
             # missing marker costs an `unknown` row in the report, never a dispatch.
             _stamp_pr_origin "$REPO" "$_PR_URL" loop || true
-            RESULT="${RESULT}
-PR: ${_PR_URL}"
+            _set_pr_status_line "PR: ${_PR_URL}"
+        else
+            _set_pr_status_line "NO_PR: $(_classify_no_pr_reason "$REPO" "$BRANCH" "$_LAST_PR_QUERY_RC")"
         fi
+    else
+        _set_pr_status_line "NO_PR: $(_classify_no_pr_reason "$REPO" "$BRANCH" 0)"
     fi
     # mika#1996: this trap delivers its own callback instead of calling
     # _deliver_callback, so the gate has to be applied here too — otherwise the
@@ -3106,15 +3165,23 @@ ${RESULT}"
 
     # Issue #138: Discover actual PR URL from the branch
     PR_URL=""
+    # mika#2121 (U1): this is the main-path emission site. On no PR it now writes
+    # `NO_PR: <reason>` — the terminal line for the muted case (dead pilot, no
+    # commits, no rescue eligible: the 306-failure shape). When a rescue DOES run
+    # later (site 3), _set_pr_status_line strips this line and replaces it, so the
+    # delivered callback never carries two PR-status lines.
     if [ -n "$REPO" ] && [ -n "$BRANCH" ]; then
-        PR_URL=$(gh pr list --repo "senara-solutions/$REPO" --head "$BRANCH" --json url --jq '.[0].url' 2>/dev/null || true)
+        PR_URL=$(_pr_list_url "$REPO" "$BRANCH")
         if [ -n "$PR_URL" ]; then
             # mika#2026: stamp origin on the artefact itself. Fail-open — a
             # missing marker costs an `unknown` row in the report, never a dispatch.
             _stamp_pr_origin "$REPO" "$PR_URL" loop || true
-            RESULT="${RESULT}
-PR: ${PR_URL}"
+            _set_pr_status_line "PR: ${PR_URL}"
+        else
+            _set_pr_status_line "NO_PR: $(_classify_no_pr_reason "$REPO" "$BRANCH" "$_LAST_PR_QUERY_RC")"
         fi
+    else
+        _set_pr_status_line "NO_PR: $(_classify_no_pr_reason "$REPO" "$BRANCH" 0)"
     fi
 
     # mika#940 Unit 1: post-flight PR-existence check.
@@ -5457,9 +5524,13 @@ RESCUEBODY
             _stamp_pr_origin "$REPO" "$RESCUED_PR_URL" loop || true
             # mika#1631: tag rescued PRs for staleness-probe targeting
             gh pr edit "$RESCUED_PR_URL" --add-label "wip-rescue" 2>&9 || true
+            # mika#2121 (U1): the rescue opened a real PR, so drop the site-2
+            # `NO_PR:` line first — the total-output contract allows exactly one
+            # PR-status line, and `PR:` is now the true one.
+            RESULT="$(printf '%s' "$RESULT" | sed '/^PR: /d; /^NO_PR: /d')"
             # mika#1352: emit canonical `PR:` line alongside the descriptive
             # `Draft PR (dispatch-lib recovery):` line. mika-dev's callback
-            # parser (dispatcher.rs:1780) matches line-anchored `^PR: ` —
+            # parser (dispatcher.rs) matches line-anchored `^PR: ` —
             # without this, claude_pilot.pr_url is never written and the
             # parent task false-fails as `callback_delivered_without_pr_url`
             # despite the rescued PR being open and reviewable. See mika#871
@@ -5475,6 +5546,16 @@ RECOVERY_PENDING: true"
             # classes (dirty-worktree mika#1282, commit-pushed-no-pr mika#1396)
             # flow through this block, so a single marker covers both. Guarded by
             # `if [ -n "$RESCUED_PR_URL" ]` — only emitted when a rescue PR opened.
+        else
+            # mika#2121 (U1): the rescue `gh pr create` failed (empty
+            # RESCUED_PR_URL). Its silence means "the rescue PR could not be
+            # created", NOT "no PR on the branch" — a fifth reason distinct from
+            # the site-1/2 `gh pr list` set (KTD2). Name it so the reaper writes
+            # `callback_no_pr_rescue_pr_create_failed` instead of the generic
+            # motif. This supersedes the `NO_PR: no_pr_on_branch` site 2 emitted.
+            # The gh stderr already went to the trace fd (2>&9), so it is not
+            # swallowed.
+            _set_pr_status_line "NO_PR: rescue_pr_create_failed"
         fi
     fi
 
