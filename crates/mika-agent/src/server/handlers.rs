@@ -1342,6 +1342,35 @@ async fn run_agent_for_message(
                 unreachable!("draft_pr_opened handler never dispatches");
             }
         }
+
+        // Upstream-close tracking-row cleanup (mika#1934 AC4): for
+        // `issues.closed` / `pull_request.closed` webhooks, terminal-mark any
+        // tracking rows the closed issue left `blocked`/`in_progress`
+        // (escalation-resolved-out-of-band phantom class). Side-effect-only —
+        // never returns Handled/Dispatched. Self-selects on the
+        // `[GitHub] Issue closed:` / `[GitHub] PR closed:` prefixes;
+        // order-independent with the handlers above.
+        let upstream_close_action = super::upstream_close_handler::try_handle_upstream_close(
+            &req.text,
+            &a.db,
+            &session_id,
+            &req.request_id,
+        )
+        .await;
+        match upstream_close_action {
+            VerdictAction::Passthrough { enrichment: None } => {}
+            VerdictAction::Passthrough {
+                enrichment: Some(_),
+            } => {
+                unreachable!("upstream_close handler never enriches");
+            }
+            VerdictAction::Handled { .. } => {
+                unreachable!("upstream_close handler never handles");
+            }
+            VerdictAction::Dispatched { .. } => {
+                unreachable!("upstream_close handler never dispatches");
+            }
+        }
     }
 
     let params = agent::AgentParams {

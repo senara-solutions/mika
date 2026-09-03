@@ -80,6 +80,8 @@ mod eval {
     mod test_tool_call_secret_redaction;
     mod test_tool_call_stream_emission;
     mod test_tool_calling;
+    mod test_tracking_row_supersede;
+    mod test_tracking_row_upstream_close;
     mod test_unauthorized_webhook_dispatch_tool_boundary;
     mod test_verdict_handler;
     mod test_webhook_no_unauthorized_dispatch_guard;
