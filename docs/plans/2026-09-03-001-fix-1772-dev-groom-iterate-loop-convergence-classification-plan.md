@@ -128,6 +128,37 @@ raison autre que `first-pass disposition UNPARSED`. Ce plan la cherche en base a
 - Ne touche pas au chemin `auto_skipped` / `already_groomed`, même si c'est lui qui empêche
   aujourd'hui de mesurer la classe en production (voir Risque R2).
 
+## Fire-Disposition
+
+Ce plan livre un **détecteur** : la fixture de régression de la Phase 3, dans
+`skills/bundled/_shared/test-dispatch-lib.sh`, câblée dans `make test` et dans le job CI. Per le
+Fire-Disposition Gate (mika#1574), sa disposition quand il tire doit être déclarée contre le schéma
+canonique à trois options — **(a) exception nommée en liste blanche**, **(b) livré désactivé**,
+**(c) halte et remontée**.
+
+**Disposition retenue : (c) halte et remontée.** Le détecteur échoue le job CI, et l'échec remonte
+avec la raison `_groom_warn` identifiée.
+
+Le raisonnement, parce que l'option (a) est le piège ici : ce détecteur ne balaie **aucune donnée
+préexistante**. Il rejoue une signature construite dans la fixture — première passe architecte
+répondant sans ligne `Disposition:`, seconde passe convergeant — contre `_iterate_groom_loop`
+chargée depuis la source. La classe de faux positif que le gate craint le plus (un détecteur qui
+tire sur du legacy qu'il n'a pas causé) est fermée par construction : il n'y a pas de legacy dans
+son champ. Un tir signifie donc l'une de deux choses, toutes deux méritant l'arrêt :
+
+- le ré-essai borné de mika#1823 (`f8b63530`) a régressé — le mécanisme qui ferme la classe n'est
+  plus là ;
+- un site `return 1` non couvert est apparu dans la boucle — la table des 19 sorties de la Phase 1
+  pas 4 est périmée, et le nouveau site doit être classé avant de merger.
+
+Aucune de ces deux-là ne se traite par exception nommée. Il n'y a pas de liste blanche à ce
+détecteur, et il n'est pas livré désactivé.
+
+**Ce qui n'est pas un tir du détecteur :** une occurrence *en production* d'un échec de convergence
+sur un ticket réel. Celle-là arrive par le callback (`GROOM_LOOP_FAILURE_REASON` dans
+`tasks.result`, per PR#2028), pas par la CI, et sa disposition est celle du ticket qu'elle bloque —
+pas celle de ce plan.
+
 ---
 
 ## Phases
@@ -165,7 +196,14 @@ sur `_arch_ask` / `_parse_*` / `_write_canonical_callout`, **arrêter et remonte
 Aucun changement de comportement. La sortie UNPARSED est déjà couverte par le ré-essai de mika#1823.
 Le livrable devient la **preuve** : le test de la Phase 3 doit démontrer que, sans le ré-essai de
 `f8b63530`, la boucle rend non-zéro sur la signature du 2026-07-04, et qu'avec lui elle converge.
-C'est la seule chose que #1772 doit encore au dépôt dans cette branche.
+
+**Une fermeture sans changement de code doit laisser une mémoire, sinon la classe redevient latente
+sans personne pour s'en souvenir.** Dans cette branche, la fermeture de #1772 est donc conditionnée
+à deux choses, et pas seulement au test : (i) le document `docs/solutions/` de la Phase 5 nomme
+explicitement que la classe du 2026-07-04 est fermée par `f8b63530` (mika#1823) et non par un
+correctif propre à #1772 ; (ii) le commentaire de fermeture du ticket cite ce document par son
+chemin. Si l'implémenteur juge que l'enseignement ne tient pas dans le document de la Phase 5, il
+ouvre un ticket de suivi nommé plutôt que de fermer en silence.
 
 ### Phase 3 — Test de régression par fixture
 
@@ -226,9 +264,17 @@ contourner, la remonter (Stop condition).
   boucle, l'AC est **remontée**, pas déclarée acquise.
   *Tie-back : critère de succès (c) du ticket.*
 - **AC5.** Un document `docs/solutions/` porte l'enseignement de la Phase 5.
-- **AC6.** Le corps du ticket est corrigé sur ses deux points périmés : la priorité (`p2-normal` →
-  `p1-important`, per le commentaire du 2026-08-28T22:12Z) et la portée du fix (le candidat C est
-  livré par PR#2028). Aucun contenu opérateur n'est supprimé — les commentaires restent la trace.
+- **AC6.** *(retiré du périmètre implémenteur — voir § Gestes opérateur ci-dessous.)*
+
+### Gestes opérateur — hors DoD implémenteur
+
+La correction du corps du ticket (priorité `p2-normal` → `p1-important` per le commentaire du
+2026-08-28T22:12Z ; mention que le candidat C est livré par PR#2028) **n'est pas un livrable de
+l'implémenteur**. Le corps est la source contractuelle : le modifier pendant l'implémentation
+fabriquerait une divergence non auditée entre ce qui a été demandé et ce qui a été fait — c'est le
+même défaut que ce ticket reproche au callback. Le geste est fait par l'opérateur au moment du
+grooming, en même temps que l'écriture du callout canonique, et daté comme tel. Aucun contenu
+opérateur n'est supprimé : les commentaires restent la trace.
 
 ---
 
@@ -266,3 +312,9 @@ contourner, la remonter (Stop condition).
   (ii) AC6 fait modifier le corps du ticket par l'implémenteur : acceptable, ou geste opérateur ?
   (iii) Faut-il, au-delà de `tasks.result`, un puits durable pour le stderr de `dispatch-lib` — ou
   est-ce un ticket de substrat distinct ?
+- **2026-09-03 — mika-arch first-pass : `Disposition: ITERATE`**, session
+  `2b9b6ec9-b673-4154-8b74-4bf7ae8b0dc5`. Trois constats, tous appliqués : F1 (bloquant) — section
+  `## Fire-Disposition` manquante pour un livrable de classe détecteur (mika#1574) → ajoutée, option
+  (c) ; F2 — AC6 faisait modifier le corps du ticket par l'implémenteur → retiré du périmètre
+  implémenteur, reclassé geste opérateur ; F3 — la branche β fermait sans mémoire → conditionnée au
+  document de la Phase 5 et à sa citation dans le commentaire de fermeture.
