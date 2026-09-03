@@ -211,9 +211,19 @@ Le comportement à protéger est syntaxique : « la liste `tags:` ne contient qu
 tags dérivés du sha ». Un test qui lit le YAML et assère cela échoue immédiatement si
 quelqu'un rajoute un tag mouvant, sans AWS, sans réseau, sans OIDC. Un test
 d'intégration ne pourrait pas s'exécuter aujourd'hui (pas de rôle OIDC) et serait donc
-une garde qui ne garde rien. Le mécanisme précis (script `scripts/`, job CI, ou test
-Rust) est laissé à l'implémenteur ; la propriété exigée est qu'il **échoue si on
-réintroduit un tag mouvant** et qu'il tourne dans la CI actuelle.
+une garde qui ne garde rien.
+
+**Le dépôt porte déjà la famille où cette garde se range** (relevé le 2026-09-03, non
+inventé) : `scripts/check-byte-slices.sh` + `scripts/test-check-byte-slices.sh`,
+`scripts/verify-egress-no-log.sh` + `scripts/test-verify-egress-no-log.sh`, chacune
+câblée comme une étape du job `check` de `.github/workflows/ci.yml` (voir les étapes
+mika#1575, #1772, #2038, #2039 en `ci.yml:81-96`). Un script `check-*` avec son harnais
+`test-check-*` et une étape CI est donc le chemin **déjà pavé**, pas une structure
+nouvelle à justifier.
+
+La latitude laissée à l'implémenteur porte sur la **mécanique** (bash suivant ce motif,
+ou test dans la suite Rust), pas sur la **sémantique** : la propriété exigée est qu'il
+**échoue si on réintroduit un tag mouvant** et qu'il tourne dans la CI actuelle.
 
 **KTD3 — preuve de non-vacuité de la garde.** La garde doit être démontrée non vide :
 réintroduire `:latest` dans une copie du workflow, montrer que le test rougit, le
@@ -331,10 +341,11 @@ un oubli. (R3, AC5)
 
 Ajouter un contrôle, exécuté par la CI actuelle, qui lit
 `.github/workflows/agent-image-build-push.yml` et échoue si la liste `tags:` contient
-une entrée non dérivée de `${{ github.sha }}`. Mécanisme au choix de l'implémenteur
-(script sous `scripts/` appelé par un job CI existant, ou test dans la suite
-existante) ; la propriété exigée est : **sans AWS, sans OIDC, sans réseau**, et
-**rouge si on réintroduit un tag mouvant**. (R2, KTD2)
+une entrée non dérivée de `${{ github.sha }}`. Mécanisme au choix de l'implémenteur, mais le
+motif du dépôt est le chemin par défaut : un `scripts/check-<nom>.sh`, son harnais
+`scripts/test-check-<nom>.sh`, et une étape nommée dans le job `check` de `ci.yml`
+(KTD2 cite les quatre précédents). La propriété exigée est : **sans AWS, sans OIDC,
+sans réseau**, et **rouge si on réintroduit un tag mouvant**. (R2, KTD2)
 
 ### U6. La preuve que la garde n'est pas vide
 
