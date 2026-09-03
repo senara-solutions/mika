@@ -75,6 +75,53 @@ Le seul champ lu sera `filename`. Les fixtures gelées ne garderont que celui-l�
 
 Les quatre fixtures de `tests/fixtures/auto_pull_compare/` ont été gelées **sans** la clé `files` (PROVENANCE : *« `commits`, `files`, `base_commit` and `merge_base_commit` were dropped »*). Sous le nouveau prédicat, une fixture sans `files` tombe dans le chemin « liste indisponible » → jamais `salvage`. Le test d'intégration `auto_pull_replay_1680_is_refused_by_name` deviendrait vert **pour la mauvaise raison** (il basculerait sur `branch_too_far_behind`, 197 > 50) et son assertion `slug() == "salvage_work_on_stale_branch"` passerait au rouge. Les fixtures doivent donc être ré-enrichies, pas laissées telles quelles. C'est un livrable, pas un détail.
 
+### M6 — le tir du nouveau prédicat sur le backlog vivant, compté
+
+Le nouveau prédicat n'est **pas** strictement plus permissif que l'ancien, et il faut le dire avant
+de l'écrire : une branche à `ahead_by == 1` dont l'unique commit touche du **code** promouvait sous
+`ahead_by > 1` et **refuse** désormais. Cette population n'est pas hypothétique par construction —
+elle est mesurable. Mesurée le 2026-09-03 sur les **11** tickets ouverts de `senara-solutions/mika`
+portant un callout `> - **Branch:**`, en évaluant les deux prédicats sur le même appel `compare` :
+
+| ticket | branche | ahead | behind | ancien → nouveau | fichiers |
+|---|---|---|---|---|---|
+| #2126 | `fix/2126/…` | 1 | 13 | distance → distance | 1 plan |
+| #2121 | `fix/2121/…` | — | — | `BranchAbsent` (branche absente d'`origin`) | — |
+| #2120 | `fix/2120/…` | 2 | 8 | **`salvage` → promotion** | 1 plan |
+| #2118 | `fix/2118/…` | 3 | 8 | **`salvage` → promotion** | 1 plan |
+| #2117 | `research/2117/…` | 1 | 17 | distance → distance | 1 plan |
+| #2108 | `fix/2108/…` | 1 | 0 | promotion → promotion | 1 plan |
+| #2036 | `bug/2036/…` | 2 | 60 | **`salvage` → `TooFarBehind`** *(latent : porte `ready`)* | 1 plan |
+| #1959 | `feat/1959/…` | 1 | 92 | distance → distance | 1 plan |
+| #1949 | `feat/1949/…` | — | — | `BranchAbsent` | — |
+| #1727 | `feat/1727/…` | 3 | 185 | `salvage` → `salvage` | 1 plan + 1 **doc** hors `docs/plans/` |
+| #1381 | `feat/1381/…` | 1 | 97 | distance → distance | 1 plan |
+
+Quatre faits que cette table établit et que le ticket n'avait pas :
+
+1. **La direction dangereuse est vide : zéro bascule promotion → refus sur 11.** Aucune branche
+   ouverte ne porte un unique commit de code. Le rétrécissement théorique du chemin d'acceptation
+   n'a, aujourd'hui, aucun sujet.
+2. **Un troisième cas du même défaut, non compté par le ticket : #2036 — mais latent, pas déjà tiré.**
+   `ahead_by = 2`, un seul fichier, sous `docs/plans/`. Il porte aujourd'hui `ready`, pas
+   `operator-gated` : la porte ne l'a donc pas encore refusé. Elle le ferait au premier passage par
+   le sauvetage `stuck-ready` de la Phase 2, qui est une re-promotion et traverse `promotion_gate_allows`
+   comme les deux autres — et elle dirait `salvage` sur une branche qui ne porte que son plan. Après
+   correctif il reste refusé — 60 commits de retard, au-delà du seuil de 50 — mais sous
+   `TooFarBehind`, le motif **honnête**. La mesure du ticket (« n = 2 sur 2 ») portait sur les
+   `operator-gated` ouverts, ce qui était exact pour sa question ; #2036 dit que la population du
+   défaut est plus large que celle où il a déjà laissé une trace. Corriger un motif faux compte même
+   quand la décision ne change pas : c'est le motif qui dit à l'opérateur quoi faire.
+3. **Un contrôle positif vivant : #1727**, qui reste `salvage` après correctif — la porte ne devient
+   pas passe-partout sur le backlog réel.
+4. **#1727 est aussi le cas-limite du préfixe étroit**, et il est instructif : son unique fichier
+   hors plan est `crates/mika-cli/docs/2026-07-06-tui-thin-client-phase-1-audit-and-plan.md` — un
+   document d'audit, pas du code. Traité en § Fire-Disposition.
+
+Les deux `BranchAbsent` (#2121, #1949) désignent des branches qui n'existent plus sur `origin`.
+C'est le troisième chemin de refus, inchangé par ce ticket, et ce n'est pas son sujet — noté ici
+pour que la table soit complète, pas pour élargir le périmètre.
+
 ## Décision de conception
 
 **Le prédicat de `salvage` devient : « la branche modifie au moins un fichier hors `docs/plans/` par rapport à `main` ».** `ahead_by` cesse d'être le discriminant et redevient ce qu'il est — une distance, journalisée, jamais interprétée.
@@ -107,6 +154,73 @@ Trois raisons, dont deux sont structurelles :
 Ce choix est écrit **dans le module**, à côté de `REFUSAL_LABEL`, pas seulement ici : un label posé par la machine et levable seulement à la main est une dette d'opérateur silencieuse tant qu'elle n'est pas nommée à l'endroit où on la lit.
 
 **Remédiation des deux tickets déjà gatés à tort** (`#2118`, `#2120`) : geste d'opérateur unique après merge — retirer `operator-gated`. Listé en § Suite opératoire ; hors du diff, parce qu'un correctif de code n'a pas à muter l'état de tickets tiers pour prouver qu'il marche. Les fixtures AC3 sont ce qui le prouve.
+
+## Fire-Disposition
+
+*(Exigée par la Fire-Disposition Gate, mika#1574 — première passe mika-arch, F1 bloquant. Les
+livrables D7/D8 sont de classe détecteur : leur chemin de succès est « aucune violation ».)*
+
+Les détecteurs de ce plan sont les tests de D8 et les fixtures de D7. La question de la porte est :
+**que fait l'implémentation quand un détecteur tire sur des données préexistantes ?** Il y a deux
+surfaces de tir, et elles n'appellent pas la même disposition.
+
+### Surface 1 — le jeu de fixtures gelées (CI)
+
+**Tir certain, pas probable.** Les quatre fixtures de mika#2123 ont été gelées sans la clé `files`
+(M5). Dès que le prédicat change, `auto_pull_replay_1680_is_refused_by_name` passe au rouge : la
+fixture tombe dans le chemin « liste indisponible », le refus bascule sur `branch_too_far_behind`,
+et l'assertion de slug échoue.
+
+**Disposition : réparation dans le périmètre (D7), ni liste blanche ni `#[ignore]`.**
+
+Le choix mérite sa justification, parce que la disposition par défaut de la doctrine est (a) la
+liste blanche nommée. Elle ne convient pas ici : une liste blanche existe pour **isoler une
+violation réelle** que le correctif ne traite pas. Or ces fixtures ne portent aucune violation —
+elles sont des **captures incomplètes** d'un appel dont ce ticket a précisément besoin du champ
+manquant. Les allowlister reviendrait à figer l'aveuglement que le ticket corrige, dans le fichier
+même qui sert à prouver qu'il est corrigé. La ré-capture est un acte d'une ligne par fixture, sur
+des branches qui existent encore sur `origin` (vérifié 2026-09-03), et le diff à trois points rend
+la liste `files` invariante à l'avance de `main` (D7). C'est donc une réparation, pas une exception.
+
+### Surface 2 — le backlog vivant (production, au tick suivant)
+
+Mesurée, pas supposée : M6, 11 tickets, table complète.
+
+**Direction dangereuse — promotion devenue refus : n = 0 sur 11.** Aucune disposition n'est due pour
+une population vide ; ce qui est dû, c'est de dire qu'elle a été comptée et à quelle date.
+
+**Cas-limite mesuré — #1727, n = 1 sur 11.** La branche porte un fichier hors `docs/plans/` qui est
+un **document d'audit** (`crates/mika-cli/docs/…-audit-and-plan.md`), pas du code. Le prédicat
+étroit le classe donc « travail qui n'est pas du grooming », ce qui est littéralement vrai et
+sémantiquement discutable.
+
+**Disposition : (a) exception nommée, mesurée, avec assertion auto-nettoyante.** Concrètement :
+
+- #1727 est gelé comme **troisième fixture d'intégration** (`1727-diverged-185-behind-3-ahead.json`)
+  et son test asserte `Refuse(salvage)` — le contrôle positif vivant.
+- Le test asserte **aussi**, dans le même corps, que `behind_by > THRESHOLD`. C'est l'assertion
+  auto-nettoyante : elle dit à voix haute que le refus de #1727 est **surdéterminé** — la règle de
+  distance le refuserait de toute façon — donc que le préfixe étroit ne décide, ici, que du *motif*
+  et jamais du *sort*. Le jour où quelqu'un gèle un cas-limite dont le préfixe serait la cause
+  **unique** d'un refus qui aurait autrement promu, cette assertion échoue et rouvre la question du
+  préfixe au lieu de la laisser se répondre en silence.
+- Suivi : aucun ticket ouvert n'est dû tant que `n_cause-unique = 0`. La condition de réveil est
+  exactement l'échec de l'assertion ci-dessus — concrète, datable, et portée par le test plutôt que
+  par la mémoire de quelqu'un.
+
+### Déclencheur de halte-et-remontée (option (c), bornée)
+
+L'option (c) n'est pas la disposition générale — elle est le **déclencheur** attaché à la mesure M6,
+parce qu'une mesure a une date et que l'implémentation arrive après :
+
+> Si, au moment d'implémenter, la ré-exécution de la mesure M6 fait apparaître **une seule** branche
+> ouverte qui bascule promotion → refus, l'implémenteur **s'arrête et remonte** avec le nom de la
+> branche et de ses fichiers. Il n'élargit pas le préfixe de sa propre autorité et ne pose pas
+> d'exception non nommée.
+
+La raison est celle de la doctrine : quand la résolution de la violation préexistante *est* la
+décision de périmètre, elle revient à l'opérateur. Élargir `PLAN_PATH_PREFIX` change ce que la porte
+appelle « travail de pilote » — c'est une décision de politique, pas un ajustement d'implémentation.
 
 ## Deliverables
 
@@ -198,6 +312,7 @@ Le paragraphe `auto_pull.rs:37-39` (*« `ahead_by` separates the two populations
 | `2123-ahead-0-behind-1-ahead.json` | enrichir | liste réelle capturée |
 | `2118-diverged-8-behind-3-ahead.json` | **nouvelle** | 1 `docs/plans/**` (M1) |
 | `2120-diverged-8-behind-2-ahead.json` | **nouvelle** | 1 `docs/plans/**` (M1) |
+| `1727-diverged-185-behind-3-ahead.json` | **nouvelle** | 1 `docs/plans/**` + 1 doc hors plan (M6, cas-limite) |
 
 `PROVENANCE.md` est mis à jour et doit porter **une honnêteté explicite** : pour les quatre fixtures existantes, les compteurs datent du 2026-09-01 et la liste `files` du 2026-09-03. Ce n'est pas une incohérence, et la raison est vérifiable : `compare/main...branch` est un diff à trois points, donc `files` est relatif à la **base de fusion**, qui ne bouge pas quand `main` avance — seul `behind_by` bouge (1680 : 180 → 197 le 2026-09-03, `ahead_by` inchangé à 2, liste inchangée). La ligne doit être dans le fichier, pas seulement dans ce plan.
 
@@ -224,6 +339,10 @@ Nouveaux tests unitaires :
 - `auto_pull_replay_2118_promotes` et `auto_pull_replay_2120_promotes` : chaque fixture rend `Promote`.
 - **Non-vacuité**, exigée parce qu'un test de régression qui aurait aussi passé avant ne prouve rien : chacun des deux asserte d'abord que la fixture est bien dans la zone de refus de l'ancien prédicat — `behind_by > 0 && ahead_by > 1` — puis que la décision est `Promote`. Le test échoue donc si quelqu'un remplace la fixture par une branche à `ahead_by == 1`.
 - `auto_pull_replay_1680_is_refused_by_name` : conservé, et **renforcé** — l'assertion passe de « le slug est `salvage` » à « le slug est `salvage` **et** le refus nomme `agent_loop/mod.rs` ». C'est la fixture dérivée d'une branche morte du 2026-08-31 que demande AC3.
+- `auto_pull_replay_1727_is_the_measured_boundary_case` — **Fire-Disposition, surface 2** : la
+  fixture rend `Refuse(salvage)` (contrôle positif vivant) **et** le test asserte `behind_by >
+  THRESHOLD`, l'assertion auto-nettoyante qui déclare le refus surdéterminé. Elle échoue si
+  quelqu'un fige un cas-limite dont le préfixe serait la cause unique du refus.
 - Le test à seuil `0` (`tests/auto_pull_promotion_gate.rs:96`) est conservé : il prouve que les deux règles restent indépendantes.
 
 ### D9 — compound
@@ -246,7 +365,7 @@ Repris du ticket, sans extension :
 | **Rendre la porte permissive rouvre la porte qu'elle ferme** (la faute que l'AC2 de mika#2120 nomme sur l'autre garde) | AC2 est un test, pas une intention : `crates/**` + plan sur branche stale → `Refuse`, y compris seuil désactivé. Et la fixture #1680 est un corps réel dont le rebase a **réellement** conflit. |
 | Les fixtures existantes sans `files` verdissent les tests pour la mauvaise raison | D7 les ré-enrichit ; D8 renforce l'assertion #1680 pour qu'elle porte sur les fichiers nommés, ce qu'aucune fixture sans `files` ne peut satisfaire. |
 | Un test de régression AC3 vacieux (la fixture promeut aussi sous l'ancien code) | Assertion de non-vacuité explicite : `behind_by > 0 && ahead_by > 1` avant la décision. |
-| Un préfixe trop étroit refuse une branche de grooming légitime touchant autre chose | Mesuré : les deux branches groomées ne touchent **que** `docs/plans/` (M1), et la spec de grooming ne commite que le fichier de plan (Phase 2 étape 7, Phase 4 étape 12, Phase 5 étape 17). Le coût d'une étroitesse est un refus lisible qui nomme le fichier — pas un dispatch perdu. |
+| Un préfixe trop étroit refuse une branche de grooming légitime touchant autre chose | **Compté, plus seulement argumenté** (M6, 11 tickets ouverts) : zéro bascule promotion → refus, un seul cas-limite (#1727, un doc hors plan) dont le refus est **surdéterminé** par la distance. Disposition nommée en § Fire-Disposition avec assertion auto-nettoyante, et déclencheur de halte-et-remontée si la mesure ne tient plus à l'implémentation. |
 | `changed_files` ajouté à une struct publique casse un site de construction | Trois sites au total dans le dépôt (`:419` déclaration, `:609` parse, `:2545` aide de test) — grep exécuté le 2026-09-03, aucun consommateur hors `auto_pull.rs`. |
 
 ## Critères d'acceptation — traçabilité
@@ -258,11 +377,17 @@ Repris du ticket, sans extension :
 | AC3 — régression sur les corps réels | D7, D8 | fixtures `2118-…`, `2120-…` → `Promote` (avec non-vacuité) ; `1680-…` → `Refuse` |
 | AC4 — liste tronquée/indisponible → promotion | D1, D2, D5 | `test_promotion_gate_missing_file_list_promotes` ; `non_plan_files(None) == []` par construction |
 | AC5 — le refus nomme les fichiers hors plan | D4 | `test_salvage_refusal_names_the_offending_files` (+ troncature à 10) |
+| Fire-Disposition (mika#1574, F1 première passe) | § Fire-Disposition ; D7, D8 | surface 1 → réparation dans le périmètre ; surface 2 → n=0 mesuré + fixture #1727 auto-nettoyante + déclencheur (c) |
 | AC6 — levée choisie et écrite | Décision de conception ; D6 | la levée est **manuelle**, justifiée en trois points et écrite dans le module à côté de `REFUSAL_LABEL` |
 
 ## Suite opératoire (hors diff, après merge)
 
 Geste d'opérateur unique, à faire une fois le correctif déployé : retirer `operator-gated` de `#2118` et `#2120`. Les deux branches restent en retard de 8 commits — sous le seuil de 50 — et ne portent que leur plan ; la porte corrigée les promeut alors d'elle-même au tick suivant, sans intervention supplémentaire. Poser `ready` reste, comme toujours, une action d'opérateur.
+
+**#2036 n'est pas dans ce geste, et c'est voulu.** Le correctif lui rend le motif honnête
+(`TooFarBehind` au lieu de `salvage`) mais ne le dé-gate pas : 60 commits de retard, au-delà du
+seuil de 50. Son remède est celui que la porte nomme déjà — rebaser la branche ou re-groomer sur une
+branche neuve — et il appartient à l'opérateur, pas à ce ticket.
 
 ## Vérification
 
