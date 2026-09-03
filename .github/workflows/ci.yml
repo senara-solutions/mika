@@ -90,6 +90,9 @@ jobs:
       - name: PR-origin marker + report suites (mika#2026)
         run: make test-pr-origin
 
+      - name: Rescue-into-open-PR signal suite (mika#2151)
+        run: make test-rescue-signal
+
       - name: Pilot sandbox secret-channel guards (mika#2039)
         run: |
           make test-sandbox-secret-argv
