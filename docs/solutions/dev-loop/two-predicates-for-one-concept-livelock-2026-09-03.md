@@ -45,19 +45,28 @@ Deux exigences, au-delà de la correction de la regex :
 
 Le plus troublant : le refus **contenait déjà le remède**, en toutes lettres dans sa propre note — *« Dispatch dev-pilot to implement, or remove the plan from the branch to force a fresh groom. »* Le système savait quoi faire. Il n'avait aucun chemin entre ce qu'il sait à un endroit et ce qu'il décide à l'autre.
 
-## Trois instances dans la même nuit — le motif, pas l'anecdote
+## Six instances dans la même nuit — le motif, pas l'anecdote
 
-Le 2026-09-03, **trois** couples de composants ont été mesurés en désaccord sur une même question, chacun dans un mécanisme différent de la boucle :
+Le 2026-09-03/04, **six** couples de composants ont été mesurés en désaccord sur une même question, chacun dans un mécanisme différent de la boucle :
 
-| question | qui répond A | qui répond B | écart mesuré |
-|---|---|---|---|
-| « ce ticket est-il groomé ? » | `is_groomed()` lit la **prose** du callout → non | garde de `dispatch-lib` résout le **fichier de plan** → oui | 12 refus en 3 h 30, 3 `p1` jamais implémentés (mika#2158) |
-| « le grooming est-il le goulot ? » | le journal l'**affirme** (`// R7`) | le code ne peut pas le savoir : `candidates.is_empty()` couvre deux cas opposés | a produit l'action inverse de celle qui était due (mika#2161) |
-| « le créneau est-il libre ? » | le **bail** expire en 120 s → libre | la **garde** lit le rappel actif → occupé | 4 h 12 de divergence, 8 réveils pour rien (mika#2162) |
+| question | qui répond A | qui répond B | écart mesuré | ticket |
+|---|---|---|---|---|
+| « ce ticket est-il groomé ? » | `is_groomed()` lit la **prose** du callout → non | garde de `dispatch-lib` résout le **fichier de plan** → oui | 12 refus en 3 h 30 ; 6 cycles de livelock, période ~70 min | mika#2158 |
+| « le grooming est-il le goulot ? » | le journal l'**affirme** (`// R7`) | le code ne peut pas le savoir : `candidates.is_empty()` couvre deux cas opposés | a produit l'action inverse de celle qui était due | mika#2161 |
+| « le créneau est-il libre ? » | le **bail** expire en 120 s → libre | la **garde** lit le rappel actif → occupé | 4 h 12 de divergence, 8 réveils pour rien | mika#2162 |
+| « cette session est-elle morte ? » | le **balayage phantom** dit oui à 1 h | le **pilote** écrivait encore 2 h 08 plus tard | 5 lignes de suivi marquées `failed` à tort en une nuit | mika#2156 |
+| « ce ticket a-t-il été écarté ? » | la ligne qui le dirait est en `debug!` | le filtre n'admet qu'**une** cible en DEBUG, et ce n'est pas celle-là | un `p1` immobile 3 jours, sans trace | mika#2131 |
+| « ce refus a-t-il tué la session ? » | `interrupt=True` décide | il n'est journalisé **nulle part** | 8 morts qui sont au moins **deux** classes indiscernables | claude-pilot#151 |
 
-Aucune des six moitiés n'est buggée prise isolément. Chacune fait ce que son commentaire annonce. Ce qui manque à chaque fois est le **même** : rien ne réconcilie les deux réponses, et rien ne casse quand elles divergent.
+Aucune des douze moitiés n'est buggée prise isolément. Chacune fait ce que son commentaire annonce. Ce qui manque à chaque fois est le **même** : rien ne réconcilie les deux réponses, et rien ne casse quand elles divergent.
 
-C'est pour ça que le motif se répète : il ne laisse pas de trace d'erreur à corriger. On ne le trouve qu'en comptant des répétitions dans un journal — douze refus, huit réveils — c'est-à-dire en cherchant une régularité, pas une panne.
+C'est pour ça que le motif se répète : il ne laisse pas de trace d'erreur à corriger. On ne le trouve qu'en **comptant des répétitions** dans un journal — douze refus, huit réveils, six cycles, vingt-neuf sessions tuées sur cinquante-deux. C'est-à-dire en cherchant une **régularité**, pas une panne.
+
+### Le critère de correction est unique pour les six
+
+**Quand deux composants répondent à la même question, l'un est la source et l'autre le lit** — jamais deux mesures parallèles. Et **quand un composant refuse, son refus doit produire un effet** : sinon ce n'est pas une garde, c'est une boucle.
+
+Le second point mérite son propre test, parce qu'il est invisible autrement : *deux tours consécutifs du mécanisme ne doivent pas produire deux refus identiques sur le même sujet.* La fenêtre d'observation se déduit de la période mesurée — ici deux heures, parce qu'un test de dix minutes tomberait entre deux tours et conclurait à tort que tout va bien.
 
 ## La classe, réutilisable
 
@@ -79,5 +88,8 @@ La première hypothèse — « ce défaut fabrique les onze sessions de grooming
 - mika#2158 — le ticket, avec le tableau des six corps mesurés
 - mika#2120 — le frère sur l'autre axe du même prédicat (préfixe du chemin de plan)
 - mika#2020 / mika#1887 — `PlanOwnership`, la classe voisine : un callout qui pointe vers le plan d'un autre ticket
-- mika#2161 — deuxième instance : le journal du feeder affirme un goulot qu'il ne peut pas connaître
-- mika#2162 — troisième instance : le bail de créneau expire en 120 s quand la garde tient 4 h
+- mika#2161 — le journal du feeder affirme un goulot qu'il ne peut pas connaître
+- mika#2162 — le bail de créneau expire en 120 s quand la garde tient 4 h
+- mika#2156 — le balayage phantom déclare morte une session qui écrivait encore
+- mika#2131 — les exclusions de l'auto-pull partent en `debug!`, que le filtre n'admet pas
+- claude-pilot#151 — `interrupt=True`, le commutateur de létalité d'un refus, n'est journalisé nulle part
