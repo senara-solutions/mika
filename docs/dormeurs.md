@@ -1,4 +1,7 @@
-# Registre des dormeurs
+---
+title: Registre des dormeurs
+description: Les travaux réellement dus dont la condition d'exécution n'est pas remplie — chacun avec sa condition de réveil vérifiable.
+---
 
 Un **dormeur** est un travail réellement dû dont la condition d'exécution n'est pas remplie
 aujourd'hui. Il ne se fait pas maintenant, mais il ne disparaît pas : il vit ici, avec sa
