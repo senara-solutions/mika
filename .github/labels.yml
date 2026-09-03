@@ -181,7 +181,7 @@
 
 - name: rescue-after-review
   color: "b60205"
-  description: "dispatch-lib's rescue net committed into this PR after it was opened — an earlier approval does not cover those commits (mika#2151)"
+  description: "rescue net committed after this PR was opened; an earlier approval no longer covers it (mika#2151)"
 
 - name: stale-against-main
   color: "b60205"
