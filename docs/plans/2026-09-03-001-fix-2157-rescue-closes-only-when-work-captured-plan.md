@@ -289,3 +289,7 @@ Première passe `mika-arch`, session `5a0533d8-f80f-44ea-8a14-8de116af3805`, dis
 | U5 | Duplication `_clean_worktree_for_rebase` ↔ liste `case` | Le commentaire croisé est la bonne réponse minimale ; la fusion créerait une mauvaise abstraction (nettoyer vs classifier) | R3 inchangé |
 
 **Ce que l'architecte n'a pas tranché**, et qui reste donc au jugement de l'implémenteur : rien sur le fond n'a été renvoyé. Les deux trouvailles portaient sur la forme du plan (une section due, une section crue absente). Le contenu technique — D1 à D7 — est passé sans contestation, U1 à U5 comprises.
+
+**Seconde passe — `Verdict: GROOMED`** (même session `5a0533d8-f80f-44ea-8a14-8de116af3805`). F1 réfuté avec preuve et clos sans modification du plan ; F2 fondé et résolu, l'architecte retenant explicitement que l'absence d'allowlist nommée pour les détecteurs 1 et 2 « n'est pas une indulgence : leur corpus est vide par construction ». Aucune décision non résolue, aucune nouvelle trouvaille.
+
+La seconde passe a dû être redemandée une fois : le premier appel a rendu `stop_reason: EndTurn`, `output_tokens: 177`, `status: success` — et aucun contenu, aucun message assistant persisté (trace `fa002cef-46bb-4706-b40c-971a53e6a542`). Un tour qui réussit et ne livre rien. Ce n'est pas une troisième passe : la seconde n'avait rendu aucun verdict. Consigné ici parce que c'est la même classe de faux positif de livraison que mika#1996 et mika#2121 traitent côté callback, et que le prochain groomer qui la rencontre doit pouvoir la nommer au lieu de la redécouvrir.
