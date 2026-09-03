@@ -568,7 +568,7 @@ fn strip_token_borders(token: &[char]) -> String {
             let n = lead.min(trail);
             if n > 0 && lead + trail <= t.len() {
                 t.drain(0..n);
-                t.truncate(t.len() - n);
+                t.truncate(t.len() - n); // safe-byte-slice: t is a Vec<char> (`let mut t: Vec<char> = token.to_vec()` above) — Vec::truncate cuts by element and t.len() counts chars, not bytes; there is no UTF-8 boundary to violate
             }
         }
 
