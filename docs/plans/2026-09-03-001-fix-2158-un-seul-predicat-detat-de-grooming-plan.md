@@ -407,7 +407,56 @@ assumé : la spec n'a pas à imposer l'anglais pour être lisible par la machine
 
 ---
 
+## Acceptance criteria
+
+Reproduits **littéralement** depuis mika#2158 — AC1-AC6 du corps de l'issue, AC7-AC8 du commentaire
+de correction de l'opérateur (2026-09-03T21:18:10Z). Aucune reformulation : c'est le contrat.
+
+- **AC1** — Un ticket dont la seule passe d'architecte a rendu `READY` (chemin prescrit par
+  `mika-groom-ticket.md` phase 3 étape 10) est reconnu groomé. Cas de test : le corps littéral
+  de #2108.
+- **AC2** — La variante française (`seconde passe`) est reconnue au même titre que `second-pass`.
+  Cas de test : le corps littéral de #1772.
+- **AC3** — Un `GROOMED` final rendu après un `ESCALATE` de seconde passe et son arbitrage est
+  reconnu. Cas de test : le corps littéral de #2127.
+- **AC4** — Les non-régressions tiennent : un ticket sans aucun verdict, un ticket dont la dernière
+  disposition est `ESCALATE` **sans** `GROOMED` ultérieur, et un ticket sans callout
+  `Branch`/`Plan` restent **non** groomés. Le correctif ne doit pas transformer le prédicat en
+  « accepte tout ».
+- **AC5** — Les six corps réels mesurés ci-dessus sont figés comme fixtures de test, avec le
+  tableau attendu (6 vrais après correctif, contre 3 aujourd'hui).
+- **AC6** — La source de vérité est nommée : soit le prédicat est aligné sur
+  `mika-groom-ticket.md`, soit la spec est alignée sur le prédicat, et la décision est écrite à
+  côté du code — pour que la prochaine divergence soit une régression et non une découverte.
+- **AC7** — Les deux prédicats rendent le même verdict sur les mêmes entrées. Un test croisé prend
+  les six corps figés de l'AC5 et vérifie que `is_groomed()` et la garde de `dispatch-lib`
+  s'accordent sur chacun. Un désaccord fait échouer la suite.
+- **AC8** — Quand la garde de dispatch refuse pour `already_groomed`, le refus **produit un
+  effet** : soit le ticket est promu en `implement` dans la foulée, soit il est marqué de façon à
+  ne pas être redemandé au tour suivant. Un refus qui laisse l'état inchangé et se répète toutes
+  les dix minutes n'est pas une garde, c'est une boucle.
+  Critère de non-régression pour l'AC8 : après correctif, deux tours consécutifs du feeder ne
+  doivent pas produire deux refus `already_groomed` sur le même ticket.
+
+### Deux précisions de lecture, assumées et non silencieuses
+
+**AC7 dit « les deux prédicats » et nomme `is_groomed()` + la garde `dispatch-lib`.** La mesure §1.2
+établit qu'il y en a **trois**, et que le troisième — `check_grooming_markers`
+(`skills/executor.rs:972`) — est celui qui rend effectivement le verdict `groom`/`implement`
+(`server/ready_label_handler.rs:265-274`). Le plan satisfait l'AC7 tel qu'il est écrit **et**
+étend le croisement au troisième porteur (M5a), parce que le satisfaire à la lettre sans l'étendre
+laisserait les trois tickets exactement là où ils sont.
+
+**AC8 offre deux remèdes au choix** (« promu en `implement` dans la foulée » ou « marqué de façon
+à ne pas être redemandé »). Le plan retient le second (M6c forme 1), et pour la raison écrite en
+M6c : le premier ajoute une quatrième autorité sur « ce ticket doit-il être implémenté », soit la
+classe de défaut que ce ticket ferme. Le critère de non-régression cité ci-dessus est vérifié
+identiquement dans les deux cas.
+
 ## 6. Critères d'acceptation — traçabilité
+
+Chaque AC cité en toute lettre ci-dessus, rattaché au module qui le ferme et à la
+vérification qui le prouve.
 
 | AC | module | vérification |
 |---|---|---|
