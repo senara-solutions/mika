@@ -236,7 +236,7 @@ Câblage `Makefile` : ligne dans la cible `test:` (auprès de `:130`) et cible n
 
 ---
 
-## Critères d'acceptation
+## Acceptance criteria
 
 - **AC1** — Étape 2, cas défaut : commentaire sur la PR + étiquette + congédiement de l'approbation. Visible sur la PR elle-même, pas seulement dans un journal. Bloquant : le congédiement referme aussi la porte machine (`ci_success_handler.rs:716` rejette tout `state != "APPROVED"`). Étape 4 couvre le troisième silence. Prouvé par T2, T3, T4, T8.
 - **AC2** — Deux paliers, tous deux tenus (F4) : **N1**, aucun sauvetage → la garde d'entrée rend `0` avant tout appel `gh`, coût strictement nul ; **N2**, sauvetage sans PR ouverte → une lecture `gh pr list`, zéro mutation, `RESULT` inchangé, une ligne stderr. Prouvé par T1, qui assert l'**absence** d'appels mutants — et par T1b, qui assert l'absence de **tout** appel `gh` quand `RESCUE_COMMITS` est vide.
