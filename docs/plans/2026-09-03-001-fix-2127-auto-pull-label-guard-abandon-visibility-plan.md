@@ -203,6 +203,9 @@ La garde d'AC2 n'a donc pas à inventer sa technique : elle a un modèle dans le
 - [ ] Le doc-comment de `abandon_stuck_ready` décrit l'ordre que son code exécute.
 - [ ] `labels.yml` est **inchangé** par cette PR (hors la restauration de la démonstration AC3).
 - [ ] L'ordre appliquer-puis-retirer de `abandon_stuck_ready` est inchangé.
+- [ ] Chaque détecteur de test (D1-D5) halte la CI en tirant, avec le message que le tableau §Fire-Disposition exige.
+- [ ] D6 remonte sans halter, et sa remontée est une ligne `audit_events` interrogeable, pas seulement un log.
+- [ ] Le commentaire au-dessus de D1 nomme les formes syntaxiques que le scan reconnaît, pour que R1 soit lisible depuis le code.
 - [ ] *(si Q1 → dans ce ticket)* `classify_stuck_ready` rend `Abandon` quand le budget est épuisé même si le disjoncteur a sauté, avec le test de régression de M5.
 
 ## Acceptance criteria
@@ -227,6 +230,32 @@ Transcrits du corps réconcilié de mika#2127.
 | AC5 | Phase 4 (étapes 11-14) | Verdict `Abandon` sous disjoncteur (test) ; `#2117` désétiqueté ; comptes `pullable` avant/après |
 | AC6 | Phase 5 (étapes 15-16) | `:180-205` et `:1660-1666` relus contre le code |
 
+## Fire-Disposition
+
+Ce plan introduit six détecteurs. Chacun doit dire, **avant d'exister**, ce qui se passe quand il tire — sinon un détecteur qui trouve quelque chose devient une ligne que personne ne traite, ce qui est exactement le défaut de ce ticket (dix-huit `warn!` en trois jours, aucune action). Citation : mika#1574, porte Fire-Disposition.
+
+**Disposition retenue pour les cinq détecteurs de test : (c) halte-et-remontée.** Ils vivent dans `cargo test`, donc dans la CI, donc dans la porte de merge. Un tir arrête la PR. Aucun n'a de mode « avertir et continuer » — un détecteur de cohérence qu'on peut ignorer ne vérifie rien, ce que l'AC3 dit déjà de son côté.
+
+| # | Détecteur | Condition de tir | Disposition | Message exigé |
+|---|---|---|---|---|
+| D1 | `test_every_label_the_module_uses_is_declared` | un label extrait du source de production n'est pas déclaré dans `labels.yml` | **halte** — échec de test, CI rouge | nomme **le label**, le **fichier et la ligne** d'où il a été extrait, et la conséquence (`ready` jamais retiré, ticket collé dans le bassin) |
+| D2 | contrôle de non-vacuité | l'extraction rend moins que `operator-review`, `blocked`, `ready` | **halte** | dit que l'extraction est cassée, pas que les labels manquent — la confusion entre les deux est ce qui rendrait D1 vert pour la mauvaise raison |
+| D3 | contrôle négatif (nom inventé) | un nom jamais déclaré est vu comme déclaré | **halte** | dit que le prédicat `declared()` ne discrimine plus |
+| D4 | contrôle de coupe production/test | la tranche production ne contient pas `fn abandon_stuck_ready` | **halte** | donne la taille de la tranche obtenue, sur le modèle de `:2841-2845` |
+| D5 | test de régression disjoncteur→abandon *(si Q1 → dans ce ticket)* | `circuit_broken && redrive_count >= budget && !abandoned` ne rend pas `Abandon` | **halte** | nomme le verdict obtenu et rappelle M5 |
+| D6 | `auto_pull_abandon_marker_unavailable` (production, pas test) | l'application du label d'abandon échoue en production | **remontée sans halte** — la boucle continue | ligne `audit_events` interrogeable + log au niveau tranché en Q3 |
+
+**D6 est délibérément le seul qui ne halte pas.** C'est un détecteur d'exécution, pas de merge : arrêter `auto_pull` parce qu'un abandon a échoué punirait tous les autres tickets pour un seul. Il remonte, il ne bloque pas. Mais « remonte » a désormais un sens vérifiable — une ligne d'audit qu'on peut interroger — au lieu d'un `warn!` que personne ne lit. C'est la totalité d'AC4.
+
+### Faux positifs — ce qui est traité, et ce qui reste ouvert
+
+Le seul détecteur qui peut tirer à tort est **D1**, par sa technique de scan.
+
+- **Faux positif** (tire alors que tout va bien) : un littéral extrait d'un contexte qui n'est pas un vrai usage de label — une chaîne dans un message d'erreur, un nom dans un doc-test. **Traitement :** l'extraction est bornée aux trois formes nommées (arguments de `gh_apply_label` / `gh_remove_label`, valeurs de `const *_LABEL: &str`, comparaisons `l.name == "…"` dans `is_feeder_excluded`) et **jamais** au fichier entier. Un tir de D1 est donc, par construction, un usage réel.
+- **Faux négatif** (ne tire pas alors qu'un label manque) : un reformatage `rustfmt` casse un appel sur plusieurs lignes et le motif ne reconnaît plus l'argument. **Traitement partiel :** D2 attrape le cas pour les trois labels connus. Il n'attrape pas un quatrième label ajouté plus tard puis rendu invisible par un reformatage. **C'est le risque résiduel R1, accepté et nommé dans le code** — pas fermé. Un commentaire au-dessus de D1 doit dire quelle forme syntaxique la garde reconnaît, pour que quiconque écrit un appel sous une autre forme sache qu'il sort de sa portée.
+
+Ce choix d'accepter R1 plutôt que de le fermer est délibéré : la fermer exigerait de passer par l'AST (`syn`) plutôt que par le texte, ce qui ajoute une dépendance de test et une complexité sans commune mesure avec la classe de défaut visée — un label appliqué et jamais déclaré. Si un faux négatif se produit réellement, il devient l'incident qui justifie l'AST ; l'anticiper aujourd'hui serait construire la garde de la garde avant d'avoir mesuré qu'elle manque.
+
 ## Questions pour l'architecte
 
 **Q1 — Le correctif de la porte scellée (Phase 4, étape 11) appartient-il à ce ticket ?**
@@ -247,7 +276,7 @@ Repris du ticket, sans extension :
 
 ## Risques
 
-- **R1 — Le scan de source est fragile au reformatage.** Un `rustfmt` qui casse un appel sur plusieurs lignes peut faire échapper un littéral au regex, rendant la garde silencieusement partielle. Le contrôle de non-vacuité (étape 4) le détecte pour les trois labels connus, pas pour un quatrième ajouté plus tard. Surface résiduelle assumée et à nommer dans le code.
+- **R1 — Le scan de source est fragile au reformatage.** *(disposition et traitement : §Fire-Disposition → Faux positifs.)* Un `rustfmt` qui casse un appel sur plusieurs lignes peut faire échapper un littéral au regex, rendant la garde silencieusement partielle. Le contrôle de non-vacuité (étape 4) le détecte pour les trois labels connus, pas pour un quatrième ajouté plus tard. Surface résiduelle assumée et à nommer dans le code.
 - **R2 — Phase 4 touche la logique de sélection du bassin.** Un verdict `Abandon` élargi désétiquette des tickets ; si le prédicat est trop large, il retire `ready` à des tickets vivants. Le test de l'étape 12 borne le cas exact (budget épuisé **et** non déjà abandonné) ; les autres branches restent intactes.
 - **R3 — AC5 se vérifie après déploiement, pas dans la PR.** Le compte `pullable` avant/après exige le binaire corrigé en production. La PR porte AC1-AC4 et AC6 ; AC5 se coche sur le ticket une fois la mesure produite. Fermer le ticket avant rejouerait l'erreur qu'il documente.
 
