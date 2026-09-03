@@ -1341,16 +1341,6 @@ impl TaskEngine {
         }
     }
 
-    /// Reap parent self_dev tasks left `in_progress` after their callback
-    /// subtask delivered without producing a PR (#871).
-    ///
-    /// Transitions matched parents to `failed` with an audit-event trail.
-    /// The `NOT EXISTS` sibling guard defers reaping when #870's correction
-    /// loop has launched a retry via `create_task`.
-    ///
-    /// Any new writers of `callback_delivered_without_pr_url` must respect
-    /// the groom-class filter. SOLE WRITER: this method is the only site
-    /// that writes `callback_delivered_without_pr_url` to `tasks.result`.
     /// mika#1705: ingest finished claude-pilot transcript JSONL files into the
     /// `pilot_transcripts` table, then delete each imported file.
     ///
@@ -1491,6 +1481,21 @@ impl TaskEngine {
         }
     }
 
+    /// Reap parent self_dev tasks left `in_progress` after their callback
+    /// subtask delivered without producing a PR (#871).
+    ///
+    /// Transitions matched parents to `failed` with an audit-event trail.
+    /// The `NOT EXISTS` sibling guard defers reaping when #870's correction
+    /// loop has launched a retry via `create_task`.
+    ///
+    /// mika#2121 (U2): the failure motif is now distinguished. When the callback
+    /// child carries an anchored `NO_PR: <reason>` line, the reap writes
+    /// `callback_no_pr_<reason>`; otherwise the generic
+    /// `callback_delivered_without_pr_url` motif is preserved for producers that
+    /// predate U1 (AC-G2). This method is the SOLE PRODUCTION WRITER of both
+    /// motifs to `tasks.result` — a test in `dispatcher.rs` simulates the write,
+    /// so a grep finds two hits, but only this site runs in production. Any new
+    /// production writer must respect the groom-class filter.
     async fn reap_orphaned_parent_tasks(&self) {
         let candidates = match self
             .db
@@ -1567,16 +1572,45 @@ impl TaskEngine {
                 }
             }
 
-            // SOLE WRITER: callback_delivered_without_pr_url
+            // mika#2121 (U2): distinguish the muted case. Since U1, the callback
+            // child's result carries an anchored `NO_PR: <reason>` line; parse it
+            // and write `callback_no_pr_<reason>` so the operator can tell a dead
+            // pilot from a `gh` outage. Absent that line — a producer that predates
+            // U1 — the generic `callback_delivered_without_pr_url` motif is written
+            // verbatim (AC-G2 negative control). A failed child lookup also falls
+            // back to the generic motif rather than skipping the reap.
+            let fail_reason = match self.db.get_task_unscoped(&parent.callback_task_id).await {
+                Ok(Some(child)) => child
+                    .result
+                    .as_deref()
+                    .and_then(super::dispatcher::parse_no_pr_reason)
+                    .map(|r| format!("callback_no_pr_{r}"))
+                    .unwrap_or_else(|| "callback_delivered_without_pr_url".to_string()),
+                Ok(None) => "callback_delivered_without_pr_url".to_string(),
+                Err(e) => {
+                    warn!(
+                        parent_id = %parent.id,
+                        callback_task_id = %parent.callback_task_id,
+                        error = %e,
+                        "task_engine_reaper: failed to load callback child result; \
+                         using generic motif"
+                    );
+                    "callback_delivered_without_pr_url".to_string()
+                }
+            };
+
+            // SOLE PRODUCTION WRITER of `callback_delivered_without_pr_url` /
+            // `callback_no_pr_*` to `tasks.result` (mika#2121 KTD5). The former
+            // `// SOLE WRITER` line read as if no other reference existed, but
+            // dispatcher.rs's test module simulates this write
+            // (`test_try_complete_parent_on_callback_success_parent_failed_noop`),
+            // so a grep finds two hits — naming the test keeps the next reader
+            // from mistaking it for a second production writer.
             // Use update_task_failed (guarded UPDATE with terminal-state check)
             // instead of raw update_task_status to avoid overwriting concurrent
             // terminal transitions. Returns false when the parent already left
             // in_progress (race with operator action or duplicate query rows).
-            match self
-                .db
-                .update_task_failed(&parent.id, "callback_delivered_without_pr_url")
-                .await
-            {
+            match self.db.update_task_failed(&parent.id, &fail_reason).await {
                 Ok(true) => {
                     // Transition succeeded — emit audit event
                     if let Err(e) = self
@@ -1587,7 +1621,7 @@ impl TaskEngine {
                             &parent.id,
                             Some("in_progress"),
                             Some("failed"),
-                            Some("callback_delivered_without_pr_url"),
+                            Some(&fail_reason),
                             Some(&trace_id),
                         )
                         .await
