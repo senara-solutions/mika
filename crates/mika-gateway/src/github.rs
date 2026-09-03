@@ -321,6 +321,12 @@ pub fn route_event(
     match (event_type, action) {
         ("issues", Some("assigned")) => Some("mika-dev"),
         ("issues", Some("labeled")) => Some("mika-dev"),
+        // mika#1934 AC4.a — `issues.closed` was previously dropped (`_ => None`).
+        // It now routes to mika-dev so the engine-side `upstream_close_handler`
+        // can terminal-mark any tracking rows the closed issue left in `blocked`
+        // (the escalation-resolved-out-of-band phantom class). Matches the
+        // existing `pull_request.closed → mika-dev` pattern.
+        ("issues", Some("closed")) => Some("mika-dev"),
         ("issue_comment", Some("created")) => Some("mika-dev"),
         (
             "pull_request",
@@ -1725,7 +1731,25 @@ mod tests {
 
     #[test]
     fn test_route_event_issues_closed() {
-        assert_eq!(route_event("issues", Some("closed"), None), None);
+        // mika#1934 AC4.a: `issues.closed` now routes to mika-dev (was dropped).
+        assert_eq!(
+            route_event("issues", Some("closed"), None),
+            Some("mika-dev")
+        );
+    }
+
+    #[test]
+    fn test_route_event_issues_closed_routes_to_mika_dev() {
+        // mika#1934 AC4.a positive-case sibling: pins the routing target so a
+        // regression that reverts `issues.closed` to unroutable (silently
+        // dropping the event) breaks a named test. The engine-side
+        // `upstream_close_handler` depends on this event reaching mika-dev to
+        // terminal-mark tracking rows left `blocked` by the closed issue.
+        assert_eq!(
+            route_event("issues", Some("closed"), None),
+            Some("mika-dev"),
+            "issues.closed must route to mika-dev for tracking-row cleanup (mika#1934)"
+        );
     }
 
     #[test]

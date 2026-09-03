@@ -20,6 +20,7 @@ pub mod state;
 pub mod tasks_stream;
 pub mod tier_guard;
 pub mod types;
+pub mod upstream_close_handler;
 pub mod variants;
 pub(crate) mod verdict;
 pub mod verdict_handler;

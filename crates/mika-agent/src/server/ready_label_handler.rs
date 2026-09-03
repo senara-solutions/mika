@@ -284,6 +284,31 @@ pub async fn try_handle_ready_label_dispatch(
     );
     let agent_id = db.agent_id().to_string();
     let task_label = format!("ready-label: {}#{}", location.owner_repo(), location.number);
+
+    // 6b. Supersede-on-new-dispatch (mika#1934 AC2). Cancel any phantom tracking
+    //     rows (blocked/in_progress, no process) left behind by a prior dispatch
+    //     for this same issue before we insert the fresh one — this both prevents
+    //     the idx_tasks_manual_active_ref_url collision that would fail step 7 and
+    //     drains the escalation-artefact accumulation the mika#1712 sweep exists to
+    //     mop up. Fail-open: never blocks the dispatch.
+    let superseded = crate::tracking_cleanup::supersede_prior_tracking_rows(
+        db,
+        session_id,
+        Some(trace_id),
+        &issue_url,
+        &task_label,
+    )
+    .await;
+    if superseded > 0 {
+        info!(
+            event = "ready_label_superseded_prior_rows",
+            repo = %location.owner_repo(),
+            num = location.number,
+            superseded = superseded,
+            "ready_label_handler: superseded prior phantom tracking rows before dispatch"
+        );
+    }
+
     let new_task = NewTask {
         agent_id,
         team_run_id: None,

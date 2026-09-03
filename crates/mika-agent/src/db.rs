@@ -6459,6 +6459,104 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Find active phantom-shape tracking rows for an issue's base URL AND its
+    /// `?phase=groom` variant (mika#1934 AC2.2 / AC4.b).
+    ///
+    /// Returns rows in the phantom shape — `trigger_type='manual'`,
+    /// `action_type='none'`, `process_id IS NULL`, `status IN ('blocked',
+    /// 'in_progress')` — whose `reference_url` is either the exact `base_url` or
+    /// `<base_url>?phase=groom`. `base_url` MUST be canonical (no `?phase=groom`
+    /// suffix); callers strip it via
+    /// [`crate::task_state::tasks::strip_groom_phase_suffix`].
+    ///
+    /// A single helper serves both cleanup surfaces: supersede-on-new-dispatch
+    /// (AC2) and complete-on-upstream-close (AC4) both need the same
+    /// exact-URL + groom-variant fan-out. Reuses the partial unique index
+    /// `idx_tasks_manual_active_ref_url` (`blocked`/`in_progress` are inside the
+    /// index's "active" set) — no new migration (AC2.1).
+    pub fn find_active_tracking_rows_by_reference_url_and_variants(
+        &self,
+        agent_id: &str,
+        base_url: &str,
+    ) -> Result<Vec<Task>> {
+        let groom_url = format!("{base_url}{}", crate::task_state::tasks::GROOM_PHASE_SUFFIX);
+        let sql = format!(
+            "SELECT {} FROM tasks
+             WHERE agent_id = ?1
+               AND trigger_type = 'manual'
+               AND action_type = 'none'
+               AND process_id IS NULL
+               AND status IN ('blocked', 'in_progress')
+               AND reference_url IN (?2, ?3)
+             ORDER BY id",
+            Self::TASK_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![agent_id, base_url, groom_url], Self::row_to_task)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Guarded transition of a phantom tracking row → `cancelled` with the
+    /// canonical supersede reason (mika#1934 AC2).
+    ///
+    /// SOLE WRITER of `result = 'superseded_by_new_dispatch'`
+    /// ([`crate::task_state::tasks::SUPERSEDED_BY_NEW_DISPATCH`]). Only
+    /// transitions from the phantom shape (blocked/in_progress,
+    /// `action_type='none'`, `process_id IS NULL`), so a caller passing a
+    /// genuine dispatched row or a `pending` row gets `false` and no write.
+    /// Returns `true` iff a row transitioned.
+    pub fn cancel_task_superseded(&self, id: &str, agent_id: &str) -> Result<bool> {
+        let rows = self.conn.execute(
+            "UPDATE tasks SET status = 'cancelled', result = ?1,
+             completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?2 AND agent_id = ?3
+               AND action_type = 'none'
+               AND process_id IS NULL
+               AND status IN ('blocked', 'in_progress')",
+            params![
+                crate::task_state::tasks::SUPERSEDED_BY_NEW_DISPATCH,
+                id,
+                agent_id
+            ],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Guarded terminal transition of a phantom tracking row on upstream close
+    /// (mika#1934 AC4).
+    ///
+    /// `new_status` is `'cancelled'` or `'completed'`; `result` is one of the
+    /// upstream-close reason constants
+    /// ([`crate::task_state::tasks::ISSUE_CLOSED_UPSTREAM`],
+    /// [`crate::task_state::tasks::UPSTREAM_PR_MERGED`],
+    /// [`crate::task_state::tasks::UPSTREAM_PR_CLOSED_UNMERGED`]). Same
+    /// phantom-shape guard as [`Self::cancel_task_superseded`]. Idempotent: an
+    /// already-terminal row matches nothing (the `status IN (...)` guard
+    /// short-circuits on re-delivery) and returns `false` (AC4.c). Returns
+    /// `true` iff transitioned.
+    pub fn terminal_mark_tracking_row_upstream_closed(
+        &self,
+        id: &str,
+        agent_id: &str,
+        new_status: &str,
+        result: &str,
+    ) -> Result<bool> {
+        let rows = self.conn.execute(
+            "UPDATE tasks SET status = ?1, result = ?2,
+             completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?3 AND agent_id = ?4
+               AND action_type = 'none'
+               AND process_id IS NULL
+               AND status IN ('blocked', 'in_progress')",
+            params![new_status, result, id, agent_id],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// Get the depth of a task by ID (for computing child depth).
     /// Scoped to agent_id to prevent cross-agent parent linking.
     pub fn get_task_depth(&self, task_id: &str, agent_id: &str) -> Result<Option<i64>> {

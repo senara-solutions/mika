@@ -10,6 +10,58 @@ pub const TASK_TYPE_PROJECT: &str = "project";
 /// the `create_task` tool boundary. Order is the documented enum order.
 pub const VALID_TASK_TYPES: &[&str] = &[TASK_TYPE_ISSUE, TASK_TYPE_MILESTONE, TASK_TYPE_PROJECT];
 
+// ===== Tracking-row cleanup (mika#1934) =====
+//
+// A dispatch-tracking row (`trigger_type='manual'`, `action_type='none'`,
+// `process_id IS NULL`) is left behind in `blocked` when an escalation fires and
+// the underlying ticket is later resolved out-of-band. These constants back the
+// two cleanup surfaces that terminal-mark such rows: supersede-on-new-dispatch
+// (AC2) and complete-on-upstream-close (AC4). Each `result` string is a
+// stable, greppable discriminator — do not spell them by hand at a call site.
+
+/// The `?phase=groom` URL suffix the LLM-driven grooming path appends to an
+/// issue URL (`crates/mika-agent/src/db.rs::has_completed_groom_for_issue`).
+/// `.../issues/1574` and `.../issues/1574?phase=groom` are DIFFERENT
+/// `reference_url`s; the cleanup surfaces canonicalize on the base URL so a
+/// fresh dispatch supersedes both variants for the same underlying issue.
+pub const GROOM_PHASE_SUFFIX: &str = "?phase=groom";
+
+/// `tasks.result` reason written when a phantom tracking row is cancelled
+/// because a fresh dispatch superseded it (mika#1934 AC2). SOLE WRITER:
+/// [`crate::db::Database::cancel_task_superseded`].
+pub const SUPERSEDED_BY_NEW_DISPATCH: &str = "superseded_by_new_dispatch";
+
+/// `tasks.result` reason written when a tracking row is cancelled because its
+/// GitHub issue was closed upstream (mika#1934 AC4, `issues.closed`).
+pub const ISSUE_CLOSED_UPSTREAM: &str = "issue_closed_upstream";
+
+/// `tasks.result` reason written when a tracking row is completed because its
+/// linked PR was merged upstream (mika#1934 AC4, `pull_request.closed` merged).
+pub const UPSTREAM_PR_MERGED: &str = "upstream_pr_merged";
+
+/// `tasks.result` reason written when a tracking row is cancelled because its
+/// linked PR was closed unmerged upstream (mika#1934 AC4, `pull_request.closed`
+/// unmerged).
+pub const UPSTREAM_PR_CLOSED_UNMERGED: &str = "upstream_pr_closed_unmerged";
+
+/// `audit_events.tool_name` emitted per row superseded by a fresh dispatch
+/// (mika#1934 AC2).
+pub const TRACKING_ROW_SUPERSEDED_TOOL: &str = "tracking_row_superseded";
+
+/// `audit_events.tool_name` emitted per row terminal-marked on upstream close
+/// (mika#1934 AC4).
+pub const TRACKING_ROW_UPSTREAM_CLOSED_TOOL: &str = "tracking_row_upstream_closed";
+
+/// Strip the `?phase=groom` suffix from a `reference_url`, returning the
+/// canonical base issue URL. A URL without the suffix is returned unchanged.
+/// Used by both tracking-row cleanup surfaces (mika#1934 AC2.2 / AC4.b) so the
+/// exact-URL and groom-variant rows are both matched from one base URL.
+pub fn strip_groom_phase_suffix(reference_url: &str) -> &str {
+    reference_url
+        .strip_suffix(GROOM_PHASE_SUFFIX)
+        .unwrap_or(reference_url)
+}
+
 #[derive(Debug, Clone)]
 pub struct Task {
     pub id: String,
