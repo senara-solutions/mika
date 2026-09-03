@@ -2,7 +2,7 @@ use bytes::Bytes;
 use reqwest::Client;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Typed error for Telegram Bot API responses, following the ClaudeApiError pattern.
 #[derive(Debug, thiserror::Error)]
@@ -309,6 +309,25 @@ pub fn detect_media_type(bytes: &[u8]) -> Option<&'static str> {
 
 // -- sendMessage payload --
 
+/// **No `parse_mode` — and that is a decision, not an omission (mika#2126).**
+///
+/// If you came here to "just turn on MarkdownV2", read this first; it was weighed and
+/// rejected.
+///
+/// MarkdownV2 requires escaping `_ * [ ] ( ) ~ ` > # + - = | { } . !` throughout the
+/// *entire* text, URLs included. A single unescaped character makes the Telegram API
+/// reject the **whole message** with a 400. We would then have traded a broken link
+/// for an **absent message** — a clear regression, because today the user at least
+/// receives the text. The property that decides it: **plain text cannot be broken by
+/// a renderer that never parses it.**
+///
+/// The cost of plain text is that markdown the agent writes arrives literally, and
+/// Telegram's autolinker swallows any decoration glued to a URL (`**https://…/mika**`
+/// → a link to `…/mika**` → 404). That is handled at the single emission point by
+/// [`strip_markdown_around_urls`], which carries the rule and its residual risk.
+///
+/// Changing this field means owning the escaping of every outbound message, including
+/// agent-authored text we do not control. Take it back through grooming, not here.
 #[derive(Debug, Serialize)]
 struct SendMessagePayload {
     chat_id: i64,
@@ -363,6 +382,203 @@ fn validate_file_path(file_path: &str) -> Result<(), TelegramApiError> {
     Ok(())
 }
 
+/// Strip markdown decoration that is glued to URLs in outgoing Telegram text (mika#2126).
+///
+/// **Why this exists.** We send plain text — [`SendMessagePayload`] deliberately has no
+/// `parse_mode` (see the note there). The agent writes markdown because that is its
+/// default register, so `**https://…/mika**` reaches Telegram verbatim. Telegram's
+/// autolinker stops at whitespace, not at markdown, so it swallows the trailing
+/// asterisks into the link and the user lands on `…/mika**` → 404.
+///
+/// **Anchor.** The perimeter is *URLs*, not markdown rendering. Nothing happens to a
+/// message that carries no `http://` / `https://` scheme, and nothing happens to
+/// decoration that is not glued to a scheme-bearing token. A cleaner that rewrote
+/// healthy messages would have repaired nothing — it would have added a second way to
+/// break them.
+///
+/// **The rule**, in two passes:
+///
+/// 1. **Markdown links.** `[label](url)` where `url` starts with a scheme, has no
+///    whitespace and no nested brackets or parentheses → rewritten as `label : url`,
+///    so the URL ends the sequence and is bounded by whitespace. An empty label, or a
+///    label identical to the url, yields the bare url. Any other shape is left intact.
+/// 2. **Border decoration.** On each whitespace-delimited token that carries a scheme,
+///    remove at the borders:
+///    - `*` and `` ` `` — **unconditionally**. A real URL practically never ends in an
+///      asterisk, and a backtick would have to be percent-encoded anyway.
+///    - `_` and `~` — **only when paired**, i.e. when the same run borders both ends
+///      (`_url_`, `~~url~~`). Both are legal URL characters, so a lone trailing `_`
+///      (`…/foo_`) is part of the URL and stays.
+///
+/// **The ambiguity is irreducible, and it is the whole reason for the bug.** `*`, `_`
+/// and `~` are legal in a URL (`*` is a sub-delimiter, `_` and `~` are unreserved), so
+/// no URL grammar can tell `…/mika**` (URL + decoration) from `…/mika**` (a URL that
+/// genuinely ends in two asterisks) — which is precisely why Telegram's autolinker
+/// gets it wrong too. No algorithm here can be both complete and safe; this one
+/// chooses safe.
+///
+/// **Named residual risk.** `_texte https://url_` — italics wrapped around a whole
+/// phrase — leaves a `_` glued, because the run is not paired at the *token* level.
+/// Accepted: the observed and overwhelmingly common shape is `**url**`, covered
+/// unconditionally. Widening this would require a real markdown parser, which is
+/// exactly what "out of scope" rules out.
+///
+/// **Infallible by construction.** No `Result`, no `unwrap`, no panic, no raw byte
+/// indexing (all slicing is over `Vec<char>`, never `&text[i..j]`). A cleaner that
+/// could fail could block a send, and a message that never arrives is strictly worse
+/// than a broken link — that is the defect for which the MarkdownV2 route was rejected.
+fn strip_markdown_around_urls(text: &str) -> String {
+    if !text.contains("http://") && !text.contains("https://") {
+        return text.to_string();
+    }
+    strip_border_decoration(&rewrite_markdown_links(text))
+}
+
+/// Pass 1 of [`strip_markdown_around_urls`]: rewrite `[label](url)` as `label : url`.
+fn rewrite_markdown_links(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '['
+            && let Some((label, url, next)) = parse_markdown_link(&chars, i)
+        {
+            if label.is_empty() || label == url {
+                out.push_str(&url);
+            } else {
+                out.push_str(&label);
+                out.push_str(" : ");
+                out.push_str(&url);
+            }
+            i = next;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Parse `[label](url)` starting at `open` (which must be `[`).
+///
+/// Returns `(label, url, index just past the closing paren)`, or `None` for any shape
+/// that is not an unambiguous scheme-bearing link — nesting, whitespace in the url, a
+/// relative target. Refusing is always safe here; rewriting a shape we misread is not.
+fn parse_markdown_link(chars: &[char], open: usize) -> Option<(String, String, usize)> {
+    let label_start = open + 1;
+    let mut close_bracket = None;
+    for (i, c) in chars.iter().enumerate().skip(label_start) {
+        match c {
+            '[' => return None, // nested bracket — refuse
+            ']' => {
+                close_bracket = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let close_bracket = close_bracket?;
+    if chars.get(close_bracket + 1) != Some(&'(') {
+        return None;
+    }
+
+    let url_start = close_bracket + 2;
+    let mut close_paren = None;
+    for (i, c) in chars.iter().enumerate().skip(url_start) {
+        match c {
+            '(' => return None, // nested paren — refuse
+            ')' => {
+                close_paren = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let close_paren = close_paren?;
+
+    let url: String = chars[url_start..close_paren].iter().collect();
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return None;
+    }
+    if url
+        .chars()
+        .any(|c| c.is_whitespace() || c == '[' || c == ']')
+    {
+        return None;
+    }
+
+    let label: String = chars[label_start..close_bracket].iter().collect();
+    Some((label, url, close_paren + 1))
+}
+
+/// Pass 2 of [`strip_markdown_around_urls`]: strip border decoration from every
+/// whitespace-delimited token that carries a scheme.
+///
+/// Whitespace is copied through verbatim, character by character, so a message with
+/// nothing to clean comes out byte-for-byte identical (AC3).
+fn strip_border_decoration(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_whitespace() {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        out.push_str(&strip_token_borders(&chars[start..i]));
+    }
+    out
+}
+
+/// Strip decoration from the borders of one token, per pass 2 of the rule.
+///
+/// Loops to a fixed point so nesting resolves in either order (`**_url_**` and
+/// `_**url**_` both unwrap). Termination is guaranteed: each round either removes at
+/// least one character or stops.
+fn strip_token_borders(token: &[char]) -> String {
+    if !token.contains(&':') {
+        return token.iter().collect();
+    }
+    let flat: String = token.iter().collect();
+    if !flat.contains("http://") && !flat.contains("https://") {
+        return flat;
+    }
+
+    let mut t: Vec<char> = token.to_vec();
+    loop {
+        let before = t.len();
+
+        // `*` and backtick: unconditional at both borders.
+        while matches!(t.first(), Some('*' | '`')) {
+            t.remove(0);
+        }
+        while matches!(t.last(), Some('*' | '`')) {
+            t.pop();
+        }
+
+        // `_` and `~`: only when the same run borders both ends.
+        for marker in ['_', '~'] {
+            let lead = t.iter().take_while(|c| **c == marker).count();
+            let trail = t.iter().rev().take_while(|c| **c == marker).count();
+            let n = lead.min(trail);
+            if n > 0 && lead + trail <= t.len() {
+                t.drain(0..n);
+                t.truncate(t.len() - n);
+            }
+        }
+
+        if t.len() == before {
+            break;
+        }
+    }
+    t.iter().collect()
+}
+
 /// Send a text message to a chat via the Telegram Bot API.
 /// Shared implementation for both client types. Returns the Telegram message_id on success.
 async fn send_message_impl(
@@ -371,9 +587,32 @@ async fn send_message_impl(
     chat_id: i64,
     text: &str,
 ) -> Result<i64, TelegramApiError> {
+    // Single emission point (mika#2126): every present and future caller inherits the
+    // cleaning here, so no individual call site has to remember it.
+    let cleaned = strip_markdown_around_urls(text);
+    if cleaned != text {
+        // Metrics only — never the message body (user data). Without this counter,
+        // "the rule stopped firing because the agent stopped decorating" and "the rule
+        // stopped matching" look identical from the gateway. `url_tokens` counts the
+        // scheme-bearing tokens the rule acted on in the incoming text; keeping
+        // `strip_markdown_around_urls` at its pinned infallible `-> String` signature
+        // is worth more than an exact touched-count.
+        let url_tokens = text
+            .split_whitespace()
+            .filter(|t| t.contains("http://") || t.contains("https://"))
+            .count();
+        debug!(
+            chat_id,
+            len_before = text.len(),
+            len_after = cleaned.len(),
+            url_tokens,
+            "stripped markdown decoration glued to outbound URL(s)"
+        );
+    }
+
     let payload = SendMessagePayload {
         chat_id,
-        text: text.to_string(),
+        text: cleaned,
     };
 
     let resp = client
@@ -1479,5 +1718,211 @@ mod tests {
         let debug = format!("{client:?}");
         assert!(!debug.contains("ABC-DEF"));
         assert!(debug.contains("[REDACTED]"));
+    }
+
+    // -- strip_markdown_around_urls tests (mika#2126) --
+    //
+    // AC2 is a test of EFFECT, not of form: every positive case asserts on the URL
+    // *as Telegram's autolinker would hand it to the user* — the whitespace-delimited
+    // token carrying the scheme — and requires it to parse as a well-formed URL.
+    // Asserting on the whole message would pass even if the URL stayed broken.
+
+    /// The URL a Telegram user would actually click: the first whitespace-delimited
+    /// token carrying an http(s) scheme. Telegram's autolinker stops at whitespace,
+    /// which is exactly why glued decoration ends up inside the link.
+    fn clicked_url(text: &str) -> String {
+        text.split_whitespace()
+            .find(|t| t.contains("http://") || t.contains("https://"))
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Assert the clicked URL of the cleaned message is exactly `expected` AND is a
+    /// well-formed absolute URL (R2/AC2).
+    fn assert_clicked_url(input: &str, expected: &str) {
+        let cleaned = strip_markdown_around_urls(input);
+        let clicked = clicked_url(&cleaned);
+        assert_eq!(
+            clicked, expected,
+            "clicked URL mismatch for input {input:?} (cleaned: {cleaned:?})"
+        );
+        url::Url::parse(&clicked)
+            .unwrap_or_else(|e| panic!("clicked URL {clicked:?} is not well-formed: {e}"));
+    }
+
+    /// AC4 — frozen fixture of the reported case. Vincent via Al, 2026-09-01 12:03:
+    /// the agent sent `**https://github.com/senara-solutions/mika**`, Telegram absorbed
+    /// the trailing asterisks into the link, and `/mika**` returned 404 (`/mika` → 200).
+    /// If this test stops failing when the cleaning is removed, it is testing nothing.
+    #[test]
+    fn test_strip_markdown_mika_2126_reported_case_bold_repo_url() {
+        assert_clicked_url(
+            "**https://github.com/senara-solutions/mika**",
+            "https://github.com/senara-solutions/mika",
+        );
+    }
+
+    // -- Positives: decoration glued to the URL is removed --
+
+    #[test]
+    fn test_strip_markdown_bold_url() {
+        assert_clicked_url("**https://example.com/a**", "https://example.com/a");
+    }
+
+    #[test]
+    fn test_strip_markdown_italic_url() {
+        assert_clicked_url("_https://example.com/a_", "https://example.com/a");
+    }
+
+    #[test]
+    fn test_strip_markdown_backticked_url() {
+        assert_clicked_url("`https://example.com/a`", "https://example.com/a");
+    }
+
+    #[test]
+    fn test_strip_markdown_strikethrough_url() {
+        assert_clicked_url("~~https://example.com/a~~", "https://example.com/a");
+    }
+
+    #[test]
+    fn test_strip_markdown_bold_url_inside_sentence() {
+        assert_clicked_url(
+            "Le dépôt est **https://example.com/a** si tu veux voir.",
+            "https://example.com/a",
+        );
+    }
+
+    #[test]
+    fn test_strip_markdown_link_becomes_label_then_bare_url() {
+        let cleaned = strip_markdown_around_urls("[le dépôt](https://example.com/a)");
+        assert_eq!(cleaned, "le dépôt : https://example.com/a");
+        assert_clicked_url("[le dépôt](https://example.com/a)", "https://example.com/a");
+    }
+
+    #[test]
+    fn test_strip_markdown_link_with_label_equal_to_url_keeps_url_only() {
+        let cleaned = strip_markdown_around_urls("[https://example.com/a](https://example.com/a)");
+        assert_eq!(cleaned, "https://example.com/a");
+    }
+
+    #[test]
+    fn test_strip_markdown_link_with_empty_label_keeps_url_only() {
+        let cleaned = strip_markdown_around_urls("[](https://example.com/a)");
+        assert_eq!(cleaned, "https://example.com/a");
+    }
+
+    #[test]
+    fn test_strip_markdown_bold_markdown_link_is_fully_unwrapped() {
+        assert_clicked_url(
+            "**[le dépôt](https://example.com/a)**",
+            "https://example.com/a",
+        );
+    }
+
+    #[test]
+    fn test_strip_markdown_http_scheme_is_covered_too() {
+        assert_clicked_url("**http://example.com/a**", "http://example.com/a");
+    }
+
+    #[test]
+    fn test_strip_markdown_two_decorated_urls_in_one_message() {
+        let cleaned =
+            strip_markdown_around_urls("Voir **https://example.com/a** et `https://example.com/b`");
+        assert_eq!(
+            cleaned,
+            "Voir https://example.com/a et https://example.com/b"
+        );
+    }
+
+    // -- Negatives (AC3): a healthy message passes byte-for-byte unchanged --
+    //
+    // A fix that rewrites correct URLs has repaired nothing: it has added a second
+    // way to break them. Each of these asserts `out == input`, not merely "looks ok".
+
+    #[test]
+    fn test_strip_markdown_bare_url_unchanged() {
+        let input = "Va voir https://example.com/a";
+        assert_eq!(strip_markdown_around_urls(input), input);
+    }
+
+    #[test]
+    fn test_strip_markdown_url_ending_in_underscore_unchanged() {
+        // `_` is a legal unreserved URL character. An unpaired trailing one is part
+        // of the URL, not decoration (KTD3).
+        let input = "https://example.com/path_with_underscore_";
+        assert_eq!(strip_markdown_around_urls(input), input);
+    }
+
+    #[test]
+    fn test_strip_markdown_url_containing_tilde_unchanged() {
+        let input = "https://example.com/~vincent";
+        assert_eq!(strip_markdown_around_urls(input), input);
+    }
+
+    #[test]
+    fn test_strip_markdown_url_followed_by_sentence_period_unchanged() {
+        // A period is sentence punctuation, not a markdown marker.
+        let input = "Voir https://example.com/a.";
+        assert_eq!(strip_markdown_around_urls(input), input);
+    }
+
+    #[test]
+    fn test_strip_markdown_hostname_without_scheme_unchanged() {
+        // Real case: OFFLINE_ERROR_MSG (routes.rs) carries `console.getmika.ai` with
+        // no scheme, so it sits outside the rule's anchor entirely.
+        let input = "Réessaie plus tard, ou passe par console.getmika.ai.";
+        assert_eq!(strip_markdown_around_urls(input), input);
+    }
+
+    #[test]
+    fn test_strip_markdown_message_without_url_unchanged() {
+        let input = "Bonjour Sonia 🌸";
+        assert_eq!(strip_markdown_around_urls(input), input);
+    }
+
+    #[test]
+    fn test_strip_markdown_bold_text_without_url_unchanged() {
+        // Out of scope on purpose: the perimeter is URLs, not markdown rendering (AC3).
+        let input = "C'est **important** de le savoir.";
+        assert_eq!(strip_markdown_around_urls(input), input);
+    }
+
+    #[test]
+    fn test_strip_markdown_preserves_exact_whitespace_and_newlines() {
+        let input = "Ligne un\n\n  Va voir  https://example.com/a\tfin";
+        assert_eq!(strip_markdown_around_urls(input), input);
+    }
+
+    #[test]
+    fn test_strip_markdown_empty_string_unchanged() {
+        assert_eq!(strip_markdown_around_urls(""), "");
+    }
+
+    #[test]
+    fn test_strip_markdown_non_url_markdown_link_unchanged() {
+        // Not anchored on a scheme → left intact (conservatism = AC3 safety).
+        let input = "[le dépôt](/relatif/a)";
+        assert_eq!(strip_markdown_around_urls(input), input);
+    }
+
+    #[test]
+    fn test_strip_markdown_link_with_space_in_url_unchanged() {
+        let input = "[x](https://example.com/a b)";
+        assert_eq!(strip_markdown_around_urls(input), input);
+    }
+
+    #[test]
+    fn test_strip_markdown_multibyte_text_around_url_unchanged() {
+        // KTD6: no raw byte indexing — this must not panic on a UTF-8 boundary.
+        let input = "Éh 🌸 https://example.com/été — ça va ?";
+        assert_eq!(strip_markdown_around_urls(input), input);
+    }
+
+    #[test]
+    fn test_strip_markdown_multibyte_text_around_decorated_url() {
+        assert_clicked_url(
+            "Éh 🌸 **https://example.com/a** — ça va ?",
+            "https://example.com/a",
+        );
     }
 }
