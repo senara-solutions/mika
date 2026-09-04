@@ -7179,7 +7179,7 @@ impl Database {
     /// narrows to `('in_progress','blocked')` only — `pending` is deferred to
     /// the mika#1934 cause-racine investigation. Rationale: `pending` is the
     /// default initial state of every tracking task from `create_task`, and
-    /// sweeping it at the 3600s grace would false-positive on any newly-created
+    /// sweeping it at the default grace would false-positive on any newly-created
     /// tracking row the agent hasn't yet transitioned. `in_progress` and
     /// `blocked` are the "started but abandoned" states where the phantom
     /// signal is unambiguous. If mika#1934's telemetry shows `pending` phantoms
@@ -7190,7 +7190,7 @@ impl Database {
     /// second the WHERE clause evaluates is still selected — SQLite's
     /// `strftime('%Y-%m-%dT%H:%M:%SZ', ...)` truncates to seconds, and a `<`
     /// would silently miss same-second injections. `<=` is safe for the AC3
-    /// path too: the 3600s default grace has 1-second slack to spare, and a
+    /// path too: the default grace has 1-second slack to spare, and a
     /// row updated exactly at "now - grace" being caught 1s early is
     /// behaviorally identical to being caught 1s later.
     ///
@@ -7199,6 +7199,13 @@ impl Database {
     /// [`super::task_engine::engine::TaskEngine::sweep_null_pid_phantoms`]
     /// (AC3 watchdog) and the equivalent step inside
     /// [`super::task_engine::engine::TaskEngine::startup_recovery`] (AC5).
+    ///
+    /// Candidates, not verdicts (mika#2156). Both callers run each row past a
+    /// liveness guard — `TaskEngine::live_dispatch_child`, backed by
+    /// [`Self::find_dispatch_children_with_pid`] — before writing the failure,
+    /// because a PID's liveness is not expressible in SQL. Age alone cannot
+    /// tell an orphaned tracking row from one whose dispatch is still running:
+    /// the row's `updated_at` is never bumped while the work proceeds.
     pub fn find_phantom_tracking_tasks(
         &self,
         agent_id: &str,
@@ -7224,6 +7231,73 @@ impl Database {
                     status: row.get(3)?,
                     created_at: row.get(4)?,
                     updated_at: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The dispatch children of a tracking row that carry a `process_id`.
+    ///
+    /// Companion to [`Self::find_phantom_tracking_tasks`] (mika#2156), placed
+    /// next to it so a reader meets the guard where they meet the query it
+    /// guards. The sweep query cannot tell "orphaned tracking row" from
+    /// "tracking row whose dispatch is still running": its three non-temporal
+    /// criteria (`action_type='none'`, `process_id IS NULL`,
+    /// `status IN ('in_progress','blocked')`) are satisfied *by construction*
+    /// for every healthy tracking row, because the real process lives on a
+    /// separate `long_running:*` recall row. That recall row already points
+    /// back via `parent_task_id` — the missing link is read here, not added.
+    ///
+    /// Deliberately does NOT filter on the child's status. Per plan mika#2156
+    /// D-2: 1146 of the 1147 PID-carrying children measured in production are
+    /// `delivered`, and nothing in the code proves `delivered` implies a dead
+    /// process. Treating the child's status as the discriminator would disarm
+    /// the sweeper on 98% of its historical population (measure M2). Liveness
+    /// is the discriminator; the caller applies it.
+    ///
+    /// `process_start_time` is extracted from `metadata` JSON, where the
+    /// executor writes it as a *string* (see `skills/executor.rs`). Rows
+    /// without it come back as `None` — the caller sweeps them (D-3).
+    pub fn find_dispatch_children_with_pid(
+        &self,
+        parent_task_id: &str,
+    ) -> Result<Vec<DispatchChild>> {
+        let mut stmt = self.conn.prepare(
+            // `json_valid` guard is load-bearing, not belt-and-braces:
+            // SQLite's `json_extract` raises a hard "malformed JSON" error
+            // (not NULL) on a non-JSON `metadata`, and that error propagates
+            // out of the whole `query_map`. Without the guard, ONE bad sibling
+            // row would fail the lookup for the entire parent — and the caller
+            // would then have no answer about a parent whose OTHER child may
+            // be alive. Wrapped, a malformed row degrades to NULL and only
+            // that child stops being able to spare (plan mika#2156 D-3).
+            "SELECT id,
+                    process_id,
+                    CASE WHEN json_valid(metadata)
+                         THEN json_extract(metadata, '$.process_start_time')
+                    END
+             FROM tasks
+             WHERE parent_task_id = ?1
+               AND process_id IS NOT NULL
+             ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map(params![parent_task_id], |row| {
+                // The executor writes process_start_time as a JSON *string*,
+                // but accept an integer too so a hand-written or future-shaped
+                // metadata row is not silently treated as missing. Anything
+                // else (NULL, malformed, negative) degrades to None — the
+                // caller then sweeps (D-3), which is the pre-fix behaviour.
+                let start_time = match row.get::<_, rusqlite::types::Value>(2)? {
+                    rusqlite::types::Value::Text(t) => t.parse::<u64>().ok(),
+                    rusqlite::types::Value::Integer(i) => u64::try_from(i).ok(),
+                    _ => None,
+                };
+                Ok(DispatchChild {
+                    id: row.get(0)?,
+                    process_id: row.get(1)?,
+                    process_start_time: start_time,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -7257,6 +7331,24 @@ impl Database {
             "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
              WHERE id = ?1",
             params![task_id, format!("-{seconds_ago} seconds")],
+        )?;
+        Ok(())
+    }
+
+    /// Test-only helper: rewrite a task's primary key.
+    ///
+    /// `find_dispatch_children_with_pid` orders by `id`, and `create_task`
+    /// generates a UUIDv4 — so a mika#2156 test that needs a *specific*
+    /// examination order (a dead child examined before a live one) cannot get
+    /// it from insertion order. Forcing the ids is what makes that test
+    /// deterministic, and therefore what makes its injection check mean
+    /// something. Safe only for a leaf row: nothing here rewrites the
+    /// `parent_task_id` of any grandchild. Not for production use.
+    #[doc(hidden)]
+    pub fn set_task_id_for_test(&self, old_id: &str, new_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET id = ?2 WHERE id = ?1",
+            params![old_id, new_id],
         )?;
         Ok(())
     }
@@ -15570,6 +15662,238 @@ mod tests {
             )
             .unwrap();
         id
+    }
+
+    // -- find_dispatch_children_with_pid tests (mika#2156) --
+
+    /// Insert a recall child under `parent_id` carrying `process_id`, and
+    /// optionally the `metadata.process_start_time` string the executor writes.
+    fn create_recall_child(
+        db: &Database,
+        agent_id: &str,
+        parent_id: &str,
+        label: &str,
+        process_id: Option<i64>,
+        start_time: Option<&str>,
+    ) -> String {
+        let mut task = new_task(agent_id, label, "manual", "resume_agent");
+        task.parent_task_id = Some(parent_id.to_string());
+        let id = db.create_task(&task).unwrap();
+        if let Some(pid) = process_id {
+            db.set_task_process_id(&id, Some(pid)).unwrap();
+        }
+        if let Some(st) = start_time {
+            db.set_task_metadata_field(&id, "process_start_time", st)
+                .unwrap();
+        }
+        id
+    }
+
+    #[test]
+    fn test_find_dispatch_children_with_pid_ignores_pidless_children() {
+        let db = db();
+        // Accented label: this repo's real tracking rows are written in
+        // French, so the fixture exercises the population we actually have.
+        let parent = create_phantom_tracking_row(
+            &db,
+            "mika",
+            "ready-label: mika#2156 — suivi différé",
+            "in_progress",
+            7200,
+        );
+        create_recall_child(&db, "mika", &parent, "note sans procédé", None, None);
+        let with_pid = create_recall_child(
+            &db,
+            "mika",
+            &parent,
+            "long_running:run_claude_pilot",
+            Some(365_667),
+            Some("52755192"),
+        );
+
+        let children = db.find_dispatch_children_with_pid(&parent).unwrap();
+        assert_eq!(
+            children.len(),
+            1,
+            "only the PID-carrying child is a liveness candidate"
+        );
+        assert_eq!(children[0].id, with_pid);
+        assert_eq!(children[0].process_id, 365_667);
+        assert_eq!(
+            children[0].process_start_time,
+            Some(52_755_192),
+            "the executor stores start_time as a JSON string — it must parse back to a number"
+        );
+    }
+
+    #[test]
+    fn test_find_dispatch_children_with_pid_start_time_absent_is_none() {
+        let db = db();
+        let parent = create_phantom_tracking_row(
+            &db,
+            "mika",
+            "ready-label: mika#2156 — rappel sans horodatage",
+            "in_progress",
+            7200,
+        );
+        create_recall_child(
+            &db,
+            "mika",
+            &parent,
+            "long_running:run_claude_pilot",
+            Some(4242),
+            None,
+        );
+
+        let children = db.find_dispatch_children_with_pid(&parent).unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(
+            children[0].process_start_time, None,
+            "a missing start_time must surface as None so the caller sweeps (D-3), \
+             never as a value that would make a recycled PID read as alive"
+        );
+    }
+
+    #[test]
+    fn test_find_dispatch_children_with_pid_start_time_value_shapes() {
+        let db = db();
+        let parent = create_phantom_tracking_row(
+            &db,
+            "mika",
+            "ready-label: mika#2156 — formes de métadonnées",
+            "in_progress",
+            7200,
+        );
+
+        // The executor writes a string; the integer arm exists so a
+        // hand-written or future-shaped row is not silently treated as
+        // missing. Both must parse.
+        let as_text = create_recall_child(
+            &db,
+            "mika",
+            &parent,
+            "long_running: chaîne",
+            Some(101),
+            Some("52755192"),
+        );
+        let as_int = create_recall_child(
+            &db,
+            "mika",
+            &parent,
+            "long_running: entier",
+            Some(102),
+            None,
+        );
+        db.conn
+            .execute(
+                "UPDATE tasks SET metadata = json('{\"process_start_time\": 52755192}') WHERE id = ?1",
+                params![as_int],
+            )
+            .unwrap();
+        // Garbage and negatives must degrade to None, never to a number.
+        let as_garbage = create_recall_child(
+            &db,
+            "mika",
+            &parent,
+            "long_running: pas un nombre",
+            Some(103),
+            Some("pas-un-nombre"),
+        );
+        let as_negative = create_recall_child(
+            &db,
+            "mika",
+            &parent,
+            "long_running: négatif",
+            Some(104),
+            None,
+        );
+        db.conn
+            .execute(
+                "UPDATE tasks SET metadata = json('{\"process_start_time\": -1}') WHERE id = ?1",
+                params![as_negative],
+            )
+            .unwrap();
+
+        let children = db.find_dispatch_children_with_pid(&parent).unwrap();
+        let got = |id: &str| {
+            children
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("child {id} missing"))
+                .process_start_time
+        };
+        assert_eq!(got(&as_text), Some(52_755_192), "string form must parse");
+        assert_eq!(got(&as_int), Some(52_755_192), "integer form must parse");
+        assert_eq!(got(&as_garbage), None, "non-numeric must degrade to None");
+        assert_eq!(got(&as_negative), None, "negative must degrade to None");
+    }
+
+    #[test]
+    fn test_find_dispatch_children_with_pid_survives_malformed_metadata_sibling() {
+        let db = db();
+        let parent = create_phantom_tracking_row(
+            &db,
+            "mika",
+            "ready-label: mika#2156 — un frère au JSON cassé",
+            "in_progress",
+            7200,
+        );
+        let broken =
+            create_recall_child(&db, "mika", &parent, "long_running: cassé", Some(201), None);
+        // Not JSON at all. SQLite's json_extract raises a hard error on this,
+        // which without the json_valid guard would fail the lookup for the
+        // WHOLE parent — and the caller would then have no answer about a
+        // parent whose other child is alive. Removing the CASE WHEN
+        // json_valid(...) wrapper in find_dispatch_children_with_pid turns
+        // this test red.
+        db.conn
+            .execute(
+                "UPDATE tasks SET metadata = 'pas du json' WHERE id = ?1",
+                params![broken],
+            )
+            .unwrap();
+        let healthy = create_recall_child(
+            &db,
+            "mika",
+            &parent,
+            "long_running: sain",
+            Some(202),
+            Some("52755192"),
+        );
+
+        let children = db
+            .find_dispatch_children_with_pid(&parent)
+            .expect("one malformed sibling must not fail the whole lookup");
+        assert_eq!(children.len(), 2);
+        let healthy_row = children.iter().find(|c| c.id == healthy).unwrap();
+        assert_eq!(
+            healthy_row.process_start_time,
+            Some(52_755_192),
+            "the healthy sibling must still be readable"
+        );
+        let broken_row = children.iter().find(|c| c.id == broken).unwrap();
+        assert_eq!(
+            broken_row.process_start_time, None,
+            "only the malformed row degrades — it simply cannot spare (D-3)"
+        );
+    }
+
+    #[test]
+    fn test_find_dispatch_children_with_pid_no_children_is_empty() {
+        let db = db();
+        let parent = create_phantom_tracking_row(
+            &db,
+            "mika",
+            "ready-label: mika#2140 — fiche vraiment orpheline",
+            "in_progress",
+            7200,
+        );
+        assert!(
+            db.find_dispatch_children_with_pid(&parent)
+                .unwrap()
+                .is_empty(),
+            "a genuine orphan has no dispatch child — the sweeper's reason to exist"
+        );
     }
 
     #[test]
