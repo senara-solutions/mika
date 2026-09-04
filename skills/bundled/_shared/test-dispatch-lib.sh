@@ -1290,6 +1290,99 @@ test_groom_gate_declines_on_directory_candidate() {
     fi
 }
 
+# ----------------------------------------------------------------------------
+# mika#2158 — le croisement contractuel Rust ↔ Bash (AC7)
+# ----------------------------------------------------------------------------
+#
+# Trois composants répondent à « ce ticket est-il groomé ? » : `is_groomed`
+# (promotion, Rust), `check_grooming_markers` (routage du dispatch, Rust) et
+# cette garde (refus, Bash). Les deux premiers sont croisés entre eux dans
+# `grooming_marker::tests::ac7_both_rust_predicates_agree_on_the_frozen_bodies`.
+# Le troisième ne peut pas l'être au même endroit : il mesure un artefact git
+# que le Rust ne peut pas évaluer sans I/O.
+#
+# Le croisement testable est donc unidirectionnel, et c'est celui qui compte :
+#
+#     si la garde refuse pour `already_groomed`, alors le Rust doit dire groomé.
+#
+# C'est exactement l'implication qui était fausse avant mika#2158, et c'est ce
+# qui faisait le livelock : la garde refusait le grooming de #2108/#2127 parce
+# que leur plan était sur la branche, pendant que le Rust les déclarait non
+# groomés et les redemandait en grooming toutes les dix minutes. Douze refus en
+# trois heures et demie, sans qu'aucun état ne change entre deux tours.
+#
+# L'implication INVERSE n'est pas vraie et ne doit pas être testée : un ticket
+# peut être groomé et son plan absent de la branche (jamais poussé), et c'est le
+# cas que la branche `elif` du site d'appel traite déjà.
+#
+# La moitié Rust est vérifiée ici structurellement, pas paraphrasée : le test
+# échoue si la fixture n'est plus dans la table Rust. Retirer `2108.md` de
+# `grooming_marker.rs` casse ce test — ce qui est le point.
+GROOMING_FIXTURE_DIR="$SCRIPT_DIR/../../../crates/mika-agent/tests/fixtures/grooming_bodies"
+GROOMING_MARKER_RS="$SCRIPT_DIR/../../../crates/mika-agent/src/grooming_marker.rs"
+
+test_groom_gate_refusal_implies_rust_says_groomed() {
+    local ticket fixture body plan_path branch rc out problems=""
+
+    if [ ! -d "$GROOMING_FIXTURE_DIR" ]; then
+        echo "FAIL: fixture dir absent: $GROOMING_FIXTURE_DIR"
+        return 0
+    fi
+    if [ ! -f "$GROOMING_MARKER_RS" ]; then
+        echo "FAIL: grooming_marker.rs absent: $GROOMING_MARKER_RS"
+        return 0
+    fi
+
+    # Les deux corps que la garde refusait pendant que le Rust les redemandait :
+    # #2108 (première passe READY, AC1) et #2127 (GROOMED après arbitrage, AC3).
+    for ticket in 2108 2127; do
+        fixture="$GROOMING_FIXTURE_DIR/$ticket.md"
+        if [ ! -f "$fixture" ]; then
+            problems="$problems; fixture $ticket.md absente"
+            continue
+        fi
+        # Moitié Rust : la fixture doit être dans la table du module.
+        if ! grep -qF "grooming_bodies/$ticket.md" "$GROOMING_MARKER_RS"; then
+            problems="$problems; $ticket.md n'est plus dans la table Rust de grooming_marker.rs"
+            continue
+        fi
+
+        body=$(cat "$fixture")
+        plan_path=$(printf '%s\n' "$body" \
+            | sed -n 's/^> - \*\*Plan:\*\* *`\([^`]*\)`.*/\1/p' | head -1)
+        branch=$(printf '%s\n' "$body" \
+            | sed -n 's/^> - \*\*Branch:\*\* *`\([^`]*\)`.*/\1/p' | head -1)
+        if [ -z "$plan_path" ] || [ -z "$branch" ]; then
+            problems="$problems; $ticket.md ne porte pas les callouts Branch/Plan"
+            continue
+        fi
+
+        _fixture_setup
+        _assert_fixture_is_local || return 1
+
+        git -C "$FIXTURE_CLONE" checkout -q -b "$branch"
+        mkdir -p "$FIXTURE_CLONE/$(dirname "$plan_path")"
+        printf '# Plan — mika#%s\n' "$ticket" > "$FIXTURE_CLONE/$plan_path"
+        git -C "$FIXTURE_CLONE" add "$plan_path"
+        git -C "$FIXTURE_CLONE" commit -q -m "commit plan for $ticket"
+        git -C "$FIXTURE_CLONE" push -q origin "$branch"
+
+        rc=0
+        out=$(_committed_plan_on_branch "$FIXTURE_CLONE" "$branch" "$body" "mika" "$ticket" 2>/dev/null) || rc=$?
+        _fixture_cleanup
+
+        if [ "$rc" -ne 0 ] || [ "$out" != "$plan_path" ]; then
+            problems="$problems; $ticket: la garde n'a pas refusé (rc=$rc out='$out', attendu '$plan_path')"
+        fi
+    done
+
+    if [ -z "$problems" ]; then
+        echo "PASS"
+    else
+        echo "FAIL${problems}"
+    fi
+}
+
 # Code-shape: the binding must not be quietly dropped by a later edit. The gate
 # is the only thing standing between a false body callout and a permanent
 # strand, so its call to the refutation helper is an assertion of its own.
@@ -3518,7 +3611,8 @@ for gate_case in \
     "test_groom_gate_plan_without_issue_marker_still_fires|mika#2034: plan with no issue marker → gate still fires" \
     "test_groom_gate_issue_arg_is_optional|mika#2034: the 5th argument is optional" \
     "test_plan_provenance_distinguishes_inherited_from_committed|mika#2034: provenance separates inherited from committed" \
-    "test_groom_gate_declines_on_directory_candidate|mika#2034: callout naming a directory → gate does NOT fire"
+    "test_groom_gate_declines_on_directory_candidate|mika#2034: callout naming a directory → gate does NOT fire" \
+    "test_groom_gate_refusal_implies_rust_says_groomed|mika#2158 AC7: la garde refuse ⇒ le Rust dit groomé (six corps figés)"
 do
     gate_fn="${gate_case%%|*}"
     gate_label="${gate_case#*|}"
