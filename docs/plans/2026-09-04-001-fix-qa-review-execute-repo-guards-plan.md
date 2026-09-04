@@ -74,6 +74,29 @@ Resynchroniser la prose corrigerait les quatre écarts d'aujourd'hui et rouvrira
 classe au prochain changement de garde. Exécuter le script la ferme : un script ne peut
 pas diverger de lui-même.
 
+## Fire-Disposition
+
+Ce plan installe un détecteur — la QA exécute désormais des gardes qui peuvent rejeter. La
+disposition de chaque tir est fixée **ici, avant l'implémentation**, pour qu'aucun échec ne
+se règle par jugement au moment où il survient.
+
+| Ce qui tire | Disposition |
+|---|---|
+| Une garde rejette (exit ≠ 0) sur une PR | **halt-and-surface** : `VERDICT: block[pipeline]`, sortie de la garde citée verbatim avec son chemin et son code de sortie (AC6). C'est le fonctionnement nominal, pas un incident. |
+| Une garde rejette en `docs-only` alors que l'issue liée porte `documentation` | **halt-and-surface dégradé** : `hold[review]`, cause nommée (D4). Le seul chemin d'exemption non reproductible hors CI. |
+| Le worktree jetable ne peut être créé (verrou, disque, fetch échoué) | **halt-and-surface** : `hold[review]` — « garde non exécutée : \<erreur\> ». **Jamais `pass`.** Une garde qu'on n'a pas pu exécuter n'est pas une garde qui passe ; c'est la règle fail-closed déjà posée pour la requête Advisory (D-step 6 du flux Dependabot). |
+| Une garde dépasse le budget `run_shell` de 30 s | Idem : `hold[review]`, jamais `pass`. |
+| Aucune garde trouvée dans le dépôt | `PIPELINE: not-applicable` + liste des chemins cherchés (D5). **Non bloquant** — une absence de garde n'est pas une violation. |
+| Un test de non-régression échoue à l'implémentation | **halt-and-surface, sans exception** : régression bloquante. Ni allowlist, ni « land disabled ». |
+
+**Aucune exception d'allowlist n'est prévue, et aucune PR préexistante n'est exemptée.** Le
+détecteur installé ici n'est pas une nouvelle règle : c'est la règle que la CI de chaque
+dépôt applique déjà. Une PR que ce détecteur rejette est une PR que sa propre CI rejette —
+il n'y a donc pas de population historique à protéger, et un « land disabled » ne
+protégerait rien qu'un vert de CI ne protège déjà.
+
+*Citation : mika#1574 (Fire-Disposition Gate).*
+
 ## Livrables
 
 ### D1 — Découverte des gardes du dépôt cible
@@ -232,6 +255,9 @@ Vérifié, ne pas supposer :
   ~7 Ko.
 
 ## Acceptance criteria
+
+Rattachement AC → livrable : AC1 → D1, D2, D5 · AC2 → D1, D3 · AC3 → D6, **D7** ·
+AC4 → D1, D6 · AC5 → D6, D7, D8 · AC6 → D6.
 
 - **AC1** — Le verdict pipeline est produit en exécutant les gardes découvertes dans le
   dépôt cible (D1), dans un worktree détaché sur la ref de la PR (D2), et le verdict est
