@@ -1109,15 +1109,41 @@ fn classify_stuck_ready(
         return verdict;
     }
 
-    // Progress: an open PR or a live dispatch means the re-drives worked. Both
-    // are already-computed filters, so the reset costs nothing extra (KTD5).
+    // Progress: an open PR means the re-drives worked. It is an already-computed
+    // filter, so the reset costs nothing extra (KTD5).
+    //
+    // A PR is **observable and external**: the dispatch cannot fabricate one. That is
+    // now the whole criterion, and it is why `in_flight` no longer resets below.
     if facts.has_open_pr {
         return StuckReadyVerdict::SkipAndResetBudget {
             reason: "open_pr_closing",
         };
     }
+    // A live dispatch is NOT progress (mika#2158 M6b — correction of a premise).
+    //
+    // This branch used to reset the budget too, justified by « an open PR or a live
+    // dispatch means the re-drives worked ». The second half of that sentence was
+    // measured false. A dispatch that is alive has not worked; it has merely started —
+    // and until mika#2158 the canonical outcome for these tickets was that it started,
+    // refused `already_groomed`, and left its tracking row to age ~60 min into
+    // `phantom_aged_out` without producing anything.
+    //
+    // For those ~60 min the ticket read `in_flight`, so every Phase 2 tick landed here
+    // and zeroed the counter. The budget did not bound the loop: the loop erased the
+    // budget. Measured on `~/.mika/data/mika.db` 2026-09-03 — after 31 re-drives on
+    // mika#1901's sibling #1772, `redrive_count` said 1, and `MAX_REDRIVES_DEFAULT` (3)
+    // had never once been reached. The guard was not too loose; it was unreachable.
+    //
+    // We still skip — waiting for a live dispatch to finish is right. We just stop
+    // calling the wait a success. With the counter now able to advance, a ticket that
+    // produces no PR is abandoned to the operator after `MAX_REDRIVES` rounds instead of
+    // turning forever; #1772 would have stopped at the third, not the thirty-first.
+    //
+    // If three rounds proves too tight for genuinely long work, the lever is
+    // `MIKA_AUTO_PULL_MAX_REDRIVES` (already an env var). It is not the return of this
+    // reset — a counter zeroed by the action it counts bounds nothing.
     if facts.in_flight {
-        return StuckReadyVerdict::SkipAndResetBudget {
+        return StuckReadyVerdict::Skip {
             reason: "in_flight_self_dev",
         };
     }
@@ -4308,7 +4334,7 @@ This ticket has been GROOMED and is ready.
     }
 
     #[test]
-    fn test_classify_progress_resets_budget() {
+    fn test_classify_only_an_open_pr_resets_the_budget() {
         let issue = make_issue(1, UNGROOMED_BODY, &["ready"], "t");
 
         let mut f = facts(2);
@@ -4317,16 +4343,58 @@ This ticket has been GROOMED and is ready.
             classify_stuck_ready(&issue, &f, 3),
             StuckReadyVerdict::SkipAndResetBudget {
                 reason: "open_pr_closing"
-            }
+            },
+            "an open PR is observable, external progress the dispatch cannot fabricate"
         );
 
+        // mika#2158 M6b — a live dispatch skips but no longer resets. It is the
+        // action the budget counts; letting it zero the counter made the guard
+        // unreachable (31 re-drives measured on #1772 with redrive_count = 1).
         let mut f = facts(2);
         f.in_flight = true;
         assert_eq!(
             classify_stuck_ready(&issue, &f, 3),
-            StuckReadyVerdict::SkipAndResetBudget {
+            StuckReadyVerdict::Skip {
                 reason: "in_flight_self_dev"
-            }
+            },
+            "a live dispatch has not worked, it has started"
+        );
+    }
+
+    /// mika#2158 AC8 — le garde-fou devient atteignable.
+    ///
+    /// Rejoue le cycle mesuré : un dispatch part, laisse le ticket `in_flight` pendant que
+    /// sa tâche de suivi vieillit, meurt sans rien produire, et le ticket redevient
+    /// « stuck ready ». Avant, chaque tour passé en vol remettait le compteur à zéro et le
+    /// tour d'après repartait de 0 — indéfiniment. Maintenant le compteur survit aux tours
+    /// en vol, donc il finit par buter sur le budget et le ticket part à l'opérateur.
+    #[test]
+    fn test_classify_budget_survives_in_flight_rounds_and_is_reachable() {
+        let issue = make_issue(1772, UNGROOMED_BODY, &["ready"], "t");
+
+        // Tours 1..3 : le dispatch est en vol. On saute — sans effacer le compteur.
+        for count in 1..=3 {
+            let mut f = facts(count);
+            f.in_flight = true;
+            assert_eq!(
+                classify_stuck_ready(&issue, &f, 3),
+                StuckReadyVerdict::Skip {
+                    reason: "in_flight_self_dev"
+                },
+                "round {count}: waiting is not progress"
+            );
+        }
+
+        // Le dispatch meurt sans PR ; le ticket redevient sélectionnable. Le compteur a
+        // survécu, donc le budget mord au lieu d'être hors d'atteinte.
+        let f = facts(3);
+        assert_eq!(
+            classify_stuck_ready(&issue, &f, 3),
+            StuckReadyVerdict::Abandon(AbandonReason::RedriveBudgetExhausted {
+                redrives: 3,
+                budget: 3
+            }),
+            "#1772 should have stopped at the third round, not the thirty-first"
         );
     }
 

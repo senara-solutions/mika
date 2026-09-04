@@ -437,6 +437,13 @@ impl TaskDispatcher {
             // depending on the LLM to fire the transition. Coupled pair with
             // `reap_orphaned_parent_tasks` (failure path).
             try_complete_parent_on_callback_success(&self.db, task).await;
+            // mika#2158 AC8: refusal-side sibling of the two above. A
+            // `dispatch-lib` auto-skip (canonically `already_groomed`) reached
+            // the engine and produced nothing — the pre-created tracking row
+            // aged ~60 min into `phantom_aged_out` while counting as `in_flight`
+            // and zeroing the auto-pull re-drive budget on every tick. Resolve
+            // it here, at the moment the refusal arrives.
+            try_resolve_parent_on_dispatch_refusal(&self.db, task).await;
             // mika#1289 / mika#1614: structural counterpart to the prompt-level
             // groom-success handler in self-dev-callback (PR #1291). When a groom
             // callback delivers with `Outcome: PLAN_GROOMED`, the engine spawns the
@@ -1918,6 +1925,155 @@ async fn try_complete_parent_on_callback_success(db: &AsyncDatabase, task: &Task
                 parent_task_id = %parent_id,
                 error = %e,
                 "engine: failed to auto-complete parent task on callback success"
+            );
+        }
+    }
+}
+
+/// The refusal reason carried by a `dispatch-lib` auto-skip callback, when the
+/// callback result is one (mika#2158 M6a).
+///
+/// `dispatch-lib` refuses a foreseeable condition with `_deliver_callback` + `exit 0`,
+/// shipping a JSON body of the shape `{"status":"auto_skipped","reason":"…", …}` as the
+/// callback text (`mika#988` exit semantics). Tolerant of surrounding text: strict parse
+/// first, then a first-`{`..last-`}` slice, because the callback transport is a message
+/// body and nothing structurally forbids a future prologue.
+fn parse_auto_skip_reason(result: &str) -> Option<String> {
+    fn reason_of(v: &serde_json::Value) -> Option<String> {
+        if v.get("status")?.as_str()? != "auto_skipped" {
+            return None;
+        }
+        Some(
+            v.get("reason")
+                .and_then(|r| r.as_str())
+                .unwrap_or("unspecified")
+                .to_string(),
+        )
+    }
+
+    let trimmed = result.trim();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && let Some(r) = reason_of(&v)
+    {
+        return Some(r);
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    let v = serde_json::from_str::<serde_json::Value>(&trimmed[start..=end]).ok()?;
+    reason_of(&v)
+}
+
+/// A dispatch refusal must produce an effect (mika#2158 AC8).
+///
+/// # Le défaut que ceci ferme
+///
+/// Quand `dispatch-lib` refuse un dispatch — canoniquement `already_groomed` : le plan du
+/// ticket est déjà committé sur la branche, le re-groomer bouclerait — le refus arrivait au
+/// moteur et n'y produisait rien. La ligne `tasks` pré-créée par `ready_label_handler`
+/// restait `in_progress` jusqu'à ce que le balayage phantom (mika#1712) la passe `failed`
+/// une heure plus tard. Mesuré sur `~/.mika/data/mika.db` le 2026-09-03 : 31 tâches
+/// `failed` sur #1772, 8 sur #2127, 7 sur #2108, toutes en `phantom_aged_out`.
+///
+/// Le coût n'était pas seulement une ligne morte. Pendant les ~60 min du fantôme, le ticket
+/// comptait comme `in_flight`, et le reconciliateur Phase 2 de l'auto-pull **remettait son
+/// budget de re-drive à zéro** à chaque tick. Le garde-fou censé borner la boucle était
+/// effacé par la boucle : après 31 re-drives sur #1772, `redrive_count` disait 1. C'est la
+/// moitié M6b (`classify_stuck_ready`) qui ferme cette seconde moitié.
+///
+/// # Pourquoi `completed` et non `failed`
+///
+/// Le refus est un **résultat correct** : le ticket EST groomé. Le marquer `failed`
+/// dirait que quelque chose s'est mal passé et brouillerait le compte des vraies pannes.
+///
+/// # Pourquoi tous les `auto_skipped`, et pas seulement `already_groomed`
+///
+/// L'AC8 nomme `already_groomed` parce que c'est la forme mesurée. Le mécanisme du fantôme
+/// est identique pour `issue_closed` (mika#988) et pour toute refus futur : la raison
+/// exacte est reportée verbatim dans le `result` et dans l'événement d'audit, donc les
+/// populations restent séparables. Filtrer sur la seule raison mesurée laisserait le même
+/// défaut ouvert sous un autre nom.
+///
+/// # Attribution (M6a)
+///
+/// L'événement d'audit porte un `tool_name` qui n'est écrit qu'ici. Avant, une ligne
+/// `phantom_aged_out` ne disait pas si le pilote n'avait jamais tourné ou si `dispatch-lib`
+/// avait refusé sans que le refus atteigne le moteur ; les deux hypothèses étaient
+/// compatibles avec ce qu'on pouvait lire. Désormais la seconde laisse une trace nommée, et
+/// son absence sous un fantôme est une information.
+///
+/// Best-effort, fire-and-forget — même forme que les helpers frères.
+async fn try_resolve_parent_on_dispatch_refusal(db: &AsyncDatabase, task: &Task) {
+    let Some(parent_id) = task.parent_task_id.clone() else {
+        return;
+    };
+
+    let Some(result) = task.result.as_deref().filter(|r| !r.is_empty()) else {
+        return;
+    };
+    let Some(reason) = parse_auto_skip_reason(result) else {
+        return;
+    };
+
+    // Portée identique aux frères : une tâche de suivi self_dev encore en vol. Pas de
+    // filtre sur `dispatch_class` — la classe est déductible de la raison, et un second
+    // prédicat plus faible pour le même fait est exactement ce que mika#2158 ferme.
+    let parent = match db.get_task_unscoped(&parent_id).await {
+        Ok(Some(t))
+            if t.trigger_type == "manual"
+                && t.status == "in_progress"
+                && t.source.as_deref() == Some("self_dev") =>
+        {
+            t
+        }
+        _ => return,
+    };
+
+    let detail = format!("parent_resolved_from_dispatch_refusal (reason: {reason})");
+    match db.update_task_completed(&parent_id, Some(&detail)).await {
+        Ok(true) => {
+            let system_session = format!("system-{}", parent.agent_id);
+            let trace_id = mika_common::trace::generate_trace_id();
+            if let Err(e) = db
+                .log_audit_event(
+                    &system_session,
+                    "dispatch_refusal_resolver",
+                    &parent_id,
+                    Some("in_progress"),
+                    Some("completed"),
+                    Some(&detail),
+                    Some(&trace_id),
+                )
+                .await
+            {
+                warn!(
+                    parent_task_id = %parent_id,
+                    error = %e,
+                    "engine: failed to write dispatch-refusal-resolver audit event"
+                );
+            }
+            info!(
+                event = "dispatch_refusal_resolved",
+                parent_task_id = %parent_id,
+                callback_task_id = %task.id,
+                reason = %reason,
+                "engine: dispatch refusal resolved its own tracking row (mika#2158)"
+            );
+        }
+        Ok(false) => {
+            debug!(
+                parent_task_id = %parent_id,
+                reason = %reason,
+                "engine: parent no longer in_progress, skipping dispatch-refusal resolution"
+            );
+        }
+        Err(e) => {
+            warn!(
+                parent_task_id = %parent_id,
+                error = %e,
+                "engine: failed to resolve parent task on dispatch refusal"
             );
         }
     }
@@ -3700,6 +3856,174 @@ mod tests {
         assert_eq!(
             parent.status, "failed",
             "parent milestone should be auto-blocked when advance turn fails"
+        );
+    }
+
+    // -- try_resolve_parent_on_dispatch_refusal tests (mika#2158 AC8) --
+
+    /// The literal refusal body `dispatch-lib` ships for `already_groomed`, trimmed of the
+    /// long `note` field. Shape, not paraphrase: `status` + `reason` are what the resolver
+    /// keys on.
+    const ALREADY_GROOMED_RESULT: &str = r#"{"status":"auto_skipped","reason":"already_groomed","issue":"senara-solutions/mika#2108","branch":"fix/2108/x","plan":"docs/plans/p.md","provenance":"committed on branch","note":"Dispatch dev-pilot to implement."}"#;
+
+    /// Helper: a self_dev parent in `in_progress` with a groom callback child whose result
+    /// is `body`.
+    async fn create_refusal_callback_pair(db: &AsyncDatabase, body: &str) -> (String, String) {
+        let parent = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "ready-label: senara-solutions/mika#2108".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: Some("https://github.com/senara-solutions/mika/issues/2108".to_string()),
+            source: Some("self_dev".to_string()),
+            metadata: None,
+            r#type: Some("issue".to_string()),
+            dispatch_class: Some("groom".to_string()),
+        };
+        let parent_id = db.create_task(parent).await.unwrap();
+        db.update_task_status(&parent_id, "in_progress")
+            .await
+            .unwrap();
+
+        let callback = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: "long_running:run_claude_pilot_groom".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("groom".to_string()),
+        };
+        let callback_id = db.create_task(callback).await.unwrap();
+        db.update_task_completed(&callback_id, Some(body))
+            .await
+            .unwrap();
+        (parent_id, callback_id)
+    }
+
+    #[test]
+    fn test_parse_auto_skip_reason_shapes() {
+        assert_eq!(
+            parse_auto_skip_reason(ALREADY_GROOMED_RESULT).as_deref(),
+            Some("already_groomed")
+        );
+        // mika#988's sibling refusal — same mechanism, different name.
+        assert_eq!(
+            parse_auto_skip_reason(r#"{"status":"auto_skipped","reason":"issue_closed"}"#)
+                .as_deref(),
+            Some("issue_closed")
+        );
+        // Tolerant of a prologue/epilogue around the JSON body.
+        assert_eq!(
+            parse_auto_skip_reason(
+                "dispatch note\n{\"status\":\"auto_skipped\",\"reason\":\"already_groomed\"}\ntrailer"
+            )
+            .as_deref(),
+            Some("already_groomed")
+        );
+        // A refusal with no named reason is still a refusal.
+        assert_eq!(
+            parse_auto_skip_reason(r#"{"status":"auto_skipped"}"#).as_deref(),
+            Some("unspecified")
+        );
+        // Non-refusals must not match.
+        assert_eq!(parse_auto_skip_reason(""), None);
+        assert_eq!(
+            parse_auto_skip_reason("claude-pilot completed (done)."),
+            None
+        );
+        assert_eq!(
+            parse_auto_skip_reason(r#"{"status":"completed","reason":"already_groomed"}"#),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refusal_resolves_its_own_tracking_row() {
+        let db = test_db();
+        let (parent_id, callback_id) =
+            create_refusal_callback_pair(&db, ALREADY_GROOMED_RESULT).await;
+        let callback = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_resolve_parent_on_dispatch_refusal(&db, &callback).await;
+
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "completed",
+            "the refusal must resolve the row it left behind, not let it age into a phantom"
+        );
+        assert!(
+            parent
+                .result
+                .as_deref()
+                .unwrap_or_default()
+                .contains("already_groomed"),
+            "the reason must survive into the row so the two refusal populations stay \
+             separable, got: {:?}",
+            parent.result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_refusal_callback_leaves_the_parent_alone() {
+        let db = test_db();
+        let (parent_id, callback_id) =
+            create_refusal_callback_pair(&db, "claude-pilot completed (status: done).").await;
+        let callback = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_resolve_parent_on_dispatch_refusal(&db, &callback).await;
+
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "in_progress",
+            "only a refusal payload may resolve the parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refusal_does_not_reopen_a_terminal_parent() {
+        let db = test_db();
+        let (parent_id, callback_id) =
+            create_refusal_callback_pair(&db, ALREADY_GROOMED_RESULT).await;
+        db.update_task_failed(&parent_id, "reaped earlier")
+            .await
+            .unwrap();
+        let callback = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_resolve_parent_on_dispatch_refusal(&db, &callback).await;
+
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "failed",
+            "a parent that already reached a terminal state is not this resolver's business"
         );
     }
 
