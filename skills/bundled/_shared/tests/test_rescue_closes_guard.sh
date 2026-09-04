@@ -156,6 +156,42 @@ B6=$(compose "$R6")
 assert_contains     "T6 body carries a non-closing reference" "$B6" "Refs #2157"
 assert_not_contains "T6 body does NOT carry Closes"           "$B6" "Closes #2157"
 
+# ── T7 — a non-ASCII path must not escape the classifier ───────────────────
+# Under git's default `core.quotePath=true`, `git diff --name-only` returns
+# `"docs/plans/\303\251tude-plan.md"` — quoted, octal-escaped, matching no case
+# pattern — and the predicate answered "carries work". A fail-OPEN on the exact
+# input this repo produces daily: its plans and tickets are written in French.
+# This case exists because the first implementation shipped that bug.
+echo "-- T7: an accented plan filename (quotePath fail-open) --"
+R7=$(make_repo t7)
+add_commit "$R7" "docs/plans/2026-09-03-001-étude-plan.md"
+B7=$(compose "$R7")
+assert_contains     "T7 body carries a non-closing reference" "$B7" "Refs #2157"
+assert_not_contains "T7 body does NOT carry Closes"           "$B7" "Closes #2157"
+
+# ── T8 — the rescue's own scaffold exclusions are incident artefacts ────────
+# `.claude/claude-pilot.json` is copied into the worktree from $PLATFORM_DIR and
+# is excluded from the rescue commit's `git add -A` by name — dispatch-lib calls
+# it a scaffold path in its own NOTE line. A commit-pushed-no-pr rescue carrying
+# nothing but that file has fixed nothing.
+echo "-- T8: a scaffold path alone --"
+R8=$(make_repo t8)
+add_commit "$R8" ".claude/claude-pilot.json"
+B8=$(compose "$R8")
+assert_contains     "T8 body carries a non-closing reference" "$B8" "Refs #2157"
+assert_not_contains "T8 body does NOT carry Closes"           "$B8" "Closes #2157"
+
+# ── T9 — an empty worktree dir must not measure the dispatch host's checkout ─
+# `git -C ""` silently runs against the dispatch process CWD. Without the guard
+# the predicate would answer from a live checkout — and if that checkout carries
+# real work, it answers "carries work" for a rescue that captured nothing.
+echo "-- T9: empty worktree dir --"
+if _rescue_diff_carries_work "" 2>/dev/null; then
+    FAIL=$((FAIL + 1)); echo "  ✗ T9 empty worktree dir is refused"
+else
+    PASS=$((PASS + 1)); echo "  ✓ T9 empty worktree dir is refused"
+fi
+
 # ── Structural: the inline heredoc is gone and the callsite calls the fn ────
 echo "-- structural: the producing callsite --"
 create_block=$(awk '/RESCUED_PR_URL=\$\(gh pr create/,/2>&9 \|\| true\)/' "$DISPATCH_LIB")
@@ -182,8 +218,14 @@ echo "-- prompt contract: qa-review Step 1.5 incident item (AC5) --"
 qa_prompt_text=$(cat "$QA_PROMPT")
 assert_contains "qa-review reads the incident-only marker" \
     "$qa_prompt_text" "rescue-diff: incident-only"
-assert_contains "qa-review refuses an incident-only diff with block[ac]" \
-    "$qa_prompt_text" "VERDICT: block[ac]"
+assert_contains "qa-review refuses an incident-only diff with a non-approving hold" \
+    "$qa_prompt_text" "emit \`VERDICT: hold[review]\` with the reason that the diff consists entirely of grooming"
+# The token matters, and so does the reason it is not the other one: block[ac]
+# structurally dispatches an AC-fix pilot run (verdict_handler.rs handle_block_ac,
+# bounded at BLOCK_AC_MAX_RETRIES=3). Pin the measurement so a future edit that
+# "upgrades" the verdict has to confront it rather than rediscover it.
+assert_contains "and records why block[ac] is the wrong token here" \
+    "$qa_prompt_text" "BLOCK_AC_MAX_RETRIES"
 assert_contains "and names an approval on such a diff a false positive" \
     "$qa_prompt_text" "is a false positive, not an opinion"
 

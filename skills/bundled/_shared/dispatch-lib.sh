@@ -1473,12 +1473,13 @@ _clean_worktree_for_rebase() {
 
     # Tier 2: surgical resets of dispatch-lib-owned scaffold/ephemeral paths.
     #
-    # mika#2157 (R3): these five paths are the same notion — "what dispatch-lib
-    # owns and may reset without losing anything" — that `_rescue_diff_carries_work`
-    # classifies as incident artefacts. The two lists are NOT merged: this one
-    # resets, that one classifies, and a shared abstraction over two different
-    # semantics would cost more than five duplicated patterns. They can drift;
-    # when you add a path here, add it there too (and add its symmetric test).
+    # mika#2157 (R3): the four resets below are one of the two authorities
+    # `_rescue_diff_carries_work` transcribes into its incident-artefact list —
+    # the other being the rescue commit's `git add -A` scaffold exclusions. They
+    # are NOT merged: this one resets, that one classifies, and a shared
+    # abstraction over two different semantics would cost more than a handful of
+    # duplicated patterns. They can drift; when you add a path here, add it to
+    # the classifier too (and give it a symmetric test).
     git -C "$wt" checkout -- .claude/groom-verdict-trail.log 2>/dev/null || true
     rm -rf "$wt/.iterate" 2>/dev/null || true
     git -C "$wt" checkout HEAD -- docs/plans/ 2>/dev/null || true
@@ -5093,13 +5094,20 @@ _derive_recovery_pr_title() {
 # `<!-- rescue-pipeline-verified: no -->`) are both revocable by a single human
 # gesture. The asymmetry sat on the wrong side; this predicate moves it back.
 #
-# The incident-artefact list below is the transcription of what dispatch-lib
-# writes into a worktree outside the pilot's own work — the same set
-# `_clean_worktree_for_rebase` resets in its Tier 2 block (keep the two in step;
-# they express the same notion, "what dispatch-lib owns", and can drift —
-# mika#2157 R3). It is deliberately CLOSED and SHORT: any path not listed counts
-# as work. Every path added here takes weight away from the net in its useful
-# case, so an extension must arrive with its symmetric test.
+# The incident-artefact list below is not an intuition: it is the union of the
+# two places dispatch-lib ALREADY declares "this is mine, not the pilot's work" —
+#   * `_clean_worktree_for_rebase` Tier 2 (four surgical resets: the groom trail,
+#     `.iterate/`, `docs/plans/`, `.claude/commands/`), and
+#   * the rescue commit's own `git add -A` exclusions (`.claude/commands/`,
+#     `.claude/claude-pilot.json`, `.claude/settings.local.json`,
+#     `.claude/*.local.*`), whose NOTE line already calls them "scaffold paths".
+# A path the rebase overwrites, or that the rescue refuses to stage, cannot be a
+# deliverable. Keep all three sites in step — they express one notion in three
+# spellings and can drift (mika#2157 R3).
+#
+# The list is deliberately CLOSED and SHORT: any path not listed counts as work.
+# Every path added here takes weight away from the net in its useful case, so an
+# extension must arrive with its symmetric test.
 #
 # Base is the THREE-dot form `origin/main...HEAD` — the file set GitHub shows on
 # the PR, i.e. what this branch introduces relative to the merge base. This
@@ -5107,6 +5115,16 @@ _derive_recovery_pr_title() {
 # question here is "what does this PR carry", not "how does it differ from main's
 # tip". On a freshly-rebased branch the two coincide; on a branch that is behind,
 # only the three-dot form answers the question actually being asked.
+#
+# `core.quotePath=false` + `-z` is load-bearing, not hygiene. Under git's default
+# `core.quotePath=true`, ANY path holding a non-ASCII byte comes back wrapped in
+# double quotes with octal escapes — `"docs/plans/\303\251tude-plan.md"` — which
+# matches none of the `case` patterns below, falls through to `*)`, and returns
+# "carries work". That is a fail-OPEN on exactly the input this repo produces
+# every day: its plans, logs and tickets are written in French. Reading the list
+# NUL-delimited and unquoted is what makes the classifier see the real path.
+# (Process substitution rather than `$(...)`: bash drops NUL bytes inside command
+# substitution, which would splice every path into one unmatched blob.)
 #
 # Args: $1 — worktree dir
 # Returns: 0 when the diff holds at least one non-incident path.
@@ -5118,20 +5136,31 @@ _derive_recovery_pr_title() {
 #          `Closes` is a silent closure nobody measures. A measurement failure
 #          does not get to land on the automatic side.
 _rescue_diff_carries_work() {
-    local wt_dir="$1" files f
-    files=$(git -C "$wt_dir" diff --name-only origin/main...HEAD 2>/dev/null) || return 1
-    [ -n "$files" ] || return 1
-    while IFS= read -r f; do
+    local wt_dir="$1" f
+
+    # Guard mirrored from _clean_worktree_for_rebase, for its stated reason:
+    # `git -C ""` silently operates on the dispatch process CWD — a live
+    # checkout. An empty $wt_dir would therefore measure the WRONG tree, and if
+    # that tree happens to carry real work the answer lands fail-OPEN, which is
+    # the one direction this ticket forbids. Not reachable on today's paths
+    # (both recovery classes derive from a real worktree), but this is a
+    # sourceable primitive: fail closed.
+    if [ -z "$wt_dir" ] || ! git -C "$wt_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        return 1
+    fi
+
+    while IFS= read -r -d '' f; do
         [ -n "$f" ] || continue
         case "$f" in
             .claude/groom-verdict-trail.log) ;;
             .claude/commands/*)              ;;
-            .claude/*.local.json)            ;;
+            .claude/claude-pilot.json)       ;;
+            .claude/*.local.*)               ;;
             .iterate/*)                      ;;
             docs/plans/*)                    ;;
             *) return 0 ;;
         esac
-    done <<<"$files"
+    done < <(git -C "$wt_dir" -c core.quotePath=false diff --name-only -z origin/main...HEAD 2>/dev/null)
     return 1
 }
 
