@@ -608,6 +608,31 @@ impl Database {
         }))
     }
 
+    /// Find the most recent A2A task created under a caller-supplied `context_id`.
+    ///
+    /// This is the read path behind mika#2036's recovery. A caller that loses the
+    /// `message/send` response never learns the task id — the server mints it
+    /// with `Uuid::new_v4` (`server/a2a.rs`), so it is not derivable from
+    /// anything the caller sent. What the caller *does* know is the `context_id`
+    /// it chose, which `a2a_create_task` already persists on the mapping row.
+    ///
+    /// Most recent wins, so a context reused across calls resolves to the
+    /// exchange that just failed rather than an older one. `created_at` has
+    /// second granularity, hence `rowid` as the tiebreaker for two tasks created
+    /// inside the same second.
+    pub fn a2a_find_task_id_by_context(&self, context_id: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a2a_task_id FROM a2a_task_map
+             WHERE context_id = ?1
+             ORDER BY created_at DESC, rowid DESC
+             LIMIT 1",
+        )?;
+        let found = stmt
+            .query_row(rusqlite::params![context_id], |row| row.get::<_, String>(0))
+            .optional()?;
+        Ok(found)
+    }
+
     /// Get the session_id for an A2A task (for use with the agent loop).
     pub fn a2a_get_session_id(&self, a2a_task_id: &str) -> Result<Option<String>> {
         let mut stmt = self

@@ -2924,6 +2924,15 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Resolve the most recent A2A task id for a caller-supplied context id.
+    ///
+    /// The recovery read behind mika#2036; see `Database::a2a_find_task_id_by_context`.
+    pub async fn a2a_find_task_id_by_context(&self, context_id: &str) -> Result<Option<String>> {
+        let c = context_id.to_owned();
+        self.with_db(move |db| db.a2a_find_task_id_by_context(&c))
+            .await
+    }
+
     pub async fn a2a_get_session_id(&self, a2a_task_id: &str) -> Result<Option<String>> {
         let i = a2a_task_id.to_owned();
         self.with_db(move |db| db.a2a_get_session_id(&i)).await
