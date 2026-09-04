@@ -1472,6 +1472,14 @@ _clean_worktree_for_rebase() {
     git -C "$wt" rebase --abort >/dev/null 2>&1 || true
 
     # Tier 2: surgical resets of dispatch-lib-owned scaffold/ephemeral paths.
+    #
+    # mika#2157 (R3): the four resets below are one of the two authorities
+    # `_rescue_diff_carries_work` transcribes into its incident-artefact list —
+    # the other being the rescue commit's `git add -A` scaffold exclusions. They
+    # are NOT merged: this one resets, that one classifies, and a shared
+    # abstraction over two different semantics would cost more than a handful of
+    # duplicated patterns. They can drift; when you add a path here, add it to
+    # the classifier too (and give it a symmetric test).
     git -C "$wt" checkout -- .claude/groom-verdict-trail.log 2>/dev/null || true
     rm -rf "$wt/.iterate" 2>/dev/null || true
     git -C "$wt" checkout HEAD -- docs/plans/ 2>/dev/null || true
@@ -5075,6 +5083,148 @@ _derive_recovery_pr_title() {
     echo "${type_prefix}: ${issue_title} (${repo}#${issue_num})"
 }
 
+# _rescue_diff_carries_work — does the captured diff carry any actual work?
+#
+# mika#2157. The rescue net used to write `Closes #N` unconditionally, without
+# ever looking at what it had captured. A grooming worktree contains, at
+# minimum, dispatch-lib's own side effect: two lines appended to
+# `.claude/groom-verdict-trail.log` by `_append_groom_verdict_trail`. Wrapped
+# into a PR carrying `Closes #N`, that is an instruction GitHub executes
+# AUTOMATICALLY on merge — while the two protections around it (`--draft` and
+# `<!-- rescue-pipeline-verified: no -->`) are both revocable by a single human
+# gesture. The asymmetry sat on the wrong side; this predicate moves it back.
+#
+# The incident-artefact list below is not an intuition: it is the union of the
+# two places dispatch-lib ALREADY declares "this is mine, not the pilot's work" —
+#   * `_clean_worktree_for_rebase` Tier 2 (four surgical resets: the groom trail,
+#     `.iterate/`, `docs/plans/`, `.claude/commands/`), and
+#   * the rescue commit's own `git add -A` exclusions (`.claude/commands/`,
+#     `.claude/claude-pilot.json`, `.claude/settings.local.json`,
+#     `.claude/*.local.*`), whose NOTE line already calls them "scaffold paths".
+# A path the rebase overwrites, or that the rescue refuses to stage, cannot be a
+# deliverable. Keep all three sites in step — they express one notion in three
+# spellings and can drift (mika#2157 R3).
+#
+# The list is deliberately CLOSED and SHORT: any path not listed counts as work.
+# Every path added here takes weight away from the net in its useful case, so an
+# extension must arrive with its symmetric test.
+#
+# Base is the THREE-dot form `origin/main...HEAD` — the file set GitHub shows on
+# the PR, i.e. what this branch introduces relative to the merge base. This
+# diverges deliberately from `_ac6_verbatim_stats_block`'s two-dot form: the
+# question here is "what does this PR carry", not "how does it differ from main's
+# tip". On a freshly-rebased branch the two coincide; on a branch that is behind,
+# only the three-dot form answers the question actually being asked.
+#
+# `core.quotePath=false` + `-z` is load-bearing, not hygiene. Under git's default
+# `core.quotePath=true`, ANY path holding a non-ASCII byte comes back wrapped in
+# double quotes with octal escapes — `"docs/plans/\303\251tude-plan.md"` — which
+# matches none of the `case` patterns below, falls through to `*)`, and returns
+# "carries work". That is a fail-OPEN on exactly the input this repo produces
+# every day: its plans, logs and tickets are written in French. Reading the list
+# NUL-delimited and unquoted is what makes the classifier see the real path.
+# (Process substitution rather than `$(...)`: bash drops NUL bytes inside command
+# substitution, which would splice every path into one unmatched blob.)
+#
+# Args: $1 — worktree dir
+# Returns: 0 when the diff holds at least one non-incident path.
+#          1 in EVERY other case — fully-incident diff, empty diff, or a diff
+#          that could not be measured (no fetched `origin/main`, broken repo).
+#          Fail-closed is the ticket's own argument applied to its own fix:
+#          erring toward `Refs` leaves a ticket open for an operator to close by
+#          hand — visible, reversible, one line in a list. Erring toward
+#          `Closes` is a silent closure nobody measures. A measurement failure
+#          does not get to land on the automatic side.
+_rescue_diff_carries_work() {
+    local wt_dir="$1" f
+
+    # Guard mirrored from _clean_worktree_for_rebase, for its stated reason:
+    # `git -C ""` silently operates on the dispatch process CWD — a live
+    # checkout. An empty $wt_dir would therefore measure the WRONG tree, and if
+    # that tree happens to carry real work the answer lands fail-OPEN, which is
+    # the one direction this ticket forbids. Not reachable on today's paths
+    # (both recovery classes derive from a real worktree), but this is a
+    # sourceable primitive: fail closed.
+    if [ -z "$wt_dir" ] || ! git -C "$wt_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        return 1
+    fi
+
+    while IFS= read -r -d '' f; do
+        [ -n "$f" ] || continue
+        case "$f" in
+            .claude/groom-verdict-trail.log) ;;
+            .claude/commands/*)              ;;
+            .claude/claude-pilot.json)       ;;
+            .claude/*.local.*)               ;;
+            .iterate/*)                      ;;
+            docs/plans/*)                    ;;
+            *) return 0 ;;
+        esac
+    done < <(git -C "$wt_dir" -c core.quotePath=false diff --name-only -z origin/main...HEAD 2>/dev/null)
+    return 1
+}
+
+# _compose_rescue_pr_body — build the body of a recovery PR (mika#2157).
+#
+# Extracted from the heredoc that used to sit inline in `gh pr create`'s --body
+# argument, on the precedent `_derive_recovery_pr_title` already set for the
+# title. Under the inline shape the closing-reference decision was only testable
+# by stubbing `gh` and re-reading its argv; as a function it is exercised against
+# real temporary git repositories, so the probe traverses the actual `git diff`
+# instead of a reconstruction of it written from the plan.
+#
+# Emits `<!-- rescue-diff: carries-work -->` + `Closes #N` when the captured diff
+# carries work, and `<!-- rescue-diff: incident-only -->` + `Refs #N` otherwise,
+# with the incident-only case announced in the body's FIRST line. qa-review
+# Step 1.5 reads that marker rather than re-judging the diff: the producer
+# measures once, the consumer reads — the same shape mika#1618 established for
+# the `rescue-pipeline-verified` marker, and for the same reason (two independent
+# judgements of one fact diverge).
+#
+# Args: $1 — worktree dir
+#       $2 — recovery class ("dirty-worktree" or "commit-pushed-no-pr")
+#       $3 — class fact sentence
+#       $4 — issue number
+# Reads SESSION_ID / TURNS / COST from the environment, as the heredoc did.
+# Outputs: the PR body to stdout.
+_compose_rescue_pr_body() {
+    local wt_dir="$1" recovery_class="$2" class_fact="$3" issue_num="$4"
+    local diff_marker issue_ref lede=""
+
+    if _rescue_diff_carries_work "$wt_dir"; then
+        diff_marker="carries-work"
+        issue_ref="Closes #${issue_num}"
+    else
+        diff_marker="incident-only"
+        issue_ref="Refs #${issue_num}"
+        lede="> **This recovery carries no fix.** Every file in the captured diff is a
+> grooming/dispatch artefact, so this PR cannot satisfy any acceptance criterion
+> of #${issue_num}. It exists so the captured state is not lost — not to be merged.
+> The issue reference at the bottom is deliberately non-closing.
+
+"
+    fi
+
+    cat <<RESCUEBODY
+${lede}## Auto-rescued PR (dispatch-lib recovery, class: ${recovery_class})
+
+<!-- rescue-pipeline-verified: no -->
+<!-- rescue-diff: ${diff_marker} -->
+
+This PR was created by dispatch-lib's git-workflow recovery. ${class_fact}
+
+**Auto-rescued PR.** Operator: verify pipeline completion, then either un-draft this PR or set the marker above to \`yes\`.
+
+### Recovery metadata
+- Recovery class: \`${recovery_class}\`
+- Pilot session: \`${SESSION_ID:-unknown}\`
+- Turns: ${TURNS:-unknown}
+- Cost: \$${COST:-unknown}
+
+${issue_ref}
+RESCUEBODY
+}
+
 _deliver_callback() {
     # mika#1996: every delivery path crosses the non-empty-output gate. First
     # executable statement, so no future early-return above it can skip it.
@@ -5739,24 +5889,7 @@ The pilot's implementation work is in the commit(s) below this one." 2>&9; then
             --base main \
             --draft \
             --title "$_rescue_title" \
-            --body "$(cat <<RESCUEBODY
-## Auto-rescued PR (dispatch-lib recovery, class: ${RECOVERY_CLASS})
-
-<!-- rescue-pipeline-verified: no -->
-
-This PR was created by dispatch-lib's git-workflow recovery. ${_rescue_class_fact}
-
-**Auto-rescued PR.** Operator: verify pipeline completion, then either un-draft this PR or set the marker above to \`yes\`.
-
-### Recovery metadata
-- Recovery class: \`${RECOVERY_CLASS}\`
-- Pilot session: \`${SESSION_ID:-unknown}\`
-- Turns: ${TURNS:-unknown}
-- Cost: \$${COST:-unknown}
-
-Closes #${ISSUE_NUM}
-RESCUEBODY
-)" 2>&9 || true)
+            --body "$(_compose_rescue_pr_body "$WORKTREE_DIR" "$RECOVERY_CLASS" "$_rescue_class_fact" "$ISSUE_NUM")" 2>&9 || true)
 
         if [ -n "$RESCUED_PR_URL" ]; then
             PR_URL="$RESCUED_PR_URL"

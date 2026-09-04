@@ -1,7 +1,7 @@
 INSTALL_DIR ?= $(HOME)/.local/bin
 BINARIES := mika mika-spirit mika-gateway
 
-.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan test-pr-origin test-rescue-signal test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv test-github-token-not-in-sandbox test-sandbox-git-usable verify-no-secret-in-setenv verify-no-sigpipe-grep check-byte-slices verify-egress-no-log verify-bundled-skills lint fmt check check-ngrok deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
+.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan test-pr-origin test-rescue-signal test-rescue-closes-guard test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv test-github-token-not-in-sandbox test-sandbox-git-usable verify-no-secret-in-setenv verify-no-sigpipe-grep check-byte-slices check-image-tags-immutable verify-egress-no-log verify-bundled-skills lint fmt check check-ngrok deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -131,6 +131,7 @@ test: ## Run all tests
 	@bash skills/bundled/_shared/tests/test_find_issue_plan.sh
 	@bash skills/bundled/_shared/tests/test_stamp_pr_origin.sh
 	@bash skills/bundled/_shared/tests/test_rescue_signal_open_pr.sh
+	@bash skills/bundled/_shared/tests/test_rescue_closes_guard.sh
 	@bash scripts/test-pr-origin-report.sh
 	@bash skills/bundled/_shared/tests/test_sandbox_no_secret_in_argv.sh
 	@bash skills/bundled/_shared/tests/test-pilot-github-token-not-in-sandbox.sh
@@ -143,6 +144,8 @@ test: ## Run all tests
 	@bash scripts/deploy-info-test.sh
 	@bash scripts/verify-no-sigpipe-grep.sh
 	@bash scripts/test-verify-no-sigpipe-grep.sh
+	@bash scripts/check-image-tags-immutable.sh
+	@bash scripts/test-check-image-tags-immutable.sh
 	@python3 -B scripts/test-pilot-egress-proxy-status.py
 
 test-async-db-saturation: ## Run async DB channel saturation regression test (mika#1258)
@@ -157,6 +160,9 @@ test-find-issue-plan: ## Run the plan-discovery suite (mika#2038 wired it into C
 
 test-rescue-signal: ## Run the rescue-into-open-PR signal suite (mika#2151)
 	@bash skills/bundled/_shared/tests/test_rescue_signal_open_pr.sh
+
+test-rescue-closes-guard: ## Verify the rescue net only writes `Closes #N` when it carries work (mika#2157)
+	@bash skills/bundled/_shared/tests/test_rescue_closes_guard.sh
 
 test-pr-origin: ## Run the PR-origin marker + report suites (mika#2026)
 	@bash skills/bundled/_shared/tests/test_stamp_pr_origin.sh
@@ -185,6 +191,10 @@ test-dispatch-symmetry: ## Verify dev-pilot and dev-groom handlers are structura
 check-byte-slices: ## Reject byte offsets into text that can miss a char boundary + pin the guard's negative behaviour (mika#764 / mika#2103)
 	@bash scripts/check-byte-slices.sh
 	@bash scripts/test-check-byte-slices.sh
+
+check-image-tags-immutable: ## Reject image tags not derived from the commit sha + pin the guard's negative behaviour (mika#2143)
+	@bash scripts/check-image-tags-immutable.sh
+	@bash scripts/test-check-image-tags-immutable.sh
 
 verify-no-sigpipe-grep: ## Reject `printf|echo | grep -q` under pipefail (SIGPIPE trap, mika#2055)
 	@bash scripts/verify-no-sigpipe-grep.sh
