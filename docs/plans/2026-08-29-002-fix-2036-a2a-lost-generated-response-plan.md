@@ -158,6 +158,35 @@ modifiée pour les appelants existants, et un identifiant que le client choisit 
   identifiant de session ou de tâche, afin qu'un humain ou un pilote puisse retrouver la réponse.
 - **AC5** — `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` verts.
 
+## Acceptance criteria
+
+Transcription anglophone des « Critères d'acceptation » ci-dessus, requise
+littéralement par `scripts/verify-pipeline.sh` (mika#1600). La section
+française reste la formulation d'origine du plan groomé et **n'est pas
+renommée** — les deux coexistent, comme pour `Definition of Done`.
+
+- [ ] **AC1** — A timeout and a refused connection produce **distinct**
+  messages, each naming the URL; the timeout message names the budget it spent.
+  Anti-vacuity: both cases asserted, and the assertion fails if any two
+  messages render identically.
+- [ ] **AC2** — The A2A client's default timeout is **300 s**, explicit in the
+  code as a named constant rather than inherited from `reqwest`'s default.
+  `A2aClient::new` **keeps its signature**; `with_timeout` overrides it. Test:
+  two clients built with different budgets actually carry them, and both
+  existing call sites (`remote_ask.rs`, `a2a_call.rs`) compile unchanged.
+- [ ] **AC3** — After a transport failure occurring **after** the send, the
+  caller reclaims the generated response by querying the `context_id` it
+  supplied itself. Test: a `tokio::net::TcpListener` accepts, reads the JSON-RPC
+  request, then drops the socket without writing a response; the caller must
+  **return the response** via recovery, not an error. Anti-vacuity: a failure
+  **before** the send (refused port) must still return an error, never a
+  phantom recovery.
+- [ ] **AC4** — When recovery fails too, the error message **says where to
+  look**: the session or task identifier, so a human or a pilot can find the
+  response.
+- [ ] **AC5** — `cargo test`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo fmt --check` green.
+
 ## Hors périmètre
 
 - Le mécanisme de journalisation `llm response body` dans `server.log`, qui a servi de filet cette
