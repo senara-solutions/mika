@@ -257,6 +257,12 @@ toujours `pending`, que `stuck_rearm_count` n'a pas bougé, et qu'aucun `stuck_p
 n'a été écrit. Le test `db.rs` prouve le prédicat ; celui-ci prouve que le faucheur consomme bien le
 prédicat corrigé.
 
+### D6 — documentation
+
+`crates/mika-agent/CLAUDE.md`, section deferred-dispatch : une phrase sur la sémantique du wrapper
+`completed` vue par le faucheur, et le nom de l'env var. La section décrit déjà la sémantique de
+promotion ; elle ne dit pas encore ce que le faucheur en fait.
+
 ### D7 — fermer la divergence sémantique sur le prédicat jumeau (F3, premier passage)
 
 `Database::has_pending_deferred_wrapper_child` (`db.rs:7535`) pose la **même question** que la clause
@@ -276,12 +282,6 @@ appelant, et « pas d'appelant aujourd'hui » n'est pas une propriété stable.
 
 Coût réel : zéro appelant de production, donc zéro risque de comportement. Le seul diff hors tests
 est la signature et le nom.
-
-### D6 — documentation
-
-`crates/mika-agent/CLAUDE.md`, section deferred-dispatch : une phrase sur la sémantique du wrapper
-`completed` vue par le faucheur, et le nom de l'env var. La section décrit déjà la sémantique de
-promotion ; elle ne dit pas encore ce que le faucheur en fait.
 
 ## Séquence
 
