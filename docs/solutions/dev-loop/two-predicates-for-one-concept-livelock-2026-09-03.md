@@ -45,6 +45,37 @@ Deux exigences, au-delà de la correction de la regex :
 
 Le plus troublant : le refus **contenait déjà le remède**, en toutes lettres dans sa propre note — *« Dispatch dev-pilot to implement, or remove the plan from the branch to force a fresh groom. »* Le système savait quoi faire. Il n'avait aucun chemin entre ce qu'il sait à un endroit et ce qu'il décide à l'autre.
 
+## Le garde-fou existait, et la boucle l'effaçait
+
+Il y avait un budget censé borner tout ça : `MAX_REDRIVES_DEFAULT = 3` (mika#2020). Il n'a jamais mordu. Mesuré sur `~/.mika/data/mika.db` le 2026-09-03 :
+
+```
+tasks (source=self_dev), statuts par ticket      auto_pull_stats
+1772 | groom | failed | 31                       1772 | redrive_count=1
+2108 | groom | failed |  7                       2108 | redrive_count=0
+2127 | groom | failed |  8                       2127 | redrive_count=0
+```
+
+**Après 31 re-drives sur #1772, le compteur disait 1.** Les 31 tâches `failed` portaient toutes le même `result` : `phantom_aged_out`.
+
+Le cycle, chaque maillon mesuré :
+
+1. Le reconciliateur juge le ticket « stuck ready », fait `remove ready` → `add ready`, **incrémente** le budget.
+2. Le webhook lit le corps, ne reconnaît pas la forme, choisit `groom`, et **pré-crée une ligne `tasks` `in_progress`**.
+3. `dispatch-lib` refuse (`already_groomed`), livre son refus au moteur — où il ne produit rien. La ligne reste `in_progress`.
+4. Pendant les ~60 min où elle vieillit, le ticket compte comme `in_flight`. Or `in_flight` rendait `SkipAndResetBudget` : **le compteur retombe à 0**, à chaque tick.
+5. Le balayage phantom finit par passer la ligne `failed`. `in_flight` redevient faux, le ticket est de nouveau « stuck ready ». Retour en 1.
+
+La justification du reset était écrite dans le code : *« an open PR or a live dispatch means the re-drives worked »*. La première moitié est vraie ; la seconde est fausse. **Un dispatch vivant n'a pas abouti, il a commencé.** Et comme le seul signal lu était « une tâche existe », un dispatch mort-né comptait exactement comme un succès.
+
+### La règle, réutilisable
+
+> **Un compteur remis à zéro par l'action qu'il compte ne borne rien.**
+
+Le signe distinctif : la condition de remise à zéro est produite *par le mécanisme surveillé lui-même*, pas par un tiers observable. Le test qui l'aurait attrapé n'est pas un test unitaire du compteur — il passait — mais celui-ci : *rejouer N tours du cycle complet et vérifier que le compteur atteint sa borne.* Ici il ne l'atteignait jamais, et rien ne le disait, parce qu'un garde-fou inatteignable est silencieux exactement comme un garde-fou qui n'a pas eu à servir.
+
+Corollaire pour le refus : un refus doit avoir un **effet d'état**, pas seulement un effet de journal. Tant que le refus laissait sa ligne de suivi vieillir, il fabriquait le `in_flight` qui effaçait le budget qui devait le borner. Les deux défauts n'en font qu'un.
+
 ## Six instances dans la même nuit — le motif, pas l'anecdote
 
 Le 2026-09-03/04, **six** couples de composants ont été mesurés en désaccord sur une même question, chacun dans un mécanisme différent de la boucle :
@@ -80,9 +111,19 @@ En posant une prédiction **avant** de regarder : « si ces trois tickets sont i
 
 La première hypothèse — « ce défaut fabrique les onze sessions de grooming vivantes sur la machine » — était **fausse**, et vérifier a coûté une commande : ces dispatchs ne lancent aucune session, la garde les refuse avant. Deux faits voisins dans le temps ne sont pas un lien de cause. Voir aussi `docs/solutions/best-practices/run-the-new-check-against-live-state-before-calling-it-done-2026-08-29.md`.
 
+## Ce qui a été fait
+
+- `crates/mika-agent/src/grooming_marker.rs` — **le** prédicat, seul. `auto_pull::is_groomed` et `skills::executor::check_grooming_markers` l'appellent ; leurs regex locales ont disparu. Un test échoue si une regex de marqueur de passe réapparaît ailleurs dans `src/` : la copie qui a créé la divergence est désormais une régression, pas une découverte.
+- Le discriminateur devient **positionnel** : la ligne de callout est le contexte, son dernier token de verdict est l'état. Les trois formes A/B/C sont reconnues sans qu'aucune quatrième regex n'ait été ajoutée.
+- Les six corps mesurés sont figés en fixtures, avec un croisement qui échoue si les deux prédicats Rust divergent, et un test Bash pour l'implication *la garde refuse ⇒ le Rust dit groomé*.
+- `try_resolve_parent_on_dispatch_refusal` : le refus clôt sa ligne de suivi au moment où il arrive, et laisse un événement d'audit `dispatch_refusal_resolver` qui n'est écrit que là.
+- `classify_stuck_ready` : `in_flight` saute sans effacer le budget. Seule une PR ouverte le remet à zéro.
+
+**Ce qui reste ouvert :** mika#2120, l'autre axe du même prédicat (le préfixe de dépôt dans le callout `Plan`). Les conditions `Branch`/`Plan` sont restées chez leurs deux appelants, divergentes, parce que les unifier *est* le correctif de #2120 et qu'il est sous arbitrage opérateur. Un test épingle cette divergence pour qu'elle reste visible.
+
 ## Références
 
-- `crates/mika-agent/src/auto_pull.rs:301-314` — le prédicat de prose
+- `crates/mika-agent/src/grooming_marker.rs` — le prédicat unique (mika#2158)
 - `skills/bundled/_shared/dispatch-lib.sh:1831` — la garde qui lit l'artefact
 - `.claude/commands/mika-groom-ticket.md` phase 3 étape 10 — la spec qui supprime la seconde passe sur `READY`
 - mika#2158 — le ticket, avec le tableau des six corps mesurés
