@@ -169,6 +169,58 @@ Cela ne justifie pas de retirer la règle `salvage` (elle protège des branches 
 branche-à-liste-`files`-indisponible qui promeut désormais devrait, pour nuire, porter du travail de
 pilote commité — ce qu'aucun pilote ne peut produire tant que #2141 n'est pas résolu.
 
+### M8 — ré-exécution du 2026-09-04 à l'implémentation : le déclencheur ne tire pas, et le défaut a grossi
+
+Le § Fire-Disposition attache un **déclencheur de halte-et-remontée** à M6 : si, au moment
+d'implémenter, une seule branche ouverte bascule promotion → refus, l'implémenteur s'arrête. La
+mesure a donc été refaite le **2026-09-04**, sur les **18** tickets ouverts portant un callout
+`> - **Branch:**` (contre 11 la veille), les deux prédicats évalués sur le même appel `compare`.
+
+**Le déclencheur ne tire pas : zéro bascule promotion → refus sur 18.** L'implémentation continue.
+
+Trois faits que la ré-exécution ajoute :
+
+1. **Le défaut a grossi d'un facteur cinq en un jour.** Dix branches basculent aujourd'hui
+   `salvage → promotion` — #2160, #2158, #2157, #2156, #2143, **#2140 elle-même**, #2127, #2120,
+   #2118, #1772 — contre deux le 2026-09-03. Toutes portent un unique fichier, sous `docs/plans/`.
+   La branche de ce ticket (`ahead = 3`, `behind = 1`) est un exemplaire du défaut qu'elle corrige :
+   la porte refusait le correctif de la porte.
+2. **#1727 tient son rôle de contrôle positif vivant**, et son refus reste surdéterminé — 190 de
+   retard (185 la veille), toujours au-delà du seuil de 50. L'assertion auto-nettoyante est donc
+   satisfaite.
+3. **Un cas hors périmètre de M6 apparaît dans le jeu de fixtures, et il bascule dans la direction
+   dangereuse : `ci/2048-re-enable-release-please`.** 17 de retard, `ahead = 1`, trois fichiers de
+   configuration et **aucun plan**. Elle promouvait ; elle refuse désormais, et le préfixe en est la
+   cause **unique** — c'est-à-dire exactement la forme que le § Fire-Disposition dit de rouvrir au
+   lieu de la laisser se répondre en silence. M6 ne l'avait pas vue parce que M6 compte les tickets
+   **ouverts** et que #2048 est fermé.
+
+#### Ce qui a été décidé sur #2048, et pourquoi ce n'est pas un élargissement du préfixe
+
+Le préfixe **n'est pas élargi** : le plan interdit à l'implémenteur de le faire de sa propre
+autorité, et cette borne est respectée. La fixture est conservée et son test **retourné en contrôle
+nommé**, qui asserte le nouveau refus *et* que la distance ne le refuse pas (17 < 50) — l'assertion
+auto-nettoyante, dans l'autre sens.
+
+Le fait est borné par mesure, pas par argument : **cette branche ne peut pas atteindre la porte.**
+
+| chemin | filtre en amont | atteint la porte ? |
+|---|---|---|
+| Phase 0 `phase0_feed_ready_pool` | `is_groomed` (`auto_pull.rs:1938`) | non |
+| Phase 1 `phase1_promote_groomed` | `is_groomed` via `select_best_candidate` (`:818`) | non |
+| Phase 2 `phase2_reconcile_stuck_ready` | label `ready` seul | **oui, en principe** |
+
+`is_groomed` (`:301-314`) exige littéralement ``> - **Plan:** `docs/plans/`` ; une branche sans
+fichier de plan n'a pas de ticket qui passe ce filtre. Reste la Phase 2, dont la population vivante
+est **vide** : sur les 18 tickets ouverts à callout du 2026-09-04, **zéro** désigne une branche sans
+plan. Et #2048 lui-même est **fermé** et ne porte aucun callout de grooming — il n'atteint la porte
+par aucun des trois chemins.
+
+Le contrôle négatif que #2048 portait — « en retard, mais promue » — n'est pas perdu : il passe aux
+replays #2118/#2120, sur des branches qui sont réellement des branches de grooming, c'est-à-dire la
+population que cette porte existe pour juger.
+
+
 ## Décision de conception
 
 **Le prédicat de `salvage` devient : « la branche modifie au moins un fichier hors `docs/plans/` par rapport à `main` ».** `ahead_by` cesse d'être le discriminant et redevient ce qu'il est — une distance, journalisée, jamais interprétée.
@@ -437,6 +489,18 @@ Repris du ticket, sans extension :
 | Un test de régression AC3 vacieux (la fixture promeut aussi sous l'ancien code) | Assertion de non-vacuité explicite : `behind_by > 0 && ahead_by > 1` avant la décision. |
 | Un préfixe trop étroit refuse une branche de grooming légitime touchant autre chose | **Compté, plus seulement argumenté** (M6, 11 tickets ouverts) : zéro bascule promotion → refus, un seul cas-limite (#1727, un doc hors plan) dont le refus est **surdéterminé** par la distance. Disposition nommée en § Fire-Disposition avec assertion auto-nettoyante, et déclencheur de halte-et-remontée si la mesure ne tient plus à l'implémentation. |
 | `changed_files` ajouté à une struct publique casse un site de construction | Trois sites au total dans le dépôt (`:419` déclaration, `:609` parse, `:2545` aide de test) — grep exécuté le 2026-09-03, aucun consommateur hors `auto_pull.rs`. |
+
+## Acceptance criteria
+
+Transcrits verbatim du corps de mika#2140 (`## Critères d'acceptation`). La colonne
+de preuve est en § Critères d'acceptation — traçabilité ci-dessous.
+
+- [ ] **AC1** — La porte ne rend `SalvageWorkOnStaleBranch` que si la branche modifie **au moins un fichier hors `docs/plans/`** par rapport à `main`. Une branche dont tous les commits ne touchent que `docs/plans/` n'est jamais classée « travail partiel », quel que soit `ahead_by`.
+- [ ] **AC2** — Contrôle négatif, explicite : une branche stale portant **du code** (`crates/**`, `scripts/**`, `.github/**`, `Cargo.toml`…) **plus** un commit de plan est **toujours** refusée. Rendre la porte permissive ne doit pas rouvrir la porte qu'elle existe pour fermer.
+- [ ] **AC3** — Test de régression sur les corps réels des deux branches mesurées : `fix/2118/…` et `fix/2120/…` rendent `Promote`, et une fixture dérivée de l'une des branches mortes du 2026-08-31 portant du code rend `Refuse`.
+- [ ] **AC4** — Le signal de comparaison utilisé est celui déjà disponible ou une extension minimale : l'appel `compare` qui fournit `behind_by` / `ahead_by` fournit aussi la liste des fichiers. Si la liste est tronquée par l'API ou indisponible, la porte **promeut**.
+- [ ] **AC5** — Le message de refus, quand il tire, **nomme les fichiers hors plan** qui ont motivé la décision.
+- [ ] **AC6** — Les tickets déjà mal gatés ne restent pas coincés : soit la porte retire `operator-gated` d'elle-même quand la condition ne tient plus, soit le ticket documente explicitement que la levée est manuelle. Choisir et l'écrire.
 
 ## Critères d'acceptation — traçabilité
 

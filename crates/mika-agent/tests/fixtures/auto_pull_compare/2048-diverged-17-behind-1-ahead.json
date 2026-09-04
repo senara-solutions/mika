@@ -1,1 +1,22 @@
-{"ahead_by":1,"behind_by":17,"diff_url":"https://github.com/senara-solutions/mika/compare/main...ci/2048-re-enable-release-please.diff","html_url":"https://github.com/senara-solutions/mika/compare/main...ci/2048-re-enable-release-please","patch_url":"https://github.com/senara-solutions/mika/compare/main...ci/2048-re-enable-release-please.patch","permalink_url":"https://github.com/senara-solutions/mika/compare/senara-solutions:2f6bead...senara-solutions:44236a6","status":"diverged","total_commits":1,"url":"https://api.github.com/repos/senara-solutions/mika/compare/main...ci/2048-re-enable-release-please"}
+{
+  "ahead_by": 1,
+  "behind_by": 17,
+  "diff_url": "https://github.com/senara-solutions/mika/compare/main...ci/2048-re-enable-release-please.diff",
+  "html_url": "https://github.com/senara-solutions/mika/compare/main...ci/2048-re-enable-release-please",
+  "patch_url": "https://github.com/senara-solutions/mika/compare/main...ci/2048-re-enable-release-please.patch",
+  "permalink_url": "https://github.com/senara-solutions/mika/compare/senara-solutions:2f6bead...senara-solutions:44236a6",
+  "status": "diverged",
+  "total_commits": 1,
+  "url": "https://api.github.com/repos/senara-solutions/mika/compare/main...ci/2048-re-enable-release-please",
+  "files": [
+    {
+      "filename": ".github/workflows/release-pr.yml"
+    },
+    {
+      "filename": "release-please-config.json"
+    },
+    {
+      "filename": "version.txt"
+    }
+  ]
+}
