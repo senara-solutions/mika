@@ -174,6 +174,18 @@ jobs:
       - name: Pin the guard's negative behaviour
         run: bash scripts/test-check-byte-slices.sh
 
+  image-tag-immutability-lint:
+    name: Image Tag Immutability Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      - name: Reject image tags not derived from the commit sha (mika#2143)
+        run: bash scripts/check-image-tags-immutable.sh
+      # A guard nobody has watched go red is a decoration — same discipline as
+      # byte-slice-lint above (mika#2103).
+      - name: Pin the guard's negative behaviour
+        run: bash scripts/test-check-image-tags-immutable.sh
+
   loop-select-lint:
     name: Loop Select Lint
     runs-on: ubuntu-22.04
