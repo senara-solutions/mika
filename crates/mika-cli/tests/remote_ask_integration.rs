@@ -146,9 +146,18 @@ async fn dispatch_surfaces_connection_error_for_dead_endpoint() {
         .await
         .expect_err("should fail when no listener accepts the connection");
     let chain = format!("{err:#}");
+
+    // Since mika#2036 this says more than "connection error". A dead endpoint is
+    // the one failure that proves no work exists on the other side, and the
+    // message must say so — it is what separates "give up" from "your answer may
+    // still be there".
     assert!(
-        chain.contains("connection error:"),
-        "expected 'connection error:' prefix, got: {chain}"
+        chain.contains("unreachable") && chain.contains(&url),
+        "a dead endpoint must be named as unreachable, with its URL; got: {chain}"
+    );
+    assert!(
+        chain.contains("never left this client"),
+        "the caller must be told no answer can exist to reclaim; got: {chain}"
     );
 }
 

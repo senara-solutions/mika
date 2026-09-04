@@ -537,11 +537,44 @@ async fn handle_tasks_get(agent_state: &Arc<AgentState>, request: JsonRpcRequest
         }
     };
 
-    match agent_state
+    // Resolve by task id first, then — only on a miss — as a caller-supplied
+    // `context_id` (mika#2036).
+    //
+    // A caller whose `message/send` lost its response never learned the task id:
+    // it is minted here with `Uuid::new_v4` and travels back only in the
+    // envelope that was lost. The `context_id` the caller chose *is* known to it
+    // and is already persisted on the mapping row, so it is the only handle that
+    // survives the failure.
+    //
+    // The order is load-bearing: a real task id is looked up first and can
+    // therefore never be shadowed by some other task's context that happens to
+    // reuse its spelling. This widens what resolves; it changes nothing that
+    // resolved before.
+    let resolved = match agent_state
         .db
         .a2a_build_task(&params.id, params.history_length)
         .await
     {
+        Ok(Some(task)) => Ok(Some(task)),
+        Ok(None) => match agent_state.db.a2a_find_task_id_by_context(&params.id).await {
+            Ok(Some(task_id)) => {
+                debug!(
+                    context_id = %params.id,
+                    task_id = %task_id,
+                    "tasks/get resolved via context id"
+                );
+                agent_state
+                    .db
+                    .a2a_build_task(&task_id, params.history_length)
+                    .await
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(e),
+    };
+
+    match resolved {
         Ok(Some(task)) => {
             let result = serde_json::to_value(&task).unwrap_or_default();
             Json(JsonRpcResponse::success(request.id, result)).into_response()

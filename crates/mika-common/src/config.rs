@@ -953,7 +953,8 @@ pub struct Settings {
     ///
     /// Env override: `MIKA_PHANTOM_SWEEP_AGE_SECONDS`.
     ///
-    /// Default: [`DEFAULT_PHANTOM_SWEEP_AGE_SECONDS`] (3600, one hour).
+    /// Default: [`DEFAULT_PHANTOM_SWEEP_AGE_SECONDS`] (14400, four hours —
+    /// see that constant for the measured rationale, mika#2156).
     #[serde(default)]
     pub phantom_sweep_age_seconds: Option<u64>,
 
@@ -1039,7 +1040,57 @@ pub const DEFAULT_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS: u64 = 120;
 /// a phantom tracking row (`action_type='none'`, `process_id IS NULL`,
 /// `status IN ('in_progress','blocked')`) to `failed`. AC5 startup sweep runs
 /// at age=0 and is unaffected by this default.
-pub const DEFAULT_PHANTOM_SWEEP_AGE_SECONDS: u64 = 3600;
+///
+/// # Why 14400 (mika#2156)
+///
+/// Raised from 3600 on 2026-09-03. The original hour was calibrated when pilot
+/// sessions were short; they are not any more. After mika#2146 (gitdir mount)
+/// and claude-pilot#147 (idle watchdog), pilots run their pipeline to the end.
+/// Measured over n=1307 `long_running:run_claude_pilot*` rows created since
+/// 2026-08-25:
+///
+/// | p50 | p90 | p95 | p99 | max |
+/// |---|---|---|---|---|
+/// | 311s | 3221s | 4276s | 10066s | 21659s |
+///
+/// The old 3600s fell between p90 and p95 — roughly 8% of *healthy* dispatches
+/// crossed it. A second term compounds it: between a tracking row's creation
+/// and its recall row's, no child exists to interrogate and the threshold
+/// applies bare (measured: 43min on one row, 3172s on another blocked behind
+/// `global_dispatch_active`). p99 dispatch + measured slot wait ≈ 13238s, so
+/// 14400 sits just above the sum.
+///
+/// What makes that number safe is that **the threshold is no longer the
+/// discriminator.** Since mika#2156 both sweep callers ask
+/// `TaskEngine::live_dispatch_child` whether a dispatch child's process is
+/// still running, and a row backed by live work is spared at any age. The
+/// grace window now only decides how fast rows with *no responding process*
+/// — the genuine orphans — get cleaned up, and waiting 4h instead of 1h to
+/// tidy those costs nothing but tidiness. Lengthening this without the
+/// liveness guard would have been a dressing on the wound; with it, it is the
+/// right order of magnitude for a second-line net.
+///
+/// # What this number does NOT cover (measured 2026-09-04, mika#2156)
+///
+/// Two limits, both found by measurement rather than reasoning, so the next
+/// person does not have to rediscover them:
+///
+/// 1. **A tracking row with no children at all never reaches this grace.** The
+///    childless-parent reaper takes it at
+///    `CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS` (1800s) with
+///    `stuck_in_progress_no_callback_child`. This threshold therefore only
+///    ever governs rows that have at least one child.
+/// 2. **A row waiting for a dispatch slot is not protected by the liveness
+///    guard**, only by this threshold. During the wait its only child is a
+///    deferred wrapper carrying no `process_id`, which the guard cannot
+///    interrogate. The 14400 figure assumes roughly one dispatch queued
+///    ahead; a deeper queue can still outlast it, and the loop's stated
+///    steady state is saturation. Closing that properly needs a second
+///    sparing predicate on the deferred wrapper, which is a design change
+///    beyond this ticket rather than a tuning question.
+///
+/// Reversible without a rebuild via `MIKA_PHANTOM_SWEEP_AGE_SECONDS`.
+pub const DEFAULT_PHANTOM_SWEEP_AGE_SECONDS: u64 = 14400;
 
 /// Default bounded webhook-queue max depth per agent (mika#1870).
 pub const DEFAULT_WEBHOOK_QUEUE_MAX_DEPTH: usize = 64;
@@ -1411,7 +1462,7 @@ impl Settings {
 
     /// Effective phantom NULL-PID sweep grace window in seconds (mika#1712).
     ///
-    /// Returns the configured value or [`DEFAULT_PHANTOM_SWEEP_AGE_SECONDS`] (3600s).
+    /// Returns the configured value or [`DEFAULT_PHANTOM_SWEEP_AGE_SECONDS`] (14400s).
     pub fn effective_phantom_sweep_age_seconds(&self) -> u64 {
         self.phantom_sweep_age_seconds
             .unwrap_or(DEFAULT_PHANTOM_SWEEP_AGE_SECONDS)
@@ -2569,7 +2620,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn phantom_sweep_age_defaults_to_3600() {
+    fn phantom_sweep_age_defaults_to_14400() {
         clean_env();
         unsafe { std::env::remove_var("MIKA_PHANTOM_SWEEP_AGE_SECONDS") };
 
@@ -2581,7 +2632,9 @@ mod tests {
             settings.effective_phantom_sweep_age_seconds(),
             DEFAULT_PHANTOM_SWEEP_AGE_SECONDS
         );
-        assert_eq!(settings.effective_phantom_sweep_age_seconds(), 3600);
+        // Anchors the mika#2156 value: raised from 3600 once the liveness
+        // guard, not the clock, became the discriminator.
+        assert_eq!(settings.effective_phantom_sweep_age_seconds(), 14400);
     }
 
     #[test]

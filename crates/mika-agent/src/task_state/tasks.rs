@@ -160,6 +160,24 @@ pub struct PhantomTrackingTask {
     pub updated_at: String,
 }
 
+/// A dispatch child row of a tracking task: a `parent_task_id`-linked task
+/// carrying a non-NULL `process_id`. Returned by
+/// `Database::find_dispatch_children_with_pid` and consumed by the phantom
+/// sweep liveness guard (mika#2156).
+///
+/// `process_start_time` is field 22 of `/proc/<pid>/stat`, lifted out of the
+/// task's `metadata` JSON where the executor stores it as a string
+/// (`skills/executor.rs`). `None` means the row predates the metadata write,
+/// carries malformed JSON, or ran on a non-Linux host — in which case the
+/// guard cannot rule out PID reuse and deliberately falls back to sweeping
+/// (plan mika#2156 D-3).
+#[derive(Debug, Clone)]
+pub struct DispatchChild {
+    pub id: String,
+    pub process_id: i64,
+    pub process_start_time: Option<u64>,
+}
+
 /// A parent self_dev task left `in_progress` after its callback subtask
 /// delivered WITH a `pr_url` (success indicator). Used by the success-side
 /// engine backstop (mika#1162) — sibling shape to `OrphanedParentTask`.
