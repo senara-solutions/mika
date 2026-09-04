@@ -292,6 +292,41 @@ Et une assertion de garde sur la porte elle-même : le test existant `executor.r
 
 ---
 
+## Fire-Disposition
+
+*(F1, bloquant, de la seconde passe architecte — session `9f9d5edc`. Trois livrables de classe détecteur entrent en service : l'indicateur de famine L2b, le rejeu L4, les non-régressions L5. Chacun dit ici, à l'avance, ce que signifie son premier tir. Dispositions canoniques de `docs/solutions/best-practices/fire-disposition-doctrine.md`.)*
+
+### L2b — `deferred_dispatch_promotion_starved` : disposition **(c) halt-and-surface, en mode indicateur**
+
+**Ce que le détecteur regarde.** Des wrappers `long_running:run_claude_pilot:deferred` en `status='completed'` depuis plus de `MIKA_DEFERRED_PROMOTION_STALE_SECS` (900 s). Après L1 et L2a, cet état signifie exclusivement « promu, pas encore pris ». Le drapeau `agent_busy` accompagne chaque tir.
+
+**Ce que le premier tir signifie, décidé d'avance.**
+
+| Tir | Sens | Disposition |
+|---|---|---|
+| `count > 0`, `agent_busy = true` | famine derrière un verrou tenu — le cas mesuré à 2 h 47 le 2026-09-04 | **attendu, bénin.** Aucune action, aucune mutation. C'est la distribution qu'on cherche à connaître. |
+| `count > 0`, `agent_busy = false` | wrappers promus avec un agent **libre** — le seul état anormal | **halt-and-surface :** le tir est un avertissement + un événement d'audit, rien de plus. L'action automatique est **explicitement différée** au ticket post-2026-09-11 nommé en § hors portée découvert, qui la décidera sur les chiffres que ce détecteur aura produits. Ce plan ne livre aucun remède sur ce tir. |
+| `count = 0` | rien | silence. |
+
+**Le seul tir sur données existantes, nommé.** Avant L1, une consommation stérile laissait un wrapper en `completed` sans jamais le passer `expired`. Des rangées de cette forme peuvent exister dans `mika.db` au moment du déploiement ; comptées par L2b, elles produiraient un tir **permanent**, toutes les 60 s, sans rapport avec une famine. Disposition :
+
+1. Le pilote **mesure** ce résidu avant d'atterrir, sur une copie de la base vivante, avec la requête de L2b sans borne temporelle, et **consigne le compte dans le corps de la PR** (zéro compris).
+2. La requête de L2b porte une borne basse nommée, grep-visible : `AND completed_at >= DEFERRED_PROMOTION_EPOCH` où `pub(crate) const DEFERRED_PROMOTION_EPOCH: &str = "2026-09-04T00:00:00Z"` (le jour où L1 rend `completed` exclusif), avec un commentaire qui dit pourquoi la borne existe et qu'elle peut être retirée quand le résidu antérieur aura été purgé — retrait porté par le même ticket post-2026-09-11.
+3. **Aucune mutation des rangées résiduelles.** Elles ne sont ni expirées ni supprimées par ce plan.
+
+### L4 — rejeu `test_replay_2026_09_04_stale_blocked_parent_with_dead_blocker` : disposition **(c) halt-and-surface**
+
+Ce test est alimenté par une graine verbatim, pas par un balayage de données préexistantes : il n'a pas d'arriéré. Ses deux états possibles sont décidés :
+
+- **Rouge sur `main`, sans le correctif** — attendu, et c'est la preuve anti-vacuité exigée par § L4. La sortie rouge est une pièce de la PR.
+- **Rouge avec le correctif** — **halt-and-surface.** Le pilote n'ouvre pas la PR en l'état (ou la passe en brouillon), colle la sortie rouge dans son corps et s'arrête. Interdits, sans exception : `#[ignore]`, affaiblissement d'une assertion (notamment la sous-chaîne accentuée `re-armement différé épuisé`), modification de la graine pour faire passer le test. Un rouge ici dit que L1/L2a/L3a ne produisent pas la trace promise, et c'est le plan qui doit être corrigé, pas le test.
+
+### L5 — `test_stale_blocked_sweep_skips_live_blocker`, `test_stale_blocked_sweep_skips_unexpired_lease`, et le test existant `executor.rs:5618-5662` : disposition **(c) halt-and-surface**
+
+Ces trois tests gardent la sérialisation « un `implement` par classe » que mika#2160 tient sous garde opérateur. Un rouge sur l'un d'eux, avec le correctif, signifie que L3b touche un bloqueur vivant ou un bail non expiré — c'est-à-dire que le plan a franchi la ligne qu'il s'interdit. Disposition : **halt-and-surface**, PR non ouverte ou en brouillon avec la sortie rouge, aucun assouplissement de prédicat dans L3b pour « faire passer ». Le test existant `executor.rs:5618-5662` est **vérifié, pas réécrit** ; toute modification de ce test est hors portée de ce ticket.
+
+**Aucune exemption nommée n'est nécessaire** pour L4 et L5 ; la seule borne posée est celle de L2b, datée, commentée et rattachée à un ticket qui porte son retrait.
+
 ## Séquence
 
 1. **L1** — `mark_deferred_wrapper_noop` (db + async_db + `rearm_consumed_deferred_wrapper`). C'est la fondation : L2a écrit par elle, et L2b dépend de l'exclusivité de `status='completed'` qu'elle établit.
