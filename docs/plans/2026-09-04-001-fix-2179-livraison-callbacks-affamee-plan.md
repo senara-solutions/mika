@@ -1,6 +1,6 @@
 # Plan : la livraison d'un callback ne dit rien, et ne s'arrête jamais (mika#2179)
 
-**Ticket :** mika issue#2179 — `fix(task_engine,llm): livraison des callbacks mika-dev affamée — 38 timeouts de transport LLM en 3 h, callback livré 5 h 06 après complétion, parent mort d'âge avant son retour`
+**Ticket :** mika issue#2179 — `fix(task_engine,llm): livraison des callbacks mika-dev affamée — 19 timeouts de transport LLM en 4 h, callback livré 5 h 06 après complétion, parent mort d'âge avant son retour` (titre corrigé au grooming — voir R2)
 **Labels :** `bug`, `p1-important`
 **Type :** issue (bug — casseur de boucle : le retour du pilote existe en base et n'atteint pas l'agent)
 **Palier de priorité :** Tier 1 — *casse la boucle*. Un parent légitime meurt d'âge (grâce 14 400 s) pendant que son retour attend son tour de livraison.
@@ -126,6 +126,32 @@ Ce n'est pas non borné — `MAX_STUCK_REARMS` et `MAX_PENDING_DEFERRED_CALLBACK
 le re-armement. Mais le plafond porte sur le re-armement, pas sur la reprise, et c'est la
 reprise que l'AC3 vise. L'ordre des gestes en §Conception s'en déduit.
 
+### M5 — au déploiement, le correctif n'a rien d'ancien sur quoi tirer
+
+`get_undelivered_callback_tasks` (`db.rs:7044-7053`) sélectionne
+`status IN ('completed','failed') AND completed_at IS NOT NULL AND completed_at > since`,
+avec `since = now − 7 jours` (`engine.rs:557`). État courant de cette population :
+
+```sql
+SELECT status, count(*) FROM tasks
+ WHERE trigger_type='callback' AND status IN ('completed','failed') GROUP BY status;
+-- failed|1   (completed_at NULL)
+
+SELECT count(*) FROM tasks
+ WHERE trigger_type='callback' AND status IN ('completed','failed')
+   AND completed_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-7 days');
+-- 0
+```
+
+**Une seule ligne** non livrée existe, `failed` avec `completed_at` NULL : le prédicat ne
+la retient pas. La population sur laquelle le recul et la mise à l'écart pourraient agir
+au moment du déploiement est **vide, par mesure et par construction du prédicat**. C'est
+la donnée que demande la porte mika#1574 ; elle est reprise en §Fire-Disposition.
+
+Sur l'autre versant : le `warn!` de lenteur à 3600 s aurait tiré sur **297 des 1632**
+livraisons depuis le 2026-08-01, soit **18,2 %**. Chiffre assumé, pas subi — voir
+§Fire-Disposition.
+
 ## Rectifications apportées au corps du ticket
 
 Deux imprécisions du corps ont été corrigées **dans le ticket** avant grooming, avec la
@@ -228,10 +254,29 @@ reculer au plafond **et** écrire l'événement **`callback_delivery_quarantined
 (`after_value = <classe>`, `reasoning = "attempts=<n> backoff_secs=<n>"`), une fois par
 franchissement de seuil — pas à chaque tentative, sinon l'événement devient du bruit.
 
-**Ce que la mise à l'écart ne fait pas :** elle ne marque **jamais** la tâche `delivered`
-ni `failed`. Le `result` du callback est le retour du pilote ; le perdre, c'est perdre le
-travail. La sortie de l'AC3 est « recul exponentiel **ou** mise à l'écart visible » —
-le plan livre les deux, et aucune des deux n'est destructrice.
+**Ce que la mise à l'écart ne fait pas, et pourquoi (trouvaille F1 de la première passe,
+F3 de l'architecte).** Elle ne marque **jamais** la tâche `delivered` ni `failed`. Le
+`result` du callback est le retour du pilote ; le marquer `delivered` sans qu'aucune
+session ne l'ait lu jette ce retour, et le marquer `failed` ment sur un travail qui a
+réussi. L'AC3 demande que le callback « **ne retienne plus la fente** », et nomme deux
+sorties acceptables : « recul exponentiel **ou** mise à l'écart visible (`status` **ou
+métadonnée**) ». Le plan livre les deux formes non destructrices, et **`status` n'est pas
+retenu** : la mise à l'écart s'écrit en métadonnée (`delivery_attempts`,
+`delivery_quarantined_at`) et en `next_fire_at` au plafond.
+
+**État final choisi, énoncé sans détour :** un callback mis à l'écart reste
+`status='completed'`, porte `next_fire_at` au plafond (3600 s), une métadonnée
+`delivery_quarantined_at`, et un événement `callback_delivery_quarantined`. Il ne tente
+plus qu'une fois par heure au lieu d'une fois par minute — **la fente n'est plus retenue,
+et c'est exactement ce que l'AC3 exige**. Ce n'est pas un état terminal SQL, et ce n'en
+est pas un par prudence mal placée : l'AC3 autorise explicitement la voie « métadonnée ».
+Un état terminal ferait perdre le `result`, ce que le ticket n'a jamais demandé.
+
+**Ce qui ferait bouger ce choix.** Si une ligne mise à l'écart doit un jour sortir
+définitivement de la population balayée, la sortie propre est une transition vers
+`delivered` **après** avoir recopié le `result` dans le parent — un geste qui appartient
+à la livraison, pas à la mise à l'écart, et qui mérite son propre ticket. Condition de
+réveil datable : la première ligne observée à plus de 24 h de mise à l'écart.
 
 **B3. Ordre avec le re-armement (M4).** L'enregistrement de l'échec (A2) et le recul (B1)
 s'exécutent **avant** `rearm_consumed_deferred_wrapper`. Le re-armement est conservé tel
@@ -296,7 +341,91 @@ Plus **un cas positif neuf** dans C2 : une livraison qui réussit du premier cou
 `callback_delivered`, ne pose **aucun** `next_fire_at`, et marque la tâche `delivered` —
 c'est le contrôle négatif sans lequel les assertions rouges ne prouvent rien.
 
-## Tie-back aux critères d'acceptation
+## Fire-Disposition
+
+La porte mika#1574 demande ce que fait l'implémentation quand un artefact de classe
+détecteur tire sur des données **préexistantes**, et non sur ce que la PR ajoute. Ce plan
+en introduit quatre, et ils n'ont pas le même rapport à l'existant. Ils sont traités
+séparément, parce qu'une disposition unique masquerait que trois d'entre eux n'ont aucun
+corpus à faire tirer.
+
+**Détecteur 1 — la suite `test_callback_delivery_starvation.rs` : disposition (c),
+halte-et-remontée, sans exception nommée.** Chaque cas construit sa propre base en
+mémoire (`Database::open_in_memory`) et n'inspecte aucun corpus du dépôt ni de
+`~/.mika/data/mika.db`. Il n'existe **aucune donnée préexistante** sur laquelle ces tests
+puissent tirer : l'allowlist qu'une disposition (a) demanderait est vide *par
+construction*. Un échec signale une régression du chemin d'écriture ou du calcul de
+recul, jamais une violation héritée. Échec de CI, pas d'`#[ignore]`.
+
+**Détecteur 2 — le recul et la mise à l'écart (phase B) sur les lignes déjà en base :
+disposition (b), aucun traitement rétroactif — et le sous-ensemble concerné est vide.**
+C'est le seul artefact de ce plan qui *agit*. M5 le mesure : la population que
+`get_undelivered_callback_tasks` retient au moment du déploiement compte **zéro ligne**
+(une seule ligne non livrée existe, `failed` avec `completed_at` NULL, que le prédicat
+`completed_at IS NOT NULL` écarte). Le compteur `delivery_attempts` naît donc à zéro pour
+toute ligne future, et **aucune ligne existante n'est mise à l'écart au déploiement** —
+pas par indulgence, mais parce qu'il n'y en a aucune à mettre à l'écart. Aucune migration,
+aucun backfill, aucune réécriture de `metadata` sur l'existant.
+
+Conséquence à énoncer clairement : les 19 échecs qu'a subis `800d739f` dans la nuit du
+03 au 04 **ne sont pas rejoués**. Cette ligne est `delivered` depuis `03:09:16Z` ; le
+correctif ne la voit pas et ne doit pas la voir. Le protocole A-puis-B s'applique aux
+détections postérieures au déploiement, et à elles seules.
+
+**Détecteur 3 — le `warn!` de lenteur au-dessus de 3600 s : il tire sur du trafic vivant,
+à un taux mesuré et assumé.** Ce n'est pas un détecteur qui gate quoi que ce soit : il
+n'échoue pas la CI, ne bloque pas une PR, n'écrit rien de destructif. Il tirera, d'après
+M5, sur environ **18,2 %** des livraisons (297/1632 en rétrospective). C'est un taux
+délibéré : il correspond à la queue au-dessus du p90 observé, et il diminuera si et quand
+la cause fournisseur est traitée (hors portée). Un taux à 33,7 % — ce qu'aurait donné le
+seuil proposé de 900 s — aurait fait de ce `warn!` du bruit permanent, donc du bruit
+désarmé. **Ce qui ferait bouger ce choix :** si le taux mesuré après un mois reste
+au-dessus de 20 %, le seuil est trop bas ou la population est malade ; l'un des deux
+mérite alors un ticket, et le fait de pouvoir le dire est précisément ce que l'AC2 achète.
+
+**Détecteur 4 — les événements d'audit `callback_delivery_failed` / `callback_delivered`
+/ `callback_delivery_quarantined` : purement observateurs.** Ils s'écrivent sur des
+transitions futures uniquement. Aucun événement rétroactif n'est fabriqué pour les 5 h 06
+de `800d739f` : la preuve de cet incident vit dans le ticket et dans le journal, pas dans
+`audit_events`. Fabriquer des événements historiques rendrait la table non fiable comme
+mesure de ce qui s'est réellement passé sous instrumentation.
+
+## Acceptance criteria
+
+Transcrits du corps de mika#2179, tel que relu le 2026-09-04 (les rectifications R1/R2 y
+sont intégrées). L'AC2 et l'AC3 portent une précision de plan, signalée sous chacune.
+
+- [ ] **AC1** — Chaque `resume_agent run failed` sur un callback écrit un événement
+  d'audit nommé (`callback_delivery_failed`) portant `task_id`, la classe d'erreur
+  (`transport_timeout`, …) et le rang de la tentative. Aujourd'hui : un `warn!` seulement.
+- [ ] **AC2** — La latence de livraison (`completed_at` → `delivered`) est mesurable sans
+  lire le journal : un événement `callback_delivered` portant `wait_secs`. Le seuil
+  d'alerte est une valeur nommée, pas un nombre magique.
+  *Précision de plan :* le corps propose 900 s ; le plan retient **3600 s**, contre la
+  mesure M2 (900 s classerait 33,7 % des livraisons en alerte). L'AC exige une valeur
+  *nommée* et étiquette 900 s comme *proposition* — l'intention est portée, le chiffre est
+  choisi contre une mesure. La valeur est configurable
+  (`MIKA_CALLBACK_DELIVERY_SLOW_THRESHOLD_SECS`) et la **mesure**, elle, est
+  inconditionnelle : `wait_secs` est écrit à chaque livraison, seuil ou pas.
+- [ ] **AC3** — Un callback dont la livraison échoue N fois de suite sur transport
+  (N nommé, défaut **3**) ne retient plus la fente de 5 minutes à chaque balayage : recul
+  exponentiel **et** mise à l'écart visible, avec événement d'audit. La sortie muette est
+  ce qui est interdit.
+  *Précision de plan (levée d'ambiguïté, trouvaille F3) :* l'AC autorise « `status` **ou**
+  métadonnée ». Le plan retient la **métadonnée**. État final : `status` reste
+  `completed`, `next_fire_at` au plafond de 3600 s, `metadata.delivery_quarantined_at`
+  posée, événement `callback_delivery_quarantined` écrit une fois. **Aucune transition
+  vers un statut terminal** : elle jetterait le `result` du pilote. Le critère
+  observable de l'AC — « ne retient plus la fente » — est satisfait par le passage d'une
+  tentative par minute à une par heure. Détail et condition de réveil en §Phase B, B2.
+- [ ] **AC4** — Rejeu anti-vacuité : un test sème `800d739f` (callback `completed` à
+  22:03:24Z) et un transport qui échoue ; sur `main` il rougit (aucun événement, fente
+  reprise indéfiniment), avec le correctif il verdit. **Sortie rouge collée dans la PR.**
+- [ ] **AC5** — Non-régression : une livraison qui réussit du premier coup ne change ni de
+  comportement ni de latence. Tests existants **nommés, pas réécrits** (liste en C3), plus
+  un cas positif neuf qui sert de contrôle négatif à la batterie rouge.
+
+## Rattachement aux critères d'acceptation
 
 | AC | Livré par | Observable |
 |---|---|---|
