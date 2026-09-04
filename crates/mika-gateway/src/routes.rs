@@ -1121,36 +1121,22 @@ async fn handle_register_customer(
     let timezone = payload.timezone.as_deref().unwrap_or("UTC");
 
     // Upsert customer row
-    let upsert_result = sqlx::query_as::<_, UpsertCustomerRow>(
-        r#"INSERT INTO customers (id, name, plan, timezone, status, bot_token, bot_username, webhook_secret, pairing_token, pairing_expires_at)
-           VALUES ($1, $2, $3, $4, 'provisioned', $5, $6, $7, $8, now() + make_interval(hours => $9))
-           ON CONFLICT (id) DO UPDATE SET
-               name = EXCLUDED.name,
-               bot_token = EXCLUDED.bot_token,
-               bot_username = EXCLUDED.bot_username,
-               -- Preserve the existing secret for active customers so the DB never
-               -- holds a secret Telegram doesn't yet have. The new secret is only
-               -- promoted after a successful setWebhook below (mika#1612).
-               webhook_secret = CASE WHEN customers.status = 'provisioned' THEN EXCLUDED.webhook_secret ELSE customers.webhook_secret END,
-               pairing_token = CASE WHEN customers.status = 'provisioned' THEN EXCLUDED.pairing_token ELSE customers.pairing_token END,
-               pairing_expires_at = CASE WHEN customers.status = 'provisioned' THEN EXCLUDED.pairing_expires_at ELSE customers.pairing_expires_at END
-           RETURNING status, pairing_token, (xmax = 0) AS was_inserted"#,
-    )
-    .bind(payload.customer_id)
-    .bind(&payload.name)
-    .bind(plan)
-    .bind(timezone)
-    .bind(payload.bot_token.expose_secret())
-    .bind(&payload.bot_username)
-    .bind(&webhook_secret)
-    .bind(&pairing_token)
-    // Postgres `make_interval(hours => $N)` expects int4; binding f64 (float8) is
-    // only an assignment cast and fails function resolution (mika#1612). Out-of-i32
-    // values fall back to the 48h default; `.max(1)` then floors zero/negative inputs
-    // to 1h so a nonsensical TTL can't mint an already-expired (unpairable) token.
-    .bind(i32::try_from(ttl_hours).unwrap_or(48).max(1))
-    .fetch_one(&state.pool)
-    .await;
+    let upsert_result = sqlx::query_as::<_, UpsertCustomerRow>(UPSERT_CUSTOMER_SQL)
+        .bind(payload.customer_id)
+        .bind(&payload.name)
+        .bind(plan)
+        .bind(timezone)
+        .bind(payload.bot_token.expose_secret())
+        .bind(&payload.bot_username)
+        .bind(&webhook_secret)
+        .bind(&pairing_token)
+        // Postgres `make_interval(hours => $N)` expects int4; binding f64 (float8) is
+        // only an assignment cast and fails function resolution (mika#1612). Out-of-i32
+        // values fall back to the 48h default; `.max(1)` then floors zero/negative inputs
+        // to 1h so a nonsensical TTL can't mint an already-expired (unpairable) token.
+        .bind(i32::try_from(ttl_hours).unwrap_or(48).max(1))
+        .fetch_one(&state.pool)
+        .await;
 
     let row = match upsert_result {
         Ok(row) => row,
@@ -1362,6 +1348,14 @@ struct GetCustomerResponse {
     pairing_token_present: bool,
     /// Non-secret — expiry timestamp cannot be used to pair.
     pairing_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `Some(ts)` when the `one-telegram-one-mika` guard refused a pairing
+    /// attempt on this customer (mika-cloud#208). Cleared by a later successful
+    /// pairing. This is what lets the console tell "refused" from "still
+    /// waiting" — the two were indistinguishable before.
+    pairing_rejected_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Closed vocabulary; `telegram_already_linked` today. Non-secret: it names
+    /// the class of refusal, never the customer holding the binding.
+    pairing_rejection_reason: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -1386,6 +1380,8 @@ struct AdminCustomerRow {
     plan: String,
     pairing_token_present: bool,
     pairing_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pairing_rejected_at: Option<chrono::DateTime<chrono::Utc>>,
+    pairing_rejection_reason: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -1402,6 +1398,8 @@ impl From<AdminCustomerRow> for GetCustomerResponse {
             plan: r.plan,
             pairing_token_present: r.pairing_token_present,
             pairing_expires_at: r.pairing_expires_at,
+            pairing_rejected_at: r.pairing_rejected_at,
+            pairing_rejection_reason: r.pairing_rejection_reason,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
@@ -1418,7 +1416,9 @@ impl From<AdminCustomerRow> for GetCustomerResponse {
 const CUSTOMER_SAFE_COLUMNS: &str = "id, name, bot_username, status, paired_at, \
                                      telegram_chat_id, plan, \
                                      (pairing_token IS NOT NULL) AS pairing_token_present, \
-                                     pairing_expires_at, created_at, updated_at";
+                                     pairing_expires_at, \
+                                     pairing_rejected_at, pairing_rejection_reason, \
+                                     created_at, updated_at";
 
 /// Handle `GET /admin/customers/{customer_id}` — returns the safe customer view.
 ///
@@ -1621,6 +1621,34 @@ async fn handle_list_customers(
 
 // -- Token generation --
 
+/// Customer upsert used by `POST /admin/customers`.
+///
+/// Named so the mika-cloud#208 regression test can assert on it: the
+/// `provisioned` branch that mints a fresh pairing token must also clear any
+/// refusal verdict recorded against the previous one.
+const UPSERT_CUSTOMER_SQL: &str = r#"INSERT INTO customers (id, name, plan, timezone, status, bot_token, bot_username, webhook_secret, pairing_token, pairing_expires_at)
+           VALUES ($1, $2, $3, $4, 'provisioned', $5, $6, $7, $8, now() + make_interval(hours => $9))
+           ON CONFLICT (id) DO UPDATE SET
+               name = EXCLUDED.name,
+               bot_token = EXCLUDED.bot_token,
+               bot_username = EXCLUDED.bot_username,
+               -- Preserve the existing secret for active customers so the DB never
+               -- holds a secret Telegram doesn't yet have. The new secret is only
+               -- promoted after a successful setWebhook below (mika#1612).
+               webhook_secret = CASE WHEN customers.status = 'provisioned' THEN EXCLUDED.webhook_secret ELSE customers.webhook_secret END,
+               pairing_token = CASE WHEN customers.status = 'provisioned' THEN EXCLUDED.pairing_token ELSE customers.pairing_token END,
+               pairing_expires_at = CASE WHEN customers.status = 'provisioned' THEN EXCLUDED.pairing_expires_at ELSE customers.pairing_expires_at END,
+               -- A fresh pairing token starts a fresh attempt, so any refusal
+               -- recorded against the previous one is spent (mika-cloud#208).
+               -- Leaving it would show the console a refusal the user has not
+               -- made yet — the same class of stale-state lie this ticket
+               -- exists to remove. Cleared under the same condition that
+               -- promotes the new token, so an active customer's row is
+               -- untouched here.
+               pairing_rejected_at = CASE WHEN customers.status = 'provisioned' THEN NULL ELSE customers.pairing_rejected_at END,
+               pairing_rejection_reason = CASE WHEN customers.status = 'provisioned' THEN NULL ELSE customers.pairing_rejection_reason END
+           RETURNING status, pairing_token, (xmax = 0) AS was_inserted"#;
+
 /// Generate a cryptographic pairing token (32 random bytes, hex-encoded → 64 chars).
 fn generate_pairing_token() -> String {
     let mut bytes = [0u8; 32];
@@ -1661,7 +1689,8 @@ async fn handle_pairing(
     let result = sqlx::query_as::<_, PairingResultRow>(
         r#"UPDATE customers
            SET telegram_chat_id = $1, paired_at = now(), status = 'active',
-               pairing_token = NULL, pairing_expires_at = NULL
+               pairing_token = NULL, pairing_expires_at = NULL,
+               pairing_rejected_at = NULL, pairing_rejection_reason = NULL
            WHERE pairing_token = $2
              AND telegram_chat_id IS NULL
              AND status = 'provisioned'
@@ -1705,21 +1734,85 @@ async fn handle_pairing(
             if let Some(db_err) = e.as_database_error()
                 && db_err.code().as_deref() == Some("23505")
             {
-                let msg = if db_err
+                let already_linked = db_err
                     .constraint()
-                    .is_some_and(|c| c.contains("telegram_chat_id"))
-                {
+                    .is_some_and(|c| c.contains("telegram_chat_id"));
+
+                let msg = if already_linked {
                     "This Telegram account is already linked to another Mika account. \
                      If it's an account you control, send /unlink from that account \
                      first, then click your invite link again. Otherwise, contact support."
                 } else {
                     "Pairing failed. Please contact support."
                 };
+
+                // Record the guard's verdict so the console can show it
+                // (mika-cloud#208). The refusal is already decided — the
+                // constraint rejected the UPDATE and this row is unchanged.
+                // This write cannot alter that decision: it is fire-and-forget,
+                // a failure logs WARN and lets the refusal stand, and the
+                // message above is sent either way. Keyed on `pairing_token`
+                // so it lands on the row that was refused.
+                if already_linked {
+                    record_pairing_rejection(
+                        state,
+                        pairing_token,
+                        PAIRING_REJECTION_ALREADY_LINKED,
+                    )
+                    .await;
+                }
+
                 let _ = tg.send_message(chat_id, msg).await;
                 return;
             }
             warn!(error = %e, chat_id, "pairing query failed");
             reply_transient_error(tg, chat_id).await;
+        }
+    }
+}
+
+/// Closed reason vocabulary for a recorded pairing refusal (mika-cloud#208).
+///
+/// Mirrors the `customers_pairing_rejection_reason_check` CHECK constraint in
+/// `migrations/010_customers_pairing_rejection.sql`. Adding a member here means
+/// adding it there too — the constraint is what makes that a deliberate act.
+pub const PAIRING_REJECTION_ALREADY_LINKED: &str = "telegram_already_linked";
+
+/// SQL that records a pairing refusal on the row bearing the presented token.
+pub const RECORD_PAIRING_REJECTION_SQL: &str = "UPDATE customers \
+                                                SET pairing_rejected_at = now(), \
+                                                    pairing_rejection_reason = $1 \
+                                                WHERE pairing_token = $2";
+
+/// Write the guard's refusal verdict to the customer row (mika-cloud#208).
+///
+/// Fire-and-forget by design: the refusal has already been decided by the
+/// `telegram_chat_id UNIQUE` constraint before this is called, and nothing here
+/// can change it. A failed write logs WARN and leaves the refusal standing —
+/// the user still receives the refusal message. Never call this on a path that
+/// did not just refuse a pairing.
+async fn record_pairing_rejection(state: &AppState, pairing_token: &str, reason: &str) {
+    match sqlx::query(RECORD_PAIRING_REJECTION_SQL)
+        .bind(reason)
+        .bind(pairing_token)
+        .execute(&state.pool)
+        .await
+    {
+        Ok(r) if r.rows_affected() == 0 => {
+            warn!(
+                reason,
+                "pairing rejection recorded on no row — token not found"
+            );
+        }
+        Ok(_) => {
+            info!(
+                reason,
+                "pairing refused by one-telegram-one-mika; verdict recorded"
+            );
+        }
+        Err(e) => {
+            // The refusal stands. Only its visibility is lost.
+            warn!(error = %e, reason, "failed to record pairing rejection verdict");
         }
     }
 }
@@ -2653,6 +2746,8 @@ mod tests {
             plan: "standard".to_string(),
             pairing_token_present: true,
             pairing_expires_at: Some(now),
+            pairing_rejected_at: None,
+            pairing_rejection_reason: None,
             created_at: now,
             updated_at: now,
         };
@@ -2688,6 +2783,11 @@ mod tests {
             plan: "premium".to_string(),
             pairing_token_present: false,
             pairing_expires_at: None,
+            // Verdict fields populated on purpose (mika-cloud#208): the
+            // secret-hygiene contract must hold with them set, not only when
+            // they happen to be null.
+            pairing_rejected_at: Some(now),
+            pairing_rejection_reason: Some(PAIRING_REJECTION_ALREADY_LINKED.to_string()),
             created_at: now,
             updated_at: now,
         };
@@ -2735,6 +2835,80 @@ mod tests {
     /// Regression guard on the SELECT column list — a future refactor must not
     /// silently add `bot_token`/`pairing_token`/`webhook_secret` here. The
     /// constant lives in code so this test locks it structurally.
+    // ------------------------------------------------------------------
+    // mika-cloud#208 — the one-telegram-one-mika verdict is recorded
+    // ------------------------------------------------------------------
+    //
+    // Founding case: Vincent finished the champion wizard, the wizard said
+    // "done", and his messages were answered by a different bot with a
+    // different agent's memory. The guard had refused his pairing — correctly,
+    // his Telegram was already bound — but the refusal was persisted nowhere,
+    // so the refused row was byte-identical to a customer who had not started.
+    // These tests pin the verdict's shape; the DB-level behaviour lives in
+    // `tests/pairing_rejection.rs`.
+
+    #[test]
+    fn pairing_rejection_reason_matches_the_migration_vocabulary() {
+        // The CHECK constraint in migrations/010_customers_pairing_rejection.sql
+        // enumerates the same members. Drift here means a refusal write that
+        // the database rejects at runtime — a silent loss of the verdict.
+        let migration = include_str!("../migrations/010_customers_pairing_rejection.sql");
+        assert!(
+            migration.contains(PAIRING_REJECTION_ALREADY_LINKED),
+            "migration 010 does not allow the reason the code writes"
+        );
+    }
+
+    #[test]
+    fn record_pairing_rejection_sql_targets_the_token_row_only() {
+        // Keyed on pairing_token: the refused row is the one bearing the token
+        // the user presented, never the row that already holds the binding.
+        assert!(RECORD_PAIRING_REJECTION_SQL.contains("WHERE pairing_token = $2"));
+        assert!(RECORD_PAIRING_REJECTION_SQL.contains("pairing_rejected_at = now()"));
+        assert!(RECORD_PAIRING_REJECTION_SQL.contains("pairing_rejection_reason = $1"));
+        // It must not touch the guard's own columns — recording a verdict may
+        // never become a second path to pairing.
+        assert!(
+            !RECORD_PAIRING_REJECTION_SQL.contains("telegram_chat_id"),
+            "the verdict write must never touch telegram_chat_id"
+        );
+        assert!(
+            !RECORD_PAIRING_REJECTION_SQL.contains("status"),
+            "the verdict write must never change customer status"
+        );
+    }
+
+    #[test]
+    fn reissuing_a_pairing_token_clears_a_spent_verdict() {
+        // A refused customer stays `provisioned`, which is exactly the branch
+        // that mints a fresh pairing token on re-provisioning. Keeping the old
+        // verdict there would make the console report a refusal the user has
+        // not made yet — the same stale-state lie this ticket exists to remove.
+        assert!(
+            UPSERT_CUSTOMER_SQL.contains(
+                "pairing_rejected_at = CASE WHEN customers.status = 'provisioned' THEN NULL"
+            ),
+            "the customer upsert must clear a spent rejection verdict"
+        );
+        assert!(
+            UPSERT_CUSTOMER_SQL.contains(
+                "pairing_rejection_reason = CASE WHEN customers.status = 'provisioned' THEN NULL"
+            ),
+            "the customer upsert must clear the spent reason too"
+        );
+        // An active customer's row is never touched by this branch.
+        assert!(
+            UPSERT_CUSTOMER_SQL.contains("ELSE customers.pairing_rejected_at END"),
+            "a non-provisioned customer must keep its verdict columns"
+        );
+    }
+
+    #[test]
+    fn customer_safe_columns_projects_the_verdict() {
+        assert!(CUSTOMER_SAFE_COLUMNS.contains("pairing_rejected_at"));
+        assert!(CUSTOMER_SAFE_COLUMNS.contains("pairing_rejection_reason"));
+    }
+
     #[test]
     fn customer_safe_columns_excludes_secrets() {
         assert!(
