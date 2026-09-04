@@ -25,6 +25,25 @@ const MAX_PER_TICK: usize = 10;
 /// How many ticks between periodic DB scans for tasks created outside the engine.
 const DB_SCAN_INTERVAL_TICKS: u64 = 60;
 
+/// What the dispatch children of a tracking row say about its liveness.
+///
+/// Three-valued on purpose (mika#2156). A sweep decides whether to write a
+/// destructive `failed`, and "the work is dead" and "we could not ask" are not
+/// the same answer — collapsing them would let an unreadable signal authorise
+/// the transition this ticket exists to prevent.
+#[derive(Debug)]
+enum DispatchLiveness {
+    /// A child's `(pid, start_time)` pair still resolves to a running process.
+    /// Spare the row.
+    Live { child_id: String, pid: i64 },
+    /// There is no child, or every child's process is gone or carries no
+    /// usable start time. Sweep — this is the sweeper's reason to exist.
+    NoneLive { unusable_children: u32 },
+    /// The lookup itself failed. Neither answer is available, so make no
+    /// claim: skip the row and let the next pass ask again.
+    Unknown,
+}
+
 /// Grace period (seconds) before the reaper transitions an orphaned parent
 /// self_dev task to `failed`. 600s ≈ 3× the upper bound of observed callback
 /// duration (mika#868 audit: 187s LLM latency). Long enough for #870's
@@ -1043,12 +1062,169 @@ impl TaskEngine {
         }
     }
 
+    /// Whether a tracking row's dispatch is still alive.
+    ///
+    /// The liveness guard both phantom-sweep callers share (mika#2156, plan
+    /// D-1/D-3). [`AsyncDatabase::find_phantom_tracking_tasks`] selects
+    /// *candidates*: liveness of a PID is not expressible in SQL, so the
+    /// discriminator lives here, between the selection and the destructive
+    /// [`AsyncDatabase::update_task_failed`] write.
+    ///
+    /// The predicate is **measured liveness, never the child's presence**. Of
+    /// the 181 sweeps in production history, 177 had a PID-carrying child
+    /// (plan measure M2) — a guard written on presence would have disarmed
+    /// the sweeper on 98% of its population. `is_same_process_alive` is what
+    /// separates the two, and it takes the `(pid, start_time)` pair because a
+    /// PID alone cannot survive reuse.
+    ///
+    /// # Which way each uncertainty falls
+    ///
+    /// - No child, or every child's process gone → `NoneLive`: sweep. This is
+    ///   the pre-fix behaviour, preserved (AC3).
+    /// - Child with a PID but no usable `process_start_time` → counted in
+    ///   `NoneLive.unusable_children` and **not** spared (plan D-3): without
+    ///   the start time the pair that identifies a process *instance* is
+    ///   incomplete, so a recycled PID would read as alive. The count is
+    ///   surfaced by the caller because this is the one path that silently
+    ///   returns the sweeper to its pre-fix behaviour — the executor's
+    ///   metadata write is best-effort (`skills/executor.rs`), so an absent
+    ///   field is a reachable production state, not a hypothetical.
+    /// - The lookup failed → `Unknown`: **skip the row**, do not sweep. A
+    ///   failed read is not evidence of death, and the sweep re-runs every
+    ///   `DB_SCAN_INTERVAL_TICKS` seconds, so declining costs one pass while
+    ///   guessing costs the incident this ticket documents.
+    ///
+    /// # Known residual, deliberately not addressed here
+    ///
+    /// `process_start_time` is `/proc/<pid>/stat` field 22 — ticks since
+    /// *boot* — so a `(pid, start_time)` pair identifies a process instance
+    /// only within the boot that recorded it. Across a host reboot a stale
+    /// pair could in principle collide with an unrelated process and spare an
+    /// orphan. This is a pre-existing property of `process_liveness` (shared
+    /// with the mika#959 callback watchdog), and it is bounded rather than
+    /// permanent: the recall child carries its own `timeout_at`, and once it
+    /// expires `kill_orphan_processes` clears the child's `process_id`, after
+    /// which the child is invisible to this guard and the row sweeps
+    /// normally.
+    ///
+    /// Likewise, a tracking row still *waiting for a dispatch slot* has no
+    /// PID-carrying child at all — only a deferred wrapper — so this guard
+    /// cannot see it. That window is covered by the grace threshold instead
+    /// (see `DEFAULT_PHANTOM_SWEEP_AGE_SECONDS`), which is a weaker instrument;
+    /// the plan priced it at one queued dispatch ahead.
+    async fn dispatch_liveness(&self, parent_id: &str) -> DispatchLiveness {
+        let children = match self.db.find_dispatch_children_with_pid(parent_id).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    task_id = %parent_id,
+                    error = %e,
+                    "phantom_sweep: dispatch-child lookup failed — skipping row, \
+                     no claim either way"
+                );
+                return DispatchLiveness::Unknown;
+            }
+        };
+
+        let mut unusable_children: u32 = 0;
+        for child in children {
+            let pid = match u32::try_from(child.process_id) {
+                // `p > 0` is load-bearing, not defensive: `kill(0, 0)` targets
+                // the CALLER's own process group, so a zero PID would read as
+                // alive and spare the row forever.
+                Ok(p) if p > 0 => p,
+                _ => {
+                    unusable_children = unusable_children.saturating_add(1);
+                    continue;
+                }
+            };
+            let Some(start_time) = child.process_start_time else {
+                unusable_children = unusable_children.saturating_add(1);
+                continue;
+            };
+            if super::process_liveness::is_same_process_alive(pid, start_time) {
+                return DispatchLiveness::Live {
+                    child_id: child.id,
+                    pid: child.process_id,
+                };
+            }
+        }
+        // Every child examined, none alive. `continue` above rather than an
+        // early return is deliberate: a dead child ordered before a live one
+        // must not stop the scan.
+        DispatchLiveness::NoneLive { unusable_children }
+    }
+
+    /// Record that the liveness guard withheld a `phantom_aged_out`
+    /// transition (mika#2156, AC4).
+    ///
+    /// Writes both surfaces, because they answer different questions. The
+    /// `info!` line is what an operator greps while watching a dispatch; the
+    /// `audit_events` row is what survives log rotation and lets the mika#1934
+    /// cause-racine query correlate spares with sweeps offline.
+    ///
+    /// SOLE WRITER: phantom_sweep_spared — this method serves both sweep
+    /// callers and is the only site that writes this audit tool_name. It is
+    /// deliberately a *distinct* name from `phantom_aged_out` so the AC7 count
+    /// semantics of `SELECT COUNT(*) ... WHERE tool_name='phantom_aged_out'`
+    /// keep meaning "rows actually transitioned" — same reasoning that gave
+    /// `phantom_sweep_db_error` its own name (ADV-3, 2026-08-21).
+    ///
+    /// `before_value` and `after_value` are both the row's unchanged status:
+    /// the point of the row is that nothing moved.
+    async fn record_phantom_spare(
+        &self,
+        system_session: &str,
+        row: &crate::db::PhantomTrackingTask,
+        child_task_id: &str,
+        pid: i64,
+        source: &str,
+        trace_id: &str,
+    ) {
+        info!(
+            event = "phantom_sweep_spared",
+            source,
+            task_id = %row.id,
+            child_task_id = %child_task_id,
+            process_id = pid,
+            updated_at = %row.updated_at,
+            // The row carries its own agent_id — no need to thread the
+            // caller's copy through just to log it.
+            agent_id = %row.agent_id,
+            trace_id = %trace_id,
+            "phantom_sweep: tracking row spared — dispatch child process is alive"
+        );
+        if let Err(e) = self
+            .db
+            .log_audit_event(
+                system_session,
+                "phantom_sweep_spared",
+                &format!("task:{}", row.id),
+                Some(&row.status),
+                Some(&row.status),
+                Some(&format!(
+                    "{source}: spared — dispatch child {child_task_id} pid {pid} is alive"
+                )),
+                Some(trace_id),
+            )
+            .await
+        {
+            // Non-fatal: the transition was withheld either way. Losing the
+            // audit row costs visibility, never correctness.
+            warn!(
+                task_id = %row.id,
+                error = %e,
+                "phantom_sweep: failed to write spare audit event (row was still spared)"
+            );
+        }
+    }
+
     /// Sweep NULL-PID phantom tracking rows (mika#1712, AC3).
     ///
     /// Selects rows with `action_type='none'`, `process_id IS NULL`,
     /// `status IN ('in_progress','blocked')`, and `updated_at` older than the
     /// configured grace window (`MIKA_PHANTOM_SWEEP_AGE_SECONDS`, default
-    /// 3600s). Transitions each match to `failed` with `error_reason =
+    /// 14400s since mika#2156). Transitions each match to `failed` with `error_reason =
     /// "phantom_aged_out"` via `update_task_failed` (guarded UPDATE — races
     /// with in-flight operator/agent transitions lose cleanly).
     ///
@@ -1058,8 +1234,12 @@ impl TaskEngine {
     /// AC3 (watchdog) and AC5 (startup) branches can be joined offline.
     ///
     /// Per-pass emits a `phantom_sweep_complete` INFO log line when at least
-    /// one row was swept, with `source="watchdog_tick"` and the aggregate
-    /// count. On count > 100 additionally emits `phantom_sweep_large_backlog`
+    /// one row was swept, spared, errored, or skipped for an unreadable
+    /// lookup (mika#2156), with `source="watchdog_tick"` and the aggregate
+    /// counts. Since mika#2156 a `count = 0` line carrying `spared_count > 0`
+    /// is the healthy shape while a long dispatch is in flight — it means the
+    /// guard withheld a transition, not that the sweeper found nothing.
+    /// On count > 100 additionally emits `phantom_sweep_large_backlog`
     /// WARN for operator anomaly visibility. NEVER caps the sweep — the
     /// telemetry is the point (feeds the mika#1934 cause-racine investigation
     /// per sami bearing §3 "no silent cap").
@@ -1101,11 +1281,41 @@ impl TaskEngine {
         let system_session = format!("system-{agent_id}");
         let mut swept_count: u32 = 0;
         let mut error_count: u32 = 0;
+        let mut spared_count: u32 = 0;
+        let mut lookup_error_count: u32 = 0;
+        let mut unusable_child_count: u32 = 0;
 
         for row in phantoms {
             // ADV-5 (2026-08-21): re-arm heartbeat every row so a large sweep
             // pass never trips the 300s wedge watchdog. Cheap AtomicI64 store.
             self.heartbeat.tick();
+
+            // mika#2156: age says how long ago this row was last *written*,
+            // not how long ago the work last showed a sign of life — the
+            // tracking row's `updated_at` is never bumped while its dispatch
+            // runs. Ask the dispatch child before writing the failure.
+            match self.dispatch_liveness(&row.id).await {
+                DispatchLiveness::Live { child_id, pid } => {
+                    spared_count = spared_count.saturating_add(1);
+                    self.record_phantom_spare(
+                        &system_session,
+                        &row,
+                        &child_id,
+                        pid,
+                        "watchdog_tick",
+                        &trace_id,
+                    )
+                    .await;
+                    continue;
+                }
+                DispatchLiveness::Unknown => {
+                    lookup_error_count = lookup_error_count.saturating_add(1);
+                    continue;
+                }
+                DispatchLiveness::NoneLive { unusable_children } => {
+                    unusable_child_count = unusable_child_count.saturating_add(unusable_children);
+                }
+            }
 
             match self
                 .db
@@ -1181,15 +1391,18 @@ impl TaskEngine {
         // R7/ADV-4 (2026-08-21): emit the aggregate line when EITHER
         // successful sweeps OR errors occurred, so a silent-failure pass
         // (many rows queried, all update_task_failed Err) still surfaces.
-        if swept_count > 0 || error_count > 0 {
+        if swept_count > 0 || error_count > 0 || spared_count > 0 || lookup_error_count > 0 {
             info!(
                 event = "phantom_sweep_complete",
                 source = "watchdog_tick",
                 count = swept_count,
                 error_count = error_count,
+                spared_count = spared_count,
+                lookup_error_count = lookup_error_count,
+                unusable_child_count = unusable_child_count,
                 agent_id = %agent_id,
                 trace_id = %trace_id,
-                "phantom_sweep watchdog tick swept phantom tracking rows"
+                "phantom_sweep watchdog tick complete"
             );
         }
         if swept_count > 100 {
@@ -1221,15 +1434,32 @@ impl TaskEngine {
     /// skips `trigger_type == MANUAL` in-progress rows with the comment
     /// "Manual (task) tasks represent human work — don't invalidate on
     /// restart". This method narrows that invariant: it DOES transition
-    /// manual/none/NULL-PID rows because per plan §7 D2 they are the phantom
-    /// shape by design — a legitimate long-running manual tracking row would
-    /// have `updated_at` bumped by any `update_task_status` write within
-    /// `MIKA_PHANTOM_SWEEP_AGE_SECONDS` (default 3600s), while a genuinely
-    /// wedged one has stale `updated_at` far past grace. AC5 at age=0 is
-    /// aggressive by intent: any phantom-shape row present at startup
-    /// outlived a prior process, which is the ticket's founding-incident
-    /// signal (24 rows/18h). If a legitimate multi-hour tracking row gets
-    /// swept, the operator un-fails it via SQL (see plan §Rollback).
+    /// manual/none/NULL-PID rows, because they are the phantom shape by
+    /// design — the real process lives on a separate `long_running:*` recall
+    /// row, so the tracking row never carries a `process_id` of its own.
+    ///
+    /// **What justifies age=0 — corrected mika#2156.** This comment used to
+    /// rest on two propositions that measurement contradicts, and they are
+    /// recorded here because a reader is likely to reach for them again:
+    ///
+    /// 1. *"a legitimate long-running tracking row would have `updated_at`
+    ///    bumped while it works"* — it does not. Measure M7 of the mika#2156
+    ///    plan found tracking rows mid-dispatch with `updated_at` frozen one
+    ///    second after creation. Age measures time since the last write to
+    ///    the row, never time since the work last showed a sign of life; the
+    ///    two only coincide once the work is dead.
+    /// 2. *"any phantom-shape row present at startup outlived a prior
+    ///    process"* — it need not have. A pilot is its own process-group
+    ///    leader (`skills/executor.rs`, `.process_group(0)`, mika#855), so a
+    ///    group signal aimed at the engine misses it, `supervise-daemon`
+    ///    restarts the engine from a third group, and the pilot is reparented
+    ///    to PID 1 and keeps working (measure M8).
+    ///
+    /// What actually separates an orphan from live work is therefore
+    /// [`Self::live_dispatch_child`], not the clock — and age=0 is safe here
+    /// precisely because that guard runs first. Aggressive freshness now only
+    /// decides how quickly rows with *no responding process* are cleaned up.
+    /// If a legitimate row is still swept, the operator un-fails it via SQL.
     async fn sweep_null_pid_phantoms_at_startup(&self) {
         let phantoms = match self.db.find_phantom_tracking_tasks(0).await {
             Ok(p) => p,
@@ -1251,6 +1481,9 @@ impl TaskEngine {
         let system_session = format!("system-{agent_id}");
         let mut swept_count: u32 = 0;
         let mut error_count: u32 = 0;
+        let mut spared_count: u32 = 0;
+        let mut lookup_error_count: u32 = 0;
+        let mut unusable_child_count: u32 = 0;
 
         for row in phantoms {
             // ADV-5 (2026-08-21): re-arm heartbeat every row so a large
@@ -1259,6 +1492,37 @@ impl TaskEngine {
             // but the heartbeat.tick() call is cheap AtomicI64 and futureproofs
             // against re-ordering.
             self.heartbeat.tick();
+
+            // mika#2156: same guard as the tick path, and it matters *more*
+            // here — at age=0 there is no grace window to absorb the mistake,
+            // so without it every engine restart would mark `failed` the whole
+            // set of dispatches actually in flight. A pilot survives that
+            // restart: it is its own process-group leader
+            // (`skills/executor.rs`, `.process_group(0)`, mika#855), so a
+            // group signal aimed at the engine misses it and it is reparented
+            // to PID 1.
+            match self.dispatch_liveness(&row.id).await {
+                DispatchLiveness::Live { child_id, pid } => {
+                    spared_count = spared_count.saturating_add(1);
+                    self.record_phantom_spare(
+                        &system_session,
+                        &row,
+                        &child_id,
+                        pid,
+                        "startup_sweep",
+                        &trace_id,
+                    )
+                    .await;
+                    continue;
+                }
+                DispatchLiveness::Unknown => {
+                    lookup_error_count = lookup_error_count.saturating_add(1);
+                    continue;
+                }
+                DispatchLiveness::NoneLive { unusable_children } => {
+                    unusable_child_count = unusable_child_count.saturating_add(unusable_children);
+                }
+            }
 
             match self.db.update_task_failed(&row.id, "startup_sweep").await {
                 Ok(true) => {
@@ -1318,16 +1582,19 @@ impl TaskEngine {
             }
         }
 
-        if swept_count > 0 || error_count > 0 {
+        if swept_count > 0 || error_count > 0 || spared_count > 0 || lookup_error_count > 0 {
             info!(
                 event = "phantom_sweep_complete",
                 source = "startup_sweep",
                 count = swept_count,
                 error_count = error_count,
+                spared_count = spared_count,
+                lookup_error_count = lookup_error_count,
+                unusable_child_count = unusable_child_count,
                 agent_id = %agent_id,
                 reason = "phantom_signature_null_pid_manual_none",
                 trace_id = %trace_id,
-                "phantom_sweep startup swept pre-existing phantom rows"
+                "phantom_sweep startup pass complete"
             );
         }
         if swept_count > 100 {

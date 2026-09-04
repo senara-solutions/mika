@@ -996,6 +996,30 @@ impl AsyncDatabase {
             .await
     }
 
+    /// The dispatch children of a tracking row that carry a `process_id`.
+    /// Wraps [`Database::find_dispatch_children_with_pid`]. mika#2156.
+    ///
+    /// No extra agent scoping: the parent row was already selected by
+    /// `find_phantom_tracking_tasks`, which is agent-scoped, and a child is
+    /// reachable only through its parent's id.
+    pub async fn find_dispatch_children_with_pid(
+        &self,
+        parent_task_id: &str,
+    ) -> Result<Vec<crate::db::DispatchChild>> {
+        let p = parent_task_id.to_owned();
+        self.with_db(move |db| db.find_dispatch_children_with_pid(&p))
+            .await
+    }
+
+    /// Test-only: rewrite a task's primary key. Wraps
+    /// [`Database::set_task_id_for_test`]. mika#2156.
+    #[doc(hidden)]
+    pub async fn set_task_id_for_test(&self, old_id: &str, new_id: &str) -> Result<()> {
+        let (o, n) = (old_id.to_owned(), new_id.to_owned());
+        self.with_db(move |db| db.set_task_id_for_test(&o, &n))
+            .await
+    }
+
     /// Count `audit_events` rows for the scoped agent + `tool_name`. Wraps
     /// [`Database::count_audit_events_by_tool_name`]. Used by mika#1712
     /// integration tests to assert the load-bearing audit-write delta on the
