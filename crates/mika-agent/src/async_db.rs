@@ -1141,8 +1141,24 @@ impl AsyncDatabase {
             .await
     }
 
-    /// Cancel a parent's surviving deferred wrappers before expiry (mika#2045).
-    /// See [`Database::cancel_deferred_wrappers_of_parent`].
+    /// Parents the reaper is sheltering only because a promoted wrapper is still
+    /// live (mika#2181). See [`Database::find_parents_sheltered_by_promoted_wrapper`].
+    pub async fn find_parents_sheltered_by_promoted_wrapper(
+        &self,
+        grace_seconds: i64,
+        promoted_liveness_seconds: i64,
+    ) -> Result<Vec<String>> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| {
+            db.find_parents_sheltered_by_promoted_wrapper(
+                &a,
+                grace_seconds,
+                promoted_liveness_seconds,
+            )
+        })
+        .await
+    }
+
     /// Every deferred wrapper of a parent, oldest first (mika#2181 AC4).
     /// See [`Database::summarize_deferred_wrappers_of_parent`].
     pub async fn summarize_deferred_wrappers_of_parent(
@@ -1155,6 +1171,8 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Cancel a parent's surviving deferred wrappers before expiry (mika#2045).
+    /// See [`Database::cancel_deferred_wrappers_of_parent`].
     pub async fn cancel_deferred_wrappers_of_parent(&self, parent_task_id: &str) -> Result<usize> {
         let a = self.agent_id.clone();
         let p = parent_task_id.to_owned();

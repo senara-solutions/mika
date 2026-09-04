@@ -7637,6 +7637,7 @@ impl Database {
                AND NOT EXISTS (
                  SELECT 1 FROM tasks w
                  WHERE w.parent_task_id = parent.id
+                   AND w.agent_id = ?1
                    AND w.trigger_type = 'callback'
                    AND w.label = ?3
                    AND (
@@ -7719,12 +7720,74 @@ impl Database {
         self.get_stuck_rearm_count(task_id)
     }
 
-    /// Cancel every deferred wrapper of a parent that is not already terminal
-    /// (mika#2045). Called immediately before expiring the parent: a wrapper
-    /// that survives the expiry can still be promoted, and would then replay a
-    /// dispatch against a dead parent while the `ready` sweep has already
-    /// created a live replacement for the same issue — a double dispatch.
-    /// Returns the number of wrappers cancelled.
+    /// Parents past the grace that the reaper is sheltering **only** because a
+    /// promoted wrapper is still inside the liveness window (mika#2181).
+    ///
+    /// The sheltering happens inside a SQL `NOT EXISTS`, so a spared parent
+    /// never reaches Rust: it produces no candidate, no log line, no audit
+    /// event, and `mika tasks stuck` does not print it. If the widened predicate
+    /// ever disarmed the reaper systematically, its counters would fall to zero
+    /// — indistinguishable from a healthy loop. That silence is the failure mode
+    /// `docs/solutions/best-practices/a-reaper-that-reads-a-proxy-instead-of-the-process-2026-09-04.md`
+    /// names ("faucher, **et le compter**") and fixed for the sibling sweep with
+    /// `phantom_sweep_spared`. This is that counter for this reaper.
+    ///
+    /// It is the exact complement of clause (1): same parent filters, same
+    /// grace, but requiring a live *promoted* wrapper rather than the absence of
+    /// any live one. A parent held by a plain `pending` wrapper is ordinary
+    /// queueing and is not counted — only the new shelter this fix introduced.
+    pub fn find_parents_sheltered_by_promoted_wrapper(
+        &self,
+        agent_id: &str,
+        grace_seconds: i64,
+        promoted_liveness_seconds: i64,
+    ) -> Result<Vec<String>> {
+        let grace_modifier = format!("-{grace_seconds} seconds");
+        let liveness_modifier = format!("-{promoted_liveness_seconds} seconds");
+        let mut stmt = self.conn.prepare(
+            "SELECT parent.reference_url
+             FROM tasks parent
+             WHERE parent.agent_id = ?1
+               AND parent.status = 'pending'
+               AND parent.source = 'self_dev'
+               AND parent.trigger_type = 'manual'
+               AND parent.type = 'issue'
+               AND parent.reference_url IS NOT NULL
+               AND parent.created_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+               AND EXISTS (
+                 SELECT 1 FROM tasks w
+                 WHERE w.parent_task_id = parent.id
+                   AND w.agent_id = ?1
+                   AND w.trigger_type = 'callback'
+                   AND w.label = ?3
+                   AND w.status = 'completed'
+                   AND w.completed_at IS NOT NULL
+                   AND w.completed_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?4)
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM tasks w2
+                 WHERE w2.parent_task_id = parent.id
+                   AND w2.agent_id = ?1
+                   AND w2.trigger_type = 'callback'
+                   AND w2.label = ?3
+                   AND w2.status = 'pending'
+               )
+             ORDER BY parent.id",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    agent_id,
+                    grace_modifier,
+                    crate::agent::DEFERRED_DISPATCH_LABEL,
+                    liveness_modifier
+                ],
+                |row| row.get(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Every deferred wrapper of a parent with the fields the stuck-pending
     /// reaper's verdict turns on (mika#2181 AC4), oldest first.
     ///
@@ -7743,7 +7806,11 @@ impl Database {
                AND parent_task_id = ?2
                AND trigger_type = 'callback'
                AND label = ?3
-             ORDER BY created_at ASC",
+             -- `created_at` has one-second resolution, so it is not a total
+             -- order: two wrappers minted in the same second would render in an
+             -- arbitrary order in the audit line. `rowid` breaks the tie by
+             -- insertion, which is the order the reaper's reader expects.
+             ORDER BY created_at ASC, rowid ASC",
         )?;
         let rows = stmt
             .query_map(
@@ -7764,6 +7831,12 @@ impl Database {
         Ok(rows)
     }
 
+    /// Cancel every deferred wrapper of a parent that is not already terminal
+    /// (mika#2045). Called immediately before expiring the parent: a wrapper
+    /// that survives the expiry can still be promoted, and would then replay a
+    /// dispatch against a dead parent while the `ready` sweep has already
+    /// created a live replacement for the same issue — a double dispatch.
+    /// Returns the number of wrappers cancelled.
     pub fn cancel_deferred_wrappers_of_parent(
         &self,
         agent_id: &str,
@@ -16488,6 +16561,137 @@ mod tests {
         }
     }
 
+    /// The two windows must not be transposable (mika#2181).
+    ///
+    /// Every other call site passes `(2700, 2700)`, so a swap of `grace_seconds`
+    /// and `promoted_liveness_seconds` — in the signature, in the `params!`
+    /// binding, or at a caller — would pass the entire suite. This is the one
+    /// test that separates them: the same fixture must give opposite answers
+    /// under the two orderings.
+    #[test]
+    fn test_find_orphaned_pending_distinguishes_grace_from_liveness() {
+        let db = db();
+        let parent_id = create_pending_issue_parent(&db, 2158, 3600);
+        attach_deferred_wrapper_at(&db, &parent_id, "completed", 1200);
+
+        // Promotion 1200 s ago, liveness 3600 s: the wrapper is still live, so
+        // the parent is sheltered.
+        assert!(
+            db.find_orphaned_pending_issue_tasks("mika", 2700, 3600)
+                .unwrap()
+                .is_empty(),
+            "grace 2700 / liveness 3600 must shelter a wrapper promoted 1200 s ago"
+        );
+
+        // Same fixture, windows swapped: liveness 2700 still shelters it, so a
+        // transposition is only detectable with a liveness SHORTER than the
+        // promotion age. 300 s expires the shield; the parent is orphaned.
+        assert_eq!(
+            db.find_orphaned_pending_issue_tasks("mika", 2700, 300)
+                .unwrap()
+                .len(),
+            1,
+            "grace 2700 / liveness 300 must NOT shelter a wrapper promoted 1200 s ago"
+        );
+
+        // And the mirror: swapping the arguments of the sheltering call flips
+        // its answer, which is exactly what a transposed binding would do.
+        assert_eq!(
+            db.find_orphaned_pending_issue_tasks("mika", 300, 2700)
+                .unwrap()
+                .len(),
+            0,
+            "grace 300 / liveness 2700 shelters — the two parameters are not interchangeable"
+        );
+    }
+
+    /// The window's edge is `>`, strictly (mika#2181). At exactly the boundary a
+    /// wrapper is NOT live, and that direction is the safe one: an off-by-one
+    /// here costs one tick of detection latency, never a wrongly-sheltered
+    /// parent. Only the exclusive side is pinned — `-2699` would race the
+    /// fixture and the query into the same second and flake.
+    #[test]
+    fn test_find_orphaned_pending_liveness_boundary_is_exclusive() {
+        let db = db();
+        let parent_id = create_pending_issue_parent(&db, 2158, 11_455);
+        attach_deferred_wrapper_at(&db, &parent_id, "completed", 2700);
+
+        let orphans = db
+            .find_orphaned_pending_issue_tasks("mika", 2700, 2700)
+            .unwrap();
+        assert_eq!(
+            orphans.len(),
+            1,
+            "completed_at == now - liveness is not `>` — the wrapper is spent"
+        );
+        assert_eq!(orphans[0].id, parent_id);
+    }
+
+    /// A `pending` wrapper is live regardless of `completed_at` (mika#2181).
+    ///
+    /// The first disjunct must not be made conditional on the timestamp by a
+    /// later edit: a wrapper still waiting for its slot is represented however
+    /// old any stale timestamp on the row happens to be.
+    #[test]
+    fn test_find_orphaned_pending_shelters_pending_wrapper_with_stale_completed_at() {
+        let db = db();
+        let parent_id = create_pending_issue_parent(&db, 2158, 11_455);
+        attach_deferred_wrapper_at(&db, &parent_id, "pending", 999_999);
+
+        assert!(
+            db.find_orphaned_pending_issue_tasks("mika", 2700, 2700)
+                .unwrap()
+                .is_empty(),
+            "a pending wrapper is live on its status alone"
+        );
+    }
+
+    /// D7's whole reason to exist: `has_live_deferred_wrapper_child` and clause
+    /// (1) of `find_orphaned_pending_issue_tasks` answer the SAME question, and
+    /// the repo's own rule (docs/solutions/.../asymmetric-perimeter-predicate-drift)
+    /// says a deliberate fork ships its parity test in the same commit. The two
+    /// clauses are hand-synced SQL; this is what makes a one-sided edit fail.
+    #[test]
+    fn test_live_wrapper_predicate_agrees_with_orphan_clause() {
+        // (wrapper status, completed_at offset or None) -> is the wrapper live?
+        let cases: &[(&str, Option<i64>)] = &[
+            ("pending", None),
+            ("pending", Some(999_999)),
+            ("completed", Some(0)),
+            ("completed", Some(1200)),
+            ("completed", Some(3000)),
+            ("completed", None),
+            ("delivered", Some(0)),
+            ("failed", Some(0)),
+            ("cancelled", Some(0)),
+        ];
+
+        for (status, offset) in cases {
+            let db = db();
+            let parent_id = create_pending_issue_parent(&db, 2158, 11_455);
+            match offset {
+                Some(o) => attach_deferred_wrapper_at(&db, &parent_id, status, *o),
+                None => attach_deferred_wrapper(&db, &parent_id, status),
+            };
+
+            let twin_says_live = db
+                .has_live_deferred_wrapper_child("mika", &parent_id, 2700)
+                .unwrap();
+            // The parent is orphaned exactly when no wrapper shelters it.
+            let clause_says_live = db
+                .find_orphaned_pending_issue_tasks("mika", 2700, 2700)
+                .unwrap()
+                .is_empty();
+
+            assert_eq!(
+                twin_says_live, clause_says_live,
+                "predicates diverged on ({status}, {offset:?}): \
+                 has_live_deferred_wrapper_child={twin_says_live}, \
+                 orphan clause sheltered={clause_says_live}"
+            );
+        }
+    }
+
     #[test]
     fn test_has_live_deferred_wrapper_child() {
         let db = db();
@@ -16576,12 +16780,18 @@ mod tests {
         assert_eq!(summaries[1].status, "pending");
         assert_eq!(summaries[1].completed_at, None);
 
-        let rendered = DeferredWrapperSummary::render(&summaries);
-        assert!(rendered.starts_with("wrappers:"));
-        assert!(rendered.contains(&promoted[..8]));
-        assert!(rendered.contains(&queued[..8]));
-        assert!(rendered.contains("completed@2"), "got: {rendered}");
-        assert!(rendered.contains("pending@-"), "got: {rendered}");
+        // Pin the whole layout, not a substring. `contains("completed@2")`
+        // passes for any string whose timestamp merely starts with a `2` — it
+        // asserts the century, not the format.
+        let promoted_at = summaries[0].completed_at.as_deref().unwrap();
+        assert_eq!(
+            DeferredWrapperSummary::render(&summaries),
+            format!(
+                "wrappers:{}:completed@{promoted_at},{}:pending@-",
+                &promoted[..8],
+                &queued[..8]
+            )
+        );
     }
 
     // -- find_childless_stuck_parent_tasks tests (mika#1687) --
