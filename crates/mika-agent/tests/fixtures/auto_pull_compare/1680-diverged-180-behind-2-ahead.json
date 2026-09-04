@@ -1,1 +1,28 @@
-{"ahead_by":2,"behind_by":180,"diff_url":"https://github.com/senara-solutions/mika/compare/main...fix/1680/mika-dev-tui-broken-glyph-rendering-in.diff","html_url":"https://github.com/senara-solutions/mika/compare/main...fix/1680/mika-dev-tui-broken-glyph-rendering-in","patch_url":"https://github.com/senara-solutions/mika/compare/main...fix/1680/mika-dev-tui-broken-glyph-rendering-in.patch","permalink_url":"https://github.com/senara-solutions/mika/compare/senara-solutions:2f6bead...senara-solutions:912c82d","status":"diverged","total_commits":2,"url":"https://api.github.com/repos/senara-solutions/mika/compare/main...fix/1680/mika-dev-tui-broken-glyph-rendering-in"}
+{
+  "ahead_by": 2,
+  "behind_by": 180,
+  "diff_url": "https://github.com/senara-solutions/mika/compare/main...fix/1680/mika-dev-tui-broken-glyph-rendering-in.diff",
+  "html_url": "https://github.com/senara-solutions/mika/compare/main...fix/1680/mika-dev-tui-broken-glyph-rendering-in",
+  "patch_url": "https://github.com/senara-solutions/mika/compare/main...fix/1680/mika-dev-tui-broken-glyph-rendering-in.patch",
+  "permalink_url": "https://github.com/senara-solutions/mika/compare/senara-solutions:2f6bead...senara-solutions:912c82d",
+  "status": "diverged",
+  "total_commits": 2,
+  "url": "https://api.github.com/repos/senara-solutions/mika/compare/main...fix/1680/mika-dev-tui-broken-glyph-rendering-in",
+  "files": [
+    {
+      "filename": "crates/mika-agent/src/agent_loop/mod.rs"
+    },
+    {
+      "filename": "crates/mika-agent/src/evidence/guards.rs"
+    },
+    {
+      "filename": "crates/mika-agent/src/evidence/mod.rs"
+    },
+    {
+      "filename": "crates/mika-agent/src/well_known_agents.rs"
+    },
+    {
+      "filename": "docs/plans/2026-06-30-016-fix-1680-mika-dev-cn-output-bleed-plan.md"
+    }
+  ]
+}

@@ -34,14 +34,37 @@
 //! because such branches conflict more often (that would be point 2 again), but
 //! because they have *two* legitimate resolutions — rebase the work, or abandon
 //! it — and choosing between them is a judgement about work, not about git. The
-//! loop should not make that choice silently by rebasing over it. `ahead_by`
-//! separates the two populations for free: a branch carrying only its plan has
-//! `ahead_by == 1`; every branch that died on 2026-08-31 carried more.
+//! loop should not make that choice silently by rebasing over it.
+//!
+//! **The two populations are separated by what the commits *touch*, not by how
+//! many there are (mika#2140).** The original rule read `ahead_by > 1`, on the
+//! stated assumption that "a branch carrying only its plan has `ahead_by == 1`".
+//! That assumption was false on the *nominal* grooming path:
+//! `.claude/commands/mika-groom-ticket.md` commits the plan at three distinct
+//! sites (Phase 3 step 10, Phase 4 step 12, Phase 5 step 17), by design, so the
+//! lineage between "the architect signed" and "the operator wrote" stays
+//! readable. Every ticket whose architect asked for an iteration therefore
+//! carried `ahead_by ∈ {2,3}` without a pilot ever touching it — and the gate
+//! called that "a dead pilot's partial work", labelled it, and removed from the
+//! pool exactly the tickets that had been worked on hardest. Measured
+//! 2026-09-04: **10 open branches** were in that state, all carrying nothing but
+//! their own plan file.
+//!
+//! The rule is now: a branch that modifies at least one file outside
+//! [`PLAN_PATH_PREFIX`] carries work that is not grooming. `ahead_by` stops
+//! being a discriminator and goes back to being what it is — a distance, logged,
+//! never interpreted.
 //!
 //! The stated cost: this refuses some branches that would have rebased fine —
 //! `feat/1959/…` in the frozen fixtures is exactly that case, measured. The
 //! alternative is an autonomous loop disposing of a dead pilot's work with
 //! nobody reading it.
+//!
+//! What it does **not** close, and does not pretend to: a pilot killed before
+//! its first commit leaves *uncommitted* work, invisible to a commit count and
+//! equally invisible to a `compare` file list. Closing that would need a local
+//! git state this module does not have (it has no checkout — see
+//! [`measure_branch_staleness`]).
 
 use anyhow::{Result, anyhow};
 use regex::Regex;
@@ -203,9 +226,56 @@ fn max_redrives() -> i64 {
 /// requiring operator-host-time. Distinct from parked/blocked. No ready
 /// label."* Repairing `operator-review` itself belongs to the mika#2020 path,
 /// not to this ticket.
+///
+/// # This label is lifted **manually** (mika#2140 AC6)
+///
+/// The gate never removes it on its own. Three reasons, two of them structural.
+///
+/// 1. **Self-lifting contradicts itself.** [`is_feeder_excluded`] drops every
+///    ticket carrying this label from all three phases. A gate that re-read its
+///    own refusals would first have to re-evaluate tickets its own exclusion
+///    forbids it to look at.
+/// 2. **The machine cannot tell its label from the operator's.** The declared
+///    description (`.github/labels.yml:106`) is *"Groomed work requiring
+///    operator-host-time. Distinct from parked/blocked. No ready label."* — a
+///    legitimate operator gesture. A gate that removed it would silently un-gate
+///    work a human gated: exactly the fault mika#2140 fixes, a reader assuming
+///    what its producer produced.
+/// 3. **The channel already exists.** [`RefusalReason::comment_body`] already
+///    says "then remove the `operator-gated` label". What was missing was not
+///    the gesture but its *readable reason* — which the named file list now
+///    supplies.
+///
+/// **Why manual is tenable now and was not before.** A manual lift used to run
+/// through a rebase that set `behind_by` to `0`, so it survived only until the
+/// next merge on `main`: 63 minutes, measured on #2120 (2026-09-02 11:10:02Z).
+/// That is Sisyphus, not a remedy. Under the file-based predicate a branch
+/// carrying only its plan never enters
+/// [`RefusalReason::SalvageWorkOnStaleBranch`] at all, whatever `behind_by` is —
+/// so the lift no longer depends on a value that `main` advancing destroys. It
+/// is idempotent with respect to `main`. If such a branch ever crosses the
+/// distance threshold, the refusal that arrives is [`RefusalReason::TooFarBehind`]
+/// — a different reason with a different, legitimate remedy, not the same lift
+/// to redo.
 const REFUSAL_LABEL: &str = "operator-gated";
 
 const MAX_BEHIND_DEFAULT: i64 = 50;
+
+/// The only prefix a pure-grooming branch modifies (mika#2140).
+///
+/// **Relative to the repo root, and that is measured rather than read off a
+/// spec.** GitHub's `compare` endpoint returns `docs/plans/…`, never
+/// `mika/docs/plans/…` — checked 2026-09-03 against
+/// `compare/main...fix/2120/…`. The distinction is not pedantry: assuming the
+/// other shape is precisely what broke [`is_groomed`] (mika#2120), where the
+/// guard required `docs/plans/` while the grooming spec wrote
+/// `mika/docs/plans/`. Same class of defect, opposite direction — hence the
+/// measurement, at this boundary, written down next to the constant.
+///
+/// The trailing slash is load-bearing: the match is a literal `starts_with`, so
+/// `docs/plansible/x.md` counts as *outside* the prefix, which is the intended
+/// reading.
+const PLAN_PATH_PREFIX: &str = "docs/plans/";
 
 /// Env override for the promotion staleness threshold (mika#2123). The literal
 /// `0` disables the distance check entirely (pre-fix behaviour), mirroring the
@@ -423,6 +493,57 @@ pub struct BranchStaleness {
     pub ahead_by: i64,
     /// GitHub's own word: `identical`, `ahead`, `behind`, or `diverged`.
     pub status: String,
+    /// The paths the branch modifies relative to `main`, exactly as the
+    /// `compare` endpoint reports them — relative to the repo root, measured
+    /// (see [`PLAN_PATH_PREFIX`]).
+    ///
+    /// `None` when the `files` key is absent or is not an array: *"I could not
+    /// read"*, never *"there is nothing"*. Collapsing those two is how a gate
+    /// starts lying — the same distinction [`StalenessMeasurement`] makes one
+    /// level up.
+    pub changed_files: Option<Vec<String>>,
+}
+
+/// The files a branch changes that are **not** part of grooming (mika#2140).
+///
+/// Pure and total. `None` — the list was truncated by the API, absent, or not
+/// an array — yields an empty vector *by construction rather than by a separate
+/// `if`*: the caller then finds nothing to salvage and falls through to the
+/// distance rule, which is the module's fail-open invariant ("every 'could not
+/// measure' outcome promotes") applied without restating it.
+///
+/// Truncation needs no special case for the same reason. If the truncated list
+/// already shows a non-plan file, the fact sought is established and truncation
+/// cannot retract it. If everything visible is under [`PLAN_PATH_PREFIX`], the
+/// only possible ignorance is "there might have been code further down" — so the
+/// branch is not classified as salvage, and it promotes.
+pub fn non_plan_files(changed: Option<&[String]>) -> Vec<String> {
+    changed
+        .unwrap_or(&[])
+        .iter()
+        .filter(|f| !f.starts_with(PLAN_PATH_PREFIX))
+        .cloned()
+        .collect()
+}
+
+/// How many paths a refusal message or audit record names before summarising
+/// the rest (mika#2140 AC5). A GitHub comment must not become a `git diff
+/// --stat`.
+const MAX_NAMED_FILES: usize = 10;
+
+/// Render a file list for humans, bounded by [`MAX_NAMED_FILES`].
+fn format_named_files(files: &[String]) -> String {
+    let shown: Vec<String> = files
+        .iter()
+        .take(MAX_NAMED_FILES)
+        .map(|f| format!("`{f}`"))
+        .collect();
+    let rest = files.len().saturating_sub(MAX_NAMED_FILES);
+    if rest == 0 {
+        shown.join(", ")
+    } else {
+        format!("{} … et {rest} autres", shown.join(", "))
+    }
 }
 
 /// The outcome of trying to measure a branch (mika#2123 U1).
@@ -459,13 +580,20 @@ pub enum RefusalReason {
         ahead_by: i64,
         threshold: i64,
     },
-    /// The branch is stale **and** carries more than its plan commit — partial
-    /// work from an earlier pilot. See [`RefusalReason::remedy`] for why this is
-    /// a separate refusal and not just a stricter threshold.
+    /// The branch is stale **and** modifies at least one file outside
+    /// [`PLAN_PATH_PREFIX`] — work that is not grooming. See
+    /// [`RefusalReason::remedy`] for why this is a separate refusal and not just
+    /// a stricter threshold.
+    ///
+    /// `non_plan_files` carries *which* files decided it (mika#2140 AC5). A
+    /// refusal that says "partial work" without saying which forces the operator
+    /// to redo the investigation by hand — which is what happened on
+    /// 2026-09-02, twice.
     SalvageWorkOnStaleBranch {
         branch: String,
         behind_by: i64,
         ahead_by: i64,
+        non_plan_files: Vec<String>,
     },
     /// The branch named in the ticket's callout does not exist on origin.
     BranchAbsent { branch: String },
@@ -508,10 +636,13 @@ impl RefusalReason {
                 branch,
                 behind_by,
                 ahead_by,
+                non_plan_files,
             } => format!(
                 "La branche `{branch}` de #{issue_number} est en retard de **{behind_by} commits** \
-                 et porte **{ahead_by} commits** — donc plus que son seul commit de plan : \
-                 du travail partiel laissé par un pilote antérieur."
+                 (avance : {ahead_by}) et modifie **{n} fichier(s) hors `{PLAN_PATH_PREFIX}`** — \
+                 du travail qui n'est pas du grooming : {files}.",
+                n = non_plan_files.len(),
+                files = format_named_files(non_plan_files),
             ),
             Self::BranchAbsent { branch } => format!(
                 "La branche `{branch}` désignée par le callout de #{issue_number} \
@@ -606,10 +737,21 @@ pub fn parse_compare_payload(stdout: &str) -> Result<BranchStaleness> {
         .as_str()
         .ok_or_else(|| anyhow!("compare payload has no status"))?
         .to_string();
+    // `files` is optional, unlike the three above: absent means "not read",
+    // and [`non_plan_files`] turns that into a promotion. Entries without a
+    // string `filename` are skipped rather than failing the parse — the gate
+    // reads that one field and nothing else.
+    let changed_files = v["files"].as_array().map(|entries| {
+        entries
+            .iter()
+            .filter_map(|e| e["filename"].as_str().map(str::to_string))
+            .collect()
+    });
     Ok(BranchStaleness {
         behind_by,
         ahead_by,
         status,
+        changed_files,
     })
 }
 
@@ -662,26 +804,35 @@ pub fn classify_promotion(
 
     // U3 / AC5 — the `wip(...)` disposition, decided rather than carried.
     //
-    // `ahead_by` separates the two populations for free: a branch carrying only
-    // its plan commit has `ahead_by == 1`; every branch that died at the rebase
-    // on 2026-08-31 carried more (2, 3, 5 and 6, measured).
+    // The two populations are separated by what the commits **touch**, not by
+    // how many there are (mika#2140). The previous test, `ahead_by > 1`, assumed
+    // a grooming branch carries exactly one plan commit; the grooming spec
+    // commits the plan at three sites by design, so every ticket that needed an
+    // architect round-trip was misread as a dead pilot's leftovers. Ten open
+    // branches were in that state on 2026-09-04, all carrying nothing but their
+    // own plan file.
     //
-    // The reason is *not* that such branches conflict more often — that would be
-    // predicting a conflict, which this gate is forbidden to pretend to do
-    // (KTD2b). It is that a stale branch carrying unpushed partial work from a
-    // dead pilot has **two** legitimate resolutions — rebase the work, or
-    // abandon it — and choosing between them is a judgement about *work*, not
-    // about git. The loop should not make that choice silently by rebasing over
-    // it.
+    // The reason for the rule itself is unchanged and is *not* that such
+    // branches conflict more often — that would be predicting a conflict, which
+    // this gate is forbidden to pretend to do (KTD2b). It is that a stale branch
+    // carrying partial work from a dead pilot has **two** legitimate resolutions
+    // — rebase the work, or abandon it — and choosing between them is a
+    // judgement about *work*, not about git. The loop should not make that
+    // choice silently by rebasing over it.
+    //
+    // Position in the rule order is unchanged: before the distance rule, because
+    // it is the more specific fact about the same branch and its remedy differs.
     //
     // Cost, stated plainly: this refuses some branches that would have rebased
     // fine. That is accepted. The alternative is an autonomous loop deciding the
     // fate of a dead pilot's partial work with nobody reading it.
-    if staleness.ahead_by > 1 {
+    let non_plan = non_plan_files(staleness.changed_files.as_deref());
+    if !non_plan.is_empty() {
         return PromotionGate::Refuse(RefusalReason::SalvageWorkOnStaleBranch {
             branch,
             behind_by: staleness.behind_by,
             ahead_by: staleness.ahead_by,
+            non_plan_files: non_plan,
         });
     }
 
@@ -725,6 +876,27 @@ fn staleness_audit_json(
         }
         _ => (None, None, None),
     };
+    // `null`, never `0`, when the list could not be read — same discipline as
+    // `behind_by` on unmeasured issues (mika#2140 D5). `ahead_by` is still
+    // emitted: it is no longer a discriminator, it is a measurement again, and
+    // the KTD2c promise to revise the threshold from a real distribution
+    // depends on it.
+    //
+    // Two fields, not one, and neither collapses a missing list into a clean
+    // one: `non_plan_files` is `null` exactly when the list could not be read,
+    // and `non_plan_files_count` carries the untruncated total so an aggregate
+    // over the audit trail is not silently capped at [`MAX_NAMED_FILES`].
+    let (changed_files_count, non_plan) = match measurement {
+        StalenessMeasurement::Measured(s) => match s.changed_files.as_deref() {
+            Some(files) => (Some(files.len()), Some(non_plan_files(Some(files)))),
+            None => (None, None),
+        },
+        _ => (None, None),
+    };
+    let non_plan_named: Option<Vec<&String>> = non_plan
+        .as_ref()
+        .map(|v| v.iter().take(MAX_NAMED_FILES).collect());
+    let non_plan_count: Option<usize> = non_plan.as_ref().map(Vec::len);
     let (outcome, reason) = match decision {
         PromotionGate::Promote { detail } => ("promote", *detail),
         PromotionGate::Refuse(r) => ("refuse", r.slug()),
@@ -742,6 +914,9 @@ fn staleness_audit_json(
         "behind_by": behind_by,
         "ahead_by": ahead_by,
         "status": status,
+        "changed_files_count": changed_files_count,
+        "non_plan_files": non_plan_named,
+        "non_plan_files_count": non_plan_count,
         "outcome": outcome,
         "reason": reason,
         "threshold": threshold,
@@ -2476,6 +2651,21 @@ async fn phase2_reconcile_stuck_ready(
         // A refusal `continue`s *before* `rescued` is incremented, so a refused
         // ticket never eats one of the tick's rescue slots. And a lookup miss is
         // a WARN, not a silently skipped gate.
+        //
+        // **The one gate entrance not fronted by [`is_groomed`] (mika#2140).**
+        // Phase 0 and Phase 1 both filter on it, so a branch with no plan file
+        // never reaches the gate through them. This path filters on `ready`
+        // alone, so a `ready` ticket whose callout names a hand-made, plan-less
+        // branch *can* arrive here — and under the file-based predicate such a
+        // branch is refused as salvage where it used to promote, which costs it
+        // `ready` and parks it under `operator-gated` until a human lifts it by
+        // hand. Measured 2026-09-04: zero of the 18 open tickets carrying a
+        // `> - **Branch:**` callout point at a plan-less branch, so the
+        // population is empty *today*. That is a measurement, not a guard —
+        // tracked in mika#2170, whose wake condition is the first audit record
+        // from `phase2_stuck_rescue` carrying
+        // `reason=salvage_work_on_stale_branch` with a `non_plan_files` list
+        // that contains no `docs/plans/` sibling.
         match issues.iter().find(|i| i.number == n) {
             Some(issue) => {
                 if !promotion_gate_allows(
@@ -2541,11 +2731,30 @@ mod tests {
 
     // ── mika#2123 promotion staleness gate ──
 
+    /// A measurement whose file list is **unavailable** (`files` absent from
+    /// the payload). Kept at its original signature so every test that never
+    /// cared about files keeps reading as it did.
     fn measured(behind_by: i64, ahead_by: i64, status: &str) -> StalenessMeasurement {
         StalenessMeasurement::Measured(BranchStaleness {
             behind_by,
             ahead_by,
             status: status.to_string(),
+            changed_files: None,
+        })
+    }
+
+    /// A measurement carrying a known file list (mika#2140).
+    fn measured_files(
+        behind_by: i64,
+        ahead_by: i64,
+        status: &str,
+        files: &[&str],
+    ) -> StalenessMeasurement {
+        StalenessMeasurement::Measured(BranchStaleness {
+            behind_by,
+            ahead_by,
+            status: status.to_string(),
+            changed_files: Some(files.iter().map(|f| f.to_string()).collect()),
         })
     }
 
@@ -2617,8 +2826,19 @@ mod tests {
         ));
         // Distance 0 wins over the salvage rule: a branch carrying salvage work
         // that is already current has nothing to rebase and nothing to decide.
+        //
+        // The file list is **load-bearing here** (mika#2140). With
+        // `changed_files: None` this assertion is vacuous — the salvage rule
+        // could not have fired anyway, so moving the `behind_by == 0`
+        // short-circuit below it would keep the suite green and the documented
+        // rule order would stop being tested. The code file is what makes the
+        // precedence real.
         assert!(matches!(
-            classify_promotion(&measured(0, 7, "ahead"), Some("feat/x"), 50),
+            classify_promotion(
+                &measured_files(0, 7, "ahead", &["crates/a.rs"]),
+                Some("feat/x"),
+                50
+            ),
             PromotionGate::Promote {
                 detail: "up_to_date"
             }
@@ -2626,7 +2846,7 @@ mod tests {
     }
 
     /// AC3 — the negative control. A branch behind but within the threshold,
-    /// carrying only its plan commit, **must** be promoted.
+    /// carrying only plan files, **must** be promoted.
     ///
     /// This is the assertion that distinguishes a working gate from a gate that
     /// refuses everything. Make the refusal branch in `classify_promotion`
@@ -2636,7 +2856,11 @@ mod tests {
         for behind in [1, 17, 49, 50] {
             assert!(
                 matches!(
-                    classify_promotion(&measured(behind, 1, "diverged"), Some("feat/x"), 50),
+                    classify_promotion(
+                        &measured_files(behind, 1, "diverged", &["docs/plans/x.md"]),
+                        Some("feat/x"),
+                        50
+                    ),
                     PromotionGate::Promote {
                         detail: "behind_within_threshold"
                     }
@@ -2669,8 +2893,18 @@ mod tests {
     /// its plan commit is never auto-promoted, whatever the distance.
     #[test]
     fn test_promotion_gate_salvage_work_refuses_independently_of_threshold() {
-        // One commit behind, two ahead: far under any threshold, still refused.
-        match classify_promotion(&measured(1, 2, "diverged"), Some("fix/1680/x"), 50) {
+        // One commit behind, carrying code: far under any threshold, still
+        // refused. (mika#2140: the discriminator is the file, not the count.)
+        match classify_promotion(
+            &measured_files(
+                1,
+                2,
+                "diverged",
+                &["crates/mika-agent/src/agent_loop/mod.rs"],
+            ),
+            Some("fix/1680/x"),
+            50,
+        ) {
             PromotionGate::Refuse(r @ RefusalReason::SalvageWorkOnStaleBranch { .. }) => {
                 assert_eq!(r.slug(), "salvage_work_on_stale_branch");
                 // The remedy names the real choice: what to do with the *work*.
@@ -2681,7 +2915,16 @@ mod tests {
         // And it survives the threshold being disabled — the two rules are
         // independent, which is exactly why no single mutation can flip #1680.
         assert!(matches!(
-            classify_promotion(&measured(180, 2, "diverged"), Some("fix/1680/x"), 0),
+            classify_promotion(
+                &measured_files(
+                    180,
+                    2,
+                    "diverged",
+                    &["crates/mika-agent/src/evidence/guards.rs"]
+                ),
+                Some("fix/1680/x"),
+                0
+            ),
             PromotionGate::Refuse(RefusalReason::SalvageWorkOnStaleBranch { .. })
         ));
     }
@@ -2690,7 +2933,11 @@ mod tests {
     #[test]
     fn test_promotion_gate_threshold_zero_disables_distance_rule() {
         assert!(matches!(
-            classify_promotion(&measured(989, 1, "diverged"), Some("docs/x"), 0),
+            classify_promotion(
+                &measured_files(989, 1, "diverged", &["docs/plans/x.md"]),
+                Some("docs/x"),
+                0
+            ),
             PromotionGate::Promote {
                 detail: "behind_within_threshold"
             }
@@ -2734,6 +2981,169 @@ mod tests {
     /// fields, not as a substring of a prose message, and they are emitted on a
     /// **promotion** too. KTD2c's promise to revise the threshold from a real
     /// distribution is unkeepable if only refusals are on record.
+    /// mika#2140 — the partition itself, including the control that makes the
+    /// literal prefix visible: `docs/plansible/` only *looks* like the prefix.
+    #[test]
+    fn test_non_plan_files_partitions() {
+        assert!(non_plan_files(None).is_empty());
+        assert!(
+            non_plan_files(Some(&["docs/plans/a.md".into(), "docs/plans/b.md".into()])).is_empty()
+        );
+        assert_eq!(
+            non_plan_files(Some(&["crates/a.rs".into()])),
+            vec!["crates/a.rs".to_string()]
+        );
+        assert_eq!(
+            non_plan_files(Some(&["crates/a.rs".into(), "docs/plans/x.md".into()])),
+            vec!["crates/a.rs".to_string()]
+        );
+        // Negative control: the prefix is literal, trailing slash included.
+        assert_eq!(
+            non_plan_files(Some(&["docs/plansible/x.md".into()])),
+            vec!["docs/plansible/x.md".to_string()]
+        );
+    }
+
+    /// **AC1, the core.** A branch groomed over three architect passes carries
+    /// three plan commits and nothing else. The old predicate refused it; this
+    /// one promotes it. `fix/2140/…` — this very ticket's branch — was in
+    /// exactly this state when it was dispatched.
+    #[test]
+    fn test_promotion_gate_multi_commit_plan_only_promotes() {
+        assert!(matches!(
+            classify_promotion(
+                &measured_files(8, 3, "diverged", &["docs/plans/x.md"]),
+                Some("fix/2118/x"),
+                50
+            ),
+            PromotionGate::Promote {
+                detail: "behind_within_threshold"
+            }
+        ));
+    }
+
+    /// **AC2** — the negative control. Making the gate permissive must not
+    /// reopen the door it exists to close: code on a stale branch is refused
+    /// whatever the distance, threshold enabled or disabled.
+    #[test]
+    fn test_promotion_gate_code_on_stale_branch_still_refuses() {
+        for threshold in [50, 0] {
+            let d = classify_promotion(
+                &measured_files(8, 3, "diverged", &["crates/a.rs", "docs/plans/x.md"]),
+                Some("fix/x/y"),
+                threshold,
+            );
+            match d {
+                PromotionGate::Refuse(RefusalReason::SalvageWorkOnStaleBranch {
+                    non_plan_files,
+                    ..
+                }) => assert_eq!(non_plan_files, vec!["crates/a.rs".to_string()]),
+                other => panic!("threshold {threshold}: expected salvage, got {other:?}"),
+            }
+        }
+    }
+
+    /// **AC4** — an unavailable file list promotes, and the audit says `null`
+    /// rather than inventing a zero. Same shape the old predicate refused.
+    #[test]
+    fn test_promotion_gate_missing_file_list_promotes() {
+        let m = measured(8, 3, "diverged");
+        let d = classify_promotion(&m, Some("feat/x"), 50);
+        assert!(matches!(
+            d,
+            PromotionGate::Promote {
+                detail: "behind_within_threshold"
+            }
+        ));
+        let json: serde_json::Value =
+            serde_json::from_str(&staleness_audit_json(1, Some("feat/x"), &m, &d, 50)).unwrap();
+        // "Could not read" is never rendered as "there is nothing outside
+        // plans" — the two are byte-distinct in the audit, which is the same
+        // distinction `BranchStaleness::changed_files` makes one level up.
+        assert!(json["changed_files_count"].is_null());
+        assert!(json["non_plan_files"].is_null());
+        assert!(json["non_plan_files_count"].is_null());
+    }
+
+    /// **AC5** — the refusal names the files, and the naming is bounded.
+    #[test]
+    fn test_salvage_refusal_names_the_offending_files() {
+        let d = classify_promotion(
+            &measured_files(
+                8,
+                2,
+                "diverged",
+                &["crates/mika-agent/src/agent_loop/mod.rs", "docs/plans/x.md"],
+            ),
+            Some("fix/1680/x"),
+            50,
+        );
+        let PromotionGate::Refuse(r) = d else {
+            panic!("expected a refusal")
+        };
+        assert!(
+            r.reason(1680)
+                .contains("crates/mika-agent/src/agent_loop/mod.rs")
+        );
+        assert!(
+            r.comment_body(1680)
+                .contains("crates/mika-agent/src/agent_loop/mod.rs")
+        );
+
+        // Truncation: 12 offending paths are named 10-then-summarised, so a
+        // comment can never turn into a `git diff --stat`.
+        let many: Vec<String> = (0..12).map(|i| format!("crates/f{i}.rs")).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let d = classify_promotion(
+            &measured_files(8, 12, "diverged", &refs),
+            Some("fix/x/y"),
+            50,
+        );
+        let PromotionGate::Refuse(r) = d else {
+            panic!("expected a refusal")
+        };
+        let reason = r.reason(1);
+        assert!(reason.contains("… et 2 autres"), "got: {reason}");
+        assert!(reason.contains("crates/f9.rs"));
+        assert!(!reason.contains("crates/f10.rs"));
+
+        // The audit names 10 but *counts* 12: truncation is a rendering bound,
+        // never a measurement bound, or the KTD2c aggregation would undercount.
+        let m = measured_files(8, 12, "diverged", &refs);
+        let d = classify_promotion(&m, Some("fix/x/y"), 50);
+        let json: serde_json::Value =
+            serde_json::from_str(&staleness_audit_json(1, Some("fix/x/y"), &m, &d, 50)).unwrap();
+        assert_eq!(json["non_plan_files"].as_array().unwrap().len(), 10);
+        assert_eq!(json["non_plan_files_count"], 12);
+        assert_eq!(json["changed_files_count"], 12);
+    }
+
+    /// The parse contract in both directions (mika#2140 D1).
+    #[test]
+    fn test_parse_compare_payload_files_absent_is_none() {
+        let s = parse_compare_payload(r#"{"status":"diverged","ahead_by":2,"behind_by":180}"#)
+            .expect("three mandatory fields are present");
+        assert!(s.changed_files.is_none());
+    }
+
+    #[test]
+    fn test_parse_compare_payload_reads_filenames() {
+        let s = parse_compare_payload(
+            r#"{"status":"diverged","ahead_by":2,"behind_by":8,
+                "files":[{"filename":"crates/a.rs","patch":"@@"},
+                         {"filename":"docs/plans/x.md"},
+                         {"no_filename":true}]}"#,
+        )
+        .expect("payload parses");
+        assert_eq!(
+            s.changed_files,
+            Some(vec![
+                "crates/a.rs".to_string(),
+                "docs/plans/x.md".to_string()
+            ])
+        );
+    }
+
     #[test]
     fn test_staleness_audit_json_is_structured_on_promote_and_refuse() {
         let m = measured(17, 1, "diverged");
@@ -2752,7 +3162,15 @@ mod tests {
         assert_eq!(json["outcome"], "promote");
         assert_eq!(json["threshold"], 50);
 
-        let m = measured(180, 2, "diverged");
+        let m = measured_files(
+            180,
+            2,
+            "diverged",
+            &[
+                "crates/mika-agent/src/agent_loop/mod.rs",
+                "docs/plans/2026-06-30-016-fix-1680-mika-dev-cn-output-bleed-plan.md",
+            ],
+        );
         let refuse = classify_promotion(&m, Some("fix/1680/x"), 50);
         let json: serde_json::Value = serde_json::from_str(&staleness_audit_json(
             1680,
@@ -2765,6 +3183,13 @@ mod tests {
         assert_eq!(json["outcome"], "refuse");
         assert_eq!(json["reason"], "salvage_work_on_stale_branch");
         assert_eq!(json["behind_by"], 180);
+        // AC5 at the audit surface: the plan file is counted but never accused.
+        assert_eq!(json["changed_files_count"], 2);
+        assert_eq!(
+            json["non_plan_files"],
+            serde_json::json!(["crates/mika-agent/src/agent_loop/mod.rs"])
+        );
+        assert_eq!(json["non_plan_files_count"], 1);
 
         // Unmeasurable outcomes carry nulls, never a fabricated zero.
         let m = StalenessMeasurement::Unavailable;
@@ -2773,6 +3198,7 @@ mod tests {
             serde_json::from_str(&staleness_audit_json(1, Some("feat/x"), &m, &d, 50)).unwrap();
         assert!(json["behind_by"].is_null());
         assert_eq!(json["measurement"], "unavailable");
+        assert!(json["changed_files_count"].is_null());
     }
 
     /// The label the gate applies must actually exist.
