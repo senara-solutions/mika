@@ -3005,10 +3005,21 @@ PATHB_BLOCK=$(sed -n '/Unit 2 (mika#1282 + mika#1396): open a draft PR/,/^    _d
 # uniquely matches the `--draft \` line of the gh pr create invocation.
 assert_contains "AC3: Path B opens the rescue PR as draft" \
     'draft \' "$PATHB_BLOCK"
+# mika#2157 extracted the body out of the inline heredoc into
+# `_compose_rescue_pr_body` so the closing-reference decision could be tested
+# against real git repositories instead of a stubbed `gh` argv. The property
+# these two assertions pin is unchanged — Path B's PR body carries the rescue
+# header and the verification marker — so they now follow it across the
+# extraction: Path B must route through the composer, and the composer must
+# emit both. Splitting the assertion is what keeps it measuring the shipped
+# body rather than a heredoc that no longer exists.
+assert_contains "AC3: Path B composes its body through _compose_rescue_pr_body (mika#2157)" \
+    '_compose_rescue_pr_body "$WORKTREE_DIR"' "$PATHB_BLOCK"
+RESCUE_BODY_FN=$(awk '/^_compose_rescue_pr_body\(\) \{/,/^\}/' "$DISPATCH_LIB")
 assert_contains "AC3: Path B writes the Auto-rescued PR rescue header (qa-review Step 1.5)" \
-    '## Auto-rescued PR (dispatch-lib recovery, class: ${RECOVERY_CLASS})' "$PATHB_BLOCK"
+    '## Auto-rescued PR (dispatch-lib recovery, class: ${recovery_class})' "$RESCUE_BODY_FN"
 assert_contains "AC3: Path B emits the rescue-pipeline-verified marker" \
-    'rescue-pipeline-verified: no' "$PATHB_BLOCK"
+    'rescue-pipeline-verified: no' "$RESCUE_BODY_FN"
 assert_contains "AC3: Path B emits RECOVERY_PENDING: true (Guard 1)" \
     'RECOVERY_PENDING: true' "$PATHB_BLOCK"
 assert_contains "AC3: Path B tags the rescued PR with the wip-rescue label" \
