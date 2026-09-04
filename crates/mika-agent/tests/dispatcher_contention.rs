@@ -70,6 +70,7 @@ fn three_dispatcher_race_dispatches_each_ticket_exactly_once() {
                                 &holder,
                                 Some(&source),
                                 120,
+                                1,
                             )
                             .expect("claim must not error")
                     };
@@ -121,7 +122,7 @@ fn slot_is_handed_on_across_successive_dispatches() {
     for round in 0..10u32 {
         let holder = format!("task-round-{round}");
         let claim = db
-            .try_acquire_dispatch_slot("mika", "implement", &holder, Some("mika_dev"), 120)
+            .try_acquire_dispatch_slot("mika", "implement", &holder, Some("mika_dev"), 120, 1)
             .unwrap();
         assert_eq!(
             claim,
@@ -147,10 +148,17 @@ fn loser_learns_which_dispatcher_holds_the_slot() {
     }
 
     let mut db = Database::open_in_memory().unwrap();
-    db.try_acquire_dispatch_slot("mika", "implement", "op-task", Some("operator"), 120)
+    db.try_acquire_dispatch_slot("mika", "implement", "op-task", Some("operator"), 120, 1)
         .unwrap();
     let loser = db
-        .try_acquire_dispatch_slot("mika", "implement", "mgr-task", Some("mika_manager"), 120)
+        .try_acquire_dispatch_slot(
+            "mika",
+            "implement",
+            "mgr-task",
+            Some("mika_manager"),
+            120,
+            1,
+        )
         .unwrap();
 
     match loser {

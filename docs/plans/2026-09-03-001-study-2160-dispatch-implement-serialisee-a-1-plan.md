@@ -22,13 +22,13 @@ Le corps du ticket décrit **deux** mécanismes. Le code en porte **trois**, et 
 
 ### 1. Le bail — `dispatch_slot_leases`
 
-`crates/mika-agent/src/db.rs:8019` (`try_acquire_dispatch_slot`). Un `INSERT … ON CONFLICT … WHERE expired OR same-holder` dans une transaction IMMEDIATE, sur une table dont la **clé primaire est `(agent_id, dispatch_class)`**. TTL par défaut 120 s (`db.rs:179`), surchargeable par `MIKA_DISPATCH_SLOT_LEASE_TTL_SECS` (`db.rs:184-190`).
+`crates/mika-agent/src/db.rs:8111` (`try_acquire_dispatch_slot`). Un `INSERT … ON CONFLICT … WHERE expired OR same-holder` dans une transaction IMMEDIATE, sur une table dont la **clé primaire est `(agent_id, dispatch_class)`**. TTL par défaut 120 s (`db.rs:179`), surchargeable par `MIKA_DISPATCH_SLOT_LEASE_TTL_SECS` (`db.rs:184-190`).
 
 Le ticket a raison de dire que régler le TTL ne débloque rien. Il faut ajouter ceci, qui n'est pas dans le corps : **cette clé primaire est elle-même un plafond dur à 1.** Une classe ne peut pas détenir deux baux vivants, quel que soit le TTL. Un plafond paramétrable qui ne toucherait que le prédicat de la §2 laisserait le bail sérialiser à 1 — le réglage existerait et n'aurait aucun effet observable.
 
 ### 2. Le verrou effectif — la ligne de rappel enfant
 
-`crates/mika-agent/src/db.rs:7883` (`has_active_callback_tasks_excluding`), appelé depuis `crates/mika-agent/src/skills/executor.rs:1388`. Un `SELECT … LIMIT 1` : *existe-t-il une ligne de rappel `pending`/`in_progress`, même classe, autre parent, hors enveloppes `:deferred`*. C'est un prédicat **booléen d'existence** — la forme même d'un plafond à 1. Le message de refus (`executor.rs:1422-1436`) dit la règle en toutes lettres.
+`crates/mika-agent/src/db.rs:7975` (`has_active_callback_tasks_excluding`), appelé depuis `crates/mika-agent/src/skills/executor.rs:1388`. Un `SELECT … LIMIT 1` : *existe-t-il une ligne de rappel `pending`/`in_progress`, même classe, autre parent, hors enveloppes `:deferred`*. C'est un prédicat **booléen d'existence** — la forme même d'un plafond à 1. Le message de refus (`executor.rs:1423-1437`) dit la règle en toutes lettres.
 
 ### 3. Le verrou de tour d'agent — `agent_lock` *(non nommé par le ticket)*
 
@@ -42,7 +42,7 @@ C'est la contrainte qui gouverne AC1. Le chemin `/message` a reçu une file born
 
 ### Phase 1 — Inventaire des ressources partagées (AC1)
 
-Livrable : `docs/solutions/cross-repo-patterns/pilot-concurrency-shared-resources-2026-09-03.md`. Pour chacune des sept ressources nommées par AC1, un verdict **parmi trois** — *partageable en l'état* / *partageable après changement nommé* / *bloquante* — avec la citation `fichier:ligne` qui le justifie. Un verdict sans citation n'est pas un verdict.
+Livrable : `docs/solutions/cross-repo-patterns/pilot-concurrency-shared-resources-2026-09-03.md`. Pour chacune des sept ressources — les six nommées par AC1, plus le daemon mitmdump identifié pendant le grooming — un verdict **parmi trois** — *partageable en l'état* / *partageable après changement nommé* / *bloquante* — avec la citation `fichier:ligne` qui le justifie. Un verdict sans citation n'est pas un verdict.
 
 L'inventaire de départ, établi par la lecture faite pendant le grooming (à confirmer et compléter par l'implémenteur, pas à recopier) :
 
@@ -51,7 +51,7 @@ L'inventaire de départ, établi par la lecture faite pendant le grooming (à co
 | socket d'egress `/tmp/mika-pilot-egress.sock` | `dispatch-lib.sh:169`, proxy hôte unique, HTTP CONNECT multi-connexions | **partageable en l'état** — à confirmer par une mesure à deux clients simultanés |
 | port `8891` du bac à sable | `dispatch-lib.sh:170`, mais `--unshare-net` en `:855` | **partageable en l'état** — chaque bac à sable a son propre namespace réseau ; le port n'est pas partagé, contrairement à ce que le corps du ticket suppose |
 | répertoire de secrets | `dispatch-lib.sh:210` `_PILOT_SECRET_DIR_SANDBOX`, monté par `--ro-bind-data` depuis un fd (`:993`) | **partageable en l'état** — par-processus, jamais un chemin hôte commun |
-| `~/.mika/data/pilot-transcripts/` | `dispatch-lib.sh:818`, `:1054`, `:1137`, `:2155` — un `.jsonl` par `task-id` | **partageable en l'état** — nommage par tâche, pas de fichier commun |
+| `~/.mika/data/pilot-transcripts/` | `dispatch-lib.sh:818`, `:1054`, `:1137`, `:2167` — un `.jsonl` par `task-id` | **partageable en l'état** — nommage par tâche, pas de fichier commun |
 | `pilot-helper.log` / `pilot-egress-proxy.log` | `dispatch-lib.sh:189`, `/var/log/mika/` | **partageable après changement nommé** — deux écrivains entrelacés restent lisibles par un humain mais cassent tout comptage par session ; nommer le changement (préfixe `task-id` par ligne, ou fichier par dispatch) |
 | helper mitmdump `:8892` | `dispatch-lib.sh:178`, `:306` — daemon hôte long-vivant, partagé, déjà multi-clients | **partageable en l'état** — mais le fichier de jeton `_PILOT_GH_TOKEN_FILE` (`:186`) est réécrit **avant chaque spawn** (`:846`) : deux spawns rapprochés se marchent dessus. **Changement nommé requis.** |
 | rappel `canUseTool` → mika-dev | `a2a.rs:226`/`:360` `try_lock_owned()` → `"Agent is busy"` ; relais `.claude/claude-pilot.json` timeout 120 000 ms | **bloquante en l'état** — c'est *la* trouvaille de l'inventaire |
@@ -80,7 +80,7 @@ Une borne qui sort à N=2 est un résultat. Une borne qui sort à N=1 est un ré
 
 **Le défaut reste 1.** Deux endroits bougent ensemble, ou le réglage est décoratif (voir § « Ce que le code dit », points 1 et 2).
 
-**3a — Le réglage.** Une fonction de lecture à la **forme à trois paliers exacte** du module, celle de `parse_max_behind` (`crates/mika-agent/src/auto_pull.rs:214-231`), `parse_max_redrives` (`:137-155`) et `parse_stuck_ready_threshold` (`:112-131`) :
+**3a — Le réglage.** Une fonction de lecture à la **forme à trois paliers exacte** du module, celle de `parse_max_behind` (`crates/mika-agent/src/auto_pull.rs:290-305`), `parse_max_redrives` (`:161-176`) et `parse_stuck_ready_threshold` (`:135-150`) :
 
 ```rust
 const MAX_CONCURRENT_IMPLEMENT_DEFAULT: i64 = 1;
@@ -97,7 +97,7 @@ Deux points de forme, non négociables parce que c'est la forme du module :
 
 Emplacement : à côté de la garde qu'il paramètre, dans `crates/mika-agent/src/skills/executor.rs` près de `derive_dispatch_class` (`:897`) — pas dans `auto_pull.rs`, qui ne consomme pas ce plafond, ni dans `config.rs`, dont ce module n'utilise aucune entrée.
 
-**3b — Le prédicat d'existence devient un comptage.** `has_active_callback_tasks_excluding` (`db.rs:7883`) rend aujourd'hui `Option<BlockingDispatch>` sur un `LIMIT 1`. Ajouter un **compagnon** — ne pas muter la signature existante, elle a des appelants de test en `executor.rs:5080/5147/5164/5182` et un jumeau async en `async_db.rs:1220` :
+**3b — Le prédicat d'existence devient un comptage.** `has_active_callback_tasks_excluding` (`db.rs:7975`) rend aujourd'hui `Option<BlockingDispatch>` sur un `LIMIT 1`. Ajouter un **compagnon** — ne pas muter la signature existante, elle a des appelants de test en `executor.rs:5080/5147/5164/5182` et un jumeau async en `async_db.rs:1244` :
 
 ```rust
 /// Nombre de rappels actifs de cette classe, hors enveloppes `:deferred`,
@@ -107,7 +107,7 @@ pub fn count_active_callback_tasks_excluding(&self, …) -> Result<i64>
 
 La garde en `executor.rs:1388` compare ce compte à `max_concurrent_implement()` et ne refuse qu'à `count >= N`. Le `BlockingDispatch` cité dans le refus reste celui du `LIMIT 1` — le refus doit nommer **un** détenteur, pas tous.
 
-**3c — Le bail cesse d'être un plafond à 1.** `dispatch_slot_leases` a `PRIMARY KEY (agent_id, dispatch_class)`. Pour N>1 il faut une migration ajoutant un `slot_index INTEGER NOT NULL DEFAULT 0` à la clé primaire, et `try_acquire_dispatch_slot` (`db.rs:8019`) qui tente les index `0..N-1` jusqu'au premier succès. À N=1, exactement une place, `slot_index = 0` : le comportement d'aujourd'hui, bit pour bit.
+**3c — Le bail cesse d'être un plafond à 1.** `dispatch_slot_leases` a `PRIMARY KEY (agent_id, dispatch_class)`. Pour N>1 il faut une migration ajoutant un `slot_index INTEGER NOT NULL DEFAULT 0` à la clé primaire, et `try_acquire_dispatch_slot` (`db.rs:8111`) qui tente les index `0..N-1` jusqu'au premier succès. À N=1, exactement une place, `slot_index = 0` : le comportement d'aujourd'hui, bit pour bit.
 
 **Décision à prendre par l'implémenteur, et à écrire dans le plan avant de coder :** 3c est une migration de schéma. Si la mesure de la Phase 2 conclut à N=1 comme borne matérielle, 3c devient du code mort ajouté au chemin critique de l'arbitrage. L'implémenteur **ordonne donc Phase 2 avant Phase 3c** et écrit le verdict dans le ticket ; il ne livre 3c que si la Phase 2 laisse N>1 sur la table. 3a et 3b se livrent dans tous les cas — ils sont le squelette du réglage et n'ont pas de coût de schéma.
 
@@ -124,7 +124,7 @@ Le réglage se passe par la fonction pure `parse_max_concurrent_implement(Some("
 
 ### Phase 5 — Non-régression à N=1 (AC5)
 
-À défaut (variable absente), reproduire la scène mesurée cette nuit : premier dispatch acquiert, second refusé avec `global_dispatch_active`, **et son rappel différé enregistré** — l'assertion doit couvrir `deferred_dispatch_registered == true` dans le JSON de refus (`executor.rs:1438`), pas seulement le code d'erreur. Un test qui vérifie le refus sans vérifier le différé laisserait passer une régression qui casse la reprise automatique (mika#1011).
+À défaut (variable absente), reproduire la scène mesurée cette nuit : premier dispatch acquiert, second refusé avec `global_dispatch_active`, **et son rappel différé enregistré** — l'assertion doit couvrir `deferred_dispatch_registered == true` dans le JSON de refus (`executor.rs:1440`), pas seulement le code d'erreur. Un test qui vérifie le refus sans vérifier le différé laisserait passer une régression qui casse la reprise automatique (mika#1011).
 
 ### Phase 6 — La décision sur N revient à l'opérateur (AC6)
 
@@ -182,7 +182,18 @@ Aucun de ces détecteurs n'a de sortie « ignorer et continuer ». Une CI rouge 
 
 ---
 
-## Acceptance criteria — rattachement
+## Acceptance criteria
+
+Transcrits verbatim depuis le corps de mika#2160.
+
+- [ ] **AC1** — Un inventaire écrit des ressources que deux pilotes simultanés partageraient : socket d'egress (`/tmp/mika-pilot-egress.sock`), port `8891` du bac à sable, répertoire de secrets, `pilot-transcripts/`, journaux `pilot-helper.log` / `pilot-egress-proxy.log`, et le chemin de rappel `canUseTool` vers mika-dev. Pour chacune : partageable en l'état, partageable après changement nommé, ou bloquante.
+- [ ] **AC2** — La borne matérielle est chiffrée à partir de mesures réelles, pas d'estimations : espace disque par worktree en vol (repartir de mika#2105), mémoire, et la borne que ça impose sur N sur cette machine.
+- [ ] **AC3** — Le verrou est rendu **paramétrable** plutôt que constant, avec la même forme à trois paliers que les autres réglages du module (absent → défaut ; valeur invalide → défaut avec WARN ; sentinelle explicite → désactivé). Le défaut reste **1** : ce ticket ouvre une porte, il ne la franchit pas.
+- [ ] **AC4** — Un test couvre le cas à N=2 : deux dispatchs `implement` concurrents obtiennent chacun leur bail, et un troisième est refusé.
+- [ ] **AC5** — Le cas de non-régression tient : à N=1 (le défaut), le comportement observé cette nuit est inchangé — le second dispatch est refusé avec `global_dispatch_active` et son rappel différé est enregistré.
+- [ ] **AC6** — La décision finale sur N en exploitation est écrite dans le ticket et **laissée à l'opérateur**. Le code ne choisit pas N ; il rend N choisissable.
+
+### Rattachement
 
 | AC | où c'est livré |
 |---|---|
@@ -192,6 +203,54 @@ Aucun de ces détecteurs n'a de sortie « ignorer et continuer ». Une CI rouge 
 | AC4 — test à N=2 : deux baux, troisième refusé | Phase 4 |
 | AC5 — non-régression à N=1 : refus `global_dispatch_active` + différé enregistré | Phase 5 |
 | AC6 — décision sur N écrite et laissée à l'opérateur | Phase 6 |
+
+## Verdict d'implémentation — 2026-09-04
+
+Le plan laissait quatre décisions à l'implémenteur. Elles sont tranchées, ici,
+avec ce qui les a tranchées.
+
+**KTD4 — la Phase 2 laisse N>1 sur la table, donc la Phase 3c se livre.** Mesuré
+sur gentux : 98 G libres sur le volume des worktrees, pour un `target/` en vol de
+19 à 38 G selon l'empilement. Borne disque N = 2 à 4. La migration est **v51 →
+v52** (`CURRENT_SCHEMA_VERSION` était 51), avec `migrate_v51_to_v52` et son test
+d'idempotence, selon la convention du fichier.
+
+**Correction de mesure portante.** Le grooming inscrivait « `/home` 466 G — 216 G
+libres (les worktrees vivent ici) ». C'est faux : les worktrees vivent sur
+`/data`, volume LVM distinct de **371 G dont 98 libres**. La borne disque se
+calcule sur 98, pas sur 216 — se fier au chiffre du grooming aurait surestimé N
+d'un facteur deux.
+
+**La commande de mesure du plan n'existe pas sur cet hôte.** `/usr/bin/time -v`
+est absent (Gentoo : `sys-process/time`, paquet séparé), et la tâche a rendu
+`exit 0` quand même parce que la dernière commande du pipeline avait réussi. Une
+sonde qui ment sans échouer. Remplacée par un échantillonnage du RSS agrégé du
+groupe de processus, avec son contrôle de non-vacuité ; procédure complète dans
+le document de la Phase 1/2.
+
+**AC4 — la répartition des assertions a changé, et le total est plus fort.** Le
+plan voulait éviter `std::env::set_var` ; la première rédaction a quand même posé
+un test d'intégration à N=2 qui mutait la variable sous `#[serial]`. Ce test a
+**fait échouer le test AC5 une fois sur deux** : `#[serial]` ne protège que
+contre d'autres `#[serial]`, pas contre les tests parallèles voisins, et le garde
+lit le plafond en ligne. La mutation a donc été retirée de la suite entière :
+
+- *deux dispatchs obtiennent chacun leur bail, un troisième est refusé* — asserté
+  au bail, où le plafond est un **paramètre** de `try_acquire_dispatch_slot`,
+  donc sans environnement (`db::tests::test_two_implement_claims_each_take_a_lease_at_cap_two`) ;
+- *l'arithmétique du plafond* — extraite en fonction pure `class_cap_reached` et
+  assertée aux plafonds 1, 2 et 0 ;
+- *le câblage garde → comptage → plafond* — asserté par le test AC5, qui passe
+  par le vrai garde au vrai défaut.
+
+Zéro `set_var` dans la suite, donc zéro test de garde à marquer, aujourd'hui ou
+plus tard. C'était le choix entre une discipline de marquage que les tests futurs
+oublieraient, et une structure qui rend l'oubli impossible.
+
+**Un fait a bougé depuis le grooming :** **mika#2156 est fermé**. Le balayage
+phantom ne déclare plus mortes les sessions longues, donc le plafond n'est plus
+illisible pour cette raison-là. Ça ne change pas le périmètre ; ça change ce que
+la Phase 6 doit dire à l'opérateur.
 
 ## Hors périmètre — confirmé
 

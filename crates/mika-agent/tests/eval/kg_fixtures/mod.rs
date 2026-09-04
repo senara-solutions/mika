@@ -31,7 +31,11 @@ use mika_agent::db::{CURRENT_SCHEMA_VERSION, Database};
 // `dispatch_slot_leases` table — both outside the KG surface, and the new column
 // is nullable, so `seed_*` helpers (which never touch `tasks`) are unaffected;
 // only the pin advances.
-const PINNED_SCHEMA_VERSION: i64 = 51;
+//
+// v51→v52 (mika#2160) rebuilt `dispatch_slot_leases` to add `slot_index` to its
+// PRIMARY KEY — again outside the KG surface, and `seed_*` helpers never touch
+// that table; only the pin advances.
+const PINNED_SCHEMA_VERSION: i64 = 52;
 
 const _: () = assert!(
     CURRENT_SCHEMA_VERSION == PINNED_SCHEMA_VERSION,

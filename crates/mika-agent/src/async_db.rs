@@ -1253,6 +1253,21 @@ impl AsyncDatabase {
             .await
     }
 
+    /// How many distinct dispatches of this class are active, excluding
+    /// `excluded_parent_id` (mika#2160). Twin of
+    /// `Database::count_active_callback_tasks_excluding`.
+    pub async fn count_active_callback_tasks_excluding(
+        &self,
+        excluded_parent_id: &str,
+        dispatch_class: &str,
+    ) -> Result<i64> {
+        let p = excluded_parent_id.to_owned();
+        let a = self.agent_id.clone();
+        let c = dispatch_class.to_owned();
+        self.with_db(move |db| db.count_active_callback_tasks_excluding(&p, &a, &c))
+            .await
+    }
+
     /// Record which dispatcher initiated a task (mika#1948).
     pub async fn set_task_dispatcher_source(
         &self,
@@ -1283,13 +1298,16 @@ impl AsyncDatabase {
         holder_task_id: &str,
         dispatcher_source: Option<&str>,
         ttl_secs: i64,
+        max_slots: i64,
     ) -> Result<crate::db::SlotClaim> {
         let a = self.agent_id.clone();
         let c = dispatch_class.to_owned();
         let h = holder_task_id.to_owned();
         let src = dispatcher_source.map(str::to_owned);
-        self.with_db(move |db| db.try_acquire_dispatch_slot(&a, &c, &h, src.as_deref(), ttl_secs))
-            .await
+        self.with_db(move |db| {
+            db.try_acquire_dispatch_slot(&a, &c, &h, src.as_deref(), ttl_secs, max_slots)
+        })
+        .await
     }
 
     /// Release a slot lease held by `holder_task_id` (mika#1948).
