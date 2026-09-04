@@ -266,12 +266,20 @@ Optional (dispatch concurrency cap — mika#2160):
   default with a WARN; the literal `0` **disables** the cap (unbounded). **The
   default is 1 and mika#2160 does not move it** — the ticket makes N choosable, the
   operator chooses it.
-  - **Two places enforce the cap, and both move together or the setting is
-    decorative.** The dispatch guard compares `count_active_callback_tasks_excluding`
-    (distinct parents, not rows) against the cap; and `dispatch_slot_leases` gained
-    `slot_index` in its PRIMARY KEY at schema v52, because
-    `PRIMARY KEY (agent_id, dispatch_class)` was itself a hard cap of one whatever
-    the guard decided.
+  - **Three places enforce the cap, and all three move together or the setting is
+    decorative.** (1) The dispatch guard compares `count_active_callback_tasks_excluding`
+    (distinct parents, not rows) against the cap — at the default of 1 it keeps the
+    original single-query path, so the shipped behaviour gains no extra round trip.
+    (2) `dispatch_slot_leases` gained `slot_index` in its PRIMARY KEY at schema v52,
+    because `PRIMARY KEY (agent_id, dispatch_class)` was itself a hard cap of one
+    whatever the guard decided; the claim also refuses when live leases already meet
+    the cap, so lowering the cap while leases are live cannot leave the class
+    over-subscribed. (3) The deferred-promotion backstop
+    (`engine.rs::promote_pending_deferred_if_idle`) and the force-promote override
+    compare `count_active_callbacks_for_class` against the cap instead of asking
+    "is anything active" — left boolean, a raised cap would admit new dispatches
+    while a *deferred* one waited for the class to fall back to **zero**, which is
+    the asymmetric-predicate drift mika#1163 already had to name once.
   - **Raising it above 1 is gated on mika#2163, not on this variable.** The
     `canUseTool` permission callback reaches mika-dev through `/a2a/{agent}`, which
     takes the per-agent mutex with `try_lock_owned()` (`server/a2a.rs:226`, `:360`)

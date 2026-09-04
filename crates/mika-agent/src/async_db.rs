@@ -1421,15 +1421,25 @@ impl AsyncDatabase {
             .await
     }
 
+    /// How many dispatches of this class occupy the per-class slots
+    /// (mika#2160). Twin of `Database::count_active_callbacks_for_class`.
+    pub async fn count_active_callbacks_for_class(&self, dispatch_class: &str) -> Result<i64> {
+        let a = self.agent_id.clone();
+        let c = dispatch_class.to_owned();
+        self.with_db(move |db| db.count_active_callbacks_for_class(&a, &c))
+            .await
+    }
+
     /// Force-promote the next pending deferred wrapper for a dispatch class
     /// with fail-closed slot-availability semantics (mika#1453).
     pub async fn force_promote_deferred_for_class(
         &self,
         dispatch_class: &str,
+        max_slots: i64,
     ) -> Result<crate::db::ForcePromoteResult> {
         let a = self.agent_id.clone();
         let c = dispatch_class.to_string();
-        self.with_db(move |db| db.force_promote_deferred_for_class(&a, &c))
+        self.with_db(move |db| db.force_promote_deferred_for_class(&a, &c, max_slots))
             .await
     }
 

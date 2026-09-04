@@ -252,6 +252,39 @@ phantom ne déclare plus mortes les sessions longues, donc le plafond n'est plus
 illisible pour cette raison-là. Ça ne change pas le périmètre ; ça change ce que
 la Phase 6 doit dire à l'opérateur.
 
+## Ce que la revue de code a trouvé — 2026-09-05
+
+Trois relecteurs (migration/données, concurrence, non-régression). Cinq constats
+réels, tous corrigés. Deux méritent d'être écrits ici parce qu'ils corrigent le
+plan lui-même.
+
+**Le plan comptait deux endroits qui tenaient le plafond. Il y en avait trois.**
+`has_any_active_callback_for_class` est un booléen `COUNT(*) > 0` — la forme d'un
+plafond à exactement un — et il garde la **promotion des dispatchs différés**
+(`engine.rs::promote_pending_deferred_if_idle`), le forçage, et l'outil CLI.
+Laissé booléen, un plafond à 2 aurait admis les dispatchs *neufs* tout en faisant
+attendre un dispatch *différé* jusqu'au retour de la classe à **zéro**. Le
+commentaire du dépôt nommait déjà cette classe de panne — *« keep in sync — see
+mika#1163 for the asymmetric-predicate-drift failure class »* — et
+l'implémentation la rebâtissait. Corrigé par un compagnon de comptage et un
+paramètre de plafond, même forme que `ttl_secs` pour le bail. KTD1 se lit donc
+désormais : le plafond bouge aux **trois** endroits, ou il est décoratif.
+
+**Deux défauts nés de la migration elle-même.** (a) Au plafond levé (`0`), le
+chemin « illimité » ajoutait un index à chaque prise sans jamais en récupérer un
+expiré — et `release_dispatch_slot` n'a aucun appelant en production. Avant v52
+la clé à deux colonnes forçait l'écrasement ; `slot_index` rendait la fuite
+représentable. (b) Une bascule du plafond vers le bas laissait la classe
+sur-souscrite : à 2 puis retour à 1, l'index 0 se libère et une prise neuve
+l'obtient sans voir que l'index 1 vit encore. Les deux ont leur test.
+
+**Et une régression de trafic au défaut.** La garde faisait deux allers-retours
+DB là où l'original en faisait un, sur le chemin même de l'AC5. Bénin — le bail
+atomique est l'arbitre, pas la garde — mais c'était bien un changement
+observable au défaut livré. Corrigé de la meilleure façon : à un plafond de 1, la
+garde reprend la requête unique d'origine. Le comptage n'est payé que par qui a
+demandé N>1.
+
 ## Hors périmètre — confirmé
 
 La classe `groom` (déjà parallèle). Le balayage phantom (mika#2156). Le livelock de grooming (mika#2158). La file bornée du chemin A2A — **fichée en mika#2163**, référencée par KTD6, non traitée ici.

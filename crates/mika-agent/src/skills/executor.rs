@@ -942,7 +942,7 @@ pub(crate) fn parse_max_concurrent_implement(raw: Option<&str>) -> i64 {
 
 /// Read the `implement` concurrency cap from the environment (mika#2160).
 /// `0` disables the cap.
-pub(crate) fn max_concurrent_implement() -> i64 {
+pub fn max_concurrent_implement() -> i64 {
     parse_max_concurrent_implement(std::env::var(MAX_CONCURRENT_IMPLEMENT_ENV).ok().as_deref())
 }
 
@@ -951,7 +951,7 @@ pub(crate) fn max_concurrent_implement() -> i64 {
 /// Only `implement` is configurable. `groom` already runs beside implementation
 /// and its own cap of one is out of scope for mika#2160 — widening it here
 /// would change a class the ticket never measured.
-pub(crate) fn max_concurrent_for_class(dispatch_class: &str) -> i64 {
+pub fn max_concurrent_for_class(dispatch_class: &str) -> i64 {
     match dispatch_class {
         "implement" => max_concurrent_implement(),
         _ => 1,
@@ -969,7 +969,7 @@ pub(crate) fn max_concurrent_for_class(dispatch_class: &str) -> i64 {
 /// failing once in a while. Keeping the decision pure removes the class.
 ///
 /// `cap <= 0` is the explicit disable sentinel: nothing is ever refused.
-pub(crate) fn class_cap_reached(active: i64, cap: i64) -> bool {
+pub fn class_cap_reached(active: i64, cap: i64) -> bool {
     cap > 0 && active >= cap
 }
 
@@ -1458,13 +1458,23 @@ pub(crate) async fn validate_dispatch_readiness(
     let dispatch_class = tool_input.and_then(extract_skill_from_input);
     let class = derive_dispatch_class(dispatch_class);
     // mika#2160 — the guard compares a COUNT against a configurable cap rather
-    // than asking "is there at least one". At the default cap of 1 those are
-    // the same question and every branch below is unchanged; the cap is what
-    // makes N>1 reachable without touching this arbitration again.
+    // than asking "is there at least one". The cap is what makes N>1 reachable
+    // without touching this arbitration again.
     let cap = max_concurrent_for_class(class);
     let guard_result = if cap == 0 {
         // Explicit disable sentinel: no cap, so nothing to compare against.
         Ok(None)
+    } else if cap == 1 {
+        // The shipped default, and deliberately the ORIGINAL single query. At a
+        // cap of one, "is there at least one" and "are there at least one" are
+        // the same question, so counting first buys nothing and costs a second
+        // round trip on the `AsyncDatabase` actor queue — two messages where
+        // there was one, with room for another writer to land between them. The
+        // state an interleaving could expose is benign (the atomic lease claim
+        // below is the arbiter, not this guard), but the default path should not
+        // acquire a new observable behaviour to pay for a setting nobody turned
+        // on.
+        db.has_active_callback_tasks_excluding(task_id, class).await
     } else {
         match db
             .count_active_callback_tasks_excluding(task_id, class)
@@ -1918,9 +1928,11 @@ pub(crate) async fn validate_dispatch_readiness(
     //
     // A slot two claimants can simultaneously believe they hold is not
     // arbitration, it is a convention. The claim below is a FACT: the PRIMARY
-    // KEY on (agent_id, dispatch_class) means the second claimant's INSERT
-    // collides rather than races, and exactly one caller leaves here holding
-    // the slot.
+    // KEY on (agent_id, dispatch_class, slot_index) means a second claimant for
+    // the same slot collides rather than races, and exactly one caller leaves
+    // here holding any given slot. `slot_index` joined that key in mika#2160;
+    // at the default cap of 1 exactly one index exists and this reads as it
+    // always did.
     //
     // Placed LAST so that no fallible step follows it — every rejection above
     // returns before a lease is ever taken, which is why no error path needs to
