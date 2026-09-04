@@ -13,9 +13,12 @@
 //! and the ascension architecture brainstorm (`docs/brainstorms/2026-06-09-...`) for
 //! the broader context — local↔cloud Mika portability, R1 daily-use unblock slice.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 pub use mika_a2a::CALLER_SESSION_ID_KEY;
-use mika_a2a::client::A2aClient;
+use mika_a2a::client::{A2aClient, RECOVERY_TIMEOUT};
+use mika_a2a::error::TransportFailure;
 use mika_a2a::{A2aError, Message, MessageSendParams, Part, Role, Task, TaskState};
 use uuid::Uuid;
 
@@ -89,7 +92,15 @@ fn push_rendered_part(part: &Part, out: &mut Vec<String>) {
 /// `caller_session_id` is the sender's own session id, carried in request
 /// metadata under [`CALLER_SESSION_ID_KEY`]. `None` leaves `metadata` absent so
 /// the serialized body is byte-identical to the pre-mika#2070 shape.
-fn build_send_params(message: &str, caller_session_id: Option<&str>) -> MessageSendParams {
+///
+/// `context_id` is the caller's own handle on this exchange (mika#2036). The
+/// server persists it beside the task it mints, which makes it the one name the
+/// caller can still use to find its answer if the response never arrives.
+fn build_send_params(
+    message: &str,
+    caller_session_id: Option<&str>,
+    context_id: &str,
+) -> MessageSendParams {
     let metadata = caller_session_id.map(|sid| {
         std::collections::HashMap::from([(
             CALLER_SESSION_ID_KEY.to_string(),
@@ -104,7 +115,7 @@ fn build_send_params(message: &str, caller_session_id: Option<&str>) -> MessageS
                 text: message.to_string(),
                 metadata: None,
             }],
-            context_id: None,
+            context_id: Some(context_id.to_string()),
             task_id: None,
             metadata: None,
             reference_task_ids: None,
@@ -114,6 +125,99 @@ fn build_send_params(message: &str, caller_session_id: Option<&str>) -> MessageS
         configuration: None,
         metadata,
     }
+}
+
+/// What a recovery read found on the server after a failed exchange.
+///
+/// These variants are the distinction the founding incident could not make. On
+/// 2026-09-04 a scripted caller retried `mika ask --agent mika-qa` eight times
+/// over twenty minutes with a growing backoff and could not tell "the agent is
+/// busy, retry" from "your answer exists and was dropped on the way back" — and
+/// only the second of those justifies an escalation.
+#[derive(Debug)]
+enum Recovery {
+    /// The generation finished and is being returned. It was produced, then
+    /// lost at transport — the whole point of mika#2036.
+    Recovered(Box<Task>),
+    /// A task exists but has not finished. The answer does not exist *yet*;
+    /// retrying is the right move.
+    StillRunning { task_id: String, state: TaskState },
+    /// A task exists and ended without a usable answer.
+    Ended { task_id: String, state: TaskState },
+    /// The server holds no task under this context. Either the request never
+    /// landed, or it was refused before a task was created — a busy agent
+    /// refuses at the lock, before `a2a_create_task`.
+    NoTask,
+    /// The recovery read itself failed, so whether an answer exists is unknown.
+    Unavailable(String),
+}
+
+/// Ask the server what became of the exchange named by `context_id`.
+///
+/// Uses [`RECOVERY_TIMEOUT`] rather than the send budget: this is a database
+/// read, and a caller already past one failure should not wait another five
+/// minutes to learn whether its answer survived.
+async fn recover_by_context(url: &str, auth_token: Option<String>, context_id: &str) -> Recovery {
+    let client = A2aClient::with_timeout(url, auth_token, RECOVERY_TIMEOUT);
+    match client.get_task(context_id, None).await {
+        Ok(Some(task)) => match task.status.state {
+            TaskState::Completed | TaskState::InputRequired | TaskState::AuthRequired => {
+                Recovery::Recovered(Box::new(task))
+            }
+            TaskState::Submitted | TaskState::Working | TaskState::Unknown => {
+                Recovery::StillRunning {
+                    task_id: task.id,
+                    state: task.status.state,
+                }
+            }
+            TaskState::Failed | TaskState::Canceled | TaskState::Rejected => Recovery::Ended {
+                task_id: task.id,
+                state: task.status.state,
+            },
+        },
+        Ok(None) => Recovery::NoTask,
+        Err(e) => Recovery::Unavailable(e.to_string()),
+    }
+}
+
+/// Build the operator-facing message for an exchange that failed and could not
+/// be recovered.
+///
+/// Kept pure so every branch can be asserted without a network. The point of
+/// mika#2036 is that these sentences *differ*; a test that cannot compare them
+/// cannot defend the difference.
+///
+/// `recovery` is `None` when no recovery was attempted — which happens only
+/// when the request never reached the server, and is itself information the
+/// caller needs.
+fn transport_error_message(
+    failure: TransportFailure,
+    url: &str,
+    timeout: Duration,
+    context_id: &str,
+    recovery: Option<&Recovery>,
+) -> String {
+    let head = failure.describe(url, timeout);
+    let tail = match recovery {
+        None => "the request never left this client, so no answer exists to reclaim".to_string(),
+        Some(Recovery::NoTask) => format!(
+            "the server holds no task for context {context_id} — the request did not land, or was              refused before work started (a busy agent refuses at the lock). Retry."
+        ),
+        Some(Recovery::StillRunning { task_id, state }) => format!(
+            "the server is still working on it (task {task_id}, state '{state}', context              {context_id}) — the answer does not exist yet. Retry."
+        ),
+        Some(Recovery::Ended { task_id, state }) => format!(
+            "the server's task {task_id} ended in state '{state}' (context {context_id}) — it will              not produce an answer."
+        ),
+        Some(Recovery::Unavailable(why)) => format!(
+            "an answer may exist server-side but the recovery read failed ({why}) — look it up              with tasks/get on context {context_id}"
+        ),
+        // Never reached: a recovered task is returned, not reported as an error.
+        Some(Recovery::Recovered(task)) => {
+            format!("recovered task {} (context {context_id})", task.id)
+        }
+    };
+    format!("{head}; {tail}")
 }
 
 /// Send a single user message to an agent's A2A endpoint via `message/send` and
@@ -143,15 +247,48 @@ pub async fn send_message_to_agent(
     let auth_token = std::env::var("MIKA_INTERNAL_TOKEN")
         .ok()
         .filter(|t| !t.is_empty());
-    let client = A2aClient::new(url, auth_token);
+    let client = A2aClient::new(url, auth_token.clone());
+
+    // The caller's own handle on this exchange. Minted before the send so it
+    // survives the send failing: the task id is server-side and comes back only
+    // in the envelope that may be lost (mika#2036).
+    let context_id = Uuid::new_v4().to_string();
 
     let task = match client
-        .send_message(build_send_params(message, caller_session_id))
+        .send_message(build_send_params(message, caller_session_id, &context_id))
         .await
     {
         Ok(task) => task,
         Err(A2aError::InvalidJsonRpc(msg)) => anyhow::bail!("remote error: {msg}"),
-        Err(A2aError::ClientError(e)) => anyhow::bail!("connection error: {e}"),
+        Err(A2aError::ClientError(e)) => {
+            let failure = TransportFailure::classify(&e);
+            // Only attempt recovery when the request actually left. A server
+            // that was never reached cannot hold a task, and asking it for one
+            // would be a phantom recovery.
+            let recovery = if failure.request_was_sent() {
+                Some(recover_by_context(url, auth_token, &context_id).await)
+            } else {
+                None
+            };
+            match recovery {
+                Some(Recovery::Recovered(recovered)) => {
+                    tracing::warn!(
+                        context_id = %context_id,
+                        task_id = %recovered.id,
+                        failure = ?failure,
+                        "reclaimed a generated A2A response after a transport failure"
+                    );
+                    *recovered
+                }
+                other => anyhow::bail!(transport_error_message(
+                    failure,
+                    url,
+                    client.timeout(),
+                    &context_id,
+                    other.as_ref(),
+                )),
+            }
+        }
         Err(A2aError::SerializationError(e)) => anyhow::bail!("serialization error: {e}"),
         Err(A2aError::InvalidStateTransition { from, to }) => {
             anyhow::bail!("invalid state transition from {from} to {to}")
@@ -195,7 +332,9 @@ pub async fn send_message_to_agent(
 /// output without capturing stdout. `run_remote` wraps this with a print.
 ///
 /// Errors are surfaced as `anyhow` failures with single-line prefixes per
-/// `A2aError` variant so the caller can `eprintln!("Error: {e}")` and exit non-zero.
+/// `A2aError` variant so the caller can `eprintln!("Error: {e}")` and exit
+/// non-zero. A transport failure additionally reports what became of the work
+/// on the other side — see [`transport_error_message`].
 pub async fn dispatch_remote(
     message: &str,
     remote_url: &str,
@@ -471,11 +610,147 @@ mod tests {
         assert_eq!(v["metadata"]["remote_task_id"], "task-test");
     }
 
+    // --- mika#2036: the error tells the truth about itself ---------------------
+
+    const URL: &str = "http://127.0.0.1:8080/a2a/mika-arch/révision-de-plan";
+    const CTX: &str = "ctx-révision-2026-09-04";
+
+    fn every_outcome() -> Vec<(&'static str, Option<Recovery>)> {
+        vec![
+            ("not sent", None),
+            ("no task", Some(Recovery::NoTask)),
+            (
+                "still running",
+                Some(Recovery::StillRunning {
+                    task_id: "tâche-1".to_string(),
+                    state: TaskState::Working,
+                }),
+            ),
+            (
+                "ended",
+                Some(Recovery::Ended {
+                    task_id: "tâche-1".to_string(),
+                    state: TaskState::Failed,
+                }),
+            ),
+            (
+                "unavailable",
+                Some(Recovery::Unavailable("connexion refusée".to_string())),
+            ),
+        ]
+    }
+
+    /// **AC1 + the 2026-09-04 instance.** Every outcome must render its own
+    /// sentence. The founding defect was not a missing message but a *shared*
+    /// one: a caller could not tell "busy, retry" from "your answer exists and
+    /// was lost", and only the second justifies an escalation. Comparing every
+    /// pair fails the moment two of them collapse again.
+    #[test]
+    fn each_outcome_reads_differently_from_every_other() {
+        let outcomes = every_outcome();
+        let rendered: Vec<(&str, String)> = outcomes
+            .iter()
+            .map(|(label, rec)| {
+                (
+                    *label,
+                    transport_error_message(
+                        TransportFailure::Interrupted,
+                        URL,
+                        Duration::from_secs(300),
+                        CTX,
+                        rec.as_ref(),
+                    ),
+                )
+            })
+            .collect();
+
+        for (i, (label_a, a)) in rendered.iter().enumerate() {
+            for (label_b, b) in rendered.iter().skip(i + 1) {
+                assert_ne!(a, b, "'{label_a}' and '{label_b}' render the same sentence");
+            }
+        }
+    }
+
+    /// **AC4.** Whatever happened, the caller must be told where to look. The
+    /// context id is the only handle it holds — the task id is server-minted and
+    /// travels back in the envelope that was lost.
+    #[test]
+    fn every_recovered_outcome_names_the_handle_to_look_it_up_with() {
+        for (label, rec) in every_outcome() {
+            let text = transport_error_message(
+                TransportFailure::Interrupted,
+                URL,
+                Duration::from_secs(300),
+                CTX,
+                rec.as_ref(),
+            );
+            assert!(
+                text.contains(URL),
+                "'{label}' does not name the endpoint: {text}"
+            );
+            if rec.is_some() {
+                assert!(
+                    text.contains(CTX),
+                    "'{label}' does not name the context to look it up with: {text}"
+                );
+            }
+        }
+    }
+
+    /// The message must carry the *reason* on top of the outcome: a timeout and
+    /// an interrupted exchange lead to the same "still running" verdict but are
+    /// not the same event, and the timeout must name the budget it spent.
+    #[test]
+    fn the_reason_survives_alongside_the_outcome() {
+        let outcome = Recovery::StillRunning {
+            task_id: "tâche-1".to_string(),
+            state: TaskState::Working,
+        };
+        let timed_out = transport_error_message(
+            TransportFailure::TimedOut,
+            URL,
+            Duration::from_secs(300),
+            CTX,
+            Some(&outcome),
+        );
+        let interrupted = transport_error_message(
+            TransportFailure::Interrupted,
+            URL,
+            Duration::from_secs(300),
+            CTX,
+            Some(&outcome),
+        );
+
+        assert!(timed_out.contains("300s"), "budget missing: {timed_out}");
+        assert_ne!(
+            timed_out, interrupted,
+            "the same outcome after different failures must not read identically"
+        );
+    }
+
+    /// A caller that never reached the server must be told exactly that, and
+    /// must not be pointed at a lookup that cannot succeed.
+    #[test]
+    fn an_unreachable_server_does_not_send_the_caller_hunting() {
+        let text = transport_error_message(
+            TransportFailure::Unreachable,
+            URL,
+            Duration::from_secs(300),
+            CTX,
+            None,
+        );
+        assert!(text.contains("never left this client"), "got: {text}");
+        assert!(
+            !text.contains("tasks/get"),
+            "an unreachable server holds nothing to look up: {text}"
+        );
+    }
+
     // --- mika#2070: caller session id on the wire ------------------------------
 
     #[test]
     fn send_params_carry_the_caller_session_id() {
-        let params = build_send_params("hello", Some("rt005-c1-r7"));
+        let params = build_send_params("hello", Some("rt005-c1-r7"), "ctx-1");
         let metadata = params.metadata.expect("metadata should be present");
         assert_eq!(metadata.len(), 1);
         assert_eq!(
@@ -486,7 +761,7 @@ mod tests {
 
     #[test]
     fn send_params_without_a_session_serialize_without_metadata() {
-        let params = build_send_params("hello", None);
+        let params = build_send_params("hello", None, "ctx-1");
         assert!(params.metadata.is_none());
         // The pre-mika#2070 body shape is preserved byte-for-byte: `metadata` is
         // `skip_serializing_if = "Option::is_none"`, so the key must be absent

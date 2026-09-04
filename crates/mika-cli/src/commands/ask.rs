@@ -742,8 +742,10 @@ mod tests {
     /// `LLM provider error: OAuth token resolution failed` under a bare
     /// "failed to reach mika-spirit... is it running?" for ~2h of duo diag. This
     /// test locks in the mask-through fix: the visible message must contain
-    /// (a) the underlying reason string (e.g. `connection error`) and
-    /// (b) the endpoint URL (actionable context).
+    /// (a) the underlying reason string and (b) the endpoint URL (actionable
+    /// context). Since mika#2036 that reason is a full sentence naming the
+    /// transport failure *and* what became of the work; the mask-through
+    /// contract this test defends is unchanged.
     ///
     /// The test exercises the real `wrap_send_error` helper (the production
     /// wrapper used at commands/ask.rs:~320) against a synthetic anyhow error
@@ -752,10 +754,12 @@ mod tests {
     /// production wrapper regressed, independent of any live-endpoint state.
     #[test]
     fn test_wrap_send_error_preserves_underlying_a2a_error_chain() {
-        // Shape mirrors `send_message_to_agent`'s `A2aError::ClientError` arm at
-        // crates/mika-cli/src/remote_ask.rs:136 — `anyhow::bail!("connection error: {e}")`.
-        let underlying: anyhow::Error =
-            anyhow::anyhow!("connection error: HTTP 500 Internal Server Error <body preview>");
+        // Shape mirrors `send_message_to_agent`'s `A2aError::ClientError` arm,
+        // which since mika#2036 bails with `remote_ask::transport_error_message`.
+        let underlying: anyhow::Error = anyhow::anyhow!(
+            "HTTP 500 from http://test.local/a2a/test-agent; \
+             the server holds no task for context ctx-1 — the request did not land"
+        );
         let spirit_endpoint = "http://test.local/a2a/test-agent";
 
         // Exercise the real production helper — a regression that reverts to
@@ -767,7 +771,7 @@ mod tests {
 
         // (a) Mask-through: the underlying reason must appear in the visible message.
         assert!(
-            visible.contains("connection error"),
+            visible.contains("holds no task"),
             "visible error must surface underlying A2aError reason; got: {visible}"
         );
         assert!(
