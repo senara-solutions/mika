@@ -2118,6 +2118,13 @@ _run_claude_pilot() {
 
     # Unit 3 (mika#1282): flag for dirty-worktree rescue, checked by Unit 2.
     RESCUED_DIRTY_WORKTREE=0
+    # mika#2151: SHAs of rescue commits produced during THIS dispatch, and the
+    # subset already reported on a PR. Reset here, per dispatch, deliberately:
+    # the detector has no backlog — it never scans history, open PRs, or
+    # existing branches, so its first fire is necessarily a live event. The
+    # reset is also what makes a LATER dispatch's second rescue speak again.
+    RESCUE_COMMITS=""
+    RESCUE_COMMITS_SIGNALLED=""
     POST_RUN_HEAD=""
     # mika#1772: set when a guardrail killed the session, read by the caller.
     PILOT_SESSION_TERMINATED=0
@@ -2801,6 +2808,10 @@ Scaffold paths excluded (mika#1288, mika#1419)." --no-verify > "$RESCUE_COMMIT_E
             # Commit succeeded on first try — proceed normally
             rm -f "$RESCUE_COMMIT_ERR"
 
+            # mika#2151: this commit will enter whatever PR the branch carries.
+            # Record it now; _signal_rescue_into_open_pr says so after the push.
+            _record_rescue_commit
+
             # Update POST_RUN_HEAD so _push_branch sees new commits
             POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
 
@@ -2841,6 +2852,10 @@ Auto-rescued by dispatch-lib dirty-worktree detection (cargo fmt applied).
 Scaffold paths excluded (mika#1288, mika#1419)." --no-verify > "$RESCUE_COMMIT_ERR" 2>&1; then
                 # Retry succeeded after cargo fmt
                 rm -f "$RESCUE_COMMIT_ERR"
+
+                # mika#2151: same recording as the direct path above — the
+                # cargo-fmt retry produces exactly the same class of commit.
+                _record_rescue_commit
 
                 POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
 
@@ -3051,7 +3066,22 @@ ${RESULT}"
                     # mika#1685: bypass pre-commit hook — see rationale on the
                     # mika#1282 rescue commit above. Same salvage-not-gate principle.
                     if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): trailing content after pilot end_turn (mika#1383)" --no-verify 2>&9; then
-                        git -C "$WORKTREE_DIR" push origin "$BRANCH" 2>&9 || true
+                        # mika#2151: this is the SECOND push site in dispatch-lib
+                        # — it pushes inline, before _push_branch ever runs. A
+                        # signal wired only into _push_branch would leave one
+                        # rescue class out of two silent, which is why the
+                        # recorder and the signal are both wired here too.
+                        _record_rescue_commit
+                        if git -C "$WORKTREE_DIR" push origin "$BRANCH" 2>&9; then
+                            # Signal only after a successful push: until the
+                            # commit reaches origin it is in no PR, and
+                            # announcing it would name something no operator
+                            # can open. A failed push leaves it pending for the
+                            # post-_push_branch call site to pick up.
+                            _signal_rescue_into_open_pr
+                        else
+                            echo "rescue_signal.push_deferred: trailing-content rescue not pushed (branch=${BRANCH}) — nothing entered a PR yet; signalling deferred to the post-_push_branch site" >&2
+                        fi
                         POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
                         RESULT="${RESULT}
 
@@ -3482,6 +3512,208 @@ _push_with_rebase_retry() {
     # Unreachable — the loop exits via early return or exhausts on line 1394.
     # Defensive: bail if we somehow fall through.
     return 1
+}
+
+# ---------------------------------------------------------------------------
+# mika#2151 — the rescue net announces its arrival in an already-open PR.
+#
+# The net (mika#1282 dirty-worktree, mika#1383 trailing content) commits pilot
+# work and pushes it. When the branch already carries an open PR, that content
+# enters a PR someone may already have stamped, and nothing said so. PR#2147 is
+# the measured case: a formal QA approval comment at 00:46:51Z, a second rescue
+# commit at 04:40:45Z, and a human writing the invalidation notice BY HAND 128
+# seconds later. The mechanism held the proof and spent none of it.
+#
+# THE TRIGGER IS "A PR IS OPEN", NEVER "A PR IS APPROVED". At 04:40:45Z no
+# review had ever reached the APPROVED state — the first one is 04:49:33Z, nine
+# minutes LATER. The stamp in force was prose in a comment. A design keyed on
+# reviewDecision would have stayed silent on the very incident that motivated
+# it. Dismissal is a secondary, conditional gesture; the comment carries AC1.
+#
+# These functions sit here, after the push helpers, because signalling is
+# strictly a post-push concern: a commit that never reached origin changed
+# nothing an operator can see, so there is nothing to announce.
+# ---------------------------------------------------------------------------
+
+# Record a rescue commit on the per-dispatch accumulator. Called from every
+# site that produces a `wip(` rescue commit, BEFORE its push — the accumulator
+# is about what the net produced, not about what reached origin.
+#
+# An accumulator, not a boolean: PR#2147 took TWO mika#1282 rescues in one
+# lineage (e3fe1724 then 628099ef) and a boolean would have reported one.
+#
+# Not scoped to dev-pilot, unlike RESCUED_DIRTY_WORKTREE (which gates draft-PR
+# creation). Since mika#2031 the net also covers dev-groom, and a regroom
+# redispatched onto a branch carrying an open PR is the same danger.
+#
+# Reads: WORKTREE_DIR. Writes: RESCUE_COMMITS.
+_record_rescue_commit() {
+    local _sha
+    _sha=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
+    [ -n "$_sha" ] || return 0
+    RESCUE_COMMITS="${RESCUE_COMMITS:+${RESCUE_COMMITS}
+}${_sha}"
+}
+
+# The recorded SHAs not yet reported on a PR, one per line, empty when none.
+# Set difference done with `case` rather than `grep -f`: an empty SIGNALLED set
+# is the common case, and an empty grep pattern matches every line — which
+# would silently report "nothing pending" on the first rescue of every dispatch.
+_unsignalled_rescue_commits() {
+    local _sha _seen
+    _seen="
+${RESCUE_COMMITS_SIGNALLED:-}
+"
+    while IFS= read -r _sha; do
+        [ -n "$_sha" ] || continue
+        case "$_seen" in
+            *"
+${_sha}
+"*) continue ;;
+        esac
+        printf '%s\n' "$_sha"
+    done <<< "${RESCUE_COMMITS:-}"
+}
+
+# Move SHAs into the reported set so the second call site does not repeat what
+# the first already said. Reset per dispatch (in _run_claude_pilot), so a LATER
+# dispatch that rescues again speaks again.
+_mark_rescue_commits_signalled() {
+    local _list="${1:-}"
+    [ -n "$_list" ] || return 0
+    RESCUE_COMMITS_SIGNALLED="${RESCUE_COMMITS_SIGNALLED:+${RESCUE_COMMITS_SIGNALLED}
+}${_list}"
+}
+
+# Announce, on the PR itself, that the net just committed into it.
+#
+# Cost model, and the entry guard is the whole of it:
+#   N1 — no rescue happened (the majority case of a healthy loop): the guard
+#        returns 0 BEFORE any `gh` call. Zero latency, zero quota, no network
+#        dependency added to a dispatch that did nothing wrong.
+#   N2 — a rescue happened, no PR is open (the nominal case of AC2): one
+#        `gh pr list` read, zero mutation. Irreducible — "is a PR open?" cannot
+#        be answered without asking — and paid only by a dispatch that has
+#        already committed rescued work.
+#
+# Every gesture is fail-open. The commits are on the branch and pushed by the
+# time this runs; it only ever writes ALONGSIDE them, so no path here can fail
+# the dispatch or lose the work (AC3).
+#
+# Reads: REPO, BRANCH, WORKTREE_DIR, ISSUE_NUM, SESSION_ID, LOG_ID,
+#        RESCUE_COMMITS, RESCUE_COMMITS_SIGNALLED.
+# Writes: RESULT, RESCUE_COMMITS_SIGNALLED.
+_signal_rescue_into_open_pr() {
+    [ -n "${REPO:-}" ] && [ -n "${BRANCH:-}" ] && [ -n "${WORKTREE_DIR:-}" ] || return 0
+
+    local _pending
+    _pending=$(_unsignalled_rescue_commits)
+    [ -n "$_pending" ] || return 0
+
+    local _open_pr
+    _open_pr=$(gh pr list --repo "senara-solutions/$REPO" --head "$BRANCH" \
+                 --state open --json number,reviewDecision --jq '.[0] // empty' 2>&9 || true)
+
+    if [ -z "$_open_pr" ]; then
+        # AC2. The net commits and pushes exactly as before; the only difference
+        # is one read. No PR write, no RESULT line, one line of stderr.
+        echo "rescue_signal.no_open_pr: branch=${BRANCH} rescued=$(printf '%s' "$_pending" | tr '\n' ' ')" >&2
+        _mark_rescue_commits_signalled "$_pending"
+        return 0
+    fi
+
+    local _n _decision
+    _n=$(printf '%s' "$_open_pr" | jq -r '.number // empty' 2>/dev/null || true)
+    _decision=$(printf '%s' "$_open_pr" | jq -r '.reviewDecision // empty' 2>/dev/null || true)
+    if [ -z "$_n" ]; then
+        # Do NOT mark signalled: the answer was unreadable, not negative. The
+        # second call site gets another chance at it.
+        echo "rescue_signal.pr_list_unparseable: branch=${BRANCH} payload=$(printf '%s' "$_open_pr" | head -c 200)" >&2
+        return 0
+    fi
+
+    # --- Gesture 1: the comment. This is what carries AC1. ---
+    # It is posted FIRST and unconditionally, so a token without dismissal
+    # rights (see the mika#2151 Step 0 probe) still leaves the operator told.
+    local _body_file _sha _subject _stat _cumulative
+    _body_file=$(mktemp "${TMPDIR:-/tmp}/mika-rescue-signal.XXXXXX")
+    {
+        printf '## Le filet de récupération a commité dans cette PR (mika#2151)\n\n'
+        printf 'Le contenu de cette PR a changé **après** son ouverture : `dispatch-lib` a sauvé du travail que la session pilote avait écrit sans le commiter. Une approbation ou une revue antérieure à ces commits **ne les couvre pas**.\n\n'
+        printf '### Commits ajoutés par le filet\n\n'
+        while IFS= read -r _sha; do
+            [ -n "$_sha" ] || continue
+            _subject=$(git -C "$WORKTREE_DIR" log -1 --format='%h %s' "$_sha" 2>/dev/null \
+                       || printf '%s (sujet illisible)' "$_sha")
+            _stat=$(git -C "$WORKTREE_DIR" diff --shortstat "${_sha}^" "$_sha" 2>/dev/null || true)
+            printf -- '- `%s`\n  %s\n' "$_subject" "${_stat:-<shortstat indisponible>}"
+        done <<< "$_pending"
+        _cumulative=$(git -C "$WORKTREE_DIR" diff --shortstat origin/main...HEAD 2>/dev/null || true)
+        printf '\n### Delta cumulé de la branche\n\n'
+        printf '`git diff --shortstat origin/main...HEAD` : %s\n\n' "${_cumulative:-<indisponible>}"
+        printf '### Provenance\n\n'
+        printf -- '- Ticket : `%s#%s`\n' "${REPO:-<inconnu>}" "${ISSUE_NUM:-<inconnu>}"
+        printf -- '- Session pilote : `%s`\n' "${SESSION_ID:-unknown}"
+        printf -- '- Log : `%s`\n' "${LOG_ID:-unknown}"
+        printf -- '- Branche : `%s`\n' "$BRANCH"
+        printf -- '\nPosté par `dispatch-lib` (mika#2151). Le geste équivalent était écrit à la main jusqu'"'"'ici.\n'
+    } > "$_body_file"
+
+    if gh pr comment "$_n" --repo "senara-solutions/$REPO" --body-file "$_body_file" 2>&9; then
+        echo "rescue_signal.commented: pr=${_n} branch=${BRANCH}" >&2
+    else
+        echo "rescue_signal.comment_failed: pr=${_n} branch=${BRANCH} — the rescue commits are on the branch and pushed; only the notice failed" >&2
+    fi
+    rm -f "$_body_file"
+
+    # --- Gesture 2: the label. Makes the class greppable across PRs. ---
+    if ! gh pr edit "$_n" --repo "senara-solutions/$REPO" --add-label "rescue-after-review" 2>&9; then
+        echo "rescue_signal.label_failed: pr=${_n} label=rescue-after-review" >&2
+    fi
+
+    # --- Gesture 3: the dismissal. Conditional and secondary. ---
+    # On the founding incident this would NOT have fired (no APPROVED state at
+    # 04:40:45Z), and its absence must never suppress the comment above.
+    #
+    # `PUT …/dismissals` rather than `gh pr review --request-changes`: the
+    # latter refuses to act on a PR the token authored ("Can not request changes
+    # on your own pull request"), which is exactly mika-platform-bot[bot]'s
+    # position on every rescue PR. Dismissal depends only on write access.
+    #
+    # It is also the machine brake: a DISMISSED review fails
+    # ci_success_handler.rs:716's `state != "APPROVED"` rejection, so the
+    # auto-merge gate closes without touching the Rust engine.
+    local _dismissed=0
+    if [ "$_decision" = "APPROVED" ]; then
+        local _review_ids _id
+        _review_ids=$(gh api "/repos/senara-solutions/$REPO/pulls/$_n/reviews" \
+                        --jq '.[] | select(.state=="APPROVED") | .id' 2>&9 || true)
+        while IFS= read -r _id; do
+            [ -n "$_id" ] || continue
+            if gh api --method PUT \
+                 "/repos/senara-solutions/$REPO/pulls/$_n/reviews/$_id/dismissals" \
+                 -f message="dispatch-lib (mika#2151) : le filet de récupération a commité sur cette branche après cette approbation. L'approbation ne couvre plus le contenu de la PR — voir le commentaire détaillant les commits ajoutés." \
+                 -f event=DISMISS 2>&9; then
+                _dismissed=$((_dismissed + 1))
+            else
+                echo "rescue_signal.dismiss_failed: pr=${_n} review=${_id} — approval left in place (token may lack pull_requests:write); the comment above still stands" >&2
+            fi
+        done <<< "$_review_ids"
+    fi
+
+    # Carry the fact into the callback so the parent task records it too — the
+    # PR comment is for the operator, this line is for the ledger. Deliberately
+    # NOT routed through _set_pr_status_line: that helper owns the single
+    # canonical `PR:`/`NO_PR:` line and this is neither.
+    local _count _dismiss_note
+    _count=$(printf '%s\n' "$_pending" | grep -c '[^[:space:]]' || true)
+    _dismiss_note=""
+    [ "$_dismissed" -gt 0 ] && _dismiss_note="; ${_dismissed} stale approval(s) dismissed"
+    RESULT="${RESULT}
+Rescue-signal (mika#2151): ${_count} rescue commit(s) landed in already-open PR #${_n} on ${BRANCH}. A notice was posted there and the \`rescue-after-review\` label applied${_dismiss_note}."
+
+    _mark_rescue_commits_signalled "$_pending"
+    return 0
 }
 
 _check_duplicate_commits() {
@@ -5422,6 +5654,15 @@ Push: SKIPPED — session terminated with no new commits; there is nothing to pu
         _push_branch
     fi
 
+    # mika#2151: the canonical push site is behind us — whatever the net
+    # rescued is now in whatever PR the branch carries, so say so on that PR.
+    # Called unconditionally: the function guards itself, and its entry guard
+    # returns before any `gh` call when nothing was rescued (the majority case).
+    # That also covers the terminated-session branch above, which reaches here
+    # having skipped the push: PILOT_SESSION_TERMINATED is only set on a clean
+    # tree with an unmoved HEAD, so the net never fired and nothing is pending.
+    _signal_rescue_into_open_pr
+
     # Unit 2 (mika#1282 + mika#1396): open a draft PR when content was rescued
     # by dispatch-lib's git-workflow ownership.
     #
@@ -5555,7 +5796,29 @@ RECOVERY_PENDING: true"
             # motif. This supersedes the `NO_PR: no_pr_on_branch` site 2 emitted.
             # The gh stderr already went to the trace fd (2>&9), so it is not
             # swallowed.
-            _set_pr_status_line "NO_PR: rescue_pr_create_failed"
+            #
+            # mika#2151 (the third silence): `gh pr create` fails with "a pull
+            # request for branch … already exists" whenever the rescue landed on
+            # a branch that already carries an open PR. That failure IS the proof
+            # the rescued content entered a PR someone may already have reviewed,
+            # and spending it on the generic create-failed motif throws the proof
+            # away — misreporting "no PR" for a dispatch that demonstrably has
+            # one. Ask which of the two it was, and report accordingly.
+            local _existing_pr
+            _existing_pr=$(_pr_list_url "$REPO" "$BRANCH")
+            if [ -n "$_existing_pr" ]; then
+                echo "rescue_pr_create.pr_already_open: branch=${BRANCH} pr=${_existing_pr} — the rescued content entered a PR opened before this dispatch" >&2
+                PR_URL="$_existing_pr"
+                _set_pr_status_line "PR: ${_existing_pr}"
+                RESULT="${RESULT}
+Rescue-into-open-PR (mika#2151): no rescue PR was opened because ${_existing_pr} was already open on ${BRANCH}. The rescued commits went into THAT PR — see the notice posted on it."
+                # Deliberately no `RECOVERY_PENDING: true` here. That marker
+                # holds back a draft PR dispatch-lib itself opened; this PR is
+                # someone else's, already in the normal review flow. The brakes
+                # for this case are mika#2151's comment, label and dismissal.
+            else
+                _set_pr_status_line "NO_PR: rescue_pr_create_failed"
+            fi
         fi
     fi
 

@@ -179,6 +179,10 @@
   color: "d97706"
   description: "PR created by dispatch-lib wip-rescue recovery (mika#1282)"
 
+- name: rescue-after-review
+  color: "b60205"
+  description: "dispatch-lib's rescue net committed into this PR after it was opened — an earlier approval does not cover those commits (mika#2151)"
+
 - name: stale-against-main
   color: "b60205"
   description: "PR branch fails clippy after rebase onto current main (mika#1631)"
