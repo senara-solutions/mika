@@ -13,9 +13,25 @@
 # policy allows this repo's GitHub OIDC subject; provisioned in mika-cloud
 # Terraform per mika#1619). No AWS access keys are stored.
 #
-# Tags pushed (AC: SHA + moving tag):
+# Tags pushed: exactly one, and it is a function of the commit.
 #   - <full github.sha>  immutable, the deploy target downstream PRs pin
-#   - latest             moving convenience tag for the newest main build
+#
+# There is deliberately NO moving convenience tag. The three ECR repositories
+# — mika-agent, mika-gateway, mika-console — are declared IMMUTABLE, and an
+# IMMUTABLE repository refuses to reassign a tag it already carries. A "moving
+# tag" is by definition a tag you reassign, so pushing one here is a
+# contradiction in terms: the push fails, not eventually but on the first run
+# that gets past authentication (mika#2143). The immutability is the guarantee
+# of provenance — a deployed tag always designates the content it was created
+# with — and it is not traded away for a naming convenience.
+#
+# The absence below is not an oversight, so do not "repair" it by adding a
+# second tag: scripts/check-image-tags-immutable.sh fails the build if any tag
+# that is not a function of the commit sha reappears in the `tags:` list.
+#
+# A consumer that wants "the newest build" resolves it instead of reading a
+# moving tag: `aws ecr describe-images --repository-name mika-agent` sorted on
+# `imagePushedAt` — which is what the cloud freshness probe already does.
 # Downstream consumers derive the short-sha (first 8) from the full sha.
 name: Agent Image Build & Push
 
@@ -43,9 +59,12 @@ permissions:
   contents: read
   id-token: write
 
-# One in-flight build per ref. Do NOT cancel a mid-push run: each main commit is
-# a distinct immutable artifact and a cancelled push could leave the moving
-# `latest` tag lagging the just-merged commit.
+# One in-flight build per ref. Do NOT cancel a mid-push run: a build killed
+# part-way through `docker push` leaves partially transferred layers behind and
+# poisons the gha cache scope shared with ci.yml's PR-side docker-build, so the
+# next run pays a full rebuild. The directive below stays — it guards a defect
+# distinct from the tag-immutability one (mika#2143), and the two must not be
+# conflated.
 concurrency:
   group: agent-image-build-push-${{ github.ref }}
   cancel-in-progress: false
@@ -97,7 +116,6 @@ jobs:
           push: true
           tags: |
             ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
-            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
           # Share the same gha cache scope as ci.yml's PR-side docker-build so the
           # merge build reuses layers already warmed during PR validation.
           cache-from: type=gha,scope=mika-agent
@@ -116,7 +134,6 @@ jobs:
             echo "| registry | \`${ECR_REGISTRY}\` |"
             echo "| repository | \`${ECR_REPOSITORY}\` |"
             echo "| immutable tag | \`${GITHUB_SHA}\` |"
-            echo "| moving tag | \`latest\` |"
             echo "| full ref | \`${ECR_REGISTRY}/${ECR_REPOSITORY}:${GITHUB_SHA}\` |"
             echo "| short-sha | \`${GITHUB_SHA:0:8}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
