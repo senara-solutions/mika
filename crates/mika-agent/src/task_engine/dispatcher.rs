@@ -1935,9 +1935,11 @@ async fn try_complete_parent_on_callback_success(db: &AsyncDatabase, task: &Task
 ///
 /// `dispatch-lib` refuses a foreseeable condition with `_deliver_callback` + `exit 0`,
 /// shipping a JSON body of the shape `{"status":"auto_skipped","reason":"…", …}` as the
-/// callback text (`mika#988` exit semantics). Tolerant of surrounding text: strict parse
-/// first, then a first-`{`..last-`}` slice, because the callback transport is a message
-/// body and nothing structurally forbids a future prologue.
+/// callback text (`mika#988` exit semantics). Tolerant of surrounding prose, because the
+/// callback transport is a message body and nothing structurally forbids a prologue:
+/// strict parse first, then the shared brace-matching extractor (mika#876), which is
+/// string-literal- and escape-aware — a naive first-`{`..last-`}` slice would be defeated
+/// by a brace in the refusal's own `note` field.
 fn parse_auto_skip_reason(result: &str) -> Option<String> {
     fn reason_of(v: &serde_json::Value) -> Option<String> {
         if v.get("status")?.as_str()? != "auto_skipped" {
@@ -1957,12 +1959,8 @@ fn parse_auto_skip_reason(result: &str) -> Option<String> {
     {
         return Some(r);
     }
-    let start = trimmed.find('{')?;
-    let end = trimmed.rfind('}')?;
-    if end <= start {
-        return None;
-    }
-    let v = serde_json::from_str::<serde_json::Value>(&trimmed[start..=end]).ok()?;
+    let candidate = crate::kg::subject_extractor::extract_first_json_object(trimmed)?;
+    let v = serde_json::from_str::<serde_json::Value>(candidate).ok()?;
     reason_of(&v)
 }
 
@@ -3945,6 +3943,15 @@ mod tests {
         assert_eq!(
             parse_auto_skip_reason(
                 "dispatch note\n{\"status\":\"auto_skipped\",\"reason\":\"already_groomed\"}\ntrailer"
+            )
+            .as_deref(),
+            Some("already_groomed")
+        );
+        // …and of a brace inside the refusal's own prose fields, which a naive
+        // first-`{`..last-`}` slice would be defeated by.
+        assert_eq!(
+            parse_auto_skip_reason(
+                "prologue\n{\"status\":\"auto_skipped\",\"reason\":\"already_groomed\",\"note\":\"use ${BRANCH} or {plan}\"}\nepilogue }"
             )
             .as_deref(),
             Some("already_groomed")

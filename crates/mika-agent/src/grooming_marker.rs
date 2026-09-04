@@ -104,12 +104,14 @@ static LATER_PASS_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// texte, dans l'ordre, fait tomber la règle du dernier token sur le callout le plus récent —
 /// ce qui est l'état courant — sans avoir à choisir arbitrairement une ligne.
 fn callout_text(issue_body: &str) -> Option<String> {
-    let mut parts = CALLOUT_LINE_RE
+    let lines: Vec<&str> = CALLOUT_LINE_RE
         .captures_iter(issue_body)
-        .map(|c| c[1].to_string())
-        .peekable();
-    parts.peek()?;
-    Some(parts.collect::<Vec<_>>().join("\n"))
+        .filter_map(|c| c.get(1).map(|m| m.as_str()))
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    Some(lines.join("\n"))
 }
 
 /// Le verdict de grooming porté par le corps d'issue.
