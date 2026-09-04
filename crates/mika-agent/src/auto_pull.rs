@@ -881,14 +881,22 @@ fn staleness_audit_json(
     // emitted: it is no longer a discriminator, it is a measurement again, and
     // the KTD2c promise to revise the threshold from a real distribution
     // depends on it.
+    //
+    // Two fields, not one, and neither collapses a missing list into a clean
+    // one: `non_plan_files` is `null` exactly when the list could not be read,
+    // and `non_plan_files_count` carries the untruncated total so an aggregate
+    // over the audit trail is not silently capped at [`MAX_NAMED_FILES`].
     let (changed_files_count, non_plan) = match measurement {
-        StalenessMeasurement::Measured(s) => (
-            s.changed_files.as_ref().map(Vec::len),
-            non_plan_files(s.changed_files.as_deref()),
-        ),
-        _ => (None, Vec::new()),
+        StalenessMeasurement::Measured(s) => match s.changed_files.as_deref() {
+            Some(files) => (Some(files.len()), Some(non_plan_files(Some(files)))),
+            None => (None, None),
+        },
+        _ => (None, None),
     };
-    let non_plan_named: Vec<&String> = non_plan.iter().take(MAX_NAMED_FILES).collect();
+    let non_plan_named: Option<Vec<&String>> = non_plan
+        .as_ref()
+        .map(|v| v.iter().take(MAX_NAMED_FILES).collect());
+    let non_plan_count: Option<usize> = non_plan.as_ref().map(Vec::len);
     let (outcome, reason) = match decision {
         PromotionGate::Promote { detail } => ("promote", *detail),
         PromotionGate::Refuse(r) => ("refuse", r.slug()),
@@ -908,6 +916,7 @@ fn staleness_audit_json(
         "status": status,
         "changed_files_count": changed_files_count,
         "non_plan_files": non_plan_named,
+        "non_plan_files_count": non_plan_count,
         "outcome": outcome,
         "reason": reason,
         "threshold": threshold,
@@ -2642,6 +2651,21 @@ async fn phase2_reconcile_stuck_ready(
         // A refusal `continue`s *before* `rescued` is incremented, so a refused
         // ticket never eats one of the tick's rescue slots. And a lookup miss is
         // a WARN, not a silently skipped gate.
+        //
+        // **The one gate entrance not fronted by [`is_groomed`] (mika#2140).**
+        // Phase 0 and Phase 1 both filter on it, so a branch with no plan file
+        // never reaches the gate through them. This path filters on `ready`
+        // alone, so a `ready` ticket whose callout names a hand-made, plan-less
+        // branch *can* arrive here — and under the file-based predicate such a
+        // branch is refused as salvage where it used to promote, which costs it
+        // `ready` and parks it under `operator-gated` until a human lifts it by
+        // hand. Measured 2026-09-04: zero of the 18 open tickets carrying a
+        // `> - **Branch:**` callout point at a plan-less branch, so the
+        // population is empty *today*. That is a measurement, not a guard —
+        // tracked in mika#2170, whose wake condition is the first audit record
+        // from `phase2_stuck_rescue` carrying
+        // `reason=salvage_work_on_stale_branch` with a `non_plan_files` list
+        // that contains no `docs/plans/` sibling.
         match issues.iter().find(|i| i.number == n) {
             Some(issue) => {
                 if !promotion_gate_allows(
@@ -2802,8 +2826,19 @@ mod tests {
         ));
         // Distance 0 wins over the salvage rule: a branch carrying salvage work
         // that is already current has nothing to rebase and nothing to decide.
+        //
+        // The file list is **load-bearing here** (mika#2140). With
+        // `changed_files: None` this assertion is vacuous — the salvage rule
+        // could not have fired anyway, so moving the `behind_by == 0`
+        // short-circuit below it would keep the suite green and the documented
+        // rule order would stop being tested. The code file is what makes the
+        // precedence real.
         assert!(matches!(
-            classify_promotion(&measured(0, 7, "ahead"), Some("feat/x"), 50),
+            classify_promotion(
+                &measured_files(0, 7, "ahead", &["crates/a.rs"]),
+                Some("feat/x"),
+                50
+            ),
             PromotionGate::Promote {
                 detail: "up_to_date"
             }
@@ -2811,7 +2846,7 @@ mod tests {
     }
 
     /// AC3 — the negative control. A branch behind but within the threshold,
-    /// carrying only its plan commit, **must** be promoted.
+    /// carrying only plan files, **must** be promoted.
     ///
     /// This is the assertion that distinguishes a working gate from a gate that
     /// refuses everything. Make the refusal branch in `classify_promotion`
@@ -2821,7 +2856,11 @@ mod tests {
         for behind in [1, 17, 49, 50] {
             assert!(
                 matches!(
-                    classify_promotion(&measured(behind, 1, "diverged"), Some("feat/x"), 50),
+                    classify_promotion(
+                        &measured_files(behind, 1, "diverged", &["docs/plans/x.md"]),
+                        Some("feat/x"),
+                        50
+                    ),
                     PromotionGate::Promote {
                         detail: "behind_within_threshold"
                     }
@@ -2894,7 +2933,11 @@ mod tests {
     #[test]
     fn test_promotion_gate_threshold_zero_disables_distance_rule() {
         assert!(matches!(
-            classify_promotion(&measured(989, 1, "diverged"), Some("docs/x"), 0),
+            classify_promotion(
+                &measured_files(989, 1, "diverged", &["docs/plans/x.md"]),
+                Some("docs/x"),
+                0
+            ),
             PromotionGate::Promote {
                 detail: "behind_within_threshold"
             }
@@ -3014,8 +3057,12 @@ mod tests {
         ));
         let json: serde_json::Value =
             serde_json::from_str(&staleness_audit_json(1, Some("feat/x"), &m, &d, 50)).unwrap();
+        // "Could not read" is never rendered as "there is nothing outside
+        // plans" — the two are byte-distinct in the audit, which is the same
+        // distinction `BranchStaleness::changed_files` makes one level up.
         assert!(json["changed_files_count"].is_null());
-        assert_eq!(json["non_plan_files"], serde_json::json!([]));
+        assert!(json["non_plan_files"].is_null());
+        assert!(json["non_plan_files_count"].is_null());
     }
 
     /// **AC5** — the refusal names the files, and the naming is bounded.
@@ -3059,6 +3106,16 @@ mod tests {
         assert!(reason.contains("… et 2 autres"), "got: {reason}");
         assert!(reason.contains("crates/f9.rs"));
         assert!(!reason.contains("crates/f10.rs"));
+
+        // The audit names 10 but *counts* 12: truncation is a rendering bound,
+        // never a measurement bound, or the KTD2c aggregation would undercount.
+        let m = measured_files(8, 12, "diverged", &refs);
+        let d = classify_promotion(&m, Some("fix/x/y"), 50);
+        let json: serde_json::Value =
+            serde_json::from_str(&staleness_audit_json(1, Some("fix/x/y"), &m, &d, 50)).unwrap();
+        assert_eq!(json["non_plan_files"].as_array().unwrap().len(), 10);
+        assert_eq!(json["non_plan_files_count"], 12);
+        assert_eq!(json["changed_files_count"], 12);
     }
 
     /// The parse contract in both directions (mika#2140 D1).
@@ -3132,6 +3189,7 @@ mod tests {
             json["non_plan_files"],
             serde_json::json!(["crates/mika-agent/src/agent_loop/mod.rs"])
         );
+        assert_eq!(json["non_plan_files_count"], 1);
 
         // Unmeasurable outcomes carry nulls, never a fabricated zero.
         let m = StalenessMeasurement::Unavailable;
