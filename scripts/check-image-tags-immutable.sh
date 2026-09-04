@@ -25,6 +25,15 @@
 #   different name, and each of them is caught here because the rule is
 #   "derived from the sha", not "not called latest".
 #
+# KNOWN BOUNDARY, stated rather than left to be discovered: this guard reads
+#   `tags:`. docker/build-push-action can also name an image through
+#   `outputs: type=image,name=...`, which this parser does not model. That path
+#   is not silently green, though — removing `tags:` makes the guard exit 3
+#   ("nothing to check" is not "clean"), so the *substitution* is caught. Only
+#   an `outputs:` added ALONGSIDE a sha-derived `tags:` would slip past. If that
+#   ever becomes a real shape here, extend this by property, not by adding a
+#   second grep for one more spelling.
+#
 # THE REMEDY, when this fires, is to delete the offending tag rather than to
 # make the repository mutable. Immutability is a provenance guarantee — a
 # deployed tag always designates the content it was created with — and it is

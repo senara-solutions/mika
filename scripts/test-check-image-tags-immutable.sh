@@ -54,9 +54,19 @@ assert_output_contains() {
 
 # A throwaway fixture workflow whose body is $1, written at relative path $2
 # (default a plain ASCII name) under a fresh temp dir. Echoes the file path.
+# One root for the whole suite, removed by a trap however the suite exits.
+#
+# Registering each fixture dir in an array instead does NOT work here, and the
+# reason is worth keeping: `make_fixture` is always called in a command
+# substitution, so its body runs in a subshell and any array it appends to is
+# discarded on return. The per-case `rm -rf` below cannot cover it either — for
+# a nested fixture path, `dirname` names the subdirectory, not the root.
+FIXTURE_ROOT="$(mktemp -d)"
+trap 'rm -rf "$FIXTURE_ROOT"' EXIT
+
 make_fixture() {
     local body="$1" rel="${2:-wf.yml}" dir
-    dir="$(mktemp -d)"
+    dir="$(mktemp -d -p "$FIXTURE_ROOT")"
     mkdir -p "$dir/$(dirname "$rel")"
     printf '%s\n' "$body" > "$dir/$rel"
     echo "$dir/$rel"
