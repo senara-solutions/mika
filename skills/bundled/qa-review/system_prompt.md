@@ -113,12 +113,21 @@ This step determines whether the PR is an auto-rescued dispatch-lib PR and, if s
 
 2. **Read the marker.** Search the PR body for `<!-- rescue-pipeline-verified: yes -->` or `<!-- rescue-pipeline-verified: no -->`.
 
-3. **Evaluate verification state.** The PR is considered pipeline-verified if ANY of these conditions hold:
+3. **Incident-only diff check (mika#2157) — runs BEFORE the verified/unverified branch below.** A diff composed entirely of grooming/dispatch artefacts cannot satisfy any acceptance criterion of the ticket, whatever the draft state or the verification marker says. That is a stronger fact than "still a draft", so it is evaluated first and it wins.
+
+   - **Read the marker.** Search the PR body for `<!-- rescue-diff: incident-only -->` or `<!-- rescue-diff: carries-work -->`. dispatch-lib measures the captured diff once, at the moment it opens the PR, and stamps the answer here — you read it rather than re-judging it (same producer/consumer split as the `rescue-pipeline-verified` marker, mika#1618).
+   - **Fallback when no marker is present** (PR opened before mika#2157): measure it yourself from the changed-file list Step 1's `qa_pr_view` already returned. The diff is incident-only when EVERY changed path matches one of: `.claude/groom-verdict-trail.log`, `.claude/commands/*`, `.claude/*.local.json`, `.iterate/*`, `docs/plans/*`. An absent marker does NOT mean "carries work" — measure, then decide.
+   - **If the diff is incident-only:** emit `VERDICT: hold[review]` with the reason that the diff consists entirely of grooming/dispatch artefacts and therefore cannot satisfy any acceptance criterion of the ticket, and that the PR body itself declares it is not meant to be merged. Publish via `--comment` per the Step 5 table. **End the review — do not proceed to Step 2.** An approval on an entirely-incident diff is a false positive, not an opinion — this verdict is non-approving and it holds the PR; that is what the refusal means here.
+
+     *Why `hold[review]` and not `block[ac]`* (mika#2157, implementation-time measurement): `block[ac]` is not an inert label. `crates/mika-agent/src/server/verdict_handler.rs:908` (`handle_block_ac`) structurally dispatches a fresh claude-pilot AC-fix run — `try_engine_dispatch`, audit action `ac_fix_dispatched` — up to `BLOCK_AC_MAX_RETRIES = 3` (`:44`) before it escalates to the operator. Emitting it here would spend the single dispatch slot on up to three autonomous runs against a PR whose own first line says it exists only so state is not lost. `handle_hold_review` (`:1564`) notifies the operator and leaves the task `in_progress` — no dispatch, no retry. It is also the verdict this document's own format rule designates when `PLAN-AC VERIFICATION` is absent (see the verdict-output rules near the top), which is necessarily the case on an exit that never reaches Step 2.5: emitting `block[ac]` here would oblige you to either omit a mandatory section or invent AC rows you never evaluated.
+   - **If the diff carries work:** continue to item 4 below.
+
+4. **Evaluate verification state.** The PR is considered pipeline-verified if ANY of these conditions hold:
    - The marker reads `yes`
    - The PR `isDraft` field is `false` (operator un-drafted it — this is a stronger signal than any body marker)
    - No marker is found at all (backward compatibility — pre-mika#1618 rescue PRs proceed normally)
 
-4. **Route based on verification state:**
+5. **Route based on verification state:**
    - **Verified:** Note "Rescue PR (class: `<class>`), pipeline verified — proceeding to standard review." Continue to Step 2 normally. The rescue boilerplate text is not treated as a review gate.
    - **Not verified** (marker is `no` AND PR is still draft): Emit `hold[review]` with reason: "Auto-rescued PR (class: `<class>`) is still in draft with pipeline-verification marker set to `no`. Operator must verify pipeline completion and either mark the PR as Ready for Review or edit the body to set `<!-- rescue-pipeline-verified: yes -->`." End the review — do not proceed to Step 2.
 
