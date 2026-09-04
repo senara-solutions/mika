@@ -90,6 +90,48 @@ chemin qu'exerce déjà `test_find_orphaned_pending_selects_when_wrapper_was_con
 sont des wrappers morts et ne doivent jamais compter comme vivants. `completed` est exactement le
 statut que la promotion écrit.
 
+## Acceptance criteria
+
+Les quatre AC sont transcrits du corps de senara-solutions/mika#2181, sans reformulation.
+
+- [ ] **AC1** — Le prédicat du faucheur compte comme présent tout wrapper différé `pending` **ou**
+      `completed` sans `delivered` (ou : tout wrapper dont `completed_at` est plus récent que
+      `now − grâce_de_tour`, valeur nommée). Un wrapper promu en cours de tour n'est jamais
+      « absent ».
+      → **Livrables** D1 (clause SQL élargie) + D2 (`PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS`, la
+      valeur nommée) + D3 (propagation aux appelants).
+      → **Mesure** : `test_find_orphaned_pending_excludes_parent_whose_wrapper_was_just_promoted`
+      passe au vert, et `test_find_orphaned_pending_selects_when_promoted_wrapper_is_stale` prouve
+      que la fenêtre est bornée. L'AC1 offre deux formes ; ce plan prend la seconde et documente
+      pourquoi la première serait un défaut (§ *La décision de conception, et pourquoi elle est
+      bornée*).
+
+- [ ] **AC2** — Rejeu anti-vacuité verbatim de la trace du ticket (parente `pending` née 12:10:08Z,
+      wrapper `f5eebf48` `completed` à 15:31:03Z sans `delivered`, tick du faucheur à 15:31:03Z) :
+      sur `main` le faucheur re-arme (rouge) ; avec le correctif il ne touche à rien (vert). Sortie
+      rouge dans la PR.
+      → **Livrable** D5, avec la séquence obligatoire signature → test → rouge capturé → clause SQL
+      → vert.
+      → **Mesure** : les deux sorties `cargo test` collées dans le corps de la PR sous « AC2 — rouge
+      sans le correctif » et « AC2 — vert avec le correctif ». Un test qui n'a jamais été rouge ne
+      démontre rien ; la capture EST le livrable.
+
+- [ ] **AC3** — Non-régression : une parente `pending` dont le wrapper est `delivered` depuis plus
+      que la grâce, sans pilote, est toujours re-armée (test existant à nommer, pas à réécrire).
+      → **Livrable** D5. **Test existant nommé** :
+      `test_find_orphaned_pending_selects_when_wrapper_was_consumed` (`db.rs:~16148`), laissé
+      **intact** — seul un commentaire doc est ajouté au-dessus. S'y ajoute
+      `test_find_orphaned_pending_selects_when_wrapper_is_delivered` pour la lettre de l'AC3, que
+      l'ancien test ne couvrait pas (il porte `completed`, pas `delivered`).
+      → **Mesure** : les deux tests verts, et le corps du test existant inchangé au diff.
+
+- [ ] **AC4** — Le re-armement écrit dans son événement d'audit **quel** wrapper il n'a pas trouvé et
+      pourquoi (statuts vus), pour que la prochaine bataille se lise sans reconstruire.
+      → **Livrable** D4.
+      → **Mesure** : `test_stuck_pending_rearm_audit_names_the_wrappers_seen` lit la ligne
+      `audit_events` et y trouve les identifiants courts et les statuts des deux wrappers ; un second
+      test couvre le rendu `wrappers:none`.
+
 ## Livrables
 
 ### D1 — élargir la clause (1) du prédicat (AC1)
@@ -215,6 +257,26 @@ toujours `pending`, que `stuck_rearm_count` n'a pas bougé, et qu'aucun `stuck_p
 n'a été écrit. Le test `db.rs` prouve le prédicat ; celui-ci prouve que le faucheur consomme bien le
 prédicat corrigé.
 
+### D7 — fermer la divergence sémantique sur le prédicat jumeau (F3, premier passage)
+
+`Database::has_pending_deferred_wrapper_child` (`db.rs:7535`) pose la **même question** que la clause
+(1) — « cette parente est-elle représentée ? » — avec l'**ancien** prédicat étroit
+(`status = 'pending'`). La version initiale de ce plan la laissait hors portée au motif qu'elle n'a
+aucun appelant de production. L'argument de l'architecte l'emporte : deux fonctions nommées comme
+équivalentes qui répondent différemment à la même question sont un piège armé pour le prochain
+appelant, et « pas d'appelant aujourd'hui » n'est pas une propriété stable.
+
+- élargir le prédicat de la fonction à l'identique de D1 (`pending` OU `completed` dans la fenêtre),
+  paramètre `promoted_liveness_seconds` ajouté à la signature ;
+- **renommer** en `has_live_deferred_wrapper_child`, et le sibling `async_db.rs:1101` avec elle. Le
+  renommage n'est pas cosmétique : `pending` dans l'ancien nom décrivait le prédicat, pas la
+  question. Le nouveau nom dit la question, et le compilateur attrape tout site oublié ;
+- le test `test_has_pending_deferred_wrapper_child` (`db.rs:~16276`) suit le renommage et gagne un
+  cas `completed` dans la fenêtre ⇒ vivant.
+
+Coût réel : zéro appelant de production, donc zéro risque de comportement. Le seul diff hors tests
+est la signature et le nom.
+
 ### D6 — documentation
 
 `crates/mika-agent/CLAUDE.md`, section deferred-dispatch : une phrase sur la sémantique du wrapper
@@ -223,13 +285,66 @@ promotion ; elle ne dit pas encore ce que le faucheur en fait.
 
 ## Séquence
 
-D2 → signatures de D1/D3 → D5 (rouge, capturé) → clause SQL de D1 (vert) → D4 → D6.
+D2 → signatures de D1/D3 → D5 (rouge, capturé) → clause SQL de D1 (vert) → D7 → D4 → D6.
+
+## Fire-Disposition
+
+Trois détecteurs entrent en service. Chacun doit dire, **avant** d'être écrit, ce qu'il fait au
+premier tir sur des données qui existaient déjà.
+
+### Corpus préexistant — mesuré, avec ses contrôles positifs
+
+Sur `~/.mika/data/mika.db`, 2026-09-04T21:05Z :
+
+| population | n |
+|---|---|
+| wrappers différés `status='completed'` (donc promus non consommés) | **0** |
+| wrappers différés `status='delivered'` — *contrôle positif* | 815 |
+| wrappers différés `status='cancelled'` — *contrôle positif* | 16 |
+| parentes `self_dev`/`issue` `status='pending'` au-delà de la grâce | **0** |
+| parentes `self_dev`/`issue` `failed` / `cancelled` / `completed` — *contrôle positif* | 744 / 283 / 94 |
+| parentes que le nouveau prédicat masquerait et l'ancien pas | **0** |
+
+Les contrôles positifs sont dans le même relevé que les zéros : les zéros sont des absences
+mesurées, pas une requête qui ne trouve rien parce qu'elle ne cherche pas au bon endroit.
+
+**Le corpus est volatil** — un wrapper promu peut exister à l'instant du déploiement. La requête du
+« corpus C » ci-dessus est donc à rejouer au moment du déploiement, et son résultat à joindre au
+commentaire de déploiement.
+
+### Dispositions
+
+**D1 — prédicat élargi. Disposition (b) : accepter le masquage, aucune action rétroactive.**
+Une parente préexistante dont le wrapper promu tombe dans la fenêtre n'est pas re-armée à ce tick.
+C'est exactement le comportement voulu, appliqué à un état ancien : le tour a peut-être encore une
+chance d'aboutir. Au pire elle est re-armée un tick de fenêtre plus tard, soit ≤ 2700 s de retard sur
+un faucheur dont la grâce est déjà 2700 s. Aucune migration, aucun backfill, aucune main sur les
+lignes existantes. Corpus mesuré à 0 : au déploiement d'aujourd'hui, cette disposition ne s'applique
+à personne.
+
+**D5 — rejeu anti-vacuité. Disposition (c) : halte-et-remontée.**
+Le test AC2 doit être rouge avant le correctif et vert après. S'il est **vert avant** le correctif,
+c'est que la fixture ne reproduit pas la trace — la reproduction est fausse, pas le code. On
+s'arrête, on ne « corrige » pas le test pour le rendre rouge, et on remonte à l'opérateur avec la
+fixture et la sortie. Même halte si le test reste rouge après le correctif : le diagnostic est faux
+et le plan ne tient plus.
+
+**D4 — inventaire d'audit. Disposition : observations futures uniquement.**
+L'inventaire est écrit au moment où le faucheur décide ; il ne relit ni ne réécrit aucun
+`audit_events` existant. Les lignes d'avant le déploiement restent sans inventaire, et c'est correct
+— elles décrivent des décisions prises par un code qui ne le calculait pas. Aucune rétro-écriture,
+aucun enrichissement d'historique. Une erreur de lecture de l'inventaire n'interrompt rien : les
+`details` reçoivent `wrappers:unavailable` et la réparation continue. Un audit dégradé ne doit jamais
+empêcher une réparation.
+
+**D7 — renommage.** Purement mécanique, aucun état en base n'est touché, aucun tir.
 
 ## Vérification
 
 - `cargo test -p mika-agent find_orphaned_pending`
 - `cargo test -p mika-agent reap_orphaned_pending`
 - `cargo test -p mika-agent stuck_pending`
+- `cargo test -p mika-agent deferred_wrapper_child` (D7)
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo build -p mika-cli` (D3 touche un appelant CLI)
 
@@ -237,10 +352,8 @@ D2 → signatures de D1/D3 → D5 (rouge, capturé) → clause SQL de D1 (vert) 
 
 - L'échec du tour lui-même (timeout, excuse sans appel d'outil) — mika#2179.
 - Le re-armement vers un parent terminal et le `RearmOutcome` jeté — mika#2169.
-- `has_pending_deferred_wrapper_child` (`db.rs:7535`) porte le même prédicat étroit. Il n'a **aucun
-  appelant de production** aujourd'hui (seul `async_db.rs:1101` l'expose). Le laisser tel quel est
-  délibéré : l'élargir sans appelant serait du code non testé par l'usage. À reprendre le jour où un
-  appelant apparaît.
+- ~~`has_pending_deferred_wrapper_child`~~ — **rentré dans la portée** par le finding F3 du premier
+  passage architecte. Voir D7.
 - Le fait qu'un wrapper `completed` non-`delivered` soit re-dispatché en boucle par
   `dispatch_undelivered_callbacks` sur le chemin `silent_turn_error` — défaut réel, voisin, distinct.
   À ficher séparément avec sa propre trace si on l'observe.
