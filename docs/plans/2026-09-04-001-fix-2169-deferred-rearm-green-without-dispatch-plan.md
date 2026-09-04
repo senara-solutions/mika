@@ -385,7 +385,7 @@ Ces trois tests gardent la sérialisation « un `implement` par classe » que mi
 ## Séquence
 
 1. **L1** — `mark_deferred_wrapper_noop` (db + async_db + `rearm_consumed_deferred_wrapper`). C'est la fondation : L2a écrit par elle, et L2b dépend de l'exclusivité de `status='completed'` qu'elle établit.
-2. **L3a** — le `match` sur `RearmOutcome` dans `rearm_consumed_deferred_wrapper`, et l'écriture de l'échec de budget. **Livrable minimal viable** : L1 + L3a satisfont déjà AC1, AC2 et AC3 sur la trace mesurée.
+2. **L3a** — le `match` sur `RearmOutcome` dans `rearm_consumed_deferred_wrapper`, et l'écriture de l'échec de budget.
 3. **L2a** — la garde du parent terminal, dans la même fonction que L3a. À faire dans la foulée : les deux touchent `rearm_consumed_deferred_wrapper`, et les séparer créerait un conflit inutile.
 4. **L2b** — le compteur de famine + l'avertissement. Indépendant, sans mutation d'état.
 5. **L3b** — `find_stale_blocked_dispatch_tasks` + `reap_stale_blocked_dispatch_tasks` + le branchement dans `tick()`. Le filet, écrit après que le chemin direct est correct.
@@ -394,7 +394,12 @@ Ces trois tests gardent la sérialisation « un `implement` par classe » que mi
 
 L1 avant L3a et L2a est une dépendance dure. **L2a et L3a sont deux modifications de la même fonction et se font ensemble.** L3b est indépendante et peut être écrite en parallèle ; les rejeux les assemblent et viennent donc après.
 
-> **Si la portée doit être réduite en revue**, l'ordre de coupe est : L3b, puis L2b. L1 + L2a + L3a est le noyau irréductible — c'est lui qui ferme la trace mesurée, et retirer l'un des trois rouvre AC1 ou AC2.
+> **Deux noyaux, deux statuts de preuve — à ne pas confondre** (F1 de la revue architecte, session `af938ffc`).
+>
+> - **Noyau de trace : L1 + L2a.** C'est lui, et lui seul, qui ferme l'incident mesuré du 2026-09-04. Fait 1bis établit que les trois tours stériles ont eu lieu contre un parent terminal ; la branche L3a n'y a jamais été atteinte. Retirer L1 ou L2a rouvre AC2 et laisse l'incident sans correctif.
+> - **Complément AC : L3a.** Requis par AC1 et AC3, qui exigent explicitement qu'un parent `blocked` dont le budget s'épuise ne reste pas muet. Cette population **n'a aucune instance mesurée** ; sa preuve est une lecture de code, et son test est un rejeu construit (L4b). Il n'est pas optionnel pour autant : c'est un AC, pas une intuition. Mais il ne doit pas être présenté comme ce qui ferme la trace.
+>
+> **Si la portée doit être réduite en revue**, l'ordre de coupe est : L3b, puis L2b — un filet et un indicateur, ni l'un ni l'autre ne fermant la trace. Le noyau de trace et le complément AC ne se coupent pas.
 
 ---
 
