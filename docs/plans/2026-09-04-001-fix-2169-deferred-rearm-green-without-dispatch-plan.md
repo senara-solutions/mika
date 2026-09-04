@@ -361,7 +361,26 @@ Et une assertion de garde sur la porte elle-même : le test existant `executor.r
 **Le seul tir sur données existantes, nommé.** Avant L1, une consommation stérile laissait un wrapper en `completed` sans jamais le passer `expired`. Des rangées de cette forme peuvent exister dans `mika.db` au moment du déploiement ; comptées par L2b, elles produiraient un tir **permanent**, toutes les 60 s, sans rapport avec une famine. Disposition :
 
 1. Le pilote **mesure** ce résidu avant d'atterrir, sur une copie de la base vivante, avec la requête de L2b sans borne temporelle, et **consigne le compte dans le corps de la PR** (zéro compris).
-2. La requête de L2b porte une borne basse nommée, grep-visible : `AND completed_at >= DEFERRED_PROMOTION_EPOCH` où `pub(crate) const DEFERRED_PROMOTION_EPOCH: &str = "2026-09-04T00:00:00Z"` (le jour où L1 rend `completed` exclusif), avec un commentaire qui dit pourquoi la borne existe et qu'elle peut être retirée quand le résidu antérieur aura été purgé — retrait porté par le même ticket post-2026-09-11.
+2. La requête de L2b porte une borne basse, mais **ce n'est pas une date écrite à la main** : c'est l'instant du déploiement, que le code s'auto-installe.
+
+   > **F1 (bloquant) de la seconde passe architecte, session `af938ffc`.** La rédaction précédente figeait `DEFERRED_PROMOTION_EPOCH` au `2026-09-04T00:00:00Z`, le jour du plan. Le jour où `completed` devient exclusif est celui où **L1 tourne en production**, pas celui où le plan est écrit : tout wrapper né entre les deux serait compté comme résidu et produirait un tir parasite permanent. L'architecte a raison, et les deux remèdes qu'il propose sont refusés tous les deux — voir ci-dessous.
+
+   **Le mécanisme.** Au premier démarrage du binaire qui porte L1, l'engine estampille une clé dans la table `schema_meta(key, value)` — celle qui porte déjà les marqueurs one-shot `v27_coalesce_complete` et `well_known_d2_migration_v1` :
+
+   ```sql
+   INSERT OR IGNORE INTO schema_meta(key, value)
+   VALUES ('deferred_promotion_epoch', strftime('%Y-%m-%dT%H:%M:%SZ','now'));
+   ```
+
+   `INSERT OR IGNORE` rend l'écriture idempotente : le premier démarrage après déploiement pose l'instant, tous les suivants ne font rien. La requête de L2b lit la valeur et l'applique en `AND completed_at >= :epoch`. **Aucune DDL, aucun bump de `CURRENT_SCHEMA_VERSION`** — la table existe déjà, on y ajoute une ligne.
+
+   **Pourquoi pas les deux options proposées.**
+   - *« Écrire la date de merge au moment du merge »* : c'est un pas manuel dont l'événement qui le défait — un merge un autre jour que le plan — a une probabilité de 1. Un remède manuel dont la demi-vie est plus courte que le délai avant son premier usage n'est pas un remède (`feedback_un_remede_manuel_a_une_demi_vie`).
+   - *`env!("DEFERRED_PROMOTION_MERGE_DATE")`* : deux compilations du même commit produiraient deux binaires au comportement différent. Le binaire cesse d'être une fonction de la source, et une sonde qui compare les deux ne peut plus rien conclure. C'est plus coûteux que le défaut qu'on répare.
+
+   **Ce que la borne auto-installée ne couvre pas, et qui est assumé.** Un déploiement, un retour arrière, puis un re-déploiement : l'époque reste celle du premier passage, et le résidu produit pendant la fenêtre de retour arrière sera compté. La fenêtre est étroite, le symptôme est un sur-comptage de l'indicateur — jamais une mutation d'état — et le ticket post-2026-09-11 qui porte le retrait de la borne porte aussi ce cas.
+
+   La ligne `schema_meta` et la clause `completed_at >= :epoch` portent chacune un commentaire nommant la raison, et le ticket post-2026-09-11 qui les retirera quand le résidu antérieur aura été purgé.
 3. **Aucune mutation des rangées résiduelles.** Elles ne sont ni expirées ni supprimées par ce plan.
 
 ### L4a / L4b / L4c — les trois rejeux : disposition **(c) halt-and-surface**
@@ -457,8 +476,8 @@ Plus la mesure pré-correctif de **L4a et L4b** (`git stash` → tests → deux 
 | `crates/mika-agent/src/db.rs` | +3 méthodes (`mark_deferred_wrapper_noop`, `count_promoted_undelivered_wrappers`, `find_stale_blocked_dispatch_tasks`) + 1 struct de rendu |
 | `crates/mika-agent/src/async_db.rs` | +3 passe-plats |
 | `crates/mika-agent/src/task_engine/dispatcher.rs` | **Le cœur.** `rearm_consumed_deferred_wrapper` : garde du parent terminal (L2a), `match` sur `RearmOutcome` (L3a), enregistrement terminal du wrapper (L1) |
-| `crates/mika-agent/src/task_engine/engine.rs` | +1 balayage (L3b), +1 compteur de famine (L2b), +1 lecteur d'env, 2 lignes dans `tick()`, **+5 tests** (L4a, L4b, L4c, 2× L5) |
+| `crates/mika-agent/src/task_engine/engine.rs` | +1 balayage (L3b), +1 compteur de famine (L2b), +1 lecteur d'env (`MIKA_DEFERRED_PROMOTION_STALE_SECS`), +1 estampille `schema_meta` idempotente au démarrage, 2 lignes dans `tick()`, **+5 tests** (L4a, L4b, L4c, 2× L5) |
 
-Aucune migration de schéma : `expired` est déjà dans la contrainte `CHECK` (`db.rs:1342-1343`), `dispatch_slot_leases` existe depuis v51.
+Aucune migration de schéma : `expired` est déjà dans la contrainte `CHECK` (`db.rs:1342-1343`), `dispatch_slot_leases` existe depuis v51, et l'époque de L2b est une **ligne** dans `schema_meta` — pas une DDL, donc pas de bump de `CURRENT_SCHEMA_VERSION` (51).
 
 **Où le poids s'est déplacé.** La première rédaction mettait l'essentiel dans `engine.rs` — deux balayages neufs pilotés par des fenêtres de temps. La re-mesure l'a déplacé dans `dispatcher.rs`, sur trois modifications d'une seule fonction existante, dont la principale est de **consommer une valeur de retour que le code jetait**. C'est un correctif plus petit, plus près de la cause, et dont l'anti-vacuité se mesure sans démonter quoi que ce soit.
