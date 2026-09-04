@@ -368,17 +368,20 @@ pub struct Issue {
 /// > - **Plan:** `docs/plans/<file>.md` (committed on branch @ <sha>)
 /// > - **Grooming history:** <...> → second-pass (GROOMED) — session-id: <uuid>
 /// ```
+///
+/// # Le marqueur de verdict n'est plus lu ici (mika#2158)
+///
+/// Cette fonction portait sa propre regex, commentée *« Mirrors GROOMED_VERDICT_RE in
+/// skills/executor.rs »* — une copie qui n'a jamais suivi les deux élargissements
+/// ultérieurs de l'original, et qui a fait diverger la **promotion** (ici) du **routage**
+/// du dispatch (`executor::check_grooming_markers`) pendant des mois. La lecture du
+/// marqueur vit désormais dans [`crate::grooming_marker`], seule et unique ; une regex de
+/// marqueur de passe recréée ici fait échouer la garde structurelle de ce module.
+///
+/// Les deux conditions `Branch`/`Plan` restent ici, délibérément : leur unification est le
+/// correctif de mika#2120, sous arbitrage opérateur.
 pub fn is_groomed(body: &str) -> bool {
-    static GROOMING_HISTORY_RE: OnceLock<Regex> = OnceLock::new();
-    let re = GROOMING_HISTORY_RE.get_or_init(|| {
-        // Mirrors GROOMED_VERDICT_RE in skills/executor.rs (#1725): accept the
-        // canonical strict form AND parameterized/annotated variants like
-        // `second-pass (GROOMED, session abc)` or `— session-id: uuid`.
-        // The character class after `GROOMED` is the structural discriminator.
-        Regex::new(r"(?m)^> - \*\*Grooming history:\*\*.+second-pass \(GROOMED[\s\)\.,;:—-]")
-            .expect("grooming history regex must compile")
-    });
-    re.is_match(body)
+    crate::grooming_marker::has_groomed_verdict(body)
         && body.contains("> - **Branch:** `")
         && body.contains("> - **Plan:** `docs/plans/")
 }
@@ -3324,15 +3327,107 @@ Some description of the issue.
         assert!(!is_groomed(body));
     }
 
+    /// **Inversé par mika#2158 (AC1).** Une première passe `READY` sans seconde passe est
+    /// le chemin que `/mika-groom-ticket` phase 3 étape 10 prescrit quand le plan est sain
+    /// du premier coup. L'exigence d'une seconde passe punissait le grooming réussi ;
+    /// #2108 en portait la forme et tournait en boucle. Voir
+    /// `skills::executor::tests::test_grooming_markers_accepts_bare_first_pass_ready`
+    /// pour l'objection d'origine et où vit désormais le garde-fou qu'elle visait.
     #[test]
-    fn test_is_groomed_only_first_pass() {
+    fn test_is_groomed_first_pass_ready_single_pass() {
         let body = r#"## Description
 
 > - **Branch:** `feat/123/some-feature`
 > - **Plan:** `docs/plans/2026-06-01-001-some-plan.md` (committed on branch @ abc1234)
 > - **Grooming history:** first-pass (READY) — session-id: 550e8400
 "#;
-        assert!(!is_groomed(body), "first-pass only should not be groomed");
+        assert!(
+            is_groomed(body),
+            "single-pass READY is the prescribed grooming exit (mika#2158 AC1)"
+        );
+    }
+
+    /// Non-régression AC4 — la marque d'une seconde passe désarme la règle AC1 : le corps
+    /// annonce lui-même un verdict de seconde passe, et ce verdict n'en est pas un.
+    #[test]
+    fn test_is_groomed_first_pass_ready_with_broken_second_pass_rejected() {
+        let body = r#"## Description
+
+> - **Branch:** `feat/123/some-feature`
+> - **Plan:** `docs/plans/2026-06-01-001-some-plan.md` (committed on branch @ abc1234)
+> - **Grooming history:** first-pass (READY) → second-pass (GROOMEDLY) — pas une forme réelle
+"#;
+        assert!(
+            !is_groomed(body),
+            "a claimed second pass with an unreadable verdict must not ride on the first pass"
+        );
+    }
+
+    /// Non-régression AC4 — `ITERATE` seul prescrit une seconde passe qui n'a pas eu lieu.
+    #[test]
+    fn test_is_groomed_iterate_alone_rejected() {
+        let body = r#"## Description
+
+> - **Branch:** `feat/123/some-feature`
+> - **Plan:** `docs/plans/2026-06-01-001-some-plan.md` (committed on branch @ abc1234)
+> - **Grooming history:** mika-arch first-pass (ITERATE) — révision demandée
+"#;
+        assert!(!is_groomed(body), "ITERATE alone must not be groomed");
+    }
+
+    /// AC2 — la variante française est reconnue au même titre que l'anglaise (#1772).
+    #[test]
+    fn test_is_groomed_french_seconde_passe() {
+        let body = r#"## Description
+
+> - **Branch:** `feat/123/some-feature`
+> - **Plan:** `docs/plans/2026-06-01-001-some-plan.md` (committed on branch @ abc1234)
+> - **Grooming history:** mika-arch première passe (ITERATE) → mika-arch seconde passe (GROOMED, session abc)
+"#;
+        assert!(
+            is_groomed(body),
+            "French `seconde passe (GROOMED` must match"
+        );
+    }
+
+    /// AC3 — un `GROOMED` rendu après un `ESCALATE` de seconde passe et son arbitrage
+    /// (#2127), et la symétrie : l'ordre compte dans les deux sens.
+    #[test]
+    fn test_is_groomed_last_verdict_wins_both_directions() {
+        let escalate_then_groomed = r#"## Description
+
+> - **Branch:** `feat/123/some-feature`
+> - **Plan:** `docs/plans/2026-06-01-001-some-plan.md` (committed on branch @ abc1234)
+> - **Grooming history:** mika-arch second-pass (ESCALATE, périmètre) → arbitrage rendu → mika-arch (GROOMED) — session abc
+"#;
+        assert!(
+            is_groomed(escalate_then_groomed),
+            "a GROOMED rendered after arbitration is the final state (AC3)"
+        );
+
+        let groomed_then_escalate = r#"## Description
+
+> - **Branch:** `feat/123/some-feature`
+> - **Plan:** `docs/plans/2026-06-01-001-some-plan.md` (committed on branch @ abc1234)
+> - **Grooming history:** second-pass (GROOMED) → revue de périmètre → mika-arch (ESCALATE)
+"#;
+        assert!(
+            !is_groomed(groomed_then_escalate),
+            "a later ESCALATE reopens the ticket (AC4)"
+        );
+    }
+
+    /// AC5 — les six corps figés, mesurés à travers `is_groomed` (donc conditions
+    /// `Branch`/`Plan` comprises), pas seulement à travers le prédicat de verdict.
+    #[test]
+    fn test_is_groomed_six_frozen_bodies() {
+        for (ticket, body, expected) in crate::grooming_marker::tests::FIXTURES {
+            assert_eq!(
+                is_groomed(body),
+                *expected,
+                "fixture #{ticket}: is_groomed doit rendre {expected}"
+            );
+        }
     }
 
     #[test]
@@ -3413,19 +3508,22 @@ This ticket has been GROOMED and is ready.
         );
     }
 
+    /// **Inversé par mika#2158 (AC3).** Le jumeau de
+    /// `skills::executor::tests::test_grooming_markers_accepts_groomed_from_any_producer` :
+    /// l'exigence du préfixe `second-pass (` est précisément ce que ce ticket supprime,
+    /// puisque l'AC3 demande de reconnaître `… → mika-arch (GROOMED)`, où le producteur
+    /// n'est aucune passe.
     #[test]
-    fn test_is_groomed_first_pass_groomed_rejected() {
-        // Ensure the `second-pass (` prefix requirement blocks `first-pass (GROOMED)`
-        // which is not a valid ratification signal (first-pass is READY/ITERATE/ESCALATE).
+    fn test_is_groomed_groomed_from_any_producer() {
         let body = r#"## Description
 
 > - **Branch:** `feat/123/some-feature`
 > - **Plan:** `docs/plans/2026-07-04-001-fix-plan.md` (committed on branch @ abc1234)
-> - **Grooming history:** first-pass (GROOMED) — no second-pass line
+> - **Grooming history:** first-pass (GROOMED) — verdict rendu dès la première passe
 "#;
         assert!(
-            !is_groomed(body),
-            "first-pass (GROOMED) without second-pass must not match"
+            is_groomed(body),
+            "a GROOMED is a GROOMED whichever producer precedes it (mika#2158 AC3)"
         );
     }
 
