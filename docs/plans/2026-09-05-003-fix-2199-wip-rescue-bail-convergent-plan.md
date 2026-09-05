@@ -327,19 +327,71 @@ harnais permanent.
 - `stale-against-main` (`.github/workflows/wip-staleness-check.yml:93,109`) : même forme
   fragile (`|| true`), mais son label **est** déclaré (`labels.yml:186`) — pas de défaut ici.
 
-## 6. Correspondance avec les critères d'acceptation
+## 6. Note de lecture sur AC1 — pourquoi les deux voies
 
-| AC | Livrable | Où |
-|----|----------|-----|
-| AC1 | `ensure_label` idempotent **et** marqueur durable indépendant du label | §4.1, §4.2 |
-| AC2 | Le marqueur est écrit même si GitHub échoue ; la PR sort du filtre et le scan avance | §4.2, §4.3 |
-| AC3 | Test de sélection avec contrôle négatif + rejeu avec faux `gh`, sortie dans la PR | §4.5 |
-| AC4 | `human-review-required` déclaré + garde de registre sur les constantes | §4.4 |
+La correspondance AC → livrable est portée par la section `## Acceptance criteria` ci-dessous,
+qui est la forme canonique. Cette note ne traite que le point qui demande un arbitrage.
 
 Le ticket propose pour AC1 « soit … soit … ». Ce plan fait **les deux**, pour deux raisons
 distinctes et mesurées : la création idempotente seule est défaite par `delete-other-labels`
 (§2) ; le marqueur seul laisserait la PR sans étiquette visible sur GitHub, où l'humain qui
 doit la reprendre va la chercher. Ni l'un ni l'autre n'est redondant.
+
+## Acceptance criteria
+
+Transcrits **littéralement** du corps de senara-solutions/mika#2199, chacun avec le test qui
+le rend falsifiable. Les intitulés `AC1`–`AC4` ne sont pas renommés.
+
+- **AC1** — Le bail-to-human ne peut pas livelocker : soit le démon **crée le label**
+  `human-review-required` s'il manque (idempotent, au démarrage ou à la première bail), soit il
+  marque la PR bailée par un moyen qui ne dépend pas d'un label pré-existant (état/commentaire)
+  et qui l'exclut du prochain scan.
+  → **Livré par §4.1 *et* §4.2** (les deux voies, raisons au §6). Testé par le test de sélection
+  du §4.5(a) : marqueur présent ⇒ la PR n'est pas ré-élue.
+
+- **AC2** — Une bail dont l'écriture d'exclusion échoue (label absent, gh en erreur) **ne laisse
+  pas la PR éligible** : le démon avance à la PR suivante au tick d'après (pas de blocage
+  one-per-tick sur une PR qu'il ne peut pas parquer).
+  → **Livré par §4.2** (marqueur écrit **avant** et **indépendamment** de toute tentative GitHub)
+  **et §4.3**. Testé par le cas « deux drafts, la plus vieille marquée bailée ⇒ la seconde est
+  rendue » du §4.5(a). Le fail-closed sur erreur de lecture (§4.2) ferme la dernière voie par
+  laquelle une PR non parquable resterait éligible.
+
+- **AC3** — Rejeu : une PR wip-rescue en conflit de rebase, dans un repo SANS le label
+  `human-review-required` → sur `main` le démon boucle (re-tente), avec le correctif il parque la
+  PR et avance. Sortie collée dans la PR.
+  → **Livré par §4.5**, en deux niveaux dont le premier est non négociable : (a) test de sélection
+  **avec contrôle négatif** — un prédicat toujours-faux, c'est-à-dire le comportement de `main`,
+  doit rendre la première PR en boucle, donc le test **échoue sans le correctif** ; (b) rejeu
+  bout-en-bout avec faux `gh` sur `PATH`, dégradable en script manuel. Dans les deux cas la sortie
+  est collée dans la PR.
+
+- **AC4** — Les labels que le démon écrit (`human-review-required`, et les autres qu'il pose) sont
+  **documentés comme requis** et/ou seedés (ex. `.github/labels.yml`), pour que le repo les ait
+  toujours.
+  → **Livré par §4.4**. Mesure qui borne « les autres » : `wip_rescue.rs` ne manipule que
+  `WIP_RESCUE_LABEL` et `HUMAN_REVIEW_LABEL`, et n'en **pose** qu'un seul ; il n'en retire ni
+  n'en crée aucun autre. « Les autres » est l'ensemble vide, donc la garde du §4.4 est
+  **exhaustive pour ce module**. Testé par le test de registre, assertions portées sur les
+  constantes et non sur des littéraux recopiés.
+
+## Fire-Disposition
+
+Ce plan livre des **détecteurs** (§4.4 test de registre, §4.5(a) test de sélection, §4.5(b) rejeu).
+Disposition pré-spécifiée pour chacun, avant qu'il ne se déclenche.
+
+| détecteur | ce qu'il détecte | disposition quand il rougit |
+|---|---|---|
+| §4.5(a) test de sélection | une PR marquée bailée reste ré-élue | **Halte et remontée.** C'est le défaut même de #2199 ; un rouge ici invalide le correctif, il ne se contourne pas. |
+| §4.5(a) **contrôle négatif** | le test resterait vert sans le correctif | **Halte et remontée.** Un contrôle négatif qui ne rougit pas sur `main` prouve que le test ne mesure rien ; le corriger avant tout autre travail. |
+| §4.4 test de registre | `human-review-required` (ou `wip-rescue`) absent de `labels.yml` | **Halte et remontée.** C'est exactement la classe que ce ticket ferme ; un rouge signifie que la déclaration a été perdue. |
+| §4.4 contrôle négatif (retrait temporaire de `wip-rescue`) | la garde ne discrimine pas | **Halte et remontée**, même raison. |
+| §4.5(b) rejeu bout-en-bout | l'écriture d'exclusion échoue encore de bout en bout | **Deux cas, distingués.** Rouge *sur le comportement* → halte et remontée. Rouge *par instabilité du harnais* (`PATH`, ordonnancement des tests) → **dégrader en script manuel**, coller la sortie dans la PR, et le dire comme tel. Ne jamais désarmer §4.5(a) pour faire passer §4.5(b). |
+| vérification post-merge du §7 (survie du label) | `delete-other-labels` a supprimé le label | **Halte et remontée.** Cela signifierait que la déclaration n'a pas pris ; le correctif serait redevenu un tapis roulant. |
+| vérification en production (§3 bis) | — | **Non armée si le démon ne tourne pas.** Dans ce cas, écrire « non effectuée » et pourquoi. Ne jamais la déclarer passée sur la foi des tests. |
+
+Aucun de ces détecteurs n'est autorisé à être mis en sourdine pour faire passer la PR. Un
+détecteur dont on ne veut pas la disposition est un détecteur qu'il ne fallait pas écrire.
 
 ## 7. Vérification
 
