@@ -191,8 +191,10 @@ relever les budgets, ces trois seuils mentent dès le premier réglage non par d
 boucle de `llm/openai.rs:344-366` avorterait, ou n'avorterait pas, sur une géométrie qui
 n'existe plus.
 
-Les rendre dérivés du plafond effectif plutôt que littéraux. La forme exacte de la
-dérivation est un point ouvert soumis à l'architecte (voir *Questions à l'architecte*, Q1).
+Les rendre dérivés du plafond effectif plutôt que littéraux, **en fractions** (Q1 tranchée) :
+les valeurs actuelles sont exactement `0,75 × plafond`, `0,25 × plafond` et `0,50 × plafond`
+au plafond par défaut de 120 s, donc la migration est un no-op au défaut et suit tout
+réglage ultérieur.
 
 ### D4 — valeurs par agent, et le réglage de mika-arch
 
@@ -211,9 +213,11 @@ configuration, pas du code.
 Sur le chemin d'erreur de `agent_loop/mod.rs:1093-1112`, écrire la taille de la requête
 plutôt que deux zéros. Le porteur minimal est `system_prompt_bytes`, déjà passé
 (`Some(system_prompt_len as i64)`) — il est correct. Ce qui manque est la taille du
-message utilisateur. Deux formes possibles (Q2 pour l'architecte) : une colonne
-`request_bytes` sur `llm_calls`, ou l'estimation de `input_tokens` avant l'appel plutôt
-qu'après.
+message utilisateur. **Q2 tranchée : colonne `request_bytes` sur `llm_calls`**, migration sur
+la forme de `system_prompt_bytes` (mika#1217, `db.rs:4342-4364`), écrite sur les deux chemins
+(succès et erreur) de `agent_loop/mod.rs:1052-1112`. L'estimation d'`input_tokens` est
+écartée : l'axe sert à corréler taille et expiration, et une corrélation bâtie sur une
+estimation ne tranche pas.
 
 Sans D5, l'AC1 est livrée avec l'axe « par taille de brief » porté par le seul prompt
 système, et la limitation est écrite noir sur blanc dans le rapport.
@@ -289,29 +293,117 @@ pour que la comparaison d'après ne dépende pas de lignes qui auront été purg
 
 ---
 
-## Correspondance avec les critères d'acceptation
+## Décisions tranchées (Q1–Q5)
 
-| AC | Livré par | Observable |
-|---|---|---|
-| AC1 — distribution réelle sur `llm_calls`, 7 j : taux, par modèle, par taille | M1–M6 (rapport) + D5 | Tableaux M1/M2/M4/M5 dans le rapport d'AC1 ; l'axe « taille » porté par `system_prompt_bytes`, sa limitation nommée en M6, son trou fermé par D5 |
-| AC2 — un remède décidé **sur la mesure** | Section *Décision* + D1–D4 | Les trois candidats du ticket arbitrés chacun par une mesure citée ; deux rejetés sur preuve |
-| AC3 — une passe qui réussit garde sa latence | V2 | (1) p50/p90/p99 des succès inchangés contre la ligne de base M4 ; (2) `plafond × tentatives ≤ enveloppe` vérifié au démarrage (D2) |
+Cinq points de jugement étaient ouverts à la rédaction. Ils ont été soumis à mika-arch en
+première passe (session `8ab15e86-6b91-4776-86cd-51a942eab786`) et sont **tranchés ici** :
+le plan ne part pas en implémentation avec des questions ouvertes.
+
+**Q1 — forme de la dérivation en D3 → fractions du plafond effectif.**
+`TYPICAL_CALL_DURATION_SECS`, `RETRY_BUFFER_SECS` et `TRANSPORT_RETRY_MIN_REMAINING_SECS`
+deviennent des fractions du plafond effectif plutôt que des littéraux. Rapport aux valeurs
+actuelles, qui fixent la calibration : à plafond 120 s, `typique = 90` = **0,75 × plafond**,
+`tampon = 30` = **0,25 × plafond**, `min-restant transport = 60` = **0,50 × plafond**. Les
+fractions reproduisent donc exactement le comportement d'aujourd'hui au plafond par défaut —
+la migration est un no-op mesurable (voir AC3-b) — et suivent tout réglage ultérieur.
+*Raison retenue :* la forme alternative (constantes + contrôle de cohérence qui panique)
+oblige à corriger deux endroits à chaque réglage, et le second oubli est silencieux jusqu'à
+la panne suivante.
+
+**Q2 — porteur de la taille de requête en D5 → colonne `request_bytes` sur `llm_calls`.**
+Migration de schéma, sur la forme des migrations existantes (`system_prompt_bytes`,
+mika#1217, `db.rs:4342-4364`). L'estimation d'`input_tokens` avant l'appel est écartée :
+l'axe « par taille de brief » de l'AC1 sert à *corréler taille et expiration*, et une
+corrélation bâtie sur une estimation ne peut pas trancher. Écrite sur les deux chemins
+(succès et erreur) de `agent_loop/mod.rs:1052-1112`, sinon le trou de M6 se rouvre côté
+erreur.
+
+**Q3 — portée de D4 → budgets par agent dans `config.toml`, sans défaut par famille.**
+La granularité agent est celle du problème : `llm_provider` et `openrouter_model` y vivent
+déjà. Le risque nommé — un nouvel agent lent découvre le problème par une panne — est
+**accepté et rendu visible** plutôt que résolu par un défaut par famille : le message de
+l'invariant D2 nomme les deux valeurs et le fichier à corriger, et la mesure de V3 reste
+rejouable par agent.
+
+**Q4 — périmètre → un seul ticket ; le chemin partagé et le réglage mika-arch ne se scindent pas.**
+M2 est la raison : mika-arch est 7 % du problème, et scinder produirait un premier ticket
+qui rend réglable sans rien régler (invérifiable sur `llm_calls`) et un second qui règle sans
+pouvoir régler. La preuve de D1–D3 *est* le réglage de D4 qui fait disparaître la signature
+120/240 pour mika-arch.
+
+**Q5 — place de l'invariant D2 → à la construction du fournisseur (chemin froid), acceptable.**
+Un agent mal configuré échoue à sa première tentative d'appel, pas au boot. Retenu tel quel :
+c'est déjà la place de la panique de mika#1660 (`llm/mod.rs:82-88`), et déplacer l'un sans
+l'autre ferait deux endroits où une config invalide est détectée, à deux moments différents.
+*Conséquence assumée, écrite ici pour qu'elle ne surprenne pas :* un `mika` qui démarre n'est
+pas la preuve que sa config de budgets est valide. La preuve est le premier appel.
 
 ---
 
-## Questions à l'architecte
+## Acceptance criteria
 
-**Q1 — la forme de la dérivation en D3.** `TYPICAL_CALL_DURATION_SECS`,
-`RETRY_BUFFER_SECS` et `TRANSPORT_RETRY_MIN_REMAINING_SECS` doivent-ils devenir des
-fractions du plafond effectif (par ex. `typique = 0,75 × plafond`), ou rester des
-constantes assorties d'une vérification de cohérence qui panique si le plafond s'en
-éloigne ? La première forme suit automatiquement, la seconde reste lisible. La mesure ne
-tranche pas.
+Transcription littérale des trois critères du corps de mika#2189. Ils sont le contrat ; les
+sections *Périmètre* et *Vérification* disent *comment* on les atteint, celle-ci dit *ce qui
+doit être vrai* à la fin.
 
-**Q2 — le porteur de la taille de requête en D5.** Colonne `request_bytes` sur
-`llm_calls` (migration de schéma, exact) ou estimation de `input_tokens` avant l'appel
-(pas de migration, approximatif) ?
+**AC1 — la distribution réelle des latences/expirations mika-arch est mesurée sur `llm_calls`
+(7 jours) : taux d'expiration, par modèle, par taille de brief.**
+Livrée sous forme d'un rapport porté par le ticket, contenant les tableaux M1 (latence des
+pannes), M2 (taux par agent et par modèle), M4 (percentiles des succès et temps cumulé par
+session), M5 (chronologie et variante de prompt). Contraintes nommées :
+- l'axe « par taille de brief » est porté par `system_prompt_bytes`, **pas** par la taille du
+  message utilisateur, laquelle n'est pas récupérable sur les lignes en échec
+  (`input_tokens = 0` en dur, `agent_loop/mod.rs:1093-1112`) — limitation M6, écrite dans le
+  rapport, pas passée sous silence ;
+- D5 ferme ce trou pour la mesure **suivante** ; il ne rétroagit pas sur les lignes déjà
+  écrites ;
+- la ligne de base est **capturée dans le rapport avant tout déploiement**, parce que
+  `prune_old_llm_calls` (`db.rs:9489`) purge les lignes anciennes et qu'une comparaison
+  d'après ne doit pas dépendre de lignes qui auront disparu.
 
-**Q3 — la portée de D4.** Poser les budgets par agent dans `config.toml` suffit-il, ou
-faut-il un défaut par famille de modèle ? Le réglage par agent laisse chaque nouvel agent
-lent découvrir le problème par une panne.
+**AC2 — un remède est décidé sur la mesure AC1, pas à l'aveugle.**
+Les trois candidats nommés par le corps sont chacun arbitrés par une mesure citée, et deux
+sont **rejetés sur preuve** : le rejeu transport borné par M3 (déjà présent, `MAX_RETRIES = 3`,
+et un appel de 150 s n'aboutit pas en 120 s quel qu'en soit le rang), le repli de modèle par
+M2 (195 des 209 pannes sont hors mika-arch, sur un autre modèle). Le troisième — plafond par
+appel relevé — est retenu, et M4 établit qu'il ne suffit pas seul : d'où D1–D4. Un remède
+retenu sans qu'une mesure le porte, ou un candidat rejeté sans mesure citée, ne satisfait pas
+cet AC.
+
+**AC3 — une passe architecte qui réussit aujourd'hui garde sa latence.**
+Deux obligations distinctes, parce que « garder sa latence » a deux faces et qu'une seule est
+observable a posteriori :
+- **AC3-a (succès) :** p50/p90/p99 des appels mika-arch en `status='success'` inchangés au
+  regard de la ligne de base M4 (20,3 s / 98,7 s / 191,3 s), mesurés après au moins 24 h et
+  100 appels — per `feedback_never_conclude_inside_the_mechanism_period`. Un plafond relevé
+  ne *peut pas* ralentir un appel qui aboutissait ; un écart signifie qu'autre chose a bougé.
+- **AC3-b (échec borné) :** `plafond × tentatives ≤ enveloppe` est vérifié au démarrage
+  (D2 étendu au rejeu), de sorte qu'un appel qui échoue ne puisse pas déborder de l'enveloppe
+  de l'agent. Sans cette moitié, l'AC3 serait satisfait par un correctif qui fait passer le
+  coût d'une panne de 240 s à 480 s sans que rien ne l'accuse. La migration de Q1 étant un
+  no-op au plafond par défaut, la géométrie 120/300 d'aujourd'hui doit rester acceptée par
+  l'invariant : c'est le contrôle positif de V1.
+
+---
+
+## Fire-Disposition
+
+Ce plan livre des **détecteurs** : un invariant qui panique, deux gardes de test, et deux
+mesures d'après-correctif. Cette section dit d'avance quoi faire quand ils tirent — pour
+qu'aucune décision ne soit prise sous la pression d'un rouge, et surtout pour qu'aucun
+détecteur ne soit ajusté pour redevenir vert.
+
+| détecteur | s'il tire | disposition |
+|---|---|---|
+| **D2** panique sur la configuration **par défaut** (`http = 120`, `agent = 300`) | l'invariant est mal écrit : il rejette la géométrie qui tourne en production aujourd'hui | **(c) halte-et-remontée.** Ne pas relâcher l'inégalité pour faire passer le défaut. C'est le contrôle positif de V1 ; son échec invalide la forme de l'invariant, pas la config. |
+| **D2** panique sur une configuration d'agent réglée (par ex. D4) | la gate fait exactement son travail : le réglage demandé ne tient pas dans son enveloppe | **Poursuivre — corriger la configuration, jamais l'invariant.** Le message doit nommer les deux valeurs et le fichier ; si ce n'est pas le cas, c'est le message qu'on corrige. |
+| **la garde « plus aucun appelant direct de `AGENT_TOTAL_TIMEOUT_SECS` »** devient rouge | un point de lecture a été ajouté ou oublié — aujourd'hui `agent_loop/mod.rs:3146` et `:3985`, plus `TEAM_AGENT_TIMEOUT_SECS` (`policy.rs:29`) | **(c) halte-et-remontée.** C'est le mode d'échec que `feedback_structural_gate_audit_grep_all_callsites` nomme : une gate qui couvre trois appelants sur quatre est une gate qui ment. |
+| **le test de dérivation D3** montre un comportement différent de l'actuel **au plafond par défaut** | la migration littéraux → fractions n'est pas le no-op annoncé en Q1 | **(c) halte-et-remontée.** Ne pas ajuster les fractions pour rattraper : l'écart signifie que la calibration lue (0,75 / 0,25 / 0,50) est fausse, et c'est cette lecture qu'il faut refaire. |
+| **V3** : la signature 120 s / 240 s **subsiste** après déploiement | avant de conclure au code : le binaire déployé peut ne pas porter le correctif | **Poursuivre — sonder le déploiement d'abord**, per `feedback_shipped_ne_equal_pas_deployed_uv_tool_env` et `feedback_strings_is_not_a_deployment_probe` (sonde fonctionnelle, pas `strings`). Si le binaire est bon et la signature demeure, le diagnostic M1 est faux et le ticket se re-groome. |
+| **V3** : une signature **neuve** apparaît à 240 s / 480 s | le plafond a bougé et la distribution aussi — la queue a suivi le plafond | **(c) halte-et-remontée.** Ne pas re-relever le plafond en réflexe : deux plafonds franchis d'affilée disent que le modèle de la panne est faux, pas que la valeur est trop basse. |
+| **AC3-a** : p50/p90/p99 des succès dégradés | un plafond relevé ne peut pas ralentir un succès ; quelque chose d'autre a changé | **(c) halte-et-remontée.** Ne pas absorber l'écart en révisant la ligne de base M4 : elle est capturée avant déploiement précisément pour ne pas être révisable après. |
+
+**Allowlist d'exceptions : vacante.** Aucun test existant n'est autorisé à être modifié,
+désactivé, `#[ignore]`é ou vu son attente ajustée dans le périmètre de ce ticket. En
+particulier les tests de `parse_http_timeout` (`llm/mod.rs:560-600`) et ceux de
+`llm/openai.rs` sur la boucle de rejeu : si D3 les rend rouges, c'est D3 qui est faux.
