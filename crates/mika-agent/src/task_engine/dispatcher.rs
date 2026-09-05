@@ -30,6 +30,101 @@ use crate::tools::ToolRegistry;
 
 use super::types::action_type;
 
+/// `metadata.$.delivery_attempts` — consecutive failed delivery attempts on a
+/// callback (mika#2179). Reset by nothing: a delivery that succeeds ends the
+/// row's life as an undelivered callback, so there is no state to clear.
+const DELIVERY_ATTEMPTS_KEY: &str = "delivery_attempts";
+/// `metadata.$.delivery_first_failed_at` — when the run of failures began.
+const DELIVERY_FIRST_FAILED_AT_KEY: &str = "delivery_first_failed_at";
+/// `metadata.$.delivery_last_error_class` — class of the most recent failure.
+const DELIVERY_LAST_ERROR_CLASS_KEY: &str = "delivery_last_error_class";
+/// `metadata.$.delivery_quarantined_at` — when the row crossed the attempt
+/// threshold. Its presence is the visible half of AC3's "mise à l'écart
+/// visible"; the row's `status` deliberately does not move.
+const DELIVERY_QUARANTINED_AT_KEY: &str = "delivery_quarantined_at";
+
+/// Ceiling on the exponent of the callback-delivery backoff (mika#2179).
+///
+/// `1u64 << 32` is ~4.3e9; multiplied by any sane base that already saturates
+/// far past any configurable `max`, so the clamp costs nothing in practice and
+/// keeps the shift provably in range. 63 would also be in range for the shift
+/// itself, but `base << 62` silently evaluates to zero for a small base — the
+/// one arithmetic result that would quietly reinstate the unbounded retry.
+const BACKOFF_MAX_SHIFT: u32 = 32;
+
+/// Cap on the error text carried in a `callback_delivery_failed` audit event.
+/// The class is the queryable field; this is context for a human reading one
+/// row, not a payload to grep.
+const DELIVERY_ERROR_REASONING_MAX_CHARS: usize = 300;
+
+/// Backoff for a failed callback delivery (mika#2179, AC3).
+///
+/// `base * 2^(attempts-1)` capped at `max` while the row is still inside its
+/// attempt budget, and **`max` outright from the quarantine crossing onward**.
+///
+/// That last clause is not cosmetic. With the shipped defaults the crossing is
+/// at `attempts = 3`, where the doubling has only reached 240 s; letting it
+/// keep doubling would mean four more `resume_agent` turns — each able to hold
+/// the agent lock for `AGENT_TOTAL_TIMEOUT_SECS` (300 s) — in the hour after we
+/// announced the row was quarantined. The operator doc and the
+/// `callback_delivery_quarantined` log line both say a quarantined callback
+/// retries at the ceiling; this is what makes that sentence true rather than
+/// approximately true. Announcing a bound and then not applying it for another
+/// four attempts is the shape of instrument that gets distrusted once and
+/// ignored thereafter.
+///
+/// A pure function so the far tail is testable. `attempts` is unbounded by
+/// construction — a row that keeps failing keeps counting — and the naive
+/// `base << (attempts - 1)` is wrong there in a way no ordinary run surfaces:
+/// `60u64 << 62` drops every set bit and evaluates to **0**, writing a
+/// `next_fire_at` in the past and restoring the once-a-minute retry loop this
+/// whole function exists to end. `checked_shl` does not catch it either — it
+/// refuses only shifts >= 64 and wraps for everything below.
+fn delivery_backoff_secs(base: u64, max: u64, attempts: u32, quarantine_at: u32) -> u64 {
+    if attempts >= quarantine_at {
+        return max;
+    }
+    let shift = attempts.saturating_sub(1).min(BACKOFF_MAX_SHIFT);
+    base.saturating_mul(1u64 << shift).min(max)
+}
+
+/// Classify a failed callback delivery by the `LlmError` variant underneath it
+/// (mika#2179, AC1).
+///
+/// **Reads the variant, not the message.** `anyhow::Error::downcast_ref` walks
+/// the whole cause chain, so an intermediate `.context()` does not break this;
+/// a substring match on the rendered message would break the day a provider
+/// rewords its errors. The one place a string is consulted is *inside* the
+/// `Transport` variant, to separate a timeout from a connection refusal —
+/// `LlmError` does not model that distinction, and the timeout is the shape the
+/// founding incident was made of (19 of them in four hours).
+///
+/// Returns [`Cow::Borrowed`] for every fixed class and [`Cow::Owned`] only for
+/// `http_<status>`. The plan wrote this signature as `-> &'static str`, which
+/// cannot carry a status code; the classification set it specified — including
+/// `http_<status>` — is what is implemented here. Keeping `429` distinguishable
+/// from `500` is the difference between "we are being rate-limited" and "the
+/// provider is down", and triage needs both.
+fn classify_delivery_error(err: &anyhow::Error) -> std::borrow::Cow<'static, str> {
+    use mika_common::llm::error::LlmError;
+    use std::borrow::Cow;
+
+    let Some(llm_err) = err.downcast_ref::<LlmError>() else {
+        return Cow::Borrowed("other");
+    };
+
+    match llm_err {
+        LlmError::Transport(msg) if msg.to_lowercase().contains("timed out") => {
+            Cow::Borrowed("transport_timeout")
+        }
+        LlmError::Transport(_) => Cow::Borrowed("transport"),
+        LlmError::HttpError { status, .. } => Cow::Owned(format!("http_{status}")),
+        LlmError::ParseError(_) => Cow::Borrowed("parse"),
+        LlmError::ProviderError(_) => Cow::Borrowed("provider"),
+        LlmError::UnsupportedFeature(_) => Cow::Borrowed("unsupported"),
+    }
+}
+
 /// Executes a task's action by matching on `action_type`.
 ///
 /// `send_message` and `inject_context` are fully implemented.
@@ -502,6 +597,19 @@ impl TaskDispatcher {
         if let Err(e) = run_silent_agent(&params).await {
             warn!(task_id = %task.id, error = %e, "resume_agent run failed");
 
+            // mika#2179 — record the failure and back the row off BEFORE the
+            // re-arm below. Order matters twice over: the re-arm creates a new
+            // `pending` row and returns early on some paths, and this row is
+            // the one that keeps being re-selected every 60s scan. Until this
+            // call existed, the branch wrote a `warn!` and nothing else — no
+            // counter, no audit event, no `next_fire_at` — so callback
+            // `800d739f` re-took the agent lock once a minute for five hours
+            // while its parent died of age waiting for the return.
+            if is_callback {
+                self.record_callback_delivery_failure(task, &e, &session_id, &trace_id)
+                    .await;
+            }
+
             // mika#2045 — a deferred wrapper whose turn errored is consumed all
             // the same: promotion already set it `completed`, so it has left the
             // pending queue for good. This branch used to do nothing at all — no
@@ -516,8 +624,25 @@ impl TaskDispatcher {
         } else if is_callback {
             // Mark delivered so TUI polling doesn't re-process this callback.
             // Only for callbacks — reminder lifecycle is managed by fire_task().
-            if let Err(e) = self.db.mark_task_delivered(&task.id).await {
-                warn!(task_id = %task.id, error = %e, "failed to mark callback task as delivered");
+            match self.db.mark_task_delivered(&task.id).await {
+                // mika#2179 — the latency this delivery just ended is written
+                // where it can be queried, gated on the transition actually
+                // having happened. `mark_task_delivered` returns false when
+                // another path won the race, and a measurement attributed to a
+                // delivery we did not make is worse than none.
+                Ok(true) => {
+                    self.record_callback_delivery_success(task, &session_id, &trace_id)
+                        .await;
+                }
+                Ok(false) => {
+                    debug!(
+                        task_id = %task.id,
+                        "callback was already delivered — skipping latency measurement"
+                    );
+                }
+                Err(e) => {
+                    warn!(task_id = %task.id, error = %e, "failed to mark callback task as delivered");
+                }
             }
 
             // #991 — Post-callback advance backstop. After a milestone/project-context
@@ -1253,6 +1378,268 @@ impl TaskDispatcher {
         }
 
         true
+    }
+
+    /// mika#2179 — Record a failed callback delivery, then bound its retry.
+    ///
+    /// Called on the `Err` arm of `run_silent_agent` for callbacks only. Three
+    /// things happen here, in this order, and the order is what makes the row
+    /// stop consuming the agent lock:
+    ///
+    /// 1. the attempt counter and the last error class are written to
+    ///    `metadata` (readable with `mika tasks get`, no log needed);
+    /// 2. a `callback_delivery_failed` audit event is written (AC1);
+    /// 3. `next_fire_at` is pushed forward by an exponential backoff, which
+    ///    the engine's existing guard in `dispatch_undelivered_callbacks`
+    ///    already reads — no scan-side change, no new column (AC3).
+    ///
+    /// Nothing here is fatal: every step warns and continues. A row that fails
+    /// to record its failure must still reach the re-arm path below it, and a
+    /// delivery bounded imperfectly is better than a delivery not attempted.
+    async fn record_callback_delivery_failure(
+        &self,
+        task: &Task,
+        err: &anyhow::Error,
+        session_id: &str,
+        trace_id: &str,
+    ) {
+        let class = classify_delivery_error(err);
+
+        let previous_attempts = self
+            .db
+            .get_task_metadata_field(&task.id, DELIVERY_ATTEMPTS_KEY)
+            .await
+            .unwrap_or_default()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+        let attempts = previous_attempts.saturating_add(1);
+
+        // Metadata first: it is the surface an operator reads on the row.
+        //
+        // The counter's write outcome is kept, because the entire escalation
+        // ladder is derived from re-reading it. `set_task_metadata_field` runs
+        // `json_set(COALESCE(metadata,'{}'), …)`, and SQLite raises a hard
+        // "malformed JSON" error — not NULL — on a row whose `metadata` is not
+        // valid JSON. Left merely warned-about, that row would read
+        // `previous_attempts = 0` on *every* failure: `attempts` pinned at 1,
+        // the backoff pinned at one scan interval, and `attempts >=
+        // max_attempts` never true, so it is never quarantined. The starvation
+        // this ticket closes would be silently restored, and the only trace
+        // would be a stream of `callback_delivery_failed` rows all reading
+        // `attempt:1` — which reads like a first failure, not a broken counter.
+        let counter_written = self
+            .set_delivery_metadata(&task.id, DELIVERY_ATTEMPTS_KEY, &attempts.to_string())
+            .await;
+        self.set_delivery_metadata(&task.id, DELIVERY_LAST_ERROR_CLASS_KEY, class.as_ref())
+            .await;
+        if previous_attempts == 0 {
+            self.set_delivery_metadata(
+                &task.id,
+                DELIVERY_FIRST_FAILED_AT_KEY,
+                &crate::timestamp::now(),
+            )
+            .await;
+        }
+
+        // AC1 — the named event. Modelled on `deferred_dispatch_noop_completion`
+        // above: same `task:<id>` target shape, same fire-and-forget policy.
+        let reasoning = format!(
+            "attempt:{attempts} label:{} err:{}",
+            task.label,
+            crate::db::truncate_chars(&err.to_string(), DELIVERY_ERROR_REASONING_MAX_CHARS)
+        );
+        if let Err(e) = self
+            .db
+            .log_audit_event(
+                session_id,
+                "callback_delivery_failed",
+                &format!("task:{}", task.id),
+                None,
+                Some(class.as_ref()),
+                Some(&reasoning),
+                Some(trace_id),
+            )
+            .await
+        {
+            warn!(error = %e, task_id = %task.id, "failed to write callback_delivery_failed audit event");
+        }
+
+        // AC3 — the backoff. See `delivery_backoff_secs` for why the shift is
+        // clamped and the multiply saturates: `attempts` is unbounded by
+        // construction, and the naive shift silently evaluates to zero at the
+        // far end of a long outage.
+        let max_attempts = self.settings.effective_callback_delivery_max_attempts();
+        let max_backoff = self.settings.effective_callback_delivery_backoff_max_secs();
+        let backoff_secs = if counter_written {
+            delivery_backoff_secs(
+                self.settings
+                    .effective_callback_delivery_backoff_base_secs(),
+                max_backoff,
+                attempts,
+                max_attempts,
+            )
+        } else {
+            // The counter could not be persisted, so `attempts` is not a count
+            // — it is 1, and it will be 1 again next scan. Escalating from an
+            // unreliable number is not possible; the safe reading of "this row
+            // just failed and I cannot tell how many times" is the ceiling, not
+            // the base. Failing open here would pin the row at a 60s retry
+            // forever, which is the starvation, not a mitigation of it.
+            warn!(
+                event = "callback_delivery_counter_unwritable",
+                task_id = %task.id,
+                label = %task.label,
+                error_class = %class,
+                "cannot persist the delivery-attempt counter (malformed task metadata?) — \
+                 backing off at the ceiling instead of escalating from an unreliable count"
+            );
+            max_backoff
+        };
+        let fire_at = crate::timestamp::now_plus(chrono::Duration::seconds(backoff_secs as i64));
+        if let Err(e) = self.db.update_task_next_fire_at(&task.id, &fire_at).await {
+            warn!(error = %e, task_id = %task.id, "failed to write callback delivery backoff");
+        }
+
+        warn!(
+            event = "callback_delivery_failed",
+            task_id = %task.id,
+            label = %task.label,
+            error_class = %class,
+            attempt = attempts,
+            backoff_secs,
+            next_fire_at = %fire_at,
+            "callback delivery failed — backing off"
+        );
+
+        // AC3 — the quarantine, announced once at the threshold crossing.
+        // Once, not per attempt: an event that repeats every minute is the same
+        // silence as no event, just louder. Gated on `counter_written` for the
+        // same reason the backoff is: a pinned counter would either never reach
+        // the threshold, or re-announce the crossing on every single failure.
+        if counter_written && attempts >= max_attempts && previous_attempts < max_attempts {
+            self.set_delivery_metadata(
+                &task.id,
+                DELIVERY_QUARANTINED_AT_KEY,
+                &crate::timestamp::now(),
+            )
+            .await;
+            if let Err(e) = self
+                .db
+                .log_audit_event(
+                    session_id,
+                    "callback_delivery_quarantined",
+                    &format!("task:{}", task.id),
+                    None,
+                    Some(class.as_ref()),
+                    Some(&format!("attempts={attempts} backoff_secs={backoff_secs}")),
+                    Some(trace_id),
+                )
+                .await
+            {
+                warn!(error = %e, task_id = %task.id, "failed to write callback_delivery_quarantined audit event");
+            }
+            warn!(
+                event = "callback_delivery_quarantined",
+                task_id = %task.id,
+                label = %task.label,
+                error_class = %class,
+                attempts,
+                "callback delivery quarantined — retrying at the backoff ceiling, result preserved"
+            );
+        }
+    }
+
+    /// mika#2179 — Record the latency of a delivery that just succeeded (AC2).
+    ///
+    /// The measurement is unconditional; only the `warn!` is gated on the
+    /// configured threshold. That asymmetry is the point of the AC: before
+    /// this, the only way to know how long a callback waited was to subtract
+    /// two columns and hope nothing else had written to the row since.
+    async fn record_callback_delivery_success(
+        &self,
+        task: &Task,
+        session_id: &str,
+        trace_id: &str,
+    ) {
+        // `completed_at` is NULL for a `failed` callback that never completed.
+        // That is a real shape (the stale-failed path in the engine), so it is
+        // reported as `unknown` rather than unwrapped or skipped.
+        let wait_secs = task
+            .completed_at
+            .as_deref()
+            .and_then(|ts| crate::timestamp::parse(ts).ok())
+            .map(|completed| (chrono::Utc::now() - completed).num_seconds().max(0));
+
+        let attempts = self
+            .db
+            .get_task_metadata_field(&task.id, DELIVERY_ATTEMPTS_KEY)
+            .await
+            .unwrap_or_default()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+
+        let after_value = match wait_secs {
+            Some(secs) => secs.to_string(),
+            None => "unknown".to_string(),
+        };
+        let reasoning = match wait_secs {
+            Some(secs) => format!("wait_secs={secs} attempts={attempts} label={}", task.label),
+            None => format!(
+                "wait_secs=unknown (completed_at is NULL) attempts={attempts} label={}",
+                task.label
+            ),
+        };
+
+        if let Err(e) = self
+            .db
+            .log_audit_event(
+                session_id,
+                "callback_delivered",
+                &format!("task:{}", task.id),
+                None,
+                Some(&after_value),
+                Some(&reasoning),
+                Some(trace_id),
+            )
+            .await
+        {
+            warn!(error = %e, task_id = %task.id, "failed to write callback_delivered audit event");
+        }
+
+        let threshold = self
+            .settings
+            .effective_callback_delivery_slow_threshold_secs();
+        if let Some(secs) = wait_secs
+            && secs as u64 > threshold
+        {
+            warn!(
+                event = "callback_delivery_slow",
+                task_id = %task.id,
+                label = %task.label,
+                wait_secs = secs,
+                threshold_secs = threshold,
+                attempts,
+                "callback delivered far later than it completed"
+            );
+        }
+    }
+
+    /// Write one `metadata.$.<key>` field, warning on failure. Returns whether
+    /// the write landed.
+    ///
+    /// Factored out because the failure path writes four of these and each one
+    /// is individually non-fatal — inlining the `if let Err` four times buried
+    /// the sequence it belongs to. The return value matters for exactly one of
+    /// the four: the attempt counter, which the escalation ladder re-reads. The
+    /// other three are pure operator surface and their loss costs a warn.
+    async fn set_delivery_metadata(&self, task_id: &str, key: &str, value: &str) -> bool {
+        match self.db.set_task_metadata_field(task_id, key, value).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(error = %e, task_id = %task_id, key, "failed to write callback delivery metadata");
+                false
+            }
+        }
     }
 
     /// mika#2045 — Replace a deferred wrapper that was consumed without
@@ -2717,6 +3104,150 @@ mod tests {
             "reminder resume_agent should not error: {:?}",
             result
         );
+    }
+
+    // ── delivery_backoff_secs tests (mika#2179) ──
+
+    /// The doubling, up to the quarantine crossing. With a quarantine budget
+    /// large enough not to interfere, the sequence is the plain exponential
+    /// capped at the ceiling.
+    #[test]
+    fn delivery_backoff_doubles_then_holds_at_the_ceiling() {
+        let seq: Vec<u64> = (1..=8)
+            .map(|n| delivery_backoff_secs(60, 3600, n, u32::MAX))
+            .collect();
+        assert_eq!(seq, vec![60, 120, 240, 480, 960, 1920, 3600, 3600]);
+    }
+
+    /// The crossing jumps straight to the ceiling, and this is what makes the
+    /// `callback_delivery_quarantined` log line and the operator doc true
+    /// rather than approximately true. With the shipped budget of 3, the
+    /// doubling has only reached 240 s at the crossing — four more attempts
+    /// away from the hour both surfaces promise. Each of those attempts can
+    /// hold the agent lock for `AGENT_TOTAL_TIMEOUT_SECS`, so "approximately"
+    /// is worth about 20 minutes of lock on a bad night.
+    #[test]
+    fn delivery_backoff_jumps_to_the_ceiling_at_the_quarantine_crossing() {
+        // Below the budget: ordinary doubling.
+        assert_eq!(delivery_backoff_secs(60, 3600, 1, 3), 60);
+        assert_eq!(delivery_backoff_secs(60, 3600, 2, 3), 120);
+        // At and past it: the ceiling, not 240.
+        assert_eq!(
+            delivery_backoff_secs(60, 3600, 3, 3),
+            3600,
+            "the announced bound must be the applied bound"
+        );
+        assert_eq!(delivery_backoff_secs(60, 3600, 4, 3), 3600);
+    }
+
+    /// The far tail, which no ordinary run reaches and which the naive shift
+    /// gets catastrophically wrong: `60u64 << 62` is 0, i.e. a `next_fire_at`
+    /// in the past — the unbounded retry loop, back, after roughly 57 h of
+    /// unbroken failure. Asserts the floor, not merely the absence of a panic:
+    /// zero does not panic, so a "does not panic" test would have passed on the
+    /// broken version. Quarantine is disabled here so the arithmetic itself is
+    /// what is under test, not the crossing short-circuit in front of it.
+    #[test]
+    fn delivery_backoff_never_collapses_to_zero_on_a_long_outage() {
+        for attempts in [40u32, 62, 63, 64, 65, 1000, u32::MAX] {
+            let backoff = delivery_backoff_secs(60, 3600, attempts, u32::MAX);
+            assert_eq!(
+                backoff, 3600,
+                "attempt {attempts} must stay at the ceiling, got {backoff}"
+            );
+        }
+    }
+
+    /// A first attempt gets exactly one base interval — one engine scan — so a
+    /// single transient blip behaves as it did before this fix.
+    #[test]
+    fn delivery_backoff_first_attempt_is_one_base_interval() {
+        assert_eq!(delivery_backoff_secs(60, 3600, 1, 3), 60);
+        assert_eq!(
+            delivery_backoff_secs(60, 3600, 0, 3),
+            60,
+            "attempts=0 is unreachable from the caller but must not underflow"
+        );
+    }
+
+    // ── classify_delivery_error tests (mika#2179) ──
+
+    /// The founding incident's exact error text, verbatim from
+    /// `/var/log/mika/server.log` on the night of 2026-09-03/04.
+    const INCIDENT_TRANSPORT_TIMEOUT: &str = "failed to read response body: error decoding response body: \
+         request or response body error: operation timed out";
+
+    #[test]
+    fn classify_delivery_error_names_the_incident_class() {
+        let err = anyhow::Error::new(mika_common::llm::error::LlmError::Transport(
+            INCIDENT_TRANSPORT_TIMEOUT.to_string(),
+        ));
+        assert_eq!(classify_delivery_error(&err), "transport_timeout");
+    }
+
+    #[test]
+    fn classify_delivery_error_separates_timeout_from_other_transport() {
+        let err = anyhow::Error::new(mika_common::llm::error::LlmError::Transport(
+            "connection refused".to_string(),
+        ));
+        assert_eq!(
+            classify_delivery_error(&err),
+            "transport",
+            "a refused connection is a transport failure but not the starvation shape"
+        );
+    }
+
+    #[test]
+    fn classify_delivery_error_keeps_the_http_status() {
+        for (status, expected) in [(429u16, "http_429"), (500, "http_500")] {
+            let err = anyhow::Error::new(mika_common::llm::error::LlmError::HttpError {
+                status,
+                message: "boom".into(),
+                retryable: true,
+            });
+            assert_eq!(
+                classify_delivery_error(&err),
+                expected,
+                "rate-limited and provider-down must stay distinguishable"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_delivery_error_covers_the_remaining_variants() {
+        use mika_common::llm::error::LlmError;
+        let cases = [
+            (LlmError::ParseError("bad json".into()), "parse"),
+            (LlmError::ProviderError("upstream".into()), "provider"),
+            (LlmError::UnsupportedFeature("vision".into()), "unsupported"),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(classify_delivery_error(&anyhow::Error::new(err)), expected);
+        }
+    }
+
+    /// The load-bearing property: classification survives `.context()` layers,
+    /// because `downcast_ref` walks the cause chain. `run_loop` propagates the
+    /// `LlmError` with a bare `?` today, but nothing stops a future caller from
+    /// adding context — and a classifier that broke silently on that would send
+    /// every future starvation into the `other` bucket.
+    #[test]
+    fn classify_delivery_error_sees_through_context_layers() {
+        let err = anyhow::Error::new(mika_common::llm::error::LlmError::Transport(
+            INCIDENT_TRANSPORT_TIMEOUT.to_string(),
+        ))
+        .context("silent agent turn failed")
+        .context("resume_agent");
+        assert_eq!(classify_delivery_error(&err), "transport_timeout");
+    }
+
+    /// A non-LLM failure must not be laundered into an LLM class. The `Err`
+    /// arm this classifier serves catches everything `run_silent_agent` can
+    /// return, and most of that is not a provider problem.
+    #[test]
+    fn classify_delivery_error_reports_non_llm_errors_as_other() {
+        let err = anyhow::anyhow!("database is locked");
+        assert_eq!(classify_delivery_error(&err), "other");
     }
 
     // ── extract_callback_fields tests ──

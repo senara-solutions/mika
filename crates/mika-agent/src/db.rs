@@ -7422,6 +7422,26 @@ impl Database {
         Ok(())
     }
 
+    /// Test-only helper: backdate a task's `completed_at` by `seconds_ago`
+    /// seconds relative to now. Sibling of [`Self::backdate_task_updated_at`],
+    /// and needed for the same reason a different column needs it:
+    /// `update_task_completed` writes `completed_at = now`, so a mika#2179 test
+    /// cannot otherwise seed the incident's `2026-09-03T22:03:24Z` completion
+    /// and measure the 5 h 06 wait that followed. Deliberately leaves
+    /// `updated_at` alone — the delivery latency under test is
+    /// `completed_at → delivery`, and moving both would hide a regression in
+    /// which column the measurement reads. Not intended for production use —
+    /// timestamps are otherwise engine-owned.
+    #[doc(hidden)]
+    pub fn backdate_task_completed_at(&self, task_id: &str, seconds_ago: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+             WHERE id = ?1",
+            params![task_id, format!("-{seconds_ago} seconds")],
+        )?;
+        Ok(())
+    }
+
     /// Test-only helper: rewrite a task's primary key.
     ///
     /// `find_dispatch_children_with_pid` orders by `id`, and `create_task`

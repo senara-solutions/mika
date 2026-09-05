@@ -45,6 +45,7 @@ mod eval {
 
     mod test_auto_groom_dispatch;
     mod test_basic_conversation;
+    mod test_callback_delivery_starvation;
     mod test_callback_milestone_advance;
     mod test_callback_terminal_action;
     mod test_callback_turn;

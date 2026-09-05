@@ -958,6 +958,53 @@ pub struct Settings {
     #[serde(default)]
     pub phantom_sweep_age_seconds: Option<u64>,
 
+    /// Callback-delivery latency above which the engine warns, in seconds
+    /// (mika#2179).
+    ///
+    /// The **measurement** is unconditional — every delivery writes a
+    /// `callback_delivered` audit event carrying its `wait_secs`. This value
+    /// only decides when that latency is additionally shouted about in the log.
+    ///
+    /// Env override: `MIKA_CALLBACK_DELIVERY_SLOW_THRESHOLD_SECS`.
+    ///
+    /// Default: [`DEFAULT_CALLBACK_DELIVERY_SLOW_THRESHOLD_SECS`] (3600 — see
+    /// that constant for the measured rationale).
+    #[serde(default)]
+    pub callback_delivery_slow_threshold_secs: Option<u64>,
+
+    /// Consecutive delivery failures after which a callback is quarantined
+    /// (mika#2179).
+    ///
+    /// Quarantine is non-destructive: the row keeps `status='completed'` and
+    /// its `result`, and only its retry cadence changes. See
+    /// [`DEFAULT_CALLBACK_DELIVERY_MAX_ATTEMPTS`].
+    ///
+    /// Env override: `MIKA_CALLBACK_DELIVERY_MAX_ATTEMPTS`.
+    #[serde(default)]
+    pub callback_delivery_max_attempts: Option<u32>,
+
+    /// First backoff step after a failed callback delivery, in seconds
+    /// (mika#2179). Doubles per attempt up to
+    /// [`Self::callback_delivery_backoff_max_secs`].
+    ///
+    /// Env override: `MIKA_CALLBACK_DELIVERY_BACKOFF_BASE_SECS`.
+    ///
+    /// Default: [`DEFAULT_CALLBACK_DELIVERY_BACKOFF_BASE_SECS`] (60 — one
+    /// engine scan interval, so the first retry is the next scan and nothing
+    /// changes for a transient blip).
+    #[serde(default)]
+    pub callback_delivery_backoff_base_secs: Option<u64>,
+
+    /// Ceiling on the callback-delivery backoff, in seconds (mika#2179).
+    ///
+    /// Env override: `MIKA_CALLBACK_DELIVERY_BACKOFF_MAX_SECS`.
+    ///
+    /// Default: [`DEFAULT_CALLBACK_DELIVERY_BACKOFF_MAX_SECS`] (3600 — a
+    /// quarantined callback still retries hourly rather than never, because
+    /// the pilot's return is real work nobody else will re-deliver).
+    #[serde(default)]
+    pub callback_delivery_backoff_max_secs: Option<u64>,
+
     /// KG docs root — absolute path to the docs directory the lexical ingestor
     /// reads (#738). Resolution chain: `MIKA_KG_DOCS_ROOT` env > `kg_docs_root`
     /// config field > `<CWD>/docs/solutions` (container-native default).
@@ -1091,6 +1138,64 @@ pub const DEFAULT_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS: u64 = 120;
 ///
 /// Reversible without a rebuild via `MIKA_PHANTOM_SWEEP_AGE_SECONDS`.
 pub const DEFAULT_PHANTOM_SWEEP_AGE_SECONDS: u64 = 14400;
+
+/// Default callback-delivery slow-warning threshold in seconds (mika#2179).
+///
+/// **Chosen against a measurement, not against a feeling.** Distribution of
+/// `updated_at − completed_at` over the 1628 callbacks delivered since
+/// 2026-08-01: `p50 = 377 s`, `p75 = 2138 s`, `p90 = 9585 s`, `p99 = 112 949 s`.
+/// The ticket proposed 900 s; that would have classified `549/1628 = 33,7 %` of
+/// all deliveries as an alert, and a threshold that fires on a third of the
+/// population gets muted rather than acted on. 3600 s sits just under the
+/// observed p90 and still fires on ~18 % — a number this fix deliberately
+/// accepts, because that 18 % *is* the starvation the ticket is about.
+///
+/// It is therefore a threshold on a **sick** population, not a target. If the
+/// provider-side cause (out of scope here) is ever fixed, this wants lowering.
+///
+/// Reversible without a rebuild via `MIKA_CALLBACK_DELIVERY_SLOW_THRESHOLD_SECS`.
+pub const DEFAULT_CALLBACK_DELIVERY_SLOW_THRESHOLD_SECS: u64 = 3600;
+
+/// Default consecutive-failure count before a callback delivery is quarantined
+/// (mika#2179).
+///
+/// Three, because the failures this bounds are transport timeouts, and the
+/// measured incident showed them arriving in runs of 6 and 9 against the same
+/// callback — not in ones. Two would quarantine on an ordinary pair of blips;
+/// ten would let the row hold the agent lock for the better part of an hour
+/// before anything visible happened.
+///
+/// A configured `0` is treated as `1` by the accessor: quarantine-before-any-
+/// attempt is not a state this design has, and silently disabling the bound
+/// would restore exactly the failure mode the ticket describes.
+pub const DEFAULT_CALLBACK_DELIVERY_MAX_ATTEMPTS: u32 = 3;
+
+/// Default first backoff step after a failed callback delivery, in seconds
+/// (mika#2179). One `DB_SCAN_INTERVAL_TICKS`, so a single transient failure
+/// retries on the very next scan and the nominal path is unchanged.
+pub const DEFAULT_CALLBACK_DELIVERY_BACKOFF_BASE_SECS: u64 = 60;
+
+/// Default ceiling on the callback-delivery backoff, in seconds (mika#2179).
+///
+/// Deliberately not infinite. A quarantined callback carries the pilot's return
+/// and nothing else will re-deliver it, so the cadence drops from once a minute
+/// to once an hour — the agent lock stops being consumed 60× per hour, which is
+/// what AC3 asks for, without the row being abandoned.
+pub const DEFAULT_CALLBACK_DELIVERY_BACKOFF_MAX_SECS: u64 = 3600;
+
+/// Hard upper bound on any configured callback-delivery backoff, in seconds
+/// (mika#2179). Thirty days — the same figure, for the same reason, as the
+/// upper clamp on `MIKA_PROMOTED_WRAPPER_LIVENESS_SECS`.
+///
+/// This is not tidiness. The effective value is handed to
+/// `chrono::Duration::seconds`, which panics above `i64::MAX / 1000`, and a
+/// value at or above `2^63` casts to a negative `i64` on the way in. An
+/// operator typing milliseconds where seconds were meant would therefore kill
+/// the delivery task *inside* the function that writes the backoff, leaving the
+/// row with no `next_fire_at` at all — the unbounded retry, restored by the
+/// setting meant to bound it. A backoff beyond thirty days has no meaning here
+/// anyway: the callback carries a pilot's return that someone is waiting on.
+pub const CALLBACK_DELIVERY_BACKOFF_ABSOLUTE_MAX_SECS: u64 = 30 * 24 * 60 * 60;
 
 /// Default bounded webhook-queue max depth per agent (mika#1870).
 pub const DEFAULT_WEBHOOK_QUEUE_MAX_DEPTH: usize = 64;
@@ -1468,6 +1573,68 @@ impl Settings {
             .unwrap_or(DEFAULT_PHANTOM_SWEEP_AGE_SECONDS)
     }
 
+    /// Effective callback-delivery slow-warning threshold in seconds (mika#2179).
+    ///
+    /// Returns the configured value or
+    /// [`DEFAULT_CALLBACK_DELIVERY_SLOW_THRESHOLD_SECS`] (3600s).
+    pub fn effective_callback_delivery_slow_threshold_secs(&self) -> u64 {
+        self.callback_delivery_slow_threshold_secs
+            .unwrap_or(DEFAULT_CALLBACK_DELIVERY_SLOW_THRESHOLD_SECS)
+    }
+
+    /// Effective consecutive-failure count before quarantine (mika#2179).
+    ///
+    /// Returns the configured value or
+    /// [`DEFAULT_CALLBACK_DELIVERY_MAX_ATTEMPTS`] (3), clamped to a floor of 1:
+    /// a configured `0` would otherwise mean "quarantine before the first
+    /// attempt", which is not a state this design has, and — read the other
+    /// way — would silently disable the bound and restore the unbounded retry
+    /// loop the ticket exists to close.
+    pub fn effective_callback_delivery_max_attempts(&self) -> u32 {
+        self.callback_delivery_max_attempts
+            .unwrap_or(DEFAULT_CALLBACK_DELIVERY_MAX_ATTEMPTS)
+            .max(1)
+    }
+
+    /// Effective first backoff step after a failed delivery (mika#2179).
+    ///
+    /// Returns the configured value or
+    /// [`DEFAULT_CALLBACK_DELIVERY_BACKOFF_BASE_SECS`] (60s), clamped to
+    /// `1..=`[`CALLBACK_DELIVERY_BACKOFF_ABSOLUTE_MAX_SECS`]. A base of `0`
+    /// would make every doubling `0` and write a `next_fire_at` in the past —
+    /// no backoff at all, while appearing in the row to have one.
+    pub fn effective_callback_delivery_backoff_base_secs(&self) -> u64 {
+        self.callback_delivery_backoff_base_secs
+            .unwrap_or(DEFAULT_CALLBACK_DELIVERY_BACKOFF_BASE_SECS)
+            .clamp(1, CALLBACK_DELIVERY_BACKOFF_ABSOLUTE_MAX_SECS)
+    }
+
+    /// Effective ceiling on the callback-delivery backoff (mika#2179).
+    ///
+    /// Returns the configured value or
+    /// [`DEFAULT_CALLBACK_DELIVERY_BACKOFF_MAX_SECS`] (3600s), clamped into
+    /// `base..=`[`CALLBACK_DELIVERY_BACKOFF_ABSOLUTE_MAX_SECS`].
+    ///
+    /// **Both ends of that clamp are load-bearing.** Below the base, a "capped"
+    /// backoff would be shorter than its own first step. Above the absolute
+    /// max, the value reaches `chrono::Duration::seconds`, which **panics**
+    /// past `i64::MAX / 1000` — and a value at or above `2^63` casts to a
+    /// negative `i64` first. Either way the delivery task dies inside the very
+    /// function that was about to write the backoff, so the row keeps
+    /// `status='completed'` with no `next_fire_at` and is re-selected on every
+    /// scan: precisely the unbounded retry this setting exists to prevent,
+    /// reachable by one fat-fingered milliseconds-for-seconds value. Same
+    /// reasoning, and the same "load-bearing" note, as the 30-day upper clamp
+    /// on `MIKA_PROMOTED_WRAPPER_LIVENESS_SECS`.
+    pub fn effective_callback_delivery_backoff_max_secs(&self) -> u64 {
+        self.callback_delivery_backoff_max_secs
+            .unwrap_or(DEFAULT_CALLBACK_DELIVERY_BACKOFF_MAX_SECS)
+            .clamp(
+                self.effective_callback_delivery_backoff_base_secs(),
+                CALLBACK_DELIVERY_BACKOFF_ABSOLUTE_MAX_SECS,
+            )
+    }
+
     /// Effective bounded webhook-queue max depth (mika#1870).
     ///
     /// Returns the configured value or [`DEFAULT_WEBHOOK_QUEUE_MAX_DEPTH`] (64).
@@ -1715,6 +1882,10 @@ impl Settings {
             kg_batch_budget: None,
             callback_watchdog_grace_period_secs: None,
             phantom_sweep_age_seconds: None,
+            callback_delivery_slow_threshold_secs: None,
+            callback_delivery_max_attempts: None,
+            callback_delivery_backoff_base_secs: None,
+            callback_delivery_backoff_max_secs: None,
             kg_docs_root: None,
             kg_docs_roots: None,
             operational_partner: false,
@@ -2651,6 +2822,134 @@ mod tests {
         assert_eq!(settings.effective_phantom_sweep_age_seconds(), 7200);
 
         unsafe { std::env::remove_var("MIKA_PHANTOM_SWEEP_AGE_SECONDS") };
+    }
+
+    // -- Callback delivery bounds (mika#2179) --
+
+    #[test]
+    #[serial]
+    fn callback_delivery_defaults() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(settings.callback_delivery_slow_threshold_secs, None);
+        assert_eq!(settings.callback_delivery_max_attempts, None);
+        assert_eq!(settings.callback_delivery_backoff_base_secs, None);
+        assert_eq!(settings.callback_delivery_backoff_max_secs, None);
+
+        // Anchors the measured values, not just the constants: 3600s is the
+        // threshold chosen against the p90 of the delivery-latency
+        // distribution (see the constant's doc comment), and 900s — the
+        // ticket's proposal — is what it deliberately is NOT.
+        assert_eq!(
+            settings.effective_callback_delivery_slow_threshold_secs(),
+            3600
+        );
+        assert_eq!(settings.effective_callback_delivery_max_attempts(), 3);
+        assert_eq!(settings.effective_callback_delivery_backoff_base_secs(), 60);
+        assert_eq!(
+            settings.effective_callback_delivery_backoff_max_secs(),
+            3600
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn callback_delivery_env_overrides() {
+        clean_env();
+        // Safety: test-only env vars.
+        unsafe {
+            std::env::set_var("MIKA_CALLBACK_DELIVERY_SLOW_THRESHOLD_SECS", "900");
+            std::env::set_var("MIKA_CALLBACK_DELIVERY_MAX_ATTEMPTS", "5");
+            std::env::set_var("MIKA_CALLBACK_DELIVERY_BACKOFF_BASE_SECS", "30");
+            std::env::set_var("MIKA_CALLBACK_DELIVERY_BACKOFF_MAX_SECS", "600");
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(
+            settings.effective_callback_delivery_slow_threshold_secs(),
+            900
+        );
+        assert_eq!(settings.effective_callback_delivery_max_attempts(), 5);
+        assert_eq!(settings.effective_callback_delivery_backoff_base_secs(), 30);
+        assert_eq!(settings.effective_callback_delivery_backoff_max_secs(), 600);
+
+        unsafe {
+            std::env::remove_var("MIKA_CALLBACK_DELIVERY_SLOW_THRESHOLD_SECS");
+            std::env::remove_var("MIKA_CALLBACK_DELIVERY_MAX_ATTEMPTS");
+            std::env::remove_var("MIKA_CALLBACK_DELIVERY_BACKOFF_BASE_SECS");
+            std::env::remove_var("MIKA_CALLBACK_DELIVERY_BACKOFF_MAX_SECS");
+        }
+    }
+
+    /// Degenerate configurations must not silently reinstate the unbounded
+    /// retry loop this ticket closes. `0` attempts would mean "quarantine
+    /// before trying"; a `0` base would make every doubling `0`, i.e. a
+    /// `next_fire_at` in the past on every attempt — a backoff that looks
+    /// present in the row and does nothing. A max under the base would make
+    /// the cap shorter than the first step.
+    #[test]
+    #[serial]
+    fn callback_delivery_degenerate_values_are_clamped() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut settings = Settings::load(tmp.path()).unwrap();
+
+        settings.callback_delivery_max_attempts = Some(0);
+        settings.callback_delivery_backoff_base_secs = Some(0);
+        settings.callback_delivery_backoff_max_secs = Some(0);
+
+        assert_eq!(settings.effective_callback_delivery_max_attempts(), 1);
+        assert_eq!(settings.effective_callback_delivery_backoff_base_secs(), 1);
+        assert_eq!(settings.effective_callback_delivery_backoff_max_secs(), 1);
+
+        settings.callback_delivery_backoff_base_secs = Some(120);
+        settings.callback_delivery_backoff_max_secs = Some(30);
+        assert_eq!(
+            settings.effective_callback_delivery_backoff_max_secs(),
+            120,
+            "a max below the base is raised to the base, never below it"
+        );
+    }
+
+    /// The upper clamp is what keeps a fat-fingered value from **panicking**
+    /// `chrono::Duration::seconds` inside the delivery path — which would leave
+    /// the row with no `next_fire_at` at all, i.e. the unbounded retry restored
+    /// by the very setting meant to bound it. Asserting the clamped value, not
+    /// merely the absence of a panic here, is the point: a test that only
+    /// checked "does not panic" would pass on the unclamped version too.
+    #[test]
+    #[serial]
+    fn callback_delivery_backoff_has_an_upper_clamp() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut settings = Settings::load(tmp.path()).unwrap();
+
+        // Milliseconds typed where seconds were meant, and the absolute worst
+        // case — both land on the same bound rather than on a panic.
+        for absurd in [3_600_000u64, u64::MAX] {
+            settings.callback_delivery_backoff_max_secs = Some(absurd);
+            settings.callback_delivery_backoff_base_secs = Some(absurd);
+            assert_eq!(
+                settings.effective_callback_delivery_backoff_base_secs(),
+                CALLBACK_DELIVERY_BACKOFF_ABSOLUTE_MAX_SECS
+            );
+            assert_eq!(
+                settings.effective_callback_delivery_backoff_max_secs(),
+                CALLBACK_DELIVERY_BACKOFF_ABSOLUTE_MAX_SECS
+            );
+            // The value the dispatcher actually hands to chrono must be
+            // representable — this is the assertion the clamp exists for.
+            let _ = chrono::Duration::seconds(
+                settings.effective_callback_delivery_backoff_max_secs() as i64,
+            );
+        }
     }
 
     // -- Bounded webhook queue (mika#1870) --
