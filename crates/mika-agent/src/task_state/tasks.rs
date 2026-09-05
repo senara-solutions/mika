@@ -250,6 +250,45 @@ pub struct OrphanedPendingTask {
     pub dispatch_class: String,
 }
 
+/// One deferred wrapper of a parent, as the stuck-pending reaper saw it at
+/// decision time (mika#2181 AC4).
+///
+/// The reaper's verdict is "nothing represents this parent". That verdict is
+/// unreadable after the fact unless the audit says *which* wrappers existed and
+/// *what statuses* produced it — otherwise the next battle starts by rebuilding
+/// the query from the code, which is what mika#2181 cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredWrapperSummary {
+    pub id: String,
+    pub status: String,
+    pub completed_at: Option<String>,
+}
+
+impl DeferredWrapperSummary {
+    /// Compact one-field rendering for an audit `details` string and a `tracing`
+    /// field (mika#2181 AC4):
+    /// `wrappers:f5eebf48:completed@2026-09-04T15:31:03Z,284b0ffe:pending@-`,
+    /// or `wrappers:none` when the parent has no wrapper at all.
+    ///
+    /// Ids are truncated to 8 chars because this line is read next to
+    /// `server.log`, where the dispatcher already prints them short.
+    pub fn render(wrappers: &[DeferredWrapperSummary]) -> String {
+        if wrappers.is_empty() {
+            return "wrappers:none".to_string();
+        }
+        let body = wrappers
+            .iter()
+            .map(|w| {
+                let short: String = w.id.chars().take(8).collect();
+                let at = w.completed_at.as_deref().unwrap_or("-");
+                format!("{short}:{}@{at}", w.status)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("wrappers:{body}")
+    }
+}
+
 /// Snapshot of a child task for the orphaned-parent reaper's structured log
 /// event (`task_engine_reaper.evaluated`). Captures all children of a candidate
 /// parent at kill time for post-incident diagnosis (mika#1126).

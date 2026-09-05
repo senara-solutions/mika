@@ -140,7 +140,12 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
         }
         Some(TaskCommand::Stuck { format }) => {
             let grace = mika_agent::task_engine::stuck_pending_reaper_grace_secs();
-            let stuck = db.find_orphaned_pending_issue_tasks(grace).await?;
+            // The probe must see exactly the population the reaper acts on
+            // (mika#2181) — a probe with its own predicate is a probe that lies.
+            let promoted_liveness = mika_agent::task_engine::promoted_wrapper_liveness_secs();
+            let stuck = db
+                .find_orphaned_pending_issue_tasks(grace, promoted_liveness)
+                .await?;
 
             match format {
                 OutputFormat::Text => {

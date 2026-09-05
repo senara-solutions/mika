@@ -76,6 +76,75 @@ const STUCK_PENDING_REAPER_GRACE_DEFAULT_SECS: i64 = 2700;
 /// Env var overriding [`STUCK_PENDING_REAPER_GRACE_DEFAULT_SECS`].
 const STUCK_PENDING_REAPER_GRACE_ENV: &str = "MIKA_STUCK_PENDING_REAPER_GRACE_SECS";
 
+/// Window (seconds) during which a *promoted* deferred wrapper still counts as
+/// representing its parent for the stuck-pending reaper (mika#2181).
+///
+/// Promotion writes `status = 'completed'` on the wrapper; the silent turn that
+/// consumes it only reaches `delivered` when it returns, several minutes later
+/// under a slow model. A predicate that counts only `pending` wrappers treats
+/// the parent as unrepresented for that whole window, re-arms it every tick, and
+/// burns `MAX_STUCK_REARMS` in two minutes — the mika#2181 trace exactly.
+///
+/// The window is **bounded** on purpose. `completed`-without-`delivered` is not
+/// a guaranteed-transient state: on the silent-turn error path
+/// (`dispatcher.rs`, `is_callback && label == DEFERRED_DISPATCH_LABEL`) the
+/// wrapper is re-armed but never marked `delivered`, so it stays `completed`
+/// forever. An unbounded predicate would turn that corpse into a permanent
+/// shield and leak in the other direction.
+///
+/// 2700 s, measured on `~/.mika/data/mika.db` — elapsed between `completed_at`
+/// (promotion) and the `delivered` transition, deferred wrappers actually
+/// delivered:
+///
+/// | window | n | <=300 s | <=900 s | <=1800 s | <=2700 s |
+/// |---|---|---|---|---|---|
+/// | 30 d | 799 | 417 (52%) | 569 (71%) | 616 (77%) | 660 (**83%**) |
+/// | 7 d | 609 | 320 (53%) | 430 (71%) | 467 (77%) | 506 (**83%**) |
+///
+/// (p50 = 247 s.) **Two honest limits on that 83 %, both measured:**
+///
+/// 1. **The remaining 17 % is not covered by any value of this constant.** 139
+///    of the 799 wrappers delivered past 2700 s; 81 of their parents were
+///    expired with `stuck_pending_no_deferred_wrapper`, and 8 of those were
+///    expired 2820-4996 s after promotion — past any shield this window can
+///    give. Roughly a tenth of the historical false-expiry class survives this
+///    fix. Raising the constant is not the answer: the long tail is server
+///    restarts and `AgentBusy` delays, and a restart-delayed wrapper is a
+///    *healthy* wrapper, so a bigger number buys coverage by blinding the
+///    reaper for longer. Retiring the residue needs a direct liveness measure
+///    (activity-row recency, the shape mika#1652 already uses for team runs),
+///    not a bigger proxy window. Tracked separately.
+/// 2. **The shield is re-armed by the repair ladder.** A re-arm mints a fresh
+///    `pending` wrapper, the next tick promotes it and writes a new
+///    `completed_at`, and the parent is sheltered again for a full window. The
+///    worst case is therefore `grace + (MAX_STUCK_REARMS + 1) * liveness`, not
+///    `grace + liveness`. It stays bounded only because the re-arm budget is
+///    spent and never reset — that budget, not this constant, is what
+///    terminates the ladder.
+///
+/// Equality with [`STUCK_PENDING_REAPER_GRACE_DEFAULT_SECS`] is still the value
+/// worth choosing: one promotion cannot hide a parent for longer than the grace
+/// took to call it stuck. It is a *separate* constant rather than a reuse of the
+/// grace because the two numbers answer two different questions and must be able
+/// to diverge under their env vars.
+/// Overridable via `MIKA_PROMOTED_WRAPPER_LIVENESS_SECS` (clamped, see
+/// [`PROMOTED_WRAPPER_LIVENESS_MAX_SECS`]).
+const PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS: i64 = 2700;
+
+/// Env var overriding [`PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS`].
+const PROMOTED_WRAPPER_LIVENESS_ENV: &str = "MIKA_PROMOTED_WRAPPER_LIVENESS_SECS";
+
+/// Upper clamp on the liveness window (30 days), and it is not cosmetic.
+///
+/// SQLite's `strftime('...', 'now', '-N seconds')` returns **NULL** for an
+/// out-of-range modifier, and `x > NULL` is NULL — so an absurdly large override
+/// does not widen the window, it makes the `completed` arm unsatisfiable and
+/// silently restores the exact mika#2181 predicate this constant exists to
+/// repair. A knob whose extreme setting reverts the fix without a word must
+/// fail closed. The sibling grace var needs no clamp: its modifier feeds a
+/// `parent.created_at <` comparison where NULL merely selects nothing.
+const PROMOTED_WRAPPER_LIVENESS_MAX_SECS: i64 = 30 * 24 * 3600;
+
 /// Ticks between pilot-transcript retention sweeps (mika#1705 AC6). At the 1s
 /// tick cadence, 86_400 ticks ≈ 24h — a daily prune, matching the plan's
 /// "daily tick deletes rows older than N days". Startup also runs one sweep.
@@ -618,9 +687,11 @@ impl TaskEngine {
     /// callback child represents any more.
     ///
     /// The ladder, in order, and the order is the point:
-    /// 1. the parent still has a `pending` deferred wrapper, or a live real
-    ///    callback -> it is queued or working. `find_orphaned_pending_issue_tasks`
-    ///    never returns it, and nothing here touches it.
+    /// 1. the parent still has a **live** deferred wrapper — `pending`, or
+    ///    promoted inside `promoted_wrapper_liveness_secs()` (mika#2181) — or a
+    ///    live real callback -> it is queued or working.
+    ///    `find_orphaned_pending_issue_tasks` never returns it, and nothing here
+    ///    touches it.
     /// 2. orphaned with repair budget left -> re-arm. A promoted task resumes its
     ///    work; an expired one loses it, so repair comes first.
     /// 3. orphaned with the budget spent, or repair refused -> cancel any
@@ -630,9 +701,10 @@ impl TaskEngine {
     ///    issue.
     async fn reap_orphaned_pending_issue_tasks(&self) {
         let grace_seconds = stuck_pending_reaper_grace_secs();
+        let promoted_liveness_seconds = promoted_wrapper_liveness_secs();
         let candidates = match self
             .db
-            .find_orphaned_pending_issue_tasks(grace_seconds)
+            .find_orphaned_pending_issue_tasks(grace_seconds, promoted_liveness_seconds)
             .await
         {
             Ok(c) => c,
@@ -644,6 +716,35 @@ impl TaskEngine {
                 return;
             }
         };
+
+        // mika#2181 — the shelter is silent by construction: it lives inside a
+        // SQL `NOT EXISTS`, so a spared parent never becomes a candidate and
+        // nothing below ever sees it. Count it explicitly, or "the reaper acted
+        // on nobody" and "the reaper is holding work back" render identically in
+        // the logs. Emitted BEFORE the empty-candidate return, because the case
+        // that matters most is exactly zero candidates and a non-empty shelter.
+        match self
+            .db
+            .find_parents_sheltered_by_promoted_wrapper(grace_seconds, promoted_liveness_seconds)
+            .await
+        {
+            Ok(sheltered) if !sheltered.is_empty() => {
+                info!(
+                    event = "stuck_pending_sheltered_by_promoted_wrapper",
+                    count = sheltered.len(),
+                    issues = ?sheltered,
+                    promoted_liveness_seconds,
+                    "parents past the grace are held back because a promoted wrapper is still live"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "task_engine_stuck_pending_reaper: failed to count sheltered parents"
+                );
+            }
+        }
 
         if candidates.is_empty() {
             return;
@@ -665,6 +766,27 @@ impl TaskEngine {
 
         for candidate in candidates {
             let system_session = format!("system-{}", self.db.agent_id());
+
+            // AC4 (mika#2181) — read the inventory ONCE, before the decision, so
+            // both terminal events carry the statuses that produced the verdict.
+            // The reaper is the component that judged "absent" via its query, so
+            // it is the reaper's event that must show what it saw. A failed read
+            // degrades the audit, never the repair.
+            let wrappers_seen = match self
+                .db
+                .summarize_deferred_wrappers_of_parent(&candidate.id)
+                .await
+            {
+                Ok(w) => crate::db::DeferredWrapperSummary::render(&w),
+                Err(e) => {
+                    warn!(
+                        task_id = %candidate.id,
+                        error = %e,
+                        "task_engine_stuck_pending_reaper: failed to inventory deferred wrappers"
+                    );
+                    "wrappers:unavailable".to_string()
+                }
+            };
 
             let action_config = match self
                 .db
@@ -719,6 +841,7 @@ impl TaskEngine {
                     issue = %candidate.reference_url,
                     age_seconds = candidate.age_seconds,
                     previous_rearm_count = candidate.rearm_count,
+                    wrappers_seen = %wrappers_seen,
                     "orphaned pending task re-armed instead of expired"
                 );
                 if let Err(e) = self
@@ -730,8 +853,11 @@ impl TaskEngine {
                         Some("pending"),
                         Some("pending"),
                         Some(&format!(
-                            "issue:{} age_seconds:{} rearm_count:{}",
-                            candidate.reference_url, candidate.age_seconds, candidate.rearm_count
+                            "issue:{} age_seconds:{} rearm_count:{} {}",
+                            candidate.reference_url,
+                            candidate.age_seconds,
+                            candidate.rearm_count,
+                            wrappers_seen
                         )),
                         None,
                     )
@@ -780,6 +906,7 @@ impl TaskEngine {
                         issue = %candidate.reference_url,
                         age_seconds = candidate.age_seconds,
                         rearm_count = candidate.rearm_count,
+                        wrappers_seen = %wrappers_seen,
                         "orphaned pending task expired — slot freed for the ready sweep"
                     );
                     if let Err(e) = self
@@ -791,10 +918,11 @@ impl TaskEngine {
                             Some("pending"),
                             Some("failed"),
                             Some(&format!(
-                                "issue:{} age_seconds:{} rearm_count:{}",
+                                "issue:{} age_seconds:{} rearm_count:{} {}",
                                 candidate.reference_url,
                                 candidate.age_seconds,
-                                candidate.rearm_count
+                                candidate.rearm_count,
+                                wrappers_seen
                             )),
                             None,
                         )
@@ -2550,6 +2678,38 @@ pub fn stuck_pending_reaper_grace_secs() -> i64 {
     )
 }
 
+/// Pure parse of the promoted-wrapper liveness window (mika#2181). Same shape as
+/// [`parse_stuck_pending_reaper_grace`]: absent, empty, unparseable, or
+/// non-positive falls back to the default with a WARN — plus an upper clamp the
+/// sibling does not need (see [`PROMOTED_WRAPPER_LIVENESS_MAX_SECS`]).
+fn parse_promoted_wrapper_liveness(raw: Option<&str>) -> i64 {
+    match raw {
+        Some(v) if !v.trim().is_empty() => match v.trim().parse::<i64>() {
+            Ok(secs) if secs > 0 && secs <= PROMOTED_WRAPPER_LIVENESS_MAX_SECS => secs,
+            _ => {
+                warn!(
+                    env = PROMOTED_WRAPPER_LIVENESS_ENV,
+                    value = %v,
+                    default = PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS,
+                    "invalid promoted-wrapper liveness value; falling back to default"
+                );
+                PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS
+            }
+        },
+        _ => PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS,
+    }
+}
+
+/// Resolve the promoted-wrapper liveness window (mika#2181).
+///
+/// `pub` for the same reason as [`stuck_pending_reaper_grace_secs`]: the
+/// `mika tasks stuck` probe must report on exactly the population the reaper
+/// sees. A probe that kept the narrow predicate would show parents the reaper
+/// deliberately leaves alone — a probe that lies.
+pub fn promoted_wrapper_liveness_secs() -> i64 {
+    parse_promoted_wrapper_liveness(std::env::var(PROMOTED_WRAPPER_LIVENESS_ENV).ok().as_deref())
+}
+
 /// Rebuild the deferred-dispatch `action_config` for a parent that never had a
 /// wrapper to copy (mika#2045).
 ///
@@ -3633,6 +3793,321 @@ mod tests {
         let parent = db.get_task(&parent_id).await.unwrap().unwrap();
         assert_eq!(parent.status, "pending");
         assert!(wrappers_of(&db, &parent_id).await.is_empty());
+    }
+
+    // -- mika#2181: a promoted wrapper is live, and the audit says what was seen --
+
+    /// Attach a deferred wrapper in the given status, optionally dating its
+    /// `completed_at` `offset_secs` into the past (mika#2181).
+    async fn seed_wrapper_with_status(
+        db: &AsyncDatabase,
+        parent_id: &str,
+        status: &str,
+        completed_at_offset_secs: Option<i64>,
+    ) -> String {
+        let wrapper = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.to_string()),
+            depth: 1,
+            label: crate::agent::DEFERRED_DISPATCH_LABEL.to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        let id = db.create_task(wrapper).await.unwrap();
+        let (i, st, off) = (id.clone(), status.to_string(), completed_at_offset_secs);
+        db.with_db(move |d| {
+            d.conn.execute(
+                "UPDATE tasks SET status = ?2 WHERE id = ?1",
+                rusqlite::params![i, st],
+            )?;
+            if let Some(off) = off {
+                d.conn.execute(
+                    "UPDATE tasks SET completed_at =
+                            strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+                     WHERE id = ?1",
+                    rusqlite::params![i, format!("-{off} seconds")],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn reaper_audit_details(
+        db: &AsyncDatabase,
+        tool_name: &'static str,
+        parent_id: &str,
+    ) -> Vec<String> {
+        let target = format!("task:{parent_id}");
+        db.with_db(move |inner| {
+            inner.list_audit_events_paginated("mika", Some(tool_name), Some(&target), 10, 0)
+        })
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| e.reasoning)
+        .collect()
+    }
+
+    /// The db-level test proves the predicate; this one proves the reaper
+    /// actually consumes the corrected predicate (mika#2181).
+    ///
+    /// The wrapper was promoted at this very tick — `completed`, `completed_at`
+    /// now, never `delivered`. Before the fix the reaper called the parent
+    /// unrepresented and re-armed it; two ticks later a healthy parent was
+    /// `failed`, two minutes before its turn answered.
+    #[tokio::test]
+    async fn test_reaper_leaves_parent_alone_when_wrapper_was_just_promoted() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2158, 11_455).await;
+        // Promote through the REAL code path rather than hand-writing
+        // `completed`: this is what pins the `completed_at` format contract
+        // between the writer (promotion) and the reader (the reaper's clause).
+        // A fixture that writes the timestamp itself tests the fixture.
+        let wrapper_id = seed_wrapper_with_status(&db, &parent_id, "pending", None).await;
+        let promoted = db
+            .with_db(move |d| d.promote_next_deferred_callback_for_class("mika", "implement"))
+            .await
+            .unwrap();
+        assert_eq!(promoted.as_deref(), Some(wrapper_id.as_str()));
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        let parent = db.get_task(&parent_id).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "pending",
+            "the turn the promoted wrapper feeds has not answered yet"
+        );
+        assert_eq!(
+            db.get_stuck_rearm_count(&parent_id).await.unwrap(),
+            0,
+            "no repair budget may be spent on a parent that is not orphaned"
+        );
+        assert!(
+            reaper_audit_details(&db, "stuck_pending_task_rearmed", &parent_id)
+                .await
+                .is_empty()
+        );
+        let wrappers = wrappers_of(&db, &parent_id).await;
+        assert_eq!(wrappers.len(), 1, "no replacement wrapper was registered");
+        assert_eq!(wrappers[0].id, wrapper_id);
+    }
+
+    /// Past the liveness window the promoted wrapper is a corpse, not a shield:
+    /// the reaper must still repair (mika#2181). This is the guard that keeps the
+    /// bound from drifting to infinity in a later refactor.
+    #[tokio::test]
+    async fn test_reaper_repairs_when_promoted_wrapper_is_stale() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2158, 11_455).await;
+        seed_wrapper_with_status(&db, &parent_id, "completed", Some(3000)).await;
+
+        // 3000 s must exceed the liveness window for this test to mean anything.
+        // The reaper reads the window from the process environment, so an
+        // operator with MIKA_PROMOTED_WRAPPER_LIVENESS_SECS exported would
+        // otherwise turn this into a silent false pass.
+        assert!(
+            promoted_wrapper_liveness_secs() < 3000,
+            "test presumes a liveness window under 3000 s; \
+             MIKA_PROMOTED_WRAPPER_LIVENESS_SECS is set to {}",
+            promoted_wrapper_liveness_secs()
+        );
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        assert_eq!(db.get_stuck_rearm_count(&parent_id).await.unwrap(), 1);
+        let wrappers = wrappers_of(&db, &parent_id).await;
+        assert!(
+            wrappers.iter().any(|w| w.status == "pending"),
+            "the repair's actual product is a fresh pending wrapper"
+        );
+    }
+
+    /// The shelter is silent by construction — it lives inside a SQL
+    /// `NOT EXISTS`, so a spared parent never becomes a candidate (mika#2181).
+    /// Without this event, "acted on nobody" and "holding work back" read
+    /// identically. The case that matters is exactly this one: zero candidates,
+    /// non-empty shelter.
+    #[tokio::test]
+    async fn test_reaper_counts_parents_it_sheltered() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let sheltered = seed_pending_issue_parent(&db, 2158, 11_455).await;
+        seed_wrapper_with_status(&db, &sheltered, "completed", Some(0)).await;
+        // Ordinary queueing is NOT the new shelter and must not be counted.
+        let queued = seed_pending_issue_parent(&db, 2159, 11_455).await;
+        seed_wrapper_with_status(&db, &queued, "pending", None).await;
+
+        let grace = stuck_pending_reaper_grace_secs();
+        let liveness = promoted_wrapper_liveness_secs();
+        let names = db
+            .find_parents_sheltered_by_promoted_wrapper(grace, liveness)
+            .await
+            .unwrap();
+        assert_eq!(
+            names,
+            vec!["https://github.com/senara-solutions/mika/issues/2158".to_string()],
+            "only the promoted-wrapper shelter counts; plain queueing does not"
+        );
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        // And the sheltered parent is genuinely untouched.
+        let parent = db.get_task(&sheltered).await.unwrap().unwrap();
+        assert_eq!(parent.status, "pending");
+        assert_eq!(db.get_stuck_rearm_count(&sheltered).await.unwrap(), 0);
+    }
+
+    /// AC4 (mika#2181): the re-arm event names which wrappers the reaper saw and
+    /// what statuses produced the "absent" verdict.
+    #[tokio::test]
+    async fn test_stuck_pending_rearm_audit_names_the_wrappers_seen() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2158, 11_455).await;
+        // Two distinct statuses, neither live: the parent IS orphaned, and the
+        // audit must show exactly why.
+        let spent = seed_wrapper_with_status(&db, &parent_id, "delivered", Some(0)).await;
+        let dead = seed_wrapper_with_status(&db, &parent_id, "cancelled", Some(60)).await;
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        let details = reaper_audit_details(&db, "stuck_pending_task_rearmed", &parent_id).await;
+        assert_eq!(details.len(), 1, "one re-arm, one audit row");
+        let d = &details[0];
+        assert!(d.contains(&spent[..8]), "missing the spent wrapper: {d}");
+        assert!(d.contains(&dead[..8]), "missing the dead wrapper: {d}");
+        assert!(d.contains("delivered@"), "missing its status: {d}");
+        assert!(d.contains("cancelled@"), "missing its status: {d}");
+    }
+
+    /// AC4, the empty rendering: a parent that never had a wrapper says so.
+    #[tokio::test]
+    async fn test_stuck_pending_rearm_audit_renders_wrappers_none() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2158, 11_455).await;
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        let details = reaper_audit_details(&db, "stuck_pending_task_rearmed", &parent_id).await;
+        assert_eq!(details.len(), 1);
+        assert!(
+            details[0].contains("wrappers:none"),
+            "an absent inventory must be stated, not omitted: {}",
+            details[0]
+        );
+    }
+
+    /// AC4 on the other terminal event: expiry ends the battle and reads even
+    /// worse than a re-arm, so it carries the same inventory.
+    #[tokio::test]
+    async fn test_stuck_pending_expiry_audit_names_the_wrappers_seen() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2158, 11_455).await;
+        let spent = seed_wrapper_with_status(&db, &parent_id, "delivered", Some(0)).await;
+        for _ in 0..crate::skills::executor::MAX_STUCK_REARMS {
+            db.increment_stuck_rearm_count(&parent_id).await.unwrap();
+        }
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        let parent = db.get_task(&parent_id).await.unwrap().unwrap();
+        assert_eq!(parent.status, "failed");
+        let details = reaper_audit_details(&db, "stuck_pending_task_expired", &parent_id).await;
+        assert_eq!(details.len(), 1);
+        assert!(details[0].contains(&spent[..8]), "got: {}", details[0]);
+        assert!(details[0].contains("delivered@"), "got: {}", details[0]);
+    }
+
+    #[test]
+    fn test_parse_promoted_wrapper_liveness() {
+        assert_eq!(
+            parse_promoted_wrapper_liveness(None),
+            PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_promoted_wrapper_liveness(Some("  ")),
+            PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS
+        );
+        assert_eq!(parse_promoted_wrapper_liveness(Some("60")), 60);
+        assert_eq!(
+            parse_promoted_wrapper_liveness(Some("0")),
+            PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_promoted_wrapper_liveness(Some("-1")),
+            PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_promoted_wrapper_liveness(Some("nonsense")),
+            PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS
+        );
+        // The upper clamp is not tidiness. SQLite returns NULL for an
+        // out-of-range strftime modifier, and `x > NULL` is NULL, so an absurd
+        // override makes the `completed` arm unsatisfiable and silently restores
+        // the mika#2181 predicate. A knob that reverts the fix without a word
+        // must fail closed.
+        assert_eq!(
+            parse_promoted_wrapper_liveness(Some(
+                &(PROMOTED_WRAPPER_LIVENESS_MAX_SECS + 1).to_string()
+            )),
+            PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_promoted_wrapper_liveness(Some(&i64::MAX.to_string())),
+            PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_promoted_wrapper_liveness(Some(&PROMOTED_WRAPPER_LIVENESS_MAX_SECS.to_string())),
+            PROMOTED_WRAPPER_LIVENESS_MAX_SECS,
+            "the clamp boundary itself is accepted"
+        );
+    }
+
+    /// The two windows default equal on purpose (mika#2181): one promotion
+    /// cannot hide a parent for longer than the grace took to call it stuck.
+    /// They remain separate constants so they can diverge under their env vars —
+    /// this pins the default relationship, not the freedom.
+    #[test]
+    fn test_liveness_default_matches_stuck_grace_default() {
+        assert_eq!(
+            PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS,
+            STUCK_PENDING_REAPER_GRACE_DEFAULT_SECS
+        );
     }
 
     #[test]

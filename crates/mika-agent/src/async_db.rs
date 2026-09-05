@@ -1096,13 +1096,20 @@ impl AsyncDatabase {
             .await
     }
 
-    /// True when the parent still has a `pending` deferred wrapper representing
-    /// it (mika#2045). See [`Database::has_pending_deferred_wrapper_child`].
-    pub async fn has_pending_deferred_wrapper_child(&self, parent_task_id: &str) -> Result<bool> {
+    /// True when the parent still has a **live** deferred wrapper representing
+    /// it — `pending`, or promoted inside the liveness window (mika#2045,
+    /// mika#2181). See [`Database::has_live_deferred_wrapper_child`].
+    pub async fn has_live_deferred_wrapper_child(
+        &self,
+        parent_task_id: &str,
+        promoted_liveness_seconds: i64,
+    ) -> Result<bool> {
         let a = self.agent_id.clone();
         let p = parent_task_id.to_owned();
-        self.with_db(move |db| db.has_pending_deferred_wrapper_child(&a, &p))
-            .await
+        self.with_db(move |db| {
+            db.has_live_deferred_wrapper_child(&a, &p, promoted_liveness_seconds)
+        })
+        .await
     }
 
     /// Find `pending` self_dev issue parents that no callback child represents
@@ -1110,10 +1117,13 @@ impl AsyncDatabase {
     pub async fn find_orphaned_pending_issue_tasks(
         &self,
         grace_seconds: i64,
+        promoted_liveness_seconds: i64,
     ) -> Result<Vec<crate::db::OrphanedPendingTask>> {
         let a = self.agent_id.clone();
-        self.with_db(move |db| db.find_orphaned_pending_issue_tasks(&a, grace_seconds))
-            .await
+        self.with_db(move |db| {
+            db.find_orphaned_pending_issue_tasks(&a, grace_seconds, promoted_liveness_seconds)
+        })
+        .await
     }
 
     /// Read `metadata.stuck_rearm_count` (mika#2045).
@@ -1128,6 +1138,36 @@ impl AsyncDatabase {
     pub async fn increment_stuck_rearm_count(&self, task_id: &str) -> Result<i64> {
         let t = task_id.to_owned();
         self.with_db(move |db| db.increment_stuck_rearm_count(&t))
+            .await
+    }
+
+    /// Parents the reaper is sheltering only because a promoted wrapper is still
+    /// live (mika#2181). See [`Database::find_parents_sheltered_by_promoted_wrapper`].
+    pub async fn find_parents_sheltered_by_promoted_wrapper(
+        &self,
+        grace_seconds: i64,
+        promoted_liveness_seconds: i64,
+    ) -> Result<Vec<String>> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| {
+            db.find_parents_sheltered_by_promoted_wrapper(
+                &a,
+                grace_seconds,
+                promoted_liveness_seconds,
+            )
+        })
+        .await
+    }
+
+    /// Every deferred wrapper of a parent, oldest first (mika#2181 AC4).
+    /// See [`Database::summarize_deferred_wrappers_of_parent`].
+    pub async fn summarize_deferred_wrappers_of_parent(
+        &self,
+        parent_task_id: &str,
+    ) -> Result<Vec<crate::db::DeferredWrapperSummary>> {
+        let a = self.agent_id.clone();
+        let p = parent_task_id.to_owned();
+        self.with_db(move |db| db.summarize_deferred_wrappers_of_parent(&a, &p))
             .await
     }
 
