@@ -4,13 +4,11 @@
 // files, creating shared-mutable-state bugs. All skill output goes to stdout/stderr.
 
 use std::path::PathBuf;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
 use base64::Engine;
-use regex::Regex;
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
@@ -993,54 +991,21 @@ fn extract_skill_from_input(input: &serde_json::Value) -> Option<&str> {
 /// contiguous substring. `docs/plans/` is the essential anchoring directory
 /// prefix.
 ///
-/// The groomed-verdict check accepts the canonical `second-pass (GROOMED)`,
-/// the spec-tolerated paraphrase `second-pass (READY, paraphrased GROOMED`,
-/// and parameterized/annotated variants like `second-pass (GROOMED, session ...)`
-/// or `second-pass (GROOMED — session-id: ...)` (#1725). The grooming spec's
-/// Phase 5 and orchestrator-manual verdict-landing both routinely emit
-/// parameterized forms; the gate must accept everything the spec authorizes.
+/// # Le marqueur de verdict n'est plus lu ici (mika#2158)
 ///
-/// # Regex shape
+/// Cette fonction portait trois regex locales — `GROOMED_VERDICT_RE` (#1725),
+/// `PARAPHRASED_GROOMED_RE` (#1725) et `SINGLE_PASS_GROOMED_RE` (mika#2012). Elles ont été
+/// supprimées et leur logique absorbée par [`crate::grooming_marker`], qui est désormais la
+/// seule lecture du marqueur de verdict du dépôt. Les trois formes qu'elles reconnaissaient
+/// sont couvertes par le nouveau prédicat et gardées par un test nommé.
 ///
-/// `second-pass \(GROOMED[\s\)\.,;:—-]` — the character class after `GROOMED` is
-/// the structural discriminator. It matches:
-/// - `)` (canonical strict form: `second-pass (GROOMED)`)
-/// - `,` (parameter: `second-pass (GROOMED, session abc)`)
-/// - `.` (terminator: `second-pass (GROOMED. Full ratification.)`)
-/// - `;` `:` (annotators)
-/// - `—` `-` (dash-separated annotation: `second-pass (GROOMED — session-id: uuid)`)
-/// - whitespace (any word-boundary follow-on)
+/// La divergence que cela ferme était mesurable : `auto_pull::is_groomed` portait une copie
+/// de la seule première regex et n'a jamais suivi les deux ajouts suivants, donc la
+/// promotion et le routage du dispatch répondaient différemment à la même question.
 ///
-/// Anchoring to the `second-pass (` prefix + a delimiter after `GROOMED`
-/// structurally distinguishes the verdict-line callout from prose like
-/// "the ticket was GROOMED yesterday" or "GROOMED status pending".
-static GROOMED_VERDICT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"second-pass \(GROOMED[\s\)\.,;:—-]").expect("groomed verdict regex must compile")
-});
-static PARAPHRASED_GROOMED_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"second-pass \(READY, paraphrased GROOMED")
-        .expect("paraphrased groomed regex must compile")
-});
-/// Single-pass grooming verdict (mika#2012).
-///
-/// The first-pass READY disposition is a legitimate grooming exit — see
-/// `/mika-groom-ticket` Phase 3 step 10: "Disposition: READY — plan is sound.
-/// Commit the staged plan […] and skip to Phase 5". No second pass runs, so the
-/// body must not claim one; `write_canonical_callout`'s `ready-single-pass`
-/// stage emits this truthful marker instead.
-///
-/// Before mika#2012 this shape had no stage and no regex: a ticket groomed in
-/// one pass stayed permanently invisible to the dispatch gate, was re-dispatched
-/// as `dev-groom`, re-groomed, and looped — 25 measured requeues across 5
-/// tickets in 13 h, producing 6 branches containing only markdown plans.
-///
-/// Anchored on the `first-pass (` prefix for the same reason as
-/// `GROOMED_VERDICT_RE`: it distinguishes the verdict-line callout from prose.
-static SINGLE_PASS_GROOMED_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"first-pass \(READY, single-pass GROOMED")
-        .expect("single-pass groomed regex must compile")
-});
-
+/// Les deux conditions `Branch`/`Plan` restent ici et divergent délibérément de celles
+/// d'`auto_pull` (préfixe de dépôt) — leur unification est le correctif de mika#2120, sous
+/// arbitrage opérateur.
 pub fn check_grooming_markers(issue_body: &str) -> Vec<&'static str> {
     let mut missing = Vec::new();
     if !issue_body.contains("> - **Branch:**") {
@@ -1049,10 +1014,7 @@ pub fn check_grooming_markers(issue_body: &str) -> Vec<&'static str> {
     if !issue_body.contains("docs/plans/") {
         missing.push("plan_callout");
     }
-    let has_groomed_marker = GROOMED_VERDICT_RE.is_match(issue_body)
-        || PARAPHRASED_GROOMED_RE.is_match(issue_body)
-        || SINGLE_PASS_GROOMED_RE.is_match(issue_body);
-    if !has_groomed_marker {
+    if !crate::grooming_marker::has_groomed_verdict(issue_body) {
         missing.push("groomed_verdict");
     }
     missing
@@ -7657,20 +7619,26 @@ GROOMED status pending in another ticket.
         );
     }
 
-    /// False-positive guard: `first-pass (GROOMED)` — the `second-pass (`
-    /// prefix requirement blocks this; first-pass verdict is READY/ITERATE/ESCALATE.
+    /// **Inversé par mika#2158.** Ce test exigeait auparavant que
+    /// `first-pass (GROOMED)` soit refusé, au motif que seul `second-pass (` pouvait
+    /// précéder un verdict.
+    ///
+    /// Ce motif est précisément celui que mika#2158 supprime : le producteur qui précède
+    /// `GROOMED` ne décide plus rien, parce que l'AC3 exige de reconnaître
+    /// `… (ESCALATE …) → arbitrage → mika-arch (GROOMED)`, où le producteur n'est aucune
+    /// passe. Un prédicat qui accepte `mika-arch (GROOMED)` et refuse
+    /// `first-pass (GROOMED)` mesurerait à nouveau une formulation.
     #[test]
-    fn test_grooming_markers_rejects_first_pass_groomed() {
+    fn test_grooming_markers_accepts_groomed_from_any_producer() {
         let body = r#"
 > - **Branch:** `feat/something`
 > - **Plan:** `docs/plans/some-plan.md`
-> - **Grooming history:** first-pass (GROOMED) — no second-pass, invalid
+> - **Grooming history:** first-pass (GROOMED) — verdict rendu dès la première passe
 "#;
         let missing = check_grooming_markers(body);
-        assert_eq!(
-            missing,
-            vec!["groomed_verdict"],
-            "first-pass (GROOMED) without second-pass must not match"
+        assert!(
+            missing.is_empty(),
+            "un GROOMED est un GROOMED quel que soit le producteur (mika#2158 AC3), got: {missing:?}"
         );
     }
 
@@ -7741,24 +7709,36 @@ GROOMED status pending in another ticket.
         );
     }
 
-    /// Load-bearing false-positive guard: a **bare** `first-pass (READY)` must
-    /// still fail. It is the disposition the architect emits mid-grooming,
-    /// before `write_canonical_callout` has committed the plan and stamped the
-    /// callout — accepting it would dispatch tickets whose plan is not on the
-    /// branch. Only the explicit `single-pass GROOMED` annotation, which only
-    /// the writer emits, closes the gate.
+    /// **Inversé par mika#2158 (AC1), et l'objection d'origine est conservée ici parce
+    /// qu'elle est réelle.**
+    ///
+    /// Ce test exigeait qu'un `first-pass (READY)` nu échoue, au motif que c'est la
+    /// disposition que l'architecte émet *au milieu* du grooming, avant que
+    /// `write_canonical_callout` ait committé le plan — l'accepter dispatcherait un ticket
+    /// dont le plan n'est pas sur la branche.
+    ///
+    /// L'objection est fondée mais elle vise le mauvais garde-fou. Elle demandait au
+    /// prédicat de prose de deviner si un fichier existe sur une branche ; c'est
+    /// `_committed_plan_on_branch` (`_shared/dispatch-lib.sh`) qui mesure cet artefact, et
+    /// il est déjà le garde du dispatch. Le coût de l'ancienne position était mesuré :
+    /// #2108 porte `first-pass (READY) → aucune révision requise` — le chemin que
+    /// `/mika-groom-ticket` phase 3 étape 10 **prescrit** quand le plan est sain du premier
+    /// coup — et restait invisible, re-dispatché en grooming toutes les dix minutes.
+    ///
+    /// Ce qui protège encore ici : la condition `Plan`/`Branch` de cette même fonction, et
+    /// le fait qu'une marque de seconde passe désarme la règle AC1 (voir
+    /// `grooming_marker::grooming_verdict`).
     #[test]
-    fn test_grooming_markers_rejects_bare_first_pass_ready() {
+    fn test_grooming_markers_accepts_bare_first_pass_ready() {
         let body = r#"
 > - **Branch:** `feat/something`
 > - **Plan:** `docs/plans/some-plan.md`
-> - **Grooming history:** first-pass (READY) — awaiting second pass
+> - **Grooming history:** first-pass (READY) — aucune révision requise
 "#;
         let missing = check_grooming_markers(body);
-        assert_eq!(
-            missing,
-            vec!["groomed_verdict"],
-            "bare first-pass (READY) must not satisfy the verdict signal"
+        assert!(
+            missing.is_empty(),
+            "le chemin prescrit première-passe-READY doit passer (mika#2158 AC1), got: {missing:?}"
         );
     }
 

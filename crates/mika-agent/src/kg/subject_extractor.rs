@@ -1984,7 +1984,12 @@ impl LlmResponseExt for mika_common::llm::LlmResponse {
 ///
 /// Returns `Some(&str)` borrowing the balanced substring, or `None` if no
 /// balanced object is found. Does NOT allocate.
-fn extract_first_json_object(text: &str) -> Option<&str> {
+///
+/// `pub(crate)` since mika#2158: `task_engine::dispatcher` needs the same
+/// prose-tolerant extraction to read a `dispatch-lib` refusal envelope out of a
+/// callback body. A second, weaker copy there (first `{` .. last `}`) is exactly
+/// the two-implementations-of-one-predicate class that ticket closes.
+pub(crate) fn extract_first_json_object(text: &str) -> Option<&str> {
     let bytes = text.as_bytes();
     let mut start = None;
     let mut depth: i32 = 0;

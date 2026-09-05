@@ -368,17 +368,20 @@ pub struct Issue {
 /// > - **Plan:** `docs/plans/<file>.md` (committed on branch @ <sha>)
 /// > - **Grooming history:** <...> → second-pass (GROOMED) — session-id: <uuid>
 /// ```
+///
+/// # Le marqueur de verdict n'est plus lu ici (mika#2158)
+///
+/// Cette fonction portait sa propre regex, commentée *« Mirrors GROOMED_VERDICT_RE in
+/// skills/executor.rs »* — une copie qui n'a jamais suivi les deux élargissements
+/// ultérieurs de l'original, et qui a fait diverger la **promotion** (ici) du **routage**
+/// du dispatch (`executor::check_grooming_markers`) pendant des mois. La lecture du
+/// marqueur vit désormais dans [`crate::grooming_marker`], seule et unique ; une regex de
+/// marqueur de passe recréée ici fait échouer la garde structurelle de ce module.
+///
+/// Les deux conditions `Branch`/`Plan` restent ici, délibérément : leur unification est le
+/// correctif de mika#2120, sous arbitrage opérateur.
 pub fn is_groomed(body: &str) -> bool {
-    static GROOMING_HISTORY_RE: OnceLock<Regex> = OnceLock::new();
-    let re = GROOMING_HISTORY_RE.get_or_init(|| {
-        // Mirrors GROOMED_VERDICT_RE in skills/executor.rs (#1725): accept the
-        // canonical strict form AND parameterized/annotated variants like
-        // `second-pass (GROOMED, session abc)` or `— session-id: uuid`.
-        // The character class after `GROOMED` is the structural discriminator.
-        Regex::new(r"(?m)^> - \*\*Grooming history:\*\*.+second-pass \(GROOMED[\s\)\.,;:—-]")
-            .expect("grooming history regex must compile")
-    });
-    re.is_match(body)
+    crate::grooming_marker::has_groomed_verdict(body)
         && body.contains("> - **Branch:** `")
         && body.contains("> - **Plan:** `docs/plans/")
 }
@@ -1106,15 +1109,41 @@ fn classify_stuck_ready(
         return verdict;
     }
 
-    // Progress: an open PR or a live dispatch means the re-drives worked. Both
-    // are already-computed filters, so the reset costs nothing extra (KTD5).
+    // Progress: an open PR means the re-drives worked. It is an already-computed
+    // filter, so the reset costs nothing extra (KTD5).
+    //
+    // A PR is **observable and external**: the dispatch cannot fabricate one. That is
+    // now the whole criterion, and it is why `in_flight` no longer resets below.
     if facts.has_open_pr {
         return StuckReadyVerdict::SkipAndResetBudget {
             reason: "open_pr_closing",
         };
     }
+    // A live dispatch is NOT progress (mika#2158 M6b — correction of a premise).
+    //
+    // This branch used to reset the budget too, justified by « an open PR or a live
+    // dispatch means the re-drives worked ». The second half of that sentence was
+    // measured false. A dispatch that is alive has not worked; it has merely started —
+    // and until mika#2158 the canonical outcome for these tickets was that it started,
+    // refused `already_groomed`, and left its tracking row to age ~60 min into
+    // `phantom_aged_out` without producing anything.
+    //
+    // For those ~60 min the ticket read `in_flight`, so every Phase 2 tick landed here
+    // and zeroed the counter. The budget did not bound the loop: the loop erased the
+    // budget. Measured on `~/.mika/data/mika.db` 2026-09-03 — after 31 re-drives on
+    // mika#1901's sibling #1772, `redrive_count` said 1, and `MAX_REDRIVES_DEFAULT` (3)
+    // had never once been reached. The guard was not too loose; it was unreachable.
+    //
+    // We still skip — waiting for a live dispatch to finish is right. We just stop
+    // calling the wait a success. With the counter now able to advance, a ticket that
+    // produces no PR is abandoned to the operator after `MAX_REDRIVES` rounds instead of
+    // turning forever; #1772 would have stopped at the third, not the thirty-first.
+    //
+    // If three rounds proves too tight for genuinely long work, the lever is
+    // `MIKA_AUTO_PULL_MAX_REDRIVES` (already an env var). It is not the return of this
+    // reset — a counter zeroed by the action it counts bounds nothing.
     if facts.in_flight {
-        return StuckReadyVerdict::SkipAndResetBudget {
+        return StuckReadyVerdict::Skip {
             reason: "in_flight_self_dev",
         };
     }
@@ -3324,15 +3353,107 @@ Some description of the issue.
         assert!(!is_groomed(body));
     }
 
+    /// **Inversé par mika#2158 (AC1).** Une première passe `READY` sans seconde passe est
+    /// le chemin que `/mika-groom-ticket` phase 3 étape 10 prescrit quand le plan est sain
+    /// du premier coup. L'exigence d'une seconde passe punissait le grooming réussi ;
+    /// #2108 en portait la forme et tournait en boucle. Voir
+    /// `skills::executor::tests::test_grooming_markers_accepts_bare_first_pass_ready`
+    /// pour l'objection d'origine et où vit désormais le garde-fou qu'elle visait.
     #[test]
-    fn test_is_groomed_only_first_pass() {
+    fn test_is_groomed_first_pass_ready_single_pass() {
         let body = r#"## Description
 
 > - **Branch:** `feat/123/some-feature`
 > - **Plan:** `docs/plans/2026-06-01-001-some-plan.md` (committed on branch @ abc1234)
 > - **Grooming history:** first-pass (READY) — session-id: 550e8400
 "#;
-        assert!(!is_groomed(body), "first-pass only should not be groomed");
+        assert!(
+            is_groomed(body),
+            "single-pass READY is the prescribed grooming exit (mika#2158 AC1)"
+        );
+    }
+
+    /// Non-régression AC4 — la marque d'une seconde passe désarme la règle AC1 : le corps
+    /// annonce lui-même un verdict de seconde passe, et ce verdict n'en est pas un.
+    #[test]
+    fn test_is_groomed_first_pass_ready_with_broken_second_pass_rejected() {
+        let body = r#"## Description
+
+> - **Branch:** `feat/123/some-feature`
+> - **Plan:** `docs/plans/2026-06-01-001-some-plan.md` (committed on branch @ abc1234)
+> - **Grooming history:** first-pass (READY) → second-pass (GROOMEDLY) — pas une forme réelle
+"#;
+        assert!(
+            !is_groomed(body),
+            "a claimed second pass with an unreadable verdict must not ride on the first pass"
+        );
+    }
+
+    /// Non-régression AC4 — `ITERATE` seul prescrit une seconde passe qui n'a pas eu lieu.
+    #[test]
+    fn test_is_groomed_iterate_alone_rejected() {
+        let body = r#"## Description
+
+> - **Branch:** `feat/123/some-feature`
+> - **Plan:** `docs/plans/2026-06-01-001-some-plan.md` (committed on branch @ abc1234)
+> - **Grooming history:** mika-arch first-pass (ITERATE) — révision demandée
+"#;
+        assert!(!is_groomed(body), "ITERATE alone must not be groomed");
+    }
+
+    /// AC2 — la variante française est reconnue au même titre que l'anglaise (#1772).
+    #[test]
+    fn test_is_groomed_french_seconde_passe() {
+        let body = r#"## Description
+
+> - **Branch:** `feat/123/some-feature`
+> - **Plan:** `docs/plans/2026-06-01-001-some-plan.md` (committed on branch @ abc1234)
+> - **Grooming history:** mika-arch première passe (ITERATE) → mika-arch seconde passe (GROOMED, session abc)
+"#;
+        assert!(
+            is_groomed(body),
+            "French `seconde passe (GROOMED` must match"
+        );
+    }
+
+    /// AC3 — un `GROOMED` rendu après un `ESCALATE` de seconde passe et son arbitrage
+    /// (#2127), et la symétrie : l'ordre compte dans les deux sens.
+    #[test]
+    fn test_is_groomed_last_verdict_wins_both_directions() {
+        let escalate_then_groomed = r#"## Description
+
+> - **Branch:** `feat/123/some-feature`
+> - **Plan:** `docs/plans/2026-06-01-001-some-plan.md` (committed on branch @ abc1234)
+> - **Grooming history:** mika-arch second-pass (ESCALATE, périmètre) → arbitrage rendu → mika-arch (GROOMED) — session abc
+"#;
+        assert!(
+            is_groomed(escalate_then_groomed),
+            "a GROOMED rendered after arbitration is the final state (AC3)"
+        );
+
+        let groomed_then_escalate = r#"## Description
+
+> - **Branch:** `feat/123/some-feature`
+> - **Plan:** `docs/plans/2026-06-01-001-some-plan.md` (committed on branch @ abc1234)
+> - **Grooming history:** second-pass (GROOMED) → revue de périmètre → mika-arch (ESCALATE)
+"#;
+        assert!(
+            !is_groomed(groomed_then_escalate),
+            "a later ESCALATE reopens the ticket (AC4)"
+        );
+    }
+
+    /// AC5 — les six corps figés, mesurés à travers `is_groomed` (donc conditions
+    /// `Branch`/`Plan` comprises), pas seulement à travers le prédicat de verdict.
+    #[test]
+    fn test_is_groomed_six_frozen_bodies() {
+        for (ticket, body, expected) in crate::grooming_marker::tests::FIXTURES {
+            assert_eq!(
+                is_groomed(body),
+                *expected,
+                "fixture #{ticket}: is_groomed doit rendre {expected}"
+            );
+        }
     }
 
     #[test]
@@ -3413,19 +3534,22 @@ This ticket has been GROOMED and is ready.
         );
     }
 
+    /// **Inversé par mika#2158 (AC3).** Le jumeau de
+    /// `skills::executor::tests::test_grooming_markers_accepts_groomed_from_any_producer` :
+    /// l'exigence du préfixe `second-pass (` est précisément ce que ce ticket supprime,
+    /// puisque l'AC3 demande de reconnaître `… → mika-arch (GROOMED)`, où le producteur
+    /// n'est aucune passe.
     #[test]
-    fn test_is_groomed_first_pass_groomed_rejected() {
-        // Ensure the `second-pass (` prefix requirement blocks `first-pass (GROOMED)`
-        // which is not a valid ratification signal (first-pass is READY/ITERATE/ESCALATE).
+    fn test_is_groomed_groomed_from_any_producer() {
         let body = r#"## Description
 
 > - **Branch:** `feat/123/some-feature`
 > - **Plan:** `docs/plans/2026-07-04-001-fix-plan.md` (committed on branch @ abc1234)
-> - **Grooming history:** first-pass (GROOMED) — no second-pass line
+> - **Grooming history:** first-pass (GROOMED) — verdict rendu dès la première passe
 "#;
         assert!(
-            !is_groomed(body),
-            "first-pass (GROOMED) without second-pass must not match"
+            is_groomed(body),
+            "a GROOMED is a GROOMED whichever producer precedes it (mika#2158 AC3)"
         );
     }
 
@@ -4210,7 +4334,7 @@ This ticket has been GROOMED and is ready.
     }
 
     #[test]
-    fn test_classify_progress_resets_budget() {
+    fn test_classify_only_an_open_pr_resets_the_budget() {
         let issue = make_issue(1, UNGROOMED_BODY, &["ready"], "t");
 
         let mut f = facts(2);
@@ -4219,16 +4343,58 @@ This ticket has been GROOMED and is ready.
             classify_stuck_ready(&issue, &f, 3),
             StuckReadyVerdict::SkipAndResetBudget {
                 reason: "open_pr_closing"
-            }
+            },
+            "an open PR is observable, external progress the dispatch cannot fabricate"
         );
 
+        // mika#2158 M6b — a live dispatch skips but no longer resets. It is the
+        // action the budget counts; letting it zero the counter made the guard
+        // unreachable (31 re-drives measured on #1772 with redrive_count = 1).
         let mut f = facts(2);
         f.in_flight = true;
         assert_eq!(
             classify_stuck_ready(&issue, &f, 3),
-            StuckReadyVerdict::SkipAndResetBudget {
+            StuckReadyVerdict::Skip {
                 reason: "in_flight_self_dev"
-            }
+            },
+            "a live dispatch has not worked, it has started"
+        );
+    }
+
+    /// mika#2158 AC8 — le garde-fou devient atteignable.
+    ///
+    /// Rejoue le cycle mesuré : un dispatch part, laisse le ticket `in_flight` pendant que
+    /// sa tâche de suivi vieillit, meurt sans rien produire, et le ticket redevient
+    /// « stuck ready ». Avant, chaque tour passé en vol remettait le compteur à zéro et le
+    /// tour d'après repartait de 0 — indéfiniment. Maintenant le compteur survit aux tours
+    /// en vol, donc il finit par buter sur le budget et le ticket part à l'opérateur.
+    #[test]
+    fn test_classify_budget_survives_in_flight_rounds_and_is_reachable() {
+        let issue = make_issue(1772, UNGROOMED_BODY, &["ready"], "t");
+
+        // Tours 1..3 : le dispatch est en vol. On saute — sans effacer le compteur.
+        for count in 1..=3 {
+            let mut f = facts(count);
+            f.in_flight = true;
+            assert_eq!(
+                classify_stuck_ready(&issue, &f, 3),
+                StuckReadyVerdict::Skip {
+                    reason: "in_flight_self_dev"
+                },
+                "round {count}: waiting is not progress"
+            );
+        }
+
+        // Le dispatch meurt sans PR ; le ticket redevient sélectionnable. Le compteur a
+        // survécu, donc le budget mord au lieu d'être hors d'atteinte.
+        let f = facts(3);
+        assert_eq!(
+            classify_stuck_ready(&issue, &f, 3),
+            StuckReadyVerdict::Abandon(AbandonReason::RedriveBudgetExhausted {
+                redrives: 3,
+                budget: 3
+            }),
+            "#1772 should have stopped at the third round, not the thirty-first"
         );
     }
 
