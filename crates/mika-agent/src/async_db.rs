@@ -1135,6 +1135,47 @@ impl AsyncDatabase {
         .await
     }
 
+    /// Find `blocked` self_dev issue parents refused on a busy dispatch slot
+    /// (mika#2169). See [`Database::find_stale_blocked_dispatch_tasks`].
+    pub async fn find_stale_blocked_dispatch_tasks(
+        &self,
+        grace_seconds: i64,
+    ) -> Result<Vec<crate::db::StaleBlockedTask>> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.find_stale_blocked_dispatch_tasks(&a, grace_seconds))
+            .await
+    }
+
+    /// Terminal record for a deferred wrapper consumed without dispatching
+    /// (mika#2169). See [`Database::mark_deferred_wrapper_noop`].
+    pub async fn mark_deferred_wrapper_noop(&self, id: &str, reason: &str) -> Result<bool> {
+        let i = id.to_owned();
+        let r = reason.to_owned();
+        self.with_db(move |db| db.mark_deferred_wrapper_noop(&i, &r))
+            .await
+    }
+
+    /// Count wrappers promoted but never taken (mika#2169, L2b).
+    /// See [`Database::count_promoted_undelivered_wrappers`].
+    pub async fn count_promoted_undelivered_wrappers(
+        &self,
+        stale_seconds: i64,
+        epoch: &str,
+    ) -> Result<(i64, i64)> {
+        let a = self.agent_id.clone();
+        let e = epoch.to_owned();
+        self.with_db(move |db| db.count_promoted_undelivered_wrappers(&a, stale_seconds, &e))
+            .await
+    }
+
+    /// Stamp the deferred-promotion epoch on first boot carrying L1
+    /// (mika#2169). See [`Database::stamp_schema_meta_epoch_if_absent`].
+    pub async fn stamp_schema_meta_epoch_if_absent(&self, key: &str) -> Result<String> {
+        let k = key.to_owned();
+        self.with_db(move |db| db.stamp_schema_meta_epoch_if_absent(&k))
+            .await
+    }
+
     /// Read `metadata.stuck_rearm_count` (mika#2045).
     /// See [`Database::get_stuck_rearm_count`].
     pub async fn get_stuck_rearm_count(&self, task_id: &str) -> Result<i64> {

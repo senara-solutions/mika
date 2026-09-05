@@ -451,6 +451,16 @@ L1 avant L3a et L2a est une dépendance dure. **L2a et L3a sont deux modificatio
 
 ---
 
+## Acceptance criteria
+
+- [ ] **AC1** — un `ready-label` refusé dont la fente se libère produit un dispatch réel **ou** un échec visible portant une raison ; jamais `blocked` en silence.
+- [ ] **AC2** — le succès du re-tir se mesure sur son effet, pas sur le réveil ; une reprise qui n'a rien dispatché ne se termine pas `completed`.
+- [ ] **AC3** — le trio « bloqueur terminé + bail expiré + parent bloqué » n'est pas un état stable.
+- [ ] **AC4** — anti-vacuité : le rejeu rougit sans le correctif.
+- [ ] **AC5** — un bloqueur réellement actif continue de refuser le second dispatch.
+
+---
+
 ## Vérification
 
 ```bash

@@ -25,6 +25,7 @@ use crate::async_db::AsyncDatabase;
 use crate::db::Task;
 use crate::messaging::MessageSender;
 use crate::skills::SkillRegistry;
+use crate::skills::executor::{MAX_STUCK_REARMS, RearmOutcome};
 use crate::skills::manifest::ToolHandler;
 use crate::tools::ToolRegistry;
 
@@ -124,6 +125,25 @@ fn classify_delivery_error(err: &anyhow::Error) -> std::borrow::Cow<'static, str
         LlmError::UnsupportedFeature(_) => Cow::Borrowed("unsupported"),
     }
 }
+
+/// Parent statuses from which no dispatch can ever be produced (mika#2169).
+///
+/// `run_claude_pilot` refuses a non-active task and `failed` is terminal, so a
+/// re-armament aimed at any of these is structurally impossible — not merely
+/// unlikely. `absent` is the synthetic value for a parent row that has
+/// disappeared, which means the same thing more strongly.
+///
+/// `completed` and `delivered` belong here for a different reason than the
+/// three failure states: work that finished does not need a second dispatch,
+/// and re-arming into it would create one.
+const TERMINAL_PARENT_STATUSES: &[&str] = &[
+    "failed",
+    "cancelled",
+    "expired",
+    "completed",
+    "delivered",
+    "absent",
+];
 
 /// Executes a task's action by matching on `action_type`.
 ///
@@ -1647,13 +1667,93 @@ impl TaskDispatcher {
     ///
     /// `rearm_deferred_callback` owns the "did this turn actually dispatch?"
     /// guard, so both this call site and the reaper's inherit it.
-    async fn rearm_consumed_deferred_wrapper(&self, task: &Task, cause: &str) {
+    /// `pub(crate)` so the mika#2169 replay tests can drive this function
+    /// directly. They must: the defect is what this function *writes*, and a
+    /// test that reached it through the full silent-turn path would be
+    /// measuring the turn, not the record.
+    pub(crate) async fn rearm_consumed_deferred_wrapper(&self, task: &Task, cause: &str) {
         let Some(parent_id) = task.parent_task_id.as_deref() else {
             return;
         };
 
         let dispatch_class = task.dispatch_class.as_deref().unwrap_or("implement");
-        crate::skills::executor::rearm_deferred_callback(
+        let system_session = format!("system-{}", self.db.agent_id());
+
+        // L2a (mika#2169) — refuse to re-arm into a terminal parent.
+        //
+        // `run_claude_pilot` rejects a non-active task ("Task is not an active
+        // task"), and `failed` is terminal ("Cannot transition from 'failed' to
+        // 'in_progress'"), so a re-armament aimed at a dead parent is
+        // structurally impossible before it is attempted. Measured twice on two
+        // distinct parents and two distinct causes of death: `14465667`
+        // (`stuck_pending_no_deferred_wrapper`) and `620ae345`
+        // (`phantom_aged_out`, terminal at 02:04:01Z while its three sterile
+        // turns ran at 03:35Z / 03:59Z / 04:01Z). Both burned repair budget
+        // against a corpse and said nothing.
+        //
+        // A parent we cannot read is NOT treated as terminal: the exhaustion of
+        // the budget is a decision, and taking it on a failed read would spend
+        // it on a database hiccup. We fall through to the normal path, which
+        // has its own fail-closed guards.
+        let parent_status = match self.db.get_task(parent_id).await {
+            Ok(Some(parent)) => Some(parent.status),
+            // The row is gone: nothing can dispatch for it ever again.
+            Ok(None) => Some("absent".to_string()),
+            Err(e) => {
+                warn!(
+                    task_id = %task.id,
+                    parent_task_id = %parent_id,
+                    error = %e,
+                    "failed to read parent before re-arming — proceeding on the normal path"
+                );
+                None
+            }
+        };
+
+        if let Some(status) = parent_status.as_deref()
+            && TERMINAL_PARENT_STATUSES.contains(&status)
+        {
+            // Word order is load-bearing: the accented tail
+            // `terminal — re-armement impossible` is the exact substring the
+            // mika#2169 replay asserts on, so the status is carried BEFORE it
+            // rather than wedged inside it. Both halves survive: the reader
+            // gets which terminal state, the test gets a stable landmark.
+            let reason = format!(
+                "aucun dispatch produit ; parent {parent_id} ({status}) \
+                 terminal — re-armement impossible"
+            );
+            self.record_wrapper_noop(&task.id, &reason).await;
+
+            warn!(
+                event = "deferred_wrapper_orphaned_by_terminal_parent",
+                task_id = %task.id,
+                parent_task_id = %parent_id,
+                parent_status = %status,
+                cause,
+                dispatch_class,
+                "deferred wrapper consumed against a terminal parent — not re-armed, budget preserved"
+            );
+            if let Err(e) = self
+                .db
+                .log_audit_event(
+                    &system_session,
+                    "deferred_wrapper_orphaned_by_terminal_parent",
+                    &format!("task:{}", task.id),
+                    None,
+                    Some("expired"),
+                    Some(&format!(
+                        "parent:{parent_id} parent_status:{status} cause:{cause}"
+                    )),
+                    None,
+                )
+                .await
+            {
+                warn!(error = %e, "failed to write deferred_wrapper_orphaned_by_terminal_parent audit event");
+            }
+            return;
+        }
+
+        let outcome = crate::skills::executor::rearm_deferred_callback(
             &self.db,
             parent_id,
             &task.action_config,
@@ -1661,6 +1761,119 @@ impl TaskDispatcher {
             cause,
         )
         .await;
+
+        // L3a (mika#2169) — consume the outcome instead of dropping it.
+        //
+        // `RearmOutcome` exists precisely to keep `NotNow` and `Unrepairable`
+        // apart; this call site used to end in `.await;` and threw both away.
+        // On `Unrepairable`, `rearm_deferred_callback` logs "leaving the task
+        // for the reaper to expire" — but the reaper it names,
+        // `find_orphaned_pending_issue_tasks`, carries `parent.status =
+        // 'pending'`. A `blocked` parent falls between the two and nothing ever
+        // writes anything about it. So we write it here, where the cause is
+        // known, rather than delegating to a sweep that will not come.
+        match outcome {
+            RearmOutcome::Rearmed => {
+                info!(
+                    event = "deferred_wrapper_rearmed",
+                    task_id = %task.id,
+                    parent_task_id = %parent_id,
+                    cause,
+                    dispatch_class,
+                    "deferred wrapper consumed without dispatching — parent re-armed"
+                );
+                self.record_wrapper_noop(
+                    &task.id,
+                    &format!("noop: aucun dispatch produit (cause={cause}) — parent ré-armé"),
+                )
+                .await;
+            }
+            // Transient by definition — destroy nothing, retry next tick.
+            RearmOutcome::NotNow => {
+                debug!(
+                    task_id = %task.id,
+                    parent_task_id = %parent_id,
+                    cause,
+                    "re-arm refused for a transient reason — retrying next tick"
+                );
+            }
+            RearmOutcome::Unrepairable => {
+                let reason = format!(
+                    "re-armement différé épuisé après {MAX_STUCK_REARMS} tentatives \
+                     (cause={cause}) — aucun dispatch produit"
+                );
+                self.record_wrapper_noop(
+                    &task.id,
+                    &format!("noop: aucun dispatch produit (cause={cause}) — budget épuisé"),
+                )
+                .await;
+
+                match self.db.update_task_failed(parent_id, &reason).await {
+                    Ok(true) => {
+                        warn!(
+                            event = "deferred_dispatch_unrepairable_parent_failed",
+                            task_id = %task.id,
+                            parent_task_id = %parent_id,
+                            cause,
+                            dispatch_class,
+                            budget = MAX_STUCK_REARMS,
+                            "repair budget exhausted — parent failed with a reason instead of staying silent"
+                        );
+                        if let Err(e) = self
+                            .db
+                            .log_audit_event(
+                                &system_session,
+                                "deferred_dispatch_unrepairable_parent_failed",
+                                &format!("task:{parent_id}"),
+                                None,
+                                Some("failed"),
+                                Some(&format!("cause:{cause} wrapper:{}", task.id)),
+                                None,
+                            )
+                            .await
+                        {
+                            warn!(error = %e, "failed to write deferred_dispatch_unrepairable_parent_failed audit event");
+                        }
+                    }
+                    Ok(false) => {
+                        debug!(
+                            parent_task_id = %parent_id,
+                            "parent left its non-terminal state before the budget write — no-op"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            parent_task_id = %parent_id,
+                            error = %e,
+                            "failed to write the exhausted-budget failure on the parent"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// L1 (mika#2169) — write the wrapper's honest terminal record.
+    ///
+    /// Fire-and-forget: the record is the point, but failing to write it must
+    /// not abort the repair path that produced it.
+    async fn record_wrapper_noop(&self, wrapper_id: &str, reason: &str) {
+        match self.db.mark_deferred_wrapper_noop(wrapper_id, reason).await {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!(
+                    task_id = %wrapper_id,
+                    "wrapper was not in a markable state — terminal record skipped"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    task_id = %wrapper_id,
+                    error = %e,
+                    "failed to write the wrapper's terminal noop record"
+                );
+            }
+        }
     }
 
     /// mika#1011 — Promote the next pending deferred-dispatch callback to `completed`.

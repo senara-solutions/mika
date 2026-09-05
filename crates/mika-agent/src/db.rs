@@ -7185,6 +7185,124 @@ impl Database {
         Ok(n > 0)
     }
 
+    /// Terminal record for a deferred wrapper consumed without dispatching
+    /// (mika#2169).
+    ///
+    /// `expired` is deliberate: it is already in the `status` CHECK constraint,
+    /// it is terminal, and it is NOT in the `('completed','failed')` set that
+    /// `get_undelivered_callback_tasks` scans — so the wrapper leaves the
+    /// delivery queue instead of re-entering it. Marking it `failed` would
+    /// livelock the delivery scan.
+    ///
+    /// Three fins de vie, trois mots distincts: `delivered` = the turn
+    /// dispatched; `expired` + reason = the turn happened and dispatched
+    /// nothing; `completed` with no successor = the promotion never fired —
+    /// which is exactly the exclusivity `count_promoted_undelivered_wrappers`
+    /// relies on.
+    ///
+    /// The guard on `label` and on the departure status makes the write
+    /// idempotent and impossible to aim at anything but a deferred wrapper.
+    pub fn mark_deferred_wrapper_noop(&self, id: &str, reason: &str) -> Result<bool> {
+        let now = crate::timestamp::now();
+        let n = self.conn.execute(
+            "UPDATE tasks
+             SET status = 'expired',
+                 result = ?2,
+                 completed_at = ?3,
+                 updated_at = ?3
+             WHERE id = ?1
+               AND label = ?4
+               AND status IN ('completed', 'delivered')",
+            params![id, reason, now, crate::agent::DEFERRED_DISPATCH_LABEL],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Count deferred wrappers promoted (`completed`) but never taken by the
+    /// engine, older than `stale_seconds` and born at or after `epoch`
+    /// (mika#2169, L2b).
+    ///
+    /// After L1 and L2a, `status = 'completed'` on this label is **exclusively**
+    /// "promoted, not yet taken": delivery writes `delivered`, and a sterile
+    /// consumption writes `expired`. That exclusivity is what makes the count
+    /// readable — without it the number mixes promotion starvation with the very
+    /// defect this ticket repairs.
+    ///
+    /// `epoch` is the instant L1 first ran in production (`schema_meta` key
+    /// `deferred_promotion_epoch`). Rows older than it predate the exclusivity
+    /// and would fire the indicator permanently, for a reason unrelated to
+    /// starvation. Nothing mutates them — the bound only narrows the count.
+    pub fn count_promoted_undelivered_wrappers(
+        &self,
+        agent_id: &str,
+        stale_seconds: i64,
+        epoch: &str,
+    ) -> Result<(i64, i64)> {
+        let stale_modifier = format!("-{stale_seconds} seconds");
+        let row = self.conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(
+                      MAX(CAST(strftime('%s','now') - strftime('%s', completed_at) AS INTEGER)),
+                      0)
+             FROM tasks
+             WHERE agent_id = ?1
+               AND trigger_type = 'callback'
+               AND label = ?2
+               AND status = 'completed'
+               AND completed_at IS NOT NULL
+               AND completed_at >= ?4
+               AND completed_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?3)",
+            params![
+                agent_id,
+                crate::agent::DEFERRED_DISPATCH_LABEL,
+                stale_modifier,
+                epoch
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(row)
+    }
+
+    /// Read a `schema_meta` value, or `None` when the key was never stamped.
+    pub fn get_schema_meta(&self, key: &str) -> Result<Option<String>> {
+        let value = self
+            .conn
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = ?1",
+                params![key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(value)
+    }
+
+    /// Stamp the current instant under `key` if — and only if — nothing is
+    /// stamped there yet, then return the effective value (mika#2169, L2b).
+    ///
+    /// `INSERT OR IGNORE` makes it idempotent: the first boot carrying L1 sets
+    /// the instant, every later boot is a no-op. No DDL, no
+    /// `CURRENT_SCHEMA_VERSION` bump — `schema_meta` already exists and already
+    /// carries one-shot markers (`v27_coalesce_complete`,
+    /// `well_known_d2_migration_v1`).
+    ///
+    /// The instant is read from the database, not from a compiled-in date: a
+    /// literal would fix the epoch at the day the plan was written rather than
+    /// the day L1 started running, and `env!()` would make two builds of the
+    /// same commit behave differently.
+    pub fn stamp_schema_meta_epoch_if_absent(&self, key: &str) -> Result<String> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO schema_meta (key, value)
+             VALUES (?1, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+            params![key],
+        )?;
+        let value = self.conn.query_row(
+            "SELECT value FROM schema_meta WHERE key = ?1",
+            params![key],
+            |row| row.get::<_, String>(0),
+        )?;
+        Ok(value)
+    }
+
     /// Find implement-class parent self_dev tasks left `in_progress` whose
     /// callback subtask delivered without producing a PR (#871).
     ///
@@ -7779,6 +7897,88 @@ impl Database {
                         age_seconds: row.get(3)?,
                         rearm_count: row.get(4)?,
                         dispatch_class: row.get(5)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Find `blocked` self_dev issue parents refused on a busy dispatch slot,
+    /// older than `grace_seconds` and with nothing left representing them
+    /// (mika#2169, L3b).
+    ///
+    /// **Discriminated, not widened.** The population is separated from the
+    /// deliberate operator gates by `json_extract(result, '$.error') =
+    /// 'global_dispatch_active'` — the only value the slot-refusal path writes.
+    /// A `blocked` written by an auto-merge refusal
+    /// (`server/verdict_handler.rs`) or a QA escalation does not carry it, so
+    /// this sweep can never re-drive a dispatch an operator deliberately
+    /// stopped. Measured negative control: task `662d9752` carries
+    /// `unauthorized_webhook_dispatch` and is excluded.
+    ///
+    /// The two `NOT EXISTS` clauses are taken verbatim from
+    /// `find_orphaned_pending_issue_tasks` and carry the same meaning: no
+    /// `pending` wrapper still queued, and no live real dispatch.
+    pub fn find_stale_blocked_dispatch_tasks(
+        &self,
+        agent_id: &str,
+        grace_seconds: i64,
+    ) -> Result<Vec<StaleBlockedTask>> {
+        let grace_modifier = format!("-{grace_seconds} seconds");
+        let mut stmt = self.conn.prepare(
+            "SELECT parent.id,
+                    parent.reference_url,
+                    parent.created_at,
+                    CAST(strftime('%s', 'now') - strftime('%s', parent.created_at) AS INTEGER),
+                    COALESCE(
+                      CASE WHEN json_valid(parent.metadata)
+                           THEN CAST(json_extract(parent.metadata, '$.stuck_rearm_count') AS INTEGER)
+                      END, 0),
+                    COALESCE(parent.dispatch_class, 'implement'),
+                    json_extract(parent.result, '$.blocking_callback_id')
+             FROM tasks parent
+             WHERE parent.agent_id = ?1
+               AND parent.status = 'blocked'
+               AND parent.source = 'self_dev'
+               AND parent.trigger_type = 'manual'
+               AND parent.type = 'issue'
+               AND parent.reference_url IS NOT NULL
+               AND json_valid(parent.result)
+               AND json_extract(parent.result, '$.error') = 'global_dispatch_active'
+               AND parent.created_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+               AND NOT EXISTS (
+                 SELECT 1 FROM tasks w
+                 WHERE w.parent_task_id = parent.id
+                   AND w.trigger_type = 'callback'
+                   AND w.status = 'pending'
+                   AND w.label = ?3
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM tasks c
+                 WHERE c.parent_task_id = parent.id
+                   AND c.trigger_type = 'callback'
+                   AND c.status IN ('pending', 'in_progress')
+                   AND c.label != ?3
+               )
+             ORDER BY parent.id",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    agent_id,
+                    grace_modifier,
+                    crate::agent::DEFERRED_DISPATCH_LABEL
+                ],
+                |row| {
+                    Ok(StaleBlockedTask {
+                        id: row.get(0)?,
+                        reference_url: row.get(1)?,
+                        created_at: row.get(2)?,
+                        age_seconds: row.get(3)?,
+                        rearm_count: row.get(4)?,
+                        dispatch_class: row.get(5)?,
+                        blocking_callback_id: row.get(6)?,
                     })
                 },
             )?

@@ -145,6 +145,24 @@ const PROMOTED_WRAPPER_LIVENESS_ENV: &str = "MIKA_PROMOTED_WRAPPER_LIVENESS_SECS
 /// `parent.created_at <` comparison where NULL merely selects nothing.
 const PROMOTED_WRAPPER_LIVENESS_MAX_SECS: i64 = 30 * 24 * 3600;
 
+/// Env var overriding the promotion-starvation indicator threshold (mika#2169,
+/// L2b).
+const DEFERRED_PROMOTION_STALE_ENV: &str = "MIKA_DEFERRED_PROMOTION_STALE_SECS";
+
+/// Default age past which a promoted-but-untaken wrapper is reported
+/// (mika#2169, L2b). 900 s, on the model of `stuck_pending_reaper_grace_secs`.
+///
+/// This threshold drives a **warning only** — never a mutation. That is the
+/// whole point: the one latency actually measured on this path is 2 h 47 min
+/// (wrapper `f0cd5967`, promoted 00:48:11Z, delivered 03:35:31Z on
+/// 2026-09-04), so a threshold that acted would have destroyed twenty-two
+/// wrappers that were about to be served. We measure first.
+const DEFERRED_PROMOTION_STALE_DEFAULT_SECS: i64 = 900;
+
+/// `schema_meta` key holding the instant L1 first ran in production
+/// (mika#2169, L2b). See `Database::stamp_schema_meta_epoch_if_absent`.
+const DEFERRED_PROMOTION_EPOCH_KEY: &str = "deferred_promotion_epoch";
+
 /// Ticks between pilot-transcript retention sweeps (mika#1705 AC6). At the 1s
 /// tick cadence, 86_400 ticks ≈ 24h — a daily prune, matching the plan's
 /// "daily tick deletes rows older than N days". Startup also runs one sweep.
@@ -480,6 +498,18 @@ impl TaskEngine {
             // `in_progress` reapers above so any task that can still resolve
             // through them does; this one owns the population none of them see.
             self.reap_orphaned_pending_issue_tasks().await;
+
+            // The net for `blocked` parents refused on a busy dispatch slot
+            // (mika#2169, L3b). Placed right after the `pending` reaper: the
+            // two select disjoint populations (`status`, plus the
+            // `global_dispatch_active` discriminant that keeps deliberate
+            // operator gates out of this one), so the order costs nothing and
+            // keeps the whole repair ladder readable in one place.
+            self.reap_stale_blocked_dispatch_tasks().await;
+
+            // Measure promotion starvation — warning only, no mutation
+            // (mika#2169, L2b).
+            self.report_promotion_starvation().await;
 
             // Reap orphaned team runs left in `status='running'` when no
             // terminal-state writer ran (mika#1652). Failure-path sibling of
@@ -943,6 +973,340 @@ impl TaskEngine {
                         error = %e,
                         "task_engine_stuck_pending_reaper: failed to expire the task"
                     );
+                }
+            }
+        }
+    }
+
+    /// L2b (mika#2169) — report promotion starvation, mutate nothing.
+    ///
+    /// Counts deferred wrappers promoted (`completed`) but never taken by the
+    /// engine. After L1 and L2a, `status = 'completed'` on this label means
+    /// exactly one thing — promoted, not yet taken — because delivery writes
+    /// `delivered` and a sterile consumption writes `expired`. That exclusivity
+    /// is what makes the number worth reading.
+    ///
+    /// **No state is mutated, no wrapper is re-armed, no window destroys
+    /// anything.** The threshold drives a warning. The only latency ever
+    /// measured on this path is 2 h 47 min, and a naive 300 s watchdog applied
+    /// to the 2026-09-04 trace would have expired twenty-two wrappers at
+    /// ~00:53Z and permanently failed parents that were served at 03:35Z. A
+    /// window cannot tell starvation from a real orphan; only a state
+    /// discriminant can, and we do not have one yet. So we measure, and a
+    /// separate ticket will decide the action once the distribution is known.
+    ///
+    /// `agent_busy` is what makes the signal interpretable: starvation behind a
+    /// held lock resolves itself, whereas wrappers waiting with a **free** agent
+    /// is the only genuinely anomalous shape.
+    async fn report_promotion_starvation(&self) {
+        // The epoch is stamped on first use rather than compiled in: the day
+        // `completed` becomes exclusive is the day L1 runs in production, not
+        // the day the plan was written. `INSERT OR IGNORE` makes every later
+        // pass a no-op read.
+        let epoch = match self
+            .db
+            .stamp_schema_meta_epoch_if_absent(DEFERRED_PROMOTION_EPOCH_KEY)
+            .await
+        {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, "failed to resolve the deferred-promotion epoch — skipping the starvation report");
+                return;
+            }
+        };
+
+        let stale_seconds = deferred_promotion_stale_secs();
+        let (count, oldest_age_secs) = match self
+            .db
+            .count_promoted_undelivered_wrappers(stale_seconds, &epoch)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "failed to count promoted-undelivered wrappers");
+                return;
+            }
+        };
+
+        if count == 0 {
+            return;
+        }
+
+        let agent_busy = self
+            .dispatcher
+            .agent_lock
+            .as_ref()
+            .is_some_and(|lock| lock.try_lock().is_err());
+
+        warn!(
+            event = "deferred_dispatch_promotion_starved",
+            count,
+            oldest_age_secs,
+            agent_busy,
+            stale_seconds,
+            epoch = %epoch,
+            agent_id = %self.db.agent_id(),
+            "deferred wrappers promoted but not taken — measurement only, nothing mutated"
+        );
+
+        if let Err(e) = self
+            .db
+            .log_audit_event(
+                &format!("system-{}", self.db.agent_id()),
+                "deferred_dispatch_promotion_starved",
+                &format!("agent:{}", self.db.agent_id()),
+                None,
+                None,
+                Some(&format!(
+                    "count:{count} oldest_age_secs:{oldest_age_secs} agent_busy:{agent_busy}"
+                )),
+                None,
+            )
+            .await
+        {
+            warn!(error = %e, "failed to write deferred_dispatch_promotion_starved audit event");
+        }
+    }
+
+    /// L3b (mika#2169) — the net: `blocked` parents refused on a busy slot
+    /// whose wrapper never reached consumption.
+    ///
+    /// L3a covers parents whose wrapper **was** consumed. This one owns the
+    /// remainder: refused at registration, or wrapper vanished. Three checks in
+    /// order, and the order is the safety:
+    ///
+    /// 1. **is the named blocker finished?** A live blocker means the
+    ///    serialisation is doing its job — skip (AC5). An absent row means the
+    ///    blocker is gone, which is finished, more strongly.
+    /// 2. **is the lease expired?** `dispatch_slot_lease_holder` already filters
+    ///    `expires_at > now`, so `None` **is** the answer "expired or absent".
+    ///    A held lease means someone is claiming the slot right now — skip
+    ///    (AC5).
+    /// 3. only then, re-arm.
+    ///
+    /// Disjoint from L3a by parent status: L3a writes `failed`, which leaves
+    /// this population. The two are therefore safe in any tick order — not
+    /// because they are sequenced, but because they cannot select the same row.
+    async fn reap_stale_blocked_dispatch_tasks(&self) {
+        let grace_seconds = stuck_pending_reaper_grace_secs();
+        let candidates = match self
+            .db
+            .find_stale_blocked_dispatch_tasks(grace_seconds)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "stale_blocked_dispatch: failed to query blocked dispatch tasks");
+                return;
+            }
+        };
+
+        if candidates.is_empty() {
+            return;
+        }
+
+        let system_session = format!("system-{}", self.db.agent_id());
+
+        for candidate in candidates {
+            // (1) The blocker the refusal named.
+            if let Some(ref blocker_id) = candidate.blocking_callback_id {
+                match self.db.get_task(blocker_id).await {
+                    Ok(Some(blocker))
+                        if blocker.status == task_status::PENDING
+                            || blocker.status == task_status::IN_PROGRESS =>
+                    {
+                        debug!(
+                            task_id = %candidate.id,
+                            blocker_id = %blocker_id,
+                            blocker_status = %blocker.status,
+                            "stale_blocked_dispatch: blocker still live — skipping (AC5)"
+                        );
+                        continue;
+                    }
+                    // Finished, or the row is gone — both mean "no longer
+                    // blocking". Proceed.
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(
+                            task_id = %candidate.id,
+                            blocker_id = %blocker_id,
+                            error = %e,
+                            "stale_blocked_dispatch: blocker lookup failed — skipping this pass"
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            // (2) The lease. `Some` means a live claim on the slot.
+            match self
+                .db
+                .dispatch_slot_lease_holder(&candidate.dispatch_class)
+                .await
+            {
+                Ok(Some((holder_task_id, holder_source))) => {
+                    debug!(
+                        task_id = %candidate.id,
+                        dispatch_class = %candidate.dispatch_class,
+                        holder_task_id = %holder_task_id,
+                        holder_source = ?holder_source,
+                        "stale_blocked_dispatch: dispatch slot lease still held — skipping (AC5)"
+                    );
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(
+                        task_id = %candidate.id,
+                        error = %e,
+                        "stale_blocked_dispatch: lease lookup failed — skipping this pass"
+                    );
+                    continue;
+                }
+            }
+
+            // (3) Both free — repair.
+            let action_config = match self
+                .db
+                .latest_deferred_wrapper_action_config(&candidate.id)
+                .await
+            {
+                Ok(Some(config)) => Some(config),
+                Ok(None) => rebuild_deferred_action_config(
+                    &candidate.id,
+                    &candidate.reference_url,
+                    &candidate.dispatch_class,
+                ),
+                Err(e) => {
+                    warn!(
+                        task_id = %candidate.id,
+                        error = %e,
+                        "stale_blocked_dispatch: failed to read the last wrapper config"
+                    );
+                    None
+                }
+            };
+
+            let outcome = match action_config {
+                Some(config) => {
+                    crate::skills::executor::rearm_deferred_callback(
+                        &self.db,
+                        &candidate.id,
+                        &config,
+                        &candidate.dispatch_class,
+                        "stale_blocked_dispatch",
+                    )
+                    .await
+                }
+                None => RearmOutcome::Unrepairable,
+            };
+
+            match outcome {
+                RearmOutcome::NotNow => {
+                    debug!(
+                        task_id = %candidate.id,
+                        issue = %candidate.reference_url,
+                        "stale_blocked_dispatch: repair refused for a transient reason — retrying next tick"
+                    );
+                }
+                RearmOutcome::Rearmed => {
+                    // Hand the parent back to the population the mika#2045
+                    // ladder already covers. This sweep feeds that ladder; it
+                    // does not replace it.
+                    if let Err(e) = self
+                        .db
+                        .update_task_status(&candidate.id, task_status::PENDING)
+                        .await
+                    {
+                        warn!(
+                            task_id = %candidate.id,
+                            error = %e,
+                            "stale_blocked_dispatch: re-armed but failed to return the parent to pending"
+                        );
+                    }
+                    info!(
+                        event = "stale_blocked_dispatch_rearmed",
+                        task_id = %candidate.id,
+                        issue = %candidate.reference_url,
+                        age_seconds = candidate.age_seconds,
+                        previous_rearm_count = candidate.rearm_count,
+                        "blocked dispatch task re-armed — blocker finished, lease expired"
+                    );
+                    if let Err(e) = self
+                        .db
+                        .log_audit_event(
+                            &system_session,
+                            "stale_blocked_dispatch_rearmed",
+                            &format!("task:{}", candidate.id),
+                            Some("blocked"),
+                            Some("pending"),
+                            Some(&format!(
+                                "issue:{} age_seconds:{} rearm_count:{}",
+                                candidate.reference_url,
+                                candidate.age_seconds,
+                                candidate.rearm_count
+                            )),
+                            None,
+                        )
+                        .await
+                    {
+                        warn!(error = %e, "failed to write stale_blocked_dispatch_rearmed audit event");
+                    }
+                }
+                RearmOutcome::Unrepairable => {
+                    let reason = format!(
+                        "stale_blocked_dispatch: bloqueur {} terminé, bail expiré, \
+                         budget de re-armement épuisé",
+                        candidate
+                            .blocking_callback_id
+                            .as_deref()
+                            .unwrap_or("absent")
+                    );
+                    match self.db.update_task_failed(&candidate.id, &reason).await {
+                        Ok(true) => {
+                            warn!(
+                                event = "loop_stuck_blocked_tasks",
+                                task_id = %candidate.id,
+                                issue = %candidate.reference_url,
+                                age_seconds = candidate.age_seconds,
+                                rearm_count = candidate.rearm_count,
+                                "blocked dispatch task failed with a reason — the trio is not a stable state"
+                            );
+                            if let Err(e) = self
+                                .db
+                                .log_audit_event(
+                                    &system_session,
+                                    "stale_blocked_dispatch_expired",
+                                    &format!("task:{}", candidate.id),
+                                    Some("blocked"),
+                                    Some("failed"),
+                                    Some(&format!(
+                                        "issue:{} age_seconds:{} rearm_count:{}",
+                                        candidate.reference_url,
+                                        candidate.age_seconds,
+                                        candidate.rearm_count
+                                    )),
+                                    None,
+                                )
+                                .await
+                            {
+                                warn!(error = %e, "failed to write stale_blocked_dispatch_expired audit event");
+                            }
+                        }
+                        Ok(false) => {
+                            debug!(
+                                task_id = %candidate.id,
+                                "stale_blocked_dispatch: task left blocked state before expiry — no-op"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                task_id = %candidate.id,
+                                error = %e,
+                                "stale_blocked_dispatch: failed to expire the task"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -2665,6 +3029,32 @@ fn parse_stuck_pending_reaper_grace(raw: Option<&str>) -> i64 {
     }
 }
 
+/// Parse the promotion-starvation threshold (mika#2169, L2b). Same three-tier
+/// shape as `parse_stuck_pending_reaper_grace`: absent or empty → default;
+/// unparseable, zero, or negative → default with a WARN.
+fn parse_deferred_promotion_stale_secs(raw: Option<&str>) -> i64 {
+    match raw {
+        Some(v) if !v.trim().is_empty() => match v.trim().parse::<i64>() {
+            Ok(secs) if secs > 0 => secs,
+            _ => {
+                warn!(
+                    env = DEFERRED_PROMOTION_STALE_ENV,
+                    value = %v,
+                    default = DEFERRED_PROMOTION_STALE_DEFAULT_SECS,
+                    "invalid deferred-promotion stale value; falling back to default"
+                );
+                DEFERRED_PROMOTION_STALE_DEFAULT_SECS
+            }
+        },
+        _ => DEFERRED_PROMOTION_STALE_DEFAULT_SECS,
+    }
+}
+
+/// Resolve the promotion-starvation threshold (mika#2169, L2b).
+pub fn deferred_promotion_stale_secs() -> i64 {
+    parse_deferred_promotion_stale_secs(std::env::var(DEFERRED_PROMOTION_STALE_ENV).ok().as_deref())
+}
+
 /// Resolve the stuck-pending reaper grace window (mika#2045).
 ///
 /// `pub` so the `mika tasks stuck` probe reports on exactly the population the
@@ -3623,6 +4013,584 @@ mod tests {
         assert!(
             wrappers[0].action_config.contains("dev-groom"),
             "an ungroomed issue must be re-armed as a grooming dispatch"
+        );
+    }
+
+    // -- mika#2169 replays and non-regressions --
+    //
+    // Three tests, three DIFFERENT statuses of proof, and conflating them is
+    // exactly the mistake this plan made twice before landing:
+    //
+    //   L4a — VERBATIM replay of the 2026-09-04 trace (terminal parent). The
+    //         population is measured, twice, on two distinct parents.
+    //   L4b — CONSTRUCTED replay of its counterfactual (parent still alive when
+    //         the budget runs out). This population has NO measured instance;
+    //         it is required by AC1/AC3 and read off `dispatcher.rs`, not off
+    //         an incident.
+    //   L4c — the L3b net. Does NOT compile on `main` (new surfaces), so it
+    //         proves no reddening and is deliberately OUT of the anti-vacuity
+    //         protocol.
+    //
+    // L4a and L4b both compile on `main` and redden there ON ASSERTION — no
+    // method neutralisation, no teardown protocol.
+
+    /// The 2026-09-04 identifiers, verbatim. Truncated to fit the `id` column
+    /// shape used by `create_task`; the suffixes are what make the rows
+    /// recognisable in a failure message.
+    const PARENT_2140: &str = "620ae345-f97b-44a0-b099-ebdf720be88c";
+    const WRAPPER_F0CD: &str = "f0cd5967-5f22-4c66-940f-86c90beb7ed1";
+    const BLOCKER_74B3: &str = "74b3ee7d-c429-4479-ba72-dc877cc8b415";
+
+    /// The verbatim refusal JSON from the ticket body: this is what
+    /// `global_dispatch_active` writes on `tasks.result`, and it is the
+    /// discriminant L3b selects on.
+    fn refusal_result_json() -> String {
+        serde_json::json!({
+            "error": "global_dispatch_active",
+            "blocking_callback_id": BLOCKER_74B3,
+            "blocking_task_id": "c479c873-0000-0000-0000-000000000000",
+            "dispatch_class": "implement",
+            "deferred_dispatch_registered": true,
+        })
+        .to_string()
+    }
+
+    /// Insert a row with a chosen id/status, bypassing `create_task`, so the
+    /// replay carries the production identifiers rather than fresh UUIDs.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_raw_task(
+        db: &AsyncDatabase,
+        id: &str,
+        parent_task_id: Option<&str>,
+        label: &str,
+        trigger_type: &str,
+        status: &str,
+        action_config: &str,
+        reference_url: Option<&str>,
+        source: Option<&str>,
+        r#type: Option<&str>,
+        result: Option<&str>,
+        metadata: Option<&str>,
+        completed_at: Option<&str>,
+        created_at: &str,
+    ) {
+        let (
+            id,
+            parent_task_id,
+            label,
+            trigger_type,
+            status,
+            action_config,
+            reference_url,
+            source,
+            ty,
+            result,
+            metadata,
+            completed_at,
+            created_at,
+        ) = (
+            id.to_string(),
+            parent_task_id.map(str::to_string),
+            label.to_string(),
+            trigger_type.to_string(),
+            status.to_string(),
+            action_config.to_string(),
+            reference_url.map(str::to_string),
+            source.map(str::to_string),
+            r#type.map(str::to_string),
+            result.map(str::to_string),
+            metadata.map(str::to_string),
+            completed_at.map(str::to_string),
+            created_at.to_string(),
+        );
+        db.with_db(move |d| {
+            d.conn.execute(
+                "INSERT INTO tasks (
+                     id, agent_id, parent_task_id, depth, label, trigger_type,
+                     action_type, action_config, status, reference_url, source,
+                     type, result, metadata, completed_at, created_at, updated_at,
+                     dispatch_class
+                 ) VALUES (?1, 'mika', ?2, 0, ?3, ?4, 'resume_agent', ?5, ?6, ?7,
+                           ?8, COALESCE(?9, 'issue'), ?10, ?11, ?12, ?13, ?13,
+                           'implement')",
+                rusqlite::params![
+                    id,
+                    parent_task_id,
+                    label,
+                    trigger_type,
+                    action_config,
+                    status,
+                    reference_url,
+                    source,
+                    ty,
+                    result,
+                    metadata,
+                    completed_at,
+                    created_at,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Seed the shared 2026-09-04 shape. `parent_status` is what separates the
+    /// verbatim replay (`failed` — its real state at 03:35:31Z, the instant of
+    /// the first sterile turn) from the counterfactual (`blocked` — the same
+    /// chain WITHOUT the 02:04:01Z phantom sweep).
+    async fn seed_2026_09_04_trace(
+        db: &AsyncDatabase,
+        parent_status: &str,
+        parent_metadata: Option<&str>,
+        blocker_status: &str,
+        with_wrapper: bool,
+    ) {
+        // The blocking callback the refusal named.
+        seed_raw_task(
+            db,
+            BLOCKER_74B3,
+            None,
+            "long_running:run_claude_pilot",
+            "callback",
+            blocker_status,
+            "{}",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("2026-09-04T00:42:16Z"),
+            "2026-09-03T23:29:44Z",
+        )
+        .await;
+
+        seed_raw_task(
+            db,
+            PARENT_2140,
+            None,
+            "ready-label: senara-solutions/mika#2140",
+            "manual",
+            parent_status,
+            "{}",
+            Some("https://github.com/senara-solutions/mika/issues/2140"),
+            Some("self_dev"),
+            Some("issue"),
+            Some(&refusal_result_json()),
+            parent_metadata,
+            None,
+            "2026-09-04T00:42:12Z",
+        )
+        .await;
+
+        if with_wrapper {
+            // Promoted at 00:48:11Z, not yet consumed at the moment of replay.
+            seed_raw_task(
+                db,
+                WRAPPER_F0CD,
+                Some(PARENT_2140),
+                crate::agent::DEFERRED_DISPATCH_LABEL,
+                "callback",
+                "completed",
+                &rebuild_deferred_action_config(
+                    PARENT_2140,
+                    "https://github.com/senara-solutions/mika/issues/2140",
+                    "implement",
+                )
+                .unwrap(),
+                None,
+                Some("deferred_dispatch".to_string()).as_deref(),
+                None,
+                None,
+                None,
+                Some("2026-09-04T00:48:11Z"),
+                "2026-09-04T00:42:12Z",
+            )
+            .await;
+        }
+    }
+
+    /// The dispatch-slot lease from the trace: acquired 23:29:44Z, expired
+    /// 23:31:44Z. `dispatch_slot_lease_holder` filters on `expires_at > now`,
+    /// so a past `expires_at` reads as "no holder".
+    async fn seed_expired_lease(db: &AsyncDatabase) {
+        db.with_db(|d| {
+            d.conn.execute(
+                "INSERT INTO dispatch_slot_leases
+                     (agent_id, dispatch_class, holder_task_id, dispatcher_source,
+                      acquired_at, expires_at)
+                 VALUES ('mika', 'implement', 'c479c873-0000-0000-0000-000000000000',
+                         'mika_dev', '2026-09-03T23:29:44Z', '2026-09-03T23:31:44Z')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// L4a — VERBATIM replay (AC2, AC4).
+    ///
+    /// The parent is seeded `failed`, not `blocked`: that is its real state at
+    /// 03:35:31Z, when the first sterile turn actually happened. A seed placing
+    /// it `blocked` would test a state production no longer had.
+    ///
+    /// Reddens on `main` on three assertions at once — there the wrapper ends
+    /// `delivered`, a replacement wrapper IS created, and `stuck_rearm_count`
+    /// goes to 1.
+    #[tokio::test]
+    async fn test_replay_2026_09_04_terminal_parent_rearm_into_corpse() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+
+        seed_2026_09_04_trace(&db, "failed", None, "completed", true).await;
+        seed_expired_lease(&db).await;
+
+        let wrapper = db.get_task(WRAPPER_F0CD).await.unwrap().unwrap();
+        dispatcher
+            .rearm_consumed_deferred_wrapper(&wrapper, "noop_completion")
+            .await;
+
+        // (1) The wrapper's terminal record tells the truth, and names the
+        //     terminal parent that makes the repair vain. Accented substring on
+        //     purpose — see the accented-case note below.
+        let wrapper = db.get_task(WRAPPER_F0CD).await.unwrap().unwrap();
+        assert_eq!(
+            wrapper.status, "expired",
+            "a turn that dispatched nothing must not end on the most affirmative word in the vocabulary"
+        );
+        let result = wrapper.result.unwrap_or_default();
+        assert!(
+            result.contains("terminal — re-armement impossible"),
+            "the record must name the cause, got: {result}"
+        );
+        assert!(
+            result.contains(PARENT_2140),
+            "the record must name the terminal parent, got: {result}"
+        );
+
+        // (2) The budget was not burned against a corpse. This is the
+        //     assertion that measures the whole point of L2a.
+        let children = db.get_child_tasks(PARENT_2140).await.unwrap();
+        assert_eq!(
+            children.len(),
+            1,
+            "no replacement wrapper may be created for a terminal parent"
+        );
+
+        // (3) …and the counter proves it independently of the row count.
+        assert_eq!(
+            db.get_stuck_rearm_count(PARENT_2140).await.unwrap(),
+            0,
+            "repair budget must stay intact when the parent is already terminal"
+        );
+
+        // (4) The event is greppable and countable.
+        assert_eq!(
+            db.count_audit_events_by_tool_name("deferred_wrapper_orphaned_by_terminal_parent")
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    /// L4b — CONSTRUCTED replay of the counterfactual (AC1, AC3, AC4).
+    ///
+    /// This does NOT replay the ticket's trace. It replays the same chain
+    /// WITHOUT the 02:04:01Z phantom sweep — the parent still `blocked` when
+    /// the budget runs out. That population has no measured instance; AC1 and
+    /// AC3 require it closed, and the defect is read off `dispatcher.rs` (a
+    /// `RearmOutcome` dropped on the floor) plus the enum's own written
+    /// doctrine.
+    ///
+    /// Reddens on `main` on assertion: there `rearm_deferred_callback` returns
+    /// `Unrepairable`, the value is discarded, and the parent stays `blocked`.
+    #[tokio::test]
+    async fn test_replay_2026_09_04_live_blocked_parent_budget_exhausted() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+
+        // Budget already spent — the state that forces `Unrepairable`.
+        let metadata = serde_json::json!({
+            "stuck_rearm_count": crate::skills::executor::MAX_STUCK_REARMS,
+            "claude_pilot": { "branch": "fix/2140/auto-pull-la-porte-de-promotion-lit" },
+        })
+        .to_string();
+        seed_2026_09_04_trace(&db, "blocked", Some(&metadata), "completed", true).await;
+        seed_expired_lease(&db).await;
+
+        let wrapper = db.get_task(WRAPPER_F0CD).await.unwrap().unwrap();
+        dispatcher
+            .rearm_consumed_deferred_wrapper(&wrapper, "noop_completion")
+            .await;
+
+        let parent = db.get_task(PARENT_2140).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "failed",
+            "an exhausted budget must produce a visible failure, not indefinite silence"
+        );
+        let result = parent.result.unwrap_or_default();
+        assert!(
+            result.contains("re-armement différé épuisé"),
+            "the failure must carry its reason, got: {result}"
+        );
+
+        assert_eq!(
+            db.count_audit_events_by_tool_name("deferred_dispatch_unrepairable_parent_failed")
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    /// L4c — the L3b net (AC3).
+    ///
+    /// **Does not compile on `main`** — `reap_stale_blocked_dispatch_tasks` and
+    /// `find_stale_blocked_dispatch_tasks` are new surfaces. It therefore
+    /// proves NO reddening and is deliberately excluded from the anti-vacuity
+    /// protocol; mixing it into L4a or L4b would destroy their proof.
+    #[tokio::test]
+    async fn test_replay_2026_09_04_stale_blocked_sweep_recovers() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        // No wrapper: it never reached consumption. Blocker finished, lease
+        // expired, parent blocked — the AC3 trio.
+        seed_2026_09_04_trace(&db, "blocked", None, "completed", false).await;
+        seed_expired_lease(&db).await;
+
+        engine.reap_stale_blocked_dispatch_tasks().await;
+
+        let parent = db.get_task(PARENT_2140).await.unwrap().unwrap();
+        assert_ne!(
+            parent.status, "blocked",
+            "the trio must not be a stable state"
+        );
+        assert_eq!(
+            parent.status, "pending",
+            "with budget left, the net hands the parent back to the mika#2045 ladder"
+        );
+        let wrappers = wrappers_of(&db, PARENT_2140).await;
+        assert_eq!(wrappers.len(), 1, "a fresh wrapper must represent it again");
+    }
+
+    /// L4c, second branch: budget spent -> the net writes a visible failure
+    /// naming `stale_blocked_dispatch` rather than leaving the parent blocked.
+    #[tokio::test]
+    async fn test_replay_2026_09_04_stale_blocked_sweep_expires_without_budget() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let metadata = serde_json::json!({
+            "stuck_rearm_count": crate::skills::executor::MAX_STUCK_REARMS
+        })
+        .to_string();
+        seed_2026_09_04_trace(&db, "blocked", Some(&metadata), "completed", false).await;
+        seed_expired_lease(&db).await;
+
+        engine.reap_stale_blocked_dispatch_tasks().await;
+
+        let parent = db.get_task(PARENT_2140).await.unwrap().unwrap();
+        assert_eq!(parent.status, "failed");
+        let result = parent.result.unwrap_or_default();
+        assert!(
+            result.contains("stale_blocked_dispatch"),
+            "the failure must name the sweep that wrote it, got: {result}"
+        );
+    }
+
+    /// L5 (AC5) — a genuinely live blocker still refuses the second dispatch.
+    ///
+    /// This is the line L3b must never cross. The serialisation to one
+    /// `implement` per class is under operator guard (mika#2160) and is NOT
+    /// what this ticket removes.
+    #[tokio::test]
+    async fn test_stale_blocked_sweep_skips_live_blocker() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        seed_2026_09_04_trace(&db, "blocked", None, "in_progress", false).await;
+        seed_expired_lease(&db).await;
+
+        engine.reap_stale_blocked_dispatch_tasks().await;
+
+        let parent = db.get_task(PARENT_2140).await.unwrap().unwrap();
+        assert_eq!(parent.status, "blocked", "a live blocker must be honoured");
+        assert_eq!(db.get_stuck_rearm_count(PARENT_2140).await.unwrap(), 0);
+        assert!(
+            wrappers_of(&db, PARENT_2140).await.is_empty(),
+            "nothing may be re-armed while the blocker still runs"
+        );
+    }
+
+    /// L5 (AC5) — an unexpired lease still refuses the second dispatch, even
+    /// with the named blocker finished. The lease is the mika#1948 claim; a
+    /// sweep that ignored it would re-open the double-dispatch window.
+    #[tokio::test]
+    async fn test_stale_blocked_sweep_skips_unexpired_lease() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        seed_2026_09_04_trace(&db, "blocked", None, "completed", false).await;
+        db.try_acquire_dispatch_slot(
+            "implement",
+            "c479c873-0000-0000-0000-000000000000",
+            Some("mika_dev"),
+            600,
+        )
+        .await
+        .unwrap();
+
+        engine.reap_stale_blocked_dispatch_tasks().await;
+
+        let parent = db.get_task(PARENT_2140).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "blocked",
+            "a live lease must be honoured — this is what protects mika#2160's serialisation"
+        );
+        assert_eq!(db.get_stuck_rearm_count(PARENT_2140).await.unwrap(), 0);
+        assert!(wrappers_of(&db, PARENT_2140).await.is_empty());
+    }
+
+    /// L3b must not touch a deliberate operator gate. `blocked` is also what an
+    /// auto-merge refusal and a QA escalation write; only the slot refusal
+    /// carries `global_dispatch_active`. Measured negative control: task
+    /// `662d9752` carries `unauthorized_webhook_dispatch` and is excluded.
+    #[tokio::test]
+    async fn test_stale_blocked_sweep_ignores_non_slot_refusals() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        seed_raw_task(
+            &db,
+            "662d9752-e0e8-4a2b-869a-c711c37a7244",
+            None,
+            "ready-label: senara-solutions/mika#2158",
+            "manual",
+            "blocked",
+            "{}",
+            Some("https://github.com/senara-solutions/mika/issues/2158"),
+            Some("self_dev"),
+            Some("issue"),
+            Some(r#"{"error":"unauthorized_webhook_dispatch"}"#),
+            None,
+            None,
+            "2026-09-04T09:44:04Z",
+        )
+        .await;
+
+        engine.reap_stale_blocked_dispatch_tasks().await;
+
+        let parent = db
+            .get_task("662d9752-e0e8-4a2b-869a-c711c37a7244")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parent.status, "blocked",
+            "a refusal that is not a slot refusal is none of this sweep's business"
+        );
+    }
+
+    /// L2b measures and mutates nothing. A wrapper promoted long ago is
+    /// counted; nothing about it changes.
+    #[tokio::test]
+    async fn test_promotion_starvation_counts_without_mutating() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        // Backdate the epoch a day: the wrapper must be born AFTER it (else the
+        // bound correctly excludes it as pre-L1 residue) and stale enough to be
+        // reported. Stamping "now" would put the epoch after the promotion.
+        db.with_db(|d| {
+            d.conn.execute(
+                "INSERT INTO schema_meta (key, value)
+                 VALUES (?1, strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 day'))",
+                rusqlite::params![DEFERRED_PROMOTION_EPOCH_KEY],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let epoch = db
+            .stamp_schema_meta_epoch_if_absent(DEFERRED_PROMOTION_EPOCH_KEY)
+            .await
+            .unwrap();
+
+        seed_2026_09_04_trace(&db, "pending", None, "completed", true).await;
+        let promoted_at = crate::timestamp::now_minus(chrono::Duration::hours(2));
+        db.with_db(move |d| {
+            d.conn.execute(
+                "UPDATE tasks SET completed_at = ?2 WHERE id = ?1",
+                rusqlite::params![WRAPPER_F0CD, promoted_at],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let (count, oldest) = db
+            .count_promoted_undelivered_wrappers(900, &epoch)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "a wrapper promoted 2h ago is starving");
+        assert!(oldest >= 7000, "oldest age must be reported, got {oldest}");
+
+        engine.report_promotion_starvation().await;
+
+        let wrapper = db.get_task(WRAPPER_F0CD).await.unwrap().unwrap();
+        assert_eq!(
+            wrapper.status, "completed",
+            "the indicator must not destroy live work — this is the 2h47 lesson"
+        );
+        assert_eq!(db.get_stuck_rearm_count(PARENT_2140).await.unwrap(), 0);
+    }
+
+    /// The epoch bound excludes pre-L1 residue, which would otherwise fire the
+    /// indicator permanently for a reason unrelated to starvation.
+    #[tokio::test]
+    async fn test_promotion_starvation_excludes_pre_epoch_residue() {
+        let db = test_db();
+
+        seed_2026_09_04_trace(&db, "pending", None, "completed", true).await;
+        // Promoted before the epoch is stamped: pre-L1 shape.
+        let epoch = db
+            .stamp_schema_meta_epoch_if_absent(DEFERRED_PROMOTION_EPOCH_KEY)
+            .await
+            .unwrap();
+
+        let (count, _) = db
+            .count_promoted_undelivered_wrappers(0, &epoch)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "a wrapper promoted at 00:48:11Z on 2026-09-04 predates the epoch and must not be counted"
+        );
+    }
+
+    /// The epoch is stamped once and never moves — a second boot must not walk
+    /// it forward, or the bound would forget everything on every restart.
+    #[tokio::test]
+    async fn test_promotion_epoch_is_stamped_once() {
+        let db = test_db();
+        let first = db
+            .stamp_schema_meta_epoch_if_absent(DEFERRED_PROMOTION_EPOCH_KEY)
+            .await
+            .unwrap();
+        let second = db
+            .stamp_schema_meta_epoch_if_absent(DEFERRED_PROMOTION_EPOCH_KEY)
+            .await
+            .unwrap();
+        assert_eq!(
+            first, second,
+            "INSERT OR IGNORE must make later boots no-ops"
         );
     }
 
