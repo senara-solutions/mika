@@ -958,9 +958,16 @@ impl TaskEngine {
     /// the inline promotion at `dispatch_resume_agent` (dispatcher.rs) fails to fire.
     async fn promote_pending_deferred_if_idle(&self) {
         for class in DISPATCH_CLASSES {
-            match self.db.has_any_active_callback_for_class(class).await {
-                Ok(true) => continue, // Class slot occupied — skip this class
-                Ok(false) => {}       // Class slot free — try to promote one wrapper
+            // mika#2160 — compare a COUNT against the class cap. This used to be
+            // a boolean, which is the shape of a cap of exactly one; left that
+            // way while the dispatch guard learned to count, a cap above 1
+            // would admit new dispatches but make a DEFERRED one wait for the
+            // class to fall back to zero rather than below the cap. That is the
+            // asymmetric-predicate drift mika#1163 already had to name once.
+            let cap = crate::skills::executor::max_concurrent_for_class(class);
+            match self.db.count_active_callbacks_for_class(class).await {
+                Ok(active) if crate::skills::executor::class_cap_reached(active, cap) => continue, // Class at cap — skip
+                Ok(_) => {} // Room in the class — try to promote one wrapper
                 Err(e) => {
                     warn!(
                         error = %e,
