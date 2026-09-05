@@ -77,6 +77,48 @@ autres : le prédicat ne dit pas « je ne sais pas lire », il dit « ce ticket 
 
 ---
 
+## Acceptance criteria
+
+Transcription littérale des six critères du corps de mika#2188. Ils sont le contrat ; §3-§4
+disent *comment* on les atteint, cette section dit *ce qui doit être vrai* à la fin.
+
+**AC1 — un `ESCALATE` antérieur résolu n'écrase plus le `READY` qui le suit.**
+`grooming_verdict` rend `Groomed` sur un callout où une escalade antérieure est suivie d'une
+passe architecte aboutie exprimée en disposition `READY` :
+`… (ESCALATE-divergence, résolu…) → … first-pass (READY)` → `Groomed`.
+Le choix entre les deux formes candidates est tranché et **argumenté** (§2 : forme (a)
+retenue, (b) et (c) écartées avec leurs raisons), et l'argument est porté dans la doc-comment
+du module — pas seulement dans ce plan.
+
+**AC2 — non-régression d'ordre.** Une escalade **non** suivie d'une passe aboutie reste
+`Escalated`. `escalate_without_later_groomed_is_escalated` et
+`groomed_then_escalate_is_escalated_order_counts_both_ways` restent verts **sans
+modification** (diff vide, attesté par `git diff --stat`).
+
+**AC3 — non-régression de la règle AC1 de mika#2158.**
+`ac1_first_pass_ready_without_second_pass_is_groomed`,
+`ac1_french_first_pass_ready_without_second_pass_is_groomed`,
+`word_continuation_after_groomed_is_not_a_verdict` et `iterate_alone_is_absent` restent verts
+sans modification. En particulier `first-pass (READY) → second-pass (GROOMEDLY)` doit rester
+`Absent` : une seconde passe annoncée dont le verdict est illisible n'est pas rattrapée par sa
+première passe.
+
+**AC4 — les six fixtures figées gardent leur verdict.** `grooming_marker::tests::FIXTURES`
+reste à six entrées, `fixture_table` vert, et **aucun fichier de
+`crates/mika-agent/tests/fixtures/grooming_bodies/` n'est ajouté, modifié ou supprimé.**
+
+**AC5 — rejeu.** Une fixture portant le callout réel de mika-cloud#205 rend
+`has_groomed_verdict = true` après correctif et `false` avant. Le corps **entier** de
+mika-cloud#205 ne peut pas servir de fixture d'`is_groomed` : son callout `Plan` est préfixé
+par le dépôt (`mika-cloud/docs/plans/…`), ce qui relève de mika#2120 et non de ce ticket — la
+fixture doit **isoler la ligne `Grooming history`** (d'où la forme inline via `body_with()`,
+§4.5). Le « false avant » est **mesuré et cité**, et il doit valoir `Escalated`, pas `Absent`.
+
+**AC6 — le correctif ne fuit pas.** Il vit dans `grooming_marker.rs` et nulle part ailleurs ;
+`no_grooming_regex_outside_this_module` reste vert.
+
+---
+
 ## 2. La décision de forme, argumentée
 
 L'AC1 du ticket laisse deux formes candidates et exige que le choix soit argumenté.
@@ -374,6 +416,28 @@ doivent apparaître verts **et** leur diff doit être vide — le rapport de tra
 **Preuve du rouge-avant (obligatoire).** Le rapport cite la sortie de l'exécution du test de
 §4.1 sur le code non modifié, montrant `Escalated`. Sans elle, le correctif n'a pas de
 contrôle négatif.
+
+---
+
+## Fire-Disposition
+
+Ce plan livre des **détecteurs** : des tests qui, en devenant rouges, accusent quelque chose.
+Cette section dit d'avance quoi faire quand ils tirent — pour qu'aucune décision ne soit prise
+sous la pression d'une suite rouge.
+
+| détecteur | s'il tire | disposition |
+|---|---|---|
+| `fixture_table` — une des six fixtures figées bascule de verdict | le correctif a changé la sémantique sur des corps réels | **(c) halte-et-remontée.** Ne pas ajuster le tableau attendu, ne pas rafraîchir la fixture. Le README de `grooming_bodies/` le dit déjà pour le rafraîchissement (« S'il bouge, ne corrigez pas le tableau ») ; c'est ici la règle symétrique côté code. Arrêter, remonter à l'opérateur avec la fixture et le verdict obtenu. |
+| `ac7_both_rust_predicates_agree_on_the_frozen_bodies` — désaccord entre `auto_pull::is_groomed` et `executor::check_grooming_markers` | le correctif a atteint un seul des deux appelants | **(c) halte-et-remontée.** Ce croisement est l'AC7 de mika#2158 ; un désaccord signifie que la centralisation a été défaite. |
+| `mika2120_divergence_is_still_open_and_this_test_pins_it` — devient rouge | le correctif a débordé sur la condition `Plan`, qui est **sous arbitrage opérateur** | **(c) halte-et-remontée.** Ne pas supprimer ce test « puisqu'il gêne » : sa suppression est prévue, mais dans le commit qui rend mika#2120, pas ici. |
+| `no_grooming_regex_outside_this_module` — devient rouge | une regex de marqueur a été recopiée hors du module | **(c) halte-et-remontée.** C'est l'AC6, et la garde a fait exactement son travail. |
+| les quatre tests d'AC3 / les deux d'AC2 — deviennent rouges | la porte `LATER_PASS_RE` ou la sémantique d'ordre a été perdue dans la réécriture | **(c) halte-et-remontée.** Ces tests ne doivent **pas** être modifiés pour redevenir verts : leur modification serait l'aveu que le correctif a changé une sémantique que les AC interdisent de changer. |
+| le test AC5 (`ac1_escalate_divergence_resolved_then_first_pass_ready_is_groomed`) — rouge **avant** correctif | attendu, c'est le contrôle négatif | **Poursuivre — mais lire la valeur.** `Escalated` confirme le diagnostic ; **`Absent` l'invalide** et impose la halte : la cause serait autre que celle décrite au §1, et le plan devrait être re-groomé plutôt qu'implémenté. |
+
+**Allowlist d'exceptions : vacante.** Aucun test existant n'est autorisé à être modifié,
+désactivé, `#[ignore]`é ou vu son attente ajustée dans le périmètre de ce ticket. Le seul
+fichier de `src/` modifié est `grooming_marker.rs`, et les seuls tests ajoutés sont les deux
+nommés au §4.
 
 ---
 
