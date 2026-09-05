@@ -289,6 +289,34 @@ impl DeferredWrapperSummary {
     }
 }
 
+/// A `blocked` self_dev issue parent refused on a busy dispatch slot, whose
+/// wrapper never reached consumption (mika#2169, L3b).
+///
+/// Sibling of [`OrphanedPendingTask`], and deliberately a **separate**
+/// population rather than a widening of it. `find_orphaned_pending_issue_tasks`
+/// keys on `parent.status = 'pending'`; relaxing that clause to
+/// `IN ('pending','blocked')` would sweep in the deliberate operator gates —
+/// `blocked` is also what an auto-merge refusal and a QA escalation write. The
+/// discriminant is `result.$.error = 'global_dispatch_active'`: only the
+/// slot-refusal path writes it, so the two queries stay disjoint and each stays
+/// readable on its own.
+#[derive(Debug, Clone)]
+pub struct StaleBlockedTask {
+    pub id: String,
+    pub reference_url: String,
+    pub created_at: String,
+    pub age_seconds: i64,
+    /// Repairs already attempted for this parent, read from
+    /// `metadata.stuck_rearm_count`. Absent or unreadable metadata reads as 0.
+    pub rearm_count: i64,
+    pub dispatch_class: String,
+    /// The callback the refusal named as holding the slot, read from
+    /// `result.$.blocking_callback_id`. `None` when the field is absent or the
+    /// result is not valid JSON — the sweep then treats the blocker as gone,
+    /// which is what a vanished row means.
+    pub blocking_callback_id: Option<String>,
+}
+
 /// Snapshot of a child task for the orphaned-parent reaper's structured log
 /// event (`task_engine_reaper.evaluated`). Captures all children of a candidate
 /// parent at kill time for post-incident diagnosis (mika#1126).
