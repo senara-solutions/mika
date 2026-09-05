@@ -187,7 +187,13 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
                 std::process::exit(1);
             }
 
-            match db.force_promote_deferred_for_class(&class).await? {
+            match db
+                .force_promote_deferred_for_class(
+                    &class,
+                    mika_agent::skills::executor::max_concurrent_for_class(&class),
+                )
+                .await?
+            {
                 ForcePromoteResult::Promoted { task_id } => {
                     db.log_audit_event(
                         "cli",
@@ -259,7 +265,13 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
                         .await?;
 
                         // Retry promotion after cancel.
-                        match db.force_promote_deferred_for_class(&class).await? {
+                        match db
+                            .force_promote_deferred_for_class(
+                                &class,
+                                mika_agent::skills::executor::max_concurrent_for_class(&class),
+                            )
+                            .await?
+                        {
                             ForcePromoteResult::Promoted { task_id } => {
                                 db.log_audit_event(
                                     "cli",

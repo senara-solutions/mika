@@ -61,7 +61,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **Grounding rule:** The system prompt prohibits the agent from claiming downstream system state unless a tool result confirms it. Reinforced in `format_callback_framing` and `SilentTrigger::Callback`.
 - **Confirmation before action:** The system prompt instructs the agent to answer informational questions directly without starting multi-step workflows.
 - **Context priority:** current user message > core memory > active skill context > conversation summary > conversation history > search results. See `docs/memory-classification.md`.
-- **Database:** Case-insensitive COLLATE NOCASE on unique text columns. Schema v50. See `crates/mika-agent/CLAUDE.md` for schema details.
+- **Database:** Case-insensitive COLLATE NOCASE on unique text columns. Schema v52. See `crates/mika-agent/CLAUDE.md` for schema details.
   - v27->v28: `agent_kg_corpora` table (#798) — maps `agent_id` to `docs_root_hash` for multi-corpus query fan-out. Populated by startup lexical ingest.
   - v28->v29: Backfill migration (#908) — scrubs secret-shaped values from existing `tool_calls.input` and `tool_calls.output` rows using `secret_scrubber::scrub_secrets()`. Data-only, no DDL. New `save_tool_call()` calls also scrub before INSERT.
   - v29->v30: Expand `kg_resolutions_log.outcome` CHECK constraint to include `'matched_llm_db_fallback'` (#874). Enables DB-fallback acceptance path for LLM matches outside the in-prompt candidate window.
@@ -258,6 +258,39 @@ Optional (bounded webhook queue — mika#1870):
 
 Optional (destructive-action grounding gate — mika#1646):
 - `MIKA_DEV_REPEAT_ACTION_WINDOW_SECS` — Window (seconds) within which a second `gh pr close` / `gh issue close` on the same target counts as a **repeat** and must acknowledge the prior one in its `--comment` (default `1800` = 30 min). Absent/empty → default; unparseable, `0`, or negative → default with a `destructive_window_invalid` WARN. Note `0` does **not** disable the check: on a destructive action an operator typo must not silently reopen the hole. Repeat detection reads the persisted `tool_calls` table scoped to the agent, so it survives a process restart and a deferred webhook replay — the founding incident's second close came from exactly such a replay, from a context sharing no memory with the first. Operator grep signal: `destructive_action_blocked` in `$MIKA_SPIRIT_LOG_FILE`; SQL surface: `SELECT * FROM audit_events WHERE tool_name = 'destructive_action_grounding'`.
+
+Optional (dispatch concurrency cap — mika#2160):
+- `MIKA_DISPATCH_MAX_CONCURRENT_IMPLEMENT` — How many `implement` dispatches may be
+  in flight at once for one agent (default `1`). Three-tier parse, the same shape as
+  `MIKA_AUTO_PULL_MAX_BEHIND`: absent/empty → default; unparseable or negative →
+  default with a WARN; the literal `0` **disables** the cap (unbounded). **The
+  default is 1 and mika#2160 does not move it** — the ticket makes N choosable, the
+  operator chooses it.
+  - **Three places enforce the cap, and all three move together or the setting is
+    decorative.** (1) The dispatch guard compares `count_active_callback_tasks_excluding`
+    (distinct parents, not rows) against the cap — at the default of 1 it keeps the
+    original single-query path, so the shipped behaviour gains no extra round trip.
+    (2) `dispatch_slot_leases` gained `slot_index` in its PRIMARY KEY at schema v52,
+    because `PRIMARY KEY (agent_id, dispatch_class)` was itself a hard cap of one
+    whatever the guard decided; the claim also refuses when live leases already meet
+    the cap, so lowering the cap while leases are live cannot leave the class
+    over-subscribed. (3) The deferred-promotion backstop
+    (`engine.rs::promote_pending_deferred_if_idle`) and the force-promote override
+    compare `count_active_callbacks_for_class` against the cap instead of asking
+    "is anything active" — left boolean, a raised cap would admit new dispatches
+    while a *deferred* one waited for the class to fall back to **zero**, which is
+    the asymmetric-predicate drift mika#1163 already had to name once.
+  - **Raising it above 1 is gated on mika#2163, not on this variable.** The
+    `canUseTool` permission callback reaches mika-dev through `/a2a/{agent}`, which
+    takes the per-agent mutex with `try_lock_owned()` (`server/a2a.rs:226`, `:360`)
+    and answers `"Agent is busy"` on collision — refuse, not defer. Two pilots whose
+    permission escalations overlap would see one refused mid-session. `/message` got
+    a bounded queue in mika#1870; the A2A path did not.
+  - Measured hardware bound on gentux (2026-09-04): disk is the binding axis at
+    **N = 2 to 4** (98 G free on the worktree volume, 19–38 G per in-flight
+    `target/`); RAM and CPU are not. Full inventory and procedure:
+    `docs/solutions/cross-repo-patterns/pilot-concurrency-shared-resources-2026-09-03.md`.
+  - `groom` is out of scope and keeps its cap of one.
 
 Optional (dispatch grooming gate):
 - `MIKA_DISPATCH_BYPASS_GROOMING_CHECK` — Emergency bypass for the grooming-marker dispatch gate (#919). When `1` or `true` (case-insensitive), `validate_dispatch_readiness()` skips the three-signal grooming check on `dev-pilot` dispatches. Logged at WARN on every hit. Default: unset (gate active).

@@ -56,7 +56,10 @@ impl Tool for PromoteDeferredCallbackTool {
 
         let result = ctx
             .db
-            .force_promote_deferred_for_class(dispatch_class)
+            .force_promote_deferred_for_class(
+                dispatch_class,
+                crate::skills::executor::max_concurrent_for_class(dispatch_class),
+            )
             .await?;
 
         match result {

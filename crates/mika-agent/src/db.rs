@@ -27,7 +27,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 51;
+pub const CURRENT_SCHEMA_VERSION: i64 = 52;
 
 /// `(target_key, before_value, after_value, reasoning)` — return shape for
 /// [`Database::get_audit_event_rows_by_tool_name`] and its async wrapper.
@@ -1205,6 +1205,11 @@ impl Database {
             info!(version = 51, "database migrated to v51");
         }
 
+        if (3..=51).contains(&version) {
+            self.migrate_v51_to_v52()?;
+            info!(version = 52, "database migrated to v52");
+        }
+
         Ok(())
     }
 
@@ -1259,7 +1264,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (51);
+            INSERT INTO schema_version (version) VALUES (52);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -1374,12 +1379,16 @@ impl Database {
                 ON tasks(agent_id, dispatcher_source, status)
                 WHERE dispatcher_source IS NOT NULL;
 
-            -- mika#1948 Porte 2 — one row per (agent, class) = one exec slot.
-            -- The PRIMARY KEY is what makes the claim atomic: a second
+            -- mika#1948 Porte 2 — one row per (agent, class, slot) = one exec
+            -- slot. The PRIMARY KEY is what makes the claim atomic: a second
             -- claimant's INSERT collides instead of racing a SELECT.
+            -- mika#2160: `slot_index` joined the key so the class ceases to be
+            -- a hard cap of one. At the default cap of 1 exactly one index (0)
+            -- is ever written, which is the pre-v52 shape bit for bit.
             CREATE TABLE dispatch_slot_leases (
                 agent_id TEXT NOT NULL,
                 dispatch_class TEXT NOT NULL,
+                slot_index INTEGER NOT NULL DEFAULT 0,
                 holder_task_id TEXT NOT NULL,
                 dispatcher_source TEXT CHECK (
                     dispatcher_source IS NULL
@@ -1387,7 +1396,7 @@ impl Database {
                 ),
                 acquired_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
-                PRIMARY KEY (agent_id, dispatch_class)
+                PRIMARY KEY (agent_id, dispatch_class, slot_index)
             );
             CREATE INDEX idx_tasks_next_fire ON tasks(next_fire_at)
                 WHERE status IN ('pending','recurring_active');
@@ -4882,6 +4891,84 @@ impl Database {
         Ok(())
     }
 
+    /// v51 → v52 (mika#2160) — the exec-slot lease stops being a hard cap of one.
+    ///
+    /// `dispatch_slot_leases` carried `PRIMARY KEY (agent_id, dispatch_class)`,
+    /// which is itself a cap of one independent of any predicate: a class
+    /// cannot hold two live leases whatever the TTL. Adding `slot_index` to the
+    /// key is what makes a configurable cap real rather than decorative — see
+    /// KTD1 in the mika#2160 plan, and the test that asserts two acquisitions.
+    ///
+    /// The migration is a table rebuild (SQLite cannot extend a PRIMARY KEY in
+    /// place). Existing rows land at `slot_index = 0`, so a database migrated
+    /// mid-dispatch keeps its live lease and the holder that owns it.
+    ///
+    /// At the default cap of 1 exactly one index is ever written and the
+    /// behaviour is the pre-v52 behaviour, bit for bit.
+    fn migrate_v51_to_v52(&mut self) -> Result<()> {
+        let version = self.schema_version()?;
+        if version >= 52 {
+            return Ok(());
+        }
+        if version != 51 {
+            anyhow::bail!(
+                "migrate_v51_to_v52 called with unexpected baseline version {version} \
+                 (expected 51) — refusing to apply migration; investigate migration order"
+            );
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        // The column may already exist if a previous run was interrupted
+        // between the rebuild and the version bump; PRAGMA-detect, do not assume.
+        let has_col: bool = {
+            let mut stmt = tx.prepare("PRAGMA table_info(dispatch_slot_leases)")?;
+            let names: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .collect();
+            names.iter().any(|n| n == "slot_index")
+        };
+
+        if !has_col {
+            tx.execute_batch(
+                "-- v52: mika#2160 — slot_index joins the lease key.
+                 CREATE TABLE dispatch_slot_leases_v52 (
+                     agent_id TEXT NOT NULL,
+                     dispatch_class TEXT NOT NULL,
+                     slot_index INTEGER NOT NULL DEFAULT 0,
+                     holder_task_id TEXT NOT NULL,
+                     dispatcher_source TEXT CHECK (
+                         dispatcher_source IS NULL
+                         OR dispatcher_source IN ('mika_dev', 'mika_manager', 'operator')
+                     ),
+                     acquired_at TEXT NOT NULL,
+                     expires_at TEXT NOT NULL,
+                     PRIMARY KEY (agent_id, dispatch_class, slot_index)
+                 );
+
+                 INSERT INTO dispatch_slot_leases_v52
+                     (agent_id, dispatch_class, slot_index, holder_task_id,
+                      dispatcher_source, acquired_at, expires_at)
+                 SELECT agent_id, dispatch_class, 0, holder_task_id,
+                        dispatcher_source, acquired_at, expires_at
+                 FROM dispatch_slot_leases;
+
+                 DROP TABLE dispatch_slot_leases;
+                 ALTER TABLE dispatch_slot_leases_v52 RENAME TO dispatch_slot_leases;",
+            )?;
+        }
+
+        tx.execute("INSERT INTO schema_version (version) VALUES (52)", [])?;
+        tx.commit()?;
+
+        info!("v51→v52: dispatch_slot_leases gained slot_index in its key (mika#2160)");
+
+        Ok(())
+    }
+
     /// Insert a permission-decision provenance record (mika#1733 AC4). All
     /// fields correspond 1:1 to the v44 schema columns. `override_used` is
     /// derived by the caller and asserted at the CHECK constraint here as
@@ -8011,6 +8098,41 @@ impl Database {
         }
     }
 
+    /// How many *distinct* dispatches of this class are active for this agent,
+    /// excluding `excluded_parent_id` (mika#2160).
+    ///
+    /// The companion to [`Database::has_active_callback_tasks_excluding`], with
+    /// the identical WHERE clause. It exists because a configurable cap needs a
+    /// number and the predicate only ever answered "is there at least one" —
+    /// the shape of a cap of exactly 1. KTD5: the existing signature is left
+    /// alone, it has callers in production, in tests, and an async twin.
+    ///
+    /// `COUNT(DISTINCT parent_task_id)`, not `COUNT(*)`: a dispatch is a
+    /// parent, and a parent that happens to carry two callback rows of the same
+    /// class is still one dispatch. Counting rows would fill the cap with a
+    /// single dispatch and re-serialize the class behind the operator's back.
+    pub fn count_active_callback_tasks_excluding(
+        &self,
+        excluded_parent_id: &str,
+        agent_id: &str,
+        dispatch_class: &str,
+    ) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(DISTINCT t.parent_task_id)
+             FROM tasks t
+             WHERE t.trigger_type = 'callback'
+               AND t.status IN ('pending', 'in_progress')
+               AND t.parent_task_id IS NOT NULL
+               AND t.parent_task_id != ?1
+               AND t.agent_id = ?2
+               AND COALESCE(t.dispatch_class, 'implement') = ?3
+               AND t.label NOT LIKE '%:deferred'",
+            params![excluded_parent_id, agent_id, dispatch_class],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     /// Record which dispatcher initiated a task (mika#1948).
     ///
     /// A separate write rather than a `NewTask` field on purpose: `NewTask` has
@@ -8115,6 +8237,7 @@ impl Database {
         holder_task_id: &str,
         dispatcher_source: Option<&str>,
         ttl_secs: i64,
+        max_slots: i64,
     ) -> Result<SlotClaim> {
         let now = Utc::now();
         let now_s = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
@@ -8126,18 +8249,14 @@ impl Database {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let changed = tx.execute(
-            "INSERT INTO dispatch_slot_leases
-                 (agent_id, dispatch_class, holder_task_id, dispatcher_source,
-                  acquired_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(agent_id, dispatch_class) DO UPDATE SET
-                 holder_task_id    = excluded.holder_task_id,
-                 dispatcher_source = excluded.dispatcher_source,
-                 acquired_at       = excluded.acquired_at,
-                 expires_at        = excluded.expires_at
-             WHERE dispatch_slot_leases.expires_at <= ?5
-                OR dispatch_slot_leases.holder_task_id = ?3",
+        // 1. Idempotent re-claim. Before v52 this was the `OR holder_task_id =
+        //    ?3` arm of the upsert; with several slots it has to come first, or
+        //    a holder that already owns slot 1 would take a free slot 0 as well
+        //    and spend two slots on one dispatch.
+        let refreshed = tx.execute(
+            "UPDATE dispatch_slot_leases
+                SET dispatcher_source = ?4, acquired_at = ?5, expires_at = ?6
+              WHERE agent_id = ?1 AND dispatch_class = ?2 AND holder_task_id = ?3",
             params![
                 agent_id,
                 dispatch_class,
@@ -8147,20 +8266,133 @@ impl Database {
                 expires_s
             ],
         )?;
-
-        if changed > 0 {
+        if refreshed > 0 {
             tx.commit()?;
             return Ok(SlotClaim::Acquired);
         }
 
-        // The claim collided with a live lease. Read the holder inside the same
-        // transaction so the reported blocker is the one we actually lost to.
+        // 2. Take the first index whose lease is free or expired. `max_slots <=
+        //    0` is the explicit disable sentinel (KTD3, the grammar of
+        //    `MIKA_AUTO_PULL_MAX_BEHIND` and `MAX_REDRIVES_ENV`): the cap is
+        //    lifted, so a fresh index is appended rather than contended for.
+        if max_slots <= 0 {
+            // Reclaim an expired index before minting a new one. Without this,
+            // every claim under the disable sentinel appends a row that nothing
+            // ever removes: `release_dispatch_slot` has no production caller,
+            // and before v52 the two-column PRIMARY KEY forced each claim to
+            // overwrite the single row. `slot_index` is what makes unbounded
+            // accumulation representable, so the reclaim has to be explicit.
+            // The table is then bounded by the high-water mark of *live*
+            // leases, not by the total number of dispatches ever made.
+            let reclaimed: Option<i64> = tx
+                .query_row(
+                    "SELECT MIN(slot_index) FROM dispatch_slot_leases
+                      WHERE agent_id = ?1 AND dispatch_class = ?2
+                        AND expires_at <= ?3",
+                    params![agent_id, dispatch_class, now_s],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+
+            if let Some(idx) = reclaimed {
+                tx.execute(
+                    "UPDATE dispatch_slot_leases
+                        SET holder_task_id = ?4, dispatcher_source = ?5,
+                            acquired_at = ?6, expires_at = ?7
+                      WHERE agent_id = ?1 AND dispatch_class = ?2 AND slot_index = ?3",
+                    params![
+                        agent_id,
+                        dispatch_class,
+                        idx,
+                        holder_task_id,
+                        dispatcher_source,
+                        now_s,
+                        expires_s
+                    ],
+                )?;
+                tx.commit()?;
+                return Ok(SlotClaim::Acquired);
+            }
+
+            let next: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(slot_index), -1) + 1 FROM dispatch_slot_leases
+                  WHERE agent_id = ?1 AND dispatch_class = ?2",
+                params![agent_id, dispatch_class],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO dispatch_slot_leases
+                     (agent_id, dispatch_class, slot_index, holder_task_id,
+                      dispatcher_source, acquired_at, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    agent_id,
+                    dispatch_class,
+                    next,
+                    holder_task_id,
+                    dispatcher_source,
+                    now_s,
+                    expires_s
+                ],
+            )?;
+            tx.commit()?;
+            return Ok(SlotClaim::Acquired);
+        }
+
+        // A cap lowered while leases are live can leave rows ABOVE the new
+        // ceiling. Scanning `0..max_slots` alone would not see them: at cap 2
+        // slots 0 and 1 are taken, the operator reverts to 1, slot 0 expires —
+        // and a fresh claim would win slot 0 while slot 1 is still live, so two
+        // leases exist under a cap of one. Count what is live first; the index
+        // scan below then only has to find a free slot, not to police the cap.
+        let live: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM dispatch_slot_leases
+              WHERE agent_id = ?1 AND dispatch_class = ?2 AND expires_at > ?3",
+            params![agent_id, dispatch_class, now_s],
+            |row| row.get(0),
+        )?;
+        if live < max_slots {
+            for slot_index in 0..max_slots {
+                let changed = tx.execute(
+                    "INSERT INTO dispatch_slot_leases
+                     (agent_id, dispatch_class, slot_index, holder_task_id,
+                      dispatcher_source, acquired_at, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(agent_id, dispatch_class, slot_index) DO UPDATE SET
+                     holder_task_id    = excluded.holder_task_id,
+                     dispatcher_source = excluded.dispatcher_source,
+                     acquired_at       = excluded.acquired_at,
+                     expires_at        = excluded.expires_at
+                 WHERE dispatch_slot_leases.expires_at <= ?6",
+                    params![
+                        agent_id,
+                        dispatch_class,
+                        slot_index,
+                        holder_task_id,
+                        dispatcher_source,
+                        now_s,
+                        expires_s
+                    ],
+                )?;
+                if changed > 0 {
+                    tx.commit()?;
+                    return Ok(SlotClaim::Acquired);
+                }
+            }
+        }
+
+        // Every slot collided with a live lease, or the cap is already met. Read a holder inside the same
+        // transaction so the reported blocker is one we actually lost to; the
+        // lowest live index is chosen so the answer is deterministic.
         let held = tx
             .query_row(
                 "SELECT holder_task_id, dispatcher_source, expires_at
                  FROM dispatch_slot_leases
-                 WHERE agent_id = ?1 AND dispatch_class = ?2",
-                params![agent_id, dispatch_class],
+                 WHERE agent_id = ?1 AND dispatch_class = ?2 AND expires_at > ?3
+                 ORDER BY slot_index ASC
+                 LIMIT 1",
+                params![agent_id, dispatch_class, now_s],
                 |row| {
                     Ok(SlotClaim::Held {
                         holder_task_id: row.get(0)?,
@@ -8203,8 +8435,14 @@ impl Database {
         Ok(n > 0)
     }
 
-    /// The current live holder of a slot lease, if any (mika#1948).
+    /// A live holder of a slot lease for this class, if any (mika#1948).
     /// Expired leases read as free — they are reclaimable by definition.
+    ///
+    /// Since mika#2160 a class may hold several live leases, so this returns
+    /// the **lowest-indexed** one. The ordering is explicit rather than left to
+    /// SQLite's scan order: before v52 the PRIMARY KEY made "the holder"
+    /// singular and the question could not arise, and a caller that inherited
+    /// that assumption would otherwise get a different answer run to run.
     pub fn dispatch_slot_lease_holder(
         &self,
         agent_id: &str,
@@ -8216,7 +8454,9 @@ impl Database {
             .query_row(
                 "SELECT holder_task_id, dispatcher_source
                  FROM dispatch_slot_leases
-                 WHERE agent_id = ?1 AND dispatch_class = ?2 AND expires_at > ?3",
+                 WHERE agent_id = ?1 AND dispatch_class = ?2 AND expires_at > ?3
+                 ORDER BY slot_index ASC
+                 LIMIT 1",
                 params![agent_id, dispatch_class, now_s],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -8429,6 +8669,44 @@ impl Database {
         Ok(count > 0)
     }
 
+    /// How many *dispatches* of this class occupy the per-class slots
+    /// (mika#2160). Counting companion to
+    /// [`Database::has_any_active_callback_for_class`], with the identical
+    /// WHERE clause.
+    ///
+    /// It exists because that predicate is a boolean — the shape of a cap of
+    /// exactly one — and it gates the deferred-promotion backstop
+    /// (`engine.rs::promote_pending_deferred_if_idle`) and the force-promote
+    /// override. Leaving them boolean while the dispatch guard learned to count
+    /// would make a cap above 1 half-effective: new dispatches would be
+    /// admitted, but a *deferred* one would wait for the class to fall back to
+    /// **zero** rather than below the cap — the asymmetric-predicate drift
+    /// mika#1163 names, rebuilt.
+    ///
+    /// `COUNT(DISTINCT COALESCE(parent_task_id, id))`: a dispatch is a parent,
+    /// so two callback rows under one parent are one occupant. The COALESCE
+    /// keeps a parentless row counting as itself, preserving the boolean
+    /// predicate's answer for that shape rather than collapsing several such
+    /// rows into one.
+    pub fn count_active_callbacks_for_class(
+        &self,
+        agent_id: &str,
+        dispatch_class: &str,
+    ) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(DISTINCT COALESCE(parent_task_id, id)) FROM tasks
+             WHERE agent_id = ?1
+               AND trigger_type = 'callback'
+               AND action_type = 'resume_agent'
+               AND status IN ('pending', 'in_progress')
+               AND label NOT LIKE '%:deferred'
+               AND COALESCE(dispatch_class, 'implement') = ?2",
+            params![agent_id, dispatch_class],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     /// Force-promote the next pending deferred wrapper for a dispatch class,
     /// with fail-closed slot-availability semantics. Checks
     /// `has_any_active_callback_for_class()` first; if the slot is occupied,
@@ -8444,10 +8722,15 @@ impl Database {
         &self,
         agent_id: &str,
         dispatch_class: &str,
+        max_slots: i64,
     ) -> Result<ForcePromoteResult> {
         // Slot-availability check (fail-closed) — same predicate as the
-        // periodic backstop in engine.rs (mika#1163 parity).
-        if self.has_any_active_callback_for_class(agent_id, dispatch_class)? {
+        // periodic backstop in engine.rs (mika#1163 parity). Since mika#2160
+        // that predicate counts and compares against the class cap; `max_slots`
+        // arrives as a parameter, the way `ttl_secs` does for the lease, so the
+        // layer that owns the setting stays the one that reads the environment.
+        let active = self.count_active_callbacks_for_class(agent_id, dispatch_class)?;
+        if max_slots > 0 && active >= max_slots {
             // Fetch the blocker's label for the rejection message.
             let blocking_label: String = self
                 .conn
@@ -12957,6 +13240,266 @@ mod tests {
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
     }
 
+    // ---- mika#2160: the lease cap becomes choosable ----
+
+    /// A fresh DB must carry the v52 surface without any migration running —
+    /// `migrate_v1` builds the schema directly, so a key column added only to
+    /// the migration would be missing on every new install.
+    #[test]
+    fn test_fresh_db_lease_table_has_slot_index_in_its_key() {
+        let db = db();
+        let cols: Vec<(String, i64)> = db
+            .conn
+            .prepare("PRAGMA table_info(dispatch_slot_leases)")
+            .unwrap()
+            .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(5)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        let slot = cols.iter().find(|(n, _)| n == "slot_index");
+        assert!(
+            slot.is_some_and(|(_, pk)| *pk > 0),
+            "fresh DB must carry slot_index inside the PRIMARY KEY — got {cols:?}"
+        );
+    }
+
+    #[test]
+    fn test_migrate_v51_to_v52_is_idempotent() {
+        let mut db = db();
+        // Already at CURRENT (>=52) — must no-op rather than double-apply.
+        db.migrate_v51_to_v52().unwrap();
+        db.migrate_v51_to_v52().unwrap();
+        let version: i64 = db
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_migrate_v51_to_v52_bails_on_unexpected_baseline() {
+        let mut db = db();
+        db.conn.execute("DELETE FROM schema_version", []).unwrap();
+        db.conn
+            .execute("INSERT INTO schema_version (version) VALUES (49)", [])
+            .unwrap();
+        let err = db.migrate_v51_to_v52().unwrap_err();
+        assert!(
+            err.to_string().contains("unexpected baseline version 49"),
+            "migration must name the baseline it refused — got {err}"
+        );
+    }
+
+    /// AC4, lease half. Two concurrent `implement` claimants each get a lease
+    /// at a cap of two, and a third is refused.
+    ///
+    /// The assertion is on **two `Acquired`**, not on the guard passing: before
+    /// mika#2160 the lease PRIMARY KEY was itself a cap of one, so a cap that
+    /// only moved the count predicate would read as configured and serialize
+    /// anyway. This is the test that makes the setting non-decorative (KTD1).
+    ///
+    /// No environment is mutated: the cap is a parameter, so the module's
+    /// tests keep running in parallel.
+    #[test]
+    fn test_two_implement_claims_each_take_a_lease_at_cap_two() {
+        let mut db = db();
+        let a = db
+            .try_acquire_dispatch_slot("mika", "implement", "task-a", Some("mika_dev"), 120, 2)
+            .unwrap();
+        assert_eq!(a, SlotClaim::Acquired, "first claimant takes a slot");
+
+        let b = db
+            .try_acquire_dispatch_slot("mika", "implement", "task-b", Some("mika_manager"), 120, 2)
+            .unwrap();
+        assert_eq!(
+            b,
+            SlotClaim::Acquired,
+            "second claimant must take the SECOND slot — a cap of 2 that only \
+             refuses is the decorative-setting regression KTD1 names"
+        );
+
+        // Two distinct holders, two distinct indices.
+        let holders: Vec<(String, i64)> = db
+            .conn
+            .prepare(
+                "SELECT holder_task_id, slot_index FROM dispatch_slot_leases
+                  WHERE agent_id = 'mika' AND dispatch_class = 'implement'
+                  ORDER BY slot_index",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(
+            holders,
+            vec![("task-a".to_string(), 0), ("task-b".to_string(), 1)],
+            "each dispatch must hold its own indexed slot"
+        );
+
+        let c = db
+            .try_acquire_dispatch_slot("mika", "implement", "task-c", None, 120, 2)
+            .unwrap();
+        assert!(
+            matches!(c, SlotClaim::Held { .. }),
+            "a third claimant must be refused at a cap of two — got {c:?}"
+        );
+    }
+
+    /// AC5, lease half. At the default cap of 1 the lease behaves exactly as it
+    /// did before v52: one holder, one row, at index 0.
+    #[test]
+    fn test_cap_of_one_is_the_pre_v52_behaviour() {
+        let mut db = db();
+        assert_eq!(
+            db.try_acquire_dispatch_slot("mika", "implement", "task-a", None, 120, 1)
+                .unwrap(),
+            SlotClaim::Acquired
+        );
+        assert!(
+            matches!(
+                db.try_acquire_dispatch_slot("mika", "implement", "task-b", None, 120, 1)
+                    .unwrap(),
+                SlotClaim::Held { .. }
+            ),
+            "the default cap must still serialize the class to one"
+        );
+        let (rows, max_idx): (i64, i64) = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(slot_index), -1) FROM dispatch_slot_leases",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((rows, max_idx), (1, 0), "exactly one row, at index 0");
+    }
+
+    /// A holder that already owns a slot must not consume a second one when it
+    /// re-claims. Before v52 the upsert's `OR holder_task_id = ?` arm gave this
+    /// for free; with several slots it has to be checked first.
+    #[test]
+    fn test_re_claim_by_same_holder_does_not_consume_a_second_slot() {
+        let mut db = db();
+        db.try_acquire_dispatch_slot("mika", "implement", "task-a", None, 120, 3)
+            .unwrap();
+        assert_eq!(
+            db.try_acquire_dispatch_slot("mika", "implement", "task-a", None, 120, 3)
+                .unwrap(),
+            SlotClaim::Acquired,
+            "re-claim by the same holder stays idempotent"
+        );
+        let rows: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM dispatch_slot_leases", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 1, "one dispatch must never hold two slots");
+    }
+
+    /// A cap lowered while leases are live must not leave the class
+    /// over-subscribed. Found in review: scanning `0..max_slots` alone cannot
+    /// see a live row ABOVE the new ceiling, so a freed low index would be
+    /// handed out while a high one is still held.
+    #[test]
+    fn test_cap_downshift_does_not_over_subscribe_the_class() {
+        let mut db = db();
+        // Two live leases at a cap of two: slots 0 and 1.
+        db.try_acquire_dispatch_slot("mika", "implement", "task-a", None, 120, 2)
+            .unwrap();
+        db.try_acquire_dispatch_slot("mika", "implement", "task-b", None, 120, 2)
+            .unwrap();
+
+        // Slot 0 frees (its holder released); slot 1 is still live.
+        assert!(
+            db.release_dispatch_slot("mika", "implement", "task-a")
+                .unwrap()
+        );
+
+        // The operator reverts the cap to the default. A new claim must be
+        // refused: one lease is already live and the cap is one — even though
+        // index 0 is now free.
+        let c = db
+            .try_acquire_dispatch_slot("mika", "implement", "task-c", None, 120, 1)
+            .unwrap();
+        assert!(
+            matches!(c, SlotClaim::Held { .. }),
+            "a cap lowered to 1 with one live lease must refuse — got {c:?}"
+        );
+
+        let live: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM dispatch_slot_leases WHERE expires_at > \
+                 strftime('%Y-%m-%dT%H:%M:%SZ','now')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            live, 1,
+            "the class must never hold more leases than its cap"
+        );
+    }
+
+    /// With the cap disabled, an expired index must be reclaimed rather than a
+    /// new one minted. Found in review: `release_dispatch_slot` has no
+    /// production caller, so without reclaim the table would grow by one row
+    /// per dispatch, forever — something the pre-v52 single-row PRIMARY KEY
+    /// made impossible to express.
+    #[test]
+    fn test_cap_zero_reclaims_an_expired_index_instead_of_leaking() {
+        let mut db = db();
+        // Born expired (ttl 0), so it is reclaimable immediately.
+        db.try_acquire_dispatch_slot("mika", "implement", "dead-1", None, 0, 0)
+            .unwrap();
+        db.try_acquire_dispatch_slot("mika", "implement", "dead-2", None, 0, 0)
+            .unwrap();
+
+        // Two fresh claims must land on the two expired indices, not above them.
+        db.try_acquire_dispatch_slot("mika", "implement", "live-1", None, 120, 0)
+            .unwrap();
+        db.try_acquire_dispatch_slot("mika", "implement", "live-2", None, 120, 0)
+            .unwrap();
+
+        let (rows, max_idx): (i64, i64) = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(slot_index), -1) FROM dispatch_slot_leases",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (rows, max_idx),
+            (2, 1),
+            "the table must be bounded by live leases, not by total dispatches"
+        );
+    }
+
+    /// The explicit disable sentinel (KTD3): `0` lifts the cap rather than
+    /// meaning "zero dispatches".
+    #[test]
+    fn test_cap_zero_lifts_the_lease_cap() {
+        let mut db = db();
+        for holder in ["t1", "t2", "t3", "t4"] {
+            assert_eq!(
+                db.try_acquire_dispatch_slot("mika", "implement", holder, None, 120, 0)
+                    .unwrap(),
+                SlotClaim::Acquired,
+                "cap 0 disables the cap — {holder} must not be refused"
+            );
+        }
+        let rows: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM dispatch_slot_leases", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 4, "each holder gets its own appended index");
+    }
+
     #[test]
     fn test_migrate_v50_to_v51_bails_on_unexpected_baseline() {
         let mut db = db();
@@ -13057,12 +13600,12 @@ mod tests {
     fn test_slot_claim_first_wins_second_is_refused() {
         let mut db = db();
         let a = db
-            .try_acquire_dispatch_slot("mika", "implement", "task-a", Some("mika_dev"), 120)
+            .try_acquire_dispatch_slot("mika", "implement", "task-a", Some("mika_dev"), 120, 1)
             .unwrap();
         assert_eq!(a, SlotClaim::Acquired, "first claimant takes the slot");
 
         let b = db
-            .try_acquire_dispatch_slot("mika", "implement", "task-b", Some("mika_manager"), 120)
+            .try_acquire_dispatch_slot("mika", "implement", "task-b", Some("mika_manager"), 120, 1)
             .unwrap();
         match b {
             SlotClaim::Held {
@@ -13087,10 +13630,10 @@ mod tests {
     #[test]
     fn test_slot_claim_is_per_class_not_global() {
         let mut db = db();
-        db.try_acquire_dispatch_slot("mika", "implement", "task-a", None, 120)
+        db.try_acquire_dispatch_slot("mika", "implement", "task-a", None, 120, 1)
             .unwrap();
         let groom = db
-            .try_acquire_dispatch_slot("mika", "groom", "task-b", None, 120)
+            .try_acquire_dispatch_slot("mika", "groom", "task-b", None, 120, 1)
             .unwrap();
         assert_eq!(
             groom,
@@ -13103,10 +13646,10 @@ mod tests {
     #[test]
     fn test_slot_claim_is_per_agent() {
         let mut db = db();
-        db.try_acquire_dispatch_slot("mika", "implement", "task-a", None, 120)
+        db.try_acquire_dispatch_slot("mika", "implement", "task-a", None, 120, 1)
             .unwrap();
         let other = db
-            .try_acquire_dispatch_slot("mika-qa", "implement", "task-b", None, 120)
+            .try_acquire_dispatch_slot("mika-qa", "implement", "task-b", None, 120, 1)
             .unwrap();
         assert_eq!(other, SlotClaim::Acquired, "slots are scoped per agent");
     }
@@ -13117,10 +13660,10 @@ mod tests {
     #[test]
     fn test_slot_claim_is_reentrant_for_same_holder() {
         let mut db = db();
-        db.try_acquire_dispatch_slot("mika", "implement", "task-a", None, 120)
+        db.try_acquire_dispatch_slot("mika", "implement", "task-a", None, 120, 1)
             .unwrap();
         let again = db
-            .try_acquire_dispatch_slot("mika", "implement", "task-a", None, 120)
+            .try_acquire_dispatch_slot("mika", "implement", "task-a", None, 120, 1)
             .unwrap();
         assert_eq!(
             again,
@@ -13136,10 +13679,10 @@ mod tests {
     #[test]
     fn test_expired_lease_is_reclaimable() {
         let mut db = db();
-        db.try_acquire_dispatch_slot("mika", "implement", "dead-task", None, 0)
+        db.try_acquire_dispatch_slot("mika", "implement", "dead-task", None, 0, 1)
             .unwrap();
         let next = db
-            .try_acquire_dispatch_slot("mika", "implement", "live-task", None, 120)
+            .try_acquire_dispatch_slot("mika", "implement", "live-task", None, 120, 1)
             .unwrap();
         assert_eq!(
             next,
@@ -13157,7 +13700,7 @@ mod tests {
     #[test]
     fn test_expired_lease_reads_as_free() {
         let mut db = db();
-        db.try_acquire_dispatch_slot("mika", "implement", "dead-task", None, 0)
+        db.try_acquire_dispatch_slot("mika", "implement", "dead-task", None, 0, 1)
             .unwrap();
         assert_eq!(
             db.dispatch_slot_lease_holder("mika", "implement").unwrap(),
@@ -13169,14 +13712,14 @@ mod tests {
     #[test]
     fn test_release_frees_the_slot_for_another_dispatcher() {
         let mut db = db();
-        db.try_acquire_dispatch_slot("mika", "implement", "task-a", None, 120)
+        db.try_acquire_dispatch_slot("mika", "implement", "task-a", None, 120, 1)
             .unwrap();
         assert!(
             db.release_dispatch_slot("mika", "implement", "task-a")
                 .unwrap()
         );
         let b = db
-            .try_acquire_dispatch_slot("mika", "implement", "task-b", None, 120)
+            .try_acquire_dispatch_slot("mika", "implement", "task-b", None, 120, 1)
             .unwrap();
         assert_eq!(b, SlotClaim::Acquired, "released slot must be claimable");
     }
@@ -13187,7 +13730,7 @@ mod tests {
     #[test]
     fn test_release_by_non_holder_is_a_noop() {
         let mut db = db();
-        db.try_acquire_dispatch_slot("mika", "implement", "task-a", None, 120)
+        db.try_acquire_dispatch_slot("mika", "implement", "task-a", None, 120, 1)
             .unwrap();
         assert!(
             !db.release_dispatch_slot("mika", "implement", "task-b")
@@ -20091,6 +20634,7 @@ mod tests {
         db2.migrate_v48_to_v49().unwrap();
         db2.migrate_v49_to_v50().unwrap();
         db2.migrate_v50_to_v51().unwrap();
+        db2.migrate_v51_to_v52().unwrap();
 
         let final_version: i64 = db2
             .conn
@@ -22660,7 +23204,7 @@ mod tests {
 
         // Force-promote should be rejected.
         let result = db
-            .force_promote_deferred_for_class("mika", "implement")
+            .force_promote_deferred_for_class("mika", "implement", 1)
             .unwrap();
         assert!(
             matches!(result, ForcePromoteResult::RejectedSlotBusy { .. }),
@@ -22749,7 +23293,7 @@ mod tests {
 
         // Step 1: Confirm slot is busy.
         let result = db
-            .force_promote_deferred_for_class("mika", "implement")
+            .force_promote_deferred_for_class("mika", "implement", 1)
             .unwrap();
         assert!(matches!(
             result,
@@ -22767,7 +23311,7 @@ mod tests {
 
         // Step 4: Retry force-promote — should succeed now.
         let result = db
-            .force_promote_deferred_for_class("mika", "implement")
+            .force_promote_deferred_for_class("mika", "implement", 1)
             .unwrap();
         match &result {
             ForcePromoteResult::Promoted { task_id } => {
@@ -22809,7 +23353,7 @@ mod tests {
         let d1_id = db.create_task(&d1).unwrap();
 
         let result = db
-            .force_promote_deferred_for_class("mika", "implement")
+            .force_promote_deferred_for_class("mika", "implement", 1)
             .unwrap();
         match &result {
             ForcePromoteResult::Promoted { task_id } => {
@@ -22819,11 +23363,124 @@ mod tests {
         }
     }
 
+    /// mika#2160 — the third place that held the cap. The deferred-promotion
+    /// path gated on a boolean "is anything active", which is a cap of exactly
+    /// one. Left that way, raising the cap would admit NEW dispatches while a
+    /// DEFERRED one waited for the class to fall back to zero — the
+    /// asymmetric-predicate drift mika#1163 already had to name once.
+    #[test]
+    fn test_force_promote_honours_a_cap_above_one() {
+        let db = db();
+
+        // One live dispatch occupies the class.
+        let p1 = db
+            .create_task(&new_task("mika", "p1", "manual", "none"))
+            .unwrap();
+        let mut busy = new_task(
+            "mika",
+            "long_running:run_claude_pilot",
+            "callback",
+            "resume_agent",
+        );
+        busy.parent_task_id = Some(p1.clone());
+        db.create_task(&busy).unwrap();
+
+        // A deferred wrapper waits behind it.
+        let p2 = db
+            .create_task(&new_task("mika", "p2", "manual", "none"))
+            .unwrap();
+        let mut d1 = deferred_wrapper("mika", "implement");
+        d1.parent_task_id = Some(p2.clone());
+        let d1_id = db.create_task(&d1).unwrap();
+
+        // At the default cap the class is full — today's behaviour, unchanged.
+        assert!(
+            matches!(
+                db.force_promote_deferred_for_class("mika", "implement", 1)
+                    .unwrap(),
+                ForcePromoteResult::RejectedSlotBusy { .. }
+            ),
+            "one active dispatch must still fill a cap of one"
+        );
+
+        // At a cap of two there is room, and the wrapper must be promoted.
+        match db
+            .force_promote_deferred_for_class("mika", "implement", 2)
+            .unwrap()
+        {
+            ForcePromoteResult::Promoted { task_id } => assert_eq!(task_id, d1_id),
+            other => panic!("a cap of two leaves room — expected Promoted, got {other:?}"),
+        }
+    }
+
+    /// The class-slot count must count dispatches, not callback rows: a parent
+    /// carrying two callbacks of the same class is one occupant.
+    #[test]
+    fn test_count_active_callbacks_for_class_counts_dispatches_not_rows() {
+        let db = db();
+        assert_eq!(
+            db.count_active_callbacks_for_class("mika", "implement")
+                .unwrap(),
+            0,
+            "an idle class counts zero"
+        );
+
+        let p1 = db
+            .create_task(&new_task("mika", "p1", "manual", "none"))
+            .unwrap();
+        for _ in 0..2 {
+            let mut cb = new_task(
+                "mika",
+                "long_running:run_claude_pilot",
+                "callback",
+                "resume_agent",
+            );
+            cb.parent_task_id = Some(p1.clone());
+            db.create_task(&cb).unwrap();
+        }
+        assert_eq!(
+            db.count_active_callbacks_for_class("mika", "implement")
+                .unwrap(),
+            1,
+            "two callback rows under one parent are one dispatch"
+        );
+
+        let p2 = db
+            .create_task(&new_task("mika", "p2", "manual", "none"))
+            .unwrap();
+        let mut cb2 = new_task(
+            "mika",
+            "long_running:run_claude_pilot",
+            "callback",
+            "resume_agent",
+        );
+        cb2.parent_task_id = Some(p2.clone());
+        db.create_task(&cb2).unwrap();
+        assert_eq!(
+            db.count_active_callbacks_for_class("mika", "implement")
+                .unwrap(),
+            2,
+            "a second parent is a second dispatch"
+        );
+
+        // Parity with the boolean it companions: both see the same population.
+        assert!(
+            db.has_any_active_callback_for_class("mika", "implement")
+                .unwrap()
+        );
+        assert_eq!(
+            db.count_active_callbacks_for_class("mika", "groom")
+                .unwrap(),
+            0,
+            "the count stays class-scoped"
+        );
+    }
+
     #[test]
     fn test_force_promote_slot_free_no_pending_wrapper() {
         let db = db();
         let result = db
-            .force_promote_deferred_for_class("mika", "implement")
+            .force_promote_deferred_for_class("mika", "implement", 1)
             .unwrap();
         assert!(
             matches!(result, ForcePromoteResult::NoPendingWrapper),

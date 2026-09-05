@@ -901,6 +901,78 @@ pub(crate) fn derive_dispatch_class(skill: Option<&str>) -> &'static str {
     }
 }
 
+/// Default concurrency cap for the `implement` dispatch class (mika#2160).
+///
+/// **1 — and this ticket does not change it.** mika#2160 opens a door; walking
+/// through it is a configuration gesture the operator makes, after the shared
+/// resources of two live pilots are proven isolated (AC1/AC6). Shipping a
+/// default of 2 would decide N in the code, which is exactly what AC6 forbids.
+pub(crate) const MAX_CONCURRENT_IMPLEMENT_DEFAULT: i64 = 1;
+
+/// Env override for the `implement` concurrency cap (mika#2160). The literal
+/// `0` disables the cap entirely, mirroring the disable sentinel of
+/// `MIKA_AUTO_PULL_MAX_BEHIND` and `MIKA_AUTO_PULL_MAX_REDRIVES` (KTD3 — two
+/// sentinel grammars in one repository is a reading debt).
+pub(crate) const MAX_CONCURRENT_IMPLEMENT_ENV: &str = "MIKA_DISPATCH_MAX_CONCURRENT_IMPLEMENT";
+
+/// Pure parse of the `implement` concurrency cap from an optional env value
+/// (mika#2160). Same three-tier contract as `auto_pull::parse_max_behind`:
+/// absent/empty → default; unparseable/negative → default with a WARN; `0` →
+/// cap disabled.
+///
+/// Split out from the env read so it is unit-testable without mutating the
+/// process environment — the module's tests run in parallel and a `set_var`
+/// there is a race.
+pub(crate) fn parse_max_concurrent_implement(raw: Option<&str>) -> i64 {
+    match raw {
+        Some(v) if !v.trim().is_empty() => match v.trim().parse::<i64>() {
+            Ok(n) if n >= 0 => n,
+            _ => {
+                warn!(
+                    value = %v,
+                    default = MAX_CONCURRENT_IMPLEMENT_DEFAULT,
+                    "dispatch: invalid {MAX_CONCURRENT_IMPLEMENT_ENV}, using default"
+                );
+                MAX_CONCURRENT_IMPLEMENT_DEFAULT
+            }
+        },
+        _ => MAX_CONCURRENT_IMPLEMENT_DEFAULT,
+    }
+}
+
+/// Read the `implement` concurrency cap from the environment (mika#2160).
+/// `0` disables the cap.
+pub fn max_concurrent_implement() -> i64 {
+    parse_max_concurrent_implement(std::env::var(MAX_CONCURRENT_IMPLEMENT_ENV).ok().as_deref())
+}
+
+/// The concurrency cap that applies to a dispatch class (mika#2160).
+///
+/// Only `implement` is configurable. `groom` already runs beside implementation
+/// and its own cap of one is out of scope for mika#2160 — widening it here
+/// would change a class the ticket never measured.
+pub fn max_concurrent_for_class(dispatch_class: &str) -> i64 {
+    match dispatch_class {
+        "implement" => max_concurrent_implement(),
+        _ => 1,
+    }
+}
+
+/// Whether a dispatch must be refused, given how many of its class are already
+/// active and what the cap is (mika#2160).
+///
+/// Split out from the guard so the arithmetic is testable without setting
+/// `MIKA_DISPATCH_MAX_CONCURRENT_IMPLEMENT` in the process. That matters more
+/// than it looks: the cap is read inline from the environment, so a test that
+/// mutated it would silently change the verdict of every *other* dispatch test
+/// running in parallel — a flake that would surface as an unrelated guard test
+/// failing once in a while. Keeping the decision pure removes the class.
+///
+/// `cap <= 0` is the explicit disable sentinel: nothing is ever refused.
+pub fn class_cap_reached(active: i64, cap: i64) -> bool {
+    cap > 0 && active >= cap
+}
+
 /// Extract the skill name from a tool input JSON value.
 fn extract_skill_from_input(input: &serde_json::Value) -> Option<&str> {
     input.get("skill").and_then(|v| v.as_str())
@@ -1385,7 +1457,40 @@ pub(crate) async fn validate_dispatch_readiness(
     // one 'implement' + one 'groom' dispatch concurrently per agent.
     let dispatch_class = tool_input.and_then(extract_skill_from_input);
     let class = derive_dispatch_class(dispatch_class);
-    match db.has_active_callback_tasks_excluding(task_id, class).await {
+    // mika#2160 — the guard compares a COUNT against a configurable cap rather
+    // than asking "is there at least one". The cap is what makes N>1 reachable
+    // without touching this arbitration again.
+    let cap = max_concurrent_for_class(class);
+    let guard_result = if cap == 0 {
+        // Explicit disable sentinel: no cap, so nothing to compare against.
+        Ok(None)
+    } else if cap == 1 {
+        // The shipped default, and deliberately the ORIGINAL single query. At a
+        // cap of one, "is there at least one" and "are there at least one" are
+        // the same question, so counting first buys nothing and costs a second
+        // round trip on the `AsyncDatabase` actor queue — two messages where
+        // there was one, with room for another writer to land between them. The
+        // state an interleaving could expose is benign (the atomic lease claim
+        // below is the arbiter, not this guard), but the default path should not
+        // acquire a new observable behaviour to pay for a setting nobody turned
+        // on.
+        db.has_active_callback_tasks_excluding(task_id, class).await
+    } else {
+        match db
+            .count_active_callback_tasks_excluding(task_id, class)
+            .await
+        {
+            // The count decides WHETHER to reject; the existing LIMIT 1
+            // predicate decides WHO to name. A rejection has always named one
+            // holder, and enumerating all of them would change its contract.
+            Ok(active) if class_cap_reached(active, cap) => {
+                db.has_active_callback_tasks_excluding(task_id, class).await
+            }
+            Ok(_) => Ok(None),
+            Err(e) => Err(e),
+        }
+    };
+    match guard_result {
         Ok(Some(blocking)) => {
             let crate::db::BlockingDispatch {
                 parent_task_id: blocking_parent_id,
@@ -1823,9 +1928,11 @@ pub(crate) async fn validate_dispatch_readiness(
     //
     // A slot two claimants can simultaneously believe they hold is not
     // arbitration, it is a convention. The claim below is a FACT: the PRIMARY
-    // KEY on (agent_id, dispatch_class) means the second claimant's INSERT
-    // collides rather than races, and exactly one caller leaves here holding
-    // the slot.
+    // KEY on (agent_id, dispatch_class, slot_index) means a second claimant for
+    // the same slot collides rather than races, and exactly one caller leaves
+    // here holding any given slot. `slot_index` joined that key in mika#2160;
+    // at the default cap of 1 exactly one index exists and this reads as it
+    // always did.
     //
     // Placed LAST so that no fallible step follows it — every rejection above
     // returns before a lease is ever taken, which is why no error path needs to
@@ -1844,6 +1951,10 @@ pub(crate) async fn validate_dispatch_readiness(
             task_id,
             dispatcher_source,
             crate::db::dispatch_slot_lease_ttl_secs(),
+            // mika#2160 — the lease honours the same cap as the guard above.
+            // Both have to move or the setting is decorative: the lease key
+            // was itself a cap of one (KTD1).
+            max_concurrent_for_class(class),
         )
         .await
     {
@@ -5024,6 +5135,181 @@ mod tests {
         assert_eq!(parsed["error"], "global_dispatch_active");
         assert_eq!(parsed["blocking_task_id"], wi_a);
         assert_eq!(parsed["task_id"], wi_b);
+    }
+
+    // ---- mika#2160: the implement cap becomes choosable ----
+
+    /// AC3 / Phase 3a. The three-tier contract of the setting, tested through
+    /// the pure parse so no environment is mutated and the module's tests keep
+    /// running in parallel.
+    #[test]
+    fn test_parse_max_concurrent_implement_three_tiers() {
+        // Tier 1 — absent or empty falls back to the default.
+        assert_eq!(parse_max_concurrent_implement(None), 1);
+        assert_eq!(parse_max_concurrent_implement(Some("")), 1);
+        assert_eq!(parse_max_concurrent_implement(Some("   ")), 1);
+
+        // Tier 2 — unreadable or negative falls back to the default (with WARN).
+        assert_eq!(parse_max_concurrent_implement(Some("deux")), 1);
+        assert_eq!(parse_max_concurrent_implement(Some("-1")), 1);
+        assert_eq!(parse_max_concurrent_implement(Some("2.5")), 1);
+
+        // Tier 3 — a readable value is honoured; `0` is the disable sentinel,
+        // NOT "zero dispatches" (KTD3, the grammar of MIKA_AUTO_PULL_MAX_BEHIND).
+        assert_eq!(parse_max_concurrent_implement(Some("2")), 2);
+        assert_eq!(parse_max_concurrent_implement(Some(" 4 ")), 4);
+        assert_eq!(parse_max_concurrent_implement(Some("0")), 0);
+    }
+
+    /// The default is 1 and this ticket does not move it (KTD2/AC3).
+    #[test]
+    fn test_max_concurrent_implement_default_is_one() {
+        assert_eq!(MAX_CONCURRENT_IMPLEMENT_DEFAULT, 1);
+    }
+
+    /// AC4, guard half — the arithmetic that makes the cap real, tested without
+    /// touching the process environment.
+    ///
+    /// The cap is read inline from the environment (the shape
+    /// `dispatch_slot_lease_ttl_secs()` already uses for the lease TTL), so an
+    /// integration test at N=2 would have to `set_var` and would then change
+    /// the verdict of every other dispatch test running in parallel. The
+    /// arithmetic is asserted here instead; the *wiring* is asserted by
+    /// `test_default_cap_refuses_second_dispatch_and_registers_the_deferral`,
+    /// which goes through the real guard at the real default; and the two
+    /// simultaneous acquisitions AC4 asks for are asserted at the lease, where
+    /// the cap is a parameter, in
+    /// `db::tests::test_two_implement_claims_each_take_a_lease_at_cap_two`.
+    #[test]
+    fn test_class_cap_reached_admits_a_second_dispatch_at_two_and_refuses_a_third() {
+        // Cap 1 — today's behaviour: one active dispatch already fills it.
+        assert!(
+            !class_cap_reached(0, 1),
+            "an idle class must admit a dispatch"
+        );
+        assert!(
+            class_cap_reached(1, 1),
+            "one active dispatch fills a cap of one"
+        );
+
+        // Cap 2 — the second is admitted, the third is refused.
+        assert!(!class_cap_reached(0, 2));
+        assert!(
+            !class_cap_reached(1, 2),
+            "at a cap of two a second dispatch must be admitted — a cap that \
+             only ever refuses is the decorative-setting regression of KTD1"
+        );
+        assert!(
+            class_cap_reached(2, 2),
+            "the third is refused at a cap of two"
+        );
+        assert!(class_cap_reached(3, 2), "and so is anything beyond it");
+
+        // Cap 0 — the disable sentinel refuses nothing, ever (KTD3).
+        assert!(!class_cap_reached(0, 0));
+        assert!(
+            !class_cap_reached(7, 0),
+            "`0` lifts the cap, it is not `no dispatch`"
+        );
+    }
+
+    /// Only `implement` is configurable — `groom` is out of scope and keeps its
+    /// cap of one whatever the variable says.
+    #[test]
+    fn test_groom_class_cap_is_not_configurable() {
+        assert_eq!(max_concurrent_for_class("groom"), 1);
+    }
+
+    /// The count companion must count *dispatches*, not callback rows. A parent
+    /// carrying two callback children of the same class is one dispatch; if it
+    /// counted rows it would fill a cap of two on its own and re-serialize the
+    /// class behind the operator's back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_count_active_callbacks_counts_dispatches_not_rows() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let wi_a = create_task_with_status(&async_db, "in_progress").await;
+        create_callback_child(&async_db, &wi_a, "pending").await;
+        create_callback_child(&async_db, &wi_a, "in_progress").await;
+
+        let wi_b = create_task_with_status(&async_db, "in_progress").await;
+        assert_eq!(
+            async_db
+                .count_active_callback_tasks_excluding(&wi_b, "implement")
+                .await
+                .unwrap(),
+            1,
+            "two callback rows under ONE parent are one dispatch"
+        );
+
+        // A second parent is a second dispatch.
+        let wi_c = create_task_with_status(&async_db, "in_progress").await;
+        create_callback_child(&async_db, &wi_c, "pending").await;
+        assert_eq!(
+            async_db
+                .count_active_callback_tasks_excluding(&wi_b, "implement")
+                .await
+                .unwrap(),
+            2
+        );
+
+        // The excluded parent never counts against itself.
+        assert_eq!(
+            async_db
+                .count_active_callback_tasks_excluding(&wi_a, "implement")
+                .await
+                .unwrap(),
+            1,
+            "the caller's own dispatch is excluded"
+        );
+    }
+
+    /// AC5 — non-regression at the default cap of 1. This is the scene measured
+    /// on 2026-09-03: a second `implement` dispatch is refused with
+    /// `global_dispatch_active`, **and its deferred callback is registered**.
+    ///
+    /// The deferral assertion is the load-bearing half. A test that checked the
+    /// error code alone would stay green through a regression that breaks the
+    /// automatic re-drive (mika#1011) — the loop would then not merely slow
+    /// down, it would stop, which is the mika#2169 shape.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_default_cap_refuses_second_dispatch_and_registers_the_deferral() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let wi_a = create_task_with_status(&async_db, "in_progress").await;
+        create_callback_child(&async_db, &wi_a, "pending").await;
+
+        let wi_b = create_task_with_status(&async_db, "in_progress").await;
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_b}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(output.is_error, "second dispatch must be refused at cap 1");
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON error, got: {}", output.content));
+        assert_eq!(parsed["error"], "global_dispatch_active");
+        assert_eq!(parsed["blocking_task_id"], wi_a);
+        assert_eq!(
+            parsed["deferred_dispatch_registered"],
+            serde_json::json!(true),
+            "the refusal must still register the deferred re-drive (mika#1011) — \
+             without it the loop stops instead of slowing down"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
