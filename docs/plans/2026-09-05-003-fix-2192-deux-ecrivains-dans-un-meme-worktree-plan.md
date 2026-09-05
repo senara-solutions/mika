@@ -209,6 +209,22 @@ tournoiement borné mais bruyant.
 → `echo "worktree_claim_refused: repo=… issue=… holder_kind=… holder_id=… expires_at=…" >&2`
 puis sortie sans toucher au répertoire. Aucun `stash push`, aucun `worktree remove`,
 aucun rebase ne s'exécute.
+**C1-bis (garde d'invariant, architecte F4).** Avant de lire la réclamation, vérifier
+que la clé `(repo, issue)` désigne bien *ce* répertoire :
+
+```sh
+_actual=$(git -C "$WORKTREE_DIR" symbolic-ref --short HEAD 2>/dev/null || true)
+if [ -n "$_actual" ] && [ "$_actual" != "$BRANCH" ]; then
+    echo "worktree_claim_key_invariant_violated: path=$WORKTREE_DIR expected_branch=$BRANCH actual_branch=$_actual — the (repo, issue) claim key no longer identifies this directory; refusing rather than guarding the wrong thing" >&2
+    return 1
+fi
+```
+
+Le jour où l'invariant slug se relâche, ce garde **rougit** au lieu de laisser le
+registre autoriser silencieusement deux écrivains. Un chemin canonique portant une
+autre branche est déjà traité en `dispatch-lib.sh:1928-1955` (relique non canonique) ;
+cette assertion couvre le cas inverse, que le pré-vol ne regarde pas.
+
 **C2.** Réclamer immédiatement après le garde : `mika worktree claim` avec
 `owner_kind=pilot`, `owner_id=$TASK_ID`, `owner_label` portant `$SKILL` et `$SESSION_ID`.
 **C3.** Libérer dans le piège `EXIT` existant (`dispatch-lib.sh:1216` voisin) :
@@ -269,8 +285,22 @@ jamais `$SESSION_ID` comme auteur quand le tenant est un tiers ou absent.
 
 ## 7. Portée
 
-**Dans la portée.** AC1–AC4 ci-dessus, sur `mika` (phases A–C) et `mika-platform`
+**Dans la portée.** AC1–AC4 ci-dessus, sur `mika` (phases A–C) **et** `mika-platform`
 (phase D).
+
+**La phase D est dans la portée de ce ticket, pas d'un suivant** (architecte F3,
+premier passage). AC1 nomme trois propriétaires — « session orchestrateur, session
+pilote, spawn » — et l'incident fondateur est un orchestrateur. Un plan qui livrerait
+A–C seules satisferait AC1 pour le pilote et laisserait l'incident exactement
+reproductible : l'orchestrateur ne poserait aucune réclamation, le garde AC2 ne lirait
+rien, et le pilote entrerait. **Aucune des deux PR ne se ferme sans l'autre** ; la
+clôture de mika#2192 exige les deux fusionnées.
+
+Mécanique : PR `mika` d'abord (le CLI `mika worktree` doit exister avant que
+mika-platform l'appelle), puis PR compagnon `senara-solutions/mika-platform#<N>`.
+Chaque corps de PR porte `Companion PR: senara-solutions/<autre-dépôt>#<numéro>`.
+La phase D dégrade proprement si le binaire `mika` est absent du `PATH`
+(`|| true`), ce qui rend l'ordre de fusion sûr sans le rendre optionnel.
 
 **Hors portée, conformément au corps du ticket.**
 - Un worktree distinct par acteur — casse `slug == sanitize(branch)`, autre conception.
@@ -310,16 +340,59 @@ travail d'un tiers ; il ne rend pas la pile de stash per-worktree. Hors portée.
 | Une réclamation orpheline fige un ticket | TTL + `worktree claim show` + `release` en CLI ; précédent du bail. |
 | Le garde B1 refuse une reprise légitime du **même** dispatch | La re-réclamation par le même `owner_id` est idempotente (§3.3) ; testée en D1. |
 | Le tournoiement ré-arme / refuse | Fermé par B3 (miroir de `engine.rs:1144`) ; `rearm_count` borne le reste. |
+| **L'invariant slug se relâche et la clé `(repo, issue)` devient fausse** | La clé de §3.1 repose sur `worktree_path_slug == sanitize(branch_ref)`. Si cet invariant se relâchait — par exemple si « un worktree par acteur » (hors portée ici) revenait — deux worktrees distincts partageraient une clé et le garde autoriserait à tort. Fermé par une **assertion qui échoue fort**, livrée avec C1 : voir §5 / C1-bis. Ce n'est pas une note de vigilance, c'est un détecteur. |
 | Migration v53 sur une base vivante | Suivre la forme de `migrate_v51_to_v52` (`db.rs:4908`) : table créée, aucune donnée réécrite, aucun `DROP` sur une table existante. |
 | Phase D pousse deux PR qui doivent atterrir ensemble | mika d'abord (le CLI doit exister avant que mika-platform l'appelle) ; la phase D dégrade proprement si `mika worktree` est absent (`|| true`). |
 
 ---
 
-## 10. Critères d'acceptation — traçabilité
+## 10. Acceptance criteria
+
+Transcrits **mot pour mot** du corps de mika#2192. Ce sont les critères de clôture ;
+le tableau de traçabilité qui suit dit par quel livrable et quelle preuve chacun est
+satisfait.
+
+- **AC1** — Un worktree occupé est **déclaré** : un marqueur portant le propriétaire
+  (session orchestrateur, session pilote, spawn) et un horodatage, écrit à l'entrée et
+  retiré à la sortie. Aujourd'hui : rien à lire.
+- **AC2** — `dispatch-lib` **refuse** d'entrer dans un worktree dont le marqueur nomme
+  un autre propriétaire vivant, et le dit — refus nommé, événement d'audit, pas de
+  `reset` silencieux. Le refus doit être une **classe de refus existante** (le dispatch
+  se re-diffère), pas une nouvelle sortie muette.
+- **AC3** — La récupération post-vol (mika#1282) n'attribue plus le contenu à sa propre
+  session sans preuve. Soit elle lit le marqueur et nomme le vrai propriétaire, soit
+  elle écrit « propriétaire inconnu » — jamais un nom faux. Même règle que la doctrine
+  PR origin : *« an unmarked PR reads "unknown", never "by hand" »*.
+- **AC4** — Rejeu anti-vacuité : un test place un marqueur d'un propriétaire vivant sur
+  un worktree, lance le chemin de dispatch, et vérifie qu'il refuse. Sur `main` il
+  rougit (le dispatch entre). Sortie rouge collée dans la PR.
+
+### Traçabilité
 
 | AC | livrables | preuve |
 |---|---|---|
-| AC1 — worktree occupé déclaré | A1, A2, A3, C2, C3, D | `mika worktree show mika#2192` rend propriétaire + horodatage |
-| AC2 — refus nommé, classe existante, audit | B1, B2, B3, C1 | D1 (Rust), D2 (shell), événement `worktree_claim_refused` |
-| AC3 — attribution sans nom faux | C4 | D3, trois branches |
-| AC4 — rejeu anti-vacuité rouge sur `main` | D1, D2 | sortie rouge collée dans la PR |
+| AC1 — worktree occupé déclaré | A1, A2, A3, C2, C3, **D** | `mika worktree show mika#2192` rend `owner_kind`, `owner_label`, `claimed_at`, `expires_at` ; sans D, satisfait pour `pilot` seulement (§7) |
+| AC2 — refus nommé, classe existante, audit | B1, B2, B3, C1, C1-bis | D1 (Rust), D2 (shell), événement d'audit `worktree_claim_refused` |
+| AC3 — attribution sans nom faux | C4 | D3, les trois branches, plus `assert_not_contains` sur `$SESSION_ID` |
+| AC4 — rejeu anti-vacuité rouge sur `main` | D1, D2 | sortie rouge collée dans le corps de la PR, contrôles positifs et négatifs lancés séparément |
+
+---
+
+## 11. Fire-Disposition
+
+Les rejeux de §6 sont des **détecteurs** : ils rougissent quand la condition qu'ils
+mesurent revient. La disposition de chaque déclenchement est fixée ici, avant la
+première exécution, plutôt qu'arbitrée le jour où l'un d'eux rougit
+(gate mika#1574 ; `feedback_scope_bind_must_name_fire_disposition`).
+
+| détecteur | ce qu'un rouge signifie | disposition, pré-spécifiée |
+|---|---|---|
+| **D1** — `executor.rs`, refus `worktree_claimed_by_other` | la frontière d'outil laisse entrer un dispatch sur un ticket réclamé par un tiers vivant | **Bloquant.** Aucune PR ne fusionne avec D1 rouge : c'est la couche qui gouverne la file. Corriger le garde, jamais l'assertion. |
+| **D1 — contrôle négatif** (réclamation expirée ; réclamation sur un autre ticket) | le garde refuse trop — il figerait la boucle | **Bloquant, et plus urgent que le positif.** Un garde qui refuse tout casse la boucle (palier 1) là où un garde absent la ralentit (palier 2). |
+| **D2** — `test-dispatch-lib.sh`, filet shell | le filet ne couvre plus le contournement de la frontière d'outil | **Bloquant.** |
+| **D2 — assertion de perte évitée** (fichier non commité présent, `git stash list` vide) | un chemin de `dispatch-lib` stashe encore le travail d'un tiers | **Bloquant, et c'est l'assertion cardinale du ticket.** Un rouge ici signifie qu'un troisième site de `stash push` / `worktree remove` a été introduit en amont du garde ; le corriger est le travail, pas relâcher l'assertion. |
+| **D3** — attribution `_rescue_dirty_worktree` | un message de sauvetage nomme à nouveau un auteur non prouvé | **Bloquant.** La doctrine « unknown, jamais un nom faux » n'a pas de version dégradée. |
+| **C1-bis** — invariant de clé (`branche ≠ branche attendue`) | l'invariant `slug == sanitize(branch)` s'est relâché | **Refus dur au moment du dispatch** (`return 1`, ligne nommée sur stderr), **et ticket immédiat** : la clé `(repo, issue)` de §3.1 doit alors être remplacée par une clé par chemin. Ne jamais neutraliser ce garde pour débloquer un dispatch. |
+
+Aucun de ces détecteurs n'est `allow-fail`, aucun n'est mis en sourdine, et aucun ne
+se règle en élargissant sa tolérance. C'est la disposition entière.
