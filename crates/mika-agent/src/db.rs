@@ -27,7 +27,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 53;
+pub const CURRENT_SCHEMA_VERSION: i64 = 54;
 
 /// `(target_key, before_value, after_value, reasoning)` — return shape for
 /// [`Database::get_audit_event_rows_by_tool_name`] and its async wrapper.
@@ -168,6 +168,57 @@ impl SlotClaim {
         matches!(self, SlotClaim::Acquired)
     }
 }
+
+/// A live declaration that some actor owns the worktree of `(repo, issue)`
+/// (mika#2192).
+///
+/// "Live" is a property of the row, not of the reader: every accessor filters
+/// on `expires_at > now`, so a `WorktreeClaim` in hand is by construction one
+/// that has not lapsed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct WorktreeClaim {
+    pub repo: String,
+    pub issue_number: i64,
+    /// `pilot` | `orchestrator` | `spawn`. CHECK-pinned at the table.
+    pub owner_kind: String,
+    /// The dispatch `task_id`, the orchestrator session id, or `MIKA_SPAWN_ID`.
+    pub owner_id: String,
+    /// Free text an operator (and the mika#1282 rescue path) can read.
+    pub owner_label: Option<String>,
+    pub claimed_at: String,
+    pub expires_at: String,
+}
+
+/// Outcome of a worktree claim (mika#2192). Mirrors [`SlotClaim`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeClaimOutcome {
+    /// The caller now owns the worktree. Also the answer to an idempotent
+    /// re-claim by the same `owner_id` — a refresh, never a deadlock against
+    /// oneself.
+    Claimed(WorktreeClaim),
+    /// Another live owner holds it. The caller must not enter the directory.
+    HeldByOther(WorktreeClaim),
+}
+
+/// Default lifetime of a worktree claim held by an interactive actor
+/// (orchestrator session or spawn), in seconds (mika#2192).
+///
+/// Two hours, renewable by idempotent re-claim. Deliberately long: an
+/// interactive session has no heartbeat, so the TTL is the only thing that can
+/// end its claim, and ending it early is the failure that loses work. The cost
+/// of erring long is a ticket that re-defers for up to two hours — the safe
+/// side, and the same trade `dispatch_slot_leases` has taken since mika#1948.
+pub const WORKTREE_CLAIM_INTERACTIVE_TTL_SECS: i64 = 7200;
+
+/// Default lifetime of a worktree claim held by a pilot dispatch, in seconds
+/// (mika#2192).
+///
+/// Six hours — the `timeout_at` panic-fallback the long-running executor
+/// already uses for a dispatch subprocess. A pilot claim must outlive the run
+/// it guards (unlike an exec-slot lease, which guards only the seconds between
+/// validation and the callback row), or the guard would lapse mid-session and
+/// let a second writer in on exactly the run it exists to protect.
+pub const WORKTREE_CLAIM_PILOT_TTL_SECS: i64 = 21600;
 
 /// Default lifetime of an exec-slot lease, in seconds (mika#1948).
 ///
@@ -1215,6 +1266,11 @@ impl Database {
             info!(version = 53, "database migrated to v53");
         }
 
+        if (3..=53).contains(&version) {
+            self.migrate_v53_to_v54()?;
+            info!(version = 54, "database migrated to v54");
+        }
+
         Ok(())
     }
 
@@ -1402,6 +1458,31 @@ impl Database {
                 acquired_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
                 PRIMARY KEY (agent_id, dispatch_class, slot_index)
+            );
+
+            -- mika#2192 — one row per (repo, issue) = one declared worktree
+            -- owner. Twin of dispatch_slot_leases: the PRIMARY KEY is what
+            -- makes the claim a fact rather than a convention, and expiry is
+            -- what keeps a dead claimant from freezing a ticket forever.
+            --
+            -- The key is (repo, issue_number) and NOT the worktree path. The
+            -- invariants worktree_path_slug == sanitize(branch_ref) and
+            -- branch_ref == derive-branch-name(title, issue, labels) make the
+            -- pair sufficient, and it is what the tool boundary already holds
+            -- (`tool_input.prompt` is `mika#2192`). Keying by path would force
+            -- the Rust side to re-derive the branch — the duplication
+            -- mika-platform#58 closed.
+            CREATE TABLE worktree_claims (
+                repo TEXT NOT NULL,
+                issue_number INTEGER NOT NULL,
+                owner_kind TEXT NOT NULL CHECK (
+                    owner_kind IN ('pilot', 'orchestrator', 'spawn')
+                ),
+                owner_id TEXT NOT NULL,
+                owner_label TEXT,
+                claimed_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                PRIMARY KEY (repo, issue_number)
             );
             CREATE INDEX idx_tasks_next_fire ON tasks(next_fire_at)
                 WHERE status IN ('pending','recurring_active');
@@ -5014,6 +5095,68 @@ impl Database {
         tx.commit()?;
 
         info!("v52→v53: added request_bytes column to llm_calls (mika#2189)");
+
+        Ok(())
+    }
+
+    /// v53 → v54 (mika#2192) — a worktree stops being an unclaimed shared
+    /// resource.
+    ///
+    /// `_set_up_worktree` derives `WORKTREE_DIR` from the branch and walks in.
+    /// Between the derivation and the entry nothing reads any state: the path
+    /// is a FUNCTION of the branch, never an allocation. Two actors on the same
+    /// ticket therefore get the same directory by construction, and the first
+    /// gesture on the resume path is `git stash push --include-untracked` — so
+    /// a file someone else has just written disappears between two tool calls,
+    /// silently, into a stash stack shared by every worktree of the repo.
+    ///
+    /// `dispatch_slot_leases` arbitrates the exec SLOT and does it correctly.
+    /// It never claimed to arbitrate a DIRECTORY, and an orchestrator session
+    /// does not appear in it at all — it is not a dispatch.
+    ///
+    /// Additive `CREATE TABLE`, nothing FK-references it, no existing row is
+    /// read or rewritten. Renuméroté de v52→v53 à v53→v54 (mika#2202) : #2189
+    /// a pris le slot v53 (colonne request_bytes) entre le grooming et le merge.
+    ///
+    /// **No `pid`, no `pgrep`, no `/proc`.** Liveness is `expires_at > now`, the
+    /// exact property `try_acquire_dispatch_slot` already documents: a claimant
+    /// that dies mid-flight blocks its ticket for at most one TTL, not forever.
+    fn migrate_v53_to_v54(&mut self) -> Result<()> {
+        let version = self.schema_version()?;
+        if version >= 54 {
+            return Ok(());
+        }
+        if version != 53 {
+            anyhow::bail!(
+                "migrate_v53_to_v54 called with unexpected baseline version {version} \
+                 (expected 53) — refusing to apply migration; investigate migration order"
+            );
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        tx.execute_batch(
+            "-- v54: mika#2192 — worktree ownership registry.
+             CREATE TABLE IF NOT EXISTS worktree_claims (
+                 repo TEXT NOT NULL,
+                 issue_number INTEGER NOT NULL,
+                 owner_kind TEXT NOT NULL CHECK (
+                     owner_kind IN ('pilot', 'orchestrator', 'spawn')
+                 ),
+                 owner_id TEXT NOT NULL,
+                 owner_label TEXT,
+                 claimed_at TEXT NOT NULL,
+                 expires_at TEXT NOT NULL,
+                 PRIMARY KEY (repo, issue_number)
+             );",
+        )?;
+
+        tx.execute("INSERT INTO schema_version (version) VALUES (54)", [])?;
+        tx.commit()?;
+
+        info!("v53→v54: added worktree_claims (mika#2192)");
 
         Ok(())
     }
@@ -8886,6 +9029,194 @@ impl Database {
             )
             .optional()?;
         Ok(row)
+    }
+
+    /// Claim the worktree of `(repo, issue_number)` (mika#2192).
+    ///
+    /// # Why a claim exists at all
+    ///
+    /// `dispatch_slot_leases` says WHO may run. It says nothing about WHERE,
+    /// and the where is a shared directory: `derive-worktree-path` is a pure
+    /// function of the branch, so two actors on one ticket land on the same
+    /// path by construction. An orchestrator session is not a dispatch and
+    /// holds no lease, so the lease can never see it — yet it is precisely the
+    /// actor of the founding incident.
+    ///
+    /// # Semantics
+    ///
+    /// One IMMEDIATE transaction. The claim is taken when no row exists, when
+    /// the existing row has expired, or when the caller re-enters with its own
+    /// `owner_id` (idempotent refresh — a resumed dispatch must not deadlock
+    /// against the claim it took on its first pass). Otherwise the live holder
+    /// is returned and the caller must not enter the directory.
+    ///
+    /// # On liveness
+    ///
+    /// `expires_at > now`, and nothing else. No `pid`, no `pgrep -f` (vacuous
+    /// in this harness), no `/proc` (the agent may be containerised, so the
+    /// host's process table is not a surface to build on). The TTL is what
+    /// keeps fail-closed from becoming loop-breaking: a claimant that dies
+    /// mid-run blocks its own ticket for one TTL, never forever, and the CLI
+    /// `mika worktree release` is the manual escape.
+    pub fn try_claim_worktree(
+        &mut self,
+        repo: &str,
+        issue_number: i64,
+        owner_kind: &str,
+        owner_id: &str,
+        owner_label: Option<&str>,
+        ttl_secs: i64,
+    ) -> Result<WorktreeClaimOutcome> {
+        let now = Utc::now();
+        let now_s = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let expires_s = (now + Duration::seconds(ttl_secs))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        // Take it, refresh it, or lose it — in one statement, so a second
+        // claimant collides on the PRIMARY KEY instead of racing a SELECT.
+        // The `WHERE` is what makes losing possible: without it the upsert
+        // would silently steal a live claim, which is the defect, not the fix.
+        let changed = tx.execute(
+            "INSERT INTO worktree_claims
+                 (repo, issue_number, owner_kind, owner_id, owner_label,
+                  claimed_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(repo, issue_number) DO UPDATE SET
+                 owner_kind  = excluded.owner_kind,
+                 owner_id    = excluded.owner_id,
+                 owner_label = excluded.owner_label,
+                 claimed_at  = excluded.claimed_at,
+                 expires_at  = excluded.expires_at
+             WHERE worktree_claims.expires_at <= ?6
+                OR worktree_claims.owner_id = ?4",
+            params![
+                repo,
+                issue_number,
+                owner_kind,
+                owner_id,
+                owner_label,
+                now_s,
+                expires_s
+            ],
+        )?;
+
+        // Read the row back inside the same transaction either way: on success
+        // it is the claim we just wrote, on failure it is the holder we
+        // actually lost to — never a second read that could see a third state.
+        let row = tx
+            .query_row(
+                "SELECT repo, issue_number, owner_kind, owner_id, owner_label,
+                        claimed_at, expires_at
+                 FROM worktree_claims
+                 WHERE repo = ?1 AND issue_number = ?2",
+                params![repo, issue_number],
+                |row| {
+                    Ok(WorktreeClaim {
+                        repo: row.get(0)?,
+                        issue_number: row.get(1)?,
+                        owner_kind: row.get(2)?,
+                        owner_id: row.get(3)?,
+                        owner_label: row.get(4)?,
+                        claimed_at: row.get(5)?,
+                        expires_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()?;
+        tx.commit()?;
+
+        match row {
+            Some(claim) if changed > 0 => Ok(WorktreeClaimOutcome::Claimed(claim)),
+            Some(claim) => Ok(WorktreeClaimOutcome::HeldByOther(claim)),
+            // A row that vanished between the write and the read cannot happen
+            // inside one IMMEDIATE transaction. Report contention rather than
+            // inventing a free worktree — fail-closed is the whole point.
+            None => Ok(WorktreeClaimOutcome::HeldByOther(WorktreeClaim {
+                repo: repo.to_string(),
+                issue_number,
+                owner_kind: "unknown".to_string(),
+                owner_id: "<unknown>".to_string(),
+                owner_label: None,
+                claimed_at: now_s,
+                expires_at: expires_s,
+            })),
+        }
+    }
+
+    /// The live owner of `(repo, issue_number)`'s worktree, if any (mika#2192).
+    ///
+    /// Filters on `expires_at > now`, so `None` **is** the answer "expired or
+    /// absent" — a caller never has to re-derive liveness and never has two
+    /// ways to get it wrong.
+    pub fn worktree_claim_holder(
+        &self,
+        repo: &str,
+        issue_number: i64,
+    ) -> Result<Option<WorktreeClaim>> {
+        let now_s = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let row = self
+            .conn
+            .query_row(
+                "SELECT repo, issue_number, owner_kind, owner_id, owner_label,
+                        claimed_at, expires_at
+                 FROM worktree_claims
+                 WHERE repo = ?1 AND issue_number = ?2 AND expires_at > ?3",
+                params![repo, issue_number, now_s],
+                |row| {
+                    Ok(WorktreeClaim {
+                        repo: row.get(0)?,
+                        issue_number: row.get(1)?,
+                        owner_kind: row.get(2)?,
+                        owner_id: row.get(3)?,
+                        owner_label: row.get(4)?,
+                        claimed_at: row.get(5)?,
+                        expires_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Release a worktree claim, but only if `owner_id` still owns it
+    /// (mika#2192).
+    ///
+    /// The owner predicate is the same one `release_dispatch_slot` carries and
+    /// for the same reason: a late release from an actor whose claim already
+    /// expired and was re-taken by someone else would free a directory it no
+    /// longer owns — handing a live writer's worktree to the next dispatch.
+    pub fn release_worktree_claim(
+        &self,
+        repo: &str,
+        issue_number: i64,
+        owner_id: &str,
+    ) -> Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM worktree_claims
+             WHERE repo = ?1 AND issue_number = ?2 AND owner_id = ?3",
+            params![repo, issue_number, owner_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Drop lapsed claims (mika#2192). Returns how many rows went.
+    ///
+    /// Purely hygienic: `worktree_claim_holder` and `try_claim_worktree`
+    /// already treat an expired row as absent, so nothing depends on this
+    /// having run. It keeps the table bounded by live claims rather than by
+    /// every ticket ever dispatched.
+    pub fn purge_expired_worktree_claims(&self) -> Result<usize> {
+        let now_s = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let n = self.conn.execute(
+            "DELETE FROM worktree_claims WHERE expires_at <= ?1",
+            params![now_s],
+        )?;
+        Ok(n)
     }
 
     /// Check whether the given parent task has any active (pending/in_progress)
