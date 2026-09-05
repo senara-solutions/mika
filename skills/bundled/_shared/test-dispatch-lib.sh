@@ -4053,6 +4053,162 @@ REASON_PAIRING=$(_reason_pairing_check 2>/dev/null)
 assert_eq "every return 1 in the loop has a reason setter within two lines" \
     "0/${REASON_PAIRING#*/}" "$REASON_PAIRING"
 
+# ===========================================================================
+# mika#1772 — the 2026-07-04 signature, replayed against the real loop
+#
+# The incident this ticket was opened for: on mika#1723 a plan DID exist on the
+# branch and `_iterate_groom_loop` still returned non-zero, while a manual
+# `/mika-ask-arch` converged GROOMED the same day. The historical trace is gone
+# — the worktree (and its `groom-verdict-trail.log`) was destroyed,
+# GROOM_LOOP_FAILURE_REASON did not exist yet, and dispatch-lib's stderr has no
+# durable sink. So the class is pinned here by construction instead: an
+# architect first pass that answers plausibly WITHOUT the `Disposition:` line.
+#
+# Two states, because one of them alone proves nothing:
+#   A. the corrective retry of mika#1823 (f8b63530, 2026-07-25) recovers, and
+#      the loop converges — this is the mechanism that closed the class, and
+#      nothing until now failed when it was removed;
+#   B. the architect misses the line TWICE. The loop still returns 1 — correctly,
+#      two failed attempts at a verdict are a real non-convergence — and the
+#      question is only what it tells the operator it did.
+#
+# These run the real `_iterate_groom_loop` with `_arch_ask` stubbed at the
+# process boundary. A structural grep would pass over both.
+# ===========================================================================
+
+echo ""
+echo "Test: the 2026-07-04 UNPARSED signature (mika#1772 / #1823)"
+echo "------------------------------------------------------------"
+
+# Architect prose that is genuinely unparsable: no `Disposition:` line, no
+# `Verdict:` line, and none of the fourteen paraphrase patterns tier 2 matches.
+# Checked against `_parse_disposition_fuzzy` — a body that accidentally said
+# "proceed" or "revise" would be parsed, and the fixture would replay a
+# different class than the one it names.
+UNPARSED_1772='I have read the document end to end. The framing is coherent and the
+acceptance criteria tie back to the ticket. My notes on section three are
+minor and mostly editorial. Nothing in here surprises me.'
+
+# $1 = what the architect replies to the mika#1823 corrective retry.
+# Emits `key=value` lines plus `trail:` / `stderr:` prefixed lines.
+_groom_signature_probe_1772() {
+    local retry_reply="$1"
+    local tmp wt rc
+    tmp=$(mktemp -d)
+    wt="$tmp/wt"
+    mkdir -p "$wt/docs/plans"
+    {
+        echo "# Plan for the replayed signature"
+        echo "**Ticket:** mika issue#1723"
+        for i in $(seq 1 14); do
+            echo "Body line $i — padding padding padding padding padding."
+        done
+    } > "$wt/docs/plans/2026-07-01-001-fix-1723-signature-plan.md"
+
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+
+        ARCH_CALLS="$tmp/arch-calls"
+        printf '0' > "$ARCH_CALLS"
+
+        # Stub at the process boundary: the parsers, the retry envelope, the
+        # trail and the terminal states all stay real.
+        _arch_ask() {
+            local n body
+            n=$(cat "$ARCH_CALLS")
+            n=$((n + 1))
+            printf '%s' "$n" > "$ARCH_CALLS"
+            case "$n" in
+                1) body="$UNPARSED_1772" ;;   # first pass — the 2026-07-04 shape
+                2) body="$retry_reply" ;;     # the mika#1823 corrective retry
+                *) body='Verdict: GROOMED' ;; # second review
+            esac
+            jq -n --arg c "$body" \
+                '{content:$c, metadata:{session_id:"probe-session-1723"}}'
+        }
+        # Real one shells out to `gh issue edit`.
+        _write_canonical_callout() { printf 'written\n' > "$tmp/callout"; return 0; }
+
+        WORKTREE_DIR="$wt" ISSUE_NUM="1723" REPO="mika" BRANCH="probe-1723"
+        if _iterate_groom_loop >/dev/null 2>"$tmp/err"; then rc=0; else rc=1; fi
+
+        printf 'rc=%s\n' "$rc"
+        printf 'arch_calls=%s\n' "$(cat "$ARCH_CALLS")"
+        printf 'reason=%s\n' "${GROOM_LOOP_FAILURE_REASON:-<none>}"
+        printf 'callout=%s\n' "$([ -f "$tmp/callout" ] && echo yes || echo no)"
+        # Field 4 of the trail is the outcome, in call order. Joined rather than
+        # emitted line-per-line so an assertion can pin the whole sequence: the
+        # individual tokens overlap (`UNPARSED` is a prefix of
+        # `UNPARSED-after-retry`) and match each other on a substring test.
+        printf 'trail_outcomes=%s\n' \
+            "$(cut -f4 "$wt/.claude/groom-verdict-trail.log" 2>/dev/null | paste -sd, -)"
+        sed 's/^/stderr: /' "$tmp/err" 2>/dev/null
+    )
+    rm -rf "$tmp"
+}
+
+# --- A: the retry recovers, and the loop converges -------------------------
+
+SIG_RECOVERED_1772=$(_groom_signature_probe_1772 'Apologies — restating with the required line.
+
+Disposition: READY') || SIG_RECOVERED_1772=""
+
+# Anti-vacuity anchor, first: without it every assertion below would pass on an
+# empty string if the probe ever stopped running.
+assert_contains "A: the probe drove the loop through all three architect calls" \
+    "arch_calls=3" "$SIG_RECOVERED_1772"
+assert_contains "A: the 2026-07-04 signature converges (loop returns zero)" \
+    "rc=0" "$SIG_RECOVERED_1772"
+assert_contains "A: convergence is announced for the issue" \
+    "converged on GROOMED for mika#1723" "$SIG_RECOVERED_1772"
+assert_contains "A: the canonical callout is written on convergence" \
+    "callout=yes" "$SIG_RECOVERED_1772"
+assert_contains "A: a converged run records no failure reason" \
+    "reason=<none>" "$SIG_RECOVERED_1772"
+# The trail is what distinguishes "converged" from "converged BECAUSE of the
+# retry". Pinned as the whole sequence: a loop that never needed a second
+# attempt would read `READY,GROOMED` and satisfy any per-token check.
+assert_contains "A: the trail is first-pass UNPARSED, then a retry, then GROOMED" \
+    "trail_outcomes=UNPARSED,READY-after-retry,GROOMED" "$SIG_RECOVERED_1772"
+assert_contains "A: the retry announces itself as the mika#1823 mechanism" \
+    "disposition recovered on retry (READY) — mika#1823" "$SIG_RECOVERED_1772"
+
+# --- B: the architect misses the line twice --------------------------------
+
+SIG_DOUBLE_1772=$(_groom_signature_probe_1772 "$UNPARSED_1772") || SIG_DOUBLE_1772=""
+
+assert_contains "B: the retry envelope is bounded at two attempts" \
+    "arch_calls=2" "$SIG_DOUBLE_1772"
+assert_contains "B: a double miss is a non-convergence (loop returns non-zero)" \
+    "rc=1" "$SIG_DOUBLE_1772"
+assert_contains "B: the trail records both attempts, the second as a retry" \
+    "trail_outcomes=UNPARSED,UNPARSED-after-retry" "$SIG_DOUBLE_1772"
+
+# The reason travels to `tasks.result` (PR#2028) and is the only thing the
+# operator sees. This exit is the loop's designed, bounded double-UNPARSED
+# terminal — `_parse_disposition` emits READY|ITERATE|ESCALATE or nothing, so
+# the `*)` arm fires on empty and on nothing else. Calling that an invariant
+# violation sends the operator hunting a bug in the loop instead of reading
+# "the architect never emitted the line, twice" — which is the mika#1772 defect
+# class exactly, surviving PR#2028 at the one site its author believed
+# unreachable.
+#
+# Asserted against the `reason=` line ALONE, not against the probe's whole
+# output: the loop's own stderr already carries both "disposition UNPARSED" and
+# "mika#1823" from the FIRST attempt, so a whole-output match reported these as
+# satisfied while the reason itself said none of it. Measured — the two needles
+# below passed against the pre-fix reason before this narrowing.
+SIG_DOUBLE_REASON_1772=$(printf '%s\n' "$SIG_DOUBLE_1772" | grep '^reason=' || true)
+assert_contains "B: the reason names the unparsed disposition" \
+    "disposition UNPARSED" "$SIG_DOUBLE_REASON_1772"
+assert_contains "B: the reason says both attempts missed" \
+    "2 attempts" "$SIG_DOUBLE_REASON_1772"
+assert_contains "B: the reason names the retry that already ran" \
+    "mika#1823" "$SIG_DOUBLE_REASON_1772"
+assert_not_contains "B: the designed terminal is not reported as an invariant violation" \
+    "invariant violation" "$SIG_DOUBLE_REASON_1772"
+
 # --- Test: the egress launch guard must constate, not affirm (mika#2041) ---
 #
 # Founding incident (2026-08-29 06:07-06:11 CEST): the host egress proxy was

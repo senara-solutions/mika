@@ -4739,8 +4739,9 @@ _iterate_groom_loop() {
     #
     # Retry envelope: 1 initial + 1 retry. The retry reuses $session_id so the
     # architect sees its own prior turn and can complete it (idempotent). If
-    # the second attempt is also UNPARSED we return 1 as before (bounded, no
-    # infinite loop).
+    # the second attempt is also UNPARSED the loop falls out of the `for` with
+    # an empty $disposition and terminates in the `*)` arm of the case below
+    # (bounded, no infinite loop) — it does NOT return 1 from inside this loop.
     local resp1 content1 session_id disposition attempt
     for attempt in 1 2; do
         if [ "$attempt" -eq 1 ]; then
@@ -4884,10 +4885,28 @@ _iterate_groom_loop() {
             return 1
             ;;
         *)
-            # Unreachable after the retry loop above (mika#1823), which returns
-            # 1 explicitly on double-UNPARSED. Kept for safety — invariant
-            # violation if reached.
-            _groom_warn "first-pass disposition unparsed after retry loop (invariant violation — see mika#1272 / #1823)"
+            # This IS the double-UNPARSED terminal, not a safety net.
+            #
+            # `_parse_disposition` emits READY, ITERATE, ESCALATE or nothing, so
+            # this arm fires on empty and on nothing else — and `disposition` is
+            # empty here only when the retry loop above exhausted both attempts
+            # without a parsable line. The loop does not `return 1` on that path;
+            # it falls out of the `for` and lands here. Two comments claimed
+            # otherwise until mika#1772 measured it (test-dispatch-lib.sh, case B
+            # of the 2026-07-04 signature block).
+            #
+            # Returning 1 is right: two failed attempts at a verdict is a real
+            # non-convergence. Only the naming was wrong. The reason below travels
+            # to `tasks.result` (PR#2028) and is all the operator sees, so calling
+            # the designed terminal an "invariant violation" sent them hunting a
+            # bug in the loop instead of reading "the architect never emitted the
+            # line, twice" — a re-kick repeats it, the retry has already run. That
+            # is the mika#1772 defect class exactly, surviving its own fix at the
+            # one site the fix believed unreachable.
+            #
+            # `$attempt` is read, not asserted: widening the retry envelope moves
+            # this count with it.
+            _groom_warn "first-pass disposition UNPARSED after ${attempt} attempts (initial + mika#1823 corrective retry) — the architect never emitted a parsable 'Disposition:' line"
             return 1
             ;;
     esac
