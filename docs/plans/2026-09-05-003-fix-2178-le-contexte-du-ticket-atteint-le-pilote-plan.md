@@ -284,7 +284,7 @@ helper sur stdin. La suite tourne sur un runner sans réseau ni jeton.
 
 ---
 
-## 5. Definition of Done
+## Definition of Done
 
 - [ ] `:1836` récupère `comments` dans le **même** appel `gh issue view`.
 - [ ] `_render_ticket_context()` existe, rend le corps puis les commentaires (auteur, rôle,
@@ -297,10 +297,12 @@ helper sur stdin. La suite tourne sur un runner sans réseau ni jeton.
 - [ ] T1–T9 passent ; T1 est rouge quand on retire le correctif, vérifié **terme par terme**
       sur trois contrôles négatifs séparés.
 - [ ] `bash skills/bundled/_shared/test-dispatch-lib.sh` vert de bout en bout.
+- [ ] Exécution de référence de la suite sur `origin/main` non modifié enregistrée dans le
+      corps de la PR, et sa liste d'assertions rouges conforme à `## Fire-Disposition`.
 - [ ] Ticket de suivi filé pour `.claude/commands/mika.md:12` (chemin interactif manuel).
 - [ ] `/ce:review` passé, TODOs résolus, `/ce:compound` produit.
 
-## 6. Acceptance criteria
+## Acceptance criteria
 
 Reprise littérale des AC du corps du ticket, dans leur numérotation.
 
@@ -324,3 +326,61 @@ Critères de qualité ajoutés par ce plan, sans contredire les quatre ci-dessus
 - [ ] **Q2** — Un ticket sans corps ni commentaire produit un `PROMPT` strictement identique à
       aujourd'hui ; dans tous les cas la **première ligne** de `PROMPT` reste `<repo>#<num>`
       (contrat mika#138, parse ancré de `:1801`). → T3, T6.
+
+---
+
+## Fire-Disposition
+
+Ce plan livre neuf détecteurs (T1–T9 dans `skills/bundled/_shared/test-dispatch-lib.sh`) : des
+tests dont le chemin de succès est « aucune violation trouvée ». La gate mika#1574 exige de
+nommer, **avant** l'implémentation, ce que fait l'implémenteur quand un détecteur rougit sur des
+**données préexistantes** — c'est-à-dire sur `origin/main` avant que le correctif ne soit posé.
+
+### Classement des neuf détecteurs
+
+| détecteur | rougit sur données préexistantes ? | pourquoi |
+|---|---|---|
+| T1, T2, T4, T5, T6 | **oui, par construction — c'est le but** | Ce sont les tests du correctif. Leur rouge-avant est la preuve d'anti-vacuité qu'AC3 exige. Ils virent au vert quand le correctif est posé. |
+| T3 (1ʳᵉ et 2ᵉ assertions), T8 | oui, avant le correctif | Assertions sur du code qui n'existe pas encore (l'append d'injection, le `--json …,comments`). |
+| T3 (3ᵉ assertion — ordre d'appel) | **non, doit être verte sur main non modifié** | La suite porte déjà cette assertion à sa ligne 260. T3 la référence, ne la duplique pas. |
+| T7 (les 7 lecteurs de `ISSUE_BODY` inchangés) | **non, doit être verte sur main non modifié** | Le détecteur mesure une invariance ; les 7 sites existent et sont conformes aujourd'hui. |
+| T9 (herméticité — aucun appel `gh`) | **non, doit être verte sur main non modifié** | Invariance de la suite existante. |
+
+### Disposition retenue
+
+**Option (c) — halt-and-surface**, pour la classe « détecteur qui devait être vert sur main et
+ne l'est pas » : T3-ordre, T7, T9.
+
+Concrètement : si l'implémenteur constate que T7 rougit sur `origin/main` **avant** toute
+modification — par exemple parce que les sept lecteurs de `ISSUE_BODY` ne sont plus sept, ou
+plus à ces lignes — il **arrête et remonte**. Il n'ajoute ni exception nommée ni allowlist.
+
+**Pourquoi (c) et non (a).** Une exception nommée est le bon outil quand la violation
+préexistante est connue, bornée et destinée à être nettoyée par un ticket de suivi. Ici, un
+rouge sur T3-ordre, T7 ou T9 ne signale pas une dette : il signale que **la lecture du code sur
+laquelle ce plan repose est fausse**. §1.4 et §3.3 dérivent tout le correctif de ces trois
+invariants — l'ordre d'appel, les sept lecteurs, l'absence d'appel réseau dans la suite.
+Allowlister l'un d'eux reviendrait à faire taire la sonde qui vient de dire que le plan ne
+décrit pas le dépôt. La résolution est elle-même une décision de périmètre : c'est la
+définition de (c) dans mika#1574.
+
+**Forme du halt.** Commenter sur mika#2178 avec : le détecteur rouge, sa sortie littérale, et
+le paragraphe du plan que ce rouge invalide. Ne pas ouvrir de PR. Ne pas contourner.
+
+### Rouge de comportement vs instabilité du harnais
+
+T1–T6 rougissent **volontairement** sur main non modifié — c'est leur contrat, pas une panne.
+Les distinguer d'une suite cassée est réglé par une règle unique : avant de poser le correctif,
+l'implémenteur lance `bash skills/bundled/_shared/test-dispatch-lib.sh` sur `origin/main` non
+modifié et **enregistre la liste des assertions rouges dans le corps de la PR**. Toute assertion
+rouge hors de {T1, T2, T4, T5, T6, T3-1, T3-2, T8} sur cette exécution de référence est un
+halt-and-surface au sens ci-dessus. Sans cette exécution de référence enregistrée, « la suite
+était déjà rouge » n'est pas une observation, c'est une hypothèse
+(`feedback_never_conclude_inside_the_mechanism_period`).
+
+### Ce que ce plan n'introduit pas
+
+Aucun détecteur livré ici ne s'applique à des données de production, à un schéma, ni à un
+historique : leur univers est le source de `dispatch-lib.sh` et des fixtures JSON littérales
+(T9). Il n'y a donc pas de population préexistante à allowlister, et l'option (a) est sans
+objet — ce qui est dit ici plutôt que laissé au silence.
