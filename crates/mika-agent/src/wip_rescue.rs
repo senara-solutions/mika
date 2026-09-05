@@ -32,9 +32,11 @@
 //!   naming the reason. The marker is what the eligibility filter reads, so a
 //!   bail whose label write fails still excludes the draft from the next scan.
 //!   Before mika#2199 the label was the sole exclusion and its failure was
-//!   swallowed: the daemon re-elected the same oldest draft every tick (28
-//!   consecutive bails on PR #2197 over six hours, one `wip_rescue_error`
-//!   each). The draft is preserved; a human decides. No further auto-attempts
+//!   swallowed: the daemon re-elected the same oldest draft every tick — 17
+//!   bails traced on 2026-09-05, **14 of them on PR #2197 alone** between 09:43
+//!   and 16:05, with one `wip_rescue_error` each. (Counts are deduplicated:
+//!   every line of the spirit log is written twice, so the raw greps read
+//!   double.) The draft is preserved; a human decides. No further auto-attempts
 //!   (AC3).
 //! - **Perimeter gate is authoritative (AC4/AC5).** Every draft — even a
 //!   one-line diff — is classified by the mika#1831 perimeter classifier
@@ -934,11 +936,19 @@ async fn bail_to_human(
 
     let parked = apply_human_review_label(token, pr_number, trace_id).await;
 
+    // The comment must not promise a re-arm gesture that no longer works.
+    // Until mika#2199 the label WAS the eligibility gate, so removing it did
+    // re-arm the scan. The gate is now the durable marker, which nothing
+    // clears; telling a human to remove the label would send them to do
+    // something with no effect — and on a `parked = false` bail the label they
+    // are told to remove was never applied in the first place.
     let comment = format!(
         "Auto-resume (wip-rescue, mika#1852) stopped and handed this PR to a \
-         human.\n\n**Reason:** `{reason}`\n\nNo further auto-attempts will be \
-         made. Resolve the condition above, then remove the \
-         `{HUMAN_REVIEW_LABEL}` label to re-arm the scan."
+         human.\n\n**Reason:** `{reason}`\n\nThis draft is now permanently out \
+         of the auto-resume scan (mika#2199): the exclusion is a durable marker, \
+         not the `{HUMAN_REVIEW_LABEL}` label, so removing the label does not \
+         re-arm anything. A human owns this PR from here — finish it by hand, or \
+         close it."
     );
     if let Err(e) = gh(
         &[
@@ -974,9 +984,13 @@ async fn bail_to_human(
 /// Best-effort like every other audit write in this module — but note what a
 /// failure here costs: the marker is the exclusion, so a PR whose marker could
 /// not be written falls back to depending on the label alone, which is the
-/// pre-mika#2199 behaviour for that one PR. Hence the `wip_rescue_error` line:
-/// the two routes of §4.1/§4.2 are independent, and losing one has to be
-/// greppable rather than silent.
+/// pre-mika#2199 behaviour for that one PR.
+///
+/// It therefore gets its **own** event name rather than the module's shared
+/// `wip_rescue_error`, which is written at eight sites: the one condition that
+/// restores the livelock must not be greppably indistinguishable from a
+/// `gh pr comment` that timed out. Any hit on `wip_rescue_marker_write_failed`
+/// is a PR whose exclusion rests on the label alone.
 async fn mark_bailed(
     db: &AsyncDatabase,
     session_id: &str,
@@ -997,7 +1011,7 @@ async fn mark_bailed(
         )
         .await
     {
-        warn!(pr_number, error = %e, trace_id, "wip_rescue_error");
+        warn!(pr_number, error = %e, trace_id, "wip_rescue_marker_write_failed");
     }
 }
 
@@ -1490,11 +1504,29 @@ mod tests {
     // The fake must not communicate through any `MIKA_`-prefixed variable — they
     // are purged before the exec — so its tempdir is baked into the script.
 
+    // What `#[serial_test::serial]` does and does not buy here, stated plainly
+    // because the obvious reading is wrong: it serialises these tests against
+    // *other `#[serial]` tests*, not against the whole binary. Tests without the
+    // attribute still run in parallel, so `PATH` is mutated under them. Two
+    // residual exposures follow, and both are bounded rather than eliminated:
+    //
+    //  1. `std::env::set_var` is `unsafe` in edition 2024 precisely because a
+    //     concurrent `getenv` is a data race. Nothing in this crate's test set
+    //     reads `PATH` on a hot path, and the window is a few milliseconds.
+    //  2. During that window a parallel test that spawns `gh` would find the
+    //     fake. Only `run_gh_subprocess` resolves `gh`, and its own unit tests
+    //     do not spawn — but this is a real property of the harness, not a
+    //     thing the attribute rules out.
+    //
+    // The plan (§4.5) anticipated this: if it ever proves flaky in CI, the
+    // §4.5(a) selection tests are the non-negotiable deliverable and these three
+    // degrade to a hand-run script.
+
     struct PathGuard(Option<std::ffi::OsString>);
 
     impl Drop for PathGuard {
         fn drop(&mut self) {
-            // SAFETY: single-threaded restore under `#[serial]`; see below.
+            // SAFETY: see the module-level note above — bounded, not absent.
             unsafe {
                 match self.0.take() {
                     Some(prev) => std::env::set_var("PATH", prev),
@@ -1505,8 +1537,6 @@ mod tests {
     }
 
     /// Put `dir` at the head of `PATH` for the lifetime of the returned guard.
-    /// Every caller is `#[serial_test::serial]`, which is what makes mutating
-    /// process-global state here sound.
     fn prepend_to_path(dir: &Path) -> PathGuard {
         let previous = std::env::var_os("PATH");
         let mut next = std::ffi::OsString::from(dir);
@@ -1514,7 +1544,7 @@ mod tests {
             next.push(":");
             next.push(prev);
         }
-        // SAFETY: serialized against every other `PATH`-touching test.
+        // SAFETY: see the module-level note above — bounded, not absent.
         unsafe { std::env::set_var("PATH", &next) };
         PathGuard(previous)
     }
@@ -1727,17 +1757,31 @@ mod tests {
     /// Two writers create this label — [`apply_human_review_label`] at runtime
     /// and `label-sync` from `.github/labels.yml` — and they must agree, or each
     /// push would revert the other's colour and description.
+    ///
+    /// The assertion is scoped to **this label's own block**, not the whole
+    /// file: `d93f0b` is also `calibration-reset`'s colour, so a whole-file
+    /// `contains` would stay green through exactly the drift this test exists
+    /// to catch.
     #[test]
     fn the_declared_label_matches_the_one_the_daemon_creates() {
         let yml = include_str!("../../../.github/labels.yml");
+        let block = yml
+            .split("- name: ")
+            .find(|entry| entry.starts_with(HUMAN_REVIEW_LABEL))
+            .unwrap_or_else(|| {
+                panic!("labels.yml declares no `{HUMAN_REVIEW_LABEL}` entry to check")
+            });
+
         assert!(
-            yml.contains(HUMAN_REVIEW_LABEL_COLOR),
-            "labels.yml must declare colour `{HUMAN_REVIEW_LABEL_COLOR}`"
+            block.contains(HUMAN_REVIEW_LABEL_COLOR),
+            "the `{HUMAN_REVIEW_LABEL}` entry must carry colour \
+             `{HUMAN_REVIEW_LABEL_COLOR}`, the one apply_human_review_label \
+             creates it with; entry was:\n{block}"
         );
         assert!(
-            yml.contains(HUMAN_REVIEW_LABEL_DESC),
-            "labels.yml must declare the same description the daemon creates the \
-             label with"
+            block.contains(HUMAN_REVIEW_LABEL_DESC),
+            "the `{HUMAN_REVIEW_LABEL}` entry must carry the same description the \
+             daemon creates the label with; entry was:\n{block}"
         );
     }
 }
