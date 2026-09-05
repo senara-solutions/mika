@@ -1720,20 +1720,24 @@ mod tests {
     /// creation fail on the very path that exists to stop a failure.
     #[test]
     fn the_label_description_fits_githubs_limit() {
-        assert!(
-            HUMAN_REVIEW_LABEL_DESC.chars().count() <= 100,
-            "{} chars",
-            HUMAN_REVIEW_LABEL_DESC.chars().count()
-        );
-        assert!(
-            yml_declares_our_color_and_description(),
-            "the colour and description in .github/labels.yml must match the ones \
-             the daemon creates the label with, or the two writers would fight"
-        );
+        let len = HUMAN_REVIEW_LABEL_DESC.chars().count();
+        assert!(len <= 100, "{len} chars, GitHub caps descriptions at 100");
     }
 
-    fn yml_declares_our_color_and_description() -> bool {
+    /// Two writers create this label — [`apply_human_review_label`] at runtime
+    /// and `label-sync` from `.github/labels.yml` — and they must agree, or each
+    /// push would revert the other's colour and description.
+    #[test]
+    fn the_declared_label_matches_the_one_the_daemon_creates() {
         let yml = include_str!("../../../.github/labels.yml");
-        yml.contains(HUMAN_REVIEW_LABEL_COLOR) && yml.contains(HUMAN_REVIEW_LABEL_DESC)
+        assert!(
+            yml.contains(HUMAN_REVIEW_LABEL_COLOR),
+            "labels.yml must declare colour `{HUMAN_REVIEW_LABEL_COLOR}`"
+        );
+        assert!(
+            yml.contains(HUMAN_REVIEW_LABEL_DESC),
+            "labels.yml must declare the same description the daemon creates the \
+             label with"
+        );
     }
 }
