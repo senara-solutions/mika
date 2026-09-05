@@ -8,13 +8,13 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
 use secrecy::ExposeSecret;
-use tokio::sync::broadcast;
+use tokio::sync::{OwnedMutexGuard, broadcast};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
 use mika_a2a::jsonrpc::{
-    A2aMethod, INTERNAL_ERROR, INVALID_PARAMS, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
-    METHOD_NOT_FOUND, TASK_NOT_CANCELABLE, TASK_NOT_FOUND,
+    A2aMethod, INTERNAL_ERROR, INVALID_PARAMS, JsonRpcError, JsonRpcId, JsonRpcRequest,
+    JsonRpcResponse, METHOD_NOT_FOUND, TASK_NOT_CANCELABLE, TASK_NOT_FOUND,
 };
 use mika_a2a::params::{CALLER_SESSION_ID_KEY, MessageSendParams, TaskIdParams, TaskQueryParams};
 use mika_a2a::state_machine::TaskStateMachine;
@@ -24,6 +24,7 @@ use mika_a2a::types::{Message, Part, Role, TaskState, TaskStatus};
 use crate::a2a_card::build_agent_card;
 use crate::a2a_db::extract_text_from_parts;
 use crate::agent::{self, AgentParams, check_onboarding};
+use crate::server::a2a_wait_queue::{self, WaitSlot};
 use crate::server::state::{AgentState, AppState};
 
 /// Guard that removes a broadcaster entry from the DashMap when dropped.
@@ -37,6 +38,20 @@ impl Drop for BroadcasterGuard {
     fn drop(&mut self) {
         self.map.remove(&self.key);
     }
+}
+
+/// How a `message/stream` request reaches its turn (mika#2163).
+///
+/// The two variants are two different contracts, not two encodings of one. On the
+/// kill-switch path the lock is taken in the handler and a busy agent is refused
+/// there with the pre-mika#2163 JSON-RPC error; on the bounded path the caller
+/// carries a place in the line into the spawned task and waits there, so the SSE
+/// stream can open first.
+enum StreamLockEntry {
+    /// Kill-switch path: the lock is already held, taken in the handler.
+    Held(OwnedMutexGuard<()>),
+    /// Bounded path: a place in the line, to be spent waiting inside the spawn.
+    Waiting(WaitSlot),
 }
 
 /// Handle A2A JSON-RPC POST requests.
@@ -205,6 +220,86 @@ fn caller_session_id(params: &MessageSendParams) -> Option<&str> {
         .as_str()
 }
 
+/// Refuse a request that could not get the agent lock, and make the refusal
+/// visible (mika#2163 AC8).
+///
+/// `err` already carries the wire shape — `-32000` with `data.reason` on the
+/// bounded path, `-32603 "Agent is busy"` verbatim when the kill-switch is off.
+/// This function does not decide the refusal, only records it: an audit row, a
+/// WARN line, and the JSON-RPC response.
+async fn refuse_busy(
+    state: &AppState,
+    agent_state: &Arc<AgentState>,
+    id: Option<JsonRpcId>,
+    err: JsonRpcError,
+    port: &'static str,
+) -> Response {
+    let agent_label = agent_state.db.agent_id().to_string();
+    let reason = err
+        .data
+        .as_ref()
+        .and_then(|d| d.get("reason"))
+        .and_then(|v| v.as_str())
+        // No `data` means the kill-switch path produced this refusal.
+        .unwrap_or("queue_disabled")
+        .to_string();
+    let code = err.code;
+    a2a_wait_queue::emit_a2a_queue_audit(
+        state,
+        agent_state,
+        &agent_label,
+        "a2a_queue_reject",
+        // Throttle per reason: a flood of `queue_full` must not bury the one
+        // `wait_timeout` that explains the incident.
+        Some(&reason),
+        &reason,
+        &format!("/a2a {port} refused: reason={reason}, code={code}"),
+    )
+    .await;
+    tracing::warn!(
+        agent = %agent_label,
+        port,
+        reason = %reason,
+        code,
+        "a2a_queue_reject"
+    );
+    Json(JsonRpcResponse::error(id, err)).into_response()
+}
+
+/// Record a wait that actually happened (mika#2163 AC8).
+///
+/// A zero-length wait is the nominal case and is not worth a row; anything above
+/// it is the contention this ticket exists to make legible.
+async fn note_wait(
+    state: &AppState,
+    agent_state: &Arc<AgentState>,
+    waited_ms: u64,
+    port: &'static str,
+) {
+    if waited_ms == 0 {
+        return;
+    }
+    let agent_label = agent_state.db.agent_id().to_string();
+    a2a_wait_queue::emit_a2a_queue_audit(
+        state,
+        agent_state,
+        &agent_label,
+        "a2a_queue_wait",
+        // No discriminator: `wait_ms` has unbounded cardinality, and keying the
+        // throttle on it would defeat the throttle entirely.
+        None,
+        &waited_ms.to_string(),
+        &format!("/a2a {port} waited {waited_ms}ms for the agent lock"),
+    )
+    .await;
+    info!(
+        agent = %agent_label,
+        port,
+        wait_ms = waited_ms,
+        "a2a_queue_wait"
+    );
+}
+
 /// Handle `message/send` — synchronous message processing via the real agent loop.
 async fn handle_message_send(
     state: &AppState,
@@ -222,18 +317,6 @@ async fn handle_message_send(
         }
     };
 
-    // Acquire agent lock to prevent concurrent agent loops
-    let _lock_guard = match agent_state.agent_lock.clone().try_lock_owned() {
-        Ok(guard) => guard,
-        Err(_) => {
-            return Json(JsonRpcResponse::error(
-                request.id.clone(),
-                JsonRpcError::with_message(INTERNAL_ERROR, "Agent is busy"),
-            ))
-            .into_response();
-        }
-    };
-
     let task_id = Uuid::new_v4().to_string();
     let context_id = params.message.context_id.clone();
     let caller_session = caller_session_id(&params).map(str::to_string);
@@ -242,6 +325,47 @@ async fn handle_message_send(
         .as_ref()
         .and_then(|c| c.return_immediately)
         .unwrap_or(false);
+
+    // Bounded wait for the agent lock (mika#2163). Take a place in the line, then
+    // wait in it. The wait lives in the handler because `message/send` is
+    // synchronous — the caller is holding the connection open for the completed
+    // Task, so there is nothing to return early with. A client that disconnects
+    // mid-wait drops this future, which drops both the lock wait and the place.
+    //
+    // **`returnImmediately` is exempt, and the exemption is new.** That branch
+    // creates the task row and returns it in `submitted`; it never runs the agent
+    // loop, so it never needs the lock that exists to serialise turns. Taking the
+    // lock there was harmless before mika#2163 — a `try_lock`, granted or refused
+    // in microseconds. Under a wait it stops being harmless: a fire-and-forget
+    // caller would park for the whole budget, and hold one of the places in front
+    // of callers that do need a turn, in order to make two database calls.
+    let _lock_guard = if return_immediately {
+        None
+    } else {
+        let slot =
+            match a2a_wait_queue::try_take_slot(&agent_state.a2a_wait_slots, &agent_state.settings)
+            {
+                Ok(slot) => slot,
+                Err(err) => {
+                    return refuse_busy(state, agent_state, request.id.clone(), err, "send").await;
+                }
+            };
+        match a2a_wait_queue::wait_for_agent_lock(
+            Arc::clone(&agent_state.agent_lock),
+            slot,
+            &agent_state.settings,
+        )
+        .await
+        {
+            Ok(acquired) => {
+                note_wait(state, agent_state, acquired.waited_ms, "send").await;
+                Some(acquired.guard)
+            }
+            Err(err) => {
+                return refuse_busy(state, agent_state, request.id.clone(), err, "send").await;
+            }
+        }
+    };
 
     // Create task in DB (creates task row, session, and mapping)
     let session_id = match agent_state
@@ -356,16 +480,50 @@ async fn handle_message_stream(
         }
     };
 
-    // Acquire agent lock — moved into the spawned task to hold for duration of agent loop
-    let lock_guard = match agent_state.agent_lock.clone().try_lock_owned() {
-        Ok(guard) => guard,
-        Err(_) => {
-            return Json(JsonRpcResponse::error(
-                request.id.clone(),
-                JsonRpcError::with_message(INTERNAL_ERROR, "Agent is busy"),
-            ))
-            .into_response();
-        }
+    // Bounded wait for the agent lock (mika#2163), split across the two halves of
+    // this handler on purpose:
+    //
+    //   * the **place in the line** is taken here, before the spawn — take it
+    //     inside the spawned task instead and the spawn itself is unbounded, so
+    //     the backpressure would be decorative;
+    //   * the **wait** happens inside the spawned task, so the SSE stream opens
+    //     immediately and the caller sees an open, waiting stream rather than a
+    //     silent connection that only speaks once the lock frees.
+    //
+    // Saturation is therefore still answerable with a JSON-RPC error: the stream
+    // is not open yet at this point.
+    let slot =
+        match a2a_wait_queue::try_take_slot(&agent_state.a2a_wait_slots, &agent_state.settings) {
+            Ok(slot) => slot,
+            Err(err) => {
+                return refuse_busy(state, agent_state, request.id.clone(), err, "stream").await;
+            }
+        };
+
+    // AC5 on this port, and it needs its own shape. With the kill-switch off the
+    // refusal must be the one this handler gave before mika#2163: a JSON-RPC
+    // `-32603` **response**, with no task row, no broadcaster, no SSE stream and
+    // no spawn. Deferring the `try_lock_owned()` into the spawned task like the
+    // enabled path does would answer `200 OK` with an open stream that later
+    // carries a `failed` frame — a different wire contract, reached by an operator
+    // who believes they turned the feature off. So the legacy attempt happens
+    // here, at the same point in the handler it always did, and only the bounded
+    // path is deferred.
+    let entry = match slot {
+        WaitSlot::Disabled => match agent_state.agent_lock.clone().try_lock_owned() {
+            Ok(guard) => StreamLockEntry::Held(guard),
+            Err(_) => {
+                return refuse_busy(
+                    state,
+                    agent_state,
+                    request.id.clone(),
+                    a2a_wait_queue::legacy_busy_error(),
+                    "stream",
+                )
+                .await;
+            }
+        },
+        queued => StreamLockEntry::Waiting(queued),
     };
 
     let task_id = Uuid::new_v4().to_string();
@@ -402,105 +560,144 @@ async fn handle_message_stream(
     let input_text = extract_text_from_parts(&params.message.parts);
     let broadcasters = Arc::clone(&state.a2a_broadcasters);
     tokio::spawn(async move {
-        let _lock_guard = lock_guard; // Hold agent lock for duration of agent loop
         let _broadcaster_guard = BroadcasterGuard {
             map: broadcasters,
             key: task_id_clone.clone(),
         };
-        // Transition to working
-        let _ = agent_state_clone
-            .db
-            .a2a_update_task_state(&task_id_clone, "working")
-            .await;
+        let turn = StreamTurn {
+            state: state_clone,
+            agent_state: agent_state_clone,
+            session_id,
+            input_text,
+            task_id: task_id_clone,
+            context_id,
+            tx,
+        };
 
-        let _ = tx.send(StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
-            task_id: task_id_clone.clone(),
-            context_id: context_id.clone(),
-            status: TaskStatus {
-                state: TaskState::Working,
-                message: None,
-                timestamp: Some(chrono::Utc::now().to_rfc3339()),
-            },
-            is_final: false,
-            metadata: None,
-        }));
+        // The kill-switch path already holds the lock — it was taken in the
+        // handler, at the same point it always was — so there is nothing here to
+        // wait for and nothing to abandon.
+        let slot = match entry {
+            StreamLockEntry::Held(guard) => {
+                run_a2a_stream_turn(guard, turn).await;
+                return;
+            }
+            StreamLockEntry::Waiting(slot) => slot,
+        };
 
-        // Run the real agent loop. Streaming path (mika#1731 wire, mika#1757
-        // emission) — bundle the per-task broadcaster + task_id + context_id
-        // into a ToolCallStreamContext so process_tool_calls can inject
-        // ToolCallStart / ToolCallResult frames as tools dispatch. The Arc
-        // wrapper enables cheap threading through run_loop.
-        let stream_ctx_for_agent: Option<Arc<mika_a2a::streaming::ToolCallStreamContext>> =
-            Some(Arc::new(mika_a2a::streaming::ToolCallStreamContext::new(
-                Arc::new(tx.clone()),
-                task_id_clone.clone(),
-                context_id.clone(),
-            )));
-        match run_a2a_agent(
-            &state_clone,
-            &agent_state_clone,
-            &session_id,
-            &input_text,
-            &task_id_clone,
-            stream_ctx_for_agent,
-        )
-        .await
-        {
-            Ok(response_text) => {
-                let text = response_text.unwrap_or_else(|| "Task completed.".to_string());
-                let response_message = Message {
-                    message_id: Uuid::new_v4().to_string(),
-                    role: Role::Agent,
-                    parts: vec![Part::Text {
-                        text,
+        // AC7 — race the lock wait against the caller going away.
+        //
+        // A spawned task is not cancelled when the client disconnects, so without
+        // this race a caller who hangs up mid-wait would still acquire the lock
+        // and run a full agent turn nobody is reading — a turn paid for, and a
+        // place held in front of everyone behind it. `tx.closed()` completes when
+        // the last SSE receiver is dropped (tokio 1.53.1 `broadcast.rs:919`);
+        // hyper drops it once it notices the peer is gone, and the stream's
+        // `KeepAlive` bounds how long that takes by making it write periodically.
+        //
+        // The abandonment therefore lands BEFORE `agent_lock` is acquired, not
+        // after: dropping the wait future gives up the place in the mutex's FIFO
+        // and returns the queue permit.
+        let acquired = tokio::select! {
+            biased;
+            _ = turn.tx.closed() => {
+                info!(task_id = %turn.task_id, "a2a_queue_abandoned");
+                let _ = turn
+                    .agent_state
+                    .db
+                    .a2a_update_task_state(&turn.task_id, "canceled")
+                    .await;
+                return;
+            }
+            result = a2a_wait_queue::wait_for_agent_lock(
+                Arc::clone(&turn.agent_state.agent_lock),
+                slot,
+                &turn.agent_state.settings,
+            ) => result,
+        };
+
+        let guard = match acquired {
+            Ok(a) => {
+                note_wait(&turn.state, &turn.agent_state, a.waited_ms, "stream").await;
+                a.guard
+            }
+            Err(err) => {
+                // The stream is already open by now, so the refusal cannot travel
+                // as a JSON-RPC error; it travels as a final `failed` frame.
+                let reason = err
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("reason"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("queue_disabled")
+                    .to_string();
+                let agent_label = turn.agent_state.db.agent_id().to_string();
+                a2a_wait_queue::emit_a2a_queue_audit(
+                    &turn.state,
+                    &turn.agent_state,
+                    &agent_label,
+                    "a2a_queue_reject",
+                    Some(&reason),
+                    &reason,
+                    &format!(
+                        "/a2a stream refused after waiting: reason={reason}, code={}",
+                        err.code
+                    ),
+                )
+                .await;
+                tracing::warn!(
+                    agent = %agent_label,
+                    port = "stream",
+                    reason = %reason,
+                    code = err.code,
+                    task_id = %turn.task_id,
+                    "a2a_queue_reject"
+                );
+                let _ = turn
+                    .agent_state
+                    .db
+                    .a2a_update_task_state(&turn.task_id, "failed")
+                    .await;
+                let _ = turn
+                    .tx
+                    .send(StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
+                        task_id: turn.task_id.clone(),
+                        context_id: turn.context_id.clone(),
+                        status: TaskStatus {
+                            state: TaskState::Failed,
+                            message: Some(Message {
+                                message_id: Uuid::new_v4().to_string(),
+                                role: Role::Agent,
+                                parts: vec![Part::Text {
+                                    text: err.message.clone(),
+                                    metadata: None,
+                                }],
+                                context_id: turn.context_id.clone(),
+                                task_id: Some(turn.task_id.clone()),
+                                // `error.data` is a JSON object by construction
+                                // (`a2a_wait_queue::busy_error`); carry its fields so
+                                // a streaming caller gets the same `reason` /
+                                // `retry_after_ms` / `queue_depth` a `message/send`
+                                // caller reads off the JSON-RPC error.
+                                metadata: err.data.as_ref().and_then(|d| {
+                                    d.as_object().map(|m| {
+                                        m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                                    })
+                                }),
+                                reference_task_ids: None,
+                                extensions: None,
+                                kind: "message".to_string(),
+                            }),
+                            timestamp: Some(chrono::Utc::now().to_rfc3339()),
+                        },
+                        is_final: true,
                         metadata: None,
-                    }],
-                    context_id: context_id.clone(),
-                    task_id: Some(task_id_clone.clone()),
-                    metadata: None,
-                    reference_task_ids: None,
-                    extensions: None,
-                    kind: "message".to_string(),
-                };
-
-                let _ = agent_state_clone
-                    .db
-                    .a2a_update_task_state(&task_id_clone, "completed")
-                    .await;
-
-                // Send completion event
-                let _ = tx.send(StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
-                    task_id: task_id_clone.clone(),
-                    context_id,
-                    status: TaskStatus {
-                        state: TaskState::Completed,
-                        message: Some(response_message),
-                        timestamp: Some(chrono::Utc::now().to_rfc3339()),
-                    },
-                    is_final: true,
-                    metadata: None,
-                }));
+                    }));
+                return;
             }
-            Err(e) => {
-                error!(error = %e, task_id = %task_id_clone, "A2A streaming agent loop failed");
-                let _ = agent_state_clone
-                    .db
-                    .a2a_update_task_state(&task_id_clone, "failed")
-                    .await;
+        };
 
-                let _ = tx.send(StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
-                    task_id: task_id_clone.clone(),
-                    context_id,
-                    status: TaskStatus {
-                        state: TaskState::Failed,
-                        message: None,
-                        timestamp: Some(chrono::Utc::now().to_rfc3339()),
-                    },
-                    is_final: true,
-                    metadata: None,
-                }));
-            }
-        }
+        run_a2a_stream_turn(guard, turn).await;
     });
 
     // Return SSE stream
@@ -522,6 +719,130 @@ async fn handle_message_stream(
     Sse::new(event_stream)
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+/// Everything a `message/stream` turn needs once the agent lock is in hand.
+///
+/// Bundled rather than passed loose because both paths into the turn — the
+/// kill-switch path, which takes the lock in the handler, and the bounded path,
+/// which waits for it in the spawned task — hand over the same seven values.
+struct StreamTurn {
+    state: AppState,
+    agent_state: Arc<AgentState>,
+    session_id: String,
+    input_text: String,
+    task_id: String,
+    context_id: Option<String>,
+    tx: broadcast::Sender<StreamEvent>,
+}
+
+/// Run the streaming turn. The guard is taken by value and dropped with this
+/// future, so the agent lock is held for exactly the turn's lifetime.
+async fn run_a2a_stream_turn(_lock_guard: OwnedMutexGuard<()>, turn: StreamTurn) {
+    let StreamTurn {
+        state,
+        agent_state,
+        session_id,
+        input_text,
+        task_id,
+        context_id,
+        tx,
+    } = turn;
+
+    // Transition to working
+    let _ = agent_state
+        .db
+        .a2a_update_task_state(&task_id, "working")
+        .await;
+
+    let _ = tx.send(StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
+        task_id: task_id.clone(),
+        context_id: context_id.clone(),
+        status: TaskStatus {
+            state: TaskState::Working,
+            message: None,
+            timestamp: Some(chrono::Utc::now().to_rfc3339()),
+        },
+        is_final: false,
+        metadata: None,
+    }));
+
+    // Run the real agent loop. Streaming path (mika#1731 wire, mika#1757
+    // emission) — bundle the per-task broadcaster + task_id + context_id
+    // into a ToolCallStreamContext so process_tool_calls can inject
+    // ToolCallStart / ToolCallResult frames as tools dispatch. The Arc
+    // wrapper enables cheap threading through run_loop.
+    let stream_ctx_for_agent: Option<Arc<mika_a2a::streaming::ToolCallStreamContext>> =
+        Some(Arc::new(mika_a2a::streaming::ToolCallStreamContext::new(
+            Arc::new(tx.clone()),
+            task_id.clone(),
+            context_id.clone(),
+        )));
+    match run_a2a_agent(
+        &state,
+        &agent_state,
+        &session_id,
+        &input_text,
+        &task_id,
+        stream_ctx_for_agent,
+    )
+    .await
+    {
+        Ok(response_text) => {
+            let text = response_text.unwrap_or_else(|| "Task completed.".to_string());
+            let response_message = Message {
+                message_id: Uuid::new_v4().to_string(),
+                role: Role::Agent,
+                parts: vec![Part::Text {
+                    text,
+                    metadata: None,
+                }],
+                context_id: context_id.clone(),
+                task_id: Some(task_id.clone()),
+                metadata: None,
+                reference_task_ids: None,
+                extensions: None,
+                kind: "message".to_string(),
+            };
+
+            let _ = agent_state
+                .db
+                .a2a_update_task_state(&task_id, "completed")
+                .await;
+
+            // Send completion event
+            let _ = tx.send(StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
+                task_id: task_id.clone(),
+                context_id,
+                status: TaskStatus {
+                    state: TaskState::Completed,
+                    message: Some(response_message),
+                    timestamp: Some(chrono::Utc::now().to_rfc3339()),
+                },
+                is_final: true,
+                metadata: None,
+            }));
+        }
+        Err(e) => {
+            error!(error = %e, task_id = %task_id, "A2A streaming agent loop failed");
+            let _ = agent_state
+                .db
+                .a2a_update_task_state(&task_id, "failed")
+                .await;
+
+            let _ = tx.send(StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
+                task_id: task_id.clone(),
+                context_id,
+                status: TaskStatus {
+                    state: TaskState::Failed,
+                    message: None,
+                    timestamp: Some(chrono::Utc::now().to_rfc3339()),
+                },
+                is_final: true,
+                metadata: None,
+            }));
+        }
+    }
 }
 
 /// Handle `tasks/get`.

@@ -1,4 +1,5 @@
 mod a2a;
+pub mod a2a_wait_queue;
 mod auth;
 pub mod check_suite_dedup;
 pub mod checkpoint;
@@ -572,6 +573,13 @@ async fn init_agent(
         std::time::Duration::from_millis(agent_settings.effective_webhook_queue_block_timeout_ms()),
     ));
 
+    // Bounded A2A wait line (mika#2163), sized from effective per-agent config.
+    // Sits beside `agent_lock`: the lock serialises turns, this bounds how many
+    // callers may be waiting for it before the gate refuses.
+    let a2a_wait_slots = Arc::new(tokio::sync::Semaphore::new(
+        agent_settings.effective_a2a_queue_max_depth(),
+    ));
+
     let agent_state = AgentState {
         db: async_db,
         tier,
@@ -581,6 +589,7 @@ async fn init_agent(
         task_engine,
         dispatcher,
         agent_lock,
+        a2a_wait_slots,
         home_dir: agent_home.to_path_buf(),
         embedding_client,
         mcp_manager,
@@ -1473,6 +1482,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         pr_reviews_posted,
         rate_limit_audit_last: Arc::new(dashmap::DashMap::new()),
         webhook_queue_audit_last: Arc::new(dashmap::DashMap::new()),
+        a2a_queue_audit_last: Arc::new(dashmap::DashMap::new()),
         webhook_queue_shutdown: webhook_queue_shutdown.clone(),
         permissions_channel: Arc::new(permissions_stream::PermissionsChannel::new()),
         task_events_channel,
@@ -1858,6 +1868,9 @@ mod tests {
             task_engine,
             dispatcher,
             agent_lock,
+            a2a_wait_slots: Arc::new(tokio::sync::Semaphore::new(
+                agent_settings.effective_a2a_queue_max_depth(),
+            )),
             home_dir: std::path::PathBuf::from("/tmp/mika-test"),
             embedding_client: None,
             mcp_manager: None,
@@ -1901,6 +1914,7 @@ mod tests {
             pr_reviews_posted: Arc::new(dashmap::DashMap::new()),
             rate_limit_audit_last: Arc::new(dashmap::DashMap::new()),
             webhook_queue_audit_last: Arc::new(dashmap::DashMap::new()),
+            a2a_queue_audit_last: Arc::new(dashmap::DashMap::new()),
             webhook_queue_shutdown: CancellationToken::new(),
             permissions_channel: Arc::new(permissions_stream::PermissionsChannel::new()),
             task_events_channel: Arc::new(tasks_stream::TaskEventsChannel::new()),
@@ -2060,7 +2074,7 @@ mod tests {
         let state = test_state();
         let db = state.agents.get("mika").unwrap().db.clone();
 
-        let resp = a2a_post(test_app(state), "message/send", send_params("hi", None)).await;
+        let resp = a2a_post(test_app(state), "message/send", send_params_turn("hi")).await;
 
         let task_id = resp["result"]["id"].as_str().expect("task id in result");
         assert_eq!(
@@ -2090,6 +2104,466 @@ mod tests {
             db.a2a_get_session_id(task_id).await.unwrap(),
             Some(format!("a2a-{task_id}")),
             "a session owned by another agent must not be adopted"
+        );
+    }
+
+    // --- mika#2163: /a2a waits for a busy agent instead of refusing -----------
+    //
+    // The unit tests in `server::a2a_wait_queue` and the integration tests in
+    // `tests/a2a_queue_contention.rs` prove the mechanism. These prove the
+    // **wiring**: that both gates actually call it, on the real HTTP path, with
+    // the real per-agent state. That distinction is the point — a refactor could
+    // leave the queue module perfect and both gates still on `try_lock_owned()`,
+    // with every mechanism test green.
+
+    fn a2a_settings(depth: Option<usize>, wait_ms: Option<u64>, enabled: Option<bool>) -> Settings {
+        let mut s = test_settings();
+        s.a2a_queue_max_depth = depth;
+        s.a2a_queue_wait_timeout_ms = wait_ms;
+        s.a2a_queue_enabled = enabled;
+        s
+    }
+
+    /// Clone the pieces of the agent's state a test needs, without holding a
+    /// DashMap shard guard across an await point.
+    fn agent_bits(
+        state: &AppState,
+    ) -> (
+        Arc<tokio::sync::Mutex<()>>,
+        Arc<tokio::sync::Semaphore>,
+        AsyncDatabase,
+    ) {
+        let agent = state.agents.get("mika").expect("test agent");
+        (
+            agent.agent_lock.clone(),
+            agent.a2a_wait_slots.clone(),
+            agent.db.clone(),
+        )
+    }
+
+    /// Spin until `f` holds or the deadline passes. Returns whether it held.
+    async fn until(deadline: std::time::Duration, mut f: impl FnMut() -> bool) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < deadline {
+            if f() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        f()
+    }
+
+    /// Params that make the request **need a turn**, and therefore the agent lock.
+    ///
+    /// `send_params` sets `returnImmediately`, which since mika#2163 deliberately
+    /// takes neither the lock nor a place in the wait line. Every contention test
+    /// below must use this shape instead, or it would assert nothing: the request
+    /// would sail past the gate it is supposed to be exercising.
+    fn send_params_turn(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "message": {
+                "messageId": "msg-turn",
+                "role": "user",
+                "parts": [{"kind": "text", "text": text}],
+                "kind": "message",
+            },
+        })
+    }
+
+    fn send_params_ctx(text: &str, context_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "message": {
+                "messageId": "msg-ctx",
+                "role": "user",
+                "parts": [{"kind": "text", "text": text}],
+                "contextId": context_id,
+                "kind": "message",
+            },
+            "configuration": {"returnImmediately": true},
+        })
+    }
+
+    /// T1 / AC4 — `message/send` against a busy agent **waits and succeeds**.
+    ///
+    /// This is the ticket. Before mika#2163 the same call answered
+    /// `-32603 "Agent is busy"` and the caller lost its turn; the measured
+    /// consequence was a grooming architect pass refused five times in a row.
+    ///
+    /// Real concurrency, not two sequential calls: the lock is genuinely held by
+    /// another task while the request is in flight, so the handler must actually
+    /// park in the wait line. A sequential test would pass on the old code too.
+    #[tokio::test]
+    async fn a2a_send_waits_for_a_busy_agent_instead_of_refusing() {
+        let state = test_state_with_settings(a2a_settings(None, Some(10_000), None));
+        let (lock, slots, _db) = agent_bits(&state);
+
+        let held = Arc::clone(&lock).lock_owned().await;
+        let app = test_app(state.clone());
+        let call =
+            tokio::spawn(
+                async move { a2a_post(app, "message/send", send_params_turn("hi")).await },
+            );
+
+        // The caller is in the line, not refused: one place is taken and the
+        // request has not answered.
+        assert!(
+            until(std::time::Duration::from_secs(5), || slots
+                .available_permits()
+                == 7)
+            .await,
+            "the request should be waiting in the bounded line"
+        );
+        assert!(
+            !call.is_finished(),
+            "it must not have answered while the lock is held"
+        );
+
+        drop(held);
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(10), call)
+            .await
+            .expect("the waiter must be released once the lock frees")
+            .unwrap();
+
+        assert!(
+            resp.get("error").is_none(),
+            "a busy agent must produce a wait, not a refusal: {resp}"
+        );
+        assert!(
+            resp["result"]["id"].as_str().is_some(),
+            "expected a Task: {resp}"
+        );
+        assert_eq!(
+            slots.available_permits(),
+            8,
+            "the place must be handed back"
+        );
+    }
+
+    /// T6 / AC1 — the same property on the second gate.
+    ///
+    /// `message/stream` takes the lock at its own call site and holds it inside a
+    /// spawned task. A fix applied to `message/send` alone leaves every streaming
+    /// caller on the old refusal, which is precisely why AC1 names both.
+    #[tokio::test]
+    async fn a2a_stream_waits_for_a_busy_agent_instead_of_refusing() {
+        let state = test_state_with_settings(a2a_settings(None, Some(10_000), None));
+        let (lock, slots, _db) = agent_bits(&state);
+
+        let held = Arc::clone(&lock).lock_owned().await;
+        let app = test_app(state.clone());
+        let call = tokio::spawn(async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/a2a/mika")
+                        .header("content-type", "application/json")
+                        .header("authorization", "Bearer test-token-secret")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "jsonrpc": "2.0", "id": 1,
+                                "method": "message/stream",
+                                "params": send_params_turn("hi"),
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&bytes).to_string()
+        });
+
+        assert!(
+            until(std::time::Duration::from_secs(5), || slots
+                .available_permits()
+                == 7)
+            .await,
+            "the streaming caller should hold a place while it waits"
+        );
+
+        drop(held);
+        let body = tokio::time::timeout(std::time::Duration::from_secs(30), call)
+            .await
+            .expect("the streaming waiter must be released")
+            .unwrap();
+
+        assert!(
+            !body.contains("Agent is busy"),
+            "the streaming gate must wait, not refuse: {body}"
+        );
+        assert!(body.contains("data: "), "expected SSE frames: {body}");
+    }
+
+    /// T2 / AC5 — with the kill-switch off, today's refusal is byte-for-byte
+    /// unchanged, `-32603` included.
+    ///
+    /// This test must fail if anyone "improves" the disabled path. A rollback
+    /// that also changed the error code would not be a rollback, and an operator
+    /// reaching for the switch mid-incident is not in a position to discover that.
+    #[tokio::test]
+    async fn a2a_send_with_the_queue_disabled_refuses_exactly_as_before() {
+        let state = test_state_with_settings(a2a_settings(None, None, Some(false)));
+        let (lock, slots, _db) = agent_bits(&state);
+
+        let _held = Arc::clone(&lock).lock_owned().await;
+        let resp = a2a_post(test_app(state), "message/send", send_params_turn("hi")).await;
+
+        assert_eq!(resp["error"]["code"], -32603);
+        assert_eq!(resp["error"]["message"], "Agent is busy");
+        assert!(
+            resp["error"].get("data").is_none(),
+            "the legacy refusal carried no data and must not grow one"
+        );
+        assert_eq!(
+            slots.available_permits(),
+            8,
+            "the disabled path must not take a place in a line it does not use"
+        );
+    }
+
+    /// T3 / AC2, AC6 — a saturated line refuses immediately, and the refusal says
+    /// which of the two refusals it is, plus how long to wait.
+    #[tokio::test]
+    async fn a2a_send_refuses_with_queue_full_when_the_line_is_saturated() {
+        let state = test_state_with_settings(a2a_settings(Some(1), Some(10_000), None));
+        let (lock, slots, _db) = agent_bits(&state);
+
+        let held = Arc::clone(&lock).lock_owned().await;
+        let app = test_app(state.clone());
+        let first =
+            tokio::spawn(
+                async move { a2a_post(app, "message/send", send_params_turn("first")).await },
+            );
+
+        assert!(
+            until(std::time::Duration::from_secs(5), || slots
+                .available_permits()
+                == 0)
+            .await,
+            "the first caller should occupy the only place"
+        );
+
+        let resp = a2a_post(test_app(state), "message/send", send_params_turn("second")).await;
+
+        assert_eq!(resp["error"]["code"], mika_a2a::jsonrpc::AGENT_BUSY);
+        assert_eq!(resp["error"]["message"], "Agent is busy");
+        assert_eq!(resp["error"]["data"]["reason"], "queue_full");
+        assert_eq!(resp["error"]["data"]["queue_depth"], 1);
+        assert_eq!(resp["error"]["data"]["retry_after_ms"], 10_000);
+
+        drop(held);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), first).await;
+    }
+
+    /// T4 / AC2, AC6 — a spent wait is a different refusal from a full line, and
+    /// must not be reported as one. A caller that waited its turn needs to know
+    /// the turn never came, not that it was turned away at the door.
+    #[tokio::test]
+    async fn a2a_send_refuses_with_wait_timeout_when_the_lock_never_frees() {
+        let state = test_state_with_settings(a2a_settings(None, Some(60), None));
+        let (lock, slots, _db) = agent_bits(&state);
+
+        let _held = Arc::clone(&lock).lock_owned().await;
+        let resp = a2a_post(test_app(state), "message/send", send_params_turn("hi")).await;
+
+        assert_eq!(resp["error"]["code"], mika_a2a::jsonrpc::AGENT_BUSY);
+        assert_eq!(resp["error"]["data"]["reason"], "wait_timeout");
+        assert_eq!(resp["error"]["data"]["retry_after_ms"], 60);
+        assert_eq!(
+            slots.available_permits(),
+            8,
+            "a spent wait must release its place"
+        );
+    }
+
+    /// AC5 on the **streaming** port — the half the first cut of this fix got
+    /// wrong, and which no test then covered.
+    ///
+    /// With the kill-switch off, the pre-mika#2163 handler answered a busy agent
+    /// with a JSON-RPC `-32603` **response**: no task row, no broadcaster, no SSE
+    /// stream, no spawn. An implementation that merely defers the `try_lock` into
+    /// the spawned task answers `200 OK` with an open stream that later carries a
+    /// `failed` frame — a different wire contract, reached by an operator who
+    /// believes they turned the feature off, and paid for with a spawn and two
+    /// database writes per refused request. "Verbatim" has to mean the shape of
+    /// the answer, not just its error code.
+    #[tokio::test]
+    async fn a2a_stream_with_the_queue_disabled_refuses_exactly_as_before() {
+        let state = test_state_with_settings(a2a_settings(None, None, Some(false)));
+        let (lock, slots, db) = agent_bits(&state);
+
+        let _held = Arc::clone(&lock).lock_owned().await;
+        let resp = test_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/a2a/mika")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "id": 1,
+                            "method": "message/stream",
+                            "params": send_params_ctx("hi", "ctx-disabled"),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.starts_with("data: "),
+            "the legacy refusal is a JSON-RPC body, not an SSE stream: {text}"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| panic!("expected a JSON-RPC error body, got: {text}"));
+        assert_eq!(body["error"]["code"], -32603);
+        assert_eq!(body["error"]["message"], "Agent is busy");
+        assert!(body["error"].get("data").is_none());
+
+        assert_eq!(
+            db.a2a_find_task_id_by_context("ctx-disabled")
+                .await
+                .unwrap(),
+            None,
+            "the legacy path refused before creating a task row, and must still"
+        );
+        assert_eq!(slots.available_permits(), 8);
+    }
+
+    /// `returnImmediately` must neither wait nor consume a place.
+    ///
+    /// That branch creates the task row and returns it in `submitted`; it never
+    /// runs the agent loop, so it never needs the lock that exists to serialise
+    /// turns. Taking it was harmless before mika#2163 — a `try_lock` — and stops
+    /// being harmless under a wait: a fire-and-forget caller would park for the
+    /// whole budget and hold a place in front of callers that do need a turn.
+    #[tokio::test]
+    async fn a2a_send_return_immediately_neither_waits_nor_takes_a_place() {
+        // A wait budget long enough that a regression would hang the test rather
+        // than pass it by accident.
+        let state = test_state_with_settings(a2a_settings(None, Some(600_000), None));
+        let (lock, slots, _db) = agent_bits(&state);
+
+        let _held = Arc::clone(&lock).lock_owned().await;
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            a2a_post(test_app(state), "message/send", send_params("hi", None)),
+        )
+        .await
+        .expect("returnImmediately must not park behind a held lock");
+
+        assert!(
+            resp.get("error").is_none(),
+            "must not be refused either: {resp}"
+        );
+        assert!(resp["result"]["id"].as_str().is_some());
+        assert_eq!(
+            slots.available_permits(),
+            8,
+            "a caller that never runs a turn must not hold a place in the line"
+        );
+    }
+
+    /// T8 / AC7 — a streaming caller that hangs up mid-wait never runs a turn.
+    ///
+    /// This is the risk mika#2163 creates rather than removes: before it, nobody
+    /// waited, so nobody could abandon a wait. A spawned task is not cancelled by
+    /// the client going away, so without the `select!` against `tx.closed()` the
+    /// task would take the lock, run a full agent turn nobody reads, and hold its
+    /// place in front of the next caller.
+    ///
+    /// **What this test measures, and what it does not.** Dropping the response
+    /// body here drops the SSE receiver directly, in-process — so it pins the
+    /// mechanism (last receiver dropped ⇒ abandonment lands *before* the lock is
+    /// acquired) and the accounting (the place comes back). It does **not**
+    /// measure the over-the-wire detection delay: on a real connection the
+    /// receiver is dropped only once hyper notices the peer is gone, which the
+    /// stream's `KeepAlive` bounds by making it write periodically. That bound is
+    /// a property of the transport, not of this code, and this harness has no
+    /// transport. Saying so is the point: an in-process assertion must not be
+    /// read as a network measurement.
+    #[tokio::test]
+    async fn a2a_stream_abandoned_mid_wait_never_starts_a_turn() {
+        let state = test_state_with_settings(a2a_settings(None, Some(60_000), None));
+        let (lock, slots, db) = agent_bits(&state);
+
+        let held = Arc::clone(&lock).lock_owned().await;
+        let resp = test_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/a2a/mika")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "id": 1,
+                            "method": "message/stream",
+                            "params": send_params_ctx("hi", "ctx-abandon"),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the stream must open before the wait"
+        );
+
+        assert!(
+            until(std::time::Duration::from_secs(5), || slots
+                .available_permits()
+                == 7)
+            .await,
+            "the spawned task should be holding a place while it waits"
+        );
+
+        // The caller hangs up.
+        let started = std::time::Instant::now();
+        drop(resp.into_body());
+
+        assert!(
+            until(std::time::Duration::from_secs(5), || slots
+                .available_permits()
+                == 8)
+            .await,
+            "abandoning the wait must hand the place back"
+        );
+        let detected_ms = started.elapsed().as_millis();
+        println!(
+            "AC7 in-process abandonment detected in {detected_ms}ms (transport delay not exercised)"
+        );
+
+        // Release the lock. If the abandonment had lost its race, this is when the
+        // orphan turn would start.
+        drop(held);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let task_id = db
+            .a2a_find_task_id_by_context("ctx-abandon")
+            .await
+            .unwrap()
+            .expect("the task row is created before the wait");
+        assert_eq!(
+            db.a2a_get_task_state(&task_id).await.unwrap().as_deref(),
+            Some("canceled"),
+            "an abandoned caller must leave a canceled task, never a turn that ran"
         );
     }
 

@@ -222,7 +222,7 @@ General-purpose `gh` CLI handler. Four-tier validation: (1) global subcommand al
 
 ### Bounded Webhook Queue (v2)
 
-`server::webhook_queue_v2` — per-agent bounded queue with backpressure + coalescing (mika#1870). **A different mechanism from the mika#528 deferral queue above** (which sequences webhooks against in-flight callbacks). This is the general-purpose ingestion queue that replaces `POST /message`'s legacy `try_lock_owned()` → 429-reject pattern. **Uniform-queue model:** every inbound `POST /message` request enqueues; a single per-agent drain worker (`handlers::spawn_webhook_drain_worker`) is the sole consumer that acquires `agent_lock` and runs `run_agent_for_message`. The mika#528 deferral check runs **before** the enqueue and is unchanged. The accepted-case HTTP response is byte-identical to the legacy path (`status: "accepted"`) — the queue is invisible to the gateway; only the busy case changes (429 → queued).
+`server::webhook_queue_v2` — per-agent bounded queue with backpressure + coalescing (mika#1870). **A different mechanism from the mika#528 deferral queue above** (which sequences webhooks against in-flight callbacks). This is the general-purpose ingestion queue that replaces `POST /message`'s legacy `try_lock_owned()` → 429-reject pattern. **It does NOT serve `/a2a/{agent}`, which has its own waiting form — see § Bounded A2A Wait Line below and do not unify the two without reading why.** **Uniform-queue model:** every inbound `POST /message` request enqueues; a single per-agent drain worker (`handlers::spawn_webhook_drain_worker`) is the sole consumer that acquires `agent_lock` and runs `run_agent_for_message`. The mika#528 deferral check runs **before** the enqueue and is unchanged. The accepted-case HTTP response is byte-identical to the legacy path (`status: "accepted"`) — the queue is invisible to the gateway; only the busy case changes (429 → queued).
 
 **Classification + coalescing (AC2):** `classify_event(text)` maps gateway-formatted text to an exhaustive `WebhookEventKind` (`CheckSuite`/`PullRequestSync`/`Push`/`PrReview`/`IssueLabeled`/`ReadyLabel`/`Other`); `coalescing_key(&kind)` is an **exhaustive match with no wildcard arm** — a new variant fails to compile until a coalescing decision is made. Coalescing keys: `check_suite:{repo}:{branch}`, `pr_sync:{repo}:{pr}`, `push:{repo}:{branch}`, `labeled:{repo}:{issue}:{label}`; `PrReview`/`ReadyLabel`/`Other` return `None` (never coalesce — user input / dispatch trigger / order-preserving). `PR synchronize` → `PullRequestSync`; other PR actions (opened/closed/review_requested) → `Other`. Reuses `verdict::parse_pr_review_event` + sibling regexes. `Push` is reserved (the current gateway does not emit a branch-bearing push text; `classify_event` never produces it today).
 
@@ -233,6 +233,107 @@ General-purpose `gh` CLI handler. Four-tier validation: (1) global subcommand al
 **Drain worker (AC4):** one `tokio::spawn` per agent (boot loop in `run_server`; lazy-resolved agents get one in `resolve_agent`, mika#1399), `select!`-ing over a parent `CancellationToken` (`AppState.webhook_queue_shutdown`, cancelled at shutdown alongside `kg_shutdown_token`), `dequeue()`, and a 5s gauge heartbeat. Processing runs in a child task so a panic never crashes the loop (captured as `JoinError`). Blocking `lock_owned().await` serialises turns — modeled exactly on `replay_deferred_webhooks`.
 
 **Audit events (AC5, throttled ≤1/sec/action/agent via `AppState.webhook_queue_audit_last`):** `webhook_queue_enqueued`, `webhook_queue_coalesced`, `webhook_queue_drop_oldest`, `webhook_queue_dequeued`, `webhook_queue_processing_error` (all `target_key = agent:{name}`). Best-effort 5s structured-log gauge `webhook_queue.gauge` (`depth`/`enqueued_total`/`coalesced_total`/`dropped_total`), emitted only when the queue is non-idle. **Config (AC6):** `MIKA_WEBHOOK_QUEUE_MAX_DEPTH` (64), `MIKA_WEBHOOK_QUEUE_BLOCK_TIMEOUT_MS` (100), `MIKA_WEBHOOK_QUEUE_ENABLED` (true; `false` = kill-switch AC9 → legacy 429-reject path verbatim, no redeploy). **Operator grep signals:** `webhook_queue_coalesced` (real coalescing volume), `webhook_queue_drop_oldest` (overflow/dead-letter — should be near-zero), `webhook_queue.gauge` (depth trend), and `rate_limit_trip` near-zero once enabled (baseline was 41/h on mika-qa). See mika#1870.
+
+### Bounded A2A Wait Line (mika#2163)
+
+`server::a2a_wait_queue` — the two `/a2a/{agent}` lock gates (`a2a.rs`
+`handle_message_send`, `handle_message_stream`) **wait in a bounded line** for
+`agent_lock` instead of refusing on collision. Before mika#2163 both did
+`try_lock_owned()` and answered `-32603 "Agent is busy"` — a refusal, on a code
+whose defined meaning is "the server failed", for what is ordinary contention.
+`/a2a` is the path of every `mika ask` (`mika-cli/src/commands/ask.rs`) and
+therefore of every pilot `canUseTool` callback, so the refusal was load-bearing:
+the founding measurement is a grooming architect pass refused **five times in a
+row** at 20 s intervals before the sixth attempt landed.
+
+**Why this is not `webhook_queue_v2`, and must not be merged into it.** mika#2163
+AC1 asked to reuse the mika#1870 mechanism; reading the code shows it does not
+transpose. `WebhookQueue`'s producer has no return channel (`enqueue` answers
+`202`, a drain worker runs the turn later) while `message/send` is synchronous and
+its caller holds the connection open for the completed `Task`; its coalescing is
+inert here (two `mika ask` calls never merge); and its saturation policy is
+`drop_oldest`, which cannot apply to a request someone is waiting on. Generalising
+it would mean a per-entry `oneshot`, a second saturation policy and a second drain
+worker — putting `POST /message`, the autonomous loop's own dispatch path, into
+this fix's blast radius. **Decision R-A, ruled by mika-prime 2026-09-05: take the
+mika#1870 *form*, not its code.** The duplication of form between the two modules
+is deliberate and load-bearing: the control contract differs (`/message` is
+fire-and-forget, `/a2a` is synchronous). A future unification that skips this
+paragraph reintroduces exactly what was rejected.
+
+**Mechanism.** No second queue structure is introduced. The wait is the one
+`tokio::sync::Mutex` already provides — documented FIFO-fair (`tokio-1.53.1`
+`sync/mutex.rs:112-116`), so the bound bounds a line and not a scramble — and a
+per-agent `Semaphore` (`AgentState.a2a_wait_slots`) only makes the depth of that
+line explicit and refusable. **The permit is released at lock acquisition, never
+at turn end**: holding it for the turn would make one wait and one execution count
+against the same number, and the configured depth would stop meaning anything.
+
+**The two gates differ, deliberately.** `message/send` waits **in the handler**
+(it is synchronous; there is nothing to return early with). `message/stream` takes
+its place in the handler **before** the `spawn` — take it inside and the spawn is
+unbounded and the backpressure decorative — but waits **inside** the spawned task,
+so the SSE stream opens immediately rather than staying silent until the lock
+frees. Saturation is still answerable as a JSON-RPC error on both, because it is
+detected before the stream opens.
+
+**Caller abandonment (AC7) — the risk this fix creates rather than removes.** A
+spawned task is not cancelled when the client disconnects, so a streaming caller
+that hangs up mid-wait would otherwise still acquire the lock and run a turn
+nobody reads, holding its place in front of everyone behind it. The spawned task
+therefore races `wait_for_agent_lock` against `tx.closed()` (`broadcast.rs:919`,
+completes when the last SSE receiver drops) with `biased`. The abandonment lands
+**before** acquisition: the place in the mutex FIFO is given up, the permit
+returns, the agent is never started, and the task row goes `canceled`. Detection
+is bounded by the SSE `KeepAlive` interval, which is a transport property — the
+in-crate test pins the mechanism and the accounting, and says explicitly that it
+does not measure the over-the-wire delay.
+
+**Error surface.** `AGENT_BUSY = -32000` (`mika-a2a/src/jsonrpc.rs`), **not**
+`-32099`: the A2A spec claims the whole `-32001`..`-32099` band for itself
+(`a2aproject/A2A@main` `docs/specification.md` §9.5; `-32001`..`-32009` assigned
+today), so every code from `-32001` down is a number in someone else's namespace.
+`-32000` is the one code of the JSON-RPC implementation-defined server-error band
+A2A does not claim. `error.data` carries
+`{reason: "queue_full"|"wait_timeout", retry_after_ms, queue_depth}` —
+`retry_after_ms` is the **configured** bound, not a prediction of the running
+turn's length, which the server does not know.
+
+**Config (AC3, three tiers, same shape as mika#1870):**
+`MIKA_A2A_QUEUE_MAX_DEPTH` (8; `0` → default + WARN),
+`MIKA_A2A_QUEUE_WAIT_TIMEOUT_MS` (30000; `0` honoured as "do not wait"),
+`MIKA_A2A_QUEUE_ENABLED` (true; `false` = kill-switch → `try_lock_owned()` →
+`-32603 "Agent is busy"` **verbatim, error code included** — a rollback that
+changed the code would not be a rollback). **The 30 s default is sized against the
+tightest real caller budget, not the most generous one:** `A2aClient::DEFAULT_TIMEOUT`
+is 300 s, but the claude-pilot `canUseTool` relay — the path this ticket was filed
+about — is **120 s** (`.claude/claude-pilot.json`) and covers the wait *and* the turn.
+A 120 s wait, reasoned from the 300 s figure alone, would spend a pilot's whole budget
+waiting and let the relay kill `mika ask` at the exact instant the wait expired, so the
+caller would never read the refusal it was owed. Pinned by the assertion in
+`config::tests::a2a_queue_defaults`.
+
+**Two costs this creates, named so they are not rediscovered.** (1) `returnImmediately`
+is **exempt** from the line and must stay so: that branch returns a `submitted` Task
+without running the agent loop, so it needs neither the lock nor a place — harmless as
+a `try_lock`, not harmless as a wait. (2) A cross-agent call cycle (A's turn shells out
+`mika ask --agent B` while B's shells out `mika ask --agent A`) now stalls for the wait
+budget instead of failing in microseconds. Inherent to waiting rather than refusing; the
+budget and the kill-switch bound the damage. If such cycles become a pattern rather than
+an accident, the answer is a cycle detector, not a longer wait.
+
+**Operator grep signals** (`$MIKA_SPIRIT_LOG_FILE`, throttled ≤1/sec/action/agent
+via `AppState.a2a_queue_audit_last`): `a2a_queue_wait` (a wait that actually
+happened, carries `wait_ms`), `a2a_queue_reject` (carries `reason` and the code),
+`a2a_queue_abandoned` (a streaming caller hung up before acquiring — no orphan
+turn ran). Audit-events SQL surface: `SELECT * FROM audit_events WHERE tool_name
+IN ('a2a_queue_wait', 'a2a_queue_reject')`. Post-deploy expectation: `mika ask`
+retry loops written by hand in caller shells stop firing.
+
+**Relation to mika#2160.** Raising `MIKA_DISPATCH_MAX_CONCURRENT_IMPLEMENT` above
+1 was gated on this ticket: two pilots whose permission escalations overlap would
+have seen one refused mid-session. This is an *operational* prerequisite of N>1,
+not a delivery one — mika#2160 ships its default of 1 without it.
 
 ### Introspection Tools
 
