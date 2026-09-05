@@ -4456,11 +4456,20 @@ mod tests {
         let engine = TaskEngine::new(db.clone(), dispatcher);
 
         seed_2026_09_04_trace(&db, "blocked", None, "completed", false).await;
+        // `max_slots = 1` is the value this test is *about*, not a filler for a
+        // parameter that arrived after it was written (mika#2160, v52). The
+        // assertion below says a live lease protects mika#2160's serialisation;
+        // that serialisation only exists at cap 1. `0` would be actively wrong
+        // here — it is the disable sentinel, under which the claim appends a
+        // fresh `slot_index` instead of contending, so the slot would never be
+        // saturated and the sweep would be asked to honour a lease that leaves
+        // room for the very second dispatch this test forbids.
         db.try_acquire_dispatch_slot(
             "implement",
             "c479c873-0000-0000-0000-000000000000",
             Some("mika_dev"),
             600,
+            1,
         )
         .await
         .unwrap();
