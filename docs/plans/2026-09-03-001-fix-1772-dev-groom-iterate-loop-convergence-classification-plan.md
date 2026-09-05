@@ -245,6 +245,50 @@ contourner, la remonter (Stop condition).
 
 ---
 
+## Acceptance criteria
+
+Critères d'acceptation testables du ticket, un par ligne. Chacun est constatable par un lecteur qui
+n'a pas suivi l'implémentation : la mention *Vérifié par* nomme l'artefact qui le prouve, et la
+mention *Tie-back* le rattache au critère de succès d'origine du ticket.
+
+- **AC1 — La cause est classée, avec sa sortie nommée.** Le corps de la PR nomme la catégorie retenue
+  parmi A / B / C / other **et** la sortie `return 1` de `_iterate_groom_loop` qui a tiré le
+  2026-07-04 ; si elle est non identifiable, il l'écrit et dit pourquoi, plutôt que de conclure sans
+  preuve. *Vérifié par :* section de classification du corps de la PR, table des 19 sorties `return 1`
+  à l'appui. *Tie-back :* critère de succès (a) du ticket.
+- **AC2 — L'absence de preuve historique est établie par sonde, pas supposée.** Les trois compteurs
+  de la Phase 1 pas 1 sont consignés **contrôle positif inclus** (un motif dont on sait qu'il est
+  présent, pour prouver que la source est bien lue), et le résultat du pas 3 — occurrence de la
+  classe postérieure au 2026-07-25 trouvée ou non — est écrit noir sur blanc.
+  *Vérifié par :* table des compteurs dans le corps de la PR. *Tie-back :* rend le critère (a)
+  honnête plutôt que non-tenu.
+- **AC3 — Un test de régression rejoue la signature du 2026-07-04.** Le test existe dans
+  `skills/bundled/_shared/test-dispatch-lib.sh`, passe avec le correctif, et **a été observé échouer**
+  avec le mécanisme neutralisé ; la sortie de cet échec est citée dans le corps de la PR.
+  *Vérifié par :* diff du fichier de test + transcription rouge-avant/vert-après dans la PR.
+  *Tie-back :* critère de succès (b) du ticket.
+- **AC4 — La convergence est prouvée en vol, pas seulement en test.** Un grooming réel a convergé
+  `GROOMED` via `_iterate_groom_loop`, avec identifiant de tâche et `session_id` consignés. Si la
+  convergence est empêchée par un fait de substrat extérieur à la boucle (`idle_timeout`,
+  `policy:deny`, gitdir absent), l'AC est **remontée à l'opérateur**, jamais déclarée acquise.
+  *Vérifié par :* identifiant de tâche + `session_id` cités dans le corps de la PR.
+  *Tie-back :* critère de succès (c) du ticket.
+- **AC5 — L'enseignement est capitalisé.** Un document sous `docs/solutions/` porte l'enseignement de
+  la Phase 5 — dater les candidats d'investigation contre l'historique du dépôt avant de les classer.
+  *Vérifié par :* fichier présent dans le diff de la PR, avec son frontmatter YAML.
+- **AC6 — Le contrat architecte est intact.** Le diff ne modifie ni `mika-arch-groom-ticket`, ni
+  `mika-arch-second-review`, ni la grammaire `Disposition:` / `Verdict:`, et n'ajoute pas de
+  troisième passe architecte. *Vérifié par :* diff de la PR — absence de changement sur ces surfaces.
+- **AC7 — Aucun garde n'est affaibli pour faire passer une mesure.** Le chemin
+  `auto_skipped` / `already_groomed` est inchangé ; en particulier le garde `already_groomed` n'est
+  pas neutralisé pour débloquer AC4. *Vérifié par :* diff de la PR — absence de changement sur ce
+  chemin.
+- **AC8 — La fermeture du ticket suit ce que les critères tiennent réellement.** La PR porte
+  `Closes #1772` si AC1–AC5 tiennent ; sinon `Refs #1772`, avec le reste nommé dans un ticket de
+  suivi ouvert et référencé. *Vérifié par :* le mot-clé effectivement présent dans le corps de la PR.
+
+---
+
 ## Definition of Done
 
 - **AC1.** La cause est classée dans l'une des quatre catégories du ticket (A / B / C / other), avec
