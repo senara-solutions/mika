@@ -486,6 +486,28 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         secret: false,
         description: "Bounded webhook-queue kill-switch. true (default) = POST /message enqueues into the per-agent bounded queue; false = legacy try_lock 429-reject path (instant rollback, no redeploy).",
     },
+    // Bounded A2A wait queue (mika#2163)
+    ConfigKeyInfo {
+        key: "a2a_queue_max_depth",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_A2A_QUEUE_MAX_DEPTH"),
+        secret: false,
+        description: "Per-agent bounded A2A wait-queue depth. Caps how many callers may WAIT for the agent lock on /a2a/{agent}; a caller arriving on a full line is refused immediately with AGENT_BUSY. Default: 8. Invalid/0 falls back to default.",
+    },
+    ConfigKeyInfo {
+        key: "a2a_queue_wait_timeout_ms",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_A2A_QUEUE_WAIT_TIMEOUT_MS"),
+        secret: false,
+        description: "How long an /a2a/{agent} caller holding a place in the wait line waits for the agent lock before being refused with AGENT_BUSY. Default: 30000 (30s — a quarter of the tightest real caller budget, the 120s claude-pilot canUseTool relay, NOT of the 300s A2A client default). 0 is honored as 'do not wait'.",
+    },
+    ConfigKeyInfo {
+        key: "a2a_queue_enabled",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_A2A_QUEUE_ENABLED"),
+        secret: false,
+        description: "Bounded A2A wait-queue kill-switch. true (default) = /a2a/{agent} waits in a bounded line; false = legacy try_lock_owned -> -32603 'Agent is busy' path verbatim (instant rollback, no redeploy).",
+    },
     // ReadOnly (runtime-computed)
     ConfigKeyInfo {
         key: "home_dir",
@@ -642,6 +664,12 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
                 .to_string(),
         ),
         "webhook_queue_enabled" => Some(settings.effective_webhook_queue_enabled().to_string()),
+        // Bounded A2A wait queue (mika#2163)
+        "a2a_queue_max_depth" => Some(settings.effective_a2a_queue_max_depth().to_string()),
+        "a2a_queue_wait_timeout_ms" => {
+            Some(settings.effective_a2a_queue_wait_timeout_ms().to_string())
+        }
+        "a2a_queue_enabled" => Some(settings.effective_a2a_queue_enabled().to_string()),
         // DB keys (timezone, thinking_level) not available from Settings
         _ => None,
     }
@@ -1063,6 +1091,32 @@ pub struct Settings {
     #[serde(default)]
     pub webhook_queue_enabled: Option<bool>,
 
+    /// Bounded A2A wait-queue depth per agent (mika#2163). Caps how many callers
+    /// may be **waiting** for `agent_lock` on the `/a2a/{agent}` path; the permit
+    /// is released at lock acquisition, not at turn end, so a wait and a turn are
+    /// never counted in the same bound. Unset =
+    /// [`DEFAULT_A2A_QUEUE_MAX_DEPTH`] (8). Invalid/`0` falls back to the default
+    /// (WARN-logged in the effective helper).
+    #[serde(default)]
+    pub a2a_queue_max_depth: Option<usize>,
+
+    /// Bounded A2A wait timeout in milliseconds (mika#2163). How long a caller
+    /// holding a place in the line waits for `agent_lock` before being refused.
+    /// Unset = [`DEFAULT_A2A_QUEUE_WAIT_TIMEOUT_MS`] (30000). `0` is honored as
+    /// "do not wait" — the mirror of
+    /// [`Settings::effective_webhook_queue_block_timeout_ms`], and a second way to
+    /// reach today's immediate refusal without touching the kill-switch.
+    #[serde(default)]
+    pub a2a_queue_wait_timeout_ms: Option<u64>,
+
+    /// Bounded A2A wait-queue kill-switch (mika#2163 AC3). When `true` (default),
+    /// `/a2a/{agent}` waits in a bounded line. When `false`, the legacy
+    /// `try_lock_owned()` → `-32603 "Agent is busy"` path is used **verbatim**,
+    /// error code included — a rollback that also changed the error code would not
+    /// be a rollback. Unset = [`DEFAULT_A2A_QUEUE_ENABLED`] (true).
+    #[serde(default)]
+    pub a2a_queue_enabled: Option<bool>,
+
     /// Resolved home directory path (populated after load, not from config file)
     #[serde(skip)]
     pub home_dir: PathBuf,
@@ -1207,6 +1261,49 @@ pub const DEFAULT_WEBHOOK_QUEUE_BLOCK_TIMEOUT_MS: u64 = 100;
 /// path active; set `MIKA_WEBHOOK_QUEUE_ENABLED=false` to revert to the legacy
 /// 429-reject path (kill-switch).
 pub const DEFAULT_WEBHOOK_QUEUE_ENABLED: bool = true;
+
+/// Default bounded A2A wait-queue depth per agent (mika#2163).
+///
+/// The bound is on callers **waiting**, not on turns. Eight is the point past
+/// which the cumulative wait exceeds every waiter's budget: a ninth caller
+/// queued behind eight agent turns is better refused quickly than made to
+/// patient its way into a client-side timeout.
+pub const DEFAULT_A2A_QUEUE_MAX_DEPTH: usize = 8;
+
+/// Default bounded A2A wait timeout in milliseconds (mika#2163).
+///
+/// **Sized against the tightest real caller budget, not the most generous one.**
+/// A server-side wait is only useful while the caller is still there to collect
+/// the answer; past that point it converts a legible refusal into an illegible
+/// transport kill, which is strictly worse than the refusal this ticket replaces.
+///
+/// The budgets in play are not equal, and the binding one is the smallest:
+///
+/// | Caller | Budget | Covers |
+/// |---|---|---|
+/// | `A2aClient::DEFAULT_TIMEOUT` (`mika-a2a/src/client.rs`) | 300 s | wait + turn |
+/// | claude-pilot `canUseTool` relay (`.claude/claude-pilot.json`, all five repos) | **120 s** | wait + turn |
+///
+/// The pilot relay is not a secondary caller: it is the path mika#2163 was filed
+/// about. Sizing the wait at 120 s — as this plan first did, reasoning from the
+/// 300 s figure alone — would spend a pilot's entire budget waiting, so the relay
+/// would kill `mika ask` at the exact instant the wait expired and the caller
+/// would never read the `AGENT_BUSY` refusal it was owed.
+///
+/// **30 s** is a quarter of that binding budget, leaving 90 s for the turn. It
+/// absorbs the common case in one call (the founding incident's refusals were
+/// 20 s apart, so a single turn boundary fits inside it), and longer contention
+/// produces a refusal that says how long to wait — `retry_after_ms` — instead of
+/// a timeout that says nothing. Absorbing the *whole* founding incident (≈100 s
+/// of occupancy) in one call is not available at any setting: it does not fit in
+/// a 120 s budget that must also pay for the turn.
+pub const DEFAULT_A2A_QUEUE_WAIT_TIMEOUT_MS: u64 = 30_000;
+
+/// Default bounded A2A wait-queue enabled state (mika#2163 AC3). `true` = the
+/// `/a2a/{agent}` gates wait in a bounded line; set `MIKA_A2A_QUEUE_ENABLED=false`
+/// to revert to the verbatim `try_lock_owned()` → `-32603 "Agent is busy"` path
+/// (kill-switch, no redeploy).
+pub const DEFAULT_A2A_QUEUE_ENABLED: bool = true;
 
 fn default_true() -> bool {
     true
@@ -1674,6 +1771,45 @@ impl Settings {
             .unwrap_or(DEFAULT_WEBHOOK_QUEUE_ENABLED)
     }
 
+    /// Effective bounded A2A wait-queue depth (mika#2163).
+    ///
+    /// Returns the configured value or [`DEFAULT_A2A_QUEUE_MAX_DEPTH`] (8). A
+    /// configured `0` is invalid — a line of depth zero admits nobody, which is
+    /// the kill-switch's job and not this key's — and falls back to the default
+    /// with a `warn!`.
+    pub fn effective_a2a_queue_max_depth(&self) -> usize {
+        match self.a2a_queue_max_depth {
+            Some(0) | None => {
+                if self.a2a_queue_max_depth == Some(0) {
+                    tracing::warn!(
+                        "MIKA_A2A_QUEUE_MAX_DEPTH=0 is invalid; falling back to default {}",
+                        DEFAULT_A2A_QUEUE_MAX_DEPTH
+                    );
+                }
+                DEFAULT_A2A_QUEUE_MAX_DEPTH
+            }
+            Some(n) => n,
+        }
+    }
+
+    /// Effective bounded A2A wait timeout in milliseconds (mika#2163).
+    ///
+    /// Returns the configured value or [`DEFAULT_A2A_QUEUE_WAIT_TIMEOUT_MS`]
+    /// (120000). A configured `0` is honored as "do not wait": the caller takes a
+    /// place, attempts the lock once, and is refused if it is held.
+    pub fn effective_a2a_queue_wait_timeout_ms(&self) -> u64 {
+        self.a2a_queue_wait_timeout_ms
+            .unwrap_or(DEFAULT_A2A_QUEUE_WAIT_TIMEOUT_MS)
+    }
+
+    /// Effective bounded A2A wait-queue enabled state (mika#2163 AC3).
+    ///
+    /// Returns the configured value or [`DEFAULT_A2A_QUEUE_ENABLED`] (true).
+    /// `false` reverts `/a2a/{agent}` to the legacy immediate-refusal path.
+    pub fn effective_a2a_queue_enabled(&self) -> bool {
+        self.a2a_queue_enabled.unwrap_or(DEFAULT_A2A_QUEUE_ENABLED)
+    }
+
     /// Parse a `provider/model` string and create an LLM provider.
     ///
     /// Reusable by `make_kg_extraction_provider` and `make_kg_resolution_provider`.
@@ -1894,6 +2030,9 @@ impl Settings {
             webhook_queue_max_depth: None,
             webhook_queue_block_timeout_ms: None,
             webhook_queue_enabled: None,
+            a2a_queue_max_depth: None,
+            a2a_queue_wait_timeout_ms: None,
+            a2a_queue_enabled: None,
         }
     }
 }
@@ -3031,5 +3170,142 @@ mod tests {
         );
 
         unsafe { std::env::remove_var("MIKA_WEBHOOK_QUEUE_MAX_DEPTH") };
+    }
+
+    // --- mika#2163 T5: the three A2A wait-queue tiers ---------------------
+
+    fn clear_a2a_queue_env() {
+        // Safety: test-only env vars.
+        unsafe {
+            std::env::remove_var("MIKA_A2A_QUEUE_MAX_DEPTH");
+            std::env::remove_var("MIKA_A2A_QUEUE_WAIT_TIMEOUT_MS");
+            std::env::remove_var("MIKA_A2A_QUEUE_ENABLED");
+        }
+    }
+
+    /// T5, tier 1 — absent reads as the default.
+    #[test]
+    #[serial]
+    fn a2a_queue_defaults() {
+        clean_env();
+        clear_a2a_queue_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(settings.a2a_queue_max_depth, None);
+        assert_eq!(settings.a2a_queue_wait_timeout_ms, None);
+        assert_eq!(settings.a2a_queue_enabled, None);
+
+        assert_eq!(
+            settings.effective_a2a_queue_max_depth(),
+            DEFAULT_A2A_QUEUE_MAX_DEPTH
+        );
+        assert_eq!(settings.effective_a2a_queue_max_depth(), 8);
+        assert_eq!(
+            settings.effective_a2a_queue_wait_timeout_ms(),
+            DEFAULT_A2A_QUEUE_WAIT_TIMEOUT_MS
+        );
+        assert_eq!(settings.effective_a2a_queue_wait_timeout_ms(), 30_000);
+        // The bound that makes this number right, pinned so a future "let's be
+        // more generous" edit has to argue with it: the wait must stay a
+        // fraction of the tightest real caller budget — the 120 s claude-pilot
+        // `canUseTool` relay — or the caller is killed before it can read the
+        // refusal. See DEFAULT_A2A_QUEUE_WAIT_TIMEOUT_MS.
+        const TIGHTEST_CALLER_BUDGET_MS: u64 = 120_000;
+        assert!(
+            settings.effective_a2a_queue_wait_timeout_ms() * 2 < TIGHTEST_CALLER_BUDGET_MS,
+            "the default wait must leave the majority of the pilot relay budget \
+             to the turn itself"
+        );
+        assert!(settings.effective_a2a_queue_enabled());
+    }
+
+    /// T5, tier 3 — the sentinel and an explicit override are both honored.
+    #[test]
+    #[serial]
+    fn a2a_queue_env_overrides() {
+        clean_env();
+        // Safety: test-only env vars.
+        unsafe {
+            std::env::set_var("MIKA_A2A_QUEUE_MAX_DEPTH", "16");
+            std::env::set_var("MIKA_A2A_QUEUE_WAIT_TIMEOUT_MS", "5000");
+            std::env::set_var("MIKA_A2A_QUEUE_ENABLED", "false");
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(settings.a2a_queue_max_depth, Some(16));
+        assert_eq!(settings.effective_a2a_queue_max_depth(), 16);
+        assert_eq!(settings.a2a_queue_wait_timeout_ms, Some(5000));
+        assert_eq!(settings.effective_a2a_queue_wait_timeout_ms(), 5000);
+        assert_eq!(settings.a2a_queue_enabled, Some(false));
+        assert!(!settings.effective_a2a_queue_enabled());
+
+        clear_a2a_queue_env();
+    }
+
+    /// T5, tier 2 — an unusable depth falls back to the default (WARN-logged).
+    #[test]
+    #[serial]
+    fn a2a_queue_zero_max_depth_falls_back_to_default() {
+        clean_env();
+        clear_a2a_queue_env();
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_A2A_QUEUE_MAX_DEPTH", "0") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(settings.a2a_queue_max_depth, Some(0));
+        assert_eq!(
+            settings.effective_a2a_queue_max_depth(),
+            DEFAULT_A2A_QUEUE_MAX_DEPTH
+        );
+
+        clear_a2a_queue_env();
+    }
+
+    /// T5, the asymmetry that is deliberate: `0` on the **delay** is not an
+    /// error, it is "do not wait" — the mirror of
+    /// `effective_webhook_queue_block_timeout_ms`, and a second route to today's
+    /// immediate refusal that does not touch the kill-switch.
+    #[test]
+    #[serial]
+    fn a2a_queue_zero_wait_timeout_is_honored() {
+        clean_env();
+        clear_a2a_queue_env();
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_A2A_QUEUE_WAIT_TIMEOUT_MS", "0") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(settings.a2a_queue_wait_timeout_ms, Some(0));
+        assert_eq!(settings.effective_a2a_queue_wait_timeout_ms(), 0);
+
+        clear_a2a_queue_env();
+    }
+
+    /// The three keys must stay visible to `mika config` — a setting the
+    /// operator cannot read is a setting they cannot roll back with.
+    #[test]
+    fn a2a_queue_keys_are_registered_and_resolvable() {
+        let settings = Settings::test_defaults();
+        for key in [
+            "a2a_queue_max_depth",
+            "a2a_queue_wait_timeout_ms",
+            "a2a_queue_enabled",
+        ] {
+            assert!(
+                CONFIG_KEYS.iter().any(|k| k.key == key),
+                "{key} missing from CONFIG_KEYS"
+            );
+            assert!(
+                get_effective_value(key, &settings).is_some(),
+                "{key} not resolvable via get_effective_value"
+            );
+        }
     }
 }

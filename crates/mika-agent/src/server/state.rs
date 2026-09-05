@@ -36,6 +36,16 @@ pub struct AgentState {
     pub task_engine: Arc<tokio::sync::Mutex<TaskEngine>>,
     pub dispatcher: Arc<TaskDispatcher>,
     pub agent_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Bounded wait line for the two `/a2a/{agent}` lock gates (mika#2163).
+    ///
+    /// Sized once at init from `effective_a2a_queue_max_depth()`. A permit is a
+    /// caller's place in the queue for `agent_lock`, held for the duration of the
+    /// **wait** and released the instant the lock is acquired — never for the
+    /// turn, or a wait and an execution would count against the same bound. Sits
+    /// next to `agent_lock` because the two are read together: the lock decides
+    /// that turns are serial, this decides what happens to everyone else
+    /// meanwhile. See `server::a2a_wait_queue`.
+    pub a2a_wait_slots: Arc<tokio::sync::Semaphore>,
     pub home_dir: PathBuf,
     pub embedding_client: Option<EmbeddingClient>,
     pub mcp_manager: Option<McpManager>,
@@ -144,6 +154,11 @@ pub struct AppState {
     /// throttle shape as `rate_limit_audit_last` so a burst does not itself flood
     /// the audit table.
     pub webhook_queue_audit_last: Arc<DashMap<String, std::time::Instant>>,
+    /// Throttle state for the two `a2a_queue_*` audit events (mika#2163 AC8).
+    /// Keyed `"{agent}:{action}"` → last emit instant, same 1/sec/action/agent
+    /// shape as `webhook_queue_audit_last`. Separate map so a burst of A2A
+    /// refusals and a burst of webhook drops cannot throttle each other.
+    pub a2a_queue_audit_last: Arc<DashMap<String, std::time::Instant>>,
     /// Parent cancellation token for the per-agent webhook drain workers
     /// (mika#1870). Stored here so lazy-resolved agents (`resolve_agent`, #1399)
     /// can spawn a worker with a child token. Cancelled at server shutdown

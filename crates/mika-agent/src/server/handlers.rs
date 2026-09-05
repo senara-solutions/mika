@@ -54,7 +54,7 @@ const RATE_LIMIT_TRIP_AUDIT_INTERVAL: std::time::Duration = std::time::Duration:
 /// Accepted benign race: two threads may both observe stale and both insert, costing at
 /// most one duplicate audit row. DO NOT restructure into a guard-holding or `.entry()`
 /// shape to close this seam (mika#1723).
-fn should_emit_rate_limit_audit(
+pub(crate) fn should_emit_rate_limit_audit(
     last_emitted: &DashMap<String, std::time::Instant>,
     agent_label: &str,
     now: std::time::Instant,
