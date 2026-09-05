@@ -57,20 +57,33 @@ const BACKOFF_MAX_SHIFT: u32 = 32;
 /// row, not a payload to grep.
 const DELIVERY_ERROR_REASONING_MAX_CHARS: usize = 300;
 
-/// Exponential backoff for a failed callback delivery: `base * 2^(attempts-1)`,
-/// capped at `max` (mika#2179, AC3).
+/// Backoff for a failed callback delivery (mika#2179, AC3).
+///
+/// `base * 2^(attempts-1)` capped at `max` while the row is still inside its
+/// attempt budget, and **`max` outright from the quarantine crossing onward**.
+///
+/// That last clause is not cosmetic. With the shipped defaults the crossing is
+/// at `attempts = 3`, where the doubling has only reached 240 s; letting it
+/// keep doubling would mean four more `resume_agent` turns — each able to hold
+/// the agent lock for `AGENT_TOTAL_TIMEOUT_SECS` (300 s) — in the hour after we
+/// announced the row was quarantined. The operator doc and the
+/// `callback_delivery_quarantined` log line both say a quarantined callback
+/// retries at the ceiling; this is what makes that sentence true rather than
+/// approximately true. Announcing a bound and then not applying it for another
+/// four attempts is the shape of instrument that gets distrusted once and
+/// ignored thereafter.
 ///
 /// A pure function so the far tail is testable. `attempts` is unbounded by
 /// construction — a row that keeps failing keeps counting — and the naive
-/// `base << (attempts - 1)` is wrong there in a way that no ordinary run would
-/// surface: `60u64 << 62` drops every set bit and evaluates to **0**, writing a
+/// `base << (attempts - 1)` is wrong there in a way no ordinary run surfaces:
+/// `60u64 << 62` drops every set bit and evaluates to **0**, writing a
 /// `next_fire_at` in the past and restoring the once-a-minute retry loop this
 /// whole function exists to end. `checked_shl` does not catch it either — it
-/// refuses only shifts >= 64 and wraps for everything below. Reaching that
-/// depth takes roughly 57 h of unbroken failure, which is a weekend outage, not
-/// an impossibility. Hence the clamped shift and the saturating multiply; from
-/// the sixth attempt on, `min(max)` is what actually decides the value.
-fn delivery_backoff_secs(base: u64, max: u64, attempts: u32) -> u64 {
+/// refuses only shifts >= 64 and wraps for everything below.
+fn delivery_backoff_secs(base: u64, max: u64, attempts: u32, quarantine_at: u32) -> u64 {
+    if attempts >= quarantine_at {
+        return max;
+    }
     let shift = attempts.saturating_sub(1).min(BACKOFF_MAX_SHIFT);
     base.saturating_mul(1u64 << shift).min(max)
 }
@@ -1402,7 +1415,20 @@ impl TaskDispatcher {
         let attempts = previous_attempts.saturating_add(1);
 
         // Metadata first: it is the surface an operator reads on the row.
-        self.set_delivery_metadata(&task.id, DELIVERY_ATTEMPTS_KEY, &attempts.to_string())
+        //
+        // The counter's write outcome is kept, because the entire escalation
+        // ladder is derived from re-reading it. `set_task_metadata_field` runs
+        // `json_set(COALESCE(metadata,'{}'), …)`, and SQLite raises a hard
+        // "malformed JSON" error — not NULL — on a row whose `metadata` is not
+        // valid JSON. Left merely warned-about, that row would read
+        // `previous_attempts = 0` on *every* failure: `attempts` pinned at 1,
+        // the backoff pinned at one scan interval, and `attempts >=
+        // max_attempts` never true, so it is never quarantined. The starvation
+        // this ticket closes would be silently restored, and the only trace
+        // would be a stream of `callback_delivery_failed` rows all reading
+        // `attempt:1` — which reads like a first failure, not a broken counter.
+        let counter_written = self
+            .set_delivery_metadata(&task.id, DELIVERY_ATTEMPTS_KEY, &attempts.to_string())
             .await;
         self.set_delivery_metadata(&task.id, DELIVERY_LAST_ERROR_CLASS_KEY, class.as_ref())
             .await;
@@ -1438,24 +1464,37 @@ impl TaskDispatcher {
             warn!(error = %e, task_id = %task.id, "failed to write callback_delivery_failed audit event");
         }
 
-        // AC3 — the backoff: `base * 2^(attempts-1)`, capped at `max`.
-        //
-        // `attempts` is unbounded by construction — a row that keeps failing
-        // keeps counting — so the shift is clamped and the multiply saturates.
-        // Neither guard is decorative. A bare `base << 62` drops every set bit
-        // of a small base and yields **0**, which writes a `next_fire_at` in
-        // the past and restores the once-a-minute retry loop this function
-        // exists to end — and it would do so precisely at the far end of a long
-        // outage, when the bound matters most. `checked_shl` does not catch
-        // that: it only refuses shifts >= 64, and wraps for everything below.
-        // In practice `min(max)` decides the value from the sixth attempt on;
-        // these two guards are what keep the far tail honest.
-        let backoff_secs = delivery_backoff_secs(
-            self.settings
-                .effective_callback_delivery_backoff_base_secs(),
-            self.settings.effective_callback_delivery_backoff_max_secs(),
-            attempts,
-        );
+        // AC3 — the backoff. See `delivery_backoff_secs` for why the shift is
+        // clamped and the multiply saturates: `attempts` is unbounded by
+        // construction, and the naive shift silently evaluates to zero at the
+        // far end of a long outage.
+        let max_attempts = self.settings.effective_callback_delivery_max_attempts();
+        let max_backoff = self.settings.effective_callback_delivery_backoff_max_secs();
+        let backoff_secs = if counter_written {
+            delivery_backoff_secs(
+                self.settings
+                    .effective_callback_delivery_backoff_base_secs(),
+                max_backoff,
+                attempts,
+                max_attempts,
+            )
+        } else {
+            // The counter could not be persisted, so `attempts` is not a count
+            // — it is 1, and it will be 1 again next scan. Escalating from an
+            // unreliable number is not possible; the safe reading of "this row
+            // just failed and I cannot tell how many times" is the ceiling, not
+            // the base. Failing open here would pin the row at a 60s retry
+            // forever, which is the starvation, not a mitigation of it.
+            warn!(
+                event = "callback_delivery_counter_unwritable",
+                task_id = %task.id,
+                label = %task.label,
+                error_class = %class,
+                "cannot persist the delivery-attempt counter (malformed task metadata?) — \
+                 backing off at the ceiling instead of escalating from an unreliable count"
+            );
+            max_backoff
+        };
         let fire_at = crate::timestamp::now_plus(chrono::Duration::seconds(backoff_secs as i64));
         if let Err(e) = self.db.update_task_next_fire_at(&task.id, &fire_at).await {
             warn!(error = %e, task_id = %task.id, "failed to write callback delivery backoff");
@@ -1474,9 +1513,10 @@ impl TaskDispatcher {
 
         // AC3 — the quarantine, announced once at the threshold crossing.
         // Once, not per attempt: an event that repeats every minute is the same
-        // silence as no event, just louder.
-        let max_attempts = self.settings.effective_callback_delivery_max_attempts();
-        if attempts >= max_attempts && previous_attempts < max_attempts {
+        // silence as no event, just louder. Gated on `counter_written` for the
+        // same reason the backoff is: a pinned counter would either never reach
+        // the threshold, or re-announce the crossing on every single failure.
+        if counter_written && attempts >= max_attempts && previous_attempts < max_attempts {
             self.set_delivery_metadata(
                 &task.id,
                 DELIVERY_QUARANTINED_AT_KEY,
@@ -1584,14 +1624,21 @@ impl TaskDispatcher {
         }
     }
 
-    /// Write one `metadata.$.<key>` field, warning on failure.
+    /// Write one `metadata.$.<key>` field, warning on failure. Returns whether
+    /// the write landed.
     ///
     /// Factored out because the failure path writes four of these and each one
     /// is individually non-fatal — inlining the `if let Err` four times buried
-    /// the sequence it belongs to.
-    async fn set_delivery_metadata(&self, task_id: &str, key: &str, value: &str) {
-        if let Err(e) = self.db.set_task_metadata_field(task_id, key, value).await {
-            warn!(error = %e, task_id = %task_id, key, "failed to write callback delivery metadata");
+    /// the sequence it belongs to. The return value matters for exactly one of
+    /// the four: the attempt counter, which the escalation ladder re-reads. The
+    /// other three are pure operator surface and their loss costs a warn.
+    async fn set_delivery_metadata(&self, task_id: &str, key: &str, value: &str) -> bool {
+        match self.db.set_task_metadata_field(task_id, key, value).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(error = %e, task_id = %task_id, key, "failed to write callback delivery metadata");
+                false
+            }
         }
     }
 
@@ -3061,24 +3108,49 @@ mod tests {
 
     // ── delivery_backoff_secs tests (mika#2179) ──
 
+    /// The doubling, up to the quarantine crossing. With a quarantine budget
+    /// large enough not to interfere, the sequence is the plain exponential
+    /// capped at the ceiling.
     #[test]
     fn delivery_backoff_doubles_then_holds_at_the_ceiling() {
-        // The shipped defaults: 60s base, 3600s ceiling.
         let seq: Vec<u64> = (1..=8)
-            .map(|n| delivery_backoff_secs(60, 3600, n))
+            .map(|n| delivery_backoff_secs(60, 3600, n, u32::MAX))
             .collect();
         assert_eq!(seq, vec![60, 120, 240, 480, 960, 1920, 3600, 3600]);
+    }
+
+    /// The crossing jumps straight to the ceiling, and this is what makes the
+    /// `callback_delivery_quarantined` log line and the operator doc true
+    /// rather than approximately true. With the shipped budget of 3, the
+    /// doubling has only reached 240 s at the crossing — four more attempts
+    /// away from the hour both surfaces promise. Each of those attempts can
+    /// hold the agent lock for `AGENT_TOTAL_TIMEOUT_SECS`, so "approximately"
+    /// is worth about 20 minutes of lock on a bad night.
+    #[test]
+    fn delivery_backoff_jumps_to_the_ceiling_at_the_quarantine_crossing() {
+        // Below the budget: ordinary doubling.
+        assert_eq!(delivery_backoff_secs(60, 3600, 1, 3), 60);
+        assert_eq!(delivery_backoff_secs(60, 3600, 2, 3), 120);
+        // At and past it: the ceiling, not 240.
+        assert_eq!(
+            delivery_backoff_secs(60, 3600, 3, 3),
+            3600,
+            "the announced bound must be the applied bound"
+        );
+        assert_eq!(delivery_backoff_secs(60, 3600, 4, 3), 3600);
     }
 
     /// The far tail, which no ordinary run reaches and which the naive shift
     /// gets catastrophically wrong: `60u64 << 62` is 0, i.e. a `next_fire_at`
     /// in the past — the unbounded retry loop, back, after roughly 57 h of
-    /// unbroken failure. This asserts the floor, not just the absence of a
-    /// panic.
+    /// unbroken failure. Asserts the floor, not merely the absence of a panic:
+    /// zero does not panic, so a "does not panic" test would have passed on the
+    /// broken version. Quarantine is disabled here so the arithmetic itself is
+    /// what is under test, not the crossing short-circuit in front of it.
     #[test]
     fn delivery_backoff_never_collapses_to_zero_on_a_long_outage() {
         for attempts in [40u32, 62, 63, 64, 65, 1000, u32::MAX] {
-            let backoff = delivery_backoff_secs(60, 3600, attempts);
+            let backoff = delivery_backoff_secs(60, 3600, attempts, u32::MAX);
             assert_eq!(
                 backoff, 3600,
                 "attempt {attempts} must stay at the ceiling, got {backoff}"
@@ -3090,9 +3162,9 @@ mod tests {
     /// single transient blip behaves as it did before this fix.
     #[test]
     fn delivery_backoff_first_attempt_is_one_base_interval() {
-        assert_eq!(delivery_backoff_secs(60, 3600, 1), 60);
+        assert_eq!(delivery_backoff_secs(60, 3600, 1, 3), 60);
         assert_eq!(
-            delivery_backoff_secs(60, 3600, 0),
+            delivery_backoff_secs(60, 3600, 0, 3),
             60,
             "attempts=0 is unreachable from the caller but must not underflow"
         );

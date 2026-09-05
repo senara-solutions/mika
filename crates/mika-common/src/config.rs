@@ -1183,6 +1183,20 @@ pub const DEFAULT_CALLBACK_DELIVERY_BACKOFF_BASE_SECS: u64 = 60;
 /// what AC3 asks for, without the row being abandoned.
 pub const DEFAULT_CALLBACK_DELIVERY_BACKOFF_MAX_SECS: u64 = 3600;
 
+/// Hard upper bound on any configured callback-delivery backoff, in seconds
+/// (mika#2179). Thirty days — the same figure, for the same reason, as the
+/// upper clamp on `MIKA_PROMOTED_WRAPPER_LIVENESS_SECS`.
+///
+/// This is not tidiness. The effective value is handed to
+/// `chrono::Duration::seconds`, which panics above `i64::MAX / 1000`, and a
+/// value at or above `2^63` casts to a negative `i64` on the way in. An
+/// operator typing milliseconds where seconds were meant would therefore kill
+/// the delivery task *inside* the function that writes the backoff, leaving the
+/// row with no `next_fire_at` at all — the unbounded retry, restored by the
+/// setting meant to bound it. A backoff beyond thirty days has no meaning here
+/// anyway: the callback carries a pilot's return that someone is waiting on.
+pub const CALLBACK_DELIVERY_BACKOFF_ABSOLUTE_MAX_SECS: u64 = 30 * 24 * 60 * 60;
+
 /// Default bounded webhook-queue max depth per agent (mika#1870).
 pub const DEFAULT_WEBHOOK_QUEUE_MAX_DEPTH: usize = 64;
 
@@ -1585,26 +1599,40 @@ impl Settings {
     /// Effective first backoff step after a failed delivery (mika#2179).
     ///
     /// Returns the configured value or
-    /// [`DEFAULT_CALLBACK_DELIVERY_BACKOFF_BASE_SECS`] (60s), clamped to a
-    /// floor of 1 — a base of `0` would make every doubling `0` and write a
-    /// `next_fire_at` in the past, i.e. no backoff at all while appearing to
-    /// have one.
+    /// [`DEFAULT_CALLBACK_DELIVERY_BACKOFF_BASE_SECS`] (60s), clamped to
+    /// `1..=`[`CALLBACK_DELIVERY_BACKOFF_ABSOLUTE_MAX_SECS`]. A base of `0`
+    /// would make every doubling `0` and write a `next_fire_at` in the past —
+    /// no backoff at all, while appearing in the row to have one.
     pub fn effective_callback_delivery_backoff_base_secs(&self) -> u64 {
         self.callback_delivery_backoff_base_secs
             .unwrap_or(DEFAULT_CALLBACK_DELIVERY_BACKOFF_BASE_SECS)
-            .max(1)
+            .clamp(1, CALLBACK_DELIVERY_BACKOFF_ABSOLUTE_MAX_SECS)
     }
 
     /// Effective ceiling on the callback-delivery backoff (mika#2179).
     ///
     /// Returns the configured value or
-    /// [`DEFAULT_CALLBACK_DELIVERY_BACKOFF_MAX_SECS`] (3600s), never below the
-    /// effective base — a max under the base would make the "capped" backoff
-    /// shorter than its own first step.
+    /// [`DEFAULT_CALLBACK_DELIVERY_BACKOFF_MAX_SECS`] (3600s), clamped into
+    /// `base..=`[`CALLBACK_DELIVERY_BACKOFF_ABSOLUTE_MAX_SECS`].
+    ///
+    /// **Both ends of that clamp are load-bearing.** Below the base, a "capped"
+    /// backoff would be shorter than its own first step. Above the absolute
+    /// max, the value reaches `chrono::Duration::seconds`, which **panics**
+    /// past `i64::MAX / 1000` — and a value at or above `2^63` casts to a
+    /// negative `i64` first. Either way the delivery task dies inside the very
+    /// function that was about to write the backoff, so the row keeps
+    /// `status='completed'` with no `next_fire_at` and is re-selected on every
+    /// scan: precisely the unbounded retry this setting exists to prevent,
+    /// reachable by one fat-fingered milliseconds-for-seconds value. Same
+    /// reasoning, and the same "load-bearing" note, as the 30-day upper clamp
+    /// on `MIKA_PROMOTED_WRAPPER_LIVENESS_SECS`.
     pub fn effective_callback_delivery_backoff_max_secs(&self) -> u64 {
         self.callback_delivery_backoff_max_secs
             .unwrap_or(DEFAULT_CALLBACK_DELIVERY_BACKOFF_MAX_SECS)
-            .max(self.effective_callback_delivery_backoff_base_secs())
+            .clamp(
+                self.effective_callback_delivery_backoff_base_secs(),
+                CALLBACK_DELIVERY_BACKOFF_ABSOLUTE_MAX_SECS,
+            )
     }
 
     /// Effective bounded webhook-queue max depth (mika#1870).
@@ -2887,6 +2915,41 @@ mod tests {
             120,
             "a max below the base is raised to the base, never below it"
         );
+    }
+
+    /// The upper clamp is what keeps a fat-fingered value from **panicking**
+    /// `chrono::Duration::seconds` inside the delivery path — which would leave
+    /// the row with no `next_fire_at` at all, i.e. the unbounded retry restored
+    /// by the very setting meant to bound it. Asserting the clamped value, not
+    /// merely the absence of a panic here, is the point: a test that only
+    /// checked "does not panic" would pass on the unclamped version too.
+    #[test]
+    #[serial]
+    fn callback_delivery_backoff_has_an_upper_clamp() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut settings = Settings::load(tmp.path()).unwrap();
+
+        // Milliseconds typed where seconds were meant, and the absolute worst
+        // case — both land on the same bound rather than on a panic.
+        for absurd in [3_600_000u64, u64::MAX] {
+            settings.callback_delivery_backoff_max_secs = Some(absurd);
+            settings.callback_delivery_backoff_base_secs = Some(absurd);
+            assert_eq!(
+                settings.effective_callback_delivery_backoff_base_secs(),
+                CALLBACK_DELIVERY_BACKOFF_ABSOLUTE_MAX_SECS
+            );
+            assert_eq!(
+                settings.effective_callback_delivery_backoff_max_secs(),
+                CALLBACK_DELIVERY_BACKOFF_ABSOLUTE_MAX_SECS
+            );
+            // The value the dispatcher actually hands to chrono must be
+            // representable — this is the assertion the clamp exists for.
+            let _ = chrono::Duration::seconds(
+                settings.effective_callback_delivery_backoff_max_secs() as i64,
+            );
+        }
     }
 
     // -- Bounded webhook queue (mika#1870) --
