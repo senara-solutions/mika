@@ -313,6 +313,27 @@ La phase D dégrade proprement si le binaire `mika` est absent du `PATH`
 
 ---
 
+## 7 bis. Deux points tranchés par l'architecte — ne pas les rouvrir
+
+Second passage, session `8f1f0d9a-6343-4ef2-a31a-9bb4817ab9c9`. Les deux incertitudes
+que le plan portait avec une valeur par défaut ont reçu un arbitrage. Elles sont
+closes ; l'implémenteur applique, il n'arbitre pas de nouveau.
+
+1. **Le refus garde son nom propre, `worktree_claimed_by_other`.** Il emprunte le
+   branchement de `global_dispatch_active` (`register_deferred_callback`,
+   `executor.rs:2415`) mais **ne fusionne pas** avec lui. Raison retenue : sans nom
+   distinct, une collision de worktree et une file de dispatch saturée deviennent
+   indistinguables dans les journaux et les métriques, ce qui rend le prochain
+   incident de cette classe non diagnosticable par `grep`.
+
+2. **B3 reste dans la portée.** La vérification miroir dans
+   `reap_stale_blocked_dispatch_tasks` (`engine.rs:1088`, à côté de celle du bail en
+   `:1144`) est la symétrie correcte du refus posé côté validation. Le tournoiement
+   ré-arme/refuse, même borné par `rearm_count`, coûte du bruit et de la latence dans
+   la file ; on ferme la boucle des deux côtés ou d'aucun.
+
+---
+
 ## 8. Résidus nommés
 
 **R1 — un `git worktree add` à la main ne réclame rien.** Après la phase D, les gestes
