@@ -1071,6 +1071,15 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Test-only wrapper for [`Database::backdate_task_completed_at`] (mika#2179).
+    /// Not for production use.
+    #[doc(hidden)]
+    pub async fn backdate_task_completed_at(&self, task_id: &str, seconds_ago: i64) -> Result<()> {
+        let t = task_id.to_owned();
+        self.with_db(move |db| db.backdate_task_completed_at(&t, seconds_ago))
+            .await
+    }
+
     /// Find completable parent self_dev tasks whose callback subtask delivered
     /// WITH a `pr_url` (success indicator) but were never transitioned by the
     /// silent agent turn (mika#1162). See
