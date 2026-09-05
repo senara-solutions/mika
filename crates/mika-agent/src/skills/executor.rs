@@ -2531,7 +2531,15 @@ pub(crate) async fn register_deferred_callback(
 /// cannot repair, and a full deferred-callback queue is not that. It is a
 /// transient condition that clears on its own, so a task refused for capacity
 /// must be left alone and retried, not destroyed with repair budget still on it.
+///
+/// `#[must_use]` (mika#2169): the doc above named one failure mode — collapsing
+/// the two refusals into a boolean — and successfully prevented it. It did not
+/// imagine the cruder one, which is what actually happened: a call site that
+/// ended in `.await;` and threw **both** away, leaving a `blocked` parent with
+/// no code path that writes anything about it. Prose could not stop that; the
+/// attribute makes it a compile error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "NotNow and Unrepairable demand different handling — discarding the outcome is the mika#2169 defect"]
 pub(crate) enum RearmOutcome {
     /// A replacement wrapper now exists.
     Rearmed,

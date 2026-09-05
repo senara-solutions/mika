@@ -1187,6 +1187,35 @@ impl TaskEngine {
                 }
             };
 
+            // Return the parent to `pending` BEFORE re-arming, and the order is
+            // a safety property rather than a preference. Both writes can fail
+            // independently, so pick the failure that lands in covered
+            // territory:
+            //
+            //   status-then-rearm, rearm fails  -> `pending` with no wrapper,
+            //     which is *exactly* the population `find_orphaned_pending_
+            //     issue_tasks` (mika#2045) owns and repairs next tick.
+            //   rearm-then-status, status fails -> `blocked` with a live
+            //     wrapper. That wrapper gets promoted, its turn calls
+            //     `run_claude_pilot`, and check (1) of
+            //     `validate_dispatch_readiness` REFUSES a `blocked` task — so
+            //     it registers another wrapper, and round it goes.
+            //
+            // This sweep feeds the mika#2045 ladder; it does not replace it,
+            // and it should fail into it rather than beside it.
+            if let Err(e) = self
+                .db
+                .update_task_status(&candidate.id, task_status::PENDING)
+                .await
+            {
+                warn!(
+                    task_id = %candidate.id,
+                    error = %e,
+                    "stale_blocked_dispatch: failed to return the parent to pending — skipping this pass"
+                );
+                continue;
+            }
+
             let outcome = match action_config {
                 Some(config) => {
                     crate::skills::executor::rearm_deferred_callback(
@@ -1210,20 +1239,6 @@ impl TaskEngine {
                     );
                 }
                 RearmOutcome::Rearmed => {
-                    // Hand the parent back to the population the mika#2045
-                    // ladder already covers. This sweep feeds that ladder; it
-                    // does not replace it.
-                    if let Err(e) = self
-                        .db
-                        .update_task_status(&candidate.id, task_status::PENDING)
-                        .await
-                    {
-                        warn!(
-                            task_id = %candidate.id,
-                            error = %e,
-                            "stale_blocked_dispatch: re-armed but failed to return the parent to pending"
-                        );
-                    }
                     info!(
                         event = "stale_blocked_dispatch_rearmed",
                         task_id = %candidate.id,
@@ -1278,7 +1293,12 @@ impl TaskEngine {
                                     &system_session,
                                     "stale_blocked_dispatch_expired",
                                     &format!("task:{}", candidate.id),
-                                    Some("blocked"),
+                                    // `pending`, not `blocked`: the sweep
+                                    // already returned the parent above, and an
+                                    // audit row must name the state that was
+                                    // actually true at write time. The origin
+                                    // is carried by the tool name and reason.
+                                    Some("pending"),
                                     Some("failed"),
                                     Some(&format!(
                                         "issue:{} age_seconds:{} rearm_count:{}",
