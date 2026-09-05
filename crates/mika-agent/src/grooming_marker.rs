@@ -39,13 +39,70 @@
 //!
 //! Avant mika#2158 il était **lexical** : le mot `second-pass` devait précéder `GROOMED`.
 //! Il est désormais **positionnel** : la ligne de callout `Grooming history` est le contexte,
-//! et le **dernier** token de verdict qu'elle contient est l'état. Cet ancrage sur le préfixe
+//! et le **dernier marqueur d'état** qu'elle contient est l'état. Cet ancrage sur le préfixe
 //! de ligne `^> - **Grooming history:**` est ce qui préserve la distinction callout/prose —
 //! « le ticket a été GROOMED hier » écrit en corps de texte ne rend toujours rien.
 //!
-//! Deux tokens seulement sont des verdicts : `GROOMED` et `ESCALATE`. `READY` et `ITERATE`
-//! sont des **dispositions de passe**, pas des verdicts finaux — à une exception près, la
-//! règle AC1 documentée sur [`grooming_verdict`].
+//! Les marqueurs d'état sont les deux tokens de verdict — `GROOMED` et `ESCALATE` — **plus**
+//! le `READY` de première passe lorsqu'aucune passe ultérieure n'est annoncée. `ITERATE`
+//! n'en est jamais un. **Il n'y a plus d'exception hors-ordre** : tous les marqueurs sont
+//! rangés dans le même ordre, et le dernier fait foi.
+//!
+//! # Pourquoi `READY` est entré dans l'ordre (mika#2188)
+//!
+//! Jusqu'à mika#2188, le `READY` de première passe était traité par un **repli** —
+//! atteignable seulement quand le callout ne portait aucun token de verdict. Dès qu'un
+//! `GROOMED` ou un `ESCALATE` apparaissait n'importe où, le repli devenait inatteignable.
+//!
+//! Ce détail a rendu indispatchable un chemin **prescrit** par `/mika-groom-ticket` :
+//!
+//! ```text
+//! /ce:plan → checkpoint Phase 2.5 (ESCALATE-divergence, résolu par l'opérateur)
+//!         → réconciliation → mika-arch first-pass (READY)
+//! ```
+//!
+//! `VERDICT_TOKEN_RE` matche `ESCALATE` **à l'intérieur** de `ESCALATE-divergence` — le tiret
+//! satisfait la frontière de mot finale. Le dernier *token de verdict* restait donc
+//! `ESCALATE`, et le repli `READY` n'était jamais lu. Un ticket dont l'escalade avait été
+//! résolue par l'opérateur, puis approuvé par l'architecte, était lu comme escaladé. Mesuré
+//! sur **mika-cloud#205** le 2026-09-05 : `verdict=Escalated` — et non `Absent`, ce qui est
+//! la signature qui distingue cette cause de toutes les autres.
+//!
+//! ## La forme retenue, et celle qui a été écartée
+//!
+//! **Retenue — `READY` devient un marqueur positionnel.** Une seule liste ordonnée, le
+//! dernier marqueur fait foi. Elle *supprime* un concept : le module retrouve une règle au
+//! lieu de deux qui se marchaient dessus.
+//!
+//! **Écartée — reconnaître le motif « escalade résolue »** (`ESCALATE…` suivi d'une passe
+//! aboutie, traité comme neutralisant l'escalade). Trois raisons :
+//!
+//! 1. Elle répare le symptôme, pas la cause : la cause est qu'une règle de repli cohabitait
+//!    avec un discriminateur qui se déclare positionnel.
+//! 2. Elle ne voit pas le cas symétrique. `first-pass (READY) → revue opérateur (ESCALATE)`
+//!    doit rendre `Escalated` ; sous la forme retenue c'est automatique, sous le motif il
+//!    faudrait une seconde règle. Le cas est épinglé par
+//!    [`tests::first_pass_ready_then_later_escalate_is_escalated`].
+//! 3. Définir « une passe aboutie » revient à reconstruire la liste de marqueurs pour un
+//!    usage local et unique — la forme retenue, plus le coût de nommer le motif.
+//!
+//! **Écartée aussi — resserrer `VERDICT_TOKEN_RE`** pour que `ESCALATE-divergence` ne matche
+//! plus : elle ferait dépendre le verdict de l'orthographe d'un mot composé plutôt que de la
+//! chronologie.
+//!
+//! ## Ce que la règle positionnelle garantit — et ce qu'elle ne garantit pas
+//!
+//! Elle est **purement chronologique**. Le dernier marqueur gagne, quelle que soit la prose
+//! autour de lui : `(ESCALATE-divergence, NON résolu) → first-pass (READY)` rend `Groomed`.
+//! Le prédicat ne lit pas le mot « résolu » et ne peut pas le lire — ce qui atteste la
+//! résolution est **la passe architecte postérieure elle-même**, pas l'adjectif.
+//!
+//! Une escalade qui doit rester lisible comme escalade est donc une escalade qu'aucun
+//! marqueur abouti ne suit. C'est ce qu'épinglent
+//! [`tests::escalate_without_later_groomed_is_escalated`] et
+//! [`tests::first_pass_ready_then_later_escalate_is_escalated`], et c'est tout ce que la
+//! forme retenue promet. Prétendre qu'elle distingue une escalade résolue d'une escalade
+//! ouverte serait lui prêter une lecture sémantique qu'elle n'a pas.
 
 use std::sync::LazyLock;
 
@@ -56,8 +113,12 @@ use regex::Regex;
 pub enum GroomingVerdict {
     /// Le grooming a abouti : le ticket peut partir en implémentation.
     Groomed,
-    /// La dernière disposition est un `ESCALATE` sans `GROOMED` postérieur — le ticket est
-    /// dans les mains de l'opérateur, pas prêt.
+    /// Le dernier marqueur d'état est un `ESCALATE` — le ticket est dans les mains de
+    /// l'opérateur, pas prêt.
+    ///
+    /// Depuis mika#2188, ce qui lève une escalade n'est plus seulement un `GROOMED`
+    /// postérieur : un `READY` de première passe postérieur la lève aussi. C'est la
+    /// **position** du dernier marqueur qui décide, pas sa nature.
     Escalated,
     /// Aucun verdict lisible : pas de callout, ou un callout dont aucune passe n'a abouti
     /// (`ITERATE` seul, une seconde passe annoncée dont le verdict est illisible).
@@ -84,8 +145,22 @@ static VERDICT_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Une première passe dont la disposition est `READY`, dans les deux langues du dépôt.
+///
+/// **Le groupe 1 est le token `READY` lui-même**, et non la phrase qui l'introduit : c'est sa
+/// position qui entre dans l'ordre des marqueurs d'état (voir [`grooming_verdict`]). Ancrer
+/// sur `first-pass` donnerait le même verdict sur les corps connus, mais ferait dépendre
+/// l'ordonnancement de la longueur du préfixe de phrase — indéfendable dès qu'une forme
+/// nouvelle apparaît.
+///
+/// **La casse du token est significative ; celle de la phrase qui l'introduit ne l'est pas.**
+/// `(?i)` ne couvre que l'alternance de préfixe — `First-pass`, `Première passe` sont des
+/// variations de rédaction légitimes. `READY` reste sensible à la casse, exactement comme
+/// [`VERDICT_TOKEN_RE`], et pour la même raison : c'est un token produit par le pipeline, pas
+/// un mot de prose. Depuis mika#2188 ce `READY` peut **surclasser** un `ESCALATE` qui le
+/// précède ; lui laisser une discipline plus lâche qu'aux tokens qu'il surclasse ferait de
+/// `first-pass (ready ?)` écrit en passant un ordre de dispatch.
 static FIRST_PASS_READY_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(first-pass|première passe|premiere passe)\s*\(\s*READY")
+    Regex::new(r"(?i:first-pass|première passe|premiere passe)\s*\(\s*(READY)")
         .expect("first-pass READY regex must compile")
 });
 
@@ -119,16 +194,20 @@ fn callout_text(issue_body: &str) -> Option<String> {
 /// # La règle
 ///
 /// 1. Pas de ligne de callout `Grooming history` → [`GroomingVerdict::Absent`].
-/// 2. Le **dernier** token de verdict de ce callout fait foi :
-///    `… (ESCALATE …) → … (GROOMED …)` rend `Groomed`, et
-///    `… (GROOMED) → … (ESCALATE)` rend `Escalated`. L'ordre compte dans les deux sens.
-/// 3. Aucun token de verdict, mais une première passe `READY` **et aucune marque de passe
-///    ultérieure** → `Groomed`. C'est la règle AC1, et le seul cas où une disposition vaut
-///    verdict : `/mika-groom-ticket` phase 3 étape 10 prescrit de sauter à la phase 5 sans
-///    seconde passe quand le plan est sain du premier coup, donc le corps ne peut pas porter
-///    de verdict de seconde passe — en exiger un revient à punir le grooming qui s'est bien
-///    passé.
-/// 4. Tout le reste → `Absent`.
+/// 2. Le **dernier marqueur d'état** du callout fait foi. Les marqueurs sont les tokens
+///    `GROOMED` et `ESCALATE[DS]?`, **plus** le `READY` de première passe lorsqu'aucune
+///    marque de passe ultérieure n'est annoncée. `… (ESCALATE …) → … (GROOMED …)` rend
+///    `Groomed` ; `… (GROOMED) → … (ESCALATE)` rend `Escalated` ;
+///    `… (ESCALATE-divergence, résolu…) → … first-pass (READY)` rend `Groomed`. L'ordre
+///    compte dans tous les sens.
+/// 3. Aucun marqueur → `Absent`.
+///
+/// Il n'y a **pas** de quatrième règle, et aucun repli : c'est le point de mika#2188. Une
+/// première passe `READY` vaut verdict parce que `/mika-groom-ticket` phase 3 étape 10
+/// prescrit de sauter à la phase 5 sans seconde passe quand le plan est sain du premier
+/// coup — en exiger une reviendrait à punir le grooming qui s'est bien passé. Mais elle le
+/// vaut **à sa position**, comme les autres, et non par une branche atteinte seulement en
+/// l'absence de tout token de verdict.
 ///
 /// # Pourquoi AC1 est désarmée par une marque de passe ultérieure
 ///
@@ -140,6 +219,13 @@ fn callout_text(issue_body: &str) -> Option<String> {
 /// première passe, alors qu'il annonce lui-même une seconde passe dont le verdict n'en est
 /// pas un.
 ///
+/// Depuis mika#2188 ce désarmement gouverne la **participation** de `READY` à l'ordre des
+/// marqueurs, et non plus un repli. Sa justification vaut mot pour mot ; seul son point
+/// d'application a bougé. `LATER_PASS_RE` s'évalue sur le texte concaténé entier : un second
+/// callout portant `second-pass` désarme donc le `READY` du premier. C'est le comportement
+/// d'avant, préservé volontairement — le changer ouvrirait une question de périmètre que
+/// mika#2188 ne couvre pas.
+///
 /// `ITERATE` seul reste `Absent` pour la raison symétrique : une première passe qui itère
 /// **prescrit** une seconde passe, qui n'a pas eu lieu.
 pub fn grooming_verdict(issue_body: &str) -> GroomingVerdict {
@@ -147,19 +233,35 @@ pub fn grooming_verdict(issue_body: &str) -> GroomingVerdict {
         return GroomingVerdict::Absent;
     };
 
-    if let Some(last) = VERDICT_TOKEN_RE.find_iter(&text).last() {
-        return if last.as_str().starts_with("GROOMED") {
-            GroomingVerdict::Groomed
-        } else {
-            GroomingVerdict::Escalated
-        };
+    // Les marqueurs d'état, dans l'ordre du document : (offset, est_groomé).
+    let mut markers: Vec<(usize, bool)> = VERDICT_TOKEN_RE
+        .find_iter(&text)
+        .map(|m| (m.start(), m.as_str().starts_with("GROOMED")))
+        .collect();
+
+    // Une première passe `READY` est un marqueur d'état — mais seulement si aucune passe
+    // ultérieure n'est annoncée. Ce désarmement est la règle AC1 de mika#2158, inchangée :
+    // il gouverne désormais la *participation* de `READY` à l'ordre, là où il gouvernait
+    // un repli.
+    if !LATER_PASS_RE.is_match(&text) {
+        markers.extend(
+            FIRST_PASS_READY_RE
+                .captures_iter(&text)
+                .filter_map(|c| c.get(1))
+                .map(|m| (m.start(), true)),
+        );
     }
 
-    if FIRST_PASS_READY_RE.is_match(&text) && !LATER_PASS_RE.is_match(&text) {
-        return GroomingVerdict::Groomed;
-    }
+    // Trier sur l'offset seul suffit : `VERDICT_TOKEN_RE` ne matche ni `READY` ni ses
+    // préfixes, donc deux marqueurs ne peuvent pas partager une position. Un `then`
+    // départageur laisserait croire à une ambiguïté qui n'existe pas.
+    markers.sort_by_key(|(offset, _)| *offset);
 
-    GroomingVerdict::Absent
+    match markers.last() {
+        Some((_, true)) => GroomingVerdict::Groomed,
+        Some((_, false)) => GroomingVerdict::Escalated,
+        None => GroomingVerdict::Absent,
+    }
 }
 
 /// Sucre : le corps porte-t-il un grooming abouti ?
@@ -223,6 +325,24 @@ pub(crate) mod tests {
             )),
             GroomingVerdict::Groomed
         );
+    }
+
+    /// mika#2188 — le chemin nominal Phase 2.5 : une escalade de réconciliation résolue par
+    /// l'opérateur, suivie d'un first-pass READY. Callout relevé sur mika-cloud#205 le
+    /// 2026-09-05, verbatim.
+    ///
+    /// Avant le correctif ce corps rendait `Escalated` — et non `Absent` : le prédicat ne
+    /// disait pas « je ne sais pas lire », il disait « ce ticket est escaladé ». C'est la
+    /// signature qui distingue cette cause de toutes les autres.
+    #[test]
+    fn ac1_escalate_divergence_resolved_then_first_pass_ready_is_groomed() {
+        let history = "/ce:plan → checkpoint Phase 2.5 (ESCALATE-divergence, résolu par \
+                       l'opérateur) → réconciliation → mika-arch first-pass (READY)";
+        assert_eq!(
+            grooming_verdict(&body_with(history)),
+            GroomingVerdict::Groomed
+        );
+        assert!(has_groomed_verdict(&body_with(history)));
     }
 
     #[test]
@@ -299,6 +419,20 @@ pub(crate) mod tests {
         );
     }
 
+    /// mika#2188 — l'ordre compte aussi quand `READY` précède l'escalade. Une escalade
+    /// POSTÉRIEURE à une passe aboutie reste une escalade. C'est le cas que la forme (a)
+    /// rend automatique et que la forme (b) — « reconnaître le motif escalade-résolue » —
+    /// aurait manqué : voir §2 du plan.
+    #[test]
+    fn first_pass_ready_then_later_escalate_is_escalated() {
+        assert_eq!(
+            grooming_verdict(&body_with(
+                "mika-arch first-pass (READY) → revue de périmètre opérateur (ESCALATE)"
+            )),
+            GroomingVerdict::Escalated
+        );
+    }
+
     #[test]
     fn iterate_alone_is_absent() {
         // Une première passe qui itère prescrit une seconde passe, qui n'a pas eu lieu.
@@ -328,6 +462,54 @@ pub(crate) mod tests {
         assert_eq!(
             grooming_verdict(&body_with("first-pass (READY) → second-pass (GROOMEDLY)")),
             GroomingVerdict::Absent
+        );
+    }
+
+    /// mika#2188 — `READY` surclasse désormais un `ESCALATE` qui le précède. Il porte donc
+    /// la même autorité qu'un token de verdict, et doit porter la même discipline lexicale :
+    /// la casse compte. Sans cela, `first-pass (ready ?)` écrit en passant dans une phrase
+    /// française vaudrait ordre de dispatch sur un ticket escaladé.
+    ///
+    /// La casse du **préfixe** reste libre — `Première passe` est une variation de rédaction,
+    /// pas un token.
+    #[test]
+    fn lowercase_ready_is_not_a_state_marker() {
+        assert_eq!(
+            grooming_verdict(&body_with(
+                "checkpoint Phase 2.5 (ESCALATE-divergence) → l'opérateur veut refaire la \
+                 first-pass (ready ?)"
+            )),
+            GroomingVerdict::Escalated
+        );
+        assert_eq!(
+            grooming_verdict(&body_with("Première passe (READY) — rien à redire")),
+            GroomingVerdict::Groomed
+        );
+    }
+
+    /// **Limite connue, épinglée — ce n'est pas une régression.**
+    ///
+    /// `LATER_PASS_RE` s'évalue sur le texte **concaténé** de tous les callouts. Un premier
+    /// callout portant `second-pass` désarme donc le `READY` d'un second callout empilé, et
+    /// le correctif de mika#2188 est inerte sur cette forme : le verdict reste `Escalated`.
+    ///
+    /// C'est le comportement d'avant mika#2188, préservé volontairement (§3.2 et §6 du plan) :
+    /// le re-grooming qui empile un second callout (mika#2012) est une population distincte,
+    /// et changer la portée de la porte ouvrirait un périmètre que le ticket ne couvre pas.
+    ///
+    /// Ce test existe parce qu'une prose disant « préservé volontairement » ne se distingue
+    /// pas d'une régression pour qui lit le module six mois plus tard. Si cette limite doit
+    /// tomber un jour, c'est **ce test** qu'il faudra retirer sciemment — pas un verdict
+    /// surprenant qu'il faudra re-diagnostiquer.
+    #[test]
+    fn stacked_callouts_later_pass_gate_is_global_known_limit() {
+        let body = "## Description\n\n\
+                    > - **Grooming history:** first-pass (ITERATE) → second-pass (ESCALATE)\n\
+                    > - **Grooming history:** mika-arch first-pass (READY)\n";
+        assert_eq!(
+            grooming_verdict(body),
+            GroomingVerdict::Escalated,
+            "limite connue mika#2188 : la porte LATER_PASS_RE est globale au texte concaténé"
         );
     }
 
