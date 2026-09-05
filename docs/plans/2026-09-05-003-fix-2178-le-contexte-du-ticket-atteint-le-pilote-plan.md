@@ -259,8 +259,11 @@ Le test asserte aussi que l'injection est **inconditionnelle** — aucune occurr
 l'horodatage ISO et le rôle attendu (`bot` / `humain`) ; le corps du ticket est sous son propre
 séparateur `--- corps du ticket ---`.
 
-**T5 — bornes.** (a) 15 commentaires → exactement 10 rendus, ordre chronologique croissant,
-ligne d'omission portant le compte `5`. (b) un commentaire de 8 Kio → tronqué à 4 096 o avec
+**T5 — bornes.** (a) 15 commentaires **courts (≤ 200 o chacun, pour que seul le plafond de
+nombre morde et non celui du bloc)** → exactement 10 rendus, ordre chronologique croissant,
+ligne d'omission portant le compte `5`. Sans cette contrainte de taille sur la fixture, une
+implémentation correcte peut rendre moins de 10 (éviction par le plafond de bloc) et le test
+rougirait à tort. (b) un commentaire de 8 Kio → tronqué à 4 096 o avec
 marqueur. (c) 10 commentaires de 4 Kio → bloc ≤ 16 384 o **et** ligne d'omission présente.
 (d) un corps de 32 Kio → tronqué à 16 384 o avec marqueur.
 
