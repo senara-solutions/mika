@@ -277,6 +277,97 @@ Optional (bounded webhook queue — mika#1870):
 - `MIKA_WEBHOOK_QUEUE_BLOCK_TIMEOUT_MS` — When the queue is full, `enqueue` blocks up to this long waiting for the drain worker to free a slot before dropping the oldest entry (backpressure). Default `100`.
 - **Operator grep signals** (`$MIKA_SPIRIT_LOG_FILE`, all throttled ≤1/sec/action/agent): `webhook_queue_coalesced` (real coalescing volume — the burst-collapse working), `webhook_queue_drop_oldest` (queue overflow / dead-letter — should be near-zero; sustained hits mean an agent is saturated), `webhook_queue_dequeued` (carries `wait_ms` — backlog latency), `webhook_queue_processing_error` (a drain-worker panic was isolated), and `webhook_queue.gauge` (5s depth/counter heartbeat, emitted only when non-idle). Post-deploy (AC8): `rate_limit_trip` should drop to near-zero (baseline 41/h on mika-qa).
 
+Optional (bounded A2A wait line — mika#2163):
+- **The failure this replaces.** Both `/a2a/{agent}` lock gates (`server/a2a.rs`
+  `message/send` and `message/stream`) took the per-agent mutex with
+  `try_lock_owned()` and answered `-32603 "Agent is busy"` on collision — a refusal,
+  not a wait, on a code whose defined meaning is "the server failed". `/a2a` is the
+  path of every `mika ask` and therefore of every pilot `canUseTool` callback.
+  Measured 2026-09-03 during the grooming of mika#2160: a first-pass architect
+  review refused **five times in a row** at 20 s intervals before the sixth attempt
+  landed. Without the retry loop hand-written in the caller's shell, the grooming
+  stopped there — and every caller of the path had to reimplement that loop or lose
+  its call.
+- `MIKA_A2A_QUEUE_MAX_DEPTH` — how many callers may be **waiting** for the agent
+  lock on `/a2a/{agent}` (default `8`). The bound is on waits, never on turns: the
+  permit is released the instant the lock is acquired, because holding it for the
+  turn would count one wait and one execution against the same number and the depth
+  would stop meaning anything an operator can reason about. `0` → default with a
+  WARN (a line that admits nobody is the kill-switch's job, not this key's). Past 8
+  the cumulative wait exceeds every waiter's budget; refusing quickly is more honest
+  than queueing a ninth caller behind eight agent turns.
+- `MIKA_A2A_QUEUE_WAIT_TIMEOUT_MS` — how long an admitted caller waits before being
+  refused (default `30000`). **Sized against the tightest real caller budget, not the
+  most generous one.** A server-side wait is only useful while the caller is still
+  there to collect the answer; past that point it converts a legible refusal into an
+  illegible transport kill — the very failure this ticket exists to remove. Two
+  budgets are in play and they are not equal: `A2aClient::DEFAULT_TIMEOUT` is 300 s,
+  but the claude-pilot `canUseTool` relay is **120 s** (`.claude/claude-pilot.json`,
+  identical in all five repos) and covers the wait *and* the turn. The pilot relay is
+  not a secondary caller — it is the path this ticket was filed about. A 120 s wait,
+  reasoned from the 300 s figure alone, would spend a pilot's whole budget waiting and
+  the relay would kill `mika ask` at the exact instant the wait expired. 30 s is a
+  quarter of the binding budget, leaves 90 s for the turn, and absorbs the common case
+  in one call (the founding incident's refusals were 20 s apart, so one turn boundary
+  fits inside it). Absorbing that incident's *full* ≈100 s of occupancy in a single
+  call is not available at any setting — it does not fit in 120 s that must also pay
+  for a turn. `0` is honoured as "do not wait" — the mirror of
+  `MIKA_WEBHOOK_QUEUE_BLOCK_TIMEOUT_MS`, and a second route to today's immediate
+  refusal that does not touch the kill-switch.
+- `MIKA_A2A_QUEUE_ENABLED` — kill-switch (default `true`). `false` restores
+  `try_lock_owned()` → `-32603 "Agent is busy"` **verbatim, error code included**,
+  with no redeploy. The code is part of the contract: a rollback that also changed
+  the error code would not be a rollback, and an operator reaching for the switch
+  mid-incident is not in a position to discover that.
+- **The refusal now says which refusal it is, and how long to wait.**
+  `AGENT_BUSY = -32000` with
+  `data = {reason: "queue_full" | "wait_timeout", retry_after_ms, queue_depth}`.
+  `queue_full` (turned away at the door) and `wait_timeout` (waited its turn, it
+  never came) call for different responses from the caller. `retry_after_ms` is the
+  **configured** bound, not a prediction of the running turn's length — the server
+  does not know that, and announcing a number it cannot honour would be worse than
+  announcing none.
+- **Why -32000 and not -32099.** The A2A spec claims the whole `-32001`..`-32099`
+  band for A2A-specific errors (`a2aproject/A2A@main` `docs/specification.md` §9.5),
+  of which `-32001`..`-32009` are assigned today. Every code from `-32001` down is
+  therefore a number in someone else's namespace waiting for an assignment.
+  `-32000` is the single code of the JSON-RPC implementation-defined server-error
+  band that A2A does not claim, and it is the semantic slot an implementation-defined
+  server error belongs in. Pinned by
+  `jsonrpc::tests::agent_busy_is_outside_the_a2a_reserved_range` — the local
+  uniqueness test cannot see this collision class, which is why there are two.
+- **The risk this creates rather than removes, and where it is closed.** Before
+  mika#2163 nobody waited, so nobody could abandon a wait. A `tokio::spawn`ed task
+  is not cancelled when its client disconnects, so a `message/stream` caller that
+  hangs up mid-wait would still acquire the lock and run a full agent turn nobody
+  reads — a turn paid for, and a place held in front of everyone behind it. The
+  spawned task races the wait against `tx.closed()`; the abandonment lands **before**
+  acquisition. Detection is bounded by the SSE `KeepAlive` interval, a transport
+  property the in-crate test deliberately does not claim to measure.
+- **Operator grep signals** (`$MIKA_SPIRIT_LOG_FILE`, throttled ≤1/sec/action/agent):
+  `a2a_queue_wait` (a wait that actually happened — carries `wait_ms`),
+  `a2a_queue_reject` (carries `reason` and the code), `a2a_queue_abandoned` (a
+  streaming caller hung up before acquiring; no orphan turn ran). SQL:
+  `SELECT * FROM audit_events WHERE tool_name IN ('a2a_queue_wait','a2a_queue_reject')`.
+- **Two costs this creates, named because they are real.** (1) **`returnImmediately`
+  is exempt from the line**, and must stay exempt: that branch creates the task row
+  and returns it in `submitted` without ever running the agent loop, so it needs no
+  turn and no place. Taking the lock there was harmless as a `try_lock` and stops
+  being harmless as a wait. (2) **A cross-agent call cycle now stalls instead of
+  failing fast.** If agent A's turn shells out `mika ask --agent B` while B's turn
+  shells out `mika ask --agent A`, each inner call used to be refused in
+  microseconds; it now blocks for up to the wait budget while its own caller still
+  holds its own agent's lock. This is inherent to waiting rather than refusing — no
+  bounded wait avoids it. What bounds the damage is the budget itself (30 s, not
+  120 s) and the kill-switch. If cross-agent cycles ever become a working pattern
+  rather than an accident, this wants a cycle detector, not a longer wait.
+- **Out of scope, deliberately:** `agent_lock` itself (serialising an agent's turns
+  is the design, not the defect — this changes what happens to the *caller* while it
+  waits), the three `try_lock_owned()` in `server/rewind.rs` (an administrative
+  operation where immediate refusal is correct), a queue that survives restart (the
+  bound is in memory; waiters are lost on restart, as today), and a client-side retry
+  in `mika ask` (`retry_after_ms` gives a future one something to tune against).
+
 Optional (destructive-action grounding gate — mika#1646):
 - `MIKA_DEV_REPEAT_ACTION_WINDOW_SECS` — Window (seconds) within which a second `gh pr close` / `gh issue close` on the same target counts as a **repeat** and must acknowledge the prior one in its `--comment` (default `1800` = 30 min). Absent/empty → default; unparseable, `0`, or negative → default with a `destructive_window_invalid` WARN. Note `0` does **not** disable the check: on a destructive action an operator typo must not silently reopen the hole. Repeat detection reads the persisted `tool_calls` table scoped to the agent, so it survives a process restart and a deferred webhook replay — the founding incident's second close came from exactly such a replay, from a context sharing no memory with the first. Operator grep signal: `destructive_action_blocked` in `$MIKA_SPIRIT_LOG_FILE`; SQL surface: `SELECT * FROM audit_events WHERE tool_name = 'destructive_action_grounding'`.
 
@@ -301,12 +392,14 @@ Optional (dispatch concurrency cap — mika#2160):
     "is anything active" — left boolean, a raised cap would admit new dispatches
     while a *deferred* one waited for the class to fall back to **zero**, which is
     the asymmetric-predicate drift mika#1163 already had to name once.
-  - **Raising it above 1 is gated on mika#2163, not on this variable.** The
+  - **Raising it above 1 was gated on mika#2163, which has now landed.** The
     `canUseTool` permission callback reaches mika-dev through `/a2a/{agent}`, which
-    takes the per-agent mutex with `try_lock_owned()` (`server/a2a.rs:226`, `:360`)
-    and answers `"Agent is busy"` on collision — refuse, not defer. Two pilots whose
-    permission escalations overlap would see one refused mid-session. `/message` got
-    a bounded queue in mika#1870; the A2A path did not.
+    used to take the per-agent mutex with `try_lock_owned()` (`server/a2a.rs`) and
+    answer `"Agent is busy"` on collision — refuse, not defer, so two pilots whose
+    permission escalations overlapped would see one refused mid-session. That path
+    now waits in a bounded line (see § *bounded A2A wait line — mika#2163*). The
+    gate is lifted on the **mechanism**; the default of 1 still stands, and the
+    disk bound below is still the binding axis for choosing N.
   - Measured hardware bound on gentux (2026-09-04): disk is the binding axis at
     **N = 2 to 4** (98 G free on the worktree volume, 19–38 G per in-flight
     `target/`); RAM and CPU are not. Full inventory and procedure:

@@ -15,6 +15,26 @@ pub const UNSUPPORTED_OPERATION: i32 = -32004;
 pub const CONTENT_TYPE_NOT_SUPPORTED: i32 = -32005;
 pub const INVALID_AGENT_RESPONSE: i32 = -32006;
 
+/// Agent-busy contention on the `/a2a/{agent}` path (mika#2163).
+///
+/// **Not** `INTERNAL_ERROR` (-32603): that code's defined meaning is "an internal
+/// error occurred on the server", which is a lie about normal contention on a
+/// per-agent lock. This code says the agent is serialising turns and the caller
+/// should retry; `error.data` carries `reason`, `retry_after_ms` and
+/// `queue_depth` so the caller does not have to guess how long to wait.
+///
+/// **Why -32000 and not -32099.** JSON-RPC 2.0 reserves -32000..-32099 for
+/// implementation-defined server errors. The A2A specification carves its own
+/// namespace out of that band and claims **all** of it: *"A2A-specific errors use
+/// codes in the range `-32001` to `-32099`"* (`a2aproject/A2A@main`
+/// `docs/specification.md` §9.5), of which -32001..-32009 are assigned today
+/// (§5.4). Every code from -32001 down is therefore a number in someone else's
+/// namespace, waiting for an assignment; -32000 is the single code of the
+/// JSON-RPC server-error band that A2A does not claim, and it is the semantic
+/// slot an implementation-defined server error belongs in. Pinned by
+/// `agent_busy_is_outside_the_a2a_reserved_range`.
+pub const AGENT_BUSY: i32 = -32000;
+
 /// JSON-RPC 2.0 request/notification ID.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
@@ -91,6 +111,7 @@ impl JsonRpcError {
             UNSUPPORTED_OPERATION => "Unsupported operation",
             CONTENT_TYPE_NOT_SUPPORTED => "Incompatible content types",
             INVALID_AGENT_RESPONSE => "Invalid agent response",
+            AGENT_BUSY => "Agent is busy",
             _ => "Unknown error",
         };
         Self {
@@ -244,6 +265,7 @@ mod tests {
             (UNSUPPORTED_OPERATION, "Unsupported operation"),
             (CONTENT_TYPE_NOT_SUPPORTED, "Incompatible content types"),
             (INVALID_AGENT_RESPONSE, "Invalid agent response"),
+            (AGENT_BUSY, "Agent is busy"),
         ];
         for (code, expected_msg) in &cases {
             let err = JsonRpcError::from_code(*code);
@@ -296,6 +318,54 @@ mod tests {
             let parsed = A2aMethod::parse(method_str);
             assert_eq!(parsed, Some(expected.clone()), "parse({method_str})");
         }
+    }
+
+    /// T7 (mika#2163) — `AGENT_BUSY` collides with nothing this module defines.
+    ///
+    /// Fire-disposition per the plan §7: a red here is a number, not a design.
+    /// Pick the next free code in the JSON-RPC server-error band and move on.
+    #[test]
+    fn agent_busy_collides_with_no_other_code_in_this_module() {
+        let others = [
+            ("PARSE_ERROR", PARSE_ERROR),
+            ("INVALID_REQUEST", INVALID_REQUEST),
+            ("METHOD_NOT_FOUND", METHOD_NOT_FOUND),
+            ("INVALID_PARAMS", INVALID_PARAMS),
+            ("INTERNAL_ERROR", INTERNAL_ERROR),
+            ("TASK_NOT_FOUND", TASK_NOT_FOUND),
+            ("TASK_NOT_CANCELABLE", TASK_NOT_CANCELABLE),
+            (
+                "PUSH_NOTIFICATION_NOT_SUPPORTED",
+                PUSH_NOTIFICATION_NOT_SUPPORTED,
+            ),
+            ("UNSUPPORTED_OPERATION", UNSUPPORTED_OPERATION),
+            ("CONTENT_TYPE_NOT_SUPPORTED", CONTENT_TYPE_NOT_SUPPORTED),
+            ("INVALID_AGENT_RESPONSE", INVALID_AGENT_RESPONSE),
+        ];
+        for (name, code) in &others {
+            assert_ne!(AGENT_BUSY, *code, "AGENT_BUSY collides with {name}");
+        }
+    }
+
+    /// T7, second half — the collision this module cannot see on its own.
+    ///
+    /// A local uniqueness check would still pass on a code the A2A spec has
+    /// claimed for something else, and the peer on the other end of the wire is
+    /// what makes that a bug. The spec claims `-32001`..`-32099` wholesale
+    /// (`a2aproject/A2A@main` `docs/specification.md` §9.5); `-32000` is the one
+    /// code of the JSON-RPC implementation-defined band left outside it.
+    #[test]
+    fn agent_busy_is_outside_the_a2a_reserved_range() {
+        const A2A_RESERVED_HIGH: i32 = -32001;
+        const A2A_RESERVED_LOW: i32 = -32099;
+        assert!(
+            !(A2A_RESERVED_LOW..=A2A_RESERVED_HIGH).contains(&AGENT_BUSY),
+            "AGENT_BUSY ({AGENT_BUSY}) sits inside the A2A-reserved range \
+             {A2A_RESERVED_LOW}..={A2A_RESERVED_HIGH}"
+        );
+        // Still inside the JSON-RPC server-error band — an implementation-defined
+        // server error, which is exactly what agent contention is.
+        assert!((-32099..=-32000).contains(&AGENT_BUSY));
     }
 
     #[test]
