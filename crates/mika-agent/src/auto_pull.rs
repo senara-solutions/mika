@@ -68,6 +68,7 @@
 
 use anyhow::{Result, anyhow};
 use regex::Regex;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use tracing::{debug, error, info, warn};
@@ -360,6 +361,75 @@ pub struct Issue {
 
 // ───────────────────── Grooming detection (F1) ─────────────────────
 
+/// Le marqueur de fence d'une ligne, s'il y en a un : `` ` `` ou `~` répété au
+/// moins trois fois, premier caractère non blanc de la ligne.
+///
+/// L'indentation est tolérée parce que GitHub la rend comme un bloc de code : un
+/// gabarit de callout cité en retrait est aussi cité qu'un autre.
+fn fence_marker(line: &str) -> Option<char> {
+    let trimmed = line.trim_start();
+    let c = trimmed.chars().next()?;
+    if c != '`' && c != '~' {
+        return None;
+    }
+    (trimmed.chars().take_while(|&x| x == c).count() >= 3).then_some(c)
+}
+
+/// Rend le corps privé de ses blocs clôturés (```` ``` ```` et `~~~`), pour que
+/// le gabarit d'un callout **cité** dans un ticket ne satisfasse pas le garde qui
+/// le lit (mika#2120, AC6).
+///
+/// L'ancrage en début de ligne ne suffit pas à lui seul : une ligne citée dans une
+/// fence commence elle aussi en colonne zéro. mika#2120 en est la démonstration —
+/// son corps cite verbatim le gabarit de l'étape 19 de `mika-groom-ticket.md`.
+/// Élargir un prédicat non ancré élargit sa surface de faux positif, et le coût
+/// d'un faux positif est un créneau de dispatch mort à `_find_issue_plan returned
+/// empty`, c'est-à-dire au pire endroit.
+///
+/// Une fence ouverte par ```` ``` ```` ne se ferme que sur ```` ``` ````, jamais
+/// sur `~~~`.
+///
+/// **Repli sur fence non fermée : ne rien retirer.** Un corps dont une fence n'est
+/// jamais refermée est ambigu, et les deux erreurs n'ont pas le même prix — un
+/// faux positif coûte un créneau, un faux négatif a coûté quinze heures de boucle
+/// (le relevé du 2026-08-31 qui a ouvert ce ticket). La doctrine citée par le
+/// ticket tranche dans le même sens : la *détection* doit être au moins aussi
+/// permissive que le consommateur, la *décision* reste stricte. Voir
+/// `docs/solutions/architecture-patterns/guard-parser-must-be-as-permissive-as-downstream-consumer-2026-08-29.md`.
+fn strip_fenced_blocks(body: &str) -> Cow<'_, str> {
+    let mut open: Option<char> = None;
+    let mut saw_fence = false;
+    for line in body.lines() {
+        match (open, fence_marker(line)) {
+            (None, Some(c)) => {
+                open = Some(c);
+                saw_fence = true;
+            }
+            (Some(c), Some(m)) if m == c => open = None,
+            _ => {}
+        }
+    }
+    // Aucune fence, ou une fence laissée ouverte : on rend le corps tel quel.
+    if !saw_fence || open.is_some() {
+        return Cow::Borrowed(body);
+    }
+
+    let mut out = String::with_capacity(body.len());
+    let mut open: Option<char> = None;
+    for line in body.lines() {
+        match (open, fence_marker(line)) {
+            (None, Some(c)) => open = Some(c),
+            (Some(c), Some(m)) if m == c => open = None,
+            (None, None) => {
+                out.push_str(line);
+                out.push('\n');
+            }
+            _ => {}
+        }
+    }
+    Cow::Owned(out)
+}
+
 /// Structural detection of a groomed issue body.
 ///
 /// Matches the canonical callout block emitted by the grooming pipeline:
@@ -368,6 +438,11 @@ pub struct Issue {
 /// > - **Plan:** `docs/plans/<file>.md` (committed on branch @ <sha>)
 /// > - **Grooming history:** <...> → second-pass (GROOMED) — session-id: <uuid>
 /// ```
+///
+/// La forme préfixée par le dépôt est acceptée au même titre que la forme nue —
+/// `> - **Plan:** \`mika/docs/plans/x.md\`` comme
+/// `> - **Plan:** \`docs/plans/x.md\``. Voir [`extract_plan_path`] pour ce que la
+/// permissivité couvre, et surtout pour ce qu'elle ne couvre pas.
 ///
 /// # Le marqueur de verdict n'est plus lu ici (mika#2158)
 ///
@@ -378,12 +453,34 @@ pub struct Issue {
 /// marqueur vit désormais dans [`crate::grooming_marker`], seule et unique ; une regex de
 /// marqueur de passe recréée ici fait échouer la garde structurelle de ce module.
 ///
-/// Les deux conditions `Branch`/`Plan` restent ici, délibérément : leur unification est le
-/// correctif de mika#2120, sous arbitrage opérateur.
+/// # Les trois prédicats sont ancrés, et lus hors des blocs de code (mika#2120)
+///
+/// Les conditions `Branch` et `Plan` étaient deux `contains` non ancrés, donc
+/// satisfaits par n'importe quelle occurrence dans le corps — bloc de code cité
+/// compris. Élargir un prédicat non ancré élargit aussi sa surface de faux
+/// positif : un ticket qui *cite* un corps de ticket réel satisferait les trois,
+/// et le dispatch mourrait plus loin, à `_find_issue_plan returned empty`, après
+/// avoir consommé un créneau. Les deux passent donc par les extracteurs ancrés
+/// ([`extract_branch_name`], [`extract_plan_path`]), et le corps est d'abord privé
+/// de ses blocs clôturés ([`strip_fenced_blocks`]).
+///
+/// # Ce que ce prédicat ne fait pas
+///
+/// Il répond de la **forme** du callout, jamais de l'appartenance du plan au
+/// ticket — c'est la question de [`plan_ownership`] (mika#2020), et les deux ne
+/// doivent pas être fondues.
+///
+/// Il n'est pas non plus le prédicat le plus étroit du dépôt, et cela reste vrai
+/// après mika#2120 : `executor::check_grooming_markers` se contente de la
+/// sous-chaîne `docs/plans/`, non ancrée. **Ne le resserrez pas pour « harmoniser »
+/// les deux** — ce sens-là de l'alignement recréerait le défaut symétrique de
+/// celui que ce ticket ferme. C'est le lecteur qui rejoint son écrivain, pas
+/// l'inverse.
 pub fn is_groomed(body: &str) -> bool {
-    crate::grooming_marker::has_groomed_verdict(body)
-        && body.contains("> - **Branch:** `")
-        && body.contains("> - **Plan:** `docs/plans/")
+    let readable = strip_fenced_blocks(body);
+    crate::grooming_marker::has_groomed_verdict(&readable)
+        && extract_branch_name(&readable).is_some()
+        && extract_plan_path(&readable).is_some()
 }
 
 // ───────────────────── Plan ownership (mika#2020) ─────────────────────
@@ -413,13 +510,56 @@ pub enum PlanOwnership {
 }
 
 /// Extract the plan path from a ticket's grooming callout, if it has one.
+///
+/// # Le segment de dépôt est optionnel (mika#2120)
+///
+/// Le callout existe en deux écritures : nue (`docs/plans/…`) et préfixée par le
+/// dépôt (`mika/docs/plans/…`, `mika-cloud/docs/plans/…`). La seconde est celle
+/// que `/mika-groom-ticket` étape 19 prescrivait, donc celle que le pipeline
+/// produit quand personne ne lui demande l'autre — huit récidives mesurées entre
+/// le 2026-09-01 et le 2026-09-03, contre zéro sur les cinq groomings où la
+/// consigne était écrite à la main dans le prompt. Un lecteur qui n'accepte
+/// qu'une écriture n'applique pas une règle : il en ignore une que son écrivain
+/// légitime produit. `dispatch-lib.sh` le sait déjà et le dit en toutes lettres à
+/// sa porte de dispatch (« The callout carries two historical shapes […] Try
+/// both »).
+///
+/// Le préfixe accepté est **n'importe quel segment de tête**, pas la constante
+/// `mika/` : le grooming écrit le préfixe du dépôt cible, ce que `mika-cloud#220`
+/// a établi.
+///
+/// La permissivité s'arrête là, et c'est le point d'AC2 — un prédicat élargi qui
+/// accepterait n'importe quel chemin n'aurait rien réparé, il aurait ouvert la
+/// porte :
+///
+/// - le premier caractère du segment ne peut pas être un point, ce qui exclut
+///   `../docs/plans/` et `./docs/plans/` ;
+/// - le littéral `docs/plans/` exclut `docs/brainstorms/` et `docs/solutions/` ;
+/// - un seul segment est autorisé, donc `a/b/docs/plans/` échoue.
+///
+/// L'ancrage `(?m)^` est conservé : c'est lui qui distingue le callout de la
+/// prose. Il ne suffit pas à distinguer le callout de sa **citation**, d'où le
+/// [`strip_fenced_blocks`] appliqué ici même.
+///
+/// Le retrait des fences est fait dans cette fonction, et pas seulement chez
+/// [`is_groomed`], parce que [`plan_ownership`] lit le même chemin pour décider
+/// d'un **abandon** de ticket (mika#2020) : élargir l'extraction sans élargir
+/// aussi ce qu'elle refuse de lire aurait ajouté à cette décision-là une surface
+/// de faux positif que ce ticket n'aurait pas eu à ouvrir. Sur un corps déjà
+/// nettoyé le second passage est gratuit — sans fence, la vue est empruntée.
+///
+/// [`extract_branch_name`] n'en fait **pas** autant, et c'est un choix noté
+/// plutôt qu'un oubli : mika#2120 n'élargit pas ce lecteur-là, et changer ce que
+/// la porte de promotion (mika#2123) lit comme branche n'est pas de ce ticket.
 fn extract_plan_path(body: &str) -> Option<String> {
     static PLAN_CALLOUT_RE: OnceLock<Regex> = OnceLock::new();
     let callout_re = PLAN_CALLOUT_RE.get_or_init(|| {
-        Regex::new(r"(?m)^> - \*\*Plan:\*\* `(docs/plans/[^`]+)`")
+        Regex::new(r"(?m)^> - \*\*Plan:\*\* `((?:[A-Za-z0-9_-][A-Za-z0-9._-]*/)?docs/plans/[^`]+)`")
             .expect("plan callout regex must compile")
     });
-    callout_re.captures(body).map(|c| c[1].to_string())
+    callout_re
+        .captures(&strip_fenced_blocks(body))
+        .map(|c| c[1].to_string())
 }
 
 /// Decide whether the plan named in a ticket's grooming callout belongs to that
@@ -3454,6 +3594,274 @@ Some description of the issue.
                 "fixture #{ticket}: is_groomed doit rendre {expected}"
             );
         }
+    }
+
+    // ── mika#2120 : l'axe du chemin de plan ──
+    //
+    // Le second axe étroit de `is_groomed`, corrigé après celui du verdict
+    // (mika#2158). Le prédicat exigeait `docs/plans/` collé au backtick ; la spec
+    // de grooming écrivait `<repo>/docs/plans/`. Tout ticket groomé selon la
+    // lettre de la spec était donc invisible à l'alimenteur.
+
+    /// Le corps d'un ticket groomé, paramétré par le chemin écrit dans le callout.
+    fn body_with_plan_path(plan_path: &str) -> String {
+        format!(
+            "## Description\n\n\
+             > - **Branch:** `fix/2120/x`\n\
+             > - **Plan:** `{plan_path}` (committed on branch @ `abc1234`)\n\
+             > - **Grooming history:** first-pass (READY) → second-pass (GROOMED) — session-id: 550e8400\n"
+        )
+    }
+
+    /// AC1 — les deux formes du chemin sont vues. Le préfixe accepté est
+    /// **n'importe quel segment de tête**, pas la constante `mika/` : le grooming
+    /// écrit le préfixe du dépôt cible, et `mika-cloud#220` (2026-09-02) est la
+    /// mesure qui l'établit.
+    #[test]
+    fn mika2120_is_groomed_accepte_les_deux_formes_de_chemin() {
+        for path in [
+            "docs/plans/2026-09-01-004-fix-2120-x-plan.md",
+            "mika/docs/plans/2026-09-01-004-fix-2120-x-plan.md",
+            "mika-cloud/docs/plans/2026-09-02-001-fix-220-x-plan.md",
+        ] {
+            assert!(
+                is_groomed(&body_with_plan_path(path)),
+                "callout `{path}` doit être vu (AC1)"
+            );
+        }
+    }
+
+    /// AC2 — le contrôle négatif. Un prédicat rendu permissif qui accepterait
+    /// n'importe quel chemin n'aurait rien réparé : il aurait ouvert la porte, et
+    /// le dispatch mourrait plus loin à `_find_issue_plan returned empty`, après
+    /// avoir consommé un créneau.
+    #[test]
+    fn mika2120_is_groomed_refuse_un_chemin_qui_nest_pas_un_plan() {
+        for path in [
+            // Un autre répertoire sous `docs/` n'est pas un plan.
+            "docs/brainstorms/2026-09-01-x.md",
+            "mika/docs/solutions/2026-09-01-x.md",
+            // Le cas qu'une classe de caractères naïve `[A-Za-z0-9._-]+`
+            // laisserait passer : le premier caractère du segment ne peut pas
+            // être un point.
+            "../docs/plans/2026-09-01-004-fix-2120-x-plan.md",
+            "./docs/plans/2026-09-01-004-fix-2120-x-plan.md",
+            // Un seul segment de tête est autorisé.
+            "a/b/docs/plans/2026-09-01-004-fix-2120-x-plan.md",
+        ] {
+            assert!(
+                !is_groomed(&body_with_plan_path(path)),
+                "callout `{path}` n'est pas un plan et doit être refusé (AC2)"
+            );
+        }
+    }
+
+    /// AC3 — les six corps figés du relevé du 2026-08-31, tous en forme préfixée.
+    ///
+    /// Provenance ligne par ligne, et pourquoi ils ne doivent jamais être
+    /// refetchés : `crates/mika-agent/tests/fixtures/plan_callout_bodies/README.md`.
+    /// Quatre des six ont été recorrigés à la main depuis la mesure ; un jeu
+    /// refetché passerait des deux côtés du correctif et n'attesterait rien.
+    #[test]
+    fn mika2120_is_groomed_sur_les_six_corps_prefixes() {
+        const FIXTURES: &[(&str, &str)] = &[
+            (
+                "1680",
+                include_str!("../tests/fixtures/plan_callout_bodies/1680.md"),
+            ),
+            (
+                "1694",
+                include_str!("../tests/fixtures/plan_callout_bodies/1694.md"),
+            ),
+            (
+                "1699",
+                include_str!("../tests/fixtures/plan_callout_bodies/1699.md"),
+            ),
+            (
+                "1934",
+                include_str!("../tests/fixtures/plan_callout_bodies/1934.md"),
+            ),
+            (
+                "1947",
+                include_str!("../tests/fixtures/plan_callout_bodies/1947.md"),
+            ),
+            (
+                "1949",
+                include_str!("../tests/fixtures/plan_callout_bodies/1949.md"),
+            ),
+        ];
+
+        assert_eq!(
+            FIXTURES.len(),
+            6,
+            "les six corps mesurés doivent être figés"
+        );
+        for (ticket, body) in FIXTURES {
+            assert!(
+                is_groomed(body),
+                "fixture #{ticket}: le callout préfixé doit être vu après mika#2120"
+            );
+        }
+    }
+
+    /// AC6 — un corps dont les trois motifs n'apparaissent qu'à l'intérieur d'un
+    /// bloc clôturé ne satisfait pas le garde.
+    ///
+    /// L'ancrage seul n'y suffit pas : une ligne citée dans une fence commence
+    /// elle aussi en colonne zéro. mika#2120 en est la démonstration — le ticket
+    /// cite le gabarit de l'étape 19 de la spec, verbatim, en colonne zéro.
+    ///
+    /// Le chemin cité est écrit sous la **forme nue** à dessein : citer la forme
+    /// préfixée rendrait le test vert sur `main` pour la raison du chemin, et il
+    /// attesterait alors le mauvais axe.
+    #[test]
+    fn mika2120_is_groomed_ignore_les_blocs_de_code() {
+        let body = "## Ce que la spec prescrit\n\n\
+             ```\n\
+             > - **Branch:** `fix/2120/x`\n\
+             > - **Plan:** `docs/plans/2026-09-01-004-fix-2120-x-plan.md` (committed @ `abc`)\n\
+             > - **Grooming history:** first-pass (READY) → second-pass (GROOMED)\n\
+             ```\n\n\
+             Ce ticket parle du garde ; il n'est pas groomé.\n";
+        assert!(
+            !is_groomed(body),
+            "un corps qui cite le callout ne doit pas satisfaire le garde (AC6)"
+        );
+
+        // Même corps, fence en `~~~` : l'autre marqueur clôturé de Markdown.
+        let tildes = body.replace("```", "~~~");
+        assert!(!is_groomed(&tildes), "les fences `~~~` comptent aussi");
+    }
+
+    /// AC6, repli — une fence jamais refermée rend le corps ambigu, et on
+    /// n'ampute rien.
+    ///
+    /// L'asymétrie des coûts le commande : un faux positif coûte un créneau de
+    /// dispatch, un faux négatif a coûté quinze heures de boucle. C'est aussi le
+    /// sens de la doctrine que le ticket cite — la *détection* est au moins aussi
+    /// permissive que le consommateur, la *décision* reste stricte.
+    #[test]
+    fn mika2120_fence_non_fermee_evalue_le_corps_entier() {
+        let body = "## Description\n\n\
+             ```\n\
+             un bloc ouvert et jamais refermé\n\n\
+             > - **Branch:** `fix/2120/x`\n\
+             > - **Plan:** `docs/plans/2026-09-01-004-fix-2120-x-plan.md` (committed @ `abc`)\n\
+             > - **Grooming history:** first-pass (READY) → second-pass (GROOMED)\n";
+        assert!(
+            is_groomed(body),
+            "fence non fermée : on évalue le corps entier plutôt que de l'amputer"
+        );
+    }
+
+    /// Preuve de bouclage — le corps de mika#2120 lui-même, tel que son grooming
+    /// l'a écrit : callout nu **et** blocs de code citant la forme préfixée et le
+    /// code du prédicat. Il doit rester vu.
+    ///
+    /// Le test garde les deux moitiés ensemble : le retrait des fences ne doit pas
+    /// emporter les callouts réels, qui vivent en dehors d'elles.
+    ///
+    /// Il passe déjà sur `main`, et c'est dit ici plutôt que laissé à découvrir :
+    /// l'axe qui le faisait échouer — le verdict de passe unique — a été fermé par
+    /// mika#2158. Ce qu'il garde désormais est le sens inverse, celui que ce
+    /// ticket-ci pourrait casser.
+    #[test]
+    fn mika2120_le_corps_de_ce_ticket_est_vu() {
+        let body = "> - **Branch:** `fix/2120/auto-pull-is-groomed-exige-docs-plans`\n\
+             > - **Plan:** `docs/plans/2026-09-01-004-fix-2120-is-groomed-repo-prefix-plan.md` (committed on branch @ `f42cd5d6`)\n\
+             > - **Grooming history:** /ce:plan → mika-arch first-pass (READY) → mika-arch second-pass (GROOMED)\n\n\
+             ## Deux conventions écrites à deux endroits\n\n\
+             ```rust\n\
+             body.contains(\"> - **Plan:** `docs/plans/\")\n\
+             ```\n\n\
+             `.claude/commands/mika-groom-ticket.md`, étape 19, prescrit :\n\n\
+             ```\n\
+             > - **Plan:** `<repo>/docs/plans/<file>` (committed on branch @ `<sha>`)\n\
+             ```\n";
+        assert!(
+            is_groomed(body),
+            "le ticket qui décrit l'invisibilité doit lui-même être visible"
+        );
+    }
+
+    /// AC5 — un bassin sous le plancher dont le seul éligible porte un callout
+    /// préfixé : l'alimenteur le retient. C'est le tir qui rendait
+    /// `auto_feeder_no_backlog` avec six candidats devant lui.
+    #[test]
+    fn mika2120_select_feeder_candidates_retient_un_callout_prefixe() {
+        let prefixed = body_with_plan_path("mika/docs/plans/2026-09-01-004-fix-2120-x-plan.md");
+        let issues = vec![
+            make_issue(1, UNGROOMED_BODY, &["p1-important"], "2026-08-31T00:00:00Z"),
+            make_issue(2120, &prefixed, &["p1-important"], "2026-08-31T00:00:00Z"),
+        ];
+        assert_eq!(
+            select_feeder_candidates(&issues, &HashSet::new(), &HashSet::new(), 1),
+            vec![2120],
+            "le seul candidat groomé porte un chemin préfixé et doit être promu (AC5)"
+        );
+    }
+
+    /// Conséquence de bord, épinglée parce qu'elle est réelle : rendre le chemin
+    /// lisible rend aussi son **appartenance** lisible.
+    ///
+    /// Avant mika#2120, un callout préfixé ne s'extrayait pas, donc
+    /// [`plan_ownership`] rendait `Unattributable` et le garde de mika#2020 était
+    /// aveugle sur toute cette population. Il voit désormais ; un plan préfixé
+    /// appartenant à un autre ticket est refusé comme l'est déjà un plan nu.
+    /// L'extraction du nom de base traverse le préfixe (`rsplit('/')`), donc le
+    /// créneau d'issue est lu à sa position canonique et nulle part ailleurs.
+    #[test]
+    fn mika2120_le_prefixe_ne_masque_plus_lappartenance_du_plan() {
+        let body =
+            body_with_plan_path("mika/docs/plans/2026-08-21-002-fix-1933-reader-section-plan.md");
+        assert_eq!(
+            plan_ownership(&body, 1887),
+            PlanOwnership::OwnedByOther(1933),
+            "le préfixe de dépôt ne doit pas soustraire un plan au garde d'appartenance"
+        );
+        assert_eq!(plan_ownership(&body, 1933), PlanOwnership::Owned);
+    }
+
+    /// Et la contrepartie : un callout **cité** dans un bloc de code n'accuse
+    /// personne. [`plan_ownership`] décide d'un abandon de ticket ; élargir ce
+    /// qu'il lit sans élargir ce qu'il refuse de lire aurait ajouté là une
+    /// surface de faux positif que ce ticket n'avait pas à ouvrir.
+    #[test]
+    fn mika2120_un_callout_cite_naccuse_personne() {
+        let body = "## Ce que le corps d'un autre ticket contenait\n\n\
+             ```\n\
+             > - **Plan:** `mika/docs/plans/2026-08-21-002-fix-1933-reader-section-plan.md`\n\
+             ```\n";
+        assert_eq!(
+            plan_ownership(body, 1887),
+            PlanOwnership::Unattributable,
+            "un callout cité n'est pas un callout"
+        );
+    }
+
+    /// La frontière du retrait de fences, isolée du prédicat qui l'utilise.
+    #[test]
+    fn mika2120_strip_fenced_blocks_frontiere() {
+        // Aucune fence : la vue est empruntée, pas recopiée.
+        assert!(matches!(
+            strip_fenced_blocks("une ligne\nune autre\n"),
+            Cow::Borrowed(_)
+        ));
+
+        // Une fence ouverte en ``` ne se ferme pas sur ~~~ — le corps entier
+        // reste donc ambigu, et rien n'est amputé.
+        assert!(matches!(
+            strip_fenced_blocks("```\ndedans\n~~~\nencore dedans\n"),
+            Cow::Borrowed(_)
+        ));
+
+        // Fence fermée : seules ses lignes disparaissent.
+        let stripped = strip_fenced_blocks("avant\n```\ndedans\n```\naprès\n");
+        assert_eq!(stripped.as_ref(), "avant\naprès\n");
+
+        // Une fence indentée compte : GitHub la rend comme un bloc de code.
+        let stripped = strip_fenced_blocks("avant\n  ```\n  dedans\n  ```\naprès\n");
+        assert_eq!(stripped.as_ref(), "avant\naprès\n");
     }
 
     #[test]
