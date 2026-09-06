@@ -124,6 +124,14 @@ touchés par ce plan. À documenter en commentaire de code au-dessus de chaque a
 - Tout chemin exigeant l'identité machine PAT (PR review/merge).
 - La cause de la disparition du PAT de l'env (couverte par le geste opérateur).
 
+## Fire-Disposition
+
+Ce plan livre trois surfaces qui « tirent » (gate mika#1574) ; disposition pré-spécifiée pour chacune :
+
+- **WARN fail-safe (ni PAT ni App résolus, runtime).** Détecteur : la garde résolue dans les deux scans. Tir sur : condition runtime (aucun token disponible au tick), pas sur des données préexistantes. Disposition : **log-and-skip non destructif** — le scan ne fait rien ce tick et émet un WARN visible (`auto_pull_no_token` / `wip_rescue_no_token`). Aucune mutation, aucune escalade automatique ; l'opérateur voit le WARN et restaure le token. C'est le comportement fail-safe existant, seulement rendu visible.
+- **AC5 — test de régression (CI).** Détecteur : test unitaire prouvant que le chemin App-fallback est emprunté sans PAT, + mise à jour de `test_auto_fire_skips_without_github_token` en « sans PAT ET sans App ». Tir sur : le diff de la PR. Disposition : **gate CI bloquant** — le build échoue si le chemin App-fallback n'est pas exercé ou si l'ancien test verrouille encore l'ancien comportement. Pas de remédiation automatique ; l'échec CI halte la PR.
+- **Sonde post-déploiement (opérateur).** Détecteur : réapparition de `auto_pull: running groomed ticket selection` et `wip_rescue: running auto-resume scan` dans `$MIKA_SPIRIT_LOG_FILE` après un restart avec App sain mais sans PAT. Tir sur : l'état runtime post-déploiement. Disposition : **halt-and-surface** — si les deux scans ne réapparaissent pas au tick suivant (App sain, PAT absent), le fix n'a pas pris ; surfacer à l'opérateur (ne pas re-déployer aveuglément, investiguer la résolution du token).
+
 ## Vérification
 
 - `cargo build -p mika-agent`
