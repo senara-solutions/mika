@@ -139,9 +139,17 @@ struct OpenAiErrorDetail {
 
 // -- Provider implementation --
 
+/// Hard ceiling on retries, independent of the budget.
+///
+/// The budget can only ever *narrow* the chain below this (see
+/// [`LlmTimeoutBudget::max_attempts`]): a generous envelope must not silently
+/// widen a provider's retry policy.
 const MAX_RETRIES: u32 = 3;
 
-use super::{RETRY_BUFFER_SECS, TRANSPORT_RETRY_MIN_REMAINING_SECS, TYPICAL_CALL_DURATION_SECS};
+/// Attempts the chain permits at most: the initial call plus [`MAX_RETRIES`].
+const MAX_ATTEMPTS_HARD_CAP: u32 = MAX_RETRIES + 1;
+
+use super::LlmTimeoutBudget;
 
 /// OpenAI-compatible provider that works with OpenAI, Ollama, vLLM, Groq, etc.
 pub struct OpenAiCompatibleProvider {
@@ -151,6 +159,12 @@ pub struct OpenAiCompatibleProvider {
     model: String,
     max_tokens: u32,
     provider_kind: ProviderKind,
+    /// Per-call plafond + agent envelope this provider was built against
+    /// (mika#2189). The plafond is what `client` was given; the envelope and
+    /// the three derived retry thresholds live here so the retry loop reasons
+    /// about the geometry it actually runs in rather than about 2026-era
+    /// literals.
+    budget: LlmTimeoutBudget,
     /// When true AND the `telemetry` feature is enabled, attach request/response
     /// bodies as `gen_ai.prompt` / `gen_ai.completion` span attributes. See #671.
     #[cfg_attr(not(feature = "telemetry"), allow(dead_code))]
@@ -165,9 +179,10 @@ impl OpenAiCompatibleProvider {
         max_tokens: u32,
         provider_kind: ProviderKind,
         log_llm_bodies: bool,
+        budget: LlmTimeoutBudget,
     ) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(super::http_timeout_secs()))
+            .timeout(Duration::from_secs(budget.http_timeout_secs()))
             .build()
             .expect("failed to build HTTP client");
 
@@ -181,6 +196,7 @@ impl OpenAiCompatibleProvider {
             model,
             max_tokens,
             provider_kind,
+            budget,
             log_llm_bodies,
         }
     }
@@ -327,7 +343,30 @@ impl OpenAiCompatibleProvider {
 
         let mut last_error = None;
 
-        for attempt in 0..=MAX_RETRIES {
+        // AC3-b (mika#2189): the failure cost is bounded by the envelope, not
+        // merely trimmed by the remaining-deadline check below.
+        //
+        // A plafond is a plafond — raising it cannot slow a call that already
+        // succeeded. The regression a raised plafond *does* create is that a
+        // FAILING call gets more expensive, and before this the only thing
+        // holding that down was an emergent property of the threshold check: at
+        // 120/300 a third attempt could start at exactly `remaining ==
+        // threshold` and carry the failure to 360 s, past the 300 s envelope.
+        // `max_attempts` makes `attempts × cap ≤ envelope` true by
+        // construction. At the default geometry it is 2 — which is what the
+        // founding measurement shows (171 of 209 failures at exactly 240 s), so
+        // this closes a boundary case rather than changing the common path.
+        //
+        // Only applied when a deadline is present: without one there is no
+        // envelope to overflow, and callers with no deadline visibility keep
+        // the full `MAX_RETRIES` chain they have always had.
+        let max_attempts = if deadline.is_some() {
+            self.budget.max_attempts(MAX_ATTEMPTS_HARD_CAP)
+        } else {
+            MAX_ATTEMPTS_HARD_CAP
+        };
+
+        for attempt in 0..max_attempts {
             if attempt > 0 {
                 // Deadline-aware retry abort: if the remaining time before the
                 // agent deadline cannot fit another LLM call attempt, bail out
@@ -347,10 +386,13 @@ impl OpenAiCompatibleProvider {
                     let last_was_transport = last_error
                         .as_ref()
                         .is_some_and(super::error::LlmError::is_transport);
+                    // mika#2189 D3: derived from the effective plafond, not
+                    // from literals calibrated against a 120 s one. At the
+                    // default plafond these reproduce 60 and 90+30 exactly.
                     let threshold_secs = if last_was_transport {
-                        TRANSPORT_RETRY_MIN_REMAINING_SECS
+                        self.budget.transport_retry_min_remaining_secs()
                     } else {
-                        TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS
+                        self.budget.typical_call_duration_secs() + self.budget.retry_buffer_secs()
                     };
                     if remaining < Duration::from_secs(threshold_secs) {
                         warn!(
@@ -388,8 +430,13 @@ impl OpenAiCompatibleProvider {
                     return Ok(llm_response);
                 }
                 Err(e) => {
-                    if attempt < MAX_RETRIES && e.is_retryable() {
-                        warn!(attempt, error = %e, "transient API error");
+                    // `attempt + 1 < max_attempts`, not `attempt < MAX_RETRIES`:
+                    // the budget may have narrowed the chain below the hard cap
+                    // (AC3-b), and a guard still reading the hard cap would
+                    // return the retryable error one iteration early — or, with
+                    // the loop bound moved, keep looping past the budget.
+                    if attempt + 1 < max_attempts && e.is_retryable() {
+                        warn!(attempt, max_attempts, error = %e, "transient API error");
                         last_error = Some(e);
                         continue;
                     }
@@ -408,9 +455,9 @@ impl OpenAiCompatibleProvider {
             .as_ref()
             .is_some_and(super::error::LlmError::is_transport);
         let deadline_threshold_secs = if last_was_transport {
-            TRANSPORT_RETRY_MIN_REMAINING_SECS
+            self.budget.transport_retry_min_remaining_secs()
         } else {
-            TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS
+            self.budget.typical_call_duration_secs() + self.budget.retry_buffer_secs()
         };
         let deadline_aborted = deadline.is_some_and(|dl| {
             dl.saturating_duration_since(Instant::now())
@@ -513,6 +560,14 @@ impl LlmProvider for OpenAiCompatibleProvider {
 
     fn max_tokens(&self) -> u32 {
         self.max_tokens
+    }
+
+    /// mika#2189: the budget this provider's `reqwest` client was actually
+    /// built with — not a re-read of the environment, which could have changed
+    /// underneath a long-lived process and would make the agent deadline
+    /// disagree with the transport timeout it is supposed to contain.
+    fn timeout_budget(&self) -> LlmTimeoutBudget {
+        self.budget
     }
 
     fn supports_tool_calling(&self) -> bool {
@@ -1048,6 +1103,50 @@ fn parse_json_tool_call(json_str: &str, index: usize) -> Option<LlmResponseConte
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Pins the coupling `budget.rs` cannot see (mika#2189 AC3-b).
+    ///
+    /// [`MAX_ATTEMPTS_HARD_CAP`] is private to this module, so
+    /// `budget::tests` duplicates the number `4` as a local constant. That
+    /// duplication is only safe while the two agree — this test is what makes
+    /// them agree, from the side that owns the real value.
+    ///
+    /// Both halves matter. The hard cap must **bound** a generous envelope (a
+    /// big envelope must not silently widen a provider's retry policy), and it
+    /// must **not raise** a narrow one (the envelope is the tighter constraint
+    /// when it is tighter, which is the whole of AC3-b).
+    #[test]
+    fn max_attempts_respects_provider_hard_cap() {
+        // Generous envelope: arithmetic alone would allow floor(10000/10) =
+        // 1000 attempts. The provider's ceiling wins.
+        let generous = LlmTimeoutBudget::new(10, 10_000).expect("valid geometry");
+        assert_eq!(
+            generous.max_attempts(MAX_ATTEMPTS_HARD_CAP),
+            MAX_ATTEMPTS_HARD_CAP,
+            "a generous envelope must not widen the chain past the provider hard cap"
+        );
+
+        // Narrow envelope: the budget wins, and the worst case stays inside it.
+        let shipped = LlmTimeoutBudget::default();
+        assert_eq!(
+            shipped.max_attempts(MAX_ATTEMPTS_HARD_CAP),
+            2,
+            "the shipped 120/300 geometry allows exactly the two attempts the \
+             mika#2189 measurement shows (171 of 209 failures at exactly 240 s)"
+        );
+        assert!(
+            shipped.worst_case_failure_secs(MAX_ATTEMPTS_HARD_CAP)
+                <= shipped.agent_total_timeout_secs(),
+            "a fully-failing call must not overflow the envelope it runs in"
+        );
+
+        // The number `budget.rs` duplicates, asserted from the side that owns it.
+        assert_eq!(
+            MAX_ATTEMPTS_HARD_CAP, 4,
+            "MAX_ATTEMPTS_HARD_CAP changed; update the HARD_CAP constant in \
+             `budget::tests`, which duplicates it because this one is private"
+        );
+    }
 
     #[test]
     fn test_to_openai_request_basic() {

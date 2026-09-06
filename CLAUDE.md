@@ -61,7 +61,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **Grounding rule:** The system prompt prohibits the agent from claiming downstream system state unless a tool result confirms it. Reinforced in `format_callback_framing` and `SilentTrigger::Callback`.
 - **Confirmation before action:** The system prompt instructs the agent to answer informational questions directly without starting multi-step workflows.
 - **Context priority:** current user message > core memory > active skill context > conversation summary > conversation history > search results. See `docs/memory-classification.md`.
-- **Database:** Case-insensitive COLLATE NOCASE on unique text columns. Schema v52. See `crates/mika-agent/CLAUDE.md` for schema details.
+- **Database:** Case-insensitive COLLATE NOCASE on unique text columns. Schema v53. See `crates/mika-agent/CLAUDE.md` for schema details.
   - v27->v28: `agent_kg_corpora` table (#798) — maps `agent_id` to `docs_root_hash` for multi-corpus query fan-out. Populated by startup lexical ingest.
   - v28->v29: Backfill migration (#908) — scrubs secret-shaped values from existing `tool_calls.input` and `tool_calls.output` rows using `secret_scrubber::scrub_secrets()`. Data-only, no DDL. New `save_tool_call()` calls also scrub before INSERT.
   - v29->v30: Expand `kg_resolutions_log.outcome` CHECK constraint to include `'matched_llm_db_fallback'` (#874). Enables DB-fallback acceptance path for LLM matches outside the in-prompt candidate window.
@@ -370,6 +370,67 @@ Optional (bounded A2A wait line — mika#2163):
 
 Optional (destructive-action grounding gate — mika#1646):
 - `MIKA_DEV_REPEAT_ACTION_WINDOW_SECS` — Window (seconds) within which a second `gh pr close` / `gh issue close` on the same target counts as a **repeat** and must acknowledge the prior one in its `--comment` (default `1800` = 30 min). Absent/empty → default; unparseable, `0`, or negative → default with a `destructive_window_invalid` WARN. Note `0` does **not** disable the check: on a destructive action an operator typo must not silently reopen the hole. Repeat detection reads the persisted `tool_calls` table scoped to the agent, so it survives a process restart and a deferred webhook replay — the founding incident's second close came from exactly such a replay, from a context sharing no memory with the first. Operator grep signal: `destructive_action_blocked` in `$MIKA_SPIRIT_LOG_FILE`; SQL surface: `SELECT * FROM audit_events WHERE tool_name = 'destructive_action_grounding'`.
+
+Optional (LLM timeout budgets — mika#2189):
+- **The asymmetry this closes.** Two numbers govern a turn: the **per-call plafond**
+  (given to `reqwest`) and the **per-agent envelope** (the turn deadline). Since
+  mika#1660 the plafond had a knob; the envelope was a bare `300` constant with
+  none. **One could raise the ceiling but not the room that must contain it** — so
+  the only available remedy made a single call eat the envelope of a pass that
+  averages three. Measured over the 7 days ending 2026-09-05: **209 failures**
+  under one message (`failed to read response body: … operation timed out`) whose
+  latency distribution has no tail, only **240 s** (171×) and **120 s** (37×) —
+  a client guillotine crossed once or twice, not provider variance. Across three
+  agents and two models, so a model fallback for mika-arch would have moved 7 %
+  of it.
+- `MIKA_LLM_HTTP_TIMEOUT_SECS` — per-call plafond in seconds (default `120`,
+  unchanged since mika#1660; still panics below `MIN_HTTP_TIMEOUT_SECS`). Now also
+  settable **per agent** as `llm_http_timeout_secs` in
+  `~/.mika/agents/<name>/config.toml`, which is the granularity the problem has:
+  `llm_provider` and `openrouter_model` already live there, and a fleet-wide env
+  var cannot give mika-arch a different geometry from mika-dev.
+- `MIKA_AGENT_TOTAL_TIMEOUT_SECS` — per-agent turn envelope in seconds (default
+  `300` — **unchanged; this ticket makes the envelope settable, it does not move
+  the fleet default**). Per-agent key: `agent_total_timeout_secs`. Absent/empty →
+  default; unparseable or `0` → default with a WARN, because an envelope of zero
+  would abort every turn before its first step and, read the other way, would be a
+  silent way to disable the agent.
+- **The containment invariant is the point of the ticket, not a side effect.** A
+  configuration where `plafond >= envelope` is refused **at provider construction**
+  — the same lifecycle point where mika#1660's too-small-plafond panic already
+  lives, so one setting mistake is not detected in two places at two moments. The
+  error names **both** values and the file to fix. Consequence, stated rather than
+  discovered: **a `mika` that starts is not proof that its budgets are valid; the
+  first LLM call is.**
+- **Retry thresholds follow the plafond now.** `TYPICAL_CALL_DURATION_SECS`,
+  `RETRY_BUFFER_SECS` and `TRANSPORT_RETRY_MIN_REMAINING_SECS` became fractions
+  (`0.75 ×`, `0.25 ×`, `0.50 ×` the effective plafond). At the 120 s default they
+  reproduce 90 / 30 / 60 exactly — the migration is a no-op at the shipped
+  geometry — and they track any later setting, where literals would have silently
+  described a geometry that no longer existed.
+- **A raised plafond makes failures more expensive, and that is bounded.** Raising
+  a plafond cannot slow a call that already succeeded; the real regression is on
+  the failing side. `max_attempts = floor(envelope / plafond)` (clamped to the
+  provider's `MAX_RETRIES + 1`) makes `attempts × plafond ≤ envelope` true by
+  construction. At the default that is **2**, which is exactly the 240 s signature
+  the measurement shows — so this closes a boundary case rather than changing the
+  common path.
+- **mika-arch is retuned to 240/900**, derived from its measured p99 = 191 s,
+  max = 233 s and 3.1 calls per pass. The rest of the fleet stays at 120/300.
+  Deliberately **no per-family default**: a new slow agent discovering the problem
+  through a failure is an accepted and *visible* risk, not one papered over.
+- **Post-deploy check.** Re-run the per-agent failure-latency count after at least
+  24 h and 100 mika-arch calls; the criterion is that 120 s / 240 s disappear from
+  the latency column of errors. **A fresh signature at 240 s / 480 s is a halt**,
+  not a cue to raise the plafond again — two plafonds crossed in a row say the
+  model of the failure is wrong. Capture the baseline **before** deploying:
+  `prune_old_llm_calls` purges old `llm_calls` rows.
+- **Out of scope, deliberately:** the *cause* of the provider-side timeouts;
+  `claude.rs:382`, which poses a `120s` literal instead of calling
+  `http_timeout_secs()` (a real inconsistency, but none of the 209 failures are on
+  the Anthropic rail — separate ticket); and shrinking mika-arch's system prompt,
+  which grew 54 KB → 59.8 KB on 2026-09-01 and is the proximate reason this agent
+  crossed the line when the fleet had been bleeding since at least 08-27.
 
 Optional (dispatch concurrency cap — mika#2160):
 - `MIKA_DISPATCH_MAX_CONCURRENT_IMPLEMENT` — How many `implement` dispatches may be

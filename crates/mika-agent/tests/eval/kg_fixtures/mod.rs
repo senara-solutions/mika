@@ -35,7 +35,13 @@ use mika_agent::db::{CURRENT_SCHEMA_VERSION, Database};
 // v51→v52 (mika#2160) rebuilt `dispatch_slot_leases` to add `slot_index` to its
 // PRIMARY KEY — again outside the KG surface, and `seed_*` helpers never touch
 // that table; only the pin advances.
-const PINNED_SCHEMA_VERSION: i64 = 52;
+//
+// v52→v53 (mika#2189) added the nullable `llm_calls.request_bytes` column. The
+// KG extraction and resolution paths do write `llm_calls` rows, but they pass
+// `None` for it by design — a batch NER call runs under no agent envelope, so
+// the size-vs-expiry axis the column serves has nothing to correlate there. No
+// `seed_*` helper touches `llm_calls` either way; only the pin advances.
+const PINNED_SCHEMA_VERSION: i64 = 53;
 
 const _: () = assert!(
     CURRENT_SCHEMA_VERSION == PINNED_SCHEMA_VERSION,

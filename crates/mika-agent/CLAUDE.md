@@ -4,13 +4,80 @@ Agent container: SQLite DB, agent loop, tools, prompt assembly, A2A server endpo
 
 ## Agent Loop
 
-Max 20 tool steps (all modes: conversation, callback, reminder, team), 5-minute total deadline, 30s default per-tool timeout (overridable via `Tool::timeout_secs()`). `LoopMode::Silent { max_steps }` carries per-trigger step limits via `SilentTrigger::max_steps()`. Step-awareness nudge injected at step `max_steps - 2` for all modes to encourage wrapping up. Silent mode nudge text is tailored for `send_message` notification.
+Max 20 tool steps (all modes: conversation, callback, reminder, team), a per-agent turn envelope **defaulting** to 5 minutes (settable since mika#2189 — see § Timeout Budgets), 30s default per-tool timeout (overridable via `Tool::timeout_secs()`). `LoopMode::Silent { max_steps }` carries per-trigger step limits via `SilentTrigger::max_steps()`. Step-awareness nudge injected at step `max_steps - 2` for all modes to encourage wrapping up. Silent mode nudge text is tailored for `send_message` notification.
 
-**Deadline enforcement (#848, #939):** the 5-min total budget is enforced via an `Instant`-based deadline checked at five points: (1) top of each `run_loop` step iteration, (2) end of prelude work in each inner function before entering `run_loop`, (3) before `attempt_continuation_turn` entry — skip when `now + CONTINUATION_TIMEOUT_SECS > deadline`, (4) inside `attempt_continuation_turn` itself, where the inner timeout is clamped to `min(60s, deadline - now)`, (5) inside the LLM transport retry loop — `send_message_with_deadline()` aborts the retry chain when remaining budget < `TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS` (120s), preventing doomed retries from consuming the deadline (#939). The provider's per-request 120s `reqwest` timeout (`crates/mika-common/src/claude.rs`) is the sole cancellation mechanism for in-flight HTTP calls — the outer agent deadline never drops a future mid-flight, so the `llm_calls` row is always persisted (success or transport-timeout). Worst-case turn duration is `300s + 120s = 420s`. `LoopResult` is a three-variant enum (`Done`/`MaxStepsExceeded`/`DeadlineExceeded`) without `#[non_exhaustive]` — the compiler's match-exhaustiveness check enforces that all three outer handlers (conversation, silent, team) handle every variant. CI lint guard `scripts/check-loop-select.sh` rejects `tokio::select!` inside `run_loop`'s body (would shadow the iteration-top deadline check).
+**Deadline enforcement (#848, #939, mika#2189):** the turn budget is enforced via an `Instant`-based deadline checked at five points: (1) top of each `run_loop` step iteration, (2) end of prelude work in each inner function before entering `run_loop`, (3) before `attempt_continuation_turn` entry — skip when `now + CONTINUATION_TIMEOUT_SECS > deadline`, (4) inside `attempt_continuation_turn` itself, where the inner timeout is clamped to `min(60s, deadline - now)`, (5) inside the LLM transport retry loop — `send_message_with_deadline()` aborts the retry chain when the remaining budget falls under a threshold **derived from the effective per-call plafond** (`0.75 × plafond + 0.25 × plafond`, which is the historical 90 + 30 = 120s at the default plafond), preventing doomed retries from consuming the deadline (#939). The provider's per-request `reqwest` timeout is the sole cancellation mechanism for in-flight HTTP calls — the outer agent deadline never drops a future mid-flight, so the `llm_calls` row is always persisted (success or transport-timeout). Worst-case turn duration is `envelope + plafond`, i.e. `300s + 120s = 420s` at the shipped defaults. Note the Anthropic rail (`crates/mika-common/src/claude.rs`) still hard-codes its own `120s` literal instead of reading the plafond — a real inconsistency mika#2189 names and leaves to its own ticket rather than bundling. `LoopResult` is a three-variant enum (`Done`/`MaxStepsExceeded`/`DeadlineExceeded`) without `#[non_exhaustive]` — the compiler's match-exhaustiveness check enforces that all three outer handlers (conversation, silent, team) handle every variant. CI lint guard `scripts/check-loop-select.sh` rejects `tokio::select!` inside `run_loop`'s body (would shadow the iteration-top deadline check).
 
 On max-steps exceeded: continuation turn (tools disabled, deadline-clamped timeout, ceiling 60s) forces a text summary via shared `attempt_continuation_turn()` helper (used by Conversation, Team, and Silent modes); the helper persists an `llm_calls` row in all outcomes (success/error/timeout) so the continuation is never the silent-drop variant of the in-flight-cancel bug at smaller scale. If continuation fails or is skipped (deadline too close), structured fallback shows last 5 tool names with status. Silent mode continuation sends the summary via `message_sender` if available, prefixed with "[Background task exceeded tool step limit]".
 
 **Test-only entry points (`run_*_with_deadline`):** publicly visible by naming convention, used only by `EvalHarness` to inject short deadlines for the deadline-during-LLM-call eval scenarios. Production callers should always use `run_agent`/`run_silent_agent`/`run_team_agent`. `AgentParams` carries no deadline knob.
+
+### Timeout Budgets (mika#2189)
+
+**The asymmetry this closed.** Two numbers govern a turn: the **per-call
+plafond** (what `reqwest` is given) and the **per-agent envelope** (the turn
+deadline). Since mika#1660 an operator could raise the plafond via
+`MIKA_LLM_HTTP_TIMEOUT_SECS`; the envelope was a bare `300` constant in
+`planning/policy.rs` with no env var and no per-agent setting. **One could raise
+the ceiling and not the room meant to contain it** — and raising the plafond
+alone lets a single call eat the whole envelope of a pass that averages three.
+
+The founding measurement (7 days ending 2026-09-05, `llm_calls`): **209
+failures** under one message — `failed to read response body: … operation timed
+out` — whose latency distribution has no tail, only two values: **240 s** (171
+occurrences) and **120 s** (37). Not provider variance; a client guillotine
+crossed once or twice. Three agents, two models, one provider — so a model
+fallback for mika-arch would have moved 7 % of the problem.
+
+**`LlmTimeoutBudget` (`mika-common::llm::budget`)** now holds the pair, and the
+three retry thresholds are **derived** from the plafond rather than written
+beside it: `typical_call = 0.75 ×`, `retry_buffer = 0.25 ×`,
+`transport_retry_min_remaining = 0.50 ×`. Those fractions reproduce the old
+literals (90 / 30 / 60) **exactly** at the 120 s default, so the migration is a
+no-op at the shipped geometry and follows any later setting — where literals
+would have silently described a geometry that stopped existing.
+
+**Containment invariant (D2).** `LlmTimeoutBudget::validate` refuses
+`plafond >= envelope` at **provider construction**, the same lifecycle point
+where mika#1660 already panics on a too-small plafond. Consequence, written down
+rather than discovered: **a `mika` that boots is not proof that its budgets are
+valid; the first call is.**
+
+**Bounded failure cost (AC3-b).** Raising a plafond cannot slow a call that
+already succeeded. The regression it *does* create is that a **failing** call
+gets more expensive, so `max_attempts = floor(envelope / plafond)` (clamped to
+the provider's own `MAX_RETRIES + 1`) makes `attempts × plafond ≤ envelope` true
+by construction. At the default geometry that is **2** — exactly what the
+measurement shows. Not a pure no-op, and saying otherwise would be more
+comfortable and less true: before this, a third attempt could start at exactly
+`remaining == threshold` and carry a failure to 360 s, past the 300 s envelope.
+
+**Reading the envelope.** `planning::policy::agent_total_timeout_secs(llm)` takes
+it off the **provider**, which already holds the plafond — taking both from one
+object is what stops them drifting apart again. The retired constants
+(`AGENT_TOTAL_TIMEOUT_SECS` and its team sibling, which was a second literal
+`300` whose doc comment merely *promised* it matched) are gated by
+`policy::tests::no_bare_agent_timeout_constant_remains`, a source scan over
+`src/`. **One documented exception:** `DELEGATE_TASK_TOOL_TIMEOUT_SECS` stays
+static because `Tool::timeout_secs` takes `&self` and cannot reach a provider —
+an agent with a raised envelope delegating through that tool would be cut at the
+default. Not reachable today (mika-arch has no `delegate_task`), so it ships as a
+stated bound rather than a `Tool` trait change bundled into a timeout ticket.
+
+**Per-agent settings** (`~/.mika/agents/<name>/config.toml`, next to
+`llm_provider` / `openrouter_model`): `llm_http_timeout_secs` and
+`agent_total_timeout_secs`. The fleet stays at 120/300; **mika-arch is retuned to
+240/900** (`MIKA_ARCH_CONFIG`), derived from its measured p99 = 191 s, max =
+233 s and 3.1 calls per pass. Deliberately **no per-family default** (Q3): a new
+slow agent discovering the problem through a failure is an accepted, *visible*
+risk — the invariant's message names both values and the file to fix.
+
+**Post-deploy check (V3).** Re-run the failure-latency count per agent after at
+least 24 h and 100 mika-arch calls. The criterion is that 120 s / 240 s vanish
+from the latency column of errors. **If a fresh signature appears at 240 s /
+480 s, halt** — the plafond moved and so did the distribution, which says the
+model of the failure is wrong, not that the value is too low. Capture the
+baseline before deploying: `prune_old_llm_calls` purges old rows.
 
 Tool call summaries (name, truncated input/output, success, non_zero_exit) persisted in `messages.metadata` JSON column for cross-turn introspection (capped at `TOOL_METADATA_MAX = 4000` chars — tail entries dropped when exceeded, #744). The `tool_calls` DB table is the authoritative source; the dashboard's inline `ToolCallsTable` fetches from `GET /api/v1/traces/:trace_id/tool-calls` with metadata as fallback for pre-v15 messages. `MessageResponse` exposes `trace_id: Option<String>` to enable this lookup. `non_zero_exit` is set by heuristic detection of `Exit code:` / `Killed by signal:` prefixes from exec handlers; history builder tags these with `[NON-ZERO]` (distinct from `[FAILED]`). History builder appends `<context type="tool_history">` blocks to assistant messages.
 
@@ -920,7 +987,7 @@ All SQLite timestamp columns use ISO 8601 TEXT format (`%Y-%m-%dT%H:%M:%SZ`). Th
 
 ## Schema Version
 
-**Current: v52.** Tables: sessions, messages (with `internal` flag for agent-to-agent visibility), team_workspace, audit_events, skill_overrides (with `enabled` column for DB-backed disable state), tasks (with manual/callback/a2a trigger types and a `type` column distinguishing `issue`/`milestone`/`project`), a2a_task_map, a2a_artifacts, a2a_push_notification_configs, llm_calls (with `response_text` and `reasoning` columns for LLM output persistence), tool_calls, team_runs (with `delegation_count` / `solo_absorption` / `failure_context` columns and `status` CHECK expanded to include `failed_no_delegation` — mika#1676 — and `failed_transport` — mika#1671), schema_meta (migration state tracking), kg_entities, kg_relationships, operational_items (#1262 — canonical operational-item ledger with 7 kind variants, 6 status variants, source-based dedup), permission_decisions (#1733 — provenance ledger for operator permission decisions with `classifier_verdict`/`operator_decision`/`override_used`/`decision_authority`/`tenant_id`/`agent_id` columns), pilot_transcripts (#1705 — claude-pilot LLM-call transcripts ingested from JSONL files), served_content (#1867 — per-(agent, person, category) content-serve ledger for proverb/quote/joke/poem/recommendation/story/fact dedup). **Shared-corpus KG tables (keyed by `docs_root_hash`):** kg_chunks, kg_subject_entities (with `discovered` and `discovery_reason` columns for roster-grounding #1158), kg_subject_relationships, kg_chunk_subjects, kg_chunk_subject_relationships, kg_extractions (first-writer-wins via INSERT OR IGNORE). **Per-agent KG tables:** kg_subject_resolutions, kg_resolutions_log (outcome CHECK includes `skipped_discovered_subject`), agent_kg_corpora (agent_id to docs_root_hash mapping for multi-corpus fan-out). `unified_timeline` VIEW for cross-subsystem queries. Session-based message storage with FK. System sessions (`system-{agent_id}`) for compaction.
+**Current: v53.** Tables: sessions, messages (with `internal` flag for agent-to-agent visibility), team_workspace, audit_events, skill_overrides (with `enabled` column for DB-backed disable state), tasks (with manual/callback/a2a trigger types and a `type` column distinguishing `issue`/`milestone`/`project`), a2a_task_map, a2a_artifacts, a2a_push_notification_configs, llm_calls (with `response_text` and `reasoning` columns for LLM output persistence, and the two size columns `system_prompt_bytes` / `request_bytes`), tool_calls, team_runs (with `delegation_count` / `solo_absorption` / `failure_context` columns and `status` CHECK expanded to include `failed_no_delegation` — mika#1676 — and `failed_transport` — mika#1671), schema_meta (migration state tracking), kg_entities, kg_relationships, operational_items (#1262 — canonical operational-item ledger with 7 kind variants, 6 status variants, source-based dedup), permission_decisions (#1733 — provenance ledger for operator permission decisions with `classifier_verdict`/`operator_decision`/`override_used`/`decision_authority`/`tenant_id`/`agent_id` columns), pilot_transcripts (#1705 — claude-pilot LLM-call transcripts ingested from JSONL files), served_content (#1867 — per-(agent, person, category) content-serve ledger for proverb/quote/joke/poem/recommendation/story/fact dedup). **Shared-corpus KG tables (keyed by `docs_root_hash`):** kg_chunks, kg_subject_entities (with `discovered` and `discovery_reason` columns for roster-grounding #1158), kg_subject_relationships, kg_chunk_subjects, kg_chunk_subject_relationships, kg_extractions (first-writer-wins via INSERT OR IGNORE). **Per-agent KG tables:** kg_subject_resolutions, kg_resolutions_log (outcome CHECK includes `skipped_discovered_subject`), agent_kg_corpora (agent_id to docs_root_hash mapping for multi-corpus fan-out). `unified_timeline` VIEW for cross-subsystem queries. Session-based message storage with FK. System sessions (`system-{agent_id}`) for compaction.
 
 Recent migrations:
 - v18->v19: `sessions.task_id` column for reverse session->task lookups. `get_sessions_for_task_tree()`.
@@ -953,5 +1020,6 @@ Recent migrations:
 - v49->v50: Additive re-drive accounting on `auto_pull_stats` (mika#2020) — three columns: `redrive_count INTEGER NOT NULL DEFAULT 0`, `last_redrive_at TEXT`, `redrive_abandoned_at TEXT`. Three `ALTER TABLE ADD COLUMN` statements, no table rebuild (nothing FK-references `auto_pull_stats`). Backs the per-ticket re-drive budget that bounds the Phase 2 stuck-ready reconciler. The columns exist because `failure_count` cannot serve this purpose: it means "the `gh` call failed" and `reset_auto_pull_failure` runs on **every** successful rescue and promotion — precisely the event the budget must count. Merging the two would rebuild the mika#1901 defect (16 `ready` re-applications in 19 h, each one zeroing the only counter that existed). `redrive_abandoned_at` is what separates "the budget just ran out, the label is not posted yet" from "the budget ran out earlier and the operator has since removed `operator-review`" — the latter being the re-entry gesture.
 - v50->v51: `tasks.dispatcher_source` + the `dispatch_slot_leases` table (mika#1948, Porte 2). The column is nullable and CHECK-pinned to `mika_dev`/`mika_manager`/`operator`; the table makes an assigned exec slot an observable fact, one row per `(agent_id, dispatch_class)`. (Entry backfilled in mika#2160 — the list skipped it.)
 - v51->v52: `dispatch_slot_leases` rebuilt with `slot_index INTEGER NOT NULL DEFAULT 0` joining the PRIMARY KEY (mika#2160). Table rebuild — SQLite cannot extend a PRIMARY KEY in place; existing rows land at `slot_index = 0`, so a database migrated mid-dispatch keeps its live lease and its holder. **Why it had to move:** `PRIMARY KEY (agent_id, dispatch_class)` was itself a hard cap of one, independent of any predicate — a class could not hold two live leases whatever the TTL or the guard decided. Without this, `MIKA_DISPATCH_MAX_CONCURRENT_IMPLEMENT=2` would be accepted, logged, and have no effect. At the default cap of 1 exactly one index is ever written and the behaviour is the pre-v52 behaviour, bit for bit.
+- v52->v53: `llm_calls.request_bytes INTEGER` (mika#2189). Additive nullable `ALTER TABLE` with a `column_exists` guard, the same shape as v37→v38's `system_prompt_bytes` and for the same family of reason. **What it closes:** mika#2189's AC1 asks for the expiry distribution "by brief size", but the **error** path writes `input_tokens = 0` and `output_tokens = 0` as literals — a failed call carried no size at all, so the request that timed out was unrecoverable after the fact. Written on **both** paths of `run_loop` and on all three arms of the continuation turn (success, provider error, deadline-clamp timeout); writing it on the success path only would reopen the hole on exactly the side that matters. An estimated `input_tokens` was rejected (Q2): the axis exists to *correlate* size with expiry, and a correlation built on an estimate cannot settle anything. The value comes from `LlmRequest::payload_bytes()`, which sums caller-supplied bytes (system prompt, message text, tool-call arguments, tool-result content, base64 image data, tool definitions) and deliberately **excludes** the provider-specific JSON envelope so the number stays comparable across rails — a lower bound on wire size, monotonic rather than exact. KG extraction and resolution write `None`: a batch NER call runs under no agent envelope, so the axis has nothing to correlate there. Non-retroactive — pre-v53 rows read NULL, which is why the column has no `DEFAULT 0` that would be indistinguishable from a genuinely empty request.
 
 Full migration history: see `docs/runtime-structure.md`.

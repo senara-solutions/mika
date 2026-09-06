@@ -27,7 +27,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 52;
+pub const CURRENT_SCHEMA_VERSION: i64 = 53;
 
 /// `(target_key, before_value, after_value, reasoning)` — return shape for
 /// [`Database::get_audit_event_rows_by_tool_name`] and its async wrapper.
@@ -1210,6 +1210,11 @@ impl Database {
             info!(version = 52, "database migrated to v52");
         }
 
+        if (3..=52).contains(&version) {
+            self.migrate_v52_to_v53()?;
+            info!(version = 53, "database migrated to v53");
+        }
+
         Ok(())
     }
 
@@ -1264,7 +1269,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (52);
+            INSERT INTO schema_version (version) VALUES (53);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -1691,7 +1696,8 @@ impl Database {
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
                 response_text TEXT,
                 reasoning TEXT,
-                system_prompt_bytes INTEGER
+                system_prompt_bytes INTEGER,
+                request_bytes INTEGER
             );
             CREATE INDEX idx_llm_calls_trace ON llm_calls(trace_id);
             CREATE INDEX idx_llm_calls_session ON llm_calls(session_id);
@@ -4965,6 +4971,49 @@ impl Database {
         tx.commit()?;
 
         info!("v51→v52: dispatch_slot_leases gained slot_index in its key (mika#2160)");
+
+        Ok(())
+    }
+
+    /// v52→v53: Add `request_bytes` column to `llm_calls` (mika#2189 D5/Q2).
+    ///
+    /// # The hole this closes
+    ///
+    /// mika#2189's AC1 asks for the expiry distribution "by brief size". On the
+    /// **error** path `agent_loop` writes `input_tokens = 0` and
+    /// `output_tokens = 0` as literals — a failed call carries no token count at
+    /// all — so the size of the request that timed out was not recoverable after
+    /// the fact. The measurement had to fall back to `system_prompt_bytes`
+    /// (mika#1217), which discriminates well but is only half the payload.
+    ///
+    /// An estimated `input_tokens` was rejected in Q2: the axis exists to
+    /// *correlate* size with expiry, and a correlation built on an estimate
+    /// cannot settle anything. This is the measured byte length of the
+    /// serialized request, written on **both** paths — write it on the success
+    /// path only and the hole reopens on exactly the side that matters.
+    ///
+    /// Nullable and non-retroactive: pre-v53 rows stay NULL, and this does not
+    /// recover the 209 failures that motivated the ticket. It makes the *next*
+    /// measurement whole. Additive shape and `column_exists` guard mirror
+    /// v37→v38, which added `system_prompt_bytes` for the same family of reason.
+    fn migrate_v52_to_v53(&mut self) -> Result<()> {
+        let version = self.schema_version()?;
+        if version >= 53 {
+            return Ok(());
+        }
+
+        let has_column = self.column_exists("llm_calls", "request_bytes")?;
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !has_column {
+            tx.execute_batch("ALTER TABLE llm_calls ADD COLUMN request_bytes INTEGER;")?;
+        }
+        tx.execute("INSERT INTO schema_version (version) VALUES (53)", [])?;
+        tx.commit()?;
+
+        info!("v52→v53: added request_bytes column to llm_calls (mika#2189)");
 
         Ok(())
     }
@@ -9389,13 +9438,14 @@ impl Database {
         response_text: Option<&str>,
         reasoning: Option<&str>,
         system_prompt_bytes: Option<i64>,
+        request_bytes: Option<i64>,
     ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO llm_calls (id, agent_id, session_id, trace_id, provider, model,
              input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
              latency_ms, stop_reason, status, error_message, step, prompt_variant,
-             response_text, reasoning, system_prompt_bytes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+             response_text, reasoning, system_prompt_bytes, request_bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 id,
                 agent_id,
@@ -9416,6 +9466,7 @@ impl Database {
                 response_text,
                 reasoning,
                 system_prompt_bytes,
+                request_bytes,
             ],
         )?;
         Ok(())
@@ -13649,6 +13700,75 @@ mod tests {
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    }
+
+    /// mika#2189 D5: the column exists on a **fresh** install, not only after
+    /// the ALTER. A migration that adds a column the `CREATE TABLE` forgot
+    /// leaves every new database silently missing it — and the write path,
+    /// which names its columns, would then fail on exactly the deployments
+    /// that have no history to migrate.
+    #[test]
+    fn fresh_db_has_llm_calls_request_bytes() {
+        let db = db();
+        assert!(
+            db.column_exists("llm_calls", "request_bytes").unwrap(),
+            "a fresh database must carry llm_calls.request_bytes"
+        );
+    }
+
+    #[test]
+    fn test_migrate_v52_to_v53_is_idempotent() {
+        let mut db = db();
+        // Already at CURRENT (>=53) — must no-op rather than double-apply.
+        db.migrate_v52_to_v53().unwrap();
+        db.migrate_v52_to_v53().unwrap();
+        let version: i64 = db
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    }
+
+    /// The ALTER path itself, exercised from a v52-shaped `llm_calls`.
+    ///
+    /// The idempotence test above runs against an already-migrated database, so
+    /// it proves the guard and never the migration. This drops the column and
+    /// rewinds the version so the `ALTER TABLE` actually executes — otherwise a
+    /// broken statement would ship green.
+    #[test]
+    fn migrate_v52_to_v53_adds_the_column_and_preserves_rows() {
+        let mut db = db();
+        db.conn
+            .execute("ALTER TABLE llm_calls DROP COLUMN request_bytes", [])
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO llm_calls (id, agent_id, session_id, provider, model)
+                 VALUES ('pre-v53', 'a', 's', 'openrouter', 'kimi')",
+                [],
+            )
+            .unwrap();
+        db.conn.execute("DELETE FROM schema_version", []).unwrap();
+        db.conn
+            .execute("INSERT INTO schema_version (version) VALUES (52)", [])
+            .unwrap();
+
+        db.migrate_v52_to_v53().unwrap();
+
+        assert!(db.column_exists("llm_calls", "request_bytes").unwrap());
+        let carried: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT request_bytes FROM llm_calls WHERE id = 'pre-v53'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            carried, None,
+            "a pre-v53 row must read NULL — the column is not retroactive, and a \
+             default of 0 would be indistinguishable from a genuinely empty request"
+        );
     }
 
     #[test]
@@ -21354,6 +21474,7 @@ mod tests {
         db2.migrate_v49_to_v50().unwrap();
         db2.migrate_v50_to_v51().unwrap();
         db2.migrate_v51_to_v52().unwrap();
+        db2.migrate_v52_to_v53().unwrap();
 
         let final_version: i64 = db2
             .conn

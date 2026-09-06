@@ -3132,6 +3132,7 @@ impl AsyncDatabase {
         response_text: Option<&str>,
         reasoning: Option<&str>,
         system_prompt_bytes: Option<i64>,
+        request_bytes: Option<i64>,
     ) -> Result<()> {
         let (a, i, sid, tid, p, m, sr, st, em, pv, rt, rz) = (
             self.agent_id.clone(),
@@ -3168,6 +3169,7 @@ impl AsyncDatabase {
                 rt.as_deref(),
                 rz.as_deref(),
                 system_prompt_bytes,
+                request_bytes,
             )
         })
         .await

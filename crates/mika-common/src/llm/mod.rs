@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod budget;
 pub mod error;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod mock;
@@ -16,13 +17,29 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde::Deserialize;
 
+pub use budget::{
+    AGENT_TOTAL_TIMEOUT_ENV_VAR, DEFAULT_AGENT_TOTAL_TIMEOUT_SECS, LlmBudgetError,
+    LlmTimeoutBudget, MIN_AGENT_TOTAL_TIMEOUT_SECS,
+};
 pub use error::LlmError;
 pub use types::*;
 
-/// Estimated typical LLM call duration for deadline-aware retry abort.
-/// Conservative: covers Sonnet 4.6 observed p95 (49s) with headroom.
+/// Estimated typical LLM call duration for deadline-aware retry abort, at the
+/// **default** per-call cap.
+///
+/// Since mika#2189 this is no longer what the retry loop reads: the live value
+/// is [`LlmTimeoutBudget::typical_call_duration_secs`], `0.75 ×` the effective
+/// cap. A literal calibrated on a 120 s cap describes a geometry that stops
+/// existing the moment an operator raises the cap — which is exactly the
+/// asymmetry mika#2189 exists to close. The constant survives as the pin for
+/// that fraction (`budget::tests::derived_thresholds_reproduce_the_literals_at_the_default_cap`)
+/// and as documentation of the original calibration: Sonnet 4.6 observed p95
+/// (49 s) with headroom.
 pub const TYPICAL_CALL_DURATION_SECS: u64 = 90;
-/// Buffer added to typical call duration for retry abort decisions.
+/// Buffer added to typical call duration for retry abort decisions, at the
+/// **default** per-call cap. See [`TYPICAL_CALL_DURATION_SECS`] for why this is
+/// a pin rather than the live value; the live value is
+/// [`LlmTimeoutBudget::retry_buffer_secs`] (`0.25 ×` the effective cap).
 pub const RETRY_BUFFER_SECS: u64 = 30;
 /// Minimum remaining-deadline budget required to attempt a retry after a
 /// **transport-class** failure (mika#1744 AC4-primary).
@@ -36,6 +53,11 @@ pub const RETRY_BUFFER_SECS: u64 = 30;
 /// The 60s value matches the typical call duration (`TYPICAL_CALL_DURATION_SECS`)
 /// with 30s slack — enough for one retry to complete while preserving a
 /// safety margin against variance.
+///
+/// As with its two siblings above, since mika#2189 this is the pin for the
+/// default cap, not the live value: the retry loop reads
+/// [`LlmTimeoutBudget::transport_retry_min_remaining_secs`] (`0.50 ×` the
+/// effective cap).
 pub const TRANSPORT_RETRY_MIN_REMAINING_SECS: u64 = 60;
 
 /// Default HTTP-client timeout (seconds) for non-Anthropic LLM providers.
@@ -239,6 +261,24 @@ pub trait LlmProvider: Send + Sync {
 
     /// Maximum output tokens configured for this provider.
     fn max_tokens(&self) -> u32;
+
+    /// The per-call plafond and per-agent envelope this provider runs under
+    /// (mika#2189).
+    ///
+    /// The agent loop derives its turn deadline from
+    /// [`LlmTimeoutBudget::agent_total_timeout_secs`] **here** rather than from
+    /// a constant of its own. That is the point of the ticket: the plafond and
+    /// the envelope were two independent numbers, only one of which had a knob,
+    /// so an operator could raise the ceiling and not the room meant to contain
+    /// it. Reading both off the same object makes them impossible to set apart.
+    ///
+    /// The default returns the environment-resolved budget, which is right for
+    /// mocks and for the Anthropic rail (whose transport carries its own
+    /// literal timeout — a real inconsistency, but one this ticket names as
+    /// out of scope and leaves to its own ticket rather than bundling).
+    fn timeout_budget(&self) -> LlmTimeoutBudget {
+        LlmTimeoutBudget::from_env()
+    }
 
     /// Whether this provider supports tool/function calling.
     fn supports_tool_calling(&self) -> bool {
@@ -472,15 +512,51 @@ impl FromStr for ProviderKind {
     }
 }
 
-/// Create an `LlmProvider` from a `ModelSpec` and max_tokens setting.
+/// Create an `LlmProvider` from a `ModelSpec` and max_tokens setting, using the
+/// budget resolved from the environment.
 ///
-/// For Anthropic, uses the native Anthropic API client.
-/// For all others, uses the OpenAI-compatible provider.
+/// Thin wrapper over [`create_provider_with_budget`] for callers that have no
+/// `Settings` in hand (calibration harnesses, smoke tests). Production paths go
+/// through `Settings::llm_provider`, which supplies the per-agent budget.
 pub fn create_provider(
     spec: &ModelSpec,
     max_tokens: u32,
     log_llm_bodies: bool,
 ) -> Result<Arc<dyn LlmProvider>> {
+    create_provider_with_budget(
+        spec,
+        max_tokens,
+        log_llm_bodies,
+        LlmTimeoutBudget::from_env(),
+    )
+}
+
+/// Create an `LlmProvider` from a `ModelSpec`, `max_tokens`, and an explicit
+/// timeout budget.
+///
+/// For Anthropic, uses the native Anthropic API client.
+/// For all others, uses the OpenAI-compatible provider.
+///
+/// # Errors
+///
+/// Refuses a `budget` whose per-call plafond is not strictly contained by its
+/// agent envelope (mika#2189 D2). This is the cold-path counterpart to the
+/// mika#1660 panic on a too-small plafond, and sits at the same point in the
+/// lifecycle by design (Q5): detecting one at boot and the other at first call
+/// would put two halves of one setting mistake in two different places.
+///
+/// **The consequence, stated rather than left to be discovered:** a `mika` that
+/// starts is not proof that its budgets are valid. The first LLM call is.
+pub fn create_provider_with_budget(
+    spec: &ModelSpec,
+    max_tokens: u32,
+    log_llm_bodies: bool,
+    budget: LlmTimeoutBudget,
+) -> Result<Arc<dyn LlmProvider>> {
+    budget
+        .validate()
+        .context("invalid LLM timeout budget (mika#2189)")?;
+
     match spec.provider {
         ProviderKind::Anthropic => {
             let provider = anthropic::AnthropicProvider::new(
@@ -502,6 +578,7 @@ pub fn create_provider(
                 spec.model.clone(),
                 max_tokens,
                 log_llm_bodies,
+                budget,
             );
             Ok(Arc::new(provider))
         }
@@ -520,6 +597,7 @@ pub fn create_provider(
                 max_tokens,
                 log_llm_bodies,
                 ProviderKind::MikaModel,
+                budget,
             );
             Ok(Arc::new(provider))
         }
@@ -540,6 +618,7 @@ pub fn create_provider(
                 max_tokens,
                 spec.provider,
                 log_llm_bodies,
+                budget,
             );
             Ok(Arc::new(provider))
         }
