@@ -1787,6 +1787,162 @@ _is_dispatchable_repo() {
     return 1
 }
 
+# mika#2178 — render the ticket text (body AND comments) in a form that can be
+# injected into the pilot's opening prompt.
+#
+# The defect this repairs: `PROMPT` was exactly `<repo>#<num>`, and claude-pilot
+# builds its opening prompt by plain concatenation, `f"{ns.command} {opening}"`
+# (claude_pilot/cli.py:290 interactive, :251 headless). On the plan-callout path
+# — the one every groomed ticket takes — the pilot's real input was therefore
+# `/ce-work docs/plans/x.md mika#N`: no body, no comments. The seven readers of
+# the issue-body variable are all internal to this file (branch derivation,
+# anti-re-groom gate, callout detection, rescue) and none of them writes into
+# the prompt, so widening the fetch alone would fill a variable nobody forwards.
+#
+# Contract: reads the issue JSON on stdin, writes the rendered block on stdout,
+# returns the EMPTY STRING when there is neither a body nor a comment to render.
+# Reads no global and opens no network round trip — the JSON is handed to it,
+# which is what keeps it testable with no token and no network.
+_render_ticket_context() {
+    local repo="$1" issue_num="$2"
+
+    # --- Volume bounds. Each value is a measurement, not a preference. ---
+    #
+    # body 16 KiB: measured groomed bodies run 3–8 KiB, so truncation stays rare
+    #   while the worst case stays bounded.
+    # 10 comments: a trajectory correction is recent by construction — it reacts
+    #   to a dead dispatch. "Posterior to the last grooming callout" was rejected
+    #   as a rule: the body callout carries no date, so "posterior" is not
+    #   computable from the body. The comment stream is the only dated surface.
+    # 4 KiB per comment: the ceiling ITERATION_CTX already applies below
+    #   (`head -c 4096`). This file keeps ONE convention, not two.
+    # 16 KiB for the comment block: ten comments at 4 KiB would be 40 KiB; the
+    #   block cap makes the worst case deterministic (≤ 32 KiB of total context
+    #   with the body). Eviction starts at the oldest because the most recent
+    #   comment is the one most likely to carry the correction.
+    #
+    # Every omission is ANNOUNCED. A silently amputated context is the defect
+    # this repairs, not one it is allowed to reintroduce.
+    local body_max=16384
+    local comment_max=4096
+    local block_max=16384
+    local keep_max=10
+
+    # Byte-exact slicing WITHOUT a pipe, deliberately.
+    #
+    # `printf '%s' "$x" | head -c N` is the obvious spelling — it is the one
+    # ITERATION_CTX uses below — but it kills its writer with SIGPIPE as soon as
+    # the payload exceeds the pipe buffer (64 KiB on Linux): head exits after N
+    # bytes while printf is still writing. Under this file's `set -euo pipefail`
+    # that becomes a failed command substitution and aborts the WHOLE dispatch.
+    # A GitHub issue body caps at 65 536 CHARACTERS, hence well past 64 KiB in
+    # UTF-8: the case is reachable on a real maximal ticket, not theoretical
+    # (same class as mika#2055).
+    #
+    # `LC_ALL=C` is what makes `${var:0:n}` count OCTETS, so the bounds above
+    # mean what their marker text says. It is function-local and NOT exported:
+    # the child processes below keep the ambient locale.
+    #
+    # Consequence accepted, exactly as with `head -c`: a cut can land mid-UTF-8.
+    # The marker follows immediately, so the seam is announced, never silent.
+    local LC_ALL=C
+
+    local issue_json
+    issue_json=$(cat)
+    [ -n "$issue_json" ] || return 0
+
+    local body total rows
+    body=$(printf '%s' "$issue_json" | jq -r '.body // ""' 2>/dev/null) || return 0
+    total=$(printf '%s' "$issue_json" | jq -r '(.comments // []) | length' 2>/dev/null) || total=0
+    [ -n "$total" ] || total=0
+
+    # One TSV row per retained comment, oldest first:
+    #   <1-based index in the FULL list> <login> <createdAt> <base64(body)>
+    # The index stays the one from the full list so that "6/15" and the omission
+    # line tell the same story. The body travels base64-encoded: a comment
+    # routinely contains newlines and ``` fences that would break any naive
+    # encoding.
+    rows=$(printf '%s' "$issue_json" | jq -r --argjson keep "$keep_max" '
+        (.comments // []) as $c
+        | ($c | length) as $n
+        | (if $n > $keep then $n - $keep else 0 end) as $skip
+        | $c[$skip:]
+        | to_entries[]
+        | [ ($skip + .key + 1 | tostring),
+            (.value.author.login // "inconnu"),
+            (.value.createdAt // ""),
+            ((.value.body // "") | @base64) ]
+        | @tsv
+    ' 2>/dev/null) || rows=""
+
+    local -a blocks=()
+    local idx login created b64 cbody role block
+    while IFS=$'\t' read -r idx login created b64; do
+        [ -n "$idx" ] || continue
+        cbody=$(printf '%s' "$b64" | base64 -d 2>/dev/null) || cbody=""
+        if [ "${#cbody}" -gt "$comment_max" ]; then
+            cbody="${cbody:0:$comment_max}
+[… tronqué à ${comment_max} o]"
+        fi
+        # Role by login. A QA `block[pipeline]` verdict posted by a bot and an
+        # operator instruction posted by a human must not read the same; the
+        # author is the only discriminant available without heuristics on the
+        # text itself.
+        case "$login" in
+            mika-platform-dev|github-actions|*'[bot]') role="bot" ;;
+            *) role="humain" ;;
+        esac
+        # Plain `---` separators, never a code fence: a comment routinely
+        # contains ``` fences that would break any nesting.
+        block=$(printf -- '--- commentaire %s/%s · %s (%s) · %s ---\n%s' \
+            "$idx" "$total" "$login" "$role" "$created" "$cbody")
+        blocks+=("$block")
+    done <<<"$rows"
+
+    # Block cap: evict the oldest first.
+    local block_text=""
+    while [ "${#blocks[@]}" -gt 0 ]; do
+        block_text=$(printf '%s\n\n' "${blocks[@]}")
+        [ "${#block_text}" -le "$block_max" ] && break
+        blocks=("${blocks[@]:1}")
+        block_text=""
+    done
+
+    if [ "${#body}" -gt "$body_max" ]; then
+        body="${body:0:$body_max}
+[… corps tronqué à ${body_max} o]"
+    fi
+
+    # Nothing to render: empty string, so the caller leaves PROMPT untouched.
+    [ -n "$body" ] || [ "${#blocks[@]}" -gt 0 ] || return 0
+
+    # The header says WHAT TO DO with the block, not merely that the text
+    # exists. A block labelled "context" with no reading instruction reads like
+    # archive noise — the precedent is `ITERATION CONTEXT` below, which names
+    # its own use. The rendered strings are French on purpose: they are content
+    # addressed to the pilot, alongside a French ticket body and French operator
+    # comments, not code commentary.
+    printf '%s\n' \
+        "CONTEXTE DU TICKET (senara-solutions/${repo}#${issue_num})" \
+        "Le corps et les commentaires ci-dessous FONT PARTIE du ticket. Une consigne" \
+        "opérateur, une correction de trajectoire ou un enrichissement de grooming y vit" \
+        "aussi souvent dans un commentaire que dans le corps. Lis les deux avant d'agir." \
+        ""
+
+    if [ -n "$body" ]; then
+        printf -- '--- corps du ticket ---\n%s\n\n' "$body"
+    fi
+
+    local omitted=$((total - ${#blocks[@]}))
+    if [ "$omitted" -gt 0 ]; then
+        printf '[%s commentaire(s) plus ancien(s) omis]\n\n' "$omitted"
+    fi
+
+    if [ -n "$block_text" ]; then
+        printf '%s' "$block_text"
+    fi
+}
+
 _set_up_worktree() {
     # --- Parse repo#number format ---
     # Matches: mika#214, mika-skills#8, mika-cloud#50, and an optional owner/
@@ -1833,7 +1989,11 @@ _set_up_worktree() {
         fi
 
         # Fetch issue — validates it exists and is open, gets labels + title + body
-        ISSUE_JSON=$(gh issue view "$ISSUE_NUM" --repo "senara-solutions/$REPO" --json state,title,labels,body 2>/dev/null) || {
+        # + comments. `comments` is fetched HERE, in the same call (mika#2178):
+        # `state` is already read below for the issue-close gate, and a second
+        # round trip would open a TOCTOU window between the state and the
+        # comments — the same one /mika-groom-ticket closed at its step 5a.
+        ISSUE_JSON=$(gh issue view "$ISSUE_NUM" --repo "senara-solutions/$REPO" --json state,title,labels,body,comments 2>/dev/null) || {
             echo "Error: Issue #${ISSUE_NUM} not found in senara-solutions/${REPO}. Aborting." >&2
             exit 1
         }
@@ -2083,6 +2243,40 @@ Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
         if [ -n "$ITERATION_CTX" ]; then
             ITERATION_CTX=$(printf '%s' "$ITERATION_CTX" | head -c 4096)
             PROMPT=$(printf '%s#%s\n\nITERATION CONTEXT:\n%s' "$REPO" "$ISSUE_NUM" "$ITERATION_CTX")
+        fi
+
+        # --- mika#2178: the ticket text reaches the pilot ---
+        #
+        # Three position invariants hold this site in place; each has a named
+        # consequence if violated.
+        #
+        #  1. AFTER the ITERATION_CTX branch above. That branch REASSIGNS PROMPT
+        #     from scratch instead of appending to it, so injecting before it
+        #     drops the context silently on every iteration.
+        #  2. AFTER the anchored repo#N parse at the top of this function
+        #     (`^([a-zA-Z0-9_-]+/)?[a-zA-Z0-9_-]+#[0-9]+$`). Injecting before it
+        #     makes the regex miss, dispatch falls through to free-text mode and
+        #     NO worktree is created. First-order regression.
+        #  3. INSIDE _set_up_worktree, therefore before _detect_plan_on_branch
+        #     and _handle_dry_run. The entry command is not arbitrated yet at
+        #     this point, which is exactly what gives both entry paths
+        #     (`/ce-work <plan>` and `/mika`) the same context with no
+        #     conditional branch — and what makes the result observable in the
+        #     dry-run JSON `prompt` field without launching a model.
+        #
+        # The FIRST LINE of PROMPT stays exactly `<repo>#<num>`: the mika#138
+        # contract and invariant 2 both depend on it.
+        #
+        # Duplication on the no-callout path is deliberate: `.claude/commands/
+        # mika.md` re-fetches the body there, so it arrives twice. Bounded cost
+        # (≤ 16 KiB) against one rule — "the pilot always has the ticket text" —
+        # with no conditional on an entry command that does not exist yet. A
+        # conditional would buy a few kilobytes and pay in asymmetry between the
+        # two paths, which is the very defect class this closes.
+        local TICKET_CONTEXT
+        TICKET_CONTEXT=$(printf '%s' "$ISSUE_JSON" | _render_ticket_context "$REPO" "$ISSUE_NUM")
+        if [ -n "$TICKET_CONTEXT" ]; then
+            PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$TICKET_CONTEXT")
         fi
 
         # Save pre-run HEAD SHA for post-flight diff check
