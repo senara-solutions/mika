@@ -367,7 +367,7 @@ travail d'un tiers ; il ne rend pas la pile de stash per-worktree. Hors portée.
 
 ---
 
-## 10. Acceptance criteria
+## Acceptance criteria
 
 Transcrits **mot pour mot** du corps de mika#2192. Ce sont les critères de clôture ;
 le tableau de traçabilité qui suit dit par quel livrable et quelle preuve chacun est
