@@ -1033,6 +1033,38 @@ pub struct Settings {
     #[serde(default)]
     pub callback_delivery_backoff_max_secs: Option<u64>,
 
+    /// Per-call LLM HTTP plafond, in seconds (mika#2189 D1/D4).
+    ///
+    /// The same knob mika#1660 introduced as `MIKA_LLM_HTTP_TIMEOUT_SECS`,
+    /// promoted to a `Settings` field so it can also be set **per agent** in
+    /// `~/.mika/agents/<name>/config.toml` — the granularity the problem has,
+    /// since `llm_provider` and `openrouter_model` already live there and a
+    /// fleet-wide env var cannot give mika-arch a different geometry from
+    /// mika-dev.
+    ///
+    /// Env override: `MIKA_LLM_HTTP_TIMEOUT_SECS`.
+    ///
+    /// Default: [`crate::llm::DEFAULT_HTTP_TIMEOUT_SECS`] (120).
+    #[serde(default)]
+    pub llm_http_timeout_secs: Option<u64>,
+
+    /// Per-agent turn envelope, in seconds (mika#2189 D1).
+    ///
+    /// Before mika#2189 this was `planning::policy::AGENT_TOTAL_TIMEOUT_SECS`,
+    /// a bare constant with no env var and no per-agent setting — while the
+    /// per-call plafond above *did* have one. That asymmetry is the ticket:
+    /// **one could raise the ceiling but not the room that must contain it**,
+    /// so the only available remedy made a single call eat the whole envelope
+    /// of a pass that needs three.
+    ///
+    /// Env override: `MIKA_AGENT_TOTAL_TIMEOUT_SECS`.
+    ///
+    /// Default: [`crate::llm::DEFAULT_AGENT_TOTAL_TIMEOUT_SECS`] (300 —
+    /// unchanged; this ticket makes the envelope settable, it does not move the
+    /// fleet default).
+    #[serde(default)]
+    pub agent_total_timeout_secs: Option<u64>,
+
     /// KG docs root — absolute path to the docs directory the lexical ingestor
     /// reads (#738). Resolution chain: `MIKA_KG_DOCS_ROOT` env > `kg_docs_root`
     /// config field > `<CWD>/docs/solutions` (container-native default).
@@ -1583,7 +1615,12 @@ impl Settings {
             base_url: config.base_url,
             api_key: config.api_key,
         };
-        crate::llm::create_provider(&spec, self.llm_max_tokens, self.log_llm_bodies)
+        crate::llm::create_provider_with_budget(
+            &spec,
+            self.llm_max_tokens,
+            self.log_llm_bodies,
+            self.llm_timeout_budget(),
+        )
     }
 
     /// Create an LLM provider for a specific provider kind with an optional model override.
@@ -1610,7 +1647,12 @@ impl Settings {
             base_url: base_url.map(String::from),
             api_key: api_key.map(String::from),
         };
-        crate::llm::create_provider(&spec, self.llm_max_tokens, self.log_llm_bodies)
+        crate::llm::create_provider_with_budget(
+            &spec,
+            self.llm_max_tokens,
+            self.log_llm_bodies,
+            self.llm_timeout_budget(),
+        )
     }
 
     /// Create an LLM provider for KG extraction (NER + fact triples).
@@ -1730,6 +1772,66 @@ impl Settings {
                 self.effective_callback_delivery_backoff_base_secs(),
                 CALLBACK_DELIVERY_BACKOFF_ABSOLUTE_MAX_SECS,
             )
+    }
+
+    /// Effective per-call LLM HTTP plafond, in seconds (mika#2189).
+    ///
+    /// Falls back to [`crate::llm::http_timeout_secs`] when unset, so the
+    /// mika#1660 env path — including its panic on an unparseable or
+    /// below-minimum value — is preserved verbatim for agents that never set
+    /// the config key. A value supplied through `config.toml` goes through the
+    /// same [`crate::llm::MIN_HTTP_TIMEOUT_SECS`] floor: a plafond too small to
+    /// complete a trivial call is the same mistake whichever file it came from.
+    pub fn effective_llm_http_timeout_secs(&self) -> u64 {
+        match self.llm_http_timeout_secs {
+            None => crate::llm::http_timeout_secs(),
+            Some(secs) if secs < crate::llm::MIN_HTTP_TIMEOUT_SECS => {
+                tracing::warn!(
+                    event = "llm_http_timeout_below_minimum",
+                    configured = secs,
+                    min = crate::llm::MIN_HTTP_TIMEOUT_SECS,
+                    "llm_http_timeout_secs is below the minimum; using the minimum"
+                );
+                crate::llm::MIN_HTTP_TIMEOUT_SECS
+            }
+            Some(secs) => secs,
+        }
+    }
+
+    /// Effective per-agent turn envelope, in seconds (mika#2189).
+    ///
+    /// Returns the configured value or
+    /// [`crate::llm::DEFAULT_AGENT_TOTAL_TIMEOUT_SECS`] (300). A configured `0`
+    /// falls back to the default with a WARN — an envelope of zero would abort
+    /// every turn before its first step, which is never what an operator meant
+    /// and, read the other way, would be a silent way to disable the agent.
+    pub fn effective_agent_total_timeout_secs(&self) -> u64 {
+        match self.agent_total_timeout_secs {
+            None => crate::llm::DEFAULT_AGENT_TOTAL_TIMEOUT_SECS,
+            Some(0) => {
+                tracing::warn!(
+                    event = "agent_total_timeout_invalid",
+                    default = crate::llm::DEFAULT_AGENT_TOTAL_TIMEOUT_SECS,
+                    "agent_total_timeout_secs=0 is invalid; falling back to the default"
+                );
+                crate::llm::DEFAULT_AGENT_TOTAL_TIMEOUT_SECS
+            }
+            Some(secs) => secs,
+        }
+    }
+
+    /// The `(per-call plafond, agent envelope)` pair this agent runs under
+    /// (mika#2189).
+    ///
+    /// Returned **unvalidated** on purpose: validation belongs at provider
+    /// construction (Q5), which is the one place that can refuse and where
+    /// mika#1660's sibling check already lives. A getter that validated would
+    /// give the containment invariant two homes.
+    pub fn llm_timeout_budget(&self) -> crate::llm::LlmTimeoutBudget {
+        crate::llm::LlmTimeoutBudget::unvalidated(
+            self.effective_llm_http_timeout_secs(),
+            self.effective_agent_total_timeout_secs(),
+        )
     }
 
     /// Effective bounded webhook-queue max depth (mika#1870).
@@ -1940,6 +2042,9 @@ impl Settings {
         Self {
             llm_provider: ProviderKind::Anthropic,
             llm_max_tokens: 4096,
+            // mika#2189: unset → the shipped 120/300 geometry via the accessors.
+            llm_http_timeout_secs: None,
+            agent_total_timeout_secs: None,
             // Per-provider fields (all None = use defaults)
             anthropic_model: None,
             anthropic_api_key: None,

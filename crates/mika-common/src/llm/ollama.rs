@@ -10,7 +10,7 @@ use tracing::{Instrument, debug, error, info, info_span, warn};
 use super::error::LlmError;
 use super::openai::extract_think_block;
 use super::types::*;
-use super::{LlmProvider, RETRY_BUFFER_SECS, TYPICAL_CALL_DURATION_SECS};
+use super::{LlmProvider, LlmTimeoutBudget};
 
 /// One-shot debug-flag-gated payload dump (mika#1387).
 ///
@@ -162,7 +162,12 @@ struct OllamaErrorResponse {
 
 // -- Provider implementation --
 
+/// Hard ceiling on retries, independent of the budget. See the sibling
+/// constant in `openai.rs` for why the budget may only narrow this.
 const MAX_RETRIES: u32 = 3;
+
+/// Attempts the chain permits at most: the initial call plus [`MAX_RETRIES`].
+const MAX_ATTEMPTS_HARD_CAP: u32 = MAX_RETRIES + 1;
 
 /// Native Ollama provider that uses `/api/chat` (Ollama's native endpoint).
 ///
@@ -183,6 +188,10 @@ pub struct OllamaProvider {
     /// `ProviderKind::Ollama` from `ProviderKind::MikaModel` (both use the
     /// same Ollama transport but report different `provider_name()`).
     provider_kind: super::ProviderKind,
+    /// Per-call plafond + agent envelope (mika#2189). See the twin field on
+    /// `OpenAiCompatibleProvider`; the two transports must not drift on
+    /// retry geometry.
+    budget: LlmTimeoutBudget,
 }
 
 impl OllamaProvider {
@@ -192,6 +201,7 @@ impl OllamaProvider {
         model: String,
         max_tokens: u32,
         log_llm_bodies: bool,
+        budget: LlmTimeoutBudget,
     ) -> Self {
         Self::with_provider_kind(
             base_url,
@@ -200,6 +210,7 @@ impl OllamaProvider {
             max_tokens,
             log_llm_bodies,
             super::ProviderKind::Ollama,
+            budget,
         )
     }
 
@@ -214,9 +225,10 @@ impl OllamaProvider {
         max_tokens: u32,
         log_llm_bodies: bool,
         provider_kind: super::ProviderKind,
+        budget: LlmTimeoutBudget,
     ) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(super::http_timeout_secs()))
+            .timeout(Duration::from_secs(budget.http_timeout_secs()))
             .build()
             .expect("failed to build HTTP client");
 
@@ -231,6 +243,7 @@ impl OllamaProvider {
             max_tokens,
             log_llm_bodies,
             provider_kind,
+            budget,
         }
     }
 
@@ -516,14 +529,23 @@ impl OllamaProvider {
 
         let mut last_error = None;
 
-        for attempt in 0..=MAX_RETRIES {
+        // AC3-b (mika#2189) — see the twin comment in `openai.rs` for the full
+        // reasoning. Deadline-gated for the same reason: without an envelope
+        // there is nothing to overflow.
+        let max_attempts = if deadline.is_some() {
+            self.budget.max_attempts(MAX_ATTEMPTS_HARD_CAP)
+        } else {
+            MAX_ATTEMPTS_HARD_CAP
+        };
+        let retry_threshold_secs =
+            self.budget.typical_call_duration_secs() + self.budget.retry_buffer_secs();
+
+        for attempt in 0..max_attempts {
             if attempt > 0 {
                 // Deadline-aware retry abort
                 if let Some(dl) = deadline {
                     let remaining = dl.saturating_duration_since(Instant::now());
-                    if remaining
-                        < Duration::from_secs(TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS)
-                    {
+                    if remaining < Duration::from_secs(retry_threshold_secs) {
                         warn!(
                             attempt,
                             remaining_ms = remaining.as_millis() as u64,
@@ -556,8 +578,10 @@ impl OllamaProvider {
                     return Ok(llm_response);
                 }
                 Err(e) => {
-                    if attempt < MAX_RETRIES && e.is_retryable() {
-                        warn!(attempt, error = %e, "transient Ollama API error");
+                    // `attempt + 1 < max_attempts` — see the twin comment in
+                    // `openai.rs`: the budget may have narrowed the chain.
+                    if attempt + 1 < max_attempts && e.is_retryable() {
+                        warn!(attempt, max_attempts, error = %e, "transient Ollama API error");
                         last_error = Some(e);
                         continue;
                     }
@@ -568,8 +592,7 @@ impl OllamaProvider {
 
         // Distinguish deadline-abort from normal retry exhaustion
         let deadline_aborted = deadline.is_some_and(|dl| {
-            dl.saturating_duration_since(Instant::now())
-                < Duration::from_secs(TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS)
+            dl.saturating_duration_since(Instant::now()) < Duration::from_secs(retry_threshold_secs)
         });
 
         Err(last_error.unwrap_or_else(|| {
@@ -668,6 +691,11 @@ impl LlmProvider for OllamaProvider {
         self.max_tokens
     }
 
+    /// mika#2189 — see the twin impl on `OpenAiCompatibleProvider`.
+    fn timeout_budget(&self) -> LlmTimeoutBudget {
+        self.budget
+    }
+
     fn supports_tool_calling(&self) -> bool {
         true
     }
@@ -719,6 +747,7 @@ mod tests {
             "llama3".into(),
             4096,
             false,
+            LlmTimeoutBudget::default(),
         )
     }
 
@@ -744,6 +773,7 @@ mod tests {
             "llama3".into(),
             4096,
             false,
+            LlmTimeoutBudget::default(),
         );
         assert_eq!(provider.chat_url(), "http://localhost:11434/api/chat");
     }

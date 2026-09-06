@@ -1658,6 +1658,11 @@ impl SubjectEntityResolver {
                 Some(kg_phase),
                 None,
                 None,
+                // See the twin comment in `subject_extractor.rs`: a batch
+                // resolution call carries no agent envelope, so both size
+                // columns stay NULL rather than carrying a number that would
+                // pollute the mika#2189 axis.
+                None,
                 None,
             )
             .await

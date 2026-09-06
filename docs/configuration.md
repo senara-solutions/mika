@@ -558,7 +558,8 @@ For running `mika` (the TUI chat client), only the API key is required:
 | `MIKA_{PROVIDER}_MODEL` | No | Override model for a provider |
 | `MIKA_{PROVIDER}_BASE_URL` | No | Override base URL for a provider |
 | `MIKA_LLM_MAX_TOKENS` | No | Override max tokens (default: `4096`) |
-| `MIKA_LLM_HTTP_TIMEOUT_SECS` | No | Per-request HTTP timeout for non-Anthropic LLM providers (openai-compatible + ollama). Default `120`. Raise for long-context synthesis (e.g. skill-review on large skills). Values `<10` rejected at provider construction (mika#1660). |
+| `MIKA_LLM_HTTP_TIMEOUT_SECS` | No | Per-call plafond: per-request HTTP timeout for non-Anthropic LLM providers (openai-compatible + ollama). Default `120`. Values `<10` rejected at provider construction (mika#1660). Also settable per agent as `llm_http_timeout_secs` in `config.toml` (mika#2189). **Must be strictly less than the envelope below** — see the note after this table. |
+| `MIKA_AGENT_TOTAL_TIMEOUT_SECS` | No | Per-agent turn envelope, in seconds (default `300`). Before mika#2189 this was a bare constant with no knob at all, while the plafond above had one — so an operator could raise the ceiling and not the room meant to contain it. Also settable per agent as `agent_total_timeout_secs`. `0` or unparseable → default with a WARN. |
 | `MIKA_DB_PATH` | No | Override database path |
 | `MIKA_LOG_LEVEL` | No | Override log level (default: `info`) |
 | `MIKA_HOME` | No | Override home directory (default: `~/.mika/`) |
@@ -578,6 +579,36 @@ For running `mika` (the TUI chat client), only the API key is required:
 | `MIKA_DISABLE_AGENT_PROVISIONING` | No | Prevent dev_mode from overwriting agent files (default: false) |
 
 \* Set the API key for the active provider. E.g., `MIKA_ANTHROPIC_API_KEY` for Anthropic, `MIKA_GROQ_API_KEY` for Groq. Ollama does not require an API key.
+
+### Timeout budgets: the plafond must fit inside the envelope (mika#2189)
+
+The two timeout settings above are **one setting in two halves**, and configuring
+either alone is how the failure they exist to prevent happens.
+
+`MIKA_LLM_HTTP_TIMEOUT_SECS` bounds a single LLM call. `MIKA_AGENT_TOTAL_TIMEOUT_SECS`
+bounds the whole agent turn, which must also hold the tool calls and, typically,
+several LLM calls. A configuration where the plafond is at or above the envelope
+means one call may consume the entire turn — so the agent loop has no budget left
+for a second step. Mika **refuses to construct a provider** under such a pair, with
+an error naming both values and the file to fix.
+
+Note where that check happens: at provider construction, not at boot. **A `mika`
+that starts is not proof that its budgets are valid; the first LLM call is.** This
+is the same lifecycle point where a below-minimum plafond has been rejected since
+mika#1660 — one setting mistake, one place it surfaces.
+
+Raising the plafond alone is the tempting move and the wrong one. It is also worth
+knowing that a raised plafond makes a *failing* call proportionally more expensive
+(a successful one is unaffected — a plafond is a plafond); Mika bounds that by
+allowing at most `floor(envelope / plafond)` attempts, so a failure can never
+overflow the envelope it runs in.
+
+**Per-agent form.** Both live in `~/.mika/agents/<name>/config.toml` as
+`llm_http_timeout_secs` and `agent_total_timeout_secs`, alongside `llm_provider`
+and the per-provider model keys. That is the granularity the problem has: a
+fleet-wide env var cannot give a slow reasoning agent a different geometry from a
+fast one. The shipped fleet default is 120/300; `mika-arch` ships at 240/900,
+derived from its measured latency distribution.
 | `MIKA_SPIRIT_URL` | No | mika-spirit URL for dashboard CLI commands (default: `http://localhost:8080`) |
 | `MIKA_GATEWAY_URL` | No | mika-gateway URL for webhook DLQ CLI commands (default: `http://localhost:3001`) |
 | `MIKA_REMOTE_AGENT_URL` | No | Cloud Mika gateway A2A endpoint for `mika ask` remote mode (e.g., `https://gw.example.com/a2a/{customer_id}/{agent}`). When set, `mika ask` bypasses the local agent loop and proxies to the cloud agent. `--remote <URL>` flag overrides. Auth via `MIKA_INTERNAL_TOKEN`. |

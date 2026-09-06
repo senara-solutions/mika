@@ -1830,6 +1830,11 @@ Rules:
                 Some(kg_phase),
                 None,
                 None,
+                // system_prompt_bytes / request_bytes (mika#1217, mika#2189):
+                // both NULL. This is a batch NER call, not an agent turn — it
+                // runs under no agent envelope, so the size-vs-expiry axis
+                // those columns serve has nothing to correlate here.
+                None,
                 None,
             )
             .await

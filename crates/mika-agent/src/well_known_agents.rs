@@ -1385,6 +1385,22 @@ llm_provider = "openrouter"
 openrouter_model = "moonshotai/kimi-k2.5"
 llm_max_tokens = 8192
 log_level = "info"
+
+# Timeout budgets (mika#2189 D4). The fleet stays at the shipped 120/300; only
+# mika-arch is retuned, because only mika-arch's measured distribution needs it.
+#
+# Derived from the 7-day measurement ending 2026-09-05 (plan § M4): successful
+# mika-arch calls run p99 = 191 s, max = 233 s, and a pass consumes 3.1 calls on
+# average. A 120 s per-call plafond therefore cut the top of a distribution that
+# routinely exceeded it — 171 of 209 fleet failures landed on exactly 240 s,
+# which is two attempts at the plafond, not provider variance.
+#
+# 240 s covers the observed max with margin; 900 s leaves room for the three
+# calls a pass actually makes plus its tool time. The containment invariant
+# (240 < 900) is checked at provider construction, so a later edit that inverts
+# them fails loudly rather than starving the loop.
+llm_http_timeout_secs = 240
+agent_total_timeout_secs = 900
 "#;
 
 // MIKA_ARCH_IDENTITY is no longer a static const — see build_mika_arch_identity()

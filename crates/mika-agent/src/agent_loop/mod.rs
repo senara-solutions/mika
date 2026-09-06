@@ -497,6 +497,12 @@ async fn attempt_continuation_turn(
         remaining,
     );
 
+    // mika#2189 D5: measured before the call, for the same reason as in
+    // `run_loop` — this site has TWO failure arms (provider error and the
+    // deadline-clamp timeout), and both would otherwise record a call whose
+    // brief size is unrecoverable.
+    let request_bytes = Some(request.payload_bytes() as i64);
+
     let llm_call_start = std::time::Instant::now();
     let continuation = tokio::time::timeout(
         continuation_timeout,
@@ -527,6 +533,7 @@ async fn attempt_continuation_turn(
                 latency_ms,
                 prompt_variant,
                 Some(system_prompt_original_len as i64),
+                request_bytes,
                 store_llm_calls,
             )
             .await;
@@ -563,6 +570,7 @@ async fn attempt_continuation_turn(
                 latency_ms,
                 prompt_variant,
                 Some(system_prompt_original_len as i64),
+                request_bytes,
                 store_llm_calls,
             )
             .await;
@@ -595,6 +603,7 @@ async fn attempt_continuation_turn(
                 latency_ms,
                 prompt_variant,
                 Some(system_prompt_original_len as i64),
+                request_bytes,
                 store_llm_calls,
             )
             .await;
@@ -639,6 +648,7 @@ async fn save_continuation_llm_call(
     latency_ms: u64,
     prompt_variant: Option<&str>,
     system_prompt_bytes: Option<i64>,
+    request_bytes: Option<i64>,
     store_llm_calls: bool,
 ) {
     // Emit turn_usage log FIRST and unconditionally (R2/D2 — decoupled from
@@ -701,6 +711,7 @@ async fn save_continuation_llm_call(
             None,
             None,
             system_prompt_bytes,
+            request_bytes,
         )
         .await
     {
@@ -1042,6 +1053,12 @@ async fn run_loop(
             system.push_str(nudge);
         }
 
+        // mika#2189 D5: measured BEFORE the call, because the failure this
+        // closes is on the error path — a call that times out returns no usage
+        // and, until v53, left `input_tokens = 0` as its only record of how big
+        // the brief was. Taken here, the number survives the timeout.
+        let request_bytes = Some(request.payload_bytes() as i64);
+
         let llm_call_start = std::time::Instant::now();
         let llm_result = llm
             .send_message_with_deadline(request, Some(deadline.into()))
@@ -1084,6 +1101,7 @@ async fn run_loop(
                             response_text.as_deref(),
                             reasoning_text.as_deref(),
                             Some(system_prompt_len as i64),
+                            request_bytes,
                         )
                         .await
                     {
@@ -1111,6 +1129,7 @@ async fn run_loop(
                             None,
                             None,
                             Some(system_prompt_len as i64),
+                            request_bytes,
                         )
                         .await
                     {
@@ -3142,8 +3161,10 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
         span.record("correlated_task_id", task_id.as_str());
     }
 
-    let deadline =
-        Instant::now() + Duration::from_secs(crate::planning::policy::AGENT_TOTAL_TIMEOUT_SECS);
+    let deadline = Instant::now()
+        + Duration::from_secs(crate::planning::policy::agent_total_timeout_secs(
+            params.llm,
+        ));
     let result = run_agent_inner(params, &trace_id, deadline, scope_task_id.as_deref())
         .instrument(span)
         .await;
@@ -3981,8 +4002,10 @@ pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<()> {
         trigger = %trigger_label,
     );
 
-    let deadline =
-        Instant::now() + Duration::from_secs(crate::planning::policy::AGENT_TOTAL_TIMEOUT_SECS);
+    let deadline = Instant::now()
+        + Duration::from_secs(crate::planning::policy::agent_total_timeout_secs(
+            params.llm,
+        ));
     run_silent_inner(params, deadline)
         .instrument(silent_span)
         .await
@@ -4739,8 +4762,8 @@ pub struct TeamAgentParams<'a> {
 /// - Returns `Some(text)` when the assistant produced a text response,
 ///   or `None` for tool-use-only turns.
 pub async fn run_team_agent(params: &TeamAgentParams<'_>) -> Result<TeamAgentOutcome> {
-    let deadline =
-        Instant::now() + Duration::from_secs(crate::planning::policy::TEAM_AGENT_TIMEOUT_SECS);
+    let deadline = Instant::now()
+        + Duration::from_secs(crate::planning::policy::team_agent_timeout_secs(params.llm));
     run_team_agent_inner(params, deadline).await
 }
 

@@ -18,6 +18,93 @@ pub struct LlmRequest {
     pub thinking: Option<ThinkingConfig>,
 }
 
+impl LlmRequest {
+    /// Total payload size of this request in bytes (mika#2189 D5).
+    ///
+    /// # What it counts, and why that is the honest boundary
+    ///
+    /// The sum of every **caller-supplied byte** the request carries: the
+    /// system prompt, every message's text and tool-call arguments and
+    /// tool-result content, base64 image data, and each tool definition's
+    /// name, description and JSON-schema. It deliberately does **not** count
+    /// the JSON envelope a provider adapter will wrap around them — key names,
+    /// braces, escaping — because that overhead is provider-specific and this
+    /// number must stay comparable across the openrouter, Anthropic and Ollama
+    /// rails that mika#2189's measurement spans.
+    ///
+    /// It is therefore a lower bound on the wire size, not the wire size. The
+    /// axis it serves (does a bigger brief expire more often?) needs a
+    /// *monotonic* measure, not an exact one — and a measure that changed
+    /// meaning per provider would be worse than none.
+    ///
+    /// # Why walk the structure instead of serializing
+    ///
+    /// `LlmRequest` is not `Serialize`, and making it so purely to `to_string`
+    /// it on **every** call would allocate a full copy of the largest object in
+    /// the turn just to read its length — on the very path this ticket exists
+    /// to stop overrunning its budget. This walk allocates nothing except for
+    /// tool-call arguments, whose `serde_json::Value` has no length without
+    /// rendering.
+    pub fn payload_bytes(&self) -> usize {
+        fn value_bytes(v: &Value) -> usize {
+            // A `Value` has no length until it is rendered. Falling back to 0
+            // on a serialization error would silently under-report a large
+            // arguments blob; that failure is not reachable for the `Value`s
+            // the tool layer produces, but the fallback is stated rather than
+            // implied.
+            serde_json::to_string(v).map(|s| s.len()).unwrap_or(0)
+        }
+
+        fn tool_result_bytes(c: &LlmToolResultContent) -> usize {
+            match c {
+                LlmToolResultContent::Text(t) => t.len(),
+                LlmToolResultContent::Blocks(blocks) => blocks
+                    .iter()
+                    .map(|b| match b {
+                        LlmToolResultBlock::Text(t) => t.len(),
+                        LlmToolResultBlock::Image(img) => img.data.len() + img.media_type.len(),
+                    })
+                    .sum(),
+            }
+        }
+
+        let system = self.system.as_ref().map_or(0, String::len);
+
+        let messages: usize = self
+            .messages
+            .iter()
+            .map(|m| match &m.content {
+                LlmContent::Text(t) => t.len(),
+                LlmContent::Blocks(blocks) => blocks
+                    .iter()
+                    .map(|b| match b {
+                        LlmContentBlock::Text(t) => t.len(),
+                        LlmContentBlock::Image(img) => img.data.len() + img.media_type.len(),
+                        LlmContentBlock::ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        } => id.len() + name.len() + value_bytes(arguments),
+                        LlmContentBlock::ToolResult {
+                            tool_call_id,
+                            content,
+                            ..
+                        } => tool_call_id.len() + tool_result_bytes(content),
+                    })
+                    .sum(),
+            })
+            .sum();
+
+        let tools: usize = self.tools.as_ref().map_or(0, |defs| {
+            defs.iter()
+                .map(|d| d.name.len() + d.description.len() + value_bytes(&d.parameters))
+                .sum()
+        });
+
+        system + messages + tools
+    }
+}
+
 /// A message in the LLM conversation.
 #[derive(Debug, Clone)]
 pub struct LlmMessage {
@@ -264,6 +351,125 @@ pub fn response_content_to_blocks(content: &[LlmResponseContent]) -> Vec<LlmCont
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal request carrying only a system prompt and one user message.
+    fn req(system: Option<&str>, messages: Vec<LlmMessage>) -> LlmRequest {
+        LlmRequest {
+            model: "m".into(),
+            system: system.map(str::to_owned),
+            messages,
+            tools: None,
+            max_tokens: 1024,
+            thinking: None,
+        }
+    }
+
+    fn user(text: &str) -> LlmMessage {
+        LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::Text(text.into()),
+        }
+    }
+
+    /// The core property (mika#2189 D5): the measure counts the caller-supplied
+    /// payload and nothing else, so it is comparable across provider rails.
+    #[test]
+    fn payload_bytes_sums_system_and_messages() {
+        assert_eq!(req(None, vec![]).payload_bytes(), 0);
+        assert_eq!(req(Some("abcde"), vec![]).payload_bytes(), 5);
+        assert_eq!(req(Some("abcde"), vec![user("xyz")]).payload_bytes(), 8);
+        assert_eq!(
+            req(None, vec![user("ab"), user("cde")]).payload_bytes(),
+            5,
+            "every message counts, not just the last"
+        );
+    }
+
+    /// Multi-byte text is counted in **bytes**, not chars — the column is named
+    /// `request_bytes` and a French-language brief must not read smaller than an
+    /// English one of the same wire size.
+    #[test]
+    fn payload_bytes_counts_bytes_not_chars() {
+        let r = req(None, vec![user("é")]);
+        assert_eq!(r.payload_bytes(), 2);
+    }
+
+    /// Images are the largest thing a request can carry, and a request that
+    /// carries one is exactly the kind that times out. Excluding them would make
+    /// the size-vs-expiry axis blind to its most extreme cases.
+    #[test]
+    fn payload_bytes_counts_image_data() {
+        let r = req(
+            None,
+            vec![LlmMessage {
+                role: LlmRole::User,
+                content: LlmContent::Blocks(vec![
+                    LlmContentBlock::Text("hi".into()),
+                    LlmContentBlock::Image(LlmImage {
+                        media_type: "image/png".into(), // 9
+                        data: "AAAA".into(),            // 4
+                    }),
+                ]),
+            }],
+        );
+        assert_eq!(r.payload_bytes(), 2 + 9 + 4);
+    }
+
+    /// Tool definitions travel on every single call and dominate a small turn;
+    /// omitting them would under-report the fixed cost each request pays.
+    #[test]
+    fn payload_bytes_counts_tool_definitions() {
+        let schema = serde_json::json!({"type": "object"});
+        let schema_len = serde_json::to_string(&schema).unwrap().len();
+        let mut r = req(None, vec![]);
+        r.tools = Some(vec![LlmToolDefinition {
+            name: "search".into(),      // 6
+            description: "Find".into(), // 4
+            parameters: schema,
+        }]);
+        assert_eq!(r.payload_bytes(), 6 + 4 + schema_len);
+    }
+
+    /// Tool results are where a long agent turn actually grows — a turn at step
+    /// 15 is mostly accumulated tool output, which is the mechanism by which a
+    /// pass drifts over its plafond.
+    #[test]
+    fn payload_bytes_counts_tool_calls_and_results() {
+        let args = serde_json::json!({"q": "x"});
+        let args_len = serde_json::to_string(&args).unwrap().len();
+        let r = req(
+            None,
+            vec![
+                LlmMessage {
+                    role: LlmRole::Assistant,
+                    content: LlmContent::Blocks(vec![LlmContentBlock::ToolCall {
+                        id: "id1".into(),      // 3
+                        name: "search".into(), // 6
+                        arguments: args,
+                    }]),
+                },
+                LlmMessage {
+                    role: LlmRole::Tool,
+                    content: LlmContent::Blocks(vec![LlmContentBlock::ToolResult {
+                        tool_call_id: "id1".into(),                           // 3
+                        content: LlmToolResultContent::Text("result".into()), // 6
+                        is_error: false,
+                    }]),
+                },
+            ],
+        );
+        assert_eq!(r.payload_bytes(), 3 + 6 + args_len + 3 + 6);
+    }
+
+    /// Monotonicity is the property the axis actually rests on: a strictly
+    /// larger brief must never measure smaller. Exactness is not claimed (the
+    /// JSON envelope is excluded on purpose); ordering is.
+    #[test]
+    fn payload_bytes_is_monotonic_in_content() {
+        let small = req(Some("sys"), vec![user("a")]);
+        let large = req(Some("sys"), vec![user("a"), user("bbbbbbbbbb")]);
+        assert!(large.payload_bytes() > small.payload_bytes());
+    }
 
     #[test]
     fn test_tool_definition_roundtrip() {
