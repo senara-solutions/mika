@@ -179,6 +179,10 @@
   color: "d97706"
   description: "PR created by dispatch-lib wip-rescue recovery (mika#1282)"
 
+- name: human-review-required
+  color: "d93f0b"
+  description: "wip-rescue: le démon a bailé vers un humain (conflit/erreur), à résoudre à la main"
+
 - name: rescue-after-review
   color: "b60205"
   description: "rescue net committed after this PR was opened; an earlier approval no longer covers it (mika#2151)"

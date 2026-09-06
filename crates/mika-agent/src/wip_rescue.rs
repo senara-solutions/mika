@@ -24,11 +24,20 @@
 //!   ref) runs before the live rebase. If the deploy host's git predates 2.38
 //!   (no `--write-tree`), we **fail closed** — bail-to-human rather than fall
 //!   back to a mutating rebase that would skip the dry-run (F3).
-//! - **Bail-to-human is terminal.** Any uncertain condition (rebase conflict,
-//!   clippy errors, un-draft failure, depth exhausted) adds the
-//!   `human-review-required` label + a PR comment naming the reason and ENDS
-//!   the chain. The draft is preserved; a human decides. No further
-//!   auto-attempts (AC3).
+//! - **Bail-to-human is terminal, and terminal does not depend on GitHub
+//!   (mika#2199).** Any uncertain condition (rebase conflict, clippy errors,
+//!   un-draft failure, depth exhausted) writes a durable `audit_events` marker
+//!   keyed by PR — **unconditionally, before any GitHub call** — and only then
+//!   tries to park the PR with the `human-review-required` label + a comment
+//!   naming the reason. The marker is what the eligibility filter reads, so a
+//!   bail whose label write fails still excludes the draft from the next scan.
+//!   Before mika#2199 the label was the sole exclusion and its failure was
+//!   swallowed: the daemon re-elected the same oldest draft every tick — 17
+//!   bails traced on 2026-09-05, **14 of them on PR #2197 alone** between 09:43
+//!   and 16:05, with one `wip_rescue_error` each. (Counts are deduplicated:
+//!   every line of the spirit log is written twice, so the raw greps read
+//!   double.) The draft is preserved; a human decides. No further auto-attempts
+//!   (AC3).
 //! - **Perimeter gate is authoritative (AC4/AC5).** Every draft — even a
 //!   one-line diff — is classified by the mika#1831 perimeter classifier
 //!   ([`crate::perimeter`]). A DECISION-CORE draft is un-drafted **with** a
@@ -72,6 +81,41 @@ const WIP_RESCUE_LABEL: &str = "wip-rescue";
 
 /// Terminal escalation label applied by [`bail_to_human`].
 const HUMAN_REVIEW_LABEL: &str = "human-review-required";
+
+/// Colour + description used when the daemon has to create
+/// [`HUMAN_REVIEW_LABEL`] itself (mika#2199 §4.1). Both are taken verbatim from
+/// the label GitHub already accepted, so a `label create` here cannot introduce
+/// a value the API refuses. The description is 82 characters — the 100-char
+/// ceiling has bitten this repo twice (mika#2130, mika#2168).
+const HUMAN_REVIEW_LABEL_COLOR: &str = "d93f0b";
+const HUMAN_REVIEW_LABEL_DESC: &str =
+    "wip-rescue: le démon a bailé vers un humain (conflit/erreur), à résoudre à la main";
+
+/// `audit_events.tool_name` of the durable per-PR bail marker (mika#2199 §4.2).
+///
+/// Distinct from the `wip_rescue` tool name the other events use: this row is a
+/// *state* marker read by the eligibility filter, not a log of an action, and
+/// counting it must never pick up a `wip_rescue_success` or a resume attempt.
+///
+/// Precedent: `ci_success_handler_processed` (mika#1869) — an audit-durable gate
+/// keyed by PR that survives a process restart. Same `pr:{repo}#{n}` key
+/// convention; no migration, because `audit_events.tool_name` is free-form TEXT.
+const BAILED_MARKER_TOOL: &str = "wip_rescue_bailed";
+
+/// Lower bound for the bail-marker lookup. The bail is terminal by design (the
+/// mika#1852 plan § 4: *"End chain — NO further auto-attempts"*), not a burst
+/// dedup, so the window is the whole audit retention rather than a few seconds.
+///
+/// The real bound is therefore `compact_old_audit_events(90)`
+/// (`server/mod.rs`): a draft still open after 90 days would be re-attempted
+/// **once**. That is not a livelock, and its age is itself the signal that a
+/// human should be looking at it.
+const BAILED_MARKER_SINCE: &str = "1970-01-01T00:00:00Z";
+
+/// `audit_events.target_key` of the bail marker for one PR.
+fn bailed_marker_key(pr_number: u64) -> String {
+    format!("pr:{DEFAULT_REPO}#{pr_number}")
+}
 
 // -- Env-var knobs (three-tier: absent → default, invalid → WARN + default) --
 
@@ -372,7 +416,13 @@ enum ChainOutcome {
     /// Un-drafted (resumed). Carries the route taken for observability.
     Resumed(UndraftRoute),
     /// Escalated to a human with the given reason. Terminal.
-    Bailed(String),
+    ///
+    /// `parked` says whether the GitHub label actually landed. It is reported
+    /// rather than swallowed (mika#2199): a bail that could not park the PR is
+    /// still terminal — the durable marker saw to that — but the operator who
+    /// goes looking for the draft on GitHub will not find the label, so the
+    /// difference has to be visible.
+    Bailed { reason: String, parked: bool },
     /// Not attempted this tick (e.g., no local checkout). Left untouched.
     Skipped(String),
 }
@@ -400,19 +450,12 @@ pub async fn auto_resume_wip_rescue_drafts(
     let threshold = min_age_secs();
     let now = crate::timestamp::now();
 
-    // Eligible = wip-rescue-labelled, not already bailed, older than threshold.
-    // Oldest-first so the most-stale draft is rescued first.
-    let mut eligible: Vec<(i64, DraftPr)> = drafts
-        .into_iter()
-        .filter(|pr| pr.has_label(WIP_RESCUE_LABEL) && !pr.has_label(HUMAN_REVIEW_LABEL))
-        .filter_map(|pr| {
-            let age = draft_age_secs(&pr.created_at, &now)?;
-            (age >= threshold).then_some((age, pr))
-        })
-        .collect();
-    eligible.sort_by(|a, b| b.0.cmp(&a.0));
+    let selected = select_eligible(drafts, &now, threshold, |pr_number| {
+        has_bailed_marker(db, pr_number, trace_id)
+    })
+    .await;
 
-    let Some((age_secs, pr)) = eligible.into_iter().next() else {
+    let Some((age_secs, pr)) = selected else {
         debug!(
             trace_id,
             threshold, "wip_rescue: no eligible drafts this tick"
@@ -439,13 +482,92 @@ pub async fn auto_resume_wip_rescue_drafts(
             .await;
             Some(1)
         }
-        ChainOutcome::Bailed(reason) => {
-            info!(pr_number = pr.number, reason = %reason, trace_id, "wip_rescue: bailed");
+        ChainOutcome::Bailed { reason, parked } => {
+            info!(pr_number = pr.number, reason = %reason, parked, trace_id, "wip_rescue: bailed");
             Some(0)
         }
         ChainOutcome::Skipped(reason) => {
             debug!(pr_number = pr.number, reason = %reason, trace_id, "wip_rescue_skipped");
             Some(0)
+        }
+    }
+}
+
+/// Pick the draft this tick should work on: `wip-rescue`-labelled, not carrying
+/// [`HUMAN_REVIEW_LABEL`], older than `threshold`, oldest first — and **not
+/// already bailed** (mika#2199 AC2).
+///
+/// The bail check is the whole point. The other three predicates are pure
+/// functions of the `gh` payload; this one asks the durable marker, which is why
+/// `is_bailed` is injected: it makes the selection falsifiable without a
+/// database, and lets a test supply the always-false predicate that reproduces
+/// `main`'s livelock.
+///
+/// It is consulted **in age order with a short-circuit on the first non-bailed
+/// candidate**, not eagerly over the whole list. Nominal cost is therefore one
+/// read per 5-minute tick; the upper bound is the list length, itself capped at
+/// 100 by the `--limit 100` on [`list_wip_rescue_drafts`].
+///
+/// Because the marker is read during filtering rather than between ticks, a
+/// parked draft disappears from the candidate set **on the same tick** and the
+/// next draft is returned immediately. mika#2199 only required the following
+/// tick; this falls out of the shape of the code rather than widening the scope.
+///
+/// The predicate is async (the plan sketched it as `&dyn Fn(u64) -> bool`)
+/// because the real one is a DB read: a synchronous signature would have forced
+/// either a blocking read or the eager fan-out the cost bound above rules out.
+async fn select_eligible<F, Fut>(
+    drafts: Vec<DraftPr>,
+    now: &str,
+    threshold: i64,
+    is_bailed: F,
+) -> Option<(i64, DraftPr)>
+where
+    F: Fn(u64) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let mut ranked: Vec<(i64, DraftPr)> = drafts
+        .into_iter()
+        .filter(|pr| pr.has_label(WIP_RESCUE_LABEL) && !pr.has_label(HUMAN_REVIEW_LABEL))
+        .filter_map(|pr| {
+            let age = draft_age_secs(&pr.created_at, now)?;
+            (age >= threshold).then_some((age, pr))
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.0.cmp(&a.0));
+
+    for (age, pr) in ranked {
+        if !is_bailed(pr.number).await {
+            return Some((age, pr));
+        }
+        debug!(
+            pr_number = pr.number,
+            reason = "already_bailed",
+            "wip_rescue_skipped"
+        );
+    }
+    None
+}
+
+/// Whether a durable bail marker exists for this PR (mika#2199 §4.2).
+///
+/// **Fail-closed**: an unreadable audit trail reads as *already bailed*. This
+/// inverts `ci_success_handler`'s fail-open policy on the same primitive, and
+/// the inversion is the point — there, fail-open protects a legitimate merge;
+/// here the arbitrage runs the other way and costs nothing. A PR that has bailed
+/// is by definition destined for a human: excluding it wrongly loses no work (it
+/// stays open, labelled, commented), while re-attempting it in a loop costs the
+/// entire queue.
+async fn has_bailed_marker(db: &AsyncDatabase, pr_number: u64, trace_id: &str) -> bool {
+    let key = bailed_marker_key(pr_number);
+    match db
+        .count_recent_audit_events_for_target(BAILED_MARKER_TOOL, &key, BAILED_MARKER_SINCE)
+        .await
+    {
+        Ok(count) => count > 0,
+        Err(e) => {
+            warn!(pr_number, error = %e, trace_id, "wip_rescue_error");
+            true
         }
     }
 }
@@ -792,7 +914,14 @@ fn resolve_repo_dir() -> Option<PathBuf> {
     path.is_dir().then_some(path)
 }
 
-/// Bail-to-human: label + comment + structured event; terminal (AC3).
+/// Bail-to-human: durable marker, then label + comment + structured event;
+/// terminal (AC3).
+///
+/// The order is load-bearing (mika#2199). The marker is written **first and
+/// unconditionally**, because it is the only exclusion that does not travel over
+/// the network: everything below it can fail, and the draft is still out of the
+/// next scan. The label is the second route, kept because it is where the human
+/// who must pick the draft up will look for it.
 async fn bail_to_human(
     token: &str,
     trace_id: &str,
@@ -803,28 +932,23 @@ async fn bail_to_human(
 ) -> ChainOutcome {
     warn!(pr_number, reason = %reason, trace_id, "wip_rescue_bail_to_human");
 
-    if let Err(e) = gh(
-        &[
-            "pr",
-            "edit",
-            &pr_number.to_string(),
-            "--repo",
-            DEFAULT_REPO,
-            "--add-label",
-            HUMAN_REVIEW_LABEL,
-        ],
-        token,
-    )
-    .await
-    {
-        warn!(pr_number, error = %e, trace_id, "wip_rescue_error");
-    }
+    mark_bailed(db, session_id, pr_number, trace_id, &reason).await;
 
+    let parked = apply_human_review_label(token, pr_number, trace_id).await;
+
+    // The comment must not promise a re-arm gesture that no longer works.
+    // Until mika#2199 the label WAS the eligibility gate, so removing it did
+    // re-arm the scan. The gate is now the durable marker, which nothing
+    // clears; telling a human to remove the label would send them to do
+    // something with no effect — and on a `parked = false` bail the label they
+    // are told to remove was never applied in the first place.
     let comment = format!(
         "Auto-resume (wip-rescue, mika#1852) stopped and handed this PR to a \
-         human.\n\n**Reason:** `{reason}`\n\nNo further auto-attempts will be \
-         made. Resolve the condition above, then remove the \
-         `{HUMAN_REVIEW_LABEL}` label to re-arm the scan."
+         human.\n\n**Reason:** `{reason}`\n\nThis draft is now permanently out \
+         of the auto-resume scan (mika#2199): the exclusion is a durable marker, \
+         not the `{HUMAN_REVIEW_LABEL}` label, so removing the label does not \
+         re-arm anything. A human owns this PR from here — finish it by hand, or \
+         close it."
     );
     if let Err(e) = gh(
         &[
@@ -852,7 +976,103 @@ async fn bail_to_human(
         &reason,
     )
     .await;
-    ChainOutcome::Bailed(reason)
+    ChainOutcome::Bailed { reason, parked }
+}
+
+/// Write the durable per-PR bail marker (mika#2199 §4.2).
+///
+/// Best-effort like every other audit write in this module — but note what a
+/// failure here costs: the marker is the exclusion, so a PR whose marker could
+/// not be written falls back to depending on the label alone, which is the
+/// pre-mika#2199 behaviour for that one PR.
+///
+/// It therefore gets its **own** event name rather than the module's shared
+/// `wip_rescue_error`, which is written at eight sites: the one condition that
+/// restores the livelock must not be greppably indistinguishable from a
+/// `gh pr comment` that timed out. Any hit on `wip_rescue_marker_write_failed`
+/// is a PR whose exclusion rests on the label alone.
+async fn mark_bailed(
+    db: &AsyncDatabase,
+    session_id: &str,
+    pr_number: u64,
+    trace_id: &str,
+    reason: &str,
+) {
+    let key = bailed_marker_key(pr_number);
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            BAILED_MARKER_TOOL,
+            &key,
+            None,
+            Some(reason),
+            Some("wip_rescue bail exclusion marker (mika#2199)"),
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(pr_number, error = %e, trace_id, "wip_rescue_marker_write_failed");
+    }
+}
+
+/// Park the PR on GitHub with [`HUMAN_REVIEW_LABEL`], creating the label when
+/// the repository does not declare it. Returns whether the label is now on the
+/// PR — the caller no longer swallows this (mika#2199 §4.1).
+///
+/// Transposition of the one precedent in this repo, `_stamp_pr_origin`
+/// (`skills/bundled/_shared/dispatch-lib.sh`, mika#2026), whose header states
+/// the pattern: *"a failed edit is retried once behind an idempotent
+/// `label create`"*. The failure it answers is measured, not hypothetical —
+/// every one of the 17 bails traced on 2026-09-05 died on
+/// `gh exit code 1: 'human-review-required' not found`.
+///
+/// This is the runtime half. The durable half is `.github/labels.yml`
+/// (§4.4): without the declaration, `delete-other-labels: true` deletes the
+/// label again on the next push touching that file, and this function would be
+/// re-creating it forever.
+async fn apply_human_review_label(token: &str, pr_number: u64, trace_id: &str) -> bool {
+    let number = pr_number.to_string();
+    let add_label = [
+        "pr",
+        "edit",
+        &number,
+        "--repo",
+        DEFAULT_REPO,
+        "--add-label",
+        HUMAN_REVIEW_LABEL,
+    ];
+
+    if gh(&add_label, token).await.is_ok() {
+        return true;
+    }
+
+    // The likeliest cause is that the repo has no such label. Create it, then
+    // retry once. A `create` that fails because the label already exists is
+    // indistinguishable here from one that fails for want of permission, so its
+    // result is not the verdict — the retry below is.
+    let _ = gh(
+        &[
+            "label",
+            "create",
+            HUMAN_REVIEW_LABEL,
+            "--repo",
+            DEFAULT_REPO,
+            "--color",
+            HUMAN_REVIEW_LABEL_COLOR,
+            "--description",
+            HUMAN_REVIEW_LABEL_DESC,
+        ],
+        token,
+    )
+    .await;
+
+    match gh(&add_label, token).await {
+        Ok(_) => true,
+        Err(e) => {
+            warn!(pr_number, error = %e, trace_id, "wip_rescue_error");
+            false
+        }
+    }
 }
 
 /// Write an `audit_events` row for a wip-rescue action (AC8).
@@ -1140,5 +1360,428 @@ mod tests {
         assert_eq!(first_line("a\nb\nc"), "a");
         assert_eq!(first_line("single"), "single");
         assert_eq!(first_line(""), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2199 — the bail must exclude, and the exclusion must not depend on
+    // a label GitHub may not have.
+    // -----------------------------------------------------------------------
+
+    const TRACE: &str = "00000000000000000000000000002199";
+
+    /// The two drafts of the founding incident: #2197, the oldest, bailed 28
+    /// times between 09:43 and 16:05 without ever being parked, and #2198 which
+    /// only got its turn once #2197 was closed by hand.
+    const OLDEST: u64 = 2197;
+    const NEXT: u64 = 2198;
+    const NOW: &str = "2026-09-05T16:00:00Z";
+    const OLDEST_CREATED: &str = "2026-09-05T09:00:00Z";
+    const NEXT_CREATED: &str = "2026-09-05T12:00:00Z";
+
+    fn draft(number: u64, created_at: &str, labels: &[&str]) -> DraftPr {
+        DraftPr {
+            number,
+            head_ref: format!("wip/{number}"),
+            title: format!("wip(x): {number}"),
+            labels: labels
+                .iter()
+                .map(|n| GhLabel {
+                    name: (*n).to_string(),
+                })
+                .collect(),
+            created_at: created_at.to_string(),
+        }
+    }
+
+    /// The queue of the incident: two `wip-rescue` drafts, neither carrying
+    /// `human-review-required` — because the label write never succeeded.
+    fn incident_queue() -> Vec<DraftPr> {
+        vec![
+            draft(OLDEST, OLDEST_CREATED, &[WIP_RESCUE_LABEL]),
+            draft(NEXT, NEXT_CREATED, &[WIP_RESCUE_LABEL]),
+        ]
+    }
+
+    // -- §4.5(a) selection --
+
+    /// AC2. The oldest draft has bailed; the scan must move on to the next one
+    /// **on this tick**, not stay on a PR it cannot park.
+    #[tokio::test]
+    async fn a_bailed_draft_is_not_re_elected_and_the_scan_advances() {
+        let selected =
+            select_eligible(incident_queue(), NOW, 900, |n| async move { n == OLDEST }).await;
+
+        assert_eq!(
+            selected.map(|(_, pr)| pr.number),
+            Some(NEXT),
+            "the marked draft must drop out of the candidate set and the next \
+             one be returned in the same pass"
+        );
+    }
+
+    /// The negative control the whole test rests on: with a predicate that
+    /// always answers `false` — which is exactly `main`, where nothing consults
+    /// a bail marker because there is none — the same input re-elects the same
+    /// draft, tick after tick. If this ever passes on `main`, the test above
+    /// measures nothing.
+    #[tokio::test]
+    async fn without_the_marker_the_same_draft_is_re_elected_forever() {
+        for tick in 0..3 {
+            let selected = select_eligible(incident_queue(), NOW, 900, |_| async { false }).await;
+            assert_eq!(
+                selected.map(|(_, pr)| pr.number),
+                Some(OLDEST),
+                "tick {tick}: this is the livelock — the oldest draft is \
+                 returned again and the queue never advances"
+            );
+        }
+    }
+
+    /// Every candidate bailed → nothing to do. The distinction matters: an empty
+    /// selection here means the queue is genuinely drained, not blocked.
+    #[tokio::test]
+    async fn all_bailed_selects_nothing() {
+        let selected = select_eligible(incident_queue(), NOW, 900, |_| async { true }).await;
+        assert!(selected.is_none());
+    }
+
+    /// The marker is an addition, not a replacement: the label exclusion, the
+    /// `wip-rescue` requirement and the age threshold all still hold.
+    #[tokio::test]
+    async fn the_pre_existing_predicates_are_unchanged() {
+        // Already parked on GitHub → excluded even with no marker.
+        let parked = vec![draft(
+            OLDEST,
+            OLDEST_CREATED,
+            &[WIP_RESCUE_LABEL, HUMAN_REVIEW_LABEL],
+        )];
+        assert!(
+            select_eligible(parked, NOW, 900, |_| async { false })
+                .await
+                .is_none()
+        );
+
+        // Not a wip-rescue draft → never a candidate.
+        let unrelated = vec![draft(OLDEST, OLDEST_CREATED, &["p1-important"])];
+        assert!(
+            select_eligible(unrelated, NOW, 900, |_| async { false })
+                .await
+                .is_none()
+        );
+
+        // Younger than the threshold → waits.
+        let fresh = vec![draft(NEXT, "2026-09-05T15:59:00Z", &[WIP_RESCUE_LABEL])];
+        assert!(
+            select_eligible(fresh, NOW, 900, |_| async { false })
+                .await
+                .is_none()
+        );
+    }
+
+    /// Fail-closed (§4.2): an unreadable audit trail reads as *already bailed*.
+    /// A closed database is the cheapest way to make the read fail for real
+    /// rather than mock the failure.
+    #[tokio::test]
+    async fn an_unreadable_audit_trail_excludes_the_draft() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        db.conn.execute_batch("DROP TABLE audit_events").unwrap();
+        let db = AsyncDatabase::new(db);
+
+        assert!(
+            has_bailed_marker(&db, OLDEST, TRACE).await,
+            "a PR that has bailed is destined for a human; excluding it wrongly \
+             loses nothing, re-attempting it in a loop costs the whole queue"
+        );
+    }
+
+    // -- §4.5(b) end-to-end replay against a failing `gh` --
+    //
+    // `run_gh_subprocess` resolves `gh` through `PATH` and `scrub_mika_env_vars`
+    // removes only `MIKA_*` and `GH_TOKEN`, so a fake `gh` at the head of `PATH`
+    // reproduces the exact production failure. The scenarios are named after
+    // `test_stamp_pr_origin.sh` (`nominal`, `needs-label`).
+    //
+    // The fake must not communicate through any `MIKA_`-prefixed variable — they
+    // are purged before the exec — so its tempdir is baked into the script.
+
+    // What `#[serial_test::serial]` does and does not buy here, stated plainly
+    // because the obvious reading is wrong: it serialises these tests against
+    // *other `#[serial]` tests*, not against the whole binary. Tests without the
+    // attribute still run in parallel, so `PATH` is mutated under them. Two
+    // residual exposures follow, and both are bounded rather than eliminated:
+    //
+    //  1. `std::env::set_var` is `unsafe` in edition 2024 precisely because a
+    //     concurrent `getenv` is a data race. Nothing in this crate's test set
+    //     reads `PATH` on a hot path, and the window is a few milliseconds.
+    //  2. During that window a parallel test that spawns `gh` would find the
+    //     fake. Only `run_gh_subprocess` resolves `gh`, and its own unit tests
+    //     do not spawn — but this is a real property of the harness, not a
+    //     thing the attribute rules out.
+    //
+    // The plan (§4.5) anticipated this: if it ever proves flaky in CI, the
+    // §4.5(a) selection tests are the non-negotiable deliverable and these three
+    // degrade to a hand-run script.
+
+    struct PathGuard(Option<std::ffi::OsString>);
+
+    impl Drop for PathGuard {
+        fn drop(&mut self) {
+            // SAFETY: see the module-level note above — bounded, not absent.
+            unsafe {
+                match self.0.take() {
+                    Some(prev) => std::env::set_var("PATH", prev),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+        }
+    }
+
+    /// Put `dir` at the head of `PATH` for the lifetime of the returned guard.
+    fn prepend_to_path(dir: &Path) -> PathGuard {
+        let previous = std::env::var_os("PATH");
+        let mut next = std::ffi::OsString::from(dir);
+        if let Some(prev) = &previous {
+            next.push(":");
+            next.push(prev);
+        }
+        // SAFETY: see the module-level note above — bounded, not absent.
+        unsafe { std::env::set_var("PATH", &next) };
+        PathGuard(previous)
+    }
+
+    fn install_fake_gh(dir: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("gh");
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// `needs-label`: `pr edit --add-label` fails with the production error
+    /// until the label exists; `label create` creates it.
+    fn needs_label_script(dir: &Path) -> String {
+        let d = dir.display();
+        format!(
+            "#!/bin/sh\n\
+             echo \"$*\" >> {d}/calls.log\n\
+             if [ \"$1 $2\" = \"label create\" ]; then : > {d}/label-exists; exit 0; fi\n\
+             if [ \"$1 $2\" = \"pr edit\" ]; then\n\
+             \x20 if [ -f {d}/label-exists ]; then exit 0; fi\n\
+             \x20 echo \"'{HUMAN_REVIEW_LABEL}' not found\" >&2; exit 1\n\
+             fi\n\
+             exit 0\n"
+        )
+    }
+
+    /// `nominal`: the label is already declared, every call succeeds.
+    fn nominal_script(dir: &Path) -> String {
+        let d = dir.display();
+        format!("#!/bin/sh\necho \"$*\" >> {d}/calls.log\nexit 0\n")
+    }
+
+    /// Everything GitHub refuses — the token cannot create a label either.
+    fn hostile_script(dir: &Path) -> String {
+        let d = dir.display();
+        format!("#!/bin/sh\necho \"$*\" >> {d}/calls.log\necho boom >&2\nexit 1\n")
+    }
+
+    fn calls(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join("calls.log")).unwrap_or_default()
+    }
+
+    fn bail_db() -> AsyncDatabase {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        db.create_session("test-session", "mika", "cli").unwrap();
+        AsyncDatabase::new(db)
+    }
+
+    /// AC1/AC3 `needs-label`: the label is missing, so the daemon creates it and
+    /// retries — the sequence `_stamp_pr_origin` (mika#2026) already uses.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn bail_creates_the_missing_label_then_parks_the_pr() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_fake_gh(tmp.path(), &needs_label_script(tmp.path()));
+        let _path = prepend_to_path(tmp.path());
+        let db = bail_db();
+
+        let outcome = bail_to_human(
+            "token",
+            TRACE,
+            "test-session",
+            &db,
+            OLDEST,
+            "rebase-conflict-on-main".to_string(),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, ChainOutcome::Bailed { parked: true, .. }),
+            "got {outcome:?} — the retry behind `label create` must park the PR"
+        );
+        let log = calls(tmp.path());
+        assert!(
+            log.contains(&format!("label create {HUMAN_REVIEW_LABEL}")),
+            "the missing label must be created, not given up on: {log}"
+        );
+        assert_eq!(
+            log.matches("pr edit").count(),
+            2,
+            "one attempt before the create and one after: {log}"
+        );
+        assert!(has_bailed_marker(&db, OLDEST, TRACE).await);
+    }
+
+    /// `nominal`: when the label already exists the first edit succeeds and the
+    /// daemon does not touch the label registry at all.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_declared_label_needs_no_creation() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_fake_gh(tmp.path(), &nominal_script(tmp.path()));
+        let _path = prepend_to_path(tmp.path());
+        let db = bail_db();
+
+        let outcome = bail_to_human(
+            "token",
+            TRACE,
+            "test-session",
+            &db,
+            OLDEST,
+            "clippy-errors-need-human".to_string(),
+        )
+        .await;
+
+        assert!(matches!(outcome, ChainOutcome::Bailed { parked: true, .. }));
+        let log = calls(tmp.path());
+        assert!(!log.contains("label create"), "nothing to create: {log}");
+        assert_eq!(log.matches("pr edit").count(), 1, "{log}");
+    }
+
+    /// AC2, end to end. GitHub refuses everything — including the label
+    /// creation, the risk named in §8 of the plan. The bail is still terminal,
+    /// and the next scan elects the *next* draft. This is the replay the ticket
+    /// asks for: on `main` this loops, here it advances.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_bail_that_cannot_park_the_pr_still_excludes_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_fake_gh(tmp.path(), &hostile_script(tmp.path()));
+        let _path = prepend_to_path(tmp.path());
+        let db = bail_db();
+
+        let outcome = bail_to_human(
+            "token",
+            TRACE,
+            "test-session",
+            &db,
+            OLDEST,
+            "rebase-conflict-on-main".to_string(),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, ChainOutcome::Bailed { parked: false, .. }),
+            "got {outcome:?} — a failed parking must be reported, not swallowed"
+        );
+        assert!(
+            has_bailed_marker(&db, OLDEST, TRACE).await,
+            "the durable marker is written before any GitHub call, precisely so \
+             that GitHub failing changes nothing about the exclusion"
+        );
+
+        let selected = select_eligible(incident_queue(), NOW, 900, |n| {
+            has_bailed_marker(&db, n, TRACE)
+        })
+        .await;
+        assert_eq!(
+            selected.map(|(_, pr)| pr.number),
+            Some(NEXT),
+            "the queue must advance even though the label never landed"
+        );
+    }
+
+    // -- §4.4 label registry (AC4) --
+
+    /// The labels this module writes must be declared in `.github/labels.yml`.
+    ///
+    /// `label-sync` runs with `delete-other-labels: true`, so a label created by
+    /// hand — or by [`apply_human_review_label`] at runtime — is deleted again on
+    /// the next push touching that file. This is the third occurrence of the
+    /// class on this repo (`dispatch:ssc`, then `operator-review`/`blocked`),
+    /// and prose has not stopped it twice; reading the declaration file does.
+    ///
+    /// The assertions are on the **constants**, never on copied literals: a name
+    /// typed out here would be a name nothing writes, and the test would stay
+    /// green for ever
+    /// (`docs/solutions/best-practices/a-count-assertion-on-an-event-name-nothing-emits-is-always-green-2026-08-31.md`).
+    ///
+    /// `wip_rescue.rs` handles exactly these two labels and *applies* only one,
+    /// so this guard is exhaustive for the module (AC4's "and the others" is the
+    /// empty set). The equivalent guard for `auto_pull.rs` remains mika#2127 AC2.
+    #[test]
+    fn labels_this_module_writes_are_declared_in_labels_yml() {
+        let yml = include_str!("../../../.github/labels.yml");
+        let declared = |name: &str| yml.contains(&format!("- name: {name}"));
+
+        // Positive control: the guard can see a label that IS declared.
+        assert!(
+            declared(WIP_RESCUE_LABEL),
+            "labels.yml must declare `{WIP_RESCUE_LABEL}`"
+        );
+        // Negative control: a check that answers `true` for everything proves
+        // nothing.
+        assert!(
+            !declared("a-label-nobody-has-ever-declared"),
+            "the guard must be able to detect an undeclared label"
+        );
+
+        assert!(
+            declared(HUMAN_REVIEW_LABEL),
+            "bail_to_human applies `{HUMAN_REVIEW_LABEL}`, which .github/labels.yml \
+             does not declare — `delete-other-labels: true` would prune it on the \
+             next push touching that file, and every bail would fail exactly as \
+             the 17 traced on 2026-09-05 did"
+        );
+    }
+
+    /// GitHub caps a label description at 100 characters; this repo has hit that
+    /// wall twice (mika#2130, mika#2168). The value is used verbatim by
+    /// [`apply_human_review_label`], so a too-long one would make the runtime
+    /// creation fail on the very path that exists to stop a failure.
+    #[test]
+    fn the_label_description_fits_githubs_limit() {
+        let len = HUMAN_REVIEW_LABEL_DESC.chars().count();
+        assert!(len <= 100, "{len} chars, GitHub caps descriptions at 100");
+    }
+
+    /// Two writers create this label — [`apply_human_review_label`] at runtime
+    /// and `label-sync` from `.github/labels.yml` — and they must agree, or each
+    /// push would revert the other's colour and description.
+    ///
+    /// The assertion is scoped to **this label's own block**, not the whole
+    /// file: `d93f0b` is also `calibration-reset`'s colour, so a whole-file
+    /// `contains` would stay green through exactly the drift this test exists
+    /// to catch.
+    #[test]
+    fn the_declared_label_matches_the_one_the_daemon_creates() {
+        let yml = include_str!("../../../.github/labels.yml");
+        let block = yml
+            .split("- name: ")
+            .find(|entry| entry.starts_with(HUMAN_REVIEW_LABEL))
+            .unwrap_or_else(|| {
+                panic!("labels.yml declares no `{HUMAN_REVIEW_LABEL}` entry to check")
+            });
+
+        assert!(
+            block.contains(HUMAN_REVIEW_LABEL_COLOR),
+            "the `{HUMAN_REVIEW_LABEL}` entry must carry colour \
+             `{HUMAN_REVIEW_LABEL_COLOR}`, the one apply_human_review_label \
+             creates it with; entry was:\n{block}"
+        );
+        assert!(
+            block.contains(HUMAN_REVIEW_LABEL_DESC),
+            "the `{HUMAN_REVIEW_LABEL}` entry must carry the same description the \
+             daemon creates the label with; entry was:\n{block}"
+        );
     }
 }
