@@ -31,6 +31,86 @@ use crate::tools::ToolRegistry;
 
 use super::types::action_type;
 
+/// Les deux scans périodiques qui résolvent leur token GitHub via
+/// [`resolve_periodic_scan_token`] (mika#2205).
+///
+/// Chaque variante ne porte qu'une chose : le nom d'événement du WARN émis
+/// quand aucun token n'est résolu. Les deux scans partagent tout le reste.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeriodicScan {
+    AutoPull,
+    WipRescue,
+}
+
+impl PeriodicScan {
+    /// Nom d'événement greppable dans `$MIKA_SPIRIT_LOG_FILE`.
+    fn no_token_event(self) -> &'static str {
+        match self {
+            Self::AutoPull => "auto_pull_no_token",
+            Self::WipRescue => "wip_rescue_no_token",
+        }
+    }
+
+    /// Ce que l'opérateur perd tant que le token manque.
+    fn idle_consequence(self) -> &'static str {
+        match self {
+            Self::AutoPull => "aucune sélection de ticket groomé ne s'exécute",
+            Self::WipRescue => "aucun brouillon wip-rescue n'est repris",
+        }
+    }
+}
+
+/// Résout le token GitHub des deux scans périodiques du dispatcher (mika#2205).
+///
+/// PAT d'abord, puis repli sur un token d'installation GitHub App — c'est-à-dire
+/// exactement [`Settings::resolve_github_token`], le convertisseur canonique que
+/// mika#2013 a déjà posé sur le cycle mika-manager
+/// (`milestone_manager/spawn.rs`). Avant ce correctif les deux scans lisaient
+/// `self.github_token` (le PAT seul, via `Settings::agent_github_token`) : le
+/// 2026-09-05 le PAT a disparu de l'environnement du spirit à ~16:20 et les deux
+/// scans sont morts à la même seconde, alors que le chemin App était sain
+/// (`manager_token_refreshed` jusqu'à 23:17Z, zéro `gh_app_token_exchange_failed`).
+///
+/// # Identité (AC4, ADR-008)
+///
+/// ADR-008 exige l'identité PAT machine **là où GitHub lit l'auteur ou le
+/// reviewer** de l'action — revue et merge de PR, où `mika-qa` approuvant une PR
+/// `mika-dev` sous l'identité App partagée est refusé par GitHub même
+/// (`Review Can not approve your own pull request`). Aucune opération de ces
+/// deux scans n'est de cette forme :
+///
+/// - `auto_pull` — bascule du label `ready` (`gh issue edit`), lectures `gh`.
+/// - `wip_rescue` — rebase, push sur une branche de brouillon, `gh pr ready`,
+///   commentaire de PR.
+///
+/// L'identité bot de l'App est donc acceptable en repli ici. Les chemins qui
+/// **exigent** l'identité machine (revue/merge de PR) ne passent pas par cette
+/// fonction et ne sont pas touchés.
+///
+/// # Fail-safe (AC3)
+///
+/// Ni PAT ni App résolus → `None`, le scan ne fait rien ce tick. C'est le
+/// comportement d'avant ; ce qui change est qu'il le **dit** — WARN au lieu de
+/// DEBUG, parce qu'un scan silencieusement inactif se lit comme un scan qui n'a
+/// rien trouvé à faire.
+async fn resolve_periodic_scan_token(
+    settings: &Settings,
+    github_app: Option<&mika_common::github_app::GitHubApp>,
+    task_id: &str,
+    scan: PeriodicScan,
+) -> Option<String> {
+    let resolved = settings.resolve_github_token(github_app).await;
+    if resolved.is_none() {
+        warn!(
+            task_id = %task_id,
+            event = scan.no_token_event(),
+            "scan inactif : aucun github_token résolu (PAT absent ET App indisponible) ; {}",
+            scan.idle_consequence()
+        );
+    }
+    resolved
+}
+
 /// `metadata.$.delivery_attempts` — consecutive failed delivery attempts on a
 /// callback (mika#2179). Reset by nothing: a delivery that succeeds ends the
 /// row's life as an undelivered callback, so there is no state to clear.
@@ -1046,12 +1126,19 @@ impl TaskDispatcher {
     /// label on the selected ticket. The webhook-driven dispatch flow then
     /// picks up the labelled ticket.
     async fn dispatch_auto_pull_groomed(&self, task: &Task) -> Result<()> {
-        let github_token = match self.github_token.as_deref() {
+        // mika#2205 — PAT d'abord, App en repli. Voir `resolve_periodic_scan_token`
+        // pour le raisonnement d'identité ADR-008 : la bascule du label `ready` ne
+        // lit pas l'auteur, donc l'identité bot de l'App convient ici.
+        let resolved = resolve_periodic_scan_token(
+            &self.settings,
+            self.github_app.as_deref(),
+            &task.id,
+            PeriodicScan::AutoPull,
+        )
+        .await;
+        let github_token = match resolved.as_deref() {
             Some(t) => t,
-            None => {
-                debug!(task_id = %task.id, "auto_pull: no github_token configured, skipping");
-                return Ok(());
-            }
+            None => return Ok(()),
         };
 
         let trace_id = mika_common::trace::generate_trace_id();
@@ -1101,12 +1188,20 @@ impl TaskDispatcher {
     /// concurrency cap of 1 (AC6) is intrinsic: the scan handles one draft per
     /// tick.
     async fn dispatch_wip_rescue(&self, task: &Task) -> Result<()> {
-        let github_token = match self.github_token.as_deref() {
+        // mika#2205 — PAT d'abord, App en repli. Voir `resolve_periodic_scan_token` :
+        // rebase, push de brouillon, `gh pr ready` et commentaire ne sont pas des
+        // opérations dont GitHub lit l'auteur au sens d'ADR-008, donc l'identité bot
+        // de l'App est acceptable en repli.
+        let resolved = resolve_periodic_scan_token(
+            &self.settings,
+            self.github_app.as_deref(),
+            &task.id,
+            PeriodicScan::WipRescue,
+        )
+        .await;
+        let github_token = match resolved.as_deref() {
             Some(t) => t,
-            None => {
-                debug!(task_id = %task.id, "wip_rescue: no github_token configured, skipping");
-                return Ok(());
-            }
+            None => return Ok(()),
         };
 
         let trace_id = mika_common::trace::generate_trace_id();
@@ -3098,6 +3193,133 @@ mod tests {
     impl MessageSender for NoopSender {
         async fn send(&self, _text: &str) -> anyhow::Result<SendOutcome> {
             Ok(SendOutcome::Delivered)
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // mika#2205 — les deux scans périodiques résolvent PAT-first / App-fallback
+    // ---------------------------------------------------------------------
+
+    /// `Settings` sans PAT — la forme exacte du 2026-09-05 après ~16:20.
+    fn settings_without_pat() -> Settings {
+        let mut s = Settings::test_defaults();
+        s.github_token = None;
+        s
+    }
+
+    /// `Settings` avec un PAT — l'identité machine d'ADR-008.
+    fn settings_with_pat(pat: &str) -> Settings {
+        let mut s = Settings::test_defaults();
+        s.github_token = Some(secrecy::SecretString::from(pat.to_string()));
+        s
+    }
+
+    /// AC5 — le cœur du correctif : PAT absent, App saine ⇒ le scan obtient un
+    /// token et tourne. Avant mika#2205 cette résolution rendait `None` et les
+    /// deux scans mouraient à la même seconde que la disparition du PAT.
+    #[tokio::test]
+    async fn mika2205_periodic_scans_fall_back_to_github_app_without_pat() {
+        let app = mika_common::github_app::GitHubApp::new_with_test_token("ghs_app_token").await;
+        let settings = settings_without_pat();
+
+        for scan in [PeriodicScan::AutoPull, PeriodicScan::WipRescue] {
+            let token =
+                resolve_periodic_scan_token(&settings, Some(app.as_ref()), "task-2205", scan).await;
+            assert_eq!(
+                token.as_deref(),
+                Some("ghs_app_token"),
+                "{scan:?} doit emprunter le repli App quand le PAT est absent"
+            );
+        }
+    }
+
+    /// ADR-008 préservé : quand le PAT existe, c'est lui — l'App reste un repli,
+    /// jamais une substitution. Un renversement ici casserait l'identité machine
+    /// distincte sur laquelle reposent revue et merge de PR.
+    #[tokio::test]
+    async fn mika2205_pat_still_wins_over_the_app_fallback() {
+        let app = mika_common::github_app::GitHubApp::new_with_test_token("ghs_app_token").await;
+        let settings = settings_with_pat("ghp_machine_user");
+
+        for scan in [PeriodicScan::AutoPull, PeriodicScan::WipRescue] {
+            let token =
+                resolve_periodic_scan_token(&settings, Some(app.as_ref()), "task-2205", scan).await;
+            assert_eq!(
+                token.as_deref(),
+                Some("ghp_machine_user"),
+                "{scan:?} doit préférer le PAT — l'App n'est qu'un repli (ADR-008)"
+            );
+        }
+    }
+
+    /// AC3 — fail-safe conservé : ni PAT ni App ⇒ pas de token, le scan saute.
+    /// Ce qui change par rapport à avant mika#2205 n'est pas l'issue mais le
+    /// niveau de log (DEBUG → WARN), non observable depuis un test unitaire.
+    #[tokio::test]
+    async fn mika2205_no_pat_and_no_app_still_skips() {
+        let settings = settings_without_pat();
+
+        for scan in [PeriodicScan::AutoPull, PeriodicScan::WipRescue] {
+            let token = resolve_periodic_scan_token(&settings, None, "task-2205", scan).await;
+            assert!(
+                token.is_none(),
+                "{scan:?} doit sauter quand ni PAT ni App ne résolvent"
+            );
+        }
+    }
+
+    /// Les deux WARN portent des noms d'événement distincts : un opérateur qui
+    /// grep `wip_rescue_no_token` ne doit pas récolter les ticks d'`auto_pull`.
+    #[test]
+    fn mika2205_scan_warn_events_are_distinct() {
+        assert_ne!(
+            PeriodicScan::AutoPull.no_token_event(),
+            PeriodicScan::WipRescue.no_token_event()
+        );
+    }
+
+    /// AC1 + AC2, garde structurelle : ni `dispatch_auto_pull_groomed` ni
+    /// `dispatch_wip_rescue` ne doivent relire `self.github_token`.
+    ///
+    /// Les quatre tests ci-dessus prouvent que le **résolveur** fait le bon
+    /// choix ; aucun ne prouve que les deux scans l'appellent. Le défaut de
+    /// mika#2205 n'était pas une mauvaise résolution, c'était un appelant qui ne
+    /// résolvait pas — exactement ce qu'un test du résolveur seul ne voit pas.
+    /// D'où cette garde sur le corps des deux fonctions, dans la forme déjà
+    /// employée par `grooming_marker::tests::no_grooming_regex_outside_this_module`.
+    ///
+    /// Hors périmètre volontaire : le troisième site PAT-seul du fichier, l'appel
+    /// à `try_dispatch_pilot_after_groom_success` (auto-fire après grooming), qui
+    /// passe encore `self.github_token.as_deref()`. Ce chemin mène à une création
+    /// de PR, où l'identité lue par GitHub compte au sens d'ADR-008 ; l'y basculer
+    /// est une décision d'identité distincte, pas un corollaire de ce ticket.
+    #[test]
+    fn mika2205_periodic_scans_do_not_read_the_pat_field_directly() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/task_engine/dispatcher.rs"),
+        )
+        .expect("la garde doit pouvoir lire dispatcher.rs");
+
+        for fn_name in ["dispatch_auto_pull_groomed", "dispatch_wip_rescue"] {
+            let sig = format!("async fn {fn_name}(");
+            let start = src
+                .find(&sig)
+                .unwrap_or_else(|| panic!("{fn_name} doit exister dans dispatcher.rs"));
+            // Le corps court jusqu'à la prochaine méthode de l'impl (indentation 4).
+            let rest = &src[start + sig.len()..];
+            let end = rest.find("\n    async fn ").unwrap_or(rest.len());
+            let body = &rest[..end];
+
+            assert!(
+                !body.contains("self.github_token"),
+                "{fn_name} lit encore self.github_token (PAT seul) — mika#2205 exige \
+                 resolve_periodic_scan_token, sinon un PAT absent tue le scan alors \
+                 que l'App est saine"
+            );
+            assert!(
+                body.contains("resolve_periodic_scan_token"),
+                "{fn_name} doit résoudre son token via resolve_periodic_scan_token"
+            );
         }
     }
 
@@ -5279,8 +5501,21 @@ mod tests {
         );
     }
 
+    /// Périmètre, explicité par mika#2205 : ce test porte sur le **paramètre**
+    /// `github_token` de `try_dispatch_pilot_after_groom_success`, pas sur les
+    /// deux scans périodiques. Il ne verrouille donc pas le comportement que
+    /// mika#2205 corrige, et il reste vrai après ce correctif — les deux scans
+    /// sautent toujours quand *aucun* token ne résout, ils le disent simplement
+    /// plus fort (AC3).
+    ///
+    /// Ce que la lecture initiale du plan mika#2205 avait manqué : l'appelant de
+    /// cette fonction (l'auto-fire après grooming) passe encore
+    /// `self.github_token.as_deref()` et reste donc PAT-seul. C'est un troisième
+    /// site de la même classe, laissé hors périmètre à dessein — il mène à une
+    /// création de PR, où l'identité lue par GitHub compte au sens d'ADR-008.
+    /// Voir `mika2205_periodic_scans_do_not_read_the_pat_field_directly`.
     #[tokio::test]
-    async fn test_auto_fire_skips_without_github_token() {
+    async fn test_auto_fire_skips_when_no_token_is_passed() {
         let db = test_db();
         let (parent_id, callback_id) =
             create_groom_callback_pair(&db, true, Some(TEST_ISSUE_URL)).await;
