@@ -1787,66 +1787,64 @@ _is_dispatchable_repo() {
     return 1
 }
 
-# mika#2178 — rend le texte du ticket (corps ET commentaires) sous une forme
-# injectable dans l'invite d'ouverture du pilote.
+# mika#2178 — render the ticket text (body AND comments) in a form that can be
+# injected into the pilot's opening prompt.
 #
-# Le défaut réparé : `PROMPT` valait exactement `<repo>#<num>`, et claude-pilot
-# assemble son invite par simple concaténation `f"{ns.command} {opening}"`
-# (claude_pilot/cli.py:290 interactif, :251 headless). Sur le chemin
-# plan-callout — celui qu'emprunte tout ticket groomé — l'entrée réelle valait
-# donc `/ce-work docs/plans/x.md mika#N` : ni le corps, ni les commentaires
-# n'atteignaient l'implémenteur. Les sept lecteurs de la variable de corps sont
-# tous internes à ce fichier (dérivation de branche, porte anti-re-groom,
-# détection du callout, sauvetage) et aucun n'écrit dans l'invite — étendre la
-# seule récupération remplirait une variable que personne ne transmet.
+# The defect this repairs: `PROMPT` was exactly `<repo>#<num>`, and claude-pilot
+# builds its opening prompt by plain concatenation, `f"{ns.command} {opening}"`
+# (claude_pilot/cli.py:290 interactive, :251 headless). On the plan-callout path
+# — the one every groomed ticket takes — the pilot's real input was therefore
+# `/ce-work docs/plans/x.md mika#N`: no body, no comments. The seven readers of
+# the issue-body variable are all internal to this file (branch derivation,
+# anti-re-groom gate, callout detection, rescue) and none of them writes into
+# the prompt, so widening the fetch alone would fill a variable nobody forwards.
 #
-# Contrat : lit le JSON de l'issue sur stdin, écrit le bloc rendu sur stdout,
-# rend la CHAÎNE VIDE quand il n'y a ni corps ni commentaire à rendre. Ne lit
-# aucune variable globale et n'ouvre aucun aller-retour réseau — le JSON lui est
-# passé, ce qui garde le helper testable sans jeton ni réseau.
+# Contract: reads the issue JSON on stdin, writes the rendered block on stdout,
+# returns the EMPTY STRING when there is neither a body nor a comment to render.
+# Reads no global and opens no network round trip — the JSON is handed to it,
+# which is what keeps it testable with no token and no network.
 _render_ticket_context() {
     local repo="$1" issue_num="$2"
 
-    # --- Bornes de volume. Chaque valeur est une mesure, pas une préférence. ---
+    # --- Volume bounds. Each value is a measurement, not a preference. ---
     #
-    # corps 16 Kio : les corps groomés mesurés font 3–8 Kio ; 16 Kio rend la
-    #   troncature rare tout en bornant le pire cas.
-    # 10 commentaires : une correction de trajectoire est récente par
-    #   construction — elle réagit à un dispatch mort. La règle « postérieurs au
-    #   dernier callout de grooming » a été écartée : le callout du corps ne
-    #   porte aucune date, donc « postérieur » n'est pas calculable depuis lui.
-    # 4 Kio par commentaire : c'est le plafond qu'ITERATION_CTX applique déjà
-    #   plus bas (`head -c 4096`). Ce fichier garde UNE convention, pas deux.
-    # bloc 16 Kio : dix commentaires à 4 Kio valent 40 Kio ; le plafond global
-    #   rend le pire cas déterministe (≤ 32 Kio de contexte total avec le corps).
-    #   L'éviction part du plus ancien parce que le plus récent porte le plus
-    #   probablement la correction.
+    # body 16 KiB: measured groomed bodies run 3–8 KiB, so truncation stays rare
+    #   while the worst case stays bounded.
+    # 10 comments: a trajectory correction is recent by construction — it reacts
+    #   to a dead dispatch. "Posterior to the last grooming callout" was rejected
+    #   as a rule: the body callout carries no date, so "posterior" is not
+    #   computable from the body. The comment stream is the only dated surface.
+    # 4 KiB per comment: the ceiling ITERATION_CTX already applies below
+    #   (`head -c 4096`). This file keeps ONE convention, not two.
+    # 16 KiB for the comment block: ten comments at 4 KiB would be 40 KiB; the
+    #   block cap makes the worst case deterministic (≤ 32 KiB of total context
+    #   with the body). Eviction starts at the oldest because the most recent
+    #   comment is the one most likely to carry the correction.
     #
-    # Toute omission est DITE. Un contexte silencieusement amputé est le défaut
-    # que ce helper répare, pas un défaut qu'il a le droit de réintroduire.
+    # Every omission is ANNOUNCED. A silently amputated context is the defect
+    # this repairs, not one it is allowed to reintroduce.
     local body_max=16384
     local comment_max=4096
     local block_max=16384
     local keep_max=10
 
-    # Découpe à l'octet SANS pipe, délibérément.
+    # Byte-exact slicing WITHOUT a pipe, deliberately.
     #
-    # `printf '%s' "$x" | head -c N` est l'écriture évidente — c'est celle
-    # qu'ITERATION_CTX utilise plus bas — mais elle tue son écrivain par SIGPIPE
-    # dès que la charge dépasse le tampon de pipe (64 Kio sous Linux) : head
-    # sort après N octets pendant que printf écrit encore. Sous le
-    # `set -euo pipefail` de ce fichier, cela devient une substitution ratée qui
-    # avorte TOUT le dispatch. Un corps d'issue GitHub plafonne à 65 536
-    # CARACTÈRES, donc en UTF-8 bien au-delà de 64 Kio : le cas est atteignable
-    # sur un vrai ticket maximal, pas théorique (même classe que mika#2055).
+    # `printf '%s' "$x" | head -c N` is the obvious spelling — it is the one
+    # ITERATION_CTX uses below — but it kills its writer with SIGPIPE as soon as
+    # the payload exceeds the pipe buffer (64 KiB on Linux): head exits after N
+    # bytes while printf is still writing. Under this file's `set -euo pipefail`
+    # that becomes a failed command substitution and aborts the WHOLE dispatch.
+    # A GitHub issue body caps at 65 536 CHARACTERS, hence well past 64 KiB in
+    # UTF-8: the case is reachable on a real maximal ticket, not theoretical
+    # (same class as mika#2055).
     #
-    # `LC_ALL=C` est ce qui fait compter des OCTETS à `${var:0:n}`, pour que les
-    # bornes ci-dessus disent bien ce que leur marqueur annonce. La variable est
-    # locale et NON exportée : les processus fils gardent la locale ambiante.
+    # `LC_ALL=C` is what makes `${var:0:n}` count OCTETS, so the bounds above
+    # mean what their marker text says. It is function-local and NOT exported:
+    # the child processes below keep the ambient locale.
     #
-    # Conséquence assumée, exactement comme avec `head -c` : une coupe peut
-    # tomber au milieu d'une séquence UTF-8. Le marqueur suit immédiatement, de
-    # sorte que la couture est annoncée plutôt que silencieuse.
+    # Consequence accepted, exactly as with `head -c`: a cut can land mid-UTF-8.
+    # The marker follows immediately, so the seam is announced, never silent.
     local LC_ALL=C
 
     local issue_json
@@ -1858,12 +1856,12 @@ _render_ticket_context() {
     total=$(printf '%s' "$issue_json" | jq -r '(.comments // []) | length' 2>/dev/null) || total=0
     [ -n "$total" ] || total=0
 
-    # Une ligne TSV par commentaire retenu, du plus ancien au plus récent :
-    #   <index 1-based dans la liste COMPLÈTE> <login> <createdAt> <base64(corps)>
-    # L'index reste celui de la liste complète pour que « 6/15 » et la ligne
-    # d'omission racontent la même histoire. Le corps passe en base64 : un
-    # commentaire contient couramment des retours ligne et des clôtures ```
-    # qui casseraient tout encodage naïf.
+    # One TSV row per retained comment, oldest first:
+    #   <1-based index in the FULL list> <login> <createdAt> <base64(body)>
+    # The index stays the one from the full list so that "6/15" and the omission
+    # line tell the same story. The body travels base64-encoded: a comment
+    # routinely contains newlines and ``` fences that would break any naive
+    # encoding.
     rows=$(printf '%s' "$issue_json" | jq -r --argjson keep "$keep_max" '
         (.comments // []) as $c
         | ($c | length) as $n
@@ -1886,22 +1884,22 @@ _render_ticket_context() {
             cbody="${cbody:0:$comment_max}
 [… tronqué à ${comment_max} o]"
         fi
-        # Rôle par login. Un verdict QA `block[pipeline]` posté par un bot et une
-        # consigne opérateur postée par un humain ne doivent pas se lire pareil ;
-        # l'auteur est le seul discriminant disponible sans heuristique sur le
-        # texte.
+        # Role by login. A QA `block[pipeline]` verdict posted by a bot and an
+        # operator instruction posted by a human must not read the same; the
+        # author is the only discriminant available without heuristics on the
+        # text itself.
         case "$login" in
             mika-platform-dev|github-actions|*'[bot]') role="bot" ;;
             *) role="humain" ;;
         esac
-        # Séparateurs `---` en clair, jamais un bloc de code : un commentaire
-        # contient couramment des clôtures ``` qui casseraient l'imbrication.
+        # Plain `---` separators, never a code fence: a comment routinely
+        # contains ``` fences that would break any nesting.
         block=$(printf -- '--- commentaire %s/%s · %s (%s) · %s ---\n%s' \
             "$idx" "$total" "$login" "$role" "$created" "$cbody")
         blocks+=("$block")
     done <<<"$rows"
 
-    # Plafond du bloc : éviction du plus ancien d'abord.
+    # Block cap: evict the oldest first.
     local block_text=""
     while [ "${#blocks[@]}" -gt 0 ]; do
         block_text=$(printf '%s\n\n' "${blocks[@]}")
@@ -1915,13 +1913,15 @@ _render_ticket_context() {
 [… corps tronqué à ${body_max} o]"
     fi
 
-    # Rien à rendre : chaîne vide, pour que l'appelant laisse PROMPT intact.
+    # Nothing to render: empty string, so the caller leaves PROMPT untouched.
     [ -n "$body" ] || [ "${#blocks[@]}" -gt 0 ] || return 0
 
-    # L'en-tête dit QUOI EN FAIRE, pas seulement que le texte existe. Un bloc
-    # étiqueté « contexte » sans consigne de lecture se lit comme du bruit
-    # d'archive — c'est le précédent d'`ITERATION CONTEXT` plus bas, qui nomme
-    # son usage.
+    # The header says WHAT TO DO with the block, not merely that the text
+    # exists. A block labelled "context" with no reading instruction reads like
+    # archive noise — the precedent is `ITERATION CONTEXT` below, which names
+    # its own use. The rendered strings are French on purpose: they are content
+    # addressed to the pilot, alongside a French ticket body and French operator
+    # comments, not code commentary.
     printf '%s\n' \
         "CONTEXTE DU TICKET (senara-solutions/${repo}#${issue_num})" \
         "Le corps et les commentaires ci-dessous FONT PARTIE du ticket. Une consigne" \
