@@ -41,7 +41,11 @@ use mika_agent::db::{CURRENT_SCHEMA_VERSION, Database};
 // `None` for it by design — a batch NER call runs under no agent envelope, so
 // the size-vs-expiry axis the column serves has nothing to correlate there. No
 // `seed_*` helper touches `llm_calls` either way; only the pin advances.
-const PINNED_SCHEMA_VERSION: i64 = 53;
+//
+// v53→v54 (mika#2192, renuméroté depuis v52→v53 par mika#2202 après collision
+// avec le v53 de #2189) ajoute la table `worktree_claims`. Table KG-indépendante,
+// aucun `seed_*` ne la touche ; seul le pin avance.
+const PINNED_SCHEMA_VERSION: i64 = 54;
 
 const _: () = assert!(
     CURRENT_SCHEMA_VERSION == PINNED_SCHEMA_VERSION,
