@@ -29,11 +29,20 @@
 //! # Ce que ce module ne couvre pas
 //!
 //! Uniquement le **marqueur de verdict**. Les conditions `Branch` et `Plan` restent chez
-//! leurs deux appelants, à leur place, et divergentes : `auto_pull` exige
-//! `> - **Plan:** \`docs/plans/` là où `executor` se contente de `docs/plans/`. Unifier cette
-//! moitié-là **est** le correctif de mika#2120, qui est sous arbitrage opérateur ; l'emporter
-//! ici court-circuiterait cet arbitrage. Ce module est le tiroir où mika#2120 déposera sa
-//! moitié quand son arbitrage sera rendu.
+//! leurs deux appelants, à leur place.
+//!
+//! Elles ne divergent plus sur la forme du chemin : mika#2120 a rendu `auto_pull`
+//! permissif au segment de dépôt optionnel (`mika/docs/plans/…`), que `executor` acceptait
+//! déjà. Elles restent volontairement asymétriques sur la rigueur — `auto_pull` ancre ses
+//! trois prédicats en début de ligne et lit hors des blocs clôturés, `executor` se contente
+//! d'une sous-chaîne. L'écart va dans le sens sûr : le lecteur strict est celui qui promeut.
+//!
+//! **Ce module n'a pas absorbé cette moitié-là, et ce n'est pas un oubli.** `auto_pull`
+//! décide d'une promotion, `executor` d'un routage : les deux lisent le même callout mais
+//! n'engagent pas la même dépense, et un prédicat commun leur imposerait la rigueur du plus
+//! strict ou la tolérance du plus lâche sans que personne ait tranché lequel. Le marqueur de
+//! verdict est ici parce que les deux appelants en veulent la **même** lecture ; les
+//! conditions `Branch`/`Plan` restent chez eux parce qu'ils n'en veulent pas la même.
 //!
 //! # Le discriminateur a changé de nature
 //!
@@ -592,17 +601,18 @@ pub(crate) mod tests {
     /// `executor::check_grooming_markers(..).is_empty()` doivent rendre le **même** verdict.
     /// Un désaccord fait échouer la suite — c'est le point de l'AC7.
     ///
-    /// # Réserve honnête, à lire avant de conclure que la divergence est fermée
+    /// # Réserve honnête, à lire avant de conclure que les deux prédicats sont un seul
     ///
-    /// Ce test est vert **sans** que la divergence mika#2120 soit close. Les deux prédicats
-    /// diffèrent encore sur la condition `Plan` : `auto_pull` exige
-    /// `> - **Plan:** \`docs/plans/` là où `executor` se contente de `docs/plans/`. Aucune
-    /// des six fixtures ne porte de callout `Plan` préfixé par le dépôt — les six écrivent
-    /// la forme nue — donc le croisement passe sur ce jeu-là et sur lui seul.
+    /// mika#2120 a fermé la divergence sur la forme du chemin : `auto_pull` accepte
+    /// désormais le préfixe de dépôt, que `executor` acceptait déjà. Les deux ne sont pas
+    /// pour autant identiques, et ne doivent pas l'être — `auto_pull` est **ancré** et lit
+    /// hors des blocs de code, `executor` reste une sous-chaîne. C'est un écart dans le
+    /// sens sûr : le lecteur strict est celui qui promeut. Le resserrer côté `executor`
+    /// serait un autre ticket, pas une harmonisation.
     ///
-    /// mika#2120 est la moitié restante. Prétendre que ce test l'atteste serait
-    /// exactement l'attestation-produite-à-côté-de-ce-qu'elle-atteste que mika#2034 a déjà
-    /// corrigée ailleurs.
+    /// Ce que ce croisement atteste reste donc borné aux six corps figés, qui écrivent
+    /// tous la forme nue. Le jeu qui mesure l'axe du chemin vit à côté, en
+    /// `crates/mika-agent/tests/fixtures/plan_callout_bodies/`.
     #[test]
     fn ac7_both_rust_predicates_agree_on_the_frozen_bodies() {
         for (ticket, body, _) in FIXTURES {
@@ -616,28 +626,29 @@ pub(crate) mod tests {
         }
     }
 
-    /// Le croisement doit rester capable de **détecter** un désaccord, sinon il n'atteste
-    /// rien. Un corps portant la forme `Plan` préfixée par le dépôt sépare les deux
-    /// prédicats aujourd'hui : c'est exactement la divergence mika#2120, et ce test la
-    /// fixe en l'état plutôt que de la laisser invisible.
+    /// Les deux prédicats s'accordent désormais sur la forme préfixée par le dépôt —
+    /// c'est ce que mika#2120 a rendu. Le test qui **épinglait leur désaccord** sur cette
+    /// forme (`mika2120_divergence_is_still_open_and_this_test_pins_it`) a été supprimé
+    /// dans le même commit que le correctif, comme sa propre documentation le prescrivait.
     ///
-    /// **Quand mika#2120 sera rendu, ce test échouera** — c'est voulu : il devra être
-    /// supprimé dans le même commit, et `ac7_both_rust_predicates_agree_on_the_frozen_bodies`
-    /// deviendra un accord inconditionnel.
+    /// Ce qui reste vrai et ce qui a changé : le croisement ci-dessus garde sa portée
+    /// bornée aux six corps figés, mais l'accord qu'il constate n'est plus le fruit d'un
+    /// jeu qui évite la forme litigieuse. L'axe du chemin a son propre jeu de mesure, en
+    /// `crates/mika-agent/tests/fixtures/plan_callout_bodies/`.
     #[test]
-    fn mika2120_divergence_is_still_open_and_this_test_pins_it() {
+    fn mika2120_repo_prefixed_plan_callout_is_read_by_both_predicates() {
         let repo_prefixed = "## Description\n\n\
              > - **Branch:** `fix/2120/x`\n\
              > - **Plan:** `mika/docs/plans/2026-09-03-001-fix-2120-x-plan.md` (committed @ abc)\n\
              > - **Grooming history:** mika-arch second-pass (GROOMED)\n";
 
         assert!(
-            !crate::auto_pull::is_groomed(repo_prefixed),
-            "auto_pull exige le préfixe `docs/plans/` collé au backtick"
+            crate::auto_pull::is_groomed(repo_prefixed),
+            "auto_pull accepte le segment de dépôt optionnel depuis mika#2120"
         );
         assert!(
             crate::skills::executor::check_grooming_markers(repo_prefixed).is_empty(),
-            "executor accepte la forme préfixée par le dépôt"
+            "executor l'acceptait déjà"
         );
     }
 

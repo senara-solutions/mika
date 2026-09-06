@@ -5462,6 +5462,46 @@ _deliver_callback() {
     fi
 }
 
+# Le chemin de plan porté par le callout d'un corps d'issue, normalisé — ou rien.
+#
+# mika#2120 : le second lecteur aveugle. Le callout existe en deux écritures, nue
+# (`docs/plans/…`) et préfixée par le dépôt (`mika/docs/plans/…`), et la seconde
+# est celle que la spec de grooming prescrivait. Le motif d'origine exigeait
+# `docs/plans/` collé au backtick : sur un corps préfixé il rendait une chaîne
+# vide, `_detect_plan_on_branch` retournait 0 sans un mot, et le pilote partait
+# sur `/mika` au lieu de `/ce-work <plan>`. Corriger `is_groomed` seul aurait
+# déplacé la mort ici — la promotion aurait réussi, le dispatch serait mort plus
+# loin.
+#
+# Le segment optionnel est **identique** à celui du prédicat Rust
+# (`auto_pull::extract_plan_path`) : un seul segment, premier caractère non
+# ponctuel, donc `../docs/plans/` et `a/b/docs/plans/` sont refusés comme
+# `docs/brainstorms/` l'est.
+#
+# **La normalisation est ce qui rend la tolérance utile.** Le chemin est résolu en
+# `"$WORKTREE_DIR/$PLAN_PATH"` et `$WORKTREE_DIR` est déjà la racine du
+# sous-dépôt : `mika/docs/plans/x.md` y désigne `…/mika/mika/docs/…`, qui
+# n'existe pas. Accepter le préfixe sans retirer le segment ne ferait que déplacer
+# l'échec d'un `grep` vide à un `-f` faux. C'est exactement ce que fait déjà la
+# porte de dispatch (`_committed_plan_on_branch`) en essayant les deux formes.
+#
+# L'ancrage `^` est ajouté au passage, comme côté Rust : il distingue le callout
+# de la prose qui en parle. Il ne distingue pas le callout de sa citation dans un
+# bloc de code — cette moitié-là n'existe que côté Rust, où elle garde une
+# promotion ; ici un faux positif est déjà rattrapé par le test `-f` qui suit.
+_extract_plan_path() {
+    local body="$1" path
+    path=$(printf '%s\n' "$body" \
+        | grep -oP '^> - \*\*Plan:\*\* `\K(?:[A-Za-z0-9_-][A-Za-z0-9._-]*/)?docs/plans/[^`]+' \
+        | head -1)
+    [ -n "$path" ] || return 1
+    case "$path" in
+        docs/plans/*) printf '%s\n' "$path" ;;
+        */docs/plans/*) printf '%s\n' "${path#*/}" ;;
+        *) return 1 ;;
+    esac
+}
+
 _detect_plan_on_branch() {
     # Plan-on-branch detection (mika#1074): When the issue body contains a groomed
     # plan callout, override ENTRY_COMMAND from "/mika" to "/ce:work <path>".
@@ -5480,14 +5520,19 @@ _detect_plan_on_branch() {
     # Guard: need a worktree directory for file validation
     [ -n "$WORKTREE_DIR" ] || return 0
 
-    # Extract plan path from the callout pattern:
+    # Extract plan path from the callout pattern, in either écriture:
     #   > - **Plan:** `docs/plans/<filename>.md` (committed on branch @ <sha>)
-    # The pattern requires `docs/plans/` prefix to avoid false positives on
-    # prose containing "Plan:" (consistent with self-dev bypass predicate).
+    #   > - **Plan:** `<repo>/docs/plans/<filename>.md` (committed on branch @ <sha>)
+    # The `docs/plans/` literal is what avoids false positives on prose containing
+    # "Plan:" (consistent with the self-dev bypass predicate); the optional repo
+    # segment is mika#2120. `_extract_plan_path` returns the path already
+    # normalized relative to $WORKTREE_DIR.
+    #
+    # Guard: no callout, or a callout whose path is not a plan → no-op. The
+    # helper never succeeds with an empty path, so its exit code IS the
+    # emptiness guard; a second `[ -n "$PLAN_PATH" ]` here would be dead.
     local PLAN_PATH
-    PLAN_PATH=$(printf '%s\n' "$ISSUE_BODY" | grep -oP '> - \*\*Plan:\*\* `\Kdocs/plans/[^`]+' | head -1)
-
-    [ -n "$PLAN_PATH" ] || return 0
+    PLAN_PATH=$(_extract_plan_path "$ISSUE_BODY") || return 0
 
     # Validate the plan file exists in the worktree
     if [ -f "$WORKTREE_DIR/$PLAN_PATH" ]; then
