@@ -235,9 +235,17 @@ Callback delivery: `idx_tasks_callback_delivery` (partial, for TUI polling).
 |--------|----------|--------|----------|
 | `mika` (CLI) | `{agent_home}/logs/mika.log` | JSON | Daily (tracing_appender) |
 | `mika` (team mode) | `{team_dir}/logs/mika.log` | JSON | Daily |
-| `mika-spirit` | stdout | JSON | None |
+| `mika-spirit` | stdout — **only when no log file is set** | JSON | None |
 | `mika-spirit` | `$MIKA_SPIRIT_LOG_FILE` (optional) | JSON | None |
-| `mika-gateway` | stdout | JSON | None |
+| `mika-gateway` | stdout — **only when no log file is set** | JSON | None |
 | `mika-gateway` | `$MIKA_GATEWAY_LOG_FILE` (optional) | JSON | None |
 
-CLI TUI mode logs to file only (no stderr, protects ratatui alternate screen). Non-TUI subcommands log to both stderr (pretty) and file (JSON).
+The two rows per binary are **mutually exclusive in `json` format** (mika#2195): setting the
+log file withholds the JSON stdout layer, because production launchers redirect stdout into
+that same file (OpenRC `supervise-daemon --stdout /var/log/mika/server.log`) and two layers
+aimed at one file write every event twice. Consequence for operators: with a log file
+configured, `docker logs` / `supervise-daemon --stdout` carry no application log lines — read
+the file. Unset the log file to get stdout back; `pretty` format keeps its console layer either
+way.
+
+CLI TUI mode logs to file only (no stderr, protects ratatui alternate screen). Non-TUI subcommands log to both stderr (pretty) and file (JSON) — different formats and different destinations, so no duplication.

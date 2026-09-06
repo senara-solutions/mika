@@ -79,5 +79,12 @@ Follow the checklist from `config-key-rename-across-layers.md`:
 - When adding format/mode switches to `tracing_subscriber` init functions,
   expect to multiply match arms by the number of new variants. This is a
   known constraint of the type system, not a design flaw.
+- **Superseded on one point (mika#2195):** the JSON + log-file arm no longer
+  installs a stdout layer at all. Two JSON layers are two destinations only until
+  a launcher redirects stdout into the log file — OpenRC's `supervise-daemon
+  --stdout /var/log/mika/server.log` does exactly that, and every event was
+  written twice for as long as it did. See
+  `2026-09-06-deux-sinks-un-seul-fichier-le-producteur-ne-doit-pas-dependre-du-lanceur.md`
+  before adding a sink to `init`.
 - New env vars should follow the checklist above to avoid missing any of
   the ~10 touch points across the codebase.
