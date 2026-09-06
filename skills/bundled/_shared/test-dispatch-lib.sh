@@ -5000,6 +5000,404 @@ assert_contains "site 2 (main path) can emit NO_PR" 'NO_PR:' "$PFR_SRC"
 DCP_SRC=$(sed -n '/^dispatch_claude_pilot() {/,/^}/p' "$DISPATCH_LIB")
 assert_contains "site 3 (rescue) can emit NO_PR: rescue_pr_create_failed" 'rescue_pr_create_failed' "$DCP_SRC"
 
+# === mika#2178 — le contexte du ticket atteint le pilote (T1–T9) ===
+#
+# Ce que ces neuf détecteurs mesurent : avant mika#2178, `PROMPT` valait
+# exactement `<repo>#<num>` et claude-pilot assemble son invite d'ouverture par
+# simple concaténation `f"{ns.command} {opening}"` (claude_pilot/cli.py:290
+# interactif, :251 headless). Sur le chemin plan-callout l'entrée devenait
+# `/ce-work docs/plans/x.md mika#N` : ni le corps, ni les commentaires du ticket
+# n'atteignaient l'implémenteur. Les sept lecteurs de `ISSUE_BODY` sont tous
+# internes à dispatch-lib et aucun n'écrit dans l'invite.
+#
+# Herméticité (T9) : aucune fixture n'appelle `gh`. Tout est du JSON littéral
+# passé au helper sur stdin — la suite tourne sur un runner sans réseau ni jeton.
+
+echo ""
+echo "Test: mika#2178 — contexte du ticket dans l'invite du pilote (T1–T9)"
+echo "---------------------------------------------------------------------"
+
+# --- Outillage local de la section -------------------------------------------
+
+# Reproduit l'assemblage de l'invite d'ouverture côté claude-pilot
+# (`opening_prompt = f"{ns.command} {opening}"`). C'est SUR CETTE CHAÎNE que
+# T1/T2 assertent — jamais sur ISSUE_JSON ni sur une variable interne de
+# dispatch-lib. C'est la définition d'AC3 (anti-vacuité).
+_t2178_pilot_input() {
+    printf '%s %s' "$1" "$2"
+}
+
+# Rejoue le site d'injection de dispatch-lib. T3 épingle la ligne source
+# littérale que ce miroir reproduit, donc le miroir ne peut pas dériver en
+# silence.
+_t2178_inject() {
+    local repo="$1" issue_num="$2" issue_json="$3"
+    local prompt ticket_context
+    prompt="${repo}#${issue_num}"
+    ticket_context=$(printf '%s' "$issue_json" | _render_ticket_context "$repo" "$issue_num" 2>/dev/null || true)
+    if [ -n "$ticket_context" ]; then
+        prompt=$(printf '%s\n\n%s' "$prompt" "$ticket_context")
+    fi
+    printf '%s' "$prompt"
+}
+
+_t2178_render() {
+    printf '%s' "$1" | _render_ticket_context "${2:-mika}" "${3:-2178}" 2>/dev/null || true
+}
+
+_t2178_line_of() {
+    grep -nF -- "$1" "$DISPATCH_LIB" 2>/dev/null | head -1 | cut -d: -f1
+}
+
+# "oui" quand $1 apparaît plus bas dans la source que $2, "non" sinon (y compris
+# quand l'un des deux est absent — un invariant de position sur un site qui
+# n'existe pas n'est pas satisfait).
+_t2178_after() {
+    local a b
+    a=$(_t2178_line_of "$1")
+    b=$(_t2178_line_of "$2")
+    if [ -n "$a" ] && [ -n "$b" ] && [ "$a" -gt "$b" ]; then printf 'oui'; else printf 'non'; fi
+}
+
+_t2178_lineno_in() {
+    printf '%s\n' "$2" | grep -nF -- "$1" | head -1 | cut -d: -f1
+}
+
+_t2178_assert_le() {
+    local label="$1" limit="$2" actual="$3"
+    if [ -n "$actual" ] && [ "$actual" -le "$limit" ] 2>/dev/null; then
+        PASS=$((PASS + 1))
+        echo "  ✓ $label"
+    else
+        FAIL=$((FAIL + 1))
+        echo "  ✗ $label"
+        echo "    expected: <= $limit"
+        echo "    actual:   $actual"
+    fi
+}
+
+T2178_SUW_SRC=$(sed -n '/^_set_up_worktree() {/,/^}/p' "$DISPATCH_LIB")
+T2178_HELPER_SRC=$(sed -n '/^_render_ticket_context() {/,/^}/p' "$DISPATCH_LIB")
+
+# --- T1 : anti-vacuité, contre l'entrée réelle du pilote (AC3) ---------------
+
+T2178_BODY_PHRASE="CONSIGNE-CORPS-2178 le plan se commite depuis un fichier deja present"
+T2178_COMMENT_PHRASE="CONSIGNE-COMMENTAIRE-2178 aucune chaine cat redirigee vers un fichier temporaire"
+
+# Extrait du commentaire d'enrichissement de mika#2158 du 2026-09-04T09:43:28Z.
+# RECONSTRUIT, pas littéral : la session qui a écrit ces tests n'avait pas
+# d'accès `gh` (aucun jeton, `gh auth` absent), et le plan §1.3 est la seule
+# source disponible sur le contenu de ce commentaire. La distinction
+# mesuré/reconstruit est celle que porte déjà
+# crates/mika-agent/tests/fixtures/grooming_bodies/README.md. Ce qui est
+# load-bearing pour AC3, c'est qu'une consigne vive dans un commentaire et une
+# autre dans le corps — pas la littéralité de l'extrait.
+T2178_C2158_EXCERPT="Enrichissement de grooming (reconstruit) : la forme refusee par le
+classifieur de permissions est la chaine \`cat > /tmp/plan.md <<EOF\`. Ecris le
+plan avec l'outil d'ecriture de fichier, puis commite-le."
+
+T2178_FIXTURE=$(jq -n \
+    --arg body "Contexte du ticket.
+
+${T2178_BODY_PHRASE}
+
+> - **Plan:** \`docs/plans/x.md\` (committed on branch @ deadbee)" \
+    --arg c1 "Premier commentaire, sans consigne particuliere." \
+    --arg c2 "${T2178_COMMENT_PHRASE}
+
+${T2178_C2158_EXCERPT}" \
+    '{state:"OPEN", title:"le contexte du ticket atteint le pilote",
+      labels:[{name:"ready"}], body:$body,
+      comments:[
+        {author:{login:"mika-platform-dev"}, createdAt:"2026-09-04T08:12:00Z", body:$c1},
+        {author:{login:"samidarko"},         createdAt:"2026-09-04T09:43:28Z", body:$c2}
+      ]}')
+
+T2178_PROMPT=$(_t2178_inject "mika" "2178" "$T2178_FIXTURE")
+T2178_INPUT_A=$(_t2178_pilot_input "/ce-work docs/plans/x.md" "$T2178_PROMPT")
+
+assert_contains "T1: la consigne du CORPS atteint l'entree reelle du pilote (/ce-work)" \
+    "$T2178_BODY_PHRASE" "$T2178_INPUT_A"
+assert_contains "T1: la consigne du COMMENTAIRE atteint l'entree reelle du pilote (/ce-work)" \
+    "$T2178_COMMENT_PHRASE" "$T2178_INPUT_A"
+
+# Rouge-avant, terme par terme : neutraliser UN seul terme ne pine pas les
+# autres, donc trois contrôles négatifs séparés.
+
+# (a) `--json` sans `comments` — la phrase du commentaire disparaît, celle du
+#     corps reste. C'est ce qui distingue « on a étendu la récupération » de
+#     « on a étendu ET transmis ».
+T2178_FIXTURE_NO_COMMENTS=$(printf '%s' "$T2178_FIXTURE" | jq 'del(.comments)')
+T2178_INPUT_NC=$(_t2178_pilot_input "/ce-work docs/plans/x.md" \
+    "$(_t2178_inject "mika" "2178" "$T2178_FIXTURE_NO_COMMENTS")")
+assert_not_contains "T1 controle negatif (a): sans le champ comments, la consigne du commentaire disparait" \
+    "$T2178_COMMENT_PHRASE" "$T2178_INPUT_NC"
+assert_contains "T1 controle negatif (a): sans le champ comments, la consigne du corps reste" \
+    "$T2178_BODY_PHRASE" "$T2178_INPUT_NC"
+
+# (b) helper neutralisé (rend la chaîne vide) — les deux phrases disparaissent.
+#     La neutralisation est réelle : le helper est masqué par une redéfinition
+#     locale au sous-shell, pas simulée par une chaîne écrite à la main. Cela
+#     prouve que l'append est alimenté par le helper et par rien d'autre.
+T2178_INPUT_NOHELPER=$(
+    _render_ticket_context() { :; }
+    _t2178_pilot_input "/ce-work docs/plans/x.md" \
+        "$(_t2178_inject "mika" "2178" "$T2178_FIXTURE")"
+)
+assert_not_contains "T1 controle negatif (b): helper neutralise, la consigne du corps disparait" \
+    "$T2178_BODY_PHRASE" "$T2178_INPUT_NOHELPER"
+assert_not_contains "T1 controle negatif (b): helper neutralise, la consigne du commentaire disparait" \
+    "$T2178_COMMENT_PHRASE" "$T2178_INPUT_NOHELPER"
+
+# (c) helper intact mais l'append supprimé — le helper rend bien du texte, mais
+#     l'entrée du pilote reste `/ce-work docs/plans/x.md mika#2178`.
+T2178_RENDER_ONLY=$(_t2178_render "$T2178_FIXTURE")
+T2178_INPUT_NOAPPEND=$(_t2178_pilot_input "/ce-work docs/plans/x.md" "mika#2178")
+assert_eq "T1 controle negatif (c): sans l'append, l'entree du pilote est exactement l'ancienne" \
+    "/ce-work docs/plans/x.md mika#2178" "$T2178_INPUT_NOAPPEND"
+assert_not_contains "T1 controle negatif (c): sans l'append, la consigne du corps n'atteint pas le pilote" \
+    "$T2178_BODY_PHRASE" "$T2178_INPUT_NOAPPEND"
+assert_not_contains "T1 controle negatif (c): sans l'append, la consigne du commentaire n'atteint pas le pilote" \
+    "$T2178_COMMENT_PHRASE" "$T2178_INPUT_NOAPPEND"
+assert_contains "T1 controle negatif (c): le helper, lui, rend bien la consigne du commentaire" \
+    "$T2178_COMMENT_PHRASE" "$T2178_RENDER_ONLY"
+
+# --- T2 : symétrie des deux chemins (AC1, AC2) -------------------------------
+
+T2178_INPUT_B=$(_t2178_pilot_input "/mika" "$T2178_PROMPT")
+assert_contains "T2: la consigne du CORPS atteint aussi le chemin sans callout (/mika)" \
+    "$T2178_BODY_PHRASE" "$T2178_INPUT_B"
+assert_contains "T2: la consigne du COMMENTAIRE atteint aussi le chemin sans callout (/mika)" \
+    "$T2178_COMMENT_PHRASE" "$T2178_INPUT_B"
+
+# L'injection est inconditionnelle : au point où elle a lieu, l'entry command
+# n'est pas encore arbitré (_detect_plan_on_branch tourne après). Une seule
+# occurrence EN CODE suffirait à réintroduire l'asymétrie que ce ticket ferme.
+#
+# Le compte exclut les lignes de commentaire, comme les gardes structurelles
+# préexistantes de cette suite (NON_COMMENT_EXIT1, NON_COMMENT_RETURNS) : le
+# commentaire qui explique POURQUOI le site ne peut pas brancher sur l'entry
+# command est précisément ce qui empêche un futur éditeur d'y brancher. Une
+# assertion qui exigerait son silence retirerait la raison pour garder la règle.
+assert_eq "T2: injection inconditionnelle — aucun branchement sur ENTRY_COMMAND en code dans _set_up_worktree" \
+    "0" "$(printf '%s\n' "$T2178_SUW_SRC" | grep -v '^[[:space:]]*#' | grep -c 'ENTRY_COMMAND' || true)"
+
+# --- T3 : invariants de position (§3.3) --------------------------------------
+
+T2178_APPEND_EXPR='PROMPT=$(printf '"'"'%s\n\n%s'"'"' "$PROMPT" "$TICKET_CONTEXT")'
+
+# Invariant 1 — après la branche ITERATION_CTX, qui RÉASSIGNE PROMPT depuis zéro
+# au lieu d'y appendre : injecter avant l'écraserait sans bruit dès qu'une
+# itération est en cours.
+assert_eq "T3 invariant 1: l'injection est APRES la reassignation ITERATION CONTEXT" "oui" \
+    "$(_t2178_after 'PROMPT" "$TICKET_CONTEXT")' 'ITERATION CONTEXT:')"
+
+# Invariant 2 — après le parse ancré `^([a-zA-Z0-9_-]+/)?[a-zA-Z0-9_-]+#[0-9]+$`
+# du mode repo#N : injecter avant ferait rater le regex, dispatch basculerait en
+# texte-libre et AUCUN worktree ne serait créé.
+assert_eq "T3 invariant 2: l'injection est APRES le parse ancre repo#N" "oui" \
+    "$(_t2178_after 'PROMPT" "$TICKET_CONTEXT")' '[a-zA-Z0-9_-]+#[0-9]+')"
+
+# Invariant 3 — l'injection vit DANS _set_up_worktree, donc avant
+# _detect_plan_on_branch et _handle_dry_run. L'ordre d'appel lui-même
+# (_set_up_worktree → _detect_plan_on_branch → _handle_dry_run) est déjà asserté
+# plus haut dans cette suite (« Call ordering: ... ») ; T3 le référence plutôt
+# que de le dupliquer, et n'ajoute ici que la moitié manquante : le site
+# d'injection est bien à l'intérieur de la première.
+assert_contains "T3 invariant 3: le site d'injection vit dans _set_up_worktree" \
+    '_render_ticket_context' "$T2178_SUW_SRC"
+
+# Le miroir de T1 n'est légitime que si l'expression d'append qu'il rejoue est
+# littéralement celle du source.
+assert_contains "T3: l'expression d'append de la source est celle que T1 rejoue" \
+    "$T2178_APPEND_EXPR" "$(cat "$DISPATCH_LIB")"
+
+# Contrat mika#138 + parse ancré de _set_up_worktree : la PREMIÈRE ligne de
+# PROMPT reste exactement `<repo>#<num>`. Égalité stricte, pas assert_contains.
+assert_eq "T3: la premiere ligne de PROMPT reste exactement mika#2178" "mika#2178" \
+    "$(printf '%s' "$T2178_PROMPT" | head -1)"
+
+# --- T4 : rendu lisible (AC1) ------------------------------------------------
+
+T2178_FX_ROLES=$(jq -n '{state:"OPEN", title:"t", labels:[], body:"corps du ticket de reference",
+  comments:[
+    {author:{login:"mika-platform-dev"}, createdAt:"2026-09-04T08:00:00Z",
+     body:"Verdict QA: block[pipeline] — la CI est rouge sur le job clippy."},
+    {author:{login:"samidarko"}, createdAt:"2026-09-04T09:43:28Z",
+     body:"Consigne operateur: refais le plan avant de reimplementer."}
+  ]}')
+T2178_RENDER_ROLES=$(_t2178_render "$T2178_FX_ROLES")
+
+assert_contains "T4: en-tete du commentaire bot — login, role bot, horodatage ISO" \
+    "--- commentaire 1/2 · mika-platform-dev (bot) · 2026-09-04T08:00:00Z ---" "$T2178_RENDER_ROLES"
+assert_contains "T4: en-tete du commentaire humain — login, role humain, horodatage ISO" \
+    "--- commentaire 2/2 · samidarko (humain) · 2026-09-04T09:43:28Z ---" "$T2178_RENDER_ROLES"
+assert_contains "T4: le corps du ticket est sous son propre separateur" \
+    "--- corps du ticket ---" "$T2178_RENDER_ROLES"
+assert_contains "T4: l'en-tete dit quoi faire du bloc, pas seulement qu'il existe" \
+    "Lis les deux avant d'agir." "$T2178_RENDER_ROLES"
+assert_contains "T4: le verdict QA du bot est transmis tel quel" \
+    "block[pipeline]" "$T2178_RENDER_ROLES"
+
+# --- T5 : bornes -------------------------------------------------------------
+
+# (a) 15 commentaires COURTS (≤ 200 o) : seul le plafond de NOMBRE mord, jamais
+#     celui du bloc. Sans cette contrainte de taille sur la fixture, une
+#     implémentation correcte pourrait en rendre moins de 10 (éviction par le
+#     plafond de bloc) et le test rougirait à tort.
+T2178_FX_15=$(jq -n '{state:"OPEN", title:"t", labels:[], body:"corps court",
+  comments:[range(1;16) | {author:{login:"samidarko"},
+                           createdAt:"2026-09-04T00:00:00Z",
+                           body:"COMMENTAIRE-NUMERO-\(.)"}]}')
+T2178_RENDER_15=$(_t2178_render "$T2178_FX_15")
+
+assert_eq "T5(a): exactement 10 commentaires rendus sur 15" "10" \
+    "$(printf '%s\n' "$T2178_RENDER_15" | grep -c '^--- commentaire ' || true)"
+assert_contains "T5(a): la ligne d'omission porte le compte 5" \
+    "[5 commentaire(s) plus ancien(s) omis]" "$T2178_RENDER_15"
+assert_contains "T5(a): le plus ancien rendu est le 6/15" \
+    "--- commentaire 6/15 · " "$T2178_RENDER_15"
+assert_contains "T5(a): le plus recent rendu est le 15/15" \
+    "--- commentaire 15/15 · " "$T2178_RENDER_15"
+assert_not_contains "T5(a): le 5/15 est bien evince" \
+    "--- commentaire 5/15 · " "$T2178_RENDER_15"
+assert_eq "T5(a): ordre chronologique croissant (6/15 avant 15/15)" "oui" \
+    "$(a=$(_t2178_lineno_in '--- commentaire 6/15 · ' "$T2178_RENDER_15"); \
+       b=$(_t2178_lineno_in '--- commentaire 15/15 · ' "$T2178_RENDER_15"); \
+       if [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]; then printf 'oui'; else printf 'non'; fi)"
+
+# (b) un commentaire de 8 Kio → tronqué à 4 096 o avec marqueur.
+T2178_FX_8K=$(jq -n '{state:"OPEN", title:"t", labels:[], body:"corps",
+  comments:[{author:{login:"samidarko"}, createdAt:"2026-09-04T09:00:00Z", body:("Y" * 8192)}]}')
+T2178_RENDER_8K=$(_t2178_render "$T2178_FX_8K")
+assert_contains "T5(b): marqueur de troncature du commentaire present" \
+    "[… tronqué à 4096 o]" "$T2178_RENDER_8K"
+# 'Y' majuscule n'apparaît nulle part ailleurs dans le rendu (en-tête, marqueurs,
+# horodatages), donc le compte de 'Y' EST la longueur du corps retenu.
+assert_eq "T5(b): le corps du commentaire est coupe a 4096 o" "4096" \
+    "$(printf '%s' "$T2178_RENDER_8K" | tr -cd 'Y' | wc -c)"
+
+# (c) 10 commentaires de 4 Kio → bloc ≤ 16 384 o ET ligne d'omission présente.
+T2178_FX_10x4K=$(jq -n '{state:"OPEN", title:"t", labels:[], body:"corps",
+  comments:[range(1;11) | {author:{login:"samidarko"},
+                           createdAt:"2026-09-04T00:00:00Z",
+                           body:("W" * 4096)}]}')
+T2178_RENDER_10x4K=$(_t2178_render "$T2178_FX_10x4K")
+T2178_BLOCK_10x4K=$(printf '%s\n' "$T2178_RENDER_10x4K" | sed -n '/^--- commentaire /,$p')
+_t2178_assert_le "T5(c): le bloc commentaires reste sous 16384 o" "16384" \
+    "$(printf '%s' "$T2178_BLOCK_10x4K" | wc -c)"
+assert_eq "T5(c): ligne d'omission presente quand le plafond de bloc mord" "1" \
+    "$(printf '%s\n' "$T2178_RENDER_10x4K" | grep -cE '^\[[0-9]+ commentaire\(s\) plus ancien\(s\) omis\]$' || true)"
+
+# (d) un corps de 32 Kio → tronqué à 16 384 o avec marqueur.
+T2178_FX_32K=$(jq -n '{state:"OPEN", title:"t", labels:[], body:("Q" * 32768), comments:[]}')
+T2178_RENDER_32K=$(_t2178_render "$T2178_FX_32K")
+assert_contains "T5(d): marqueur de troncature du corps present" \
+    "[… corps tronqué à 16384 o]" "$T2178_RENDER_32K"
+assert_eq "T5(d): le corps est coupe a 16384 o" "16384" \
+    "$(printf '%s' "$T2178_RENDER_32K" | tr -cd 'Q' | wc -c)"
+
+# (e) charge au-delà du tampon de pipe (64 Kio sur Linux). Ce cas n'est pas une
+#     variante de (b)/(d) : c'est le seul qui distingue une troncature écrite
+#     avec `printf … | head -c N` d'une troncature sans pipe. Avec le pipe, head
+#     sort après N octets pendant que printf écrit encore, printf meurt en
+#     SIGPIPE, et sous le `set -euo pipefail` de dispatch-lib la substitution
+#     rate et le dispatch entier avorte — le helper rendrait la chaîne vide.
+#     Un corps d'issue GitHub plafonne à 65 536 CARACTERES, donc en UTF-8 bien
+#     au-delà de 64 Kio : le cas est atteignable sur un vrai ticket maximal.
+T2178_FX_HUGE=$(jq -n '{state:"OPEN", title:"t", labels:[], body:("Q" * 204800),
+  comments:[{author:{login:"samidarko"}, createdAt:"2026-09-04T09:00:00Z", body:("Y" * 204800)}]}')
+T2178_RENDER_HUGE=$(_t2178_render "$T2178_FX_HUGE")
+assert_contains "T5(e): une charge > tampon de pipe ne fait pas avorter le helper (corps)" \
+    "[… corps tronqué à 16384 o]" "$T2178_RENDER_HUGE"
+assert_contains "T5(e): une charge > tampon de pipe ne fait pas avorter le helper (commentaire)" \
+    "[… tronqué à 4096 o]" "$T2178_RENDER_HUGE"
+assert_eq "T5(e): le corps de 200 Kio est bien coupe a 16384 o" "16384" \
+    "$(printf '%s' "$T2178_RENDER_HUGE" | tr -cd 'Q' | wc -c)"
+assert_eq "T5(e): le commentaire de 200 Kio est bien coupe a 4096 o" "4096" \
+    "$(printf '%s' "$T2178_RENDER_HUGE" | tr -cd 'Y' | wc -c)"
+
+# --- T6 : dégénérescences ----------------------------------------------------
+
+T2178_FX_NO_COMMENTS=$(jq -n '{state:"OPEN", title:"t", labels:[],
+  body:"CORPS-SEUL-DISTINCTIF-2178", comments:[]}')
+T2178_RENDER_NO_COMMENTS=$(_t2178_render "$T2178_FX_NO_COMMENTS")
+assert_not_contains "T6(a): aucun separateur de commentaire quand comments est vide" \
+    "--- commentaire " "$T2178_RENDER_NO_COMMENTS"
+assert_not_contains "T6(a): aucune ligne d'omission quand comments est vide" \
+    "plus ancien(s) omis" "$T2178_RENDER_NO_COMMENTS"
+assert_contains "T6(a): le corps seul est bien present" \
+    "CORPS-SEUL-DISTINCTIF-2178" "$T2178_RENDER_NO_COMMENTS"
+
+T2178_FX_EMPTY=$(jq -n '{state:"OPEN", title:"t", labels:[], body:"", comments:[]}')
+assert_eq "T6(b): sans corps ni commentaire, le helper rend la chaine vide" "" \
+    "$(_t2178_render "$T2178_FX_EMPTY")"
+assert_eq "T6(b): sans corps ni commentaire, PROMPT est STRICTEMENT egal a mika#2178" "mika#2178" \
+    "$(_t2178_inject "mika" "2178" "$T2178_FX_EMPTY")"
+
+# --- T7 : non-régression des sept lecteurs de ISSUE_BODY (AC4) ---------------
+#
+# Détecteur d'INVARIANCE : il doit être VERT sur main non modifié. S'il rougit
+# avant tout correctif, la lecture du code sur laquelle le plan mika#2178 repose
+# est fausse — halt-and-surface, pas d'allowlist (Fire-Disposition, option (c)).
+
+assert_eq "T7: exactement 7 lecteurs de ISSUE_BODY (AC4 les gele)" "7" \
+    "$(grep -c 'ISSUE_BODY' "$DISPATCH_LIB" || true)"
+
+T2178_ISSUE_BODY_LINES=$(grep -h 'ISSUE_BODY' "$DISPATCH_LIB" | sed 's/^[[:space:]]*//')
+assert_contains "T7: lecteur 1 — derivation ISSUE_BODY depuis ISSUE_JSON" \
+    "ISSUE_BODY=\$(printf '%s' \"\$ISSUE_JSON\" | jq -r '.body // empty')" "$T2178_ISSUE_BODY_LINES"
+assert_contains "T7: lecteur 2 — derive-branch-name --body-callout" \
+    '--body-callout "$ISSUE_BODY")' "$T2178_ISSUE_BODY_LINES"
+assert_contains "T7: lecteur 3 — porte anti-re-groom _committed_plan_on_branch (mika#2012)" \
+    'if existing_plan=$(_committed_plan_on_branch "$SUB_REPO_DIR" "$BRANCH" "$ISSUE_BODY" "$REPO" "$ISSUE_NUM"); then' \
+    "$T2178_ISSUE_BODY_LINES"
+assert_contains "T7: lecteur 4 — callout obsolete (dispatch_gate_groom_allowed_stale_callout)" \
+    'elif grep -qE -- '"'"'^> - \*\*Plan:\*\*'"'"' <<<"$ISSUE_BODY"; then' \
+    "$T2178_ISSUE_BODY_LINES"
+assert_contains "T7: lecteur 5 — garde de _detect_plan_on_branch" \
+    '[ -n "$ISSUE_BODY" ] || return 0' "$T2178_ISSUE_BODY_LINES"
+assert_contains "T7: lecteur 6 — extraction du chemin de plan" \
+    'PLAN_PATH=$(printf '"'"'%s\n'"'"' "$ISSUE_BODY" | grep -oP '"'"'> - \*\*Plan:\*\* `\Kdocs/plans/[^`]+'"'"' | head -1)' \
+    "$T2178_ISSUE_BODY_LINES"
+assert_contains "T7: lecteur 7 — sauvetage de la ligne de plan dans _iterate_groom_loop" \
+    'elif _groom_plan_path=$(_committed_plan_on_branch "$SUB_REPO_DIR" "$BRANCH" "$ISSUE_BODY" "$REPO" "$ISSUE_NUM" 2>/dev/null); then' \
+    "$T2178_ISSUE_BODY_LINES"
+
+# Le helper lit ISSUE_JSON, jamais ISSUE_BODY — un accès partagé coupleraient
+# les deux surfaces et ferait de la moindre évolution du rendu une modification
+# des sept lecteurs.
+assert_not_contains "T7: _render_ticket_context ne lit jamais ISSUE_BODY" \
+    "ISSUE_BODY" "$T2178_HELPER_SRC"
+
+# --- T8 : structure ----------------------------------------------------------
+
+assert_eq "T8: --json state,title,labels,body,comments present a un SEUL site" "1" \
+    "$(grep -cF -- '--json state,title,labels,body,comments' "$DISPATCH_LIB" || true)"
+assert_eq "T8: _render_ticket_context() est defini exactement une fois" "1" \
+    "$(grep -c '^_render_ticket_context() {' "$DISPATCH_LIB" || true)"
+assert_contains "T8: l'injection lit ISSUE_JSON (pas un second aller-retour reseau)" \
+    'ISSUE_JSON" | _render_ticket_context' "$T2178_SUW_SRC"
+# Un second `gh issue view` ouvrirait une fenêtre TOCTOU entre l'état lu par la
+# porte issue-close et les commentaires — la même que la spec de
+# /mika-groom-ticket a fermée à son étape 5a.
+assert_eq "T8: un seul appel gh issue view dans _set_up_worktree" "1" \
+    "$(printf '%s\n' "$T2178_SUW_SRC" | grep -c 'gh issue view' || true)"
+
+# --- T9 : herméticité --------------------------------------------------------
+#
+# Détecteur d'INVARIANCE : vert sur main non modifié. Aucun test de cette
+# section n'appelle `gh` — les fixtures sont du JSON littéral passé au helper
+# sur stdin, donc la suite tourne sur un runner sans réseau ni jeton.
+
+T2178_SECTION=$(sed -n '/^# === mika#2178 — le contexte du ticket atteint le pilote/,$p' "${BASH_SOURCE[0]}")
+assert_eq "T9: aucune invocation de gh en tete de commande dans la section mika#2178" "0" \
+    "$(printf '%s\n' "$T2178_SECTION" | grep -cE '^[[:space:]]*gh[[:space:]]' || true)"
+assert_eq "T9: aucune invocation de gh en substitution dans la section mika#2178" "0" \
+    "$(printf '%s\n' "$T2178_SECTION" | grep -cE '\$\(gh[[:space:]]' || true)"
+assert_not_contains "T9: _render_ticket_context n'appelle pas gh (il lit stdin)" \
+    "gh issue" "$T2178_HELPER_SRC"
+
 # --- Summary ---
 
 echo ""
