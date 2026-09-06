@@ -1787,6 +1787,34 @@ _is_dispatchable_repo() {
     return 1
 }
 
+# mika#2211 — the PR-body containment rule, carried in every dispatch prompt.
+#
+# The failure it closes, measured: a pilot composing a long PR body reaches for
+# `--body-file /tmp/pr-body-<N>.md` on its own (no prompt ever asked for it), the
+# claude-pilot permission policy refuses every write outside the worktree
+# (`[policy:deny] Write: /tmp/pr-body-2195.md`), `gh pr create --body-file` finds
+# no file, and the session ends by ASKING the operator to paste the body — a
+# dispatched session that asks a question is dead. Zero PR, then the mika#1282
+# dirty-worktree recovery opens a `wip-rescue` draft instead. PRs #2202 and #2210
+# both landed that way from this one cause.
+#
+# It states the positive form FIRST: a pilot told only "not /tmp" still has to
+# invent a replacement, and the one it reaches for next
+# (`--body-file - <<'BODY'`) breaks on a body that contains its own delimiter
+# line — which a generated PR body, full of fenced blocks and headings, can.
+# A file under the worktree is insensitive to the body's content.
+#
+# Kept to a few lines on purpose: it rides at the END of a prompt that already
+# carries up to 16 KiB of ticket context, and recency is the only leverage it has.
+_PR_BODY_CONTAINMENT_RULE="RÈGLE DE DISPATCH (mika#2211) — le corps de PR ne s'écrit JAMAIS hors du worktree.
+Pour ouvrir la PR : écris le corps dans un fichier SOUS le worktree (\`pr-body.md\` à sa racine),
+passe-le en \`--body-file pr-body.md\`, puis supprime-le. Un corps court peut rester en \`--body\` inline.
+N'écris jamais dans \`/tmp\` : la permission-policy refuse toute écriture hors worktree
+(\`[policy:deny] Write: /tmp/pr-body-<N>.md\`), \`gh pr create --body-file\` ne trouve alors aucun fichier,
+et la session se termine sans PR. N'utilise pas non plus de heredoc \`<<'BODY'\` : un corps généré peut
+contenir la ligne délimitrice et le terminer trop tôt. Ne demande jamais à l'opérateur de coller le corps
+— une session dispatchée qui pose une question est une session morte."
+
 # mika#2178 — render the ticket text (body AND comments) in a form that can be
 # injected into the pilot's opening prompt.
 #
@@ -2278,6 +2306,26 @@ Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
         if [ -n "$TICKET_CONTEXT" ]; then
             PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$TICKET_CONTEXT")
         fi
+
+        # --- mika#2211: the PR-body containment rule reaches the pilot ---
+        #
+        # The rule belongs HERE and not only in a `.claude/commands/mika.md`,
+        # because this is the one channel every pilot of every repo reads. The
+        # pilot is launched with exactly two inputs (see `_run_pilot_sandboxed
+        # claude-pilot … --command "$ENTRY_COMMAND" … -- "$PROMPT"`): the entry
+        # command, resolved from the TARGET repo's worktree, and this PROMPT.
+        # `skills/bundled/self-dev/system_prompt.md` is mika-dev's own system
+        # prompt and never reaches the pilot process — a guard placed there
+        # alone would be decorative for the failure it is meant to close. So
+        # `mika`'s command file carries the canonical form (mika#2211 AC1),
+        # mika-dev's prompt carries the rule for what IT composes (AC2), and
+        # this line is what covers `mika-cloud` / `mika-skills`, whose command
+        # files still hold the pre-fix inline instruction.
+        #
+        # Appended AFTER the ticket context, so the same three position
+        # invariants documented above still hold, and the FIRST LINE of PROMPT
+        # is still exactly `<repo>#<num>` (the mika#138 contract).
+        PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$_PR_BODY_CONTAINMENT_RULE")
 
         # Save pre-run HEAD SHA for post-flight diff check
         PRE_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)

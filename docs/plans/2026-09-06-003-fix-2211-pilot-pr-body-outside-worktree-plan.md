@@ -41,6 +41,13 @@ prématurément, reproduisant l'échec). Un fichier dans le worktree est insensi
   détection dirty). Comme `docs/plans/` et le code sont committés avant l'étape PR, le worktree
   est propre à ce moment ; écrire puis supprimer `pr-body.md` autour du `gh pr create` garde le
   worktree propre.
+- **Durcissement ajouté à l'implémentation** : `/pr-body.md` est ajouté au `.gitignore`. La
+  suppression seule laisse un trou — si `gh pr create` échoue, le fichier survit et
+  `git status --porcelain` (la sonde exacte que dispatch-lib interroge) le rapporte, déclenchant
+  la recovery wip-rescue mika#1282 que ce fix existe pour tarir. `git status --porcelain` ne
+  rapporte pas les fichiers ignorés : l'ignore rend le résidu inoffensif au lieu de compter sur
+  un `rm` qui n'a pas lieu sur le chemin d'échec. Le ticket l'autorise explicitement
+  (« ou un fichier ignoré du worktree », direction #1).
 
 Rejeté : (a) heredoc stdin `--body-file -` — fragile au contenu (F1) ; (b) élargir la
 permission-policy pour autoriser `/tmp/pr-body-*` (direction #3 du ticket) — élargit la surface
@@ -48,18 +55,42 @@ d'écriture hors-worktree pour un gain nul ; la policy hors-worktree est une gar
 
 ## Acceptance criteria
 
-- **AC1** : `mika/.claude/commands/mika.md` (étape PR) instruit la création de PR avec le corps
+- [x] **AC1** : `mika/.claude/commands/mika.md` (étape PR) instruit la création de PR avec le corps
   écrit dans un fichier **sous le worktree** (puis supprimé après création), passé à
   `--body-file`, et **interdit explicitement** toute écriture du corps hors du worktree
   (`/tmp`). (tie-back : ticket §Fix direction #1)
-- **AC2** : `mika/skills/bundled/self-dev/system_prompt.md` porte une garde transversale sur
+- [x] **AC2** : `mika/skills/bundled/self-dev/system_prompt.md` porte une garde transversale sur
   l'étape PR : « n'écris jamais le corps de PR hors du worktree ; écris-le sous le worktree ».
   Cette garde vit dans le prompt PILOTE, donc elle couvre les pilotes de **tous** les repos
   (mika, mika-cloud, mika-skills) indépendamment du `mika.md` du repo cible. (résout mika-arch F2
   au niveau transversal — l'invariant de confinement est répliqué au bon endroit unique)
-- **AC3** (anti-régression, du ticket) : un dispatch nominal ouvre une PR **non-draft**
+  — **voir la correction de prémisse ci-dessous : la garde est posée en DEUX endroits, pas un.**
+- [ ] **AC3** (anti-régression, du ticket) : un dispatch nominal ouvre une PR **non-draft**
   directement — pas de draft wip-rescue — et le pilote n'émet **pas de question terminale** sur
-  l'étape PR quand le corps est long.
+  l'étape PR quand le corps est long. *(observable au prochain dispatch nominal après merge — ne
+  peut pas être coché depuis cette PR ; filet inchangé = mika#1282.)*
+- [x] **AC4** (ajouté à l'implémentation, voir ci-dessous) : la garde transversale est portée par
+  le `PROMPT` composé dans `dispatch-lib.sh`, seul canal que le processus pilote lit réellement.
+
+### Correction de prémisse sur AC2 (constatée à l'implémentation)
+
+AC2 affirmait que `self-dev/system_prompt.md` est « le prompt PILOTE ». **Il ne l'est pas.**
+Vérifié en code : `_run_pilot_sandboxed claude-pilot … --command "$ENTRY_COMMAND" … -- "$PROMPT"`
+(`dispatch-lib.sh`) — le processus pilote ne reçoit que deux entrées, la commande d'entrée
+résolue depuis le worktree du repo **cible** (donc le `.claude/commands/mika.md` de ce repo) et
+le `PROMPT` composé par dispatch-lib. `self-dev/system_prompt.md` est le system prompt de
+**mika-dev** (l'agent qui dispatche) et n'atteint jamais le pilote ; une garde qui n'y vivrait
+que là serait décorative pour la panne qu'elle prétend fermer, et la couverture
+mika-cloud/mika-skills annoncée par AC2 ne serait pas obtenue.
+
+La garde est donc posée aux deux endroits, chacun pour ce qu'il couvre réellement :
+
+- `self-dev/system_prompt.md` (Rule 12) — pour ce que **mika-dev compose lui-même**
+  (`iteration_context`, prompts free-text). C'est AC2 à la lettre, et c'est utile à ce titre.
+- `dispatch-lib.sh` (`_PR_BODY_CONTAINMENT_RULE`, injectée dans `PROMPT`) — pour ce que **le
+  pilote lit**. C'est ce qui réalise l'intention d'AC2 (« couvre tous les repos ») : `mika-cloud`
+  et `mika-skills` portent encore l'instruction inline d'avant le fix dans leur `mika.md`, et
+  cette ligne les couvre sans les toucher.
 
 ## mika-arch first-pass — résolution des findings
 
@@ -101,5 +132,21 @@ d'écriture hors-worktree pour un gain nul ; la policy hors-worktree est une gar
 
 ## Fichiers touchés
 
-- `mika/.claude/commands/mika.md` (étape PR)
-- `mika/skills/bundled/self-dev/system_prompt.md` (garde transversale étape PR)
+- `mika/.claude/commands/mika.md` (étape PR) — AC1
+- `mika/skills/bundled/self-dev/system_prompt.md` (Rule 12) — AC2
+- `mika/skills/bundled/_shared/dispatch-lib.sh` (`_PR_BODY_CONTAINMENT_RULE` + injection dans
+  `PROMPT`) — AC4, l'intention d'AC2 sur le seul canal que le pilote lit
+- `mika/.gitignore` (`/pr-body.md`) — durcissement du chemin d'échec
+- `mika/skills/bundled/_shared/test-dispatch-lib.sh` — garde structurelle anti-régression
+
+## Vérification exécutée
+
+- `bash skills/bundled/_shared/test-dispatch-lib.sh` → 588 passed, 0 failed (dont les 11
+  assertions mika#2211 ajoutées).
+- `bash skills/bundled/_shared/tests/test_rescue_signal_open_pr.sh` → 63 passed, 0 failed
+  (inclut le garde-fou `dispatch-lib passes bash -n`).
+- `bash skills/bundled/_shared/tests/test_rescue_closes_guard.sh` → 29 passed, 0 failed.
+- `bash skills/bundled/_shared/tests/test_seed_worktree_slash_commands.sh` → 11 passed, 0 failed.
+- `cargo run -q --bin verify-bundled-skills` → 5/5 checks OK.
+
+AC3 n'est pas vérifiable depuis cette PR : il se mesure au prochain dispatch nominal après merge.
