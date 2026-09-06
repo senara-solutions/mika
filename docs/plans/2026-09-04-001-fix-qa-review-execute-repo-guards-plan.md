@@ -259,29 +259,29 @@ Vérifié, ne pas supposer :
 Rattachement AC → livrable : AC1 → D1, D2, D5 · AC2 → D1, D3 · AC3 → D6, **D7** ·
 AC4 → D1, D6 · AC5 → D6, D7, D8 · AC6 → D6.
 
-- **AC1** — Le verdict pipeline est produit en exécutant les gardes découvertes dans le
+- [ ] **AC1** — Le verdict pipeline est produit en exécutant les gardes découvertes dans le
   dépôt cible (D1), dans un worktree détaché sur la ref de la PR (D2), et le verdict est
   la conjonction de leurs codes de sortie. Aucun chemin du prompt ne réévalue une règle
   qu'une garde porte déjà. Un dépôt sans garde rend `PIPELINE: not-applicable` avec la
   liste des chemins cherchés (D5), et n'est jamais jugé sur les règles d'un autre dépôt.
-- **AC2** — Un trailer `Pipeline-Exempt:` valide pour le dépôt concerné est honoré, quel
+- [ ] **AC2** — Un trailer `Pipeline-Exempt:` valide pour le dépôt concerné est honoré, quel
   que soit son vocabulaire, parce que c'est la garde du dépôt qui le lit. Vérification :
   rejouer mika-platform#203 (`no-plan — <raison>`) produit un verdict non bloquant ; les
   deux gardes du dépôt sortent 0 (mesuré au grooming).
-- **AC3** — La QA ne bloque plus sur l'absence de `docs/plans/*.md` quand la garde ne
+- [ ] **AC3** — La QA ne bloque plus sur l'absence de `docs/plans/*.md` quand la garde ne
   l'exige pas — **ni en Step 2, ni en Step 2.5.1** (D7). Vérification : rejouer mika#2167
   (`docs && source`, sans callout Plan, sans issue liée) produit un verdict non bloquant
   sur ce motif, et le verdict cite `verify-pipeline.sh` exit 0.
-- **AC4** — Anti-vacuité. Une PR qui viole réellement une garde reste bloquée en
+- [ ] **AC4** — Anti-vacuité. Une PR qui viole réellement une garde reste bloquée en
   `block[pipeline]` : (a) `!docs && source` sans trailer sur `mika` → la garde sort 1
   (mesuré : `REJECT: code-only PR`) ; (b) des changements source sans plan ni trailer sur
   `mika-platform` → `plan-doc-check.sh` sort 1. Le même diff avec trailer valide passe —
   la sonde porte ses deux contrôles.
-- **AC5** — Non-régression. `DIFF ANALYSIS` (Step 3) et la revue de fond restent produites
+- [ ] **AC5** — Non-régression. `DIFF ANALYSIS` (Step 3) et la revue de fond restent produites
   inchangées. `PLAN-AC VERIFICATION` reste produite et gatante **quand un plan existe** ;
   elle n'est passée en `skipped` que dans le cas D7 (pas de plan **et** gardes passantes).
   Le check 3 (nouvelles dépendances) est conservé.
-- **AC6** — Le verdict cite la sortie verbatim de chaque garde exécutée, avec son chemin et
+- [ ] **AC6** — Le verdict cite la sortie verbatim de chaque garde exécutée, avec son chemin et
   son code de sortie. Un verdict pipeline qui n'exhibe pas la sortie de la garde qu'il
   prétend refléter est la faute que ce ticket répare, une couche plus haut.
 

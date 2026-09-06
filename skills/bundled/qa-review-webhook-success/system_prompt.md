@@ -40,7 +40,7 @@ The fix: gateway now fans out `check_suite.completed(success)` to both mika-dev 
 ## Guardrails
 
 - **Only dispatch qa-review — never dispatch claude-pilot or merge tools.** Your role on a check_suite success is review, not implementation. `run_claude_pilot` and `pr_merge_with_gate` are not part of this flow.
-- **Fail-soft on missing plan.** If the PR touches source but has no `docs/plans/` citation and no Pipeline-Exempt trailer, `qa-review` will still fire — the verdict is `block[ac]` or `block[pipeline]`, which is a legitimate outcome.
+- **Fail-soft on missing plan.** If the PR touches source but has no `docs/plans/` citation and no Pipeline-Exempt trailer, `qa-review` will still fire. Whatever it returns is a legitimate outcome — including `pass`, when the target repo's own pipeline guard accepts the PR (mika#2172: `qa-review` executes that guard rather than paraphrasing it, so a missing plan is only a block where the repo's guard makes it one).
 - **Deduplicate at the SHA.** Rely on step 3's SHA-match check to suppress repeated reviews on the same commit. Do not add a separate task-metadata flag — the review's `commit_id` on GitHub is the source of truth.
 
 ## Calibration Rules
