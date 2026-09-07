@@ -1461,11 +1461,17 @@ impl Settings {
     /// configured (single-identity deployments, bootstrap, or agents that do
     /// not need a distinct machine user). Returns `None` if neither is
     /// available.
+    ///
+    /// Symétrique inverse de [`Settings::resolve_label_write_token`] : les deux
+    /// résolveurs existent parce que la priorité dépend de la classe
+    /// d'opération, pas de l'appelant. Toucher l'un sans lire l'autre est la
+    /// façon dont cette règle se perdra.
     pub async fn resolve_github_token(
         &self,
         github_app: Option<&crate::github_app::GitHubApp>,
     ) -> Option<String> {
-        // PAT first — the agent's machine user identity.
+        // PAT-first : opérations identitaires où GitHub expose l'auteur
+        // (approve, merge) — le PAT machine est l'identité que la forge lit.
         if let Some(pat) = self.github_token.as_ref() {
             return Some(pat.expose_secret().to_string());
         }
@@ -1483,6 +1489,70 @@ impl Settings {
                     );
                 }
             }
+        }
+        None
+    }
+
+    /// Résout le token des **écritures de label** — App d'abord (mika#2228).
+    ///
+    /// App-first : écritures non-identitaires (labels, status checks) où
+    /// l'origine est technique. GitHub enregistre qui a posé `ready`, mais
+    /// aucune règle de la forge ne lit cet auteur — contrairement à approve et
+    /// merge, qui gardent [`Settings::resolve_github_token`] (PAT-first) et ne
+    /// passent pas par ici.
+    ///
+    /// # Pourquoi l'inversion, et pas seulement le repli de mika#2205
+    ///
+    /// mika#2205 avait déjà rendu l'App acceptable **en repli** pour ces mêmes
+    /// scans. Le repli n'a jamais été atteint : le PAT résolu authentifie — les
+    /// scans tournent — mais n'a pas `issues: write`, donc chaque `--add-label`
+    /// meurt sur `Resource not accessible by personal access token
+    /// (addLabelsToLabelable)`. 34 refus mesurés le 2026-09-07 (29 sur le
+    /// marqueur `operator-gated`, 5 sur la promotion `ready` de l'auto-feeder),
+    /// pendant que le chemin App était sain. Un token qui authentifie et
+    /// n'autorise pas ne déclenche aucun repli : il faut inverser la priorité,
+    /// pas en ajouter un.
+    ///
+    /// # Échec de l'échange App
+    ///
+    /// Si l'échange App échoue (App absente du déploiement, réseau, clé
+    /// invalide), on retombe sur le PAT — c'est le comportement d'avant
+    /// mika#2228, et il est correct : sur un déploiement sans App, le PAT est
+    /// la seule identité disponible. Ce que ce chemin ne couvre **pas**, et ne
+    /// doit pas couvrir, c'est l'App présente dont l'installation n'a pas
+    /// `Issues: write` : là l'échange réussit, le token revient, et c'est
+    /// l'écriture qui est refusée — signalée par
+    /// [`crate::label_write::LabelWriteToken::report_write_failure`] sous son
+    /// propre nom, sans second essai au PAT qui échouerait de la même façon.
+    pub async fn resolve_label_write_token(
+        &self,
+        github_app: Option<&crate::github_app::GitHubApp>,
+    ) -> Option<crate::label_write::LabelWriteToken> {
+        use crate::label_write::{LabelWriteToken, LabelWriteTokenSource};
+
+        if let Some(app) = github_app {
+            match app.installation_token().await {
+                Ok(token) => {
+                    return Some(LabelWriteToken::new(token, LabelWriteTokenSource::App));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "mika::github_auth",
+                        event = "gh_app_token_exchange_failed",
+                        error = %e,
+                        has_pat_fallback = self.github_token.is_some(),
+                        scope = "label_write",
+                        "GitHub App token exchange failed for a label write"
+                    );
+                }
+            }
+        }
+
+        if let Some(pat) = self.github_token.as_ref() {
+            return Some(LabelWriteToken::new(
+                pat.expose_secret().to_string(),
+                LabelWriteTokenSource::Pat,
+            ));
         }
         None
     }
@@ -2325,6 +2395,7 @@ impl std::fmt::Debug for Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::label_write::LabelWriteTokenSource;
     use serial_test::serial;
 
     /// Set required env vars and clear optional ones to ensure clean state.
@@ -2816,6 +2887,66 @@ mod tests {
 
         let resolved = settings.resolve_github_token(None).await;
         assert!(resolved.is_none());
+    }
+
+    // -- mika#2228 : écritures de label, App d'abord --
+
+    #[tokio::test]
+    #[serial]
+    async fn mika2228_label_write_prefers_the_app_token_over_the_pat() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut settings = Settings::load(tmp.path()).unwrap();
+        // Le PAT est là — et c'est exactement la configuration mesurée le
+        // 2026-09-07 : présent, authentifiant, sans `issues: write`.
+        settings.github_token = Some("github_pat_test_value".to_string().into());
+
+        let app = crate::github_app::GitHubApp::new_with_test_token("ghs_app_installation").await;
+        let resolved = settings
+            .resolve_label_write_token(Some(app.as_ref()))
+            .await
+            .expect("un token doit être résolu quand PAT et App sont là");
+
+        assert_eq!(resolved.token(), "ghs_app_installation");
+        assert_eq!(resolved.source(), LabelWriteTokenSource::App);
+
+        // Et le résolveur identitaire, lui, ne bouge pas (AC4) : la même
+        // configuration continue de rendre le PAT pour approve/merge.
+        let identity = settings.resolve_github_token(Some(app.as_ref())).await;
+        assert_eq!(identity.as_deref(), Some("github_pat_test_value"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn mika2228_label_write_falls_back_to_the_pat_when_no_app_is_configured() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut settings = Settings::load(tmp.path()).unwrap();
+        settings.github_token = Some("github_pat_test_value".to_string().into());
+
+        // App absente : déploiement mono-identité, bootstrap. Le comportement
+        // d'avant mika#2228 doit être préservé tel quel (AC2).
+        let resolved = settings
+            .resolve_label_write_token(None)
+            .await
+            .expect("le PAT doit servir de repli quand l'App est absente");
+
+        assert_eq!(resolved.token(), "github_pat_test_value");
+        assert_eq!(resolved.source(), LabelWriteTokenSource::Pat);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn mika2228_label_write_returns_none_when_nothing_is_configured() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+        assert!(settings.github_token.is_none());
+
+        assert!(settings.resolve_label_write_token(None).await.is_none());
     }
 
     #[test]
