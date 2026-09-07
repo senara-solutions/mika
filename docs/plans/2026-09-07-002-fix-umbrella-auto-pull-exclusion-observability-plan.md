@@ -40,14 +40,17 @@ Un seul changement de code satisfait les deux → PR atomique, un échec → tou
   au point de code) : quel volume d'exclusion va en INFO, quel volume en `audit_events`, pour
   qu'un tick touchant des dizaines de tickets ne noie pas le journal.
 
-## Politique journal-vs-audit_events (AC5, décidée ici)
+## Politique journal-vs-audit_events (AC5, décidée — canal VÉRIFIÉ)
 
-Décision : **les exclusions vont en `audit_events`** (structuré, requêtable, sans noyer le
-journal INFO), avec un **résumé agrégé unique par tick en INFO** (« N tickets écartés ce tick :
-<compte par filtre> »). Rationale : un tick peut écarter des dizaines de tickets ; le détail
+**Fait vérifié (mika-arch F1) :** `auto_pull.rs` émet DÉJÀ des `log_audit_event` (9 sites
+existants). Le canal `audit_events` existe et auto_pull l'utilise — aucun ajout d'architecture.
+
+Décision : **le détail par-ticket des exclusions va en `log_audit_event`** (structuré, requêtable,
+sans noyer le journal), **plus un résumé agrégé unique par tick en INFO** (« N tickets écartés ce
+tick : <compte par filtre> »). Rationale : un tick peut écarter des dizaines de tickets ; le détail
 par-ticket appartient à `audit_events` (interrogeable a posteriori sur #1651/#1403), le journal
-INFO ne porte que l'agrégat actionnable. À confirmer/ajuster par l'architecte selon l'existence
-d'un canal `audit_events` pour auto_pull.
+INFO ne porte que l'agrégat actionnable. Le canal existant rend cette décision immédiate, pas un
+changement de surface.
 
 ## Fire-Disposition
 
@@ -58,8 +61,9 @@ les exclusions refait échouer `Check`.
 
 ## Phases
 
-1. **Repérer les points d'exclusion** dans `auto_pull.rs` (les `debug!` de skip par filtre, phases
-   2-3, `stuck_ready_reconcile`).
+1. **Repérer les points d'exclusion** dans `auto_pull.rs` — la chaîne de `.filter(...)` (~lignes
+   988-996 : `is_feeder_excluded`, `is_groomed`, open-PR, `ready`) + les filtres de phases 2-3 et
+   `stuck_ready_reconcile`. Ces `.filter()` écartent aujourd'hui sans trace collectée.
 2. **Émettre la trace observable** (AC1/AC3) : par exclusion → entrée `audit_events` nommant
    ticket+filtre ; par tick → un résumé agrégé INFO (AC5). Contrôle négatif préservé (AC2).
 3. **Test non-vacuité** (AC4) : rejouer un tick avec #1651/#1403 → 2 traces nommant le filtre.
