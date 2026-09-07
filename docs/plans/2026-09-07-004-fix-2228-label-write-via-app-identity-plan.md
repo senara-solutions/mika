@@ -71,3 +71,8 @@ AC3 s'appuie sur des **détecteurs déjà existants** (les events ERROR `auto_pu
 
 - **App sans `issues: write`** : couvert par AC5 (échec loud nommé) + checklist opérateur.
 - **Portée** : les 3 chemins de label (auto_pull, auto-feeder, wip_rescue) sont couverts ; comments explicitement exclus faute d'évidence — bordé.
+
+## Note d'implémentation (guidance GROOMED mika-arch)
+
+1. **Commentaire canonique** dans les deux résolveurs nommant la règle : `resolve_github_token` → `// PAT-first : opérations identitaires où GitHub expose l'auteur (approve, merge)` ; `resolve_label_write_token` → `// App-first : écritures non-identitaires (labels, status checks) où l'origine est technique`.
+2. **Matching d'erreur 403 (AC5)** : préciser le mécanisme (code HTTP/message gh) pour distinguer « App token permission insuffisante » d'une autre erreur App. Si le matching s'avère impraticable, le repli le moins pire est « toute erreur App → erreur nommée » (jamais fallback PAT silencieux). L'erreur LOUD reste l'option sûre.
