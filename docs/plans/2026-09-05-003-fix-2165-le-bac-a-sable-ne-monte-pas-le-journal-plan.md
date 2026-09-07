@@ -385,3 +385,19 @@ disque et sur GitHub il s'appelle `claude-pilot`. Sans effet sur ce plan.
 journal ne peut plus être silencieuse : l'hôte constate l'absence du `.log` après la session et
 l'écrit dans le `.stderr` », puis relancer `/mika-groom-ticket`. (2) Éditer le plan pour suivre
 AC3 à la lettre — non recommandé : le livrable serait un no-op. (3) Trancher à la main.
+
+---
+
+## Contexte d'itération (2026-09-07, re-passe rouge) — COLLISION avec la garde secret-channel #2039
+
+**À LIRE avant la prochaine itération (porté dans le plan car le canal commentaire est invisible au pilote — leçon #2178).**
+
+La re-passe a laissé `Check` ROUGE. L'échec n'est PAS dans les assertions de ce plan (le journal se monte bien) : c'est **`make test-sandbox-secret-argv` (garde secret-channel mika#2039) qui échoue, 1/34** (run CI 34145121606, job Check, étape « Pilot sandbox secret-channel guards (mika#2039) »).
+
+**Cause : collision.** Le montage du journal dans le sandbox bwrap (le fix de ce ticket) fait trébucher la garde #2039, qui vérifie qu'**aucune valeur secrète ne fuit dans l'argv / le `--setenv` du sandbox**. Le nouveau `--bind` (ou la façon dont le chemin du log est passé) déclenche cette détection.
+
+**Travail requis pour la prochaine itération :** réconcilier le bind du journal avec `test-sandbox-secret-argv`. Deux voies :
+1. Ajuster la garde #2039 pour reconnaître le bind légitime du log-dir (s'il n'introduit réellement aucun secret) ;
+2. Changer la façon dont le log-dir est transmis au sandbox pour ne pas passer par un chemin que la garde secret-in-argv flague.
+
+**Critère de sortie : `make test-sandbox-secret-argv` VERT** (34/34) **ET** les assertions du journal de ce plan vertes, avant de rendre. Ne pas rendre tant que Check est rouge.
