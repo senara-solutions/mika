@@ -227,16 +227,30 @@ async fn main() -> Result<()> {
     } else {
         LogOutput::PrettyAndFile
     };
-    let log_llm_bodies = std::env::var("MIKA_LOG_LLM_BODIES")
-        .ok()
-        .is_some_and(|v| v == "true" || v == "1");
+    // mika#2220: one truth table, shared with the daemon's config-rs parse.
+    let log_llm_bodies = mika_common::logging::log_llm_bodies_from_env();
     let _log_guard = mika_common::logging::init_pretty(
         &log_level,
         log_dir.as_deref(),
         log_output,
         otel_layer,
-        log_llm_bodies,
+        log_llm_bodies.enabled(),
     );
+    // After init — a warning emitted before the subscriber exists reaches nobody.
+    log_llm_bodies.warn_if_unrecognized();
+
+    // mika#2220: `mika ask` has not run the agent loop in-process since mika#1727 —
+    // it ships the prompt to mika-spirit over A2A. Arming capture here therefore
+    // captures nothing of the turn, and the resulting empty per-agent log is what
+    // this ticket was filed about. Say so at the one moment the operator is looking.
+    if log_llm_bodies.enabled() && matches!(cli.command, Some(Commands::Ask(_))) {
+        tracing::warn!(
+            event = "llm_body_capture_wrong_process",
+            "`mika ask` dispatches the turn to mika-spirit (mika#1727), so this \
+             process logs no LLM body for it. Arm MIKA_LOG_LLM_BODIES on mika-spirit \
+             and read MIKA_SPIRIT_LOG_FILE instead."
+        );
+    }
 
     // Validate -c/--continue conflicts with --session-id (can't use clap conflicts_with
     // across global and subcommand args).
@@ -427,16 +441,17 @@ fn init_team_logging(
         .map(|s| mika_common::telemetry::try_init_otel(&s))
         .unwrap_or((None, None));
     let log_dir = team::team_dir(global_home, team_name).join("logs");
-    let log_llm_bodies = std::env::var("MIKA_LOG_LLM_BODIES")
-        .ok()
-        .is_some_and(|v| v == "true" || v == "1");
+    // mika#2220: one truth table, shared with the daemon's config-rs parse.
+    let log_llm_bodies = mika_common::logging::log_llm_bodies_from_env();
     let log_guard = mika_common::logging::init_pretty(
         &log_level,
         Some(&log_dir),
         LogOutput::FileOnly,
         otel_layer,
-        log_llm_bodies,
+        log_llm_bodies.enabled(),
     );
+    // After init — a warning emitted before the subscriber exists reaches nobody.
+    log_llm_bodies.warn_if_unrecognized();
     (log_guard, telemetry_guard)
 }
 
@@ -455,16 +470,17 @@ fn init_team_logging(
         .map(|s| mika_common::telemetry::try_init_otel(&s))
         .unwrap_or((None, None));
     let log_dir = team::team_dir(global_home, team_name).join("logs");
-    let log_llm_bodies = std::env::var("MIKA_LOG_LLM_BODIES")
-        .ok()
-        .is_some_and(|v| v == "true" || v == "1");
+    // mika#2220: one truth table, shared with the daemon's config-rs parse.
+    let log_llm_bodies = mika_common::logging::log_llm_bodies_from_env();
     let log_guard = mika_common::logging::init_pretty(
         &log_level,
         Some(&log_dir),
         LogOutput::FileOnly,
         otel_layer,
-        log_llm_bodies,
+        log_llm_bodies.enabled(),
     );
+    // After init — a warning emitted before the subscriber exists reaches nobody.
+    log_llm_bodies.warn_if_unrecognized();
     (log_guard, telemetry_guard)
 }
 
@@ -485,6 +501,40 @@ fn parse_log_level(content: &str) -> Option<String> {
 mod tests {
     use super::*;
     use mika_common::home;
+
+    /// Own source, read back for the structural guard below.
+    const THIS_FILE: &str = include_str!("main.rs");
+
+    /// mika#2220 — no call site here may read `MIKA_LOG_LLM_BODIES` itself.
+    ///
+    /// The three that did (`main`, and both `init_team_logging` variants) each
+    /// open-coded `v == "true" || v == "1"`, byte-exact and lowercase-only, while
+    /// the daemon reached the same flag through config-rs and accepted
+    /// `1 / true / on / yes` case-insensitively. So `MIKA_LOG_LLM_BODIES=True`
+    /// armed mika-spirit and was a silent no-op on every `mika` process — the
+    /// reported "works for the daemon, inert for the agent".
+    ///
+    /// A unit test on `parse_log_llm_bodies` cannot see this class: the defect was
+    /// never a wrong parse, it was a caller that did not ask the parser. Hence a
+    /// source scan, matching the `mika2195_*` guards in `mika-common::logging`.
+    ///
+    /// The check is on the *reading* shape — the variable's name closing a string
+    /// literal argument — not on the name itself, so the operator-facing message
+    /// that names the variable in prose stays legal.
+    ///
+    /// The needle is assembled at runtime rather than written as a literal: a
+    /// source scan whose pattern appears in its own source matches itself and
+    /// fails forever. (It did, once, before this line.)
+    #[test]
+    fn mika2220_no_local_reparse_of_the_llm_bodies_env_var() {
+        let read_shape = format!("{}\")", mika_common::logging::LOG_LLM_BODIES_ENV);
+        assert!(
+            !THIS_FILE.contains(&read_shape),
+            "read the flag through mika_common::logging::log_llm_bodies_from_env() — \
+             a second parse here is how the CLI and the daemon came to disagree on \
+             `True` (mika#2220)"
+        );
+    }
 
     #[test]
     fn test_parse_log_level_quoted() {
