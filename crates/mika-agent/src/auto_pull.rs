@@ -1110,6 +1110,243 @@ fn feeder_rank(labels: &[IssueLabel]) -> u8 {
         .unwrap_or(0)
 }
 
+// ───────── Exclusion observability (mika#2131 AC6/AC7 + mika#2132 AC1–AC5) ─────────
+
+/// The audit `tool_name` every exclusion row carries.
+///
+/// One name, deliberately, so that
+/// `SELECT * FROM audit_events WHERE tool_name = 'auto_pull_exclusion'` is the
+/// **whole** answer to "why was this ticket never dispatched?". Two names would
+/// mean a reader who queries one of them gets a smaller, plausible, wrong
+/// answer — the failure shape this ticket exists to remove.
+const EXCLUSION_TOOL_NAME: &str = "auto_pull_exclusion";
+
+/// Per-phase cap on the **per-ticket detail** written to `audit_events` in one
+/// tick. The per-tick INFO aggregate is never capped — see [`ExclusionLedger`].
+const EXCLUSION_AUDIT_DETAIL_CAP: usize = 50;
+
+// Phase names. Reused verbatim from the `phase` argument the staleness gate
+// already passes to `promotion_gate_allows`, so one vocabulary covers both
+// audit surfaces rather than two that drift.
+const PHASE_FEEDER: &str = "phase0_feeder";
+const PHASE_IDLE_PULL: &str = "phase1_idle_pull";
+const PHASE_STUCK_RESCUE: &str = "phase2_stuck_rescue";
+
+// Filter names. The first five are the exact strings [`StuckReadyVerdict::Skip`]
+// already carried into its `debug!`, kept so the taxonomy this ticket makes
+// visible is the one the code was already reasoning in — not a second one
+// invented at the moment of publication.
+const FILTER_OPEN_PR_CLOSING: &str = "open_pr_closing";
+const FILTER_IN_FLIGHT_SELF_DEV: &str = "in_flight_self_dev";
+const FILTER_OPERATOR_REVIEW_OR_BLOCKED: &str = "operator_review_or_blocked";
+const FILTER_CIRCUIT_BREAKER: &str = "circuit_breaker";
+const FILTER_BELOW_THRESHOLD: &str = "below_threshold";
+const FILTER_NOT_GROOMED: &str = "not_groomed";
+const FILTER_PLAN_OWNED_BY_OTHER_ISSUE: &str = "plan_owned_by_other_issue";
+const FILTER_SEAT_REFUSED: &str = "seat_refused";
+const FILTER_IN_FLIGHT_PROBE_ERROR: &str = "in_flight_probe_error";
+const FILTER_LABEL_AGE_READ_ERROR: &str = "label_age_read_error";
+const FILTER_UNEXPECTED_VERDICT: &str = "unexpected_verdict";
+
+/// One ticket, dropped by one named filter, in one phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExclusionRecord {
+    phase: &'static str,
+    issue: u64,
+    filter: &'static str,
+}
+
+/// The tick's exclusion ledger — every ticket auto-pull declined to act on, and
+/// the filter that declined it (mika#2131 AC6, mika#2132 AC1/AC3).
+///
+/// # The failure this replaces
+///
+/// Every skip decision was a `debug!` on target `mika_agent::auto_pull`, and the
+/// server's log filter admits DEBUG for `mika::llm_debug` **only**. Measured over
+/// the last 200 MB of `/var/log/mika/server.log` (2026-09-03): 0 occurrences of
+/// `stuck_ready_reconcile_skipped`, 184 of `auto_feeder_no_backlog` — an `info!`
+/// from the same module — and 0 DEBUG lines carrying this module's target at all.
+/// The control is clean in both directions: the module logs, and none of its
+/// DEBUG survives. mika#1651 and mika#1403 were therefore dropped on every tick
+/// from 2026-08-30 onward with nothing anywhere saying so, and mika#2117 sat
+/// `ready` and undispatched for three days after the mika#2127 fix had already
+/// ruled out the other cause.
+///
+/// Raising the log filter was the obvious remedy and is the wrong one: it depends
+/// on an env var read at startup, it does not survive a misconfigured restart,
+/// and it says nothing to whoever reads the journal of an already-running server.
+///
+/// # Channel policy (mika#2132 AC5) — decided, and here is the reasoning
+///
+/// **Per-ticket detail goes to `audit_events`; one aggregate per tick goes to
+/// INFO.** A tick can decline dozens of tickets (the backlog is fetched at
+/// `--limit 100`), so per-ticket lines in the journal would be the mirror defect
+/// of the silence — a channel nobody reads because it says too much. The detail
+/// belongs in a queryable table, where the question "why was #1651 skipped on
+/// 2026-08-30?" is a `WHERE` clause; the journal carries only the actionable
+/// aggregate. `auto_pull` already writes nine `log_audit_event` calls, so this
+/// adds no architecture — it uses the channel the module already has.
+///
+/// **The detail is capped per phase, the aggregate never is.** Past
+/// [`EXCLUSION_AUDIT_DETAIL_CAP`] rows in one phase the ledger stops writing
+/// detail and *says so* (`audit_truncated`), rather than silently writing a
+/// prefix. The count in the aggregate stays exact either way, so the instrument
+/// never misreports what it did not write. The bound is real: uncapped, a
+/// 100-ticket backlog × 144 ticks/day × the 90-day `compact_old_audit_events`
+/// window is over a million rows in a table other consumers read.
+///
+/// # What is deliberately NOT recorded, and why
+///
+/// - **The `ready` / `!ready` split.** It partitions tickets between phases; it
+///   does not exclude any of them. A ticket without `ready` is not "dropped by
+///   Phase 2", it is Phase 1's business. Recording it would put every open issue
+///   in the ledger on every tick, and per mika#2131 AC7 an observability that
+///   logs everyone distinguishes no one.
+/// - **[`count_pullable_ready`].** It counts a pool, it selects nothing. The same
+///   tickets are seen by Phase 2, which filters on `ready` and records them there.
+/// - **Abandonments** ([`abandon_stuck_ready`]) and **staleness refusals**
+///   ([`promotion_gate_allows`]). Both already write their own audit row, a WARN
+///   or INFO line, and — for abandonment — a comment on the ticket itself. They
+///   are louder than this channel, not quieter; doubling them would inflate the
+///   very count this ledger exists to make trustworthy.
+#[derive(Debug, Default)]
+struct ExclusionLedger {
+    records: Vec<ExclusionRecord>,
+}
+
+impl ExclusionLedger {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Note that `phase` declined `issue`, naming the filter that did it.
+    fn record(&mut self, phase: &'static str, issue: u64, filter: &'static str) {
+        self.records.push(ExclusionRecord {
+            phase,
+            issue,
+            filter,
+        });
+    }
+
+    fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// Exclusion counts keyed `<phase>/<filter>`. `BTreeMap` for a deterministic
+    /// rendering — an aggregate whose field order shuffles between ticks cannot
+    /// be diffed across a window.
+    fn counts_by_filter(&self) -> std::collections::BTreeMap<String, usize> {
+        let mut counts = std::collections::BTreeMap::new();
+        for r in &self.records {
+            *counts
+                .entry(format!("{}/{}", r.phase, r.filter))
+                .or_insert(0) += 1;
+        }
+        counts
+    }
+
+    /// Write the tick's exclusions: one `audit_events` row per ticket (capped per
+    /// phase) plus one aggregate INFO line.
+    ///
+    /// **Silence is the negative control** (mika#2131 AC7, mika#2132 AC2): a tick
+    /// where every ticket cleared every filter returns here with an empty ledger
+    /// and writes nothing at all — no row, no line. That is what makes a written
+    /// line mean something.
+    async fn flush(&self, db: &AsyncDatabase, trace_id: &str, session_id: &str) {
+        if self.is_empty() {
+            return;
+        }
+
+        let mut written_per_phase: std::collections::BTreeMap<&'static str, usize> =
+            std::collections::BTreeMap::new();
+        let mut truncated = false;
+
+        for r in &self.records {
+            let written = written_per_phase.entry(r.phase).or_insert(0);
+            if *written >= EXCLUSION_AUDIT_DETAIL_CAP {
+                truncated = true;
+                continue;
+            }
+            *written += 1;
+
+            if let Err(e) = db
+                .log_audit_event(
+                    session_id,
+                    EXCLUSION_TOOL_NAME,
+                    &format!("issue:{}", r.issue),
+                    None,
+                    Some(r.filter),
+                    Some(r.phase),
+                    Some(trace_id),
+                )
+                .await
+            {
+                warn!(
+                    error = %e,
+                    issue = r.issue,
+                    phase = r.phase,
+                    filter = r.filter,
+                    "auto_pull_exclusion_audit_write_failed"
+                );
+            }
+        }
+
+        let counts = self.counts_by_filter();
+        info!(
+            total = self.records.len(),
+            audit_truncated = truncated,
+            by_filter = %serde_json::to_string(&counts)
+                .unwrap_or_else(|_| "<unserializable>".to_string()),
+            "auto_pull_exclusions"
+        );
+    }
+}
+
+/// The exclusion filters shared by Phase 0 and Phase 1 — both select from the
+/// groomed-not-ready backlog, and both applied the same predicates in the same
+/// order as anonymous `.filter(...)` closures before this ticket. Returns the
+/// name of the first filter that drops `issue`, or `None` when it survives all
+/// of them.
+///
+/// `in_flight` is `None` for Phase 1, which has no in-flight probe (its
+/// queue-empty gate makes one redundant).
+///
+/// The `ready` / `!ready` split is **not** evaluated here — see
+/// [`ExclusionLedger`] for why a partition is not an exclusion.
+///
+/// Order note: [`seat_refusal`] is checked ahead of [`is_feeder_excluded`] even
+/// though the latter would also catch it, exactly as
+/// [`classify_stuck_ready_in_memory`] already does and for the same reason — the
+/// recorded reason is the operator's tally of avoided collisions, so naming a
+/// seat collision `operator_review_or_blocked` would be the wrong cause on a
+/// correct decision. Reordering the filters does not change *which* tickets
+/// survive, only which name a dropped one is filed under.
+fn backlog_exclusion(
+    issue: &Issue,
+    open_pr_issue_numbers: &HashSet<u64>,
+    in_flight_issue_numbers: Option<&HashSet<u64>>,
+) -> Option<&'static str> {
+    if open_pr_issue_numbers.contains(&issue.number) {
+        return Some(FILTER_OPEN_PR_CLOSING);
+    }
+    if in_flight_issue_numbers.is_some_and(|s| s.contains(&issue.number)) {
+        return Some(FILTER_IN_FLIGHT_SELF_DEV);
+    }
+    if let Some(verdict) = seat_refusal(issue) {
+        return Some(verdict.refusal_reason().unwrap_or(FILTER_SEAT_REFUSED));
+    }
+    if is_feeder_excluded(issue) {
+        return Some(FILTER_OPERATOR_REVIEW_OR_BLOCKED);
+    }
+    if !is_groomed(&issue.body) {
+        return Some(FILTER_NOT_GROOMED);
+    }
+    if warn_and_reject_foreign_plan(issue) {
+        return Some(FILTER_PLAN_OWNED_BY_OTHER_ISSUE);
+    }
+    None
+}
+
 // ───────────────────── Selection logic ─────────────────────
 
 /// Select the best groomed-not-ready ticket from a list of open issues.
@@ -1119,23 +1356,29 @@ fn feeder_rank(labels: &[IssueLabel]) -> u8 {
 /// dispatch-lib's recovery paths leave a DRAFT PR), then ranks by priority
 /// (p0 > p1 > p2 > p3 > unlabelled) and by oldest `updated_at` within same
 /// priority.
-pub fn select_best_candidate(
+///
+/// The filter chain is [`backlog_exclusion`] — the same predicates in the same
+/// order as the `.filter(...)` closures this replaced (mika#2020 R11 included:
+/// `blocked`/`operator-review` are structural exclusions here as they have always
+/// been in Phase 0, without which a ticket handed to the operator could be
+/// re-promoted to `ready` on the very next idle tick). Each drop is now recorded
+/// in `ledger` instead of vanishing.
+fn select_best_candidate_recording(
     issues: Vec<Issue>,
     open_pr_issue_numbers: &HashSet<u64>,
+    ledger: &mut ExclusionLedger,
 ) -> Option<Issue> {
-    let candidates: Vec<_> = issues
-        .into_iter()
-        .filter(|i| !i.labels.iter().any(|l| l.name == "ready"))
-        .filter(|i| !open_pr_issue_numbers.contains(&i.number))
-        // mika#2020 R11: `blocked`/`operator-review` are structural exclusions,
-        // as Phase 0 has always treated them. Phase 1 did not, which left the
-        // abandonment leaking: a groomed ticket handed to the operator could be
-        // re-promoted to `ready` here on the very next idle tick, and the
-        // `ready` webhook would dispatch it again.
-        .filter(|i| !is_feeder_excluded(i))
-        .filter(|i| is_groomed(&i.body))
-        .filter(|i| !warn_and_reject_foreign_plan(i))
-        .collect();
+    let mut candidates: Vec<Issue> = Vec::new();
+    for issue in issues {
+        // Partition, not exclusion: a `ready` ticket is Phase 2's business.
+        if issue.labels.iter().any(|l| l.name == "ready") {
+            continue;
+        }
+        match backlog_exclusion(&issue, open_pr_issue_numbers, None) {
+            Some(filter) => ledger.record(PHASE_IDLE_PULL, issue.number, filter),
+            None => candidates.push(issue),
+        }
+    }
 
     if candidates.is_empty() {
         return None;
@@ -1146,6 +1389,20 @@ pub fn select_best_candidate(
         let pb = priority_rank(&b.labels);
         pa.cmp(&pb).then_with(|| b.updated_at.cmp(&a.updated_at))
     })
+}
+
+/// Selection without a ledger — **tests only**, on purpose.
+///
+/// Production goes through [`select_best_candidate_recording`], whose ledger
+/// parameter is not optional. A convenience wrapper reachable from production
+/// would be a way to re-lose the traces this ticket exists to produce, so it is
+/// gated out of the build the server ships.
+#[cfg(test)]
+fn select_best_candidate(
+    issues: Vec<Issue>,
+    open_pr_issue_numbers: &HashSet<u64>,
+) -> Option<Issue> {
+    select_best_candidate_recording(issues, open_pr_issue_numbers, &mut ExclusionLedger::new())
 }
 
 /// Pure selection predicate for the Phase 2 stuck-ready reconciler (mika#1824
@@ -1416,21 +1673,24 @@ fn count_pullable_ready(
 ///
 /// Pure/in-memory — no GitHub or DB calls. The async wrapper resolves the
 /// `in_flight` set and wires real `gh`/DB, same split as the Phase 2 predicate.
-fn select_feeder_candidates(
+fn select_feeder_candidates_recording(
     issues: &[Issue],
     open_pr_issue_numbers: &HashSet<u64>,
     in_flight_issue_numbers: &HashSet<u64>,
     slots: usize,
+    ledger: &mut ExclusionLedger,
 ) -> Vec<u64> {
-    let mut candidates: Vec<&Issue> = issues
-        .iter()
-        .filter(|i| !i.labels.iter().any(|l| l.name == "ready"))
-        .filter(|i| !open_pr_issue_numbers.contains(&i.number))
-        .filter(|i| !in_flight_issue_numbers.contains(&i.number))
-        .filter(|i| !is_feeder_excluded(i))
-        .filter(|i| is_groomed(&i.body))
-        .filter(|i| !warn_and_reject_foreign_plan(i))
-        .collect();
+    let mut candidates: Vec<&Issue> = Vec::new();
+    for issue in issues {
+        // Partition, not exclusion (see [`ExclusionLedger`]).
+        if issue.labels.iter().any(|l| l.name == "ready") {
+            continue;
+        }
+        match backlog_exclusion(issue, open_pr_issue_numbers, Some(in_flight_issue_numbers)) {
+            Some(filter) => ledger.record(PHASE_FEEDER, issue.number, filter),
+            None => candidates.push(issue),
+        }
+    }
 
     // Rank DESC, then oldest `updated_at` first within a rank tier.
     candidates.sort_by(|a, b| {
@@ -1444,6 +1704,24 @@ fn select_feeder_candidates(
         .take(slots.min(FEEDER_WORKING_SET_CAP))
         .map(|i| i.number)
         .collect()
+}
+
+/// Feeder selection without a ledger — **tests only**. Same rationale as
+/// [`select_best_candidate`]: production must not have a ledger-free door.
+#[cfg(test)]
+fn select_feeder_candidates(
+    issues: &[Issue],
+    open_pr_issue_numbers: &HashSet<u64>,
+    in_flight_issue_numbers: &HashSet<u64>,
+    slots: usize,
+) -> Vec<u64> {
+    select_feeder_candidates_recording(
+        issues,
+        open_pr_issue_numbers,
+        in_flight_issue_numbers,
+        slots,
+        &mut ExclusionLedger::new(),
+    )
 }
 
 // ───────────────────── GitHub CLI helpers ─────────────────────
@@ -2182,6 +2460,12 @@ pub async fn auto_pull_groomed_ticket(
         }
     };
 
+    // One ledger for the whole tick (mika#2131 + mika#2132). The three phases
+    // record into it; it is flushed once at the end, so the aggregate INFO line
+    // is per tick — not per phase — and an operator reading the journal sees one
+    // number per pass of the loop.
+    let mut ledger = ExclusionLedger::new();
+
     // Phase 0 — feeder: top the pullable-ready pool up to MIN_READY (mika#1863).
     // Runs BEFORE Phase 1 in the same tick, sharing the two `gh` fetches above,
     // so AC2's "feeder promotes → puller picks up same tick" is structural, not
@@ -2193,6 +2477,7 @@ pub async fn auto_pull_groomed_ticket(
         &open_pr_issue_numbers,
         trace_id,
         session_id,
+        &mut ledger,
     )
     .await;
     debug!(fed, "auto_pull: phase 0 feeder complete");
@@ -2212,6 +2497,7 @@ pub async fn auto_pull_groomed_ticket(
         &open_pr_issue_numbers,
         trace_id,
         session_id,
+        &mut ledger,
     )
     .await;
 
@@ -2223,12 +2509,17 @@ pub async fn auto_pull_groomed_ticket(
         &open_pr_issue_numbers,
         trace_id,
         session_id,
+        &mut ledger,
     )
     .await;
     debug!(
         rescued,
         "auto_pull: phase 2 stuck-ready reconciler complete"
     );
+
+    // Publish the tick's exclusions. Writes nothing when nothing was excluded —
+    // that silence is the negative control (mika#2131 AC7 / mika#2132 AC2).
+    ledger.flush(db, trace_id, session_id).await;
 
     promoted
 }
@@ -2253,6 +2544,7 @@ async fn phase0_feed_ready_pool(
     open_pr_issue_numbers: &HashSet<u64>,
     trace_id: &str,
     session_id: &str,
+    ledger: &mut ExclusionLedger,
 ) -> usize {
     // R2: read the pool target; `0` disables the feeder entirely.
     let min_ready = auto_feeder_min_ready();
@@ -2329,11 +2621,12 @@ async fn phase0_feed_ready_pool(
 
     // R5: promote up to `min_ready − pullable` top candidates.
     let slots = min_ready as usize - pullable;
-    let candidates = select_feeder_candidates(
+    let candidates = select_feeder_candidates_recording(
         issues,
         open_pr_issue_numbers,
         &in_flight_issue_numbers,
         slots,
+        ledger,
     );
 
     if candidates.is_empty() {
@@ -2371,6 +2664,7 @@ async fn phase0_feed_ready_pool(
                     failure_count = count,
                     "auto_feeder: circuit-breaker skip for #{n} ({count}× failures)"
                 );
+                ledger.record(PHASE_FEEDER, n, FILTER_CIRCUIT_BREAKER);
                 continue;
             }
             Err(e) => {
@@ -2465,6 +2759,7 @@ async fn phase1_promote_groomed(
     open_pr_issue_numbers: &HashSet<u64>,
     trace_id: &str,
     session_id: &str,
+    ledger: &mut ExclusionLedger,
 ) -> Option<u64> {
     // 1. Queue-empty gate (F2): check if mika-dev has active self_dev tasks.
     let queue_count = match db.count_active_self_dev_tasks().await {
@@ -2483,13 +2778,15 @@ async fn phase1_promote_groomed(
     }
 
     // 3. Select the best groomed-not-ready candidate (skip those with open PRs).
-    let candidate = match select_best_candidate(issues.to_vec(), open_pr_issue_numbers) {
-        Some(c) => c,
-        None => {
-            debug!("auto_pull: no groomed-not-ready candidates found");
-            return None;
-        }
-    };
+    //    Every ticket the chain drops is recorded in `ledger` on the way past.
+    let candidate =
+        match select_best_candidate_recording(issues.to_vec(), open_pr_issue_numbers, ledger) {
+            Some(c) => c,
+            None => {
+                debug!("auto_pull: no groomed-not-ready candidates found");
+                return None;
+            }
+        };
 
     // 4. Circuit-breaker check (AC3): skip if failure_count >= threshold.
     match db
@@ -2522,6 +2819,11 @@ async fn phase1_promote_groomed(
             {
                 warn!(error = %e, "auto_pull: failed to write skip audit event");
             }
+            // Also recorded in the tick ledger. The duplication with
+            // `auto_pull_skip` above is one row per tick at most, and it is what
+            // makes `tool_name = 'auto_pull_exclusion'` a complete answer rather
+            // than one that silently omits a filter.
+            ledger.record(PHASE_IDLE_PULL, candidate.number, FILTER_CIRCUIT_BREAKER);
             return None;
         }
         Err(e) => {
@@ -2621,10 +2923,17 @@ async fn phase1_promote_groomed(
 ///
 /// Filter chain follows the D2 cost-bounded ordering (cheapest → most
 /// expensive): in-memory ready/open-PR, DB in-flight, DB circuit-breaker, then
-/// one GitHub timeline API call per survivor for the label age. Each drop emits
-/// a `stuck_ready_reconcile_skipped` DEBUG with its reason. Survivors past the
-/// age threshold are remove→add rescued (capped at [`MAX_STUCK_RESCUE_PER_TICK`]),
-/// emitting `stuck_ready_reconciled` INFO on success. Returns the rescue count.
+/// one GitHub timeline API call per survivor for the label age. Survivors past
+/// the age threshold are remove→add rescued (capped at
+/// [`MAX_STUCK_RESCUE_PER_TICK`]), emitting `stuck_ready_reconciled` INFO on
+/// success. Returns the rescue count.
+///
+/// **Each drop is recorded in `ledger`** (mika#2131 AC6). It used to emit a
+/// `stuck_ready_reconcile_skipped` DEBUG, on a target whose DEBUG this server has
+/// never collected — see [`ExclusionLedger`] for the measurement. This is the
+/// phase mika#2131 was filed about: mika#1651 and mika#1403 clear filter 1
+/// (`ready`) and are dropped here, by filters 2–3, on every tick since
+/// 2026-08-30.
 async fn phase2_reconcile_stuck_ready(
     db: &AsyncDatabase,
     github_token: &str,
@@ -2632,6 +2941,7 @@ async fn phase2_reconcile_stuck_ready(
     open_pr_issue_numbers: &HashSet<u64>,
     trace_id: &str,
     session_id: &str,
+    ledger: &mut ExclusionLedger,
 ) -> usize {
     let threshold = stuck_ready_threshold_secs();
     let redrive_budget = max_redrives();
@@ -2660,17 +2970,27 @@ async fn phase2_reconcile_stuck_ready(
         if let Some(verdict) = classify_stuck_ready_in_memory(issue) {
             match verdict {
                 StuckReadyVerdict::Skip { reason } => {
-                    debug!(issue = n, reason, "stuck_ready_reconcile_skipped");
+                    ledger.record(PHASE_STUCK_RESCUE, n, reason);
                 }
+                // Abandonment has its own, louder channel (audit row + WARN + a
+                // comment on the ticket). Recording it here too would inflate the
+                // exclusion count without adding a fact.
                 StuckReadyVerdict::Abandon(reason) => {
                     abandon_stuck_ready(db, github_token, n, reason, trace_id, session_id).await;
                 }
-                // `classify_stuck_ready_in_memory` yields only those two.
-                other => debug!(
-                    issue = n,
-                    ?other,
-                    "stuck_ready_reconcile_unexpected_verdict"
-                ),
+                // `classify_stuck_ready_in_memory` yields only those two. Reaching
+                // here is a code defect, not a routine skip — but the ticket is
+                // still dropped, so it is still recorded. A silent exclusion is
+                // exactly what this ticket forbids, and an impossible one most of
+                // all.
+                other => {
+                    warn!(
+                        issue = n,
+                        ?other,
+                        "stuck_ready_reconcile_unexpected_verdict"
+                    );
+                    ledger.record(PHASE_STUCK_RESCUE, n, FILTER_UNEXPECTED_VERDICT);
+                }
             }
             continue;
         }
@@ -2681,6 +3001,10 @@ async fn phase2_reconcile_stuck_ready(
             Ok(v) => v,
             Err(e) => {
                 warn!(error = %e, issue = n, "auto_pull: phase 2 in-flight check failed; skipping ticket");
+                // A ticket dropped because a probe failed is still a ticket
+                // dropped. It gets its own filter name so an operator can tell a
+                // policy decision from an infrastructure one.
+                ledger.record(PHASE_STUCK_RESCUE, n, FILTER_IN_FLIGHT_PROBE_ERROR);
                 continue;
             }
         };
@@ -2719,10 +3043,10 @@ async fn phase2_reconcile_stuck_ready(
         match classify_stuck_ready(issue, &facts, redrive_budget) {
             StuckReadyVerdict::Eligible => survivors.push(n),
             StuckReadyVerdict::Skip { reason } => {
-                debug!(issue = n, reason, "stuck_ready_reconcile_skipped");
+                ledger.record(PHASE_STUCK_RESCUE, n, reason);
             }
             StuckReadyVerdict::SkipAndResetBudget { reason } => {
-                debug!(issue = n, reason, "stuck_ready_reconcile_skipped");
+                ledger.record(PHASE_STUCK_RESCUE, n, reason);
                 if redrive_count > 0
                     && let Err(e) = db.reset_auto_pull_redrive(DEFAULT_REPO, n).await
                 {
@@ -2761,15 +3085,11 @@ async fn phase2_reconcile_stuck_ready(
             }
             Ok(None) => {
                 // No `labeled(ready)` event → treat as not-stuck / skip.
-                debug!(
-                    issue = n,
-                    reason = "below_threshold",
-                    detail = "no labeled(ready) timeline event",
-                    "stuck_ready_reconcile_skipped"
-                );
+                ledger.record(PHASE_STUCK_RESCUE, n, FILTER_BELOW_THRESHOLD);
             }
             Err(e) => {
                 warn!(error = %e, issue = n, "auto_pull: phase 2 ready-label age read failed; skipping ticket");
+                ledger.record(PHASE_STUCK_RESCUE, n, FILTER_LABEL_AGE_READ_ERROR);
             }
         }
     }
@@ -2783,18 +3103,12 @@ async fn phase2_reconcile_stuck_ready(
         threshold,
     );
 
-    // Emit below_threshold skips for survivors with a known-but-too-young age.
+    // Record below_threshold skips for survivors with a known-but-too-young age.
     for &n in &survivors {
         if let Some(&age) = ages_by_issue.get(&n)
             && age < threshold
         {
-            debug!(
-                issue = n,
-                reason = "below_threshold",
-                age_secs = age,
-                threshold,
-                "stuck_ready_reconcile_skipped"
-            );
+            ledger.record(PHASE_STUCK_RESCUE, n, FILTER_BELOW_THRESHOLD);
         }
     }
 
