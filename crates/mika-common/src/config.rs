@@ -2645,6 +2645,13 @@ mod tests {
     /// (`global_home == agent_home` : layout legacy mono-agent, et tout appel
     /// via `Settings::load`), la branche per-agent ne s'exécute pas et le
     /// comportement « shell-override gagne » reste intact, à l'octet près.
+    ///
+    /// Le test reproduit la séquence réelle de ce mode et pas seulement la
+    /// condition de branche : le shell pose la variable, PUIS `load_dotenv`
+    /// charge le `.env` (comme `mika-cli::main`), et `dotenvy` n'écrase pas ce
+    /// que le shell a posé. Sans cet appel le fichier ne serait jamais lu sur ce
+    /// chemin — l'assertion passerait à l'identique en son absence et
+    /// n'attesterait aucune précédence.
     #[test]
     #[serial]
     fn mika2218_cli_mode_keeps_process_env_priority() {
@@ -2657,8 +2664,18 @@ mod tests {
         )
         .unwrap();
 
+        // L'ordre est celui du réel : le shell précède le lancement du process.
         // Safety: test-only env var, sérialisé par `#[serial]`.
         unsafe { std::env::set_var("MIKA_GITHUB_TOKEN", "github_pat_from_shell") };
+        crate::dotenv::load_dotenv(tmp.path());
+
+        // Garde-fou : si `load_dotenv` venait à écraser la valeur du shell, ce
+        // test perdrait son objet en silence.
+        assert_eq!(
+            std::env::var("MIKA_GITHUB_TOKEN").ok().as_deref(),
+            Some("github_pat_from_shell"),
+            "dotenvy ne doit pas écraser une variable déjà posée par le shell"
+        );
 
         let settings = Settings::load_for_agent(tmp.path(), tmp.path()).unwrap();
 
