@@ -286,29 +286,12 @@ echo ""
 echo "Test 7: Plan callout regex extraction (live)"
 echo "----------------------------------------------"
 
-# Exercise the grep -oP regex against a canonical callout string
-CALLOUT_REGEX='> - \*\*Plan:\*\* `\Kdocs/plans/[^`]+'
-
-# Happy path: canonical callout with trailing context
-TEST_BODY='> - **Plan:** `docs/plans/2026-05-11-001-feat-foo-plan.md` (committed on branch @ abc1234)'
-EXTRACTED=$(printf '%s\n' "$TEST_BODY" | grep -oP "$CALLOUT_REGEX" | head -1)
-assert_eq "Extracts plan path from canonical callout" "docs/plans/2026-05-11-001-feat-foo-plan.md" "$EXTRACTED"
-
-# Edge case: callout with no trailing context (just backtick-close)
-TEST_BODY2='> - **Plan:** `docs/plans/short.md`'
-EXTRACTED2=$(printf '%s\n' "$TEST_BODY2" | grep -oP "$CALLOUT_REGEX" | head -1)
-assert_eq "Extracts plan path from minimal callout" "docs/plans/short.md" "$EXTRACTED2"
-
-# Edge case: prose containing "Plan:" without docs/plans/ prefix — should NOT match
-TEST_BODY3='The Plan: is to refactor the module'
-EXTRACTED3=$(printf '%s\n' "$TEST_BODY3" | grep -oP "$CALLOUT_REGEX" | head -1 || true)
-assert_eq "Prose Plan: without docs/plans/ prefix does not match" "" "$EXTRACTED3"
-
-# Edge case: multiple callouts — first one wins
-TEST_BODY4='> - **Plan:** `docs/plans/first.md` (committed on branch @ aaa)
-> - **Plan:** `docs/plans/second.md` (committed on branch @ bbb)'
-EXTRACTED4=$(printf '%s\n' "$TEST_BODY4" | grep -oP "$CALLOUT_REGEX" | head -1)
-assert_eq "Multiple callouts: first one wins" "docs/plans/first.md" "$EXTRACTED4"
+# Les cas d'extraction eux-mêmes vivent dans la section mika#2120, plus bas :
+# ils y appellent `_extract_plan_path`, la fonction de production, au lieu d'en
+# recopier le motif ici. La copie qui vivait à cet endroit a survécu au
+# changement de motif de mika#2120 sans rien signaler — c'est la classe même que
+# ce ticket ferme, rejouée dans son propre harnais de test. Un test qui recopie
+# ce qu'il vérifie ne le vérifie pas.
 
 # Verify dry_run output includes entry_command field
 DRY_RUN_JQ=$(sed -n '/_handle_dry_run()/,/^}/p' "$DISPATCH_LIB")
@@ -5355,8 +5338,11 @@ assert_contains "T7: reader 4 — stale callout (dispatch_gate_groom_allowed_sta
     "$T2178_ISSUE_BODY_LINES"
 assert_contains "T7: reader 5 — _detect_plan_on_branch guard" \
     '[ -n "$ISSUE_BODY" ] || return 0' "$T2178_ISSUE_BODY_LINES"
+# Reader 6 a changé de forme en mika#2120 : le motif vit désormais dans
+# `_extract_plan_path`, qui accepte les deux écritures du callout et normalise.
+# Le lecteur reste unique et lit toujours `$ISSUE_BODY` — c'est ce que T7 fige.
 assert_contains "T7: reader 6 — plan-path extraction" \
-    'PLAN_PATH=$(printf '"'"'%s\n'"'"' "$ISSUE_BODY" | grep -oP '"'"'> - \*\*Plan:\*\* `\Kdocs/plans/[^`]+'"'"' | head -1)' \
+    'PLAN_PATH=$(_extract_plan_path "$ISSUE_BODY") || return 0' \
     "$T2178_ISSUE_BODY_LINES"
 assert_contains "T7: reader 7 — plan-line rescue in _iterate_groom_loop" \
     'elif _groom_plan_path=$(_committed_plan_on_branch "$SUB_REPO_DIR" "$BRANCH" "$ISSUE_BODY" "$REPO" "$ISSUE_NUM" 2>/dev/null); then' \
@@ -5400,6 +5386,94 @@ assert_eq "T9: no gh invocation in a substitution in the mika#2178 section" "0" 
     "$(printf '%s\n' "$T2178_SECTION" | grep -cE '\$\(gh[[:space:]]' || true)"
 assert_not_contains "T9: _render_ticket_context does not call gh (it reads stdin)" \
     "gh issue" "$T2178_HELPER_SRC"
+
+# ============================================================================
+# mika#2120 — le second lecteur du callout `Plan` tolère le préfixe de dépôt
+# ============================================================================
+#
+# Parité avec `auto_pull::extract_plan_path` : les deux écritures du callout
+# rendent le **même** chemin normalisé, relatif à la racine du sous-dépôt. La
+# divergence entre ces deux lecteurs est la cause racine du ticket, rejouée si
+# elle revient — d'où un test, pas un commentaire.
+
+echo ""
+echo "Test: _extract_plan_path — les deux écritures du callout (mika#2120)"
+echo "---------------------------------------------------------------------"
+
+MIKA2120_BARE='> - **Plan:** `docs/plans/2026-09-01-004-fix-2120-x-plan.md` (committed on branch @ `abc1234`)'
+MIKA2120_PREFIXED='> - **Plan:** `mika/docs/plans/2026-09-01-004-fix-2120-x-plan.md` (committed on branch @ `abc1234`)'
+MIKA2120_OTHER_REPO='> - **Plan:** `mika-cloud/docs/plans/2026-09-02-001-fix-220-x-plan.md` (committed on branch @ `abc1234`)'
+
+assert_eq "mika#2120: forme nue → chemin inchangé" \
+    "docs/plans/2026-09-01-004-fix-2120-x-plan.md" \
+    "$(_extract_plan_path "$MIKA2120_BARE" || true)"
+
+assert_eq "mika#2120: forme préfixée → segment de dépôt retiré" \
+    "docs/plans/2026-09-01-004-fix-2120-x-plan.md" \
+    "$(_extract_plan_path "$MIKA2120_PREFIXED" || true)"
+
+# La parité elle-même, affirmée plutôt que déduite des deux lignes ci-dessus.
+assert_eq "mika#2120: les deux écritures rendent le même chemin" \
+    "$(_extract_plan_path "$MIKA2120_BARE" || true)" \
+    "$(_extract_plan_path "$MIKA2120_PREFIXED" || true)"
+
+# Le préfixe accepté est n'importe quel segment de tête, pas la constante `mika/`
+# — le grooming écrit le préfixe du dépôt cible (mika-cloud#220, 2026-09-02).
+assert_eq "mika#2120: le préfixe accepté n'est pas la constante 'mika/'" \
+    "docs/plans/2026-09-02-001-fix-220-x-plan.md" \
+    "$(_extract_plan_path "$MIKA2120_OTHER_REPO" || true)"
+
+# Contrôle négatif : élargir ne veut pas dire tout accepter. Un chemin refusé
+# rend une sortie vide ET un code non nul.
+for mika2120_bad in \
+    '> - **Plan:** `docs/brainstorms/2026-09-01-x.md` (committed @ `abc`)' \
+    '> - **Plan:** `mika/docs/solutions/2026-09-01-x.md` (committed @ `abc`)' \
+    '> - **Plan:** `../docs/plans/2026-09-01-004-fix-2120-x-plan.md` (committed @ `abc`)' \
+    '> - **Plan:** `a/b/docs/plans/2026-09-01-004-fix-2120-x-plan.md` (committed @ `abc`)'
+do
+    mika2120_rc=0
+    mika2120_out=$(_extract_plan_path "$mika2120_bad") || mika2120_rc=$?
+    assert_eq "mika#2120: refus — ${mika2120_bad:16:40}" "empty/nonzero" \
+        "$(if [ -z "$mika2120_out" ] && [ "$mika2120_rc" -ne 0 ]; then printf 'empty/nonzero'; else printf "out='%s' rc=%s" "$mika2120_out" "$mika2120_rc"; fi)"
+done
+
+# Ancré, comme côté Rust : la prose qui *parle* du callout n'en est pas un.
+mika2120_rc=0
+_extract_plan_path 'voir la ligne > - **Plan:** `docs/plans/x-plan.md` du corps' >/dev/null || mika2120_rc=$?
+assert_eq "mika#2120: le motif est ancré en début de ligne" "1" "$mika2120_rc"
+
+# Cas d'extraction hérités du Test 7 (mika#1074), rapatriés ici pour qu'ils
+# exercent la fonction de production au lieu d'une copie de son motif.
+assert_eq "Extracts plan path from canonical callout" \
+    "docs/plans/2026-05-11-001-feat-foo-plan.md" \
+    "$(_extract_plan_path '> - **Plan:** `docs/plans/2026-05-11-001-feat-foo-plan.md` (committed on branch @ abc1234)' || true)"
+
+assert_eq "Extracts plan path from minimal callout" "docs/plans/short.md" \
+    "$(_extract_plan_path '> - **Plan:** `docs/plans/short.md`' || true)"
+
+assert_eq "Prose Plan: without docs/plans/ prefix does not match" "" \
+    "$(_extract_plan_path 'The Plan: is to refactor the module' || true)"
+
+assert_eq "Multiple callouts: first one wins" "docs/plans/first.md" \
+    "$(_extract_plan_path '> - **Plan:** `docs/plans/first.md` (committed on branch @ aaa)
+> - **Plan:** `docs/plans/second.md` (committed on branch @ bbb)' || true)"
+
+# Et la même règle quand les deux écritures se côtoient : c'est la ligne, pas la
+# forme, qui décide de la priorité.
+assert_eq "Multiple callouts: first wins whatever the écriture" "docs/plans/first.md" \
+    "$(_extract_plan_path '> - **Plan:** `mika/docs/plans/first.md` (committed on branch @ aaa)
+> - **Plan:** `docs/plans/second.md` (committed on branch @ bbb)' || true)"
+
+# Un seul lecteur : `_detect_plan_on_branch` ne doit pas reporter sa propre
+# extraction. C'est la copie-à-côté-du-lecteur qui a fait diverger les deux
+# prédicats Rust pendant des mois (mika#2158) ; même discipline ici.
+MIKA2120_DETECT_SRC=$(sed -n '/^_detect_plan_on_branch()/,/^}/p' "$DISPATCH_LIB")
+assert_eq "mika#2120: _detect_plan_on_branch a bien été trouvée (guards the guard)" "yes" \
+    "$(if [ -n "$MIKA2120_DETECT_SRC" ]; then printf 'yes'; else printf 'no'; fi)"
+assert_contains "mika#2120: _detect_plan_on_branch appelle le lecteur partagé" \
+    "_extract_plan_path" "$MIKA2120_DETECT_SRC"
+assert_eq "mika#2120: _detect_plan_on_branch ne porte plus de motif de callout" "0" \
+    "$(printf '%s\n' "$MIKA2120_DETECT_SRC" | grep -cF 'grep -oP' || true)"
 
 # --- Summary ---
 
