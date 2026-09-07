@@ -193,6 +193,128 @@ pub fn print_ready() {
 }
 
 // ---------------------------------------------------------------------------
+// `MIKA_LOG_LLM_BODIES` — one truth table (mika#2220)
+// ---------------------------------------------------------------------------
+
+/// The env var that arms LLM request/response body capture.
+pub const LOG_LLM_BODIES_ENV: &str = "MIKA_LOG_LLM_BODIES";
+
+/// How a raw `MIKA_LOG_LLM_BODIES` value reads.
+///
+/// **mika#2220 — the divergence this type exists to remove.** The daemon reaches
+/// the flag through `Settings` (config-rs), which accepts `1 / true / on / yes`
+/// **case-insensitively**. Every CLI call site instead open-coded
+/// `v == "true" || v == "1"` — byte-exact, lowercase only. So
+/// `MIKA_LOG_LLM_BODIES=True` (or `yes`, or `on`) armed mika-spirit and was a
+/// **silent no-op** on every `mika` process: exactly the reported shape, "works
+/// for the daemon, inert for the agent". Measured, not inferred — see
+/// `crates/mika-common/tests/tui_llm_body_capture.rs`, which prints the
+/// config-rs truth table next to this one.
+///
+/// A value neither side recognises is [`Unrecognized`](Self::Unrecognized)
+/// rather than `false`. The two halves still differ there, deliberately: config-rs
+/// makes it a hard `Settings::load` error (the daemon refuses to boot), while a
+/// `mika` invocation only warns — downing the CLI over a typo in a diagnostic
+/// variable would cost more than it buys. What is *not* acceptable, and is what
+/// this closes, is reading it as "off" without saying so.
+///
+/// Note the leading-space case: config-rs does **not** trim, so `" true"` is an
+/// error there. This does not trim either. Trimming would be a new divergence in
+/// the opposite direction — a value the CLI accepts and the daemon refuses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogLlmBodiesSetting {
+    /// The variable is absent from the environment.
+    Unset,
+    /// Recognised as on.
+    Enabled,
+    /// Recognised as off.
+    Disabled,
+    /// Present, but not a value either parser recognises. Carries it verbatim
+    /// (quoted when reported) so a stray space is visible in the warning.
+    Unrecognized(String),
+}
+
+impl LogLlmBodiesSetting {
+    /// Whether body capture should be armed. Only [`Enabled`](Self::Enabled) is.
+    pub fn enabled(&self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+
+    /// Emit the operator-visible warning when the value was set to something
+    /// neither parser recognises.
+    ///
+    /// Call this **after** the subscriber is installed — before it, the event has
+    /// nowhere to go. At WARN because the failure it reports is invisible by
+    /// construction: the operator asked for capture and silently did not get it.
+    pub fn warn_if_unrecognized(&self) {
+        if let Self::Unrecognized(raw) = self {
+            tracing::warn!(
+                event = "llm_body_capture_unrecognized_value",
+                value = %format!("{raw:?}"),
+                "{LOG_LLM_BODIES_ENV} is set to a value that is neither on nor off — \
+                 body capture stays OFF. Use one of: 1, true, on, yes (case-insensitive)."
+            );
+        }
+    }
+}
+
+/// Read [`LOG_LLM_BODIES_ENV`] from the process environment.
+pub fn log_llm_bodies_from_env() -> LogLlmBodiesSetting {
+    parse_log_llm_bodies(std::env::var(LOG_LLM_BODIES_ENV).ok().as_deref())
+}
+
+/// Classify a raw `MIKA_LOG_LLM_BODIES` value.
+///
+/// The accepted set is config-rs's, so the CLI and the daemon agree — see
+/// [`LogLlmBodiesSetting`] for why that agreement is the whole point.
+pub fn parse_log_llm_bodies(raw: Option<&str>) -> LogLlmBodiesSetting {
+    let Some(raw) = raw else {
+        return LogLlmBodiesSetting::Unset;
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => LogLlmBodiesSetting::Enabled,
+        "0" | "false" | "off" | "no" => LogLlmBodiesSetting::Disabled,
+        _ => LogLlmBodiesSetting::Unrecognized(raw.to_string()),
+    }
+}
+
+/// Announce, once per process, that body capture is armed and **where it lands**.
+///
+/// **mika#2220 — why a sink path and not just a boolean.** The flag is
+/// process-global, but an agent's turns are not all served by the same process:
+/// since mika#1727 `mika ask` is a thin A2A client, so its agent turns execute in
+/// mika-spirit and are logged there, not in `~/.mika/agents/<name>/logs/`. An
+/// operator who arms the variable on the agent's own process and then reads the
+/// agent's own file finds an empty file and concludes the flag is broken — the
+/// founding observation of this ticket. This line makes the sink a fact the
+/// operator reads instead of a routing rule they have to know.
+///
+/// WARN, not INFO, for two independent reasons: the CLI's default level is
+/// `warn`, so an INFO line would be filtered out on precisely the surface that
+/// needed it; and full prompt bodies on disk is a state worth flagging — they can
+/// carry anything the agent was sent.
+fn announce_llm_body_capture(sink: &str) {
+    tracing::warn!(
+        event = "llm_body_capture",
+        state = "enabled",
+        sink = %sink,
+        "{LOG_LLM_BODIES_ENV} is on — full LLM request/response bodies are being \
+         written to {sink}. Turns served by mika-spirit (webhooks, callbacks, and \
+         `mika ask` since mika#1727) are logged by that process, not this one."
+    );
+}
+
+/// The file a `log_dir`-style (daily-rolling) sink writes to today.
+fn daily_sink_path(dir: &Path) -> String {
+    dir.join(format!(
+        "mika.log.{}",
+        chrono::Local::now().format("%Y-%m-%d")
+    ))
+    .display()
+    .to_string()
+}
+
+// ---------------------------------------------------------------------------
 // Subscriber initialization
 // ---------------------------------------------------------------------------
 
@@ -253,9 +375,15 @@ where
         filter = filter.add_directive("mika::llm_debug=debug".parse().unwrap());
     }
 
+    // Resolved before the match so the announce below can name it (mika#2220).
+    let sink = match log_file {
+        Some(path) => path.display().to_string(),
+        None => "stdout".to_string(),
+    };
+
     // Note: the match arms look duplicative, but tracing_subscriber's type-level layer
     // composition creates distinct types for each combination, preventing shared setup.
-    match (log_file, log_format) {
+    let guard = match (log_file, log_format) {
         (Some(path), LogFormat::Json) => {
             // JSON file only — no JSON stdout layer (mika#2195).
             if let Some(parent) = path.parent() {
@@ -340,7 +468,14 @@ where
 
             None
         }
+    };
+
+    // After `.init()` — before it, the event has no subscriber to reach.
+    if log_llm_bodies {
+        announce_llm_body_capture(&sink);
     }
+
+    guard
 }
 
 /// Initialize logging with optional stderr output + daily-rotating file log.
@@ -369,7 +504,13 @@ where
         filter = filter.add_directive("mika::llm_debug=debug".parse().unwrap());
     }
 
-    match (log_dir, output) {
+    // Resolved before the match so the announce below can name it (mika#2220).
+    let sink = match log_dir {
+        Some(dir) => daily_sink_path(dir),
+        None => "nowhere (no log directory resolved)".to_string(),
+    };
+
+    let guard = match (log_dir, output) {
         (Some(dir), LogOutput::PrettyAndFile) => {
             // Both stderr (compact dev) + file (JSON) — non-TUI commands
             let _ = std::fs::create_dir_all(dir);
@@ -432,7 +573,14 @@ where
                 .init();
             None
         }
+    };
+
+    // After `.init()` — before it, the event has no subscriber to reach.
+    if log_llm_bodies {
+        announce_llm_body_capture(&sink);
     }
+
+    guard
 }
 
 #[cfg(test)]
@@ -544,6 +692,141 @@ mod tests {
              here would silence the process entirely"
         );
         assert_eq!(lines_written_for_one_event(false, "turn_usage"), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2220 — `MIKA_LOG_LLM_BODIES` truth table
+    // -----------------------------------------------------------------------
+
+    /// Every value the daemon's parser (config-rs, string → bool) recognises,
+    /// with the verdict it reaches.
+    const CONFIG_RS_RECOGNISED: &[(&str, bool)] = &[
+        ("1", true),
+        ("true", true),
+        ("on", true),
+        ("yes", true),
+        ("0", false),
+        ("false", false),
+        ("off", false),
+        ("no", false),
+    ];
+
+    /// AC1 — the CLI and the daemon must reach the same verdict on the same value.
+    ///
+    /// This is the assertion the pre-fix code could not satisfy: every CLI call
+    /// site open-coded `v == "true" || v == "1"`, so `True` / `TRUE` / `on` /
+    /// `yes` armed the daemon and were silently inert on the CLI. The reference
+    /// side is config-rs itself, queried here rather than transcribed — a
+    /// transcribed table would drift the first time config-rs widened its own.
+    #[test]
+    fn mika2220_cli_parse_agrees_with_the_daemon_parse() {
+        for (raw, expected) in CONFIG_RS_RECOGNISED {
+            let daemon = config::Config::builder()
+                .set_override("v", *raw)
+                .expect("override")
+                .build()
+                .expect("build")
+                .get_bool("v")
+                .unwrap_or_else(|e| panic!("config-rs no longer accepts {raw:?}: {e}"));
+            assert_eq!(
+                daemon, *expected,
+                "the reference table claims config-rs reads {raw:?} as {expected}"
+            );
+            assert_eq!(
+                parse_log_llm_bodies(Some(raw)).enabled(),
+                daemon,
+                "{raw:?}: the CLI must reach the daemon's verdict, or arming \
+                 MIKA_LOG_LLM_BODIES on one process and not the other is silent (mika#2220)"
+            );
+        }
+    }
+
+    /// Case-insensitivity is the specific half that bit: an operator typing
+    /// `True` got a working daemon and an inert CLI.
+    #[test]
+    fn mika2220_case_variants_are_recognised() {
+        for raw in ["TRUE", "True", "tRuE", "ON", "Yes", "YES"] {
+            assert_eq!(
+                parse_log_llm_bodies(Some(raw)),
+                LogLlmBodiesSetting::Enabled,
+                "{raw:?} must arm capture"
+            );
+        }
+        for raw in ["FALSE", "False", "Off", "NO"] {
+            assert_eq!(
+                parse_log_llm_bodies(Some(raw)),
+                LogLlmBodiesSetting::Disabled
+            );
+        }
+    }
+
+    /// Absent is not the same as unreadable, and unreadable is not the same as
+    /// off — collapsing the third into the second is what made the failure silent.
+    #[test]
+    fn mika2220_unset_and_unrecognized_are_distinct_from_disabled() {
+        assert_eq!(parse_log_llm_bodies(None), LogLlmBodiesSetting::Unset);
+        assert!(!parse_log_llm_bodies(None).enabled());
+
+        for raw in ["nope", "", " true", "true ", "2"] {
+            assert_eq!(
+                parse_log_llm_bodies(Some(raw)),
+                LogLlmBodiesSetting::Unrecognized(raw.to_string()),
+                "{raw:?} must be reported, not read as off"
+            );
+            assert!(!parse_log_llm_bodies(Some(raw)).enabled());
+        }
+    }
+
+    /// The whitespace-padded case is deliberately NOT trimmed: config-rs does not
+    /// trim either, so trimming here would make the CLI accept a value the daemon
+    /// refuses — the same divergence class, pointing the other way.
+    #[test]
+    fn mika2220_padded_values_are_not_silently_trimmed() {
+        let daemon_verdict = config::Config::builder()
+            .set_override("v", " true")
+            .expect("override")
+            .build()
+            .expect("build")
+            .get_bool("v");
+        assert!(
+            daemon_verdict.is_err(),
+            "config-rs is expected to refuse a padded value; if it started \
+             trimming, parse_log_llm_bodies must follow it"
+        );
+        assert!(matches!(
+            parse_log_llm_bodies(Some(" true")),
+            LogLlmBodiesSetting::Unrecognized(_)
+        ));
+    }
+
+    /// The unrecognized case must actually reach the operator, and must quote the
+    /// value so an invisible difference (a stray space) is visible in the log.
+    #[test]
+    fn mika2220_unrecognized_value_warns_with_the_value_quoted() {
+        let sink = SharedSink::default();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .json()
+                .flatten_event(true)
+                .with_writer(sink.clone()),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            parse_log_llm_bodies(Some(" true")).warn_if_unrecognized();
+            parse_log_llm_bodies(Some("true")).warn_if_unrecognized();
+            parse_log_llm_bodies(None).warn_if_unrecognized();
+        });
+
+        assert_eq!(
+            sink.lines_mentioning("llm_body_capture_unrecognized_value"),
+            1,
+            "exactly the unreadable value warns — a recognised or absent one must stay quiet"
+        );
+        assert_eq!(
+            sink.lines_mentioning(r#"\" true\""#),
+            1,
+            "the value must be quoted in the warning, or a leading space is invisible"
+        );
     }
 
     /// Structural guard: the JSON+file arm of `init` must keep exactly one file
