@@ -69,7 +69,9 @@ Un quatrième site parlait de `latest` sans être le défaut : le commentaire ju
 
 Trois propriétés la rendent non décorative :
 
-**1. Elle lit la propriété, pas le jeton.** Elle ne cherche pas la chaîne `latest`. Elle exige que **chaque tag contienne le sha du commit** — donc `:stable`, `:main`, `:prod`, `:dev` tombent aussi. C'est la leçon de mika#2103 appliquée en avance : une garde qui connaît une *orthographe* du défaut laisse passer toutes les autres.
+**1. Elle lit la propriété, pas le jeton.** Elle ne cherche pas la chaîne `latest`. Elle exige que **le sha du commit atteigne chaque tag** — donc `:stable`, `:main`, `:prod`, `:dev` tombent aussi. C'est la leçon de mika#2103 appliquée en avance : une garde qui connaît une *orthographe* du défaut laisse passer toutes les autres.
+
+> **Étendue depuis, par mika#2174.** À la livraison de #2143 la garde exigeait le jeton `github.sha` **littéralement dans le tag**. Elle a donc refusé le correctif de #2174, dont le tag `main-${{ env.SHORT_SHA }}` est bien dérivé du sha mais ne le dit pas à cet endroit (le langage d'expression de GitHub n'a pas de sous-chaîne). Elle **résout** désormais l'indirection : une variable rend un tag sha-dérivé quand le fichier lui-même l'assigne depuis le sha — fail-closed sur ce qu'elle ne peut pas prouver. Une propriété vérifiée par une orthographe protège des faux négatifs et fabrique des faux positifs ; voir `2026-09-07-tag-produit-vs-tag-consomme-mika-2174.md`.
 
 **2. Elle couvre les quatre écritures YAML d'une liste de tags** — scalaire bloc (`tags: |`), séquence bloc (`- item`), séquence flow (`[a, b]`), scalaire simple. Un analyseur qui ne connaîtrait que la première laisserait un tag mouvant réintroduit en style flow passer sans bruit : même classe d'échec, un cran plus bas.
 
@@ -96,6 +98,6 @@ La moitié empirique du critère d'acceptation (deux merges consécutifs verts) 
 ## Références
 
 - mika#2143 — le ticket ; `docs/plans/2026-09-03-001-fix-2143-tag-mouvant-sur-depot-immuable-plan.md` — le plan groomé
-- mika#2174 — le défaut voisin fiché à part : le workflow émet le sha **nu** de 40 caractères, la rotation consomme `main-<short8>`
+- mika#2174 — le défaut voisin fiché à part, **livré depuis** : le workflow émettait le sha **nu** de 40 caractères là où la rotation consomme `main-<short8>` ; il pousse désormais les deux formes, et la garde ci-dessus a dû apprendre à résoudre l'indirection pour l'accepter
 - PR#2093 — l'entrée du workflow sur `main` ; mika-cloud#220 — l'OIDC qui conditionne la réactivation ; mika#1619 — la capacité visée
 - mika#2103 / `scripts/check-byte-slices.sh` — la garde dont la leçon (« étendre par propriété, jamais par orthographe ») est appliquée ici
