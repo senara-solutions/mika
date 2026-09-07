@@ -37,7 +37,13 @@
 # PILOT_LOG_DIR is redirected to a mktemp dir rather than /var/log/claude-pilot,
 # so `make test` never writes into the live operational diagnosis surface — the
 # same precaution MIKA_PILOT_EGRESS_LOG_DIR already takes for the egress log.
-# It is exported BEFORE sourcing, because _PILOT_LOG_DIR resolves at source time.
+# The override is read at the point of use by `_pilot_log_dir`, so where it is
+# set relative to the `source` below does not matter. That is deliberate and it
+# is asserted: the first cut of this fix froze the directory in a variable
+# assigned at load time, and three probes in test-dispatch-lib.sh that set
+# PILOT_LOG_DIR after sourcing silently went back to reading
+# /var/log/claude-pilot — an override answering with the default, without an
+# error, which is the same shape as the outage this suite guards.
 #
 # Companions, none subsuming this one:
 #   test_sandbox_git_usable.sh                 — mika#2141 gitdir binds
@@ -81,7 +87,8 @@ fi
 TMPROOT=$(mktemp -d "${TMPDIR:-/tmp}/mika2165-XXXXXX")
 trap 'rm -rf "$TMPROOT"' EXIT
 
-# The redirected log dir. Must be exported before the source below.
+# The redirected log dir. Set here for readability, not out of necessity —
+# see the note above; the assertion below is what holds that claim.
 export PILOT_LOG_DIR="$TMPROOT/pilot-log"
 mkdir -p "$PILOT_LOG_DIR"
 
@@ -107,7 +114,16 @@ _PILOT_SANDBOX_SECRET_ALLOWLIST=()
 echo ""
 echo "PRECONDITION — the resolver honours the redirect"
 echo "------------------------------------------------"
-assert_eq "_PILOT_LOG_DIR follows PILOT_LOG_DIR" "$PILOT_LOG_DIR" "$_PILOT_LOG_DIR"
+assert_eq "_pilot_log_dir follows PILOT_LOG_DIR" "$PILOT_LOG_DIR" "$(_pilot_log_dir)"
+
+# And it follows it whenever it changes, not only at the value it held when the
+# library was sourced. Without this, every host-side assertion below would still
+# pass against a resolver frozen at load time — and the three probes in
+# test-dispatch-lib.sh that set the override late would keep silently reading
+# the operational directory.
+_late=$(PILOT_LOG_DIR="$TMPROOT/moved-after-source" _pilot_log_dir)
+assert_eq "the override is read at the point of use, not at source time" \
+    "$TMPROOT/moved-after-source" "$_late"
 
 echo ""
 echo "MUST WORK — the log directory is writable from inside, and survives"
