@@ -47,3 +47,5 @@ pub mod validate;
 pub(crate) mod webhook_dispatch;
 pub mod well_known_agents;
 pub mod wip_rescue;
+
+// probe(#2218): no-op marker for a diagnostic QA-review turn — this PR is closed without merge.
