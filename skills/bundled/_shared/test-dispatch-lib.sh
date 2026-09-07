@@ -5387,6 +5387,75 @@ assert_eq "T9: no gh invocation in a substitution in the mika#2178 section" "0" 
 assert_not_contains "T9: _render_ticket_context does not call gh (it reads stdin)" \
     "gh issue" "$T2178_HELPER_SRC"
 
+# =============================================================================
+# mika#2211 — the PR-body containment rule reaches the pilot
+# =============================================================================
+#
+# Why a structural test and not a behavioural one: the defect is a pilot writing
+# `/tmp/pr-body-<N>.md` on its own initiative, which no test in this repo can
+# reproduce without launching a model. What CAN be pinned is the thing that was
+# missing — that the rule is present, and present on the ONE channel the pilot
+# actually reads. A test asserting only that some file somewhere contains the
+# sentence would have stayed green through the exact failure this closes:
+# mika-dev's own system prompt never reaches the pilot process.
+
+T2211_SUW_SRC=$(sed -n '/^_set_up_worktree() {/,/^}/p' "$DISPATCH_LIB")
+
+# --- The rule exists and is non-empty ---------------------------------------
+assert_eq "mika#2211: _PR_BODY_CONTAINMENT_RULE is defined exactly once" "1" \
+    "$(grep -c '^_PR_BODY_CONTAINMENT_RULE=' "$DISPATCH_LIB" || true)"
+
+# --- It is injected into the prompt the pilot receives ----------------------
+assert_contains "mika#2211: the rule is appended to PROMPT inside _set_up_worktree" \
+    '_PR_BODY_CONTAINMENT_RULE' "$T2211_SUW_SRC"
+
+# The same position invariant mika#2178 documents: the ITERATION_CTX branch
+# REASSIGNS PROMPT from scratch, so an injection above it is dropped silently on
+# every iteration — the failure would then reappear on exactly the reruns that
+# follow a first attempt.
+assert_eq "mika#2211: the injection sits AFTER the ITERATION CONTEXT reassignment" "yes" \
+    "$(_t2178_after 'PROMPT" "$_PR_BODY_CONTAINMENT_RULE")' 'ITERATION CONTEXT:')"
+
+# The mika#138 contract: the first line of PROMPT stays `<repo>#<num>`. The
+# anchored parse in _set_up_worktree depends on it, so appending must never
+# prepend.
+assert_eq "mika#2211: the rule is APPENDED (repo#N stays the first line)" "yes" \
+    "$(if printf '%s' "$T2211_SUW_SRC" \
+        | grep -qF 'PROMPT=$(printf '"'"'%s\n\n%s'"'"' "$PROMPT" "$_PR_BODY_CONTAINMENT_RULE")'; \
+       then printf 'yes'; else printf 'no'; fi)"
+
+# --- The rule says the three things that make it actionable -----------------
+# Stated positively first: a pilot told only "not /tmp" still has to invent a
+# replacement, and the one it reaches for next (a heredoc) breaks on a body
+# containing its own delimiter.
+T2211_RULE=$(sed -n '/^_PR_BODY_CONTAINMENT_RULE=/,/^$/p' "$DISPATCH_LIB")
+
+assert_contains "mika#2211: the rule names the working form (--body-file under the worktree)" \
+    '--body-file pr-body.md' "$T2211_RULE"
+assert_contains "mika#2211: the rule forbids the measured failure path (/tmp)" \
+    '/tmp' "$T2211_RULE"
+assert_contains "mika#2211: the rule forbids the heredoc the pilot would reach for next" \
+    "heredoc" "$T2211_RULE"
+assert_contains "mika#2211: the rule forbids ending the session on a question" \
+    "session morte" "$T2211_RULE"
+
+# --- The target repo's own command file carries the canonical form ----------
+# AC1. Checked here because this suite already resolves REPO_ROOT and runs on
+# every PR; a prompt-only fix with no gate is how the pre-fix inline instruction
+# survived unexamined.
+T2211_MIKA_CMD="$REPO_ROOT/.claude/commands/mika.md"
+if [ -f "$T2211_MIKA_CMD" ]; then
+    T2211_CMD_SRC=$(cat "$T2211_MIKA_CMD")
+    assert_contains "mika#2211 AC1: mika.md PR step uses --body-file under the worktree" \
+        '--body-file pr-body.md' "$T2211_CMD_SRC"
+    assert_contains "mika#2211 AC1: mika.md PR step forbids writing the body outside the worktree" \
+        'Never write the PR body outside the worktree' "$T2211_CMD_SRC"
+    # The residue guard: the ignore is what keeps a failed `gh pr create` from
+    # leaving a file that `git status --porcelain` reports, which is precisely
+    # the probe that triggers the mika#1282 wip-rescue draft.
+    assert_contains "mika#2211: pr-body.md is gitignored (a residue must not read as dirty)" \
+        'pr-body.md' "$(cat "$REPO_ROOT/.gitignore" 2>/dev/null || true)"
+fi
 # ============================================================================
 # mika#2120 — le second lecteur du callout `Plan` tolère le préfixe de dépôt
 # ============================================================================
