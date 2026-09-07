@@ -71,3 +71,7 @@ Non automatisable en CI (dépend de l'état live des rulesets GitHub) — **chec
 
 - **Changement de priorité pour toutes les clés du `.env` per-agent en mode serveur** : assumé et justifié (le `.env` per-agent est autoritaire en mode serveur ; shell-override est CLI-only). AC2/AC3 bordent le fallback et le mode CLI.
 - **Habilitation reviewer** : si `mika-platform-qa` n'est pas CODEOWNER sur les chemins du ruleset périmètre, `--approve` n'y satisfait pas le code-owner-review → couvert par la checklist opérateur pré-déploiement.
+
+## Note d'implémentation (guidance GROOMED mika-arch, 2026-09-07)
+
+Le reorder inverse la hiérarchie standard (fichier > env process) **en mode serveur uniquement**. L'implémenteur DOIT documenter ce trade-off comme **convention forte** : un commentaire explicite dans `load_for_agent` au point du reorder (« en mode serveur, le .env per-agent est autoritaire et prime sur l'env process ; pour forcer un paramètre global temporaire, éditer le .env per-agent ou utiliser une clé absente de ce fichier »), avec référence à ce plan/#2218. Sans cette note, un futur lecteur croira à un bug d'ordre de sources.
