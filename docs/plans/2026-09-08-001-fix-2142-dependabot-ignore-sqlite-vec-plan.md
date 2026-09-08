@@ -18,7 +18,7 @@ status: groomed
 
 Dans `.github/dependabot.yml`, ecosystem `cargo`, ajouter un `ignore` pour `sqlite-vec` couvrant la (les) version(s) alpha cassée(s) — au minimum `0.1.10-alpha.4`, idéalement un `version-update:semver-patch`/pré-release sur `sqlite-vec` tant que l'upstream ne re-livre pas le fichier. Objectif : dependabot n'ouvre plus de PR bumpant sqlite-vec vers une alpha incomplète (qui rouge la CID de toute PR groupée, comme #2224).
 
-## Acceptance
+## Acceptance criteria
 - **AC1** — `.github/dependabot.yml` ecosystem cargo porte un `ignore` sur `sqlite-vec` (version alpha cassée / pré-releases).
 - **AC2** — Une prochaine passe dependabot cargo ne propose plus sqlite-vec 0.1.10-alpha.4 (vérifiable : la PR groupée cargo-minor-patch ne le contient plus).
 - **AC3** — Note : la version pinnée effective dans `Cargo.toml`/`Cargo.lock` reste celle qui build (hors périmètre : ce ticket empêche la RE-introduction par dependabot, il ne change pas le pin actuel).
