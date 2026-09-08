@@ -167,7 +167,7 @@ impl Tool for PrMergeWithGateTool {
                 let remediation =
                     remediate_behind_main("pr_merge_with_gate", pr_number, repo, token, &info)
                         .await;
-                if let Some(result) = disposition_for_remediation(&remediation, &info) {
+                if let Some(result) = disposition_for_remediation(&remediation, repo, &info) {
                     return Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?));
                 }
                 // `None` — the PR turned out not to be behind. Continue the gate.
@@ -1038,10 +1038,25 @@ fn log_behind_main_remediation(
 /// ONLY value on this path that can reach `run_gh_merge`. R3 ("no merge in the
 /// same turn as an update-branch") is therefore a property of this one pure
 /// function rather than of three call sites that each have to remember it.
+///
+/// A credential-scope failure takes the mika#1616 branch rather than the
+/// generic behind-main one (plan KTD-5). The two are not interchangeable: a 403
+/// on update-branch is a config gap with a named remedy — install the App on
+/// this repo, or widen the PAT — and mika#1616 exists precisely so the agent
+/// reports that instead of paraphrasing an opaque error into a guess about PR
+/// state. Every other failure stays `blocked[behind_main]`, so "behind and not
+/// repaired" remains one place to look.
 pub(crate) fn disposition_for_remediation(
     remediation: &BehindMainRemediation,
+    repo: &str,
     info: &BehindMainInfo,
 ) -> Option<MergeGateResult> {
+    if let BehindMainRemediation::Failed(detail) = remediation
+        && let Some(credential_scope) = classify_credential_scope_error(detail, repo)
+    {
+        return Some(credential_scope);
+    }
+
     match remediation {
         BehindMainRemediation::NotBehind => None,
         BehindMainRemediation::Updated => Some(MergeGateResult::BranchUpdated {
@@ -1100,9 +1115,9 @@ pub(crate) fn describe_behind_main_remediation(
     let base = &info.pr_base_sha;
     let head = &info.current_main_sha;
 
-    Some(match remediation {
-        BehindMainRemediation::NotBehind => return None,
-        BehindMainRemediation::Updated => format!(
+    match remediation {
+        BehindMainRemediation::NotBehind => None,
+        BehindMainRemediation::Updated => Some(format!(
             "the PR was behind main (base: {base}, main HEAD: {head}). The branch has been \
              brought up to date with main automatically (mika#2238). Do NOT merge this PR in \
              this turn and do NOT call `pr_merge_with_gate` for it: the update created a new \
@@ -1110,25 +1125,25 @@ pub(crate) fn describe_behind_main_remediation(
              unvalidated commit on main (the failure mika#1577 closed). GitHub is running CI \
              on the new commit; the resulting `check_suite success` webhook re-enters the \
              merge path and finishes the job. End the turn.\n\n"
-        ),
-        BehindMainRemediation::AlreadyAttempted => format!(
+        )),
+        BehindMainRemediation::AlreadyAttempted => Some(format!(
             "the PR is behind main (base: {base}, main HEAD: {head}). An automatic branch \
              update toward this exact main HEAD was already attempted, so it is not being \
              retried (anti-thrash guard, mika#2238). Do NOT merge and do NOT rebase by hand. \
              End the turn; if no fresh CI run appears for this PR, surface it to the \
              operator.\n\n"
-        ),
-        BehindMainRemediation::Conflict(d) => format!(
+        )),
+        BehindMainRemediation::Conflict(d) => Some(format!(
             "the PR is behind main (base: {base}, main HEAD: {head}) and the automatic branch \
              update hit a real conflict: {d}. Do NOT merge. Conflict resolution is required \
              before this PR can go in.\n\n"
-        ),
-        BehindMainRemediation::Failed(d) => format!(
+        )),
+        BehindMainRemediation::Failed(d) => Some(format!(
             "the PR is behind main (base: {base}, main HEAD: {head}) and the automatic branch \
              update did not go through: {d}. Do NOT merge. Rebase the PR onto main before \
              merging, or surface the failure to the operator.\n\n"
-        ),
-    })
+        )),
+    }
 }
 
 /// Run `gh pr merge <number> --repo <repo> --<method> [--delete-branch] [--auto]`
@@ -1761,6 +1776,8 @@ mod tests {
     // Behind-main remediation (mika#2238)
     // -----------------------------------------------------------------------
 
+    const REPO: &str = "senara-solutions/mika";
+
     fn behind_info() -> BehindMainInfo {
         BehindMainInfo {
             pr_base_sha: "abc1234deadbeef".to_string(),
@@ -1842,7 +1859,7 @@ mod tests {
         // has not run; merging it in the same turn is exactly the failure
         // mika#1577 was written to close, re-opened through mika#2238's door.
         let info = behind_info();
-        let disposition = disposition_for_remediation(&BehindMainRemediation::Updated, &info);
+        let disposition = disposition_for_remediation(&BehindMainRemediation::Updated, REPO, &info);
 
         assert!(
             disposition.is_some(),
@@ -1860,7 +1877,8 @@ mod tests {
     #[test]
     fn mika2238_only_a_not_behind_pr_continues_into_the_merge_gate() {
         let info = behind_info();
-        let continues = |r: BehindMainRemediation| disposition_for_remediation(&r, &info).is_none();
+        let continues =
+            |r: BehindMainRemediation| disposition_for_remediation(&r, REPO, &info).is_none();
 
         assert!(
             continues(BehindMainRemediation::NotBehind),
@@ -1888,6 +1906,7 @@ mod tests {
         let detail = "gh: merge conflict between base and head (HTTP 422)";
         let disposition = disposition_for_remediation(
             &BehindMainRemediation::Conflict(detail.to_string()),
+            REPO,
             &info,
         )
         .expect("a conflict must terminate the turn");
@@ -1908,7 +1927,8 @@ mod tests {
         // R8: a failed update leaves the gate at least as closed as before.
         let info = behind_info();
         let disposition = disposition_for_remediation(
-            &BehindMainRemediation::Failed("HTTP 403: Resource not accessible".to_string()),
+            &BehindMainRemediation::Failed("gh exit code 1: Not Found (HTTP 404)".to_string()),
+            REPO,
             &info,
         )
         .expect("a failed update must terminate the turn");
@@ -1924,9 +1944,44 @@ mod tests {
                         current_main_sha: info.current_main_sha.clone(),
                     }
                 );
-                assert!(d.contains("403"), "the failure cause must survive: {d}");
+                assert!(d.contains("404"), "the failure cause must survive: {d}");
             }
             other => panic!("expected blocked[behind_main], got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mika2238_permission_failure_takes_the_credential_scope_branch() {
+        // KTD-5. A 403 on update-branch is a config gap with a named remedy,
+        // not a fact about the PR. mika#1616 built that branch so the agent
+        // reports the remedy instead of paraphrasing an opaque error — routing
+        // it into the generic behind-main detail would throw that away.
+        let info = behind_info();
+        let disposition = disposition_for_remediation(
+            &BehindMainRemediation::Failed(
+                "gh exit code 1: gh: Resource not accessible by integration (HTTP 403)".to_string(),
+            ),
+            REPO,
+            &info,
+        )
+        .expect("a permission failure must terminate the turn");
+
+        match disposition {
+            MergeGateResult::GateError {
+                kind, detail: d, ..
+            } => {
+                assert_eq!(
+                    kind,
+                    GateErrorKind::CredentialScope {
+                        repo: REPO.to_string()
+                    }
+                );
+                assert!(
+                    d.contains("install the mika GitHub App"),
+                    "the remedy must reach the agent: {d}"
+                );
+            }
+            other => panic!("expected gate_errored[credential_scope], got {other:?}"),
         }
     }
 

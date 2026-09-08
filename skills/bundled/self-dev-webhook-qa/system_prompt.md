@@ -74,7 +74,7 @@ The message contains the review body, PR URL, repo, and reviewer. mika-qa posts 
         - Task status: `in_progress`.
 
         **`reason.reason = "behind_main"`** (mika#1577 / mika#2238) — PR is behind main AND the automatic branch update did not go through:
-        - Read `detail` for the cause: a permission or API failure, or an update toward this exact main HEAD that was already attempted (anti-thrash guard).
+        - Read `detail` for the cause: an API failure, or an update toward this exact main HEAD that was already attempted (anti-thrash guard). A **permission** failure does not land here — it arrives as `gate_errored` with `kind = credential_scope`, which names the fix (install the App on the repo / widen the PAT).
         - Do NOT merge. Do NOT rebase by hand. Do NOT call `run_claude_pilot` — a behind-main state is mechanical, not a code change.
         - Correlate to task (Step 4).
         - Notify Vincent via `send_message`: "{repo}#{number} is behind main and the automatic branch update did not go through: {detail}. {PR URL}"
