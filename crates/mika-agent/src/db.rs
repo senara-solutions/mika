@@ -18187,9 +18187,10 @@ mod tests {
         // `pending` / `in_progress` mean the pilot may still be writing. The
         // finished boundary here must stay byte-for-byte the one the ingestion
         // uses, or the detector reports transcripts that are merely late.
-        let db = db();
         for status in ["pending", "in_progress"] {
-            let db = db;
+            // A fresh DB per status: leaving the previous iteration's row in
+            // place would let a passing assertion rest on the wrong row.
+            let db = db();
             let _ = create_stamped_dispatch(&db, "mika", status, 600);
             assert!(
                 db.find_dispatches_expecting_transcripts("mika", 300)
@@ -18197,7 +18198,6 @@ mod tests {
                     .is_empty(),
                 "a {status} dispatch must not be reported"
             );
-            return;
         }
     }
 
