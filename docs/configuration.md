@@ -106,19 +106,58 @@ sensitive tokens, edit `mcp.json` directly.
 Settings are loaded from multiple sources, in order of increasing priority. A value
 set at a higher layer overrides the same value from a lower layer.
 
+There are two cascades. Which one applies depends on whether the agent has a home
+directory of its own — **not** on whether you are running the CLI or the daemon.
+
+**An agent with its own home** (`~/.mika/agents/X/`, i.e. every agent under the
+multi-agent layout: the `mika-spirit` daemon *and* `mika --agent X`):
+
 | Priority | Source                    | Description                                |
 |----------|---------------------------|--------------------------------------------|
 | 1 (lowest) | Rust defaults           | Compiled-in serde defaults (e.g. `claude-sonnet-4-6`) |
 | 2        | TOML config files         | `~/.mika/config.toml` + optional `~/.mika/agents/X/config.toml` |
-| 3        | Per-agent `.env`          | `~/.mika/agents/X/.env` — parsed inline, not set in process env (server mode) |
-| 4        | Global `.env`             | `~/.mika/.env` — loaded into process env via dotenvy |
-| 5 (highest) | `MIKA_*` env vars      | Shell environment variables, always win    |
+| 3        | Global `.env`             | `~/.mika/.env` — loaded into process env via dotenvy |
+| 4        | `MIKA_*` env vars         | Shell environment variables                |
+| 5 (highest) | Per-agent `.env`       | `~/.mika/agents/X/.env` — parsed inline, wins over the process env (mika#2218) |
 
-In **CLI mode** (single agent per process), the per-agent `.env` is loaded into the
-process environment before the global `.env` (dotenvy first-write-wins). In **server
-mode** (multiple agents per process), per-agent `.env` files are parsed without
-mutating process env and injected as inline TOML config sources — each agent gets
-its own secrets without cross-contamination.
+**An agent with no home of its own** (`global_home == agent_home`: the legacy
+single-agent layout):
+
+| Priority | Source                    | Description                                |
+|----------|---------------------------|--------------------------------------------|
+| 1 (lowest) | Rust defaults           | Compiled-in serde defaults                 |
+| 2        | TOML config files         | `~/.mika/config.toml`                      |
+| 3        | Global `.env`             | `~/.mika/.env` — loaded into process env via dotenvy |
+| 4 (highest) | `MIKA_*` env vars      | Shell environment variables, always win    |
+
+### Why the per-agent `.env` outranks the process env (mika#2218)
+
+In the first cascade the per-agent `.env` deliberately **inverts** the usual
+"environment beats file" rule. It is the authority on what belongs to one agent —
+its identity secrets above all (`MIKA_GITHUB_TOKEN`, `MIKA_GITHUB_APP_*`,
+per-agent LLM keys). The process environment carries *global* configuration and
+must not shadow a value an agent set for itself.
+
+Before mika#2218 it did: the `mika-spirit` daemon hosts the family agents' turns,
+its environment carried a `MIKA_GITHUB_TOKEN` belonging to the operator account —
+which authors the autonomous loop's PRs — and that shadowed `mika-qa`'s own
+distinct PAT. Review turns therefore signed as the PR's own author, and GitHub
+refused to approve them ("Can not approve your own pull request").
+
+Two consequences worth knowing:
+
+- **A shell override no longer wins for a key the agent's `.env` defines.**
+  `MIKA_FOO=v mika --agent qa …` is ignored when `~/.mika/agents/qa/.env` sets
+  `MIKA_FOO`. To force a value onto that agent, edit its `.env` by hand
+  (`mika config set` writes the global `~/.mika/.env`, not the per-agent one).
+- **A globally rotated secret does not reach an agent holding a stale copy.** If
+  you rotate an API key in `~/.mika/.env` or the environment, any agent whose own
+  `.env` still carries the old value keeps using it. Rotate per-agent `.env`
+  files too, or leave the key out of them.
+
+A key the per-agent `.env` does not define is not affected: config sources merge
+key by key, and the source is only added when the file exists and is non-empty —
+so an agent with no `.env` of its own inherits the process env unchanged.
 
 All config files are optional. If a file does not exist, it is silently skipped.
 
@@ -161,7 +200,9 @@ MIKA_GITHUB_APP_INSTALLATION_ID=98765432
 MIKA_GITHUB_APP_LOGIN=mika-qa[bot]
 ```
 
-Per-agent `.env` values override the global `~/.mika/.env` but not shell env vars.
+Per-agent `.env` values override the global `~/.mika/.env` **and** the process
+environment, including shell-set `MIKA_*` variables — see
+[Configuration Cascade](#configuration-cascade) for why (mika#2218).
 
 ### GitHub App authentication (preferred)
 
@@ -439,6 +480,19 @@ emoji = "✦"
 **`[kg]` behavior:** When `enabled = false`, no KG subsystem components are constructed for the agent. Existing shared-corpus rows are preserved (cleanup via `mika kg purge`). When `docs_root` is set to an explicit path that doesn't exist, the agent fails to start with a clear error. Agents with matching `docs_root` share extraction via `docs_root_hash` (v27 schema).
 
 **`[context.summary]` behavior:** `inject = false` (Axis 4) is a load-prevention gate — `db.load_conversation_summary()` is never called and the summary is not available to any downstream code path. `max_tokens` (Axis 3) is mode-conditional — it only fires on silent-mode turns (when `SilentTrigger` is present). Axis 4 always wins: when `inject = false`, the `max_tokens` field is never evaluated. See `crates/mika-agent/CLAUDE.md` for implementation details.
+
+**Missing, unreadable, or malformed file:** a missing `identity.toml` makes the
+agent start **fail-closed** — zero skills, every mutational built-in tool denied
+(mika#2027). Absence never means "everything permitted". The three faults are
+logged under distinct event names (`identity_toml_absent`,
+`identity_toml_unreadable`, `identity_toml_malformed`) because they need
+different remediations. Note that **deleting the file and restarting does not
+regenerate it**: bootstrap only runs on an uninitialized home. A fail-closed
+start also empties the agent's `skills/` directory of its bundled-skill symlinks
+(re-materialized on the first valid start). The supported re-provisioning gesture
+is in `docs/operator/agent-identity-reprovision.md` in the repository — the path
+is written out rather than linked because this page is also shipped as a
+crate-local copy where a relative link would dangle.
 
 To customize, edit `~/.mika/identity.toml`:
 

@@ -13,26 +13,45 @@
 # policy allows this repo's GitHub OIDC subject; provisioned in mika-cloud
 # Terraform per mika#1619). No AWS access keys are stored.
 #
-# Tags pushed: exactly one, and it is a function of the commit.
-#   - <full github.sha>  immutable, the deploy target downstream PRs pin
+# Tags pushed: two, and each one is a function of the commit.
+#   - <full github.sha>       the 40-char sha; provenance, pinnable forever
+#   - main-<first 8 of sha>   the form the downstream rotation actually consumes
 #
-# There is deliberately NO moving convenience tag. The three ECR repositories
-# — mika-agent, mika-gateway, mika-console — are declared IMMUTABLE, and an
-# IMMUTABLE repository refuses to reassign a tag it already carries. A "moving
-# tag" is by definition a tag you reassign, so pushing one here is a
-# contradiction in terms: the push fails, not eventually but on the first run
-# that gets past authentication (mika#2143). The immutability is the guarantee
-# of provenance — a deployed tag always designates the content it was created
-# with — and it is not traded away for a naming convenience.
+# The second tag is not a convenience, it is the whole point of pushing at all
+# (mika#2174). Measured on mika-cloud 2026-09-04: every deployed `image.tag` and
+# every tag in the ECR history is of the form `main-<short>` — `main-7cea6d6`,
+# `main-960ab824`, `main-56336b9e`, `main-d7314906` — while nothing anywhere
+# reads the bare 40-char form (`grep -rn -E 'github\.sha|GITHUB_SHA|[0-9a-f]{40}'`
+# over mika-cloud's helm/ and scripts/ returns zero lines; rotate-image.sh
+# derives no tag at all, it writes the literal it is handed). A workflow that
+# pushed only the bare sha would not fail — it would produce an artifact nobody
+# downstream can deploy without a manual translation.
 #
-# The absence below is not an oversight, so do not "repair" it by adding a
-# second tag: scripts/check-image-tags-immutable.sh fails the build if any tag
-# that is not a function of the commit sha reappears in the `tags:` list.
+# There is still deliberately NO moving convenience tag, and that is not in
+# tension with pushing two tags. What mika#2143 forbids is a tag that gets
+# REASSIGNED from one build to the next, not a second tag: both tags above are
+# functions of the commit sha, so two distinct commits can never produce the
+# same tag and no push can ever reassign one. The three ECR repositories —
+# mika-agent, mika-gateway, mika-console — are declared IMMUTABLE and refuse to
+# reassign a tag they already carry, so `latest`, `stable` or a bare `main`
+# would fail on the first run that gets past authentication. The immutability
+# is the guarantee of provenance — a deployed tag always designates the content
+# it was created with — and it is not traded away for a naming convenience.
+#
+# A third tag is therefore allowed if and only if it is a function of the sha.
+# scripts/check-image-tags-immutable.sh fails the build otherwise — including
+# when a tag hides its non-derivation behind a variable, since the guard
+# resolves `${{ env.X }}` against this file's own assignments and refuses what
+# it cannot prove.
+#
+# `main-<short8>` has to travel through the SHORT_SHA step below because
+# GitHub's expression language has no substring function. Eight characters is
+# the ask of mika#2174; the 7-char tags already in the ECR history stay
+# consumable, since the rotation takes a literal tag argument, not a length.
 #
 # A consumer that wants "the newest build" resolves it instead of reading a
 # moving tag: `aws ecr describe-images --repository-name mika-agent` sorted on
 # `imagePushedAt` — which is what the cloud freshness probe already does.
-# Downstream consumers derive the short-sha (first 8) from the full sha.
 name: Agent Image Build & Push
 
 on:
@@ -108,6 +127,14 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2  # v3
 
+      # The rotation consumes `main-<short8>`, and GitHub's expression language
+      # has no substring function — so the short form cannot be written inline
+      # in `tags:` and travels through this variable instead. The immutability
+      # guard resolves that indirection against this assignment rather than
+      # trusting the variable's name (mika#2174).
+      - name: Derive the short sha
+        run: echo "SHORT_SHA=${GITHUB_SHA:0:8}" >> "$GITHUB_ENV"
+
       - name: Build and push mika-agent image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v6
         with:
@@ -116,15 +143,19 @@ jobs:
           push: true
           tags: |
             ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:main-${{ env.SHORT_SHA }}
           # Share the same gha cache scope as ci.yml's PR-side docker-build so the
           # merge build reuses layers already warmed during PR validation.
           cache-from: type=gha,scope=mika-agent
           cache-to: type=gha,scope=mika-agent,mode=max
           platforms: linux/amd64
 
-      # Emit the immutable tag so a downstream reconciler / rotation PR can pin it
+      # Emit the pushed tags so a downstream reconciler / rotation PR can pin one
       # without re-deriving it (ticket: "Outputs the new tag to a workflow summary").
-      - name: Publish pushed tag to workflow summary
+      # The rotation row is the one an operator copies into a helm values file;
+      # it is printed from ${SHORT_SHA} rather than re-sliced here, so the summary
+      # cannot drift from the tag that was actually pushed.
+      - name: Publish pushed tags to workflow summary
         run: |
           {
             echo "### mika-agent image pushed to ECR"
@@ -133,7 +164,8 @@ jobs:
             echo "| --- | --- |"
             echo "| registry | \`${ECR_REGISTRY}\` |"
             echo "| repository | \`${ECR_REPOSITORY}\` |"
-            echo "| immutable tag | \`${GITHUB_SHA}\` |"
+            echo "| immutable tag (full sha) | \`${GITHUB_SHA}\` |"
+            echo "| rotation tag (the form helm values consume) | \`main-${SHORT_SHA}\` |"
             echo "| full ref | \`${ECR_REGISTRY}/${ECR_REPOSITORY}:${GITHUB_SHA}\` |"
-            echo "| short-sha | \`${GITHUB_SHA:0:8}\` |"
+            echo "| full ref (rotation) | \`${ECR_REGISTRY}/${ECR_REPOSITORY}:main-${SHORT_SHA}\` |"
           } >> "$GITHUB_STEP_SUMMARY"

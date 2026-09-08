@@ -438,6 +438,18 @@ impl EvalHarnessBuilder {
         };
         std::fs::write(agent_dir.join("soul.md"), soul_contents)?;
 
+        // A provisioned agent home carries an identity.toml. Since mika#2027 its
+        // *absence* is fail-closed (sentinel allowlist, mutational tools denied,
+        // `[context.summary].inject = false`), so a harness without one would
+        // silently exercise a state no real agent is in. The content below parses
+        // to exactly `Identity::default()`, which is what the harness got before —
+        // tests that overwrite this file (e.g. to set `[context.summary]`) are
+        // unaffected, they run after `build()`.
+        std::fs::write(
+            agent_dir.join("identity.toml"),
+            "name = \"Mika\"\nemoji = \"✦\"\n",
+        )?;
+
         // Create in-memory DB with session
         let session_id = self
             .session_id
