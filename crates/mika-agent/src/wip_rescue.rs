@@ -67,6 +67,7 @@
 use crate::async_db::AsyncDatabase;
 use crate::perimeter::{self, Classification};
 use crate::tools::pr_merge_with_gate::run_gh_subprocess;
+use mika_common::label_write::LabelWriteToken;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -436,6 +437,7 @@ enum ChainOutcome {
 pub async fn auto_resume_wip_rescue_drafts(
     db: &AsyncDatabase,
     github_token: &str,
+    label_auth: &LabelWriteToken,
     trace_id: &str,
     session_id: &str,
 ) -> Option<usize> {
@@ -463,7 +465,17 @@ pub async fn auto_resume_wip_rescue_drafts(
         return None;
     };
 
-    match resume_chain(db, github_token, trace_id, session_id, &pr, age_secs).await {
+    match resume_chain(
+        db,
+        github_token,
+        label_auth,
+        trace_id,
+        session_id,
+        &pr,
+        age_secs,
+    )
+    .await
+    {
         ChainOutcome::Resumed(route) => {
             info!(
                 pr_number = pr.number,
@@ -573,9 +585,11 @@ async fn has_bailed_marker(db: &AsyncDatabase, pr_number: u64, trace_id: &str) -
 }
 
 /// The per-draft cost-bounded chain (AC2). See module docs for the step map.
+#[allow(clippy::too_many_arguments)]
 async fn resume_chain(
     db: &AsyncDatabase,
     token: &str,
+    label_auth: &LabelWriteToken,
     trace_id: &str,
     session_id: &str,
     pr: &DraftPr,
@@ -593,6 +607,7 @@ async fn resume_chain(
     if rescue_depth >= max_depth() {
         return bail_to_human(
             token,
+            label_auth,
             trace_id,
             session_id,
             db,
@@ -608,6 +623,7 @@ async fn resume_chain(
         Some(v) => {
             return bail_to_human(
                 token,
+                label_auth,
                 trace_id,
                 session_id,
                 db,
@@ -620,6 +636,7 @@ async fn resume_chain(
             warn!(pr_number = pr.number, trace_id, "wip_rescue_error");
             return bail_to_human(
                 token,
+                label_auth,
                 trace_id,
                 session_id,
                 db,
@@ -637,7 +654,10 @@ async fn resume_chain(
     match prepare_branch(&repo_dir, &pr.head_ref, pr.number, trace_id).await {
         PrepareOutcome::Ready => {}
         PrepareOutcome::Bail(reason) => {
-            return bail_to_human(token, trace_id, session_id, db, pr.number, reason).await;
+            return bail_to_human(
+                token, label_auth, trace_id, session_id, db, pr.number, reason,
+            )
+            .await;
         }
         PrepareOutcome::Skip(reason) => {
             return ChainOutcome::Skipped(reason);
@@ -664,6 +684,7 @@ async fn resume_chain(
         let snippet: String = e.chars().take(200).collect();
         return bail_to_human(
             token,
+            label_auth,
             trace_id,
             session_id,
             db,
@@ -924,6 +945,7 @@ fn resolve_repo_dir() -> Option<PathBuf> {
 /// who must pick the draft up will look for it.
 async fn bail_to_human(
     token: &str,
+    label_auth: &LabelWriteToken,
     trace_id: &str,
     session_id: &str,
     db: &AsyncDatabase,
@@ -934,7 +956,7 @@ async fn bail_to_human(
 
     mark_bailed(db, session_id, pr_number, trace_id, &reason).await;
 
-    let parked = apply_human_review_label(token, pr_number, trace_id).await;
+    let parked = apply_human_review_label(label_auth, pr_number, trace_id).await;
 
     // The comment must not promise a re-arm gesture that no longer works.
     // Until mika#2199 the label WAS the eligibility gate, so removing it did
@@ -1030,7 +1052,11 @@ async fn mark_bailed(
 /// (§4.4): without the declaration, `delete-other-labels: true` deletes the
 /// label again on the next push touching that file, and this function would be
 /// re-creating it forever.
-async fn apply_human_review_label(token: &str, pr_number: u64, trace_id: &str) -> bool {
+async fn apply_human_review_label(
+    label_auth: &LabelWriteToken,
+    pr_number: u64,
+    trace_id: &str,
+) -> bool {
     let number = pr_number.to_string();
     let add_label = [
         "pr",
@@ -1042,7 +1068,7 @@ async fn apply_human_review_label(token: &str, pr_number: u64, trace_id: &str) -
         HUMAN_REVIEW_LABEL,
     ];
 
-    if gh(&add_label, token).await.is_ok() {
+    if gh(&add_label, label_auth.token()).await.is_ok() {
         return true;
     }
 
@@ -1062,13 +1088,14 @@ async fn apply_human_review_label(token: &str, pr_number: u64, trace_id: &str) -
             "--description",
             HUMAN_REVIEW_LABEL_DESC,
         ],
-        token,
+        label_auth.token(),
     )
     .await;
 
-    match gh(&add_label, token).await {
+    match gh(&add_label, label_auth.token()).await {
         Ok(_) => true,
         Err(e) => {
+            label_auth.report_write_failure("wip_rescue", pr_number, HUMAN_REVIEW_LABEL, &e);
             warn!(pr_number, error = %e, trace_id, "wip_rescue_error");
             false
         }
@@ -1588,6 +1615,18 @@ mod tests {
         std::fs::read_to_string(dir.join("calls.log")).unwrap_or_default()
     }
 
+    /// Un token d'écriture de label pour les tests de bail.
+    ///
+    /// Provenance `Pat` : `report_write_failure` ne doit pas émettre
+    /// `label_write_app_token_insufficient` sur un refus de `gh` simulé — cet
+    /// event nomme une cause réelle de déploiement, pas un scénario de fixture.
+    fn test_label_auth() -> LabelWriteToken {
+        LabelWriteToken::new(
+            "token".to_string(),
+            mika_common::label_write::LabelWriteTokenSource::Pat,
+        )
+    }
+
     fn bail_db() -> AsyncDatabase {
         let db = crate::db::Database::open_in_memory().unwrap();
         db.create_session("test-session", "mika", "cli").unwrap();
@@ -1606,6 +1645,7 @@ mod tests {
 
         let outcome = bail_to_human(
             "token",
+            &test_label_auth(),
             TRACE,
             "test-session",
             &db,
@@ -1643,6 +1683,7 @@ mod tests {
 
         let outcome = bail_to_human(
             "token",
+            &test_label_auth(),
             TRACE,
             "test-session",
             &db,
@@ -1671,6 +1712,7 @@ mod tests {
 
         let outcome = bail_to_human(
             "token",
+            &test_label_auth(),
             TRACE,
             "test-session",
             &db,
