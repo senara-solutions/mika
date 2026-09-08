@@ -273,6 +273,22 @@ pub struct PilotTranscriptRow {
     pub latency_ms: Option<i64>,
 }
 
+/// A finished dispatch that was asked for a pilot transcript (mika#2040 AC7).
+///
+/// Produced by [`Database::find_dispatches_expecting_transcripts`] and consumed
+/// by the engine's empty-transcript detector. `expected_path` is the path the
+/// executor stamped on the task when it injected `ANTHROPIC_LOG_FILE` — the
+/// detector re-reads it rather than recomputing it, so a later change to the
+/// directory layout cannot make the detector look for a file at an address the
+/// dispatch was never given.
+#[derive(Debug, Clone)]
+pub struct DispatchExpectingTranscript {
+    pub task_id: String,
+    pub expected_path: String,
+    pub status: String,
+    pub updated_at: String,
+}
+
 /// A per-(agent, person, category) content-serve ledger row (mika#1867).
 /// Populated by the `record_served_content` tool after Mika delivers content
 /// (proverb, quote, joke, poem, recommendation, story, fact) to a specific

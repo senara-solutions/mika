@@ -16,6 +16,7 @@ use super::cron::{
 };
 use super::dispatcher::TaskDispatcher;
 use super::liveness::EngineHeartbeat;
+use super::pilot_transcript;
 use super::queue::QueuedTask;
 use super::types::{action_type, task_status, trigger_type};
 
@@ -183,35 +184,34 @@ const PILOT_TRANSCRIPT_RETENTION_DEFAULT_DAYS: i64 = 90;
 /// drift when a new class is added to the executor (mika#1175).
 const DISPATCH_CLASSES: &[&str] = &["implement", "groom"];
 
-/// Parse one claude-pilot transcript JSONL object into a [`crate::db::PilotTranscriptRow`]
-/// (mika#1705). Missing fields become `None`; body fields are secret-scrubbed.
-/// Body values that are JSON objects/arrays are serialized to their compact
-/// string form before scrubbing (claude-pilot may emit either shape).
-fn parse_pilot_transcript_line(v: &serde_json::Value) -> crate::db::PilotTranscriptRow {
-    let str_field = |key: &str| v.get(key).and_then(|x| x.as_str()).map(str::to_owned);
-    let i64_field = |key: &str| v.get(key).and_then(serde_json::Value::as_i64);
-    let scrubbed_body = |key: &str| -> Option<String> {
-        match v.get(key) {
-            None | Some(serde_json::Value::Null) => None,
-            Some(serde_json::Value::String(s)) => {
-                Some(crate::secret_scrubber::scrub_secrets(s).into_owned())
-            }
-            Some(other) => {
-                Some(crate::secret_scrubber::scrub_secrets(&other.to_string()).into_owned())
-            }
-        }
-    };
-    crate::db::PilotTranscriptRow {
-        timestamp: str_field("timestamp"),
-        provider: str_field("provider"),
-        model: str_field("model"),
-        request_body: scrubbed_body("request_body"),
-        response_body: scrubbed_body("response_body"),
-        tokens_in: i64_field("tokens_in"),
-        tokens_out: i64_field("tokens_out"),
-        latency_ms: i64_field("latency_ms"),
-    }
-}
+/// Grace period before the empty-transcript detector reports a finished
+/// dispatch that produced nothing (mika#2040 AC7).
+///
+/// The detector runs in the same 60-tick scan as the ingestion and *after* it,
+/// so a file written and ingested in the same pass is never reported. The grace
+/// covers the other direction: a pilot whose last write landed after the scan
+/// read the directory. Five minutes is far longer than that window and far
+/// shorter than the hours a silent capture used to go unnoticed.
+const PILOT_TRANSCRIPT_EMPTY_GRACE_SECS: i64 = 300;
+
+/// Task-metadata key stamped by the executor when it injects
+/// `ANTHROPIC_LOG_FILE` for a dispatch (mika#2040 AC7).
+///
+/// The detector's premise — "this dispatch was supposed to produce a
+/// transcript" — is a **fact stamped by the producer**, not reconstructed
+/// afterwards from the skill name and the current value of
+/// `MIKA_LOG_PILOT_TRANSCRIPTS`. That gate is read per dispatch and can flip
+/// between the dispatch and the check; a reconstruction would then report
+/// dispatches that were never asked for a transcript, and stay silent on the
+/// ones that were.
+pub(crate) const PILOT_TRANSCRIPT_EXPECTED_KEY: &str = "pilot_transcript_expected";
+
+/// Task-metadata key stamped by the detector once it has reported a dispatch
+/// (mika#2040 AC7). Read back in SQL by
+/// [`crate::db::Database::find_dispatches_expecting_transcripts`] so a reported
+/// dispatch is excluded from the next pass — the warning fires once per
+/// dispatch, not once per minute for ever.
+pub(crate) const PILOT_TRANSCRIPT_REPORTED_KEY: &str = "pilot_transcript_empty_reported";
 
 /// The unified task engine: a min-heap BinaryHeap backed by SQLite, driven by a
 /// 1-second tick loop that fires tasks whose `next_fire_at <= now`.
@@ -521,6 +521,12 @@ impl TaskEngine {
             // into the pilot_transcripts table (the implementation-reasoning
             // corpus for the owned-model bet).
             self.ingest_pilot_transcripts().await;
+
+            // mika#2040 AC7: and say so when a dispatch that was asked for a
+            // transcript produced none. Runs AFTER the ingestion so a file
+            // imported this pass is never reported — the two are one step, in
+            // this order, on purpose.
+            self.detect_empty_pilot_transcripts().await;
         }
 
         // mika#1705 AC6: daily pilot-transcript retention sweep.
@@ -2215,19 +2221,54 @@ impl TaskEngine {
                 }
             };
 
-            let rows: Vec<crate::db::PilotTranscriptRow> = contents
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-                .map(|v| parse_pilot_transcript_line(&v))
-                .collect();
+            // Two failure shapes, deliberately handled differently
+            // (mika#2040 AC2):
+            //
+            // * A line that is not JSON at all is **skipped**. The common cause
+            //   is a truncated last line from a pilot killed mid-write — and
+            //   the transcript of a pilot that died is precisely the one worth
+            //   keeping (mika#2029). Refusing the file over it would throw away
+            //   the evidence at exactly the moment it matters.
+            // * A line that parses but carries no known `schema_version` is a
+            //   **producer contract violation**, not a truncation artifact. The
+            //   file is refused whole, quarantined next to itself, and named.
+            let mut rows: Vec<crate::db::PilotTranscriptRow> = Vec::new();
+            let mut unparseable_lines: usize = 0;
+            let mut schema_error: Option<String> = None;
+
+            for line in contents.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                    unparseable_lines += 1;
+                    continue;
+                };
+                match pilot_transcript::parse_pilot_transcript_line(&value) {
+                    Ok(row) => rows.push(row),
+                    Err(e) => {
+                        schema_error = Some(e.to_string());
+                        break;
+                    }
+                }
+            }
+
+            if let Some(reason) = schema_error {
+                self.quarantine_transcript_file(&path, &task_id, &reason)
+                    .await;
+                continue;
+            }
 
             if rows.is_empty() {
                 // Empty or all-unparseable file: delete so it doesn't linger.
+                // The AC7 detector reports the dispatch on its next pass — the
+                // *file* is gone, the *silence* is not swallowed.
                 if let Err(e) = std::fs::remove_file(&path) {
                     warn!(task_id = %task_id, error = %e, "mika#1705: failed to delete empty transcript file");
                 }
+                warn!(
+                    event = "pilot_transcript_file_empty",
+                    task_id = %task_id,
+                    unparseable_lines,
+                    "mika#2040: transcript file carried no ingestible line"
+                );
                 continue;
             }
 
@@ -2246,6 +2287,188 @@ impl TaskEngine {
                     // Leave the file in place — retried on the next scan.
                     warn!(task_id = %task_id, error = %e, "mika#1705: transcript import failed; will retry");
                 }
+            }
+        }
+    }
+
+    /// Set a transcript file aside instead of ingesting or deleting it
+    /// (mika#2040 AC2).
+    ///
+    /// Renaming to `<task-id>.jsonl.rejected` is what makes the refusal
+    /// bounded: the ingestion loop only picks `.jsonl`, so the file stops being
+    /// re-read and re-warned on every 60-tick scan, while the bytes stay on
+    /// disk for whoever has to work out what the writer emitted. Deleting it
+    /// would destroy the only evidence of the format break; leaving it in place
+    /// would turn one contract violation into a warning every minute.
+    ///
+    /// SOLE WRITER of the `pilot_transcript_schema_rejected` audit tool_name.
+    async fn quarantine_transcript_file(
+        &self,
+        path: &std::path::Path,
+        task_id: &str,
+        reason: &str,
+    ) {
+        let quarantined = path.with_extension("jsonl.rejected");
+        let renamed = match std::fs::rename(path, &quarantined) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(
+                    task_id = %task_id,
+                    error = %e,
+                    "mika#2040: failed to quarantine non-conforming transcript file"
+                );
+                false
+            }
+        };
+
+        warn!(
+            event = "pilot_transcript_schema_rejected",
+            task_id = %task_id,
+            reason = %reason,
+            quarantined = renamed,
+            path = %quarantined.display(),
+            "mika#2040: refused a transcript file whose lines do not carry a known \
+             schema_version — nothing was ingested"
+        );
+
+        let agent_id = self.db.agent_id().to_string();
+        if let Err(e) = self
+            .db
+            .log_audit_event(
+                &format!("system-{agent_id}"),
+                "pilot_transcript_schema_rejected",
+                &format!("task:{task_id}"),
+                None,
+                Some(reason),
+                Some("mika#2040: transcript file refused on schema_version"),
+                None,
+            )
+            .await
+        {
+            warn!(task_id = %task_id, error = %e, "mika#2040: failed to write schema-rejection audit event");
+        }
+    }
+
+    /// Report a finished dispatch that was asked for a transcript and produced
+    /// none (mika#2040 AC7).
+    ///
+    /// # Why this exists at all
+    ///
+    /// The defect mika#2040 was filed on is **silent by construction**: the
+    /// variable is injected, the directory is mounted, and a writer that never
+    /// runs leaves a state byte-identical to "no session happened". mika#1705's
+    /// ingestion could only ever react to files that arrived, so it had nothing
+    /// to say about the 25+ days in which none did. This is the detector on the
+    /// ingestion side of the repo boundary — the one that would have fired on
+    /// the first dispatch instead of waiting for someone to go looking for a
+    /// transcript and find an empty directory.
+    ///
+    /// Runs after [`Self::ingest_pilot_transcripts`] in the same scan, so a
+    /// transcript ingested this pass is never reported. Reports each dispatch
+    /// once (the metadata stamp is read back in SQL). A file still on disk is
+    /// left alone: ingestion owns it, and its own failure has its own warning.
+    ///
+    /// SOLE WRITER of the `pilot_transcript_empty_after_dispatch` audit
+    /// tool_name — so `SELECT count(*) FROM audit_events WHERE tool_name =
+    /// 'pilot_transcript_empty_after_dispatch'` counts dispatches that produced
+    /// nothing, and nothing else.
+    async fn detect_empty_pilot_transcripts(&self) {
+        if !crate::skills::executor::pilot_transcripts_enabled() {
+            return;
+        }
+
+        let candidates = match self
+            .db
+            .find_dispatches_expecting_transcripts(PILOT_TRANSCRIPT_EMPTY_GRACE_SECS)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "mika#2040: failed to query dispatches expecting a transcript");
+                return;
+            }
+        };
+
+        let agent_id = self.db.agent_id().to_string();
+        let system_session = format!("system-{agent_id}");
+
+        for candidate in candidates {
+            self.heartbeat.tick();
+
+            // The file is still there: ingestion owns it and will import it (or
+            // fail loudly on its own). Reporting here would double-count a
+            // transcript that is merely late.
+            if std::path::Path::new(&candidate.expected_path).exists() {
+                continue;
+            }
+
+            match self
+                .db
+                .count_pilot_transcripts_for_task(candidate.task_id.clone())
+                .await
+            {
+                Ok(0) => {}
+                // Ingested: the nominal path. Stamp nothing, say nothing.
+                Ok(_) => continue,
+                Err(e) => {
+                    warn!(
+                        task_id = %candidate.task_id,
+                        error = %e,
+                        "mika#2040: transcript count check failed; will retry next scan"
+                    );
+                    continue;
+                }
+            }
+
+            warn!(
+                event = "pilot_transcript_empty_after_dispatch",
+                task_id = %candidate.task_id,
+                status = %candidate.status,
+                expected_path = %candidate.expected_path,
+                agent_id = %agent_id,
+                "mika#2040: dispatch finished with ANTHROPIC_LOG_FILE set but produced \
+                 no ingested transcript — the claude-pilot writer is not running"
+            );
+
+            if let Err(e) = self
+                .db
+                .log_audit_event(
+                    &system_session,
+                    "pilot_transcript_empty_after_dispatch",
+                    &format!("task:{}", candidate.task_id),
+                    Some(&candidate.status),
+                    Some(&candidate.expected_path),
+                    Some(
+                        "mika#2040: ANTHROPIC_LOG_FILE was injected for this dispatch \
+                         and no transcript line was ingested",
+                    ),
+                    None,
+                )
+                .await
+            {
+                warn!(
+                    task_id = %candidate.task_id,
+                    error = %e,
+                    "mika#2040: failed to write empty-transcript audit event"
+                );
+            }
+
+            // Stamp last. A stamp written before the report would silence a
+            // dispatch this pass failed to report.
+            if let Err(e) = self
+                .db
+                .set_task_metadata_field(
+                    &candidate.task_id,
+                    PILOT_TRANSCRIPT_REPORTED_KEY,
+                    &crate::timestamp::now(),
+                )
+                .await
+            {
+                warn!(
+                    task_id = %candidate.task_id,
+                    error = %e,
+                    "mika#2040: failed to stamp empty-transcript report (will re-report next scan)"
+                );
             }
         }
     }
