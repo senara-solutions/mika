@@ -273,7 +273,13 @@ If a tool returns `"Missing required parameter(s)"`, check field names character
 
 Never call `run_gh("pr merge ...")` or `run_gh("gh pr merge ...")` to merge a PR. Always use `pr_merge_with_gate` with `pr_number` (integer) and `repo` (owner/repo string). The tool checks required CI statuses and returns a structured `action` — act on it.
 
-**Structural enforcement:** `pr_merge_with_gate` returns typed variants (`merged`, `auto_merge_enabled`, `blocked`, `already_merged`, `gate_errored`). The `blocked` variant carries a `reason` field with sub-variants (`merge_conflict`, `required_check_failed`, `missing_approval`, `pr_closed`, `draft`). The `gate_errored` variant carries `kind` and `detail` fields. Branch on these variants exhaustively — do NOT fall back to `run_gh pr merge` on ANY error or blocked state. Runtime enforcement via policy table — see follow-up ticket.
+**Structural enforcement:** `pr_merge_with_gate` returns **six** typed variants — `merged`, `auto_merge_enabled`, `blocked`, `already_merged`, `gate_errored`, `branch_updated`. The `blocked` variant carries a `reason` field with **seven** sub-variants — `merge_conflict`, `required_check_failed`, `missing_approval`, `pr_closed`, `draft`, `behind_main`, `human_gate_required`. The `gate_errored` variant carries `kind` and `detail` fields. Branch on these variants exhaustively — do NOT fall back to `run_gh pr merge` on ANY error or blocked state.
+
+- **`"branch_updated"`** (mika#2238) — the PR was behind main and the gate brought its branch up to date. **No merge was attempted and none must be attempted in this turn.** The update created a new head commit that no CI run has validated; merging it now would put unvalidated code on main — the failure mika#1577 was written to close. Do NOT call `pr_merge_with_gate` again for this PR. Do NOT rebase by hand. **End the turn** — GitHub's fresh `check_suite success` webhook re-enters the merge path and finishes the job.
+- **`reason.reason = "behind_main"`** — the PR is behind main and the automatic branch update did NOT go through. The `detail` field says why: a permission or API failure, or an update toward this exact main HEAD that was already attempted (anti-thrash guard). Do NOT merge. Do NOT rebase by hand. Notify the operator with the `detail`, then end the turn.
+- **`reason.reason = "human_gate_required"`** (mika#1829) — the PR touches a DECISION-CORE zone and the forge-gate perimeter holds it for the operator. Notify. Do NOT work around it, do NOT retry the tool.
+
+**Why this list used to be short:** until mika#2238 these prompts named five of the seven `blocked.reason` values while instructing you to branch "exhaustively". An agent that met an unlisted variant had no defined move, and the observed behaviour was a silent stop.
 
 **Exception:** The "merge anyway" block resumption command uses raw `run_gh` as an intentional override of the CI gate when Vincent explicitly requests it.
 
@@ -516,10 +522,14 @@ For each `child_task_id` in `child_wis` (in order):
 
    *(M4 HOLD ≠ QA verdict `hold[*]`. The latter is a verdict class for blocked-but-fixable PRs handled in `self-dev-webhook-qa` § Verdict class `hold[*]`. Same word, different machinery.)*
 
+   - If `pr_merge_with_gate` returned `"branch_updated"` (mika#2238): the PR was behind main and its branch was brought up to date. The PR is NOT merged and must NOT be merged in this turn — the update created a new head commit with no CI result. This is a **HOLD state**, handled exactly like `auto_merge_enabled` above: persist the HOLD with note `"HOLD: branch updated to main, awaiting fresh CI (PR #<num>)"`, then **end the turn immediately**. Do NOT re-call `pr_merge_with_gate`. Do NOT rebase by hand. Do NOT dispatch the next child. The fresh `check_suite success` webhook resumes the merge path.
+
    - If `pr_merge_with_gate` returned `"blocked"`: branch on the `reason` field:
      - `reason.reason = "required_check_failed"`: the webhook handler already routed to CI-fix. M4 step 3 will see the child per the handler's outcome.
      - `reason.reason = "merge_conflict"`: rebase needed. M4 step 3 will see the child as `blocked` or `in_progress` per the handler's outcome.
      - `reason.reason = "missing_approval"`: review approval needed. Task stays `in_progress`.
+     - `reason.reason = "behind_main"`: the PR is behind main AND the automatic branch update did not go through — read `detail` for the cause (permission/API failure, or an attempt already spent toward this main HEAD). Do NOT merge, do NOT rebase by hand. Notify Vincent with the `detail`. Task stays `in_progress`.
+     - `reason.reason = "human_gate_required"`: the PR touches a DECISION-CORE zone; the operator merges it (mika#1829). Notify Vincent, do NOT work around the gate. Task stays `in_progress`.
      - `reason.reason = "draft"` or `reason.reason = "pr_closed"`: unexpected in milestone flow. Escalate to Vincent. Task status: `blocked`.
      - Unrecognized `reason` value: do NOT fall back to `run_gh pr merge`. Notify Vincent. Task stays `in_progress`.
 

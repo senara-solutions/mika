@@ -51,8 +51,9 @@ use crate::messaging::MessageSender;
 use crate::perimeter::{self, Classification};
 use crate::task_state::merge_metadata;
 use crate::tools::pr_merge_with_gate::{
-    CheckClassification, classify_checks, is_behind_main, run_gh_checks, run_gh_merge,
-    run_gh_pr_view, run_gh_subprocess,
+    BehindMainInfo, BehindMainRemediation, CheckClassification, classify_checks,
+    describe_behind_main_remediation, is_behind_main, remediate_behind_main, run_gh_checks,
+    run_gh_merge, run_gh_pr_view, run_gh_subprocess,
 };
 
 use super::check_suite_dedup;
@@ -348,25 +349,30 @@ pub async fn try_handle_ci_success(
         return VerdictAction::Passthrough { enrichment: None };
     }
 
-    // 5b. Behind-main assertion (#1577) — block merge if PR is behind main.
+    // 5b. Behind-main assertion (#1577) + remediation (mika#2238).
     // Fetch the PR's baseRefOid via gh pr view, then compare against main HEAD.
-    // Fail-open: API errors log a warning and proceed.
+    // When behind, the branch is brought up to date and this turn ENDS — the
+    // update creates a new head commit, and the fresh `check_suite success`
+    // webhook re-enters this very handler to finish the merge.
+    // Fail-open on the DETECTION API error, as before.
     match run_gh_pr_view(pr.number, &event.repo, token).await {
         Ok(preflight) => {
             match is_behind_main(&preflight.base_ref_oid, &event.repo, token).await {
                 Ok(Some(info)) => {
-                    info!(
-                        pr_number = pr.number,
-                        pr_base_sha = %info.pr_base_sha,
-                        current_main_sha = %info.current_main_sha,
-                        "CI success handler: PR is behind main — skipping merge"
-                    );
-                    return VerdictAction::Passthrough {
-                        enrichment: Some(format_behind_main_enrichment(
-                            &info.pr_base_sha,
-                            &info.current_main_sha,
-                        )),
-                    };
+                    let remediation = remediate_behind_main(
+                        "ci_success_handler",
+                        pr.number,
+                        &event.repo,
+                        token,
+                        &info,
+                    )
+                    .await;
+                    if let Some(enrichment) = format_behind_main_enrichment(&remediation, &info) {
+                        return VerdictAction::Passthrough {
+                            enrichment: Some(enrichment),
+                        };
+                    }
+                    // `None` — the PR turned out not to be behind. Proceed.
                 }
                 Ok(None) => {} // Up-to-date — proceed to merge
                 Err(e) => {
@@ -853,13 +859,27 @@ fn format_decision_core_hold_pre_digest(
     )
 }
 
-/// Format the enrichment message for a behind-main block.
-fn format_behind_main_enrichment(pr_base_sha: &str, current_main_sha: &str) -> String {
-    format!(
-        "[ci_success_handler] All CI checks passed and VERDICT: pass exists, \
-         but the PR is behind main (base: {pr_base_sha}, main HEAD: {current_main_sha}). \
-         Rebase the PR onto main before merging.\n\n"
-    )
+/// Format the enrichment message for a behind-main outcome (mika#2238).
+///
+/// `None` means the PR turned out not to be behind — the handler continues to
+/// the merge path. Every other value ends the turn.
+///
+/// The remediation-specific half comes from
+/// [`describe_behind_main_remediation`] so the do-not-merge instruction — the
+/// point where a zealous LLM could re-open #1577 — has exactly one wording
+/// shared with `verdict_handler`. The prior text ("Rebase the PR onto main
+/// before merging") asked the LLM for an action the code now performs itself.
+///
+/// IMPORTANT: avoids the completion-claim guard's vocabulary (merged, deployed,
+/// complete/completed, shipped) — pinned by the tests below.
+fn format_behind_main_enrichment(
+    remediation: &BehindMainRemediation,
+    info: &BehindMainInfo,
+) -> Option<String> {
+    let described = describe_behind_main_remediation(remediation, info)?;
+    Some(format!(
+        "[ci_success_handler] All CI checks passed and VERDICT: pass exists, but {described}"
+    ))
 }
 
 #[cfg(test)]
@@ -1026,38 +1046,90 @@ mod tests {
         assert!(parse_check_suite_success(text).is_none());
     }
 
-    // ---- Behind-main enrichment tests (#1577) ----
+    // ---- Behind-main enrichment tests (#1577, mika#2238) ----
+
+    fn behind_info() -> BehindMainInfo {
+        BehindMainInfo {
+            pr_base_sha: "abc1234deadbeef".to_string(),
+            current_main_sha: "def5678cafebabe".to_string(),
+        }
+    }
 
     #[test]
     fn behind_main_enrichment_contains_both_shas() {
-        let pr_base = "abc1234deadbeef";
-        let main_head = "def5678cafebabe";
-        let text = format_behind_main_enrichment(pr_base, main_head);
+        let info = behind_info();
+        let text = format_behind_main_enrichment(&BehindMainRemediation::Updated, &info)
+            .expect("an updated branch must still enrich the turn");
         assert!(
-            text.contains(pr_base),
+            text.contains(&info.pr_base_sha),
             "Enrichment missing pr_base_sha: {text}"
         );
         assert!(
-            text.contains(main_head),
+            text.contains(&info.current_main_sha),
             "Enrichment missing current_main_sha: {text}"
         );
     }
 
     #[test]
     fn behind_main_enrichment_avoids_completion_claim_words() {
-        let text = format_behind_main_enrichment("aaa", "bbb");
+        // Every remediation shape is a pre-digest fed to an LLM turn, so every
+        // one of them must clear the completion-claim guard — not just the
+        // shape that happened to exist when the guard was written.
+        for remediation in [
+            BehindMainRemediation::Updated,
+            BehindMainRemediation::AlreadyAttempted,
+            BehindMainRemediation::Conflict("merge conflict between base and head".to_string()),
+            BehindMainRemediation::Failed("HTTP 403: Resource not accessible".to_string()),
+        ] {
+            let text = format_behind_main_enrichment(&remediation, &behind_info())
+                .expect("only NotBehind yields no enrichment");
+            assert!(
+                !COMPLETION_CLAIM_RE.is_match(&text),
+                "Behind-main enrichment for {remediation:?} contains a completion-claim \
+                 trigger word: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn behind_main_enrichment_on_failed_update_still_instructs_rebase() {
+        // The rebase instruction is the fallback wording, kept for the one case
+        // the code could not repair itself.
+        let text = format_behind_main_enrichment(
+            &BehindMainRemediation::Failed("gh exit code 1".to_string()),
+            &behind_info(),
+        )
+        .expect("a failed update must enrich the turn");
         assert!(
-            !COMPLETION_CLAIM_RE.is_match(&text),
-            "Behind-main enrichment contains completion-claim trigger word: {text}"
+            text.contains("Rebase"),
+            "Failed-update enrichment should instruct rebase: {text}"
         );
     }
 
     #[test]
-    fn behind_main_enrichment_mentions_rebase() {
-        let text = format_behind_main_enrichment("aaa", "bbb");
+    fn mika2238_updated_enrichment_forbids_merging_in_this_turn() {
+        // R3, handler side. An update-branch creates a new head commit that no
+        // CI run has validated; an LLM that merges it anyway re-opens #1577
+        // through the door mika#2238 opened.
+        let text = format_behind_main_enrichment(&BehindMainRemediation::Updated, &behind_info())
+            .expect("an updated branch must enrich the turn");
         assert!(
-            text.contains("Rebase"),
-            "Behind-main enrichment should instruct rebase: {text}"
+            text.contains("Do NOT merge"),
+            "Updated enrichment must forbid merging in this turn: {text}"
+        );
+        assert!(
+            text.contains("pr_merge_with_gate"),
+            "Updated enrichment must name the tool not to call: {text}"
+        );
+    }
+
+    #[test]
+    fn mika2238_not_behind_yields_no_enrichment_so_the_handler_continues() {
+        // `None` is the only value that lets the handler reach `run_gh_merge`.
+        assert!(
+            format_behind_main_enrichment(&BehindMainRemediation::NotBehind, &behind_info())
+                .is_none(),
+            "a PR that is not behind must not be held by this path"
         );
     }
 

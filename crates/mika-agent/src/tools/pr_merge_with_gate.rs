@@ -1,7 +1,10 @@
 use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use async_trait::async_trait;
+use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use mika_common::claude::ToolDefinition;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -44,11 +47,15 @@ impl Tool for PrMergeWithGateTool {
                 checks pass. If all required checks pass, the PR is merged immediately.\n\n\
                 IMPORTANT: 'auto_merge_enabled' means GitHub will merge when all checks pass — \
                 the PR is NOT yet merged. Do not claim the PR is merged until you confirm it.\n\n\
+                IMPORTANT: 'branch_updated' means the PR was behind main and the gate brought \
+                its branch up to date. No merge was attempted. Do NOT call this tool again for \
+                this PR in the same turn — the update created a new head commit with no CI \
+                result yet; the fresh check_suite webhook resumes the merge path. End the turn.\n\n\
                 After a successful merge (action: 'merged'), update the task status before \
                 reporting to the user.\n\n\
                 Returns a structured JSON response with an 'action' field. Possible actions: \
-                'merged', 'auto_merge_enabled', 'blocked', 'already_merged', 'gate_errored'. \
-                Branch on 'action' to determine next steps."
+                'merged', 'auto_merge_enabled', 'blocked', 'already_merged', 'gate_errored', \
+                'branch_updated'. Branch on 'action' to determine next steps."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -149,25 +156,21 @@ impl Tool for PrMergeWithGateTool {
             return Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?));
         }
 
-        // -- Step 1b: Behind-main assertion (#1577) --
-        // Block merge if PR base is behind the current main HEAD.
-        // Fail-open: API errors log a warning and proceed.
+        // -- Step 1b: Behind-main assertion (#1577) + remediation (mika#2238) --
+        // A behind-main PR is now repaired rather than merely declined: the
+        // branch is brought up to date and the turn ends there, so the fresh CI
+        // run — not this turn — is what re-opens the merge path.
+        // Fail-open on the DETECTION API error, as before; the remediation
+        // itself never fails open (see `disposition_for_remediation`).
         match is_behind_main(&preflight.base_ref_oid, repo, token).await {
             Ok(Some(info)) => {
-                let detail = format!(
-                    "PR is behind main — rebase needed. \
-                     PR base: {}, main HEAD: {}",
-                    info.pr_base_sha, info.current_main_sha
-                );
-                let result = MergeGateResult::Blocked {
-                    reason: BlockReason::BehindMain {
-                        pr_base_sha: info.pr_base_sha,
-                        current_main_sha: info.current_main_sha,
-                    },
-                    failing_checks: vec![],
-                    detail,
-                };
-                return Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?));
+                let remediation =
+                    remediate_behind_main("pr_merge_with_gate", pr_number, repo, token, &info)
+                        .await;
+                if let Some(result) = disposition_for_remediation(&remediation, &info) {
+                    return Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?));
+                }
+                // `None` — the PR turned out not to be behind. Continue the gate.
             }
             Ok(None) => {} // Up-to-date — proceed
             Err(e) => {
@@ -397,6 +400,17 @@ pub(crate) enum MergeGateResult {
     AlreadyMerged,
     #[serde(rename = "gate_errored")]
     GateError { kind: GateErrorKind, detail: String },
+    /// The PR was behind `main` and the gate brought its branch up to date
+    /// (mika#2238). Deliberately NOT a `Blocked` variant: a behind-main state
+    /// that was repaired is not a blockage, and collapsing the two would leave
+    /// the agent unable to tell "wait for the fresh CI run" from "something is
+    /// wrong". No merge was attempted and none must be attempted this turn —
+    /// the new head commit has no CI result yet.
+    #[serde(rename = "branch_updated")]
+    BranchUpdated {
+        pr_base_sha: String,
+        new_main_sha: String,
+    },
 }
 
 /// Why a PR is blocked from merging.
@@ -722,6 +736,399 @@ pub(crate) async fn is_behind_main(
     } else {
         Ok(None)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Behind-main remediation (mika#2238)
+// ---------------------------------------------------------------------------
+//
+// `is_behind_main` above DETECTS the stale state; nothing repaired it. The
+// only remediation shipped with #1577 was a sentence addressed to an LLM
+// ("Rebase the PR onto main before merging") naming no tool — and every merge
+// onto `main` makes every other open PR behind, so this was not an edge case
+// but the default state as soon as a second PR exists. Measured on mika#2236:
+// APPROVED + CI-green + mergeable at 08:25:08Z, closed by a human at 10:00:36Z.
+//
+// The sequence below is a RENDEZVOUS, not a retry loop. `update-branch` creates
+// a NEW commit on the PR head, so the green `statusCheckRollup` the gate just
+// read belongs to the PREVIOUS commit. Merging straight after the update would
+// put a commit no CI validated onto `main` — precisely the failure #1577 was
+// written to close. So the turn ENDS after the update, and GitHub's fresh
+// `check_suite success` webhook re-enters `ci_success_handler`, which is
+// already the handler for that event. No new waiting mechanism is introduced.
+
+/// Soft capacity of the update-branch attempt ledger.
+const UPDATE_ATTEMPT_CAP: usize = 256;
+
+/// Entries older than this are dropped on the next capacity-triggered sweep.
+///
+/// This is a memory bound, not a retry policy. It is set far above any CI
+/// cycle so it cannot re-arm a thrash loop: a PR still behind the *same* main
+/// HEAD six hours later is a stalled PR, not a PR being hammered. A process
+/// restart re-arms the same way, and for the same reason is harmless.
+const UPDATE_ATTEMPT_TTL: Duration = Duration::from_secs(6 * 3600);
+
+/// Process-global ledger of update-branch attempts.
+/// Key = `"{repo}#{pr}@{target_main_sha}"`, value = monotonic `Instant`.
+static UPDATE_ATTEMPTS: LazyLock<DashMap<String, Instant>> = LazyLock::new(DashMap::new);
+
+/// Outcome of one `update-branch` call against a PR.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum UpdateBranchOutcome {
+    /// GitHub accepted the update — a new commit now sits on the PR head.
+    Updated,
+    /// GitHub declined because the branch is not behind after all (benign race).
+    AlreadyUpToDate,
+    /// The update revealed a real content conflict — resolution is required.
+    Conflict(String),
+    /// Permission, network, malformed response, or `gh` itself missing.
+    Failed(String),
+}
+
+/// What the behind-main path decided for this PR, in this turn.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BehindMainRemediation {
+    /// The branch was brought up to date. A fresh CI run is expected.
+    Updated,
+    /// The anti-thrash guard already spent this PR's attempt at this main SHA.
+    AlreadyAttempted,
+    /// The PR turned out not to be behind after all — the gate may continue.
+    NotBehind,
+    /// The update hit a real conflict.
+    Conflict(String),
+    /// The update did not go through (permission, API, gh missing, contradiction).
+    Failed(String),
+}
+
+/// Claim the single update-branch attempt allowed for `(pr, target_main_sha)`.
+///
+/// Returns `true` for the caller that may proceed, `false` for every later one.
+/// The key is the SHA of `main` being aimed at rather than an attempt counter
+/// (KTD-2): it is idempotent by construction and needs no reset. When another
+/// PR merges, the target SHA changes, which legitimately re-opens one attempt —
+/// so under a sustained merge stream a PR can stay behind indefinitely without
+/// ever looping. That is deliberate: the starvation stays visible in the trace
+/// rather than being hidden by an abandonment.
+pub(crate) fn claim_update_branch_attempt(
+    pr_number: u64,
+    repo: &str,
+    target_main_sha: &str,
+) -> bool {
+    claim_update_attempt_in(
+        &UPDATE_ATTEMPTS,
+        pr_number,
+        repo,
+        target_main_sha,
+        Instant::now(),
+    )
+}
+
+/// Core of [`claim_update_branch_attempt`], parameterized over the backing map
+/// and the notion of "now" so it can be exercised without the process-global
+/// ledger or real sleeps. Mirrors [`crate::server::check_suite_dedup`].
+fn claim_update_attempt_in(
+    map: &DashMap<String, Instant>,
+    pr_number: u64,
+    repo: &str,
+    target_main_sha: &str,
+    now: Instant,
+) -> bool {
+    let key = format!("{repo}#{pr_number}@{target_main_sha}");
+
+    // Amortized eviction, done BEFORE taking the per-key shard lock — `retain`
+    // locks every shard, so running it while holding an entry lock deadlocks.
+    if map.len() >= UPDATE_ATTEMPT_CAP {
+        map.retain(|_, &mut stored| now.saturating_duration_since(stored) < UPDATE_ATTEMPT_TTL);
+    }
+
+    // Atomic check-and-insert: the shard lock is held across read and write, so
+    // a concurrent burst on one key yields exactly one `true`.
+    match map.entry(key) {
+        Entry::Occupied(mut e) => {
+            if now.saturating_duration_since(*e.get()) < UPDATE_ATTEMPT_TTL {
+                false
+            } else {
+                e.insert(now);
+                true
+            }
+        }
+        Entry::Vacant(e) => {
+            e.insert(now);
+            true
+        }
+    }
+}
+
+/// Ask GitHub to bring the PR's head branch up to date with its base.
+///
+/// **This is the only call site of update-branch in the codebase (R1).** A
+/// source-scan test pins that; a behavioural test cannot, because a second
+/// caller would not make any assertion fail — it would only make the
+/// anti-thrash guard bypassable.
+///
+/// Goes through the REST endpoint rather than `gh pr update-branch`, and the
+/// difference is load-bearing: `gh pr update-branch` decides whether to act
+/// from the PR's `mergeStateStatus`, and #1577 KTD-1 established that this
+/// repository's ruleset (`strict_required_status_checks_policy: false`,
+/// `bypass_mode: always`) makes GitHub report `CLEAN` on PRs that are behind.
+/// Routing the repair through that check would make it a no-op in exactly the
+/// case it exists for. The SHA comparison in `is_behind_main` is the authority
+/// on "behind"; this endpoint is the authority on "make it not so".
+pub(crate) async fn attempt_update_branch(
+    pr_number: u64,
+    repo: &str,
+    token: &str,
+) -> UpdateBranchOutcome {
+    let endpoint = format!("repos/{repo}/pulls/{pr_number}/update-branch");
+    let args = vec!["api", "--method", "PUT", &endpoint];
+
+    match run_gh_subprocess(&args, token).await {
+        Ok(_) => UpdateBranchOutcome::Updated,
+        Err(e) => classify_update_branch_error(&e),
+    }
+}
+
+/// Discriminate an update-branch failure from the `gh` error text.
+///
+/// Pure so the four outcomes can be pinned against real `gh` messages without
+/// a subprocess.
+pub(crate) fn classify_update_branch_error(err: &str) -> UpdateBranchOutcome {
+    let lower = err.to_lowercase();
+
+    // Checked FIRST. A "nothing to do" 422 body can carry the word "merge", and
+    // reading it as a conflict would block a PR that has nothing wrong with it —
+    // the expensive direction of this mistake.
+    if lower.contains("up to date")
+        || lower.contains("up-to-date")
+        || lower.contains("not behind")
+        || lower.contains("no new commits")
+    {
+        return UpdateBranchOutcome::AlreadyUpToDate;
+    }
+
+    if lower.contains("conflict") {
+        return UpdateBranchOutcome::Conflict(err.to_string());
+    }
+
+    UpdateBranchOutcome::Failed(err.to_string())
+}
+
+/// Run the behind-main repair for one PR and report what happened.
+///
+/// Shared by all three behind-main sites (`pr_merge_with_gate` step 1b,
+/// `ci_success_handler` step 5b, `verdict_handler`) so the anti-thrash claim,
+/// the repair, and the trace have exactly one shape. `site` names the caller in
+/// the log line (R7).
+///
+/// # Ordering against the forge-gate perimeter (mika#1829/#1853)
+///
+/// This repair runs BEFORE the perimeter classifier at every site, so a
+/// DECISION-CORE PR now has its branch brought up to date by the loop before
+/// the operator is told to merge it by hand. That is a deliberate consequence,
+/// not an oversight: the perimeter gate exists to stop the loop **merging**
+/// decision-core changes, and update-branch merges nothing — it moves the PR's
+/// own branch forward, exactly what GitHub's "Update branch" button does. The
+/// inverse order would cost more than it buys: `fetch_pr_files` is fail-closed
+/// on error, so putting it first would let one transient API failure block the
+/// mechanical repair of every PR, decision-core or not. The merge itself stays
+/// gated either way.
+pub(crate) async fn remediate_behind_main(
+    site: &'static str,
+    pr_number: u64,
+    repo: &str,
+    token: &str,
+    info: &BehindMainInfo,
+) -> BehindMainRemediation {
+    if !claim_update_branch_attempt(pr_number, repo, &info.current_main_sha) {
+        let remediation = BehindMainRemediation::AlreadyAttempted;
+        log_behind_main_remediation(site, pr_number, repo, info, &remediation);
+        return remediation;
+    }
+
+    let remediation = match attempt_update_branch(pr_number, repo, token).await {
+        UpdateBranchOutcome::Updated => BehindMainRemediation::Updated,
+        UpdateBranchOutcome::AlreadyUpToDate => {
+            reconcile_already_up_to_date(pr_number, repo, token)
+                .await
+                .unwrap_or_else(BehindMainRemediation::Failed)
+        }
+        UpdateBranchOutcome::Conflict(detail) => BehindMainRemediation::Conflict(detail),
+        UpdateBranchOutcome::Failed(detail) => BehindMainRemediation::Failed(detail),
+    };
+
+    log_behind_main_remediation(site, pr_number, repo, info, &remediation);
+    remediation
+}
+
+/// GitHub said the branch was already up to date; our SHA read said otherwise.
+///
+/// Re-read the PR's `baseRefOid` rather than believing either side. Note the
+/// re-read cannot reuse the stale `pr_base_sha` we came in with: that value is
+/// what the contradiction is *about*. Only a genuinely up-to-date PR is allowed
+/// back into the gate — proceeding on an unverified assumption is what #1577
+/// exists to stop.
+async fn reconcile_already_up_to_date(
+    pr_number: u64,
+    repo: &str,
+    token: &str,
+) -> Result<BehindMainRemediation, String> {
+    let preflight = run_gh_pr_view(pr_number, repo, token).await.map_err(|e| {
+        format!(
+            "update-branch reported the branch was already up to date; \
+             re-reading the PR base failed: {}",
+            e.message
+        )
+    })?;
+
+    match is_behind_main(&preflight.base_ref_oid, repo, token).await {
+        Ok(None) => Ok(BehindMainRemediation::NotBehind),
+        Ok(Some(fresh)) => Err(format!(
+            "update-branch reported the branch was already up to date, but the PR base \
+             is still behind main (base: {}, main HEAD: {})",
+            fresh.pr_base_sha, fresh.current_main_sha
+        )),
+        Err(e) => Err(format!(
+            "update-branch reported the branch was already up to date; \
+             re-checking behind-main failed: {e}"
+        )),
+    }
+}
+
+/// Emit the structured trace for one behind-main decision (R7).
+///
+/// One emission point for all three sites: a PR that shows up behind without a
+/// following `outcome="updated"` is the starvation signal the ticket asked for,
+/// and that reading only works if every site writes the same event shape.
+///
+/// `$MIKA_SPIRIT_LOG_FILE` no longer double-writes every line (mika#2195), but
+/// any count taken over lines written before that deploy is doubled — dedup
+/// before counting historical windows.
+fn log_behind_main_remediation(
+    site: &'static str,
+    pr_number: u64,
+    repo: &str,
+    info: &BehindMainInfo,
+    remediation: &BehindMainRemediation,
+) {
+    let (outcome, detail) = match remediation {
+        BehindMainRemediation::Updated => ("updated", None),
+        BehindMainRemediation::AlreadyAttempted => ("already_attempted", None),
+        BehindMainRemediation::NotBehind => ("not_behind", None),
+        BehindMainRemediation::Conflict(d) => ("conflict", Some(d.as_str())),
+        BehindMainRemediation::Failed(d) => ("failed", Some(d.as_str())),
+    };
+
+    info!(
+        event = "behind_main_update_branch",
+        site,
+        pr_number,
+        repo,
+        pr_base_sha = %info.pr_base_sha,
+        target_main_sha = %info.current_main_sha,
+        outcome,
+        detail,
+        issue = 2238,
+        "Behind-main remediation decided for PR"
+    );
+}
+
+/// Map a remediation outcome to the tool's structured result.
+///
+/// `None` means "no disposition — let the merge gate continue", and it is the
+/// ONLY value on this path that can reach `run_gh_merge`. R3 ("no merge in the
+/// same turn as an update-branch") is therefore a property of this one pure
+/// function rather than of three call sites that each have to remember it.
+pub(crate) fn disposition_for_remediation(
+    remediation: &BehindMainRemediation,
+    info: &BehindMainInfo,
+) -> Option<MergeGateResult> {
+    match remediation {
+        BehindMainRemediation::NotBehind => None,
+        BehindMainRemediation::Updated => Some(MergeGateResult::BranchUpdated {
+            pr_base_sha: info.pr_base_sha.clone(),
+            new_main_sha: info.current_main_sha.clone(),
+        }),
+        BehindMainRemediation::AlreadyAttempted => Some(MergeGateResult::Blocked {
+            reason: BlockReason::BehindMain {
+                pr_base_sha: info.pr_base_sha.clone(),
+                current_main_sha: info.current_main_sha.clone(),
+            },
+            failing_checks: vec![],
+            detail: format!(
+                "PR is behind main (base: {}, main HEAD: {}) — an automatic branch update \
+                 toward this main HEAD was already attempted and is not being retried.",
+                info.pr_base_sha, info.current_main_sha
+            ),
+        }),
+        BehindMainRemediation::Conflict(d) => Some(MergeGateResult::Blocked {
+            reason: BlockReason::MergeConflict,
+            failing_checks: vec![],
+            detail: format!(
+                "PR is behind main and the automatic branch update hit a conflict — \
+                 resolution is required before merging. {d}"
+            ),
+        }),
+        BehindMainRemediation::Failed(d) => Some(MergeGateResult::Blocked {
+            reason: BlockReason::BehindMain {
+                pr_base_sha: info.pr_base_sha.clone(),
+                current_main_sha: info.current_main_sha.clone(),
+            },
+            failing_checks: vec![],
+            detail: format!(
+                "PR is behind main (base: {}, main HEAD: {}) and the automatic branch \
+                 update did not go through: {d}",
+                info.pr_base_sha, info.current_main_sha
+            ),
+        }),
+    }
+}
+
+/// The remediation-specific half of the two handlers' enrichment text.
+///
+/// `None` means "no enrichment — let the handler continue", the webhook mirror
+/// of `disposition_for_remediation`'s `None`. Shared because the load-bearing
+/// sentence is the do-not-merge instruction, and two copies of it would drift.
+///
+/// The wording deliberately avoids the completion-claim guard's vocabulary
+/// (`merged` / `deployed` / `complete(d)` / `shipped`) — these strings are
+/// pre-digest input to an LLM turn, and a pre-digest that trips that guard
+/// costs the turn.
+pub(crate) fn describe_behind_main_remediation(
+    remediation: &BehindMainRemediation,
+    info: &BehindMainInfo,
+) -> Option<String> {
+    let base = &info.pr_base_sha;
+    let head = &info.current_main_sha;
+
+    Some(match remediation {
+        BehindMainRemediation::NotBehind => return None,
+        BehindMainRemediation::Updated => format!(
+            "the PR was behind main (base: {base}, main HEAD: {head}). The branch has been \
+             brought up to date with main automatically (mika#2238). Do NOT merge this PR in \
+             this turn and do NOT call `pr_merge_with_gate` for it: the update created a new \
+             head commit that no CI run has validated yet, and merging it now would put an \
+             unvalidated commit on main (the failure mika#1577 closed). GitHub is running CI \
+             on the new commit; the resulting `check_suite success` webhook re-enters the \
+             merge path and finishes the job. End the turn.\n\n"
+        ),
+        BehindMainRemediation::AlreadyAttempted => format!(
+            "the PR is behind main (base: {base}, main HEAD: {head}). An automatic branch \
+             update toward this exact main HEAD was already attempted, so it is not being \
+             retried (anti-thrash guard, mika#2238). Do NOT merge and do NOT rebase by hand. \
+             End the turn; if no fresh CI run appears for this PR, surface it to the \
+             operator.\n\n"
+        ),
+        BehindMainRemediation::Conflict(d) => format!(
+            "the PR is behind main (base: {base}, main HEAD: {head}) and the automatic branch \
+             update hit a real conflict: {d}. Do NOT merge. Conflict resolution is required \
+             before this PR can go in.\n\n"
+        ),
+        BehindMainRemediation::Failed(d) => format!(
+            "the PR is behind main (base: {base}, main HEAD: {head}) and the automatic branch \
+             update did not go through: {d}. Do NOT merge. Rebase the PR onto main before \
+             merging, or surface the failure to the operator.\n\n"
+        ),
+    })
 }
 
 /// Run `gh pr merge <number> --repo <repo> --<method> [--delete-branch] [--auto]`
@@ -1348,6 +1755,379 @@ mod tests {
         let result = MergeGateResult::AlreadyMerged;
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["action"], "already_merged");
+    }
+
+    // -----------------------------------------------------------------------
+    // Behind-main remediation (mika#2238)
+    // -----------------------------------------------------------------------
+
+    fn behind_info() -> BehindMainInfo {
+        BehindMainInfo {
+            pr_base_sha: "abc1234deadbeef".to_string(),
+            current_main_sha: "def5678cafebabe".to_string(),
+        }
+    }
+
+    // -- U1: the four outcomes, discriminated from real `gh` error text --
+
+    #[test]
+    fn mika2238_conflict_error_classifies_as_conflict() {
+        // The 422 body GitHub returns when the update cannot be applied.
+        let err = "gh exit code 1: gh: merge conflict between base and head (HTTP 422)";
+        assert_eq!(
+            classify_update_branch_error(err),
+            UpdateBranchOutcome::Conflict(err.to_string())
+        );
+    }
+
+    #[test]
+    fn mika2238_already_up_to_date_is_not_read_as_a_conflict() {
+        // The benign race: main moved, or someone else updated the branch,
+        // between our SHA read and this call. GitHub's wording for it can carry
+        // the word "merge", and reading it as a conflict would block a PR that
+        // has nothing wrong with it — the expensive direction of the mistake.
+        for err in [
+            "gh exit code 1: gh: This branch is already up to date with the base branch (HTTP 422)",
+            "gh exit code 1: gh: merge branch is already up-to-date (HTTP 422)",
+            "gh exit code 1: gh: the head branch is not behind the base branch (HTTP 422)",
+            "gh exit code 1: gh: no new commits on the base branch (HTTP 422)",
+        ] {
+            assert_eq!(
+                classify_update_branch_error(err),
+                UpdateBranchOutcome::AlreadyUpToDate,
+                "expected AlreadyUpToDate for: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn mika2238_permission_and_missing_gh_classify_as_failed() {
+        for err in [
+            "gh exit code 1: gh: Resource not accessible by integration (HTTP 403)",
+            "gh exit code 1: gh: Not Found (HTTP 404)",
+            "gh CLI not found — install from https://cli.github.com",
+        ] {
+            assert_eq!(
+                classify_update_branch_error(err),
+                UpdateBranchOutcome::Failed(err.to_string()),
+                "expected Failed for: {err}"
+            );
+        }
+    }
+
+    // -- U1/R5: the new first-level action --
+
+    #[test]
+    fn mika2238_serialize_branch_updated() {
+        let info = behind_info();
+        let result = MergeGateResult::BranchUpdated {
+            pr_base_sha: info.pr_base_sha.clone(),
+            new_main_sha: info.current_main_sha.clone(),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["action"], "branch_updated");
+        assert_eq!(json["pr_base_sha"], info.pr_base_sha);
+        assert_eq!(json["new_main_sha"], info.current_main_sha);
+        // A repaired behind-main state is NOT a blockage — an agent that sees
+        // `blocked` here would report a failure where the loop is progressing.
+        assert!(json.get("reason").is_none());
+    }
+
+    // -- U3/R3: the test the plan calls the most important one --
+
+    #[test]
+    fn mika2238_successful_update_never_falls_through_to_the_merge() {
+        // `None` is the ONLY value on this path that lets the caller reach
+        // `run_gh_merge`. An update-branch creates a new head commit whose CI
+        // has not run; merging it in the same turn is exactly the failure
+        // mika#1577 was written to close, re-opened through mika#2238's door.
+        let info = behind_info();
+        let disposition = disposition_for_remediation(&BehindMainRemediation::Updated, &info);
+
+        assert!(
+            disposition.is_some(),
+            "an updated branch must terminate the turn, never continue into the merge gate"
+        );
+        assert_eq!(
+            disposition,
+            Some(MergeGateResult::BranchUpdated {
+                pr_base_sha: info.pr_base_sha.clone(),
+                new_main_sha: info.current_main_sha.clone(),
+            })
+        );
+    }
+
+    #[test]
+    fn mika2238_only_a_not_behind_pr_continues_into_the_merge_gate() {
+        let info = behind_info();
+        let continues = |r: BehindMainRemediation| disposition_for_remediation(&r, &info).is_none();
+
+        assert!(
+            continues(BehindMainRemediation::NotBehind),
+            "a PR that is genuinely not behind must not be held by this path"
+        );
+        for held in [
+            BehindMainRemediation::Updated,
+            BehindMainRemediation::AlreadyAttempted,
+            BehindMainRemediation::Conflict("merge conflict".to_string()),
+            BehindMainRemediation::Failed("HTTP 403".to_string()),
+        ] {
+            assert!(
+                !continues(held.clone()),
+                "{held:?} must terminate the turn, not continue into the merge gate"
+            );
+        }
+    }
+
+    #[test]
+    fn mika2238_conflict_blocks_as_a_merge_conflict_not_as_behind_main() {
+        // The ticket's second bullet: BEHIND is mechanical, a conflict is not.
+        // They must stay distinguishable or the agent cannot tell "wait" from
+        // "someone has to resolve this".
+        let info = behind_info();
+        let detail = "gh: merge conflict between base and head (HTTP 422)";
+        let disposition = disposition_for_remediation(
+            &BehindMainRemediation::Conflict(detail.to_string()),
+            &info,
+        )
+        .expect("a conflict must terminate the turn");
+
+        match disposition {
+            MergeGateResult::Blocked {
+                reason, detail: d, ..
+            } => {
+                assert_eq!(reason, BlockReason::MergeConflict);
+                assert!(d.contains(detail), "the gh detail must survive: {d}");
+            }
+            other => panic!("expected blocked[merge_conflict], got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mika2238_failed_update_degrades_to_behind_main_never_to_a_merge() {
+        // R8: a failed update leaves the gate at least as closed as before.
+        let info = behind_info();
+        let disposition = disposition_for_remediation(
+            &BehindMainRemediation::Failed("HTTP 403: Resource not accessible".to_string()),
+            &info,
+        )
+        .expect("a failed update must terminate the turn");
+
+        match disposition {
+            MergeGateResult::Blocked {
+                reason, detail: d, ..
+            } => {
+                assert_eq!(
+                    reason,
+                    BlockReason::BehindMain {
+                        pr_base_sha: info.pr_base_sha.clone(),
+                        current_main_sha: info.current_main_sha.clone(),
+                    }
+                );
+                assert!(d.contains("403"), "the failure cause must survive: {d}");
+            }
+            other => panic!("expected blocked[behind_main], got {other:?}"),
+        }
+    }
+
+    // -- U2/R4: the anti-thrash cap --
+
+    #[test]
+    fn mika2238_second_pass_on_the_same_target_sha_does_not_re_emit() {
+        let map = DashMap::new();
+        let now = Instant::now();
+        assert!(
+            claim_update_attempt_in(&map, 2236, "senara-solutions/mika", "main-sha-one", now),
+            "the first caller must get the attempt"
+        );
+        assert!(
+            !claim_update_attempt_in(&map, 2236, "senara-solutions/mika", "main-sha-one", now),
+            "a second arrival at the same target SHA must not re-emit an update"
+        );
+    }
+
+    #[test]
+    fn mika2238_a_new_main_sha_legitimately_re_opens_one_attempt() {
+        // KTD-2: the key is the SHA aimed at, not a counter. When another PR
+        // merges, main moves and this PR is behind something new — a fresh,
+        // legitimate attempt, not thrash.
+        let map = DashMap::new();
+        let now = Instant::now();
+        assert!(claim_update_attempt_in(
+            &map,
+            2236,
+            "senara-solutions/mika",
+            "main-sha-one",
+            now
+        ));
+        assert!(
+            claim_update_attempt_in(&map, 2236, "senara-solutions/mika", "main-sha-two", now),
+            "a different main HEAD is a different target and re-opens one attempt"
+        );
+    }
+
+    #[test]
+    fn mika2238_the_cap_is_scoped_to_one_pr() {
+        let map = DashMap::new();
+        let now = Instant::now();
+        assert!(claim_update_attempt_in(
+            &map,
+            2236,
+            "senara-solutions/mika",
+            "sha",
+            now
+        ));
+        assert!(
+            claim_update_attempt_in(&map, 2237, "senara-solutions/mika", "sha", now),
+            "one PR's attempt must not spend another PR's"
+        );
+        assert!(
+            claim_update_attempt_in(&map, 2236, "senara-solutions/mika-cloud", "sha", now),
+            "the same PR number in another repo is another PR"
+        );
+    }
+
+    #[test]
+    fn mika2238_concurrent_claims_on_one_key_yield_exactly_one_attempt() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let map = Arc::new(DashMap::new());
+        let granted = Arc::new(AtomicUsize::new(0));
+        let now = Instant::now();
+
+        let handles: Vec<_> = (0..5)
+            .map(|_| {
+                let map = Arc::clone(&map);
+                let granted = Arc::clone(&granted);
+                std::thread::spawn(move || {
+                    if claim_update_attempt_in(&map, 2236, "senara-solutions/mika", "sha", now) {
+                        granted.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(
+            granted.load(Ordering::SeqCst),
+            1,
+            "exactly one of five concurrent callers may emit the update"
+        );
+    }
+
+    #[test]
+    fn mika2238_attempt_ledger_stays_bounded() {
+        let map = DashMap::new();
+        let base = Instant::now();
+        for i in 0..UPDATE_ATTEMPT_CAP {
+            assert!(claim_update_attempt_in(
+                &map,
+                i as u64,
+                "senara-solutions/mika",
+                "sha",
+                base
+            ));
+        }
+        assert_eq!(map.len(), UPDATE_ATTEMPT_CAP);
+
+        let later = base + UPDATE_ATTEMPT_TTL + Duration::from_secs(1);
+        assert!(claim_update_attempt_in(
+            &map,
+            999_999,
+            "senara-solutions/mika",
+            "sha",
+            later
+        ));
+        assert!(
+            map.len() < UPDATE_ATTEMPT_CAP,
+            "entries older than the TTL must be swept, got {}",
+            map.len()
+        );
+    }
+
+    #[test]
+    fn mika2238_public_claim_uses_the_process_global_ledger() {
+        // Exercise the real path once. Unique key so parallel tests sharing the
+        // process-global map cannot collide.
+        let sha = "mika2238-public-api-unique-sha-4b1c9d";
+        assert!(claim_update_branch_attempt(
+            2238,
+            "senara-solutions/mika",
+            sha
+        ));
+        assert!(!claim_update_branch_attempt(
+            2238,
+            "senara-solutions/mika",
+            sha
+        ));
+    }
+
+    // -- R1: one call site, and only one --
+
+    /// Fails if update-branch is invoked anywhere but [`attempt_update_branch`].
+    ///
+    /// A behavioural test cannot hold this: a second call site would make no
+    /// assertion fail — it would only make the anti-thrash guard bypassable,
+    /// which is invisible until a PR is being hammered in production. Same
+    /// shape as `grooming_marker::tests::no_grooming_regex_outside_this_module`
+    /// and for the same reason: the regression would not produce a wrong
+    /// answer, it would produce an unguarded one.
+    #[test]
+    fn mika2238_update_branch_has_exactly_one_call_site() {
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let this_module = src_root.join("tools/pr_merge_with_gate.rs");
+
+        let mut offenders = Vec::new();
+        let mut stack = vec![src_root.clone()];
+        let mut scanned = 0usize;
+
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| {
+                panic!("the guard must be able to read {}: {e}", dir.display())
+            });
+            for entry in entries {
+                let path = entry.expect("readable directory entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") || path == this_module {
+                    continue;
+                }
+                let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                    panic!("the guard must be able to read {}: {e}", path.display())
+                });
+                scanned += 1;
+                for (n, line) in content.lines().enumerate() {
+                    let trimmed = line.trim_start();
+                    // Prose (doc comments, `//` comments) may name the endpoint;
+                    // only executable code that builds the argv is an offence.
+                    if trimmed.starts_with("//") {
+                        continue;
+                    }
+                    if line.contains("update-branch") || line.contains("/update-branch") {
+                        offenders.push(format!(
+                            "{}:{}: {}",
+                            path.strip_prefix(&src_root).unwrap_or(&path).display(),
+                            n + 1,
+                            line.trim()
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert!(scanned > 0, "the guard scanned no files — broken path");
+        assert!(
+            offenders.is_empty(),
+            "mika#2238 — update-branch is invoked outside `attempt_update_branch`. \
+             R1 makes that helper the single call site so the per-(PR, main SHA) \
+             anti-thrash claim cannot be bypassed. Route the call through it:\n{}",
+            offenders.join("\n")
+        );
     }
 
     // -- Preflight classification tests --
