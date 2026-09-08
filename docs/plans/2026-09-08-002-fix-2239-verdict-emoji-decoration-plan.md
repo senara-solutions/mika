@@ -44,29 +44,79 @@ pas les deux cas, et le message affirme le premier. C'est exactement ce qui a fa
 à mika-dev « reviews sans ligne VERDICT parsable » — un diagnostic faux produit par une
 observable fausse, pas par un mauvais raisonnement.
 
-## Décision de grooming — la frontière décoration/signal
+## Décisions de grooming (tranchées — passe 1 architecte, findings F1-F4)
 
-Le ticket laisse ouvert : **tolérer côté parseur** vs **contraindre l'émetteur**. Tranché :
-**parseur seul**. Raisons, dans l'ordre :
+### D-A — Parseur seul, pas l'émetteur (frontière tolérance/contrainte)
 
-1. **Le prompt émetteur dit déjà « nu ».** `skills/bundled/qa-review/system_prompt.md` ne
-   montre l'emoji sur **aucun** de ses exemples de ligne `VERDICT:` (`:558`, `:573`, `:601`,
-   `:613`, `:631`, `:652`, `:679`, `:691`, `:710` — tous `VERDICT: pass` / `block[ac]` nus).
-   L'émetteur a décoré **contre** son prompt. Ajouter « et pas d'emoji » ajoute une phrase à
-   un prompt déjà tenu en échec sur ce point précis ; c'est de l'enforcement par prompt au
-   niveau substrat, la classe empiriquement mesurée comme non tenante.
-2. **Le parseur porte déjà ce contrat de tolérance.** mika#1821 (troncature `**`) et mika#1828
-   (peel d'emphase + table d'alias) ont établi que « les reviewers décorent leur verdict » est
-   une classe traitée côté moteur. L'emoji est une décoration de plus dans une famille déjà
-   nommée ; le refuser demanderait de justifier pourquoi `**pass**` est tolérable et `pass ✅`
-   ne l'est pas.
+Le ticket laissait ouvert « tolérer côté parseur » vs « contraindre l'émetteur ». **Parseur seul.**
+
+1. **Le prompt émetteur dit déjà « nu ».** `skills/bundled/qa-review/system_prompt.md` ne montre
+   l'emoji sur **aucun** de ses exemples de ligne `VERDICT:` (`:558`, `:573`, `:601`, `:613`,
+   `:631`, `:652`, `:679`, `:691`, `:710` — tous `VERDICT: pass` / `block[ac]` nus). L'émetteur a
+   décoré **contre** son prompt. Ajouter « et pas d'emoji » ajoute une phrase à un prompt déjà
+   tenu en échec sur ce point précis : c'est de l'enforcement par prompt au niveau substrat.
+2. **Le parseur porte déjà ce contrat.** mika#1821 (troncature `**`) et mika#1828 (peel d'emphase
+   + table d'alias) ont établi que « les reviewers décorent leur verdict » est une classe traitée
+   côté moteur. L'emoji est une décoration de plus dans une famille déjà nommée.
 3. **Blast radius.** Le fix parseur est additif et n'est atteint que lorsque la classification
-   actuelle a **déjà** échoué (voir D1) : aucune forme aujourd'hui reconnue ne change de sens.
+   actuelle a **déjà** échoué (D-B) : aucune forme aujourd'hui reconnue ne change de sens.
 
-**Où passe la frontière :** la décoration est un **suffixe non-alphanumérique**. On la retire ;
-on ne retire rien d'autre. `pass — but see findings below` garde un caractère alphanumérique
-final et reste donc `Missing`, comme aujourd'hui. C'est la borne de mika#1821 (« ne pas avaler
-un commentaire de fin ») conservée telle quelle.
+### D-B — Repli additif après la passe primaire, pas normalisation en amont (F2)
+
+**Repli additif.** La décoration est retirée **seulement** quand `classify_value(value)` a déjà
+rendu `None`. L'alternative — dénuder d'abord, classifier ensuite — n'a qu'un seul chemin de
+lecture et serait plus élégante, mais elle place les acquis mika#1821 et mika#1828 **en aval** du
+nouveau helper : toute erreur dans `strip_trailing_decoration` deviendrait une régression sur des
+formes aujourd'hui vertes.
+
+Le repli additif rend la règle d'arrêt **vérifiable et non négociable** : aucun test
+`parse_verdict_*` existant (`verdict.rs:283-556`) ne doit être modifié (AC4). Cette propriété est
+la raison du choix ; le coût accepté est un second chemin de code, borné à trois lignes.
+
+### D-C — Exemption de `]` seul, pas de la classe « fermeture de bracket » (F1)
+
+**`]` seul.** L'ensemble d'exemption n'est pas un pari de style : il est **dérivé de la grammaire**.
+Les seules formes canoniques à bracket sont `block[…]` (`BLOCK_RE`, `verdict.rs:60`) et `hold[…]`
+(`HOLD_RE`, `verdict.rs:63`). `]` est exempté parce qu'il les termine ; le retirer casserait
+l'ancrage `^…$` de ces deux regex.
+
+Élargir à `]})>` serait **contre-productif, pas seulement inutile** : exempter un caractère rend
+le retrait *plus faible*, jamais plus fort. `pass 🎉)` s'arrêterait sur le `)` exempté et
+resterait `Missing`. On ajouterait donc des exemptions mortes — aucune grammaire derrière — qui
+bloquent le retrait légitime dans les cas qu'elles couvrent.
+
+**Liaison inscrite dans le code :** le commentaire canonique de `strip_trailing_decoration` nomme
+`BLOCK_RE`/`HOLD_RE` comme source de l'exemption, et exige que toute nouvelle forme de verdict à
+bracket étende la regex **et** l'exemption dans le même changement.
+
+### D-D — Décoration de tête : attendre la mesure, avec condition de réveil concrète (F3)
+
+**Attendre la mesure.** `VERDICT: ✅ pass` n'a été observée sur aucune review réelle. La couvrir
+maintenant élargirait la frontière sur une hypothèse, contre la discipline « preuve dure avant de
+filer ». Aucun ticket n'est ouvert pour elle — un dormeur sans preuve serait du bruit, pas un
+dormeur.
+
+**Condition de réveil, datable et vérifiable :** un WARN
+`verdict_approved_but_unclassified` (D2c) portant un champ `verdict_value` dont la valeur commence
+par autre chose qu'un alphanumérique ASCII. C'est-à-dire : la décoration de tête devient un
+ticket le jour où le moteur la mesure lui-même, pas le jour où on l'imagine.
+
+**Cette condition n'existe que si D2 est livré** — d'où D-E.
+
+### D-E — D2 (observable honnête) est dans le périmètre, avec AC dédié (F4)
+
+**Dans le périmètre.** Deux raisons, la seconde étant structurelle :
+
+1. L'observable fausse a produit un **diagnostic faux mesuré** dans la même fenêtre d'incident :
+   interrogé sur #2236, mika-dev a répondu « reviews sans ligne VERDICT parsable » — ce que le WARN
+   affirme littéralement (`verdict_handler.rs:1697`) alors que la ligne était présente.
+2. **D2 est le détecteur de la condition de réveil de D-D.** Sortir D2 dans un ticket séparé
+   laisserait la décoration de tête aussi invisible que la décoration de queue l'a été jusqu'à
+   aujourd'hui — c'est-à-dire qu'on reproduirait exactement le défaut qu'on répare. Les deux
+   livrables ne sont séparables qu'en apparence.
+
+Coût : ~15 lignes, **aucun changement de comportement** (`Verdict::Missing` continue de router en
+safe-default `hold[review]`). Porté par AC5.
 
 ### Écart assumé avec la piste du ticket
 
@@ -92,12 +142,23 @@ Déplacement pur, y compris le `info!(event = "verdict_alias_normalized", …)` 
 /// Retire un suffixe décoratif d'une valeur de verdict (mika#2239).
 ///
 /// Les reviewers décorent : `pass ✅`, `block[ac] ❌`, `hold[review] ⏸️`. La décoration
-/// est toujours une queue de caractères non-alphanumériques. `]` est exempté : il termine
-/// les formes canoniques `block[…]`/`hold[…]`, et le retirer casserait `BLOCK_RE`.
+/// est toujours une queue de caractères non-alphanumériques.
+///
+/// L'ensemble d'exemption est DÉRIVÉ DE LA GRAMMAIRE, pas choisi : `]` est le seul
+/// caractère non-alphanumérique porteur de signal, parce qu'il termine les deux seules
+/// formes canoniques à bracket — `block[…]` (`BLOCK_RE`) et `hold[…]` (`HOLD_RE`), toutes
+/// deux ancrées `^…$`. Toute nouvelle forme de verdict à bracket DOIT étendre la regex ET
+/// cette exemption dans le même changement, sinon le retrait la mutile en silence.
+/// N'exemptez PAS `)`, `}`, `>` : aucune grammaire derrière, et exempter un caractère
+/// AFFAIBLIT le retrait (`pass 🎉)` s'arrêterait sur le `)` et resterait `Missing`).
 ///
 /// Volontairement conservateur — la queue s'arrête au premier alphanumérique ASCII, donc
 /// un vrai commentaire de fin (`pass — but see findings`) n'est PAS avalé et continue de
 /// classer `Missing`. C'est la borne de mika#1821, inchangée.
+///
+/// La décoration de TÊTE (`VERDICT: ✅ pass`) est hors périmètre (mika#2239 D-D) : jamais
+/// mesurée. Sa condition de réveil est un `verdict_approved_but_unclassified` dont le
+/// champ `verdict_value` ne commence pas par un alphanumérique ASCII.
 fn strip_trailing_decoration(value: &str) -> &str {
     value.trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != ']')
 }
@@ -209,13 +270,80 @@ Rouge-avant exigé : lancer les six tests D3 **avant** D1 et constater l'échec 
 six positifs (les deux bornes doivent, elles, être vertes dès avant — elles décrivent le
 comportement actuel qu'on préserve).
 
+## Acceptance criteria
+
+- [ ] **AC1** — `parse_verdict("VERDICT: pass ✅")` rend `Verdict::Pass`. Le corps de review réel
+      de senara-solutions/mika#2236 (ligne 1 `VERDICT: pass ✅`, puis `DEPTH:`, `REASON:`) rend
+      `Verdict::Pass`.
+- [ ] **AC2** — `VERDICT: block[ac] ❌` rend `Block("ac")` ; `VERDICT: hold[review] ⏸️` rend
+      `Hold("review")` ; `VERDICT: approved ✅` rend `Verdict::Pass` (chemin alias décoré) ;
+      `**VERDICT: pass ✅**` rend `Verdict::Pass` (cumul mika#1828 + mika#2239).
+- [ ] **AC3** — La frontière tient : `VERDICT: pass — but see findings below` et
+      `VERDICT: frobnicate ✅` rendent tous deux `Verdict::Missing`. Un commentaire de fin n'est
+      pas une décoration ; un jeton inconnu décoré reste inconnu.
+- [ ] **AC4** — Règle d'arrêt (D-B) : **aucun** test `parse_verdict_*` existant
+      (`verdict.rs:283-556`) n'est modifié, supprimé, ni marqué `#[ignore]`. Si l'un doit l'être,
+      le repli est trop large et le plan est faux — ce n'est pas un test à ajuster.
+- [ ] **AC5** — Observable honnête : `handle_missing_verdict` distingue « aucune ligne `VERDICT:` »
+      (message actuel conservé) de « ligne présente, valeur non reconnue » (message distinct +
+      champ structuré `verdict_value`). Quand `event.state == "approved"`, le WARN nommé
+      `verdict_approved_but_unclassified` est émis en plus. Aucun changement de routage.
+- [ ] **AC6** — `verdict_decoration_stripped` est émis (champs `raw_value`, `undecorated`,
+      `mapped_to`) à chaque fois — et seulement quand — le repli sauve un verdict que la passe
+      primaire avait rejeté.
+
+## Rattachement aux critères d'acceptation
+
+| AC | Porté par | Vérifié par |
+|---|---|---|
+| AC1 | D1a + D1b + D1c | `parse_verdict_emoji_suffix_pass`, `parse_verdict_field_shape_pr2236` |
+| AC2 | D1b (exemption `]`, D-C) + D1c | `parse_verdict_emoji_suffix_block`, `…_hold`, `…_alias`, `parse_verdict_bold_plus_emoji` |
+| AC3 | D1b (arrêt au premier alphanumérique) | `parse_verdict_trailing_comment_still_missing`, `parse_verdict_unknown_token_with_emoji_still_missing` |
+| AC4 | D-B (repli **après** la passe primaire) | suite `parse_verdict_*` existante, verte sans édition ; `git diff` sur `verdict.rs:283-556` vide en zone test |
+| AC5 | D2a + D2b + D2c | `verdict_raw_value` : `Some("pass ✅")` sur corps décoré, `None` sans ligne `VERDICT:` — la branche WARN est un wrapper mince au-dessus (voir Fire-Disposition, détecteur 3) |
+| AC6 | D1c (`info!`) | inspection du chemin de repli ; non prouvable par capture de tracing en test unitaire |
+
+## Fire-Disposition
+
+Ce plan livre trois artefacts de classe détecteur, dont deux tirent à l'exécution sur des données
+**préexistantes** (les reviews futures). La porte mika#1574 exige de dire ce qui se passe quand ils
+tirent sur de l'existant, et non sur ce que la PR ajoute. Les trois n'ont pas le même rapport à
+l'existant ; disposition séparée pour chacun.
+
+**Détecteur 1 — la suite de tests D3 : disposition (c) halte-et-remontée, sans exception nommée.**
+Chaque cas construit sa propre chaîne littérale ; aucun ne lit un corpus du dépôt. Il n'existe donc
+**aucune donnée préexistante** sur laquelle ces tests puissent tirer — l'allowlist qu'une
+disposition (a) demanderait est vide **par construction**, pas par indulgence. Un échec signale une
+régression du repli ou de la frontière. Échec CI, pas d'`#[ignore]`, pas d'exception.
+
+**Détecteur 2 — `verdict_decoration_stripped` (exécution) : observation, pas alarme.**
+Son corpus est réel : toute review décorée future. Son tir n'est **pas** un échec — c'est le
+chemin de sauvetage prévu, et sa fréquence est la mesure de la dérive émetteur qu'on a choisi de
+ne pas contraindre (D-A). Il ne fait échouer aucune CI et ne réveille personne. **Ce qui le fait
+devenir un ticket** : le même `reviewer` sur **trois PR consécutives** — la dérive n'est alors plus
+un accident de modèle mais une forme stable, et la calibration émetteur redevient discutable sur
+mesure au lieu de sur intuition.
+
+**Détecteur 3 — `verdict_approved_but_unclassified` (exécution) : halte-et-remontée opérateur.**
+Corpus réel lui aussi. Son tir signifie exactement une chose : GitHub dit `APPROVED`, le moteur ne
+comprend toujours pas — donc une **classe de décoration que ce plan ne couvre pas**. C'est le seul
+des trois qui porte une conséquence hors CI : c'est la condition de réveil de D-D (décoration de
+tête), et plus largement de toute forme suivante. Il est WARN, pas ERROR, parce que le routage
+reste sûr (`hold[review]`) — mais il est nommé précisément pour être greppable par le moniteur, ce
+que le WARN générique actuel ne permettait pas. **Il ne peut pas tirer sur l'existant au sens de
+mika#1574** : il n'existe aucun journal rétroactif à re-classifier, le champ n'est produit qu'à
+partir des reviews reçues après le déploiement. Aucun désarmement rétroactif n'est donc dû, et
+c'est une propriété du flux, pas une omission.
+
 ## Hors périmètre
 
-- **Décoration de tête** (`✅ VERDICT: pass` ou `VERDICT: ✅ pass`). Non mesurée sur le terrain ;
-  l'ajouter maintenant élargirait la frontière sans preuve. Si elle apparaît, elle relève du
-  même helper et fera son propre ticket.
-- **Calibration de l'émetteur** `mika-platform-qa` / prompt `qa-review` — tranché en section
-  « Décision de grooming » ci-dessus.
+- **Décoration de tête** (`VERDICT: ✅ pass`). Hors périmètre par décision D-D, avec condition de
+  réveil concrète : un WARN `verdict_approved_but_unclassified` dont le champ `verdict_value`
+  commence par autre chose qu'un alphanumérique ASCII. Aucun ticket ouvert — sans mesure, un
+  dormeur serait du bruit.
+- **Calibration de l'émetteur** `mika-platform-qa` / prompt `qa-review` — hors périmètre par
+  décision D-A, avec condition de réveil concrète : `verdict_decoration_stripped` sur le même
+  `reviewer` pour trois PR consécutives (Fire-Disposition, détecteur 2).
 - **#2237** (action GitHub `--comment` vs `--approve`) et **#2238** (BEHIND, pas d'update-branch).
   Verrous distincts du même jalon « fermeture autonome » ; aucun fichier partagé avec ce plan.
 - **Le mécanisme de merge lui-même** (`handle_pass_verdict`) : ce plan lui redonne son
