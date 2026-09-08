@@ -45,12 +45,13 @@ The message contains the review body, PR URL, repo, and reviewer. mika-qa posts 
       - Notify Vincent via `send_message`: "{repo}#{number} passed QA. CI pending — auto-merge enabled. {PR URL}"
       - Proceed to Step 5 with `in_progress` and note "QA passed, auto-merge enabled, awaiting CI. PR: {url}".
 
-      **`"branch_updated"`** (mika#2238) — PR was behind main; the gate brought its branch up to date:
-      - The PR is **NOT** merged, no merge was attempted, and none must be attempted in this turn. The update created a new head commit that no CI run has validated; merging it now would put unvalidated code on main — the failure mika#1577 was written to close.
+      **`"branch_updated"`** (mika#2238) — PR was behind main; GitHub accepted an update of its branch:
+      - The PR is **NOT** merged, no merge was attempted, and none must be attempted in this turn. The update moves the head to a new commit that no CI run has validated; merging it now would put unvalidated code on main — the failure mika#1577 was written to close.
       - Do NOT call `pr_merge_with_gate` again for this PR. Do NOT rebase by hand. Do NOT call `run_gh pr merge`.
+      - **The PR now needs a FRESH QA review.** Moving the head SHA invalidates the approval that pointed at the old one, and the stale-SHA gate holds the PR until QA re-reviews the updated head. `branch_updated` repairs the mechanical behind-main state; it does not, on its own, lead to a merge.
       - Correlate to task (Step 4).
-      - Notify Vincent via `send_message`: "{repo}#{number} passed QA but was behind main — branch updated, awaiting fresh CI. {PR URL}"
-      - Proceed to Step 5 with `in_progress` and note "QA passed, branch updated to main, awaiting fresh CI. PR: {url}". **End the turn** — GitHub's fresh `check_suite success` webhook re-enters the merge path.
+      - Notify Vincent via `send_message`: "{repo}#{number} was behind main — branch update accepted. Head moved, so it needs a fresh QA review before it can merge. {PR URL}"
+      - Proceed to Step 5 with `in_progress` and note "Behind-main repaired, head moved, awaiting fresh QA review. PR: {url}". **End the turn.**
 
       **`"blocked"`** — PR cannot merge. Branch on the `reason` field:
 

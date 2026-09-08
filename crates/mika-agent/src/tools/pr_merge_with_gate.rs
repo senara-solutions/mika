@@ -47,10 +47,12 @@ impl Tool for PrMergeWithGateTool {
                 checks pass. If all required checks pass, the PR is merged immediately.\n\n\
                 IMPORTANT: 'auto_merge_enabled' means GitHub will merge when all checks pass — \
                 the PR is NOT yet merged. Do not claim the PR is merged until you confirm it.\n\n\
-                IMPORTANT: 'branch_updated' means the PR was behind main and the gate brought \
-                its branch up to date. No merge was attempted. Do NOT call this tool again for \
-                this PR in the same turn — the update created a new head commit with no CI \
-                result yet; the fresh check_suite webhook resumes the merge path. End the turn.\n\n\
+                IMPORTANT: 'branch_updated' means the PR was behind main and GitHub accepted an \
+                update of its branch. No merge was attempted. Do NOT call this tool again for \
+                this PR in the same turn and do NOT rebase by hand — the update moves the head \
+                to a new commit with no CI result. The PR then needs a FRESH QA review: moving \
+                the head SHA invalidates the approval that pointed at the old one. End the \
+                turn and say that the behind-main state is repaired but the review is not.\n\n\
                 After a successful merge (action: 'merged'), update the task status before \
                 reporting to the user.\n\n\
                 Returns a structured JSON response with an 'action' field. Possible actions: \
@@ -156,32 +158,6 @@ impl Tool for PrMergeWithGateTool {
             return Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?));
         }
 
-        // -- Step 1b: Behind-main assertion (#1577) + remediation (mika#2238) --
-        // A behind-main PR is now repaired rather than merely declined: the
-        // branch is brought up to date and the turn ends there, so the fresh CI
-        // run — not this turn — is what re-opens the merge path.
-        // Fail-open on the DETECTION API error, as before; the remediation
-        // itself never fails open (see `disposition_for_remediation`).
-        match is_behind_main(&preflight.base_ref_oid, repo, token).await {
-            Ok(Some(info)) => {
-                let remediation =
-                    remediate_behind_main("pr_merge_with_gate", pr_number, repo, token, &info)
-                        .await;
-                if let Some(result) = disposition_for_remediation(&remediation, repo, &info) {
-                    return Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?));
-                }
-                // `None` — the PR turned out not to be behind. Continue the gate.
-            }
-            Ok(None) => {} // Up-to-date — proceed
-            Err(e) => {
-                warn!(
-                    pr_number,
-                    error = %e,
-                    "Failed to check behind-main status — proceeding with merge (fail-open)"
-                );
-            }
-        }
-
         // -- Step 1c: Forge-gate perimeter check (mika#1829) --
         //
         // Fetch touched files from GitHub, classify via perimeter rules.
@@ -248,33 +224,69 @@ impl Tool for PrMergeWithGateTool {
         // -- Step 3: Classify and act --
         let classification = classify_checks(&checks);
 
-        match classification {
-            CheckClassification::HasFailures => {
-                let failing: Vec<CheckInfo> = checks
-                    .iter()
-                    .filter(|c| matches!(c.bucket.as_str(), "fail" | "cancel"))
-                    .map(|c| CheckInfo {
-                        name: c.name.clone(),
-                        state: c.state.clone(),
-                        link: c.link.clone(),
-                    })
-                    .collect();
+        // -- Step 3a: A red PR is reported as red, before anything else --
+        // This arm runs ahead of the behind-main step below so a PR that is both
+        // behind and failing reports the failing checks, not "branch updated".
+        if classification == CheckClassification::HasFailures {
+            let failing: Vec<CheckInfo> = checks
+                .iter()
+                .filter(|c| matches!(c.bucket.as_str(), "fail" | "cancel"))
+                .map(|c| CheckInfo {
+                    name: c.name.clone(),
+                    state: c.state.clone(),
+                    link: c.link.clone(),
+                })
+                .collect();
 
-                let result = MergeGateResult::Blocked {
-                    reason: BlockReason::RequiredCheckFailed {
-                        failing_checks: failing.clone(),
-                    },
-                    failing_checks: failing,
-                    detail: format!(
-                        "{} required check(s) failed",
-                        checks
-                            .iter()
-                            .filter(|c| matches!(c.bucket.as_str(), "fail" | "cancel"))
-                            .count()
-                    ),
-                };
-                Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
+            let result = MergeGateResult::Blocked {
+                reason: BlockReason::RequiredCheckFailed {
+                    failing_checks: failing.clone(),
+                },
+                failing_checks: failing.clone(),
+                detail: format!("{} required check(s) failed", failing.len()),
+            };
+            return Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?));
+        }
+
+        // -- Step 3b: Behind-main assertion (#1577) + remediation (mika#2238) --
+        //
+        // Placed AFTER the perimeter gate and the CI-failure arm, and BEFORE the
+        // auto-merge arm. That last part is load-bearing: `--auto` on a PR that
+        // is behind would let GitHub merge it behind our backs once the pending
+        // checks go green, which is the #1577 defect. The behind state has to be
+        // settled before auto-merge is armed.
+        //
+        // Fail-open on the DETECTION API error, as before; the remediation
+        // itself never fails open (see `disposition_for_remediation`).
+        match is_behind_main(&preflight.base_ref_oid, repo, token).await {
+            Ok(Some(info)) => {
+                let remediation = remediate_behind_main(
+                    "pr_merge_with_gate",
+                    pr_number,
+                    repo,
+                    &preflight.base_ref_name,
+                    token,
+                    &info,
+                )
+                .await;
+                if let Some(result) = disposition_for_remediation(&remediation, repo, &info) {
+                    return Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?));
+                }
+                // `None` — the PR turned out not to be behind. Continue the gate.
             }
+            Ok(None) => {} // Up-to-date — proceed
+            Err(e) => {
+                warn!(
+                    pr_number,
+                    error = %e,
+                    "Failed to check behind-main status — proceeding with merge (fail-open)"
+                );
+            }
+        }
+
+        match classification {
+            // Handled above by step 3a, which returns.
+            CheckClassification::HasFailures => unreachable!("HasFailures returns at step 3a"),
             CheckClassification::HasPending => {
                 // Enable auto-merge — GitHub merges when checks pass
                 let auto_result =
@@ -400,12 +412,19 @@ pub(crate) enum MergeGateResult {
     AlreadyMerged,
     #[serde(rename = "gate_errored")]
     GateError { kind: GateErrorKind, detail: String },
-    /// The PR was behind `main` and the gate brought its branch up to date
+    /// The PR was behind `main` and GitHub accepted an update of its branch
     /// (mika#2238). Deliberately NOT a `Blocked` variant: a behind-main state
     /// that was repaired is not a blockage, and collapsing the two would leave
-    /// the agent unable to tell "wait for the fresh CI run" from "something is
-    /// wrong". No merge was attempted and none must be attempted this turn —
+    /// the agent unable to tell "the mechanical state is fixed" from "something
+    /// is wrong". No merge was attempted and none must be attempted this turn —
     /// the new head commit has no CI result yet.
+    ///
+    /// **This does not, on its own, lead to a merge.** Moving the head SHA also
+    /// invalidates the QA approval that pointed at the old one, so the stale-SHA
+    /// gate in `ci_success_handler` holds the PR until QA re-reviews. This
+    /// variant means "the behind-main state is repaired", never "the merge will
+    /// now happen by itself". Teaching that gate to follow an update-branch
+    /// merge is a change to a review gate and is tracked separately.
     #[serde(rename = "branch_updated")]
     BranchUpdated {
         pr_base_sha: String,
@@ -518,6 +537,14 @@ pub(crate) struct PrPreflight {
     /// Used by the behind-main assertion (#1577) to detect stale PRs.
     #[serde(default)]
     pub(crate) base_ref_oid: String,
+    /// The NAME of the base branch (`main`, a stacking parent, a release
+    /// branch). `is_behind_main` compares `base_ref_oid` against
+    /// `refs/heads/main` unconditionally, so for a PR based on anything else
+    /// the comparison always reports "behind" (mika#2238). Reading it as a fact
+    /// was merely noisy while the gate only declined; it stopped being harmless
+    /// once the gate started pushing a merge commit in response.
+    #[serde(default)]
+    pub(crate) base_ref_name: String,
 }
 
 /// Error from `run_gh_pr_view` with optional exit code.
@@ -642,7 +669,7 @@ pub(crate) async fn run_gh_pr_view(
         "--repo",
         repo,
         "--json",
-        "mergeable,mergeStateStatus,isDraft,state,baseRefOid",
+        "mergeable,mergeStateStatus,isDraft,state,baseRefOid,baseRefName",
     ];
 
     let output = run_gh_subprocess(&args, token).await.map_err(|e| {
@@ -796,8 +823,27 @@ pub(crate) enum BehindMainRemediation {
     NotBehind,
     /// The update hit a real conflict.
     Conflict(String),
-    /// The update did not go through (permission, API, gh missing, contradiction).
+    /// The update did not go through (permission, API, `gh` missing). The string
+    /// is the RAW `gh` error, which is why this is the only variant routed
+    /// through `classify_credential_scope_error`.
     Failed(String),
+    /// GitHub reported the branch was already up to date and the re-read
+    /// disagreed, or the re-read itself failed.
+    ///
+    /// Separate from [`BehindMainRemediation::Failed`] for two reasons, both
+    /// load-bearing. It is a different fact — the two sources of truth
+    /// contradict each other, rather than an operation failing — so it earns
+    /// its own `outcome` in the trace. And its string is composed prose that
+    /// embeds SHAs, which must never reach `classify_credential_scope_error`:
+    /// that helper matches the bare substring `403`, and a 40-hex SHA contains
+    /// `403` about 1% of the time, which would turn a state contradiction into
+    /// a confident, wrong "install the GitHub App" instruction.
+    Contradiction(String),
+    /// The PR's base branch is not `main`, so the behind-main comparison — which
+    /// resolves `refs/heads/main` unconditionally (#1577) — does not describe
+    /// this PR. Detection was a false positive; repairing it would push a real
+    /// merge commit onto the head every time `main` moved.
+    BaseNotMain(String),
 }
 
 /// Claim the single update-branch attempt allowed for `(pr, target_main_sha)`.
@@ -821,6 +867,27 @@ pub(crate) fn claim_update_branch_attempt(
         target_main_sha,
         Instant::now(),
     )
+}
+
+/// Give back a claim whose attempt demonstrably did not happen.
+///
+/// The claim is spent optimistically, before the call — it has to be, or two
+/// concurrent webhooks both see it free and both fire an update. But an attempt
+/// that failed to reach GitHub produced no commit, so it is not the thrash the
+/// cap exists to stop, and keeping it spent would strand the PR: nothing evicts
+/// the entry until the ledger hits its soft cap, and with a serialized dispatch
+/// `main` may not advance for hours. A permanent stall is exactly the state
+/// mika#2238 exists to end, so the guard must not manufacture one.
+///
+/// Released only for `Failed` — a `Conflict` is a stable fact about the PR that
+/// re-asking cannot change, and an `Updated` is the case the cap is for.
+///
+/// The cost of releasing, stated: a persistently failing update (a 403) is
+/// retried once per webhook rather than once per `main` SHA. That is a bounded
+/// number of extra `gh` calls on a PR that is already blocked and already
+/// notifying the operator — cheaper than a PR nobody comes back to.
+fn release_update_branch_attempt(pr_number: u64, repo: &str, target_main_sha: &str) {
+    UPDATE_ATTEMPTS.remove(&format!("{repo}#{pr_number}@{target_main_sha}"));
 }
 
 /// Core of [`claim_update_branch_attempt`], parameterized over the backing map
@@ -874,6 +941,13 @@ fn claim_update_attempt_in(
 /// Routing the repair through that check would make it a no-op in exactly the
 /// case it exists for. The SHA comparison in `is_behind_main` is the authority
 /// on "behind"; this endpoint is the authority on "make it not so".
+///
+/// **`Updated` means accepted, not finished.** The endpoint answers `202
+/// Accepted` and performs the merge asynchronously, so a zero exit proves
+/// GitHub took the request, never that a commit exists. Every string this
+/// module renders for `Updated` says "accepted" for that reason. The failure it
+/// leaves open — GitHub accepts, the async job fails, no commit and no webhook —
+/// resolves the next time `main` moves, because that is a new claim key.
 pub(crate) async fn attempt_update_branch(
     pr_number: u64,
     repo: &str,
@@ -913,32 +987,57 @@ pub(crate) fn classify_update_branch_error(err: &str) -> UpdateBranchOutcome {
     UpdateBranchOutcome::Failed(err.to_string())
 }
 
+/// The base branch `is_behind_main` measures against (#1577 resolves
+/// `refs/heads/main` unconditionally). A PR based on anything else is outside
+/// what that comparison can describe.
+pub(crate) const BEHIND_MAIN_BASE_BRANCH: &str = "main";
+
 /// Run the behind-main repair for one PR and report what happened.
 ///
-/// Shared by all three behind-main sites (`pr_merge_with_gate` step 1b,
-/// `ci_success_handler` step 5b, `verdict_handler`) so the anti-thrash claim,
-/// the repair, and the trace have exactly one shape. `site` names the caller in
-/// the log line (R7).
+/// Shared by all three behind-main sites so the base-branch guard, the
+/// anti-thrash claim, the repair, and the trace have exactly one shape. `site`
+/// names the caller in the log line (R7).
 ///
-/// # Ordering against the forge-gate perimeter (mika#1829/#1853)
+/// # Where this sits in each gate, and why
 ///
-/// This repair runs BEFORE the perimeter classifier at every site, so a
-/// DECISION-CORE PR now has its branch brought up to date by the loop before
-/// the operator is told to merge it by hand. That is a deliberate consequence,
-/// not an oversight: the perimeter gate exists to stop the loop **merging**
-/// decision-core changes, and update-branch merges nothing — it moves the PR's
-/// own branch forward, exactly what GitHub's "Update branch" button does. The
-/// inverse order would cost more than it buys: `fetch_pr_files` is fail-closed
-/// on error, so putting it first would let one transient API failure block the
-/// mechanical repair of every PR, decision-core or not. The merge itself stays
-/// gated either way.
+/// Every site runs, in order: PR state → forge-gate perimeter → CI checks (a
+/// failure stops here) → **this** → merge. Two orderings are load-bearing.
+///
+/// The perimeter comes first because this function *writes*: it pushes a merge
+/// commit onto the PR's head. While the gate only declined, letting a
+/// DECISION-CORE PR reach it was harmless; now it would mean the loop touching
+/// a branch the operator owns before the operator has been told the PR is
+/// theirs to merge.
+///
+/// The CI-failure check comes first because reporting "CI is red" is strictly
+/// more useful than "branch updated, awaiting fresh CI" when both are true —
+/// and updating the branch of a red PR buys a CI cycle that will fail again.
+/// `ci_success_handler` already had this order; the other two were brought to
+/// match it rather than the reverse.
 pub(crate) async fn remediate_behind_main(
     site: &'static str,
     pr_number: u64,
     repo: &str,
+    base_ref_name: &str,
     token: &str,
     info: &BehindMainInfo,
 ) -> BehindMainRemediation {
+    // Guard before the claim: `is_behind_main` compares against `main` whatever
+    // the PR's real base, so for a stacked or release-branch PR "behind" is a
+    // misread, not a fact. Declining on a misread was noise; repairing one would
+    // push a merge commit onto the head every time `main` moved, re-firing CI
+    // and QA each round. An empty name means the field did not come back — treat
+    // that as unknown and decline rather than guess.
+    if base_ref_name != BEHIND_MAIN_BASE_BRANCH {
+        let remediation = BehindMainRemediation::BaseNotMain(if base_ref_name.is_empty() {
+            "the PR's base branch could not be read".to_string()
+        } else {
+            format!("the PR's base branch is `{base_ref_name}`, not `main`")
+        });
+        log_behind_main_remediation(site, pr_number, repo, info, &remediation);
+        return remediation;
+    }
+
     if !claim_update_branch_attempt(pr_number, repo, &info.current_main_sha) {
         let remediation = BehindMainRemediation::AlreadyAttempted;
         log_behind_main_remediation(site, pr_number, repo, info, &remediation);
@@ -950,11 +1049,17 @@ pub(crate) async fn remediate_behind_main(
         UpdateBranchOutcome::AlreadyUpToDate => {
             reconcile_already_up_to_date(pr_number, repo, token)
                 .await
-                .unwrap_or_else(BehindMainRemediation::Failed)
+                .unwrap_or_else(BehindMainRemediation::Contradiction)
         }
         UpdateBranchOutcome::Conflict(detail) => BehindMainRemediation::Conflict(detail),
         UpdateBranchOutcome::Failed(detail) => BehindMainRemediation::Failed(detail),
     };
+
+    // An attempt that never reached GitHub made no commit, so it is not the
+    // thrash the cap exists to stop — see `release_update_branch_attempt`.
+    if matches!(remediation, BehindMainRemediation::Failed(_)) {
+        release_update_branch_attempt(pr_number, repo, &info.current_main_sha);
+    }
 
     log_behind_main_remediation(site, pr_number, repo, info, &remediation);
     remediation
@@ -1016,6 +1121,8 @@ fn log_behind_main_remediation(
         BehindMainRemediation::NotBehind => ("not_behind", None),
         BehindMainRemediation::Conflict(d) => ("conflict", Some(d.as_str())),
         BehindMainRemediation::Failed(d) => ("failed", Some(d.as_str())),
+        BehindMainRemediation::Contradiction(d) => ("contradiction", Some(d.as_str())),
+        BehindMainRemediation::BaseNotMain(d) => ("base_not_main", Some(d.as_str())),
     };
 
     info!(
@@ -1083,16 +1190,27 @@ pub(crate) fn disposition_for_remediation(
                  resolution is required before merging. {d}"
             ),
         }),
-        BehindMainRemediation::Failed(d) => Some(MergeGateResult::Blocked {
-            reason: BlockReason::BehindMain {
-                pr_base_sha: info.pr_base_sha.clone(),
-                current_main_sha: info.current_main_sha.clone(),
-            },
-            failing_checks: vec![],
+        BehindMainRemediation::Failed(d) | BehindMainRemediation::Contradiction(d) => {
+            Some(MergeGateResult::Blocked {
+                reason: BlockReason::BehindMain {
+                    pr_base_sha: info.pr_base_sha.clone(),
+                    current_main_sha: info.current_main_sha.clone(),
+                },
+                failing_checks: vec![],
+                detail: format!(
+                    "PR is behind main (base: {}, main HEAD: {}) and the automatic branch \
+                     update did not go through: {d}",
+                    info.pr_base_sha, info.current_main_sha
+                ),
+            })
+        }
+        BehindMainRemediation::BaseNotMain(d) => Some(MergeGateResult::GateError {
+            kind: GateErrorKind::Unknown,
             detail: format!(
-                "PR is behind main (base: {}, main HEAD: {}) and the automatic branch \
-                 update did not go through: {d}",
-                info.pr_base_sha, info.current_main_sha
+                "Behind-main could not be evaluated for this PR: {d}. The behind-main \
+                 comparison resolves `refs/heads/main` unconditionally (#1577), so its \
+                 verdict does not describe a PR based on another branch. The gate did not \
+                 merge and did not touch the branch — an operator decides this one."
             ),
         }),
     }
@@ -1118,30 +1236,44 @@ pub(crate) fn describe_behind_main_remediation(
     match remediation {
         BehindMainRemediation::NotBehind => None,
         BehindMainRemediation::Updated => Some(format!(
-            "the PR was behind main (base: {base}, main HEAD: {head}). The branch has been \
-             brought up to date with main automatically (mika#2238). Do NOT merge this PR in \
-             this turn and do NOT call `pr_merge_with_gate` for it: the update created a new \
-             head commit that no CI run has validated yet, and merging it now would put an \
-             unvalidated commit on main (the failure mika#1577 closed). GitHub is running CI \
-             on the new commit; the resulting `check_suite success` webhook re-enters the \
-             merge path and finishes the job. End the turn.\n\n"
+            "the PR was behind main (base: {base}, main HEAD: {head}). GitHub has accepted an \
+             automatic branch update toward {head} (mika#2238), which moves the PR's head to a \
+             new commit. Do NOT merge this PR in this turn and do NOT call \
+             `pr_merge_with_gate` for it: that new head commit has no CI result, and merging \
+             it would put an unvalidated commit on main (the failure mika#1577 closed). Do NOT \
+             rebase by hand. End the turn. **The PR now needs a fresh QA review** — the head \
+             SHA moved, so the existing approval no longer matches HEAD and the stale-SHA gate \
+             will hold the PR until QA re-reviews the updated head. Say so when you notify: \
+             the mechanical behind-main state is repaired, the review is not.\n\n"
         )),
         BehindMainRemediation::AlreadyAttempted => Some(format!(
             "the PR is behind main (base: {base}, main HEAD: {head}). An automatic branch \
-             update toward this exact main HEAD was already attempted, so it is not being \
-             retried (anti-thrash guard, mika#2238). Do NOT merge and do NOT rebase by hand. \
-             End the turn; if no fresh CI run appears for this PR, surface it to the \
-             operator.\n\n"
+             update toward this exact main HEAD was already accepted by GitHub, so it is not \
+             being re-sent (anti-thrash guard, mika#2238). Do NOT merge and do NOT rebase by \
+             hand. End the turn; if the PR's head never moves, surface it to the operator.\n\n"
         )),
         BehindMainRemediation::Conflict(d) => Some(format!(
             "the PR is behind main (base: {base}, main HEAD: {head}) and the automatic branch \
              update hit a real conflict: {d}. Do NOT merge. Conflict resolution is required \
              before this PR can go in.\n\n"
         )),
-        BehindMainRemediation::Failed(d) => Some(format!(
-            "the PR is behind main (base: {base}, main HEAD: {head}) and the automatic branch \
-             update did not go through: {d}. Do NOT merge. Rebase the PR onto main before \
-             merging, or surface the failure to the operator.\n\n"
+        BehindMainRemediation::Failed(d) | BehindMainRemediation::Contradiction(d) => {
+            Some(format!(
+                "the PR is behind main (base: {base}, main HEAD: {head}) and the automatic \
+                 branch update did not go through: {d}. Do NOT merge. Do NOT rebase by hand — \
+                 surface the failure to the operator with that detail verbatim. If it names a \
+                 403 or `Resource not accessible by integration`, the merge credential lacks \
+                 write access to this repository: the fix is to install the mika GitHub App on \
+                 it with Contents + Pull requests write permission, or to grant the configured \
+                 PAT the `repo` scope.\n\n"
+            ))
+        }
+        BehindMainRemediation::BaseNotMain(d) => Some(format!(
+            "the behind-main comparison could not be evaluated for this PR: {d}. That \
+             comparison resolves `refs/heads/main` unconditionally (#1577), so it does not \
+             describe a PR based on another branch. The gate took no action and did not touch \
+             the branch. Do NOT merge and do NOT rebase by hand. Surface it to the \
+             operator.\n\n"
         )),
     }
 }
@@ -1889,6 +2021,8 @@ mod tests {
             BehindMainRemediation::AlreadyAttempted,
             BehindMainRemediation::Conflict("merge conflict".to_string()),
             BehindMainRemediation::Failed("HTTP 403".to_string()),
+            BehindMainRemediation::Contradiction("still behind".to_string()),
+            BehindMainRemediation::BaseNotMain("release/1.4".to_string()),
         ] {
             assert!(
                 !continues(held.clone()),
@@ -2104,6 +2238,88 @@ mod tests {
     }
 
     #[test]
+    fn mika2238_a_failed_attempt_gives_its_claim_back() {
+        // The claim is spent optimistically, before the call, so two concurrent
+        // webhooks cannot both fire an update. But an attempt that never reached
+        // GitHub made no commit, so keeping it spent would strand the PR: nothing
+        // evicts the entry until the ledger hits its soft cap, and with a
+        // serialized dispatch `main` may not move for hours. A guard that
+        // manufactures a permanent stall is the defect this ticket exists to end.
+        let sha = "mika2238-release-unique-sha-7c2e5a";
+        assert!(claim_update_branch_attempt(4242, REPO, sha));
+        assert!(
+            !claim_update_branch_attempt(4242, REPO, sha),
+            "the claim must be exclusive while it is held"
+        );
+
+        release_update_branch_attempt(4242, REPO, sha);
+
+        assert!(
+            claim_update_branch_attempt(4242, REPO, sha),
+            "a released claim must be re-takeable — otherwise one transient gh \
+             failure blocks this PR until `main` moves"
+        );
+    }
+
+    #[test]
+    fn mika2238_a_contradiction_detail_never_reaches_the_credential_classifier() {
+        // `classify_credential_scope_error` matches the bare substring `403`,
+        // and a 40-hex SHA contains it ~1% of the time. The reconcile path
+        // composes prose around two SHAs, so routing it through that helper
+        // would occasionally answer a state contradiction with a confident,
+        // wrong "install the GitHub App". Hence the separate variant.
+        let info = BehindMainInfo {
+            pr_base_sha: "a403bc1234567890abcdef1234567890abcdef12".to_string(),
+            current_main_sha: "def5678cafebabe".to_string(),
+        };
+        let contradiction = BehindMainRemediation::Contradiction(format!(
+            "update-branch reported the branch was already up to date, but the PR base \
+             is still behind main (base: {}, main HEAD: {})",
+            info.pr_base_sha, info.current_main_sha
+        ));
+
+        // Sanity: the composed detail really does contain the substring that
+        // would trip the classifier, so this test would catch the regression.
+        let detail = match &contradiction {
+            BehindMainRemediation::Contradiction(d) => d.clone(),
+            other => panic!("expected Contradiction, got {other:?}"),
+        };
+        assert!(classify_credential_scope_error(&detail, REPO).is_some());
+
+        match disposition_for_remediation(&contradiction, REPO, &info)
+            .expect("a contradiction must terminate the turn")
+        {
+            MergeGateResult::Blocked { reason, .. } => assert_eq!(
+                reason,
+                BlockReason::BehindMain {
+                    pr_base_sha: info.pr_base_sha.clone(),
+                    current_main_sha: info.current_main_sha.clone(),
+                }
+            ),
+            other => panic!("expected blocked[behind_main], got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mika2238_a_pr_based_on_another_branch_is_never_repaired() {
+        // `is_behind_main` resolves `refs/heads/main` unconditionally (#1577),
+        // so for a stacked or release-branch PR "behind" is a misread. Declining
+        // on a misread was noise; repairing one would push a merge commit onto
+        // the head every time `main` moved, re-firing CI and QA each round.
+        let info = behind_info();
+        for base in ["release/1.4", "feat/parent-of-a-stack", ""] {
+            let remediation = BehindMainRemediation::BaseNotMain(base.to_string());
+            let disposition = disposition_for_remediation(&remediation, REPO, &info)
+                .expect("a non-main base must terminate the turn, never merge");
+            assert!(
+                matches!(disposition, MergeGateResult::GateError { .. }),
+                "a base the comparison cannot describe is a gate error, not a PR-state \
+                 claim; got {disposition:?}"
+            );
+        }
+    }
+
+    #[test]
     fn mika2238_public_claim_uses_the_process_global_ledger() {
         // Exercise the real path once. Unique key so parallel tests sharing the
         // process-global map cannot collide.
@@ -2195,6 +2411,7 @@ mod tests {
             is_draft: false,
             state: "OPEN".to_string(),
             base_ref_oid: String::new(),
+            base_ref_name: "main".to_string(),
         };
         let result = classify_preflight(&preflight);
         assert_eq!(
@@ -2215,6 +2432,7 @@ mod tests {
             is_draft: false,
             state: "OPEN".to_string(),
             base_ref_oid: String::new(),
+            base_ref_name: "main".to_string(),
         };
         let result = classify_preflight(&preflight);
         assert_eq!(
@@ -2235,6 +2453,7 @@ mod tests {
             is_draft: false,
             state: "OPEN".to_string(),
             base_ref_oid: String::new(),
+            base_ref_name: "main".to_string(),
         };
         assert_eq!(classify_preflight(&preflight), None);
     }
@@ -2247,6 +2466,7 @@ mod tests {
             is_draft: false,
             state: "CLOSED".to_string(),
             base_ref_oid: String::new(),
+            base_ref_name: "main".to_string(),
         };
         let result = classify_preflight(&preflight);
         assert_eq!(
@@ -2267,6 +2487,7 @@ mod tests {
             is_draft: false,
             state: "MERGED".to_string(),
             base_ref_oid: String::new(),
+            base_ref_name: "main".to_string(),
         };
         assert_eq!(
             classify_preflight(&preflight),
@@ -2282,6 +2503,7 @@ mod tests {
             is_draft: true,
             state: "OPEN".to_string(),
             base_ref_oid: String::new(),
+            base_ref_name: "main".to_string(),
         };
         let result = classify_preflight(&preflight);
         assert_eq!(
@@ -2308,6 +2530,7 @@ mod tests {
             is_draft: false,
             state: "OPEN".to_string(),
             base_ref_oid: String::new(),
+            base_ref_name: "main".to_string(),
         };
 
         let result = classify_preflight(&preflight);

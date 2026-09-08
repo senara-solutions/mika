@@ -349,51 +349,7 @@ pub async fn try_handle_ci_success(
         return VerdictAction::Passthrough { enrichment: None };
     }
 
-    // 5b. Behind-main assertion (#1577) + remediation (mika#2238).
-    // Fetch the PR's baseRefOid via gh pr view, then compare against main HEAD.
-    // When behind, the branch is brought up to date and this turn ENDS — the
-    // update creates a new head commit, and the fresh `check_suite success`
-    // webhook re-enters this very handler to finish the merge.
-    // Fail-open on the DETECTION API error, as before.
-    match run_gh_pr_view(pr.number, &event.repo, token).await {
-        Ok(preflight) => {
-            match is_behind_main(&preflight.base_ref_oid, &event.repo, token).await {
-                Ok(Some(info)) => {
-                    let remediation = remediate_behind_main(
-                        "ci_success_handler",
-                        pr.number,
-                        &event.repo,
-                        token,
-                        &info,
-                    )
-                    .await;
-                    if let Some(enrichment) = format_behind_main_enrichment(&remediation, &info) {
-                        return VerdictAction::Passthrough {
-                            enrichment: Some(enrichment),
-                        };
-                    }
-                    // `None` — the PR turned out not to be behind. Proceed.
-                }
-                Ok(None) => {} // Up-to-date — proceed to merge
-                Err(e) => {
-                    warn!(
-                        pr_number = pr.number,
-                        error = %e,
-                        "CI success handler: failed to check behind-main — proceeding (fail-open)"
-                    );
-                }
-            }
-        }
-        Err(e) => {
-            warn!(
-                pr_number = pr.number,
-                error = %e.message,
-                "CI success handler: failed to fetch PR preflight for behind-main check — proceeding (fail-open)"
-            );
-        }
-    }
-
-    // 5c. Forge-gate perimeter check (mika#1853 — coupled pair with verdict_handler mika#1829).
+    // 5b. Forge-gate perimeter check (mika#1853 — coupled pair with verdict_handler mika#1829).
     //
     // The CI-success race path was previously the load-bearing bypass: `verdict_handler`
     // has consulted the classifier since mika#1829, but this handler called
@@ -488,6 +444,56 @@ pub async fn try_handle_ci_success(
                 &perimeter_verdict.summary(),
             ),
         };
+    }
+
+    // 5c. Behind-main assertion (#1577) + remediation (mika#2238).
+    // Fetch the PR's baseRefOid via gh pr view, then compare against main HEAD.
+    // When behind, GitHub is asked to update the branch and this turn ENDS.
+    //
+    // Placed AFTER the perimeter gate on purpose: this step WRITES (it moves the
+    // PR's head), and a DECISION-CORE PR must be handed to the operator before
+    // the loop touches a branch they own. It stays after the all-checks-green
+    // gate above for the same reason it does in `pr_merge_with_gate` — a red PR
+    // is reported red, not "awaiting fresh CI".
+    //
+    // Fail-open on the DETECTION API error, as before.
+    match run_gh_pr_view(pr.number, &event.repo, token).await {
+        Ok(preflight) => {
+            match is_behind_main(&preflight.base_ref_oid, &event.repo, token).await {
+                Ok(Some(info)) => {
+                    let remediation = remediate_behind_main(
+                        "ci_success_handler",
+                        pr.number,
+                        &event.repo,
+                        &preflight.base_ref_name,
+                        token,
+                        &info,
+                    )
+                    .await;
+                    if let Some(enrichment) = format_behind_main_enrichment(&remediation, &info) {
+                        return VerdictAction::Passthrough {
+                            enrichment: Some(enrichment),
+                        };
+                    }
+                    // `None` — the PR turned out not to be behind. Proceed.
+                }
+                Ok(None) => {} // Up-to-date — proceed to merge
+                Err(e) => {
+                    warn!(
+                        pr_number = pr.number,
+                        error = %e,
+                        "CI success handler: failed to check behind-main — proceeding (fail-open)"
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            warn!(
+                pr_number = pr.number,
+                error = %e.message,
+                "CI success handler: failed to fetch PR preflight for behind-main check — proceeding (fail-open)"
+            );
+        }
     }
 
     // 6. All conditions met — initiate merge
@@ -1080,6 +1086,8 @@ mod tests {
             BehindMainRemediation::AlreadyAttempted,
             BehindMainRemediation::Conflict("merge conflict between base and head".to_string()),
             BehindMainRemediation::Failed("HTTP 403: Resource not accessible".to_string()),
+            BehindMainRemediation::Contradiction("still behind".to_string()),
+            BehindMainRemediation::BaseNotMain("release/1.4".to_string()),
         ] {
             let text = format_behind_main_enrichment(&remediation, &behind_info())
                 .expect("only NotBehind yields no enrichment");
@@ -1092,17 +1100,60 @@ mod tests {
     }
 
     #[test]
-    fn behind_main_enrichment_on_failed_update_still_instructs_rebase() {
-        // The rebase instruction is the fallback wording, kept for the one case
-        // the code could not repair itself.
+    fn mika2238_no_enrichment_ever_tells_the_agent_to_rebase_by_hand() {
+        // The old wording ("Rebase the PR onto main before merging") is the one
+        // the prompts now forbid in the same breath — a webhook turn cannot
+        // reach the worktree, so an agent that obeys it either fails or edits
+        // its own sandbox. Every shape must instead route to the operator.
+        for remediation in [
+            BehindMainRemediation::Updated,
+            BehindMainRemediation::AlreadyAttempted,
+            BehindMainRemediation::Conflict("merge conflict".to_string()),
+            BehindMainRemediation::Failed("gh exit code 1".to_string()),
+            BehindMainRemediation::Contradiction("still behind".to_string()),
+            BehindMainRemediation::BaseNotMain("release/1.4".to_string()),
+        ] {
+            let text = format_behind_main_enrichment(&remediation, &behind_info())
+                .expect("only NotBehind yields no enrichment");
+            assert!(
+                !text.contains("Rebase the PR onto main"),
+                "enrichment for {remediation:?} still instructs a hand rebase the prompts \
+                 forbid: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn mika2238_a_failed_update_names_the_credential_remedy() {
+        // The webhook paths never reach `classify_credential_scope_error` — they
+        // render prose, not a `MergeGateResult` — so the remedy mika#1616 exists
+        // to state has to be in the text, or a 403 is named nowhere the agent
+        // can act on.
         let text = format_behind_main_enrichment(
-            &BehindMainRemediation::Failed("gh exit code 1".to_string()),
+            &BehindMainRemediation::Failed(
+                "gh: Resource not accessible by integration (HTTP 403)".to_string(),
+            ),
             &behind_info(),
         )
         .expect("a failed update must enrich the turn");
         assert!(
-            text.contains("Rebase"),
-            "Failed-update enrichment should instruct rebase: {text}"
+            text.contains("install the mika GitHub App"),
+            "a failed update must carry the credential remedy: {text}"
+        );
+    }
+
+    #[test]
+    fn mika2238_the_updated_enrichment_admits_the_pr_needs_a_fresh_review() {
+        // The stale-SHA gate at step 4 compares the QA review's commit_id with
+        // the PR head. An update-branch moves that head, so the approval no
+        // longer matches and this handler will hold the PR on the next pass.
+        // Saying "the webhook finishes the merge" would be a promise the gate
+        // right above refuses to keep.
+        let text = format_behind_main_enrichment(&BehindMainRemediation::Updated, &behind_info())
+            .expect("an updated branch must enrich the turn");
+        assert!(
+            text.contains("fresh QA review"),
+            "the updated enrichment must say the PR returns to QA: {text}"
         );
     }
 

@@ -503,11 +503,41 @@ async fn handle_pass_verdict(
         }
     };
 
+    let classification = classify_checks(&checks);
+
+    // A red PR is reported as red, ahead of the behind-main step below: a PR that
+    // is both behind and failing must surface the failing checks, not "branch
+    // updated, awaiting fresh CI" (mika#2238).
+    if classification == CheckClassification::HasFailures {
+        let failing: Vec<String> = checks
+            .iter()
+            .filter(|c| matches!(c.bucket.as_str(), "fail" | "cancel"))
+            .map(|c| format!("  - {} ({})", c.name, c.state))
+            .collect();
+
+        info!(
+            pr_number = event.pr_number,
+            "VERDICT: pass but CI checks failing — passing through to LLM"
+        );
+
+        return VerdictAction::Passthrough {
+            enrichment: Some(format!(
+                "[verdict_handler] VERDICT: pass received but CI checks are failing:\n{}\n\
+                 The structural merge handler did not act. Handle the CI failures.\n\n",
+                failing.join("\n")
+            )),
+        };
+    }
+
     // Behind-main assertion (#1577) + remediation (mika#2238).
     // Fetch the PR's baseRefOid via gh pr view, then compare against main HEAD.
-    // When behind, the branch is brought up to date and this turn ENDS — the
-    // update creates a new head commit, and the fresh `check_suite success`
-    // webhook hands the merge to `ci_success_handler`.
+    // When behind, GitHub is asked to update the branch and this turn ENDS.
+    //
+    // Placed after the perimeter gate (above) and the CI-failure arm, and before
+    // the merge/auto-merge arm — the same order as the other two sites. The last
+    // part matters most here: `--auto` on a behind PR would let GitHub merge it
+    // behind once its pending checks go green, which is the #1577 defect.
+    //
     // Fail-open on the DETECTION API error, as before.
     match run_gh_pr_view(event.pr_number, &event.repo, token).await {
         Ok(preflight) => {
@@ -517,6 +547,7 @@ async fn handle_pass_verdict(
                         "verdict_handler",
                         event.pr_number,
                         &event.repo,
+                        &preflight.base_ref_name,
                         token,
                         &info,
                     )
@@ -547,28 +578,10 @@ async fn handle_pass_verdict(
         }
     }
 
-    let classification = classify_checks(&checks);
-
     match classification {
+        // Handled above, which returns.
         CheckClassification::HasFailures => {
-            let failing: Vec<String> = checks
-                .iter()
-                .filter(|c| matches!(c.bucket.as_str(), "fail" | "cancel"))
-                .map(|c| format!("  - {} ({})", c.name, c.state))
-                .collect();
-
-            info!(
-                pr_number = event.pr_number,
-                "VERDICT: pass but CI checks failing — passing through to LLM"
-            );
-
-            VerdictAction::Passthrough {
-                enrichment: Some(format!(
-                    "[verdict_handler] VERDICT: pass received but CI checks are failing:\n{}\n\
-                     The structural merge handler did not act. Handle the CI failures.\n\n",
-                    failing.join("\n")
-                )),
-            }
+            unreachable!("HasFailures returns before the behind-main step")
         }
         CheckClassification::HasPending | CheckClassification::AllPassed => {
             let is_auto = classification == CheckClassification::HasPending;
@@ -3716,6 +3729,8 @@ mod tests {
             BehindMainRemediation::AlreadyAttempted,
             BehindMainRemediation::Conflict("merge conflict between base and head".to_string()),
             BehindMainRemediation::Failed("HTTP 403: Resource not accessible".to_string()),
+            BehindMainRemediation::Contradiction("still behind".to_string()),
+            BehindMainRemediation::BaseNotMain("release/1.4".to_string()),
         ] {
             let text = format_behind_main_enrichment(&remediation, &behind_info())
                 .expect("only NotBehind yields no enrichment");
@@ -3728,15 +3743,37 @@ mod tests {
     }
 
     #[test]
-    fn behind_main_enrichment_on_failed_update_still_instructs_rebase() {
-        let text = format_behind_main_enrichment(
-            &BehindMainRemediation::Failed("gh exit code 1".to_string()),
-            &behind_info(),
-        )
-        .expect("a failed update must enrich the turn");
+    fn mika2238_no_enrichment_ever_tells_the_agent_to_rebase_by_hand() {
+        // See the sibling test in `ci_success_handler` for why.
+        for remediation in [
+            BehindMainRemediation::Updated,
+            BehindMainRemediation::AlreadyAttempted,
+            BehindMainRemediation::Conflict("merge conflict".to_string()),
+            BehindMainRemediation::Failed("gh exit code 1".to_string()),
+            BehindMainRemediation::Contradiction("still behind".to_string()),
+            BehindMainRemediation::BaseNotMain("release/1.4".to_string()),
+        ] {
+            let text = format_behind_main_enrichment(&remediation, &behind_info())
+                .expect("only NotBehind yields no enrichment");
+            assert!(
+                !text.contains("Rebase the PR onto main"),
+                "enrichment for {remediation:?} still instructs a hand rebase the prompts \
+                 forbid: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn mika2238_the_updated_enrichment_admits_the_pr_needs_a_fresh_review() {
+        // An update-branch moves the head SHA, which invalidates the approval
+        // the stale-SHA gate in `ci_success_handler` checks against. Promising
+        // that the webhook finishes the merge would be a promise that gate
+        // refuses to keep.
+        let text = format_behind_main_enrichment(&BehindMainRemediation::Updated, &behind_info())
+            .expect("an updated branch must enrich the turn");
         assert!(
-            text.contains("Rebase"),
-            "Failed-update enrichment should instruct rebase: {text}"
+            text.contains("fresh QA review"),
+            "the updated enrichment must say the PR returns to QA: {text}"
         );
     }
 
