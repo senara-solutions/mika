@@ -120,6 +120,26 @@
   description: "Docs-only or non-code PR exempt from pipeline gates"
 
 # ── Dispatch / Routing ────────────────────────────────────────────────────────
+#
+# Ces trois étiquettes SONT le vocabulaire de `KNOWN_DISPATCH_SEATS`
+# (crates/mika-agent/src/webhook_dispatch.rs). Les deux listes doivent bouger
+# dans le MÊME commit : `scripts/check-dispatch-seats-declared.sh` échoue en CI
+# dès qu'elles divergent, dans un sens comme dans l'autre.
+#
+# Pourquoi une garde plutôt qu'une note (mika#2092) : le workflow labels.yml
+# synchronise avec `delete-other-labels: true`. Un siège non déclaré ici est
+# donc supprimé du dépôt — et de toutes les issues qui le portent — sans
+# événement `unlabeled` et sans trace. Le 2026-08-30, `dispatch:ssc` et
+# `dispatch:mpc` ont disparu de cette façon à 09:12:51Z, à l'occasion d'un push
+# sans rapport ; la garde de siège s'est désarmée en silence.
+#
+# `dispatch:zorglub` est la fixture de test « siège inconnu » du code Rust :
+# elle ne doit JAMAIS être déclarée ici, sous peine de la rendre atteignable en
+# production.
+- name: "dispatch:loop"
+  color: "1d76db"
+  description: "Routage : ce ticket est pris par la boucle autonome (mika-dev). Un seul dispatcher par ticket."
+
 - name: "dispatch:ssc"
   color: "5319e7"
   description: "Routage : ce ticket est pris par SSC (senara-solutions-claude). Un seul dispatcher par ticket."
