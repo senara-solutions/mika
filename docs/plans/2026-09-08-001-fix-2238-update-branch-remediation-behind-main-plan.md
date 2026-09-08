@@ -58,6 +58,18 @@ PR mika#2236 : `reviewDecision=APPROVED` par `mika-platform-qa` à 08:25:08Z, `m
 
 ---
 
+## Acceptance criteria
+
+- **AC1** — `attempt_update_branch(pr_number, repo, token)` existe dans `pr_merge_with_gate.rs` à côté de `is_behind_main` et est le **seul** appelant de `gh pr update-branch` (R1). Test : un unique call-site.
+- **AC2** — Les trois sites BEHIND appellent `attempt_update_branch` au lieu de décliner (R2). Test unitaire par site.
+- **AC3** — Après un update-branch réussi, **aucun merge** dans le même tour ; l'état retourné est `MergeGateResult::BranchUpdated` (R3/R5). Test : pas de `run_gh_merge` dans le même tour.
+- **AC4** — Plafond anti-thrash : au plus une tentative par couple (PR, SHA `main` visé) ; une seconde sur le même SHA cible ne ré-émet pas (R4). Test.
+- **AC5** — Les prompts embarqués énumèrent les **sept** variantes `blocked.reason`, avec une disposition nommée pour `behind_main` et `human_gate_required` (R6). Test/lint.
+- **AC6** — Chaque tentative d'update-branch émet un event structuré (PR, SHA avant, SHA main visé, issue) lisible par le moniteur (R7). Test.
+- **AC7** — Un échec d'update-branch (conflit réel, permission, 422) dégrade en `Blocked { reason: MergeConflict | CredentialScope | ré-éval }` avec le détail — **jamais** en merge silencieux (R8). Test par cas.
+
+---
+
 ## Décisions techniques clés
 
 ### KTD-1 — Update-branch, puis **rendez-vous sur le webhook CI**. Jamais de re-merge dans le même tour.
