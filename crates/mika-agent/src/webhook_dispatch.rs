@@ -248,6 +248,27 @@ pub(crate) const CURRENT_DISPATCH_SEAT: &str = "loop";
 /// refused (see [`classify_dispatch_seat`]), so the first ticket carrying a new
 /// seat reports itself loudly instead of failing quietly — that is the intended
 /// way to add one.
+///
+/// **This list and `.github/labels.yml` are one vocabulary written twice, and
+/// they must move in the same commit** (mika#2092). A seat here without its
+/// `dispatch:<seat>` entry there is not merely undeclared: the label-sync
+/// workflow runs with `delete-other-labels: true`, so it is a label GitHub
+/// DELETES from the repository — and from every issue carrying it — with no
+/// `unlabeled` event and no log. [`classify_dispatch_seat`] then reads
+/// [`SeatVerdict::NoSeatLabel`] everywhere and refuses nothing: the gate
+/// disarms itself in silence, which is exactly how the 2026-08-30 collision
+/// this module exists to prevent became reachable again on 2026-08-30 at
+/// 09:12:51Z, an hour before mika#2084 shipped.
+///
+/// The other direction is the mirror and equally real: a `dispatch:*` label
+/// declared without a seat here resolves to [`SeatVerdict::Unresolvable`] and
+/// refuses the ticket — fail-closed, so the loop stops on a label somebody was
+/// told existed.
+///
+/// `scripts/check-dispatch-seats-declared.sh` compares the two lists both ways
+/// and fails CI on divergence, so this paragraph is enforced rather than
+/// remembered. `dispatch:zorglub`, used below as the unknown-seat fixture, must
+/// stay undeclared for the same reason it is a good fixture.
 pub(crate) const KNOWN_DISPATCH_SEATS: &[&str] = &["loop", "ssc", "mpc"];
 
 /// What the seat labels on one issue say about whether this engine may take it.
