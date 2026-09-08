@@ -140,6 +140,16 @@ mod tests {
     fn setup() -> (TempDir, TestHarness) {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("skills")).unwrap();
+        // An agent home carries an identity.toml; since mika#2027 its absence is
+        // fail-closed (zero skills) rather than permissive, so a fixture that
+        // omitted it was silently testing a state no provisioned agent is in.
+        // No `[skills]` block = no allowlist filter, which is what these tests
+        // used to get by accident.
+        std::fs::write(
+            tmp.path().join("identity.toml"),
+            "name = \"Mika\"\nemoji = \"✦\"\n",
+        )
+        .unwrap();
         let harness = TestHarness::new();
         (tmp, harness)
     }

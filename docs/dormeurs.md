@@ -36,7 +36,7 @@ son historique) et retirer la ligne d'ici.
 | ticket | sujet | condition de réveil |
 |---|---|---|
 | [#1403](https://github.com/senara-solutions/mika/issues/1403) | monitoring filtré événementiel pour les agents orchestrateurs | `git rev-list --count origin/feat/1403/gateway-agent-core-event-driven-filtered..origin/main` rend **0** |
-| [#1619](https://github.com/senara-solutions/mika/issues/1619) | build + push ECR de l'image `mika-agent` au merge sur `main` | les **trois** ensemble : `gh secret list --repo senara-solutions/mika` contient `ECR_PUSH_ROLE_ARN` et le rôle IAM existe (mika-cloud#220) ; **mika#2143** livré ; le workflow réactivé et **deux merges consécutifs** réussis |
+| [#1619](https://github.com/senara-solutions/mika/issues/1619) | build + push ECR de l'image `mika-agent` au merge sur `main` | les **trois** ensemble : `gh secret list --repo senara-solutions/mika` contient `ECR_PUSH_ROLE_ARN` et le rôle IAM existe (mika-cloud#220) ; **mika#2143** et **mika#2174** livrés ; le workflow réactivé et **deux merges consécutifs** réussis |
 | [#1651](https://github.com/senara-solutions/mika/issues/1651) | couche d'intention entre le match par mot-clé et la porte d'outils requis | `git rev-list --count origin/design/1651/skills-intent-layer-between-keyword..origin/main` rend **0** |
 | [#1680](https://github.com/senara-solutions/mika/issues/1680) | glyphes cassés dans le résumé de dispatch webhook (TUI mika-dev) | `git rev-list --count origin/fix/1680/mika-dev-tui-broken-glyph-rendering-in..origin/main` rend **0** |
 | [#1694](https://github.com/senara-solutions/mika/issues/1694) | dette de worktrees et de branches — audit et nettoyage automatisés | une branche `origin/*/1694/*` existe et porte un plan commité |

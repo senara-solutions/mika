@@ -60,7 +60,9 @@ async fn test_summary_injected_by_default() {
         .await
         .unwrap();
 
-    // No identity.toml — defaults apply (inject = true)
+    // The harness writes a `name`/`emoji`-only identity.toml (mika#2027: an
+    // ABSENT file is fail-closed, which includes inject = false). No `[context]`
+    // section, so the default applies: inject = true.
 
     // Seed a conversation summary
     harness

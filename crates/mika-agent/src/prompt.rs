@@ -474,18 +474,71 @@ impl Default for Identity {
     }
 }
 
-/// Load identity from ~/.mika/identity.toml.
+/// Sentinel allowlist entry that matches no real skill. Its presence in
+/// `skills.allowlist` evicts every bundled skill (`apply_identity_allowlist`
+/// retains only allowlisted names, and nothing is named this).
 ///
-/// Returns defaults if the file is missing.
+/// `well_known_agents::well_known_skill_allowlists` filters any `__…__` token
+/// out of the coherence gate for exactly this reason.
+pub const FAIL_CLOSED_SKILL_SENTINEL: &str = "__fail_closed_no_skills__";
+
+/// Load identity from `<home_dir>/identity.toml`.
 ///
-/// On parse error: emits `error!` and applies fail-closed semantics for
-/// well-known agents (e.g., mika-arch). Specifically:
-/// - For well-known agents, returns an `Identity` with `skills.allowlist =
-///   Some(vec!["__fail_closed__"])` (a sentinel that matches no real skill,
-///   evicting all bundled skills) and `tools.disabled` = full mutational set.
-///   The agent is effectively neutered until the operator fixes the file.
-/// - For user-defined agents, falls back to `Identity::default()` (current
-///   behavior — they have no security contract to preserve).
+/// # Absence is not permission (mika#2027)
+///
+/// A missing `identity.toml` used to return `Identity::default()`, whose
+/// `skills.allowlist` is `None` — and `apply_identity_allowlist` treats `None`
+/// as a no-op, i.e. **every bundled skill active**, `shell-exec` / `git-ops` /
+/// `github` / `tmux` included. Deleting an agent's identity file therefore
+/// *widened* it. Worse, the deletion is not recoverable by restarting:
+/// `bootstrap_fresh_install` is gated on `home::is_initialized`, which is true
+/// for any tenant whose `data/mika.db` exists, so nothing ever rewrites the
+/// file. Measured on a live tenant 2026-08-28; ~2 min of exposure opened by an
+/// authorized tier remediation that looked correct.
+///
+/// A read failure now yields the same fail-closed sentinel as a malformed file:
+/// the agent starts with **zero skills** and mika-arch's platform-mutational
+/// tool denylist. This is universal — well-known and user-defined agents alike
+/// (F1). An agent that needs skills must carry an explicit `identity.toml`, even
+/// a minimal one.
+///
+/// **What "neutered" does and does not mean.** The denylist is
+/// `MIKA_ARCH_DISABLED_TOOLS`, which by design keeps `send_message` and the
+/// agent-scoped memory writes (`update_core_memory`, `store_fact`,
+/// `update_fact`) — mika#811 treats those as constitutive of being an agent
+/// rather than platform side effects. A fail-closed agent can therefore still
+/// write its own memory, and core memory is re-injected into every later system
+/// prompt. Whether the fail-closed path wants a *stricter* denylist than
+/// mika-arch's steady-state one is a real question, and a separate one: the two
+/// share a constant today, so narrowing it here would also narrow mika-arch.
+/// Left open deliberately rather than answered in a load-path fix.
+///
+/// **The sentinel reaches disk, not just memory.** `startup::seed_bundled_skills_if_needed`
+/// feeds this allowlist to `materialize_agent_skill_links`, whose second pass
+/// removes the symlink of every de-allowlisted bundled skill. A fail-closed start
+/// therefore empties `<agent_home>/skills/` of its library symlinks — recoverable
+/// (they are re-materialized on the first start with a valid identity) and scoped
+/// (marketplace and `--copy-managed` directories are untouched), but a real disk
+/// effect, including for the transient `identity_toml_unreadable` case.
+///
+/// Fail-closed *sentinel* rather than refusing to boot (F2): mika-spirit serves
+/// every agent from one process, so a hard refusal would take the healthy agents
+/// down with the broken one, and it would contradict mika#1962's `tier_guard`,
+/// which explicitly tolerates a missing persona file. Neutering one agent is the
+/// per-agent shape of the same posture.
+///
+/// The two causes are logged under **distinct** event names — `identity_toml_absent`
+/// (`ErrorKind::NotFound`) and `identity_toml_unreadable` (permissions, I/O) —
+/// because they call for different remediations (AC2).
+///
+/// On parse error the behaviour is unchanged from mika#811:
+/// - well-known agents fail closed (same sentinel, `event = "identity_toml_malformed"`);
+/// - user-defined agents fall back to `Identity::default()`.
+///
+/// That leaves one deliberate asymmetry: a *user-defined* agent is failed closed
+/// on an absent file but not on a malformed one. mika#2027 scopes itself to the
+/// absent case; widening the malformed path is a separate decision with a wider
+/// blast radius, not a fix smuggled into this one.
 ///
 /// The well-known check uses the home_dir's last component matched against
 /// `find_well_known_agent`. This keeps the discrimination at the load layer
@@ -495,7 +548,7 @@ pub fn load_identity(home_dir: &Path) -> Identity {
     let path = home_dir.join("identity.toml");
     match std::fs::read_to_string(&path) {
         Ok(content) => parse_identity_or_fail_closed(&content, home_dir, &path),
-        Err(_) => Identity::default(),
+        Err(e) => unreadable_identity_fail_closed(home_dir, &path, &e),
     }
 }
 
@@ -505,8 +558,50 @@ pub async fn load_identity_async(home_dir: &Path) -> Identity {
     let path = home_dir.join("identity.toml");
     match tokio::fs::read_to_string(&path).await {
         Ok(content) => parse_identity_or_fail_closed(&content, home_dir, &path),
-        Err(_) => Identity::default(),
+        Err(e) => unreadable_identity_fail_closed(home_dir, &path, &e),
     }
+}
+
+/// The agent's name as the load layer knows it: the last component of its home
+/// directory. Shared by every fail-closed log site so one agent is named one way.
+fn agent_name_from_home(home_dir: &Path) -> &str {
+    home_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("<unknown>")
+}
+
+/// `identity.toml` could not be read. Fail closed, and say **which** unreadable
+/// it was — an absent file and an unreadable-but-present one have different
+/// remediations (mika#2027 AC2).
+fn unreadable_identity_fail_closed(home_dir: &Path, path: &Path, err: &std::io::Error) -> Identity {
+    let agent_name = agent_name_from_home(home_dir);
+
+    if err.kind() == std::io::ErrorKind::NotFound {
+        tracing::error!(
+            event = "identity_toml_absent",
+            agent = %agent_name,
+            path = %path.display(),
+            "identity.toml is ABSENT — failing CLOSED (all skills evicted, all \
+             mutational tools denied). Absence never means 'everything permitted' \
+             (mika#2027). Restarting will NOT regenerate the file: bootstrap only \
+             runs on an uninitialized home. Re-provision it from the agent's tier \
+             template — see docs/operator/agent-identity-reprovision.md"
+        );
+    } else {
+        tracing::error!(
+            event = "identity_toml_unreadable",
+            agent = %agent_name,
+            path = %path.display(),
+            error = %err,
+            "identity.toml is present but could not be read — failing CLOSED (all \
+             skills evicted, all mutational tools denied). This is a permissions or \
+             I/O fault, not a missing file: fix the file's readability rather than \
+             re-provisioning it. See docs/operator/agent-identity-reprovision.md"
+        );
+    }
+
+    fail_closed_identity()
 }
 
 fn parse_identity_or_fail_closed(content: &str, home_dir: &Path, path: &Path) -> Identity {
@@ -523,10 +618,7 @@ fn parse_identity_or_fail_closed(content: &str, home_dir: &Path, path: &Path) ->
     match parsed {
         Ok(identity) => identity,
         Err(parse_err) => {
-            let agent_name = home_dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("<unknown>");
+            let agent_name = agent_name_from_home(home_dir);
 
             // Well-known agents fail closed; user agents fall back to defaults.
             let is_well_known =
@@ -534,6 +626,7 @@ fn parse_identity_or_fail_closed(content: &str, home_dir: &Path, path: &Path) ->
 
             if is_well_known {
                 tracing::error!(
+                    event = "identity_toml_malformed",
                     agent = %agent_name,
                     path = %path.display(),
                     error = %parse_err,
@@ -544,6 +637,7 @@ fn parse_identity_or_fail_closed(content: &str, home_dir: &Path, path: &Path) ->
                 fail_closed_identity()
             } else {
                 tracing::error!(
+                    event = "identity_toml_malformed",
                     agent = %agent_name,
                     path = %path.display(),
                     error = %parse_err,
@@ -555,9 +649,10 @@ fn parse_identity_or_fail_closed(content: &str, home_dir: &Path, path: &Path) ->
     }
 }
 
-/// Fail-closed `Identity` for well-known agents whose `identity.toml` failed
-/// to parse. Sentinel allowlist matches no real skill (evicts all bundled
-/// skills); denylist contains every mutational built-in tool to prevent
+/// Fail-closed `Identity` for an agent whose `identity.toml` could not be read
+/// (absent or unreadable — mika#2027, any agent) or failed to parse (mika#811,
+/// well-known agents). Sentinel allowlist matches no real skill (evicts all
+/// bundled skills); denylist contains every mutational built-in tool to prevent
 /// the agent from acting until the operator fixes the file.
 fn fail_closed_identity() -> Identity {
     Identity {
@@ -567,7 +662,7 @@ fn fail_closed_identity() -> Identity {
         heartbeat: None,
         kg: KgIdentityConfig::default(),
         skills: SkillsIdentityConfig {
-            allowlist: Some(vec!["__fail_closed_no_skills__".to_string()]),
+            allowlist: Some(vec![FAIL_CLOSED_SKILL_SENTINEL.to_string()]),
             allow_authoring: None,
             nudge_enabled: None,
             nudge_interval: None,
@@ -1886,12 +1981,137 @@ emoji = "✦"
         assert_eq!(identity.emoji, "🕶");
     }
 
+    /// A missing `identity.toml` keeps the *display* identity (name/emoji) so
+    /// listing surfaces still read sensibly — what it does NOT keep is the
+    /// permissive allowlist. See the fail-closed tests below.
     #[test]
-    fn test_load_identity_defaults_if_missing() {
+    fn test_load_identity_keeps_display_defaults_if_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let identity = load_identity(tmp.path());
         assert_eq!(identity.name, "Mika");
         assert_eq!(identity.emoji, "✦");
+    }
+
+    /// mika#2027 AC1 — Fire-Disposition detector.
+    ///
+    /// RED before the fix: `Err(_) => Identity::default()` gave
+    /// `allowlist: None`, which `apply_identity_allowlist` treats as a no-op —
+    /// i.e. every bundled skill active, `shell-exec` / `git-ops` / `github` /
+    /// `tmux` included. Deleting an agent's identity file *widened* it.
+    /// GREEN after: the same fail-closed sentinel the malformed path uses.
+    #[test]
+    fn mika2027_absent_identity_toml_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!tmp.path().join("identity.toml").exists());
+
+        let identity = load_identity(tmp.path());
+
+        let allowlist = identity
+            .skills
+            .allowlist
+            .as_ref()
+            .expect("absent identity.toml must NOT yield a permissive (None) allowlist");
+        assert_eq!(allowlist, &[FAIL_CLOSED_SKILL_SENTINEL.to_string()]);
+
+        // The sentinel is only fail-closed if it names nothing real: an
+        // allowlist of one existing skill would leave that skill active.
+        assert!(
+            !crate::bundled_skills::is_bundled_skill(FAIL_CLOSED_SKILL_SENTINEL),
+            "the fail-closed sentinel must match no bundled skill"
+        );
+
+        // Summary injection cannot be re-enabled by the absence of a file
+        // (mika#1009 leak protection).
+        assert!(!identity.context.summary.inject);
+
+        // Platform-mutational tools denied — pinned against the actual constant,
+        // not merely "non-empty", so a future edit to the list is a visible diff.
+        let disabled: std::collections::HashSet<&str> =
+            identity.tools.disabled.iter().map(String::as_str).collect();
+        for tool in crate::well_known_agents::MIKA_ARCH_DISABLED_TOOLS {
+            assert!(disabled.contains(tool), "{tool} must be denied fail-closed");
+        }
+
+        // And what it deliberately does NOT deny, written down so nobody reads
+        // "fail-closed" as "inert": #811 keeps the agent-scoped memory writes,
+        // counting them as constitutive of being an agent rather than platform
+        // side effects. A neutered agent can still write core memory, which is
+        // re-injected into every later system prompt. Whether the fail-closed
+        // path wants a stricter list than mika-arch's steady-state one is open —
+        // the two share this constant, so tightening it here tightens mika-arch.
+        for still_allowed in ["update_core_memory", "store_fact", "update_fact"] {
+            assert!(
+                !disabled.contains(still_allowed),
+                "{still_allowed} is expected to remain allowed; if that changed \
+                 deliberately, update this assertion and the paragraph above it"
+            );
+        }
+    }
+
+    /// mika#2027 F1 — the fail-closed posture is **universal**. A user-defined
+    /// agent (not in `WELL_KNOWN_AGENTS`) gets the same sentinel: AC1 admits no
+    /// exception, and discriminating here would reopen the "which agent is
+    /// supposed to have a file?" ambiguity the universal rule closes.
+    #[test]
+    fn mika2027_absent_identity_toml_fails_closed_for_user_defined_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_home = tmp.path().join("agents").join("vincent-perso");
+        std::fs::create_dir_all(&agent_home).unwrap();
+        assert!(
+            crate::well_known_agents::find_well_known_agent("vincent-perso").is_none(),
+            "fixture must name a user-defined agent for this test to mean anything"
+        );
+
+        let identity = load_identity(&agent_home);
+
+        assert_eq!(
+            identity.skills.allowlist,
+            Some(vec![FAIL_CLOSED_SKILL_SENTINEL.to_string()])
+        );
+    }
+
+    /// The async loader is the one the server, task engine and agent loop
+    /// actually call. A fix that only landed on the sync path would leave the
+    /// running daemon permissive.
+    #[tokio::test]
+    async fn mika2027_absent_identity_toml_fails_closed_on_the_async_path() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let identity = load_identity_async(tmp.path()).await;
+
+        assert_eq!(
+            identity.skills.allowlist,
+            Some(vec![FAIL_CLOSED_SKILL_SENTINEL.to_string()])
+        );
+        assert!(!identity.context.summary.inject);
+    }
+
+    /// A present-but-unreadable file is a different fault from an absent one
+    /// (mika#2027 AC2) — but it fails closed just the same. Only the log event
+    /// discriminates, because only the remediation differs.
+    #[cfg(unix)]
+    #[test]
+    fn mika2027_unreadable_identity_toml_also_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("identity.toml");
+        std::fs::write(&path, "name = \"Agent X\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Running as root defeats the permission bits; skip rather than assert
+        // something the environment cannot produce.
+        if std::fs::read_to_string(&path).is_ok() {
+            return;
+        }
+
+        let identity = load_identity(tmp.path());
+
+        assert_eq!(
+            identity.skills.allowlist,
+            Some(vec![FAIL_CLOSED_SKILL_SENTINEL.to_string()]),
+            "an unreadable identity.toml must not read as 'everything permitted' either"
+        );
     }
 
     #[test]

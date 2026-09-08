@@ -2873,8 +2873,14 @@ DRIFT_BLOCK=$(sed -n '/Post-flight plan validation/,/Issue #138: Discover/p' "$D
 
 assert_contains "POLICY_DENY variable initialized" \
     'POLICY_DENY=""' "$DRIFT_BLOCK"
+# mika#2165 moved the directory behind the single resolver `_pilot_log_dir`;
+# the LOG_ID convention this assertion exists for is unchanged, only its
+# spelling is. The default literal now lives at exactly one site, pinned below.
+# The resolver is called ON THE SAME LINE as the read — an assigning accessor
+# (not a printing one, see the mika#2039 collision pinned below) can go stale,
+# and co-location is what stops it.
 assert_contains "PERSISTENT_STDERR_PATH uses LOG_ID convention" \
-    'PERSISTENT_STDERR_PATH="${PILOT_LOG_DIR:-/var/log/claude-pilot}/${LOG_ID}.stderr"' "$DRIFT_BLOCK"
+    '_pilot_log_dir; PERSISTENT_STDERR_PATH="$_PILOT_LOG_DIR/${LOG_ID}.stderr"' "$DRIFT_BLOCK"
 assert_contains "Reads from persistent stderr (mika#1097 channel)" \
     '"$PERSISTENT_STDERR_PATH"' "$DRIFT_BLOCK"
 assert_contains "Strips ANSI before grep (UI ANSI shouldn't break match)" \
@@ -2970,7 +2976,7 @@ assert_contains "Class C check fires on HEAD-unchanged for ALL skills (not just 
 assert_contains "POLICY_DENY variable set in HEAD-unchanged path" \
     'POLICY_DENY=""' "$POSTFLIGHT_BLOCK"
 assert_contains "Reads persistent stderr at LOG_ID path" \
-    'PERSISTENT_STDERR_PATH="${PILOT_LOG_DIR:-/var/log/claude-pilot}/${LOG_ID}.stderr"' "$POSTFLIGHT_BLOCK"
+    '_pilot_log_dir; PERSISTENT_STDERR_PATH="$_PILOT_LOG_DIR/${LOG_ID}.stderr"' "$POSTFLIGHT_BLOCK"
 assert_contains "Strips ANSI before grep" \
     'sed' "$POSTFLIGHT_BLOCK"
 assert_contains "Searches for [policy:deny] marker" \
@@ -4842,8 +4848,18 @@ CP_JOINED=$(awk '
 # dispatch invocation out of the guard's sight entirely, silently, while all
 # three assertions stayed green (measured). Every real launch goes through
 # `_run_pilot_sandboxed`, plus the venv smoke test; that is the chokepoint.
+#
+# mika#2165 widened the anchor from start-of-line to start-of-COMMAND (`^` or a
+# preceding `;`). The launcher is still the anchor; what changed is that it no
+# longer has to be the first command on its line. This was not a preference:
+# mika#2165 co-locates `_pilot_log_dir;` with the reads of $_PILOT_LOG_DIR, and
+# the launch lines are two of those reads. Under the old anchor both real launch
+# sites dropped out of sight at once — the site count fell 3 → 1 and said so,
+# which is precisely the "renamed, reordered, or added launch point turns red
+# instead of evaporating" property below doing its job. Widening here strictly
+# increases what the guard can see; it never lets a launch line hide.
 CP_INVOCATIONS=$(printf '%s\n' "$CP_JOINED" \
-    | grep -E '^[[:space:]]*(_run_pilot_sandboxed[[:space:]]+claude-pilot|(if ! )?timeout[[:space:]]+[0-9]+[[:space:]]+claude-pilot)([[:space:]]|$)' || true)
+    | grep -E '(^|;)[[:space:]]*(_run_pilot_sandboxed[[:space:]]+claude-pilot|(if ! )?timeout[[:space:]]+[0-9]+[[:space:]]+claude-pilot)([[:space:]]|$)' || true)
 
 # Quoted segments carry payload, not argv words: `ENTRY_COMMAND="/mika"` and the
 # prompt text cannot word-split into flags. Scanning them made the guard accuse
@@ -5543,6 +5559,170 @@ assert_contains "mika#2120: _detect_plan_on_branch appelle le lecteur partagé" 
     "_extract_plan_path" "$MIKA2120_DETECT_SRC"
 assert_eq "mika#2120: _detect_plan_on_branch ne porte plus de motif de callout" "0" \
     "$(printf '%s\n' "$MIKA2120_DETECT_SRC" | grep -cF 'grep -oP' || true)"
+
+echo ""
+echo "Test: _pilot_log_dir — un seul point de vérité, résolu tard (mika#2165)"
+echo "----------------------------------------------------------------------"
+# Trois parties doivent nommer le MÊME répertoire : le pilote depuis l'intérieur
+# du bac à sable (--log-dir), le bind bwrap, et l'hôte en post-flight. Ce bloc
+# épingle le résolveur unique — et surtout le MOMENT de sa résolution.
+#
+# Pourquoi le moment est l'assertion principale. La première coupe de mika#2165
+# figeait le répertoire dans une variable assignée au chargement de la lib
+# (`_PILOT_LOG_DIR="${PILOT_LOG_DIR:-...}"`). Trois sondes de cette suite posent
+# PILOT_LOG_DIR APRÈS le `source` ; elles se sont mises à lire
+# /var/log/claude-pilot au lieu de leur tmpdir — sans erreur, comme la panne que
+# le ticket répare. Une surcharge d'environnement lue une seule fois répond le
+# défaut à tout appelant qui la pose trop tard, et le fait en silence.
+
+MIKA2165_RESOLVER_SRC=$(sed -n '/^_pilot_log_dir()/,/^}/p' "$DISPATCH_LIB")
+assert_eq "mika#2165: _pilot_log_dir a bien été trouvée (guards the guard)" "yes" \
+    "$(if [ -n "$MIKA2165_RESOLVER_SRC" ]; then printf 'yes'; else printf 'no'; fi)"
+
+# Le défaut littéral n'apparaît en CODE qu'à un seul endroit : le résolveur.
+# Toute autre occurrence exécutable est une quatrième épellation, exactement ce
+# que mika#2165 a fermé. Les lignes de commentaire sont exclues à dessein — la
+# prose doit pouvoir nommer le chemin (l'en-tête du bac à sable et la note sur
+# le .stderr le font) sans que nommer devienne réintroduire.
+assert_eq "mika#2165: le défaut /var/log/claude-pilot n'est écrit qu'une fois en code" "1" \
+    "$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" | grep -cF '/var/log/claude-pilot' || true)"
+
+# Aucun site ne doit revenir à une variable gelée au chargement. La forme
+# dangereuse est l'assignation en COLONNE ZÉRO — au chargement de la lib, donc
+# avant toute surcharge posée par l'appelant. L'assignation *dans* le résolveur
+# est au contraire le mécanisme : elle s'exécute à chaque appel.
+assert_eq "mika#2165: pas de variable _PILOT_LOG_DIR figée au source" "0" \
+    "$(grep -cE '^_PILOT_LOG_DIR=' "$DISPATCH_LIB" || true)"
+assert_eq "mika#2165: la seule assignation du résolveur est dans son corps" "1" \
+    "$(printf '%s\n' "$MIKA2165_RESOLVER_SRC" | grep -cE '^[[:space:]]+_PILOT_LOG_DIR=' || true)"
+
+# COLLISION mika#2039 — pourquoi le résolveur ASSIGNE au lieu d'IMPRIMER.
+#
+# La deuxième coupe de mika#2165 exposait `printf` et se lisait `$(_pilot_log_dir)`.
+# Sous `set -x` (tout le dispatch tourne ainsi, BASH_XTRACEFD vers $TRACE_FILE que
+# _emit_callback renvoie à l'appelant), cette forme écrit `++ printf %s <valeur>`.
+# `_scrub_secrets_from_output` ne réécrit que `NAME=value` et les formes de token :
+# cette ligne-là n'est couverte par rien. La garde R8 de mika#2039
+# (test_sandbox_no_secret_in_argv.sh) interdit donc la FORME, sans regarder la
+# valeur — et elle est passée rouge, 34/35, sur ce résolveur.
+#
+# La valeur en jeu ici est un chemin, jamais un identifiant. C'est précisément
+# pourquoi la garde ne raisonne pas par valeur : une garde qui ferait l'exception
+# pour ce printf-ci laisserait passer le prochain écrivain. Les deux autres issues
+# ont été écartées — assouplir la garde échange une propriété structurelle contre
+# une commodité, et emballer le printf dans `set +x` (le bracket de
+# _stage_pilot_gh_token) masquerait la ligne au lieu de cesser de la produire.
+#
+# Cette assertion est ce qui empêche un futur contributeur de « simplifier » le
+# résolveur en accesseur imprimant : la garde #2039 redeviendrait rouge, mais
+# dans une autre suite, et le lien avec ce ticket serait perdu.
+assert_eq "mika#2165 × mika#2039: le résolveur n'imprime pas (aucun printf/echo dans son corps)" "0" \
+    "$(printf '%s\n' "$MIKA2165_RESOLVER_SRC" | grep -cE '^[[:space:]]*(printf|echo)[[:space:]]' || true)"
+assert_eq "mika#2165 × mika#2039: aucune substitution \$(_pilot_log_dir) ne subsiste" "0" \
+    "$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" | grep -cF '$(_pilot_log_dir)' || true)"
+
+# CO-LOCATION — le coût de l'accesseur assignant, refermé structurellement.
+#
+# Un accesseur qui assigne peut être lu périmé : un appelant qui lit
+# $_PILOT_LOG_DIR sans appeler le résolveur juste avant obtient la valeur d'un
+# appel précédent (ou rien). Ce serait une nouvelle panne silencieuse, la classe
+# exacte que ce ticket referme — donc elle n'est pas laissée à la discipline.
+#
+# Règle : toute ligne de code qui LIT $_PILOT_LOG_DIR doit aussi APPELER
+# _pilot_log_dir. Les lignes du corps du résolveur et les commentaires sont hors
+# sujet ; les déclarations de tableau `_PILOT_LOG_BIND_ARGS` portent un autre nom
+# et ne matchent pas.
+MIKA2165_UNCOLOCATED=$(grep -nE '\$\{?_PILOT_LOG_DIR\b' "$DISPATCH_LIB" \
+    | grep -vE '^[0-9]+:[[:space:]]*#' \
+    | grep -vE '_pilot_log_dir' \
+    || true)
+assert_eq "mika#2165: chaque lecture de \$_PILOT_LOG_DIR appelle le résolveur sur la même ligne" "" \
+    "$MIKA2165_UNCOLOCATED"
+
+# `--log-dir` valué, jamais nu : nu, argparse retombe sur le `const` Python
+# (/var/log/claude-pilot) et le pilote écrit ailleurs que là où l'hôte bind et
+# relit — l'invariant à trois têtes casse sans qu'aucun test structurel ne bouge.
+assert_eq "mika#2165: aucun --log-dir nu ne subsiste" "0" \
+    "$(grep -cE -- '--log-dir([[:space:]]+--|[[:space:]]*$)' "$DISPATCH_LIB" || true)"
+assert_eq "mika#2165: chaque --log-dir est valué par le résolveur" "2" \
+    "$(grep -cF -- '--log-dir "$_PILOT_LOG_DIR"' "$DISPATCH_LIB" || true)"
+
+# L'assertion de comportement : la surcharge posée APRÈS le source est honorée.
+# C'est celle qui aurait attrapé la régression ci-dessus ; les assertions
+# structurelles au-dessus n'y suffisent pas.
+# Les sondes impriment $_PILOT_LOG_DIR elles-mêmes : le résolveur assigne, il ne
+# rend rien sur stdout (voir la collision mika#2039 ci-dessus). Ce `printf` vit
+# dans la suite de tests, pas dans le dispatch tracé — la garde R8 ne le voit pas
+# et n'a pas à le voir.
+_mika2165_late_override_probe() {
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        PILOT_LOG_DIR="/tmp/mika2165-late-override"
+        _pilot_log_dir; printf '%s' "$_PILOT_LOG_DIR"
+    )
+}
+assert_eq "mika#2165: PILOT_LOG_DIR posé APRÈS le source est honoré" \
+    "/tmp/mika2165-late-override" "$(_mika2165_late_override_probe)"
+
+_mika2165_default_probe() {
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        unset PILOT_LOG_DIR
+        _pilot_log_dir; printf '%s' "$_PILOT_LOG_DIR"
+    )
+}
+assert_eq "mika#2165: sans surcharge, le défaut opérationnel est rendu" \
+    "/var/log/claude-pilot" "$(_mika2165_default_probe)"
+
+# Le bind suit le résolveur, pas une copie. Un bind qui nommerait un autre
+# répertoire que celui passé à --log-dir serait vert partout et vide : le
+# pilote écrirait dans le tmpfs, exactement la panne d'origine.
+_mika2165_bind_probe() {
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        PILOT_LOG_DIR=$(mktemp -d "${TMPDIR:-/tmp}/mika2165-bind.XXXXXX")
+        _PILOT_LOG_BIND_ARGS=()
+        _pilot_log_bind_args 2>/dev/null
+        printf '%s' "${_PILOT_LOG_BIND_ARGS[*]}"
+        rm -rf "$PILOT_LOG_DIR"
+    )
+}
+MIKA2165_BIND_OUT=$(_mika2165_bind_probe)
+assert_contains "mika#2165: le bind est rw (--bind, pas --ro-bind)" \
+    "--bind " "$MIKA2165_BIND_OUT"
+assert_eq "mika#2165: le bind nomme le répertoire du résolveur, source == cible" "yes" \
+    "$(set -- $MIKA2165_BIND_OUT; if [ "${2:-}" = "${3:-x}" ] && [ -n "${2:-}" ]; then printf 'yes'; else printf 'no'; fi)"
+assert_eq "mika#2165: le bind ne s'élargit pas à /var/log" "no" \
+    "$(set -- $MIKA2165_BIND_OUT; if [ "${2:-}" = "/var/log" ]; then printf 'yes'; else printf 'no'; fi)"
+
+# Le repli est une liste VIDE, jamais un bind rigide : `--bind` dont la source
+# manque fait échouer bwrap en entier. Le défaut d'aujourd'hui perd un journal ;
+# un bind rigide perdrait la session.
+_mika2165_unwritable_probe() {
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        PILOT_LOG_DIR="/proc/mika2165-cannot-exist"
+        _PILOT_LOG_BIND_ARGS=(sentinel)
+        _pilot_log_bind_args 2>/dev/null
+        printf '%s' "${_PILOT_LOG_BIND_ARGS[*]}"
+    )
+}
+assert_eq "mika#2165: un répertoire impossible laisse la liste vide (bwrap survit)" \
+    "" "$(_mika2165_unwritable_probe)"
+assert_contains "mika#2165: et le repli est bruyant — la moitié hôte d'AC3" \
+    "pilot_log_guard." "$(
+        (
+            # shellcheck disable=SC1090
+            source "$DISPATCH_LIB" 2>/dev/null || true
+            PILOT_LOG_DIR="/proc/mika2165-cannot-exist"
+            _PILOT_LOG_BIND_ARGS=()
+            _pilot_log_bind_args 2>&1 >/dev/null
+        )
+    )"
 
 # --- Summary ---
 

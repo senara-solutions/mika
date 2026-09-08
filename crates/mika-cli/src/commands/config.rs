@@ -348,6 +348,19 @@ fn resolve_source(
     agent_home: &Path,
     global_home: &Path,
 ) -> String {
+    // mika#2218 — when the agent has a home of its own, its `.env` is the
+    // HIGHEST-priority source and outranks the process env, so it must be
+    // checked first. Reporting "env var" for a value the agent actually reads
+    // from its own `.env` would mislead exactly the operator debugging an
+    // identity mismatch — which is the surface mika#2218 was diagnosed on.
+    // See `Settings::load_for_agent` for the cascade.
+    if agent_home != global_home
+        && let Some(env_var) = info.env_var
+        && env_key_exists(&agent_home.join(".env"), env_var)
+    {
+        return "agent .env".to_string();
+    }
+
     // Check env var override (highest priority for File/Env backend keys)
     if let Some(env_var) = info.env_var
         && std::env::var(env_var).is_ok()
