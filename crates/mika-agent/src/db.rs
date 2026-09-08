@@ -5380,6 +5380,91 @@ impl Database {
         Ok(n)
     }
 
+    /// Finished dispatches that were asked for a pilot transcript and have not
+    /// yet been reported as having produced none (mika#2040 AC7).
+    ///
+    /// # What selects a row, and what deliberately does not
+    ///
+    /// The premise "this dispatch was supposed to produce a transcript" is read
+    /// from the producer's own stamp
+    /// ([`PILOT_TRANSCRIPT_EXPECTED_KEY`]), never reconstructed from the skill
+    /// name plus the current value of `MIKA_LOG_PILOT_TRANSCRIPTS` — that gate
+    /// is read per dispatch and can flip in between, which would make the
+    /// detector report dispatches nobody asked a transcript of and stay silent
+    /// on the ones that were asked. For the same reason there is **no**
+    /// `trigger_type = 'callback'` clause: the stamp is the discriminant, and a
+    /// narrower filter would silently drop a stamped dispatch that a later
+    /// caller spawns from somewhere else.
+    ///
+    /// The finished boundary is `status NOT IN ('pending','in_progress')` —
+    /// byte-for-byte the guard [`crate::task_engine::engine`]'s ingestion uses
+    /// before it dares read a file. The two must agree: a detector that
+    /// considered a dispatch finished earlier than the ingestion does would
+    /// report a transcript that was merely still being written.
+    ///
+    /// # Why `json_valid` wraps every extraction
+    ///
+    /// SQLite's `json_extract` raises a hard "malformed JSON" error — not NULL
+    /// — on a `metadata` that is not JSON, and that error propagates out of the
+    /// whole `query_map`. Unguarded, ONE task with corrupt metadata would blind
+    /// the detector for every other dispatch, for ever — which is the exact
+    /// failure class mika#2040 exists to end. Wrapped, the corrupt row degrades
+    /// to NULL and drops out of the result; only that dispatch stops being
+    /// watched. Same reasoning, same shape as
+    /// [`Self::get_reaper_child_snapshot`].
+    pub fn find_dispatches_expecting_transcripts(
+        &self,
+        agent_id: &str,
+        grace_seconds: i64,
+    ) -> Result<Vec<DispatchExpectingTranscript>> {
+        let expected_path_json = format!(
+            "$.{}",
+            crate::task_engine::engine::PILOT_TRANSCRIPT_EXPECTED_KEY
+        );
+        let reported_path_json = format!(
+            "$.{}",
+            crate::task_engine::engine::PILOT_TRANSCRIPT_REPORTED_KEY
+        );
+        let grace_modifier = format!("-{grace_seconds} seconds");
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id,
+                    CASE WHEN json_valid(metadata)
+                         THEN json_extract(metadata, ?2)
+                    END AS expected_path,
+                    status,
+                    updated_at
+             FROM tasks
+             WHERE agent_id = ?1
+               AND status NOT IN ('pending', 'in_progress')
+               AND updated_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?4)
+               AND expected_path IS NOT NULL
+               AND (CASE WHEN json_valid(metadata)
+                         THEN json_extract(metadata, ?3)
+                    END) IS NULL
+             ORDER BY updated_at, id",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    agent_id,
+                    expected_path_json,
+                    reported_path_json,
+                    grace_modifier
+                ],
+                |row| {
+                    Ok(DispatchExpectingTranscript {
+                        task_id: row.get(0)?,
+                        expected_path: row.get(1)?,
+                        status: row.get(2)?,
+                        updated_at: row.get(3)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// v46→v47: team_runs delegation-visibility (mika#1676).
     ///
     /// Two coupled schema changes, one atomic table-rebuild:
