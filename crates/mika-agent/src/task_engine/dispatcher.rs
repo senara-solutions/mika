@@ -111,6 +111,32 @@ async fn resolve_periodic_scan_token(
     resolved
 }
 
+/// Résout le token des écritures de label d'un scan périodique (mika#2228).
+///
+/// App-first, contrairement à [`resolve_periodic_scan_token`] : poser un label
+/// n'est pas une opération dont GitHub lit l'auteur, et le PAT résolu du spirit
+/// authentifie sans porter `issues: write` (34 refus mesurés le 2026-09-07).
+/// Le WARN émis quand rien ne se résout porte le même nom d'événement que le
+/// token identitaire suffixé, pour que l'opérateur distingue les deux absences.
+async fn resolve_periodic_scan_label_token(
+    settings: &Settings,
+    github_app: Option<&mika_common::github_app::GitHubApp>,
+    task_id: &str,
+    scan: PeriodicScan,
+) -> Option<mika_common::label_write::LabelWriteToken> {
+    let resolved = settings.resolve_label_write_token(github_app).await;
+    if resolved.is_none() {
+        warn!(
+            task_id = %task_id,
+            event = scan.no_token_event(),
+            scope = "label_write",
+            "scan inactif : aucun token d'écriture de label résolu (App indisponible ET PAT absent) ; {}",
+            scan.idle_consequence()
+        );
+    }
+    resolved
+}
+
 /// `metadata.$.delivery_attempts` — consecutive failed delivery attempts on a
 /// callback (mika#2179). Reset by nothing: a delivery that succeeds ends the
 /// row's life as an undelivered callback, so there is no state to clear.
@@ -1140,6 +1166,18 @@ impl TaskDispatcher {
             Some(t) => t,
             None => return Ok(()),
         };
+        // Écritures de label : identité App, résolue à part (mika#2228).
+        let label_auth = match resolve_periodic_scan_label_token(
+            &self.settings,
+            self.github_app.as_deref(),
+            &task.id,
+            PeriodicScan::AutoPull,
+        )
+        .await
+        {
+            Some(t) => t,
+            None => return Ok(()),
+        };
 
         let trace_id = mika_common::trace::generate_trace_id();
         let session_id = format!("auto-pull-{}", uuid::Uuid::new_v4());
@@ -1153,6 +1191,7 @@ impl TaskDispatcher {
         let result = crate::auto_pull::auto_pull_groomed_ticket(
             &self.db,
             github_token,
+            &label_auth,
             &trace_id,
             &session_id,
         )
@@ -1203,6 +1242,18 @@ impl TaskDispatcher {
             Some(t) => t,
             None => return Ok(()),
         };
+        // Écritures de label : identité App, résolue à part (mika#2228).
+        let label_auth = match resolve_periodic_scan_label_token(
+            &self.settings,
+            self.github_app.as_deref(),
+            &task.id,
+            PeriodicScan::WipRescue,
+        )
+        .await
+        {
+            Some(t) => t,
+            None => return Ok(()),
+        };
 
         let trace_id = mika_common::trace::generate_trace_id();
         let session_id = format!("wip-rescue-{}", uuid::Uuid::new_v4());
@@ -1216,6 +1267,7 @@ impl TaskDispatcher {
         let result = crate::wip_rescue::auto_resume_wip_rescue_drafts(
             &self.db,
             github_token,
+            &label_auth,
             &trace_id,
             &session_id,
         )

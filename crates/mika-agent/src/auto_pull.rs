@@ -67,6 +67,7 @@
 //! [`measure_branch_staleness`]).
 
 use anyhow::{Result, anyhow};
+use mika_common::label_write::LabelWriteToken;
 use regex::Regex;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -1560,7 +1561,18 @@ async fn gh_list_open_pr_closing_issues(github_token: &str) -> Result<HashSet<u6
 }
 
 /// Apply a label to a GitHub issue.
-async fn gh_apply_label(github_token: &str, issue_number: u64, label: &str) -> Result<()> {
+///
+/// Prend un [`LabelWriteToken`] et non un `&str` (mika#2228). Le type est le
+/// gardien : les deux tokens de ce module sont des chaînes de la même forme et
+/// se passent au même `GH_TOKEN`, donc rien qu'un `&str` n'aurait empêché un
+/// futur appelant de rendre à cette fonction le token de lecture — celui-là
+/// même dont on a mesuré, 34 fois le 2026-09-07, qu'il authentifie sans
+/// autoriser. On ne peut plus l'appeler avec le mauvais token par inattention.
+async fn gh_apply_label(
+    label_auth: &LabelWriteToken,
+    issue_number: u64,
+    label: &str,
+) -> Result<()> {
     let mut cmd = tokio::process::Command::new("gh");
     cmd.args([
         "issue",
@@ -1571,7 +1583,7 @@ async fn gh_apply_label(github_token: &str, issue_number: u64, label: &str) -> R
         "--add-label",
         label,
     ]);
-    cmd.env("GH_TOKEN", github_token);
+    cmd.env("GH_TOKEN", label_auth.token());
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -1580,6 +1592,10 @@ async fn gh_apply_label(github_token: &str, issue_number: u64, label: &str) -> R
     let output = cmd.output().await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // AC5 : un refus de permission sous identité App a son propre nom, ici
+        // et nulle part ailleurs — l'appelant continue de journaliser l'échec
+        // sous le sien, avec sa propre gravité.
+        label_auth.report_write_failure("auto_pull", issue_number, label, &stderr);
         return Err(anyhow!(
             "gh issue edit --add-label failed for #{}: {}",
             issue_number,
@@ -1594,7 +1610,11 @@ async fn gh_apply_label(github_token: &str, issue_number: u64, label: &str) -> R
 /// client-side, so removing an absent label is a no-op that exits 0 — the
 /// operation is idempotent. On the off chance a "not found" surfaces, it is
 /// tolerated as success.
-async fn gh_remove_label(github_token: &str, issue_number: u64, label: &str) -> Result<()> {
+async fn gh_remove_label(
+    label_auth: &LabelWriteToken,
+    issue_number: u64,
+    label: &str,
+) -> Result<()> {
     let mut cmd = tokio::process::Command::new("gh");
     cmd.args([
         "issue",
@@ -1605,7 +1625,7 @@ async fn gh_remove_label(github_token: &str, issue_number: u64, label: &str) -> 
         "--remove-label",
         label,
     ]);
-    cmd.env("GH_TOKEN", github_token);
+    cmd.env("GH_TOKEN", label_auth.token());
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -1622,6 +1642,7 @@ async fn gh_remove_label(github_token: &str, issue_number: u64, label: &str) -> 
             );
             return Ok(());
         }
+        label_auth.report_write_failure("auto_pull", issue_number, label, &stderr);
         return Err(anyhow!(
             "gh issue edit --remove-label failed for #{}: {}",
             issue_number,
@@ -1731,9 +1752,11 @@ async fn gh_compare_branch(github_token: &str, branch: &str) -> StalenessMeasure
 ///
 /// A refusal costs one label and one comment. A promotion that should not have
 /// happened costs a dispatch, and on 2026-08-31 seven of them died in a row.
+#[allow(clippy::too_many_arguments)]
 async fn promotion_gate_allows(
     db: &AsyncDatabase,
     github_token: &str,
+    label_auth: &LabelWriteToken,
     issue: &Issue,
     phase: &str,
     trace_id: &str,
@@ -1788,6 +1811,7 @@ async fn promotion_gate_allows(
             refuse_promotion(
                 db,
                 github_token,
+                label_auth,
                 issue.number,
                 reason,
                 phase,
@@ -1816,10 +1840,16 @@ async fn promotion_gate_allows(
 /// `ready` is removed for the Phase 2 case, where the ticket already carries it.
 /// [`gh_remove_label`] is idempotent, so the Phase 0/1 case where it was never
 /// applied is a no-op that exits 0.
+/// `github_token` sert au **commentaire** (identité de lecture, inchangée) ;
+/// `label_auth` aux deux écritures de label. La séparation est celle du plan
+/// mika#2228 : l'évidence mesurée est `addLabelsToLabelable` seul, `createComment`
+/// relève d'un scope distinct et n'a jamais été observé en échec. L'élargir sans
+/// évidence serait deviner.
 #[allow(clippy::too_many_arguments)]
 async fn refuse_promotion(
     db: &AsyncDatabase,
     github_token: &str,
+    label_auth: &LabelWriteToken,
     issue_number: u64,
     reason: RefusalReason,
     phase: &str,
@@ -1838,7 +1868,7 @@ async fn refuse_promotion(
     // human. So this branch escalates to ERROR under its own event key, writes
     // its own audit row, and posts no comment — with no marker to back it, a
     // comment would repeat on every tick and become the second kind of noise.
-    if let Err(e) = gh_apply_label(github_token, issue_number, REFUSAL_LABEL).await {
+    if let Err(e) = gh_apply_label(label_auth, issue_number, REFUSAL_LABEL).await {
         error!(
             error = %e,
             issue = issue_number,
@@ -1874,7 +1904,7 @@ async fn refuse_promotion(
     // Past this point the ticket is excluded from every phase
     // ([`is_feeder_excluded`] knows `REFUSAL_LABEL`), so a failure below
     // degrades the refusal's reach, never its effect.
-    if let Err(e) = gh_remove_label(github_token, issue_number, "ready").await {
+    if let Err(e) = gh_remove_label(label_auth, issue_number, "ready").await {
         warn!(error = %e, issue = issue_number, "auto_pull: promotion refusal could not remove ready label");
     }
 
@@ -2008,9 +2038,12 @@ impl AbandonReason {
 /// the loop; everything after it is visibility layered on top of an arrest
 /// already secured. A failure to comment degrades the refusal's reach, not its
 /// effect.
+/// Même répartition que [`refuse_promotion`] : `label_auth` pour les labels,
+/// `github_token` pour le commentaire (mika#2228).
 async fn abandon_stuck_ready(
     db: &AsyncDatabase,
     github_token: &str,
+    label_auth: &LabelWriteToken,
     issue_number: u64,
     reason: AbandonReason,
     trace_id: &str,
@@ -2025,7 +2058,7 @@ async fn abandon_stuck_ready(
     // gesture, and the budget would reset — a fresh loop every N re-drives.
     // Aborting instead is convergent: the counter is still past the budget, so
     // the next tick simply retries the abandonment.
-    if let Err(e) = gh_apply_label(github_token, issue_number, "operator-review").await {
+    if let Err(e) = gh_apply_label(label_auth, issue_number, "operator-review").await {
         warn!(error = %e, issue = issue_number, "auto_pull: abandon could not apply operator-review label; leaving ticket untouched for the next tick");
         if let Err(e2) = db
             .increment_auto_pull_failure(DEFAULT_REPO, issue_number)
@@ -2038,7 +2071,7 @@ async fn abandon_stuck_ready(
 
     // Past this point the ticket is already excluded from every phase, so a
     // failure below degrades the refusal's reach, never its effect.
-    if let Err(e) = gh_remove_label(github_token, issue_number, "ready").await {
+    if let Err(e) = gh_remove_label(label_auth, issue_number, "ready").await {
         warn!(error = %e, issue = issue_number, "auto_pull: abandon could not remove ready label");
     }
 
@@ -2157,9 +2190,18 @@ async fn gh_ready_label_age_secs(github_token: &str, issue_number: u64) -> Resul
 /// Returns `Some(issue_number)` if Phase 1 promoted a ticket, `None` otherwise.
 /// The Phase 2 rescue count is logged but not returned (the dispatcher log at
 /// `dispatcher.rs` keys off the Phase 1 promotion).
+///
+/// # Deux tokens, deux classes d'opération (mika#2228)
+///
+/// `github_token` est le token identitaire résolu PAT-first (mika#2205) : il
+/// sert aux lectures et aux commentaires. `label_auth` est résolu App-first et
+/// sert **uniquement** aux écritures de label, parce que le PAT résolu du spirit
+/// authentifie sans porter `issues: write` — 34 `--add-label` refusés le
+/// 2026-09-07, sur trois chemins de ce module.
 pub async fn auto_pull_groomed_ticket(
     db: &AsyncDatabase,
     github_token: &str,
+    label_auth: &LabelWriteToken,
     trace_id: &str,
     session_id: &str,
 ) -> Option<u64> {
@@ -2189,6 +2231,7 @@ pub async fn auto_pull_groomed_ticket(
     let fed = phase0_feed_ready_pool(
         db,
         github_token,
+        label_auth,
         &issues,
         &open_pr_issue_numbers,
         trace_id,
@@ -2208,6 +2251,7 @@ pub async fn auto_pull_groomed_ticket(
     let promoted = phase1_promote_groomed(
         db,
         github_token,
+        label_auth,
         &issues,
         &open_pr_issue_numbers,
         trace_id,
@@ -2219,6 +2263,7 @@ pub async fn auto_pull_groomed_ticket(
     let rescued = phase2_reconcile_stuck_ready(
         db,
         github_token,
+        label_auth,
         &issues,
         &open_pr_issue_numbers,
         trace_id,
@@ -2246,9 +2291,11 @@ pub async fn auto_pull_groomed_ticket(
 /// pool already meets the threshold, `auto_feeder_no_backlog` when the pool is
 /// under threshold but no dispatchable backlog exists (true starvation signal),
 /// and `auto_feeder_promoted` per successful apply.
+#[allow(clippy::too_many_arguments)]
 async fn phase0_feed_ready_pool(
     db: &AsyncDatabase,
     github_token: &str,
+    label_auth: &LabelWriteToken,
     issues: &[Issue],
     open_pr_issue_numbers: &HashSet<u64>,
     trace_id: &str,
@@ -2398,6 +2445,7 @@ async fn phase0_feed_ready_pool(
                 if !promotion_gate_allows(
                     db,
                     github_token,
+                    label_auth,
                     issue,
                     "phase0_feeder",
                     trace_id,
@@ -2414,7 +2462,7 @@ async fn phase0_feed_ready_pool(
             ),
         }
 
-        if let Err(e) = gh_apply_label(github_token, n, "ready").await {
+        if let Err(e) = gh_apply_label(label_auth, n, "ready").await {
             warn!(error = %e, issue = n, "auto_feeder: failed to apply ready label");
             if let Err(e2) = db.increment_auto_pull_failure(DEFAULT_REPO, n).await {
                 warn!(error = %e2, "auto_feeder: failed to increment failure counter");
@@ -2458,9 +2506,11 @@ async fn phase0_feed_ready_pool(
 /// queue-empty early-return — Phase 1 only fires when mika-dev's dispatch queue
 /// is idle. Now receives the shared issue list and open-PR set (D5) instead of
 /// fetching them itself.
+#[allow(clippy::too_many_arguments)]
 async fn phase1_promote_groomed(
     db: &AsyncDatabase,
     github_token: &str,
+    label_auth: &LabelWriteToken,
     issues: &[Issue],
     open_pr_issue_numbers: &HashSet<u64>,
     trace_id: &str,
@@ -2546,6 +2596,7 @@ async fn phase1_promote_groomed(
     if !promotion_gate_allows(
         db,
         github_token,
+        label_auth,
         &candidate,
         "phase1_idle_pull",
         trace_id,
@@ -2557,7 +2608,7 @@ async fn phase1_promote_groomed(
     }
 
     // 5. Apply the `ready` label to trigger webhook-driven dispatch.
-    if let Err(e) = gh_apply_label(github_token, candidate.number, "ready").await {
+    if let Err(e) = gh_apply_label(label_auth, candidate.number, "ready").await {
         warn!(
             error = %e,
             issue = candidate.number,
@@ -2625,9 +2676,11 @@ async fn phase1_promote_groomed(
 /// a `stuck_ready_reconcile_skipped` DEBUG with its reason. Survivors past the
 /// age threshold are remove→add rescued (capped at [`MAX_STUCK_RESCUE_PER_TICK`]),
 /// emitting `stuck_ready_reconciled` INFO on success. Returns the rescue count.
+#[allow(clippy::too_many_arguments)]
 async fn phase2_reconcile_stuck_ready(
     db: &AsyncDatabase,
     github_token: &str,
+    label_auth: &LabelWriteToken,
     issues: &[Issue],
     open_pr_issue_numbers: &HashSet<u64>,
     trace_id: &str,
@@ -2663,7 +2716,16 @@ async fn phase2_reconcile_stuck_ready(
                     debug!(issue = n, reason, "stuck_ready_reconcile_skipped");
                 }
                 StuckReadyVerdict::Abandon(reason) => {
-                    abandon_stuck_ready(db, github_token, n, reason, trace_id, session_id).await;
+                    abandon_stuck_ready(
+                        db,
+                        github_token,
+                        label_auth,
+                        n,
+                        reason,
+                        trace_id,
+                        session_id,
+                    )
+                    .await;
                 }
                 // `classify_stuck_ready_in_memory` yields only those two.
                 other => debug!(
@@ -2742,7 +2804,16 @@ async fn phase2_reconcile_stuck_ready(
                 survivors.push(n);
             }
             StuckReadyVerdict::Abandon(reason) => {
-                abandon_stuck_ready(db, github_token, n, reason, trace_id, session_id).await;
+                abandon_stuck_ready(
+                    db,
+                    github_token,
+                    label_auth,
+                    n,
+                    reason,
+                    trace_id,
+                    session_id,
+                )
+                .await;
             }
         }
     }
@@ -2840,6 +2911,7 @@ async fn phase2_reconcile_stuck_ready(
                 if !promotion_gate_allows(
                     db,
                     github_token,
+                    label_auth,
                     issue,
                     "phase2_stuck_rescue",
                     trace_id,
@@ -2856,14 +2928,14 @@ async fn phase2_reconcile_stuck_ready(
             ),
         }
 
-        if let Err(e) = gh_remove_label(github_token, n, "ready").await {
+        if let Err(e) = gh_remove_label(label_auth, n, "ready").await {
             warn!(error = %e, issue = n, "auto_pull: phase 2 remove ready label failed");
             if let Err(e2) = db.increment_auto_pull_failure(DEFAULT_REPO, n).await {
                 warn!(error = %e2, "auto_pull: failed to increment failure counter");
             }
             continue;
         }
-        if let Err(e) = gh_apply_label(github_token, n, "ready").await {
+        if let Err(e) = gh_apply_label(label_auth, n, "ready").await {
             warn!(error = %e, issue = n, "auto_pull: phase 2 re-add ready label failed");
             if let Err(e2) = db.increment_auto_pull_failure(DEFAULT_REPO, n).await {
                 warn!(error = %e2, "auto_pull: failed to increment failure counter");

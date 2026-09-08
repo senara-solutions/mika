@@ -8,6 +8,7 @@ pub mod embedding;
 pub mod github_app;
 pub mod github_event_format;
 pub mod home;
+pub mod label_write;
 pub mod llm;
 pub mod logging;
 pub mod mcp_config_path;
