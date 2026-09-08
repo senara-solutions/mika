@@ -1461,11 +1461,17 @@ impl Settings {
     /// configured (single-identity deployments, bootstrap, or agents that do
     /// not need a distinct machine user). Returns `None` if neither is
     /// available.
+    ///
+    /// Symétrique inverse de [`Settings::resolve_label_write_token`] : les deux
+    /// résolveurs existent parce que la priorité dépend de la classe
+    /// d'opération, pas de l'appelant. Toucher l'un sans lire l'autre est la
+    /// façon dont cette règle se perdra.
     pub async fn resolve_github_token(
         &self,
         github_app: Option<&crate::github_app::GitHubApp>,
     ) -> Option<String> {
-        // PAT first — the agent's machine user identity.
+        // PAT-first : opérations identitaires où GitHub expose l'auteur
+        // (approve, merge) — le PAT machine est l'identité que la forge lit.
         if let Some(pat) = self.github_token.as_ref() {
             return Some(pat.expose_secret().to_string());
         }
@@ -1483,6 +1489,70 @@ impl Settings {
                     );
                 }
             }
+        }
+        None
+    }
+
+    /// Résout le token des **écritures de label** — App d'abord (mika#2228).
+    ///
+    /// App-first : écritures non-identitaires (labels, status checks) où
+    /// l'origine est technique. GitHub enregistre qui a posé `ready`, mais
+    /// aucune règle de la forge ne lit cet auteur — contrairement à approve et
+    /// merge, qui gardent [`Settings::resolve_github_token`] (PAT-first) et ne
+    /// passent pas par ici.
+    ///
+    /// # Pourquoi l'inversion, et pas seulement le repli de mika#2205
+    ///
+    /// mika#2205 avait déjà rendu l'App acceptable **en repli** pour ces mêmes
+    /// scans. Le repli n'a jamais été atteint : le PAT résolu authentifie — les
+    /// scans tournent — mais n'a pas `issues: write`, donc chaque `--add-label`
+    /// meurt sur `Resource not accessible by personal access token
+    /// (addLabelsToLabelable)`. 34 refus mesurés le 2026-09-07 (29 sur le
+    /// marqueur `operator-gated`, 5 sur la promotion `ready` de l'auto-feeder),
+    /// pendant que le chemin App était sain. Un token qui authentifie et
+    /// n'autorise pas ne déclenche aucun repli : il faut inverser la priorité,
+    /// pas en ajouter un.
+    ///
+    /// # Échec de l'échange App
+    ///
+    /// Si l'échange App échoue (App absente du déploiement, réseau, clé
+    /// invalide), on retombe sur le PAT — c'est le comportement d'avant
+    /// mika#2228, et il est correct : sur un déploiement sans App, le PAT est
+    /// la seule identité disponible. Ce que ce chemin ne couvre **pas**, et ne
+    /// doit pas couvrir, c'est l'App présente dont l'installation n'a pas
+    /// `Issues: write` : là l'échange réussit, le token revient, et c'est
+    /// l'écriture qui est refusée — signalée par
+    /// [`crate::label_write::LabelWriteToken::report_write_failure`] sous son
+    /// propre nom, sans second essai au PAT qui échouerait de la même façon.
+    pub async fn resolve_label_write_token(
+        &self,
+        github_app: Option<&crate::github_app::GitHubApp>,
+    ) -> Option<crate::label_write::LabelWriteToken> {
+        use crate::label_write::{LabelWriteToken, LabelWriteTokenSource};
+
+        if let Some(app) = github_app {
+            match app.installation_token().await {
+                Ok(token) => {
+                    return Some(LabelWriteToken::new(token, LabelWriteTokenSource::App));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "mika::github_auth",
+                        event = "gh_app_token_exchange_failed",
+                        error = %e,
+                        has_pat_fallback = self.github_token.is_some(),
+                        scope = "label_write",
+                        "GitHub App token exchange failed for a label write"
+                    );
+                }
+            }
+        }
+
+        if let Some(pat) = self.github_token.as_ref() {
+            return Some(LabelWriteToken::new(
+                pat.expose_secret().to_string(),
+                LabelWriteTokenSource::Pat,
+            ));
         }
         None
     }
@@ -1963,18 +2033,26 @@ impl Settings {
 
     /// Load settings with multi-agent config cascade.
     ///
-    /// Config cascade (lowest to highest priority):
+    /// Two cascades, selected by whether the agent has a home of its own.
+    ///
+    /// **`global_home == agent_home`** (legacy single-agent layout, and
+    /// `Settings::load`), lowest to highest priority:
+    ///   1. Rust `Default` / serde defaults        (compiled-in)
+    ///   2. `{global_home}/config.toml`             (shared settings)
+    ///   3. `~/.mika/.env`                          (global secrets, loaded by caller into process env)
+    ///   4. MIKA_* env vars                         (highest priority — shell always wins)
+    ///
+    /// **`global_home != agent_home`** (every agent under the multi-agent
+    /// layout — the spirit daemon AND `mika --agent <name>`), lowest to highest:
     ///   1. Rust `Default` / serde defaults        (compiled-in)
     ///   2. `{global_home}/config.toml`             (shared settings)
     ///   3. `{agent_home}/config.toml`              (per-agent overrides)
-    ///   4. `~/.mika/agents/<name>/.env`             (per-agent secrets, parsed inline)
-    ///   5. `~/.mika/.env`                          (global secrets, loaded by caller into process env)
-    ///   6. MIKA_* env vars                         (highest priority — shell always wins)
+    ///   4. MIKA_* env vars                         (process env)
+    ///   5. `~/.mika/agents/<name>/.env`             (per-agent secrets — highest priority, mika#2218)
     ///
-    /// In CLI mode (single agent), the caller also loads per-agent `.env` into the
-    /// process environment before this method, so layers 4 and 5 are redundant but
-    /// harmless. In server mode (multiple agents), per-agent `.env` is NOT in the
-    /// process environment — layer 4 is the only path for per-agent secrets.
+    /// **That second cascade inverts the usual "process env beats file" order,
+    /// deliberately (mika#2218).** See the comment at the reorder point below for
+    /// the reasoning, the CLI consequence, and how to force a global override.
     ///
     /// `agent_home` is the resolved directory for the specific agent.
     /// `db_path` defaults to `{global_home}/data/mika.db` (single container DB).
@@ -1989,12 +2067,54 @@ impl Settings {
             builder = builder.add_source(File::from(agent_config).required(false));
         }
 
-        // Per-agent .env: parse without mutating process env, inject as config source.
-        // Priority: config files < per-agent .env < process env vars (shell always wins).
-        // In server mode, process env only has global .env values — this is the only
-        // path for per-agent secrets like MIKA_GITHUB_APP_*.
-        // Converted to inline TOML and added as a File source so that the process-env
-        // Environment source (added next) retains highest priority.
+        // Process env (`MIKA_*`). When the agent has no home of its own this is
+        // the last source and keeps the usual "shell always wins" semantics.
+        // When it does, the per-agent `.env` is added AFTER it — see below.
+        builder = builder.add_source(
+            Environment::with_prefix("MIKA")
+                .prefix_separator("_")
+                .separator("__"),
+        );
+
+        // Per-agent `.env`: parsed without mutating process env, injected as an
+        // inline-TOML config source. Added LAST, so it is the highest-priority
+        // source for every key it defines.
+        //
+        // **Convention forte, contre-intuitive, à ne pas "réparer" (mika#2218).**
+        // This inverts the standard file < process-env hierarchy. It is not an
+        // ordering bug:
+        //
+        //   - The per-agent `.env` IS the authority on what is proper to one
+        //     agent — its identity secrets above all (`MIKA_GITHUB_TOKEN`,
+        //     `MIKA_GITHUB_APP_*`, per-agent LLM keys). The process env carries
+        //     the *global* configuration and has no business shadowing a value
+        //     an agent explicitly set for itself.
+        //   - Until mika#2218 it did exactly that: the spirit daemon hosts the
+        //     family agents' turns, its env carried `MIKA_GITHUB_TOKEN` = the
+        //     operator account (which authors the loop's PRs), and that shadowed
+        //     mika-qa's own `mika-platform-qa` PAT. A hosted review turn
+        //     therefore signed as the PR's own author, and GitHub refused
+        //     `--approve` ("Can not approve your own pull request", 137 hits on
+        //     2026-09-07). Repointing that one key would have left the same
+        //     class of bug open on every other identity key.
+        //
+        // **Consequence on the CLI, named rather than discovered.** The
+        // discriminant is `global_home != agent_home`, NOT daemon-versus-CLI:
+        // under the multi-agent layout `mika --agent <name>` takes this branch
+        // too. So a one-shot `MIKA_FOO=v mika --agent qa …` no longer overrides
+        // a `MIKA_FOO` that agent's `.env` defines. The blast radius is small —
+        // `main.rs` already loads the per-agent `.env` into the process env
+        // before this call, so the two sources agree on every key the shell did
+        // not touch — but it is a real change, pinned by
+        // `mika2218_agent_scoped_cli_invocation_also_takes_the_inverted_cascade`.
+        //
+        // **To force a global setting onto an agent anyway:** edit that agent's
+        // `.env`, or use a key its `.env` does not define — a key absent from
+        // the file is not masked (config-rs merges key by key, and the source is
+        // only added when the file is non-empty, so an agent with no `.env` of
+        // its own inherits the process env unchanged).
+        //
+        // See `docs/plans/2026-09-07-003-fix-2218-qa-review-hosted-turn-agent-token-plan.md`.
         if global_home != agent_home {
             let dotenv_vars = crate::dotenv::parse_dotenv(agent_home);
             if !dotenv_vars.is_empty() {
@@ -2003,14 +2123,7 @@ impl Settings {
             }
         }
 
-        let mut settings: Settings = builder
-            .add_source(
-                Environment::with_prefix("MIKA")
-                    .prefix_separator("_")
-                    .separator("__"),
-            )
-            .build()?
-            .try_deserialize()?;
+        let mut settings: Settings = builder.build()?.try_deserialize()?;
 
         settings.home_dir = agent_home.to_path_buf();
 
@@ -2282,6 +2395,7 @@ impl std::fmt::Debug for Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::label_write::LabelWriteTokenSource;
     use serial_test::serial;
 
     /// Set required env vars and clear optional ones to ensure clean state.
@@ -2293,6 +2407,12 @@ mod tests {
             std::env::remove_var("MIKA_DISABLE_BUNDLED_SKILLS");
             std::env::remove_var("MIKA_KG_DOCS_ROOT");
             std::env::remove_var("MIKA_KG_DOCS_ROOTS");
+            // mika#2218 — clé identitaire posée par les tests de cascade. Elle
+            // est nettoyée ICI, et pas seulement en fin de test, parce qu'un
+            // test qui panique n'exécute pas son épilogue : sans ça, une
+            // assertion cassée ferait fuiter le token vers les tests `#[serial]`
+            // suivants, qui passeraient ou échoueraient pour la mauvaise raison.
+            std::env::remove_var("MIKA_GITHUB_TOKEN");
         }
     }
 
@@ -2420,6 +2540,228 @@ mod tests {
         assert_eq!(via_load.home_dir, via_load_for_agent.home_dir);
     }
 
+    // --- mika#2218 : quand l'agent a un home propre, son `.env` prime sur l'env process ---
+    //
+    // Les tours de review des agents famille s'exécutent **hébergés dans le
+    // process spirit**. L'env de ce process portait `MIKA_GITHUB_TOKEN` =
+    // l'identité opérateur (auteur des PR de la boucle) et **ombrait** le
+    // `MIKA_GITHUB_TOKEN` = `mika-platform-qa` du `.env` de mika-qa. Résultat :
+    // reviewer == auteur, et GitHub refuse `--approve` (137 hits le 2026-09-07).
+    //
+    // Ces cinq tests bordent les deux axes de l'inversion : ce qu'elle change
+    // (AC1, et sa conséquence sur `mika --agent`) et ce qu'elle NE change pas
+    // (les deux fallbacks d'AC2, et le cas `global_home == agent_home` d'AC3).
+    //
+    // Ils posent `MIKA_GITHUB_TOKEN` dans l'env process : `clean_env()` la
+    // retire, ce qui les isole même quand l'un d'eux panique avant son épilogue.
+
+    /// mika#2218 AC1 — avec un home d'agent distinct (`global_home != agent_home`),
+    /// le cas du daemon spirit, la valeur
+    /// du `.env` per-agent l'emporte sur celle de l'env process pour la même clé.
+    /// C'est exactement la collision de l'incident : env process = identité
+    /// auteur, `.env` per-agent = identité reviewer distincte.
+    #[test]
+    #[serial]
+    fn mika2218_per_agent_dotenv_wins_over_process_env_in_server_mode() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let global_home = tmp.path().join("global");
+        let agent_home = tmp.path().join("agent");
+        std::fs::create_dir_all(&global_home).unwrap();
+        std::fs::create_dir_all(&agent_home).unwrap();
+
+        // `.env` per-agent : l'identité machine propre à l'agent (ADR-008).
+        std::fs::write(
+            agent_home.join(".env"),
+            "MIKA_GITHUB_TOKEN=github_pat_agent_identity\n",
+        )
+        .unwrap();
+
+        // Env du process spirit : l'identité globale, qui ombrait la précédente.
+        // Safety: test-only env var, sérialisé par `#[serial]`.
+        unsafe { std::env::set_var("MIKA_GITHUB_TOKEN", "github_pat_process_identity") };
+
+        let settings = Settings::load_for_agent(&global_home, &agent_home).unwrap();
+
+        assert_eq!(
+            settings.agent_github_token(),
+            Some("github_pat_agent_identity"),
+            "en mode serveur le `.env` per-agent est autoritaire — l'env du process \
+             spirit ne doit pas ombrer une clé que l'agent a explicitement posée"
+        );
+
+        clean_env();
+    }
+
+    /// mika#2218 AC2 (fallback) — un agent **sans** `.env` per-agent continue
+    /// d'hériter de l'env process, inchangé. La source per-agent n'est ajoutée
+    /// que si le fichier existe et n'est pas vide, donc le reorder ne peut pas
+    /// régresser cette population.
+    #[test]
+    #[serial]
+    fn mika2218_absent_per_agent_dotenv_falls_back_to_process_env() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let global_home = tmp.path().join("global");
+        let agent_home = tmp.path().join("agent");
+        std::fs::create_dir_all(&global_home).unwrap();
+        std::fs::create_dir_all(&agent_home).unwrap();
+        // Volontairement : aucun `.env` dans agent_home.
+
+        // Safety: test-only env var, sérialisé par `#[serial]`.
+        unsafe { std::env::set_var("MIKA_GITHUB_TOKEN", "github_pat_process_identity") };
+
+        let settings = Settings::load_for_agent(&global_home, &agent_home).unwrap();
+
+        assert_eq!(
+            settings.agent_github_token(),
+            Some("github_pat_process_identity"),
+            "sans `.env` per-agent, la valeur de l'env process doit être conservée"
+        );
+
+        clean_env();
+    }
+
+    /// mika#2218 AC2 (fallback, cas fin) — un `.env` per-agent non vide qui ne
+    /// définit **pas** la clé ne doit pas la masquer : `config-rs` fusionne clé
+    /// par clé, il ne remplace pas la source précédente en bloc. Ce cas est plus
+    /// dangereux que le `.env` absent (la source EST ajoutée après l'env process)
+    /// et mérite donc son propre verrou.
+    #[test]
+    #[serial]
+    fn mika2218_per_agent_dotenv_without_the_key_does_not_mask_process_env() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let global_home = tmp.path().join("global");
+        let agent_home = tmp.path().join("agent");
+        std::fs::create_dir_all(&global_home).unwrap();
+        std::fs::create_dir_all(&agent_home).unwrap();
+
+        // `.env` per-agent non vide, mais muet sur `MIKA_GITHUB_TOKEN`.
+        std::fs::write(agent_home.join(".env"), "MIKA_BRAVE_API_KEY=BSA-agent\n").unwrap();
+
+        // Safety: test-only env var, sérialisé par `#[serial]`.
+        unsafe { std::env::set_var("MIKA_GITHUB_TOKEN", "github_pat_process_identity") };
+
+        let settings = Settings::load_for_agent(&global_home, &agent_home).unwrap();
+
+        assert_eq!(
+            settings.agent_github_token(),
+            Some("github_pat_process_identity"),
+            "une clé absente du `.env` per-agent garde la valeur de l'env process"
+        );
+        assert_eq!(
+            settings.brave_api_key.as_ref().map(|s| s.expose_secret()),
+            Some("BSA-agent"),
+            "et la clé que le `.env` per-agent définit, elle, est bien chargée"
+        );
+
+        clean_env();
+    }
+
+    /// mika#2218 — la conséquence CLI, verrouillée pour être **lue**, pas
+    /// découverte. Le discriminant du reorder est `global_home != agent_home`,
+    /// pas « daemon vs CLI » : sous le layout multi-agent, `resolve_agent_home`
+    /// rend un sous-dossier, donc `mika --agent <name>` prend LA MÊME cascade
+    /// inversée que le spirit. Une surcharge shell ponctuelle ne l'emporte donc
+    /// plus sur une clé que le `.env` de cet agent définit.
+    ///
+    /// Portée réelle atténuée : `main.rs` charge déjà le `.env` per-agent dans
+    /// l'env process avant l'appel (et `dotenvy` n'écrase pas), donc les deux
+    /// sources s'accordent sur toute clé que le shell n'a pas touchée. L'écart
+    /// n'existe que pour une clé surchargée depuis le shell ET présente dans le
+    /// `.env` de l'agent. Remède : éditer ce `.env`.
+    ///
+    /// Si ce test casse, ce n'est pas le test qu'il faut réparer — c'est une
+    /// décision à reprendre (le plan de #2218 croyait le CLI hors périmètre).
+    #[test]
+    #[serial]
+    fn mika2218_agent_scoped_cli_invocation_also_takes_the_inverted_cascade() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let global_home = tmp.path().join("global");
+        // Le chemin qu'un `mika --agent qa` obtient sous le layout multi-agent.
+        let agent_home = global_home.join("agents").join("qa");
+        std::fs::create_dir_all(&global_home).unwrap();
+        std::fs::create_dir_all(&agent_home).unwrap();
+
+        std::fs::write(
+            agent_home.join(".env"),
+            "MIKA_GITHUB_TOKEN=github_pat_from_agent_dotenv\n",
+        )
+        .unwrap();
+
+        // L'opérateur surcharge depuis son shell : `MIKA_GITHUB_TOKEN=… mika --agent qa …`
+        // Safety: test-only env var, sérialisé par `#[serial]`.
+        unsafe { std::env::set_var("MIKA_GITHUB_TOKEN", "github_pat_from_shell") };
+
+        let settings = Settings::load_for_agent(&global_home, &agent_home).unwrap();
+
+        assert_eq!(
+            settings.agent_github_token(),
+            Some("github_pat_from_agent_dotenv"),
+            "sous le layout multi-agent, une invocation CLI `--agent` prend la \
+             cascade inversée elle aussi — conséquence assumée et documentée de \
+             mika#2218, pas un effet de bord non vu"
+        );
+
+        clean_env();
+    }
+
+    /// mika#2218 AC3 — quand l'agent n'a pas de home propre
+    /// (`global_home == agent_home` : layout legacy mono-agent, et tout appel
+    /// via `Settings::load`), la branche per-agent ne s'exécute pas et le
+    /// comportement « shell-override gagne » reste intact, à l'octet près.
+    ///
+    /// Le test reproduit la séquence réelle de ce mode et pas seulement la
+    /// condition de branche : le shell pose la variable, PUIS `load_dotenv`
+    /// charge le `.env` (comme `mika-cli::main`), et `dotenvy` n'écrase pas ce
+    /// que le shell a posé. Sans cet appel le fichier ne serait jamais lu sur ce
+    /// chemin — l'assertion passerait à l'identique en son absence et
+    /// n'attesterait aucune précédence.
+    #[test]
+    #[serial]
+    fn mika2218_cli_mode_keeps_process_env_priority() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".env"),
+            "MIKA_GITHUB_TOKEN=github_pat_from_file\n",
+        )
+        .unwrap();
+
+        // L'ordre est celui du réel : le shell précède le lancement du process.
+        // Safety: test-only env var, sérialisé par `#[serial]`.
+        unsafe { std::env::set_var("MIKA_GITHUB_TOKEN", "github_pat_from_shell") };
+        crate::dotenv::load_dotenv(tmp.path());
+
+        // Garde-fou : si `load_dotenv` venait à écraser la valeur du shell, ce
+        // test perdrait son objet en silence.
+        assert_eq!(
+            std::env::var("MIKA_GITHUB_TOKEN").ok().as_deref(),
+            Some("github_pat_from_shell"),
+            "dotenvy ne doit pas écraser une variable déjà posée par le shell"
+        );
+
+        let settings = Settings::load_for_agent(tmp.path(), tmp.path()).unwrap();
+
+        assert_eq!(
+            settings.agent_github_token(),
+            Some("github_pat_from_shell"),
+            "sans home d'agent distinct, la branche per-agent ne s'exécute pas et \
+             la surcharge shell continue de gagner — noter que ce n'est PAS « le \
+             CLI » : `mika --agent <name>` sous le layout multi-agent a bien un \
+             home distinct et prend l'autre cascade"
+        );
+
+        clean_env();
+    }
+
     #[test]
     #[serial]
     fn test_disable_bundled_skills_from_env() {
@@ -2545,6 +2887,66 @@ mod tests {
 
         let resolved = settings.resolve_github_token(None).await;
         assert!(resolved.is_none());
+    }
+
+    // -- mika#2228 : écritures de label, App d'abord --
+
+    #[tokio::test]
+    #[serial]
+    async fn mika2228_label_write_prefers_the_app_token_over_the_pat() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut settings = Settings::load(tmp.path()).unwrap();
+        // Le PAT est là — et c'est exactement la configuration mesurée le
+        // 2026-09-07 : présent, authentifiant, sans `issues: write`.
+        settings.github_token = Some("github_pat_test_value".to_string().into());
+
+        let app = crate::github_app::GitHubApp::new_with_test_token("ghs_app_installation").await;
+        let resolved = settings
+            .resolve_label_write_token(Some(app.as_ref()))
+            .await
+            .expect("un token doit être résolu quand PAT et App sont là");
+
+        assert_eq!(resolved.token(), "ghs_app_installation");
+        assert_eq!(resolved.source(), LabelWriteTokenSource::App);
+
+        // Et le résolveur identitaire, lui, ne bouge pas (AC4) : la même
+        // configuration continue de rendre le PAT pour approve/merge.
+        let identity = settings.resolve_github_token(Some(app.as_ref())).await;
+        assert_eq!(identity.as_deref(), Some("github_pat_test_value"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn mika2228_label_write_falls_back_to_the_pat_when_no_app_is_configured() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut settings = Settings::load(tmp.path()).unwrap();
+        settings.github_token = Some("github_pat_test_value".to_string().into());
+
+        // App absente : déploiement mono-identité, bootstrap. Le comportement
+        // d'avant mika#2228 doit être préservé tel quel (AC2).
+        let resolved = settings
+            .resolve_label_write_token(None)
+            .await
+            .expect("le PAT doit servir de repli quand l'App est absente");
+
+        assert_eq!(resolved.token(), "github_pat_test_value");
+        assert_eq!(resolved.source(), LabelWriteTokenSource::Pat);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn mika2228_label_write_returns_none_when_nothing_is_configured() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+        assert!(settings.github_token.is_none());
+
+        assert!(settings.resolve_label_write_token(None).await.is_none());
     }
 
     #[test]

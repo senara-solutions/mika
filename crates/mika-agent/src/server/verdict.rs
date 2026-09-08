@@ -158,6 +158,79 @@ fn alias_to_verdict(normalized: &str) -> Option<Verdict> {
     }
 }
 
+/// Classify a normalized verdict value into a canonical `Verdict`.
+///
+/// The cascade is the mika#1821/#1828 pipeline, unchanged: exact canonical
+/// `pass` → `BLOCK_RE` → `HOLD_RE` → alias table. Returns `None` for values
+/// this cascade does not recognize.
+fn classify_value(value: &str) -> Option<Verdict> {
+    if value.eq_ignore_ascii_case("pass") {
+        return Some(Verdict::Pass);
+    }
+
+    if let Some(bcaps) = BLOCK_RE.captures(value) {
+        return Some(Verdict::Block(bcaps[1].to_string()));
+    }
+
+    if let Some(hcaps) = HOLD_RE.captures(value) {
+        return Some(Verdict::Hold(hcaps[1].to_string()));
+    }
+
+    // mika#1828 AC2: alias fallback. GitHub-review-state-adjacent tokens
+    // (`REQUEST CHANGES`, `REQUEST_CHANGES`, `CHANGES_REQUESTED`, `APPROVE`,
+    // `APPROVED`) map to canonical Verdicts. Runs after the exact
+    // canonical checks so a legitimate `block[ac]` is never rewritten.
+    let normalized = normalize_alias(value);
+    if let Some(mapped) = alias_to_verdict(&normalized) {
+        info!(
+            event = "verdict_alias_normalized",
+            raw_value = value,
+            normalized = normalized.as_str(),
+            mapped_to = ?mapped,
+            "verdict: normalized non-canonical alias to canonical verdict (mika#1828)"
+        );
+        return Some(mapped);
+    }
+
+    None
+}
+
+/// Retire un suffixe décoratif d'une valeur de verdict (mika#2239).
+///
+/// Les reviewers décorent : `pass ✅`, `block[ac] ❌`, `hold[review] ⏸️`. La décoration
+/// est toujours une queue de caractères non-alphanumériques.
+///
+/// L'ensemble d'exemption est DÉRIVÉ DE LA GRAMMAIRE, pas choisi : `]` est le seul
+/// caractère non-alphanumérique porteur de signal, parce qu'il termine les deux seules
+/// formes canoniques à bracket — `block[…]` (`BLOCK_RE`) et `hold[…]` (`HOLD_RE`), toutes
+/// deux ancrées `^…$`. Toute nouvelle forme de verdict à bracket DOIT étendre la regex ET
+/// cette exemption dans le même changement, sinon le retrait la mutile en silence.
+/// N'exemptez PAS `)`, `}`, `>` : aucune grammaire derrière, et exempter un caractère
+/// AFFAIBLIT le retrait (`pass 🎉)` s'arrêterait sur le `)` et resterait `Missing`).
+///
+/// Volontairement conservateur — la queue s'arrête au premier alphanumérique ASCII, donc
+/// un vrai commentaire de fin (`pass — but see findings`) n'est PAS avalé et continue de
+/// classer `Missing`. C'est la borne de mika#1821, inchangée.
+///
+/// La décoration de TÊTE (`VERDICT: ✅ pass`) est hors périmètre (mika#2239 D-D) : jamais
+/// mesurée. Sa condition de réveil est un `verdict_approved_but_unclassified` dont le
+/// champ `verdict_value` ne commence pas par un alphanumérique ASCII.
+fn strip_trailing_decoration(value: &str) -> &str {
+    value.trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != ']')
+}
+
+/// La valeur brute de la ligne `VERDICT:` si une telle ligne existe (mika#2239).
+///
+/// `None` ⇔ aucune ligne `VERDICT:` dans le corps. Sert à distinguer, côté handler,
+/// « pas de ligne » de « ligne présente, valeur non reconnue » — la distinction que
+/// `Verdict::Missing` ne porte pas, et dont l'absence a produit un diagnostic faux
+/// mesuré sur mika#2236.
+pub(crate) fn verdict_raw_value(body: &str) -> Option<String> {
+    VERDICT_RE
+        .captures(body)
+        .map(|caps| caps[1].trim().to_string())
+}
+
 /// Parse a verdict from a review body.
 pub(crate) fn parse_verdict(body: &str) -> Verdict {
     if let Some(caps) = VERDICT_RE.captures(body) {
@@ -177,32 +250,25 @@ pub(crate) fn parse_verdict(body: &str) -> Verdict {
             .unwrap_or(stripped_leading);
         let value = strip_md_emphasis(truncated_at_close.trim()).trim();
 
-        if value.eq_ignore_ascii_case("pass") {
-            return Verdict::Pass;
+        // Passe primaire — pipeline mika#1821/#1828 inchangé.
+        if let Some(v) = classify_value(value) {
+            return v;
         }
 
-        if let Some(bcaps) = BLOCK_RE.captures(value) {
-            return Verdict::Block(bcaps[1].to_string());
-        }
-
-        if let Some(hcaps) = HOLD_RE.captures(value) {
-            return Verdict::Hold(hcaps[1].to_string());
-        }
-
-        // mika#1828 AC2: alias fallback. GitHub-review-state-adjacent tokens
-        // (`REQUEST CHANGES`, `REQUEST_CHANGES`, `CHANGES_REQUESTED`, `APPROVE`,
-        // `APPROVED`) map to canonical Verdicts. Runs after the exact
-        // canonical checks so a legitimate `block[ac]` is never rewritten.
-        let normalized = normalize_alias(value);
-        if let Some(mapped) = alias_to_verdict(&normalized) {
+        // mika#2239 : repli décoration. Atteint uniquement quand la passe primaire a
+        // déjà échoué → aucune forme actuellement reconnue ne change de sens.
+        let undecorated = strip_trailing_decoration(value).trim_end();
+        if undecorated != value
+            && let Some(v) = classify_value(undecorated)
+        {
             info!(
-                event = "verdict_alias_normalized",
+                event = "verdict_decoration_stripped",
                 raw_value = value,
-                normalized = normalized.as_str(),
-                mapped_to = ?mapped,
-                "verdict: normalized non-canonical alias to canonical verdict (mika#1828)"
+                undecorated = undecorated,
+                mapped_to = ?v,
+                "verdict: suffixe décoratif retiré avant classification (mika#2239)"
             );
-            return mapped;
+            return v;
         }
 
         // Unrecognized verdict value
@@ -537,6 +603,107 @@ Please fix the pipeline issues.";
         assert_eq!(
             parse_verdict("VERDICT: **block[ac]"),
             Verdict::Block("ac".to_string())
+        );
+    }
+
+    // --- mika#2239: trailing-decoration tolerance -------------------------
+
+    #[test]
+    fn parse_verdict_emoji_suffix_pass() {
+        assert_eq!(parse_verdict("VERDICT: pass ✅"), Verdict::Pass);
+    }
+
+    #[test]
+    fn parse_verdict_emoji_suffix_block() {
+        assert_eq!(
+            parse_verdict("VERDICT: block[ac] ❌"),
+            Verdict::Block("ac".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_verdict_emoji_suffix_hold() {
+        assert_eq!(
+            parse_verdict("VERDICT: hold[review] ⏸️"),
+            Verdict::Hold("review".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_verdict_emoji_suffix_alias() {
+        assert_eq!(parse_verdict("VERDICT: approved ✅"), Verdict::Pass);
+    }
+
+    #[test]
+    fn parse_verdict_bold_plus_emoji() {
+        // Cumul mika#1828 (emphase) + mika#2239 (décoration).
+        assert_eq!(parse_verdict("**VERDICT: pass ✅**"), Verdict::Pass);
+    }
+
+    /// mika#2239 founding regression — the review-body shape `mika-platform-qa`
+    /// emitted on all four of its reviews of PR mika#2236 (three APPROVED at
+    /// 08:25:08Z / 08:47:25Z / 09:29:39Z, plus a COMMENTED at 08:03:23Z), each
+    /// classifying as `Missing` and so never arming the autonomous merge.
+    ///
+    /// The field shape (line 1 `VERDICT:`, then `DEPTH:`, then `REASON:`) is
+    /// the one measured on the PR and recorded in the ticket; the REASON prose
+    /// is illustrative — only the VERDICT line's decoration is under test.
+    #[test]
+    fn parse_verdict_field_shape_pr2236() {
+        let body = "VERDICT: pass ✅\n\
+                    DEPTH: code-level\n\
+                    REASON: all acceptance criteria satisfied, CI clean.";
+        assert_eq!(parse_verdict(body), Verdict::Pass);
+    }
+
+    #[test]
+    fn parse_verdict_trailing_comment_still_missing() {
+        // Un commentaire de fin n'est PAS une décoration — la queue s'arrête au
+        // premier alphanumérique ASCII. Borne mika#1821, inchangée.
+        assert_eq!(
+            parse_verdict("VERDICT: pass — but see findings below"),
+            Verdict::Missing { truncated: false }
+        );
+    }
+
+    #[test]
+    fn parse_verdict_unknown_token_with_emoji_still_missing() {
+        // Un jeton inconnu décoré reste inconnu.
+        assert_eq!(
+            parse_verdict("VERDICT: frobnicate ✅"),
+            Verdict::Missing { truncated: false }
+        );
+    }
+
+    #[test]
+    fn strip_trailing_decoration_edge_cases() {
+        assert_eq!(strip_trailing_decoration("pass ✅").trim_end(), "pass");
+        assert_eq!(
+            strip_trailing_decoration("block[ac] ❌").trim_end(),
+            "block[ac]"
+        );
+        assert_eq!(
+            strip_trailing_decoration("hold[review] ⏸️").trim_end(),
+            "hold[review]"
+        );
+        // No-ops — rien à retirer.
+        assert_eq!(strip_trailing_decoration("pass"), "pass");
+        // La garde `]` : le bracket fermant porte du signal, il ne part pas.
+        assert_eq!(strip_trailing_decoration("block[ac]"), "block[ac]");
+        assert_eq!(strip_trailing_decoration(""), "");
+    }
+
+    #[test]
+    fn verdict_raw_value_reports_the_line_when_present() {
+        assert_eq!(
+            verdict_raw_value("VERDICT: pass ✅\nDEPTH: code-level"),
+            Some("pass ✅".to_string())
+        );
+        // Aucune ligne VERDICT: → None. C'est la distinction que
+        // `Verdict::Missing` ne porte pas.
+        assert_eq!(
+            verdict_raw_value("No verdict line here, just comments."),
+            None
         );
     }
 

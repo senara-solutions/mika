@@ -67,9 +67,12 @@
 //! [`measure_branch_staleness`]).
 
 use anyhow::{Result, anyhow};
+use mika_common::label_write::LabelWriteToken;
 use regex::Regex;
-use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use crate::async_db::AsyncDatabase;
@@ -360,6 +363,75 @@ pub struct Issue {
 
 // ───────────────────── Grooming detection (F1) ─────────────────────
 
+/// Le marqueur de fence d'une ligne, s'il y en a un : `` ` `` ou `~` répété au
+/// moins trois fois, premier caractère non blanc de la ligne.
+///
+/// L'indentation est tolérée parce que GitHub la rend comme un bloc de code : un
+/// gabarit de callout cité en retrait est aussi cité qu'un autre.
+fn fence_marker(line: &str) -> Option<char> {
+    let trimmed = line.trim_start();
+    let c = trimmed.chars().next()?;
+    if c != '`' && c != '~' {
+        return None;
+    }
+    (trimmed.chars().take_while(|&x| x == c).count() >= 3).then_some(c)
+}
+
+/// Rend le corps privé de ses blocs clôturés (```` ``` ```` et `~~~`), pour que
+/// le gabarit d'un callout **cité** dans un ticket ne satisfasse pas le garde qui
+/// le lit (mika#2120, AC6).
+///
+/// L'ancrage en début de ligne ne suffit pas à lui seul : une ligne citée dans une
+/// fence commence elle aussi en colonne zéro. mika#2120 en est la démonstration —
+/// son corps cite verbatim le gabarit de l'étape 19 de `mika-groom-ticket.md`.
+/// Élargir un prédicat non ancré élargit sa surface de faux positif, et le coût
+/// d'un faux positif est un créneau de dispatch mort à `_find_issue_plan returned
+/// empty`, c'est-à-dire au pire endroit.
+///
+/// Une fence ouverte par ```` ``` ```` ne se ferme que sur ```` ``` ````, jamais
+/// sur `~~~`.
+///
+/// **Repli sur fence non fermée : ne rien retirer.** Un corps dont une fence n'est
+/// jamais refermée est ambigu, et les deux erreurs n'ont pas le même prix — un
+/// faux positif coûte un créneau, un faux négatif a coûté quinze heures de boucle
+/// (le relevé du 2026-08-31 qui a ouvert ce ticket). La doctrine citée par le
+/// ticket tranche dans le même sens : la *détection* doit être au moins aussi
+/// permissive que le consommateur, la *décision* reste stricte. Voir
+/// `docs/solutions/architecture-patterns/guard-parser-must-be-as-permissive-as-downstream-consumer-2026-08-29.md`.
+fn strip_fenced_blocks(body: &str) -> Cow<'_, str> {
+    let mut open: Option<char> = None;
+    let mut saw_fence = false;
+    for line in body.lines() {
+        match (open, fence_marker(line)) {
+            (None, Some(c)) => {
+                open = Some(c);
+                saw_fence = true;
+            }
+            (Some(c), Some(m)) if m == c => open = None,
+            _ => {}
+        }
+    }
+    // Aucune fence, ou une fence laissée ouverte : on rend le corps tel quel.
+    if !saw_fence || open.is_some() {
+        return Cow::Borrowed(body);
+    }
+
+    let mut out = String::with_capacity(body.len());
+    let mut open: Option<char> = None;
+    for line in body.lines() {
+        match (open, fence_marker(line)) {
+            (None, Some(c)) => open = Some(c),
+            (Some(c), Some(m)) if m == c => open = None,
+            (None, None) => {
+                out.push_str(line);
+                out.push('\n');
+            }
+            _ => {}
+        }
+    }
+    Cow::Owned(out)
+}
+
 /// Structural detection of a groomed issue body.
 ///
 /// Matches the canonical callout block emitted by the grooming pipeline:
@@ -368,6 +440,11 @@ pub struct Issue {
 /// > - **Plan:** `docs/plans/<file>.md` (committed on branch @ <sha>)
 /// > - **Grooming history:** <...> → second-pass (GROOMED) — session-id: <uuid>
 /// ```
+///
+/// La forme préfixée par le dépôt est acceptée au même titre que la forme nue —
+/// `> - **Plan:** \`mika/docs/plans/x.md\`` comme
+/// `> - **Plan:** \`docs/plans/x.md\``. Voir [`extract_plan_path`] pour ce que la
+/// permissivité couvre, et surtout pour ce qu'elle ne couvre pas.
 ///
 /// # Le marqueur de verdict n'est plus lu ici (mika#2158)
 ///
@@ -378,12 +455,34 @@ pub struct Issue {
 /// marqueur vit désormais dans [`crate::grooming_marker`], seule et unique ; une regex de
 /// marqueur de passe recréée ici fait échouer la garde structurelle de ce module.
 ///
-/// Les deux conditions `Branch`/`Plan` restent ici, délibérément : leur unification est le
-/// correctif de mika#2120, sous arbitrage opérateur.
+/// # Les trois prédicats sont ancrés, et lus hors des blocs de code (mika#2120)
+///
+/// Les conditions `Branch` et `Plan` étaient deux `contains` non ancrés, donc
+/// satisfaits par n'importe quelle occurrence dans le corps — bloc de code cité
+/// compris. Élargir un prédicat non ancré élargit aussi sa surface de faux
+/// positif : un ticket qui *cite* un corps de ticket réel satisferait les trois,
+/// et le dispatch mourrait plus loin, à `_find_issue_plan returned empty`, après
+/// avoir consommé un créneau. Les deux passent donc par les extracteurs ancrés
+/// ([`extract_branch_name`], [`extract_plan_path`]), et le corps est d'abord privé
+/// de ses blocs clôturés ([`strip_fenced_blocks`]).
+///
+/// # Ce que ce prédicat ne fait pas
+///
+/// Il répond de la **forme** du callout, jamais de l'appartenance du plan au
+/// ticket — c'est la question de [`plan_ownership`] (mika#2020), et les deux ne
+/// doivent pas être fondues.
+///
+/// Il n'est pas non plus le prédicat le plus étroit du dépôt, et cela reste vrai
+/// après mika#2120 : `executor::check_grooming_markers` se contente de la
+/// sous-chaîne `docs/plans/`, non ancrée. **Ne le resserrez pas pour « harmoniser »
+/// les deux** — ce sens-là de l'alignement recréerait le défaut symétrique de
+/// celui que ce ticket ferme. C'est le lecteur qui rejoint son écrivain, pas
+/// l'inverse.
 pub fn is_groomed(body: &str) -> bool {
-    crate::grooming_marker::has_groomed_verdict(body)
-        && body.contains("> - **Branch:** `")
-        && body.contains("> - **Plan:** `docs/plans/")
+    let readable = strip_fenced_blocks(body);
+    crate::grooming_marker::has_groomed_verdict(&readable)
+        && extract_branch_name(&readable).is_some()
+        && extract_plan_path(&readable).is_some()
 }
 
 // ───────────────────── Plan ownership (mika#2020) ─────────────────────
@@ -413,13 +512,56 @@ pub enum PlanOwnership {
 }
 
 /// Extract the plan path from a ticket's grooming callout, if it has one.
+///
+/// # Le segment de dépôt est optionnel (mika#2120)
+///
+/// Le callout existe en deux écritures : nue (`docs/plans/…`) et préfixée par le
+/// dépôt (`mika/docs/plans/…`, `mika-cloud/docs/plans/…`). La seconde est celle
+/// que `/mika-groom-ticket` étape 19 prescrivait, donc celle que le pipeline
+/// produit quand personne ne lui demande l'autre — huit récidives mesurées entre
+/// le 2026-09-01 et le 2026-09-03, contre zéro sur les cinq groomings où la
+/// consigne était écrite à la main dans le prompt. Un lecteur qui n'accepte
+/// qu'une écriture n'applique pas une règle : il en ignore une que son écrivain
+/// légitime produit. `dispatch-lib.sh` le sait déjà et le dit en toutes lettres à
+/// sa porte de dispatch (« The callout carries two historical shapes […] Try
+/// both »).
+///
+/// Le préfixe accepté est **n'importe quel segment de tête**, pas la constante
+/// `mika/` : le grooming écrit le préfixe du dépôt cible, ce que `mika-cloud#220`
+/// a établi.
+///
+/// La permissivité s'arrête là, et c'est le point d'AC2 — un prédicat élargi qui
+/// accepterait n'importe quel chemin n'aurait rien réparé, il aurait ouvert la
+/// porte :
+///
+/// - le premier caractère du segment ne peut pas être un point, ce qui exclut
+///   `../docs/plans/` et `./docs/plans/` ;
+/// - le littéral `docs/plans/` exclut `docs/brainstorms/` et `docs/solutions/` ;
+/// - un seul segment est autorisé, donc `a/b/docs/plans/` échoue.
+///
+/// L'ancrage `(?m)^` est conservé : c'est lui qui distingue le callout de la
+/// prose. Il ne suffit pas à distinguer le callout de sa **citation**, d'où le
+/// [`strip_fenced_blocks`] appliqué ici même.
+///
+/// Le retrait des fences est fait dans cette fonction, et pas seulement chez
+/// [`is_groomed`], parce que [`plan_ownership`] lit le même chemin pour décider
+/// d'un **abandon** de ticket (mika#2020) : élargir l'extraction sans élargir
+/// aussi ce qu'elle refuse de lire aurait ajouté à cette décision-là une surface
+/// de faux positif que ce ticket n'aurait pas eu à ouvrir. Sur un corps déjà
+/// nettoyé le second passage est gratuit — sans fence, la vue est empruntée.
+///
+/// [`extract_branch_name`] n'en fait **pas** autant, et c'est un choix noté
+/// plutôt qu'un oubli : mika#2120 n'élargit pas ce lecteur-là, et changer ce que
+/// la porte de promotion (mika#2123) lit comme branche n'est pas de ce ticket.
 fn extract_plan_path(body: &str) -> Option<String> {
     static PLAN_CALLOUT_RE: OnceLock<Regex> = OnceLock::new();
     let callout_re = PLAN_CALLOUT_RE.get_or_init(|| {
-        Regex::new(r"(?m)^> - \*\*Plan:\*\* `(docs/plans/[^`]+)`")
+        Regex::new(r"(?m)^> - \*\*Plan:\*\* `((?:[A-Za-z0-9_-][A-Za-z0-9._-]*/)?docs/plans/[^`]+)`")
             .expect("plan callout regex must compile")
     });
-    callout_re.captures(body).map(|c| c[1].to_string())
+    callout_re
+        .captures(&strip_fenced_blocks(body))
+        .map(|c| c[1].to_string())
 }
 
 /// Decide whether the plan named in a ticket's grooming callout belongs to that
@@ -970,6 +1112,276 @@ fn feeder_rank(labels: &[IssueLabel]) -> u8 {
         .unwrap_or(0)
 }
 
+// ───────────────────── Exclusion observability (mika#2131 / mika#2132) ─────────────────────
+//
+// **The invariant.** Every exclusion decision auto_pull makes is observable —
+// emitted at a level that is actually collected (INFO or `audit_events`), naming
+// the ticket AND the filter that dropped it — never abandoned in a `debug!` on a
+// target whose DEBUG nobody keeps.
+//
+// **Why this is not a `debug!` level bump.** Measured 2026-09-03 over the last
+// 200 MB of `/var/log/mika/server.log`: `stuck_ready_reconcile_skipped` (the
+// `debug!` this module wrote on every skip) appeared **0** times, while
+// `auto_feeder_no_backlog` — an `info!` of the *same module* — appeared 184
+// times, and 517 of 517 DEBUG lines sampled carried `target: mika::llm_debug`.
+// The filter admits exactly one target at DEBUG; the rest start at INFO. That is
+// configuration, not volume. So the skips were *decided* and observable nowhere:
+// #1651 and #1403 were dropped silently on every tick from 2026-08-30 onward,
+// and #2117 sat `ready` for three days with no line able to say why. Raising the
+// log filter would fix it only for a server started with the right env var —
+// these lines belong at a collected level, like every other decision this loop
+// takes (`auto_feeder_no_backlog`, `auto_pull_promotion_refused`).
+//
+// # Journal-vs-`audit_events` policy (mika#2132 AC5)
+//
+// A tick classifies every open issue (~100), so a naive per-ticket INFO would
+// write ~14 000 lines/day and drown the very signal it exists to raise. The
+// split, and the bound that makes it affordable:
+//
+// - **Per-ticket detail → `audit_events`** (`tool_name = "auto_pull_exclusion"`,
+//   `target_key = "issue:<n>"`, `after_value = <filter>`, `reasoning = <phase>`).
+//   Structured and queryable after the fact, which is the shape the founding
+//   question needs: *"why was #2117 never dispatched?"* is answered by one SQL
+//   row, not by a grep over a 19 GB file.
+// - **Per-tick aggregate → one INFO line** (`auto_pull_exclusions`), carrying the
+//   total and the per-(phase, filter) counts. Never ticket names — the journal
+//   carries the actionable shape of the tick, the ledger carries the detail.
+// - **Deduplicated by `(phase, issue, filter)` for the life of the process.** A
+//   ticket excluded by the same filter on 144 consecutive ticks writes **one**
+//   audit row, not 144: the information is *"this ticket is held by this filter"*,
+//   not *"it still was at 14:32"*. Liveness is what the per-tick INFO aggregate is
+//   for. A ticket whose filter *changes* writes a new row — that is a state
+//   change and it is information. The set does not survive a restart, by design:
+//   a fresh process re-photographs the state it finds.
+// - **Zero exclusions → zero lines** (mika#2131 AC7 / mika#2132 AC2). An
+//   observability that logs everybody distinguishes nobody.
+//
+// **What is deliberately NOT an exclusion**, so the counts stay honest:
+//
+// 1. **The partitioning filter of each phase.** Phase 0/1 work the `!ready`
+//    pool, Phase 2 works the `ready` pool. A ticket outside a phase's pool is
+//    not "dropped by" that phase — it is another phase's territory. The ticket
+//    itself uses that language: #1651/#1403 "passed filter 1" and were dropped
+//    "by filters 2–3".
+// 2. **Losing a ranking.** Phase 1 promotes one candidate and Phase 0 takes
+//    `slots`; the runners-up passed every filter and were simply not elected
+//    this tick. Recording them would be false, and would make "excluded" mean
+//    two different things in one counter.
+
+/// The phase of one auto-pull tick that refused a ticket (mika#2131).
+///
+/// Carried on every ledger entry so the operator can tell a Phase 2 skip
+/// (a `ready` ticket that will not be re-driven) from a Phase 0 one (a backlog
+/// ticket that will not be promoted) — the two call for different actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum ExclusionPhase {
+    Phase0Feeder,
+    Phase1Pull,
+    Phase2StuckReady,
+}
+
+impl ExclusionPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Phase0Feeder => "phase0_feeder",
+            Self::Phase1Pull => "phase1_pull",
+            Self::Phase2StuckReady => "phase2_stuck_ready",
+        }
+    }
+}
+
+// The filter vocabulary. Named constants rather than inline literals because the
+// same filter must read the same in all three phases — an operator grouping
+// `audit_events` by `after_value` is counting one population, and two spellings
+// of one filter would split it in half without saying so.
+
+/// An open PR already closes this ticket.
+const FILTER_OPEN_PR: &str = "open_pr_closing";
+/// A self_dev task is in flight for this ticket.
+const FILTER_IN_FLIGHT: &str = "in_flight_self_dev";
+/// `blocked` / `operator-review` / [`REFUSAL_LABEL`] — someone else holds it.
+const FILTER_OPERATOR_HELD: &str = "operator_review_or_blocked";
+/// No canonical grooming callout in the body.
+const FILTER_NOT_GROOMED: &str = "not_groomed";
+/// The `Plan:` callout names a plan belonging to another issue (mika#2020).
+const FILTER_FOREIGN_PLAN: &str = "plan_owned_by_other_issue";
+/// `auto_pull_stats.failure_count` reached [`CIRCUIT_BREAKER_THRESHOLD`].
+const FILTER_CIRCUIT_BREAKER: &str = "circuit_breaker";
+/// The `ready` label is younger than the stuck-ready threshold (Phase 2).
+const FILTER_BELOW_THRESHOLD: &str = "below_threshold";
+/// The timeline carries no `labeled(ready)` event at all, so no age can be read
+/// (Phase 2).
+///
+/// Distinct from [`FILTER_BELOW_THRESHOLD`] on purpose, and the distinction is
+/// the interesting one: a ticket that is merely young will age past the
+/// threshold on its own, whereas one whose `labeled(ready)` event cannot be
+/// found is **never** rescued — it fails the same way on every tick, for ever.
+/// The pre-mika#2131 `debug!` kept them apart in a `detail` field; collapsing
+/// them into one filter name would hide a permanent wedge inside a transient
+/// one.
+const FILTER_NO_READY_LABEL_EVENT: &str = "no_ready_label_event";
+/// The mika#2123 promotion staleness gate refused this branch.
+const FILTER_PROMOTION_GATE: &str = "promotion_gate_refused";
+/// A DB probe failed and the ticket was skipped conservatively.
+const FILTER_PROBE_ERROR: &str = "state_probe_failed";
+/// A seat verdict refused without naming itself (defensive; see
+/// [`crate::webhook_dispatch::SeatVerdict::refusal_reason`]).
+const FILTER_SEAT_REFUSED: &str = "seat_refused";
+
+/// `audit_events.tool_name` for per-ticket exclusion rows.
+///
+/// SOLE WRITER: [`ExclusionLedger::flush`]. One literal, one site — a call site
+/// that spelled it by hand would be invisible to
+/// `WHERE tool_name = 'auto_pull_exclusion'` on the day it mattered.
+const EXCLUSION_AUDIT_TOOL_NAME: &str = "auto_pull_exclusion";
+
+/// Ceiling on the dedup map. Bounds a theoretical leak: the real population is
+/// (open issues × filters), a few hundred at most, so reaching this means
+/// something is generating unbounded distinct keys. Clearing and starting over
+/// costs one redundant audit row per live exclusion, which is cheap and honest —
+/// the alternative is a map that grows for the life of the process.
+const EXCLUSION_AUDIT_SEEN_CAP: usize = 10_000;
+
+/// How stale a recorded exclusion may get before it is written again.
+///
+/// **Why the dedup has a horizon at all.** Without one, a ticket that leaves a
+/// filter and later returns to it writes nothing the second time, so the newest
+/// audit row for that ticket can describe a filter that stopped applying days
+/// earlier — and a row whose date suggests currency while carrying a stale fact
+/// is worse than no row. One day bounds that error: the most recent row is never
+/// older than 24 h, and the cost stays a few hundred rows a day against the
+/// ~14 000 a naive per-tick write would produce.
+const EXCLUSION_AUDIT_REFRESH: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// One exclusion, as both the ledger and the dedup map key it: which phase
+/// refused, which ticket, which filter.
+type ExclusionKey = (ExclusionPhase, u64, &'static str);
+
+/// When each key was last written to `audit_events` by this process (see the
+/// dedup paragraph of the policy above).
+static EXCLUSION_AUDIT_SEEN: OnceLock<Mutex<HashMap<ExclusionKey, Instant>>> = OnceLock::new();
+
+/// `true` when this `(phase, issue, filter)` is unrecorded, or last recorded
+/// more than [`EXCLUSION_AUDIT_REFRESH`] ago.
+///
+/// **Consulting is not marking.** The caller marks with
+/// [`mark_exclusion_audited`] only after the write lands, so one transient
+/// `log_audit_event` failure costs a retry on the next tick rather than that
+/// ticket's row for the life of the process — which is the one outcome this
+/// whole module exists to prevent.
+///
+/// Fail-open on a poisoned mutex: recovering the inner map is right here because
+/// the only state it holds is "already written", and re-writing an audit row is
+/// strictly better than losing one.
+fn exclusion_audit_is_due(key: ExclusionKey, now: Instant) -> bool {
+    let seen = EXCLUSION_AUDIT_SEEN
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match seen.get(&key) {
+        Some(&written_at) => now.duration_since(written_at) >= EXCLUSION_AUDIT_REFRESH,
+        None => true,
+    }
+}
+
+/// Record that `key`'s audit row was written at `now`.
+fn mark_exclusion_audited(key: ExclusionKey, now: Instant) {
+    let mut seen = EXCLUSION_AUDIT_SEEN
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if seen.len() >= EXCLUSION_AUDIT_SEEN_CAP {
+        warn!(
+            cap = EXCLUSION_AUDIT_SEEN_CAP,
+            "auto_pull: exclusion dedup map hit its cap; clearing"
+        );
+        seen.clear();
+    }
+    seen.insert(key, now);
+}
+
+/// The exclusions of one auto-pull tick, collected across the three phases and
+/// emitted once at the end (mika#2131 / mika#2132).
+///
+/// Collected rather than emitted in place so the per-tick aggregate is a single
+/// line covering the whole tick, not three partial ones the reader must add up.
+#[derive(Debug, Default)]
+struct ExclusionLedger {
+    entries: Vec<ExclusionKey>,
+}
+
+impl ExclusionLedger {
+    fn record(&mut self, phase: ExclusionPhase, issue: u64, filter: &'static str) {
+        self.entries.push((phase, issue, filter));
+    }
+
+    /// Per-(phase, filter) counts, ordered deterministically so two ticks with
+    /// the same shape produce the same line and a diff over the journal is
+    /// readable.
+    fn counts(&self) -> BTreeMap<(ExclusionPhase, &'static str), usize> {
+        let mut counts = BTreeMap::new();
+        for &(phase, _, filter) in &self.entries {
+            *counts.entry((phase, filter)).or_insert(0) += 1;
+        }
+        counts
+    }
+
+    /// The aggregate rendered for the INFO line: `phase/filter=n, …`.
+    fn summary(&self) -> String {
+        self.counts()
+            .into_iter()
+            .map(|((phase, filter), n)| format!("{}/{}={}", phase.as_str(), filter, n))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Write the per-ticket audit rows (deduplicated) and the one per-tick INFO
+    /// aggregate. A tick that excluded nobody writes nothing at all.
+    async fn flush(&self, db: &AsyncDatabase, trace_id: &str, session_id: &str) {
+        // AC7 / AC2 negative control. Not an optimisation: a line saying
+        // "0 excluded" on every tick is exactly the noise that makes the real
+        // ones unreadable.
+        if self.entries.is_empty() {
+            return;
+        }
+
+        let now = Instant::now();
+        for &key in &self.entries {
+            if !exclusion_audit_is_due(key, now) {
+                continue;
+            }
+            let (phase, issue, filter) = key;
+            match db
+                .log_audit_event(
+                    session_id,
+                    EXCLUSION_AUDIT_TOOL_NAME,
+                    &format!("issue:{issue}"),
+                    None,
+                    Some(filter),
+                    Some(phase.as_str()),
+                    Some(trace_id),
+                )
+                .await
+            {
+                // Marked only on success — a failed write must be retried next
+                // tick, not remembered as done.
+                Ok(()) => mark_exclusion_audited(key, now),
+                // Fire-and-forget otherwise: an unwritable ledger must not change
+                // what the loop does, only what it can be asked about afterwards.
+                Err(e) => {
+                    warn!(error = %e, issue, filter, "auto_pull: failed to write exclusion audit event")
+                }
+            }
+        }
+
+        info!(
+            total = self.entries.len(),
+            by_filter = %self.summary(),
+            "auto_pull_exclusions"
+        );
+    }
+}
+
 // ───────────────────── Selection logic ─────────────────────
 
 /// Select the best groomed-not-ready ticket from a list of open issues.
@@ -979,22 +1391,52 @@ fn feeder_rank(labels: &[IssueLabel]) -> u8 {
 /// dispatch-lib's recovery paths leave a DRAFT PR), then ranks by priority
 /// (p0 > p1 > p2 > p3 > unlabelled) and by oldest `updated_at` within same
 /// priority.
+///
+/// Ledger-free view of [`select_best_candidate_recording`], kept for callers and
+/// tests that want the selection alone. Phase 1 goes through the recording form
+/// (mika#2131) — a tick that selects without recording is the silence that
+/// ticket closed.
 pub fn select_best_candidate(
     issues: Vec<Issue>,
     open_pr_issue_numbers: &HashSet<u64>,
 ) -> Option<Issue> {
+    select_best_candidate_recording(
+        issues,
+        open_pr_issue_numbers,
+        &mut ExclusionLedger::default(),
+    )
+}
+
+/// [`select_best_candidate`], recording why each dropped ticket was dropped
+/// (mika#2131).
+///
+/// The selection is unchanged — the ledger is the only addition. The two are
+/// one function rather than two so the trace can never describe a filter chain
+/// the selection no longer runs.
+fn select_best_candidate_recording(
+    issues: Vec<Issue>,
+    open_pr_issue_numbers: &HashSet<u64>,
+    ledger: &mut ExclusionLedger,
+) -> Option<Issue> {
     let candidates: Vec<_> = issues
         .into_iter()
+        // Partitioning filter, not an exclusion: a ticket already carrying
+        // `ready` is Phase 2's territory, not something Phase 1 dropped.
         .filter(|i| !i.labels.iter().any(|l| l.name == "ready"))
-        .filter(|i| !open_pr_issue_numbers.contains(&i.number))
-        // mika#2020 R11: `blocked`/`operator-review` are structural exclusions,
-        // as Phase 0 has always treated them. Phase 1 did not, which left the
-        // abandonment leaking: a groomed ticket handed to the operator could be
-        // re-promoted to `ready` here on the very next idle tick, and the
-        // `ready` webhook would dispatch it again.
-        .filter(|i| !is_feeder_excluded(i))
-        .filter(|i| is_groomed(&i.body))
-        .filter(|i| !warn_and_reject_foreign_plan(i))
+        .filter(|i| {
+            // mika#2020 R11: `blocked`/`operator-review` are structural
+            // exclusions, as Phase 0 has always treated them. Phase 1 did not,
+            // which left the abandonment leaking: a groomed ticket handed to the
+            // operator could be re-promoted to `ready` here on the very next idle
+            // tick, and the `ready` webhook would dispatch it again.
+            match groomed_candidate_exclusion(i, open_pr_issue_numbers, None) {
+                Some(filter) => {
+                    ledger.record(ExclusionPhase::Phase1Pull, i.number, filter);
+                    false
+                }
+                None => true,
+            }
+        })
         .collect();
 
     if candidates.is_empty() {
@@ -1006,6 +1448,39 @@ pub fn select_best_candidate(
         let pb = priority_rank(&b.labels);
         pa.cmp(&pb).then_with(|| b.updated_at.cmp(&a.updated_at))
     })
+}
+
+/// The filter that drops `issue` from the groomed-candidate pool shared by
+/// Phase 0 and Phase 1, or `None` when it survives every one (mika#2131).
+///
+/// One function for both phases so the two orders cannot drift: Phase 0 passes
+/// `Some(in_flight)` (it probes the DB for live dispatches before selecting),
+/// Phase 1 passes `None` (its queue-empty gate already ran, ticket-wide).
+///
+/// The `ready` partitioning filter is **not** here — both callers apply it
+/// themselves, precisely because it is not an exclusion (see the policy note
+/// above [`ExclusionPhase`]).
+fn groomed_candidate_exclusion(
+    issue: &Issue,
+    open_pr_issue_numbers: &HashSet<u64>,
+    in_flight_issue_numbers: Option<&HashSet<u64>>,
+) -> Option<&'static str> {
+    if open_pr_issue_numbers.contains(&issue.number) {
+        return Some(FILTER_OPEN_PR);
+    }
+    if in_flight_issue_numbers.is_some_and(|s| s.contains(&issue.number)) {
+        return Some(FILTER_IN_FLIGHT);
+    }
+    if let Some(filter) = feeder_exclusion_label(issue) {
+        return Some(filter);
+    }
+    if !is_groomed(&issue.body) {
+        return Some(FILTER_NOT_GROOMED);
+    }
+    if warn_and_reject_foreign_plan(issue) {
+        return Some(FILTER_FOREIGN_PLAN);
+    }
+    None
 }
 
 /// Pure selection predicate for the Phase 2 stuck-ready reconciler (mika#1824
@@ -1043,8 +1518,9 @@ struct StuckReadyFacts {
 enum StuckReadyVerdict {
     /// Eligible for a re-drive, pending the label-age check.
     Eligible,
-    /// Not this tick. `reason` is the value of the existing
-    /// `stuck_ready_reconcile_skipped` DEBUG field.
+    /// Not this tick. `reason` is the filter name recorded in the tick's
+    /// [`ExclusionLedger`] (mika#2131 — it used to be the value of a
+    /// `stuck_ready_reconcile_skipped` DEBUG field nobody collected).
     Skip { reason: &'static str },
     /// Not this tick, and the re-drive budget goes back to zero — the ticket
     /// shows observable progress (mika#2020 R6).
@@ -1074,14 +1550,14 @@ fn classify_stuck_ready_in_memory(issue: &Issue) -> Option<StuckReadyVerdict> {
         // the owner". Counting a `dispatch:zorglub` typo as a collision would
         // inflate the very number this record exists to make trustworthy.
         return Some(StuckReadyVerdict::Skip {
-            reason: verdict.refusal_reason().unwrap_or("seat_refused"),
+            reason: verdict.refusal_reason().unwrap_or(FILTER_SEAT_REFUSED),
         });
     }
 
     // Filter A: the ticket is already in the operator's hands (or blocked).
     if is_feeder_excluded(issue) {
         return Some(StuckReadyVerdict::Skip {
-            reason: "operator_review_or_blocked",
+            reason: FILTER_OPERATOR_HELD,
         });
     }
 
@@ -1116,7 +1592,7 @@ fn classify_stuck_ready(
     // now the whole criterion, and it is why `in_flight` no longer resets below.
     if facts.has_open_pr {
         return StuckReadyVerdict::SkipAndResetBudget {
-            reason: "open_pr_closing",
+            reason: FILTER_OPEN_PR,
         };
     }
     // A live dispatch is NOT progress (mika#2158 M6b — correction of a premise).
@@ -1144,7 +1620,7 @@ fn classify_stuck_ready(
     // reset — a counter zeroed by the action it counts bounds nothing.
     if facts.in_flight {
         return StuckReadyVerdict::Skip {
-            reason: "in_flight_self_dev",
+            reason: FILTER_IN_FLIGHT,
         };
     }
 
@@ -1156,7 +1632,7 @@ fn classify_stuck_ready(
 
     if facts.circuit_broken {
         return StuckReadyVerdict::Skip {
-            reason: "circuit_breaker",
+            reason: FILTER_CIRCUIT_BREAKER,
         };
     }
 
@@ -1169,6 +1645,32 @@ fn classify_stuck_ready(
     }
 
     StuckReadyVerdict::Eligible
+}
+
+/// Record what one Phase 2 verdict excluded, and nothing else (mika#2131).
+///
+/// Only the two skip verdicts are exclusions that carry no trace of their own.
+/// `Eligible` is not an exclusion; `ReEntry` emits `auto_pull_redrive_reentry`
+/// INFO; `Abandon` emits `auto_pull_redrive_abandoned` WARN plus its own audit
+/// row plus a comment on the ticket. Recording those here would double-count
+/// them in the tick aggregate and make the number unusable for the one thing it
+/// is for — sizing how much the loop is refusing.
+///
+/// Shared by the async loop and the AC4 replay test, so the test exercises the
+/// production mapping rather than a copy of it that can drift.
+fn record_stuck_ready_verdict(
+    ledger: &mut ExclusionLedger,
+    issue: u64,
+    verdict: &StuckReadyVerdict,
+) {
+    match verdict {
+        StuckReadyVerdict::Skip { reason } | StuckReadyVerdict::SkipAndResetBudget { reason } => {
+            ledger.record(ExclusionPhase::Phase2StuckReady, issue, reason);
+        }
+        StuckReadyVerdict::Eligible
+        | StuckReadyVerdict::ReEntry
+        | StuckReadyVerdict::Abandon(_) => {}
+    }
 }
 
 fn select_stuck_ready_candidates(
@@ -1210,13 +1712,19 @@ fn select_stuck_ready_candidates(
 /// `.github/labels.yml:106` reads "No ready label" — so the exclusion is the
 /// declared meaning finally being enforced, not a new policy.
 fn is_feeder_excluded(issue: &Issue) -> bool {
-    if issue
-        .labels
-        .iter()
-        .any(|l| l.name == "blocked" || l.name == "operator-review" || l.name == REFUSAL_LABEL)
-    {
-        return true;
-    }
+    feeder_exclusion_label(issue).is_some()
+}
+
+/// The same predicate as [`is_feeder_excluded`], saying **which** exclusion it
+/// found (mika#2131).
+///
+/// The boolean is derived from this, not the other way round, so the reason an
+/// operator reads can never describe a rule the loop stopped applying.
+///
+/// The seat verdict is checked first so its own reason survives: naming a
+/// seat collision `operator_review_or_blocked` would be the right decision under
+/// the wrong label, and the reason exists to be counted (mika#2084 AC5).
+fn feeder_exclusion_label(issue: &Issue) -> Option<&'static str> {
     // mika#2084 — a ticket another dispatch seat owns is not ours to feed.
     //
     // This lives in the shared predicate, not in one caller, because all three
@@ -1229,7 +1737,17 @@ fn is_feeder_excluded(issue: &Issue) -> bool {
     //
     // Free: the labels are already in memory, so this costs no round trip.
     // Unlabelled issues take the `NoSeatLabel` branch and are untouched (AC3).
-    seat_refusal(issue).is_some()
+    if let Some(verdict) = seat_refusal(issue) {
+        return Some(verdict.refusal_reason().unwrap_or(FILTER_SEAT_REFUSED));
+    }
+    if issue
+        .labels
+        .iter()
+        .any(|l| l.name == "blocked" || l.name == "operator-review" || l.name == REFUSAL_LABEL)
+    {
+        return Some(FILTER_OPERATOR_HELD);
+    }
+    None
 }
 
 /// The seat verdict for one issue when — and only when — it refuses (mika#2084).
@@ -1265,31 +1783,68 @@ fn count_pullable_ready(
         .count()
 }
 
-/// Select the groomed-not-ready tickets to promote, highest [`feeder_rank`]
-/// first (oldest-`updated_at` tiebreak), capped at `slots` (mika#1863 R4/R5/D4).
-///
-/// Candidate filter chain: `!ready` → [`is_groomed`] (full canonical callout,
-/// not the loose `Plan:` substring — see D3) → `!open_pr` → `!in_flight` →
-/// `!blocked`/`!operator-review`. The surviving set is sorted by rank DESC then
-/// `updated_at` ASC and truncated to `min(slots, FEEDER_WORKING_SET_CAP)` — the
-/// working-set cap (D6/F4) bounds the promoted count independent of `slots`.
-///
-/// Pure/in-memory — no GitHub or DB calls. The async wrapper resolves the
-/// `in_flight` set and wires real `gh`/DB, same split as the Phase 2 predicate.
+/// Ledger-free view of [`select_feeder_candidates_recording`], for the selection
+/// tests that predate mika#2131 and assert on the selection alone. Production
+/// goes through the recording form — a tick that selects without recording is
+/// exactly the silence this ticket closed.
+#[cfg(test)]
 fn select_feeder_candidates(
     issues: &[Issue],
     open_pr_issue_numbers: &HashSet<u64>,
     in_flight_issue_numbers: &HashSet<u64>,
     slots: usize,
 ) -> Vec<u64> {
+    select_feeder_candidates_recording(
+        issues,
+        open_pr_issue_numbers,
+        in_flight_issue_numbers,
+        slots,
+        &mut ExclusionLedger::default(),
+    )
+}
+
+/// Select the groomed-not-ready tickets to promote, highest [`feeder_rank`]
+/// first (oldest-`updated_at` tiebreak), capped at `slots` (mika#1863 R4/R5/D4).
+///
+/// Candidate filter chain: `!ready` → `!open_pr` → `!in_flight` →
+/// `!blocked`/`!operator-review` → [`is_groomed`] (full canonical callout, not
+/// the loose `Plan:` substring — see D3) → `!foreign_plan`, resolved one ticket
+/// at a time by [`groomed_candidate_exclusion`] so each drop can name its cause
+/// (mika#2131). The surviving set is sorted by rank DESC then `updated_at` ASC
+/// and truncated to `min(slots, FEEDER_WORKING_SET_CAP)` — the working-set cap
+/// (D6/F4) bounds the promoted count independent of `slots`.
+///
+/// Candidates that survive every filter but fall outside `slots` are **not**
+/// recorded as excluded: they were not dropped, they were merely not elected
+/// this tick.
+///
+/// Pure/in-memory — no GitHub or DB calls. The async wrapper resolves the
+/// `in_flight` set and wires real `gh`/DB, same split as the Phase 2 predicate.
+fn select_feeder_candidates_recording(
+    issues: &[Issue],
+    open_pr_issue_numbers: &HashSet<u64>,
+    in_flight_issue_numbers: &HashSet<u64>,
+    slots: usize,
+    ledger: &mut ExclusionLedger,
+) -> Vec<u64> {
     let mut candidates: Vec<&Issue> = issues
         .iter()
+        // Partitioning filter, not an exclusion — see the policy note above
+        // [`ExclusionPhase`].
         .filter(|i| !i.labels.iter().any(|l| l.name == "ready"))
-        .filter(|i| !open_pr_issue_numbers.contains(&i.number))
-        .filter(|i| !in_flight_issue_numbers.contains(&i.number))
-        .filter(|i| !is_feeder_excluded(i))
-        .filter(|i| is_groomed(&i.body))
-        .filter(|i| !warn_and_reject_foreign_plan(i))
+        .filter(|i| {
+            match groomed_candidate_exclusion(
+                i,
+                open_pr_issue_numbers,
+                Some(in_flight_issue_numbers),
+            ) {
+                Some(filter) => {
+                    ledger.record(ExclusionPhase::Phase0Feeder, i.number, filter);
+                    false
+                }
+                None => true,
+            }
+        })
         .collect();
 
     // Rank DESC, then oldest `updated_at` first within a rank tier.
@@ -1420,7 +1975,18 @@ async fn gh_list_open_pr_closing_issues(github_token: &str) -> Result<HashSet<u6
 }
 
 /// Apply a label to a GitHub issue.
-async fn gh_apply_label(github_token: &str, issue_number: u64, label: &str) -> Result<()> {
+///
+/// Prend un [`LabelWriteToken`] et non un `&str` (mika#2228). Le type est le
+/// gardien : les deux tokens de ce module sont des chaînes de la même forme et
+/// se passent au même `GH_TOKEN`, donc rien qu'un `&str` n'aurait empêché un
+/// futur appelant de rendre à cette fonction le token de lecture — celui-là
+/// même dont on a mesuré, 34 fois le 2026-09-07, qu'il authentifie sans
+/// autoriser. On ne peut plus l'appeler avec le mauvais token par inattention.
+async fn gh_apply_label(
+    label_auth: &LabelWriteToken,
+    issue_number: u64,
+    label: &str,
+) -> Result<()> {
     let mut cmd = tokio::process::Command::new("gh");
     cmd.args([
         "issue",
@@ -1431,7 +1997,7 @@ async fn gh_apply_label(github_token: &str, issue_number: u64, label: &str) -> R
         "--add-label",
         label,
     ]);
-    cmd.env("GH_TOKEN", github_token);
+    cmd.env("GH_TOKEN", label_auth.token());
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -1440,6 +2006,10 @@ async fn gh_apply_label(github_token: &str, issue_number: u64, label: &str) -> R
     let output = cmd.output().await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // AC5 : un refus de permission sous identité App a son propre nom, ici
+        // et nulle part ailleurs — l'appelant continue de journaliser l'échec
+        // sous le sien, avec sa propre gravité.
+        label_auth.report_write_failure("auto_pull", issue_number, label, &stderr);
         return Err(anyhow!(
             "gh issue edit --add-label failed for #{}: {}",
             issue_number,
@@ -1454,7 +2024,11 @@ async fn gh_apply_label(github_token: &str, issue_number: u64, label: &str) -> R
 /// client-side, so removing an absent label is a no-op that exits 0 — the
 /// operation is idempotent. On the off chance a "not found" surfaces, it is
 /// tolerated as success.
-async fn gh_remove_label(github_token: &str, issue_number: u64, label: &str) -> Result<()> {
+async fn gh_remove_label(
+    label_auth: &LabelWriteToken,
+    issue_number: u64,
+    label: &str,
+) -> Result<()> {
     let mut cmd = tokio::process::Command::new("gh");
     cmd.args([
         "issue",
@@ -1465,7 +2039,7 @@ async fn gh_remove_label(github_token: &str, issue_number: u64, label: &str) -> 
         "--remove-label",
         label,
     ]);
-    cmd.env("GH_TOKEN", github_token);
+    cmd.env("GH_TOKEN", label_auth.token());
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -1482,6 +2056,7 @@ async fn gh_remove_label(github_token: &str, issue_number: u64, label: &str) -> 
             );
             return Ok(());
         }
+        label_auth.report_write_failure("auto_pull", issue_number, label, &stderr);
         return Err(anyhow!(
             "gh issue edit --remove-label failed for #{}: {}",
             issue_number,
@@ -1591,9 +2166,11 @@ async fn gh_compare_branch(github_token: &str, branch: &str) -> StalenessMeasure
 ///
 /// A refusal costs one label and one comment. A promotion that should not have
 /// happened costs a dispatch, and on 2026-08-31 seven of them died in a row.
+#[allow(clippy::too_many_arguments)]
 async fn promotion_gate_allows(
     db: &AsyncDatabase,
     github_token: &str,
+    label_auth: &LabelWriteToken,
     issue: &Issue,
     phase: &str,
     trace_id: &str,
@@ -1648,6 +2225,7 @@ async fn promotion_gate_allows(
             refuse_promotion(
                 db,
                 github_token,
+                label_auth,
                 issue.number,
                 reason,
                 phase,
@@ -1676,10 +2254,16 @@ async fn promotion_gate_allows(
 /// `ready` is removed for the Phase 2 case, where the ticket already carries it.
 /// [`gh_remove_label`] is idempotent, so the Phase 0/1 case where it was never
 /// applied is a no-op that exits 0.
+/// `github_token` sert au **commentaire** (identité de lecture, inchangée) ;
+/// `label_auth` aux deux écritures de label. La séparation est celle du plan
+/// mika#2228 : l'évidence mesurée est `addLabelsToLabelable` seul, `createComment`
+/// relève d'un scope distinct et n'a jamais été observé en échec. L'élargir sans
+/// évidence serait deviner.
 #[allow(clippy::too_many_arguments)]
 async fn refuse_promotion(
     db: &AsyncDatabase,
     github_token: &str,
+    label_auth: &LabelWriteToken,
     issue_number: u64,
     reason: RefusalReason,
     phase: &str,
@@ -1698,7 +2282,7 @@ async fn refuse_promotion(
     // human. So this branch escalates to ERROR under its own event key, writes
     // its own audit row, and posts no comment — with no marker to back it, a
     // comment would repeat on every tick and become the second kind of noise.
-    if let Err(e) = gh_apply_label(github_token, issue_number, REFUSAL_LABEL).await {
+    if let Err(e) = gh_apply_label(label_auth, issue_number, REFUSAL_LABEL).await {
         error!(
             error = %e,
             issue = issue_number,
@@ -1734,7 +2318,7 @@ async fn refuse_promotion(
     // Past this point the ticket is excluded from every phase
     // ([`is_feeder_excluded`] knows `REFUSAL_LABEL`), so a failure below
     // degrades the refusal's reach, never its effect.
-    if let Err(e) = gh_remove_label(github_token, issue_number, "ready").await {
+    if let Err(e) = gh_remove_label(label_auth, issue_number, "ready").await {
         warn!(error = %e, issue = issue_number, "auto_pull: promotion refusal could not remove ready label");
     }
 
@@ -1868,9 +2452,12 @@ impl AbandonReason {
 /// the loop; everything after it is visibility layered on top of an arrest
 /// already secured. A failure to comment degrades the refusal's reach, not its
 /// effect.
+/// Même répartition que [`refuse_promotion`] : `label_auth` pour les labels,
+/// `github_token` pour le commentaire (mika#2228).
 async fn abandon_stuck_ready(
     db: &AsyncDatabase,
     github_token: &str,
+    label_auth: &LabelWriteToken,
     issue_number: u64,
     reason: AbandonReason,
     trace_id: &str,
@@ -1885,7 +2472,7 @@ async fn abandon_stuck_ready(
     // gesture, and the budget would reset — a fresh loop every N re-drives.
     // Aborting instead is convergent: the counter is still past the budget, so
     // the next tick simply retries the abandonment.
-    if let Err(e) = gh_apply_label(github_token, issue_number, "operator-review").await {
+    if let Err(e) = gh_apply_label(label_auth, issue_number, "operator-review").await {
         warn!(error = %e, issue = issue_number, "auto_pull: abandon could not apply operator-review label; leaving ticket untouched for the next tick");
         if let Err(e2) = db
             .increment_auto_pull_failure(DEFAULT_REPO, issue_number)
@@ -1898,7 +2485,7 @@ async fn abandon_stuck_ready(
 
     // Past this point the ticket is already excluded from every phase, so a
     // failure below degrades the refusal's reach, never its effect.
-    if let Err(e) = gh_remove_label(github_token, issue_number, "ready").await {
+    if let Err(e) = gh_remove_label(label_auth, issue_number, "ready").await {
         warn!(error = %e, issue = issue_number, "auto_pull: abandon could not remove ready label");
     }
 
@@ -2017,9 +2604,18 @@ async fn gh_ready_label_age_secs(github_token: &str, issue_number: u64) -> Resul
 /// Returns `Some(issue_number)` if Phase 1 promoted a ticket, `None` otherwise.
 /// The Phase 2 rescue count is logged but not returned (the dispatcher log at
 /// `dispatcher.rs` keys off the Phase 1 promotion).
+///
+/// # Deux tokens, deux classes d'opération (mika#2228)
+///
+/// `github_token` est le token identitaire résolu PAT-first (mika#2205) : il
+/// sert aux lectures et aux commentaires. `label_auth` est résolu App-first et
+/// sert **uniquement** aux écritures de label, parce que le PAT résolu du spirit
+/// authentifie sans porter `issues: write` — 34 `--add-label` refusés le
+/// 2026-09-07, sur trois chemins de ce module.
 pub async fn auto_pull_groomed_ticket(
     db: &AsyncDatabase,
     github_token: &str,
+    label_auth: &LabelWriteToken,
     trace_id: &str,
     session_id: &str,
 ) -> Option<u64> {
@@ -2042,6 +2638,11 @@ pub async fn auto_pull_groomed_ticket(
         }
     };
 
+    // mika#2131: one ledger for the whole tick. The three phases record into it;
+    // it is flushed once at the end, so the per-tick INFO aggregate covers the
+    // tick rather than a third of it.
+    let mut ledger = ExclusionLedger::default();
+
     // Phase 0 — feeder: top the pullable-ready pool up to MIN_READY (mika#1863).
     // Runs BEFORE Phase 1 in the same tick, sharing the two `gh` fetches above,
     // so AC2's "feeder promotes → puller picks up same tick" is structural, not
@@ -2049,10 +2650,12 @@ pub async fn auto_pull_groomed_ticket(
     let fed = phase0_feed_ready_pool(
         db,
         github_token,
+        label_auth,
         &issues,
         &open_pr_issue_numbers,
         trace_id,
         session_id,
+        &mut ledger,
     )
     .await;
     debug!(fed, "auto_pull: phase 0 feeder complete");
@@ -2068,10 +2671,12 @@ pub async fn auto_pull_groomed_ticket(
     let promoted = phase1_promote_groomed(
         db,
         github_token,
+        label_auth,
         &issues,
         &open_pr_issue_numbers,
         trace_id,
         session_id,
+        &mut ledger,
     )
     .await;
 
@@ -2079,16 +2684,23 @@ pub async fn auto_pull_groomed_ticket(
     let rescued = phase2_reconcile_stuck_ready(
         db,
         github_token,
+        label_auth,
         &issues,
         &open_pr_issue_numbers,
         trace_id,
         session_id,
+        &mut ledger,
     )
     .await;
     debug!(
         rescued,
         "auto_pull: phase 2 stuck-ready reconciler complete"
     );
+
+    // mika#2131: every exclusion this tick decided, said once — per-ticket in
+    // `audit_events`, aggregated in one INFO line. A tick that excluded nobody
+    // writes nothing (AC7).
+    ledger.flush(db, trace_id, session_id).await;
 
     promoted
 }
@@ -2106,13 +2718,16 @@ pub async fn auto_pull_groomed_ticket(
 /// pool already meets the threshold, `auto_feeder_no_backlog` when the pool is
 /// under threshold but no dispatchable backlog exists (true starvation signal),
 /// and `auto_feeder_promoted` per successful apply.
+#[allow(clippy::too_many_arguments)]
 async fn phase0_feed_ready_pool(
     db: &AsyncDatabase,
     github_token: &str,
+    label_auth: &LabelWriteToken,
     issues: &[Issue],
     open_pr_issue_numbers: &HashSet<u64>,
     trace_id: &str,
     session_id: &str,
+    ledger: &mut ExclusionLedger,
 ) -> usize {
     // R2: read the pool target; `0` disables the feeder entirely.
     let min_ready = auto_feeder_min_ready();
@@ -2189,11 +2804,12 @@ async fn phase0_feed_ready_pool(
 
     // R5: promote up to `min_ready − pullable` top candidates.
     let slots = min_ready as usize - pullable;
-    let candidates = select_feeder_candidates(
+    let candidates = select_feeder_candidates_recording(
         issues,
         open_pr_issue_numbers,
         &in_flight_issue_numbers,
         slots,
+        ledger,
     );
 
     if candidates.is_empty() {
@@ -2231,6 +2847,7 @@ async fn phase0_feed_ready_pool(
                     failure_count = count,
                     "auto_feeder: circuit-breaker skip for #{n} ({count}× failures)"
                 );
+                ledger.record(ExclusionPhase::Phase0Feeder, n, FILTER_CIRCUIT_BREAKER);
                 continue;
             }
             Err(e) => {
@@ -2258,6 +2875,7 @@ async fn phase0_feed_ready_pool(
                 if !promotion_gate_allows(
                     db,
                     github_token,
+                    label_auth,
                     issue,
                     "phase0_feeder",
                     trace_id,
@@ -2265,6 +2883,7 @@ async fn phase0_feed_ready_pool(
                 )
                 .await
                 {
+                    ledger.record(ExclusionPhase::Phase0Feeder, n, FILTER_PROMOTION_GATE);
                     continue;
                 }
             }
@@ -2274,7 +2893,7 @@ async fn phase0_feed_ready_pool(
             ),
         }
 
-        if let Err(e) = gh_apply_label(github_token, n, "ready").await {
+        if let Err(e) = gh_apply_label(label_auth, n, "ready").await {
             warn!(error = %e, issue = n, "auto_feeder: failed to apply ready label");
             if let Err(e2) = db.increment_auto_pull_failure(DEFAULT_REPO, n).await {
                 warn!(error = %e2, "auto_feeder: failed to increment failure counter");
@@ -2318,13 +2937,16 @@ async fn phase0_feed_ready_pool(
 /// queue-empty early-return — Phase 1 only fires when mika-dev's dispatch queue
 /// is idle. Now receives the shared issue list and open-PR set (D5) instead of
 /// fetching them itself.
+#[allow(clippy::too_many_arguments)]
 async fn phase1_promote_groomed(
     db: &AsyncDatabase,
     github_token: &str,
+    label_auth: &LabelWriteToken,
     issues: &[Issue],
     open_pr_issue_numbers: &HashSet<u64>,
     trace_id: &str,
     session_id: &str,
+    ledger: &mut ExclusionLedger,
 ) -> Option<u64> {
     // 1. Queue-empty gate (F2): check if mika-dev has active self_dev tasks.
     let queue_count = match db.count_active_self_dev_tasks().await {
@@ -2343,13 +2965,14 @@ async fn phase1_promote_groomed(
     }
 
     // 3. Select the best groomed-not-ready candidate (skip those with open PRs).
-    let candidate = match select_best_candidate(issues.to_vec(), open_pr_issue_numbers) {
-        Some(c) => c,
-        None => {
-            debug!("auto_pull: no groomed-not-ready candidates found");
-            return None;
-        }
-    };
+    let candidate =
+        match select_best_candidate_recording(issues.to_vec(), open_pr_issue_numbers, ledger) {
+            Some(c) => c,
+            None => {
+                debug!("auto_pull: no groomed-not-ready candidates found");
+                return None;
+            }
+        };
 
     // 4. Circuit-breaker check (AC3): skip if failure_count >= threshold.
     match db
@@ -2382,6 +3005,11 @@ async fn phase1_promote_groomed(
             {
                 warn!(error = %e, "auto_pull: failed to write skip audit event");
             }
+            ledger.record(
+                ExclusionPhase::Phase1Pull,
+                candidate.number,
+                FILTER_CIRCUIT_BREAKER,
+            );
             return None;
         }
         Err(e) => {
@@ -2406,6 +3034,7 @@ async fn phase1_promote_groomed(
     if !promotion_gate_allows(
         db,
         github_token,
+        label_auth,
         &candidate,
         "phase1_idle_pull",
         trace_id,
@@ -2413,11 +3042,16 @@ async fn phase1_promote_groomed(
     )
     .await
     {
+        ledger.record(
+            ExclusionPhase::Phase1Pull,
+            candidate.number,
+            FILTER_PROMOTION_GATE,
+        );
         return None;
     }
 
     // 5. Apply the `ready` label to trigger webhook-driven dispatch.
-    if let Err(e) = gh_apply_label(github_token, candidate.number, "ready").await {
+    if let Err(e) = gh_apply_label(label_auth, candidate.number, "ready").await {
         warn!(
             error = %e,
             issue = candidate.number,
@@ -2481,17 +3115,23 @@ async fn phase1_promote_groomed(
 ///
 /// Filter chain follows the D2 cost-bounded ordering (cheapest → most
 /// expensive): in-memory ready/open-PR, DB in-flight, DB circuit-breaker, then
-/// one GitHub timeline API call per survivor for the label age. Each drop emits
-/// a `stuck_ready_reconcile_skipped` DEBUG with its reason. Survivors past the
-/// age threshold are remove→add rescued (capped at [`MAX_STUCK_RESCUE_PER_TICK`]),
-/// emitting `stuck_ready_reconciled` INFO on success. Returns the rescue count.
+/// one GitHub timeline API call per survivor for the label age. Each drop is
+/// recorded in the tick's [`ExclusionLedger`] (mika#2131 — it used to be a
+/// `stuck_ready_reconcile_skipped` DEBUG that this server's log filter never
+/// collected, which is how #1651 and #1403 were dropped silently for six days).
+/// Survivors past the age threshold are remove→add rescued (capped at
+/// [`MAX_STUCK_RESCUE_PER_TICK`]), emitting `stuck_ready_reconciled` INFO on
+/// success. Returns the rescue count.
+#[allow(clippy::too_many_arguments)]
 async fn phase2_reconcile_stuck_ready(
     db: &AsyncDatabase,
     github_token: &str,
+    label_auth: &LabelWriteToken,
     issues: &[Issue],
     open_pr_issue_numbers: &HashSet<u64>,
     trace_id: &str,
     session_id: &str,
+    ledger: &mut ExclusionLedger,
 ) -> usize {
     let threshold = stuck_ready_threshold_secs();
     let redrive_budget = max_redrives();
@@ -2518,12 +3158,21 @@ async fn phase2_reconcile_stuck_ready(
         // Filters 2–3 (in-mem): operator-held tickets and misattributed plans.
         // Decided before any I/O (mika#2020 KTD6).
         if let Some(verdict) = classify_stuck_ready_in_memory(issue) {
+            record_stuck_ready_verdict(ledger, n, &verdict);
             match verdict {
-                StuckReadyVerdict::Skip { reason } => {
-                    debug!(issue = n, reason, "stuck_ready_reconcile_skipped");
-                }
+                // Recorded above — the skip itself is the whole action.
+                StuckReadyVerdict::Skip { .. } => {}
                 StuckReadyVerdict::Abandon(reason) => {
-                    abandon_stuck_ready(db, github_token, n, reason, trace_id, session_id).await;
+                    abandon_stuck_ready(
+                        db,
+                        github_token,
+                        label_auth,
+                        n,
+                        reason,
+                        trace_id,
+                        session_id,
+                    )
+                    .await;
                 }
                 // `classify_stuck_ready_in_memory` yields only those two.
                 other => debug!(
@@ -2541,6 +3190,7 @@ async fn phase2_reconcile_stuck_ready(
             Ok(v) => v,
             Err(e) => {
                 warn!(error = %e, issue = n, "auto_pull: phase 2 in-flight check failed; skipping ticket");
+                ledger.record(ExclusionPhase::Phase2StuckReady, n, FILTER_PROBE_ERROR);
                 continue;
             }
         };
@@ -2576,13 +3226,13 @@ async fn phase2_reconcile_stuck_ready(
             abandoned,
         };
 
-        match classify_stuck_ready(issue, &facts, redrive_budget) {
+        let verdict = classify_stuck_ready(issue, &facts, redrive_budget);
+        record_stuck_ready_verdict(ledger, n, &verdict);
+        match verdict {
             StuckReadyVerdict::Eligible => survivors.push(n),
-            StuckReadyVerdict::Skip { reason } => {
-                debug!(issue = n, reason, "stuck_ready_reconcile_skipped");
-            }
-            StuckReadyVerdict::SkipAndResetBudget { reason } => {
-                debug!(issue = n, reason, "stuck_ready_reconcile_skipped");
+            // Recorded above — the skip itself is the whole action.
+            StuckReadyVerdict::Skip { .. } => {}
+            StuckReadyVerdict::SkipAndResetBudget { .. } => {
                 if redrive_count > 0
                     && let Err(e) = db.reset_auto_pull_redrive(DEFAULT_REPO, n).await
                 {
@@ -2602,7 +3252,16 @@ async fn phase2_reconcile_stuck_ready(
                 survivors.push(n);
             }
             StuckReadyVerdict::Abandon(reason) => {
-                abandon_stuck_ready(db, github_token, n, reason, trace_id, session_id).await;
+                abandon_stuck_ready(
+                    db,
+                    github_token,
+                    label_auth,
+                    n,
+                    reason,
+                    trace_id,
+                    session_id,
+                )
+                .await;
             }
         }
     }
@@ -2620,16 +3279,18 @@ async fn phase2_reconcile_stuck_ready(
                 ages_by_issue.insert(n, age);
             }
             Ok(None) => {
-                // No `labeled(ready)` event → treat as not-stuck / skip.
-                debug!(
-                    issue = n,
-                    reason = "below_threshold",
-                    detail = "no labeled(ready) timeline event",
-                    "stuck_ready_reconcile_skipped"
+                // No `labeled(ready)` event → no age to compare, so not-stuck.
+                // Recorded under its own filter: unlike a young label, this one
+                // never resolves by waiting (mika#2131 review F2).
+                ledger.record(
+                    ExclusionPhase::Phase2StuckReady,
+                    n,
+                    FILTER_NO_READY_LABEL_EVENT,
                 );
             }
             Err(e) => {
                 warn!(error = %e, issue = n, "auto_pull: phase 2 ready-label age read failed; skipping ticket");
+                ledger.record(ExclusionPhase::Phase2StuckReady, n, FILTER_PROBE_ERROR);
             }
         }
     }
@@ -2643,18 +3304,12 @@ async fn phase2_reconcile_stuck_ready(
         threshold,
     );
 
-    // Emit below_threshold skips for survivors with a known-but-too-young age.
+    // Record below_threshold skips for survivors with a known-but-too-young age.
     for &n in &survivors {
         if let Some(&age) = ages_by_issue.get(&n)
             && age < threshold
         {
-            debug!(
-                issue = n,
-                reason = "below_threshold",
-                age_secs = age,
-                threshold,
-                "stuck_ready_reconcile_skipped"
-            );
+            ledger.record(ExclusionPhase::Phase2StuckReady, n, FILTER_BELOW_THRESHOLD);
         }
     }
 
@@ -2700,6 +3355,7 @@ async fn phase2_reconcile_stuck_ready(
                 if !promotion_gate_allows(
                     db,
                     github_token,
+                    label_auth,
                     issue,
                     "phase2_stuck_rescue",
                     trace_id,
@@ -2707,6 +3363,7 @@ async fn phase2_reconcile_stuck_ready(
                 )
                 .await
                 {
+                    ledger.record(ExclusionPhase::Phase2StuckReady, n, FILTER_PROMOTION_GATE);
                     continue;
                 }
             }
@@ -2716,14 +3373,14 @@ async fn phase2_reconcile_stuck_ready(
             ),
         }
 
-        if let Err(e) = gh_remove_label(github_token, n, "ready").await {
+        if let Err(e) = gh_remove_label(label_auth, n, "ready").await {
             warn!(error = %e, issue = n, "auto_pull: phase 2 remove ready label failed");
             if let Err(e2) = db.increment_auto_pull_failure(DEFAULT_REPO, n).await {
                 warn!(error = %e2, "auto_pull: failed to increment failure counter");
             }
             continue;
         }
-        if let Err(e) = gh_apply_label(github_token, n, "ready").await {
+        if let Err(e) = gh_apply_label(label_auth, n, "ready").await {
             warn!(error = %e, issue = n, "auto_pull: phase 2 re-add ready label failed");
             if let Err(e2) = db.increment_auto_pull_failure(DEFAULT_REPO, n).await {
                 warn!(error = %e2, "auto_pull: failed to increment failure counter");
@@ -3454,6 +4111,274 @@ Some description of the issue.
                 "fixture #{ticket}: is_groomed doit rendre {expected}"
             );
         }
+    }
+
+    // ── mika#2120 : l'axe du chemin de plan ──
+    //
+    // Le second axe étroit de `is_groomed`, corrigé après celui du verdict
+    // (mika#2158). Le prédicat exigeait `docs/plans/` collé au backtick ; la spec
+    // de grooming écrivait `<repo>/docs/plans/`. Tout ticket groomé selon la
+    // lettre de la spec était donc invisible à l'alimenteur.
+
+    /// Le corps d'un ticket groomé, paramétré par le chemin écrit dans le callout.
+    fn body_with_plan_path(plan_path: &str) -> String {
+        format!(
+            "## Description\n\n\
+             > - **Branch:** `fix/2120/x`\n\
+             > - **Plan:** `{plan_path}` (committed on branch @ `abc1234`)\n\
+             > - **Grooming history:** first-pass (READY) → second-pass (GROOMED) — session-id: 550e8400\n"
+        )
+    }
+
+    /// AC1 — les deux formes du chemin sont vues. Le préfixe accepté est
+    /// **n'importe quel segment de tête**, pas la constante `mika/` : le grooming
+    /// écrit le préfixe du dépôt cible, et `mika-cloud#220` (2026-09-02) est la
+    /// mesure qui l'établit.
+    #[test]
+    fn mika2120_is_groomed_accepte_les_deux_formes_de_chemin() {
+        for path in [
+            "docs/plans/2026-09-01-004-fix-2120-x-plan.md",
+            "mika/docs/plans/2026-09-01-004-fix-2120-x-plan.md",
+            "mika-cloud/docs/plans/2026-09-02-001-fix-220-x-plan.md",
+        ] {
+            assert!(
+                is_groomed(&body_with_plan_path(path)),
+                "callout `{path}` doit être vu (AC1)"
+            );
+        }
+    }
+
+    /// AC2 — le contrôle négatif. Un prédicat rendu permissif qui accepterait
+    /// n'importe quel chemin n'aurait rien réparé : il aurait ouvert la porte, et
+    /// le dispatch mourrait plus loin à `_find_issue_plan returned empty`, après
+    /// avoir consommé un créneau.
+    #[test]
+    fn mika2120_is_groomed_refuse_un_chemin_qui_nest_pas_un_plan() {
+        for path in [
+            // Un autre répertoire sous `docs/` n'est pas un plan.
+            "docs/brainstorms/2026-09-01-x.md",
+            "mika/docs/solutions/2026-09-01-x.md",
+            // Le cas qu'une classe de caractères naïve `[A-Za-z0-9._-]+`
+            // laisserait passer : le premier caractère du segment ne peut pas
+            // être un point.
+            "../docs/plans/2026-09-01-004-fix-2120-x-plan.md",
+            "./docs/plans/2026-09-01-004-fix-2120-x-plan.md",
+            // Un seul segment de tête est autorisé.
+            "a/b/docs/plans/2026-09-01-004-fix-2120-x-plan.md",
+        ] {
+            assert!(
+                !is_groomed(&body_with_plan_path(path)),
+                "callout `{path}` n'est pas un plan et doit être refusé (AC2)"
+            );
+        }
+    }
+
+    /// AC3 — les six corps figés du relevé du 2026-08-31, tous en forme préfixée.
+    ///
+    /// Provenance ligne par ligne, et pourquoi ils ne doivent jamais être
+    /// refetchés : `crates/mika-agent/tests/fixtures/plan_callout_bodies/README.md`.
+    /// Quatre des six ont été recorrigés à la main depuis la mesure ; un jeu
+    /// refetché passerait des deux côtés du correctif et n'attesterait rien.
+    #[test]
+    fn mika2120_is_groomed_sur_les_six_corps_prefixes() {
+        const FIXTURES: &[(&str, &str)] = &[
+            (
+                "1680",
+                include_str!("../tests/fixtures/plan_callout_bodies/1680.md"),
+            ),
+            (
+                "1694",
+                include_str!("../tests/fixtures/plan_callout_bodies/1694.md"),
+            ),
+            (
+                "1699",
+                include_str!("../tests/fixtures/plan_callout_bodies/1699.md"),
+            ),
+            (
+                "1934",
+                include_str!("../tests/fixtures/plan_callout_bodies/1934.md"),
+            ),
+            (
+                "1947",
+                include_str!("../tests/fixtures/plan_callout_bodies/1947.md"),
+            ),
+            (
+                "1949",
+                include_str!("../tests/fixtures/plan_callout_bodies/1949.md"),
+            ),
+        ];
+
+        assert_eq!(
+            FIXTURES.len(),
+            6,
+            "les six corps mesurés doivent être figés"
+        );
+        for (ticket, body) in FIXTURES {
+            assert!(
+                is_groomed(body),
+                "fixture #{ticket}: le callout préfixé doit être vu après mika#2120"
+            );
+        }
+    }
+
+    /// AC6 — un corps dont les trois motifs n'apparaissent qu'à l'intérieur d'un
+    /// bloc clôturé ne satisfait pas le garde.
+    ///
+    /// L'ancrage seul n'y suffit pas : une ligne citée dans une fence commence
+    /// elle aussi en colonne zéro. mika#2120 en est la démonstration — le ticket
+    /// cite le gabarit de l'étape 19 de la spec, verbatim, en colonne zéro.
+    ///
+    /// Le chemin cité est écrit sous la **forme nue** à dessein : citer la forme
+    /// préfixée rendrait le test vert sur `main` pour la raison du chemin, et il
+    /// attesterait alors le mauvais axe.
+    #[test]
+    fn mika2120_is_groomed_ignore_les_blocs_de_code() {
+        let body = "## Ce que la spec prescrit\n\n\
+             ```\n\
+             > - **Branch:** `fix/2120/x`\n\
+             > - **Plan:** `docs/plans/2026-09-01-004-fix-2120-x-plan.md` (committed @ `abc`)\n\
+             > - **Grooming history:** first-pass (READY) → second-pass (GROOMED)\n\
+             ```\n\n\
+             Ce ticket parle du garde ; il n'est pas groomé.\n";
+        assert!(
+            !is_groomed(body),
+            "un corps qui cite le callout ne doit pas satisfaire le garde (AC6)"
+        );
+
+        // Même corps, fence en `~~~` : l'autre marqueur clôturé de Markdown.
+        let tildes = body.replace("```", "~~~");
+        assert!(!is_groomed(&tildes), "les fences `~~~` comptent aussi");
+    }
+
+    /// AC6, repli — une fence jamais refermée rend le corps ambigu, et on
+    /// n'ampute rien.
+    ///
+    /// L'asymétrie des coûts le commande : un faux positif coûte un créneau de
+    /// dispatch, un faux négatif a coûté quinze heures de boucle. C'est aussi le
+    /// sens de la doctrine que le ticket cite — la *détection* est au moins aussi
+    /// permissive que le consommateur, la *décision* reste stricte.
+    #[test]
+    fn mika2120_fence_non_fermee_evalue_le_corps_entier() {
+        let body = "## Description\n\n\
+             ```\n\
+             un bloc ouvert et jamais refermé\n\n\
+             > - **Branch:** `fix/2120/x`\n\
+             > - **Plan:** `docs/plans/2026-09-01-004-fix-2120-x-plan.md` (committed @ `abc`)\n\
+             > - **Grooming history:** first-pass (READY) → second-pass (GROOMED)\n";
+        assert!(
+            is_groomed(body),
+            "fence non fermée : on évalue le corps entier plutôt que de l'amputer"
+        );
+    }
+
+    /// Preuve de bouclage — le corps de mika#2120 lui-même, tel que son grooming
+    /// l'a écrit : callout nu **et** blocs de code citant la forme préfixée et le
+    /// code du prédicat. Il doit rester vu.
+    ///
+    /// Le test garde les deux moitiés ensemble : le retrait des fences ne doit pas
+    /// emporter les callouts réels, qui vivent en dehors d'elles.
+    ///
+    /// Il passe déjà sur `main`, et c'est dit ici plutôt que laissé à découvrir :
+    /// l'axe qui le faisait échouer — le verdict de passe unique — a été fermé par
+    /// mika#2158. Ce qu'il garde désormais est le sens inverse, celui que ce
+    /// ticket-ci pourrait casser.
+    #[test]
+    fn mika2120_le_corps_de_ce_ticket_est_vu() {
+        let body = "> - **Branch:** `fix/2120/auto-pull-is-groomed-exige-docs-plans`\n\
+             > - **Plan:** `docs/plans/2026-09-01-004-fix-2120-is-groomed-repo-prefix-plan.md` (committed on branch @ `f42cd5d6`)\n\
+             > - **Grooming history:** /ce:plan → mika-arch first-pass (READY) → mika-arch second-pass (GROOMED)\n\n\
+             ## Deux conventions écrites à deux endroits\n\n\
+             ```rust\n\
+             body.contains(\"> - **Plan:** `docs/plans/\")\n\
+             ```\n\n\
+             `.claude/commands/mika-groom-ticket.md`, étape 19, prescrit :\n\n\
+             ```\n\
+             > - **Plan:** `<repo>/docs/plans/<file>` (committed on branch @ `<sha>`)\n\
+             ```\n";
+        assert!(
+            is_groomed(body),
+            "le ticket qui décrit l'invisibilité doit lui-même être visible"
+        );
+    }
+
+    /// AC5 — un bassin sous le plancher dont le seul éligible porte un callout
+    /// préfixé : l'alimenteur le retient. C'est le tir qui rendait
+    /// `auto_feeder_no_backlog` avec six candidats devant lui.
+    #[test]
+    fn mika2120_select_feeder_candidates_retient_un_callout_prefixe() {
+        let prefixed = body_with_plan_path("mika/docs/plans/2026-09-01-004-fix-2120-x-plan.md");
+        let issues = vec![
+            make_issue(1, UNGROOMED_BODY, &["p1-important"], "2026-08-31T00:00:00Z"),
+            make_issue(2120, &prefixed, &["p1-important"], "2026-08-31T00:00:00Z"),
+        ];
+        assert_eq!(
+            select_feeder_candidates(&issues, &HashSet::new(), &HashSet::new(), 1),
+            vec![2120],
+            "le seul candidat groomé porte un chemin préfixé et doit être promu (AC5)"
+        );
+    }
+
+    /// Conséquence de bord, épinglée parce qu'elle est réelle : rendre le chemin
+    /// lisible rend aussi son **appartenance** lisible.
+    ///
+    /// Avant mika#2120, un callout préfixé ne s'extrayait pas, donc
+    /// [`plan_ownership`] rendait `Unattributable` et le garde de mika#2020 était
+    /// aveugle sur toute cette population. Il voit désormais ; un plan préfixé
+    /// appartenant à un autre ticket est refusé comme l'est déjà un plan nu.
+    /// L'extraction du nom de base traverse le préfixe (`rsplit('/')`), donc le
+    /// créneau d'issue est lu à sa position canonique et nulle part ailleurs.
+    #[test]
+    fn mika2120_le_prefixe_ne_masque_plus_lappartenance_du_plan() {
+        let body =
+            body_with_plan_path("mika/docs/plans/2026-08-21-002-fix-1933-reader-section-plan.md");
+        assert_eq!(
+            plan_ownership(&body, 1887),
+            PlanOwnership::OwnedByOther(1933),
+            "le préfixe de dépôt ne doit pas soustraire un plan au garde d'appartenance"
+        );
+        assert_eq!(plan_ownership(&body, 1933), PlanOwnership::Owned);
+    }
+
+    /// Et la contrepartie : un callout **cité** dans un bloc de code n'accuse
+    /// personne. [`plan_ownership`] décide d'un abandon de ticket ; élargir ce
+    /// qu'il lit sans élargir ce qu'il refuse de lire aurait ajouté là une
+    /// surface de faux positif que ce ticket n'avait pas à ouvrir.
+    #[test]
+    fn mika2120_un_callout_cite_naccuse_personne() {
+        let body = "## Ce que le corps d'un autre ticket contenait\n\n\
+             ```\n\
+             > - **Plan:** `mika/docs/plans/2026-08-21-002-fix-1933-reader-section-plan.md`\n\
+             ```\n";
+        assert_eq!(
+            plan_ownership(body, 1887),
+            PlanOwnership::Unattributable,
+            "un callout cité n'est pas un callout"
+        );
+    }
+
+    /// La frontière du retrait de fences, isolée du prédicat qui l'utilise.
+    #[test]
+    fn mika2120_strip_fenced_blocks_frontiere() {
+        // Aucune fence : la vue est empruntée, pas recopiée.
+        assert!(matches!(
+            strip_fenced_blocks("une ligne\nune autre\n"),
+            Cow::Borrowed(_)
+        ));
+
+        // Une fence ouverte en ``` ne se ferme pas sur ~~~ — le corps entier
+        // reste donc ambigu, et rien n'est amputé.
+        assert!(matches!(
+            strip_fenced_blocks("```\ndedans\n~~~\nencore dedans\n"),
+            Cow::Borrowed(_)
+        ));
+
+        // Fence fermée : seules ses lignes disparaissent.
+        let stripped = strip_fenced_blocks("avant\n```\ndedans\n```\naprès\n");
+        assert_eq!(stripped.as_ref(), "avant\naprès\n");
+
+        // Une fence indentée compte : GitHub la rend comme un bloc de code.
+        let stripped = strip_fenced_blocks("avant\n  ```\n  dedans\n  ```\naprès\n");
+        assert_eq!(stripped.as_ref(), "avant\naprès\n");
     }
 
     #[test]
@@ -4621,5 +5546,434 @@ This ticket has been GROOMED and is ready.
             StuckReadyVerdict::Eligible
         );
         assert!(!is_feeder_excluded(&near));
+    }
+
+    // ─────────── mika#2131 / mika#2132: exclusion observability ───────────
+    //
+    // **What these fixtures are, and are not.** The states of #1651 and #1403 at
+    // the date of the founding measurement (2026-09-01, 48-minute watch) are not
+    // re-fetched from GitHub, deliberately and for the same reason the mika#2158
+    // and mika#2120 fixture sets are frozen: a state refetched today would have
+    // moved, would pass on both sides of the fix, and would attest nothing. What
+    // is pinned is the **shape** the ticket measured and named — `ready` tickets
+    // dropped by filters 2–3 ("operator-held tickets and misattributed plans",
+    // in the words of the code comment those two hit) — plus the requirement
+    // that each one leaves the pass named together with its filter.
+
+    /// Replay one Phase 2 pass over a pool holding the two tickets the ticket was
+    /// filed about, and assert both leave it named (mika#2131 AC6 / mika#2132
+    /// AC1+AC4).
+    ///
+    /// Red before the fix: the two skips went to `debug!(… "stuck_ready_reconcile_skipped")`
+    /// on a target whose DEBUG this server never collected — 0 occurrences in the
+    /// last 200 MB of `server.log` against 184 of an `info!` from the same module.
+    /// There was no ledger to assert against, which is exactly the defect.
+    #[test]
+    fn mika2131_replay_names_the_filter_that_dropped_each_ticket() {
+        // #1651 — held by the operator. Filter 2, in-memory, before any I/O.
+        let held = make_issue(1651, GROOMED_BODY, &["ready", "operator-review"], "t");
+        // #1403 — a live dispatch holds it. Skipped, and (since mika#2158) without
+        // resetting the re-drive budget.
+        let busy = make_issue(1403, GROOMED_BODY, &["ready"], "t");
+        let mut busy_facts = facts(0);
+        busy_facts.in_flight = true;
+
+        let mut ledger = ExclusionLedger::default();
+        for (issue, f) in [(&held, facts(0)), (&busy, busy_facts)] {
+            let verdict = classify_stuck_ready(issue, &f, 3);
+            record_stuck_ready_verdict(&mut ledger, issue.number, &verdict);
+        }
+
+        assert_eq!(
+            ledger.entries.len(),
+            2,
+            "both tickets must leave the pass recorded, not just counted"
+        );
+        assert!(
+            ledger.entries.contains(&(
+                ExclusionPhase::Phase2StuckReady,
+                1651,
+                FILTER_OPERATOR_HELD
+            )),
+            "#1651 must be named together with the filter that held it (AC3)"
+        );
+        assert!(
+            ledger
+                .entries
+                .contains(&(ExclusionPhase::Phase2StuckReady, 1403, FILTER_IN_FLIGHT)),
+            "#1403 must be named together with the filter that held it (AC3)"
+        );
+
+        // AC3, said once more where an operator actually reads it: the aggregate
+        // carries the filter names, not just a total.
+        let summary = ledger.summary();
+        assert!(summary.contains(FILTER_OPERATOR_HELD), "{summary}");
+        assert!(summary.contains(FILTER_IN_FLIGHT), "{summary}");
+    }
+
+    /// AC7 / AC2 negative control: a ticket that clears every filter leaves no
+    /// trace at all. An observability that logs everybody distinguishes nobody.
+    #[test]
+    fn mika2131_a_ticket_that_clears_every_filter_leaves_no_trace() {
+        let clean = make_issue(2117, GROOMED_BODY, &["ready", "p1-important"], "t");
+        let mut ledger = ExclusionLedger::default();
+        let verdict = classify_stuck_ready(&clean, &facts(0), 3);
+        assert_eq!(verdict, StuckReadyVerdict::Eligible);
+        record_stuck_ready_verdict(&mut ledger, clean.number, &verdict);
+        assert!(ledger.entries.is_empty(), "{:?}", ledger.entries);
+
+        // Same control on the Phase 0/1 side, where the drop used to be a silent
+        // `.filter()` with no reason at all.
+        let mut ledger = ExclusionLedger::default();
+        let pool = vec![make_issue(2118, GROOMED_BODY, &["p1-important"], "t")];
+        assert!(
+            select_best_candidate_recording(pool.clone(), &HashSet::new(), &mut ledger).is_some()
+        );
+        assert!(ledger.entries.is_empty(), "{:?}", ledger.entries);
+
+        let selected = select_feeder_candidates_recording(
+            &pool,
+            &HashSet::new(),
+            &HashSet::new(),
+            5,
+            &mut ledger,
+        );
+        assert_eq!(selected, vec![2118]);
+        assert!(ledger.entries.is_empty(), "{:?}", ledger.entries);
+    }
+
+    /// The partitioning filter of a phase is not an exclusion (policy, first
+    /// bullet of "what is deliberately NOT an exclusion").
+    ///
+    /// A `ready` ticket is Phase 2's territory. Counting Phase 1's `!ready` drop
+    /// as an exclusion would put every ticket of the ready pool into the tick's
+    /// refusal count on every tick — a number that grows with a healthy queue.
+    #[test]
+    fn mika2131_the_partitioning_filter_is_not_an_exclusion() {
+        let mut ledger = ExclusionLedger::default();
+        let pool = vec![make_issue(2119, GROOMED_BODY, &["ready"], "t")];
+        assert!(select_best_candidate_recording(pool, &HashSet::new(), &mut ledger).is_none());
+        assert!(
+            ledger.entries.is_empty(),
+            "a ticket belonging to another phase was not dropped by this one: {:?}",
+            ledger.entries
+        );
+    }
+
+    /// Losing a ranking is not an exclusion either (policy, second bullet).
+    #[test]
+    fn mika2131_a_runner_up_is_not_recorded_as_excluded() {
+        let mut ledger = ExclusionLedger::default();
+        let pool = vec![
+            make_issue(3001, GROOMED_BODY, &["p0-critical"], "2026-08-01T00:00:00Z"),
+            make_issue(3002, GROOMED_BODY, &["p2-normal"], "2026-08-01T00:00:00Z"),
+        ];
+        let selected = select_feeder_candidates_recording(
+            &pool,
+            &HashSet::new(),
+            &HashSet::new(),
+            1,
+            &mut ledger,
+        );
+        assert_eq!(selected, vec![3001], "the p0 wins the single slot");
+        assert!(
+            ledger.entries.is_empty(),
+            "#3002 passed every filter and was merely not elected: {:?}",
+            ledger.entries
+        );
+    }
+
+    /// Phase 0 and Phase 1 name their filters too — the `.filter()` chains that
+    /// dropped tickets with no reason at all before mika#2131.
+    #[test]
+    fn mika2131_phase0_and_phase1_name_their_filters() {
+        let foreign =
+            body_with_plan("2026-08-21-002-fix-1933-reader-completed-section-avancement-plan.md");
+        let pool = vec![
+            make_issue(4001, UNGROOMED_BODY, &["p1-important"], "t"),
+            make_issue(4002, GROOMED_BODY, &["blocked"], "t"),
+            make_issue(4003, GROOMED_BODY, &["p1-important"], "t"),
+            make_issue(4004, &foreign, &["p0-critical"], "t"),
+        ];
+        let open_pr: HashSet<u64> = [4003].into_iter().collect();
+
+        let mut ledger = ExclusionLedger::default();
+        assert!(select_best_candidate_recording(pool.clone(), &open_pr, &mut ledger).is_none());
+        let recorded: HashSet<(u64, &str)> = ledger
+            .entries
+            .iter()
+            .map(|&(_, issue, filter)| (issue, filter))
+            .collect();
+        assert_eq!(
+            recorded,
+            [
+                (4001, FILTER_NOT_GROOMED),
+                (4002, FILTER_OPERATOR_HELD),
+                (4003, FILTER_OPEN_PR),
+                (4004, FILTER_FOREIGN_PLAN),
+            ]
+            .into_iter()
+            .collect::<HashSet<_>>()
+        );
+        assert!(
+            ledger
+                .entries
+                .iter()
+                .all(|&(phase, _, _)| phase == ExclusionPhase::Phase1Pull)
+        );
+
+        // Phase 0 adds the in-flight filter Phase 1 does not carry.
+        let mut ledger = ExclusionLedger::default();
+        let in_flight: HashSet<u64> = [4001].into_iter().collect();
+        let selected =
+            select_feeder_candidates_recording(&pool, &open_pr, &in_flight, 5, &mut ledger);
+        assert!(selected.is_empty());
+        assert!(
+            ledger
+                .entries
+                .contains(&(ExclusionPhase::Phase0Feeder, 4001, FILTER_IN_FLIGHT)),
+            "in-flight is checked before grooming, so #4001 reads as in-flight, not ungroomed: {:?}",
+            ledger.entries
+        );
+    }
+
+    /// A verdict that already carries its own collected trace is not recorded
+    /// again — the tick count must size what the loop is refusing *silently*.
+    #[test]
+    fn mika2131_verdicts_with_their_own_trace_are_not_double_counted() {
+        let mut ledger = ExclusionLedger::default();
+        // `Abandon` writes `auto_pull_redrive_abandoned` WARN + an audit row + a
+        // comment on the ticket; `ReEntry` writes `auto_pull_redrive_reentry` INFO.
+        record_stuck_ready_verdict(
+            &mut ledger,
+            1887,
+            &StuckReadyVerdict::Abandon(AbandonReason::PlanOwnedByOtherIssue {
+                plan: "docs/plans/2026-08-21-002-fix-1933-x-plan.md".to_string(),
+                owner: 1933,
+            }),
+        );
+        record_stuck_ready_verdict(&mut ledger, 1901, &StuckReadyVerdict::ReEntry);
+        record_stuck_ready_verdict(&mut ledger, 2117, &StuckReadyVerdict::Eligible);
+        assert!(ledger.entries.is_empty(), "{:?}", ledger.entries);
+    }
+
+    /// The per-tick aggregate counts by (phase, filter) and is deterministic —
+    /// two ticks of the same shape must produce the same line, or a diff over the
+    /// journal is unreadable.
+    #[test]
+    fn mika2131_summary_counts_by_phase_and_filter() {
+        let mut ledger = ExclusionLedger::default();
+        ledger.record(ExclusionPhase::Phase2StuckReady, 1, FILTER_IN_FLIGHT);
+        ledger.record(ExclusionPhase::Phase2StuckReady, 2, FILTER_IN_FLIGHT);
+        ledger.record(ExclusionPhase::Phase0Feeder, 3, FILTER_NOT_GROOMED);
+        assert_eq!(
+            ledger.summary(),
+            "phase0_feeder/not_groomed=1, phase2_stuck_ready/in_flight_self_dev=2"
+        );
+        assert_eq!(ExclusionLedger::default().summary(), "");
+    }
+
+    /// Structural guard: an exclusion decision must never go back to `debug!`
+    /// (mika#2131 Fire-Disposition — the permanent half).
+    ///
+    /// A behavioural test cannot catch this class. The regression would not make
+    /// a decision wrong; it would make it invisible, and every assertion about
+    /// the decision would stay green while the operator lost the answer again.
+    /// So the guard is a source scan, like `grooming_marker`'s
+    /// `no_grooming_regex_outside_this_module` and `dispatcher`'s
+    /// `mika2205_periodic_scans_do_not_read_the_pat_field_directly`.
+    ///
+    /// It scans for the *event literal that was removed* rather than for
+    /// `debug!` at large: this module legitimately keeps `debug!` for
+    /// phase-completion tracing and for the defensive
+    /// `stuck_ready_reconcile_unexpected_verdict` arm (an impossible branch, not
+    /// an exclusion), and a guard that banned the macro outright would be worked
+    /// around within a week instead of being read.
+    ///
+    /// The scan is per **statement**, not per line: a re-introduction wrapped by
+    /// `rustfmt` across several lines would slip past a line-wise scan — and
+    /// rustfmt wraps exactly this shape, so the multi-line form is the likely
+    /// one, not the exotic one (mika#2131 review F5).
+    #[test]
+    fn mika2131_exclusion_skips_never_return_to_an_uncollected_debug() {
+        // Split so the guard's own predicate is not the first thing it catches.
+        let macro_needle = ["debug", "!"].concat();
+        let event_needle = ["stuck_ready_reconcile", "_skipped"].concat();
+
+        let source = include_str!("auto_pull.rs");
+
+        // Non-vacuity, both ways. A guard that scans the wrong file, or whose
+        // predicate stopped matching, is green and empty — which reads exactly
+        // like a clean module.
+        assert!(
+            source.contains("fn phase2_reconcile_stuck_ready"),
+            "the scan is not reading this module"
+        );
+
+        // Code only: strip line comments, then split on `;` so one statement is
+        // one unit however it is wrapped.
+        let code: String = source
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("*")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let offending = |statements: &str| -> bool {
+            statements
+                .split(';')
+                .any(|s| s.contains(&macro_needle) && s.contains(&event_needle))
+        };
+
+        // The predicate still recognises the shape it exists to refuse — in both
+        // the single-line and the rustfmt-wrapped form.
+        assert!(
+            offending(&format!(
+                "{macro_needle}(issue = n, reason, \"{event_needle}\");"
+            )),
+            "the predicate no longer recognises the single-line form"
+        );
+        assert!(
+            offending(&format!(
+                "{macro_needle}(\n    issue = n,\n    reason,\n    \"{event_needle}\"\n);"
+            )),
+            "the predicate no longer recognises the wrapped form"
+        );
+
+        assert!(
+            !offending(&code),
+            "an exclusion decision went back to `{macro_needle}`. This server's \
+             log filter admits exactly one target at DEBUG (`mika::llm_debug`), \
+             so such a line is decided and observable nowhere — the mika#2131 \
+             defect. Record it in the tick's ExclusionLedger instead."
+        );
+    }
+
+    /// The dedup that makes the per-ticket audit affordable: a ticket held by the
+    /// same filter tick after tick writes one row, not one per tick. A change of
+    /// filter is a state change and writes again.
+    #[test]
+    fn mika2131_audit_dedup_writes_once_per_state() {
+        // Issue numbers well outside the real range — the dedup map is
+        // process-global and the test suite runs in one process.
+        let now = Instant::now();
+        let held = (ExclusionPhase::Phase2StuckReady, 990_001, FILTER_IN_FLIGHT);
+
+        assert!(exclusion_audit_is_due(held, now));
+        mark_exclusion_audited(held, now);
+        assert!(
+            !exclusion_audit_is_due(held, now),
+            "the same exclusion, tick after tick, is one fact — not 144 of them"
+        );
+        assert!(
+            exclusion_audit_is_due(
+                (
+                    ExclusionPhase::Phase2StuckReady,
+                    990_001,
+                    FILTER_OPERATOR_HELD
+                ),
+                now
+            ),
+            "a ticket that changed filter changed state, and that is information"
+        );
+        assert!(
+            exclusion_audit_is_due(
+                (ExclusionPhase::Phase0Feeder, 990_001, FILTER_IN_FLIGHT),
+                now
+            ),
+            "the same filter in another phase is another fact"
+        );
+    }
+
+    /// A consult that is not a write must not mark the key (review F1): one
+    /// transient `log_audit_event` failure would otherwise cost that ticket's row
+    /// for the life of the process — the exact silence this ticket closed.
+    #[test]
+    fn mika2131_a_failed_audit_write_is_retried_next_tick() {
+        let now = Instant::now();
+        let key = (ExclusionPhase::Phase1Pull, 990_002, FILTER_NOT_GROOMED);
+        assert!(exclusion_audit_is_due(key, now));
+        // Write failed → `mark_exclusion_audited` is not called.
+        assert!(
+            exclusion_audit_is_due(key, now),
+            "consulting must not mark; only a landed write does"
+        );
+    }
+
+    /// The dedup has a horizon (review F4): a row whose date suggests currency
+    /// while carrying a fact days old is worse than no row.
+    #[test]
+    fn mika2131_a_stale_record_is_written_again() {
+        let now = Instant::now();
+        let key = (ExclusionPhase::Phase0Feeder, 990_003, FILTER_OPEN_PR);
+        mark_exclusion_audited(key, now);
+        assert!(!exclusion_audit_is_due(key, now));
+        assert!(
+            !exclusion_audit_is_due(key, now + EXCLUSION_AUDIT_REFRESH - Duration::from_secs(1)),
+            "still fresh one second before the horizon"
+        );
+        assert!(
+            exclusion_audit_is_due(key, now + EXCLUSION_AUDIT_REFRESH),
+            "past the horizon the state is re-asserted, so the newest row is \
+             never older than a day"
+        );
+    }
+
+    /// The filter names are a wire format: they land in `audit_events.after_value`
+    /// and operators `GROUP BY` them. Renaming a constant must not silently split
+    /// a population in two (review F3), so the values are pinned here — and the
+    /// Phase 2 verdicts, which produce the same values through
+    /// `StuckReadyVerdict::reason`, are pinned against the same constants.
+    #[test]
+    fn mika2131_filter_names_are_a_wire_format() {
+        assert_eq!(FILTER_OPEN_PR, "open_pr_closing");
+        assert_eq!(FILTER_IN_FLIGHT, "in_flight_self_dev");
+        assert_eq!(FILTER_OPERATOR_HELD, "operator_review_or_blocked");
+        assert_eq!(FILTER_NOT_GROOMED, "not_groomed");
+        assert_eq!(FILTER_FOREIGN_PLAN, "plan_owned_by_other_issue");
+        assert_eq!(FILTER_CIRCUIT_BREAKER, "circuit_breaker");
+        assert_eq!(FILTER_BELOW_THRESHOLD, "below_threshold");
+        assert_eq!(FILTER_NO_READY_LABEL_EVENT, "no_ready_label_event");
+        assert_eq!(FILTER_PROMOTION_GATE, "promotion_gate_refused");
+        assert_eq!(FILTER_PROBE_ERROR, "state_probe_failed");
+        assert_eq!(FILTER_SEAT_REFUSED, "seat_refused");
+        assert_eq!(EXCLUSION_AUDIT_TOOL_NAME, "auto_pull_exclusion");
+
+        // The Phase 2 classifier reaches the same vocabulary. These four are the
+        // ones a rename would silently fork.
+        let held = make_issue(1, GROOMED_BODY, &["ready", "operator-review"], "t");
+        assert_eq!(
+            classify_stuck_ready(&held, &facts(0), 3),
+            StuckReadyVerdict::Skip {
+                reason: FILTER_OPERATOR_HELD
+            }
+        );
+        let clean = make_issue(2, GROOMED_BODY, &["ready"], "t");
+        let mut f = facts(0);
+        f.in_flight = true;
+        assert_eq!(
+            classify_stuck_ready(&clean, &f, 3),
+            StuckReadyVerdict::Skip {
+                reason: FILTER_IN_FLIGHT
+            }
+        );
+        let mut f = facts(0);
+        f.has_open_pr = true;
+        assert_eq!(
+            classify_stuck_ready(&clean, &f, 3),
+            StuckReadyVerdict::SkipAndResetBudget {
+                reason: FILTER_OPEN_PR
+            }
+        );
+        let mut f = facts(0);
+        f.circuit_broken = true;
+        assert_eq!(
+            classify_stuck_ready(&clean, &f, 3),
+            StuckReadyVerdict::Skip {
+                reason: FILTER_CIRCUIT_BREAKER
+            }
+        );
     }
 }

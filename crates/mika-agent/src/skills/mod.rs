@@ -3619,6 +3619,39 @@ keywords = ["big-test"]
         assert_eq!(registry.disabled[0].name, "skill-b");
     }
 
+    /// mika#2027 AC1, end of the chain: the fail-closed sentinel that
+    /// `prompt::load_identity` hands back for an absent `identity.toml` must
+    /// actually empty the registry here. The load-layer test asserts the
+    /// sentinel is produced; this one asserts it *bites* — the two together are
+    /// what make "absent → zero skill" a fact rather than a convention.
+    #[test]
+    fn mika2027_fail_closed_sentinel_evicts_every_skill() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![
+                make_entry("shell-exec", false, true),
+                make_entry("git-ops", false, true),
+                make_entry("github", false, true),
+                make_entry("tmux", true, true),
+            ],
+        };
+
+        registry.apply_identity_allowlist(&[crate::prompt::FAIL_CLOSED_SKILL_SENTINEL.to_string()]);
+
+        assert!(
+            registry.skills.is_empty(),
+            "sentinel allowlist left skills active: {:?}",
+            registry
+                .skills
+                .iter()
+                .map(|e| &e.manifest.skill.name)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(registry.disabled.len(), 4);
+    }
+
     #[test]
     fn test_identity_allowlist_empty_is_noop() {
         let mut registry = SkillRegistry {

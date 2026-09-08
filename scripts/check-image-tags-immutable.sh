@@ -25,6 +25,33 @@
 #   different name, and each of them is caught here because the rule is
 #   "derived from the sha", not "not called latest".
 #
+# THE INDIRECTION, and why resolving it is the same rule rather than a hole in
+# it (mika#2174). The tag the downstream rotation consumes is `main-<short8>`,
+# and GitHub's expression language has no substring function — so the short sha
+# cannot be written inline in `tags:` and has to travel through a variable:
+#
+#   - name: Derive the short sha
+#     run: echo "SHORT_SHA=${GITHUB_SHA:0:8}" >> "$GITHUB_ENV"
+#   ...
+#     tags: |
+#       registry/repo:main-${{ env.SHORT_SHA }}
+#
+# A guard that only knew the literal `github.sha` would refuse that tag for the
+# *shape of its writing* rather than for a property — and a guard refused on a
+# correct change is a guard that gets deleted. The opposite reflex is worse: a
+# guard that accepted any `${{ env.X }}` would accept `:latest` written as a
+# variable, i.e. the mika#2143 defect with one indirection added.
+#
+# So the guard RESOLVES the indirection: a variable makes a tag sha-derived when
+# THIS SAME FILE assigns it from the commit sha. It is fail-closed — a variable
+# whose derivation the file does not show is refused, exactly as a bare `:latest`
+# is. Two boundaries, stated rather than left to be discovered:
+#   - Derivations written in a comment do not count. A `#` line is what someone
+#     says the file does, not what it does.
+#   - Resolution is file-scoped and name-scoped, not job-scoped: if two jobs
+#     assigned the same variable name differently, this guard would read the
+#     union. Extend by property if that shape ever becomes real here.
+#
 # KNOWN BOUNDARY, stated rather than left to be discovered: this guard reads
 #   `tags:`. docker/build-push-action can also name an image through
 #   `outputs: type=image,name=...`, which this parser does not model. That path
@@ -125,6 +152,69 @@ extract_tags() {
     ' "$1"
 }
 
+# Every variable name this workflow assigns FROM the commit sha, one per line.
+#
+# Two writings are recognised, because those are the two a workflow has:
+#   NAME: <...github.sha...>   a mapping entry INSIDE an `env:` block
+#   NAME=<...GITHUB_SHA...>    a shell assignment, including the
+#                              `echo "NAME=..." >> "$GITHUB_ENV"` and
+#                              `>> "$GITHUB_OUTPUT"` forms
+#
+# The mapping form is read only inside an `env:` block, tracked by indentation
+# the same way extract_tags tracks a tag list. Collecting every `key:` on a line
+# that happens to mention the sha would enrol the `tags:` key itself when the
+# list is written as a plain scalar — and a tag could then be legitimised by a
+# variable named after the very key that carries it. A flow-style `env: {A: b}`
+# is not modelled, so it collects nothing and the tags depending on it are
+# refused: fail-closed, like everything else here.
+#
+# Comment lines are skipped on purpose: a derivation that only exists in a `#`
+# line is a claim, not a mechanism, and accepting it would let a tag be
+# legitimised by a sentence someone wrote next to it.
+collect_sha_derived_names() {
+    awk '
+        {
+            line = $0
+            stripped = line
+            sub(/^[ \t]+/, "", stripped)
+            if (stripped ~ /^#/) { next }
+            match(line, /^[ \t]*/); ind = RLENGTH
+
+            # An `env:` block ends at the first non-blank line indented no
+            # deeper than the `env:` key itself.
+            if (inenv == 1 && stripped != "" && ind <= envbase) { inenv = 0 }
+            if (stripped ~ /^env:[ \t]*$/) { inenv = 1; envbase = ind; next }
+
+            if (line !~ /github\.sha|GITHUB_SHA/) { next }
+
+            # `NAME: <value containing the sha>`, inside an `env:` block.
+            if (inenv == 1 && match(line, /^[ \t]*[A-Za-z_][A-Za-z0-9_-]*[ \t]*:[ \t]/)) {
+                name = substr(line, RSTART, RLENGTH)
+                gsub(/[ \t:]/, "", name)
+                if (name != "") { print name }
+            }
+
+            # `NAME=<value containing the sha>`, anywhere on the line.
+            rest = line
+            while (match(rest, /[A-Za-z_][A-Za-z0-9_]*=/)) {
+                name = substr(rest, RSTART, RLENGTH - 1)
+                print name
+                rest = substr(rest, RSTART + RLENGTH)
+            }
+        }
+    ' "$1"
+}
+
+# True when $1 (a tag) reads variable $2, in any of the writings a tag can use:
+# `${{ env.NAME }}`, `${{ steps.<id>.outputs.NAME }}`, `${NAME}`, `$NAME`.
+# The trailing boundary keeps `SHORT_SHA` from matching `SHORT_SHA_SUFFIX`.
+tag_reads_variable() {
+    local tag="$1" name="$2"
+    [[ "$tag" =~ (env\.|outputs\.)${name}([^A-Za-z0-9_]|$) ]] && return 0
+    [[ "$tag" =~ \$\{?${name}([^A-Za-z0-9_]|$) ]] && return 0
+    return 1
+}
+
 TAGS=""
 awk_status=0
 TAGS="$(extract_tags "$WORKFLOW")" || awk_status=$?
@@ -143,14 +233,32 @@ if [[ -z "$TAGS" ]]; then
     exit 3
 fi
 
-# A tag is acceptable only if the commit sha appears in it: two distinct
-# commits then cannot produce the same tag, so no push can ever reassign one.
+DERIVED_NAMES="$(collect_sha_derived_names "$WORKFLOW")"
+
+# A tag is acceptable only if the commit sha reaches it: either written in the
+# tag itself, or through a variable this same file derives from the sha. Two
+# distinct commits then cannot produce the same tag, so no push can ever
+# reassign one.
 VIOLATIONS=0
 while IFS= read -r tag; do
     [[ -z "$tag" ]] && continue
     if [[ "$tag" == *'github.sha'* || "$tag" == *'GITHUB_SHA'* ]]; then
         continue
     fi
+
+    resolved=""
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        if tag_reads_variable "$tag" "$name"; then
+            resolved="$name"
+            break
+        fi
+    done <<< "$DERIVED_NAMES"
+
+    if [[ -n "$resolved" ]]; then
+        continue
+    fi
+
     echo "ERROR: moving tag pushed to an IMMUTABLE registry: $tag"
     VIOLATIONS=$((VIOLATIONS + 1))
 done <<< "$TAGS"
@@ -166,6 +274,12 @@ if [[ $VIOLATIONS -gt 0 ]]; then
     echo "Fix: drop the tag. Do NOT make the repository mutable — immutability is"
     echo "the provenance guarantee, not an obstacle. A consumer wanting the newest"
     echo "build resolves it with \`aws ecr describe-images\` sorted on imagePushedAt."
+    echo ""
+    echo "If the tag IS meant to be sha-derived and reaches the sha through a"
+    echo "variable, derive that variable from the sha in this same file — e.g."
+    echo "\`echo \"SHORT_SHA=\${GITHUB_SHA:0:8}\" >> \"\$GITHUB_ENV\"\` — and this guard"
+    echo "will resolve it (mika#2174). A variable whose derivation the file does"
+    echo "not show is refused on purpose: it is a moving tag with one more step."
     exit 1
 fi
 

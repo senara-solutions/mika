@@ -63,10 +63,26 @@ Before running the pipeline, set up an isolated worktree:
 5. `/compound-engineering:resolve_todo_parallel`
 6. `/ce:compound`
 7. Run `bash scripts/verify-pipeline.sh` to verify pipeline artifacts exist. If it fails, read the error messages to identify missing artifacts, go back and produce them (run `/ce:plan` if no plan doc, `/ce:work` if no source changes), then re-run verification until it passes.
-8. Create a PR if one doesn't already exist:
+8. Create a PR if one doesn't already exist. **The PR body file lives inside the
+   worktree — never outside it.** Write the body with the **Write** tool to
+   `pr-body.md` at the worktree root (it is gitignored, so it never dirties
+   `git status`), pass it with `--body-file`, then delete it:
+   ```bash
+   # after Write → <worktree>/pr-body.md
+   gh pr create --repo senara-solutions/mika --title "<title>" --body-file pr-body.md
+   rm -f pr-body.md
    ```
-   gh pr create --repo senara-solutions/mika --title "<title>" --body "<body>"
-   ```
+   **Never write the PR body outside the worktree** — `/tmp/pr-body-<N>.md` or any
+   other out-of-worktree path is refused by the claude-pilot permission policy
+   (`[policy:deny] Write: /tmp/pr-body-<N>.md`). `gh pr create --body-file` then has
+   no file to read, and the session ends with no PR at all (mika#2211). A file under
+   the worktree is always writable and is insensitive to the body's content — unlike
+   a `<<'BODY'` heredoc, which a body containing its own delimiter line terminates
+   early.
+
+   A short single-line body may still be passed inline with `--body "<body>"`. When
+   the body is long or multi-line, use the file form above — do not reach for `/tmp`.
+
    If a GitHub issue was referenced, include `Closes #<number>` in the PR body.
 
 ## Cleanup

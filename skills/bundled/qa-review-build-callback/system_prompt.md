@@ -202,14 +202,14 @@ REASON: Security issues — hardcoded credentials and SQL injection vector
 | `hold[review]` | Judgment findings warrant human review OR a non-AC step failed due to tool error (e.g., a pure compile failure unrelated to AC content) |
 | `block[ac]` | One or more plan ACs unsatisfied (gating; verdict body must include `Plan amendment required:`) |
 | `block[security]` | Security issue found in diff (hardcoded secrets, SQL injection, eval/exec) |
-| `block[pipeline]` | Pipeline violation (missing plan doc, no source changes, plan callout/file/section missing) |
+| `block[pipeline]` | The target repo's pipeline guard rejected (`qa-review` Step 2 executes `scripts/verify-pipeline.sh` / `scripts/plan-doc-check.sh` and quotes the output), or the plan is unreadable in this callback. A missing plan doc is NOT itself a pipeline block unless the repo's guard says so (mika#2172) |
 
 **Verdict rules:**
 - `pass` — all steps completed successfully AND no hold-worthy findings in diff review AND every plan AC marked `[✅]` or `[⏭️]`
 - `hold[review]` — no hard blocks, no AC failures, but judgment findings warrant human review OR a non-AC step failed due to tool error
 - `block[ac]` — at least one plan AC marked `[❌]`; verdict body MUST include `Plan amendment required:` section
 - `block[security]` — security issue found in diff review
-- `block[pipeline]` — pipeline compliance check failed
+- `block[pipeline]` — the target repo's pipeline guard exited non-zero, or the plan is unreadable in this callback (the `:30` structural-failure path above)
 
 **Multiple findings:** If you find both `hold` and `block` issues, the verdict is the most severe `block` sub-type. Severity order: `block[security]` > `block[pipeline]` > `block[ac]` > `hold[review]`.
 

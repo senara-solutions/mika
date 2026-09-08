@@ -186,6 +186,21 @@ jobs:
       - name: Pin the guard's negative behaviour
         run: bash scripts/test-check-image-tags-immutable.sh
 
+  dispatch-seats-lint:
+    name: Dispatch Seat Declaration Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      # An undeclared seat label is DELETED by label-sync (delete-other-labels:
+      # true) from the repo and every issue carrying it, with no `unlabeled`
+      # event — the seat gate then refuses nothing and says nothing (mika#2092).
+      - name: Reject drift between KNOWN_DISPATCH_SEATS and labels.yml (mika#2092)
+        run: bash scripts/check-dispatch-seats-declared.sh
+      # A guard nobody has watched go red is a decoration — same discipline as
+      # byte-slice-lint and image-tag-immutability-lint above (mika#2103).
+      - name: Pin the guard's negative behaviour
+        run: bash scripts/test-check-dispatch-seats-declared.sh
+
   loop-select-lint:
     name: Loop Select Lint
     runs-on: ubuntu-22.04

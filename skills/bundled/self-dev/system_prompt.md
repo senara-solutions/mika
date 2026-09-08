@@ -325,6 +325,18 @@ Never store task UUIDs in core memory — they drift across sessions/compaction.
 
 **Incident:** 2026-04-20 — `check_task` with UUID `12e27a78-08dd-...` failed; real ID was `12e27a78-155c-...` (first 8 chars matched, rest fabricated).
 
+### Rule 12 — A PR body is never written outside the worktree
+
+This rule holds for **every repo** (`mika`, `mika-cloud`, `mika-skills`), whoever writes the PR — you, or a pilot you dispatch. Whenever you compose an `iteration_context` or a free-text prompt that reaches the PR step, carry the rule into it.
+
+The claude-pilot permission policy **refuses every write outside the dispatch worktree**. `/tmp/pr-body-<N>.md` is outside it. Writing the body there yields `[policy:deny] Write: /tmp/pr-body-<N>.md`, `gh pr create --body-file /tmp/...` then finds no file, and the session ends with **no PR at all** — after which the mika#1282 dirty-worktree recovery opens a `wip-rescue` **draft** instead of the clean PR the run was supposed to produce.
+
+**The form that works:** write the body to a file **under the worktree** (`pr-body.md` at its root — gitignored), pass it as `--body-file pr-body.md`, delete it after. It is always writable and, unlike a `<<'BODY'` heredoc, insensitive to what the body contains (a generated body can hold its own delimiter line and terminate the heredoc early). A short single-line body may still go inline with `--body`.
+
+**Never** ask the operator to paste the body by hand when the write is refused — a dispatched session that asks a question is a dead session. Use the worktree file.
+
+**Incident:** mika#2211 — session #2195 (stderr `675479e5-…`) hit `[policy:deny] Write: /tmp/pr-body-2195.md`, then halted on the question "Dis-moi si tu veux que je le colle". Both PRs #2202 and #2210 landed as `wip-rescue` drafts from this one cause.
+
 ---
 
 ## Milestone Workflow

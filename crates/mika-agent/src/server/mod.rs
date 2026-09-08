@@ -432,10 +432,12 @@ async fn init_agent(
     disable_bundled_skills: bool,
     pr_reviews_posted: Arc<dashmap::DashMap<String, std::collections::HashSet<String>>>,
 ) -> Result<AgentState> {
-    // Load per-agent settings (global config.toml → agent config.toml → agent .env → env vars).
-    // Settings::load_for_agent injects per-agent .env as a config source (#430),
-    // so each agent gets its own secrets (e.g., MIKA_GITHUB_APP_*) without
-    // polluting the process environment.
+    // Load per-agent settings (global config.toml → agent config.toml → env vars
+    // → agent .env). Settings::load_for_agent injects per-agent .env as a config
+    // source (#430), so each agent gets its own secrets (e.g., MIKA_GITHUB_APP_*)
+    // without polluting the process environment — and since mika#2218 that source
+    // is added LAST, so this daemon's own environment cannot shadow an identity
+    // secret an agent set for itself. See `Settings::load_for_agent`.
     let agent_settings = Settings::load_for_agent(global_home, agent_home)?;
     let github_token = agent_settings.agent_github_token().map(String::from);
     let agent_llm = agent_settings.make_llm_provider()?;

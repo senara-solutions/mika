@@ -51,3 +51,11 @@ lefthook-local.yml
 # every stale branch touched by dispatch-lib after a fresh iteration run
 # (mika#1705 blocked 2× on this class, 41 commits behind).
 .iterate/
+
+# `pr-body.md` — the PR body a pilot writes at the worktree root before
+# `gh pr create --body-file` (mika#2211). It is deleted right after, but the
+# ignore is what makes the residue harmless: `git status --porcelain` — the
+# dirty-worktree probe dispatch-lib runs — does not report ignored files, so a
+# failed `gh pr create` that leaves the file behind can no longer trip the
+# mika#1282 wip-rescue recovery it was written to avoid.
+/pr-body.md

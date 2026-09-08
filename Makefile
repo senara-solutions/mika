@@ -1,7 +1,7 @@
 INSTALL_DIR ?= $(HOME)/.local/bin
 BINARIES := mika mika-spirit mika-gateway
 
-.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan test-pr-origin test-rescue-signal test-rescue-closes-guard test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv test-github-token-not-in-sandbox test-sandbox-git-usable verify-no-secret-in-setenv verify-no-sigpipe-grep check-byte-slices check-image-tags-immutable verify-egress-no-log verify-bundled-skills lint fmt check check-ngrok deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
+.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan test-pr-origin test-rescue-signal test-rescue-closes-guard test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv test-github-token-not-in-sandbox test-sandbox-git-usable verify-no-secret-in-setenv verify-no-sigpipe-grep check-byte-slices check-image-tags-immutable check-dispatch-seats-declared verify-egress-no-log verify-bundled-skills lint fmt check check-ngrok deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -146,6 +146,8 @@ test: ## Run all tests
 	@bash scripts/test-verify-no-sigpipe-grep.sh
 	@bash scripts/check-image-tags-immutable.sh
 	@bash scripts/test-check-image-tags-immutable.sh
+	@bash scripts/check-dispatch-seats-declared.sh
+	@bash scripts/test-check-dispatch-seats-declared.sh
 	@python3 -B scripts/test-pilot-egress-proxy-status.py
 
 test-async-db-saturation: ## Run async DB channel saturation regression test (mika#1258)
@@ -195,6 +197,10 @@ check-byte-slices: ## Reject byte offsets into text that can miss a char boundar
 check-image-tags-immutable: ## Reject image tags not derived from the commit sha + pin the guard's negative behaviour (mika#2143)
 	@bash scripts/check-image-tags-immutable.sh
 	@bash scripts/test-check-image-tags-immutable.sh
+
+check-dispatch-seats-declared: ## Reject drift between KNOWN_DISPATCH_SEATS and .github/labels.yml + pin the guard's negative behaviour (mika#2092)
+	@bash scripts/check-dispatch-seats-declared.sh
+	@bash scripts/test-check-dispatch-seats-declared.sh
 
 verify-no-sigpipe-grep: ## Reject `printf|echo | grep -q` under pipefail (SIGPIPE trap, mika#2055)
 	@bash scripts/verify-no-sigpipe-grep.sh

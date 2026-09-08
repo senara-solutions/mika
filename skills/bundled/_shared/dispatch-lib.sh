@@ -67,7 +67,8 @@
 #                 ~/.local (uv + claude-pilot binary), ~/.claude (plugin cache),
 #                 ~/.nvm (node runtime), ~/.cargo/{registry,config.toml,bin}
 #                 (crate cache + config — NOT credentials.toml)
-#     * rw binds: $WORKTREE_DIR (branch worktree), ~/.mika/data (transcripts)
+#     * rw binds: $WORKTREE_DIR (branch worktree), ~/.mika/data (transcripts),
+#                 $_PILOT_LOG_DIR (session log, mika#2165 — see the audit below)
 #     * git binds (mika#2141), derived by path from the worktree's own
 #       gitdir + commondir — never /data/workspace in bulk:
 #         rw  $PARENT_GIT/worktrees/<this worktree>   HEAD, index, per-worktree refs
@@ -95,6 +96,30 @@
 #       paths listed above (other worktrees, other repositories)
 #     * $PARENT_GIT/hooks — the sandbox runs no repository hooks; CI is the
 #                           gate, and the rescue path already used --no-verify
+#
+#   EVERY ABSOLUTE PATH THE PILOT WRITES, AND WHETHER IT IS BOUND (mika#2165
+#   AC5). This table is the reason the list above can be trusted: twice now a
+#   writer reached a path the bind set did not cover, and both times the write
+#   succeeded into the sandbox tmpfs and vanished with the container — no
+#   error, no warning. Add a writer, add a row, or the third one is already
+#   written and merely not yet noticed.
+#
+#     writer                                     target                                    status
+#     ----------------------------------------   ---------------------------------------   ------
+#     claude-pilot logger.py:27-28               $_PILOT_LOG_DIR/<task-id>.log             BOUND (mika#2165)
+#     ANTHROPIC_LOG_FILE (mika#1705)             ~/.mika/data/pilot-transcripts/<id>.jsonl BOUND
+#     git (index, refs, objects)                 $PARENT_GIT/... (see the block above)     BOUND (mika#2141)
+#     heartbeat.py / inbox_writer.py /           HTTP urlopen                              no filesystem
+#       permission_events.py
+#     notify.py                                  subprocess.Popen                          no filesystem
+#     egress proxy (dispatch-lib, host `nohup`)  /var/log/mika/pilot-egress-proxy.log      HOST-side; the
+#                                                                                          in-sandbox instance
+#                                                                                          redirects >&2 into
+#                                                                                          the .stderr
+#
+#   The remaining /tmp/ and /var/log occurrences in the pilot's tier1.py and
+#   permissions.py are classification PATTERNS, not writes. Audited 2026-09-06:
+#   there is no third hole.
 #
 #   Read this next paragraph before narrowing or widening anything above.
 #
@@ -160,6 +185,97 @@ _pilot_sandbox_enabled() {
         0|false|no|off|disabled) return 1 ;;
         *) return 0 ;;
     esac
+}
+
+# mika#2165: THE single point of truth for the pilot's session-log directory.
+#
+# Three parties name this directory and they must name the SAME one:
+#
+#   1. the pilot, from INSIDE the sandbox — claude-pilot cli.py:216-219 opens
+#      "<log-dir>/<task-id>.log";
+#   2. the bwrap bind below (_pilot_log_bind_args) — what makes that write
+#      land on the host instead of the sandbox's ephemeral tmpfs root;
+#   3. the host, AFTER the session — the .stderr sibling, the post-flight
+#      guard, dev-groom's /ce:plan gate, and the callback reporters.
+#
+# INVARIANT: the path passed to --log-dir == the path bound == the path read
+# post-flight. Touch one, touch all three in the same commit — the same
+# discipline the gitdir block above states for mika#2141.
+#
+# Until mika#2165 there were three spellings: a hardcoded literal, a
+# ${PILOT_LOG_DIR:-...} that only the READERS honoured, and a bare `--log-dir`
+# that fell through to claude-pilot's own Python `const`. So PILOT_LOG_DIR
+# moved the readers without moving the writer, and nothing bound anything —
+# every .log since 2026-08-04 was written into the sandbox tmpfs and lost with
+# the container, silently.
+#
+# A FUNCTION, not a variable assigned at source time. That distinction is not
+# style: PILOT_LOG_DIR is an environment override, and an override read once at
+# load answers with the default for every caller that sets it AFTER sourcing —
+# silently, which is the exact failure class this ticket exists to close. It
+# was measured: the first cut of this fix froze the value here, and three
+# probes in test-dispatch-lib.sh that set PILOT_LOG_DIR after the source went
+# on reading /var/log/claude-pilot. Resolving late keeps the override honoured
+# wherever it is set.
+#
+# It ASSIGNS $_PILOT_LOG_DIR; it does not print it. That is not a style
+# preference either — it is the mika#2039 secret-channel guard, and the second
+# cut of this fix was measured red against it.
+#
+# The whole dispatch runs under `set -x` with BASH_XTRACEFD, and _emit_callback
+# tails that trace back to the caller. `_scrub_secrets_from_output` only
+# rewrites `NAME=value` and known token shapes, so an accessor that printed
+# would be read as `$(_pilot_log_dir)` and land `++ printf %s <value>` in the
+# trace — a line shape no scrubber here covers. The value at stake today is a
+# directory path, not a credential; but the guard is deliberately shape-based,
+# because a guard that reasoned per-value is the one that lets the next writer
+# through. Assigning emits `+ _PILOT_LOG_DIR=<value>`, which is the shape the
+# scrubber was built for.
+#
+# The other two ways out were rejected: relaxing the guard would trade a
+# structural property for a convenience, and wrapping the printf in
+# `set +x`/restore (the _stage_pilot_gh_token bracket) would hide the line
+# rather than stop producing it — and would teach the next contributor that
+# tripping the guard is answered by silencing the trace.
+#
+# COST, named: an assigning accessor can go stale. Every reader must call
+# `_pilot_log_dir` immediately before reading `$_PILOT_LOG_DIR`, on the same
+# line, so the pair cannot drift apart under a later edit. That co-location is
+# not left to discipline — test-dispatch-lib.sh refuses any read of
+# $_PILOT_LOG_DIR that is not on a line which also calls the resolver.
+_pilot_log_dir() {
+    _PILOT_LOG_DIR="${PILOT_LOG_DIR:-/var/log/claude-pilot}"
+}
+
+# mika#2165: make that directory visible — and writable — from INSIDE.
+#
+# Narrow on purpose: this directory, never /var/log. /var/log/mika holds the
+# egress-proxy log, an incident-diagnosis surface (mika#2041), and the pilot
+# has no business writing there.
+#
+# The bind is rw, not --bind-try, and not a per-task subdirectory: the pilot
+# creates its own file with open("a"), so it needs write on the DIRECTORY; and
+# the host must re-read that file at the same path afterwards. A per-task
+# subdirectory would add a fourth spelling to the invariant above and close
+# nothing.
+#
+# The arg list is left EMPTY rather than binding unconditionally. A `--bind`
+# whose source is missing makes bwrap fail outright: today's defect loses a
+# log, a rigid bind would lose the session. The fallback is loud — that noise
+# is the host half of AC3.
+_pilot_log_bind_args() {
+    local log_dir
+    _pilot_log_dir; log_dir="$_PILOT_LOG_DIR"
+    _PILOT_LOG_BIND_ARGS=()
+    if [ ! -d "$log_dir" ] && ! mkdir -p "$log_dir" 2>/dev/null; then
+        echo "dispatch-lib: pilot_log_guard.unmountable $log_dir does not exist and cannot be created — this session will leave no .log (mika#2165)" >&2
+        return 0
+    fi
+    if [ ! -w "$log_dir" ]; then
+        echo "dispatch-lib: pilot_log_guard.unwritable $log_dir is not writable — this session will leave no .log (mika#2165)" >&2
+        return 0
+    fi
+    _PILOT_LOG_BIND_ARGS=(--bind "$log_dir" "$log_dir")
 }
 
 # Phase 2b (network cut): egress-proxy unix socket path + sandbox-side TCP
@@ -836,6 +952,12 @@ _run_pilot_sandboxed() {
         return 78
     fi
 
+    # mika#2165: the session-log bind. Unlike the gitdir helper this one never
+    # refuses the launch — losing the journal must not cost the work — so it
+    # returns 0 with an empty arg list and says so on stderr instead.
+    local -a _PILOT_LOG_BIND_ARGS=()
+    _pilot_log_bind_args
+
     # Phase 2b: launch host-side egress proxy (idempotent). If it's not
     # available (binary missing, first deploy), returns non-zero and we run
     # in Phase 2a mode (fs cut only, network open) — degraded but functional.
@@ -1052,6 +1174,7 @@ _run_pilot_sandboxed() {
             --ro-bind-try "$HOME/.cargo/bin" "$HOME/.cargo/bin" \
             --ro-bind-try "$HOME/.rustup" "$HOME/.rustup" \
             --bind "$HOME/.mika/data/pilot-transcripts" "$HOME/.mika/data/pilot-transcripts" \
+            ${_PILOT_LOG_BIND_ARGS[@]+"${_PILOT_LOG_BIND_ARGS[@]}"} \
             "${net_bwrap_args[@]}" \
             "${setenv_args[@]}" \
             "${net_setenv_args[@]}" \
@@ -1135,6 +1258,7 @@ $quoted_argv
             --ro-bind-try "$HOME/.cargo/bin" "$HOME/.cargo/bin" \
             --ro-bind-try "$HOME/.rustup" "$HOME/.rustup" \
             --bind "$HOME/.mika/data/pilot-transcripts" "$HOME/.mika/data/pilot-transcripts" \
+            ${_PILOT_LOG_BIND_ARGS[@]+"${_PILOT_LOG_BIND_ARGS[@]}"} \
             "${setenv_args[@]}" \
             ${secret_args[@]+"${secret_args[@]}"} \
             --chdir "$WORKTREE_DIR" \
@@ -1787,6 +1911,34 @@ _is_dispatchable_repo() {
     return 1
 }
 
+# mika#2211 — the PR-body containment rule, carried in every dispatch prompt.
+#
+# The failure it closes, measured: a pilot composing a long PR body reaches for
+# `--body-file /tmp/pr-body-<N>.md` on its own (no prompt ever asked for it), the
+# claude-pilot permission policy refuses every write outside the worktree
+# (`[policy:deny] Write: /tmp/pr-body-2195.md`), `gh pr create --body-file` finds
+# no file, and the session ends by ASKING the operator to paste the body — a
+# dispatched session that asks a question is dead. Zero PR, then the mika#1282
+# dirty-worktree recovery opens a `wip-rescue` draft instead. PRs #2202 and #2210
+# both landed that way from this one cause.
+#
+# It states the positive form FIRST: a pilot told only "not /tmp" still has to
+# invent a replacement, and the one it reaches for next
+# (`--body-file - <<'BODY'`) breaks on a body that contains its own delimiter
+# line — which a generated PR body, full of fenced blocks and headings, can.
+# A file under the worktree is insensitive to the body's content.
+#
+# Kept to a few lines on purpose: it rides at the END of a prompt that already
+# carries up to 16 KiB of ticket context, and recency is the only leverage it has.
+_PR_BODY_CONTAINMENT_RULE="RÈGLE DE DISPATCH (mika#2211) — le corps de PR ne s'écrit JAMAIS hors du worktree.
+Pour ouvrir la PR : écris le corps dans un fichier SOUS le worktree (\`pr-body.md\` à sa racine),
+passe-le en \`--body-file pr-body.md\`, puis supprime-le. Un corps court peut rester en \`--body\` inline.
+N'écris jamais dans \`/tmp\` : la permission-policy refuse toute écriture hors worktree
+(\`[policy:deny] Write: /tmp/pr-body-<N>.md\`), \`gh pr create --body-file\` ne trouve alors aucun fichier,
+et la session se termine sans PR. N'utilise pas non plus de heredoc \`<<'BODY'\` : un corps généré peut
+contenir la ligne délimitrice et le terminer trop tôt. Ne demande jamais à l'opérateur de coller le corps
+— une session dispatchée qui pose une question est une session morte."
+
 # mika#2178 — render the ticket text (body AND comments) in a form that can be
 # injected into the pilot's opening prompt.
 #
@@ -2279,6 +2431,26 @@ Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
             PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$TICKET_CONTEXT")
         fi
 
+        # --- mika#2211: the PR-body containment rule reaches the pilot ---
+        #
+        # The rule belongs HERE and not only in a `.claude/commands/mika.md`,
+        # because this is the one channel every pilot of every repo reads. The
+        # pilot is launched with exactly two inputs (see `_run_pilot_sandboxed
+        # claude-pilot … --command "$ENTRY_COMMAND" … -- "$PROMPT"`): the entry
+        # command, resolved from the TARGET repo's worktree, and this PROMPT.
+        # `skills/bundled/self-dev/system_prompt.md` is mika-dev's own system
+        # prompt and never reaches the pilot process — a guard placed there
+        # alone would be decorative for the failure it is meant to close. So
+        # `mika`'s command file carries the canonical form (mika#2211 AC1),
+        # mika-dev's prompt carries the rule for what IT composes (AC2), and
+        # this line is what covers `mika-cloud` / `mika-skills`, whose command
+        # files still hold the pre-fix inline instruction.
+        #
+        # Appended AFTER the ticket context, so the same three position
+        # invariants documented above still hold, and the FIRST LINE of PROMPT
+        # is still exactly `<repo>#<num>` (the mika#138 contract).
+        PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$_PR_BODY_CONTAINMENT_RULE")
+
         # Save pre-run HEAD SHA for post-flight diff check
         PRE_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
         # Save pre-run remote HEAD for pilot push guard (mika#1318).
@@ -2336,7 +2508,7 @@ _run_claude_pilot() {
     # Persistent stderr copy for post-mortem forensics (mika#1097 Step 0-A).
     # The mktemp file above is deleted after callback delivery; this copy persists
     # alongside the claude-pilot log file so operators can inspect it independently.
-    PERSISTENT_STDERR="/var/log/claude-pilot/${LOG_ID}.stderr"
+    _pilot_log_dir; PERSISTENT_STDERR="$_PILOT_LOG_DIR/${LOG_ID}.stderr"
     # Event-stream capture is `--verbose`, passed unconditionally on the run
     # below — there is no trace flag to add, and adding one would abort the
     # launch (mika#2043).
@@ -2373,13 +2545,35 @@ _run_claude_pilot() {
     PILOT_RAN=1
     # CWD_ARGS is intentionally word-split (multiple flags)
     # shellcheck disable=SC2086
-    _run_pilot_sandboxed claude-pilot --verbose --log-dir --task-id "$LOG_ID" --command "$ENTRY_COMMAND" $CWD_ARGS -- "$PROMPT" >"$STDOUT_FILE" 2>"$STDERR_FILE"
+    # mika#2165: --log-dir is VALUED, not bare. Bare, it fell through to
+    # claude-pilot's own Python `const`, which no override here could move and
+    # which the bind could therefore never be guaranteed to cover.
+    _pilot_log_dir; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$LOG_ID" --command "$ENTRY_COMMAND" $CWD_ARGS -- "$PROMPT" >"$STDOUT_FILE" 2>"$STDERR_FILE"
     PILOT_EXIT=$?
     # Persist stderr to durable file before any processing (mika#1097).
     # Scrub secrets from the persistent copy to prevent durable secret retention (mika#903).
     if [ -s "$STDERR_FILE" ]; then
         mkdir -p "$(dirname "$PERSISTENT_STDERR")" 2>/dev/null || true
         _scrub_secrets_from_output < "$STDERR_FILE" > "$PERSISTENT_STDERR" 2>/dev/null || echo "Warning: failed to persist stderr to $PERSISTENT_STDERR" >&2
+    fi
+    # mika#2165 (AC3): a missing session log can no longer be silent.
+    #
+    # The internal half already exists and does NOT fire here: claude-pilot's
+    # logger.py:34-35 reports an OSError on stderr, but the sandbox root is a
+    # writable tmpfs, so mkdir/open/write all SUCCEED and the file is simply
+    # lost at teardown. Nothing raises. The only party that can notice is the
+    # host, after the fact, by looking for the file it was promised.
+    #
+    # This must run AFTER the persistence above, which truncates ('>'); written
+    # before, the confession would be the thing overwritten.
+    #
+    # -s, not -f: a .log created and left empty is the same observable failure
+    # as a .log never created.
+    _pilot_log_dir; _SESSION_LOG_PATH="$_PILOT_LOG_DIR/${LOG_ID}.log"
+    if [ ! -s "$_SESSION_LOG_PATH" ]; then
+        mkdir -p "$(dirname "$PERSISTENT_STDERR")" 2>/dev/null || true
+        echo "dispatch-lib: pilot_log_guard.missing $_SESSION_LOG_PATH is absent or empty after the session — the session-log bind may have dropped (mika#2165)" \
+            | tee -a "$PERSISTENT_STDERR" >&2
     fi
     # Issue #135: extract first JSON-object line from stdout
     PILOT_OUTPUT_RAW=$(cat "$STDOUT_FILE" 2>/dev/null)
@@ -2434,7 +2628,7 @@ ${PILOT_OUTPUT_RAW}"
         # process ever existed, so "FAILED (exit code 78)" with an empty stdout
         # would send the operator hunting for pilot drift that cannot be there.
         # The reason lives in $_PILOT_GITDIR_BIND_ABORT and on stderr; carry it.
-        RESULT="Log path: /var/log/claude-pilot/${LOG_ID}.log
+        _pilot_log_dir; RESULT="Log path: $_PILOT_LOG_DIR/${LOG_ID}.log
 
 CONTAINMENT REFUSAL (exit 78) — the pilot was never launched.
 
@@ -2444,7 +2638,7 @@ This is not pilot drift and not a pipeline failure: dispatch-lib declined to
 build the sandbox rather than mount something it could not justify (mika#2141).
 Fix the worktree, then re-dispatch."
     else
-        RESULT="Log path: /var/log/claude-pilot/${LOG_ID}.log
+        _pilot_log_dir; RESULT="Log path: $_PILOT_LOG_DIR/${LOG_ID}.log
 
 claude-pilot FAILED (exit code ${PILOT_EXIT}).
 
@@ -2580,7 +2774,8 @@ _measure_cycle_output() {
     # means the SDK never invoked the callback — the model emitted no tool_use
     # at all. KTD3 of mika#1772 applies: stderr only enriches. An absent or
     # unreadable copy leaves the count empty and never decides a verdict.
-    local _stderr_path="${PILOT_LOG_DIR:-/var/log/claude-pilot}/${LOG_ID:-}.stderr"
+    local _stderr_path
+    _pilot_log_dir; _stderr_path="$_PILOT_LOG_DIR/${LOG_ID:-}.stderr"
     if [ -n "${LOG_ID:-}" ] && [ -r "$_stderr_path" ]; then
         CYCLE_TOOL_CALLS=$(grep -c '\[tool:request\]' "$_stderr_path" 2>/dev/null || true)
         case "${CYCLE_TOOL_CALLS}" in
@@ -2785,7 +2980,7 @@ _classify_terminated_session() {
         # or unreadable copy degrades the text and never the verdict — both
         # 2026-08-28 tasks had no .log file at all, and a fail-closed read here
         # would have hidden the entire class.
-        stderr_path="${PILOT_LOG_DIR:-/var/log/claude-pilot}/${LOG_ID}.stderr"
+        _pilot_log_dir; stderr_path="$_PILOT_LOG_DIR/${LOG_ID}.stderr"
         for _candidate in "${STDERR_FILE:-}" "$stderr_path"; do
             [ -n "$_candidate" ] && [ -f "$_candidate" ] && [ -r "$_candidate" ] || continue
             guardrail=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$_candidate" 2>/dev/null \
@@ -3170,7 +3365,7 @@ _post_flight_recovery() {
             # See: docs/solutions/workflow-issues/
             #      2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md
             POLICY_DENY=""
-            PERSISTENT_STDERR_PATH="${PILOT_LOG_DIR:-/var/log/claude-pilot}/${LOG_ID}.stderr"
+            _pilot_log_dir; PERSISTENT_STDERR_PATH="$_PILOT_LOG_DIR/${LOG_ID}.stderr"
             if [ -f "$PERSISTENT_STDERR_PATH" ] && [ -r "$PERSISTENT_STDERR_PATH" ]; then
                 POLICY_DENY=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$PERSISTENT_STDERR_PATH" 2>/dev/null \
                     | grep -m1 '\[policy:deny\]' || true)
@@ -3322,7 +3517,7 @@ dispatch-lib (mika#1383): rescued trailing dirty content into wip() commit; PR c
         # Check session log for /ce:plan invocation (mika#1032).
         # Broad pattern covers Skill tool call JSON, command strings, etc.
         # Fail-open: if log is unavailable, skip the check with a warning.
-        SESSION_LOG="${PILOT_LOG_DIR:-/var/log/claude-pilot}/${LOG_ID}.log"
+        _pilot_log_dir; SESSION_LOG="$_PILOT_LOG_DIR/${LOG_ID}.log"
         CE_PLAN_INVOKED=""
         if [ -f "$SESSION_LOG" ] && [ -r "$SESSION_LOG" ]; then
             if grep -qiE 'ce[.:\-_]plan' "$SESSION_LOG" 2>/dev/null; then
@@ -3343,7 +3538,7 @@ dispatch-lib (mika#1383): rescued trailing dirty content into wip() commit; PR c
         # Fail-open: if stderr is unavailable, fall through to the
         # existing drift messages.
         POLICY_DENY=""
-        PERSISTENT_STDERR_PATH="${PILOT_LOG_DIR:-/var/log/claude-pilot}/${LOG_ID}.stderr"
+        _pilot_log_dir; PERSISTENT_STDERR_PATH="$_PILOT_LOG_DIR/${LOG_ID}.stderr"
         if [ -f "$PERSISTENT_STDERR_PATH" ] && [ -r "$PERSISTENT_STDERR_PATH" ]; then
             # Strip ANSI color codes, then extract the first [policy:deny] line.
             # The line shape is `[policy:deny] <Tool>: <command>[ \[rule-id\]]`.
@@ -4606,7 +4801,7 @@ _launch_revise_pilot() {
     set +e
     # CWD_ARGS is intentionally word-split (multiple flags)
     # shellcheck disable=SC2086
-    _run_pilot_sandboxed claude-pilot --verbose --log-dir --task-id "$revise_log_id" \
+    _pilot_log_dir; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$revise_log_id" \
         --command "/mika-revise-plan" $CWD_ARGS \
         -- "@${findings_file}" \
         >"$revise_stdout" 2>"$revise_stderr"
@@ -5462,6 +5657,46 @@ _deliver_callback() {
     fi
 }
 
+# Le chemin de plan porté par le callout d'un corps d'issue, normalisé — ou rien.
+#
+# mika#2120 : le second lecteur aveugle. Le callout existe en deux écritures, nue
+# (`docs/plans/…`) et préfixée par le dépôt (`mika/docs/plans/…`), et la seconde
+# est celle que la spec de grooming prescrivait. Le motif d'origine exigeait
+# `docs/plans/` collé au backtick : sur un corps préfixé il rendait une chaîne
+# vide, `_detect_plan_on_branch` retournait 0 sans un mot, et le pilote partait
+# sur `/mika` au lieu de `/ce-work <plan>`. Corriger `is_groomed` seul aurait
+# déplacé la mort ici — la promotion aurait réussi, le dispatch serait mort plus
+# loin.
+#
+# Le segment optionnel est **identique** à celui du prédicat Rust
+# (`auto_pull::extract_plan_path`) : un seul segment, premier caractère non
+# ponctuel, donc `../docs/plans/` et `a/b/docs/plans/` sont refusés comme
+# `docs/brainstorms/` l'est.
+#
+# **La normalisation est ce qui rend la tolérance utile.** Le chemin est résolu en
+# `"$WORKTREE_DIR/$PLAN_PATH"` et `$WORKTREE_DIR` est déjà la racine du
+# sous-dépôt : `mika/docs/plans/x.md` y désigne `…/mika/mika/docs/…`, qui
+# n'existe pas. Accepter le préfixe sans retirer le segment ne ferait que déplacer
+# l'échec d'un `grep` vide à un `-f` faux. C'est exactement ce que fait déjà la
+# porte de dispatch (`_committed_plan_on_branch`) en essayant les deux formes.
+#
+# L'ancrage `^` est ajouté au passage, comme côté Rust : il distingue le callout
+# de la prose qui en parle. Il ne distingue pas le callout de sa citation dans un
+# bloc de code — cette moitié-là n'existe que côté Rust, où elle garde une
+# promotion ; ici un faux positif est déjà rattrapé par le test `-f` qui suit.
+_extract_plan_path() {
+    local body="$1" path
+    path=$(printf '%s\n' "$body" \
+        | grep -oP '^> - \*\*Plan:\*\* `\K(?:[A-Za-z0-9_-][A-Za-z0-9._-]*/)?docs/plans/[^`]+' \
+        | head -1)
+    [ -n "$path" ] || return 1
+    case "$path" in
+        docs/plans/*) printf '%s\n' "$path" ;;
+        */docs/plans/*) printf '%s\n' "${path#*/}" ;;
+        *) return 1 ;;
+    esac
+}
+
 _detect_plan_on_branch() {
     # Plan-on-branch detection (mika#1074): When the issue body contains a groomed
     # plan callout, override ENTRY_COMMAND from "/mika" to "/ce:work <path>".
@@ -5480,14 +5715,19 @@ _detect_plan_on_branch() {
     # Guard: need a worktree directory for file validation
     [ -n "$WORKTREE_DIR" ] || return 0
 
-    # Extract plan path from the callout pattern:
+    # Extract plan path from the callout pattern, in either écriture:
     #   > - **Plan:** `docs/plans/<filename>.md` (committed on branch @ <sha>)
-    # The pattern requires `docs/plans/` prefix to avoid false positives on
-    # prose containing "Plan:" (consistent with self-dev bypass predicate).
+    #   > - **Plan:** `<repo>/docs/plans/<filename>.md` (committed on branch @ <sha>)
+    # The `docs/plans/` literal is what avoids false positives on prose containing
+    # "Plan:" (consistent with the self-dev bypass predicate); the optional repo
+    # segment is mika#2120. `_extract_plan_path` returns the path already
+    # normalized relative to $WORKTREE_DIR.
+    #
+    # Guard: no callout, or a callout whose path is not a plan → no-op. The
+    # helper never succeeds with an empty path, so its exit code IS the
+    # emptiness guard; a second `[ -n "$PLAN_PATH" ]` here would be dead.
     local PLAN_PATH
-    PLAN_PATH=$(printf '%s\n' "$ISSUE_BODY" | grep -oP '> - \*\*Plan:\*\* `\Kdocs/plans/[^`]+' | head -1)
-
-    [ -n "$PLAN_PATH" ] || return 0
+    PLAN_PATH=$(_extract_plan_path "$ISSUE_BODY") || return 0
 
     # Validate the plan file exists in the worktree
     if [ -f "$WORKTREE_DIR/$PLAN_PATH" ]; then

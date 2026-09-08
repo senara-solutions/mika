@@ -173,6 +173,96 @@ f="$(make_fixture "$ACCENTED_OK" "dépôt d'images/agent-image-build-push.yml")"
 assert_exit "$f" 0 "accented path + accented comment, sha-only list, passes"
 rm -rf "$(dirname "$f")"
 
+# ── 8. THE INDIRECTION (mika#2174). `main-<short8>` is the tag the downstream
+#    rotation consumes, and GitHub's expression language has no substring — so
+#    the short sha travels through a variable. The guard resolves that against
+#    the file's own assignments. Both halves need pinning: refusing a tag whose
+#    derivation IS shown would get the guard deleted on the next correct change;
+#    accepting one whose derivation is NOT shown is mika#2143 with one extra step.
+
+# 8a. The real shape this repo now ships: derivation present, tag resolves.
+f="$(make_fixture '      - name: Derive the short sha
+        run: echo "SHORT_SHA=${GITHUB_SHA:0:8}" >> "$GITHUB_ENV"
+          tags: |
+            registry/repo:${{ github.sha }}
+            registry/repo:main-${{ env.SHORT_SHA }}')"
+assert_exit "$f" 0 "a variable the file derives from the sha resolves (main-\${{ env.SHORT_SHA }})"
+rm -rf "$(dirname "$f")"
+
+# 8b. FAIL-CLOSED: the same tag, with the derivation removed. If this ever goes
+#     green, every moving tag can be laundered through a variable name.
+f="$(make_fixture '          tags: |
+            registry/repo:${{ github.sha }}
+            registry/repo:main-${{ env.SHORT_SHA }}')"
+assert_exit "$f" 1 "the same tag WITHOUT a derivation in the file is rejected"
+rm -rf "$(dirname "$f")"
+
+# 8c. A variable is not a password. One assigned from something that is not the
+#     sha must not resolve, whatever it is called.
+f="$(make_fixture '      - name: Not a derivation at all
+        run: echo "SHORT_SHA=latest" >> "$GITHUB_ENV"
+          tags: |
+            registry/repo:${{ github.sha }}
+            registry/repo:${{ env.SHORT_SHA }}')"
+assert_exit "$f" 1 "a variable assigned from a non-sha value does not resolve"
+rm -rf "$(dirname "$f")"
+
+# 8d. A derivation written in a COMMENT is a claim, not a mechanism.
+f="$(make_fixture '      # run: echo "SHORT_SHA=${GITHUB_SHA:0:8}" >> "$GITHUB_ENV"
+          tags: |
+            registry/repo:main-${{ env.SHORT_SHA }}')"
+assert_exit "$f" 1 "a derivation that exists only in a comment does not resolve"
+rm -rf "$(dirname "$f")"
+
+# 8e. The other writing of an assignment: a YAML `env:` mapping entry.
+f="$(make_fixture '    env:
+      BUILD_SHA: ${{ github.sha }}
+          tags: |
+            registry/repo:main-${{ env.BUILD_SHA }}')"
+assert_exit "$f" 0 "a sha-derived \`env:\` mapping entry resolves"
+rm -rf "$(dirname "$f")"
+
+# 8f. ...and a step output, the third place a workflow puts a derived value.
+f="$(make_fixture '      - id: meta
+        run: echo "short=${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
+          tags: |
+            registry/repo:main-${{ steps.meta.outputs.short }}')"
+assert_exit "$f" 0 "a sha-derived step output resolves"
+rm -rf "$(dirname "$f")"
+
+# 8g. Name boundary: resolving `SHORT_SHA` must not resolve `SHORT_SHA_SUFFIX`.
+#     A prefix match would hand every variable starting with a derived name a
+#     free pass — the "one spelling" failure wearing a substring costume.
+f="$(make_fixture '      - name: Derive the short sha
+        run: echo "SHORT_SHA=${GITHUB_SHA:0:8}" >> "$GITHUB_ENV"
+          tags: |
+            registry/repo:main-${{ env.SHORT_SHA_SUFFIX }}')"
+assert_exit "$f" 1 "a different variable sharing a derived name's prefix does not resolve"
+rm -rf "$(dirname "$f")"
+
+# 8g-bis. The mapping form is read only inside an `env:` block. Otherwise a
+#     plain-scalar `tags:` line mentioning the sha would enrol the key `tags`
+#     itself, and a tag could be legitimised by a variable named after the very
+#     key that carries it. Contrived, cheap to close, so closed.
+f="$(make_fixture '          tags: registry/repo:${{ github.sha }}
+          tags: registry/repo:${{ env.tags }}')"
+assert_exit "$f" 1 "a \`key:\` outside an \`env:\` block does not become a derived variable"
+rm -rf "$(dirname "$f")"
+
+# 8h. THE FOUNDING DEFECT THROUGH THE NEW DOOR. A file that legitimately derives
+#     a variable must not thereby legitimise the `latest` sitting next to it.
+f="$(make_fixture '      - name: Derive the short sha
+        run: echo "SHORT_SHA=${GITHUB_SHA:0:8}" >> "$GITHUB_ENV"
+          tags: |
+            registry/repo:main-${{ env.SHORT_SHA }}
+            registry/repo:latest')"
+assert_exit "$f" 1 "a resolvable variable does not launder a \`:latest\` beside it"
+assert_output_contains "$f" "registry/repo:latest" \
+    "the failure still names the moving tag, not the resolvable one"
+assert_output_contains "$f" "Found 1 tag(s)" \
+    "only the moving tag is counted when a resolvable one is present"
+rm -rf "$(dirname "$f")"
+
 echo ""
 echo "check-image-tags-immutable anti-vacuity: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
