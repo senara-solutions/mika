@@ -481,6 +481,19 @@ emoji = "✦"
 
 **`[context.summary]` behavior:** `inject = false` (Axis 4) is a load-prevention gate — `db.load_conversation_summary()` is never called and the summary is not available to any downstream code path. `max_tokens` (Axis 3) is mode-conditional — it only fires on silent-mode turns (when `SilentTrigger` is present). Axis 4 always wins: when `inject = false`, the `max_tokens` field is never evaluated. See `crates/mika-agent/CLAUDE.md` for implementation details.
 
+**Missing, unreadable, or malformed file:** a missing `identity.toml` makes the
+agent start **fail-closed** — zero skills, every mutational built-in tool denied
+(mika#2027). Absence never means "everything permitted". The three faults are
+logged under distinct event names (`identity_toml_absent`,
+`identity_toml_unreadable`, `identity_toml_malformed`) because they need
+different remediations. Note that **deleting the file and restarting does not
+regenerate it**: bootstrap only runs on an uninitialized home. A fail-closed
+start also empties the agent's `skills/` directory of its bundled-skill symlinks
+(re-materialized on the first valid start). The supported re-provisioning gesture
+is in `docs/operator/agent-identity-reprovision.md` in the repository — the path
+is written out rather than linked because this page is also shipped as a
+crate-local copy where a relative link would dangle.
+
 To customize, edit `~/.mika/identity.toml`:
 
 ```toml

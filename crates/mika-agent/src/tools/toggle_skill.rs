@@ -121,6 +121,15 @@ mod tests {
 
     fn setup_with_skill(name: &str) -> (TempDir, TestHarness) {
         let tmp = TempDir::new().unwrap();
+        // An agent home carries an identity.toml; since mika#2027 its absence is
+        // fail-closed (zero skills) rather than permissive, and the guard above
+        // would refuse every toggle. No `[skills]` block = no allowlist filter,
+        // which is what these tests used to get by accident.
+        std::fs::write(
+            tmp.path().join("identity.toml"),
+            "name = \"Mika\"\nemoji = \"✦\"\n",
+        )
+        .unwrap();
         let skill_dir = tmp.path().join("skills").join(name);
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
