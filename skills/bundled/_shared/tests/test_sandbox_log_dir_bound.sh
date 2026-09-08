@@ -114,16 +114,25 @@ _PILOT_SANDBOX_SECRET_ALLOWLIST=()
 echo ""
 echo "PRECONDITION — the resolver honours the redirect"
 echo "------------------------------------------------"
-assert_eq "_pilot_log_dir follows PILOT_LOG_DIR" "$PILOT_LOG_DIR" "$(_pilot_log_dir)"
+# `_pilot_log_dir` ASSIGNS $_PILOT_LOG_DIR rather than printing it — see the
+# mika#2039 collision documented at the resolver: a printing accessor is read as
+# `$(...)`, and under the dispatch's `set -x` that lands `++ printf %s <value>`
+# in the trace file _emit_callback returns to the caller, a line shape no
+# scrubber covers. The guard bans the shape without inspecting the value.
+_pilot_log_dir
+assert_eq "_pilot_log_dir follows PILOT_LOG_DIR" "$PILOT_LOG_DIR" "$_PILOT_LOG_DIR"
 
 # And it follows it whenever it changes, not only at the value it held when the
 # library was sourced. Without this, every host-side assertion below would still
 # pass against a resolver frozen at load time — and the three probes in
 # test-dispatch-lib.sh that set the override late would keep silently reading
 # the operational directory.
-_late=$(PILOT_LOG_DIR="$TMPROOT/moved-after-source" _pilot_log_dir)
+_late=$(PILOT_LOG_DIR="$TMPROOT/moved-after-source" _pilot_log_dir; printf '%s' "$_PILOT_LOG_DIR")
 assert_eq "the override is read at the point of use, not at source time" \
     "$TMPROOT/moved-after-source" "$_late"
+# That subshell moved $_PILOT_LOG_DIR in its own scope only; restore the
+# outer one so the probes below cannot read a value from the wrong assertion.
+_pilot_log_dir
 
 echo ""
 echo "MUST WORK — the log directory is writable from inside, and survives"
