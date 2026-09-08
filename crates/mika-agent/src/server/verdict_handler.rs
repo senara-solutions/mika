@@ -37,6 +37,7 @@ use crate::tools::pr_merge_with_gate::{
 
 use super::verdict::{
     PrReviewEvent, Verdict, parse_pr_review_event, parse_review_depth, parse_verdict,
+    verdict_raw_value,
 };
 use super::webhook_queue::has_active_callback_child;
 
@@ -1686,16 +1687,54 @@ async fn handle_missing_verdict(
     let pr_url = event.pr_url();
     let body_excerpt = truncate_body(&event.body);
 
-    // Log structured verdict_classification_failed event
-    warn!(
-        pr_number = event.pr_number,
-        repo = %event.repo,
-        reviewer = %event.reviewer,
-        review_url = %event.review_url,
-        body_truncated = truncated,
-        body_excerpt = %truncate_body_for_log(&body_excerpt),
-        "verdict_classification_failed: no parseable VERDICT: line in review body"
-    );
+    // mika#2239 (D2) — `Verdict::Missing` conflates two different failures, and
+    // the single WARN below asserted the first of them unconditionally. On
+    // mika#2236 the `VERDICT:` line WAS present and parsable; only its value
+    // (`pass ✅`) was rejected. The message said otherwise, and that is what
+    // produced a false diagnosis of the incident. Branch on whether the line
+    // exists so the log states which of the two happened.
+    let raw_value = verdict_raw_value(&event.body);
+
+    match raw_value.as_deref() {
+        None => warn!(
+            pr_number = event.pr_number,
+            repo = %event.repo,
+            reviewer = %event.reviewer,
+            review_url = %event.review_url,
+            body_truncated = truncated,
+            body_excerpt = %truncate_body_for_log(&body_excerpt),
+            "verdict_classification_failed: no parseable VERDICT: line in review body"
+        ),
+        Some(value) => warn!(
+            pr_number = event.pr_number,
+            repo = %event.repo,
+            reviewer = %event.reviewer,
+            review_url = %event.review_url,
+            body_truncated = truncated,
+            verdict_value = %value,
+            body_excerpt = %truncate_body_for_log(&body_excerpt),
+            "verdict_classification_failed: VERDICT: line present but value unrecognized"
+        ),
+    }
+
+    // mika#2239 (D2c) — GitHub says APPROVED and the engine does not understand
+    // the verdict: a decoration class this fix does not cover. Named separately
+    // from the generic WARN above so the monitor can grep it, and so the
+    // head-decoration wake-up condition of D-D (a `verdict_value` not starting
+    // with an ASCII alphanumeric) is detectable at all.
+    if event.state.eq_ignore_ascii_case("approved")
+        && let Some(value) = raw_value.as_deref()
+    {
+        warn!(
+            event = "verdict_approved_but_unclassified",
+            pr_number = event.pr_number,
+            repo = %event.repo,
+            reviewer = %event.reviewer,
+            review_url = %event.review_url,
+            verdict_value = %value,
+            "verdict: review is APPROVED on GitHub but its VERDICT value did not classify (mika#2239)"
+        );
+    }
 
     // Look up task — if found, update metadata; if not, still handle structurally
     if let Some(task) = find_task_for_verdict(db, &pr_url, event).await {
