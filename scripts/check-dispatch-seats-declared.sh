@@ -182,7 +182,7 @@ VIOLATIONS=0
 
 while IFS= read -r seat; do
     [[ -z "$seat" ]] && continue
-    if ! printf '%s\n' "$DECLARED" | grep -qxF "$seat"; then
+    if ! grep -qxF "$seat" <<< "$DECLARED"; then
         echo "ERROR: seat \`$seat\` is in KNOWN_DISPATCH_SEATS but \`dispatch:$seat\` is not declared in $(basename "$LABELS_YML")"
         VIOLATIONS=$((VIOLATIONS + 1))
     fi
@@ -190,7 +190,7 @@ done <<< "$SEATS"
 
 while IFS= read -r declared; do
     [[ -z "$declared" ]] && continue
-    if ! printf '%s\n' "$SEATS" | grep -qxF "$declared"; then
+    if ! grep -qxF "$declared" <<< "$SEATS"; then
         echo "ERROR: label \`dispatch:$declared\` is declared in $(basename "$LABELS_YML") but \`$declared\` is not in KNOWN_DISPATCH_SEATS"
         VIOLATIONS=$((VIOLATIONS + 1))
     fi
