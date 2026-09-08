@@ -2716,7 +2716,16 @@ async fn phase2_reconcile_stuck_ready(
                     debug!(issue = n, reason, "stuck_ready_reconcile_skipped");
                 }
                 StuckReadyVerdict::Abandon(reason) => {
-                    abandon_stuck_ready(db, github_token, n, reason, trace_id, session_id).await;
+                    abandon_stuck_ready(
+                        db,
+                        github_token,
+                        label_auth,
+                        n,
+                        reason,
+                        trace_id,
+                        session_id,
+                    )
+                    .await;
                 }
                 // `classify_stuck_ready_in_memory` yields only those two.
                 other => debug!(
@@ -2795,7 +2804,16 @@ async fn phase2_reconcile_stuck_ready(
                 survivors.push(n);
             }
             StuckReadyVerdict::Abandon(reason) => {
-                abandon_stuck_ready(db, github_token, n, reason, trace_id, session_id).await;
+                abandon_stuck_ready(
+                    db,
+                    github_token,
+                    label_auth,
+                    n,
+                    reason,
+                    trace_id,
+                    session_id,
+                )
+                .await;
             }
         }
     }
@@ -2893,6 +2911,7 @@ async fn phase2_reconcile_stuck_ready(
                 if !promotion_gate_allows(
                     db,
                     github_token,
+                    label_auth,
                     issue,
                     "phase2_stuck_rescue",
                     trace_id,
@@ -2909,14 +2928,14 @@ async fn phase2_reconcile_stuck_ready(
             ),
         }
 
-        if let Err(e) = gh_remove_label(github_token, n, "ready").await {
+        if let Err(e) = gh_remove_label(label_auth, n, "ready").await {
             warn!(error = %e, issue = n, "auto_pull: phase 2 remove ready label failed");
             if let Err(e2) = db.increment_auto_pull_failure(DEFAULT_REPO, n).await {
                 warn!(error = %e2, "auto_pull: failed to increment failure counter");
             }
             continue;
         }
-        if let Err(e) = gh_apply_label(github_token, n, "ready").await {
+        if let Err(e) = gh_apply_label(label_auth, n, "ready").await {
             warn!(error = %e, issue = n, "auto_pull: phase 2 re-add ready label failed");
             if let Err(e2) = db.increment_auto_pull_failure(DEFAULT_REPO, n).await {
                 warn!(error = %e2, "auto_pull: failed to increment failure counter");
