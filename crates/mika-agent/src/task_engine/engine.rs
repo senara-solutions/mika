@@ -475,6 +475,13 @@ impl TaskEngine {
             self.expire_timed_out_tasks().await;
             self.kill_orphan_processes().await;
             self.check_callback_process_liveness().await;
+            // mika#2249 D1: the mirror of the watchdog above. That one owns the
+            // dispatch whose process is DEAD; this one owns the dispatch whose
+            // process is ALIVE and whose worktree has stopped receiving writes —
+            // a population every state-driven reaper is structurally blind to.
+            // The two select disjoint sets, so this order costs nothing and
+            // keeps the whole repair ladder readable in one place.
+            self.reap_silently_stalled_pilots().await;
             // mika#1712: sweep NULL-PID phantom tracking rows the callback
             // watchdog cannot see (its first predicate is
             // `process_id IS NOT NULL`) and the orphaned-parent reaper does not
@@ -1605,6 +1612,287 @@ impl TaskEngine {
                     }
                 }
             }
+        }
+    }
+
+    /// Reap dispatches whose process is alive but whose worktree has gone
+    /// silent (mika#2249, D1).
+    ///
+    /// # The population nothing else can see
+    ///
+    /// Every existing reaper fires on **task state**: orphan-on-startup, the
+    /// stuck-`pending` reaper, the stale-`blocked` reaper, the two self_dev
+    /// parent reapers. A task that is `in_progress` with a **live** process is
+    /// structurally invisible to all of them — which is why `fb355061` sat for
+    /// 2 h 18 with an empty `result` and no terminal marker. The PID watchdog
+    /// [`Self::check_callback_process_liveness`] is this method's exact mirror:
+    /// it owns the process that is **dead**; nothing owned the process that is
+    /// **alive and mute**.
+    ///
+    /// # Why this lives in the engine and not in claude-pilot
+    ///
+    /// The word is load-bearing: the detector must be **external**. Both
+    /// mika#2246 pilots ran with a working internal watchdog compiled in
+    /// (`toolWaitCeiling=1800s modelWaitCeiling=900s` appear in all three logs,
+    /// fields that only exist post-cpp#145) and neither fired. A watchdog
+    /// starved inside the pilot's own event loop cannot fire on a pilot-side
+    /// timer either, whatever that timer measures. Any detector housed in
+    /// claude-pilot inherits the failure it exists to see.
+    ///
+    /// # The predicate, term by term (AC4)
+    ///
+    /// A conjunction, and each term is pinned by a negative-control test that
+    /// neutralises **only** it:
+    ///
+    /// 1. `trigger_type='callback'`, `status='in_progress'`, `process_id NOT
+    ///    NULL` — the population, straight from
+    ///    [`AsyncDatabase::get_active_callback_tasks_with_pid`].
+    /// 2. The process is **alive** (`is_same_process_alive`, PID-reuse safe).
+    ///    A dead one belongs to the watchdog above.
+    /// 3. A worktree was **declared** ([`DISPATCH_WORKTREE_FILE_KEY`]) and the
+    ///    declaration file is readable and non-empty.
+    /// 4. The declared path **exists** and yields at least one mtime.
+    /// 5. That mtime is older than the configured window.
+    /// 6. The task is **still** `in_progress` on re-read — so an in-flight
+    ///    callback wins the race cleanly.
+    ///
+    /// Terms 3 and 4 are the fail-safe, and they run the same way as
+    /// everything else here: **absence of evidence is never evidence**. A
+    /// free-text dispatch has no worktree at all (`engine.rs`'s mika#1593
+    /// path); a dispatch whose declaration was lost is indistinguishable from
+    /// one. Both fall out of the population rather than into it.
+    ///
+    /// # Detection is unconditional; disposition is not (Décision 4)
+    ///
+    /// The audit row is written whenever the predicate holds. The kill and the
+    /// transition happen only when `pilot_stall_reap_enabled` is armed, which
+    /// it is **not** by default. The asymmetry is the reason: a false negative
+    /// costs one dispatch slot, a false positive destroys hours of work in a
+    /// decision-core worktree, and the threshold's negative control is a
+    /// sample of size one. So the mechanism ships whole and measures first —
+    /// see [`mika_common::config::DEFAULT_PILOT_STALL_REAP_ENABLED`] for the
+    /// dated flip condition.
+    async fn reap_silently_stalled_pilots(&self) {
+        let tasks = match self.db.get_active_callback_tasks_with_pid().await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(error = %e, "pilot_stall_reaper: failed to query active callback tasks");
+                return;
+            }
+        };
+        if tasks.is_empty() {
+            return;
+        }
+
+        let settings = &self.dispatcher.settings;
+        let max_age_secs = settings.effective_pilot_stall_reap_age_seconds();
+        let disposition_armed = settings.effective_pilot_stall_reap_enabled();
+        let agent_id = self.db.agent_id().to_string();
+        let system_session = format!("system-{agent_id}");
+
+        for task in tasks {
+            // Term 1: a usable PID.
+            let pid = match task.process_id {
+                Some(pid) if pid > 0 => pid,
+                _ => continue,
+            };
+
+            let metadata: Option<serde_json::Value> = task
+                .metadata
+                .as_deref()
+                .and_then(|m| serde_json::from_str(m).ok());
+
+            let start_time: Option<u64> = metadata
+                .as_ref()
+                .and_then(|v| v.get("process_start_time")?.as_str()?.parse().ok());
+
+            // Term 2: the process must be ALIVE. A dead one is
+            // `check_callback_process_liveness`'s population, not ours — the two
+            // methods select disjoint sets by construction, which is why they
+            // can sit next to each other in the same tick with no ordering
+            // hazard.
+            let process_alive = match (u32::try_from(pid).ok(), start_time) {
+                (Some(p), Some(st)) => super::process_liveness::is_same_process_alive(p, st),
+                // No stored start time (pre-#959 task, or a metadata write that
+                // failed) — the pair that identifies a process *instance* is
+                // incomplete, so a recycled PID would read as alive. Decline
+                // rather than guess: this reaper kills.
+                _ => continue,
+            };
+            if !process_alive {
+                continue;
+            }
+
+            // Term 3: a declared worktree. Every failure below is "not a
+            // candidate", never "stale".
+            let Some(declaration_file) = metadata
+                .as_ref()
+                .and_then(|v| v.get(DISPATCH_WORKTREE_FILE_KEY)?.as_str())
+                .map(std::path::PathBuf::from)
+            else {
+                continue;
+            };
+            let Ok(declared) = std::fs::read_to_string(&declaration_file) else {
+                continue;
+            };
+            let worktree = std::path::PathBuf::from(declared.trim());
+            if declared.trim().is_empty() {
+                continue;
+            }
+
+            // Terms 4 and 5: the worktree exists, yields an mtime, and that
+            // mtime is older than the window.
+            let Some(age_secs) = super::worktree_activity::seconds_since_last_write(&worktree)
+            else {
+                continue;
+            };
+            if age_secs <= max_age_secs {
+                continue;
+            }
+
+            // Term 6: still `in_progress`. Re-read rather than trust the
+            // snapshot — the scan above did filesystem I/O, and a callback may
+            // have landed meanwhile.
+            let current = match self.db.get_task(&task.id).await {
+                Ok(Some(t)) => t,
+                _ => continue,
+            };
+            if current.status != task_status::IN_PROGRESS {
+                debug!(
+                    task_id = %task.id,
+                    status = %current.status,
+                    "pilot_stall_reaper: task transitioned during the scan, skipping"
+                );
+                continue;
+            }
+
+            self.dispose_of_silently_stalled_pilot(
+                &task,
+                pid,
+                start_time,
+                &worktree,
+                age_secs,
+                max_age_secs,
+                disposition_armed,
+                &system_session,
+            )
+            .await;
+        }
+    }
+
+    /// Report — and, when armed, dispose of — one silently stalled dispatch
+    /// (mika#2249, AC1/AC2/AC6/AC8).
+    ///
+    /// Split out of [`Self::reap_silently_stalled_pilots`] so the predicate
+    /// reads as a predicate and the destructive half reads as one action. The
+    /// caller has already established every term; this method only decides
+    /// between *say it* and *say it and act on it*.
+    #[allow(clippy::too_many_arguments)]
+    async fn dispose_of_silently_stalled_pilot(
+        &self,
+        task: &crate::db::Task,
+        pid: i64,
+        start_time: Option<u64>,
+        worktree: &std::path::Path,
+        age_secs: u64,
+        max_age_secs: u64,
+        disposition_armed: bool,
+        system_session: &str,
+    ) {
+        // The disposition runs BEFORE the audit write, so `after_value` states
+        // what actually happened rather than what was intended. A kill that
+        // failed and a kill that was never attempted must not produce the same
+        // row — the flip condition in Décision 4 is read off these rows.
+        let mut transitioned = false;
+        if disposition_armed {
+            // Pre-write the discriminator BEFORE the signal (Décision 3, AC6).
+            // Left to itself, `dispatch-lib`'s TERM trap writes
+            // `STATUS=CANCELLED_BY_SIGNAL`, which `self-dev-callback` reads as
+            // an operator cancel and answers with *do NOT retry*. The reaper
+            // would then have killed the pilot AND the retry. The trap only
+            // writes when the file is absent, so this wins the race.
+            super::process_kill::pre_write_cancel_reason(
+                pid,
+                super::process_kill::CANCEL_REASON_PILOT_SILENT_STALL,
+            );
+            let killed = super::process_kill::kill_process_gracefully(pid, start_time).await;
+            if !killed {
+                warn!(
+                    task_id = %task.id,
+                    pid,
+                    "pilot_stall_reaper: kill failed; leaving the task in_progress rather than \
+                     claiming a disposition that did not happen"
+                );
+            } else {
+                // `failed`, not `cancelled`: `cancelled` is the operator's word
+                // and carries "do not retry" downstream. This dispatch is to be
+                // re-driven, by `stuck_ready_reconcile`, once the ticket is back
+                // in the pool.
+                match self
+                    .db
+                    .update_task_failed(&task.id, "pilot_silent_stall")
+                    .await
+                {
+                    Ok(true) => {
+                        transitioned = true;
+                        let _ = self.db.clear_task_process_id(&task.id).await;
+                    }
+                    Ok(false) => {
+                        debug!(
+                            task_id = %task.id,
+                            "pilot_stall_reaper: task reached a terminal state first"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(task_id = %task.id, error = %e, "pilot_stall_reaper: failed to mark task failed");
+                    }
+                }
+            }
+        }
+
+        let after_value = if transitioned {
+            task_status::FAILED
+        } else {
+            task_status::IN_PROGRESS
+        };
+        warn!(
+            event = "pilot_silent_stall",
+            task_id = %task.id,
+            parent_task_id = ?task.parent_task_id,
+            pid,
+            worktree = %worktree.display(),
+            worktree_idle_secs = age_secs,
+            threshold_secs = max_age_secs,
+            disposition_armed,
+            transitioned,
+            "pilot_silent_stall: dispatch process is alive but its worktree has received no \
+             write past the configured window"
+        );
+
+        if let Err(e) = self
+            .db
+            .log_audit_event(
+                system_session,
+                "pilot_silent_stall",
+                &format!("task:{}", task.id),
+                Some(task_status::IN_PROGRESS),
+                Some(after_value),
+                Some(&format!(
+                    "worktree {} idle for {age_secs}s (threshold {max_age_secs}s), pid {pid} \
+                     alive; disposition_armed={disposition_armed}, transitioned={transitioned}",
+                    worktree.display()
+                )),
+                None,
+            )
+            .await
+        {
+            // Non-fatal, but worth saying plainly: this row IS the deliverable
+            // while the flag is disarmed, and the flip condition counts these.
+            warn!(
+                task_id = %task.id,
+                error = %e,
+                "pilot_stall_reaper: failed to write the pilot_silent_stall audit event"
+            );
         }
     }
 
