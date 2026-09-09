@@ -79,6 +79,7 @@ mod eval {
     mod test_required_tools_gate;
     mod test_schema_divergence;
     mod test_self_knowledge_kg;
+    mod test_supersede_kills_live_pilot;
     mod test_task_not_found_retry;
     mod test_tool_call_secret_redaction;
     mod test_tool_call_stream_emission;

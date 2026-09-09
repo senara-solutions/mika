@@ -751,6 +751,19 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Async wrapper for
+    /// [`Database::find_live_dispatch_rows_by_reference_url_and_variants`]
+    /// (mika#2263 défaut (a)). `base_url` MUST be canonical (no `?phase=groom`).
+    pub async fn find_live_dispatch_rows_by_reference_url_and_variants(
+        &self,
+        base_url: &str,
+    ) -> Result<Vec<Task>> {
+        let a = self.agent_id.clone();
+        let url = base_url.to_owned();
+        self.with_db(move |db| db.find_live_dispatch_rows_by_reference_url_and_variants(&a, &url))
+            .await
+    }
+
     /// Async wrapper for [`Database::cancel_task_superseded`] (mika#1934 AC2).
     pub async fn cancel_task_superseded(&self, id: &str) -> Result<bool> {
         let a = self.agent_id.clone();

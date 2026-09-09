@@ -18,10 +18,21 @@
 //! grooming branch.
 
 use crate::async_db::AsyncDatabase;
+use crate::task_engine::process_kill::{
+    CANCEL_REASON_SUPERSEDED, kill_process_gracefully, pre_write_cancel_reason,
+};
 use crate::task_state::tasks::{
     SUPERSEDED_BY_NEW_DISPATCH, TRACKING_ROW_SUPERSEDED_TOOL, strip_groom_phase_suffix,
 };
 use tracing::{info, warn};
+
+/// `audit_events.tool_name` for a live pilot disposed of by a fresh dispatch
+/// (mika#2263 défaut (a)). Distinct from [`TRACKING_ROW_SUPERSEDED_TOOL`],
+/// which counts phantom ROWS: a superseded row and a killed PROCESS are two
+/// different events, and collapsing them would make "how often did the loop
+/// leave a zombie behind" uncountable — the one number this fix exists to
+/// drive to zero.
+pub const SUPERSEDED_DISPATCH_PROCESS_KILLED_TOOL: &str = "superseded_dispatch_process_killed";
 
 /// Cancel every active phantom tracking row that a fresh dispatch for
 /// `reference_url` (+ `label`) supersedes, emitting one
@@ -45,6 +56,14 @@ pub async fn supersede_prior_tracking_rows(
     label: &str,
 ) -> usize {
     let base_url = strip_groom_phase_suffix(reference_url);
+
+    // mika#2263 défaut (a) — dispose of the PROCESS before the ROWS.
+    //
+    // Ordered first deliberately: the fresh dispatch is about to take the same
+    // worktree, and the whole point is that no prior pilot is still writing to
+    // it when that happens. Killing after the row bookkeeping would still leave
+    // a window where two writers share an arbre (classe #2248/#2249).
+    dispose_superseded_dispatch_processes(db, session_id, trace_id, base_url).await;
 
     // Collect candidate (task_id, reference_url) pairs, deduped by id. URL-variant
     // branch first, then the NULL-URL label fallback.
@@ -136,4 +155,120 @@ pub async fn supersede_prior_tracking_rows(
     }
 
     superseded
+}
+
+/// Kill the pilot process of every LIVE dispatch that a fresh dispatch for
+/// `base_url` supersedes, and mark its row terminal (mika#2263 défaut (a)).
+///
+/// **The defect this closes.** Superseding cancelled the ROW and ignored the
+/// PROCESS. On 2026-09-09 `#2252` and `#2212` each ended with a `cancelled`
+/// row and a bwrap pilot still alive on its worktree — 69 min and 45 min of a
+/// burned dispatch slot, plus a second writer on an arbre a fresh dispatch was
+/// about to claim.
+///
+/// Per row: pre-write the cancel-reason file (so `dispatch-lib`'s TERM trap
+/// names [`CANCEL_REASON_SUPERSEDED`] instead of the generic
+/// `CANCELLED_BY_SIGNAL`), SIGTERM → grace → SIGKILL the process **group**,
+/// then `cancelled` the row and clear its `process_id` so no later reaper
+/// re-signals a PID that may since have been reused.
+///
+/// **Fail-open, like everything on this path.** Superseding is a courtesy
+/// cleanup, never a precondition for dispatch: every DB error is logged and
+/// swallowed. A kill that does not land leaves the pre-#2263 behaviour, which
+/// the mtime-worktree reaper (mika#2249) and the PID watchdog still backstop.
+///
+/// Returns the count of processes actually signalled.
+pub async fn dispose_superseded_dispatch_processes(
+    db: &AsyncDatabase,
+    session_id: &str,
+    trace_id: Option<&str>,
+    base_url: &str,
+) -> usize {
+    let rows = match db
+        .find_live_dispatch_rows_by_reference_url_and_variants(base_url)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(
+                event = "superseded_dispatch_lookup_failed",
+                reference_url = %base_url,
+                error = %e,
+                "supersede: live-dispatch lookup failed (fail-open, dispatch proceeds)"
+            );
+            return 0;
+        }
+    };
+
+    let mut killed = 0usize;
+    for task in rows {
+        let Some(pid) = task.process_id else { continue };
+
+        // PID-reuse guard input (#855). Absent metadata degrades to the basic
+        // /proc existence check, exactly as on the operator cancel path.
+        let start_time: Option<u64> = task
+            .metadata
+            .as_deref()
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+            .and_then(|v| v.get("process_start_time")?.as_str()?.parse().ok());
+
+        pre_write_cancel_reason(pid, CANCEL_REASON_SUPERSEDED);
+        let dead = kill_process_gracefully(pid, start_time).await;
+        killed += 1;
+
+        // Terminal-mark the row through the ordinary cancel path — the
+        // supersede-specific `cancel_task_superseded` refuses anything carrying
+        // a `process_id`, which is precisely the shape being disposed of here.
+        match db.cancel_task(&task.id).await {
+            Ok(_) => {}
+            Err(e) => warn!(
+                event = "superseded_dispatch_cancel_failed",
+                task_id = %task.id,
+                error = %e,
+                "supersede: failed to cancel live dispatch row after kill (non-fatal)"
+            ),
+        }
+        if let Err(e) = db.clear_task_process_id(&task.id).await {
+            warn!(
+                event = "superseded_dispatch_clear_pid_failed",
+                task_id = %task.id,
+                error = %e,
+                "supersede: failed to clear process_id after kill (non-fatal)"
+            );
+        }
+
+        let reasoning = format!(
+            "live pilot pid={pid} killed={dead} superseded by fresh dispatch for {base_url}"
+        );
+        if let Err(e) = db
+            .log_audit_event(
+                session_id,
+                SUPERSEDED_DISPATCH_PROCESS_KILLED_TOOL,
+                &format!("task:{}", task.id),
+                task.reference_url.as_deref(),
+                Some(CANCEL_REASON_SUPERSEDED),
+                Some(&reasoning),
+                trace_id,
+            )
+            .await
+        {
+            warn!(
+                event = "superseded_dispatch_audit_failed",
+                task_id = %task.id,
+                error = %e,
+                "supersede: failed to write process-kill audit event (non-fatal)"
+            );
+        }
+
+        info!(
+            event = "superseded_dispatch_process_killed",
+            task_id = %task.id,
+            pid,
+            dead,
+            reference_url = %base_url,
+            "supersede: disposed of the pilot a fresh dispatch replaces"
+        );
+    }
+
+    killed
 }

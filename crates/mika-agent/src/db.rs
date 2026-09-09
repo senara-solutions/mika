@@ -6878,6 +6878,43 @@ impl Database {
         Ok(rows)
     }
 
+    /// Every **live dispatch** a fresh dispatch for `base_url` supersedes
+    /// (mika#2263 défaut (a)).
+    ///
+    /// The complement of
+    /// [`Self::find_active_tracking_rows_by_reference_url_and_variants`], and
+    /// deliberately so: that lookup answers "which phantom ROWS does this
+    /// dispatch replace" and filters on `process_id IS NULL`, so a row carrying
+    /// a running pilot is not even a candidate. That filter is what let the
+    /// mika#2263 zombies live — supersede cancelled the row it could see and
+    /// never looked at the process it could not.
+    ///
+    /// Returns non-terminal rows (`pending`/`in_progress`) that carry a
+    /// `process_id`, for the exact URL and its `?phase=groom` variant — same
+    /// two-variant coverage as the phantom lookup, so a groom dispatch disposes
+    /// of the base-URL pilot too.
+    pub fn find_live_dispatch_rows_by_reference_url_and_variants(
+        &self,
+        agent_id: &str,
+        base_url: &str,
+    ) -> Result<Vec<Task>> {
+        let groom_url = format!("{base_url}{}", crate::task_state::tasks::GROOM_PHASE_SUFFIX);
+        let sql = format!(
+            "SELECT {} FROM tasks
+             WHERE agent_id = ?1
+               AND process_id IS NOT NULL
+               AND status IN ('pending', 'in_progress')
+               AND reference_url IN (?2, ?3)
+             ORDER BY id",
+            Self::TASK_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![agent_id, base_url, groom_url], Self::row_to_task)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// Guarded transition of a phantom tracking row → `cancelled` with the
     /// canonical supersede reason (mika#1934 AC2).
     ///

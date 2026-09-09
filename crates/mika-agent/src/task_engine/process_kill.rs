@@ -212,6 +212,17 @@ pub const CANCEL_REASON_OPERATOR: &str = "CANCELLED_BY_OPERATOR";
 /// signal-sender chose.
 pub const CANCEL_REASON_PILOT_SILENT_STALL: &str = "REAPED_PILOT_SILENT_STALL";
 
+/// Discriminator written when a fresh dispatch supersedes a still-running one
+/// (mika#2263 défaut (a)).
+///
+/// **Deliberately inside the `CANCELLED_BY_*` family**, unlike
+/// [`CANCEL_REASON_PILOT_SILENT_STALL`]. `self-dev-callback` reads that family
+/// as *do NOT retry*, and here that is exactly right: the replacement dispatch
+/// already exists — it is the reason this one is being disposed of. A retry
+/// would re-create the double-writer collision (classe #2248/#2249) the
+/// supersede exists to end.
+pub const CANCEL_REASON_SUPERSEDED: &str = "CANCELLED_BY_SUPERSEDE";
+
 /// Pre-write the cancel-reason file a killed dispatch's TERM trap reads
 /// (mika#749).
 ///
