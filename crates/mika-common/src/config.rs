@@ -1000,26 +1000,21 @@ pub struct Settings {
     pub pilot_stall_reap_age_seconds: Option<u64>,
 
     /// Whether the silent-stall reaper may *dispose* of what it detects
-    /// (mika#2249, Décision 4). Unset = [`DEFAULT_PILOT_STALL_REAP_ENABLED`]
-    /// (`false`).
+    /// (mika#2249). Unset = [`DEFAULT_PILOT_STALL_REAP_ENABLED`] (`true` since
+    /// mika#2272).
     ///
-    /// **Detection is unconditional; only disposition is gated.** With the
-    /// default, the reaper still measures the worktree age and writes its
-    /// `pilot_silent_stall` audit row — it just does not signal the process
-    /// and does not transition the task. The mode of failure is asymmetric:
-    /// a false negative costs one dispatch slot, a false positive destroys
-    /// hours of work in a decision-core worktree, and the threshold's
-    /// negative control is an n=1 sample (the 24-minute inter-write gap
-    /// measured on the healthy run c3f9a2f9, 2026-09-08).
+    /// **Detection is unconditional; only disposition is gated.** Set to
+    /// `false` and the reaper still measures the worktree age and writes its
+    /// `pilot_silent_stall` audit row — it just does not signal the process and
+    /// does not transition the task. That is the observation mode: an explicit
+    /// choice for a test or an investigation, no longer the default.
     ///
-    /// **Flip condition — dated and concrete, not "later":** arm this once
-    /// `audit_events` carries **at least 3** `pilot_silent_stall` rows whose
-    /// review confirms **zero** of them matched a pilot that was still
-    /// writing (control: the worktree mtimes at the time of measurement). A
-    /// single false positive revises
-    /// [`DEFAULT_PILOT_STALL_REAP_AGE_SECONDS`] instead of arming this flag.
+    /// The asymmetry that motivated landing disarmed, and what carries it now
+    /// that the flag is armed, are set out on
+    /// [`DEFAULT_PILOT_STALL_REAP_ENABLED`].
     ///
-    /// Env override: `MIKA_PILOT_STALL_REAP_ENABLED`.
+    /// Env override: `MIKA_PILOT_STALL_REAP_ENABLED` (`0` disarms without a
+    /// rebuild).
     #[serde(default)]
     pub pilot_stall_reap_enabled: Option<bool>,
 
@@ -1293,12 +1288,48 @@ pub const DEFAULT_PHANTOM_SWEEP_AGE_SECONDS: u64 = 14400;
 /// Reversible without a rebuild via `MIKA_PILOT_STALL_REAP_AGE_SECONDS`.
 pub const DEFAULT_PILOT_STALL_REAP_AGE_SECONDS: u64 = 2700;
 
-/// Default arming state of the pilot silent-stall reaper (mika#2249,
-/// Décision 4): **`false`** — it observes, it does not dispose.
+/// Default arming state of the pilot silent-stall reaper: **`true`** since
+/// mika#2272 — it disposes of what it detects.
 ///
-/// See [`Settings::pilot_stall_reap_enabled`] for the asymmetry that motivates
-/// landing disarmed and for the dated flip condition.
-pub const DEFAULT_PILOT_STALL_REAP_ENABLED: bool = false;
+/// # Why this flipped
+///
+/// mika#2249 landed it `false` behind a dated flip condition: arm once
+/// `audit_events` carries at least three reviewed `pilot_silent_stall` rows
+/// with no false positive among them. That condition turned out to be
+/// **unsatisfiable rather than unmet**. It counts rows written by a detector
+/// whose population was empty by construction — the scan filtered
+/// `status='in_progress'` while the PID lives on the `pending` callback row —
+/// so the count could only ever stay at zero. Two live pilots went ~50 minutes
+/// silent on 2026-09-09 and produced no row at all. Zero was the absence of
+/// measurement, not the presence of caution.
+///
+/// # What still pays for the caution
+///
+/// The asymmetry mika#2249 named is real and unchanged: a false negative costs
+/// one dispatch slot; a false positive destroys hours of work in a
+/// decision-core worktree. Three things carry it, and none of them moved.
+///
+/// - **The fail-safe terms.** A dispatch with no declared worktree, an
+///   unreadable declaration, a path that no longer exists, or an unreadable
+///   mtime falls *out* of the population. Absence of evidence never becomes
+///   evidence of staleness.
+/// - **The window.** [`DEFAULT_PILOT_STALL_REAP_AGE_SECONDS`] (2700 s) still
+///   clears its measured negative control — the 24-minute inter-write gap of
+///   the healthy run `c3f9a2f9` — by roughly a factor of two.
+/// - **The disarm.** `MIKA_PILOT_STALL_REAP_ENABLED=0`, or
+///   `pilot_stall_reap_enabled = false` in the settings file, restores
+///   observation-only without a rebuild. Detection is unconditional either way,
+///   so the audit rows keep coming while disarmed.
+///
+/// And mika#2272 adds what mika#2249 never had: a **positive control on a real
+/// process**. An authentically live, silent pilot, seeded through the
+/// production write path onto the row shape production actually writes, is
+/// found by the scan and killed by the disposition
+/// (`tests/eval/test_reaper_reaps_live_pending_pilot_2272.rs`).
+///
+/// Arming is a decision of record on mika#2272, taken with the asymmetry in
+/// view — not an inference from the code.
+pub const DEFAULT_PILOT_STALL_REAP_ENABLED: bool = true;
 
 /// Default callback-delivery slow-warning threshold in seconds (mika#2179).
 ///
@@ -3623,10 +3654,12 @@ mod tests {
         unsafe { std::env::remove_var("MIKA_PILOT_STALL_REAP_AGE_SECONDS") };
     }
 
-    /// Décision 4: the reaper lands observing, not armed.
+    /// mika#2272: the reaper ships armed. The value under test is a decision of
+    /// record, so it is asserted on the constant and on the accessor both — a
+    /// silent flip back to observation would reproduce the inert reaper exactly.
     #[test]
     #[serial]
-    fn pilot_stall_reap_disposition_is_disarmed_by_default() {
+    fn pilot_stall_reap_disposition_is_armed_by_default() {
         clean_env();
         unsafe { std::env::remove_var("MIKA_PILOT_STALL_REAP_ENABLED") };
 
@@ -3634,10 +3667,37 @@ mod tests {
         let settings = Settings::load(tmp.path()).unwrap();
 
         assert_eq!(settings.pilot_stall_reap_enabled, None);
+        // The unset flag resolves through `DEFAULT_PILOT_STALL_REAP_ENABLED`,
+        // so this one assertion pins the constant too. mika#2249's disarmed
+        // default gated the kill behind a flip condition that counted audit
+        // rows an empty population could never produce — a silent return to it
+        // would reproduce the inert reaper exactly.
+        assert!(
+            settings.effective_pilot_stall_reap_enabled(),
+            "an unset flag must resolve to the armed default (mika#2272)"
+        );
+    }
+
+    /// The disarm path, which is what makes arming reversible without a
+    /// rebuild. Asserted with `0` rather than `false` because that is the form
+    /// an operator types under pressure, and `config` accepts both.
+    #[test]
+    #[serial]
+    fn pilot_stall_reap_disposition_disarms_from_the_env() {
+        clean_env();
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_PILOT_STALL_REAP_ENABLED", "0") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(settings.pilot_stall_reap_enabled, Some(false));
         assert!(
             !settings.effective_pilot_stall_reap_enabled(),
-            "the reaper must land without the right to kill (mika#2249 Décision 4)"
+            "MIKA_PILOT_STALL_REAP_ENABLED=0 must restore observation-only"
         );
+
+        unsafe { std::env::remove_var("MIKA_PILOT_STALL_REAP_ENABLED") };
     }
 
     #[test]
