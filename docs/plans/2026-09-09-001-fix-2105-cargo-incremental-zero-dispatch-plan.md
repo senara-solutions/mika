@@ -51,10 +51,13 @@ Aujourd'hui, `CARGO_INCREMENTAL` n'atteint le build par aucun de ces chemins. Su
 
 ## Décision — le point d'application, et pourquoi celui-là
 
-**Deux lignes dans `dispatch-lib.sh` couvrent les deux chemins par construction :**
+**Trois sites, pas deux.** Les deux premiers posent le réglage ; le troisième est le prix d'entrée
+exigé par le garde de sécurité existant.
 
 1. `export CARGO_INCREMENTAL=0` au setup du dispatch, avant l'appel au wrapper d'invocation.
-2. `CARGO_INCREMENTAL` ajouté à `_PILOT_SANDBOX_ENV_ALLOWLIST`.
+2. `CARGO_INCREMENTAL` ajouté à `_PILOT_SANDBOX_ENV_ALLOWLIST` (`dispatch-lib.sh:563`).
+3. `CARGO_INCREMENTAL` ajouté à `EXPECTED_ENV_ALLOWLIST`
+   (`scripts/verify-no-secret-in-setenv.sh:53`), **sans quoi la CI casse**.
 
 Le chemin direct hérite de l'export. Le chemin sandboxé le récupère via la boucle de réinjection
 (`dispatch-lib.sh:1074-1078`), qui teste `[ -n "${!var:-}" ]` — et `-n "0"` est **vrai** en shell,
@@ -90,12 +93,26 @@ prise le plan du 09-03, avec un garde qui vérifiait la présence du paragraphe.
 paragraphe ne garde aucun comportement — `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`.
 Le réglage doit être dans le code qui lance le processus.
 
-**Contrainte de sécurité à honorer.** Le bloc d'audit `dispatch-lib.sh:549-562` (mika#2039 R6) exige
-que toute valeur atteignant `--setenv` soit **pesée et documentée**, parce que `--setenv NAME VALUE`
-place la valeur dans l'argv de bwrap et que `/proc/<pid>/cmdline` est lisible par tous. Ajouter une
-entrée à l'allowlist sans étendre cet audit viole la discipline même si la valeur est anodine. Le
-plan étend le bloc : `CARGO_INCREMENTAL` — littéral `0`, drapeau de build, aucun matériel de
-créance. `scripts/verify-no-secret-in-setenv.sh` reste vert.
+**Contrainte de sécurité à honorer — et elle est mécanique, pas seulement documentaire.**
+`scripts/verify-no-secret-in-setenv.sh` applique une règle **deny-by-default** (son en-tête,
+règle 1) : il tient un second registre `EXPECTED_ENV_ALLOWLIST` (ligne 53) et le compare à
+l'allowlist réelle (lignes 167-171). **Toute** addition, suppression ou renommage échoue —
+indépendamment de l'apparence du nom. Ajouter `CARGO_INCREMENTAL` d'un seul côté produit
+`VIOLATION: … + added, not audited: CARGO_INCREMENTAL` et rougit la CI.
+
+Ce double registre est délibéré : « Adding a name here is a deliberate act: confirm the variable
+carries no credential material, note why in the audit comment above
+`_PILOT_SANDBOX_ENV_ALLOWLIST` in dispatch-lib.sh, then update this set » (lignes 50-52). Le plan
+honore les trois gestes que cette phrase prescrit :
+
+- la variable ne porte aucun matériel de créance — c'est le littéral `0`, un drapeau de build ;
+- la raison est notée dans le bloc d'audit R6 (`dispatch-lib.sh:549-562`) ;
+- `EXPECTED_ENV_ALLOWLIST` est mis à jour dans le même diff.
+
+Vérifié en lisant le script au grooming du 2026-09-09 : la première passe architecte avait jugé
+l'extension du seul commentaire d'audit suffisante, et la seconde a classé la question en « détail
+d'implémentation ». Elle ne l'est pas — c'est un livrable, et son absence casse la CI de
+l'implémenteur sans lui dire pourquoi.
 
 ---
 
@@ -108,6 +125,9 @@ créance. `scripts/verify-no-secret-in-setenv.sh` reste vert.
   jamais réutilisé).
 - `dispatch-lib.sh:563-566` : ajouter `CARGO_INCREMENTAL` à `_PILOT_SANDBOX_ENV_ALLOWLIST`.
 - `dispatch-lib.sh:549-562` : étendre le bloc d'audit R6 d'une puce pour cette variable.
+- `scripts/verify-no-secret-in-setenv.sh:53` : ajouter `CARGO_INCREMENTAL` à
+  `EXPECTED_ENV_ALLOWLIST` (liste triée). **Dans le même diff** — c'est ce que le garde
+  deny-by-default exige, et l'oublier rougit la CI.
 - **Ne pas** créer ni modifier `mika/.cargo/config.toml`.
 
 ### Phase 2 — Le garde, avec son comportement négatif pinné (AC3)
@@ -198,6 +218,8 @@ d'échec que l'AC1 nomme.
 
 - [ ] `export CARGO_INCREMENTAL=0` posé dans `dispatch-lib.sh`, commenté avec ticket + chiffre.
 - [ ] `CARGO_INCREMENTAL` dans `_PILOT_SANDBOX_ENV_ALLOWLIST`, bloc d'audit R6 étendu.
+- [ ] `CARGO_INCREMENTAL` dans `EXPECTED_ENV_ALLOWLIST` (`verify-no-secret-in-setenv.sh:53`) ;
+      `make verify-no-secret-in-setenv` vert.
 - [ ] Aucun `mika/.cargo/config.toml` créé ni modifié.
 - [ ] Les cinq assertions de la Phase 2 (A/B/C/D + négatif pinné) dans `test-dispatch-lib.sh`, négatif pinné, `make
       `make test-dispatch-lib` vert, et rouge quand le réglage est retiré.
@@ -246,7 +268,7 @@ ventilé** :
 | Risque | Effet | Traitement |
 |---|---|---|
 | Le rebuild non incrémental ralentit les spawns | Ralentit la boucle (palier 1 > palier 2) | Phase 4 : quatre durées + seuil de renoncement +50 % nommé d'avance |
-| L'entrée d'allowlist ajoutée sans peser l'audit R6 | Discipline mika#2039 érodée par précédent | Phase 1 : le bloc d'audit est étendu dans le même diff |
+| L'entrée d'allowlist ajoutée sans mettre à jour `EXPECTED_ENV_ALLOWLIST` | CI rouge, cause non évidente pour l'implémenteur | Phase 1 : les trois sites sont nommés et listés en DoD ; le garde deny-by-default est décrit avec son message d'erreur exact |
 | Le premier spawn suivant ne compile pas | AC4 non mesurable | Prérequis explicite en Phase 3 : attendre un spawn compilant |
 | Deux chemins d'invocation (`address-pr-comments`, `resolve-pr-conflicts`) ne passent pas par `dispatch-lib` | Gain nul sur les worktrees de PR | **Mesuré, pas supposé** : hors périmètre par décision (option A), régime réutilisé où l'argument du ticket ne tient pas. Assertion D du garde |
 | Un cinquième chemin apparaît plus tard | Gain perdu en silence | Assertion D : l'énumération des handlers hors `dispatch-lib` est dans le garde ; un ajout non déclaré fait rougir la CI |
@@ -258,6 +280,7 @@ ventilé** :
 - `…:916`, `…:927` — les deux sorties `"$@"` du chemin direct
 - `…:1074-1078` — boucle de réinjection `--setenv`, test `[ -n "${!var:-}" ]`
 - `…:1144` — `--clearenv`
+- `mika/scripts/verify-no-secret-in-setenv.sh:23-28` — règle deny-by-default ; `:50-52` — les trois gestes exigés pour une addition ; `:53` — `EXPECTED_ENV_ALLOWLIST` ; `:167-171` — la comparaison stricte
 - `mika/Makefile:156` — cible `test-dispatch-lib`, câblée CI (mika#1772)
 - `mika/Makefile:186`, `:193` — modèles de garde à comportement négatif pinné
 - `lefthook.yml:16-18` — `cargo clippy --all-targets --all-features -- -D warnings` en pre-commit
