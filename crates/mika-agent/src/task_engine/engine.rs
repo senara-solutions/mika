@@ -206,6 +206,27 @@ const PILOT_TRANSCRIPT_EMPTY_GRACE_SECS: i64 = 300;
 /// ones that were.
 pub(crate) const PILOT_TRANSCRIPT_EXPECTED_KEY: &str = "pilot_transcript_expected";
 
+/// Task-metadata key stamped by the executor with the path of the file into
+/// which `dispatch-lib.sh` writes this dispatch's worktree directory
+/// (mika#2249, D1 Phase 1).
+///
+/// The engine does not, and must not, derive the worktree path itself.
+/// `dispatch-lib.sh` is the only place that knows it — it calls
+/// `scripts/derive-worktree-path` — and re-deriving it on the Rust side is
+/// exactly the duplication mika-platform#58 closed. `worktree_claims` is keyed
+/// `(repo, issue_number)` and deliberately does not store the path
+/// (`db.rs:1484-1490` says so in prose), so there is no existing column to
+/// read either. Hence the same trajectory mika#2040 already uses for the
+/// pilot transcript: **the shell declares, the engine reads.**
+///
+/// Absence is not evidence. A dispatch with no stamp, whose declaration file
+/// is missing, empty, or names a path that does not exist, is simply **not a
+/// candidate** for the silent-stall reaper. A free-text dispatch legitimately
+/// has no worktree at all; a dispatch whose declaration was lost is
+/// indistinguishable from one, and a reaper that kills must never fire on an
+/// absence of proof.
+pub(crate) const DISPATCH_WORKTREE_FILE_KEY: &str = "dispatch_worktree_file";
+
 /// Task-metadata key stamped by the detector once it has reported a dispatch
 /// (mika#2040 AC7). Read back in SQL by
 /// [`crate::db::Database::find_dispatches_expecting_transcripts`] so a reported
