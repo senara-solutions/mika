@@ -16256,6 +16256,117 @@ mod tests {
         );
     }
 
+    /// mika#2271 — un cancel de config *reverté* n'est pas une mort : la row
+    /// porte le marqueur, la garde la saute, la ré-inscription passe.
+    #[test]
+    fn zombie_guard_reverted_config_cancel_allows_registration() {
+        let db = db();
+        let first = db
+            .create_recurring_task_if_absent(zombie_recurring_task("mika", "auto_pull_groomed"))
+            .unwrap()
+            .unwrap();
+        db.cancel_recurring_task_by_label("mika", "auto_pull_groomed")
+            .unwrap();
+
+        let marked = db
+            .revert_config_cancel_recurring_task("mika", "auto_pull_groomed")
+            .unwrap();
+        assert_eq!(marked, 1, "la row cancelled doit être marquée");
+
+        let retry = db
+            .create_recurring_task_if_absent(zombie_recurring_task("mika", "auto_pull_groomed"))
+            .unwrap();
+        assert!(
+            retry.is_some(),
+            "un cancel de config reverté ne doit plus bloquer (mika#2271)"
+        );
+        assert_ne!(retry.unwrap(), first, "une row fraîche doit être créée");
+    }
+
+    /// L'exemption ne s'étend pas aux morts accidentelles : `revert` ne touche
+    /// que `cancelled`, et un `failed` récent continue de bloquer (mika#1742).
+    #[test]
+    fn revert_config_cancel_leaves_failed_rows_blocking() {
+        let db = db();
+        let first = db
+            .create_recurring_task_if_absent(zombie_recurring_task("mika", "auto_pull_groomed"))
+            .unwrap()
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'failed',
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 hour')
+                 WHERE id = ?1",
+                params![first],
+            )
+            .unwrap();
+
+        let marked = db
+            .revert_config_cancel_recurring_task("mika", "auto_pull_groomed")
+            .unwrap();
+        assert_eq!(marked, 0, "revert ne doit marquer aucune row `failed`");
+
+        let retry = db
+            .create_recurring_task_if_absent(zombie_recurring_task("mika", "auto_pull_groomed"))
+            .unwrap();
+        assert!(
+            retry.is_none(),
+            "un échec terminal récent doit toujours bloquer (mika#1742)"
+        );
+    }
+
+    /// Le marqueur porte l'exemption ; il ne falsifie pas l'horodatage de
+    /// l'annulation réelle (`updated_at` intact — piste d'audit préservée).
+    #[test]
+    fn revert_config_cancel_preserves_updated_at() {
+        let db = db();
+        db.create_recurring_task_if_absent(zombie_recurring_task("mika", "auto_pull_groomed"))
+            .unwrap();
+        db.cancel_recurring_task_by_label("mika", "auto_pull_groomed")
+            .unwrap();
+
+        let before: String = db
+            .conn
+            .query_row(
+                "SELECT updated_at FROM tasks WHERE label = 'auto_pull_groomed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        db.revert_config_cancel_recurring_task("mika", "auto_pull_groomed")
+            .unwrap();
+        let after: String = db
+            .conn
+            .query_row(
+                "SELECT updated_at FROM tasks WHERE label = 'auto_pull_groomed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, after, "updated_at doit rester celui du cancel réel");
+    }
+
+    /// Idempotence : un second boot ne re-marque pas une row déjà exemptée.
+    #[test]
+    fn revert_config_cancel_is_idempotent() {
+        let db = db();
+        db.create_recurring_task_if_absent(zombie_recurring_task("mika", "auto_pull_groomed"))
+            .unwrap();
+        db.cancel_recurring_task_by_label("mika", "auto_pull_groomed")
+            .unwrap();
+        assert_eq!(
+            db.revert_config_cancel_recurring_task("mika", "auto_pull_groomed")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.revert_config_cancel_recurring_task("mika", "auto_pull_groomed")
+                .unwrap(),
+            0,
+            "une row déjà marquée ne doit pas être ré-écrite"
+        );
+    }
+
     /// Recent `cancelled` row within the grace window → refuse.
     #[test]
     fn zombie_guard_recent_cancelled_refuses_registration() {
