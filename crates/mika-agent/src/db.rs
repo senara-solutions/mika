@@ -48,6 +48,23 @@ pub const RECURRING_ZOMBIE_GRACE_HOURS: u32 = 24;
 /// as a `&str` const so the query stays a bindable parameter.
 pub const RECURRING_ZOMBIE_GRACE_SQL: &str = "-24 hours";
 
+/// mika#2271: JSON path of the marker written into a recurring task's
+/// `metadata` when a *config-driven* cancel is reverted — i.e. the config that
+/// disabled the task (a knob like `MIKA_DEV_AUTO_PULL=0`, or an
+/// `identity.toml` toggle) is gone and the boot path re-declares the task as
+/// wanted.
+///
+/// A row carrying this marker is invisible to the mika#1742 refuse-to-zombie
+/// guard: a cancel the operator has explicitly reverted is not a terminal
+/// failure and must not block re-registration. `failed` / `expired` rows keep
+/// blocking — that is the guard's actual purpose.
+///
+/// Load-bearing: bound as a parameter by both
+/// [`Database::revert_config_cancel_recurring_task`] (writer) and
+/// [`Database::create_recurring_task_if_absent`] (reader), so the two SQL
+/// statements cannot drift apart.
+pub const RECURRING_CONFIG_CANCEL_REVERTED_PATH: &str = "$.config_cancel_reverted";
+
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
 const UNIFIED_TIMELINE_VIEW_SQL: &str = "\
@@ -6124,6 +6141,15 @@ impl Database {
     /// - Investigate the previous instance's failure via `mika tasks get <id>`.
     /// - Manually clear the dead row and let the next startup re-register.
     ///
+    /// **mika#2271 — config-cancel exemption.** A `cancelled` row is not always
+    /// a death: a knob (`MIKA_DEV_AUTO_PULL=0`) or an `identity.toml` toggle
+    /// cancels the recurring row on purpose, and removing the knob is meant to
+    /// bring the task back. Rows whose `metadata` carries
+    /// [`RECURRING_CONFIG_CANCEL_REVERTED_PATH`] — written by
+    /// [`Database::revert_config_cancel_recurring_task`] when the boot path
+    /// re-declares the task as wanted — are therefore skipped by this guard.
+    /// `failed` / `expired` rows are never exempted.
+    ///
     /// Non-goal here: fixing the *underlying* dispatch failure for Mika's
     /// specific `curator_review` (Problem A in the ticket). Root-claude's
     /// diagnosis notes PR#1726 (RouteFuture/dashmap wedge) likely already
@@ -6140,8 +6166,15 @@ impl Database {
                    AND trigger_type = 'recurring'
                    AND status IN ('failed', 'cancelled', 'expired')
                    AND updated_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?3)
+                   AND NOT (json_valid(metadata)
+                            AND COALESCE(json_extract(metadata, ?4), 0) = 1)
                  ORDER BY updated_at DESC LIMIT 1",
-                params![task.agent_id, task.label, RECURRING_ZOMBIE_GRACE_SQL],
+                params![
+                    task.agent_id,
+                    task.label,
+                    RECURRING_ZOMBIE_GRACE_SQL,
+                    RECURRING_CONFIG_CANCEL_REVERTED_PATH
+                ],
                 |r| {
                     Ok((
                         r.get::<_, String>(0)?,
@@ -6225,6 +6258,41 @@ impl Database {
             params![new_cron, next_fire_at, agent_id, label],
         )?;
         Ok(())
+    }
+
+    /// Mark every `cancelled` recurring row for `(agent_id, label)` as a
+    /// *reverted config cancel* (mika#2271). Returns the number of rows marked.
+    ///
+    /// Called from `ensure_recurring_task` — whose invocation *is* the config
+    /// declaring the task must run — right before re-registration. Without it,
+    /// the knob-off → knob-on cycle leaves the feeder dead: the knob-off boot
+    /// cancels the row, and the knob-on boot hits the mika#1742 refuse-to-zombie
+    /// guard, which cannot tell a deliberate config cancel from a terminal
+    /// failure.
+    ///
+    /// Deliberately does **not** touch `updated_at`: the row keeps the timestamp
+    /// of its actual cancel so the audit trail stays truthful. Exemption is
+    /// carried by the metadata marker, not by ageing the row out of the grace
+    /// window. Non-JSON `metadata` is replaced by a fresh object rather than
+    /// erroring — the marker matters more than a malformed legacy blob.
+    pub fn revert_config_cancel_recurring_task(
+        &self,
+        agent_id: &str,
+        label: &str,
+    ) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE tasks
+             SET metadata = json_set(
+                     CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                     ?3, 1)
+             WHERE agent_id = ?1 AND label = ?2 COLLATE NOCASE
+               AND trigger_type = 'recurring'
+               AND status = 'cancelled'
+               AND NOT (json_valid(metadata)
+                        AND COALESCE(json_extract(metadata, ?3), 0) = 1)",
+            params![agent_id, label, RECURRING_CONFIG_CANCEL_REVERTED_PATH],
+        )?;
+        Ok(n)
     }
 
     /// Cancel a recurring task by label (e.g. when reflection is disabled in identity.toml).

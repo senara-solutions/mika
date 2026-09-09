@@ -35,12 +35,35 @@ pub async fn prune_old_tasks(db: &AsyncDatabase) {
 /// the next fire time.
 ///
 /// Used at startup to ensure built-in tasks (heartbeat, reflection) are always registered.
+///
+/// **Calling this function *is* the config declaring the task must run** — the
+/// callers are the boot paths that already evaluated the knob or the
+/// `identity.toml` toggle. So a prior *config-driven* cancel of the same label
+/// (the knob-off boot cancelled the row) must not survive as a veto: mika#2271
+/// reverts it before re-registering. Terminal failures (`failed` / `expired`)
+/// keep blocking through the mika#1742 refuse-to-zombie guard — only the
+/// deliberate `cancelled` state is cleared here.
 pub async fn ensure_recurring_task(
     db: &AsyncDatabase,
     label: &str,
     cron_expr: &str,
     action_config: &str,
 ) {
+    // mika#2271: knob-off cancelled this label; the caller now says it must run.
+    // Clear the config-cancel veto so the mika#1742 guard doesn't refuse the
+    // re-registration below.
+    match db.revert_config_cancel_recurring_task(label).await {
+        Ok(0) => {}
+        Ok(n) => {
+            info!(
+                label,
+                rows = n,
+                "reverted config cancel on recurring task (mika#2271)"
+            )
+        }
+        Err(e) => warn!(label, error = %e, "failed to revert config cancel on recurring task"),
+    }
+
     let agent_id = db.agent_id.clone();
     let task = NewTask {
         agent_id,
