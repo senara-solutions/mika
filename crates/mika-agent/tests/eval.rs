@@ -11,6 +11,18 @@ mod eval {
     pub mod scenarios;
     pub mod trace;
 
+    // Harness eval multi-agents : N `agent_id` sur une base container partagée,
+    // pour que la classe fan-out cesse d'être invisible (mika#2265).
+    pub mod multi_agent;
+
+    // Fixtures de processus réels partagées (mika#2265, AC2) : `spawn_live_child`
+    // & co., extraites de test_pilot_silent_stall_reaper.rs.
+    pub mod process_fixtures;
+
+    // Porte transverse (mika#2265) : aucun fichier de tests/eval/ n'existe sans
+    // être compilé. Elle se déclare elle-même.
+    mod test_eval_modules_declared;
+
     // Golden dataset: 25 curated scenarios for end-to-end quality testing (#339)
     pub mod golden;
 
@@ -65,6 +77,7 @@ mod eval {
     mod test_kg_budget_757;
     mod test_max_steps_continuation;
     mod test_merge_identity_2248;
+    mod test_multi_agent_harness_witness;
     mod test_multi_step;
     mod test_multi_turn_persistence;
     mod test_per_corpus_fairness_927;
