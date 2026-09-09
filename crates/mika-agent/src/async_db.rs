@@ -3261,6 +3261,18 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Finished dispatches that were stamped as expecting a pilot transcript
+    /// and have not yet been reported as having produced none (mika#2040 AC7).
+    /// See [`Database::find_dispatches_expecting_transcripts`].
+    pub async fn find_dispatches_expecting_transcripts(
+        &self,
+        grace_seconds: i64,
+    ) -> Result<Vec<crate::db::DispatchExpectingTranscript>> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.find_dispatches_expecting_transcripts(&a, grace_seconds))
+            .await
+    }
+
     pub async fn query_llm_calls_by_trace(
         &self,
         trace_id: &str,
