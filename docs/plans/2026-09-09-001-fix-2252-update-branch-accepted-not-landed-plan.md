@@ -100,14 +100,36 @@ ne comporte aucune lecture, et la contradiction D1 est lisible dans le fichier. 
   arrivée re-mesure et peut re-tenter, au lieu d'attendre six heures ou un mouvement de `main`.
 
 - **R5** — `MergeGateResult::BranchUpdated.new_main_sha` porte le SHA **observé** (R3), pas le SHA
-  visé. `AcceptedNotLanded` rend une disposition distincte de `BranchUpdated` — la boucle ne doit
-  pas lire « réparé » sur un atterrissage non constaté.
+  visé.
+
+- **R5b** — `AcceptedNotLanded` rend `MergeGateResult::Blocked { reason: BehindMain, detail }` avec
+  un `detail` nommé — **pas une nouvelle variante de `MergeGateResult`.** Trois raisons, dans
+  l'ordre de force :
+
+  1. **C'est le fait.** `AcceptedNotLanded` signifie littéralement « la base n'a pas bougé », donc
+     la PR *est* encore behind. `BehindMain` est la description exacte, pas un repli.
+  2. **Le précédent est dans le fichier.** `BehindMainRemediation::AlreadyAttempted` rend déjà
+     exactement cette forme (1216-1226) : `Blocked { reason: BehindMain, detail: "…an automatic
+     branch update toward this main HEAD was already attempted and is not being retried." }`.
+     `AcceptedNotLanded` en est le frère — même fait, autre cause.
+  3. **Une septième variante rouvrirait T2 de mika#2238.** Les trois prompts embarqués
+     (`self-dev/system_prompt.md:276`, `self-dev-webhook-ci:37`, `self-dev-webhook-qa:278`)
+     énumèrent **six** variantes de `MergeGateResult` et instruisent « branch on these variants
+     **exhaustively** ». Introduire une septième sans les mettre à jour reproduit précisément le
+     trou que #2238 existe pour fermer : un agent qui reçoit une variante hors de sa liste
+     exhaustive n'a pas de disposition définie, et le comportement observé est l'arrêt silencieux.
+     `reason: BehindMain` est déjà l'une des **huit** `blocked.reason` énumérées, avec sa
+     disposition déjà écrite — coût prompt nul.
 
 - **R6** — La trace (`log_behind_main_remediation`) distingue les deux issues par des `outcome`
   différents, de sorte que le moniteur puisse compter les acceptations non atterries.
 
-- **R7** — Le budget de vérification est une constante nommée avec sa justification écrite, et il est
-  paramétrable dans les tests (même discipline que `claim_update_attempt_in`, qui abstrait `now`).
+- **R7** — Le budget de vérification est **3 re-lectures espacées de 2 s (6 s au pire)**, porté par
+  une constante nommée avec sa justification écrite, et paramétrable dans les tests (même discipline
+  que `claim_update_attempt_in`, qui abstrait `now`). La valeur est un choix assumé, pas une mesure :
+  la latence réelle d'atterrissage d'un `202 update-branch` sur ce dépôt n'a jamais été observée.
+  C'est R8 qui la rend sûre — un budget trop court dégrade la trace, il ne casse rien. La trace (R6)
+  est l'instrument qui permettra de la corriger sur données plutôt que sur intuition.
 
 - **R8** — Un faux négatif de vérification (l'atterrissage arrive après l'expiration du budget) est
   **bénin par construction** : il relâche le claim, et le tour suivant mesure `is_behind_main` qui
@@ -121,8 +143,11 @@ ne comporte aucune lecture, et la contradiction D1 est lisible dans le fichier. 
 - La détection `is_behind_main` (mika#1577) — inchangée, elle reste l'autorité sur « behind ».
 - Les trois sites d'appel de `remediate_behind_main` — ils reçoivent une variante de plus, leur
   ordonnancement ne bouge pas.
-- Les prompts embarqués (R6 de #2238) — l'énumération des `blocked.reason` n'est pas touchée ; si
-  `AcceptedNotLanded` doit y apparaître, c'est un ticket séparé.
+- Les prompts embarqués (R6 de #2238) — **et R5b garantit qu'ils n'ont pas besoin de l'être** : le
+  choix de `Blocked { reason: BehindMain }` plutôt qu'une septième variante maintient les prompts
+  exacts sans les toucher. Ce n'est pas un report, c'est une contrainte de conception respectée. Si
+  une révision future introduit malgré tout une variante, la mise à jour des trois prompts entre
+  dans son périmètre — pas dans un ticket séparé.
 - Le gate de SHA périmé qui retient la PR après un update (documenté 455-460) — explicitement suivi
   ailleurs.
 - Toute tentative d'expliquer rétrospectivement l'état de PR#2251 : la chronologie établie par
@@ -156,8 +181,9 @@ ne comporte aucune lecture, et la contradiction D1 est lisible dans le fichier. 
 8. Ajouter `BehindMainRemediation::AcceptedNotLanded` (859-889) avec un doc-comment qui nomme les
    trois défauts fermés.
 9. `disposition_for_remediation` (1198) : `Updated { observed_base_sha }` → `BranchUpdated` portant
-   le SHA **observé** ; `AcceptedNotLanded` → une disposition distincte qui dit « acceptée,
-   atterrissage non constaté, une nouvelle tentative est ouverte ».
+   le SHA **observé** ; `AcceptedNotLanded` → `Blocked { reason: BehindMain, detail }` (R5b), sur le
+   modèle littéral du bras `AlreadyAttempted` voisin (1216-1226), avec un `detail` qui dit
+   « acceptée, atterrissage non constaté sous le budget, une nouvelle tentative est ouverte ».
 10. `describe_behind_main_remediation` (1271) et `log_behind_main_remediation` (1153) : prose et
     `outcome` distincts pour la nouvelle variante (R6).
 
@@ -181,8 +207,13 @@ ne comporte aucune lecture, et la contradiction D1 est lisible dans le fichier. 
   dit « accepté » ; celui de la variante issue de la re-lecture dit « observé ».
 - **AC2** — `MergeGateResult::BranchUpdated.new_main_sha` est le SHA lu sur la PR après
   l'update-branch, jamais `info.current_main_sha`. Épinglé par le test 13.
-- **AC3** — Un `202` dont l'effet n'atterrit pas dans le budget produit une disposition **distincte**
-  de `BranchUpdated`, et relâche le claim. Épinglé par le test 11.
+- **AC3** — Un `202` dont l'effet n'atterrit pas dans le budget produit
+  `Blocked { reason: BehindMain }` — jamais `BranchUpdated` — et relâche le claim. Épinglé par le
+  test 11.
+- **AC8** — `MergeGateResult` compte toujours **six** variantes après ce changement. Vérifiable par
+  `grep -c` sur l'énumération, et par le fait que les trois prompts embarqués restent inchangés et
+  exacts (leur phrase « six typed variants » reste vraie). C'est la garde qui empêche ce fix de
+  rouvrir T2 de mika#2238.
 - **AC4** — Un `202` dont l'effet atterrit produit `BranchUpdated` et **conserve** le claim (le
   plafond anti-thrash de #2238 R4 reste en vigueur pour le cas nominal). Épinglé par le test 12.
 - **AC5** — La trace émet des `outcome` distincts pour « atterri » et « accepté non atterri », de
