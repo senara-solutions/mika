@@ -369,3 +369,7 @@ dans une session ne survit pas au dispatch :
 5. **Seuil de réveil n=1 ratifié** — « la doctrine "prompt-only échoue au substrat de la boucle" ne
    tolère pas de tolérance ». Une seule PR du périmètre recevant `pass` sans test négatif après le
    déploiement de ce fix suffit à déclencher le ticket de gate structurel.
+
+## Amendement (AC8) — scope de la harness de calibration (2026-09-09)
+
+Vincent/QA a flaggé `crates/mika-agent/src/bin/calibrate.rs` et `crates/mika-agent/src/calibration/role.rs` comme hors-scope (AC8). **Justification de leur inclusion :** ils sont NÉCESSAIRES pour AC5 (le dogfood red-before/green-after). Sans eux, la calibration n'aurait pas consommé le **prompt de production** de qa-review — la preuve red/green aurait porté sur un prompt-fixture, pas sur le prompt réel que ce PR modifie, donc une preuve creuse. Les changements sont **minimaux** : faire consommer le prompt de production par la harness pour que le scénario `negative_test_invariant_gate` prouve que la VRAIE porte mord. Ils appartiennent donc à #2264 (ils réalisent AC5), pas à un ticket séparé. Si QA/Vincent tranche autrement, les extraire dans un ticket harness dédié est trivial (ils sont isolés).
