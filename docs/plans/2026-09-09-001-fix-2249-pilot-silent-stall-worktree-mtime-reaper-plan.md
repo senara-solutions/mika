@@ -3,7 +3,7 @@ issue: 2249
 type: fix
 title: "loop-substrate : reaper mtime-worktree côté engine — un pilote vivant qui n'écrit plus est détecté, audité, disposé"
 branch: bug/2249/loop-substrate-les-pilotes-calent
-status: draft
+status: groomed
 ---
 
 # Plan — D1 : reaper `pilot_silent_stall` côté engine (mika#2249)
@@ -102,6 +102,19 @@ cas** » — c'est cette mesure. Le « ex. 15-20 min » du corps est une illustr
 corrige au lieu de la copier. **À arbitrer par l'architecte** : si l'illustration doit primer sur
 la mesure, le contrôle négatif c3f9a2f9 doit être réfuté d'abord.
 
+**La marge ne peut PAS être élargie sans perdre de la couverture (réponse au finding F3 de la
+première passe).** L'architecte suggère 3600-5400 s par prudence face au mode d'échec destructif.
+Les deux cas fondateurs l'interdisent : les stalls mesurés durent **2h18** et **58 min**, et
+58 min = **3480 s**. Un seuil de 3600 s **rate déjà** le second cas ; 5400 s en rate un sur deux
+avec de la marge. La fenêtre qui attrape les deux occurrences tout en restant au-dessus du plafond
+structurel est donc **]1800 s, 3480 s[**, et 2700 s en est à peu près le milieu. Élargir la marge
+n'achète pas de la sûreté : cela échange un faux positif hypothétique contre un faux **négatif
+mesuré**.
+
+La prudence que F3 demande à juste titre est donc payée autrement — par la Décision 4, qui retire
+au reaper le droit de tuer avant que la mesure existe. C'est la même prudence, placée là où elle ne
+coûte pas de couverture.
+
 Override env : `MIKA_PILOT_STALL_REAP_AGE_SECONDS`, patron `config.rs:1780`.
 
 ## Décision 3 — ce que « disposer » veut dire, sans casser le retry
@@ -130,6 +143,38 @@ plus vite. La boucle ne deviendrait pas auto-guérissante, ce qui est le seul in
   dans une branche `CANCELLED_BY_*` du parseur, et que le ticket redevienne éligible à
   `stuck_ready_reconcile` après le reap. Si la vérification échoue, la branche de prompt
   redevient nécessaire et **est fichée séparément** (elle change la surface d'un autre skill).
+
+## Décision 4 — le reaper atterrit en observation, il n'atterrit pas armé
+
+**Adopté de la première passe architecte (F2/F3).** Le seuil repose sur une borne structurelle
+solide (1800 s) et un contrôle négatif à **n=1** (les 24 min de c3f9a2f9). Le mode d'échec est
+destructif et asymétrique : un faux négatif coûte un slot de dispatch, un faux positif détruit des
+heures de travail en zone décision-core. Une valeur par défaut dérivée d'un échantillon de taille 1
+ne mérite pas le droit de tuer avant d'avoir été mesurée contre le trafic réel.
+
+`pilot_stall_reap_enabled` (`MIKA_PILOT_STALL_REAP_ENABLED`), **défaut `false`** au landing :
+
+- **Désactivé (défaut) :** le reaper s'exécute, mesure, et émet `pilot_silent_stall`
+  (`warn!` + `audit_events`) avec l'âge mtime mesuré — mais **ne tue pas** et ne transitionne pas.
+  La détection est immédiate ; seule la disposition attend.
+- **Activé :** le chemin complet d'AC1 (kill + `failed`).
+
+Le code de disposition est **livré et testé** dans ce ticket, désactivé — pas reporté. AC5 et AC6
+s'exécutent avec le flag armé ; AC8 pince le contraire : flag au défaut, même entrée, aucune
+transition et aucun kill, mais l'audit **présent**.
+
+**Condition de bascule — datée et concrète, pas « plus tard » :** activer quand `audit_events`
+porte **au moins 3 lignes `pilot_silent_stall`** dont la revue confirme que **zéro** correspond à un
+pilote qui écrivait encore (contrôle : les mtimes du worktree au moment de la mesure). Si une seule
+est un faux positif, c'est le **seuil** qui est révisé, pas le flag qui est armé. La bascule est une
+décision opérateur, et elle est le seul reste manuel de ce ticket.
+
+**Ce que cela fait à l'AC1 du ticket.** L'AC1 demande « détecté et disposé automatiquement, sans
+intervention manuelle ». Ce plan livre la détection automatique immédiatement, et la disposition
+automatique derrière un flag dont la bascule est spécifiée ci-dessus. Je considère l'AC honoré — le
+mécanisme est entier, seul son armement est gradué. **À trancher explicitement par l'architecte en
+seconde passe :** si l'AC1 exige l'armement au landing, le flag passe à `true` par défaut et la
+Décision 4 se réduit au kill-switch.
 
 ## Acceptance criteria
 
@@ -160,6 +205,12 @@ plus vite. La boucle ne deviendrait pas auto-guérissante, ce qui est le seul in
   `warn!` si le scan d'un worktree dépasse un budget de temps. Le reaper ne tourne que sur les
   tâches en vol (0-2 en régime normal), une fois par `DB_SCAN_INTERVAL_TICKS`.
 
+- **AC8 — l'observation est le défaut.** Avec `pilot_stall_reap_enabled` à sa valeur par défaut,
+  la même entrée qu'AC5 produit la ligne `audit_events` `pilot_silent_stall` **et** laisse la tâche
+  `in_progress`, process vivant, aucun signal envoyé. Contrôle positif et négatif dans le même
+  test : l'audit présent prouve que le détecteur a vu ; l'absence de transition prouve qu'il n'a
+  pas tiré.
+
 ## Fire-Disposition
 
 Le livrable détecteur est le test AC5 (+ les cinq contrôles négatifs AC4) dans les tests du
@@ -167,6 +218,12 @@ task_engine : **rouge sur `main` actuel** — aucun reaper existant ne se décle
 d'écriture, la tâche reste `in_progress` et l'assert échoue —, **vert après**. Gate CI `Check`
 bloquant, garde permanente : toute régression qui re-rend un pilote muet invisible refait échouer
 `Check`.
+
+**Disposition des violations pré-existantes** (pilotes déjà calés au moment du déploiement) : elles
+sont **mesurées, pas tuées**. Un pilote calé présent au premier tick après déploiement produit sa
+ligne `pilot_silent_stall` et rien d'autre, puisque le flag de la Décision 4 est à `false` — c'est
+précisément le trafic qui alimente la condition de bascule. Aucune violation pré-existante n'est
+disposée sans que l'opérateur ait armé le flag.
 
 ## Phases
 
@@ -185,9 +242,12 @@ bloquant, garde permanente : toute régression qui re-rend un pilote muet invisi
    `get_active_callback_tasks_with_pid`. Prédicat : conjonction d'AC4. Action : audit → fichier de
    raison → `kill_process_gracefully` → `update_task_failed` sous garde de statut.
 4. **Config.** `pilot_stall_reap_age_seconds` + `DEFAULT_PILOT_STALL_REAP_AGE_SECONDS = 2700` +
-   `effective_*`, patron `config.rs:1226/1780`, avec la dérivation en doc-comment.
-5. **Tests.** AC5 (non-vacuité, rouge-avant vérifié en l'exécutant sur `main` **sans** le fix) et
-   les cinq contrôles négatifs AC4, chacun ne neutralisant qu'un terme.
+   `effective_*`, patron `config.rs:1226/1780`, avec la dérivation **et la fenêtre
+   ]1800 s, 3480 s[** en doc-comment. Plus `pilot_stall_reap_enabled` (défaut `false`,
+   Décision 4) et sa condition de bascule écrite au point de code.
+5. **Tests.** AC5 (non-vacuité, rouge-avant vérifié en l'exécutant sur `main` **sans** le fix),
+   les cinq contrôles négatifs AC4 — chacun ne neutralisant qu'un terme —, et AC8 (le défaut
+   observe sans tirer).
 6. **Vérification de la queue de disposition** (Décision 3) : que `REAPED_PILOT_SILENT_STALL` ne
    soit pas absorbé par une branche `CANCELLED_BY_*`, et que le ticket redevienne éligible à
    `stuck_ready_reconcile`. Résultat écrit dans la PR. Si négatif → ticket séparé, pas
@@ -205,9 +265,11 @@ bloquant, garde permanente : toute régression qui re-rend un pilote muet invisi
 
 ## Risques
 
-- **Faux positif = travail détruit.** C'est le risque dominant, et c'est pourquoi le défaut vient
-  d'une borne structurelle et non de l'illustration du corps. Les cinq contrôles négatifs d'AC4
-  sont là pour ça, pas pour la couverture.
+- **Faux positif = travail détruit.** C'est le risque dominant. Il est traité à trois niveaux, pas
+  un : le défaut vient d'une borne structurelle et non de l'illustration du corps (Décision 2) ; les
+  cinq contrôles négatifs d'AC4 existent pour ça et non pour la couverture ; et le reaper atterrit
+  **sans le droit de tuer** (Décision 4), ce qui rend le premier faux positif observable au lieu de
+  destructeur.
 - **Le répertoire du fichier de déclaration doit être inscriptible sous bwrap.** Phase 1 le vérifie
   avant que quoi que ce soit d'autre soit câblé ; s'il ne l'est pas, la Décision 1 doit être
   re-arbitrée avant d'écrire le reaper.
