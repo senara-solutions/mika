@@ -82,6 +82,7 @@ tower.workspace = true
 http-body-util.workspace = true
 mika-common = { workspace = true, features = ["test-utils"] }
 serial_test.workspace = true
+filetime.workspace = true
 tracing-subscriber.workspace = true
 # wiremock-backed dev-dep for gateway substrate delegation tests.
 # Consumers: mika#1969 (fetch_url builtin) + mika#1971 (web_search substrate cut).

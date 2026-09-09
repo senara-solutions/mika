@@ -54,19 +54,29 @@ fn try_handle_ci_success_body() -> &'static str {
     &rest[..end]
 }
 
-/// Assert an audit-event name is one the handler can actually emit.
+/// Source of the merge actor, the second half of the CI-success path since
+/// mika#2248. `ci_success_merge` is written there now — the evaluator signals,
+/// the actor merges — so an audit-name check that only read the evaluator would
+/// start failing for the right reason in the wrong place.
+const MERGE_READY_HANDLER_SRC: &str = include_str!("../../src/server/merge_ready_handler.rs");
+
+/// Assert an audit-event name is one the CI-success path can actually emit.
 ///
 /// Without this, `count_audit_events_by_tool_name("<name nothing writes>")`
 /// returns 0 and the assertion passes for the wrong reason — a guaranteed green
 /// that proves nothing. Found exactly that way in review on this file's first
 /// draft, which asserted zero rows for `ci_success_handler_merge_initiated`, a
 /// name no code writes.
+///
+/// Both halves of the path count: the evaluator and the actor each own the rows
+/// they write (mika#2248).
 pub fn assert_audit_event_name_is_real(name: &str) {
+    let literal = format!("\"{name}\"");
     assert!(
-        CI_SUCCESS_HANDLER_SRC.contains(&format!("\"{name}\"")),
-        "audit-event name `{name}` appears nowhere in ci_success_handler.rs — \
-         a count assertion on it is vacuous. The emitted names are the string \
-         literals passed to `db.log_audit_event`."
+        CI_SUCCESS_HANDLER_SRC.contains(&literal) || MERGE_READY_HANDLER_SRC.contains(&literal),
+        "audit-event name `{name}` appears neither in ci_success_handler.rs nor in \
+         merge_ready_handler.rs — a count assertion on it is vacuous. The emitted names \
+         are the string literals passed to `db.log_audit_event`."
     );
 }
 
@@ -142,22 +152,34 @@ async fn ci_success_milestone_manager_pr_holds_for_operator() -> Result<()> {
     let gate_event_at = body
         .find("\"ci_success_handler_human_gate_required\"")
         .expect("the DECISION-CORE branch must write a greppable audit row");
-    let merge_at = body
-        .find("run_gh_merge(")
-        .expect("try_handle_ci_success must still contain the merge call");
+    let signal_at = body
+        .find("let signal = MergeReadySignal {")
+        .expect("try_handle_ci_success must emit the merge-ready signal (mika#2248)");
 
+    // Since mika#2248 the thing that must come after the gates is no longer a
+    // merge — this handler issues none — but the merge-ready signal it hands the
+    // dispatcher. Same invariant, new callsite: a signal emitted before the
+    // classifier would let the actor merge a DECISION-CORE PR on the evaluator's
+    // word. The absence of the merge call is asserted in the same breath: it is
+    // what makes the identity of `mergedBy` deterministic.
     assert!(
-        classify_at < merge_at,
-        "the perimeter classifier must be consulted BEFORE any merge is issued — \
-         a merge that runs first is mika#1851 verbatim"
+        !body.contains("run_gh_merge("),
+        "try_handle_ci_success must issue NO merge: it runs in every agent the check_suite \
+         fan-out reaches, so a merge here lands under whichever agent won the race — \
+         mika#2244, `mergedBy = mika-platform-qa` on the reviewer's own approval (mika#2248)"
     );
     assert!(
-        fail_closed_at < merge_at,
-        "the fail-closed clause must be evaluated before the merge call"
+        classify_at < signal_at,
+        "the perimeter classifier must be consulted BEFORE the merge-ready signal is \
+         emitted — a signal that precedes it is mika#1851 with one more hop"
     );
     assert!(
-        gate_event_at < merge_at,
-        "the DECISION-CORE hold (and its audit row) must precede the merge branch"
+        fail_closed_at < signal_at,
+        "the fail-closed clause must be evaluated before the signal is emitted"
+    );
+    assert!(
+        gate_event_at < signal_at,
+        "the DECISION-CORE hold (and its audit row) must precede the signal branch"
     );
 
     Ok(())

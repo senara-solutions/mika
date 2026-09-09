@@ -192,6 +192,49 @@ pub fn kill_process_immediate(pid: i64, expected_start_time: Option<u64>) {
     }
 }
 
+/// Discriminator written when an operator cancels a dispatch (mika#749).
+///
+/// `self-dev-callback/system_prompt.md` treats every `CANCELLED_BY_*` status as
+/// a deliberate operator cancel and instructs **do NOT retry** — which is
+/// correct here and is exactly why the reaper below must not reuse it.
+pub const CANCEL_REASON_OPERATOR: &str = "CANCELLED_BY_OPERATOR";
+
+/// Discriminator written when the silent-stall reaper disposes of a wedged
+/// pilot (mika#2249, Décision 3).
+///
+/// **Deliberately outside the `CANCELLED_BY_*` family.** A naive SIGTERM would
+/// let `dispatch-lib`'s TERM trap write `STATUS=CANCELLED_BY_SIGNAL`, which
+/// `self-dev-callback` reads as an operator cancel and answers with *do NOT
+/// retry*. The reaper would then have killed the pilot **and** the retry: the
+/// ticket would still return nothing, only faster, and the loop would not have
+/// become self-healing — which is the entire point of D1. The distinct name
+/// also stops the trace from claiming "cancelled by signal" for something no
+/// signal-sender chose.
+pub const CANCEL_REASON_PILOT_SILENT_STALL: &str = "REAPED_PILOT_SILENT_STALL";
+
+/// Pre-write the cancel-reason file a killed dispatch's TERM trap reads
+/// (mika#749).
+///
+/// Convention: `/tmp/mika-cancel-reason-{pid}`. `dispatch-lib.sh`'s trap only
+/// writes the file when it is **absent**, so whatever is written here wins the
+/// race and names the real cause instead of the generic
+/// `CANCELLED_BY_SIGNAL`.
+///
+/// Best-effort: a write failure degrades to the trap's own fallback, which is
+/// worse telemetry but never a failed kill. Callers do not branch on it.
+pub fn pre_write_cancel_reason(pid: i64, status: &str) {
+    let reason_path = format!("/tmp/mika-cancel-reason-{pid}");
+    if let Err(e) = std::fs::write(&reason_path, format!("STATUS={status}\n")) {
+        warn!(
+            pid,
+            reason_path,
+            status,
+            error = %e,
+            "failed to write cancel reason file — TERM trap will fall back to CANCELLED_BY_SIGNAL"
+        );
+    }
+}
+
 /// Outcome of a cancel-with-kill operation.
 pub struct CancelOutcome {
     /// The cancelled task's label.
@@ -244,20 +287,7 @@ pub async fn cancel_task_and_kill(
             "killing process for cancelled task"
         );
 
-        // Pre-write cancel reason file before SIGTERM (mika#749).
-        // Convention: /tmp/mika-cancel-reason-{pid} — the shell-side TERM trap
-        // checks this file and skips its own write if already present, so the
-        // CANCELLED_BY_OPERATOR discriminator wins the race.
-        let reason_path = format!("/tmp/mika-cancel-reason-{pid}");
-        if let Err(e) = std::fs::write(&reason_path, "STATUS=CANCELLED_BY_OPERATOR\n") {
-            warn!(
-                task_id,
-                pid,
-                reason_path,
-                error = %e,
-                "failed to write cancel reason file — TERM trap will fall back to CANCELLED_BY_SIGNAL"
-            );
-        }
+        pre_write_cancel_reason(pid, CANCEL_REASON_OPERATOR);
 
         let killed = kill_process_gracefully(pid, start_time).await;
         let _ = db.clear_task_process_id(task_id).await;

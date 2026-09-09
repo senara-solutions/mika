@@ -986,6 +986,43 @@ pub struct Settings {
     #[serde(default)]
     pub phantom_sweep_age_seconds: Option<u64>,
 
+    /// Silence window, in seconds, after which a live pilot process whose
+    /// worktree has received no write is reaped (mika#2249, D1).
+    ///
+    /// Measured against the two founding populations rather than guessed —
+    /// see [`DEFAULT_PILOT_STALL_REAP_AGE_SECONDS`] for the derivation and
+    /// the usable window `]1800 s, 3480 s[`.
+    ///
+    /// Env override: `MIKA_PILOT_STALL_REAP_AGE_SECONDS`.
+    ///
+    /// Default: [`DEFAULT_PILOT_STALL_REAP_AGE_SECONDS`] (2700).
+    #[serde(default)]
+    pub pilot_stall_reap_age_seconds: Option<u64>,
+
+    /// Whether the silent-stall reaper may *dispose* of what it detects
+    /// (mika#2249, Décision 4). Unset = [`DEFAULT_PILOT_STALL_REAP_ENABLED`]
+    /// (`false`).
+    ///
+    /// **Detection is unconditional; only disposition is gated.** With the
+    /// default, the reaper still measures the worktree age and writes its
+    /// `pilot_silent_stall` audit row — it just does not signal the process
+    /// and does not transition the task. The mode of failure is asymmetric:
+    /// a false negative costs one dispatch slot, a false positive destroys
+    /// hours of work in a decision-core worktree, and the threshold's
+    /// negative control is an n=1 sample (the 24-minute inter-write gap
+    /// measured on the healthy run c3f9a2f9, 2026-09-08).
+    ///
+    /// **Flip condition — dated and concrete, not "later":** arm this once
+    /// `audit_events` carries **at least 3** `pilot_silent_stall` rows whose
+    /// review confirms **zero** of them matched a pilot that was still
+    /// writing (control: the worktree mtimes at the time of measurement). A
+    /// single false positive revises
+    /// [`DEFAULT_PILOT_STALL_REAP_AGE_SECONDS`] instead of arming this flag.
+    ///
+    /// Env override: `MIKA_PILOT_STALL_REAP_ENABLED`.
+    #[serde(default)]
+    pub pilot_stall_reap_enabled: Option<bool>,
+
     /// Callback-delivery latency above which the engine warns, in seconds
     /// (mika#2179).
     ///
@@ -1224,6 +1261,44 @@ pub const DEFAULT_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS: u64 = 120;
 ///
 /// Reversible without a rebuild via `MIKA_PHANTOM_SWEEP_AGE_SECONDS`.
 pub const DEFAULT_PHANTOM_SWEEP_AGE_SECONDS: u64 = 14400;
+
+/// Default silence window before the pilot silent-stall reaper acts, in
+/// seconds (mika#2249, D1).
+///
+/// **2700 s = the structural ceiling plus margin, not a round number.** Two
+/// measurements bound it, both taken 2026-09-08:
+///
+/// 1. **Lower bound — the pilot's own ceiling.** A claude-pilot whose internal
+///    watchdog *runs* cannot stay silent past `toolWaitCeiling=1800s`
+///    (defaults in `claude-pilot/types.py`, launched without override by
+///    `dispatch-lib.sh`). Below 1800 s this reaper would be racing a watchdog
+///    that still works; the class it exists to see starts above it.
+/// 2. **Upper bound — the shorter of the two founding stalls.** The mika#2246
+///    pilots ran silent for 2h18 and **58 min = 3480 s**. A threshold at or
+///    above 3480 s misses the second case outright.
+///
+/// The usable window is therefore `]1800 s, 3480 s[`, and 2700 s sits near its
+/// middle. Widening the margin toward the 3600–5400 s an abundance of caution
+/// would suggest does not buy safety: it trades a hypothetical false positive
+/// for a **measured** false negative. The caution is paid instead by
+/// [`DEFAULT_PILOT_STALL_REAP_ENABLED`], which withholds the right to kill
+/// until the threshold has been measured against live traffic.
+///
+/// **Negative control the default must clear:** the healthy run c3f9a2f9
+/// (mika#2238) wrote its worktree at 20:19 and again at 20:43 — a **24-minute**
+/// inter-write gap on a pilot that was working. The 15–20 min figure the
+/// ticket body offers as an illustration would have killed it; 2700 s clears
+/// it by roughly a factor of two.
+///
+/// Reversible without a rebuild via `MIKA_PILOT_STALL_REAP_AGE_SECONDS`.
+pub const DEFAULT_PILOT_STALL_REAP_AGE_SECONDS: u64 = 2700;
+
+/// Default arming state of the pilot silent-stall reaper (mika#2249,
+/// Décision 4): **`false`** — it observes, it does not dispose.
+///
+/// See [`Settings::pilot_stall_reap_enabled`] for the asymmetry that motivates
+/// landing disarmed and for the dated flip condition.
+pub const DEFAULT_PILOT_STALL_REAP_ENABLED: bool = false;
 
 /// Default callback-delivery slow-warning threshold in seconds (mika#2179).
 ///
@@ -1782,6 +1857,37 @@ impl Settings {
             .unwrap_or(DEFAULT_PHANTOM_SWEEP_AGE_SECONDS)
     }
 
+    /// Effective silent-stall reap window in seconds (mika#2249).
+    ///
+    /// Returns the configured value or
+    /// [`DEFAULT_PILOT_STALL_REAP_AGE_SECONDS`] (2700). A configured `0` is
+    /// invalid — it would make every in-flight dispatch instantly stale — and
+    /// falls back to the default with a `warn!`.
+    pub fn effective_pilot_stall_reap_age_seconds(&self) -> u64 {
+        match self.pilot_stall_reap_age_seconds {
+            Some(0) => {
+                tracing::warn!(
+                    "pilot_stall_reap_age_seconds=0 is invalid (every in-flight dispatch \
+                     would read as stalled); falling back to {}",
+                    DEFAULT_PILOT_STALL_REAP_AGE_SECONDS
+                );
+                DEFAULT_PILOT_STALL_REAP_AGE_SECONDS
+            }
+            Some(v) => v,
+            None => DEFAULT_PILOT_STALL_REAP_AGE_SECONDS,
+        }
+    }
+
+    /// Whether the silent-stall reaper may dispose (mika#2249, Décision 4).
+    ///
+    /// Returns the configured value or [`DEFAULT_PILOT_STALL_REAP_ENABLED`]
+    /// (`false`). Detection does not consult this — only the kill and the
+    /// status transition do.
+    pub fn effective_pilot_stall_reap_enabled(&self) -> bool {
+        self.pilot_stall_reap_enabled
+            .unwrap_or(DEFAULT_PILOT_STALL_REAP_ENABLED)
+    }
+
     /// Effective callback-delivery slow-warning threshold in seconds (mika#2179).
     ///
     /// Returns the configured value or
@@ -2236,6 +2342,8 @@ impl Settings {
             kg_batch_budget: None,
             callback_watchdog_grace_period_secs: None,
             phantom_sweep_age_seconds: None,
+            pilot_stall_reap_age_seconds: None,
+            pilot_stall_reap_enabled: None,
             callback_delivery_slow_threshold_secs: None,
             callback_delivery_max_attempts: None,
             callback_delivery_backoff_base_secs: None,
@@ -3431,6 +3539,121 @@ mod tests {
         assert_eq!(settings.effective_callback_watchdog_grace_period_secs(), 60);
 
         unsafe { std::env::remove_var("MIKA_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS") };
+    }
+
+    // -- Pilot silent-stall reaper (mika#2249) --
+
+    #[test]
+    #[serial]
+    fn pilot_stall_reap_age_defaults_to_2700() {
+        clean_env();
+        unsafe { std::env::remove_var("MIKA_PILOT_STALL_REAP_AGE_SECONDS") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(settings.pilot_stall_reap_age_seconds, None);
+        assert_eq!(
+            settings.effective_pilot_stall_reap_age_seconds(),
+            DEFAULT_PILOT_STALL_REAP_AGE_SECONDS
+        );
+        // Pinned literally, not only through the constant: the value is the
+        // decision (the `]1800 s, 3480 s[` window), so a silent retune has to
+        // turn a test red.
+        assert_eq!(settings.effective_pilot_stall_reap_age_seconds(), 2700);
+    }
+
+    /// The default must stay inside the window both founding measurements
+    /// carve out. Not a tautology on the constant: it re-states the two
+    /// bounds independently, so moving the constant out of the window fails
+    /// here rather than in production.
+    #[test]
+    #[serial]
+    fn pilot_stall_reap_age_default_sits_inside_the_measured_window() {
+        // Lower bound: the pilot's own `toolWaitCeiling` (1800 s). Below it,
+        // the reaper races a watchdog that still works.
+        const {
+            assert!(
+                DEFAULT_PILOT_STALL_REAP_AGE_SECONDS > 1800,
+                "default must sit above the pilot's structural silence ceiling"
+            )
+        };
+        // Upper bound: the shorter founding stall, 58 min = 3480 s. At or
+        // above it, that case is missed outright.
+        const {
+            assert!(
+                DEFAULT_PILOT_STALL_REAP_AGE_SECONDS < 3480,
+                "default must stay below the shorter measured stall (58 min)"
+            )
+        };
+    }
+
+    #[test]
+    #[serial]
+    fn pilot_stall_reap_age_env_override() {
+        clean_env();
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_PILOT_STALL_REAP_AGE_SECONDS", "3000") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(settings.pilot_stall_reap_age_seconds, Some(3000));
+        assert_eq!(settings.effective_pilot_stall_reap_age_seconds(), 3000);
+
+        unsafe { std::env::remove_var("MIKA_PILOT_STALL_REAP_AGE_SECONDS") };
+    }
+
+    #[test]
+    #[serial]
+    fn pilot_stall_reap_age_zero_falls_back_to_default() {
+        clean_env();
+        unsafe { std::env::set_var("MIKA_PILOT_STALL_REAP_AGE_SECONDS", "0") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(settings.pilot_stall_reap_age_seconds, Some(0));
+        assert_eq!(
+            settings.effective_pilot_stall_reap_age_seconds(),
+            DEFAULT_PILOT_STALL_REAP_AGE_SECONDS,
+            "0 would make every in-flight dispatch read as stalled"
+        );
+
+        unsafe { std::env::remove_var("MIKA_PILOT_STALL_REAP_AGE_SECONDS") };
+    }
+
+    /// Décision 4: the reaper lands observing, not armed.
+    #[test]
+    #[serial]
+    fn pilot_stall_reap_disposition_is_disarmed_by_default() {
+        clean_env();
+        unsafe { std::env::remove_var("MIKA_PILOT_STALL_REAP_ENABLED") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(settings.pilot_stall_reap_enabled, None);
+        assert!(
+            !settings.effective_pilot_stall_reap_enabled(),
+            "the reaper must land without the right to kill (mika#2249 Décision 4)"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn pilot_stall_reap_enabled_env_override() {
+        clean_env();
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_PILOT_STALL_REAP_ENABLED", "true") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(settings.pilot_stall_reap_enabled, Some(true));
+        assert!(settings.effective_pilot_stall_reap_enabled());
+
+        unsafe { std::env::remove_var("MIKA_PILOT_STALL_REAP_ENABLED") };
     }
 
     // -- Phantom NULL-PID sweep grace window (mika#1712) --

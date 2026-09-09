@@ -63,6 +63,7 @@ mod eval {
     mod test_internal_tagging;
     mod test_kg_budget_757;
     mod test_max_steps_continuation;
+    mod test_merge_identity_2248;
     mod test_multi_step;
     mod test_multi_turn_persistence;
     mod test_per_corpus_fairness_927;
@@ -70,6 +71,7 @@ mod eval {
     mod test_persistence_eval_guard;
     mod test_phantom_retry_guard;
     mod test_phantom_task_row_sweep;
+    mod test_pilot_silent_stall_reaper;
     mod test_pr_review_idempotency;
     mod test_ready_label_grooming_guard;
     mod test_real_provider_matrix;

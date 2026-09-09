@@ -157,13 +157,21 @@ pub(crate) fn pilot_transcripts_enabled() -> bool {
 /// stripped. Best-effort: feature-off, non-pilot skill, home resolution failure,
 /// or dir-create failure are all silent no-ops — transcript capture must never
 /// block or fail a dispatch.
+///
+/// Returns the path the variable was set to, or `None` on any of the no-op
+/// paths above. The caller stamps that path on the task once the subprocess is
+/// confirmed started (mika#2040 AC7): the empty-transcript detector's premise
+/// is *"a pilot ran and was asked for a transcript"*, and that premise has to
+/// be a fact recorded by the producer, not one reconstructed later from the
+/// skill name and the current value of `MIKA_LOG_PILOT_TRANSCRIPTS` — that gate
+/// is read per dispatch and can flip in between.
 fn inject_pilot_transcript_env(
     cmd: &mut tokio::process::Command,
     skill_dir: &std::path::Path,
     task_id: &str,
-) {
+) -> Option<PathBuf> {
     if !pilot_transcripts_enabled() {
-        return;
+        return None;
     }
     // Only the two claude-pilot dispatch skills produce subprocess LLM
     // trajectories worth capturing (both source `_shared/dispatch-lib.sh`).
@@ -172,20 +180,83 @@ fn inject_pilot_transcript_env(
         .and_then(|n| n.to_str())
         .is_some_and(|n| n == "dev-pilot" || n == "dev-groom");
     if !is_pilot_skill {
-        return;
+        return None;
     }
     let Ok(home) = mika_common::home::resolve_home_dir() else {
         warn!(task_id = %task_id, "mika#1705: could not resolve home dir; skipping transcript capture");
-        return;
+        return None;
     };
     let dir = home.join("data").join("pilot-transcripts");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         warn!(task_id = %task_id, error = %e, "mika#1705: failed to create pilot-transcripts dir; skipping capture");
-        return;
+        return None;
     }
     let path = dir.join(format!("{task_id}.jsonl"));
     cmd.env(PILOT_TRANSCRIPT_ENV, &path);
     debug!(task_id = %task_id, path = %path.display(), "mika#1705: pilot transcript capture enabled");
+    Some(path)
+}
+
+/// Environment variable `dispatch-lib.sh` honours to declare the worktree it
+/// created for a dispatch (mika#2249, D1 Phase 1). Deliberately `MIKA_`-prefixed
+/// and injected explicitly AFTER [`sandboxed_pilot_env`], like `GH_TOKEN`: it
+/// carries no secret, is read only by `dispatch-lib.sh` itself (which runs
+/// **outside** the bubblewrap sandbox — bwrap wraps only the claude-pilot
+/// invocation), and must not be inherited by anything else.
+const DISPATCH_WORKTREE_ENV: &str = "MIKA_DISPATCH_WORKTREE_FILE";
+
+/// Inject `MIKA_DISPATCH_WORKTREE_FILE` for claude-pilot dispatch skills so
+/// `dispatch-lib.sh` can declare the worktree it created
+/// (`{home}/data/dispatch-worktrees/<task-id>.path`, mika#2249).
+///
+/// The engine's silent-stall reaper needs one thing the Rust side cannot
+/// compute: **where this dispatch is writing**. Only `dispatch-lib.sh` knows —
+/// it derives the path through `scripts/derive-worktree-path`, and
+/// mika-platform#58 closed the duplication that re-deriving it here would
+/// reopen. So the shell declares and the engine reads, exactly as mika#2040
+/// does for the transcript one function above.
+///
+/// MUST be called AFTER [`sandboxed_pilot_env`] so the injected var survives
+/// the env rebuild. Best-effort: a non-pilot skill, a home-resolution failure
+/// or a dir-create failure are all silent no-ops. An undeclared dispatch is
+/// **invisible to the reaper, never a blocked dispatch** — the same trade the
+/// transcript path makes, and the one the fail-safe in
+/// [`crate::task_engine::engine::DISPATCH_WORKTREE_FILE_KEY`] depends on.
+///
+/// Returns the declaration path, or `None` on any no-op path. The caller
+/// stamps it on the task once the subprocess is confirmed started.
+fn inject_dispatch_worktree_env(
+    cmd: &mut tokio::process::Command,
+    skill_dir: &std::path::Path,
+    task_id: &str,
+) -> Option<PathBuf> {
+    // Same two skills as the transcript: both source `_shared/dispatch-lib.sh`
+    // and both create a worktree.
+    let is_pilot_skill = skill_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "dev-pilot" || n == "dev-groom");
+    if !is_pilot_skill {
+        return None;
+    }
+    let Ok(home) = mika_common::home::resolve_home_dir() else {
+        warn!(task_id = %task_id, "mika#2249: could not resolve home dir; dispatch worktree will not be watched");
+        return None;
+    };
+    let dir = home.join("data").join("dispatch-worktrees");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        warn!(task_id = %task_id, error = %e, "mika#2249: failed to create dispatch-worktrees dir; dispatch will not be watched");
+        return None;
+    }
+    let path = dir.join(format!("{task_id}.path"));
+    // A stale file from a previous dispatch reusing this task id would point
+    // the reaper at a worktree this run is not writing to. Remove it rather
+    // than trust `dispatch-lib` to overwrite: the declaration only happens if
+    // the shell gets that far, and a leftover path is worse than no path.
+    let _ = std::fs::remove_file(&path);
+    cmd.env(DISPATCH_WORKTREE_ENV, &path);
+    debug!(task_id = %task_id, path = %path.display(), "mika#2249: dispatch worktree declaration armed");
+    Some(path)
 }
 
 /// Maximum raw image file size (5 MB).
@@ -3052,7 +3123,11 @@ pub(crate) fn spawn_long_running_exec(
         }
         // mika#1705: enable claude-pilot subprocess LLM-transcript capture.
         // Injected AFTER the env sandbox so the non-allowlisted var survives.
-        inject_pilot_transcript_env(&mut cmd, &skill_dir, &task_id);
+        let expected_transcript = inject_pilot_transcript_env(&mut cmd, &skill_dir, &task_id);
+        // mika#2249: arm the worktree declaration channel the silent-stall
+        // reaper reads. Same placement rationale as the line above — injected
+        // after the env sandbox so the var survives.
+        let expected_worktree_file = inject_dispatch_worktree_env(&mut cmd, &skill_dir, &task_id);
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -3066,6 +3141,51 @@ pub(crate) fn spawn_long_running_exec(
                 return;
             }
         };
+
+        // mika#2040 AC7: record that this dispatch was asked for a transcript.
+        // Stamped AFTER the spawn succeeded, deliberately: a dispatch whose
+        // spawn failed produced no transcript because no pilot ran, and
+        // reporting it under `pilot_transcript_empty_after_dispatch` would put
+        // a failure the spawn arm already logs into the count of writer
+        // failures — which is the one number the detector exists to keep clean.
+        if let Some(ref path) = expected_transcript
+            && let Err(e) = db
+                .set_task_metadata_field(
+                    &task_id,
+                    crate::task_engine::engine::PILOT_TRANSCRIPT_EXPECTED_KEY,
+                    &path.to_string_lossy(),
+                )
+                .await
+        {
+            // Fire-and-forget, as everywhere on this path: an unstamped
+            // dispatch is invisible to the detector, never a blocked dispatch.
+            warn!(
+                task_id = %task_id,
+                error = %e,
+                "mika#2040: failed to stamp expected transcript path; this dispatch \
+                 will not be watched for an empty transcript"
+            );
+        }
+
+        // mika#2249 D1: stamp the worktree declaration path, same fire-and-forget
+        // discipline and the same reason — an unstamped dispatch is invisible to
+        // the silent-stall reaper, never a blocked dispatch.
+        if let Some(ref path) = expected_worktree_file
+            && let Err(e) = db
+                .set_task_metadata_field(
+                    &task_id,
+                    crate::task_engine::engine::DISPATCH_WORKTREE_FILE_KEY,
+                    &path.to_string_lossy(),
+                )
+                .await
+        {
+            warn!(
+                task_id = %task_id,
+                error = %e,
+                "mika#2249: failed to stamp dispatch worktree declaration path; this \
+                 dispatch will not be watched for a silent stall"
+            );
+        }
 
         // Record PID and process start time for watchdog (#959)
         if let Some(pid) = child.id() {

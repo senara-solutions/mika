@@ -39,7 +39,7 @@ regex = "1"
 # Configuration
 config = "0.15"
 toml = "1.1"
-toml_edit = "0.22"
+toml_edit = "0.25"
 dotenvy = "0.15"
 
 # Directories
@@ -66,7 +66,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
-cron = "0.12"
+cron = "0.17"
 
 # Async trait
 async-trait = "0.1"
@@ -146,9 +146,13 @@ dialoguer = "0.11"
 
 # Testing
 tempfile = "3"
-serial_test = "3"
+serial_test = "4"
 # HTTP mock server for wiremock-style integration tests (mika-gateway egress-search)
 wiremock = "0.6"
+# mtime stamping for the mika#2249 worktree-activity probe tests. std can read
+# mtimes but not set them, and those tests need backdated worktrees to pin the
+# reaper threshold. Already in the tree as a transitive dep of `tar`.
+filetime = "0.2"
 
 # Concurrent collections
 dashmap = "6"

@@ -5,6 +5,7 @@ pub mod claude;
 pub mod config;
 pub mod dotenv;
 pub mod embedding;
+pub mod forge_identity;
 pub mod github_app;
 pub mod github_event_format;
 pub mod home;
