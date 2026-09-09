@@ -28,13 +28,23 @@ valeur que pour des rebuilds successifs du *même* arbre sur la durée. Un workt
 construit une à trois fois puis jeté : cet état est produit intégralement et **jamais** réutilisé.
 C'est le seul poste du `target/` qui soit du déchet pur plutôt qu'un artefact dont le pipeline dépend.
 
-Aujourd'hui, `CARGO_INCREMENTAL` n'atteint le build d'un spawn par aucun chemin :
+**Quatre chemins invoquent `claude-pilot` dans un worktree qui compile**, et ils ne sont pas de
+même régime :
+
+| chemin | source `dispatch-lib` | régime du worktree |
+|---|---|---|
+| `dev-pilot/handlers/run.sh` | oui | **créé puis jeté** |
+| `dev-groom/handlers/run.sh` | oui | **créé puis jeté** |
+| `address-pr-comments/handlers/run.sh:254` | non — `claude-pilot` direct, sans bwrap | **réutilisé** sur la durée d'une PR |
+| `resolve-pr-conflicts/handlers/run.sh:196` | non — idem, worktree via `derive-worktree-path` | **réutilisé** |
+
+Aujourd'hui, `CARGO_INCREMENTAL` n'atteint le build par aucun de ces chemins. Sur les deux premiers :
 
 - **Chemin sandboxé** — `dispatch-lib.sh` lance le pilote sous `bwrap --clearenv` (ligne 1144). Toute
   variable non listée dans `_PILOT_SANDBOX_ENV_ALLOWLIST` (ligne 563) est supprimée. Même exportée
   côté hôte, `CARGO_INCREMENTAL` n'entre pas dans le sandbox.
 - **Chemin direct** — deux sorties `"$@"` sans bwrap : opt-out `MIKA_PILOT_SANDBOX=0`
-  (`dispatch-lib.sh:916`) et `bwrap` absent du PATH (ligne 928). Là, l'env de l'hôte est hérité tel
+  (`dispatch-lib.sh:916`) et `bwrap` absent du PATH (ligne 927). Là, l'env de l'hôte est hérité tel
   quel — donc rien n'est posé non plus.
 
 ---
@@ -49,6 +59,25 @@ Aujourd'hui, `CARGO_INCREMENTAL` n'atteint le build d'un spawn par aucun chemin 
 Le chemin direct hérite de l'export. Le chemin sandboxé le récupère via la boucle de réinjection
 (`dispatch-lib.sh:1074-1078`), qui teste `[ -n "${!var:-}" ]` — et `-n "0"` est **vrai** en shell,
 la valeur `0` n'étant pas la chaîne vide. Aucun troisième site à tenir synchronisé.
+
+**Pourquoi seulement les deux chemins `dispatch-lib`, et pas les quatre** (AC1). L'argument qui
+porte ce plan est que le worktree est *jeté* : l'état incrémental est produit puis perdu, donc c'est
+du déchet pur. Cet argument **ne tient pas** sur `address-pr-comments` et `resolve-pr-conflicts` :
+une PR reçoit plusieurs rounds, et ces handlers recompilent le *même* worktree à chaque round —
+précisément le régime où l'incrémental paie. Trois options ont été pesées :
+
+- **A (retenue)** — les deux chemins jetables. Le gain porte là où le raisonnement tient.
+- **B** — les quatre chemins. Gain maximal, mais paie un coût de rebuild répété sur les worktrees de
+  PR, contre l'argument même du ticket. Ce serait appliquer la bonne conclusion au mauvais
+  raisonnement, et ce qui ralentit la boucle (palier 1 du tri) coûte plus cher que ce qui la remplit
+  (palier 2).
+- **C** — A, plus un nettoyage du seul `incremental/` à la fermeture de la PR. Rend le disque sans
+  coûter de temps de rebuild pendant la vie de la PR. Surface différente
+  (`scripts/mika-platform-worktree-cleanup`) : second ticket si la mesure AC4 montre que les
+  worktrees de PR pèsent encore.
+
+Le périmètre est donc **nommé**, pas subi : AC1 couvre `dev-pilot` et `dev-groom`, et l'assertion D
+de la Phase 2 fait échouer le garde si un cinquième chemin apparaît sans décision.
 
 **Pourquoi pas `mika/.cargo/config.toml` avec `incremental = false`** (AC2) : ce fichier s'applique à
 tout build du dépôt, y compris le checkout principal, où l'itération répétée sur le même arbre rend
@@ -90,7 +119,12 @@ Dans `skills/bundled/_shared/test-dispatch-lib.sh` (suite existante, cible `make
 2. **Assertion positive B** — l'export existe dans `dispatch-lib.sh` et vaut `0`.
 3. **Assertion positive C** — `mika/.cargo/config.toml` ne définit pas `incremental` (AC2 vérifiée,
    pas seulement promise) ; le fichier peut être absent, ce qui satisfait aussi l'assertion.
-4. **Comportement négatif pinné** — sur une copie de `dispatch-lib.sh` privée de l'export, puis sur
+4. **Assertion positive D** — les handlers qui invoquent `claude-pilot` **sans** passer par
+   `dispatch-lib.sh` sont énumérés dans le garde (`address-pr-comments`, `resolve-pr-conflicts`).
+   Un cinquième chemin ajouté plus tard fait échouer le test, forçant une décision de périmètre au
+   lieu de perdre le gain en silence. C'est le risque « un troisième chemin apparaît » rendu
+   structurel plutôt que confié à la vigilance en revue.
+5. **Comportement négatif pinné** — sur une copie de `dispatch-lib.sh` privée de l'export, puis sur
    une copie privée de l'entrée d'allowlist, le garde doit **échouer**. Modèle exact :
    `verify-egress-no-log` (`Makefile:186`) et `check-byte-slices` (`Makefile:193`), qui pinnent tous
    deux leur négatif. Un garde qui passe encore une fois le réglage retiré est vide.
@@ -141,13 +175,33 @@ PR. Si une étape casse, la nommer et la traiter — jamais réintroduire le ré
 
 ---
 
+## Fire-Disposition
+
+Les livrables de la Phase 2 sont des **détecteurs de régression** (assertions A/B/C/D + comportement
+négatif pinné). Leur disposition quand ils tirent, spécifiée d'avance (mika#1574 Fire-Disposition
+Gate) :
+
+**Disposition : (c) halt-and-surface, via gate CI bloquant.** `make test-dispatch-lib` échoue et la
+CI bloque la fusion dès que la configuration diverge de l'invariant — export retiré, entrée
+d'allowlist retirée, `incremental` réapparu dans un `.cargo/config.toml`, ou nouveau chemin
+d'invocation non déclaré.
+
+**Violations pré-existantes : aucune.** Le réglage n'existe pas encore ; le garde naît avec le
+comportement qu'il garde. Il n'y a donc ni période de grâce, ni allowlist de dérogations à porter,
+ni tri de dette à faire avant d'activer le gate.
+
+**Pourquoi halt-and-surface et pas warn-only :** l'invariant est binaire et bon marché à satisfaire
+(deux lignes). Un avertissement laisserait le gain se perdre en silence — exactement le mode
+d'échec que l'AC1 nomme.
+
 ## Definition of Done
 
 - [ ] `export CARGO_INCREMENTAL=0` posé dans `dispatch-lib.sh`, commenté avec ticket + chiffre.
 - [ ] `CARGO_INCREMENTAL` dans `_PILOT_SANDBOX_ENV_ALLOWLIST`, bloc d'audit R6 étendu.
 - [ ] Aucun `mika/.cargo/config.toml` créé ni modifié.
-- [ ] Les quatre assertions de la Phase 2 dans `test-dispatch-lib.sh`, négatif pinné, `make
-      test-dispatch-lib` vert et rouge quand le réglage est retiré.
+- [ ] Les cinq assertions de la Phase 2 (A/B/C/D + négatif pinné) dans `test-dispatch-lib.sh`, négatif pinné, `make
+      `make test-dispatch-lib` vert, et rouge quand le réglage est retiré.
+- [ ] Section `## Fire-Disposition` présente et honorée par le câblage CI.
 - [ ] Mesure ventilée du premier spawn compilant dans la PR (4 postes, avec les commandes).
 - [ ] Quatre durées de l'arbitrage disque/temps dans la PR, verdict contre le seuil de +50 %.
 - [ ] `cargo test`, `clippy --all-targets --all-features`, `fmt --check` verts, sorties jointes.
@@ -155,7 +209,7 @@ PR. Si une étape casse, la nommer et la traiter — jamais réintroduire le ré
 ## Acceptance criteria
 
 - [ ] **AC1** — `CARGO_INCREMENTAL=0` atteint réellement le build d'un spawn, sur les deux chemins de
-      dispatch : sandboxé (`--setenv` malgré `--clearenv`) et direct (`dispatch-lib.sh:916` et `:928`).
+      dispatch : sandboxé (`--setenv` malgré `--clearenv`) et direct (`dispatch-lib.sh:916` et `:927`).
 - [ ] **AC2** — Le réglage ne quitte pas le dispatch : pas de `mika/.cargo/config.toml`, checkout
       principal inchangé, vérifiable.
 - [ ] **AC3** — Un garde structurel, pas une clause en prose, avec le comportement négatif pinné.
@@ -194,13 +248,14 @@ ventilé** :
 | Le rebuild non incrémental ralentit les spawns | Ralentit la boucle (palier 1 > palier 2) | Phase 4 : quatre durées + seuil de renoncement +50 % nommé d'avance |
 | L'entrée d'allowlist ajoutée sans peser l'audit R6 | Discipline mika#2039 érodée par précédent | Phase 1 : le bloc d'audit est étendu dans le même diff |
 | Le premier spawn suivant ne compile pas | AC4 non mesurable | Prérequis explicite en Phase 3 : attendre un spawn compilant |
-| Un troisième chemin d'invocation apparaît plus tard | Gain perdu en silence sur ce chemin | Le garde assert l'export **et** l'allowlist ; un nouveau chemin qui n'hérite ni ne réinjecte est une régression visible en revue |
+| Deux chemins d'invocation (`address-pr-comments`, `resolve-pr-conflicts`) ne passent pas par `dispatch-lib` | Gain nul sur les worktrees de PR | **Mesuré, pas supposé** : hors périmètre par décision (option A), régime réutilisé où l'argument du ticket ne tient pas. Assertion D du garde |
+| Un cinquième chemin apparaît plus tard | Gain perdu en silence | Assertion D : l'énumération des handlers hors `dispatch-lib` est dans le garde ; un ajout non déclaré fait rougir la CI |
 
 ## Références
 
 - `mika/skills/bundled/_shared/dispatch-lib.sh:563-566` — `_PILOT_SANDBOX_ENV_ALLOWLIST`
 - `…:549-562` — bloc d'audit mika#2039 R6 (toute addition à `--setenv` doit être pesée)
-- `…:916`, `…:928` — les deux sorties `"$@"` du chemin direct
+- `…:916`, `…:927` — les deux sorties `"$@"` du chemin direct
 - `…:1074-1078` — boucle de réinjection `--setenv`, test `[ -n "${!var:-}" ]`
 - `…:1144` — `--clearenv`
 - `mika/Makefile:156` — cible `test-dispatch-lib`, câblée CI (mika#1772)
