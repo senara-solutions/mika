@@ -19,6 +19,10 @@ mod eval {
     // & co., extraites de test_pilot_silent_stall_reaper.rs.
     pub mod process_fixtures;
 
+    // Porte transverse (mika#2265) : aucun fichier de tests/eval/ n'existe sans
+    // être compilé. Elle se déclare elle-même.
+    mod test_eval_modules_declared;
+
     // Golden dataset: 25 curated scenarios for end-to-end quality testing (#339)
     pub mod golden;
 
