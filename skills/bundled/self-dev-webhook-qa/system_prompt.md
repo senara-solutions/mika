@@ -45,6 +45,14 @@ The message contains the review body, PR URL, repo, and reviewer. mika-qa posts 
       - Notify Vincent via `send_message`: "{repo}#{number} passed QA. CI pending — auto-merge enabled. {PR URL}"
       - Proceed to Step 5 with `in_progress` and note "QA passed, auto-merge enabled, awaiting CI. PR: {url}".
 
+      **`"branch_updated"`** (mika#2238) — PR was behind main; GitHub accepted an update of its branch:
+      - The PR is **NOT** merged, no merge was attempted, and none must be attempted in this turn. The update moves the head to a new commit that no CI run has validated; merging it now would put unvalidated code on main — the failure mika#1577 was written to close.
+      - Do NOT call `pr_merge_with_gate` again for this PR. Do NOT rebase by hand. Do NOT call `run_gh pr merge`.
+      - **The PR now needs a FRESH QA review.** Moving the head SHA invalidates the approval that pointed at the old one, and the stale-SHA gate holds the PR until QA re-reviews the updated head. `branch_updated` repairs the mechanical behind-main state; it does not, on its own, lead to a merge.
+      - Correlate to task (Step 4).
+      - Notify Vincent via `send_message`: "{repo}#{number} was behind main — branch update accepted. Head moved, so it needs a fresh QA review before it can merge. {PR URL}"
+      - Proceed to Step 5 with `in_progress` and note "Behind-main repaired, head moved, awaiting fresh QA review. PR: {url}". **End the turn.**
+
       **`"blocked"`** — PR cannot merge. Branch on the `reason` field:
 
         **`reason.reason = "required_check_failed"`** — Required CI checks failing:
@@ -64,6 +72,20 @@ The message contains the review body, PR URL, repo, and reviewer. mika-qa posts 
         **`reason.reason = "missing_approval"`** — PR needs review approval:
         - Correlate to task (Step 4).
         - Notify Vincent via `send_message`: "{repo}#{number} needs approval review. {PR URL}"
+        - Task status: `in_progress`.
+
+        **`reason.reason = "behind_main"`** (mika#1577 / mika#2238) — PR is behind main AND the automatic branch update did not go through:
+        - Read `detail` for the cause: an API failure, or an update toward this exact main HEAD that was already attempted (anti-thrash guard). A **permission** failure does not land here — it arrives as `gate_errored` with `kind = credential_scope`, which names the fix (install the App on the repo / widen the PAT).
+        - Do NOT merge. Do NOT rebase by hand. Do NOT call `run_claude_pilot` — a behind-main state is mechanical, not a code change.
+        - Correlate to task (Step 4).
+        - Notify Vincent via `send_message`: "{repo}#{number} is behind main and the automatic branch update did not go through: {detail}. {PR URL}"
+        - Task status: `in_progress`.
+
+        **`reason.reason = "human_gate_required"`** (mika#1829) — PR touches a DECISION-CORE zone:
+        - The forge-gate perimeter holds this PR for the operator, who merges it by hand.
+        - Do NOT work around the gate, do NOT retry the tool, do NOT call `run_gh pr merge`.
+        - Correlate to task (Step 4).
+        - Notify Vincent via `send_message`: "{repo}#{number} touches a DECISION-CORE zone — forge-gate holds it for you. {summary} {PR URL}"
         - Task status: `in_progress`.
 
         **`reason.reason = "draft"` or `reason.reason = "pr_closed"`** — Unexpected in webhook-qa:
@@ -247,7 +269,9 @@ If you find yourself tempted to "quickly fix" a CI failure via `write_agent_file
 
 Never call `run_gh("pr merge ...")` or `run_gh("gh pr merge ...")` to merge a PR. Always use `pr_merge_with_gate` with `pr_number` (integer) and `repo` (owner/repo string). The tool checks required CI statuses and returns a structured `action` — act on it.
 
-**Structural enforcement:** `pr_merge_with_gate` now returns typed variants (`merged`, `auto_merge_enabled`, `blocked`, `already_merged`, `gate_errored`). The `gate_errored` and `blocked` branches above are the exhaustive handling surface. On ANY error or blocked state, do NOT fall back to `run_gh pr merge`. Runtime enforcement via policy table — see follow-up ticket.
+**Structural enforcement:** `pr_merge_with_gate` returns **six** typed variants — `merged`, `auto_merge_enabled`, `blocked`, `already_merged`, `gate_errored`, `branch_updated`. The `blocked` variant carries a `reason` field with **seven** sub-variants — `merge_conflict`, `required_check_failed`, `missing_approval`, `pr_closed`, `draft`, `behind_main`, `human_gate_required`. Every one of them has a branch in Step 2 above; that list is the exhaustive handling surface. On ANY error or blocked state, do NOT fall back to `run_gh pr merge`.
+
+**Why this list used to be short:** until mika#2238 this prompt named five of the seven `blocked.reason` values while instructing you to branch "exhaustively". An agent that met an unlisted variant had no defined move, and the observed behaviour was a silent stop — the mika#2236 shape, where an APPROVED, CI-green, behind-main PR sat until the operator merged it by hand.
 
 **Incident:** mika#485 on 2026-04-08 — PR merged with required CI check in FAILURE state because agent used `run_gh pr merge` which has no CI gate. mika#792 on 2026-04-24 — agent improvised `run_gh pr merge --auto` when gate returned an unstructured error on a CONFLICTING PR.
 
