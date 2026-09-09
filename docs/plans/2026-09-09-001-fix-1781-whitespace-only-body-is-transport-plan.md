@@ -151,6 +151,27 @@ suite** — the tests cover the classification and its retryability, not the log
 - **AC5** — No change to the success path, to any other error variant, or to retry policy itself.
   `cargo clippy --all-targets -- -D warnings` and `cargo test -p mika-common` pass.
 
+## Fire-Disposition
+
+Both deliverables that can fire are named here with what happens when they do (mika#1574).
+
+- **AC4 — unit tests (CI).** Fire on: the diff / CI. Disposition: **blocking CI gate**. The
+  whitespace test must be verified **red before** the guard lands — on today's code a 1320-byte
+  blank body reaches `serde_json::from_str` and yields `ParseError`, so the assertion
+  `is_retryable() == true` fails. Green only after the guard. No auto-remediation.
+  There is **no pre-existing-violation backlog to dispose of**: the classifier is new code on a new
+  path, not a sweep over existing call sites, so the "land disabled then clean up" option has an
+  empty set to work on and is not needed.
+- **AC2 — the `warn!` as a runtime probe (operator).** Fire on: `mika::llm` in
+  `/var/log/mika/server.log` after deploy. Disposition: **halt-and-surface, not auto-retry-forever**.
+  A `"LLM response body was whitespace-only"` line is expected and benign on its own — it means the
+  class was caught and routed. What is *not* benign is that same `task_id` appearing afterwards in a
+  `WARN resume_agent run failed`: that would mean the retry path did not absorb it, and the fix
+  routed the error without changing the outcome. In that case stop and re-open, do not re-deploy.
+  Stated honestly: with a base rate of n=1 in 12 days, silence on this probe is **not** evidence the
+  fix works. The red-before-green unit test is the evidence; this probe only confirms the routing if
+  and when the class recurs.
+
 ## Out of scope
 
 - Repairing malformed JSON in any form (schema-gated repair, third-party "suture" libraries). A
