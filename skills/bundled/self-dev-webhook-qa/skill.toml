@@ -2,7 +2,16 @@
 name = "self-dev-webhook-qa"
 description = "Webhook handler for PR review verdicts (pass/hold/block)"
 version = "0.1.0"
-max_prompt_size = 32768
+# Relevé de 32768 à 65536 (mika#2248) : le prompt était à 94,4 % du plafond
+# avant d'ajouter la huitième sous-variante de `blocked.reason`, et la porte
+# d'alerte des 95 % a fait feu à 97,2 %. La remédiation ne pouvait pas être
+# « retirer une branche » : ce prompt affirme l'exhaustivité de sa table de
+# dispatch, et mika#2238 a mesuré qu'une variante non listée produit un arrêt
+# silencieux. 65536 est le plafond déjà déclaré par `self-dev` (dont ce skill
+# dépend) et `qa-review`, sous le plafond dur de 80 Ko ; le coût est nul
+# aujourd'hui — c'est la taille réelle qui est injectée, pas le plafond — et la
+# porte refera feu à ~62 Ko.
+max_prompt_size = 65536
 always_on = false
 dependencies = ["self-dev"]
 
