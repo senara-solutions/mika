@@ -86,11 +86,52 @@ pub async fn try_handle_ready_label_dispatch(
     text: &str,
     db: &AsyncDatabase,
     github_token: Option<&str>,
-    _message_sender: Option<&Arc<dyn MessageSender>>,
+    message_sender: Option<&Arc<dyn MessageSender>>,
     session_id: &str,
     trace_id: &str,
     skills: &SkillRegistry,
 ) -> VerdictAction {
+    try_handle_ready_label_dispatch_with_fetcher(
+        text,
+        db,
+        github_token,
+        message_sender,
+        session_id,
+        trace_id,
+        skills,
+        |owner_repo, number, token| async move {
+            fetch_issue_body_and_labels_via_gh(&owner_repo, number, &token).await
+        },
+    )
+    .await
+}
+
+/// [`try_handle_ready_label_dispatch`] with the issue fetch injected.
+///
+/// The seam exists for one reason: the refusal gates in this handler are
+/// defined by what they do BEFORE the step-7 pre-create — "zero task created"
+/// is the property, and no test can observe it while the only way in runs `gh
+/// issue view` against the real GitHub. Production always passes
+/// [`fetch_issue_body_and_labels_via_gh`]; tests pass the labels they want to
+/// gate on.
+///
+/// `fetch_issue` receives `(owner_repo, number, token)` and yields
+/// `(body, labels)`.
+#[allow(clippy::too_many_arguments)]
+pub async fn try_handle_ready_label_dispatch_with_fetcher<F, Fut>(
+    text: &str,
+    db: &AsyncDatabase,
+    github_token: Option<&str>,
+    _message_sender: Option<&Arc<dyn MessageSender>>,
+    session_id: &str,
+    trace_id: &str,
+    skills: &SkillRegistry,
+    fetch_issue: F,
+) -> VerdictAction
+where
+    F: FnOnce(String, u64, String) -> Fut,
+    Fut: std::future::Future<Output = Result<(String, Vec<String>), String>>,
+{
     // 1. Early-return for non-ready-label messages. Cheapest predicate.
     if !text.starts_with(READY_LABEL_DISPATCH_MARKER) {
         return VerdictAction::Passthrough { enrichment: None };
@@ -183,19 +224,20 @@ pub async fn try_handle_ready_label_dispatch(
 
     // 4. Fetch issue body via `gh issue view`. Used to determine groomed-state
     //    via the same predicate the dispatch gate uses (#919, #1108).
-    let (body, labels) = match fetch_issue_body_and_labels(&location, token).await {
-        Ok(pair) => pair,
-        Err(e) => {
-            warn!(
-                event = "ready_label_body_fetch_failed",
-                repo = %location.owner_repo(),
-                num = location.number,
-                error = %e,
-                "ready_label_handler: gh issue view failed — passthrough"
-            );
-            return VerdictAction::Passthrough { enrichment: None };
-        }
-    };
+    let (body, labels) =
+        match fetch_issue(location.owner_repo(), location.number, token.to_string()).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!(
+                    event = "ready_label_body_fetch_failed",
+                    repo = %location.owner_repo(),
+                    num = location.number,
+                    error = %e,
+                    "ready_label_handler: gh issue view failed — passthrough"
+                );
+                return VerdictAction::Passthrough { enrichment: None };
+            }
+        };
 
     // 4b. Dispatch-seat gate (mika#2084). Placed here because it is the first
     //     point at which the issue's labels are known — they ride along on the
@@ -614,18 +656,18 @@ pub(crate) fn parse_ready_label_location(text: &str) -> Option<ReadyLabelLocatio
 /// the mika#2084 seat gate costs no extra round trip. Returns a descriptive
 /// error string on failure — which the caller turns into a passthrough, exactly
 /// as it did before the labels were added.
-async fn fetch_issue_body_and_labels(
-    loc: &ReadyLabelLocation,
+pub async fn fetch_issue_body_and_labels_via_gh(
+    owner_repo: &str,
+    number: u64,
     token: &str,
 ) -> Result<(String, Vec<String>), String> {
-    let owner_repo = loc.owner_repo();
-    let number_str = loc.number.to_string();
+    let number_str = number.to_string();
     let args = [
         "issue",
         "view",
         &number_str,
         "--repo",
-        &owner_repo,
+        owner_repo,
         "--json",
         "body,labels",
     ];
