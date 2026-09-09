@@ -380,6 +380,16 @@ impl AsyncDatabase {
             .await
     }
 
+    /// mika#2271: mark cancelled recurring rows for `label` as a reverted
+    /// config cancel so the mika#1742 zombie guard lets re-registration
+    /// through. Returns the number of rows marked.
+    pub async fn revert_config_cancel_recurring_task(&self, label: &str) -> Result<usize> {
+        let a = self.agent_id.clone();
+        let l = label.to_owned();
+        self.with_db(move |db| db.revert_config_cancel_recurring_task(&a, &l))
+            .await
+    }
+
     pub async fn cancel_recurring_task_by_label(&self, label: &str) -> Result<()> {
         // mika#1758 note: this method cancels 0..N recurring rows keyed by
         // (agent_id, label) without returning the affected task ids. Emitting

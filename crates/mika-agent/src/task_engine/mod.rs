@@ -35,12 +35,35 @@ pub async fn prune_old_tasks(db: &AsyncDatabase) {
 /// the next fire time.
 ///
 /// Used at startup to ensure built-in tasks (heartbeat, reflection) are always registered.
+///
+/// **Calling this function *is* the config declaring the task must run** — the
+/// callers are the boot paths that already evaluated the knob or the
+/// `identity.toml` toggle. So a prior *config-driven* cancel of the same label
+/// (the knob-off boot cancelled the row) must not survive as a veto: mika#2271
+/// reverts it before re-registering. Terminal failures (`failed` / `expired`)
+/// keep blocking through the mika#1742 refuse-to-zombie guard — only the
+/// deliberate `cancelled` state is cleared here.
 pub async fn ensure_recurring_task(
     db: &AsyncDatabase,
     label: &str,
     cron_expr: &str,
     action_config: &str,
 ) {
+    // mika#2271: knob-off cancelled this label; the caller now says it must run.
+    // Clear the config-cancel veto so the mika#1742 guard doesn't refuse the
+    // re-registration below.
+    match db.revert_config_cancel_recurring_task(label).await {
+        Ok(0) => {}
+        Ok(n) => {
+            info!(
+                label,
+                rows = n,
+                "reverted config cancel on recurring task (mika#2271)"
+            )
+        }
+        Err(e) => warn!(label, error = %e, "failed to revert config cancel on recurring task"),
+    }
+
     let agent_id = db.agent_id.clone();
     let task = NewTask {
         agent_id,
@@ -147,4 +170,110 @@ pub async fn reflection_cron_for_agent(home_dir: &Path, db: &AsyncDatabase) -> O
     let utc_time = utc_dt.with_timezone(&chrono::Utc).time();
 
     Some(format!("0 {} {} * * *", utc_time.minute(), utc_time.hour()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+
+    const FEEDER_LABEL: &str = "auto_pull_groomed";
+    const FEEDER_CRON: &str = "0 */20 * * * *";
+    const FEEDER_CONFIG: &str = r#"{"trigger":"auto_pull_groomed"}"#;
+
+    fn test_async_db() -> AsyncDatabase {
+        AsyncDatabase::new(Database::open_in_memory().unwrap())
+    }
+
+    async fn statuses_for(db: &AsyncDatabase, label: &str) -> Vec<String> {
+        db.get_tasks_by_status(vec![
+            "recurring_active".to_string(),
+            "pending".to_string(),
+            "in_progress".to_string(),
+            "cancelled".to_string(),
+            "failed".to_string(),
+            "expired".to_string(),
+        ])
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.label == label)
+        .map(|t| t.status)
+        .collect()
+    }
+
+    /// **Porte mika#2271 — test négatif.** Invariant : *un cycle knob-off →
+    /// knob-on ré-inscrit le feeder*. Le knob-off boot annule la task
+    /// récurrente ; le knob-on boot rappelle `ensure_recurring_task`, ce qui
+    /// **est** la config déclarant que la task doit tourner. La garde
+    /// refuse-to-zombie (mika#1742) ne doit pas transformer ce cancel
+    /// délibéré en veto permanent.
+    ///
+    /// Sans le fix, le second `ensure_recurring_task` est refusé par la garde
+    /// et le seul statut restant est `cancelled` — la boucle n'est plus
+    /// réalimentée (symptôme mesuré le 2026-09-09).
+    #[tokio::test]
+    async fn knob_off_then_on_reregisters_the_feeder() {
+        let db = test_async_db();
+
+        // Boot 1 — knob absent : le feeder s'inscrit.
+        ensure_recurring_task(&db, FEEDER_LABEL, FEEDER_CRON, FEEDER_CONFIG).await;
+        assert_eq!(
+            statuses_for(&db, FEEDER_LABEL).await,
+            vec!["recurring_active".to_string()],
+            "boot initial : le feeder doit être inscrit"
+        );
+
+        // Boot 2 — MIKA_DEV_AUTO_PULL=0 : la branche knob-off annule la row.
+        db.cancel_recurring_task_by_label(FEEDER_LABEL)
+            .await
+            .unwrap();
+        assert_eq!(
+            statuses_for(&db, FEEDER_LABEL).await,
+            vec!["cancelled".to_string()],
+            "knob-off : la row doit être annulée"
+        );
+
+        // Boot 3 — knob retiré : le feeder doit revenir.
+        ensure_recurring_task(&db, FEEDER_LABEL, FEEDER_CRON, FEEDER_CONFIG).await;
+
+        let statuses = statuses_for(&db, FEEDER_LABEL).await;
+        assert!(
+            statuses.iter().any(|s| s == "recurring_active"),
+            "knob-on : le feeder doit être RÉ-INSCRIT (recurring_active), \
+             pas laissé cancelled — statuts observés : {statuses:?}"
+        );
+    }
+
+    /// Contrôle positif de la garde : un `failed` récent bloque toujours la
+    /// ré-inscription. L'exemption mika#2271 ne vise que le cancel de config —
+    /// elle ne doit pas désarmer la protection anti-zombie de mika#1742.
+    #[tokio::test]
+    async fn recent_failed_still_blocks_reregistration() {
+        let db = test_async_db();
+        ensure_recurring_task(&db, FEEDER_LABEL, FEEDER_CRON, FEEDER_CONFIG).await;
+
+        let label = FEEDER_LABEL.to_string();
+        db.with_db(move |d| {
+            d.conn.execute(
+                "UPDATE tasks SET status = 'failed',
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 hour')
+                 WHERE label = ?1",
+                rusqlite::params![label],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        ensure_recurring_task(&db, FEEDER_LABEL, FEEDER_CRON, FEEDER_CONFIG).await;
+
+        let statuses = statuses_for(&db, FEEDER_LABEL).await;
+        assert_eq!(
+            statuses,
+            vec!["failed".to_string()],
+            "un échec terminal récent doit toujours bloquer la ré-inscription \
+             (mika#1742) — statuts observés : {statuses:?}"
+        );
+    }
 }
