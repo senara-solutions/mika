@@ -186,11 +186,32 @@ part qui empêche un futur test d'asserter le contraire de ce qu'il croit.
 `test_pilot_silent_stall_reaper.rs` importe désormais depuis ce module et perd ses copies —
 pas de duplication, et son comportement doit être **inchangé** (voir V2).
 
+Déclaration : `pub mod process_fixtures;` dans le bloc `mod eval` de `tests/eval.rs` (vérifié par L5).
+
 ### L3 — `crates/mika-agent/tests/eval/test_multi_agent_harness_witness.rs` (nouveau) — AC3
 
 Les trois tests de D4 : positif, négatif (mono-agent), partage. Le scénario est celui de #2248 —
 `tool_name = "ci_success_handler_processed"`, `target_key = "senara-solutions/mika#2244"` — pour
 que le témoin nomme la classe qu'il rend visible, sans dépendre du handler réel.
+
+Déclaration : `mod test_multi_agent_harness_witness;` dans le bloc `mod eval` de `tests/eval.rs`.
+**Non négociable, et vérifié par L5.** Un fichier `.rs` posé dans `tests/eval/` sans sa ligne `mod`
+n'est pas compilé : il ne casse rien, ne rapporte rien, et aucune CI ne le réclame. Un livrable
+oublié de cette façon rend la porte AC3 verte pour la mauvaise raison — la CI ne voit pas un test
+absent (elle ne voit que les tests qui existent et échouent).
+
+### L5 — `crates/mika-agent/tests/eval/test_eval_modules_declared.rs` (nouveau) — la porte qui voit l'absence
+
+Un test qui compare la liste des fichiers de `tests/eval/*.rs` aux modules déclarés dans
+`tests/eval.rs`, lu par `include_str!("../eval.rs")`, et échoue en nommant tout fichier présent
+mais non déclaré. Aujourd'hui l'écart est vide (audité pendant le grooming : 0 fichier orphelin,
+les 8 seules entrées déclarées-sans-`.rs` sont des dossiers à `mod.rs`) — la porte naît donc verte
+et le reste tant que la discipline tient.
+
+Elle est ici parce que ce ticket ajoute trois fichiers d'un coup à ce répertoire, et parce que
+c'est exactement la forme où une porte déléguée à la CI est aveugle. Elle se déclare elle-même
+(`mod test_eval_modules_declared;`) : si *elle* est oubliée, l'oubli est visible dans le diff du
+même commit qui la crée.
 
 ### L4 — Doc-comment de module (dans L1)
 
@@ -208,10 +229,41 @@ classe fan-out ; ce qu'il doit surtout ne pas refaire, c'est le montage à mémo
 | V3 | Rouge-avant réel | Le test négatif retiré, l'assertion positive portée sur `EvalHarness` → **échoue**. Consigné dans le corps du test, pas seulement dans ce plan |
 | V4 | Pas de dérive `src/` | `git diff --stat main -- crates/mika-agent/src/` → vide |
 | V5 | Hygiène | `cargo clippy -p mika-agent --tests -- -D warnings`, `cargo fmt --check` |
+| V6 | Aucun livrable invisible | `cargo test -p mika-agent --test eval eval_modules_declared` — vert, ET les 4 nouveaux `mod` présents dans `tests/eval.rs` (`grep -c 'mod multi_agent;\|mod process_fixtures;\|mod test_multi_agent_harness_witness;\|mod test_eval_modules_declared;' crates/mika-agent/tests/eval.rs` = 4) |
 
 V3 est le seul point où le plan demande une manipulation manuelle : elle se fait une fois,
 pendant l'implémentation, et son résultat s'écrit dans le doc-comment du test négatif. Un rouge
 qu'on n'a pas vu de ses yeux est une croyance.
+
+## Fire-Disposition
+
+Requis par le Fire-Disposition Gate (mika#1574), soulevé par mika-arch en première passe. Trois
+surfaces de ce plan « tirent », et le schéma canonique est **(a) exception nommée en liste blanche /
+(b) posé-désactivé / (c) halte-et-remontée**.
+
+**1. Témoin positif + sonde de partage (L3) → (c) halte-et-remontée, gate CI bloquant.**
+Ils tirent quand la capacité multi-agents régresse : le harness cesse de rendre deux attributions
+distinctes, ou la base cesse d'être partagée (retour à `open_in_memory`, à `with_agent()` comme
+seule topologie, ou une future factorisation qui redonne une mémoire par agent). Le rouge est la
+disposition entière — pas de remédiation automatique, pas de skip conditionnel. Violations
+préexistantes : **aucune**, tout est du code neuf.
+
+**2. Contrôle négatif mono-agent (L3) → (c) halte-et-remontée, avec une instruction écrite dans
+l'assertion.** Il tire si `EvalHarness` devient un jour capable de produire deux attributions.
+Ce serait une *bonne* nouvelle signalée en rouge, et le réflexe — supprimer le test qui gêne —
+serait le pire geste : c'est le contrôle négatif qui aurait perdu son pouvoir de contrôle, et donc
+le témoin positif qui ne prouverait plus rien. Le message d'assertion doit le dire en toutes
+lettres : *ne pas supprimer ce test ; re-cadrer le témoin positif sur la nouvelle asymétrie.*
+
+**3. Porte de déclaration de modules (L5) → (c) halte-et-remontée, gate CI bloquant.**
+Elle tire quand un fichier existe dans `tests/eval/` sans sa ligne `mod`. Disposition : nommer le
+ou les fichiers orphelins et échouer. Pas de liste blanche — une exception nommée ici rouvrirait
+exactement le trou que la porte ferme. Violations préexistantes : **aucune** (audit de grooming,
+écart vide).
+
+**Ce qui ne tire pas.** L1, L2 et L4 sont de l'outillage : un harness, des fixtures extraites, un
+doc-comment. Ils n'ont pas de disposition parce qu'ils ne rendent aucun verdict — ce sont les tests
+qui en rendent, et ce sont eux qui portent les trois dispositions ci-dessus.
 
 ## Hors périmètre (explicite)
 
@@ -228,9 +280,10 @@ qu'on n'a pas vu de ses yeux est une croyance.
 
 | AC | Livrable | Vérif |
 |---|---|---|
-| AC1 — helper ≥2 agents sur un même event, pilotant leurs handlers | L1 (+ L4) | V1 |
-| AC2 — `spawn_live_child` réutilisable | L2 | V2 |
-| AC3 — témoin fan-out, rouge avant / vert après | L3 (D4) | V1, V3 |
+| AC1 — helper ≥2 agents sur un même event, pilotant leurs handlers | L1 (+ L4) | V1, V6 |
+| AC2 — `spawn_live_child` réutilisable | L2 | V2, V6 |
+| AC3 — témoin fan-out, rouge avant / vert après | L3 (D4) | V1, V3, V6 |
+| — porte transverse : aucun livrable n'existe sans être compilé | L5 | V6 |
 
 ## Note de grooming — deux points relevés dans le corps du ticket
 
