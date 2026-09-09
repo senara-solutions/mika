@@ -1224,6 +1224,36 @@ async fn run_agent_for_message(
             VerdictAction::Dispatched { .. } => {}
         }
 
+        // Merge actor (mika#2248). MUST stay immediately after ci_success_handler:
+        // that handler emits the merge-ready signal into `req.text`, and this one
+        // reads it from there. The two are one transition split in half on purpose
+        // — the evaluator runs in every agent the check_suite fan-out reaches, the
+        // actor only in the dispatcher, so the forge never records the reviewer as
+        // the one who closed their own approval. Ordering is pinned by
+        // `tests/eval/test_merge_identity_2248.rs`.
+        let merge_action = super::merge_ready_handler::try_handle_merge_ready(
+            &req.text,
+            &a.db,
+            verdict_github_token.as_deref(),
+            Some(&sender_arc),
+            &session_id,
+            &req.request_id,
+        )
+        .await;
+        match merge_action {
+            VerdictAction::Handled { pre_digest } => {
+                req.text = pre_digest;
+            }
+            VerdictAction::Passthrough {
+                enrichment: Some(e),
+            } => {
+                req.text = format!("{e}{}", req.text);
+            }
+            VerdictAction::Passthrough { enrichment: None } => {}
+            // This handler never dispatches — it merges or holds.
+            VerdictAction::Dispatched { .. } => {}
+        }
+
         // Structural CI failure handler: intercept check_suite.completed(failure|timed_out)
         // webhooks, gather failure context, and prepare dispatch pre-digest (#594).
         // Order-independent — self-selects on failure/timed_out conclusions.

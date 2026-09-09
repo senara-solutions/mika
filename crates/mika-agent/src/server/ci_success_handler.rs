@@ -28,6 +28,17 @@
 //!   The cost is one extra QA cycle. The alternative is silently trusting
 //!   that the push was safe, which is the judgment call we're trying to avoid here.
 //!
+//! - Signal, pas acteur (mika#2248): ce handler **ne merge pas**. Il évalue, et
+//!   émet un signal merge-ready ([`MergeReadySignal`]) que le dispatcher
+//!   (`mika-dev`) consomme dans [`super::merge_ready_handler`] pour merger sous
+//!   sa propre identité. La raison est structurelle : `check_suite.completed
+//!   (success)` est diffusé à `mika-dev` ET `mika-qa` (fan-out mika#1711), les
+//!   deux exécutent ce handler, et un `gh pr merge` posé ici tourne sous le token
+//!   de celui qui gagne la course. Mesuré le 2026-09-08 sur mika#2244 :
+//!   `mergedBy = mika-platform-qa`, le relecteur mergeant sa propre approbation.
+//!   Corollaire : aucun `run_gh_merge` dans ce fichier — épinglé par
+//!   `tests/eval/test_ci_success_handler.rs`.
+//!
 //! - Burst dedup (mika#1869): a single push fans out to up to 8 workflows, each
 //!   firing its own `check_suite.completed(success)` webhook, and every one walks
 //!   this full path doing identical work (the aggregation above re-runs on each).
@@ -53,8 +64,9 @@ use crate::task_state::merge_metadata;
 use crate::tools::pr_merge_with_gate::{
     BehindMainInfo, BehindMainRemediation, CheckClassification, classify_checks,
     describe_behind_main_remediation, is_behind_main, remediate_behind_main, run_gh_checks,
-    run_gh_merge, run_gh_pr_view, run_gh_subprocess,
+    run_gh_pr_view, run_gh_subprocess,
 };
+use mika_common::forge_identity::MergeReadySignal;
 
 use super::check_suite_dedup;
 use super::verdict::{Verdict, parse_verdict};
@@ -102,8 +114,9 @@ pub(crate) fn is_duplicate_processed(recent_marker_count: i64) -> bool {
 
 /// Attempt to handle a CI success event structurally before the LLM turn.
 ///
-/// Returns `VerdictAction::Handled` when the handler initiated a merge (or
-/// encountered a merge error), with a pre-digest message for the LLM.
+/// Returns `VerdictAction::Handled` when the handler emitted a merge-ready
+/// signal (or encountered an evaluation error), with a pre-digest message for
+/// the LLM. It never merges — see the `mika#2248` invariant above.
 /// Returns `VerdictAction::Passthrough` for all other cases (non-matching events,
 /// no open PR, no QA verdict, stale verdict, checks not all green).
 #[allow(clippy::too_many_arguments)]
@@ -496,8 +509,13 @@ pub async fn try_handle_ci_success(
         }
     }
 
-    // 6. All conditions met — initiate merge
-    // Look up task by PR URL for metadata update
+    // 6. Toutes les portes sont franchies — ÉMETTRE LE SIGNAL, ne pas merger (mika#2248).
+    //
+    // Ce handler tourne dans `mika-dev` ET dans `mika-qa` (fan-out mika#1711) ;
+    // un `gh pr merge` ici merge sous le token de celui qui gagne la course. Le
+    // signal est inerte : il dit « cette PR a franchi toutes les portes pour ce
+    // head_sha », et laisse le dispatcher agir sous sa propre identité. Aucune
+    // logique d'identité ici, par conception — ce fichier évalue, il n'agit pas.
     let pr_url = format!("https://github.com/{}/pull/{}", event.repo, pr.number);
     let task = match db.find_active_task_by_pr_url(&pr_url).await {
         Ok(t) => t,
@@ -506,123 +524,67 @@ pub async fn try_handle_ci_success(
             None
         }
     };
+    let task_id = task
+        .as_ref()
+        .map(|t| t.id.as_str())
+        .unwrap_or("none")
+        .to_string();
 
-    let merge_future = run_gh_merge(
-        pr.number,
-        &event.repo,
-        "squash",
-        true,  // delete_branch
-        false, // not auto — we've verified all checks pass
-        token,
-    );
-    let merge_result = tokio::time::timeout(std::time::Duration::from_secs(60), merge_future).await;
-
-    let merge_result = match merge_result {
-        Ok(inner) => inner,
-        Err(_) => {
-            warn!(pr_number = pr.number, "gh pr merge timed out after 60s");
-            Err("gh pr merge timed out after 60s".to_string())
-        }
+    let signal = MergeReadySignal {
+        repo: event.repo.clone(),
+        pr_number: pr.number,
+        head_sha: pr.head_sha.clone(),
+        branch: event.branch.clone(),
+        task_id: task_id.clone(),
+        reviewer_login: verdict_review.reviewer.clone(),
     };
 
-    match merge_result {
-        Ok(_output) => {
-            let task_id = task.as_ref().map(|t| t.id.as_str()).unwrap_or("none");
+    // Trace durable côté tâche : l'état de sortie de CE handler est « signalé »,
+    // jamais « mergé ». L'acteur écrit le sien (`merge_initiated`) quand il merge.
+    if let Some(ref t) = task
+        && let Err(e) = update_verdict_merge_metadata(
+            db,
+            &t.id,
+            &t.metadata,
+            pr.number,
+            &pr_url,
+            "merge_ready_signaled",
+        )
+        .await
+    {
+        warn!(error = %e, task_id = %t.id, "Failed to update task metadata after merge-ready signal");
+    }
 
-            // Update task metadata
-            if let Some(ref t) = task
-                && let Err(e) =
-                    update_ci_merge_metadata(db, &t.id, &t.metadata, pr.number, &pr_url).await
-            {
-                warn!(error = %e, task_id = %t.id, "Failed to update task metadata after CI success merge");
-            }
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            "ci_success_merge_ready",
+            &format!("pr:{}#{}@{}", event.repo, pr.number, pr.head_sha),
+            Some("ci_green_verdict_pass"),
+            Some("merge_ready_signaled"),
+            Some(&format!(
+                "trigger=check_suite_success reviewer={} task_id={task_id} pr_url={pr_url}",
+                verdict_review.reviewer,
+            )),
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(error = %e, "Failed to log ci_success_merge_ready audit event");
+    }
 
-            // Log audit event
-            if let Err(e) = db
-                .log_audit_event(
-                    session_id,
-                    "ci_success_merge",
-                    &format!("task:{task_id}"),
-                    Some("in_progress"),
-                    Some("merge_initiated"),
-                    Some(&format!(
-                        "trigger=check_suite_success pr_url={pr_url} task_id={task_id}"
-                    )),
-                    Some(trace_id),
-                )
-                .await
-            {
-                warn!(error = %e, "Failed to log ci_success_merge audit event");
-            }
+    info!(
+        event = "ci_success_merge_ready",
+        pr_number = pr.number,
+        repo = %event.repo,
+        head_sha = %pr.head_sha,
+        task_id = %task_id,
+        reviewer = %verdict_review.reviewer,
+        "CI success handler: merge-ready signal emitted — the dispatcher owns the merge (mika#2248)"
+    );
 
-            // Send notification
-            if let Some(sender) = message_sender {
-                let notification = format!(
-                    "PR #{} on {} — CI checks all green + VERDICT: pass from @{}. \
-                     Merge initiated (squash, delete branch).",
-                    pr.number, event.repo, verdict_review.reviewer
-                );
-                match sender.send(&notification).await {
-                    Ok(crate::messaging::SendOutcome::Delivered) => {}
-                    Ok(crate::messaging::SendOutcome::Failed { reason }) => {
-                        warn!(reason = %reason, "CI success merge notification delivery failed");
-                    }
-                    Ok(crate::messaging::SendOutcome::NoChannel) => {
-                        warn!(
-                            "CI success merge notification skipped — no reply channel (chat_id=0)"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to send CI success merge notification");
-                    }
-                }
-            }
-
-            info!(
-                pr_number = pr.number,
-                repo = %event.repo,
-                task_id = task_id,
-                reviewer = %verdict_review.reviewer,
-                "CI success handler: merge initiated for PR #{} (QA pass from @{})",
-                pr.number,
-                verdict_review.reviewer
-            );
-
-            VerdictAction::Handled {
-                pre_digest: format_success_pre_digest(
-                    &event,
-                    pr.number,
-                    &verdict_review.reviewer,
-                    task_id,
-                ),
-            }
-        }
-        Err(e) => {
-            // Check for "already merged" in the error
-            let lower = e.to_lowercase();
-            if lower.contains("already merged") || lower.contains("pull request is closed") {
-                info!(
-                    pr_number = pr.number,
-                    "PR already finalized — CI success handler acknowledging"
-                );
-                return VerdictAction::Handled {
-                    pre_digest: format_already_merged_pre_digest(
-                        &event,
-                        pr.number,
-                        task.as_ref().map(|t| t.id.as_str()).unwrap_or("none"),
-                    ),
-                };
-            }
-
-            warn!(
-                error = %e,
-                pr_number = pr.number,
-                "CI success structural merge failed"
-            );
-            VerdictAction::Handled {
-                pre_digest: format_error_pre_digest(&event, pr.number, &e),
-            }
-        }
+    VerdictAction::Handled {
+        pre_digest: format_merge_ready_pre_digest(&event, &signal),
     }
 }
 
@@ -755,13 +717,21 @@ async fn find_pass_verdict(
 // Metadata helpers
 // ---------------------------------------------------------------------------
 
-/// Update task metadata with CI success merge state.
-async fn update_ci_merge_metadata(
+/// Update task metadata with a state on the `verdict_merge` ladder (mika#2248).
+///
+/// Shared with [`super::merge_ready_handler`] so the two halves of the CI-success
+/// path write the same shape. The ladder has two rungs and they are not
+/// interchangeable: `merge_ready_signaled` is written by the evaluator, which has
+/// merged nothing; `merge_initiated` is written by the actor, and only after the
+/// forge accepted the merge. Collapsing them is how a reader comes to believe a
+/// PR was closed because a gate went green.
+pub(super) async fn update_verdict_merge_metadata(
     db: &AsyncDatabase,
     task_id: &str,
     existing_metadata: &Option<String>,
     pr_number: u64,
     pr_url: &str,
+    state: &str,
 ) -> Result<()> {
     let mut base = existing_metadata
         .as_deref()
@@ -770,7 +740,7 @@ async fn update_ci_merge_metadata(
 
     let incoming = json!({
         "verdict_merge": {
-            "state": "merge_initiated",
+            "state": state,
             "trigger": "check_suite_success",
             "pr_number": pr_number,
             "pr_url": pr_url,
@@ -788,44 +758,36 @@ async fn update_ci_merge_metadata(
 // Pre-digest message formatting
 // ---------------------------------------------------------------------------
 
-/// Format the pre-digest message for a successful merge action.
+/// Format the pre-digest for an emitted merge-ready signal (mika#2248).
+///
+/// Two audiences in one text. The [`MergeReadySignal`] line is read by
+/// [`super::merge_ready_handler`], which runs immediately after this handler in
+/// the same turn and is the only code allowed to merge. The prose is read by the
+/// LLM, and tells it the one thing it must not do — call the merge tool itself,
+/// which would put the merge back under whichever agent happens to be running.
 ///
 /// IMPORTANT: Avoids completion-claim guard trigger words (merged, deployed,
-/// completed, complete, shipped). Uses "initiated" phrasing.
-fn format_success_pre_digest(
-    event: &CheckSuiteEvent,
-    pr_number: u64,
-    reviewer: &str,
-    task_id: &str,
-) -> String {
+/// completed, complete, shipped). Uses "signal" / "cleared" phrasing.
+fn format_merge_ready_pre_digest(event: &CheckSuiteEvent, signal: &MergeReadySignal) -> String {
     format!(
         "<ci_success_handler>\n\
          [GitHub] Check suite success on {}#{} (branch: {})\n\
-         CI checks all green + VERDICT: pass from @{reviewer} — structural handler acted.\n\n\
-         Squash-merge has been initiated for PR #{pr_number} on {} (branch deletion requested).\n\n\
-         Task: {task_id}\n\n\
-         Do NOT call pr_merge_with_gate — the merge action is already in progress.\n\
-         Update the task status to reflect the outcome, then notify the user.\n\
+         CI checks all green + VERDICT: pass from @{} — every gate cleared for head {}.\n\n\
+         {signal}\n\n\
+         Task: {}\n\n\
+         This handler does NOT merge (mika#2248): the dispatcher agent `{}` owns the merge and \
+         acts on the signal above under its own identity, so the forge never records the \
+         reviewer as the one who closed their own approval.\n\
+         Do NOT call pr_merge_with_gate — you are not the merge actor on this path. \
+         Update the task status to reflect the signal, then notify the user.\n\
          </ci_success_handler>",
-        event.repo, pr_number, event.branch, event.repo
-    )
-}
-
-/// Format the pre-digest for a PR that was already finalized.
-fn format_already_merged_pre_digest(
-    event: &CheckSuiteEvent,
-    pr_number: u64,
-    task_id: &str,
-) -> String {
-    format!(
-        "<ci_success_handler>\n\
-         [GitHub] Check suite success on {}#{} (branch: {})\n\
-         CI checks all green — PR was already finalized before the handler ran.\n\n\
-         Task: {task_id}\n\n\
-         Do NOT call pr_merge_with_gate — no action needed.\n\
-         Update the task status if not already done, then notify the user.\n\
-         </ci_success_handler>",
-        event.repo, pr_number, event.branch
+        event.repo,
+        signal.pr_number,
+        event.branch,
+        signal.reviewer_login,
+        signal.head_sha,
+        signal.task_id,
+        mika_common::forge_identity::DISPATCHER_AGENT,
     )
 }
 
@@ -947,10 +909,20 @@ mod tests {
 
     // -- Pre-digest formatting tests --
 
+    fn sample_signal() -> MergeReadySignal {
+        MergeReadySignal {
+            repo: "senara-solutions/mika".to_string(),
+            pr_number: 571,
+            head_sha: "abc123def".to_string(),
+            branch: "feat/ci-success".to_string(),
+            task_id: "task-123".to_string(),
+            reviewer_login: "mika-platform-qa".to_string(),
+        }
+    }
+
     #[test]
-    fn success_pre_digest_avoids_completion_claim_words() {
-        let event = sample_event();
-        let text = format_success_pre_digest(&event, 571, "mika-qa", "task-123");
+    fn merge_ready_pre_digest_avoids_completion_claim_words() {
+        let text = format_merge_ready_pre_digest(&sample_event(), &sample_signal());
         assert!(
             !COMPLETION_CLAIM_RE.is_match(&text),
             "Pre-digest contains completion-claim trigger word: {text}"
@@ -958,26 +930,34 @@ mod tests {
     }
 
     #[test]
-    fn success_pre_digest_contains_do_not_call_instruction() {
-        let event = sample_event();
-        let text = format_success_pre_digest(&event, 571, "mika-qa", "task-123");
+    fn merge_ready_pre_digest_contains_do_not_call_instruction() {
+        let text = format_merge_ready_pre_digest(&sample_event(), &sample_signal());
         assert!(text.contains("Do NOT call pr_merge_with_gate"));
     }
 
     #[test]
-    fn success_pre_digest_contains_task_id() {
-        let event = sample_event();
-        let text = format_success_pre_digest(&event, 571, "mika-qa", "task-123");
+    fn merge_ready_pre_digest_contains_task_id() {
+        let text = format_merge_ready_pre_digest(&sample_event(), &sample_signal());
         assert!(text.contains("task-123"));
     }
 
     #[test]
-    fn already_merged_pre_digest_avoids_completion_claim_words() {
-        let event = sample_event();
-        let text = format_already_merged_pre_digest(&event, 571, "task-123");
+    fn mika2248_le_pre_digest_porte_un_signal_relisible_par_lacteur() {
+        // Le handoff passe par ce texte : s'il ne se reparse pas, l'acteur ne
+        // voit rien et la PR reste ouverte. C'est la jointure à épingler.
+        let signal = sample_signal();
+        let text = format_merge_ready_pre_digest(&sample_event(), &signal);
+        let parsed = mika_common::forge_identity::parse_merge_ready_signal(&text)
+            .expect("le pré-digest doit porter un signal merge-ready relisible");
+        assert_eq!(parsed, signal);
+    }
+
+    #[test]
+    fn mika2248_le_pre_digest_nomme_le_dispatcher_comme_acteur() {
+        let text = format_merge_ready_pre_digest(&sample_event(), &sample_signal());
         assert!(
-            !COMPLETION_CLAIM_RE.is_match(&text),
-            "Pre-digest contains completion-claim trigger word: {text}"
+            text.contains(mika_common::forge_identity::DISPATCHER_AGENT),
+            "le pré-digest doit nommer qui merge, sinon le LLM comble le vide : {text}"
         );
     }
 
@@ -1176,7 +1156,7 @@ mod tests {
 
     #[test]
     fn mika2238_not_behind_yields_no_enrichment_so_the_handler_continues() {
-        // `None` is the only value that lets the handler reach `run_gh_merge`.
+        // `None` is the only value that lets the handler reach the signal step.
         assert!(
             format_behind_main_enrichment(&BehindMainRemediation::NotBehind, &behind_info())
                 .is_none(),
