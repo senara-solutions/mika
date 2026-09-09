@@ -150,9 +150,10 @@ async fn cascade_never_dispatches_into_milestone_manager() -> Result<()> {
         !matches!(ci_action, VerdictAction::Dispatched { .. }),
         "CI_success must not dispatch a follow-up on a gated PR"
     );
-    // `ci_success_merge` is the row written after `run_gh_merge` fires
-    // (`after = "merge_initiated"`). The name is checked against the handler
-    // source first: a count assertion on a name nothing emits is vacuous.
+    // `ci_success_merge` is the row written after the merge actually fires
+    // (`after = "merge_initiated"`) — by `merge_ready_handler` since mika#2248,
+    // which is the only half of this path allowed to merge. The name is checked
+    // against the source first: a count assertion on a name nothing emits is vacuous.
     crate::eval::test_ci_success_handler::assert_audit_event_name_is_real("ci_success_merge");
     assert_eq!(
         db.count_audit_events_by_tool_name("ci_success_merge")

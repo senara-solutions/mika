@@ -273,6 +273,22 @@ pub struct PilotTranscriptRow {
     pub latency_ms: Option<i64>,
 }
 
+/// A finished dispatch that was asked for a pilot transcript (mika#2040 AC7).
+///
+/// Produced by [`Database::find_dispatches_expecting_transcripts`] and consumed
+/// by the engine's empty-transcript detector. `expected_path` is the path the
+/// executor stamped on the task when it injected `ANTHROPIC_LOG_FILE` — the
+/// detector re-reads it rather than recomputing it, so a later change to the
+/// directory layout cannot make the detector look for a file at an address the
+/// dispatch was never given.
+#[derive(Debug, Clone)]
+pub struct DispatchExpectingTranscript {
+    pub task_id: String,
+    pub expected_path: String,
+    pub status: String,
+    pub updated_at: String,
+}
+
 /// A per-(agent, person, category) content-serve ledger row (mika#1867).
 /// Populated by the `record_served_content` tool after Mika delivers content
 /// (proverb, quote, joke, poem, recommendation, story, fact) to a specific
@@ -5362,6 +5378,91 @@ impl Database {
             |r| r.get(0),
         )?;
         Ok(n)
+    }
+
+    /// Finished dispatches that were asked for a pilot transcript and have not
+    /// yet been reported as having produced none (mika#2040 AC7).
+    ///
+    /// # What selects a row, and what deliberately does not
+    ///
+    /// The premise "this dispatch was supposed to produce a transcript" is read
+    /// from the producer's own stamp
+    /// ([`PILOT_TRANSCRIPT_EXPECTED_KEY`]), never reconstructed from the skill
+    /// name plus the current value of `MIKA_LOG_PILOT_TRANSCRIPTS` — that gate
+    /// is read per dispatch and can flip in between, which would make the
+    /// detector report dispatches nobody asked a transcript of and stay silent
+    /// on the ones that were asked. For the same reason there is **no**
+    /// `trigger_type = 'callback'` clause: the stamp is the discriminant, and a
+    /// narrower filter would silently drop a stamped dispatch that a later
+    /// caller spawns from somewhere else.
+    ///
+    /// The finished boundary is `status NOT IN ('pending','in_progress')` —
+    /// byte-for-byte the guard [`crate::task_engine::engine`]'s ingestion uses
+    /// before it dares read a file. The two must agree: a detector that
+    /// considered a dispatch finished earlier than the ingestion does would
+    /// report a transcript that was merely still being written.
+    ///
+    /// # Why `json_valid` wraps every extraction
+    ///
+    /// SQLite's `json_extract` raises a hard "malformed JSON" error — not NULL
+    /// — on a `metadata` that is not JSON, and that error propagates out of the
+    /// whole `query_map`. Unguarded, ONE task with corrupt metadata would blind
+    /// the detector for every other dispatch, for ever — which is the exact
+    /// failure class mika#2040 exists to end. Wrapped, the corrupt row degrades
+    /// to NULL and drops out of the result; only that dispatch stops being
+    /// watched. Same reasoning, same shape as
+    /// [`Self::get_reaper_child_snapshot`].
+    pub fn find_dispatches_expecting_transcripts(
+        &self,
+        agent_id: &str,
+        grace_seconds: i64,
+    ) -> Result<Vec<DispatchExpectingTranscript>> {
+        let expected_path_json = format!(
+            "$.{}",
+            crate::task_engine::engine::PILOT_TRANSCRIPT_EXPECTED_KEY
+        );
+        let reported_path_json = format!(
+            "$.{}",
+            crate::task_engine::engine::PILOT_TRANSCRIPT_REPORTED_KEY
+        );
+        let grace_modifier = format!("-{grace_seconds} seconds");
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id,
+                    CASE WHEN json_valid(metadata)
+                         THEN json_extract(metadata, ?2)
+                    END AS expected_path,
+                    status,
+                    updated_at
+             FROM tasks
+             WHERE agent_id = ?1
+               AND status NOT IN ('pending', 'in_progress')
+               AND updated_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?4)
+               AND expected_path IS NOT NULL
+               AND (CASE WHEN json_valid(metadata)
+                         THEN json_extract(metadata, ?3)
+                    END) IS NULL
+             ORDER BY updated_at, id",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    agent_id,
+                    expected_path_json,
+                    reported_path_json,
+                    grace_modifier
+                ],
+                |row| {
+                    Ok(DispatchExpectingTranscript {
+                        task_id: row.get(0)?,
+                        expected_path: row.get(1)?,
+                        status: row.get(2)?,
+                        updated_at: row.get(3)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// v46→v47: team_runs delegation-visibility (mika#1676).
@@ -18006,6 +18107,208 @@ mod tests {
                 &queued[..8]
             )
         );
+    }
+
+    // -- find_dispatches_expecting_transcripts tests (mika#2040 AC7) --
+
+    /// Create a callback dispatch stamped as expecting a transcript, left in
+    /// `status`, with `updated_at` aged `age_secs` into the past. Mirrors what
+    /// `spawn_long_running_exec` stamps after a successful spawn.
+    fn create_stamped_dispatch(
+        db: &Database,
+        agent_id: &str,
+        status: &str,
+        age_secs: i64,
+    ) -> String {
+        let task_id = db.create_task(&callback_task(agent_id)).unwrap();
+        db.set_task_metadata_field(
+            &task_id,
+            crate::task_engine::engine::PILOT_TRANSCRIPT_EXPECTED_KEY,
+            &format!("/tmp/pilot-transcripts/{task_id}.jsonl"),
+        )
+        .unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = ?2,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?3)
+                 WHERE id = ?1",
+                params![task_id, status, format!("-{age_secs} seconds")],
+            )
+            .unwrap();
+        task_id
+    }
+
+    #[test]
+    fn mika2040_stamped_finished_dispatch_is_selected() {
+        let db = db();
+        let task_id = create_stamped_dispatch(&db, "mika", "delivered", 600);
+
+        let found = db
+            .find_dispatches_expecting_transcripts("mika", 300)
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].task_id, task_id);
+        assert_eq!(found[0].status, "delivered");
+        assert!(
+            found[0]
+                .expected_path
+                .ends_with(&format!("{task_id}.jsonl")),
+            "the detector must re-read the path the producer stamped, got {}",
+            found[0].expected_path
+        );
+    }
+
+    #[test]
+    fn mika2040_unstamped_dispatch_is_invisible_to_the_detector() {
+        // The premise is a fact the producer records. A dispatch nobody asked a
+        // transcript of must never be reported as having failed to produce one
+        // — that is the whole reason the key is stamped rather than inferred
+        // from the skill name plus the current gate.
+        let db = db();
+        let task_id = db.create_task(&callback_task("mika")).unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'delivered',
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-600 seconds')
+                 WHERE id = ?1",
+                params![task_id],
+            )
+            .unwrap();
+
+        assert!(
+            db.find_dispatches_expecting_transcripts("mika", 300)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn mika2040_unfinished_dispatch_is_not_selected() {
+        // `pending` / `in_progress` mean the pilot may still be writing. The
+        // finished boundary here must stay byte-for-byte the one the ingestion
+        // uses, or the detector reports transcripts that are merely late.
+        for status in ["pending", "in_progress"] {
+            // A fresh DB per status: leaving the previous iteration's row in
+            // place would let a passing assertion rest on the wrong row.
+            let db = db();
+            let _ = create_stamped_dispatch(&db, "mika", status, 600);
+            assert!(
+                db.find_dispatches_expecting_transcripts("mika", 300)
+                    .unwrap()
+                    .is_empty(),
+                "a {status} dispatch must not be reported"
+            );
+        }
+    }
+
+    #[test]
+    fn mika2040_dispatch_inside_the_grace_window_is_not_selected() {
+        let db = db();
+        create_stamped_dispatch(&db, "mika", "delivered", 10);
+
+        assert!(
+            db.find_dispatches_expecting_transcripts("mika", 300)
+                .unwrap()
+                .is_empty(),
+            "a dispatch that finished seconds ago may still have a file in flight"
+        );
+    }
+
+    #[test]
+    fn mika2040_reported_dispatch_is_not_reported_twice() {
+        let db = db();
+        let task_id = create_stamped_dispatch(&db, "mika", "delivered", 600);
+        assert_eq!(
+            db.find_dispatches_expecting_transcripts("mika", 300)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        db.set_task_metadata_field(
+            &task_id,
+            crate::task_engine::engine::PILOT_TRANSCRIPT_REPORTED_KEY,
+            "2026-09-08T10:00:00Z",
+        )
+        .unwrap();
+
+        assert!(
+            db.find_dispatches_expecting_transcripts("mika", 300)
+                .unwrap()
+                .is_empty(),
+            "the warning fires once per dispatch, not once per scan"
+        );
+    }
+
+    #[test]
+    fn mika2040_detector_is_agent_scoped() {
+        let db = db();
+        // Les tasks référencent agents(id) (FK NOT NULL) — créer les agents d'abord.
+        db.register_agent("agent_a", "Agent A", "/tmp/a").unwrap();
+        db.register_agent("agent_b", "Agent B", "/tmp/b").unwrap();
+        create_stamped_dispatch(&db, "agent_a", "delivered", 600);
+
+        assert_eq!(
+            db.find_dispatches_expecting_transcripts("agent_a", 300)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            db.find_dispatches_expecting_transcripts("agent_b", 300)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn mika2040_one_corrupt_metadata_row_does_not_blind_the_detector() {
+        // `json_extract` raises a hard error on non-JSON metadata, and that
+        // error propagates out of the whole query_map. Unguarded, ONE bad row
+        // would silence the detector for every other dispatch — the exact
+        // failure class mika#2040 exists to end.
+        let db = db();
+        let good = create_stamped_dispatch(&db, "mika", "delivered", 600);
+
+        let corrupt = db.create_task(&callback_task("mika")).unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'delivered', metadata = 'not json at all',
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-600 seconds')
+                 WHERE id = ?1",
+                params![corrupt],
+            )
+            .unwrap();
+
+        let found = db
+            .find_dispatches_expecting_transcripts("mika", 300)
+            .unwrap();
+        assert_eq!(found.len(), 1, "the corrupt row drops out, alone");
+        assert_eq!(found[0].task_id, good);
+    }
+
+    #[test]
+    fn mika2040_ingested_transcript_is_countable_for_its_task() {
+        // AC4, end of the reader chain: a v1 line parses, inserts, and is
+        // findable by the task id the detector keys on.
+        let mut db = db();
+        let task_id = db.create_task(&callback_task("mika")).unwrap();
+
+        let row =
+            crate::task_engine::pilot_transcript::parse_pilot_transcript_line(&serde_json::json!({
+                "schema_version": "v1",
+                "timestamp": "2026-09-07T12:00:00Z",
+                "model": "claude-sonnet-4-6",
+                "response_body": "hello",
+                "tokens_out": 7,
+            }))
+            .expect("v1 line must parse");
+
+        assert_eq!(
+            db.insert_pilot_transcripts_batch(&task_id, &[row]).unwrap(),
+            1
+        );
+        assert_eq!(db.count_pilot_transcripts_for_task(&task_id).unwrap(), 1);
     }
 
     // -- find_childless_stuck_parent_tasks tests (mika#1687) --

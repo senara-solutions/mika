@@ -2,6 +2,7 @@ pub mod cron;
 pub mod dispatcher;
 pub mod engine;
 pub mod liveness;
+pub mod pilot_transcript;
 pub mod process_kill;
 pub mod process_liveness;
 pub mod queue;
