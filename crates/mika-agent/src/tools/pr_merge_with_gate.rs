@@ -93,6 +93,39 @@ impl Tool for PrMergeWithGateTool {
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
+        // -- Step 0: authority — the reviewer is never a merge actor (mika#2248) --
+        //
+        // Placed before input validation and before the token check on purpose:
+        // this is not about the PR, it is about who is asking. `mergedBy` is
+        // stamped with the identity of whatever token `run_gh_merge` injects, so
+        // an agent that approved the PR must be refused here rather than gated
+        // later — otherwise the refusal depends on the PR's state, and a green
+        // mechanical PR would slip through. Measured on mika#2244:
+        // `mergedBy = mika-platform-qa` on a PR the same agent had approved.
+        let agent_id = ctx.db.agent_id();
+        if mika_common::forge_identity::is_reviewer_agent(agent_id) {
+            let result = MergeGateResult::Blocked {
+                reason: BlockReason::ReviewerCannotMerge {
+                    agent_id: agent_id.to_string(),
+                    dispatcher_agent: mika_common::forge_identity::DISPATCHER_AGENT.to_string(),
+                },
+                failing_checks: vec![],
+                detail: format!(
+                    "`{agent_id}` is the autonomous reviewer and cannot merge: the forge would \
+                     record the merge under the same login that posted the review. The dispatcher \
+                     `{}` owns the merge — post the verdict and let the merge-ready path hand it \
+                     over (mika#2248).",
+                    mika_common::forge_identity::DISPATCHER_AGENT,
+                ),
+            };
+            warn!(
+                event = "pr_merge_with_gate_reviewer_refused",
+                agent_id,
+                "pr_merge_with_gate called by the reviewer agent — refused before any gh call (mika#2248)"
+            );
+            return Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?));
+        }
+
         // -- Extract and validate inputs --
         let pr_number = match input.get("pr_number").and_then(|v| v.as_u64()) {
             Some(n) if n > 0 => n,
@@ -464,6 +497,15 @@ pub(crate) enum BlockReason {
     HumanGateRequired {
         decision_core_files: Vec<String>,
         summary: String,
+    },
+    /// The calling agent is the autonomous reviewer (mika#2248). Merging under
+    /// its credentials stamps `mergedBy` with the login that posted the review —
+    /// the PR would close on its own approval, with no handoff. Blocked
+    /// regardless of PR state: this is an authority verdict, not a gate result.
+    #[serde(rename = "reviewer_cannot_merge")]
+    ReviewerCannotMerge {
+        agent_id: String,
+        dispatcher_agent: String,
     },
 }
 
@@ -2901,6 +2943,70 @@ mod tests {
                 .as_str()
                 .map(String::from)
         })
+    }
+
+    // ---- Authority gate: the reviewer is never a merge actor (mika#2248) ----
+
+    /// `pr_merge_with_gate` appelé par l'agent relecteur : refusé avant tout
+    /// appel `gh`. Le contexte n'a pas de token et l'entrée est valide — si la
+    /// porte d'autorité ne tenait pas, le test verrait l'erreur de token, pas le
+    /// blocage. C'est ce qui rend le refus attribuable à l'identité.
+    #[tokio::test]
+    async fn mika2248_le_relecteur_est_refuse_avant_tout_appel_gh() {
+        let harness = TestHarness::with_agent(mika_common::forge_identity::REVIEWER_AGENT);
+        let ctx = harness.ctx();
+        let out = PrMergeWithGateTool
+            .execute(
+                json!({"pr_number": 2244, "repo": "senara-solutions/mika"}),
+                &ctx,
+            )
+            .await
+            .expect("tool must not error out");
+
+        let parsed: serde_json::Value = serde_json::from_str(&out.content).expect("output is JSON");
+        assert_eq!(parsed["action"], "blocked", "got {}", out.content);
+        assert_eq!(parsed["reason"]["reason"], "reviewer_cannot_merge");
+        assert_eq!(
+            parsed["reason"]["agent_id"],
+            mika_common::forge_identity::REVIEWER_AGENT
+        );
+        assert!(
+            parsed["detail"]
+                .as_str()
+                .unwrap()
+                .contains(mika_common::forge_identity::DISPATCHER_AGENT),
+            "the refusal must name who does own the merge: {}",
+            out.content
+        );
+    }
+
+    /// Le contrôle négatif du même appel : le dispatcher n'est PAS retenu par
+    /// cette porte. Sans lui, un refus inconditionnel passerait le test ci-dessus
+    /// et casserait le merge autonome dans le silence.
+    #[tokio::test]
+    async fn mika2248_le_dispatcher_passe_la_porte_didentite() {
+        let harness = TestHarness::with_agent(mika_common::forge_identity::DISPATCHER_AGENT);
+        let ctx = harness.ctx();
+        let out = PrMergeWithGateTool
+            .execute(
+                json!({"pr_number": 2244, "repo": "senara-solutions/mika"}),
+                &ctx,
+            )
+            .await
+            .expect("tool must not error out");
+
+        // `ctx.github_token` est `None` : l'appel avance jusqu'à l'exigence de
+        // token, donc au-delà de la porte d'identité.
+        assert!(
+            out.content.contains("GitHub token required"),
+            "the dispatcher must reach the token check, not an authority refusal: {}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("reviewer_cannot_merge"),
+            "the dispatcher must never be refused as a reviewer: {}",
+            out.content
+        );
     }
 
     #[tokio::test]
