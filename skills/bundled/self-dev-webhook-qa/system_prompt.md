@@ -88,6 +88,12 @@ The message contains the review body, PR URL, repo, and reviewer. mika-qa posts 
         - Notify Vincent via `send_message`: "{repo}#{number} touches a DECISION-CORE zone — forge-gate holds it for you. {summary} {PR URL}"
         - Task status: `in_progress`.
 
+        **`reason.reason = "reviewer_cannot_merge"`** (mika#2248) — the calling agent is the autonomous reviewer:
+        - The forge would record the merge under the same login that posted the review. This is an authority verdict about **who asked**, not a fact about the PR: retrying, waiting for CI, or falling back to `run_gh pr merge` all reproduce the defect mika#2244 measured.
+        - The dispatcher `mika-dev` owns the merge and picks the PR up from the merge-ready signal the CI-success path emits. You do not need to hand it over by hand.
+        - Do NOT call `pr_merge_with_gate` again. Do NOT call `run_gh pr merge`. Do NOT call `run_claude_pilot`.
+        - Unexpected on this path — this handler runs in the dispatcher, so seeing it means the verdict webhook reached the reviewer instead. Notify Vincent with the `agent_id` from the response; task status: `in_progress`.
+
         **`reason.reason = "draft"` or `reason.reason = "pr_closed"`** — Unexpected in webhook-qa:
         - Correlate to task (Step 4).
         - Notify Vincent with context. Escalate.
@@ -269,7 +275,7 @@ If you find yourself tempted to "quickly fix" a CI failure via `write_agent_file
 
 Never call `run_gh("pr merge ...")` or `run_gh("gh pr merge ...")` to merge a PR. Always use `pr_merge_with_gate` with `pr_number` (integer) and `repo` (owner/repo string). The tool checks required CI statuses and returns a structured `action` — act on it.
 
-**Structural enforcement:** `pr_merge_with_gate` returns **six** typed variants — `merged`, `auto_merge_enabled`, `blocked`, `already_merged`, `gate_errored`, `branch_updated`. The `blocked` variant carries a `reason` field with **seven** sub-variants — `merge_conflict`, `required_check_failed`, `missing_approval`, `pr_closed`, `draft`, `behind_main`, `human_gate_required`. Every one of them has a branch in Step 2 above; that list is the exhaustive handling surface. On ANY error or blocked state, do NOT fall back to `run_gh pr merge`.
+**Structural enforcement:** `pr_merge_with_gate` returns **six** typed variants — `merged`, `auto_merge_enabled`, `blocked`, `already_merged`, `gate_errored`, `branch_updated`. The `blocked` variant carries a `reason` field with **eight** sub-variants — `merge_conflict`, `required_check_failed`, `missing_approval`, `pr_closed`, `draft`, `behind_main`, `human_gate_required`, `reviewer_cannot_merge`. Every one of them has a branch in Step 2 above; that list is the exhaustive handling surface. On ANY error or blocked state, do NOT fall back to `run_gh pr merge`.
 
 **Why this list used to be short:** until mika#2238 this prompt named five of the seven `blocked.reason` values while instructing you to branch "exhaustively". An agent that met an unlisted variant had no defined move, and the observed behaviour was a silent stop — the mika#2236 shape, where an APPROVED, CI-green, behind-main PR sat until the operator merged it by hand.
 
