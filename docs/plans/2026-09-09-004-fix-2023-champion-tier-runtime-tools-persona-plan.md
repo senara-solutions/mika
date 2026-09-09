@@ -33,7 +33,12 @@ Cinq mesures faites contre le code d'aujourd'hui. Trois répondent aux réserves
 
 Le placeholder est sûr **sur l'axe outils** — ce qui est l'objet du p0 — et décalé sur l'axe registre. Prix nommé, pas caché.
 
-**M4 — la dissociation est chirurgicale.** Réserve de Prime sur la taille : levée par la mesure. Un seul `match` exhaustif sur `AgentTier` hors `home.rs` (`crates/mika-agent/src/tools/mod.rs:316`), plus une comparaison d'égalité (`tier_guard.rs:70`, cf. M2). Les ~25 autres occurrences sont du portage de champ (`tier: self.tier`, hérité de mika#1962), pas des points de décision.
+**M4 — la dissociation est chirurgicale, et le rayon a été audité au-delà des `match`.** Réserve de Prime sur la taille : levée. Audit élargi sur demande de l'architecte (F3), aux traits et aux comparaisons d'égalité — deux surfaces qu'un comptage de `match` ne voit pas :
+
+- **`match` exhaustif** : un seul hors `home.rs` — `crates/mika-agent/src/tools/mod.rs:316`.
+- **Comparaisons d'égalité** : **trois** sites, tous dans `tier_guard.rs` — `:66` et `:159` (`tier == AgentTier::Family`, les deux portes de sortie anticipée : la garde de boot et la garde par-agent du chemin lazy `resolve_agent`, mika#1399) et `:102` (`tier == AgentTier::Default`, formatage du message d'erreur). **Correction de ma première mesure**, qui n'avait vu que `:66` : la mine de M2 est double, et oublier `:159` laisserait le chemin lazy casser le boot champion après un premier boot sain.
+- **Sérialisation** : **sans objet, mesuré.** `AgentTier` dérive `Debug, Clone, Copy, PartialEq, Eq` (`home.rs:12`) et **aucun** `Serialize`/`Deserialize`. Le tier n'est jamais persisté : il est relu de l'environnement et mis en cache à l'init (mika#1962). Le risque de décalage d'index serde soulevé par F3 n'existe donc pas sur cet enum — il n'y a rien à convertir en représentation-chaîne, et un futur `derive(Serialize)` devrait être posé en `rename_all` explicite pour que ça reste vrai.
+- Les ~25 autres occurrences sont du portage de champ (`tier: self.tier`), pas des points de décision.
 
 **M5 — séquencement : `mika` d'abord, jamais l'inverse.** Tant que mika-cloud émet `family` pour un champion (temps 1), la variante `Champion` est **inerte à l'exécution** : aucun champion ne l'atteint. Si mika-cloud basculait d'abord vers l'émission de `champion`, les champions traverseraient le chemin valeur-inconnue — sûr *après* l'AC2 de ce plan, fail-open *avant*. L'ordre est donc contraint : ce ticket, puis le compagnon mika-cloud.
 
@@ -58,6 +63,8 @@ Exigence Prime : le ticket compagnon s'ouvre **dans le même geste** que la re-p
 
 - **AC2** — **Fail-closed sur valeur non reconnue.** Une valeur non vide hors `{default, family, champion}` résout vers le tier d'outils le **plus restreint** (famille) et non plus vers `Default`, avec le `warn!` conservé nommant la valeur. L'absence, `""` et `default` restent `Default` — le poste opérateur est légitime (M1). Test rouge-avant/vert-après portant les **deux contrôles dans le même appel** : positif `MIKA_AGENT_TIER=pro` → tier restreint (aujourd'hui `Default`) ; négatif, variable absente → `Default` (inchangé).
 
+  **Livrable de documentation attaché (F2, dette nommée) :** un commentaire sur la variante `Family` dans `home.rs` déclare qu'elle sert aussi de **plancher fail-closed** — p.ex. `/// NOTE: Family sert aujourd'hui de tier plancher fail-closed (AC2, mika#2023). Si Family gagne des outils ou de la surface, le plancher doit devenir un tier explicite.` Le plan retient délibérément la réutilisation de `Family` plutôt qu'un `AgentTier::Minimal` neuf (arbitrage architecte : ne pas élargir la surface de l'enum sans besoin), au prix d'un couplage entre un invariant de sûreté et une définition produit. Le couplage est acceptable parce qu'il est écrit et daté, pas parce qu'il est inoffensif.
+
 - **AC3** — **Dissociation outils↔persona.** `AgentTier` expose les deux axes séparément : l'axe outils (l'allowlist de skills) et l'axe persona (`identity_toml()`/`soul_md()`) ne dérivent plus d'une correspondance unique. `Champion` = **outils famille** + **persona placeholder famille**, marquée en clair `// PLACEHOLDER (mika#2023) — contenu propriété de Vincent, remplaçable en un site`. **Aucune règle de locale n'est introduite** (interdiction Prime). Test : `Champion` rend l'allowlist famille, et le site de remplacement de la persona est unique.
 
 - **AC4** — **`tier_guard` ne casse pas le boot champion.** `assert_family_tier_env_consistency` accepte un agent provisionné famille-sur-disque quand le tier du process est `Champion` — le placeholder rend cet état *attendu*, pas une dérive. Test rouge-avant/vert-après avec contrôle négatif conservé dans le même test : disque famille + tier `Champion` → `bail!` aujourd'hui / `Ok` après ; disque famille + tier `Default` → `bail!` avant **et** après (M2).
@@ -67,6 +74,21 @@ Exigence Prime : le ticket compagnon s'ouvre **dans le même geste** que la re-p
 - **AC6** — **Aucun AC orphelin.** Le ticket compagnon **senara-solutions/mika-cloud#242** est ouvert (2026-09-09, dans le même geste que cette re-partition, exigence Prime), portant (a) le vocabulaire réel de `add-customer.sh --tier` (`scripts/add-customer.sh:236`) et (b) le trou M1 « un tier connu de la console mais non mappé n'émet rien et retombe en opérateur ». Il porte `blockedBy: mika#2023` ; le corps de mika#2023 le cite en retour. La PR de ce plan cite mika-cloud#242 dans son corps et **ne le ferme pas** — l'ordre est mika d'abord (M5).
 
 - **AC7** — `cargo build` + `cargo clippy --all-targets -- -D warnings` + `cargo test` VERTS. Les sorties rouge-avant/vert-après des tests AC2 et AC4 sont collées au corps de la PR (porte mika#2264).
+
+## Fire-Disposition
+
+Trois livrables de ce plan sont de classe détecteur. Leur comportement quand ils tirent est pré-spécifié ici, avant écriture (porte mika#1574).
+
+**(a) Détecteur « valeur de tier non reconnue » (AC2) — halt-and-surface.**
+Violations préexistantes : **aucune**, mesuré en M1 — aucun chemin n'émet aujourd'hui une valeur non vide non reconnue. Le détecteur ne tire donc sur rien à l'introduction. Quand il tire, il tire sur une **régression** : un tier ajouté côté console sans correspondance côté provisioning. Disposition : l'agent résout vers le tier le plus restreint (il ne refuse pas le démarrage — un champion privé d'agent est pire qu'un champion en tier restreint) **et** journalise en `warn!` avec la valeur fautive ; le test d'AC2 échoue en CI si la résolution retombe sur `Default`. La CI est le point d'arrêt, pas le runtime.
+
+**(b) Garde de cohérence tier↔disque (AC4) — halt-and-surface, avec un état explicitement exempté.**
+L'état « persona famille sur disque + tier runtime `Champion` » est l'état **attendu** du placeholder, pas une dérive : il est exempté par construction, aux **deux** portes (`tier_guard.rs:66` et `:159` — cf. M4). L'état « persona famille sur disque + tier runtime `Default` » reste une dérive et conserve son `bail!` au démarrage, contrôle négatif épinglé dans le test d'AC4.
+
+**Angle mort nommé, hors du pouvoir de ce plan :** la garde ne détecte que la provision **famille** sur disque — le module le dit lui-même (« there is no operator-side provisioning sentinel »). Un champion bootstrappé **avant** mika-cloud#209 porte l'allowlist **opérateur** sur disque : la garde ne voit rien, ne tire pas, et l'agent démarre en silence avec la surface opérateur alors que son tier runtime dit `Champion`. Aucune ligne de ce plan ne le rattrape. C'est ce qui rend la vérification d'exploitation en « Hors scope » bloquante pour le lancement, et non facultative.
+
+**(c) Exhaustivité du `match` sur le tier (AC5) — bloqué à la compilation.**
+Le compilateur est le détecteur : retirer le `_ =>` fourre-tout fait échouer `cargo build` sur tout site non traité. Aucune violation runtime n'est possible, donc aucune disposition runtime à spécifier. C'est la formulation du cap : le compilateur devient le gardien à la place du `warn!`.
 
 ## Hors scope — nommé, pas éludé
 
