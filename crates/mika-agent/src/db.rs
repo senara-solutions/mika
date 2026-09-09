@@ -18243,6 +18243,9 @@ mod tests {
     #[test]
     fn mika2040_detector_is_agent_scoped() {
         let db = db();
+        // Les tasks référencent agents(id) (FK NOT NULL) — créer les agents d'abord.
+        db.register_agent("agent_a", "Agent A", "/tmp/a").unwrap();
+        db.register_agent("agent_b", "Agent B", "/tmp/b").unwrap();
         create_stamped_dispatch(&db, "agent_a", "delivered", 600);
 
         assert_eq!(
