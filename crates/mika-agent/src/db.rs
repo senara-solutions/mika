@@ -8556,9 +8556,38 @@ impl Database {
         Ok(rows)
     }
 
+    /// Record (or clear) the OS process running under a task.
+    ///
+    /// **Also stamps `fired_at` when a process is recorded and the row has none
+    /// (mika#2263 défaut (b)).** Registering a PID is the moment the engine
+    /// learns a pilot is alive under this task — `skills/executor.rs` calls it
+    /// immediately after the spawn — so a row that leaves this function with a
+    /// `process_id` and no `fired_at` is a live dispatch that reads as *never
+    /// dispatched*. That is precisely what `b429a658` (#2252) and `4e867d85`
+    /// (#2212) looked like on 2026-09-09 while their bwrap pilots ran for 69
+    /// and 45 minutes: `pending`, `fired_at` NULL, invisible to every probe
+    /// that uses `fired_at` to tell *not yet dispatched* from *zombie*.
+    ///
+    /// The stamp lives here, at the single chokepoint every spawn path passes
+    /// through, rather than in each caller — one site cannot drift from
+    /// another the way a per-caller convention does.
+    ///
+    /// Two deliberate non-effects, both pinned by tests:
+    /// - clearing (`process_id = None`, what a disposal does after a kill)
+    ///   stamps nothing — that is not a dispatch;
+    /// - an existing `fired_at` is never overwritten, so a re-record cannot
+    ///   reset a dispatch's age under the reapers that measure it.
     pub fn set_task_process_id(&self, id: &str, process_id: Option<i64>) -> Result<()> {
         self.conn.execute(
-            "UPDATE tasks SET process_id = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?2",
+            "UPDATE tasks
+                SET process_id = ?1,
+                    fired_at = CASE
+                                 WHEN ?1 IS NOT NULL AND fired_at IS NULL
+                                 THEN strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                                 ELSE fired_at
+                               END,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+              WHERE id = ?2",
             params![process_id, id],
         )?;
         Ok(())
