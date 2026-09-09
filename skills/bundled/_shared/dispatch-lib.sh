@@ -2309,6 +2309,32 @@ _set_up_worktree() {
             rm -f "$wt_err_1" "$wt_err_2"
         fi
 
+        # mika#2249 D1: declare the worktree to the engine.
+        #
+        # The engine's silent-stall reaper needs to know where this dispatch is
+        # writing, and this is the ONLY place that knows: WORKTREE_DIR comes from
+        # `scripts/derive-worktree-path`, and re-deriving it on the Rust side is
+        # the duplication mika-platform#58 closed. The engine pre-created the
+        # declaration file's directory and passed its path in
+        # MIKA_DISPATCH_WORKTREE_FILE; one line lands there, no new channel.
+        #
+        # Written after the whole reuse-or-create block, not only after a fresh
+        # `worktree add`: a re-dispatch onto an existing worktree is exactly as
+        # capable of stalling silently, and skipping it there would leave the
+        # most-repeated dispatches unwatched.
+        #
+        # Every failure is silent by design. An undeclared dispatch is invisible
+        # to the reaper — which is the safe direction — and a dispatch that
+        # aborted because it could not write a diagnostic file would trade a
+        # missed detection for a broken loop.
+        if [ -n "${MIKA_DISPATCH_WORKTREE_FILE:-}" ]; then
+            if printf '%s\n' "$WORKTREE_DIR" > "$MIKA_DISPATCH_WORKTREE_FILE" 2>/dev/null; then
+                echo "[dispatch-lib] dispatch_worktree_declared: $WORKTREE_DIR -> $MIKA_DISPATCH_WORKTREE_FILE (mika#2249)" >&2
+            else
+                echo "[dispatch-lib] dispatch_worktree_declare_failed: could not write $MIKA_DISPATCH_WORKTREE_FILE; this dispatch will not be watched for a silent stall (mika#2249)" >&2
+            fi
+        fi
+
         # mika#2123 kept this rebase deliberately, and it is worth saying why: the
         # promotion-time gate added in `auto_pull` has no checkout, so it only
         # ever *measures*. This is still the only place anything is rebased.

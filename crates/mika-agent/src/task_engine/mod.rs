@@ -7,6 +7,7 @@ pub mod process_kill;
 pub mod process_liveness;
 pub mod queue;
 pub mod types;
+pub mod worktree_activity;
 
 pub use dispatcher::{DispatchError, TaskDispatcher};
 pub use engine::{TaskEngine, promoted_wrapper_liveness_secs, stuck_pending_reaper_grace_secs};
