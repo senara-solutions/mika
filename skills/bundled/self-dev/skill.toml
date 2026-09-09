@@ -4,7 +4,17 @@ description = "Orchestrator: delegates implementation work to Claude Code via cl
 version = "0.2.0"
 always_on = true
 timeout_secs = 30
-max_prompt_size = 65536
+# Relevé de 65536 à 73728 (mika#2264) : la Rule 13 (test négatif rouge-avant
+# sur une PR touchant server/task_engine/tools) porte le prompt de 59 420 à
+# ~62 790 octets, au-dessus du gate des 95 % de 65536 (62 259) qui PANIQUE au
+# lieu d'avertir (tests/bundled_skills_load.rs:141,166). Même geste et même
+# plafond que qa-review (mika#2264) et self-dev-webhook-qa (mika#2248) : ce
+# prompt énumère les règles de calibration, et en retirer une pour tenir dans
+# le budget est précisément la dérive que les règles existent pour empêcher.
+# 73728 < le plafond dur de 81 920 (skills/index.rs:27) ; le gate refera feu à
+# 70 041 octets. Le plafond déclaré ne coûte rien — c'est la taille réelle qui
+# est injectée.
+max_prompt_size = 73728
 dependencies = [
     "build-mika",
     "deploy-mika",

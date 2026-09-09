@@ -81,6 +81,7 @@ The handler derives everything else (branch, worktree, pipeline command).
 **Rules:**
 - **Always pass `task_id`** — the task UUID from Step 2 (36-char format like `15383984-a3e7-41bf-ac6f-630ba9a89d63`). Do NOT pass issue references like `mika-284` — pass the UUID returned by `create_task`. Ensures logs correlate with the task tree.
 - **One session per issue** — the handler runs the full pipeline.
+- **Loop-substrate issues carry Rule 13** — if the issue names `crates/mika-agent/src/{server,task_engine,tools}/`, compose an `iteration_context` carrying Rule 13's four requirements verbatim. A bare `repo#number` dispatch instructs the pilot to write no negative test.
 - **Wait for the callback** — results arrive via callback when claude-pilot finishes. Do NOT poll.
 - **Do NOT do the work inline** — never read source files, analyze code, or produce implementation plans. That wastes your context window. Always use `run_claude_pilot`.
 - **State-awareness on re-dispatch (engine guard — see `executor.rs` `dispatch_task_has_open_pr`, mika#920):**
@@ -176,6 +177,8 @@ If `update_task_status` returns `{"error": "task_not_found", ...}`, the task ID 
 4. If multiple matches: escalate — notify Vincent with the candidate list and ask which to update.
 
 **Incident (mika#693, trace `7a9cb990`, 2026-04-20):** Agent called `update_task_status` with hallucinated UUID suffix. Tool returned `task_not_found`. Agent called `list_tasks` in a subsequent step — correct ID was visible — but ended the turn without retrying. Child task was left `in_progress` after PR merge, blocking milestone advancement.
+
+**Before applying the status rules: run the Rule 13 check** (negative test on an in-perimeter PR). An in-perimeter PR without the `## Negative test (red → green)` section stays `in_progress` and is re-dispatched once — never closed.
 
 **Status rules:**
 - PR merged (GitHub auto-merge or "merge anyway") → `completed`
@@ -343,6 +346,30 @@ The claude-pilot permission policy **refuses every write outside the dispatch wo
 **Never** ask the operator to paste the body by hand when the write is refused — a dispatched session that asks a question is a dead session. Use the worktree file.
 
 **Incident:** mika#2211 — session #2195 (stderr `675479e5-…`) hit `[policy:deny] Write: /tmp/pr-body-2195.md`, then halted on the question "Dis-moi si tu veux que je le colle". Both PRs #2202 and #2210 landed as `wip-rescue` drafts from this one cause.
+
+### Rule 13 — A loop-substrate PR ships a negative test, run red-then-green (mika#2264)
+
+**Perimeter.** A PR is *in perimeter* when its changed-file list touches
+`crates/mika-agent/src/server/`, `crates/mika-agent/src/task_engine/`, or
+`crates/mika-agent/src/tools/`. Get the list with `run_gh(["pr","diff",<N>,"--name-only"], repo)` — listing filenames is not reading source code, so Step 1's "do not read source" rule does not bar it.
+
+**What the pilot owes.** For an in-perimeter PR the pilot MUST, inside its worktree:
+
+1. **Name the invariant** the change could violate — the forbidden state, in the PR's own symbols (`mergedBy != reviewer`, `superseded → pgid killed`, `blocked → 0 dispatch`). "The correctness invariant" is not a name.
+2. **Write a negative assertion** for it — a test that fails when the forbidden state occurs. A test proving the nominal path works does not count: the 2026-09-09 cascade (#2248, #2252, #2260, #2263) had passing tests throughout, and not one of them asserted *"this must NOT happen"*.
+3. **Run it red, then green** — red against the pre-fix code (`git stash push` the fix, or run the test on the parent commit), green after. A test never seen red proves nothing about the invariant; it may assert something that was already true.
+4. **Paste both outputs into the PR body**, under a `## Negative test (red → green)` heading, with the test's `file:symbol`.
+
+**Carry it into every dispatch that reaches the PR step.** Like Rule 12, this rule is yours to propagate: whenever the issue names one of the three paths, put requirements 1–4 verbatim into the `iteration_context` you compose. A bare `repo#number` dispatch carries no such instruction on its own.
+
+**At callback, before Step 6 — verify, do not assume.** When the callback reports a PR:
+
+- Not in perimeter → nothing to check, proceed.
+- In perimeter, PR body contains a `## Negative test (red → green)` section with both outputs → proceed.
+- In perimeter, section absent or carrying only one run → **do not close the task.** Re-dispatch once with `iteration_context`: *"Add the negative test required by Rule 13 for <invariant>. Run it red against the pre-fix code and green after; paste both outputs into the PR body under `## Negative test (red → green)`. Change nothing else."* Keep the task `in_progress`. If a second callback still lacks it, escalate to Vincent via `send_message` — do not close, and do not dispatch a third time.
+
+**Why both layers.** mika-qa refuses `pass` on an in-perimeter PR whose body lacks this proof (`qa-review` Step 2.5.4b). Catching it here means the pilot fixes it inside the run it already owns, instead of the PR bouncing off the reviewer after the worktree is cold. Defense in depth, same shape as the two-layer deploy gate: the reviewer's refusal is the backstop, not the primary check.
+
 
 ---
 

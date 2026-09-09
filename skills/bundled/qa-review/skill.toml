@@ -7,7 +7,18 @@ always_on = true
 # DEP-REVIEW section (Prime's load-bearing distinct-from-CI signal) pushed the
 # prompt to ~58 KB. 64 KB stays well under the 80 KB ceiling and the 95% warn
 # gate (bundled_skills_approaching_max_prompt_size_warns).
-max_prompt_size = 65536
+#
+# Raised from 65536 to 73728 (72 KB) for mika#2264. Step 2.5.4b (the implicit
+# negative-test AC) plus the CI-deferred closure in 2.5.3 and the tenth row of
+# the 3b table add ~5.7 KB to a prompt that sat at 61 498 bytes — 761 bytes
+# under the 95 % gate, which PANICS rather than warns
+# (tests/bundled_skills_load.rs:141,166). Remediation could not be "drop a
+# rule": this prompt's whole subject is a closed enumeration of what blocks a
+# merge, and mika#2238 measured that an unlisted branch produces a silent stop.
+# Same gesture, same reason as self-dev-webhook-qa/skill.toml (mika#2248).
+# 73728 < the 81 920 hard ceiling (skills/index.rs:27); the gate fires again at
+# 70 041 bytes. The declared size costs nothing — the real size is injected.
+max_prompt_size = 73728
 dependencies = ["github", "build-mika"]
 
 [triggers]

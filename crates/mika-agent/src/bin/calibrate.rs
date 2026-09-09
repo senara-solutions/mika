@@ -90,6 +90,12 @@ struct Args {
     /// Number of times to run each scenario. v1: always 1 (DR-8). v2 will support N≥3 averaging.
     #[arg(long, default_value = "1")]
     _runs_per_scenario: u32,
+
+    /// Run only the named scenario(s) from the role's suite (repeatable). Diagnostic
+    /// use only: a filtered run reports on a subset, so it is NOT a gate result and
+    /// refuses `--establish-baseline`.
+    #[arg(long)]
+    scenario: Vec<String>,
 }
 
 #[tokio::main]
@@ -119,6 +125,50 @@ async fn main() {
             );
             std::process::exit(2);
         }
+    };
+
+    // Backing storage for a filtered run; borrowed by `scenarios` below.
+    let filtered: Vec<mika_agent::calibration::role::RoleScenario>;
+
+    // Optional scenario filter (diagnostic). A filtered run measures a subset, so it
+    // must never be able to write a baseline that a later full run is compared against.
+    let scenarios: &[_] = if args.scenario.is_empty() {
+        scenarios
+    } else {
+        if args.establish_baseline {
+            eprintln!(
+                "Error: --scenario cannot be combined with --establish-baseline (a filtered run is not a gate result)."
+            );
+            std::process::exit(2);
+        }
+        let unknown: Vec<&String> = args
+            .scenario
+            .iter()
+            .filter(|want| !scenarios.iter().any(|s| s.id == want.as_str()))
+            .collect();
+        if !unknown.is_empty() {
+            eprintln!(
+                "Error: unknown scenario(s) for role '{}': {}. Available: {}",
+                args.role,
+                unknown
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                scenarios
+                    .iter()
+                    .map(|s| s.id)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            std::process::exit(2);
+        }
+        filtered = scenarios
+            .iter()
+            .filter(|s| args.scenario.iter().any(|want| want == s.id))
+            .cloned()
+            .collect();
+        &filtered
     };
 
     // Create provider

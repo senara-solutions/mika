@@ -16,6 +16,7 @@ use super::scenario::ScenarioOutcome;
 /// Unlike provider-level `Scenario` (which tests basic LLM functionality),
 /// a `RoleScenario` tests agent-role-specific behavior through the full
 /// agent loop with synthetic skills.
+#[derive(Clone)]
 pub struct RoleScenario {
     /// Unique identifier for this scenario.
     pub id: &'static str,
