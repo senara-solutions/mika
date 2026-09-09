@@ -1740,10 +1740,11 @@ fn feeder_exclusion_label(issue: &Issue) -> Option<&'static str> {
     if let Some(verdict) = seat_refusal(issue) {
         return Some(verdict.refusal_reason().unwrap_or(FILTER_SEAT_REFUSED));
     }
-    if issue
-        .labels
-        .iter()
-        .any(|l| l.name == "blocked" || l.name == "operator-review" || l.name == REFUSAL_LABEL)
+    // mika#2263 — the list itself lives in `webhook_dispatch` now, shared with
+    // the `ready_label_handler` gate. Two copies is how #1781 stayed excluded
+    // from the feeder and got re-dispatched twice by the handler anyway.
+    if crate::webhook_dispatch::operator_held_label(issue.labels.iter().map(|l| l.name.as_str()))
+        .is_some()
     {
         return Some(FILTER_OPERATOR_HELD);
     }
@@ -3414,6 +3415,20 @@ async fn phase2_reconcile_stuck_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// mika#2263 — the label this module APPLIES on a promotion refusal must
+    /// stay one the shared operator-held list EXCLUDES. If the two ever drift,
+    /// a refusal stops persisting: the gate would refuse, label, and measure
+    /// the same branch again on the next tick, forever.
+    #[test]
+    fn the_refusal_label_is_operator_held_on_both_surfaces() {
+        assert!(
+            crate::webhook_dispatch::operator_held_label([REFUSAL_LABEL]).is_some(),
+            "{REFUSAL_LABEL} must be in webhook_dispatch::OPERATOR_HELD_LABELS"
+        );
+        // Negative control: an ordinary label holds nothing.
+        assert!(crate::webhook_dispatch::operator_held_label(["ready"]).is_none());
+    }
 
     // ── mika#2123 promotion staleness gate ──
 

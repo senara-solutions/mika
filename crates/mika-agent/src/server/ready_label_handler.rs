@@ -301,6 +301,72 @@ where
         };
     }
 
+    // 4c. Operator-held gate (mika#2263 défaut (c)). Same placement rationale as
+    //     the seat gate above — the labels are already in hand from the step-4
+    //     `gh` call, and this is still ahead of the step-7 pre-create, which is
+    //     the property that matters: a held ticket produces ZERO tasks.
+    //
+    //     Measured 2026-09-09: #1781 carried `blocked` and had had its `ready`
+    //     label removed, and this handler still re-dispatched it twice (pgid
+    //     478551, 492118, row daba9416) on stale/redelivered `ready` events.
+    //     `blocked` excluded the ticket from the `auto_pull` feeder and from
+    //     nothing else — so the label did not contain the dispatch, it
+    //     contained half the paths to it. The predicate is now shared with
+    //     `auto_pull::feeder_exclusion_label`, which is what makes the two
+    //     surfaces unable to drift apart again.
+    //
+    //     Refusal returns `Handled`, never `Passthrough`, for the third time in
+    //     this function and for the same reason: `Passthrough` leaves `req.text`
+    //     on the ready-label marker, which is exactly what the
+    //     `webhook_ready_label_dispatch` INTENT_GUARD triggers on — it would
+    //     re-prompt the LLM until it dispatched the ticket this gate just
+    //     refused. Zero tasks created here and a guard-driven dispatch two
+    //     steps later is not a gate.
+    if let Some(held_by) =
+        crate::webhook_dispatch::operator_held_label(labels.iter().map(String::as_str))
+    {
+        let owner_repo = location.owner_repo();
+        warn!(
+            event = "ready_label_operator_held",
+            repo = %owner_repo,
+            num = location.number,
+            held_by = %held_by,
+            "ready_label_handler: `ready` event on a ticket an operator is holding —              refused before task creation"
+        );
+
+        // Operator-visible record. As at the two gates above, no `task_id`
+        // exists yet by construction, so the audit target is the issue
+        // reference itself.
+        if let Err(e) = db
+            .log_audit_event(
+                session_id,
+                "ready_label_operator_held",
+                &format!("{}#{}", owner_repo, location.number),
+                None,
+                Some("dispatch_refused"),
+                Some(&format!(
+                    "repo={} number={} held_by={} refused=operator_held",
+                    owner_repo, location.number, held_by
+                )),
+                Some(trace_id),
+            )
+            .await
+        {
+            warn!(
+                event = "ready_label_audit_log_failed",
+                repo = %owner_repo,
+                num = location.number,
+                error = %e,
+                "ready_label_handler: failed to write operator-held refusal audit event \
+                 (non-fatal)"
+            );
+        }
+
+        return VerdictAction::Handled {
+            pre_digest: format_operator_held_pre_digest(&location, held_by),
+        };
+    }
+
     // 5. Determine groomed-state via the canonical predicate. Same code path as
     //    `validate_dispatch_readiness` gate (#919) — drift between the two
     //    sites would re-introduce the bug class this handler closes.
@@ -690,6 +756,35 @@ pub async fn fetch_issue_body_and_labels_via_gh(
         })
         .unwrap_or_default();
     Ok((body, labels))
+}
+
+/// Pre-digest for a `ready` event on a ticket an operator is holding
+/// (mika#2263 défaut (c)).
+///
+/// Opens with `<ready_label_handler>` for the same load-bearing reason as the
+/// two refusals below it: any text still matching the
+/// `webhook_ready_label_dispatch` trigger would have the guard demand the very
+/// dispatch this refusal exists to prevent.
+///
+/// Names the issue AND the label holding it, because the operator reading this
+/// needs to know which label to remove to release the ticket — "refused" alone
+/// sends them looking.
+fn format_operator_held_pre_digest(loc: &ReadyLabelLocation, held_by: &str) -> String {
+    let owner_repo = loc.owner_repo();
+    let number = loc.number;
+    format!(
+        "<ready_label_handler>\n\
+         DISPATCH REFUSED — {owner_repo}#{number} carries the `{held_by}` label.\n\n\
+         `{held_by}` means someone is holding this ticket: the autonomous loop does not \
+         dispatch it, whatever `ready` events arrive for it (stale, redelivered, or applied \
+         by hand). The same label already keeps it out of the auto-pull feeder — this gate \
+         is the other half of that hold.\n\n\
+         No task was created. Do NOT call run_claude_pilot or run_claude_pilot_groom for \
+         this issue. Acknowledge and end the turn; use send_message only if the operator \
+         asked to be told.\n\n\
+         To release the ticket, an operator removes `{held_by}` and re-applies `ready`.\n\
+         </ready_label_handler>"
+    )
 }
 
 /// Pre-digest for a `ready` label on an issue another dispatch seat owns

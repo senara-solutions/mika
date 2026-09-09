@@ -74,6 +74,7 @@ mod eval {
     mod test_phantom_task_row_sweep;
     mod test_pilot_silent_stall_reaper;
     mod test_pr_review_idempotency;
+    mod test_ready_label_blocked_skip;
     mod test_ready_label_grooming_guard;
     mod test_real_provider_matrix;
     mod test_request_wellformedness;

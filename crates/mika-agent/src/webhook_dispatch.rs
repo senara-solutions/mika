@@ -222,6 +222,38 @@ pub(crate) fn dispatchable_repos_display() -> String {
 
 /// Prefix of the label that names which dispatcher owns a ticket (mika#2084).
 ///
+/// The labels that mean **someone else is holding this ticket** (mika#2263
+/// défaut (c)).
+///
+/// The single list behind two surfaces: `auto_pull::feeder_exclusion_label`
+/// (which keeps a held ticket out of the pullable pool and the feeder backlog)
+/// and the `ready_label_handler` gate (which keeps a held ticket from being
+/// dispatched by a `ready` event that arrives anyway — stale, redelivered, or
+/// applied by hand).
+///
+/// One list, because the 2026-09-09 measurement is what happens with two:
+/// `blocked` excluded #1781 from the feeder and nothing else, and the handler
+/// re-dispatched it twice (pgid 478551, 492118). A label that holds a ticket
+/// on one path and not the other does not hold the ticket.
+///
+/// `operator-gated` is here for the reason mika#2123 gave it to the feeder: it
+/// is what makes a promotion refusal *persist*, and `.github/labels.yml`
+/// already promised "No ready label" for it.
+pub(crate) const OPERATOR_HELD_LABELS: &[&str] = &["blocked", "operator-review", "operator-gated"];
+
+/// The operator-held label carried by `labels`, if any (mika#2263).
+///
+/// Returns **which** label held the ticket, never a bare boolean: an operator
+/// reading a refusal needs to know which label to remove, and a counter needs
+/// to distinguish "held by `blocked`" from "held by `operator-gated`".
+pub(crate) fn operator_held_label<'a>(
+    labels: impl IntoIterator<Item = &'a str>,
+) -> Option<&'a str> {
+    labels
+        .into_iter()
+        .find(|l| OPERATOR_HELD_LABELS.contains(l))
+}
+
 /// The match is on this **exact** prefix. `dispatched`, `dispatch-ready`, and
 /// any other label that merely starts with the letters `dispatch` are ordinary
 /// labels and must not enter the seat gate — treating them as seat labels would
