@@ -276,7 +276,7 @@ qui en rendent, et ce sont eux qui portent les trois dispositions ci-dessus.
   généralité non mesurée.
 - **Toute modification de `crates/mika-agent/src/`** (D3).
 
-## Acceptance (tie-back)
+## Acceptance criteria
 
 | AC | Livrable | Vérif |
 |---|---|---|
