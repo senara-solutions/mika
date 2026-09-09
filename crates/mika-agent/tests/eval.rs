@@ -56,6 +56,7 @@ mod eval {
     mod test_deadline_in_flight_llm_call;
     mod test_deferred_dispatch_idempotent_ack;
     mod test_di_builders;
+    mod test_dispatch_fired_at_stamped;
     mod test_dispatch_no_grooming_marker_guard;
     mod test_dispatch_task_has_open_pr_guard;
     mod test_error_handling;
@@ -73,12 +74,14 @@ mod eval {
     mod test_phantom_task_row_sweep;
     mod test_pilot_silent_stall_reaper;
     mod test_pr_review_idempotency;
+    mod test_ready_label_blocked_skip;
     mod test_ready_label_grooming_guard;
     mod test_real_provider_matrix;
     mod test_request_wellformedness;
     mod test_required_tools_gate;
     mod test_schema_divergence;
     mod test_self_knowledge_kg;
+    mod test_supersede_kills_live_pilot;
     mod test_task_not_found_retry;
     mod test_tool_call_secret_redaction;
     mod test_tool_call_stream_emission;

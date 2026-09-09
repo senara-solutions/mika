@@ -6878,6 +6878,43 @@ impl Database {
         Ok(rows)
     }
 
+    /// Every **live dispatch** a fresh dispatch for `base_url` supersedes
+    /// (mika#2263 défaut (a)).
+    ///
+    /// The complement of
+    /// [`Self::find_active_tracking_rows_by_reference_url_and_variants`], and
+    /// deliberately so: that lookup answers "which phantom ROWS does this
+    /// dispatch replace" and filters on `process_id IS NULL`, so a row carrying
+    /// a running pilot is not even a candidate. That filter is what let the
+    /// mika#2263 zombies live — supersede cancelled the row it could see and
+    /// never looked at the process it could not.
+    ///
+    /// Returns non-terminal rows (`pending`/`in_progress`) that carry a
+    /// `process_id`, for the exact URL and its `?phase=groom` variant — same
+    /// two-variant coverage as the phantom lookup, so a groom dispatch disposes
+    /// of the base-URL pilot too.
+    pub fn find_live_dispatch_rows_by_reference_url_and_variants(
+        &self,
+        agent_id: &str,
+        base_url: &str,
+    ) -> Result<Vec<Task>> {
+        let groom_url = format!("{base_url}{}", crate::task_state::tasks::GROOM_PHASE_SUFFIX);
+        let sql = format!(
+            "SELECT {} FROM tasks
+             WHERE agent_id = ?1
+               AND process_id IS NOT NULL
+               AND status IN ('pending', 'in_progress')
+               AND reference_url IN (?2, ?3)
+             ORDER BY id",
+            Self::TASK_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![agent_id, base_url, groom_url], Self::row_to_task)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// Guarded transition of a phantom tracking row → `cancelled` with the
     /// canonical supersede reason (mika#1934 AC2).
     ///
@@ -8519,9 +8556,38 @@ impl Database {
         Ok(rows)
     }
 
+    /// Record (or clear) the OS process running under a task.
+    ///
+    /// **Also stamps `fired_at` when a process is recorded and the row has none
+    /// (mika#2263 défaut (b)).** Registering a PID is the moment the engine
+    /// learns a pilot is alive under this task — `skills/executor.rs` calls it
+    /// immediately after the spawn — so a row that leaves this function with a
+    /// `process_id` and no `fired_at` is a live dispatch that reads as *never
+    /// dispatched*. That is precisely what `b429a658` (#2252) and `4e867d85`
+    /// (#2212) looked like on 2026-09-09 while their bwrap pilots ran for 69
+    /// and 45 minutes: `pending`, `fired_at` NULL, invisible to every probe
+    /// that uses `fired_at` to tell *not yet dispatched* from *zombie*.
+    ///
+    /// The stamp lives here, at the single chokepoint every spawn path passes
+    /// through, rather than in each caller — one site cannot drift from
+    /// another the way a per-caller convention does.
+    ///
+    /// Two deliberate non-effects, both pinned by tests:
+    /// - clearing (`process_id = None`, what a disposal does after a kill)
+    ///   stamps nothing — that is not a dispatch;
+    /// - an existing `fired_at` is never overwritten, so a re-record cannot
+    ///   reset a dispatch's age under the reapers that measure it.
     pub fn set_task_process_id(&self, id: &str, process_id: Option<i64>) -> Result<()> {
         self.conn.execute(
-            "UPDATE tasks SET process_id = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?2",
+            "UPDATE tasks
+                SET process_id = ?1,
+                    fired_at = CASE
+                                 WHEN ?1 IS NOT NULL AND fired_at IS NULL
+                                 THEN strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                                 ELSE fired_at
+                               END,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+              WHERE id = ?2",
             params![process_id, id],
         )?;
         Ok(())

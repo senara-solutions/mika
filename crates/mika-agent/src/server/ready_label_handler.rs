@@ -86,11 +86,52 @@ pub async fn try_handle_ready_label_dispatch(
     text: &str,
     db: &AsyncDatabase,
     github_token: Option<&str>,
-    _message_sender: Option<&Arc<dyn MessageSender>>,
+    message_sender: Option<&Arc<dyn MessageSender>>,
     session_id: &str,
     trace_id: &str,
     skills: &SkillRegistry,
 ) -> VerdictAction {
+    try_handle_ready_label_dispatch_with_fetcher(
+        text,
+        db,
+        github_token,
+        message_sender,
+        session_id,
+        trace_id,
+        skills,
+        |owner_repo, number, token| async move {
+            fetch_issue_body_and_labels_via_gh(&owner_repo, number, &token).await
+        },
+    )
+    .await
+}
+
+/// [`try_handle_ready_label_dispatch`] with the issue fetch injected.
+///
+/// The seam exists for one reason: the refusal gates in this handler are
+/// defined by what they do BEFORE the step-7 pre-create — "zero task created"
+/// is the property, and no test can observe it while the only way in runs `gh
+/// issue view` against the real GitHub. Production always passes
+/// [`fetch_issue_body_and_labels_via_gh`]; tests pass the labels they want to
+/// gate on.
+///
+/// `fetch_issue` receives `(owner_repo, number, token)` and yields
+/// `(body, labels)`.
+#[allow(clippy::too_many_arguments)]
+pub async fn try_handle_ready_label_dispatch_with_fetcher<F, Fut>(
+    text: &str,
+    db: &AsyncDatabase,
+    github_token: Option<&str>,
+    _message_sender: Option<&Arc<dyn MessageSender>>,
+    session_id: &str,
+    trace_id: &str,
+    skills: &SkillRegistry,
+    fetch_issue: F,
+) -> VerdictAction
+where
+    F: FnOnce(String, u64, String) -> Fut,
+    Fut: std::future::Future<Output = Result<(String, Vec<String>), String>>,
+{
     // 1. Early-return for non-ready-label messages. Cheapest predicate.
     if !text.starts_with(READY_LABEL_DISPATCH_MARKER) {
         return VerdictAction::Passthrough { enrichment: None };
@@ -183,19 +224,20 @@ pub async fn try_handle_ready_label_dispatch(
 
     // 4. Fetch issue body via `gh issue view`. Used to determine groomed-state
     //    via the same predicate the dispatch gate uses (#919, #1108).
-    let (body, labels) = match fetch_issue_body_and_labels(&location, token).await {
-        Ok(pair) => pair,
-        Err(e) => {
-            warn!(
-                event = "ready_label_body_fetch_failed",
-                repo = %location.owner_repo(),
-                num = location.number,
-                error = %e,
-                "ready_label_handler: gh issue view failed — passthrough"
-            );
-            return VerdictAction::Passthrough { enrichment: None };
-        }
-    };
+    let (body, labels) =
+        match fetch_issue(location.owner_repo(), location.number, token.to_string()).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!(
+                    event = "ready_label_body_fetch_failed",
+                    repo = %location.owner_repo(),
+                    num = location.number,
+                    error = %e,
+                    "ready_label_handler: gh issue view failed — passthrough"
+                );
+                return VerdictAction::Passthrough { enrichment: None };
+            }
+        };
 
     // 4b. Dispatch-seat gate (mika#2084). Placed here because it is the first
     //     point at which the issue's labels are known — they ride along on the
@@ -256,6 +298,72 @@ pub async fn try_handle_ready_label_dispatch(
 
         return VerdictAction::Handled {
             pre_digest: format_seat_mismatch_pre_digest(&location, &seat_verdict, current),
+        };
+    }
+
+    // 4c. Operator-held gate (mika#2263 défaut (c)). Same placement rationale as
+    //     the seat gate above — the labels are already in hand from the step-4
+    //     `gh` call, and this is still ahead of the step-7 pre-create, which is
+    //     the property that matters: a held ticket produces ZERO tasks.
+    //
+    //     Measured 2026-09-09: #1781 carried `blocked` and had had its `ready`
+    //     label removed, and this handler still re-dispatched it twice (pgid
+    //     478551, 492118, row daba9416) on stale/redelivered `ready` events.
+    //     `blocked` excluded the ticket from the `auto_pull` feeder and from
+    //     nothing else — so the label did not contain the dispatch, it
+    //     contained half the paths to it. The predicate is now shared with
+    //     `auto_pull::feeder_exclusion_label`, which is what makes the two
+    //     surfaces unable to drift apart again.
+    //
+    //     Refusal returns `Handled`, never `Passthrough`, for the third time in
+    //     this function and for the same reason: `Passthrough` leaves `req.text`
+    //     on the ready-label marker, which is exactly what the
+    //     `webhook_ready_label_dispatch` INTENT_GUARD triggers on — it would
+    //     re-prompt the LLM until it dispatched the ticket this gate just
+    //     refused. Zero tasks created here and a guard-driven dispatch two
+    //     steps later is not a gate.
+    if let Some(held_by) =
+        crate::webhook_dispatch::operator_held_label(labels.iter().map(String::as_str))
+    {
+        let owner_repo = location.owner_repo();
+        warn!(
+            event = "ready_label_operator_held",
+            repo = %owner_repo,
+            num = location.number,
+            held_by = %held_by,
+            "ready_label_handler: `ready` event on a ticket an operator is holding —              refused before task creation"
+        );
+
+        // Operator-visible record. As at the two gates above, no `task_id`
+        // exists yet by construction, so the audit target is the issue
+        // reference itself.
+        if let Err(e) = db
+            .log_audit_event(
+                session_id,
+                "ready_label_operator_held",
+                &format!("{}#{}", owner_repo, location.number),
+                None,
+                Some("dispatch_refused"),
+                Some(&format!(
+                    "repo={} number={} held_by={} refused=operator_held",
+                    owner_repo, location.number, held_by
+                )),
+                Some(trace_id),
+            )
+            .await
+        {
+            warn!(
+                event = "ready_label_audit_log_failed",
+                repo = %owner_repo,
+                num = location.number,
+                error = %e,
+                "ready_label_handler: failed to write operator-held refusal audit event \
+                 (non-fatal)"
+            );
+        }
+
+        return VerdictAction::Handled {
+            pre_digest: format_operator_held_pre_digest(&location, held_by),
         };
     }
 
@@ -614,18 +722,18 @@ pub(crate) fn parse_ready_label_location(text: &str) -> Option<ReadyLabelLocatio
 /// the mika#2084 seat gate costs no extra round trip. Returns a descriptive
 /// error string on failure — which the caller turns into a passthrough, exactly
 /// as it did before the labels were added.
-async fn fetch_issue_body_and_labels(
-    loc: &ReadyLabelLocation,
+pub async fn fetch_issue_body_and_labels_via_gh(
+    owner_repo: &str,
+    number: u64,
     token: &str,
 ) -> Result<(String, Vec<String>), String> {
-    let owner_repo = loc.owner_repo();
-    let number_str = loc.number.to_string();
+    let number_str = number.to_string();
     let args = [
         "issue",
         "view",
         &number_str,
         "--repo",
-        &owner_repo,
+        owner_repo,
         "--json",
         "body,labels",
     ];
@@ -648,6 +756,35 @@ async fn fetch_issue_body_and_labels(
         })
         .unwrap_or_default();
     Ok((body, labels))
+}
+
+/// Pre-digest for a `ready` event on a ticket an operator is holding
+/// (mika#2263 défaut (c)).
+///
+/// Opens with `<ready_label_handler>` for the same load-bearing reason as the
+/// two refusals below it: any text still matching the
+/// `webhook_ready_label_dispatch` trigger would have the guard demand the very
+/// dispatch this refusal exists to prevent.
+///
+/// Names the issue AND the label holding it, because the operator reading this
+/// needs to know which label to remove to release the ticket — "refused" alone
+/// sends them looking.
+fn format_operator_held_pre_digest(loc: &ReadyLabelLocation, held_by: &str) -> String {
+    let owner_repo = loc.owner_repo();
+    let number = loc.number;
+    format!(
+        "<ready_label_handler>\n\
+         DISPATCH REFUSED — {owner_repo}#{number} carries the `{held_by}` label.\n\n\
+         `{held_by}` means someone is holding this ticket: the autonomous loop does not \
+         dispatch it, whatever `ready` events arrive for it (stale, redelivered, or applied \
+         by hand). The same label already keeps it out of the auto-pull feeder — this gate \
+         is the other half of that hold.\n\n\
+         No task was created. Do NOT call run_claude_pilot or run_claude_pilot_groom for \
+         this issue. Acknowledge and end the turn; use send_message only if the operator \
+         asked to be told.\n\n\
+         To release the ticket, an operator removes `{held_by}` and re-applies `ready`.\n\
+         </ready_label_handler>"
+    )
 }
 
 /// Pre-digest for a `ready` label on an issue another dispatch seat owns
