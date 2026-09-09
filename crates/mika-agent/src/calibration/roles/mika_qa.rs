@@ -971,27 +971,50 @@ async fn run_negative_test_invariant_gate(
         "../../../tests/eval/calibration_fixtures/mika-qa/negative_test_invariant_gate_out_of_perimeter.md"
     );
 
-    // The production rule, quoted rather than paraphrased — the scenario measures
-    // adherence to what `skills/bundled/qa-review/system_prompt.md` Step 2.5.4b says.
-    let system = "You are mika-qa. Apply Step 2.5.4b (implicit negative-test AC, \
-         path-conditional): a PR whose changed files touch \
-         crates/mika-agent/src/server/, crates/mika-agent/src/task_engine/ or \
-         crates/mika-agent/src/tools/ and that changes behavior there, but whose diff \
-         adds no negative assertion naming the invariant the change could violate, \
-         fails an implicit structural AC and must receive `VERDICT: block[ac]` with the \
-         invariant named. On the same perimeter an AC of the form \"no test \
-         regressions\" is NOT CI-deferrable — it is Structural and verified against the \
-         diff. Out of that perimeter Step 2.5.4b does not apply. Emit a verdict.";
+    // The scenario consumes the PRODUCTION prompt verbatim — `include_str!` of the
+    // very file this PR edits — not a paraphrase of it. That coupling is what makes
+    // the red-before/green-after calibration meaningful: revert
+    // `skills/bundled/qa-review/system_prompt.md` to its pre-PR content and this
+    // scenario fails, because the rule under test is no longer in the prompt. A
+    // scenario that restated 2.5.4b inline would pass with or without the fix and
+    // would measure nothing (mika#2264 AC5).
+    const QA_REVIEW_PROMPT: &str =
+        include_str!("../../../../../skills/bundled/qa-review/system_prompt.md");
+
+    // Harness preamble — identical in both the red and green runs, so the ONLY
+    // variable between them is the prompt body above. It neutralises the steps that
+    // are out of scope here (tool calls, pipeline artifacts, GitHub posting) without
+    // touching the AC-classification steps the scenario measures.
+    const HARNESS_PREAMBLE: &str = "\
+        CALIBRATION HARNESS — OFFLINE REVIEW EXERCISE.\n\
+        You have NO tools in this turn. Do not attempt any tool call, and do not \
+        report the absence of tools as a finding. The PR under review is supplied \
+        verbatim in the user message: its metadata, its acceptance criteria, its \
+        changed-file list and its diff summary. Treat Step 1 (qa_pr_view), Step 2/2E \
+        (pipeline guards) and Step 3a (pr diff) as ALREADY PERFORMED AND GREEN, and \
+        treat DEPTH as code-level. Do not post to GitHub (Step 5); emit the verdict \
+        body as your reply text instead. Perform Step 2.5 (AC classification and the \
+        implicit ACs) and Step 3b against the supplied diff, then emit the verdict \
+        body exactly as the prompt below specifies, starting with the VERDICT line.\n\n\
+        ── The mika-qa review prompt follows verbatim. ──\n\n";
+
+    let system = format!("{HARNESS_PREAMBLE}{QA_REVIEW_PROMPT}");
 
     let ask = |fixture: &str| LlmRequest {
         model: provider.model_name().to_string(),
-        system: Some(system.to_string()),
+        system: Some(system.clone()),
         messages: vec![LlmMessage {
             role: LlmRole::User,
             content: LlmContent::Text(fixture.to_string()),
         }],
         tools: None,
-        max_tokens: 2000,
+        // The production prompt asks for a full verdict body (VERDICT/DEPTH/REASON +
+        // NEGATIVE-TEST + DIFF ANALYSIS + PLAN-AC VERIFICATION). The 2000-token budget
+        // the shorter scenarios use is not enough here: mika-qa's model is a reasoning
+        // model, and a first run at 2000 spent the whole budget on `reasoning_content`,
+        // returning empty text. mika-qa itself runs at 16384 (`~/.mika/agents/mika-qa/
+        // config.toml`); 12000 leaves room for reasoning plus the body.
+        max_tokens: 12000,
         thinking: None,
     };
 
@@ -1008,6 +1031,31 @@ async fn run_negative_test_invariant_gate(
         Err(e) => return llm_error_result(ID, e, start.elapsed().as_millis() as u64),
     };
     let negative_text = negative.text().to_lowercase();
+
+    // Optional transcript dump — the calibration's own evidence surface. Without the
+    // raw verdicts a red/green run reports only PASS/FAIL, which is a claim about the
+    // run rather than evidence from it. Set MIKA_CALIBRATION_DUMP_DIR to capture them.
+    if let Ok(dir) = std::env::var("MIKA_CALIBRATION_DUMP_DIR") {
+        let dir = std::path::PathBuf::from(dir);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("Warning: could not create dump dir {}: {e}", dir.display());
+        } else {
+            for (name, resp) in [("in-perimeter", &positive), ("out-of-perimeter", &negative)] {
+                let mut body = resp.text();
+                // A reasoning model can spend its whole budget on `reasoning_content`
+                // and return empty text. Recording that separately is what tells an
+                // empty verdict (budget exhausted) apart from a refused one.
+                if let Some(reasoning) = resp.reasoning() {
+                    body.push_str("\n\n<!-- reasoning_content (not part of the verdict) -->\n");
+                    body.push_str(reasoning);
+                }
+                let path = dir.join(format!("{ID}.{name}.verdict.md"));
+                if let Err(e) = std::fs::write(&path, &body) {
+                    eprintln!("Warning: could not write {}: {e}", path.display());
+                }
+            }
+        }
+    }
 
     let latency = start.elapsed().as_millis() as u64;
     let input_tokens = positive.usage.input_tokens + negative.usage.input_tokens;
@@ -1066,11 +1114,32 @@ async fn run_negative_test_invariant_gate(
         );
     }
 
-    // Negative control — out of perimeter, 2.5.4b must not be the blocking reason.
-    if negative_text.contains("2.5.4b") || negative_text.contains("negative-test ac") {
+    // Negative control — out of perimeter, 2.5.4b must not be the blocking REASON.
+    //
+    // Mentioning 2.5.4b is not the leak: the prompt *requires* a `NEGATIVE-TEST:` line
+    // on every verdict, and the out-of-perimeter form of that line is
+    // `NEGATIVE-TEST: n/a — PR out of perimeter`. An assertion keyed on the mere
+    // string "2.5.4b" would therefore fire on correct behavior. The leak is the rule
+    // *biting* out of perimeter: a `missing` disposition, or a `block[ac]` whose
+    // stated reason is the absent negative test.
+    if negative_text.contains("negative-test: missing") {
         return fail(
             FailureClass::ContractViolation,
-            "Out-of-perimeter PR was judged under 2.5.4b — the rule leaked past its perimeter"
+            "Out-of-perimeter PR received `NEGATIVE-TEST: missing` — the rule leaked past \
+             its perimeter (expected `n/a — PR out of perimeter`)"
+                .to_string(),
+        );
+    }
+    if negative_text.contains("verdict: block[ac]")
+        && (negative_text.contains("negative assertion")
+            || negative_text.contains("negative test")
+            || negative_text.contains("negative-test"))
+        && !negative_text.contains("negative-test: n/a")
+    {
+        return fail(
+            FailureClass::ContractViolation,
+            "Out-of-perimeter PR was blocked on negative-test grounds — the rule leaked past \
+             its perimeter"
                 .to_string(),
         );
     }
