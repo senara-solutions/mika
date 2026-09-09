@@ -201,6 +201,27 @@ Both deliverables that can fire are named here with what happens when they do (m
    not by itself evidence the fix works. The unit test is the evidence; the log check is the
    confirmation that the class was routed, if and when it recurs.
 
+## Architect record
+
+Recorded because a verdict rules on the plan, not on the brief: what the architect stated he read
+this plan as committing to, in his own words (session `1586fa32-dd40-4897-9896-c2a2a820cffc`,
+`Verdict: GROOMED`, 2026-09-09).
+
+- **On the predicate (`body.trim().is_empty()`)** — "Le plan committe ce prédicat avec la prémisse
+  explicite — non vérifiée par lecture de #1744 — que l'arithmétique de deadline borne le retry même
+  sur une condition blanche permanente. C'est un risque nommé, pas caché."
+  *The implementer inherits that unverified premise. If reading #1744's deadline arithmetic shows the
+  retry is not bounded on a permanently-blank response, this is a criterion change: loop back rather
+  than ship around it.*
+- **On the test shape** — "Le plan committe un prédicat pur testé directement, laissant le `warn!` de
+  AC2 à la vérification par relecture humaine plutôt que par suite de test, pour éviter d'ajouter
+  `wiremock` aux dev-deps de `mika-common`."
+
+Three judgement calls were put to the architect and left unruled across both passes; they stand as
+orchestrator decisions, uncontradicted rather than endorsed: shipping at all on n=1 (his first-pass
+citation A2 quotes the plan's own argument for it), declining the `ParseError` per-stage split, and
+the p1-important → p2-normal re-qualification.
+
 ## Files touched
 
 - `crates/mika-common/src/llm/openai.rs` — the guard, the predicate, the tests.
