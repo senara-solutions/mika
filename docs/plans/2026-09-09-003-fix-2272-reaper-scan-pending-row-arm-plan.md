@@ -122,3 +122,8 @@ Le watchdog #959 `check_callback_process_liveness` filtre `in_progress` sur la
 corriger change qui marque `failed` une row dont le process est mort, ce qui a
 son propre rayon d'action et sa propre course avec le moniteur de spawn. Ticket
 distinct, pas un bundle.
+
+## Acceptance criteria
+- AC1 scan la row porteuse du pid (in_progress ET callback pending) — test two-surface.
+- AC2 disposition armée (REAP_ENABLED=1) — pilote réel vivant+muet trouvé ET tué (test intégration via harness #2265).
+- AC3 build+clippy-D+tests verts.
