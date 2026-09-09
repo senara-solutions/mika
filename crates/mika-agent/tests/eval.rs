@@ -63,6 +63,7 @@ mod eval {
     mod test_internal_tagging;
     mod test_kg_budget_757;
     mod test_max_steps_continuation;
+    mod test_merge_identity_2248;
     mod test_multi_step;
     mod test_multi_turn_persistence;
     mod test_per_corpus_fairness_927;
