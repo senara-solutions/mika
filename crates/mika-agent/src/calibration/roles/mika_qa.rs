@@ -1083,8 +1083,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scenario_count_is_seven() {
-        assert_eq!(SCENARIOS.len(), 7);
+    fn scenario_count_is_eight() {
+        assert_eq!(SCENARIOS.len(), 8);
     }
 
     #[test]
