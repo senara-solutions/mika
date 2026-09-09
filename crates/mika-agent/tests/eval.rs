@@ -11,6 +11,10 @@ mod eval {
     pub mod scenarios;
     pub mod trace;
 
+    // Fixtures de processus réels partagées (mika#2265, AC2) : `spawn_live_child`
+    // & co., extraites de test_pilot_silent_stall_reaper.rs.
+    pub mod process_fixtures;
+
     // Golden dataset: 25 curated scenarios for end-to-end quality testing (#339)
     pub mod golden;
 

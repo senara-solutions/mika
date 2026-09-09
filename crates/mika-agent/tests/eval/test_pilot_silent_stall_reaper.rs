@@ -25,7 +25,6 @@
 //! a `mika`-sized checkout here would buy a slower suite and the same answer.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime};
@@ -37,6 +36,11 @@ use mika_agent::skills::SkillRegistry;
 use mika_agent::task_engine::dispatcher::TaskDispatcher;
 use mika_agent::task_engine::engine::TaskEngine;
 use mika_agent::tools::default_tools;
+
+// Fixtures de processus réels (mika#2265, AC2) : extraites de ce fichier vers un
+// module partagé, commentaires load-bearing inclus — le fix reaper de mika#2272
+// les réutilise pour ses assertions cycle-de-vie-process.
+use super::process_fixtures::{kill_pid, spawn_and_reap_child, spawn_live_child};
 
 const AGENT_ID: &str = "mika";
 
@@ -85,69 +89,6 @@ fn test_dispatcher(db: AsyncDatabase, armed: bool) -> Arc<TaskDispatcher> {
         settings,
         pr_reviews_posted: None,
     })
-}
-
-/// A real, killable child. `sleep 600` outlives every test in this file, so a
-/// case that asserts "not reaped" is asserting on a process that is genuinely
-/// still alive rather than on a race.
-///
-/// Two details of this fixture are load-bearing, and both exist to make it
-/// match production rather than to make the test pass.
-///
-/// **`process_group(0)`** — the executor spawns every dispatch as a process
-/// group leader (`skills/executor.rs`), and `kill_process_gracefully` signals
-/// the **group** first. That first attempt reports success whether or not a
-/// matching group exists: `/bin/kill -TERM -<n>` exits 0 on this platform even
-/// when no such group is there, so the single-PID fallback behind the `||` is
-/// never reached. A child spawned without a group of its own would therefore
-/// receive no signal at all, the kill would report failure, the reaper would
-/// (correctly) decline to transition a task whose process it could not dispose
-/// of — and the test would be measuring its own fixture rather than the code.
-///
-/// **The reaping thread** — `is_process_alive` tests `/proc/<pid>/stat`, which
-/// a **zombie** still has. In production the executor's `tokio::spawn` awaits
-/// the child, so the zombie is reaped the instant it dies. This thread
-/// reproduces that, and nothing more.
-fn spawn_live_child() -> (i64, u64) {
-    use std::os::unix::process::CommandExt;
-    let mut child = Command::new("sleep")
-        .arg("600")
-        .process_group(0)
-        .spawn()
-        .expect("spawn sleep");
-    let pid = i64::from(child.id());
-    let start_time = mika_agent::task_engine::process_liveness::read_process_start_time(child.id())
-        .expect("read child start time");
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    (pid, start_time)
-}
-
-fn kill_pid(pid: i64) {
-    let _ = Command::new("kill").arg("-9").arg(pid.to_string()).output();
-}
-
-/// A PID whose process is genuinely **gone** — killed *and reaped*.
-///
-/// [`spawn_live_child`] leaks its handle, which is right for the live cases but
-/// wrong here: an unreaped child becomes a zombie, `/proc/<pid>/stat` survives
-/// with its original start time, and `is_same_process_alive` correctly answers
-/// *alive*. A test built on a zombie would assert the opposite of what it
-/// claims. So this one waits on the child before returning.
-fn spawn_and_reap_child() -> (i64, u64) {
-    use std::os::unix::process::CommandExt;
-    let mut child = Command::new("sleep")
-        .arg("600")
-        .process_group(0)
-        .spawn()
-        .expect("spawn sleep");
-    let pid = i64::from(child.id());
-    let start_time = mika_agent::task_engine::process_liveness::read_process_start_time(child.id())
-        .expect("read child start time");
-    child.kill().expect("kill child");
-    child.wait().expect("reap child");
-    (pid, start_time)
 }
 
 fn set_mtime(path: &Path, secs_ago: u64) {
