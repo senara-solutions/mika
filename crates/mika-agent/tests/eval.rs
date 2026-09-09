@@ -11,6 +11,10 @@ mod eval {
     pub mod scenarios;
     pub mod trace;
 
+    // Harness eval multi-agents : N `agent_id` sur une base container partagée,
+    // pour que la classe fan-out cesse d'être invisible (mika#2265).
+    pub mod multi_agent;
+
     // Fixtures de processus réels partagées (mika#2265, AC2) : `spawn_live_child`
     // & co., extraites de test_pilot_silent_stall_reaper.rs.
     pub mod process_fixtures;
