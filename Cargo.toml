@@ -149,6 +149,10 @@ tempfile = "3"
 serial_test = "3"
 # HTTP mock server for wiremock-style integration tests (mika-gateway egress-search)
 wiremock = "0.6"
+# mtime stamping for the mika#2249 worktree-activity probe tests. std can read
+# mtimes but not set them, and those tests need backdated worktrees to pin the
+# reaper threshold. Already in the tree as a transitive dep of `tar`.
+filetime = "0.2"
 
 # Concurrent collections
 dashmap = "6"
