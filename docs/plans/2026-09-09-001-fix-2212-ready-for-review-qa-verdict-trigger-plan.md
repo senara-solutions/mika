@@ -131,9 +131,37 @@ déjà éprouvé de `qa-review-webhook-success` (mika#1711).
 mika#1822 a changé la table de routage sans changer le contrat côté agent, et rien n'a
 échoué. C'est le défaut fondateur, et il est plus général que ce ticket. Le plan ajoute un
 test qui échoue si une action `pull_request` routée vers `mika-qa` par `route_event`
-n'est déclarée par **aucun** skill de la famille qa-review (mot-clé de déclenchement ou
-énumération de `qa-review`). La prochaine action ajoutée à la table de routage sans
-handler ne compilera pas verte.
+n'est couverte par aucun handler.
+
+**Emplacement tranché (F3) : côté `mika-gateway`, sans dépendance de crate nouvelle.**
+Mesuré : `crates/mika-gateway/Cargo.toml` dépend de `mika-common` et `mika-a2a`, **pas** de
+`mika-agent` ; `crates/mika-agent/Cargo.toml` ne dépend pas de `mika-gateway`. Aucune crate
+ne voit aujourd'hui à la fois `route_event` et les manifestes bundled. La résolution est de
+ne pas créer la dépendance : le test vit dans `mika-gateway` (où `route_event` est une `pub
+fn` appelable directement) et lit les manifestes **depuis le disque**, par un chemin relatif
+à `env!("CARGO_MANIFEST_DIR")` vers `skills/bundled/` — ce répertoire est versionné dans le
+dépôt, `include_str!` n'en est qu'un consommateur. Écrire le test côté `mika-agent`
+imposerait d'ajouter `mika-gateway` aux dépendances de `mika-agent` pour un seul test :
+refusé.
+
+**Terme de couverture (disjonction à deux termes, tous deux lus sur disque) :**
+une action `a` est couverte si
+
+- **T1** — un `skills/bundled/*/skill.toml` de la famille qa-review déclare `a` comme
+  mot-clé de déclenchement ; **ou**
+- **T2** — `skills/bundled/qa-review/system_prompt.md` contient la sous-chaîne littérale
+  `pull_request.<a>`.
+
+T2 existe parce que `qa-review` est `always_on = true` : `opened`, `synchronize` et
+`review_requested` ne sont couverts par aucun mot-clé de manifeste et n'ont pas à l'être —
+ils sont couverts par l'énumération de `qa-review:5`, qui est le contrat qu'ils ont
+réellement. Une recherche de sous-chaîne littérale sur `pull_request.opened` est mécanique,
+pas de l'analyse de prose : la forme est exacte. C'est précisément le terme qui manquait
+pour `ready_for_review` et dont l'absence n'a rien fait échouer.
+
+L'ensemble des actions est **lu depuis `route_event`** en itérant sur une liste d'actions
+candidates et en ne retenant que celles qui rendent `Some("mika-qa")` — jamais recopié en
+dur : c'est le recopiage qui laisserait passer la prochaine divergence.
 
 ### D-D — Hors périmètre, avec ticket de suite nommé
 
@@ -150,6 +178,28 @@ handler ne compilera pas verte.
   (dispatch-FAIL en général). **Ticket de suite à ficher.**
 - **`DROP_REVIEWER_FILTER`** (mika#1655) : inchangé, et sans effet ici — #2210 était
   `ready_for_review`, pas `review_requested`.
+
+### D-E — `isDraft == true` et la garde marker répondent à deux questions différentes (F5)
+
+Le handler saute sur `isDraft == true` ; la garde marker de `qa-review:110-131` item 4
+répute une PR vérifiée si `marker == yes` **même en draft**. Ces deux règles ne se
+contredisent pas — elles portent sur des questions distinctes, et l'incident lui-même le
+montre :
+
+- **Éligibilité au dispatch** (question du handler) : *cette transition draft→ready
+  justifie-t-elle de dépenser un tour de revue maintenant ?* Si la PR est redevenue draft
+  entre l'émission de l'événement et son traitement, l'opérateur a **retiré** son signal de
+  disponibilité. Sauter est la bonne réponse, et c'est déjà la règle du précédent :
+  `qa-review-webhook-success` step 2 exige `draft: false`.
+- **Traitement du boilerplate rescue** (question de `qa-review`) : *une fois la revue
+  engagée, la boilerplate « Auto-rescued PR » doit-elle bloquer le verdict ?* L'item 4 dit
+  non quand le marker est `yes`. Il ne dit rien sur l'opportunité de déclencher une revue.
+
+**Règle tranchée :** l'éligibilité au dispatch appartient au handler et le draft y est
+disqualifiant ; le sort de la boilerplate rescue appartient à `qa-review` et le marker y
+est décisif. Le cas rescue-draft `marker: yes` + re-draft n'est donc pas un verdict perdu :
+il est un verdict **non déclenché**, et le geste qui le déclenche reste l'undraft — celui
+que ce ticket rend enfin opérant. Aucune divergence n'est laissée implicite.
 
 ## Phases
 
@@ -183,29 +233,58 @@ déclenché du tout.
 ### Phase 1 — Le handler `qa-review-webhook-ready`
 
 Nouveau skill bundled `skills/bundled/qa-review-webhook-ready/`, calqué sur
-`qa-review-webhook-success/` :
+`qa-review-webhook-success/`.
 
-- `skill.toml` : `always_on = false`, `dependencies = ["qa-review"]`,
-  `[triggers] keywords = ["ready_for_review", "PR ready_for_review", "ready for review", "undraft"]`.
-  Enregistrement dans `crates/mika-agent/src/bundled_skills.rs` selon le motif existant.
-- `system_prompt.md` : point d'entrée webhook, impératif « ne termine pas le tour sans
-  agir », et chemin de décision aligné sur celui de `qa-review-webhook-success` :
-  1. Corréler le numéro de PR depuis la première ligne de l'événement.
-  2. Sauter si hors périmètre (dépôt non révisable, auteur humain avec relecteur désigné).
-  3. Sauter si `isDraft == true` — un `ready_for_review` suivi d'un re-draft.
-  4. Sauter si une review de `mika-platform-qa` existe déjà **au SHA de tête courant**
-     (`commit_id == pr.headRefOid`) — la déduplication au SHA, pas au numéro de PR.
-     C'est ce qui empêche l'undraft répété de produire des verdicts en double, et c'est
-     ce qui fait que la review périmée de #2202 (2026-09-05, autre SHA) **ne** supprime
-     **pas** la revue fraîche.
-  5. Sinon, appeler `qa-review` — qui possède seule le diff, la vérification plan-AC, la
-     vérification de build et l'émission du verdict. Le handler ne duplique aucune de ces
-     règles.
-  6. Discipline de tour : sur impossibilité de procéder, `send_message` à l'opérateur avec
-     la raison précise, jamais de fin de tour silencieuse.
-- Le handler **ne réimplémente pas** la garde marker rescue : elle vit dans
-  `qa-review/system_prompt.md:110-131` et s'applique telle quelle une fois `qa-review`
-  appelée. Un rescue-draft passé non-draft y est réputé vérifié par l'item 4.
+**`skill.toml`** : `always_on = false`, `dependencies = ["qa-review"]`, et
+
+```toml
+[triggers]
+keywords = ["ready_for_review", "PR ready_for_review"]
+```
+
+**Mots-clés — tranché (F4), sur mesure du moteur d'appariement.**
+`crates/mika-agent/src/skills/matcher.rs:50` (`build_matcher_regex`) et `:119`
+(`message_lower = user_message.to_lowercase()`) apparient **avec limites de mots et sans
+sensibilité à la casse** ; les tests `:714` (`test_word_boundary_bare_bigram_does_not_collide_on_prose`)
+et `:796` (`test_word_boundary_multiword_keyword_requires_adjacent_tokens`) fixent cette
+sémantique. Conséquence directe : le candidat `"ready for review"` (avec espaces) **fire sur
+de la prose ordinaire** — « this PR is ready for review » suffit — et activerait le handler
+sur des tours conversationnels sans rapport. Il est **retiré**. Le candidat `"undraft"` est
+également retiré : il n'apparaît dans aucun texte d'événement produit par
+`format_event_text`, et sa seule fonction serait d'ouvrir une porte conversationnelle que
+personne n'a demandée. Restent les deux formes exactes qui collent à la première ligne
+réellement émise : `ready_for_review` et `PR ready_for_review`.
+
+**Enregistrement — les deux endroits, pas un seul.** Un skill bundled n'est matérialisé pour
+un agent que s'il figure dans son allowlist. `qa-review-webhook-success` apparaît à **deux**
+emplacements de `crates/mika-agent/src/well_known_agents.rs` : `:225` (JSON d'identité de
+`mika-qa`) et `:1968` (test de l'allowlist). `qa-review-webhook-ready` doit être ajouté aux
+deux, en plus de son enregistrement dans `crates/mika-agent/src/bundled_skills.rs` selon le
+motif `BundledSkill` existant. Un oubli de `:225` produit un skill qui existe, se seede dans
+la bibliothèque canonique, et n'est **jamais** lié sous
+`{global_home}/agents/mika-qa/skills/` — invisible, sans échec.
+
+**`system_prompt.md`** : point d'entrée webhook, impératif « ne termine pas le tour sans
+agir », et chemin de décision aligné sur celui de `qa-review-webhook-success` :
+
+1. Corréler le numéro de PR depuis la première ligne de l'événement.
+2. Sauter si hors périmètre (dépôt non révisable, auteur humain avec relecteur désigné).
+3. Sauter si `isDraft == true` — la PR est redevenue draft entre l'événement et le
+   traitement (voir D-E ci-dessous pour pourquoi cela ne contredit pas la garde marker).
+4. Sauter si une review de `mika-platform-qa` existe déjà **au SHA de tête courant**
+   (`commit_id == pr.headRefOid`) — la déduplication au SHA, pas au numéro de PR.
+   C'est ce qui empêche l'undraft répété de produire des verdicts en double, et c'est
+   ce qui fait que la review périmée de #2202 (2026-09-05, autre SHA) **ne** supprime
+   **pas** la revue fraîche.
+5. Sinon, appeler `qa-review` — qui possède seule le diff, la vérification plan-AC, la
+   vérification de build et l'émission du verdict. Le handler ne duplique aucune de ces
+   règles.
+6. Discipline de tour : sur impossibilité de procéder, `send_message` à l'opérateur avec
+   la raison précise, jamais de fin de tour silencieuse.
+
+Le handler **ne réimplémente pas** la garde marker rescue : elle vit dans
+`qa-review/system_prompt.md:110-131` et s'applique telle quelle une fois `qa-review`
+appelée. Un rescue-draft passé non-draft y est réputé vérifié par l'item 4.
 
 ### Phase 2 — Fermer l'énumération de `qa-review`
 
@@ -221,12 +300,19 @@ existe déjà et couvre ce point).
 
 ### Phase 3 — La garde de cohérence routage ↔ handlers (D-C)
 
-Test unitaire, côté `mika-gateway` ou `mika-agent` selon l'accès aux manifestes bundled :
-pour chaque action `a` telle que `route_event("pull_request", Some(a), None) == Some("mika-qa")`,
-affirmer qu'`a` est couverte — soit par un mot-clé de déclenchement d'un skill de la famille
-qa-review, soit par l'énumération de `qa-review/system_prompt.md:5`. L'ensemble des actions
-est lu depuis `route_event`, jamais recopié en dur dans le test : c'est le recopiage qui
-laisserait passer la prochaine divergence.
+Test unitaire dans `crates/mika-gateway` (emplacement tranché en D-C — aucune dépendance de
+crate nouvelle) :
+
+1. Construire l'ensemble `A` des actions `pull_request` routées vers `mika-qa`, en itérant
+   sur une liste d'actions candidates et en filtrant sur
+   `route_event("pull_request", Some(a), None) == Some("mika-qa")`. `A` n'est jamais
+   recopié en dur.
+2. Charger, depuis `env!("CARGO_MANIFEST_DIR")` + chemin relatif vers `skills/bundled/` :
+   les `skill.toml` de la famille qa-review (T1) et le texte de
+   `qa-review/system_prompt.md` (T2).
+3. Pour chaque `a ∈ A`, affirmer T1 ∨ T2 (définis en D-C). Message d'échec nommant l'action
+   découverte et les deux termes manquants, pour que la prochaine divergence se lise sans
+   enquête.
 
 ### Phase 4 — Tests
 
@@ -235,42 +321,95 @@ laisserait passer la prochaine divergence.
 - Manifeste : `qa-review-webhook-ready` déclare des mots-clés (sinon `index.rs:1552` le
   déclare « never activate »), déclare `qa-review` en dépendance, et passe
   `verify_bundled_skills`.
-- Cohérence phase 3 : rouge si l'on retire `ready_for_review` du manifeste du handler,
-  vert avec. **Le rouge-avant se mesure terme par terme** — neutraliser le mot-clé du
-  handler ET, séparément, l'énumération de `qa-review:5`, pour que la garde ne soit pas
-  satisfaite par un seul des deux termes d'une disjonction.
+- Cohérence phase 3 : contrôle rouge-avant **terme par terme**, protocole en trois mesures
+  détaillé sous `## Fire-Disposition`. Ne pas se contenter d'une seule neutralisation : la
+  couverture est une disjonction, un seul terme retiré laisse l'assertion satisfaite.
+- Allowlist : `qa-review-webhook-ready` présent aux deux emplacements de
+  `well_known_agents.rs` (`:225`, `:1968`).
 - `cargo test` (pas seulement `clippy`) sur les crates touchées, plus le test de taille
   des prompts bundled.
 
 ### Phase 5 — Vérification de bout en bout
 
-Sur une PR de test dans le dépôt : ouvrir en draft, marquer non-draft, et constater qu'une
-review `mika-platform-qa` fraîche est postée au SHA de tête. La mesure porte sur la review
-postée (source de vérité selon `qa-review/system_prompt.md:47`), pas sur un log.
+Sur une PR de test dans le dépôt, **les deux branches d'AC2 dans la même session** :
 
-## Critères d'acceptation
+1. Ouvrir en draft, marquer non-draft → une review `mika-platform-qa` fraîche est postée au
+   SHA de tête. (Contrôle positif.)
+2. Re-draft puis re-undraft **sans nouveau commit** → aucun second verdict, la review du
+   SHA courant existant déjà. (Contrôle négatif de la déduplication.)
+3. Pousser un commit, puis undraft → un verdict frais au nouveau SHA, la review du SHA
+   antérieur ne le supprimant pas. (Le cas #2202.)
 
-- **AC1** — `pull_request.ready_for_review` sur une PR non-draft, éligible et non encore
-  revue au SHA de tête déclenche une qa-review qui **poste** une review GitHub.
-  Vérification : phase 5, review de `mika-platform-qa` au `headRefOid` courant.
-- **AC2** — Le skill `qa-review-webhook-ready` existe, s'active par mot-clé sur la première
-  ligne `[GitHub] PR ready_for_review: …`, dépend de `qa-review`, et porte l'impératif
-  de ne pas terminer le tour sans agir. Vérification : manifeste + `verify_bundled_skills`.
-- **AC3** — `qa-review/system_prompt.md:5` énumère `pull_request.ready_for_review`.
-  Vérification : lecture du fichier dans le diff.
-- **AC4** — Un test échoue si une action `pull_request` routée vers `mika-qa` par
-  `route_event` n'est couverte par aucun handler ni par l'énumération de `qa-review`.
-  Vérification : rouge-avant **terme par terme** (mot-clé du handler neutralisé seul, puis
-  énumération neutralisée seule), vert après.
-- **AC5** — Déduplication au SHA : un second `ready_for_review` sur le même SHA de tête,
-  après une review déjà postée par `mika-platform-qa` à ce SHA, ne produit pas de second
-  verdict ; une review à un SHA **antérieur** (cas #2202) ne supprime pas la revue fraîche.
-  Vérification : le chemin de décision du handler l'énonce, et la phase 5 l'exerce.
-- **AC6** — `DROP_SYNCHRONIZE_NO_DIFF` et `DROP_REVIEWER_FILTER` sont **inchangés**.
-  Vérification : absents du diff.
-- **AC7** — La phase 0 a rendu sa disposition, écrite en commentaire sur le ticket #2212
-  (tour-déclenché-sans-post, ou aucun-tour-déclenché), et le ticket de suite éventuel est
-  fiché avec son évidence.
+La mesure porte sur la review postée — source de vérité selon
+`qa-review/system_prompt.md:47` — jamais sur un log. Un contrôle positif seul ne
+distinguerait pas « le handler marche » de « le handler poste toujours ».
+
+## Acceptance criteria
+
+- **AC1** — Le handler `qa-review-webhook-ready` existe, s'active **par appariement moteur**
+  sur la première ligne `[GitHub] PR ready_for_review: …`, déclare exactement les mots-clés
+  `["ready_for_review", "PR ready_for_review"]`, dépend de `qa-review`, et son prompt porte
+  l'impératif de ne pas terminer le tour sans agir.
+  *Vérification :* `skill.toml` + `system_prompt.md` dans le diff ; `verify_bundled_skills`
+  passe ; le skill est enregistré dans `bundled_skills.rs` **et** aux deux emplacements de
+  `well_known_agents.rs` (`:225` identité `mika-qa`, `:1968` test d'allowlist).
+
+- **AC2** — Déduplication au SHA de tête. Un second `ready_for_review` sur le même
+  `headRefOid`, alors qu'une review `mika-platform-qa` existe déjà à ce SHA, ne produit pas
+  de second verdict ; une review à un SHA **antérieur** (cas #2202, review du 2026-09-05) ne
+  supprime **pas** la revue fraîche.
+  *Vérification :* le chemin de décision du handler l'énonce (étape 4, `commit_id ==
+  pr.headRefOid`) ; la phase 5 exerce les deux branches.
+
+- **AC3** — Le test de cohérence routage ↔ handlers passe : pour chaque action `a` telle que
+  `route_event("pull_request", Some(a), None) == Some("mika-qa")`, `a` est couverte par T1
+  (mot-clé d'un `skill.toml` de la famille qa-review) ou T2 (sous-chaîne littérale
+  `pull_request.<a>` dans `qa-review/system_prompt.md`). L'ensemble des actions est dérivé
+  de `route_event`, jamais recopié en dur.
+  *Vérification :* rouge-avant **terme par terme** (voir Fire-Disposition), vert après.
+
+- **AC4** — `qa-review/system_prompt.md:5` énumère `pull_request.ready_for_review` — ce qui
+  est aussi le terme T2 qu'AC3 exige pour cette action.
+  *Vérification :* lecture du fichier dans le diff ; AC3 échoue si la ligne est retirée.
+
+- **AC5** — Bout en bout : une PR non-draft, marker `rescue-pipeline-verified: yes`, CI
+  verte, passée de draft à ready, reçoit une review **postée** par `mika-platform-qa` au SHA
+  de tête courant.
+  *Vérification :* phase 5, sur la review GitHub — source de vérité selon
+  `qa-review/system_prompt.md:47` — et non sur un log.
+
+- **AC6** — La phase 0 a rendu sa disposition (tour-déclenché-sans-post, ou
+  aucun-tour-déclenché), écrite en commentaire sur mika issue#2212, et le ticket de suite
+  éventuel est fiché avec son évidence.
+  *Vérification :* le commentaire existe sur le ticket.
+
+- **AC7** — `DROP_SYNCHRONIZE_NO_DIFF` (`github.rs:894-970`, `audit_events.rs:42`) et
+  `DROP_REVIEWER_FILTER` (mika#1655) sont **inchangés**, et la garde marker de
+  `qa-review:110-131` est **inchangée**.
+  *Vérification :* absents du diff.
+
+## Fire-Disposition
+
+Les détecteurs livrés par ce plan, et ce qui doit arriver quand ils font feu.
+
+| Détecteur | Nature | Disposition |
+|---|---|---|
+| Test de cohérence routage ↔ handlers (phase 3, AC3) | **Gate CI bloquant** | Un feu signifie qu'une action `pull_request` est routée vers `mika-qa` sans handler ni énumération — exactement la classe mika#1822. Le feu **bloque le merge** ; la remédiation est d'ajouter le terme manquant, jamais de retirer l'action de la table de routage pour faire taire le test. |
+| `verify_bundled_skills` sur le nouveau manifeste (AC1) | Gate CI bloquant (existant) | Feu = manifeste invalide ou skill « never activate » (`index.rs:1552`). Bloquant, remédiation dans le manifeste. |
+| Test d'allowlist `well_known_agents.rs:1968` (AC1) | Gate CI bloquant (existant) | Feu = le skill n'est pas dans l'allowlist `mika-qa`. Bloquant. |
+| Test de taille des prompts bundled (phase 2) | Gate CI, avertissement à 95 % | `qa-review` déclare `max_prompt_size = 65536` et était à ~58 Ko à mika#1729. L'ajout d'AC4 est d'une phrase. Si l'avertissement 95 % fait feu, la remédiation est un relèvement motivé du plafond (sous le plafond dur de 80 Ko), **pas** le retrait de l'énumération — c'est elle le terme T2. |
+
+**Rouge-avant, terme par terme (AC3).** La couverture d'AC3 est une **disjonction** T1 ∨ T2 :
+neutraliser un seul terme ne prouve rien, puisque l'autre satisfait encore l'assertion. Le
+contrôle rouge exige donc **deux mesures séparées**, chacune avec l'autre terme neutralisé :
+
+1. Retirer `ready_for_review` des mots-clés du handler, `qa-review:5` neutralisée → rouge.
+2. Retirer `pull_request.ready_for_review` de `qa-review:5`, mot-clé du handler neutralisé
+   → rouge.
+3. Les deux termes en place → vert.
+
+Sans ces deux mesures, un test vert n'établit pas que la garde tient : il peut n'avoir
+jamais évalué que le terme survivant.
 
 ## Hors périmètre
 
