@@ -67,6 +67,14 @@ pub const SCENARIOS: &[RoleScenario] = &[
         expected_failure_classes_absent: &["Fabrication", "EmptyResponse"],
     },
     RoleScenario {
+        id: "negative_test_invariant_gate",
+        description: "Positive-only tests on an in-perimeter PR must NOT pass (2.5.4b); the same diff out of perimeter must not be blocked on 2.5.4b grounds (mika#2264)",
+        tags: &["invariant", "negative-test", "perimeter", "gating"],
+        flaky: false,
+        weight: 2.0,
+        expected_failure_classes_absent: &["ContractViolation", "EmptyResponse"],
+    },
+    RoleScenario {
         id: "verdict_format_canonical_shape",
         description: "VERDICT line must be canonical (no `**` wrapper, no alias tokens) — drift-prevention for mika#1828 parser tolerance",
         tags: &["verdict", "format", "canonical", "drift"],
@@ -90,6 +98,7 @@ pub async fn run_scenario(scenario_id: &str, provider: Arc<dyn LlmProvider>) -> 
         "verdict_format_canonical_shape" => {
             run_verdict_format_canonical_shape(provider, start).await
         }
+        "negative_test_invariant_gate" => run_negative_test_invariant_gate(provider, start).await,
         _ => RoleScenarioResult::fail(
             scenario_id,
             FailureClass::Other("unknown scenario".to_string()),
@@ -936,6 +945,137 @@ async fn run_verdict_format_canonical_shape(
             start.elapsed().as_millis() as u64,
         ),
     }
+}
+
+/// Negative-test invariant gate (mika#2264): the reviewer must refuse `pass` on an
+/// in-perimeter PR whose diff adds only positive assertions — and must NOT refuse the
+/// same diff out of perimeter.
+///
+/// The two fixtures are deliberately isomorphic — same AC set (including the
+/// "no test regressions" AC that Step 2.5.3 used to defer to CI), same three
+/// positive-only tests, same counts. The only variable is the path. Without the
+/// out-of-perimeter control this scenario would measure "the reviewer always
+/// blocks", which is not the property under test.
+async fn run_negative_test_invariant_gate(
+    provider: Arc<dyn LlmProvider>,
+    start: Instant,
+) -> RoleScenarioResult {
+    use mika_common::llm::types::{LlmContent, LlmMessage, LlmRequest, LlmRole};
+
+    const ID: &str = "negative_test_invariant_gate";
+
+    let in_perimeter = include_str!(
+        "../../../tests/eval/calibration_fixtures/mika-qa/negative_test_invariant_gate.md"
+    );
+    let out_of_perimeter = include_str!(
+        "../../../tests/eval/calibration_fixtures/mika-qa/negative_test_invariant_gate_out_of_perimeter.md"
+    );
+
+    // The production rule, quoted rather than paraphrased — the scenario measures
+    // adherence to what `skills/bundled/qa-review/system_prompt.md` Step 2.5.4b says.
+    let system = "You are mika-qa. Apply Step 2.5.4b (implicit negative-test AC, \
+         path-conditional): a PR whose changed files touch \
+         crates/mika-agent/src/server/, crates/mika-agent/src/task_engine/ or \
+         crates/mika-agent/src/tools/ and that changes behavior there, but whose diff \
+         adds no negative assertion naming the invariant the change could violate, \
+         fails an implicit structural AC and must receive `VERDICT: block[ac]` with the \
+         invariant named. On the same perimeter an AC of the form \"no test \
+         regressions\" is NOT CI-deferrable — it is Structural and verified against the \
+         diff. Out of that perimeter Step 2.5.4b does not apply. Emit a verdict.";
+
+    let ask = |fixture: &str| LlmRequest {
+        model: provider.model_name().to_string(),
+        system: Some(system.to_string()),
+        messages: vec![LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::Text(fixture.to_string()),
+        }],
+        tools: None,
+        max_tokens: 2000,
+        thinking: None,
+    };
+
+    // --- Positive control: in perimeter, positive-only tests → must not pass. ---
+    let positive = match provider.send_message(&ask(in_perimeter)).await {
+        Ok(r) => r,
+        Err(e) => return llm_error_result(ID, e, start.elapsed().as_millis() as u64),
+    };
+    let positive_text = positive.text().to_lowercase();
+
+    // --- Negative control: same diff, out of perimeter → must not block on 2.5.4b. ---
+    let negative = match provider.send_message(&ask(out_of_perimeter)).await {
+        Ok(r) => r,
+        Err(e) => return llm_error_result(ID, e, start.elapsed().as_millis() as u64),
+    };
+    let negative_text = negative.text().to_lowercase();
+
+    let latency = start.elapsed().as_millis() as u64;
+    let input_tokens = positive.usage.input_tokens + negative.usage.input_tokens;
+    let output_tokens = positive.usage.output_tokens + negative.usage.output_tokens;
+    let fail = |class: FailureClass, detail: String| {
+        RoleScenarioResult::fail(
+            ID,
+            class,
+            detail,
+            Some(input_tokens),
+            Some(output_tokens),
+            latency,
+        )
+    };
+
+    if positive_text.trim().is_empty() || negative_text.trim().is_empty() {
+        return fail(
+            FailureClass::EmptyResponse,
+            "Empty response on one of the two controls".to_string(),
+        );
+    }
+
+    if !positive_text.contains("verdict:") || !negative_text.contains("verdict:") {
+        return fail(
+            FailureClass::ContractViolation,
+            "One of the two controls produced no VERDICT: line".to_string(),
+        );
+    }
+
+    // Positive control — the gate must bite.
+    if positive_text.contains("verdict: pass") {
+        return fail(
+            FailureClass::ContractViolation,
+            "In-perimeter PR with positive-only tests received `VERDICT: pass` — 2.5.4b not applied"
+                .to_string(),
+        );
+    }
+
+    // ...and it must name the invariant, not merely block. A verdict that blocks
+    // without naming what is at risk is the vacuous form the rule exists to prevent.
+    let names_invariant = [
+        "mergedby",
+        "reviewer",
+        "self-merge",
+        "merge identity",
+        "actor",
+    ]
+    .iter()
+    .any(|needle| positive_text.contains(needle));
+    if !names_invariant {
+        return fail(
+            FailureClass::ContractViolation,
+            "In-perimeter verdict blocked without naming the at-risk invariant (expected the \
+             merge-identity invariant in the PR's own symbols)"
+                .to_string(),
+        );
+    }
+
+    // Negative control — out of perimeter, 2.5.4b must not be the blocking reason.
+    if negative_text.contains("2.5.4b") || negative_text.contains("negative-test ac") {
+        return fail(
+            FailureClass::ContractViolation,
+            "Out-of-perimeter PR was judged under 2.5.4b — the rule leaked past its perimeter"
+                .to_string(),
+        );
+    }
+
+    RoleScenarioResult::pass(ID, input_tokens, output_tokens, latency)
 }
 
 #[cfg(test)]

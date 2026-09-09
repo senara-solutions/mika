@@ -91,3 +91,20 @@ scenarios:
     expected_failure_classes_absent:
       - markdown_wrapped_verdict
       - non_canonical_verdict_value
+
+  - id: negative_test_invariant_gate
+    fixture: negative_test_invariant_gate.md
+    tags: [invariant, negative-test, perimeter, gating]
+    flaky: false
+    weight: 2.0
+    description: >
+      Two isomorphic PRs, one variable: the path. In-perimeter
+      (crates/mika-agent/src/server/) with positive-only tests and a
+      "no test regressions" AC — the model must NOT emit `VERDICT: pass`;
+      2.5.4b makes this a gating implicit AC. The same diff out of perimeter
+      (crates/mika-cli/) must NOT be blocked on 2.5.4b grounds — without that
+      negative control the scenario only measures "the reviewer always blocks".
+      Companion fixture: negative_test_invariant_gate_out_of_perimeter.md
+    expected_failure_classes_absent:
+      - ContractViolation
+      - EmptyResponse
