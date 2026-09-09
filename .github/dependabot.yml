@@ -26,6 +26,38 @@ updates:
         update-types:
           - "minor"
           - "patch"
+    ignore:
+      # sqlite-vec — excluded from ALL automated updates (mika#2142).
+      #
+      # WHY (measured, not suspected): the published `sqlite-vec 0.1.10-alpha.4`
+      # package is incomplete. Its `sqlite-vec.c` `#include`s a file the crate
+      # does not ship, so `cc` cannot compile it and the build dies at the
+      # build-script stage, before any of our code is touched:
+      #
+      #   warning: sqlite-vec@0.1.10-alpha.4: sqlite-vec.c:3772:10:
+      #            fatal error: sqlite-vec-diskann.c: No such file or directory
+      #   error: failed to run custom build command for `sqlite-vec v0.1.10-alpha.4`
+      #
+      # Measured on PR #2114 (run 33617805291, 2026-09-02 10:09Z): both `Check`
+      # and `Docker Build (Dockerfile.agent)` fail on it. Because the bump rides
+      # in the `cargo-minor-patch` GROUP, it reddens every healthy bump batched
+      # with it (miniz_oxide, zlib-rs) — one broken upstream crate blocks the
+      # whole autonomous Dependabot review chain. Recurred on #2224.
+      #
+      # WHY the whole dependency, not just the one bad version: this crate is
+      # pinned with `=` (`Cargo.toml`: `sqlite-vec = "=0.1.7-alpha.10"`) since the
+      # repo's initial commit — it has always been updated by hand, deliberately.
+      # Ignoring only `0.1.10-alpha.4` would let the next incomplete alpha through
+      # and re-open the same red-CI hole without warning.
+      #
+      # WAKE-UP CONDITION (verifiable, one command): when a `sqlite-vec` release
+      # newer than 0.1.10-alpha.4 actually ships the missing file —
+      #   cargo package --list -p sqlite-vec  # or: inspect the .crate from crates.io
+      #   ... and confirm `sqlite-vec-diskann.c` is present
+      # — delete this `ignore` block and bump the pin in `Cargo.toml` in the same
+      # PR. Until then, an update is a manual, verified gesture; the pin is the
+      # source of truth, not Dependabot.
+      - dependency-name: "sqlite-vec"
 
   # GitHub Actions used by the CI/release workflows (all pinned to SHAs).
   - package-ecosystem: "github-actions"
