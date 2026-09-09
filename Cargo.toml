@@ -146,7 +146,7 @@ dialoguer = "0.11"
 
 # Testing
 tempfile = "3"
-serial_test = "3"
+serial_test = "4"
 # HTTP mock server for wiremock-style integration tests (mika-gateway egress-search)
 wiremock = "0.6"
 # mtime stamping for the mika#2249 worktree-activity probe tests. std can read
