@@ -240,7 +240,11 @@ const WEBHOOK_SKILL_DENYLIST: &[&str] = &["dev-groom"];
 /// requests for human reviewers (e.g. the operator) must NOT spin up a full
 /// qa-review (mika#1655). Out of scope: routing other reviewers to other
 /// agents (different agents may want different handlers — see mika#1655 body).
-const QA_REVIEWER_LOGIN: &str = "mika-platform-qa";
+/// Défini une seule fois dans `mika_common::forge_identity` : le même login
+/// décide aussi qui ne peut PAS merger une PR qu'il a approuvée (mika#2248),
+/// et deux littéraux à garder en phase auraient divergé au premier changement
+/// de compte bot.
+const QA_REVIEWER_LOGIN: &str = mika_common::forge_identity::REVIEWER_FORGE_LOGIN;
 
 /// Internal org repos that should route to the well-known mika-dev agent container
 /// without requiring a `github_repos` row. These are org-internal development repos,

@@ -12,6 +12,7 @@ pub mod embedded_dashboard;
 mod handlers;
 pub mod investigate;
 pub mod json_extractor;
+pub mod merge_ready_handler;
 mod milestone_context_handler;
 pub mod openapi;
 pub mod permissions_stream;
