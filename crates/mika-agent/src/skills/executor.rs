@@ -2807,7 +2807,13 @@ fn extract_pr_url(metadata: &Option<String>) -> Option<String> {
 /// mirror of dispatch fields (#958), and the per-class `dispatch_class`. Drift
 /// between the two construction sites would re-introduce the callback-shape bug
 /// class this consolidation prevents (plan Risk 1).
-pub(crate) fn build_callback_task(
+///
+/// `pub` rather than `pub(crate)` since mika#2272: the eval suite seeds
+/// dispatch rows through this builder rather than hand-writing a `NewTask`.
+/// The inert reaper was born of a fixture that wrote a status production never
+/// writes on this row, so the fixture has to come through the production
+/// construction site or it is measuring itself.
+pub fn build_callback_task(
     agent_id: String,
     parent_task_id: Option<String>,
     tool_name: &str,

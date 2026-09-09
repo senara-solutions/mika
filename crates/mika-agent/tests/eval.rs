@@ -86,10 +86,15 @@ mod eval {
     mod test_phantom_retry_guard;
     mod test_phantom_task_row_sweep;
     mod test_pilot_silent_stall_reaper;
+
+    // Le contrôle positif sur processus réel du reaper D1 (mika#2272) : row
+    // `pending` sémée par le chemin de production, pilote authentiquement
+    // vivant, harness multi-agents pour l'attribution.
     mod test_pr_review_idempotency;
     mod test_ready_label_blocked_skip;
     mod test_ready_label_grooming_guard;
     mod test_real_provider_matrix;
+    mod test_reaper_reaps_live_pending_pilot_2272;
     mod test_request_wellformedness;
     mod test_required_tools_gate;
     mod test_schema_divergence;
