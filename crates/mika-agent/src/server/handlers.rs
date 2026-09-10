@@ -1121,6 +1121,13 @@ async fn post_deadline_verdict_if_cut_off(
 
     // Sortie immédiate sur le chemin nominal — pas de résolution de token, pas
     // de log, rien, quand le tour a conclu ou ne portait pas sur une PR.
+    //
+    // `parse_pr_target` est appelé deux fois — ici pour décider si l'on paie la
+    // résolution de token (asynchrone, potentiellement un échange App), et une
+    // seconde fois dans le filet pour construire la requête. Un seul lecteur de
+    // la grammaire, donc aucun risque de divergence ; le coût est un match de
+    // regex sur un chemin déjà rare. Passer une `PrTarget` pré-parsée ferait
+    // dépendre le filet d'un parse fait par l'appelant, pour rien.
     if output.deadline_exceeded.is_none() || parse_pr_target(&req.text).is_none() {
         return;
     }

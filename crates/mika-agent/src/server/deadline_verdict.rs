@@ -130,27 +130,37 @@ pub fn parse_pr_target(text: &str) -> Option<PrTarget> {
         });
     }
     let (_action, repo, pr_number) = parse_pr_action_event(text)?;
-    Some(PrTarget { repo, pr_number })
+    Some(PrTarget {
+        repo: repo.to_string(),
+        pr_number,
+    })
 }
 
-/// La clé du registre anti-double-post, dans le format que `run_gh` écrit.
+/// Le registre anti-double-post porte-t-il déjà une review pour cette PR ?
 ///
-/// `make_pr_dedup_key` (`skills::builtin_handlers`) compose
-/// `{repo}|{numéro_normalisé}`, avec `__default__` quand l'appel `gh pr review`
-/// n'a pas porté de `--repo`. On teste les deux formes : un tour QA qui poste
-/// sans `--repo` a bien posté, et le manquer ferait re-poster le filet — soit
-/// exactement le double-post qu'AC3 interdit.
+/// Le format de clé appartient à `builtin_handlers::format_pr_dedup_key`, qui est
+/// aussi ce qu'écrit `run_gh` sur succès de `gh pr review` — on l'appelle plutôt
+/// que de le recomposer, faute de quoi la même grammaire vivrait à deux endroits
+/// et dériverait en silence dans les deux sens : une clé manquée re-poste une
+/// review, une clé fabriquée laisse la PR muette.
+///
+/// **Deux formes testées, pas une.** `make_pr_dedup_key` met `__default__` à la
+/// place du dépôt quand l'appel `gh pr review` n'a pas porté de `--repo`. Un tour
+/// QA qui poste sans `--repo` a bel et bien posté ; manquer cette forme ferait
+/// re-poster le filet — le double-post exact qu'AC3 interdit.
 fn session_has_review_for(
     registry: &DashMap<String, HashSet<String>>,
     session_id: &str,
     target: &PrTarget,
 ) -> bool {
+    use crate::skills::builtin_handlers::format_pr_dedup_key;
+
     let Some(posted) = registry.get(session_id) else {
         return false;
     };
     let number = target.pr_number.to_string();
-    posted.contains(&format!("{}|{}", target.repo, number))
-        || posted.contains(&format!("__default__|{number}"))
+    posted.contains(&format_pr_dedup_key(Some(&target.repo), &number))
+        || posted.contains(&format_pr_dedup_key(None, &number))
 }
 
 /// Le corps du verdict de secours (AC1).
@@ -272,7 +282,10 @@ where
             registry
                 .entry(input.session_id.to_string())
                 .or_default()
-                .insert(format!("{}|{}", target.repo, target.pr_number));
+                .insert(crate::skills::builtin_handlers::format_pr_dedup_key(
+                    Some(&target.repo),
+                    &target.pr_number.to_string(),
+                ));
             warn!(
                 event = DEADLINE_VERDICT_EVENT,
                 agent_id = %input.agent_id,
