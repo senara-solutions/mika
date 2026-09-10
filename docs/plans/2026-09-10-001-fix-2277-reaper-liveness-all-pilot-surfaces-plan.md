@@ -210,6 +210,51 @@ merge**. Pas d'auto-merge.
    classe « stall SDK » est moins bien établie que n=3 le laissait croire. À
    porter dans le ticket de suivi si la question 1 se confirme.
 
+## Fire-Disposition
+
+Deux livrables de ce plan sont de classe détecteur. Ce que chacun fait **quand il
+tire** est fixé ici, avant l'implémentation, plutôt que découvert au premier feu.
+
+### Les tests négatifs N1–N4 (AC2)
+
+- **Disposition : halt-and-surface.** Un N1..N4 rouge arrête la suite et rend la
+  ligne d'assertion échouée. Il n'y a pas de mode « avertir et continuer » : ces
+  quatre tests sont la porte de AC2, et un prédicat trop permissif est
+  exactement le défaut que ce ticket répare.
+- **Violations préexistantes : aucune, par construction.** Le prédicat conjonctif
+  n'existe pas encore ; N1..N4 naissent avec lui. Il n'y a donc rien à
+  grand-parenter, et aucune tolérance transitoire à prévoir.
+- **Propagation : gate CI.** Les quatre tests vivent dans la suite eval de
+  `mika-agent` et échouent la CI de la PR comme n'importe quel test. Le contrôle
+  positif tombe sous la même règle : un contrôle positif rouge veut dire que le
+  reaper ne fauche plus rien, ce qui est un défaut de même gravité qu'un faux
+  positif.
+- **Preuve exigée à la PR :** la sortie de `cargo test -p mika-agent` couvrant le
+  contrôle positif et N1..N4 est collée dans le corps de la PR.
+
+### Le `warn!` d'inertie (AC4)
+
+- **Disposition : emit-and-continue.** Le `warn!` est de l'observabilité : il
+  nomme le `task_id` et la surface dont le signal est indisponible, puis le
+  dispatch sort de la population comme prévu. Il ne bloque pas le tick, ne
+  change pas le statut de la row, et ne devient jamais lui-même une cause de
+  disposition. Un mécanisme de sûreté qui s'arrête parce qu'il n'arrive pas à
+  mesurer serait un pire défaut que celui qu'il signale.
+- **Cadence : au plus une fois par dispatch.** Le reaper passe à chaque
+  `DB_SCAN_INTERVAL_TICKS` ; sans borne, un dispatch aux transcripts coupés
+  produirait une ligne par tick pendant toute sa vie. La borne suit le motif
+  déjà en place pour le détecteur de transcript vide (`PILOT_TRANSCRIPT_REPORTED_KEY`,
+  mika#2040 AC7) : une clé de metadata estampillée après le premier rapport.
+- **Violations préexistantes : attendues, et c'est le but.** Tout dispatch lancé
+  avec `MIKA_LOG_PILOT_TRANSCRIPTS` désactivé, ou avant que ce fix ne soit
+  déployé, tombera hors population et émettra la ligne. Ce n'est pas du bruit à
+  supprimer : c'est la mesure de combien de la flotte le reaper ne voit pas.
+  Aucune tolérance, aucun grand-parentage — la ligne doit sortir dès le premier
+  dispatch concerné.
+- **Ce qui n'est pas un feu :** un dispatch écarté parce qu'une surface est
+  **active** (le pilote est vivant) est le fonctionnement nominal et reste
+  silencieux au niveau `warn`. Seule l'indisponibilité du signal se dit.
+
 ## Vérification
 
 - `cargo test -p mika-agent` — la suite eval, contrôle positif + N1..N4 verts.
