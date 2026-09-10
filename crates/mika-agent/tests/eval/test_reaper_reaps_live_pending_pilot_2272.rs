@@ -96,10 +96,19 @@ impl MessageSender for NoopSender {
 ///
 /// `armed: None` laisse **le défaut de production** décider — c'est la seule
 /// forme qui teste la cause n° 2 plutôt que de la contourner.
-fn dispatcher_for(db: &AsyncDatabase, armed: Option<bool>) -> Arc<TaskDispatcher> {
+///
+/// `pilot_log_dir` (mika#2277) points at a directory the caller owns: the
+/// claude-pilot session log is **derived** as `<pilot_log_dir>/<task-id>.log`,
+/// so it must survive the whole test rather than the `TempDir` created here.
+fn dispatcher_for(
+    db: &AsyncDatabase,
+    armed: Option<bool>,
+    pilot_log_dir: &Path,
+) -> Arc<TaskDispatcher> {
     let tmp = tempfile::tempdir().expect("tmp dir");
     let mut settings = mika_common::config::Settings::load(tmp.path()).expect("load settings");
     settings.pilot_stall_reap_enabled = armed;
+    settings.pilot_log_dir = Some(pilot_log_dir.to_string_lossy().into_owned());
     Arc::new(TaskDispatcher {
         db: db.clone(),
         tier: mika_common::home::AgentTier::Default,
@@ -122,8 +131,16 @@ fn dispatcher_for(db: &AsyncDatabase, armed: Option<bool>) -> Arc<TaskDispatcher
     })
 }
 
-fn engine_for(db: &AsyncDatabase, armed: Option<bool>) -> TaskEngine {
-    TaskEngine::new(db.clone(), dispatcher_for(db, armed))
+fn engine_for(db: &AsyncDatabase, armed: Option<bool>, pilot_log_dir: &Path) -> TaskEngine {
+    TaskEngine::new(db.clone(), dispatcher_for(db, armed, pilot_log_dir))
+}
+
+/// Un répertoire tenant lieu de `/var/log/claude-pilot`, sous le tmp du test
+/// (mika#2277).
+fn pilot_log_dir(root: &Path) -> PathBuf {
+    let dir = root.join("var-log-claude-pilot");
+    std::fs::create_dir_all(&dir).expect("mkdir pilot log dir");
+    dir
 }
 
 /// Un cycle de scan complet (`DB_SCAN_INTERVAL_TICKS` = 60).
@@ -174,6 +191,12 @@ fn declare_worktree(root: &Path, worktree: &Path) -> PathBuf {
 /// [`build_callback_task`]. Si un jour ce n'est plus `pending`, c'est
 /// [`la_row_porteuse_du_pid_est_pending`] qui doit le dire, pas ce helper qui
 /// doit le corriger.
+///
+/// Les **trois** surfaces sont muettes (mika#2277) : depuis que le prédicat est
+/// une conjonction, silencer le seul worktree ne décrit plus un pilote bloqué —
+/// ça décrit la forme des faux positifs du 2026-09-10, que
+/// `test_reaper_liveness_all_surfaces_2277.rs` épingle comme **non** fauchable.
+#[allow(clippy::too_many_arguments)]
 async fn seed_live_dispatch(
     db: &AsyncDatabase,
     agent_id: &str,
@@ -181,6 +204,8 @@ async fn seed_live_dispatch(
     pid: i64,
     start_time: u64,
     declaration_file: &Path,
+    root: &Path,
+    log_dir: &Path,
 ) -> Result<String> {
     let input = serde_json::json!({
         "skill": "self-dev",
@@ -212,6 +237,24 @@ async fn seed_live_dispatch(
         &declaration_file.to_string_lossy(),
     )
     .await?;
+
+    // Les deux surfaces ajoutées par mika#2277, muettes elles aussi : le
+    // transcript déclaré (`inject_pilot_transcript_env` écrit le fichier ET
+    // estampille la clé) et le log claude-pilot dérivé.
+    let transcript = root.join(format!("{id}.jsonl"));
+    std::fs::write(&transcript, b"{\"type\":\"llm_call\"}\n")?;
+    set_mtime(&transcript, STALE_SECS);
+    db.set_task_metadata_field(
+        &id,
+        "pilot_transcript_expected",
+        &transcript.to_string_lossy(),
+    )
+    .await?;
+
+    let log = log_dir.join(format!("{id}.log"));
+    std::fs::write(&log, b"tool result\n")?;
+    set_mtime(&log, STALE_SECS);
+
     Ok(id)
 }
 
@@ -239,6 +282,7 @@ async fn la_row_porteuse_du_pid_est_pending() -> Result<()> {
     let db = h.db(DISPATCHER_AGENT);
 
     let tmp = tempfile::tempdir()?;
+    let log_dir = pilot_log_dir(tmp.path());
     let worktree = seed_worktree(tmp.path(), STALE_SECS);
     let declaration = declare_worktree(tmp.path(), &worktree);
 
@@ -250,6 +294,8 @@ async fn la_row_porteuse_du_pid_est_pending() -> Result<()> {
         pid,
         start_time,
         &declaration,
+        tmp.path(),
+        &log_dir,
     )
     .await?;
 
@@ -303,6 +349,7 @@ async fn un_pilote_vivant_et_muet_est_trouve_et_tue() -> Result<()> {
         .build()?;
 
     let tmp = tempfile::tempdir()?;
+    let log_dir = pilot_log_dir(tmp.path());
     let worktree = seed_worktree(tmp.path(), STALE_SECS);
     let declaration = declare_worktree(tmp.path(), &worktree);
 
@@ -318,6 +365,8 @@ async fn un_pilote_vivant_et_muet_est_trouve_et_tue() -> Result<()> {
         pid,
         start_time,
         &declaration,
+        tmp.path(),
+        &log_dir,
     )
     .await?;
 
@@ -333,7 +382,7 @@ async fn un_pilote_vivant_et_muet_est_trouve_et_tue() -> Result<()> {
     );
 
     // --- Contrôle d'attribution : l'autre agent ne fauche pas cette row ------
-    let mut autre = engine_for(h.db(OTHER_AGENT), None);
+    let mut autre = engine_for(h.db(OTHER_AGENT), None, &log_dir);
     drive_scan(&mut autre).await;
 
     assert_eq!(
@@ -359,7 +408,7 @@ async fn un_pilote_vivant_et_muet_est_trouve_et_tue() -> Result<()> {
     );
 
     // --- Contrôle positif : l'agent propriétaire fauche ----------------------
-    let mut proprietaire = engine_for(h.db(DISPATCHER_AGENT), None);
+    let mut proprietaire = engine_for(h.db(DISPATCHER_AGENT), None, &log_dir);
     assert!(
         is_same_process_alive(pid_u32, start_time),
         "contrôle d'entrée : le pilote est bien vivant au moment où son propre agent scanne — \
@@ -432,6 +481,7 @@ async fn desarme_explicitement_il_observe_sans_faucher() -> Result<()> {
     let db = h.db(DISPATCHER_AGENT);
 
     let tmp = tempfile::tempdir()?;
+    let log_dir = pilot_log_dir(tmp.path());
     let worktree = seed_worktree(tmp.path(), STALE_SECS);
     let declaration = declare_worktree(tmp.path(), &worktree);
 
@@ -444,10 +494,12 @@ async fn desarme_explicitement_il_observe_sans_faucher() -> Result<()> {
         pid,
         start_time,
         &declaration,
+        tmp.path(),
+        &log_dir,
     )
     .await?;
 
-    let mut engine = engine_for(db, Some(false));
+    let mut engine = engine_for(db, Some(false), &log_dir);
     drive_scan(&mut engine).await;
 
     assert_eq!(

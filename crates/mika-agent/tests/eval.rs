@@ -98,6 +98,10 @@ mod eval {
     mod test_ready_label_blocked_skip;
     mod test_ready_label_grooming_guard;
     mod test_real_provider_matrix;
+
+    // La porte de mika#2277 : le prédicat de kill est une conjonction sur les
+    // trois surfaces du pilote. Contrôle positif + N1..N4, même suite.
+    mod test_reaper_liveness_all_surfaces_2277;
     mod test_reaper_reaps_live_pending_pilot_2272;
     mod test_request_wellformedness;
     mod test_required_tools_gate;

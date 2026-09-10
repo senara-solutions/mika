@@ -79,13 +79,19 @@ fn test_db() -> AsyncDatabase {
     AsyncDatabase::new_with_agent(db, AGENT_ID)
 }
 
-/// Build a dispatcher with the reaper's two knobs pinned through `Settings`
+/// Build a dispatcher with the reaper's knobs pinned through `Settings`
 /// rather than through `MIKA_PILOT_STALL_REAP_*`: the env is process-global and
 /// this binary runs its tests concurrently.
-fn test_dispatcher(db: AsyncDatabase, armed: bool) -> Arc<TaskDispatcher> {
+///
+/// `pilot_log_dir` comes from the caller (mika#2277) because the log surface is
+/// **derived** — `<pilot_log_dir>/<task-id>.log` — so it must point at a
+/// directory the test owns and keeps alive for the whole test, not at a
+/// `TempDir` dropped when this function returns.
+fn test_dispatcher(db: AsyncDatabase, armed: bool, pilot_log_dir: &Path) -> Arc<TaskDispatcher> {
     let tmp = tempfile::tempdir().expect("tmp dir");
     let mut settings = mika_common::config::Settings::load(tmp.path()).expect("load settings");
     settings.pilot_stall_reap_enabled = Some(armed);
+    settings.pilot_log_dir = Some(pilot_log_dir.to_string_lossy().into_owned());
     Arc::new(TaskDispatcher {
         db,
         tier: mika_common::home::AgentTier::Default,
@@ -205,6 +211,48 @@ async fn seed_dispatch(
     id
 }
 
+/// A directory standing in for `/var/log/claude-pilot`, under the test's own
+/// tmp root (mika#2277).
+fn pilot_log_dir(root: &Path) -> PathBuf {
+    let dir = root.join("var-log-claude-pilot");
+    std::fs::create_dir_all(&dir).expect("mkdir pilot log dir");
+    dir
+}
+
+/// Silence the two surfaces mika#2277 added — the declared transcript and the
+/// derived claude-pilot session log — for a dispatch already seeded.
+///
+/// **Why every test in this file now calls it.** Since mika#2277 the predicate
+/// is a conjunction over three surfaces, so a fixture that silences only the
+/// worktree no longer describes a stalled pilot: it describes the shape of the
+/// 2026-09-10 false positives, where the worktree was untouched for 46 minutes
+/// while the pilot streamed tool results. That shape must NOT be reaped, which
+/// is exactly what `test_reaper_liveness_all_surfaces_2277.rs` pins. Here, the
+/// point of each case is a *different* term, so the other surfaces are held
+/// silent to keep each control single-term.
+async fn seed_silent_surfaces(
+    db: &AsyncDatabase,
+    root: &Path,
+    log_dir: &Path,
+    task_id: &str,
+    idle_secs: u64,
+) {
+    let transcript = root.join(format!("{task_id}.jsonl"));
+    std::fs::write(&transcript, b"{\"type\":\"llm_call\"}\n").expect("write transcript");
+    set_mtime(&transcript, idle_secs);
+    db.set_task_metadata_field(
+        task_id,
+        "pilot_transcript_expected",
+        &transcript.to_string_lossy(),
+    )
+    .await
+    .expect("stamp pilot_transcript_expected");
+
+    let log = log_dir.join(format!("{task_id}.log"));
+    std::fs::write(&log, b"tool result\n").expect("write pilot log");
+    set_mtime(&log, idle_secs);
+}
+
 /// Drive one full DB-scan cycle (`DB_SCAN_INTERVAL_TICKS` = 60).
 async fn drive_scan(engine: &mut TaskEngine) {
     for _ in 0..60 {
@@ -231,8 +279,9 @@ async fn stalled_pilot_is_detected_and_disposed() {
     let worktree = seed_worktree(tmp.path(), STALE_SECS);
     let declaration = declare_worktree(tmp.path(), &worktree);
 
+    let log_dir = pilot_log_dir(tmp.path());
     let db = test_db();
-    let dispatcher = test_dispatcher(db.clone(), true);
+    let dispatcher = test_dispatcher(db.clone(), true, &log_dir);
     let mut engine = TaskEngine::new(db.clone(), dispatcher);
 
     let (pid, start_time) = spawn_live_child();
@@ -244,6 +293,7 @@ async fn stalled_pilot_is_detected_and_disposed() {
         Some(&declaration),
     )
     .await;
+    seed_silent_surfaces(&db, tmp.path(), &log_dir, &task_id, STALE_SECS).await;
 
     assert_eq!(
         stall_audit_count(&db).await,
@@ -280,15 +330,16 @@ async fn disposition_writes_a_non_cancel_discriminator() {
     let worktree = seed_worktree(tmp.path(), STALE_SECS);
     let declaration = declare_worktree(tmp.path(), &worktree);
 
+    let log_dir = pilot_log_dir(tmp.path());
     let db = test_db();
-    let dispatcher = test_dispatcher(db.clone(), true);
+    let dispatcher = test_dispatcher(db.clone(), true, &log_dir);
     let mut engine = TaskEngine::new(db.clone(), dispatcher);
 
     let (pid, start_time) = spawn_live_child();
     let reason_path = format!("/tmp/mika-cancel-reason-{pid}");
     let _ = std::fs::remove_file(&reason_path);
 
-    seed_dispatch(
+    let task_id = seed_dispatch(
         &db,
         "pilote muet — raison",
         pid,
@@ -296,6 +347,7 @@ async fn disposition_writes_a_non_cancel_discriminator() {
         Some(&declaration),
     )
     .await;
+    seed_silent_surfaces(&db, tmp.path(), &log_dir, &task_id, STALE_SECS).await;
     drive_scan(&mut engine).await;
 
     let reason = std::fs::read_to_string(&reason_path)
@@ -333,11 +385,12 @@ async fn disarmed_it_observes_without_disposing() {
     let worktree = seed_worktree(tmp.path(), STALE_SECS);
     let declaration = declare_worktree(tmp.path(), &worktree);
 
+    let log_dir = pilot_log_dir(tmp.path());
     let db = test_db();
     // Explicitly disarmed. Since mika#2272 this is the opt-out, not the
     // default; `mika_common::config` pins the default and
     // `test_reaper_reaps_live_pending_pilot_2272.rs` exercises it.
-    let dispatcher = test_dispatcher(db.clone(), false);
+    let dispatcher = test_dispatcher(db.clone(), false, &log_dir);
     let mut engine = TaskEngine::new(db.clone(), dispatcher);
 
     let (pid, start_time) = spawn_live_child();
@@ -349,6 +402,7 @@ async fn disarmed_it_observes_without_disposing() {
         Some(&declaration),
     )
     .await;
+    seed_silent_surfaces(&db, tmp.path(), &log_dir, &task_id, STALE_SECS).await;
 
     drive_scan(&mut engine).await;
 
@@ -386,8 +440,9 @@ async fn recent_worktree_write_is_not_reaped() {
     let worktree = seed_worktree(tmp.path(), 5);
     let declaration = declare_worktree(tmp.path(), &worktree);
 
+    let log_dir = pilot_log_dir(tmp.path());
     let db = test_db();
-    let dispatcher = test_dispatcher(db.clone(), true);
+    let dispatcher = test_dispatcher(db.clone(), true, &log_dir);
     let mut engine = TaskEngine::new(db.clone(), dispatcher);
 
     let (pid, start_time) = spawn_live_child();
@@ -399,6 +454,9 @@ async fn recent_worktree_write_is_not_reaped() {
         Some(&declaration),
     )
     .await;
+    // The other two surfaces are held silent so this control neutralises the
+    // worktree term and nothing else (mika#2277).
+    seed_silent_surfaces(&db, tmp.path(), &log_dir, &task_id, STALE_SECS).await;
 
     drive_scan(&mut engine).await;
 
@@ -425,13 +483,14 @@ async fn dead_process_is_not_this_reapers_population() {
     let worktree = seed_worktree(tmp.path(), STALE_SECS);
     let declaration = declare_worktree(tmp.path(), &worktree);
 
+    let log_dir = pilot_log_dir(tmp.path());
     let db = test_db();
-    let dispatcher = test_dispatcher(db.clone(), true);
+    let dispatcher = test_dispatcher(db.clone(), true, &log_dir);
     let mut engine = TaskEngine::new(db.clone(), dispatcher);
 
     let (pid, start_time) = spawn_and_reap_child();
 
-    seed_dispatch(
+    let task_id = seed_dispatch(
         &db,
         "pilote mort — pas notre population",
         pid,
@@ -439,6 +498,7 @@ async fn dead_process_is_not_this_reapers_population() {
         Some(&declaration),
     )
     .await;
+    seed_silent_surfaces(&db, tmp.path(), &log_dir, &task_id, STALE_SECS).await;
 
     drive_scan(&mut engine).await;
 
@@ -453,8 +513,10 @@ async fn dead_process_is_not_this_reapers_population() {
 /// Absence of evidence must not become evidence.
 #[tokio::test]
 async fn undeclared_worktree_is_not_reaped() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let log_dir = pilot_log_dir(tmp.path());
     let db = test_db();
-    let dispatcher = test_dispatcher(db.clone(), true);
+    let dispatcher = test_dispatcher(db.clone(), true, &log_dir);
     let mut engine = TaskEngine::new(db.clone(), dispatcher);
 
     let (pid, start_time) = spawn_live_child();
@@ -466,6 +528,7 @@ async fn undeclared_worktree_is_not_reaped() {
         None,
     )
     .await;
+    seed_silent_surfaces(&db, tmp.path(), &log_dir, &task_id, STALE_SECS).await;
 
     drive_scan(&mut engine).await;
 
@@ -488,8 +551,9 @@ async fn declared_but_missing_worktree_is_not_reaped() {
     let ghost = tmp.path().join("worktree-that-was-removed");
     let declaration = declare_worktree(tmp.path(), &ghost);
 
+    let log_dir = pilot_log_dir(tmp.path());
     let db = test_db();
-    let dispatcher = test_dispatcher(db.clone(), true);
+    let dispatcher = test_dispatcher(db.clone(), true, &log_dir);
     let mut engine = TaskEngine::new(db.clone(), dispatcher);
 
     let (pid, start_time) = spawn_live_child();
@@ -501,6 +565,7 @@ async fn declared_but_missing_worktree_is_not_reaped() {
         Some(&declaration),
     )
     .await;
+    seed_silent_surfaces(&db, tmp.path(), &log_dir, &task_id, STALE_SECS).await;
 
     drive_scan(&mut engine).await;
 
@@ -526,8 +591,9 @@ async fn task_no_longer_in_progress_is_not_reaped() {
     let worktree = seed_worktree(tmp.path(), STALE_SECS);
     let declaration = declare_worktree(tmp.path(), &worktree);
 
+    let log_dir = pilot_log_dir(tmp.path());
     let db = test_db();
-    let dispatcher = test_dispatcher(db.clone(), true);
+    let dispatcher = test_dispatcher(db.clone(), true, &log_dir);
     let mut engine = TaskEngine::new(db.clone(), dispatcher);
 
     let (pid, start_time) = spawn_live_child();
@@ -539,6 +605,7 @@ async fn task_no_longer_in_progress_is_not_reaped() {
         Some(&declaration),
     )
     .await;
+    seed_silent_surfaces(&db, tmp.path(), &log_dir, &task_id, STALE_SECS).await;
     db.update_task_status(&task_id, "completed")
         .await
         .expect("simulate the in-flight callback landing first");
@@ -564,12 +631,14 @@ async fn pid_without_start_time_is_not_reaped() {
     let worktree = seed_worktree(tmp.path(), STALE_SECS);
     let declaration = declare_worktree(tmp.path(), &worktree);
 
+    let log_dir = pilot_log_dir(tmp.path());
     let db = test_db();
-    let dispatcher = test_dispatcher(db.clone(), true);
+    let dispatcher = test_dispatcher(db.clone(), true, &log_dir);
     let mut engine = TaskEngine::new(db.clone(), dispatcher);
 
     let (pid, _start_time) = spawn_live_child();
     let task_id = seed_dispatch(&db, "PID sans start_time", pid, None, Some(&declaration)).await;
+    seed_silent_surfaces(&db, tmp.path(), &log_dir, &task_id, STALE_SECS).await;
 
     drive_scan(&mut engine).await;
 
