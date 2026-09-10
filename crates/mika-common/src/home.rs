@@ -18,14 +18,84 @@ pub enum AgentTier {
     /// Family-tier persona (native French, `tu` register, warm/patient/simple tone,
     /// zero technical jargon, narrow allowlist excluding dev/orchestrator surfaces).
     /// Selected when `MIKA_AGENT_TIER=family` (case-insensitive).
+    ///
+    /// NOTE (mika#2023 AC2): `Family` also serves today as the **fail-closed floor** —
+    /// an unrecognized `MIKA_AGENT_TIER` value resolves here, because it is the most
+    /// restricted tools profile that exists. If `Family` ever gains tools or surface,
+    /// the floor must become an explicit tier of its own rather than riding on a
+    /// product definition. The coupling is acceptable because it is written down and
+    /// dated, not because it is harmless.
+    Family,
+    /// Champion tier — an external tester on a cloud tenant. Selected when
+    /// `MIKA_AGENT_TIER=champion` (case-insensitive).
+    ///
+    /// Carries the **family tools profile** (that is the whole of mika#2023's p0: a
+    /// champion must never inherit `shell-exec`/`tmux`/`git-ops`/`github`-write) and,
+    /// for now, a **placeholder persona** — see [`CHAMPION_PERSONA_PLACEHOLDER`].
+    Champion,
+}
+
+/// The tools axis of a tier: which skill allowlist — and therefore which
+/// `identity.toml` template — an agent of this tier is provisioned with.
+///
+/// Split from [`PersonaProfile`] by mika#2023. Before that split, `identity_toml()`
+/// and `soul_md()` each matched on `AgentTier` directly, so "which tools" and
+/// "which voice" were one decision written twice. The champion tier is exactly the
+/// case that breaks the conflation: it needs the family *sobriety of tools* and does
+/// not need the family *persona* (French, `tu`, family-companion register) — a
+/// champion is an adult external tester, sometimes anglophone, not a relative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolsProfile {
+    /// Full operator surface (`DEFAULT_AGENT_SKILL_ALLOWLIST`).
+    Operator,
+    /// Narrow daily-life surface (`FAMILY_AGENT_SKILL_ALLOWLIST`). The most
+    /// restricted profile that exists, and therefore the fail-closed floor.
     Family,
 }
 
+/// The persona axis of a tier: which `soul.md` template — voice, register,
+/// language — an agent of this tier is provisioned with. Sibling of
+/// [`ToolsProfile`]; see its doc for why the two are separate (mika#2023).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersonaProfile {
+    /// Operator persona (`DEFAULT_SOUL`).
+    Operator,
+    /// Family persona (`FAMILY_SOUL`).
+    Family,
+}
+
+/// PLACEHOLDER (mika#2023) — the champion persona is Vincent's to name; this is
+/// the one site to change when he does.
+///
+/// What a champion's voice should be — a dedicated persona, the family persona
+/// reused, or a narrowed operator persona — is not deducible from code: it is a
+/// choice about what a champion *is* to the person being served. The form
+/// (two-axis split, fail-closed floor) ships without waiting for that answer; the
+/// content stays with him.
+///
+/// **The price of this placeholder, named rather than hidden:** `FAMILY_SOUL`
+/// prescribes "Tu réponds en **français** natif" and freezes a French first-turn
+/// opening, so an *anglophone* champion receives the exact mirror image of the bug
+/// mika#2023 was filed for. That is a register mismatch, not a privilege leak —
+/// the tools axis above is what lifts the p0 — and it disappears the moment this
+/// constant is replaced. Deliberately NOT resolved by keying the persona off the
+/// account locale: that is a product choice wearing a technical default's clothes
+/// (ruled out by Mika Prime, 2026-09-09). See mika#2247.
+pub const CHAMPION_PERSONA_PLACEHOLDER: PersonaProfile = PersonaProfile::Family;
+
 impl AgentTier {
-    /// Resolve the tier from the `MIKA_AGENT_TIER` env var. Unknown values (anything
-    /// outside `{"default", "family"}` after case-folding) fall through to `Default`
-    /// with a single `warn!` log naming the offending value — visible in
-    /// `MIKA_SPIRIT_LOG_FILE`.
+    /// Resolve the tier from the `MIKA_AGENT_TIER` env var.
+    ///
+    /// Absent, empty, and `"default"` resolve to [`AgentTier::Default`] — an unset
+    /// variable is the legitimate shape of the operator workstation, not a
+    /// misconfiguration. A **non-empty unrecognized** value is a different animal:
+    /// it means some upstream (the cloud console, a Helm value, a hand-edited
+    /// ConfigMap) knows about a tier this binary does not, and falling through to
+    /// the operator persona there is how a champion tenant ended up with
+    /// `shell-exec`/`tmux`/`git-ops`/`github`-write in mika#2023. Since that fix,
+    /// an unrecognized value resolves **fail-closed** to the most restricted tools
+    /// profile, still with the single `warn!` naming the offending value (visible
+    /// in `MIKA_SPIRIT_LOG_FILE`).
     pub fn from_env() -> Self {
         match std::env::var("MIKA_AGENT_TIER") {
             Err(_) => Self::Default,
@@ -34,29 +104,85 @@ impl AgentTier {
                 match normalized.as_str() {
                     "" | "default" => Self::Default,
                     "family" => Self::Family,
+                    "champion" => Self::Champion,
                     _ => {
                         warn!(
                             value = %raw,
-                            "MIKA_AGENT_TIER value not recognized; falling through to Default persona"
+                            "MIKA_AGENT_TIER value not recognized; failing closed to the \
+                             most restricted tools tier (mika#2023)"
                         );
-                        Self::Default
+                        Self::FAIL_CLOSED_TIER
                     }
                 }
             }
         }
     }
 
-    fn identity_toml(self) -> &'static str {
+    /// The tier an unrecognized `MIKA_AGENT_TIER` value resolves to — the most
+    /// restricted tools profile that exists. Named rather than inlined so the
+    /// choice is greppable from the `Family` variant's NOTE.
+    const FAIL_CLOSED_TIER: Self = Self::Family;
+
+    /// Which skill surface this tier is provisioned with (tools axis).
+    pub fn tools_profile(self) -> ToolsProfile {
         match self {
-            Self::Default => DEFAULT_IDENTITY,
-            Self::Family => FAMILY_IDENTITY,
+            Self::Default => ToolsProfile::Operator,
+            Self::Family => ToolsProfile::Family,
+            // The whole of mika#2023's p0: family tools for a champion.
+            Self::Champion => ToolsProfile::Family,
+        }
+    }
+
+    /// Which voice this tier is provisioned with (persona axis).
+    pub fn persona_profile(self) -> PersonaProfile {
+        match self {
+            Self::Default => PersonaProfile::Operator,
+            Self::Family => PersonaProfile::Family,
+            Self::Champion => CHAMPION_PERSONA_PLACEHOLDER,
+        }
+    }
+
+    /// The skill allowlist this tier's `identity.toml` template ships.
+    pub fn skill_allowlist(self) -> &'static [&'static str] {
+        match self.tools_profile() {
+            ToolsProfile::Operator => DEFAULT_AGENT_SKILL_ALLOWLIST,
+            ToolsProfile::Family => FAMILY_AGENT_SKILL_ALLOWLIST,
+        }
+    }
+
+    /// Whether family provisioning on disk is the **expected** state for this tier
+    /// — i.e. whether this tier's own templates ARE the family ones, on both axes.
+    ///
+    /// The boot-time and lazy-path tier guards (`mika-agent`'s `server::tier_guard`,
+    /// mika#1962) used to ask this with `tier == AgentTier::Family`, an equality
+    /// comparison the compiler cannot see through: introducing `Champion` — whose
+    /// placeholder persona and allowlist are family's — would have made both guards
+    /// detect drift and `bail!` at startup for the entire champion population, with
+    /// no compile error to announce it (mika#2023 M2). Asking through an exhaustive
+    /// match instead makes the compiler the guardian.
+    ///
+    /// Consequence worth knowing when [`CHAMPION_PERSONA_PLACEHOLDER`] is replaced:
+    /// this then returns `false` for `Champion`, and champions provisioned during
+    /// the placeholder era — family soul on disk, champion tier in env — will refuse
+    /// to boot. That is the guard doing its job (their on-disk persona genuinely no
+    /// longer matches their tier); the remedy is re-provisioning, as it is for every
+    /// other drift mika#1962 catches.
+    pub fn expects_family_provisioning(self) -> bool {
+        matches!(self.tools_profile(), ToolsProfile::Family)
+            && matches!(self.persona_profile(), PersonaProfile::Family)
+    }
+
+    fn identity_toml(self) -> &'static str {
+        match self.tools_profile() {
+            ToolsProfile::Operator => DEFAULT_IDENTITY,
+            ToolsProfile::Family => FAMILY_IDENTITY,
         }
     }
 
     fn soul_md(self) -> &'static str {
-        match self {
-            Self::Default => DEFAULT_SOUL,
-            Self::Family => FAMILY_SOUL,
+        match self.persona_profile() {
+            PersonaProfile::Operator => DEFAULT_SOUL,
+            PersonaProfile::Family => FAMILY_SOUL,
         }
     }
 }
@@ -1188,11 +1314,14 @@ mod tests {
         );
     }
 
-    /// An unknown tier value falls through to Default (with a `warn!` in the
-    /// live path; the test just asserts persona selection).
+    /// An unknown tier value provisions the **most restricted** surface, not the
+    /// operator one (mika#2023 AC2 — this test asserted the fall-through until
+    /// that fix; the fall-through is what put `shell-exec`/`tmux`/`git-ops`/
+    /// `github`-write on a champion tenant). The `warn!` naming the value is
+    /// unchanged and lives in the live path.
     #[test]
     #[serial]
-    fn test_bootstrap_writes_default_persona_on_unknown_tier() {
+    fn test_bootstrap_writes_restricted_persona_on_unknown_tier() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
 
@@ -1201,10 +1330,27 @@ mod tests {
         unsafe { std::env::remove_var("MIKA_AGENT_TIER") };
         res.unwrap();
 
+        let identity = fs::read_to_string(home.join("identity.toml")).unwrap();
+        let parsed: toml::Value = toml::from_str(&identity).unwrap();
+        let allowlist: Vec<&str> = parsed
+            .get("skills")
+            .and_then(|s| s.get("allowlist"))
+            .and_then(|a| a.as_array())
+            .expect("provisioned identity.toml must carry an active allowlist")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        for excluded in ["github", "git-ops", "shell-exec", "tmux"] {
+            assert!(
+                !allowlist.contains(&excluded),
+                "unknown tier must not provision the operator surface (`{excluded}`)"
+            );
+        }
+
         let soul = fs::read_to_string(home.join("soul.md")).unwrap();
         assert!(
-            soul.contains("senior executive assistant"),
-            "unknown tier must fall through to the default operator persona"
+            !soul.contains("senior executive assistant"),
+            "unknown tier must not fall through to the operator persona"
         );
     }
 
@@ -1420,10 +1566,110 @@ mod tests {
         unsafe { std::env::set_var("MIKA_AGENT_TIER", "  family  ") };
         assert_eq!(AgentTier::from_env(), AgentTier::Family);
 
-        // Unknown → Default (fall-through)
-        unsafe { std::env::set_var("MIKA_AGENT_TIER", "quantum") };
-        assert_eq!(AgentTier::from_env(), AgentTier::Default);
+        // mika#2023 AC1 — champion, same case-insensitivity and same trim.
+        unsafe { std::env::set_var("MIKA_AGENT_TIER", "champion") };
+        assert_eq!(AgentTier::from_env(), AgentTier::Champion);
+        unsafe { std::env::set_var("MIKA_AGENT_TIER", "CHAMPION ") };
+        assert_eq!(AgentTier::from_env(), AgentTier::Champion);
 
         unsafe { std::env::remove_var("MIKA_AGENT_TIER") };
+    }
+
+    /// mika#2023 AC3 — the two axes are decoupled, and the champion sits on the
+    /// family tools profile.
+    ///
+    /// The tools assertion is the p0: a champion must be provisioned with the
+    /// family allowlist, so `shell-exec`/`tmux`/`git-ops`/`github` never reach an
+    /// external tester's tenant.
+    #[test]
+    fn mika2023_champion_carries_family_tools() {
+        assert_eq!(AgentTier::Champion.tools_profile(), ToolsProfile::Family);
+        assert_eq!(
+            AgentTier::Champion.skill_allowlist(),
+            FAMILY_AGENT_SKILL_ALLOWLIST
+        );
+        assert_eq!(AgentTier::Champion.identity_toml(), FAMILY_IDENTITY);
+
+        for excluded in ["github", "git-ops", "shell-exec", "tmux", "gh-read-only"] {
+            assert!(
+                !AgentTier::Champion.skill_allowlist().contains(&excluded),
+                "the champion tools profile must not carry `{excluded}`"
+            );
+        }
+    }
+
+    /// mika#2023 AC3 — the champion persona is a placeholder reachable from ONE
+    /// site, and the axes are genuinely independent rather than one match written
+    /// twice.
+    ///
+    /// The single-site property is asserted structurally: `persona_profile`'s
+    /// `Champion` arm returns the named constant, so replacing the constant is the
+    /// whole of the change Vincent's answer requires. A source scan pins that the
+    /// constant is defined exactly once in this module.
+    #[test]
+    fn mika2023_champion_persona_is_a_single_site_placeholder() {
+        assert_eq!(
+            AgentTier::Champion.persona_profile(),
+            CHAMPION_PERSONA_PLACEHOLDER,
+            "the champion persona must be read from the placeholder constant, \
+             never inlined"
+        );
+        assert_eq!(AgentTier::Champion.soul_md(), FAMILY_SOUL);
+
+        // The axes are separable: today Default is the only tier that differs
+        // between them, but the API admits a tier that mixes them — which is the
+        // shape the champion slot needs when it is filled.
+        assert_eq!(AgentTier::Default.tools_profile(), ToolsProfile::Operator);
+        assert_eq!(
+            AgentTier::Default.persona_profile(),
+            PersonaProfile::Operator
+        );
+
+        // Built by concat so this needle does not match itself in the scan below.
+        let definition = concat!("const CHAMPION_PERSONA_", "PLACEHOLDER: PersonaProfile");
+        let source = include_str!("home.rs");
+        assert_eq!(
+            source.matches(definition).count(),
+            1,
+            "the champion persona placeholder must have exactly one definition site"
+        );
+    }
+
+    /// mika#2023 AC2 — fail-closed on an unrecognized value, and ONLY on an
+    /// unrecognized value.
+    ///
+    /// The two controls live in the same test on purpose. The failure this
+    /// closes is "a tier the console knows about, that provisioning does not
+    /// map, emits nothing and lands on the operator persona" — but *absence*
+    /// is the legitimate shape on Vincent's own machine (`MIKA_AGENT_TIER`
+    /// unset = operator). A positive control alone would pass on an
+    /// implementation that fails every start of the operator workstation
+    /// closed, which is the wrong fix wearing the right result.
+    #[test]
+    #[serial]
+    fn mika2023_unrecognized_tier_value_fails_closed_but_absence_stays_default() {
+        // Positive: a non-empty value outside {default, family, champion}
+        // resolves to the most restricted tools tier, not to Default.
+        // Safety: serialized against every other MIKA_AGENT_TIER test.
+        unsafe { std::env::set_var("MIKA_AGENT_TIER", "pro") };
+        let resolved = AgentTier::from_env();
+        assert_ne!(
+            resolved,
+            AgentTier::Default,
+            "an unrecognized tier must never resolve to the operator tier"
+        );
+        assert_eq!(
+            resolved.tools_profile(),
+            ToolsProfile::Family,
+            "an unrecognized tier must resolve to the most restricted tools profile"
+        );
+
+        // Negative, same call site: absence is not an unrecognized value.
+        unsafe { std::env::remove_var("MIKA_AGENT_TIER") };
+        assert_eq!(
+            AgentTier::from_env(),
+            AgentTier::Default,
+            "an unset MIKA_AGENT_TIER is the legitimate operator workstation"
+        );
     }
 }

@@ -314,10 +314,26 @@ pub async fn dispatch_substrate_diagnostic(
         return;
     };
     match ctx.tier {
-        mika_common::home::AgentTier::Family => {
+        // Champion routes with Family, and the arm names it rather than hiding
+        // behind a `_ =>` (mika#2023 AC5): an external tester is not the reader
+        // of a substrate diagnostic any more than a family member is, and a
+        // catch-all would have silently absorbed every future tier into that
+        // judgement. With the arm explicit, the compiler — not a `warn!` — is
+        // what stops the next variant from inheriting a decision nobody made
+        // for it.
+        mika_common::home::AgentTier::Family | mika_common::home::AgentTier::Champion => {
             // Route diagnostic to audit_events; LLM sees only the neutral fallback
             // already in output.content. Fire-and-forget on error — a monitoring
             // gap is not worth blocking the being's turn.
+            //
+            // The reasoning names the tier that was actually resolved rather than
+            // the literal "family-tier" it carried before mika#2023 — two tiers
+            // reach this arm now, and a row that named the wrong one would send an
+            // operator looking at the wrong tenant.
+            let reason = format!(
+                "{tier:?} tier: substrate diagnostic gated from LLM",
+                tier = ctx.tier
+            );
             if let Err(e) = ctx
                 .db
                 .log_audit_event(
@@ -326,7 +342,7 @@ pub async fn dispatch_substrate_diagnostic(
                     tool_name,
                     None,
                     Some(&diagnostic),
-                    Some("family-tier: substrate diagnostic gated from LLM"),
+                    Some(&reason),
                     Some(ctx.trace_id),
                 )
                 .await
