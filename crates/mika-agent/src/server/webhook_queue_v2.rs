@@ -119,6 +119,19 @@ static ISSUE_LABELED_RE: LazyLock<Regex> = LazyLock::new(|| {
 static PR_ACTION_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\[GitHub\] PR (\w+): (\S+)#(\d+)").expect("pr_action regex"));
 
+/// Parse the `[GitHub] PR {action}: {repo}#{pr}` header into its three parts.
+///
+/// Sole reader of [`PR_ACTION_RE`]. Extracted in mika#2276 so the deadline-verdict
+/// net (`server::deadline_verdict`) can name the PR a cut-off turn was reviewing
+/// without carrying a second copy of this regex — a duplicated event grammar is
+/// how two readers of one wire format drift apart (the mika#2158 shape).
+pub(crate) fn parse_pr_action_event(text: &str) -> Option<(String, String, u64)> {
+    let first_line = text.lines().next()?;
+    let caps = PR_ACTION_RE.captures(first_line)?;
+    let pr = caps[3].parse::<u64>().ok()?;
+    Some((caps[1].to_string(), caps[2].to_string(), pr))
+}
+
 /// The GitHub label whose add-event is a dispatch trigger (never coalesce).
 const READY_LABEL: &str = "ready";
 
@@ -159,15 +172,9 @@ pub fn classify_event(text: &str) -> WebhookEventKind {
         }
     }
 
-    if let Some(caps) = PR_ACTION_RE.captures(first_line) {
-        let action = &caps[1];
-        if action == "synchronize"
-            && let Ok(pr) = caps[3].parse::<u64>()
-        {
-            return WebhookEventKind::PullRequestSync {
-                repo: caps[2].to_string(),
-                pr,
-            };
+    if let Some((action, repo, pr)) = parse_pr_action_event(text) {
+        if action == "synchronize" {
+            return WebhookEventKind::PullRequestSync { repo, pr };
         }
         // opened / closed / review_requested / ready_for_review carry distinct
         // downstream semantics (review, milestone advance) — never coalesce.

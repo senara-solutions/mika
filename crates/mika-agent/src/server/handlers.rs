@@ -1093,6 +1093,84 @@ async fn drain_one_webhook(
 const AGENT_ERROR_REPLY: &str =
     "Sorry, I had a hiccup processing your message. Could you try again?";
 
+/// Câblage du filet mika#2276 : poser un verdict sur la PR quand le tour a été
+/// coupé par son enveloppe au lieu de conclure.
+///
+/// Toute la décision vit dans [`crate::server::deadline_verdict`] ; ce qui vit
+/// ici est ce qui ne peut vivre ailleurs — la résolution du token et l'exécution
+/// de `gh`.
+///
+/// **Identité (ADR-008) : PAT d'abord.** Poster une review est une opération
+/// dont GitHub lit l'auteur : le verdict doit apparaître sous l'identité machine
+/// de la QA (`mika-platform-qa`), pas sous l'App partagée si un PAT existe.
+/// `resolve_github_token` est le convertisseur canonique de cette règle — c'est
+/// aussi celui dont mika#2205 a montré que le contourner tue un scan en silence.
+///
+/// Aucune erreur ne remonte : un filet qui fait échouer le traitement du webhook
+/// remplacerait un silence par une panne.
+async fn post_deadline_verdict_if_cut_off(
+    state: &AppState,
+    agent_state: &Arc<AgentState>,
+    output: &agent::AgentOutput,
+    req: &MessageRequest,
+    session_id: &str,
+) {
+    use crate::server::deadline_verdict::{
+        DeadlineVerdictInput, maybe_post_deadline_verdict, parse_pr_target,
+    };
+
+    // Sortie immédiate sur le chemin nominal — pas de résolution de token, pas
+    // de log, rien, quand le tour a conclu ou ne portait pas sur une PR.
+    if output.deadline_exceeded.is_none() || parse_pr_target(&req.text).is_none() {
+        return;
+    }
+
+    let Some(token) = agent_state
+        .settings
+        .resolve_github_token(agent_state.github_app.as_deref())
+        .await
+    else {
+        warn!(
+            event = crate::server::deadline_verdict::DEADLINE_VERDICT_EVENT,
+            agent_id = %agent_state.db.agent_id(),
+            trace_id = %req.request_id,
+            outcome = "no_token",
+            "tour de revue coupé par sa deadline mais aucun token GitHub résolu — \
+             verdict de secours non posté"
+        );
+        return;
+    };
+
+    maybe_post_deadline_verdict(
+        DeadlineVerdictInput {
+            overrun: output.deadline_exceeded,
+            event_text: &req.text,
+            session_id,
+            trace_id: &req.request_id,
+            agent_id: agent_state.db.agent_id(),
+            pr_reviews_posted: Some(&state.pr_reviews_posted),
+        },
+        |request| async move {
+            let pr = request.pr_number.to_string();
+            crate::tools::pr_merge_with_gate::run_gh_subprocess(
+                &[
+                    "pr",
+                    "review",
+                    &pr,
+                    "--comment",
+                    "--body",
+                    &request.body,
+                    "--repo",
+                    &request.repo,
+                ],
+                &token,
+            )
+            .await
+        },
+    )
+    .await;
+}
+
 async fn run_agent_for_message(
     state: &AppState,
     agent_state: &Arc<AgentState>,
@@ -1439,6 +1517,17 @@ async fn run_agent_for_message(
 
     match agent::run_agent(&params).await {
         Ok(output) => {
+            // mika#2276 M2 — le filet. Si le tour a été COUPÉ par son enveloppe
+            // (et non conclu) alors qu'il traitait une PR, le moteur pose
+            // lui-même `VERDICT: hold[review]` sur cette PR.
+            //
+            // Placé AVANT l'envoi sur le canal de réponse, à dessein : le
+            // symptôme du ticket est précisément que la notification part et que
+            // la PR reste muette. Le fallback conversationnel continue de partir
+            // juste après — il ne remplace pas le verdict, et le verdict ne le
+            // remplace pas.
+            post_deadline_verdict_if_cut_off(state, a, &output, &req, &session_id).await;
+
             if let Some(response) = output.text {
                 info!("agent loop completed");
                 match sender_arc.send(&response).await {
