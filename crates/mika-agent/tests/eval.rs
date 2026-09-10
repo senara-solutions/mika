@@ -66,6 +66,10 @@ mod eval {
     mod test_context_summary_inject;
     mod test_correction_message_classifier_guard;
     mod test_deadline_in_flight_llm_call;
+
+    // mika#2276 AC2 — la porte : `deadline dépassé ⇒ verdict posté`. Chaîne
+    // complète, du vrai agent loop au POST, avec le poster injecté.
+    mod test_deadline_verdict_2276;
     mod test_deferred_dispatch_idempotent_ack;
     mod test_di_builders;
     mod test_dispatch_fired_at_stamped;
