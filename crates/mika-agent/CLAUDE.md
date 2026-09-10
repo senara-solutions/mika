@@ -4,7 +4,7 @@ Agent container: SQLite DB, agent loop, tools, prompt assembly, A2A server endpo
 
 ## Agent Loop
 
-Max 20 tool steps (all modes: conversation, callback, reminder, team), a per-agent turn envelope **defaulting** to 5 minutes (settable since mika#2189 — see § Timeout Budgets), 30s default per-tool timeout (overridable via `Tool::timeout_secs()`). `LoopMode::Silent { max_steps }` carries per-trigger step limits via `SilentTrigger::max_steps()`. Step-awareness nudge injected at step `max_steps - 2` for all modes to encourage wrapping up. Silent mode nudge text is tailored for `send_message` notification.
+Max 20 tool steps (all modes: conversation, callback, reminder, team), a per-agent turn envelope **defaulting** to 5 minutes (settable since mika#2189 — see § Timeout Budgets), 30s default per-tool timeout (overridable via `Tool::timeout_secs()` for builtins, and by the owning skill's `timeout_secs` for skill tools — see § Per-Tool Skill Budget). `LoopMode::Silent { max_steps }` carries per-trigger step limits via `SilentTrigger::max_steps()`. Step-awareness nudge injected at step `max_steps - 2` for all modes to encourage wrapping up. Silent mode nudge text is tailored for `send_message` notification.
 
 **Deadline enforcement (#848, #939, mika#2189):** the turn budget is enforced via an `Instant`-based deadline checked at five points: (1) top of each `run_loop` step iteration, (2) end of prelude work in each inner function before entering `run_loop`, (3) before `attempt_continuation_turn` entry — skip when `now + CONTINUATION_TIMEOUT_SECS > deadline`, (4) inside `attempt_continuation_turn` itself, where the inner timeout is clamped to `min(60s, deadline - now)`, (5) inside the LLM transport retry loop — `send_message_with_deadline()` aborts the retry chain when the remaining budget falls under a threshold **derived from the effective per-call plafond** (`0.75 × plafond + 0.25 × plafond`, which is the historical 90 + 30 = 120s at the default plafond), preventing doomed retries from consuming the deadline (#939). The provider's per-request `reqwest` timeout is the sole cancellation mechanism for in-flight HTTP calls — the outer agent deadline never drops a future mid-flight, so the `llm_calls` row is always persisted (success or transport-timeout). Worst-case turn duration is `envelope + plafond`, i.e. `300s + 120s = 420s` at the shipped defaults. Note the Anthropic rail (`crates/mika-common/src/claude.rs`) still hard-codes its own `120s` literal instead of reading the plafond — a real inconsistency mika#2189 names and leaves to its own ticket rather than bundling. `LoopResult` is a three-variant enum (`Done`/`MaxStepsExceeded`/`DeadlineExceeded`) without `#[non_exhaustive]` — the compiler's match-exhaustiveness check enforces that all three outer handlers (conversation, silent, team) handle every variant. CI lint guard `scripts/check-loop-select.sh` rejects `tokio::select!` inside `run_loop`'s body (would shadow the iteration-top deadline check).
 
@@ -268,6 +268,91 @@ General-purpose `gh` CLI handler. Four-tier validation: (1) global subcommand al
 **Audit (AC3).** Every decision — refusal *and* authorization — writes an `audit_events` row with `tool_name = "destructive_action_grounding"` and `target_key = "<pr|issue>:close:<n>"`. No migration was needed: `audit_events` has no `event_type` column, `tool_name` is free-form TEXT, and this follows `phantom_aged_out` (mika#1712) / `wip_rescue` (mika#1852). Query: `SELECT * FROM audit_events WHERE tool_name = 'destructive_action_grounding'`. Operator grep signal: `destructive_action_blocked` in `$MIKA_SPIRIT_LOG_FILE` — any hit is a close the engine stopped; sustained hits from one agent mean an upstream verdict source is producing ungrounded close recommendations (the mika#1645 class).
 
 **Regression coverage.** Predicate units in `evidence::guards::tests`, repeat-detection SQL units in `db::tests` (cross-session, window edge, `#164` vs `#1644`, pr-vs-issue, cross-agent), and the AC4/AC5 calibration scenario `destructive_action_thread_reground` (mika-dev role suite) which replays the PR #1644 timeline and fails the model both for re-closing *and* for declining without engaging the contradiction.
+
+### Per-Tool Skill Budget (mika#2276 M1)
+
+**A skill tool runs under the budget of the skill that DEFINES it**, resolved once
+per turn by `agent_loop::build_skill_tool_timeouts` into a `tool name → secs` map
+threaded to `tool_execution::dispatch`. Sibling of `build_skill_tool_map` and
+`build_skill_data_grades`: same `matched` slice, same order, same last-write-wins
+collision rule — a tool dispatched to one skill's handler while cut at another
+skill's budget is exactly the defect this closed. `max_skill_timeout` keeps its
+maximum semantics and is now only the fallback for anything absent from the map.
+
+**What it replaced.** That maximum used to be applied *uniformly to every tool
+call*, so an outer skill loaded for an unrelated reason raised everyone's ceiling.
+`shell-exec` declares 30 s and owns `run_shell`; `build-mika` declares 300 s and is
+a declared dependency of `qa-review` — so a QA review turn ran `run_shell` under
+300 s. Measured on PR #2275, trace `921f11f0`: two `cargo test --release` calls of
+**237,9 s** and **231,1 s**, 469 s of a ~506 s envelope, then
+`agent deadline exceeded` at `steps_completed=5` with no verdict written. And
+`qa-review/system_prompt.md:194` said literally *"against `run_shell`'s 30s
+budget"* — the doctrine reasoned on a floor the engine never held
+(`feedback_prompt_enforcement_fragile`).
+
+**Detail worth knowing before tuning any of these numbers.** Every skill with a
+large declared budget (`dev-pilot`/`dev-groom`/`address-pr-comments`/
+`resolve-pr-conflicts` at 600, `build-mika` at 300, `deploy-mika` at 120) exposes
+**only `long_running` tools**, which return from `execute_skill_tool` *before* the
+timeout is applied (detached spawn + callback). Those budgets therefore never
+protected their own tools; their only observable effect was raising other skills'
+ceiling. A value whose sole effect is on somebody else is a value nobody re-reads
+— which is why `qa-review/skill.toml` now declares `timeout_secs = 30` explicitly
+even though 30 is the manifest default (mika#2276 AC5).
+
+**Fan-out:** `run_loop` has three callers (conversation `mod.rs` ~3382, silent
+~4291, team ~4956) and all three build and thread the map. Compound entry:
+`docs/solutions/best-practices/un-budget-declare-par-un-manifeste-doit-etre-celui-applique-2026-09-10.md`.
+
+### Deadline Verdict Net (mika#2276 M2)
+
+`server::deadline_verdict` — when a turn is **cut off by its envelope** rather than
+concluding, and it was processing a PR event, the engine itself posts
+`VERDICT: hold[review]` on that PR.
+
+**The signal.** `AgentOutput.deadline_exceeded: Option<DeadlineOverrun>` (carrying
+`steps_completed`) is stamped in `persist_deadline_fallback` — the one function all
+three deadline gates (prelude, continuation-skip, `LoopResult::DeadlineExceeded`)
+return through, so the flag cannot be set on two and forgotten on the third.
+Architect Q3 chose a field over propagating `LoopResult`: `handlers.rs` already
+consumes this struct, and widening the agent-core/orchestrator interface was too
+much surface for a p1.
+
+**Why `text` could not answer.** On deadline the loop persists a canned assistant
+message — *"I'm sorry, that took too long"* — and returns it as `text` like any
+other response, which `run_agent_for_message` then sends on the reply channel.
+**That is the exact mechanism of the mika#2276 symptom:** Telegram notified on each
+of four turns, PR silent, because the only path that posts a verdict is
+`run_gh pr review` and the LLM never reached it. "The turn finished" and "the turn
+concluded" were two different facts nothing in the code separated.
+
+**`hold[review]`, not a new verdict (Q1).** The line already exists in
+`qa-review/skill.toml` and `verdict_handler` already understands it (notify
+operator, leave the task `in_progress`). A `block[timeout]` would have needed a new
+branch in `verdict_handler.rs` — hence the CODEOWNERS gate — for a meaning
+`hold[review]` already carries.
+
+**Anti-double-post (AC3), two independent layers.** (1) The existing session-scoped
+`pr_reviews_posted` registry, read for both key shapes `run_gh` can write
+(`{repo}|{n}` and `__default__|{n}` when the call carried no `--repo`); the net also
+registers its own post so a second pass in the same session cannot fire. (2) A POST
+answering **422** is read as **idempotent success, never a verdict failure**
+(architect Q4) — the in-memory registry does not survive a restart, and 422 is the
+net for when it was lost. Classification is narrow on purpose: a bare `422` would be
+too wide, and a genuine 403/404 must stay a failure or the outage goes invisible
+again.
+
+**Boundaries.** The POST is injected (`poster` closure) so the contract AC2 asks for
+— *a verdict IS posted* — is assertable without touching GitHub; production wires
+`run_gh_subprocess` with a PAT-first token (`Settings::resolve_github_token`, ADR-008
+— posting a review is an operation whose author GitHub reads). The net never returns
+an error: a net that fails the webhook would replace a silence with an outage. It
+does not replace the conversational fallback, which still goes out on the reply
+channel. **Operator grep signal:** `qa_deadline_verdict` in `$MIKA_SPIRIT_LOG_FILE`,
+with an `outcome` field in
+`{posted, already_reviewed, already_posted_upstream, post_failed, no_token, no_registry}`.
+Steady state after M1 is zero lines; sustained `posted` means review turns are still
+running out of budget and the cause is upstream, not here.
 
 ### Structural Verdict Handler
 
