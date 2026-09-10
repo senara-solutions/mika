@@ -63,11 +63,19 @@ use mika_common::home::{
 /// helpers' own docs) — an agent directory mid-bootstrap legitimately has
 /// neither.
 pub fn assert_family_tier_env_consistency(home_dir: &Path, tier: AgentTier) -> Result<()> {
-    if tier == AgentTier::Family {
-        // Env says family. Any family provisioning on disk agrees with it, and
-        // an operator-provisioned agent under a family env is the reverse
-        // direction — out of scope here (see the plan's Out of scope: there is
-        // no operator-side provisioning sentinel to detect against).
+    if tier.expects_family_provisioning() {
+        // This tier's own templates ARE the family ones, so family provisioning
+        // on disk agrees with it. An operator-provisioned agent under such a
+        // tier is the reverse direction — out of scope here (see the plan's Out
+        // of scope: there is no operator-side provisioning sentinel to detect
+        // against).
+        //
+        // Asked through `expects_family_provisioning` rather than
+        // `tier == AgentTier::Family` (mika#2023 M2): the equality comparison
+        // was a mine the compiler could not see. `AgentTier::Champion` carries
+        // the family templates on both axes, so adding the variant would have
+        // made this guard read drift and refuse startup for the whole champion
+        // population — with no compile error anywhere to announce it.
         return Ok(());
     }
 
@@ -156,7 +164,10 @@ pub fn check_agent_tier_consistency(
     agent_name: &str,
     tier: AgentTier,
 ) -> Result<()> {
-    if tier == AgentTier::Family {
+    // Same predicate as the boot guard, for the same mika#2023 M2 reason — and
+    // this is the gate that would have broken second, at the first `/send` of an
+    // agent created after boot rather than at startup.
+    if tier.expects_family_provisioning() {
         return Ok(());
     }
 
@@ -254,6 +265,57 @@ mod tests {
     fn starts_clean_when_family_provisioning_matches_family_tier() {
         let home = home_with_agent("mika", FAMILY_IDENTITY, FAMILY_SOUL);
         assert_family_tier_env_consistency(home.path(), AgentTier::Family).unwrap();
+    }
+
+    /// mika#2023 AC4 — the champion tier must not take the boot guard down.
+    ///
+    /// While `CHAMPION_PERSONA_PLACEHOLDER` stands, a champion is provisioned
+    /// with exactly the family templates, so family-on-disk under a `Champion`
+    /// tier is the **expected** state, not drift. The mine this closes is that
+    /// both gates asked the question with `tier == AgentTier::Family` — an
+    /// equality comparison, so introducing the variant would have made every
+    /// champion container `bail!` at startup with no compile error to announce
+    /// it (mika#2023 M2).
+    ///
+    /// The negative control lives in the same test deliberately: an exemption
+    /// that also stopped catching the founding drift would satisfy the positive
+    /// assertion just as well.
+    #[test]
+    fn mika2023_champion_tier_starts_clean_on_family_provisioning() {
+        let home = home_with_agent("mika", FAMILY_IDENTITY, FAMILY_SOUL);
+
+        // Positive: family on disk + Champion tier → starts.
+        assert_family_tier_env_consistency(home.path(), AgentTier::Champion).unwrap();
+
+        // Negative, same disk state: family on disk + Default tier → still refuses.
+        let err = assert_family_tier_env_consistency(home.path(), AgentTier::Default).unwrap_err();
+        assert!(
+            err.to_string().contains("mika"),
+            "the founding drift must still be caught and must still name the agent"
+        );
+    }
+
+    /// mika#2023 AC4, second gate — the lazy-construction path (mika#1399).
+    ///
+    /// A separate test because it is a separate `bail!`: the boot guard passing
+    /// says nothing about `resolve_agent`'s slow path, and an agent created
+    /// after boot would otherwise have been declined at its first `/send` —
+    /// a champion that starts fine and then cannot be served.
+    #[test]
+    fn mika2023_champion_tier_is_servable_on_the_lazy_path() {
+        let home = home_with_agent("nadia", FAMILY_IDENTITY, FAMILY_SOUL);
+        let agent_home = resolve_agent_home(home.path(), "nadia");
+
+        // Positive: family on disk + Champion tier → servable.
+        check_agent_tier_consistency(&agent_home, "nadia", AgentTier::Champion).unwrap();
+
+        // Negative, same disk state: Default tier → still declined.
+        let err =
+            check_agent_tier_consistency(&agent_home, "nadia", AgentTier::Default).unwrap_err();
+        assert!(
+            err.to_string().contains("nadia"),
+            "the lazy-path drift must still be caught and must still name the agent"
+        );
     }
 
     /// An operator-provisioned agent under operator tier is the ordinary case.
