@@ -234,6 +234,73 @@ pub(crate) const DISPATCH_WORKTREE_FILE_KEY: &str = "dispatch_worktree_file";
 /// dispatch, not once per minute for ever.
 pub(crate) const PILOT_TRANSCRIPT_REPORTED_KEY: &str = "pilot_transcript_empty_reported";
 
+/// Task-metadata key stamped by the silent-stall reaper the first time a
+/// dispatch leaves its population because a liveness signal could not be read
+/// (mika#2277 AC4).
+///
+/// The reaper passes on every `DB_SCAN_INTERVAL_TICKS`. Without a mark, a
+/// dispatch running with `MIKA_LOG_PILOT_TRANSCRIPTS` disabled would produce
+/// one `warn!` per minute for its whole life. The bound follows the motif
+/// already in place for the empty-transcript detector
+/// ([`PILOT_TRANSCRIPT_REPORTED_KEY`], mika#2040 AC7): a metadata key stamped
+/// after the first report. Its **value** is the comma-joined list of the
+/// surfaces that were unavailable, so the row itself says which one to fix.
+pub(crate) const PILOT_STALL_SIGNAL_UNAVAILABLE_REPORTED_KEY: &str =
+    "pilot_stall_signal_unavailable_reported";
+
+/// What one liveness surface says about a dispatch (mika#2277).
+///
+/// Three states, not two, and the third is the whole point: "I could not read
+/// this surface" is a different answer from "this surface is silent", and
+/// collapsing them is how a detector starts firing on absence of evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LivenessSignal {
+    /// Written within the window — the pilot is demonstrably alive here.
+    Active,
+    /// Readable, and silent for longer than the window.
+    Silent { idle_secs: u64 },
+    /// No readable evidence at all: key absent, file absent, unreadable, no
+    /// mtime, or an mtime in the future. **Never** a satisfied term.
+    Unavailable,
+}
+
+impl LivenessSignal {
+    /// Classify a measured age against the window. `None` — the shape every
+    /// probe in [`super::worktree_activity`] returns when it has no evidence —
+    /// becomes [`LivenessSignal::Unavailable`], never a large age.
+    fn from_age(age_secs: Option<u64>, max_age_secs: u64) -> Self {
+        match age_secs {
+            None => Self::Unavailable,
+            Some(age) if age <= max_age_secs => Self::Active,
+            Some(age) => Self::Silent { idle_secs: age },
+        }
+    }
+
+    fn is_active(self) -> bool {
+        matches!(self, Self::Active)
+    }
+
+    fn silent_age(self) -> Option<u64> {
+        match self {
+            Self::Silent { idle_secs } => Some(idle_secs),
+            _ => None,
+        }
+    }
+}
+
+/// The three idle ages a disposition rests on (mika#2277 AC5).
+///
+/// Carried into the `warn!` and the audit row together. Reporting the worktree
+/// age alone is what made the 2026-09-10 false positives read as nominal on
+/// first inspection: `worktree_idle_secs=2758` is a true statement about a
+/// pilot that was, at that same instant, streaming tool results.
+#[derive(Debug, Clone, Copy)]
+struct PilotStallAges {
+    worktree_idle_secs: u64,
+    transcript_idle_secs: u64,
+    pilot_log_idle_secs: u64,
+}
+
 /// The unified task engine: a min-heap BinaryHeap backed by SQLite, driven by a
 /// 1-second tick loop that fires tasks whose `next_fire_at <= now`.
 ///
@@ -1681,19 +1748,67 @@ impl TaskEngine {
     ///    `in_progress` — which is why mika#2261 shipped and never fired.
     /// 2. The process is **alive** (`is_same_process_alive`, PID-reuse safe).
     ///    A dead one belongs to the watchdog above.
-    /// 3. A worktree was **declared** ([`DISPATCH_WORKTREE_FILE_KEY`]) and the
-    ///    declaration file is readable and non-empty.
-    /// 4. The declared path **exists** and yields at least one mtime.
-    /// 5. That mtime is older than the configured window.
+    /// 3. The **transcript** declared on the row
+    ///    ([`PILOT_TRANSCRIPT_EXPECTED_KEY`]) has not been appended to for
+    ///    longer than the window.
+    /// 4. The **claude-pilot session log**, derived as
+    ///    `<pilot_log_dir>/<task-id>.log`, has not been written for longer
+    ///    than the window.
+    /// 5. A worktree was **declared** ([`DISPATCH_WORKTREE_FILE_KEY`]), the
+    ///    declaration is readable and non-empty, the path exists and yields an
+    ///    mtime, and that mtime is older than the window.
     /// 6. The task is **still** in one of those two live statuses on re-read —
     ///    so an in-flight callback, which moves the row to `completed` or
     ///    `delivered`, wins the race cleanly.
     ///
-    /// Terms 3 and 4 are the fail-safe, and they run the same way as
-    /// everything else here: **absence of evidence is never evidence**. A
+    /// # Why three surfaces and not one (mika#2277)
+    ///
+    /// Terms 3 and 4 exist because term 5 alone is **false**. On 2026-09-10 at
+    /// 07:16:10Z, the first armed deploy of mika#2272 killed the only two
+    /// pilots in flight, both alive and productive: their claude-pilot logs and
+    /// transcripts had been written 3 min 40 s and 3 min 31 s earlier, while
+    /// their worktrees had not moved since `checkout` — 2758 s and 2744 s, past
+    /// the 2700 s window. A pilot in its reading / exploration / planning phase
+    /// touches no file in the worktree while the SDK keeps yielding turns.
+    ///
+    /// The negative control that justified the window is refuted with it: the
+    /// 24-minute inter-write gap of the healthy run `c3f9a2f9` was never the
+    /// upper bound of a healthy gap — the upper bound is the length of a
+    /// reading phase, which has no measured ceiling. **There is no safe window
+    /// for a worktree-only predicate**, so the fix is not a wider window.
+    ///
+    /// The transcript, by contrast, separates: it timestamps every LLM turn,
+    /// and on the two false positives the largest inter-turn gap was 387 s and
+    /// 376 s — a factor of 7 under the window. It is also the *definition* of
+    /// the class D1 targets (mika#1901: the SDK stream goes quiet) rather than
+    /// a proxy for it.
+    ///
+    /// # The fail-safe rule, stated once
+    ///
+    /// > A signal that cannot be read is **never** a satisfied term.
+    ///
+    /// Terms 3, 4 and 5 all obey it: a missing metadata key, an absent or
+    /// unreadable file, no mtime, an mtime in the future — each takes the
+    /// dispatch **out** of the population (`continue`), never into it. A
     /// free-text dispatch has no worktree at all (`engine.rs`'s mika#1593
     /// path); a dispatch whose declaration was lost is indistinguishable from
-    /// one. Both fall out of the population rather than into it.
+    /// one; a fleet running with `MIKA_LOG_PILOT_TRANSCRIPTS` disabled has no
+    /// transcript. All are invisible to the reaper rather than fodder for it.
+    ///
+    /// That rule has a cost, and AC4 is what keeps it from being paid in
+    /// silence: turning off an observability feature would otherwise disarm a
+    /// safety mechanism with nothing said. The first time a dispatch drops out
+    /// for an *unavailable* signal, the reaper says so and stamps
+    /// [`PILOT_STALL_SIGNAL_UNAVAILABLE_REPORTED_KEY`] so it says it once. A
+    /// dispatch dropped because a surface is **active** is nominal and stays
+    /// silent.
+    ///
+    /// # Evaluation order is cost, not semantics
+    ///
+    /// The two single-file `stat`s run before the bounded worktree walk, and an
+    /// active one short-circuits it. The conjunction is unchanged — a surface
+    /// found active ends the question either way — but a live pilot no longer
+    /// pays for a directory walk on every scan.
     ///
     /// # Detection is unconditional; disposition is armed (mika#2272)
     ///
@@ -1726,6 +1841,7 @@ impl TaskEngine {
         let settings = &self.dispatcher.settings;
         let max_age_secs = settings.effective_pilot_stall_reap_age_seconds();
         let disposition_armed = settings.effective_pilot_stall_reap_enabled();
+        let pilot_log_dir = settings.effective_pilot_log_dir();
         let agent_id = self.db.agent_id().to_string();
         let system_session = format!("system-{agent_id}");
 
@@ -1762,32 +1878,58 @@ impl TaskEngine {
                 continue;
             }
 
-            // Term 3: a declared worktree. Every failure below is "not a
-            // candidate", never "stale".
-            let Some(declaration_file) = metadata
-                .as_ref()
-                .and_then(|v| v.get(DISPATCH_WORKTREE_FILE_KEY)?.as_str())
-                .map(std::path::PathBuf::from)
-            else {
-                continue;
-            };
-            let Ok(declared) = std::fs::read_to_string(&declaration_file) else {
-                continue;
-            };
-            let worktree = std::path::PathBuf::from(declared.trim());
-            if declared.trim().is_empty() {
+            // Terms 3 and 4: the two single-file surfaces, cheapest first. An
+            // active one ends the question — the pilot is demonstrably alive —
+            // and skips the bounded worktree walk below.
+            let transcript_signal = Self::probe_transcript_signal(metadata.as_ref(), max_age_secs);
+            let pilot_log_signal =
+                Self::probe_pilot_log_signal(&pilot_log_dir, &task.id, max_age_secs);
+            if transcript_signal.is_active() || pilot_log_signal.is_active() {
                 continue;
             }
 
-            // Terms 4 and 5: the worktree exists, yields an mtime, and that
-            // mtime is older than the window.
-            let Some(age_secs) = super::worktree_activity::seconds_since_last_write(&worktree)
-            else {
-                continue;
-            };
-            if age_secs <= max_age_secs {
+            // Term 5: the declared worktree. Every failure below is "not a
+            // candidate", never "stale".
+            let worktree = Self::declared_worktree(metadata.as_ref());
+            let worktree_signal = LivenessSignal::from_age(
+                worktree
+                    .as_deref()
+                    .and_then(super::worktree_activity::seconds_since_last_write),
+                max_age_secs,
+            );
+            if worktree_signal.is_active() {
                 continue;
             }
+
+            // Every surface is either silent or unreadable. Silence on all
+            // three is the only shape that authorises a kill; anything less is
+            // inertia, and AC4 says inertia out loud — once per dispatch.
+            let (
+                Some(transcript_idle_secs),
+                Some(pilot_log_idle_secs),
+                Some(worktree_idle_secs),
+                Some(worktree),
+            ) = (
+                transcript_signal.silent_age(),
+                pilot_log_signal.silent_age(),
+                worktree_signal.silent_age(),
+                worktree,
+            )
+            else {
+                self.report_unavailable_liveness_signal(
+                    &task,
+                    transcript_signal,
+                    pilot_log_signal,
+                    worktree_signal,
+                )
+                .await;
+                continue;
+            };
+            let ages = PilotStallAges {
+                worktree_idle_secs,
+                transcript_idle_secs,
+                pilot_log_idle_secs,
+            };
 
             // Term 6: still on a live surface. Re-read rather than trust the
             // snapshot — the scan above did filesystem I/O, and a callback may
@@ -1810,13 +1952,149 @@ impl TaskEngine {
                 pid,
                 start_time,
                 &worktree,
-                age_secs,
+                ages,
                 max_age_secs,
                 disposition_armed,
                 &system_session,
                 &current.status,
             )
             .await;
+        }
+    }
+
+    /// The worktree path this dispatch declared, or `None` when nothing
+    /// readable declares one (mika#2249 terms 3–4, unchanged by mika#2277).
+    fn declared_worktree(metadata: Option<&serde_json::Value>) -> Option<std::path::PathBuf> {
+        let declaration_file = metadata
+            .and_then(|v| v.get(DISPATCH_WORKTREE_FILE_KEY)?.as_str())
+            .map(std::path::PathBuf::from)?;
+        let declared = std::fs::read_to_string(&declaration_file).ok()?;
+        let trimmed = declared.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(std::path::PathBuf::from(trimmed))
+    }
+
+    /// Term 3 — the pilot transcript's activity (mika#2277).
+    ///
+    /// The path is **declared, not derived**: `inject_pilot_transcript_env`
+    /// stamps [`PILOT_TRANSCRIPT_EXPECTED_KEY`] on this very row once the
+    /// subprocess is confirmed started (mika#2040 AC7). Reconstructing it here
+    /// from the skill name and the current value of
+    /// `MIKA_LOG_PILOT_TRANSCRIPTS` would read a gate that can flip between
+    /// the dispatch and this scan, and would claim a transcript for dispatches
+    /// that were never asked for one.
+    fn probe_transcript_signal(
+        metadata: Option<&serde_json::Value>,
+        max_age_secs: u64,
+    ) -> LivenessSignal {
+        let Some(path) = metadata
+            .and_then(|v| v.get(PILOT_TRANSCRIPT_EXPECTED_KEY)?.as_str())
+            .map(std::path::PathBuf::from)
+        else {
+            return LivenessSignal::Unavailable;
+        };
+        LivenessSignal::from_age(
+            super::worktree_activity::seconds_since_file_write(&path),
+            max_age_secs,
+        )
+    }
+
+    /// Term 4 — the claude-pilot session log's activity (mika#2277).
+    ///
+    /// This one **is** derived, and it is the only derived path in the
+    /// predicate. `dispatch-lib.sh` sets `LOG_ID="$TASK_ID"` and launches
+    /// `claude-pilot --log-dir "$_PILOT_LOG_DIR" --task-id "$LOG_ID"`, so the
+    /// file is `<pilot_log_dir>/<callback-task-id>.log`; verified empirically
+    /// against the two mika#2277 false positives.
+    ///
+    /// Deriving rather than declaring is acceptable **here specifically**
+    /// because the derivation cannot fail dangerously: the two halves read
+    /// different environment variables (`PILOT_LOG_DIR` in the shell,
+    /// `MIKA_PILOT_LOG_DIR` in the engine, since `MIKA_*` is scrubbed from the
+    /// dispatch child), and a disagreement makes the file **absent** — which
+    /// is `Unavailable`, which takes the dispatch out of the population. A
+    /// wrong derivation can only buy inertia, never a false positive.
+    fn probe_pilot_log_signal(
+        pilot_log_dir: &std::path::Path,
+        task_id: &str,
+        max_age_secs: u64,
+    ) -> LivenessSignal {
+        let path = pilot_log_dir.join(format!("{task_id}.log"));
+        LivenessSignal::from_age(
+            super::worktree_activity::seconds_since_file_write(&path),
+            max_age_secs,
+        )
+    }
+
+    /// Say once, per dispatch, that a liveness signal could not be read
+    /// (mika#2277 AC4).
+    ///
+    /// **Disposition: emit-and-continue.** This is observability. It names the
+    /// dispatch and the surfaces, then the dispatch leaves the population as
+    /// planned. It never blocks the tick, never changes a row's status, and
+    /// never becomes a cause of disposition itself — a safety mechanism that
+    /// halted because it could not measure would be a worse defect than the
+    /// one it reports.
+    ///
+    /// Cadence is bounded by [`PILOT_STALL_SIGNAL_UNAVAILABLE_REPORTED_KEY`].
+    /// A failed stamp is logged at `debug` and nothing else: re-warning next
+    /// tick is noisier than intended but strictly better than swallowing the
+    /// signal, and the repetition is itself visible.
+    async fn report_unavailable_liveness_signal(
+        &self,
+        task: &crate::db::Task,
+        transcript: LivenessSignal,
+        pilot_log: LivenessSignal,
+        worktree: LivenessSignal,
+    ) {
+        let missing: Vec<&str> = [
+            (transcript, "transcript"),
+            (pilot_log, "pilot_log"),
+            (worktree, "worktree"),
+        ]
+        .into_iter()
+        .filter(|(signal, _)| *signal == LivenessSignal::Unavailable)
+        .map(|(_, name)| name)
+        .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let missing = missing.join(",");
+
+        let already_reported = task
+            .metadata
+            .as_deref()
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+            .is_some_and(|v| v.get(PILOT_STALL_SIGNAL_UNAVAILABLE_REPORTED_KEY).is_some());
+        if already_reported {
+            return;
+        }
+
+        warn!(
+            event = "pilot_stall_signal_unavailable",
+            task_id = %task.id,
+            parent_task_id = ?task.parent_task_id,
+            missing_surfaces = %missing,
+            "pilot_stall_reaper: a liveness signal could not be read, so this dispatch is \
+             invisible to the silent-stall reaper for its whole life (mika#2277 AC4)"
+        );
+
+        if let Err(e) = self
+            .db
+            .set_task_metadata_field(
+                &task.id,
+                PILOT_STALL_SIGNAL_UNAVAILABLE_REPORTED_KEY,
+                &missing,
+            )
+            .await
+        {
+            debug!(
+                task_id = %task.id,
+                error = %e,
+                "pilot_stall_reaper: could not stamp the inertia marker; the warning will repeat"
+            );
         }
     }
 
@@ -1834,7 +2112,7 @@ impl TaskEngine {
         pid: i64,
         start_time: Option<u64>,
         worktree: &std::path::Path,
-        age_secs: u64,
+        ages: PilotStallAges,
         max_age_secs: u64,
         disposition_armed: bool,
         system_session: &str,
@@ -1901,6 +2179,11 @@ impl TaskEngine {
         } else {
             observed_status
         };
+        let PilotStallAges {
+            worktree_idle_secs,
+            transcript_idle_secs,
+            pilot_log_idle_secs,
+        } = ages;
         warn!(
             event = "pilot_silent_stall",
             task_id = %task.id,
@@ -1908,12 +2191,15 @@ impl TaskEngine {
             pid,
             worktree = %worktree.display(),
             observed_status,
-            worktree_idle_secs = age_secs,
+            worktree_idle_secs,
+            transcript_idle_secs,
+            pilot_log_idle_secs,
             threshold_secs = max_age_secs,
             disposition_armed,
             transitioned,
-            "pilot_silent_stall: dispatch process is alive but its worktree has received no \
-             write past the configured window"
+            "pilot_silent_stall: dispatch process is alive but every one of its liveness \
+             surfaces — worktree, transcript, pilot log — has been silent past the \
+             configured window"
         );
 
         if let Err(e) = self
@@ -1924,8 +2210,16 @@ impl TaskEngine {
                 &format!("task:{}", task.id),
                 Some(observed_status),
                 Some(after_value),
+                // AC5: the three ages, not the worktree alone. This row is the
+                // only surface anyone reads this mechanism through, and it has
+                // to let the decision be replayed — a `worktree_idle_secs`
+                // reported by itself is what made the 2026-09-10 false
+                // positives look nominal.
                 Some(&format!(
-                    "worktree {} idle for {age_secs}s (threshold {max_age_secs}s), pid {pid} \
+                    "worktree {} silent on all surfaces past {max_age_secs}s \
+                     (worktree_idle_secs={worktree_idle_secs}, \
+                     transcript_idle_secs={transcript_idle_secs}, \
+                     pilot_log_idle_secs={pilot_log_idle_secs}), pid {pid} \
                      alive on a `{observed_status}` row; \
                      disposition_armed={disposition_armed}, transitioned={transitioned}",
                     worktree.display()

@@ -1018,6 +1018,20 @@ pub struct Settings {
     #[serde(default)]
     pub pilot_stall_reap_enabled: Option<bool>,
 
+    /// Directory the silent-stall reaper reads claude-pilot session logs from
+    /// (mika#2277). The per-dispatch file is `<dir>/<callback-task-id>.log`.
+    ///
+    /// Must match `dispatch-lib.sh`'s `${PILOT_LOG_DIR:-/var/log/claude-pilot}`.
+    /// The two are separate variables on purpose — `MIKA_*` is scrubbed from the
+    /// dispatch child's environment — and a divergence costs inertia, never a
+    /// false positive: see [`DEFAULT_PILOT_LOG_DIR`].
+    ///
+    /// Env override: `MIKA_PILOT_LOG_DIR`.
+    ///
+    /// Default: [`DEFAULT_PILOT_LOG_DIR`] (`/var/log/claude-pilot`).
+    #[serde(default)]
+    pub pilot_log_dir: Option<String>,
+
     /// Callback-delivery latency above which the engine warns, in seconds
     /// (mika#2179).
     ///
@@ -1330,6 +1344,32 @@ pub const DEFAULT_PILOT_STALL_REAP_AGE_SECONDS: u64 = 2700;
 /// Arming is a decision of record on mika#2272, taken with the asymmetry in
 /// view — not an inference from the code.
 pub const DEFAULT_PILOT_STALL_REAP_ENABLED: bool = true;
+
+/// Default directory into which claude-pilot writes its per-dispatch session
+/// log — the third liveness surface the silent-stall reaper reads (mika#2277).
+///
+/// **Symmetric to `dispatch-lib.sh:247`**, which resolves
+/// `${PILOT_LOG_DIR:-/var/log/claude-pilot}` and then launches
+/// `claude-pilot --log-dir "$_PILOT_LOG_DIR" --task-id "$LOG_ID"`, producing
+/// `<dir>/<task-id>.log`. The engine derives the same path from the callback
+/// row's own id; verified empirically on the two mika#2277 false positives,
+/// whose logs are `11cf415b-….log` and `4df0f177-….log`.
+///
+/// # Why a divergence here is bounded, and in which direction
+///
+/// The two halves read *different* variables — the shell honours `PILOT_LOG_DIR`
+/// and the engine `MIKA_PILOT_LOG_DIR`, because `scrub_mika_env_vars` strips
+/// every `MIKA_*` from the dispatch child. mika#2165 documented what an override
+/// only the readers honour costs; here that cost has a floor. If the engine
+/// looks in the wrong directory the derived file is simply **absent**, the
+/// signal is unavailable, and the dispatch falls **out** of the reaper's
+/// population (see the fail-safe rule on
+/// [`DEFAULT_PILOT_STALL_REAP_AGE_SECONDS`]'s sibling terms). A mismatched
+/// directory can therefore only produce inertia — never a false positive, which
+/// is the failure class mika#2277 exists to close.
+///
+/// Overridable without a rebuild via `MIKA_PILOT_LOG_DIR`.
+pub const DEFAULT_PILOT_LOG_DIR: &str = "/var/log/claude-pilot";
 
 /// Default callback-delivery slow-warning threshold in seconds (mika#2179).
 ///
@@ -1919,6 +1959,24 @@ impl Settings {
             .unwrap_or(DEFAULT_PILOT_STALL_REAP_ENABLED)
     }
 
+    /// Effective claude-pilot session-log directory (mika#2277).
+    ///
+    /// Returns the configured value or [`DEFAULT_PILOT_LOG_DIR`]. An empty or
+    /// whitespace-only setting falls back to the default with a `warn!`: the
+    /// derived path would otherwise be `/<task-id>.log`, a file that never
+    /// exists, which would silently take every dispatch out of the reaper's
+    /// population — a disarm dressed as a configuration.
+    pub fn effective_pilot_log_dir(&self) -> std::path::PathBuf {
+        match self.pilot_log_dir.as_deref().map(str::trim) {
+            Some("") => {
+                tracing::warn!("pilot_log_dir is empty; falling back to {DEFAULT_PILOT_LOG_DIR}");
+                std::path::PathBuf::from(DEFAULT_PILOT_LOG_DIR)
+            }
+            Some(v) => std::path::PathBuf::from(v),
+            None => std::path::PathBuf::from(DEFAULT_PILOT_LOG_DIR),
+        }
+    }
+
     /// Effective callback-delivery slow-warning threshold in seconds (mika#2179).
     ///
     /// Returns the configured value or
@@ -2375,6 +2433,7 @@ impl Settings {
             phantom_sweep_age_seconds: None,
             pilot_stall_reap_age_seconds: None,
             pilot_stall_reap_enabled: None,
+            pilot_log_dir: None,
             callback_delivery_slow_threshold_secs: None,
             callback_delivery_max_attempts: None,
             callback_delivery_backoff_base_secs: None,
@@ -3714,6 +3773,67 @@ mod tests {
         assert!(settings.effective_pilot_stall_reap_enabled());
 
         unsafe { std::env::remove_var("MIKA_PILOT_STALL_REAP_ENABLED") };
+    }
+
+    // -- claude-pilot session-log directory (mika#2277) --
+
+    #[test]
+    #[serial]
+    fn pilot_log_dir_defaults_to_the_dispatch_lib_path() {
+        clean_env();
+        unsafe { std::env::remove_var("MIKA_PILOT_LOG_DIR") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(settings.pilot_log_dir, None);
+        assert_eq!(
+            settings.effective_pilot_log_dir(),
+            std::path::Path::new("/var/log/claude-pilot"),
+            "the engine's default must be `dispatch-lib.sh:247`'s default verbatim — the two \
+             halves read different env vars, so the *defaults* are the only place they can \
+             agree without an operator"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn pilot_log_dir_env_override() {
+        clean_env();
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_PILOT_LOG_DIR", "/srv/pilot-logs") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(settings.pilot_log_dir.as_deref(), Some("/srv/pilot-logs"));
+        assert_eq!(
+            settings.effective_pilot_log_dir(),
+            std::path::Path::new("/srv/pilot-logs")
+        );
+
+        unsafe { std::env::remove_var("MIKA_PILOT_LOG_DIR") };
+    }
+
+    /// An empty setting must not become `""`, or the derived path would be
+    /// `/<task-id>.log` — a file that never exists, which takes every dispatch
+    /// out of the reaper's population. That is a disarm wearing a
+    /// configuration's clothes, so it falls back to the default instead.
+    #[test]
+    #[serial]
+    fn pilot_log_dir_empty_falls_back_rather_than_disarming_the_reaper() {
+        clean_env();
+        unsafe { std::env::set_var("MIKA_PILOT_LOG_DIR", "   ") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(
+            settings.effective_pilot_log_dir(),
+            std::path::Path::new(DEFAULT_PILOT_LOG_DIR)
+        );
+
+        unsafe { std::env::remove_var("MIKA_PILOT_LOG_DIR") };
     }
 
     // -- Phantom NULL-PID sweep grace window (mika#1712) --

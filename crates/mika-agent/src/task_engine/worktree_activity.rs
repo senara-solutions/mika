@@ -183,6 +183,44 @@ pub fn seconds_since_last_write(root: &Path) -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
+/// Seconds elapsed since a **single file** was last written (mika#2277).
+///
+/// The sibling of [`seconds_since_last_write`] for the two per-dispatch files
+/// the reaper reads besides the worktree: the pilot transcript
+/// (`~/.mika/data/pilot-transcripts/<task-id>.jsonl`, declared on the row) and
+/// the claude-pilot session log (`<pilot_log_dir>/<task-id>.log`, derived). It
+/// lives here rather than in a module of its own because what matters about
+/// both probes is not the shape of the thing walked — it is the rule they
+/// share, stated once in this module's header and restated for each new caller:
+/// **a signal that cannot be read is never a signal of silence.**
+///
+/// `None` — meaning *no evidence*, which the caller must read as "not a
+/// candidate", never as "stale" — for every one of:
+///
+/// - the path does not exist, or is unreadable (permissions, I/O);
+/// - it is not a regular file (a directory named `<task>.log` is pathological,
+///   and its mtime would answer a question nobody asked);
+/// - the filesystem yields no mtime;
+/// - the mtime is in the **future** (clock skew), where a naive subtraction
+///   would wrap and manufacture an enormous age.
+///
+/// Symlinks **are** followed here, unlike the worktree walk. The reasoning is
+/// inverted by the shape of the target: in a tree, following a link would
+/// import an unrelated tree's recency and size, whereas for a single declared
+/// file the link's own mtime is frozen at creation and would read as silence
+/// for ever — the one direction this module must never produce.
+pub fn seconds_since_file_write(path: &Path) -> Option<u64> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mtime = meta.modified().ok()?;
+    SystemTime::now()
+        .duration_since(mtime)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,6 +364,96 @@ mod tests {
         assert_eq!(activity.max_mtime, None);
         assert_eq!(activity.entries_scanned, 0);
         assert!(seconds_since_last_write(&empty).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2277 — the single-file probe. Every case below is a way for the
+    // signal to be *unavailable*, and each must answer `None` rather than a
+    // number, because a number here is a term in a predicate that kills.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_fresh_file_reads_as_recent() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let log = tmp.path().join("11cf415b.log");
+        fs::write(&log, b"stream event").expect("write");
+        backdate(&log, 12);
+        let age = seconds_since_file_write(&log).expect("a readable file has an age");
+        assert!((12..120).contains(&age), "expected ~12s, got {age}s");
+    }
+
+    #[test]
+    fn a_silent_file_reads_as_old() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let log = tmp.path().join("silent.log");
+        fs::write(&log, b"last line").expect("write");
+        backdate(&log, 10_000);
+        assert!(seconds_since_file_write(&log).expect("age") > 9_000);
+    }
+
+    #[test]
+    fn an_absent_file_is_no_evidence() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        assert!(seconds_since_file_write(&tmp.path().join("never-written.log")).is_none());
+    }
+
+    /// The derivation `<pilot_log_dir>/<task-id>.log` can point at a directory
+    /// that does not exist at all — the shape of an engine and a `dispatch-lib`
+    /// disagreeing on `PILOT_LOG_DIR`. Inertia, not a kill.
+    #[test]
+    fn a_file_under_an_absent_directory_is_no_evidence() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("no-such-dir").join("task.log");
+        assert!(seconds_since_file_write(&path).is_none());
+    }
+
+    #[test]
+    fn a_directory_is_not_a_signal() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dir = tmp.path().join("task.log");
+        fs::create_dir_all(&dir).expect("mkdir");
+        backdate(&dir, 10_000);
+        assert!(
+            seconds_since_file_write(&dir).is_none(),
+            "a directory's mtime answers a question nobody asked"
+        );
+    }
+
+    /// A file mtime in the future must not wrap into an enormous age — that
+    /// would be the one arithmetic accident able to turn a live pilot into a
+    /// candidate.
+    #[test]
+    fn a_future_file_mtime_is_not_evidence_of_silence() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let log = tmp.path().join("skewed.log");
+        fs::write(&log, b"x").expect("write");
+        let future = SystemTime::now() + StdDuration::from_secs(3_600);
+        filetime::set_file_mtime(&log, filetime::FileTime::from_system_time(future))
+            .expect("stamp future");
+        assert!(seconds_since_file_write(&log).is_none());
+    }
+
+    /// A symlink is followed: its own mtime is frozen at creation and would
+    /// read as silence for ever, which is the direction that kills.
+    #[test]
+    fn a_symlink_reports_its_targets_age_not_its_own() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let target = tmp.path().join("real.log");
+        fs::write(&target, b"fresh").expect("write");
+        let link = tmp.path().join("link.log");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        // The link itself is stamped old; the target is fresh.
+        filetime::set_symlink_file_times(
+            &link,
+            filetime::FileTime::from_system_time(SystemTime::now() - StdDuration::from_secs(9_999)),
+            filetime::FileTime::from_system_time(SystemTime::now() - StdDuration::from_secs(9_999)),
+        )
+        .expect("backdate link");
+        let age = seconds_since_file_write(&link).expect("age");
+        assert!(
+            age < 120,
+            "the target's freshness must win over the link's own mtime, got {age}s"
+        );
     }
 
     /// A worktree whose newest mtime is in the future yields no age rather
