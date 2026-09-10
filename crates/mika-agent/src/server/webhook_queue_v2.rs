@@ -119,6 +119,31 @@ static ISSUE_LABELED_RE: LazyLock<Regex> = LazyLock::new(|| {
 static PR_ACTION_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\[GitHub\] PR (\w+): (\S+)#(\d+)").expect("pr_action regex"));
 
+/// Parse the `[GitHub] PR {action}: {repo}#{pr}` header into its three parts.
+///
+/// Sole reader of [`PR_ACTION_RE`]. Extracted in mika#2276 so the deadline-verdict
+/// net (`server::deadline_verdict`) can name the PR a cut-off turn was reviewing
+/// without carrying a second copy of this regex — a duplicated event grammar is
+/// how two readers of one wire format drift apart (the mika#2158 shape).
+///
+/// **Borrows rather than allocates**, deliberately: this runs inside
+/// `classify_event`, i.e. once per inbound webhook on `WebhookQueue::enqueue`.
+/// Returning owned `String`s would allocate the action on every matched PR event
+/// — where the only use is a comparison against one literal — and the repo on the
+/// four non-`synchronize` actions that immediately fall through to `Other`.
+/// Each caller allocates only the field it keeps.
+pub(crate) fn parse_pr_action_event(text: &str) -> Option<(&str, &str, u64)> {
+    let first_line = text.lines().next()?;
+    let caps = PR_ACTION_RE.captures(first_line)?;
+    let pr = caps[3].parse::<u64>().ok()?;
+    // `captures` borrows from `first_line`, which borrows from `text`; the
+    // `Captures` value itself is dropped here, so re-slice from `text` via the
+    // match offsets rather than through it.
+    let action = caps.get(1).map(|m| m.as_str())?;
+    let repo = caps.get(2).map(|m| m.as_str())?;
+    Some((action, repo, pr))
+}
+
 /// The GitHub label whose add-event is a dispatch trigger (never coalesce).
 const READY_LABEL: &str = "ready";
 
@@ -159,13 +184,10 @@ pub fn classify_event(text: &str) -> WebhookEventKind {
         }
     }
 
-    if let Some(caps) = PR_ACTION_RE.captures(first_line) {
-        let action = &caps[1];
-        if action == "synchronize"
-            && let Ok(pr) = caps[3].parse::<u64>()
-        {
+    if let Some((action, repo, pr)) = parse_pr_action_event(text) {
+        if action == "synchronize" {
             return WebhookEventKind::PullRequestSync {
-                repo: caps[2].to_string(),
+                repo: repo.to_string(),
                 pr,
             };
         }

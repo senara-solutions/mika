@@ -7,6 +7,7 @@ pub mod ci_failure_handler;
 pub mod ci_success_handler;
 pub mod dashboard;
 pub mod dashboard_dev_runs;
+pub mod deadline_verdict;
 pub mod draft_pr_opened_handler;
 pub mod embedded_dashboard;
 mod handlers;

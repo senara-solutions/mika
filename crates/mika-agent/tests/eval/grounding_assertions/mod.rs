@@ -459,6 +459,8 @@ mod tests {
                 text: Some(text.to_string()),
                 thinking: None,
                 usage: None,
+                // Fixture replaying a recorded response: the turn concluded.
+                deadline_exceeded: None,
             },
             llm_calls: vec![],
             tool_calls,

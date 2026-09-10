@@ -32,7 +32,24 @@ pub(crate) struct ToolDispatchCtx<'a> {
     pub(crate) tools: &'a ToolRegistry,
     pub(crate) skill_tools: &'a HashMap<String, &'a ResolvedSkillTool>,
     pub(crate) ctx: &'a ToolContext<'a>,
+    /// Fallback tool-execution budget: the maximum across every skill loaded in
+    /// the turn (`max_skill_timeout`). Applies to skill tools absent from
+    /// [`Self::skill_tool_timeouts`] only — see that field for why.
     pub(crate) skill_timeout: u64,
+    /// Per-tool-name execution budget, keyed by the tool's **owning** skill
+    /// (mika#2276 M1).
+    ///
+    /// Built alongside `skill_tools` and `skill_data_grades` from the same
+    /// `matched` slice under the same last-write-wins rule, so a tool's handler,
+    /// its data grade and its budget always come from one skill.
+    ///
+    /// Before mika#2276 there was no such map and every skill tool ran under
+    /// [`Self::skill_timeout`]. That let `run_shell` — declared at 30 s by
+    /// `shell-exec` — execute under `build-mika`'s 300 s merely because
+    /// `build-mika` is a declared dependency of `qa-review`, which is how a QA
+    /// review turn spent 469 s of its ~506 s envelope on two
+    /// `cargo test --release` calls and died before writing a verdict.
+    pub(crate) skill_tool_timeouts: &'a HashMap<String, u64>,
     pub(crate) mcp_manager: Option<&'a McpManager>,
     pub(crate) long_running_ctx: Option<&'a executor::LongRunningContext>,
     /// Per-tool-name data-grade lookup (mika#1798 Layer 4).
@@ -83,6 +100,10 @@ pub(crate) async fn process_tool_calls(
     // maps stay consistent under last-write-wins collision semantics.
     skill_data_grades: &HashMap<String, crate::skills::manifest::DataGrade>,
     skill_timeout: u64,
+    // mika#2276 M1: per-tool budget keyed by the owning skill. Built next to
+    // `skill_tools` in the caller so the two maps cannot disagree on who owns
+    // a tool. `skill_timeout` above stays the fallback for anything absent.
+    skill_tool_timeouts: &HashMap<String, u64>,
     tool_ctx: &ToolContext<'_>,
     request: &mut LlmRequest,
     step: u32,
@@ -202,6 +223,7 @@ pub(crate) async fn process_tool_calls(
                     skill_tools,
                     ctx: tool_ctx,
                     skill_timeout,
+                    skill_tool_timeouts,
                     mcp_manager,
                     long_running_ctx,
                     // mika#1798 Layer 4: clone the map so the dispatch context
@@ -486,9 +508,20 @@ async fn execute_tool(
 
     // 2. Try skill-defined tool
     if let Some(skill_tool) = dispatch.skill_tools.get(name) {
+        // mika#2276 M1: the budget is the OWNING skill's, resolved once per turn
+        // in `build_skill_tool_timeouts`. `skill_timeout` (the turn maximum) is
+        // the fallback only — a skill tool present in `skill_tools` is always
+        // present in this map, since both are built from the same slice, so the
+        // fallback is reachable in practice only from a hand-built dispatch
+        // context in tests.
+        let owning_skill_timeout = dispatch
+            .skill_tool_timeouts
+            .get(name)
+            .copied()
+            .unwrap_or(dispatch.skill_timeout);
         // Builtin skill handlers dispatch to Rust functions with ToolContext access
         if let ToolHandler::Builtin { function } = &skill_tool.handler {
-            let timeout = dispatch.skill_timeout;
+            let timeout = owning_skill_timeout;
             return match tokio::time::timeout(
                 std::time::Duration::from_secs(timeout),
                 builtin_handlers::execute(function, input, dispatch.ctx),
@@ -505,7 +538,7 @@ async fn execute_tool(
         return executor::execute_skill_tool(
             skill_tool,
             input,
-            dispatch.skill_timeout,
+            owning_skill_timeout,
             dispatch.long_running_ctx,
             dispatch.ctx.github_token,
             dispatch.ctx.callback_task_id,

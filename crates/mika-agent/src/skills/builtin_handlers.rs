@@ -3104,7 +3104,23 @@ fn make_pr_dedup_key(args: &[String], repo: Option<&str>) -> String {
         .get(2)
         .map(|s| normalize_pr_identifier(s))
         .unwrap_or("__current_branch__");
-    format!("{}|{}", repo.unwrap_or("__default__"), positional)
+    format_pr_dedup_key(repo, positional)
+}
+
+/// The `pr_reviews_posted` key format itself: `{repo}|{pr identifier}`, with
+/// `__default__` standing in for an absent `--repo`.
+///
+/// **Sole owner of this wire format.** Extracted in mika#2276 because that
+/// ticket's deadline-verdict net (`server::deadline_verdict`) must *read* the
+/// registry that [`make_pr_dedup_key`] *writes*, and it cannot reuse
+/// `make_pr_dedup_key` directly — that function's signature is bound to raw `gh`
+/// argv, while the net holds a structured `{repo, pr_number}`. Reimplementing
+/// the `format!` on the reading side would put the same wire grammar in two
+/// places, which is the mika#2158 shape: two readers of one format drift, and
+/// here the drift is silent in both directions — a missed match posts a
+/// duplicate review, a false match leaves the PR silent.
+pub(crate) fn format_pr_dedup_key(repo: Option<&str>, pr_identifier: &str) -> String {
+    format!("{}|{}", repo.unwrap_or("__default__"), pr_identifier)
 }
 
 /// Check if a `gh` command array is a `pr review` invocation.
