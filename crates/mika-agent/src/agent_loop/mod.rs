@@ -298,6 +298,40 @@ pub struct AgentOutput {
     pub text: Option<String>,
     pub thinking: Option<String>,
     pub usage: Option<LlmUsage>,
+    /// The turn ended because it ran out of its envelope, not because it
+    /// concluded (mika#2276 M2).
+    ///
+    /// **Why this field exists at all.** `text` cannot answer the question. On
+    /// deadline the loop persists a canned assistant message — *"I'm sorry, that
+    /// took too long"* — and returns it as `text` like any other response, so
+    /// the call site could not tell "the turn answered" from "the turn was cut
+    /// off". That is the exact mechanism of the mika#2276 symptom: on PR #2275
+    /// Telegram was notified twice (the fallback went out on the reply channel)
+    /// while the PR stayed silent, because the only path that posts a verdict is
+    /// `run_gh pr review`, which the LLM never reached.
+    ///
+    /// **Why a field and not a `LoopResult` return.** Architect Q3: the callers
+    /// of `run_agent` already consume this struct, whereas propagating
+    /// `LoopResult` would widen the agent-core/orchestrator interface. Minimal
+    /// surface for a p1.
+    ///
+    /// `Some` on every path that returns the deadline fallback (prelude gate,
+    /// continuation-skip gate, `LoopResult::DeadlineExceeded`); `None`
+    /// everywhere else, including max-steps continuation — a turn that ran out
+    /// of *steps* did produce a summary and is not this class.
+    pub deadline_exceeded: Option<DeadlineOverrun>,
+}
+
+/// What a caller needs to know about a turn cut off by its envelope (mika#2276).
+///
+/// Carries `steps_completed` because AC1 requires the posted verdict body to say
+/// how far the turn got: a review cut off at step 5 and one cut off at step 19
+/// call for different operator responses, and the fallback text says neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeadlineOverrun {
+    /// Tool steps the loop completed before the envelope ran out. `0` when the
+    /// deadline was already past before the loop was entered (prelude gate).
+    pub steps_completed: usize,
 }
 
 // -- Shared helpers --
@@ -851,7 +885,14 @@ async fn run_loop(
     // `process_tool_calls` invocation so the execute-time testimony
     // guardrail fires uniformly across all agent-loop entry points.
     skill_data_grades: &HashMap<String, crate::skills::manifest::DataGrade>,
+    // Fallback tool budget: the turn maximum. See `skill_tool_timeouts`.
     skill_timeout: u64,
+    // mika#2276 M1: per-tool budget keyed by the tool's OWNING skill, built
+    // from the same matched-skill list as `skill_tool_map` and threaded
+    // verbatim into every `process_tool_calls` invocation so all three entry
+    // points (conversation, silent, team) enforce the same budget. A fix
+    // covering only two of the three would be a fix that lies.
+    skill_tool_timeouts: &HashMap<String, u64>,
     tool_ctx: &ToolContext<'_>,
     request: &mut LlmRequest,
     mode: &LoopMode,
@@ -1239,6 +1280,7 @@ async fn run_loop(
                         skill_tool_map,
                         skill_data_grades,
                         skill_timeout,
+                        skill_tool_timeouts,
                         tool_ctx,
                         request,
                         step as u32,
@@ -2853,6 +2895,7 @@ async fn run_loop(
                     skill_tool_map,
                     skill_data_grades,
                     skill_timeout,
+                    skill_tool_timeouts,
                     tool_ctx,
                     request,
                     step as u32,
@@ -3380,6 +3423,8 @@ async fn run_agent_inner(
     // tool map so both stay consistent under the same last-write-wins rule.
     let skill_data_grades = build_skill_data_grades(&matched_entries);
     let skill_timeout = max_skill_timeout(&matched_entries, provider, model);
+    // mika#2276 M1 (conversation mode) — 1 of the 3 fan-out sites.
+    let skill_tool_timeouts = build_skill_tool_timeouts(&matched_entries, provider, model);
     let required_tools = collect_required_tools(&matched, params.user_message);
     let required_suffix_lines = collect_required_suffix_lines(&matched);
     let required_finding_list_prefixes = collect_required_finding_list_prefixes(&matched);
@@ -3650,7 +3695,8 @@ async fn run_agent_inner(
             mode = "conversation",
             "agent deadline exceeded during prelude — skipping loop"
         );
-        return persist_deadline_fallback(db, session_id, trace_id, params.internal, None).await;
+        // Prelude gate: the loop was never entered, so zero steps ran.
+        return persist_deadline_fallback(db, session_id, trace_id, params.internal, None, 0).await;
     }
 
     let store_llm = params.settings.is_none_or(|s| s.store_llm_calls);
@@ -3672,6 +3718,7 @@ async fn run_agent_inner(
         &skill_tool_map,
         &skill_data_grades,
         skill_timeout,
+        &skill_tool_timeouts,
         &tool_ctx,
         &mut request,
         &mode,
@@ -3718,6 +3765,7 @@ async fn run_agent_inner(
             text,
             thinking,
             usage,
+            deadline_exceeded: None,
         }),
         LoopResult::MaxStepsExceeded {
             thinking,
@@ -3743,6 +3791,10 @@ async fn run_agent_inner(
                     trace_id,
                     params.internal,
                     scope_task_id,
+                    // Reached from the MaxStepsExceeded arm: the loop ran its
+                    // full step budget, then the deadline was too close for a
+                    // continuation turn.
+                    crate::planning::policy::MAX_TOOL_STEPS,
                 )
                 .await;
             }
@@ -3777,11 +3829,23 @@ async fn run_agent_inner(
                 text: Some(cont.text),
                 thinking,
                 usage: cont.usage.or(usage),
+                // Max-steps continuation, not a deadline overrun: the turn
+                // produced a summary. mika#2276's net must not fire here.
+                deadline_exceeded: None,
             })
         }
-        LoopResult::DeadlineExceeded { .. } => {
-            persist_deadline_fallback(db, session_id, trace_id, params.internal, scope_task_id)
-                .await
+        LoopResult::DeadlineExceeded {
+            steps_completed, ..
+        } => {
+            persist_deadline_fallback(
+                db,
+                session_id,
+                trace_id,
+                params.internal,
+                scope_task_id,
+                steps_completed,
+            )
+            .await
         }
     }
 }
@@ -3790,12 +3854,19 @@ async fn run_agent_inner(
 /// the corresponding `AgentOutput`. Centralizes the fallback shape so the three
 /// callsites (prelude gate, continuation-skip gate, `LoopResult::DeadlineExceeded`)
 /// stay in sync.
+///
+/// mika#2276 M2: this is also the single place that stamps
+/// [`AgentOutput::deadline_exceeded`]. Because all three deadline callsites
+/// return through here, the flag cannot be set on two of them and forgotten on
+/// the third — the fan-out shape that `feedback_structural_gate_audit_grep_all_callsites`
+/// warns about.
 async fn persist_deadline_fallback(
     db: &AsyncDatabase,
     session_id: &str,
     trace_id: &str,
     internal: bool,
     scope_task_id: Option<&str>,
+    steps_completed: usize,
 ) -> Result<AgentOutput> {
     let fallback = "I'm sorry, that took too long. Let me try a simpler approach next time.";
     db.save_message_with_task_context(
@@ -3812,6 +3883,8 @@ async fn persist_deadline_fallback(
         text: Some(fallback.to_string()),
         thinking: None,
         usage: None,
+        // mika#2276 M2: the one place that says "cut off, not concluded".
+        deadline_exceeded: Some(DeadlineOverrun { steps_completed }),
     })
 }
 
@@ -4289,6 +4362,9 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
     // mika#1798 Layer 4 (silent mode).
     let skill_data_grades = build_skill_data_grades(&matched);
     let skill_timeout = max_skill_timeout(&matched, provider, model);
+    // mika#2276 M1 (silent mode) — 2 of the 3 fan-out sites. qa-review runs in
+    // callback turns too, so this one is not decorative.
+    let skill_tool_timeouts = build_skill_tool_timeouts(&matched, provider, model);
     // Tool-arg suffix validation fires in silent mode too — qa-review runs
     // in callback turns and must still validate verdict trailers before GitHub
     // submission. Unlike required_suffix_lines (which is intentionally empty
@@ -4548,6 +4624,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         &skill_tool_map,
         &skill_data_grades,
         skill_timeout,
+        &skill_tool_timeouts,
         &tool_ctx,
         &mut request,
         &mode,
@@ -4954,6 +5031,8 @@ async fn run_team_agent_inner_impl(
     // tool map so both stay consistent under the same last-write-wins rule.
     let skill_data_grades = build_skill_data_grades(&matched_entries);
     let skill_timeout = max_skill_timeout(&matched_entries, provider, model);
+    // mika#2276 M1 (team mode) — 3 of the 3 fan-out sites.
+    let skill_tool_timeouts = build_skill_tool_timeouts(&matched_entries, provider, model);
     let required_tools = collect_required_tools(&matched, params.task_message);
     let required_suffix_lines = collect_required_suffix_lines(&matched);
     let required_finding_list_prefixes = collect_required_finding_list_prefixes(&matched);
@@ -5079,6 +5158,7 @@ async fn run_team_agent_inner_impl(
         &skill_tool_map,
         &skill_data_grades,
         skill_timeout,
+        &skill_tool_timeouts,
         &tool_ctx,
         &mut request,
         &mode,
@@ -5418,6 +5498,39 @@ fn max_skill_timeout(matched: &[&SkillEntry], provider_name: &str, model_name: &
         .map(|e| e.effective_timeout(provider_name, model_name))
         .max()
         .unwrap_or(crate::planning::policy::TOOL_TIMEOUT_SECS)
+}
+
+/// Build a lookup map from tool name → **the owning skill's** effective timeout (mika#2276 M1).
+///
+/// Sibling of [`build_skill_tool_map`] and [`build_skill_data_grades`]: same
+/// `matched` slice, same iteration order, same last-write-wins collision rule.
+/// The three must stay consistent — a tool dispatched to one skill's handler
+/// while being cut at another skill's budget is the defect this closes.
+///
+/// **Why this exists.** [`max_skill_timeout`] takes the maximum across every
+/// skill loaded in the turn and that maximum used to be applied *uniformly to
+/// every tool call*. So `run_shell` (owned by `shell-exec`, 30 s) ran under
+/// `build-mika`'s 300 s merely because `build-mika` is a declared dependency of
+/// `qa-review`. Measured on trace `921f11f0` (mika#2276): two
+/// `cargo test --release` calls of 237,9 s and 231,1 s inside one QA review
+/// turn — 469 s of a ~506 s envelope — after which the turn died on its
+/// deadline without ever writing a verdict.
+///
+/// `max_skill_timeout` keeps its meaning and stays the fallback for anything
+/// absent from this map; what it stops being is the per-tool budget.
+fn build_skill_tool_timeouts(
+    matched: &[&SkillEntry],
+    provider_name: &str,
+    model_name: &str,
+) -> HashMap<String, u64> {
+    let mut map = HashMap::new();
+    for entry in matched {
+        let timeout = entry.effective_timeout(provider_name, model_name);
+        for st in &entry.skill_tools {
+            map.insert(st.definition.name.clone(), timeout);
+        }
+    }
+    map
 }
 
 /// Collect the union of all `required_tools` from keyword-matched skills' `[constraints]` sections.
@@ -7509,6 +7622,106 @@ mod tests {
         assert_eq!(
             max_skill_timeout(&matched, "anthropic", "claude-sonnet-4-6"),
             120
+        );
+    }
+
+    /// mika#2276 AC4 — **contrôle négatif de M1.**
+    ///
+    /// La doctrine QA (`skills/bundled/qa-review/system_prompt.md:194`) raisonne
+    /// sur « `run_shell`'s 30s budget ». Le moteur ne tenait pas ce plancher :
+    /// `max_skill_timeout` prend le MAXIMUM des timeouts de tous les skills du
+    /// tour et l'applique uniformément à chaque appel d'outil. `shell-exec`
+    /// déclare 30 s ; `build-mika`, dépendance déclarée de `qa-review`, déclare
+    /// 300 s. Mesuré sur la trace `921f11f0` : deux `cargo test --release` de
+    /// 237,9 s et 231,1 s, soit 469 s des ~506 s d'enveloppe du tour.
+    ///
+    /// Ce test asserte le contrat inverse : **le budget d'un outil est celui du
+    /// skill qui le définit**, pas celui du skill le plus généreux du tour.
+    ///
+    /// Rouge sur `main` — voir le corps de PR : avant le fix, le seul chemin de
+    /// résolution était `max_skill_timeout`, qui rend 300 pour ce même jeu.
+    #[test]
+    fn mika2276_tool_budget_is_its_own_skills_budget_not_the_turns_maximum() {
+        // Le jeu exact de la trace 921f11f0 : shell-exec (30 s) possède
+        // `run_shell`, build-mika (300 s) est chargé comme dépendance.
+        let shell_exec = make_skill_entry("shell-exec", 30, &["run_shell"]);
+        let build_mika = make_skill_entry("build-mika", 300, &["build_mika"]);
+        let matched: Vec<&SkillEntry> = vec![&shell_exec, &build_mika];
+
+        let timeouts = build_skill_tool_timeouts(&matched, "anthropic", "claude-sonnet-4-6");
+
+        assert_eq!(
+            timeouts.get("run_shell").copied(),
+            Some(30),
+            "run_shell doit être coupé au budget déclaré par shell-exec (30 s), \
+             pas au maximum du tour"
+        );
+        assert_eq!(
+            timeouts.get("build_mika").copied(),
+            Some(300),
+            "build_mika garde son propre budget — le fix n'abaisse personne"
+        );
+
+        // Le défaut lui-même, épinglé : `max_skill_timeout` rend toujours le
+        // maximum. Il survit comme plafond de repli pour les outils absents de
+        // la carte (MCP, builtins non-skill) ; ce qui change est que la valeur
+        // passée à `execute_skill_tool` ne vient plus de lui.
+        assert_eq!(
+            max_skill_timeout(&matched, "anthropic", "claude-sonnet-4-6"),
+            300,
+            "max_skill_timeout garde sa sémantique de maximum — c'est son usage \
+             comme budget par outil qui est retiré"
+        );
+    }
+
+    /// mika#2276 AC4 — les overrides provider/modèle suivent le skill propriétaire.
+    ///
+    /// `effective_timeout` résout `modèle > provider > racine`. La carte par outil
+    /// doit hériter de cette résolution, sinon un override déclaré chez un skill
+    /// serait perdu au moment où il compte.
+    #[test]
+    fn mika2276_per_tool_budget_honours_provider_overrides() {
+        let mut fast = make_skill_entry("fast", 30, &["quick_tool"]);
+        fast.provider_overrides.insert(
+            "openai".to_string(),
+            crate::skills::manifest::ProviderSkillFields {
+                timeout_secs: Some(90),
+                max_prompt_size: None,
+            },
+        );
+        let slow = make_skill_entry("slow", 600, &["slow_tool"]);
+        let matched: Vec<&SkillEntry> = vec![&fast, &slow];
+
+        let openai = build_skill_tool_timeouts(&matched, "openai", "gpt-4o");
+        assert_eq!(openai.get("quick_tool").copied(), Some(90));
+
+        let anthropic = build_skill_tool_timeouts(&matched, "anthropic", "claude-sonnet-4-6");
+        assert_eq!(anthropic.get("quick_tool").copied(), Some(30));
+    }
+
+    /// mika#2276 AC4 — collision de noms d'outil : même règle que la carte des
+    /// outils et que celle des `data_grade` (dernier écrit gagne).
+    ///
+    /// Les trois cartes sont construites depuis le même `matched` dans le même
+    /// ordre ; si celle-ci divergeait, un outil serait dispatché vers le handler
+    /// d'un skill et coupé au budget d'un autre.
+    #[test]
+    fn mika2276_per_tool_budget_collision_follows_the_tool_map() {
+        let alpha = make_skill_entry("alpha", 10, &["shared_tool"]);
+        let beta = make_skill_entry("beta", 20, &["shared_tool"]);
+        let matched: Vec<&SkillEntry> = vec![&alpha, &beta];
+
+        let tool_map = build_skill_tool_map(&matched);
+        let timeouts = build_skill_tool_timeouts(&matched, "anthropic", "claude-sonnet-4-6");
+
+        assert_eq!(
+            tool_map["shared_tool"].skill_dir,
+            PathBuf::from("/skills/beta")
+        );
+        assert_eq!(
+            timeouts.get("shared_tool").copied(),
+            Some(20),
+            "le budget doit suivre le même gagnant que le handler"
         );
     }
 
