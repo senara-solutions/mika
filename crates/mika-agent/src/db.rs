@@ -8705,6 +8705,50 @@ impl Database {
         Ok(rows)
     }
 
+    /// Callback tasks whose dispatch may still be **alive**, with a
+    /// `process_id` set (mika#2272).
+    ///
+    /// # Why this is not [`Self::get_active_callback_tasks_with_pid`]
+    ///
+    /// That method filters `status = 'in_progress'`, and on this row that
+    /// status **never occurs**. A dispatch's callback child is created by
+    /// `build_callback_task` with no status at all, so `create_task` writes
+    /// `pending`; the auto-transition to `in_progress` (`executor.rs`, #525)
+    /// applies to the **parent** manual task, not to the child. The child
+    /// carries the PID (`set_task_process_id`, right after the spawn) and stays
+    /// `pending` until the callback lands and moves it to `delivered`.
+    ///
+    /// Measured on the production database on 2026-09-09, over every row that
+    /// has ever carried a `process_id`: 876 `delivered`, 19 `cancelled`, 1
+    /// `failed`, 1 `pending` — and **zero** `in_progress`. A reaper reading the
+    /// other method is not looking at a small population, it is looking at an
+    /// empty one, which is exactly why mika#2261 shipped and never fired.
+    ///
+    /// So this scans both surfaces on which a live dispatch can sit: `pending`,
+    /// which is where it actually sits, and `in_progress`, kept because nothing
+    /// guarantees the state machine keeps this shape and a reaper that silently
+    /// narrows again is the defect this method exists to close.
+    ///
+    /// The #959 watchdog deliberately keeps the narrower query: widening the
+    /// population of *that* mechanism changes who marks a task `failed` when a
+    /// process dies, which races the spawn monitor. Separate blast radius,
+    /// separate ticket.
+    pub fn get_live_dispatch_callback_tasks_with_pid(&self, agent_id: &str) -> Result<Vec<Task>> {
+        let sql = format!(
+            "SELECT {} FROM tasks
+             WHERE agent_id = ?1
+               AND trigger_type = 'callback'
+               AND status IN ('pending', 'in_progress')
+               AND process_id IS NOT NULL",
+            Self::TASK_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![agent_id], Self::row_to_task)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Set a single field in the task's metadata JSON (#959).
     ///
     /// Uses SQLite's `json_set()` to merge the field into existing metadata,

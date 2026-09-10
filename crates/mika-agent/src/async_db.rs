@@ -1302,6 +1302,18 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Callback tasks whose dispatch may still be alive, with a `process_id`
+    /// set (mika#2272).
+    ///
+    /// Scans both `pending` and `in_progress` — see
+    /// [`crate::db::Database::get_live_dispatch_callback_tasks_with_pid`] for
+    /// the measurement showing that the live row is the `pending` one.
+    pub async fn get_live_dispatch_callback_tasks_with_pid(&self) -> Result<Vec<crate::db::Task>> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.get_live_dispatch_callback_tasks_with_pid(&a))
+            .await
+    }
+
     /// Set a single field in the task's metadata JSON (#959).
     pub async fn set_task_metadata_field(
         &self,

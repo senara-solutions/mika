@@ -247,6 +247,32 @@ pub(crate) const PILOT_TRANSCRIPT_REPORTED_KEY: &str = "pilot_transcript_empty_r
 /// `fire_task()` immediately `tokio::spawn`s the heavy dispatch work, releasing
 /// the mutex before any I/O. This prevents the lock from blocking user message
 /// processing.
+/// The two statuses on which a dispatch whose process may still be running can
+/// sit (mika#2272).
+///
+/// `pending` first because that is where it actually sits: a dispatch's
+/// callback child is created without a status, so `create_task` writes
+/// `pending`, and the `pending → in_progress` auto-transition of #525 is
+/// applied to the **parent** manual task. The child keeps `pending` from the
+/// spawn — which is where `set_task_process_id` stamps the PID — until the
+/// callback lands and moves it to `delivered`.
+///
+/// `in_progress` is kept anyway. Nothing pins the state machine to this shape,
+/// and a predicate that silently narrows to whatever the code happens to write
+/// today is the defect mika#2272 is closing.
+///
+/// This mirrors the `status IN (…)` term of
+/// [`crate::db::Database::get_live_dispatch_callback_tasks_with_pid`]. The two
+/// must agree: the SELECT chooses the population and this re-checks it after
+/// the scan's filesystem I/O, so a divergence would let the reaper act on a row
+/// its own query would no longer return.
+const LIVE_DISPATCH_STATUSES: &[&str] = &[task_status::PENDING, task_status::IN_PROGRESS];
+
+/// Whether `status` is one of [`LIVE_DISPATCH_STATUSES`].
+fn is_live_dispatch_status(status: &str) -> bool {
+    LIVE_DISPATCH_STATUSES.contains(&status)
+}
+
 pub struct TaskEngine {
     db: AsyncDatabase,
     queue: BinaryHeap<QueuedTask>,
@@ -1644,17 +1670,24 @@ impl TaskEngine {
     /// A conjunction, and each term is pinned by a negative-control test that
     /// neutralises **only** it:
     ///
-    /// 1. `trigger_type='callback'`, `status='in_progress'`, `process_id NOT
-    ///    NULL` — the population, straight from
-    ///    [`AsyncDatabase::get_active_callback_tasks_with_pid`].
+    /// 1. `trigger_type='callback'`, `status IN ('pending','in_progress')`,
+    ///    `process_id NOT NULL` — the population, straight from
+    ///    [`AsyncDatabase::get_live_dispatch_callback_tasks_with_pid`].
+    ///    **`pending` is where a live dispatch actually sits** (mika#2272): the
+    ///    callback child is created without a status, so it is written
+    ///    `pending`, and #525 transitions the *parent* rather than the child.
+    ///    Scanning `in_progress` alone selected an empty set — 897 rows have
+    ///    carried a `process_id` in production and not one of them was ever
+    ///    `in_progress` — which is why mika#2261 shipped and never fired.
     /// 2. The process is **alive** (`is_same_process_alive`, PID-reuse safe).
     ///    A dead one belongs to the watchdog above.
     /// 3. A worktree was **declared** ([`DISPATCH_WORKTREE_FILE_KEY`]) and the
     ///    declaration file is readable and non-empty.
     /// 4. The declared path **exists** and yields at least one mtime.
     /// 5. That mtime is older than the configured window.
-    /// 6. The task is **still** `in_progress` on re-read — so an in-flight
-    ///    callback wins the race cleanly.
+    /// 6. The task is **still** in one of those two live statuses on re-read —
+    ///    so an in-flight callback, which moves the row to `completed` or
+    ///    `delivered`, wins the race cleanly.
     ///
     /// Terms 3 and 4 are the fail-safe, and they run the same way as
     /// everything else here: **absence of evidence is never evidence**. A
@@ -1662,18 +1695,24 @@ impl TaskEngine {
     /// path); a dispatch whose declaration was lost is indistinguishable from
     /// one. Both fall out of the population rather than into it.
     ///
-    /// # Detection is unconditional; disposition is not (Décision 4)
+    /// # Detection is unconditional; disposition is armed (mika#2272)
     ///
     /// The audit row is written whenever the predicate holds. The kill and the
-    /// transition happen only when `pilot_stall_reap_enabled` is armed, which
-    /// it is **not** by default. The asymmetry is the reason: a false negative
-    /// costs one dispatch slot, a false positive destroys hours of work in a
-    /// decision-core worktree, and the threshold's negative control is a
-    /// sample of size one. So the mechanism ships whole and measures first —
-    /// see [`mika_common::config::DEFAULT_PILOT_STALL_REAP_ENABLED`] for the
-    /// dated flip condition.
+    /// transition happen when `pilot_stall_reap_enabled` is armed, which since
+    /// mika#2272 it is **by default**.
+    ///
+    /// mika#2249 landed it disarmed behind a flip condition — three reviewed
+    /// `pilot_silent_stall` rows with no false positive. That condition counted
+    /// rows produced by a detector whose population was empty, so it could
+    /// never be met: zero rows was the absence of measurement, not evidence of
+    /// caution. What the caution bought is still paid, by the parts that did
+    /// not change — terms 3 and 4 keep any dispatch without a readable,
+    /// existing worktree out of the population entirely, the 2700 s window
+    /// still clears its measured negative control by a factor of two, and
+    /// `MIKA_PILOT_STALL_REAP_ENABLED=0` disarms without a rebuild. See
+    /// [`mika_common::config::DEFAULT_PILOT_STALL_REAP_ENABLED`].
     async fn reap_silently_stalled_pilots(&self) {
-        let tasks = match self.db.get_active_callback_tasks_with_pid().await {
+        let tasks = match self.db.get_live_dispatch_callback_tasks_with_pid().await {
             Ok(t) => t,
             Err(e) => {
                 warn!(error = %e, "pilot_stall_reaper: failed to query active callback tasks");
@@ -1750,14 +1789,14 @@ impl TaskEngine {
                 continue;
             }
 
-            // Term 6: still `in_progress`. Re-read rather than trust the
+            // Term 6: still on a live surface. Re-read rather than trust the
             // snapshot — the scan above did filesystem I/O, and a callback may
-            // have landed meanwhile.
+            // have landed meanwhile, moving the row to `completed`/`delivered`.
             let current = match self.db.get_task(&task.id).await {
                 Ok(Some(t)) => t,
                 _ => continue,
             };
-            if current.status != task_status::IN_PROGRESS {
+            if !is_live_dispatch_status(&current.status) {
                 debug!(
                     task_id = %task.id,
                     status = %current.status,
@@ -1775,6 +1814,7 @@ impl TaskEngine {
                 max_age_secs,
                 disposition_armed,
                 &system_session,
+                &current.status,
             )
             .await;
         }
@@ -1798,6 +1838,7 @@ impl TaskEngine {
         max_age_secs: u64,
         disposition_armed: bool,
         system_session: &str,
+        observed_status: &str,
     ) {
         // The disposition runs BEFORE the audit write, so `after_value` states
         // what actually happened rather than what was intended. A kill that
@@ -1850,10 +1891,15 @@ impl TaskEngine {
             }
         }
 
+        // `before_value` is the status actually READ off the row, never a
+        // constant. Hard-coding `in_progress` here would have made every audit
+        // row assert the very thing mika#2272 disproved — that a live dispatch
+        // sits in `in_progress` — and the row is the only surface anyone reads
+        // this mechanism through.
         let after_value = if transitioned {
             task_status::FAILED
         } else {
-            task_status::IN_PROGRESS
+            observed_status
         };
         warn!(
             event = "pilot_silent_stall",
@@ -1861,6 +1907,7 @@ impl TaskEngine {
             parent_task_id = ?task.parent_task_id,
             pid,
             worktree = %worktree.display(),
+            observed_status,
             worktree_idle_secs = age_secs,
             threshold_secs = max_age_secs,
             disposition_armed,
@@ -1875,11 +1922,12 @@ impl TaskEngine {
                 system_session,
                 "pilot_silent_stall",
                 &format!("task:{}", task.id),
-                Some(task_status::IN_PROGRESS),
+                Some(observed_status),
                 Some(after_value),
                 Some(&format!(
                     "worktree {} idle for {age_secs}s (threshold {max_age_secs}s), pid {pid} \
-                     alive; disposition_armed={disposition_armed}, transitioned={transitioned}",
+                     alive on a `{observed_status}` row; \
+                     disposition_armed={disposition_armed}, transitioned={transitioned}",
                     worktree.display()
                 )),
                 None,

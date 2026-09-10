@@ -1,11 +1,27 @@
 //! Integration tests for the pilot silent-stall reaper (mika#2249, D1).
 //!
 //! The class under test is the one no reaper could see before: a dispatch whose
-//! **process is alive** and whose task is `in_progress`, but whose worktree has
-//! received no write for hours. Every pre-existing reaper fires on task state,
+//! **process is alive** but whose worktree has received no write for hours.
+//! Every pre-existing reaper fires on task state,
 //! and the PID watchdog fires on a **dead** process — so `fb355061` sat for
 //! 2 h 18 with an empty `result`, no terminal marker, and no callback, until an
 //! operator disposed of it by hand.
+//!
+//! # This file covers the `in_progress` surface — not the production one
+//!
+//! Read this before adding a case here (mika#2272). Every test below seeds
+//! `in_progress` **by an explicit write**, and production never puts a live
+//! dispatch's callback row in that status: it is created `pending` and stays
+//! `pending` until the callback lands. That synthetic status is precisely how
+//! the reaper could ship, pass this whole file, and be inert in production for
+//! a day — the fixture manufactured the population the code knew how to read.
+//!
+//! The file is kept, and kept on `in_progress`, because the reaper's query
+//! covers both surfaces and the second one deserves coverage too. But the
+//! **production shape** — a `pending` row seeded through `build_callback_task`,
+//! with a real live process — lives in
+//! `test_reaper_reaps_live_pending_pilot_2272.rs`, and that is where a new case
+//! about "does the reaper actually fire" belongs.
 //!
 //! # Injection-verification recipe (MANDATORY, plan Phase 5 / AC5)
 //!
@@ -15,8 +31,9 @@
 //! assertion cannot pass. To re-verify against *this* branch, comment out the
 //! `self.reap_silently_stalled_pilots().await;` call in `TaskEngine::tick` —
 //! the count assertion in [`stalled_pilot_is_detected_and_disposed`] and the
-//! status assertion in [`observation_is_the_default`] must both fail. Restore,
-//! re-run, both pass.
+//! status assertion in [`disarmed_it_observes_without_disposing`] must both
+//! fail. Restore, re-run, both pass. (Done again on mika#2272, against the
+//! production-shape tests in the companion file.)
 //!
 //! # What these tests deliberately do NOT cover
 //!
@@ -125,8 +142,13 @@ fn declare_worktree(root: &Path, worktree: &Path) -> PathBuf {
     file
 }
 
-/// Seed the exact production shape: a `callback` task, `in_progress`, carrying
-/// `process_id` plus the two metadata fields the executor stamps.
+/// Seed the `in_progress` surface: a `callback` task moved there by an explicit
+/// write, carrying `process_id` plus the two metadata fields the executor
+/// stamps.
+///
+/// The `update_task_status` below is **not** what production writes on this row
+/// (mika#2272) — see this module's header. `test_reaper_reaps_live_pending_pilot_2272.rs`
+/// carries the production-shape fixture.
 async fn seed_dispatch(
     db: &AsyncDatabase,
     label: &str,
@@ -292,23 +314,29 @@ async fn disposition_writes_a_non_cancel_discriminator() {
 }
 
 // ---------------------------------------------------------------------------
-// AC8 — observation is the default.
+// AC8 — disarmed, it observes without disposing.
 // ---------------------------------------------------------------------------
 
-/// Same input as AC5, flag at its default: the audit row proves the detector
-/// SAW; the untouched status and the live PID prove it did not FIRE. Positive
-/// and negative control in one test, which is the point — an "observes only"
-/// claim asserted by absence alone is indistinguishable from a broken detector.
+/// Same input as AC5, disposition explicitly disarmed: the audit row proves the
+/// detector SAW; the untouched status and the live PID prove it did not FIRE.
+/// Positive and negative control in one test, which is the point — an "observes
+/// only" claim asserted by absence alone is indistinguishable from a broken
+/// detector.
+///
+/// Named for what it tests since mika#2272. It used to be called
+/// `observation_is_the_default`, and it kept passing after the default flipped
+/// to armed because it passes `armed: false` explicitly — a green test whose
+/// name asserted the opposite of the shipped behaviour.
 #[tokio::test]
-async fn observation_is_the_default() {
+async fn disarmed_it_observes_without_disposing() {
     let tmp = tempfile::tempdir().expect("tmp");
     let worktree = seed_worktree(tmp.path(), STALE_SECS);
     let declaration = declare_worktree(tmp.path(), &worktree);
 
     let db = test_db();
-    // `armed: false` mirrors DEFAULT_PILOT_STALL_REAP_ENABLED; the default
-    // itself is pinned in `mika_common::config`, so this fixture only has to
-    // reproduce it, not re-assert it.
+    // Explicitly disarmed. Since mika#2272 this is the opt-out, not the
+    // default; `mika_common::config` pins the default and
+    // `test_reaper_reaps_live_pending_pilot_2272.rs` exercises it.
     let dispatcher = test_dispatcher(db.clone(), false);
     let mut engine = TaskEngine::new(db.clone(), dispatcher);
 
@@ -486,10 +514,12 @@ async fn declared_but_missing_worktree_is_not_reaped() {
     kill_pid(pid);
 }
 
-/// (e) The task is no longer `in_progress` — the shape of a callback that
-/// landed while the scan was doing filesystem I/O. `get_active_callback_tasks_with_pid`
-/// already filters on `in_progress`, so this control pins the SELECT term
-/// together with the re-read that follows the scan.
+/// (e) The task has left the live statuses — the shape of a callback that landed
+/// while the scan was doing filesystem I/O. `get_live_dispatch_callback_tasks_with_pid`
+/// already filters on `pending`/`in_progress`, so this control pins the SELECT
+/// term together with the re-read that follows the scan. `completed` is chosen
+/// deliberately: since mika#2272 `pending` is *inside* the population, so a
+/// control using it would no longer neutralise this term.
 #[tokio::test]
 async fn task_no_longer_in_progress_is_not_reaped() {
     let tmp = tempfile::tempdir().expect("tmp");
