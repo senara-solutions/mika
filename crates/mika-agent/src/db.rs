@@ -9526,9 +9526,9 @@ impl Database {
     /// task-reuse). The callback child survives both: it keeps
     /// `dispatch_class='groom'` (derived from the `skill` input), reaches
     /// `completed` then `delivered`, and its `result` is the dispatch-lib RESULT
-    /// written by `POST /tasks/{id}/complete`, which carries the literal
-    /// `Outcome: PLAN_GROOMED` on convergence — the same marker
-    /// `try_dispatch_pilot_after_groom_success` already trusts.
+    /// written by `POST /tasks/{id}/complete`, which carries
+    /// [`crate::task_state::tasks::GROOM_SUCCESS_MARKER`] on convergence — the
+    /// same marker `try_dispatch_pilot_after_groom_success` already trusts.
     ///
     /// One query serves every groom producer: the parent `reference_url` is
     /// accepted in bare form or with the legacy
@@ -9551,9 +9551,14 @@ impl Database {
                AND child.trigger_type = 'callback'
                AND child.dispatch_class = 'groom'
                AND child.status IN ('completed', 'delivered')
-               AND instr(child.result, 'Outcome: PLAN_GROOMED') > 0
+               AND instr(child.result, ?4) > 0
                AND parent.reference_url IN (?2, ?3)",
-            params![agent_id, issue_url, legacy_groom_url],
+            params![
+                agent_id,
+                issue_url,
+                legacy_groom_url,
+                crate::task_state::tasks::GROOM_SUCCESS_MARKER
+            ],
             |row| row.get(0),
         )?;
         Ok(count > 0)

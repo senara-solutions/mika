@@ -2885,7 +2885,7 @@ async fn try_dispatch_pilot_after_groom_success(
 
     // 2. Canonical success marker in callback result text.
     match &task.result {
-        Some(r) if r.contains("Outcome: PLAN_GROOMED") => {}
+        Some(r) if r.contains(crate::task_state::tasks::GROOM_SUCCESS_MARKER) => {}
         _ => return,
     };
 
