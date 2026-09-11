@@ -5714,4 +5714,64 @@ mod tests {
         assert_eq!(cb.dispatch_class.as_deref(), Some("implement"));
         assert_eq!(cb.parent_task_id.as_deref(), Some(parent_id.as_str()));
     }
+
+    // ---- mika#2287: the #1620 dispatch gate must survive the #1614 flip ----
+
+    /// Anti-recursion guard (mika#2287). The #1620 grooming-provenance gate and
+    /// the #1614 task-reuse flip landed the same day with incompatible
+    /// assumptions: the gate looked for a `dispatch_class='groom'` parent row
+    /// with a `?phase=groom` URL suffix, while the structural producers write
+    /// the bare URL and flip the parent groom→implement before it ever reaches
+    /// a terminal status. The durable proof is the groom *callback* row — it
+    /// keeps `dispatch_class='groom'`, reaches `completed`/`delivered`, and
+    /// carries `Outcome: PLAN_GROOMED` in its result — exactly what
+    /// `try_dispatch_pilot_after_groom_success` already trusts.
+    ///
+    /// This test builds the pair through the production write API (no raw
+    /// SQL), flips the parent as the engine does, and asserts the gate passes.
+    /// It is RED on the pre-#2287 gate and GREEN after.
+    #[tokio::test]
+    async fn test_groom_gate_survives_implement_flip() {
+        let db = test_db();
+        let (parent_id, _cb) = create_groom_callback_pair(&db, true, Some(TEST_ISSUE_URL)).await;
+
+        // The mika#1614 / mika#996 task-reuse flip — the parent is now
+        // implement-class and still `in_progress`.
+        db.update_task_dispatch_class(&parent_id, "implement")
+            .await
+            .unwrap();
+        assert_eq!(dispatch_class_of(&db, &parent_id).await, "implement");
+
+        let verified = db
+            .has_completed_groom_for_issue(TEST_ISSUE_URL)
+            .await
+            .expect("gate query must not error");
+        assert!(
+            verified,
+            "the #1620 gate must recognise a completed groom callback with \
+             `Outcome: PLAN_GROOMED` under a parent that was flipped \
+             groom→implement (mika#2287)"
+        );
+    }
+
+    /// Refusal twin of the test above: the same pair, same flip, but the
+    /// callback result carries `Outcome: PLAN_ITERATE` — a groom that ran and
+    /// did NOT converge. The gate must refuse.
+    #[tokio::test]
+    async fn test_groom_gate_refuses_plan_iterate_after_flip() {
+        let db = test_db();
+        let (parent_id, _cb) = create_groom_callback_pair(&db, false, Some(TEST_ISSUE_URL)).await;
+        db.update_task_dispatch_class(&parent_id, "implement")
+            .await
+            .unwrap();
+
+        let verified = db
+            .has_completed_groom_for_issue(TEST_ISSUE_URL)
+            .await
+            .expect("gate query must not error");
+        assert!(
+            !verified,
+            "a groom callback without `Outcome: PLAN_GROOMED` is not proof of grooming"
+        );
+    }
 }

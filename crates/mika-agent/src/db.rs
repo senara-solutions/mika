@@ -9514,24 +9514,46 @@ impl Database {
         Ok(count > 0)
     }
 
-    /// Check whether a completed groom-class task exists for a given GitHub
-    /// issue. Used by the dispatch-classification gate (#1620) to verify that
-    /// grooming markers in an issue body were written by the autonomous
-    /// `dev-groom` loop (which creates tasks with `?phase=groom` URL suffix)
-    /// rather than pre-stamped by a manual `/mika-ask-arch` session.
+    /// Check whether the autonomous `dev-groom` loop has really groomed a
+    /// GitHub issue. Used by the dispatch-classification gate (#1620) so that
+    /// grooming markers in an issue body are only trusted when a groom actually
+    /// ran and converged — not when they were pre-stamped by hand.
     ///
-    /// `issue_url` is the canonical issue URL without the `?phase=groom` suffix
-    /// (e.g., `https://github.com/owner/repo/issues/123`). The method appends
-    /// the suffix internally to match the autonomous groom flow's URL pattern.
+    /// **Proof = the groom callback row (mika#2287).** The parent dispatch row
+    /// is not durable evidence: the structural producers write the bare issue
+    /// URL (mika#1572), and the engine flips the parent's `dispatch_class`
+    /// groom→implement before it ever reaches a terminal status (mika#1614
+    /// task-reuse). The callback child survives both: it keeps
+    /// `dispatch_class='groom'` (derived from the `skill` input), reaches
+    /// `completed` then `delivered`, and its `result` is the dispatch-lib RESULT
+    /// written by `POST /tasks/{id}/complete`, which carries the literal
+    /// `Outcome: PLAN_GROOMED` on convergence — the same marker
+    /// `try_dispatch_pilot_after_groom_success` already trusts.
+    ///
+    /// One query serves every groom producer: the parent `reference_url` is
+    /// accepted in bare form or with the legacy
+    /// [`crate::task_state::tasks::GROOM_PHASE_SUFFIX`] the LLM-driven path
+    /// appends. Nothing is appended to `issue_url` by the caller.
+    ///
+    /// Read-only, fail-closed: a single `SELECT`; a DB error propagates as
+    /// `Err` and the caller refuses the dispatch. A proof pruned by
+    /// `prune_completed_tasks` (30-day retention, either row) is a refusal.
     pub fn has_completed_groom_for_issue(&self, agent_id: &str, issue_url: &str) -> Result<bool> {
-        let groom_url = format!("{}?phase=groom", issue_url);
+        let legacy_groom_url = format!(
+            "{}{}",
+            issue_url,
+            crate::task_state::tasks::GROOM_PHASE_SUFFIX
+        );
         let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM tasks
-             WHERE agent_id = ?1
-               AND dispatch_class = 'groom'
-               AND status IN ('completed', 'delivered')
-               AND reference_url = ?2",
-            params![agent_id, groom_url],
+            "SELECT COUNT(*) FROM tasks child
+             JOIN tasks parent ON child.parent_task_id = parent.id
+             WHERE child.agent_id = ?1
+               AND child.trigger_type = 'callback'
+               AND child.dispatch_class = 'groom'
+               AND child.status IN ('completed', 'delivered')
+               AND instr(child.result, 'Outcome: PLAN_GROOMED') > 0
+               AND parent.reference_url IN (?2, ?3)",
+            params![agent_id, issue_url, legacy_groom_url],
             |row| row.get(0),
         )?;
         Ok(count > 0)
@@ -25550,15 +25572,29 @@ mod tests {
         assert!(result.is_none());
     }
 
-    // --- has_completed_groom_for_issue (#1620) ---
+    // --- has_completed_groom_for_issue (#1620, rewritten for mika#2287) ---
+    //
+    // The proof is the groom CALLBACK row joined to its parent, never the
+    // parent row alone: producers write the bare URL and the engine flips the
+    // parent groom→implement before it is terminal. Every row below is born
+    // from the production write API (`create_task` + `update_task_completed`
+    // / `update_task_status`) — no raw SQL INSERT.
 
-    fn groom_task(agent_id: &str, reference_url: &str) -> NewTask {
+    const GROOM_ISSUE_URL: &str = "https://github.com/senara-solutions/mika/issues/123";
+    const GROOM_CALLBACK_PLAN_GROOMED: &str =
+        "claude-pilot completed (status: done).\nOutcome: PLAN_GROOMED\nSession: sess-2287";
+    const GROOM_CALLBACK_PLAN_ITERATE: &str =
+        "claude-pilot completed (status: done).\nOutcome: PLAN_ITERATE\nSession: sess-2287";
+
+    /// Groom parent as the structural ready-label handler creates it
+    /// (`trigger_type='manual'`, bare issue URL, `dispatch_class='groom'`).
+    fn groom_parent(agent_id: &str, reference_url: &str) -> NewTask {
         NewTask {
             agent_id: agent_id.to_string(),
             team_run_id: None,
             parent_task_id: None,
             depth: 0,
-            label: "groom senara-solutions/mika#123".to_string(),
+            label: "ready-label: senara-solutions/mika#123".to_string(),
             trigger_type: "manual".to_string(),
             cron_expr: None,
             event_source: None,
@@ -25574,90 +25610,220 @@ mod tests {
             reference_url: Some(reference_url.to_string()),
             source: Some("self_dev".to_string()),
             metadata: None,
-            r#type: None,
+            r#type: Some("issue".to_string()),
             dispatch_class: Some("groom".to_string()),
         }
+    }
+
+    /// Groom callback child as `build_callback_task` creates it
+    /// (`trigger_type='callback'`, `reference_url: None`, class from the skill).
+    fn groom_callback(agent_id: &str, parent_id: &str, dispatch_class: &str) -> NewTask {
+        NewTask {
+            agent_id: agent_id.to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.to_string()),
+            depth: 1,
+            label: "long_running:run_claude_pilot".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some(dispatch_class.to_string()),
+        }
+    }
+
+    /// Build a groom parent + groom callback pair for `agent_id` and complete
+    /// the callback with `result` through the production write path. Returns
+    /// `(parent_id, callback_id)`.
+    fn completed_groom_pair(
+        db: &Database,
+        agent_id: &str,
+        reference_url: &str,
+        result: &str,
+    ) -> (String, String) {
+        let parent_id = db
+            .create_task(&groom_parent(agent_id, reference_url))
+            .unwrap();
+        db.update_task_status(&parent_id, "in_progress").unwrap();
+        let callback_id = db
+            .create_task(&groom_callback(agent_id, &parent_id, "groom"))
+            .unwrap();
+        assert!(
+            db.update_task_completed(&callback_id, agent_id, Some(result))
+                .unwrap(),
+            "callback must complete through the production write path"
+        );
+        (parent_id, callback_id)
     }
 
     #[test]
     fn test_groom_cross_check_no_task_returns_false() {
         let db = db();
-        let result = db
-            .has_completed_groom_for_issue(
-                "mika",
-                "https://github.com/senara-solutions/mika/issues/123",
-            )
+        assert!(
+            !db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_groom_cross_check_completed_callback_returns_true() {
+        let db = db();
+        completed_groom_pair(&db, "mika", GROOM_ISSUE_URL, GROOM_CALLBACK_PLAN_GROOMED);
+        assert!(
+            db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_groom_cross_check_delivered_callback_returns_true() {
+        let db = db();
+        let (_, callback_id) =
+            completed_groom_pair(&db, "mika", GROOM_ISSUE_URL, GROOM_CALLBACK_PLAN_GROOMED);
+        db.update_task_status(&callback_id, "delivered").unwrap();
+        assert!(
+            db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+                .unwrap()
+        );
+    }
+
+    /// mika#2287 anchor: the parent's CURRENT dispatch_class is irrelevant —
+    /// the engine flips it groom→implement (mika#1614) and the proof must
+    /// survive. The async twin of this test lives in
+    /// `task_engine::dispatcher::tests::test_groom_gate_survives_implement_flip`.
+    #[test]
+    fn test_groom_cross_check_survives_parent_flip_to_implement() {
+        let db = db();
+        let (parent_id, _) =
+            completed_groom_pair(&db, "mika", GROOM_ISSUE_URL, GROOM_CALLBACK_PLAN_GROOMED);
+        assert!(
+            db.update_task_dispatch_class(&parent_id, "mika", "implement")
+                .unwrap()
+        );
+        assert!(
+            db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+                .unwrap()
+        );
+    }
+
+    /// R3/R14: the legacy LLM-driven path writes the parent URL with
+    /// `GROOM_PHASE_SUFFIX`; the same query accepts it.
+    #[test]
+    fn test_groom_cross_check_legacy_suffixed_parent_url_returns_true() {
+        let db = db();
+        let suffixed = format!(
+            "{}{}",
+            GROOM_ISSUE_URL,
+            crate::task_state::tasks::GROOM_PHASE_SUFFIX
+        );
+        completed_groom_pair(&db, "mika", &suffixed, GROOM_CALLBACK_PLAN_GROOMED);
+        assert!(
+            db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_groom_cross_check_pending_callback_returns_false() {
+        let db = db();
+        let parent_id = db
+            .create_task(&groom_parent("mika", GROOM_ISSUE_URL))
             .unwrap();
-        assert!(!result);
+        db.create_task(&groom_callback("mika", &parent_id, "groom"))
+            .unwrap();
+        // Callback never completed — no result, status pending.
+        assert!(
+            !db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+                .unwrap()
+        );
     }
 
     #[test]
-    fn test_groom_cross_check_completed_task_returns_true() {
+    fn test_groom_cross_check_plan_iterate_returns_false() {
         let db = db();
-        let issue_url = "https://github.com/senara-solutions/mika/issues/123";
-        let groom_url = format!("{}?phase=groom", issue_url);
-        let task = groom_task("mika", &groom_url);
-        let id = db.create_task(&task).unwrap();
-        db.update_task_status(&id, "completed").unwrap();
-
-        let result = db.has_completed_groom_for_issue("mika", issue_url).unwrap();
-        assert!(result);
+        completed_groom_pair(&db, "mika", GROOM_ISSUE_URL, GROOM_CALLBACK_PLAN_ITERATE);
+        assert!(
+            !db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+                .unwrap()
+        );
     }
 
     #[test]
-    fn test_groom_cross_check_delivered_task_returns_true() {
+    fn test_groom_cross_check_implement_class_callback_returns_false() {
         let db = db();
-        let issue_url = "https://github.com/senara-solutions/mika/issues/123";
-        let groom_url = format!("{}?phase=groom", issue_url);
-        let task = groom_task("mika", &groom_url);
-        let id = db.create_task(&task).unwrap();
-        db.update_task_status(&id, "completed").unwrap();
-        db.update_task_status(&id, "delivered").unwrap();
-
-        let result = db.has_completed_groom_for_issue("mika", issue_url).unwrap();
-        assert!(result);
-    }
-
-    #[test]
-    fn test_groom_cross_check_pending_task_returns_false() {
-        let db = db();
-        let issue_url = "https://github.com/senara-solutions/mika/issues/123";
-        let groom_url = format!("{}?phase=groom", issue_url);
-        let task = groom_task("mika", &groom_url);
-        db.create_task(&task).unwrap();
-        // Status is "pending" (default) — should not satisfy the gate
-
-        let result = db.has_completed_groom_for_issue("mika", issue_url).unwrap();
-        assert!(!result);
-    }
-
-    #[test]
-    fn test_groom_cross_check_implement_class_returns_false() {
-        let db = db();
-        let issue_url = "https://github.com/senara-solutions/mika/issues/123";
-        let groom_url = format!("{}?phase=groom", issue_url);
-        let mut task = groom_task("mika", &groom_url);
-        task.dispatch_class = Some("implement".to_string());
-        let id = db.create_task(&task).unwrap();
-        db.update_task_status(&id, "completed").unwrap();
-
-        let result = db.has_completed_groom_for_issue("mika", issue_url).unwrap();
-        assert!(!result);
+        let parent_id = db
+            .create_task(&groom_parent("mika", GROOM_ISSUE_URL))
+            .unwrap();
+        let callback_id = db
+            .create_task(&groom_callback("mika", &parent_id, "implement"))
+            .unwrap();
+        db.update_task_completed(&callback_id, "mika", Some(GROOM_CALLBACK_PLAN_GROOMED))
+            .unwrap();
+        assert!(
+            !db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+                .unwrap()
+        );
     }
 
     #[test]
     fn test_groom_cross_check_different_agent_returns_false() {
         let db = db();
         db.register_agent("other-agent", "Other", "").unwrap();
-        let issue_url = "https://github.com/senara-solutions/mika/issues/123";
-        let groom_url = format!("{}?phase=groom", issue_url);
-        let task = groom_task("other-agent", &groom_url);
-        let id = db.create_task(&task).unwrap();
-        db.update_task_status(&id, "completed").unwrap();
+        completed_groom_pair(
+            &db,
+            "other-agent",
+            GROOM_ISSUE_URL,
+            GROOM_CALLBACK_PLAN_GROOMED,
+        );
+        // Query for "mika" — must not see the other agent's proof.
+        assert!(
+            !db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+                .unwrap()
+        );
+    }
 
-        // Query for "mika" agent — should not find the other-agent's task
-        let result = db.has_completed_groom_for_issue("mika", issue_url).unwrap();
-        assert!(!result);
+    #[test]
+    fn test_groom_cross_check_different_issue_returns_false() {
+        let db = db();
+        completed_groom_pair(&db, "mika", GROOM_ISSUE_URL, GROOM_CALLBACK_PLAN_GROOMED);
+        assert!(
+            !db.has_completed_groom_for_issue(
+                "mika",
+                "https://github.com/senara-solutions/mika/issues/124",
+            )
+            .unwrap()
+        );
+    }
+
+    /// The pre-mika#2287 proof shape — a terminal groom-class PARENT with the
+    /// suffixed URL and no callback — is no longer proof on its own. A hand
+    /// pre-stamped ticket cannot satisfy the gate by minting such a row.
+    #[test]
+    fn test_groom_cross_check_parent_only_legacy_shape_returns_false() {
+        let db = db();
+        let suffixed = format!(
+            "{}{}",
+            GROOM_ISSUE_URL,
+            crate::task_state::tasks::GROOM_PHASE_SUFFIX
+        );
+        let parent_id = db.create_task(&groom_parent("mika", &suffixed)).unwrap();
+        db.update_task_status(&parent_id, "completed").unwrap();
+        assert!(
+            !db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+                .unwrap()
+        );
     }
 
     // ------------------------------------------------------------------

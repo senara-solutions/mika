@@ -1495,9 +1495,10 @@ impl AsyncDatabase {
             .await
     }
 
-    /// Check whether a completed groom-class task exists for a given GitHub
-    /// issue (#1620). Used by the dispatch-classification gate to verify
-    /// grooming markers were written by the autonomous loop.
+    /// Check whether the autonomous loop really groomed a GitHub issue (#1620,
+    /// mika#2287): a completed groom *callback* row carrying
+    /// `Outcome: PLAN_GROOMED` under a parent for that issue. Read-only;
+    /// `Err` means the caller must refuse (fail-closed).
     pub async fn has_completed_groom_for_issue(&self, issue_url: &str) -> Result<bool> {
         let a = self.agent_id.clone();
         let u = issue_url.to_owned();
