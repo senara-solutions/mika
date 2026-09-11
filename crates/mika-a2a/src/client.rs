@@ -14,11 +14,44 @@ use crate::types::Task;
 /// mika#2036 this client had no timeout *policy* — only whatever the OS and the
 /// peer happened to do, which is not a decision.
 ///
-/// 300 s is measured, not generous. During the founding incident the longest
-/// generation that was delivered successfully took 114 s; 300 s leaves a 2.6x
-/// margin for a heavier generation or a degraded network while staying well
-/// short of an interval a caller would read as a hang.
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
+/// 600 s aligns the client budget with the engine total budget
+/// (`MIKA_AGENT_TOTAL_TIMEOUT_SECS`). Before mika#2297 this was 300 s, and a
+/// client that abandons a generation the engine is still within its own
+/// deadline to finish strands live work — the failure that cost four gate-proof
+/// attempts on 2026-09-11 (the arch, on a bloated brief, ran past 300 s while
+/// the engine's own 600 s budget had not yet expired). The client must never
+/// sit below the engine total; this is that value, and the env overrides it.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Env var naming the A2A send budget, in seconds — the single source of truth
+/// so no callsite carries a hardcoded literal (mika#2297).
+pub const TIMEOUT_ENV: &str = "MIKA_A2A_TIMEOUT_SECS";
+
+/// Resolve the send budget from the environment: `MIKA_A2A_TIMEOUT_SECS` (or the
+/// aligned [`DEFAULT_TIMEOUT`]), floored so it is never below
+/// `MIKA_AGENT_TOTAL_TIMEOUT_SECS`. The `client >= total` floor lives here so a
+/// caller cannot configure the client to give up before the engine's own
+/// deadline (mika#2297).
+pub fn resolve_send_timeout() -> Duration {
+    fn env_secs(key: &str) -> Option<u64> {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    }
+    let secs = resolve_timeout_secs(
+        env_secs(TIMEOUT_ENV),
+        env_secs("MIKA_AGENT_TOTAL_TIMEOUT_SECS"),
+    );
+    Duration::from_secs(secs)
+}
+
+/// Pure core of [`resolve_send_timeout`], separated so the `client >= total`
+/// floor is tested without touching process-global env (which races under
+/// parallel tests).
+fn resolve_timeout_secs(a2a: Option<u64>, total: Option<u64>) -> u64 {
+    a2a.unwrap_or(DEFAULT_TIMEOUT.as_secs())
+        .max(total.unwrap_or(0))
+}
 
 /// Budget for a recovery read (`tasks/get`) issued after a failed exchange.
 ///
@@ -36,13 +69,14 @@ pub struct A2aClient {
 }
 
 impl A2aClient {
-    /// Create a new A2A client with the [`DEFAULT_TIMEOUT`] budget.
+    /// Create a new A2A client with the environment-resolved send budget
+    /// ([`resolve_send_timeout`]).
     ///
     /// The signature is unchanged from before mika#2036 — both existing call
     /// sites (`mika-cli/src/remote_ask.rs`, `mika-agent/src/tools/a2a_call.rs`)
     /// compile untouched and simply gain a timeout they did not have.
     pub fn new(base_url: impl Into<String>, auth_token: Option<String>) -> Self {
-        Self::with_timeout(base_url, auth_token, DEFAULT_TIMEOUT)
+        Self::with_timeout(base_url, auth_token, resolve_send_timeout())
     }
 
     /// Create a client with an explicit budget.
@@ -177,10 +211,27 @@ mod tests {
     use super::*;
 
     /// AC2: the budget is a named decision in the code, not `reqwest`'s default
-    /// (which is *no* timeout at all).
+    /// (which is *no* timeout at all). 600 s aligns with the engine total
+    /// budget (mika#2297).
     #[test]
-    fn default_timeout_is_the_measured_300_seconds() {
-        assert_eq!(DEFAULT_TIMEOUT, Duration::from_secs(300));
+    fn default_timeout_aligns_with_the_engine_total_budget() {
+        assert_eq!(DEFAULT_TIMEOUT, Duration::from_secs(600));
+    }
+
+    /// The single-source default and the `client >= total` floor, tested on the
+    /// pure core so no process-global env is touched (mika#2297).
+    #[test]
+    fn resolve_send_timeout_floors_the_client_budget_at_the_engine_total() {
+        // Nothing set: the aligned 600 s default.
+        assert_eq!(resolve_timeout_secs(None, None), 600);
+        // A total above the default pulls the client up to meet it.
+        assert_eq!(resolve_timeout_secs(None, Some(900)), 900);
+        // An explicit client budget below the total is floored to the total.
+        assert_eq!(resolve_timeout_secs(Some(300), Some(600)), 600);
+        // An explicit client budget above the total is honored.
+        assert_eq!(resolve_timeout_secs(Some(900), Some(600)), 900);
+        // An explicit client budget with no total is honored as-is.
+        assert_eq!(resolve_timeout_secs(Some(120), None), 120);
     }
 
     /// A recovery read must not inherit the generation-sized budget.
