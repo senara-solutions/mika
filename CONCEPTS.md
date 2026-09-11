@@ -38,6 +38,24 @@ The distinction is load-bearing beyond confinement strength: the attestation tha
 
 A one-command reproducer that spawns a real sandbox through the same code path a dispatch uses, then asserts both directions: that credentials and host state are unreachable from inside, and that the tools the session legitimately needs still work. It exists because a containment claim read from source is not a containment result — the author is not their own control — so it also offers an interactive mode an external reviewer can enter the sandbox through and probe by hand.
 
+## Dispatch gates
+
+### Grooming-provenance gate
+
+The check that refuses an autonomous implementation dispatch on a ticket unless the loop itself groomed that ticket — a groom ran and converged. It is distinct from the body-marker check, which reads the ticket text for the grooming callout and can be satisfied by anything that writes text into the ticket; the provenance gate reads the loop's own record instead, so a hand-stamped callout does not pass it.
+
+The gate refuses on every degraded case of its own read — no record, an unreadable store, a record aged past retention — never allows by default. A bypass flag on it is an operator decision with a measured expiry, not a standing configuration: a gate that only passes traffic while its bypass is set has never been observed working.
+
+### Groom proof
+
+The record the grooming-provenance gate reads: the loop's own statement that a groom converged, held on the row whose shape no other mechanism is entitled to change during the ticket's life. A record that lives on a row another process rewrites — the dispatch parent, which task reuse re-classes — is not a proof, because the read can fail for reasons unrelated to whether grooming happened.
+
+A groom proof has a retention half-life: once the store prunes it, the ticket reads as never groomed and must be re-groomed through the loop. Grooming done outside the loop mints no proof by construction.
+
+### Task reuse
+
+The pattern by which one ticket keeps one dispatch identity across grooming and implementation: when a groom converges, the same parent task is re-classed from grooming to implementation and the pilot is launched against it, rather than a second parent being created. It exists so that an issue never holds two active dispatch rows at once. Its consequence for any reader is that the parent's class is not a stable fact — a check that needs "this was groomed" must read the [groom proof](#groom-proof), not the parent.
+
 ## Flagged ambiguities
 
 - *Guard* had been used for both a structural CI check and an in-process runtime assertion. In this glossary **structural guard** names the CI-enforced kind; a runtime assertion is not one.

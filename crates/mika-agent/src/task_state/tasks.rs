@@ -20,11 +20,24 @@ pub const VALID_TASK_TYPES: &[&str] = &[TASK_TYPE_ISSUE, TASK_TYPE_MILESTONE, TA
 // stable, greppable discriminator — do not spell them by hand at a call site.
 
 /// The `?phase=groom` URL suffix the LLM-driven grooming path appends to an
-/// issue URL (`crates/mika-agent/src/db.rs::has_completed_groom_for_issue`).
-/// `.../issues/1574` and `.../issues/1574?phase=groom` are DIFFERENT
-/// `reference_url`s; the cleanup surfaces canonicalize on the base URL so a
-/// fresh dispatch supersedes both variants for the same underlying issue.
+/// issue URL. `.../issues/1574` and `.../issues/1574?phase=groom` are
+/// DIFFERENT `reference_url`s; the cleanup surfaces canonicalize on the base
+/// URL so a fresh dispatch supersedes both variants for the same underlying
+/// issue. The dispatch gate
+/// (`crates/mika-agent/src/db.rs::has_completed_groom_for_issue`) no longer
+/// appends this suffix — since mika#2287 it reads the groom callback row and
+/// accepts the parent URL in either form.
 pub const GROOM_PHASE_SUFFIX: &str = "?phase=groom";
+
+/// The convergence marker dispatch-lib writes into a `dev-groom` callback's
+/// `result` (`skills/bundled/_shared/dispatch-lib.sh`, `Outcome:` line of the
+/// RESULT posted via `POST /tasks/{id}/complete`). Two readers share it and
+/// must never drift apart: the engine-side auto-fire
+/// (`task_engine::dispatcher::try_dispatch_pilot_after_groom_success`) and the
+/// dispatch-classification gate (`db::Database::has_completed_groom_for_issue`,
+/// mika#1620 / mika#2287). Writer lives in shell; keep this literal identical
+/// to the one dispatch-lib emits.
+pub const GROOM_SUCCESS_MARKER: &str = "Outcome: PLAN_GROOMED";
 
 /// `tasks.result` reason written when a phantom tracking row is cancelled
 /// because a fresh dispatch superseded it (mika#1934 AC2). SOLE WRITER:
