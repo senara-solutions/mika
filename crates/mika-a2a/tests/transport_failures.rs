@@ -161,5 +161,5 @@ async fn a_socket_dropped_after_the_request_lands_allows_recovery() {
 fn the_default_client_carries_the_measured_budget() {
     let client = A2aClient::new("http://127.0.0.1:9/a2a/mika-arch", None);
     assert_eq!(client.timeout(), DEFAULT_TIMEOUT);
-    assert_eq!(DEFAULT_TIMEOUT, Duration::from_secs(300));
+    assert_eq!(DEFAULT_TIMEOUT, Duration::from_secs(600));
 }
