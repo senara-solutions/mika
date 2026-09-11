@@ -1677,10 +1677,10 @@ pub(crate) async fn validate_dispatch_readiness(
                                         "predicate": "issue body must contain all three substrings: \
                                                       '> - **Branch:**', 'docs/plans/', and a second-pass \
                                                       marker ('(GROOMED)' or '(READY, paraphrased GROOMED ...)')",
-                                        "recovery": "Run /mika-groom-ticket <ref> to produce the canonical \
-                                                     callout block, or dispatch dev-groom first via \
-                                                     'mika ask --agent mika-dev \"groom <typed-ref>\"', or \
-                                                     set MIKA_DISPATCH_BYPASS_GROOMING_CHECK=1 to bypass.",
+                                        "recovery": "Dispatch dev-groom first via \
+                                                     'mika ask --agent mika-dev \"groom <typed-ref>\"' \
+                                                     (or re-apply the `ready` label) so the autonomous loop \
+                                                     produces the canonical callout block.",
                                         "reason": format!(
                                             "Cannot dispatch dev-pilot on ticket #{number}: issue body is \
                                              missing one or more grooming-marker signals. The grooming-marker \
@@ -1693,10 +1693,14 @@ pub(crate) async fn validate_dispatch_readiness(
                                     return Err(rejection.to_string());
                                 }
 
-                                // Grooming provenance cross-check (#1620): markers are
-                                // present but may have been pre-stamped by a manual
-                                // /mika-ask-arch session. Verify a completed groom-class
-                                // task exists for this issue in the DB.
+                                // Grooming provenance cross-check (#1620, mika#2287):
+                                // markers are present but may have been pre-stamped by
+                                // hand. Proof = a completed groom CALLBACK row carrying
+                                // `Outcome: PLAN_GROOMED` under a parent for this issue
+                                // (bare URL or legacy `?phase=groom`). The parent row is
+                                // not proof — the engine flips it groom→implement
+                                // (mika#1614) before it is terminal. Read-only,
+                                // fail-closed on every degraded case of the cross-check.
                                 let issue_url = format!(
                                     "https://github.com/{}/{}/issues/{}",
                                     owner, repo, number
@@ -1711,12 +1715,18 @@ pub(crate) async fn validate_dispatch_readiness(
                                             "task_id": task_id,
                                             "issue": format!("{}/{}#{}", owner, repo, number),
                                             "predicate": "issue body has grooming markers but no \
-                                                          completed dispatch_class='groom' task exists \
-                                                          for this issue — markers may be pre-stamped \
-                                                          from a manual /mika-ask-arch session",
-                                            "recovery": "Run /mika-groom-ticket <ref> to groom via \
-                                                         the autonomous loop, or set \
-                                                         MIKA_DISPATCH_BYPASS_GROOMING_CHECK=1 to bypass.",
+                                                          completed groom callback carrying \
+                                                          'Outcome: PLAN_GROOMED' exists under a task for \
+                                                          this issue — markers may be pre-stamped by hand, \
+                                                          or the proof aged past the 30-day task retention",
+                                            "recovery": "Groom through the autonomous loop: dispatch \
+                                                         dev-groom via 'mika ask --agent mika-dev \
+                                                         \"groom <typed-ref>\"' or re-apply the `ready` \
+                                                         label. If the plan already resolves on the \
+                                                         dispatch branch (hand-groomed ticket), dev-groom \
+                                                         answers `already_groomed` and mints no proof — \
+                                                         remove the plan from the branch first so a fresh \
+                                                         loop groom can run.",
                                             "reason": format!(
                                                 "Cannot dispatch dev-pilot on ticket #{number}: \
                                                  grooming markers are present in the issue body but \
@@ -1734,14 +1744,32 @@ pub(crate) async fn validate_dispatch_readiness(
                                         return Err(rejection.to_string());
                                     }
                                     Err(e) => {
-                                        // Fail-open on DB error (consistent with
-                                        // no-token fail-open behavior)
+                                        // Fail-closed (mika#2287): a DB error is a
+                                        // degraded case of the cross-check, same shape as
+                                        // the global-state and issue-body-fetch failures.
                                         warn!(
                                             task_id = task_id,
                                             error = %e,
                                             "grooming provenance cross-check failed, \
-                                             allowing dispatch (fail-open)"
+                                             rejecting dispatch (fail-closed)"
                                         );
+                                        let rejection = serde_json::json!({
+                                            "error": "dispatch_check_failed",
+                                            "task_id": task_id,
+                                            "issue": format!("{}/{}#{}", owner, repo, number),
+                                            "reason": format!(
+                                                "Failed to verify grooming provenance for ticket \
+                                                 #{number} (DB error: {e}). The dispatch-classification \
+                                                 gate refuses when it cannot read its proof (mika#2287)."
+                                            )
+                                        });
+                                        record_dispatch_rejection(
+                                            db,
+                                            task_id,
+                                            &rejection.to_string(),
+                                        )
+                                        .await;
+                                        return Err(rejection.to_string());
                                     }
                                 }
                             }
