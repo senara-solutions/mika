@@ -87,8 +87,9 @@ impl TransportFailure {
         match self {
             Self::Unreachable => format!("unreachable: no request reached {url}"),
             Self::TimedOut => format!(
-                "timed out: waited {}s for {url} and gave up",
-                timeout.as_secs()
+                "timed out: waited {secs}s for {url} and gave up \
+                 (client budget MIKA_A2A_TIMEOUT_SECS={secs}s spent)",
+                secs = timeout.as_secs()
             ),
             Self::HttpStatus(code) => format!("HTTP {code} from {url}"),
             Self::Undecodable => format!("unreadable response from {url}"),

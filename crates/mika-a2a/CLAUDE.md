@@ -11,8 +11,11 @@ A2A (Agent-to-Agent) protocol v0.3 implementation for inter-agent communication.
 
 ## Client transport policy (mika#2036)
 
-`A2aClient` carries an explicit budget: `DEFAULT_TIMEOUT` = **300 s**, a measured
-value (the longest generation ever delivered took 114 s; 300 s is a 2.6x margin),
+`A2aClient` carries an explicit budget: `DEFAULT_TIMEOUT` = **600 s**, aligned
+with the engine total budget (`MIKA_AGENT_TOTAL_TIMEOUT_SECS`) and overridable
+via `MIKA_A2A_TIMEOUT_SECS`; it must never sit below the engine total, or the
+client abandons a generation the engine is still within its deadline to finish
+(mika#2297; before it, 300 s),
 not `reqwest`'s default of *no timeout at all*. `A2aClient::new` keeps its
 signature and gains it; `with_timeout` overrides it, and `RECOVERY_TIMEOUT`
 (30 s) bounds a recovery read. `timeout()` reports what the client actually
