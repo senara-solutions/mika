@@ -269,6 +269,37 @@ mod tests {
         );
     }
 
+    /// mika#2293 — an envelope below its own floor is reported as *that*, not as
+    /// a containment failure.
+    ///
+    /// Distinct from the case above: here the plafond clears its own floor, so
+    /// only `validate()`'s first arm can catch the pair. `budget.rs` pins that
+    /// ordering in isolation; this pins that the guard actually surfaces it, with
+    /// the agent's name on it. Without this the fourth branch of
+    /// `first_violation` was only ever exercised through `CapNotContained`, and a
+    /// guard that reported "these two numbers do not fit" for a units mistake
+    /// would send the operator to the wrong key.
+    #[test]
+    #[serial]
+    fn mika2293_envelope_below_its_floor_is_named_as_such() {
+        clean_budget_env();
+        let home = home_with_agent(
+            "mika-relay",
+            "llm_http_timeout_secs = 12\nagent_total_timeout_secs = 15\n",
+        );
+        let err = assert_llm_budgets_valid(home.path())
+            .expect_err("une enveloppe sous son plancher doit refuser le démarrage");
+        let msg = format!("{err}");
+        assert!(msg.contains("mika-relay"), "message: {msg}");
+        assert!(
+            msg.contains("below the minimum")
+                && msg.contains(&MIN_AGENT_TOTAL_TIMEOUT_SECS.to_string()),
+            "le message doit désigner le plancher de l'enveloppe, pas le containment \
+             — « vous avez tapé des secondes là où des millisecondes étaient voulues » \
+             est plus utile que « ces deux nombres ne rentrent pas ». Message : {msg}"
+        );
+    }
+
     /// mika#2293 — an unreadable value is named, not swallowed.
     #[test]
     #[serial]

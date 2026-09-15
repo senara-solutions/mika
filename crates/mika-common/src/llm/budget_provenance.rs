@@ -65,6 +65,17 @@
 //! Positions 1 and 3 exist only when `global_home != agent_home` — exactly the
 //! condition `load_for_agent` itself branches on.
 //!
+//! **This is the third walk of that cascade in the workspace, and the count is
+//! written down so the next reader does not have to discover it.** The other
+//! two are `Settings::load_for_agent` itself (via config-rs) and
+//! `mika-cli`'s `commands::config::resolve_source`, added by mika#2218 to make
+//! the inverted order legible where `mika config get` reads it. The three differ
+//! in what they return — merged value, source label, and source + raw + parsed
+//! — so none is a drop-in for another, but the *order* is one fact in three
+//! places. If a fourth appears, the right move is a shared primitive in this
+//! crate rather than a fourth copy; what keeps this one honest meanwhile is the
+//! equality test below, which the CLI's walk has no counterpart for.
+//!
 //! # `default` is not ambiguous here, and that is deliberate (M11)
 //!
 //! `Settings::effective_llm_http_timeout_secs` falls back, when its field is
@@ -197,19 +208,11 @@ impl BudgetProvenance {
     /// it (mika#1660 keeps that panic on its own cold path; this reader
     /// precedes it, it does not replace it).
     pub fn resolve(global_home: &Path, agent_home: &Path) -> Self {
+        let layers = CascadeLayers::read(global_home, agent_home);
         Self {
-            http: resolve_key(
-                global_home,
-                agent_home,
-                HTTP_TIMEOUT_CONFIG_KEY,
-                HTTP_TIMEOUT_ENV_VAR,
-            ),
-            agent_total: resolve_key(
-                global_home,
-                agent_home,
-                AGENT_TOTAL_TIMEOUT_CONFIG_KEY,
-                AGENT_TOTAL_TIMEOUT_ENV_VAR,
-            ),
+            http: layers.resolve_key(HTTP_TIMEOUT_CONFIG_KEY, HTTP_TIMEOUT_ENV_VAR),
+            agent_total: layers
+                .resolve_key(AGENT_TOTAL_TIMEOUT_CONFIG_KEY, AGENT_TOTAL_TIMEOUT_ENV_VAR),
         }
     }
 
@@ -242,56 +245,93 @@ impl BudgetProvenance {
     }
 }
 
-/// Resolve one key through the four cascade positions, highest priority first.
+/// The file-backed cascade positions, read **once** per [`BudgetProvenance`].
 ///
-/// The branch on `global_home != agent_home` is the same discriminant
-/// `Settings::load_for_agent` uses, and for the same reason: under the legacy
+/// Both budget keys walk the same four doors, so reading per key would parse
+/// `{agent_home}/.env` twice and each `config.toml` up to twice, discarding a
+/// whole `HashMap` or `toml::Table` after pulling one key out of it. Cheap at
+/// the boot sites, but `teams::engine` re-runs its per-member loop on every
+/// suspend/resume of a team run — so the waste recurs there for the life of the
+/// run.
+///
+/// The `global_home != agent_home` discriminant is the same one
+/// `Settings::load_for_agent` branches on, for the same reason: under the legacy
 /// single-agent layout there is no per-agent file of either kind, and the
-/// process environment keeps the usual "shell always wins" semantics.
-fn resolve_key(
-    global_home: &Path,
-    agent_home: &Path,
-    config_key: &str,
-    env_var: &str,
-) -> ResolvedBudgetValue {
-    let has_agent_home = global_home != agent_home;
-
-    // 1. Per-agent `.env` — highest priority since mika#2218.
-    if has_agent_home && let Some(raw) = crate::dotenv::parse_dotenv(agent_home).get(env_var) {
-        return ResolvedBudgetValue::from_raw(BudgetSource::AgentDotenv, raw);
-    }
-
-    // 2. Process environment.
-    if let Ok(raw) = std::env::var(env_var)
-        && !raw.trim().is_empty()
-    {
-        return ResolvedBudgetValue::from_raw(BudgetSource::ProcessEnv, &raw);
-    }
-
-    // 3. Per-agent `config.toml`.
-    if has_agent_home
-        && let Some(raw) = read_config_key(&agent_home.join("config.toml"), config_key)
-    {
-        return ResolvedBudgetValue::from_raw(BudgetSource::AgentConfig, &raw);
-    }
-
-    // 4. Global `config.toml`.
-    if let Some(raw) = read_config_key(&global_home.join("config.toml"), config_key) {
-        return ResolvedBudgetValue::from_raw(BudgetSource::GlobalConfig, &raw);
-    }
-
-    ResolvedBudgetValue::compiled_default()
+/// process environment keeps its usual "shell always wins" semantics.
+struct CascadeLayers {
+    /// `{agent_home}/.env`, keyed by full `MIKA_*` variable name. `None` under
+    /// the legacy layout, where no per-agent `.env` participates.
+    agent_dotenv: Option<std::collections::HashMap<String, String>>,
+    /// `{agent_home}/config.toml`. `None` under the legacy layout — there the
+    /// file *is* the global one, and counting it twice would report
+    /// `agent_config` for a value that came from the shared file.
+    agent_config: Option<toml::Table>,
+    /// `{global_home}/config.toml`.
+    global_config: Option<toml::Table>,
 }
 
-/// Read one top-level key from a `config.toml`, as the string it was written as.
+impl CascadeLayers {
+    fn read(global_home: &Path, agent_home: &Path) -> Self {
+        let has_agent_home = global_home != agent_home;
+        Self {
+            agent_dotenv: has_agent_home.then(|| crate::dotenv::parse_dotenv(agent_home)),
+            agent_config: has_agent_home
+                .then(|| read_config_table(&agent_home.join("config.toml")))
+                .flatten(),
+            global_config: read_config_table(&global_home.join("config.toml")),
+        }
+    }
+
+    /// Resolve one key through the four positions, highest priority first.
+    fn resolve_key(&self, config_key: &str, env_var: &str) -> ResolvedBudgetValue {
+        // 1. Per-agent `.env` — highest priority since mika#2218.
+        if let Some(raw) = self.agent_dotenv.as_ref().and_then(|v| v.get(env_var)) {
+            return ResolvedBudgetValue::from_raw(BudgetSource::AgentDotenv, raw);
+        }
+
+        // 2. Process environment.
+        if let Ok(raw) = std::env::var(env_var)
+            && !raw.trim().is_empty()
+        {
+            return ResolvedBudgetValue::from_raw(BudgetSource::ProcessEnv, &raw);
+        }
+
+        // 3. Per-agent `config.toml`.
+        if let Some(raw) = self
+            .agent_config
+            .as_ref()
+            .and_then(|t| config_key_as_string(t, config_key))
+        {
+            return ResolvedBudgetValue::from_raw(BudgetSource::AgentConfig, &raw);
+        }
+
+        // 4. Global `config.toml`.
+        if let Some(raw) = self
+            .global_config
+            .as_ref()
+            .and_then(|t| config_key_as_string(t, config_key))
+        {
+            return ResolvedBudgetValue::from_raw(BudgetSource::GlobalConfig, &raw);
+        }
+
+        ResolvedBudgetValue::compiled_default()
+    }
+}
+
+/// Parse one `config.toml`, or `None` for an absent or unparseable file.
 ///
-/// Returns `None` for an absent file, an unparseable file, or an absent key —
-/// all three mean "this door carries nothing", which is the only distinction
-/// the cascade needs. Integers and quoted strings both come back as their
-/// decimal text so the caller parses one shape.
-fn read_config_key(path: &Path, key: &str) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let table: toml::Table = text.parse().ok()?;
+/// Both failures mean "this door carries nothing", which is the only
+/// distinction the cascade needs — a malformed file is refused loudly by
+/// `Settings::load_for_agent` itself, not here.
+fn read_config_table(path: &Path) -> Option<toml::Table> {
+    std::fs::read_to_string(path).ok()?.parse().ok()
+}
+
+/// One top-level key, as the string it was written as.
+///
+/// Integers and quoted strings both come back as their decimal text so the
+/// caller parses one shape.
+fn config_key_as_string(table: &toml::Table, key: &str) -> Option<String> {
     match table.get(key)? {
         toml::Value::Integer(i) => Some(i.to_string()),
         toml::Value::String(s) => Some(s.clone()),
