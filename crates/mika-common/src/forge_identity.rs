@@ -54,6 +54,19 @@ pub const REVIEWER_AGENT: &str = "mika-qa";
 /// se lire à un seul endroit.
 pub const REVIEWER_FORGE_LOGIN: &str = "mika-platform-qa";
 
+/// Le login GitHub sous lequel la boucle autonome ouvre ses PRs.
+///
+/// Défini ici, à côté de son pendant relecteur, pour la même raison : un
+/// changement de compte bot doit se lire à un seul endroit. Son premier
+/// consommateur est le réconciliateur de demandes de revue (mika#2334), qui
+/// s'en sert pour ne jamais poser de relecteur sur une PR humaine.
+///
+/// Délibérément **absent** de [`forge_login_for_agent`] : cette fonction sert
+/// uniquement à attraper une égalité d'identité prouvée sur le chemin de merge,
+/// et y cartographier le dispatcher élargirait la surface d'une fonction de
+/// sécurité sans qu'aucun appelant ne le demande.
+pub const DISPATCHER_FORGE_LOGIN: &str = "mika-platform-dev";
+
 /// Préfixe de la ligne porteuse du signal merge-ready.
 pub const MERGE_READY_MARKER: &str = "MERGE-READY-SIGNAL:";
 
