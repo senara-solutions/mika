@@ -14256,7 +14256,7 @@ impl Database {
 pub(crate) mod tests {
     use super::*;
 
-    fn db() -> Database {
+    pub(crate) fn db() -> Database {
         Database::open_in_memory().unwrap()
     }
 
