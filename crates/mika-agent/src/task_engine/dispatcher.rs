@@ -31,15 +31,16 @@ use crate::tools::ToolRegistry;
 
 use super::types::action_type;
 
-/// Les deux scans périodiques qui résolvent leur token GitHub via
+/// Les scans périodiques qui résolvent leur token GitHub via
 /// [`resolve_periodic_scan_token`] (mika#2205).
 ///
 /// Chaque variante ne porte qu'une chose : le nom d'événement du WARN émis
-/// quand aucun token n'est résolu. Les deux scans partagent tout le reste.
+/// quand aucun token n'est résolu. Les scans partagent tout le reste.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PeriodicScan {
     AutoPull,
     WipRescue,
+    QaReviewReconcile,
 }
 
 impl PeriodicScan {
@@ -48,6 +49,7 @@ impl PeriodicScan {
         match self {
             Self::AutoPull => "auto_pull_no_token",
             Self::WipRescue => "wip_rescue_no_token",
+            Self::QaReviewReconcile => "qa_review_reconcile_no_token",
         }
     }
 
@@ -56,6 +58,7 @@ impl PeriodicScan {
         match self {
             Self::AutoPull => "aucune sélection de ticket groomé ne s'exécute",
             Self::WipRescue => "aucun brouillon wip-rescue n'est repris",
+            Self::QaReviewReconcile => "aucune PR ouverte sans revue n'est rattrapée (mika#2334)",
         }
     }
 }
@@ -441,6 +444,7 @@ impl TaskDispatcher {
             "reflection" => Ok(self.dispatch_reflection(task).await?),
             "auto_pull_groomed" => Ok(self.dispatch_auto_pull_groomed(task).await?),
             "wip_rescue" => Ok(self.dispatch_wip_rescue(task).await?),
+            "qa_review_reconcile" => Ok(self.dispatch_qa_review_reconcile(task).await?),
             "curator_review" => Ok(self.dispatch_curator_review(task).await?),
             other => Err(anyhow!("unknown run_skill trigger: {}", other).into()),
         }
@@ -1287,6 +1291,74 @@ impl TaskDispatcher {
                     task_id = %task.id,
                     trace_id = %trace_id,
                     "wip_rescue: no action taken"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Run the QA-review reconciliation scan (mika#2334).
+    ///
+    /// Cron-driven, fond-de-file like `auto_pull` and `wip_rescue`: no silent
+    /// agent turn, no LLM. It reads open PRs once per repo and asks
+    /// `mika-platform-qa` for a review on the loop's PRs that nothing came to
+    /// review — the recovery path for a lost `pull_request.opened`, which is an
+    /// event nothing replays.
+    ///
+    /// No label is written, so unlike its two neighbours there is no
+    /// `resolve_periodic_scan_label_token` here (mika#2228 is about label
+    /// scope; `requested_reviewers` is a different endpoint whose refusals are
+    /// reported under `qa_review_request_failed`).
+    async fn dispatch_qa_review_reconcile(&self, task: &Task) -> Result<()> {
+        // mika#2205 — PAT d'abord, App en repli. Poser un relecteur n'est pas
+        // une opération dont GitHub lit l'auteur au sens d'ADR-008 (au
+        // contraire d'une revue ou d'un merge), donc l'identité bot de l'App
+        // est acceptable en repli, au même titre que la bascule de label
+        // d'`auto_pull`.
+        let resolved = resolve_periodic_scan_token(
+            &self.settings,
+            self.github_app.as_deref(),
+            &task.id,
+            PeriodicScan::QaReviewReconcile,
+        )
+        .await;
+        let github_token = match resolved.as_deref() {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+
+        let trace_id = mika_common::trace::generate_trace_id();
+        let session_id = format!("qa-review-reconcile-{}", uuid::Uuid::new_v4());
+
+        debug!(
+            task_id = %task.id,
+            trace_id = %trace_id,
+            "qa_review_reconcile: running review-request reconciliation scan"
+        );
+
+        let result = crate::qa_review_reconcile::reconcile_qa_review_requests(
+            &self.db,
+            github_token,
+            &trace_id,
+            &session_id,
+        )
+        .await;
+
+        match result {
+            Some(count) => {
+                info!(
+                    task_id = %task.id,
+                    reconciled = count,
+                    trace_id = %trace_id,
+                    "qa_review_reconcile: scan complete"
+                );
+            }
+            None => {
+                debug!(
+                    task_id = %task.id,
+                    trace_id = %trace_id,
+                    "qa_review_reconcile: no action taken"
                 );
             }
         }
@@ -3259,6 +3331,37 @@ mod tests {
         s
     }
 
+    /// Tous les scans périodiques, pour que les gardes mika#2205 couvrent chaque
+    /// variante plutôt qu'une liste écrite à la main à chaque test.
+    ///
+    /// Couplé structurellement à l'énumération par
+    /// `mika2334_every_scan_variant_is_covered` : ajouter une variante casse la
+    /// compilation de ce test tant qu'elle n'est pas ajoutée ici.
+    const ALL_PERIODIC_SCANS: [PeriodicScan; 3] = [
+        PeriodicScan::AutoPull,
+        PeriodicScan::WipRescue,
+        PeriodicScan::QaReviewReconcile,
+    ];
+
+    /// Le couplage : le `match` exhaustif refuse de compiler quand une variante
+    /// apparaît, et l'assertion de longueur dit alors quoi faire.
+    #[test]
+    fn mika2334_every_scan_variant_is_covered() {
+        for scan in ALL_PERIODIC_SCANS {
+            match scan {
+                PeriodicScan::AutoPull
+                | PeriodicScan::WipRescue
+                | PeriodicScan::QaReviewReconcile => {}
+            }
+        }
+        assert_eq!(
+            ALL_PERIODIC_SCANS.len(),
+            3,
+            "une variante de PeriodicScan a été ajoutée : l'ajouter à \
+             ALL_PERIODIC_SCANS, sinon les gardes mika#2205 ne la couvrent pas"
+        );
+    }
+
     /// `Settings` avec un PAT — l'identité machine d'ADR-008.
     fn settings_with_pat(pat: &str) -> Settings {
         let mut s = Settings::test_defaults();
@@ -3274,7 +3377,7 @@ mod tests {
         let app = mika_common::github_app::GitHubApp::new_with_test_token("ghs_app_token").await;
         let settings = settings_without_pat();
 
-        for scan in [PeriodicScan::AutoPull, PeriodicScan::WipRescue] {
+        for scan in ALL_PERIODIC_SCANS {
             let token =
                 resolve_periodic_scan_token(&settings, Some(app.as_ref()), "task-2205", scan).await;
             assert_eq!(
@@ -3293,7 +3396,7 @@ mod tests {
         let app = mika_common::github_app::GitHubApp::new_with_test_token("ghs_app_token").await;
         let settings = settings_with_pat("ghp_machine_user");
 
-        for scan in [PeriodicScan::AutoPull, PeriodicScan::WipRescue] {
+        for scan in ALL_PERIODIC_SCANS {
             let token =
                 resolve_periodic_scan_token(&settings, Some(app.as_ref()), "task-2205", scan).await;
             assert_eq!(
@@ -3311,7 +3414,7 @@ mod tests {
     async fn mika2205_no_pat_and_no_app_still_skips() {
         let settings = settings_without_pat();
 
-        for scan in [PeriodicScan::AutoPull, PeriodicScan::WipRescue] {
+        for scan in ALL_PERIODIC_SCANS {
             let token = resolve_periodic_scan_token(&settings, None, "task-2205", scan).await;
             assert!(
                 token.is_none(),
@@ -3320,18 +3423,23 @@ mod tests {
         }
     }
 
-    /// Les deux WARN portent des noms d'événement distincts : un opérateur qui
-    /// grep `wip_rescue_no_token` ne doit pas récolter les ticks d'`auto_pull`.
+    /// Chaque WARN porte un nom d'événement distinct : un opérateur qui grep
+    /// `wip_rescue_no_token` ne doit pas récolter les ticks d'`auto_pull`, ni
+    /// ceux de `qa_review_reconcile`.
     #[test]
     fn mika2205_scan_warn_events_are_distinct() {
-        assert_ne!(
-            PeriodicScan::AutoPull.no_token_event(),
-            PeriodicScan::WipRescue.no_token_event()
-        );
+        let mut seen = std::collections::HashSet::new();
+        for scan in ALL_PERIODIC_SCANS {
+            assert!(
+                seen.insert(scan.no_token_event()),
+                "{scan:?} partage son nom d'événement avec un autre scan — \
+                 le grep de l'opérateur ne discriminerait plus"
+            );
+        }
     }
 
-    /// AC1 + AC2, garde structurelle : ni `dispatch_auto_pull_groomed` ni
-    /// `dispatch_wip_rescue` ne doivent relire `self.github_token`.
+    /// AC1 + AC2, garde structurelle : aucun scan périodique ne doit relire
+    /// `self.github_token`.
     ///
     /// Les quatre tests ci-dessus prouvent que le **résolveur** fait le bon
     /// choix ; aucun ne prouve que les deux scans l'appellent. Le défaut de
@@ -3352,7 +3460,13 @@ mod tests {
         )
         .expect("la garde doit pouvoir lire dispatcher.rs");
 
-        for fn_name in ["dispatch_auto_pull_groomed", "dispatch_wip_rescue"] {
+        for fn_name in [
+            "dispatch_auto_pull_groomed",
+            "dispatch_wip_rescue",
+            // mika#2334 — le quatrième scan naît avec la garde, il ne la
+            // rejoint pas après une panne.
+            "dispatch_qa_review_reconcile",
+        ] {
             let sig = format!("async fn {fn_name}(");
             let start = src
                 .find(&sig)
