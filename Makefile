@@ -47,6 +47,12 @@ install: ## Copy release binaries + scripts to INSTALL_DIR (safe while services 
 	@chmod +x $(INSTALL_DIR)/mika-pilot-egress-proxy.tmp
 	@mv $(INSTALL_DIR)/mika-pilot-egress-proxy.tmp $(INSTALL_DIR)/mika-pilot-egress-proxy
 	@echo "Installed mika-pilot-egress-proxy -> $(INSTALL_DIR)/mika-pilot-egress-proxy"
+	@# mika#2313: sandbox-safe ~/.claude.json emitter — dispatch-lib.sh calls it
+	@# by the stable path so the contained pilot keeps its prompt cache.
+	@cp scripts/mika-pilot-sanitize-claude-json $(INSTALL_DIR)/mika-pilot-sanitize-claude-json.tmp
+	@chmod +x $(INSTALL_DIR)/mika-pilot-sanitize-claude-json.tmp
+	@mv $(INSTALL_DIR)/mika-pilot-sanitize-claude-json.tmp $(INSTALL_DIR)/mika-pilot-sanitize-claude-json
+	@echo "Installed mika-pilot-sanitize-claude-json -> $(INSTALL_DIR)/mika-pilot-sanitize-claude-json"
 	@# addon deployed at stable path (2026-08-05).
 	@cp scripts/mika-pilot-anthropic-auth-addon.py $(INSTALL_DIR)/mika-pilot-anthropic-auth-addon.py.tmp
 	@mv $(INSTALL_DIR)/mika-pilot-anthropic-auth-addon.py.tmp $(INSTALL_DIR)/mika-pilot-anthropic-auth-addon.py
