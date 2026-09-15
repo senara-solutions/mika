@@ -5128,6 +5128,27 @@ _groom_warn() {
     echo "WARN: iterate_groom_loop: $1" >&2
 }
 
+# mika#2296 — an architect pass that returned an EMPTY `.content`.
+#
+# This used to be reported as a missing JSON field, which sent the reader
+# looking for a transport defect. The measured cause is a budget defect: a
+# reasoning model counts its thinking in the OUTPUT budget, so on a heavy brief
+# the thinking exhausts `llm_max_tokens` before the verdict line is ever
+# emitted. The provider answers 200 with a well-formed envelope whose `content`
+# is empty — nothing is missing, the answer is genuinely empty. That ambiguity
+# cost three attempts and four tickets.
+#
+# The engine-side confirmation is one grep, named here so the reader does not
+# have to know it exists. Message only — the caller's guard and its `return 1`
+# are unchanged.
+_groom_warn_empty_content() {
+    _groom_warn "$1 returned an EMPTY .content (not a malformed response): the architect \
+answered with no visible text. Most likely the model spent its whole output budget on \
+internal reasoning before emitting the verdict (mika#2296) — confirm with \
+\`grep llm_reasoning_budget_exhausted \$MIKA_SPIRIT_LOG_FILE\`, whose line carries \
+output_tokens/max_tokens, and raise \`llm_max_tokens\` in that agent's config.toml if it fired."
+}
+
 _iterate_groom_loop() {
     # Phase D — the iterate-loop state machine (mika#1271).
     #
@@ -5220,8 +5241,16 @@ _iterate_groom_loop() {
         fi
         content1=$(printf '%s' "$resp1" | jq -r '.content // empty' 2>/dev/null)
         session_id=$(printf '%s' "$resp1" | jq -r '.metadata.session_id // empty' 2>/dev/null)
-        [ -n "$content1" ] && [ -n "$session_id" ] || {
-            _groom_warn "first-pass response missing .content or .metadata.session_id"
+        # mika#2296 — the two failures are told apart. An empty `.content` and a
+        # missing `.metadata.session_id` used to share one message naming a JSON
+        # field, so a budget defect read as a transport defect.
+        [ -n "$content1" ] || {
+            _groom_warn_empty_content "first-pass"
+            return 1
+        }
+        [ -n "$session_id" ] || {
+            _groom_warn "first-pass response missing .metadata.session_id (the envelope itself \
+is incomplete — this is NOT the mika#2296 empty-content case)"
             return 1
         }
         disposition=$(printf '%s' "$content1" | _parse_disposition)
@@ -5249,7 +5278,7 @@ _iterate_groom_loop() {
                 _groom_warn "second-pass _arch_ask failed"; return 1; }
             local content2; content2=$(printf '%s' "$resp2" | jq -r '.content // empty' 2>/dev/null)
             [ -n "$content2" ] || {
-                _groom_warn "second-pass response missing .content"; return 1; }
+                _groom_warn_empty_content "second-pass"; return 1; }
             local verdict; verdict=$(printf '%s' "$content2" | _parse_verdict)
             local _trail_suffix_v=""
             _disposition_was_fuzzy && _trail_suffix_v=" (fuzzy)"
@@ -5300,7 +5329,7 @@ _iterate_groom_loop() {
             }
             local content2_iter; content2_iter=$(printf '%s' "$resp2_iter" | jq -r '.content // empty' 2>/dev/null)
             [ -n "$content2_iter" ] || {
-                _groom_warn "second-pass response missing .content (after revise)"
+                _groom_warn_empty_content "second-pass (after revise)"
                 return 1
             }
             local verdict_iter; verdict_iter=$(printf '%s' "$content2_iter" | _parse_verdict)

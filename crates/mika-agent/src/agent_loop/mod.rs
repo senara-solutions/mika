@@ -1304,6 +1304,37 @@ async fn run_loop(
                 // disposition from the final text rather than accepting it (fail-closed).
                 let mut text = mika_common::llm::strip_internal_tags(&response.text());
 
+                // mika#2296 — a turn that ended on MaxTokens with nothing visible
+                // to show for it names itself, and names its remedy. See
+                // `is_reasoning_budget_exhausted` for why this lives here and not
+                // only in `calibration/`. Observability only: the turn ends below
+                // exactly as it did before.
+                if is_reasoning_budget_exhausted(
+                    response.stop_reason,
+                    &text,
+                    response.usage.output_tokens,
+                ) {
+                    warn!(
+                        event = "llm_reasoning_budget_exhausted",
+                        agent_id = db.agent_id(),
+                        session_id,
+                        trace_id = tool_ctx.trace_id,
+                        step,
+                        label = mode.label(),
+                        provider = llm.provider_name(),
+                        model = llm.model_name(),
+                        output_tokens = response.usage.output_tokens,
+                        max_tokens = llm.max_tokens(),
+                        "reasoning budget exhausted: the model stopped on MaxTokens having \
+                         billed its full output budget without emitting any visible text — \
+                         its reasoning consumed the budget before the answer. Remediation is \
+                         raising `llm_max_tokens` in this agent's config.toml (mika#2296). If \
+                         a raised ceiling is crossed again, do NOT raise it further: two \
+                         ceilings crossed in a row say the model of the failure is wrong — \
+                         look at the size of the brief instead (mika#2295)."
+                    );
+                }
+
                 // mika#1168 — refusal-detection telemetry (Phase C Step 10).
                 //
                 // When the model self-classifies a prior engine-injected
@@ -6863,6 +6894,36 @@ fn detect_persistable_output(text: &str) -> Option<&str> {
     PERSISTABLE_OUTPUT_RE.find(text).map(|m| m.as_str())
 }
 
+/// mika#2296 — is this turn a reasoning model that spent its whole output
+/// budget thinking, before emitting anything visible?
+///
+/// The signature is the conjunction the calibration module has classified as
+/// `FailureClass::ReasoningBudgetExhausted` since mika#1665: the provider
+/// stopped on `MaxTokens`, it billed output tokens, and yet the extracted text
+/// is empty. `output_tokens > 0` is what separates it from a genuinely empty
+/// response — without that term, a provider returning nothing at all would read
+/// as a budget problem.
+///
+/// **Why this exists in production and not only in `calibration/`.** The class
+/// was already named there, complete with its remediation in a comment
+/// ("Remediation is raising `max_tokens`") — at the one place no production
+/// failure ever passes through. In `run_loop`, `MaxTokens` is handled exactly
+/// like `EndTurn`: the turn leaves with empty text and says nothing. Three
+/// attempts and four tickets were spent walking down a chain of layers of which
+/// this was the last; the structural counter-measure is that the failure names
+/// itself in the log, with the name of its remedy, so the next diagnosis is one
+/// `grep` rather than three attempts.
+///
+/// This is a `warn!`, never a change of flow: the value chosen by mika#2296 can
+/// be exceeded in turn one day, and that day the line must already be there.
+fn is_reasoning_budget_exhausted(
+    stop_reason: LlmStopReason,
+    text: &str,
+    output_tokens: u64,
+) -> bool {
+    matches!(stop_reason, LlmStopReason::MaxTokens) && text.trim().is_empty() && output_tokens > 0
+}
+
 /// mika#1168 — detect the literal classifier-refusal shape the model emits
 /// when it self-classifies an engine correction as a prompt-injection
 /// attempt. Anchored to the first 60 chars of the stripped response and
@@ -7465,6 +7526,68 @@ mod tests {
     use crate::test_utils::test_helpers::test_async_db;
     use mika_common::claude::ToolDefinition;
     use std::path::PathBuf;
+
+    // ===========================================================================
+    // mika#2296 — reasoning-budget-exhaustion predicate (M2 / T3)
+    // ===========================================================================
+
+    /// The founding signature: MaxTokens, a full output budget billed, nothing
+    /// visible. This is the arch pass `8b623724` — 123 s, 8192 output tokens,
+    /// empty content, no `Disposition:` for dispatch-lib to parse.
+    #[test]
+    fn mika2296_maxtokens_with_empty_text_and_billed_output_is_budget_exhaustion() {
+        assert!(is_reasoning_budget_exhausted(
+            LlmStopReason::MaxTokens,
+            "",
+            8192
+        ));
+        // Whitespace-only is the same failure wearing a newline.
+        assert!(is_reasoning_budget_exhausted(
+            LlmStopReason::MaxTokens,
+            "\n  \n",
+            8192
+        ));
+    }
+
+    /// A turn that hit the ceiling *while writing* is truncated output, not a
+    /// starved verdict — the operator's remedy differs, so the signal must not
+    /// conflate them.
+    #[test]
+    fn mika2296_maxtokens_with_visible_text_is_not_budget_exhaustion() {
+        assert!(!is_reasoning_budget_exhausted(
+            LlmStopReason::MaxTokens,
+            "Disposition: READY",
+            8192
+        ));
+    }
+
+    /// Without the `output_tokens > 0` term, a provider that returned nothing at
+    /// all would read as a budget problem and send the operator to raise a
+    /// ceiling that was never reached.
+    #[test]
+    fn mika2296_zero_output_tokens_is_an_empty_response_not_a_starved_budget() {
+        assert!(!is_reasoning_budget_exhausted(
+            LlmStopReason::MaxTokens,
+            "",
+            0
+        ));
+    }
+
+    /// The other stop reasons keep their own meanings; an empty `EndTurn` is a
+    /// different defect with a different remedy.
+    #[test]
+    fn mika2296_other_stop_reasons_never_fire_the_budget_signal() {
+        for stop_reason in [
+            LlmStopReason::EndTurn,
+            LlmStopReason::ToolUse,
+            LlmStopReason::ContentFilter,
+        ] {
+            assert!(
+                !is_reasoning_budget_exhausted(stop_reason, "", 8192),
+                "{stop_reason:?} must not be reported as reasoning-budget exhaustion"
+            );
+        }
+    }
 
     // ===========================================================================
     // mika#1324 — Structural tool filter (CI webhook → no dispatch tools)

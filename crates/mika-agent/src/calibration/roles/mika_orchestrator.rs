@@ -23,7 +23,7 @@ use mika_common::llm::LlmProvider;
 
 use crate::calibration::failure::FailureClass;
 use crate::calibration::role::{RoleScenario, RoleScenarioResult};
-use crate::calibration::roles::llm_error_result;
+use crate::calibration::roles::{CALIBRATION_SCENARIO_MAX_TOKENS, llm_error_result};
 
 /// Shared system-prompt preamble establishing the orchestrator role framing.
 /// Each scenario appends its task-specific instruction.
@@ -127,7 +127,7 @@ async fn run_substrate_wedge_diagnosis(
             content: LlmContent::Text(fixture.to_string()),
         }],
         tools: None,
-        max_tokens: 2000,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
@@ -258,7 +258,7 @@ async fn run_ticket_framing_hard_evidence(
             content: LlmContent::Text(fixture.to_string()),
         }],
         tools: None,
-        max_tokens: 2000,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
@@ -372,7 +372,7 @@ async fn run_sibling_pr_collision_recovery(
             content: LlmContent::Text(fixture.to_string()),
         }],
         tools: None,
-        max_tokens: 2000,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
@@ -461,7 +461,7 @@ async fn run_deploy_gate_discipline(
             content: LlmContent::Text(fixture.to_string()),
         }],
         tools: None,
-        max_tokens: 2000,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
@@ -577,7 +577,7 @@ async fn run_escalation_vs_derivable(
             content: LlmContent::Text(fixture.to_string()),
         }],
         tools: None,
-        max_tokens: 2000,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 

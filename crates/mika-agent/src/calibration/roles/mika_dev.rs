@@ -14,7 +14,9 @@ use mika_common::llm::LlmProvider;
 
 use crate::calibration::failure::FailureClass;
 use crate::calibration::role::{RoleScenario, RoleScenarioResult};
-use crate::calibration::roles::{empty_response_result, llm_error_result};
+use crate::calibration::roles::{
+    CALIBRATION_SCENARIO_MAX_TOKENS, empty_response_result, llm_error_result,
+};
 
 /// Static scenario definitions for the mika-dev role.
 pub const SCENARIOS: &[RoleScenario] = &[
@@ -114,11 +116,10 @@ async fn run_refusal_regression(
             content: LlmContent::Text(fixture.to_string()),
         }],
         tools: None,
-        // Parity with the other scenarios (2000): reasoning-mode models (e.g.
-        // GLM-5.2) can burn a 1000-token budget entirely on internal reasoning
-        // before emitting visible content, producing a false EmptyResponse
-        // fail. See mika#1665.
-        max_tokens: 2000,
+        // mika#2296: the parity this comment used to claim by hand ("parity with
+        // the other scenarios (2000)", mika#1665) had already come undone — three
+        // scenarios of this very file were still at 1000. It is structural now.
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
@@ -184,7 +185,7 @@ async fn run_contract_dev_groom(
             content: LlmContent::Text(fixture.to_string()),
         }],
         tools: None,
-        max_tokens: 2000,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
@@ -239,7 +240,7 @@ async fn run_golden_path_dispatch(
             content: LlmContent::Text(fixture.to_string()),
         }],
         tools: None,
-        max_tokens: 2000,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
@@ -305,7 +306,7 @@ async fn run_required_tools_gate(
             content: LlmContent::Text(fixture.to_string()),
         }],
         tools: None,
-        max_tokens: 1000,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
@@ -361,7 +362,7 @@ async fn run_plan_callout_recognition(
             content: LlmContent::Text(fixture.to_string()),
         }],
         tools: None,
-        max_tokens: 1000,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
@@ -441,7 +442,7 @@ async fn run_destructive_action_thread_reground(
             content: LlmContent::Text(fixture.to_string()),
         }],
         tools: None,
-        max_tokens: 1000,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
