@@ -348,6 +348,156 @@ pub struct ToolsIdentityConfig {
 pub struct ContextIdentityConfig {
     #[serde(default)]
     pub summary: ContextSummaryConfig,
+    #[serde(default)]
+    pub history: ContextHistoryConfig,
+}
+
+/// Perimeter of the conversation window loaded for a turn (mika#2295).
+///
+/// The window has always been bounded by a **count** (`LIMIT 20`) and filtered
+/// on `m.agent_id`, never on `m.session_id`. For an agent whose messages are
+/// whole plans and architect reviews, twenty items of unbounded size is not a
+/// bounded window, and an agent-wide perimeter means a review of ticket A reads
+/// the plans of tickets B, C and D. This enum is the first of the two levers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryScope {
+    /// Every session of this agent — the pre-mika#2295 behaviour, and the default.
+    Agent,
+    /// The turn's own session only.
+    Session,
+}
+
+/// Wire value of [`HistoryScope::Agent`] in `identity.toml`.
+pub const HISTORY_SCOPE_AGENT: &str = "agent";
+/// Wire value of [`HistoryScope::Session`] in `identity.toml`.
+pub const HISTORY_SCOPE_SESSION: &str = "session";
+
+/// Sanity ceiling on `[context.history] max_tokens`.
+///
+/// A value above this is read as a typo (bytes typed where tokens were meant)
+/// and falls back to *no ceiling* with a WARN. It is deliberately not a clamp:
+/// silently capping an absurd value would leave the operator believing a ceiling
+/// applies at the figure they wrote.
+const HISTORY_MAX_TOKENS_SANITY_CEILING: usize = 1_000_000;
+
+/// `[context.history]` subsection — the conversation window's perimeter and its
+/// byte ceiling (mika#2295). Shaped on `[context.summary]` (mika#1019/#1021) on
+/// purpose: same nesting, same `Some(0)` omission sentinel, same
+/// [`CHARS_PER_TOKEN_ESTIMATE`] conversion — one estimator in the crate, not two.
+///
+/// ```toml
+/// [context.history]
+/// scope = "session"   # "agent" (default, current behaviour) | "session"
+/// max_tokens = 8000   # optional; absent = no ceiling
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct ContextHistoryConfig {
+    /// Window perimeter. Kept as a `String` rather than a `#[serde]` enum so an
+    /// unrecognized value degrades to the default with a WARN instead of failing
+    /// the whole `identity.toml` parse — which, for a well-known agent, means the
+    /// fail-closed sentinel and an agent with no skills at all. A perf knob must
+    /// not be able to neuter an agent.
+    #[serde(default = "default_history_scope")]
+    pub scope: String,
+
+    /// Optional ceiling on the **history** portion of the window (everything but
+    /// the turn's own user message), in approximate tokens.
+    ///
+    ///   - `None` → no ceiling (default; pre-mika#2295 behaviour).
+    ///   - `Some(0)` → omission sentinel: the history is dropped entirely. The
+    ///     turn's own message is still never dropped — answering a question one
+    ///     has erased is not a cheaper turn, it is a wrong one.
+    ///   - `Some(n)` → prune oldest-first until the history fits in
+    ///     `n * CHARS_PER_TOKEN_ESTIMATE` bytes.
+    ///
+    /// An unparseable or out-of-range value resolves to `None` with a WARN: a
+    /// mistyped ceiling that silently emptied the window would be a context
+    /// erasure wearing a configuration's clothes.
+    #[serde(default, deserialize_with = "deserialize_lenient_token_budget")]
+    pub max_tokens: Option<usize>,
+}
+
+fn default_history_scope() -> String {
+    HISTORY_SCOPE_AGENT.to_string()
+}
+
+impl Default for ContextHistoryConfig {
+    fn default() -> Self {
+        Self {
+            scope: default_history_scope(),
+            max_tokens: None,
+        }
+    }
+}
+
+impl ContextHistoryConfig {
+    /// Resolve [`Self::scope`] to its enum. An unrecognized value WARNs and
+    /// resolves to [`HistoryScope::Agent`] — the pre-mika#2295 behaviour, so a
+    /// typo widens the window rather than silently narrowing it. Narrowing on a
+    /// typo would hide context loss behind a spelling mistake; widening restores
+    /// exactly what the agent had before this ticket, loudly.
+    pub fn resolve_scope(&self) -> HistoryScope {
+        match self.scope.trim().to_ascii_lowercase().as_str() {
+            HISTORY_SCOPE_SESSION => HistoryScope::Session,
+            HISTORY_SCOPE_AGENT => HistoryScope::Agent,
+            other => {
+                tracing::warn!(
+                    event = "context_history_scope_invalid",
+                    value = %other,
+                    "[context.history] scope is not \"agent\" or \"session\"; using \"agent\""
+                );
+                HistoryScope::Agent
+            }
+        }
+    }
+}
+
+/// Tolerant deserializer for `[context.history] max_tokens`.
+///
+/// Accepts any TOML value and answers `None` (no ceiling) with a WARN on
+/// anything that is not a non-negative integer within
+/// [`HISTORY_MAX_TOKENS_SANITY_CEILING`]. See the field's doc comment for why
+/// the strict `Option<usize>` deserializer is the wrong trade here.
+fn deserialize_lenient_token_budget<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Lenient {
+        Int(i64),
+        Other(serde::de::IgnoredAny),
+    }
+
+    match Lenient::deserialize(deserializer)? {
+        Lenient::Int(n) if n >= 0 && (n as u64) <= HISTORY_MAX_TOKENS_SANITY_CEILING as u64 => {
+            Ok(Some(n as usize))
+        }
+        Lenient::Int(n) => {
+            tracing::warn!(
+                event = "context_history_max_tokens_invalid",
+                value = n,
+                ceiling = HISTORY_MAX_TOKENS_SANITY_CEILING,
+                "[context.history] max_tokens is negative or above the sanity ceiling; no ceiling applied"
+            );
+            Ok(None)
+        }
+        Lenient::Other(_) => {
+            tracing::warn!(
+                event = "context_history_max_tokens_invalid",
+                "[context.history] max_tokens is not an integer; no ceiling applied"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Convert an approximate token budget to a byte budget with the crate's single
+/// estimator (mika#2295). Exposed so the conversation-window pruner in
+/// `agent_loop` uses the same 4:1 ratio as [`truncate_to_token_budget`] rather
+/// than growing a second one beside it.
+pub fn token_budget_to_bytes(max_tokens: usize) -> usize {
+    max_tokens.saturating_mul(CHARS_PER_TOKEN_ESTIMATE)
 }
 
 /// `[context.summary]` subsection — controls injection of the conversational
@@ -680,6 +830,15 @@ fn fail_closed_identity() -> Identity {
                 inject: false,
                 max_tokens: None,
             },
+            // The window stays at its default perimeter here, deliberately, while
+            // the summary above is hardened. The two are not symmetric: summary
+            // injection is an established leak class (mika#1009), whereas
+            // narrowing the history window on the fail-closed path would change
+            // the window of every user-defined agent whose identity.toml is
+            // absent or unreadable (mika#2027) — a behaviour change no ticket has
+            // asked for. An agent that reaches here has no skills at all, which
+            // is the containment; the window is not the lever.
+            history: ContextHistoryConfig::default(),
         },
         session: SessionIdentityConfig::default(),
         curator: None,

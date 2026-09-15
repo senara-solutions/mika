@@ -10937,12 +10937,15 @@ impl Database {
         })
     }
 
+    /// `session_id = None` keeps the agent-wide window (pre-mika#2295 behaviour,
+    /// byte for byte); `Some(sid)` restricts it to that session.
     pub fn load_recent_messages(
         &self,
         agent_id: &str,
+        session_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SessionMessage>> {
-        let (msgs, _) = self.load_recent_messages_filtered(agent_id, limit, false)?;
+        let (msgs, _) = self.load_recent_messages_filtered(agent_id, session_id, limit, false)?;
         Ok(msgs)
     }
 
