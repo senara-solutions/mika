@@ -245,11 +245,17 @@ Some issue.
 
 // --- Scenario 10-12: grooming provenance cross-check (#1620) ---
 //
-// The full `validate_dispatch_readiness` integration path for the cross-check
-// requires `fetch_issue_body` (HTTP call to GitHub API) which is not mocked
-// in this test file. The DB-level `has_completed_groom_for_issue` method is
-// thoroughly tested in `db.rs::tests`. These scenarios verify the
-// `check_grooming_markers` predicate layer that gates the cross-check:
+// `fetch_issue_body` (HTTP call to GitHub API) is not mocked in this test
+// file, so the segment that follows it is not exercised from here. Since
+// mika#2310 that segment is `evaluate_grooming_gate` (`skills/executor.rs`),
+// which takes the issue body as a parameter, and its end-to-end run — markers
+// → issue URL → `has_completed_groom_for_issue` → verdict, on a temporary
+// `AsyncDatabase` — is covered by `skills::executor::tests::harnais_porte`
+// (case 9 with the proof row, case 9b without it). The DB-level predicate is
+// tested in `db.rs::tests` (mika#2287 plus `db::tests::harnais_porte` for the
+// terminal-negative statuses and the fail-closed `Err`). These scenarios
+// verify the `check_grooming_markers` predicate layer that gates the
+// cross-check:
 //
 // - Scenario 10: check_grooming_markers passes → cross-check would fire
 //   (verified by DB tests in db.rs)
