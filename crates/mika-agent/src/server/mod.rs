@@ -1629,6 +1629,14 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         // Register the QA-review reconciliation scan for mika-dev only
         // (mika#2334). Same env-gated shape as auto_pull / wip_rescue:
         // MIKA_QA_REVIEW_RECONCILE=0 disables it.
+        //
+        // The name deliberately drops the `MIKA_DEV_` prefix its two neighbours
+        // carry: this scan owns four sibling knobs
+        // (`MIKA_QA_REVIEW_RECONCILE_MIN_AGE_SECS` and friends) read inside
+        // `qa_review_reconcile`, which has no notion of which agent runs it, and
+        // one prefix for the family beats a kill-switch spelled unlike the knobs
+        // it governs. Carried by mika-dev today; that is a wiring fact here, not
+        // a property of the variable.
         if name == "mika-dev" {
             if std::env::var("MIKA_QA_REVIEW_RECONCILE")
                 .map(|v| v == "0")

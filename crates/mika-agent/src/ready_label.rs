@@ -204,7 +204,13 @@ impl MachineIdentities {
 }
 
 /// Minuscules + retrait du suffixe `[bot]` + trim.
-fn normalize_login(login: &str) -> String {
+///
+/// `pub(crate)` depuis mika#2334 : `qa_review_reconcile` compare les mêmes
+/// identités machine (auteur de PR, relecteur demandé) et doit lire les deux
+/// formes exactement comme ici. Une seconde normalisation écrite à la main
+/// dériverait de celle-ci le jour où GitHub change de rendu — et la dérive
+/// serait silencieuse des deux côtés.
+pub(crate) fn normalize_login(login: &str) -> String {
     let trimmed = login.trim().to_ascii_lowercase();
     trimmed
         .strip_suffix("[bot]")

@@ -218,14 +218,14 @@ pub fn select_prs_needing_review(
             }
             // Auteur illisible (compte supprimé) ⇒ hors population.
             let author = pr.author.as_ref()?;
-            if !author.login.eq_ignore_ascii_case(DISPATCHER_FORGE_LOGIN) {
+            if !is_login(&author.login, DISPATCHER_FORGE_LOGIN) {
                 return None;
             }
             if pr
                 .review_requests
                 .iter()
                 .filter_map(|r| r.login.as_deref())
-                .any(|l| l.eq_ignore_ascii_case(REVIEWER_FORGE_LOGIN))
+                .any(|l| is_login(l, REVIEWER_FORGE_LOGIN))
             {
                 return None;
             }
@@ -233,7 +233,7 @@ pub fn select_prs_needing_review(
                 .reviews
                 .iter()
                 .filter_map(|r| r.author.as_ref())
-                .any(|a| a.login.eq_ignore_ascii_case(REVIEWER_FORGE_LOGIN))
+                .any(|a| is_login(&a.login, REVIEWER_FORGE_LOGIN))
             {
                 return None;
             }
@@ -253,6 +253,27 @@ pub fn select_prs_needing_review(
     retained.sort_by(|a, b| b.age_secs.cmp(&a.age_secs).then(a.number.cmp(&b.number)));
     retained.truncate(cfg.max_per_tick);
     retained
+}
+
+/// Deux logins désignent-ils la même identité de forge ?
+///
+/// **GitHub rend la même identité de deux façons** : `mika-platform-dev` quand
+/// le compte agit sous PAT, `mika-platform-dev[bot]` quand il agit sous
+/// l'identité App — et le repli App est un chemin nominal depuis mika#2205. Une
+/// comparaison brute écarterait donc **toutes** les PRs ouvertes par ce chemin,
+/// et ce module serait silencieusement inerte exactement là où il doit servir.
+/// Le symétrique est aussi vrai et plus dangereux : une revue de
+/// `mika-platform-qa[bot]` non reconnue ferait re-demander une PR déjà revue,
+/// c'est-à-dire produirait la revue en double que le conditionnement existe pour
+/// éviter.
+///
+/// La normalisation est empruntée à [`crate::ready_label::normalize_login`],
+/// module écrit en partie pour cette raison (« GitHub rend
+/// `mika-platform-dev[bot]` là où la configuration porte `mika-platform-dev`, et
+/// l'évidence du ticket cite les deux formes »), plutôt que réécrite : deux
+/// normalisations dériveraient en silence le jour où GitHub change de rendu.
+fn is_login(actual: &str, expected: &str) -> bool {
+    crate::ready_label::normalize_login(actual) == crate::ready_label::normalize_login(expected)
 }
 
 /// Âge en secondes pleines. `None` quand `created_at` est illisible.
@@ -367,8 +388,21 @@ async fn gh(args: &[&str], token: &str) -> Result<String, String> {
     }
 }
 
+/// Taille de page de l'unique `gh pr list` par dépôt et par tick.
+const LIST_LIMIT: usize = 100;
+
 /// Un seul `gh pr list` par dépôt et par tick — le coût API est constant.
+///
+/// **La troncature va dans le mauvais sens, et c'est pourquoi elle est dite.**
+/// `gh pr list` rend les PRs de la plus récente à la plus ancienne, alors que ce
+/// scan sert les plus **anciennes** d'abord : une page pleine ne coupe donc pas
+/// une queue indifférente, elle coupe exactement la population visée. Le remède
+/// est un réglage d'exploitation (relever la limite, ou réduire le nombre de PRs
+/// ouvertes), pas une décision que ce module puisse prendre seul — mais une
+/// troncature muette rendrait le scan inerte sans que rien ne le dise, ce qui est
+/// la forme de panne que tout ce ticket existe pour fermer.
 async fn list_open_prs(repo: &str, token: &str) -> Result<Vec<PrSnapshot>, String> {
+    let limit = LIST_LIMIT.to_string();
     let out = gh(
         &[
             "pr",
@@ -380,7 +414,7 @@ async fn list_open_prs(repo: &str, token: &str) -> Result<Vec<PrSnapshot>, Strin
             "--json",
             "number,author,isDraft,createdAt,reviewRequests,reviews",
             "--limit",
-            "100",
+            &limit,
         ],
         token,
     )
@@ -389,7 +423,18 @@ async fn list_open_prs(repo: &str, token: &str) -> Result<Vec<PrSnapshot>, Strin
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
-    serde_json::from_str(trimmed).map_err(|e| format!("parse gh pr list ({repo}): {e}"))
+    let prs: Vec<PrSnapshot> =
+        serde_json::from_str(trimmed).map_err(|e| format!("parse gh pr list ({repo}): {e}"))?;
+    if prs.len() >= LIST_LIMIT {
+        warn!(
+            event = "qa_review_reconcile_page_full",
+            repo = %repo,
+            limit = LIST_LIMIT,
+            "page pleine : les PRs les plus anciennes du dépôt peuvent être \
+             invisibles à ce scan, et ce sont celles qu'il vise"
+        );
+    }
+    Ok(prs)
 }
 
 /// Scanne les dépôts configurés et pose [`REVIEWER_FORGE_LOGIN`] sur les PRs de
@@ -440,9 +485,16 @@ pub async fn reconcile_qa_review_requests(
         let selected = select_prs_needing_review(&prs, now, &budgeted);
 
         for pr in selected {
+            // Débité à **chaque tentative**, pas aux seuls succès. Un échec
+            // systématique — la famille mika#2228, `Resource not accessible by
+            // personal access token` — laisserait sinon le budget intact, et
+            // chaque dépôt suivant se verrait réoffrir le quota entier : jusqu'à
+            // `max_per_tick × dépôts` écritures dans un tick censé en plafonner
+            // `max_per_tick`. C'est précisément quand la forge refuse qu'il ne
+            // faut pas la marteler.
+            budget -= 1;
             match request_review(repo, pr.number, github_token).await {
                 Ok(()) => {
-                    budget -= 1;
                     reconciled += 1;
                     info!(
                         event = RECONCILED_TOOL,
@@ -620,6 +672,66 @@ mod tests {
             login: Some(REVIEWER_FORGE_LOGIN.to_uppercase()),
         }];
         assert!(select(&[pr]).is_empty());
+    }
+
+    /// **La forme `[bot]` est la même identité.** GitHub rend
+    /// `mika-platform-dev` quand le compte agit sous PAT et
+    /// `mika-platform-dev[bot]` quand il agit sous l'identité App — et le repli
+    /// App est un chemin nominal depuis mika#2205. Sans normalisation, ce scan
+    /// écarterait **toutes** les PRs ouvertes par ce chemin : il serait
+    /// silencieusement inerte exactement là où il doit servir, c'est-à-dire
+    /// reproduirait la forme de panne que ce ticket existe pour fermer.
+    /// Précédent daté : `ready_label::normalize_login`, dont la normalisation est
+    /// empruntée plutôt que réécrite.
+    #[test]
+    fn mika2334_lauteur_en_forme_bot_est_la_meme_identite() {
+        let mut pr = loop_pr(13, 7200);
+        pr.author = Some(GhAuthor {
+            login: format!("{DISPATCHER_FORGE_LOGIN}[bot]"),
+        });
+        assert_eq!(
+            select(&[pr]),
+            vec![13],
+            "une PR ouverte sous l'identité App doit rester dans la population"
+        );
+    }
+
+    /// Le symétrique, et il est plus dangereux : une demande ou une revue de
+    /// `mika-platform-qa[bot]` non reconnue ferait re-demander une PR déjà
+    /// servie — c'est-à-dire produirait exactement la revue en double que le
+    /// conditionnement existe pour éviter. Les deux moitiés de l'idempotence
+    /// sont couvertes, parce qu'elles lisent deux champs distincts.
+    #[test]
+    fn mika2334_le_relecteur_en_forme_bot_sort_la_pr() {
+        let mut demandee = loop_pr(14, 7200);
+        demandee.review_requests = vec![GhReviewRequest {
+            login: Some(format!("{REVIEWER_FORGE_LOGIN}[bot]")),
+        }];
+
+        let mut revue = loop_pr(15, 7200);
+        revue.reviews = vec![GhReview {
+            author: Some(GhAuthor {
+                login: format!("{REVIEWER_FORGE_LOGIN}[BOT]"),
+            }),
+        }];
+
+        assert!(
+            select(&[demandee, revue]).is_empty(),
+            "une PR déjà servie sous l'identité App ne doit pas être re-servie"
+        );
+    }
+
+    /// Le contrôle négatif du trio d'identité ci-dessus : la normalisation ne
+    /// doit pas rendre tout le monde égal à tout le monde. Sans lui, un
+    /// `is_login` qui rendrait toujours `true` passerait les trois.
+    #[test]
+    fn mika2334_la_normalisation_ne_confond_pas_deux_identites() {
+        assert!(!is_login("samidarko[bot]", DISPATCHER_FORGE_LOGIN));
+        assert!(!is_login(
+            &format!("{REVIEWER_FORGE_LOGIN}[bot]"),
+            DISPATCHER_FORGE_LOGIN
+        ));
+        assert!(!is_login("", DISPATCHER_FORGE_LOGIN));
     }
 
     /// AC3 — les brouillons ont leur propre voie (`wip_rescue`), y compris une
