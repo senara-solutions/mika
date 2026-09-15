@@ -8146,4 +8146,117 @@ Discussion: this one was a single-pass GROOMED case, unlike the others.
         assert!(reason.contains("database has been shut down"));
         assert!(reason.contains("#2287"));
     }
+
+    /// mika#2310 — isolated harness for the mika#1620 / mika#2287 gate, dispatch
+    /// path level. Cases 4 and 8 (predicate level) live in
+    /// `db::tests::harnais_porte`; this submodule carries the two the gate never
+    /// had: the end-to-end run the campaign (mika#2288) only ever obtained from a
+    /// live groom, and its negative twin.
+    ///
+    /// The name is the campaign's, not the mechanism's: it is what the ticket's
+    /// exit criterion interrogates (`cargo test -p mika-agent harnais_porte`).
+    mod harnais_porte {
+        use super::*;
+        use crate::async_db::AsyncDatabase;
+        use crate::db::tests::{GROOM_CALLBACK_PLAN_GROOMED, completed_groom_pair, db};
+
+        /// Owner / repo / number that `evaluate_grooming_gate` folds into the
+        /// issue URL — they MUST reproduce `db::tests::GROOM_ISSUE_URL`
+        /// (`https://github.com/senara-solutions/mika/issues/123`), because the
+        /// proof row is keyed on the bare URL the ready-label handler writes.
+        const OWNER: &str = "senara-solutions";
+        const REPO: &str = "mika";
+        const NUMBER: u64 = 123;
+
+        /// Issue body carrying the three canonical grooming markers, as the
+        /// autonomous loop stamps them (mika#907, mika#919). A fixture, not
+        /// GitHub: the only link outside this test is the HTTP transport, which
+        /// the ticket excludes itself ("zero network").
+        const GROOMED_ISSUE_BODY: &str = "\
+## Summary
+
+Harness ticket.
+
+> - **Branch:** `feat/123/harnais-porte`
+> - **Plan:** `docs/plans/2026-09-15-001-test-123-harnais-porte-plan.md`
+> - **Grooming history:** /ce:plan → mika-arch first-pass (ITERATE) → revisions → mika-arch second-pass (GROOMED)
+";
+
+        /// Case 9 — end to end, on the real dispatch path.
+        ///
+        /// Before mika#2310 the segment `check_grooming_markers` → issue-URL →
+        /// `has_completed_groom_for_issue` → `groom_provenance_verdict` was
+        /// exercised by no test: `test_dispatch_no_grooming_marker_guard.rs`
+        /// stops at the markers because `fetch_issue_body` is not mockable, and
+        /// the `db.rs` tests know nothing of the call site. That is why live
+        /// grooms were the gate's only proof. Here: a temporary `AsyncDatabase`
+        /// carrying the nominal parent+child pair (built through the production
+        /// write API by `completed_groom_pair`), the markers in a fixture, and
+        /// the extracted segment called as `validate_dispatch_readiness` calls it.
+        ///
+        /// Read together with `harnais_porte_cas9b_…` below — an assertion of
+        /// absence also passes when the path evaluates nothing.
+        #[tokio::test]
+        async fn harnais_porte_cas9_groomed_issue_with_proof_passes_gate() {
+            let sync_db = db();
+            let (_parent_id, _callback_id) = completed_groom_pair(
+                &sync_db,
+                "mika",
+                crate::db::tests::GROOM_ISSUE_URL,
+                GROOM_CALLBACK_PLAN_GROOMED,
+            );
+            let async_db = AsyncDatabase::new_with_agent(sync_db, "mika");
+
+            let outcome = evaluate_grooming_gate(
+                &async_db,
+                "task-2310",
+                OWNER,
+                REPO,
+                NUMBER,
+                GROOMED_ISSUE_BODY,
+            )
+            .await;
+
+            assert!(
+                outcome.is_ok(),
+                "a groomed issue whose proof row exists must pass the gate with \
+                 no rejection at all (neither `dispatch_no_grooming_marker` nor \
+                 `dispatch_grooming_not_verified`); got: {outcome:?}"
+            );
+        }
+
+        /// Case 9b — the negative twin of case 9 (mika#2310 D2).
+        ///
+        /// Same path, same temporary DB, same markers in the fixture, but
+        /// **without** the parent+child pair. An `evaluate_grooming_gate` that
+        /// returned `Ok(())` without reading anything would satisfy case 9 in
+        /// full; this test is what makes the pair attest the gate. The expected
+        /// rejection is exactly `dispatch_grooming_not_verified` — not
+        /// `dispatch_no_grooming_marker` (the markers ARE present) and not
+        /// `dispatch_check_failed` (the DB is readable, the proof is merely
+        /// absent).
+        #[tokio::test]
+        async fn harnais_porte_cas9b_groomed_issue_without_proof_is_refused() {
+            let async_db = AsyncDatabase::new_with_agent(db(), "mika");
+
+            let rejection = evaluate_grooming_gate(
+                &async_db,
+                "task-2310",
+                OWNER,
+                REPO,
+                NUMBER,
+                GROOMED_ISSUE_BODY,
+            )
+            .await
+            .expect_err("markers present but no proof row must refuse the dispatch");
+
+            assert_eq!(
+                rejection["error"], "dispatch_grooming_not_verified",
+                "markers are present and the DB is readable: the only admissible \
+                 refusal is the provenance one; got: {rejection}"
+            );
+            assert_eq!(rejection["task_id"], "task-2310");
+            assert_eq!(rejection["issue"], "senara-solutions/mika#123");
+        }
+    }
 }
