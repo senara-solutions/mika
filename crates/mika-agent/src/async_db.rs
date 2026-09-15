@@ -1873,14 +1873,19 @@ impl AsyncDatabase {
     }
 
     /// Rebuild conversation context with optional task-mode hybrid merge (mika#974).
+    ///
+    /// `session_id = Some(id)` bounds the channel window to one session
+    /// (mika#2295); `None` is the pre-mika#2295 agent-wide window.
     pub async fn rebuild_context(
         &self,
+        session_id: Option<&str>,
         task_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SessionMessage>> {
         let a = self.agent_id.clone();
+        let sid = session_id.map(|s| s.to_owned());
         let tid = task_id.map(|s| s.to_owned());
-        self.with_db(move |db| db.rebuild_context(&a, tid.as_deref(), limit))
+        self.with_db(move |db| db.rebuild_context(&a, sid.as_deref(), tid.as_deref(), limit))
             .await
     }
 
@@ -1894,7 +1899,7 @@ impl AsyncDatabase {
         exclude_internal: bool,
     ) -> Result<(Vec<SessionMessage>, usize)> {
         let a = self.agent_id.clone();
-        self.with_db(move |db| db.load_recent_messages_filtered(&a, limit, exclude_internal))
+        self.with_db(move |db| db.load_recent_messages_filtered(&a, None, limit, exclude_internal))
             .await
     }
 

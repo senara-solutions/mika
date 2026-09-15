@@ -387,6 +387,10 @@ docs_roots = [
 [context.summary]
 inject = false
 
+[context.history]
+scope = "session"
+max_tokens = 8000
+
 [skills]
 allow_authoring = false
 nudge_enabled = false
@@ -470,6 +474,15 @@ pub const CODE_OWNED_IDENTITY_SECTIONS: &[&str] = &[
     "skills.nudge_enabled",
     "tools.disabled",
     "context.summary",
+    // mika#2295. Listed here for the same reason as its `context.summary`
+    // sibling: the window bounds are a property of the role, not an operator
+    // preference. It is also what makes the fix take on a mika-arch that is
+    // already provisioned — `write_default_if_missing` never rewrites an
+    // existing `identity.toml`, so without this entry the agent would keep an
+    // unbounded, agent-wide window after deploy and the post-deploy probes
+    // would read like a fix that did not work rather than a switch that never
+    // happened.
+    "context.history",
 ];
 
 /// Walk a dotted path through a `toml::Value` tree.
@@ -1576,6 +1589,43 @@ mod tests {
         assert!(
             !identity.context.summary.inject,
             "mika-arch must have [context.summary] inject = false (mika#1009 leak protection)"
+        );
+    }
+
+    /// AC5 — mika-arch's window is bounded on both axes (mika#2295).
+    ///
+    /// `max_tokens` is derived, not picked: the ticket's target is under 40 000
+    /// input tokens; mika-arch's system prompt and skills are ≈ 20 000; the plan
+    /// under review is 6 000 to 15 000. That leaves ≈ 8 000 for history in the
+    /// worst case. It is a ceiling, not an instruction — under session scope a
+    /// first pass consumes none of it.
+    #[test]
+    fn mika2295_mika_arch_identity_bounds_its_conversation_window() {
+        let toml_str = build_mika_arch_identity(&test_settings_with_kg_roots()).unwrap();
+        let identity: crate::prompt::Identity =
+            toml::from_str(&toml_str).expect("mika-arch identity must parse as valid Identity");
+
+        assert_eq!(
+            identity.context.history.scope,
+            crate::prompt::HistoryScope::Session,
+            "each architect pass is a one-shot act on one plan; an agent-wide \
+             window makes it read other tickets' plans (mika#2295 AC7)"
+        );
+        assert_eq!(identity.context.history.max_tokens, Some(8000));
+    }
+
+    /// AC5's other half — the switch actually takes on an agent already on disk.
+    ///
+    /// `write_default_if_missing` never rewrites an existing `identity.toml`, so
+    /// without `context.history` among the code-owned sections, every deployed
+    /// mika-arch would keep its unbounded agent-wide window and the post-deploy
+    /// probes would read like a fix that did not work rather than a switch that
+    /// never happened. This is the assertion that the reconciler owns the block.
+    #[test]
+    fn mika2295_history_block_is_reconciled_onto_already_provisioned_agents() {
+        assert!(
+            CODE_OWNED_IDENTITY_SECTIONS.contains(&"context.history"),
+            "the window bounds are a property of the role, not an operator preference"
         );
     }
 
