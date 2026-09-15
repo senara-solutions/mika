@@ -229,7 +229,7 @@ changement est celle de V1 : une vraie passe arch sur un vrai plan.
 | **M1b** | `crates/mika-agent/src/well_known_agents.rs` (près de `MIKA_DEV_CONFIG`) | Commentaire nommant la dérive source/runtime de mika-dev (D2) et disant que relever son budget token exige d'abord de réconcilier son modèle. Aucun changement de valeur. |
 | **M2** | `crates/mika-agent/src/agent_loop/mod.rs` (branche `LlmStopReason::MaxTokens`, ~`:1246`) | `warn!(event = "llm_reasoning_budget_exhausted", …)` quand `stop_reason == MaxTokens` **et** que le texte extrait est vide. Champs : `agent_id`, `provider`, `model`, `output_tokens`, `max_tokens`, `step`, `trace_id`, `session_id`, plus la remédiation en clair. Aucun changement de flux : le tour se termine comme avant. |
 | **M3** | `skills/bundled/_shared/dispatch-lib.sh` (~5224) | Distinguer « `content` vide » de « `session_id` manquant » et, pour le premier, nommer la cause probable et le `grep` serveur (`llm_reasoning_budget_exhausted`). Message uniquement — la garde et son `return 1` sont inchangés. |
-| **M4** | `crates/mika-common/src/llm/mod.rs:441` + `crates/mika-cli/src/tui/commands/handlers.rs:2033` | `DeepSeek => 8_192` → `65_536`, commentaire citant la source et la date ; le test qui épingle 8_192 suit la valeur. |
+| **M4** | `crates/mika-common/src/llm/mod.rs:441` + `crates/mika-cli/src/tui/commands/handlers.rs:2033` **et `:1947-1960`** | `DeepSeek => 8_192` → `65_536`, commentaire citant la source et la date ; le test qui épingle 8_192 suit la valeur. **Second test, dépendant mais pas épinglant :** `handlers.rs:1947` écrit `llm_max_tokens = 16384` et attend le message `exceeds deepseek's limit` — il a choisi 16384 *parce que* la limite valait 8192. À 65 536 la valeur ne dépasse plus rien, l'avertissement n'est plus émis et le test échoue. Sa fixture passe à `131072` (borne dure de `validation.rs:110`, donc la plus grande valeur qui reste légale). |
 | **M5** | `crates/mika-agent/src/calibration/roles/{mod,mika_dev,mika_arch,mika_qa,mika_orchestrator}.rs` | `CALIBRATION_SCENARIO_MAX_TOKENS: u32 = 8192` dans `roles/mod.rs` ; les `max_tokens:` littéraux des scénarios des quatre suites la lisent (30 occurrences au total dans `roles/`, à trier entre scénarios de production et fixtures de test — seules les premières sont concernées). |
 
 ### Tests
@@ -240,6 +240,7 @@ changement est celle de V1 : une vraie passe arch sur un vrai plan.
 | T2 | `well_known_agents::tests` (nouveau) | Aucune constante `config_toml` d'agent well-known ne déclare un `llm_max_tokens` sous 8192 sans commentaire adjacent. Attrape la régression par copier-coller d'un futur agent. |
 | T3 | `agent_loop::tests` (nouveau) | Sur `MockLlmProvider` renvoyant `MaxTokens` + contenu vide + `output_tokens > 0`, le prédicat de M2 est vrai ; sur `MaxTokens` + texte non vide, il est faux. Le prédicat est extrait en fonction pure pour être testable sans capturer le journal. |
 | T4 | `llm::tests` (étendu) | `DeepSeek.max_output_tokens() == 65_536`, avec la source en commentaire. |
+| T4b | `tui::commands::handlers::tests` (fixture corrigée) | Le test de l'avertissement de bascule de provider continue de vérifier qu'un `llm_max_tokens` **au-dessus** de la limite DeepSeek déclenche `exceeds deepseek's limit` — avec une fixture qui dépasse la nouvelle limite. Il tient le comportement, pas la valeur ; c'est pour cela qu'il est distinct de T4 et qu'il doit bouger avec M4 plutôt qu'être découvert rouge à la compilation. |
 | T5 | `calibration::roles::tests` (nouveau) | Tous les scénarios des quatre suites lisent `CALIBRATION_SCENARIO_MAX_TOKENS` — scan de source refusant un littéral `max_tokens: <n>` dans `roles/`. C'est un scan et pas une assertion de valeur parce que la régression ne rendrait aucun scénario faux : elle re-désynchroniserait la parité que D5 vient de rendre structurelle, et toutes les assertions de comportement resteraient vertes. |
 | T6 | `skills/bundled/_shared/test-dispatch-lib.sh` (étendu) | Un `content` vide et un `session_id` manquant produisent deux messages distincts. |
 
@@ -286,7 +287,9 @@ changement est celle de V1 : une vraie passe arch sur un vrai plan.
   `session_id`. T6 tient la distinction.
 - **AC5** — `ProviderKind::DeepSeek.max_output_tokens()` ne contredit plus un
   `llm_max_tokens` de 32768 ; la nouvelle valeur porte sa source en commentaire.
-  T4 l'épingle.
+  T4 l'épingle. L'avertissement de bascule de provider (`provider.rs:117`) reste
+  fonctionnel — il se déclenche toujours au-dessus de la nouvelle limite, ce que
+  T4b tient.
 - **AC6** — Les scénarios de calibration des quatre suites de rôles lisent une
   constante unique valant 8192, de sorte qu'un modèle à raisonnement puisse
   franchir le gate mika#1190. T5 refuse le retour d'un littéral.
@@ -297,7 +300,7 @@ changement est celle de V1 : une vraie passe arch sur un vrai plan.
 ## Definition of Done
 
 - `cargo build`, `cargo test`, `cargo clippy` et `cargo fmt --check` passent.
-- T1–T6 écrits et verts.
+- T1–T6 (T4b inclus) écrits et verts.
 - `make verify-bundled-skills` passe (M3 touche `_shared/`).
 - `scripts/verify-pipeline.sh` passe (section AC présente).
 - AC1 et AC3–AC7 vérifiables dans l'arbre ; AC2 vérifié après déploiement (V1).
