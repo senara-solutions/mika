@@ -4,6 +4,7 @@
 **Labels :** `bug`, `p2-normal`
 **Type :** issue (bug de substrat — correction de fond, le budget HTTP de mika#2293 étant le pansement)
 **Palier de priorité :** Tier 2 — *dégrade la boucle sans la casser*. Depuis le retrait du bypass grooming (08:11, 2026-09-14), une passe arch réussie est obligatoire à chaque dispatch ; un brief à 71 k reste lent et fragile même sous un budget élargi.
+**Implémentation :** PR senara-solutions/mika#2327 (branche `fix/2295/borner-fenetre-arch-en-tokens`) — plan groomé et mergé en amont via #2319 ; ce PR porte le code AC2-7.
 **Fichiers principaux :** `crates/mika-agent/src/prompt.rs`, `crates/mika-agent/src/agent_loop/mod.rs`, `crates/mika-agent/src/db.rs`, `crates/mika-agent/src/async_db.rs`, `crates/mika-agent/src/well_known_agents.rs`, `crates/mika-agent/tests/eval/test_context_window_budget_2295.rs` (nouveau)
 
 ---
