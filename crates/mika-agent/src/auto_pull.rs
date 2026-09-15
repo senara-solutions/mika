@@ -1983,7 +1983,7 @@ async fn gh_list_open_pr_closing_issues(github_token: &str) -> Result<HashSet<u6
 /// futur appelant de rendre à cette fonction le token de lecture — celui-là
 /// même dont on a mesuré, 34 fois le 2026-09-07, qu'il authentifie sans
 /// autoriser. On ne peut plus l'appeler avec le mauvais token par inattention.
-async fn gh_apply_label(
+pub(crate) async fn gh_apply_label(
     label_auth: &LabelWriteToken,
     issue_number: u64,
     label: &str,
