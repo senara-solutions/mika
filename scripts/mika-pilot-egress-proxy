@@ -520,6 +520,27 @@ async def pipe_bytes(reader: asyncio.StreamReader, writer: asyncio.StreamWriter)
             pass
 
 
+# Client request headers the relay MUST NOT forward upstream (mika#2313).
+# host/authorization/x-api-key/proxy-authorization are re-written by the relay.
+# connection/keep-alive/proxy-connection are hop-by-hop: forwarding the client's
+# `Connection: keep-alive` upstream (alongside our injected `Connection: close`)
+# left TWO Connection headers; upstream honoured keep-alive and held the TLS open,
+# so the relay (one request per connection) looped on up_reader.read() until
+# upstream's ~360 s idle-timeout — never closing the client, so the CLI's
+# already-sent 2nd request sat unread ~358 s per turn. That hang exceeded the
+# 5-min prompt-cache TTL, so every turn re-created 100-250k tokens (the real
+# "cache_read=0", NOT ~/.claude.json). Stripping these leaves ONLY our
+# `Connection: close` upstream → upstream closes right after the response →
+# the relay returns promptly, the response carries Connection: close, and the
+# client does not reuse the connection. Module-level so the guard is testable
+# (test-pilot-egress-keepalive.py).
+_CLIENT_HEADER_DROP_RE = re.compile(
+    rb"^(host|authorization|x-api-key|proxy-authorization"
+    rb"|connection|keep-alive|proxy-connection)\s*:",
+    re.IGNORECASE,
+)
+
+
 async def handle_anthropic_reverse_proxy(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
@@ -583,10 +604,7 @@ async def handle_anthropic_reverse_proxy(
     # we re-write them. Drop Proxy-Authorization defensively. Preserve
     # everything else (Content-Type, Content-Length, Transfer-Encoding,
     # Accept, User-Agent, anthropic-version, anthropic-beta, etc.).
-    drop_re = re.compile(
-        rb"^(host|authorization|x-api-key|proxy-authorization)\s*:",
-        re.IGNORECASE,
-    )
+    drop_re = _CLIENT_HEADER_DROP_RE  # mika#2313 — see module constant
     filtered_headers = [h for h in header_lines if not drop_re.match(h)]
     # Detect body length. Support Content-Length (fixed) and
     # Transfer-Encoding: chunked (streaming).
