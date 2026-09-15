@@ -3479,6 +3479,23 @@ async fn run_agent_inner(
 
     let history = db.rebuild_context(scope_task_id, 20).await?;
 
+    // mika#2295 brique 0 — the attribution instrument, emitted at the single
+    // production site where a conversation window is assembled (`rewind.rs` is an
+    // administrative path, not a turn). The `20` above bounds a COUNT and never a
+    // size, and the query underneath filters on `m.agent_id` rather than
+    // `m.session_id`, so this is the one place able to say how many bytes and how
+    // many distinct sessions the window dragged in.
+    //
+    // The truncation counts are `0` and stay `0` until the byte ceiling lands:
+    // that ceiling is gated on the verdict this event produces, not the reverse.
+    emit_context_window_assembled(
+        &db.agent_id,
+        session_id,
+        trace_id,
+        "conversation",
+        &build_context_window_fields(&history, &skill_tool_defs, 0, 0, chrono::Utc::now()),
+    );
+
     // Build initial message list from history.
     // The last message in history is the user message we just saved.
     // If user_images is non-empty, replace the last message with a multi-block version.
@@ -6113,6 +6130,136 @@ fn emit_system_prompt_assembled(
         "system prompt assembled"
     );
     Some(total_bytes as i64)
+}
+
+/// Raw dimensions of the conversation window assembled for a turn (mika#2295).
+/// Pure data — no I/O — so the attribution arithmetic is unit-testable without a
+/// database or a tracing subscriber, the same split `TurnUsageFields` uses below.
+///
+/// **This is the missing sibling of `system_prompt_assembled` (mika#1217):** that
+/// event measures the *system* half of a request, and nothing measured the
+/// *conversation* half. That gap is why mika#2295's founding observation — the
+/// median input prompt of mika-arch doubling from 35 829 to 71 007 tokens on
+/// 2026-09-03, with none of its three `system_prompt.md` nor `prompt.rs` touched
+/// on that date — could only be attributed by inference from the code.
+///
+/// Two properties of the window make the attribution worth measuring rather than
+/// deducing, and both are visible in `load_recent_messages_filtered` (`db.rs`):
+/// its `LIMIT 20` bounds a **count, never a size** (for mika-arch the counted
+/// items are whole plans and architect reviews), and it filters on `m.agent_id`
+/// rather than `m.session_id`, so the window crosses sessions and therefore
+/// tickets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContextWindowFields {
+    /// Messages retained in the window, including the turn's own user message.
+    message_count: usize,
+    /// Bytes of every message *except* the last — what the window costs beyond
+    /// the question actually being asked.
+    history_bytes: usize,
+    /// Bytes of the last message: the user message this turn just saved.
+    user_message_bytes: usize,
+    /// Bytes of the serialized tool definitions offered to the model.
+    tool_defs_bytes: usize,
+    /// Distinct `session_id` values in the window. **This is the field that
+    /// proves or refutes cross-ticket contamination** — a value above 1 means an
+    /// architect reviewing ticket A is reading the plans of tickets B, C and D —
+    /// and it costs one `HashSet`. Measuring the cost without it would answer
+    /// "how expensive?" while missing "whose content?".
+    distinct_sessions: usize,
+    /// Age in seconds of the oldest retained message. `0` when the window is
+    /// empty or the timestamp is unreadable — never negative, never a guess.
+    oldest_age_secs: i64,
+    /// What a byte ceiling removed from the window. Always `0` today: the ceiling
+    /// is brique 2 of the mika#2295 plan and is deliberately gated on the verdict
+    /// this very event produces. The fields ship now so the log schema does not
+    /// change under an analyzer written against this first brick.
+    truncated_messages: usize,
+    truncated_bytes: usize,
+}
+
+/// Compute the window's dimensions. Pure — `now` is injected so `oldest_age_secs`
+/// is assertable without a clock.
+fn build_context_window_fields(
+    history: &[crate::db::SessionMessage],
+    tool_defs: &[mika_common::claude::ToolDefinition],
+    truncated_messages: usize,
+    truncated_bytes: usize,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ContextWindowFields {
+    // The last message is the user message this turn just saved; everything
+    // before it is the history the window dragged in. Splitting exactly there is
+    // what lets the event answer "how much of this request is NOT the question?".
+    let (history_slice, user_message_bytes) = match history.split_last() {
+        Some((last, rest)) => (rest, last.content.len()),
+        // Empty window: `history` is itself the empty slice, and there is no
+        // user message to bill.
+        None => (history, 0),
+    };
+
+    let distinct_sessions = history
+        .iter()
+        .map(|m| m.session_id.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+
+    // An unreadable or future timestamp reports 0 rather than a negative or a
+    // fabricated age — the same rule `timestamp::is_older_than` applies.
+    let oldest_age_secs = history
+        .first()
+        .and_then(|m| crate::timestamp::parse(&m.created_at).ok())
+        .map(|dt| (now - dt).num_seconds().max(0))
+        .unwrap_or(0);
+
+    ContextWindowFields {
+        message_count: history.len(),
+        history_bytes: history_slice.iter().map(|m| m.content.len()).sum(),
+        user_message_bytes,
+        tool_defs_bytes: serde_json::to_string(tool_defs)
+            .map(|s| s.len())
+            .unwrap_or(0),
+        distinct_sessions,
+        oldest_age_secs,
+        truncated_messages,
+        truncated_bytes,
+    }
+}
+
+/// Emit a structured `context_window_assembled` INFO event (mika#2295). Mirrors
+/// `emit_system_prompt_assembled` shape.
+///
+/// **Ungated by `MIKA_STORE_LLM_CALLS`, like `turn_usage` (mika#1889) and for the
+/// same reason:** an instrument that goes quiet when DB persistence is disabled
+/// is not an instrument, it is an option.
+///
+/// The two DB columns this cross-checks against are `llm_calls.system_prompt_bytes`
+/// (v38, mika#1217) and `llm_calls.request_bytes` (v53, mika#2189):
+/// `request_bytes − system_prompt_bytes` and `history_bytes` are two independent
+/// surfaces that must move together. If only one moves, it is the measurement
+/// that is in question, not the system.
+fn emit_context_window_assembled(
+    agent_id: &str,
+    session_id: &str,
+    trace_id: &str,
+    mode: &str,
+    fields: &ContextWindowFields,
+) {
+    info!(
+        target: "mika::otel",
+        event = "context_window_assembled",
+        agent_id = %agent_id,
+        session_id = %session_id,
+        trace_id = %trace_id,
+        mode = %mode,
+        message_count = fields.message_count,
+        history_bytes = fields.history_bytes,
+        user_message_bytes = fields.user_message_bytes,
+        tool_defs_bytes = fields.tool_defs_bytes,
+        distinct_sessions = fields.distinct_sessions,
+        oldest_age_secs = fields.oldest_age_secs,
+        truncated_messages = fields.truncated_messages,
+        truncated_bytes = fields.truncated_bytes,
+        "context window assembled"
+    );
 }
 
 /// Raw dimensions of a per-turn LLM `usage` observation, decoupled from log emission
@@ -11805,5 +11952,185 @@ mod tests {
             classify_delegation_from_error("agent 'foo' not found in team resources"),
             DelegationOutcome::BusinessLogicFailure
         );
+    }
+
+    // ===========================================================================
+    // mika#2295 brique 0 — context-window attribution instrument
+    // ===========================================================================
+
+    fn window_msg(session_id: &str, content: &str, created_at: &str) -> crate::db::SessionMessage {
+        crate::db::SessionMessage {
+            id: 0,
+            session_id: session_id.to_string(),
+            agent_id: "mika-arch".to_string(),
+            role: "user".to_string(),
+            content: content.to_string(),
+            channel_type: "cli".to_string(),
+            metadata: None,
+            trace_id: None,
+            created_at: created_at.to_string(),
+            internal: false,
+        }
+    }
+
+    fn at(secs_ago: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() - chrono::Duration::seconds(secs_ago)
+    }
+
+    #[test]
+    fn mika2295_history_bytes_excludes_the_turn_s_own_user_message() {
+        // The whole point of the split: `history_bytes` must answer "what does
+        // this request carry BEYOND the question?". Folding the turn's own user
+        // message into it would make a large plan look like a large history and
+        // send the correction at the wrong component.
+        let now = chrono::Utc::now();
+        let history = vec![
+            window_msg("s1", "aaaa", &crate::timestamp::format(&at(60))),
+            window_msg("s1", "bbbbbb", &crate::timestamp::format(&at(30))),
+            window_msg(
+                "s1",
+                "the plan under review",
+                &crate::timestamp::format(&at(0)),
+            ),
+        ];
+
+        let f = build_context_window_fields(&history, &[], 0, 0, now);
+
+        assert_eq!(f.message_count, 3);
+        assert_eq!(f.history_bytes, 4 + 6);
+        assert_eq!(f.user_message_bytes, "the plan under review".len());
+    }
+
+    #[test]
+    fn mika2295_distinct_sessions_is_the_cross_ticket_contamination_detector() {
+        // The window is filtered on `m.agent_id`, not `m.session_id`, so it
+        // crosses sessions and therefore tickets. This field is what turns that
+        // property from a code reading into a measurement.
+        let now = chrono::Utc::now();
+        let ts = crate::timestamp::format(&at(10));
+
+        let one_ticket = vec![
+            window_msg("s1", "a", &ts),
+            window_msg("s1", "b", &ts),
+            window_msg("s1", "c", &ts),
+        ];
+        assert_eq!(
+            build_context_window_fields(&one_ticket, &[], 0, 0, now).distinct_sessions,
+            1,
+            "a window confined to one session must report exactly 1"
+        );
+
+        let three_tickets = vec![
+            window_msg("ticket-a", "plan A", &ts),
+            window_msg("ticket-b", "plan B", &ts),
+            window_msg("ticket-c", "plan C", &ts),
+            window_msg("ticket-a", "review A", &ts),
+        ];
+        assert_eq!(
+            build_context_window_fields(&three_tickets, &[], 0, 0, now).distinct_sessions,
+            3,
+            "three distinct sessions in the window is the contamination signal"
+        );
+    }
+
+    #[test]
+    fn mika2295_oldest_age_is_taken_from_the_first_message() {
+        // `rebuild_context` returns oldest-first (the SQL sorts DESC then the
+        // loader reverses), so the age is read off `first()`. If that ordering
+        // ever flips, this assertion is what says so.
+        let now = chrono::Utc::now();
+        let history = vec![
+            window_msg("s1", "old", &crate::timestamp::format(&at(3600))),
+            window_msg("s1", "recent", &crate::timestamp::format(&at(5))),
+        ];
+
+        let f = build_context_window_fields(&history, &[], 0, 0, now);
+        assert!(
+            (3595..=3605).contains(&f.oldest_age_secs),
+            "expected ~3600s, got {}",
+            f.oldest_age_secs
+        );
+    }
+
+    #[test]
+    fn mika2295_unreadable_or_future_timestamp_reports_zero_never_a_negative() {
+        // A negative age would read as a clock claim the instrument cannot back.
+        // Zero is the honest floor, and it is the rule `timestamp::is_older_than`
+        // already applies to the same class of input.
+        let now = chrono::Utc::now();
+
+        let garbled = vec![window_msg("s1", "x", "not-a-timestamp")];
+        assert_eq!(
+            build_context_window_fields(&garbled, &[], 0, 0, now).oldest_age_secs,
+            0
+        );
+
+        let from_the_future = vec![window_msg(
+            "s1",
+            "x",
+            &crate::timestamp::format(&(now + chrono::Duration::seconds(600))),
+        )];
+        assert_eq!(
+            build_context_window_fields(&from_the_future, &[], 0, 0, now).oldest_age_secs,
+            0
+        );
+    }
+
+    #[test]
+    fn mika2295_empty_window_reports_zeroes_rather_than_panicking() {
+        // A fresh session assembles an empty window. The instrument must survive
+        // it: an attribution event that panics on the first turn of a session
+        // would take the turn down with it.
+        let f = build_context_window_fields(&[], &[], 0, 0, chrono::Utc::now());
+
+        assert_eq!(f.message_count, 0);
+        assert_eq!(f.history_bytes, 0);
+        assert_eq!(f.user_message_bytes, 0);
+        assert_eq!(f.distinct_sessions, 0);
+        assert_eq!(f.oldest_age_secs, 0);
+    }
+
+    #[test]
+    fn mika2295_single_message_window_is_all_user_message_and_no_history() {
+        // The first turn of a session: the only message IS the question, so the
+        // history it carries is zero. An off-by-one in `split_last` would show up
+        // here as the question being counted as its own history.
+        let history = vec![window_msg(
+            "s1",
+            "review this plan",
+            &crate::timestamp::format(&at(1)),
+        )];
+
+        let f = build_context_window_fields(&history, &[], 0, 0, chrono::Utc::now());
+
+        assert_eq!(f.history_bytes, 0);
+        assert_eq!(f.user_message_bytes, "review this plan".len());
+    }
+
+    #[test]
+    fn mika2295_tool_defs_bytes_is_the_serialized_size() {
+        // Tool definitions are the third component of the request and grow
+        // independently of the window. Reporting them here is what lets the
+        // analyzer subtract a known quantity instead of attributing its growth to
+        // the history by elimination.
+        let defs = full_tool_set();
+        let expected = serde_json::to_string(&defs).unwrap().len();
+
+        let f = build_context_window_fields(&[], &defs, 0, 0, chrono::Utc::now());
+
+        assert_eq!(f.tool_defs_bytes, expected);
+        assert!(f.tool_defs_bytes > 0);
+    }
+
+    #[test]
+    fn mika2295_truncation_counts_are_passed_through_not_invented() {
+        // They are `0` at every production call site today because the byte
+        // ceiling is gated on this instrument's verdict. They are parameters
+        // rather than literals so that gate can be lifted without reshaping the
+        // event an analyzer has already been written against.
+        let f = build_context_window_fields(&[], &[], 7, 4096, chrono::Utc::now());
+
+        assert_eq!(f.truncated_messages, 7);
+        assert_eq!(f.truncated_bytes, 4096);
     }
 }
