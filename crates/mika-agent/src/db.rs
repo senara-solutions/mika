@@ -14248,8 +14248,12 @@ impl Database {
 
 // ===== Tests =====
 
+// `pub(crate)` for the test build only: `skills::executor::tests::harnais_porte`
+// (mika#2310, cases 9 / 9b) reuses the groom-pair fixtures defined below rather
+// than duplicating them, per the ticket's "reuse, do not duplicate". No
+// production visibility changes — the module is `#[cfg(test)]`.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn db() -> Database {

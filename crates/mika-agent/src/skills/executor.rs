@@ -1163,6 +1163,79 @@ fn groom_provenance_verdict(
     }
 }
 
+/// The grooming gate, from the issue body to the verdict (mika#2310 D1).
+///
+/// This is the segment of `validate_dispatch_readiness` that follows
+/// `fetch_issue_body`: markers check → rejection `dispatch_no_grooming_marker`
+/// if any is missing, otherwise issue-URL construction →
+/// `has_completed_groom_for_issue` → [`groom_provenance_verdict`].
+///
+/// **Extracted so the gate can be exercised end-to-end without a network.**
+/// `fetch_issue_body` (`github_graphql.rs`) writes `https://api.github.com/...`
+/// in the clear with no injectable base URL, and the caller invokes it
+/// unconditionally whenever a token is present — so no `Some`/`None` setting
+/// gives an offline end-to-end run. Taking the issue body as a *parameter* is
+/// the smallest cut that makes case 9 of mika#2288 testable: in production the
+/// body comes from the fetch, in test from a fixture, and the only link left
+/// outside the test is the HTTP transport, which the ticket excludes itself
+/// ("zero network"). The alternative — a configurable base URL on
+/// `github_graphql` — touches ten functions of a shared module and adds a
+/// production configuration point nobody needs, for the benefit of a test.
+///
+/// **This function never touches `tasks.result`.** `record_dispatch_rejection`
+/// stays with the caller, one level up, so the extraction is a move of lines
+/// and not a change of behaviour: same order, same conditions, same JSON
+/// payloads.
+pub(crate) async fn evaluate_grooming_gate(
+    db: &AsyncDatabase,
+    task_id: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    issue_body: &str,
+) -> Result<(), serde_json::Value> {
+    let missing = check_grooming_markers(issue_body);
+
+    if !missing.is_empty() {
+        return Err(serde_json::json!({
+            "error": "dispatch_no_grooming_marker",
+            "task_id": task_id,
+            "issue": format!("{}/{}#{}", owner, repo, number),
+            "missing_signals": missing,
+            "predicate": "issue body must contain all three substrings: \
+                          '> - **Branch:**', 'docs/plans/', and a second-pass \
+                          marker ('(GROOMED)' or '(READY, paraphrased GROOMED ...)')",
+            "recovery": "Dispatch dev-groom first via \
+                         'mika ask --agent mika-dev \"groom <typed-ref>\"' \
+                         (or re-apply the `ready` label) so the autonomous loop \
+                         produces the canonical callout block.",
+            "reason": format!(
+                "Cannot dispatch dev-pilot on ticket #{number}: issue body is \
+                 missing one or more grooming-marker signals. The grooming-marker \
+                 gate ensures architect-reviewed plans are committed before \
+                 implementation begins (mika#907, mika#919)."
+            )
+        }));
+    }
+
+    // Grooming provenance cross-check (#1620, mika#2287):
+    // markers are present but may have been pre-stamped by
+    // hand. Proof = a completed groom CALLBACK row carrying
+    // `Outcome: PLAN_GROOMED` under a parent for this issue
+    // (bare URL or legacy `?phase=groom`). The parent row is
+    // not proof — the engine flips it groom→implement
+    // (mika#1614) before it is terminal. Read-only,
+    // fail-closed on every degraded case of the cross-check.
+    let issue_url = format!("https://github.com/{}/{}/issues/{}", owner, repo, number);
+    groom_provenance_verdict(
+        db.has_completed_groom_for_issue(&issue_url).await,
+        task_id,
+        owner,
+        repo,
+        number,
+    )
+}
+
 async fn record_dispatch_rejection(db: &AsyncDatabase, task_id: &str, reason_json: &str) {
     if let Err(e) = db.write_task_dispatch_rejection(task_id, reason_json).await {
         warn!(
@@ -1733,52 +1806,21 @@ pub(crate) async fn validate_dispatch_readiness(
                     Some(token) => {
                         match fetch_issue_body(token, owner, repo, number).await {
                             Ok(issue_body) => {
-                                let missing = check_grooming_markers(&issue_body);
-
-                                if !missing.is_empty() {
-                                    let rejection = serde_json::json!({
-                                        "error": "dispatch_no_grooming_marker",
-                                        "task_id": task_id,
-                                        "issue": format!("{}/{}#{}", owner, repo, number),
-                                        "missing_signals": missing,
-                                        "predicate": "issue body must contain all three substrings: \
-                                                      '> - **Branch:**', 'docs/plans/', and a second-pass \
-                                                      marker ('(GROOMED)' or '(READY, paraphrased GROOMED ...)')",
-                                        "recovery": "Dispatch dev-groom first via \
-                                                     'mika ask --agent mika-dev \"groom <typed-ref>\"' \
-                                                     (or re-apply the `ready` label) so the autonomous loop \
-                                                     produces the canonical callout block.",
-                                        "reason": format!(
-                                            "Cannot dispatch dev-pilot on ticket #{number}: issue body is \
-                                             missing one or more grooming-marker signals. The grooming-marker \
-                                             gate ensures architect-reviewed plans are committed before \
-                                             implementation begins (mika#907, mika#919)."
-                                        )
-                                    });
-                                    record_dispatch_rejection(db, task_id, &rejection.to_string())
-                                        .await;
-                                    return Err(rejection.to_string());
-                                }
-
-                                // Grooming provenance cross-check (#1620, mika#2287):
-                                // markers are present but may have been pre-stamped by
-                                // hand. Proof = a completed groom CALLBACK row carrying
-                                // `Outcome: PLAN_GROOMED` under a parent for this issue
-                                // (bare URL or legacy `?phase=groom`). The parent row is
-                                // not proof — the engine flips it groom→implement
-                                // (mika#1614) before it is terminal. Read-only,
-                                // fail-closed on every degraded case of the cross-check.
-                                let issue_url = format!(
-                                    "https://github.com/{}/{}/issues/{}",
-                                    owner, repo, number
-                                );
-                                if let Err(rejection) = groom_provenance_verdict(
-                                    db.has_completed_groom_for_issue(&issue_url).await,
+                                // Markers + provenance cross-check live in
+                                // `evaluate_grooming_gate` (mika#2310 D1) so the
+                                // segment can be exercised without the network.
+                                // Recording the rejection stays here: the extracted
+                                // function never touches the DB.
+                                if let Err(rejection) = evaluate_grooming_gate(
+                                    db,
                                     task_id,
                                     owner,
                                     repo,
                                     number,
-                                ) {
+                                    &issue_body,
+                                )
+                                .await
+                                {
                                     record_dispatch_rejection(db, task_id, &rejection.to_string())
                                         .await;
                                     return Err(rejection.to_string());
