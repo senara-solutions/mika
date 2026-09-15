@@ -14248,11 +14248,15 @@ impl Database {
 
 // ===== Tests =====
 
+// `pub(crate)` for the test build only: `skills::executor::tests::harnais_porte`
+// (mika#2310, cases 9 / 9b) reuses the groom-pair fixtures defined below rather
+// than duplicating them, per the ticket's "reuse, do not duplicate". No
+// production visibility changes — the module is `#[cfg(test)]`.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn db() -> Database {
+    pub(crate) fn db() -> Database {
         Database::open_in_memory().unwrap()
     }
 
@@ -25585,15 +25589,15 @@ mod tests {
     // from the production write API (`create_task` + `update_task_completed`
     // / `update_task_status`) — no raw SQL INSERT.
 
-    const GROOM_ISSUE_URL: &str = "https://github.com/senara-solutions/mika/issues/123";
-    const GROOM_CALLBACK_PLAN_GROOMED: &str =
+    pub(crate) const GROOM_ISSUE_URL: &str = "https://github.com/senara-solutions/mika/issues/123";
+    pub(crate) const GROOM_CALLBACK_PLAN_GROOMED: &str =
         "claude-pilot completed (status: done).\nOutcome: PLAN_GROOMED\nSession: sess-2287";
     const GROOM_CALLBACK_PLAN_ITERATE: &str =
         "claude-pilot completed (status: done).\nOutcome: PLAN_ITERATE\nSession: sess-2287";
 
     /// Groom parent as the structural ready-label handler creates it
     /// (`trigger_type='manual'`, bare issue URL, `dispatch_class='groom'`).
-    fn groom_parent(agent_id: &str, reference_url: &str) -> NewTask {
+    pub(crate) fn groom_parent(agent_id: &str, reference_url: &str) -> NewTask {
         NewTask {
             agent_id: agent_id.to_string(),
             team_run_id: None,
@@ -25622,7 +25626,7 @@ mod tests {
 
     /// Groom callback child as `build_callback_task` creates it
     /// (`trigger_type='callback'`, `reference_url: None`, class from the skill).
-    fn groom_callback(agent_id: &str, parent_id: &str, dispatch_class: &str) -> NewTask {
+    pub(crate) fn groom_callback(agent_id: &str, parent_id: &str, dispatch_class: &str) -> NewTask {
         NewTask {
             agent_id: agent_id.to_string(),
             team_run_id: None,
@@ -25652,7 +25656,7 @@ mod tests {
     /// Build a groom parent + groom callback pair for `agent_id` and complete
     /// the callback with `result` through the production write path. Returns
     /// `(parent_id, callback_id)`.
-    fn completed_groom_pair(
+    pub(crate) fn completed_groom_pair(
         db: &Database,
         agent_id: &str,
         reference_url: &str,
@@ -25830,6 +25834,14 @@ mod tests {
                 .unwrap()
         );
     }
+
+    /// mika#2310 — isolated harness for the mika#1620 / mika#2287 gate (cases 4
+    /// and 8, predicate level). Lives in `db/tests/harnais_porte.rs` because
+    /// `db.rs` sits 4.6 KB under the 1 MB cap of `scripts/check-secrets.sh`;
+    /// the module path `db::tests::harnais_porte` is what the ticket's exit
+    /// criterion filters on, and `#[path]` preserves it.
+    #[path = "harnais_porte.rs"]
+    mod harnais_porte;
 
     // ------------------------------------------------------------------
     // mika#1676 — v46→v47: team_runs delegation-visibility (Unit B + Unit A
