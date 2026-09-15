@@ -315,6 +315,126 @@ Test d'intégration :
 
 ---
 
+## Fire-Disposition
+
+Deux des quinze livrables du contrat sont de **classe détecteur** au sens de
+mika#1574 (`docs/solutions/best-practices/fire-disposition-doctrine.md`) : leur
+chemin de succès est « aucune violation trouvée », donc leur première exécution
+peut firer sur du code **préexistant** que ce plan n'a pas écrit. Cette section
+dit ce que l'implémenteur fait dans ce cas, pour que la décision ne soit pas
+prise au fil de l'eau.
+
+**Test 13 — scan de source « aucune écriture de `ready` hors du module » (garde D1)
+→ option (c), halt-and-surface.**
+
+Ce détecteur fire **par construction** au démarrage de l'implémentation : les
+quatre applicateurs de l'inventaire (`auto_pull.rs:2897`, `:3055`, `:3384`,
+`server/milestone_context_handler.rs:373`) sont exactement les violations qu'il
+nomme. Leur migration vers `ready_label::apply_ready` est dans le périmètre de
+D1 : le test passe au vert parce que les quatre sites ont bougé, pas parce qu'on
+les a exemptés.
+
+Le cas qui appelle une décision est le **cinquième site** : une écriture de
+`ready` que l'inventaire n'a pas vue et que le scan découvre. Disposition :
+**halt-and-surface**. Pas d'allowlist, pas de `#[ignore]`.
+
+- Pourquoi pas l'option (a), l'exception nommée — qui est pourtant le défaut de
+  la doctrine : une exception d'allowlist ici serait un applicateur de `ready`
+  qui continue d'écrire **sans consulter le park**, c'est-à-dire précisément le
+  bug B2 laissé vivant derrière une ligne qui a l'air d'une décision. La
+  doctrine réserve (c) au cas où « la forme de la résolution est elle-même la
+  question de cadrage opérateur » : c'en est un, parce qu'un cinquième
+  applicateur inconnu peut être soit un site à migrer (même geste que les
+  quatre), soit un chemin légitime dont le park ne doit pas dépendre — et cette
+  distinction ne se tranche pas depuis ce plan.
+- Pourquoi pas l'option (b), land disabled : un scan de source désarmé est
+  précisément la classe que D1 existe pour refuser (leçon mika#2158 — la regex
+  dupliquée a divergé des mois pendant que tous les tests restaient verts). Le
+  détecteur serait alors du décor.
+- **Forme du halt** : l'implémenteur s'arrête, nomme le site (fichier + ligne +
+  appelant), et surface à l'opérateur dans le corps de PR sous un titre
+  `Fire-Disposition: cinquième applicateur découvert`. La PR ne merge pas tant
+  que le cadrage n'est pas rendu.
+- **Non-négociable** : le scan ne merge jamais ni désarmé ni assorti d'une
+  exemption. AC6 reste intact.
+
+**Test 11 — épinglage de la régression de pagination (`timeline > 100 événements`)
+→ gate CI bloquant, vert au merge par construction.**
+
+Ce détecteur fire **aujourd'hui sur `main`** : c'est la définition de B1. Il
+n'est pas de classe « violation préexistante à exempter » mais de classe
+« rouge maintenant → vert après le fix », le même modèle que le plan mika#2228
+applique à ses events ERROR. Disposition :
+
+- **Avant D5** : rouge. C'est la preuve que le test mesure bien la régression et
+  non un invariant déjà satisfait. Un test 11 vert sur `main` serait un test qui
+  n'épingle rien, et vaudrait rejet à la revue.
+- **Après D5** : vert, parce que la timeline est lue en entier.
+- **Aucune exemption disponible** : une pagination partielle est une régression
+  fonctionnelle, pas une dette tolérable — c'est le mécanisme qui rend le
+  self-throttle inopérant sur la population qu'il existe pour freiner. Ni
+  allowlist, ni `#[ignore]`.
+- **Gate** : `cargo test` bloquant en CI, comme tout test du contrat. Rien de
+  spécifique n'est à ajouter au pipeline.
+
+**Ce qui n'est délibérément pas de classe détecteur**, pour que le périmètre de
+cette section soit clos :
+
+- Test 14 (`machine_identities` vide → refus) teste un **chemin de code** du fix,
+  pas l'état d'un corpus existant : il ne peut pas firer sur du préexistant.
+- Test 12 (plafond `MAX_TIMELINE_PAGES`) et test 15 (rejeu mika#2295) sont des
+  tests de comportement sur du code neuf, même raison.
+- Tests 1–10 sont des tests unitaires purs sur `is_parked`, sur des timelines
+  fixées en dur : il n'y a pas de population existante à heurter.
+
+*Citation : `docs/solutions/best-practices/fire-disposition-doctrine.md`
+(mika#1574) ; review-guide.md § Fire-Disposition Gate.*
+
+---
+
+## Amendement du corps du ticket mika#2315
+
+Le corps de #2315 porte, verbatim, une hypothèse que l'investigation réfute :
+
+> « Cause suspectée : Un re-dispatch automatique moteur — vraisemblablement le
+> reaper mtime-worktree »
+
+La section « L'hypothèse du ticket est réfutée » établit que ce reaper n'écrit
+aucun label et que l'applicateur est Phase 2 (`stuck_ready_reconcile`). Laisser
+le corps en l'état fait diverger l'issue-comme-contrat de son propre résultat
+d'enquête : un lecteur futur poursuivra le reaper pendant que le correctif vit
+dans `auto_pull`. C'est la convention *issue-as-versioned-contract* (précédent
+mika#2295), et elle vaut ici parce que le corps est la seule surface qu'un
+lecteur consulte avant le plan.
+
+**Livrable** : amender le corps de mika#2315 — texte ajouté sous la section
+« Cause suspectée », l'hypothèse d'origine **conservée et barrée** plutôt que
+supprimée (une hypothèse effacée ne s'apprend pas) :
+
+```markdown
+> [!NOTE]
+> **Édité le 2026-09-15 — attribution corrigée par l'investigation.**
+> ~~Cause suspectée : le reaper mtime-worktree (mika#2249, `dba4f7e7`).~~
+> **Réfuté** : ce reaper n'écrit aucun label ; sa seule mention de `ready` est un
+> commentaire qui délègue explicitement le re-drive à `stuck_ready_reconcile`.
+> Il est un maillon de la chaîne (il libère le verrou `in_flight`), jamais
+> l'applicateur.
+> **Applicateur réel** : `auto_pull.rs` Phase 2 (`stuck_ready_reconcile`), dont
+> le remove→add est la signature exacte de l'évidence. Son frein
+> (`gh_ready_label_age_secs`) est inopérant au-delà de 100 événements de
+> timeline — voir le plan pour la démonstration.
+> Plan : `docs/plans/2026-09-15-004-fix-2315-ready-rearme-sur-ticket-parque-plan.md`
+```
+
+Accompagné d'un **commentaire d'édition** sur l'issue nommant la modification et
+sa raison, de sorte que l'amendement ne soit pas une réécriture silencieuse de
+l'historique (même exigence que la trace d'édition du précédent mika#2295).
+
+*Citation : convention issue-as-versioned-contract (mika#2295) ;
+review-guide.md § citation-or-silence.*
+
+---
+
 ## Risques et coûts, nommés
 
 - **Un opérateur agissant via le PAT de la machine sera classé « machine ».** Son
@@ -385,6 +505,17 @@ application. Chacun émet son signal opérateur distinct.
 les protections qui les couvrent (`has_open_pr`, `is_feeder_excluded`) restent
 intactes.
 
+**AC10** — Le corps de mika#2315 porte la réfutation de l'hypothèse « reaper
+mtime-worktree » et l'attribution corrigée à Phase 2, avec l'hypothèse d'origine
+barrée et non supprimée, plus un commentaire d'édition sur l'issue nommant la
+modification et sa raison. Vérifiable à la lecture de l'issue.
+
+**AC11** — Aucun des deux détecteurs ne merge désarmé ni exempté : le scan de
+source (test 13) est actif sans allowlist, et l'épinglage de pagination
+(test 11) est bloquant en CI. Un détecteur qui fire sur un cinquième applicateur
+non inventorié arrête la PR et surface à l'opérateur (§ Fire-Disposition) — il
+n'est ni ignoré ni contourné.
+
 ---
 
 ## Definition of Done
@@ -403,3 +534,37 @@ intactes.
       comme vérifications post-déploiement, avec leur critère de lecture.
 - [ ] Le ticket de suivi « STOP global hot-swappable » est ouvert et référencé
       (`Tracked in:`) dans le corps de PR.
+- [ ] Le corps de mika#2315 est amendé selon la section « Amendement du corps du
+      ticket » (hypothèse barrée, attribution corrigée, callout `Plan:`), et un
+      commentaire d'édition est posté sur l'issue.
+- [ ] Le test 13 a été exécuté au moins une fois **avant** migration des quatre
+      applicateurs, et il firait : un scan vert dès le premier run signifierait
+      qu'il ne détecte pas ce qu'il prétend détecter.
+- [ ] Le test 11 a été exécuté au moins une fois contre le
+      `gh_ready_label_age_secs` d'avant D5, et il firait (même raison).
+- [ ] Aucun cinquième applicateur de `ready` n'a été découvert ; si c'est le cas,
+      la PR porte la section `Fire-Disposition: cinquième applicateur découvert`
+      et attend le cadrage opérateur.
+
+---
+
+## Revision history
+
+- rev 2 (2026-09-15) : adressé F1 en ajoutant la section `## Fire-Disposition`
+  manquante — test 13 (scan de source, garde D1) en **halt-and-surface**
+  (option (c) de `fire-disposition-doctrine.md`), avec l'argument explicite pour
+  lequel l'option (a) par défaut est refusée ici : une exception d'allowlist
+  serait un applicateur de `ready` qui continue d'écrire sans consulter le park,
+  c'est-à-dire B2 laissé vivant ; test 11 (pagination) en **gate CI bloquant,
+  rouge-avant/vert-après**, sans exemption disponible ; plus l'énumération de ce
+  qui n'est *pas* de classe détecteur (tests 1–10, 12, 14, 15) pour clore le
+  périmètre. Ajouté AC11 et quatre items de DoD, dont deux qui exigent d'avoir
+  vu chaque détecteur firer avant le fix — un détecteur vert dès son premier run
+  ne détecte rien.
+- rev 2 (2026-09-15) : adressé F2 en ajoutant la section « Amendement du corps du
+  ticket mika#2315 », qui porte le texte exact de l'amendement (hypothèse
+  « reaper mtime-worktree » **barrée et conservée**, attribution corrigée à
+  Phase 2, callout `Plan:`) plus l'exigence d'un commentaire d'édition sur
+  l'issue ; inscrit comme AC10 et comme item de DoD. La rédaction du texte est
+  faite ici ; sa pose sur GitHub appartient à l'implémenteur, le contrat de
+  `/mika-revise-plan` étant strictement content-only.
