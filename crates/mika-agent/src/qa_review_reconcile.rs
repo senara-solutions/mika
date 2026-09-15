@@ -251,7 +251,7 @@ pub fn select_prs_needing_review(
         .collect();
 
     retained.sort_by(|a, b| b.age_secs.cmp(&a.age_secs).then(a.number.cmp(&b.number)));
-    retained.truncate(cfg.max_per_tick);
+    retained.truncate(cfg.max_per_tick); // safe-byte-slice: retained is Vec<PrRef>; truncate is by element count (usize max_per_tick), not a byte offset — no UTF-8 boundary
     retained
 }
 
