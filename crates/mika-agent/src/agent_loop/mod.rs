@@ -3477,23 +3477,48 @@ async fn run_agent_inner(
     let enabled_tool_names: HashSet<String> =
         skill_tool_defs.iter().map(|d| d.name.clone()).collect();
 
-    let history = db.rebuild_context(scope_task_id, 20).await?;
+    // mika#2295 briques 1 & 2 — the two bounds on the conversation window, read
+    // off the identity and applied here rather than inside the DB layer. Same
+    // shape as the `[context.summary]` gate a few hundred lines up
+    // (`load_gated_summary`): a `[context.*]` block read by the caller, the
+    // storage layer's signature left alone.
+    //
+    // The `20` below still bounds a COUNT. That is the whole defect: for an
+    // architect the counted items are entire plans and reviews, so twenty of them
+    // is twenty times an unknown quantity. `scope` bounds *which* rows may be
+    // counted, `max_tokens` bounds *how large* the result may be, and they close
+    // two different axes — a session that iterates (plan v1, review, plan v2 …)
+    // is bounded by the second and not the first.
+    let history_config = &ctx.identity.context.history;
+    let scoped_session_id = match history_config.scope {
+        prompt::HistoryScope::Session => Some(session_id),
+        prompt::HistoryScope::Agent => None,
+    };
+    let mut history = db
+        .rebuild_context(scoped_session_id, scope_task_id, 20)
+        .await?;
+    let truncation = match history_config.max_tokens {
+        Some(max_tokens) => truncate_history_to_token_budget(&mut history, max_tokens),
+        None => HistoryTruncation::default(),
+    };
 
     // mika#2295 brique 0 — the attribution instrument, emitted at the single
     // production site where a conversation window is assembled (`rewind.rs` is an
-    // administrative path, not a turn). The `20` above bounds a COUNT and never a
-    // size, and the query underneath filters on `m.agent_id` rather than
-    // `m.session_id`, so this is the one place able to say how many bytes and how
-    // many distinct sessions the window dragged in.
-    //
-    // The truncation counts are `0` and stay `0` until the byte ceiling lands:
-    // that ceiling is gated on the verdict this event produces, not the reverse.
+    // administrative path, not a turn). This is the one place able to say how many
+    // bytes and how many distinct sessions the window dragged in — and, since the
+    // two bounds above landed, how much they took back out.
     emit_context_window_assembled(
         &db.agent_id,
         session_id,
         trace_id,
         "conversation",
-        &build_context_window_fields(&history, &skill_tool_defs, 0, 0, chrono::Utc::now()),
+        &build_context_window_fields(
+            &history,
+            &skill_tool_defs,
+            truncation.truncated_messages,
+            truncation.truncated_bytes,
+            chrono::Utc::now(),
+        ),
     );
 
     // Build initial message list from history.
@@ -6222,6 +6247,90 @@ fn build_context_window_fields(
         truncated_messages,
         truncated_bytes,
     }
+}
+
+/// Text of the marker inserted in place of elided history (mika#2295).
+///
+/// A window that shrinks silently teaches the model that it has seen everything,
+/// which is the failure mode `truncate_to_token_budget` already guards against
+/// for the summary. Same discipline here.
+const HISTORY_ELISION_MARKER: &str =
+    "[… older conversation history elided to fit the context-window budget …]";
+
+/// What a byte ceiling removed from a window (mika#2295).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct HistoryTruncation {
+    truncated_messages: usize,
+    truncated_bytes: usize,
+}
+
+/// Elide the oldest history until it fits under a token budget, oldest first.
+///
+/// **The turn's own user message is never elided.** It is the last element of the
+/// window (the message just saved), and dropping it would answer a question that
+/// was erased — so `Some(0)`, the omission sentinel inherited from
+/// [`ContextSummaryConfig::max_tokens`], means *the history is emptied*, not *the
+/// window is emptied*. That reading is the only one under which the plan's two
+/// requirements — "`Some(0)` → empty window" and "the last message is never
+/// elided" — are both true, and it is the safe side of the ambiguity: the cost of
+/// keeping the question is bytes, the cost of dropping it is an unanswerable turn.
+///
+/// The budget is measured on message content only, through
+/// [`prompt::token_budget_to_bytes`] — the same estimator as the summary path, not
+/// a second one.
+///
+/// When anything is elided, a [`HISTORY_ELISION_MARKER`] message is inserted at
+/// the front rather than the oldest surviving message being prefixed: a real
+/// message's content is not ours to rewrite. It carries the turn's own
+/// `session_id` so it cannot inflate `distinct_sessions`, the field AC7 reads.
+/// It does count as one message and ~70 bytes in
+/// [`build_context_window_fields`] — deliberately, since it is genuinely in the
+/// window sent to the model.
+fn truncate_history_to_token_budget(
+    history: &mut Vec<crate::db::SessionMessage>,
+    max_tokens: usize,
+) -> HistoryTruncation {
+    // Nothing to bound: an empty window, or one holding only the turn's own
+    // message. `split_last`'s `None` arm and a 1-element window agree here.
+    if history.len() < 2 {
+        return HistoryTruncation::default();
+    }
+
+    let budget = prompt::token_budget_to_bytes(max_tokens);
+    let history_end = history.len() - 1; // exclusive: the turn's user message.
+    let mut history_bytes: usize = history[..history_end].iter().map(|m| m.content.len()).sum();
+
+    let mut truncation = HistoryTruncation::default();
+    let mut cut = 0usize;
+    while cut < history_end && history_bytes > budget {
+        let bytes = history[cut].content.len();
+        history_bytes -= bytes;
+        truncation.truncated_bytes += bytes;
+        truncation.truncated_messages += 1;
+        cut += 1;
+    }
+
+    if cut == 0 {
+        return truncation;
+    }
+
+    let template = &history[history_end];
+    let marker = crate::db::SessionMessage {
+        id: -1,
+        session_id: template.session_id.clone(),
+        agent_id: template.agent_id.clone(),
+        role: "system".to_string(),
+        content: HISTORY_ELISION_MARKER.to_string(),
+        channel_type: template.channel_type.clone(),
+        metadata: None,
+        trace_id: None,
+        created_at: template.created_at.clone(),
+        internal: false,
+    };
+    history.drain(..cut);
+    history.insert(0, marker);
+
+    truncation
 }
 
 /// Emit a structured `context_window_assembled` INFO event (mika#2295). Mirrors
@@ -12124,13 +12233,147 @@ mod tests {
 
     #[test]
     fn mika2295_truncation_counts_are_passed_through_not_invented() {
-        // They are `0` at every production call site today because the byte
-        // ceiling is gated on this instrument's verdict. They are parameters
-        // rather than literals so that gate can be lifted without reshaping the
-        // event an analyzer has already been written against.
+        // They are parameters rather than literals so the byte ceiling could be
+        // lifted without reshaping the event an analyzer has already been written
+        // against. Since brique 2, the production call site passes real counts.
         let f = build_context_window_fields(&[], &[], 7, 4096, chrono::Utc::now());
 
         assert_eq!(f.truncated_messages, 7);
         assert_eq!(f.truncated_bytes, 4096);
+    }
+
+    // ===========================================================================
+    // mika#2295 brique 2 — the byte ceiling
+    // ===========================================================================
+
+    /// A window of `n` history messages of `bytes` each, plus the turn's own
+    /// user message last — the shape `rebuild_context` returns.
+    fn window_with_history(sizes: &[usize], user_message: &str) -> Vec<crate::db::SessionMessage> {
+        let mut out: Vec<crate::db::SessionMessage> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| window_msg("s1", &"x".repeat(*n), &format!("2026-09-15T00:00:{i:02}Z")))
+            .collect();
+        out.push(window_msg("s1", user_message, "2026-09-15T00:01:00Z"));
+        out
+    }
+
+    #[test]
+    fn mika2295_ceiling_elides_oldest_first() {
+        // 4 × 400 bytes of history = 1600, ceiling of 250 tokens = 1000 bytes.
+        // Two of the four must go, and they must be the two oldest.
+        let mut history = window_with_history(&[400, 400, 400, 400], "the question");
+        history[0].content = format!("oldest{}", "x".repeat(394));
+        history[3].content = format!("newest{}", "x".repeat(394));
+
+        let t = truncate_history_to_token_budget(&mut history, 250);
+
+        assert_eq!(t.truncated_messages, 2);
+        assert_eq!(t.truncated_bytes, 800);
+        // marker + 2 surviving history + the user message
+        assert_eq!(history.len(), 4);
+        assert!(history.iter().any(|m| m.content.starts_with("newest")));
+        assert!(
+            !history.iter().any(|m| m.content.starts_with("oldest")),
+            "the oldest message is the first to go, never the newest"
+        );
+    }
+
+    #[test]
+    fn mika2295_the_turn_s_own_question_is_never_elided() {
+        // Even at the tightest ceiling there is, the last message survives:
+        // eliding it would answer a question that was erased.
+        let mut history = window_with_history(&[5_000, 5_000], "what should I do about #2295?");
+
+        let t = truncate_history_to_token_budget(&mut history, 0);
+
+        assert_eq!(t.truncated_messages, 2);
+        assert_eq!(
+            history.last().unwrap().content,
+            "what should I do about #2295?"
+        );
+    }
+
+    #[test]
+    fn mika2295_zero_is_the_omission_sentinel_and_empties_the_history() {
+        // `Some(0)` inherits `ContextSummaryConfig`'s meaning: omit, do not "cap
+        // at zero tokens". What it omits is the history — see the test above for
+        // the half of that sentence the plan left implicit.
+        let mut history = window_with_history(&[100, 100, 100], "q");
+
+        truncate_history_to_token_budget(&mut history, 0);
+
+        assert_eq!(history.len(), 2, "marker + the turn's own message only");
+        assert_eq!(history[0].content, HISTORY_ELISION_MARKER);
+        assert_eq!(history[1].content, "q");
+    }
+
+    #[test]
+    fn mika2295_elision_inserts_a_marker_rather_than_shrinking_in_silence() {
+        let mut history = window_with_history(&[4_000], "q");
+
+        truncate_history_to_token_budget(&mut history, 10);
+
+        assert_eq!(
+            history[0].content, HISTORY_ELISION_MARKER,
+            "a window that shrinks silently teaches the model it has seen everything"
+        );
+        // The marker must not look like another ticket to AC7's detector.
+        assert_eq!(
+            build_context_window_fields(&history, &[], 1, 4_000, chrono::Utc::now())
+                .distinct_sessions,
+            1,
+            "the marker carries the turn's own session_id"
+        );
+    }
+
+    #[test]
+    fn mika2295_a_window_already_under_budget_is_left_exactly_alone() {
+        let before = window_with_history(&[10, 10], "q");
+        let mut after = before.clone();
+
+        let t = truncate_history_to_token_budget(&mut after, 1_000);
+
+        assert_eq!(t, HistoryTruncation::default());
+        assert_eq!(after.len(), before.len());
+        assert!(
+            after.iter().all(|m| m.content != HISTORY_ELISION_MARKER),
+            "no marker when nothing was elided"
+        );
+    }
+
+    #[test]
+    fn mika2295_a_window_with_no_history_is_a_no_op_at_any_ceiling() {
+        // Both degenerate shapes: empty, and the turn's own message alone. A
+        // first architect pass under session scope is exactly the second one, so
+        // this is the nominal case, not an edge case.
+        for len in [0usize, 1] {
+            let mut history: Vec<crate::db::SessionMessage> = (0..len)
+                .map(|_| window_msg("s1", &"x".repeat(9_999), "2026-09-15T00:00:00Z"))
+                .collect();
+
+            let t = truncate_history_to_token_budget(&mut history, 0);
+
+            assert_eq!(t, HistoryTruncation::default(), "len = {len}");
+            assert_eq!(history.len(), len, "len = {len}");
+        }
+    }
+
+    #[test]
+    fn mika2295_budget_converts_through_the_one_shared_estimator() {
+        // Not a second estimator beside `truncate_to_token_budget`'s: 4 bytes per
+        // token, the same constant. 100 tokens = 400 bytes, so a 400-byte history
+        // fits and a 401-byte one does not.
+        let mut fits = window_with_history(&[400], "q");
+        assert_eq!(
+            truncate_history_to_token_budget(&mut fits, 100),
+            HistoryTruncation::default()
+        );
+
+        let mut over = window_with_history(&[401], "q");
+        assert_eq!(
+            truncate_history_to_token_budget(&mut over, 100).truncated_messages,
+            1
+        );
     }
 }

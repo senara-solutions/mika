@@ -102,6 +102,7 @@ use mika_common::{agent, team};
 use serde::Deserialize;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
+use tracing::warn;
 
 /// Heuristic conversion ratio for character-count to token-count approximation.
 ///
@@ -348,6 +349,129 @@ pub struct ToolsIdentityConfig {
 pub struct ContextIdentityConfig {
     #[serde(default)]
     pub summary: ContextSummaryConfig,
+    #[serde(default)]
+    pub history: ContextHistoryConfig,
+}
+
+/// `[context.history]` subsection — bounds the conversation window a turn
+/// assembles (mika#2295).
+///
+/// The window it governs was bounded by `LIMIT 20` and nothing else, and the
+/// counted items are, for an architect, whole plans and reviews: **twenty items
+/// of unbounded size is not a bounded window**. Its filter was also `m.agent_id`
+/// rather than `m.session_id`, so the window crossed sessions and therefore
+/// tickets — an architect reviewing ticket A read the plans of B, C and D. The
+/// measured consequence was mika-arch's median input prompt doubling from 35 829
+/// to 71 007 tokens on 2026-09-03, the day 59 engine-grooms went through, with
+/// none of its prompt files touched.
+///
+/// The two fields close two genuinely distinct axes and neither makes the other
+/// redundant: `scope` bounds contamination *between* tickets, `max_tokens`
+/// bounds a single session that iterates (`_iterate_groom_loop` runs plan v1,
+/// review, plan v2, … in one session).
+///
+/// Shape is copied from [`ContextSummaryConfig`] deliberately — same `[context.*]`
+/// home, same `CHARS_PER_TOKEN_ESTIMATE` conversion, same "applied by the caller,
+/// DB layer signature untouched" discipline as [`load_gated_summary`].
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct ContextHistoryConfig {
+    /// Which rows the window may draw from. Default [`HistoryScope::Agent`]
+    /// reproduces the pre-mika#2295 behaviour exactly, so no existing agent
+    /// changes without that change being written into its identity.
+    #[serde(default, deserialize_with = "deserialize_history_scope")]
+    pub scope: HistoryScope,
+
+    /// Optional token ceiling on the history, converted to bytes via
+    /// [`CHARS_PER_TOKEN_ESTIMATE`] — the same `4` as
+    /// [`truncate_to_token_budget`], not a second estimator.
+    ///
+    ///   - `None` → no ceiling (default; current behaviour).
+    ///   - `Some(0)` → omission sentinel: the history is dropped entirely. The
+    ///     turn's own user message is still kept — see
+    ///     `truncate_history_to_token_budget` for why "empty window" cannot mean
+    ///     "erase the question".
+    ///   - `Some(n)` → oldest messages are elided until the history fits under
+    ///     `n * CHARS_PER_TOKEN_ESTIMATE` bytes.
+    ///
+    /// A malformed value does NOT fail the parse: see
+    /// [`deserialize_history_max_tokens`].
+    #[serde(default, deserialize_with = "deserialize_history_max_tokens")]
+    pub max_tokens: Option<usize>,
+}
+
+/// Row set the conversation window may draw from (mika#2295).
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HistoryScope {
+    /// Every session of this agent — the pre-mika#2295 behaviour, and the default.
+    #[default]
+    Agent,
+    /// The turn's own session only. This is the correction of substance for an
+    /// architect: each pass is a one-shot act on one plan, so a first pass starts
+    /// from an empty history and a second sees only the first — which is exactly
+    /// what it should see. August's regime is recovered by construction, not by
+    /// tuning a number.
+    Session,
+}
+
+/// Deserialize `[context.history].scope`, degrading an unknown value to the
+/// default rather than failing the parse.
+///
+/// **Why tolerance here is the safe direction, not laxity.** A parse failure on
+/// `identity.toml` is not inert: for a well-known agent, `load_identity` answers
+/// with the fail-closed sentinel allowlist, which neuters the agent *and*
+/// unlinks its bundled skills from disk. Downing mika-arch over `scope =
+/// "sesion"` would be a far larger effect than the typo, so an unreadable value
+/// reads as "no scope was configured" — the conservative reading, since `Agent`
+/// is the historical behaviour — and says so at WARN.
+fn deserialize_history_scope<'de, D>(deserializer: D) -> Result<HistoryScope, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<toml::Value>::deserialize(deserializer)?;
+    match raw {
+        None => Ok(HistoryScope::default()),
+        Some(toml::Value::String(s)) if s.eq_ignore_ascii_case("agent") => Ok(HistoryScope::Agent),
+        Some(toml::Value::String(s)) if s.eq_ignore_ascii_case("session") => {
+            Ok(HistoryScope::Session)
+        }
+        Some(other) => {
+            warn!(
+                event = "context_history_scope_invalid",
+                value = %other,
+                "[context.history].scope is not \"agent\" or \"session\" — falling back to the default scope"
+            );
+            Ok(HistoryScope::default())
+        }
+    }
+}
+
+/// Deserialize `[context.history].max_tokens`, degrading a malformed value to
+/// "no ceiling" rather than failing the parse.
+///
+/// Same fail-closed-identity reasoning as [`deserialize_history_scope`], plus one
+/// of its own: the alternative reading — treating an unusable ceiling as `0` —
+/// would silently erase the whole history. **A mistyped ceiling that empties the
+/// window is a context wipe wearing a configuration's clothes**, and is strictly
+/// worse than the unbounded window this field exists to bound. Negative values
+/// (a plausible way to spell "no limit") and non-integers both land here.
+fn deserialize_history_max_tokens<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<toml::Value>::deserialize(deserializer)?;
+    match raw {
+        None => Ok(None),
+        Some(toml::Value::Integer(n)) if n >= 0 => Ok(Some(n as usize)),
+        Some(other) => {
+            warn!(
+                event = "context_history_max_tokens_invalid",
+                value = %other,
+                "[context.history].max_tokens is not a non-negative integer — falling back to no ceiling"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// `[context.summary]` subsection — controls injection of the conversational
@@ -408,8 +532,18 @@ impl Default for ContextSummaryConfig {
 ///
 /// Heuristic: not exact tokenization. Acceptable because the cap is a soft
 /// policy, not a hard limit, and tokenizers vary by provider.
+/// Convert a token budget to a byte budget using [`CHARS_PER_TOKEN_ESTIMATE`].
+///
+/// Exposed so the conversation-window ceiling (mika#2295) converts through the
+/// **same** estimator as [`truncate_to_token_budget`] rather than growing a
+/// second one beside it. Two estimators for one heuristic is how a soft policy
+/// becomes two different soft policies nobody notices disagreeing.
+pub fn token_budget_to_bytes(max_tokens: usize) -> usize {
+    max_tokens.saturating_mul(CHARS_PER_TOKEN_ESTIMATE)
+}
+
 pub fn truncate_to_token_budget(summary: &str, max_tokens: usize) -> String {
-    let max_chars = max_tokens.saturating_mul(CHARS_PER_TOKEN_ESTIMATE);
+    let max_chars = token_budget_to_bytes(max_tokens);
     if summary.len() <= max_chars {
         return summary.to_string();
     }
@@ -680,6 +814,16 @@ fn fail_closed_identity() -> Identity {
                 inject: false,
                 max_tokens: None,
             },
+            // Deliberately the plain default, not a tightened window (mika#2295).
+            // This path is what an agent gets when its `identity.toml` is
+            // malformed, absent or unreadable — including transiently, and
+            // including for ordinary personal agents since mika#2027. What
+            // fail-closed protects is *permission*: skills, tools, and the
+            // summary leak. A context window is not a permission, and silently
+            // amputating an agent's conversation history because its identity
+            // file was briefly unreadable would be a new class of surprise, not a
+            // safer posture.
+            history: ContextHistoryConfig::default(),
         },
         session: SessionIdentityConfig::default(),
         curator: None,
@@ -3862,6 +4006,87 @@ inject = true
         let result = truncate_to_token_budget(summary, 5);
         assert!(result.contains("[… summary truncated to fit silent-mode budget …]"));
         // Should not panic — that's the main assertion
+    }
+
+    // -- ContextHistoryConfig deserialization tests (mika#2295) --
+
+    /// AC2 — an identity that says nothing about the window gets the old window.
+    #[test]
+    fn mika2295_absent_history_block_is_the_pre_fix_behaviour() {
+        let identity: Identity = toml::from_str(
+            r#"
+name = "Dev"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(identity.context.history.scope, HistoryScope::Agent);
+        assert_eq!(identity.context.history.max_tokens, None);
+    }
+
+    #[test]
+    fn mika2295_history_block_parses_both_scopes_and_a_ceiling() {
+        let identity: Identity = toml::from_str(
+            r#"
+name = "Architect"
+
+[context.history]
+scope = "session"
+max_tokens = 8000
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(identity.context.history.scope, HistoryScope::Session);
+        assert_eq!(identity.context.history.max_tokens, Some(8000));
+
+        let agent_scoped: Identity =
+            toml::from_str("[context.history]\nscope = \"agent\"\n").unwrap();
+        assert_eq!(agent_scoped.context.history.scope, HistoryScope::Agent);
+    }
+
+    /// AC4 — a malformed ceiling degrades to "no ceiling", and does not fail the
+    /// parse.
+    ///
+    /// Both halves matter. Reading an unusable value as `0` would silently wipe
+    /// the history — a context erasure wearing a configuration's clothes, and
+    /// strictly worse than the unbounded window this field exists to bound. And
+    /// failing the parse is not inert either: for a well-known agent that routes
+    /// into the fail-closed sentinel, which neuters the agent and unlinks its
+    /// bundled skills from disk. A typo should cost neither.
+    #[test]
+    fn mika2295_malformed_ceiling_degrades_to_no_ceiling_without_failing_the_parse() {
+        for value in ["-1", "\"lots\"", "3.5", "true"] {
+            let toml_src = format!("name = \"Dev\"\n\n[context.history]\nmax_tokens = {value}\n");
+            let identity: Identity = toml::from_str(&toml_src)
+                .unwrap_or_else(|e| panic!("`max_tokens = {value}` must not fail the parse: {e}"));
+
+            assert_eq!(
+                identity.context.history.max_tokens, None,
+                "`max_tokens = {value}` must read as no ceiling, never as zero"
+            );
+        }
+    }
+
+    /// AC4's sibling — an unknown scope degrades to the historical scope.
+    #[test]
+    fn mika2295_unknown_scope_degrades_to_the_default_without_failing_the_parse() {
+        for value in ["\"sesion\"", "\"ticket\"", "7"] {
+            let toml_src = format!("name = \"Dev\"\n\n[context.history]\nscope = {value}\n");
+            let identity: Identity = toml::from_str(&toml_src)
+                .unwrap_or_else(|e| panic!("`scope = {value}` must not fail the parse: {e}"));
+
+            assert_eq!(identity.context.history.scope, HistoryScope::Agent);
+        }
+    }
+
+    #[test]
+    fn mika2295_token_budget_uses_the_same_estimator_as_the_summary_path() {
+        // If these two ever disagree, one heuristic has quietly become two.
+        assert_eq!(token_budget_to_bytes(1), CHARS_PER_TOKEN_ESTIMATE);
+        assert_eq!(token_budget_to_bytes(8000), 8000 * CHARS_PER_TOKEN_ESTIMATE);
+        assert_eq!(token_budget_to_bytes(0), 0);
+        assert_eq!(token_budget_to_bytes(usize::MAX), usize::MAX, "saturating");
     }
 
     // -- ContextSummaryConfig deserialization tests (Axis 3 — mika#1021) --

@@ -10942,8 +10942,40 @@ impl Database {
         agent_id: &str,
         limit: usize,
     ) -> Result<Vec<SessionMessage>> {
-        let (msgs, _) = self.load_recent_messages_filtered(agent_id, limit, false)?;
+        let (msgs, _) = self.load_recent_messages_filtered(agent_id, None, limit, false)?;
         Ok(msgs)
+    }
+
+    /// Build the recent-messages query (mika#2295).
+    ///
+    /// Two SQL strings rather than one with `AND (?3 IS NULL OR m.session_id = ?3)`,
+    /// for two reasons. The unscoped string stays **byte-for-byte** what it was
+    /// before mika#2295, which is what makes "the default is unchanged" (AC2) a
+    /// fact a test can assert rather than a claim. And a neutralised `OR` predicate
+    /// is not sargable, so it would quietly cost both paths the index each one
+    /// wants — and there is one for each: `idx_msg_agent_created(agent_id,
+    /// created_at DESC)` for the unscoped form, `idx_msg_session(session_id,
+    /// created_at ASC)` for the scoped one, whose leading column is the far more
+    /// selective of the two (one agent has many sessions) and whose `created_at`
+    /// SQLite can walk backwards to serve the `DESC` ordering without a sort.
+    /// Neither index is new; the split is what keeps them reachable.
+    ///
+    /// Pure and `pub(crate)` so the AC2 equality is assertable without a database.
+    pub(crate) fn recent_messages_sql(columns: &str, session_scoped: bool) -> String {
+        if session_scoped {
+            format!(
+                "SELECT {columns} FROM messages m JOIN sessions s ON m.session_id = s.id
+              WHERE m.agent_id = ?1 AND m.role != 'summary' AND s.channel_type != 'team'
+                AND m.session_id = ?3
+              ORDER BY m.created_at DESC, m.id DESC LIMIT ?2"
+            )
+        } else {
+            format!(
+                "SELECT {columns} FROM messages m JOIN sessions s ON m.session_id = s.id
+              WHERE m.agent_id = ?1 AND m.role != 'summary' AND s.channel_type != 'team'
+              ORDER BY m.created_at DESC, m.id DESC LIMIT ?2"
+            )
+        }
     }
 
     /// Rebuild conversation context for prompt assembly (mika#974).
@@ -10952,19 +10984,32 @@ impl Database {
     /// - `task_id = Some(tid)` → hybrid merge: load both `task_messages` (full narrative)
     ///   and `messages` (recent channel context), merge sorted by `created_at`,
     ///   dedup on `(session_id, role, content, created_at)`.
+    ///
+    /// `session_id` scopes the **channel** window only (mika#2295). The task
+    /// narrative is deliberately untouched by it: `task_messages` are already
+    /// scoped by `task_id`, so they are the current task's own story, not other
+    /// tickets' — which is the contamination `session_id` exists to cut. Note the
+    /// narrative is loaded with no limit at all, so the byte ceiling applied by
+    /// the caller is what bounds it.
     pub fn rebuild_context(
         &self,
         agent_id: &str,
+        session_id: Option<&str>,
         task_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SessionMessage>> {
+        let load_channel = |db: &Self| -> Result<Vec<SessionMessage>> {
+            let (msgs, _) = db.load_recent_messages_filtered(agent_id, session_id, limit, false)?;
+            Ok(msgs)
+        };
+
         let tid = match task_id {
             Some(t) => t,
-            None => return self.load_recent_messages(agent_id, limit),
+            None => return load_channel(self),
         };
 
         // Load channel messages (recent window).
-        let channel_msgs = self.load_recent_messages(agent_id, limit)?;
+        let channel_msgs = load_channel(self)?;
 
         // Load task narrative (full history, no limit).
         let task_msgs = self.load_task_messages(tid)?;
@@ -11017,26 +11062,41 @@ impl Database {
     /// excluded from the returned Vec. The count is best-effort: it reflects
     /// internals discarded from the limit-bound window, not the total across all
     /// history. When `exclude_internal` is false, the count is always 0.
+    ///
+    /// `session_id = Some(id)` restricts the window to one session (mika#2295).
+    /// `None` reproduces the pre-mika#2295 query byte for byte — see
+    /// [`Self::recent_messages_sql`].
+    ///
+    /// **The restriction has to be in the query, and that is not a preference.**
+    /// Filtering twenty already-loaded rows would return an amputated window the
+    /// moment other sessions' messages interleave past the limit — which is
+    /// precisely what 59 grooms a day do. A post-load filter is correct at rest
+    /// and wrong under exactly the load that produced mika#2295: the worse of the
+    /// two, because it would look like it worked.
     pub fn load_recent_messages_filtered(
         &self,
         agent_id: &str,
+        session_id: Option<&str>,
         limit: usize,
         exclude_internal: bool,
     ) -> Result<(Vec<SessionMessage>, usize)> {
         // Always fetch without the internal filter so we can count hidden rows.
-        let sql = format!(
-            "SELECT {} FROM messages m JOIN sessions s ON m.session_id = s.id
-              WHERE m.agent_id = ?1 AND m.role != 'summary' AND s.channel_type != 'team'
-              ORDER BY m.created_at DESC, m.id DESC LIMIT ?2",
-            Self::SESSION_MESSAGE_COLUMNS,
-        );
+        let sql = Self::recent_messages_sql(Self::SESSION_MESSAGE_COLUMNS, session_id.is_some());
         let mut stmt = self.conn.prepare(&sql)?;
-        let all_rows = stmt
-            .query_map(
-                params![agent_id, limit as i64],
-                Self::row_to_session_message,
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let all_rows = match session_id {
+            Some(sid) => stmt
+                .query_map(
+                    params![agent_id, limit as i64, sid],
+                    Self::row_to_session_message,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            None => stmt
+                .query_map(
+                    params![agent_id, limit as i64],
+                    Self::row_to_session_message,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
 
         if !exclude_internal {
             let mut messages = all_rows;
@@ -21684,21 +21744,142 @@ pub(crate) mod tests {
             .unwrap();
 
         // Without filter: all 3, hidden count 0
-        let (all, hidden) = db.load_recent_messages_filtered("mika", 10, false).unwrap();
+        let (all, hidden) = db
+            .load_recent_messages_filtered("mika", None, 10, false)
+            .unwrap();
         assert_eq!(all.len(), 3);
         assert_eq!(hidden, 0);
 
         // With filter: only 2 visible, 1 hidden
-        let (visible, hidden) = db.load_recent_messages_filtered("mika", 10, true).unwrap();
+        let (visible, hidden) = db
+            .load_recent_messages_filtered("mika", None, 10, true)
+            .unwrap();
         assert_eq!(visible.len(), 2);
         assert_eq!(hidden, 1);
         assert!(visible.iter().all(|m| !m.internal));
     }
 
+    // ===== mika#2295: conversation-window scope =====
+
+    /// AC2 — the default is unchanged, asserted on the query itself.
+    ///
+    /// The behavioural tests around it would all still pass if the unscoped path
+    /// had quietly grown an `AND (?3 IS NULL OR …)`; this is the assertion that
+    /// says "byte for byte" and means it. It also pins what the scoped form adds:
+    /// one equality on `m.session_id`, and nothing else moved.
+    #[test]
+    fn mika2295_unscoped_query_is_byte_for_byte_the_pre_fix_query() {
+        let cols = Database::SESSION_MESSAGE_COLUMNS;
+        let unscoped = Database::recent_messages_sql(cols, false);
+
+        let pre_fix = format!(
+            "SELECT {cols} FROM messages m JOIN sessions s ON m.session_id = s.id
+              WHERE m.agent_id = ?1 AND m.role != 'summary' AND s.channel_type != 'team'
+              ORDER BY m.created_at DESC, m.id DESC LIMIT ?2"
+        );
+        assert_eq!(
+            unscoped, pre_fix,
+            "the unscoped window query must be the pre-mika#2295 query verbatim"
+        );
+
+        let scoped = Database::recent_messages_sql(cols, true);
+        assert!(
+            scoped.contains("AND m.session_id = ?3"),
+            "the scoped form must restrict in SQL, not after loading: {scoped}"
+        );
+        assert_ne!(unscoped, scoped);
+    }
+
+    /// AC2 (behaviour) — `None` still returns every session's messages.
+    #[test]
+    fn mika2295_unscoped_window_still_crosses_sessions() {
+        let (db, sid_a) = db_with_session();
+        let sid_b = "other-ticket-session".to_string();
+        db.create_session(&sid_b, "mika", "cli").unwrap();
+
+        db.save_message("mika", &sid_a, "user", "ticket A", None)
+            .unwrap();
+        db.save_message("mika", &sid_b, "user", "ticket B", None)
+            .unwrap();
+
+        let (msgs, _) = db
+            .load_recent_messages_filtered("mika", None, 20, false)
+            .unwrap();
+        assert_eq!(msgs.len(), 2, "the default window is agent-wide");
+    }
+
+    /// AC3 — the session filter runs in the query, proven by interleaving.
+    ///
+    /// This is the test the plan asks for, and its shape is the whole argument:
+    /// the other session's messages are written **past the limit**, so a filter
+    /// applied after loading would have spent all 5 slots on session B and
+    /// returned an amputated window — zero or one of A's four messages. Only a
+    /// filter that runs in SQL returns all four. That is the exact difference
+    /// between "correct at rest" and "correct under the 59-grooms-a-day load that
+    /// produced the incident".
+    #[test]
+    fn mika2295_session_scope_survives_interleaving_past_the_limit() {
+        let (db, sid_a) = db_with_session();
+        let sid_b = "other-ticket-session".to_string();
+        db.create_session(&sid_b, "mika", "cli").unwrap();
+
+        for i in 0..4 {
+            db.save_message("mika", &sid_a, "user", &format!("A{i}"), None)
+                .unwrap();
+        }
+        // Ten newer messages from another ticket — more than the limit below.
+        for i in 0..10 {
+            db.save_message("mika", &sid_b, "user", &format!("B{i}"), None)
+                .unwrap();
+        }
+
+        let (scoped, _) = db
+            .load_recent_messages_filtered("mika", Some(&sid_a), 5, false)
+            .unwrap();
+        assert_eq!(
+            scoped.len(),
+            4,
+            "every message of the current session must survive, however many \
+             newer messages other sessions interleaved: {scoped:?}"
+        );
+        assert!(scoped.iter().all(|m| m.session_id == sid_a));
+
+        // The control: the same call unscoped sees only the other ticket.
+        let (unscoped, _) = db
+            .load_recent_messages_filtered("mika", None, 5, false)
+            .unwrap();
+        assert!(
+            unscoped.iter().all(|m| m.session_id == sid_b),
+            "the agent-wide window is exactly what buries the current session"
+        );
+    }
+
+    /// AC3 — `rebuild_context` propagates the scope on the channel-mode path.
+    #[test]
+    fn mika2295_rebuild_context_propagates_session_scope() {
+        let (db, sid_a) = db_with_session();
+        let sid_b = "other-ticket-session".to_string();
+        db.create_session(&sid_b, "mika", "cli").unwrap();
+
+        db.save_message("mika", &sid_a, "user", "mine", None)
+            .unwrap();
+        db.save_message("mika", &sid_b, "user", "theirs", None)
+            .unwrap();
+
+        let scoped = db.rebuild_context("mika", Some(&sid_a), None, 20).unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].content, "mine");
+
+        let unscoped = db.rebuild_context("mika", None, None, 20).unwrap();
+        assert_eq!(unscoped.len(), 2);
+    }
+
     #[test]
     fn test_load_recent_messages_filtered_hidden_count_empty() {
         let (db, _sid) = db_with_session();
-        let (msgs, hidden) = db.load_recent_messages_filtered("mika", 20, true).unwrap();
+        let (msgs, hidden) = db
+            .load_recent_messages_filtered("mika", None, 20, true)
+            .unwrap();
         assert!(msgs.is_empty());
         assert_eq!(hidden, 0);
     }
@@ -21723,12 +21904,16 @@ pub(crate) mod tests {
         }
 
         // Limit 10 fetches all 10 rows from DB; 5 visible returned, 5 hidden counted
-        let (visible, hidden) = db.load_recent_messages_filtered("mika", 10, true).unwrap();
+        let (visible, hidden) = db
+            .load_recent_messages_filtered("mika", None, 10, true)
+            .unwrap();
         assert_eq!(visible.len(), 5);
         assert_eq!(hidden, 5);
 
         // Without filter: all 10 returned, 0 hidden
-        let (all, hidden) = db.load_recent_messages_filtered("mika", 10, false).unwrap();
+        let (all, hidden) = db
+            .load_recent_messages_filtered("mika", None, 10, false)
+            .unwrap();
         assert_eq!(all.len(), 10);
         assert_eq!(hidden, 0);
     }
@@ -24898,7 +25083,9 @@ pub(crate) mod tests {
 
         // Verify: rebuild_context from the callback session with task-mode
         // surfaces the "advance to item #2" intent from the dispatch session.
-        let ctx = db.rebuild_context("mika", Some(scope_root), 20).unwrap();
+        let ctx = db
+            .rebuild_context("mika", None, Some(scope_root), 20)
+            .unwrap();
         assert!(
             ctx.iter().any(|m| m.content.contains("advance to item #2")),
             "rebuild_context in task-mode must surface cross-session dispatch intent"
@@ -24926,7 +25113,9 @@ pub(crate) mod tests {
         );
 
         // Verify: rebuild_context still surfaces full narrative post-compaction.
-        let ctx_after = db.rebuild_context("mika", Some(scope_root), 20).unwrap();
+        let ctx_after = db
+            .rebuild_context("mika", None, Some(scope_root), 20)
+            .unwrap();
         assert_eq!(
             ctx_after.len(),
             6,

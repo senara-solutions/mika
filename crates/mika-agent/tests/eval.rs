@@ -64,6 +64,10 @@ mod eval {
     mod test_ci_success_handler;
     mod test_completion_claim_guard;
     mod test_context_summary_inject;
+
+    // mika#2295 briques 1 & 2 — the two window bounds, asserted on the window the
+    // model actually received rather than on the predicates that compute it.
+    mod test_context_window_budget_2295;
     mod test_correction_message_classifier_guard;
     mod test_deadline_in_flight_llm_call;
 
