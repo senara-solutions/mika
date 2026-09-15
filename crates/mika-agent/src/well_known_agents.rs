@@ -164,6 +164,20 @@ allowlist = [\n\
 
 /// mika-dev config.toml — switches base model to openrouter/z-ai/glm-5.2
 /// for cost reduction (mika#1633). Calibration gate satisfied: 100% pass (5/5).
+///
+/// **Do not raise `llm_max_tokens` here without first reconciling the model
+/// (mika#2296 D2).** mika-dev suffers the same reasoning-budget failure
+/// mika#2296 fixed for mika-arch, and the obvious one-line fix is a trap: this
+/// constant's source has DRIFTED from its runtime. It declares `z-ai/glm-5.2`
+/// while the plans of mika#2179 and mika#2189 measure mika-dev on
+/// `z-ai/glm-5.3` (see
+/// `docs/solutions/architecture-patterns/well-known-agent-config-toml-override.md`).
+/// `reconcile_well_known_config` rewrites the WHOLE file on the next
+/// provisioning pass, so touching one field here silently demotes the model
+/// from 5.3 to 5.2 — without a calibration run, and without anyone asking for
+/// it. Reconciling that drift requires a passing calibration on the model
+/// actually in service (mika#1190); it is its own piece of work, deliberately
+/// not opened by mika#2296.
 const MIKA_DEV_CONFIG: &str = r#"# Mika Dev — autonomous development agent.
 # Base model switched to glm-5.2 per mika#1633 (cost reduction).
 
@@ -177,6 +191,10 @@ log_level = "info"
 /// (zai/glm-5.2) per mika#1670. Calibration gate satisfied: 100% pass (5/5,
 /// mika#1632 suite). Uses native `zai` (mika#1657), not openrouter — that is
 /// the provider the calibration run exercised and the current-correct routing.
+///
+/// `llm_max_tokens` is deliberately left at 16384 by mika#2296: the QA return
+/// to glm-5.3 is mika#2328's subject, and its budget belongs to the ticket that
+/// carries the model swap and its calibration run, not to this one.
 const MIKA_QA_CONFIG: &str = r#"# Mika QA — fabrication-catching review agent.
 # Base model switched to zai/glm-5.2 per mika#1670 calibration evidence (5/5 PASS).
 
@@ -1396,7 +1414,30 @@ const MIKA_ARCH_CONFIG: &str = r#"# Mika Architect — advisory plan review agen
 
 llm_provider = "openrouter"
 openrouter_model = "moonshotai/kimi-k2.5"
-llm_max_tokens = 8192
+
+# Output-token budget (mika#2296). A reasoning model counts its thinking in the
+# OUTPUT budget. On a heavy brief the thinking alone exhausted 8192 before the
+# verdict was ever emitted: the arch pass 8b623724 ran 123 s — well inside its
+# time budget — and ended on stop_reason=MaxTokens, output_tokens=8192, with an
+# EMPTY content. dispatch-lib found no `Disposition:` line to parse and reported
+# PIPELINE FAILURE (326780db).
+#
+# 32768 is not a target, it is a ceiling made non-binding. The measured
+# throughput is ~66 tok/s (8192 tokens in 123 s), so the 240 s per-call plafond
+# below caps one call at ~16 000 tokens: the TIME budget is the real brake, and
+# it already bounds the runaway this value could otherwise open. 16384 was
+# refused for exactly that reason — it coincides with the reachable maximum and
+# would become binding again at the first speed-up or plafond widening. 32768
+# keeps a factor of 2 of margin, sits ON (not above) the `validate.rs:73`
+# warning threshold, and is far under kimi-k2.5's 262 144 announced completion
+# tokens on OpenRouter.
+#
+# This line PROTECTS a value already in service rather than changing one. The
+# runtime was raised to 32768 by hand; `reconcile_well_known_config` rewrites a
+# provisioned agent's config.toml on every provisioning pass, so against a
+# source constant of 8192 that manual value was unprotected and the next
+# restart would have demoted it — bringing the failure straight back.
+llm_max_tokens = 32768
 log_level = "info"
 
 # Timeout budgets (mika#2189 D4). The fleet stays at the shipped 120/300; only
@@ -2322,6 +2363,56 @@ mod tests {
             config["openrouter_model"].as_str(),
             Some("moonshotai/kimi-k2.5")
         );
+        // mika#2296 T1 — the output budget is a fact of the repository, not an
+        // intention of a plan. 8192 is the value that produced the empty-content
+        // MaxTokens failure this constant exists to prevent from coming back.
+        assert_eq!(
+            config["llm_max_tokens"].as_integer(),
+            Some(32768),
+            "mika#2296: mika-arch's output budget must stay non-binding for a \
+             reasoning model — see the derivation in MIKA_ARCH_CONFIG"
+        );
+    }
+
+    /// mika#2296 T2 — no well-known agent declares an output budget below 8192.
+    ///
+    /// The scan reads DECLARATIONS, never absences: an agent whose spec carries
+    /// `config_toml: None` has taken no budget decision at all and inherits the
+    /// global default, so firing on it would be firing on a non-choice.
+    ///
+    /// There is deliberately **no exemption list**. The population was counted
+    /// when this test was written (mika-dev 8192, mika-qa 16384, mika-arch
+    /// 32768) and nothing violates the predicate, so exempting anything would
+    /// create a dispensation nothing ever cleans up. If this test fires on a
+    /// declaration added later, the resolution is NOT to add an exemption and
+    /// NOT to raise the value here: a well-known agent's output budget is
+    /// solidary with its model (see the mika-dev drift note above), so raising
+    /// one is a scope decision that belongs to the operator.
+    #[test]
+    fn mika2296_no_well_known_config_declares_an_output_budget_below_8192() {
+        const MIN_OUTPUT_BUDGET: i64 = 8192;
+
+        for agent in WELL_KNOWN_AGENTS {
+            let Some(config_toml) = agent.config_toml else {
+                // No declaration — inherits the global default, out of population.
+                continue;
+            };
+            let config: toml::Value = toml::from_str(config_toml).unwrap_or_else(|e| {
+                panic!("{}'s config_toml should be valid TOML: {e}", agent.name)
+            });
+            let Some(declared) = config.get("llm_max_tokens").and_then(|v| v.as_integer()) else {
+                continue;
+            };
+            assert!(
+                declared >= MIN_OUTPUT_BUDGET,
+                "mika#2296: {} declares llm_max_tokens = {declared}, below the {MIN_OUTPUT_BUDGET} \
+                 floor. A reasoning model counts its thinking in the output budget and will \
+                 exhaust that before emitting a verdict. Do NOT exempt this agent and do NOT \
+                 raise the value here — its budget is solidary with its model; surface the \
+                 decision to the operator.",
+                agent.name
+            );
+        }
     }
 
     #[test]
