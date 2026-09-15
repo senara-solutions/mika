@@ -17,8 +17,9 @@
 
 use super::verdict_handler::VerdictAction;
 use crate::async_db::AsyncDatabase;
-use crate::github_graphql::{
-    add_label_to_issue, fetch_milestone_issues_by_state, parse_phase_label,
+use crate::github_graphql::{fetch_milestone_issues_by_state, parse_phase_label};
+use crate::ready_label::{
+    self, READY_LABEL_SESSION_ID, ReadyApplyOutcome, ReadyApplyRequest, ReadyWriteAuth,
 };
 use crate::task_state::merge_metadata;
 use tracing::{debug, info, warn};
@@ -370,13 +371,35 @@ async fn try_phase_cascade(
             }
         }
 
-        match add_label_to_issue(token, owner, repo, *issue_number, "ready").await {
-            Ok(()) => {
+        // mika#2315 — the fourth applicator of `ready` goes through the same
+        // canonical applicator as the three in `auto_pull`: a ticket whose
+        // `ready` an operator removed by hand stays parked across a phase
+        // cascade too. A refusal is a decision (logged and audited by the
+        // applicator), a write failure is a fault; both continue the cascade.
+        let slug = format!("{owner}/{repo}");
+        let outcome = ready_label::apply_ready(
+            db,
+            ReadyApplyRequest {
+                repo: &slug,
+                issue: *issue_number,
+                read_token: token,
+                write: ReadyWriteAuth::Rest(token),
+                caller: "milestone_phase_cascade",
+                session_id: READY_LABEL_SESSION_ID,
+                trace_id: None,
+            },
+        )
+        .await;
+        match outcome {
+            ReadyApplyOutcome::Applied => {
                 issues_labeled += 1;
             }
-            Err(e) => {
+            ReadyApplyOutcome::RefusedParked | ReadyApplyOutcome::RefusedUnreadable { .. } => {
+                // Already logged + audited by the applicator.
+            }
+            ReadyApplyOutcome::WriteFailed { error } => {
                 warn!(
-                    error = %e,
+                    error = %error,
                     issue_number = issue_number,
                     milestone_number = milestone_number,
                     "milestone_context: failed to label issue ready (continuing)"

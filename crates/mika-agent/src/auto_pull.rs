@@ -76,6 +76,9 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use crate::async_db::AsyncDatabase;
+use crate::ready_label::{
+    self, ReadyApplyOutcome, ReadyApplyRequest, ReadyLabelEvent, ReadyWriteAuth,
+};
 
 /// Default repo for auto-pull (mika-only for v1).
 const DEFAULT_REPO: &str = "senara-solutions/mika";
@@ -1227,6 +1230,12 @@ const FILTER_PROBE_ERROR: &str = "state_probe_failed";
 /// A seat verdict refused without naming itself (defensive; see
 /// [`crate::webhook_dispatch::SeatVerdict::refusal_reason`]).
 const FILTER_SEAT_REFUSED: &str = "seat_refused";
+/// `ready` was removed by a non-machine actor and not re-applied since: the
+/// ticket is parked, and [`ready_label::apply_ready`] refused to write (mika#2315).
+///
+/// This is the row that answers "why is this ticket no longer promoted?". It is
+/// a decision, not a failure — it does not touch the circuit breaker.
+const FILTER_READY_PARKED: &str = "ready_parked";
 
 /// `audit_events.tool_name` for per-ticket exclusion rows.
 ///
@@ -2534,62 +2543,96 @@ async fn abandon_stuck_ready(
     }
 }
 
-/// Parse an issue-timeline JSON array and return the `created_at` of the LAST
-/// `labeled` event whose label name is `ready` (mika#1824 D1). A remove→add
-/// cycle appends a fresh `labeled` event, so `last` is the authoritative
-/// apply-time. Returns `None` when no such event exists.
-fn parse_last_ready_labeled_at(timeline_json: &str) -> Option<String> {
-    let events: Vec<serde_json::Value> = serde_json::from_str(timeline_json).ok()?;
-    events
-        .iter()
-        .filter(|e| {
-            e["event"].as_str() == Some("labeled") && e["label"]["name"].as_str() == Some("ready")
-        })
-        .filter_map(|e| e["created_at"].as_str())
-        .next_back()
-        .map(|s| s.to_string())
-}
-
-/// Age in seconds since the `ready` label was last applied to `issue_number`,
-/// read from the issue timeline (mika#1824 D1). Returns `Ok(None)` when no
-/// `labeled(ready)` event exists (treat as not-stuck / skip). Fail-open: on an
-/// API error the caller skips the ticket (does not rescue on unknown age).
+/// Age in seconds since the `ready` label was last applied, read from an
+/// already-fetched, **complete** timeline (mika#1824 D1, mika#2315 D5).
 ///
-/// Single page (`per_page=100`) — timeline events beyond the 100th are not
-/// inspected; a `ready` re-label is near the tail for any recently-touched
-/// ticket, so this bound is safe in practice.
-async fn gh_ready_label_age_secs(github_token: &str, issue_number: u64) -> Result<Option<i64>> {
-    let mut cmd = tokio::process::Command::new("gh");
-    cmd.args([
-        "api",
-        &format!(
-            "repos/{}/issues/{}/timeline?per_page=100",
-            DEFAULT_REPO, issue_number
-        ),
-    ]);
-    cmd.env("GH_TOKEN", github_token);
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    cmd.kill_on_drop(true);
-
-    let output = cmd.output().await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!(
-            "gh api timeline failed for #{}: {}",
-            issue_number,
-            stderr
-        ));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let Some(applied_at) = parse_last_ready_labeled_at(&stdout) else {
+/// Returns `Ok(None)` when no `labeled(ready)` event exists (treat as
+/// not-stuck / skip). The timeline is read once per survivor by
+/// [`ready_label::read_ready_label_timeline`] and shared with the park
+/// predicate, so the age is that of the last `labeled` of the *whole* timeline
+/// — not of the first 100 events, which is the B1 defect this replaced.
+fn ready_label_age_secs(events: &[ReadyLabelEvent]) -> Result<Option<i64>> {
+    let Some(applied_at) = ready_label::last_ready_labeled_at(events) else {
         return Ok(None);
     };
-    let applied = crate::timestamp::parse(&applied_at)?;
+    let applied = crate::timestamp::parse(applied_at)?;
     let age = (chrono::Utc::now() - applied).num_seconds();
     Ok(Some(age))
+}
+
+/// The three `ready` applications of this module, routed through the canonical
+/// applicator (mika#2315 D1). Consults the park before writing; a refusal is a
+/// returned value the caller records in its ledger, never a swallowed error.
+///
+/// `timeline` is the already-read timeline when the caller holds one (Phase 2
+/// read it for the age) so that path pays no extra API call; `None` makes the
+/// applicator read it.
+///
+/// Eight parameters, one more than clippy's default: the seven every phase
+/// already threads through [`promotion_gate_allows`], plus the shared timeline.
+#[allow(clippy::too_many_arguments)]
+async fn apply_ready_label(
+    db: &AsyncDatabase,
+    github_token: &str,
+    label_auth: &LabelWriteToken,
+    issue_number: u64,
+    caller: &str,
+    trace_id: &str,
+    session_id: &str,
+    timeline: Option<&[ReadyLabelEvent]>,
+) -> ReadyApplyOutcome {
+    let req = ReadyApplyRequest {
+        repo: DEFAULT_REPO,
+        issue: issue_number,
+        read_token: github_token,
+        write: ReadyWriteAuth::Cli(label_auth),
+        caller,
+        session_id,
+        trace_id: Some(trace_id),
+    };
+    match timeline {
+        Some(events) => ready_label::apply_ready_with_timeline(db, req, events).await,
+        None => ready_label::apply_ready(db, req).await,
+    }
+}
+
+/// Handle the outcome of [`apply_ready_label`] the same way in all three
+/// phases: a park or an unreadable timeline is a ledger row (a decision), a
+/// write failure feeds the circuit breaker (a fault). Returns `true` when the
+/// caller must skip the ticket.
+async fn record_ready_refusal(
+    db: &AsyncDatabase,
+    ledger: &mut ExclusionLedger,
+    phase: ExclusionPhase,
+    issue_number: u64,
+    outcome: &ReadyApplyOutcome,
+) -> bool {
+    match outcome {
+        ReadyApplyOutcome::Applied => false,
+        ReadyApplyOutcome::RefusedParked => {
+            ledger.record(phase, issue_number, FILTER_READY_PARKED);
+            true
+        }
+        ReadyApplyOutcome::RefusedUnreadable { .. } => {
+            ledger.record(phase, issue_number, FILTER_PROBE_ERROR);
+            true
+        }
+        ReadyApplyOutcome::WriteFailed { error } => {
+            warn!(
+                error = %error,
+                issue = issue_number,
+                phase = phase.as_str(),
+                "auto_pull: failed to apply ready label"
+            );
+            if let Err(e) = db
+                .increment_auto_pull_failure(DEFAULT_REPO, issue_number)
+                .await
+            {
+                warn!(error = %e, "auto_pull: failed to increment failure counter");
+            }
+            true
+        }
+    }
 }
 
 // ───────────────────── Orchestration ─────────────────────
@@ -2894,11 +2937,18 @@ async fn phase0_feed_ready_pool(
             ),
         }
 
-        if let Err(e) = gh_apply_label(label_auth, n, "ready").await {
-            warn!(error = %e, issue = n, "auto_feeder: failed to apply ready label");
-            if let Err(e2) = db.increment_auto_pull_failure(DEFAULT_REPO, n).await {
-                warn!(error = %e2, "auto_feeder: failed to increment failure counter");
-            }
+        let outcome = apply_ready_label(
+            db,
+            github_token,
+            label_auth,
+            n,
+            "phase0_feeder",
+            trace_id,
+            session_id,
+            None,
+        )
+        .await;
+        if record_ready_refusal(db, ledger, ExclusionPhase::Phase0Feeder, n, &outcome).await {
             continue;
         }
 
@@ -3051,20 +3101,29 @@ async fn phase1_promote_groomed(
         return None;
     }
 
-    // 5. Apply the `ready` label to trigger webhook-driven dispatch.
-    if let Err(e) = gh_apply_label(label_auth, candidate.number, "ready").await {
-        warn!(
-            error = %e,
-            issue = candidate.number,
-            "auto_pull: failed to apply ready label"
-        );
-        // AC3: increment circuit-breaker failure counter on label-apply failure.
-        if let Err(e) = db
-            .increment_auto_pull_failure(DEFAULT_REPO, candidate.number)
-            .await
-        {
-            warn!(error = %e, "auto_pull: failed to increment failure counter");
-        }
+    // 5. Apply the `ready` label to trigger webhook-driven dispatch — through
+    // the canonical applicator, which refuses a parked ticket (mika#2315).
+    // AC3: a write failure increments the circuit-breaker failure counter.
+    let outcome = apply_ready_label(
+        db,
+        github_token,
+        label_auth,
+        candidate.number,
+        "phase1_idle_pull",
+        trace_id,
+        session_id,
+        None,
+    )
+    .await;
+    if record_ready_refusal(
+        db,
+        ledger,
+        ExclusionPhase::Phase1Pull,
+        candidate.number,
+        &outcome,
+    )
+    .await
+    {
         return None;
     }
 
@@ -3271,13 +3330,27 @@ async fn phase2_reconcile_stuck_ready(
         return 0;
     }
 
-    // Filter 5 (GitHub API, one call each): read the `ready` label age. This is
-    // the expensive step, reached only by the rare survivor set.
+    // Filter 5 (GitHub API, one paginated read each): read the `ready` label
+    // age. This is the expensive step, reached only by the rare survivor set.
+    // The timeline is kept: the rescue loop below hands it to the park
+    // predicate, so Phase 2 pays no call it did not already pay (mika#2315 D5).
     let mut ages_by_issue: HashMap<u64, i64> = HashMap::new();
+    let mut timelines_by_issue: HashMap<u64, Vec<ReadyLabelEvent>> = HashMap::new();
     for &n in &survivors {
-        match gh_ready_label_age_secs(github_token, n).await {
+        let events = match ready_label::read_ready_label_timeline(github_token, DEFAULT_REPO, n)
+            .await
+        {
+            Ok(events) => events,
+            Err(e) => {
+                warn!(error = %e, issue = n, "auto_pull: phase 2 ready-label timeline read failed; skipping ticket");
+                ledger.record(ExclusionPhase::Phase2StuckReady, n, FILTER_PROBE_ERROR);
+                continue;
+            }
+        };
+        match ready_label_age_secs(&events) {
             Ok(Some(age)) => {
                 ages_by_issue.insert(n, age);
+                timelines_by_issue.insert(n, events);
             }
             Ok(None) => {
                 // No `labeled(ready)` event → no age to compare, so not-stuck.
@@ -3381,11 +3454,22 @@ async fn phase2_reconcile_stuck_ready(
             }
             continue;
         }
-        if let Err(e) = gh_apply_label(label_auth, n, "ready").await {
-            warn!(error = %e, issue = n, "auto_pull: phase 2 re-add ready label failed");
-            if let Err(e2) = db.increment_auto_pull_failure(DEFAULT_REPO, n).await {
-                warn!(error = %e2, "auto_pull: failed to increment failure counter");
-            }
+        // Re-add through the canonical applicator, on the timeline already read
+        // for the age (mika#2315). Between the remove above and this add, the
+        // last `ready` event is a *machine* `unlabeled` — the rescue does not
+        // park itself (AC4).
+        let outcome = apply_ready_label(
+            db,
+            github_token,
+            label_auth,
+            n,
+            "phase2_stuck_rescue",
+            trace_id,
+            session_id,
+            timelines_by_issue.get(&n).map(Vec::as_slice),
+        )
+        .await;
+        if record_ready_refusal(db, ledger, ExclusionPhase::Phase2StuckReady, n, &outcome).await {
             continue;
         }
 
@@ -4727,39 +4811,6 @@ This ticket has been GROOMED and is ready.
         );
     }
 
-    // ── mika#1824 Phase 2: timeline-parse tests ──
-
-    #[test]
-    fn test_parse_last_ready_labeled_at_picks_last() {
-        // Two labeled(ready) events + noise; `last` (remove→add reset) wins.
-        let json = r#"[
-            {"event":"labeled","label":{"name":"ready"},"created_at":"2026-07-20T10:00:00Z"},
-            {"event":"labeled","label":{"name":"p1"},"created_at":"2026-07-21T10:00:00Z"},
-            {"event":"unlabeled","label":{"name":"ready"},"created_at":"2026-07-22T10:00:00Z"},
-            {"event":"labeled","label":{"name":"ready"},"created_at":"2026-07-23T10:00:00Z"},
-            {"event":"commented","created_at":"2026-07-24T10:00:00Z"}
-        ]"#;
-        assert_eq!(
-            parse_last_ready_labeled_at(json).as_deref(),
-            Some("2026-07-23T10:00:00Z")
-        );
-    }
-
-    #[test]
-    fn test_parse_last_ready_labeled_at_none_when_absent() {
-        let json = r#"[
-            {"event":"labeled","label":{"name":"p1"},"created_at":"2026-07-21T10:00:00Z"},
-            {"event":"commented","created_at":"2026-07-24T10:00:00Z"}
-        ]"#;
-        assert_eq!(parse_last_ready_labeled_at(json), None);
-    }
-
-    #[test]
-    fn test_parse_last_ready_labeled_at_empty_and_malformed() {
-        assert_eq!(parse_last_ready_labeled_at("[]"), None);
-        assert_eq!(parse_last_ready_labeled_at("not json"), None);
-    }
-
     // ── mika#1824 Phase 2: AC5 mixed-fixture selection test ──
 
     fn ready_body_issue(number: u64, extra_labels: &[&str]) -> Issue {
@@ -5954,6 +6005,7 @@ This ticket has been GROOMED and is ready.
         assert_eq!(FILTER_PROMOTION_GATE, "promotion_gate_refused");
         assert_eq!(FILTER_PROBE_ERROR, "state_probe_failed");
         assert_eq!(FILTER_SEAT_REFUSED, "seat_refused");
+        assert_eq!(FILTER_READY_PARKED, "ready_parked");
         assert_eq!(EXCLUSION_AUDIT_TOOL_NAME, "auto_pull_exclusion");
 
         // The Phase 2 classifier reaches the same vocabulary. These four are the
