@@ -506,6 +506,50 @@ assert_eq "no marker — tier 2 still returns READY" "READY" \
 assert_eq "no marker — verdict tier 1a still returns GROOMED" "GROOMED" \
     "$(printf 'Verdict: GROOMED\n' | _parse_verdict 2>/dev/null)"
 
+# ---------------------------------------------------------------------------
+# Tier 0b — engine escalation line (mika#2338)
+#
+# Since mika#2338 the engine no longer withholds an unattested disposition into the
+# marker above: it rewrites the response into a terminal ESCALATE preceded by a
+# finding line of fixed shape, `F<n>: (BLOCKING) [mika-engine] review-anchor: …`.
+# Tier 0b recognizes that exact shape anchored at the START OF A LINE and returns
+# ESCALATE before any textual tier runs. Two things are guarded here:
+#
+# - POSITION: tier 1a / verdict tier 1 grep the first `Disposition:`/`Verdict:`
+#   ANYWHERE in the text, unanchored. The engine also rewrites every inline
+#   mention, but the shell must be fail-closed on its own — the two layers each
+#   suffice alone.
+# - SHAPE: `[mika-engine]` alone is not the signal. Every corrective re-prompt
+#   begins with it, the model relays it in its session, and the prompts teach it.
+#   Only the full line the engine composes counts; an echo in prose does not.
+#
+# The literal must stay in sync with REVIEW_ANCHOR_ENGINE_FINDING_MARKER in
+# crates/mika-agent/src/agent_loop/mod.rs (drift guard below, next to the marker's).
+# ---------------------------------------------------------------------------
+ENGINE_FINDING_MARKER="(BLOCKING) [mika-engine] review-anchor:"
+ENGINE_LINE="F1: $ENGINE_FINDING_MARKER attestation withheld after the corrective re-prompt — anchors_found=3, anchors_valid=2, miss_reason=QuoteNotInBrief: paraphrase."
+
+assert_eq "tier 0b — engine line + Disposition: ESCALATE parses ESCALATE" "ESCALATE" \
+    "$(printf 'A1: x\nA2: y\n\n%s\n\nDisposition: ESCALATE\n' "$ENGINE_LINE" | _parse_disposition 2>/dev/null)"
+assert_eq "tier 0b — verdict parser reads ESCALATE from the engine line" "ESCALATE" \
+    "$(printf 'A1: x\n\n%s\n\nVerdict: ESCALATE\n' "$ENGINE_LINE" | _parse_verdict 2>/dev/null)"
+assert_eq "tier 0b beats tier 1a — READY quoted inline BEFORE the engine line" "ESCALATE" \
+    "$(printf 'Je confirme que ma réponse se termine par Disposition: READY comme demandé.\nA1: x\n\n%s\n\nDisposition: ESCALATE\n' "$ENGINE_LINE" | _parse_disposition 2>/dev/null)"
+assert_eq "tier 0b beats verdict tier 1 — GROOMED quoted inline BEFORE the engine line" "ESCALATE" \
+    "$(printf 'Mon verdict est bien Verdict: GROOMED.\n\n%s\n\nVerdict: ESCALATE\n' "$ENGINE_LINE" | _parse_verdict 2>/dev/null)"
+assert_eq "tier 0b — indented engine line still counts" "ESCALATE" \
+    "$(printf 'prose\n   %s\nDisposition: READY\n' "$ENGINE_LINE" | _parse_disposition 2>/dev/null)"
+assert_eq "tier 0b — F2 prefix (any finding index) counts" "ESCALATE" \
+    "$(printf 'F2: %s counters\nDisposition: READY\n' "$ENGINE_FINDING_MARKER" | _parse_disposition 2>/dev/null)"
+
+# An echo of `[mika-engine]` in prose is not the engine line: the architect's own verdict stands.
+assert_eq "echo of [mika-engine] in prose does not suppress a genuine READY" "READY" \
+    "$(printf 'The engine re-prompt began with [mika-engine] and I addressed it.\nA1: x\nDisposition: READY\n' | _parse_disposition 2>/dev/null)"
+assert_eq "echo of the marker mid-line does not force ESCALATE on a genuine ITERATE" "ITERATE" \
+    "$(printf 'Were the anchors missing the engine would write %s here.\nDisposition: ITERATE\n' "$ENGINE_FINDING_MARKER" | _parse_disposition 2>/dev/null)"
+assert_eq "verdict parser — echo of [mika-engine] in prose keeps a genuine GROOMED" "GROOMED" \
+    "$(printf 'I saw a [mika-engine] re-prompt earlier.\nA1: x\nVerdict: GROOMED\n' | _parse_verdict 2>/dev/null)"
+
 # _trail_append + _trail_read — round-trip
 TRAIL_TMP=$(mktemp -d)
 WORKTREE_DIR="$TRAIL_TMP" _trail_append "groom-ticket" "session-abc" "READY"
@@ -713,6 +757,38 @@ assert_contains "_escalate_groom RESULT includes Verdict: ESCALATE" "Verdict: ES
 assert_contains "_escalate_groom RESULT includes session_id" "Session: session-esc-1" "$RESULT"
 assert_contains "_escalate_groom RESULT references findings file path" "Architect findings preserved at:" "$RESULT"
 rm -rf "$ESC_TMP"
+
+# _escalate_groom — engine escalation line (mika#2338): the cause travels into RESULT and
+# the failure reason names the engine, not the architect.
+ESC_TMP_ENG=$(mktemp -d)
+RESULT=""
+GROOM_LOOP_FAILURE_REASON="architect ESCALATE (first-pass)"
+ENGINE_CONTENT="A1: x
+A2: y
+
+$ENGINE_LINE
+
+Disposition: ESCALATE"
+WORKTREE_DIR="$ESC_TMP_ENG" _escalate_groom "first-pass" "$ENGINE_CONTENT" "session-esc-eng" 2>/dev/null
+assert_contains "_escalate_groom copies the engine line into RESULT as Engine reason" "Engine reason: $ENGINE_LINE" "$RESULT"
+assert_eq "_escalate_groom names the engine in the failure reason" \
+    "engine ESCALATE (first-pass): review-anchor attestation withheld" "$GROOM_LOOP_FAILURE_REASON"
+rm -rf "$ESC_TMP_ENG"
+
+# An architect ESCALATE whose prose echoes `[mika-engine]` is NOT relabelled as an engine refusal.
+ESC_TMP_ECHO=$(mktemp -d)
+RESULT=""
+GROOM_LOOP_FAILURE_REASON="architect ESCALATE (first-pass)"
+WORKTREE_DIR="$ESC_TMP_ECHO" _escalate_groom "first-pass" "F1: (BLOCKING) The [mika-engine] re-prompt was addressed but the plan contradicts ADR-008.
+Disposition: ESCALATE" "session-esc-echo" 2>/dev/null
+if printf '%s' "$RESULT" | grep -q "Engine reason:"; then
+    assert_eq "_escalate_groom ignores an echo of [mika-engine] in architect prose" "no engine reason" "engine reason present"
+else
+    assert_eq "_escalate_groom ignores an echo of [mika-engine] in architect prose" "no engine reason" "no engine reason"
+fi
+assert_eq "_escalate_groom keeps the architect reason on an echo" "architect ESCALATE (first-pass)" "$GROOM_LOOP_FAILURE_REASON"
+rm -rf "$ESC_TMP_ECHO"
+GROOM_LOOP_FAILURE_REASON=""
 
 # _escalate_groom — distinct stage labels write distinct findings files
 ESC_TMP2=$(mktemp -d)
@@ -4477,6 +4553,18 @@ if [ -f "$ANCHOR_RUST_SRC" ]; then
         assert_eq "dispatch-lib carries the marker literal" "yes" "yes"
     else
         assert_eq "dispatch-lib carries the marker literal" "yes" "no"
+    fi
+    # mika#2338 — same necessity, same shape, for the engine escalation line. If the two
+    # copies diverge, tier 0b stops recognizing the engine's line and the escalation falls
+    # through to the unanchored textual tiers.
+    RUST_ENGINE_MARKER=$(grep -oE 'const REVIEW_ANCHOR_ENGINE_FINDING_MARKER: &str = "[^"]+"' "$ANCHOR_RUST_SRC" \
+        | sed 's/.*= "//; s/"$//')
+    assert_eq "shell tier-0b marker matches Rust REVIEW_ANCHOR_ENGINE_FINDING_MARKER (no drift)" \
+        "$RUST_ENGINE_MARKER" "$ENGINE_FINDING_MARKER"
+    if grep -qF "$RUST_ENGINE_MARKER" "$DISPATCH_LIB"; then
+        assert_eq "dispatch-lib carries the engine marker literal" "yes" "yes"
+    else
+        assert_eq "dispatch-lib carries the engine marker literal" "yes" "no"
     fi
 else
     FAIL=$((FAIL + 1))
