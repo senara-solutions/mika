@@ -103,9 +103,41 @@ const MAX_AGE_DEFAULT_SECS: i64 = 604_800;
 const MAX_PER_TICK_ENV: &str = "MIKA_QA_REVIEW_RECONCILE_MAX_PER_TICK";
 /// Étalement du premier tick après déploiement — le seul moment où ce scan peut
 /// faire du bruit, puisqu'il voit toute l'arriération d'un coup.
-const MAX_PER_TICK_DEFAULT: usize = 3;
+///
+/// **Passé de 3 à 1 par mika#2347, et c'est le seul défaut que ce correctif
+/// déplace.** Trois poses par tick et quatre ticks par heure font **12
+/// demandes/heure** ; à une enveloppe de 600 s par revue et une exécution
+/// sérialisée par `agent_lock`, la capacité de mika-qa plafonne à **6
+/// revues/heure** — et le trafic nominal (`opened`, `synchronize`,
+/// `review_requested`, fan-out `check_suite` de mika#1711) s'ajoute par-dessus.
+/// Le cap par tick, seul, autorisait donc une file qui croît sans borne. À 1, le
+/// rattrapage demande au plus **4 revues/heure**, sous la capacité. C'est le seul
+/// réglage de ce ticket dont l'effet est arithmétiquement démontrable.
+const MAX_PER_TICK_DEFAULT: usize = 1;
+
+const COOLDOWN_ENV: &str = "MIKA_QA_REVIEW_RECONCILE_COOLDOWN_SECS";
+/// Une heure, alignée sur [`MIN_AGE_DEFAULT_SECS`] : le délai doit dépasser la
+/// durée d'un tour de revue avec une marge large, et une PR que le rattrapage
+/// n'a pas réveillée en une heure ne le sera pas davantage en quinze minutes.
+const COOLDOWN_DEFAULT_SECS: i64 = 3600;
+
+const MAX_ATTEMPTS_ENV: &str = "MIKA_QA_REVIEW_RECONCILE_MAX_ATTEMPTS";
+/// Deux rattrapages par (dépôt, PR, SHA), puis abandon.
+///
+/// **Le budget est ce qui distingue ce correctif d'un simple ralentissement** :
+/// un cooldown seul rejoue pour toujours, juste moins vite. Précédent direct du
+/// dépôt, `MIKA_AUTO_PULL_MAX_REDRIVES` (mika#2020), né du constat que mika#1901
+/// avait reçu le label `ready` seize fois en dix-neuf heures. Deux laisse une
+/// seconde chance à un webhook perdu et refuse la troisième.
+const MAX_ATTEMPTS_DEFAULT: i64 = 2;
 
 const REPOS_ENV: &str = "MIKA_QA_REVIEW_RECONCILE_REPOS";
+
+/// `audit_events.tool_name` écrit à chaque abandon d'un (dépôt, PR, SHA).
+///
+/// **SOLE WRITER**, comme [`RECONCILED_TOOL`]. C'est la réponse directe à
+/// « pourquoi cette PR n'est-elle plus rattrapée ? », sans grep.
+const ABANDONED_TOOL: &str = "qa_review_reconcile_abandoned";
 
 // ---------------------------------------------------------------------------
 // Formes JSON GitHub
@@ -130,6 +162,16 @@ pub struct PrSnapshot {
     pub is_draft: bool,
     #[serde(rename = "createdAt")]
     pub created_at: String,
+    /// SHA de tête, qui keye le ledger de mika#2347.
+    ///
+    /// **Pas de `#[serde(default)]`, pour la raison déjà écrite au-dessus de
+    /// cette structure** : le champ est explicitement demandé dans `--json`, donc
+    /// toujours rendu. Une absence doit avorter le parse plutôt que faire entrer
+    /// la PR dans la population avec une clé de ledger vide — qui confondrait
+    /// toutes les PRs sans SHA en un seul compteur. Une valeur **vide** est
+    /// traitée comme illisible et sort la PR, même discipline que `createdAt`.
+    #[serde(rename = "headRefOid")]
+    pub head_ref_oid: String,
     #[serde(rename = "reviewRequests")]
     pub review_requests: Vec<GhReviewRequest>,
     pub reviews: Vec<GhReview>,
@@ -156,19 +198,32 @@ pub struct GhReview {
     pub author: Option<GhAuthor>,
 }
 
-/// Une PR retenue, et son âge au moment de la décision.
+/// Une PR retenue, son âge au moment de la décision, et son SHA de tête.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrRef {
     pub number: u64,
     pub age_secs: i64,
+    /// Ce qui keye le ledger : **un nouveau SHA rouvre naturellement le budget**,
+    /// parce que la clé change et que le compte repart à zéro. C'est
+    /// l'idempotence « par (PR, SHA) » obtenue par la forme de la clé plutôt que
+    /// par un champ de plus.
+    pub head_sha: String,
 }
 
-/// Les trois bornes numériques de la décision.
+/// Les bornes numériques de la décision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReconcileConfig {
     pub min_age_secs: i64,
     pub max_age_secs: i64,
+    /// Plafond d'écritures par tick. **Lu par l'appelant, pas par
+    /// [`select_prs_needing_review`]** depuis mika#2347 — voir la note de
+    /// déplacement sur cette fonction.
     pub max_per_tick: usize,
+    /// Délai après une pose avant qu'une nouvelle soit possible sur le même
+    /// (dépôt, PR, SHA).
+    pub cooldown_secs: i64,
+    /// Nombre de poses au-delà duquel le (dépôt, PR, SHA) est abandonné.
+    pub max_attempts: i64,
 }
 
 impl Default for ReconcileConfig {
@@ -177,6 +232,8 @@ impl Default for ReconcileConfig {
             min_age_secs: MIN_AGE_DEFAULT_SECS,
             max_age_secs: MAX_AGE_DEFAULT_SECS,
             max_per_tick: MAX_PER_TICK_DEFAULT,
+            cooldown_secs: COOLDOWN_DEFAULT_SECS,
+            max_attempts: MAX_ATTEMPTS_DEFAULT,
         }
     }
 }
@@ -198,13 +255,23 @@ impl Default for ReconcileConfig {
 /// | aucune revue de [`REVIEWER_FORGE_LOGIN`] | GitHub retire la demande quand la revue est soumise ; sans ce terme, chaque PR revue serait re-demandée en boucle |
 /// | âge > `min_age_secs` | laisse au chemin nominal le temps d'aboutir — c'est ce terme qui évite le doublon |
 /// | âge < `max_age_secs` | au-delà, PR abandonnée |
+/// | `headRefOid` non vide | sans SHA, la clé du ledger (mika#2347) ne discrimine plus rien |
 ///
 /// La terminaison du pilote qui a produit la PR **n'est pas une entrée** de
 /// cette fonction : c'est la forme structurelle de « indépendant de la survie
 /// du pilote » (AC1).
 ///
 /// Ordre : la plus vieille d'abord, puis par numéro croissant pour que deux
-/// ticks sur le même état rendent la même liste. Tronqué à `max_per_tick`.
+/// ticks sur le même état rendent la même liste.
+///
+/// # La troncature a déménagé (mika#2347), et c'est un changement de contrat
+///
+/// Cette fonction **ne tronque plus** à `max_per_tick` ; l'appelant tronque
+/// après avoir appliqué le filtre de cooldown. Si la troncature restait ici,
+/// `max_per_tick` PRs en cooldown consommeraient tout le tick et la suivante,
+/// légitimement rattrapable, ne serait jamais vue — un plafond sur les *sauts*
+/// au lieu d'un plafond sur les *écritures*. Ce n'est pas une assertion perdue :
+/// c'est une assertion déplacée avec la décision qu'elle garde.
 pub fn select_prs_needing_review(
     prs: &[PrSnapshot],
     now: DateTime<Utc>,
@@ -243,15 +310,23 @@ pub fn select_prs_needing_review(
             if age_secs <= cfg.min_age_secs || age_secs >= cfg.max_age_secs {
                 return None;
             }
+            // SHA vide ⇒ hors population (mika#2347). La clé du ledger est
+            // `pr:{repo}#{n}@{sha}` : un SHA vide ferait de toutes les PRs sans
+            // SHA un unique compteur partagé, donc un cooldown et un budget qui
+            // ne discriminent plus rien.
+            let head_sha = pr.head_ref_oid.trim();
+            if head_sha.is_empty() {
+                return None;
+            }
             Some(PrRef {
                 number: pr.number,
                 age_secs,
+                head_sha: head_sha.to_string(),
             })
         })
         .collect();
 
     retained.sort_by(|a, b| b.age_secs.cmp(&a.age_secs).then(a.number.cmp(&b.number)));
-    retained.truncate(cfg.max_per_tick); // safe-byte-slice: retained is Vec<PrRef>; truncate is by element count (usize max_per_tick), not a byte offset — no UTF-8 boundary
     retained
 }
 
@@ -363,6 +438,16 @@ fn config_from_env() -> ReconcileConfig {
             MAX_PER_TICK_DEFAULT,
             MAX_PER_TICK_ENV,
         ),
+        cooldown_secs: parse_positive_i64(
+            std::env::var(COOLDOWN_ENV).ok().as_deref(),
+            COOLDOWN_DEFAULT_SECS,
+            COOLDOWN_ENV,
+        ),
+        max_attempts: parse_positive_i64(
+            std::env::var(MAX_ATTEMPTS_ENV).ok().as_deref(),
+            MAX_ATTEMPTS_DEFAULT,
+            MAX_ATTEMPTS_ENV,
+        ),
     };
     if cfg.max_age_secs <= cfg.min_age_secs {
         warn!(
@@ -374,6 +459,160 @@ fn config_from_env() -> ReconcileConfig {
         );
     }
     cfg
+}
+
+// ---------------------------------------------------------------------------
+// Le ledger devient décisionnel (mika#2347)
+// ---------------------------------------------------------------------------
+
+/// Clé d'audit d'une pose : `pr:{repo}#{n}@{sha}`.
+///
+/// La forme exacte que `ci_success_handler` emploie déjà pour sa dedup durable
+/// (mika#1869). Le préfixe reste `pr:{repo}#{n}`, donc la requête opérateur
+/// `WHERE tool_name = 'qa_review_reconciled'` est inchangée ; seul le format de
+/// `target_key` s'allonge.
+pub fn reconciled_audit_key(repo: &str, pr_number: u64, head_sha: &str) -> String {
+    format!("pr:{repo}#{pr_number}@{head_sha}")
+}
+
+/// Clé d'audit **héritée**, écrite par mika#2334 avant que le SHA n'existe.
+///
+/// Daté : ce second format peut disparaître dès que toute ligne écrite avant le
+/// déploiement de mika#2347 est plus vieille que `max_age_secs` (sept jours par
+/// défaut). Il est consulté en **deuxième requête exacte**, jamais par un `LIKE`
+/// — qui ferait matcher `#234` sur `#2343`.
+fn legacy_reconciled_audit_key(repo: &str, pr_number: u64) -> String {
+    format!("pr:{repo}#{pr_number}")
+}
+
+/// Borne basse d'une fenêtre de comptage, en ISO 8601, **sans jamais paniquer**.
+///
+/// `chrono::Duration::seconds` panique au-delà de `i64::MAX / 1000` : des
+/// millisecondes tapées là où des secondes étaient attendues tueraient le tick
+/// du moteur depuis une variable d'environnement. Même discipline que le plafond
+/// absolu de `MIKA_PROMOTED_WRAPPER_LIVENESS_SECS`.
+fn window_start(now: DateTime<Utc>, secs: i64) -> String {
+    let delta = chrono::TimeDelta::try_seconds(secs).unwrap_or(chrono::TimeDelta::MAX);
+    crate::timestamp::format(
+        &now.checked_sub_signed(delta)
+            .unwrap_or(DateTime::<Utc>::MIN_UTC),
+    )
+}
+
+/// Ce que le ledger répond pour un (dépôt, PR, SHA) donné.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewLedgerVerdict {
+    /// Aucune pose récente, budget non épuisé : on peut poser.
+    Postable,
+    /// Une pose existe à l'intérieur du cooldown : on saute ce tick.
+    Cooldown,
+    /// Le budget est épuisé pour ce SHA : la PR est abandonnée jusqu'au prochain
+    /// SHA, qui rouvrira le budget en changeant la clé.
+    Abandoned { attempts: i64 },
+    /// `audit_events` est illisible. **Fail-closed** : on ne pose pas.
+    Unreadable,
+}
+
+/// Lit le ledger avant toute pose — l'idempotence, le cooldown et le budget.
+///
+/// # Ce que ça ferme
+///
+/// Avant mika#2347, les seuls termes d'idempotence étaient *l'absence de demande*
+/// et *l'absence de revue* pour [`REVIEWER_FORGE_LOGIN`] — deux états **GitHub
+/// qui n'existent qu'après aboutissement de la revue**. Une PR dont le tour de
+/// revue meurt sans rien poster retombait donc dans la population au tick
+/// suivant, identique à elle-même : avec le cron `0 */15 * * * *`, jusqu'à **96
+/// re-demandes par jour et par PR** pendant les sept jours de `max_age_secs`.
+/// La ligne d'audit `qa_review_reconciled` était écrite et **jamais relue** : le
+/// ledger existait et ne décidait rien.
+///
+/// # Fail-closed, à l'inverse de `ci_success_handler`
+///
+/// Une lecture impossible refuse la pose. C'est le choix de `wip_rescue`
+/// (mika#2199) et pas celui de `ci_success_handler` (fail-open), pour la raison
+/// qui y est écrite : un faux négatif fait attendre une PR qui, avant mika#2334,
+/// attendait indéfiniment ; un faux positif rejoue une revue, c'est-à-dire
+/// produit exactement le défaut que ce ticket existe pour fermer.
+///
+/// Aucune nouvelle méthode DB, aucune migration : deux (parfois trois) lectures
+/// de [`crate::db::Database::count_recent_audit_events_for_target`].
+pub async fn review_ledger_verdict(
+    db: &AsyncDatabase,
+    repo: &str,
+    pr: &PrRef,
+    cfg: &ReconcileConfig,
+    now: DateTime<Utc>,
+    trace_id: &str,
+) -> ReviewLedgerVerdict {
+    let key = reconciled_audit_key(repo, pr.number, &pr.head_sha);
+
+    // Budget : toutes les poses pour ce SHA sur la durée de vie scannable de la
+    // PR. Au-delà de `max_attempts`, abandon définitif pour ce SHA.
+    let budget_since = window_start(now, cfg.max_age_secs);
+    let attempts = match db
+        .count_recent_audit_events_for_target(RECONCILED_TOOL, &key, &budget_since)
+        .await
+    {
+        Ok(n) => n,
+        Err(e) => return unreadable(repo, pr, "budget", &e, trace_id),
+    };
+    if attempts >= cfg.max_attempts {
+        return ReviewLedgerVerdict::Abandoned { attempts };
+    }
+
+    let cooldown_since = window_start(now, cfg.cooldown_secs);
+
+    // La fenêtre du budget contient celle du cooldown, donc `attempts == 0`
+    // implique « aucune pose récente » : la requête est évitée plutôt que
+    // répétée. `cooldown_secs > max_age_secs` est une configuration incohérente
+    // que ce raccourci lit dans la direction sûre (on pose).
+    if attempts > 0 {
+        match db
+            .count_recent_audit_events_for_target(RECONCILED_TOOL, &key, &cooldown_since)
+            .await
+        {
+            Ok(n) if n > 0 => return ReviewLedgerVerdict::Cooldown,
+            Ok(_) => {}
+            Err(e) => return unreadable(repo, pr, "cooldown", &e, trace_id),
+        }
+    }
+
+    // Transition des lignes héritées : les poses écrites avant mika#2347 portent
+    // `pr:{repo}#{n}` sans SHA et seraient invisibles au cooldown ci-dessus, ce
+    // qui autoriserait une re-pose immédiate sur des PRs déjà rattrapées.
+    let legacy_key = legacy_reconciled_audit_key(repo, pr.number);
+    match db
+        .count_recent_audit_events_for_target(RECONCILED_TOOL, &legacy_key, &cooldown_since)
+        .await
+    {
+        Ok(n) if n > 0 => ReviewLedgerVerdict::Cooldown,
+        Ok(_) => ReviewLedgerVerdict::Postable,
+        Err(e) => unreadable(repo, pr, "legacy_cooldown", &e, trace_id),
+    }
+}
+
+/// Le seul site qui transforme une erreur de lecture d'audit en verdict.
+///
+/// **Doit rester vide en régime nominal** : toute occurrence est un ledger
+/// illisible, donc un scan devenu inerte.
+fn unreadable(
+    repo: &str,
+    pr: &PrRef,
+    stage: &str,
+    error: &anyhow::Error,
+    trace_id: &str,
+) -> ReviewLedgerVerdict {
+    warn!(
+        event = "qa_review_reconcile_ledger_unreadable",
+        repo = %repo,
+        pr = pr.number,
+        head_sha = %pr.head_sha,
+        stage,
+        error = %error,
+        trace_id,
+        "qa_review_reconcile: ledger illisible, pose refusée (fail-closed)"
+    );
+    ReviewLedgerVerdict::Unreadable
 }
 
 // ---------------------------------------------------------------------------
@@ -412,7 +651,7 @@ async fn list_open_prs(repo: &str, token: &str) -> Result<Vec<PrSnapshot>, Strin
             "--state",
             "open",
             "--json",
-            "number,author,isDraft,createdAt,reviewRequests,reviews",
+            "number,author,isDraft,createdAt,headRefOid,reviewRequests,reviews",
             "--limit",
             &limit,
         ],
@@ -459,6 +698,8 @@ pub async fn reconcile_qa_review_requests(
     let mut budget = cfg.max_per_tick;
     let mut reconciled = 0usize;
     let mut failed = 0usize;
+    let mut skipped_cooldown = 0usize;
+    let mut abandoned = 0usize;
 
     for repo in &repos {
         if budget == 0 {
@@ -478,13 +719,33 @@ pub async fn reconcile_qa_review_requests(
             }
         };
 
-        let budgeted = ReconcileConfig {
-            max_per_tick: budget,
-            ..cfg
-        };
-        let selected = select_prs_needing_review(&prs, now, &budgeted);
+        // Liste complète, non tronquée (mika#2347) : le cap s'applique après le
+        // filtre de ledger, sur les seules tentatives de pose.
+        let selected = select_prs_needing_review(&prs, now, &cfg);
 
         for pr in selected {
+            if budget == 0 {
+                break;
+            }
+
+            // Le budget de tick n'est débité que sur **tentative de pose** : un
+            // saut de cooldown ne coûte rien, sans quoi le cap redeviendrait un
+            // plafond sur les sauts plutôt que sur les écritures.
+            match review_ledger_verdict(db, repo, &pr, &cfg, now, trace_id).await {
+                ReviewLedgerVerdict::Postable => {}
+                ReviewLedgerVerdict::Cooldown => {
+                    skipped_cooldown += 1;
+                    continue;
+                }
+                ReviewLedgerVerdict::Unreadable => continue,
+                ReviewLedgerVerdict::Abandoned { attempts } => {
+                    abandoned += 1;
+                    log_abandoned_once(db, session_id, repo, &pr, attempts, &cfg, now, trace_id)
+                        .await;
+                    continue;
+                }
+            }
+
             // Débité à **chaque tentative**, pas aux seuls succès. Un échec
             // systématique — la famille mika#2228, `Resource not accessible by
             // personal access token` — laisserait sinon le budget intact, et
@@ -501,6 +762,7 @@ pub async fn reconcile_qa_review_requests(
                         repo = %repo,
                         pr = pr.number,
                         age_secs = pr.age_secs,
+                        head_sha = %pr.head_sha,
                         reviewer = REVIEWER_FORGE_LOGIN,
                         trace_id,
                         "qa_review_reconcile: relecteur posé sur une PR que la cascade n'a pas atteinte"
@@ -537,6 +799,11 @@ pub async fn reconcile_qa_review_requests(
         event = "qa_review_reconcile_tick",
         reconciled,
         failed,
+        // mika#2347 — la forme du tick, sans nommer de PR : un INFO par PR sautée
+        // serait du bruit à chaque tick (doctrine mika#2131). Le détail par PR
+        // vit dans `audit_events`.
+        skipped_cooldown,
+        abandoned,
         repos = repos.len(),
         trace_id,
         "qa_review_reconcile: tick agissant"
@@ -567,14 +834,16 @@ async fn request_review(repo: &str, pr_number: u64, token: &str) -> Result<(), S
     .map(|_| ())
 }
 
-async fn log_reconciled(
+/// Écrit la ligne de pose. **C'est cette ligne que [`review_ledger_verdict`]
+/// relit** — le ledger n'est plus décoratif depuis mika#2347.
+pub async fn log_reconciled(
     db: &AsyncDatabase,
     session_id: &str,
     repo: &str,
     pr: &PrRef,
     trace_id: &str,
 ) {
-    let key = format!("pr:{repo}#{}", pr.number);
+    let key = reconciled_audit_key(repo, pr.number, &pr.head_sha);
     let age = pr.age_secs.to_string();
     if let Err(e) = db
         .log_audit_event(
@@ -593,6 +862,87 @@ async fn log_reconciled(
             error = %e,
             trace_id,
             "qa_review_reconcile: audit write failed"
+        );
+    }
+}
+
+/// Dit l'abandon **une fois par (dépôt, PR, SHA)**, pas une fois par tick.
+///
+/// Un abandon dure jusqu'au prochain SHA, c'est-à-dire potentiellement les sept
+/// jours de `max_age_secs`. Écrire à chaque tick y déverserait ~670 lignes par
+/// PR — le churn que ce ticket borne, déplacé dans la table d'audit. La
+/// déduplication est celle de mika#2131 : l'information est « cette PR est
+/// abandonnée pour ce SHA », pas « elle l'était encore à 14h32 ». La marque
+/// n'est posée qu'après une écriture réussie.
+///
+/// Lecture impossible ⇒ on n'écrit pas : la ligne existe très probablement déjà
+/// (c'est le cas nominal d'un abandon répété), et l'agrégat `abandoned` du tick
+/// continue de le compter.
+#[allow(clippy::too_many_arguments)]
+async fn log_abandoned_once(
+    db: &AsyncDatabase,
+    session_id: &str,
+    repo: &str,
+    pr: &PrRef,
+    attempts: i64,
+    cfg: &ReconcileConfig,
+    now: DateTime<Utc>,
+    trace_id: &str,
+) {
+    let key = reconciled_audit_key(repo, pr.number, &pr.head_sha);
+    let since = window_start(now, cfg.max_age_secs);
+    match db
+        .count_recent_audit_events_for_target(ABANDONED_TOOL, &key, &since)
+        .await
+    {
+        Ok(0) => {}
+        Ok(_) => return,
+        Err(e) => {
+            debug!(
+                pr = pr.number,
+                error = %e,
+                trace_id,
+                "qa_review_reconcile: relecture du marqueur d'abandon impossible, écriture sautée"
+            );
+            return;
+        }
+    }
+
+    warn!(
+        event = "qa_review_reconcile_abandoned",
+        repo = %repo,
+        pr = pr.number,
+        head_sha = %pr.head_sha,
+        attempts,
+        max_attempts = cfg.max_attempts,
+        trace_id,
+        "qa_review_reconcile: budget de rattrapage épuisé pour ce SHA — \
+         deux rattrapages n'ont produit aucune revue, le chemin nominal est \
+         probablement cassé en amont ; un nouveau SHA rouvrira le budget"
+    );
+
+    let reasoning = format!(
+        "budget de rattrapage épuisé : {attempts} pose(s) pour ce (dépôt, PR, SHA), \
+         plafond {} (mika#2347)",
+        cfg.max_attempts
+    );
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            ABANDONED_TOOL,
+            &key,
+            None,
+            Some(&attempts.to_string()),
+            Some(&reasoning),
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(
+            pr = pr.number,
+            error = %e,
+            trace_id,
+            "qa_review_reconcile: audit write failed (abandon)"
         );
     }
 }
@@ -622,6 +972,7 @@ mod tests {
             }),
             is_draft: false,
             created_at: created_secs_ago(age_secs),
+            head_ref_oid: format!("{number:040x}"),
             review_requests: vec![],
             reviews: vec![],
         }
@@ -762,21 +1113,88 @@ mod tests {
         assert_eq!(select(&[trop_jeune, trop_vieille, dedans]), vec![8]);
     }
 
-    /// AC6 — le premier tick est borné, et sert les plus vieilles d'abord.
+    /// AC6 — les plus vieilles d'abord, ordre total et stable.
     #[test]
-    fn mika2334_le_premier_tick_est_borne_et_oldest_first() {
+    fn mika2334_la_selection_sert_les_plus_vieilles_dabord() {
         let prs: Vec<PrSnapshot> = (1..=6)
             .map(|i| loop_pr(i, MIN_AGE_DEFAULT_SECS + 100 * i as i64))
             .collect();
-        let cfg = ReconcileConfig {
-            max_per_tick: 3,
-            ..ReconcileConfig::default()
-        };
-        let picked: Vec<u64> = select_prs_needing_review(&prs, now(), &cfg)
+        let picked: Vec<u64> = select_prs_needing_review(&prs, now(), &ReconcileConfig::default())
             .into_iter()
             .map(|p| p.number)
             .collect();
-        assert_eq!(picked, vec![6, 5, 4], "les plus vieilles d'abord, cap à 3");
+        assert_eq!(picked, vec![6, 5, 4, 3, 2, 1]);
+    }
+
+    /// mika#2347 — **l'assertion de troncature n'est pas perdue, elle a déménagé
+    /// avec la décision qu'elle garde.** Si la fonction pure tronquait encore,
+    /// `max_per_tick` PRs en cooldown consommeraient tout le tick et la suivante,
+    /// légitimement rattrapable, ne serait jamais vue. Le cap vit désormais dans
+    /// l'appelant, après le filtre de ledger, et ne plafonne que les écritures.
+    #[test]
+    fn mika2347_la_fonction_pure_ne_tronque_plus() {
+        let prs: Vec<PrSnapshot> = (1..=6)
+            .map(|i| loop_pr(i, MIN_AGE_DEFAULT_SECS + 100 * i as i64))
+            .collect();
+        for max_per_tick in [1, 3, 100] {
+            let cfg = ReconcileConfig {
+                max_per_tick,
+                ..ReconcileConfig::default()
+            };
+            assert_eq!(
+                select_prs_needing_review(&prs, now(), &cfg).len(),
+                6,
+                "max_per_tick={max_per_tick} ne doit plus influer sur la sélection"
+            );
+        }
+    }
+
+    /// Le cap par défaut est **1** depuis mika#2347 : 4 demandes/heure au plus,
+    /// sous la capacité de 6 revues/heure établie par la mesure. C'est une valeur
+    /// de contrat, pas un détail — d'où l'assertion.
+    #[test]
+    fn mika2347_le_cap_par_defaut_est_un() {
+        assert_eq!(ReconcileConfig::default().max_per_tick, 1);
+    }
+
+    /// Un SHA vide sort la PR : la clé du ledger ne discriminerait plus rien.
+    #[test]
+    fn mika2347_un_sha_illisible_sort_la_pr() {
+        let mut sans_sha = loop_pr(16, 7200);
+        sans_sha.head_ref_oid = "   ".to_string();
+        assert!(select(&[sans_sha]).is_empty());
+    }
+
+    /// `headRefOid` absent ⇒ erreur de parsing, jamais une chaîne vide — même
+    /// discipline que `reviewRequests` / `reviews`.
+    #[test]
+    fn mika2347_le_sha_manquant_est_une_erreur_pas_un_vide() {
+        let sans_sha = r#"[{"number":1,"author":{"login":"mika-platform-dev"},
+            "isDraft":false,"createdAt":"2026-09-15T10:00:00Z",
+            "reviewRequests":[],"reviews":[]}]"#;
+        assert!(serde_json::from_str::<Vec<PrSnapshot>>(sans_sha).is_err());
+    }
+
+    /// Les deux clés d'audit, l'ancienne et la nouvelle, et le préfixe partagé
+    /// qui laisse la requête opérateur inchangée.
+    #[test]
+    fn mika2347_la_cle_daudit_porte_le_sha_sans_perdre_son_prefixe() {
+        let key = reconciled_audit_key("senara-solutions/mika", 2343, "deadbeef");
+        assert_eq!(key, "pr:senara-solutions/mika#2343@deadbeef");
+        let legacy = legacy_reconciled_audit_key("senara-solutions/mika", 2343);
+        assert_eq!(legacy, "pr:senara-solutions/mika#2343");
+        assert!(
+            key.starts_with(&legacy),
+            "le préfixe doit rester `pr:{{repo}}#{{n}}`"
+        );
+    }
+
+    /// `chrono::Duration::seconds` panique au-delà de `i64::MAX / 1000` : une
+    /// faute de frappe dans une variable d'environnement ne doit pas tuer le tick.
+    #[test]
+    fn mika2347_une_fenetre_absurde_ne_panique_pas() {
+        let _ = window_start(now(), i64::MAX);
+        let _ = window_start(now(), 3600);
     }
 
     /// Fail-safe : une information illisible sort la PR, elle ne l'y fait jamais
@@ -825,12 +1243,13 @@ mod tests {
     #[test]
     fn mika2334_un_champ_manquant_est_une_erreur_pas_un_vide() {
         let sans_reviews = r#"[{"number":1,"author":{"login":"mika-platform-dev"},
-            "isDraft":false,"createdAt":"2026-09-15T10:00:00Z","reviewRequests":[]}]"#;
+            "isDraft":false,"createdAt":"2026-09-15T10:00:00Z",
+            "headRefOid":"abc123","reviewRequests":[]}]"#;
         assert!(serde_json::from_str::<Vec<PrSnapshot>>(sans_reviews).is_err());
 
         let complet = r#"[{"number":1,"author":{"login":"mika-platform-dev"},
             "isDraft":false,"createdAt":"2026-09-15T10:00:00Z",
-            "reviewRequests":[],"reviews":[]}]"#;
+            "headRefOid":"abc123","reviewRequests":[],"reviews":[]}]"#;
         assert!(serde_json::from_str::<Vec<PrSnapshot>>(complet).is_ok());
     }
 
@@ -840,6 +1259,7 @@ mod tests {
     fn mika2334_les_formes_gh_reelles_se_deserialisent() {
         let raw = r#"[{"number":2332,"author":{"login":"mika-platform-dev"},
             "isDraft":false,"createdAt":"2026-09-15T10:00:00Z",
+            "headRefOid":"1f2e3d4c5b6a798807162534435261708f9e0d1c",
             "reviewRequests":[{"__typename":"Team","name":"core","slug":"core"}],
             "reviews":[{"author":null,"state":"COMMENTED"}]}]"#;
         let parsed: Vec<PrSnapshot> = serde_json::from_str(raw).expect("forme gh réelle");
@@ -876,16 +1296,49 @@ mod tests {
         assert_eq!(parse_positive_usize(Some("7"), 3, MAX_PER_TICK_ENV), 7);
     }
 
+    /// AC7 — les deux clés de mika#2347 suivent le palier maison, et **`0` ne
+    /// désarme pas** : c'est le rôle de `MIKA_QA_REVIEW_RECONCILE`. Une lecture
+    /// inverse ferait d'une faute de frappe un désarmement silencieux — ici, un
+    /// cooldown de zéro rendrait le rejeu immédiat, c'est-à-dire reproduirait
+    /// exactement le défaut que ce ticket ferme.
+    #[test]
+    fn mika2347_les_deux_nouvelles_cles_suivent_les_trois_paliers() {
+        for (default, env) in [
+            (COOLDOWN_DEFAULT_SECS, COOLDOWN_ENV),
+            (MAX_ATTEMPTS_DEFAULT, MAX_ATTEMPTS_ENV),
+        ] {
+            assert_eq!(parse_positive_i64(None, default, env), default);
+            assert_eq!(parse_positive_i64(Some(""), default, env), default);
+            for bad in ["abc", "0", "-1"] {
+                assert_eq!(
+                    parse_positive_i64(Some(bad), default, env),
+                    default,
+                    "{env}={bad} doit retomber sur le défaut, jamais désarmer"
+                );
+            }
+        }
+        assert_eq!(
+            parse_positive_i64(Some("900"), COOLDOWN_DEFAULT_SECS, COOLDOWN_ENV),
+            900
+        );
+        assert_eq!(
+            parse_positive_i64(Some("5"), MAX_ATTEMPTS_DEFAULT, MAX_ATTEMPTS_ENV),
+            5
+        );
+    }
+
     /// AC8 — chaque pose écrit une ligne d'audit sous le nom dont ce module est
-    /// **seul writer**, clé `pr:<repo>#<n>`. C'est cette ligne qui fait de
-    /// `SELECT … WHERE tool_name = 'qa_review_reconciled'` la liste exacte des
-    /// PRs que la boucle a dû rattraper.
+    /// **seul writer**, clé `pr:<repo>#<n>@<sha>` depuis mika#2347. C'est cette
+    /// ligne qui fait de `SELECT … WHERE tool_name = 'qa_review_reconciled'` la
+    /// liste exacte des PRs que la boucle a dû rattraper — et, depuis mika#2347,
+    /// c'est aussi celle que [`review_ledger_verdict`] relit.
     #[tokio::test]
     async fn mika2334_chaque_pose_ecrit_une_ligne_d_audit() {
         let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
         let pr = PrRef {
             number: 2333,
             age_secs: 7200,
+            head_sha: "deadbeef".to_string(),
         };
         log_reconciled(&db, "session-2334", "senara-solutions/mika", &pr, "trace-1").await;
 
@@ -897,7 +1350,7 @@ mod tests {
             .iter()
             .find(|e| e.tool_name == RECONCILED_TOOL)
             .expect("une ligne qa_review_reconciled doit exister");
-        assert_eq!(row.target_key, "pr:senara-solutions/mika#2333");
+        assert_eq!(row.target_key, "pr:senara-solutions/mika#2333@deadbeef");
         assert_eq!(row.after_value.as_deref(), Some("7200"));
     }
 

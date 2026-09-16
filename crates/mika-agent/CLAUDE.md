@@ -478,8 +478,77 @@ Token via `Settings::resolve_github_token` (PAT-first, App fallback — posting 
 reviewer is not an operation whose author GitHub reads in the ADR-008 sense), and
 the mika#2205 structural guard covers this fourth scan. `PeriodicScan` gained a
 variant, so `mika2334_every_scan_variant_is_covered` makes the next one fail to
-compile until the guards enumerate it. Config, kill-switch and the five operator
+compile until the guards enumerate it. Config, kill-switch and the operator
 grep signals: root `CLAUDE.md` § *Optional (QA-review reconciliation — mika#2334)*.
+
+#### The ledger decides (mika#2347)
+
+**What mika#2334 left open, and it is readable in the code alone.** Its only
+idempotence terms were *no request* and *no review* for `REVIEWER_FORGE_LOGIN` —
+two **GitHub states that exist only once the review has concluded**. A PR whose
+review turn dies without posting anything therefore fell back into the population
+on the next tick, identical to itself: with the `0 */15 * * * *` cron and the
+then-default cap of 3, up to **96 re-requests per day per PR** across the seven
+days of `MAX_AGE`. The `qa_review_reconciled` audit row was written and **never
+read back** — the ledger existed and decided nothing.
+
+**The key carries the head SHA.** `PrSnapshot` gained `head_ref_oid` (requested in
+`--json`, **no `#[serde(default)]`**, empty value treated as unreadable and takes
+the PR *out* of the population), and the audit key became
+`pr:{repo}#{n}@{sha}` — the exact form `ci_success_handler` already uses for its
+durable dedup (mika#1869). The operator query is unchanged and the `pr:{repo}#{n}`
+prefix is preserved. **A new SHA reopens the budget by itself**: the key changes,
+the count restarts — the "per (PR, SHA)" idempotence obtained from the shape of
+the key rather than from one more column.
+
+**Two bounds, read through `count_recent_audit_events_for_target` — no new DB
+method, no migration.** `review_ledger_verdict` answers `Postable` / `Cooldown` /
+`Abandoned{attempts}` / `Unreadable`: a pose inside `COOLDOWN_SECS` skips the PR
+for that tick; `MAX_ATTEMPTS` poses inside the `MAX_AGE` window abandon that SHA
+for good. **The budget is what separates this fix from a slowdown** — a cooldown
+alone replays for ever, just less often. Direct precedent, cited in the code:
+`MIKA_AUTO_PULL_MAX_REDRIVES` (mika#2020), born of mika#1901 receiving the `ready`
+label sixteen times in nineteen hours. Legacy rows (`pr:{repo}#{n}`, no SHA) are
+consulted by a **second exact query**, never a `LIKE` — which would match `#234`
+against `#2343`; that query is dated in the code and can go once every pre-fix row
+is older than `MAX_AGE`.
+
+**Fail-closed, the inverse of `ci_success_handler`.** An unreadable
+`audit_events` refuses the pose (`qa_review_reconcile_ledger_unreadable`, WARN,
+**must stay empty**). Same choice as `wip_rescue` (mika#2199) and for the reason
+written there: a false negative makes a PR wait, which is what it did before
+mika#2334 anyway; a false positive replays a review, i.e. produces the very defect
+this closes.
+
+**The truncation moved, and that is a contract change.** `select_prs_needing_review`
+no longer truncates to `max_per_tick`; the caller truncates **after** the cooldown
+filter. Left upstream, `max_per_tick` PRs in cooldown would consume the whole tick
+and a fourth, legitimately recoverable one would never be seen — a cap on *skips*
+instead of a cap on *writes*. The tick budget is debited on **attempted poses**
+only; the inverse rule already written (a *failed* pose does debit) is unchanged.
+`MAX_PER_TICK` default drops **3 → 1**: 4 requests/hour against a measured
+capacity of 6 reviews/hour (600 s envelope, serialized execution), the one setting
+here whose effect is arithmetically demonstrable.
+
+**Serialization (AC4) is an engine invariant, pinned rather than implemented.**
+The scan triggers no turn: it posts a reviewer, and the resulting
+`review_requested` falls into the mika#1870 bounded queue, drained by **one worker
+per agent** taking `agent_lock`. Writing a concurrency lock inside
+`qa_review_reconcile` would be a placebo — the scan holds no turn.
+`test_qa_review_reconcile_2347.rs` pins it two ways: behaviourally (two
+`review_requested` never coalesce and drain in order) and structurally (one
+`spawn_webhook_drain_worker` definition, exactly two spawn sites, and
+`run_agent_for_message` *receiving* the guard rather than taking it). A behavioural
+test alone cannot see that class: a second consumer would make no decision wrong,
+it would lift the invariant in silence.
+
+**What this fix does NOT prove.** The ticket's hourly evidence is not compatible
+with the reconciler as the sole source of the churn — two `hold[review]` eleven
+minutes apart cannot come from a fifteen-minute scan, and the first `hold` **is a
+posted review**, which takes the PR out of the population on the next tick.
+`pull_request.synchronize`, the `check_suite` fan-out and a queue replay remain in
+play and are out of scope. This reduces the number of reviews *requested*; it makes
+no turn faster.
 
 **What kept it inert for a day, and where that is fixed: mika#2337.** The scan
 shipped complete — the registration literal and the match arm are two literals of

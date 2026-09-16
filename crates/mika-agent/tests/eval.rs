@@ -103,6 +103,10 @@ mod eval {
     // mika#2334 — la revue ne dépend plus d'un `pull_request.opened` que rien
     // ne rejoue : l'incident rejoué, plus les trois faits de câblage.
     mod test_qa_review_reconcile_2334;
+
+    // mika#2347 — le ledger devient décisionnel : cooldown et budget keyés
+    // (dépôt, PR, head SHA), plus l'invariant « un tour par agent » épinglé.
+    mod test_qa_review_reconcile_2347;
     mod test_ready_label_blocked_skip;
     mod test_ready_label_grooming_guard;
     mod test_real_provider_matrix;
