@@ -79,6 +79,48 @@ from the latency column of errors. **If a fresh signature appears at 240 s /
 model of the failure is wrong, not that the value is too low. Capture the
 baseline before deploying: `prune_old_llm_calls` purges old rows.
 
+**Observability + boot guard (mika#2293).** mika#2189 made the pair settable and
+left it unobservable, and the two failures that follow from that are closed here.
+
+*The pair is now said out loud.* `llm_budget_resolved` (INFO, **ungated** by
+`MIKA_STORE_LLM_CALLS`) is emitted at `server::init_agent` and per team run in
+`teams::engine` — the two callers that already hold the agent's name, rather than
+widening `create_provider_with_budget`, a free function that knows neither agent
+nor home. It carries `agent_id`, both values, `max_attempts`,
+`worst_case_failure_secs`, and the **provenance** of each half. That last field is
+the point: `agent_config` at 240 means the setting is in force and the cause of a
+cut is elsewhere; `process_env` means a fleet-wide variable is shadowing the
+per-agent file; `default` means the file was never read or never carried the key.
+Three remedies, and none of them is deducible from a plafond someone raised — which
+is why mika-arch's `240/900`, shipped 2026-09-06, could fail in silence until the
+2026-09-11 measurement. Deduplicated on the resolved pair, so a repetition is silent
+and a **change** is re-emitted. **Deliberate blind spot, written at the emission
+site:** the per-skill `[llm]` override path (`agent_loop`'s `make_provider_for`,
+one provider per override) emits nothing — the question is an agent's *nominal*
+budget, not what a skill overrides for one turn. Reader lives in
+`mika_common::llm::budget_provenance` (see `mika-common/CLAUDE.md` for why the
+cascade is rebuilt rather than recorded, and why its inverted order is pinned).
+
+*A half-configured pair now fails at boot.* `server::budget_guard::assert_llm_budgets_valid`
+runs in `run_server` after `provision_well_known_agents` (which writes the
+`config.toml` carrying the pair) and before any agent is initialized, over the same
+`servable_agent_names` population as `tier_guard`. It refuses startup naming the
+agent, both values, their provenance and the key to fix. **The failure it closes:**
+`MIKA_LLM_HTTP_TIMEOUT_SECS=300` on the service without raising the envelope gives
+mika-dev and mika-qa `cap = 300 >= envelope = 300` — no LLM call ever again — while
+**mika-arch survives** on its own `config.toml`'s 900. Two agents silent, a third
+answering: the shape that looks least like a configuration mistake and gets blamed
+on the provider most readily, which is the misreading mika#2293 exists to correct.
+Pre-existing violations get **no grace period and that costs nothing** — such an
+agent could not make an LLM call anyway, so the guard moves an existing failure from
+the first call to startup and makes it legible. It corrects no value and invents
+none. It also **precedes** mika#1660's panic rather than replacing it: the `None`
+path of the plafond goes through `llm::http_timeout_secs()`, which aborts on an
+unparseable or below-floor value without naming the agent or the cascade door, so
+the guard reads the raw values through the non-panicking `BudgetProvenance` the
+observability half already writes. The panic stays for unguarded paths — a `mika`
+CLI reaching it still panics exactly as before.
+
 Tool call summaries (name, truncated input/output, success, non_zero_exit) persisted in `messages.metadata` JSON column for cross-turn introspection (capped at `TOOL_METADATA_MAX = 4000` chars — tail entries dropped when exceeded, #744). The `tool_calls` DB table is the authoritative source; the dashboard's inline `ToolCallsTable` fetches from `GET /api/v1/traces/:trace_id/tool-calls` with metadata as fallback for pre-v15 messages. `MessageResponse` exposes `trace_id: Option<String>` to enable this lookup. `non_zero_exit` is set by heuristic detection of `Exit code:` / `Killed by signal:` prefixes from exec handlers; history builder tags these with `[NON-ZERO]` (distinct from `[FAILED]`). History builder appends `<context type="tool_history">` blocks to assistant messages.
 
 Compaction includes tool names in summarization. Multi-modal tool results: `ToolOutput` carries optional `images: Vec<ImageData>` (base64-encoded), converted to multi-block `tool_result` content arrays for the Claude API. Prior-turn images are stripped before each API call to prevent unbounded memory growth.

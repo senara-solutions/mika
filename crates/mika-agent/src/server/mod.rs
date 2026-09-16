@@ -1,6 +1,7 @@
 mod a2a;
 pub mod a2a_wait_queue;
 mod auth;
+pub mod budget_guard;
 pub mod check_suite_dedup;
 pub mod checkpoint;
 pub mod ci_failure_handler;
@@ -447,6 +448,17 @@ async fn init_agent(
     // is added LAST, so this daemon's own environment cannot shadow an identity
     // secret an agent set for itself. See `Settings::load_for_agent`.
     let agent_settings = Settings::load_for_agent(global_home, agent_home)?;
+    // mika#2293 — say which plafond/envelope this agent actually got, and
+    // through which door of the cascade. Emitted HERE, where the agent's name
+    // is already in hand, rather than inside `create_provider_with_budget`,
+    // which is a free function that knows neither agent nor home (F2). Before
+    // `make_llm_provider` on purpose: a pair so broken that provider
+    // construction refuses is exactly the case whose budget we want on record.
+    //
+    // Out of scope, and deliberately: the per-skill `[llm]` override path
+    // (`agent_loop`'s `make_provider_for`) emits nothing. mika#2293 asks about
+    // an agent's *nominal* budget, not what a skill overrides for one turn.
+    mika_common::llm::log_llm_budget_resolved(agent_name, global_home, agent_home);
     let github_token = agent_settings.agent_github_token().map(String::from);
     let agent_llm = agent_settings.make_llm_provider()?;
     let db_path = home::container_db_path(global_home);
@@ -737,6 +749,15 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
             settings.disable_agent_provisioning,
         );
     }
+
+    // mika#2293 — boot-time refusal of a half-configured `(plafond, envelope)`
+    // pair. Runs here, after provisioning has written the per-agent
+    // `config.toml` that carries the pair and before any agent is initialized:
+    // scanning earlier would validate the previous boot's state. Fails startup
+    // rather than letting half the fleet go silent at its first LLM call while
+    // the other half keeps answering — the failure shape that reads like a
+    // provider outage and is not one.
+    budget_guard::assert_llm_budgets_valid(global_home)?;
 
     // Warn if embedded dashboard is enabled but no assets were compiled in
     if settings.dashboard_enabled && !embedded_dashboard::has_embedded_assets() {

@@ -458,6 +458,82 @@ Optional (LLM timeout budgets — mika#2189):
   which grew 54 KB → 59.8 KB on 2026-09-01 and is the proximate reason this agent
   crossed the line when the fleet had been bleeding since at least 08-27.
 
+Observabilité du budget effectif + garde de demi-configuration (mika#2293) :
+- **Ce que mika#2189 ne pouvait pas dire.** Le couple `240/900` a été donné à
+  mika-arch le 06/09 ; la mesure du 11/09 voyait toujours des coupures à **120 s
+  pile**, le défaut de flotte. Quelque chose annulait le réglage, et **aucune ligne
+  de journal ne pouvait dire quoi** : rien n'exposait le couple réellement en
+  vigueur pour un agent donné. C'est ce trou qui a laissé un réglage livré le 06
+  échouer en silence jusqu'au 11 — et qui aurait avalé le suivant de la même façon.
+  *Un réglage qu'on ne peut pas observer n'est pas un réglage, c'est un espoir.*
+- **`llm_budget_resolved` (INFO, ungated).** Émis à l'initialisation de chaque
+  agent (`server::init_agent`) et par run d'équipe (`teams::engine`) — les deux
+  sites qui connaissent déjà l'agent, plutôt qu'en élargissant la signature de
+  `create_provider_with_budget`, qui est une fonction libre sans agent ni home.
+  Champs : `agent_id`, `http_timeout_secs`, `agent_total_timeout_secs`,
+  `max_attempts`, `worst_case_failure_secs`, `http_source`, `total_source`,
+  `http_raw`, `total_raw`. **Indépendant de `MIKA_STORE_LLM_CALLS`** : c'est un
+  événement de *configuration*, pas de télémétrie d'appel, et il doit rester
+  lisible précisément quand on a coupé la télémétrie pour réduire le bruit.
+  Dédupliqué sur le couple résolu — une répétition à l'identique est tue, un
+  **changement** est ré-émis (la déduplication borne la répétition, elle ne
+  subordonne l'événement à aucun réglage).
+- **La provenance sépare trois mondes, et c'est tout son objet.**
+  `grep llm_budget_resolved $MIKA_SPIRIT_LOG_FILE | jq '{agent_id, http_timeout_secs, http_source}'` :
+  `agent_config` à 240 → le réglage est bien en vigueur, la cause est ailleurs, **ne
+  touchez pas aux valeurs** ; `process_env` → une variable fleet-wide écrase le
+  `config.toml` per-agent, le remède est de la **retirer de l'environnement du
+  service** ; `default` → le `config.toml` n'a pas été lu ou ne porte pas la clé
+  (provisionnement gelé derrière `MIKA_DISABLE_AGENT_PROVISIONING` ou `dev_mode`),
+  le remède est un geste de provisionnement. Aucun des trois ne se déduit d'un
+  plafond qu'on remonte. Cinquième valeur `global_config`, distincte d'`agent_config`
+  à dessein : répondre « per-agent » pour une valeur venant du `~/.mika/config.toml`
+  partagé répondrait faux à la seule question que l'instrument existe pour trancher.
+- **La cascade est reconstruite, pas devinée — et l'ordre est INVERSÉ.** `Settings` a
+  déjà fusionné ses sources quand on lit le champ, donc `llm::budget_provenance`
+  refait la résolution pour ces deux clés seulement, dans l'ordre réel :
+  `.env` per-agent > env du process > `config.toml` per-agent > `config.toml` global
+  > constante (mika#2218). Une reconstruction qui supposerait l'ordre usuel
+  rapporterait une provenance **fausse**, ce qui est strictement pire qu'aucune
+  provenance. La duplication est **épinglée** par
+  `mika2293_reconstruction_equals_load_for_agent_on_every_cascade_position`, qui
+  compare la valeur reconstruite à celle fusionnée par `Settings::load_for_agent` sur
+  les quatre positions : le jour où l'ordre change dans `config.rs`, ce test rougit
+  au lieu de laisser la provenance dériver en silence.
+- **Garde de démarrage : la demi-configuration échoue bruyamment.**
+  `server::budget_guard::assert_llm_budgets_valid` refuse le démarrage quand un agent
+  porte un couple invalide, en nommant l'agent, les deux valeurs, leur provenance et
+  la clé à corriger. Elle tourne dans `run_server` après le provisionnement (qui
+  écrit le `config.toml` porteur du couple) et avant toute initialisation d'agent.
+  **Le mode de panne qu'elle ferme :** poser `MIKA_LLM_HTTP_TIMEOUT_SECS=300` sur le
+  service *sans* lever l'enveloppe donne à mika-dev et mika-qa `cap = 300 >= envelope
+  = 300` — plus aucun appel LLM pour eux — pendant que **mika-arch survit** (son
+  `config.toml` pose 900, qu'aucune variable n'écrase). Deux agents se taisent, un
+  troisième répond : la forme de panne qui ressemble le moins à une erreur de
+  configuration, et qu'on impute le plus volontiers au fournisseur. **Aucune
+  tolérance pour les couples invalides pré-existants, et ça ne coûte rien** : un
+  couple invalide empêchait déjà tout appel LLM, donc la garde ne casse rien qui
+  marchait — elle avance l'échec du premier appel au démarrage et le rend lisible.
+  Elle ne corrige aucune valeur et n'en invente aucune.
+- **Elle devance la panique de mika#1660, elle ne la remplace pas.** La voie `None`
+  du plafond passe par `llm::http_timeout_secs()`, qui **panique** sur une valeur
+  non-parsable ou sous `MIN_HTTP_TIMEOUT_SECS` — sans nommer l'agent ni la porte de
+  la cascade, ce qui est toute la valeur d'une garde sur une flotte de quatre. La
+  garde lit donc les valeurs brutes par le lecteur non-paniquant que la brique
+  d'observabilité écrit déjà (aucune duplication), et couvre cette classe-là. La
+  panique reste en place pour les chemins non gardés : un `mika` CLI qui l'atteint
+  panique exactement comme avant.
+- **Angle mort assumé, écrit au site d'émission :** le chemin per-skill
+  (`agent_loop`'s `make_provider_for`, un provider par override `[llm]`) **n'émet
+  rien**. La question du ticket porte sur le budget **nominal** de l'agent, pas sur
+  ce qu'une skill surcharge le temps d'un tour.
+- **Ce que ce travail ne fait PAS :** il ne change aucune valeur. Le défaut de flotte
+  reste `120/300`, mika-arch reste à `240/900`. Le recalibrage demandé par le ticket
+  est **conditionné à une mesure post-mika#2295** (qui a corrigé la charge dont la
+  latence du 11/09 était le symptôme) et passera par le `config.toml` per-agent, pas
+  par une variable d'environnement fleet-wide — voir la garde ci-dessus pour
+  pourquoi.
+
 Optional (dispatch concurrency cap — mika#2160):
 - `MIKA_DISPATCH_MAX_CONCURRENT_IMPLEMENT` — How many `implement` dispatches may be
   in flight at once for one agent (default `1`). Three-tier parse, the same shape as

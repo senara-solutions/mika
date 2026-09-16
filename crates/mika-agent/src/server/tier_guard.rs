@@ -205,7 +205,10 @@ pub fn check_agent_tier_consistency(
 /// the looser-consequence side of the disagreement, so this takes the union:
 /// anything `list_agents` finds, plus any directory under `agents/` carrying an
 /// `identity.toml`.
-fn servable_agent_names(home_dir: &Path) -> Vec<String> {
+/// `pub(crate)` since mika#2293: the LLM-budget boot guard scans the same
+/// population, and two copies of "which agents will this process serve?" would
+/// drift the day one of them learned about a new layout.
+pub(crate) fn servable_agent_names(home_dir: &Path) -> Vec<String> {
     let mut names: std::collections::BTreeSet<String> = mika_common::agent::list_agents(home_dir)
         .into_iter()
         .collect();

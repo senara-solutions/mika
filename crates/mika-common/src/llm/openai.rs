@@ -147,7 +147,11 @@ struct OpenAiErrorDetail {
 const MAX_RETRIES: u32 = 3;
 
 /// Attempts the chain permits at most: the initial call plus [`MAX_RETRIES`].
-const MAX_ATTEMPTS_HARD_CAP: u32 = MAX_RETRIES + 1;
+///
+/// `pub(crate)` since mika#2293 so `budget_provenance` reports the same ceiling
+/// the rail actually runs under, instead of posing a second copy of 4 beside
+/// this one.
+pub(crate) const MAX_ATTEMPTS_HARD_CAP: u32 = MAX_RETRIES + 1;
 
 use super::LlmTimeoutBudget;
 
