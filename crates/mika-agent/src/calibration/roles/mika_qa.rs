@@ -14,7 +14,9 @@ use mika_common::llm::LlmProvider;
 
 use crate::calibration::failure::FailureClass;
 use crate::calibration::role::{RoleScenario, RoleScenarioResult};
-use crate::calibration::roles::llm_error_result;
+use crate::calibration::roles::{
+    CALIBRATION_QA_VERDICT_BODY_MAX_TOKENS, CALIBRATION_SCENARIO_MAX_TOKENS, llm_error_result,
+};
 
 /// Static scenario definitions for the mika-qa role.
 pub const SCENARIOS: &[RoleScenario] = &[
@@ -136,7 +138,7 @@ async fn run_verdict_format_precision(
             content: LlmContent::Text(fixture.to_string()),
         }],
         tools: None,
-        max_tokens: 2000,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
@@ -255,7 +257,7 @@ async fn run_per_ac_enumeration(
             content: LlmContent::Text(fixture.to_string()),
         }],
         tools: None,
-        max_tokens: 2000,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
@@ -364,7 +366,7 @@ async fn run_absence_claim_grounding(
             content: LlmContent::Text(fixture.to_string()),
         }],
         tools: None,
-        max_tokens: 2000,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
@@ -459,7 +461,7 @@ async fn run_wip_rescue_skip(provider: Arc<dyn LlmProvider>, start: Instant) -> 
             content: LlmContent::Text(fixture.to_string()),
         }],
         tools: None,
-        max_tokens: 2000,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
@@ -538,7 +540,7 @@ async fn run_no_fabricated_fix(
             content: LlmContent::Text(fixture.to_string()),
         }],
         tools: None,
-        max_tokens: 2000,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
@@ -574,7 +576,7 @@ async fn run_no_fabricated_fix(
             content: LlmContent::Text(fixture.to_string()),
         }],
         tools: None,
-        max_tokens: 2000,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
@@ -731,7 +733,7 @@ async fn run_duplicate_claim_grounded(
             content: LlmContent::Text(fixture.to_string()),
         }],
         tools: None,
-        max_tokens: 2000,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
@@ -841,7 +843,7 @@ async fn run_verdict_format_canonical_shape(
             content: LlmContent::Text(fixture.to_string()),
         }],
         tools: None,
-        max_tokens: 2000,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
@@ -1009,12 +1011,17 @@ async fn run_negative_test_invariant_gate(
         }],
         tools: None,
         // The production prompt asks for a full verdict body (VERDICT/DEPTH/REASON +
-        // NEGATIVE-TEST + DIFF ANALYSIS + PLAN-AC VERIFICATION). The 2000-token budget
-        // the shorter scenarios use is not enough here: mika-qa's model is a reasoning
+        // NEGATIVE-TEST + DIFF ANALYSIS + PLAN-AC VERIFICATION). The budget the
+        // shorter scenarios use is not enough here: mika-qa's model is a reasoning
         // model, and a first run at 2000 spent the whole budget on `reasoning_content`,
         // returning empty text. mika-qa itself runs at 16384 (`~/.mika/agents/mika-qa/
         // config.toml`); 12000 leaves room for reasoning plus the body.
-        max_tokens: 12000,
+        //
+        // mika#2296: this is the single named exception to the shared scenario
+        // budget. Uniformising it would be a regression on the one scenario that
+        // measured its own need. `mika2296_*` in `roles::tests` fails the day the
+        // shared budget catches up, demanding this constant's removal.
+        max_tokens: CALIBRATION_QA_VERDICT_BODY_MAX_TOKENS,
         thinking: None,
     };
 

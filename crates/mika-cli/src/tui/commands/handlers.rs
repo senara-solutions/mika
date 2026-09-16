@@ -1944,11 +1944,19 @@ mod tests {
     async fn test_provider_switch_warns_max_tokens() {
         let (mut app, _rx, tmp) = test_app().await;
 
-        // Set up: llm_max_tokens exceeds DeepSeek's 8192 limit
+        // Set up: llm_max_tokens exceeds DeepSeek's limit.
+        //
+        // mika#2296 T4b — this test holds the BEHAVIOUR (a budget above the
+        // provider's ceiling still warns), not the value. Its fixture was 16384
+        // only because the ceiling was 8192; at 65_536 that fixture no longer
+        // exceeds anything and the warning would legitimately stop firing. It
+        // moves with the constant rather than being discovered red, which is why
+        // it is a distinct test from the `max_output_tokens` pin. 131072 is the
+        // hard bound of `validation.rs:110` — the largest value still legal.
         let config_path = tmp.path().join("config.toml");
         std::fs::write(
             &config_path,
-            "llm_provider = \"anthropic\"\nllm_max_tokens = 16384\n",
+            "llm_provider = \"anthropic\"\nllm_max_tokens = 131072\n",
         )
         .unwrap();
         let env_path = tmp.path().join(".env");
@@ -2030,7 +2038,9 @@ mod tests {
     #[test]
     fn test_max_output_tokens_known_providers() {
         // Verify key providers have sensible limits
-        assert_eq!(ProviderKind::DeepSeek.max_output_tokens(), 8_192);
+        // mika#2296: was 8_192 (the R1-era figure). See the derivation at
+        // `ProviderKind::max_output_tokens` and `llm::tests`.
+        assert_eq!(ProviderKind::DeepSeek.max_output_tokens(), 65_536);
         assert_eq!(ProviderKind::Anthropic.max_output_tokens(), 128_000);
         assert_eq!(ProviderKind::OpenAi.max_output_tokens(), 16_384);
         assert_eq!(ProviderKind::Groq.max_output_tokens(), 8_192);

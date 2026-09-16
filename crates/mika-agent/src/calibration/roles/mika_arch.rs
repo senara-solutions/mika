@@ -13,7 +13,7 @@ use mika_common::llm::LlmProvider;
 
 use crate::calibration::failure::FailureClass;
 use crate::calibration::role::{RoleScenario, RoleScenarioResult};
-use crate::calibration::roles::llm_error_result;
+use crate::calibration::roles::{CALIBRATION_SCENARIO_MAX_TOKENS, llm_error_result};
 
 /// Static scenario definitions for the mika-arch role.
 pub const SCENARIOS: &[RoleScenario] = &[
@@ -146,7 +146,7 @@ async fn run_groom_ticket_basic(
             content: LlmContent::Text(fixture.to_string()),
         }],
         tools: None,
-        max_tokens: 2000,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
@@ -214,7 +214,7 @@ async fn run_groom_milestone(provider: Arc<dyn LlmProvider>, start: Instant) -> 
             content: LlmContent::Text(fixture.to_string()),
         }],
         tools: None,
-        max_tokens: 3000,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
@@ -282,7 +282,7 @@ async fn run_citation_discipline(
             content: LlmContent::Text(fixture.to_string()),
         }],
         tools: None,
-        max_tokens: 1500,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
@@ -356,7 +356,7 @@ async fn run_disposition_keyword(
             content: LlmContent::Text(fixture.to_string()),
         }],
         tools: None,
-        max_tokens: 2000,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
@@ -430,7 +430,7 @@ async fn run_required_finding_list(
             content: LlmContent::Text(fixture.to_string()),
         }],
         tools: None,
-        max_tokens: 2000,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
@@ -518,7 +518,7 @@ async fn run_groomed_no_tbds_passes(
             )),
         }],
         tools: None,
-        max_tokens: 2000,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
@@ -600,7 +600,7 @@ async fn run_groomed_with_tbd_rejected(
             )),
         }],
         tools: None,
-        max_tokens: 2000,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
@@ -714,7 +714,7 @@ async fn run_groomed_with_placeholder_path_rejected(
             )),
         }],
         tools: None,
-        max_tokens: 2000,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
@@ -832,7 +832,7 @@ async fn run_fire_disposition_gate(
             )),
         }],
         tools: None,
-        max_tokens: 2000,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
@@ -992,7 +992,7 @@ async fn run_review_anchor_attestation(
             content: LlmContent::Text(fixture.to_string()),
         }],
         tools: None,
-        max_tokens: 2000,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
         thinking: None,
     };
 
