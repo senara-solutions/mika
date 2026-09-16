@@ -351,9 +351,18 @@ pub async fn dispose_superseded_dispatch_processes(
 /// Deliberately a positive list of terminal states rather than `!= pending &&
 /// != in_progress`: an unknown status must read as *not terminal*, so a state
 /// added later is still disposed of rather than silently spared.
+///
+/// Written with the `task_status` constants rather than bare literals, for the
+/// reason their own module gives: a typo in a status string compiles and then
+/// spares a live pilot in silence.
 fn is_terminal_status(status: &str) -> bool {
+    use crate::task_engine::types::task_status;
     matches!(
         status,
-        "delivered" | "completed" | "cancelled" | "failed" | "expired"
+        task_status::DELIVERED
+            | task_status::COMPLETED
+            | task_status::CANCELLED
+            | task_status::FAILED
+            | task_status::EXPIRED
     )
 }

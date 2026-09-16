@@ -502,6 +502,22 @@ enum PilotLiveness {
     Unknown,
 }
 
+impl PilotLiveness {
+    /// How much this answer outranks another when a parent carries several
+    /// PID-bearing children. Higher wins. `Unverifiable` sits **above** `Dead`
+    /// on purpose: a dead child was checked and is gone, an unverifiable one
+    /// might be running and we cannot tell — and "might be running" is the
+    /// answer an operator about to cancel needs to see.
+    fn rank(&self) -> u8 {
+        match self {
+            PilotLiveness::Alive { .. } => 3,
+            PilotLiveness::Unverifiable { .. } => 2,
+            PilotLiveness::Dead { .. } => 1,
+            PilotLiveness::NoPilot | PilotLiveness::Unknown => 0,
+        }
+    }
+}
+
 fn short(id: &str) -> &str {
     &id[..12.min(id.len())]
 }
@@ -556,27 +572,34 @@ async fn probe_pilot_liveness(db: &AsyncDatabase, settings: &Settings, t: &Task)
         Err(_) => return PilotLiveness::Unknown,
     };
 
-    // A parent can have several PID-carrying children across retries. One live
-    // child is the answer; report the last non-live one only if none is alive,
-    // so a dead predecessor never masks a running pilot.
+    // A parent can carry several PID-bearing children across retries, so the
+    // answers must be ranked rather than overwritten: **alive > unverifiable >
+    // dead > none**. A live child is the answer outright. Failing that, an
+    // *unverifiable* child outranks a dead one — we checked the dead one and it
+    // is gone, whereas the unverifiable one might be running and we cannot tell.
+    // Letting a later dead child overwrite an earlier unverifiable one would
+    // print "no live pilot" over a genuine unknown, which is the fail-safe
+    // inversion this whole ticket exists to remove.
     let mut fallback = PilotLiveness::NoPilot;
     for child in children {
-        let Some(start_time) = child.process_start_time else {
-            fallback = PilotLiveness::Unverifiable {
+        let candidate = match child.process_start_time {
+            Some(start_time) => classify(
+                child.process_id,
+                Some(child.id.clone()),
+                start_time,
+                settings,
+                &child.id,
+            ),
+            None => PilotLiveness::Unverifiable {
                 pid: child.process_id,
                 child_id: Some(child.id),
-            };
-            continue;
+            },
         };
-        match classify(
-            child.process_id,
-            Some(child.id.clone()),
-            start_time,
-            settings,
-            &child.id,
-        ) {
-            alive @ PilotLiveness::Alive { .. } => return alive,
-            other => fallback = other,
+        if matches!(candidate, PilotLiveness::Alive { .. }) {
+            return candidate;
+        }
+        if candidate.rank() > fallback.rank() {
+            fallback = candidate;
         }
     }
     fallback
@@ -891,6 +914,36 @@ mod tests {
         assert_eq!(
             summary_annotation("callback", "pending", &PilotLiveness::NoPilot),
             " [queued]"
+        );
+    }
+
+    /// A parent carrying several PID-bearing children must report the SAFEST
+    /// answer, not the last one scanned. `Unverifiable` outranks `Dead`: a dead
+    /// child was checked and is gone, an unverifiable one might be running —
+    /// and printing "no live pilot" over a genuine unknown is exactly the
+    /// fail-safe inversion that cost a working pilot on 2026-09-15.
+    #[test]
+    fn an_unverifiable_child_outranks_a_dead_one() {
+        let dead = PilotLiveness::Dead {
+            pid: 1,
+            child_id: None,
+        };
+        let unverifiable = PilotLiveness::Unverifiable {
+            pid: 2,
+            child_id: None,
+        };
+        let alive = PilotLiveness::Alive {
+            pid: 3,
+            child_id: None,
+            idle_secs: None,
+        };
+        assert!(unverifiable.rank() > dead.rank());
+        assert!(alive.rank() > unverifiable.rank());
+        assert!(dead.rank() > PilotLiveness::NoPilot.rank());
+        assert_eq!(
+            PilotLiveness::Unknown.rank(),
+            PilotLiveness::NoPilot.rank(),
+            "ni l'un ni l'autre ne doit jamais écraser une réponse mesurée"
         );
     }
 
