@@ -113,6 +113,11 @@ mod eval {
     // mika#2279 — un `labeled ready` répété sur un ticket dont le pilote est vif
     // est un NO-OP : processus réel, topologie parent/enfant de production.
     mod test_ready_label_live_pilot_noop_2279;
+
+    // mika#2279 — le terme sur lequel repose le filtre 4b d'`auto_pull`, mesuré
+    // sur un processus réellement tué et récolté (la décision elle-même est
+    // épinglée in-crate, là où vit son classifieur).
+    mod test_auto_pull_live_pilot_filter_2279;
     mod test_real_provider_matrix;
 
     // mika#2337 — un trigger enregistré a un destinataire (garde de classe),
