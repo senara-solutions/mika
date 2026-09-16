@@ -40,7 +40,9 @@ The provisioning system follows a two-phase design to work within the existing s
 
 2. **Deny by default:** With the allowlist pattern, new bundled skills are automatically denied unless explicitly added to an agent's allowlist. This is the correct default for well-known agents — new skills should be consciously assigned, not silently inherited.
 
-3. **`disable_agent_provisioning` env var:** Follows the `MIKA_DISABLE_BUNDLED_SKILLS` pattern. When true, prevents file creation/overwrite even when `dev_mode = true`. Allows manual edits to soul.md and identity.toml to persist across deploys.
+3. **`disable_agent_provisioning` env var:** Follows the `MIKA_DISABLE_BUNDLED_SKILLS` pattern. When true, no well-known agent is created and no `config.toml` is rewritten, even with `dev_mode = true`. Manual edits to `soul.md` and to the **operator-owned** parts of `identity.toml` (`name`, `emoji`, `[reflection]`, `[kg]`) persist across deploys.
+
+   **Since mika#2330 the flag does NOT freeze code-owned identity sections.** `reconcile_well_known_identity` still runs under the flag; only `reconcile_well_known_config` and agent creation are suppressed. The earlier all-or-nothing behaviour is what made mika#2327's `[context.history]` merge and stay inert in production — the operator was freezing `config.toml` (which `reconcile_well_known_config` replaces whole, clobbering hand-picked models) and silently paid for the identity half too. A hand edit inside a path listed in `CODE_OWNED_IDENTITY_SECTIONS` is now overwritten at the next startup, and named in `reconciled_paths` on `identity_reconcile.complete`.
 
 4. **Gate `seed_well_known_skill_overrides` on `dev_mode`:** The skill override seeding must be gated on `dev_mode` at the call site, not just inside the function. Without this gate, a user who manually names an agent "mika-dev" outside dev mode would have skills silently disabled.
 
