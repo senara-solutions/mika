@@ -5777,6 +5777,18 @@ fn collect_review_anchor_contract(matched: &[MatchedSkill<'_>]) -> ReviewAnchorC
     contract
 }
 
+/// The last three non-empty lines of a response, last first — the window every
+/// disposition guard in this chain reads (mika#864 suffix-line guard, mika#901 F-list guard,
+/// mika#2037 review-anchor guard). One definition so the guards cannot disagree about where
+/// "the end of the message" is.
+fn last_three_non_empty_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .rev()
+        .take(3)
+}
+
 /// Disposition lines that are terminal — they require an F-list (mika#901) and are never
 /// forged into an approval. Everything else a skill declares (`Disposition: READY`,
 /// `Verdict: GROOMED`) is non-terminal and owes an attestation instead (mika#2037).
@@ -5851,15 +5863,8 @@ fn escalate_unattested_disposition(
     // The disposition being withdrawn: the non-terminal declared line in the same last-3
     // window `has_declared_disposition` reads. The guard only calls this after that predicate
     // held, so the window carries one.
-    let withdrawn = text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .take(3)
-        .find(|line| non_terminal_declared.contains(line))?;
+    let withdrawn =
+        last_three_non_empty_lines(text).find(|line| non_terminal_declared.contains(line))?;
     let escalate = escalate_line_of_family(withdrawn)?;
     if !is_declared(&escalate) {
         return None;
@@ -5970,13 +5975,7 @@ const REVIEW_ANCHOR_GUARD_LABEL: &str = "review_anchor";
 /// anchor guard must not fire on it and demand an attestation for a verdict that was never
 /// claimed. Same last-3-non-empty-lines window as its siblings.
 fn has_declared_disposition(text: &str, required_suffix_lines: &[String]) -> bool {
-    text.lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .take(3)
+    last_three_non_empty_lines(text)
         .any(|line| required_suffix_lines.iter().any(|req| line == req.as_str()))
 }
 
@@ -5986,25 +5985,11 @@ fn has_declared_disposition(text: &str, required_suffix_lines: &[String]) -> boo
 /// Non-terminal: `Disposition: READY`, `Verdict: GROOMED`.
 /// Per mika#901 R1: F-list is required only on terminal dispositions.
 fn is_terminal_disposition(text: &str, required_suffix_lines: &[String]) -> bool {
-    // Scan the last 3 non-empty lines (same window as the suffix-line guard)
-    // for any terminal disposition match against the skill's declared suffix lines.
-    let last_non_empty: Vec<&str> = text
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .take(3)
-        .collect();
-
-    last_non_empty.iter().any(|line| {
-        // Only consider lines that are both in the skill's declared suffix set AND
-        // in the terminal disposition set.
-        required_suffix_lines
-            .iter()
-            .any(|req| *line == req.as_str())
-            && TERMINAL_DISPOSITIONS.contains(line)
+    // Same window as the suffix-line guard. Only lines that are both in the skill's
+    // declared suffix set AND in the terminal disposition set count.
+    last_three_non_empty_lines(text).any(|line| {
+        required_suffix_lines.iter().any(|req| line == req.as_str())
+            && TERMINAL_DISPOSITIONS.contains(&line)
     })
 }
 
