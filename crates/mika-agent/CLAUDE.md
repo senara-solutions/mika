@@ -481,6 +481,76 @@ variant, so `mika2334_every_scan_variant_is_covered` makes the next one fail to
 compile until the guards enumerate it. Config, kill-switch and the five operator
 grep signals: root `CLAUDE.md` § *Optional (QA-review reconciliation — mika#2334)*.
 
+**What kept it inert for a day, and where that is fixed: mika#2337.** The scan
+shipped complete — the registration literal and the match arm are two literals of
+the same commit — and never ran. Its first fire failed on
+`unknown run_skill trigger: qa_review_reconcile`, which only a binary *older* than
+that commit can emit, and the death did the rest. See § *Unknown-Trigger Veto Lift*
+below; the root cause (merged code ≠ running code) is not in this repo and is
+tracked as follow-up.
+
+### Unknown-Trigger Veto Lift (mika#2337)
+
+**The failure this closes is a veto, not a missing wire.** A `run_skill` recurrence
+whose trigger the running binary cannot route falls into `dispatch_run_skill`'s
+catch-all and dies `failed`. There is **no spam**: re-enqueue lives only in
+`fire_task`'s `Ok` arm, so a recurrence that fails is never rescheduled — the line
+dies once and goes quiet, which is why it took a day to notice. What the death
+leaves behind is the mika#1742 refuse-to-zombie veto, armed for
+`RECURRING_ZOMBIE_GRACE_HOURS` (24 h), whose only exit
+(`revert_config_cancel_recurring_task`) targets `status = 'cancelled'` and never
+lifts a veto born of a `failed`. **Every restart inside that window — including one
+carrying the correct binary — refuses to re-register.** The natural remedy is
+exactly what the state neutralises.
+
+**Why this class alone is exempt.** mika#1742 exists because a recurrence that
+kills the system must not re-arm on every restart. Here the premise does not hold:
+the binary that re-registers a trigger name is, by construction, the binary that
+carries its arm — so the death predicts nothing about the next one, and the veto
+only prolongs the outage it was meant to contain. mika#1742 is **not** disarmed in
+general: any other cause of death still arms it
+(`db::tests::mika2337_any_other_death_still_arms_the_veto`).
+
+**Mechanism, three writes.** (1) `DispatchError::UnknownTrigger { trigger }` — the
+class comes from the **variant**, never a substring on the rendered message; the
+message text itself is unchanged, so operator greps and log history keep working.
+(2) `fire_task` stamps `RECURRING_UNKNOWN_TRIGGER_PATH` on the row **before**
+`update_task_failed` (never an unmarked corpse, not even between two writes), emits
+the named `recurring_unknown_trigger` WARN instead of the generic
+`task dispatch failed` — indistinguishable from a network failure — and writes an
+`audit_events` row. The terminal state stays `failed`: what is corrected is its
+*consequence* on re-registration. (3) `create_recurring_task_if_absent` skips a
+marked dead sibling, and **spends** the lift in the same statement that honours it
+(marker removed, `RECURRING_UNKNOWN_TRIGGER_LIFT_CONSUMED_PATH` written). A
+**second** unknown-trigger death on the same label inside the window meets a fully
+armed veto — the lift buys one restart, not immunity. The consumed marker rides on
+the row it was spent on, so it ages out of the grace window with it and the
+exemption re-arms rather than being lost for good.
+
+**Not retroactive, and that is a stated bound.** A row that died *before* the
+stamping code existed carries no marker, so it stays a `dead_sibling`. mika#2337
+makes every **future** death repairable by restart; it does not retroactively
+unblock the one that caused it. Reading a
+`mika#1742: refusing to re-register` on `qa_review_reconcile` at the first
+post-deploy startup is that pre-existing row, **not** a regression — wait out the
+window, or clear the row by hand.
+
+**Guards.** `tests/eval/test_recurring_trigger_wiring_2337.rs` — a class guard
+asserting every **registered** trigger has an arm (population = the calls to
+`task_engine::ensure_recurring_task`, anchored on the *caller* rather than on the
+`{"trigger":"X"}` literal, which has three false members in the tree), plus a
+firing probe driving the recurrence through `TaskEngine::tick` with no network.
+`db::tests::mika2337_*` carry the veto behaviour. **Honest scope:** these close the
+**intra-binary** divergence; none of them would have caught the 2026-09-16 incident,
+which is a skew between merged and running code.
+
+**Operator surfaces.** `SELECT * FROM audit_events WHERE tool_name =
+'recurring_unknown_trigger'` — **must stay empty** in nominal operation; any row
+names a registered trigger a running binary does not know, i.e. a version skew.
+Grep `recurring_unknown_trigger` in `$MIKA_SPIRIT_LOG_FILE`. If
+`unknown run_skill trigger` reappears after a deploy, **do not touch the
+dispatcher** — establish the version of the running binary instead.
+
 ### Structural CI Failure Handler
 
 `server::ci_failure_handler` — intercepts `check_suite.completed(failure|timed_out)` webhook events **before** the LLM turn. Failure-side companion to `ci_success_handler`. Matches CI failures to open PRs and existing work items, fetches failing-job context (up to 3 jobs, 100 lines each), and constructs a pre-digest instructing the LLM to dispatch `run_claude_pilot` for an autonomous fix. Circuit breaker: `ci_fix_count >= 2` in task metadata triggers escalation instead of dispatch — the handler increments `ci_fix_count` deterministically (not reliant on LLM). Checks both task-level callback children and global dispatch guard, including results in the pre-digest. Reuses `VerdictAction`, `find_open_pr`, `run_gh_checks`/`classify_checks`, and `has_active_callback_child` from sibling modules. Also fixes `CHECK_SUITE_RE` regex in `webhook_queue.rs` to match actual gateway format (was `Check suite (failure)`, corrected to `Check suite failure`). Order-independent with other handlers. 30s timeout per subprocess call. See #594.

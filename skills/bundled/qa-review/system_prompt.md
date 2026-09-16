@@ -127,6 +127,8 @@ This step determines whether the PR is an auto-rescued dispatch-lib PR and, if s
    - The PR `isDraft` field is `false` (operator un-drafted it — this is a stronger signal than any body marker)
    - No marker is found at all (backward compatibility — pre-mika#1618 rescue PRs proceed normally)
 
+   *Scope of "operator un-drafted it"* (mika#2286): the `wip_rescue` daemon un-drafts too, so `isDraft: false` is not by itself a human gesture. It became trustworthy again only for the sensitive class — since mika#2286 the daemon un-drafts a DECISION-CORE rescue draft **only** on marker `yes`, otherwise it parks it (PR #2285 was the breach). It still un-drafts MECHANICAL at `no`, deliberately.
+
 5. **Route based on verification state:**
    - **Verified:** Note "Rescue PR (class: `<class>`), pipeline verified — proceeding to standard review." Continue to Step 2 normally. The rescue boilerplate text is not treated as a review gate.
    - **Not verified** (marker is `no` AND PR is still draft): Emit `hold[review]` with reason: "Auto-rescued PR (class: `<class>`) is still in draft with pipeline-verification marker set to `no`. Operator must verify pipeline completion and either mark the PR as Ready for Review or edit the body to set `<!-- rescue-pipeline-verified: yes -->`." End the review — do not proceed to Step 2.

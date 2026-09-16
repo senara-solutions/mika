@@ -16,6 +16,19 @@ use tracing::{debug, info, warn};
 pub enum DispatchError {
     #[error("agent busy, defer task {0}")]
     AgentBusy(String),
+    /// mika#2337 — a `run_skill` task naming a trigger this binary cannot route.
+    ///
+    /// A **variant**, deliberately, and never a substring match on the rendered
+    /// message: `Other` is an `anyhow::Error` whose text is a formatting detail,
+    /// and the repo already ruled once (mika#2179's `LlmError` classes, derived
+    /// by `downcast_ref`) that an error class read off a string is not a class.
+    /// [`crate::task_engine::engine::TaskEngine`] keys the mika#1742 veto lift on
+    /// this variant, so the discrimination has to survive a reworded message.
+    ///
+    /// The rendered text is unchanged from the `anyhow!` it replaces, so
+    /// operator greps and log history keep working.
+    #[error("unknown run_skill trigger: {trigger}")]
+    UnknownTrigger { trigger: String },
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -446,7 +459,13 @@ impl TaskDispatcher {
             "wip_rescue" => Ok(self.dispatch_wip_rescue(task).await?),
             "qa_review_reconcile" => Ok(self.dispatch_qa_review_reconcile(task).await?),
             "curator_review" => Ok(self.dispatch_curator_review(task).await?),
-            other => Err(anyhow!("unknown run_skill trigger: {}", other).into()),
+            // mika#2337 — a dedicated variant, not `anyhow!`. The caller needs to
+            // tell "this binary does not know that trigger" from "the dispatch
+            // failed", because only the first is a death that predicts nothing
+            // about the next one.
+            other => Err(DispatchError::UnknownTrigger {
+                trigger: other.to_string(),
+            }),
         }
     }
 
