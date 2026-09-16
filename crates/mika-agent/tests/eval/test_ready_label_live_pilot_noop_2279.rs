@@ -58,12 +58,10 @@ const AGENT_ID: &str = "mika";
 const SESSION: &str = "eval-session";
 const TRACE: &str = "eval-trace";
 
-const ISSUE: u64 = 2276;
 const URL: &str = "https://github.com/senara-solutions/mika/issues/2276";
 
 /// Un ticket groomé : rien d'autre que la porte testée ne peut refuser.
-const GROOMED_BODY: &str =
-    "> - **Plan:** docs/plans/2026-09-10-fix-2276.md\n> - **Branch:** `fix/2276`\n\
+const GROOMED_BODY: &str = "> - **Plan:** docs/plans/2026-09-10-fix-2276.md\n> - **Branch:** `fix/2276`\n\
      \n> - **Grooming history:** first-pass (READY) → second-pass (GROOMED)\n";
 
 const READY_EVENT: &str = "[GitHub] Issue labeled ready on senara-solutions/mika#2276 — fix: quelque chose\nhttps://github.com/senara-solutions/mika/issues/2276";
@@ -166,12 +164,7 @@ async fn seed_parent(db: &AsyncDatabase, url: &str, status: &str) -> String {
 
 /// La row **enfant** : ce que `build_callback_task` + `set_task_process_id`
 /// écrivent. Porte le pgid, jamais d'URL.
-async fn seed_child(
-    db: &AsyncDatabase,
-    parent: &str,
-    pid: i64,
-    start_time: Option<u64>,
-) -> String {
+async fn seed_child(db: &AsyncDatabase, parent: &str, pid: i64, start_time: Option<u64>) -> String {
     let id = db
         .create_task(NewTask {
             agent_id: AGENT_ID.to_string(),
@@ -260,7 +253,11 @@ async fn a_live_pilot_makes_the_ready_event_a_noop() {
 
     let parent = seed_parent(&db, URL, "in_progress").await;
     let child = seed_child(&db, &parent, pid, Some(start_time)).await;
-    assert_eq!(task_count(&db).await, 2, "contrôle positif : deux rows semées");
+    assert_eq!(
+        task_count(&db).await,
+        2,
+        "contrôle positif : deux rows semées"
+    );
     assert!(is_alive(pid), "contrôle positif : le pilote tourne avant");
 
     let action = run_handler(&db).await;

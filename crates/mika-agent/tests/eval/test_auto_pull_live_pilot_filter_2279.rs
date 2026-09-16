@@ -222,10 +222,7 @@ async fn a_reaped_pilot_is_not_alive() {
         "contrôle positif : vif avant le kill"
     );
 
-    let _ = Command::new("kill")
-        .arg("-9")
-        .arg(pid.to_string())
-        .output();
+    let _ = Command::new("kill").arg("-9").arg(pid.to_string()).output();
     child_proc.wait().expect("reap the pilot");
 
     assert_eq!(
