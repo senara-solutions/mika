@@ -6303,22 +6303,22 @@ impl Database {
             // marker is what let it through, spend it now. Conditioned on
             // `!lift_already_spent` so a re-registration that never needed the
             // exemption cannot silently burn a fresh one.
-            if !lift_already_spent {
-                if let Err(e) = self.spend_unknown_trigger_lift(&task.agent_id, &task.label) {
-                    // Fail-open on the *bookkeeping*, never on the guard: the
-                    // row is already registered and the engine is running
-                    // again. An unspent marker costs at most one extra lift on
-                    // the next death; refusing the registration here would
-                    // restore the outage this whole path exists to end.
-                    tracing::warn!(
-                        agent_id = %task.agent_id,
-                        label = %task.label,
-                        error = %e,
-                        "mika#2337: failed to spend the unknown-trigger veto lift — \
-                         the next unknown-trigger death on this label may be \
-                         forgiven a second time"
-                    );
-                }
+            if !lift_already_spent
+                && let Err(e) = self.spend_unknown_trigger_lift(&task.agent_id, &task.label)
+            {
+                // Fail-open on the *bookkeeping*, never on the guard: the row is
+                // already registered and the engine is running again. An unspent
+                // marker costs at most one extra lift on the next death;
+                // refusing the registration here would restore the outage this
+                // whole path exists to end.
+                tracing::warn!(
+                    agent_id = %task.agent_id,
+                    label = %task.label,
+                    error = %e,
+                    "mika#2337: failed to spend the unknown-trigger veto lift — \
+                     the next unknown-trigger death on this label may be \
+                     forgiven a second time"
+                );
             }
             Ok(Some(id))
         } else {
