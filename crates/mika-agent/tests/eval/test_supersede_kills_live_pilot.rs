@@ -358,7 +358,11 @@ async fn cancelling_a_parent_kills_the_pilot_of_its_child() {
         "INVARIANT VIOLÉ : l'annulation n'a pas trouvé le pgid — il vit sur \
          l'enfant, pas sur le parent qu'on nomme"
     );
-    assert_eq!(outcome.process_killed, Some(true), "le pilote doit être tué");
+    assert_eq!(
+        outcome.process_killed,
+        Some(true),
+        "le pilote doit être tué"
+    );
     assert!(
         !is_alive(pid),
         "INVARIANT VIOLÉ : la task est annulée et le pilote (pgid {pid}) tourne \
