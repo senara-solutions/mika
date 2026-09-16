@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod budget;
+pub mod budget_provenance;
 pub mod error;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod mock;
@@ -20,6 +21,9 @@ use serde::Deserialize;
 pub use budget::{
     AGENT_TOTAL_TIMEOUT_ENV_VAR, DEFAULT_AGENT_TOTAL_TIMEOUT_SECS, LlmBudgetError,
     LlmTimeoutBudget, MIN_AGENT_TOTAL_TIMEOUT_SECS,
+};
+pub use budget_provenance::{
+    BudgetProvenance, BudgetSource, ResolvedBudgetValue, log_llm_budget_resolved,
 };
 pub use error::LlmError;
 pub use types::*;

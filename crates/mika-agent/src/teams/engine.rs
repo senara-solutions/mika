@@ -212,6 +212,10 @@ impl TeamEngine {
             // This ensures each team agent uses its own LLM provider/model settings (#285).
             let agent_settings = Settings::load_for_agent(global_home, &home_dir)
                 .with_context(|| format!("failed to load config for agent '{}'", ta.name))?;
+            // mika#2293 — the second site that knows which agent it is building
+            // for (F2). Same contract as `server::init_agent`: the per-skill
+            // `[llm]` override path is out of scope and emits nothing.
+            mika_common::llm::log_llm_budget_resolved(&ta.name, global_home, &home_dir);
             let agent_llm = agent_settings.make_llm_provider().with_context(|| {
                 format!("failed to create LLM provider for agent '{}'", ta.name)
             })?;
