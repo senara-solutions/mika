@@ -7798,6 +7798,36 @@ mod tests {
         assert_eq!(last_non_empty_line(&out), "Verdict: ESCALATE");
     }
 
+    /// The cross-family fallback inside the rewrite loop: a declared non-terminal line whose
+    /// own family has no declared ESCALATE is rewritten into the WITHDRAWN line's ESCALATE,
+    /// so no declared verdict keyword survives. Unreachable with the shipped always_on arch
+    /// manifests (their union always carries both families); live code for a future
+    /// single-family verdict producer.
+    #[test]
+    fn mika2338_a_line_whose_family_has_no_escalate_is_rewritten_into_the_withdrawn_family() {
+        // Verdict family complete; Disposition family declares READY but no ESCALATE.
+        let partial: Vec<String> = [
+            "Disposition: READY",
+            "Verdict: GROOMED",
+            "Verdict: ESCALATE",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let text = "La première passe disait Disposition: READY.\n\nA1: x\n\nVerdict: GROOMED\n";
+        let out = escalate_2338(text, &partial, &finding_prefixes()).unwrap();
+        assert!(!out.contains("Disposition: READY"), "{out}");
+        assert!(
+            out.contains("disait Verdict: ESCALATE."),
+            "the READY mention falls back to the withdrawn line's family: {out}"
+        );
+        assert!(
+            !out.contains("Disposition: ESCALATE"),
+            "undeclared, must not be emitted: {out}"
+        );
+        assert_eq!(last_non_empty_line(&out), "Verdict: ESCALATE");
+    }
+
     #[test]
     fn mika2338_the_finding_line_never_carries_a_declared_line_in_clear() {
         for reason in [

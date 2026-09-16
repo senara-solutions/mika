@@ -4566,6 +4566,15 @@ if [ -f "$ANCHOR_RUST_SRC" ]; then
     else
         assert_eq "dispatch-lib carries the engine marker literal" "yes" "no"
     fi
+    # The literal check above is satisfied by a comment; the RECOGNIZER stores the marker
+    # as an escaped regex. Bind the regex itself to the Rust constant by feeding a line
+    # composed exactly as escalate_unattested_disposition composes it (`<prefix> <MARKER> …`)
+    # through _engine_escalation_line — a regex-only edit can no longer stay green.
+    RUST_COMPOSED_LINE="F1: $RUST_ENGINE_MARKER attestation withheld after the corrective re-prompt — anchors_found=3, anchors_valid=2, miss_reason=QuoteNotInBrief: x"
+    assert_eq "tier-0b regex recognizes a line composed from the Rust constant" "$RUST_COMPOSED_LINE" \
+        "$(printf 'prose\n%s\nDisposition: ESCALATE\n' "$RUST_COMPOSED_LINE" | _engine_escalation_line)"
+    assert_eq "tier-0b regex rejects the Rust constant when it is not at line start" "" \
+        "$(printf 'the engine would write %s here\nDisposition: READY\n' "$RUST_ENGINE_MARKER" | _engine_escalation_line)"
 else
     FAIL=$((FAIL + 1))
     echo "  ✗ Rust source not found at $RUST_SRC — cannot verify allowlist drift"
