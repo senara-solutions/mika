@@ -76,9 +76,28 @@ un second résolveur par `reference_url` au lieu de réutiliser celui-ci — et 
 
 `set_task_process_id` (`db.rs:8648-8662`) stampe bien `fired_at` (clause `CASE … WHEN fired_at IS NULL`),
 et c'est le seul écrivain de `process_id`. Mais son unique appelant de production est
-`executor.rs:3279` — **sur l'enfant**. La transition de dispatch du parent passe par
-`update_manual_task_status(task_id, "in_progress")` (`executor.rs:3067` → `db.rs:6708-6739`),
-qui n'écrit **que** `status`, `updated_at`, `completed_at`.
+`executor.rs:3279` — **sur l'enfant** (les autres occurrences, `process_kill.rs:476` incluse, sont
+dans des modules `#[cfg(test)]`). La transition de dispatch du parent passe par
+`update_manual_task_status(task_id, "in_progress")` (→ `db.rs:6708-6739`), qui n'écrit **que**
+`status`, `updated_at`, `completed_at`.
+
+**Et elle passe par TROIS sites de production, pas un** — vérifié par recensement exhaustif des
+appelants hors `#[cfg(test)]` (`executor.rs:3386` borne son module de tests) :
+
+| site | chemin de dispatch |
+|---|---|
+| `skills/executor.rs:3067` | `execute_long_running` (#525, l'original) |
+| `server/ready_label_handler.rs:637` | dispatch sur label `ready` — *« mirrors execute_long_running's #525 transition »* |
+| `server/verdict_handler.rs:866` | dispatch post-verdict — *« mirrors execute_long_running #525 »* |
+
+Le quatrième appelant, `rewind.rs:484`, restaure un statut antérieur et ne doit rien stamper.
+
+**Le site de l'incident n'est pas l'original.** La ligne parent de `094fc5f6` porte une
+`reference_url` d'issue, écrite par `ready_label_handler.rs:438` : le dispatch de l'incident est un
+dispatch **ready-label**, donc sa transition est la l. **637**. Un correctif posé sur le seul
+`executor.rs:3067` laisserait `fired_at` NULL exactement sur le chemin que le ticket décrit — il
+serait vert en test et inopérant sur le cas fondateur. C'est la même classe de défaut que les deux
+fixtures de mika#2263 ci-dessous : un correctif juste, posé à côté de ce que la production exécute.
 
 Or les surfaces lisent le parent : CLI `mika tasks` (`mika-cli/src/commands/tasks.rs:464,519`),
 dashboard (`server/dashboard.rs:573,610,696,726`), sondes de santé. **Il existe donc bien une
@@ -139,11 +158,27 @@ de prudence »), corrigée là-bas par un contrôle positif **sur la forme de li
 
 ### F2a — stamper `fired_at` sur le parent au dispatch (facette 2, lettre)
 
-Écrivain dédié appelé en `executor.rs:3067` à la place de `update_manual_task_status(…, "in_progress")` :
-transition de statut **et** `fired_at` sous la même clause « jamais réécrire un `fired_at` existant »
-que `db.rs:8652-8656` (sinon l'âge d'un dispatch se remettrait à zéro sous les faucheurs qui le
-mesurent). Un écrivain nommé plutôt qu'un `CASE` ajouté à `update_manual_task_status` : cette
-méthode sert aussi `rewind.rs:484`, qui restaure un statut antérieur et ne doit rien stamper.
+Écrivain dédié — `mark_parent_dispatched` — qui fait la transition de statut **et** pose `fired_at`
+sous la même clause « jamais réécrire un `fired_at` existant » que `db.rs:8652-8656` (sinon l'âge
+d'un dispatch se remettrait à zéro sous les faucheurs qui le mesurent). Un écrivain nommé plutôt
+qu'un `CASE` ajouté à `update_manual_task_status` : cette méthode sert aussi `rewind.rs:484`, qui
+restaure un statut antérieur et ne doit rien stamper.
+
+**Il remplace l'appel aux TROIS sites de dispatch**, pas seulement à l'original — `executor.rs:3067`,
+`ready_label_handler.rs:637`, `verdict_handler.rs:866`. Le second est celui de l'incident ; en
+omettre un rendrait le correctif vert et inopérant sur le cas fondateur (voir le recensement plus
+haut). Les trois conservent leur sémantique non-fatale actuelle (`warn!` et on continue) : le stamp
+est de l'observabilité, il ne doit jamais faire échouer un dispatch.
+
+**Garde structurelle, parce que cette classe s'est déjà reproduite trois fois ici même.** Les deux
+sites secondaires existent parce qu'un chemin de dispatch a été ajouté en recopiant le premier ; le
+quatrième arrivera de la même façon. Un scan de source — de la famille de
+`mika2205_periodic_scans_do_not_read_the_pat_field_directly` et
+`mika2131_exclusion_skips_never_return_to_an_uncollected_debug` — refuse
+`update_manual_task_status(…, "in_progress")` hors des modules de test et hors de
+`mark_parent_dispatched`. Un test comportemental ne peut pas attraper cette régression : elle ne
+rendrait aucune décision fausse sur les chemins couverts, elle laisserait le nouveau chemin muet
+pendant que toutes les assertions existantes restent vertes.
 
 ### F2b — la vivacité devient lisible là où l'opérateur regarde (facette 2, mode d'échec réel)
 
@@ -187,7 +222,9 @@ annuler un pilote vivant est parfois exactement ce qu'on veut.
 - La cause de l'arrêt net de `590a06c0` à `20:29:09Z` sans trace : hors signal de supersession,
   cela relève du reaper silent-stall (mika#2277) ou d'un SIGKILL manuel. Ce plan rend la
   supersession correcte ; il n'explique pas cette mort-là.
-- `update_manual_task_status` au sens large et ses autres appelants.
+- `update_manual_task_status` au sens large : la méthode n'est ni modifiée ni supprimée, et ses
+  appelants qui ne dispatchent pas un parent (`rewind.rs:484` en tête) sont laissés intacts. Seuls
+  les trois sites de dispatch énumérés ci-dessus basculent vers `mark_parent_dispatched`.
 - La sonde `long_running` de `get_task_health_summary`, qui filtre `trigger_type != 'manual'`
   alors que les callbacks sont `pending` et jamais `in_progress` — elle ne peut donc rien voir.
   Défaut réel trouvé en chemin, sans rapport avec celui-ci : **ticket de suivi à ouvrir.**
@@ -206,14 +243,19 @@ annuler un pilote vivant est parfois exactement ce qu'on veut.
 - **Les deux fixtures de mika#2263 sont corrigées, pas conservées** : `test_supersede_kills_live_pilot.rs`
   (chimère l.70-117) et `test_dispatch_fired_at_stamped.rs` (appel que la prod ne fait pas, l.70-96).
   Les laisser vertes sur une fiction, c'est garder deux tests qui attestent l'inverse de ce qui tourne.
-- Test F2a : un parent dispatché porte `fired_at` non-NULL ; un `fired_at` existant n'est jamais
-  déplacé ; `rewind` ne stampe pas.
+- Test F2a, **un cas par site de dispatch** : un parent dispatché porte `fired_at` non-NULL par
+  `executor.rs:3067`, par `ready_label_handler.rs:637` (le chemin de l'incident) et par
+  `verdict_handler.rs:866` ; un `fired_at` existant n'est jamais déplacé ; `rewind` ne stampe pas.
+  Un seul cas sur l'original laisserait passer exactement le défaut du ticket.
+- Garde structurelle F2a : le scan de source refuse un quatrième
+  `update_manual_task_status(…, "in_progress")` de production, et il est rouge si on en réintroduit un.
 - `cargo build` + `cargo clippy --all-targets -- -D warnings` + suite verte. Sortie
   rouge-avant/vert-après collée au corps de PR (porte #2264).
 
 ## Definition of Done
 
-- F1, F2a, F2b, F2c implémentés ; `find_live_dispatch_rows_by_reference_url_and_variants` supprimée.
+- F1, F2a (aux trois sites + garde de source), F2b, F2c implémentés ;
+  `find_live_dispatch_rows_by_reference_url_and_variants` supprimée.
 - Tests ci-dessus verts, fixtures mika#2263 corrigées, clippy propre.
 - Corps de PR : inventaire des lecteurs de `fired_at` sur lignes parents, et sortie
   rouge-avant/vert-après.
@@ -230,8 +272,11 @@ annuler un pilote vivant est parfois exactement ce qu'on veut.
   supprimée du dépôt.
 - **AC3** — Fail-safe : un enfant sans `process_start_time` lisible, ou dont le statut est
   terminal, n'est **jamais** signalé ; le cas est compté et journalisé.
-- **AC4** — Une ligne de tracking parent dont le dispatch a été lancé porte `fired_at` non-NULL ;
-  un `fired_at` déjà posé n'est jamais réécrit ; `rewind` n'en pose aucun.
+- **AC4** — Une ligne de tracking parent dont le dispatch a été lancé porte `fired_at` non-NULL,
+  **par chacun des trois chemins de dispatch de production** (`execute_long_running`, ready-label,
+  post-verdict) — le chemin ready-label étant celui de l'incident ; un `fired_at` déjà posé n'est
+  jamais réécrit ; `rewind` n'en pose aucun. Une garde de source refuse l'ajout d'un quatrième
+  chemin qui transitionnerait un parent sans stamper.
 - **AC5** — `mika tasks get|list` sur un parent affiche l'état de vivacité **mesuré** de son
   enfant de dispatch (vivant / PID mort / aucun enfant), pas seulement la présence d'un PID.
 - **AC6** — `mika tasks cancel` sur une task dont l'enfant de dispatch est vivant avertit en
