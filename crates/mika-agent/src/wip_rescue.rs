@@ -14,7 +14,11 @@
 //!                 └─ clippy gate (bail on errors)
 //!                    └─ push rebased branch (force-with-lease)
 //!                       └─ substrate-diff perimeter classify  ── AC4 (reuse #1831)
-//!                          └─ un-draft (gh pr ready)          ── F1
+//!                          ├─ MECHANICAL, or DECISION-CORE whose body reads
+//!                          │  `rescue-pipeline-verified: yes`
+//!                          │   └─ un-draft (gh pr ready)      ── F1
+//!                          └─ DECISION-CORE, marker not `yes`
+//!                              └─ park unverified, stay draft ── mika#2286
 //! ```
 //!
 //! ## Safety invariants
@@ -38,12 +42,25 @@
 //!   every line of the spirit log is written twice, so the raw greps read
 //!   double.) The draft is preserved; a human decides. No further auto-attempts
 //!   (AC3).
-//! - **Perimeter gate is authoritative (AC4/AC5).** Every draft — even a
-//!   one-line diff — is classified by the mika#1831 perimeter classifier
-//!   ([`crate::perimeter`]). A DECISION-CORE draft is un-drafted **with** a
-//!   hand-merge comment (never auto-merged); a MECHANICAL draft is un-drafted
-//!   normally so the verdict handler's merge path can fire. There is no
+//! - **Perimeter gate is authoritative (AC4/AC5), and a DECISION-CORE draft is
+//!   only un-drafted once verified (mika#2286).** Every draft — even a one-line
+//!   diff — is classified by the mika#1831 perimeter classifier
+//!   ([`crate::perimeter`]). A MECHANICAL draft is un-drafted normally so the
+//!   verdict handler's merge path can fire. A DECISION-CORE draft is un-drafted
+//!   **only** when its body reads `<!-- rescue-pipeline-verified: yes -->`, and
+//!   then **with** a hand-merge comment (never auto-merged); otherwise it is
+//!   *parked* — left a draft, commented, and excluded from the scan by a durable
+//!   marker until the `yes` re-arms it ([`park_unverified`]). There is no
 //!   trivial-diff carve-out.
+//!
+//!   This revises step 6 of the mika#1852 spec rather than contradicting it. That
+//!   spec placed the un-draft **after** step 5, *"re-run pilot"* — i.e. after a
+//!   fresh verification of the pipeline. The v1 below descoped steps 4-fix and 5
+//!   (§ *Scope boundary (v1)*) and kept the un-draft, so what the spec treated as
+//!   verified no longer was, and the marker that says so was read nowhere: on
+//!   2026-09-10 PR #2285 was un-drafted by this daemon, classified DECISION-CORE,
+//!   with `rescue-pipeline-verified: no` still in its body. Without a re-run, the
+//!   daemon has no right to un-draft the sensitive class blind.
 //! - **Concurrency cap of 1 (AC6).** The scan processes at most one draft per
 //!   tick (oldest-eligible first). Excess drafts wait for the next tick.
 //!
@@ -103,18 +120,38 @@ const HUMAN_REVIEW_LABEL_DESC: &str =
 /// convention; no migration, because `audit_events.tool_name` is free-form TEXT.
 const BAILED_MARKER_TOOL: &str = "wip_rescue_bailed";
 
-/// Lower bound for the bail-marker lookup. The bail is terminal by design (the
-/// mika#1852 plan § 4: *"End chain — NO further auto-attempts"*), not a burst
-/// dedup, so the window is the whole audit retention rather than a few seconds.
+/// `audit_events.tool_name` of the durable per-PR **parked-unverified** marker
+/// (mika#2286 §4.3).
+///
+/// Sibling of [`BAILED_MARKER_TOOL`], deliberately a different name because it
+/// is a different state. A bail says *the daemon found something wrong and a
+/// human owns this PR from here*; a park says *nothing is wrong, the class just
+/// requires a verification that has not happened yet*. Collapsing the two would
+/// make the operator who reads the PR look for a conflict or a red clippy that
+/// does not exist — and would make the two populations uncountable apart.
+///
+/// The exclusion it drives is **re-armable**, which is the other half of the
+/// difference: nothing clears a bail, whereas `rescue-pipeline-verified: yes`
+/// in the body makes this marker stop excluding (see [`select_eligible`]).
+const PARKED_MARKER_TOOL: &str = "wip_rescue_parked_unverified";
+
+/// Lower bound for the per-PR marker lookups ([`BAILED_MARKER_TOOL`],
+/// [`PARKED_MARKER_TOOL`]). Neither is a burst dedup, so the window is the whole
+/// audit retention rather than a few seconds.
 ///
 /// The real bound is therefore `compact_old_audit_events(90)`
 /// (`server/mod.rs`): a draft still open after 90 days would be re-attempted
 /// **once**. That is not a livelock, and its age is itself the signal that a
 /// human should be looking at it.
-const BAILED_MARKER_SINCE: &str = "1970-01-01T00:00:00Z";
+const MARKER_LOOKUP_SINCE: &str = "1970-01-01T00:00:00Z";
 
-/// `audit_events.target_key` of the bail marker for one PR.
-fn bailed_marker_key(pr_number: u64) -> String {
+/// `audit_events.target_key` of a per-PR state marker.
+///
+/// Shared by the bail and the park markers: the key identifies the *PR*, the
+/// `tool_name` identifies *which* state. Reading one and finding the other is
+/// therefore impossible, which is what lets the two exclusions coexist on one
+/// draft without either needing to know about the other.
+fn pr_marker_key(pr_number: u64) -> String {
     format!("pr:{DEFAULT_REPO}#{pr_number}")
 }
 
@@ -269,6 +306,97 @@ fn version_supports_writetree(v: (u32, u32, u32)) -> bool {
     major > GIT_MIN_MAJOR || (major == GIT_MIN_MAJOR && minor >= GIT_MIN_MINOR)
 }
 
+/// The HTML-comment key dispatch-lib stamps in every rescue PR body
+/// (`_compose_rescue_pr_body`, mika#1618) — always `no` at creation.
+///
+/// The producer/consumer split is the whole point: dispatch-lib writes the
+/// state once, a human flips it, and both readers (qa-review Step 1.5 and
+/// [`pipeline_verified`] below) read rather than re-judge.
+const PIPELINE_VERIFIED_KEY: &str = "rescue-pipeline-verified";
+
+/// Whether a rescue PR body declares its pipeline verified.
+///
+/// `<!-- rescue-pipeline-verified: yes -->` → `true`. Everything else — `no`,
+/// absent, any other value, an empty body, two markers that disagree — reads as
+/// **not** verified (mika#2286, fail-closed).
+///
+/// Tolerance stops at whitespace around the value and the ASCII case of `yes`:
+/// a human who types `Yes` has made the gesture, a human who types `probably`
+/// has not. The "absent marker means pre-mika#1618 PR, proceed" fallback that
+/// qa-review allows itself has **no** place here — every `wip-rescue` draft is
+/// produced by dispatch-lib, which has stamped the marker since 2026-06-29, so
+/// an absent one means the body was mangled, not that it predates the contract.
+///
+/// A mention of the key that is not a well-formed marker (this doc comment, the
+/// PR comment [`park_unverified`] posts) contributes no value: it can neither
+/// verify nor contradict. A marker value is a bare token, so a candidate span
+/// carrying `<` is a prose mention that ran on until some *later* comment's
+/// `-->` — counting it would let one sentence swallow the real marker behind it
+/// and turn a verified PR unverified.
+fn pipeline_verified(body: &str) -> bool {
+    let mut values: Vec<String> = Vec::new();
+    let mut rest = body;
+
+    while let Some(idx) = rest.find(PIPELINE_VERIFIED_KEY) {
+        let after = &rest[idx + PIPELINE_VERIFIED_KEY.len()..];
+        // Advance before any `continue`, so a malformed occurrence cannot pin
+        // the scan on itself — and so the marker a prose mention ran past is
+        // still reached on the next turn of the loop.
+        rest = after;
+
+        let Some(tail) = after.trim_start().strip_prefix(':') else {
+            continue;
+        };
+        let Some(end) = tail.find("-->") else {
+            continue;
+        };
+        let value = tail[..end].trim();
+        if value.contains('<') {
+            continue;
+        }
+        values.push(value.to_ascii_lowercase());
+    }
+
+    !values.is_empty() && values.iter().all(|v| v == "yes")
+}
+
+/// What to do with a draft once it is classified and its marker is read (AC2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UndraftDecision {
+    /// Proceed to `gh pr ready` (MECHANICAL, or DECISION-CORE already verified).
+    Undraft,
+    /// Leave the draft a draft and park it until a human verifies
+    /// (DECISION-CORE whose marker does not read `yes`).
+    ParkUnverified,
+}
+
+/// The mika#2286 gate, as a pure function of the two facts that decide it.
+///
+/// | route | marker `yes` | decision |
+/// |---|---|---|
+/// | MECHANICAL | yes | `Undraft` |
+/// | MECHANICAL | no | `Undraft` — unchanged, deliberately (see below) |
+/// | DECISION-CORE | yes | `Undraft` + hand-merge comment |
+/// | DECISION-CORE | no | `ParkUnverified` |
+///
+/// **MECHANICAL keeps its unverified auto-path on purpose.** That is the
+/// mika#1852 design (RT#004): the mechanical class is already held by the
+/// perimeter classifier, qa-review, CI and the forge gate. mika#2286 is scoped
+/// to DECISION-CORE and ratifies the rest as it stands; closing the mechanical
+/// path too is a separate ticket with its own measurement.
+///
+/// Note how this composes with the fail-closed classification: `classify_route`
+/// answers DECISION-CORE when it cannot read the diff, so an unreadable
+/// classification on an unverified marker **parks** instead of un-drafting. That
+/// is "fail-closed" propagated one step further, not a new policy.
+fn undraft_decision(route: UndraftRoute, verified: bool) -> UndraftDecision {
+    match (route, verified) {
+        (UndraftRoute::Mechanical, _) => UndraftDecision::Undraft,
+        (UndraftRoute::DecisionCore, true) => UndraftDecision::Undraft,
+        (UndraftRoute::DecisionCore, false) => UndraftDecision::ParkUnverified,
+    }
+}
+
 /// The un-draft routing decision for a classified draft (AC4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UndraftRoute {
@@ -303,6 +431,13 @@ struct DraftPr {
     labels: Vec<GhLabel>,
     #[serde(rename = "createdAt")]
     created_at: String,
+    /// The PR body as the listing saw it, read by [`select_eligible`] to decide
+    /// whether a parked draft has been re-armed (mika#2286). `gh pr list`
+    /// already returns it for free; the *decision* re-reads a fresh copy, since
+    /// rebase + clippy can take minutes and a human may flip the marker inside
+    /// that window.
+    #[serde(default)]
+    body: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -321,6 +456,15 @@ impl DraftPr {
 #[derive(Debug, Deserialize)]
 struct ClosingIssueRef {
     number: u64,
+}
+
+/// `gh pr view --json body` (mika#2286). `body` is defaulted because GitHub
+/// renders an empty body as JSON `null`, and an empty body is a legitimate —
+/// and, per [`pipeline_verified`], unverified — state.
+#[derive(Debug, Deserialize)]
+struct PrBodyEnvelope {
+    #[serde(default)]
+    body: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -424,6 +568,11 @@ enum ChainOutcome {
     /// goes looking for the draft on GitHub will not find the label, so the
     /// difference has to be visible.
     Bailed { reason: String, parked: bool },
+    /// DECISION-CORE draft whose pipeline-verification marker does not read
+    /// `yes` — left a draft, commented, and excluded until the `yes` re-arms it
+    /// (mika#2286). **Not** a bail: nothing went wrong, and the exclusion lifts
+    /// itself.
+    ParkedUnverified,
     /// Not attempted this tick (e.g., no local checkout). Left untouched.
     Skipped(String),
 }
@@ -452,9 +601,13 @@ pub async fn auto_resume_wip_rescue_drafts(
     let threshold = min_age_secs();
     let now = crate::timestamp::now();
 
-    let selected = select_eligible(drafts, &now, threshold, |pr_number| {
-        has_bailed_marker(db, pr_number, trace_id)
-    })
+    let selected = select_eligible(
+        drafts,
+        &now,
+        threshold,
+        |pr_number| has_bailed_marker(db, pr_number, trace_id),
+        |pr_number| has_parked_marker(db, pr_number, trace_id),
+    )
     .await;
 
     let Some((age_secs, pr)) = selected else {
@@ -498,6 +651,9 @@ pub async fn auto_resume_wip_rescue_drafts(
             info!(pr_number = pr.number, reason = %reason, parked, trace_id, "wip_rescue: bailed");
             Some(0)
         }
+        // `Some(0)` like a bail: a draft was examined and not resumed. The two
+        // are told apart by the event name, never by the return value.
+        ChainOutcome::ParkedUnverified => Some(0),
         ChainOutcome::Skipped(reason) => {
             debug!(pr_number = pr.number, reason = %reason, trace_id, "wip_rescue_skipped");
             Some(0)
@@ -525,18 +681,33 @@ pub async fn auto_resume_wip_rescue_drafts(
 /// next draft is returned immediately. mika#2199 only required the following
 /// tick; this falls out of the shape of the code rather than widening the scope.
 ///
-/// The predicate is async (the plan sketched it as `&dyn Fn(u64) -> bool`)
-/// because the real one is a DB read: a synchronous signature would have forced
+/// The predicates are async (the plan sketched them as `&dyn Fn(u64) -> bool`)
+/// because the real ones are DB reads: a synchronous signature would have forced
 /// either a blocking read or the eager fan-out the cost bound above rules out.
-async fn select_eligible<F, Fut>(
+///
+/// **Parked drafts (mika#2286).** A second, *re-armable* exclusion sits beside
+/// the bail: a DECISION-CORE draft the daemon left unverified is skipped while
+/// its marker is set **and** its body does not read
+/// `rescue-pipeline-verified: yes`. Without it the draft would be re-elected on
+/// every 5-minute tick — fetch, rebase, clippy (up to 900 s), push, classify,
+/// *still `no`* — holding the single slot (AC6 cap = 1, oldest first) and
+/// starving everything behind it. That is the mika#2199 livelock shape, measured
+/// there as 14 bails on one PR in six hours.
+///
+/// The body test comes **first** on purpose: it is free, and a re-armed draft
+/// must not pay a database read to discover it is eligible again.
+async fn select_eligible<F, Fut, G, GFut>(
     drafts: Vec<DraftPr>,
     now: &str,
     threshold: i64,
     is_bailed: F,
+    is_parked: G,
 ) -> Option<(i64, DraftPr)>
 where
     F: Fn(u64) -> Fut,
     Fut: std::future::Future<Output = bool>,
+    G: Fn(u64) -> GFut,
+    GFut: std::future::Future<Output = bool>,
 {
     let mut ranked: Vec<(i64, DraftPr)> = drafts
         .into_iter()
@@ -549,14 +720,23 @@ where
     ranked.sort_by(|a, b| b.0.cmp(&a.0));
 
     for (age, pr) in ranked {
-        if !is_bailed(pr.number).await {
-            return Some((age, pr));
+        if is_bailed(pr.number).await {
+            debug!(
+                pr_number = pr.number,
+                reason = "already_bailed",
+                "wip_rescue_skipped"
+            );
+            continue;
         }
-        debug!(
-            pr_number = pr.number,
-            reason = "already_bailed",
-            "wip_rescue_skipped"
-        );
+        if !pipeline_verified(&pr.body) && is_parked(pr.number).await {
+            debug!(
+                pr_number = pr.number,
+                reason = "parked_unverified",
+                "wip_rescue_skipped"
+            );
+            continue;
+        }
+        return Some((age, pr));
     }
     None
 }
@@ -571,14 +751,32 @@ where
 /// stays open, labelled, commented), while re-attempting it in a loop costs the
 /// entire queue.
 async fn has_bailed_marker(db: &AsyncDatabase, pr_number: u64, trace_id: &str) -> bool {
-    let key = bailed_marker_key(pr_number);
+    has_marker(db, BAILED_MARKER_TOOL, pr_number, trace_id).await
+}
+
+/// Whether a durable *parked-unverified* marker exists for this PR (mika#2286).
+///
+/// **Fail-closed** for the same arbitrage as [`has_bailed_marker`], reached by a
+/// slightly different road: a parked DECISION-CORE draft excluded in error loses
+/// nothing — it stays open, a draft, carrying the comment that names the two
+/// gestures which free it, and the very next tick after a human writes `yes`
+/// re-elects it, because the body test in [`select_eligible`] runs before this
+/// read. Re-attempting it in a loop, by contrast, costs the whole queue.
+async fn has_parked_marker(db: &AsyncDatabase, pr_number: u64, trace_id: &str) -> bool {
+    has_marker(db, PARKED_MARKER_TOOL, pr_number, trace_id).await
+}
+
+/// Shared read behind the two exclusion predicates. Fail-closed: an unreadable
+/// audit trail answers *excluded*.
+async fn has_marker(db: &AsyncDatabase, tool_name: &str, pr_number: u64, trace_id: &str) -> bool {
+    let key = pr_marker_key(pr_number);
     match db
-        .count_recent_audit_events_for_target(BAILED_MARKER_TOOL, &key, BAILED_MARKER_SINCE)
+        .count_recent_audit_events_for_target(tool_name, &key, MARKER_LOOKUP_SINCE)
         .await
     {
         Ok(count) => count > 0,
         Err(e) => {
-            warn!(pr_number, error = %e, trace_id, "wip_rescue_error");
+            warn!(pr_number, marker = tool_name, error = %e, trace_id, "wip_rescue_error");
             true
         }
     }
@@ -667,6 +865,18 @@ async fn resume_chain(
     // Step 6: substrate-diff perimeter classification (AC4/AC5). Fail-closed —
     // a fetch/parse failure classifies DECISION-CORE (never auto-merge).
     let route = classify_route(pr.number, token).await;
+
+    // Step 6b (mika#2286): read the verification marker off a FRESH copy of the
+    // body, not off the listing. Steps 2–5 above can take minutes (clippy alone
+    // is budgeted 900 s) and the gesture the rescue body asks of the operator —
+    // "set the marker above to `yes`" — can land inside that window. A failed
+    // read is not verified: the next tick re-reads the listing and re-arms on
+    // its own if the body does say `yes`.
+    let verified = fresh_pipeline_verified(pr.number, token, trace_id).await;
+
+    if undraft_decision(route, verified) == UndraftDecision::ParkUnverified {
+        return park_unverified(token, trace_id, session_id, db, pr.number).await;
+    }
 
     // Step 7: un-draft (F1). Any failure bails; the draft stays a draft.
     if let Err(e) = gh(
@@ -791,6 +1001,42 @@ async fn closing_issue_number(pr_number: u64, token: &str) -> Option<u64> {
     .ok()?;
     let env: ClosingIssuesEnvelope = serde_json::from_str(out.trim()).ok()?;
     env.closing_issues_references.first().map(|r| r.number)
+}
+
+/// Re-read the PR body and answer [`pipeline_verified`] on it (mika#2286).
+///
+/// Fail-closed at every step: an unreachable `gh`, an unparseable payload, an
+/// absent body all answer `false`. The cost of being wrong here is one tick of
+/// delay for a draft that stays exactly where it is; the cost of the other
+/// direction is un-drafting the decision core on a failed read.
+async fn fresh_pipeline_verified(pr_number: u64, token: &str, trace_id: &str) -> bool {
+    let out = match gh(
+        &[
+            "pr",
+            "view",
+            &pr_number.to_string(),
+            "--repo",
+            DEFAULT_REPO,
+            "--json",
+            "body",
+        ],
+        token,
+    )
+    .await
+    {
+        Ok(out) => out,
+        Err(e) => {
+            warn!(pr_number, error = %e, trace_id, "wip_rescue_error");
+            return false;
+        }
+    };
+    match serde_json::from_str::<PrBodyEnvelope>(out.trim()) {
+        Ok(env) => pipeline_verified(&env.body),
+        Err(e) => {
+            warn!(pr_number, error = %e, trace_id, "wip_rescue_error");
+            false
+        }
+    }
 }
 
 /// Perimeter classification route for a PR, fail-closed to DECISION-CORE on any
@@ -1001,18 +1247,94 @@ async fn bail_to_human(
     ChainOutcome::Bailed { reason, parked }
 }
 
+/// Park a DECISION-CORE draft whose pipeline-verification marker does not read
+/// `yes` (mika#2286 §4.3). Mirror of [`bail_to_human`] **without** the label and
+/// **without** the bail marker — because this is not a bail.
+///
+/// The order is the same load-bearing one: the durable marker first and
+/// unconditionally, so the exclusion holds even if every GitHub call below
+/// fails. The marker also guarantees a single pass, hence a single comment — no
+/// spam every five minutes.
+///
+/// Nothing here increments `$.wip_rescue.depth`: no resume happened. The resume
+/// that follows the human's `yes` will increment it, which is the accounting
+/// this draft deserves.
+async fn park_unverified(
+    token: &str,
+    trace_id: &str,
+    session_id: &str,
+    db: &AsyncDatabase,
+    pr_number: u64,
+) -> ChainOutcome {
+    info!(pr_number, trace_id, "wip_rescue_parked_unverified");
+
+    write_pr_marker(
+        db,
+        session_id,
+        PARKED_MARKER_TOOL,
+        pr_number,
+        trace_id,
+        PARKED_REASON,
+        "wip_rescue parked-unverified exclusion marker (mika#2286)",
+    )
+    .await;
+
+    // The wording is deliberately not the bail's. The daemon found nothing
+    // wrong: it rebased the branch, clippy passed, and the only thing missing is
+    // the verification this class requires. Saying "a human owns this PR from
+    // here" would send the reader looking for a conflict that does not exist.
+    let comment = format!(
+        "Auto-resume (wip-rescue, mika#1852) rebased this branch onto `main` and \
+         it passes clippy, but substrate-diff classified it **DECISION-CORE** and \
+         its pipeline-verification marker is not `yes` — so it stays a draft \
+         (mika#2286). To make it reviewable: verify the pipeline, then either \
+         mark it Ready for Review yourself, or set \
+         `<!-- {PIPELINE_VERIFIED_KEY}: yes -->` in the body and the next scan \
+         will un-draft it for you. Merge stays a Vincent hand-merge either way."
+    );
+    if let Err(e) = gh(
+        &[
+            "pr",
+            "comment",
+            &pr_number.to_string(),
+            "--repo",
+            DEFAULT_REPO,
+            "--body",
+            &comment,
+        ],
+        token,
+    )
+    .await
+    {
+        warn!(pr_number, error = %e, trace_id, "wip_rescue_error");
+    }
+
+    // The action row, distinct from the state marker above. Both carry the same
+    // string, in different columns and with different meanings: the marker is
+    // `tool_name = PARKED_MARKER_TOOL` (one row per PR, read by the eligibility
+    // filter), the action is `tool_name = 'wip_rescue'` with this string as
+    // `target_key` (one row per park, alongside every other wip_rescue action).
+    // Same split as `wip_rescue_bailed` / `wip_rescue_bail_to_human`.
+    log_audit(
+        db,
+        session_id,
+        PARKED_MARKER_TOOL,
+        pr_number,
+        trace_id,
+        PARKED_REASON,
+    )
+    .await;
+
+    ChainOutcome::ParkedUnverified
+}
+
+/// Reason string carried by both rows [`park_unverified`] writes. One constant,
+/// so the audit row and the marker cannot drift into two spellings of one fact.
+const PARKED_REASON: &str = "decision_core_marker_not_yes";
+
 /// Write the durable per-PR bail marker (mika#2199 §4.2).
 ///
-/// Best-effort like every other audit write in this module — but note what a
-/// failure here costs: the marker is the exclusion, so a PR whose marker could
-/// not be written falls back to depending on the label alone, which is the
-/// pre-mika#2199 behaviour for that one PR.
-///
-/// It therefore gets its **own** event name rather than the module's shared
-/// `wip_rescue_error`, which is written at eight sites: the one condition that
-/// restores the livelock must not be greppably indistinguishable from a
-/// `gh pr comment` that timed out. Any hit on `wip_rescue_marker_write_failed`
-/// is a PR whose exclusion rests on the label alone.
+/// See [`write_pr_marker`] for what a failed write costs.
 async fn mark_bailed(
     db: &AsyncDatabase,
     session_id: &str,
@@ -1020,20 +1342,56 @@ async fn mark_bailed(
     trace_id: &str,
     reason: &str,
 ) {
-    let key = bailed_marker_key(pr_number);
+    write_pr_marker(
+        db,
+        session_id,
+        BAILED_MARKER_TOOL,
+        pr_number,
+        trace_id,
+        reason,
+        "wip_rescue bail exclusion marker (mika#2199)",
+    )
+    .await;
+}
+
+/// Write a durable per-PR exclusion marker (bail, mika#2199 — or park,
+/// mika#2286).
+///
+/// Best-effort like every other audit write in this module — but note what a
+/// failure here costs: the marker **is** the exclusion. A bail whose marker
+/// could not be written falls back to depending on the label alone, which is the
+/// pre-mika#2199 behaviour for that one PR; a park whose marker could not be
+/// written has no fallback at all, so the draft is re-elected next tick and
+/// re-parked — degraded, bounded by the cost of one tick, and never an un-draft.
+///
+/// It therefore gets its **own** event name rather than the module's shared
+/// `wip_rescue_error`, which is written at ten sites: the one condition that
+/// restores the livelock must not be greppably indistinguishable from a
+/// `gh pr comment` that timed out. Any hit on `wip_rescue_marker_write_failed`
+/// is a PR whose exclusion is not held.
+async fn write_pr_marker(
+    db: &AsyncDatabase,
+    session_id: &str,
+    tool_name: &str,
+    pr_number: u64,
+    trace_id: &str,
+    reason: &str,
+    note: &str,
+) {
+    let key = pr_marker_key(pr_number);
     if let Err(e) = db
         .log_audit_event(
             session_id,
-            BAILED_MARKER_TOOL,
+            tool_name,
             &key,
             None,
             Some(reason),
-            Some("wip_rescue bail exclusion marker (mika#2199)"),
+            Some(note),
             Some(trace_id),
         )
         .await
     {
-        warn!(pr_number, error = %e, trace_id, "wip_rescue_marker_write_failed");
+        warn!(pr_number, marker = tool_name, error = %e, trace_id, "wip_rescue_marker_write_failed");
     }
 }
 
@@ -1142,7 +1500,7 @@ async fn list_wip_rescue_drafts(token: &str) -> Result<Vec<DraftPr>, String> {
             "--label",
             WIP_RESCUE_LABEL,
             "--json",
-            "number,headRefName,title,labels,createdAt",
+            "number,headRefName,title,labels,createdAt,body",
             "--limit",
             "100",
         ],
@@ -1350,6 +1708,7 @@ mod tests {
                 name: "WIP-Rescue".into(),
             }],
             created_at: "2026-07-29T12:00:00Z".into(),
+            body: MARKER_NO.into(),
         };
         assert!(pr.has_label(WIP_RESCUE_LABEL));
         assert!(!pr.has_label(HUMAN_REVIEW_LABEL));
@@ -1405,7 +1764,17 @@ mod tests {
     const OLDEST_CREATED: &str = "2026-09-05T09:00:00Z";
     const NEXT_CREATED: &str = "2026-09-05T12:00:00Z";
 
+    /// The marker as dispatch-lib stamps it at PR creation, and as it stays
+    /// until a human edits the body.
+    const MARKER_NO: &str = "<!-- rescue-pipeline-verified: no -->";
+    /// The marker after the gesture the rescue body asks the operator for.
+    const MARKER_YES: &str = "<!-- rescue-pipeline-verified: yes -->";
+
     fn draft(number: u64, created_at: &str, labels: &[&str]) -> DraftPr {
+        draft_with_body(number, created_at, labels, MARKER_NO)
+    }
+
+    fn draft_with_body(number: u64, created_at: &str, labels: &[&str], body: &str) -> DraftPr {
         DraftPr {
             number,
             head_ref: format!("wip/{number}"),
@@ -1417,7 +1786,19 @@ mod tests {
                 })
                 .collect(),
             created_at: created_at.to_string(),
+            body: body.to_string(),
         }
+    }
+
+    /// The two exclusion predicates of [`select_eligible`], as they read when
+    /// the axis a test is *not* exercising is absent. Named functions rather
+    /// than inline `|_| async { false }` so each call site says which axis it
+    /// holds constant.
+    async fn never_bailed(_pr_number: u64) -> bool {
+        false
+    }
+    async fn never_parked(_pr_number: u64) -> bool {
+        false
     }
 
     /// The queue of the incident: two `wip-rescue` drafts, neither carrying
@@ -1435,8 +1816,14 @@ mod tests {
     /// **on this tick**, not stay on a PR it cannot park.
     #[tokio::test]
     async fn a_bailed_draft_is_not_re_elected_and_the_scan_advances() {
-        let selected =
-            select_eligible(incident_queue(), NOW, 900, |n| async move { n == OLDEST }).await;
+        let selected = select_eligible(
+            incident_queue(),
+            NOW,
+            900,
+            |n| async move { n == OLDEST },
+            never_parked,
+        )
+        .await;
 
         assert_eq!(
             selected.map(|(_, pr)| pr.number),
@@ -1454,7 +1841,8 @@ mod tests {
     #[tokio::test]
     async fn without_the_marker_the_same_draft_is_re_elected_forever() {
         for tick in 0..3 {
-            let selected = select_eligible(incident_queue(), NOW, 900, |_| async { false }).await;
+            let selected =
+                select_eligible(incident_queue(), NOW, 900, never_bailed, never_parked).await;
             assert_eq!(
                 selected.map(|(_, pr)| pr.number),
                 Some(OLDEST),
@@ -1468,7 +1856,8 @@ mod tests {
     /// selection here means the queue is genuinely drained, not blocked.
     #[tokio::test]
     async fn all_bailed_selects_nothing() {
-        let selected = select_eligible(incident_queue(), NOW, 900, |_| async { true }).await;
+        let selected =
+            select_eligible(incident_queue(), NOW, 900, |_| async { true }, never_parked).await;
         assert!(selected.is_none());
     }
 
@@ -1483,7 +1872,7 @@ mod tests {
             &[WIP_RESCUE_LABEL, HUMAN_REVIEW_LABEL],
         )];
         assert!(
-            select_eligible(parked, NOW, 900, |_| async { false })
+            select_eligible(parked, NOW, 900, never_bailed, never_parked)
                 .await
                 .is_none()
         );
@@ -1491,7 +1880,7 @@ mod tests {
         // Not a wip-rescue draft → never a candidate.
         let unrelated = vec![draft(OLDEST, OLDEST_CREATED, &["p1-important"])];
         assert!(
-            select_eligible(unrelated, NOW, 900, |_| async { false })
+            select_eligible(unrelated, NOW, 900, never_bailed, never_parked)
                 .await
                 .is_none()
         );
@@ -1499,7 +1888,7 @@ mod tests {
         // Younger than the threshold → waits.
         let fresh = vec![draft(NEXT, "2026-09-05T15:59:00Z", &[WIP_RESCUE_LABEL])];
         assert!(
-            select_eligible(fresh, NOW, 900, |_| async { false })
+            select_eligible(fresh, NOW, 900, never_bailed, never_parked)
                 .await
                 .is_none()
         );
@@ -1731,9 +2120,13 @@ mod tests {
              that GitHub failing changes nothing about the exclusion"
         );
 
-        let selected = select_eligible(incident_queue(), NOW, 900, |n| {
-            has_bailed_marker(&db, n, TRACE)
-        })
+        let selected = select_eligible(
+            incident_queue(),
+            NOW,
+            900,
+            |n| has_bailed_marker(&db, n, TRACE),
+            never_parked,
+        )
         .await;
         assert_eq!(
             selected.map(|(_, pr)| pr.number),
@@ -1824,6 +2217,268 @@ mod tests {
             block.contains(HUMAN_REVIEW_LABEL_DESC),
             "the `{HUMAN_REVIEW_LABEL}` entry must carry the same description the \
              daemon creates the label with; entry was:\n{block}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2286 — a DECISION-CORE draft is un-drafted only once verified, and
+    // the draft it leaves behind must not eat the queue.
+    // -----------------------------------------------------------------------
+
+    /// PR #2285, the rescue of mika#2023: classified DECISION-CORE and
+    /// un-drafted by the daemon on 2026-09-10 with its marker still `no`.
+    const PARKED_PR: u64 = 2285;
+    /// A second draft waiting behind it — the queue #2285 would hold if the park
+    /// did not exclude.
+    const BEHIND_PR: u64 = 2287;
+    /// `wip_rescue_resume_attempt pr=2285 age_secs=1028`.
+    const PARK_NOW: &str = "2026-09-10T18:00:01Z";
+    /// 1028 s before `PARK_NOW`, so the fixture reproduces the logged age.
+    const PARKED_CREATED: &str = "2026-09-10T17:42:53Z";
+    const BEHIND_CREATED: &str = "2026-09-10T17:45:00Z";
+
+    /// The two drafts of the incident, both past the 900 s threshold, both
+    /// carrying the marker dispatch-lib stamps and nobody has flipped.
+    fn park_queue() -> Vec<DraftPr> {
+        vec![
+            draft_with_body(PARKED_PR, PARKED_CREATED, &[WIP_RESCUE_LABEL], MARKER_NO),
+            draft_with_body(BEHIND_PR, BEHIND_CREATED, &[WIP_RESCUE_LABEL], MARKER_NO),
+        ]
+    }
+
+    /// AC1. Only the literal `yes` verifies; every other shape is unverified.
+    #[test]
+    fn mika2286_pipeline_verified_reads_only_an_explicit_yes() {
+        // The gesture the rescue body asks for, in the forms a human types it.
+        assert!(pipeline_verified(MARKER_YES));
+        assert!(pipeline_verified("<!-- rescue-pipeline-verified:yes-->"));
+        assert!(pipeline_verified("<!--  rescue-pipeline-verified :  Yes  -->"));
+        assert!(
+            pipeline_verified(&format!("## Auto-rescued PR\n\n{MARKER_YES}\n\nCloses #2023")),
+            "the marker is read inside a real body, not on a line of its own"
+        );
+
+        // The state dispatch-lib writes, and the state of a body nobody touched.
+        assert!(!pipeline_verified(MARKER_NO));
+        assert!(!pipeline_verified(""));
+        assert!(
+            !pipeline_verified("## Auto-rescued PR\n\nCloses #2023"),
+            "an absent marker is not verified: every wip-rescue draft is produced \
+             by dispatch-lib, which has stamped it since 2026-06-29, so absence \
+             means a mangled body — not a PR predating the contract"
+        );
+
+        // Anything that is not the literal `yes`.
+        assert!(!pipeline_verified("<!-- rescue-pipeline-verified: maybe -->"));
+        assert!(!pipeline_verified("<!-- rescue-pipeline-verified: YES SIR -->"));
+        assert!(!pipeline_verified("<!-- rescue-pipeline-verified: -->"));
+
+        // Two markers that disagree resolve to the safe side, whichever order.
+        assert!(!pipeline_verified(&format!("{MARKER_YES}\n{MARKER_NO}")));
+        assert!(!pipeline_verified(&format!("{MARKER_NO}\n{MARKER_YES}")));
+
+        // A mention that is not a marker contributes nothing — it can neither
+        // verify nor contradict. This is the shape of the comment
+        // `park_unverified` posts, quoted back into a body.
+        assert!(
+            !pipeline_verified("set rescue-pipeline-verified in the body"),
+            "an unterminated mention must not be read as a value"
+        );
+        assert!(
+            pipeline_verified(&format!(
+                "{MARKER_YES}\n\nsee `rescue-pipeline-verified` above"
+            )),
+            "…and must not cancel a well-formed `yes` either"
+        );
+        assert!(
+            pipeline_verified(&format!(
+                "set rescue-pipeline-verified: as shown below\n{MARKER_YES}"
+            )),
+            "a prose mention that happens to carry a colon must not run on to \
+             the next comment's `-->` and swallow the real marker behind it"
+        );
+        assert!(
+            !pipeline_verified(&format!(
+                "set rescue-pipeline-verified: as shown below\n{MARKER_NO}"
+            )),
+            "…and skipping it must not turn an unverified body into a verified one"
+        );
+    }
+
+    /// AC2. The four rows of the decision table, each named.
+    #[test]
+    fn mika2286_undraft_decision_gates_decision_core_on_the_marker() {
+        assert_eq!(
+            undraft_decision(UndraftRoute::DecisionCore, false),
+            UndraftDecision::ParkUnverified,
+            "the hole this ticket closes: PR #2285 was un-drafted here"
+        );
+        assert_eq!(
+            undraft_decision(UndraftRoute::DecisionCore, true),
+            UndraftDecision::Undraft,
+            "a human who set the marker to `yes` has made the gesture the rescue \
+             body asks for; the daemon honours it"
+        );
+        assert_eq!(
+            undraft_decision(UndraftRoute::Mechanical, false),
+            UndraftDecision::Undraft,
+            "the mechanical auto-path of mika#1852 is deliberately unchanged"
+        );
+        assert_eq!(
+            undraft_decision(UndraftRoute::Mechanical, true),
+            UndraftDecision::Undraft
+        );
+    }
+
+    /// AC4, the replay of #2285. The parked draft drops out of the candidate set
+    /// and the one behind it is returned **on the same tick** — the queue moves.
+    ///
+    /// The negative control is in the same test, term by term: with a predicate
+    /// that always answers `false` — which is `main`, where nothing consults a
+    /// park marker because there is none — the same input re-elects #2285 tick
+    /// after tick. Without it, the assertion above measures nothing.
+    #[tokio::test]
+    async fn mika2286_a_parked_draft_is_not_re_elected_and_the_scan_advances() {
+        let selected = select_eligible(park_queue(), PARK_NOW, 900, never_bailed, |n| async move {
+            n == PARKED_PR
+        })
+        .await;
+        assert_eq!(
+            selected.map(|(_, pr)| pr.number),
+            Some(BEHIND_PR),
+            "a parked draft must leave the candidate set and the next one be \
+             returned in the same pass"
+        );
+
+        for tick in 0..3 {
+            let selected =
+                select_eligible(park_queue(), PARK_NOW, 900, never_bailed, never_parked).await;
+            assert_eq!(
+                selected.map(|(_, pr)| pr.number),
+                Some(PARKED_PR),
+                "tick {tick}: this is the livelock the marker prevents — the \
+                 oldest draft is returned again and the queue never advances"
+            );
+        }
+    }
+
+    /// AC4, the other half: the exclusion is re-armable. Both directions live in
+    /// one test so neither can pass while the other rots.
+    #[tokio::test]
+    async fn mika2286_the_yes_marker_re_arms_the_parked_draft() {
+        let parked_pred = |n: u64| async move { n == PARKED_PR };
+
+        // Marker still `no` → held back, as above.
+        let still_no = vec![draft_with_body(
+            PARKED_PR,
+            PARKED_CREATED,
+            &[WIP_RESCUE_LABEL],
+            MARKER_NO,
+        )];
+        assert!(
+            select_eligible(still_no, PARK_NOW, 900, never_bailed, parked_pred)
+                .await
+                .is_none(),
+            "the marker alone excludes while the body is unverified"
+        );
+
+        // Same PR, same marker row, body now says `yes` → eligible again. No
+        // gesture on the audit trail is required: the body is what lifts it.
+        let now_yes = vec![draft_with_body(
+            PARKED_PR,
+            PARKED_CREATED,
+            &[WIP_RESCUE_LABEL],
+            MARKER_YES,
+        )];
+        assert_eq!(
+            select_eligible(now_yes, PARK_NOW, 900, never_bailed, parked_pred)
+                .await
+                .map(|(_, pr)| pr.number),
+            Some(PARKED_PR),
+            "`yes` in the body must re-arm the draft without anyone clearing the \
+             marker — otherwise the park is a bail wearing another name"
+        );
+    }
+
+    /// AC4, fail-closed. An unreadable audit trail reads as *already parked* —
+    /// the same arbitrage as the bail, reached by a different road: a parked
+    /// draft excluded in error stays open, a draft, and commented, and the body
+    /// test in front of this read re-elects it the moment a human writes `yes`.
+    #[tokio::test]
+    async fn mika2286_an_unreadable_audit_trail_parks_the_draft() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        db.conn.execute_batch("DROP TABLE audit_events").unwrap();
+        let db = AsyncDatabase::new(db);
+
+        assert!(has_parked_marker(&db, PARKED_PR, TRACE).await);
+    }
+
+    /// AC3, against a `gh` that refuses everything: the park is durable before
+    /// any GitHub call, it is **not** a bail, and it says so.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2286_parking_is_durable_and_is_not_a_bail() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_fake_gh(tmp.path(), &hostile_script(tmp.path()));
+        let _path = prepend_to_path(tmp.path());
+        let db = bail_db();
+
+        let outcome = park_unverified("token", TRACE, "test-session", &db, PARKED_PR).await;
+
+        assert_eq!(outcome, ChainOutcome::ParkedUnverified);
+        assert!(
+            has_parked_marker(&db, PARKED_PR, TRACE).await,
+            "the marker is written before any GitHub call, precisely so that \
+             GitHub failing changes nothing about the exclusion"
+        );
+        assert!(
+            !has_bailed_marker(&db, PARKED_PR, TRACE).await,
+            "a park is not a bail: writing the bail marker would make the \
+             exclusion terminal, and `yes` would never re-arm it"
+        );
+
+        let log = calls(tmp.path());
+        assert!(
+            log.contains("pr comment"),
+            "the operator must be told which two gestures free the draft: {log}"
+        );
+        assert!(
+            !log.contains("pr ready"),
+            "the whole point is that the draft stays a draft: {log}"
+        );
+        assert!(
+            !log.contains(HUMAN_REVIEW_LABEL),
+            "`{HUMAN_REVIEW_LABEL}` says a human owns this PR because something \
+             went wrong; nothing did: {log}"
+        );
+    }
+
+    /// AC3, the comment's content. It must name **both** freeing gestures, and
+    /// it must not carry the bail's "a human owns this PR from here" — a reader
+    /// who believes that goes looking for a conflict that does not exist.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2286_the_park_comment_names_both_freeing_gestures() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_fake_gh(tmp.path(), &nominal_script(tmp.path()));
+        let _path = prepend_to_path(tmp.path());
+        let db = bail_db();
+
+        park_unverified("token", TRACE, "test-session", &db, PARKED_PR).await;
+
+        let log = calls(tmp.path());
+        assert!(
+            log.contains(MARKER_YES),
+            "the comment must quote the marker verbatim, so the gesture can be \
+             copy-pasted rather than reconstructed: {log}"
+        );
+        assert!(
+            log.contains("Ready for Review"),
+            "…and name the un-draft gesture too: {log}"
+        );
+        assert!(
+            !log.contains("owns this PR"),
+            "the bail's wording must not leak into a park: {log}"
         );
     }
 }
