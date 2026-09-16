@@ -693,6 +693,17 @@ impl AsyncDatabase {
         Ok(outcome)
     }
 
+    /// Async wrapper for [`Database::mark_parent_dispatched`] (mika#2335).
+    ///
+    /// No `TaskEventFrame` emission: the wrapper above emits only on
+    /// `cancelled`, and a dispatch transition is not a cancellation.
+    pub async fn mark_parent_dispatched(&self, task_id: &str) -> Result<Option<String>> {
+        let a = self.agent_id.clone();
+        let i = task_id.to_owned();
+        self.with_db(move |db| db.mark_parent_dispatched(&i, &a))
+            .await
+    }
+
     pub async fn list_manual_tasks(
         &self,
         status_filter: Option<&str>,
@@ -770,18 +781,10 @@ impl AsyncDatabase {
             .await
     }
 
-    /// Async wrapper for
-    /// [`Database::find_live_dispatch_rows_by_reference_url_and_variants`]
-    /// (mika#2263 défaut (a)). `base_url` MUST be canonical (no `?phase=groom`).
-    pub async fn find_live_dispatch_rows_by_reference_url_and_variants(
-        &self,
-        base_url: &str,
-    ) -> Result<Vec<Task>> {
-        let a = self.agent_id.clone();
-        let url = base_url.to_owned();
-        self.with_db(move |db| db.find_live_dispatch_rows_by_reference_url_and_variants(&a, &url))
-            .await
-    }
+    // mika#2335 — the wrapper for
+    // `find_live_dispatch_rows_by_reference_url_and_variants` is deleted with
+    // the query it wrapped. See the note at its former site in `db.rs`: its
+    // conjunction was empty on the topology production writes.
 
     /// Async wrapper for [`Database::cancel_task_superseded`] (mika#1934 AC2).
     pub async fn cancel_task_superseded(&self, id: &str) -> Result<bool> {

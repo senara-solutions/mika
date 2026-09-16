@@ -1,27 +1,47 @@
-//! Négatif (b) — mika#2263 : **un dispatch dont le process tourne n'est jamais
-//! comptablement « jamais firé ».**
+//! Négatif (b) — mika#2263, **réécrit sur la topologie de production** par
+//! mika#2335 : *une ligne de tracking parent dont le dispatch est parti porte
+//! `fired_at`.*
 //!
-//! Classe mesurée le 2026-09-09 : les rows `b429a658` (#2252) et `4e867d85`
-//! (#2212) étaient `pending` avec `fired_at` VIDE — l'état « pas encore
-//! dispatché » — alors qu'un pilote bwrap tournait réellement dessus. Toute
-//! sonde qui lit `fired_at` pour séparer *non-dispatché* de *zombie* (le
-//! faucheur stuck-pending, `mika tasks`, la colonne du dashboard) voyait ces
-//! rows comme non-dispatchées et passait à côté. Le zombie était invisible à
-//! cette classe entière de sonde.
+//! # Ce que la fixture précédente attestait, et pourquoi elle est remplacée
 //!
-//! Le point de passage obligé est `set_task_process_id(id, Some(pid))` : c'est
-//! le seul endroit où le moteur apprend qu'un process vit sous une task
-//! (`skills/executor.rs`, juste après le `spawn` du pilote). Stamper là couvre
-//! tous les chemins de spawn d'un coup, plutôt que de compter sur la
-//! discipline de chaque appelant.
+//! La version mika#2263 semait bien la forme **parent**, puis appelait
+//! `set_task_process_id` **directement dessus** — un appel que la production ne
+//! fait jamais sur cette row. `set_task_process_id` est le seul écrivain de
+//! `process_id`, et son unique appelant de production (`skills/executor.rs`,
+//! juste après le spawn) l'appelle sur la row **enfant**. Le test validait donc
+//! le `CASE` SQL, pendant que l'invariant qu'il énonçait restait faux en
+//! production : le parent — la row que lisent `mika tasks`, le dashboard et les
+//! sondes de santé — passait par `update_manual_task_status`, qui n'écrit que
+//! `status`, `updated_at` et `completed_at`.
+//!
+//! Conséquence mesurée le 2026-09-15 : un opérateur a lu `status=pending,
+//! fired_at=null` sur un dispatch dont le pilote écrivait des fichiers depuis
+//! 38 minutes, en a conclu « orphelin inerte », et l'a annulé.
+//!
+//! # Ce que ce fichier mesure, et ce qu'il assère structurellement
+//!
+//! - **Mesuré** (comportemental) : `mark_parent_dispatched` stampe, ne réécrit
+//!   jamais un `fired_at` existant, et `rewind`'s writer n'en pose aucun.
+//! - **Asséré structurellement** : les **trois** chemins de dispatch de
+//!   production passent par cet écrivain. Un test comportemental ne peut pas
+//!   couvrir cette moitié sans monter un webhook GitHub complet pour
+//!   `ready_label_handler` et un verdict de revue pour `verdict_handler` ; et
+//!   c'est précisément la moitié qui compte, puisque **le chemin de l'incident
+//!   n'est pas l'original** : `094fc5f6` est un dispatch ready-label. Un
+//!   correctif posé sur le seul `executor.rs` aurait été vert ici et inopérant
+//!   sur le cas fondateur. Le pendant négatif de cette assertion vit dans
+//!   `db::tests::mika2335_no_production_dispatch_transitions_a_parent_without_stamping`.
 //!
 //! # Rouge-avant (porte #2264)
 //!
-//! Sur `main`, `set_task_process_id` n'écrit que `process_id` :
-//! [`recording_a_live_pilot_stamps_fired_at`] échoue sur `fired_at.is_some()`.
-//! Recette d'injection : retirer la branche `CASE WHEN ... fired_at IS NULL`
-//! de l'UPDATE — le test redevient rouge, ses deux contrôles négatifs restent
-//! verts.
+//! Sur le code d'avant, `mark_parent_dispatched` n'existe pas : le fichier ne
+//! compile pas, ce qui est la forme la plus franche du rouge. Recette
+//! d'injection sur cette branche : retirer la clause
+//! `fired_at = CASE WHEN fired_at IS NULL …` de `mark_parent_dispatched` — le
+//! premier test redevient rouge, ses contrôles négatifs restent verts. Pour la
+//! moitié structurelle : remettre `update_manual_task_status(&task_id,
+//! "in_progress")` à l'un des trois sites — `every_production_dispatch_path_stamps`
+//! rougit en nommant le site.
 
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::{Database, NewTask};
@@ -33,9 +53,10 @@ fn test_db() -> AsyncDatabase {
     AsyncDatabase::new_with_agent(db, AGENT_ID)
 }
 
-/// La forme exacte d'une row de dispatch pré-créée par `ready_label_handler` :
-/// `pending`, `fired_at` NULL, aucun process encore enregistré.
-async fn seed_pending_dispatch(db: &AsyncDatabase, reference_url: &str) -> String {
+/// La forme exacte d'une row de tracking parent pré-créée par
+/// `ready_label_handler` : `manual`, `action_type='none'`, `pending`,
+/// `fired_at` NULL, jamais de `process_id`.
+async fn seed_parent_tracking_row(db: &AsyncDatabase, reference_url: &str) -> String {
     db.create_task(NewTask {
         agent_id: AGENT_ID.to_string(),
         team_run_id: None,
@@ -61,79 +82,160 @@ async fn seed_pending_dispatch(db: &AsyncDatabase, reference_url: &str) -> Strin
         dispatch_class: Some("implement".to_string()),
     })
     .await
-    .expect("create pending dispatch row")
+    .expect("create parent tracking row")
 }
 
-/// INVARIANT : enregistrer le process d'un pilote stampe `fired_at`. Un
-/// dispatch vivant ne peut pas se lire « jamais firé ».
+/// INVARIANT : dispatcher un parent le stampe. Une row de tracking dont le
+/// pilote tourne ne peut pas se lire « jamais firée ».
 #[tokio::test]
-async fn recording_a_live_pilot_stamps_fired_at() {
+async fn dispatching_a_parent_stamps_fired_at() {
     let db = test_db();
     let id =
-        seed_pending_dispatch(&db, "https://github.com/senara-solutions/mika/issues/2252").await;
+        seed_parent_tracking_row(&db, "https://github.com/senara-solutions/mika/issues/2334").await;
 
     let before = db.get_task(&id).await.unwrap().unwrap();
     assert!(
         before.fired_at.is_none(),
         "contrôle positif : la row pré-créée part bien sans fired_at"
     );
+    assert_eq!(before.status, "pending");
 
-    db.set_task_process_id(&id, Some(4_014_133))
+    db.mark_parent_dispatched(&id)
         .await
-        .expect("record pilot pid");
+        .expect("mark parent dispatched");
 
     let after = db.get_task(&id).await.unwrap().unwrap();
+    assert_eq!(
+        after.status, "in_progress",
+        "la transition #525 est conservée"
+    );
     assert!(
         after.fired_at.is_some(),
-        "INVARIANT VIOLÉ : un pilote tourne sous cette task et elle se lit \
-         encore 'pending fired_at=null' — le fantôme comptable de mika#2263"
+        "INVARIANT VIOLÉ : un pilote part sous cette task et elle se lit encore \
+         'fired_at=null' — le signal trompeur de mika#2335"
     );
-    assert_eq!(
-        after.process_id,
-        Some(4_014_133),
-        "le pgid reste enregistré"
-    );
-}
-
-/// Contrôle négatif 1 : EFFACER le pgid (ce que fait toute disposition après
-/// un kill) ne stampe rien. Sans lui, un `fired_at = now()` inconditionnel
-/// passerait le test ci-dessus tout en mentant sur des rows jamais dispatchées.
-#[tokio::test]
-async fn clearing_the_pid_never_stamps_fired_at() {
-    let db = test_db();
-    let id =
-        seed_pending_dispatch(&db, "https://github.com/senara-solutions/mika/issues/2212").await;
-
-    db.set_task_process_id(&id, None)
-        .await
-        .expect("clear pid on a never-dispatched row");
-
-    let after = db.get_task(&id).await.unwrap().unwrap();
     assert!(
-        after.fired_at.is_none(),
-        "contrôle négatif : effacer un pgid n'est pas un dispatch"
+        after.process_id.is_none(),
+        "un parent ne porte JAMAIS de pgid : le pgid vit sur l'enfant callback"
     );
 }
 
-/// Contrôle négatif 2 : le stamp est idempotent — un ré-enregistrement de pgid
-/// (retry de spawn) ne réécrit PAS l'heure de tir d'origine, sinon l'âge d'un
-/// dispatch se remettrait à zéro à chaque écriture et tout faucheur fondé sur
-/// cet âge perdrait sa prise.
+/// Contrôle négatif 1 : le stamp est idempotent. Un second passage (retry de
+/// dispatch sur une row déjà `in_progress`) ne déplace pas l'heure de tir
+/// d'origine, sinon l'âge d'un dispatch se remettrait à zéro sous les faucheurs
+/// qui le mesurent.
 #[tokio::test]
-async fn re_recording_a_pid_does_not_move_the_original_fired_at() {
+async fn re_dispatching_does_not_move_the_original_fired_at() {
     let db = test_db();
     let id =
-        seed_pending_dispatch(&db, "https://github.com/senara-solutions/mika/issues/2263").await;
+        seed_parent_tracking_row(&db, "https://github.com/senara-solutions/mika/issues/2263").await;
 
-    db.set_task_process_id(&id, Some(29_905)).await.unwrap();
+    db.mark_parent_dispatched(&id).await.unwrap();
     let first = db.get_task(&id).await.unwrap().unwrap().fired_at;
-    assert!(first.is_some(), "premier enregistrement : fired_at stampé");
+    assert!(first.is_some(), "premier dispatch : fired_at stampé");
 
-    db.set_task_process_id(&id, Some(29_906)).await.unwrap();
+    db.mark_parent_dispatched(&id).await.unwrap();
     let second = db.get_task(&id).await.unwrap().unwrap().fired_at;
 
     assert_eq!(
         first, second,
-        "contrôle négatif : le fired_at d'origine ne bouge pas au ré-enregistrement"
+        "contrôle négatif : le fired_at d'origine ne bouge pas au re-dispatch"
     );
+}
+
+/// Contrôle négatif 2 : le chemin `rewind` ne stampe rien. Il *restaure un
+/// statut antérieur*, ce qui n'est pas un dispatch — et c'est la raison pour
+/// laquelle le stamp est un écrivain nommé plutôt qu'un `CASE` ajouté à
+/// `update_manual_task_status`, que `rewind.rs` partage.
+#[tokio::test]
+async fn restoring_a_status_never_stamps_fired_at() {
+    let db = test_db();
+    let id =
+        seed_parent_tracking_row(&db, "https://github.com/senara-solutions/mika/issues/2212").await;
+
+    db.update_manual_task_status(&id, "in_progress")
+        .await
+        .expect("restore a prior status, the rewind shape");
+
+    let after = db.get_task(&id).await.unwrap().unwrap();
+    assert_eq!(after.status, "in_progress");
+    assert!(
+        after.fired_at.is_none(),
+        "contrôle négatif : restaurer un statut n'est pas dispatcher"
+    );
+}
+
+/// INVARIANT (mika#2335, revue) : **un dispatch ne ressuscite pas un parent
+/// qu'une supersession concurrente vient d'annuler.**
+///
+/// Les deux sites secondaires observent le statut de la ligne, puis créent
+/// l'enfant callback et vérifient le script du handler avant de stamper. Une
+/// supersession pour la même `reference_url` tourne en tête du même handler :
+/// c'est un événement prévu, pas une hypothèse. Sans garde, le dispatch
+/// remettrait `in_progress` par-dessus l'annulation et deux dispatches vivants
+/// se retrouveraient sur un même ticket — par la comptabilité cette fois, pas
+/// par le kill manquant.
+///
+/// Rouge-avant : retirer `AND status IN ('pending','in_progress')` de
+/// `mark_parent_dispatched`.
+#[tokio::test]
+async fn dispatching_never_resurrects_a_parent_cancelled_meanwhile() {
+    let db = test_db();
+    let id =
+        seed_parent_tracking_row(&db, "https://github.com/senara-solutions/mika/issues/2340").await;
+
+    // Ce qu'une supersession concurrente laisse derrière elle.
+    db.update_manual_task_status(&id, "cancelled")
+        .await
+        .expect("a concurrent supersession cancels the parent");
+
+    db.mark_parent_dispatched(&id)
+        .await
+        .expect("the stamp is non-fatal and must not error");
+
+    let after = db.get_task(&id).await.unwrap().unwrap();
+    assert_eq!(
+        after.status, "cancelled",
+        "INVARIANT VIOLÉ : le dispatch a ressuscité un parent annulé"
+    );
+    assert!(
+        after.fired_at.is_none(),
+        "un parent annulé n'a pas été dispatché : rien à stamper"
+    );
+}
+
+/// Un cas par site de dispatch de production (AC4). Assertion **structurelle**
+/// — voir l'en-tête du fichier pour pourquoi cette moitié ne peut pas être
+/// comportementale, et pourquoi elle est celle qui décide du cas fondateur.
+#[test]
+fn every_production_dispatch_path_stamps() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    // (fichier, fonction qui dispatche) — le recensement exhaustif des
+    // appelants de production de la transition parente.
+    for (rel, marker) in [
+        ("skills/executor.rs", "execute_long_running"),
+        ("server/ready_label_handler.rs", "spawn_long_running_exec"),
+        ("server/verdict_handler.rs", "spawn_long_running_exec"),
+    ] {
+        let path = src.join(rel);
+        let body = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("doit pouvoir lire {}: {e}", path.display()));
+        let production = match body.find("#[cfg(test)]") {
+            Some(i) => &body[..i],
+            None => &body[..],
+        };
+        assert!(
+            production.contains(marker),
+            "{rel} ne contient plus {marker} — le recensement des chemins de \
+             dispatch a changé, ce test doit être remis à jour AVANT de \
+             conclure quoi que ce soit sur fired_at"
+        );
+        assert!(
+            production.contains("mark_parent_dispatched"),
+            "AC4 mika#2335 : le chemin de dispatch de {rel} ne stampe pas \
+             `fired_at` sur son parent. Le chemin ready-label est celui de \
+             l'incident du 2026-09-15 — un correctif qui l'oublie est vert et \
+             inopérant."
+        );
+    }
 }
