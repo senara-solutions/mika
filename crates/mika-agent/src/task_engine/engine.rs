@@ -3829,6 +3829,76 @@ impl TaskEngine {
                                 })
                                 .await;
                         }
+                    } else if let super::dispatcher::DispatchError::UnknownTrigger { ref trigger } =
+                        e
+                    {
+                        // mika#2337 — the running binary does not know this
+                        // trigger. The task still dies (the terminal state is
+                        // correct); what is corrected is the *consequence* on
+                        // re-registration.
+                        //
+                        // There is no spam to stop here: re-enqueue lives only
+                        // in the `Ok` arm above, so a recurring task that fails
+                        // is never rescheduled. The line dies once and goes
+                        // quiet — which is exactly why the outage was hard to
+                        // notice. What kept mika#2334 inert for a full day was
+                        // the mika#1742 veto this death armed, and which no path
+                        // lifted.
+                        let err_msg = e.to_string();
+                        let label = match db.get_task(&task_id).await {
+                            Ok(Some(t)) => t.label,
+                            _ => String::from("<unknown>"),
+                        };
+
+                        if trigger_type_val == trigger_type::RECURRING {
+                            // Stamp BEFORE `update_task_failed`, so the row is
+                            // never an unmarked corpse — not even for the
+                            // instant between the two writes.
+                            if let Err(db_err) = db.mark_recurring_unknown_trigger(&task_id).await {
+                                warn!(
+                                    task_id = %task_id,
+                                    error = %db_err,
+                                    "mika#2337: failed to stamp the unknown-trigger death — \
+                                     the mika#1742 veto will survive this one and a restart \
+                                     will refuse to re-register until the grace window elapses"
+                                );
+                            }
+                        }
+
+                        // A named event, not the generic `task dispatch failed`
+                        // — which is indistinguishable from a network failure
+                        // and is what made this class unreadable in the log.
+                        warn!(
+                            event = "recurring_unknown_trigger",
+                            task_id = %task_id,
+                            label = %label,
+                            trigger = %trigger,
+                            trigger_type = %trigger_type_val,
+                            "mika#2337: run_skill trigger registered but not routable by this \
+                             binary — this is a version skew between the merged code and the \
+                             running code, not a defect of the dispatch itself"
+                        );
+
+                        if let Err(audit_err) = db
+                            .log_audit_event(
+                                &format!("system-{}", db.agent_id()),
+                                "recurring_unknown_trigger",
+                                &format!("task:{task_id}"),
+                                None,
+                                Some("failed"),
+                                Some(&format!(
+                                    "label:{label} trigger:{trigger} trigger_type:{trigger_type_val}"
+                                )),
+                                None,
+                            )
+                            .await
+                        {
+                            warn!(task_id = %task_id, error = %audit_err, "failed to write recurring_unknown_trigger audit event");
+                        }
+
+                        if let Err(db_err) = db.update_task_failed(&task_id, &err_msg).await {
+                            warn!(task_id = %task_id, error = %db_err, "failed to mark task as failed in DB");
+                        }
                     } else {
                         let err_msg = e.to_string();
                         warn!(task_id = %task_id, error = %err_msg, "task dispatch failed");

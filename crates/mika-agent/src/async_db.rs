@@ -390,6 +390,15 @@ impl AsyncDatabase {
             .await
     }
 
+    /// mika#2337 — stamp an unknown-trigger death on a recurring row so the
+    /// mika#1742 veto does not survive it. See
+    /// [`Database::mark_recurring_unknown_trigger`].
+    pub async fn mark_recurring_unknown_trigger(&self, task_id: &str) -> Result<usize> {
+        let t = task_id.to_owned();
+        self.with_db(move |db| db.mark_recurring_unknown_trigger(&t))
+            .await
+    }
+
     pub async fn cancel_recurring_task_by_label(&self, label: &str) -> Result<()> {
         // mika#1758 note: this method cancels 0..N recurring rows keyed by
         // (agent_id, label) without returning the affected task ids. Emitting

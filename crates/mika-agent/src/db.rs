@@ -65,6 +65,42 @@ pub const RECURRING_ZOMBIE_GRACE_SQL: &str = "-24 hours";
 /// statements cannot drift apart.
 pub const RECURRING_CONFIG_CANCEL_REVERTED_PATH: &str = "$.config_cancel_reverted";
 
+/// mika#2337: JSON path of the marker written into a recurring task's
+/// `metadata` when it died because the running binary could not route its
+/// trigger ([`crate::task_engine::DispatchError::UnknownTrigger`]).
+///
+/// **Why this death is not like the others.** The mika#1742 refuse-to-zombie
+/// guard exists because a recurring task that kills the system must not re-arm
+/// itself on every restart. For this class the premise does not hold: the
+/// binary that re-registers a trigger name is, by construction, the binary that
+/// carries the match arm for it — the registration literal and the arm are two
+/// literals of the same build (mika#2337 F1+F3, made structural by the
+/// registered-triggers ↔ match-arms guard in `tests/eval`). So the death cannot
+/// predict the next one, and the veto it arms only prolongs the outage it was
+/// meant to contain: **every restart inside the 24 h window, including one with
+/// the correct binary, refuses to re-register.**
+///
+/// Only a death whose cause is the `UnknownTrigger` *variant* carries this
+/// marker — never a substring match on a rendered message. Any other cause of
+/// death keeps arming the veto; mika#1742 is not disarmed in general.
+pub const RECURRING_UNKNOWN_TRIGGER_PATH: &str = "$.unknown_trigger_death";
+
+/// mika#2337: JSON path of the marker that records a veto lift was **spent**
+/// on this `(agent_id, label)` — the self-cleaning half of the exemption.
+///
+/// Written by [`Database::create_recurring_task_if_absent`] on the row whose
+/// [`RECURRING_UNKNOWN_TRIGGER_PATH`] marker it just honoured, in the same
+/// statement that removes that marker. While a row carrying this marker is
+/// still inside the [`RECURRING_ZOMBIE_GRACE_HOURS`] window, the exemption is
+/// disarmed: a **second** unknown-trigger death on the same label meets a fully
+/// armed veto.
+///
+/// Load-bearing. Without it, each death would write a fresh marker on a fresh
+/// row and absolve itself, and a binary that genuinely re-registers a trigger
+/// it cannot route would loop for ever — reopening the exact hole mika#1742
+/// closed. The lift buys **one** restart, not immunity.
+pub const RECURRING_UNKNOWN_TRIGGER_LIFT_CONSUMED_PATH: &str = "$.unknown_trigger_lift_consumed";
+
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
 const UNIFIED_TIMELINE_VIEW_SQL: &str = "\
@@ -6150,12 +6186,43 @@ impl Database {
     /// re-declares the task as wanted — are therefore skipped by this guard.
     /// `failed` / `expired` rows are never exempted.
     ///
+    /// **mika#2337 — unknown-trigger exemption, single-use.** A death caused by
+    /// [`crate::task_engine::DispatchError::UnknownTrigger`] carries
+    /// [`RECURRING_UNKNOWN_TRIGGER_PATH`], and this guard skips it: the binary
+    /// that re-registers a trigger name is the binary that carries its match
+    /// arm, so that death predicts nothing about the next one and the veto only
+    /// prolongs the outage. The exemption is **spent** when honoured — the
+    /// marker is removed and [`RECURRING_UNKNOWN_TRIGGER_LIFT_CONSUMED_PATH`]
+    /// is written in its place — so a *second* unknown-trigger death on the same
+    /// label inside the window meets a fully armed veto. The lift buys one
+    /// restart, not immunity.
+    ///
     /// Non-goal here: fixing the *underlying* dispatch failure for Mika's
     /// specific `curator_review` (Problem A in the ticket). Root-claude's
     /// diagnosis notes PR#1726 (RouteFuture/dashmap wedge) likely already
     /// resolves it. Verification is a Phase-2 follow-up under the Problem-A
     /// investigation.
     pub fn create_recurring_task_if_absent(&self, task: NewTask) -> Result<Option<String>> {
+        // mika#2337 — has a lift already been spent on this (agent, label)
+        // inside the grace window? The marker rides on the row it was spent on,
+        // so it ages out of the window together with the death it absolved:
+        // past the grace, the exemption re-arms rather than being lost for good.
+        let lift_already_spent: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks
+               WHERE agent_id = ?1 AND label = ?2 COLLATE NOCASE
+                 AND trigger_type = 'recurring'
+                 AND updated_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?3)
+                 AND json_valid(metadata)
+                 AND COALESCE(json_extract(metadata, ?4), 0) = 1)",
+            params![
+                task.agent_id,
+                task.label,
+                RECURRING_ZOMBIE_GRACE_SQL,
+                RECURRING_UNKNOWN_TRIGGER_LIFT_CONSUMED_PATH
+            ],
+            |r| r.get::<_, i64>(0).map(|n| n == 1),
+        )?;
+
         // Zombie guard — refuse to re-register a recurring label whose most
         // recent instance died in the grace window.
         let dead_sibling: Option<(String, String, String)> = self
@@ -6168,12 +6235,17 @@ impl Database {
                    AND updated_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?3)
                    AND NOT (json_valid(metadata)
                             AND COALESCE(json_extract(metadata, ?4), 0) = 1)
+                   AND NOT (?5 = 0
+                            AND json_valid(metadata)
+                            AND COALESCE(json_extract(metadata, ?6), 0) = 1)
                  ORDER BY updated_at DESC LIMIT 1",
                 params![
                     task.agent_id,
                     task.label,
                     RECURRING_ZOMBIE_GRACE_SQL,
-                    RECURRING_CONFIG_CANCEL_REVERTED_PATH
+                    RECURRING_CONFIG_CANCEL_REVERTED_PATH,
+                    i64::from(lift_already_spent),
+                    RECURRING_UNKNOWN_TRIGGER_PATH
                 ],
                 |r| {
                     Ok((
@@ -6227,10 +6299,65 @@ impl Database {
             ],
         )?;
         if n > 0 {
+            // mika#2337 — the registration went through; if an unknown-trigger
+            // marker is what let it through, spend it now. Conditioned on
+            // `!lift_already_spent` so a re-registration that never needed the
+            // exemption cannot silently burn a fresh one.
+            if !lift_already_spent {
+                if let Err(e) = self.spend_unknown_trigger_lift(&task.agent_id, &task.label) {
+                    // Fail-open on the *bookkeeping*, never on the guard: the
+                    // row is already registered and the engine is running
+                    // again. An unspent marker costs at most one extra lift on
+                    // the next death; refusing the registration here would
+                    // restore the outage this whole path exists to end.
+                    tracing::warn!(
+                        agent_id = %task.agent_id,
+                        label = %task.label,
+                        error = %e,
+                        "mika#2337: failed to spend the unknown-trigger veto lift — \
+                         the next unknown-trigger death on this label may be \
+                         forgiven a second time"
+                    );
+                }
+            }
             Ok(Some(id))
         } else {
             Ok(None) // already existed (unique-index conflict on an active row)
         }
+    }
+
+    /// mika#2337 — consume the unknown-trigger exemption for `(agent_id, label)`.
+    ///
+    /// Removes [`RECURRING_UNKNOWN_TRIGGER_PATH`] from every row that carries it
+    /// and writes [`RECURRING_UNKNOWN_TRIGGER_LIFT_CONSUMED_PATH`] in the same
+    /// statement. Returns the number of rows whose marker was spent.
+    ///
+    /// **Why both halves.** Removing the marker alone does not bound anything:
+    /// a second death writes a *fresh* marker on a *fresh* row and would absolve
+    /// itself. The `lift_consumed` marker is what the next call reads to find
+    /// the exemption already spent — and because it is never given a new
+    /// `updated_at`, it ages out of the grace window together with the death it
+    /// absolved, so the exemption re-arms rather than being lost permanently.
+    fn spend_unknown_trigger_lift(&self, agent_id: &str, label: &str) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE tasks
+             SET metadata = json_set(
+                     json_remove(
+                         CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                         ?3),
+                     ?4, 1)
+             WHERE agent_id = ?1 AND label = ?2 COLLATE NOCASE
+               AND trigger_type = 'recurring'
+               AND json_valid(metadata)
+               AND COALESCE(json_extract(metadata, ?3), 0) = 1",
+            params![
+                agent_id,
+                label,
+                RECURRING_UNKNOWN_TRIGGER_PATH,
+                RECURRING_UNKNOWN_TRIGGER_LIFT_CONSUMED_PATH
+            ],
+        )?;
+        Ok(n)
     }
 
     /// Get the cron expression for an existing recurring task by label.
@@ -6291,6 +6418,38 @@ impl Database {
                AND NOT (json_valid(metadata)
                         AND COALESCE(json_extract(metadata, ?3), 0) = 1)",
             params![agent_id, label, RECURRING_CONFIG_CANCEL_REVERTED_PATH],
+        )?;
+        Ok(n)
+    }
+
+    /// Mark a recurring task's row as having died on an **unknown trigger**
+    /// (mika#2337). Returns the number of rows marked (0 or 1).
+    ///
+    /// Called from `TaskEngine::fire_task` on the
+    /// [`crate::task_engine::DispatchError::UnknownTrigger`] arm, *before*
+    /// `update_task_failed`, so the row is never a plain unmarked corpse — not
+    /// even for the instant between the two writes.
+    ///
+    /// Writes the integer `1`, not the string `"1"`: the reader compares with
+    /// `COALESCE(json_extract(metadata, ?), 0) = 1`, and SQLite orders INTEGER
+    /// before TEXT, so `'1' = 1` is false. A string would produce a marker that
+    /// is visible in the row and invisible to the guard — the worst shape.
+    ///
+    /// Deliberately does **not** touch `updated_at`, mirroring
+    /// [`Database::revert_config_cancel_recurring_task`]: the row keeps the
+    /// timestamp of its actual death so the audit trail stays truthful, and the
+    /// exemption is carried by the marker rather than by ageing the row out of
+    /// the grace window. Non-JSON `metadata` is replaced by a fresh object
+    /// rather than erroring — the marker matters more than a malformed legacy
+    /// blob.
+    pub fn mark_recurring_unknown_trigger(&self, task_id: &str) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE tasks
+             SET metadata = json_set(
+                     CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                     ?2, 1)
+             WHERE id = ?1 AND trigger_type = 'recurring'",
+            params![task_id, RECURRING_UNKNOWN_TRIGGER_PATH],
         )?;
         Ok(n)
     }
@@ -16598,6 +16757,190 @@ pub(crate) mod tests {
             .create_recurring_task_if_absent(zombie_recurring_task("mika-arch", "curator_review"))
             .unwrap();
         assert!(arch.is_some(), "guard must scope to agent_id");
+    }
+
+    // ── mika#2337 — la levée du veto pour la classe « trigger inconnu » ──
+    //
+    // Trois tests jumeaux. Ils se lisent ensemble : le premier dit ce que la
+    // levée achète, le deuxième ce qu'elle ne touche pas, le troisième ce
+    // qu'elle coûte. Pris isolément, aucun des trois n'atteste l'invariant —
+    // une levée sans bornage passerait le premier, une levée sur *toute* mort
+    // passerait le premier et le troisième.
+
+    /// Tue la récurrence `label` maintenant, `age` en arrière, en marquant (ou
+    /// non) la mort comme « trigger inconnu ». Rend l'id de la ligne morte.
+    fn kill_recurring(db: &Database, label: &str, age: &str, unknown_trigger: bool) -> String {
+        let id = db
+            .create_recurring_task_if_absent(zombie_recurring_task("mika", label))
+            .unwrap()
+            .expect("la ligne doit s'inscrire avant de pouvoir mourir");
+        if unknown_trigger {
+            // L'ordre de production : le marqueur est posé AVANT le passage en
+            // `failed`, pour qu'aucun instant n'expose une mort non marquée.
+            assert_eq!(
+                db.mark_recurring_unknown_trigger(&id).unwrap(),
+                1,
+                "le marqueur doit s'écrire sur une ligne récurrente"
+            );
+        }
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'failed',
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+                 WHERE id = ?1",
+                params![id, age],
+            )
+            .unwrap();
+        id
+    }
+
+    /// AC4 — une mort par trigger inconnu **survenue sous le binaire porteur du
+    /// marquage** n'arme pas le veto : le redémarrage suivant ré-inscrit sans
+    /// attendre les 24 h.
+    ///
+    /// C'est le cœur du hotfix mika#2337 : la ligne `failed` de `fb425f89` a
+    /// gelé la réconciliation de revue (#2334) pendant toute la fenêtre, et
+    /// redéployer — le remède naturel — était précisément ce que cet état
+    /// neutralisait.
+    #[test]
+    fn mika2337_unknown_trigger_death_does_not_arm_the_veto() {
+        let db = db();
+        kill_recurring(&db, "qa_review_reconcile", "-1 hour", true);
+
+        let retry = db
+            .create_recurring_task_if_absent(zombie_recurring_task("mika", "qa_review_reconcile"))
+            .unwrap();
+        assert!(
+            retry.is_some(),
+            "une mort marquée « trigger inconnu » ne doit pas empêcher la \
+             ré-inscription : le binaire qui écrit le nom porte le bras qui le route"
+        );
+    }
+
+    /// AC5 — le contrôle négatif d'AC4, et la seule chose qui l'empêche de
+    /// signifier « mika#1742 est désarmée ». Même scénario, même fenêtre, même
+    /// label : seule la cause de la mort change.
+    #[test]
+    fn mika2337_any_other_death_still_arms_the_veto() {
+        let db = db();
+        kill_recurring(&db, "qa_review_reconcile", "-1 hour", false);
+
+        let retry = db
+            .create_recurring_task_if_absent(zombie_recurring_task("mika", "qa_review_reconcile"))
+            .unwrap();
+        assert!(
+            retry.is_none(),
+            "une mort de toute autre cause doit continuer d'armer le veto \
+             mika#1742 — la levée est une exception nommée, pas un désarmement"
+        );
+    }
+
+    /// AC6 — la levée est à usage unique. Une **seconde** mort marquée sur le
+    /// même label dans la fenêtre retrouve un veto armé.
+    ///
+    /// C'est l'assertion auto-nettoyante au sens du gate : elle rougit le jour
+    /// où la levée cesserait d'être bornée, c'est-à-dire le jour où une boucle
+    /// réelle — un binaire qui ré-enregistre en continu un trigger qu'il ne
+    /// sait pas router — pourrait s'auto-absoudre indéfiniment.
+    #[test]
+    fn mika2337_the_lift_is_single_use_within_the_window() {
+        let db = db();
+        kill_recurring(&db, "qa_review_reconcile", "-2 hours", true);
+
+        let first_retry = db
+            .create_recurring_task_if_absent(zombie_recurring_task("mika", "qa_review_reconcile"))
+            .unwrap();
+        assert!(first_retry.is_some(), "la première levée doit passer (AC4)");
+
+        // La ligne ré-inscrite meurt à son tour, même cause, même fenêtre.
+        let second_id = first_retry.unwrap();
+        assert_eq!(
+            db.mark_recurring_unknown_trigger(&second_id).unwrap(),
+            1,
+            "la seconde mort porte le marqueur, comme la première"
+        );
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'failed',
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 hour')
+                 WHERE id = ?1",
+                params![second_id],
+            )
+            .unwrap();
+
+        let second_retry = db
+            .create_recurring_task_if_absent(zombie_recurring_task("mika", "qa_review_reconcile"))
+            .unwrap();
+        assert!(
+            second_retry.is_none(),
+            "la levée achète UN redémarrage, pas une immunité : la seconde mort \
+             marquée dans la fenêtre doit retrouver le veto armé"
+        );
+    }
+
+    /// Le marqueur de levée consommée sort de la fenêtre avec la ligne qui le
+    /// porte : passé la grâce, l'exemption se ré-arme. Sans cela, un `(agent,
+    /// label)` ayant consommé sa levée une fois la perdrait pour toujours —
+    /// une dispense négative permanente, l'exact miroir du défaut que la levée
+    /// corrige.
+    #[test]
+    fn mika2337_the_lift_rearms_once_the_grace_window_has_elapsed() {
+        let db = db();
+        kill_recurring(&db, "qa_review_reconcile", "-2 hours", true);
+        let reregistered = db
+            .create_recurring_task_if_absent(zombie_recurring_task("mika", "qa_review_reconcile"))
+            .unwrap()
+            .expect("première levée");
+
+        // La ligne consommée ET la nouvelle mort sortent toutes deux de la
+        // fenêtre de 24 h.
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at =
+                 strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-72 hours')
+                 WHERE agent_id = 'mika' AND label = 'qa_review_reconcile'",
+                [],
+            )
+            .unwrap();
+        db.mark_recurring_unknown_trigger(&reregistered).unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'failed',
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 hour')
+                 WHERE id = ?1",
+                params![reregistered],
+            )
+            .unwrap();
+
+        let retry = db
+            .create_recurring_task_if_absent(zombie_recurring_task("mika", "qa_review_reconcile"))
+            .unwrap();
+        assert!(
+            retry.is_some(),
+            "une levée consommée hors fenêtre ne doit plus désarmer l'exemption"
+        );
+    }
+
+    /// Le marqueur est écrit en **entier**, pas en texte. SQLite ordonne
+    /// INTEGER avant TEXT, donc `'1' = 1` est faux : un marqueur textuel serait
+    /// visible dans la ligne et invisible à la garde — la pire des formes,
+    /// puisque l'inspection manuelle le confirmerait tout en le laissant inerte.
+    #[test]
+    fn mika2337_the_marker_is_written_as_an_integer() {
+        let db = db();
+        let id = kill_recurring(&db, "qa_review_reconcile", "-1 hour", true);
+        let typ: String = db
+            .conn
+            .query_row(
+                "SELECT json_type(metadata, ?2) FROM tasks WHERE id = ?1",
+                params![id, RECURRING_UNKNOWN_TRIGGER_PATH],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            typ, "integer",
+            "le marqueur doit être l'entier 1 — la garde compare avec `= 1`"
+        );
     }
 
     /// Consts stay in sync: the SQL modifier's magnitude must match
