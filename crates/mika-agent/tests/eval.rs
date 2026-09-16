@@ -107,6 +107,10 @@ mod eval {
     mod test_ready_label_grooming_guard;
     mod test_real_provider_matrix;
 
+    // mika#2337 — un trigger enregistré a un destinataire (garde de classe),
+    // et une mort par trigger inconnu ne gèle plus la récurrence 24 h.
+    mod test_recurring_trigger_wiring_2337;
+
     // La porte de mika#2277 : le prédicat de kill est une conjonction sur les
     // trois surfaces du pilote. Contrôle positif + N1..N4, même suite.
     mod test_reaper_liveness_all_surfaces_2277;
