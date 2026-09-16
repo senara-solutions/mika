@@ -1046,6 +1046,22 @@ impl AsyncDatabase {
             .await
     }
 
+    /// The dispatch children reachable from an issue URL, whatever the status of
+    /// the tracking row carrying it. Wraps
+    /// [`Database::find_dispatch_children_for_issue_url`]. mika#2279.
+    ///
+    /// Agent-scoped on the **parent**, like
+    /// [`Self::has_active_self_dev_task_for_issue`] — the URL is the only way in
+    /// here, so nothing upstream has already scoped the query.
+    pub async fn find_dispatch_children_for_issue_url(
+        &self,
+        issue_url: &str,
+    ) -> Result<Vec<crate::db::IssueDispatchChild>> {
+        let (a, u) = (self.agent_id.clone(), issue_url.to_owned());
+        self.with_db(move |db| db.find_dispatch_children_for_issue_url(&a, &u))
+            .await
+    }
+
     /// Test-only: rewrite a task's primary key. Wraps
     /// [`Database::set_task_id_for_test`]. mika#2156.
     #[doc(hidden)]

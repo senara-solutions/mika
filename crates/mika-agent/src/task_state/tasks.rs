@@ -199,17 +199,39 @@ pub struct DispatchChild {
     pub status: String,
 }
 
+/// A dispatch child reached from the **issue URL** rather than from a known
+/// parent id, with the parent that carries that URL named alongside it
+/// (mika#2279).
+///
+/// The two fields exist because a dispatch is two rows and neither one alone
+/// answers the question: the **parent** carries `reference_url` and never a
+/// `process_id`, the **child** carries the pgid and never a URL. A caller
+/// asking *"is a pilot alive for this ticket?"* starts from the URL and must be
+/// told both — the child so it can probe liveness, the parent so the refusal it
+/// writes names the row an operator would cancel.
+#[derive(Debug, Clone)]
+pub struct IssueDispatchChild {
+    /// The tracking row carrying the issue URL. Its **status is deliberately
+    /// not constrained** by the query: a `cancelled` parent is precisely the
+    /// state mika#2279 exists to see.
+    pub parent_task_id: String,
+    pub child: DispatchChild,
+}
+
 /// Statuses on which a task no longer has a pilot to kill (mika#2335).
 ///
 /// Deliberately a positive list of terminal states rather than `!= pending &&
 /// != in_progress`: an unknown status must read as *not terminal*, so a state
 /// added later is still disposed of rather than silently spared.
 ///
-/// Lives here, beside [`DispatchChild`], because both callers that filter a
-/// dispatch child on it — the supersession disposal (`tracking_cleanup`) and
-/// the operator cancel path (`task_engine::process_kill`) — must agree. A
-/// second copy of this list is the shape of defect this ticket exists to
-/// remove.
+/// Lives here, beside [`DispatchChild`], because every caller that filters a
+/// dispatch child on it — the supersession disposal (`tracking_cleanup`), the
+/// operator cancel path (`task_engine::process_kill`) and the live-pilot
+/// predicate (`live_pilot`, mika#2279) — must agree. A second copy of this list
+/// is the shape of defect this ticket exists to remove, which is also why
+/// `find_dispatch_children_for_issue_url` does **not** spell the terminal
+/// statuses into its SQL: that would be a third copy, in a dialect where the
+/// "unknown status is not terminal" rule above cannot be read.
 pub fn is_terminal_task_status(status: &str) -> bool {
     use crate::task_engine::types::task_status;
     matches!(

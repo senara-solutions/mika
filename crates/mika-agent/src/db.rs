@@ -8127,6 +8127,85 @@ impl Database {
         Ok(rows)
     }
 
+    /// The dispatch children reachable from an **issue URL**, whatever the
+    /// status of the tracking row that carries it (mika#2279).
+    ///
+    /// Sibling of [`Self::find_dispatch_children_with_pid`], which starts from a
+    /// known parent id. This one starts from the URL, because the caller —
+    /// "is a pilot alive for this ticket?" — holds an issue, not a task.
+    ///
+    /// **The absent predicate is the fix.** There is deliberately no condition
+    /// on `parent.status`. `has_active_self_dev_task_for_issue` conjoins
+    /// `reference_url LIKE …` with `status IN ('pending','in_progress')` on one
+    /// row, and that conjunction goes false the instant a supersession cancels
+    /// the parent — while the pilot on the child keeps running. That false
+    /// answer is what let the mika#2279 loop re-drive a ticket every 20 minutes
+    /// with its pilot working: a cancelled parent is not the absence of a
+    /// dispatch, it is exactly the state where the question needs asking.
+    ///
+    /// `issue_url` is matched as a prefix `LIKE` so the `?phase=groom` variant
+    /// is covered — same rule, same reason, as
+    /// [`Self::has_active_self_dev_task_for_issue`].
+    ///
+    /// Two things this query does **not** decide, both left to the caller:
+    /// liveness (only `/proc` can answer that) and the child's terminal status
+    /// (`is_terminal_task_status` owns that vocabulary; spelling it here would
+    /// be a third copy in a dialect that cannot express its "unknown is not
+    /// terminal" rule).
+    ///
+    /// The `json_valid` guard is carried over verbatim from the sibling, and is
+    /// load-bearing for the same reason: `json_extract` raises a hard error on a
+    /// non-JSON `metadata`, and that error propagates out of the whole
+    /// `query_map` — so one malformed sibling row would make the answer for the
+    /// entire ticket "no pilot", which is the fail-open direction *and* the
+    /// wrong one here.
+    pub fn find_dispatch_children_for_issue_url(
+        &self,
+        agent_id: &str,
+        issue_url: &str,
+    ) -> Result<Vec<IssueDispatchChild>> {
+        let prefix = format!("{}%", issue_url);
+        let mut stmt = self.conn.prepare(
+            "SELECT child.id,
+                    child.process_id,
+                    CASE WHEN json_valid(child.metadata)
+                         THEN json_extract(child.metadata, '$.process_start_time')
+                    END,
+                    child.status,
+                    parent.id
+             FROM tasks child
+             JOIN tasks parent ON child.parent_task_id = parent.id
+             WHERE parent.agent_id = ?1
+               AND parent.reference_url LIKE ?2
+               AND child.trigger_type = 'callback'
+               AND child.process_id IS NOT NULL
+             ORDER BY child.id",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, prefix], |row| {
+                // Same tolerance as the sibling: the executor writes the start
+                // time as a JSON *string*, an integer is accepted too, and
+                // anything else degrades to `None` — which the caller reads as
+                // "cannot prove liveness", never as "alive".
+                let start_time = match row.get::<_, rusqlite::types::Value>(2)? {
+                    rusqlite::types::Value::Text(t) => t.parse::<u64>().ok(),
+                    rusqlite::types::Value::Integer(i) => u64::try_from(i).ok(),
+                    _ => None,
+                };
+                Ok(IssueDispatchChild {
+                    parent_task_id: row.get(4)?,
+                    child: DispatchChild {
+                        id: row.get(0)?,
+                        process_id: row.get(1)?,
+                        process_start_time: start_time,
+                        status: row.get(3)?,
+                    },
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Count `audit_events` rows for a given agent + tool_name — helper for
     /// mika#1712 integration tests to assert the load-bearing delta on the
     /// `phantom_aged_out` audit-write path. Keeping this query as a first-class

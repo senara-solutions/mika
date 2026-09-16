@@ -17,6 +17,7 @@ pub mod evidence;
 pub(crate) mod github_graphql;
 pub mod grooming_marker;
 pub mod kg;
+pub mod live_pilot;
 pub mod mcp;
 pub mod memory;
 pub mod messaging;
