@@ -4627,6 +4627,24 @@ _parse_verdict_fuzzy() {
     fi
 }
 
+# _engine_escalation_line — Tier 0b recognizer (mika#2338).
+#
+# Since mika#2338 the engine no longer withholds an unattested disposition into
+# the tier-0 marker: it rewrites the response into a terminal ESCALATE preceded
+# by a finding line of FIXED shape,
+#     F<n>: (BLOCKING) [mika-engine] review-anchor: attestation withheld … anchors_found=… miss_reason=…
+# This helper prints the first such line, or nothing. The shape is matched at the
+# START OF A LINE and in full: `[mika-engine]` alone is not the signal — every
+# corrective re-prompt begins with it, the model relays it in its session and the
+# arch prompts teach it, so an echo in prose is an ordinary shape. Only the line
+# the engine composes counts. The literal fragment must stay in sync with
+# REVIEW_ANCHOR_ENGINE_FINDING_MARKER in crates/mika-agent/src/agent_loop/mod.rs
+# (test-dispatch-lib.sh compares the two).
+_engine_escalation_line() {
+    # stdin → first engine escalation line on stdout (or nothing).
+    grep -m1 -E '^[[:space:]]*F[0-9]+: \(BLOCKING\) \[mika-engine\] review-anchor:' 2>/dev/null || true
+}
+
 _parse_disposition() {
     # Phase B — first-pass verdict parser. Reads architect response text from
     # stdin, emits READY|ITERATE|ESCALATE on stdout (or nothing on no match).
@@ -4661,10 +4679,11 @@ _parse_disposition() {
     # disposition line was merely removed could still yield READY out of its own body. Tier 0
     # runs first so the engine's refusal cannot be undone downstream. Keep the literal in sync
     # with DISPOSITION_WITHHELD_MARKER in crates/mika-agent/src/agent_loop/mod.rs.
-    # Matched at the START OF A LINE, not anywhere in the text. The three arch prompts now
-    # teach this literal to the model ("replaced with `Disposition-Withheld: ...`"), so a
-    # response that QUOTES the marker while carrying a genuine ITERATE or GROOMED must not be
-    # suppressed. Only the engine writes it as a line of its own.
+    # Matched at the START OF A LINE, not anywhere in the text: a response that QUOTES the
+    # marker while carrying a genuine ITERATE or GROOMED must not be suppressed. Only the
+    # engine writes it as a line of its own. Since mika#2338 this tier is the FALLBACK — the
+    # engine escalates with a cause (tier 0b below) whenever the skill declares an ESCALATE of
+    # the withdrawn line's family, which every shipped arch manifest does.
     case "$text" in
         "Disposition-Withheld: REVIEW-ANCHOR-MISSING"*|*"
 Disposition-Withheld: REVIEW-ANCHOR-MISSING"*)
@@ -4672,6 +4691,17 @@ Disposition-Withheld: REVIEW-ANCHOR-MISSING"*)
             return
             ;;
     esac
+    # Tier 0b — engine escalation line (mika#2338). The engine's refusal of an
+    # unattested disposition is an ESCALATE with a cause, and it must win before
+    # tier 1a: that tier greps the FIRST `Disposition:` anywhere in the text,
+    # unanchored, so a READY the model quoted inline would otherwise be read
+    # before the ESCALATE the engine appended at the end. The engine also
+    # rewrites inline mentions; the two layers each suffice alone.
+    if [ -n "$(printf '%s\n' "$text" | _engine_escalation_line)" ]; then
+        echo "_parse_disposition: tier 0b — engine escalation line present (review-anchor attestation withheld, mika#2338); ESCALATE" >&2
+        echo "ESCALATE"
+        return
+    fi
     # Tier 1a — canonical first-pass shape
     result=$(printf '%s' "$text" | grep -oE 'Disposition:[[:space:]]*(READY|ITERATE|ESCALATE)' \
         | grep -oE '(READY|ITERATE|ESCALATE)' \
@@ -4737,10 +4767,11 @@ _parse_verdict() {
     # disposition line was merely removed could still yield READY out of its own body. Tier 0
     # runs first so the engine's refusal cannot be undone downstream. Keep the literal in sync
     # with DISPOSITION_WITHHELD_MARKER in crates/mika-agent/src/agent_loop/mod.rs.
-    # Matched at the START OF A LINE, not anywhere in the text. The three arch prompts now
-    # teach this literal to the model ("replaced with `Disposition-Withheld: ...`"), so a
-    # response that QUOTES the marker while carrying a genuine ITERATE or GROOMED must not be
-    # suppressed. Only the engine writes it as a line of its own.
+    # Matched at the START OF A LINE, not anywhere in the text: a response that QUOTES the
+    # marker while carrying a genuine ITERATE or GROOMED must not be suppressed. Only the
+    # engine writes it as a line of its own. Since mika#2338 this tier is the FALLBACK — the
+    # engine escalates with a cause (tier 0b below) whenever the skill declares an ESCALATE of
+    # the withdrawn line's family, which every shipped arch manifest does.
     case "$text" in
         "Disposition-Withheld: REVIEW-ANCHOR-MISSING"*|*"
 Disposition-Withheld: REVIEW-ANCHOR-MISSING"*)
@@ -4748,6 +4779,12 @@ Disposition-Withheld: REVIEW-ANCHOR-MISSING"*)
             return
             ;;
     esac
+    # Tier 0b — engine escalation line (mika#2338); see _parse_disposition.
+    if [ -n "$(printf '%s\n' "$text" | _engine_escalation_line)" ]; then
+        echo "_parse_verdict: tier 0b — engine escalation line present (review-anchor attestation withheld, mika#2338); ESCALATE" >&2
+        echo "ESCALATE"
+        return
+    fi
     result=$(printf '%s' "$text" | grep -oE 'Verdict:[[:space:]]*(GROOMED|ESCALATE)' \
         | grep -oE '(GROOMED|ESCALATE)' \
         | head -1)
@@ -4920,6 +4957,21 @@ PIPELINE FAILURE: groom escalated by mika-arch ${stage}.
 Verdict: ESCALATE — human review required.
 Session: ${session_id}
 Architect findings preserved at: ${findings_file}"
+
+    # mika#2338 — when the ESCALATE was written by the ENGINE (review-anchor
+    # attestation withheld after the corrective re-prompt), say so: the cause
+    # line travels into RESULT, and the failure reason names the engine rather
+    # than the architect. Recognized by the full line shape at line start
+    # (_engine_escalation_line), never by `[mika-engine]` alone — an architect
+    # ESCALATE whose prose echoes the re-prompt keeps its own reason.
+    local engine_line
+    engine_line=$(printf '%s\n' "$content" | _engine_escalation_line)
+    if [ -n "$engine_line" ]; then
+        echo "iterate_groom_loop: engine escalation at ${stage} — review-anchor attestation withheld (mika#2338)" >&2
+        RESULT="${RESULT}
+Engine reason: ${engine_line}"
+        GROOM_LOOP_FAILURE_REASON="engine ESCALATE (${stage}): review-anchor attestation withheld"
+    fi
 }
 
 _write_canonical_callout() {

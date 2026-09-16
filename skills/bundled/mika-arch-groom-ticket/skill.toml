@@ -4,6 +4,13 @@ description = "First-pass principle-grounded plan review — produces READY / IT
 version = "0.1.0"
 always_on = true
 timeout_secs = 120
+# mika#2338 — the Review-Anchor Attestation Contract gained the three citation
+# rules the comparator actually checks (brief of this turn, anchor line only,
+# words not markup) and the ESCALATE-with-cause outcome; the prompt is 16 269
+# bytes, 99 % of the 16 KiB default, past the 95 % warn gate (mika#852). Raised
+# to 24 KiB: headroom for one more rule, well under the 80 KiB ceiling. The
+# declared size costs nothing — the real size is injected.
+max_prompt_size = 24576
 
 [triggers]
 keywords = [
