@@ -207,6 +207,119 @@ where
         };
     }
 
+    // The canonical issue URL. Resolved here rather than at step 7 because the
+    // live-pilot gate below is keyed on it — and because it depends on nothing
+    // but the marker, which is what lets that gate run before any round trip.
+    let issue_url = format!(
+        "https://github.com/{}/issues/{}",
+        location.owner_repo(),
+        location.number
+    );
+
+    // 2c. Live-pilot gate (mika#2279). A `labeled ready` event for a ticket
+    //     whose pilot is still running is a NO-OP: no task, no supersession, no
+    //     kill, no deferred dispatch.
+    //
+    //     Measured on #2276, 2026-09-10: a second `labeled ready` landed 31
+    //     seconds after the dispatch, superseded the parent — which since
+    //     mika#2335 also KILLS the running pilot — then failed the readiness
+    //     check and registered a duplicate deferred dispatch. `auto_pull` then
+    //     read the cancelled parent as "nothing in flight" and re-drove the
+    //     label, closing a loop that turned every ~20 minutes with no human in
+    //     it. The supersede's kill is the correct contract for a dispatch that
+    //     is *new*; a replayed `labeled` event is not a new dispatch, so the
+    //     missing guard belongs on the trigger, not in the supersede (putting it
+    //     there would undo mika#2335).
+    //
+    //     Placement is reasoned, not inherited. **Before step 3**, so it costs
+    //     no `gh issue view` — the predicate reads the issue's URL, never its
+    //     body, and the measured loop was paying one round trip every 20 minutes
+    //     for nothing. **Before 6b and 7**, which is the property that matters
+    //     and that the three neighbouring gates already state: zero task
+    //     created, zero process killed, zero deferred dispatch. The step-9d
+    //     deferral disappears because step 9d is never reached, not because an
+    //     exception was added to the deferral registry.
+    //
+    //     Ordering against 4c (operator-held) is a deliberate choice: a ticket
+    //     both in flight and operator-held is refused as "in flight". Both
+    //     refusals create zero tasks, only the event name differs, and the
+    //     cheaper one wins. Named so it does not read later as an oversight.
+    //
+    //     Refusal returns `Handled`, never `Passthrough` — for the fourth time
+    //     in this function and for the reason written at each of the other
+    //     three: `Passthrough` leaves `req.text` on the ready-label marker,
+    //     which is exactly what `webhook_ready_label_dispatch` triggers on, and
+    //     the guard would re-prompt the LLM until it dispatched the ticket this
+    //     gate just refused.
+    //
+    //     Fail-safe: only `Alive` refuses. A dead pilot, an unreadable
+    //     `process_start_time` or a DB error yield `None` / `Unreadable`, and
+    //     the dispatch proceeds exactly as it did before this gate existed —
+    //     see `live_pilot`'s module doc for why the asymmetry leans this way.
+    if let crate::live_pilot::LivePilotVerdict::Alive {
+        child_task_id,
+        parent_task_id,
+        pid,
+    } = crate::live_pilot::live_pilot_for_issue(db, &issue_url).await
+    {
+        let owner_repo = location.owner_repo();
+        // INFO, not WARN: a `ready` event arriving on a ticket already in flight
+        // is a nominal consequence of how the feeder and the webhook path
+        // compose. What would be anomalous is a sustained stream of these on one
+        // ticket — that is a producer still beating the label, and it is this
+        // line that names it.
+        info!(
+            event = "ready_label_pilot_in_flight",
+            repo = %owner_repo,
+            num = location.number,
+            child_task_id = %child_task_id,
+            parent_task_id = %parent_task_id,
+            pid,
+            "ready_label_handler: `ready` event on a ticket whose pilot is still \
+             running — no-op before task creation, supersession and dispatch"
+        );
+
+        // Operator-visible record. As at the three gates around it, no `task_id`
+        // exists yet by construction, so the audit target is the issue reference:
+        // `SELECT target_key, count(*) … WHERE tool_name =
+        // 'ready_label_pilot_in_flight' GROUP BY 1` answers "how many times was
+        // this ticket re-triggered during its own dispatch?" directly.
+        if let Err(e) = db
+            .log_audit_event(
+                session_id,
+                "ready_label_pilot_in_flight",
+                &format!("{}#{}", owner_repo, location.number),
+                None,
+                Some("dispatch_refused"),
+                Some(&format!(
+                    "repo={} number={} refused=live_pilot pid={} child_task_id={} \
+                     parent_task_id={}",
+                    owner_repo, location.number, pid, child_task_id, parent_task_id
+                )),
+                Some(trace_id),
+            )
+            .await
+        {
+            warn!(
+                event = "ready_label_audit_log_failed",
+                repo = %owner_repo,
+                num = location.number,
+                error = %e,
+                "ready_label_handler: failed to write live-pilot refusal audit event \
+                 (non-fatal)"
+            );
+        }
+
+        return VerdictAction::Handled {
+            pre_digest: format_pilot_in_flight_pre_digest(
+                &location,
+                pid,
+                &child_task_id,
+                &parent_task_id,
+            ),
+        };
+    }
+
     // 3. Need a GitHub token to fetch the issue body. Without it we cannot
     //    determine groomed-state, so degrade to passthrough.
     let token = match github_token {
@@ -384,12 +497,8 @@ where
 
     // 7. Pre-create the task in DB. The LLM's tool call will reuse this
     //    `task_id` rather than calling `create_task` first — removes one
-    //    decision-point from the LLM's path.
-    let issue_url = format!(
-        "https://github.com/{}/issues/{}",
-        location.owner_repo(),
-        location.number
-    );
+    //    decision-point from the LLM's path. (`issue_url` was resolved at step
+    //    2c, which needed it first.)
     let agent_id = db.agent_id().to_string();
     let task_label = format!("ready-label: {}#{}", location.owner_repo(), location.number);
 
@@ -762,6 +871,49 @@ pub async fn fetch_issue_body_and_labels_via_gh(
         })
         .unwrap_or_default();
     Ok((body, labels))
+}
+
+/// Pre-digest for a `ready` event on a ticket whose pilot is still running
+/// (mika#2279).
+///
+/// Opens with `<ready_label_handler>` for the same load-bearing reason as its
+/// three neighbours: any text still matching the `webhook_ready_label_dispatch`
+/// trigger would have the INTENT_GUARD demand the very dispatch this refusal
+/// exists to prevent.
+///
+/// Names the pilot's pid and the row that carries it, **and the gesture that
+/// lifts the refusal**. The last part is not politeness: a refusal that does not
+/// name its own release is a refusal someone works around by guesswork, and the
+/// guess available here — re-applying `ready` — is precisely the loop the gate
+/// was built to stop.
+fn format_pilot_in_flight_pre_digest(
+    loc: &ReadyLabelLocation,
+    pid: u32,
+    child_task_id: &str,
+    parent_task_id: &str,
+) -> String {
+    let owner_repo = loc.owner_repo();
+    let number = loc.number;
+    format!(
+        "<ready_label_handler>\n\
+         DISPATCH REFUSED — {owner_repo}#{number} already has a pilot running \
+         (pid {pid}).\n\n\
+         A repeated `ready` event on a ticket already in flight is a no-op. \
+         Re-dispatching it would supersede the tracking row of the LIVE pilot, \
+         kill it mid-work (mika#2335), and queue a duplicate dispatch for the same \
+         ticket. Dispatch task: {parent_task_id}; dispatch child: {child_task_id}.\n\n\
+         No task was created, no process was signalled, no dispatch was deferred. \
+         You MUST NOT:\n\
+         - call `run_claude_pilot` or `run_claude_pilot_groom` for this issue\n\
+         - call `create_task` for this issue\n\
+         - re-add or re-trigger the `ready` label\n\n\
+         Acknowledge and end the turn; use `send_message` only if the operator \
+         asked to be told.\n\n\
+         To force a fresh dispatch, an operator runs `mika tasks cancel \
+         {parent_task_id}` (which warns and asks for confirmation while the pilot \
+         is alive) and then re-applies `ready`.\n\
+         </ready_label_handler>"
+    )
 }
 
 /// Pre-digest for a `ready` event on a ticket an operator is holding

@@ -109,6 +109,10 @@ mod eval {
     mod test_qa_review_reconcile_2347;
     mod test_ready_label_blocked_skip;
     mod test_ready_label_grooming_guard;
+
+    // mika#2279 — un `labeled ready` répété sur un ticket dont le pilote est vif
+    // est un NO-OP : processus réel, topologie parent/enfant de production.
+    mod test_ready_label_live_pilot_noop_2279;
     mod test_real_provider_matrix;
 
     // mika#2337 — un trigger enregistré a un destinataire (garde de classe),
