@@ -20,6 +20,12 @@ The broken form is synthesized — built by mutating the current source — rath
 
 It proves the predicate that was written, not the perimeter that was intended. Every input reaching the mutated predicate had already been admitted as something to judge, so going red establishes that the decision is load-bearing and says nothing about what never got that far. Coverage of the detection step is a separate question, asked against the consumer rather than against the guard.
 
+### Review-anchor attestation
+
+The evidence a non-terminal architect disposition (`Disposition: READY`, `Verdict: GROOMED`) must carry to count as a review: at least three anchor lines (`A1:`…) each quoting at least forty characters of the brief, at distinct regions of it. A disposition keyword alone is an acknowledgement, not an attestation, and the engine treats an unattested one as no verdict at all — never as an approval.
+
+"Quoting the brief" means its words, not its bytes: the brief is markdown and a model quotes what it read, so inline markers and apostrophe shape fold away on both sides before comparison, while a paraphrase or an exact quote of a different document is still refused. The comparison runs against the brief message of the turn being answered, never against a file the model opened or an earlier ticket in its session. A first miss earns one corrective re-prompt; a second is escalated with its cause (anchors found, anchors valid, miss reason) as a terminal `ESCALATE`, which downstream reads before any textual verdict tier. It is a runtime guard, not a [structural guard](#structural-guard).
+
 ## Pilot containment
 
 ### Pilot sandbox
