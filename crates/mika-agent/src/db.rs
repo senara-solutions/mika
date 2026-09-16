@@ -6738,6 +6738,75 @@ impl Database {
         Ok(old_status)
     }
 
+    /// Transition a **parent tracking row** to `in_progress` on dispatch **and**
+    /// stamp `fired_at` (mika#2335, facette 2).
+    ///
+    /// SOLE WRITER of the parent-side dispatch transition. The three production
+    /// dispatch paths — `skills::executor::execute_long_running` (#525, the
+    /// original), `server::ready_label_handler` and `server::verdict_handler`
+    /// (both of which say in their own comments that they *mirror* the first) —
+    /// call this instead of `update_manual_task_status(…, "in_progress")`.
+    ///
+    /// **The defect this closes.** `set_task_process_id` stamps `fired_at`
+    /// (mika#2263 défaut (b)), and it is the sole writer of `process_id` — but
+    /// its only production caller writes the **callback child**. The parent
+    /// tracking row, the one every operator surface reads (`mika tasks`, the
+    /// dashboard, the health probes), went through `update_manual_task_status`,
+    /// which writes `status`, `updated_at` and `completed_at` and nothing else.
+    /// So a live dispatch's parent read `fired_at = NULL` — "never fired" — for
+    /// the whole life of the pilot. On 2026-09-15 an operator read exactly that
+    /// and cancelled a pilot that had been running for 38 minutes.
+    ///
+    /// **Why a dedicated writer and not a `CASE` added to
+    /// [`Self::update_manual_task_status`].** That method also serves
+    /// `rewind.rs`, which *restores a prior status* and must stamp nothing — a
+    /// rewind is not a dispatch. Naming the dispatch transition separates the
+    /// two intents at the call site instead of relying on a conditional that a
+    /// future caller would inherit silently.
+    ///
+    /// **An existing `fired_at` is never overwritten**, same clause and same
+    /// reason as `set_task_process_id`: the reapers measure a dispatch's age
+    /// from it, and a re-stamp would reset that age under them.
+    ///
+    /// Returns the prior status (`None` when no such manual row exists), so
+    /// callers keep the non-fatal `warn!`-and-continue shape they already had —
+    /// the stamp is observability and must never fail a dispatch.
+    pub fn mark_parent_dispatched(&self, task_id: &str, agent_id: &str) -> Result<Option<String>> {
+        let old_status: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = ?1 AND agent_id = ?2 AND trigger_type = 'manual'",
+                params![task_id, agent_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        if old_status.is_none() {
+            return Ok(None);
+        }
+
+        // Unlike `update_manual_task_status`, an unchanged status is NOT an
+        // early return: a row already `in_progress` whose dispatch is only now
+        // firing still needs its `fired_at`. Skipping the write there would
+        // reproduce the defect on every path that transitions before it
+        // dispatches.
+        self.conn.execute(
+            "UPDATE tasks
+                SET status = 'in_progress',
+                    fired_at = CASE
+                                 WHEN fired_at IS NULL
+                                 THEN strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                                 ELSE fired_at
+                               END,
+                    completed_at = NULL,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+              WHERE id = ?1 AND agent_id = ?2 AND trigger_type = 'manual'",
+            params![task_id, agent_id],
+        )?;
+
+        Ok(old_status)
+    }
+
     /// Number of columns in TASK_COLUMNS (used for child_count ordinal in list_manual_tasks).
     /// Bumped to 32 in mika#1948 for `dispatcher_source`.
     const TASK_COLUMN_COUNT: usize = 32;
@@ -6946,42 +7015,16 @@ impl Database {
         Ok(rows)
     }
 
-    /// Every **live dispatch** a fresh dispatch for `base_url` supersedes
-    /// (mika#2263 défaut (a)).
-    ///
-    /// The complement of
-    /// [`Self::find_active_tracking_rows_by_reference_url_and_variants`], and
-    /// deliberately so: that lookup answers "which phantom ROWS does this
-    /// dispatch replace" and filters on `process_id IS NULL`, so a row carrying
-    /// a running pilot is not even a candidate. That filter is what let the
-    /// mika#2263 zombies live — supersede cancelled the row it could see and
-    /// never looked at the process it could not.
-    ///
-    /// Returns non-terminal rows (`pending`/`in_progress`) that carry a
-    /// `process_id`, for the exact URL and its `?phase=groom` variant — same
-    /// two-variant coverage as the phantom lookup, so a groom dispatch disposes
-    /// of the base-URL pilot too.
-    pub fn find_live_dispatch_rows_by_reference_url_and_variants(
-        &self,
-        agent_id: &str,
-        base_url: &str,
-    ) -> Result<Vec<Task>> {
-        let groom_url = format!("{base_url}{}", crate::task_state::tasks::GROOM_PHASE_SUFFIX);
-        let sql = format!(
-            "SELECT {} FROM tasks
-             WHERE agent_id = ?1
-               AND process_id IS NOT NULL
-               AND status IN ('pending', 'in_progress')
-               AND reference_url IN (?2, ?3)
-             ORDER BY id",
-            Self::TASK_COLUMNS
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(params![agent_id, base_url, groom_url], Self::row_to_task)?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok(rows)
-    }
+    // mika#2335 — `find_live_dispatch_rows_by_reference_url_and_variants` lived
+    // here and is deleted, not left in place. Its WHERE clause was
+    // `process_id IS NOT NULL AND reference_url IN (?2, ?3)`, a conjunction
+    // **empty on the topology production writes**: the `reference_url` is on
+    // the parent tracking row, which never carries a `process_id`; the pgid is
+    // on the callback child, which never carries a `reference_url`. It could
+    // not return a row for any normal dispatch — not in the mika#2263 incident,
+    // in none. A query that can return nothing and stays in the file will one
+    // day be read as a guarantee. The traversal that does work already existed
+    // and is tested: [`Self::find_dispatch_children_with_pid`].
 
     /// Guarded transition of a phantom tracking row → `cancelled` with the
     /// canonical supersede reason (mika#1934 AC2).
@@ -7879,7 +7922,8 @@ impl Database {
                     process_id,
                     CASE WHEN json_valid(metadata)
                          THEN json_extract(metadata, '$.process_start_time')
-                    END
+                    END,
+                    status
              FROM tasks
              WHERE parent_task_id = ?1
                AND process_id IS NOT NULL
@@ -7901,6 +7945,7 @@ impl Database {
                     id: row.get(0)?,
                     process_id: row.get(1)?,
                     process_start_time: start_time,
+                    status: row.get(3)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -14325,6 +14370,137 @@ pub(crate) mod tests {
         let session_id = "test-session".to_string();
         db.create_session(&session_id, "mika", "cli").unwrap();
         (db, session_id)
+    }
+
+    // ── mika#2335 F2a: la transition de dispatch d'un parent a UN écrivain ──
+
+    /// Aucun chemin de production ne transitionne un parent avec
+    /// `update_manual_task_status(…, "in_progress")` — c'est
+    /// [`Database::mark_parent_dispatched`] qui le fait, stamp compris.
+    ///
+    /// **Pourquoi un scan de source et pas un test comportemental.** La
+    /// régression que cette garde attrape ne rend aucune décision fausse sur
+    /// les chemins couverts : elle ajoute un *quatrième* chemin de dispatch,
+    /// muet sur `fired_at`, pendant que toutes les assertions existantes
+    /// restent vertes. Famille
+    /// `mika2205_periodic_scans_do_not_read_the_pat_field_directly` /
+    /// `mika2131_exclusion_skips_never_return_to_an_uncollected_debug`.
+    ///
+    /// Les deux sites secondaires (`ready_label_handler`, `verdict_handler`)
+    /// existent parce qu'un chemin de dispatch a été ajouté en recopiant le
+    /// premier — leurs commentaires le disent en toutes lettres (« mirrors
+    /// execute_long_running's #525 transition »). Le quatrième arrivera de la
+    /// même façon.
+    ///
+    /// **Allowlist vide, à dessein.** Exempter les trois sites du recensement
+    /// aurait rendu la garde verte en laissant `fired_at` NULL sur exactement
+    /// les trois chemins que le ticket décrit — donc en contredisant AC4. Ils
+    /// ont migré ; aucun n'est exempté.
+    ///
+    /// **Disposition d'un quatrième site : halt-and-surface.** Pas d'entrée
+    /// d'allowlist, pas de `#[ignore]`. La réponse dépend d'une question que
+    /// personne ne peut pré-trancher ici : ce site dispatche-t-il un parent (→
+    /// il migre, et il était un quatrième visage du défaut) ou non (→ il est
+    /// légitime, et c'est cette garde qu'il faut affiner) ? Deviner en silence,
+    /// c'est soit poser un `fired_at` sur une ligne jamais dispatchée, soit
+    /// exempter un chemin de dispatch muet.
+    ///
+    /// **Portée : lexicale sur le littéral `"in_progress"`, et c'est un coût
+    /// assumé.** Deux appelants de production passent le statut par variable et
+    /// échappent structurellement à ce scan — `rewind.rs` (`before_status`,
+    /// restaure un statut antérieur) et `tools/update_task_status.rs` (l'outil
+    /// agent). C'est le bon comportement : aucun des deux n'est un dispatch et
+    /// aucun ne doit stamper. Mais un futur chemin de dispatch qui
+    /// construirait son statut dans une variable passerait dessous. Un scan
+    /// sémantique demanderait une analyse de flot que cette famille de gardes
+    /// n'a pas.
+    ///
+    /// Les lignes de commentaire sont neutralisées avant le scan — sans quoi la
+    /// doc de `mark_parent_dispatched`, qui doit nommer l'appel qu'elle
+    /// remplace, ferait rougir la garde. Les commentaires de bloc `/* … */` ne
+    /// le sont pas : ce dépôt n'en écrit pas, et une prose qui en emploierait
+    /// un pour citer l'appel proscrit se signalerait d'elle-même au premier run.
+    #[test]
+    fn mika2335_no_production_dispatch_transitions_a_parent_without_stamping() {
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut violations: Vec<String> = Vec::new();
+
+        for path in rust_sources_under(&src_root) {
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("la garde doit pouvoir lire {}: {e}", path.display()));
+
+            // Tronquer au premier module de test : ces fixtures posent
+            // légitimement des rows `in_progress` à la main.
+            let production = match src.find("#[cfg(test)]") {
+                Some(i) => &src[..i],
+                None => &src[..],
+            };
+
+            // Les lignes de commentaire sont neutralisées (et non supprimées,
+            // pour que les numéros de ligne restent ceux du fichier) : la prose
+            // doit pouvoir décrire ce qui est interdit — y compris la doc de
+            // `mark_parent_dispatched` juste au-dessus, qui nomme l'appel
+            // proscrit. Même idiome que `milestone_manager/no_dispatch_test.rs`.
+            let code: String = production
+                .lines()
+                .map(|l| {
+                    if l.trim_start().starts_with("//") {
+                        ""
+                    } else {
+                        l
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let needle = "update_manual_task_status";
+            let mut from = 0usize;
+            while let Some(rel) = code[from..].find(needle) {
+                let at = from + rel;
+                // Fenêtre volontairement large : l'appel est régulièrement
+                // reformaté sur trois lignes par `cargo fmt`, et une fenêtre
+                // trop courte ferait passer le prochain site sous la garde.
+                let end = (at + 200).min(code.len());
+                let window = &code[at..end];
+                if window.contains("\"in_progress\"") {
+                    let line = code[..at].matches('\n').count() + 1;
+                    violations.push(format!("{}:{line}", path.display()));
+                }
+                from = at + needle.len();
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "mika#2335 F2a — ces sites de production transitionnent un parent \
+             sans stamper `fired_at` : {violations:?}\n\
+             Si le site dispatche un parent, il doit appeler \
+             `mark_parent_dispatched`. S'il ne dispatche pas, c'est la garde \
+             qu'il faut affiner — et dans les deux cas c'est une décision à \
+             prendre explicitement, pas une exemption à poser en passant."
+        );
+    }
+
+    /// Énumère récursivement les `.rs` sous `root`. Utilisée par la garde de
+    /// source ci-dessus ; pas de dépendance `walkdir` pour un test.
+    pub(crate) fn rust_sources_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|e| e == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        out.sort();
+        out
     }
 
     // ── mika#1948 Porte 2: exec-slot arbitration ──

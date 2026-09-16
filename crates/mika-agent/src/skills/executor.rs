@@ -3059,14 +3059,11 @@ async fn execute_long_running(
     let estimated = estimated_duration_secs.unwrap_or(3600);
     let timeout_secs = (estimated * 3).clamp(600, 7_776_000); // 10min..90days
 
-    // Auto-transition pending tasks to in_progress on dispatch (#525).
-    // Closes the TOCTOU window where two dispatches to a pending item both pass.
+    // Auto-transition pending tasks to in_progress on dispatch (#525), and
+    // stamp `fired_at` on the parent (mika#2335) — the transition and the stamp
+    // are one act, so they are one writer.
     if wi_status == "pending" {
-        if let Err(e) = ctx
-            .db
-            .update_manual_task_status(task_id, "in_progress")
-            .await
-        {
+        if let Err(e) = ctx.db.mark_parent_dispatched(task_id).await {
             // Non-fatal: the callback child creation provides a secondary guard
             warn!(
                 task_id,

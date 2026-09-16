@@ -189,6 +189,14 @@ pub struct DispatchChild {
     pub id: String,
     pub process_id: i64,
     pub process_start_time: Option<u64>,
+    /// The child's own status (mika#2335). The query still does **not** filter
+    /// on it — mika#2156's D-2 reasoning is unchanged, liveness is the
+    /// discriminator and the caller applies it. This field exists so a second
+    /// caller can apply a *different* rule without a second resolver: the
+    /// supersede disposal skips a terminal child (`delivered`, `cancelled`, …)
+    /// because there is no pilot left to kill and its `process_id` is a stale
+    /// pgid. One join predicate, two filtering decisions, both at their caller.
+    pub status: String,
 }
 
 /// A parent self_dev task left `in_progress` after its callback subtask

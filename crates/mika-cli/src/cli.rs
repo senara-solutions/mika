@@ -795,7 +795,13 @@ pub enum TaskCommand {
         format: OutputFormat,
     },
     /// Cancel a task by ID (from `mika tasks`)
-    Cancel { id: String },
+    Cancel {
+        id: String,
+        /// Skip the confirmation prompt when a pilot is still running under
+        /// this task (mika#2335). Required in non-interactive contexts.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Force-promote the next pending deferred dispatch wrapper for a class.
     /// Fails if the per-class dispatch slot is occupied, unless --override is set.
     PromoteDeferred {

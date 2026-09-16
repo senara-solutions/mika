@@ -862,8 +862,9 @@ async fn try_engine_dispatch(
         };
     }
 
-    // Auto-transition parent task to in_progress (mirrors execute_long_running #525).
-    if let Err(e) = db.update_manual_task_status(task_id, "in_progress").await {
+    // Auto-transition parent task to in_progress and stamp `fired_at` (mirrors
+    // execute_long_running #525; the stamp is mika#2335).
+    if let Err(e) = db.mark_parent_dispatched(task_id).await {
         warn!(
             task_id = %task_id,
             error = %e,

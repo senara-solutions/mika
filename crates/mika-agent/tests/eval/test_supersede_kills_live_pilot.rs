@@ -1,31 +1,50 @@
-//! Négatif (a) — mika#2263 : **une supersession ne laisse jamais un pilote vivant
-//! derrière elle.**
+//! Négatif (a) — mika#2263, **réécrit sur la topologie de production** par
+//! mika#2335 : *une supersession ne laisse jamais vivant le pilote de l'enfant.*
 //!
-//! Classe mesurée le 2026-09-09 : `#2252` et `#2212` portaient chacun une row
-//! `cancelled` (l'ancien dispatch, superseded) ET un process bwrap **toujours
-//! vivant** (69 min / 45 min), parce que la supersession annule la ROW et
-//! ignore le PROCESS. Deux écrivains sur le même worktree (classe #2248/#2249)
-//! et deux slots de dispatch brûlés.
+//! # Ce que la fixture précédente attestait, et pourquoi elle est remplacée
 //!
-//! L'invariant que ces tests nomment : *après un passage de
-//! `supersede_prior_tracking_rows` sur une `reference_url`, aucun process de
-//! dispatch antérieur pour cette URL n'est encore en vie.*
+//! La version mika#2263 de ce fichier semait **une chimère** : une seule row
+//! portant à la fois `trigger_type: "callback"`, `reference_url: Some(url)`,
+//! `process_id` et `parent_task_id: None`. Cette forme satisfait la conjonction
+//! SQL de `find_live_dispatch_rows_by_reference_url_and_variants`
+//! (`process_id IS NOT NULL AND reference_url IN (…)`) — et **la production ne
+//! l'écrit jamais**. Un dispatch, c'est deux rows :
+//!
+//! | row | `trigger_type` | `reference_url` | `process_id` |
+//! |---|---|---|---|
+//! | **parent** (tracking) | `manual` / `action_type='none'` | **oui** | **jamais** |
+//! | **enfant** (callback) | `callback` / `resume_agent` | **non** | **oui** (le pgid) |
+//!
+//! L'URL est sur le parent, le pgid sur l'enfant, rien ne porte les deux : la
+//! conjonction était **vide en production**, donc le correctif mika#2263 était
+//! inopérant depuis sa livraison — et son test vert. Mesuré le 2026-09-15 : le
+//! log du pilote survivant `590a06c0` ne contient **aucune** occurrence de
+//! `SIGTERM`, `CANCELLED_BY`, `superseded` ou `Killed`. La supersession ne l'a
+//! pas raté de peu, elle ne l'a jamais vu.
+//!
+//! La fixture n'est donc ni `#[ignore]`, ni supprimée, ni adaptée au nouveau
+//! code : elle est **réécrite sur la forme que la production écrit** — même
+//! remède que mika#2272 (« zéro était l'absence de mesure, pas la présence de
+//! prudence »).
 //!
 //! # Rouge-avant (porte #2264)
 //!
-//! Sur `main`, `supersede_prior_tracking_rows` ne regarde QUE les rows
-//! fantômes (`process_id IS NULL`) : une row portant un pgid n'est même pas
-//! candidate, donc l'enfant reste vivant et
-//! [`live_pilot_is_killed_by_supersede`] échoue sur son assertion
-//! `!is_alive(pid)`. Sur cette branche il passe. Recette d'injection : commenter
-//! l'appel `dispose_superseded_dispatch_processes(...)` dans
-//! `supersede_prior_tracking_rows` — le test redevient rouge.
+//! Sur le code d'avant, [`live_pilot_of_the_child_is_killed_by_supersede`]
+//! échoue sur `!is_alive(pid)` : la traversée `parent_task_id` n'existait pas
+//! dans le chemin de supersession, et le résolveur par `reference_url` ne
+//! pouvait rendre aucune row de cette topologie. Recette d'injection sur cette
+//! branche : retirer l'appel à `dispose_superseded_dispatch_processes` dans
+//! `supersede_prior_tracking_rows`, ou remplacer son argument `&candidates` par
+//! `&[]` — le test redevient rouge et les trois contrôles négatifs restent
+//! verts.
 
 use std::process::Command;
 
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::{Database, NewTask};
-use mika_agent::tracking_cleanup::supersede_prior_tracking_rows;
+use mika_agent::tracking_cleanup::{
+    SUPERSEDED_DISPATCH_PROCESS_KILLED_TOOL, supersede_prior_tracking_rows,
+};
 
 const AGENT_ID: &str = "mika";
 const SESSION: &str = "eval-session";
@@ -37,15 +56,25 @@ fn test_db() -> AsyncDatabase {
 }
 
 /// Un enfant réel, chef de son propre groupe de process — la forme exacte que
-/// `dispatch-lib` donne à un pilote (le kill vise le pgid). Reprend
-/// `spawn_live_child` de `test_pilot_silent_stall_reaper.rs` : le handle est
+/// `dispatch-lib` donne à un pilote (le kill vise le pgid). Le handle est
 /// attendu dans un thread pour que le process mort soit *récolté*, sinon
 /// `/proc/<pid>/stat` survit en zombie et une sonde de vivacité mentirait.
-fn spawn_live_child() -> (i64, u64) {
+///
+/// **Deux précautions que la version mika#2263 n'avait pas, et qui se paient
+/// au premier échec.** (1) Sa sortie standard est `/dev/null` : héritée, elle
+/// tient ouvert le pipe de `cargo test`, qui attend alors la fin du `sleep`.
+/// (2) Le PID est rendu dans un [`ChildGuard`] qui signale à la destruction —
+/// un `kill_pid` en fin de test n'est jamais atteint quand une assertion
+/// panique, et c'est exactement le moment où le nettoyage compte. Mesuré en
+/// posant le rouge-avant de ce fichier : l'échec attendu a immobilisé la suite
+/// **dix minutes**, la durée du `sleep`.
+fn spawn_live_child() -> (ChildGuard, u64) {
     use std::os::unix::process::CommandExt;
     let mut child = Command::new("sleep")
         .arg("600")
         .process_group(0)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn sleep");
     let pid = i64::from(child.id());
@@ -54,23 +83,77 @@ fn spawn_live_child() -> (i64, u64) {
     std::thread::spawn(move || {
         let _ = child.wait();
     });
-    (pid, start_time)
+    (ChildGuard(pid), start_time)
+}
+
+/// Tue son groupe de process à la destruction, échec du test compris.
+struct ChildGuard(i64);
+
+impl ChildGuard {
+    fn pid(&self) -> i64 {
+        self.0
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = Command::new("kill")
+            .arg("-9")
+            .arg(format!("-{}", self.0))
+            .output();
+        let _ = Command::new("kill")
+            .arg("-9")
+            .arg(self.0.to_string())
+            .output();
+    }
 }
 
 fn is_alive(pid: i64) -> bool {
     std::path::PathBuf::from(format!("/proc/{pid}/stat")).exists()
 }
 
-fn kill_pid(pid: i64) {
-    let _ = Command::new("kill").arg("-9").arg(pid.to_string()).output();
+/// La row **parent** : ce que `ready_label_handler` pré-crée. Elle porte l'URL
+/// de l'issue et **jamais** de `process_id`.
+async fn seed_parent_tracking_row(db: &AsyncDatabase, reference_url: &str) -> String {
+    let id = db
+        .create_task(NewTask {
+            agent_id: AGENT_ID.to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: format!("ready-label: {reference_url}"),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: Some(SESSION.to_string()),
+            created_trace_id: None,
+            reference_url: Some(reference_url.to_string()),
+            source: Some("self_dev".to_string()),
+            metadata: None,
+            r#type: Some("issue".to_string()),
+            dispatch_class: Some("implement".to_string()),
+        })
+        .await
+        .expect("create parent tracking row");
+    // L'état d'un parent dont le dispatch est parti (mika#2335 F2a).
+    db.mark_parent_dispatched(&id)
+        .await
+        .expect("mark parent dispatched");
+    id
 }
 
-/// Sème un dispatch VIVANT : row non terminale portant un `process_id` et le
-/// `process_start_time` que la garde anti-réutilisation de PID (#855) exige.
-async fn seed_live_dispatch(
+/// La row **enfant** : ce que `build_callback_task` + `set_task_process_id`
+/// écrivent. Elle porte le pgid et **jamais** de `reference_url`.
+async fn seed_dispatch_child(
     db: &AsyncDatabase,
-    label: &str,
-    reference_url: &str,
+    parent_id: &str,
     status: &str,
     pid: i64,
     start_time: Option<u64>,
@@ -79,9 +162,9 @@ async fn seed_live_dispatch(
         .create_task(NewTask {
             agent_id: AGENT_ID.to_string(),
             team_run_id: None,
-            parent_task_id: None,
-            depth: 0,
-            label: label.to_string(),
+            parent_task_id: Some(parent_id.to_string()),
+            depth: 1,
+            label: "long_running:run_claude_pilot".to_string(),
             trigger_type: "callback".to_string(),
             cron_expr: None,
             event_source: None,
@@ -89,25 +172,27 @@ async fn seed_live_dispatch(
             condition_expr: None,
             next_fire_at: None,
             timeout_at: None,
-            action_type: "run_skill".to_string(),
+            action_type: "resume_agent".to_string(),
             action_config: "{}".to_string(),
             input_context: None,
             created_by_session: Some(SESSION.to_string()),
             created_trace_id: None,
-            reference_url: Some(reference_url.to_string()),
+            reference_url: None,
             source: Some("self_dev".to_string()),
             metadata: None,
             r#type: None,
             dispatch_class: Some("implement".to_string()),
         })
         .await
-        .expect("create dispatch row");
-    db.update_task_status(&id, status)
-        .await
-        .expect("set status");
+        .expect("create dispatch child");
+    if status != "pending" {
+        db.update_task_status(&id, status)
+            .await
+            .expect("set child status");
+    }
     db.set_task_process_id(&id, Some(pid))
         .await
-        .expect("record pid");
+        .expect("record pgid");
     if let Some(st) = start_time {
         db.set_task_metadata_field(&id, "process_start_time", &st.to_string())
             .await
@@ -116,23 +201,19 @@ async fn seed_live_dispatch(
     id
 }
 
-/// INVARIANT : une supersession ne laisse jamais un pilote vivant derrière
-/// elle. Le process est tué ET la row cesse d'être active.
+/// INVARIANT : une supersession ne laisse jamais vivant le pilote de l'enfant.
+/// Le process meurt, la row enfant devient terminale et rend son pgid, la row
+/// parent est annulée, et l'événement d'audit est écrit.
 #[tokio::test]
 #[cfg(target_os = "linux")]
-async fn live_pilot_is_killed_by_supersede() {
+async fn live_pilot_of_the_child_is_killed_by_supersede() {
     let db = test_db();
-    let url = "https://github.com/senara-solutions/mika/issues/2252";
-    let (pid, start_time) = spawn_live_child();
-    let old_id = seed_live_dispatch(
-        &db,
-        "long_running:run_claude_pilot mika#2252",
-        url,
-        "in_progress",
-        pid,
-        Some(start_time),
-    )
-    .await;
+    let url = "https://github.com/senara-solutions/mika/issues/2334";
+    let (guard, start_time) = spawn_live_child();
+    let pid = guard.pid();
+
+    let parent_id = seed_parent_tracking_row(&db, url).await;
+    let child_id = seed_dispatch_child(&db, &parent_id, "pending", pid, Some(start_time)).await;
 
     assert!(is_alive(pid), "contrôle positif : l'enfant tourne avant");
 
@@ -141,51 +222,61 @@ async fn live_pilot_is_killed_by_supersede() {
         SESSION,
         Some(TRACE),
         url,
-        "ready-label: senara-solutions/mika#2252",
+        "ready-label: senara-solutions/mika#2334",
     )
     .await;
 
     assert!(
         !is_alive(pid),
-        "INVARIANT VIOLÉ : la supersession a annulé la row et laissé le pilote \
-         (pgid {pid}) vivant — c'est le zombie de mika#2263"
+        "INVARIANT VIOLÉ : la supersession a annulé le parent et laissé le \
+         pilote de l'enfant (pgid {pid}) vivant — c'est le 590a06c0 de \
+         mika#2335, deux pilotes sur un même worktree"
     );
-    let old = db.get_task(&old_id).await.unwrap().unwrap();
+
+    let child = db.get_task(&child_id).await.unwrap().unwrap();
     assert_eq!(
-        old.status, "cancelled",
-        "le dispatch superseded doit être terminal"
+        child.status, "cancelled",
+        "la row enfant doit être terminale"
     );
     assert!(
-        old.process_id.is_none(),
-        "le pgid doit être effacé après le kill, sinon un faucheur retente"
+        child.process_id.is_none(),
+        "le pgid doit être effacé après le kill, sinon un faucheur retente un \
+         PID potentiellement recyclé"
     );
-    kill_pid(pid);
+
+    let parent = db.get_task(&parent_id).await.unwrap().unwrap();
+    assert_eq!(
+        parent.status, "cancelled",
+        "la row parent reste annulée par le chemin mika#1934"
+    );
+
+    let audits = db
+        .count_audit_events_by_tool_name(SUPERSEDED_DISPATCH_PROCESS_KILLED_TOOL)
+        .await
+        .unwrap();
+    assert_eq!(audits, 1, "un kill de pilote = un événement d'audit");
 }
 
-/// Contrôle négatif du même appel : un dispatch vivant pour une AUTRE issue
-/// n'est pas touché. Sans lui, un `kill` aveugle passerait le test ci-dessus.
+/// Contrôle négatif (a) : un dispatch vivant sur **une autre** issue survit.
+/// Sans lui, un `kill` aveugle passerait le test ci-dessus.
 #[tokio::test]
 #[cfg(target_os = "linux")]
 async fn live_pilot_on_another_issue_survives() {
     let db = test_db();
     let other_url = "https://github.com/senara-solutions/mika/issues/2212";
-    let (pid, start_time) = spawn_live_child();
-    let other_id = seed_live_dispatch(
-        &db,
-        "long_running:run_claude_pilot mika#2212",
-        other_url,
-        "in_progress",
-        pid,
-        Some(start_time),
-    )
-    .await;
+    let (guard, start_time) = spawn_live_child();
+    let pid = guard.pid();
+
+    let other_parent = seed_parent_tracking_row(&db, other_url).await;
+    let other_child =
+        seed_dispatch_child(&db, &other_parent, "pending", pid, Some(start_time)).await;
 
     supersede_prior_tracking_rows(
         &db,
         SESSION,
         Some(TRACE),
-        "https://github.com/senara-solutions/mika/issues/2252",
-        "ready-label: senara-solutions/mika#2252",
+        "https://github.com/senara-solutions/mika/issues/2334",
+        "ready-label: senara-solutions/mika#2334",
     )
     .await;
 
@@ -193,7 +284,82 @@ async fn live_pilot_on_another_issue_survives() {
         is_alive(pid),
         "contrôle négatif : un dispatch pour une autre issue doit survivre"
     );
-    let other = db.get_task(&other_id).await.unwrap().unwrap();
-    assert_eq!(other.status, "in_progress", "row voisine intacte");
-    kill_pid(pid);
+    let child = db.get_task(&other_child).await.unwrap().unwrap();
+    assert_eq!(child.status, "pending", "row voisine intacte");
+    assert_eq!(child.process_id, Some(pid), "pgid voisin intact");
+}
+
+/// Contrôle négatif (b) : un enfant **`delivered`** portant un vieux pgid n'est
+/// pas signalé. Son pilote est terminé depuis longtemps ; le PID inscrit sur la
+/// row peut désigner n'importe quel process depuis.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn delivered_child_carrying_a_stale_pgid_is_not_signalled() {
+    let db = test_db();
+    let url = "https://github.com/senara-solutions/mika/issues/2335";
+    let (guard, start_time) = spawn_live_child();
+    let pid = guard.pid();
+
+    let parent_id = seed_parent_tracking_row(&db, url).await;
+    let child_id = seed_dispatch_child(&db, &parent_id, "delivered", pid, Some(start_time)).await;
+
+    supersede_prior_tracking_rows(
+        &db,
+        SESSION,
+        Some(TRACE),
+        url,
+        "ready-label: senara-solutions/mika#2335",
+    )
+    .await;
+
+    assert!(
+        is_alive(pid),
+        "contrôle négatif : le pgid d'un enfant terminal ne désigne plus son \
+         pilote — le signaler, c'est tuer un inconnu"
+    );
+    let child = db.get_task(&child_id).await.unwrap().unwrap();
+    assert_eq!(
+        child.status, "delivered",
+        "la row terminale n'est pas touchée"
+    );
+}
+
+/// Contrôle négatif (c) : un enfant **sans `process_start_time`** n'est pas
+/// signalé (fail-safe F1.4). `kill_process_gracefully` retomberait sur une
+/// simple existence de PID, qui ne distingue pas un PID recyclé — et signaler
+/// un groupe de process par erreur est un dégât non borné. Le coût est nommé :
+/// cet enfant survit à sa supersession. Inertie, jamais un kill à l'aveugle.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn child_without_a_readable_start_time_is_not_signalled() {
+    let db = test_db();
+    let url = "https://github.com/senara-solutions/mika/issues/2263";
+    let (guard, _start_time) = spawn_live_child();
+    let pid = guard.pid();
+
+    let parent_id = seed_parent_tracking_row(&db, url).await;
+    let child_id = seed_dispatch_child(&db, &parent_id, "pending", pid, None).await;
+
+    supersede_prior_tracking_rows(
+        &db,
+        SESSION,
+        Some(TRACE),
+        url,
+        "ready-label: senara-solutions/mika#2263",
+    )
+    .await;
+
+    assert!(
+        is_alive(pid),
+        "contrôle négatif : sans start_time la paire qui identifie une \
+         *instance* de process est incomplète — on n'en tue aucun"
+    );
+    let child = db.get_task(&child_id).await.unwrap().unwrap();
+    assert_eq!(child.process_id, Some(pid), "le pgid reste inscrit");
+
+    let audits = db
+        .count_audit_events_by_tool_name(SUPERSEDED_DISPATCH_PROCESS_KILLED_TOOL)
+        .await
+        .unwrap();
+    assert_eq!(audits, 0, "aucun kill, donc aucun événement de kill");
 }

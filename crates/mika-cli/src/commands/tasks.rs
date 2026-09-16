@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::{ForcePromoteResult, Task, format_ts};
+use mika_common::config::Settings;
 use serde_json::{Value, json};
 
 use crate::cli::{OutputFormat, TaskArgs, TaskCommand};
@@ -63,7 +64,8 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
                     } else {
                         println!("\n  Active Tasks ({}):", tasks.len());
                         for t in &tasks {
-                            print_task_summary(t);
+                            let liveness = probe_pilot_liveness(db, &ctx.settings, t).await;
+                            print_task_summary(t, &liveness);
                         }
                         println!();
                     }
@@ -89,7 +91,10 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
             let task = db.get_task(&resolved_id).await?;
             match task {
                 Some(t) => match format {
-                    OutputFormat::Text => print_task_detail(&t),
+                    OutputFormat::Text => {
+                        let liveness = probe_pilot_liveness(db, &ctx.settings, &t).await;
+                        print_task_detail(&t, &liveness);
+                    }
                     OutputFormat::Json => {
                         println!("{}", serde_json::to_string_pretty(&task_to_json(&t))?);
                     }
@@ -102,7 +107,7 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
                 }
             }
         }
-        Some(TaskCommand::Cancel { id }) => {
+        Some(TaskCommand::Cancel { id, yes }) => {
             let resolved_id = match resolve_task_id(db, &id).await? {
                 Some(id) => id,
                 None => {
@@ -110,6 +115,53 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
                     return Ok(());
                 }
             };
+
+            // mika#2335 F2c — the gesture that caused the 2026-09-15 incident.
+            // Warn and ask; do NOT refuse: cancelling a live pilot is sometimes
+            // exactly what you want. What must never happen again is doing it
+            // without being told there is one.
+            if let Some(task) = db.get_task(&resolved_id).await?
+                && let PilotLiveness::Alive {
+                    pid,
+                    child_id,
+                    idle_secs,
+                } = probe_pilot_liveness(db, &ctx.settings, &task).await
+            {
+                let idle = match idle_secs {
+                    Some(s) => format!("its session log was written {s}s ago"),
+                    None => "its session log is not readable from here".to_string(),
+                };
+                let child = child_id
+                    .as_ref()
+                    .map(|c| format!(" (dispatch child {})", short(c)))
+                    .unwrap_or_default();
+                eprintln!(
+                    "\n  ⚠  A pilot is RUNNING under this task{child}: PID {pid}, {idle}.\n  \
+                     Cancelling kills it. A task row reading `pending` / `fired_at=null` is \
+                     not evidence\n  that a dispatch is inert — that misreading cost 30 \
+                     minutes of work and left three files\n  dirty under a second pilot on \
+                     2026-09-15.\n"
+                );
+                if !yes {
+                    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                        eprintln!(
+                            "  Refusing to kill a live pilot without confirmation. \
+                             Re-run with --yes if that is what you mean.\n"
+                        );
+                        std::process::exit(1);
+                    }
+                    let proceed = dialoguer::Confirm::new()
+                        .with_prompt(format!("  Kill the running pilot (PID {pid})?"))
+                        .default(false)
+                        .interact()
+                        .unwrap_or(false);
+                    if !proceed {
+                        println!("\n  Cancelled nothing — the pilot keeps running.\n");
+                        return Ok(());
+                    }
+                }
+            }
+
             match mika_agent::task_engine::process_kill::cancel_task_and_kill(db, &resolved_id)
                 .await?
             {
@@ -418,34 +470,212 @@ fn find_event_separator(buf: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
-fn print_task_summary(t: &Task) {
-    let short_id = &t.id[..12.min(t.id.len())];
+/// What a task's dispatch actually looks like **on the machine** (mika#2335).
+///
+/// The founding incident is a reading error the tool made possible: the row of
+/// the live pilot `590a06c0` carried `status=pending, fired_at=null` — the
+/// shape of "inert, never launched" — while its PID was active and its log had
+/// just been written to. An operator read the row, concluded orphan, and
+/// cancelled a pilot that had been working for 38 minutes. `fired_at` is now
+/// stamped (F2a), but the authoritative signal of life was never the row: it is
+/// the PID and the log mtime. This type is that signal, read where the operator
+/// looks instead of left as a gesture they must remember to perform.
+#[derive(Debug)]
+enum PilotLiveness {
+    /// No PID-carrying dispatch to speak of.
+    NoPilot,
+    /// A PID is recorded and the process at it is the instance we spawned.
+    Alive {
+        pid: i64,
+        child_id: Option<String>,
+        /// Seconds since the claude-pilot session log was last written.
+        /// `None` when the log is absent or unreadable — which says nothing
+        /// about the pilot, only about the log.
+        idle_secs: Option<u64>,
+    },
+    /// A PID is recorded and nothing is running under it.
+    Dead { pid: i64, child_id: Option<String> },
+    /// A PID is recorded but carries no readable `process_start_time`, so a
+    /// recycled PID cannot be told from the pilot. We claim neither.
+    Unverifiable { pid: i64, child_id: Option<String> },
+    /// The lookup failed. Not evidence of anything.
+    Unknown,
+}
+
+fn short(id: &str) -> &str {
+    &id[..12.min(id.len())]
+}
+
+/// `process_start_time` as the executor writes it into task metadata: a JSON
+/// *string*. An integer is accepted too, matching `find_dispatch_children_with_pid`.
+fn start_time_from_metadata(metadata: Option<&str>) -> Option<u64> {
+    let v: Value = serde_json::from_str(metadata?).ok()?;
+    let field = v.get("process_start_time")?;
+    match field {
+        Value::String(s) => s.parse().ok(),
+        Value::Number(n) => n.as_u64(),
+        _ => None,
+    }
+}
+
+/// Seconds since `<pilot_log_dir>/<task-id>.log` was last written.
+///
+/// Same derivation as the silent-stall reaper (mika#2277) and the same
+/// discipline: an unreadable signal is reported as absent, never as silence.
+fn pilot_log_idle_secs(settings: &Settings, log_id: &str) -> Option<u64> {
+    let path = settings
+        .effective_pilot_log_dir()
+        .join(format!("{log_id}.log"));
+    mika_agent::task_engine::worktree_activity::seconds_since_file_write(&path)
+}
+
+/// Measure the liveness of the pilot behind `t`, whichever of the two rows of a
+/// dispatch `t` happens to be.
+///
+/// A **callback** row carries the pgid itself. A **parent** tracking row never
+/// does — its pilot hangs off a `parent_task_id`-linked child, which is exactly
+/// the traversal `find_dispatch_children_with_pid` performs (mika#2156). The
+/// parent is the row an operator consults, so before mika#2335 the one surface
+/// that could have contradicted the misleading status showed nothing at all.
+async fn probe_pilot_liveness(db: &AsyncDatabase, settings: &Settings, t: &Task) -> PilotLiveness {
+    if t.trigger_type == "callback" {
+        let Some(pid) = t.process_id else {
+            return PilotLiveness::NoPilot;
+        };
+        let Some(start_time) = start_time_from_metadata(t.metadata.as_deref()) else {
+            return PilotLiveness::Unverifiable {
+                pid,
+                child_id: None,
+            };
+        };
+        return classify(pid, None, start_time, settings, &t.id);
+    }
+
+    let children = match db.find_dispatch_children_with_pid(&t.id).await {
+        Ok(c) => c,
+        Err(_) => return PilotLiveness::Unknown,
+    };
+
+    // A parent can have several PID-carrying children across retries. One live
+    // child is the answer; report the last non-live one only if none is alive,
+    // so a dead predecessor never masks a running pilot.
+    let mut fallback = PilotLiveness::NoPilot;
+    for child in children {
+        let Some(start_time) = child.process_start_time else {
+            fallback = PilotLiveness::Unverifiable {
+                pid: child.process_id,
+                child_id: Some(child.id),
+            };
+            continue;
+        };
+        match classify(
+            child.process_id,
+            Some(child.id.clone()),
+            start_time,
+            settings,
+            &child.id,
+        ) {
+            alive @ PilotLiveness::Alive { .. } => return alive,
+            other => fallback = other,
+        }
+    }
+    fallback
+}
+
+fn classify(
+    pid: i64,
+    child_id: Option<String>,
+    start_time: u64,
+    settings: &Settings,
+    log_id: &str,
+) -> PilotLiveness {
+    let Ok(pid_u32) = u32::try_from(pid) else {
+        return PilotLiveness::Unverifiable { pid, child_id };
+    };
+    if mika_agent::task_engine::process_liveness::is_same_process_alive(pid_u32, start_time) {
+        PilotLiveness::Alive {
+            pid,
+            child_id,
+            idle_secs: pilot_log_idle_secs(settings, log_id),
+        }
+    } else {
+        PilotLiveness::Dead { pid, child_id }
+    }
+}
+
+fn print_task_summary(t: &Task, liveness: &PilotLiveness) {
+    let short_id = short(&t.id);
     let when = t
         .next_fire_at
         .as_ref()
         .map(|s| format_ts(s))
         .unwrap_or_else(|| t.trigger_type.clone());
-    // For callback tasks, annotate executing vs queued (#1057)
-    let status_info = if t.trigger_type == "callback" {
-        if let Some(pid) = t.process_id {
-            format!(" [executing, PID {pid}]")
-        } else if t.status == "pending" || t.status == "in_progress" {
-            " [queued]".to_string()
-        } else {
-            String::new()
-        }
-    } else {
-        t.process_id
-            .map(|pid| format!(" [PID {pid}]"))
-            .unwrap_or_default()
-    };
+    let status_info = summary_annotation(&t.trigger_type, &t.status, liveness);
     println!(
         "    {}: [{}] [{}] \"{}\" ({}){status_info}",
         short_id, t.status, t.action_type, t.label, when
     );
 }
 
-fn print_task_detail(t: &Task) {
+/// The bracketed tail of a summary line (#1057, **measured** since mika#2335).
+///
+/// The `[executing, PID n]` this replaces was inferred from the presence of a
+/// PID column, so it stayed on the screen long after the process was gone — and
+/// said nothing at all on a parent tracking row, which is the row an operator
+/// consults. Pure, so the branch deciding what an operator reads is testable
+/// without capturing stdout. Takes the two fields it reads rather than the
+/// whole `Task`: `Task` has no `Default`, and a test that had to spell out
+/// thirty-two columns to assert on one bracket would not get written.
+fn summary_annotation(trigger_type: &str, status: &str, liveness: &PilotLiveness) -> String {
+    match liveness {
+        PilotLiveness::Alive { pid, .. } => format!(" [pilot alive, PID {pid}]"),
+        PilotLiveness::Dead { pid, .. } => format!(" [PID {pid} — no live pilot]"),
+        PilotLiveness::Unverifiable { pid, .. } => format!(" [PID {pid} — liveness unverifiable]"),
+        PilotLiveness::NoPilot | PilotLiveness::Unknown => {
+            if trigger_type == "callback" && (status == "pending" || status == "in_progress") {
+                " [queued]".to_string()
+            } else {
+                String::new()
+            }
+        }
+    }
+}
+
+/// The `Dispatch pilot:` line of `mika tasks get` — the measured answer to
+/// "is anything actually running under this task?".
+fn format_pilot_detail(liveness: &PilotLiveness) -> String {
+    let child = |c: &Option<String>| {
+        c.as_ref()
+            .map(|id| format!(", child {}", short(id)))
+            .unwrap_or_default()
+    };
+    match liveness {
+        PilotLiveness::Alive {
+            pid,
+            child_id,
+            idle_secs,
+        } => {
+            let idle = match idle_secs {
+                Some(s) => format!(", last log write {s}s ago"),
+                None => ", no readable session log".to_string(),
+            };
+            format!("alive — PID {pid}{}{idle}", child(child_id))
+        }
+        PilotLiveness::Dead { pid, child_id } => format!(
+            "none — PID {pid} is not running{} (dead or reused)",
+            child(child_id)
+        ),
+        PilotLiveness::Unverifiable { pid, child_id } => format!(
+            "unverifiable — PID {pid}{} has no recorded start time, so a \
+             recycled PID cannot be ruled out",
+            child(child_id)
+        ),
+        PilotLiveness::NoPilot => "none — no dispatch carrying a PID".to_string(),
+        PilotLiveness::Unknown => "unknown — the dispatch-child lookup failed".to_string(),
+    }
+}
+
+fn print_task_detail(t: &Task, liveness: &PilotLiveness) {
     println!();
     println!("  Task Detail");
     println!("  ───────────────────────────────────");
@@ -482,6 +712,10 @@ fn print_task_detail(t: &Task) {
     if let Some(pid) = t.process_id {
         println!("  Process ID:    {pid}");
     }
+    // mika#2335 — the measured answer, not the one inferred from the columns
+    // above. `status` and `fired_at` describe bookkeeping; this describes the
+    // machine.
+    println!("  Dispatch pilot: {}", format_pilot_detail(liveness));
     if let Some(ref v) = t.result {
         let display = match v.char_indices().nth(200) {
             Some((i, _)) => &v[..i],
@@ -533,6 +767,140 @@ fn task_to_json(t: &Task) -> Value {
 mod tests {
     use super::*;
     use mika_agent::db::OrphanedPendingTask;
+
+    // -- pilot liveness surfacing (mika#2335 F2b/F2c) --
+
+    /// The line an operator reads must **name the pilot**, not merely echo the
+    /// PID column. The 2026-09-15 cancel happened because every surface agreed
+    /// with the row (`pending`, `fired_at=null`) and none contradicted it.
+    #[test]
+    fn alive_detail_names_the_pid_the_child_and_the_log_age() {
+        let line = format_pilot_detail(&PilotLiveness::Alive {
+            pid: 890_205,
+            child_id: Some("590a06c0-0000-0000-0000-000000000000".to_string()),
+            idle_secs: Some(12),
+        });
+        assert!(line.contains("alive"), "{line}");
+        assert!(line.contains("890205"), "le PID doit être nommé — {line}");
+        assert!(
+            line.contains("590a06c0"),
+            "l'enfant doit être nommé — {line}"
+        );
+        assert!(
+            line.contains("12s ago"),
+            "l'âge de la dernière écriture est la moitié de la leçon opérateur — {line}"
+        );
+    }
+
+    /// An unreadable log says something about the log, never about the pilot.
+    /// Reporting it as silence is exactly the fail-safe inversion the reaper
+    /// family (mika#2277) exists to refuse.
+    #[test]
+    fn alive_without_a_readable_log_still_reads_alive() {
+        let line = format_pilot_detail(&PilotLiveness::Alive {
+            pid: 42,
+            child_id: None,
+            idle_secs: None,
+        });
+        assert!(line.starts_with("alive"), "{line}");
+        assert!(line.contains("no readable session log"), "{line}");
+    }
+
+    /// A recorded PID with nothing running under it must NOT read as a pilot —
+    /// the failure the old `[executing, PID n]` annotation produced, since it
+    /// was inferred from the column rather than measured.
+    #[test]
+    fn a_dead_pid_never_reads_as_a_running_pilot() {
+        let line = format_pilot_detail(&PilotLiveness::Dead {
+            pid: 890_205,
+            child_id: None,
+        });
+        assert!(!line.contains("alive"), "{line}");
+        assert!(line.contains("not running"), "{line}");
+    }
+
+    /// Unverifiable is its own answer, distinct from both "alive" and "dead":
+    /// without a start time the pair identifying a process *instance* is
+    /// incomplete, and claiming either way is what a recycled PID exploits.
+    #[test]
+    fn unverifiable_claims_neither_life_nor_death() {
+        let line = format_pilot_detail(&PilotLiveness::Unverifiable {
+            pid: 7,
+            child_id: None,
+        });
+        assert!(line.contains("unverifiable"), "{line}");
+        assert!(!line.contains("alive —"), "{line}");
+        assert!(!line.contains("not running"), "{line}");
+    }
+
+    /// `process_start_time` is written by the executor as a JSON **string**; an
+    /// integer is accepted too, and anything else degrades to `None` rather
+    /// than to a wrong number.
+    #[test]
+    fn start_time_is_read_from_metadata_in_both_shapes() {
+        assert_eq!(
+            start_time_from_metadata(Some(r#"{"process_start_time":"12345"}"#)),
+            Some(12345)
+        );
+        assert_eq!(
+            start_time_from_metadata(Some(r#"{"process_start_time":12345}"#)),
+            Some(12345)
+        );
+        assert_eq!(start_time_from_metadata(Some(r#"{"other":1}"#)), None);
+        assert_eq!(start_time_from_metadata(Some("not json")), None);
+        assert_eq!(start_time_from_metadata(None), None);
+    }
+
+    /// The summary line must never say a pilot is alive about a dead PID — the
+    /// exact misreading the old annotation licensed.
+    #[test]
+    fn summary_annotation_separates_alive_from_dead() {
+        assert!(
+            summary_annotation(
+                "manual",
+                "in_progress",
+                &PilotLiveness::Alive {
+                    pid: 890_205,
+                    child_id: None,
+                    idle_secs: None,
+                },
+            )
+            .contains("pilot alive, PID 890205")
+        );
+        let dead = summary_annotation(
+            "manual",
+            "in_progress",
+            &PilotLiveness::Dead {
+                pid: 890_205,
+                child_id: None,
+            },
+        );
+        assert!(dead.contains("no live pilot"), "{dead}");
+        assert!(!dead.contains("alive,"), "{dead}");
+    }
+
+    /// A parent with no dispatch child stays silent; a queued callback keeps
+    /// its `[queued]` (#1057 behaviour, unchanged). Annotating every row would
+    /// make the annotation stop meaning anything.
+    #[test]
+    fn no_pilot_is_silent_on_a_parent_and_queued_on_a_callback() {
+        assert_eq!(
+            summary_annotation("manual", "in_progress", &PilotLiveness::NoPilot),
+            ""
+        );
+        assert_eq!(
+            summary_annotation("callback", "pending", &PilotLiveness::NoPilot),
+            " [queued]"
+        );
+    }
+
+    /// A failed lookup is not evidence of absence, so it must not be dressed as
+    /// a verdict in the detail view.
+    #[test]
+    fn nopilot_and_unknown_are_distinguishable_in_the_detail_view() {
+        assert!(format_pilot_detail(&PilotLiveness::NoPilot).contains("no dispatch"));
+        assert!(format_pilot_detail(&PilotLiveness::Unknown).contains("unknown"));
+    }
 
     // -- `mika tasks stuck` probe shape (mika#2045) --
 

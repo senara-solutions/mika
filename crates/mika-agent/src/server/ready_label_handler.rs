@@ -632,9 +632,15 @@ where
         return fallback();
     }
 
-    // 9g. Auto-transition the pre-created parent task to in_progress (mirrors
-    //     execute_long_running's #525 transition). Non-fatal on error.
-    if let Err(e) = db.update_manual_task_status(&task_id, "in_progress").await {
+    // 9g. Auto-transition the pre-created parent task to in_progress and stamp
+    //     `fired_at` (mirrors execute_long_running's #525 transition; the stamp
+    //     is mika#2335). Non-fatal on error — the stamp is observability, it
+    //     must never fail a dispatch.
+    //
+    //     This is the path of the 2026-09-15 incident: the parent row of a
+    //     ready-label dispatch is the one an operator reads, and it read
+    //     `fired_at = NULL` while its pilot was writing files.
+    if let Err(e) = db.mark_parent_dispatched(&task_id).await {
         warn!(
             task_id = %task_id,
             error = %e,
