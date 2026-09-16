@@ -106,6 +106,34 @@ plafond de 10 s — et un filet dérivé mécaniquement de ce budget vaudrait al
 un rail Anthropic qui prend physiquement jusqu'à ~480 s. **Faux positif garanti.** Le
 filet ne doit donc pas *dériver* le pire cas ; il doit le **demander au rail**.
 
+**E8 — Le filet firerait sur deux tests existants, et cela révèle une limite de D2 qu'il
+faut écrire plutôt que découvrir au `cargo test`.** `AnthropicProvider`
+(`crates/mika-common/src/llm/anthropic.rs:48`) **et** `MockLlmProvider` implémentent
+`LlmProvider` sans surcharger `timeout_budget()` : tous deux héritent du défaut
+`LlmTimeoutBudget::from_env()` (`llm/mod.rs:283`). En test, sans variable d'environnement,
+cela vaut la géométrie livrée 120/300 — donc `max_attempts(4) = floor(300/120) = 2`,
+`worst_case = 240 s`, et **le filet vaut 300 s**. Or deux tests eval dorment **360 s
+virtuelles** :
+
+| test | ligne | ce qu'il teste |
+|---|---|---|
+| `test_deadline_in_flight_llm_call.rs::deadline_during_llm_call_persists_llm_calls_row` | 44 | mika#848 — la ligne `llm_calls` survit au deadline traversé en vol |
+| `test_deadline_verdict_2276.rs::run_until_deadline_exceeded` | 72 | mika#2276 — le verdict posé sur un tour coupé par l'enveloppe |
+
+Les deux seraient coupés par le filet à 300 s au lieu d'atteindre leur `Delayed`. Le
+contrat A de mika#848 (`llm_call_count >= 1`) resterait vert — la ligne serait persistée
+par l'arm timeout — mais le contrat B (`"took too long"`) ne le serait pas : le tour
+sortirait par une erreur transport et non par `LoopResult::DeadlineExceeded`. Un test qui
+reste vert en testant autre chose est pire qu'un test rouge.
+
+**Ce que E8 dit de D2, et qui vaut au-delà des tests :** l'affirmation « calé sur le pire
+cas, le filet ne peut firer que lorsque reqwest a déjà manqué » suppose que le rail borne
+ses propres appels. C'est vrai des trois rails de production ; ce n'est **pas** une
+propriété du trait `LlmProvider`. Tout rail qui n'a pas de timeout transport — le mock
+aujourd'hui, un rail futur demain — verra le filet comme son **premier** mécanisme de
+coupure, pas comme son second. La formulation de D2 est donc conditionnelle et doit être
+écrite comme telle.
+
 ## Décisions
 
 **D1 — Un filet de sécurité au site principal, calqué sur celui de la continuation.**
@@ -118,9 +146,15 @@ trace ») plutôt que la cause reqwest, qu'on ne sait pas nommer.
 `remaining` réintroduirait mika#848 : un appel coupé en vol perd son résultat *et* sa
 ligne `llm_calls`, y compris quand il allait aboutir. Le contrat maison est explicite —
 *« Worst-case turn duration is `envelope + plafond` »* — et il est préservé tel quel. Calé
-sur le pire cas, le filet **ne peut firer que lorsque reqwest a déjà manqué**, c'est-à-dire
-sur un appel déjà perdu : le coût de le couper est nul, et son déclenchement est une
-information de premier ordre.
+sur le pire cas, le filet **ne peut firer que lorsque le mécanisme de coupure du rail a
+déjà manqué**, c'est-à-dire sur un appel déjà perdu : le coût de le couper est nul, et son
+déclenchement est une information de premier ordre.
+
+Formulation conditionnelle à dessein (E8) : cette propriété tient *parce que* les trois
+rails de production bornent leurs propres appels, pas parce que le trait l'exige. Sur un
+rail sans timeout transport, le filet est le premier mécanisme et non le second — ce qui
+reste un comportement correct, mais n'est plus « ne coupe que du déjà-perdu ». Le dire ici
+évite qu'un rail futur hérite d'une garantie que personne ne lui a donnée.
 
 **D3 — Le pire cas est déclaré par le rail, pas dérivé du budget.** Nouvelle méthode par
 défaut sur `LlmProvider` :
@@ -171,6 +205,21 @@ d'un `tokio::time::timeout`.
 que reqwest borne effectivement les appels. Le confondre avec une erreur transport
 ordinaire perdrait exactement le signal pour lequel on écrit ce code.
 
+**D8 — Les deux tests de E8 sont ramenés sous le filet, pas neutralisés.** Le réflexe
+tentant — poser un budget large sur le mock pour que le filet ne fire jamais en test —
+serait un désarmement déguisé en réglage : il rendrait le filet invisible à toute la suite
+eval, y compris aux tests qui devront l'exercer. Correction retenue : abaisser le `Delayed`
+de 360 s à une valeur **sous le filet et au-dessus du deadline** (200 s convient : > 1 s de
+deadline, < 300 s de filet), avec un commentaire nommant mika#2342 et disant pourquoi le
+nombre est encadré des deux côtés. Chacun des deux tests continue alors de tester ce que
+son titre annonce — la traversée du deadline, pas la coupure par le filet.
+
+Ce n'est pas un ajustement cosmétique : c'est le **contrôle négatif 4** du contrat de
+vérification, déjà présent sous forme de deux tests réels. Un `Delayed` de 200 s dépasse le
+plafond par tentative (120 s) sans atteindre le filet — exactement la zone que le contrôle
+négatif doit couvrir. La correction et le contrôle sont la même chose, et le plan les
+traite comme telle plutôt que d'écrire un troisième test qui dirait la même phrase.
+
 **D7 — Aucune valeur n'est changée.** Ni le plafond, ni l'enveloppe, ni `MAX_RETRIES`, ni
 le défaut de flotte. Ce travail rend l'appel borné et le blocage lisible ; le recalibrage
 éventuel se décidera sur la mesure que D4 produit.
@@ -179,11 +228,20 @@ le défaut de flotte. Ce travail rend l'appel borné et le blocage lisible ; le 
 
 ### V1 — `worst_case_failure_secs` sur le trait (`crates/mika-common/src/llm/mod.rs`)
 
-Méthode par défaut sur `LlmProvider` (D3), à côté de `timeout_budget()`, avec la constante
-`DEFAULT_ATTEMPTS_HARD_CAP` exposée depuis `openai.rs` ou remontée dans `llm/mod.rs`
-(`MAX_ATTEMPTS_HARD_CAP` y est déjà `pub(crate)` depuis mika#2293). Surcharge sur le rail
-Anthropic (`crates/mika-common/src/llm/anthropic.rs`) rendant `120 × (MAX_RETRIES + 1)`,
-avec un commentaire nommant `claude.rs:381` et le ticket qui le laisse en place.
+Méthode par défaut sur `LlmProvider` (D3), à côté de `timeout_budget()` (`llm/mod.rs:283`).
+
+**Le hard cap doit d'abord être remonté, et ce n'est pas un détail de rédaction.**
+`MAX_ATTEMPTS_HARD_CAP` vit en `openai.rs:154`, `pub(crate)` et *privé au module* — le
+commentaire d'`openai.rs:1113` le dit explicitement. Une méthode par défaut sur le trait,
+dans `llm/mod.rs`, ne peut donc pas le lire : il faut le déplacer dans `llm/mod.rs` (ou l'y
+ré-exporter) et laisser `openai.rs` le consommer depuis là. Un pré-requis d'implémentation,
+pas une ligne de plus.
+
+Surcharge sur le rail Anthropic (`crates/mika-common/src/llm/anthropic.rs:48`) rendant
+`120 × (MAX_RETRIES + 1)`, avec un commentaire nommant `claude.rs:381` et le ticket qui le
+laisse en place. À vérifier au passage : `AnthropicProvider` ne surcharge **pas** aujourd'hui
+`timeout_budget()` (E8), donc il annonce actuellement un budget d'environnement qu'il
+n'honore pas — c'est la forme exacte du piège que D3 convertit en valeur déclarée.
 
 Tests : le pire cas déclaré par chaque rail est ≥ son plafond effectif ; le rail Anthropic
 ne descend pas sous son littéral même quand l'environnement pose un plafond plus petit
@@ -244,6 +302,16 @@ soit pas son propre premier contrevenant (motif de `policy.rs:155-158`). Le mess
 d'échec doit nommer mika#2342 et dire *pourquoi* le filet est là — une garde qui dit
 seulement « interdit » se fait désarmer au premier refactor pressé.
 
+### V4-bis — Ajustement des deux tests de E8 (`crates/mika-agent/tests/eval/`)
+
+`test_deadline_in_flight_llm_call.rs:44` et `test_deadline_verdict_2276.rs:72` : `360_000`
+→ `200_000` ms, avec le commentaire de D8 nommant les deux bornes (deadline 1 s en dessous,
+filet 300 s au-dessus) et mika#2342. Ne toucher **aucune** assertion : si l'une d'elles
+rougit après l'ajustement, c'est le filet qu'il faut regarder, pas le test.
+
+Le troisième `delayed_response` de la suite (`test_deadline_in_flight_llm_call.rs:185`,
+10 s) est déjà sous le filet et ne bouge pas.
+
 ### V5 — Documentation
 
 - `crates/mika-agent/CLAUDE.md` § *Deadline enforcement* : la phrase « the provider's
@@ -274,12 +342,17 @@ seulement « interdit » se fait désarmer au premier refactor pressé.
    `request_bytes` non nul ; `llm_call_watchdog_fired` est émis.
 4. **Contrôle négatif** : un appel dont la durée est sous le filet mais **au-dessus** du
    plafond par tentative n'est pas coupé par le filet. C'est le test qui prouve que le
-   filet est un anti-hang et non un second deadline.
+   filet est un anti-hang et non un second deadline. Porté par les deux tests ajustés de
+   D8 (`Delayed` à 200 s : > 120 s de plafond, < 300 s de filet), pas par un test neuf.
 5. **Contrôle négatif de chaîne** : une chaîne de retry légitime complète (`max_attempts`
    tentatives, chacune à son plafond, plus les backoffs) reste sous le filet. Sans lui, la
    marge de D3 est une affirmation, pas une propriété.
-6. **Non-régression mika#848** : sur un appel qui aboutit juste après le deadline mais
-   avant le filet, la ligne `llm_calls` est bien persistée et le résultat utilisé.
+6. **Non-régression mika#848 et mika#2276** : les deux tests de E8 restent verts **sur
+   leurs contrats d'origine**, deadline traversé et verdict d'enveloppe compris — pas
+   seulement sur leur assertion la plus lâche. Le contrat B de mika#848 (`"took too long"`,
+   donc sortie par `LoopResult::DeadlineExceeded` et non par une erreur transport) est le
+   discriminateur : c'est lui qui tombe si le filet coupe l'appel à leur place, et c'est
+   donc lui qu'il faut lire pour savoir si D8 a été appliqué correctement.
 
 **Garde structurelle**
 
@@ -300,6 +373,8 @@ seulement « interdit » se fait désarmer au premier refactor pressé.
 - Le pire cas est déclaré par le rail et non dérivé d'un budget qu'un rail n'honore pas.
 - Une garde structurelle refuse le retour d'un appel non enveloppé.
 - Aucune valeur de plafond, d'enveloppe ou de `MAX_RETRIES` n'a bougé.
+- Les deux tests eval qui traversent aujourd'hui 360 s virtuelles ont été ramenés sous le
+  filet et testent toujours leur sujet d'origine, filet armé.
 - Les trois `CLAUDE.md` concernés disent ce que le code fait, en particulier là où ils
   affirmaient le contraire.
 
@@ -327,6 +402,11 @@ par tentative » — et des faits E1-E7.*
 - **AC6** — Aucun réglage n'est modifié par cette PR (contrôle : le diff ne touche ni
   `DEFAULT_HTTP_TIMEOUT_SECS`, ni `DEFAULT_AGENT_TOTAL_TIMEOUT_SECS`, ni `MAX_RETRIES`, ni
   un `config.toml` d'agent).
+- **AC7** — Aucun test existant ne change de sujet. Les deux tests de E8 gardent leurs
+  contrats d'origine, y compris ceux qui n'auraient pas rougi sans être lus (contrat B de
+  mika#848). Le filet n'est **pas** désarmé en test — ni par un budget large posé sur le
+  mock, ni par un drapeau de test — et la valeur des `Delayed` ajustés est encadrée par un
+  commentaire nommant ses deux bornes.
 
 ## Surfaces opérateur et sonde post-déploiement
 
@@ -379,3 +459,14 @@ sans `llm_call_attempt` intermédiaire pointe vers un blocage **avant** `send_on
 ## Revision history
 
 - 2026-09-16 — rédaction initiale (content-only, revue architecte à suivre).
+- 2026-09-16 — re-groom. Vérification des faits E1-E7 contre le code : tous confirmés
+  (`mod.rs:1105` nu vs `mod.rs:543` enveloppé, `llm_call started` hors boucle en
+  `openai.rs:341`, `max_attempts` en `openai.rs:367-371`, `claude.rs:381` littéral 120 s,
+  `worst_case_failure_secs` en `budget.rs:281`). Ajouts : **E8** (le filet vaut 300 s à la
+  géométrie de test et couperait deux tests eval existants, qui dorment 360 s virtuelles —
+  `AnthropicProvider` et `MockLlmProvider` héritent tous deux du `timeout_budget()` par
+  défaut) ; **D8** et **V4-bis** (ajuster ces deux tests sous le filet plutôt que désarmer
+  le filet en test) ; **AC7** ; nuance conditionnelle sur **D2** (« ne coupe que du
+  déjà-perdu » est une propriété des rails de production, pas du trait). Correction d'une
+  imprécision de **V1** : `MAX_ATTEMPTS_HARD_CAP` est privé à `openai.rs:154` et non déjà
+  présent dans `llm/mod.rs` — le remonter est un pré-requis de la méthode par défaut.
