@@ -2629,6 +2629,23 @@ async fn run_loop(
                                 .take()
                                 .map(|c| c.correlation_id)
                                 .unwrap_or_default();
+                            // mika#2338 — fail-visible: rewrite into a terminal ESCALATE that
+                            // names the cause, so the groom reports it instead of an opaque
+                            // "verdict missing". The withheld marker remains the fallback for
+                            // a skill that declares no ESCALATE of the withdrawn family.
+                            let escalated = escalate_unattested_disposition(
+                                &text,
+                                required_suffix_lines,
+                                required_finding_list_prefixes,
+                                anchors_found,
+                                anchors_valid,
+                                reason,
+                            );
+                            let emitted = if escalated.is_some() {
+                                "escalate"
+                            } else {
+                                "withheld-marker"
+                            };
                             error!(
                                 target: "mika::otel",
                                 trace_id = %tool_ctx.trace_id,
@@ -2640,12 +2657,15 @@ async fn run_loop(
                                 anchors_found,
                                 anchors_valid,
                                 miss_reason = ?reason,
+                                emitted,
                                 event = "guard.review_anchor_withheld",
                                 "Review-anchor guard: attestation still absent after the \
                                  corrective re-prompt — disposition withheld from the final \
-                                 response (#2037)"
+                                 response (#2037, escalated with its cause since #2338)"
                             );
-                            text = withhold_disposition(&text, required_suffix_lines);
+                            text = escalated.unwrap_or_else(|| {
+                                withhold_disposition(&text, required_suffix_lines)
+                            });
                         }
                     }
 
@@ -5757,6 +5777,131 @@ fn collect_review_anchor_contract(matched: &[MatchedSkill<'_>]) -> ReviewAnchorC
     contract
 }
 
+/// Disposition lines that are terminal — they require an F-list (mika#901) and are never
+/// forged into an approval. Everything else a skill declares (`Disposition: READY`,
+/// `Verdict: GROOMED`) is non-terminal and owes an attestation instead (mika#2037).
+const TERMINAL_DISPOSITIONS: &[&str] = &[
+    "Disposition: ITERATE",
+    "Disposition: ESCALATE",
+    "Verdict: ESCALATE",
+];
+
+/// Marker fragment of the finding line the engine writes when it escalates an unattested
+/// disposition (mika#2338). The full line is `<prefix> (BLOCKING) [mika-engine] review-anchor:
+/// …`, and `dispatch-lib` recognizes it by that complete shape anchored at the start of a
+/// line — never by `[mika-engine]` alone, which every corrective re-prompt also begins with
+/// and which the model recopies into its own prose. Keep in sync with the tier-0b pattern in
+/// `skills/bundled/_shared/dispatch-lib.sh`; `test-dispatch-lib.sh` compares the two.
+const REVIEW_ANCHOR_ENGINE_FINDING_MARKER: &str = "(BLOCKING) [mika-engine] review-anchor:";
+
+/// The `ESCALATE` line of the same family as a declared disposition line
+/// (`Disposition: READY` → `Disposition: ESCALATE`, `Verdict: GROOMED` → `Verdict: ESCALATE`).
+fn escalate_line_of_family(disposition_line: &str) -> Option<String> {
+    disposition_line
+        .split_once(':')
+        .map(|(family, _)| format!("{family}: ESCALATE"))
+}
+
+/// Rewrite an unattested non-terminal disposition into a terminal `ESCALATE` that names its
+/// cause (mika#2338). Returns `None` when the skill declares no `ESCALATE` line of the same
+/// family as the disposition being withdrawn — the caller then falls back to
+/// [`withhold_disposition`].
+///
+/// This is the fail-**visible** half of the mika#2037 guard. Withholding left `dispatch-lib`
+/// with "no verdict", which the groom reported as an opaque `PIPELINE FAILURE: architect
+/// verdict missing`; measured on three substrate grooms of 2026-09-16, the operator had to
+/// read `server.log` to learn that the guard had refused a 2-of-3 attestation. An `ESCALATE`
+/// carrying the counters and the miss reason travels through the existing escalation path
+/// (`_escalate_groom`) into `tasks.result`, findings preserved.
+///
+/// Three properties are load-bearing:
+///
+/// - **The family follows the withdrawn line, not the order of a list.** The three arch skills
+///   are `always_on`, so `collect_required_suffix_lines` yields the union of all five lines on
+///   every mika-arch turn; a fixed "`Disposition: ESCALATE` first" would make
+///   `Verdict: ESCALATE` unreachable in production.
+/// - **Every occurrence is rewritten, inline mentions included.** `dispatch-lib`'s tier 1a and
+///   `_parse_verdict`'s tier 1 run `grep -oE … | head -1` over the whole text, unanchored, and
+///   the withheld marker that short-circuited them at tier 0 is not written on this path. A
+///   sentence of the model quoting `Disposition: READY` — the shipped prompts carry it as a
+///   worked example, and `body_lines` already had to move to `rposition` for the same reason
+///   — would be read before the `ESCALATE` appended at the end. Rewriting an inline mention is
+///   free: it never was a verdict.
+/// - **The finding line has a fixed shape** (`REVIEW_ANCHOR_ENGINE_FINDING_MARKER`) and never
+///   contains a declared suffix line in clear, so no tier can read a verdict out of it.
+///
+/// Like [`withhold_disposition`], this rewrites the text rather than failing the turn: the
+/// guard chain has no hard-refusal mechanism and the shell consumer already owns the
+/// escalation path.
+fn escalate_unattested_disposition(
+    text: &str,
+    required_suffix_lines: &[String],
+    finding_prefixes: &[String],
+    anchors_found: usize,
+    anchors_valid: usize,
+    reason: review_anchor::AnchorMissReason,
+) -> Option<String> {
+    let is_declared = |line: &str| required_suffix_lines.iter().any(|req| req == line);
+    let non_terminal_declared: Vec<&str> = required_suffix_lines
+        .iter()
+        .map(String::as_str)
+        .filter(|line| !TERMINAL_DISPOSITIONS.contains(line))
+        .collect();
+
+    // The disposition being withdrawn: the non-terminal declared line in the same last-3
+    // window `has_declared_disposition` reads. The guard only calls this after that predicate
+    // held, so the window carries one.
+    let withdrawn = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .take(3)
+        .find(|line| non_terminal_declared.contains(line))?;
+    let escalate = escalate_line_of_family(withdrawn)?;
+    if !is_declared(&escalate) {
+        return None;
+    }
+
+    // Substring replacement over the whole text, one declared non-terminal line at a time.
+    // Each is rewritten into the ESCALATE of its own family when that one is declared, and
+    // into the withdrawn line's otherwise — a `Disposition: READY` quoted inline during a
+    // second-review turn still cannot be read as READY.
+    let mut rewritten = text.to_string();
+    for line in &non_terminal_declared {
+        let replacement = escalate_line_of_family(line)
+            .filter(|candidate| is_declared(candidate))
+            .unwrap_or_else(|| escalate.clone());
+        rewritten = rewritten.replace(line, &replacement);
+    }
+
+    let prefix = finding_prefixes
+        .first()
+        .map(String::as_str)
+        .unwrap_or("F1:");
+    let finding = format!(
+        "{prefix} {REVIEW_ANCHOR_ENGINE_FINDING_MARKER} attestation withheld after the \
+         corrective re-prompt — anchors_found={anchors_found}, anchors_valid={anchors_valid}, \
+         miss_reason={reason:?}: {}. The non-terminal disposition this response carried could \
+         not be verified against the reviewed brief; it is not a verdict (mika#2037 guard, \
+         mika#2338).",
+        reason.describe()
+    );
+    debug_assert!(
+        required_suffix_lines
+            .iter()
+            .all(|req| !finding.contains(req.as_str())),
+        "the engine finding line must not carry a declared suffix line in clear"
+    );
+
+    Some(format!(
+        "{}\n\n{finding}\n\n{escalate}\n",
+        rewritten.trim_end()
+    ))
+}
+
 /// Withhold an unattested disposition from the final text (mika#2037).
 ///
 /// Replaces the disposition line with `DISPOSITION_WITHHELD_MARKER` and leaves the rest of
@@ -5768,6 +5913,11 @@ fn collect_review_anchor_contract(matched: &[MatchedSkill<'_>]) -> ReviewAnchorC
 /// `LoopResult` variant handled at all three call sites for no gain: the shell consumer
 /// already treats a response with no derivable disposition as `UNPARSED`, which is a bounded
 /// retry then a pipeline failure. This reaches the same fail-closed end by touching one layer.
+///
+/// Since mika#2338 this is the **fallback**: the guard first tries
+/// [`escalate_unattested_disposition`], which reaches the same fail-closed end while naming the
+/// cause. The marker path is kept for a skill that declares no `ESCALATE` line of the withdrawn
+/// family — unreachable with the shipped arch manifests, whose union always carries both.
 fn withhold_disposition(text: &str, required_suffix_lines: &[String]) -> String {
     text.lines()
         .map(|line| {
@@ -5836,13 +5986,6 @@ fn has_declared_disposition(text: &str, required_suffix_lines: &[String]) -> boo
 /// Non-terminal: `Disposition: READY`, `Verdict: GROOMED`.
 /// Per mika#901 R1: F-list is required only on terminal dispositions.
 fn is_terminal_disposition(text: &str, required_suffix_lines: &[String]) -> bool {
-    // Terminal disposition lines — these are the suffix lines that require an F-list.
-    const TERMINAL_DISPOSITIONS: &[&str] = &[
-        "Disposition: ITERATE",
-        "Disposition: ESCALATE",
-        "Verdict: ESCALATE",
-    ];
-
     // Scan the last 3 non-empty lines (same window as the suffix-line guard)
     // for any terminal disposition match against the skill's declared suffix lines.
     let last_non_empty: Vec<&str> = text
@@ -7526,6 +7669,181 @@ mod tests {
     use crate::test_utils::test_helpers::test_async_db;
     use mika_common::claude::ToolDefinition;
     use std::path::PathBuf;
+
+    // ===========================================================================
+    // mika#2338 — unattested disposition escalates with its cause
+    // ===========================================================================
+
+    /// What mika-arch sees in production: the three arch skills are `always_on`, so the
+    /// union of all five declared lines is present on every turn.
+    fn arch_suffix_union() -> Vec<String> {
+        [
+            "Disposition: READY",
+            "Disposition: ITERATE",
+            "Disposition: ESCALATE",
+            "Verdict: GROOMED",
+            "Verdict: ESCALATE",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    fn finding_prefixes() -> Vec<String> {
+        (1..=3).map(|n| format!("F{n}:")).collect()
+    }
+
+    fn escalate_2338(text: &str, suffixes: &[String], prefixes: &[String]) -> Option<String> {
+        escalate_unattested_disposition(
+            text,
+            suffixes,
+            prefixes,
+            3,
+            2,
+            review_anchor::AnchorMissReason::QuoteNotInBrief,
+        )
+    }
+
+    fn last_non_empty_line(text: &str) -> &str {
+        text.lines()
+            .map(str::trim)
+            .rfind(|l| !l.is_empty())
+            .unwrap_or("")
+    }
+
+    #[test]
+    fn mika2338_first_pass_2_of_3_becomes_a_disposition_escalate_naming_the_cause() {
+        let text = "A1: \"une citation\" — ok.\nA2: \"une autre\" — ok.\nA3: paraphrase.\n\nLe plan est sain.\n\nDisposition: READY\n";
+        let out = escalate_2338(text, &arch_suffix_union(), &finding_prefixes())
+            .expect("the union declares Disposition: ESCALATE");
+        assert_eq!(last_non_empty_line(&out), "Disposition: ESCALATE");
+        assert!(
+            out.contains("F1: (BLOCKING) [mika-engine] review-anchor: attestation withheld"),
+            "finding line must open with the prefix and the constant marker: {out}"
+        );
+        assert!(out.contains("anchors_found=3, anchors_valid=2, miss_reason=QuoteNotInBrief"));
+        assert!(
+            !out.contains("Disposition: READY"),
+            "no READY may survive: {out}"
+        );
+        assert!(
+            out.contains("Le plan est sain."),
+            "the model's body is kept"
+        );
+    }
+
+    #[test]
+    fn mika2338_second_pass_groomed_becomes_a_verdict_escalate_not_a_disposition() {
+        let text = "A1: \"une citation\" — ok.\nA2: \"une autre\" — ok.\nA3: paraphrase.\n\nVerdict: GROOMED\n";
+        let out = escalate_2338(text, &arch_suffix_union(), &finding_prefixes()).unwrap();
+        assert_eq!(last_non_empty_line(&out), "Verdict: ESCALATE");
+        assert!(!out.contains("Verdict: GROOMED"));
+        assert!(
+            !out.contains("Disposition: ESCALATE"),
+            "the family follows the withdrawn line, not the order of the list: {out}"
+        );
+    }
+
+    #[test]
+    fn mika2338_undeclared_family_falls_back_to_none() {
+        let only_dispositions: Vec<String> = [
+            "Disposition: READY",
+            "Disposition: ITERATE",
+            "Disposition: ESCALATE",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let text = "A1: x\n\nVerdict: GROOMED\n";
+        assert_eq!(
+            escalate_2338(text, &only_dispositions, &finding_prefixes()),
+            None,
+            "Verdict: ESCALATE is not declared — the caller withholds instead"
+        );
+
+        let only_ready = vec!["Disposition: READY".to_string()];
+        let text = "A1: x\n\nDisposition: READY\n";
+        assert_eq!(escalate_2338(text, &only_ready, &finding_prefixes()), None);
+    }
+
+    #[test]
+    fn mika2338_no_finding_prefixes_declared_defaults_to_f1() {
+        let text = "A1: x\n\nDisposition: READY\n";
+        let out = escalate_2338(text, &arch_suffix_union(), &[]).unwrap();
+        assert!(
+            out.contains("\nF1: (BLOCKING) [mika-engine] review-anchor:"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn mika2338_a_disposition_cited_early_on_its_own_line_is_rewritten_too() {
+        let text = "Le contrat dit :\nDisposition: READY\nquand le plan est sain.\n\nA1: x\n\nDisposition: READY\n";
+        let out = escalate_2338(text, &arch_suffix_union(), &finding_prefixes()).unwrap();
+        assert!(!out.contains("Disposition: READY"), "{out}");
+        assert_eq!(out.matches("Disposition: ESCALATE").count(), 3, "{out}");
+    }
+
+    /// The case the withheld marker used to cover at tier 0 and that this path must cover
+    /// itself: `dispatch-lib` reads the FIRST `Disposition:` anywhere in the text.
+    #[test]
+    fn mika2338_an_inline_mention_of_the_disposition_is_rewritten() {
+        let text = "Je confirme que ma réponse se termine par `Disposition: READY` comme demandé.\n\nA1: x\n\nDisposition: READY\n";
+        let out = escalate_2338(text, &arch_suffix_union(), &finding_prefixes()).unwrap();
+        assert!(!out.contains("Disposition: READY"), "{out}");
+        assert!(
+            out.contains("se termine par `Disposition: ESCALATE`"),
+            "{out}"
+        );
+
+        let text = "Mon verdict est bien `Verdict: GROOMED`.\n\nA1: x\n\nVerdict: GROOMED\n";
+        let out = escalate_2338(text, &arch_suffix_union(), &finding_prefixes()).unwrap();
+        assert!(!out.contains("Verdict: GROOMED"), "{out}");
+        assert_eq!(last_non_empty_line(&out), "Verdict: ESCALATE");
+    }
+
+    /// A READY quoted inline during a second-review turn is rewritten into ITS family's
+    /// ESCALATE, so `_parse_disposition`'s tier 1a cannot read READY out of it either.
+    #[test]
+    fn mika2338_a_foreign_family_mention_is_rewritten_into_its_own_escalate() {
+        let text = "La première passe disait Disposition: READY.\n\nA1: x\n\nVerdict: GROOMED\n";
+        let out = escalate_2338(text, &arch_suffix_union(), &finding_prefixes()).unwrap();
+        assert!(!out.contains("Disposition: READY"), "{out}");
+        assert!(out.contains("disait Disposition: ESCALATE."), "{out}");
+        assert_eq!(last_non_empty_line(&out), "Verdict: ESCALATE");
+    }
+
+    #[test]
+    fn mika2338_the_finding_line_never_carries_a_declared_line_in_clear() {
+        for reason in [
+            review_anchor::AnchorMissReason::NoAnchorLine,
+            review_anchor::AnchorMissReason::QuoteTooShort,
+            review_anchor::AnchorMissReason::QuoteNotInBrief,
+            review_anchor::AnchorMissReason::OverlappingRegions,
+            review_anchor::AnchorMissReason::TooFewAnchors,
+        ] {
+            let out = escalate_unattested_disposition(
+                "A1: x\n\nDisposition: READY\n",
+                &arch_suffix_union(),
+                &finding_prefixes(),
+                1,
+                0,
+                reason,
+            )
+            .unwrap();
+            let finding = out
+                .lines()
+                .find(|l| l.starts_with("F1: "))
+                .expect("finding line present");
+            assert!(
+                !finding.contains("READY") && !finding.contains("GROOMED"),
+                "{finding}"
+            );
+            for req in arch_suffix_union() {
+                assert!(!finding.contains(&req), "{finding} carries {req}");
+            }
+        }
+    }
 
     // ===========================================================================
     // mika#2296 — reasoning-budget-exhaustion predicate (M2 / T3)
