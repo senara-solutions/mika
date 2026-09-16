@@ -714,6 +714,8 @@ async fn save_continuation_llm_call(
         false,
         status,
         latency_ms,
+        request_bytes,
+        system_prompt_bytes,
     );
     emit_turn_usage(
         db.agent_id(),
@@ -1304,6 +1306,8 @@ async fn run_loop(
                     tool_use_in_turn,
                     "success",
                     llm_call_latency_ms,
+                    request_bytes,
+                    Some(system_prompt_len as i64),
                 );
                 emit_turn_usage(
                     db.agent_id(),
@@ -1316,6 +1320,10 @@ async fn run_loop(
                 );
             }
             Err(_) => {
+                // The arm mika#2331 AC1 exists for: `usage` is `None` here, so
+                // every token count is 0 and the line used to say nothing at
+                // all about the size of the brief that timed out. These two
+                // values were measured before the call and survive it.
                 let fields = build_turn_usage_fields(
                     step as u32,
                     None,
@@ -1323,6 +1331,8 @@ async fn run_loop(
                     false,
                     "error",
                     llm_call_latency_ms,
+                    request_bytes,
+                    Some(system_prompt_len as i64),
                 );
                 emit_turn_usage(
                     db.agent_id(),
@@ -6655,6 +6665,21 @@ struct TurnUsageFields {
     stop_reason: String,
     tool_use_in_turn: bool,
     status: String,
+    /// Wire bytes of the request, measured **before** the call (mika#2331 AC1).
+    ///
+    /// Both this and `system_prompt_bytes` are RAW discriminating dimensions,
+    /// not a classification — they respect Prime hard condition #1 above.
+    ///
+    /// They were already computed, and already written to `llm_calls` on the
+    /// error path (v53 / v38); they were simply invisible to the log stream,
+    /// which is why an operator measuring a 420 s hang saw `input_tokens = 0`
+    /// and nothing about how big the brief was.
+    ///
+    /// `Option`, and `None` is not `0`: no request is empty, so a zero would be
+    /// a readable lie. `null` says "not measured".
+    request_bytes: Option<i64>,
+    /// Bytes of the assembled system prompt for this turn (mika#2331 AC1).
+    system_prompt_bytes: Option<i64>,
 }
 
 /// Pure builder: maps a per-turn observation into `TurnUsageFields` (mika#1889).
@@ -6677,6 +6702,7 @@ struct TurnUsageFields {
 ///
 /// `step = u32::MAX` is the continuation sentinel (mirrors the DB path in
 /// `save_continuation_llm_call`).
+#[allow(clippy::too_many_arguments)]
 fn build_turn_usage_fields(
     step: u32,
     usage: Option<&LlmUsage>,
@@ -6684,6 +6710,8 @@ fn build_turn_usage_fields(
     tool_use_in_turn: bool,
     status: &str,
     latency_ms: u64,
+    request_bytes: Option<i64>,
+    system_prompt_bytes: Option<i64>,
 ) -> TurnUsageFields {
     let (input, output, cache_read, cache_write) = match usage {
         Some(u) => (
@@ -6704,6 +6732,8 @@ fn build_turn_usage_fields(
         stop_reason: stop_reason.to_string(),
         tool_use_in_turn,
         status: status.to_string(),
+        request_bytes,
+        system_prompt_bytes,
     }
 }
 
@@ -6745,6 +6775,10 @@ fn emit_turn_usage(
         latency_ms = fields.latency_ms,
         tool_use_in_turn = fields.tool_use_in_turn,
         status = %fields.status,
+        // `?` rather than a plain value: it preserves the null/value
+        // distinction the two fields exist to carry (mika#2331 D6).
+        request_bytes = ?fields.request_bytes,
+        system_prompt_bytes = ?fields.system_prompt_bytes,
         "turn usage"
     );
 }
@@ -12536,7 +12570,7 @@ mod tests {
     #[test]
     fn build_turn_usage_success_with_cache_passes_through_tokens() {
         let u = usage_with_cache();
-        let f = build_turn_usage_fields(3, Some(&u), "ToolUse", true, "success", 250);
+        let f = build_turn_usage_fields(3, Some(&u), "ToolUse", true, "success", 250, None, None);
         assert_eq!(f.step, 3);
         assert_eq!(f.input_tokens, 1234);
         assert_eq!(f.output_tokens, 567);
@@ -12557,7 +12591,7 @@ mod tests {
         // still be jq-parseable unconditionally — `None` → `0`, never a missing
         // field. This is the load-bearing analyzer-shape invariant.
         let u = usage_without_cache();
-        let f = build_turn_usage_fields(0, Some(&u), "EndTurn", false, "success", 0);
+        let f = build_turn_usage_fields(0, Some(&u), "EndTurn", false, "success", 0, None, None);
         assert_eq!(f.input_tokens, 10);
         assert_eq!(f.output_tokens, 20);
         assert_eq!(f.cache_read_tokens, 0);
@@ -12571,7 +12605,7 @@ mod tests {
         // Error/timeout arms have no `LlmUsage`. R3 mandates the event still
         // fires so the covariable "turns" count is not silently undercounted —
         // the tokens roll to zero but the row exists.
-        let f = build_turn_usage_fields(7, None, "error", false, "error", 42);
+        let f = build_turn_usage_fields(7, None, "error", false, "error", 42, None, None);
         assert_eq!(f.step, 7);
         assert_eq!(f.input_tokens, 0);
         assert_eq!(f.output_tokens, 0);
@@ -12592,7 +12626,16 @@ mod tests {
         // the offline analyzer (brick 5/5) can distinguish continuation-turn
         // usage from in-loop step indices without a separate flag.
         let u = usage_without_cache();
-        let f = build_turn_usage_fields(u32::MAX, Some(&u), "EndTurn", false, "success", 100);
+        let f = build_turn_usage_fields(
+            u32::MAX,
+            Some(&u),
+            "EndTurn",
+            false,
+            "success",
+            100,
+            None,
+            None,
+        );
         assert_eq!(f.step, u32::MAX);
     }
 
@@ -12604,8 +12647,10 @@ mod tests {
         // classification. Verified here by exercising both truth values with
         // otherwise-identical inputs.
         let u = usage_without_cache();
-        let f_true = build_turn_usage_fields(1, Some(&u), "ToolUse", true, "success", 0);
-        let f_false = build_turn_usage_fields(1, Some(&u), "EndTurn", false, "success", 0);
+        let f_true =
+            build_turn_usage_fields(1, Some(&u), "ToolUse", true, "success", 0, None, None);
+        let f_false =
+            build_turn_usage_fields(1, Some(&u), "EndTurn", false, "success", 0, None, None);
         assert!(f_true.tool_use_in_turn);
         assert!(!f_false.tool_use_in_turn);
         // No `phase`/`is_planning`/`role` field exists on the struct — D1/R5
@@ -12619,8 +12664,64 @@ mod tests {
         // measurement (wall-clock of the HTTP call), not an estimand
         // component. Verified here as a pure pass-through.
         let u = usage_without_cache();
-        let f = build_turn_usage_fields(0, Some(&u), "EndTurn", false, "success", 12345);
+        let f =
+            build_turn_usage_fields(0, Some(&u), "EndTurn", false, "success", 12345, None, None);
         assert_eq!(f.latency_ms, 12345);
+    }
+
+    // ===========================================================================
+    // mika#2331 (AC1) — the turn says its size, including when it fails
+    // ===========================================================================
+
+    /// The load-bearing distinction of D6: `None` and `Some(0)` are different
+    /// answers. No request is empty, so a `0` would be a readable lie about a
+    /// measurement that did not happen; `null` says "not measured".
+    #[test]
+    fn mika2331_request_bytes_none_and_some_do_not_collapse() {
+        let u = usage_without_cache();
+        let measured = build_turn_usage_fields(
+            0,
+            Some(&u),
+            "EndTurn",
+            false,
+            "success",
+            0,
+            Some(59_812),
+            Some(48_000),
+        );
+        assert_eq!(measured.request_bytes, Some(59_812));
+        assert_eq!(measured.system_prompt_bytes, Some(48_000));
+
+        let unmeasured =
+            build_turn_usage_fields(0, Some(&u), "EndTurn", false, "success", 0, None, None);
+        assert_eq!(unmeasured.request_bytes, None);
+        assert_eq!(unmeasured.system_prompt_bytes, None);
+        assert_ne!(unmeasured.request_bytes, Some(0));
+    }
+
+    /// The arm the whole of AC1 is about. A hung call returns no `usage`, so
+    /// every token count is zero — and until now that zero was the line's only
+    /// statement about how big the brief was. The two sizes are measured before
+    /// the call and must survive it.
+    #[test]
+    fn mika2331_error_arm_still_carries_the_brief_size() {
+        let f = build_turn_usage_fields(
+            4,
+            None,
+            "error",
+            false,
+            "error",
+            420_000,
+            Some(59_812),
+            Some(48_000),
+        );
+        assert_eq!(f.input_tokens, 0, "no usage on the error arm — unchanged");
+        assert_eq!(
+            f.request_bytes,
+            Some(59_812),
+            "the size of a brief that timed out is exactly what a 420 s hang needs to be read"
+        );
+        assert_eq!(f.system_prompt_bytes, Some(48_000));
     }
 
     // ===========================================================================

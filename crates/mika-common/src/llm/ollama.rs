@@ -500,10 +500,61 @@ impl OllamaProvider {
             });
         }
 
-        let resp: OllamaChatResponse = response
-            .json()
-            .await
-            .map_err(|e| LlmError::ParseError(format!("failed to parse ollama response: {e}")))?;
+        // Read the body as text before deserializing (mika#2015 pattern, ported
+        // to this rail by mika#2331 §3.3).
+        //
+        // `response.json()` conflates two failures the retry loop must treat
+        // differently: the bytes never arrived (transport — retryable) and the
+        // bytes arrived and are unreadable (parse — not). Mapping both to
+        // ParseError is what made every mid-body network hiccup terminal on the
+        // openai rail for four months; that hole was closed there by mika#2015
+        // and never ported here. No measured hang is on this rail, but the hole
+        // is the same one, and the split is the same three lines.
+        //
+        // reqwest's Display for a read failure is the opaque "error decoding
+        // response body" — the cause (unexpected EOF, decompression, reset)
+        // lives in the source chain, so walk it into the message. The cost of
+        // the retry itself: a second completion is billed. Same price already
+        // accepted on the openai rail; a completion has no server-side effect
+        // beyond that.
+        let body = match response.text().await {
+            Ok(b) => b,
+            Err(e) => {
+                let mut chain = e.to_string();
+                let mut src = std::error::Error::source(&e);
+                while let Some(s) = src {
+                    chain.push_str(": ");
+                    chain.push_str(&s.to_string());
+                    src = s.source();
+                }
+                warn!(
+                    target: "mika::llm",
+                    provider = %self.provider_kind,
+                    error = %chain,
+                    "LLM response body read failed mid-stream (retryable transport)"
+                );
+                return Err(LlmError::Transport(format!(
+                    "failed to read response body: {chain}"
+                )));
+            }
+        };
+
+        let resp: OllamaChatResponse = serde_json::from_str(&body).map_err(|e| {
+            let excerpt: String = body.chars().take(400).collect();
+            warn!(
+                target: "mika::llm",
+                provider = %self.provider_kind,
+                error = %e,
+                body_len = body.len(),
+                body_excerpt = %excerpt,
+                "ollama response body did not parse"
+            );
+            LlmError::ParseError(format!(
+                "failed to parse ollama response: {e} (body {} bytes, starts: {})",
+                body.len(),
+                excerpt.chars().take(120).collect::<String>()
+            ))
+        })?;
 
         // Dev-mode body logging
         if tracing::enabled!(target: "mika::llm_debug", tracing::Level::DEBUG) {
@@ -536,7 +587,13 @@ impl OllamaProvider {
         } else {
             MAX_ATTEMPTS_HARD_CAP
         };
-        let retry_threshold_secs =
+        // mika#2331 §3.3: the transport-aware threshold of mika#1744 was never
+        // ported to this rail — it used the long `0.75 + 0.25` threshold even
+        // after a transport failure, i.e. precisely after the error mika#1744
+        // exists to retry quickly. Computed per-iteration now (as on the openai
+        // rail) because it depends on the class of the last error.
+        let transport_threshold_secs = self.budget.transport_retry_min_remaining_secs();
+        let default_threshold_secs =
             self.budget.typical_call_duration_secs() + self.budget.retry_buffer_secs();
 
         info!(
@@ -553,11 +610,33 @@ impl OllamaProvider {
                 // Deadline-aware retry abort
                 if let Some(dl) = deadline {
                     let remaining = dl.saturating_duration_since(Instant::now());
+                    let last_was_transport = last_error
+                        .as_ref()
+                        .is_some_and(super::error::LlmError::is_transport);
+                    let retry_threshold_secs = if last_was_transport {
+                        transport_threshold_secs
+                    } else {
+                        default_threshold_secs
+                    };
                     if remaining < Duration::from_secs(retry_threshold_secs) {
                         warn!(
                             attempt,
                             remaining_ms = remaining.as_millis() as u64,
+                            threshold_secs = retry_threshold_secs,
+                            last_was_transport,
                             "aborting retry chain — remaining deadline insufficient for another attempt"
+                        );
+                        // mika#2331 AC2 — see the twin comment in `openai.rs`.
+                        super::emit_llm_call_attempt(
+                            &self.provider_kind.to_string(),
+                            &request.model,
+                            attempt,
+                            max_attempts,
+                            0,
+                            super::attempt_outcome::DEADLINE_ABORT,
+                            last_error.as_ref().map(|e| e.error_class()).as_deref(),
+                            self.budget.http_timeout_secs(),
+                            Some(remaining.as_millis() as u64),
                         );
                         break;
                     }
@@ -583,7 +662,36 @@ impl OllamaProvider {
                 "llm_call_attempt"
             );
 
-            match self.send_once(&ollama_request).await {
+            // mika#2331 AC2 — the outcome line; see the twin comment in `openai.rs`.
+            let attempt_start = Instant::now();
+            let attempt_result = self.send_once(&ollama_request).await;
+            let attempt_elapsed_ms = attempt_start.elapsed().as_millis() as u64;
+            let deadline_remaining_ms =
+                deadline.map(|dl| dl.saturating_duration_since(Instant::now()).as_millis() as u64);
+            let outcome = match &attempt_result {
+                Ok(_) => super::attempt_outcome::SUCCESS,
+                Err(e) if attempt + 1 < max_attempts && e.is_retryable() => {
+                    super::attempt_outcome::RETRYING
+                }
+                Err(_) => super::attempt_outcome::EXHAUSTED,
+            };
+            super::emit_llm_call_attempt(
+                &self.provider_kind.to_string(),
+                &request.model,
+                attempt,
+                max_attempts,
+                attempt_elapsed_ms,
+                outcome,
+                attempt_result
+                    .as_ref()
+                    .err()
+                    .map(LlmError::error_class)
+                    .as_deref(),
+                self.budget.http_timeout_secs(),
+                deadline_remaining_ms,
+            );
+
+            match attempt_result {
                 Ok(response) => {
                     let llm_response = Self::from_ollama_response(response);
                     info!(
@@ -609,9 +717,20 @@ impl OllamaProvider {
             }
         }
 
-        // Distinguish deadline-abort from normal retry exhaustion
+        // Distinguish deadline-abort from normal retry exhaustion. Mirrors the
+        // loop's transport-aware threshold so the two branches agree on which
+        // errors classify as "aborted by deadline".
+        let last_was_transport = last_error
+            .as_ref()
+            .is_some_and(super::error::LlmError::is_transport);
+        let deadline_threshold_secs = if last_was_transport {
+            transport_threshold_secs
+        } else {
+            default_threshold_secs
+        };
         let deadline_aborted = deadline.is_some_and(|dl| {
-            dl.saturating_duration_since(Instant::now()) < Duration::from_secs(retry_threshold_secs)
+            dl.saturating_duration_since(Instant::now())
+                < Duration::from_secs(deadline_threshold_secs)
         });
 
         Err(last_error.unwrap_or_else(|| {

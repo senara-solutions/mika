@@ -228,24 +228,22 @@ fn delivery_backoff_secs(base: u64, max: u64, attempts: u32, quarantine_at: u32)
 /// `http_<status>` — is what is implemented here. Keeping `429` distinguishable
 /// from `500` is the difference between "we are being rate-limited" and "the
 /// provider is down", and triage needs both.
+///
+/// **Since mika#2331 this is an adapter, not a classifier.** The mapping itself
+/// moved to `LlmError::error_class` in `mika-common`, because the per-attempt
+/// `llm_call_attempt` event needed the same vocabulary from inside the LLM
+/// client — and a second spelling written there would have cut the operator's
+/// `GROUP BY` population in two without saying so. What stays here is the two
+/// things the LLM client cannot do: walk an `anyhow` cause chain, and answer
+/// `other` for a failure that is not an LLM failure at all. The four tests
+/// below this function are unchanged by that move, which is what attests the
+/// wire format did not shift.
 fn classify_delivery_error(err: &anyhow::Error) -> std::borrow::Cow<'static, str> {
-    use mika_common::llm::error::LlmError;
+    use mika_common::llm::error::{LlmError, error_class};
     use std::borrow::Cow;
 
-    let Some(llm_err) = err.downcast_ref::<LlmError>() else {
-        return Cow::Borrowed("other");
-    };
-
-    match llm_err {
-        LlmError::Transport(msg) if msg.to_lowercase().contains("timed out") => {
-            Cow::Borrowed("transport_timeout")
-        }
-        LlmError::Transport(_) => Cow::Borrowed("transport"),
-        LlmError::HttpError { status, .. } => Cow::Owned(format!("http_{status}")),
-        LlmError::ParseError(_) => Cow::Borrowed("parse"),
-        LlmError::ProviderError(_) => Cow::Borrowed("provider"),
-        LlmError::UnsupportedFeature(_) => Cow::Borrowed("unsupported"),
-    }
+    err.downcast_ref::<LlmError>()
+        .map_or(Cow::Borrowed(error_class::OTHER), LlmError::error_class)
 }
 
 /// Parent statuses from which no dispatch can ever be produced (mika#2169).
@@ -3868,6 +3866,44 @@ mod tests {
     fn classify_delivery_error_reports_non_llm_errors_as_other() {
         let err = anyhow::anyhow!("database is locked");
         assert_eq!(classify_delivery_error(&err), "other");
+    }
+
+    /// mika#2331 T3 — the factorisation guard.
+    ///
+    /// The classification moved to `LlmError::error_class` so the LLM client
+    /// could carry the same vocabulary on its per-attempt event. This asserts
+    /// the adapter and the moved mapping still answer identically over the
+    /// whole domain: the divergence D3 exists to prevent would otherwise show
+    /// up as an operator's `GROUP BY` quietly splitting one population in two,
+    /// with every individual test still green.
+    #[test]
+    fn mika2331_adapter_agrees_with_the_moved_classifier_on_every_variant() {
+        use mika_common::llm::error::LlmError;
+        let domain = [
+            LlmError::Transport(INCIDENT_TRANSPORT_TIMEOUT.to_string()),
+            LlmError::Transport("connection refused".into()),
+            LlmError::HttpError {
+                status: 429,
+                message: "slow down".into(),
+                retryable: true,
+            },
+            LlmError::HttpError {
+                status: 500,
+                message: "upstream".into(),
+                retryable: false,
+            },
+            LlmError::ParseError("bad json".into()),
+            LlmError::ProviderError("upstream".into()),
+            LlmError::UnsupportedFeature("vision".into()),
+        ];
+        for err in domain {
+            let direct = err.error_class();
+            let through_adapter = classify_delivery_error(&anyhow::Error::new(err.clone()));
+            assert_eq!(
+                through_adapter, direct,
+                "adapter and classifier disagree on {err:?}"
+            );
+        }
     }
 
     // ── extract_callback_fields tests ──

@@ -27,8 +27,16 @@ pub(crate) const ANTHROPIC_MAX_ATTEMPTS: u32 = MAX_RETRIES + 1;
 /// being *silent*: the number is now a named constant that
 /// `AnthropicProvider::worst_case_failure_secs` reports, so the agent-loop
 /// watchdog is sized on what this transport can physically take rather than on
-/// a budget this rail does not honour.
+/// a budget this rail does not honour. mika#2331 reports the same constant as
+/// `http_timeout_secs` on its per-attempt outcome line, so an operator reading
+/// a 120 s cut here knows it comes from this constant and not from their
+/// configuration.
 pub(crate) const ANTHROPIC_HTTP_TIMEOUT_SECS: u64 = 120;
+
+/// Provider name this rail reports on its `llm_call_attempt` lines
+/// (mika#2331 AC2). Matches `AnthropicProvider::provider_name`, which this file
+/// cannot reach from here.
+const ANTHROPIC_PROVIDER_NAME: &str = "anthropic";
 
 const OAUTH_TOKEN_PREFIX: &str = "sk-ant-oat";
 
@@ -314,8 +322,21 @@ pub enum ClaudeApiError {
     BillingError { message: String },
     #[error("Claude API request failed")]
     Transport(#[from] reqwest::Error),
-    #[error("Claude API response parse error")]
-    ParseError(#[source] reqwest::Error),
+    #[error("Claude API response parse error: {0}")]
+    ParseError(String),
+    /// Body read failed mid-stream: the bytes never arrived (mika#2015 pattern,
+    /// ported to this rail by mika#2331 §3.3).
+    ///
+    /// **Retryable unconditionally**, unlike [`ClaudeApiError::Transport`],
+    /// whose `is_timeout()` condition this variant deliberately does not
+    /// inherit: a body cut mid-stream is not a `reqwest` timeout (its cause
+    /// chain says `unexpected EOF` / `decode` / `reset`), so classifying it as
+    /// `Transport` would leave it non-retryable — the split alone does not
+    /// repair this rail. Widening `Transport` to `=> true` instead would also
+    /// have made a refused connection retryable, a behaviour change this ticket
+    /// has not measured.
+    #[error("Claude API response body read failed: {0}")]
+    BodyRead(String),
 }
 
 // -- Client --
@@ -363,6 +384,14 @@ impl MessagesResponse {
 pub struct ClaudeClient {
     client: reqwest::Client,
     auth: AnthropicAuth,
+    /// Messages endpoint this client posts to. Always [`API_URL`] in
+    /// production; a field only so a test can point the rail at a local server
+    /// (mika#2331 §3.4).
+    ///
+    /// Until then this rail was **unreachable by any test** — it posted to a
+    /// hard-coded constant — which is also the explanation for its retry loop
+    /// having never been covered.
+    base_url: String,
     pub model: String,
     pub max_tokens: u32,
     /// When true AND the `telemetry` feature is enabled, attach request/response
@@ -405,6 +434,7 @@ impl ClaudeClient {
         Ok(Self {
             client,
             auth,
+            base_url: API_URL.to_string(),
             model,
             max_tokens,
             log_llm_bodies,
@@ -417,8 +447,34 @@ impl ClaudeClient {
         Self {
             client: reqwest::Client::new(),
             auth: AnthropicAuth::ApiKey(String::new()),
+            base_url: API_URL.to_string(),
             model: String::new(),
             max_tokens: 0,
+            log_llm_bodies: false,
+        }
+    }
+
+    /// Build a client pointed at a local test server (mika#2331 §3.4).
+    ///
+    /// Gated behind the crate's existing `test-utils` feature, the same
+    /// convention that already gates `MockLlmProvider` — an integration test
+    /// under `tests/` does not see `#[cfg(test)]`.
+    ///
+    /// `http_timeout_secs` is a parameter because this rail's production
+    /// constructor hard-codes `120` (mika#2189 named that inconsistency and
+    /// left it out of scope); a test that had to wait two minutes for a
+    /// deliberate hang would not be a test anyone runs.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(base_url: String, model: String, http_timeout_secs: u64) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(http_timeout_secs))
+                .build()
+                .expect("failed to build HTTP client"),
+            auth: AnthropicAuth::ApiKey("test-key".to_string()),
+            base_url,
+            model,
+            max_tokens: 64,
             log_llm_bodies: false,
         }
     }
@@ -576,9 +632,7 @@ impl ClaudeClient {
                 // OpenAI-compatible providers.
                 if let Some(dl) = deadline {
                     let remaining = dl.saturating_duration_since(Instant::now());
-                    let last_was_transport = last_error
-                        .as_ref()
-                        .is_some_and(|e| matches!(e, ClaudeApiError::Transport(_)));
+                    let last_was_transport = last_error.as_ref().is_some_and(is_transport_class);
                     let threshold_secs = if last_was_transport {
                         TRANSPORT_RETRY_MIN_REMAINING_SECS
                     } else {
@@ -591,6 +645,18 @@ impl ClaudeClient {
                             threshold_secs,
                             last_was_transport,
                             "aborting retry chain — remaining deadline insufficient for another attempt"
+                        );
+                        // mika#2331 AC2 — see the twin comment in `openai.rs`.
+                        crate::llm::emit_llm_call_attempt(
+                            ANTHROPIC_PROVIDER_NAME,
+                            &request.model,
+                            attempt,
+                            ANTHROPIC_MAX_ATTEMPTS,
+                            0,
+                            crate::llm::attempt_outcome::DEADLINE_ABORT,
+                            last_error.as_ref().map(error_class).as_deref(),
+                            ANTHROPIC_HTTP_TIMEOUT_SECS,
+                            Some(remaining.as_millis() as u64),
                         );
                         break;
                     }
@@ -605,10 +671,10 @@ impl ClaudeClient {
                 tokio::time::sleep(delay).await;
             }
 
-            // mika#2342 D4 — the per-attempt discriminator; see the twin
-            // comment in `llm/openai.rs`. `request_bytes_measured` is carried
-            // because this rail is the one that can legitimately not know the
-            // size, and a bare `0` would read as an empty brief.
+            // mika#2342 D4 — the per-attempt discriminator, emitted BEFORE the
+            // call; see the twin comment in `llm/openai.rs`. `request_bytes_measured`
+            // is carried because this rail is the one that can legitimately not
+            // know the size, and a bare `0` would read as an empty brief.
             info!(
                 target: "mika::otel",
                 attempt,
@@ -620,7 +686,43 @@ impl ClaudeClient {
                 "llm_call_attempt"
             );
 
-            match self.send_once(request, auth_header.clone()).await {
+            // mika#2331 AC2 — the outcome line, emitted AFTER the call and HERE,
+            // inside this rail's own loop, not at the `LlmProvider` boundary:
+            // `llm::anthropic` maps every error off this rail to
+            // `LlmError::ProviderError`, so an event emitted above it would
+            // report `provider` for a transport timeout — a false line, which is
+            // worse than an absent one (F8-2). The mika#2342 line above marks
+            // the start of the attempt; this one says how it ended.
+            let attempt_start = Instant::now();
+            let attempt_result = self.send_once(request, auth_header.clone()).await;
+            let attempt_elapsed_ms = attempt_start.elapsed().as_millis() as u64;
+            let deadline_remaining_ms =
+                deadline.map(|dl| dl.saturating_duration_since(Instant::now()).as_millis() as u64);
+            let outcome = match &attempt_result {
+                Ok(_) => crate::llm::attempt_outcome::SUCCESS,
+                Err(e) if attempt < MAX_RETRIES && is_retryable(e) => {
+                    crate::llm::attempt_outcome::RETRYING
+                }
+                Err(_) => crate::llm::attempt_outcome::EXHAUSTED,
+            };
+            crate::llm::emit_llm_call_attempt(
+                ANTHROPIC_PROVIDER_NAME,
+                &request.model,
+                attempt,
+                // This rail still consumes `MAX_RETRIES` instead of the
+                // budget's `max_attempts`, and hard-codes its own 120 s
+                // plafond — a real inconsistency mika#2189 named and left out
+                // of scope. Reporting the values it actually runs under is the
+                // honest thing to do, and makes the inconsistency readable.
+                ANTHROPIC_MAX_ATTEMPTS,
+                attempt_elapsed_ms,
+                outcome,
+                attempt_result.as_ref().err().map(error_class).as_deref(),
+                ANTHROPIC_HTTP_TIMEOUT_SECS,
+                deadline_remaining_ms,
+            );
+
+            match attempt_result {
                 Ok(response) => {
                     info!(
                         model = %request.model,
@@ -684,6 +786,10 @@ impl ClaudeClient {
                         ClaudeApiError::Transport(_) => anyhow::Error::from(e).context(
                             "Could not connect to Claude API. Check your internet connection.",
                         ),
+                        ClaudeApiError::BodyRead(_) => anyhow::Error::from(e).context(
+                            "The Claude API response was cut off mid-transfer. \
+                             This is usually transient — try again.",
+                        ),
                         ClaudeApiError::ParseError(_) => anyhow::Error::from(e)
                             .context("Received an unexpected response from Claude API."),
                         ClaudeApiError::HttpError { .. } => anyhow::Error::from(e)
@@ -700,9 +806,7 @@ impl ClaudeClient {
         // diagnostics. Mirrors the retry-loop's transport-aware threshold
         // (mika#1744) so the abort surface matches whichever threshold
         // actually fired.
-        let last_was_transport = last_error
-            .as_ref()
-            .is_some_and(|e| matches!(e, ClaudeApiError::Transport(_)));
+        let last_was_transport = last_error.as_ref().is_some_and(is_transport_class);
         let deadline_threshold_secs = if last_was_transport {
             TRANSPORT_RETRY_MIN_REMAINING_SECS
         } else {
@@ -794,7 +898,7 @@ impl ClaudeClient {
 
         let response = self
             .client
-            .post(API_URL)
+            .post(&self.base_url)
             .headers(headers)
             .json(request)
             .send()
@@ -832,8 +936,52 @@ impl ClaudeClient {
             });
         }
 
-        let response: MessagesResponse =
-            response.json().await.map_err(ClaudeApiError::ParseError)?;
+        // Read the body as text before deserializing (mika#2015 pattern, ported
+        // to this rail by mika#2331 §3.3). A failure HERE is a transport
+        // failure — the bytes never arrived — and gets the dedicated
+        // `BodyRead` variant, which `is_retryable` accepts unconditionally.
+        // A failure BELOW is a genuine parse failure and stays terminal.
+        //
+        // reqwest's Display for a read failure is the opaque "error decoding
+        // response body"; the cause lives in the source chain, so walk it in.
+        let body = match response.text().await {
+            Ok(b) => b,
+            Err(e) => {
+                let mut chain = e.to_string();
+                let mut src = std::error::Error::source(&e);
+                while let Some(s) = src {
+                    chain.push_str(": ");
+                    chain.push_str(&s.to_string());
+                    src = s.source();
+                }
+                warn!(
+                    target: "mika::llm",
+                    provider = "anthropic",
+                    error = %chain,
+                    "LLM response body read failed mid-stream (retryable transport)"
+                );
+                return Err(ClaudeApiError::BodyRead(format!(
+                    "failed to read response body: {chain}"
+                )));
+            }
+        };
+
+        let response: MessagesResponse = serde_json::from_str(&body).map_err(|e| {
+            let excerpt: String = body.chars().take(400).collect();
+            warn!(
+                target: "mika::llm",
+                provider = "anthropic",
+                error = %e,
+                body_len = body.len(),
+                body_excerpt = %excerpt,
+                "Claude API response body did not parse"
+            );
+            ClaudeApiError::ParseError(format!(
+                "{e} (body {} bytes, starts: {})",
+                body.len(),
+                excerpt.chars().take(120).collect::<String>()
+            ))
+        })?;
 
         // Dev-mode body logging
         if tracing::enabled!(target: "mika::llm_debug", tracing::Level::DEBUG) {
@@ -848,7 +996,60 @@ fn is_retryable(error: &ClaudeApiError) -> bool {
     match error {
         ClaudeApiError::HttpError { status, .. } => matches!(status, 429 | 500 | 529),
         ClaudeApiError::Transport(e) => e.is_timeout(),
+        // Unconditional, and deliberately not inheriting the `is_timeout()`
+        // condition above — see the variant's doc comment (mika#2331 §3.3).
+        ClaudeApiError::BodyRead(_) => true,
         _ => false,
+    }
+}
+
+/// Whether this failure counts as transport for the mika#1744 fast-retry
+/// threshold.
+///
+/// **`BodyRead` belongs here, and forgetting it is the quietest mistake in this
+/// file**: the omission breaks no test and produces no readable symptom — only
+/// a retry chain abandoned earlier than it should be, after precisely the error
+/// mika#1744 exists to retry quickly. Named as a function so the two call sites
+/// below cannot drift apart.
+fn is_transport_class(error: &ClaudeApiError) -> bool {
+    matches!(
+        error,
+        ClaudeApiError::Transport(_) | ClaudeApiError::BodyRead(_)
+    )
+}
+
+/// The wire-format error class of an Anthropic-rail failure (mika#2331 AC5).
+///
+/// A **second mapping** of the vocabulary defined once in
+/// `crate::llm::error::error_class`, never a second spelling: `ClaudeApiError`
+/// is foreign to `LlmError` and cannot share an implementation, so the shared
+/// site is one of definition. Every value returned here is one of those
+/// constants.
+///
+/// It exists because `llm::anthropic` flattens every error off this rail into
+/// `LlmError::ProviderError` (`anthropic.rs`): an `llm_call_attempt` emitted
+/// above that boundary would report `provider` for a transport timeout, i.e. a
+/// **false** line rather than an absent one. So the event is emitted from
+/// inside this file's retry loop, where the cause is still typed — and that is
+/// what needs this mapping.
+fn error_class(error: &ClaudeApiError) -> std::borrow::Cow<'static, str> {
+    use crate::llm::error::{classify_transport_message, error_class as class};
+    use std::borrow::Cow;
+
+    match error {
+        ClaudeApiError::HttpError { status, .. } => Cow::Owned(class::http(*status)),
+        // A billing rejection IS an HTTP 400; reporting it as such keeps the
+        // vocabulary at seven classes rather than inventing an eighth.
+        ClaudeApiError::BillingError { .. } => Cow::Owned(class::http(400)),
+        ClaudeApiError::Transport(e) => {
+            if e.is_timeout() {
+                Cow::Borrowed(class::TRANSPORT_TIMEOUT)
+            } else {
+                Cow::Borrowed(classify_transport_message(&e.to_string()))
+            }
+        }
+        ClaudeApiError::BodyRead(chain) => Cow::Borrowed(classify_transport_message(chain)),
+        ClaudeApiError::ParseError(_) => Cow::Borrowed(class::PARSE),
     }
 }
 
@@ -1240,6 +1441,95 @@ mod tests {
     }
 
     // -- Prompt caching tests --
+
+    // ── mika#2331 — the Anthropic rail's own mapping and retryability ──
+
+    /// T3: a **second mapping**, never a second spelling. Every value this rail
+    /// produces must come out of the one site of definition — an eighth string
+    /// invented here is exactly the divergence D3 exists to prevent, and it
+    /// would be invisible to every other test.
+    #[test]
+    fn mika2331_anthropic_error_class_stays_inside_the_shared_vocabulary() {
+        use crate::llm::error::error_class as class;
+
+        let known: Vec<String> = vec![
+            class::TRANSPORT_TIMEOUT.to_string(),
+            class::TRANSPORT.to_string(),
+            class::PARSE.to_string(),
+            class::PROVIDER.to_string(),
+            class::UNSUPPORTED.to_string(),
+            class::OTHER.to_string(),
+            class::http(400),
+            class::http(429),
+            class::http(500),
+        ];
+        let cases = [
+            ClaudeApiError::HttpError {
+                status: 429,
+                message: "slow down".into(),
+            },
+            ClaudeApiError::BillingError {
+                message: "Your credit balance is too low".into(),
+            },
+            ClaudeApiError::ParseError("bad json".into()),
+            ClaudeApiError::BodyRead(
+                "failed to read response body: error decoding response body: \
+                 request or response body error: operation timed out"
+                    .into(),
+            ),
+            ClaudeApiError::BodyRead("failed to read response body: unexpected EOF".into()),
+        ];
+        for err in &cases {
+            let c = error_class(err).to_string();
+            assert!(
+                known.contains(&c),
+                "{err:?} produced an unknown class {c:?}"
+            );
+        }
+
+        // And the two BodyRead shapes must not collapse into one another: the
+        // timeout is the shape the founding incident was made of.
+        assert_eq!(error_class(&cases[3]), class::TRANSPORT_TIMEOUT);
+        assert_eq!(error_class(&cases[4]), class::TRANSPORT);
+        assert_eq!(error_class(&cases[1]), class::http(400));
+    }
+
+    /// AC3: retryable **unconditionally** on this rail — it must not inherit
+    /// the `is_timeout()` condition `Transport` carries, or a body cut
+    /// mid-stream (whose cause chain says `unexpected EOF`, not `timed out`)
+    /// would stay terminal and §3.3 would have repaired nothing.
+    #[test]
+    fn mika2331_body_read_is_retryable_without_condition() {
+        assert!(is_retryable(&ClaudeApiError::BodyRead(
+            "failed to read response body: unexpected EOF during chunked body read".into()
+        )));
+        assert!(is_retryable(&ClaudeApiError::BodyRead(
+            "failed to read response body: operation timed out".into()
+        )));
+        // The neighbouring contract is unchanged: a body that ARRIVED and does
+        // not parse stays terminal.
+        assert!(!is_retryable(&ClaudeApiError::ParseError(
+            "expected value at line 1".into()
+        )));
+    }
+
+    /// The quietest possible omission, pinned: `BodyRead` must count as
+    /// transport for the mika#1744 fast-retry threshold. Forgetting it breaks
+    /// no test and shows no symptom — only a retry chain abandoned earlier than
+    /// it should be, after precisely the error mika#1744 exists to retry fast.
+    #[test]
+    fn mika2331_body_read_counts_as_transport_for_the_mika1744_threshold() {
+        assert!(is_transport_class(&ClaudeApiError::BodyRead(
+            "failed to read response body: unexpected EOF".into()
+        )));
+        assert!(!is_transport_class(&ClaudeApiError::ParseError(
+            "bad json".into()
+        )));
+        assert!(!is_transport_class(&ClaudeApiError::HttpError {
+            status: 500,
+            message: "upstream".into(),
+        }));
+    }
 
     #[test]
     fn test_cache_control_serialization() {
