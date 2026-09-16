@@ -109,7 +109,7 @@ Aux trois sites d'émission de `turn_usage`, les deux valeurs sont **déjà en p
 - `mod.rs:1204` (bras `Ok`) et `mod.rs:1223` (bras `Err`) : `request_bytes` (l. 1101), `system_prompt_len` ;
 - `mod.rs:704` (`save_continuation_llm_call`) : `system_prompt_bytes` et `request_bytes` sont déjà des **paramètres de la fonction** (l. 685).
 
-> **Ancrage des citations** : tous les numéros de ligne de ce plan sont relevés au SHA `40d36c91` de la branche. Les noms de symboles sont l'ancre porteuse — si un numéro a dérivé sous un rebase, c'est le symbole qui fait foi.
+> **Ancrage des citations** : tous les numéros de ligne de ce plan sont relevés au SHA `45cec264` de la branche, et **re-vérifiés contre l'arbre à ce SHA** — `is_retryable` (`llm/error.rs`), `max_attempts` (`llm/budget.rs`), les trois paires `build_turn_usage_fields`/`emit_turn_usage`, `request_bytes` (l. 1101), les deux `response.json()` d'`ollama.rs`/`claude.rs`, le `retry_threshold_secs` sans branche transport d'`ollama.rs`, et le `.timeout(Duration::from_secs(120))` en dur de `claude.rs`. Les noms de symboles restent l'ancre porteuse — si un numéro a dérivé sous un rebase, c'est le symbole qui fait foi.
 
 > L'instrument central de ce plan ne demande donc **aucune nouvelle mesure** : il déplace une donnée déjà calculée d'une surface gatée vers la surface ungated qui existe précisément pour ça.
 
@@ -178,6 +178,8 @@ Ni `MIKA_STORE_LLM_CALLS`, ni `MIKA_LOG_LLM_BODIES` ne doivent le taire. Doctrin
    Les six sites sont énumérables d'un seul grep, qui est aussi la vérification que le câblage est complet :
    `grep -n "emit_turn_usage\|build_turn_usage_fields" crates/mika-agent/src/agent_loop/mod.rs`
    → trois paires hors bloc `#[cfg(test)]`. Aucune quatrième paire ne doit apparaître sans que ce plan soit relu.
+
+5. **Coût mécanique nommé d'avance** : le même grep rend **dix** appels supplémentaires *dans* le bloc `#[cfg(test)]` (l. ≈12287–12370), qui construisent la structure avec six arguments. Élargir la signature les casse tous, et cette modification-là est **attendue et sans signification** — elle n'est qu'un ajout d'arguments. C'est l'exacte inverse de la contrainte portée par V4 sur `classify_delivery_error`, où le moindre test à modifier est un signal d'alarme ; les deux contraintes sont énoncées ensemble en §*Verification contract* pour qu'aucune ne soit lue comme l'autre.
 
 Le commentaire de `TurnUsageFields` mentionne la condition dure Prime #1 (aucun champ `phase`/`is_planning`/`role`). **Les deux champs ajoutés sont des dimensions RAW**, pas une classification : ils la respectent. Le noter au site.
 
@@ -313,7 +315,12 @@ Second ticket de dette, non conditionné : `claude.rs` n'honore ni `http_timeout
 | V6 | Structure des bundles | `make verify-bundled-skills` |
 | V7 | Formatage | `cargo fmt --check` |
 
-**Contrainte sur V4** : si un test de `classify_delivery_error` doit être modifié, la factorisation a changé le format de fil et le travail est à reprendre — c'est la seule façon de constater la divergence que D3 existe pour empêcher.
+**Contrainte sur V4, et son inverse sur V5 — les deux se lisent ensemble.**
+
+- **V4 est une contrainte de non-modification** : si un test de `classify_delivery_error` doit être modifié, la factorisation a changé le format de fil et le travail est à reprendre. C'est la seule façon de constater la divergence que D3 existe pour empêcher.
+- **V5 est exactement le contraire** : les dix appels de test à `build_turn_usage_fields` (§3.1 point 5) *doivent* être modifiés, puisque la signature gagne deux paramètres. Cette modification-là ne dit rien et n'atteste rien ; ce que V5 atteste est l'assertion ajoutée — `None` et `Some(n)` ne se confondent pas (D6).
+
+Énoncer les deux côte à côte est nécessaire : sans ça, « aucun test ne doit bouger » se lit comme une règle du PR entier et interdirait le seul câblage que ce plan demande.
 
 ---
 
