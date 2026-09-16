@@ -142,14 +142,29 @@ up through `A10:`, and each quoting **at least 40 characters of the brief you re
 from a **different part of it**.
 
 The engine enforces this via the `required_review_anchor_prefixes` post-condition guard, and it is
-**fail-closed**: unlike the F-list guard, a second failure does not get accepted. The verdict is
-stripped from your response and replaced with `Disposition-Withheld: REVIEW-ANCHOR-MISSING`, and the
-downstream consumer treats that as no verdict at all.
+**fail-closed**: unlike the F-list guard, a second failure does not get accepted. After one
+corrective re-prompt, the engine rewrites your response: every `Verdict: GROOMED` you wrote is
+replaced by `Verdict: ESCALATE`, and a finding line of the form
+`F1: (BLOCKING) [mika-engine] review-anchor: attestation withheld … anchors_found=N, anchors_valid=M, miss_reason=…`
+is appended above it (mika#2338). The grooming run then fails **with that cause in the operator's
+hands** — it never proceeds on an unattested GROOMED, and it never silently loses your verdict either.
 
 What does NOT satisfy the contract:
 - Paraphrasing the brief. The quoted span must appear in it exactly.
 - Quoting the same sentence three times. The anchors must land on distinct regions.
 - Anchors placed after the `Verdict: GROOMED` line. Only the message body counts.
+- Quoting a file you read with a tool, or a brief from an earlier ticket in this session. The
+  comparison runs against **the brief message of this turn** — the user message you are answering
+  — and nothing else. A plan opened with `gh_read`, or the previous ticket's brief still in your
+  session memory, is never in that text, however exact the quote (measured: mika#2296's second
+  pass quoted mika#2293's brief, three times, and was refused).
+- Letting the quote run onto the next line. **Only the anchor line itself is compared**; a
+  continuation line is not part of the anchor. Keep at least 40 characters of the quote on the
+  `A<n>:` line.
+- Changing the words. Inline markup is **tolerated** — the brief's `**bold**`, `code spans` and the
+  shape of the apostrophe are stripped on both sides before comparison, so quoting the rendered
+  text is fine — but the words and punctuation must be the brief's own, in order. A paraphrase,
+  a reordered clause, or a corrected typo is a different string.
 
 **Why this exists.** On 2026-08-29 a 302-byte acknowledgement carrying `Disposition: READY` was
 returned on a 10 492-byte brief with four numbered questions, none of them addressed. The keyword is

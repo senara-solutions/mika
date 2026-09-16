@@ -59,12 +59,59 @@ fn every_verdict_producer_teaches_the_anchor_contract() {
             prompt.contains("Review-Anchor Attestation Contract"),
             "{skill}'s prompt does not describe the contract its manifest enforces"
         );
+        // mika#2338 — the second failure is no longer a silent withhold: the engine rewrites
+        // the disposition into a terminal ESCALATE carrying a `[mika-engine]` finding line
+        // that names the cause. The prompt must describe that outcome, not the retired
+        // marker, or the model is taught a failure shape the engine no longer produces.
         assert!(
-            prompt.contains("Disposition-Withheld: REVIEW-ANCHOR-MISSING"),
-            "{skill}'s prompt must name the marker the engine substitutes, so the model knows \
-             the failure is terminal rather than advisory"
+            prompt.contains("[mika-engine]") && prompt.contains("ESCALATE"),
+            "{skill}'s prompt must describe the engine's ESCALATE-with-cause outcome, so the \
+             model knows the failure is terminal, visible, and attributed to the engine"
+        );
+        assert!(
+            !prompt.contains("replaced with `Disposition-Withheld"),
+            "{skill}'s prompt still teaches the retired withheld-marker outcome (mika#2338)"
         );
     }
+}
+
+/// The three citation rules the comparator actually checks (mika#2338): the source of the
+/// quote is the brief message of this turn, the quote lives on the anchor line, and the words
+/// must be exact while inline markup is tolerated. A prompt that omits any of them teaches a
+/// failure the engine will refuse.
+#[test]
+fn every_verdict_producer_teaches_the_three_citation_rules() {
+    for skill in VERDICT_PRODUCERS {
+        let prompt = read(skill, "system_prompt.md");
+        assert!(
+            prompt.contains("brief message of this turn"),
+            "{skill}'s prompt must say the quote is compared against the brief message of \
+             this turn — not a file read with a tool, not an earlier ticket in the session"
+        );
+        assert!(
+            prompt.contains("the anchor line itself is compared"),
+            "{skill}'s prompt must say a quote that wraps onto the next line is truncated at \
+             the anchor line"
+        );
+        assert!(
+            prompt.contains("markup") && prompt.contains("tolerated"),
+            "{skill}'s prompt must say inline markup is tolerated while the words must be exact"
+        );
+    }
+}
+
+/// The milestone prompt used to tell the architect to quote "the sub-issue plans you actually
+/// read". The milestone brief carries each sub-issue's key decisions, not the plans' text, and
+/// a plan read through `gh_read` is never in the text the comparator holds — so that sentence
+/// prescribed exactly the failure the guard refuses (mika#2338).
+#[test]
+fn the_milestone_prompt_no_longer_points_anchors_at_plans_read_by_tool() {
+    let milestone = read("mika-arch-groom-milestone", "system_prompt.md");
+    assert!(
+        !milestone.contains("quote the sub-issue plans you actually read"),
+        "mika-arch-groom-milestone still tells the model to quote plan files it read by tool; \
+         those are never in the brief the engine compares against"
+    );
 }
 
 /// The founding prescription: the prompt used to authorize exactly the response mika#2037
