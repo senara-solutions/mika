@@ -103,6 +103,12 @@ const CURATOR_REVIEW_CRON: &str = "0 0 3 * * *";
 /// (concurrency cap = 1, AC6).
 const WIP_RESCUE_CRON: &str = "0 */5 * * * *";
 
+/// Cron schedule for the QA-review reconciliation scan: every 15 minutes
+/// (mika#2334). Fond-de-file like `wip_rescue`; the per-tick cap
+/// (`MIKA_QA_REVIEW_RECONCILE_MAX_PER_TICK`, default 3) is what spreads the
+/// one-off backlog the first tick after deployment sees.
+const QA_REVIEW_RECONCILE_CRON: &str = "0 */15 * * * *";
+
 /// Build the Axum router with all routes and middleware.
 ///
 /// Shared between production `run_server` and test `test_app`.
@@ -1636,6 +1642,40 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                     "wip_rescue",
                     WIP_RESCUE_CRON,
                     r#"{"trigger":"wip_rescue"}"#,
+                )
+                .await;
+            }
+        }
+
+        // Register the QA-review reconciliation scan for mika-dev only
+        // (mika#2334). Same env-gated shape as auto_pull / wip_rescue:
+        // MIKA_QA_REVIEW_RECONCILE=0 disables it.
+        //
+        // The name deliberately drops the `MIKA_DEV_` prefix its two neighbours
+        // carry: this scan owns four sibling knobs
+        // (`MIKA_QA_REVIEW_RECONCILE_MIN_AGE_SECS` and friends) read inside
+        // `qa_review_reconcile`, which has no notion of which agent runs it, and
+        // one prefix for the family beats a kill-switch spelled unlike the knobs
+        // it governs. Carried by mika-dev today; that is a wiring fact here, not
+        // a property of the variable.
+        if name == "mika-dev" {
+            if std::env::var("MIKA_QA_REVIEW_RECONCILE")
+                .map(|v| v == "0")
+                .unwrap_or(false)
+            {
+                info!(agent = %name, "qa_review_reconcile disabled via MIKA_QA_REVIEW_RECONCILE=0");
+                if let Err(e) = db
+                    .cancel_recurring_task_by_label("qa_review_reconcile")
+                    .await
+                {
+                    warn!(agent = %name, error = %e, "failed to cancel stale qa_review_reconcile task");
+                }
+            } else {
+                task_engine::ensure_recurring_task(
+                    &db,
+                    "qa_review_reconcile",
+                    QA_REVIEW_RECONCILE_CRON,
+                    r#"{"trigger":"qa_review_reconcile"}"#,
                 )
                 .await;
             }

@@ -420,6 +420,67 @@ The policy itself lives in `mika_common::forge_identity` — shared with `mika-g
 
 **Operator grep signals** (`$MIKA_SPIRIT_LOG_FILE`, each with an `audit_events` row of the same name): `merge_ready_hold_reviewer_is_not_merge_actor` (the AC1 refusal — the shape mika#2244 measured), `merge_ready_hold_not_dispatcher` (any other agent holding), `merge_ready_human_gate_required` (perimeter hold at the actor), `merge_ready_merge_initiated` (the merge fired; the `ci_success_merge` audit row moved here from the evaluator). The tool-side companion refusal is `pr_merge_with_gate_reviewer_refused` — `pr_merge_with_gate` blocks the reviewer at step 0, before input validation and before any `gh` call, and returns `blocked` / `reason.reason = "reviewer_cannot_merge"` (the eighth `BlockReason`, carried in the three `self-dev*` prompts' taxonomy).
 
+### QA-Review Reconciler (mika#2334)
+
+`qa_review_reconcile` — the fourth recurring scan, next to `auto_pull_groomed`
+and `wip_rescue` in `task_engine/dispatcher.rs`, carried by mika-dev, cron
+`0 */15 * * * *`. It asks `mika-platform-qa` for a review on the loop's open PRs
+that nothing came to review. **Outside the LLM, outside the pilot session,
+triggered by time rather than by an event** — which is the whole point.
+
+**Two measurements moved the diagnosis, and they are worth keeping.** The
+founding ticket read two reviewerless PRs (2026-09-15) as a trailing
+`gh pr edit --add-reviewer` the pilot died before reaching. (M1) **That step did
+not exist anywhere in the repo** — the exhaustive search returns one hit and it
+is a flag-arity table; `dispatch-lib.sh`'s eight `gh pr edit` carry only
+`--add-label` / `--title` / `--body`. (M2) **The review never depended on the
+pilot**: `mika-gateway/src/github.rs` routes `pull_request.opened` to mika-qa
+with no draft filter, so creating the PR starts the cascade. The real defect is
+that `opened` is a **single, non-replayable event** — droppable head-of-line by
+the mika#1870 queue at saturation, then DLQ and `dead` behind the gateway
+circuit breaker, then lost to a second empty turn that `webhook_zero_tools` only
+opposes once — and **no path re-read an open PR without a review**. `auto_pull`
+works on issues, `wip_rescue` only on `wip-rescue`-labelled drafts,
+`curator_review` on skills; the mika#1711 `check_suite.completed(success)`
+fan-out is the one existing catch-up and it requires `draft: false` **and** a
+green CI.
+
+**Why the letter of the fix was declined.** An *unconditional* reviewer posted at
+PR creation double-reviews **every** PR of the loop: `opened` starts a session,
+the gesture emits `review_requested` on exactly `REVIEWER_FORGE_LOGIN` — so
+mika#1655's `is_suppressed_review_request` lets it through — and the second
+session cannot see the first (`gh pr view` is outside `QA_REVIEW_GH_ALLOWED`, and
+the first review is not posted yet anyway). The duplicate would be nominal, not
+exceptional — the class #886 closed once already. Hence: the gesture must be
+**conditional on the absence of a review**, and so it cannot live in
+`dispatch-lib.sh`, whose tail delivers its callback and dies in seconds and
+cannot observe an absence only measurable after a delay. The anchor there is real
+(`_post_flight_recovery`, `PR_URL` resolved, `_stamp_pr_origin` already called)
+and is declined for that reason alone.
+
+**Shape.** `select_prs_needing_review(&[PrSnapshot], now, &ReconcileConfig)` is a
+pure function carrying the entire decision; the `gh` execution is a thin caller.
+Six conjunctive terms, each fail-safe — unreadable information takes a PR **out**
+of the population, never into it (deleted author, unparseable `createdAt`, a
+future timestamp clamped to age 0). **The pilot's termination is not a parameter
+of that function**, which is the structural form of "independent of the pilot's
+survival". Deserialization is part of the guard: `review_requests` and `reviews`
+deliberately carry **no** `#[serde(default)]`, because a defaulted absence would
+read as "no request, no review" and *admit* a PR on missing information.
+
+**Sole writer** of the `qa_review_reconciled` audit `tool_name`, which is what
+makes `SELECT … WHERE tool_name = 'qa_review_reconciled'` the exact list of PRs
+the loop had to catch up on — and therefore the measure of the nominal path's
+health. This is a **net, not a path**: if it carries nominal traffic, the upstream
+loss is the subject and the net is now hiding the signal that would show it.
+
+Token via `Settings::resolve_github_token` (PAT-first, App fallback — posting a
+reviewer is not an operation whose author GitHub reads in the ADR-008 sense), and
+the mika#2205 structural guard covers this fourth scan. `PeriodicScan` gained a
+variant, so `mika2334_every_scan_variant_is_covered` makes the next one fail to
+compile until the guards enumerate it. Config, kill-switch and the five operator
+grep signals: root `CLAUDE.md` § *Optional (QA-review reconciliation — mika#2334)*.
+
 ### Structural CI Failure Handler
 
 `server::ci_failure_handler` — intercepts `check_suite.completed(failure|timed_out)` webhook events **before** the LLM turn. Failure-side companion to `ci_success_handler`. Matches CI failures to open PRs and existing work items, fetches failing-job context (up to 3 jobs, 100 lines each), and constructs a pre-digest instructing the LLM to dispatch `run_claude_pilot` for an autonomous fix. Circuit breaker: `ci_fix_count >= 2` in task metadata triggers escalation instead of dispatch — the handler increments `ci_fix_count` deterministically (not reliant on LLM). Checks both task-level callback children and global dispatch guard, including results in the pre-digest. Reuses `VerdictAction`, `find_open_pr`, `run_gh_checks`/`classify_checks`, and `has_active_callback_child` from sibling modules. Also fixes `CHECK_SUITE_RE` regex in `webhook_queue.rs` to match actual gateway format (was `Check suite (failure)`, corrected to `Check suite failure`). Order-independent with other handlers. 30s timeout per subprocess call. See #594.
@@ -1026,6 +1087,18 @@ The audit row's `reasoning` carries **all three** idle ages since mika#2277 (`wo
 **SOLE WRITER:** `dispatch_refusal_resolver` audit rows come from this site only. That is load-bearing for attribution (mika#2158 M6a): a `phantom_aged_out` row used to be compatible with two incompatible stories — the pilot never ran, or `dispatch-lib` refused and the refusal never landed on the engine. Now the second leaves a named trace, so its **absence** under a phantom is itself evidence for the first.
 
 **Childless-parent reaper (mika#1687):** `reap_childless_stuck_parent_tasks()` runs every 60-tick cycle after the auto-completer (so delivered-child success/failure cases resolve first). The deterministic backstop for **silent pilot death** — a parent that reaches `in_progress` but never records a callback child falls through all three sibling mechanisms above: the orphan reaper and auto-completer both INNER-JOIN a delivered callback child, and the watchdog keys off the callback child's PID. Detection query (`find_childless_stuck_parent_tasks`): parent `status='in_progress'`, `source='self_dev'`, `trigger_type='manual'`, `type='issue'`, `updated_at` older than `MIKA_CHILDLESS_PARENT_REAPER_GRACE_SECS` (default 1800s / 30 min — far larger than the orphan reaper's 600s because a legitimately-dispatching parent is childless only for the sub-second window between its `pending → in_progress` transition and the callback-child row commit), and `NOT EXISTS (SELECT 1 FROM tasks child WHERE child.parent_task_id = parent.id)` — the **exact complement** of the sibling reapers' INNER JOIN, so the three selection sets are disjoint by construction. On match: transitions parent to `failed` via guarded `update_task_failed` (terminal-state check prevents TOCTOU race), emits an `audit_events` row plus an INFO `task_engine_childless_reaper.reaped` log (with `age_minutes`); reuses `get_reaper_child_snapshot` for a `.evaluated` log confirming `children_count == 0` at decision time. Its job is **fail-with-telemetry, not re-drive** — freeing the dispatch slot + emitting a greppable signal; re-driving the still-open ticket is mika#1824's job at the auto-pull/label layer. Scoped to `type='issue'` in v1 — milestone/project childless-stuck detection is a deferred follow-up (they carry their own advancement backstops #991/#1218). **SOLE WRITER:** distinct `error_reason = "stuck_in_progress_no_callback_child"` (on `tasks.result`) and distinct `tool_name = 'task_engine_childless_reaper'` (on `audit_events`) — neither string is written anywhere else; reusing either breaks the operator/monitor discriminator that counts silent-pilot deaths separately from delivered-without-PR orphans (`task_engine_reaper`) and dead-PID subprocess deaths (`subprocess_exited_without_delivery`).
+
+**QA-review reconciler (mika#2334):** `qa_review_reconcile::reconcile_qa_review_requests()` — the fourth recurring scan, beside `auto_pull` and `wip_rescue`, carried by mika-dev on cron `0 */15 * * * *`. It asks `mika-platform-qa` for a review on the loop's open PRs that nothing came to review.
+
+**The event it backs up is unique and nothing replays it.** `pull_request.opened` is what starts the QA cascade (routed by the gateway, no draft filter), so the pilot's death after the push cannot by itself prevent the review — the founding ticket's causal premise does not hold, and the trailing `gh pr edit --add-reviewer` it wanted moved **did not exist anywhere in the repo**. What does hold is that `opened` is losable in four places (drop-oldest in the mika#1870 bounded queue → 429 → the gateway circuit breaker → a DLQ row that only a manual replay pulls back; plus the empty LLM turn, where `webhook_zero_tools` is opposed once) and that **no path re-read an open PR without a review**. The one pre-existing recovery, the mika#1711 `check_suite.completed(success)` fan-out, requires `draft: false` **and** a green CI, so a PR whose CI is red or never ran was never caught.
+
+**The decision is a pure function, and what is NOT an input to it is the point.** `select_prs_needing_review(prs, now, cfg)` takes no signal about how the pilot terminated — that absence *is* the structural form of "independent of pilot survival" (AC1), and it is why the fix covers the three upstream losses too, none of which are pilot deaths. Six conjunctive terms, each **fail-safe** (unreadable information takes a PR *out* of the population, never into it): open, author = `DISPATCHER_FORGE_LOGIN`, `isDraft == false`, no request **and** no review from `REVIEWER_FORGE_LOGIN`, age inside `]MIN_AGE, MAX_AGE[`. The review term is not redundant with the request term: GitHub withdraws the request once the review lands, so without it every reviewed PR would be re-requested for ever.
+
+**Why not a step before the fragile ones, as the ticket's comment asked.** An *unconditional* gesture at PR creation doubles the review on **every** PR of the loop, not just the stranded ones: `opened` has already started a session, and the `review_requested` the gesture emits targets exactly `REVIEWER_FORGE_LOGIN`, so `is_suppressed_review_request` (mika#1655) does not filter it and a second session starts — one that cannot observe the first, since `gh pr view` is outside qa-review's tooled perimeter and the first review is not posted yet anyway. The gesture must therefore be **conditional on the absence of a review**, which the shell tail cannot be: `dispatch-lib.sh` delivers its callback and dies in seconds, and an absence is only measurable after a delay. A prompt step is ruled out by `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`.
+
+**No new literal.** `REVIEWER_FORGE_LOGIN` and `DISPATCHER_FORGE_LOGIN` both come from `mika_common::forge_identity`, which `mika-gateway` imports for the same filter — writing the login here would be the constant divergence a shell implementation would have guaranteed. **Token:** `Settings::resolve_github_token` (PAT-first, App fallback) via `resolve_periodic_scan_token`, covered by the mika#2205 structural guard; no label is written, so there is no `resolve_periodic_scan_label_token` here.
+
+**SOLE WRITER:** `tool_name = 'qa_review_reconciled'`. That is what makes `SELECT … WHERE tool_name = 'qa_review_reconciled'` the exact list of PRs the loop had to catch up on — i.e. the measure of the nominal path's health. **Operator grep signals:** `qa_review_reconciled`, `qa_review_reconcile_tick` (aggregate, emitted **only when the tick acts**), `qa_review_reconcile_no_token`, `qa_review_request_failed` (should stay empty — `requested_reviewers` is the same family as the label write that already fails under PAT, mika#2228), `qa_review_reconcile_error`. Config and post-deploy probes: root `CLAUDE.md` § *réconciliation des demandes de revue*. **This is a net, not a path:** sustained volume means `opened` is being lost systematically and the net is now hiding the signal that would show it.
 
 **Team task tree:** parent `invoke_orchestrator` task + child `resume_agent` tasks per delegation. Suspend/resume on pending grandchild callbacks. **Team-run user notification (#287):** fired once at terminal status from two symmetric callsites (`run_team` tool for sync completion, `dispatch_invoke_orchestrator` for async resume), both routing through `teams::notification::build_run_completion_message`. Per-child `resume_agent` callbacks have their user-facing `send_message` suppressed via `NoopSender`; the silent turn still runs (updates memory, records `llm_calls`) — only the user channel is gated. Deliverable text is UTF-8-safe truncated at 4000 chars (below Telegram's 4096 limit).
 

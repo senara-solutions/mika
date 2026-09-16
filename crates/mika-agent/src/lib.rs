@@ -28,6 +28,7 @@ pub mod planning;
 pub mod post_condition;
 pub mod pricing;
 pub mod prompt;
+pub mod qa_review_reconcile;
 pub mod ready_label;
 pub mod research;
 pub mod rewind;
