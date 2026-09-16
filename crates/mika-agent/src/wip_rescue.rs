@@ -2265,9 +2265,13 @@ mod tests {
         // The gesture the rescue body asks for, in the forms a human types it.
         assert!(pipeline_verified(MARKER_YES));
         assert!(pipeline_verified("<!-- rescue-pipeline-verified:yes-->"));
-        assert!(pipeline_verified("<!--  rescue-pipeline-verified :  Yes  -->"));
+        assert!(pipeline_verified(
+            "<!--  rescue-pipeline-verified :  Yes  -->"
+        ));
         assert!(
-            pipeline_verified(&format!("## Auto-rescued PR\n\n{MARKER_YES}\n\nCloses #2023")),
+            pipeline_verified(&format!(
+                "## Auto-rescued PR\n\n{MARKER_YES}\n\nCloses #2023"
+            )),
             "the marker is read inside a real body, not on a line of its own"
         );
 
@@ -2282,8 +2286,12 @@ mod tests {
         );
 
         // Anything that is not the literal `yes`.
-        assert!(!pipeline_verified("<!-- rescue-pipeline-verified: maybe -->"));
-        assert!(!pipeline_verified("<!-- rescue-pipeline-verified: YES SIR -->"));
+        assert!(!pipeline_verified(
+            "<!-- rescue-pipeline-verified: maybe -->"
+        ));
+        assert!(!pipeline_verified(
+            "<!-- rescue-pipeline-verified: YES SIR -->"
+        ));
         assert!(!pipeline_verified("<!-- rescue-pipeline-verified: -->"));
 
         // Two markers that disagree resolve to the safe side, whichever order.
