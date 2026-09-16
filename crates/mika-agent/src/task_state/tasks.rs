@@ -199,6 +199,29 @@ pub struct DispatchChild {
     pub status: String,
 }
 
+/// Statuses on which a task no longer has a pilot to kill (mika#2335).
+///
+/// Deliberately a positive list of terminal states rather than `!= pending &&
+/// != in_progress`: an unknown status must read as *not terminal*, so a state
+/// added later is still disposed of rather than silently spared.
+///
+/// Lives here, beside [`DispatchChild`], because both callers that filter a
+/// dispatch child on it — the supersession disposal (`tracking_cleanup`) and
+/// the operator cancel path (`task_engine::process_kill`) — must agree. A
+/// second copy of this list is the shape of defect this ticket exists to
+/// remove.
+pub fn is_terminal_task_status(status: &str) -> bool {
+    use crate::task_engine::types::task_status;
+    matches!(
+        status,
+        task_status::DELIVERED
+            | task_status::COMPLETED
+            | task_status::CANCELLED
+            | task_status::FAILED
+            | task_status::EXPIRED
+    )
+}
+
 /// A parent self_dev task left `in_progress` after its callback subtask
 /// delivered WITH a `pr_url` (success indicator). Used by the success-side
 /// engine backstop (mika#1162) — sibling shape to `OrphanedParentTask`.

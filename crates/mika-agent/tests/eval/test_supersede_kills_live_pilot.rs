@@ -324,6 +324,148 @@ async fn delivered_child_carrying_a_stale_pgid_is_not_signalled() {
     );
 }
 
+/// INVARIANT (mika#2335, revue) : **annuler un parent tue le pilote de son
+/// enfant.** C'est le geste de l'opérateur, et c'est le même aveuglement
+/// parent/enfant que la supersession : `cancel_task_and_kill` lisait
+/// `process_id` sur la ligne qu'on lui nomme, donc jamais rien sur un parent.
+/// La CLI annonçait « un pilote tourne, PID n », prenait la confirmation,
+/// annulait la ligne — et le pilote continuait d'écrire.
+///
+/// Rouge-avant : retirer la traversée `find_dispatch_children_with_pid` de
+/// `cancel_task_and_kill` ; `process_killed` redevient `None` et le `sleep`
+/// survit.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn cancelling_a_parent_kills_the_pilot_of_its_child() {
+    let db = test_db();
+    let url = "https://github.com/senara-solutions/mika/issues/2336";
+    let (guard, start_time) = spawn_live_child();
+    let pid = guard.pid();
+
+    let parent_id = seed_parent_tracking_row(&db, url).await;
+    let child_id = seed_dispatch_child(&db, &parent_id, "pending", pid, Some(start_time)).await;
+
+    assert!(is_alive(pid), "contrôle positif : l'enfant tourne avant");
+
+    let outcome = mika_agent::task_engine::process_kill::cancel_task_and_kill(&db, &parent_id)
+        .await
+        .expect("cancel must not error")
+        .expect("the parent row is cancellable");
+
+    assert_eq!(
+        outcome.pid,
+        Some(pid),
+        "INVARIANT VIOLÉ : l'annulation n'a pas trouvé le pgid — il vit sur \
+         l'enfant, pas sur le parent qu'on nomme"
+    );
+    assert_eq!(outcome.process_killed, Some(true), "le pilote doit être tué");
+    assert!(
+        !is_alive(pid),
+        "INVARIANT VIOLÉ : la task est annulée et le pilote (pgid {pid}) tourne \
+         encore — exactement ce que la CLI promettait de faire"
+    );
+
+    let child = db.get_task(&child_id).await.unwrap().unwrap();
+    assert!(
+        child.process_id.is_none(),
+        "le pgid doit être effacé sur la ligne qui le PORTE, pas sur le parent"
+    );
+}
+
+/// Contrôle négatif de la traversée : une task **sans enfant de dispatch** est
+/// annulée exactement comme avant, sans prétendre à un kill. Sans lui, une
+/// traversée trop gourmande passerait le test ci-dessus.
+#[tokio::test]
+async fn cancelling_a_parent_without_a_dispatch_child_claims_no_kill() {
+    let db = test_db();
+    let parent_id =
+        seed_parent_tracking_row(&db, "https://github.com/senara-solutions/mika/issues/2337").await;
+
+    let outcome = mika_agent::task_engine::process_kill::cancel_task_and_kill(&db, &parent_id)
+        .await
+        .expect("cancel must not error")
+        .expect("the parent row is cancellable");
+
+    assert_eq!(outcome.pid, None, "aucun pgid à rapporter");
+    assert_eq!(
+        outcome.process_killed, None,
+        "aucun kill tenté, donc aucun kill rapporté"
+    );
+}
+
+/// Contrôle négatif de la traversée (2) : un enfant **terminal** portant un
+/// vieux pgid n'est pas signalé par l'annulation non plus. Même règle que la
+/// supersession, et pour la même raison : ce pgid ne désigne plus son pilote.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn cancelling_a_parent_ignores_a_terminal_child_carrying_a_stale_pgid() {
+    let db = test_db();
+    let (guard, start_time) = spawn_live_child();
+    let pid = guard.pid();
+
+    let parent_id =
+        seed_parent_tracking_row(&db, "https://github.com/senara-solutions/mika/issues/2338").await;
+    seed_dispatch_child(&db, &parent_id, "delivered", pid, Some(start_time)).await;
+
+    let outcome = mika_agent::task_engine::process_kill::cancel_task_and_kill(&db, &parent_id)
+        .await
+        .expect("cancel must not error")
+        .expect("the parent row is cancellable");
+
+    assert_eq!(outcome.pid, None, "un enfant terminal n'offre pas son pgid");
+    assert!(
+        is_alive(pid),
+        "contrôle négatif : le pgid d'un enfant terminal ne désigne plus son \
+         pilote — le signaler, c'est tuer un inconnu"
+    );
+}
+
+/// INVARIANT (mika#2335, revue) : **un kill qui n'atterrit pas n'est pas écrit
+/// comme s'il avait atterri.** Un enfant dont le process a survécu garde sa
+/// ligne et son pgid — les deux seuls champs par lesquels un faucheur peut
+/// encore l'atteindre (`process_id IS NOT NULL` + statut non terminal). Les
+/// effacer ferait d'un pilote vivant un pilote définitivement injoignable.
+///
+/// Le kill est fait échouer sans toucher au code : le `process_start_time`
+/// enregistré ne correspond pas au process réel, donc la garde anti-réutilisation
+/// de PID refuse de signaler — et `kill_process_gracefully` rend alors `true`
+/// (« ce n'est pas notre process »). Ce test emprunte donc l'autre voie de
+/// l'échec : un `process_id` hors plage `u32`, que `kill_process_gracefully`
+/// refuse en rendant `false` sans rien signaler.
+#[tokio::test]
+async fn a_supersession_whose_kill_fails_keeps_the_row_and_the_pgid() {
+    let db = test_db();
+    let url = "https://github.com/senara-solutions/mika/issues/2339";
+
+    // PID négatif : `kill_process_gracefully` refuse et rend `false` sans
+    // signaler quoi que ce soit. Aucun process réel n'est en jeu.
+    let parent_id = seed_parent_tracking_row(&db, url).await;
+    let child_id = seed_dispatch_child(&db, &parent_id, "pending", -4242, Some(12345)).await;
+
+    supersede_prior_tracking_rows(
+        &db,
+        SESSION,
+        Some(TRACE),
+        url,
+        "ready-label: senara-solutions/mika#2339",
+    )
+    .await;
+
+    let child = db.get_task(&child_id).await.unwrap().unwrap();
+    assert_eq!(
+        child.process_id,
+        Some(-4242),
+        "INVARIANT VIOLÉ : le pgid a été effacé alors que le kill n'a pas \
+         atterri — plus aucun faucheur ne peut atteindre ce process"
+    );
+    assert_eq!(
+        child.status, "pending",
+        "INVARIANT VIOLÉ : la ligne a été marquée terminale sur un kill raté — \
+         « un kill raté et un kill jamais tenté ne doivent pas produire la même \
+         ligne » (engine.rs)"
+    );
+}
+
 /// Contrôle négatif (c) : un enfant **sans `process_start_time`** n'est pas
 /// signalé (fail-safe F1.4). `kill_process_gracefully` retomberait sur une
 /// simple existence de PID, qui ne distingue pas un PID recyclé — et signaler

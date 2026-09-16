@@ -284,6 +284,51 @@ pub async fn cancel_task_and_kill(
         .map(|t| t.label.clone())
         .unwrap_or_else(|| "unknown".to_string());
 
+    // mika#2335 — a PARENT tracking row never carries the pgid.
+    //
+    // A dispatch is two rows: the parent (`trigger_type='manual'`,
+    // `action_type='none'`) carries the issue URL, and the callback child
+    // carries the process-group id. Reading `process_id` off the row the
+    // caller named therefore finds nothing whenever that row is the parent —
+    // which is the row an operator types the id of, the row `cancel_task` (the
+    // agent tool) is given, and the row `POST /tasks/:id/cancel` receives. The
+    // task was cancelled, its child row was cascaded to `cancelled`, and the
+    // pilot kept writing to its worktree: the same parent/child blindness
+    // mika#2263 shipped in the supersession path, on the manual path.
+    //
+    // The traversal is the one that already exists and is tested
+    // (`find_dispatch_children_with_pid`, mika#2156) — not a second resolver.
+    // Its two filters are the supersession's, for the same reasons: a terminal
+    // child has no pilot left and its pgid is stale, and a child with no
+    // readable `process_start_time` is left alone because a recycled PID
+    // cannot be told from the pilot and mis-signalling a process *group* is
+    // unbounded damage.
+    let (process_id, start_time, pid_owner) = match process_id {
+        Some(pid) => (Some(pid), start_time, task_id.to_string()),
+        None => match db.find_dispatch_children_with_pid(task_id).await {
+            Ok(children) => children
+                .into_iter()
+                .find(|c| {
+                    !crate::task_state::tasks::is_terminal_task_status(&c.status)
+                        && c.process_start_time.is_some()
+                })
+                .map(|c| (Some(c.process_id), c.process_start_time, c.id))
+                .unwrap_or((None, None, task_id.to_string())),
+            Err(e) => {
+                // Fail-safe: an unreadable lookup is not evidence that no
+                // pilot exists. Cancel the row as before and say so, rather
+                // than reporting a kill that was never attempted.
+                warn!(
+                    task_id,
+                    error = %e,
+                    "cancel: dispatch-child lookup failed — cancelling the row \
+                     without reaching any pilot it may carry"
+                );
+                (None, None, task_id.to_string())
+            }
+        },
+    };
+
     let cancelled = db.cancel_task(task_id).await?;
     if !cancelled {
         return Ok(None);
@@ -301,7 +346,22 @@ pub async fn cancel_task_and_kill(
         pre_write_cancel_reason(pid, CANCEL_REASON_OPERATOR);
 
         let killed = kill_process_gracefully(pid, start_time).await;
-        let _ = db.clear_task_process_id(task_id).await;
+        // Clear the pgid on the row that CARRIES it (mika#2335) — the child
+        // when the traversal found one, the named row otherwise. Clearing it
+        // on the parent would be a no-op that reads like a cleanup, and
+        // clearing the child's after a kill that did not land would erase the
+        // last handle anything has on a live process.
+        if killed {
+            let _ = db.clear_task_process_id(&pid_owner).await;
+        } else {
+            warn!(
+                task_id,
+                pid_owner = %pid_owner,
+                pid,
+                "cancel: kill did not land — leaving the pgid on the row so a \
+                 reaper can still reach the process"
+            );
+        }
         Some(killed)
     } else {
         None

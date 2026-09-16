@@ -165,6 +165,45 @@ async fn restoring_a_status_never_stamps_fired_at() {
     );
 }
 
+/// INVARIANT (mika#2335, revue) : **un dispatch ne ressuscite pas un parent
+/// qu'une supersession concurrente vient d'annuler.**
+///
+/// Les deux sites secondaires observent le statut de la ligne, puis créent
+/// l'enfant callback et vérifient le script du handler avant de stamper. Une
+/// supersession pour la même `reference_url` tourne en tête du même handler :
+/// c'est un événement prévu, pas une hypothèse. Sans garde, le dispatch
+/// remettrait `in_progress` par-dessus l'annulation et deux dispatches vivants
+/// se retrouveraient sur un même ticket — par la comptabilité cette fois, pas
+/// par le kill manquant.
+///
+/// Rouge-avant : retirer `AND status IN ('pending','in_progress')` de
+/// `mark_parent_dispatched`.
+#[tokio::test]
+async fn dispatching_never_resurrects_a_parent_cancelled_meanwhile() {
+    let db = test_db();
+    let id =
+        seed_parent_tracking_row(&db, "https://github.com/senara-solutions/mika/issues/2340").await;
+
+    // Ce qu'une supersession concurrente laisse derrière elle.
+    db.update_manual_task_status(&id, "cancelled")
+        .await
+        .expect("a concurrent supersession cancels the parent");
+
+    db.mark_parent_dispatched(&id)
+        .await
+        .expect("the stamp is non-fatal and must not error");
+
+    let after = db.get_task(&id).await.unwrap().unwrap();
+    assert_eq!(
+        after.status, "cancelled",
+        "INVARIANT VIOLÉ : le dispatch a ressuscité un parent annulé"
+    );
+    assert!(
+        after.fired_at.is_none(),
+        "un parent annulé n'a pas été dispatché : rien à stamper"
+    );
+}
+
 /// Un cas par site de dispatch de production (AC4). Assertion **structurelle**
 /// — voir l'en-tête du fichier pour pourquoi cette moitié ne peut pas être
 /// comportementale, et pourquoi elle est celle qui décide du cas fondateur.

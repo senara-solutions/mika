@@ -22,7 +22,8 @@ use crate::task_engine::process_kill::{
     CANCEL_REASON_SUPERSEDED, kill_process_gracefully, pre_write_cancel_reason,
 };
 use crate::task_state::tasks::{
-    SUPERSEDED_BY_NEW_DISPATCH, TRACKING_ROW_SUPERSEDED_TOOL, strip_groom_phase_suffix,
+    SUPERSEDED_BY_NEW_DISPATCH, TRACKING_ROW_SUPERSEDED_TOOL, is_terminal_task_status,
+    strip_groom_phase_suffix,
 };
 use tracing::{info, warn};
 
@@ -250,7 +251,7 @@ pub async fn dispose_superseded_dispatch_processes(
         };
 
         for child in children {
-            if is_terminal_status(&child.status) {
+            if is_terminal_task_status(&child.status) {
                 continue;
             }
 
@@ -274,26 +275,48 @@ pub async fn dispose_superseded_dispatch_processes(
             let dead = kill_process_gracefully(pid, Some(start_time)).await;
             killed += 1;
 
-            // Terminal-mark the CHILD through the ordinary cancel path — the
-            // supersede-specific `cancel_task_superseded` refuses anything
-            // carrying a `process_id`, which is precisely the shape being
-            // disposed of here. The parent is cancelled by the caller, through
-            // that guarded path, once this returns.
-            if let Err(e) = db.cancel_task(&child.id).await {
+            // **A kill that did not land must not be written down as one.**
+            // `kill_process_gracefully` returns `false` on a refused SIGTERM
+            // (EPERM) and on a process that survives SIGKILL. Cancelling the
+            // row and clearing its `process_id` in that case would erase the
+            // only two fields by which anything downstream can still find the
+            // process — every reaper selects on `process_id IS NOT NULL` and a
+            // non-terminal status — so a pilot known to be alive would become
+            // permanently unreachable. The silent-stall reaper guards the same
+            // hazard in the same words (`engine.rs`: "leaving the task
+            // in_progress rather than claiming a disposition that did not
+            // happen"); this is that rule, applied here.
+            if !dead {
                 warn!(
-                    event = "superseded_dispatch_cancel_failed",
-                    task_id = %child.id,
-                    error = %e,
-                    "supersede: failed to cancel live dispatch row after kill (non-fatal)"
+                    event = "superseded_dispatch_kill_failed",
+                    task_id = %parent_id,
+                    child_task_id = %child.id,
+                    pid,
+                    "supersede: kill did not land — leaving the row and its pgid \
+                     intact so a reaper can still reach the process"
                 );
-            }
-            if let Err(e) = db.clear_task_process_id(&child.id).await {
-                warn!(
-                    event = "superseded_dispatch_clear_pid_failed",
-                    task_id = %child.id,
-                    error = %e,
-                    "supersede: failed to clear process_id after kill (non-fatal)"
-                );
+            } else {
+                // Terminal-mark the CHILD through the ordinary cancel path —
+                // the supersede-specific `cancel_task_superseded` refuses
+                // anything carrying a `process_id`, which is precisely the
+                // shape being disposed of here. The parent is cancelled by the
+                // caller, through that guarded path, once this returns.
+                if let Err(e) = db.cancel_task(&child.id).await {
+                    warn!(
+                        event = "superseded_dispatch_cancel_failed",
+                        task_id = %child.id,
+                        error = %e,
+                        "supersede: failed to cancel live dispatch row after kill (non-fatal)"
+                    );
+                }
+                if let Err(e) = db.clear_task_process_id(&child.id).await {
+                    warn!(
+                        event = "superseded_dispatch_clear_pid_failed",
+                        task_id = %child.id,
+                        error = %e,
+                        "supersede: failed to clear process_id after kill (non-fatal)"
+                    );
+                }
             }
 
             let reasoning = format!(
@@ -346,23 +369,6 @@ pub async fn dispose_superseded_dispatch_processes(
     killed
 }
 
-/// Statuses on which a dispatch child no longer has a pilot to kill.
-///
-/// Deliberately a positive list of terminal states rather than `!= pending &&
-/// != in_progress`: an unknown status must read as *not terminal*, so a state
-/// added later is still disposed of rather than silently spared.
-///
-/// Written with the `task_status` constants rather than bare literals, for the
-/// reason their own module gives: a typo in a status string compiles and then
-/// spares a live pilot in silence.
-fn is_terminal_status(status: &str) -> bool {
-    use crate::task_engine::types::task_status;
-    matches!(
-        status,
-        task_status::DELIVERED
-            | task_status::COMPLETED
-            | task_status::CANCELLED
-            | task_status::FAILED
-            | task_status::EXPIRED
-    )
-}
+// mika#2335 — the terminal-status predicate lives in `task_state::tasks`
+// beside `DispatchChild`, shared with the operator cancel path. Two copies of
+// the list is the shape of defect this module exists to remove.

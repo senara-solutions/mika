@@ -6790,6 +6790,21 @@ impl Database {
         // firing still needs its `fired_at`. Skipping the write there would
         // reproduce the defect on every path that transitions before it
         // dispatches.
+        //
+        // **The `status IN ('pending','in_progress')` guard is load-bearing,
+        // and it is the one place this method is STRICTER than the free
+        // transition it replaces.** Two of the three call sites observe the
+        // row's status and then do real work before stamping —
+        // `ready_label_handler` creates the callback child and stats the
+        // handler script in between, `verdict_handler` likewise — and a
+        // concurrent supersession for the same `reference_url` is a designed-
+        // for event on exactly that path (`supersede_prior_tracking_rows` runs
+        // at the top of the same handler). Without the guard, a dispatch could
+        // resurrect a parent another dispatch had just cancelled, putting two
+        // live dispatches back on one ticket through the bookkeeping instead of
+        // through the missing kill. A refusal writes nothing and is silent by
+        // design: the callers already treat this whole call as non-fatal, and
+        // the prior status is returned either way.
         self.conn.execute(
             "UPDATE tasks
                 SET status = 'in_progress',
@@ -6800,7 +6815,8 @@ impl Database {
                                END,
                     completed_at = NULL,
                     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-              WHERE id = ?1 AND agent_id = ?2 AND trigger_type = 'manual'",
+              WHERE id = ?1 AND agent_id = ?2 AND trigger_type = 'manual'
+                AND status IN ('pending', 'in_progress')",
             params![task_id, agent_id],
         )?;
 
