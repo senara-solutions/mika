@@ -442,8 +442,22 @@ impl ProviderKind {
             ProviderKind::Ollama => 131_072, // no hard limit
             ProviderKind::Mistral => 8_192,
             ProviderKind::Google => 65_536,
-            ProviderKind::DeepSeek => 8_192,
+            // mika#2296: was 8_192 — the R1-era figure. DeepSeek's current docs
+            // give `max_tokens ∈ [1, 384K]` with a 64K default in thinking mode,
+            // and reasoning now SHARES that ceiling with the answer instead of
+            // being billed apart. The stale value warned an operator that a
+            // perfectly legal 32768 "exceeds deepseek's limit" — contradicting
+            // the fix at the exact moment the question became live. 65_536 is
+            // the documented thinking-mode default rather than the 384K maximum:
+            // this table describes itself as conservative and exists to warn,
+            // not to authorise.
+            ProviderKind::DeepSeek => 65_536,
             ProviderKind::MiniMax => 16_384,
+            // Left at 8_192 by mika#2296, deliberately. The native `Kimi`
+            // provider targets api.moonshot.cn, which is NOT the route mika-arch
+            // uses (it goes through OpenRouter, already at 128_000). Correcting a
+            // figure nobody has measured on its own route would replace a stale
+            // datum with an invented one.
             ProviderKind::Kimi => 8_192,
             ProviderKind::Qwen => 8_192,
             // MikaModel uses the Ollama transport, which imposes no hard cap.
@@ -786,6 +800,22 @@ mod tests {
         assert_eq!("Z-AI".parse::<ProviderKind>(), Ok(ProviderKind::ZAi));
         // Canonical form survives a Display→FromStr round-trip as `zai`.
         assert_eq!(ProviderKind::ZAi.to_string(), "zai");
+    }
+
+    /// mika#2296 T4 — DeepSeek's output ceiling no longer contradicts a legal
+    /// `llm_max_tokens`.
+    ///
+    /// Source: DeepSeek's current API docs give `max_tokens ∈ [1, 384K]` with a
+    /// 64K default in thinking mode, reasoning and answer sharing one ceiling.
+    /// The 8_192 this replaces was the R1-era figure, three orders of magnitude
+    /// off, and `provider.rs:117` used it to tell an operator that a 32768
+    /// budget "exceeds deepseek's limit".
+    #[test]
+    fn mika2296_deepseek_max_output_tokens_is_not_the_r1_era_value() {
+        assert_eq!(ProviderKind::DeepSeek.max_output_tokens(), 65_536);
+        // The guard this repairs: a mika#2296-legal budget must no longer read
+        // as over the provider's limit.
+        assert!(32_768 <= ProviderKind::DeepSeek.max_output_tokens());
     }
 
     #[test]

@@ -4026,7 +4026,13 @@ _reason_pairing_check() {
             *"return 1"*)
                 n=$((n + 1))
                 case "$line$prev1$prev2" in
-                    *_groom_warn\ *|*GROOM_LOOP_FAILURE_REASON=*) ;;
+                    # mika#2296: `_groom_warn_empty_content` is listed by name,
+                    # not covered by relaxing the pattern to `*_groom_warn*`.
+                    # It delegates to `_groom_warn` and therefore genuinely sets
+                    # the reason — but a wildcard prefix would also accept any
+                    # future `_groom_warn_*` that does not, which is how a
+                    # detector stops detecting.
+                    *_groom_warn\ *|*_groom_warn_empty_content\ *|*GROOM_LOOP_FAILURE_REASON=*) ;;
                     *) bad=$((bad + 1)); echo "    unreasoned exit: $(printf '%s' "$line" | sed 's/^ *//')" >&2 ;;
                 esac
                 ;;
@@ -5723,6 +5729,50 @@ assert_contains "mika#2165: et le repli est bruyant — la moitié hôte d'AC3" 
             _pilot_log_bind_args 2>&1 >/dev/null
         )
     )"
+
+# --- mika#2296: un `.content` vide et un `session_id` absent ne se lisent plus pareil ---
+#
+# Avant ce ticket, les deux échouaient sur un seul message nommant un champ JSON
+# manquant. La cause mesurée du premier est un budget de sortie épuisé par le
+# raisonnement du modèle : le fournisseur répond 200, l'enveloppe est bien
+# formée, et son `content` est authentiquement vide. Lire « champ manquant » là
+# où il y a « réponse vide » a coûté trois essais.
+
+_mika2296_empty_content_reason() {
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        _groom_warn_empty_content "first-pass" >/dev/null 2>&1
+        printf '%s' "$GROOM_LOOP_FAILURE_REASON"
+    )
+}
+MIKA2296_EMPTY=$(_mika2296_empty_content_reason) || MIKA2296_EMPTY=""
+
+assert_contains "mika#2296: le message du content vide dit que la réponse est VIDE" \
+    "EMPTY .content" "$MIKA2296_EMPTY"
+assert_contains "mika#2296: il nomme la cause probable (budget de raisonnement)" \
+    "output budget" "$MIKA2296_EMPTY"
+assert_contains "mika#2296: il nomme le grep serveur qui confirme (AC3/AC4)" \
+    "llm_reasoning_budget_exhausted" "$MIKA2296_EMPTY"
+assert_contains "mika#2296: il nomme la remédiation" \
+    "llm_max_tokens" "$MIKA2296_EMPTY"
+# Le point du ticket : il ne se lit plus comme une enveloppe incomplète.
+assert_not_contains "mika#2296: il n'accuse plus un champ JSON manquant" \
+    "missing .content" "$MIKA2296_EMPTY"
+
+# La garde de première passe teste désormais les deux conditions séparément —
+# sans quoi les deux messages existeraient sans que personne ne puisse les voir.
+MIKA2296_GUARD=$(awk '/first-pass response missing \.metadata\.session_id/{found=1} END{print found+0}' "$DISPATCH_LIB")
+assert_eq "mika#2296: la garde session_id a son propre message" \
+    "1" "$MIKA2296_GUARD"
+assert_contains "mika#2296: le message session_id se démarque du cas content vide" \
+    "NOT the mika#2296 empty-content case" "$(grep -A 2 'first-pass response missing \.metadata\.session_id' "$DISPATCH_LIB")"
+
+# Les trois passes architecte qui lisent un `.content` passent par le même
+# message : n'en corriger qu'une laisserait la même énigme aux deux autres.
+MIKA2296_CALLSITES=$(grep -c '_groom_warn_empty_content "' "$DISPATCH_LIB" || true)
+assert_eq "mika#2296: les trois sites de lecture de .content partagent le message" \
+    "3" "$MIKA2296_CALLSITES"
 
 # --- Summary ---
 
