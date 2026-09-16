@@ -189,6 +189,37 @@ pub struct DispatchChild {
     pub id: String,
     pub process_id: i64,
     pub process_start_time: Option<u64>,
+    /// The child's own status (mika#2335). The query still does **not** filter
+    /// on it — mika#2156's D-2 reasoning is unchanged, liveness is the
+    /// discriminator and the caller applies it. This field exists so a second
+    /// caller can apply a *different* rule without a second resolver: the
+    /// supersede disposal skips a terminal child (`delivered`, `cancelled`, …)
+    /// because there is no pilot left to kill and its `process_id` is a stale
+    /// pgid. One join predicate, two filtering decisions, both at their caller.
+    pub status: String,
+}
+
+/// Statuses on which a task no longer has a pilot to kill (mika#2335).
+///
+/// Deliberately a positive list of terminal states rather than `!= pending &&
+/// != in_progress`: an unknown status must read as *not terminal*, so a state
+/// added later is still disposed of rather than silently spared.
+///
+/// Lives here, beside [`DispatchChild`], because both callers that filter a
+/// dispatch child on it — the supersession disposal (`tracking_cleanup`) and
+/// the operator cancel path (`task_engine::process_kill`) — must agree. A
+/// second copy of this list is the shape of defect this ticket exists to
+/// remove.
+pub fn is_terminal_task_status(status: &str) -> bool {
+    use crate::task_engine::types::task_status;
+    matches!(
+        status,
+        task_status::DELIVERED
+            | task_status::COMPLETED
+            | task_status::CANCELLED
+            | task_status::FAILED
+            | task_status::EXPIRED
+    )
 }
 
 /// A parent self_dev task left `in_progress` after its callback subtask
