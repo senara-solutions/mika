@@ -797,7 +797,22 @@ fn render_identity_content(spec: &WellKnownAgent, settings: &Settings) -> Result
 /// 1. Calls `bootstrap_agent()` to create dirs + default files
 /// 2. Overwrites `identity.toml` and `soul.md` with agent-specific content
 ///
-/// When `disabled` is true, logs a warning and returns without changes.
+/// When `disabled` is true, the three effects this function carries are NOT
+/// equivalent and are no longer gated together (mika#2330):
+/// - agent creation: **no** — nothing is bootstrapped;
+/// - `config.toml` rewriting: **no** — [`reconcile_well_known_config`] is never
+///   called, so an operator's hand-picked `llm_provider` / `openrouter_model`
+///   survives;
+/// - code-owned identity sections: **yes** — [`CODE_OWNED_IDENTITY_SECTIONS`] is
+///   still reconciled onto agents already on disk.
+///
+/// The flag exists to freeze `config.toml`, which
+/// [`reconcile_well_known_config`] replaces whole. Gating identity
+/// reconciliation behind the same `return` made mika#2327's
+/// `[context.history]` ship merged and inert: `write_default_if_missing` never
+/// rewrites an existing `identity.toml`, and the reconciler — the only other
+/// path that could have written it — was out of reach.
+///
 /// This is the filesystem phase — DB skill overrides are set separately
 /// in [`seed_well_known_skill_overrides`] during agent init.
 ///
@@ -808,9 +823,15 @@ pub fn provision_well_known_agents(home_dir: &Path, settings: &Settings, disable
     if disabled {
         warn!(
             "agent provisioning disabled by config \
-             (MIKA_DISABLE_AGENT_PROVISIONING=true) — well-known agents \
-             will not be auto-created or updated"
+             (MIKA_DISABLE_AGENT_PROVISIONING=true) — no well-known agent will be \
+             created and no config.toml will be rewritten; code-owned identity \
+             sections are still reconciled onto existing agents (mika#2330)"
         );
+        for spec in WELL_KNOWN_AGENTS {
+            if mika_common::agent::agent_exists(home_dir, spec.name) {
+                reconcile_well_known_identity(home_dir, spec, settings);
+            }
+        }
         return;
     }
 
@@ -1655,18 +1676,188 @@ mod tests {
         assert_eq!(identity.context.history.max_tokens, Some(8000));
     }
 
-    /// AC5's other half — the switch actually takes on an agent already on disk.
+    /// AC5's other half — `context.history` is DECLARED code-owned.
     ///
     /// `write_default_if_missing` never rewrites an existing `identity.toml`, so
     /// without `context.history` among the code-owned sections, every deployed
     /// mika-arch would keep its unbounded agent-wide window and the post-deploy
     /// probes would read like a fix that did not work rather than a switch that
-    /// never happened. This is the assertion that the reconciler owns the block.
+    /// never happened.
+    ///
+    /// This guards the **constant** and nothing else: it exercises no code path
+    /// and proves no write. The behavioural proof — that the section actually
+    /// lands on an agent already on disk, including when provisioning is
+    /// disabled — lives in
+    /// [`mika2330_code_owned_identity_is_written_at_boot_when_provisioning_is_disabled`].
+    /// The two are deliberately separate so a failure names its own half
+    /// (mika#2330 U4).
     #[test]
-    fn mika2295_history_block_is_reconciled_onto_already_provisioned_agents() {
+    fn mika2295_history_block_is_declared_code_owned() {
         assert!(
             CODE_OWNED_IDENTITY_SECTIONS.contains(&"context.history"),
             "the window bounds are a property of the role, not an operator preference"
+        );
+    }
+
+    /// Remove a dotted path from an on-disk `identity.toml`, reproducing the
+    /// state of an agent provisioned before the section existed.
+    ///
+    /// Fabricating the "old" file this way rather than freezing a literal keeps
+    /// the fixture honest: a literal would drift from the spec silently and the
+    /// test would start failing (or passing) for a reason unrelated to the fix
+    /// (mika#2330 KTD4).
+    fn strip_identity_path(identity_path: &Path, dotted: &str) {
+        let raw = fs::read_to_string(identity_path).expect("read identity.toml");
+        let mut value: toml::Value = toml::from_str(&raw).expect("parse identity.toml");
+        let segments: Vec<&str> = dotted.split('.').collect();
+        let (last, parents) = segments.split_last().expect("non-empty path");
+        let mut current = &mut value;
+        for segment in parents {
+            current = current
+                .as_table_mut()
+                .expect("intermediate is a table")
+                .get_mut(*segment)
+                .expect("intermediate segment exists");
+        }
+        let removed = current
+            .as_table_mut()
+            .expect("parent is a table")
+            .remove(*last);
+        assert!(
+            removed.is_some(),
+            "fixture precondition: '{dotted}' must be present before it is stripped"
+        );
+        fs::write(identity_path, toml::to_string(&value).expect("serialize")).expect("write");
+    }
+
+    /// mika#2330 AC1/AC2/AC3 — a code-owned identity section reaches an
+    /// already-provisioned agent at boot **even with
+    /// `MIKA_DISABLE_AGENT_PROVISIONING=1`**.
+    ///
+    /// The failure this pins: `MIKA_DISABLE_AGENT_PROVISIONING` used to gate
+    /// three effects behind one `return` — agent creation, `config.toml`
+    /// rewriting, and identity reconciliation. Operators set it for the second
+    /// (it clobbers hand-picked `openrouter_model` values) and silently paid for
+    /// the third, which is why mika#2327's `[context.history]` shipped merged and
+    /// inert on four agents whose `identity.toml` dated from 26/07.
+    ///
+    /// This drives `provision_well_known_agents` — the real boot entry point,
+    /// from disk to disk — rather than `reconcile_well_known_identity` directly,
+    /// because the defect was never in the reconciler. It was that nothing
+    /// reached it.
+    #[test]
+    fn mika2330_code_owned_identity_is_written_at_boot_when_provisioning_is_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        fs::create_dir_all(home.join("agents")).unwrap();
+
+        let settings = test_settings_with_kg_roots();
+        provision_well_known_agents(home, &settings, false);
+
+        let identity_path = mika_common::agent::agent_dir(home, "mika-arch").join("identity.toml");
+        strip_identity_path(&identity_path, "context.history");
+
+        // Sanity: the fixture really is the pre-mika#2327 state.
+        let stripped: crate::prompt::Identity =
+            toml::from_str(&fs::read_to_string(&identity_path).unwrap()).unwrap();
+        assert_eq!(
+            stripped.context.history.scope,
+            crate::prompt::HistoryScope::Agent,
+            "without the section the defaults apply — that is the production symptom"
+        );
+        assert_eq!(stripped.context.history.max_tokens, None);
+
+        provision_well_known_agents(home, &settings, /* disabled = */ true);
+
+        let reconciled: crate::prompt::Identity =
+            toml::from_str(&fs::read_to_string(&identity_path).unwrap())
+                .expect("reconciled identity.toml must still parse");
+        assert_eq!(
+            reconciled.context.history.scope,
+            crate::prompt::HistoryScope::Session,
+            "the code-owned window bound must reach an agent already on disk"
+        );
+        assert_eq!(reconciled.context.history.max_tokens, Some(8000));
+    }
+
+    /// mika#2330 AC4/AC5 — the disabled mode keeps the two promises it was set
+    /// for: it creates nothing, and it does not touch `config.toml`.
+    ///
+    /// Separate from its sibling above so a failure names its own half: one test
+    /// says the reconciliation reaches the agent, this one says it did not
+    /// overreach. `config.toml` is compared **byte for byte** because
+    /// `reconcile_well_known_config` replaces the whole file
+    /// (`fs::write(tmp, spec.config_toml)`) — there is no section-level merge to
+    /// partially survive, so anything other than byte equality is a total
+    /// clobber of the operator's model choices.
+    #[test]
+    fn mika2330_disabled_provisioning_still_creates_nothing_and_leaves_config_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        fs::create_dir_all(home.join("agents")).unwrap();
+
+        let settings = test_settings_with_kg_roots();
+        provision_well_known_agents(home, &settings, false);
+
+        // An operator-edited config.toml: a different model from the spec's.
+        let arch_home = mika_common::agent::agent_dir(home, "mika-arch");
+        let config_path = arch_home.join("config.toml");
+        let operator_config =
+            "llm_provider = \"zai\"\nopenrouter_model = \"operator/hand-picked\"\n";
+        fs::write(&config_path, operator_config).unwrap();
+        assert_ne!(
+            operator_config, MIKA_ARCH_CONFIG,
+            "fixture precondition: the operator's config must differ from the spec's"
+        );
+
+        // An absent well-known agent, to prove nothing is created.
+        fs::remove_dir_all(mika_common::agent::agent_dir(home, "mika-qa")).unwrap();
+        assert!(!mika_common::agent::agent_exists(home, "mika-qa"));
+
+        provision_well_known_agents(home, &settings, /* disabled = */ true);
+
+        assert_eq!(
+            fs::read_to_string(&config_path).unwrap(),
+            operator_config,
+            "disabled provisioning must leave config.toml byte-identical — freezing it \
+             is the reason the flag is set (mika#2330 D3)"
+        );
+        assert!(
+            !mika_common::agent::agent_exists(home, "mika-qa"),
+            "disabled provisioning must not create an absent well-known agent"
+        );
+    }
+
+    /// mika#2330 AC6 — reconciliation under `disabled = true` stays idempotent.
+    ///
+    /// The second boot must write nothing. Compared on **file mtime and bytes**
+    /// rather than on the log, because a reconciler that rewrote an identical
+    /// file on every boot would still emit the same content and only an
+    /// unnecessary write would betray it.
+    #[test]
+    fn mika2330_disabled_reconciliation_is_idempotent_across_boots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        fs::create_dir_all(home.join("agents")).unwrap();
+
+        let settings = test_settings_with_kg_roots();
+        provision_well_known_agents(home, &settings, false);
+
+        let identity_path = mika_common::agent::agent_dir(home, "mika-arch").join("identity.toml");
+        strip_identity_path(&identity_path, "context.history");
+
+        provision_well_known_agents(home, &settings, true);
+        let after_first = fs::read_to_string(&identity_path).unwrap();
+        let mtime_first = fs::metadata(&identity_path).unwrap().modified().unwrap();
+
+        provision_well_known_agents(home, &settings, true);
+        let after_second = fs::read_to_string(&identity_path).unwrap();
+        let mtime_second = fs::metadata(&identity_path).unwrap().modified().unwrap();
+
+        assert_eq!(after_first, after_second);
+        assert_eq!(
+            mtime_first, mtime_second,
+            "a second boot must not rewrite an identity.toml that already matches the spec"
         );
     }
 
@@ -2849,22 +3040,50 @@ mod tests {
         );
     }
 
+    /// mika#2330 — this test used to assert the opposite, and the inversion is
+    /// the whole ticket.
+    ///
+    /// It was named `test_provision_disabled_skips_reconciliation` and pinned
+    /// the coupling that made mika#2327 inert in production: one `return` gated
+    /// agent creation, `config.toml` rewriting **and** identity reconciliation,
+    /// while the operator only ever wanted the second frozen. Keeping the old
+    /// assertion under a new implementation would have been a lie about intent;
+    /// deleting the test would have erased the record that the coupling was once
+    /// deliberate.
+    ///
+    /// Distinct from the two `mika2330_*` boot tests above, which drive
+    /// mika-arch — an `IdentitySource::Computed` agent provisioned by the spec.
+    /// This one drives mika-dev from a hand-seeded, never-spec-provisioned file,
+    /// so the `Static` identity path is covered too.
     #[test]
-    fn test_provision_disabled_skips_reconciliation() {
+    fn mika2330_disabled_provisioning_still_reconciles_identity() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
-        // Pre-seed mika-dev with drifted (no [skills]) identity.
+        // Pre-seed mika-dev with a drifted (no [skills]) identity.
         let pre_content = "name = \"Dev\"\nemoji = \"🛠\"\n";
         pre_seed_identity(home, "mika-dev", pre_content);
 
-        // disabled=true must skip the entire provisioning loop, including reconciliation.
         provision_well_known_agents(home, &test_settings_with_kg_roots(), true);
 
         let after = read_identity(home, "mika-dev");
-        assert_eq!(
+        assert_ne!(
             after, pre_content,
-            "disabled provisioning must not invoke the reconciler"
+            "disabled provisioning must still reconcile code-owned identity sections"
         );
+        let identity: crate::prompt::Identity =
+            toml::from_str(&after).expect("reconciled identity must parse");
+        assert!(
+            identity
+                .skills
+                .allowlist
+                .as_ref()
+                .is_some_and(|a| a.contains(&"dev-pilot".to_string())),
+            "the spec's [skills].allowlist is code-owned and must land"
+        );
+        // Operator-owned fields survive verbatim — the reconciler replaces
+        // subtrees by dotted path, it does not overwrite the file.
+        assert_eq!(identity.name, "Dev");
+        assert_eq!(identity.emoji, "🛠");
     }
 
     #[test]

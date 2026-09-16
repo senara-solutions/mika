@@ -415,7 +415,7 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 | `dashboard_enabled` | `bool` | `false` | `MIKA_DASHBOARD_ENABLED` | Enable embedded dashboard SPA at `/dashboard/`. When enabled, the pre-built React dashboard is served from the binary via `rust-embed`. Requires `MIKA_DASHBOARD_TOKEN` for token injection. Build the dashboard before compiling: `npm run build --prefix dashboard` (`VITE_BASE_PATH` is set automatically). |
 | `disable_bundled_skills` | `bool` | `false` | `MIKA_DISABLE_BUNDLED_SKILLS` | Skip bundled skill re-sync on startup. Useful for debugging handler scripts. **Do not enable in production** — prevents security updates to handler scripts from propagating. |
 | `dev_mode` | `bool` | `false` | `MIKA_DEV_MODE` | Enable dev mode — auto-provisions well-known development agents (`mika-dev`, `mika-qa`) on startup with role-specific identity, soul, and skill assignments. Idempotent — existing agents are never overwritten. |
-| `disable_agent_provisioning` | `bool` | `false` | `MIKA_DISABLE_AGENT_PROVISIONING` | Skip well-known agent auto-creation on startup. When true, prevents `dev_mode` from creating or updating agent identity files, allowing manual edits to persist across restarts/deploys. |
+| `disable_agent_provisioning` | `bool` | `false` | `MIKA_DISABLE_AGENT_PROVISIONING` | Skip well-known agent auto-creation on startup. When true: no agent is created and no `config.toml` is rewritten, but code-owned `identity.toml` sections are still reconciled onto existing agents (mika#2330). See the note below. |
 | `telemetry_enabled` | `bool` | `false` | `MIKA_TELEMETRY_ENABLED` | Enable OpenTelemetry trace export. Requires `--features telemetry` at build time. When enabled, spans are exported via OTLP HTTP to the configured endpoint. |
 | `otlp_endpoint` | `Option<String>` | None | `MIKA_OTLP_ENDPOINT` | OTLP endpoint URL for trace export — must include `/v1/traces` (e.g. `https://cloud.langfuse.com/api/public/otel/v1/traces` for Langfuse, `http://localhost:4318/v1/traces` for Jaeger). Required when `telemetry_enabled` is true. |
 | `otlp_auth_header` | `Option<SecretString>` | None | `MIKA_OTLP_AUTH_HEADER` | OTLP authorization header value. For Langfuse, pass raw `publicKey:secretKey` (auto-encoded to Base64) or pre-encoded Base64. Sent as `Authorization: Basic <value>`. Zeroized on drop. |
@@ -423,6 +423,52 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 The `home_dir` field is also present on the struct but is not configurable via
 file or environment variable. It is resolved automatically from `$MIKA_HOME` or
 defaults to `~/.mika/`.
+
+### `disable_agent_provisioning` freezes the config, not the identity (mika#2330)
+
+The flag carries three effects, and until mika#2330 one `return` gated all three
+together. Only one of them is what operators set it for.
+
+| Effect | `disable_agent_provisioning = true` |
+|---|---|
+| Create a missing well-known agent | **No** |
+| Rewrite an existing agent's `config.toml` | **No** |
+| Reconcile code-owned `identity.toml` sections | **Yes** |
+
+The middle row is the flag's purpose: `reconcile_well_known_config` replaces
+`config.toml` **whole** (`fs::write(tmp, spec.config_toml)` then rename), so a
+hand-picked `llm_provider` / `openrouter_model` is clobbered on every deploy pass
+unless the flag freezes it. The last row was collateral damage.
+
+**What it cost, measured.** mika#2327 made `[context.history]` code-owned
+(`scope = "session"`, `max_tokens = 8000`) to bound the architect's window. It
+merged and stayed inert in production: `write_default_if_missing` never rewrites
+an existing `identity.toml`, the deployed identities predated the change, and the
+reconciler — the only other writer — was behind the same `return`. Symptom: the
+architect's history spanned 9–10 distinct sessions at 190–205 KB with
+`truncated_messages = 0` and inputs of 83–89 k tokens against an expected < 40 k.
+
+**What the flag still protects:** `config.toml`, `soul.md`, and every
+operator-owned section of `identity.toml` — `name`, `emoji`, `[reflection]`,
+`[kg]` — which the reconciler preserves verbatim, replacing only the dotted paths
+listed in `CODE_OWNED_IDENTITY_SECTIONS`.
+
+**What it no longer protects:** a hand edit *inside* a code-owned section is
+overwritten at the next startup. Each overwritten path is named in
+`reconciled_paths` on the `identity_reconcile.complete` log event, so the loss is
+readable rather than silent. Expect `identity_reconcile.complete` on the first
+startup after a spec change and `identity_reconcile.in_sync` on every startup
+after that.
+
+**Timing:** the startup is what writes. An identity already on disk is re-read
+every turn, so no restart is needed for an edit to take effect — but a restart is
+needed for the reconciler to make the edit.
+
+**Scope note, to avoid a misreading.** The reconciler skips any path the agent's
+own spec does not define. `[context.history]` is declared only by mika-arch's
+spec, and mika-prime / mika-relay are not well-known agents at all, so they have
+no spec to reconcile against. Those agents having no `[context.history]` after
+this change is the intended outcome, not an incomplete rollout.
 
 ### Security notes
 
@@ -630,7 +676,7 @@ For running `mika` (the TUI chat client), only the API key is required:
 | `MIKA_GITHUB_REPO` | No | GitHub repo (`owner/repo`) for issue creation |
 | `MIKA_DEV_MODE` | No | Auto-provision mika-dev + mika-qa agents on startup (default: false) |
 | `MIKA_DISABLE_BUNDLED_SKILLS` | No | Skip bundled skill re-sync on startup (default: false) |
-| `MIKA_DISABLE_AGENT_PROVISIONING` | No | Prevent dev_mode from overwriting agent files (default: false) |
+| `MIKA_DISABLE_AGENT_PROVISIONING` | No | Freeze `config.toml` and skip agent creation; code-owned identity sections are still reconciled (mika#2330, default: false) |
 
 \* Set the API key for the active provider. E.g., `MIKA_ANTHROPIC_API_KEY` for Anthropic, `MIKA_GROQ_API_KEY` for Groq. Ollama does not require an API key.
 
@@ -690,7 +736,7 @@ are required for inter-service communication:
 | `MIKA_LOG_FORMAT` | No | Stdout log format: `json` (default) or `pretty` |
 | `MIKA_DEV_MODE` | No | Auto-provision mika-dev + mika-qa agents on startup (default: false) |
 | `MIKA_DISABLE_BUNDLED_SKILLS` | No | Skip bundled skill re-sync on startup (default: false) |
-| `MIKA_DISABLE_AGENT_PROVISIONING` | No | Prevent dev_mode from overwriting agent files (default: false) |
+| `MIKA_DISABLE_AGENT_PROVISIONING` | No | Freeze `config.toml` and skip agent creation; code-owned identity sections are still reconciled (mika#2330, default: false) |
 | `MIKA_TELEMETRY_ENABLED` | No | Enable OTel trace export (requires `--features telemetry` build) |
 | `MIKA_OTLP_ENDPOINT` | No | OTLP endpoint URL with `/v1/traces` path (required when telemetry enabled) |
 | `MIKA_OTLP_AUTH_HEADER` | No | OTLP auth header value (e.g. Base64-encoded Langfuse credentials) |
