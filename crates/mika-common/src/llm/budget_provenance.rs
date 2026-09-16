@@ -348,9 +348,11 @@ static LAST_EMITTED: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 /// The provider attempt ceiling used to report `max_attempts`.
 ///
-/// `openai::MAX_ATTEMPTS_HARD_CAP`, the ceiling every OpenAI-compatible rail
-/// runs under — which is every well-known agent today.
-const REPORTED_ATTEMPT_HARD_CAP: u32 = super::openai::MAX_ATTEMPTS_HARD_CAP;
+/// [`super::DEFAULT_ATTEMPTS_HARD_CAP`], the ceiling every OpenAI-compatible
+/// rail runs under — which is every well-known agent today. Read from the
+/// shared constant since mika#2342; it used to reach into `openai`'s private
+/// copy, which is the same value by a longer route.
+const REPORTED_ATTEMPT_HARD_CAP: u32 = super::DEFAULT_ATTEMPTS_HARD_CAP;
 
 /// Emit `llm_budget_resolved` for one agent — the line that answers "under
 /// which plafond did this turn run?" (mika#2293 AC1).

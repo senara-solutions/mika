@@ -31,18 +31,30 @@ use super::harness::EvalHarness;
 /// behavior, but it's not the path we're trying to test here.
 ///
 /// Uses `tokio::time::pause()` to drive the clock without wall-clock waits.
-/// `MockResponse::Delayed` sleeps virtually for 6 minutes; the deadline is set
-/// to 1s; the runtime advances time until the mock resolves.
+/// `MockResponse::Delayed` sleeps virtually; the deadline is set to 1s; the
+/// runtime advances time until the mock resolves.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn deadline_during_llm_call_persists_llm_calls_row() {
-    // Step 0: a tool_call response delayed by 6 minutes virtual. When it
-    // resolves, the `llm_calls` row is persisted, the (no-op) tool runs, and
-    // the loop iterates to step 1.
+    // Step 0: a delayed tool_call response. When it resolves, the `llm_calls`
+    // row is persisted, the (no-op) tool runs, and the loop iterates to step 1.
     // Step 1: deadline check fires (now far past the 1s deadline), loop exits
     // via DeadlineExceeded. No second LLM call is made.
     let responses = vec![
         delayed_response(
-            360_000, // 6 minutes virtual
+            // mika#2342 D8 — bracketed on BOTH sides, and both bounds are
+            // load-bearing:
+            //   > 1 s   the deadline, or the call would not cross it and this
+            //           test would stop testing mika#848 at all;
+            //   < 300 s the `run_loop` watchdog at the test geometry
+            //           (`MockLlmProvider` inherits the default 120/300 budget,
+            //           so worst case = 2 × 120 = 240, + 60 margin = 300).
+            // It used to be 360 s, which the watchdog would now cut *before*
+            // the deadline is reached: contract A would stay green (the timeout
+            // arm persists a row too) while contract B silently changed subject
+            // from `DeadlineExceeded` to a transport error. The number was
+            // lowered rather than the watchdog disarmed in test — a detector
+            // exempted from the suite it must protect is a detector removed.
+            200_000,
             tool_call_response("search_memory", json!({"query": "anything"})),
         ),
         // Sentinel: this should never be consumed because the deadline fires

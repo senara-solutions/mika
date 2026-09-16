@@ -139,19 +139,14 @@ struct OpenAiErrorDetail {
 
 // -- Provider implementation --
 
-/// Hard ceiling on retries, independent of the budget.
+/// Attempts this rail's chain permits at most.
 ///
-/// The budget can only ever *narrow* the chain below this (see
-/// [`LlmTimeoutBudget::max_attempts`]): a generous envelope must not silently
-/// widen a provider's retry policy.
-const MAX_RETRIES: u32 = 3;
-
-/// Attempts the chain permits at most: the initial call plus [`MAX_RETRIES`].
-///
-/// `pub(crate)` since mika#2293 so `budget_provenance` reports the same ceiling
-/// the rail actually runs under, instead of posing a second copy of 4 beside
-/// this one.
-pub(crate) const MAX_ATTEMPTS_HARD_CAP: u32 = MAX_RETRIES + 1;
+/// Was a module-private `MAX_RETRIES + 1` until mika#2342 moved the ceiling to
+/// [`super::DEFAULT_ATTEMPTS_HARD_CAP`]: a default method on the `LlmProvider`
+/// trait needs it, and a trait method cannot read a constant private to one
+/// rail's module. The alias is kept so the retry loop below still reads in the
+/// vocabulary of the rail it governs.
+use super::DEFAULT_ATTEMPTS_HARD_CAP as MAX_ATTEMPTS_HARD_CAP;
 
 use super::LlmTimeoutBudget;
 
@@ -338,12 +333,11 @@ impl OpenAiCompatibleProvider {
     ) -> Result<LlmResponse, LlmError> {
         let openai_request = to_openai_request(request);
 
-        info!(
-            model = %request.model,
-            max_tokens = request.max_tokens,
-            provider = %self.provider_kind,
-            "llm_call started"
-        );
+        // mika#2342 D4: measured once, before the chain. It is carried on the
+        // per-attempt event because a request that never returns takes its size
+        // with it — `llm_calls.request_bytes` is only written after the call
+        // comes back, which is precisely what a hang prevents.
+        let request_bytes = request.payload_bytes() as u64;
 
         let mut last_error = None;
 
@@ -363,12 +357,25 @@ impl OpenAiCompatibleProvider {
         //
         // Only applied when a deadline is present: without one there is no
         // envelope to overflow, and callers with no deadline visibility keep
-        // the full `MAX_RETRIES` chain they have always had.
+        // the full hard-cap chain they have always had.
         let max_attempts = if deadline.is_some() {
             self.budget.max_attempts(MAX_ATTEMPTS_HARD_CAP)
         } else {
             MAX_ATTEMPTS_HARD_CAP
         };
+
+        // Emitted after `max_attempts` is known (mika#2342 D4): half the
+        // ambiguity of the founding incident was that the chain's width was
+        // invisible, so "one unbounded call" and "N bounded silent ones" read
+        // identically in the log.
+        info!(
+            model = %request.model,
+            max_tokens = request.max_tokens,
+            max_attempts,
+            request_bytes,
+            provider = %self.provider_kind,
+            "llm_call started"
+        );
 
         for attempt in 0..max_attempts {
             if attempt > 0 {
@@ -419,6 +426,23 @@ impl OpenAiCompatibleProvider {
                 tokio::time::sleep(delay).await;
             }
 
+            // mika#2342 D4 — the discriminator. Emitted immediately BEFORE the
+            // call, so what follows separates the three readings of the same
+            // silence: N attempts of about a plafond each (the chain is running
+            // and the cause is upstream of the rail); one attempt that outlives
+            // the plafond (reqwest did not bound it); or no attempt at all after
+            // `llm_call started` (the block is before `send_once` — body
+            // serialization, connection acquisition).
+            info!(
+                target: "mika::otel",
+                attempt,
+                max_attempts,
+                request_bytes,
+                provider = %self.provider_kind,
+                model = %request.model,
+                "llm_call_attempt"
+            );
+
             match self.send_once(&openai_request).await {
                 Ok(response) => {
                     let llm_response = from_openai_response(response)?;
@@ -434,7 +458,7 @@ impl OpenAiCompatibleProvider {
                     return Ok(llm_response);
                 }
                 Err(e) => {
-                    // `attempt + 1 < max_attempts`, not `attempt < MAX_RETRIES`:
+                    // `attempt + 1 < max_attempts`, not `attempt < hard cap`:
                     // the budget may have narrowed the chain below the hard cap
                     // (AC3-b), and a guard still reading the hard cap would
                     // return the retryable error one iteration early — or, with
@@ -1108,12 +1132,14 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Pins the coupling `budget.rs` cannot see (mika#2189 AC3-b).
+    /// Pins the ceiling the retry chain of this rail runs under (mika#2189
+    /// AC3-b).
     ///
-    /// [`MAX_ATTEMPTS_HARD_CAP`] is private to this module, so
-    /// `budget::tests` duplicates the number `4` as a local constant. That
-    /// duplication is only safe while the two agree — this test is what makes
-    /// them agree, from the side that owns the real value.
+    /// Since mika#2342 the value lives in `llm/mod.rs` as
+    /// [`super::super::DEFAULT_ATTEMPTS_HARD_CAP`] and `budget::tests` reads it
+    /// there rather than duplicating `4`, so this test no longer guards a
+    /// duplication — it guards the *behaviour* of `max_attempts` against the
+    /// shared ceiling.
     ///
     /// Both halves matter. The hard cap must **bound** a generous envelope (a
     /// big envelope must not silently widen a provider's retry policy), and it
@@ -1144,11 +1170,12 @@ mod tests {
             "a fully-failing call must not overflow the envelope it runs in"
         );
 
-        // The number `budget.rs` duplicates, asserted from the side that owns it.
+        // The shared ceiling, asserted from the rail that runs under it.
         assert_eq!(
             MAX_ATTEMPTS_HARD_CAP, 4,
-            "MAX_ATTEMPTS_HARD_CAP changed; update the HARD_CAP constant in \
-             `budget::tests`, which duplicates it because this one is private"
+            "the shared attempt ceiling changed; mika#2342's watchdog is sized \
+             on it via `LlmProvider::worst_case_failure_secs`, so re-read that \
+             margin before accepting a new value"
         );
     }
 

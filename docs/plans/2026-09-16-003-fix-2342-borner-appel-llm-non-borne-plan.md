@@ -245,7 +245,8 @@ n'honore pas — c'est la forme exacte du piège que D3 convertit en valeur déc
 
 Tests : le pire cas déclaré par chaque rail est ≥ son plafond effectif ; le rail Anthropic
 ne descend pas sous son littéral même quand l'environnement pose un plafond plus petit
-(contrôle négatif de E7, à `MIN_HTTP_TIMEOUT_SECS`).
+(contrôle négatif de E7, à `MIN_HTTP_TIMEOUT_SECS`). Population du test et exception nommée
+du mock : § Fire-Disposition, FD3.
 
 ### V2 — Instrumentation par tentative (`crates/mika-common/src/llm/openai.rs`)
 
@@ -302,15 +303,23 @@ soit pas son propre premier contrevenant (motif de `policy.rs:155-158`). Le mess
 d'échec doit nommer mika#2342 et dire *pourquoi* le filet est là — une garde qui dit
 seulement « interdit » se fait désarmer au premier refactor pressé.
 
+**Ce volet vient après V3, et sans allowlist** : le site `mod.rs:1105` est encore nu tant
+que V3 n'est pas appliqué, et une exception créée pour l'absorber survivrait à sa raison.
+Voir § Fire-Disposition, FD1, pour l'inventaire clos (deux occurrences) et la conduite à
+tenir sur une troisième.
+
 ### V4-bis — Ajustement des deux tests de E8 (`crates/mika-agent/tests/eval/`)
 
-`test_deadline_in_flight_llm_call.rs:44` et `test_deadline_verdict_2276.rs:72` : `360_000`
-→ `200_000` ms, avec le commentaire de D8 nommant les deux bornes (deadline 1 s en dessous,
-filet 300 s au-dessus) et mika#2342. Ne toucher **aucune** assertion : si l'une d'elles
-rougit après l'ajustement, c'est le filet qu'il faut regarder, pas le test.
+`test_deadline_in_flight_llm_call.rs:44` et `test_deadline_verdict_2276.rs:72` : l'argument
+`sleep_ms` (respectivement l. 45 et l. 73) passe de `360_000` à `200_000` ms, avec le
+commentaire de D8 nommant les deux bornes (deadline 1 s en dessous, filet 300 s au-dessus)
+et mika#2342. Ne toucher **aucune** assertion : si l'une d'elles rougit après l'ajustement,
+c'est le filet qu'il faut regarder, pas le test.
 
 Le troisième `delayed_response` de la suite (`test_deadline_in_flight_llm_call.rs:185`,
-10 s) est déjà sous le filet et ne bouge pas.
+10 s) est déjà sous le filet et ne bouge pas. Ces trois appels sont la population entière
+du détecteur — inventaire, commande de vérification et conduite sur un quatrième :
+§ Fire-Disposition, FD2.
 
 ### V5 — Documentation
 
@@ -364,6 +373,109 @@ Le troisième `delayed_response` de la suite (`test_deadline_in_flight_llm_call.
 8. `cargo test`, `cargo clippy`, `cargo fmt --check` verts ;
    `cargo test -p mika-agent --test eval` vert.
 
+## Fire-Disposition
+
+*Requis par le Fire-Disposition Gate (mika#1574,
+`docs/solutions/best-practices/fire-disposition-doctrine.md`), soulevé par F1 en première
+passe.* Le plan porte des livrables de classe détecteur ; chacun reçoit ci-dessous sa
+disposition, l'inventaire **clos** de la population sur laquelle il peut firer, et la
+commande qui referme cet inventaire.
+
+**Règle transverse :** aucune de ces dispositions n'autorise à désarmer le filet en test
+(AC7). Une exception qui neutralise le détecteur qu'elle exempte n'est pas une exception,
+c'est un retrait déguisé en réglage.
+
+### FD1 — Garde structurelle (V4) → option (c), halt-and-surface, sans allowlist
+
+**Population :** les occurrences de `send_message_with_deadline` dans
+`crates/mika-agent/src/agent_loop/mod.rs`. Inventaire clos à **deux** : `mod.rs:543` (déjà
+enveloppée, motif de `attempt_continuation_turn`, E2) et `mod.rs:1105` (nue — c'est
+précisément la violation que V3 corrige dans la même PR).
+Commande : `grep -n "send_message_with_deadline" crates/mika-agent/src/agent_loop/mod.rs`.
+
+**Aucune allowlist n'est créée, et c'est le fond de la disposition.** Une allowlist
+naîtrait ici **vide**, puisque l'unique violation est corrigée par le même diff. Une
+allowlist vide n'est pas neutre : elle offre un emplacement où déposer la prochaine
+violation au lieu de l'envelopper — exactement ce que la garde existe pour empêcher
+(D5 : la régression ne rendrait aucune assertion fausse).
+
+Deux conséquences que l'implémenteur doit tenir :
+
+1. **Ordre contraint dans la PR : V3 avant V4.** La garde attend un fichier déjà propre.
+   Écrite avant le filet, elle rougit sur `mod.rs:1105` — un rouge *exact*, pas un faux
+   positif, mais qui inviterait au contournement (exception ad hoc, `#[ignore]`) alors que
+   le correctif est à un volet de là.
+2. **Toute occurrence au-delà des deux inventoriées : halte.** Un troisième site signifie
+   soit que l'inventaire ci-dessus était faux, soit qu'un appel a été ajouté pendant la PR.
+   Ni l'un ni l'autre ne se tranche par un ajustement de la garde ; c'est le cas où
+   *« la forme de résolution est elle-même la question à scoper »*, donc remontée opérateur.
+
+La garde ne scanne que ce fichier. Elle ne prétend couvrir ni `investigate.rs:799` ni un
+futur appelant hors `agent_loop/` : élargir son périmètre serait une décision neuve, pas
+une extension muette.
+
+### FD2 — Le filet (V3) est lui-même un détecteur, et il fire aujourd'hui sur des données existantes
+
+C'est la fire la plus concrète du plan : deux tests eval existants dorment 360 s virtuelles
+sous un filet qui vaut 300 s à la géométrie de test (E8).
+
+**Population :** les appels `delayed_response` de la suite eval. Inventaire clos à
+**trois** : `test_deadline_in_flight_llm_call.rs:44` (360 s → fire),
+`test_deadline_verdict_2276.rs:72` (360 s → fire),
+`test_deadline_in_flight_llm_call.rs:185` (10 s → ne fire pas).
+Commande : `grep -rn "delayed_response" crates/mika-agent/tests/ | grep -v "fn delayed_response"`.
+
+**Les deux violations connues sont corrigées à la source par V4-bis** (D8), sans exception
+et sans désarmement. Ni l'option (a) — une exception nommée laisserait deux tests affirmer
+un contrat qu'ils ne testent plus, ce que AC7 refuse ; ni l'option (b) — un filet qui land
+`#[ignore]` n'est exercé par aucune suite, or le contrôle positif (3) est la seule preuve
+d'AC1.
+
+**Disposition résiduelle : option (c), halt-and-surface.** Tout *autre* test que le filet
+couperait au `cargo test` — un quatrième `delayed_response`, un test futur, un rail dont le
+budget diffère — s'arrête et remonte. Le réflexe interdit est d'abaisser le `Delayed` ou de
+remonter `LLM_WATCHDOG_MARGIN_SECS` pour faire passer la suite : les deux gestes sont
+indiscernables au diff, et l'un des deux ment sur AC4. « Est-ce le test ou le filet qui a
+tort ? » est une question d'opérateur.
+
+### FD3 — Test unitaire 1, pire cas déclaré par rail → option (a), une exception nommée
+
+**Population :** les implémentations de `LlmProvider`. Inventaire clos à **quatre** :
+`OpenAiCompatibleProvider` (`openai.rs:482`), `OllamaProvider` (`ollama.rs:609`),
+`AnthropicProvider` (`anthropic.rs:48`), `MockLlmProvider` (`mock.rs:121`).
+Commande : `grep -rn "impl LlmProvider for" crates/mika-common/src/`.
+
+Trois des quatre sont dans la population du test. Le quatrième, `MockLlmProvider`, en est
+exclu par **exception nommée**, portant les trois attributs que la doctrine exige :
+
+1. **Donnée nommée** — `MockLlmProvider`, pas « les rails de test ».
+2. **Raison, et ce n'est pas une dette** — le mock n'a aucun mécanisme de coupure transport
+   (E8) ; « le pire cas déclaré couvre le pire cas réel du transport » est une phrase sans
+   référent pour lui. Il n'y a donc **pas** de ticket de suivi, et il faut l'écrire :
+   l'option (a) en demande un par défaut, et une exception muette sur ce point enverrait la
+   prochaine lecture chercher un tracker qui n'a jamais eu lieu d'être.
+3. **Assertion auto-nettoyante** — l'exception porte l'assertion que `MockLlmProvider` ne
+   surcharge pas `timeout_budget()`. Le jour où il en acquiert un, elle rougit avec le
+   message « le mock a désormais un budget transport : retirer cette exception et le
+   remettre dans la population ». Sans elle, l'exception survivrait à sa raison et D2
+   hériterait d'une nuance (E8 : « sur un rail sans timeout transport, le filet est le
+   premier mécanisme ») que plus rien ne vérifie.
+
+`AnthropicProvider` reste **dans** la population, et c'est le point : sa surcharge (V1) est
+exactement ce qui le fait passer. L'écrire en exception aurait converti le piège de E7 en
+dette permanente au lieu de le fermer.
+
+### FD4 — Les détecteurs sans population préexistante
+
+Test unitaire 2 (`llm_call_attempt` par tentative) et contrôles 3, 5, 7 portent sur du code
+que cette PR crée : l'événement `llm_call_attempt` n'existe pas avant elle, le filet non
+plus, la garde non plus. **Aucune fire sur données existantes n'est possible**, aucune
+disposition n'est requise. Écrit ici plutôt qu'omis, pour que le silence se lise comme un
+inventaire fait et non comme un inventaire oublié.
+
+Les contrôles 4 et 6 ne sont pas des détecteurs neufs : ce sont les deux tests de FD2 après
+correction. Leur disposition est celle de FD2.
+
 ## Definition of Done
 
 - Le site d'appel LLM principal de `run_loop` est enveloppé, la ligne `llm_calls` est
@@ -377,6 +489,8 @@ Le troisième `delayed_response` de la suite (`test_deadline_in_flight_llm_call.
   filet et testent toujours leur sujet d'origine, filet armé.
 - Les trois `CLAUDE.md` concernés disent ce que le code fait, en particulier là où ils
   affirmaient le contraire.
+- Chaque livrable de classe détecteur a sa disposition écrite, son inventaire de population
+  clos par une commande, et aucune exception au-delà de celle nommée en FD3.
 
 ## Acceptance criteria
 
@@ -407,6 +521,13 @@ par tentative » — et des faits E1-E7.*
   mika#848). Le filet n'est **pas** désarmé en test — ni par un budget large posé sur le
   mock, ni par un drapeau de test — et la valeur des `Delayed` ajustés est encadrée par un
   commentaire nommant ses deux bornes.
+- **AC8** — Les dispositions de la § Fire-Disposition sont tenues à la lettre : aucune
+  allowlist n'existe pour la garde structurelle (FD1) ; les deux `Delayed` de FD2 sont
+  corrigés et non exemptés ; la seule exception du diff est celle de `MockLlmProvider`
+  (FD3), nommée, justifiée sans ticket de suivi et porteuse de son assertion
+  auto-nettoyante. Contrôle : le diff ne contient aucun `#[ignore]`, aucune constante
+  d'exception hors celle de FD3, et l'assertion auto-nettoyante rougit si on retire à
+  `MockLlmProvider` la propriété qui fonde son exception.
 
 ## Surfaces opérateur et sonde post-déploiement
 
@@ -470,3 +591,21 @@ sans `llm_call_attempt` intermédiaire pointe vers un blocage **avant** `send_on
   déjà-perdu » est une propriété des rails de production, pas du trait). Correction d'une
   imprécision de **V1** : `MAX_ATTEMPTS_HARD_CAP` est privé à `openai.rs:154` et non déjà
   présent dans `llm/mod.rs` — le remonter est un pré-requis de la méthode par défaut.
+- rev 2 (2026-09-16) — première passe architecte, `Disposition: ITERATE`, un seul finding
+  bloquant. **F1 adressé** par l'ajout d'une section `## Fire-Disposition` (mika#1574)
+  couvrant les quatre classes de détecteur du plan, chacune avec l'option canonique retenue
+  et l'inventaire clos de sa population : **FD1** garde structurelle V4 → option (c),
+  halt-and-surface, sans allowlist, avec l'ordre V3-avant-V4 posé en pré-requis
+  d'implémentation — c'est la réponse directe à la question de F1 sur l'occurrence nue de
+  `mod.rs:1105` ; **FD2** le filet V3, détecteur qui fire aujourd'hui sur deux tests eval
+  existants → correction à la source par V4-bis (ni exception, ni `#[ignore]`), option (c)
+  pour tout résiduel ; **FD3** test unitaire 1 → option (a), exception nommée pour
+  `MockLlmProvider` avec assertion auto-nettoyante et l'absence de ticket de suivi
+  explicitée ; **FD4** les détecteurs sans population préexistante, déclarés tels plutôt
+  qu'omis. Inventaires vérifiés contre le code (2 `send_message_with_deadline` dans
+  `agent_loop/mod.rs`, 4 `impl LlmProvider`, 3 `delayed_response` en eval), chacun avec sa
+  commande. Ajouts induits : **AC8** (les dispositions sont tenues : aucune allowlist,
+  aucun `#[ignore]`, une seule exception), une ligne de *Definition of Done*, et des renvois
+  depuis V1, V4 et V4-bis. Correction d'une imprécision de **V4-bis** : les `360_000` sont
+  aux lignes 45 et 73, les lignes 44 et 72 étant celles des appels `delayed_response`.
+  Aucun AC affaibli, aucune valeur de réglage touchée (D7 intact).

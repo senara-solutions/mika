@@ -83,6 +83,11 @@ mod eval {
     mod test_intent_precondition_guard;
     mod test_internal_tagging;
     mod test_kg_budget_757;
+
+    // mika#2342 — le filet du site d'appel LLM principal : un appel qui dépasse
+    // le pire cas déclaré du rail est coupé et laisse une trace, et un appel
+    // lent mais borné ne l'est pas.
+    mod test_llm_watchdog_2342;
     mod test_max_steps_continuation;
     mod test_merge_identity_2248;
     mod test_multi_agent_harness_witness;
