@@ -109,7 +109,25 @@ Aux trois sites d'émission de `turn_usage`, les deux valeurs sont **déjà en p
 - `mod.rs:1204` (bras `Ok`) et `mod.rs:1223` (bras `Err`) : `request_bytes` (l. 1101), `system_prompt_len` ;
 - `mod.rs:704` (`save_continuation_llm_call`) : `system_prompt_bytes` et `request_bytes` sont déjà des **paramètres de la fonction** (l. 685).
 
-> **Ancrage des citations** : tous les numéros de ligne de ce plan sont relevés au SHA `45cec264` de la branche, et **re-vérifiés contre l'arbre à ce SHA** — `is_retryable` (`llm/error.rs`), `max_attempts` (`llm/budget.rs`), les trois paires `build_turn_usage_fields`/`emit_turn_usage`, `request_bytes` (l. 1101), les deux `response.json()` d'`ollama.rs`/`claude.rs`, le `retry_threshold_secs` sans branche transport d'`ollama.rs`, et le `.timeout(Duration::from_secs(120))` en dur de `claude.rs`. Les noms de symboles restent l'ancre porteuse — si un numéro a dérivé sous un rebase, c'est le symbole qui fait foi.
+### F8 — Le rail Anthropic porte deux barrages supplémentaires que les deux autres n'ont pas
+
+Mesure faite en écrivant la §*Fire-Disposition* (rev 2), et elle **contredit la rev 1 sur un point** : la §3.3 telle qu'elle était écrite n'aurait pas suffi à rendre le rail Anthropic retryable, et le cas 6 de §3.4 aurait échoué **après** le correctif autant qu'avant.
+
+1. **`is_retryable` y est conditionnel.** `crates/mika-common/src/claude.rs:796-801` :
+   ```rust
+   ClaudeApiError::Transport(e) => e.is_timeout(),
+   ```
+   Là où `LlmError::is_retryable` rend `Transport(_) => true` **inconditionnellement** (F1). Un corps coupé en cours de route n'est pas un timeout `reqwest` (`unexpected EOF`, `decode`, `reset` — la chaîne de causes que le motif mika#2015 exhume, `openai.rs:279-300`) : classer l'échec de lecture en `ClaudeApiError::Transport` le laisserait donc **non retryable**. Le découpage `.text()` puis désérialisation est nécessaire sur ce rail, il n'est pas suffisant.
+
+2. **La classe d'erreur y est aplatie à la frontière.** `crates/mika-common/src/llm/anthropic.rs:64` :
+   ```rust
+   .map_err(|e| LlmError::ProviderError(e.to_string()))?
+   ```
+   Toute erreur du rail Anthropic sort du `LlmProvider` en `ProviderError`, donc en classe `provider`, quelle qu'ait été sa cause. Conséquence pour §3.4 : sur ce rail, **la seule assertion honnête est le nombre de requêtes reçues**, jamais la classe propagée. Conséquence pour §3.2 : l'événement `llm_call_attempt` doit y être émis **depuis la boucle interne de `claude.rs`**, où la cause est encore typée, et sa classe vient d'un mapping local — d'où la contrainte d'orthographe unique reformulée en AC5.
+
+Ces deux faits ne changent rien aux hangs mesurés (aucun n'est sur ce rail, F1) ; ils changent ce que §3.3 et §3.4 doivent livrer pour que l'AC3 « tous les rails » soit vrai plutôt qu'annoncé.
+
+> **Ancrage des citations** : tous les numéros de ligne de ce plan sont relevés au SHA `45cec264` de la branche, et **re-vérifiés contre l'arbre à ce SHA** — `is_retryable` (`llm/error.rs`), `max_attempts` (`llm/budget.rs`), les trois paires `build_turn_usage_fields`/`emit_turn_usage`, `request_bytes` (l. 1101), les deux `response.json()` d'`ollama.rs`/`claude.rs`, le `retry_threshold_secs` sans branche transport d'`ollama.rs`, et le `.timeout(Duration::from_secs(120))` en dur de `claude.rs`. Les citations de F8 et de la §*Fire-Disposition* (rev 2) sont relevées au SHA `0874eab1` : `is_retryable` d'`claude.rs`, le `map_err` d'`anthropic.rs:64`, `classify_delivery_error` (`dispatcher.rs:218-236`), les deux `matches!(e, ClaudeApiError::Transport(_))` du seuil mika#1744 (`claude.rs:545`, `:654`), et les `dev-dependencies` de `crates/mika-common/Cargo.toml:61-64`. Les noms de symboles restent l'ancre porteuse — si un numéro a dérivé sous un rebase, c'est le symbole qui fait foi.
 
 > L'instrument central de ce plan ne demande donc **aucune nouvelle mesure** : il déplace une donnée déjà calculée d'une surface gatée vers la surface ungated qui existe précisément pour ça.
 
@@ -220,6 +238,8 @@ Ses quatre tests existants (`dispatcher.rs:3781-3810`) restent inchangés et dev
 
 Sites : `openai.rs:423-449`, `ollama.rs:~570-590`, `claude.rs:~560-590` (le rail Anthropic n'ayant ni budget ni `max_attempts`, il reporte `MAX_RETRIES + 1` et `http_timeout_secs = 120` — **le littéral en dur de `claude.rs:381-384`, que ce plan ne corrige pas mais rend au moins visible**).
 
+**Le rail Anthropic émet depuis sa boucle interne, et c'est F8 qui l'impose.** `anthropic.rs:64` aplatit toute erreur en `LlmError::ProviderError` : un événement émis au-dessus de cette frontière rapporterait `error_class = "provider"` sur un timeout transport, c'est-à-dire une ligne fausse plutôt qu'une ligne absente. L'émission est donc posée dans la boucle de `claude.rs` (l. 533-590), là où la cause est encore typée, et la classe vient d'un `ClaudeApiError::error_class()` local. **Les deux mappings, un seul vocabulaire** : les sept littéraux deviennent des constantes d'un unique site dans `llm/error.rs`, auxquelles `LlmError::error_class()` et `ClaudeApiError::error_class()` se réfèrent toutes deux. C'est la forme que D3 exige — un site de définition — et non un site d'implémentation, qu'un enum étranger ne peut de toute façon pas partager.
+
 Les `warn!` actuels (`"transient API error"`, `"retrying OpenAI-compatible API call"`, `"aborting retry chain — …"`) sont **conservés** : ils sont greppables par message et un opérateur peut déjà s'y appuyer. Le nouvel événement ne les remplace pas, il ajoute le champ `event` structuré, la durée par tentative et la classe d'erreur — les trois choses qui manquent pour trancher F4.
 
 > **Couverture, pas partialité.** Les trois rails sont instrumentés dans le même travail, y compris ceux qui ne portent aucun hang mesuré. Un événement posé sur un seul rail ferait lire l'absence de ligne comme « ce tour n'a pas retenté » alors qu'elle ne dirait que « ce rail n'est pas instrumenté » — le piège « l'absence n'est pas une preuve » que ce dépôt a déjà dû nommer plusieurs fois.
@@ -232,6 +252,24 @@ Les `warn!` actuels (`"transient API error"`, `"retrying OpenAI-compatible API c
 - échec de **désérialisation** ⇒ `ParseError` ⇒ non retryable, inchangé.
 
 C'est ce découpage, et non un élargissement de `is_retryable`, qui distingue les deux causes : les octets ne sont jamais arrivés, contre les octets sont arrivés et sont illisibles.
+
+**Sur le rail Anthropic, le découpage ne suffit pas (F8-1), et voici le complément.** `claude.rs:796-801` rend `Transport(e) => e.is_timeout()` : un `ClaudeApiError::Transport` né d'un corps coupé resterait non retryable. Plutôt que d'élargir `Transport` en `=> true` — ce qui rendrait aussi retryable un refus de connexion et changerait un comportement que ce ticket n'a pas mesuré —, ajouter un variant dédié :
+
+```rust
+/// Body read failed mid-stream: the bytes never arrived (mika#2015 pattern,
+/// ported to this rail by mika#2331). Retryable unconditionally, unlike
+/// `Transport`, whose is_timeout() condition this variant deliberately
+/// does not inherit.
+#[error("Claude API response body read failed")]
+BodyRead(String),
+```
+
+- `is_retryable` : `ClaudeApiError::BodyRead(_) => true`.
+- **Seuil transport-aware** : les deux `matches!(e, ClaudeApiError::Transport(_))` qui calculent `last_was_transport` (`claude.rs:545` et `:654`) doivent inclure `BodyRead`, sans quoi le rail retomberait sur le seuil long `0,75 + 0,25` après précisément l'erreur que mika#1744 existe pour traiter vite. **C'est le trou le plus facile à laisser ouvert de tout ce plan** : l'oubli ne casse aucun test et ne produit aucun symptôme lisible — seulement une chaîne de retry abandonnée plus tôt qu'il ne faut.
+- `error_class()` : `BodyRead` rend `transport_timeout` si la chaîne de causes contient `timed out`, `transport` sinon — même prédicat que `LlmError`, mêmes constantes (§3.2).
+- **Coût mécanique, borné et mesuré** : `ClaudeApiError` n'est nommé **dans aucun fichier hors `crates/mika-common/src/claude.rs`**. Les sites à compléter sont donc les six de ce fichier : le `match` exhaustif de contextualisation (l. 617-642), `is_retryable` (l. 796), les deux `matches!` du seuil, et le site de construction (l. 785). Aucun consommateur externe ne voit le nouveau variant.
+
+Le variant n'est **pas** ajouté à `LlmError`, qui n'en a pas besoin : `Transport` y est déjà retryable sans condition.
 
 **`ollama.rs:540-541`** : porter le seuil transport-aware de mika#1744, aujourd'hui absent de ce rail (il utilise le seuil long `0,75 + 0,25` du plafond même après une erreur transport, là où `openai.rs:396` bascule sur `transport_retry_min_remaining_secs()`).
 
@@ -248,9 +286,12 @@ Ajouter `wiremock` aux dev-dependencies de `crates/mika-common/Cargo.toml` (déj
 1. **Le test du ticket** — 1ʳᵉ réponse coupée mid-body (corps annoncé plus long qu'envoyé) ⇒ `Transport` ; 2ᵉ réponse valide ⇒ **succès, exactement 2 requêtes reçues**.
 2. **Pas de boucle infinie** — deux échecs transport d'affilée ⇒ `Err` propagée, **exactement `max_attempts` requêtes reçues**, jamais davantage.
 3. **`max_attempts` est bien la borne** — à la géométrie 120/300, un échec permanent produit **2** requêtes, pas 4 ; épingle F2 contre une dérive vers `MAX_RETRIES`.
-4. **La classe est la bonne** — l'erreur propagée rend `error_class() == "transport_timeout"` sur la chaîne d'incident verbatim (déjà figée à `dispatcher.rs:3778-3779`).
+4. **La classe est la bonne** — **sur le rail OpenAI-compat**, l'erreur propagée rend `error_class() == "transport_timeout"` sur la chaîne d'incident verbatim (déjà figée à `dispatcher.rs:3778-3779`). La restriction au rail est portante : F8-2 montre que sur le rail Anthropic la classe propagée est toujours `provider`, et asserter `transport_timeout` à cette frontière asserterait quelque chose de faux.
 5. **Non-retryable reste non-retryable** — un HTTP 400 ⇒ **1** requête.
-6. **Les rails Ollama et Anthropic** — un corps tronqué produit une erreur retryable et **2** requêtes (aujourd'hui : `ParseError` et **1** requête ; c'est le test qui échoue avant §3.3 et passe après).
+6. **a) Rail Ollama** — 1ʳᵉ réponse coupée mid-body, 2ᵉ valide ⇒ succès, **2** requêtes (aujourd'hui : `ParseError`, non retryable, **1** requête ; c'est le test qui échoue avant §3.3 et passe après).
+   **b) Rail Anthropic** — même scénario, même assertion : **2** requêtes. **L'assertion porte sur le compte, jamais sur la classe** (F8-2). Elle est de surcroît indépendante de `MAX_RETRIES`, que ce rail consomme encore à la place de `max_attempts` (§3.3, hors périmètre) : un succès au 2ᵉ essai s'arrête à 2 quelle que soit la borne.
+
+**Accessibilité des trois rails à un serveur de test — mesurée, et elle n'est pas uniforme.** `OpenAiCompatClient` et `OllamaClient` prennent une `base_url` en paramètre de construction (`openai.rs:180`, `ollama.rs:199`) : pointables sur wiremock sans toucher au code de production. `ClaudeClient` **poste sur une constante en dur** — `API_URL` (`claude.rs:11`), unique usage à `claude.rs:746` — et n'est donc atteignable par aucun test. Le cas 6b exige par conséquent un champ `base_url` sur `ClaudeClient`, initialisé à `API_URL` par `new()`, plus un constructeur de test derrière la feature **`test-utils` déjà déclarée** par ce crate (`Cargo.toml:43`, la convention qui gate déjà `MockLlmProvider`) — un test d'intégration de `tests/` ne voyant pas le `#[cfg(test)]` du crate. La dépendance de test s'ajoute alors en `mika-common = { path = ".", features = ["test-utils"] }` côté dev-dependencies. **Ce n'est pas un contournement du test : c'est la condition pour que le rail soit testable du tout**, et l'absence de cette condition est précisément pourquoi aucune boucle de retry n'a jamais été testée ici.
 
 Tests unitaires complémentaires, sans réseau :
 - `error_class` couvre les sept classes et **coïncide avec `classify_delivery_error`** sur tout le domaine (garde de la factorisation D3) ;
@@ -301,6 +342,83 @@ Ouvrir, **si et seulement si** la branche 2 de §3.5 se vérifie : *« Borner en
 
 Second ticket de dette, non conditionné : `claude.rs` n'honore ni `http_timeout_secs()` ni `max_attempts` (D2, §3.3).
 
+Troisième ticket de dette, découvert en rev 2 : `anthropic.rs:64` aplatit **toute** erreur du rail Anthropic en `LlmError::ProviderError(e.to_string())`, donc en classe `provider`, quelle qu'ait été la cause (F8-2). Ce plan contourne le défaut là où il le faut — l'événement `llm_call_attempt` est émis sous la frontière, et le cas 6b n'asserte que le compte de requêtes — mais ne le corrige pas : traduire fidèlement `ClaudeApiError` en `LlmError` change la classe d'erreur vue par tout le moteur sur ce rail, ce qui est un changement de format de fil et mérite son propre ticket et sa propre mesure.
+
+---
+
+## Fire-Disposition
+
+*(mika#1574 / review-guide.md § Fire-Disposition Gate — section ajoutée en rev 2 sur F1.)*
+
+Quatre livrables de ce plan sont de classe détecteur. Tous sont des `#[test]` / `#[tokio::test]` ordinaires, donc **bloquants en CI par le `cargo test --workspace` existant** (V2) : aucun nouveau job à créer, et aucune possibilité de les lander verts mais inertes.
+
+La disposition ci-dessous est écrite sur une population **comptée dans l'arbre à `0874eab1`**, pas supposée. Le comptage a contredit la rev 1 sur deux points, tous deux reportés dans le corps (F8, §3.3, §3.4) plutôt que dissimulés ici.
+
+| Détecteur | Où | Fire sur l'existant ? |
+|---|---|---|
+| T1 — `llm_retry.rs` cas 1 à 5 | rail OpenAI-compat | **Non** (mesuré) |
+| T2 — `llm_retry.rs` cas 6a / 6b | rails Ollama / Anthropic | **Oui** — c'est le seul |
+| T3 — parité `error_class` ↔ `classify_delivery_error` | `mika-common` + `mika-agent` | **Non** (mesuré) |
+| T4 — propagation `None` / `Some(n)` de `build_turn_usage_fields` | `mika-agent` | **Non** (code neuf) |
+
+### T1 — la boucle OpenAI-compat fait déjà ce que les cas 1 à 5 assertent
+
+**Population : zéro violation.** C'est le contenu même de F1 et F2 — `LlmError::Transport` est inconditionnellement retryable (`llm/error.rs:32-38`) et `max_attempts` borne déjà la chaîne à 2 pour la géométrie 120/300 (`llm/budget.rs:270-275`, consommé à `openai.rs:367-371`). Les cinq cas sont des **tests de caractérisation** : ils figent un comportement livré, ils ne le demandent pas.
+
+**Disposition : (a) allowlist nommée, avec une liste vide.** Aucune exemption n'est écrite, parce qu'exempter d'un détecteur ce qui le passe déjà crée une dispense morte que rien ne nettoie ensuite.
+
+**Halt-and-surface conditionnel, et il est porteur.** Si l'un de ces cinq cas est rouge à la pose — en particulier le cas 3, « 2 requêtes et non 4 » —, alors **F2 est faux**, et F2 est ce sur quoi repose toute la §3.5 (la lecture de `attempt` contre `max_attempts`). L'implémenteur ne doit alors ni exempter, ni ajuster l'assertion à ce qu'il observe : il **halte et remonte**, parce qu'un plan dont la prémisse de mesure vient d'être démentie ne se répare pas au niveau du test.
+
+### T2 — le seul détecteur qui fire sur l'état existant, et il land avec son correctif
+
+**Population : exactement deux sites, tous deux nommés.**
+- `crates/mika-common/src/llm/ollama.rs:502-505` — `response.json().await.map_err(… LlmError::ParseError …)`, non retryable ;
+- `crates/mika-common/src/claude.rs:785` — `response.json().await.map_err(ClaudeApiError::ParseError)`, non retryable, **et** `is_retryable` y conditionne même `Transport` à `is_timeout()` (F8-1).
+
+Avant §3.3, le cas 6a observe 1 requête là où il en attend 2, et le cas 6b fait de même. **Ce sont des échecs attendus, et ils mesurent exactement le trou que §3.3 comble.**
+
+**Disposition : co-location atomique — ni exemption, ni détecteur désarmé.** Les cas 6a/6b et le correctif §3.3 (découpage `.text()` + variant `BodyRead` + seuil transport-aware) atterrissent dans **le même PR**. À aucun instant de l'historique de `main` le détecteur n'existe sans son correctif, donc il n'y a **aucune violation préexistante à exempter** : la population passe de deux à zéro dans le commit qui introduit le détecteur. C'est la seconde branche que F1(b) prévoit explicitement, et c'est celle-ci qui s'applique.
+
+L'ordre interne au PR est libre (test d'abord et rouge, ou correctif d'abord) ; ce qui est contraint est ce que porte le merge.
+
+**Dérogation unique, et sa condition est nommée.** Si et seulement si §3.3 devait être scindé hors de ce PR — par exemple parce que le variant `BodyRead` révèle à l'implémentation un consommateur d'`ClaudeApiError` que le comptage n'a pas vu (le comptage dit : **aucun fichier hors `claude.rs` ne nomme cet enum**) —, alors et alors seulement le sous-cas concerné bascule en **(b) land disabled** :
+
+```rust
+// FIRE-DISPOSITION (mika#1574, plan mika#2331 §Fire-Disposition T2):
+// disabled until <tracker> lands the body-read split on this rail.
+#[ignore = "mika#2331: enable with the <tracker> body-read split"]
+```
+
+avec, dans le même test, l'**assertion auto-nettoyante** qui fait de l'`#[ignore]` une dette datée plutôt que permanente :
+
+```rust
+// Fires when the rail is repaired and the #[ignore] has gone stale.
+assert!(
+    matches!(err, /* encore la variante non retryable */),
+    "rail repaired — remove the #[ignore] above and this assertion with it"
+);
+```
+
+Le numéro de tracker est à créer **au moment de la scission**, pas d'avance : un ticket ouvert pour une scission qui n'aura pas lieu est un tracker mort, et ce plan prévoit que la scission n'ait pas lieu.
+
+### T3 — le vocabulaire des classes n'a aujourd'hui qu'une seule orthographe
+
+**Population : zéro seconde orthographe, mesurée.** `grep -rn 'transport_timeout' crates/` rend six lignes : le site de définition (`dispatcher.rs:228`), deux assertions de ses tests (`:3786`, `:3842`), et trois lignes de `tests/eval/test_callback_delivery_starvation.rs` (un nom de fonction, une valeur attendue, un commentaire de triage). **Aucune seconde écriture du vocabulaire n'existe** — ce que D3 existe pour empêcher n'a pas encore eu lieu.
+
+**Disposition : (a) allowlist nommée, avec une liste vide.** Le détecteur de parité est bloquant dès le land, sans exemption ni période de grâce.
+
+**Nuance qui appartient à cette section, parce qu'elle est née de la mesure (F8-2)** : la parité à vérifier n'est pas « une fonction » mais « un vocabulaire ». `ClaudeApiError` est un enum étranger à `LlmError` et ne peut pas partager une implémentation ; §3.2 fait donc des sept littéraux des **constantes d'un site unique**, et T3 asserte que les deux mappings ne produisent que des valeurs tirées de ce jeu. Un `error_class()` qui renverrait une huitième chaîne est exactement la divergence que D3 nomme, et T3 la voit.
+
+### T4 — `build_turn_usage_fields` ne fire sur rien d'existant
+
+**Population : zéro.** Les deux champs `request_bytes` / `system_prompt_bytes` n'existent pas encore ; l'assertion porte sur un comportement introduit par ce PR.
+
+**Disposition : sans objet** — il n'y a pas d'état préexistant sur lequel ce détecteur puisse firer. Les **dix** appels de test que l'élargissement de signature casse (§3.1 point 5) ne sont **pas** un fire : ce sont des appels à mettre à jour, sans signification, et la §*Verification contract* dit déjà pourquoi il ne faut pas les lire comme un signal.
+
+### Ce qui n'est pas un détecteur, et qu'il ne faut pas confondre
+
+**V4 est une contrainte de non-modification, pas un détecteur.** « Les quatre tests de `classify_delivery_error` passent sans être modifiés » est une règle sur le **diff**, que rien dans le code ne peut faire firer ; aucune disposition ne lui est due. Elle est énoncée en §*Verification contract*, avec son inverse sur V5, et les deux se lisent ensemble.
+
 ---
 
 ## Verification contract
@@ -309,7 +427,7 @@ Second ticket de dette, non conditionné : `claude.rs` n'honore ni `http_timeout
 |---|---|---|
 | V1 | Compilation et lints | `cargo clippy --workspace --all-targets -- -D warnings` |
 | V2 | Suite complète non régressée | `cargo test --workspace` |
-| V3 | Boucle de retry, les six cas | `cargo test -p mika-common --test llm_retry` |
+| V3 | Boucle de retry, les six cas (6a et 6b inclus) | `cargo test -p mika-common --features test-utils --test llm_retry` |
 | V4 | Factorisation `error_class` sans changement de fil | `cargo test -p mika-agent classify_delivery_error` (quatre tests préexistants, **non modifiés**) |
 | V5 | Champs `turn_usage` | `cargo test -p mika-agent build_turn_usage_fields` |
 | V6 | Structure des bundles | `make verify-bundled-skills` |
@@ -328,10 +446,11 @@ Second ticket de dette, non conditionné : `claude.rs` n'honore ni `http_timeout
 
 - [ ] `turn_usage` porte `request_bytes` et `system_prompt_bytes` aux trois sites d'émission, en `Option`, ungated, sans qu'aucun champ existant ne change de nom ni de sémantique.
 - [ ] `llm_call_attempt` est émis par tentative sur les trois rails, ungated, avec les sept champs de §3.2.
-- [ ] `LlmError::error_class()` est l'unique source du vocabulaire de classes ; `classify_delivery_error` y délègue et ses tests préexistants passent **sans modification**.
-- [ ] Un échec de **lecture de corps** est retryable sur les trois rails ; un échec de **désérialisation** ne l'est sur aucun.
-- [ ] Le seuil transport-aware (mika#1744) s'applique aussi au rail Ollama.
-- [ ] `crates/mika-common/tests/llm_retry.rs` couvre les six cas de §3.4, `wiremock` ajouté en dev-dep de `mika-common`.
+- [ ] Les sept classes ont un unique site de définition (constantes) ; `classify_delivery_error` délègue à `LlmError::error_class()` et ses tests préexistants passent **sans modification** ; `ClaudeApiError::error_class()` tire ses valeurs des mêmes constantes.
+- [ ] Un échec de **lecture de corps** est retryable sur les trois rails ; un échec de **désérialisation** ne l'est sur aucun. Sur le rail Anthropic, la retryabilité passe par un variant dédié (`BodyRead`), inconditionnel, et non par un élargissement de `Transport`.
+- [ ] Le seuil transport-aware (mika#1744) s'applique aussi au rail Ollama, et compte `ClaudeApiError::BodyRead` comme transport aux deux sites `last_was_transport` de `claude.rs`.
+- [ ] `crates/mika-common/tests/llm_retry.rs` couvre les six cas de §3.4 (6a et 6b inclus), `wiremock` ajouté en dev-dep de `mika-common` ; `ClaudeClient` porte une `base_url` (défaut `API_URL`) et un constructeur de test derrière la feature `test-utils` existante, sans quoi le rail Anthropic n'est atteignable par aucun test.
+- [ ] La section `## Fire-Disposition` couvre les quatre détecteurs T1 à T4 (mika#1574) ; T2 land atomiquement avec son correctif §3.3 et n'écrit aucune exemption.
 - [ ] V1 à V7 passent.
 - [ ] `CLAUDE.md` porte les greps et la procédure à quatre branches, **avec son critère de halte** et l'angle mort de corrélation de D4.
 - [ ] Le corps de PR énonce les rectifications F1/F4/F5 au ticket, et dit explicitement que le retry demandé par le corps du ticket existait déjà sur le rail de l'incident.
@@ -347,16 +466,30 @@ Un tour LLM dont l'appel échoue émet un `turn_usage` portant `request_bytes` e
 Chaque tentative d'appel LLM émet un `llm_call_attempt` portant `provider`, `model`, `attempt`, `max_attempts`, `elapsed_ms`, `outcome` ∈ {`success`, `retrying`, `exhausted`, `deadline_abort`}, `error_class` et `http_timeout_secs`. Les **trois** rails (OpenAI-compat, Ollama, Anthropic) l'émettent, de sorte que l'absence d'événement soit un fait sur l'appel et non sur le rail. L'événement est ungated.
 
 **AC3 — Un timeout en cours de lecture du corps est retryable sur tous les rails.**
-Sur les rails Ollama et Anthropic, un échec de lecture du corps produit une erreur de classe transport, retryable ; un échec de désérialisation d'un corps intégralement reçu reste `parse`, non retryable. Le seuil de reprise transport-aware de mika#1744 s'applique au rail Ollama.
+Sur les rails Ollama et Anthropic, un échec de lecture du corps produit une erreur de classe transport, retryable ; un échec de désérialisation d'un corps intégralement reçu reste `parse`, non retryable. Sur le rail Anthropic la retryabilité est **inconditionnelle** — elle n'hérite pas de la condition `is_timeout()` que `ClaudeApiError::Transport` porte (F8-1) —, et le seuil de reprise transport-aware de mika#1744 compte cette erreur comme transport (`last_was_transport`, `claude.rs:545` et `:654`). Le même seuil s'applique au rail Ollama, où il est aujourd'hui absent.
 
 **AC4 — Le test négatif du ticket passe, sur la boucle réelle.**
 Un appel dont la première réponse est coupée en cours de corps est **retenté une fois** ; si le second essai aboutit, l'appel réussit ; si le second échoue, l'erreur est propagée et le nombre total de requêtes émises est **exactement `max_attempts`**, jamais davantage. Vérifié contre un serveur HTTP de test, pas contre un mock de provider.
 
 **AC5 — Une classe d'erreur, une seule orthographe.**
-Le vocabulaire `transport_timeout` / `transport` / `http_<status>` / `parse` / `provider` / `unsupported` / `other` a un unique site de définition dans `mika-common`. `classify_delivery_error` (mika#2179) y délègue et ses tests préexistants passent sans modification, de sorte que les `GROUP BY` opérateur existants sur `audit_events` restent valides.
+Le vocabulaire `transport_timeout` / `transport` / `http_<status>` / `parse` / `provider` / `unsupported` / `other` a un unique site de **définition** dans `mika-common` — un jeu de constantes. `classify_delivery_error` (mika#2179) délègue à `LlmError::error_class()` et ses tests préexistants passent sans modification, de sorte que les `GROUP BY` opérateur existants sur `audit_events` restent valides. Le mapping du rail Anthropic (`ClaudeApiError::error_class()`, requis par F8-2) tire ses valeurs de ces mêmes constantes : deux mappings, jamais deux orthographes.
 
 **AC6 — La décision suivante est écrite avant d'être prise.**
 `CLAUDE.md` porte la procédure de diagnostic à quatre branches de §3.5, son ordre (l'instrument mika#2293 d'abord), son critère de halte (« cinq hangs sans `llm_call_attempt` ⇒ la panne est en amont de l'appel HTTP »), et l'angle mort de corrélation de D4. Chaque branche nomme son remède ou son ticket de suite.
 
 **AC7 — Ce qui n'est pas fait est dit.**
-Le corps de PR énonce : que le retry « 1× sur transport » demandé par le corps du ticket **existait déjà** sur le rail portant 100 % des hangs mesurés (F1/F2) ; que 420 s n'est expliqué par aucun budget du code (F4) ; que l'hypothèse « le log pilote complet est dans le prompt » est réfutée par trois barrages (F5) ; et que la borne du prompt callback est **conditionnée à la mesure**, avec le ticket de suite pré-décrit en §4.
+Le corps de PR énonce : que le retry « 1× sur transport » demandé par le corps du ticket **existait déjà** sur le rail portant 100 % des hangs mesurés (F1/F2) ; que 420 s n'est expliqué par aucun budget du code (F4) ; que l'hypothèse « le log pilote complet est dans le prompt » est réfutée par trois barrages (F5) ; que le rail Anthropic porte deux barrages supplémentaires qui rendaient la §3.3 de la rev 1 insuffisante (F8), dont l'un — l'aplatissement en `ProviderError` — est contourné et non corrigé, avec son ticket de dette en §4 ; et que la borne du prompt callback est **conditionnée à la mesure**, avec le ticket de suite pré-décrit en §4.
+
+---
+
+## Revision history
+
+- **rev 2 (2026-09-16)** — première passe architecte, `Disposition: ITERATE`, un finding bloquant.
+  - **F1 adressé** : ajout de la section `## Fire-Disposition` (mika#1574 / review-guide.md § Fire-Disposition Gate), couvrant les quatre livrables de classe détecteur T1 à T4. Elle a été écrite **après avoir compté la population de chaque détecteur dans l'arbre à `0874eab1`**, et le comptage a contredit la rev 1 sur deux points, tous deux reportés dans le corps du plan plutôt que gardés dans la section :
+    - **T2, le seul détecteur qui fire sur l'existant, a une population de deux sites nommés** (`ollama.rs:502-505`, `claude.rs:785`). Disposition retenue : **co-location atomique** — la branche que F1(b) prévoit en second (« document that the detector lands alongside the §3.3 fix »). Aucune exemption n'est écrite : la population passe de deux à zéro dans le commit qui introduit le détecteur, et exempter ce qui n'existera plus créerait une dispense morte. La dérogation en option (b) *land disabled* est écrite avec sa condition de déclenchement, son `#[ignore]` porteur de tracker et son assertion auto-nettoyante — à n'activer que si §3.3 est scindé hors du PR, ce que le plan ne prévoit pas.
+    - **Le correctif de la rev 1 ne suffisait pas sur le rail Anthropic.** F1 supposait que « les tests vérifient un rail réparé » ; la mesure dit que `claude.rs:796-801` conditionne `Transport` à `is_timeout()`, qu'un corps coupé n'est pas un timeout, et que le seul découpage `.text()` aurait donc laissé le cas 6b rouge **après** §3.3. D'où le nouveau **F8**, le variant `BodyRead` en §3.3, et l'inclusion de `BodyRead` dans le `last_was_transport` du seuil mika#1744 — l'oubli le plus silencieux du plan, nommé au site.
+    - **Deuxième contradiction, même rail** : `anthropic.rs:64` aplatit toute erreur en `ProviderError`. Le cas 6b n'asserte donc **que le compte de requêtes**, jamais la classe ; l'événement `llm_call_attempt` est émis **sous** cette frontière ; et AC5 devient « un site de définition, deux mappings ». Le défaut lui-même est nommé en dette (§4, troisième ticket) parce que le corriger change un format de fil.
+    - **Troisième mesure, sur la faisabilité même du cas 6b** : `ClaudeClient` poste sur la constante `API_URL` en dur (`claude.rs:11`, `:746`) et n'est atteignable par aucun serveur de test. §3.4 porte désormais la `base_url` + le constructeur derrière la feature `test-utils` déjà déclarée par le crate. Sans cela, le détecteur T2-6b n'aurait pas pu exister — ce qui est aussi l'explication de son absence jusqu'ici.
+  - T1, T3 et T4 sont disposés en **(a) avec liste vide**, chacun sur un comptage explicite (zéro violation). T1 porte en plus un **halt-and-surface conditionnel** : un cas 3 rouge signifierait que F2 est faux, donc que la §3.5 entière repose sur une prémisse démentie — l'implémenteur remonte au lieu d'ajuster l'assertion.
+  - AC3, AC5, AC7, la *Definition of Done* et la ligne V3 du *Verification contract* sont mis à jour en conséquence. Aucun AC n'est affaibli : AC3 gagne la clause d'inconditionnalité et celle du seuil, AC5 gagne la contrainte sur le second mapping.
+  - Les annotations A1 à A3 de la première passe ne portaient aucune demande de changement ; la strate la plus récente du ticket, la citation du commentaire 2 et l'étape 0 de la procédure de diagnostic sont conservées telles quelles.
