@@ -10,21 +10,33 @@
 //!
 //! The guard requires anchor lines quoting the brief verbatim at distinct positions, and is
 //! fail-CLOSED: when the corrective re-prompt does not produce them, the disposition is
-//! withheld from the final text rather than accepted.
+//! never accepted. Since mika#2338 the refusal is also fail-VISIBLE: the disposition is
+//! rewritten into a terminal `ESCALATE` of its own family, preceded by an engine finding
+//! line naming the cause (`anchors_found`, `anchors_valid`, `miss_reason`), so the groom
+//! reports why instead of an opaque "verdict missing". The withheld marker remains the
+//! fallback for a skill that declares no `ESCALATE` of that family.
+//!
+//! "Verbatim" is the brief's words, not its bytes (mika#2338): a quote of a markdown brief
+//! with the `**` and backticks dropped — what the mika#2335 architect actually returned —
+//! is accepted.
 //!
 //! ## Hard Assertions
 //! - Guard fires on READY without attestation, and on `Verdict: GROOMED`.
 //! - Guard does NOT fire on a terminal disposition (that half belongs to mika#901).
 //! - Guard does NOT fire when the skill does not declare the contract.
 //! - A real anchored review passes on the first turn, with no re-prompt.
-//! - After the re-prompt fails, the disposition is gone and the marker is present.
+//! - After the re-prompt fails at 2 of 3, the response ends on `ESCALATE` of the withdrawn
+//!   line's family, carries the engine finding line, and no READY/GROOMED survives.
+//! - With no `ESCALATE` of that family declared, the withheld marker is present (fallback).
+//! - A rendered quote of a markdown brief is accepted.
 //! - The anchor guard's retry budget is independent of the F-list guard's.
 //!
 //! ## Tags
 //! - `grounding:review-anchor-required` — post-fix success tag
 //! - `grounding:unanchored-ready` — pre-fix failure tag
 //!
-//! Reference: mika#2037, mika#901 (the exempted half), mika#1957 (n=2 of the same class)
+//! Reference: mika#2037, mika#901 (the exempted half), mika#1957 (n=2 of the same class),
+//! mika#2338 (fail-visible escalation and word-level comparison)
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -42,6 +54,18 @@ const GROOM_SUFFIX_LINES: &[&str] = &[
     "Disposition: ESCALATE",
 ];
 const SECOND_REVIEW_SUFFIX_LINES: &[&str] = &["Verdict: GROOMED", "Verdict: ESCALATE"];
+/// What mika-arch actually sees: the three arch skills are `always_on`, so the engine
+/// collects the union of every declared line on every turn (mika#2338).
+const ARCH_SUFFIX_UNION: &[&str] = &[
+    "Disposition: READY",
+    "Disposition: ITERATE",
+    "Disposition: ESCALATE",
+    "Verdict: GROOMED",
+    "Verdict: ESCALATE",
+];
+/// The engine finding line's fixed marker (mika#2338). Kept as a literal for the same reason
+/// as `WITHHELD_MARKER`: `dispatch-lib`'s tier 0b recognizes this exact shape.
+const ENGINE_FINDING_MARKER: &str = "(BLOCKING) [mika-engine] review-anchor:";
 const ANCHOR_PREFIXES: &[&str] = &["A1:", "A2:", "A3:", "A4:", "A5:"];
 const FINDING_PREFIXES: &[&str] = &["F1:", "F2:", "F3:"];
 
@@ -195,21 +219,33 @@ async fn test_review_anchor_caught_on_unanchored_ready() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Test 2: fail-closed. When the corrective re-prompt does not produce an attestation, the
-/// disposition does not survive into the final response — the marker replaces it, and the
-/// model's own prose is kept.
+/// Test 2: fail-closed AND fail-visible (mika#2338). When the corrective re-prompt still
+/// yields only two verifiable anchors out of three — the measured mika#2335 shape — the
+/// disposition does not survive: the response ends on `Disposition: ESCALATE`, carries the
+/// engine finding line with the counters and the miss reason, and keeps the model's prose.
 #[tokio::test]
-async fn test_review_anchor_withholds_disposition_after_failed_retry() -> anyhow::Result<()> {
+async fn test_review_anchor_escalates_with_cause_after_failed_retry() -> anyhow::Result<()> {
+    // Two verbatim anchors, one paraphrase: 2 of 3, QuoteNotInBrief.
+    let two_of_three = "A1: \"re-resolves the manager cycle token before every cycle instead of freezing it\" — correct.\n\
+         A2: \"is the trace exhaustive, should every refresh be journaled at INFO level\" — yes.\n\
+         A3: the threshold for repeated auth failures is left open, express it as a duration.\n\
+         \n\
+         Still nothing to add. The plan is fine as written.\n\
+         \n\
+         Disposition: READY";
+    let skills = SkillRegistry::from_test_entries(vec![make_anchor_skill(
+        "arch-groom-ticket",
+        &["groom-ticket"],
+        ARCH_SUFFIX_UNION,
+        ANCHOR_PREFIXES,
+        FINDING_PREFIXES,
+    )]);
     let harness = EvalHarness::builder()
         .responses(vec![
-            text_response(UNANCHORED_STUB),
-            // Second attempt: still no anchors. This is where every sibling guard would
-            // give up and accept.
-            text_response(
-                "Still nothing to add. The plan is fine as written.\n\nDisposition: READY",
-            ),
+            text_response(two_of_three),
+            text_response(two_of_three),
         ])
-        .skills(groom_skill())
+        .skills(skills)
         .build()
         .await?;
 
@@ -217,9 +253,137 @@ async fn test_review_anchor_withholds_disposition_after_failed_retry() -> anyhow
 
     assert_has_output(&trace);
     grounding_assertions::assert_response_forbids(&trace, &["Disposition: READY"]);
-    grounding_assertions::assert_response_contains(&trace, WITHHELD_MARKER);
+    grounding_assertions::assert_response_contains(&trace, "Disposition: ESCALATE");
+    grounding_assertions::assert_response_contains(&trace, ENGINE_FINDING_MARKER);
+    grounding_assertions::assert_response_contains(&trace, "anchors_valid=2");
+    grounding_assertions::assert_response_contains(&trace, "QuoteNotInBrief");
     // The body survives — the guard removes the unearned attestation, not the content.
     grounding_assertions::assert_response_contains(&trace, "Still nothing to add");
+    // The marker is the fallback, not this path.
+    grounding_assertions::assert_response_forbids(&trace, &[WITHHELD_MARKER]);
+
+    Ok(())
+}
+
+/// Test 2b: the second-review mirror. On the same union of declared lines, a withdrawn
+/// `Verdict: GROOMED` becomes `Verdict: ESCALATE` — its own family, not the first ESCALATE
+/// in the list.
+#[tokio::test]
+async fn test_review_anchor_escalates_second_pass_in_its_own_family() -> anyhow::Result<()> {
+    let two_of_three = "A1: \"re-resolves the manager cycle token before every cycle instead of freezing it\" — correct.\n\
+         A2: \"is the trace exhaustive, should every refresh be journaled at INFO level\" — yes.\n\
+         A3: the threshold for repeated auth failures is left open.\n\
+         \n\
+         Verdict: GROOMED";
+    let skills = SkillRegistry::from_test_entries(vec![make_anchor_skill(
+        // The shipped second-review skill name: a verdict producer, so the #1133
+        // dev-groom fabrication guard stays out of the way as it does in production.
+        "mika-arch-second-review",
+        &["second-review"],
+        ARCH_SUFFIX_UNION,
+        ANCHOR_PREFIXES,
+        FINDING_PREFIXES,
+    )]);
+    let brief = format!("second-review: {BRIEF}");
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            text_response(two_of_three),
+            text_response(two_of_three),
+        ])
+        .skills(skills)
+        .build()
+        .await?;
+
+    let trace = harness.run(&brief).await?;
+
+    assert_has_output(&trace);
+    grounding_assertions::assert_response_forbids(
+        &trace,
+        &["Verdict: GROOMED", "Disposition: ESCALATE"],
+    );
+    grounding_assertions::assert_response_contains(&trace, "Verdict: ESCALATE");
+    grounding_assertions::assert_response_contains(&trace, ENGINE_FINDING_MARKER);
+
+    Ok(())
+}
+
+/// Test 2c: the fallback. A skill that declares no `ESCALATE` of the withdrawn family cannot
+/// be escalated in that family, so the withheld marker still replaces the disposition
+/// (unreachable with the shipped arch manifests, kept as the defensive floor).
+#[tokio::test]
+async fn test_review_anchor_withholds_when_no_escalate_of_the_family_is_declared()
+-> anyhow::Result<()> {
+    // `Verdict: GROOMED` is declared (the guard must fire on it) but no `Verdict: ESCALATE`
+    // is: the withdrawn line has no ESCALATE of its own family to become.
+    let mut lines: Vec<&str> = GROOM_SUFFIX_LINES.to_vec();
+    lines.push("Verdict: GROOMED");
+    let skills = SkillRegistry::from_test_entries(vec![make_anchor_skill(
+        // The shipped second-review skill name: a verdict producer, so the #1133
+        // dev-groom fabrication guard stays out of the way as it does in production.
+        "mika-arch-second-review",
+        &["second-review"],
+        &lines,
+        ANCHOR_PREFIXES,
+        FINDING_PREFIXES,
+    )]);
+    let brief = format!("second-review: {BRIEF}");
+    let stub = "All prior findings resolved.\n\nVerdict: GROOMED";
+    let harness = EvalHarness::builder()
+        .responses(vec![text_response(stub), text_response(stub)])
+        .skills(skills)
+        .build()
+        .await?;
+
+    let trace = harness.run(&brief).await?;
+
+    assert_has_output(&trace);
+    grounding_assertions::assert_response_forbids(&trace, &["Verdict: GROOMED", "ESCALATE"]);
+    grounding_assertions::assert_response_contains(&trace, WITHHELD_MARKER);
+
+    Ok(())
+}
+
+/// Test 2d: the mika#2335 case seen from the harness. The brief is markdown; the architect
+/// quotes it with the markup dropped. That is a genuine review and must be accepted on the
+/// first turn — the guard exists to refuse forgeries, not renderings.
+#[tokio::test]
+async fn test_review_anchor_accepts_a_rendered_quote_of_a_markdown_brief() -> anyhow::Result<()> {
+    let markdown_brief = BRIEF
+        .replace(
+            "The cycle token is re-resolved through a TokenResolver trait",
+            "**The cycle token is re-resolved** through a `TokenResolver` trait",
+        )
+        .replace(
+            "is the trace exhaustive, should every refresh be journaled at INFO level",
+            "is the trace **exhaustive**, should every refresh be journaled at `INFO` level",
+        )
+        .replace(
+            "I have not fixed N for the repeated authentication failure threshold",
+            "I have not fixed `N` for the **repeated authentication failure** threshold",
+        );
+    let rendered_review = "A1: \"The cycle token is re-resolved through a TokenResolver trait, never frozen at spawn\" — correct.\n\
+         A2: \"is the trace exhaustive, should every refresh be journaled at INFO level\" — yes.\n\
+         A3: \"I have not fixed N for the repeated authentication failure threshold\" — a duration.\n\
+         \n\
+         Disposition: READY";
+    let harness = EvalHarness::builder()
+        .responses(vec![text_response(rendered_review)])
+        .skills(groom_skill())
+        .build()
+        .await?;
+
+    let trace = harness.run(&markdown_brief).await?;
+
+    assert_eq!(
+        trace.llm_call_count, 1,
+        "a rendered quote of a markdown brief is a real review; no re-prompt"
+    );
+    assert_has_output(&trace);
+    grounding_assertions::assert_response_contains(&trace, "Disposition: READY");
+    grounding_assertions::assert_response_forbids(
+        &trace,
+        &[ENGINE_FINDING_MARKER, WITHHELD_MARKER],
+    );
 
     Ok(())
 }
