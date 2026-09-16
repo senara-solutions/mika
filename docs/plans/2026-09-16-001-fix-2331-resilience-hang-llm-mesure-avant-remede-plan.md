@@ -57,7 +57,7 @@ Le `MAX_RETRIES = 3` d'`openai.rs:147` est donc **inatteignable en production su
 
 ### F3 — Le tour ne dit ni sa taille, ni son nombre de tentatives
 
-`emit_turn_usage` (`agent_loop/mod.rs:6489-6518`) porte : `step`, `stop_reason`, les quatre compteurs de tokens, `latency_ms`, `tool_use_in_turn`, `status`. **Aucun champ d'octets, aucun compteur de tentatives.** Sur le bras `Err` (`mod.rs:1223`), `usage = None` ⇒ tous les tokens à 0 : c'est exactement la ligne `input_tokens=0 / latency≈420 000 / status=error` que l'opérateur a mesurée.
+`emit_turn_usage` (`agent_loop/mod.rs:6617-6646`) porte : `step`, `stop_reason`, les quatre compteurs de tokens, `latency_ms`, `tool_use_in_turn`, `status`. **Aucun champ d'octets, aucun compteur de tentatives.** Sur le bras `Err` (`mod.rs:1223`), `usage = None` ⇒ tous les tokens à 0 : c'est exactement la ligne `input_tokens=0 / latency≈420 000 / status=error` que l'opérateur a mesurée.
 
 Un hang de 420 s est donc aujourd'hui **indiscernable** entre : une tentative anormalement longue, deux tentatives de 120 s, quatre tentatives, ou un échec en amont de l'appel.
 
@@ -107,7 +107,9 @@ let request_bytes = Some(request.payload_bytes() as i64);
 Aux trois sites d'émission de `turn_usage`, les deux valeurs sont **déjà en portée lexicale** :
 
 - `mod.rs:1204` (bras `Ok`) et `mod.rs:1223` (bras `Err`) : `request_bytes` (l. 1101), `system_prompt_len` ;
-- `mod.rs:704` (`save_continuation_llm_call`) : `system_prompt_bytes` et `request_bytes` sont déjà des **paramètres de la fonction**.
+- `mod.rs:704` (`save_continuation_llm_call`) : `system_prompt_bytes` et `request_bytes` sont déjà des **paramètres de la fonction** (l. 685).
+
+> **Ancrage des citations** : tous les numéros de ligne de ce plan sont relevés au SHA `40d36c91` de la branche. Les noms de symboles sont l'ancre porteuse — si un numéro a dérivé sous un rebase, c'est le symbole qui fait foi.
 
 > L'instrument central de ce plan ne demande donc **aucune nouvelle mesure** : il déplace une donnée déjà calculée d'une surface gatée vers la surface ungated qui existe précisément pour ça.
 
@@ -125,7 +127,7 @@ Le plan livre donc, dans le même travail : **l'instrument** (§3.1, §3.2), **l
 
 Le commentaire 1 demande la couverture « tous transports ». Elle est acquise sur le rail OpenAI (F1) et **manque sur les deux autres**, où un échec de lecture du corps est classé `ParseError`, donc **non retryable** :
 
-- `crates/mika-common/src/claude.rs:786-787` : `response.json().await.map_err(ClaudeApiError::ParseError)?`
+- `crates/mika-common/src/claude.rs:785` : `response.json().await.map_err(ClaudeApiError::ParseError)?`
 - `crates/mika-common/src/llm/ollama.rs:502-505` : `.json().await.map_err(|e| LlmError::ParseError(…))?`
 
 C'est **la régression exacte que mika#2015 a fermée sur openai.rs et qui n'a jamais été portée**. Aucun hang mesuré n'est sur ces rails — mais la demande du ticket est explicitement transverse, le trou est de la même classe, et le correctif est mécanique.
@@ -164,12 +166,18 @@ Ni `MIKA_STORE_LLM_CALLS`, ni `MIKA_LOG_LLM_BODIES` ne doivent le taire. Doctrin
 
 **Fichier** : `crates/mika-agent/src/agent_loop/mod.rs`
 
-1. Ajouter à `TurnUsageFields` (l. 6416-6426) : `request_bytes: Option<i64>`, `system_prompt_bytes: Option<i64>`.
-2. Étendre `build_turn_usage_fields` (l. 6448) de deux paramètres, passés tels quels (fonction pure, testable sans subscriber).
-3. Émettre dans `emit_turn_usage` (l. 6489) : `request_bytes = ?fields.request_bytes`, `system_prompt_bytes = ?fields.system_prompt_bytes` (le sigil `?` préserve la distinction `null` / valeur, cf. D6).
-4. Câbler les **trois** sites :
-   - `mod.rs:1195` (bras `Ok`) et `mod.rs:1215` (bras `Err`) : `request_bytes` (l. 1101) et `Some(system_prompt_len as i64)` sont en portée ;
-   - `mod.rs:686` (`save_continuation_llm_call`) : les deux sont déjà des paramètres de la fonction.
+1. Ajouter à `TurnUsageFields` (l. 6544-6554) : `request_bytes: Option<i64>`, `system_prompt_bytes: Option<i64>`.
+2. Étendre `build_turn_usage_fields` (l. 6576) de deux paramètres, passés tels quels (fonction pure, testable sans subscriber).
+3. Émettre dans `emit_turn_usage` (l. 6617) : `request_bytes = ?fields.request_bytes`, `system_prompt_bytes = ?fields.system_prompt_bytes` (le sigil `?` préserve la distinction `null` / valeur, cf. D6).
+4. Câbler les **trois** sites. Chacun est une paire `build_turn_usage_fields` (où les deux arguments s'ajoutent) suivie de `emit_turn_usage` (qui lit `fields`) — **ce sont les appels `build_*` qu'il faut modifier**, les `emit_*` ne changent pas d'appel :
+   - bras `Ok` : build l. 1196, emit l. 1204 ;
+   - bras `Err` : build l. 1215, emit l. 1223 ;
+   — pour ces deux-là, `request_bytes` (l. 1101) et `Some(system_prompt_len as i64)` sont en portée lexicale ;
+   - continuation (`save_continuation_llm_call`) : build l. 696, emit l. 704 — les deux valeurs sont déjà des paramètres de la fonction (l. 685).
+
+   Les six sites sont énumérables d'un seul grep, qui est aussi la vérification que le câblage est complet :
+   `grep -n "emit_turn_usage\|build_turn_usage_fields" crates/mika-agent/src/agent_loop/mod.rs`
+   → trois paires hors bloc `#[cfg(test)]`. Aucune quatrième paire ne doit apparaître sans que ce plan soit relu.
 
 Le commentaire de `TurnUsageFields` mentionne la condition dure Prime #1 (aucun champ `phase`/`is_planning`/`role`). **Les deux champs ajoutés sont des dimensions RAW**, pas une classification : ils la respectent. Le noter au site.
 
@@ -283,7 +291,7 @@ grep turn_usage $MIKA_SPIRIT_LOG_FILE | jq 'select(.status == "error") | {sessio
 
 Ouvrir, **si et seulement si** la branche 2 de §3.5 se vérifie : *« Borner en octets le bloc de skills injecté dans le tour callback »*. Contenu pressenti, pour que le ticket naisse groomé :
 
-- `callback_safe_skills()` (`skills/mod.rs:963`) est le seul sélecteur silencieux qui résout les dépendances transitives et garde exec/http ;
+- `callback_safe_skills()` (`skills/mod.rs:964`) est le seul sélecteur silencieux qui résout les dépendances transitives et garde exec/http ;
 - la borne s'**ajoute** à la sélection, elle ne la remplace pas (brique 1+2 de mika#2295, `agent_loop/mod.rs:3510-3534`) ;
 - `per_skill_bytes` de `emit_system_prompt_assembled` est **déjà** la brique 0 équivalente et n'a pas à être réécrit ;
 - prise d'effet sur agent déjà provisionné : toute clé nouvelle d'`identity.toml` doit entrer dans `CODE_OWNED_IDENTITY_SECTIONS` (`well_known_agents.rs:477`), sans quoi `write_default_if_missing` ne réécrit rien et *« les sondes post-déploiement liraient comme un correctif qui n'a pas marché plutôt que comme un interrupteur qu'on n'a jamais actionné »* ;
