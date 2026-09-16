@@ -123,18 +123,26 @@ lecteur de #2337 de ré-appliquer un no-op.
    `NOT (json_valid(metadata) AND COALESCE(json_extract(metadata, ?4), 0) = 1)`.
    Étendre l'exclusion à la nouvelle clé, et **consommer le marqueur** au moment
    où il est honoré (D5).
-4. **Remise en service** — après déploiement, la première ré-inscription doit
-   réussir sans attendre l'expiration des 24 h.
+4. **Remise en service — non couverte par le code de ce volet.** La ligne
+   `failed` de `fb425f89` est morte *avant* que le marquage existe : son
+   `metadata` ne porte pas la nouvelle clé, donc `COALESCE(json_extract(...), 0)`
+   rend `0` et elle reste un `dead_sibling` pour la garde. V2 rend réparable par
+   redémarrage **toute mort future** ; il ne débloque pas rétroactivement celle
+   qui a causé #2337. Le geste de remise en service est un geste opérateur —
+   voir § Fire-Disposition, « La violation préexistante ».
 
 ### V3 — La sonde, générique (répond au test négatif obligatoire)
 
-1. **Garde de classe** : extraire tous les littéraux `{"trigger":"X"}` des sites
-   d'enregistrement (`server/mod.rs`, `task_engine/mod.rs::FEEDER_CONFIG`) et
-   asserter que chaque `X` a un bras `"X" =>` dans `dispatch_run_skill`. Un
-   trigger enregistré sans bras échoue le test en nommant le trigger. Ceci
-   **subsume** `mika2334_le_scan_est_route_dans_le_dispatcher` (F2) pour la
-   moitié « routage » ; garder l'assertion sur l'appel effectif au scan, qu'une
-   garde générique ne peut pas voir.
+1. **Garde de classe** : asserter que chaque trigger **enregistré** a un bras
+   `"X" =>` dans `dispatch_run_skill`, en nommant le trigger fautif. Le prédicat
+   s'ancre sur **l'appelant** — l'argument `action_config` des appels à
+   `task_engine::ensure_recurring_task`, seul enregistreur de récurrences
+   `run_skill` (il pose `action_type::RUN_SKILL`) — et **non** sur la forme
+   textuelle `{"trigger":"X"}`, qui a trois faux membres dans l'arbre (voir
+   § Fire-Disposition, V3.1). Ceci **subsume**
+   `mika2334_le_scan_est_route_dans_le_dispatcher` (F2) pour la moitié
+   « routage » ; garder l'assertion sur l'appel effectif au scan, qu'une garde
+   générique ne peut pas voir.
 2. **Sonde de tir** (demande explicite du ticket) : faire tirer la récurrence
    `qa_review_reconcile` par le moteur et asserter que la tâche **ne finit pas
    `failed` sur le motif du catch-all**. Elle s'arrête à la **résolution** :
@@ -151,6 +159,117 @@ deux littéraux étaient cohérents dans le source, et le test F2 était vert
 pendant toute la panne. La sonde qui manque pour cette classe-là appartient au
 suivi ci-dessous.
 
+## Fire-Disposition
+
+Ce plan porte trois livrables de classe détecteur (V3.1 garde de classe, V3.2
+sonde de tir, V3.3 tests jumeaux du veto), **et** il crée une exception à un
+détecteur préexistant : la garde zombie mika#1742, dont le chemin de succès est
+« aucune récurrence zombie ne se ré-arme ». Les quatre sont traités ci-dessous.
+La disposition est écrite sur une population **comptée dans l'arbre à
+`9f28342b`**, pas supposée — et la mesure a contredit le plan sur deux points,
+reportés en V3.1 et dans « La violation préexistante ».
+
+### V3.1 — garde de classe : zéro violation, et un prédicat qu'il faut borner
+
+**Population.** Six appels à `task_engine::ensure_recurring_task`, tous dans
+`server/mod.rs` (`:1583` heartbeat, `:1595` reflection, `:1618`
+auto_pull_groomed, `:1640` wip_rescue, `:1674` qa_review_reconcile, `:1693`
+curator_review). Les six ont un bras dans `dispatch_run_skill`
+(`dispatcher.rs:441-447`). **Violations existantes : zéro.**
+
+**Disposition : (a) allowlist nommée, avec une liste vide.** La garde est
+bloquante dès le land, sans exemption ni période de grâce, parce qu'il n'y a
+rien à exempter. **Aucune exemption n'est écrite** : exempter d'un scan ce qui
+le passe déjà crée une dispense morte que plus rien ne nettoie — la dette même
+que le sous-point (3) de l'option (a) cherche à éviter.
+
+**Ce que la mesure corrige dans V3.** Le prédicat textuel que V3.1 proposait
+d'abord — extraire les littéraux `{"trigger":"X"}` — a **trois faux membres**
+dans l'arbre, et l'un d'eux ferait fire la garde au land :
+
+| Site | Littéral | Statut |
+|---|---|---|
+| `engine.rs:4467` | `{"trigger":"callback"}` | **Firerait à tort.** Helper `#[cfg(test)] make_callback_task`, `action_type = "resume_agent"` : ce n'est pas un `run_skill`, il n'a donc légitimement aucun bras. |
+| `task_engine/mod.rs:182` | `FEEDER_CONFIG` | Constante sous `#[cfg(test)] mod tests` — le plan la citait comme site d'enregistrement de production. Elle passe par coïncidence (`auto_pull_groomed` a un bras). |
+| `research/mechanism_analyzer.rs:789` | fixture de journal JSON | Passe par coïncidence (`heartbeat` a un bras). |
+
+Deux des trois passent **par chance**, ce qui est le pire cas : une garde qui
+tient sur une coïncidence est verte jusqu'au jour où elle accuse un site
+innocent. D'où l'ancrage sur l'appelant plutôt que sur la forme — le prédicat
+désigne alors exactement la population qu'il prétend garder.
+
+**Si le scan fire malgré tout : (c) halt-and-surface.** Si le poseur découvre en
+écrivant la garde un septième enregistrement hors des six sites recensés, ou un
+trigger enregistré sans bras, il **s'arrête et remonte à l'opérateur** au lieu
+d'ajouter une exemption ou de câbler le bras lui-même : un trigger enregistré
+sans destinataire est précisément l'incident de ce ticket, et sa résolution est
+une décision de périmètre, pas un geste de poseur.
+
+### V3.2 / V3.3 — sondes de comportement : le gate est N/A, et c'est dit
+
+Ni la sonde de tir (V3.2) ni les tests jumeaux du veto (V3.3) ne s'exécutent sur
+des données préexistantes : chacun fabrique ses lignes dans une base en mémoire.
+Il n'existe donc **aucune population à exempter** et le gate ne les concerne pas
+— énoncé ici plutôt que tu, pour qu'un lecteur ne prenne pas le silence pour un
+oubli (arbre de décision du gate, branche 3).
+
+### La levée du veto — (a) exception nommée, mono-use, auto-nettoyante
+
+V2 crée une exception à mika#1742. Elle est écrite sous l'option **(a) named
+allowlist exception**, dont les trois sous-points sont honorés ainsi :
+
+1. **La donnée qui déclenche l'exception est nommée** — non par une valeur
+   codée en dur (« le label `qa_review_reconcile` »), qui serait une dispense
+   permanente accordée à un nom, mais par un **marqueur posé au moment de la
+   mort**, sous une clé metadata dédiée, miroir de
+   `RECURRING_CONFIG_CANCEL_REVERTED_PATH` (mika#2271). Seule une mort dont la
+   cause est `DispatchError::UnknownTrigger` — la variante, jamais un substring
+   (D4) — porte le marqueur. Toute autre cause de mort reste sous veto (D3).
+2. **Le suivi est référencé** — l'exception ne couvre pas la racine, qui est le
+   décalage entre code mergé et code en exécution ; elle est explicitement
+   adossée au suivi § Hors périmètre, premier item. Le veto levé est un faux
+   positif *de la garde*, pas un défaut absous.
+3. **L'exception se nettoie elle-même, et c'est un test qui le prouve.** Le
+   marqueur est **consommé** au moment où il est honoré : la requête
+   `dead_sibling` étend son exclusion existante
+   `NOT (json_valid(metadata) AND COALESCE(json_extract(metadata, ?) , 0) = 1)`
+   à la nouvelle clé, et la ligne est ré-écrite sans le marqueur lors de la
+   ré-inscription. Une **seconde** mort marquée sur le même label dans la
+   fenêtre de 24 h retrouve donc un veto armé (D5) — assertion portée par le
+   troisième test jumeau de V3.3, qui est l'assertion self-cleaning au sens du
+   gate : elle rougit le jour où la levée cesserait d'être à usage unique,
+   c'est-à-dire le jour où l'exception deviendrait la dispense permanente que
+   mika#1742 existe pour empêcher.
+
+**Ce que l'exception ne couvre délibérément pas.** Une boucle réelle — un
+binaire qui ré-enregistre en continu un trigger qu'il ne sait pas router —
+consomme sa levée au premier tour et se retrouve sous veto au second. La levée
+achète **un** redémarrage, pas une immunité.
+
+### La violation préexistante : la ligne `failed` qui a causé #2337 — (c) halt-and-surface
+
+C'est ici que le gate mord, et la réponse n'est pas celle que V2 supposait. La
+tâche `fb425f89` est morte le 2026-09-16 **avant** que le code de marquage
+existe ; son `metadata` ne porte pas la nouvelle clé, `COALESCE(json_extract(…),
+0)` rend `0`, et elle reste un `dead_sibling` au sens de `db.rs:6163`. **Déployer
+V2 ne lève pas le veto né de cette mort-là.**
+
+**Disposition : (c) halt-and-surface.** Aucune correction rétroactive n'est
+écrite — ni migration marquant la ligne, ni exemption sur le label. Raisons :
+l'effet à corriger **s'évapore de lui-même** à l'expiration de la fenêtre de
+24 h, et une structure permanente pour une ligne unique et périssable est une
+dette qui survivrait à son objet ; une exemption sur le label, elle, absoudrait
+aussi les morts *futures* de ce label quelle qu'en soit la cause, ce qui est
+exactement le contraire de D3.
+
+Le geste est donc opérateur et borné à deux issues, au choix : attendre
+l'expiration de la fenêtre puis redémarrer, ou marquer/supprimer la ligne
+`failed` à la main avant de redémarrer. La sonde post-déploiement « Remise en
+service » ci-dessous est ce qui rend l'état lisible — un
+`mika#1742: refusing to re-register` sur `qa_review_reconcile` après déploiement
+n'est **pas** une régression de V2 : c'est cette violation préexistante, et le
+distinguer d'un échec de V2 est précisément ce que cette section permet.
+
 ## Verification contract
 
 ```bash
@@ -163,10 +282,15 @@ cargo test -p mika-agent --test eval mika2337    # sondes V3
 
 **Sondes post-déploiement.**
 
-- **Remise en service** — au premier démarrage après déploiement, la récurrence
-  doit se ré-enregistrer *sans* attendre la fenêtre de 24 h :
-  `grep 'registered recurring task' $MIKA_SPIRIT_LOG_FILE | grep qa_review_reconcile`,
-  et **absence** de `mika#1742: refusing to re-register` pour ce label.
+- **Remise en service** —
+  `grep 'registered recurring task' $MIKA_SPIRIT_LOG_FILE | grep qa_review_reconcile`.
+  **Lire le résultat avec la § Fire-Disposition en main** : un
+  `mika#1742: refusing to re-register` sur ce label au premier démarrage n'est
+  pas un échec de V2 mais la violation préexistante (la mort de `fb425f89` ne
+  porte pas le marqueur), et il appelle le geste opérateur qui y est décrit —
+  attendre l'expiration de la fenêtre, ou nettoyer la ligne à la main. La
+  propriété que V2 doit tenir se vérifie sur la **mort suivante**, pas sur
+  celle-ci ; son test hermétique est AC4.
 - **Effectivité de #2334** — au tick suivant :
   `grep qa_review_reconcile_tick $MIKA_SPIRIT_LOG_FILE`. Zéro action produit
   zéro ligne (doctrine mika#2131) ; le signal d'un scan qui *tourne* est
@@ -192,7 +316,9 @@ cargo test -p mika-agent --test eval mika2337    # sondes V3
   échoue en nommant le trigger fautif.
 - La sonde de tir de `qa_review_reconcile` existe et n'exige aucun réseau.
 - `cargo fmt`, `clippy -D warnings` et la suite `mika-agent` passent.
-- Le corps de PR porte la rectification V1 avec ses preuves.
+- Le corps de PR porte la rectification V1 avec ses preuves, **et** le geste de
+  remise en service de #2334 (§ Fire-Disposition, « La violation préexistante »)
+  — sans quoi le hotfix land vert en laissant #2334 inert.
 
 ## Acceptance criteria
 
@@ -208,15 +334,21 @@ faits F1–F6.
 - **AC3** — Une tâche récurrente dont le trigger est inconnu produit une erreur
   d'une **variante dédiée**, un WARN portant un nom d'événement propre, et une
   ligne `audit_events` — et non plus un `task dispatch failed` générique.
-- **AC4** — Après une telle mort, un redémarrage ré-enregistre la récurrence
-  **sans attendre** `RECURRING_ZOMBIE_GRACE_HOURS`. Test à l'appui.
+- **AC4** — Après une telle mort **survenue sous le binaire porteur du marquage**,
+  un redémarrage ré-enregistre la récurrence **sans attendre**
+  `RECURRING_ZOMBIE_GRACE_HOURS`. Test à l'appui. La restriction n'affaiblit pas
+  le critère, elle le rend vrai : une mort antérieure au marquage ne porte pas le
+  marqueur et reste sous veto (§ Fire-Disposition, « La violation préexistante »).
 - **AC5** — Une mort de récurrence **pour toute autre cause** arme toujours le
   veto mika#1742. Test à l'appui.
 - **AC6** — Une **seconde** mort par trigger inconnu sur le même label dans la
   fenêtre arme le veto (la levée est à usage unique). Test à l'appui.
 - **AC7** — Un test échoue, en nommant le trigger, si un trigger est enregistré
-  aux sites d'enregistrement sans bras correspondant dans `dispatch_run_skill` —
-  pour **tout** trigger, pas seulement `qa_review_reconcile`.
+  sans bras correspondant dans `dispatch_run_skill` — pour **tout** trigger, pas
+  seulement `qa_review_reconcile`. Sa population est celle des appels à
+  `ensure_recurring_task` ; il est **vert au land** et ne fire sur aucun des
+  trois littéraux `{"trigger":…}` qui ne sont pas des enregistrements
+  (§ Fire-Disposition, V3.1).
 - **AC8** — Un test exerce le tir de la récurrence `qa_review_reconcile` et
   asserte qu'elle ne finit pas `failed` sur le motif du catch-all, sans réseau.
 - **AC9** — La portée des sondes est écrite : elles ferment la divergence
@@ -235,4 +367,26 @@ faits F1–F6.
   construction, ne peut pas fournir.
 - **La fenêtre de 24 h elle-même** (`RECURRING_ZOMBIE_GRACE_HOURS`) et
   l'absence de surface opérateur listant les récurrences actuellement sous veto.
-  Réels, plus larges que ce hotfix, et sans effet sur #2334 une fois V2 livré.
+  Réels et plus larges que ce hotfix. La § Fire-Disposition renforce ce suivi
+  plutôt qu'elle ne l'épuise : c'est faute d'une telle surface que la remise en
+  service de #2334 reste un geste manuel (« halt-and-surface ») au lieu d'être
+  constatable en une commande.
+
+## Revision history
+
+- rev 2 (2026-09-16) : addressed F1 (BLOCKING) en ajoutant la section
+  `## Fire-Disposition`, écrite sur une population **comptée** dans l'arbre à
+  `9f28342b` plutôt que supposée. Elle nomme l'option (a) pour la levée du veto
+  (marqueur mono-use issu de la variante `UnknownTrigger`, consommé à l'usage,
+  assertion auto-nettoyante portée par le troisième test jumeau de V3.3), comme
+  le demandait le (b) du finding. Le comptage a en outre contredit le plan sur
+  deux points, corrigés dans le corps : (i) le prédicat de la garde V3.1 est
+  ancré sur les appels à `ensure_recurring_task` et non sur la forme textuelle
+  `{"trigger":"X"}`, qui a trois faux membres dont un ferait fire la garde au
+  land (`engine.rs:4467`, helper de test `action_type = resume_agent`) — le plan
+  citait à tort `task_engine/mod.rs::FEEDER_CONFIG`, constante sous `#[cfg(test)]`,
+  comme site d'enregistrement ; (ii) V2.4 annonçait une remise en service que le
+  code ne produit pas — la ligne `failed` de `fb425f89` est morte avant le
+  marquage, reste `dead_sibling`, et sa levée est un geste opérateur
+  (halt-and-surface). AC4 et AC7 précisés en conséquence, sonde post-déploiement
+  « Remise en service » rectifiée, DoD étendu au geste de remise en service.
