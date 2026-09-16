@@ -21,6 +21,12 @@
 //! by copying the brief's first line; three quotes spread across a multi-kilobyte document are
 //! not a by-product of an acknowledgement.
 //!
+//! "Verbatim" means the brief's *words*, not its bytes (mika#2338). Briefs are markdown and a
+//! model quotes what it read, not the markup around it; the comparison therefore runs on a
+//! canonical form of both sides — see [`normalize_for_anchor_match`] for exactly what folds
+//! and why each fold is grounded in a measured case. What never folds: the words themselves.
+//! A paraphrase, or an exact quote of a different document, is refused as before.
+//!
 //! The matcher is deliberately regex-free. mika#864 established the precedent for this family
 //! ("regex is a footgun — silent failure to fire when pattern is malformed"), and a guard that
 //! silently stops firing is the defect class being closed here, not an acceptable cost.
@@ -87,14 +93,41 @@ impl AnchorVerdict {
     }
 }
 
-/// Collapse every run of whitespace into a single space and trim the ends.
+/// Normalize a span of text to the form the quote comparison runs on.
 ///
-/// Applied to both the brief and each anchor line before comparison. A reviewer quoting a plan
-/// re-flows the text they lift — the line break that sat mid-sentence in a 10 KB brief does not
-/// survive into a one-line citation. Without this, a genuine quote fails on the reviewer's line
-/// wrapping, which is a false rejection of exactly the response the guard must let through.
-fn normalize_whitespace(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+/// Applied to both the brief and each anchor line before comparison, so it is a symmetric
+/// canonical form, never a one-way concession. The contract is "quotes the brief's *words*
+/// verbatim", not its bytes, and three things separate the two in practice:
+///
+/// - **Whitespace.** A reviewer quoting a plan re-flows the text they lift — the line break
+///   that sat mid-sentence in a 10 KB brief does not survive into a one-line citation.
+/// - **Inline markdown markers** (`*` for emphasis, `` ` `` for code spans). Briefs are
+///   markdown written by a planning agent — 237 of the 245 briefs mika-arch received between
+///   2026-09-01 and 2026-09-16 carry `**`, 243 carry backticks — and a model reading one the
+///   way a human does quotes the *rendered* text. mika#2338 measured the cost: an anchor that
+///   quoted the brief word for word was refused because `**Le mécanisme de kill, lui, est
+///   correct** : \`kill_process_gracefully\`` had become `Le mécanisme de kill, lui, est
+///   correct : kill_process_gracefully`, and no 40-character window survived the two markers.
+///   Underscores are deliberately left alone: the repo's identifiers are full of them, and no
+///   measured case put them in question.
+/// - **Apostrophe shape.** `’` and `‘` fold onto `'`. Rare (2 of 199 responses in the same
+///   window) but one character wide, and a false rejection costs a whole grooming run.
+///
+/// Markers are stripped *before* whitespace collapses, so `** :` does not leave a double space
+/// behind, and the quote-length threshold is measured on the result — markup cannot buy length.
+///
+/// Without this, a genuine quote fails on the reviewer's rendering, which is a false rejection
+/// of exactly the response the guard must let through.
+fn normalize_for_anchor_match(text: &str) -> String {
+    let unmarked: String = text
+        .chars()
+        .filter(|c| !matches!(c, '*' | '`'))
+        .map(|c| match c {
+            '\u{2019}' | '\u{2018}' => '\'',
+            other => other,
+        })
+        .collect();
+    unmarked.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The message body, up to (exclusive of) the disposition-line landmark.
@@ -203,7 +236,7 @@ pub(crate) fn verify_review_anchors(
     min_count: usize,
     min_quote_chars: usize,
 ) -> AnchorVerdict {
-    let normalized_brief = normalize_whitespace(brief);
+    let normalized_brief = normalize_for_anchor_match(brief);
 
     // Keep the anchor's *content*, not its label. The declared prefix (`A1:`) is the marker
     // that identifies the line, never part of the quote — counting it toward
@@ -244,7 +277,7 @@ pub(crate) fn verify_review_anchors(
     let mut seen_lines: Vec<String> = Vec::new();
 
     for line in &anchor_lines {
-        let normalized_line = normalize_whitespace(line);
+        let normalized_line = normalize_for_anchor_match(line);
         // A repeated anchor line is one read of the brief, however many times it is pasted.
         // Region disjointness alone does not catch this: a single line longer than
         // `2 * min_quote_chars` yields non-overlapping windows, so copying one long sentence
@@ -592,6 +625,166 @@ mod tests {
             AnchorVerdict::Satisfied,
             "an early echo of the disposition must not hide the body from the guard"
         );
+    }
+
+    /// The measured brief excerpt of mika#2338 (message 87416, the mika#2335 grooming brief):
+    /// three regions, each carrying inline markdown — bold and code spans — as every brief
+    /// written by a planning agent does (237 of 245 briefs since 2026-09-01 carry `**`, 243
+    /// carry backticks).
+    const BRIEF_2338_MARKDOWN: &str = "\
+**Le mécanisme de kill, lui, est correct** : `kill_process_gracefully` (`process_kill.rs:82`)\n\
+signale bien le groupe (`kill -TERM -<pid>`, l.53-58), possible parce que le spawn fait du\n\
+fils un chef de groupe (`.process_group(0)`, `executor.rs:3201`).\n\
+\n\
+**Le chaînon manquant existe déjà et est testé.** `find_dispatch_children_with_pid(parent_task_id)`\n\
+(`db.rs:7843-7910`, wrapper `async_db.rs:1023`) fait exactement la traversée parent → enfant-avec-pgid.\n\
+\n\
+- **AC1** — Une supersession qui annule un parent portant un dispatch **vivant** signale le\n\
+  process du fils (par groupe) et le marque terminal.\n";
+
+    /// The measured architect response of mika#2338 (`llm_calls` 8abf1b1b, session 975d44d0,
+    /// 2026-09-16T07:32:11Z): the model quoted the *rendered* text — bold markers and code
+    /// spans dropped — so A1 had no 40-character window in the brief while A2 and A3 did.
+    /// The engine logged `anchors_found=3 anchors_valid=2 miss_reason=QuoteNotInBrief`.
+    const RESPONSE_2338_REAL: &str = "\
+A1: \"Le mécanisme de kill, lui, est correct : kill_process_gracefully (process_kill.rs:82)\n\
+signale bien le groupe (kill -TERM -<pid>, l.53-58)\" — le plan ne réécrit pas ce qui marche.\n\
+\n\
+A2: \"Le chaînon manquant existe déjà et est testé. find_dispatch_children_with_pid(parent_task_id)\n\
+(db.rs:7843-7910, wrapper async_db.rs:1023) fait exactement la traversée\" — réutilisation directe.\n\
+\n\
+A3: \"AC1 — Une supersession qui annule un parent portant un dispatch vivant signale le\n\
+process du fils (par groupe) et le marque terminal.\" — critère testable.\n\
+\n\
+Disposition: READY\n";
+
+    fn verify_2338(text: &str) -> AnchorVerdict {
+        verify_review_anchors(
+            text,
+            BRIEF_2338_MARKDOWN,
+            &prefixes(),
+            &suffix_lines(),
+            3,
+            40,
+        )
+    }
+
+    /// The founding case of mika#2338, verbatim: a genuine review of the brief, refused on
+    /// markup alone. Must pass — the contract is the words of the brief, not its bytes.
+    #[test]
+    fn mika2338_rendered_quote_of_a_markdown_brief_is_satisfied() {
+        assert_eq!(
+            verify_2338(RESPONSE_2338_REAL),
+            AnchorVerdict::Satisfied,
+            "the mika#2335 architect quoted the brief word for word; only `**` and backticks \
+             differed"
+        );
+    }
+
+    /// Symmetry: a brief written plain and an anchor that *adds* markup must match too, so the
+    /// normalization is not a one-way concession.
+    #[test]
+    fn mika2338_markup_in_the_anchor_against_a_plain_brief_is_satisfied() {
+        let text = "A1: le plan propose bien de **re-résoudre le token avant chaque cycle du manager** — correct.\n\
+                    A2: sur `l'exhaustivité du tracé : faut-il journaliser chaque rafraîchissement ?` — oui.\n\
+                    A3: « Je n'ai pas fixé N pour le seuil de détection des échecs » — je propose 30 minutes.\n\
+                    \n\
+                    Disposition: READY\n";
+        assert_eq!(verify(text), AnchorVerdict::Satisfied);
+    }
+
+    /// Typographic apostrophes (2 of 199 architect responses since 2026-09-01) fold onto the
+    /// ASCII one, in both directions.
+    #[test]
+    fn mika2338_apostrophe_variants_fold_together() {
+        let curly_anchor = "A1: sur « l\u{2019}exhaustivité du tracé : faut-il journaliser chaque rafraîchissement ? » — oui.\n\
+                            A2: le plan propose bien de « re-résoudre le token avant chaque cycle du manager » — correct.\n\
+                            A3: « Je n\u{2019}ai pas fixé N pour le seuil de détection des échecs » — 30 minutes.\n\
+                            \n\
+                            Disposition: READY\n";
+        assert_eq!(verify(curly_anchor), AnchorVerdict::Satisfied);
+
+        let curly_brief = brief().replace('\'', "\u{2019}");
+        let ascii_anchor = "A1: sur « l'exhaustivité du tracé : faut-il journaliser chaque rafraîchissement ? » — oui.\n\
+                            A2: le plan propose bien de « re-résoudre le token avant chaque cycle du manager » — correct.\n\
+                            A3: « Je n'ai pas fixé N pour le seuil de détection des échecs » — 30 minutes.\n\
+                            \n\
+                            Disposition: READY\n";
+        assert_eq!(
+            verify_review_anchors(
+                ascii_anchor,
+                &curly_brief,
+                &prefixes(),
+                &suffix_lines(),
+                3,
+                40
+            ),
+            AnchorVerdict::Satisfied
+        );
+    }
+
+    /// Markup cannot buy length: the quote threshold is measured after normalization, so a
+    /// 44-character anchor whose markers account for 6 of them is a 38-character quote.
+    #[test]
+    fn mika2338_markup_does_not_count_toward_the_quote_length() {
+        // 38 real characters of the brief, dressed up to 44 with `**` and backticks.
+        let span: String = "Je n'ai pas fixé N pour le seuil de dét"
+            .chars()
+            .take(38)
+            .collect();
+        assert_eq!(span.chars().count(), 38);
+        let dressed = format!("**{span}**``");
+        assert_eq!(dressed.chars().count(), 44);
+        let text = format!("A1: {dressed}\n\nDisposition: READY\n");
+        let verdict = verify_review_anchors(&text, &brief(), &prefixes(), &suffix_lines(), 1, 40);
+        assert!(
+            !verdict.is_satisfied(),
+            "38 real characters must not pass n=40 because of 6 markup characters, got {verdict:?}"
+        );
+    }
+
+    /// Normalization is not a paraphrase licence: the same brief, the same words changed.
+    #[test]
+    fn mika2338_paraphrase_of_a_markdown_brief_is_still_rejected() {
+        let text = "A1: \"Le mécanisme de kill est correct : kill_process_gracefully signale le groupe\" — ok.\n\
+                    A2: \"Le chaînon manquant existe déjà et est testé. find_dispatch_children_with_pid(parent_task_id)\" — ok.\n\
+                    A3: \"AC1 — Une supersession qui annule un parent portant un dispatch vivant signale le\" — ok.\n\
+                    \n\
+                    Disposition: READY\n";
+        match verify_2338(text) {
+            AnchorVerdict::Missing {
+                anchors_found,
+                anchors_valid,
+                reason,
+            } => {
+                assert_eq!((anchors_found, anchors_valid), (3, 2));
+                assert_eq!(reason, AnchorMissReason::QuoteNotInBrief);
+            }
+            other => panic!("expected not-in-brief rejection, got {other:?}"),
+        }
+    }
+
+    /// The other measured class of mika#2338 (session 09b565bb): three exact quotes of a
+    /// *different* ticket's brief, read from the agent-wide history window. Normalization
+    /// must not let a wrong-brief attestation through — that refusal was the guard working.
+    #[test]
+    fn mika2338_exact_quotes_of_another_brief_are_still_rejected() {
+        let text = "A1: \"La résolution retenue est l'option 2 : reconstruction explicite, parce que `load_for_agent` a déjà fusionné les sources\"\n\
+                    A2: \"**Geste d'opérateur requis, et non automatisable :** si M2 se confirme, une variable `MIKA_LLM_HTTP_TIMEOUT_SECS`\"\n\
+                    A3: \"**Ce que la garde ne fait pas :** elle ne corrige aucune valeur et n'en invente aucune. Un couple invalide\"\n\
+                    \n\
+                    Verdict: GROOMED\n";
+        match verify_2338(text) {
+            AnchorVerdict::Missing {
+                anchors_found,
+                anchors_valid,
+                reason,
+            } => {
+                assert_eq!((anchors_found, anchors_valid), (3, 0));
+                assert_eq!(reason, AnchorMissReason::QuoteNotInBrief);
+            }
+            other => panic!("expected not-in-brief rejection, got {other:?}"),
+        }
     }
 
     #[test]
