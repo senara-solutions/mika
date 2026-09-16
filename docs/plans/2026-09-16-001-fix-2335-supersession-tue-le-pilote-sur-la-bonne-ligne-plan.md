@@ -252,11 +252,95 @@ annuler un pilote vivant est parfois exactement ce qu'on veut.
 - `cargo build` + `cargo clippy --all-targets -- -D warnings` + suite verte. Sortie
   rouge-avant/vert-après collée au corps de PR (porte #2264).
 
+## Fire-Disposition
+
+Ce plan introduit des livrables de **classe détecteur** au sens de mika#1574
+(`docs/solutions/best-practices/fire-disposition-doctrine.md`) : leur chemin de succès est
+« aucune violation trouvée », donc leur première exécution peut firer sur du code **préexistant**
+que ce plan n'a pas écrit. Cette section dit ce que l'implémenteur fait dans ce cas, pour que la
+décision ne soit pas prise au fil de l'eau.
+
+**D1 — garde de source F2a (« aucun `update_manual_task_status(…, "in_progress")` de production
+hors `mark_parent_dispatched` ») → option (a) à zéro exception pour l'inventaire, option (c) pour
+tout site hors inventaire.**
+
+Ce détecteur fire **par construction** au démarrage de l'implémentation : les trois sites du
+recensement (`skills/executor.rs:3067`, `server/ready_label_handler.rs:637`,
+`server/verdict_handler.rs:866`) sont exactement les violations qu'il nomme. Leur migration vers
+`mark_parent_dispatched` est dans le périmètre de F2a : **le scan passe au vert parce que les trois
+sites ont bougé, pas parce qu'on les a exemptés.** L'allowlist de l'option (a) existe donc, et elle
+est vide — à dessein.
+
+- **Pourquoi pas une exception nommée pour les trois sites, qui est pourtant le défaut de la
+  doctrine.** Une entrée d'allowlist ici serait un chemin de dispatch qui continue de transitionner
+  un parent **sans poser `fired_at`** — c'est-à-dire précisément le défaut que le ticket décrit, et
+  précisément ce qu'AC4 interdit (« par chacun des trois chemins de dispatch de production »). Une
+  exemption des trois sites rendrait le détecteur vert en laissant le cas fondateur cassé : la forme
+  exacte du défaut que mika#2263 a déjà produite une fois sur ce même code. L'option (a) est le
+  défaut de la doctrine parce que le cas usuel est un détecteur dont les violations préexistantes
+  sont **hors** du périmètre du ticket ; ici elles **sont** le périmètre.
+- **Pourquoi pas l'option (b), atterrir désarmé.** Un scan `#[ignore]` ne garde rien pendant que le
+  quatrième chemin de dispatch arrive — et l'existence même des deux sites secondaires établit que
+  ce chemin arrive par recopie, pas par oubli théorique. Un détecteur désarmé sur cette classe
+  reconduit l'état d'avant le ticket en donnant l'apparence d'une garde.
+- **Ordre d'implémentation, contraint :** migrer les trois sites **avant** (ou dans le même commit
+  que) l'atterrissage du scan. Dans l'autre ordre le rouge est réel mais transitoire à l'intérieur
+  de la PR ; il ne doit jamais atteindre `main`, et un implémenteur qui commence par la garde lira
+  un rouge qu'il pourrait prendre pour une erreur de la garde elle-même.
+- **Le cas qui appelle une décision est le quatrième site** : un
+  `update_manual_task_status(…, "in_progress")` littéral que le recensement n'a pas vu et que le
+  scan découvre. Disposition : **halt-and-surface** (option (c)). Pas d'allowlist, pas de
+  `#[ignore]` — parce que la réponse dépend d'une question que ce plan ne peut pas pré-trancher :
+  ce site dispatche-t-il un parent (→ il migre vers `mark_parent_dispatched`, et il était un
+  quatrième visage du défaut) ou non (→ il est légitime, et c'est la garde qu'il faut affiner) ?
+  Deviner l'une ou l'autre en silence, c'est soit poser un `fired_at` sur une ligne qui n'a pas été
+  dispatchée, soit exempter un chemin de dispatch muet.
+- **Portée de la garde, nommée plutôt que découverte plus tard :** le scan est **lexical sur le
+  littéral** `"in_progress"`. Deux appelants de production passent le statut par variable et lui
+  échappent structurellement — `rewind.rs:484` (`before_status`, restaure un statut antérieur) et
+  `tools/update_task_status.rs:243` (l'outil agent, `status`). C'est le bon comportement : aucun des
+  deux n'est un dispatch et aucun ne doit stamper. Mais la garde ne couvre donc que les sites qui
+  écrivent le littéral, et un futur chemin de dispatch qui construirait son statut dans une variable
+  passerait dessous. Le coût est accepté ici (un scan sémantique demanderait une analyse de flot que
+  la famille `mika2205_*` / `mika2131_*` n'a pas), à condition d'être écrit **au site de la garde**
+  et pas seulement dans ce plan.
+
+**D2 — tests négatifs d'invariant (F1 supersession, F2a `fired_at`) → aucune disposition requise,
+et pourquoi.**
+
+Ces tests sèment leurs propres fixtures et ne balaient aucune donnée préexistante : il n'existe pas
+de population sur laquelle ils puissent firer en dehors du cas qu'ils construisent. Leur seul
+« rouge sur l'existant » est le rouge-avant exigé par la porte #2264 — c'est le contrat, pas un
+accident à disposer.
+
+**D3 — les deux fixtures mika#2263 deviennent rouges quand F1 atterrit → corrigées dans la même PR
+(option (a), exception vide, même forme que D1).**
+
+C'est le seul détecteur **préexistant** que ce plan fait firer.
+`tests/eval/test_supersede_kills_live_pilot.rs` sème une chimère dont la seule raison d'être verte
+est la conjonction SQL que F1 supprime ; `test_dispatch_fired_at_stamped.rs` appelle
+`set_task_process_id` sur une ligne parent, appel que la production ne fait pas et que F2a ne rend
+pas davantage réel. Les deux sont réécrites sur la topologie de production — ni `#[ignore]`, ni
+suppression, ni adaptation au nouveau code.
+
+La distinction avec « adapter le test au code » n'est pas une question d'intention, elle est
+vérifiable et doit l'être : **les deux fixtures corrigées doivent être rouges sur le code d'avant**
+(contrôle rouge-avant de la porte #2264, sortie collée au corps de PR). Une fixture corrigée qui
+serait verte des deux côtés n'attesterait rien de plus que celle qu'elle remplace.
+
+**D4 — ce que la suppression de `find_live_dispatch_rows_by_reference_url_and_variants` casse en
+plus : rien.** Recensement exhaustif (3 occurrences) : la définition `db.rs:6964`, le wrapper
+`async_db.rs:767`, l'unique appelant `tracking_cleanup.rs:188`. Aucun test ne l'exerce
+directement, donc aucune exemption à poser — les trois partent ensemble, wrapper compris.
+
 ## Definition of Done
 
 - F1, F2a (aux trois sites + garde de source), F2b, F2c implémentés ;
   `find_live_dispatch_rows_by_reference_url_and_variants` supprimée.
 - Tests ci-dessus verts, fixtures mika#2263 corrigées, clippy propre.
+- Fire-Disposition honorée : allowlist du scan de source **vide** (les trois sites ont migré, aucun
+  n'est exempté), note de portée lexicale écrite au site de la garde, et sortie rouge-avant des deux
+  fixtures corrigées collée au corps de PR (D1, D3).
 - Corps de PR : inventaire des lecteurs de `fired_at` sur lignes parents, et sortie
   rouge-avant/vert-après.
 - PR human-gated (zone décision-core), non auto-mergée.
@@ -288,3 +372,23 @@ annuler un pilote vivant est parfois exactement ce qu'on veut.
 
 Décision-core (`tracking_cleanup.rs`, `db.rs`, `task_engine/`, `skills/executor.rs`) → PR
 human-gated (samidarko/Vincent).
+
+## Revision history
+
+- rev 2 (2026-09-16) : adressé **F1** par l'ajout de la section `## Fire-Disposition`, qui couvre
+  les quatre livrables pouvant firer sur de l'existant. La suggestion de la note de revue — option
+  (a) énumérant les trois sites de production comme exceptions nommées — est **refusée sur le
+  fond** : exempter ces trois sites, c'est exempter exactement les trois chemins qui laissent
+  `fired_at` NULL, donc contredire AC4 et rendre le détecteur vert sur le cas fondateur cassé. La
+  forme retenue est l'option (a) **à allowlist vide** (les trois sites migrent, aucun n'est exempté)
+  plus l'option (c), halt-and-surface, pour tout quatrième site hors inventaire — dont la nature
+  (chemin de dispatch ou non) est une question que ce plan ne peut pas pré-trancher. L'option (b)
+  est écartée en une phrase : un scan désarmé ne garde rien contre le quatrième chemin, dont
+  l'existence des deux sites secondaires établit qu'il arrive par recopie. S'y ajoutent trois points
+  que la rédaction de la section a fait apparaître et qui ne figuraient nulle part : l'ordre
+  d'implémentation contraint (migrer avant d'armer la garde), la **portée lexicale** de la garde —
+  `rewind.rs:484` et `tools/update_task_status.rs:243` passent le statut par variable et lui
+  échappent structurellement, ce qui est correct mais doit être écrit au site de la garde — et le
+  contrôle qui distingue « corriger une fixture qui attestait une fiction » de « adapter le test au
+  code » : les deux fixtures mika#2263 corrigées doivent être **rouges sur le code d'avant**.
+  DoD complétée en conséquence.
