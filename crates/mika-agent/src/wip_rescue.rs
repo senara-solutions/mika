@@ -334,16 +334,14 @@ const PIPELINE_VERIFIED_KEY: &str = "rescue-pipeline-verified";
 /// `-->` — counting it would let one sentence swallow the real marker behind it
 /// and turn a verified PR unverified.
 fn pipeline_verified(body: &str) -> bool {
-    let mut values: Vec<String> = Vec::new();
-    let mut rest = body;
+    let mut saw_marker = false;
+    let mut every_marker_says_yes = true;
 
-    while let Some(idx) = rest.find(PIPELINE_VERIFIED_KEY) {
-        let after = &rest[idx + PIPELINE_VERIFIED_KEY.len()..];
-        // Advance before any `continue`, so a malformed occurrence cannot pin
-        // the scan on itself — and so the marker a prose mention ran past is
-        // still reached on the next turn of the loop.
-        rest = after;
-
+    // `match_indices` enumerates every occurrence left to right, so a prose
+    // mention that this loop skips does not hide the well-formed marker behind
+    // it.
+    for (idx, _) in body.match_indices(PIPELINE_VERIFIED_KEY) {
+        let after = &body[idx + PIPELINE_VERIFIED_KEY.len()..];
         let Some(tail) = after.trim_start().strip_prefix(':') else {
             continue;
         };
@@ -354,10 +352,11 @@ fn pipeline_verified(body: &str) -> bool {
         if value.contains('<') {
             continue;
         }
-        values.push(value.to_ascii_lowercase());
+        saw_marker = true;
+        every_marker_says_yes &= value.eq_ignore_ascii_case("yes");
     }
 
-    !values.is_empty() && values.iter().all(|v| v == "yes")
+    saw_marker && every_marker_says_yes
 }
 
 /// What to do with a draft once it is classified and its marker is read (AC2).
@@ -567,6 +566,11 @@ enum ChainOutcome {
     /// still terminal — the durable marker saw to that — but the operator who
     /// goes looking for the draft on GitHub will not find the label, so the
     /// difference has to be visible.
+    ///
+    /// Note this field's `parked` is **not** [`ChainOutcome::ParkedUnverified`]:
+    /// here it means *the bail's label landed on GitHub*, there it names the
+    /// mika#2286 state. Two senses of one word, kept because the first predates
+    /// the second and the second is pinned by the marker name operators query.
     Bailed { reason: String, parked: bool },
     /// DECISION-CORE draft whose pipeline-verification marker does not read
     /// `yes` — left a draft, commented, and excluded until the `yes` re-arms it
@@ -872,6 +876,15 @@ async fn resume_chain(
     // "set the marker above to `yes`" — can land inside that window. A failed
     // read is not verified: the next tick re-reads the listing and re-arms on
     // its own if the body does say `yes`.
+    //
+    // The read is unconditional even though `undraft_decision` ignores it on
+    // the MECHANICAL route. Skipping it there would cost one `gh` call per
+    // 5-minute tick and buy a *second* reader of the decision table — the
+    // "only DECISION-CORE consults the marker" row, restated at the call site,
+    // which would keep un-drafting on its own the day that row changes. This
+    // repo has a compound entry for that failure class
+    // (`two-predicates-for-one-concept-livelock-2026-09-03.md`); one subprocess
+    // per tick is the cheaper side of the trade.
     let verified = fresh_pipeline_verified(pr.number, token, trace_id).await;
 
     if undraft_decision(route, verified) == UndraftDecision::ParkUnverified {
