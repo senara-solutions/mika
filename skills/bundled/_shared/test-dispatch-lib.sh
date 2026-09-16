@@ -781,7 +781,7 @@ RESULT=""
 GROOM_LOOP_FAILURE_REASON="architect ESCALATE (first-pass)"
 WORKTREE_DIR="$ESC_TMP_ECHO" _escalate_groom "first-pass" "F1: (BLOCKING) The [mika-engine] re-prompt was addressed but the plan contradicts ADR-008.
 Disposition: ESCALATE" "session-esc-echo" 2>/dev/null
-if printf '%s' "$RESULT" | grep -q "Engine reason:"; then
+if grep -q "Engine reason:" <<<"$RESULT"; then
     assert_eq "_escalate_groom ignores an echo of [mika-engine] in architect prose" "no engine reason" "engine reason present"
 else
     assert_eq "_escalate_groom ignores an echo of [mika-engine] in architect prose" "no engine reason" "no engine reason"
