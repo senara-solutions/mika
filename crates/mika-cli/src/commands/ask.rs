@@ -74,6 +74,18 @@ fn wrap_send_error(err: &anyhow::Error, spirit_endpoint: &str) -> anyhow::Error 
     anyhow::anyhow!("mika ask to {spirit_endpoint} failed: {err:#}")
 }
 
+/// The stderr notice for background work this invocation started (#265).
+///
+/// Extracted because mika#2270 gave it a second emission site: a turn whose reply
+/// was lost still started its background tasks, and the operator needs that fact
+/// on the failure path as much as on the success one.
+fn pending_callbacks_notice(count: usize) -> String {
+    format!(
+        "\n[mika] {count} background task(s) started. \
+         Open TUI (`mika`) or start server to receive results."
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     message: &str,
@@ -375,18 +387,6 @@ pub async fn run(
         tracing::warn!(error = %e, "failed to end session");
     }
 
-    // Extract the assistant text from the returned Task (artifacts → agent-role
-    // history → status message), reusing remote_ask's renderer. Empty output maps
-    // to `None` to preserve the text-mode fallback and JSON `content: null`.
-    let content: Option<String> = {
-        let rendered = mika_cli::remote_ask::render_task_parts(&task);
-        if rendered.is_empty() {
-            None
-        } else {
-            Some(rendered)
-        }
-    };
-
     // Check for pending callback tasks spawned during the agent loop (#265).
     // In `mika ask` there is no TaskEngine to poll for callbacks — the user needs
     // TUI or server to receive results from long-running background tasks.
@@ -399,6 +399,26 @@ pub async fn run(
         Err(e) => {
             tracing::warn!(error = %e, "failed to check pending callbacks");
             vec![]
+        }
+    };
+
+    // Extract the assistant text from the returned Task (mika#2270). A Task the
+    // renderer cannot read is a LOST turn, not an agent with nothing to say: the
+    // engine produced its answer, paid for it, and the return channel dropped it.
+    // So this fails naming what it inspected instead of mapping to `None`, which
+    // is what let eleven consecutive calls exit 0 with `.content` absent while the
+    // verdict sat in the server log.
+    //
+    // The pending-callback notice is emitted before returning: background work was
+    // genuinely started, and the failure of the reply channel must not also cost
+    // the operator that fact.
+    let content = match mika_cli::remote_ask::render_task_parts(&task) {
+        Ok(text) => text,
+        Err(empty) => {
+            if !pending_callbacks.is_empty() {
+                eprintln!("{}", pending_callbacks_notice(pending_callbacks.len()));
+            }
+            return Err(anyhow::Error::new(empty));
         }
     };
 
@@ -451,16 +471,9 @@ pub async fn run(
 
     match format {
         OutputFormat::Text => {
-            match content {
-                Some(text) => println!("{text}"),
-                None => eprintln!("{}", mika_agent::agent::EMPTY_RESPONSE_FALLBACK),
-            }
+            println!("{content}");
             if !pending_callbacks.is_empty() {
-                eprintln!(
-                    "\n[mika] {} background task(s) started. \
-                     Open TUI (`mika`) or start server to receive results.",
-                    pending_callbacks.len()
-                );
+                eprintln!("{}", pending_callbacks_notice(pending_callbacks.len()));
             }
             // Text-mode trailer: one key: value per populated field.
             // Blank line separates response body from metadata trailer.
@@ -503,7 +516,11 @@ pub async fn run(
         OutputFormat::Json => {
             let response = AskJsonResponse {
                 role: "assistant",
-                content,
+                // `Option` is kept on the envelope for the team path and for
+                // consumers that already tolerate a null; on this path it is now
+                // always `Some` — mika#2270 turned an absent `.content` from a
+                // possible answer into an error.
+                content: Some(content),
                 task_id: task_id.map(|s| s.to_string()),
                 pending_tasks: pending_callbacks,
                 metadata,
@@ -513,7 +530,7 @@ pub async fn run(
         OutputFormat::Yaml => {
             let response = AskJsonResponse {
                 role: "assistant",
-                content,
+                content: Some(content),
                 task_id: task_id.map(|s| s.to_string()),
                 pending_tasks: pending_callbacks,
                 metadata,

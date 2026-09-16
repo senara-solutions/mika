@@ -743,6 +743,92 @@ retry loops written by hand in caller shells stop firing.
 have seen one refused mid-session. This is an *operational* prerequisite of N>1,
 not a delivery one — mika#2160 ships its default of 1 without it.
 
+### No Completed Turn Is Lost In Silence (mika#2270)
+
+**The failure.** Eleven consecutive `mika ask` calls came back empty on
+2026-09-09 — `.content` absent, **exit 0** — while the engine had produced the
+full answer and written it to the log (trace `d5887aa7`, 43 108 input tokens,
+28 s, `stop_reason=EndTurn`). mika#2266's architect verdict had to be harvested by
+hand out of a 19 GB log file for the grooming to finish. The shape is what makes
+it a loop-breaker rather than a slowdown: well-formed JSON, code zero, a key
+simply missing — **nothing distinguished "the agent had nothing to say" from "the
+answer was lost"**. A probe that lies without failing.
+
+**M1 — `message/send` held the answer and threw it away; `message/stream` never
+did.** `run_a2a_agent` returns `Result<Option<String>, String>`: the turn's text,
+in memory. The stream port serves it directly. The send port filtered it out with
+`Ok(_)` and then **rebuilt a Task from the database** via `a2a_build_task`. Same
+loop, two ports, one of which kept the reply in hand. That is the literal shape of
+"LLM cost paid and discarded".
+
+**M2 — the renderer's "three tiers" were never three sources**, and its own doc
+comment claimed defence in depth for months. `a2a_insert_artifact` has no
+production caller, so tier 1 is dead on the spirit path; and `a2a_build_task`
+derives `status.message` from the last agent-role message of `history`, which is
+`a2a_get_messages`' result — so tiers 2 and 3 fail **together**, on one query.
+Chasing the cause in the renderer, which is what the ticket's main lead proposed,
+could not have converged: the renderer was the victim.
+
+**What ships.** (a) `message/send` keeps the loop's text and guarantees that a
+terminal Task it serves carries at least one non-empty slice —
+`ensure_send_task_carries_text`, whose decision half `decide_content_net` is a
+pure function with three outcomes (`Nominal` / `MuteTurn` / `Rescued`). (b) The
+renderer returns `Result` instead of `String`, so an unreadable Task **fails
+naming what was inspected** (artifact and history counts with their roles,
+`status.message` presence, plus `task_id` and `context_id` — the two handles that
+find the turn in `$MIKA_SPIRIT_LOG_FILE`). The signature change, not a parallel
+function, is what makes the compiler force both call sites.
+
+**The two halves share one predicate, and that is load-bearing.**
+`mika_a2a::render::render_task_text` is the single definition of "does this Task
+carry text", used by the server's net and by the CLI's renderer. A server-side
+approximation could call a Task fine while the client found nothing readable —
+the exact gap the net exists to close. It also means the fourth line of the
+decision table is not a detail: a turn that produced **no** text is served with
+the same literal `message/stream` serves (`COMPLETED_WITHOUT_TEXT`), which
+**removes the whole "completed but empty" class from this port** and is what lets
+the CLI treat every empty Task as a loss with no false positive.
+
+**The net does not hide the defect.** A silent repair would turn the loop green
+and make the fault permanently invisible — i.e. build the next occurrence. So the
+rescue path emits `a2a_send_task_content_lost` carrying only the facts that settle
+the cause: `task_id`, `context_id`, `session_id`, the `trace_id` handed to the
+loop (equal to `task_id` today, reported rather than assumed), and the two counts
+from `Database::a2a_message_census` — rows for this session, rows for this trace —
+which separate "nothing was persisted" from "persisted under another trace id"
+without an operator opening the database.
+
+**SOLE WRITER:** `a2a_send_task_content_lost`, in the log and in `audit_events`.
+Its **absence** under a symptom is therefore information: it says the loss is not
+here. Pinned by `server::a2a::tests::the_loss_signal_has_exactly_one_writer_in_this_module`,
+a lexical guard — a second writer would make no decision wrong, only
+unattributable, which no behavioural test can see.
+
+**What this does NOT explain: why `a2a_get_messages` returns empty.** M3 reduces
+it to one predicate on one column written by one path (the agent loop's
+`trace_id`), but deciding between "nothing persisted" and "persisted under another
+trace id" needs the production database. Follow-up ticket **conditioned on the
+first occurrence** of the WARN, which carries exactly the two counts that
+depart it. Opening it before that line exists would be instructing without a
+measurement.
+
+**Operator surfaces.** Grep `a2a_send_task_content_lost` in
+`$MIKA_SPIRIT_LOG_FILE` — **empty in nominal operation**; continuous firing means
+the net is masking a persistence failure that deserves its own fix, so treat the
+cause, not the threshold. SQL:
+`SELECT COUNT(*) FROM audit_events WHERE tool_name = 'a2a_send_task_content_lost';`
+Two adjacent names, deliberately distinct: `a2a_send_task_census_unreadable`
+(ERROR — the counts could not be read, the loss is still reported) and
+`a2a_send_task_content_lost_audit_failed` (the WARN landed, the audit row did
+not).
+
+**Halt conditions.** The symptom returns and the WARN stays silent → the loss is
+not where this fix places it: do **not** widen the net or add a tier to the
+renderer, reopen the investigation on the client or transport side with the POST
+trace. A nominal reply whose bytes change → the net is biting where it must not;
+halt before deploying, since a return-channel fix that alters healthy answers is
+worse than the silence it replaces.
+
 ### Introspection Tools
 
 5 read-only tools: `query_timeline`, `get_session_messages`, `list_audit_events`, `search_tool_history` (30-day retention, 500-char field truncation, 10KB output cap), `query_knowledge_graph`. Non-orchestrator agents scoped to their own agent_id/sessions.

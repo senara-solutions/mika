@@ -19,6 +19,7 @@ use anyhow::{Context, Result};
 pub use mika_a2a::CALLER_SESSION_ID_KEY;
 use mika_a2a::client::{A2aClient, RECOVERY_TIMEOUT};
 use mika_a2a::error::TransportFailure;
+pub use mika_a2a::render::{EmptyKind, TaskRenderEmpty};
 use mika_a2a::{A2aError, Message, MessageSendParams, Part, Role, Task, TaskState};
 use uuid::Uuid;
 
@@ -31,60 +32,34 @@ pub enum OutputFormat {
     Json,
 }
 
-/// Render an A2A `Task`'s text content to a flat string using the same three-tier
-/// extraction strategy as the in-process `a2a_call` builtin tool
-/// (`crates/mika-agent/src/tools/a2a_call.rs`): artifacts → agent-role history →
-/// status-message fallback. The A2A spec carries completed-task output in
-/// artifacts, so reading only `status.message` would silently render empty for
-/// spec-conformant remote agents.
+/// Render an A2A `Task`'s text content, or report that there is none to render.
 ///
-/// Non-text parts surface as placeholder strings (`[file: <name>]`, `[data]`);
-/// multi-text parts are joined with blank-line separators to preserve paragraph
-/// boundaries from the remote agent.
-pub fn render_task_parts(task: &Task) -> String {
-    let mut parts_text: Vec<String> = Vec::new();
-
-    // Tier 1: artifacts
-    if let Some(artifacts) = &task.artifacts {
-        for artifact in artifacts {
-            for part in &artifact.parts {
-                push_rendered_part(part, &mut parts_text);
-            }
-        }
-    }
-
-    // Tier 2: agent-role messages in history
-    if let Some(history) = &task.history {
-        for msg in history {
-            if msg.role == Role::Agent {
-                for part in &msg.parts {
-                    push_rendered_part(part, &mut parts_text);
-                }
-            }
-        }
-    }
-
-    // Tier 3: status.message fallback (only if tiers 1+2 produced nothing)
-    if parts_text.is_empty()
-        && let Some(msg) = task.status.message.as_ref()
-    {
-        for part in &msg.parts {
-            push_rendered_part(part, &mut parts_text);
-        }
-    }
-
-    parts_text.join("\n\n")
-}
-
-fn push_rendered_part(part: &Part, out: &mut Vec<String>) {
-    match part {
-        Part::Text { text, .. } => out.push(text.clone()),
-        Part::File { file, .. } => {
-            let name = file.name.as_deref().unwrap_or("unnamed");
-            out.push(format!("[file: {name}]"));
-        }
-        Part::Data { .. } => out.push("[data]".to_string()),
-    }
+/// Thin CLI-facing name for [`mika_a2a::render::render_task_text`]. The reading
+/// itself lives in the protocol crate because mika-spirit's `message/send` needs
+/// the *same* verdict this side reaches: the server's mika#2270 net fires exactly
+/// when this function would fail, so the two cannot drift into disagreeing.
+///
+/// # The three tiers are one query, not three sources (mika#2270)
+///
+/// The doc comment this replaces promised defence in depth — artifacts, then
+/// agent-role history, then `status.message`, "so reading only `status.message`
+/// would silently render empty". Against a lost turn that promise is empty, and
+/// believing it is what sent mika#2270's investigation at this function instead
+/// of upstream:
+///
+/// * `Database::a2a_insert_artifact` has no production caller, so a Task built by
+///   mika-spirit never carries artifacts (tier 1 survives only for `--remote`,
+///   where a spec-conformant server may populate it);
+/// * `a2a_build_task` derives `status.message` from the last agent-role message
+///   of `history`, and `history` is `a2a_get_messages`' result — so tiers 2 and 3
+///   fail **together**, on one query.
+///
+/// A renderer cannot rescue what the Task does not carry. What it can do is
+/// refuse to answer an empty string, which is why this returns a `Result`: an
+/// empty rendering used to be indistinguishable from an agent with nothing to
+/// say, at exit 0. See [`mika_a2a::render`] for the full reasoning.
+pub fn render_task_parts(task: &Task) -> Result<String, TaskRenderEmpty> {
+    mika_a2a::render::render_task_text(task)
 }
 
 /// Build a `MessageSendParams` containing the user's single text prompt.
@@ -371,8 +346,15 @@ pub async fn run_remote(
     Ok(())
 }
 
+/// Format a `Task` for stdout, or fail naming what was inspected (mika#2270).
+///
+/// The failure is propagated bare, with no `with_context` on top: the outer CLI
+/// printer shows only the top layer of the chain (mika#1985), so wrapping it
+/// would hide the slice census that is the whole point of failing here. Both
+/// formats share this one gate, which is why `--format json` cannot emit
+/// `"content": ""` while `--format text` errors, or the reverse.
 fn render(task: &Task, format: OutputFormat, verbose: bool) -> Result<String> {
-    let rendered = render_task_parts(task);
+    let rendered = render_task_parts(task)?;
     Ok(match format {
         OutputFormat::Text => {
             if verbose {
@@ -433,7 +415,7 @@ mod tests {
     #[test]
     fn render_text_part_emits_text_verbatim() {
         let task = task_with_text("hello world");
-        assert_eq!(render_task_parts(&task), "hello world");
+        assert_eq!(render_task_parts(&task).unwrap(), "hello world");
     }
 
     #[test]
@@ -450,7 +432,7 @@ mod tests {
             metadata: None,
             extensions: None,
         }]);
-        assert_eq!(render_task_parts(&task), "artifact-text");
+        assert_eq!(render_task_parts(&task).unwrap(), "artifact-text");
     }
 
     #[test]
@@ -470,7 +452,7 @@ mod tests {
             extensions: None,
             kind: "message".to_string(),
         }]);
-        assert_eq!(render_task_parts(&task), "history-text");
+        assert_eq!(render_task_parts(&task).unwrap(), "history-text");
     }
 
     #[test]
@@ -491,14 +473,99 @@ mod tests {
             kind: "message".to_string(),
         }]);
         // User-role history is skipped; falls through to status.message
-        assert_eq!(render_task_parts(&task), "status-fallback-text");
+        assert_eq!(render_task_parts(&task).unwrap(), "status-fallback-text");
     }
 
+    // --- mika#2270 (gate #2264): no completed turn renders to the empty string --
+
+    /// **AC4, negative 1 — content living only in `role: User`.**
+    ///
+    /// This is the shape the ticket describes: a `completed` Task whose content
+    /// sits in a slice the renderer does not read. Before mika#2270 it rendered
+    /// `""` and `mika ask` exited 0 with `.content` absent — a probe that lies
+    /// without failing.
     #[test]
-    fn render_empty_message_emits_empty_string() {
+    fn content_only_in_user_role_history_fails_the_render() {
         let mut task = task_with_text("ignored");
         task.status.message = None;
-        assert_eq!(render_task_parts(&task), "");
+        task.history = Some(vec![Message {
+            message_id: "history-msg-1".to_string(),
+            role: Role::User,
+            parts: vec![Part::Text {
+                text: "Disposition: READY".to_string(),
+                metadata: None,
+            }],
+            context_id: None,
+            task_id: None,
+            metadata: None,
+            reference_task_ids: None,
+            extensions: None,
+            kind: "message".to_string(),
+        }]);
+
+        let empty = render_task_parts(&task).expect_err("a completed turn must not render empty");
+        assert_eq!(empty.kind, EmptyKind::SlicesUnreadable);
+        assert_eq!(empty.history, 1);
+        assert_eq!(empty.agent_history, 0);
+    }
+
+    /// **AC4, negative 2 — an artifact whose `parts` are empty.**
+    #[test]
+    fn an_artifact_with_no_parts_fails_the_render() {
+        let mut task = task_with_text("ignored");
+        task.status.message = None;
+        task.artifacts = Some(vec![mika_a2a::Artifact {
+            artifact_id: "art-1".to_string(),
+            name: None,
+            description: None,
+            parts: vec![],
+            metadata: None,
+            extensions: None,
+        }]);
+
+        let empty = render_task_parts(&task).expect_err("a completed turn must not render empty");
+        assert_eq!(empty.kind, EmptyKind::SlicesUnreadable);
+        assert_eq!(empty.artifacts, 1);
+        assert_eq!(empty.artifact_parts, 0);
+    }
+
+    /// **AC4, negative 3 — an agent message carrying no part at all.**
+    ///
+    /// Distinct from negative 2 on purpose: the slice the mika-spirit path
+    /// actually populates is `status.message`, so a renderer fixed only for
+    /// artifacts would still be blind here.
+    #[test]
+    fn an_agent_message_with_no_textual_part_fails_the_render() {
+        let mut task = task_with_text("ignored");
+        task.status.message.as_mut().unwrap().parts = vec![];
+
+        let empty = render_task_parts(&task).expect_err("a completed turn must not render empty");
+        assert_eq!(empty.kind, EmptyKind::SlicesUnreadable);
+        assert!(empty.status_message);
+        assert_eq!(empty.status_message_parts, 0);
+    }
+
+    /// **AC5 — neither output format can answer an empty body at exit 0.**
+    ///
+    /// `render` is the single gate both formats pass through, so this asserts the
+    /// property for `--format json` and `--format text` at once, and would fail
+    /// the day one of them grew its own fallback.
+    #[test]
+    fn both_output_formats_fail_and_name_the_handles() {
+        let mut task = task_with_text("ignored");
+        task.status.message = None;
+        task.context_id = Some("ctx-2270".to_string());
+
+        for format in [OutputFormat::Json, OutputFormat::Text] {
+            for verbose in [false, true] {
+                let err = render(&task, format, verbose)
+                    .expect_err("an empty task must never render at exit 0");
+                let chain = format!("{err:#}");
+                assert!(chain.contains("task-test"), "no task id: {chain}");
+                assert!(chain.contains("ctx-2270"), "no context id: {chain}");
+                assert!(chain.contains("status.message"), "no slice census: {chain}");
+            }
+        }
     }
 
     #[test]
@@ -513,7 +580,7 @@ mod tests {
             },
             metadata: None,
         }];
-        assert_eq!(render_task_parts(&task), "[file: foo.txt]");
+        assert_eq!(render_task_parts(&task).unwrap(), "[file: foo.txt]");
     }
 
     #[test]
@@ -528,7 +595,7 @@ mod tests {
             },
             metadata: None,
         }];
-        assert_eq!(render_task_parts(&task), "[file: unnamed]");
+        assert_eq!(render_task_parts(&task).unwrap(), "[file: unnamed]");
     }
 
     #[test]
@@ -538,7 +605,7 @@ mod tests {
             data: serde_json::json!({"k": "v"}),
             metadata: None,
         }];
-        assert_eq!(render_task_parts(&task), "[data]");
+        assert_eq!(render_task_parts(&task).unwrap(), "[data]");
     }
 
     #[test]
@@ -561,7 +628,10 @@ mod tests {
         ];
         // Parts are joined with blank-line separators to preserve agent paragraph
         // boundaries; mirrors a2a_call's render contract.
-        assert_eq!(render_task_parts(&task), "see file:\n\n[file: a.txt]");
+        assert_eq!(
+            render_task_parts(&task).unwrap(),
+            "see file:\n\n[file: a.txt]"
+        );
     }
 
     #[tokio::test]

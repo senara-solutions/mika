@@ -2,6 +2,7 @@ pub mod client;
 pub mod error;
 pub mod jsonrpc;
 pub mod params;
+pub mod render;
 pub mod state_machine;
 pub mod streaming;
 pub mod types;
@@ -12,6 +13,7 @@ pub use params::{
     CALLER_SESSION_ID_KEY, MessageSendParams, SendMessageConfiguration, TaskIdParams,
     TaskQueryParams,
 };
+pub use render::{EmptyKind, TaskRenderEmpty, render_task_text};
 pub use state_machine::TaskStateMachine;
 pub use streaming::{
     StreamEvent, StreamEventSender, TaskArtifactUpdateEvent, TaskStatusUpdateEvent,

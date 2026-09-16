@@ -46,6 +46,20 @@ The envelope itself is omitted only when all its fields are absent — non-verbo
 
 Scoped flags: `--agent <name>` (override active agent, most subcommands), `--team <name>` (team mode, chat and ask, mutually exclusive with `--agent` and `--model`). `mika ask --team <name> "goal"` runs the full team cycle non-interactively (progress to stderr, deliverable to stdout); `--format json` extends the schema with `team_run` metadata. `--run-id <uuid>` (requires `--team`) references a previous run's workspace as read-only context; `--last-run` (requires `--team`, conflicts with `--run-id`) resolves to the most recent finished team run automatically.
 
+**A lost reply is an error, not an empty answer (mika#2270).** On both paths — the
+local mika-spirit thin-client path and `--remote` — a `Task` the renderer cannot
+read makes `mika ask` exit **non-zero** with a message naming what was inspected
+(artifact count, history count and roles, `status.message` presence) plus `task_id`
+and `context_id`, the two handles that find the turn in `$MIKA_SPIRIT_LOG_FILE`.
+It used to render the empty string and exit 0 with `.content` absent, which is how
+eleven consecutive calls dropped a completed architect verdict in silence. The rule
+holds identically for `text`, `json` and `yaml`: they share one gate,
+`remote_ask::render`. Consumers of `--format json` should note that `content` can
+no longer be `null` on this path — a missing answer is now a failure, not a field.
+The background-task notice (`[mika] N background task(s) started.`) is still
+emitted on that failure path: the work was genuinely started and the reply
+channel's failure must not also cost the operator that fact.
+
 **Remote mode (R1 ascension architecture, 2026-06-09):** `--remote <URL>` or `MIKA_REMOTE_AGENT_URL` env (flag wins) puts `mika ask` in remote mode — the in-process agent loop is bypassed and the prompt is dispatched to a cloud Mika agent via the gateway's A2A proxy (e.g., `https://gw.example.com/a2a/{customer_id}/{agent}`). Auth uses `MIKA_INTERNAL_TOKEN` as a bearer header (existing gateway internal-token contract). The remote `Task` response is rendered to stdout: text parts emitted verbatim, file parts as `[file: <name>]`, data parts as `[data]`. Errors surface single-line prefixes by `A2aError` variant — `remote error:` (JSON-RPC error) and, for a transport failure, a sentence naming both what failed and what became of the work (mika#2036). The transport half distinguishes unreachable / timed out (naming the budget spent) / HTTP status / unreadable / interrupted; the second half reports whether the answer was reclaimed, is still being generated ("Retry"), was never started, or could not be looked up — and names the `context_id` to query with `tasks/get`. **A generated answer is no longer lost:** when the exchange fails after the request landed, `mika ask` re-reads the task by the `context_id` it minted before sending, and returns the response the server already produced. Conflicts with `--team`. JSON mode adds `metadata.remote_task_id` under `--verbose`; text mode appends a `remote_task_id: <id>` trailer under `--verbose`. Remote mode does not write to the local `~/.mika/data/mika.db` — session state lives on the cloud agent. Implementation: `src/remote_ask.rs` (lib-exposed for integration tests), wired in `src/main.rs` Ask branch.
 
 ## TUI Features
