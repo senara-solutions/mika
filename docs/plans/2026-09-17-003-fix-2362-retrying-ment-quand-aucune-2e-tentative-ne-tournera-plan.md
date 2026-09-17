@@ -53,20 +53,55 @@ va immédiatement refuser. Vérification :
 `grep -n "outcome = match" crates/mika-common/src/llm/openai.rs` puis lecture des
 deux blocs ; aucune variable de deadline n'entre dans le premier.
 
-### E2 — La divergence est écrite six fois : deux prédicats × trois rails
+### E2 — La divergence est écrite neuf fois : trois décisions × trois rails
 
-| Rail | Calcul de `outcome` | Garde de deadline |
-|---|---|---|
-| `llm/openai.rs` | 470-476 | 382-431 |
-| `llm/ollama.rs` | 671-677 | 610-641 |
-| `claude.rs` | 701-707 | 627-661 |
+La même question — *une tentative suivante va-t-elle tourner ?* — est reposée
+**trois** fois par rail, pas deux. Le troisième site est le post-boucle qui
+choisit le message d'erreur final entre « retry chain aborted: deadline budget
+insufficient » et « max retries exceeded » :
 
-Les trois copies sont identiques à la nomenclature près (`claude.rs` lit
-`MAX_RETRIES` et ses littéraux au lieu du budget — l'incohérence nommée hors
-périmètre par mika#2189). **Corriger un seul rail reproduirait exactement la
-classe que mika#2158 a dû fermer une fois** : un prédicat recopié est un prédicat
-qui peut diverger, et la copie d'`auto_pull` portait sa propre confession en
-commentaire pendant des mois sans que rien ne casse.
+| Rail | Garde de deadline | Calcul de `outcome` | Message d'erreur post-boucle | Calculs de seuil |
+|---|---|---|---|---|
+| `llm/openai.rs` | 395-433 | 470-476 | 529-548 | **2** (404-406, 532-535) |
+| `llm/ollama.rs` | 611-643 | 671-677 | 725-737 | **1** (hoisté, 595-597) |
+| `claude.rs` | 627-661 | 701-707 | 805-840 | **2** (637-639, 811-813) |
+
+Soit **neuf décisions** et **cinq calculs du seuil**. `ollama` hoiste ses deux
+seuils hors de la boucle et les relit ; `openai` et `claude` les recalculent à
+l'identique à deux endroits chacun.
+
+Le troisième site mérite d'être nommé séparément pour deux raisons. D'abord il
+**porte déjà la divergence sous une autre forme** : son commentaire
+(`openai.rs:525-528`) explique qu'il duplique le seuil de la garde précisément
+« *so the two branches agree* » — l'accord est obtenu par recopie, donc il n'est
+pas garanti, c'est la définition de la classe qu'on ferme. Ensuite il mesure la
+deadline à un **instant différent** (après la boucle, non avant la tentative
+refusée), donc son verdict peut légitimement différer de celui de la garde ; le
+prédicat partagé prend `remaining` en paramètre, ce qui préserve cette différence
+au lieu de l'aplatir.
+
+Les copies sont identiques à la nomenclature près (`claude.rs` lit `MAX_RETRIES`
+et ses littéraux au lieu du budget — l'incohérence nommée hors périmètre par
+mika#2189). **Corriger un seul rail reproduirait exactement la classe que
+mika#2158 a dû fermer une fois** : un prédicat recopié est un prédicat qui peut
+diverger, et la copie d'`auto_pull` portait sa propre confession en commentaire
+pendant des mois sans que rien ne casse.
+
+**Deux confessions de ce genre sont déjà dans ce code**, et elles sont l'argument
+le plus court en faveur de D1 :
+
+- `openai.rs:525-528` — la duplication du seuil dans le post-boucle est justifiée
+  « *so the two branches agree on which errors classify as aborted by deadline* ».
+- `claude.rs:627-632` — « *See `crates/mika-common/src/llm/openai.rs` for the
+  source of truth; keeping both paths symmetric ensures a single discipline shift
+  lands identically* ».
+
+Les deux nomment un rail « source de vérité » qu'aucun mécanisme ne contraint.
+C'est exactement la forme que portait la copie d'`auto_pull`, et le résultat est
+déjà mesuré ici : mika#2331 §3.3 (cité en commentaire `ollama.rs:590-594`) a dû
+constater que le seuil transport de mika#1744 « *n'avait jamais été porté sur ce
+rail* » — la symétrie promise par le commentaire de `claude.rs` avait déjà
+échoué sur un troisième rail, en silence, pendant deux tickets.
 
 ### E3 — La ligne `deadline_abort` existe déjà ; c'est la ligne `retrying` qui est fausse
 
@@ -147,7 +182,7 @@ que le correctif doit produire, pas une précondition à son écriture.
 
 ## Décisions
 
-### D1 — Un seul prédicat, nommé, lu par les deux sites de chaque rail
+### D1 — Un seul prédicat, nommé, lu par les trois sites de chaque rail
 
 `crates/mika-common/src/llm/retry_gate.rs`, fonction pure :
 
@@ -201,7 +236,9 @@ raisons :
 1. **Le comportement de retry est exactement celui d'aujourd'hui**, donc le
    correctif ne peut ni allonger ni raccourcir une chaîne, ni déplacer un pire
    cas, ni désaccorder le filet de mika#2342.
-2. Fusionner les deux sites en une seule décision collapserait les deux lignes en
+2. Fusionner les deux sites **émetteurs de lignes** (la garde et le calcul
+   d'`outcome` ; le troisième site d'E2 n'émet rien, il choisit un message
+   d'erreur) en une seule décision collapserait les deux lignes en
    une — et la ligne `deadline_abort` porte `deadline_remaining_ms`, qui est
    l'information qui tranche L1 contre L2 (E6). On perdrait la mesure en
    corrigeant l'étiquette.
@@ -242,15 +279,24 @@ mesure ; la décision reste à Prime, avec ses données.
 
 `retry_gate::tests::mika2362_no_rail_recomputes_the_retry_threshold_inline` —
 scan de source sur `crates/mika-common/src/` refusant, hors de `retry_gate.rs`,
-toute occurrence de la forme `typical_call_duration_secs() + retry_buffer_secs()`
-ou `TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS`. **Allowlist vide** : les
-trois rails migrent, aucun n'est exempté ; un quatrième site est halt-and-surface.
+la **sélection** d'un seuil de deadline : toute occurrence de
+`typical_call_duration_secs() + retry_buffer_secs()` ou de
+`TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS`. **Allowlist vide** : les cinq
+calculs recensés en E2 migrent, aucun rail n'est exempté ; un sixième site est
+halt-and-surface.
+
+Le scan vise la **somme**, pas les accesseurs isolés : `budget.rs` les définit et
+ses propres tests les asseoient (`budget.rs:354-370`), donc interdire
+`typical_call_duration_secs()` seul rendrait le module de définition non
+conforme à sa propre garde. C'est la somme qui est le prédicat recopié — un
+accesseur lu seul ne décide rien.
 
 Un test comportemental ne peut pas attraper la régression : réintroduire un
-prédicat local ne rendrait aucune décision fausse, il rendrait les deux réponses
+prédicat local ne rendrait aucune décision fausse, il rendrait les trois réponses
 *libres de diverger à nouveau*, et toutes les assertions existantes resteraient
-vertes pendant la dérive. Même raisonnement que
-`grooming_marker::tests::no_grooming_regex_outside_this_module`.
+vertes pendant la dérive — ce qui est précisément ce qui s'est produit pour le
+seuil transport entre mika#1744 et mika#2331. Même raisonnement, et même forme de
+garde, que `grooming_marker::tests::no_grooming_regex_outside_this_module`.
 
 ---
 
@@ -268,28 +314,44 @@ correspondance verdict ↔ format de fil ait un seul site.
 
 ### V2 — `crates/mika-common/src/llm/openai.rs`
 
-- La garde (382-431) appelle `next_attempt_verdict` au lieu de recalculer le seuil.
+Les **trois** sites d'E2 migrent :
+
+- La garde (395-433) appelle `next_attempt_verdict` au lieu de recalculer le seuil.
   Sur `DeadlineInsufficient`, elle émet `deadline_abort` **inchangée** (mêmes
   champs, même `elapsed_ms = 0`) et `break`.
 - Le calcul d'`outcome` (470-476) appelle le même prédicat avec le `remaining`
   qu'il vient de mesurer (`deadline_remaining_ms`, déjà calculé ligne 468).
+- Le message d'erreur post-boucle (529-548) lit le verdict au lieu de recalculer
+  son propre seuil : `DeadlineInsufficient` ⇒ « deadline budget insufficient »,
+  tout autre verdict ⇒ « max retries exceeded ». Le commentaire actuel
+  (525-528) justifie la recopie par le besoin que « les deux branches
+  s'accordent » — l'accord devient structurel et le commentaire est remplacé par
+  le renvoi au prédicat.
 
 ### V3 — `crates/mika-common/src/llm/ollama.rs`
 
-Identique à V2. Les deux constantes hoistées (`transport_threshold_secs`,
-`default_threshold_secs`, lignes 595-597) deviennent les arguments du prédicat.
+Identique à V2, trois sites (611-643, 671-677, 725-737). Les deux constantes
+hoistées (`transport_threshold_secs`, `default_threshold_secs`, lignes 595-597)
+deviennent les arguments du prédicat, et restent hoistées — elles ne dépendent
+que du budget, donc les recalculer par itération serait une régression gratuite.
 
 ### V4 — `crates/mika-common/src/claude.rs`
 
-Identique, avec l'impl `RetryClass for ClaudeApiError` (déléguant à `is_retryable`
-et `is_transport_class`, déjà présents dans ce fichier). Les littéraux
+Identique, trois sites (627-661, 701-707, 805-840), avec l'impl
+`RetryClass for ClaudeApiError` déléguant à `is_retryable` (995) et
+`is_transport_class` (1014), déjà présents dans ce fichier. Les littéraux
 `TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS` et
 `TRANSPORT_RETRY_MIN_REMAINING_SECS` sont passés en arguments plutôt que lus
 inline — c'est ce qui rend la garde D5 applicable à ce rail sans le forcer dans le
 système de budget.
 
-Note : ce fichier porte un **second** calcul du même seuil ligne 811 (hors de la
-boucle). Il entre dans le périmètre de la garde D5 et migre aussi.
+Note : ce rail borne sa boucle sur `MAX_RETRIES = 3` (`claude.rs:13`, d'où
+`for attempt in 0..=MAX_RETRIES` ligne 625) et non sur le budget, donc
+`max_attempts` y vaut `ANTHROPIC_MAX_ATTEMPTS = 4` indépendamment de la géométrie.
+Le prédicat reçoit ce compte tel quel ; **D2 ne s'applique donc pas à ce rail**
+(son `max_attempts` ne dérive pas de `floor(E/P)`), ce qui est cohérent avec
+l'override de `worst_case_failure_secs` que mika#2342 a dû lui donner pour la
+même raison.
 
 ### V5 — `crates/mika-common/src/llm/budget.rs`
 
@@ -352,6 +414,21 @@ T1 et T2 rejoués sur `ollama` et `anthropic` via les fixtures existantes
 sur le seul rail mesuré laisserait deux copies libres de diverger, et l'absence de
 ligne sur un rail non instrumenté se lit comme « ce rail n'a pas retryé ».
 
+### T3b — Le message d'erreur final suit le même verdict (le troisième site d'E2)
+
+Sous la géométrie `P/2P` de T1, l'erreur rendue au terme de la chaîne doit porter
+« deadline budget insufficient » et non « max retries exceeded » — c'est le site
+post-boucle, celui dont le commentaire actuel justifie la recopie du seuil.
+Contrôle négatif dans le même test : sous `120/300` avec les deux tentatives
+consommées et une dernière erreur non-retryable, le message doit rester
+« max retries exceeded ». Sans les deux, un prédicat qui répondrait toujours
+`DeadlineInsufficient` passerait.
+
+Ce test a une valeur propre au-delà de la parité : ce message est ce que
+l'appelant voit, donc ce qui atterrit dans `turn_usage.status` et dans le
+`result` d'un groom échoué — la surface par laquelle l'incident fondateur a été
+lu (« *transient API error* »).
+
 ### T4 — `effective_max_attempts`, les cinq géométries d'E4
 
 Test unitaire dans `budget.rs` asserant la colonne de droite du tableau, plus
@@ -412,7 +489,7 @@ demanderait alors une autre explication (piste L2 d'E6).
 ## Definition of Done
 
 - `retry_gate.rs` existe, est la seule définition du prédicat « une tentative
-  suivante va-t-elle tourner ? », et les six sites des trois rails le lisent.
+  suivante va-t-elle tourner ? », et les neuf sites des trois rails le lisent.
 - Aucun rail ne recalcule un seuil de deadline inline ; la garde D5 passe avec une
   allowlist vide.
 - `outcome` sur une tentative qui a tourné ne vaut `retrying` que si la tentative
@@ -422,7 +499,10 @@ demanderait alors une autre explication (piste L2 d'E6).
 - `llm_budget_resolved` porte `effective_max_attempts` et `retry_reachable` ;
   `llm_budget_retry_unreachable` est émis quand les deux comptes divergent.
 - Aucune valeur de géométrie n'a bougé (ni défaut de flotte, ni per-agent).
-- T1–T7 verts ; `cargo clippy` et `cargo fmt` propres.
+- Le message d'erreur final de chaque rail (« deadline budget insufficient » vs
+  « max retries exceeded ») est décidé par le même verdict que la garde, non par
+  un seuil recalculé.
+- T1–T7, T3b incluse, verts ; `cargo clippy` et `cargo fmt` propres.
 - `CLAUDE.md` racine et `crates/mika-common/CLAUDE.md` à jour, glissement de
   vocabulaire daté, `scripts/sync-agent-docs.sh` si `docs/` est touché.
 
@@ -437,8 +517,9 @@ sont dérivés de sa section « Correctif attendu » et des volets ci-dessus.)*
   est T1, avec son contrôle positif sous `120/300` dans le même appel.
 - **AC2** — la valeur émise dans ce cas est `exhausted`, et `deadline_abort`
   conserve son invariant `elapsed_ms = 0` sur la tentative qui n'a pas eu lieu.
-- **AC3** — le prédicat est écrit une fois et lu par les six sites ; une
-  septième occurrence d'un calcul de seuil inline fait échouer la CI.
+- **AC3** — le prédicat est écrit une fois et lu par les neuf sites (garde,
+  `outcome`, message d'erreur post-boucle, sur chacun des trois rails) ; une
+  sixième occurrence d'un calcul de seuil inline fait échouer la CI.
 - **AC4** — la correction est observable sur les trois rails (T3), pas seulement
   sur celui où l'incident a été mesuré.
 - **AC5 (D2)** — `llm_budget_resolved` expose le nombre de tentatives réellement
@@ -481,7 +562,7 @@ corps des lignes DEBUG de capture de body.
 2. Sur les hangs coupés au plafond, la ligne `attempt = 0` doit désormais porter
    `exhausted` et non `retrying`. Une seule ligne `retrying` suivie d'un
    `deadline_abort` immédiat signifie que le prédicat partagé n'est pas lu par les
-   deux sites → **halte**, le correctif n'a pas pris.
+   deux sites émetteurs → **halte**, le correctif n'a pas pris.
 3. Le décompte `GROUP BY outcome` se déplace de `retrying` vers `exhausted` au
    déploiement. **C'est attendu et daté** ; une population `retrying` inchangée
    signifie soit qu'aucun hang n'est tombé dans la classe visée sur la fenêtre,
@@ -515,3 +596,16 @@ corps des lignes DEBUG de capture de body.
 ## Revision history
 
 - 2026-09-17 — rédaction initiale (dev-groom, content-only, revue architecte en aval).
+- 2026-09-17 — re-groom : **l'inventaire E2 était sous-compté**. Vérification des
+  ancrages contre le code : un **troisième** site par rail repose la même question
+  pour choisir le message d'erreur final (`openai.rs:529-548`,
+  `ollama.rs:725-737`, `claude.rs:805-840`), soit neuf décisions et cinq calculs
+  de seuil au lieu de six et trois. Conséquences propagées à D1, D5 (le scan vise
+  la somme, pas les accesseurs — sinon `budget.rs` violerait sa propre garde),
+  V2–V4, AC3, DoD, et nouveau test T3b. Deux confessions de recopie déjà
+  présentes dans le code (`openai.rs:525-528`, `claude.rs:627-632`) versées en
+  preuve à E2, avec leur échec déjà mesuré : le seuil transport de mika#1744
+  n'avait jamais été porté sur le rail ollama (constaté par mika#2331 §3.3).
+  Ajouté que **D2 ne s'applique pas au rail Anthropic** (son `max_attempts` est
+  `MAX_RETRIES + 1`, pas `floor(E/P)`). Arithmétique d'E4 et dimensionnement du
+  filet E5 revérifiés exacts (`hard_cap = 4`, filet = `worst_case + 60 s`).
