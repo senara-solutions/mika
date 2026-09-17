@@ -9,6 +9,7 @@ use serde_json::Value;
 use tracing::{Instrument, debug, info, info_span, warn};
 
 use super::error::LlmError;
+use super::retry_gate::{RetryThresholds, RetryVerdict, deadline_verdict, next_attempt_verdict};
 use super::types::*;
 use super::{LlmProvider, ProviderKind};
 
@@ -364,6 +365,12 @@ impl OpenAiCompatibleProvider {
             MAX_ATTEMPTS_HARD_CAP
         };
 
+        // mika#2362: the two deadline thresholds, derived once. The three sites
+        // below that ask "will a further attempt run?" — the guard, the outcome
+        // line, and the post-loop error message — now read one predicate over
+        // this one pair instead of three copies of the same arithmetic.
+        let thresholds = RetryThresholds::from_budget(&self.budget);
+
         // Emitted after `max_attempts` is known (mika#2342 D4): half the
         // ambiguity of the founding incident was that the chain's width was
         // invisible, so "one unbounded call" and "N bounded silent ones" read
@@ -400,12 +407,13 @@ impl OpenAiCompatibleProvider {
                     // mika#2189 D3: derived from the effective plafond, not
                     // from literals calibrated against a 120 s one. At the
                     // default plafond these reproduce 60 and 90+30 exactly.
-                    let threshold_secs = if last_was_transport {
-                        self.budget.transport_retry_min_remaining_secs()
-                    } else {
-                        self.budget.typical_call_duration_secs() + self.budget.retry_buffer_secs()
-                    };
-                    if remaining < Duration::from_secs(threshold_secs) {
+                    // mika#2362: the selection now lives in `retry_gate`, which
+                    // is the same predicate the outcome line below reads — they
+                    // used to be two, and the outcome line ignored the deadline
+                    // entirely.
+                    if let RetryVerdict::DeadlineInsufficient { threshold_secs, .. } =
+                        deadline_verdict(Some(remaining), last_was_transport, &thresholds)
+                    {
                         warn!(
                             attempt,
                             remaining_ms = remaining.as_millis() as u64,
@@ -467,12 +475,20 @@ impl OpenAiCompatibleProvider {
             let attempt_elapsed_ms = attempt_start.elapsed().as_millis() as u64;
             let deadline_remaining_ms =
                 deadline.map(|dl| dl.saturating_duration_since(Instant::now()).as_millis() as u64);
+            // mika#2362: the same predicate the guard above consults, fed the
+            // margin measured just now. Before this it read the budget and the
+            // error class and **never the deadline**, so it could announce a
+            // retry the guard was about to refuse — which is the whole of the
+            // founding incident.
             let outcome = match &attempt_result {
                 Ok(_) => super::attempt_outcome::SUCCESS,
-                Err(e) if attempt + 1 < max_attempts && e.is_retryable() => {
-                    super::attempt_outcome::RETRYING
-                }
-                Err(_) => super::attempt_outcome::EXHAUSTED,
+                Err(e) => super::attempt_outcome::outcome_for(&next_attempt_verdict(
+                    attempt,
+                    max_attempts,
+                    Some(e),
+                    deadline_remaining_ms.map(Duration::from_millis),
+                    &thresholds,
+                )),
             };
             super::emit_llm_call_attempt(
                 &self.provider_kind.to_string(),
@@ -521,23 +537,21 @@ impl OpenAiCompatibleProvider {
         }
 
         // Distinguish deadline-abort from normal retry exhaustion for
-        // diagnostics. Mirrors the retry-loop's transport-aware threshold
-        // (mika#1744) so the two branches agree on which errors classify
-        // as "aborted by deadline" — otherwise a transport-late failure
-        // would classify as "max retries exceeded" instead of the more
-        // accurate "deadline budget insufficient" surface.
+        // diagnostics. mika#2362: this used to re-derive the guard's threshold
+        // a third time, with a comment saying it did so "so the two branches
+        // agree" — an agreement obtained by copying. It now reads the same
+        // predicate, so the agreement is structural. The margin is still
+        // measured *here* rather than reused from the guard: this site runs at
+        // a later instant, and its verdict may legitimately differ.
         let last_was_transport = last_error
             .as_ref()
             .is_some_and(super::error::LlmError::is_transport);
-        let deadline_threshold_secs = if last_was_transport {
-            self.budget.transport_retry_min_remaining_secs()
-        } else {
-            self.budget.typical_call_duration_secs() + self.budget.retry_buffer_secs()
-        };
-        let deadline_aborted = deadline.is_some_and(|dl| {
-            dl.saturating_duration_since(Instant::now())
-                < Duration::from_secs(deadline_threshold_secs)
-        });
+        let deadline_aborted = deadline_verdict(
+            deadline.map(|dl| dl.saturating_duration_since(Instant::now())),
+            last_was_transport,
+            &thresholds,
+        )
+        .is_deadline_insufficient();
 
         Err(last_error.unwrap_or_else(|| {
             if deadline_aborted {
