@@ -86,6 +86,16 @@ générique qui est en réalité le prompt de `self-dev-callback` recopié en du
 (F2), et `pr_reviews_posted: None, // Silent mode: no session-scoped dedup needed`
 (`agent_loop/mod.rs:4723`) — faux dès qu'un tour silencieux poste une revue.
 
+**La troisième se contredit à 155 lignes de distance, dans le même fichier.** En
+4566-4569, le commentaire qui arme la validation de suffixe d'argument en mode
+silencieux écrit noir sur blanc : *« Tool-arg suffix validation fires in silent
+mode too — qa-review runs in callback turns and must still validate verdict
+trailers before GitHub submission »* (mika#899). Le moteur **sait** donc que ce
+tour-là poste des revues GitHub — il en valide le corps — puis affirme 155 lignes
+plus bas qu'aucun dédoublonnage de revue n'y est nécessaire. Ce n'est pas une
+hypothèse à confirmer en production : la preuve que B3 est possible et que son
+commentaire est faux tient dans un seul écran de code.
+
 ### Corollaire : `self-dev-callback` non plus n'est pas chargé
 
 `self-dev/skill.toml` ne déclare pas `self-dev-callback` dans ses dépendances :
@@ -119,15 +129,35 @@ sortantes ; précédent mika#1251).
 
 Une ligne, effet décisif : le tour de callback reçoit enfin son propre contrat.
 
-**Coût nommé.** `qa-review` étant `always_on`, ses dépendances sont résolues sur
-**tous** ses tours, pas seulement les callbacks : +19 330 octets de prompt sur
-chaque tour mika-qa. Accepté ici parce que la dépendance déclarée est le geste
-maison (mika#1251), qu'elle est bornée au skill qu'on nomme, et qu'un axe
-`callback_handler` générique dans le manifeste embarquerait `self-dev-callback`
-par la même mécanique, sans décision. Cet axe est la bonne généralisation ; il a
-son propre ticket. Vérifier au passage qu'aucun `max_prompt_size` ne franchit son
-gate à 95 %, lequel **panique** au lieu d'avertir
-(`tests/bundled_skills_load.rs:141,166`).
+**Précondition vérifiée — l'aval ne bloque pas.** `qa-review-build-callback` est
+**déjà** déclaré dans l'allowlist de mika-qa (`well_known_agents.rs`,
+`MIKA_QA_IDENTITY`, entre `qa-review` et `qa-review-webhook-success`). Les skills
+bundled étant refusés par défaut hors allowlist, une dépendance résolue mais non
+allowlistée aurait été filtrée juste après le BFS, et B1 aurait été une ligne sans
+effet. Ce n'est pas le cas : le skill est autorisé et n'a jamais été atteignable —
+ce qui est exactement la signature d'un chaînon manquant, pas d'un choix.
+
+**Coût nommé, et ce qu'il n'est pas.** `qa-review` étant `always_on`, ses
+dépendances sont résolues sur **tous** ses tours, pas seulement les callbacks :
++19 330 octets de prompt sur chaque tour mika-qa (taille mesurée du fichier).
+C'est un coût de **contexte à l'exécution**, pas un coût de gate — le gate
+`max_prompt_size` est **par skill** et non sur la somme, et
+`qa-review-build-callback` mesure 19 330 octets contre son propre plafond de
+32 768 (59 %). B1 ne rapproche donc aucun gate de son seuil. Accepté parce que la
+dépendance déclarée est le geste maison (mika#1251), qu'elle est bornée au skill
+qu'on nomme, et qu'un axe `callback_handler` générique dans le manifeste
+embarquerait `self-dev-callback` par la même mécanique, sans décision. Cet axe est
+la bonne généralisation ; il a son propre ticket.
+
+**En revanche, la marge de `qa-review` lui-même est mince, et elle contraint B2.**
+`qa-review/system_prompt.md` mesure 68 380 octets contre un plafond déclaré de
+73 728 : le gate à 95 % **panique** (il n'avertit pas —
+`tests/bundled_skills_load.rs:141,166`) à 70 041 octets, soit **1 661 octets de
+marge**. Conséquence opératoire directe : **B2 ne peut pas être résolue en
+ajoutant du texte au prompt de `qa-review`.** Le correctif du contrat terminal
+doit vivre dans le moteur (garde + framing), ce qu'il fait déjà ci-dessous — mais
+la tentation du paragraphe de prompt est la première qui vient, et elle casse le
+build.
 
 ### B2 — cesser de prescrire le mauvais contrat terminal, exiger le bon
 
@@ -233,8 +263,11 @@ assertables sans production.
 6. **B3 anti-double-post** — un tour qui **a** posté son verdict n'en reçoit pas
    un second. Pinne la propagation du registre : sans elle ce test est rouge,
    c'est-à-dire que le filet doublerait chaque revue réussie.
-7. **Budget de prompt** — les gates `max_prompt_size` restent verts après B1
-   (rappel : ils paniquent à 95 %, ils n'avertissent pas).
+7. **Budget de prompt** — les gates `max_prompt_size` restent verts après B1.
+   Attendu par construction (le gate est par skill, et `qa-review-build-callback`
+   est à 59 % du sien), donc ce test ne garde pas B1 : il garde **B2**, dont la
+   solution naïve — un paragraphe ajouté au prompt de `qa-review` — dispose de
+   1 661 octets avant de faire **paniquer** le build (le gate ne prévient pas).
 
 ## Definition of Done
 
