@@ -536,6 +536,33 @@ pub enum TeamRunIdFilter {
     Specific(String),
 }
 
+/// mika#2360 — closed projection of the recurring-task registry.
+///
+/// Deliberately distinct from [`Task`]: what is not named here cannot reach
+/// the HTTP response, whatever the `tasks` table gains later. `action_config`,
+/// `result`, `input_context` and `metadata` are excluded by construction —
+/// they carry user content (mika#2360 AC4: registry metadata only, never a
+/// message body).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RecurringRegistryRow {
+    pub label: String,
+    pub agent_id: String,
+    /// Always `"recurring"` — the filter is hard-wired in the SQL (R2).
+    pub trigger_type: String,
+    pub action_type: String,
+    pub cron_expr: Option<String>,
+    pub next_fire_at: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+    /// mika#1742: does this row, at read time, arm the refuse-to-zombie veto
+    /// against re-registering its `(agent_id, label)`? Computed in SQL with
+    /// the same predicate [`Database::create_recurring_task_if_absent`]
+    /// applies — the operator does not have to replay the 24 h window and
+    /// the three `metadata` markers by hand to read the registry.
+    pub zombie_veto_active: bool,
+}
+
 /// Filters for paginated team run listing (dashboard API).
 #[derive(Debug, Clone, Default)]
 pub struct TeamRunFilters {
@@ -13788,6 +13815,100 @@ impl Database {
         Ok((data, count))
     }
 
+    /// mika#2360 — list the recurring-task registry as a closed projection.
+    ///
+    /// `trigger_type = 'recurring'` is a literal in the SQL, never a
+    /// parameter (R2): no query string can widen the population. The
+    /// `SELECT` names its columns (R3) — never `*` nor [`Self::TASK_COLUMNS`],
+    /// so `action_config` / `result` / `input_context` / `metadata` cannot
+    /// leak whatever the table grows. No status filter: a dead row is
+    /// precisely what an operator diagnosing a missing recurrence needs to
+    /// see (mika#2358 D2). Sorted `label COLLATE NOCASE, created_at` so the
+    /// duplicates of one label sit next to each other in birth order — the
+    /// veto compares labels case-insensitively, so must the sort.
+    ///
+    /// `zombie_veto_active` mirrors the two-query guard in
+    /// [`Self::create_recurring_task_if_absent`]: the *lift-spent* term is a
+    /// correlated `EXISTS` over `(agent_id, label COLLATE NOCASE)`, not a read
+    /// of the current row's `metadata` — the lift may have been spent on a
+    /// sibling row (mika#2337). `mika2360_zombie_veto_flag_*` tests pin the
+    /// two predicates together.
+    ///
+    /// Read-only (R4): a `SELECT` and a `COUNT`, no frame emitted.
+    pub fn list_recurring_registry(
+        &self,
+        agent_id: Option<&str>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<RecurringRegistryRow>, u64)> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks
+             WHERE trigger_type = 'recurring'
+               AND (?1 IS NULL OR agent_id = ?1)",
+            params![agent_id],
+            |r| r.get(0),
+        )?;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT t.label, t.agent_id, t.trigger_type, t.action_type, t.cron_expr,
+                    t.next_fire_at, t.status, t.created_at, t.updated_at,
+                    COALESCE(
+                        t.status IN ('failed', 'cancelled', 'expired')
+                        AND t.updated_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+                        AND NOT (json_valid(t.metadata)
+                                 AND COALESCE(json_extract(t.metadata, ?3), 0) = 1)
+                        AND NOT (
+                            NOT EXISTS (
+                                SELECT 1 FROM tasks s
+                                WHERE s.agent_id = t.agent_id
+                                  AND s.label = t.label COLLATE NOCASE
+                                  AND s.trigger_type = 'recurring'
+                                  AND s.updated_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+                                  AND json_valid(s.metadata)
+                                  AND COALESCE(json_extract(s.metadata, ?4), 0) = 1
+                            )
+                            AND json_valid(t.metadata)
+                            AND COALESCE(json_extract(t.metadata, ?5), 0) = 1
+                        ),
+                        0
+                    ) AS zombie_veto_active
+             FROM tasks t
+             WHERE t.trigger_type = 'recurring'
+               AND (?1 IS NULL OR t.agent_id = ?1)
+             ORDER BY t.label COLLATE NOCASE ASC, t.created_at ASC
+             LIMIT ?6 OFFSET ?7",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    agent_id,
+                    RECURRING_ZOMBIE_GRACE_SQL,
+                    RECURRING_CONFIG_CANCEL_REVERTED_PATH,
+                    RECURRING_UNKNOWN_TRIGGER_LIFT_CONSUMED_PATH,
+                    RECURRING_UNKNOWN_TRIGGER_PATH,
+                    limit as i64,
+                    offset as i64,
+                ],
+                |r| {
+                    Ok(RecurringRegistryRow {
+                        label: r.get(0)?,
+                        agent_id: r.get(1)?,
+                        trigger_type: r.get(2)?,
+                        action_type: r.get(3)?,
+                        cron_expr: r.get(4)?,
+                        next_fire_at: r.get(5)?,
+                        status: r.get(6)?,
+                        created_at: r.get(7)?,
+                        updated_at: r.get(8)?,
+                        zombie_veto_active: r.get::<_, i64>(9)? == 1,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok((rows, count as u64))
+    }
+
     /// List team runs and count in a single closure.
     pub fn list_team_runs_paginated_with_count(
         &self,
@@ -17208,6 +17329,360 @@ pub(crate) mod tests {
             retry.is_some(),
             "une levée consommée hors fenêtre ne doit plus désarmer l'exemption"
         );
+    }
+
+    // ── mika#2360 — registre des récurrences en lecture seule ─────────────
+
+    /// Insère une ligne du registre en contournant la garde mika#1742 (l'objet
+    /// des tests de tri est la projection, pas la garde). Rend l'id.
+    fn registry_row(db: &Database, label: &str, status: &str, created_at: &str) -> String {
+        let mut t = zombie_recurring_task("mika", label);
+        t.action_type = "send_message".to_string();
+        t.action_config = r#"{"text":"SECRET-MEDICATION-REMINDER"}"#.to_string();
+        t.metadata = Some(r#"{"note":"SECRET-METADATA-BLOB"}"#.to_string());
+        let id = db.create_task(&t).unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = ?2, created_at = ?3 WHERE id = ?1",
+                params![id, status, created_at],
+            )
+            .unwrap();
+        id
+    }
+
+    fn registry_labels(db: &Database) -> Vec<String> {
+        db.list_recurring_registry(None, 200, 0)
+            .unwrap()
+            .0
+            .into_iter()
+            .map(|r| r.label)
+            .collect()
+    }
+
+    /// R2 — `trigger_type = 'recurring'` est un littéral : `manual`,
+    /// `callback` et `time` ne sortent jamais, quel que soit le filtre.
+    #[test]
+    fn mika2360_registry_excludes_non_recurring_rows() {
+        let db = db();
+        db.create_task(&make_task("callback-row")).unwrap();
+        let mut manual = make_task("manual-row");
+        manual.trigger_type = "manual".to_string();
+        db.create_task(&manual).unwrap();
+        let mut time = make_task("time-row");
+        time.trigger_type = "time".to_string();
+        time.next_fire_at = Some("2286-11-20T17:46:39Z".to_string());
+        db.create_task(&time).unwrap();
+        db.create_recurring_task_if_absent(zombie_recurring_task("mika", "curator_review"))
+            .unwrap()
+            .unwrap();
+
+        let (rows, total) = db.list_recurring_registry(None, 200, 0).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "curator_review");
+        assert_eq!(rows[0].trigger_type, "recurring");
+        assert_eq!(rows[0].status, "recurring_active");
+        assert!(!rows[0].zombie_veto_active);
+    }
+
+    /// AC4 — testée sur le JSON rendu, pas sur les champs de la struct : un
+    /// `#[serde(flatten)]` ajouté plus tard passerait un test sur les champs.
+    #[test]
+    fn mika2360_registry_projection_carries_no_message_content() {
+        let db = db();
+        registry_row(
+            &db,
+            "rappel-medicaments",
+            "recurring_active",
+            "2026-09-01T08:00:00Z",
+        );
+
+        let (rows, _) = db.list_recurring_registry(None, 200, 0).unwrap();
+        let json = serde_json::to_string(&rows).unwrap();
+        assert!(
+            !json.contains("SECRET-MEDICATION-REMINDER"),
+            "action_config leaked into the registry projection: {json}"
+        );
+        assert!(
+            !json.contains("SECRET-METADATA-BLOB"),
+            "metadata leaked into the registry projection: {json}"
+        );
+        assert!(!json.contains("action_config"));
+        assert!(!json.contains("\"metadata\""));
+        assert!(!json.contains("\"result\""));
+        assert!(!json.contains("input_context"));
+        assert!(json.contains("\"label\":\"rappel-medicaments\""));
+        assert!(json.contains("\"zombie_veto_active\""));
+    }
+
+    /// T2 — aucun filtre de statut : la ligne morte qui bloque est visible.
+    #[test]
+    fn mika2360_registry_lists_cancelled_and_failed_rows() {
+        let db = db();
+        registry_row(&db, "a-cancelled", "cancelled", "2026-09-01T08:00:00Z");
+        registry_row(&db, "b-failed", "failed", "2026-09-01T08:00:00Z");
+        registry_row(&db, "c-expired", "expired", "2026-09-01T08:00:00Z");
+        registry_row(&db, "d-active", "recurring_active", "2026-09-01T08:00:00Z");
+
+        let (rows, total) = db.list_recurring_registry(None, 200, 0).unwrap();
+        assert_eq!(total, 4);
+        let statuses: Vec<&str> = rows.iter().map(|r| r.status.as_str()).collect();
+        assert_eq!(
+            statuses,
+            vec!["cancelled", "failed", "expired", "recurring_active"]
+        );
+    }
+
+    /// T4 — les doublons d'un label sont contigus et en ordre de naissance,
+    /// quel que soit `updated_at`.
+    #[test]
+    fn mika2360_registry_orders_by_label_then_created_at() {
+        let db = db();
+        let newer = registry_row(&db, "rappel", "cancelled", "2026-09-02T08:00:00Z");
+        registry_row(&db, "aaa-autre", "recurring_active", "2026-09-01T12:00:00Z");
+        let older = registry_row(&db, "rappel", "recurring_active", "2026-09-01T08:00:00Z");
+        // updated_at in the *opposite* order of created_at: the sort must
+        // not follow it.
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = '2026-09-10T00:00:00Z' WHERE id = ?1",
+                params![older],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = '2026-09-03T00:00:00Z' WHERE id = ?1",
+                params![newer],
+            )
+            .unwrap();
+
+        let (rows, _) = db.list_recurring_registry(None, 200, 0).unwrap();
+        let seq: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|r| (r.label.as_str(), r.created_at.as_str()))
+            .collect();
+        assert_eq!(
+            seq,
+            vec![
+                ("aaa-autre", "2026-09-01T12:00:00Z"),
+                ("rappel", "2026-09-01T08:00:00Z"),
+                ("rappel", "2026-09-02T08:00:00Z"),
+            ]
+        );
+    }
+
+    /// T6 b — `Rappel` et `rappel` sont le même label pour le veto ; le tri
+    /// doit les rapprocher, pas les séparer par la ligne intermédiaire.
+    #[test]
+    fn mika2360_registry_orders_labels_case_insensitively() {
+        let db = db();
+        registry_row(&db, "Rappel", "cancelled", "2026-09-01T08:00:00Z");
+        registry_row(
+            &db,
+            "aaa-autre-label",
+            "recurring_active",
+            "2026-09-01T09:00:00Z",
+        );
+        registry_row(&db, "rappel", "recurring_active", "2026-09-01T10:00:00Z");
+
+        assert_eq!(
+            registry_labels(&db),
+            vec!["aaa-autre-label", "Rappel", "rappel"],
+            "a binary sort would put `Rappel` before `aaa-…` and split the pair"
+        );
+    }
+
+    /// `?agent_id=` restreint le registre à un agent.
+    #[test]
+    fn mika2360_registry_filters_by_agent_id() {
+        let db = db();
+        db.register_agent("other", "Other", "/tmp/other").unwrap();
+        registry_row(&db, "mika-only", "recurring_active", "2026-09-01T08:00:00Z");
+        let mut t = zombie_recurring_task("other", "other-only");
+        db.create_task(&t).unwrap();
+        t.label = "other-second".to_string();
+        db.create_task(&t).unwrap();
+
+        let (all, total_all) = db.list_recurring_registry(None, 200, 0).unwrap();
+        assert_eq!(total_all, 3);
+        assert_eq!(all.len(), 3);
+
+        let (mika, total_mika) = db.list_recurring_registry(Some("mika"), 200, 0).unwrap();
+        assert_eq!(total_mika, 1);
+        assert_eq!(mika[0].agent_id, "mika");
+
+        let (other, total_other) = db.list_recurring_registry(Some("other"), 200, 0).unwrap();
+        assert_eq!(total_other, 2);
+        assert!(other.iter().all(|r| r.agent_id == "other"));
+
+        // Pagination: total counts the whole population, data is the page.
+        let (page2, total_p) = db.list_recurring_registry(None, 2, 2).unwrap();
+        assert_eq!(total_p, 3);
+        assert_eq!(page2.len(), 1);
+    }
+
+    /// Test d'accord (§3.1 option b) — sur chaque état du veto,
+    /// `zombie_veto_active` concorde avec le refus réel de
+    /// `create_recurring_task_if_absent`. Chaque cas vit dans sa propre base :
+    /// un seul label mort par base, donc « une ligne arme le veto » et « la
+    /// ré-inscription est refusée » sont la même proposition.
+    #[test]
+    fn mika2360_zombie_veto_flag_matches_registration_refusal() {
+        // (nom du cas, préparation, veto attendu)
+        type Prepare = Box<dyn Fn(&Database)>;
+        let cases: Vec<(&str, Prepare, bool)> = vec![
+            (
+                "recent cancelled",
+                Box::new(|db| {
+                    let id = db
+                        .create_recurring_task_if_absent(zombie_recurring_task("mika", "lbl"))
+                        .unwrap()
+                        .unwrap();
+                    db.conn
+                        .execute(
+                            "UPDATE tasks SET status = 'cancelled',
+                             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-2 hours')
+                             WHERE id = ?1",
+                            params![id],
+                        )
+                        .unwrap();
+                }),
+                true,
+            ),
+            (
+                "cancelled + config-cancel reverted (mika#2271)",
+                Box::new(|db| {
+                    db.create_recurring_task_if_absent(zombie_recurring_task("mika", "lbl"))
+                        .unwrap()
+                        .unwrap();
+                    db.cancel_recurring_task_by_label("mika", "lbl").unwrap();
+                    assert_eq!(
+                        db.revert_config_cancel_recurring_task("mika", "lbl")
+                            .unwrap(),
+                        1
+                    );
+                }),
+                false,
+            ),
+            (
+                "failed outside the grace window",
+                Box::new(|db| {
+                    kill_recurring(db, "lbl", "-72 hours", false);
+                }),
+                false,
+            ),
+            (
+                "failed inside the window, any other cause",
+                Box::new(|db| {
+                    kill_recurring(db, "lbl", "-1 hour", false);
+                }),
+                true,
+            ),
+            (
+                "unknown-trigger death, lift not yet spent (mika#2337)",
+                Box::new(|db| {
+                    kill_recurring(db, "lbl", "-1 hour", true);
+                }),
+                false,
+            ),
+        ];
+
+        for (name, prepare, expected_veto) in cases {
+            let db = db();
+            prepare(&db);
+
+            let (rows, _) = db.list_recurring_registry(None, 200, 0).unwrap();
+            assert_eq!(rows.len(), 1, "{name}: one row expected");
+            assert_eq!(
+                rows[0].zombie_veto_active, expected_veto,
+                "{name}: zombie_veto_active"
+            );
+
+            let registered = db
+                .create_recurring_task_if_absent(zombie_recurring_task("mika", "lbl"))
+                .unwrap();
+            assert_eq!(
+                registered.is_none(),
+                expected_veto,
+                "{name}: the flag must agree with the real guard"
+            );
+        }
+    }
+
+    /// T6 a — le lift est une propriété de `(agent_id, label)`, pas de la
+    /// ligne. Deux lignes du même label (casse mêlée) : l'une porte
+    /// `lift_consumed`, l'autre `unknown_trigger_death`. Une lecture par ligne
+    /// verrait la seconde exemptée ; la sous-requête corrélée rend le même
+    /// verdict que la garde : veto armé.
+    #[test]
+    fn mika2360_zombie_veto_flag_reads_lift_spent_on_a_sibling_row() {
+        let db = db();
+        let first = kill_recurring(&db, "Qa_Review_Reconcile", "-2 hours", true);
+        // The lift is spent on `first` by this re-registration (same label,
+        // different case — the guard compares NOCASE, so must the flag).
+        let second = db
+            .create_recurring_task_if_absent(zombie_recurring_task("mika", "qa_review_reconcile"))
+            .unwrap()
+            .expect("first lift must pass");
+        assert_eq!(db.mark_recurring_unknown_trigger(&second).unwrap(), 1);
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'failed',
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 hour')
+                 WHERE id = ?1",
+                params![second],
+            )
+            .unwrap();
+
+        let (rows, _) = db.list_recurring_registry(None, 200, 0).unwrap();
+        assert_eq!(rows.len(), 2);
+        // Sorted NOCASE then created_at: `first` (older) before `second`.
+        assert_eq!(rows[0].label, "Qa_Review_Reconcile");
+        assert_eq!(rows[1].label, "qa_review_reconcile");
+        assert!(
+            rows[0].zombie_veto_active,
+            "the row whose lift was spent is a plain recent death now"
+        );
+        assert!(
+            rows[1].zombie_veto_active,
+            "a per-row read would exempt this row: its own metadata carries \
+             the marker and no lift_consumed — the sibling carries that"
+        );
+
+        let retry = db
+            .create_recurring_task_if_absent(zombie_recurring_task("mika", "qa_review_reconcile"))
+            .unwrap();
+        assert!(retry.is_none(), "the guard must agree: veto armed");
+        let _ = first;
+    }
+
+    /// AC3 — lire le registre n'écrit rien : même nombre de lignes, mêmes
+    /// `status` / `updated_at` / `metadata` avant et après.
+    #[test]
+    fn mika2360_registry_is_read_only() {
+        let db = db();
+        kill_recurring(&db, "dead", "-1 hour", true);
+        registry_row(&db, "alive", "recurring_active", "2026-09-01T08:00:00Z");
+        db.create_task(&make_task("callback-row")).unwrap();
+
+        let snapshot = |db: &Database| -> Vec<(String, String, String, Option<String>)> {
+            let mut stmt = db
+                .conn
+                .prepare("SELECT id, status, updated_at, metadata FROM tasks ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+
+        let before = snapshot(&db);
+        assert_eq!(before.len(), 3);
+        for _ in 0..3 {
+            db.list_recurring_registry(None, 200, 0).unwrap();
+            db.list_recurring_registry(Some("mika"), 1, 0).unwrap();
+        }
+        assert_eq!(snapshot(&db), before, "a read must leave `tasks` untouched");
     }
 
     /// Le marqueur est écrit en **entier**, pas en texte. SQLite ordonne

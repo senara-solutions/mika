@@ -692,6 +692,21 @@ Grep `recurring_unknown_trigger` in `$MIKA_SPIRIT_LOG_FILE`. If
 `unknown run_skill trigger` reappears after a deploy, **do not touch the
 dispatcher** — establish the version of the running binary instead.
 
+**Registry inspector (mika#2360).** `GET /api/v1/recurring-tasks` (dashboard or
+internal token; `?agent_id=`, `?page=`, `?per_page=`) lists every
+`trigger_type = 'recurring'` row — all statuses, sorted `label COLLATE NOCASE,
+created_at` so a label's duplicates sit together — as a **closed projection**
+(`db::RecurringRegistryRow`: `label, agent_id, trigger_type, action_type,
+cron_expr, next_fire_at, status, created_at, updated_at, zombie_veto_active`).
+No `action_config` / `result` / `input_context` / `metadata`: a `send_message`
+recurrence carries the user's reminder text in `action_config`, which is why this
+is not `GET /api/v1/tasks?trigger_type=recurring`. `zombie_veto_active` is the
+mika#1742 guard evaluated per row in SQL (lift-spent term correlated on
+`(agent_id, label COLLATE NOCASE)`, mika#2337); `db::tests::mika2360_zombie_veto_flag_*`
+pin it to `create_recurring_task_if_absent`. Reached from outside the cluster
+through the gateway's `GET /admin/tenants/{customer_id}/recurring-tasks`
+(admin read token — see `crates/mika-gateway/CLAUDE.md`).
+
 ### Structural CI Failure Handler
 
 `server::ci_failure_handler` — intercepts `check_suite.completed(failure|timed_out)` webhook events **before** the LLM turn. Failure-side companion to `ci_success_handler`. Matches CI failures to open PRs and existing work items, fetches failing-job context (up to 3 jobs, 100 lines each), and constructs a pre-digest instructing the LLM to dispatch `run_claude_pilot` for an autonomous fix. Circuit breaker: `ci_fix_count >= 2` in task metadata triggers escalation instead of dispatch — the handler increments `ci_fix_count` deterministically (not reliant on LLM). Checks both task-level callback children and global dispatch guard, including results in the pre-digest. Reuses `VerdictAction`, `find_open_pr`, `run_gh_checks`/`classify_checks`, and `has_active_callback_child` from sibling modules. Also fixes `CHECK_SUITE_RE` regex in `webhook_queue.rs` to match actual gateway format (was `Check suite (failure)`, corrected to `Check suite failure`). Order-independent with other handlers. 30s timeout per subprocess call. See #594.

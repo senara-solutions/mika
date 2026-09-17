@@ -16,8 +16,8 @@ use tracing::error;
 use utoipa::ToSchema;
 
 use crate::db::{
-    self, CoreMemoryEntry, LlmCallRow, SessionMessage, Task, TaskFilters, TeamRunFilters,
-    TeamRunIdFilter, TimelineFilters,
+    self, CoreMemoryEntry, LlmCallRow, RecurringRegistryRow, SessionMessage, Task, TaskFilters,
+    TeamRunFilters, TeamRunIdFilter, TimelineFilters,
 };
 
 use super::state::AppState;
@@ -670,6 +670,49 @@ pub async fn handle_tasks_list(
 
     Json(PaginatedResponse {
         data: data.into_iter().map(TaskResponse::from).collect(),
+        total,
+        page,
+        per_page,
+    })
+    .into_response()
+}
+
+// ===== Recurring registry (mika#2360) =====
+
+#[derive(Debug, Deserialize)]
+pub struct RecurringRegistryQuery {
+    pub agent_id: Option<String>,
+    pub page: Option<u32>,
+    pub per_page: Option<u32>,
+}
+
+/// GET /api/v1/recurring-tasks — paginated, read-only registry of
+/// `trigger_type = 'recurring'` rows, metadata only (mika#2360).
+///
+/// Same envelope and pagination as [`handle_tasks_list`], but a different
+/// projection: [`RecurringRegistryRow`] is closed at the SQL level, so no
+/// `action_config` preview — a `send_message` recurrence carries the user's
+/// reminder text there — can reach the response (AC4). The `recurring` filter
+/// is hard-wired in the query, not a parameter (R2). All statuses are listed:
+/// the dead row that arms the mika#1742 veto is what an operator is looking
+/// for (mika#2358 D2).
+pub async fn handle_recurring_registry(
+    State(state): State<AppState>,
+    Query(q): Query<RecurringRegistryQuery>,
+) -> impl IntoResponse {
+    let (page, per_page, offset) = resolve_pagination(q.page, q.per_page);
+
+    let (data, total) = match state
+        .dashboard_db
+        .list_recurring_registry(q.agent_id, per_page, offset)
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => return internal_error(e).into_response(),
+    };
+
+    Json(PaginatedResponse::<RecurringRegistryRow> {
+        data,
         total,
         page,
         per_page,

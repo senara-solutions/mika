@@ -2582,6 +2582,7 @@ mod tests {
             )),
             search_egress_client: None,
             fetch_egress_client: None,
+            admin_read_token: None,
         };
 
         axum::Router::new()
@@ -2704,6 +2705,7 @@ mod tests {
             )),
             search_egress_client: None,
             fetch_egress_client: None,
+            admin_read_token: None,
         };
 
         let app = axum::Router::new()
@@ -3138,6 +3140,7 @@ mod tests {
             )),
             search_egress_client: None,
             fetch_egress_client: None,
+            admin_read_token: None,
         }
     }
 
@@ -3944,6 +3947,7 @@ omInFBLWVyWK89xoc49UvUcyRcbL3iWqa+zAv7eOC5TZyy1SVJtPVw==\n\
             )),
             search_egress_client: None,
             fetch_egress_client: None,
+            admin_read_token: None,
         };
 
         axum::Router::new()

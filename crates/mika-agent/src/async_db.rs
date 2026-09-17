@@ -6,10 +6,10 @@ use tokio::sync::oneshot;
 
 use crate::db::{
     AgentRow, AgentWithStats, AuditEvent, BackgroundTaskCounts, Commitment, CoreMemoryEntry,
-    Database, Event, FailedSend, NewTask, Person, Preference, RecordOutcome, SearchResult,
-    ServedContent, Session, SessionMessage, SessionWithStats, SkillOverride, Task, TaskFilters,
-    TaskHealthSummary, TaskMessage, TaskSessionRow, TeamRow, TeamRunFilters, TeamRunRow,
-    TeamRunSummary, TeamWorkspaceEntry, TimelineFilters, TimelineRow,
+    Database, Event, FailedSend, NewTask, Person, Preference, RecordOutcome, RecurringRegistryRow,
+    SearchResult, ServedContent, Session, SessionMessage, SessionWithStats, SkillOverride, Task,
+    TaskFilters, TaskHealthSummary, TaskMessage, TaskSessionRow, TeamRow, TeamRunFilters,
+    TeamRunRow, TeamRunSummary, TeamWorkspaceEntry, TimelineFilters, TimelineRow,
 };
 use crate::server::tasks_stream::{TaskEventFrame, TaskEventsChannel};
 
@@ -3028,6 +3028,19 @@ impl AsyncDatabase {
         offset: u32,
     ) -> Result<(Vec<Task>, u64)> {
         self.with_db(move |db| db.list_tasks_paginated_with_count(&filters, limit, offset))
+            .await
+    }
+
+    /// mika#2360 — closed-projection read of the recurring registry. No
+    /// frame emitted: this is a pure read, unlike
+    /// [`Self::create_recurring_task_if_absent`].
+    pub async fn list_recurring_registry(
+        &self,
+        agent_id: Option<String>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<RecurringRegistryRow>, u64)> {
+        self.with_db(move |db| db.list_recurring_registry(agent_id.as_deref(), limit, offset))
             .await
     }
 

@@ -556,6 +556,7 @@ mod tests {
             )),
             search_egress_client: None,
             fetch_egress_client: None,
+            admin_read_token: None,
         }
     }
 

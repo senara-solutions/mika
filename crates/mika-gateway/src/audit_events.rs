@@ -25,6 +25,50 @@ use tracing::warn;
 /// dashboard SQL.
 pub(crate) const TOOL_NAME: &str = "gateway_webhook";
 
+/// mika#2360 — `tool_name` written for every served admin read of a tenant's
+/// recurring registry. Deliberately NOT [`TOOL_NAME`]: that constant carries
+/// the mika#1774 webhook-drop population, and mixing admin reads into it
+/// would split that query without saying so. Operator query:
+/// `SELECT target_key, created_at FROM audit_events
+///  WHERE tool_name = 'gateway_admin_read' ORDER BY created_at DESC;`
+pub(crate) const TOOL_NAME_ADMIN_READ: &str = "gateway_admin_read";
+
+/// mika#2360 — `target_key` for an admin read of one tenant's registry. The id
+/// is a validated `Uuid`, so the indexed column never carries caller text.
+pub(crate) fn admin_read_target_key(customer_id: &uuid::Uuid) -> String {
+    format!("tenant:{customer_id}")
+}
+
+/// mika#2360 — persist one admin read of a tenant's recurring registry.
+/// Fire-and-forget on the model of [`log_webhook_drop`]: a DB failure logs a
+/// WARN and never changes the response (a read must not depend on a write).
+pub(crate) async fn log_admin_read(pool: &PgPool, customer_id: &uuid::Uuid) {
+    let target_key = admin_read_target_key(customer_id);
+    let metadata = json!({
+        "route": "GET /admin/tenants/{customer_id}/recurring-tasks",
+        "customer_id": customer_id,
+    });
+    let result = sqlx::query(
+        r#"
+        INSERT INTO audit_events (tool_name, target_key, metadata)
+        VALUES ($1, $2, $3)
+        "#,
+    )
+    .bind(TOOL_NAME_ADMIN_READ)
+    .bind(&target_key)
+    .bind(&metadata)
+    .execute(pool)
+    .await;
+
+    if let Err(e) = result {
+        warn!(
+            target_key,
+            error = %e,
+            "failed to persist gateway_admin_read audit_event (response unchanged)"
+        );
+    }
+}
+
 /// Drop-reason `target_key` written when `route_event(...)` returns `None`
 /// (unroutable event type / action / conclusion tuple).
 pub(crate) const DROP_NO_ROUTE: &str = "webhook_no_route";
@@ -112,6 +156,22 @@ pub(crate) async fn log_webhook_drop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// mika#2360 R9 — the admin-read population is its own `tool_name`, never
+    /// merged into the webhook-drop one, and the key is `tenant:{uuid}`.
+    #[test]
+    fn mika2360_admin_read_audit_constants() {
+        assert_eq!(TOOL_NAME_ADMIN_READ, "gateway_admin_read");
+        assert_ne!(
+            TOOL_NAME_ADMIN_READ, TOOL_NAME,
+            "admin reads must not be written under the webhook-drop tool_name"
+        );
+        let id = uuid::Uuid::parse_str("a0394c24-9558-4cb6-9078-52043912ecbc").unwrap();
+        assert_eq!(
+            admin_read_target_key(&id),
+            "tenant:a0394c24-9558-4cb6-9078-52043912ecbc"
+        );
+    }
 
     fn base_ctx() -> WebhookDropContext<'static> {
         WebhookDropContext {
