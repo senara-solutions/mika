@@ -331,7 +331,12 @@ qui tombe remplacerait un silence par une panne.
 - **`self-dev-callback` inatteignable** (même classe, F1) : son contrat est porté
   en dur par le moteur, donc le rendre actif changerait le comportement du chemin
   self_dev sans qu'on l'ait décidé. **Ticket de suivi**, avec l'axe manifeste
-  `callback_handler` qui est sa bonne forme.
+  `callback_handler` qui est sa bonne forme. Hors périmètre ne veut pas dire
+  invisible : depuis la § Fire-Disposition (D-A), il est **compté** par le
+  détecteur d'atteignabilité sous une exception nommée qui porte le numéro du
+  tracker et se dénonce elle-même quand elle devient périmée. C'est la différence
+  entre un descope et un oubli — et l'absence exacte qui a laissé mika#1251 à
+  moitié fermée.
 - **`qa-review-webhook-success`** : lui est déclenché par des mots-clés présents
   dans le texte de l'événement `check_suite`, donc atteignable sur un tour
   conversationnel. Pas le même défaut.
@@ -347,13 +352,18 @@ qui tombe remplacerait un silence par une panne.
 Tous rouge-avant : les trois faits de racine sont des propriétés du code, donc
 assertables sans production.
 
-1. **F1 figé** — sur le registre réellement embarqué (`all_bundled_skills()`, pas
-   une fixture synthétique), `callback_safe_skills()` contient
-   `qa-review-build-callback`. Rouge avant B1. Sœur du test mika#1251
-   (`test_self_dev_declares_both_dispatch_siblings_as_dependencies`), qui ne peut
-   structurellement pas voir cette classe : il raisonne sur des **noms d'outils**
-   référencés par le moteur (`ENGINE_REFERENCED_SKILL_TOOLS`), et
-   `qa-review-build-callback` n'apporte aucun outil — seulement du prompt.
+1. **F1 figé, et généralisé** — sur le registre réellement embarqué
+   (`all_bundled_skills()`, pas une fixture synthétique), **tout skill dont le nom
+   se termine par `-callback`** est atteignable par `callback_safe_skills()`,
+   l'exception nommée `self-dev-callback` mise à part (§ Fire-Disposition D-A, qui
+   porte aussi son tracker et son assertion auto-nettoyante). Rouge avant B1. Sœur
+   du test mika#1251 (`test_self_dev_declares_both_dispatch_siblings_as_dependencies`),
+   qui ne peut structurellement pas voir cette classe : il raisonne sur des **noms
+   d'outils** référencés par le moteur (`ENGINE_REFERENCED_SKILL_TOOLS`), et
+   `qa-review-build-callback` n'apporte aucun outil — seulement du prompt. Écrit
+   générique et non nommé sur le seul skill corrigé, parce qu'un test nommé serait
+   vert sans rien compter : c'est l'absence de ce détecteur, et non l'absence de
+   correctif, qui a laissé la classe mika#1251 à moitié fermée pendant des mois.
 1b. **B1 ne dégrade pas le tour 1** — sur un tour **conversationnel** de
    `qa-review` (le tour d'ouverture d'une revue), le prompt assemblé contient bien
    le snippet du callback (c'est le BFS de `match_skills`, attendu) **et**
@@ -404,6 +414,114 @@ assertables sans production.
    solution naïve — un paragraphe ajouté au prompt de `qa-review` — dispose de
    1 661 octets avant de faire **paniquer** le build (le gate ne prévient pas).
 
+## Fire-Disposition
+
+*(Exigée par la Fire-Disposition Gate, mika#1574 — première passe mika-arch, F1
+bloquant. Citation : `docs/solutions/best-practices/fire-disposition-doctrine.md`.)*
+
+Un seul des détecteurs de la § Tests peut tirer sur des **données
+pré-existantes**. Les autres sont soit comportementaux sur un tour neuf, soit des
+assertions dont la population est précisément ce que ce correctif écrit. Chacun
+est tranché ci-dessous, et les cas « rien à disposer » sont énoncés plutôt que
+tus : c'est ce qui permet à la seconde passe de vérifier que le tour a été fait.
+
+### D-A — Test 1 (atteignabilité des handlers de callback) : option (a), exception nommée
+
+**Le détecteur est écrit générique, pas nommé.** Un test qui asserte uniquement
+`callback_safe_skills().contains("qa-review-build-callback")` ne tirerait sur
+rien — mais il laisserait la seconde moitié de la classe invisible, ce qui est
+exactement la façon dont ce défaut a survécu : mika#1251 a résolu la classe pour
+`self-dev`, personne ne l'a généralisée, et **aucun détecteur ne l'a dit**. Le
+test asserte donc que **tout skill bundled dont le nom se termine par
+`-callback`** est atteignable par `callback_safe_skills()`.
+
+**Il tire sur une violation pré-existante, et elle est mesurée, pas supposée.**
+Les skills `-callback` du dépôt sont exactement deux — `qa-review-build-callback`
+et `self-dev-callback` — et `self-dev/skill.toml:18-29` ne déclare pas le second
+dans ses `dependencies` (il déclare `build-mika`, `deploy-mika`, `dev-pilot`,
+`dev-groom`, `browser-control`, `resolve-pr-conflicts`). Après B1, le détecteur
+serait donc vert sur un et **rouge sur l'autre**, alors que le corriger est
+explicitement hors périmètre (§ Hors périmètre : rendre `self-dev-callback`
+soudainement actif changerait le comportement du chemin le plus chaud du dépôt
+sans que personne l'ait décidé).
+
+**Disposition : option (a), exception nommée avec ses trois composants.**
+
+1. **Donnée nommée** — l'exception porte la chaîne `"self-dev-callback"` et elle
+   seule. Pas de tolérance par motif, pas de « les skills déjà existants » : une
+   exception dont la forme est un motif ré-autoriserait silencieusement le
+   troisième handler du même défaut.
+2. **Tracker** — le ticket de suivi déjà annoncé en § Hors périmètre (axe
+   manifeste `callback_handler`), **ouvert dans le même PR** et son numéro écrit
+   dans l'exception. Une exception sans numéro est une exception permanente.
+3. **Assertion auto-nettoyante** — le test asserte *aussi* que l'exception est
+   encore **nécessaire** : le jour où `self-dev` déclare `self-dev-callback`, le
+   test rougit avec « exception périmée, retirez cette entrée ». Sans cette
+   moitié, le ticket de suivi peut atterrir et laisser derrière lui une exception
+   qui re-couvre la classe pour le handler suivant.
+
+L'exception est une donnée de test, portée dans `#[cfg(test)] mod tests` : le
+chargeur de production ne doit pas pouvoir la consulter à l'exécution (doctrine,
+§ Option (a)).
+
+**Coût nommé.** L'heuristique « nom terminant par `-callback` » n'est pas l'axe
+manifeste `callback_handler` : un futur handler nommé autrement passerait à
+travers en faux négatif. C'est accepté comme **borne inférieure** — le détecteur
+compte aujourd'hui deux cas sur deux, là où il n'en comptait zéro — et c'est
+précisément ce que le ticket de suivi supprime en rendant le rôle déclaratif
+plutôt que devinable au nom.
+
+### D-B — Test 2b (portée non élargie) : aucune fire sur l'existant, par construction
+
+La population est l'ensemble des outils portant `long_running: true`, mesuré à
+**six** : `build_mika`, `deploy_mika`, `run_claude_pilot`, `run_claude_pilot_groom`,
+`address_pr_comments`, `resolve_pr_conflicts` (`*/tools.json`). Le test les
+énumère **en les lisant depuis les manifestes**, jamais par une liste recopiée, et
+asserte que les cinq autres que `build_mika` conservent framing, garde et contrat
+terminal. La couverture étant exhaustive au moment où il est écrit, il ne peut
+pas tirer sur l'existant. Il tirera sur un **septième** outil `long_running`
+ajouté plus tard sans décision de contrat — ce n'est pas une violation
+pré-existante à disposer, c'est le service que ce test rend.
+
+### D-C — Scan de source du discriminant (B2) : périmètre serré, fire pré-existante nulle
+
+B2 exige que le discriminant vive à un seul endroit. Le scan qui le garde refuse
+le **littéral `long_running:build_mika`** hors du module qui le définit.
+Occurrences existantes : **zéro** — le label est construit par `format!` à
+`executor.rs:2911`, et les ~30 littéraux `long_running:*` du dépôt nomment tous
+un autre outil (majoritairement `run_claude_pilot` en fixtures de test).
+
+**Le scan large est refusé, et c'est la moitié de la décision.** Un scan
+interdisant tout littéral `long_running:` hors du site de construction tirerait
+sur ces ~30 occurrences, toutes légitimes, et demanderait donc trente exceptions :
+un détecteur dont l'allowlist est plus grosse que la population qu'il contrôle ne
+contrôle rien. Périmètre serré, aucune exception, rien à disposer.
+
+### D-D — Gate `max_prompt_size` (test 7) : détecteur pré-existant, mais un déclencheur de halte
+
+Ce plan **n'ajoute pas** ce détecteur : il existe
+(`tests/bundled_skills_load.rs:141,166`) et il est vert. Il n'y a donc pas de
+fire-disposition à en écrire au sens de la doctrine.
+
+En revanche, il porte un **déclencheur de halte-et-remontée (option c)** attaché à
+B2. Si l'implémentation conclut que le contrat terminal ne peut pas être corrigé
+dans le moteur et exige du texte dans `qa-review/system_prompt.md`, elle dispose
+de 1 661 octets avant que le gate ne **panique** (il n'avertit pas). Dans ce cas
+elle **s'arrête et remonte** ; elle ne relève pas `max_prompt_size` (ce qui
+rapprocherait le plafond dur de 81 920 sans que personne ait arbitré) et ne taille
+pas dans le prompt de QA (décision de produit, pas de correctif de gate). La forme
+de la résolution est ici la question à poser à l'opérateur, ce qui est la
+condition d'emploi exacte de l'option (c).
+
+### D-E — Les autres détecteurs : population vide, disposition sans objet
+
+Tests 1b, 3, 4, 4b, 5, 5b, 6 et l'épinglage prompt↔moteur de B2 sont
+comportementaux ou portent sur une donnée unique que ce correctif écrit
+lui-même : le tour de callback, le prédicat après B2, le corps posté par le
+filet, l'en-tête de portée de B1. Aucun ne balaie une population antérieure, donc
+aucun ne peut tirer sur de l'existant. Énoncé pour que l'absence de disposition
+se lise comme un constat et non comme un oubli.
+
 ## Definition of Done
 
 - B1, B2, B3 livrées ; `cargo test -p mika-agent` vert ; `cargo clippy` propre.
@@ -412,6 +530,10 @@ assertables sans production.
 - Les trois commentaires devenus faux sont corrigés dans le même commit que le
   code qui les dément (#870 « only one callback flow », le framing générique,
   `// Silent mode: no session-scoped dedup needed`).
+- Le ticket de suivi de l'axe manifeste `callback_handler` est **ouvert dans ce
+  PR**, et son numéro figure dans l'exception `self-dev-callback` du détecteur
+  d'atteignabilité (§ Fire-Disposition D-A). Une exception sans numéro de tracker
+  est une exception permanente et fait échouer sa propre condition d'emploi.
 - Le stamp de cible PR passe par la signature unique de `build_callback_task`
   (C3), jamais par un constructeur parallèle ; les quatre tests d'eval qui
   l'appellent restent verts sans être contournés.
@@ -424,6 +546,12 @@ assertables sans production.
 - **AC1** — Sur le registre de skills réellement embarqué,
   `callback_safe_skills()` contient `qa-review-build-callback`. Test rouge avant
   le correctif, vert après.
+- **AC1c** — Le détecteur qui porte AC1 est écrit sur la **classe** (tout skill
+  bundled dont le nom se termine par `-callback`), et non sur le seul skill
+  corrigé. Sa seule exception est `self-dev-callback`, nommée littéralement,
+  portant le numéro du ticket de suivi et une assertion qui rougit le jour où
+  l'exception devient périmée (§ Fire-Disposition D-A). L'exception est portée
+  dans `#[cfg(test)] mod tests` : le chargeur de production ne la consulte jamais.
 - **AC1b** — B1 ne dégrade pas le tour d'ouverture : sur un tour conversationnel
   de `qa-review`, la présence du snippet de reprise ne fait sauter aucun des
   Steps 1–3d, parce que le fichier porte en tête une condition de portée qui le
@@ -508,3 +636,36 @@ Revert du commit. B1 redevient une dépendance non déclarée, B2 rend au callba
 de build le contrat self_dev, B3 cesse de poster — c'est-à-dire l'état d'avant,
 sans autre changement de comportement. Le filet B3 est en outre désarmable seul
 si son kill-switch est jugé nécessaire à la revue.
+
+## Revision history
+
+- **rev 2 (2026-09-17)** — adressé F1 (bloquant, Fire-Disposition Gate mika#1574)
+  en ajoutant une § Fire-Disposition qui tranche **par détecteur** plutôt que par
+  un choix global : un seul des détecteurs de la § Tests peut tirer sur des
+  données pré-existantes, et les quatre autres classes sont énoncées comme
+  « population vide » pour que l'absence de disposition se lise comme un constat
+  vérifiable et non comme un oubli.
+  - **D-A, option (a)** pour le test 1 (atteignabilité des handlers de callback).
+    La violation pré-existante est mesurée, pas supposée : les skills `-callback`
+    du dépôt sont exactement deux, et `self-dev/skill.toml:18-29` ne déclare pas
+    `self-dev-callback`. Exception nommée littéralement + tracker ouvert dans le
+    même PR + assertion auto-nettoyante, portée en `#[cfg(test)]` conformément à
+    `docs/solutions/best-practices/fire-disposition-doctrine.md` § Option (a).
+    Conséquence assumée : le test 1 passe d'une assertion nommée à un détecteur de
+    classe — sans quoi il serait vert sans rien compter, ce qui est exactement
+    comment la classe mika#1251 est restée à moitié fermée.
+  - **D-B / D-C**, fire pré-existante **nulle et mesurée** (les six outils
+    `long_running` sont couverts par énumération lue des manifestes ; zéro
+    littéral `long_running:build_mika` dans le dépôt, le label étant construit par
+    `format!` à `executor.rs:2911`). D-C refuse explicitement le scan large, dont
+    l'allowlist (~30 fixtures légitimes) serait plus grosse que la population
+    contrôlée.
+  - **D-D, option (c)** — halte-et-remontée attachée au gate `max_prompt_size`,
+    détecteur **pré-existant** que ce plan n'ajoute pas : si B2 devait passer par
+    du texte dans `qa-review/system_prompt.md`, l'implémentation s'arrête plutôt
+    que de relever le plafond ou de tailler dans le prompt de QA.
+  - Répercussions pour que la section ne soit pas décorative : test 1 réécrit en
+    détecteur de classe, **AC1c** ajoutée (forme du détecteur et de son
+    exception), une ligne de DoD sur l'ouverture du tracker, et la puce
+    § Hors périmètre de `self-dev-callback` qui dit désormais que le descope est
+    compté. Aucune AC existante n'a été affaiblie.
