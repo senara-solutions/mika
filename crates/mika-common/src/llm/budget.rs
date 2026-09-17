@@ -278,8 +278,73 @@ impl LlmTimeoutBudget {
     ///
     /// Exposed so the bound can be asserted directly rather than re-derived at
     /// each callsite.
+    ///
+    /// **Sized on [`Self::max_attempts`], never on
+    /// [`Self::effective_max_attempts`]** — see that method for why swapping
+    /// them would break the mika#2342 watchdog.
     pub fn worst_case_failure_secs(&self, hard_cap: u32) -> u64 {
         u64::from(self.max_attempts(hard_cap)) * self.http_timeout_secs
+    }
+
+    /// How many attempts are *reachable* once the deadline guard is accounted
+    /// for (mika#2362 D4).
+    ///
+    /// # The off-by-one this measures
+    ///
+    /// [`Self::max_attempts`] is `floor(envelope / cap)` — arithmetic with zero
+    /// overhead. The deadline guard measures a real clock, and refuses another
+    /// attempt when the remaining margin is *below* the non-transport
+    /// threshold, which is `0.75 × cap + 0.25 × cap = 1.0 × cap` exactly. After
+    /// an attempt consuming the full cap the margin is `envelope − cap − ε`
+    /// with `ε > 0` always, so the last nominal attempt is unreachable whenever
+    /// `envelope ≤ 2 × cap` — and more generally whenever the envelope is an
+    /// exact multiple of the cap.
+    ///
+    /// | Geometry | `max_attempts` | reachable |
+    /// |---|---|---|
+    /// | 120/300 (fleet default) | 2 | **2** — `300 − 120 = 180 > 120` |
+    /// | 300/600 (the mika#2362 incident) | 2 | **1** — `600 − 300 = 300`, not `> 300` |
+    /// | 240/900 (mika-arch, mika#2189) | 3 | **3** |
+    /// | 200/600 | 3 | **2** |
+    /// | 420/600 | 1 | 1 |
+    ///
+    /// # Why it does not replace `max_attempts`
+    ///
+    /// Two reasons, and the second is the expensive one.
+    ///
+    /// The **transport** class clears a smaller threshold (`0.50 × cap`,
+    /// mika#1744), so at 300/600 a transport failure *does* get its second
+    /// attempt: the real worst case there is `2 × 300 = 600 s`, the whole
+    /// envelope. This method reports the non-transport figure, which is the
+    /// pessimistic one for *reachability* and the optimistic one for *cost*.
+    ///
+    /// So making [`Self::worst_case_failure_secs`] read this instead would take
+    /// the mika#2342 watchdog from `660 s` to `360 s` at that geometry and cut
+    /// a perfectly legitimate transport chain mid-flight — a guaranteed false
+    /// positive on a mechanism whose entire value is that it never fires.
+    /// `budget::tests::mika2362_worst_case_is_unchanged_by_the_effective_count`
+    /// exists to make that swap go red.
+    ///
+    /// This number is **reported**, never enforced: nothing in the retry path
+    /// reads it.
+    pub fn effective_max_attempts(&self, hard_cap: u32) -> u32 {
+        let nominal = self.max_attempts(hard_cap);
+        let threshold = self.typical_call_duration_secs() + self.retry_buffer_secs();
+
+        // Walk the chain the way the clock does: each attempt consumes the cap,
+        // and the next one only runs while the margin strictly exceeds the
+        // threshold. Strictly, because the guard refuses at `remaining <
+        // threshold` and `ε > 0` makes equality unreachable from above.
+        let mut reachable = 1;
+        while reachable < nominal {
+            let consumed = u64::from(reachable) * self.http_timeout_secs;
+            let remaining = self.agent_total_timeout_secs.saturating_sub(consumed);
+            if remaining <= threshold {
+                break;
+            }
+            reachable += 1;
+        }
+        reachable
     }
 }
 
@@ -452,6 +517,97 @@ mod tests {
             agent_total_timeout_secs: 300,
         };
         assert_eq!(budget.max_attempts(HARD_CAP), 1);
+    }
+
+    // -- mika#2362 D4: the honest attempt count, and the net it must not move --
+
+    /// T4 — the five geometries of the plan's E4 table, whose right-hand column
+    /// is the whole diagnosis: at `envelope = k × cap` the last nominal attempt
+    /// is unreachable, and 300/600 is the `k = 2` case of that family rather
+    /// than a peculiarity of the number 300.
+    ///
+    /// **If this is red, halt.** The arithmetic is what mika#2362's D2 rests
+    /// on; adjusting the expectation to whatever was observed would repair the
+    /// test and lose the finding.
+    #[test]
+    fn mika2362_effective_attempts_on_the_five_measured_geometries() {
+        let cases = [
+            (120, 300, 2, 2, "fleet default — 300 − 120 = 180 > 120"),
+            (300, 600, 2, 1, "the incident — 600 − 300 = 300, not > 300"),
+            (240, 900, 3, 3, "mika-arch (mika#2189)"),
+            (200, 600, 3, 2, "the third attempt is refused"),
+            (420, 600, 1, 1, "one attempt, nominal and effective agree"),
+        ];
+        for (cap, envelope, nominal, effective, why) in cases {
+            let budget = LlmTimeoutBudget::new(cap, envelope).expect("valid geometry");
+            assert_eq!(
+                budget.max_attempts(HARD_CAP),
+                nominal,
+                "nominal for {cap}/{envelope} ({why})"
+            );
+            assert_eq!(
+                budget.effective_max_attempts(HARD_CAP),
+                effective,
+                "effective for {cap}/{envelope} ({why})"
+            );
+        }
+    }
+
+    /// The reported count can never exceed the count that bounds the loop —
+    /// asserted over the same geometries as
+    /// `worst_case_failure_never_exceeds_the_envelope`, plus the incident's.
+    #[test]
+    fn mika2362_effective_never_exceeds_nominal() {
+        for (cap, envelope) in [
+            (120, 300),
+            (240, 900),
+            (60, 300),
+            (10, 20),
+            (100, 1000),
+            (300, 600),
+        ] {
+            let budget = LlmTimeoutBudget::new(cap, envelope).expect("valid geometry");
+            assert!(
+                budget.effective_max_attempts(HARD_CAP) <= budget.max_attempts(HARD_CAP),
+                "cap={cap} envelope={envelope}: effective exceeds nominal"
+            );
+            assert!(
+                budget.effective_max_attempts(HARD_CAP) >= 1,
+                "cap={cap} envelope={envelope}: one attempt always runs"
+            );
+        }
+    }
+
+    /// T5 — the guard-rail of the whole ticket.
+    ///
+    /// `worst_case_failure_secs` is what the mika#2342 LLM-call watchdog is
+    /// sized on. A future "simplification" replacing `max_attempts` with
+    /// `effective_max_attempts` there would shorten the net — at 300/600 from
+    /// 660 s to 360 s — and cut a legitimate **transport** chain, which clears
+    /// the smaller `0.50 × cap` threshold and really does get its second
+    /// attempt. That is a guaranteed false positive on a mechanism whose value
+    /// is its silence.
+    ///
+    /// The literals below are the pre-mika#2362 values, written out rather than
+    /// re-derived: a test that recomputed them from the same code it guards
+    /// would follow the regression it exists to catch.
+    #[test]
+    fn mika2362_worst_case_is_unchanged_by_the_effective_count() {
+        let cases = [
+            (120u64, 300u64, 240u64),
+            (300, 600, 600),
+            (240, 900, 720),
+            (200, 600, 600),
+            (420, 600, 420),
+        ];
+        for (cap, envelope, worst) in cases {
+            let budget = LlmTimeoutBudget::new(cap, envelope).expect("valid geometry");
+            assert_eq!(
+                budget.worst_case_failure_secs(HARD_CAP),
+                worst,
+                "the mika#2342 net must not move for {cap}/{envelope}"
+            );
+        }
     }
 
     // -- envelope parsing, three-tier --

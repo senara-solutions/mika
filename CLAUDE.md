@@ -543,13 +543,38 @@ Observabilité du budget effectif + garde de demi-configuration (mika#2293) :
   sites qui connaissent déjà l'agent, plutôt qu'en élargissant la signature de
   `create_provider_with_budget`, qui est une fonction libre sans agent ni home.
   Champs : `agent_id`, `http_timeout_secs`, `agent_total_timeout_secs`,
-  `max_attempts`, `worst_case_failure_secs`, `http_source`, `total_source`,
+  `max_attempts`, `effective_max_attempts`, `retry_reachable`,
+  `worst_case_failure_secs`, `http_source`, `total_source`,
   `http_raw`, `total_raw`. **Indépendant de `MIKA_STORE_LLM_CALLS`** : c'est un
   événement de *configuration*, pas de télémétrie d'appel, et il doit rester
   lisible précisément quand on a coupé la télémétrie pour réduire le bruit.
   Dédupliqué sur le couple résolu — une répétition à l'identique est tue, un
   **changement** est ré-émis (la déduplication borne la répétition, elle ne
-  subordonne l'événement à aucun réglage).
+  subordonne l'événement à aucun réglage). Depuis mika#2362 la signature de
+  déduplication intègre `effective_max_attempts` : sans ça, un changement de
+  géométrie qui ne bouge que l'atteignabilité — précisément ce que ces deux
+  champs existent pour dire — serait tu comme « pas de changement ».
+- **`effective_max_attempts` / `retry_reachable` : le compte qu'on rapporte, pas
+  celui qui borne (mika#2362).** `max_attempts` est `floor(enveloppe / plafond)`,
+  une arithmétique à surcoût nul ; la garde de deadline mesure une horloge réelle
+  et refuse dès que la marge restante est **sous** le seuil non-transport, lequel
+  vaut exactement `1.0 × plafond`. Après une tentative consommant le plafond
+  plein, la marge est `enveloppe − plafond − ε` avec `ε > 0` toujours : **quand
+  l'enveloppe est un multiple exact du plafond, la dernière tentative nominale
+  est inatteignable.** 300/600 est le cas `k = 2` de cette famille, pas une
+  singularité du nombre 300. `llm_budget_retry_unreachable` (WARN) nomme l'agent,
+  les deux comptes, la géométrie et la provenance de chaque moitié quand les deux
+  divergent. **Régime attendu : silencieux.** Une occurrence n'est pas une panne
+  — la configuration est valide et fonctionne, la classe transport retry bel et
+  bien (seuil `0.50 × plafond`) — c'est une mesure qui appelle une décision de
+  réglage : décaler l'un des deux nombres hors du multiple, ou accepter. **Pas de
+  garde de démarrage, à dessein** : refuser de démarrer sur un réglage
+  sous-optimal mais fonctionnel coucherait la flotte, exactement le mode de panne
+  que mika#2293 a dû nommer pour son propre garde. Et ce compte **ne remplace
+  jamais** `max_attempts` : le filet de mika#2342 est dimensionné sur le nominal,
+  et l'échanger le ferait passer de 660 s à 360 s à cette géométrie — faux
+  positif garanti sur une chaîne transport légitime (`mika2362_worst_case_is_unchanged_by_the_effective_count`
+  rougit si quelqu'un tente l'échange).
 - **La provenance sépare trois mondes, et c'est tout son objet.**
   `grep llm_budget_resolved $MIKA_SPIRIT_LOG_FILE | jq '{agent_id, http_timeout_secs, http_source}'` :
   `agent_config` à 240 → le réglage est bien en vigueur, la cause est ailleurs, **ne
@@ -791,6 +816,9 @@ grep turn_usage $MIKA_SPIRIT_LOG_FILE | jq 'select(.status == "error") | {sessio
 | `request_bytes` des tours en échec nettement supérieur à celui des tours sains du même agent | La taille du brief corrèle | **Ouvrir le ticket « borner le prompt du tour callback »** (pattern mika#2295 appliqué à `callback_safe_skills()`) |
 | `attempt = 1` avec `elapsed_ms` très supérieur à `http_timeout_secs × 1000` | Le timeout `reqwest` **ne coupe pas** : la panne est sous le client HTTP | **Halte.** Ni le retry ni la borne ne s'appliquent ; instrumenter au niveau connexion (relie mika#2313, egress-proxy) |
 | `request_bytes` indiscernable entre tours sains et tours en échec | La corrélation structurelle est infirmée | Ne pas borner ; rouvrir le diagnostic |
+| `outcome = "exhausted"` avec `deadline_remaining_ms` ≈ plafond × 1000 (mika#2362) | La garde de deadline a **refusé** la 2ᵉ tentative : la marge restante n'atteint pas le seuil non-transport, qui vaut exactement `1.0 × plafond` | Lire `llm_budget_retry_unreachable` **avant de toucher quoi que ce soit** : si l'enveloppe est un multiple exact du plafond, la dernière tentative nominale est inatteignable par construction. Décaler l'un des deux nombres hors du multiple, ou accepter — jamais rallonger l'enveloppe par réflexe |
+
+**Ce que `retrying` veut dire depuis mika#2362.** La valeur n'est émise que si la tentative suivante peut **effectivement** tourner : budget *et* deadline. Avant, elle ignorait la deadline, donc une ligne `retrying` immédiatement suivie d'un `deadline_abort` était le régime nominal d'une géométrie sans marge — impossible à distinguer d'un vrai retry. Ce couple est désormais **anormal** : s'il réapparaît, le prédicat partagé n'est pas lu par les deux sites émetteurs et le correctif n'a pas pris. Corollaire pour la lecture d'historique : une comparaison `GROUP BY outcome` qui enjambe le déploiement compare deux vocabulaires.
 
 **Critère de halte explicite.** Si les cinq hangs suivants ne portent **aucune** ligne `llm_call_attempt`, alors la panne est **en amont de l'appel HTTP** et toute la lignée « retry / borne » est hors sujet. C'est un résultat, pas un échec de l'instrument.
 
