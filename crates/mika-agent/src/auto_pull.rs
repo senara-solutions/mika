@@ -1230,6 +1230,19 @@ const FILTER_PROBE_ERROR: &str = "state_probe_failed";
 /// A seat verdict refused without naming itself (defensive; see
 /// [`crate::webhook_dispatch::SeatVerdict::refusal_reason`]).
 const FILTER_SEAT_REFUSED: &str = "seat_refused";
+/// The tracking row is terminal but the pilot it dispatched is still alive
+/// (mika#2279).
+///
+/// Deliberately **not** folded into [`FILTER_IN_FLIGHT`], even though both mean
+/// "a dispatch is running, wait". That population *is* the mika#2279 symptom —
+/// a parent cancelled out from under a working pilot — and its count is the
+/// direct answer to "is the defect still occurring?". Merged into the nominal
+/// in-flight count it would be invisible: a permanent wedge hidden inside a
+/// transient, which is the mika#2131 doctrine's own sentence. It should tend to
+/// zero once the ready-label gate is deployed; a count that does not decrease
+/// names a producer of orphaned parents to be treated at its source, not
+/// filtered harder.
+const FILTER_LIVE_PILOT: &str = "live_pilot_orphaned_parent";
 /// `ready` was removed by a non-machine actor and not re-applied since: the
 /// ticket is parked, and [`ready_label::apply_ready`] refused to write (mika#2315).
 ///
@@ -1514,6 +1527,10 @@ struct StuckReadyFacts {
     has_open_pr: bool,
     /// A self_dev task is in flight for this ticket.
     in_flight: bool,
+    /// The tracking row is terminal, yet the pilot it dispatched is still alive
+    /// (mika#2279). Resolved **only when [`Self::in_flight`] is false** — the
+    /// nominal case is already excluded and must not pay for a `/proc` probe.
+    live_pilot: bool,
     /// `auto_pull_stats.failure_count` is at or past the circuit-breaker threshold.
     circuit_broken: bool,
     /// Successful re-drives since the last observed progress.
@@ -1630,6 +1647,30 @@ fn classify_stuck_ready(
     if facts.in_flight {
         return StuckReadyVerdict::Skip {
             reason: FILTER_IN_FLIGHT,
+        };
+    }
+
+    // mika#2279 — the same wait, behind a tracking row that no longer says so.
+    //
+    // `in_flight` above reads one row: `reference_url LIKE …` AND a live status.
+    // A supersession cancels the parent while its pilot keeps working, so that
+    // conjunction goes false on a ticket whose dispatch is very much running —
+    // and Phase 2 then re-drove the label, every 20 minutes, killing a working
+    // pilot each round (measured on #2276, 2026-09-10). This branch is that
+    // blind spot, read through `live_pilot`, which traverses parent → child.
+    //
+    // **Ordered after `in_flight`, never before.** The nominal case is already
+    // excluded up there and must not be charged a `/proc` probe; the caller
+    // resolves this fact only when `in_flight` is false, so in steady state —
+    // where the population of terminal-parent-live-pilot tickets is empty — this
+    // costs nothing.
+    //
+    // `Skip`, never `SkipAndResetBudget`: waiting for a pilot is right, calling
+    // the wait a success is what made the mika#2020 budget unreachable
+    // (mika#2158, measured at 31 re-drives against a counter reading 1).
+    if facts.live_pilot {
+        return StuckReadyVerdict::Skip {
+            reason: FILTER_LIVE_PILOT,
         };
     }
 
@@ -3258,6 +3299,24 @@ async fn phase2_reconcile_stuck_ready(
             in_flight_issue_numbers.insert(n);
         }
 
+        // Filter 4b (DB + /proc, mika#2279): the tracking row is terminal but
+        // its pilot is still alive. Probed **only when filter 4 said no** — a
+        // ticket with a live parent is already excluded, and the nominal case
+        // must not be charged for this. The population this reaches is normally
+        // empty, which is what bounds the cost of the probe to nothing.
+        //
+        // `Unreadable` proceeds exactly like `None`: a signal that cannot be read
+        // is never a satisfied term (see `live_pilot`'s module doc). That is also
+        // why this reads `is_alive()` rather than matching on the negative — the
+        // one inversion that would freeze a ticket on a supposition.
+        let live_pilot = if in_flight {
+            false
+        } else {
+            crate::live_pilot::live_pilot_for_issue(db, &issue_url)
+                .await
+                .is_alive()
+        };
+
         // Filter 5 (DB, cheap): circuit-breaker. Fail-open on error.
         let circuit_broken = match db.get_auto_pull_failure_count(DEFAULT_REPO, n).await {
             Ok(count) => count >= CIRCUIT_BREAKER_THRESHOLD,
@@ -3281,6 +3340,7 @@ async fn phase2_reconcile_stuck_ready(
         let facts = StuckReadyFacts {
             has_open_pr: open_pr_issue_numbers.contains(&n),
             in_flight,
+            live_pilot,
             circuit_broken,
             redrive_count,
             abandoned,
@@ -5258,6 +5318,7 @@ This ticket has been GROOMED and is ready.
         StuckReadyFacts {
             has_open_pr: false,
             in_flight: false,
+            live_pilot: false,
             circuit_broken: false,
             redrive_count,
             abandoned: false,
@@ -6042,5 +6103,229 @@ This ticket has been GROOMED and is ready.
                 reason: FILTER_CIRCUIT_BREAKER
             }
         );
+
+        // mika#2279 — the fifth. Deliberately NOT folded into
+        // `in_flight_self_dev`: this population *is* the #2279 symptom and its
+        // count is the direct measure of "is the defect still occurring?".
+        assert_eq!(FILTER_LIVE_PILOT, "live_pilot_orphaned_parent");
+        let mut f = facts(0);
+        f.live_pilot = true;
+        assert_eq!(
+            classify_stuck_ready(&clean, &f, 3),
+            StuckReadyVerdict::Skip {
+                reason: FILTER_LIVE_PILOT
+            }
+        );
+    }
+
+    // ── mika#2279: Phase 2 does not re-drive a ticket whose pilot is alive ──
+
+    /// INVARIANT : a live pilot behind a terminal parent **skips without
+    /// spending or resetting the budget**.
+    ///
+    /// The two halves matter for different reasons. *Skip*: re-driving the label
+    /// would supersede the tracking row of a working pilot and — since
+    /// mika#2335 — kill it. *Without resetting*: mika#2158 measured what a
+    /// counter zeroed by the action it counts is worth (31 re-drives on #1772
+    /// while `redrive_count` said 1). Waiting for a pilot is right; calling the
+    /// wait a success is what made the guard unreachable.
+    #[test]
+    fn mika2279_a_live_pilot_skips_without_touching_the_budget() {
+        let issue = make_issue(2276, GROOMED_BODY, &["ready"], "t");
+        let mut f = facts(2);
+        f.live_pilot = true;
+
+        let verdict = classify_stuck_ready(&issue, &f, 3);
+        assert_eq!(
+            verdict,
+            StuckReadyVerdict::Skip {
+                reason: FILTER_LIVE_PILOT
+            },
+            "un pilote vif derrière un parent terminal doit être un skip nommé"
+        );
+        assert!(
+            !matches!(verdict, StuckReadyVerdict::SkipAndResetBudget { .. }),
+            "INVARIANT VIOLÉ : attendre un pilote n'est pas un succès — un compteur \
+             remis à zéro par l'action qu'il compte ne borne rien (mika#2158)"
+        );
+    }
+
+    /// Contrôle négatif (b) du contrat de vérification : **pilote mort ⇒
+    /// re-drive nominal.** Le terme est une conjonction, et c'est ici qu'on
+    /// vérifie que le neutraliser rend bien le ticket éligible plutôt que de
+    /// laisser passer un refus inconditionnel.
+    ///
+    /// La moitié « le pilote mort rend bien `None` » est attestée une couche plus
+    /// bas — `live_pilot::tests::a_dead_pilot_is_none_not_unreadable` et
+    /// `tests/eval/test_auto_pull_live_pilot_filter_2279.rs`, qui la mesure sur un
+    /// vrai processus.
+    #[test]
+    fn mika2279_a_dead_pilot_leaves_the_redrive_nominal() {
+        let issue = make_issue(2276, GROOMED_BODY, &["ready"], "t");
+        assert_eq!(
+            classify_stuck_ready(&issue, &facts(0), 3),
+            StuckReadyVerdict::Eligible,
+            "contrôle négatif : sans pilote vif le ticket reste éligible au re-drive"
+        );
+    }
+
+    /// L'ordre des deux branches est porteur : un ticket dont le parent est
+    /// VIVANT est déjà exclu par `in_flight`, et la sonde `/proc` ne doit pas lui
+    /// être facturée. Le classifieur pur en est le témoin — si la branche
+    /// `live_pilot` remontait au-dessus d'`in_flight`, ce test nommerait le
+    /// mauvais filtre et l'appelant paierait une sonde par tick sur le cas
+    /// nominal.
+    #[test]
+    fn mika2279_the_nominal_in_flight_case_is_still_named_in_flight() {
+        let issue = make_issue(2276, GROOMED_BODY, &["ready"], "t");
+        let mut f = facts(0);
+        f.in_flight = true;
+        f.live_pilot = true;
+        assert_eq!(
+            classify_stuck_ready(&issue, &f, 3),
+            StuckReadyVerdict::Skip {
+                reason: FILTER_IN_FLIGHT
+            },
+            "un parent vivant reste `in_flight_self_dev` — sinon les deux \
+             populations fusionnent et le compte de #2279 ment"
+        );
+    }
+
+    /// Le câblage, de bout en bout et sans réseau : un `ready` dont le parent est
+    /// `cancelled` et dont le pilote tourne est **sauté par Phase 2**, une ligne
+    /// d'exclusion `live_pilot_orphaned_parent` est écrite, et le budget de
+    /// re-drive n'est pas touché.
+    ///
+    /// Aucun appel `gh` n'est fait : le ticket est écarté au filtre 4b, donc
+    /// avant l'étape des âges de label. C'est aussi ce qui rend ce test
+    /// hermétique.
+    ///
+    /// Rouge-avant : retirer le bloc « Filter 4b » de
+    /// `phase2_reconcile_stuck_ready` — le ticket redevient survivant, le ledger
+    /// ne porte plus la ligne, et l'assertion sur le filtre échoue.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn mika2279_phase2_skips_a_ready_ticket_whose_pilot_is_alive() {
+        use crate::db::{Database, NewTask};
+        use mika_common::label_write::{LabelWriteToken, LabelWriteTokenSource};
+
+        let db = AsyncDatabase::new_with_agent(
+            Database::open_in_memory().expect("open in-memory DB"),
+            "mika",
+        );
+        let n = 2276u64;
+        let url = format!("https://github.com/{DEFAULT_REPO}/issues/{n}");
+
+        // La topologie de production : l'URL sur le parent (annulé), le pgid sur
+        // l'enfant. Le pilote est ce process-ci — vivant par construction.
+        let parent = db
+            .create_task(NewTask {
+                agent_id: "mika".to_string(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: format!("ready-label: {DEFAULT_REPO}#{n}"),
+                trigger_type: "manual".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: "none".to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: Some("s".to_string()),
+                created_trace_id: None,
+                reference_url: Some(url.clone()),
+                source: Some("self_dev".to_string()),
+                metadata: None,
+                r#type: Some("issue".to_string()),
+                dispatch_class: Some("implement".to_string()),
+            })
+            .await
+            .expect("create parent");
+        db.update_task_status(&parent, "cancelled")
+            .await
+            .expect("cancel parent");
+
+        let pid = std::process::id();
+        let start_time = crate::task_engine::process_liveness::read_process_start_time(pid)
+            .expect("read own start time");
+        let child = db
+            .create_task(NewTask {
+                agent_id: "mika".to_string(),
+                team_run_id: None,
+                parent_task_id: Some(parent.clone()),
+                depth: 1,
+                label: "long_running:run_claude_pilot".to_string(),
+                trigger_type: "callback".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: "resume_agent".to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: Some("s".to_string()),
+                created_trace_id: None,
+                reference_url: None,
+                source: Some("self_dev".to_string()),
+                metadata: None,
+                r#type: None,
+                dispatch_class: Some("implement".to_string()),
+            })
+            .await
+            .expect("create child");
+        db.set_task_process_id(&child, Some(i64::from(pid)))
+            .await
+            .expect("record pgid");
+        db.set_task_metadata_field(&child, "process_start_time", &start_time.to_string())
+            .await
+            .expect("record start time");
+
+        let issues = vec![make_issue(n, GROOMED_BODY, &["ready"], "t")];
+        let auth = LabelWriteToken::new("fake-token".to_string(), LabelWriteTokenSource::Pat);
+        let mut ledger = ExclusionLedger::default();
+
+        let rescued = phase2_reconcile_stuck_ready(
+            &db,
+            "fake-token",
+            &auth,
+            &issues,
+            &HashSet::new(),
+            "trace",
+            "session",
+            &mut ledger,
+        )
+        .await;
+
+        assert_eq!(
+            rescued, 0,
+            "INVARIANT VIOLÉ : Phase 2 a re-drivé un ticket dont le pilote tourne — \
+             c'est le battement de label mesuré sur #2276 (labeled → unlabeled → \
+             labeled toutes les ~20 min, par le moteur lui-même)"
+        );
+        assert!(
+            ledger
+                .entries
+                .contains(&(ExclusionPhase::Phase2StuckReady, n, FILTER_LIVE_PILOT)),
+            "l'exclusion doit être comptable sous son propre nom — la confondre \
+             avec `in_flight_self_dev` cacherait un blocage permanent dans un \
+             transitoire (doctrine mika#2131) ; ledger = {:?}",
+            ledger.entries
+        );
+
+        let (redrives, abandoned) = db
+            .get_auto_pull_redrive_state(DEFAULT_REPO, n)
+            .await
+            .expect("read redrive state");
+        assert_eq!(
+            redrives, 0,
+            "attendre un pilote ne dépense pas le budget de re-drive"
+        );
+        assert!(!abandoned, "et ne mène pas à l'abandon du ticket");
     }
 }
