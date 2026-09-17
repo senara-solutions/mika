@@ -179,6 +179,7 @@ async fn run_callback(harness: &EvalHarness, label: &str, result: &str) {
     let skills_dirty = AtomicBool::new(false);
     let params = SilentAgentParams {
         tier: harness.tier,
+        deployment: mika_common::home::Deployment::Unknown,
         db: &harness.db,
         llm: harness.llm.as_ref(),
         tools: &harness.tools,
