@@ -16,7 +16,9 @@ use mika_a2a::jsonrpc::{
     A2aMethod, INTERNAL_ERROR, INVALID_PARAMS, JsonRpcError, JsonRpcId, JsonRpcRequest,
     JsonRpcResponse, METHOD_NOT_FOUND, TASK_NOT_CANCELABLE, TASK_NOT_FOUND,
 };
-use mika_a2a::params::{CALLER_SESSION_ID_KEY, MessageSendParams, TaskIdParams, TaskQueryParams};
+use mika_a2a::params::{
+    CALLER_SESSION_ID_KEY, MessageSendParams, ONLY_SKILLS_KEY, TaskIdParams, TaskQueryParams,
+};
 use mika_a2a::state_machine::TaskStateMachine;
 use mika_a2a::streaming::{StreamEvent, TaskStatusUpdateEvent};
 use mika_a2a::types::{Message, Part, Role, Task, TaskState, TaskStatus};
@@ -135,6 +137,7 @@ async fn run_a2a_agent(
     input_text: &str,
     task_id: &str,
     stream_ctx: Option<Arc<mika_a2a::streaming::ToolCallStreamContext>>,
+    only_skills: &[String],
 ) -> Result<Option<String>, String> {
     // Hot-reload skills if dirty
     let skills = if agent_state.skills_dirty.load(Ordering::Acquire) {
@@ -160,6 +163,33 @@ async fn run_a2a_agent(
         new
     } else {
         agent_state.skills.lock().unwrap().clone()
+    };
+
+    // Per-turn restriction (mika#2363). The clone is what keeps this off the
+    // shared registry: `skills` above is the `Arc` two concurrent turns hold, and
+    // restricting through it would give one turn's `only_skills` to the other.
+    // The restricted registry is never written back into
+    // `*agent_state.skills.lock()`.
+    //
+    // An empty request leaves `skills` untouched — same `Arc`, no clone, no
+    // allocation — so a caller that declares nothing gets today's turn byte for
+    // byte.
+    let skills = if only_skills.is_empty() {
+        skills
+    } else {
+        let mut restricted = (*skills).clone();
+        let outcome = restricted.apply_only_skills(only_skills);
+        info!(
+            event = "a2a_only_skills_applied",
+            agent = %agent_state.db.agent_id(),
+            task_id = %task_id,
+            requested = %only_skills.join(","),
+            kept = %outcome.kept.join(","),
+            evicted_count = outcome.evicted.len(),
+            unknown_count = outcome.unknown.len(),
+            "restricted this turn's skill registry to the caller's declared set"
+        );
+        Arc::new(restricted)
     };
 
     let is_onboarding = check_onboarding(&agent_state.db).await;
@@ -219,6 +249,38 @@ fn caller_session_id(params: &MessageSendParams) -> Option<&str> {
         .as_ref()?
         .get(CALLER_SESSION_ID_KEY)?
         .as_str()
+}
+
+/// Extract the caller's declared skill restriction from request metadata
+/// (mika#2363).
+///
+/// Returns the names the caller wants kept, or an empty vector when it declared
+/// nothing. Every malformed shape — key absent, `null`, not an array, an array
+/// with non-string or blank entries — degrades to "no restriction" rather than
+/// to an error: a caller from an older or a newer version of the protocol must
+/// not be able to fail a turn with a field this server is free to ignore.
+/// Non-string entries inside an otherwise valid array are dropped individually,
+/// so one bad element does not discard the caller's whole declaration.
+///
+/// The names are not validated here. Whether this agent carries a given skill is
+/// `SkillRegistry::apply_only_skills`'s question — it is the only layer that
+/// holds the registry to answer it.
+fn requested_only_skills(params: &MessageSendParams) -> Vec<String> {
+    params
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get(ONLY_SKILLS_KEY))
+        .and_then(|v| v.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Refuse a request that could not get the agent lock, and make the refusal
@@ -645,27 +707,37 @@ async fn handle_message_send(
         // mika#2270: the returned text is KEPT. It used to be dropped with `Ok(_)`
         // right here, one line before the Task was rebuilt from the database — so
         // an empty rebuild lost an answer the process was still holding.
-        let turn_text =
-            match run_a2a_agent(state, agent_state, &session_id, &input_text, &task_id, None).await
-            {
-                Ok(text) => {
-                    let _ = agent_state
-                        .db
-                        .a2a_update_task_state(&task_id, "completed")
-                        .await;
+        let only_skills = requested_only_skills(&params);
 
-                    info!(task_id = %task_id, "A2A task completed via agent loop");
-                    TurnText::Produced(text)
-                }
-                Err(e) => {
-                    error!(error = %e, task_id = %task_id, "A2A agent loop failed");
-                    let _ = agent_state
-                        .db
-                        .a2a_update_task_state(&task_id, "failed")
-                        .await;
-                    TurnText::LoopFailed
-                }
-            };
+        let turn_text = match run_a2a_agent(
+            state,
+            agent_state,
+            &session_id,
+            &input_text,
+            &task_id,
+            None,
+            &only_skills,
+        )
+        .await
+        {
+            Ok(text) => {
+                let _ = agent_state
+                    .db
+                    .a2a_update_task_state(&task_id, "completed")
+                    .await;
+
+                info!(task_id = %task_id, "A2A task completed via agent loop");
+                TurnText::Produced(text)
+            }
+            Err(e) => {
+                error!(error = %e, task_id = %task_id, "A2A agent loop failed");
+                let _ = agent_state
+                    .db
+                    .a2a_update_task_state(&task_id, "failed")
+                    .await;
+                TurnText::LoopFailed
+            }
+        };
 
         match agent_state
             .db
@@ -803,6 +875,11 @@ async fn handle_message_stream(
     let state_clone = state.clone();
     let agent_state_clone = Arc::clone(agent_state);
     let input_text = extract_text_from_parts(&params.message.parts);
+    // mika#2363: `message/stream` shares `MessageSendParams` with `message/send`,
+    // so it reads the same key. Honouring it on one port and ignoring it on the
+    // other would make the field mean different things on two endpoints of the
+    // same protocol, which is worse than not having it.
+    let only_skills = requested_only_skills(&params);
     let broadcasters = Arc::clone(&state.a2a_broadcasters);
     tokio::spawn(async move {
         let _broadcaster_guard = BroadcasterGuard {
@@ -817,6 +894,7 @@ async fn handle_message_stream(
             task_id: task_id_clone,
             context_id,
             tx,
+            only_skills,
         };
 
         // The kill-switch path already holds the lock — it was taken in the
@@ -979,6 +1057,10 @@ struct StreamTurn {
     task_id: String,
     context_id: Option<String>,
     tx: broadcast::Sender<StreamEvent>,
+    /// Per-turn skill restriction (mika#2363), empty when the caller declared
+    /// none. Carried here rather than re-read in the spawned task because
+    /// `params` does not survive the spawn.
+    only_skills: Vec<String>,
 }
 
 /// Run the streaming turn. The guard is taken by value and dropped with this
@@ -992,6 +1074,7 @@ async fn run_a2a_stream_turn(_lock_guard: OwnedMutexGuard<()>, turn: StreamTurn)
         task_id,
         context_id,
         tx,
+        only_skills,
     } = turn;
 
     // Transition to working
@@ -1030,6 +1113,7 @@ async fn run_a2a_stream_turn(_lock_guard: OwnedMutexGuard<()>, turn: StreamTurn)
         &input_text,
         &task_id,
         stream_ctx_for_agent,
+        &only_skills,
     )
     .await
     {
@@ -1678,5 +1762,113 @@ mod tests {
         ] {
             assert_eq!(caller_session_id(&with_key(value)), None);
         }
+    }
+
+    // --- mika#2363: the per-turn skill restriction (V2, R3, R4) ----------------
+
+    fn with_only_skills(value: serde_json::Value) -> MessageSendParams {
+        params_with_metadata(Some(HashMap::from([(ONLY_SKILLS_KEY.to_string(), value)])))
+    }
+
+    #[test]
+    fn mika2363_only_skills_is_read_from_request_metadata() {
+        let params = with_only_skills(serde_json::json!(["mika-arch-groom-ticket"]));
+        assert_eq!(
+            requested_only_skills(&params),
+            vec!["mika-arch-groom-ticket".to_string()]
+        );
+    }
+
+    #[test]
+    fn mika2363_absent_metadata_means_no_restriction() {
+        // R3: the byte-for-byte-unchanged path. An empty vector is what
+        // `run_a2a_agent` short-circuits on, so this is the assertion that a
+        // caller declaring nothing gets the pre-mika#2363 turn.
+        assert!(requested_only_skills(&params_with_metadata(None)).is_empty());
+        assert!(
+            requested_only_skills(&params_with_metadata(Some(HashMap::new()))).is_empty(),
+            "an empty metadata map declares nothing"
+        );
+    }
+
+    #[test]
+    fn mika2363_an_empty_array_is_treated_as_absent() {
+        // Deliberately NOT read as "keep no skills". Nobody means that by an
+        // empty array, and reading it that way would let a serialization quirk
+        // silently strip a turn of every skill it has.
+        assert!(requested_only_skills(&with_only_skills(serde_json::json!([]))).is_empty());
+    }
+
+    #[test]
+    fn mika2363_malformed_shapes_degrade_to_no_restriction() {
+        // A field this server is free to ignore must never be able to fail a
+        // turn — same discipline as `caller_session_id` above.
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(42),
+            serde_json::json!("mika-arch-groom-ticket"),
+            serde_json::json!({"skill": "mika-arch-groom-ticket"}),
+        ] {
+            assert!(
+                requested_only_skills(&with_only_skills(value.clone())).is_empty(),
+                "unexpected restriction parsed out of {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn mika2363_bad_entries_are_dropped_individually() {
+        // One malformed element must not discard the caller's whole declaration:
+        // dropping the array would silently restore the triple injection this
+        // ticket exists to remove.
+        let params = with_only_skills(serde_json::json!([
+            "mika-arch-groom-ticket",
+            42,
+            "  ",
+            null,
+            "  mika-arch-second-review  "
+        ]));
+        assert_eq!(
+            requested_only_skills(&params),
+            vec![
+                "mika-arch-groom-ticket".to_string(),
+                "mika-arch-second-review".to_string()
+            ]
+        );
+    }
+
+    /// V5 / R4, structural. A restriction is `&mut`, so applying it to the
+    /// registry behind `AgentState.skills` would leak one turn's `only_skills`
+    /// into every concurrent turn of the same agent. The clone is the mechanism
+    /// that prevents it, and its removal would break no assertion anywhere: the
+    /// turn would still be correctly restricted, and the *next* turn would be
+    /// silently wrong. Hence a lexical guard rather than a behavioural test.
+    #[test]
+    fn mika2363_the_restriction_is_applied_to_a_clone_and_never_written_back() {
+        // Production half only — this test module quotes the same identifiers,
+        // and counting its own assertions would make the guard report itself.
+        let source = include_str!("a2a.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("split always yields a first element");
+
+        assert_eq!(
+            source.matches("apply_only_skills(").count(),
+            1,
+            "the restriction must be applied at exactly one site in this module"
+        );
+        assert!(
+            source.contains("let mut restricted = (*skills).clone();"),
+            "the restriction must be applied to a per-turn clone of the shared registry"
+        );
+        // One writer, and it is the hot-reload path — not the restriction.
+        let writebacks = source
+            .matches("*agent_state.skills.lock().unwrap() =")
+            .count();
+        assert_eq!(
+            writebacks, 1,
+            "expected exactly one write to the cached registry (the dirty-reload); \
+             found {writebacks} — a restricted registry must never be one of them"
+        );
     }
 }
