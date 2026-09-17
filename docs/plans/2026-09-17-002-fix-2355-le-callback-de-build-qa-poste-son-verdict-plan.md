@@ -261,8 +261,50 @@ réussi, le moteur poste lui-même `VERDICT: hold[review]` sur la PR, en réutil
 traitement idempotent du 422, corps adapté au motif (*ce tour n'a pas conclu*,
 pas *ce tour a été coupé*).
 
-Deux pièces manquent pour que ce soit possible, et toutes deux suivent une
-trajectoire déjà employée :
+**Le token est `hold[review]` et rien d'autre, et ce n'est pas un choix de
+registre : c'est une contrainte de sûreté.** `server/verdict_handler.rs` intercepte
+`pull_request_review.submitted` **avant** le tour LLM et route déterministement sur
+la ligne `VERDICT:` — `pass` → **merge** via `pr_merge_with_gate`, `block[ac]` /
+`block[ci]` → dispatch d'un pilote de correction, `hold[review]` → notifier
+l'opérateur et laisser la tâche `in_progress`. Un filet qui poserait `pass` au
+motif que *le build a réussi* **mergerait donc la PR sans qu'aucun diff ait été
+revu**. C'est la même classe de dégât qu'AC1b garde côté prompt, par un autre
+chemin. Corollaire positif : le verdict du filet n'est pas décoratif — il est lu
+par la machine d'état, qui sort la PR du silence et la remet devant un humain.
+C'est ce qui fait de B3 un filet et non une trace.
+
+**Réutiliser `deadline_verdict` est une généralisation, pas un appel — trois
+contraintes de source, à connaître avant d'écrire la première ligne.**
+
+- **(C1) La porte d'entrée de la fonction refuse précisément notre cas.** La
+  première ligne de `maybe_post_deadline_verdict` est
+  `let Some(overrun) = input.overrun else { return NotApplicable("turn_completed") }`
+  — et `overrun` vaut `None` exactement quand le tour s'est terminé proprement,
+  c'est-à-dire dans **tout** le périmètre de B3 (F4). Le motif de déclenchement
+  (`overrun: Option<DeadlineOverrun>`) doit donc devenir un **motif énuméré**
+  (`CutOffByDeadline` | `CallbackConcludedWithoutVerdict`), dont dépendent aussi le
+  corps posté et la ligne de journal : les deux disent aujourd'hui *« tour de revue
+  coupé par sa deadline »*, ce qui serait faux et trompeur sur notre chemin. Le
+  call-site existant (`handlers.rs:1536`) suit mécaniquement.
+- **(C2) La cible est stampée, mais la fonction la dérive.** `DeadlineVerdictInput`
+  porte `event_text: &str` et appelle `parse_pr_target`. Deux formes possibles, et
+  on tranche pour la seconde : re-stamper le *texte d'événement* (zéro changement de
+  signature, mais la cible se re-dérive tard et peut échouer au pire moment) ou
+  admettre une cible **déjà résolue**. La seconde est cohérente avec « dite, jamais
+  dérivée » et déplace l'échec possible au moment du stamp, où il est observable.
+- **(C3) `build_callback_task` a cinq appelants de production, pas un.**
+  `executor.rs:3109`, `ready_label_handler.rs:700`, `dispatcher.rs:3125`,
+  `dispatcher.rs:5833`, `verdict_handler.rs:833` — plus quatre tests d'eval qui
+  l'appellent **délibérément** parce que la fixture doit passer par le chemin
+  d'écriture de production (mika#2272 : *« la fixture doit venir du site de
+  construction de production ou elle se mesure elle-même »*). Le stamp se fait donc
+  par un paramètre supplémentaire porté par cette signature unique, **jamais** par
+  un second constructeur : le doc-comment de la fonction interdit explicitement la
+  dérive entre sites de construction, et c'est la classe de bug que sa consolidation
+  a fermée. Coût assumé et borné : neuf sites à toucher, dont huit passent `None`.
+
+Deux pièces manquent ensuite, et toutes deux suivent une trajectoire déjà
+employée :
 
 - **La cible PR doit traverser la frontière du tour.** Le tour de callback n'a
   pas `req.text` et ne peut donc pas `parse_pr_target`. Elle lui est **dite, jamais
@@ -338,8 +380,21 @@ assertables sans production.
    → **un** POST `pr review` portant `VERDICT: hold[review]`. Poster injecté,
    comme `maybe_post_deadline_verdict` le fait déjà : le contrat à asserter est
    *« un verdict EST posté »*, ce qu'un test ne voit qu'en tenant l'exécution.
+4b. **B3 ne peut poser qu'un token inerte** — le verdict du filet est
+   `hold[review]`, asserté **sur la constante** (`DEADLINE_VERDICT_LINE`) et non
+   sur une chaîne recopiée ; et le parseur de `verdict_handler` classe ce corps en
+   `hold[review]`, donc en « notifier l'opérateur », jamais en `pass` (→ merge) ni
+   en `block[*]` (→ dispatch d'un pilote). Ce test ne garde pas une préférence de
+   vocabulaire : il garde le fait qu'un filet de sûreté ne peut pas, par une
+   édition ultérieure du corps, se mettre à **merger des PR non revues**.
 5. **B3 fail-safe** — pas de stamp / stamp illisible / cible absente → zéro POST
    et une ligne nommant l'abstention.
+5b. **C1 figé** — le motif `CallbackConcludedWithoutVerdict` produit un POST là où
+   le tour n'a **pas** dépassé sa deadline. Rouge avant la généralisation, puisque
+   `maybe_post_deadline_verdict` répond aujourd'hui `NotApplicable("turn_completed")`
+   sur exactement cette entrée. Jumeau : le motif `CutOffByDeadline` conserve le
+   comportement de mika#2276 à l'identique, corps et ligne de journal compris — la
+   généralisation ne doit pas réécrire le filet qui marche.
 6. **B3 anti-double-post** — un tour qui **a** posté son verdict n'en reçoit pas
    un second. Pinne la propagation du registre : sans elle ce test est rouge,
    c'est-à-dire que le filet doublerait chaque revue réussie.
@@ -357,6 +412,9 @@ assertables sans production.
 - Les trois commentaires devenus faux sont corrigés dans le même commit que le
   code qui les dément (#870 « only one callback flow », le framing générique,
   `// Silent mode: no session-scoped dedup needed`).
+- Le stamp de cible PR passe par la signature unique de `build_callback_task`
+  (C3), jamais par un constructeur parallèle ; les quatre tests d'eval qui
+  l'appellent restent verts sans être contournés.
 - `docs/` et `CLAUDE.md` : nouvelles variables d'observation et signaux grep
   documentés ; `scripts/sync-agent-docs.sh` si `docs/` bouge.
 - PR ouverte avec le corps écrit sous le worktree (mika#2211).
@@ -385,6 +443,15 @@ assertables sans production.
 - **AC5** — Filet : un tour de callback de build QA terminé sans verdict, avec
   une cible PR stampée, produit exactement **un** POST `pr review` portant
   `VERDICT: hold[review]`.
+- **AC5b** — Le filet ne pose qu'un verdict **inerte** : le corps porte
+  `hold[review]`, que `server/verdict_handler.rs` route vers « notifier
+  l'opérateur, laisser la tâche `in_progress` ». Aucun chemin du filet ne peut
+  produire `pass` (qui **merge** via `pr_merge_with_gate`) ni `block[ac]`/`block[ci]`
+  (qui dispatchent un pilote). Un filet qui merge une PR jamais revue serait un
+  dégât strictement pire que le silence qu'il remplace.
+- **AC5c** — La généralisation du motif de `deadline_verdict` (C1) ne change rien
+  au filet mika#2276 : sur un tour coupé par sa deadline, corps posté, ligne de
+  journal et registre anti-double-post sont identiques à avant le correctif.
 - **AC6** — Filet fail-safe : stamp absent, illisible, ou cible non résoluble →
   **zéro** POST, et une ligne de journal nommant l'abstention et son motif.
 - **AC7** — Anti-double-post : un tour de callback qui a posté son propre verdict
@@ -416,6 +483,12 @@ assertables sans production.
   vérifie **avant** de se féliciter que les verdicts reviennent. **Halte** — un
   verdict sans `DIFF ANALYSIS` réelle ⇒ revenir sur l'en-tête de portée, ne pas
   se contenter du test unitaire qui l'aura pourtant validé.
+- **Sonde 2c (aucun merge non revu).** Sur les premières PR touchées, aucune n'est
+  mergée sans revue soumise portant une `DIFF ANALYSIS`. C'est le contrôle de la
+  contrainte de sûreté de B3 : `verdict_handler` merge sur `pass`, donc une
+  régression du corps du filet se lirait en production comme des PR qui passent
+  toutes seules. **Halte immédiate** si une PR est mergée sans revue : désarmer le
+  filet avant tout diagnostic.
 - **Sonde 3 (contrôle négatif).** `grep qa_deadline_verdict $MIKA_SPIRIT_LOG_FILE | jq 'select(.outcome == "posted")'`
   — le filet mika#2276 ne doit pas se mettre à firer : ce correctif ne rallonge
   aucun tour.
