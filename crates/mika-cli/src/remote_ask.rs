@@ -93,15 +93,9 @@ fn build_send_params(
         );
     }
     if !only_skills.is_empty() {
-        fields.insert(
-            ONLY_SKILLS_KEY.to_string(),
-            serde_json::Value::Array(
-                only_skills
-                    .iter()
-                    .map(|s| serde_json::Value::String(s.clone()))
-                    .collect(),
-            ),
-        );
+        // A `&[String]` serializes to a JSON array of strings, which is exactly
+        // the shape the server reads.
+        fields.insert(ONLY_SKILLS_KEY.to_string(), serde_json::json!(only_skills));
     }
     let metadata = if fields.is_empty() {
         None

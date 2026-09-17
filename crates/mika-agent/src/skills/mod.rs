@@ -872,6 +872,29 @@ impl SkillRegistry {
         result
     }
 
+    /// Is a skill by this name currently loaded? Case-insensitive, like every
+    /// other name comparison in this module.
+    fn is_loaded_skill_name(&self, name: &str) -> bool {
+        self.skills
+            .iter()
+            .any(|e| e.manifest.skill.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Does this registry know a skill by this name at all — loaded, or evicted
+    /// into `disabled`?
+    ///
+    /// The distinction matters to two callers that answer opposite questions with
+    /// it: `apply_transient_disable` reports an unknown name as `not_found`, and
+    /// `apply_only_skills` reports it as `unknown`. "Known but disabled" is a
+    /// no-op for both and must not be confused with "never heard of it".
+    fn is_known_skill_name(&self, name: &str) -> bool {
+        self.is_loaded_skill_name(name)
+            || self
+                .disabled
+                .iter()
+                .any(|d| d.name.eq_ignore_ascii_case(name))
+    }
+
     /// Apply transient disable overrides from CLI flags.
     ///
     /// For each skill name, finds the matching entry (case-insensitive) and evicts
@@ -890,17 +913,9 @@ impl SkillRegistry {
         let disable_names: Vec<&String> = skill_names
             .iter()
             .filter(|name| {
-                // Check if the skill is loaded
-                let in_loaded = self
-                    .skills
-                    .iter()
-                    .any(|e| e.manifest.skill.name.eq_ignore_ascii_case(name));
-                // Check if already disabled (no-op)
-                let in_disabled = self
-                    .disabled
-                    .iter()
-                    .any(|d| d.name.eq_ignore_ascii_case(name));
-                if !in_loaded && !in_disabled {
+                let in_loaded = self.is_loaded_skill_name(name);
+                // Already disabled is a no-op, not a not-found.
+                if !in_loaded && !self.is_known_skill_name(name) {
                     result.not_found.push((*name).clone());
                     false
                 } else {
@@ -981,15 +996,7 @@ impl SkillRegistry {
             .collect();
 
         for wanted in only_names {
-            let known = self
-                .skills
-                .iter()
-                .any(|e| e.manifest.skill.name.eq_ignore_ascii_case(wanted))
-                || self
-                    .disabled
-                    .iter()
-                    .any(|d| d.name.eq_ignore_ascii_case(wanted));
-            if !known {
+            if !self.is_known_skill_name(wanted) {
                 result.unknown.push(wanted.clone());
             }
         }
