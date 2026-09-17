@@ -1776,10 +1776,16 @@ fn classify_stuck_ready(
 ///
 /// Only the two skip verdicts are exclusions that carry no trace of their own.
 /// `Eligible` is not an exclusion; `ReEntry` emits `auto_pull_redrive_reentry`
-/// INFO; `Abandon` emits `auto_pull_redrive_abandoned` WARN plus its own audit
-/// row plus a comment on the ticket. Recording those here would double-count
-/// them in the tick aggregate and make the number unusable for the one thing it
-/// is for — sizing how much the loop is refusing.
+/// INFO **plus its own audit row** since mika#2361; `Abandon` emits
+/// `auto_pull_redrive_abandoned` WARN plus its own audit row plus a comment on
+/// the ticket. Recording those here would double-count them in the tick
+/// aggregate and make the number unusable for the one thing it is for — sizing
+/// how much the loop is refusing.
+///
+/// A `Skip` under [`FILTER_ABANDONED_OPERATOR_HELD`] *does* also post a comment
+/// (mika#2361), and that is deliberately not an exception to the rule above: it
+/// is an exclusion, it belongs in the tick aggregate, and the comment is a
+/// second surface for the same fact rather than a trace that replaces this one.
 ///
 /// Shared by the async loop and the AC4 replay test, so the test exercises the
 /// production mapping rather than a copy of it that can drift.
