@@ -26,6 +26,45 @@ Since mika#2189 the threshold is **derived from the effective per-call plafond**
 
 **Timeout budgets (mika#2189).** `llm/budget.rs` owns `LlmTimeoutBudget`, the pair `(per-call plafond, per-agent envelope)` from which those three thresholds and `max_attempts` are computed — so a budget cannot be half-configured. `validate()` refuses `plafond >= envelope` (a configuration where one call may consume the whole envelope leaves the agent loop nothing for a second step) and is called from `create_provider_with_budget`, the cold path where mika#1660's too-small-plafond panic already lives. Providers carry the budget they were built with and surface it via `LlmProvider::timeout_budget()` — the agent loop reads its deadline from **there** rather than from a constant of its own, which is what stops the plafond and the envelope drifting apart again. `from_env()` reads `MIKA_LLM_HTTP_TIMEOUT_SECS` and `MIKA_AGENT_TOTAL_TIMEOUT_SECS`; `Settings::llm_timeout_budget()` supplies the per-agent form (`llm_http_timeout_secs` / `agent_total_timeout_secs` in `config.toml`) and returns it **unvalidated on purpose** — validation belongs at provider construction, and a getter that validated would give the invariant two homes. `timeout_budget()`'s default impl re-reads the environment, which is right for mocks and for the Anthropic rail; note `claude.rs` still poses its own `120s` literal instead of reading the plafond — a real inconsistency, named as out of scope by mika#2189 rather than bundled into it.
 
+**Declared worst case (mika#2342).** `LlmProvider::worst_case_failure_secs()` is
+what the agent-loop watchdog is sized on (`agent_loop::run_loop`, see
+`mika-agent/CLAUDE.md` § *LLM-call watchdog*). It is **asked of the rail**, not
+derived from the budget, and the difference is load-bearing: the default returns
+`timeout_budget().worst_case_failure_secs(DEFAULT_ATTEMPTS_HARD_CAP)`, which is
+right for any rail whose transport honours the budget it was built with — but
+`AnthropicProvider` **overrides** it, because `claude.rs` hands `reqwest` the
+literal `ANTHROPIC_HTTP_TIMEOUT_SECS` (120) instead of reading the plafond. At
+`MIN_HTTP_TIMEOUT_SECS` a derived value would answer 40 s for a transport that
+can physically take 480, and a watchdog sized on that would cut healthy calls: a
+guaranteed false positive. The override does not make `claude.rs` consistent —
+that stays out of scope, named by mika#2189 — it converts a silent trap into a
+declared value. `MAX_ATTEMPTS_HARD_CAP` moved from `openai.rs` to
+`llm/mod.rs::DEFAULT_ATTEMPTS_HARD_CAP` in the same change: a default method on
+the trait cannot read a constant private to one rail's module, and the move
+removed two copies rather than adding a third.
+
+`MockLlmProvider` is the one rail deliberately outside that population
+(`llm::tests::mika2342_mock_is_excluded_from_the_declared_worst_case_population`):
+it has no transport, so "the declared worst case covers the transport's real
+worst case" has no referent for it — **no follow-up ticket, and that is stated
+rather than implied**. It is also the one rail where the watchdog is the *first*
+cancellation mechanism instead of the second, which is why the property is
+phrased conditionally at the call site. The exception carries a self-cleaning
+assertion: the day the mock gains a budget of its own, it goes red.
+
+**Per-attempt instrumentation (mika#2342).** `llm_call started` is emitted once,
+*before* the retry chain, and used to carry neither the chain's width nor the
+request size — so N silent bounded attempts and one unbounded call read
+identically. Each rail now emits `llm_call_attempt` immediately before
+`send_once` with `attempt`, `max_attempts` and `request_bytes`, and `started`
+carries `max_attempts` too. The Anthropic rail cannot measure the brief itself
+(it only ever sees the converted `MessagesRequest`), so `AnthropicProvider`
+threads `LlmRequest::payload_bytes()` down through
+`ClaudeClient::send_message_with_deadline` — one measure for the three rails
+rather than a second one free to disagree. When it is genuinely absent the event
+says so via `request_bytes_measured`, instead of a `0` indistinguishable from an
+empty request.
+
 **Budget provenance (mika#2293).** `llm/budget_provenance.rs` answers the question mika#2189 shipped without: *which* plafond and envelope is this agent actually running under, and **through which door of the cascade**. mika-arch got `240/900` in its `config.toml` on 2026-09-06 and the 2026-09-11 measurement still saw cuts at 120 s exactly — the fleet default — with no line of log anywhere able to say what annulled it. `BudgetProvenance::resolve(global_home, agent_home)` reports, per key, a `BudgetSource` (`agent_dotenv` / `process_env` / `agent_config` / `global_config` / `default`), the raw string as written, and what it parses to; `log_llm_budget_resolved` emits the `llm_budget_resolved` INFO event from the two callers that already know the agent (`server::init_agent`, `teams::engine`) — **ungated** by `MIKA_STORE_LLM_CALLS`, because a configuration event has to stay readable exactly when telemetry was cut to reduce noise, and deduplicated on the resolved pair so a repetition is silent while a *change* is re-emitted.
 
 The five sources split three remedies that nothing else separates: `agent_config` says the setting is in force and the cause is elsewhere; `process_env` says a fleet-wide variable is shadowing the per-agent file; `default` says the file was never read or never carried the key. `global_config` is split out of `agent_config` deliberately — the question is whether the *per-agent* setting took, and answering "per-agent" for a value from the shared `~/.mika/config.toml` would answer it wrongly.

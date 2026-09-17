@@ -66,11 +66,24 @@ const SESSION_ID_HINT: &str = "qa-review";
 /// la sortie du moteur est la même.
 async fn run_until_deadline_exceeded() -> mika_agent::agent_loop::AgentOutput {
     let responses = vec![
-        // L'appel LLM traverse la deadline (6 min virtuelles) et rend un
-        // tool_call — la boucle itère, et le contrôle de deadline en tête
-        // d'itération sort en `DeadlineExceeded`.
+        // L'appel LLM traverse la deadline et rend un tool_call — la boucle
+        // itère, et le contrôle de deadline en tête d'itération sort en
+        // `DeadlineExceeded`.
         delayed_response(
-            360_000,
+            // mika#2342 D8 — valeur encadrée des deux côtés, et les deux bornes
+            // portent :
+            //   > 1 s   la deadline, sinon l'appel ne la traverse plus et ce
+            //           test cesse de tester le verdict d'enveloppe ;
+            //   < 300 s le filet de `run_loop` à la géométrie de test
+            //           (`MockLlmProvider` hérite du budget 120/300 par défaut,
+            //           donc pire cas = 2 × 120 = 240, + 60 de marge = 300).
+            // C'était 360 s, que le filet couperait désormais AVANT la deadline :
+            // le tour sortirait par une erreur transport au lieu de
+            // `LoopResult::DeadlineExceeded`, et ce test attesterait autre chose
+            // que son titre. La valeur est abaissée plutôt que le filet désarmé
+            // en test — une exception qui neutralise le détecteur qu'elle exempte
+            // n'est pas une exception, c'est un retrait déguisé en réglage.
+            200_000,
             tool_call_response("search_memory", json!({"query": "review the diff"})),
         ),
         // Sentinelle : jamais consommée si la deadline garde bien la porte.

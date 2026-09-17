@@ -57,9 +57,14 @@ impl LlmProvider for AnthropicProvider {
     ) -> Result<LlmResponse, LlmError> {
         let anthropic_request = to_anthropic_request(request);
 
+        // mika#2342 D4/AC3: measured on the provider-agnostic request, the same
+        // way the two OpenAI-shaped rails measure it, and threaded down so the
+        // per-attempt event on this rail reports a comparable number.
+        let request_bytes = request.payload_bytes() as u64;
+
         let response = self
             .client
-            .send_message_with_deadline(&anthropic_request, deadline)
+            .send_message_with_deadline(&anthropic_request, deadline, Some(request_bytes))
             .await
             .map_err(|e| LlmError::ProviderError(e.to_string()))?;
 
@@ -76,6 +81,26 @@ impl LlmProvider for AnthropicProvider {
 
     fn max_tokens(&self) -> u32 {
         self.client.max_tokens
+    }
+
+    /// The rail's **real** worst case, declared rather than derived
+    /// (mika#2342 D3 / E7).
+    ///
+    /// This rail does not honour `LlmTimeoutBudget`: `ClaudeClient::new` hands
+    /// `reqwest` the literal [`ANTHROPIC_HTTP_TIMEOUT_SECS`] and its loop runs
+    /// [`ANTHROPIC_MAX_ATTEMPTS`] attempts. The trait default would report
+    /// `budget.worst_case_failure_secs(..)` instead — and since
+    /// `MIN_HTTP_TIMEOUT_SECS` is 10, an operator may legally configure a 10 s
+    /// plafond, which would make the default answer 40 s for a transport that
+    /// can physically take 480. The agent-loop watchdog sized on that would cut
+    /// healthy calls: a guaranteed false positive.
+    ///
+    /// Overriding here does **not** make `claude.rs` consistent with the
+    /// configured plafond — that stays out of scope, named by mika#2189. It
+    /// converts a silent trap into a value the watchdog can trust.
+    fn worst_case_failure_secs(&self) -> u64 {
+        crate::claude::ANTHROPIC_HTTP_TIMEOUT_SECS
+            * u64::from(crate::claude::ANTHROPIC_MAX_ATTEMPTS)
     }
 
     fn supports_tool_calling(&self) -> bool {
