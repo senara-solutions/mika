@@ -3119,6 +3119,18 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Count the `messages` rows behind an empty rebuilt Task (mika#2270).
+    ///
+    /// See `Database::a2a_message_census` for how the pair is read.
+    pub async fn a2a_message_census(
+        &self,
+        session_id: &str,
+        trace_id: &str,
+    ) -> Result<crate::a2a_db::A2aMessageCensus> {
+        let (s, t) = (session_id.to_owned(), trace_id.to_owned());
+        self.with_db(move |db| db.a2a_message_census(&s, &t)).await
+    }
+
     /// Resolve the most recent A2A task id for a caller-supplied context id.
     ///
     /// The recovery read behind mika#2036; see `Database::a2a_find_task_id_by_context`.

@@ -19,7 +19,7 @@ use mika_a2a::jsonrpc::{
 use mika_a2a::params::{CALLER_SESSION_ID_KEY, MessageSendParams, TaskIdParams, TaskQueryParams};
 use mika_a2a::state_machine::TaskStateMachine;
 use mika_a2a::streaming::{StreamEvent, TaskStatusUpdateEvent};
-use mika_a2a::types::{Message, Part, Role, TaskState, TaskStatus};
+use mika_a2a::types::{Message, Part, Role, Task, TaskState, TaskStatus};
 
 use crate::a2a_card::build_agent_card;
 use crate::a2a_db::extract_text_from_parts;
@@ -300,6 +300,230 @@ async fn note_wait(
     );
 }
 
+/// The text a completed turn that produced none is served with.
+///
+/// `message/stream` has served this literal since it was written; mika#2270 gives
+/// `message/send` the same semantics, and the shared constant is what makes "the
+/// same" checkable rather than a coincidence between two string literals.
+const COMPLETED_WITHOUT_TEXT: &str = "Task completed.";
+
+/// What the agent loop left in `handle_message_send`'s hand.
+///
+/// Named rather than an `Option<Option<String>>` because the three states are
+/// semantically distinct and the nesting reads as a mistake: the loop failing, the
+/// loop producing nothing, and the loop producing text are three different things
+/// to do with a rebuilt Task.
+enum TurnText {
+    /// The loop finished. `Some` when it produced text of its own.
+    Produced(Option<String>),
+    /// The loop failed; the task is `failed` and there is no answer to serve.
+    LoopFailed,
+}
+
+/// What `message/send` must do about the Task it has just rebuilt (mika#2270).
+///
+/// Kept pure so the three outcomes can be asserted without a server, a database
+/// or a network — including the one that must change nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContentNet {
+    /// The Task carries readable text. Serve it untouched: byte-identical to the
+    /// pre-mika#2270 response, which is what AC3 pins.
+    Nominal,
+    /// The Task is empty and the loop produced nothing either. Serve the same
+    /// literal `message/stream` serves. **Not** a loss — this is the shape of a
+    /// turn that legitimately had nothing to say, and counting it as a loss would
+    /// make the WARN useless by burying it in false positives.
+    MuteTurn,
+    /// The Task is empty and the loop's own answer is still in hand. Serve it, and
+    /// say so: this is mika#2270's founding failure, the 43 108 input tokens paid
+    /// for and thrown away.
+    Rescued { text: String },
+}
+
+/// Decide the net from the rebuilt Task and the loop's own answer.
+///
+/// The emptiness predicate is [`mika_a2a::render::render_task_text`] — the very
+/// function the CLI renders with. That sharing is load-bearing: a server-side
+/// approximation could call a Task fine while the client found nothing readable,
+/// which is precisely the gap this net exists to close.
+///
+/// Whitespace-only loop text counts as no text. It cannot be served (the renderer
+/// would reject it right back) and reporting it as a rescued answer would be a
+/// false positive on the one signal that must stay trustworthy.
+fn decide_content_net(task: &Task, loop_text: Option<&str>) -> ContentNet {
+    if mika_a2a::render::render_task_text(task).is_ok() {
+        return ContentNet::Nominal;
+    }
+    match loop_text.filter(|t| !t.trim().is_empty()) {
+        Some(text) => ContentNet::Rescued {
+            text: text.to_string(),
+        },
+        None => ContentNet::MuteTurn,
+    }
+}
+
+/// The facts that decide mika#2270's cause at the first recurrence — and only
+/// those.
+///
+/// A WARN that repeats the symptom teaches nothing. These fields exist to
+/// separate the two hypotheses `a2a_get_messages`' predicate leaves open (see
+/// `Database::a2a_message_census`), so the follow-up ticket can be opened on a
+/// measurement rather than on a guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContentLostReport {
+    task_id: String,
+    context_id: Option<String>,
+    session_id: String,
+    /// The id the agent loop stamped its rows with. Equal to `task_id` today —
+    /// `run_a2a_agent` passes it as `AgentParams.trace_id` — and reported anyway,
+    /// because that equality is exactly what a future reader has to be able to
+    /// check rather than assume.
+    trace_id: String,
+    /// Conversational rows this session holds; `None` when the census itself failed.
+    messages_for_session: Option<i64>,
+    /// Conversational rows carrying this trace id; `None` when the census failed.
+    messages_for_trace: Option<i64>,
+    /// Byte length of the text the net saved.
+    saved_text_len: usize,
+}
+
+impl ContentLostReport {
+    /// One line for the `audit_events` row, so the SQL surface carries the same
+    /// facts as the log without a join.
+    fn reasoning(&self) -> String {
+        fn count(value: Option<i64>) -> String {
+            value.map_or_else(|| "unreadable".to_string(), |n| n.to_string())
+        }
+        format!(
+            "message/send rebuilt an empty Task for a turn that produced {} bytes of text; \
+             served from the loop's own answer. session={}, trace={}, context={}, \
+             messages_for_session={}, messages_for_trace={}",
+            self.saved_text_len,
+            self.session_id,
+            self.trace_id,
+            self.context_id.as_deref().unwrap_or("none"),
+            count(self.messages_for_session),
+            count(self.messages_for_trace),
+        )
+    }
+}
+
+/// Make sure a terminal Task served by `message/send` carries text (mika#2270).
+///
+/// `run_a2a_agent` returns the turn's text, and this port used to discard it with
+/// `Ok(_)` before rebuilding the Task from the database — so when that rebuild came
+/// back empty, the answer was lost while still in the process's hand. The
+/// `message/stream` port never had the defect: it serves the returned text
+/// directly.
+///
+/// After this call, a Task served here always carries at least one non-empty slice.
+/// That guarantee is what makes the CLI's fail-closed rendering safe: with the
+/// "completed but empty" class removed from this port, the client can treat every
+/// empty Task as a loss without ever misreading a legitimately mute turn.
+///
+/// **The net does not hide the defect, and that restraint is the point of the
+/// brick.** A silent repair would turn the loop green and make the fault
+/// permanently invisible — building the next occurrence of mika#2270. Hence the
+/// WARN and the audit row, carrying the facts that settle the cause.
+///
+/// SOLE WRITER of `a2a_send_task_content_lost`, in the log and in `audit_events`.
+/// Its absence under a symptom is therefore information: it says the loss is not
+/// here. Reusing the name elsewhere would destroy exactly that property.
+async fn ensure_send_task_carries_text(
+    agent_state: &Arc<AgentState>,
+    task: &mut Task,
+    loop_text: Option<&str>,
+    session_id: &str,
+) {
+    let (text, saved_len) = match decide_content_net(task, loop_text) {
+        ContentNet::Nominal => return,
+        ContentNet::MuteTurn => (COMPLETED_WITHOUT_TEXT.to_string(), None),
+        ContentNet::Rescued { text } => {
+            let len = text.len();
+            (text, Some(len))
+        }
+    };
+
+    let task_id = task.id.clone();
+    let context_id = task.context_id.clone();
+    task.status.message = Some(agent_text_message(&task_id, context_id.clone(), text));
+
+    // A mute turn is served, not reported: nothing was produced, so nothing was
+    // lost.
+    let Some(saved_text_len) = saved_len else {
+        return;
+    };
+
+    let census = agent_state
+        .db
+        .a2a_message_census(session_id, &task_id)
+        .await;
+    let (messages_for_session, messages_for_trace) = match census {
+        Ok(c) => (Some(c.session_rows), Some(c.trace_rows)),
+        Err(e) => {
+            // An unreadable census must not swallow the loss report — the report
+            // is the load-bearing half, the counts only sharpen it.
+            error!(error = %e, task_id = %task_id, "a2a_send_task_census_unreadable");
+            (None, None)
+        }
+    };
+
+    let report = ContentLostReport {
+        task_id,
+        context_id,
+        session_id: session_id.to_string(),
+        trace_id: task.id.clone(),
+        messages_for_session,
+        messages_for_trace,
+        saved_text_len,
+    };
+
+    tracing::warn!(
+        task_id = %report.task_id,
+        context_id = report.context_id.as_deref().unwrap_or("none"),
+        session_id = %report.session_id,
+        trace_id = %report.trace_id,
+        messages_for_session = ?report.messages_for_session,
+        messages_for_trace = ?report.messages_for_trace,
+        saved_text_len = report.saved_text_len,
+        "a2a_send_task_content_lost"
+    );
+
+    if let Err(e) = agent_state
+        .db
+        .log_audit_event(
+            &report.session_id,
+            "a2a_send_task_content_lost",
+            &format!("a2a_task:{}", report.task_id),
+            None,
+            Some(&report.saved_text_len.to_string()),
+            Some(&report.reasoning()),
+            Some(&report.trace_id),
+        )
+        .await
+    {
+        tracing::warn!(error = %e, task_id = %report.task_id, "a2a_send_task_content_lost_audit_failed");
+    }
+}
+
+/// An agent-role message carrying one text part.
+fn agent_text_message(task_id: &str, context_id: Option<String>, text: String) -> Message {
+    Message {
+        message_id: Uuid::new_v4().to_string(),
+        role: Role::Agent,
+        parts: vec![Part::Text {
+            text,
+            metadata: None,
+        }],
+        context_id,
+        task_id: Some(task_id.to_string()),
+        metadata: None,
+        reference_task_ids: None,
+        extensions: None,
+        kind: "message".to_string(),
+    }
+}
+
 /// Handle `message/send` — synchronous message processing via the real agent loop.
 async fn handle_message_send(
     state: &AppState,
@@ -416,23 +640,31 @@ async fn handle_message_send(
 
         // Run the real agent loop. Non-streaming `message/send` path — no
         // broadcast subscriber, so pass `None`.
-        match run_a2a_agent(state, agent_state, &session_id, &input_text, &task_id, None).await {
-            Ok(_) => {
-                let _ = agent_state
-                    .db
-                    .a2a_update_task_state(&task_id, "completed")
-                    .await;
+        //
+        // mika#2270: the returned text is KEPT. It used to be dropped with `Ok(_)`
+        // right here, one line before the Task was rebuilt from the database — so
+        // an empty rebuild lost an answer the process was still holding.
+        let turn_text =
+            match run_a2a_agent(state, agent_state, &session_id, &input_text, &task_id, None).await
+            {
+                Ok(text) => {
+                    let _ = agent_state
+                        .db
+                        .a2a_update_task_state(&task_id, "completed")
+                        .await;
 
-                info!(task_id = %task_id, "A2A task completed via agent loop");
-            }
-            Err(e) => {
-                error!(error = %e, task_id = %task_id, "A2A agent loop failed");
-                let _ = agent_state
-                    .db
-                    .a2a_update_task_state(&task_id, "failed")
-                    .await;
-            }
-        }
+                    info!(task_id = %task_id, "A2A task completed via agent loop");
+                    TurnText::Produced(text)
+                }
+                Err(e) => {
+                    error!(error = %e, task_id = %task_id, "A2A agent loop failed");
+                    let _ = agent_state
+                        .db
+                        .a2a_update_task_state(&task_id, "failed")
+                        .await;
+                    TurnText::LoopFailed
+                }
+            };
 
         match agent_state
             .db
@@ -442,7 +674,19 @@ async fn handle_message_send(
             )
             .await
         {
-            Ok(Some(task)) => {
+            Ok(Some(mut task)) => {
+                // A failed loop is served as `failed` with nothing to say — the
+                // client turns that state into a named error of its own, so the net
+                // has neither a text to serve nor a loss to report.
+                if let TurnText::Produced(text) = &turn_text {
+                    ensure_send_task_carries_text(
+                        agent_state,
+                        &mut task,
+                        text.as_deref(),
+                        &session_id,
+                    )
+                    .await;
+                }
                 let result = serde_json::to_value(&task).unwrap_or_default();
                 Json(JsonRpcResponse::success(request.id, result)).into_response()
             }
@@ -789,21 +1033,12 @@ async fn run_a2a_stream_turn(_lock_guard: OwnedMutexGuard<()>, turn: StreamTurn)
     .await
     {
         Ok(response_text) => {
-            let text = response_text.unwrap_or_else(|| "Task completed.".to_string());
-            let response_message = Message {
-                message_id: Uuid::new_v4().to_string(),
-                role: Role::Agent,
-                parts: vec![Part::Text {
-                    text,
-                    metadata: None,
-                }],
-                context_id: context_id.clone(),
-                task_id: Some(task_id.clone()),
-                metadata: None,
-                reference_task_ids: None,
-                extensions: None,
-                kind: "message".to_string(),
-            };
+            // mika#2270: the literal is shared with `message/send`, which now
+            // serves the same one for a turn that produced no text. Two ports
+            // answering the same situation identically is a property worth being
+            // able to check.
+            let text = response_text.unwrap_or_else(|| COMPLETED_WITHOUT_TEXT.to_string());
+            let response_message = agent_text_message(&task_id, context_id.clone(), text);
 
             let _ = agent_state
                 .db
@@ -1292,6 +1527,143 @@ mod tests {
             serde_json::Value::String("s1".to_string()),
         )])));
         assert_eq!(caller_session_id(&params), None);
+    }
+
+    // --- mika#2270: `message/send` stops throwing away the answer it holds -----
+
+    fn completed_task(status_message: Option<Message>) -> Task {
+        Task {
+            id: "951dc60c-23cd-420d-8981-cdc0b7fd91be".to_string(),
+            context_id: Some("ctx-2266".to_string()),
+            status: TaskStatus {
+                state: TaskState::Completed,
+                message: status_message,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+            kind: "task".to_string(),
+        }
+    }
+
+    fn agent_reply(text: &str) -> Message {
+        agent_text_message(
+            "951dc60c-23cd-420d-8981-cdc0b7fd91be",
+            None,
+            text.to_string(),
+        )
+    }
+
+    /// **AC1.** The measured mika#2270 shape: the loop produced a full plan review
+    /// and the rebuilt Task came back empty. The text is in hand, so it is served.
+    #[test]
+    fn a_turn_whose_task_rebuilt_empty_is_served_from_the_loop_text() {
+        let task = completed_task(None);
+        assert_eq!(
+            decide_content_net(&task, Some("Disposition: READY")),
+            ContentNet::Rescued {
+                text: "Disposition: READY".to_string()
+            }
+        );
+    }
+
+    /// **AC3.** The nominal case must decide *nothing*. This is the assertion that
+    /// keeps the net from biting where it should not: a correctable failure on the
+    /// return channel that alters healthy replies is worse than the silence it
+    /// replaces.
+    #[test]
+    fn a_task_that_already_carries_content_is_left_alone() {
+        let task = completed_task(Some(agent_reply("Disposition: READY")));
+        assert_eq!(
+            decide_content_net(&task, Some("ignored")),
+            ContentNet::Nominal
+        );
+        // …and equally when the loop returned nothing: the Task is the answer.
+        assert_eq!(decide_content_net(&task, None), ContentNet::Nominal);
+    }
+
+    /// **AC6.** A turn that produced no text is not a loss. It is served with the
+    /// same literal `message/stream` serves, which is what removes the whole
+    /// "completed but empty" class from this port — and therefore what lets the CLI
+    /// treat every empty Task as a loss without a false positive.
+    #[test]
+    fn a_mute_turn_is_served_with_the_stream_literal_and_is_not_a_loss() {
+        let task = completed_task(None);
+        assert_eq!(decide_content_net(&task, None), ContentNet::MuteTurn);
+    }
+
+    /// Whitespace-only text is no text: it could not be served (the renderer would
+    /// reject it straight back) and reporting it as a rescue would be a false
+    /// positive on the one signal that has to stay trustworthy.
+    #[test]
+    fn whitespace_only_loop_text_counts_as_no_text() {
+        let task = completed_task(None);
+        for blank in ["", "   ", "\n\t "] {
+            assert_eq!(decide_content_net(&task, Some(blank)), ContentNet::MuteTurn);
+        }
+    }
+
+    /// **AC2, the report half.** The six diagnostic facts must reach the operator,
+    /// including the `trace_id`/`task_id` equality — reported rather than assumed,
+    /// because the day it stops holding is the day the census stops meaning
+    /// anything.
+    #[test]
+    fn the_loss_report_carries_the_facts_that_settle_the_cause() {
+        let report = ContentLostReport {
+            task_id: "951dc60c".to_string(),
+            context_id: Some("ctx-2266".to_string()),
+            session_id: "probe-a".to_string(),
+            trace_id: "951dc60c".to_string(),
+            messages_for_session: Some(2),
+            messages_for_trace: Some(0),
+            saved_text_len: 1481,
+        };
+        let reasoning = report.reasoning();
+        for needle in [
+            "probe-a",
+            "951dc60c",
+            "ctx-2266",
+            "messages_for_session=2",
+            "messages_for_trace=0",
+            "1481",
+        ] {
+            assert!(reasoning.contains(needle), "missing {needle}: {reasoning}");
+        }
+    }
+
+    /// An unreadable census must not swallow the report — the counts sharpen the
+    /// diagnosis, they are not a precondition for admitting the loss.
+    #[test]
+    fn an_unreadable_census_still_reports_the_loss() {
+        let report = ContentLostReport {
+            task_id: "951dc60c".to_string(),
+            context_id: None,
+            session_id: "probe-a".to_string(),
+            trace_id: "951dc60c".to_string(),
+            messages_for_session: None,
+            messages_for_trace: None,
+            saved_text_len: 12,
+        };
+        let reasoning = report.reasoning();
+        assert!(reasoning.contains("messages_for_session=unreadable"));
+        assert!(reasoning.contains("messages_for_trace=unreadable"));
+        assert!(reasoning.contains("context=none"));
+    }
+
+    /// **SOLE WRITER.** `a2a_send_task_content_lost` is written at exactly one
+    /// site, in the log and in `audit_events`. That is what makes its *absence*
+    /// under a symptom informative — it says the loss is not here. A second writer
+    /// would break no test about the decision, which is why this guard is lexical:
+    /// the regression would make nothing wrong, only unattributable.
+    #[test]
+    fn the_loss_signal_has_exactly_one_writer_in_this_module() {
+        let source = include_str!("a2a.rs");
+        let emissions = source.matches("\"a2a_send_task_content_lost\"").count();
+        assert_eq!(
+            emissions, 2,
+            "expected exactly two emission literals (one WARN, one audit row), found {emissions}"
+        );
     }
 
     #[test]

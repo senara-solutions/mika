@@ -27,6 +27,20 @@ struct A2aMessageMeta {
     a2a_metadata: Option<HashMap<String, serde_json::Value>>,
 }
 
+/// The two counts that make an empty rebuilt Task diagnosable (mika#2270).
+///
+/// Read them as a pair: `session_rows == 0 && trace_rows == 0` says nothing was
+/// persisted for this turn at all; `session_rows > 0 && trace_rows == 0` says rows
+/// exist but do not carry this trace id, so the loss is in the stamping rather
+/// than in the write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct A2aMessageCensus {
+    /// Conversational rows this session holds, whatever their trace id.
+    pub session_rows: i64,
+    /// Conversational rows carrying this trace id, whatever their session.
+    pub trace_rows: i64,
+}
+
 /// Map A2A state strings to internal task status values.
 fn a2a_state_to_task_status(state: &str) -> &'static str {
     match state {
@@ -387,6 +401,35 @@ impl Database {
             });
         }
         Ok(messages)
+    }
+
+    /// Row counts that separate the two hypotheses behind an empty rebuilt Task
+    /// (mika#2270).
+    ///
+    /// [`Self::a2a_get_messages`] filters on `session_id` **and**
+    /// (`trace_id` OR `metadata.a2a_task_id`). When it returns nothing, two
+    /// incompatible stories fit the evidence: the turn was never persisted, or it
+    /// was persisted under a different trace id. Counting each half of that
+    /// predicate separately tells them apart — which is the whole reason
+    /// `a2a_send_task_content_lost` carries these two numbers instead of leaving an
+    /// operator to open the database at the first recurrence.
+    pub fn a2a_message_census(&self, session_id: &str, trace_id: &str) -> Result<A2aMessageCensus> {
+        let session_rows: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM messages \
+             WHERE session_id = ?1 AND role IN ('user', 'assistant')",
+            rusqlite::params![session_id],
+            |row| row.get(0),
+        )?;
+        let trace_rows: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM messages \
+             WHERE trace_id = ?1 AND role IN ('user', 'assistant')",
+            rusqlite::params![trace_id],
+            |row| row.get(0),
+        )?;
+        Ok(A2aMessageCensus {
+            session_rows,
+            trace_rows,
+        })
     }
 
     // === A2A Artifacts (genuinely new — kept as-is) ===
@@ -1315,6 +1358,100 @@ mod tests {
         let task = db.a2a_build_task("t1", None).unwrap().unwrap();
         assert!(task.history.is_none());
         assert!(task.artifacts.is_none());
+    }
+
+    // --- mika#2270: the derivation behind tier 3, and the census behind the WARN -
+
+    /// **AC7.** `a2a_build_task` derives `status.message` from the **last
+    /// agent-role** message of `history`, not from the last message. That is a
+    /// property of the code and was never a written contract — and it is exactly
+    /// what makes the renderer's "three tiers" two readings of one query (mika#2270
+    /// M2). The trailing user message is the whole test: a "last message overall"
+    /// implementation passes the pre-existing `build_task_status_has_last_agent_message`
+    /// and fails here.
+    #[test]
+    fn mika2270_status_message_is_the_last_agent_message_not_the_last_message() {
+        let db = db();
+        db.a2a_create_task("t1", "mika", None, None).unwrap();
+
+        for (id, role, text) in [
+            ("m1", mika_a2a::types::Role::User, "first request"),
+            ("m2", mika_a2a::types::Role::Agent, "Disposition: READY"),
+            ("m3", mika_a2a::types::Role::User, "follow-up request"),
+        ] {
+            db.a2a_insert_message("t1", "mika", &make_message(id, role, text))
+                .unwrap();
+        }
+
+        let task = db.a2a_build_task("t1", None).unwrap().unwrap();
+        let history = task.history.as_ref().expect("history");
+        assert_eq!(history.len(), 3, "all three rows must be in history");
+
+        let status_msg = task.status.message.expect("status.message");
+        assert_eq!(
+            status_msg.message_id, "m2",
+            "status.message must be the last AGENT message, not the last message"
+        );
+        assert_eq!(status_msg.role, mika_a2a::types::Role::Agent);
+    }
+
+    /// The `status.message` tier cannot outlive the `history` tier: both come from
+    /// `a2a_get_messages`, so an empty read empties both. This is the fact that
+    /// makes a "defence in depth" reading of the renderer false, and the fact the
+    /// server-side net exists because of.
+    #[test]
+    fn mika2270_an_empty_message_read_empties_history_and_status_together() {
+        let db = db();
+        db.a2a_create_task("t1", "mika", None, None).unwrap();
+        db.a2a_update_task_state("t1", "completed").unwrap();
+
+        let task = db.a2a_build_task("t1", None).unwrap().unwrap();
+        assert!(task.history.is_none());
+        assert!(task.status.message.is_none());
+        assert!(task.artifacts.is_none());
+    }
+
+    /// **AC2, the census half.** The pair must separate "nothing was persisted"
+    /// from "persisted under another trace id" — the two hypotheses `a2a_get_messages`'
+    /// predicate leaves open. Without that separation the WARN would restate the
+    /// symptom and the follow-up ticket would be opened on a guess.
+    #[test]
+    fn mika2270_the_census_separates_nothing_persisted_from_wrong_trace() {
+        let db = db();
+        let session = db.a2a_create_task("t1", "mika", None, None).unwrap();
+
+        // Nothing persisted at all.
+        let census = db.a2a_message_census(&session, "t1").unwrap();
+        assert_eq!(census.session_rows, 0);
+        assert_eq!(census.trace_rows, 0);
+
+        // Persisted in the session, but stamped with a different trace id — the
+        // shape that would point the investigation at the stamping rather than at
+        // the write.
+        db.save_message(
+            "mika",
+            &session,
+            "assistant",
+            "Disposition: READY",
+            Some("other"),
+        )
+        .unwrap();
+        let census = db.a2a_message_census(&session, "t1").unwrap();
+        assert_eq!(census.session_rows, 1);
+        assert_eq!(census.trace_rows, 0);
+
+        // And the healthy shape, for contrast.
+        db.save_message(
+            "mika",
+            &session,
+            "assistant",
+            "Disposition: READY",
+            Some("t1"),
+        )
+        .unwrap();
+        let census = db.a2a_message_census(&session, "t1").unwrap();
+        assert_eq!(census.session_rows, 2);
+        assert_eq!(census.trace_rows, 1);
     }
 
     #[test]
