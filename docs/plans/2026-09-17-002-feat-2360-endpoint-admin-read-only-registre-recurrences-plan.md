@@ -828,6 +828,7 @@ Le fichier porte déjà ce style (`.header("authorization", "Bearer test-token-s
 | `mika2360_non_uuid_customer_id_is_rejected_before_any_forward` | **R12/T5, le test qui compte.** `customer_id = "x.attacker.example/"` (et un jeu de variantes : `../`, `a@b`, `id:8080`) → `400`, **et le serveur amont factice n'a reçu aucune requête**. L'assertion porte sur le compteur de l'amont, pas seulement sur le code : un `400` rendu *après* un forward aurait déjà fui le jeton. |
 | `mika2360_unknown_customer_id_is_404_and_does_not_forward` | Un UUID bien formé mais absent de `customers` → `404`, zéro requête amont. R12 terme 2. |
 | `mika2360_internal_token_never_reaches_an_unvalidated_host` | Garde de non-régression de la classe T5 : sur l'ensemble des entrées refusées ci-dessus, aucune requête sortante n'est émise — donc `internal_token` n'a pu partir nulle part. Le test échoue si quelqu'un déplace un jour la validation *après* la construction de l'URL. |
+| `mika2360_admin_read_writes_an_audit_row` (inline, dans `audit_events.rs`) | **R9, qui n'avait aucune ligne dans ce tableau alors qu'elle est exigée et portée au DoD.** Tient la constante `TOOL_NAME_ADMIN_READ == "gateway_admin_read"` **et** sa distinction d'avec `TOOL_NAME` (`assert_ne!`) — c'est cette seconde moitié qui empêche la fusion des deux populations que R9 refuse, et aucune assertion sur la valeur seule ne peut la voir. Tient aussi la forme `target_key == "tenant:{uuid}"`. **Sa place est inline et non `tests/`, pour une raison de visibilité et non de commodité :** `log_webhook_drop` est `pub(crate)` (`audit_events.rs:83`), donc inaccessible depuis `tests/`, qui est un crate externe — c'est exactement pourquoi `audit_events_gateway_webhook.rs` reconstruit le DDL et teste la requête plutôt que d'appeler le writer, et pourquoi son doc-comment de tête renvoie les assertions sur les constantes et le `target_key` à l'inline. Le nouveau writer suit la même visibilité, donc la même répartition. |
 | `mika2360_admin_read_token_is_redacted_in_settings_debug` (dans `settings.rs`) | **T7 e.** `format!("{:?}", settings)` sur un `GatewaySettings` dont le jeton porte une sentinelle : la sortie **contient** la chaîne `gateway_admin_read_token` (le `Debug` est exhaustif — un champ omis y est une régression silencieuse que rien d'autre ne voit, pas même le compilateur) et **ne contient pas** la sentinelle. Les deux moitiés sont nécessaires : la première seule laisserait passer un champ affiché en clair, la seconde seule laisserait passer un champ absent. **À écrire en étendant `test_debug_redacts_secrets` (`settings.rs:392`) plutôt qu'à côté** — et noter au passage que son assertion actuelle, `debug.contains("[REDACTED]")` (`:426`), est vraie dès qu'*un seul* champ est rédigé : elle ne peut pas voir l'omission d'un champ, ce qui est précisément la régression visée ici. |
 
 ### Ce que le harnais de test de la gateway permet, et ce qu'il interdit
@@ -970,16 +971,20 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 - [ ] Ligne INFO de démarrage disant l'état d'armement (R7).
 - [ ] Ligne `audit_events` `tool_name = 'gateway_admin_read'` par accès servi,
       fire-and-forget, via une constante dédiée distincte de `audit_events::TOOL_NAME` (R9).
-      Aucune migration Postgres.
+      Aucune migration Postgres. **Épinglé par `mika2360_admin_read_writes_an_audit_row`,
+      inline dans `audit_events.rs` parce que le writer y est `pub(crate)` et qu'un test de
+      `tests/` ne peut pas l'appeler** — l'assertion porte sur la constante *et* sur son
+      `assert_ne!` d'avec `TOOL_NAME`, la valeur seule ne pouvant pas voir la fusion des deux
+      populations.
 - [ ] **`openapi.rs` : aucune modification** — la surface `/admin/*` est hors du spec public
       (T7 b). Ne pas annoter le handler.
 - [ ] `crates/mika-gateway/CLAUDE.md` : la route ajoutée à la table `## Endpoints` (colonne
       Auth = *Admin read token*, pas *Internal token*) et `MIKA_GATEWAY_ADMIN_READ_TOKEN` à
       `## Gateway Environment Variables` (T7 d).
-- [ ] Les 25 tests ci-dessus passent (8 DB, 4 tenant, 13 gateway — dont **1 dans
-      `tests/admin_tenant_recurring_tasks.rs`** et **1 dans `settings.rs`**) ; clippy et fmt
-      propres. Les 24 non-`#[ignore]` passent en CI ; le 25e passe contre un Postgres jetable
-      par la commande écrite en tête de son fichier.
+- [ ] Les 26 tests ci-dessus passent (8 DB, 4 tenant, 14 gateway — dont **1 dans
+      `tests/admin_tenant_recurring_tasks.rs`**, **1 dans `settings.rs`** et **1 inline dans
+      `audit_events.rs`**) ; clippy et fmt propres. Les 25 non-`#[ignore]` passent en CI ; le
+      26e passe contre un Postgres jetable par la commande écrite en tête de son fichier.
 - [ ] Root `CLAUDE.md` : `MIKA_GATEWAY_ADMIN_READ_TOKEN` documenté (valeur, défaut, R7/R8,
       surfaces opérateur) ; `.env.example` mis à jour.
 - [ ] Échec de la résolution en base → `503` sans forward (fail-closed, §*harnais de test*).
