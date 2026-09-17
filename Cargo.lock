@@ -2265,6 +2265,7 @@ dependencies = [
  "dotenvy",
  "hex",
  "jsonwebtoken",
+ "mika-common",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

@@ -413,6 +413,21 @@ impl OpenAiCompatibleProvider {
                             last_was_transport,
                             "aborting retry chain — remaining deadline insufficient for another attempt"
                         );
+                        // mika#2331 AC2: the attempt that did NOT happen is
+                        // itself the answer to "how many times did it try?".
+                        // `elapsed_ms = 0` here measures nothing — see
+                        // `attempt_outcome::DEADLINE_ABORT`.
+                        super::emit_llm_call_attempt(
+                            &self.provider_kind.to_string(),
+                            &request.model,
+                            attempt,
+                            max_attempts,
+                            0,
+                            super::attempt_outcome::DEADLINE_ABORT,
+                            last_error.as_ref().map(|e| e.error_class()).as_deref(),
+                            self.budget.http_timeout_secs(),
+                            Some(remaining.as_millis() as u64),
+                        );
                         break;
                     }
                 }
@@ -443,7 +458,39 @@ impl OpenAiCompatibleProvider {
                 "llm_call_attempt"
             );
 
-            match self.send_once(&openai_request).await {
+            // mika#2331 AC2: the outcome line, measured around the single
+            // `send_once`, so the per-attempt duration is readable independently
+            // of how many attempts the chain ran. The mika#2342 line above marks
+            // the start of the attempt; this one says how it ended.
+            let attempt_start = Instant::now();
+            let attempt_result = self.send_once(&openai_request).await;
+            let attempt_elapsed_ms = attempt_start.elapsed().as_millis() as u64;
+            let deadline_remaining_ms =
+                deadline.map(|dl| dl.saturating_duration_since(Instant::now()).as_millis() as u64);
+            let outcome = match &attempt_result {
+                Ok(_) => super::attempt_outcome::SUCCESS,
+                Err(e) if attempt + 1 < max_attempts && e.is_retryable() => {
+                    super::attempt_outcome::RETRYING
+                }
+                Err(_) => super::attempt_outcome::EXHAUSTED,
+            };
+            super::emit_llm_call_attempt(
+                &self.provider_kind.to_string(),
+                &request.model,
+                attempt,
+                max_attempts,
+                attempt_elapsed_ms,
+                outcome,
+                attempt_result
+                    .as_ref()
+                    .err()
+                    .map(LlmError::error_class)
+                    .as_deref(),
+                self.budget.http_timeout_secs(),
+                deadline_remaining_ms,
+            );
+
+            match attempt_result {
                 Ok(response) => {
                     let llm_response = from_openai_response(response)?;
                     info!(

@@ -135,6 +135,94 @@ fn parse_http_timeout(raw: Option<&str>) -> u64 {
     secs
 }
 
+/// Outcomes an [`emit_llm_call_attempt`] line can report (mika#2331 AC2).
+pub mod attempt_outcome {
+    /// The call returned a usable response.
+    pub const SUCCESS: &str = "success";
+    /// The call failed and another attempt follows.
+    pub const RETRYING: &str = "retrying";
+    /// The call failed and no further attempt will be made — the error is not
+    /// retryable, or the attempt budget is spent.
+    pub const EXHAUSTED: &str = "exhausted";
+    /// The attempt **did not happen**: the remaining deadline could not fit
+    /// another call. `elapsed_ms` is 0 here, and that is not a measurement of a
+    /// fast call — it is the absence of one.
+    pub const DEADLINE_ABORT: &str = "deadline_abort";
+}
+
+/// Emit one structured `llm_call_attempt` INFO event per attempt of an LLM
+/// retry chain (mika#2331 AC2).
+///
+/// **The question this exists to answer.** A turn that hangs writes
+/// `input_tokens = 0`, `latency_ms ≈ 420 000`, `status = error` — and that one
+/// line is compatible with an abnormally long single attempt, with two attempts
+/// of 120 s, with four, and with a failure upstream of the call. 420 s is a
+/// multiple of no documented budget (`120/300 → ≈240 s`, `240/900 → ≈721 s`),
+/// so nothing in the code explains the number. Deciding between "one retry is
+/// enough" and "the prompt must be bounded" without first separating those
+/// cases is how mika#2293 shipped a setting on 09-06 that failed in silence
+/// until 09-11.
+///
+/// **Ungated**, like `turn_usage` (mika#1889 R2/D2) and `llm_budget_resolved`
+/// (mika#2293): the failure to diagnose is precisely the one where an operator
+/// has cut telemetry to reduce noise.
+///
+/// **All three rails emit it, including the two carrying no measured hang.** An
+/// event posted on one rail only would make a missing line read as "this turn
+/// did not retry" when it only says "this rail is not instrumented" — absence
+/// is not evidence.
+///
+/// No `correlation_id` threads through to the `turn_usage` of the same turn
+/// (D4): that would mean widening the `LlmProvider` trait or `LlmRequest` for
+/// observability alone. For the measured class — isolated 420 s hangs, not a
+/// burst — the timestamp plus `provider`/`model` re-joins the lines. Under
+/// heavy concurrency on one provider/model pair the pairing is ambiguous; that
+/// is a known blind spot, payable the day a measurement asks for it.
+/// The `error_class` field is **absent** on a success rather than carrying a
+/// `"null"` string, and `deadline_remaining_ms` is absent when the call carries
+/// no deadline — hence the two emission arms below. A string spelling "null"
+/// would be indistinguishable, under `jq`, from a class genuinely named that;
+/// an absent field lets `select(.error_class)` be the exact filter for failed
+/// attempts.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_llm_call_attempt(
+    provider: &str,
+    model: &str,
+    attempt: u32,
+    max_attempts: u32,
+    elapsed_ms: u64,
+    outcome: &str,
+    error_class: Option<&str>,
+    http_timeout_secs: u64,
+    deadline_remaining_ms: Option<u64>,
+) {
+    macro_rules! emit {
+        ($($extra:tt)*) => {
+            tracing::info!(
+                target: "mika::otel",
+                event = "llm_call_attempt",
+                provider = %provider,
+                model = %model,
+                attempt,
+                max_attempts,
+                elapsed_ms,
+                outcome = %outcome,
+                http_timeout_secs,
+                $($extra)*
+                "llm call attempt"
+            )
+        };
+    }
+    match (error_class, deadline_remaining_ms) {
+        (Some(class), Some(remaining)) => {
+            emit!(error_class = %class, deadline_remaining_ms = remaining,);
+        }
+        (Some(class), None) => emit!(error_class = %class,),
+        (None, Some(remaining)) => emit!(deadline_remaining_ms = remaining,),
+        (None, None) => emit!(),
+    }
+}
+
 /// Internal tag names that should be stripped from LLM response text.
 /// These tags are injected into conversation history for LLM context (tool history,
 /// callback results, task health, etc.) but the LLM may echo them in its response.
