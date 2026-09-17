@@ -1493,9 +1493,8 @@ mod tests {
             .into_iter()
             .filter_map(|s| {
                 let toml_src = s.files.iter().find(|f| f.path == "skill.toml")?.content;
-                let manifest: crate::skills::manifest::SkillManifest =
-                    toml::from_str(toml_src)
-                        .unwrap_or_else(|e| panic!("{} skill.toml must parse: {e}", s.name));
+                let manifest: crate::skills::manifest::SkillManifest = toml::from_str(toml_src)
+                    .unwrap_or_else(|e| panic!("{} skill.toml must parse: {e}", s.name));
                 Some(SkillEntry {
                     dir: std::path::PathBuf::from(format!("/skills/{}", manifest.skill.name)),
                     keywords_lower: vec![],
@@ -1511,12 +1510,7 @@ mod tests {
             })
             .collect();
 
-        crate::skills::SkillRegistry {
-            skipped: Vec::new(),
-            disabled: Vec::new(),
-            validated_warnings: Vec::new(),
-            skills,
-        }
+        crate::skills::SkillRegistry::from_test_entries(skills)
     }
 
     /// mika#2355 AC1 + AC1c — **tout** handler de callback bundled est
@@ -1549,7 +1543,7 @@ mod tests {
             .collect();
 
         let handlers: Vec<String> = registry
-            .skills
+            .skills()
             .iter()
             .map(|e| e.manifest.skill.name.to_ascii_lowercase())
             .filter(|n| n.ends_with("-callback"))
