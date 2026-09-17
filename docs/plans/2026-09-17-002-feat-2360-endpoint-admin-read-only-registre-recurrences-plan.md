@@ -288,13 +288,19 @@ servir. Le tri est donc `ORDER BY label COLLATE NOCASE ASC, created_at ASC`, et 
 sous-requête corrélée du point (a) groupe sur la même collation — les deux doivent s'accorder,
 sinon le booléen et le voisinage visuel racontent deux histoires différentes sur la même page.
 
-### T7 — quatre lectures sur les surfaces d'accueil, dont deux qui rectifient ce plan
+### T7 — cinq lectures sur les surfaces d'accueil, dont trois qui rectifient ce plan
 
 Les passes antérieures ont vérifié la logique métier (T1–T6) et laissé les surfaces
 d'accueil — montage du routeur, `Debug`, OpenAPI, documentation — au statut d'évidences.
-Deux d'entre elles se révèlent **fausses à la lecture**, et une exigence fausse coûte plus
+Trois d'entre elles se révèlent **fausses à la lecture**, et une exigence fausse coûte plus
 cher qu'une exigence absente : elle apprend au clavier une propriété du code qui sera
 appliquée ailleurs.
+
+La troisième, (e), rectifie une **passe antérieure de ce T7 lui-même** : (a) a réfuté une
+exigence en n'examinant qu'une des deux structs où le champ atterrit, et a conclu au-delà de
+ce qu'elle avait lu. La correction d'une sur-généralisation est du même ordre que celle d'une
+omission — et elle illustre la raison d'être de la section : une propriété affirmée trop
+largement voyage plus loin qu'une propriété absente.
 
 **(a) Le `Debug` d'`AppState` se termine par `finish_non_exhaustive()` — l'omission est
 déjà sûre.** Le §3.3 justifiait l'ajout du champ par « le `Debug` de `AppState` est rédacteur
@@ -309,6 +315,11 @@ de diagnostic, et c'est ce que le champ rend lisible sans exposer le secret. Ce 
 le classement du risque : ce n'est pas une fuite évitée, c'est une observabilité gagnée — et
 aucune entrée de risque n'est ouverte pour une fuite qui ne peut pas se produire (le tableau
 n'en portait pas — c'est la justification du §3.3, pas le tableau, qui était fausse).
+
+**Cette conclusion vaut pour `AppState` et pour elle seule — voir (e).** R6 pose le champ dans
+*deux* structs, et la seconde a la propriété inverse. Généraliser « omettre un champ secret
+d'un `Debug` est sans risque dans cette gateway » est exactement le genre de propriété fausse
+que ce T7 existe pour ne pas enseigner au clavier.
 
 **(b) `openapi.rs` de la gateway ne documente AUCUNE route `/admin/*`.** Le §3.3 et le DoD
 exigeaient d'ajouter le chemin à `paths(...)`. Or les cinq annotations `#[utoipa::path]` de
@@ -356,6 +367,43 @@ les quatre routes `/admin/customers*` et une section `## Gateway Environment Var
 Ce sont les surfaces canoniques de cette famille — celles où un opérateur cherchera la route
 et le jeton. Le DoD ne nommait que le `CLAUDE.md` racine.
 
+**(e) Les deux `Debug` sont de polarités opposées, et le secret arrive par celui que (a)
+n'a pas regardé.** R6 pose le jeton dans deux structs — `GatewaySettings` (où il est lu
+depuis l'environnement) puis `AppState` (où il est consommé). La passe T7 a n'a examiné que
+la seconde. La première a la propriété **inverse** :
+
+| Struct | Clôture du `Debug` | Champs énumérés | Un champ omis |
+|---|---|---|---|
+| `AppState` (`routes.rs:183`) | `.finish_non_exhaustive()` | 6 sur ~20 | n'est pas affiché — sûr |
+| `GatewaySettings` (`settings.rs:315`) | **`.finish()`** | **tous** | **romprait l'exhaustivité** |
+
+`GatewaySettings` énumère ses vingt-et-un champs et rédige **chacun** de ses cinq
+`Option<SecretString>` en `.map(|_| "[REDACTED]")` (`telegram_bot_token`,
+`telegram_webhook_secret`, `github_webhook_secret`, `github_app_private_key`,
+`brave_api_key`), plus `database_url` et `internal_token` en `&"[REDACTED]"` nus.
+
+Deux conséquences, et c'est la seconde qui est un mode de panne :
+
+1. La justification que T7 a déclarait fausse — « un ajout non rédigé fuirait le secret » —
+   **est vraie ici**. Un `#[derive(Debug)]` est hors de question et n'est pas en jeu ; ce qui
+   est en jeu est le geste naturel d'ajouter le champ à la struct et de passer au suivant.
+2. **Rust ne force pas l'exhaustivité d'un `Debug` manuel.** Ajouter le champ à
+   `GatewaySettings` sans toucher à son `Debug` **compile**, ne lève aucun avertissement, et
+   produit un dump de configuration où le nouveau jeton est simplement absent — silencieux,
+   donc indétectable à la relecture d'un diff qui ne montre pas le `Debug`. C'est l'inverse
+   exact du risque d'`AppState`, et il se referme par la même ligne de trois mots.
+
+**Corollaire sur la validation, qui tranche une question que R8 laissait ouverte.**
+`GatewaySettings::validate` (`settings.rs:169`) procède **par `bail!`** : `validate_hex_token`
+y est appliqué à `internal_token` sans condition (`:171`) et à `telegram_webhook_secret` sous
+single-bot mode (`:199`), et un échec fait échouer `Settings::load`, donc le démarrage. Y
+soumettre le nouveau jeton serait le geste symétrique évident — et il contredirait R8 mot pour
+mot : un jeton read mal formé downerait le routage Telegram, les webhooks GitHub et le `/send`
+de tous les tenants, pour une route d'inspection. **Le jeton admin read n'entre donc pas dans
+`validate()`** ; une valeur inexploitable désarme la route comme le fait la collision R8, avec
+le même `WARN`. Le dire ici évite qu'un implémenteur cohérent avec le voisinage produise
+précisément la rançon que R8 refuse.
+
 ---
 
 ## Requirements
@@ -398,6 +446,15 @@ est **désarmée** (traitée comme non configurée → `404`) et un `WARN` nomm�
 Désarmer plutôt que refuser le démarrage : downer toute la gateway — routage Telegram,
 webhooks GitHub, `/send` de tous les tenants — pour une route d'inspection serait une
 rançon. Le fail-closed local ne prend personne en otage, et le `WARN` rend la cause lisible.
+
+**Le même raisonnement exclut le jeton de `GatewaySettings::validate` (T7 e).** Cette
+fonction procède par `bail!` et fait échouer le démarrage ; `validate_hex_token` y est
+appliqué à `internal_token` (`settings.rs:171`) et à `telegram_webhook_secret` (`:199`).
+Aligner le nouveau jeton sur ses voisins y est le geste naturel — et il rendrait un jeton read
+mal formé capable de downer la gateway entière, c'est-à-dire la rançon que le paragraphe
+ci-dessus refuse. Toute valeur inexploitable (mal formée, ou égale à l'internal token) suit
+donc **une seule voie** : désarmement de la route + `WARN` nommé, jamais un refus de
+démarrage.
 
 **R9 — Traçabilité des accès.** Chaque appel servi écrit une ligne INFO structurée et une
 ligne `audit_events` côté gateway. Cet endpoint lit les données d'un tenant tiers : « qui a
@@ -589,6 +646,24 @@ côté pod (T3). Aucune route de mutation n'est touchée.
 pub gateway_admin_read_token: Option<SecretString>,
 ```
 
+**Et, dans le même geste, la ligne correspondante du `Debug` manuel de `GatewaySettings`**
+(`settings.rs:268-316`) :
+
+```rust
+.field(
+    "gateway_admin_read_token",
+    &self.gateway_admin_read_token.as_ref().map(|_| "[REDACTED]"),
+)
+```
+
+**Ce `Debug`-ci est exhaustif** (`.finish()`, vingt-et-un champs, cinq `Option<SecretString>`
+tous rédigés) — à l'inverse de celui d'`AppState`. L'omission n'y est pas sûre, et rien ne la
+signale : un champ ajouté à la struct sans sa ligne ici **compile sans avertissement** (T7 e).
+C'est la seule des deux structs où l'oubli a un coût, et c'est celle où le secret entre.
+
+**Le jeton n'est PAS ajouté à `GatewaySettings::validate`** — voir R8 et T7 e : cette fonction
+`bail!`, et un jeton read mal formé ne doit pas pouvoir downer la gateway.
+
 **`routes.rs` — `AppState`** : `pub admin_read_token: Option<SecretString>`, ajouté au
 `Debug` manuel comme `.map(|_| "[REDACTED]")` (`routes.rs:166-183`), sur la forme exacte que
 `webhook_secret` et `github_webhook_secret` y emploient déjà pour un `Option<SecretString>`.
@@ -737,7 +812,7 @@ Le fichier porte déjà ce style (`.header("authorization", "Bearer test-token-s
 | `mika2360_recurring_registry_returns_paginated_shape` | `{data, total, page, per_page}`. AC1. |
 | `mika2360_recurring_registry_agent_filter` | `?agent_id=` restreint bien. |
 
-### Tests d'intégration — gateway (`routes.rs`, module `tests`)
+### Tests d'intégration — gateway (`routes.rs`, module `tests` ; une entrée dans `settings.rs`)
 
 | Test | Ce qu'il tient |
 |---|---|
@@ -753,6 +828,7 @@ Le fichier porte déjà ce style (`.header("authorization", "Bearer test-token-s
 | `mika2360_non_uuid_customer_id_is_rejected_before_any_forward` | **R12/T5, le test qui compte.** `customer_id = "x.attacker.example/"` (et un jeu de variantes : `../`, `a@b`, `id:8080`) → `400`, **et le serveur amont factice n'a reçu aucune requête**. L'assertion porte sur le compteur de l'amont, pas seulement sur le code : un `400` rendu *après* un forward aurait déjà fui le jeton. |
 | `mika2360_unknown_customer_id_is_404_and_does_not_forward` | Un UUID bien formé mais absent de `customers` → `404`, zéro requête amont. R12 terme 2. |
 | `mika2360_internal_token_never_reaches_an_unvalidated_host` | Garde de non-régression de la classe T5 : sur l'ensemble des entrées refusées ci-dessus, aucune requête sortante n'est émise — donc `internal_token` n'a pu partir nulle part. Le test échoue si quelqu'un déplace un jour la validation *après* la construction de l'URL. |
+| `mika2360_admin_read_token_is_redacted_in_settings_debug` (dans `settings.rs`) | **T7 e.** `format!("{:?}", settings)` sur un `GatewaySettings` dont le jeton porte une sentinelle : la sortie **contient** la chaîne `gateway_admin_read_token` (le `Debug` est exhaustif — un champ omis y est une régression silencieuse que rien d'autre ne voit, pas même le compilateur) et **ne contient pas** la sentinelle. Les deux moitiés sont nécessaires : la première seule laisserait passer un champ affiché en clair, la seconde seule laisserait passer un champ absent. **À écrire en étendant `test_debug_redacts_secrets` (`settings.rs:392`) plutôt qu'à côté** — et noter au passage que son assertion actuelle, `debug.contains("[REDACTED]")` (`:426`), est vraie dès qu'*un seul* champ est rédigé : elle ne peut pas voir l'omission d'un champ, ce qui est précisément la régression visée ici. |
 
 ### Ce que le harnais de test de la gateway permet, et ce qu'il interdit
 
@@ -875,6 +951,13 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 - [ ] `gateway_admin_read_token` dans `GatewaySettings`, `admin_read_token` dans `AppState`,
       rédigé dans le `Debug` manuel en `Option::map` — l'état d'armement reste lisible, le
       secret non (T7 a).
+- [ ] **Le `Debug` de `GatewaySettings` porte sa ligne** (`settings.rs:268-316`). Ce `Debug`-là
+      est **exhaustif** (`.finish()`), contrairement à celui d'`AppState` : un champ ajouté sans
+      sa ligne compile sans avertissement et disparaît des dumps de configuration (T7 e).
+      Épinglé par l'extension de `test_debug_redacts_secrets`.
+- [ ] **Le jeton n'entre PAS dans `GatewaySettings::validate`** — elle `bail!` et downerait la
+      gateway entière pour une route d'inspection. Toute valeur inexploitable désarme la route
+      avec un `WARN` (R8, T7 e).
 - [ ] R8 résolu à la construction de l'`AppState` (jamais par requête), `WARN` nommé.
 - [ ] `require_admin_read_token` avec ses cinq branches dans l'ordre spécifié.
 - [ ] Route gateway + handler proxy sur le décalque `handle_a2a_agent_card`
@@ -893,10 +976,10 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 - [ ] `crates/mika-gateway/CLAUDE.md` : la route ajoutée à la table `## Endpoints` (colonne
       Auth = *Admin read token*, pas *Internal token*) et `MIKA_GATEWAY_ADMIN_READ_TOKEN` à
       `## Gateway Environment Variables` (T7 d).
-- [ ] Les 24 tests ci-dessus passent (8 DB, 4 tenant, 12 gateway dont **1 dans
-      `tests/admin_tenant_recurring_tasks.rs`**) ; clippy et fmt propres. Les 23 non-`#[ignore]`
-      passent en CI ; le 24e passe contre un Postgres jetable par la commande écrite en tête de
-      son fichier.
+- [ ] Les 25 tests ci-dessus passent (8 DB, 4 tenant, 13 gateway — dont **1 dans
+      `tests/admin_tenant_recurring_tasks.rs`** et **1 dans `settings.rs`**) ; clippy et fmt
+      propres. Les 24 non-`#[ignore]` passent en CI ; le 25e passe contre un Postgres jetable
+      par la commande écrite en tête de son fichier.
 - [ ] Root `CLAUDE.md` : `MIKA_GATEWAY_ADMIN_READ_TOKEN` documenté (valeur, défaut, R7/R8,
       surfaces opérateur) ; `.env.example` mis à jour.
 - [ ] Échec de la résolution en base → `503` sans forward (fail-closed, §*harnais de test*).
@@ -979,6 +1062,8 @@ lendemain. Les quatre AC restent un sous-ensemble strict de ce qui est livré.
 | En single-tenant (`agent_base_url = Some`) un id inconnu rendrait le registre d'un autre | R12 terme 2 exigé même dans ce mode ; nommé en fin de T5 pour qu'un test local vert ne soit pas lu comme une preuve de routage. |
 | **La route est montée sans son `.route_layer` et se retrouve servie sans aucune auth** — le préfixe `/admin` ne protège rien par lui-même (T7 c) | Les onze middlewares admin sont posés par route ; `mika2360_admin_read_rejects_missing_header_with_401` échoue si le layer manque. Le risque est nommé pour que ce test ne soit pas jugé redondant avec les quatre autres tests d'auth. |
 | Un implémenteur copie le `500` de `handle_get_customer` sur l'échec de résolution et manque le fail-closed `503` (T7 d) | La divergence est écrite au site (§3.3, commentaire du handler) **et** dans le DoD, pas seulement dans la section harnais. |
+| **Le champ est ajouté à `GatewaySettings` sans sa ligne de `Debug`** — ce `Debug` est exhaustif, l'oubli compile sans avertissement et le jeton disparaît des dumps de configuration (T7 e) | Ligne exigée au §3.3 et au DoD ; `test_debug_redacts_secrets` étendu pour assert **la présence du nom de champ** autant que l'absence de la sentinelle. L'assertion existante (`contains("[REDACTED]")`) ne peut pas voir cette régression. |
+| Le nouveau jeton est validé par `validate_hex_token` comme ses voisins, et une valeur mal formée downe le routage Telegram, les webhooks GitHub et `/send` de tous les tenants | R8 + T7 e : le jeton n'entre pas dans `validate()`. Une seule voie pour toute valeur inexploitable — désarmement local + `WARN`. Le geste « cohérent avec le voisinage » est ici le geste dangereux, donc il est nommé au lieu d'être laissé à l'inférence. |
 
 **Hors périmètre, délibérément.**
 
