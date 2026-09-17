@@ -147,10 +147,13 @@ faire en silence.
 D1 — *dédoublonner* une récurrence — c'est le tri qui cache le symptôme : deux lignes du même
 label atterrissent à des endroits arbitraires de la liste selon leur dernière mise à jour.
 
-Le registre se lit `ORDER BY label ASC, created_at ASC` : les doublons d'un label sont
-contigus et leur ordre de naissance est visible. Cela suffit à justifier une fonction DB
-dédiée plutôt qu'un appel à la fonction générique — et cette fonction dédiée est de toute
-façon le véhicule de la projection fermée de T1.
+Le registre se lit `ORDER BY label COLLATE NOCASE ASC, created_at ASC` : les doublons d'un
+label sont contigus et leur ordre de naissance est visible. **La collation n'est pas un
+raffinement** — sans elle, deux lignes ne différant que par la casse, qui sont le *même*
+label pour le veto, sont rendues non contiguës par le tri même qui doit les rapprocher
+(T6 b). Cela suffit à justifier une fonction DB dédiée plutôt qu'un appel à la fonction
+générique — et cette fonction dédiée est de toute façon le véhicule de la projection fermée
+de T1.
 
 Le ticket demande de « réutiliser la machinerie `handle_tasks_list` ». C'est ce qui est fait :
 la pagination (`resolve_pagination`, `dashboard.rs:38`), la forme `PaginatedResponse`, le
@@ -171,10 +174,10 @@ None => format!("http://mika-{customer_id}.{agents_namespace}.svc.cluster.local:
 ```
 
 Sur les chemins qui l'appellent aujourd'hui, c'est sans danger — mais **pas grâce à cette
-fonction**. `handle_a2a_proxy` et `handle_agent_card_proxy` valident d'abord une clé API
-qui *résout un customer* (`a2a_routes.rs`, `validate_a2a_api_key`) : un `customer_id` inventé
-est refusé en `401` avant que l'interpolation ait lieu. La sûreté vient du **préalable**, pas
-du formatage.
+fonction**. `handle_a2a_proxy` (`a2a_routes.rs:31`) et `handle_a2a_agent_card` (`:166`)
+valident d'abord une clé API qui *résout un customer* (`validate_a2a_api_key`, appelé
+`:183`) et refusent en `401`/`403` tout `customer_id` qui n'est pas celui de la clé — avant
+que l'interpolation ait lieu (`:210`). La sûreté vient du **préalable**, pas du formatage.
 
 Or le jeton de R6 est **global** : il n'est lié à aucun customer. Le préalable disparaît, et
 avec lui la seule chose qui contraignait l'argument. Un `customer_id` choisi par l'appelant
@@ -225,13 +228,72 @@ la résolution en base du point 2 reste néanmoins exigée, sans quoi un id inco
 `200` avec le registre de quelqu'un d'autre. C'est le mode de dev, pas le mode canari ; le
 nommer évite de lire un test local vert comme une preuve de routage.
 
+### T6 — le veto n'est pas un prédicat de ligne, et le tri sépare les doublons qu'il doit rapprocher
+
+Deux lectures de `db.rs:6205-6258` et du schéma `tasks`. Elles ne changent pas le livrable ;
+elles changent ce qu'un implémenteur doit écrire pour que T2 et T4 soient vrais plutôt que
+plausibles.
+
+**(a) `zombie_veto_active` se calcule sur DEUX requêtes, dont la première est un agrégat de
+groupe.** Une passe antérieure de ce plan parlait d'« un fragment de prédicat » à extraire ou
+à dupliquer. Il n'y en a pas un, il y en a deux, et le second consomme le résultat du premier
+comme paramètre scalaire :
+
+```rust
+// 1) db.rs:6210 — EXISTS sur (agent_id, label), PAS sur une ligne
+let lift_already_spent: bool = … "SELECT EXISTS(SELECT 1 FROM tasks
+     WHERE agent_id = ?1 AND label = ?2 COLLATE NOCASE
+       AND trigger_type = 'recurring'
+       AND updated_at > strftime(…, ?3)
+       AND json_valid(metadata)
+       AND COALESCE(json_extract(metadata, ?4), 0) = 1)" …
+
+// 2) db.rs:6231 — le booléen ci-dessus entre en ?5
+… "AND NOT (?5 = 0 AND json_valid(metadata)
+           AND COALESCE(json_extract(metadata, ?6), 0) = 1)" …
+```
+
+**Le lift est une propriété de `(agent_id, label)`, pas de la ligne.** Il peut avoir été
+dépensé sur une ligne *autre* que celle qu'on est en train de projeter. Un implémenteur qui
+lit le §3.1 dans sa forme antérieure — « calculé dans le `SELECT` en réutilisant les
+constantes » — écrit naturellement `json_extract(metadata, …)` sur la ligne courante, et
+obtient un booléen faux exactement dans le cas que mika#2337 a créé : deux lignes du même
+label, le lift porté par l'une, le veto évalué sur l'autre. Le calcul par ligne exige donc
+une **sous-requête corrélée** sur `(agent_id, label COLLATE NOCASE)`, pas une lecture du blob
+de la ligne.
+
+Conséquence sur l'arbitrage (a)/(b) du §3.1 : l'option « extraire le fragment » n'est pas
+bloquée par la numérotation des paramètres — elle l'est par le fait qu'il faut extraire deux
+fragments dont le second dépend de la valeur du premier, laquelle est calculée en Rust entre
+les deux. **L'option (b), le test d'accord, devient donc le choix attendu**, et l'interdit
+demeure le troisième terme : dupliquer sans épingler.
+
+Note que `ORDER BY updated_at DESC LIMIT 1` dans la requête 2 ne restreint pas le prédicat —
+il choisit seulement quelle ligne morte journaliser. Toute ligne satisfaisant le `WHERE` arme
+le veto, donc « cette ligne arme-t-elle le veto » reste une question bien posée par ligne,
+une fois le terme de lift correctement corrélé.
+
+**(b) `label` n'a pas de collation de colonne, et le veto compare en `COLLATE NOCASE`.** Le
+schéma déclare `label TEXT NOT NULL` (`db.rs:1460`) — sans `COLLATE NOCASE`, contrairement à
+la convention énoncée pour les colonnes texte uniques. Les cinq comparaisons du veto posent
+donc la collation explicitement, à chaque site.
+
+Un `ORDER BY label ASC` nu trie donc en binaire : `Rappel` avant `rappel`, séparés par tout
+ce qui commence par une minuscule intermédiaire. **Or deux lignes qui ne diffèrent que par la
+casse sont le même label pour le veto** — c'est-à-dire précisément la classe de doublon la
+plus probable quand un label est produit par un LLM à des semaines d'intervalle. Le tri censé
+rendre les doublons contigus (T4) les éloignerait exactement sur le cas D1 qu'il existe pour
+servir. Le tri est donc `ORDER BY label COLLATE NOCASE ASC, created_at ASC`, et la
+sous-requête corrélée du point (a) groupe sur la même collation — les deux doivent s'accorder,
+sinon le booléen et le voisinage visuel racontent deux histoires différentes sur la même page.
+
 ---
 
 ## Requirements
 
 **R1 — Tenant (mika-agent).** `GET /api/v1/recurring-tasks` rend le registre des lignes
-`trigger_type = 'recurring'`, en métadonnées seules, trié `label, created_at`, tous statuts
-confondus. Paramètres : `agent_id` (optionnel), `page` / `per_page` (mêmes bornes que
+`trigger_type = 'recurring'`, en métadonnées seules, trié `label COLLATE NOCASE, created_at`
+(T6 b), tous statuts confondus. Paramètres : `agent_id` (optionnel), `page` / `per_page` (mêmes bornes que
 l'existant : défaut 50, max 200).
 
 **R2 — `trigger_type = 'recurring'` est en dur dans le SQL.** Ce n'est pas un paramètre de
@@ -367,11 +429,20 @@ pub fn list_recurring_registry(
 
 - `WHERE trigger_type = 'recurring'` littéral dans la chaîne SQL (R2), `AND agent_id = ?`
   ajouté seulement si le paramètre est `Some`.
-- `ORDER BY label ASC, created_at ASC` (T4).
+- `ORDER BY label COLLATE NOCASE ASC, created_at ASC` (T4, T6 b).
 - `zombie_veto_active` calculé dans le `SELECT`, en réutilisant les constantes
   déjà exportées plutôt qu'en réécrivant leurs littéraux : `RECURRING_ZOMBIE_GRACE_SQL`
   (`db.rs:49`), `RECURRING_CONFIG_CANCEL_REVERTED_PATH` (`:66`),
-  `RECURRING_UNKNOWN_TRIGGER_PATH` (`:87`).
+  `RECURRING_UNKNOWN_TRIGGER_PATH` (`:86`),
+  `RECURRING_UNKNOWN_TRIGGER_LIFT_CONSUMED_PATH` (`:102`).
+
+  **Le terme de lift est corrélé, jamais lu sur la ligne (T6 a).** Le booléen
+  `lift_already_spent` de `create_recurring_task_if_absent` est un `EXISTS` sur
+  `(agent_id, label COLLATE NOCASE)` dans la fenêtre de grâce — il peut donc être porté par
+  une ligne différente de celle qu'on projette. Sa transposition dans un `SELECT` de liste est
+  une **sous-requête corrélée** sur ce couple, pas un `json_extract` du `metadata` courant.
+  Écrit sur la ligne, le booléen répondrait faux précisément sur la configuration que
+  mika#2337 produit : deux lignes du même label, le lift sur l'une, le veto évalué sur l'autre.
 
   **Point de vigilance, à traiter comme un risque et non comme un détail :** le prédicat de
   veto vit aujourd'hui dans le SQL de `create_recurring_task_if_absent` (`db.rs:6205`). Une
@@ -383,12 +454,16 @@ pub fn list_recurring_registry(
     les deux requêtes. Un seul littéral, aucune dérive possible.
   - **(b) Le dupliquer** en épinglant l'accord par un test qui construit les états pertinents
     (ligne `cancelled` récente, `cancelled` + marqueur reverted, `failed` hors fenêtre,
-    `unknown_trigger` + lift dépensé) et vérifie que `zombie_veto_active` et le comportement
-    réel de `create_recurring_task_if_absent` **concordent sur chacun**.
+    `unknown_trigger` + lift dépensé **sur une ligne sœur**) et vérifie que
+    `zombie_veto_active` et le comportement réel de `create_recurring_task_if_absent`
+    **concordent sur chacun**.
 
-  **(a) est préférée** si le fragment s'extrait sans contorsion de numérotation de paramètres
-  — c'est la forme qui rend la dérive impossible plutôt que détectée. (b) est le repli
-  acceptable ; l'option interdite est la troisième, dupliquer sans épingler.
+  **(b) est le choix attendu, et T6 a dit pourquoi :** il n'y a pas *un* fragment à extraire
+  mais deux, dont le second consomme en paramètre (`?5`) un booléen que le premier calcule et
+  que Rust transporte entre les deux. (a) reste préférable *si* l'implémentation trouve une
+  forme — par exemple une seule requête où la sous-requête corrélée remplace le paramètre —
+  qui rende la dérive impossible plutôt que détectée ; c'est à évaluer au clavier, pas à
+  décider ici. L'option interdite reste la troisième : dupliquer sans épingler.
 
   Si la complexité s'avère disproportionnée à l'implémentation, le repli explicite est
   d'exposer `zombie_veto_active` en `Option<bool>` avec `None` pour « non déterminé » plutôt
@@ -488,12 +563,16 @@ sur un secret, ici pas plus qu'ailleurs.
 )
 ```
 
-**Handler proxy** — le décalque est `handle_agent_card_proxy` (`a2a_routes.rs:~210`) et **non**
-`handle_a2a_proxy` (`:31`) : le premier est déjà un `GET` qui forwarde avec
-`state.http_client.get(...)`, pose `Bearer {internal_token}`, relaie statut + corps et rend
-`BAD_GATEWAY` sur **les deux** échecs (envoi et lecture du corps). C'est la forme exacte
-cherchée ici ; le `POST` A2A ajoute un corps et une validation de clé API dont ce chemin n'a
-que faire.
+**Handler proxy** — le décalque est **`handle_a2a_agent_card` (`a2a_routes.rs:166`)**, et non
+`handle_a2a_proxy` (`:31`). Le nom compte : une passe antérieure de ce plan écrivait
+`handle_agent_card_proxy`, qui n'existe nulle part dans l'arbre — un décalque qu'on ne peut
+pas ouvrir n'est pas un décalque. À partir de sa ligne 209, la fonction fait exactement ce
+qui est cherché ici : `container_url_str`, `format!("{container}/…")`,
+`state.http_client.get(...)`, `Bearer {internal_token}` (`:222`), puis relais du statut et du
+corps avec `BAD_GATEWAY` sur **les deux** échecs (envoi `:231`, lecture du corps). Ses
+lignes 171-207 — extraction et validation de la clé API — sont ce qu'on ne reprend pas : ce
+chemin est authentifié par R6 en amont, et c'est la disparition de ce préalable qui fait
+exister R12 (T5). Le `POST` A2A ajoute en plus un corps dont ce chemin n'a que faire.
 
 ```rust
 async fn handle_admin_tenant_recurring_tasks(
@@ -554,7 +633,9 @@ merges.
 | `mika2360_registry_projection_carries_no_message_content` | Une récurrence `send_message` dont `action_config` contient une sentinelle (`"SECRET-MEDICATION-REMINDER"`) ; la sérialisation JSON de la réponse **ne contient pas** la sentinelle. **AC4, testée sur le JSON rendu, pas sur les champs de la struct** — un test sur les champs passerait encore si quelqu'un ajoutait un `#[serde(flatten)]`. |
 | `mika2360_registry_lists_cancelled_and_failed_rows` | Les lignes non-`active` sont présentes. T2. |
 | `mika2360_registry_orders_by_label_then_created_at` | Deux lignes du même label, créées dans le désordre de `updated_at`, sortent contiguës et en ordre de naissance. T4. |
+| `mika2360_registry_orders_labels_case_insensitively` | **T6 b.** Trois lignes : `Rappel`, `aaa-autre-label`, `rappel`. Les deux variantes de casse sortent **contiguës** — un tri binaire les sépare par la ligne intermédiaire. Le test échoue si quelqu'un retire `COLLATE NOCASE` du `ORDER BY`, ce qu'aucune assertion sur un jeu mono-casse ne peut voir. |
 | `mika2360_zombie_veto_flag_matches_registration_refusal` | Les quatre états du veto (récent `cancelled`, `cancelled` + reverted, `failed` hors fenêtre, `unknown_trigger` + lift dépensé) ; `zombie_veto_active` **concorde** avec le comportement observé de `create_recurring_task_if_absent`. Le test d'accord de T2/§3.1. |
+| `mika2360_zombie_veto_flag_reads_lift_spent_on_a_sibling_row` | **T6 a, le test qui distingue les deux implémentations.** Deux lignes du même label : l'une porte `unknown_trigger_death`, l'*autre* porte `unknown_trigger_lift_consumed`. Une lecture par ligne rend un veto faux ; la sous-requête corrélée rend le même verdict que `create_recurring_task_if_absent`. Casse mélangée entre les deux lignes, pour épingler la collation du groupement en même temps que la corrélation. |
 | `mika2360_registry_is_read_only` | Compte les lignes de `tasks` et lit `updated_at` de chacune avant/après ; identiques. **AC3.** |
 
 ### Tests d'intégration — handler tenant (`server/mod.rs`, module `tests`)
@@ -667,18 +748,19 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 ## Definition of Done
 
 - [ ] `RecurringRegistryRow` + `list_recurring_registry` dans `db.rs`, projection fermée,
-      `trigger_type` littéral, tri `label, created_at`.
-- [ ] `zombie_veto_active` calculé, et son accord avec `create_recurring_task_if_absent`
-      soit **rendu impossible à rompre** (fragment SQL partagé), soit **épinglé** par le test
-      d'accord.
+      `trigger_type` littéral, tri `label COLLATE NOCASE, created_at` (T6 b).
+- [ ] `zombie_veto_active` calculé, **le terme de lift en sous-requête corrélée sur
+      `(agent_id, label COLLATE NOCASE)` et non sur le `metadata` de la ligne** (T6 a), et son
+      accord avec `create_recurring_task_if_absent` soit **rendu impossible à rompre**
+      (fragment SQL partagé), soit **épinglé** par les deux tests d'accord.
 - [ ] Wrapper async sans émission de frame.
 - [ ] `handle_recurring_registry` + montage `/api/v1/recurring-tasks` sous l'auth dashboard.
 - [ ] `gateway_admin_read_token` dans `GatewaySettings`, `admin_read_token` dans `AppState`,
       rédigé dans le `Debug` manuel.
 - [ ] R8 résolu à la construction de l'`AppState` (jamais par requête), `WARN` nommé.
 - [ ] `require_admin_read_token` avec ses cinq branches dans l'ordre spécifié.
-- [ ] Route gateway + handler proxy sur le décalque `handle_agent_card_proxy`, query string en
-      liste blanche, `502` sur échec amont.
+- [ ] Route gateway + handler proxy sur le décalque `handle_a2a_agent_card`
+      (`a2a_routes.rs:166`), query string en liste blanche, `502` sur échec amont.
 - [ ] **R12 : `Path<Uuid>` + résolution en base, tous deux AVANT `container_url_str`.** La
       garde de non-régression T5 passe (aucune requête sortante sur entrée refusée).
 - [ ] Ligne INFO de démarrage disant l'état d'armement (R7).
@@ -686,7 +768,7 @@ curl -s -o /dev/null -w '%{http_code}\n' \
       fire-and-forget, via une constante dédiée distincte de `audit_events::TOOL_NAME` (R9).
       Aucune migration Postgres.
 - [ ] `openapi.rs` de la gateway à jour.
-- [ ] Les 22 tests ci-dessus passent ; clippy et fmt propres.
+- [ ] Les 24 tests ci-dessus passent (8 DB, 4 tenant, 12 gateway) ; clippy et fmt propres.
 - [ ] Root `CLAUDE.md` : `MIKA_GATEWAY_ADMIN_READ_TOKEN` documenté (valeur, défaut, R7/R8,
       surfaces opérateur) ; `.env.example` mis à jour.
 - [ ] Échec de la résolution en base → `503` sans forward (fail-closed, §*harnais de test*).
@@ -759,6 +841,8 @@ lendemain. Les quatre AC restent un sous-ensemble strict de ce qui est livré.
 | Un `403` est lu comme « l'INTERNAL_TOKEN ne peut pas lire ce tenant » | T3 l'écrit noir sur blanc : le porteur du write est superuser ailleurs sur `/admin/*`. Le gain est organisationnel. |
 | **SSRF via `customer_id` → exfiltration de l'`internal_token`** (T5) — le risque le plus grave du ticket, et celui qui inverserait son propos | R12 : `Path<Uuid>` puis résolution en base, tous deux avant `container_url_str`. Épinglé par trois tests dont une garde qui assert **l'absence de requête sortante**, pas seulement le code de retour. |
 | Le veto est lu par un chemin JSON inexistant et répond `false` avec assurance | Les trois chemins sont consommés par leurs constantes (`db.rs:66`, `:86`, `:102`), jamais recopiés — cf. la note de T2 sur `_lift_spent`, qui est exactement cette faute commise une fois. |
+| **Le lift est lu sur la ligne projetée au lieu du groupe `(agent_id, label)`** — le veto répond faux sur la configuration même que mika#2337 produit (T6 a) | Sous-requête corrélée exigée par R1/§3.1, épinglée par `mika2360_zombie_veto_flag_reads_lift_spent_on_a_sibling_row`, qui est construit pour que la lecture par ligne échoue. |
+| Deux lignes du même label en casses différentes sont rendues non contiguës, et le registre se lit comme deux récurrences distinctes sur le cas D1 (T6 b) | `ORDER BY label COLLATE NOCASE` + `mika2360_registry_orders_labels_case_insensitively`, dont le jeu porte une ligne intermédiaire — un jeu mono-casse ne peut pas voir la régression. |
 | En single-tenant (`agent_base_url = Some`) un id inconnu rendrait le registre d'un autre | R12 terme 2 exigé même dans ce mode ; nommé en fin de T5 pour qu'un test local vert ne soit pas lu comme une preuve de routage. |
 
 **Hors périmètre, délibérément.**
