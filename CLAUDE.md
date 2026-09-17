@@ -756,9 +756,9 @@ Livré par mika#2293. Si le plafond effectif de l'agent qui a hangué n'est pas 
 
 **Étape 1 — combien de tentatives, et de quelle durée.**
 ```
-grep llm_call_attempt $MIKA_SPIRIT_LOG_FILE | jq 'select(.outcome != "success") | {provider, model, attempt, max_attempts, elapsed_ms, outcome, error_class, http_timeout_secs}'
+grep llm_call_attempt $MIKA_SPIRIT_LOG_FILE | jq 'select(.event == "llm_call_attempt" and .outcome != "success") | {provider, model, attempt, max_attempts, elapsed_ms, outcome, error_class, http_timeout_secs}'
 ```
-Une ligne INFO **par tentative**, sur les **trois** rails, ungated. `outcome` ∈ `{success, retrying, exhausted, deadline_abort}`. `error_class` est **absent** sur un succès (jamais la chaîne `"null"`), donc `select(.error_class)` filtre exactement les tentatives en échec. `deadline_abort` désigne une tentative qui **n'a pas eu lieu** : son `elapsed_ms = 0` n'est pas la mesure d'un appel rapide, c'est l'absence d'appel.
+Une ligne INFO **par tentative**, sur les **trois** rails, ungated, portant `event: "llm_call_attempt"`. Le garde `.event == "llm_call_attempt"` est **nécessaire** : `grep llm_call_attempt` seul capte aussi la ligne homonyme de mika#2342 (émise *avant* l'appel, sans champ `outcome`) et les lignes DEBUG `llm request/response body` dont le corps contient la chaîne — toutes rendues par un `select(.outcome != "success")` seul (leur `.outcome` est `null`), qui noierait le signal sous des centaines de lignes à champs nuls. `outcome` ∈ `{success, retrying, exhausted, deadline_abort}` ; `error_class` est **absent** sur un succès (jamais la chaîne `"null"`). `deadline_abort` désigne une tentative qui **n'a pas eu lieu** : son `elapsed_ms = 0` n'est pas la mesure d'un appel rapide, c'est l'absence d'appel.
 
 **Étape 2 — quelle taille de brief, sur le tour qui a échoué.**
 ```
