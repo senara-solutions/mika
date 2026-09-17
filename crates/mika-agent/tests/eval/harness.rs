@@ -34,6 +34,11 @@ pub struct EvalHarness {
     /// routes substrate-unavailable diagnostics to `audit_events` instead of
     /// the LLM-visible tool content (mika#1783).
     pub tier: mika_common::home::AgentTier,
+    /// Deployment threaded into every `AgentParams` (mika#2290). `Unknown`
+    /// unless `.deployment()` was called on the builder — and `Unknown` is
+    /// deliberately the default, because it is the state every cloud tenant is
+    /// in today and the state the 2026-09-11 incident happened in.
+    pub deployment: mika_common::home::Deployment,
     /// The LLM provider used for the agent run (mock or real).
     pub llm: Arc<dyn LlmProvider>,
     /// The mock provider, if one was created. `None` when using a real provider.
@@ -83,6 +88,7 @@ impl EvalHarness {
     pub async fn run(&self, message: &str) -> Result<AgentTrace> {
         let params = AgentParams {
             tier: self.tier,
+            deployment: self.deployment,
             db: &self.db,
             llm: self.llm.as_ref(),
             tools: &self.tools,
@@ -134,6 +140,7 @@ impl EvalHarness {
     pub async fn run_with_deadline(&self, message: &str, deadline: Instant) -> Result<AgentTrace> {
         let params = AgentParams {
             tier: self.tier,
+            deployment: self.deployment,
             db: &self.db,
             llm: self.llm.as_ref(),
             tools: &self.tools,
@@ -196,6 +203,7 @@ impl EvalHarness {
 
         let params = AgentParams {
             tier: self.tier,
+            deployment: self.deployment,
             db: &self.db,
             llm: self.llm.as_ref(),
             tools: &self.tools,
@@ -244,6 +252,7 @@ pub struct EvalHarnessBuilder {
     skip_compaction: bool,
     internal: bool,
     family_tier: bool,
+    deployment: mika_common::home::Deployment,
     provider_name: Option<String>,
     model_name: Option<String>,
     message_sender: Option<Arc<dyn MessageSender>>,
@@ -269,6 +278,7 @@ impl Default for EvalHarnessBuilder {
             skip_compaction: true, // Default: skip compaction to simplify mock sequences
             internal: false,
             family_tier: false,
+            deployment: mika_common::home::Deployment::Unknown,
             provider_name: None,
             model_name: None,
             message_sender: None,
@@ -344,6 +354,15 @@ impl EvalHarnessBuilder {
     /// content. Default: `false` (operator tier).
     pub fn family_tier(mut self) -> Self {
         self.family_tier = true;
+        self
+    }
+
+    /// Set the resolved deployment for the run (mika#2290). Default:
+    /// `Deployment::Unknown` — the state of every cloud tenant today, and the
+    /// one the measured false privacy claim was made in. Pass `Local` to
+    /// exercise the exemption, `Cloud` to exercise the declared-cloud answer.
+    pub fn deployment(mut self, deployment: mika_common::home::Deployment) -> Self {
+        self.deployment = deployment;
         self
     }
 
@@ -481,6 +500,7 @@ impl EvalHarnessBuilder {
         Ok(EvalHarness {
             db: async_db,
             tier,
+            deployment: self.deployment,
             llm,
             mock_provider,
             tools: self.tools.unwrap_or_else(default_tools),

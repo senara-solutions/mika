@@ -87,6 +87,7 @@ fn test_dispatcher_with_grace(db: AsyncDatabase, grace_secs: Option<u64>) -> Arc
     Arc::new(TaskDispatcher {
         db,
         tier: mika_common::home::AgentTier::Default,
+        deployment: mika_common::home::Deployment::Unknown,
         llm: mika_common::llm::dummy_provider(),
         tools: Arc::new(default_tools()),
         skills: Arc::new(SkillRegistry::empty()),

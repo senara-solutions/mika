@@ -282,6 +282,7 @@ impl Tool for DelegateTaskTool {
         let params = crate::agent::TeamAgentParams {
             db: &async_db,
             tier: ctx.tier,
+            deployment: ctx.deployment,
             llm: llm.as_ref(),
             tools: &tool_registry,
             skills: &skills,

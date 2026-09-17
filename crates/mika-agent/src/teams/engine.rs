@@ -132,6 +132,10 @@ pub struct TeamEngine {
     /// a single process-start read in CLI mode. Threaded into every member's
     /// `TeamAgentParams` so no team turn re-reads the environment.
     tier: mika_common::home::AgentTier,
+    /// Deployment for this team run, same caller-supplied contract as `tier`
+    /// (mika#2290). Threaded into every member's `TeamAgentParams` so the
+    /// hosting ground truth and the 5d guard reach team turns too.
+    deployment: mika_common::home::Deployment,
 }
 
 /// Outcome of an `execute_tasks` iteration (mika#1671). Replaces the previous
@@ -258,6 +262,7 @@ impl TeamEngine {
         github_app: Option<Arc<mika_common::github_app::GitHubApp>>,
         pr_reviews_posted: Option<Arc<dashmap::DashMap<String, std::collections::HashSet<String>>>>,
         tier: mika_common::home::AgentTier,
+        deployment: mika_common::home::Deployment,
     ) -> Result<Self> {
         let run_id = uuid::Uuid::new_v4().to_string();
 
@@ -315,6 +320,7 @@ impl TeamEngine {
             reference_run_id: reference_run_id.map(|s| s.to_string()),
             pr_reviews_posted,
             tier,
+            deployment,
         })
     }
 
@@ -329,6 +335,7 @@ impl TeamEngine {
         github_app: Option<Arc<mika_common::github_app::GitHubApp>>,
         pr_reviews_posted: Option<Arc<dashmap::DashMap<String, std::collections::HashSet<String>>>>,
         tier: mika_common::home::AgentTier,
+        deployment: mika_common::home::Deployment,
     ) -> Result<Self> {
         let res = Self::init_resources(&team, global_home, settings, &run.run_id, None)?;
 
@@ -370,6 +377,7 @@ impl TeamEngine {
             reference_run_id: None,
             pr_reviews_posted,
             tier,
+            deployment,
         })
     }
 
@@ -1309,6 +1317,7 @@ impl TeamEngine {
             let trace_id = self.trace_id.clone();
             let pr_reviews_posted = self.pr_reviews_posted.clone();
             let tier = self.tier;
+            let deployment = self.deployment;
 
             let agent_span = info_span!("team_agent_task", agent = %input.agent_name);
             join_set.spawn(
@@ -1352,6 +1361,7 @@ impl TeamEngine {
                             let params = TeamAgentParams {
                                 db: &resources.db,
                                 tier,
+                                deployment,
                                 llm: resources.llm.as_ref(),
                                 tools: &tool_registry,
                                 skills: &resources.skills,
@@ -1805,6 +1815,7 @@ impl TeamEngine {
         let params = TeamAgentParams {
             db: &resources.db,
             tier: self.tier,
+            deployment: self.deployment,
             llm: resources.llm.as_ref(),
             tools: &self.tool_registry,
             skills: &resources.skills,

@@ -46,10 +46,6 @@ const OAUTH_TOKEN_PREFIX: &str = "sk-ant-oat";
 const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.75";
 const CLAUDE_CODE_APP_HEADER: &str = "cli";
 
-use crate::llm::{
-    RETRY_BUFFER_SECS, TRANSPORT_RETRY_MIN_REMAINING_SECS, TYPICAL_CALL_DURATION_SECS,
-};
-
 /// Prefix of the Anthropic error message when the account has insufficient credits.
 /// Pinned as a const because `invalid_request_error` is Anthropic's generic 4xx type
 /// (also covers malformed requests, bad model names, oversize payloads) — the substring
@@ -622,23 +618,33 @@ impl ClaudeClient {
 
         let mut last_error = None;
 
+        // mika#2362: this rail carries no `LlmTimeoutBudget` — it hands
+        // `reqwest` the literal `ANTHROPIC_HTTP_TIMEOUT_SECS` instead of
+        // reading a plafond, the inconsistency mika#2189 named and left out of
+        // scope. `pinned_at_default_cap()` is the thresholds of exactly that
+        // cap, so the substitution is faithful and the fractions stay defined
+        // in one module. The three sites below read one predicate over it.
+        let thresholds = crate::llm::retry_gate::RetryThresholds::pinned_at_default_cap();
+
         for attempt in 0..=MAX_RETRIES {
             if attempt > 0 {
-                // Deadline-aware retry abort — mirrors the OpenAI-compatible
-                // retry loop's transport-aware threshold (mika#1744 AC4).
-                // See `crates/mika-common/src/llm/openai.rs` for the source
-                // of truth; keeping both paths symmetric ensures a single
-                // discipline shift lands identically for Anthropic and
-                // OpenAI-compatible providers.
+                // Deadline-aware retry abort — the same predicate the
+                // OpenAI-compatible rails read (mika#1744 AC4, mika#2362). The
+                // comment that used to sit here named `openai.rs` as "the
+                // source of truth" and promised symmetry by copying; that
+                // promise had already failed once, silently, on the ollama rail
+                // (mika#2331 §3.3). The symmetry is structural now.
                 if let Some(dl) = deadline {
                     let remaining = dl.saturating_duration_since(Instant::now());
                     let last_was_transport = last_error.as_ref().is_some_and(is_transport_class);
-                    let threshold_secs = if last_was_transport {
-                        TRANSPORT_RETRY_MIN_REMAINING_SECS
-                    } else {
-                        TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS
-                    };
-                    if remaining < Duration::from_secs(threshold_secs) {
+                    if let crate::llm::retry_gate::RetryVerdict::DeadlineInsufficient {
+                        threshold_secs,
+                        ..
+                    } = crate::llm::retry_gate::deadline_verdict(
+                        Some(remaining),
+                        last_was_transport,
+                        &thresholds,
+                    ) {
                         warn!(
                             attempt,
                             remaining_ms = remaining.as_millis() as u64,
@@ -698,12 +704,23 @@ impl ClaudeClient {
             let attempt_elapsed_ms = attempt_start.elapsed().as_millis() as u64;
             let deadline_remaining_ms =
                 deadline.map(|dl| dl.saturating_duration_since(Instant::now()).as_millis() as u64);
+            // mika#2362 — see the twin comment in `llm/openai.rs`: this line
+            // used to read the budget and the error class and never the
+            // deadline, so it could announce a retry the guard above was about
+            // to refuse. `ANTHROPIC_MAX_ATTEMPTS` is `MAX_RETRIES + 1`, so
+            // `attempt + 1 < max_attempts` inside the predicate is the same
+            // bound as the `attempt < MAX_RETRIES` written here before.
             let outcome = match &attempt_result {
                 Ok(_) => crate::llm::attempt_outcome::SUCCESS,
-                Err(e) if attempt < MAX_RETRIES && is_retryable(e) => {
-                    crate::llm::attempt_outcome::RETRYING
-                }
-                Err(_) => crate::llm::attempt_outcome::EXHAUSTED,
+                Err(e) => crate::llm::attempt_outcome::outcome_for(
+                    &crate::llm::retry_gate::next_attempt_verdict(
+                        attempt,
+                        ANTHROPIC_MAX_ATTEMPTS,
+                        Some(&ClaudeRetryClass(e)),
+                        deadline_remaining_ms.map(Duration::from_millis),
+                        &thresholds,
+                    ),
+                ),
             };
             crate::llm::emit_llm_call_attempt(
                 ANTHROPIC_PROVIDER_NAME,
@@ -803,19 +820,19 @@ impl ClaudeClient {
         }
 
         // Distinguish deadline-abort from normal retry exhaustion for
-        // diagnostics. Mirrors the retry-loop's transport-aware threshold
-        // (mika#1744) so the abort surface matches whichever threshold
-        // actually fired.
+        // diagnostics. mika#2362: the same predicate as the guard, so the abort
+        // surface cannot drift away from the threshold that actually fired —
+        // while the margin is still measured at this later instant. This is the
+        // rail where that message is *observable*: it wraps the real error as
+        // context, where the OpenAI-shaped rails only use it for a
+        // `last_error == None` case their loop cannot reach.
         let last_was_transport = last_error.as_ref().is_some_and(is_transport_class);
-        let deadline_threshold_secs = if last_was_transport {
-            TRANSPORT_RETRY_MIN_REMAINING_SECS
-        } else {
-            TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS
-        };
-        let deadline_aborted = deadline.is_some_and(|dl| {
-            dl.saturating_duration_since(Instant::now())
-                < Duration::from_secs(deadline_threshold_secs)
-        });
+        let deadline_aborted = crate::llm::retry_gate::deadline_verdict(
+            deadline.map(|dl| dl.saturating_duration_since(Instant::now())),
+            last_was_transport,
+            &thresholds,
+        )
+        .is_deadline_insufficient();
 
         Err(last_error
             .map(|e| {
@@ -1018,6 +1035,25 @@ fn is_transport_class(error: &ClaudeApiError) -> bool {
     )
 }
 
+/// The adapter that lets this rail read the shared retry predicate (mika#2362).
+///
+/// A newtype rather than `impl RetryClass for ClaudeApiError` because the trait
+/// and the error live in two modules of the same crate and the two inherent
+/// methods above already carry the logic — the adapter delegates, so there is
+/// still exactly one definition of "retryable" and one of "transport" on this
+/// rail. It is the same shape `error_class` had to take for the same reason:
+/// two *mappings*, one site of *definition*.
+struct ClaudeRetryClass<'a>(&'a ClaudeApiError);
+
+impl crate::llm::retry_gate::RetryClass for ClaudeRetryClass<'_> {
+    fn is_retryable(&self) -> bool {
+        is_retryable(self.0)
+    }
+    fn is_transport(&self) -> bool {
+        is_transport_class(self.0)
+    }
+}
+
 /// The wire-format error class of an Anthropic-rail failure (mika#2331 AC5).
 ///
 /// A **second mapping** of the vocabulary defined once in
@@ -1056,6 +1092,40 @@ fn error_class(error: &ClaudeApiError) -> std::borrow::Cow<'static, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// mika#2362: this rail reads `RetryThresholds::pinned_at_default_cap()`
+    /// because the plafond it hands `reqwest` **is** the default cap.
+    ///
+    /// The substitution is only faithful while that equality holds, and nothing
+    /// in the type system enforces it — so it is pinned here. The day either
+    /// literal moves, this goes red instead of silently applying a geometry
+    /// that belongs to someone else. Fixing the underlying inconsistency
+    /// (`claude.rs` posing a literal rather than reading a budget) stays out of
+    /// scope, named by mika#2189.
+    #[test]
+    fn mika2362_anthropic_cap_is_the_default_cap() {
+        assert_eq!(
+            ANTHROPIC_HTTP_TIMEOUT_SECS,
+            crate::llm::DEFAULT_HTTP_TIMEOUT_SECS,
+            "the Anthropic rail's hard-coded plafond must stay the default cap, \
+             or `pinned_at_default_cap()` reports another geometry's thresholds"
+        );
+    }
+
+    /// The predicate's budget bound must be the bound this rail's loop uses:
+    /// `for attempt in 0..=MAX_RETRIES` with `attempt < MAX_RETRIES` is exactly
+    /// `attempt + 1 < MAX_RETRIES + 1`. The substitution is arithmetic, not a
+    /// re-interpretation, and this is where that is written down.
+    #[test]
+    fn mika2362_anthropic_attempt_bound_is_unchanged_by_the_shared_predicate() {
+        for attempt in 0..=MAX_RETRIES {
+            assert_eq!(
+                attempt < MAX_RETRIES,
+                attempt + 1 < ANTHROPIC_MAX_ATTEMPTS,
+                "bounds diverge at attempt={attempt}"
+            );
+        }
+    }
 
     #[test]
     fn test_deserialize_response() {

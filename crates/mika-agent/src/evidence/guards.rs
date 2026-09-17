@@ -711,6 +711,299 @@ pub(crate) fn detect_doctrine_public_promo(text: &str) -> Option<DoctrinePublicP
 }
 
 // ---------------------------------------------------------------------------
+// mika#2290 — False local-hosting claim guard
+// ---------------------------------------------------------------------------
+
+/// Label used for `intent_guard_retries` tracking of the false local-hosting
+/// guard (mika#2290). Inline guard at position 5d, immediately after 5c
+/// (`doctrine_public_promo`) whose shape, retry budget and `guard.*` telemetry
+/// it reuses. Sibling of the fabrication-class family: the defect is an
+/// assertion of fact about oneself that no ground truth supports.
+pub(crate) const FALSE_LOCAL_HOSTING_LABEL: &str = "false_local_hosting_claim";
+
+/// Structured result from false local-hosting detection.
+pub(crate) struct FalseLocalHostingMatch {
+    /// The locality predicate captured by Layer A (e.g. `en local`, `ta machine`).
+    pub(crate) subject: String,
+    /// The first-person present-tense assertion captured by Layer B
+    /// (e.g. `tout tourne`, `tes données ne quittent`).
+    pub(crate) assertion: String,
+}
+
+/// Longest-first alternation of **locality predicates** (Layer A) — "this
+/// instance runs on the user's own machine" / "the user's data lives there".
+///
+/// Bilingual FR + EN for the same reason 5c is: the founding incident
+/// (2026-09-11, cloud tenant, canary Vietnam) is French, the operator works in
+/// English, and the exact English wording of the claim is already published on
+/// the marketing site ("Your data never leaves your machine.").
+const LOCALITY_ALTERNATION: &str = r"(?:
+      en\s+local\b
+    | localement
+    | 100\s*%\s*local\b
+    | sur\s+(?:ta|ton|votre|vos)\s+(?:machine|ordinateur|t[ée]l[ée]phone|appareil|poste|portable)
+    | (?:ta|ton|votre)\s+(?:machine|ordinateur|t[ée]l[ée]phone|appareil|poste|portable)
+    | chez\s+(?:toi|vous)
+    | on\s+your\s+(?:machine|computer|device|phone|laptop|box)
+    | your\s+(?:machine|computer|device|phone|laptop|box)
+    | locally
+    | local\b
+)";
+
+/// **Layer B, positive polarity** — a first-person / impersonal assertion in the
+/// present indicative, carrying its own grammatical subject.
+///
+/// Carrying the subject is what makes the layer discriminating rather than
+/// lexical: `est self-hostable` is not here, so the remedy sentence the ticket
+/// body prescribes ("la MÊME stack open-source (MIT) est self-hostable en local
+/// si tu veux") cannot fire the guard even though it contains the word `local`.
+/// The modal / conditional / interrogative forms are absent by construction —
+/// they are not assertions of fact.
+const ASSERTION_POSITIVE_ALTERNATION: &str = r"(?:
+      je\s+(?:tourne|fonctionne|m'ex[ée]cute|suis\s+h[ée]berg[ée]+)
+    | tout\s+(?:tourne|fonctionne|reste|est)
+    | [cç]a\s+(?:tourne|fonctionne|reste|est)
+    | (?:tes|vos|les)\s+donn[ée]es\s+(?:sont|restent|vivent|demeurent)
+    | i\s+(?:run|operate|live)\b
+    | i'?m\s+running
+    | i\s+am\s+running
+    | everything\s+(?:runs|is|stays)
+    | it\s+(?:all\s+)?runs
+    | your\s+data\s+(?:stays|lives|sits|remains|is)
+)";
+
+/// **Layer B, negated polarity** — the same assertion class written in the
+/// negative, which is how half the measured claim was phrased: « tes données ne
+/// quittent **pas** ta machine ».
+///
+/// It has to be a separate alternation from the positive one because the
+/// gap-rejection rule differs: a `pas` between assertion and locality *cancels*
+/// a positive claim ("Je tourne sur un serveur, pas sur ton téléphone") and
+/// *completes* a negated one. One list with one rule would have to choose which
+/// of those two to get wrong.
+const ASSERTION_NEGATED_ALTERNATION: &str = r"(?:
+      (?:tes|vos|les)\s+donn[ée]es\s+ne\s+(?:quittent|sortent|partent|vont)
+    | rien\s+ne\s+(?:quitte|sort|part)
+    | your\s+data\s+(?:never|doesn'?t|does\s+not|won'?t|will\s+never)\s+(?:leave|leaves|go|goes)
+    | nothing\s+(?:ever\s+)?leaves
+)";
+
+/// Maximum number of non-sentence-terminating characters tolerated between the
+/// assertion (Layer B) and the locality predicate (Layer A).
+///
+/// The character class excludes `.`/`!`/`?`/newline, so the bound also enforces
+/// "same sentence" for free. 40 is wide enough for the measured claim and for
+/// ordinary subordination, and narrow enough that an unrelated later mention of
+/// the word `local` in a truthful cloud answer does not get glued to the
+/// assertion.
+const CLAIM_GAP_MAX: usize = 40;
+
+static FALSE_LOCAL_POSITIVE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
+    || {
+        regex::Regex::new(&format!(
+            r"(?ix)\b(?P<assert>{ASSERTION_POSITIVE_ALTERNATION})(?P<gap>[^.!?\n]{{0,{CLAIM_GAP_MAX}}}?)(?P<loc>{LOCALITY_ALTERNATION})"
+        ))
+        .expect("false-local-hosting positive regex must compile")
+    },
+);
+
+static FALSE_LOCAL_NEGATED_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(&format!(
+        r"(?ix)\b(?P<assert>{ASSERTION_NEGATED_ALTERNATION})(?P<gap>[^.!?\n]{{0,{CLAIM_GAP_MAX}}}?)(?P<loc>{LOCALITY_ALTERNATION})"
+    ))
+    .expect("false-local-hosting negated regex must compile")
+});
+
+/// Negation tokens that, sitting between a **positive** assertion and the
+/// locality predicate, mean the sentence denies local hosting rather than
+/// asserting it. Not applied to the negated alternation, where the negation is
+/// the claim.
+const CLAIM_GAP_NEGATIONS: &[&str] = &[
+    " pas ", " jamais ", " aucun", " non ", " never ", " not ", "n't ", " no ",
+];
+
+/// Contrast conjunctions that, sitting between assertion and locality, mean the
+/// two are not predicated of one another ("Je tourne dans le cloud, **mais** un
+/// mode local existe"). Applied to both polarities.
+const CLAIM_GAP_CONTRASTS: &[&str] = &[
+    " mais ",
+    " but ",
+    " however",
+    " alors que ",
+    " tandis que ",
+    " whereas ",
+];
+
+/// Self-hosting / conditional markers that place the whole sentence in the
+/// register of possibility rather than of fact.
+///
+/// Deliberately **narrow**: these are the exact fragments of the remedy the
+/// ticket body prescribes, not a general modal list. A broad modal suppressor
+/// (`peux`, `can`, `could`) would be a one-phrase bypass — "je peux te dire que
+/// tout tourne en local" would walk straight through the guard.
+const CLAIM_CONDITIONAL_MARKERS: &[&str] = &[
+    "self-host",
+    "self host",
+    "selfhost",
+    "auto-héberg",
+    "auto-heberg",
+    "autohéberg",
+    "si tu veux",
+    "si vous voulez",
+    "si tu préfères",
+    "si vous préférez",
+    "if you want",
+    "if you prefer",
+    "if you self",
+    "tu peux l'installer",
+    "tu peux installer",
+    "tu peux faire tourner",
+    "vous pouvez installer",
+    "you can install",
+    "you could install",
+    "you can run",
+    "you could run",
+    "peut être installé",
+    "peut être hébergé",
+    "peut etre installe",
+    "can be installed",
+    "can be self",
+    "can be run",
+];
+
+/// Detects an assertion that **this instance** is locally hosted, or that the
+/// user's data never leaves their machine (mika#2290).
+///
+/// Pure function; the caller supplies the resolved [`Deployment`] and only fires
+/// the guard when it is not `Local`. That split is what makes the ticket
+/// deliverable on its own: a cloud tenant today carries no `MIKA_DEPLOYMENT`, so
+/// it resolves `Unknown`, so the measured claim is refused from this deploy
+/// onwards — the companion `mika-cloud` signal improves the *answer*, it is not
+/// needed for the *refusal*.
+///
+/// **Two layers, and the discrimination is of scope, not of vocabulary.** The
+/// remedy the ticket prescribes contains the word "local" itself ("la MÊME stack
+/// open-source (MIT) est self-hostable en local si tu veux"), so a guard that
+/// fired on the word would forbid the true sentence it exists to make Mika say.
+/// Hence:
+/// - **Layer A — subject:** a locality predicate about this instance or the
+///   user's data (`en local`, `ta machine`, `locally`, `on your machine`, …).
+/// - **Layer B — assertion:** a first-person / impersonal present-tense claim
+///   *carrying its own subject* (`tout tourne`, `je tourne`, `tes données
+///   restent`, `I run`, `your data stays`). Modal, conditional, interrogative
+///   and self-hosting forms are simply not in the list.
+///
+/// Both must fire, in that order, within `CLAIM_GAP_MAX` characters of the same
+/// sentence, and the sentence must not be a question nor carry a self-hosting
+/// marker.
+///
+/// `deployment` is a parameter rather than a caller-side `if` so that "a local
+/// install may say it runs locally" is a property of this pure function and
+/// carries its own test, instead of living in one branch of the agent loop.
+pub(crate) fn detect_false_local_hosting_claim(
+    text: &str,
+    deployment: mika_common::home::Deployment,
+) -> Option<FalseLocalHostingMatch> {
+    // A declared local install is telling the truth. Note `Unknown` is NOT
+    // exempt: it is the state every cloud tenant is in today, and it is the
+    // state the measured incident happened in.
+    if matches!(deployment, mika_common::home::Deployment::Local) {
+        return None;
+    }
+
+    // Fast path: no locality atom at all → skip both regex passes. Mirrors the
+    // substring atoms of `LOCALITY_ALTERNATION`; extending that constant means
+    // extending this list.
+    let lower = text.to_lowercase();
+    let has_candidate = lower.contains("local")
+        || lower.contains("machine")
+        || lower.contains("ordinateur")
+        || lower.contains("computer")
+        || lower.contains("phone")
+        || lower.contains("téléphone")
+        || lower.contains("telephone")
+        || lower.contains("appareil")
+        || lower.contains("device")
+        || lower.contains("laptop")
+        || lower.contains("portable")
+        || lower.contains("poste")
+        || lower.contains("box")
+        || lower.contains("chez toi")
+        || lower.contains("chez vous");
+    if !has_candidate {
+        return None;
+    }
+
+    first_surviving_claim(text, &FALSE_LOCAL_POSITIVE_RE, true)
+        .or_else(|| first_surviving_claim(text, &FALSE_LOCAL_NEGATED_RE, false))
+}
+
+/// Walk every match of `re` and return the first one no suppressor cancels.
+///
+/// Iterating rather than taking `find()` matters: a truthful answer and a false
+/// claim can live in the same response, and stopping at the first *syntactic*
+/// match would let a suppressed one mask a real violation further down.
+fn first_surviving_claim(
+    text: &str,
+    re: &regex::Regex,
+    reject_gap_negations: bool,
+) -> Option<FalseLocalHostingMatch> {
+    for caps in re.captures_iter(text) {
+        let whole = caps.get(0)?;
+        let gap = caps
+            .name("gap")
+            .map(|m| format!(" {} ", m.as_str().to_lowercase()))
+            .unwrap_or_default();
+
+        if reject_gap_negations && CLAIM_GAP_NEGATIONS.iter().any(|n| gap.contains(n)) {
+            continue;
+        }
+        if CLAIM_GAP_CONTRASTS.iter().any(|c| gap.contains(c)) {
+            continue;
+        }
+        if sentence_is_suppressed(text, whole.start(), whole.end()) {
+            continue;
+        }
+
+        return Some(FalseLocalHostingMatch {
+            subject: caps.name("loc")?.as_str().to_string(),
+            assertion: caps.name("assert")?.as_str().to_string(),
+        });
+    }
+    None
+}
+
+/// Whether the sentence enclosing `[start, end)` disqualifies the match: it is a
+/// question, or it places the locality in the register of possibility.
+///
+/// Byte offsets come from regex match boundaries and from `find`/`rfind` over
+/// `char` patterns, so every slice below lands on a character boundary.
+fn sentence_is_suppressed(text: &str, start: usize, end: usize) -> bool {
+    const TERMINATORS: [char; 4] = ['.', '!', '?', '\n'];
+
+    let sentence_start = text[..start]
+        .rfind(TERMINATORS)
+        .map(|i| i + 1)
+        .unwrap_or(0)
+        .min(start);
+    let (sentence_end, terminator) = match text[end..].find(TERMINATORS) {
+        Some(offset) => (end + offset, text[end + offset..].chars().next()),
+        None => (text.len(), None),
+    };
+
+    // An interrogative restatement is not an assertion ("peux-tu tourner en
+    // local ?"). The negative controls of the plan name this case explicitly.
+    if terminator == Some('?') {
+        return true;
+    }
+
+    let sentence = text[sentence_start..sentence_end].to_lowercase();
+    CLAIM_CONDITIONAL_MARKERS
+        .iter()
+        .any(|marker| sentence.contains(marker))
+}
+
+// ---------------------------------------------------------------------------
 // mika#1646 — Destructive-action grounding guard (pre-execution)
 // ---------------------------------------------------------------------------
 //
@@ -2198,6 +2491,136 @@ mod tests {
                     title and the three bullets.";
         detect_doctrine_public_promo(text)
             .expect("plain violation without alignment signal must still fire");
+    }
+
+    // -- detect_false_local_hosting_claim tests (mika#2290) --
+
+    use mika_common::home::Deployment;
+
+    /// AC3 positive — the sentence measured on 2026-09-11 (cloud tenant of Al,
+    /// canary Vietnam), under **both** non-local states. `Unknown` is the state
+    /// every cloud tenant is actually in today, so a test that only exercised
+    /// `Cloud` would attest a guard that does not fire where the bug happened.
+    #[test]
+    fn mika2290_measured_false_claim_fires_under_cloud_and_unknown() {
+        let text = "Tout tourne en local, tes données ne quittent pas ta machine.";
+        for deployment in [Deployment::Cloud, Deployment::Unknown] {
+            let m = detect_false_local_hosting_claim(text, deployment)
+                .unwrap_or_else(|| panic!("must fire under {deployment:?}"));
+            assert!(
+                !m.subject.is_empty() && !m.assertion.is_empty(),
+                "telemetry fields must name what matched"
+            );
+        }
+    }
+
+    /// AC4 — **the most important negative control.** The remedy the ticket body
+    /// prescribes contains the word "local". A guard that forbade it would have
+    /// removed the truth while removing the lie.
+    #[test]
+    fn mika2290_prescribed_remedy_sentence_does_not_fire() {
+        for text in [
+            "Tu es sur un tenant isolé, et la même stack open-source (MIT) est \
+             self-hostable en local si tu veux.",
+            "Your data is yours and exportable, and the same open-source (MIT) \
+             stack can be self-hosted locally if you prefer.",
+        ] {
+            assert!(
+                detect_false_local_hosting_claim(text, Deployment::Cloud).is_none(),
+                "the prescribed cloud remedy must never fire the guard: {text}"
+            );
+        }
+    }
+
+    /// AC4 — the same positive assertion under a **declared local install** is
+    /// true, and the guard is a parameter of the deployment for exactly this.
+    #[test]
+    fn mika2290_same_claim_under_declared_local_does_not_fire() {
+        let text = "Tout tourne en local, tes données ne quittent pas ta machine.";
+        assert!(
+            detect_false_local_hosting_claim(text, Deployment::Cloud).is_some(),
+            "control: the claim is a violation when hosting is not local"
+        );
+        assert!(
+            detect_false_local_hosting_claim(text, Deployment::Local).is_none(),
+            "a declared local install may state that it runs locally"
+        );
+    }
+
+    /// AC4 — interrogative and negated forms are not assertions of fact.
+    #[test]
+    fn mika2290_interrogative_and_negation_do_not_fire() {
+        for text in [
+            "Peux-tu tourner en local ?",
+            "Est-ce que tout tourne en local ?",
+            "Je ne tourne pas en local.",
+            "I do not run locally.",
+            "Your data does not stay on your machine — it lives on a server.",
+        ] {
+            assert!(
+                detect_false_local_hosting_claim(text, Deployment::Unknown).is_none(),
+                "must not fire on a non-assertive form: {text}"
+            );
+        }
+    }
+
+    /// AC5 companion — the **family** cloud answer this ticket puts in the
+    /// prompt must survive the guard it ships with. Its shape is `assertion +
+    /// negation + locality` ("Je tourne sur un serveur, pas sur ton
+    /// téléphone"), which is exactly the case the positive/negated polarity
+    /// split exists to tell apart from the measured claim.
+    #[test]
+    fn mika2290_family_cloud_answer_does_not_fire() {
+        let text = "Je tourne sur un serveur, pas sur ton téléphone. Ce que tu me \
+                    confies est à toi, et tu peux le récupérer quand tu veux.";
+        assert!(
+            detect_false_local_hosting_claim(text, Deployment::Cloud).is_none(),
+            "the honest family-register cloud answer must pass"
+        );
+    }
+
+    /// A truthful cloud answer that also mentions that a local mode exists is
+    /// not a claim about where *this* instance runs. Contrast conjunctions
+    /// break the predication.
+    #[test]
+    fn mika2290_contrastive_mention_of_a_local_mode_does_not_fire() {
+        for text in [
+            "Je tourne dans le cloud, mais un mode local existe aussi.",
+            "I run in the cloud, but a local mode exists too.",
+        ] {
+            assert!(
+                detect_false_local_hosting_claim(text, Deployment::Cloud).is_none(),
+                "a contrastive mention is not a local-hosting claim: {text}"
+            );
+        }
+    }
+
+    /// The English wording of the claim is not hypothetical — it is published on
+    /// the marketing site today ("Your data never leaves your machine."), so it
+    /// is already in the model's prior. Bilingual coverage is the same reasoning
+    /// 5c uses (mika#1814).
+    #[test]
+    fn mika2290_english_phrasings_fire() {
+        for text in [
+            "Everything runs locally — your data never leaves your machine.",
+            "I run entirely on your machine.",
+            "Your data stays on your computer.",
+        ] {
+            assert!(
+                detect_false_local_hosting_claim(text, Deployment::Unknown).is_some(),
+                "must fire on the published English phrasing: {text}"
+            );
+        }
+    }
+
+    /// A suppressed match must not mask a real one later in the same response —
+    /// hence the iteration over every match rather than a single `find()`.
+    #[test]
+    fn mika2290_suppressed_match_does_not_mask_a_later_violation() {
+        let text = "Je tourne dans le cloud, mais un mode local existe. \
+                    Et de toute façon tout tourne en local chez toi.";
+        detect_false_local_hosting_claim(text, Deployment::Cloud)
+            .expect("the second sentence is a violation and must still be caught");
     }
 
     // -- mika#1646 destructive-action grounding tests --

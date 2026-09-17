@@ -723,6 +723,10 @@ struct InvestigationParams {
     /// Agent tier borrowed from the default agent's cached `AgentState.tier`
     /// (mika#1962).
     tier: mika_common::home::AgentTier,
+    /// Deployment borrowed from the same cached `AgentState` (mika#2290) — the
+    /// investigation panel is not agent-scoped, so it inherits the default
+    /// agent's posed hosting fact rather than re-reading the environment.
+    deployment: mika_common::home::Deployment,
 }
 
 /// Run the investigation agent loop, sending SSE events via the channel.
@@ -739,6 +743,7 @@ async fn run_investigation(
         session_id: investigation_session_id,
         trace_id: investigation_trace_id,
         tier,
+        deployment,
     } = params;
     let tool_defs: Vec<_> = tools
         .definitions()
@@ -780,6 +785,7 @@ async fn run_investigation(
         required_tool_arg_suffixes: &[],
         tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
         tier,
+        deployment,
         scope_task_id: None, // Investigation: no task context for parallel narrative
     };
 
@@ -1136,6 +1142,7 @@ pub async fn handle_investigate(
     // here: an investigation started after an env change must not run under a
     // different tier than the agents it is investigating.
     let tier = default_agent.tier;
+    let deployment = default_agent.deployment;
     drop(default_agent);
     let db = state.dashboard_db.clone();
     let agents = state.agents.clone();
@@ -1160,6 +1167,7 @@ pub async fn handle_investigate(
                 session_id: investigation_session_id,
                 trace_id: investigation_trace_id,
                 tier,
+                deployment,
             },
         )
         .await;

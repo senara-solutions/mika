@@ -377,17 +377,37 @@ const REPORTED_ATTEMPT_HARD_CAP: u32 = super::DEFAULT_ATTEMPTS_HARD_CAP;
 /// asks is about an agent's *nominal* budget, not what a skill overrides for one
 /// turn. Said here so a reader looking for an override's budget knows it was
 /// never written, rather than concluding the instrument is broken.
-pub fn log_llm_budget_resolved(agent_id: &str, global_home: &Path, agent_home: &Path) {
-    let provenance = BudgetProvenance::resolve(global_home, agent_home);
+/// The deduplication key of one resolved budget.
+///
+/// Written once and read by the emitter *and* by its test (mika#2362): the test
+/// used to rebuild this string by hand, so extending the key silently broke it
+/// — a copy of a predicate, in the ticket that exists to remove copies of a
+/// predicate.
+///
+/// `effective_max_attempts` is part of the key: without it, a geometry change
+/// that moves only *reachability* — the very thing the new fields report —
+/// would be deduplicated away as "no change".
+fn dedup_signature(provenance: &BudgetProvenance) -> String {
     let budget = provenance.effective_budget();
-
-    let signature = format!(
-        "{}|{}|{}|{}",
+    format!(
+        "{}|{}|{}|{}|{}",
         budget.http_timeout_secs(),
         budget.agent_total_timeout_secs(),
         provenance.http.source.as_str(),
         provenance.agent_total.source.as_str(),
-    );
+        budget.effective_max_attempts(REPORTED_ATTEMPT_HARD_CAP),
+    )
+}
+
+pub fn log_llm_budget_resolved(agent_id: &str, global_home: &Path, agent_home: &Path) {
+    let provenance = BudgetProvenance::resolve(global_home, agent_home);
+    let budget = provenance.effective_budget();
+
+    let max_attempts = budget.max_attempts(REPORTED_ATTEMPT_HARD_CAP);
+    let effective_max_attempts = budget.effective_max_attempts(REPORTED_ATTEMPT_HARD_CAP);
+    let retry_reachable = effective_max_attempts == max_attempts;
+
+    let signature = dedup_signature(&provenance);
 
     let mut seen = LAST_EMITTED
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -404,7 +424,9 @@ pub fn log_llm_budget_resolved(agent_id: &str, global_home: &Path, agent_home: &
         agent_id,
         http_timeout_secs = budget.http_timeout_secs(),
         agent_total_timeout_secs = budget.agent_total_timeout_secs(),
-        max_attempts = budget.max_attempts(REPORTED_ATTEMPT_HARD_CAP),
+        max_attempts,
+        effective_max_attempts,
+        retry_reachable,
         worst_case_failure_secs = budget.worst_case_failure_secs(REPORTED_ATTEMPT_HARD_CAP),
         http_source = provenance.http.source.as_str(),
         total_source = provenance.agent_total.source.as_str(),
@@ -412,6 +434,40 @@ pub fn log_llm_budget_resolved(agent_id: &str, global_home: &Path, agent_home: &
         total_raw = provenance.agent_total.raw_or_empty(),
         "resolved LLM timeout budget (mika#2293)"
     );
+
+    // mika#2362 D4 — the measurement, emitted where the geometry is known and
+    // nowhere else.
+    //
+    // **It sits after the dedup `return` on purpose**, so it fires once per
+    // agent per resolved pair, exactly like the INFO line it accompanies — not
+    // once per turn. The two describe one configuration event, and a WARN that
+    // repeated while its own INFO stayed silent would read as a new condition
+    // each time. Said out loud in the operator section of the root `CLAUDE.md`
+    // too: a grep finding a handful of lines after days of running is the
+    // nominal regime, not evidence the geometry was fixed.
+    //
+    // **Not a startup refusal.** `envelope = k × cap` is a *valid, working*
+    // configuration: calls run, and the transport class still retries. Refusing
+    // to boot on it would lay the fleet down over a suboptimal setting — the
+    // exact failure mode mika#2293 had to name for its own guard. This produces
+    // the number; the decision belongs to the operator, with it in hand.
+    if !retry_reachable {
+        tracing::warn!(
+            event = "llm_budget_retry_unreachable",
+            agent_id,
+            http_timeout_secs = budget.http_timeout_secs(),
+            agent_total_timeout_secs = budget.agent_total_timeout_secs(),
+            max_attempts,
+            effective_max_attempts,
+            http_source = provenance.http.source.as_str(),
+            total_source = provenance.agent_total.source.as_str(),
+            "this agent's last nominal LLM retry cannot run: after an attempt consuming the \
+             full per-call cap the remaining envelope is at or below the non-transport retry \
+             threshold (1.0 × cap), so the deadline guard refuses it. The envelope being an \
+             exact multiple of the cap is the usual cause — move either number off the \
+             multiple to make the attempt reachable (mika#2362)"
+        );
+    }
 }
 
 /// Forget every emitted signature — test-only, so one test's emission cannot
@@ -639,17 +695,9 @@ mod tests {
         )
         .unwrap();
 
-        let signature_now = || {
-            let p = BudgetProvenance::resolve(&global, &agent);
-            let b = p.effective_budget();
-            format!(
-                "{}|{}|{}|{}",
-                b.http_timeout_secs(),
-                b.agent_total_timeout_secs(),
-                p.http.source.as_str(),
-                p.agent_total.source.as_str()
-            )
-        };
+        // Reads the emitter's own key rather than rebuilding it: a hand-written
+        // copy here is what broke when mika#2362 extended the signature.
+        let signature_now = || dedup_signature(&BudgetProvenance::resolve(&global, &agent));
 
         let first = signature_now();
         log_llm_budget_resolved("mika-arch", &global, &agent);
@@ -692,6 +740,90 @@ mod tests {
             let seen = LAST_EMITTED.get().unwrap().lock().unwrap();
             assert_eq!(seen.get("mika-arch"), Some(&first));
         }
+
+        reset_dedup_for_test();
+        clean_budget_env();
+    }
+
+    /// mika#2362 AC5 — the reachability line fires on the incident's geometry
+    /// and stays silent on the fleet's.
+    ///
+    /// Both controls in one call: a warning that fired for every agent would be
+    /// muted within a week, and a probe that only ever observed the firing side
+    /// could not tell the two apart.
+    #[test]
+    #[serial]
+    fn mika2362_retry_unreachable_fires_on_the_incident_geometry_only() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Default)]
+        struct Events(Arc<Mutex<Vec<String>>>);
+        struct Layer(Arc<Mutex<Vec<String>>>);
+        struct Visitor<'a>(&'a mut Vec<String>);
+
+        impl tracing::field::Visit for Visitor<'_> {
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                if f.name() == "event" {
+                    self.0.push(format!("{v:?}").trim_matches('"').to_string());
+                }
+            }
+            fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                if f.name() == "event" {
+                    self.0.push(v.to_string());
+                }
+            }
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Layer {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if let Ok(mut seen) = self.0.lock() {
+                    event.record(&mut Visitor(&mut seen));
+                }
+            }
+        }
+
+        let collected = Events::default().0;
+        let subscriber = tracing_subscriber::registry().with(Layer(Arc::clone(&collected)));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        clean_budget_env();
+        reset_dedup_for_test();
+        let (_tmp, global, agent) = homes();
+
+        // Negative control: the fleet geometry, whose second attempt is real.
+        std::fs::write(
+            agent.join("config.toml"),
+            "llm_http_timeout_secs = 120\nagent_total_timeout_secs = 300\n",
+        )
+        .unwrap();
+        log_llm_budget_resolved("fleet-agent", &global, &agent);
+        assert!(
+            !collected
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e == "llm_budget_retry_unreachable"),
+            "120/300 reaches both its attempts and must not warn"
+        );
+
+        // Positive control: the mika#2362 incident's geometry.
+        std::fs::write(
+            agent.join("config.toml"),
+            "llm_http_timeout_secs = 300\nagent_total_timeout_secs = 600\n",
+        )
+        .unwrap();
+        log_llm_budget_resolved("incident-agent", &global, &agent);
+        let seen = collected.lock().unwrap();
+        assert!(
+            seen.iter().any(|e| e == "llm_budget_retry_unreachable"),
+            "300/600 cannot reach its second attempt and must say so: {seen:?}"
+        );
+        drop(seen);
 
         reset_dedup_for_test();
         clean_budget_env();

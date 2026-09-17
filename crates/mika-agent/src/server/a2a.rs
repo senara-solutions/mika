@@ -167,6 +167,7 @@ async fn run_a2a_agent(
     let params = AgentParams {
         db: &agent_state.db,
         tier: agent_state.tier,
+        deployment: agent_state.deployment,
         llm: agent_state.llm.as_ref(),
         tools: &state.tools,
         skills: &skills,
