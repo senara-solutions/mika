@@ -437,7 +437,7 @@ dit au root `CLAUDE.md` avec le reste du vocabulaire (§ 6).
 
 ---
 
-## 7. Acceptance criteria
+## Acceptance criteria
 
 *(Le ticket ne porte pas de section `## Acceptance criteria` ; celles-ci sont dérivées
 du « Correctif attendu », des mesures du § 1 et du refus motivé du § 2.)*
