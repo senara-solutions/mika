@@ -9,6 +9,7 @@ use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use super::error::LlmError;
 use super::openai::extract_think_block;
+use super::retry_gate::{RetryThresholds, RetryVerdict, deadline_verdict, next_attempt_verdict};
 use super::types::*;
 use super::{LlmProvider, LlmTimeoutBudget};
 
@@ -590,11 +591,11 @@ impl OllamaProvider {
         // mika#2331 §3.3: the transport-aware threshold of mika#1744 was never
         // ported to this rail — it used the long `0.75 + 0.25` threshold even
         // after a transport failure, i.e. precisely after the error mika#1744
-        // exists to retry quickly. Computed per-iteration now (as on the openai
-        // rail) because it depends on the class of the last error.
-        let transport_threshold_secs = self.budget.transport_retry_min_remaining_secs();
-        let default_threshold_secs =
-            self.budget.typical_call_duration_secs() + self.budget.retry_buffer_secs();
+        // exists to retry quickly. That omission is the measured proof that a
+        // copied predicate drifts, which is why mika#2362 moved the selection
+        // into `retry_gate`: the pair is derived once here and the three sites
+        // below read one predicate over it.
+        let thresholds = RetryThresholds::from_budget(&self.budget);
 
         info!(
             model = %request.model,
@@ -613,16 +614,13 @@ impl OllamaProvider {
                     let last_was_transport = last_error
                         .as_ref()
                         .is_some_and(super::error::LlmError::is_transport);
-                    let retry_threshold_secs = if last_was_transport {
-                        transport_threshold_secs
-                    } else {
-                        default_threshold_secs
-                    };
-                    if remaining < Duration::from_secs(retry_threshold_secs) {
+                    if let RetryVerdict::DeadlineInsufficient { threshold_secs, .. } =
+                        deadline_verdict(Some(remaining), last_was_transport, &thresholds)
+                    {
                         warn!(
                             attempt,
                             remaining_ms = remaining.as_millis() as u64,
-                            threshold_secs = retry_threshold_secs,
+                            threshold_secs,
                             last_was_transport,
                             "aborting retry chain — remaining deadline insufficient for another attempt"
                         );
@@ -668,12 +666,18 @@ impl OllamaProvider {
             let attempt_elapsed_ms = attempt_start.elapsed().as_millis() as u64;
             let deadline_remaining_ms =
                 deadline.map(|dl| dl.saturating_duration_since(Instant::now()).as_millis() as u64);
+            // mika#2362 — see the twin comment in `openai.rs`: this line used
+            // to ignore the deadline, and could announce a retry the guard
+            // above was about to refuse.
             let outcome = match &attempt_result {
                 Ok(_) => super::attempt_outcome::SUCCESS,
-                Err(e) if attempt + 1 < max_attempts && e.is_retryable() => {
-                    super::attempt_outcome::RETRYING
-                }
-                Err(_) => super::attempt_outcome::EXHAUSTED,
+                Err(e) => super::attempt_outcome::outcome_for(&next_attempt_verdict(
+                    attempt,
+                    max_attempts,
+                    Some(e),
+                    deadline_remaining_ms.map(Duration::from_millis),
+                    &thresholds,
+                )),
             };
             super::emit_llm_call_attempt(
                 &self.provider_kind.to_string(),
@@ -717,21 +721,19 @@ impl OllamaProvider {
             }
         }
 
-        // Distinguish deadline-abort from normal retry exhaustion. Mirrors the
-        // loop's transport-aware threshold so the two branches agree on which
-        // errors classify as "aborted by deadline".
+        // Distinguish deadline-abort from normal retry exhaustion. mika#2362 —
+        // see the twin comment in `openai.rs`: the agreement with the guard is
+        // structural now, not a copy, while the margin is still measured at
+        // this later instant.
         let last_was_transport = last_error
             .as_ref()
             .is_some_and(super::error::LlmError::is_transport);
-        let deadline_threshold_secs = if last_was_transport {
-            transport_threshold_secs
-        } else {
-            default_threshold_secs
-        };
-        let deadline_aborted = deadline.is_some_and(|dl| {
-            dl.saturating_duration_since(Instant::now())
-                < Duration::from_secs(deadline_threshold_secs)
-        });
+        let deadline_aborted = deadline_verdict(
+            deadline.map(|dl| dl.saturating_duration_since(Instant::now())),
+            last_was_transport,
+            &thresholds,
+        )
+        .is_deadline_insufficient();
 
         Err(last_error.unwrap_or_else(|| {
             if deadline_aborted {
