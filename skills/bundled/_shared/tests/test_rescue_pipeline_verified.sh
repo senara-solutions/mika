@@ -233,8 +233,12 @@ R5=$(make_repo t5)
 add_work "$R5" "$CLIPPY_DIRTY_LIB"
 measure "$R5" && { FAIL=$((FAIL + 1)); echo "  ✗ T5 refuses a clippy lint"; }
 assert_eq "T5 names the \`clippy\` term" "clippy" "$MEASURE_TERM"
+# `_rescue_verify_excerpt` keeps the `error:` line — the one clippy prints for
+# `ptr_arg` reads `error: writing \`&Vec\` instead of \`&[_]\` …`. The lint's
+# NAME sits on an indented `= help:` line the excerpt deliberately drops, so
+# the assertion targets what the excerpt retains, not what the lint is called.
 assert_contains "T5 excerpt carries the diagnostic, not the \`Compiling\` noise" \
-    "$MEASURE_EXCERPT" "ptr_arg"
+    "$MEASURE_EXCERPT" "error: writing \`&Vec\`"
 
 # ── T6 (AC2, term 5) — a pathological split verify-pipeline.sh rejects ──────
 echo "-- T6: code-only diff (AC2, term \`verify-pipeline\`) --"
@@ -265,12 +269,26 @@ assert_contains "T8 excerpt says the script is absent or not executable" \
     "$MEASURE_EXCERPT" "absent or not executable"
 
 # ── T9 (AC3) — an exhausted budget yields `no`, never a partial `yes` ───────
+# The budget is in whole seconds and 1 is its floor; on a host where the
+# shared `CARGO_TARGET_DIR` is already warm from T1–T8, a clean fixture crate
+# clears all five terms in well under a second and a 1s budget is never
+# exhausted (the assertion then flips on cache temperature, not on the
+# product). So the clock is pinned rather than raced: a `cargo` shim ahead of
+# PATH that sleeps past the budget. Under `timeout` it is killed at 1s (124 →
+# `budget`); without `timeout` the next deadline check catches the overrun —
+# both branches of `_rescue_verify_run` yield the same term.
 echo "-- T9: exhausted budget (AC3) --"
 R9=$(make_repo t9)
 add_work "$R9" "$CLEAN_LIB"
-MIKA_RESCUE_VERIFY_BUDGET_SECS=1 measure "$R9" \
+SLOW_BIN="$TMP_ROOT/slow-bin"
+mkdir -p "$SLOW_BIN"
+printf '#!/bin/sh\nexec sleep 5\n' > "$SLOW_BIN/cargo"
+chmod +x "$SLOW_BIN/cargo"
+PATH="$SLOW_BIN:$PATH" MIKA_RESCUE_VERIFY_BUDGET_SECS=1 measure "$R9" \
     && { FAIL=$((FAIL + 1)); echo "  ✗ T9 refuses on an exhausted budget"; }
 assert_eq "T9 names the \`budget\` term" "budget" "$MEASURE_TERM"
+assert_contains "T9 excerpt names the term the budget ran out on" \
+    "$MEASURE_EXCERPT" "budget"
 
 # ── T9b — an invalid budget falls back to the default, it does not disarm ───
 # `0` is NOT a disarm here: that is `MIKA_RESCUE_VERIFY_ENABLED`'s job, and
@@ -362,7 +380,11 @@ fi
 echo "-- T14: the daemon never writes its own green light (AC7) --"
 WIP_RESCUE_RS="$REPO_ROOT/crates/mika-agent/src/wip_rescue.rs"
 if [ -f "$WIP_RESCUE_RS" ]; then
-    writers=$(grep -n 'rescue-pipeline-verified' "$WIP_RESCUE_RS" \
+    # Stop at the first `#[cfg(test)]`: the unit-test module holds string
+    # fixtures such as `<!-- rescue-pipeline-verified: maybe -->` that are
+    # inputs to `pipeline_verified`, not writes of the marker. Only the
+    # production half of the file is a candidate writer.
+    writers=$(awk '/^#\[cfg\(test\)\]/ { exit } /rescue-pipeline-verified/ { print NR ":" $0 }' "$WIP_RESCUE_RS" \
         | grep -vE '^[0-9]+:[[:space:]]*(//|///|//!)' \
         | grep -vE 'const (MARKER_NO|MARKER_YES|PIPELINE_VERIFIED_KEY)' \
         | grep -vE 'assert|pipeline_verified\(' || true)
