@@ -909,6 +909,17 @@ impl AsyncDatabase {
             .await
     }
 
+    /// The instant a ticket was abandoned, or `None` when it is not (mika#2361).
+    pub async fn get_auto_pull_redrive_abandoned_at(
+        &self,
+        repo_full_name: &str,
+        issue_number: u64,
+    ) -> Result<Option<String>> {
+        let repo = repo_full_name.to_owned();
+        self.with_db(move |db| db.get_auto_pull_redrive_abandoned_at(&repo, issue_number))
+            .await
+    }
+
     /// Increment a ticket's re-drive counter (mika#2020).
     pub async fn increment_auto_pull_redrive(
         &self,
