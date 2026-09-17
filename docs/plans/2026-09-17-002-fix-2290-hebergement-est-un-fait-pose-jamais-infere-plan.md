@@ -318,7 +318,7 @@ Chacune paraît économique et chacune est fausse :
 | `crates/mika-common/src/home.rs` | `Deployment` + `from_env()` (trois états, casse/trim, `warn!` sur valeur non reconnue), près d'`AgentTier` |
 | `crates/mika-agent/src/prompt.rs` | `write_runtime_section` prend `(deployment, persona_profile)` et écrit la ligne ; règle 5 de `## Self-Identity Discipline` ; champs sur `PromptContext` / `SilentPromptContext` ; `build_compact_system_prompt` inchangé (carve-out épinglée) |
 | `crates/mika-agent/src/evidence/guards.rs` | `detect_false_local_hosting_claim(text) -> Option<…>`, fonction pure à deux couches, à côté de `detect_doctrine_public_promo` |
-| `crates/mika-agent/src/agent_loop/mod.rs` | Garde 5d après 5c : `intent_guard_retries`, `GuardCorrelation`, `warn!(event = "guard.false_local_hosting_claim")`, re-prompt |
+| `crates/mika-agent/src/agent_loop/mod.rs` | Garde 5d après 5c : `intent_guard_retries`, `GuardCorrelation`, `warn!(event = "guard.false_local_hosting_claim")`, re-prompt ; plus le WARN de budget épuisé `guard.false_local_hosting_claim_uncorrected` sur le modèle de 4b (`:1786-1797`) — voir § Fire-Disposition |
 | site de `DOCTRINE_PUBLIC_PROMO_LABEL` | `FALSE_LOCAL_HOSTING_LABEL` |
 | `crates/mika-agent/src/server/{mod.rs,state.rs}` + params structs | Résolution une fois, cache, threading (déploiement **et** persona) |
 | `docs/architecture.md` + `scripts/sync-agent-docs.sh` | Décision 6 |
@@ -367,6 +367,10 @@ imposée à cette famille par mika#2023 AC2/AC4.
   interceptée ; répétée sur un même tenant, elle signifie que la moitié *intent*
   n'atteint pas ce chemin — vérifier d'abord la carve-out compacte avant de
   toucher au garde.
+- `guard.false_local_hosting_claim_uncorrected` (WARN — le re-prompt n'a pas
+  corrigé, budget épuisé, la réponse est sortie). **Régime nominal : zéro ligne.**
+  C'est la seule population que le garde ne ferme pas ; sans cette ligne elle
+  serait indiscernable d'un tour sain. Voir § Fire-Disposition.
 - Le fait lui-même est dans le prompt, donc lisible via `MIKA_LOG_LLM_BODIES`
   armé **sur mika-spirit** (mika#2220 : armé sur le process CLI, il est inerte
   pour les tours servis par le démon).
@@ -430,6 +434,91 @@ pas. Établir lequel d'abord.
 - **~30 sites de construction en test à compléter.** Mécanique, porté par le
   compilateur, prix explicite de ne pas relire l'environnement par tour.
 
+## Fire-Disposition
+
+Exigée par la porte mika#1574 (`docs/solutions/best-practices/fire-disposition-doctrine.md`) :
+ce plan introduit des livrables de classe détecteur, et la doctrine demande ce que
+fait l'implémentation quand le détecteur tire sur les données **existantes** — les
+violations préexistantes, non le code neuf. Les cinq détecteurs, avec leur option et
+leur population existante :
+
+| # | Détecteur | Population existante | Option |
+|---|---|---|---|
+| D1 | Garde EndTurn **5d** `detect_false_local_hosting_claim` (Décision 3, AC3) | Les tours en cours et les réponses déjà persistées dans `messages` | **(c) Halt-and-surface** — détail ci-dessous |
+| D2 | Tests d'acceptation AC3/AC4 et contrat de vérification §3-§6 | **Vide par construction** — les fixtures sont écrites par ce ticket | Sans objet, zéro exception |
+| D3 | Scénario eval `doctrine_regressions` (AC9, §9) | **Vide** — rejoue la forme mesurée du 2026-09-11, rouge-avant/vert-après | Sans objet, zéro exception |
+| D4 | Garde structurelle AC7 (`grep -rn 'Deployment::from_env()'`) | **Vide** — le type n'existe pas avant ce ticket, donc zéro site à trier | Sans objet, **et pas d'allowlist** |
+| D5 | Test 7 (la ligne `Cloud` sous `PersonaProfile::Family` ne porte aucun terme interdit par `FAMILY_SOUL:680-681`) | **Vide** — la seule ligne évaluée est celle qu'ajoute la Décision 4 | Sans objet, zéro exception |
+
+### D1 — option (c) Halt-and-surface, et ce que « halt » veut dire ici
+
+Le tour est **interrompu avant émission** : le garde lit le texte sortant sur
+`LlmStopReason::EndTurn`, et sur détection il ne laisse pas la réponse sortir — il
+pousse la réponse fautive comme message assistant puis un message utilisateur
+`[mika-engine]` nommant l'état de déploiement résolu et la phrase à ne pas tenir,
+et `continue` la boucle. Forme reprise **littéralement** de 5c
+(`agent_loop/mod.rs:2009-2058`), `intent_guard_retries` compris, ce qui donne un
+**re-prompt unique**. Non exempté par `skip_remaining_guards` (#1178).
+
+**Ce qui arrive au second échec, dit plutôt que découvert.** `intent_guard_retries`
+contenant déjà le label, le garde ne re-tire pas et l'EndTurn est accepté : une
+seconde affirmation fausse **sortirait**. Laisser ce résidu muet serait le point
+aveugle que la porte existe pour fermer, donc le garde émet dans ce cas un WARN
+distinct `guard.false_local_hosting_claim_uncorrected` — exactement le geste que 4b
+fait déjà pour la même situation (`agent_loop/mod.rs:1786-1797`, « accepting EndTurn
+with second violation (budget exhausted) »). Ce n'est pas une seconde correction :
+c'est la surface qui rend la population résiduelle **comptable** au lieu de la
+laisser se confondre avec les tours sains. Un budget de deux re-prompts n'est
+délibérément pas retenu : la famille en accorde un, et un garde qui diverge de ses
+voisins sur ce point deviendrait le garde qu'on relit pour comprendre pourquoi.
+
+**Pas de scan rétroactif, et c'est une décision, pas un oubli.** L'option (a) est
+écartée pour D1 : les « données existantes » sont ici des réponses déjà envoyées à
+des utilisateurs. Réécrire `messages` falsifierait un historique, et une réponse
+déjà lue par un invité de campagne n'est pas rattrapable par un balayage. Le garde
+est un détecteur de flux, pas de corpus.
+
+**Télémétrie (#953), la même que toute la famille.** Détection :
+`guard.false_local_hosting_claim` (WARN, `target: "mika::otel"`, champs
+`trace_id`, `agent_id`, `session_id`, `step`, `deployment`, `persona`,
+`matched_subject`, `matched_assertion`, `guard_correlation_id`,
+`label = mode.label()`). Correction : `guard.correction_accepted`, joint par
+`guard_correlation_id` — c'est ce joint qui permet au downstream de vérifier que le
+détecteur a bien un comportement défini et observable sur chaque violation, plutôt
+que de l'inférer. Résidu : `guard.false_local_hosting_claim_uncorrected`.
+
+**Auto-nettoyage — la ligne cesse de tirer d'elle-même quand le fait atteint le
+prompt.** Le garde est conditionné à `deployment != Local`. Trois trajectoires
+l'éteignent sans geste sur le garde : (i) le ticket compagnon `mika-cloud` livre
+`MIKA_DEPLOYMENT=cloud`, la ligne `Cloud` de la Décision 2 entre dans `## Runtime`,
+le modèle lit la vérité-terrain au lieu de fabriquer, et `guard.*` retombe à zéro ;
+(ii) l'opérateur déclare `MIKA_DEPLOYMENT=local` sur son poste, le garde ne
+s'applique plus à cette instance ; (iii) sur un tenant `Unknown`, la règle 5 de
+`## Self-Identity Discipline` plus la règle 3 (*fallback honestly*) suffisent
+généralement à empêcher l'affirmation en amont. Le régime nominal attendu est
+**zéro ligne** ; toute occurrence persistante est le signal que la moitié *intent*
+n'atteint pas ce chemin — vérifier d'abord la carve-out du chemin compact
+(Décision 2) avant de toucher au détecteur.
+
+**Pourquoi (b) « land disabled » est refusé.** Ce garde est la moitié structurelle
+qui ferme le p1 (M7, mika#1814) ; le livrer derrière un `#[ignore]` laisserait
+l'affirmation de confidentialité fausse ouverte pendant tout le délai
+d'activation — c'est-à-dire tout ce que le ticket existe pour fermer.
+
+### D4 — pas d'allowlist, halt-and-surface sur découverte
+
+La garde structurelle de l'AC7 naît sur une population vide, donc sans exception.
+Aucune allowlist n'est créée : une allowlist née vide est un endroit où ranger la
+prochaine violation. Si un site de production appelant `Deployment::from_env()`
+hors du site de résolution apparaît plus tard, la disposition est **halt-and-surface**
+— la PR s'arrête et la question remonte, parce que « faut-il un second lecteur
+d'environnement » est exactement la décision que mika#1962 a tranchée une fois et
+qu'un ajout de ligne rendrait invisible.
+
+*Citation : mika#1574 Fire-Disposition Gate ;
+`docs/solutions/best-practices/fire-disposition-doctrine.md` ;
+`docs/architecture/review-guide.md` § détecteurs EndTurn.*
+
 ## Note zone
 
 Aucun chemin visé n'est sous CODEOWNERS (`.github/CODEOWNERS` couvre
@@ -453,6 +542,9 @@ crates en dépendent) : `cargo test` complet, pas seulement le crate touché.
   mes données ».
 - Le garde 5d refuse une affirmation d'hébergement local quand le déploiement
   résolu n'est pas `Local`, et laisse passer la phrase de remède prescrite.
+- Le résidu du budget de retry est **nommé** : une seconde violation dans le même
+  tour émet `guard.false_local_hosting_claim_uncorrected` au lieu de sortir en
+  silence (§ Fire-Disposition, option (c)).
 - `docs/architecture.md:13-15` ne porte plus d'affirmation de localité détachable
   de son mode ; les copies sont synchronisées et `docs-sync` est vert.
 - Le déploiement est résolu une fois par process et mis en cache ; aucun appel à
@@ -534,3 +626,33 @@ qui l'affirme ».
 - **AC10 — CI verte.** `cargo build` + `cargo clippy --all-targets -- -D warnings`
   + `cargo test` verts ; sorties rouge-avant/vert-après des tests AC3 et AC4
   collées au corps de la PR (porte mika#2264).
+
+## Revision history
+
+- rev 2 (2026-09-17) : adressé **F1** (BLOCKING, porte Fire-Disposition mika#1574)
+  en ajoutant la section `## Fire-Disposition` entre `## Risques` et
+  `## Definition of Done`. Elle recense les **cinq** détecteurs du plan — les trois
+  nommés par l'architecte (garde EndTurn 5d, scénario eval `doctrine_regressions`
+  AC9, tests d'acceptation AC3/AC4 et contrat §3-§6) plus deux que la revue n'avait
+  pas listés et qui relèvent de la même classe (la garde structurelle de l'AC7 sur
+  `Deployment::from_env()`, et le test 7 sur les termes interdits par
+  `FAMILY_SOUL:680-681`). Pour le garde 5d : option **(c) Halt-and-surface** retenue
+  et détaillée — interruption avant émission, re-prompt unique via
+  `intent_guard_retries` sur la forme littérale de 5c (`agent_loop/mod.rs:2009-2058`),
+  télémétrie `guard.false_local_hosting_claim` / `guard.correction_accepted` jointes
+  par `guard_correlation_id` (#953), et mécanisme d'auto-nettoyage explicite (la
+  ligne cesse de tirer quand le fait atteint le prompt, par le ticket compagnon ou
+  par déclaration opérateur). L'option (a) est refusée pour ce détecteur avec sa
+  raison (un scan rétroactif des réponses déjà émises falsifierait `messages` et ne
+  rattrape rien), l'option (b) également (livrer le garde désactivé laisserait
+  ouverte l'affirmation de confidentialité fausse que le ticket existe pour fermer).
+  Les quatre autres détecteurs ont une population existante **vide par
+  construction**, ce qui est énoncé plutôt que sous-entendu, et l'AC7 est explicitée
+  *sans allowlist* avec halt-and-surface sur découverte d'un site futur.
+  Trouvé en écrivant la disposition et corrigé en conséquence : le comportement au
+  **second** échec n'était défini nulle part — le budget de retry épuisé, la famille
+  accepte l'EndTurn, donc une seconde affirmation fausse serait sortie en silence.
+  Le plan ajoute un WARN distinct `guard.false_local_hosting_claim_uncorrected`, sur
+  le précédent littéral de 4b (`agent_loop/mod.rs:1786-1797`), répercuté dans
+  § Implémentation, § Surfaces opérateur et la Definition of Done. Aucun AC n'a été
+  affaibli ; aucune autre section n'a été réécrite.

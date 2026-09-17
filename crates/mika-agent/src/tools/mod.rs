@@ -112,6 +112,12 @@ pub struct ToolContext<'a> {
     /// mika#1783 and `ToolOutput::substrate_unavailable`. Resolved from
     /// `MIKA_AGENT_TIER` at ToolContext construction time.
     pub tier: mika_common::home::AgentTier,
+    /// Where this instance runs (mika#2290). Sibling of `tier` in every
+    /// respect: resolved once at `server::init_agent` from `MIKA_DEPLOYMENT`,
+    /// cached on `AgentState`, threaded through the params structs, never
+    /// re-read from the environment per turn. Read by the EndTurn guard 5d,
+    /// which refuses an assertion of local hosting on any non-`Local` value.
+    pub deployment: mika_common::home::Deployment,
     pub core_memory_edit_count: &'a AtomicU32,
     pub is_onboarding: bool,
     pub message_sender: Option<Arc<dyn MessageSender>>,

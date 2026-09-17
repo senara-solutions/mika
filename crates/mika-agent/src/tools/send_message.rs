@@ -250,6 +250,7 @@ mod tests {
             required_tool_arg_suffixes: &[],
             tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
             tier: mika_common::home::AgentTier::Default,
+            deployment: mika_common::home::Deployment::Unknown,
             scope_task_id: None,
         };
         let tool = SendMessageTool;
@@ -315,6 +316,7 @@ mod tests {
             required_tool_arg_suffixes: &[],
             tool_arg_suffix_rejected,
             tier: mika_common::home::AgentTier::Default,
+            deployment: mika_common::home::Deployment::Unknown,
             scope_task_id: None,
         }
     }
@@ -558,6 +560,7 @@ mod tests {
             required_tool_arg_suffixes: &[],
             tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
             tier: mika_common::home::AgentTier::Default,
+            deployment: mika_common::home::Deployment::Unknown,
             scope_task_id: None,
         };
         let tool = SendMessageTool;
@@ -619,6 +622,7 @@ mod tests {
             required_tool_arg_suffixes: &[],
             tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
             tier: mika_common::home::AgentTier::Default,
+            deployment: mika_common::home::Deployment::Unknown,
             scope_task_id: None,
         };
         let tool = SendMessageTool;
@@ -681,6 +685,7 @@ mod tests {
             required_tool_arg_suffixes: &[],
             tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
             tier: mika_common::home::AgentTier::Default,
+            deployment: mika_common::home::Deployment::Unknown,
             scope_task_id: None,
         };
         let tool = SendMessageTool;
@@ -742,6 +747,7 @@ mod tests {
             required_tool_arg_suffixes: &[],
             tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
             tier: mika_common::home::AgentTier::Default,
+            deployment: mika_common::home::Deployment::Unknown,
             scope_task_id: None,
         };
         let tool = SendMessageTool;

@@ -63,6 +63,8 @@ fn make_ctx<'a>(soul_content: &'a str, identity: &'a Identity) -> PromptContext<
         runtime_provider: "test-provider",
         runtime_model: "test-model",
         stopped_topics: &[],
+        deployment: mika_common::home::Deployment::Unknown,
+        persona_profile: mika_common::home::PersonaProfile::Operator,
     }
 }
 

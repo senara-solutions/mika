@@ -174,11 +174,15 @@ async fn spawn_agent_worker(
     // init boundary for the tier. Resolve once here and thread the copy; do
     // not re-read the env per turn.
     let cli_tier = mika_common::home::AgentTier::from_env();
+    // mika#2290 — same boundary, same reason: the CLI process start is where
+    // the posed hosting fact is read, once.
+    let cli_deployment = mika_common::home::Deployment::from_env();
 
     // Set up task engine for background tasks (reminders, reflection)
     let dispatcher = Arc::new(TaskDispatcher {
         db: ctx.async_db.clone(),
         tier: cli_tier,
+        deployment: cli_deployment,
         llm: ctx.llm.clone(),
         tools: tool_registry.clone(),
         skills: skill_registry.clone(),
@@ -326,6 +330,7 @@ async fn spawn_agent_worker(
                     let result = agent::run_agent(&AgentParams {
                         db: &worker_db,
                         tier: cli_tier,
+                        deployment: cli_deployment,
                         llm: worker_llm.as_ref(),
                         tools: &worker_tools,
                         skills: &worker_skills,
@@ -445,6 +450,7 @@ async fn spawn_agent_worker(
                     let callback_result = agent::run_agent(&AgentParams {
                         db: &worker_db,
                         tier: cli_tier,
+                        deployment: cli_deployment,
                         llm: worker_llm.as_ref(),
                         tools: &worker_tools,
                         skills: &worker_skills,
@@ -1071,6 +1077,8 @@ pub async fn run_team(
                         None, // CLI: no AppState for session-scoped dedup (#821)
                         // mika#1962 — CLI process start is the tier init boundary.
                         mika_common::home::AgentTier::from_env(),
+                        // mika#2290 — same boundary for the posed hosting fact.
+                        mika_common::home::Deployment::from_env(),
                     )
                     .await
                     {

@@ -38,6 +38,8 @@ pub async fn run_team(
     // Agent tier, supplied by the caller from its own cached authority
     // (mika#1962) rather than re-read from the environment here.
     tier: mika_common::home::AgentTier,
+    // Deployment, same caller-supplied-cached-authority contract (mika#2290).
+    deployment: mika_common::home::Deployment,
 ) -> Result<TeamRun> {
     let def = team::load_team(global_home, team_name)?;
     team::validate_team(global_home, &def)?;
@@ -53,6 +55,7 @@ pub async fn run_team(
         github_app,
         pr_reviews_posted,
         tier,
+        deployment,
     )?;
     engine.execute().await
 }
@@ -77,6 +80,8 @@ pub async fn resume_team_run(
     // Agent tier, supplied by the caller from its own cached authority
     // (mika#1962) rather than re-read from the environment here.
     tier: mika_common::home::AgentTier,
+    // Deployment, same caller-supplied-cached-authority contract (mika#2290).
+    deployment: mika_common::home::Deployment,
 ) -> Result<()> {
     tracing::info!(
         team_name = team_name,
@@ -108,6 +113,7 @@ pub async fn resume_team_run(
         github_app,
         pr_reviews_posted,
         tier,
+        deployment,
     )
     .await?;
     let _run = engine.execute_from_phase(next_phase, child_results).await?;

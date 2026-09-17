@@ -187,6 +187,84 @@ impl AgentTier {
     }
 }
 
+/// Where this Mika instance physically runs (mika#2290).
+///
+/// A **posed fact**, never an inferred one. Nothing in the process can observe
+/// its own hosting: `grep -rhoE "MIKA_[A-Z0-9_]+" crates/` returns no
+/// deployment signal, and the two quasi-proxies (`customer_id`, the gateway's
+/// `telegram_single_bot_mode`) describe transport, not hosting. So the channel
+/// is the one [`AgentTier`] already uses — set by the provisioner **before** the
+/// first startup, read once, cached.
+///
+/// **Absence resolves to [`Deployment::Unknown`], which is the exact inverse of
+/// [`AgentTier::from_env`], and the divergence is deliberate.** There, an unset
+/// variable is the legitimate shape of the operator workstation and failing
+/// closed would break Vincent's own machine. Here, absence *is* the damaged
+/// population: the cloud tenant that told a campaign guest « tout tourne en
+/// local, tes données ne quittent pas ta machine » (2026-09-11) carried no
+/// variable at all, and it is that emptiness that produced the false claim.
+/// Resolving absence to `Local` would rewrite the bug as a constant.
+///
+/// The cost is real and falls on the right side: an operator workstation with no
+/// variable loses the right to *assert* that it runs locally. It does not lose
+/// the right to say so once declared (`MIKA_DEPLOYMENT=local` in `~/.mika/.env`,
+/// one line), and what it says instead — "I cannot reliably determine where I
+/// run" — is **true**. An honest silence on a local box costs one sentence; a
+/// false privacy claim on a cloud tenant costs a guest's trust.
+///
+/// **Why `Unknown` rather than `Cloud` as the floor.** The floor is not "the
+/// least flattering hypothesis" but "the least risky assertion". Telling a local
+/// user they are in the cloud is also a false claim — less dangerous, same
+/// family. `Unknown` is the only state that asserts nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Deployment {
+    /// Runs on the user's own machine (local install). May assert local hosting.
+    Local,
+    /// Runs in the cloud, in an isolated per-tenant container. Must tell the
+    /// verifiable truth instead: per-tenant isolation, the data belongs to the
+    /// user and is exportable, and the same MIT stack is self-hostable.
+    Cloud,
+    /// Hosting mode not declared in this environment. Asserts nothing.
+    Unknown,
+}
+
+impl Deployment {
+    /// Resolve the deployment from the `MIKA_DEPLOYMENT` env var.
+    ///
+    /// `local` / `cloud`, case-insensitive and trimmed. Absent or empty →
+    /// [`Deployment::Unknown`] (see the type doc for why this diverges from
+    /// [`AgentTier::from_env`]). A **non-empty unrecognized** value also
+    /// resolves to `Unknown`, with a single `warn!` naming the offending value
+    /// — same fail-closed floor as the tier, except that here the floor and the
+    /// absence happen to coincide, so no asymmetry has to be maintained.
+    ///
+    /// Read once per process at agent init and cached; setting or unsetting the
+    /// variable on a running process has no effect, exactly as for the tier
+    /// (mika#1962).
+    pub fn from_env() -> Self {
+        match std::env::var("MIKA_DEPLOYMENT") {
+            Err(_) => Self::Unknown,
+            Ok(raw) => {
+                let normalized = raw.trim().to_ascii_lowercase();
+                match normalized.as_str() {
+                    "" => Self::Unknown,
+                    "local" => Self::Local,
+                    "cloud" => Self::Cloud,
+                    _ => {
+                        warn!(
+                            value = %raw,
+                            "MIKA_DEPLOYMENT value not recognized; failing closed to \
+                             Unknown — the agent will assert nothing about where it \
+                             runs (mika#2290)"
+                        );
+                        Self::Unknown
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Resolve the Mika home directory.
 /// Priority: $MIKA_HOME > ~/.mika/
 pub fn resolve_home_dir() -> Result<PathBuf> {
@@ -1573,6 +1651,65 @@ mod tests {
         assert_eq!(AgentTier::from_env(), AgentTier::Champion);
 
         unsafe { std::env::remove_var("MIKA_AGENT_TIER") };
+    }
+
+    /// mika#2290 AC1 — `Deployment::from_env()` has three states, and the
+    /// **negative control of absence rides in the same call** (the discipline
+    /// mika#2023 AC2/AC4 imposed on this family): a test that only proved
+    /// `cloud → Cloud` would stay green under a `from_env` that resolved
+    /// absence to `Local`, which is precisely the bug.
+    #[test]
+    #[serial]
+    fn mika2290_deployment_from_env_has_three_states() {
+        // Absence → Unknown. This is the damaged population: the tenant that
+        // asserted "tout tourne en local" carried no variable at all.
+        unsafe { std::env::remove_var("MIKA_DEPLOYMENT") };
+        assert_eq!(Deployment::from_env(), Deployment::Unknown);
+
+        // Empty → Unknown (an operator who blanked the value declared nothing).
+        unsafe { std::env::set_var("MIKA_DEPLOYMENT", "") };
+        assert_eq!(Deployment::from_env(), Deployment::Unknown);
+
+        // Recognized values, case-insensitive and trimmed.
+        unsafe { std::env::set_var("MIKA_DEPLOYMENT", "cloud") };
+        assert_eq!(Deployment::from_env(), Deployment::Cloud);
+        unsafe { std::env::set_var("MIKA_DEPLOYMENT", "CLOUD ") };
+        assert_eq!(Deployment::from_env(), Deployment::Cloud);
+        unsafe { std::env::set_var("MIKA_DEPLOYMENT", "  Local  ") };
+        assert_eq!(Deployment::from_env(), Deployment::Local);
+
+        // Non-empty unrecognized → Unknown (fail-closed floor, `warn!` names it).
+        unsafe { std::env::set_var("MIKA_DEPLOYMENT", "prod") };
+        assert_eq!(
+            Deployment::from_env(),
+            Deployment::Unknown,
+            "an unrecognized value must never be read as a hosting assertion"
+        );
+
+        unsafe { std::env::remove_var("MIKA_DEPLOYMENT") };
+    }
+
+    /// mika#2290 — the divergence with `AgentTier::from_env` on **absence** is a
+    /// decision, so it is pinned rather than left to be re-derived. Both are
+    /// asserted in one test because the property is the *contrast*: reading
+    /// either assertion alone invites "make them consistent" as a cleanup.
+    #[test]
+    #[serial]
+    fn mika2290_absence_diverges_from_the_tier_on_purpose() {
+        unsafe { std::env::remove_var("MIKA_DEPLOYMENT") };
+        unsafe { std::env::remove_var("MIKA_AGENT_TIER") };
+
+        assert_eq!(
+            AgentTier::from_env(),
+            AgentTier::Default,
+            "an unset tier is the legitimate operator workstation (mika#2023 M1)"
+        );
+        assert_eq!(
+            Deployment::from_env(),
+            Deployment::Unknown,
+            "an unset deployment is the population that produced the false \
+             privacy claim — it must assert nothing (mika#2290 Décision 1)"
+        );
     }
 
     /// mika#2023 AC3 — the two axes are decoupled, and the champion sits on the

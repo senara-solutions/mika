@@ -126,6 +126,7 @@ fn dispatcher_with_llm(
     Arc::new(TaskDispatcher {
         db,
         tier: mika_common::home::AgentTier::Default,
+        deployment: mika_common::home::Deployment::Unknown,
         llm,
         tools: Arc::new(default_tools()),
         skills: Arc::new(SkillRegistry::empty()),
