@@ -64,6 +64,23 @@ pub const RETRY_BUFFER_SECS: u64 = 30;
 /// effective cap).
 pub const TRANSPORT_RETRY_MIN_REMAINING_SECS: u64 = 60;
 
+/// Retries a rail's transport loop permits beyond its first attempt.
+///
+/// Lived as three private `MAX_RETRIES` copies (`openai.rs`, `ollama.rs`,
+/// `claude.rs`) until mika#2342 needed the ceiling from a **default method on
+/// the trait**, which cannot read a constant private to one rail's module.
+/// `claude.rs` keeps its own copy for now — its loop is `0..=MAX_RETRIES`, a
+/// different shape — but the two OpenAI-shaped rails read this one.
+pub const DEFAULT_MAX_RETRIES: u32 = 3;
+
+/// Attempts a rail's retry chain permits at most: the initial call plus
+/// [`DEFAULT_MAX_RETRIES`].
+///
+/// The budget can only ever *narrow* the chain below this (see
+/// [`LlmTimeoutBudget::max_attempts`]): a generous envelope must not silently
+/// widen a provider's retry policy.
+pub const DEFAULT_ATTEMPTS_HARD_CAP: u32 = DEFAULT_MAX_RETRIES + 1;
+
 /// Default HTTP-client timeout (seconds) for non-Anthropic LLM providers.
 /// Overridable per-process via `MIKA_LLM_HTTP_TIMEOUT_SECS` (see [`http_timeout_secs`]).
 pub const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 120;
@@ -282,6 +299,29 @@ pub trait LlmProvider: Send + Sync {
     /// out of scope and leaves to its own ticket rather than bundling).
     fn timeout_budget(&self) -> LlmTimeoutBudget {
         LlmTimeoutBudget::from_env()
+    }
+
+    /// Worst-case wall-clock cost, in seconds, of a call this rail fails at
+    /// every attempt — **as the rail declares it**, not as a budget implies it
+    /// (mika#2342 D3).
+    ///
+    /// The agent loop's watchdog (`agent_loop::run_loop`) is calibrated on this
+    /// number, so it must cover what the rail's *transport* can physically take,
+    /// not what its configured budget says it should take. The two diverge: the
+    /// Anthropic rail hard-codes a `120s` reqwest timeout instead of reading the
+    /// plafond (`claude.rs`, an inconsistency mika#2189 names and leaves to its
+    /// own ticket), so a value *derived* from the budget would read 40 s when an
+    /// operator legitimately sets `MIKA_LLM_HTTP_TIMEOUT_SECS=10` — and the
+    /// watchdog would then cut healthy Anthropic calls. Asking the rail turns
+    /// that silent trap into a declared value; it does not fix the
+    /// inconsistency.
+    ///
+    /// The default is the right answer for any rail whose transport honours the
+    /// budget it was built with — the two OpenAI-shaped rails, and the mock
+    /// (which has no transport at all, so nothing can contradict it).
+    fn worst_case_failure_secs(&self) -> u64 {
+        self.timeout_budget()
+            .worst_case_failure_secs(DEFAULT_ATTEMPTS_HARD_CAP)
     }
 
     /// Whether this provider supports tool/function calling.
@@ -1165,6 +1205,155 @@ Bye."#;
         let result = serialize_response_text(&content, 50_000).unwrap();
         assert_eq!(result, "Hello  world");
         assert!(!result.contains("hidden"));
+    }
+
+    // -- mika#2342: the worst case is declared by the rail, not derived --
+
+    /// The OpenAI-shaped rail follows its budget; the Anthropic rail does not
+    /// and must say so (mika#2342 D3 / E7, verification contract item 1).
+    ///
+    /// # Population, and the one exception
+    ///
+    /// `grep -rn "impl LlmProvider for" crates/mika-common/src/` closes the
+    /// inventory at four: `OpenAiCompatibleProvider`, `OllamaProvider`,
+    /// `AnthropicProvider`, `MockLlmProvider`. The first three are here. The
+    /// fourth is excluded by the named exception in
+    /// [`mika2342_mock_is_excluded_from_the_declared_worst_case_population`] —
+    /// read it before adding a rail to either side.
+    #[test]
+    fn mika2342_each_rail_declares_a_worst_case_covering_its_transport() {
+        use super::budget::LlmTimeoutBudget;
+
+        // (1) OpenAI-compatible: honours the budget it was built with, so the
+        // trait default is the right answer and `max_attempts × plafond` is it.
+        let budget = LlmTimeoutBudget::new(60, 600).expect("valid geometry");
+        let openai = super::openai::OpenAiCompatibleProvider::new(
+            "http://localhost:1".into(),
+            None,
+            "m".into(),
+            100,
+            ProviderKind::OpenAi,
+            false,
+            budget,
+        );
+        assert_eq!(
+            openai.worst_case_failure_secs(),
+            budget.worst_case_failure_secs(DEFAULT_ATTEMPTS_HARD_CAP),
+            "an OpenAI-compatible rail's worst case is its own budget's"
+        );
+        assert!(
+            openai.worst_case_failure_secs() >= budget.http_timeout_secs(),
+            "a declared worst case below one attempt's plafond would make the \
+             agent-loop watchdog cut healthy calls"
+        );
+
+        // (2) Anthropic: hard-codes its transport timeout instead of reading
+        // the plafond (`claude.rs`, out of scope per mika#2189), so a derived
+        // value would be a lie. 120 s × 4 attempts.
+        let anthropic = super::anthropic::AnthropicProvider::dummy();
+        assert_eq!(
+            anthropic.worst_case_failure_secs(),
+            crate::claude::ANTHROPIC_HTTP_TIMEOUT_SECS
+                * u64::from(crate::claude::ANTHROPIC_MAX_ATTEMPTS),
+        );
+
+        // (3) …and the negative control of E7, without touching the process
+        // environment: at the smallest plafond an operator may legally set, a
+        // *derived* worst case is 40 s against a transport that can physically
+        // take 480. The override is what stops that being a guaranteed false
+        // positive.
+        let floor_budget =
+            LlmTimeoutBudget::new(MIN_HTTP_TIMEOUT_SECS, 600).expect("valid geometry");
+        assert!(
+            anthropic.worst_case_failure_secs()
+                > floor_budget.worst_case_failure_secs(DEFAULT_ATTEMPTS_HARD_CAP),
+            "the Anthropic rail must not follow a budget it does not honour"
+        );
+
+        // (4) Ollama: same shape as the OpenAI rail — included so the guard
+        // covers three of the four impls rather than the one that motivated it.
+        let ollama = super::ollama::OllamaProvider::new(
+            "http://localhost:1".into(),
+            None,
+            "m".into(),
+            100,
+            false,
+            budget,
+        );
+        assert_eq!(
+            ollama.worst_case_failure_secs(),
+            budget.worst_case_failure_secs(DEFAULT_ATTEMPTS_HARD_CAP),
+        );
+    }
+
+    /// `MockLlmProvider` is excluded from the population above — **named
+    /// exception, and the only one in this change** (mika#2342 FD3).
+    ///
+    /// *Reason, which is not a debt:* the mock has no transport and therefore
+    /// no cancellation mechanism of its own. "The declared worst case covers
+    /// the transport's real worst case" is a sentence with no referent for it,
+    /// so there is **no follow-up ticket** — stated explicitly, because
+    /// otherwise the next reader goes looking for a tracker that never had a
+    /// reason to exist. It is also the one rail for which mika#2342 D2's
+    /// property genuinely does not hold: the agent-loop watchdog is its
+    /// *first* cancellation mechanism, not its second.
+    ///
+    /// *Self-cleaning:* the exception asserts the property that grounds it. The
+    /// day `MockLlmProvider` gains a budget of its own, this goes red with the
+    /// instruction to retire the exception rather than quietly surviving its
+    /// reason.
+    #[test]
+    fn mika2342_mock_is_excluded_from_the_declared_worst_case_population() {
+        use super::budget::LlmTimeoutBudget;
+        use super::mock::*;
+
+        let mock = MockLlmProvider::builder()
+            .response(text_response("x"))
+            .build();
+
+        assert_eq!(
+            mock.worst_case_failure_secs(),
+            LlmTimeoutBudget::from_env().worst_case_failure_secs(DEFAULT_ATTEMPTS_HARD_CAP),
+            "MockLlmProvider now carries a transport budget of its own. Remove this \
+             exception and put it back in \
+             `mika2342_each_rail_declares_a_worst_case_covering_its_transport`'s \
+             population — and re-read mika#2342 D2, whose conditional phrasing \
+             exists for exactly this rail."
+        );
+    }
+
+    /// Every rail that owns a retry chain emits the per-attempt event
+    /// (mika#2342 AC3).
+    ///
+    /// The behavioural proof lives in
+    /// `mika-agent/tests/llm_call_attempt_2342.rs`, which stands up a real HTTP
+    /// server and counts events across a three-attempt chain — but only for the
+    /// OpenAI-compatible rail. The Anthropic rail's base URL is a hard-coded
+    /// constant and cannot be pointed at a test server without a refactor
+    /// outside this ticket's scope, so its coverage is structural: the token has
+    /// to be present at the site.
+    ///
+    /// Partial instrumentation is the specific defect this guards. An operator
+    /// reading a silence on an uninstrumented rail gets exactly the ambiguity
+    /// mika#2342 exists to remove, and nothing in a green suite would say which
+    /// rail they were on.
+    #[test]
+    fn mika2342_every_retrying_rail_emits_the_per_attempt_event() {
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // In halves: this file is under `src/` and is not itself a rail.
+        let token = concat!("llm_call", "_attempt");
+
+        for rail in ["llm/openai.rs", "llm/ollama.rs", "claude.rs"] {
+            let content = std::fs::read_to_string(src_root.join(rail))
+                .unwrap_or_else(|e| panic!("the guard must be able to read {rail}: {e}"));
+            assert!(
+                content.contains(token),
+                "{rail} no longer emits the per-attempt event. Restore it — a rail \
+                 without it makes 'one unbounded call' and 'N bounded silent calls' \
+                 indistinguishable in the log, which is hypothesis 1 of mika#2342 \
+                 left unanswerable."
+            );
+        }
     }
 
     // -- send_message_with_deadline default implementation tests --

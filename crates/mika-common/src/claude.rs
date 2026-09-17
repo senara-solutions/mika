@@ -11,6 +11,25 @@ use crate::oauth::OAuthTokenManager;
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
 const MAX_RETRIES: u32 = 3;
+
+/// Attempts this rail's chain permits at most — its loop is `0..=MAX_RETRIES`.
+///
+/// `pub(crate)` since mika#2342 so `AnthropicProvider::worst_case_failure_secs`
+/// can declare the rail's real worst case instead of re-deriving `4` beside it.
+pub(crate) const ANTHROPIC_MAX_ATTEMPTS: u32 = MAX_RETRIES + 1;
+
+/// The per-request reqwest timeout this rail is built with.
+///
+/// **This is a literal where the OpenAI-shaped rails read the configured
+/// plafond** — `ClaudeClient::new` gives it to `reqwest` directly instead of
+/// calling `llm::http_timeout_secs()`. mika#2189 named that inconsistency and
+/// left it to its own ticket; mika#2342 does not fix it either, but it stops it
+/// being *silent*: the number is now a named constant that
+/// `AnthropicProvider::worst_case_failure_secs` reports, so the agent-loop
+/// watchdog is sized on what this transport can physically take rather than on
+/// a budget this rail does not honour.
+pub(crate) const ANTHROPIC_HTTP_TIMEOUT_SECS: u64 = 120;
+
 const OAUTH_TOKEN_PREFIX: &str = "sk-ant-oat";
 
 // Claude Code identity headers required for OAuth/subscription token auth.
@@ -379,7 +398,7 @@ impl ClaudeClient {
         };
 
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_secs(ANTHROPIC_HTTP_TIMEOUT_SECS))
             .build()
             .expect("failed to build HTTP client");
 
@@ -405,8 +424,12 @@ impl ClaudeClient {
     }
 
     /// Send a message to Claude with retry on transient errors (429, 500, 529).
+    ///
+    /// Passes `None` for `request_bytes`: this entry point receives an
+    /// already-converted `MessagesRequest` and has no way to measure the brief
+    /// the way the other rails do (see [`Self::send_message_with_deadline`]).
     pub async fn send_message(&self, request: &MessagesRequest) -> Result<MessagesResponse> {
-        self.send_message_with_deadline(request, None).await
+        self.send_message_with_deadline(request, None, None).await
     }
 
     /// Send a message with deadline-aware retry abort.
@@ -414,10 +437,19 @@ impl ClaudeClient {
     /// When `deadline` is `Some` and the remaining time is insufficient for
     /// another LLM call attempt, the retry chain aborts early instead of
     /// starting a doomed retry.
+    ///
+    /// `request_bytes` is the caller's `LlmRequest::payload_bytes()`
+    /// (mika#2342 D4/AC3). It is threaded in rather than computed here so the
+    /// three rails report **the same measure**: this method only ever sees the
+    /// Anthropic-shaped request, and re-deriving a size from it would be a
+    /// second measurement free to disagree with the first. `None` means "not
+    /// measured", which the per-attempt event says out loud instead of
+    /// reporting a zero indistinguishable from an empty request.
     pub async fn send_message_with_deadline(
         &self,
         request: &MessagesRequest,
         deadline: Option<Instant>,
+        request_bytes: Option<u64>,
     ) -> Result<MessagesResponse> {
         let span = info_span!(
             target: "mika::otel",
@@ -447,7 +479,7 @@ impl ClaudeClient {
         }
 
         let response = self
-            .send_message_inner(request, deadline)
+            .send_message_inner(request, deadline, request_bytes)
             .instrument(span.clone())
             .await?;
 
@@ -505,10 +537,14 @@ impl ClaudeClient {
         &self,
         request: &MessagesRequest,
         deadline: Option<Instant>,
+        request_bytes: Option<u64>,
     ) -> Result<MessagesResponse> {
         info!(
             model = %request.model,
             max_tokens = request.max_tokens,
+            max_attempts = ANTHROPIC_MAX_ATTEMPTS,
+            request_bytes = request_bytes.unwrap_or(0),
+            request_bytes_measured = request_bytes.is_some(),
             "llm_call started"
         );
 
@@ -568,6 +604,21 @@ impl ClaudeClient {
                 );
                 tokio::time::sleep(delay).await;
             }
+
+            // mika#2342 D4 — the per-attempt discriminator; see the twin
+            // comment in `llm/openai.rs`. `request_bytes_measured` is carried
+            // because this rail is the one that can legitimately not know the
+            // size, and a bare `0` would read as an empty brief.
+            info!(
+                target: "mika::otel",
+                attempt,
+                max_attempts = ANTHROPIC_MAX_ATTEMPTS,
+                request_bytes = request_bytes.unwrap_or(0),
+                request_bytes_measured = request_bytes.is_some(),
+                provider = "anthropic",
+                model = %request.model,
+                "llm_call_attempt"
+            );
 
             match self.send_once(request, auth_header.clone()).await {
                 Ok(response) => {

@@ -162,12 +162,13 @@ struct OllamaErrorResponse {
 
 // -- Provider implementation --
 
-/// Hard ceiling on retries, independent of the budget. See the sibling
-/// constant in `openai.rs` for why the budget may only narrow this.
-const MAX_RETRIES: u32 = 3;
-
-/// Attempts the chain permits at most: the initial call plus [`MAX_RETRIES`].
-const MAX_ATTEMPTS_HARD_CAP: u32 = MAX_RETRIES + 1;
+/// Attempts this rail's chain permits at most.
+///
+/// Read from [`super::DEFAULT_ATTEMPTS_HARD_CAP`] since mika#2342 rather than
+/// re-derived here — the watchdog in `agent_loop::run_loop` is sized on the
+/// same ceiling through `LlmProvider::worst_case_failure_secs`, and a rail
+/// running under a ceiling of its own would be a rail the watchdog mis-sizes.
+use super::DEFAULT_ATTEMPTS_HARD_CAP as MAX_ATTEMPTS_HARD_CAP;
 
 /// Native Ollama provider that uses `/api/chat` (Ollama's native endpoint).
 ///
@@ -520,12 +521,10 @@ impl OllamaProvider {
     ) -> Result<LlmResponse, LlmError> {
         let ollama_request = self.to_ollama_request(request);
 
-        info!(
-            model = %request.model,
-            max_tokens = request.max_tokens,
-            provider = "ollama",
-            "llm_call started"
-        );
+        // mika#2342 D4 — see the twin comment in `openai.rs`. Instrumenting one
+        // rail only would leave the same blindness on the others, which is the
+        // partial-coverage defect this house has already had to refuse once.
+        let request_bytes = request.payload_bytes() as u64;
 
         let mut last_error = None;
 
@@ -539,6 +538,15 @@ impl OllamaProvider {
         };
         let retry_threshold_secs =
             self.budget.typical_call_duration_secs() + self.budget.retry_buffer_secs();
+
+        info!(
+            model = %request.model,
+            max_tokens = request.max_tokens,
+            max_attempts,
+            request_bytes,
+            provider = "ollama",
+            "llm_call started"
+        );
 
         for attempt in 0..max_attempts {
             if attempt > 0 {
@@ -563,6 +571,17 @@ impl OllamaProvider {
                 );
                 tokio::time::sleep(delay).await;
             }
+
+            // mika#2342 D4 — the per-attempt discriminator; see `openai.rs`.
+            info!(
+                target: "mika::otel",
+                attempt,
+                max_attempts,
+                request_bytes,
+                provider = "ollama",
+                model = %request.model,
+                "llm_call_attempt"
+            );
 
             match self.send_once(&ollama_request).await {
                 Ok(response) => {

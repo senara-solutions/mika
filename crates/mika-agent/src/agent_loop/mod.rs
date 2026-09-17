@@ -72,6 +72,20 @@ pub const EMPTY_RESPONSE_FALLBACK: &str = "Done.";
 /// Fallback message used when a failed callback task has no error details in its result.
 pub const FAILED_TASK_FALLBACK: &str = "Task failed with no error details.";
 
+/// Slack added to a rail's declared worst case before the `run_loop` watchdog
+/// cuts an LLM call (mika#2342 D3).
+///
+/// The watchdog is `LlmProvider::worst_case_failure_secs() + this`. The margin
+/// is not a guess at variance: it covers the retry chain's own backoff sleeps
+/// (`500 ms × 2^(n-1)`, at most ~3.5 s over four attempts), which
+/// `worst_case_failure_secs` deliberately does not include, and then leaves an
+/// order of magnitude on top.
+///
+/// Sixty seconds of delay in noticing a **27-minute** block cost nothing; a
+/// false positive costs a whole turn. The asymmetry is the whole sizing
+/// argument, and it points one way.
+const LLM_WATCHDOG_MARGIN_SECS: u64 = 60;
+
 /// Delegation-layer classification at the agent→team-engine boundary (mika#1671 D1).
 ///
 /// Produced by `run_team_agent`'s post-loop classifier and consumed by the team
@@ -1098,12 +1112,102 @@ async fn run_loop(
         // closes is on the error path — a call that times out returns no usage
         // and, until v53, left `input_tokens = 0` as its only record of how big
         // the brief was. Taken here, the number survives the timeout.
-        let request_bytes = Some(request.payload_bytes() as i64);
+        //
+        // mika#2342 keeps the raw value alongside the `Option` the persistence
+        // path wants: the watchdog reports it too, and a hang is exactly the
+        // case where this measurement is the only one left.
+        let request_bytes_measured = request.payload_bytes() as i64;
+        let request_bytes = Some(request_bytes_measured);
 
+        // mika#2342 D1/V3 — the safety net, modelled on the one
+        // `attempt_continuation_turn` has had all along (see `mod.rs:541`).
+        //
+        // Until this, the provider's own `reqwest` timeout was the SOLE
+        // cancellation mechanism for this call: the envelope is tested at the
+        // top of the iteration, which an unreturning future never reaches. So
+        // when that single mechanism failed — for a reason still unnamed, see
+        // the ticket — nothing in the process could bound the call, and it left
+        // no trace at all: no `llm_call completed`, no `turn_usage`, no error.
+        // 27 minutes, twice.
+        //
+        // The bound is the rail's own declared worst case, NOT the remaining
+        // deadline. Cutting on `remaining` would re-open mika#848: a call
+        // dropped in flight loses its result *and* its `llm_calls` row, even
+        // when it was about to succeed. Sized on the worst case, the net can
+        // only fire once the rail's own mechanism has already failed, i.e. on a
+        // call that is already lost — so cutting it costs nothing and its
+        // firing is first-order information (D2).
+        //
+        // That last property is conditional and says so: it holds *because* the
+        // three production rails bound their own calls, not because the
+        // `LlmProvider` trait requires it. On a rail with no transport timeout,
+        // this is the first mechanism rather than the second — still correct,
+        // no longer "only ever cuts the already-lost".
+        let watchdog =
+            Duration::from_secs(llm.worst_case_failure_secs() + LLM_WATCHDOG_MARGIN_SECS);
         let llm_call_start = std::time::Instant::now();
-        let llm_result = llm
-            .send_message_with_deadline(request, Some(deadline.into()))
-            .await;
+        let llm_result = match tokio::time::timeout(
+            watchdog,
+            llm.send_message_with_deadline(request, Some(deadline.into())),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                let budget = llm.timeout_budget();
+                let watchdog_secs = watchdog.as_secs();
+                let elapsed_secs = llm_call_start.elapsed().as_secs();
+                // Dedicated event name, SOLE WRITER (D6). Its **absence** is
+                // the information in nominal operation: it says reqwest really
+                // is bounding these calls. Folding it into an ordinary
+                // transport error would lose exactly the signal this code
+                // exists to produce.
+                warn!(
+                    target: "mika::otel",
+                    trace_id = %tool_ctx.trace_id,
+                    step,
+                    watchdog_secs,
+                    elapsed_secs,
+                    http_timeout_secs = budget.http_timeout_secs(),
+                    agent_total_timeout_secs = budget.agent_total_timeout_secs(),
+                    request_bytes = request_bytes_measured,
+                    provider = llm.provider_name(),
+                    model = llm.model_name(),
+                    mode = mode.label(),
+                    "llm_call_watchdog_fired"
+                );
+                if let Err(e) = db
+                    .log_audit_event(
+                        session_id,
+                        "llm_call_watchdog",
+                        &format!("agent:{}", db.agent_id()),
+                        None,
+                        None,
+                        Some(&format!(
+                            "watchdog_secs:{watchdog_secs} elapsed_secs:{elapsed_secs} step:{step} \
+                             provider:{} model:{} request_bytes:{}",
+                            llm.provider_name(),
+                            llm.model_name(),
+                            request_bytes_measured,
+                        )),
+                        Some(tool_ctx.trace_id),
+                    )
+                    .await
+                {
+                    warn!(error = %e, "failed to write llm_call_watchdog audit event");
+                }
+                // `Transport` so mika#2179's classifier reads `transport_timeout`
+                // and mika#1744's transport retry threshold treats it as the cut
+                // it is. The message names the net rather than mimicking a
+                // reqwest error: an operator who reads `failed to read response
+                // body` must be able to keep believing reqwest said it.
+                Err(mika_common::llm::LlmError::Transport(format!(
+                    "mika#2342 watchdog: LLM call exceeded the rail's declared worst case \
+                     ({watchdog_secs}s) without returning — the provider's own request timeout \
+                     did not fire"
+                )))
+            }
+        };
         let llm_call_latency_ms = llm_call_start.elapsed().as_millis() as u64;
 
         // Record the LLM call in the database (success or error)
@@ -7654,6 +7758,154 @@ mod tests {
     use crate::test_utils::test_helpers::test_async_db;
     use mika_common::claude::ToolDefinition;
     use std::path::PathBuf;
+
+    // ===========================================================================
+    // mika#2342 — every LLM call of this module carries a safety net
+    // ===========================================================================
+
+    /// How many lines above a call the wrapping `timeout(` may sit.
+    ///
+    /// Three covers both real shapes — the continuation's two-line form and the
+    /// watchdog's `match` form — plus the single-line form (window includes the
+    /// call's own line). Deliberately *not* wider: a `timeout` five lines above
+    /// is more likely to belong to something else, and a gate that accepts an
+    /// unrelated wrapper is a gate that passes the regression it exists to
+    /// catch.
+    const WATCHDOG_GUARD_LOOKBACK_LINES: usize = 3;
+
+    /// The detector behind [`mika2342_every_llm_call_is_wrapped_in_a_timeout`],
+    /// split out so the guard can be exercised on a fabricated string rather
+    /// than by breaking the real source (verification contract item 7).
+    ///
+    /// Lexical, and says so: it looks for the call token and then for a
+    /// `tokio::time::timeout(` within the preceding
+    /// [`WATCHDOG_GUARD_LOOKBACK_LINES`]. It cannot parse Rust, so a
+    /// sufficiently creative formatting could fool it in either direction. That
+    /// is acceptable for what it defends — not a subtle behaviour, but the
+    /// *disappearance* of a wrapper, which is what a hurried refactor does.
+    fn unwrapped_deadline_call_sites(src: &str) -> Vec<String> {
+        // Both tokens in halves: this function's own body is inside the file
+        // the guard scans, so writing either one whole would make the gate its
+        // own first offender (the `policy.rs:no_bare_agent_timeout_constant_remains`
+        // motif).
+        let call_token = concat!("send_message_", "with_deadline");
+        let wrap_token = concat!("tokio::time::", "timeout(");
+
+        let lines: Vec<&str> = src.lines().collect();
+        let mut offenders = Vec::new();
+
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            // Comments are how this ticket explains itself; scanning them would
+            // make the explanation the violation.
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            // The call token appears in a *definition* too (`fn
+            // send_message_with_deadline`), which is not a call site.
+            if !line.contains(call_token) || trimmed.starts_with("async fn") {
+                continue;
+            }
+            let from = i.saturating_sub(WATCHDOG_GUARD_LOOKBACK_LINES);
+            let wrapped = lines[from..=i].iter().any(|l| l.contains(wrap_token));
+            if !wrapped {
+                offenders.push(format!("{}: {}", i + 1, trimmed));
+            }
+        }
+
+        offenders
+    }
+
+    /// Every `send_message_with_deadline` in this module must be the argument
+    /// of a `tokio::time::timeout` (mika#2342 D5).
+    ///
+    /// # Why a source scan and not a behavioural test
+    ///
+    /// Removing the net breaks **no assertion**. The loop keeps working, every
+    /// existing test stays green, and the only change is that the call goes
+    /// unbounded and silent again — which is the entire defect of mika#2342: a
+    /// 27-minute call with no `llm_call completed`, no `turn_usage` and no
+    /// error. A regression that makes nothing false, only something invisible,
+    /// is the class this house guards by scanning source
+    /// (`policy::no_bare_agent_timeout_constant_remains`,
+    /// `scripts/check-loop-select.sh`,
+    /// `grooming_marker::no_grooming_regex_outside_this_module`).
+    ///
+    /// # Scope, and what a third site means
+    ///
+    /// This file only. `investigate.rs` wraps its own call and a future caller
+    /// outside `agent_loop/` is not covered — widening the perimeter would be a
+    /// new decision, not a silent extension.
+    ///
+    /// The inventory is closed at **two** sites: the continuation turn and the
+    /// main `run_loop` call. Per the plan's Fire-Disposition FD1 there is **no
+    /// allowlist** — an allowlist born empty is just a place to put the next
+    /// violation instead of wrapping it. A third site means either the
+    /// inventory was wrong or a call was added: **halt and surface**, do not
+    /// adjust the guard.
+    #[test]
+    fn mika2342_every_llm_call_is_wrapped_in_a_timeout() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/agent_loop/mod.rs"),
+        )
+        .expect("the guard must be able to read its own module");
+
+        // The scan stops at this module's own `#[cfg(test)]` block: the test
+        // code below writes both tokens on purpose.
+        let production = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map_or(src.as_str(), |(before, _)| before);
+
+        let offenders = unwrapped_deadline_call_sites(production);
+        assert!(
+            offenders.is_empty(),
+            "mika#2342: {} LLM call site(s) in `agent_loop/mod.rs` are no longer wrapped in a \
+             `tokio::time::timeout`.\n{}\n\n\
+             WHY THIS MATTERS: the agent envelope is checked at the TOP of each loop iteration, \
+             so it can never interrupt a call that does not return. Without this wrapper the \
+             provider's own reqwest timeout is the SOLE cancellation mechanism, and when it \
+             failed (mika#2342, n=2) the call ran 27+ minutes leaving no completion, no \
+             turn_usage and no error — the task stayed `in_progress` for ever.\n\
+             FIX: wrap the call as `run_loop` does, sized on \
+             `llm.worst_case_failure_secs() + LLM_WATCHDOG_MARGIN_SECS` — never on the remaining \
+             deadline, which would re-open mika#848.",
+            offenders.len(),
+            offenders.join("\n")
+        );
+    }
+
+    /// The guard's positive control: it must actually fire on a bare call.
+    ///
+    /// Written against a fabricated snippet rather than by editing the real
+    /// source — a guard verified only by its own green is a guard verified by
+    /// nothing.
+    #[test]
+    fn mika2342_guard_fires_on_an_unwrapped_call() {
+        let bare = "        let llm_result = llm\n\
+                    \x20           .send_message_with_deadline(request, Some(deadline.into()))\n\
+                    \x20           .await;\n";
+        assert_eq!(
+            unwrapped_deadline_call_sites(bare).len(),
+            1,
+            "the guard must flag an unwrapped call — it is the exact shape mika#2342 removed"
+        );
+
+        let wrapped = "        let llm_result = match tokio::time::timeout(\n\
+                       \x20           watchdog,\n\
+                       \x20           llm.send_message_with_deadline(request, Some(deadline.into())),\n\
+                       \x20       )\n";
+        assert!(
+            unwrapped_deadline_call_sites(wrapped).is_empty(),
+            "the guard must accept the wrapped shape, or it would forbid the fix"
+        );
+
+        let commented =
+            "        // llm.send_message_with_deadline(request, None) is wrapped below\n";
+        assert!(
+            unwrapped_deadline_call_sites(commented).is_empty(),
+            "prose naming the call must not be a violation, or the guard forbids documenting itself"
+        );
+    }
 
     // ===========================================================================
     // mika#2338 — unattested disposition escalates with its cause
