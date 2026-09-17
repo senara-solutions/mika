@@ -283,6 +283,22 @@ pub struct AskArgs {
     #[arg(long, conflicts_with = "team")]
     pub disable_skill: Vec<String>,
 
+    /// Restrict this invocation to the named skill(s) — everything else is
+    /// transiently evicted (repeatable, not persisted). Unlike --enable-skill,
+    /// this one reaches the execution surface: it travels to mika-spirit in
+    /// `message/send` request metadata (mika#2363).
+    ///
+    /// Strictly subtractive — it can never activate a skill the turn would
+    /// otherwise have left inactive. Naming a skill this agent does not carry
+    /// keeps nothing, so a typo yields a turn with no skills rather than a
+    /// silently unrestricted one.
+    ///
+    /// Mutually exclusive with --enable-skill / --disable-skill: three selection
+    /// semantics on one turn is a composition nobody wants to debug.
+    /// Example: --only-skill mika-arch-groom-ticket
+    #[arg(long, conflicts_with_all = ["team", "enable_skill", "disable_skill"])]
+    pub only_skill: Vec<String>,
+
     /// Emit metadata trailer after response (e.g., session_id).
     /// Useful for cross-command integration where downstream consumers need session context.
     #[arg(long, conflicts_with = "team")]

@@ -6221,8 +6221,13 @@ fn escalate_line_of_family(disposition_line: &str) -> Option<String> {
 ///
 /// - **The family follows the withdrawn line, not the order of a list.** The three arch skills
 ///   are `always_on`, so `collect_required_suffix_lines` yields the union of all five lines on
-///   every mika-arch turn; a fixed "`Disposition: ESCALATE` first" would make
-///   `Verdict: ESCALATE` unreachable in production.
+///   any mika-arch turn that did not declare its pass; a fixed
+///   "`Disposition: ESCALATE` first" would make `Verdict: ESCALATE` unreachable in production.
+///   Since mika#2363 a turn that DOES declare its pass (`--only-skill`, which `_arch_ask` now
+///   always passes) carries only that pass's lines — the union is the unrestricted case, not
+///   the only one. The family-of-the-withdrawn-line rule is what makes both work: each arch
+///   skill declares the ESCALATE of its own family, so the target stays declared under
+///   restriction. Pinned by `mika2363_escalation_still_has_a_declared_target_under_restriction`.
 /// - **Every occurrence is rewritten, inline mentions included.** `dispatch-lib`'s tier 1a and
 ///   `_parse_verdict`'s tier 1 run `grep -oE … | head -1` over the whole text, unanchored, and
 ///   the withheld marker that short-circuited them at tier 0 is not written on this path. A
@@ -10155,6 +10160,124 @@ mod tests {
         assert_eq!(required.len(), 1);
         assert!(required.contains("run_tests"));
         assert!(!required.contains("run_claude_pilot"));
+    }
+
+    // -- mika#2363: what the per-turn skill restriction does to the output
+    //    contract (V4 / B2) --
+
+    /// The three mika-arch skills as the registry carries them: all `always_on`,
+    /// each declaring its own pass's suffix lines.
+    fn arch_skill(name: &str, suffix_lines: &[&str]) -> SkillEntry {
+        let mut entry = make_skill_entry(name, 30, &[]);
+        entry.manifest.skill.always_on = true;
+        entry.manifest.output.required_suffix_lines =
+            suffix_lines.iter().map(|s| s.to_string()).collect();
+        entry
+    }
+
+    fn groom_ticket_skill() -> SkillEntry {
+        arch_skill(
+            "mika-arch-groom-ticket",
+            &[
+                "Disposition: READY",
+                "Disposition: ITERATE",
+                "Disposition: ESCALATE",
+            ],
+        )
+    }
+
+    fn second_review_skill() -> SkillEntry {
+        arch_skill(
+            "mika-arch-second-review",
+            &["Verdict: GROOMED", "Verdict: ESCALATE"],
+        )
+    }
+
+    #[test]
+    fn mika2363_unrestricted_arch_turn_accepts_both_verdict_families() {
+        // The pre-mika#2363 state, asserted so the narrowing below is a measured
+        // change and not a coincidence. A first-pass turn could satisfy the
+        // suffix-line guard by emitting `Verdict: GROOMED` — a contract
+        // `_parse_disposition` does not read, which surfaces as UNPARSED.
+        let a = groom_ticket_skill();
+        let b = second_review_skill();
+        let matched = vec![
+            MatchedSkill {
+                entry: &a,
+                reason: MatchReason::AlwaysOn,
+            },
+            MatchedSkill {
+                entry: &b,
+                reason: MatchReason::AlwaysOn,
+            },
+        ];
+
+        let accepted = collect_required_suffix_lines(&matched);
+        assert_eq!(accepted.len(), 5);
+        assert!(accepted.contains(&"Verdict: GROOMED".to_string()));
+        assert!(accepted.contains(&"Disposition: READY".to_string()));
+    }
+
+    #[test]
+    fn mika2363_a_restricted_turn_accepts_only_its_own_pass_contract() {
+        // After the restriction the matched set is the single declared pass —
+        // `skills::tests::mika2363_only_skills_narrows_the_matched_set_to_one`
+        // asserts that half. This is the consequence on the output contract: the
+        // accept-set is the running pass's, and the sister family is gone.
+        //
+        // B2 calls this a **tightening**, and it is the one behaviour change to
+        // watch post-deploy: a model that used to satisfy the guard with the
+        // wrong family now costs one corrective re-prompt instead of passing.
+        let a = groom_ticket_skill();
+        let matched = vec![MatchedSkill {
+            entry: &a,
+            reason: MatchReason::AlwaysOn,
+        }];
+
+        let accepted = collect_required_suffix_lines(&matched);
+        assert_eq!(
+            accepted,
+            vec![
+                "Disposition: READY".to_string(),
+                "Disposition: ITERATE".to_string(),
+                "Disposition: ESCALATE".to_string(),
+            ]
+        );
+        assert!(
+            !accepted.iter().any(|l| l.starts_with("Verdict:")),
+            "the second-pass contract must not be accepted on a first-pass turn"
+        );
+    }
+
+    #[test]
+    fn mika2363_escalation_still_has_a_declared_target_under_restriction() {
+        // `escalate_unattested_disposition` withdraws a non-terminal disposition
+        // into the ESCALATE *of its own family*, and refuses when that line is
+        // not declared. Narrowing the accept-set could have removed the target
+        // and silently disarmed the mika#2037 fail-visible path, so both
+        // restricted shapes are checked here rather than assumed.
+        for (entry, withdrawn, expected) in [
+            (
+                groom_ticket_skill(),
+                "Disposition: READY",
+                "Disposition: ESCALATE",
+            ),
+            (
+                second_review_skill(),
+                "Verdict: GROOMED",
+                "Verdict: ESCALATE",
+            ),
+        ] {
+            let matched = vec![MatchedSkill {
+                entry: &entry,
+                reason: MatchReason::AlwaysOn,
+            }];
+            let accepted = collect_required_suffix_lines(&matched);
+            assert!(
+                accepted.contains(&expected.to_string()),
+                "{withdrawn} must still have a declared ESCALATE target after restriction"
+            );
+        }
     }
 
     // -- collect_required_tools pre-fetch augmentation tests (#863) --

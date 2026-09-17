@@ -993,6 +993,82 @@ A read failure now returns the **same fail-closed sentinel as the malformed path
 
 **Skill enabled state:** DB-backed via `skill_overrides.enabled` column (schema v24, #629). Tri-state: `NULL` = default (enabled), `0` = disabled, `1` = explicitly enabled. `apply_overrides()` evicts disabled skills from `SkillRegistry.entries` into `disabled: Vec<DisabledSkill>` before applying `always_on`/LLM overrides. `enabled=false` always wins over `always_on=true` and over identity allowlist (DB override at Phase 0 runs after identity allowlist at Phase -1). `toggle_skill` agent tool and CLI `mika skills enable/disable` write to DB. Legacy `.disabled` marker files are migrated to DB rows on startup via `migrate_disabled_markers()` (one-shot, idempotent, fail-open). No match-time filter — disabled skills are evicted before matching (#630).
 
+**Per-turn skill restriction over A2A (mika#2363).** `message/send` and
+`message/stream` read an optional request-metadata key,
+`mika.only_skills` (`mika_a2a::params::ONLY_SKILLS_KEY`), holding an array of
+skill names. When present and non-empty, `run_a2a_agent` restricts **this turn's**
+registry to those names via `SkillRegistry::apply_only_skills`. `mika ask
+--only-skill <name>` (repeatable) writes it; `_arch_ask` in `dispatch-lib.sh`
+passes the pass it is running.
+
+**The measurement.** mika-arch declares three `always_on` skills —
+`mika-arch-groom-ticket` (16 269 B), `mika-arch-second-review` (14 290 B),
+`mika-arch-groom-milestone` (9 239 B) — and a turn runs exactly **one** pass. So
+**23 529 B, 59 % of the skill portion of every architect system prompt, described
+two tasks the turn was not doing**. Declaring the pass removes 23.5–30.6 KB
+depending on which one it is. That saving is unconditional and costs no
+correctness: nothing is summarised, truncated or elided — the reviewed plan, the
+history window (mika#2295/#2330) and the user message are untouched.
+
+**Strictly subtractive, and that is the whole safety argument.**
+`apply_only_skills` computes the complement of the named set and delegates to
+`apply_transient_disable`; it **never** calls `apply_transient_always_on`. A
+skill named here that would not otherwise have been active is not resurrected, so
+the field can only ever narrow a turn. That matters because `/a2a/{agent}` is
+reachable by any authenticated caller: the additive half of the channel would let
+one force a skill into an agent's prompt, and it buys nothing here — the skill
+`_arch_ask` needs is already `always_on`. The additive half of mika#1727's missing
+config channel therefore stays deferred, with that reason.
+
+**Per-turn, never on the cache (R4).** The restriction is `&mut`, and the registry
+lives behind an `Arc` on `AgentState` that concurrent turns share. `run_a2a_agent`
+clones it, restricts the clone, and never writes it back — an empty request does
+not even clone. Removing that clone would break no assertion: the declaring turn
+would still be correct and the *next* turn would silently inherit its restriction.
+Hence a lexical guard,
+`server::a2a::tests::mika2363_the_restriction_is_applied_to_a_clone_and_never_written_back`.
+
+**Fail-soft on the wire.** Key absent, `null`, not an array, an empty array — all
+mean "no restriction", so a caller that declares nothing gets the pre-mika#2363
+turn byte for byte. Non-string entries inside a valid array are dropped
+individually rather than discarding the declaration, which would silently restore
+the triple injection. A name the registry does not carry keeps nothing: the turn
+ends with zero skills, which is loud (`active_skill_count = 0` on
+`system_prompt_assembled`, no output-contract guard armed) and deliberately not
+softened into a no-op.
+
+**What it tightens, and how to disarm it.** `collect_required_suffix_lines` unions
+the lines of every `AlwaysOn`-matched skill, so an *unrestricted* architect turn
+accepted five lines — a first pass could satisfy the suffix-line guard with
+`Verdict: GROOMED`, a contract `_parse_disposition` does not read and reports as
+`UNPARSED`. A declaring turn accepts only its own pass's lines. This is a
+tightening: a model that leaned on the tolerance now costs one corrective
+re-prompt instead of passing. Watch `UNPARSED` counts after deploy; to disarm,
+delete `--only-skill "$skill"` from `_arch_ask` — shell only, no binary redeploy.
+`escalate_unattested_disposition` (mika#2037) is unaffected: it escalates within
+the withdrawn line's own family, and each arch skill declares its own family's
+`ESCALATE` (pinned by
+`agent_loop::tests::mika2363_escalation_still_has_a_declared_target_under_restriction`).
+
+**The trap, pinned.** Do **not** flip the three arch `always_on` flags to `false`
+now that the pass is declared. The channel cannot activate anything, and keyword
+routing cannot stand in — `mika-arch-groom-ticket` triggers on `plan review` and
+`mika-arch-second-review` on `second pass`, both of which occur in the body of a
+plan, so the content under review would select the skill that reviews it (T2b).
+With the flags off, an architect turn carries no prompt at all: no
+`required_suffix_lines`, no `required_finding_list_prefixes`, no review-anchor
+contract — and nothing fails loudly, `_parse_disposition` just returns `UNPARSED`
+on every groom. `tests/only_skills_arch_pass_2363.rs` refuses the flip with that
+reasoning in its failure message.
+
+**Observability, no new instrumentation.** `a2a_only_skills_applied` (INFO, fields
+`agent`, `task_id`, `requested`, `kept`, `evicted_count`, `unknown_count`) and
+`only_skills_unknown_name` (WARN). The reduction itself is attested by the two
+surfaces that already existed: `system_prompt_assembled.active_skill_count` /
+`.per_skill_bytes` (mika#1217) and `turn_usage.system_prompt_bytes` (mika#1889).
+**Both must move together** — one moving alone means the measurement is wrong, not
+the system.
+
 **Transient enable/disable overrides (#682):** Two methods handle per-invocation skill overrides, called after `apply_overrides()` (disable first, enable second — matches Phase 0/1 pattern): (1) `SkillRegistry::apply_transient_disable(skill_names)` evicts named skills from the registry entirely for a single CLI invocation. Returns `TransientDisableResult` with `not_found` list. Used by `mika ask --disable-skill <name>` (repeatable). (2) `SkillRegistry::apply_transient_always_on(skill_names)` sets `always_on = true` on named skills. Returns `TransientOverrideResult` with separate `disabled` and `not_found` lists. Cannot resurrect disabled (evicted) or skipped skills. Used by `mika ask --enable-skill <name>` (repeatable). Neither is persisted. Conflict check: same skill name in both flags produces a hard error before any registry ops.
 
 **Oversized prompt handling (#630):** Skills with prompts exceeding their size limit are hard-skipped at scan time (pushed to `ScanResult.skipped`) regardless of `always_on` status. This prevents zombie skills with tools but no prompt context. Tool-only skills (no `system_prompt.md`) are unaffected — they load with an empty prompt via `SnippetLoadResult::Empty`.

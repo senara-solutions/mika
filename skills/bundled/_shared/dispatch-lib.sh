@@ -4513,7 +4513,29 @@ _arch_ask() {
     [ -n "$skill" ] && [ -n "$plan_path" ] || { echo "_arch_ask: missing skill or plan_path" >&2; return 2; }
     [ -r "$plan_path" ] || { echo "_arch_ask: plan_path not readable: $plan_path" >&2; return 2; }
 
-    local args=( ask --agent mika-arch --format json --verbose --enable-skill "$skill" )
+    # mika#2363: declare the pass this turn executes, and ONLY it.
+    #
+    # `--enable-skill` used to sit here. It was measured to be abandoned in
+    # transit since mika#1727 — `mika ask` is a thin A2A client and the flag
+    # configures a local registry that is no longer the execution surface, which
+    # `crates/mika-cli/src/commands/ask.rs` says in as many words. So mika-arch's
+    # three `always_on` skills were ALL injected on every architect turn: 39 798
+    # bytes of prompt, of which ~23.5 KB described two passes this call is not
+    # making.
+    #
+    # `--only-skill` is the half of that missing channel that reaches spirit. It
+    # is strictly subtractive — it evicts the sister passes, it cannot activate
+    # anything — and the two flags are mutually exclusive by clap, so this is a
+    # replacement and not an addition. Nothing is lost by dropping
+    # `--enable-skill`: it already did nothing on this path.
+    #
+    # Only `$skill` is named. The vocabulary of the three architect skills lives
+    # in MIKA_ARCH_SKILL_ALLOWLIST (`well_known_agents.rs`) and must not be
+    # rewritten in shell, where it would silently drift.
+    #
+    # Disarming, if B2's tighter suffix-line contract ever bites: delete the two
+    # `--only-skill` words below. No binary redeploy, no restart.
+    local args=( ask --agent mika-arch --format json --verbose --only-skill "$skill" )
     [ -n "$session_id" ] && args+=( --session-id "$session_id" )
     args+=( - )
 
