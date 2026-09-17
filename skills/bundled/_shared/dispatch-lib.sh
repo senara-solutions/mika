@@ -5709,6 +5709,249 @@ _rescue_diff_carries_work() {
     return 1
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# _measure_pipeline_verified — give `rescue-pipeline-verified` a producer.
+#
+# mika#2354. Two gates read `<!-- rescue-pipeline-verified: yes -->` — qa-review
+# Step 1.5 (marker `no` + draft ⇒ `hold[review]`, review over before Step 2) and
+# `wip_rescue` (since mika#2286 a DECISION-CORE draft is un-drafted only on the
+# literal `yes`, otherwise parked). And `grep -rn "rescue-pipeline-verified: yes"`
+# over `skills/`, `scripts/` and `crates/mika-agent/src/` returns ONLY readers:
+# no site in this repo has ever written `yes`. The single path to that value was
+# a human hand editing the PR body — so the drain could not be autonomous, not
+# because it broke, but because the marker that unblocks it had no producer.
+#
+# `_compose_rescue_pr_body` wrote the literal `no` unconditionally, thirty lines
+# below, while its sibling `rescue-diff` marker is a MEASURED fact
+# (`_rescue_diff_carries_work`). The producer/consumer split existed for one of
+# the two markers; this is the other one's missing half.
+#
+# WHAT `yes` MEANS, and it is deliberately narrow: "the local pipeline is
+# complete, the review may begin". NOT "this work is good" — that is the review
+# that follows. mika#2286 fixed the sense of the marker as a FRESH verification,
+# and its lesson is why the terms below are EXECUTIONS rather than an inspection
+# of shape: a `yes` posed on the mere presence of artefacts would reopen that
+# ticket under another name.
+#
+# Conjunction, cheapest term first, short-circuited on the first failure:
+#   1. diff             — the captured diff carries work (reuses the mika#2157
+#                         predicate; an incident-only diff can satisfy no AC and
+#                         has nothing to verify)
+#   2. worktree-dirty   — nothing left outside the commit the PR will publish,
+#                         under the rescue's own scaffold exclusions
+#   3. fmt              — `cargo fmt --all --check`
+#   4. clippy           — `cargo clippy --workspace --all-targets -- -D warnings`
+#   5. verify-pipeline  — `scripts/verify-pipeline.sh origin/main`
+#
+# `-D warnings` on term 4 follows BOTH house precedents rather than diverging
+# from them: `ci.yml` runs `cargo clippy --all-targets --all-features -- -D
+# warnings`, and `wip_rescue`'s own clippy gate (`wip_rescue.rs`) runs
+# `cargo clippy --manifest-path … --tests -- -D warnings`. It is also the one
+# invocation whose exit code expresses the plan's stated criterion ("rc=0, zero
+# `warning:` line") without parsing output.
+#
+# `origin/main` on term 5 is LOAD-BEARING, not decoration: `verify-pipeline.sh`
+# defaults to `BASE_REF="${1:-main}"`, and a dispatch worktree's local `main` can
+# be days stale — the docs/source bucket split would then be computed on a diff
+# that is not the one the PR publishes. `origin/main` is the mode CI uses and the
+# script's own usage block documents.
+#
+# Term 5 is STRICTER here than in CI, knowingly (mika#2354 § Fire-Disposition
+# D1-bis): two of the script's three exemption mechanisms read artefacts that do
+# not exist yet at measurement time — the `documentation` label is inherited
+# through `Closes #N` in the PR BODY (`gh pr create` has not run), and the
+# `pipeline-exempt` label is read from `GITHUB_EVENT_PATH` (absent off-runner).
+# Only the `Pipeline-Exempt:` commit trailer works. A legitimately docs-only
+# ticket therefore reads `no` here while it would pass in CI. That `no` is
+# accepted rather than compensated: it sits on the safe side of the asymmetry
+# below, and the body names the term so the operator reads the cause instead of
+# investigating it. The remedy, if the measured frequency justifies one, is a
+# fourth exemption mechanism readable BEFORE the PR exists — a separate ticket,
+# never a term 5 made permissive here.
+#
+# FAIL-CLOSED WITHOUT EXCEPTION. Anything that is not an explicit success yields
+# `no`: missing command, exhausted budget, empty `$WORKTREE_DIR`, unreadable
+# repo, absent or non-executable `verify-pipeline.sh`. We can therefore never be
+# more permissive than today, where the value is `no` in every circumstance. The
+# asymmetry is the one mika#2157 already arbitrated on this very PR body: one
+# `no` too many costs a visible, reversible operator gesture; one `yes` too many
+# opens the review on incomplete work, and the two remaining protections
+# (`--draft`, the marker) are "revocable by a single human gesture".
+#
+# Args: $1 — worktree dir
+# Returns: 0 when every term holds, and prints NOTHING.
+#          1 otherwise, printing the failing term's wire name on the FIRST line
+#          and an excerpt of its output on the following ones. The caller splits
+#          on that first newline.
+_measure_pipeline_verified() {
+    local wt_dir="$1"
+    local budget deadline remaining out rc
+
+    # Same guard, same reason, as `_rescue_diff_carries_work`: `git -C ""`
+    # silently operates on the dispatch process CWD — a live checkout — so an
+    # empty dir would measure the WRONG tree, and a tree that happens to be
+    # clean would land fail-OPEN, the one direction forbidden here.
+    if [ -z "$wt_dir" ] || ! git -C "$wt_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        printf 'worktree-unusable\nnot a readable git worktree: %s\n' "${wt_dir:-<empty>}"
+        return 1
+    fi
+
+    budget=$(_rescue_verify_budget_secs)
+    deadline=$(( $(date +%s) + budget ))
+
+    # ── Term 1: the diff carries work ───────────────────────────────────────
+    if ! _rescue_diff_carries_work "$wt_dir"; then
+        printf 'diff\nthe captured diff carries no work (incident-only, empty, or unmeasurable)\n'
+        return 1
+    fi
+
+    # ── Term 2: nothing left outside the commit the PR will publish ─────────
+    # Same scaffold exclusions as the rescue commit's own `git add -A`
+    # (mika#1288, mika#1419, mika#1552): a path the rescue refuses to stage is
+    # not pilot content and must not make the worktree read dirty. `-c
+    # core.quotePath=false` for the reason `_rescue_diff_carries_work` states —
+    # this repo's paths are written in French.
+    out=$(git -C "$wt_dir" -c core.quotePath=false status --porcelain -- \
+        ':!.claude/commands/' ':!.claude/claude-pilot.json' \
+        ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&1) || {
+        printf 'worktree-dirty\ncould not read worktree status\n%s\n' "$(_rescue_verify_excerpt "$out")"
+        return 1
+    }
+    if [ -n "$out" ]; then
+        printf 'worktree-dirty\n%s\n' "$(_rescue_verify_excerpt "$out")"
+        return 1
+    fi
+
+    # ── Term 3: formatting ──────────────────────────────────────────────────
+    remaining=$(( deadline - $(date +%s) ))
+    if [ "$remaining" -le 0 ]; then
+        printf 'budget\nthe %ss measurement budget was exhausted before `cargo fmt`\n' "$budget"
+        return 1
+    fi
+    # `if out=$(…); then rc=0; else rc=$?; fi` rather than `out=$(…); rc=$?`:
+    # the handlers source this file under `set -e`, where a failing command
+    # substitution in a plain assignment terminates the dispatch outright.
+    if out=$(_rescue_verify_run "$remaining" "$wt_dir" cargo fmt --all --check 2>&1); then rc=0; else rc=$?; fi
+    if [ "$rc" -ne 0 ]; then
+        [ "$rc" -eq 124 ] && { printf 'budget\n`cargo fmt --all --check` exceeded the remaining measurement budget\n'; return 1; }
+        printf 'fmt\n%s\n' "$(_rescue_verify_excerpt "$out")"
+        return 1
+    fi
+
+    # ── Term 4: lint ────────────────────────────────────────────────────────
+    remaining=$(( deadline - $(date +%s) ))
+    if [ "$remaining" -le 0 ]; then
+        printf 'budget\nthe %ss measurement budget was exhausted before `cargo clippy`\n' "$budget"
+        return 1
+    fi
+    if out=$(_rescue_verify_run "$remaining" "$wt_dir" cargo clippy --workspace --all-targets -- -D warnings 2>&1); then rc=0; else rc=$?; fi
+    if [ "$rc" -ne 0 ]; then
+        [ "$rc" -eq 124 ] && { printf 'budget\n`cargo clippy` exceeded the remaining measurement budget\n'; return 1; }
+        printf 'clippy\n%s\n' "$(_rescue_verify_excerpt "$out")"
+        return 1
+    fi
+
+    # ── Term 5: the /mika pipeline's own artefact check ─────────────────────
+    if [ ! -x "$wt_dir/scripts/verify-pipeline.sh" ]; then
+        printf 'verify-pipeline\nscripts/verify-pipeline.sh is absent or not executable in the worktree\n'
+        return 1
+    fi
+    remaining=$(( deadline - $(date +%s) ))
+    if [ "$remaining" -le 0 ]; then
+        printf 'budget\nthe %ss measurement budget was exhausted before `verify-pipeline.sh`\n' "$budget"
+        return 1
+    fi
+    if out=$(_rescue_verify_run "$remaining" "$wt_dir" ./scripts/verify-pipeline.sh origin/main 2>&1); then rc=0; else rc=$?; fi
+    if [ "$rc" -ne 0 ]; then
+        [ "$rc" -eq 124 ] && { printf 'budget\n`verify-pipeline.sh` exceeded the remaining measurement budget\n'; return 1; }
+        printf 'verify-pipeline\n%s\n' "$(_rescue_verify_excerpt "$out")"
+        return 1
+    fi
+
+    return 0
+}
+
+# _rescue_verify_enabled — is the mika#2354 measurement armed?
+#
+# Default armed. `0` / `false` / `no` / `off` (case-insensitive) disarm it, which
+# restores the pre-mika#2354 body VERBATIM (`_compose_rescue_pr_body` called with
+# its pre-fix argument shape), with no redeploy. The rollback has to be exact:
+# one that also changed the shape of the body would not be a rollback, and an
+# operator reaching for the switch mid-incident is not in a position to discover
+# that.
+#
+# The variable reaches this process by explicit injection from
+# `skills/executor.rs::inject_rescue_verify_env` — `sandboxed_pilot_env` rebuilds
+# the child env from a positive allowlist, so nothing crosses by inheritance. A
+# setting only its reader honours is a decorative setting (mika#2165).
+_rescue_verify_enabled() {
+    local raw="${MIKA_RESCUE_VERIFY_ENABLED:-1}"
+    case "${raw,,}" in
+        0|false|no|off) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# _rescue_verify_budget_secs — the measurement's global budget, in seconds.
+#
+# House three-tier convention: absent/empty → default; unreadable, `0` or
+# negative → default + WARN. `0` does NOT disarm — that is
+# `MIKA_RESCUE_VERIFY_ENABLED`'s job, and reading a typo'd budget as a disarm
+# would silently restore the producerless marker this ticket exists to remove.
+#
+# Default 900s, aligned on `wip_rescue`'s clippy gate, which already runs this
+# class of work one step downstream.
+_rescue_verify_budget_secs() {
+    local raw="${MIKA_RESCUE_VERIFY_BUDGET_SECS:-}"
+    if [ -z "$raw" ]; then
+        echo 900
+        return
+    fi
+    if ! [[ "$raw" =~ ^-?[0-9]+$ ]] || [ "$raw" -le 0 ]; then
+        echo "WARN: rescue_verify_budget_invalid: MIKA_RESCUE_VERIFY_BUDGET_SECS='${raw}' is not a positive integer — falling back to 900s" >&2
+        echo 900
+        return
+    fi
+    echo "$raw"
+}
+
+# _rescue_verify_run — run one measurement term inside the remaining budget.
+#
+# `timeout` yields 124 on expiry, which the caller reads as `budget` rather than
+# as the term's own failure — the two are different facts and the operator acts
+# on them differently. When `timeout` is unavailable the command runs unbounded
+# and the caller's next deadline check catches the overrun: the budget still
+# holds, one term late. Degrading to "cannot measure" there would be fail-closed
+# in the letter and useless in practice on a host missing coreutils.
+#
+# Args: $1 — seconds remaining, $2 — worktree dir, $3.. — command + args.
+_rescue_verify_run() {
+    local secs="$1" wt_dir="$2"; shift 2
+    if command -v timeout >/dev/null 2>&1; then
+        ( cd "$wt_dir" && timeout "$secs" "$@" )
+    else
+        ( cd "$wt_dir" && "$@" )
+    fi
+}
+
+# _rescue_verify_excerpt — the part of a failing term's output an operator acts on.
+#
+# Diagnostic lines first (`error:`, `warning:`, `FAIL:`, rustfmt's `Diff in`, a
+# panic), because a cargo invocation's FIRST lines are `Compiling …` and would
+# say nothing. Falls back to the head of the output when nothing matches — which
+# is the shape `verify-pipeline.sh` already has, its own first line being
+# `FAIL: …`. Capped so a red clippy cannot bloat the PR body.
+# Written with here-strings and one `awk` rather than `grep | head` pipelines:
+# `head` closes the pipe at its limit, the producer takes SIGPIPE, and under the
+# `pipefail` this library is sourced into that 141 becomes the pipeline's status
+# (mika#2055). No pipeline, no SIGPIPE.
+_rescue_verify_excerpt() {
+    local out="$1" picked
+    picked=$(grep -E '^(error|warning|FAIL|Diff in|thread |note: )' <<<"$out" || true)
+    [ -z "$picked" ] && picked=$(grep -v '^[[:space:]]*$' <<<"$out" || true)
+    awk 'NR<=12 { print substr($0, 1, 500) }' <<<"$picked"
+}
+
 # _compose_rescue_pr_body — build the body of a recovery PR (mika#2157).
 #
 # Extracted from the heredoc that used to sit inline in `gh pr create`'s --body
@@ -5726,15 +5969,61 @@ _rescue_diff_carries_work() {
 # the `rescue-pipeline-verified` marker, and for the same reason (two independent
 # judgements of one fact diverge).
 #
+# mika#2354 gave the OTHER marker its producer: `rescue-pipeline-verified` is no
+# longer the hard-coded literal `no` but the measured verdict of
+# `_measure_pipeline_verified`, passed in by the caller. Passed in rather than
+# measured here, deliberately: this function is called by tests against
+# throwaway repositories, and running two cargo invocations to compose a string
+# would make the composer's own tests depend on the health of a temp crate.
+#
 # Args: $1 — worktree dir
 #       $2 — recovery class ("dirty-worktree" or "commit-pushed-no-pr")
 #       $3 — class fact sentence
 #       $4 — issue number
+#       $5 — pipeline-verified verdict, `yes` or `no` (mika#2354; anything that
+#            is not the literal `yes` reads as `no` — fail-closed, and an absent
+#            argument keeps the pre-mika#2354 call shape working)
+#       $6 — failing term's wire name, empty when none (kill-switch, or `yes`)
+#       $7 — excerpt of the failing term's output, empty when none
 # Reads SESSION_ID / TURNS / COST from the environment, as the heredoc did.
 # Outputs: the PR body to stdout.
+#
+# AC4 invariant: with $5..$7 absent or ("no", "", "") the body is BYTE-IDENTICAL
+# to the pre-mika#2354 one. That is what makes `MIKA_RESCUE_VERIFY_ENABLED=0` a
+# real rollback — one that also changed the shape of the body would not be one.
 _compose_rescue_pr_body() {
     local wt_dir="$1" recovery_class="$2" class_fact="$3" issue_num="$4"
+    local verified="${5:-no}" failed_term="${6:-}" failed_excerpt="${7:-}"
     local diff_marker issue_ref lede=""
+    local verify_marker="" operator_line verify_detail=""
+
+    [ "$verified" = "yes" ] || verified="no"
+
+    if [ "$verified" = "yes" ]; then
+        # No object left for the operator gesture: naming it anyway would keep
+        # the door shut in the reader's mind after the code opened it.
+        operator_line="**Auto-rescued PR.** dispatch-lib measured the local pipeline as complete before opening this PR (mika#2354): the diff carries work, the worktree is clean, \`cargo fmt --all --check\` and \`cargo clippy --workspace --all-targets\` are green, and \`scripts/verify-pipeline.sh origin/main\` passes. That attests the pipeline is complete and the review may begin — not that the work is good, which is what the review decides."
+    elif [ -n "$failed_term" ]; then
+        # The `no` becomes actionable: it says which term to treat. Before
+        # mika#2354 it said only that something, somewhere, was unverified.
+        verify_marker="
+<!-- rescue-verify-failed: ${failed_term} -->"
+        operator_line="**Auto-rescued PR.** dispatch-lib measured the local pipeline as INCOMPLETE before opening this PR (mika#2354): the \`${failed_term}\` term failed. Operator: treat that term, then either un-draft this PR or set the marker above to \`yes\`."
+        if [ -n "$failed_excerpt" ]; then
+            verify_detail="
+<details><summary>rescue-verify-failed: ${failed_term}</summary>
+
+\`\`\`
+${failed_excerpt}
+\`\`\`
+
+</details>
+"
+        fi
+    else
+        # Kill-switch (or a pre-mika#2354 caller): verbatim pre-fix sentence.
+        operator_line="**Auto-rescued PR.** Operator: verify pipeline completion, then either un-draft this PR or set the marker above to \`yes\`."
+    fi
 
     if _rescue_diff_carries_work "$wt_dir"; then
         diff_marker="carries-work"
@@ -5753,13 +6042,13 @@ _compose_rescue_pr_body() {
     cat <<RESCUEBODY
 ${lede}## Auto-rescued PR (dispatch-lib recovery, class: ${recovery_class})
 
-<!-- rescue-pipeline-verified: no -->
-<!-- rescue-diff: ${diff_marker} -->
+<!-- rescue-pipeline-verified: ${verified} -->
+<!-- rescue-diff: ${diff_marker} -->${verify_marker}
 
 This PR was created by dispatch-lib's git-workflow recovery. ${class_fact}
 
-**Auto-rescued PR.** Operator: verify pipeline completion, then either un-draft this PR or set the marker above to \`yes\`.
-
+${operator_line}
+${verify_detail}
 ### Recovery metadata
 - Recovery class: \`${recovery_class}\`
 - Pilot session: \`${SESSION_ID:-unknown}\`
@@ -6473,13 +6762,39 @@ The pilot's implementation work is in the commit(s) below this one." 2>&9; then
             fi
         fi
 
+        # mika#2354: give `rescue-pipeline-verified` its producer. Measured
+        # HERE — after the rescue commit and after the push, immediately before
+        # `gh pr create` — so what is measured is the exact state this PR is
+        # about to publish, not an earlier one.
+        #
+        # The clippy run below deliberately DUPLICATES the one `wip_rescue`
+        # performs downstream. The two do not measure the same thing: this one
+        # runs before the rebase onto main, that one after, and their
+        # consequences differ (a marker on the body vs. an un-draft). Unifying
+        # them would mean moving the measurement into a consumer, which AC7
+        # refuses — the producer stays dispatch-lib, sole writer of its own
+        # green light.
+        local _rescue_verified="no" _rescue_verify_term="" _rescue_verify_excerpt=""
+        if _rescue_verify_enabled; then
+            local _rescue_verify_out=""
+            if _rescue_verify_out=$(_measure_pipeline_verified "$WORKTREE_DIR"); then
+                _rescue_verified="yes"
+            else
+                _rescue_verify_term=$(head -1 <<<"$_rescue_verify_out")
+                _rescue_verify_excerpt=$(tail -n +2 <<<"$_rescue_verify_out")
+            fi
+            echo "rescue_pipeline_verified: verified=${_rescue_verified} term=${_rescue_verify_term:-none} (mika#2354)" >&2
+        else
+            echo "rescue_pipeline_verified: disabled by MIKA_RESCUE_VERIFY_ENABLED — marker stays 'no', body unchanged (mika#2354)" >&2
+        fi
+
         RESCUED_PR_URL=$(gh pr create \
             --repo "senara-solutions/$REPO" \
             --head "$BRANCH" \
             --base main \
             --draft \
             --title "$_rescue_title" \
-            --body "$(_compose_rescue_pr_body "$WORKTREE_DIR" "$RECOVERY_CLASS" "$_rescue_class_fact" "$ISSUE_NUM")" 2>&9 || true)
+            --body "$(_compose_rescue_pr_body "$WORKTREE_DIR" "$RECOVERY_CLASS" "$_rescue_class_fact" "$ISSUE_NUM" "$_rescue_verified" "$_rescue_verify_term" "$_rescue_verify_excerpt")" 2>&9 || true)
 
         if [ -n "$RESCUED_PR_URL" ]; then
             PR_URL="$RESCUED_PR_URL"

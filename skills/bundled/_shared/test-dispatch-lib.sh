@@ -3176,8 +3176,33 @@ assert_contains "AC3: Path B composes its body through _compose_rescue_pr_body (
 RESCUE_BODY_FN=$(awk '/^_compose_rescue_pr_body\(\) \{/,/^\}/' "$DISPATCH_LIB")
 assert_contains "AC3: Path B writes the Auto-rescued PR rescue header (qa-review Step 1.5)" \
     '## Auto-rescued PR (dispatch-lib recovery, class: ${recovery_class})' "$RESCUE_BODY_FN"
-assert_contains "AC3: Path B emits the rescue-pipeline-verified marker" \
-    'rescue-pipeline-verified: no' "$RESCUE_BODY_FN"
+# mika#2354: the marker is no longer the hard-coded literal `no` — it is the
+# measured verdict, interpolated. Asserting `rescue-pipeline-verified: no` here
+# would pin the very defect that ticket exists to remove, so the assertion
+# follows the property (a marker IS emitted, and it carries the measured value)
+# rather than the literal. The two values it can take are covered end-to-end in
+# `tests/test_rescue_pipeline_verified.sh` against real repositories.
+assert_contains "AC3: Path B emits the rescue-pipeline-verified marker (mika#2354: measured, not literal)" \
+    'rescue-pipeline-verified: ${verified}' "$RESCUE_BODY_FN"
+assert_not_contains "AC3/mika#2354: no hard-coded 'no' literal survives in the composer" \
+    'rescue-pipeline-verified: no -->' "$RESCUE_BODY_FN"
+assert_contains "AC3/mika#2354: Path B measures the pipeline before opening the PR" \
+    '_measure_pipeline_verified "$WORKTREE_DIR"' "$PATHB_BLOCK"
+assert_contains "AC3/mika#2354: the measurement is behind the kill-switch" \
+    'if _rescue_verify_enabled; then' "$PATHB_BLOCK"
+assert_contains "AC3/mika#2354: the measured verdict is passed to the composer" \
+    '"$_rescue_verified" "$_rescue_verify_term" "$_rescue_verify_excerpt"' "$PATHB_BLOCK"
+
+# mika#2354 AC10: term 5 is invoked with `origin/main`, never the script's own
+# `main` default. A dispatch worktree's local `main` can be days stale, so the
+# docs/source bucket split would be computed on a diff that is not the one the
+# PR publishes. Structural assertion — the wrong base ref produces a plausible
+# verdict, not an error, so no behavioural test can see it.
+MEASURE_FN=$(awk '/^_measure_pipeline_verified\(\) \{/,/^\}/' "$DISPATCH_LIB")
+assert_contains "AC10: verify-pipeline.sh is invoked against origin/main" \
+    './scripts/verify-pipeline.sh origin/main' "$MEASURE_FN"
+assert_not_contains "AC10: never against the worktree's local main" \
+    'verify-pipeline.sh main' "$MEASURE_FN"
 assert_contains "AC3: Path B emits RECOVERY_PENDING: true (Guard 1)" \
     'RECOVERY_PENDING: true' "$PATHB_BLOCK"
 assert_contains "AC3: Path B tags the rescued PR with the wip-rescue label" \
