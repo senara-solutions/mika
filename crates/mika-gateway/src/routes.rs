@@ -161,6 +161,14 @@ pub struct AppState {
     /// invariant as the search substrate (see
     /// `crates/mika-gateway/src/egress_fetch/`).
     pub(crate) fetch_egress_client: Option<egress_fetch::SharedFetchEgressClient>,
+
+    /// mika#2360 — admin READ-ONLY token, already resolved by
+    /// [`crate::settings::resolve_admin_read_token`]: `None` means the route
+    /// `GET /admin/tenants/{customer_id}/recurring-tasks` answers 404, whether
+    /// because the token is unset or because it collided with
+    /// `internal_token`. No request path re-checks the collision — the invalid
+    /// state never reaches this struct.
+    pub admin_read_token: Option<SecretString>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -177,6 +185,12 @@ impl std::fmt::Debug for AppState {
             .field(
                 "github_webhook_secret",
                 &self.github_webhook_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            // mika#2360 — `Some`/`None` is the armed state of the admin read
+            // route, the first thing to look for in a diagnostic dump.
+            .field(
+                "admin_read_token",
+                &self.admin_read_token.as_ref().map(|_| "[REDACTED]"),
             )
             .finish_non_exhaustive()
     }
@@ -315,6 +329,18 @@ pub fn build_router(state: AppState) -> Router {
                     require_bearer_token,
                 ))
                 .layer(RequestBodyLimitLayer::new(1024)),
+        )
+        // Admin: read-only recurring registry of a tenant (mika#2360), proxied
+        // to the tenant pod. Dedicated READ token — the write internal token
+        // is refused here. Auth is per-route in this router: this
+        // `.route_layer` is what protects the route; without it the route is
+        // served with no authentication at all.
+        .route(
+            "/admin/tenants/{customer_id}/recurring-tasks",
+            get(handle_admin_tenant_recurring_tasks).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_admin_read_token,
+            )),
         )
         // Health probes and version (no auth)
         .route("/health", get(handle_readiness))
@@ -1915,6 +1941,204 @@ async fn require_bearer_token(
     }
 }
 
+/// mika#2360 — middleware for the admin READ-ONLY scope.
+///
+/// Branches, in this order:
+/// 1. route not armed (`admin_read_token == None`) → 404, before any header
+///    is read — the answer on an unconfigured route must not depend on the
+///    client's input;
+/// 2. header absent / not `Bearer ` → 403;
+/// 3. token is the admin read token → pass;
+/// 4. token is the *write* internal token → 403 + WARN (authenticated, not
+///    authorized — AC2 "wrong scope"). The bearer of the internal token is
+///    already superuser on `/admin/*`; refusing it here removes no privilege,
+///    it only means an operator who inspects no longer needs to hold the write
+///    secret;
+/// 5. anything else → 403.
+///
+/// AC2 of mika#2360 asks for 403 on all three refusals (absent / unknown /
+/// write scope). The sibling `require_bearer_token` answers 401 on absent and
+/// unknown; the AC is followed literally here, and the two tests
+/// `admin_read_rejects_missing_header_with_403` /
+/// `admin_read_rejects_unknown_token_with_403` pin that choice so it is
+/// decided, not drifted. Flipping to 401 is one line per branch.
+async fn require_admin_read_token(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> impl IntoResponse {
+    let Some(read_token) = state.admin_read_token.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let token = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+
+    match token {
+        Some(t) if constant_time_eq(t, read_token.expose_secret()) => {
+            next.run(req).await.into_response()
+        }
+        Some(t) if constant_time_eq(t, state.internal_token.expose_secret()) => {
+            warn!(
+                path = %req.uri().path(),
+                "mika#2360: internal (write) token presented on the admin read-only \
+                 route — refused; use MIKA_GATEWAY_ADMIN_READ_TOKEN"
+            );
+            (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "admin read scope required"})),
+            )
+                .into_response()
+        }
+        Some(_) | None => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "admin read token required"})),
+        )
+            .into_response(),
+    }
+}
+
+/// Query params forwarded to the tenant by
+/// `GET /admin/tenants/{customer_id}/recurring-tasks` — an allowlist, never an
+/// opaque passthrough: a parameter the tenant handler does not know today
+/// but might tomorrow must not become reachable without a line changing here.
+#[derive(Debug, Default, serde::Deserialize)]
+pub(crate) struct AdminRecurringQuery {
+    pub agent_id: Option<String>,
+    pub page: Option<u32>,
+    pub per_page: Option<u32>,
+}
+
+impl AdminRecurringQuery {
+    /// Encode the allowlisted params for the tenant hop.
+    pub(crate) fn to_query_pairs(&self) -> Vec<(&'static str, String)> {
+        let mut pairs = Vec::with_capacity(3);
+        if let Some(a) = &self.agent_id {
+            pairs.push(("agent_id", a.clone()));
+        }
+        if let Some(p) = self.page {
+            pairs.push(("page", p.to_string()));
+        }
+        if let Some(p) = self.per_page {
+            pairs.push(("per_page", p.to_string()));
+        }
+        pairs
+    }
+}
+
+/// `GET /admin/tenants/{customer_id}/recurring-tasks` (mika#2360) — proxy the
+/// tenant's read-only recurring registry (`GET /api/v1/recurring-tasks` on the
+/// pod) to an operator holding the admin READ token.
+///
+/// `customer_id` is validated **before** any URL is built (T5/R12):
+/// `Path<Uuid>` rejects a non-UUID with 400 in the extractor, and an unknown
+/// UUID answers 404 without forwarding. Both matter: the internal hop carries
+/// `Bearer {internal_token}`, and `container_url_str` interpolates its argument
+/// into a hostname without validating it — on this route no per-customer API
+/// key constrains the argument the way the A2A paths are constrained, so the
+/// validation has to live here. A DB failure on the lookup answers 503 and
+/// never forwards.
+///
+/// Each served call writes one `audit_events` row (`gateway_admin_read`,
+/// `tenant:{uuid}`) — "who read Al's registry, and when" must be a SQL query.
+/// Fire-and-forget: an audit failure logs a WARN and does not change the
+/// response (a read must not depend on a write).
+async fn handle_admin_tenant_recurring_tasks(
+    State(state): State<AppState>,
+    Path(customer_id): Path<Uuid>,
+    Query(q): Query<AdminRecurringQuery>,
+) -> Response {
+    // R12 term 2 — resolve in `customers` before any interpolation.
+    match sqlx::query_scalar::<_, i32>("SELECT 1 FROM customers WHERE id = $1")
+        .bind(customer_id)
+        .fetch_optional(&state.pool)
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "customer not found"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            error!(error = %e, %customer_id, "admin recurring-tasks: customer lookup failed");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "database unavailable"})),
+            )
+                .into_response();
+        }
+    }
+
+    info!(%customer_id, "mika#2360: admin read of tenant recurring registry");
+    crate::audit_events::log_admin_read(&state.pool, &customer_id).await;
+
+    forward_recurring_registry(&state, &customer_id, &q).await
+}
+
+/// The tenant hop of [`handle_admin_tenant_recurring_tasks`], split out so the
+/// forwarding contract (internal bearer, allowlisted query, 502 on any
+/// upstream failure) is testable against a fake upstream without Postgres.
+/// Callers MUST have validated `customer_id` first — this function trusts it.
+pub(crate) async fn forward_recurring_registry(
+    state: &AppState,
+    customer_id: &Uuid,
+    q: &AdminRecurringQuery,
+) -> Response {
+    let container = container_url_str(
+        &customer_id.to_string(),
+        state.agent_base_url.as_deref(),
+        &state.agents_namespace,
+    );
+    let forward_url = format!("{container}/api/v1/recurring-tasks");
+
+    let resp = match state
+        .http_client
+        .get(&forward_url)
+        .query(&q.to_query_pairs())
+        .header(
+            "authorization",
+            format!("Bearer {}", state.internal_token.expose_secret()),
+        )
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            error!(error = %e, %customer_id, "admin recurring-tasks: tenant unreachable");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": "tenant unavailable"})),
+            )
+                .into_response();
+        }
+    };
+
+    let status = resp.status();
+    let body = match resp.text().await {
+        Ok(b) => b,
+        Err(e) => {
+            error!(error = %e, %customer_id, "admin recurring-tasks: failed to read tenant response");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": "failed to read tenant response"})),
+            )
+                .into_response();
+        }
+    };
+
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 // -- Send handler --
 
 /// Format outbound Telegram text: prepend `[<agent_name>] ` for identification in
@@ -2990,5 +3214,282 @@ mod tests {
         let json = serde_json::to_string(&resp).expect("serialize");
         assert!(json.contains("\"customers\":["));
         assert!(json.contains("\"count\":1"));
+    }
+
+    // ── mika#2360 — GET /admin/tenants/{customer_id}/recurring-tasks ──────
+
+    mod mika2360 {
+        use super::super::*;
+        use axum::body::Body;
+        use http_body_util::BodyExt;
+        use sqlx::postgres::PgPoolOptions;
+        use tower::ServiceExt;
+        use wiremock::matchers::{header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const INTERNAL: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const READ: &str = "read-only-admin-token";
+        const CUSTOMER: &str = "a0394c24-9558-4cb6-9078-52043912ecbc";
+
+        /// Lazy Postgres pool that never connects: auth rejection, the
+        /// extractor gate and the 405 fallback run without a DB; the customer
+        /// lookup fails fast and must answer 503 without forwarding.
+        fn state(admin_read_token: Option<&str>, agent_base_url: Option<String>) -> AppState {
+            let http_client = reqwest::Client::new();
+            let pool = PgPoolOptions::new()
+                .acquire_timeout(Duration::from_millis(100))
+                .connect_lazy("postgres://fake:fake@localhost:1/fake")
+                .expect("lazy pool");
+            AppState {
+                pool,
+                telegram: None,
+                http_client,
+                internal_token: SecretString::from(INTERNAL),
+                webhook_secret: None,
+                ready: Arc::new(AtomicBool::new(true)),
+                webhook_semaphore: Arc::new(tokio::sync::Semaphore::new(30)),
+                agent_base_url,
+                agents_namespace: "mika-agents".to_string(),
+                webhook_counter: Arc::new(AtomicU64::new(0)),
+                github_webhook_secret: None,
+                github_delivery_cache: crate::github::new_delivery_cache(),
+                github_app: None,
+                github_api_base_url: None,
+                orchestrator_inbox_enabled: false,
+                inbox_subscriber_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
+                gateway_external_url: None,
+                cm_api_url: None,
+                target_health: Arc::new(crate::circuit_breaker::TargetCircuitBreaker::new()),
+                delivery_slots: Arc::new(tokio::sync::Semaphore::new(
+                    crate::circuit_breaker::MAX_INFLIGHT_DELIVERIES,
+                )),
+                search_egress_client: None,
+                fetch_egress_client: None,
+                admin_read_token: admin_read_token.map(SecretString::from),
+            }
+        }
+
+        async fn call(app: Router, method: &str, uri: &str, bearer: Option<&str>) -> Response {
+            let mut req = Request::builder().method(method).uri(uri);
+            if let Some(b) = bearer {
+                req = req.header("authorization", format!("Bearer {b}"));
+            }
+            app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap()
+        }
+
+        fn route(customer: &str) -> String {
+            format!("/admin/tenants/{customer}/recurring-tasks")
+        }
+
+        /// R7 — unconfigured token ⇒ 404, even with a valid-looking header.
+        #[tokio::test]
+        async fn admin_read_route_404_when_token_unconfigured() {
+            let app = build_router(state(None, None));
+            let resp = call(app.clone(), "GET", &route(CUSTOMER), Some(READ)).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            // Not even the write token opens a disarmed route.
+            let resp = call(app, "GET", &route(CUSTOMER), Some(INTERNAL)).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        /// AC2 — the write-only token is authenticated but not authorized.
+        #[tokio::test]
+        async fn admin_read_rejects_internal_token_with_403() {
+            let app = build_router(state(Some(READ), None));
+            let resp = call(app, "GET", &route(CUSTOMER), Some(INTERNAL)).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            assert!(String::from_utf8_lossy(&body).contains("admin read scope required"));
+        }
+
+        /// AC2 "absent" — and the route has no auth by prefix: this 403 is
+        /// what proves the `.route_layer` is mounted at all.
+        #[tokio::test]
+        async fn admin_read_rejects_missing_header_with_403() {
+            let app = build_router(state(Some(READ), None));
+            let resp = call(app, "GET", &route(CUSTOMER), None).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+
+        /// AC2 "unknown" — pinned at 403 per the ticket (not the 401 of the
+        /// sibling `require_bearer_token`).
+        #[tokio::test]
+        async fn admin_read_rejects_unknown_token_with_403() {
+            let app = build_router(state(Some(READ), None));
+            let resp = call(app.clone(), "GET", &route(CUSTOMER), Some("nope")).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            // Prefix of the real token is not the token.
+            let resp = call(app, "GET", &route(CUSTOMER), Some(&READ[..8])).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+
+        /// AC3 — held by the router: no mutating method exists on the path.
+        #[tokio::test]
+        async fn no_mutating_method_on_admin_read_route() {
+            let app = build_router(state(Some(READ), None));
+            for m in ["POST", "PUT", "DELETE", "PATCH"] {
+                let resp = call(app.clone(), m, &route(CUSTOMER), Some(READ)).await;
+                assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED, "{m}");
+            }
+        }
+
+        /// R12 term 1 / T5 — a non-UUID `customer_id` is refused by the
+        /// extractor before the handler runs, so before any URL is built and
+        /// before the internal token can leave. The assertion that counts is
+        /// the upstream's request counter, not the status alone.
+        #[tokio::test]
+        async fn non_uuid_customer_id_is_rejected_before_any_forward() {
+            let upstream = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+                .expect(0)
+                .mount(&upstream)
+                .await;
+            let app = build_router(state(Some(READ), Some(upstream.uri())));
+
+            for bad in [
+                "x.attacker.example%2F",
+                "..%2F..%2Fadmin",
+                "a@b",
+                "id:8080",
+                "not-a-uuid",
+                "a0394c24-9558-4cb6-9078-52043912ecb", // one char short
+            ] {
+                let resp = call(app.clone(), "GET", &route(bad), Some(READ)).await;
+                assert!(
+                    matches!(
+                        resp.status(),
+                        StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND
+                    ),
+                    "{bad}: got {}",
+                    resp.status()
+                );
+            }
+            assert!(
+                upstream.received_requests().await.unwrap().is_empty(),
+                "no request may reach the tenant for an invalid customer_id"
+            );
+        }
+
+        /// R12 term 2, fail-closed side — when the customer cannot be
+        /// resolved (DB unavailable) the gateway answers 503 and does NOT
+        /// forward: the internal token never leaves on an unresolved id.
+        #[tokio::test]
+        async fn db_unavailable_is_503_and_does_not_forward() {
+            let upstream = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+                .expect(0)
+                .mount(&upstream)
+                .await;
+            let app = build_router(state(Some(READ), Some(upstream.uri())));
+
+            let resp = call(app, "GET", &route(CUSTOMER), Some(READ)).await;
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(upstream.received_requests().await.unwrap().is_empty());
+        }
+
+        /// The tenant hop: `Bearer {internal_token}`, `/api/v1/recurring-tasks`,
+        /// allowlisted query only, body and status relayed as-is.
+        #[tokio::test]
+        async fn forward_carries_internal_token_and_allowlisted_query() {
+            let upstream = MockServer::start().await;
+            let body = r#"{"data":[{"label":"rappel","trigger_type":"recurring"}],"total":1,"page":2,"per_page":5}"#;
+            Mock::given(method("GET"))
+                .and(path("/api/v1/recurring-tasks"))
+                .and(header(
+                    "authorization",
+                    format!("Bearer {INTERNAL}").as_str(),
+                ))
+                .and(query_param("agent_id", "mika"))
+                .and(query_param("page", "2"))
+                .and(query_param("per_page", "5"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .expect(1)
+                .mount(&upstream)
+                .await;
+            let st = state(Some(READ), Some(upstream.uri()));
+            let q = AdminRecurringQuery {
+                agent_id: Some("mika".to_string()),
+                page: Some(2),
+                per_page: Some(5),
+            };
+
+            let resp =
+                forward_recurring_registry(&st, &Uuid::parse_str(CUSTOMER).unwrap(), &q).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let got = resp.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(String::from_utf8_lossy(&got), body);
+
+            let reqs = upstream.received_requests().await.unwrap();
+            assert_eq!(reqs.len(), 1);
+            let sent = reqs[0].url.query().unwrap_or("");
+            assert!(!sent.contains("evil"), "query passthrough: {sent}");
+        }
+
+        /// The allowlist is the struct: unknown params are dropped at
+        /// deserialization and never encoded for the hop.
+        #[test]
+        fn admin_recurring_query_is_an_allowlist() {
+            let uri: http::Uri = "/x?agent_id=x&per_page=5&evil=1&page=3".parse().unwrap();
+            let Query(q) = Query::<AdminRecurringQuery>::try_from_uri(&uri).unwrap();
+            let pairs = q.to_query_pairs();
+            assert_eq!(
+                pairs,
+                vec![
+                    ("agent_id", "x".to_string()),
+                    ("page", "3".to_string()),
+                    ("per_page", "5".to_string()),
+                ]
+            );
+        }
+
+        /// An unreachable tenant is 502, never an empty 200: an empty
+        /// registry and a pod the gateway could not reach are two different
+        /// answers.
+        #[tokio::test]
+        async fn upstream_failure_is_502_not_empty_200() {
+            let st = state(Some(READ), Some("http://127.0.0.1:1".to_string()));
+            let resp = forward_recurring_registry(
+                &st,
+                &Uuid::parse_str(CUSTOMER).unwrap(),
+                &AdminRecurringQuery::default(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        }
+
+        /// Upstream 4xx/5xx statuses are relayed, not rewritten.
+        #[tokio::test]
+        async fn forward_relays_upstream_status() {
+            let upstream = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api/v1/recurring-tasks"))
+                .respond_with(ResponseTemplate::new(500).set_body_string(r#"{"error":"x"}"#))
+                .mount(&upstream)
+                .await;
+            let st = state(Some(READ), Some(upstream.uri()));
+            let resp = forward_recurring_registry(
+                &st,
+                &Uuid::parse_str(CUSTOMER).unwrap(),
+                &AdminRecurringQuery::default(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        }
+
+        /// T7 a — the armed state is readable in a diagnostic dump, the
+        /// secret is not.
+        #[tokio::test]
+        async fn app_state_debug_shows_armed_state_without_secret() {
+            let armed = format!("{:?}", state(Some(READ), None));
+            assert!(
+                armed.contains("admin_read_token: Some(\"[REDACTED]\")"),
+                "{armed}"
+            );
+            assert!(!armed.contains(READ));
+            let disarmed = format!("{:?}", state(None, None));
+            assert!(disarmed.contains("admin_read_token: None"), "{disarmed}");
+        }
     }
 }

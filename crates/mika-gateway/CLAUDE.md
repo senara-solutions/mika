@@ -23,6 +23,7 @@ Telegram and GitHub webhook router with Postgres customer registry. Handles text
 | `/admin/customers` | GET | Internal token | List customers filtered by `status`, `paired`, `stale_after_minutes` — orphan sweep (mika#1820) |
 | `/admin/customers/{customer_id}` | GET | Internal token | Read a customer record — safe fields only, never `bot_token` / `pairing_token` value / `webhook_secret` (mika#1820) |
 | `/admin/customers/{customer_id}/unlink` | POST | Internal token | Release a customer's Telegram binding server-side (mika#1749) |
+| `/admin/tenants/{customer_id}/recurring-tasks` | GET | **Admin read token** (`MIKA_GATEWAY_ADMIN_READ_TOKEN`) | Read-only proxy of the tenant's recurring-task registry (`GET /api/v1/recurring-tasks` on the pod) — metadata only, no message content; the internal (write) token is refused with 403; `customer_id` must be a UUID present in `customers` before any forward (mika#2360). Each served call writes an `audit_events` row (`tool_name = 'gateway_admin_read'`, `target_key = 'tenant:{uuid}'`). |
 
 ## GitHub Webhook Integration
 
@@ -90,6 +91,7 @@ API keys are SHA-256 hashed and stored in Postgres `a2a_api_keys` table (migrati
 - `MIKA_TELEGRAM_WEBHOOK_URL` — Public HTTPS URL for inbound Telegram webhook delivery. Required only in single-bot mode (inbound registration).
 - `MIKA_TELEGRAM_SINGLE_BOT_MODE` — Exclusively controls **inbound global webhook registration**. When `1` or `true`, the gateway registers the global webhook with Telegram for inbound messages (requires all three: `MIKA_TELEGRAM_BOT_TOKEN`, `MIKA_TELEGRAM_WEBHOOK_SECRET`, `MIKA_TELEGRAM_WEBHOOK_URL`). Default: off (per-customer inbound mode). **Semantic narrowing (mika#1590):** pre-fix, this flag gated both inbound webhook registration and outbound client construction; post-fix, it gates inbound registration only — the global outbound client is built whenever `MIKA_TELEGRAM_BOT_TOKEN` is configured.
 - `MIKA_INTERNAL_TOKEN` — Shared 64-char hex bearer token
+- `MIKA_GATEWAY_ADMIN_READ_TOKEN` — Admin **read-only** bearer token (mika#2360). Opens `GET /admin/tenants/{customer_id}/recurring-tasks` and nothing else. Optional: when absent the route answers 404 (an INFO line at startup says so). Must be **distinct** from `MIKA_INTERNAL_TOKEN` — an equal value disarms the route with a WARN rather than silently voiding the read/write segregation. Never fails startup: a malformed value disarms the route, it does not take the gateway down.
 - `MIKA_AGENTS_NAMESPACE` — K8s namespace where agent pods run (default: `mika-agents`). Used for FQDN construction in cross-namespace DNS resolution (`http://mika-{id}.{ns}.svc.cluster.local:8080`). Override for environment-scoped namespaces (e.g. `mika-agents-prd`).
 - `MIKA_GITHUB_WEBHOOK_SECRET` — Secret for validating inbound GitHub App webhooks via HMAC-SHA256. Arbitrary string (not hex-constrained like Telegram). When absent, `POST /webhook/github` returns 404.
 - `MIKA_GITHUB_APP_ID` — GitHub App ID (u64). Required for the synchronize no-diff guard (#886).

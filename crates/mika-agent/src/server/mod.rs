@@ -151,6 +151,12 @@ fn build_router(state: AppState) -> Router {
             get(dashboard::handle_session_messages),
         )
         .route("/tasks", get(dashboard::handle_tasks_list))
+        // mika#2360 — read-only recurring registry, metadata only, proxied
+        // by the gateway's `/admin/tenants/{id}/recurring-tasks`.
+        .route(
+            "/recurring-tasks",
+            get(dashboard::handle_recurring_registry),
+        )
         .route("/tasks/{task_id}", get(dashboard::handle_task_detail))
         .route(
             "/tasks/{task_id}/children",
@@ -3975,6 +3981,166 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ===== mika#2360 — GET /api/v1/recurring-tasks =====
+
+    /// Seed one `send_message` recurrence whose `action_config` carries a
+    /// sentinel the response must never echo (AC4), plus one recurrence on a
+    /// second agent for the `?agent_id=` filter.
+    async fn seed_recurring_registry(state: &AppState) {
+        state
+            .dashboard_db
+            .with_db(|db| {
+                db.register_agent("other", "Other", "/tmp/other")?;
+                let mk = |agent: &str, label: &str| crate::db::NewTask {
+                    agent_id: agent.to_string(),
+                    team_run_id: None,
+                    parent_task_id: None,
+                    depth: 0,
+                    label: label.to_string(),
+                    trigger_type: "recurring".to_string(),
+                    cron_expr: Some("0 0 8 * * *".to_string()),
+                    event_source: None,
+                    event_offset_secs: None,
+                    condition_expr: None,
+                    next_fire_at: Some("2286-11-20T17:46:39Z".to_string()),
+                    timeout_at: None,
+                    action_type: "send_message".to_string(),
+                    action_config: r#"{"text":"SECRET-MEDICATION-REMINDER"}"#.to_string(),
+                    input_context: Some("SECRET-INPUT-CONTEXT".to_string()),
+                    created_by_session: None,
+                    created_trace_id: None,
+                    reference_url: None,
+                    source: None,
+                    metadata: Some(r#"{"note":"SECRET-METADATA-BLOB"}"#.to_string()),
+                    r#type: None,
+                    dispatch_class: None,
+                };
+                db.create_recurring_task_if_absent(mk("mika", "rappel-medicaments"))?
+                    .expect("seeded");
+                db.create_recurring_task_if_absent(mk("other", "other-recurrence"))?
+                    .expect("seeded");
+                // A non-recurring row that must never appear (R2).
+                let mut cb = mk("mika", "callback-row");
+                cb.trigger_type = "callback".to_string();
+                cb.cron_expr = None;
+                cb.next_fire_at = None;
+                db.create_task(&cb)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn get_recurring_registry(
+        app: Router,
+        uri: &str,
+        bearer: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut req = Request::builder().uri(uri);
+        if let Some(b) = bearer {
+            req = req.header("authorization", format!("Bearer {b}"));
+        }
+        let resp = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn mika2360_recurring_registry_requires_auth() {
+        let state = test_state_with_dashboard_token();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        let (status, _) =
+            get_recurring_registry(app.clone(), "/api/v1/recurring-tasks", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, _) =
+            get_recurring_registry(app, "/api/v1/recurring-tasks", Some("wrong-token")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// AC1 shape + AC4 content: the dashboard token (and the internal token
+    /// the gateway carries) read the registry; the JSON carries the label,
+    /// never the reminder text.
+    #[tokio::test]
+    async fn mika2360_recurring_registry_returns_metadata_only() {
+        let state = test_state_with_dashboard_token();
+        state.ready.store(true, Ordering::Release);
+        seed_recurring_registry(&state).await;
+        let app = test_app(state);
+
+        for bearer in ["dashboard-token-secret", "test-token-secret"] {
+            let (status, json) =
+                get_recurring_registry(app.clone(), "/api/v1/recurring-tasks", Some(bearer)).await;
+            assert_eq!(status, StatusCode::OK, "bearer {bearer}");
+            assert_eq!(json["total"], 2);
+            assert_eq!(json["page"], 1);
+            assert_eq!(json["per_page"], 50);
+            let data = json["data"].as_array().unwrap();
+            assert_eq!(data.len(), 2);
+            // Sorted by label NOCASE: other-recurrence < rappel-medicaments.
+            assert_eq!(data[0]["label"], "other-recurrence");
+            assert_eq!(data[1]["label"], "rappel-medicaments");
+            assert_eq!(data[1]["trigger_type"], "recurring");
+            assert_eq!(data[1]["action_type"], "send_message");
+            assert_eq!(data[1]["cron_expr"], "0 0 8 * * *");
+            assert_eq!(data[1]["status"], "recurring_active");
+            assert_eq!(data[1]["zombie_veto_active"], false);
+            assert!(data[1]["created_at"].is_string());
+            assert!(data[1]["updated_at"].is_string());
+
+            let rendered = json.to_string();
+            for sentinel in [
+                "SECRET-MEDICATION-REMINDER",
+                "SECRET-INPUT-CONTEXT",
+                "SECRET-METADATA-BLOB",
+                "action_config",
+                "callback-row",
+            ] {
+                assert!(
+                    !rendered.contains(sentinel),
+                    "response must not carry `{sentinel}`: {rendered}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mika2360_recurring_registry_agent_filter_and_pagination() {
+        let state = test_state_with_dashboard_token();
+        state.ready.store(true, Ordering::Release);
+        seed_recurring_registry(&state).await;
+        let app = test_app(state);
+
+        let (status, json) = get_recurring_registry(
+            app.clone(),
+            "/api/v1/recurring-tasks?agent_id=other",
+            Some("dashboard-token-secret"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["total"], 1);
+        assert_eq!(json["data"][0]["agent_id"], "other");
+
+        let (status, json) = get_recurring_registry(
+            app,
+            "/api/v1/recurring-tasks?page=2&per_page=1",
+            Some("dashboard-token-secret"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["total"], 2);
+        assert_eq!(json["page"], 2);
+        assert_eq!(json["per_page"], 1);
+        assert_eq!(json["data"].as_array().unwrap().len(), 1);
+        assert_eq!(json["data"][0]["label"], "rappel-medicaments");
     }
 
     #[tokio::test]
