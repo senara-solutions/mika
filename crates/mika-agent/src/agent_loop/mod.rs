@@ -21,9 +21,10 @@ use crate::async_db::AsyncDatabase;
 use crate::compaction;
 use crate::evidence::guards::{
     ASSERT_GROUNDED_LABEL, ASSERTED_UNAVAILABILITY_LABEL, DOCTRINE_PUBLIC_PROMO_LABEL,
-    EQUIVALENCE_CLAIM_LABEL, assert_grounded_satisfied, asserted_unavailability_satisfied,
-    detect_affirmative_state_claim, detect_asserted_unavailability, detect_doctrine_public_promo,
-    detect_equivalence_claim, detect_fabricated_action_claim,
+    EQUIVALENCE_CLAIM_LABEL, FALSE_LOCAL_HOSTING_LABEL, assert_grounded_satisfied,
+    asserted_unavailability_satisfied, detect_affirmative_state_claim,
+    detect_asserted_unavailability, detect_doctrine_public_promo, detect_equivalence_claim,
+    detect_fabricated_action_claim, detect_false_local_hosting_claim,
     detect_unverified_callback_state_claim, equivalence_claim_satisfied,
 };
 use crate::mcp::McpManager;
@@ -2057,6 +2058,122 @@ async fn run_loop(
                         continue;
                     }
 
+                    // mika#2290 — False local-hosting claim guard (5d).
+                    //
+                    // Immediately after 5c, whose form, retry budget and `guard.*`
+                    // telemetry it reuses: same fabrication family, one step more
+                    // self-referential. It fires when the outgoing text asserts that
+                    // THIS instance runs locally — or that the user's data never
+                    // leaves their machine — while the resolved deployment is not
+                    // `Local`.
+                    //
+                    // **This is the half that closes the p1, and it closes it without
+                    // the companion `mika-cloud` ticket.** A cloud tenant today carries
+                    // no `MIKA_DEPLOYMENT`, so it resolves `Unknown`, so it is not
+                    // `Local`, so the measured 2026-09-11 claim is refused from this
+                    // deploy onwards. The `cloud` signal, when it lands, improves the
+                    // *answer* (the Runtime hosting line); it was never needed for the
+                    // *refusal*. Per mika#1814 / M7, the prompt half alone does not
+                    // hold — nine measured recurrences under prompt enforcement.
+                    //
+                    // Applies uniformly across modes: a heartbeat that asserts local
+                    // hosting is exactly as false as a conversation-mode turn, and the
+                    // compacted history carries it into the next one. Not skipped by
+                    // `skip_remaining_guards` (#1178) — a successful PR review grants
+                    // no licence to make a false privacy claim, the same literal reason
+                    // as 5c.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !intent_guard_retries.contains(FALSE_LOCAL_HOSTING_LABEL)
+                        && let Some(hosting) =
+                            detect_false_local_hosting_claim(&text, tool_ctx.deployment)
+                    {
+                        intent_guard_retries.insert(FALSE_LOCAL_HOSTING_LABEL);
+                        let corr_id =
+                            format!("{}:{}:false_local_hosting_claim", tool_ctx.trace_id, step);
+                        guard_correlation = Some(GuardCorrelation {
+                            correlation_id: corr_id.clone(),
+                            guard_label: "false_local_hosting_claim",
+                            step,
+                        });
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
+                            deployment = ?tool_ctx.deployment,
+                            persona = ?tool_ctx.tier.persona_profile(),
+                            matched_subject = %hosting.subject,
+                            matched_assertion = %hosting.assertion,
+                            guard_correlation_id = %corr_id,
+                            label = mode.label(),
+                            event = "guard.false_local_hosting_claim",
+                            "False local-hosting claim guard fired — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        let correction = format!(
+                            "[mika-engine] Your response asserts that you run locally, \
+                             or that the user's data never leaves their machine \
+                             (matched: `{assertion}` … `{subject}`). That is a claim \
+                             about verifiable fact, and the ground truth for this \
+                             environment is `{deployment:?}` — NOT local. Rewrite your \
+                             response now, using the hosting line of the `## Runtime` \
+                             section of your system prompt. If hosting is `Cloud`, say \
+                             what is verifiable: the tenant is isolated, the user's \
+                             data is theirs and exportable, and the same open-source \
+                             stack is self-hostable locally if they prefer. If hosting \
+                             is `Unknown`, say plainly that you cannot reliably \
+                             determine where you run — do not guess, and do not fall \
+                             back on \"local\". Keep the rest of your answer; change \
+                             only the false claim.",
+                            assertion = hosting.assertion,
+                            subject = hosting.subject,
+                            deployment = tool_ctx.deployment,
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(correction),
+                        });
+                        continue;
+                    }
+
+                    // mika#2290 — the residue of 5d's single-retry budget, named.
+                    //
+                    // Once the label is in `intent_guard_retries` the guard above
+                    // cannot fire again, so a SECOND false privacy claim in the same
+                    // turn would go out silently and be indistinguishable from a
+                    // healthy turn. That is the blind spot the Fire-Disposition gate
+                    // (mika#1574) exists to close, so it gets its own event — the same
+                    // gesture 4b already makes for the milestone-close guard. It is not
+                    // a second correction: the family grants one re-prompt, and a guard
+                    // that diverged from its neighbours on that point would become the
+                    // one everybody re-reads to find out why.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && intent_guard_retries.contains(FALSE_LOCAL_HOSTING_LABEL)
+                        && let Some(hosting) =
+                            detect_false_local_hosting_claim(&text, tool_ctx.deployment)
+                    {
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
+                            deployment = ?tool_ctx.deployment,
+                            matched_subject = %hosting.subject,
+                            matched_assertion = %hosting.assertion,
+                            label = mode.label(),
+                            event = "guard.false_local_hosting_claim_uncorrected",
+                            "False local-hosting claim guard already fired this turn — \
+                             accepting EndTurn with second violation (budget exhausted)"
+                        );
+                    }
+
                     // Intent-precondition registry (#702): iterate INTENT_GUARDS
                     // and reject EndTurn once per entry when the trigger matches but
                     // the precondition is not satisfied.  Generalizes the former
@@ -3218,6 +3335,11 @@ pub struct AgentParams<'a> {
     /// Threaded from `AgentState.tier` — never re-read from the environment
     /// here, so a mid-runtime env change cannot flip a running agent's tier.
     pub tier: mika_common::home::AgentTier,
+    /// Where this agent runs (mika#2290), resolved once at agent init and
+    /// threaded from `AgentState.deployment`. Same never-re-read-per-turn
+    /// contract as `tier`, and for the same reason: the fact is posed by the
+    /// provisioner before startup, not discovered at runtime.
+    pub deployment: mika_common::home::Deployment,
     pub db: &'a AsyncDatabase,
     pub llm: &'a dyn LlmProvider,
     pub tools: &'a ToolRegistry,
@@ -3490,6 +3612,10 @@ async fn run_agent_inner(
         stopped_topics: &ctx.stopped_topics,
         runtime_provider,
         runtime_model,
+        deployment: params.deployment,
+        // mika#2290 — the register of the hosting line follows the persona axis
+        // of the cached tier, never the hosting axis and never the locale.
+        persona_profile: params.tier.persona_profile(),
     };
     let is_compact_provider = llm.provider_name() == ProviderKind::MikaModel.config_prefix();
     let mut system = if is_compact_provider {
@@ -3772,6 +3898,7 @@ async fn run_agent_inner(
         required_tool_arg_suffixes: &required_tool_arg_suffixes,
         tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
         tier: params.tier,
+        deployment: params.deployment,
         scope_task_id,
     };
 
@@ -4228,6 +4355,11 @@ pub struct SilentAgentParams<'a> {
     /// Threaded from `AgentState.tier` — never re-read from the environment
     /// here, so a mid-runtime env change cannot flip a running agent's tier.
     pub tier: mika_common::home::AgentTier,
+    /// Where this agent runs (mika#2290), resolved once at agent init and
+    /// threaded from `AgentState.deployment`. Same never-re-read-per-turn
+    /// contract as `tier`, and for the same reason: the fact is posed by the
+    /// provisioner before startup, not discovered at runtime.
+    pub deployment: mika_common::home::Deployment,
     pub db: &'a AsyncDatabase,
     pub llm: &'a dyn LlmProvider,
     pub tools: &'a ToolRegistry,
@@ -4516,6 +4648,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         stopped_topics: &ctx.stopped_topics,
         runtime_provider: silent_runtime_provider,
         runtime_model: silent_runtime_model,
+        deployment: params.deployment,
+        persona_profile: params.tier.persona_profile(),
     };
     let mut system = prompt::build_silent_prompt(&silent_ctx);
 
@@ -4735,6 +4869,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         required_tool_arg_suffixes: &required_tool_arg_suffixes_silent,
         tool_arg_suffix_rejected: &tool_arg_suffix_rejected_silent,
         tier: params.tier,
+        deployment: params.deployment,
         scope_task_id: scope_task_id.as_deref(),
     };
 
@@ -4995,6 +5130,11 @@ pub struct TeamAgentParams<'a> {
     /// Threaded from `AgentState.tier` — never re-read from the environment
     /// here, so a mid-runtime env change cannot flip a running agent's tier.
     pub tier: mika_common::home::AgentTier,
+    /// Where this agent runs (mika#2290), resolved once at agent init and
+    /// threaded from `AgentState.deployment`. Same never-re-read-per-turn
+    /// contract as `tier`, and for the same reason: the fact is posed by the
+    /// provisioner before startup, not discovered at runtime.
+    pub deployment: mika_common::home::Deployment,
     pub db: &'a AsyncDatabase,
     pub llm: &'a dyn LlmProvider,
     pub tools: &'a ToolRegistry,
@@ -5148,6 +5288,8 @@ async fn run_team_agent_inner_impl(
         stopped_topics: &ctx.stopped_topics,
         runtime_provider: team_runtime_provider,
         runtime_model: team_runtime_model,
+        deployment: params.deployment,
+        persona_profile: params.tier.persona_profile(),
     };
     let is_compact_provider = llm.provider_name() == ProviderKind::MikaModel.config_prefix();
     let mut system = if is_compact_provider {
@@ -5310,6 +5452,7 @@ async fn run_team_agent_inner_impl(
         required_tool_arg_suffixes: &required_tool_arg_suffixes_team,
         tool_arg_suffix_rejected: &tool_arg_suffix_rejected_team,
         tier: params.tier,
+        deployment: params.deployment,
         scope_task_id: None, // Team mode: no task context for parallel narrative
     };
 

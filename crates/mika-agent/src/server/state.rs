@@ -92,6 +92,13 @@ pub struct AgentState {
     /// Setting `MIKA_AGENT_TIER` on an already-running process has no effect
     /// by design. Deploy discipline is to set it before first startup.
     pub tier: mika_common::home::AgentTier,
+    /// Deployment resolved ONCE at `init_agent` time from `MIKA_DEPLOYMENT`
+    /// (mika#2290). Same contract and same reason as `tier` above: the hosting
+    /// mode is a fact the provisioner poses before the first startup, so
+    /// re-reading it per turn would buy nothing and would let a mid-runtime env
+    /// change flip a running agent's privacy answer. Threaded to every
+    /// `ToolContext` and to both prompt builders.
+    pub deployment: mika_common::home::Deployment,
     /// Canonical session ID for singleton agents (mika#1401). `Some` when the
     /// agent's `identity.toml` sets `[session] singleton = true` — the `/send`
     /// handler then reuses this one session instead of minting a UUID per message.

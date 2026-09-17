@@ -1,6 +1,7 @@
 use crate::db::{
     Commitment, CoreMemoryEntry, Preference, TaskHealthSummary, core_memory_section_names,
 };
+use mika_common::home::{Deployment, PersonaProfile};
 
 /// Preference-key prefix used for user stop-signals (mika#1813).
 ///
@@ -888,6 +889,17 @@ pub struct PromptContext<'a> {
     /// See `runtime_provider` for the ground-truth contract. Consumed by
     /// `write_runtime_section`. See mika#1815.
     pub runtime_model: &'a str,
+    /// Where this instance runs (mika#2290) — ground truth for "where do you
+    /// run / where does my data live", the sibling question of mika#1815's
+    /// "which model are you". Resolved once at `server::init_agent` and cached
+    /// on `AgentState`; never read from the environment here, so a mid-runtime
+    /// env change cannot flip a running agent's hosting claim.
+    pub deployment: Deployment,
+    /// Persona register of the hosting line (mika#2290). Derived from the
+    /// agent's cached tier, not from the deployment: a family or champion tenant
+    /// gets the same fact without infrastructure vocabulary, because
+    /// `FAMILY_SOUL` forbids it. See `hosting_ground_truth_line`.
+    pub persona_profile: PersonaProfile,
 }
 
 fn onboarding_prompt() -> String {
@@ -936,7 +948,13 @@ fn write_identity_section(prompt: &mut String, identity: &Identity) {
 /// "which model / LLM are you?" questions. The Self-Identity Discipline
 /// section directs the agent to quote this section verbatim (rule 1) and
 /// forbids inferring the model from commented-out config lines or defaults.
-fn write_runtime_section(prompt: &mut String, provider: &str, model: &str) {
+fn write_runtime_section(
+    prompt: &mut String,
+    provider: &str,
+    model: &str,
+    deployment: Deployment,
+    persona: PersonaProfile,
+) {
     prompt.push_str("## Runtime\n");
     writeln!(
         prompt,
@@ -946,8 +964,65 @@ fn write_runtime_section(prompt: &mut String, provider: &str, model: &str) {
     prompt.push_str(
         "This is the ground truth for questions about your own LLM/model. \
          Do NOT infer your model from commented-out config lines, defaults, or \"probably\" reasoning. \
-         If a user asks which model you use, quote this line verbatim.\n\n",
+         If a user asks which model you use, quote this line verbatim.\n",
     );
+    prompt.push_str(hosting_ground_truth_line(deployment, persona));
+    prompt.push('\n');
+}
+
+/// The hosting half of the `## Runtime` ground truth (mika#2290).
+///
+/// Two axes, and the crossing is a `match` with no `_ =>` arm on purpose — the
+/// model of `dispatch_substrate_diagnostic` (`tools/mod.rs`): the compiler, not
+/// a reviewer, is what forces a new persona or a new deployment state to make a
+/// decision instead of inheriting one nobody took for it.
+///
+/// **Why the register follows the persona axis and not the hosting axis.**
+/// `FAMILY_SOUL` forbids "toute mention … de l'infrastructure sous-jacente —
+/// jamais, même si on te le demande". The cloud truth the ticket prescribes
+/// (per-tenant isolation, exportable data, self-hostable MIT stack) *is*
+/// infrastructure. Serving it verbatim to a family or champion tenant would
+/// break the persona Vincent approved; serving nothing would leave the same void
+/// that produced the false claim. So the same fact is written twice, and the
+/// family register says it without a single technical term. No rule is derived
+/// from the account locale or from the tenant — Prime's 2026-09-09 ruling,
+/// carried over from mika#2023.
+fn hosting_ground_truth_line(deployment: Deployment, persona: PersonaProfile) -> &'static str {
+    match (persona, deployment) {
+        (PersonaProfile::Operator, Deployment::Local) => {
+            "You are running **on the user's own machine** (local install): the agent \
+             process and the SQLite database live on that machine.\n"
+        }
+        (PersonaProfile::Operator, Deployment::Cloud) => {
+            "You are running **in the cloud**, in an isolated per-tenant container — \
+             NOT on the user's machine. When asked about privacy, say what is \
+             verifiable: the tenant is isolated, the user's data belongs to the user \
+             and is exportable, and the same open-source (MIT) stack can be \
+             self-hosted locally if they prefer. Never claim local hosting.\n"
+        }
+        (PersonaProfile::Operator, Deployment::Unknown) => {
+            "**Your hosting mode is not declared in this environment.** You do not \
+             know whether you run on the user's machine or in the cloud. Say so \
+             plainly if asked — do not guess, and do not default to \"local\".\n"
+        }
+        // Family register: the same fact, no infrastructure vocabulary. "Server"
+        // is the one concrete noun, and it is the word the ticket's own approved
+        // formulation uses.
+        (PersonaProfile::Family, Deployment::Local) => {
+            "You run on the person's own machine. What they tell you stays there. \
+             Say it simply, in everyday words.\n"
+        }
+        (PersonaProfile::Family, Deployment::Cloud) => {
+            "You run on a server, not on the person's phone or computer. What they \
+             tell you belongs to them, and they can get it back whenever they want. \
+             Say it in everyday words, with no technical detail — and never tell \
+             them everything stays on their machine, because it does not.\n"
+        }
+        (PersonaProfile::Family, Deployment::Unknown) => {
+            "You do not know where you run. If the person asks, say so simply — \
+             never say that everything stays on their machine.\n"
+        }
+    }
 }
 
 /// Write the self-identity discipline section (mika#1815).
@@ -960,8 +1035,9 @@ fn write_self_identity_discipline_section(prompt: &mut String) {
     prompt.push_str("## Self-Identity Discipline\n");
     prompt.push_str(
         "When a user asks about YOU — which model you are, which provider powers you, \
-         your configuration, your capabilities — the ground truth is the `## Runtime` \
-         section above, populated from your live LLM instance. Follow these rules:\n\n",
+         WHERE you run and where their data lives, your configuration, your capabilities \
+         — the ground truth is the `## Runtime` section above, populated from your live \
+         LLM instance and from this environment's declared hosting. Follow these rules:\n\n",
     );
     prompt.push_str(
         "1. **Quote, don't infer.** For \"which model / LLM are you?\" quote the Runtime \
@@ -985,6 +1061,17 @@ fn write_self_identity_discipline_section(prompt: &mut String) {
          with certainty\" and then in the next paragraph assert a model with \
          confidence. Uncertainty at t=0 and confidence at t=1 within the same \
          response is confabulation.\n\n",
+    );
+    prompt.push_str(
+        "5. **Where you run is ground truth too.** \"Where do you run?\", \"where does \
+         my data live?\", \"is this local?\", \"do my data leave my machine?\" are \
+         self-identity questions, exactly like \"which model are you?\". The hosting \
+         line of the `## Runtime` section above is the ground truth. NEVER assert that \
+         you run locally, or that the user's data never leaves their machine, unless \
+         that line says your hosting is local. If it says your hosting mode is not \
+         declared, rule 3 applies — say you cannot reliably determine where you run. \
+         \"Local\" is not a safe default: on a cloud tenant it is a false privacy \
+         claim.\n\n",
     );
     prompt.push_str(
         "This applies self-referentially: the anti-fabrication virtue you extend to \
@@ -1142,7 +1229,16 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     // Runtime ground truth (mika#1815) — placed between Identity and Current Time
     // so the "who am I / what am I running on" block reads coherently. The
     // Self-Identity Discipline section below quotes this data as ground truth.
-    write_runtime_section(&mut prompt, ctx.runtime_provider, ctx.runtime_model);
+    // mika#2290 extends "what am I running on" to "where am I running": the
+    // block was already the right home for it, already declared ground truth,
+    // and already ahead of Time/Channel/core-memory.
+    write_runtime_section(
+        &mut prompt,
+        ctx.runtime_provider,
+        ctx.runtime_model,
+        ctx.deployment,
+        ctx.persona_profile,
+    );
     write_self_identity_discipline_section(&mut prompt);
     // mika#1798: non-transit doctrine — rendered BEFORE time / channel /
     // core-memory / instructions so it grounds every downstream section.
@@ -1538,6 +1634,15 @@ pub fn build_compact_system_prompt(ctx: &PromptContext<'_>) -> String {
     // budget cannot afford the full Self-Identity Discipline block, but the
     // ground-truth line itself is ~50 bytes and pays for itself the first time
     // a user asks "which model?" — quoting the line beats confabulating.
+    //
+    // mika#2290 carve-out, aligned with the mika#1814 / mika#1925 ones above:
+    // the hosting line is deliberately NOT rendered here. What that carve-out
+    // costs is bounded and worth saying — it withholds the *intent* half from
+    // this path, never the protection: the 5d guard reads outgoing text, not the
+    // prompt, so a MikaModel turn that asserts local hosting on a non-local
+    // deployment is refused exactly like any other. Pinned by
+    // `mika2290_compact_prompt_omits_the_hosting_line` as a decision, not an
+    // oversight; joined to the mika#1925 follow-up.
     prompt.push_str("## Runtime\n");
     writeln!(
         prompt,
@@ -1589,6 +1694,14 @@ pub struct SilentPromptContext<'a> {
     pub runtime_provider: &'a str,
     /// Runtime LLM model name (mika#1815) — companion to `runtime_provider`.
     pub runtime_model: &'a str,
+    /// Where this instance runs (mika#2290). Silent turns render the hosting
+    /// line too: a heartbeat that asserts "local" on a cloud tenant is exactly
+    /// as false as a conversation-mode one, and the compacted history the next
+    /// conversational turn inherits carries it forward.
+    pub deployment: Deployment,
+    /// Persona register of the hosting line (mika#2290). See
+    /// `PromptContext::persona_profile`.
+    pub persona_profile: PersonaProfile,
 }
 
 /// Sanitize a label for prompt injection prevention: truncate to 200 chars, strip angle brackets
@@ -1628,8 +1741,14 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
     // may still be asked "which model are you?" via a subsequent user message
     // or in the compacted history the next conversation-mode turn inherits.
     // Same section shape as `build_system_prompt` so downstream discipline is
-    // uniform.
-    write_runtime_section(&mut prompt, ctx.runtime_provider, ctx.runtime_model);
+    // uniform — hosting line included (mika#2290).
+    write_runtime_section(
+        &mut prompt,
+        ctx.runtime_provider,
+        ctx.runtime_model,
+        ctx.deployment,
+        ctx.persona_profile,
+    );
     write_self_identity_discipline_section(&mut prompt);
     // mika#1798: non-transit doctrine — rendered on silent turns too so the
     // model consults it before any autonomous send_message on testimony-grade
@@ -1940,6 +2059,8 @@ emoji = "✦"
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2018,6 +2139,8 @@ emoji = "✦"
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2056,6 +2179,8 @@ emoji = "✦"
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2080,6 +2205,8 @@ emoji = "✦"
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2105,6 +2232,8 @@ emoji = "✦"
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2276,6 +2405,8 @@ emoji = "✦"
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2321,6 +2452,8 @@ emoji = "✦"
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
         let prompt = build_system_prompt(&ctx);
 
@@ -2366,6 +2499,8 @@ emoji = "✦"
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
         let prompt = build_silent_prompt(&ctx);
 
@@ -2398,6 +2533,8 @@ emoji = "✦"
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
         let prompt = build_compact_system_prompt(&ctx);
 
@@ -2446,6 +2583,8 @@ emoji = "✦"
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
         let prompt = build_system_prompt(&ctx);
 
@@ -2491,6 +2630,8 @@ emoji = "✦"
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -2521,6 +2662,8 @@ emoji = "✦"
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -2559,6 +2702,8 @@ emoji = "✦"
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -2584,6 +2729,8 @@ emoji = "✦"
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2611,6 +2758,8 @@ emoji = "✦"
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2636,6 +2785,8 @@ emoji = "✦"
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2673,6 +2824,8 @@ emoji = "✦"
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2711,6 +2864,8 @@ emoji = "✦"
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -2740,6 +2895,8 @@ emoji = "✦"
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -2792,6 +2949,8 @@ max_iterations = 3
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2839,6 +2998,8 @@ max_iterations = 3
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2873,6 +3034,8 @@ max_iterations = 3
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2898,6 +3061,8 @@ max_iterations = 3
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2922,6 +3087,8 @@ max_iterations = 3
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2946,6 +3113,8 @@ max_iterations = 3
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2972,6 +3141,8 @@ max_iterations = 3
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2998,6 +3169,8 @@ max_iterations = 3
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3022,6 +3195,8 @@ max_iterations = 3
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3053,6 +3228,8 @@ max_iterations = 3
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3083,6 +3260,8 @@ max_iterations = 3
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -3110,6 +3289,8 @@ max_iterations = 3
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -3137,6 +3318,8 @@ max_iterations = 3
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -3307,6 +3490,8 @@ enabled = true
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -3337,6 +3522,8 @@ enabled = true
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -3411,6 +3598,8 @@ enabled = true
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -3446,6 +3635,8 @@ enabled = true
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -3479,6 +3670,8 @@ enabled = true
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -3542,6 +3735,8 @@ enabled = true
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("store_fact(category=\"person\")"));
@@ -3565,6 +3760,8 @@ enabled = true
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("## Callback Result Turn"));
@@ -3589,6 +3786,8 @@ enabled = true
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
         let prompt = build_system_prompt(&ctx);
         assert!(!prompt.contains("## Callback Result Turn"));
@@ -3612,6 +3811,8 @@ enabled = true
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3637,6 +3838,8 @@ enabled = true
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3662,6 +3865,8 @@ enabled = true
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3687,6 +3892,8 @@ enabled = true
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3714,6 +3921,8 @@ enabled = true
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3747,6 +3956,8 @@ enabled = true
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -4163,6 +4374,8 @@ inject = false
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_compact_system_prompt(&ctx);
@@ -4223,6 +4436,8 @@ inject = false
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
 
         let prompt = build_compact_system_prompt(&ctx);
@@ -4293,6 +4508,8 @@ inject = false
             stopped_topics: &stops,
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
         let prompt = build_silent_prompt(&ctx);
         assert!(
@@ -4335,6 +4552,8 @@ inject = false
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
         let prompt = build_silent_prompt(&ctx);
         // Check for block-unique prose (silent-mode block description) — the
@@ -4380,6 +4599,8 @@ inject = false
             stopped_topics: &stops,
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
         let prompt = build_silent_prompt(&ctx);
         // The literal `<script>` fragment inside the category value must be
@@ -4417,6 +4638,8 @@ inject = false
             stopped_topics: &stops,
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
         let prompt = build_system_prompt(&ctx);
         assert!(
@@ -4445,6 +4668,8 @@ inject = false
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
         let prompt = build_system_prompt(&ctx);
         // The "Respect stop signals (consult)" rule mentions `## Stopped
@@ -4479,6 +4704,8 @@ inject = false
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
         let prompt = build_system_prompt(&ctx);
         assert!(
@@ -4521,6 +4748,8 @@ inject = false
             stopped_topics: &[],
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("Respect stop signals (consult)"));
@@ -4560,6 +4789,8 @@ inject = false
             stopped_topics: &stops,
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
         let prompt = build_silent_prompt(&ctx);
         // AC1 (state): the specific stopped topic Al refused is present.
@@ -4622,6 +4853,8 @@ inject = false
             stopped_topics: &stops,
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
         let prompt = build_silent_prompt(&ctx);
         // Both blocks present.
@@ -4727,6 +4960,8 @@ inject = false
             stopped_topics: &stops,
             runtime_provider: "test-provider",
             runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
         let prompt = build_compact_system_prompt(&ctx);
         assert!(
@@ -4750,6 +4985,254 @@ inject = false
     // failure (Al testeur, 2026-07-20). Each is written to fail if the
     // ground-truth channel drifts from what the tool + prompt promise.
 
+    // -- mika#2290: the hosting fact is posed in `## Runtime` --
+
+    /// Build a conversation-mode context for the mika#2290 prompt assertions.
+    /// Both axes are parameters: the whole point of Décision 4 is that the two
+    /// vary independently.
+    fn hosting_ctx<'a>(
+        identity: &'a Identity,
+        memory: &'a [CoreMemoryEntry],
+        deployment: Deployment,
+        persona_profile: PersonaProfile,
+    ) -> PromptContext<'a> {
+        PromptContext {
+            soul_content: "",
+            identity,
+            core_memory: memory,
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+            stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
+            deployment,
+            persona_profile,
+        }
+    }
+
+    /// AC2 — the three states render three **distinct** lines in `## Runtime`,
+    /// on both prompt builders that carry the full block.
+    ///
+    /// Asserting distinctness rather than three literals is what makes the test
+    /// resistant to the failure it exists to catch: a `match` that fell through
+    /// to one arm would still contain every substring a per-state `contains`
+    /// assertion looked for.
+    #[test]
+    fn mika2290_runtime_section_renders_one_line_per_deployment_state() {
+        let identity = test_identity();
+        let memory = test_core_memory();
+
+        for persona in [PersonaProfile::Operator, PersonaProfile::Family] {
+            let mut rendered = Vec::new();
+            for deployment in [Deployment::Local, Deployment::Cloud, Deployment::Unknown] {
+                let ctx = hosting_ctx(&identity, &memory, deployment, persona);
+                let prompt = build_system_prompt(&ctx);
+                let runtime_pos = prompt
+                    .find("## Runtime")
+                    .expect("Runtime section must be present");
+                let next_heading = prompt[runtime_pos + 2..]
+                    .find("\n## ")
+                    .map(|i| runtime_pos + 2 + i)
+                    .unwrap_or(prompt.len());
+                rendered.push(prompt[runtime_pos..next_heading].to_string());
+            }
+            assert_eq!(rendered.len(), 3);
+            for (a, b) in [(0, 1), (0, 2), (1, 2)] {
+                assert_ne!(
+                    rendered[a], rendered[b],
+                    "{persona:?}: two deployment states rendered the same \
+                     `## Runtime` block — the hosting match fell through"
+                );
+            }
+        }
+    }
+
+    /// AC2 — `Unknown` says it does not know, and `Local` is not its fallback.
+    /// The negative control rides in the same test, per the discipline this
+    /// family inherited from mika#2023.
+    #[test]
+    fn mika2290_unknown_state_asserts_nothing_and_never_defaults_to_local() {
+        let identity = test_identity();
+        let memory = test_core_memory();
+        let ctx = hosting_ctx(
+            &identity,
+            &memory,
+            Deployment::Unknown,
+            PersonaProfile::Operator,
+        );
+        let prompt = build_system_prompt(&ctx);
+
+        assert!(
+            prompt.contains("not declared in this environment"),
+            "the Unknown line must say the hosting mode is undeclared"
+        );
+        assert!(
+            prompt.contains("do not default to \"local\""),
+            "the Unknown line must forbid falling back on \"local\""
+        );
+        // Control: the declared-local wording must NOT be present.
+        assert!(
+            !prompt.contains("on the user's own machine"),
+            "an undeclared deployment must not carry the local-install wording"
+        );
+    }
+
+    /// AC2 — `## Self-Identity Discipline` names hosting as ground truth.
+    /// Without this, rule 3 (*fallback honestly*) was already written word for
+    /// word for the `Unknown` case and simply did not apply to the question —
+    /// which is the hole mika#2290 M3 measured to the byte.
+    #[test]
+    fn mika2290_self_identity_discipline_covers_where_you_run() {
+        let identity = test_identity();
+        let memory = test_core_memory();
+        let ctx = hosting_ctx(
+            &identity,
+            &memory,
+            Deployment::Cloud,
+            PersonaProfile::Operator,
+        );
+        let prompt = build_system_prompt(&ctx);
+
+        assert!(
+            prompt.contains("WHERE you run and where their data lives"),
+            "the discipline preamble must include the hosting question in its scope"
+        );
+        assert!(
+            prompt.contains("Where you run is ground truth too"),
+            "rule 5 must be present"
+        );
+        assert!(
+            prompt.contains("\"Local\" is not a safe default"),
+            "rule 5 must forbid the \"local\" default explicitly"
+        );
+    }
+
+    /// AC5 — the `Cloud` line served under the family persona tells the truth
+    /// **without** any of the vocabulary `FAMILY_SOUL` forbids ("aucun jargon
+    /// technique ni mention de tickets, GitHub, agents …, skills, ou de
+    /// l'infrastructure sous-jacente — jamais, même si on te le demande").
+    ///
+    /// The forbidden list is checked in both languages: the persona answers in
+    /// French but the prompt is written in English, so a FR-only check would
+    /// pass over an English "container" without noticing.
+    #[test]
+    fn mika2290_family_cloud_line_carries_no_infrastructure_jargon() {
+        let line = hosting_ground_truth_line(Deployment::Cloud, PersonaProfile::Family);
+        let lowered = line.to_lowercase();
+
+        for forbidden in [
+            "container",
+            "conteneur",
+            "tenant",
+            "github",
+            "ticket",
+            "skill",
+            "agent",
+            "sqlite",
+            "open-source",
+            "mit",
+            "stack",
+            "self-host",
+            "infrastructure",
+        ] {
+            assert!(
+                !lowered.contains(forbidden),
+                "the family Cloud line must not carry `{forbidden}`: {line}"
+            );
+        }
+
+        // Control: it still says the true thing, rather than saying nothing.
+        assert!(
+            lowered.contains("server") && lowered.contains("belongs to them"),
+            "the family Cloud line must still carry the verifiable truth: {line}"
+        );
+
+        // Control: the operator line, by contrast, IS allowed the vocabulary —
+        // otherwise this test would pass on a line that simply said nothing.
+        let operator =
+            hosting_ground_truth_line(Deployment::Cloud, PersonaProfile::Operator).to_lowercase();
+        assert!(
+            operator.contains("container") && operator.contains("self-hosted"),
+            "the operator Cloud line must carry the full prescribed remedy"
+        );
+    }
+
+    /// AC2 — the compact (MikaModel) path deliberately omits the hosting line.
+    /// Pinned as a **decision**: the ≤5 KB budget cannot afford it, and the 5d
+    /// guard covers that path anyway because it reads outgoing text, not the
+    /// prompt. Joined to the mika#1925 follow-up.
+    #[test]
+    fn mika2290_compact_prompt_omits_the_hosting_line() {
+        let identity = test_identity();
+        let memory = test_core_memory();
+        let ctx = hosting_ctx(
+            &identity,
+            &memory,
+            Deployment::Cloud,
+            PersonaProfile::Operator,
+        );
+        let compact = build_compact_system_prompt(&ctx);
+
+        assert!(
+            compact.contains("## Runtime"),
+            "control: the compact prompt still carries the model ground truth"
+        );
+        assert!(
+            !compact.contains("isolated per-tenant container"),
+            "the compact carve-out must not render the hosting line"
+        );
+        assert!(
+            compact.len() <= 5 * 1024,
+            "the carve-out exists for the ≤5 KB budget; compact prompt is {} bytes",
+            compact.len()
+        );
+    }
+
+    /// AC2 — silent turns carry the hosting line too. A heartbeat that asserts
+    /// local hosting on a cloud tenant is exactly as false, and the compacted
+    /// history hands it to the next conversational turn.
+    #[test]
+    fn mika2290_silent_prompt_carries_the_hosting_line() {
+        let identity = test_identity();
+        let ctx = SilentPromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            pending_commitments: &[],
+            trigger_context: "heartbeat",
+            current_utc: test_time(),
+            timezone: None,
+            telegram_configured: false,
+            has_message_sender: true,
+            recent_conversations: None,
+            recent_audit_events: None,
+            home_dir: None,
+            task_health: None,
+            stored_preferences: &[],
+            stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
+            deployment: Deployment::Cloud,
+            persona_profile: PersonaProfile::Operator,
+        };
+        let prompt = build_silent_prompt(&ctx);
+
+        assert!(
+            prompt.contains("isolated per-tenant container"),
+            "the silent prompt must render the hosting line"
+        );
+        assert!(
+            prompt.contains("Where you run is ground truth too"),
+            "the silent prompt must render rule 5"
+        );
+    }
+
     #[test]
     fn mika1815_runtime_section_carries_ground_truth_from_context() {
         let identity = test_identity();
@@ -4769,6 +5252,8 @@ inject = false
             stopped_topics: &[],
             runtime_provider: "zai",
             runtime_model: "glm-5.2",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
         let prompt = build_system_prompt(&ctx);
         assert!(
@@ -4813,6 +5298,8 @@ inject = false
             stopped_topics: &[],
             runtime_provider: "anthropic",
             runtime_model: "claude-sonnet-4-6",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
         let prompt = build_system_prompt(&ctx);
         let runtime_pos = prompt
@@ -4869,6 +5356,8 @@ inject = false
             stopped_topics: &[],
             runtime_provider: "mikamodel",
             runtime_model: "wizzard-v1",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
         let prompt = build_compact_system_prompt(&ctx);
         assert!(
@@ -4914,6 +5403,8 @@ inject = false
             stopped_topics: &[],
             runtime_provider: "zai",
             runtime_model: "glm-5.2",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
         };
         let prompt = build_silent_prompt(&ctx);
         // Silent mode carries the same ground-truth block as conversation

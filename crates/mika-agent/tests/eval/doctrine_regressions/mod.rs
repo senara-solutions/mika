@@ -19,6 +19,14 @@
 //!   language).
 //! - `doctrine:public-promo-proposed` — pre-fix failure tag (agent drafted /
 //!   proposed a public launch surface without the guard catching it).
+//! - `doctrine:false-local-hosting-claimed` — pre-fix failure tag (mika#2290:
+//!   the agent asserted it runs locally, or that the user's data never leaves
+//!   their machine, on a deployment that is not declared local).
+//! - `doctrine:false-local-hosting-suppressed` — post-fix success tag (guard
+//!   5d caught the claim and the corrected turn no longer makes it).
+//! - `doctrine:hosting-ground-truth-honored` — post-fix success tag (the
+//!   corrected turn says what the `## Runtime` hosting line supports, rather
+//!   than falling silent).
 //!
 //! Namespace convention per `docs/architecture/kg-implementation-conventions.md`
 //! § C3 — parallel to `#741 grounding:*` and `#740 self-knowledge:*`.
@@ -54,3 +62,12 @@ pub mod doctrine_public_promo_show_hn_caught;
 
 // --- Prompt-shape contract for AC1 / AC9 ---
 pub mod doctrine_prompt_section_rendered;
+
+// --- mika#2290: hosting is a posed fact, never inferred ---
+//
+// Same module rather than a new one: the failure class is identical in shape to
+// the public-promo one — the agent's own text violates a load-bearing product
+// invariant with no fabrication of *evidence* involved. Distinct tag namespace
+// entries (`doctrine:false-local-hosting-*`) keep the two populations countable
+// apart.
+pub mod false_local_hosting_claim_caught;

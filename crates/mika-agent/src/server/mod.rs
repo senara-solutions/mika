@@ -542,10 +542,16 @@ async fn init_agent(
     // this cached value instead, so a mid-runtime env change cannot flip the
     // tier of an already-running agent.
     let tier = mika_common::home::AgentTier::from_env();
+    // mika#2290 — the single authorized `Deployment::from_env()` read, on the
+    // same trajectory and for the same reason. `grep -rn 'Deployment::from_env()'
+    // crates/mika-agent/src/` must return no production hit outside this site
+    // (AC7); a hit elsewhere means a per-turn consumer stopped reading the cache.
+    let deployment = mika_common::home::Deployment::from_env();
 
     let dispatcher = Arc::new(TaskDispatcher {
         db: async_db.clone(),
         tier,
+        deployment,
         llm: agent_llm.clone(),
         tools: tool_registry.clone(),
         skills: skill_registry.clone(),
@@ -611,6 +617,7 @@ async fn init_agent(
     let agent_state = AgentState {
         db: async_db,
         tier,
+        deployment,
         skills: std::sync::Mutex::new(skill_registry),
         skills_dirty,
         skill_nudge: Arc::new(crate::agent_loop::skill_nudge::SkillNudgeState::default()),
@@ -1837,6 +1844,7 @@ mod tests {
         let llm = mika_common::llm::dummy_provider();
         let dispatcher = Arc::new(TaskDispatcher {
             tier: mika_common::home::AgentTier::Default,
+            deployment: mika_common::home::Deployment::Unknown,
             db: db.clone(),
             llm,
             tools: Arc::new(tools::default_tools()),
@@ -1906,6 +1914,62 @@ mod tests {
         );
     }
 
+    /// mika#2290 AC7 — the hosting fact is resolved **once**, at `init_agent`,
+    /// and nowhere else in this crate.
+    ///
+    /// A source scan rather than a behavioural test, and for the reason that
+    /// class of guard always exists: a second `Deployment::from_env()` added in
+    /// `agent_loop/`, `teams/` or `task_engine/` would make no assertion fail.
+    /// The loop would keep working, every existing test would stay green, and
+    /// the only thing lost would be the mika#1962 property that a running
+    /// agent's answer cannot be flipped by a mid-runtime ConfigMap edit.
+    ///
+    /// **No allowlist, deliberately** (Fire-Disposition D4): the population is
+    /// empty at birth, and an allowlist born empty is a place to put the next
+    /// violation. If a second production reader ever becomes genuinely
+    /// necessary, the disposition is halt-and-surface — "does this need a second
+    /// environment reader" is exactly the question mika#1962 settled once, and a
+    /// line added to a list would make the answer invisible.
+    #[test]
+    fn mika2290_deployment_is_resolved_at_exactly_one_production_site() {
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let needle = "Deployment::from_env()";
+        let mut hits: Vec<String> = Vec::new();
+
+        fn walk(dir: &std::path::Path, needle: &str, hits: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).expect("src tree must be readable") {
+                let path = entry.expect("dir entry must be readable").path();
+                if path.is_dir() {
+                    walk(&path, needle, hits);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let src = std::fs::read_to_string(&path).expect("source must be readable");
+                    for (idx, line) in src.lines().enumerate() {
+                        if line.contains(needle) {
+                            hits.push(format!("{}:{}", path.display(), idx + 1));
+                        }
+                    }
+                }
+            }
+        }
+        walk(&src_root, needle, &mut hits);
+
+        let offenders: Vec<&String> = hits
+            .iter()
+            .filter(|h| !h.contains("server/mod.rs"))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "mika#2290 AC7: `Deployment::from_env()` must be read only at the \
+             `server::init_agent` resolution site; found {offenders:?}. Thread \
+             `AgentState.deployment` through the params structs instead — see \
+             mika#1962 for why a per-turn read is the defect, not the fix."
+        );
+        assert!(
+            !hits.is_empty(),
+            "the guard must actually find the resolution site, or it is vacuous"
+        );
+    }
+
     /// Build a test `AppState` whose single "mika" agent carries the given
     /// per-agent `Settings`. Lets tests flip the mika#1870 webhook-queue
     /// kill-switch (`webhook_queue_enabled = Some(false)`) to exercise the legacy
@@ -1932,6 +1996,7 @@ mod tests {
 
         let agent_state = AgentState {
             tier,
+            deployment: mika_common::home::Deployment::Unknown,
             db,
             skills: std::sync::Mutex::new(skills_reg),
             skills_dirty,

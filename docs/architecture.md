@@ -10,14 +10,28 @@ description: System architecture, memory model, agent loop, and component design
 Mika is a conversation-first AI executive assistant built in Rust. It operates in two
 modes:
 
-- **CLI mode (embedded):** The `mika` binary runs locally. User input flows through a
-  ratatui TUI, the agent loop runs in-process, and SQLite stores all data on the local
-  filesystem. No network services are required beyond the Claude API.
+- **CLI mode (embedded):** In CLI mode the `mika` binary runs on the user's own
+  machine. User input flows through a ratatui TUI, the agent loop runs in-process, and
+  SQLite stores that installation's data on that machine's local filesystem. No network
+  services are required beyond the Claude API. **This paragraph describes CLI mode only
+  — it is not a statement about where Mika runs in general** (mika#2290: this document
+  is embedded in the agent binary and served verbatim by `get_documentation`, so a
+  locality claim whose condition lives in the bullet's title does not survive being
+  quoted).
 
-- **Hosted mode (per-customer containers):** Each customer gets their own
-  agent container running `mika-spirit` (Axum HTTP), with an isolated SQLite database
-  on a persistent volume. A shared gateway (`crates/mika-gateway/` in this repo)
-  routes messages from Telegram to the correct container.
+- **Hosted mode (per-customer containers):** In hosted mode, Mika runs in the cloud,
+  not on the user's machine. Each customer gets their own agent container running
+  `mika-spirit` (Axum HTTP), with an isolated SQLite database on a persistent volume
+  that lives on the hosting infrastructure. The customer's data is theirs and is
+  exportable, and the same open-source (MIT) stack can be self-hosted locally by anyone
+  who prefers CLI mode. A shared gateway (`crates/mika-gateway/` in this repo) routes
+  messages from Telegram to the correct container.
+
+Which of the two a given instance is running in is a **posed fact, never inferred**:
+`MIKA_DEPLOYMENT` (`local` / `cloud`) is set by the provisioner before first startup
+and read once per process. Absent, it resolves to `Unknown` and the agent says it
+cannot determine where it runs rather than guessing — see the root `CLAUDE.md`
+§ `MIKA_DEPLOYMENT`.
 
 Both modes use the same agent loop, tools, memory model, and prompt assembly code
 from the `mika-agent` crate.
