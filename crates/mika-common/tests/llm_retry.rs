@@ -394,7 +394,7 @@ async fn anthropic_retries_once_after_a_body_cut_mid_stream() {
     let client = ClaudeClient::for_test(api.base_url(), "claude-test".into(), 10);
 
     let response = client
-        .send_message_with_deadline(&anthropic_request(), Some(deadline_in(300)))
+        .send_message_with_deadline(&anthropic_request(), Some(deadline_in(300)), None)
         .await
         .expect("second attempt should succeed");
 
@@ -408,7 +408,7 @@ async fn anthropic_unparseable_body_is_terminal() {
     let client = ClaudeClient::for_test(api.base_url(), "claude-test".into(), 10);
 
     let err = client
-        .send_message_with_deadline(&anthropic_request(), Some(deadline_in(300)))
+        .send_message_with_deadline(&anthropic_request(), Some(deadline_in(300)), None)
         .await
         .expect_err("a schema mismatch must propagate");
 
@@ -435,7 +435,7 @@ async fn anthropic_body_cut_uses_the_transport_retry_threshold() {
     let client = ClaudeClient::for_test(api.base_url(), "claude-test".into(), 10);
 
     let response = client
-        .send_message_with_deadline(&anthropic_request(), Some(deadline_in(90)))
+        .send_message_with_deadline(&anthropic_request(), Some(deadline_in(90)), None)
         .await
         .expect("the retry must be allowed under the transport threshold");
 
