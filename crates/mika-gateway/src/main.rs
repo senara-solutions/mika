@@ -210,6 +210,13 @@ async fn main() -> Result<()> {
     ))));
     info!("egress-fetch substrate configured (upstream=gouv_fr)");
 
+    // mika#2360 — resolve the admin read token once; a collision with the
+    // internal token disarms the route (WARN) rather than failing startup.
+    let admin_read_token = settings::resolve_admin_read_token(
+        settings.gateway_admin_read_token.as_ref(),
+        &settings.internal_token,
+    );
+
     // Build app state
     let state = AppState {
         pool,
@@ -238,6 +245,7 @@ async fn main() -> Result<()> {
         )),
         search_egress_client,
         fetch_egress_client,
+        admin_read_token,
     };
 
     // Spawn DLQ background worker (retries pending deliveries every 30s)

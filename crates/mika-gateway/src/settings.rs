@@ -1,6 +1,7 @@
 use config::{Config, Environment};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
+use subtle::ConstantTimeEq;
 
 /// Gateway-specific settings, loaded from MIKA_* environment variables.
 #[derive(Deserialize, Clone)]
@@ -124,6 +125,20 @@ pub struct GatewaySettings {
     /// `crate::egress_search::DEFAULT_BRAVE_ENDPOINT`.
     #[serde(default)]
     pub brave_endpoint: Option<String>,
+
+    /// mika#2360 — admin READ-ONLY token. Opens
+    /// `GET /admin/tenants/{customer_id}/recurring-tasks` and nothing else.
+    /// Maps to `MIKA_GATEWAY_ADMIN_READ_TOKEN`.
+    ///
+    /// Optional: absent ⇒ the route answers 404 (fail-closed, like
+    /// `github_webhook_secret`). Refused ⇒ route disarmed with a WARN when it
+    /// equals `internal_token` — a copy-paste of the write secret would erase
+    /// the read/write segregation this token exists to create. Deliberately
+    /// NOT part of [`GatewaySettings::validate`]: a malformed read token must
+    /// not be able to take the whole gateway down (see
+    /// [`resolve_admin_read_token`]).
+    #[serde(default)]
+    pub gateway_admin_read_token: Option<SecretString>,
 }
 
 fn default_port() -> u16 {
@@ -313,8 +328,60 @@ impl std::fmt::Debug for GatewaySettings {
                 &self.brave_api_key.as_ref().map(|_| "[REDACTED]"),
             )
             .field("brave_endpoint", &self.brave_endpoint)
+            .field(
+                "gateway_admin_read_token",
+                &self.gateway_admin_read_token.as_ref().map(|_| "[REDACTED]"),
+            )
             .finish()
     }
+}
+
+/// mika#2360 — resolve the admin read token once, at startup.
+///
+/// Returns the token that arms `GET /admin/tenants/{id}/recurring-tasks`, or
+/// `None` when the route must stay 404. Two disarming cases, both logged so a
+/// 404 on a route that exists is never read as "not deployed":
+///
+/// - unset / empty ⇒ INFO, route disabled;
+/// - equal to `internal_token` ⇒ WARN, route disabled. Sharing the write
+///   secret would silently void the segregation (R8) without any AC2 test
+///   being able to see it.
+///
+/// Disarm rather than `bail!`: taking Telegram routing, GitHub webhooks and
+/// `/send` down for every tenant because of a read-only inspection token
+/// would be a ransom. The invalid state is resolved here, before `AppState`
+/// exists, so no request path can forget to check it.
+pub fn resolve_admin_read_token(
+    raw: Option<&SecretString>,
+    internal_token: &SecretString,
+) -> Option<SecretString> {
+    let token = raw?;
+    let exposed = token.expose_secret();
+    if exposed.trim().is_empty() {
+        tracing::info!(
+            "admin read route disabled (MIKA_GATEWAY_ADMIN_READ_TOKEN empty) — \
+             GET /admin/tenants/{{id}}/recurring-tasks answers 404"
+        );
+        return None;
+    }
+    if bool::from(
+        exposed
+            .as_bytes()
+            .ct_eq(internal_token.expose_secret().as_bytes()),
+    ) {
+        tracing::warn!(
+            "mika#2360: MIKA_GATEWAY_ADMIN_READ_TOKEN equals MIKA_INTERNAL_TOKEN — \
+             the read/write segregation would be void; admin read route DISARMED \
+             (GET /admin/tenants/{{id}}/recurring-tasks answers 404). Generate a \
+             distinct secret."
+        );
+        return None;
+    }
+    tracing::info!(
+        "admin read route enabled (MIKA_GATEWAY_ADMIN_READ_TOKEN set) — \
+         GET /admin/tenants/{{id}}/recurring-tasks"
+    );
+    Some(token.clone())
 }
 
 /// Parse `MIKA_TELEGRAM_SINGLE_BOT_MODE`. Treats `1` / `true` (case-insensitive)
@@ -415,6 +482,7 @@ mod tests {
                 search_upstream: Some("brave".to_string()),
                 brave_api_key: Some(SecretString::from("brave-api-key-secret")),
                 brave_endpoint: None,
+                gateway_admin_read_token: Some(SecretString::from("admin-read-sentinel")),
             }
         );
         assert!(!debug.contains("pass"));
@@ -424,6 +492,41 @@ mod tests {
         assert!(!debug.contains("super-secret-pem"));
         assert!(!debug.contains("brave-api-key-secret"));
         assert!(debug.contains("[REDACTED]"));
+        // mika#2360 — this Debug is exhaustive (`.finish()`): a field added to
+        // the struct without its line here compiles silently. Both halves are
+        // needed: the name must be present (no silent omission) and the value
+        // must be absent (no leak).
+        assert!(
+            debug.contains("gateway_admin_read_token"),
+            "gateway_admin_read_token omitted from GatewaySettings::Debug"
+        );
+        assert!(!debug.contains("admin-read-sentinel"));
+    }
+
+    // -- mika#2360 admin read token resolution --
+
+    #[test]
+    fn mika2360_admin_read_token_unset_disarms() {
+        let internal = SecretString::from("a".repeat(64));
+        assert!(resolve_admin_read_token(None, &internal).is_none());
+        assert!(resolve_admin_read_token(Some(&SecretString::from("")), &internal).is_none());
+        assert!(resolve_admin_read_token(Some(&SecretString::from("   ")), &internal).is_none());
+    }
+
+    /// R8 — a copy-paste of the write secret voids the segregation: disarm.
+    #[test]
+    fn mika2360_admin_read_token_equal_to_internal_disarms() {
+        let internal = SecretString::from("a".repeat(64));
+        let same = SecretString::from("a".repeat(64));
+        assert!(resolve_admin_read_token(Some(&same), &internal).is_none());
+    }
+
+    #[test]
+    fn mika2360_admin_read_token_distinct_arms() {
+        let internal = SecretString::from("a".repeat(64));
+        let read = SecretString::from("read-only-secret");
+        let resolved = resolve_admin_read_token(Some(&read), &internal).expect("armed");
+        assert_eq!(resolved.expose_secret(), "read-only-secret");
     }
 
     #[test]
@@ -523,6 +626,7 @@ mod tests {
             search_upstream: None,
             brave_api_key: None,
             brave_endpoint: None,
+            gateway_admin_read_token: None,
         }
     }
 
