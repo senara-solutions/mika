@@ -564,7 +564,12 @@ Observabilité du budget effectif + garde de demi-configuration (mika#2293) :
   est inatteignable.** 300/600 est le cas `k = 2` de cette famille, pas une
   singularité du nombre 300. `llm_budget_retry_unreachable` (WARN) nomme l'agent,
   les deux comptes, la géométrie et la provenance de chaque moitié quand les deux
-  divergent. **Régime attendu : silencieux.** Une occurrence n'est pas une panne
+  divergent. **Cadence : celle de `llm_budget_resolved`, pas une par tour** — le
+  WARN est émis derrière la même déduplication, donc **une fois par agent et par
+  couple résolu** (ré-émis quand la géométrie change, tu quand elle ne change
+  pas). Un grep qui n'en trouve qu'une poignée après des jours d'exécution est
+  le régime normal, pas un signe que le problème a cessé. **Régime attendu :
+  silencieux.** Une occurrence n'est pas une panne
   — la configuration est valide et fonctionne, la classe transport retry bel et
   bien (seuil `0.50 × plafond`) — c'est une mesure qui appelle une décision de
   réglage : décaler l'un des deux nombres hors du multiple, ou accepter. **Pas de

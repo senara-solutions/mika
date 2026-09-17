@@ -438,6 +438,14 @@ pub fn log_llm_budget_resolved(agent_id: &str, global_home: &Path, agent_home: &
     // mika#2362 D4 — the measurement, emitted where the geometry is known and
     // nowhere else.
     //
+    // **It sits after the dedup `return` on purpose**, so it fires once per
+    // agent per resolved pair, exactly like the INFO line it accompanies — not
+    // once per turn. The two describe one configuration event, and a WARN that
+    // repeated while its own INFO stayed silent would read as a new condition
+    // each time. Said out loud in the operator section of the root `CLAUDE.md`
+    // too: a grep finding a handful of lines after days of running is the
+    // nominal regime, not evidence the geometry was fixed.
+    //
     // **Not a startup refusal.** `envelope = k × cap` is a *valid, working*
     // configuration: calls run, and the transport class still retries. Refusing
     // to boot on it would lay the fleet down over a suboptimal setting — the
