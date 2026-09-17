@@ -52,6 +52,11 @@ fn loop_pr(number: u64, created_at: &str, is_draft: bool) -> PrSnapshot {
         }),
         is_draft,
         created_at: created_at.to_string(),
+        // mika#2347 — le SHA de tête keye désormais le ledger. Il n'est pas une
+        // entrée de la décision de *population* ; il ne doit simplement pas être
+        // vide, un SHA illisible sortant la PR comme toute autre information
+        // manquante.
+        head_ref_oid: format!("{number:040x}"),
         review_requests: vec![],
         reviews: vec![],
     }
