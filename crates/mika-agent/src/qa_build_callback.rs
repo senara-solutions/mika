@@ -30,7 +30,7 @@
 //! partager une constante Rust : `tests::mika2355_the_scope_header_quotes_the_engine_marker`
 //! épingle que la chaîne qu'il cite est bien celle que le moteur émet.
 
-use crate::agent_loop::ToolCallSummary;
+use crate::tool_execution::ToolCallSummary;
 
 /// Nom de l'outil long-running exposé par le skill `build-mika`.
 ///
@@ -67,7 +67,10 @@ pub fn is_build_callback(msg: &str) -> bool {
 /// personne. Une garde armée sur le seul label re-prompterait mika-dev pour
 /// poster une revue de PR — elle échangerait le loop-breaker QA contre un
 /// loop-breaker dev.
-pub fn qa_verdict_required(msg: &str, skill_names: impl IntoIterator<Item = impl AsRef<str>>) -> bool {
+pub fn qa_verdict_required(
+    msg: &str,
+    skill_names: impl IntoIterator<Item = impl AsRef<str>>,
+) -> bool {
     is_build_callback(msg)
         && skill_names
             .into_iter()
@@ -100,8 +103,7 @@ pub const QA_VERDICT_REQUIRED_LABEL: &str = "qa_build_callback_verdict";
 /// Nomme l'outil **et** la ligne attendue : une correction qui dit seulement
 /// « vous n'avez pas fini » laisse le modèle deviner par quoi finir, et il
 /// devine le contrat qu'on vient précisément de lui retirer.
-pub const QA_VERDICT_REQUIRED_CORRECTION: &str =
-    "[mika-engine] This is a build callback for a QA review, and the review is not \
+pub const QA_VERDICT_REQUIRED_CORRECTION: &str = "[mika-engine] This is a build callback for a QA review, and the review is not \
      complete: no successful `run_gh` call with `pr review` appears in this turn's \
      tool history. A qa-review turn concludes by POSTING the review to GitHub — \
      the posted review is the source of truth, and verdict text in your response \
