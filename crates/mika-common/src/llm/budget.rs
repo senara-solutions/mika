@@ -329,7 +329,13 @@ impl LlmTimeoutBudget {
     /// reads it.
     pub fn effective_max_attempts(&self, hard_cap: u32) -> u32 {
         let nominal = self.max_attempts(hard_cap);
-        let threshold = self.typical_call_duration_secs() + self.retry_buffer_secs();
+        // Read from the one owner of that sum rather than writing it a second
+        // time. The first draft of this method did write it — `self.typical…()
+        // + self.retry_buffer_secs()` — one commit after declaring
+        // `RetryThresholds::from_budget` the crate's only writer, and the guard
+        // below did not catch it. Reading it here keeps the claim true *and*
+        // ties this count to the threshold the deadline guard actually applies.
+        let threshold = super::retry_gate::RetryThresholds::from_budget(self).default_secs();
 
         // Walk the chain the way the clock does: each attempt consumes the cap,
         // and the next one only runs while the margin strictly exceeds the

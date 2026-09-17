@@ -439,6 +439,66 @@ mod tests {
 
     // ── D5: no rail may recompute the threshold inline ────────────────────
 
+    /// Does this source line write the non-transport threshold sum?
+    ///
+    /// Split out of the scan below so it can be probed on both controls — the
+    /// omission that made the first version of this guard **hollow**. That
+    /// version matched the literal `typical_call_duration_secs()+retry_buffer_secs()`,
+    /// which assumes no receiver between the `+` and the second call; every
+    /// real spelling has one (`self.`, `budget.`), so it matched nothing at
+    /// all — not the violation it was written for, and not even the legitimate
+    /// definition in `from_budget`. It passed, and it guarded nothing. A guard
+    /// that is only ever asked to find nothing cannot tell "clean tree" from
+    /// "broken detector".
+    ///
+    /// Both accessors on one line, in either order and whatever the receiver.
+    /// Comment lines are exempt: prose naming the two is documentation, and the
+    /// module above is full of it.
+    fn line_writes_the_threshold_sum(line: &str) -> bool {
+        let flat: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+        if flat.starts_with("//") {
+            return false;
+        }
+        (flat.contains("typical_call_duration_secs()") && flat.contains("retry_buffer_secs()"))
+            || (flat.contains("TYPICAL_CALL_DURATION_SECS") && flat.contains("RETRY_BUFFER_SECS"))
+    }
+
+    /// The positive control the first version of this guard never had.
+    ///
+    /// Every spelling that actually appeared in this codebase, plus the two
+    /// shapes that must **not** fire: an accessor read on its own (which
+    /// decides nothing — `budget.rs` defines them and asserts them in its own
+    /// tests, so forbidding one alone would make the defining module violate
+    /// its own guard), and prose naming both.
+    #[test]
+    fn mika2362_the_threshold_detector_detects() {
+        // Positive controls — each of these was, or could have been, written.
+        for offending in [
+            "let t = self.typical_call_duration_secs() + self.retry_buffer_secs();",
+            "default_secs: budget.typical_call_duration_secs() + budget.retry_buffer_secs(),",
+            "        TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS",
+            "let t = b.retry_buffer_secs() + b.typical_call_duration_secs();",
+        ] {
+            assert!(
+                line_writes_the_threshold_sum(offending),
+                "detector missed: {offending}"
+            );
+        }
+
+        // Negative controls — an accessor alone, and documentation.
+        for innocent in [
+            "assert_eq!(budget.typical_call_duration_secs(), 180);",
+            "pub fn retry_buffer_secs(&self) -> u64 {",
+            "/// `typical_call_duration_secs() + retry_buffer_secs()`, and that sum is",
+            "// TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS is what this replaces",
+        ] {
+            assert!(
+                !line_writes_the_threshold_sum(innocent),
+                "detector false-positived: {innocent}"
+            );
+        }
+    }
+
     /// A structural scan, because a behavioural test cannot see this class of
     /// regression.
     ///
@@ -448,18 +508,17 @@ mod tests {
     /// That is exactly what happened to mika#1744's transport threshold between
     /// its own ticket and mika#2331 §3.3, on a rail nobody was watching.
     ///
-    /// The scan targets the **sum**, not the accessors: `budget.rs` defines
-    /// them and its own tests assert them, so forbidding
-    /// `typical_call_duration_secs()` alone would make the defining module
-    /// violate its own guard. An accessor read on its own decides nothing; the
-    /// sum is the predicate that was being copied.
+    /// The scan targets the **sum**, not the accessors — see
+    /// [`line_writes_the_threshold_sum`] for the predicate and for why its
+    /// first version was hollow.
     ///
-    /// Allowlist: empty. A sixth site is halt-and-surface, not an entry here.
+    /// Allowlist: empty. A second site is halt-and-surface, not an entry here.
     #[test]
     fn mika2362_no_rail_recomputes_the_retry_threshold_inline() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let this_file = "retry_gate.rs";
         let mut offenders = Vec::new();
+        let mut files_scanned = 0usize;
 
         let mut stack = vec![src.clone()];
         while let Some(dir) = stack.pop() {
@@ -476,18 +535,23 @@ mod tests {
                     continue;
                 }
                 let text = std::fs::read_to_string(&path).expect("readable source file");
-                // Whitespace-insensitive: a reformat must not open the gate.
-                let flat: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-                for needle in [
-                    "typical_call_duration_secs()+retry_buffer_secs()",
-                    "TYPICAL_CALL_DURATION_SECS+RETRY_BUFFER_SECS",
-                ] {
-                    if flat.contains(needle) {
-                        offenders.push(format!("{} contains `{needle}`", path.display()));
+                files_scanned += 1;
+                for (n, line) in text.lines().enumerate() {
+                    if line_writes_the_threshold_sum(line) {
+                        offenders.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
                     }
                 }
             }
         }
+
+        // A scan that walked nothing would also report no offender. The count
+        // is what separates "clean" from "the tree moved and this test is
+        // looking at an empty directory".
+        assert!(
+            files_scanned > 5,
+            "the scan found only {files_scanned} source files under {} — it is not looking at the crate",
+            src.display()
+        );
 
         assert!(
             offenders.is_empty(),

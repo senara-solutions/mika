@@ -224,6 +224,7 @@ fn anthropic_request() -> MessagesRequest {
 /// freezes behaviour mika#2015 already shipped, which is the finding the ticket
 /// body did not have: the retry it asks for was already there.
 #[tokio::test]
+#[serial]
 async fn openai_retries_once_after_a_body_cut_mid_stream() {
     let api = FakeApi::start(vec![Reply::TruncatedBody, Reply::Ok(openai_body())]).await;
     let provider = openai_provider(api.base_url(), fleet_budget());
@@ -240,6 +241,7 @@ async fn openai_retries_once_after_a_body_cut_mid_stream() {
 // ── case 2 — no infinite loop ─────────────────────────────────────────────
 
 #[tokio::test]
+#[serial]
 async fn openai_propagates_the_error_after_a_bounded_number_of_attempts() {
     let api = FakeApi::start(vec![Reply::TruncatedBody]).await;
     let provider = openai_provider(api.base_url(), fleet_budget());
@@ -266,6 +268,7 @@ async fn openai_propagates_the_error_after_a_bounded_number_of_attempts() {
 /// plan whose measurement premise has just been disproved is not repaired by
 /// adjusting the assertion to whatever was observed.
 #[tokio::test]
+#[serial]
 async fn openai_chain_length_follows_the_budget_not_the_hard_cap() {
     let api = FakeApi::start(vec![Reply::Status(
         500,
@@ -292,6 +295,7 @@ async fn openai_chain_length_follows_the_budget_not_the_hard_cap() {
 /// leaves `LlmProvider` as `ProviderError`, so asserting `transport_timeout`
 /// there would assert something false.
 #[tokio::test]
+#[serial]
 async fn openai_body_cut_carries_the_transport_class_the_ledger_groups_by() {
     let api = FakeApi::start(vec![Reply::TruncatedBody]).await;
     let provider = openai_provider(api.base_url(), fleet_budget());
@@ -310,6 +314,7 @@ async fn openai_body_cut_carries_the_transport_class_the_ledger_groups_by() {
 // ── case 5 — non-retryable stays non-retryable ────────────────────────────
 
 #[tokio::test]
+#[serial]
 async fn openai_http_400_is_not_retried() {
     let api = FakeApi::start(vec![Reply::Status(
         400,
@@ -331,6 +336,7 @@ async fn openai_http_400_is_not_retried() {
 /// that **arrived** and does not parse is terminal. Without this, "make body
 /// reads retryable" could be satisfied by making everything retryable.
 #[tokio::test]
+#[serial]
 async fn openai_unparseable_body_is_terminal() {
     let api = FakeApi::start(vec![Reply::Unparseable]).await;
     let provider = openai_provider(api.base_url(), fleet_budget());
@@ -350,6 +356,7 @@ async fn openai_unparseable_body_is_terminal() {
 /// stopped at **1** request. This is one of the two detectors that fire on the
 /// pre-fix tree, and it lands in the same commit as its fix.
 #[tokio::test]
+#[serial]
 async fn ollama_retries_once_after_a_body_cut_mid_stream() {
     let api = FakeApi::start(vec![Reply::TruncatedBody, Reply::Ok(ollama_body())]).await;
     let provider = ollama_provider(api.base_url(), fleet_budget());
@@ -364,6 +371,7 @@ async fn ollama_retries_once_after_a_body_cut_mid_stream() {
 }
 
 #[tokio::test]
+#[serial]
 async fn ollama_unparseable_body_is_terminal() {
     let api = FakeApi::start(vec![Reply::Unparseable]).await;
     let provider = ollama_provider(api.base_url(), fleet_budget());
@@ -389,6 +397,7 @@ async fn ollama_unparseable_body_is_terminal() {
 /// independent of `MAX_RETRIES`, which this rail still consumes instead of
 /// `max_attempts` — a success on the second try stops at 2 whatever the bound.
 #[tokio::test]
+#[serial]
 async fn anthropic_retries_once_after_a_body_cut_mid_stream() {
     let api = FakeApi::start(vec![Reply::TruncatedBody, Reply::Ok(anthropic_body())]).await;
     let client = ClaudeClient::for_test(api.base_url(), "claude-test".into(), 10);
@@ -403,6 +412,7 @@ async fn anthropic_retries_once_after_a_body_cut_mid_stream() {
 }
 
 #[tokio::test]
+#[serial]
 async fn anthropic_unparseable_body_is_terminal() {
     let api = FakeApi::start(vec![Reply::Unparseable]).await;
     let client = ClaudeClient::for_test(api.base_url(), "claude-test".into(), 10);
@@ -430,6 +440,7 @@ async fn anthropic_unparseable_body_is_terminal() {
 /// chain would abandon after one request — no error, no symptom, just a retry
 /// that silently stops being attempted.
 #[tokio::test]
+#[serial]
 async fn anthropic_body_cut_uses_the_transport_retry_threshold() {
     let api = FakeApi::start(vec![Reply::TruncatedBody, Reply::Ok(anthropic_body())]).await;
     let client = ClaudeClient::for_test(api.base_url(), "claude-test".into(), 10);
@@ -483,17 +494,22 @@ struct Attempt {
     elapsed_ms: u64,
 }
 
-/// Why every capturing test below carries `#[serial]`.
+/// Why **every** test in this file carries `#[serial]`, not just the capturing
+/// ones.
 ///
-/// `tracing::subscriber::set_default` is thread-local, but the count of live
-/// scoped subscribers is process-global and feeds the max-level hint the `info!`
-/// macros consult. Two capturing tests overlapping on two threads — one
-/// dropping its guard while the other emits — silently lose events, which shows
-/// up as an empty capture in whichever test lost the race. Measured here as a
-/// different test failing on each run before this attribute was added.
+/// `tracing::subscriber::set_default` is thread-local, but two things a
+/// capturing test depends on are process-global: the count of live scoped
+/// subscribers (which feeds the max-level hint the `info!` macros consult) and
+/// the per-callsite `Interest` cache (see `capture::start`). A test running in
+/// parallel — **including one that installs no subscriber at all** — can move
+/// either one out from under a capture in progress, and the symptom is an empty
+/// capture, i.e. a failure that reads as "the rail emitted nothing".
 ///
-/// The serialization is between *capturing* tests only; the rest of this file
-/// installs no subscriber and still runs in parallel.
+/// Serializing only the capturing tests was tried first and was not enough: the
+/// failure moved to a different test on each run. The whole file is therefore
+/// serial. It costs a couple of seconds and buys a deterministic suite; a
+/// flaky assertion about a log line is worse than a slow one, because the
+/// natural response to it is to stop believing the line.
 use serial_test::serial;
 
 mod capture {
@@ -541,11 +557,29 @@ mod capture {
     }
 
     /// Install a capturing subscriber for the current thread.
+    ///
+    /// `rebuild_interest_cache` is **not** optional here, and the reason is the
+    /// trap this file is most likely to re-lose: a `tracing` callsite caches
+    /// its `Interest` **globally**, decided by whichever thread reaches it
+    /// first. In a test binary that is routinely a test with no subscriber
+    /// installed, which answers `never` — after which the capturing test on
+    /// another thread observes nothing at all, and the failure looks like "the
+    /// rail did not emit" rather than "the callsite was disabled before we got
+    /// there". Measured here as an empty capture moving from one test to
+    /// another between runs. Rebuilding on install re-asks every callsite under
+    /// the subscriber now in place.
+    ///
+    /// It composes with the `#[serial]` on every test in this file (see the
+    /// note above `Attempt`): the rebuild fixes the cache, and the
+    /// serialization is what stops a parallel test from re-deciding it mid
+    /// capture.
     pub fn start() -> (tracing::subscriber::DefaultGuard, Sink) {
         use tracing_subscriber::layer::SubscriberExt;
         let sink = Sink::default();
         let subscriber = tracing_subscriber::registry().with(Layer(Arc::clone(&sink.0)));
-        (tracing::subscriber::set_default(subscriber), sink)
+        let guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        (guard, sink)
     }
 
     impl Sink {
@@ -782,6 +816,7 @@ async fn mika2362_anthropic_zero_margin_says_exhausted_and_a_real_margin_retries
 /// Negative control in the same test: with the margin wide and the error
 /// non-retryable, the chain must not claim the deadline stopped it.
 #[tokio::test]
+#[serial]
 async fn mika2362_anthropic_post_loop_message_names_the_deadline_not_the_retries() {
     let api = FakeApi::start(vec![Reply::Status(
         429,
