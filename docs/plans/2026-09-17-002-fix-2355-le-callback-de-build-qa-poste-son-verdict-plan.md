@@ -149,6 +149,37 @@ qu'on nomme, et qu'un axe `callback_handler` générique dans le manifeste
 embarquerait `self-dev-callback` par la même mécanique, sans décision. Cet axe est
 la bonne généralisation ; il a son propre ticket.
 
+**Le coût qui compte n'est pas les octets : c'est que le tour 1 lise un prompt de
+reprise. B1 ne peut donc pas être livrée nue.** `match_skills`
+(`skills/matcher.rs:135-152`) fait **le même BFS sortant** que
+`callback_safe_skills` ; la dépendance déclarée est donc résolue sur tous les
+tours de `qa-review`, et le snippet est injecté verbatim —
+`agent_loop/mod.rs:6361` écrit `## {nom} Skill\n{prompt}` sans aucun cadrage
+conditionnel. Or la **première ligne** du fichier est : *« You are mika-qa
+resuming a QA review after a build_mika callback. **Steps 1–3d were completed in
+the previous turn — do NOT re-run them.** »*
+⇒ Sur le tour 1, B1 nue place cette phrase dans le prompt d'un tour qui n'a rien
+fait, et elle autorise textuellement à sauter Step 3 — la revue du diff. Le risque
+n'est pas cosmétique : il **change la classe du défaut**, d'un loop-breaker
+visible (aucun verdict) vers une régression silencieuse (un verdict `pass` posé
+sans revue de diff). Un correctif de gate QA qui dégrade la QA sans le dire est
+pire que le silence qu'il remplace.
+
+**Garde-fou, livré avec B1 :** un en-tête de portée en tête de
+`qa-review-build-callback/system_prompt.md`, énonçant que tout le fichier ne
+s'applique **que** si le message du tour porte le label de callback de build
+(§ B2 pour le discriminant, nommé une seule fois), et qu'autrement il doit être
+ignoré intégralement. C'est l'énoncé de la **condition d'applicabilité d'un
+document**, non l'application d'une règle de processus par prompt : la doctrine
+maison (`feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`)
+vise la seconde. La marge existe là où elle manque ailleurs :
+`qa-review-build-callback` est à 19 330 octets pour un plafond de 32 768, soit
+**11 799 octets** sous le gate à 95 % — contre 1 661 côté `qa-review`.
+
+La forme définitive reste l'axe manifeste `callback_handler` (une dépendance
+résolue **uniquement** sur les tours de callback), qui rendrait ce garde-fou sans
+objet. Il a son ticket ; le garde-fou est ce qui rend B1 livrable sans lui.
+
 **En revanche, la marge de `qa-review` lui-même est mince, et elle contraint B2.**
 `qa-review/system_prompt.md` mesure 68 380 octets contre un plafond déclaré de
 73 728 : le gate à 95 % **panique** (il n'avertit pas —
@@ -165,23 +196,57 @@ Le contrat terminal d'un tour de callback dépend du **flux**, pas du fait d'êt
 un callback. Discriminant : le label de la tâche, déjà présent dans le message
 (`long_running:{tool_name}`, `executor.rs:2911`).
 
-1. `callback_trigger_active` cesse de couvrir le callback de build QA : la garde
-   `callback_terminal_action` (#870) ne s'y arme plus. Corriger au passage son
-   commentaire, dont l'affirmation « un seul flux » est ce qui a rendu la
+**Ce que ce label discrimine, et ce qu'il ne discrimine pas.** Il porte le nom de
+l'outil, jamais l'agent ni le skill. Les outils `long_running: true` du dépôt sont
+`build_mika`, `deploy_mika`, `address_pr_comments`, `resolve_pr_conflicts`
+(`tools.json`), plus `run_claude_pilot` / `run_claude_pilot_groom`. Un prédicat
+posé sur `long_running:build_mika` retire donc le contrat self_dev à **tout**
+callback de build, y compris ceux de mika-dev — qui porte `build-mika` dans son
+allowlist (`well_known_agents.rs:145`). C'est **accepté et motivé**, pas subi :
+*« marquer la tâche parent self_dev terminale »* + `send_message` est le contrat
+terminal d'un **dispatch de pilote**, pas d'un build ; l'imposer à un `build_mika`
+lancé hors flux self_dev était déjà la même sur-portée que F3 décrit, au même
+endroit. Ce que B2 ne doit pas faire, c'est l'élargir : les trois autres outils
+`long_running` gardent leur comportement d'aujourd'hui à l'identique (AC9).
+
+1. `callback_trigger_active` cesse de couvrir le callback de build : la garde
+   `callback_terminal_action` (#870) ne s'y arme plus. **Deux sites lisent ce
+   prédicat** — l'entrée du registre `INTENT_GUARDS` (chemin texte non-vide) et le
+   contrôle *inline* de `agent_loop/mod.rs:2898`, dont le commentaire dit qu'il
+   « mirrors the INTENT_GUARDS entry » pour le chemin **texte vide**. Les deux
+   suivent d'office puisqu'ils appellent le même prédicat, mais le test doit
+   l'asserter sur les deux : un EndTurn sec n'est pas un texte, et c'est
+   exactement la forme que prend un tour qui n'a rien à dire. Corriger au passage
+   le commentaire dont l'affirmation « un seul flux » est ce qui a rendu la
    sur-portée invisible.
 2. `build_callback_trigger_context` cesse d'injecter l'instruction
    `update_task_status` + `send_message` sur ce flux.
-3. **Positivement** : nouvelle entrée `INTENT_GUARDS` dont le `trigger` est le
-   callback de build QA et le `satisfied` est « un `run_gh` `pr review` a été
-   appelé avec succès dans ce tour ». Le message de correction nomme
-   `run_gh pr review` et la ligne `VERDICT:` attendue. C'est la force réelle du
-   moteur sur ce chemin, et le dépôt s'en sert déjà pour ce genre de contrat
-   (garde `required_suffix_lines`, mika#864) — la même mécanique qui re-prompte
-   aujourd'hui vers le mauvais contrat re-promptera vers le bon.
+3. **Positivement** : une garde qui exige « un `run_gh` `pr review` appelé avec
+   succès dans ce tour », dont le message de correction nomme `run_gh pr review`
+   et la ligne `VERDICT:` attendue. C'est la force réelle du moteur sur ce chemin,
+   et la même mécanique qui re-prompte aujourd'hui vers le mauvais contrat
+   re-promptera vers le bon.
+
+   **Elle ne peut pas être une entrée d'`INTENT_GUARDS`, et c'est structurel.**
+   `IntentPrecondition.trigger` a pour signature `fn(&str) -> bool` : le message
+   seul. Or le label ne distingue pas mika-qa de mika-dev (ci-dessus) — une entrée
+   du registre armée sur `long_running:build_mika` **re-prompterait mika-dev pour
+   poster une revue de PR** qu'il n'a aucune raison de poster, c'est-à-dire
+   qu'elle échangerait le loop-breaker QA contre un loop-breaker dev. La garde est
+   donc **inline**, sur le précédent exact et voisin de
+   `callback_milestone_advance` (`mod.rs:2093-2098`), dont le commentaire énonce
+   la même raison : *« Inline rather than in INTENT_GUARDS because the satisfied
+   predicate needs [more than the registry signature] »*. L'information nécessaire
+   est déjà là : `run_silent_agent` calcule `matched` en `mod.rs:4531`. Le trigger
+   est **conjonctif** — label de callback de build **ET** `qa-review` parmi les
+   skills du tour — donc il ne s'arme que là où un verdict est dû.
 
 Le discriminant vit à **un seul endroit** (une constante + un prédicat nommés),
-jamais recopié entre le framing et la garde : deux lecteurs d'une même grammaire
-qui divergent est la classe que mika#2158 a dû fermer une fois.
+jamais recopié entre le framing, la garde négative, la garde positive et l'en-tête
+de portée de B1 : quatre lecteurs d'une même grammaire, c'est la classe que
+mika#2158 a dû fermer une fois — et l'en-tête de B1 étant du **prompt**, il ne
+peut pas partager la constante Rust : un test doit alors épingler que la chaîne
+qu'il cite est bien celle que le moteur émet.
 
 ### B3 — le filet : une PR n'est plus jamais muette
 
@@ -247,13 +312,28 @@ assertables sans production.
    structurellement pas voir cette classe : il raisonne sur des **noms d'outils**
    référencés par le moteur (`ENGINE_REFERENCED_SKILL_TOOLS`), et
    `qa-review-build-callback` n'apporte aucun outil — seulement du prompt.
-2. **F3 figé** — `callback_trigger_active("[callback: long_running:build_mika]")`
+1b. **B1 ne dégrade pas le tour 1** — sur un tour **conversationnel** de
+   `qa-review` (le tour d'ouverture d'une revue), le prompt assemblé contient bien
+   le snippet du callback (c'est le BFS de `match_skills`, attendu) **et**
+   l'en-tête de portée qui le neutralise. Assertion comportementale jumelle : un
+   tour 1 exécute toujours la revue de diff (Steps 1–3d). Rouge si B1 est livrée
+   sans son garde-fou — c'est-à-dire que ce test est le seul qui garde la classe de
+   défaut la plus coûteuse de tout ce plan, une QA qui passe sans regarder.
+2. **F3 figé, sur les deux sites** — `callback_trigger_active("[callback: long_running:build_mika]")`
    est `false` après B2, et reste `true` pour
-   `[callback: long_running:run_claude_pilot]` : la garde #870 ne perd rien de sa
-   portée d'origine.
-3. **B2 positive** — un tour de callback de build QA qui termine sans
-   `run_gh pr review` est re-prompté ; le même tour avec un `pr review` réussi
-   passe.
+   `[callback: long_running:run_claude_pilot]`. Asserté **et** par le chemin
+   texte non-vide (registre) **et** par le chemin texte vide
+   (`mod.rs:2898`) : la garde #870 ne perd rien de sa portée d'origine.
+2b. **Portée non élargie** — `deploy_mika`, `address_pr_comments` et
+   `resolve_pr_conflicts` conservent à l'identique framing, garde et contrat
+   terminal. Les trois sont nommés : une assertion sur le seul
+   `run_claude_pilot` laisserait trois outils `long_running` hors contrôle.
+3. **B2 positive, et bornée** — un tour de callback de build **avec `qa-review`
+   chargé** qui termine sans `run_gh pr review` est re-prompté ; le même tour avec
+   un `pr review` réussi passe. **Contrôle négatif, qui est la moitié qui compte :**
+   un callback `long_running:build_mika` **sans** `qa-review` chargé (le cas
+   mika-dev) n'est **pas** re-prompté. Rouge si la garde est posée dans le
+   registre plutôt qu'inline.
 4. **B3 filet** — tour de callback de build QA sans verdict et cible PR stampée
    → **un** POST `pr review` portant `VERDICT: hold[review]`. Poster injecté,
    comme `maybe_post_deadline_verdict` le fait déjà : le contrat à asserter est
@@ -272,6 +352,8 @@ assertables sans production.
 ## Definition of Done
 
 - B1, B2, B3 livrées ; `cargo test -p mika-agent` vert ; `cargo clippy` propre.
+- B1 livrée **avec** son en-tête de portée dans
+  `qa-review-build-callback/system_prompt.md` — jamais la dépendance seule.
 - Les trois commentaires devenus faux sont corrigés dans le même commit que le
   code qui les dément (#870 « only one callback flow », le framing générique,
   `// Silent mode: no session-scoped dedup needed`).
@@ -284,14 +366,22 @@ assertables sans production.
 - **AC1** — Sur le registre de skills réellement embarqué,
   `callback_safe_skills()` contient `qa-review-build-callback`. Test rouge avant
   le correctif, vert après.
+- **AC1b** — B1 ne dégrade pas le tour d'ouverture : sur un tour conversationnel
+  de `qa-review`, la présence du snippet de reprise ne fait sauter aucun des
+  Steps 1–3d, parce que le fichier porte en tête une condition de portée qui le
+  neutralise hors callback de build.
 - **AC2** — La garde `callback_terminal_action` (#870) ne s'arme plus sur
   `[callback: long_running:build_mika]`, et s'arme toujours sur
-  `[callback: long_running:run_claude_pilot]`.
+  `[callback: long_running:run_claude_pilot]` — sur **les deux** sites de lecture
+  du prédicat (registre `INTENT_GUARDS`, et contrôle inline du chemin texte vide).
 - **AC3** — Le framing injecté sur un callback de build QA ne contient plus
   l'instruction terminale `update_task_status` + `send_message`.
 - **AC4** — Un tour de callback de build QA qui atteint EndTurn sans
   `run_gh pr review` réussi est re-prompté par une garde dont le message nomme
   `run_gh pr review` et la ligne `VERDICT:`.
+- **AC4b** — Cette garde ne s'arme que là où un verdict est dû : un callback
+  `long_running:build_mika` sans `qa-review` parmi les skills du tour (le cas
+  mika-dev, qui porte `build-mika` dans son allowlist) n'est **pas** re-prompté.
 - **AC5** — Filet : un tour de callback de build QA terminé sans verdict, avec
   une cible PR stampée, produit exactement **un** POST `pr review` portant
   `VERDICT: hold[review]`.
@@ -303,8 +393,12 @@ assertables sans production.
 - **AC8** — Bout en bout : une revue qa-review sur une PR à ACs comportementaux
   produit un build **et** un verdict posté sur la PR — pas seulement
   « Build succeeded ». C'est le test nommé par le ticket.
-- **AC9** — Aucune régression de portée : les callbacks `run_claude_pilot`
-  conservent à l'identique leur framing, leur garde et leur contrat terminal.
+- **AC9** — Aucune régression de portée : les callbacks `run_claude_pilot`,
+  `run_claude_pilot_groom`, `deploy_mika`, `address_pr_comments` et
+  `resolve_pr_conflicts` conservent à l'identique leur framing, leur garde et leur
+  contrat terminal. Les cinq sont nommés parce que quatre outils portent
+  `long_running: true` hors du pilote, et qu'une AC écrite sur le seul pilote
+  laisserait les trois autres hors contrôle.
 
 ## Sondes post-déploiement, et leurs haltes
 
@@ -315,6 +409,13 @@ assertables sans production.
   — **doit rester proche de zéro.** Un filet qui porte le trafic nominal a
   remplacé un silence par un `hold[review]` systématique : B1/B2 n'ont alors pas
   pris, et c'est **là** qu'il faut chercher, pas dans le réglage du filet.
+- **Sonde 2b (la QA regarde toujours le diff).** Sur les premières revues après
+  déploiement, chaque verdict posté porte une section `DIFF ANALYSIS` à puces
+  code-level non vides. C'est le contrôle du risque de B1 : un `pass` sans revue
+  de diff serait *moins* visible que le silence qu'on vient de réparer, donc il se
+  vérifie **avant** de se féliciter que les verdicts reviennent. **Halte** — un
+  verdict sans `DIFF ANALYSIS` réelle ⇒ revenir sur l'en-tête de portée, ne pas
+  se contenter du test unitaire qui l'aura pourtant validé.
 - **Sonde 3 (contrôle négatif).** `grep qa_deadline_verdict $MIKA_SPIRIT_LOG_FILE | jq 'select(.outcome == "posted")'`
   — le filet mika#2276 ne doit pas se mettre à firer : ce correctif ne rallonge
   aucun tour.
