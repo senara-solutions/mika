@@ -60,6 +60,16 @@ use skill_nudge::{SkillNudgeContext, SkillNudgeState, apply_turn_end, inject_pen
 const VERDICT_PRODUCER_SKILLS: &[&str] = &["mika-arch-groom-ticket", "mika-arch-second-review"];
 
 /// Check if any skill in the registry is a known verdict producer.
+/// mika#2355 — the names of the skills injected on a turn, in registry order.
+/// Threaded into `run_loop` so the `qa_build_callback_verdict` guard can ask
+/// `qa_build_callback::qa_verdict_required` whether a verdict is due.
+fn skill_names_of(matched: &[&SkillEntry]) -> Vec<String> {
+    matched
+        .iter()
+        .map(|e| e.manifest.skill.name.clone())
+        .collect()
+}
+
 fn has_verdict_producer_skill(skills: &[crate::skills::index::SkillEntry]) -> bool {
     skills
         .iter()
@@ -209,6 +219,18 @@ impl TeamAgentOutcome {
 /// (e.g., claude-pilot → self-dev skill) is driven by the active skill prompts,
 /// not the engine. See #313 — the previous 3-branch routing created competing
 /// instruction sets between the engine and the self-dev skill prompt.
+///
+/// The **terminal contract** appended after the framing is flow-specific, and
+/// the flow is read off the label (mika#2355 B2):
+///
+/// - `long_running:build_mika` — a build callback. The turn concludes by
+///   whatever the skill that launched the build prescribes (for `qa-review`:
+///   `run_gh pr review` carrying a `VERDICT:` line, enforced by the
+///   `qa_build_callback_verdict` guard). The self_dev contract is NOT
+///   prescribed here: three mika-qa turns on 2026-09-17 answered "Build
+///   succeeded" via `send_message`, satisfied the engine, and posted nothing.
+/// - every other label — the self_dev dispatch contract (`update_task_status`
+///   + `send_message`), enforced by the `callback_terminal_action` guard (#870).
 pub fn build_callback_trigger_context(
     label: &str,
     task_id: &str,
@@ -233,6 +255,29 @@ pub fn build_callback_trigger_context(
         ""
     };
 
+    // mika#2355 B2 — the terminal contract follows the flow, not the fact of
+    // being a callback. A build callback never owns a self_dev parent task to
+    // mark terminal; prescribing `update_task_status` + `send_message` here
+    // taught the model that "Build succeeded" delivered by send_message was a
+    // complete turn.
+    let terminal_contract = if crate::qa_build_callback::is_build_callback_label(label) {
+        "This is a BUILD callback. Its terminal contract is the one defined by the \
+         skill that launched the build — for a QA review, that is a successful \
+         `run_gh` call with `pr review` carrying a trailing `VERDICT:` line, and the \
+         engine will re-prompt an EndTurn that lacks it. Do NOT treat this as a \
+         pilot-dispatch callback: `update_task_status` on a self_dev parent and a \
+         `send_message` summary are not the terminal actions of this turn."
+    } else {
+        "This turn MUST end with both of the following before EndTurn:\n\
+         1. update_task_status — mark the parent self_dev task terminal \
+         (failed/pending/completed) based on the callback result\n\
+         2. send_message — notify the operator of the result\n\n\
+         Optionally also call create_task to relaunch claude-pilot if the failure mode \
+         is retry-safe.\n\n\
+         EndTurn without both (1) and (2) will be rejected by the engine and you will \
+         be re-prompted."
+    };
+
     format!(
         "{base}\n\
          IMPORTANT: A successful result confirms only the specific action performed. \
@@ -241,14 +286,7 @@ pub fn build_callback_trigger_context(
          Follow the workflow defined by your active skills for this callback type. \
          If no skill-specific workflow applies, use send_message to notify the user \
          with a clear, concise summary of the key findings and any recommended actions.\n\n\
-         This turn MUST end with both of the following before EndTurn:\n\
-         1. update_task_status — mark the parent self_dev task terminal \
-         (failed/pending/completed) based on the callback result\n\
-         2. send_message — notify the operator of the result\n\n\
-         Optionally also call create_task to relaunch claude-pilot if the failure mode \
-         is retry-safe.\n\n\
-         EndTurn without both (1) and (2) will be rejected by the engine and you will \
-         be re-prompted."
+         {terminal_contract}"
     )
 }
 
@@ -926,6 +964,11 @@ async fn run_loop(
     review_brief: Option<&str>,
     enabled_tool_names: &HashSet<String>,
     is_verdict_producer: bool,
+    // mika#2355 — names of the skills injected on this turn. Read by the
+    // `qa_build_callback_verdict` inline guard, whose trigger is conjunctive
+    // (build-callback message AND `qa-review` loaded) and therefore cannot be
+    // an `INTENT_GUARDS` entry (`fn(&str) -> bool` sees the message alone).
+    loaded_skill_names: &[String],
     store_llm_calls: bool,
     store_tool_calls: bool,
     prompt_variant: Option<&str>,
@@ -1053,6 +1096,13 @@ async fn run_loop(
                 .join(""),
         })
         .unwrap_or_default();
+    // mika#2355 — is a QA verdict DUE on this turn? Conjunctive: the message
+    // is a build callback AND `qa-review` is among the turn's skills. Computed
+    // once, here, from the same `user_input_text` every other guard reads, so
+    // the positive guard below and the negative carve-out in
+    // `callback_trigger_active` cannot disagree on what a build callback is.
+    let qa_verdict_due =
+        crate::qa_build_callback::qa_verdict_required(&user_input_text, loaded_skill_names);
     // Track system prompt length before nudge so we can strip it later
     let system_prompt_len = request.system.as_ref().map_or(0, |s| s.len());
 
@@ -2255,6 +2305,46 @@ async fn run_loop(
                         continue;
                     }
 
+                    // mika#2355 — QA build-callback verdict guard (non-empty text
+                    // path). A build callback with `qa-review` loaded concludes by
+                    // POSTING the review: a successful `run_gh pr review` must appear
+                    // in this turn's tool history before EndTurn. Inline rather than
+                    // in INTENT_GUARDS because the trigger is conjunctive (message
+                    // AND skill set) — the registry's `fn(&str) -> bool` sees only
+                    // the message, and armed on the label alone this guard would
+                    // re-prompt mika-dev (which carries `build-mika`) to post a PR
+                    // review it does not owe. Single retry via intent_guard_retries.
+                    if !skip_remaining_guards
+                        && matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && qa_verdict_due
+                        && !intent_guard_retries
+                            .contains(crate::qa_build_callback::QA_VERDICT_REQUIRED_LABEL)
+                        && !crate::qa_build_callback::pr_review_posted_in_turn(&all_tool_summaries)
+                    {
+                        intent_guard_retries
+                            .insert(crate::qa_build_callback::QA_VERDICT_REQUIRED_LABEL);
+                        warn!(
+                            step,
+                            label = mode.label(),
+                            intent_guard = crate::qa_build_callback::QA_VERDICT_REQUIRED_LABEL,
+                            "QA build-callback verdict guard fired — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(
+                                crate::qa_build_callback::QA_VERDICT_REQUIRED_CORRECTION
+                                    .to_string(),
+                            ),
+                        });
+                        continue;
+                    }
+
                     // #1218 — Webhook milestone advance guard. Mirrors
                     // callback_milestone_advance for `pull_request.closed(merged:true)`
                     // webhook turns whose correlated task has a milestone/project
@@ -3044,6 +3134,40 @@ async fn run_loop(
                             role: LlmRole::User,
                             content: LlmContent::Text(
                                 CALLBACK_TERMINAL_ACTION_CORRECTION.to_string(),
+                            ),
+                        });
+                        continue;
+                    }
+
+                    // mika#2355 — QA build-callback verdict guard for empty-text
+                    // exits. Mirror of the inline guard in the non-empty text path:
+                    // a bare EndTurn is exactly the shape a turn that has nothing to
+                    // say takes, and it is the one the registry never sees.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && qa_verdict_due
+                        && !intent_guard_retries
+                            .contains(crate::qa_build_callback::QA_VERDICT_REQUIRED_LABEL)
+                        && !crate::qa_build_callback::pr_review_posted_in_turn(&all_tool_summaries)
+                    {
+                        intent_guard_retries
+                            .insert(crate::qa_build_callback::QA_VERDICT_REQUIRED_LABEL);
+                        warn!(
+                            step,
+                            label = mode.label(),
+                            intent_guard = crate::qa_build_callback::QA_VERDICT_REQUIRED_LABEL,
+                            "QA build-callback verdict guard fired on empty-text exit — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(
+                                crate::qa_build_callback::QA_VERDICT_REQUIRED_CORRECTION
+                                    .to_string(),
                             ),
                         });
                         continue;
@@ -4036,6 +4160,8 @@ async fn run_agent_inner(
     let store_llm = params.settings.is_none_or(|s| s.store_llm_calls);
     let store_tools = params.settings.is_none_or(|s| s.store_tool_calls);
     let is_verdict_producer = has_verdict_producer_skill(params.skills.skills());
+    // mika#2355 — the turn's skill set, for the QA build-callback verdict guard.
+    let loaded_skill_names = skill_names_of(&matched_entries);
 
     // mika#1583 — per-turn nudge context (conversation mode only; `None` when no
     // server-provided `SkillNudgeState` is threaded through `AgentParams`).
@@ -4067,6 +4193,7 @@ async fn run_agent_inner(
         Some(params.user_message),
         &enabled_tool_names,
         is_verdict_producer,
+        &loaded_skill_names,
         store_llm,
         store_tools,
         prompt_variant.as_deref(),
@@ -4960,6 +5087,11 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
     let no_required_suffix_lines: Vec<String> = Vec::new();
     let no_required_finding_list_prefixes: Vec<String> = Vec::new();
     let no_review_anchor_contract = ReviewAnchorContract::default();
+    // mika#2355 — the production site of the QA build-callback verdict guard:
+    // a build callback is always a silent trigger, and `matched` here is
+    // `callback_safe_skills()`, which is exactly where B1 made
+    // `qa-review-build-callback` reachable.
+    let loaded_skill_names = skill_names_of(&matched);
     let result = run_loop(
         llm,
         tools,
@@ -4981,6 +5113,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         None, // mika#2037: silent turns review no brief
         &enabled_tool_names,
         false, // silent mode: mode.is_conversation() gate handles callback turns (#1254)
+        &loaded_skill_names, // mika#2355: callback_safe_skills() — where qa-review is or isn't
         store_llm,
         store_tools,
         prompt_variant.as_deref(),
@@ -5523,6 +5656,7 @@ async fn run_team_agent_inner_impl(
         None, // mika#2037: team turns review no brief
         &enabled_tool_names,
         has_verdict_producer_skill(params.skills.skills()),
+        &skill_names_of(&matched_entries), // mika#2355
         store_llm,
         store_tools,
         prompt_variant.as_deref(),
@@ -7530,10 +7664,18 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
     // #870 — callback turns must update parent task AND notify operator before
     // EndTurn.  Without this guard, the callback session can run diagnostic
     // tool calls and exit with zero assistant messages, leaving the operator
-    // blind to dev-run failures.  F1 callback-site audit confirmed only one
-    // callback flow exists today (long_running:run_claude_pilot via
-    // task_engine/dispatcher.rs).  AND-shape: BOTH update_task_status AND
+    // blind to dev-run failures.  AND-shape: BOTH update_task_status AND
     // send_message required; create_task (relaunch) optional.
+    //
+    // Scope (mika#2355): this is the contract of the self_dev DISPATCH flow
+    // (`long_running:run_claude_pilot` / `run_claude_pilot_groom`, plus the
+    // other `long_running` tools that report to a self_dev parent —
+    // `deploy_mika`, `address_pr_comments`, `resolve_pr_conflicts`). The
+    // original #870 audit believed only one callback flow existed; `build_mika`
+    // was a second one all along, and imposing this contract on it produced
+    // three "Build succeeded" turns with no PR verdict on 2026-09-17.
+    // `callback_trigger_active` now excludes `long_running:build_mika`; the
+    // build flow's own contract is the inline `qa_build_callback_verdict` guard.
     IntentPrecondition {
         label: CALLBACK_TERMINAL_ACTION_LABEL,
         trigger: callback_trigger_active,
@@ -7731,11 +7873,24 @@ fn resume_reconcile_satisfied(summaries: &[ToolCallSummary]) -> bool {
 /// #870 — Detects callback turns by matching the synthetic user message
 /// format emitted by `run_silent_agent` for `SilentTrigger::Callback`.
 /// The user message is `[callback: {label}]` (see agent.rs line ~2767).
+///
+/// Two callback flows are carved out, each because it owns a different
+/// terminal contract. Both carve-outs are read by the INTENT_GUARDS registry
+/// entry (non-empty text path) AND the inline empty-text mirror — they share
+/// this predicate, so the two sites cannot drift apart.
 fn callback_trigger_active(msg: &str) -> bool {
     // Match regular callback turns but NOT deferred-dispatch retries (mika#1011).
     // Deferred-dispatch has its own INTENT_GUARD with a different required-action
     // set ({run_claude_pilot} only, no update_task_status/send_message).
-    msg.starts_with("[callback:") && !msg.starts_with("[callback:deferred-dispatch]")
+    //
+    // NOT build callbacks either (mika#2355 B2): `long_running:build_mika` has
+    // no self_dev parent to mark terminal. Its contract — a posted `run_gh pr
+    // review` when qa-review is loaded — is enforced by the inline
+    // `qa_build_callback_verdict` guard in `run_loop`, which needs the turn's
+    // skill set and therefore cannot live in this `fn(&str) -> bool` registry.
+    msg.starts_with("[callback:")
+        && !msg.starts_with("[callback:deferred-dispatch]")
+        && !crate::qa_build_callback::is_build_callback(msg)
 }
 
 /// mika#1011 — Returns `true` when the user message indicates a deferred-dispatch retry.
@@ -10644,6 +10799,116 @@ mod tests {
         assert!(!callback_trigger_active(
             "[callback:deferred-dispatch] [parent: task-123]"
         ));
+    }
+
+    /// mika#2355 AC2 / AC9 — the #870 guard no longer arms on a build
+    /// callback, and still arms on every other `long_running` callback.
+    ///
+    /// `callback_trigger_active` is the ONE predicate both sites read — the
+    /// `INTENT_GUARDS` registry entry (non-empty text) and the inline
+    /// empty-text mirror — so asserting it here asserts both; the eval test
+    /// `test_qa_build_callback_verdict_2355` drives the production silent path
+    /// through each site end to end.
+    #[test]
+    fn mika2355_callback_terminal_action_is_carved_out_of_build_callbacks_only() {
+        assert!(
+            !callback_trigger_active("[callback: long_running:build_mika]"),
+            "a build callback owns no self_dev parent to mark terminal"
+        );
+        // The milestone suffix must not re-arm it either.
+        assert!(!callback_trigger_active(
+            "[callback: long_running:build_mika] [milestone-parent: abc]"
+        ));
+        // The five other long_running tools keep the #870 contract verbatim.
+        for tool in [
+            "run_claude_pilot",
+            "run_claude_pilot_groom",
+            "deploy_mika",
+            "address_pr_comments",
+            "resolve_pr_conflicts",
+        ] {
+            assert!(
+                callback_trigger_active(&format!("[callback: long_running:{tool}]")),
+                "{tool}: the #870 guard must still arm"
+            );
+        }
+        // Registry wiring: the entry's trigger IS this predicate, not a copy.
+        let entry = INTENT_GUARDS
+            .iter()
+            .find(|g| g.label == CALLBACK_TERMINAL_ACTION_LABEL)
+            .expect("the #870 entry exists");
+        assert!(!(entry.trigger)("[callback: long_running:build_mika]"));
+        assert!((entry.trigger)("[callback: long_running:run_claude_pilot]"));
+    }
+
+    /// mika#2355 AC3 / AC9 — the framing prescribes the self_dev terminal
+    /// contract to every callback EXCEPT a build callback, which is told what
+    /// its own contract is (a posted `run_gh pr review`).
+    #[test]
+    fn mika2355_build_callback_framing_does_not_prescribe_the_self_dev_contract() {
+        let build = build_callback_trigger_context(
+            crate::qa_build_callback::BUILD_CALLBACK_LABEL,
+            "task-001",
+            None,
+            "Build succeeded",
+            false,
+        );
+        assert!(
+            !build.contains("This turn MUST end with both of the following"),
+            "build callback framing still prescribes update_task_status + send_message"
+        );
+        assert!(
+            !build.contains("mark the parent self_dev task terminal"),
+            "build callback framing still names a self_dev parent"
+        );
+        assert!(build.contains("`run_gh` call with `pr review`"));
+        assert!(build.contains("`VERDICT:`"));
+        // The grounding and skill-delegation lines are common to all flows.
+        assert!(build.contains("NEVER extrapolate to downstream states"));
+        assert!(build.contains("Follow the workflow defined by your active skills"));
+
+        for tool in [
+            "run_claude_pilot",
+            "run_claude_pilot_groom",
+            "deploy_mika",
+            "address_pr_comments",
+            "resolve_pr_conflicts",
+        ] {
+            let ctx = build_callback_trigger_context(
+                &format!("long_running:{tool}"),
+                "task-001",
+                None,
+                "Result text",
+                false,
+            );
+            assert!(
+                ctx.contains("This turn MUST end with both of the following"),
+                "{tool}: the self_dev terminal contract must be unchanged"
+            );
+            assert!(
+                ctx.contains("1. update_task_status") && ctx.contains("2. send_message"),
+                "{tool}: both terminal actions must still be named"
+            );
+            assert!(
+                !ctx.contains("This is a BUILD callback"),
+                "{tool}: must not receive the build-callback contract"
+            );
+        }
+    }
+
+    /// mika#2355 — the failure-verification instruction (#716) is orthogonal
+    /// to the flow: a FAILED build callback still gets it.
+    #[test]
+    fn mika2355_failed_build_callback_keeps_the_verification_instruction() {
+        let ctx = build_callback_trigger_context(
+            crate::qa_build_callback::BUILD_CALLBACK_LABEL,
+            "task-001",
+            None,
+            "Build failed",
+            true,
+        );
+        assert!(ctx.contains("This callback reported a FAILURE"));
+        assert!(ctx.contains("This is a BUILD callback"));
     }
 
     #[test]
