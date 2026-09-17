@@ -153,9 +153,19 @@ plus cher, court-circuitée au premier échec :
    hors de la PR et « complet » serait faux.
 3. `cargo fmt --all --check` propre.
 4. `cargo clippy --workspace --all-targets` sans erreur.
-5. `scripts/verify-pipeline.sh` passe — l'étape 7 du pipeline `/mika`, dont l'en-tête
-   dit « Verify that the /mika pipeline produced required artifacts before PR
+5. `scripts/verify-pipeline.sh origin/main` passe — l'étape 7 du pipeline `/mika`, dont
+   l'en-tête dit « Verify that the /mika pipeline produced required artifacts before PR
    creation ». C'est littéralement la vérification que le corps demande à l'opérateur.
+   L'argument est **porteur** : sans lui le script compare à `main` local
+   (`BASE_REF="${1:-main}"`, `verify-pipeline.sh:91`), qui dans un worktree de dispatch
+   peut avoir des jours de retard — le bucket `source`/`docs` serait alors calculé sur
+   un diff qui n'est pas celui que la PR publiera. `origin/main` est le mode que la CI
+   emploie, documenté dans l'usage du script lui-même.
+   Ce terme a une limite mesurée, traitée en § Fire-Disposition : deux de ses trois
+   mécanismes d'exemption lisent des artefacts qui n'existent pas encore au moment de
+   la mesure (le corps de la PR pour l'héritage du label `documentation`,
+   `GITHUB_EVENT_PATH` pour le label `pipeline-exempt`), donc il est ici **plus strict
+   que dans la CI**.
 
 **Fail-closed sans exception.** Tout ce qui n'est pas une réussite explicite rend
 `no` : commande absente, budget dépassé, `$WORKTREE_DIR` vide, dépôt illisible,
@@ -184,13 +194,57 @@ défaut + WARN) :
   sur le clippy gate de `wip_rescue` qui exécute déjà cette classe de travail en aval.
   Dépassement ⇒ `no` + terme `budget`, jamais un `yes` partiel.
 
-**Point d'implémentation à trancher en écrivant le code :** vérifier que ces deux
-variables atteignent bien le process `dispatch-lib.sh`. Le fichier lit déjà des
-`MIKA_*` (`MIKA_PILOT_SANDBOX`, `MIKA_DISPATCH_WORKTREE_FILE`), mais
-`scrub_mika_env_vars` retire tout `MIKA_*` des enfants du dispatch. Si la propagation
-n'est pas acquise, suivre le précédent `PILOT_LOG_DIR` (mika#2249) : nom sans préfixe,
-divergence documentée au site de lecture. Une variable que seul le lecteur honore est
-un réglage décoratif (mika#2165).
+#### Comment ces deux variables atteignent `dispatch-lib.sh` (F1, tranché)
+
+Le plan laissait la propagation « à trancher en écrivant le code ». Elle est tranchée
+ici, et la mesure montre que le dilemme était **mal posé** : le choix du nom n'a aucun
+effet sur la propagation.
+
+**Ce que le code fait, lu à la source.** `dispatch-lib.sh` est lancé par
+`spawn_long_running_exec` (`crates/mika-agent/src/skills/executor.rs:3181`), qui
+appelle `sandboxed_pilot_env` (`executor.rs:115`) — et cette fonction ne *retire* pas
+les `MIKA_*`, elle fait `env_clear()` puis ne recopie que l'allowlist **positive**
+`SANDBOX_ENV_CORE_ALLOWLIST` + `SANDBOX_ENV_ALLOWED_PREFIXES` (`PATH`, `HOME`, `USER`,
+`LOGNAME`, `SHELL`, `TERM`, `LANG`, `LC_ALL`, `TMPDIR`, `HOSTNAME`, puis les préfixes
+`LC_`, `XDG_`, `NVM_`, `CARGO_`, `RUSTUP_`). **Aucun nom hors de cette liste ne
+traverse, préfixé ou non** : `RESCUE_VERIFY_ENABLED` sans préfixe serait effacé
+exactement comme `MIKA_RESCUE_VERIFY_ENABLED`. Le « repli sans préfixe » que le plan
+envisageait ne propage rien.
+
+**Le précédent `PILOT_LOG_DIR` ne dit pas ce qu'on lui faisait dire.**
+`grep -rn PILOT_LOG_DIR skills/ crates/ scripts/` ne rend que le défaut de lecture
+(`dispatch-lib.sh`) et deux fichiers de test — **rien ne le pose en production**. Il
+n'a donc jamais eu à traverser ce sandbox, et n'établit rien sur cette question. La
+phrase du CLAUDE.md qui le cite raisonne d'ailleurs sur `scrub_mika_env_vars`
+(`executor.rs:767`), la voie exec-handler courte, et non sur `sandboxed_pilot_env`
+(`executor.rs:3204`), la voie long-running qui porte `dispatch-lib.sh`. Deux voies,
+deux mécanismes ; seule la seconde est sur ce chemin.
+
+**Décision : préfixe `MIKA_` conservé, propagation par injection explicite.** La seule
+voie qui traverse est celle que le fichier emprunte déjà trois fois, immédiatement
+après le sandbox : `GH_TOKEN` (`executor.rs:3205`), `MIKA_PILOT_TRANSCRIPT_FILE`
+(`executor.rs:3210`, mika#1705) et `MIKA_DISPATCH_WORKTREE_FILE` (`executor.rs:3214`,
+mika#2249). Deux des trois portent le préfixe : garder `MIKA_RESCUE_VERIFY_*` est la
+lecture cohérente, et un nom sans préfixe coûterait une divergence de vocabulaire sans
+rien acheter.
+
+**La nuance qui distingue cette injection de ses deux sœurs, et qui décide sa forme.**
+Les deux sœurs injectent un chemin **calculé par le moteur** ; celle-ci relaie une
+valeur **d'opérateur** lue dans l'environnement du process mika-spirit. Première de sa
+classe, donc : elle ne pose la variable **que** si elle est présente et non vide côté
+spirit. Une absence ne devient jamais une valeur — le shell garde son propre défaut au
+lieu d'en hériter un silencieusement, ce qui est la différence entre un réglage absent
+et un réglage posé à la valeur par défaut, deux états qu'un opérateur doit pouvoir
+distinguer.
+
+**Ce que la mesure ne franchit pas, et ce n'est pas un oubli.** `bwrap` n'enveloppe que
+l'invocation `claude-pilot` (`_run_pilot_sandboxed`) ; le tail de rescue — donc
+`_measure_pipeline_verified` et les `cargo` qu'elle lance — tourne **hors** bubblewrap,
+comme le `git worktree add`. L'allowlist `--setenv` du sandbox pilote n'est donc pas
+sur ce chemin et n'a pas à être élargie.
+
+Une variable que seul le lecteur honore est un réglage décoratif (mika#2165) ; c'est
+exactement ce que l'injection explicite empêche, et AC9 l'épingle.
 
 ### Coût, nommé
 
@@ -205,7 +259,9 @@ kill-switch le rend réversible sans rebuild.
 **U1 — `_measure_pipeline_verified`** dans `skills/bundled/_shared/dispatch-lib.sh`,
 posée à côté de `_rescue_diff_carries_work` dont elle reprend la forme (garde
 `$wt_dir` vide → fail-closed, commentaire d'en-tête portant l'arbitrage). Rend `0`
-pour vérifié, `1` sinon, et écrit sur stdout le nom du terme en échec.
+pour vérifié, `1` sinon, et écrit sur stdout le nom du terme en échec. Le terme 5
+invoque `scripts/verify-pipeline.sh origin/main` — l'argument est porteur, voir
+§ La mesure. Prérequis : U7 (sans le canal, le kill-switch est décoratif).
 
 **U2 — `_compose_rescue_pr_body`** prend un cinquième argument (l'état vérifié) et le
 nom du terme en échec ; le littéral `no` du heredoc est remplacé par la valeur
@@ -238,6 +294,91 @@ lira `yes` comme une approbation préalable.
 lisible par deux consommateurs et écrit par personne », et la mise à jour de la
 section CLAUDE.md qui décrit le marqueur, avec ses surfaces opérateur.
 
+**U7 — canal de réglage, côté Rust.** `inject_rescue_verify_env(&mut cmd)` dans
+`crates/mika-agent/src/skills/executor.rs`, posée à côté de
+`inject_dispatch_worktree_env` et appelée au même endroit — dans
+`spawn_long_running_exec`, **après** `sandboxed_pilot_env`, avec le même commentaire
+d'ancrage que ses deux sœurs. Elle relaie `MIKA_RESCUE_VERIFY_ENABLED` et
+`MIKA_RESCUE_VERIFY_BUDGET_SECS` depuis l'environnement du process spirit, et **ne
+pose que ce qui est présent et non vide** (voir § Réglages). Unité listée en dernier
+mais **prérequis de U1** : sans elle, le kill-switch est un réglage que seul le
+lecteur honore.
+
+## Fire-Disposition
+
+Requis par le Fire-Disposition Gate (mika#1574,
+`docs/solutions/best-practices/fire-disposition-doctrine.md`). Ce plan porte trois
+livrables de classe détecteur ; ils n'ont pas la même population, donc pas la même
+disposition, et les séparer est ce qui rend chacune vérifiable.
+
+### D1 — `_measure_pipeline_verified` (le détecteur qui balaie des données réelles)
+
+C'est le seul des trois qui s'exécute sur une population pré-existante : ses termes 3,
+4 et 5 traversent l'état réel du dépôt au moment du rescue.
+
+**Population mesurée sur la branche de ce plan, aujourd'hui :**
+
+| Terme | Commande | Résultat |
+|---|---|---|
+| 3 | `cargo fmt --all --check` | rc=0, sortie vide |
+| 4 | `cargo clippy --workspace --all-targets` | rc=0, zéro ligne `warning:` |
+| 5 | `scripts/verify-pipeline.sh` | présent, exécutable (`-rwxr-xr-x`) |
+
+**Disposition retenue : (c) halt-and-surface, et le fail-closed en EST la forme.** Un
+terme qui fire ne casse pas la CI et ne rend pas la main à un choix du pilote : il
+produit `no` + `<!-- rescue-verify-failed: <terme> -->` + l'extrait de sortie, c'est-à-dire
+le geste opérateur d'aujourd'hui, mais nommé. La surface de remontée est la PR, pas le
+test — ce qui est le bon endroit, puisque la donnée qui fire appartient à cette PR-là.
+
+**(a) allowlist nommée est écartée sur mesure, pas par préférence :** la population à
+exempter est **vide** sur les deux termes exemptables (fmt, clippy). Une allowlist née
+vide est un endroit où déposer la prochaine violation, et personne ne saurait plus si
+elle protège un cas mesuré ou une habitude.
+
+**(b) land disabled est écartée parce que le kill-switch la couvre déjà**, et mieux :
+`MIKA_RESCUE_VERIFY_ENABLED=0` désarme sans rebuild et restaure le corps d'aujourd'hui à
+l'octet près (AC4). Livrer désarmé exigerait une condition de réarmement, et mika#2272 a
+mesuré ce que coûte une condition de réarmement **insatisfiable** : mika#2249 a attendu
+trois lignes d'audit qu'un scan à population vide ne pouvait pas produire.
+
+### D1-bis — le terme 5 fire sur une classe légitime, et c'est nommé plutôt que corrigé
+
+`verify-pipeline.sh` a trois mécanismes d'exemption ; **deux sont inopérants à l'endroit
+où la mesure tourne**, parce qu'ils lisent des artefacts qui n'existent pas encore : (1)
+l'héritage du label `documentation` passe par `Closes #N` dans le **corps de la PR**, que
+`gh pr create` n'a pas encore écrit ; (2) le label `pipeline-exempt` est lu depuis
+`GITHUB_EVENT_PATH`, absent hors runner. Seul (3), le trailer de commit
+`Pipeline-Exempt:`, fonctionne. Conséquence : un travail docs-only légitime dont le
+ticket porte le label `documentation` rend `no` ici alors qu'il passerait en CI.
+
+**Disposition : accepter ce `no`, le nommer, et ne pas le compenser.** Il est du côté sûr
+de l'asymétrie déjà arbitrée (§ La mesure) — un `no` de trop coûte un geste opérateur
+visible, un `yes` de trop ouvre la revue sur du travail incomplet. La sortie du script
+commence par `FAIL: …`, qui est portée telle quelle dans le corps sous
+`rescue-verify-failed: verify-pipeline`, donc l'opérateur lit la cause au lieu de
+l'enquêter. **Ce qu'il ne faut PAS faire en réaction** : rendre le terme 5 permissif, ni
+le retirer de la conjonction. La bonne correction, si la fréquence le justifie, est de
+donner au script un quatrième mécanisme d'exemption lisible avant la PR — ticket séparé,
+pas un assouplissement décidé ici. La sonde § Sondes post-déploiement compte cette
+population séparément, précisément pour que cette décision repose sur un chiffre.
+
+### D2 — les tests de U4 (population vide par construction)
+
+Les assertions symétriques de U4 montent leurs propres dépôts temporaires, à la manière
+de celles de `_rescue_diff_carries_work`. Il n'existe aucune donnée pré-existante
+qu'elles puissent traverser : leur population est bâtie par le test et détruite avec lui.
+**Disposition : sans objet**, et dit ici plutôt que tu par prudence — la doctrine demande
+de nommer, pas seulement de traiter.
+
+### D3 — l'assertion AC3 existante (une mise à jour, pas un feu)
+
+`test-dispatch-lib.sh:3179` affirme `'rescue-pipeline-verified: no'` en dur, par un scan
+du corps de `_compose_rescue_pr_body`. Elle rougira au commit qui remplace le littéral —
+mais c'est **le même commit** qui la met à jour (U4), et il n'y a là non plus aucune
+donnée pré-existante. **Disposition : mise à jour atomique dans U4**, jamais un `skip`
+ni une exception. Une assertion qui affirme le littéral que ce ticket existe pour retirer
+épinglerait le défaut ; la laisser désarmée le cacherait.
+
 ## Contrat de vérification
 
 - `bash skills/bundled/_shared/test-dispatch-lib.sh` — vert, U4 compris.
@@ -256,7 +397,10 @@ section CLAUDE.md qui décrit le marqueur, avec ses surfaces opérateur.
 - `_measure_pipeline_verified` existe, est appelée sur la voie rescue, et son
   résultat est ce que le corps de la PR publie.
 - Aucun littéral `no` ne subsiste dans `_compose_rescue_pr_body`.
-- Le kill-switch restaure le corps d'aujourd'hui à l'octet près.
+- Le kill-switch restaure le corps d'aujourd'hui à l'octet près, **et il est
+  effectivement lu** : les deux variables sont injectées explicitement après
+  `sandboxed_pilot_env` (U7), jamais laissées à un héritage que l'allowlist positive
+  bloque.
 - Les deux consommateurs (qa-review Step 1.5, `wip_rescue`) sont inchangés dans leur
   logique de lecture ; seule la note explicative du prompt bouge.
 - La rectification du diagnostic (R1–R4) est portée dans le corps de la PR, pour que
@@ -272,6 +416,8 @@ section CLAUDE.md qui décrit le marqueur, avec ses surfaces opérateur.
 - [ ] AC6 — Le Step 1.5 de qa-review énonce que `yes` atteste la complétude du pipeline local et non la qualité du travail ; la logique `yes`/`no` est inchangée.
 - [ ] AC7 — `wip_rescue` n'est pas modifié : aucun diff sous `crates/mika-agent/src/wip_rescue.rs`. Le daemon reste lecteur, jamais écrivain de son propre feu vert.
 - [ ] AC8 — Une PR de rescue produite par un dispatch dont le pipeline est complet traverse le Step 1.5 de qa-review sans `hold[review]` sur le motif du marqueur.
+- [ ] AC9 — `MIKA_RESCUE_VERIFY_ENABLED` et `MIKA_RESCUE_VERIFY_BUDGET_SECS` atteignent `dispatch-lib.sh` par **injection explicite après `sandboxed_pilot_env`**, jamais par héritage. Deux assertions : (a) un test Rust sur `inject_rescue_verify_env` vérifie qu'une variable absente ou vide côté spirit n'est pas posée côté enfant ; (b) un test refuse que ces deux noms soient ajoutés à `SANDBOX_ENV_CORE_ALLOWLIST` ou couverts par `SANDBOX_ENV_ALLOWED_PREFIXES` — l'allowlist positive reste la garde, l'injection reste l'exception nommée.
+- [ ] AC10 — Le terme 5 est invoqué avec `origin/main` en argument, jamais avec le défaut `main` local. Assertion de forme sur le corps de `_measure_pipeline_verified` : une comparaison à un `main` de worktree mesurerait un diff qui n'est pas celui que la PR publie.
 
 ## Risques, et ce qui les borne
 
@@ -297,6 +443,13 @@ déplacer la mesure chez un consommateur, ce qu'AC7 refuse.
   `no`. Un régime à `no` quasi total signifie que la mesure est trop stricte ou qu'un
   terme échoue systématiquement — lire le `rescue-verify-failed` avant de toucher au
   moindre seuil.
+- **Le terme 5 compté à part, 72 h (§ Fire-Disposition D1-bis).** Parmi les `no`,
+  compter ceux dont le `rescue-verify-failed` vaut `verify-pipeline` **et** dont le
+  ticket porte le label `documentation` : c'est la population des faux `no` structurels,
+  celle que la mesure ne peut pas voir avant que la PR existe. Elle est attendue rare.
+  Si elle domine les `no`, le remède est un mécanisme d'exemption lisible avant la PR,
+  dans son propre ticket — **ne pas assouplir le terme 5**, ce serait rendre permissif
+  le seul terme dont on aura mesuré qu'il refuse pour une bonne raison.
 - **Symptôme, 72 h.** Les `hold[review]` de qa-review motivés par le marqueur doivent
   tendre vers zéro sur les PR dont le pipeline est complet. S'ils persistent avec un
   marqueur `yes`, **halte** : le Step 1.5 tient la PR pour une autre raison
@@ -323,3 +476,36 @@ déplacer la mesure chez un consommateur, ce qu'AC7 refuse.
 - **Le choix de `/ce-work` comme entry-command** (mika#1074). Il est délibéré et
   résout la classe narrate-then-exit ; ce plan ne le relitige pas.
 - **mika#2348 (fmt rescue)**, adjacent et déjà traité ailleurs.
+- **Un quatrième mécanisme d'exemption pour `verify-pipeline.sh`**, lisible avant que
+  la PR existe (§ Fire-Disposition D1-bis). Réel, mesurable, et conditionné à la sonde
+  des 72 h : ouvrir ce ticket avant d'avoir le chiffre serait prescrire sans mesure.
+
+## Revision history
+
+- rev 2 (2026-09-17) : adressé **F1** en tranchant la propagation des deux variables
+  plutôt qu'en la déléguant à l'implémentation — la mesure
+  (`sandboxed_pilot_env`, `executor.rs:115`, `env_clear()` + allowlist positive) montre
+  qu'**aucun** nom ne traverse par héritage, préfixé ou non, donc le dilemme
+  « `MIKA_*` vs repli sans préfixe » était mal posé ; décision retenue : préfixe
+  conservé + injection explicite après le sandbox, à côté de `MIKA_PILOT_TRANSCRIPT_FILE`
+  et `MIKA_DISPATCH_WORKTREE_FILE` (nouvelle unité U7, nouvel AC9). Le précédent
+  `PILOT_LOG_DIR` invoqué par la rev 1 est écarté sur mesure : rien ne le pose en
+  production, il n'a jamais eu à traverser ce sandbox (citation : review-guide.md
+  § Unresolved-Decision Gate, mika#1244).
+  Adressé **F2** par une section `## Fire-Disposition` séparant trois populations de
+  détecteurs : D1 `_measure_pipeline_verified` → option (c) halt-and-surface, le
+  fail-closed en étant la forme, avec (a) et (b) écartées sur mesure (population
+  exemptable vide : `cargo fmt --all --check` rc=0 et `cargo clippy --workspace
+  --all-targets` rc=0 zéro warning sur cette branche ; et le kill-switch couvre déjà
+  (b)) ; D2 les tests de U4 → sans objet, population bâtie par le test ; D3 l'assertion
+  AC3 existante → mise à jour atomique dans U4, jamais un skip (citation :
+  review-guide.md § Fire-Disposition Gate, mika#1574, et
+  `docs/solutions/best-practices/fire-disposition-doctrine.md`).
+  Trouvé en chemin en instruisant F2 et porté dans le plan : le terme 5 est **plus
+  strict au moment de la mesure que dans la CI** (deux de ses trois exemptions lisent
+  le corps de la PR et `GITHUB_EVENT_PATH`, tous deux absents avant `gh pr create`) —
+  D1-bis le nomme, une sonde le compte à part, et un ticket de suivi conditionné à ce
+  chiffre est ajouté au hors-périmètre. Et le terme 5 doit être invoqué avec
+  `origin/main` (`verify-pipeline.sh:91` fait défaut sur `main` local, stale dans un
+  worktree de dispatch) — nouvel AC10.
+  Aucun AC affaibli ; deux ajoutés.
