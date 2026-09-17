@@ -142,19 +142,44 @@ l'architecte.** Si elle est refusée, la bascule est d'une ligne par branche et 
 l'AC2 se lisent dans l'autre sens ; le plan ne s'y oppose pas, il refuse seulement de la
 faire en silence.
 
-### T4 — le tri de `list_tasks_paginated` est le mauvais pour cet usage
+### T4 — le tri de la fonction générique est le mauvais pour cet usage — et ce n'est pas la fonction que les passes antérieures nommaient
 
-`list_tasks_paginated` (`db.rs:13518`) trie `ORDER BY updated_at DESC`. Pour le diagnostic
-D1 — *dédoublonner* une récurrence — c'est le tri qui cache le symptôme : deux lignes du même
-label atterrissent à des endroits arbitraires de la liste selon leur dernière mise à jour.
+**Rectification, du même ordre que celle que T7 e applique à T7 a.** Les passes antérieures
+écrivaient : « `list_tasks_paginated` (`db.rs:13518`) trie `ORDER BY updated_at DESC` […]
+deux lignes du même label atterrissent à des endroits arbitraires selon leur dernière mise à
+jour ». La phrase est vraie de cette fonction — et **cette fonction n'est pas celle que le
+décalque utilise**.
+
+`handle_tasks_list` (`dashboard.rs:639`) appelle `list_tasks_paginated_with_count`
+(`dashboard.rs:664` → `async_db.rs:3024` → `db.rs:13780`), dont le `ORDER BY` est
+`created_at DESC` (`db.rs:13860`). Les deux fonctions coexistent et trient différemment :
+
+| Fonction | Tri | Appelée par le décalque |
+|---|---|---|
+| `list_tasks_paginated` (`db.rs:13518`) | `updated_at DESC` (`:13526`) | **non** |
+| `list_tasks_paginated_with_count` (`db.rs:13780`) | `created_at DESC` (`:13860`) | **oui** |
+
+**Ce que la rectification change, et ce qu'elle laisse debout.** La conclusion — fonction DB
+dédiée, tri par label — est inchangée. Ce qui tombe est la **force** de l'argument du tri :
+sous `created_at DESC`, deux lignes du même label ne sont pas dispersées « arbitrairement »,
+elles sont dispersées par leur date de naissance. C'est un défaut réel pour D1 (les doublons
+d'un label restent séparés par toutes les récurrences nées entre eux) mais nettement plus
+faible que celui que les passes antérieures décrivaient.
+
+**Pourquoi le dire plutôt que corriger le numéro de ligne en silence.** Un implémenteur
+envoyé lire `list_tasks_paginated` pour comprendre T4 ouvre une fonction que le handler
+n'appelle pas, constate que le décalque réel trie `created_at DESC`, et peut raisonnablement
+conclure que réutiliser la fonction générique « n'est pas si mal ». Le tri n'est donc **pas**
+ce qui justifie la fonction dédiée : **T1 l'est** — la projection fermée est ce qui rend
+`list_tasks_paginated_with_count` inutilisable ici, quel que soit son `ORDER BY`, parce
+qu'elle rend des `Task` complets dont `TaskResponse` publie `action_config_preview`. Le tri
+par label est un gain qui vient avec la fonction dédiée, pas la raison de l'écrire.
 
 Le registre se lit `ORDER BY label COLLATE NOCASE ASC, created_at ASC` : les doublons d'un
 label sont contigus et leur ordre de naissance est visible. **La collation n'est pas un
 raffinement** — sans elle, deux lignes ne différant que par la casse, qui sont le *même*
 label pour le veto, sont rendues non contiguës par le tri même qui doit les rapprocher
-(T6 b). Cela suffit à justifier une fonction DB dédiée plutôt qu'un appel à la fonction
-générique — et cette fonction dédiée est de toute façon le véhicule de la projection fermée
-de T1.
+(T6 b).
 
 Le ticket demande de « réutiliser la machinerie `handle_tasks_list` ». C'est ce qui est fait :
 la pagination (`resolve_pagination`, `dashboard.rs:38`), la forme `PaginatedResponse`, le
@@ -1057,6 +1082,7 @@ lendemain. Les quatre AC restent un sous-ensemble strict de ce qui est livré.
 |---|---|
 | Divergence du prédicat de veto entre `zombie_veto_active` et `create_recurring_task_if_absent` (classe mika#2158) | Fragment SQL partagé (préféré) ou test d'accord sur quatre états (repli). Jamais la duplication nue. |
 | `TaskResponse`/`Task` gagne un champ de contenu et le rouvre | Impossible : projection dédiée, struct distincte, `SELECT` nommé (R3). |
+| **Un implémenteur juge la fonction dédiée superflue** parce que le tri du décalque réel (`created_at DESC`) lui paraît acceptable (T4) | La justification de la fonction dédiée est **T1**, pas le tri : `list_tasks_paginated_with_count` rend des `Task` complets, donc `action_config_preview`. Le tri par label est un gain qui l'accompagne, jamais sa raison d'être. |
 | Le secret read n'est pas déployé et l'opérateur débogue la mauvaise couche | `404` + ligne INFO de démarrage (R7). |
 | Les deux secrets sont identiques et AC2 est annulée en silence | Désarmement + `WARN` (R8), résolu à la construction de l'`AppState`. |
 | Un `403` est lu comme « l'INTERNAL_TOKEN ne peut pas lire ce tenant » | T3 l'écrit noir sur blanc : le porteur du write est superuser ailleurs sur `/admin/*`. Le gain est organisationnel. |
