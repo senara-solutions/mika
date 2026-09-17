@@ -288,6 +288,74 @@ servir. Le tri est donc `ORDER BY label COLLATE NOCASE ASC, created_at ASC`, et 
 sous-requête corrélée du point (a) groupe sur la même collation — les deux doivent s'accorder,
 sinon le booléen et le voisinage visuel racontent deux histoires différentes sur la même page.
 
+### T7 — quatre lectures sur les surfaces d'accueil, dont deux qui rectifient ce plan
+
+Les passes antérieures ont vérifié la logique métier (T1–T6) et laissé les surfaces
+d'accueil — montage du routeur, `Debug`, OpenAPI, documentation — au statut d'évidences.
+Deux d'entre elles se révèlent **fausses à la lecture**, et une exigence fausse coûte plus
+cher qu'une exigence absente : elle apprend au clavier une propriété du code qui sera
+appliquée ailleurs.
+
+**(a) Le `Debug` d'`AppState` se termine par `finish_non_exhaustive()` — l'omission est
+déjà sûre.** Le §3.3 justifiait l'ajout du champ par « le `Debug` de `AppState` est rédacteur
+par champ, un ajout non rédigé fuirait le secret ». C'est l'inverse : `routes.rs:166-183`
+n'énumère que **six** champs sur la vingtaine que porte la struct (`pool`, `http_client`,
+`github_app`, `search_egress_client`… sont déjà absents) et referme par
+`.finish_non_exhaustive()`. Un champ qu'on n'ajoute pas n'est pas affiché ; il ne fuit pas.
+
+L'exigence est **maintenue, pour une autre raison** : l'état d'armement de la route
+(`Some`/`None` après la résolution R8) est exactement ce qu'un opérateur cherche dans un dump
+de diagnostic, et c'est ce que le champ rend lisible sans exposer le secret. Ce qui change est
+le classement du risque : ce n'est pas une fuite évitée, c'est une observabilité gagnée — et
+aucune entrée de risque n'est ouverte pour une fuite qui ne peut pas se produire (le tableau
+n'en portait pas — c'est la justification du §3.3, pas le tableau, qui était fausse).
+
+**(b) `openapi.rs` de la gateway ne documente AUCUNE route `/admin/*`.** Le §3.3 et le DoD
+exigeaient d'ajouter le chemin à `paths(...)`. Or les cinq annotations `#[utoipa::path]` de
+`routes.rs` (`:69`, `:397`, `:1950`, `:2140`, `:2154`) portent sur `/webhook`, `/send`, les
+sondes et la version ; les trois handlers admin — `handle_register_customer` (`:1034`),
+`handle_admin_unlink` (`:1245`), `handle_get_customer` (`:1432`) — **n'en portent aucune**, et
+`openapi.rs:19-29` ne les liste pas. La surface `/admin/*` est délibérément hors du spec
+public : c'est un plan de contrôle opérateur, pas l'API de la gateway.
+
+Satisfaire l'exigence telle qu'écrite ferait de cette route la **seule** route admin du spec,
+et demanderait d'annoter un handler dont les trois voisins ne le sont pas. L'exigence est donc
+**retirée** et remplacée par la surface documentaire qui existe réellement pour cette famille —
+voir (d).
+
+**(c) L'auth admin est posée par route, jamais par préfixe : oublier le `route_layer` laisse
+la route OUVERTE.** Les onze occurrences de `require_bearer_token` (`routes.rs:206`→`:315`)
+sont toutes des `.route_layer(...)` attachés à un `.route(...)` individuel. Il n'existe aucun
+layer monté sur le préfixe `/admin`.
+
+Deux conséquences, et la seconde est un mode de panne :
+
+1. **Rien n'empêche la nouvelle route de porter un middleware différent de ses voisines** —
+   le montage de R6 est mécaniquement possible, sans conflit ni superposition avec
+   `require_bearer_token`. C'était l'hypothèse tacite du §3.3 ; elle est vérifiée.
+2. **Le chemin `/admin/` ne protège rien par lui-même.** Un `.route(...)` sans `.route_layer`
+   est servi sans aucune authentification — et non, comme on pourrait le supposer, protégé
+   par défaut par l'internal token. Une route d'inspection multi-tenant ouverte est un
+   incident d'un autre ordre que les `403` que ce ticket discute.
+
+   La propriété est déjà couverte *par accident* par
+   `mika2360_admin_read_rejects_missing_header_with_401` (sans middleware, la réponse ne
+   serait pas `401`). Elle est ici **nommée** pour qu'un implémenteur sache ce que ce test
+   tient, et que personne ne le juge redondant avec les quatre autres tests d'auth.
+
+**(d) Le décalque `handle_get_customer` rend `500` sur erreur DB, là où ce plan exige `503`
+— et la documentation de la gateway a deux surfaces que le DoD oubliait.** Sur l'erreur de
+résolution, `routes.rs:1450` journalise et rend `500`. La section *harnais de test* exige
+`503` pour la route neuve, et cette exigence est maintenue : `503` dit « réessaie », `500`
+dit « c'est cassé », et l'indisponibilité de Postgres est le premier cas. Mais un
+implémenteur qui copie le voisin — ce que le plan lui demande par ailleurs — écrira `500`
+sans voir la contradiction. **La divergence est délibérée et porte sur ce seul code.**
+
+Côté documentation, `crates/mika-gateway/CLAUDE.md` porte une table `## Endpoints` qui liste
+les quatre routes `/admin/customers*` et une section `## Gateway Environment Variables`.
+Ce sont les surfaces canoniques de cette famille — celles où un opérateur cherchera la route
+et le jeton. Le DoD ne nommait que le `CLAUDE.md` racine.
+
 ---
 
 ## Requirements
@@ -522,8 +590,16 @@ pub gateway_admin_read_token: Option<SecretString>,
 ```
 
 **`routes.rs` — `AppState`** : `pub admin_read_token: Option<SecretString>`, ajouté au
-`Debug` manuel comme `[REDACTED]` (`routes.rs:166-183`) — le `Debug` de `AppState` est
-rédacteur par champ, un ajout non rédigé fuirait le secret dans un log de diagnostic.
+`Debug` manuel comme `.map(|_| "[REDACTED]")` (`routes.rs:166-183`), sur la forme exacte que
+`webhook_secret` et `github_webhook_secret` y emploient déjà pour un `Option<SecretString>`.
+
+**Ce n'est pas une fuite évitée, c'est une observabilité gagnée (T7 a).** Ce `Debug`
+referme par `.finish_non_exhaustive()` et n'énumère que six champs sur la vingtaine de la
+struct : un champ omis n'est pas affiché. L'ajout sert à rendre lisible **l'état d'armement
+de la route** — `Some` ou `None` après la résolution R8 — dans un dump de diagnostic, ce qui
+est précisément la question que R7 et R8 apprennent à l'opérateur à se poser. La forme
+`Option::map` est ce qui distingue « armé » de « non configuré » sans exposer le secret ;
+un `&"[REDACTED]"` nu les rendrait indiscernables et annulerait le seul gain de l'ajout.
 
 La résolution R8 se fait **une fois à la construction de l'`AppState`**, pas à chaque
 requête : si le jeton lu est égal à l'internal token, le champ est peuplé à `None` et le
@@ -583,6 +659,8 @@ async fn handle_admin_tenant_recurring_tasks(
 ) -> impl IntoResponse {
     // R12 terme 2 — 404 si le customer n'existe pas, AVANT toute interpolation
     // …SELECT 1 FROM customers WHERE id = $1 → Ok(None) ⇒ 404
+    //                                        → Err(_)  ⇒ 503, JAMAIS de forward
+    //   (le décalque handle_get_customer rend 500 ici ; divergence voulue, T7 d)
 
     let container = container_url_str(
         &customer_id.to_string(),
@@ -602,8 +680,16 @@ async fn handle_admin_tenant_recurring_tasks(
 - Échec de forward → `502` + `error!`. Ne jamais rendre `200` avec un corps vide : un
   registre vide et une gateway qui n'a pas joint le pod sont deux réponses différentes, et
   les confondre est exactement le mode de panne que T2 décrit une couche plus bas.
-- `openapi.rs` : ajouter le chemin à `paths(...)` (`:19-29`) et le schéma de réponse à
-  `components(schemas(...))`.
+- **`openapi.rs` : ne rien ajouter (T7 b).** Les trois handlers `/admin/*` existants ne
+  portent aucune annotation `#[utoipa::path]` et ne figurent pas dans `paths(...)` : la
+  surface admin est délibérément hors du spec public. Y inscrire cette route en ferait la
+  seule route admin documentée. La documentation de cette famille passe par
+  `crates/mika-gateway/CLAUDE.md` — table `## Endpoints` et section
+  `## Gateway Environment Variables` (T7 d).
+- **Le `.route_layer` n'est pas optionnel (T7 c).** Aucun layer d'auth n'est monté sur le
+  préfixe `/admin` : une route déclarée sans son `route_layer` est servie **sans
+  authentification du tout**. Le montage ci-dessus le porte ; c'est la ligne à ne pas perdre
+  dans un rebase.
 
 ### 3.4 Companion mika-cloud
 
@@ -787,18 +873,26 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 - [ ] Wrapper async sans émission de frame.
 - [ ] `handle_recurring_registry` + montage `/api/v1/recurring-tasks` sous l'auth dashboard.
 - [ ] `gateway_admin_read_token` dans `GatewaySettings`, `admin_read_token` dans `AppState`,
-      rédigé dans le `Debug` manuel.
+      rédigé dans le `Debug` manuel en `Option::map` — l'état d'armement reste lisible, le
+      secret non (T7 a).
 - [ ] R8 résolu à la construction de l'`AppState` (jamais par requête), `WARN` nommé.
 - [ ] `require_admin_read_token` avec ses cinq branches dans l'ordre spécifié.
 - [ ] Route gateway + handler proxy sur le décalque `handle_a2a_agent_card`
       (`a2a_routes.rs:166`), query string en liste blanche, `502` sur échec amont.
+- [ ] **La route porte son `.route_layer(require_admin_read_token)`** — aucun layer n'est
+      monté sur le préfixe `/admin`, donc une route sans son layer est servie sans auth
+      (T7 c).
 - [ ] **R12 : `Path<Uuid>` + résolution en base, tous deux AVANT `container_url_str`.** La
       garde de non-régression T5 passe (aucune requête sortante sur entrée refusée).
 - [ ] Ligne INFO de démarrage disant l'état d'armement (R7).
 - [ ] Ligne `audit_events` `tool_name = 'gateway_admin_read'` par accès servi,
       fire-and-forget, via une constante dédiée distincte de `audit_events::TOOL_NAME` (R9).
       Aucune migration Postgres.
-- [ ] `openapi.rs` de la gateway à jour.
+- [ ] **`openapi.rs` : aucune modification** — la surface `/admin/*` est hors du spec public
+      (T7 b). Ne pas annoter le handler.
+- [ ] `crates/mika-gateway/CLAUDE.md` : la route ajoutée à la table `## Endpoints` (colonne
+      Auth = *Admin read token*, pas *Internal token*) et `MIKA_GATEWAY_ADMIN_READ_TOKEN` à
+      `## Gateway Environment Variables` (T7 d).
 - [ ] Les 24 tests ci-dessus passent (8 DB, 4 tenant, 12 gateway dont **1 dans
       `tests/admin_tenant_recurring_tasks.rs`**) ; clippy et fmt propres. Les 23 non-`#[ignore]`
       passent en CI ; le 24e passe contre un Postgres jetable par la commande écrite en tête de
@@ -806,6 +900,8 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 - [ ] Root `CLAUDE.md` : `MIKA_GATEWAY_ADMIN_READ_TOKEN` documenté (valeur, défaut, R7/R8,
       surfaces opérateur) ; `.env.example` mis à jour.
 - [ ] Échec de la résolution en base → `503` sans forward (fail-closed, §*harnais de test*).
+      **Le décalque `handle_get_customer` rend `500` sur ce cas ; la divergence est voulue et
+      porte sur ce seul code** (T7 d) — copier le voisin ici manquerait le DoD.
 - [ ] Le test du chemin nominal complet vit dans `crates/mika-gateway/tests/`, calqué sur
       `admin_customers_read.rs` : `#[ignore = "requires a live Postgres at MIKA_DATABASE_URL /
       DATABASE_URL"]`, commande de lancement en doc-comment de tête, skip gracieux si la
@@ -881,6 +977,8 @@ lendemain. Les quatre AC restent un sous-ensemble strict de ce qui est livré.
 | **Le lift est lu sur la ligne projetée au lieu du groupe `(agent_id, label)`** — le veto répond faux sur la configuration même que mika#2337 produit (T6 a) | Sous-requête corrélée exigée par R1/§3.1, épinglée par `mika2360_zombie_veto_flag_reads_lift_spent_on_a_sibling_row`, qui est construit pour que la lecture par ligne échoue. |
 | Deux lignes du même label en casses différentes sont rendues non contiguës, et le registre se lit comme deux récurrences distinctes sur le cas D1 (T6 b) | `ORDER BY label COLLATE NOCASE` + `mika2360_registry_orders_labels_case_insensitively`, dont le jeu porte une ligne intermédiaire — un jeu mono-casse ne peut pas voir la régression. |
 | En single-tenant (`agent_base_url = Some`) un id inconnu rendrait le registre d'un autre | R12 terme 2 exigé même dans ce mode ; nommé en fin de T5 pour qu'un test local vert ne soit pas lu comme une preuve de routage. |
+| **La route est montée sans son `.route_layer` et se retrouve servie sans aucune auth** — le préfixe `/admin` ne protège rien par lui-même (T7 c) | Les onze middlewares admin sont posés par route ; `mika2360_admin_read_rejects_missing_header_with_401` échoue si le layer manque. Le risque est nommé pour que ce test ne soit pas jugé redondant avec les quatre autres tests d'auth. |
+| Un implémenteur copie le `500` de `handle_get_customer` sur l'échec de résolution et manque le fail-closed `503` (T7 d) | La divergence est écrite au site (§3.3, commentaire du handler) **et** dans le DoD, pas seulement dans la section harnais. |
 
 **Hors périmètre, délibérément.**
 
