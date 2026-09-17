@@ -20,15 +20,23 @@
 //!
 //! # Pourquoi un module, et pas un littéral à chaque site
 //!
-//! Quatre lecteurs posent la même question : le framing (`agent_loop`), la garde
-//! négative (`callback_trigger_active`), la garde positive (`qa_verdict_required`)
-//! et le filet (`task_engine::dispatcher`). Une grammaire de fil recopiée entre
-//! quatre lecteurs est exactement la classe que mika#2158 a dû refermer une fois
-//! — deux regex de grooming qui répondaient différemment à la même question
-//! pendant des mois sans que rien ne casse. Le cinquième lecteur est du
+//! Trois lecteurs du moteur posent la même question : le framing
+//! (`agent_loop::build_callback_trigger_context`, via [`is_build_callback_label`]),
+//! la garde négative (`agent_loop::callback_trigger_active`, via
+//! [`is_build_callback`]) et la garde positive (`qa_build_callback_verdict`,
+//! inline dans `agent_loop::run_loop`, via [`qa_verdict_required`] +
+//! [`pr_review_posted_in_turn`]). Une grammaire de fil recopiée entre trois
+//! lecteurs est exactement la classe que mika#2158 a dû refermer une fois —
+//! deux regex de grooming qui répondaient différemment à la même question
+//! pendant des mois sans que rien ne casse. Le quatrième lecteur est du
 //! **prompt** (`qa-review-build-callback/system_prompt.md`) et ne peut pas
 //! partager une constante Rust : `tests::mika2355_the_scope_header_quotes_the_engine_marker`
 //! épingle que la chaîne qu'il cite est bien celle que le moteur émet.
+//!
+//! Le filet moteur qui posterait `hold[review]` quand le re-prompt lui-même
+//! échoue (plan mika#2355 § B3, AC5–AC7) n'est **pas** dans ce module : il
+//! généralise `server::deadline_verdict` et suit sous mika#2368. Quand
+//! il arrive, il lit [`pr_review_posted_in_turn`] et rien d'autre.
 
 use crate::tool_execution::ToolCallSummary;
 
@@ -40,16 +48,31 @@ pub const BUILD_MIKA_TOOL: &str = "build_mika";
 /// Le skill dont la présence au tour rend un verdict **dû**.
 pub const QA_REVIEW_SKILL: &str = "qa-review";
 
+/// Le label de tâche d'un callback de build, tel que
+/// `skills::executor::build_callback_task` le forme
+/// (`format!("long_running:{tool_name}")`).
+///
+/// C'est la clé que lit le framing (`build_callback_trigger_context` reçoit le
+/// label, pas le message) ; le marqueur de message ci-dessous en est l'enveloppe.
+pub const BUILD_CALLBACK_LABEL: &str = "long_running:build_mika";
+
 /// Le marqueur de tour qu'émet `run_silent_agent` pour un callback de build.
 ///
 /// Forme composée de deux moitiés qui vivent ailleurs et qu'on ne peut pas
 /// importer : `format!("[callback: {label}]")` dans `run_silent_agent`, et
-/// `format!("long_running:{tool_name}")` dans
-/// `skills::executor::build_callback_task`. Le test
+/// [`BUILD_CALLBACK_LABEL`]. Le test
 /// [`tests::mika2355_the_marker_is_the_shape_the_engine_actually_emits`]
 /// reconstruit les deux `format!` et compare — un changement de l'une ou
 /// l'autre grammaire rougit ici plutôt que de désarmer les gardes en silence.
 pub const BUILD_CALLBACK_MESSAGE_MARKER: &str = "[callback: long_running:build_mika]";
+
+/// Ce label de callback est-il celui d'un build ?
+///
+/// Égalité stricte : `long_running:build_mika_foo` n'existe pas, et un
+/// `starts_with` ici lirait un futur outil homonyme comme un build.
+pub fn is_build_callback_label(label: &str) -> bool {
+    label == BUILD_CALLBACK_LABEL
+}
 
 /// Le message de ce tour est-il un callback de build ?
 ///
@@ -79,8 +102,8 @@ pub fn qa_verdict_required(
 
 /// Un `run_gh pr review` a-t-il **réussi** dans ce tour ?
 ///
-/// Le prédicat de satisfaction de la garde positive, et le même que consulte le
-/// filet B3 avant de poster quoi que ce soit. Miroir exact de
+/// Le prédicat de satisfaction de la garde positive `qa_build_callback_verdict`
+/// (`agent_loop::run_loop`, les deux chemins de sortie EndTurn). Miroir exact de
 /// `agent_loop::has_successful_pr_review` (early-accept #695/#821), délibérément
 /// réécrit ici plutôt qu'appelé : cette fonction-là est privée à `agent_loop` et
 /// la rendre publique pour le dispatcher exporterait un détail de la chaîne de
@@ -134,6 +157,16 @@ mod tests {
     #[test]
     fn mika2355_the_marker_is_the_shape_the_engine_actually_emits() {
         let label = format!("long_running:{BUILD_MIKA_TOOL}");
+        assert_eq!(
+            label, BUILD_CALLBACK_LABEL,
+            "le label a divergé de la grammaire de build_callback_task"
+        );
+        assert!(is_build_callback_label(&label));
+        assert!(!is_build_callback_label("long_running:run_claude_pilot"));
+        assert!(
+            !is_build_callback_label("long_running:build_mika_extra"),
+            "égalité stricte, pas de préfixe"
+        );
         let emitted = format!("[callback: {label}]");
         assert_eq!(
             emitted, BUILD_CALLBACK_MESSAGE_MARKER,

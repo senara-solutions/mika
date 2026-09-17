@@ -639,6 +639,32 @@ si son kill-switch est jugé nécessaire à la revue.
 
 ## Revision history
 
+- **rev 3 (2026-09-17, implémentation)** — état de livraison par brique, pour
+  que le lecteur du plan ne le prenne pas pour un état du code.
+  - **B1 livrée** (PR #2359, session pilote `b2f26283` + reprise à la main) :
+    arête `qa-review → qa-review-build-callback`, en-tête de portée, détecteur
+    de classe D-A avec exception `self-dev-callback` / tracker mika#2356,
+    module `qa_build_callback`.
+  - **B2 livrée** (PR #2359, reprise du 2026-09-17) : `callback_trigger_active`
+    exclut `[callback: long_running:build_mika]` (AC2, sur les deux sites — un
+    seul prédicat) ; `build_callback_trigger_context` prescrit le contrat du
+    flux au lieu du contrat self_dev (AC3) ; garde positive inline
+    `qa_build_callback_verdict` aux deux sites de sortie EndTurn, conjonctive
+    sur le message ET `loaded_skill_names` (nouveau paramètre de `run_loop`,
+    câblé aux trois appelants) — AC4, AC4b. Le commentaire #870 « only one
+    callback flow » et la ligne « The engine enforces post-callback action
+    structurally » du prompt sont remplacés par ce que le moteur fait
+    réellement. AC8 tenu par `tests/eval/test_qa_build_callback_verdict_2355.rs`
+    sur `run_silent_agent` (chemin de production), rouge-avant vérifié en
+    neutralisant les trois câblages (4 rouges / 2 contrôles verts).
+  - **B3 (filet `hold[review]`, AC5–AC7) NON livrée** — reste due. Après le
+    re-prompt unique, un second EndTurn muet est accepté ; c'est exactement le
+    cas que le filet couvre. À implémenter sous **mika#2368** sur la forme
+    décrite § B3 (C1–C3) ; `pr_review_posted_in_turn` est déjà le prédicat
+    qu'il lira.
+  - **AC9** tenue par tests unitaires (les cinq autres labels `long_running`)
+    et par le contrôle silencieux `run_claude_pilot`.
+
 - **rev 2 (2026-09-17)** — adressé F1 (bloquant, Fire-Disposition Gate mika#1574)
   en ajoutant une § Fire-Disposition qui tranche **par détecteur** plutôt que par
   un choix global : un seul des détecteurs de la § Tests peut tirer sur des

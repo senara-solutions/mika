@@ -42,7 +42,8 @@ max_prompt_size = 73728
 # Classe exacte de mika#1251, résolue à l'époque pour `self-dev` seulement (voir
 # le commentaire de `self-dev/skill.toml` sur ses deux frères de dispatch) et
 # jamais généralisée. Le détecteur de classe qui compte désormais TOUS les
-# handlers `-callback` vit dans `tests/bundled_skills_load.rs`.
+# handlers `-callback` vit dans `src/bundled_skills.rs` (`mod tests`,
+# `mika2355_every_bundled_callback_handler_is_reachable_on_a_callback_turn`).
 #
 # Coût nommé : `qa-review` étant `always_on`, ses dépendances sont résolues sur
 # TOUS ses tours, pas seulement les callbacks — +19 330 octets de prompt par
