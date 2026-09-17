@@ -91,8 +91,9 @@ qui est livré, et l'ajout ne franchit aucune ligne qu'AC4 trace.
 
 ### T3 — l'auth : deux frontières, deux jetons, et une garantie qu'il faut nommer honnêtement
 
-`/admin/*` **existe déjà** sur la gateway (`routes.rs:288-317` : `POST /admin/customers`,
-`GET /admin/customers/{id}`, `POST /admin/customers/{id}/unlink`) et il est protégé par
+`/admin/*` **existe déjà** sur la gateway (`routes.rs:292`, `:303`, `:311` : `POST
+/admin/customers`, `GET /admin/customers/{id}`, `POST /admin/customers/{id}/unlink`) et il est
+protégé par
 `require_bearer_token` (`routes.rs:1899`), qui compare à `state.internal_token` — le jeton
 write. Le ticket demande explicitement « PAS l'INTERNAL_TOKEN write ».
 
@@ -143,7 +144,7 @@ faire en silence.
 
 ### T4 — le tri de `list_tasks_paginated` est le mauvais pour cet usage
 
-`list_tasks_paginated` (`db.rs:13526`) trie `ORDER BY updated_at DESC`. Pour le diagnostic
+`list_tasks_paginated` (`db.rs:13518`) trie `ORDER BY updated_at DESC`. Pour le diagnostic
 D1 — *dédoublonner* une récurrence — c'est le tri qui cache le symptôme : deux lignes du même
 label atterrissent à des endroits arbitraires de la liste selon leur dernière mise à jour.
 
@@ -505,7 +506,7 @@ Montage dans `build_router` (`server/mod.rs:129-315`), **dans `dashboard_routes`
 ```
 
 Donc `/api/v1/recurring-tasks`, sous `require_dashboard_or_internal_token`
-(`server/mod.rs:311`). La gateway porte l'internal token : le hop passe sans nouveau secret
+(`server/mod.rs:313`). La gateway porte l'internal token : le hop passe sans nouveau secret
 côté pod (T3). Aucune route de mutation n'est touchée.
 
 ### 3.3 Couche gateway — `crates/mika-gateway/`
@@ -659,7 +660,7 @@ Le fichier porte déjà ce style (`.header("authorization", "Bearer test-token-s
 | `mika2360_admin_read_rejects_internal_token_with_403` | **AC2**, le cas « write-seul ». |
 | `mika2360_admin_read_rejects_missing_header_with_401` | La divergence T3, épinglée pour qu'elle soit *décidée* et non *dérivée*. |
 | `mika2360_admin_read_rejects_unknown_token_with_401` | Idem. |
-| `mika2360_admin_read_forwards_with_internal_token` | Serveur amont factice (`agent_base_url`) : le hop porte bien `Bearer {internal_token}` et frappe `/api/v1/recurring-tasks`. |
+| `mika2360_admin_read_forwards_with_internal_token` | Serveur amont factice (`agent_base_url`) : le hop porte bien `Bearer {internal_token}` et frappe `/api/v1/recurring-tasks`. **Seul test de ce tableau à vivre dans `tests/admin_tenant_recurring_tasks.rs`** (harnais DB-backed (2)) — il doit franchir la résolution en base de R12 terme 2, que le pool paresseux du harnais inline ne peut pas servir. |
 | `mika2360_admin_read_forwards_only_allowlisted_query_params` | `?agent_id=x&per_page=5&evil=1` → l'amont voit les deux premiers, jamais le troisième. |
 | `mika2360_admin_read_upstream_failure_is_502_not_empty_200` | Amont injoignable → `502`. |
 | `mika2360_no_mutating_method_on_admin_read_route` | `POST`/`PUT`/`DELETE`/`PATCH` sur le chemin → `405`. AC3, tenue par le routeur. |
@@ -669,13 +670,40 @@ Le fichier porte déjà ce style (`.header("authorization", "Bearer test-token-s
 
 ### Ce que le harnais de test de la gateway permet, et ce qu'il interdit
 
-À vérifier avant d'écrire les tests, sous peine d'en écrire quatre qui ne peuvent pas passer.
-**La gateway n'a pas de Postgres en test.** Le harnais construit un pool paresseux sur un DSN
-factice — `PgPoolOptions::new().connect_lazy("postgres://fake:fake@localhost/fake")`
-(`tests/admin_customers_read.rs:25`, `tests/audit_events_gateway_webhook.rs:54`,
-`orchestrator_inbox.rs:531`) — et `orchestrator_inbox.rs:419-420` écrit noir sur blanc que
-tout test touchant réellement la base « 1s-timeout on a real DELETE. Needs a docker-postgres
-or `sqlx::test!` harness — out of scope ».
+À lire avant d'écrire les tests. **La gateway a DEUX harnais, et une passe antérieure de ce
+plan les a confondus** — la confusion tirait AC1 vers le bas sans raison, donc la rectification
+est écrite ici plutôt que corrigée en silence.
+
+**(1) Le harnais inline `#[cfg(test)]` n'a pas de Postgres.** Il construit un pool paresseux
+sur un DSN factice — `PgPoolOptions::new().connect_lazy("postgres://fake:fake@localhost/fake")`
+(`src/orchestrator_inbox.rs:531` et cinq sites dans `src/github.rs`) — et
+`src/orchestrator_inbox.rs:419-421` écrit noir sur blanc que tout test y touchant réellement la
+base « 1s-timeout on a real DELETE. Needs a docker-postgres or `sqlx::test!` harness — out of
+scope ». C'est là que vivent les tests de routage et d'auth.
+
+**(2) Le répertoire `crates/mika-gateway/tests/` est DB-backed, et c'est une convention établie,
+pas une exception.** Cinq fichiers la suivent à l'identique (`admin_customers.rs`,
+`admin_customers_read.rs`, `unlink.rs`, `pairing_rejection.rs`,
+`audit_events_gateway_webhook.rs`), chacun avec les trois mêmes traits :
+
+- `#[ignore = "requires a live Postgres at MIKA_DATABASE_URL / DATABASE_URL"]` — une raison
+  **machine-lisible** dans l'attribut, pas un commentaire au-dessus ;
+- un doc-comment de tête donnant la **commande exacte** de lancement
+  (`MIKA_DATABASE_URL=… cargo test -p mika-gateway --test <fichier> -- --ignored --nocapture`) ;
+- un **skip gracieux** — la variable absente fait `eprintln!("SKIP: …")` et rendre, plutôt
+  qu'échouer.
+
+Les deux fichiers que la passe antérieure citait comme preuves du harnais (1) appartiennent en
+fait au (2) : leur ligne 25 / 23 est un `use sqlx::postgres::PgPoolOptions;`, et leur
+`PgPoolOptions::new()` (ligne 60 / 54) porte une **vraie** URL lue dans l'environnement. Aucun
+`connect_lazy` dans ce répertoire.
+
+**Ce que la rectification change.** `admin_customers_read.rs` n'est pas un voisin quelconque :
+c'est le test DB-backed de `GET /admin/customers/{id}`, c'est-à-dire du handler que R12 terme 2
+décalque. Le chemin nominal complet de cette route est donc testable **sous une convention qui
+existe déjà**, et son `#[ignore]` cesse d'être un aveu pour devenir la disposition normale de sa
+famille. AC1 gagne un test exécutable — par une commande écrite — au lieu de reposer sur la seule
+vérification manuelle.
 
 Conséquences, et elles tombent du bon côté :
 
@@ -691,14 +719,17 @@ Conséquences, et elles tombent du bon côté :
   retour.
 - **Les tests d'auth ne touchent pas la base** (le middleware ne lit que l'`AppState`) : les
   cinq tests `401` / `403` / `404` du tableau tournent tels quels.
-- **`mika2360_admin_read_forwards_with_internal_token` (le chemin nominal complet) ne peut
-  pas passer** avec ce harnais : il exige de franchir la résolution en base. Il est donc
-  marqué `#[ignore]` avec un commentaire nommant la raison et la levée (harnais
-  docker-postgres / `sqlx::test`), sur le précédent exact d'`orchestrator_inbox.rs`. **AC1
-  est alors portée par le tenant** (`mika2360_recurring_registry_returns_paginated_shape`,
-  côté SQLite, sans contrainte) **plus la vérification manuelle post-déploiement.** Le dire
-  ici évite qu'un implémenteur conclue à un défaut de son code devant un timeout d'une
-  seconde.
+- **`mika2360_admin_read_forwards_with_internal_token` (le chemin nominal complet) ne peut pas
+  vivre dans le harnais (1)** : il exige de franchir la résolution en base, et un pool paresseux
+  y répond par un timeout d'une seconde. Le dire évite qu'un implémenteur lise ce timeout comme
+  un défaut de son code. Sa place est le harnais **(2)**, dans un fichier
+  `crates/mika-gateway/tests/admin_tenant_recurring_tasks.rs` calqué sur
+  `admin_customers_read.rs` : `#[ignore = "requires a live Postgres at MIKA_DATABASE_URL /
+  DATABASE_URL"]`, commande de lancement en tête de fichier, skip gracieux. **AC1 est donc portée
+  par trois choses** — le test tenant (`mika2360_recurring_registry_returns_paginated_shape`,
+  côté SQLite, sans contrainte), ce test bout-en-bout exécutable à la demande, et la vérification
+  manuelle post-déploiement. Le `#[ignore]` n'y est pas une AC affaiblie : il est la disposition
+  de ses cinq voisins, pour la raison qu'ils nomment tous.
 
 **Décision de conception qui en découle — l'échec de la résolution est fail-closed.** Si la
 requête `SELECT 1 FROM customers WHERE id = $1` échoue (base indisponible, pool mort), le
@@ -768,12 +799,17 @@ curl -s -o /dev/null -w '%{http_code}\n' \
       fire-and-forget, via une constante dédiée distincte de `audit_events::TOOL_NAME` (R9).
       Aucune migration Postgres.
 - [ ] `openapi.rs` de la gateway à jour.
-- [ ] Les 24 tests ci-dessus passent (8 DB, 4 tenant, 12 gateway) ; clippy et fmt propres.
+- [ ] Les 24 tests ci-dessus passent (8 DB, 4 tenant, 12 gateway dont **1 dans
+      `tests/admin_tenant_recurring_tasks.rs`**) ; clippy et fmt propres. Les 23 non-`#[ignore]`
+      passent en CI ; le 24e passe contre un Postgres jetable par la commande écrite en tête de
+      son fichier.
 - [ ] Root `CLAUDE.md` : `MIKA_GATEWAY_ADMIN_READ_TOKEN` documenté (valeur, défaut, R7/R8,
       surfaces opérateur) ; `.env.example` mis à jour.
 - [ ] Échec de la résolution en base → `503` sans forward (fail-closed, §*harnais de test*).
-- [ ] Le test du chemin nominal complet est `#[ignore]` avec sa raison écrite, et AC1 est
-      portée par le test tenant + la vérification manuelle.
+- [ ] Le test du chemin nominal complet vit dans `crates/mika-gateway/tests/`, calqué sur
+      `admin_customers_read.rs` : `#[ignore = "requires a live Postgres at MIKA_DATABASE_URL /
+      DATABASE_URL"]`, commande de lancement en doc-comment de tête, skip gracieux si la
+      variable est absente.
 - [ ] Corps de PR : nomme la divergence 401/403 (T3), **la parade SSRF R12/T5**, et le ticket
       compagnon mika-cloud.
 - [ ] Ticket compagnon mika-cloud ouvert (§3.4).
@@ -788,11 +824,12 @@ Transcrits verbatim du corps de `mika issue#2360`, suivis de ce qui les rend vé
   registre récurrent du tenant.
   → `mika2360_recurring_registry_returns_paginated_shape` (tenant, SQLite, sans contrainte de
   harnais) + `mika2360_admin_read_forwards_only_allowlisted_query_params` pour la forme du hop
-  + la vérification manuelle pour le bout-en-bout. Le test du chemin nominal complet
-  (`mika2360_admin_read_forwards_with_internal_token`) est `#[ignore]` faute de Postgres en
-  test — raison et levée écrites au-dessus du test, cf. § *harnais de test*. **C'est une
-  limite du harnais, pas une AC affaiblie :** le bout-en-bout est vérifié manuellement au
-  déploiement, et c'est de toute façon là que se juge AC1 (elle traverse un pod réel).
+  + `mika2360_admin_read_forwards_with_internal_token` pour le bout-en-bout, dans
+  `tests/admin_tenant_recurring_tasks.rs` sous la convention DB-backed de ses cinq voisins
+  (`#[ignore]` à raison machine-lisible, commande en tête de fichier, skip gracieux ; cf.
+  § *harnais de test*) + la vérification manuelle post-déploiement. **Le `#[ignore]` est la
+  disposition normale de cette famille de tests, pas une AC affaiblie** — et AC1 se juge de
+  toute façon en traversant un pod réel.
 
 - **AC2** — token write-seul / absent / mauvais scope → 403 (gated).
   → `mika2360_admin_read_rejects_internal_token_with_403` pour le cas « write-seul », qui est
