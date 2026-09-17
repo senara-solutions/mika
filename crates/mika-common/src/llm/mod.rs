@@ -7,6 +7,7 @@ pub mod mock;
 pub mod models;
 pub mod ollama;
 pub mod openai;
+pub mod retry_gate;
 pub mod types;
 
 use std::str::FromStr;
@@ -137,17 +138,44 @@ fn parse_http_timeout(raw: Option<&str>) -> u64 {
 
 /// Outcomes an [`emit_llm_call_attempt`] line can report (mika#2331 AC2).
 pub mod attempt_outcome {
+    use super::retry_gate::RetryVerdict;
+
     /// The call returned a usable response.
     pub const SUCCESS: &str = "success";
     /// The call failed and another attempt follows.
+    ///
+    /// Since mika#2362 this means what it says: the attempt budget **and** the
+    /// remaining deadline both permit the next call. It used to be decided by
+    /// the budget alone, so a chain the deadline guard was about to refuse
+    /// announced a retry that never ran — measured 2026-09-17 under a `300/600`
+    /// geometry, 18 ms before the turn errored.
     pub const RETRYING: &str = "retrying";
     /// The call failed and no further attempt will be made — the error is not
-    /// retryable, or the attempt budget is spent.
+    /// retryable, the attempt budget is spent, **or** the remaining deadline
+    /// cannot fit another call (mika#2362).
     pub const EXHAUSTED: &str = "exhausted";
     /// The attempt **did not happen**: the remaining deadline could not fit
     /// another call. `elapsed_ms` is 0 here, and that is not a measurement of a
     /// fast call — it is the absence of one.
     pub const DEADLINE_ABORT: &str = "deadline_abort";
+
+    /// The wire value for an attempt that **ran** and ended on `verdict`.
+    ///
+    /// The single site where a verdict becomes a wire string, kept next to the
+    /// constants so the correspondence has one home.
+    ///
+    /// [`RetryVerdict::DeadlineInsufficient`] maps to [`EXHAUSTED`], never to
+    /// [`DEADLINE_ABORT`]: the attempt being reported here consumed real
+    /// wall-clock — 300 s in the founding incident — and `DEADLINE_ABORT`'s
+    /// documented invariant is `elapsed_ms = 0`, the attempt that did not
+    /// happen. `EXHAUSTED` already covers "the attempt budget is spent", and a
+    /// budget that can no longer fit a call before the deadline is spent.
+    pub fn outcome_for(verdict: &RetryVerdict) -> &'static str {
+        match verdict {
+            RetryVerdict::Retry => RETRYING,
+            RetryVerdict::BudgetSpent | RetryVerdict::DeadlineInsufficient { .. } => EXHAUSTED,
+        }
+    }
 }
 
 /// Emit one structured `llm_call_attempt` INFO event per attempt of an LLM
@@ -781,6 +809,50 @@ pub fn dummy_provider() -> Arc<dyn LlmProvider> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- attempt_outcome: the wire vocabulary (mika#2331, pinned by mika#2362) --
+
+    /// These four strings land on `llm_call_attempt` and operators
+    /// `GROUP BY outcome` over them. A rename splits one population without
+    /// saying so — the same reason `error_class`'s seven names and mika#2131's
+    /// `FILTER_*` names are pinned.
+    ///
+    /// Pinned here rather than in mika#2331 because mika#2362 *moves* a
+    /// population between two of them — deadline-refused attempts leave
+    /// `retrying` for `exhausted` — and a move is only legible against a fixed
+    /// vocabulary.
+    #[test]
+    fn mika2362_attempt_outcome_names_are_a_wire_format() {
+        assert_eq!(attempt_outcome::SUCCESS, "success");
+        assert_eq!(attempt_outcome::RETRYING, "retrying");
+        assert_eq!(attempt_outcome::EXHAUSTED, "exhausted");
+        assert_eq!(attempt_outcome::DEADLINE_ABORT, "deadline_abort");
+    }
+
+    /// The verdict → wire mapping, including the one that matters: a deadline
+    /// refusal on an attempt that **ran** is `exhausted`, never
+    /// `deadline_abort` — the latter's documented invariant is
+    /// `elapsed_ms = 0`, the attempt that did not happen.
+    #[test]
+    fn mika2362_outcome_for_maps_every_verdict() {
+        use retry_gate::RetryVerdict;
+
+        assert_eq!(
+            attempt_outcome::outcome_for(&RetryVerdict::Retry),
+            attempt_outcome::RETRYING
+        );
+        assert_eq!(
+            attempt_outcome::outcome_for(&RetryVerdict::BudgetSpent),
+            attempt_outcome::EXHAUSTED
+        );
+        assert_eq!(
+            attempt_outcome::outcome_for(&RetryVerdict::DeadlineInsufficient {
+                remaining_ms: 299_995,
+                threshold_secs: 300,
+            }),
+            attempt_outcome::EXHAUSTED
+        );
+    }
 
     // -- http_timeout_secs / parse_http_timeout (mika#1660) --
 
