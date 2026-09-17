@@ -462,6 +462,57 @@ Optional (LLM timeout budgets — mika#2189):
   which grew 54 KB → 59.8 KB on 2026-09-01 and is the proximate reason this agent
   crossed the line when the fleet had been bleeding since at least 08-27.
 
+Filet de sécurité sur l'appel LLM principal (mika#2342) :
+- **Le défaut que ça ferme.** Un tour mika-arch partait en `llm_call started` et ne
+  rendait plus rien pendant **27+ minutes** : ni `llm_call completed`, ni
+  `turn_usage`, ni erreur. Tâche `in_progress` indéfiniment, client A2A parti, groom
+  livrant `first-pass _arch_ask failed`. n=2, même brief, avec 420/600 posés sur le
+  service — un appel de cette durée **ne devrait pas exister**.
+- **La cause structurelle, lisible sans reproduire l'incident.** L'appel de
+  `run_loop` était nu, et l'enveloppe est un **test en tête d'itération**, pas un
+  enveloppeur : un appel qui ne rend pas la main ne l'atteint jamais. Le timeout
+  `reqwest` du rail était donc le **seul** mécanisme de coupure, et sa défaillance
+  n'avait ni second filet ni trace. L'asymétrie était dans le même fichier :
+  `attempt_continuation_turn` enveloppe le sien depuis toujours.
+- **Le filet.** `tokio::time::timeout(worst_case_du_rail + 60 s)`. Sur déclenchement :
+  WARN `llm_call_watchdog_fired`, ligne `audit_events`
+  (`tool_name = 'llm_call_watchdog'`), et une erreur transport synthétique routée
+  dans la branche `Err` **existante** — donc ligne `llm_calls` en `error` avec la
+  latence réelle et `request_bytes`, sans dupliquer le chemin de persistance.
+- **Calé sur le pire cas, jamais sur le deadline restant** : borner par `remaining`
+  rouvrirait mika#848 (un appel coupé en vol perd son résultat *et* sa ligne, y
+  compris quand il allait aboutir). Sur un rail qui borne ses propres appels, le
+  filet ne peut donc firer qu'après la défaillance du mécanisme du rail — sur un
+  appel déjà perdu. Propriété **conditionnelle et écrite comme telle** : elle tient
+  parce que les trois rails de production bornent leurs appels, pas parce que le
+  trait l'exige.
+- **Aucune valeur de réglage n'a bougé** (ni plafond, ni enveloppe, ni `MAX_RETRIES`,
+  ni défaut de flotte). Aux géométries en vigueur : 420/600 → filet à **480 s** ;
+  240/900 → **780 s**.
+- **Surfaces opérateur.** Grep dans `$MIKA_SPIRIT_LOG_FILE` : `llm_call_watchdog_fired`
+  — **doit rester vide** ; toute occurrence est un appel que reqwest n'a pas borné,
+  c'est-à-dire la cause racine de mika#2342 rendue visible, et elle alimente son
+  ticket de suivi (les champs `request_bytes` et `max_attempts` tranchent entre les
+  trois lectures). `llm_call_attempt` — `jq 'select(.attempt > 0)'` donne le volume
+  réel de retry, jusqu'ici impossible à compter. SQL :
+  `SELECT COUNT(*) FROM audit_events WHERE tool_name = 'llm_call_watchdog';`
+- **Sonde post-déploiement, avec sa halte.** Le ticket affirme 420/600 sur le
+  process ; si c'est exact, le `240/900` posé à mika-arch par mika#2189 est **écrasé**
+  par une variable de service (cascade mika#2218). Lire `llm_budget_resolved` pour
+  mika-arch et regarder `http_source` : `process_env` à 420 → confirmé, la correction
+  relève de l'environnement du service ; `agent_config` à 240 → l'affirmation du
+  ticket est fausse et l'arithmétique doit être refaite avant toute conclusion. Sur
+  48 h, `llm_call_watchdog_fired` non vide est un **résultat**, pas une panne : il
+  attribue enfin le blocage. Répété sur un même agent **sans `llm_call_attempt`
+  intermédiaire** → blocage **avant** `send_once` (sérialisation du corps, acquisition
+  de connexion) : **halte**, ne pas remonter le filet, c'est un autre défaut.
+- **Hors périmètre, délibérément :** la cause reqwest elle-même (ce travail borne et
+  rend lisible ; le ticket de suivi s'ouvre sur la première occurrence avec ses
+  champs) ; le littéral `120s` de `claude.rs` (mika#2342 le rend *déclaré* via
+  `AnthropicProvider::worst_case_failure_secs`, pas *cohérent*) ; le retry d'`_arch_ask`
+  (mika#2331, en aval — AC1/AC2 lui rendent sa précondition) ; et le volume du prompt
+  système d'arch.
+
 Observabilité du budget effectif + garde de demi-configuration (mika#2293) :
 - **Ce que mika#2189 ne pouvait pas dire.** Le couple `240/900` a été donné à
   mika-arch le 06/09 ; la mesure du 11/09 voyait toujours des coupures à **120 s

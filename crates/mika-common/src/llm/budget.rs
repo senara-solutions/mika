@@ -330,14 +330,15 @@ fn parse_agent_total_timeout(raw: Option<&str>) -> u64 {
 mod tests {
     use super::*;
     use crate::llm::{
-        DEFAULT_HTTP_TIMEOUT_SECS, RETRY_BUFFER_SECS, TRANSPORT_RETRY_MIN_REMAINING_SECS,
-        TYPICAL_CALL_DURATION_SECS,
+        DEFAULT_ATTEMPTS_HARD_CAP, DEFAULT_HTTP_TIMEOUT_SECS, RETRY_BUFFER_SECS,
+        TRANSPORT_RETRY_MIN_REMAINING_SECS, TYPICAL_CALL_DURATION_SECS,
     };
 
-    /// The provider's own attempt ceiling (`MAX_RETRIES + 1`). Duplicated here
-    /// rather than imported because `openai::MAX_RETRIES` is private; the
-    /// coupling is pinned by `openai::tests::max_attempts_respects_provider_hard_cap`.
-    const HARD_CAP: u32 = 4;
+    /// The attempt ceiling the rails run under. Imported since mika#2342 —
+    /// it used to be a local `4` duplicating a constant private to `openai.rs`,
+    /// and the move to `llm/mod.rs` (so a trait default method could read it)
+    /// removes the duplication rather than relocating it.
+    const HARD_CAP: u32 = DEFAULT_ATTEMPTS_HARD_CAP;
 
     // -- D3 / Q1: the fractions reproduce the literals at the default cap --
 

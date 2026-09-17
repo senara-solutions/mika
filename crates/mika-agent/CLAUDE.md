@@ -6,7 +6,7 @@ Agent container: SQLite DB, agent loop, tools, prompt assembly, A2A server endpo
 
 Max 20 tool steps (all modes: conversation, callback, reminder, team), a per-agent turn envelope **defaulting** to 5 minutes (settable since mika#2189 — see § Timeout Budgets), 30s default per-tool timeout (overridable via `Tool::timeout_secs()` for builtins, and by the owning skill's `timeout_secs` for skill tools — see § Per-Tool Skill Budget). `LoopMode::Silent { max_steps }` carries per-trigger step limits via `SilentTrigger::max_steps()`. Step-awareness nudge injected at step `max_steps - 2` for all modes to encourage wrapping up. Silent mode nudge text is tailored for `send_message` notification.
 
-**Deadline enforcement (#848, #939, mika#2189):** the turn budget is enforced via an `Instant`-based deadline checked at five points: (1) top of each `run_loop` step iteration, (2) end of prelude work in each inner function before entering `run_loop`, (3) before `attempt_continuation_turn` entry — skip when `now + CONTINUATION_TIMEOUT_SECS > deadline`, (4) inside `attempt_continuation_turn` itself, where the inner timeout is clamped to `min(60s, deadline - now)`, (5) inside the LLM transport retry loop — `send_message_with_deadline()` aborts the retry chain when the remaining budget falls under a threshold **derived from the effective per-call plafond** (`0.75 × plafond + 0.25 × plafond`, which is the historical 90 + 30 = 120s at the default plafond), preventing doomed retries from consuming the deadline (#939). The provider's per-request `reqwest` timeout is the sole cancellation mechanism for in-flight HTTP calls — the outer agent deadline never drops a future mid-flight, so the `llm_calls` row is always persisted (success or transport-timeout). Worst-case turn duration is `envelope + plafond`, i.e. `300s + 120s = 420s` at the shipped defaults. Note the Anthropic rail (`crates/mika-common/src/claude.rs`) still hard-codes its own `120s` literal instead of reading the plafond — a real inconsistency mika#2189 names and leaves to its own ticket rather than bundling. `LoopResult` is a three-variant enum (`Done`/`MaxStepsExceeded`/`DeadlineExceeded`) without `#[non_exhaustive]` — the compiler's match-exhaustiveness check enforces that all three outer handlers (conversation, silent, team) handle every variant. CI lint guard `scripts/check-loop-select.sh` rejects `tokio::select!` inside `run_loop`'s body (would shadow the iteration-top deadline check).
+**Deadline enforcement (#848, #939, mika#2189):** the turn budget is enforced via an `Instant`-based deadline checked at five points: (1) top of each `run_loop` step iteration, (2) end of prelude work in each inner function before entering `run_loop`, (3) before `attempt_continuation_turn` entry — skip when `now + CONTINUATION_TIMEOUT_SECS > deadline`, (4) inside `attempt_continuation_turn` itself, where the inner timeout is clamped to `min(60s, deadline - now)`, (5) inside the LLM transport retry loop — `send_message_with_deadline()` aborts the retry chain when the remaining budget falls under a threshold **derived from the effective per-call plafond** (`0.75 × plafond + 0.25 × plafond`, which is the historical 90 + 30 = 120s at the default plafond), preventing doomed retries from consuming the deadline (#939). **The outer agent deadline still never drops a future mid-flight** — that is the mika#848 contract and it is unchanged: the `llm_calls` row is always persisted (success or transport-timeout), and worst-case turn duration remains `envelope + plafond`, i.e. `300s + 120s = 420s` at the shipped defaults. What changed with **mika#2342** is that the provider's `reqwest` timeout is no longer the **sole** cancellation mechanism: `run_loop`'s call is wrapped in a `tokio::time::timeout` sized on `LlmProvider::worst_case_failure_secs() + LLM_WATCHDOG_MARGIN_SECS` (60 s) — see § LLM-call watchdog below. Sized on the *worst case* rather than on the remaining deadline, that net does not contradict the mika#848 reasoning: on a rail that bounds its own calls it can only fire once the rail's mechanism has already failed, i.e. on a call that is already lost. Note the Anthropic rail (`crates/mika-common/src/claude.rs`) still hard-codes its own `120s` literal instead of reading the plafond — a real inconsistency mika#2189 names and leaves to its own ticket; mika#2342 makes it a *declared* value (`AnthropicProvider::worst_case_failure_secs`) so the net is not sized on a budget that rail does not honour. `LoopResult` is a three-variant enum (`Done`/`MaxStepsExceeded`/`DeadlineExceeded`) without `#[non_exhaustive]` — the compiler's match-exhaustiveness check enforces that all three outer handlers (conversation, silent, team) handle every variant. CI lint guard `scripts/check-loop-select.sh` rejects `tokio::select!` inside `run_loop`'s body (would shadow the iteration-top deadline check).
 
 On max-steps exceeded: continuation turn (tools disabled, deadline-clamped timeout, ceiling 60s) forces a text summary via shared `attempt_continuation_turn()` helper (used by Conversation, Team, and Silent modes); the helper persists an `llm_calls` row in all outcomes (success/error/timeout) so the continuation is never the silent-drop variant of the in-flight-cancel bug at smaller scale. If continuation fails or is skipped (deadline too close), structured fallback shows last 5 tool names with status. Silent mode continuation sends the summary via `message_sender` if available, prefixed with "[Background task exceeded tool step limit]".
 
@@ -120,6 +120,78 @@ unparseable or below-floor value without naming the agent or the cascade door, s
 the guard reads the raw values through the non-panicking `BudgetProvenance` the
 observability half already writes. The panic stays for unguarded paths — a `mika`
 CLI reaching it still panics exactly as before.
+
+### LLM-call watchdog (mika#2342)
+
+**The failure.** A mika-arch turn entered `llm_call started` and returned
+**nothing for 27+ minutes**: no `llm_call completed`, no `turn_usage`, no error.
+The task stayed `in_progress`, the A2A client walked away, the groom delivered
+`first-pass _arch_ask failed`. Twice, on the same brief, with
+`MIKA_LLM_HTTP_TIMEOUT_SECS=420` and `MIKA_AGENT_TOTAL_TIMEOUT_SECS=600` in the
+service environment — a call of that length *should not exist*.
+
+**The structural defect, which is readable without reproducing the incident.**
+`run_loop`'s call was made bare, and the envelope is a test at the **top of the
+iteration**, not a wrapper. A call that does not return the future never reaches
+that test. So the provider's `reqwest` timeout was the **sole** mechanism able to
+end an in-flight call, and when it failed — for a reason still unnamed — nothing
+in the process could bound it and nothing recorded that anything had happened.
+The asymmetry made it hard to read as a choice: `attempt_continuation_turn`, in
+the same file, has wrapped *its* call in a `tokio::time::timeout` all along and
+persists a row on all three arms.
+
+**The net.** `tokio::time::timeout(llm.worst_case_failure_secs() +
+LLM_WATCHDOG_MARGIN_SECS, …)`. On timeout: a `llm_call_watchdog_fired` WARN, an
+`audit_events` row (`tool_name = 'llm_call_watchdog'`), and a synthetic
+`LlmError::Transport` routed into the **pre-existing** `Err` branch, so the
+`llm_calls` row is persisted with `status = "error"`, the real latency and
+`request_bytes` without duplicating the persistence path.
+
+**Why the worst case and not the remaining deadline.** Cutting on `remaining`
+would re-open mika#848: a call dropped in flight loses its result *and* its row,
+including when it was about to succeed. Sized on the worst case, the net fires
+only after the rail's own mechanism has already failed — on a call that is
+already lost, so cutting it costs nothing and its firing is first-order
+information. **That property is conditional and the code says so:** it holds
+*because* the three production rails bound their own calls, not because the
+`LlmProvider` trait requires it. On a rail without a transport timeout (the mock
+today, a new rail tomorrow) the net is the *first* mechanism, not the second.
+
+**The worst case is declared by the rail, never derived from the budget.**
+`LlmProvider::worst_case_failure_secs()` defaults to
+`timeout_budget().worst_case_failure_secs(DEFAULT_ATTEMPTS_HARD_CAP)`, and
+`AnthropicProvider` overrides it: that rail hands `reqwest` a `120s` literal
+instead of the plafond, so at `MIN_HTTP_TIMEOUT_SECS` a derived value would read
+40 s against a transport that can take 480 — a guaranteed false positive. At the
+current geometries: 420/600 → `max_attempts = 1`, net at **480 s**; 240/900 →
+`max_attempts = 3`, net at **780 s**. Both far under the 27 minutes observed and
+above any legitimate chain.
+
+**Per-attempt instrumentation is the discriminator, not decoration.** The net
+alone says "something exceeded the worst case" without saying what.
+`llm_call_attempt` (before each `send_once`, on the three rails, carrying
+`attempt`, `max_attempts`, `request_bytes`) separates three readings of the same
+silence: N attempts of roughly a plafond each (the chain runs, the cause is
+upstream); one attempt outliving the plafond (reqwest did not bound it); no
+attempt at all after `started` (the block is *before* `send_once` — body
+serialization, connection acquisition). `request_bytes` rides on the **start** of
+the attempt because that is the only way to know the size of a request that never
+comes back: `llm_calls.request_bytes` is written after the call returns.
+
+**Structural guard.** `agent_loop::tests::mika2342_every_llm_call_is_wrapped_in_a_timeout`
+— a source scan, because removing the net breaks no assertion: the loop keeps
+working and every existing test stays green, only the call goes unbounded and
+silent again. Inventory closed at two call sites, **no allowlist** (an allowlist
+born empty is a place to put the next violation); a third site is halt-and-surface.
+
+**Operator surfaces.** `llm_call_watchdog_fired` in `$MIKA_SPIRIT_LOG_FILE`
+should stay **empty** — any hit is a call reqwest failed to bound, i.e. the root
+cause of mika#2342 made visible, and it feeds the follow-up ticket.
+`SELECT COUNT(*) FROM audit_events WHERE tool_name = 'llm_call_watchdog';`.
+`grep llm_call_attempt … | jq 'select(.attempt > 0)'` gives the real retry volume,
+until now uncountable. **Halt condition:** repeated `llm_call_watchdog_fired` on
+one agent with no intervening `llm_call_attempt` points at a block *before*
+`send_once` — a different defect; do not raise the net.
 
 Tool call summaries (name, truncated input/output, success, non_zero_exit) persisted in `messages.metadata` JSON column for cross-turn introspection (capped at `TOOL_METADATA_MAX = 4000` chars — tail entries dropped when exceeded, #744). The `tool_calls` DB table is the authoritative source; the dashboard's inline `ToolCallsTable` fetches from `GET /api/v1/traces/:trace_id/tool-calls` with metadata as fallback for pre-v15 messages. `MessageResponse` exposes `trace_id: Option<String>` to enable this lookup. `non_zero_exit` is set by heuristic detection of `Exit code:` / `Killed by signal:` prefixes from exec handlers; history builder tags these with `[NON-ZERO]` (distinct from `[FAILED]`). History builder appends `<context type="tool_history">` blocks to assistant messages.
 
@@ -742,6 +814,92 @@ retry loops written by hand in caller shells stop firing.
 1 was gated on this ticket: two pilots whose permission escalations overlap would
 have seen one refused mid-session. This is an *operational* prerequisite of N>1,
 not a delivery one — mika#2160 ships its default of 1 without it.
+
+### No Completed Turn Is Lost In Silence (mika#2270)
+
+**The failure.** Eleven consecutive `mika ask` calls came back empty on
+2026-09-09 — `.content` absent, **exit 0** — while the engine had produced the
+full answer and written it to the log (trace `d5887aa7`, 43 108 input tokens,
+28 s, `stop_reason=EndTurn`). mika#2266's architect verdict had to be harvested by
+hand out of a 19 GB log file for the grooming to finish. The shape is what makes
+it a loop-breaker rather than a slowdown: well-formed JSON, code zero, a key
+simply missing — **nothing distinguished "the agent had nothing to say" from "the
+answer was lost"**. A probe that lies without failing.
+
+**M1 — `message/send` held the answer and threw it away; `message/stream` never
+did.** `run_a2a_agent` returns `Result<Option<String>, String>`: the turn's text,
+in memory. The stream port serves it directly. The send port filtered it out with
+`Ok(_)` and then **rebuilt a Task from the database** via `a2a_build_task`. Same
+loop, two ports, one of which kept the reply in hand. That is the literal shape of
+"LLM cost paid and discarded".
+
+**M2 — the renderer's "three tiers" were never three sources**, and its own doc
+comment claimed defence in depth for months. `a2a_insert_artifact` has no
+production caller, so tier 1 is dead on the spirit path; and `a2a_build_task`
+derives `status.message` from the last agent-role message of `history`, which is
+`a2a_get_messages`' result — so tiers 2 and 3 fail **together**, on one query.
+Chasing the cause in the renderer, which is what the ticket's main lead proposed,
+could not have converged: the renderer was the victim.
+
+**What ships.** (a) `message/send` keeps the loop's text and guarantees that a
+terminal Task it serves carries at least one non-empty slice —
+`ensure_send_task_carries_text`, whose decision half `decide_content_net` is a
+pure function with three outcomes (`Nominal` / `MuteTurn` / `Rescued`). (b) The
+renderer returns `Result` instead of `String`, so an unreadable Task **fails
+naming what was inspected** (artifact and history counts with their roles,
+`status.message` presence, plus `task_id` and `context_id` — the two handles that
+find the turn in `$MIKA_SPIRIT_LOG_FILE`). The signature change, not a parallel
+function, is what makes the compiler force both call sites.
+
+**The two halves share one predicate, and that is load-bearing.**
+`mika_a2a::render::render_task_text` is the single definition of "does this Task
+carry text", used by the server's net and by the CLI's renderer. A server-side
+approximation could call a Task fine while the client found nothing readable —
+the exact gap the net exists to close. It also means the fourth line of the
+decision table is not a detail: a turn that produced **no** text is served with
+the same literal `message/stream` serves (`COMPLETED_WITHOUT_TEXT`), which
+**removes the whole "completed but empty" class from this port** and is what lets
+the CLI treat every empty Task as a loss with no false positive.
+
+**The net does not hide the defect.** A silent repair would turn the loop green
+and make the fault permanently invisible — i.e. build the next occurrence. So the
+rescue path emits `a2a_send_task_content_lost` carrying only the facts that settle
+the cause: `task_id`, `context_id`, `session_id`, the `trace_id` handed to the
+loop (equal to `task_id` today, reported rather than assumed), and the two counts
+from `Database::a2a_message_census` — rows for this session, rows for this trace —
+which separate "nothing was persisted" from "persisted under another trace id"
+without an operator opening the database.
+
+**SOLE WRITER:** `a2a_send_task_content_lost`, in the log and in `audit_events`.
+Its **absence** under a symptom is therefore information: it says the loss is not
+here. Pinned by `server::a2a::tests::the_loss_signal_has_exactly_one_writer_in_this_module`,
+a lexical guard — a second writer would make no decision wrong, only
+unattributable, which no behavioural test can see.
+
+**What this does NOT explain: why `a2a_get_messages` returns empty.** M3 reduces
+it to one predicate on one column written by one path (the agent loop's
+`trace_id`), but deciding between "nothing persisted" and "persisted under another
+trace id" needs the production database. Follow-up ticket **conditioned on the
+first occurrence** of the WARN, which carries exactly the two counts that
+depart it. Opening it before that line exists would be instructing without a
+measurement.
+
+**Operator surfaces.** Grep `a2a_send_task_content_lost` in
+`$MIKA_SPIRIT_LOG_FILE` — **empty in nominal operation**; continuous firing means
+the net is masking a persistence failure that deserves its own fix, so treat the
+cause, not the threshold. SQL:
+`SELECT COUNT(*) FROM audit_events WHERE tool_name = 'a2a_send_task_content_lost';`
+Two adjacent names, deliberately distinct: `a2a_send_task_census_unreadable`
+(ERROR — the counts could not be read, the loss is still reported) and
+`a2a_send_task_content_lost_audit_failed` (the WARN landed, the audit row did
+not).
+
+**Halt conditions.** The symptom returns and the WARN stays silent → the loss is
+not where this fix places it: do **not** widen the net or add a tier to the
+renderer, reopen the investigation on the client or transport side with the POST
+trace. A nominal reply whose bytes change → the net is biting where it must not;
+halt before deploying, since a return-channel fix that alters healthy answers is
+worse than the silence it replaces.
 
 ### Introspection Tools
 

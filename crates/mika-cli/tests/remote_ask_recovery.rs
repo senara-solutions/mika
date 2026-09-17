@@ -191,7 +191,7 @@ async fn a_generated_response_survives_a_dropped_socket() {
         .expect("the answer existed server-side and must be reclaimed");
 
     assert_eq!(
-        render_task_parts(&task),
+        render_task_parts(&task).expect("a reclaimed answer must render"),
         GENERATED_VERDICT,
         "the reclaimed text must be the generation, verbatim and accented"
     );
