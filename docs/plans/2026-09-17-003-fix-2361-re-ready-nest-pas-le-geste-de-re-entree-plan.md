@@ -354,6 +354,64 @@ plus son miroir `AsyncDatabase`.
 
 ---
 
+## Fire-Disposition
+
+*(Exigée par le Fire-Disposition Gate — mika#1574. Ce plan livre des détecteurs
+T1–T10, dont un scan structurel T7 ; cette section dit comment chacun se comporte
+face aux données et au code **préexistants**.)*
+
+**Disposition retenue : (c) halt-and-surface.** Aucun allowlist, aucun détecteur
+livré désarmé. La justification est mesurée, pas prudentielle : l'état courant du
+dépôt est déjà à zéro violation pour chacun des dix détecteurs, donc il n'y a rien
+à tolérer, et tolérer par anticipation reviendrait à s'aveugler sur exactement la
+classe que ce plan existe pour rendre attribuable.
+
+**T7 — le seul détecteur qui tire sur du préexistant.** Il scanne `src/` à la
+recherche des appelants de `reset_auto_pull_redrive` hors `#[cfg(test)]`.
+
+- *État à l'écriture :* exactement deux appelants de production, nommés au § 1.2
+  (`auto_pull.rs:3357`, `auto_pull.rs:3363`). Le détecteur passe au vert sans qu'une
+  seule ligne de code de production soit modifiée pour lui — c'est la condition qui
+  rend (c) disponible ici, et elle est vérifiée avant l'écriture, pas espérée.
+- *Allowlist :* **vide**, et la vacuité est l'invariant. Les deux sites attendus sont
+  la valeur attendue de l'assertion, pas des exemptions : un test qui tolérerait N
+  appelants dont deux nommés ne dirait plus rien du jour où un troisième apparaît.
+- *Si T7 échoue au land time :* **halte**. Un troisième écrivain de
+  `redrive_abandoned_at` invaliderait la réfutation du § 1.2 (« le restart ne peut pas
+  avoir effacé l'abandon ») et donc le diagnostic dont tout ce plan dépend. Le remède
+  n'est **pas** d'ajouter le site à un allowlist ni d'assouplir le scan : c'est de lire
+  le nouvel écrivain, de reprendre le § 1.2, et de rouvrir le périmètre si la cause
+  mesurée a changé. La sonde S3 énonce la même halte côté production — les deux se
+  répondent délibérément.
+- *Auto-exclusion :* T7 vit dans `auto_pull::tests`, donc sous `#[cfg(test)]`, et le
+  scan doit exclure ce module — sans quoi le détecteur se compterait lui-même et
+  échouerait sur sa propre existence. C'est un défaut d'implémentation connu de cette
+  famille de gardes (`mika2131_exclusion_skips_never_return_to_an_uncollected_debug`
+  le traite déjà) et il est nommé ici pour que l'implémenteur ne le redécouvre pas.
+
+**T1–T6 — détecteurs de décision, sur fixtures construites.** Ils classifient des
+issues synthétiques au travers de la fonction pure ; aucun corpus préexistant n'entre
+dans leur population. Ils ne peuvent donc pas « tirer » sur de l'historique. Un échec
+au land time n'est jamais un héritage : il signifie que la requalification D2 a changé
+un verdict, ce qu'AC8 interdit — **halte**, et non ajustement de l'attente du test.
+
+**T8–T10 — détecteurs d'intégration, sur base temporaire.** Chaque test ouvre une DB
+neuve ; aucune donnée de production n'est lue. Aucune migration n'est livrée (D7), donc
+aucun schéma préexistant n'est sollicité.
+
+**Données de production préexistantes — non touchées, et la scission est datée.** La
+requalification ne réécrit aucune ligne `audit_events` déjà posée : les exclusions
+historiques gardent `after_value = 'operator_review_or_blocked'`. L'agrégat se scinde
+**à partir du déploiement**, et c'est voulu — réécrire l'historique pour rendre la
+série continue rendrait faux ce que ces lignes ont dit au moment où elles ont été
+écrites. AC7 tient l'autre moitié de la propriété : un ticket tenu mais non abandonné
+continue de produire l'ancien nom, donc la série historique reste comparable à
+elle-même sur la population qui n'a pas changé de nom. L'opérateur qui compare de part
+et d'autre du déploiement doit sommer les deux noms ; c'est dit au § 9 (S1) et ce sera
+dit au root `CLAUDE.md` avec le reste du vocabulaire (§ 6).
+
+---
+
 ## 6. Definition of Done
 
 - [ ] `FILTER_ABANDONED_OPERATOR_HELD` existe, est requalifiée depuis
@@ -364,6 +422,9 @@ plus son miroir `AsyncDatabase`.
       seul écrivain.
 - [ ] `AbandonReason::comment_body` ne nomme plus `operator-review` comme unique remède.
 - [ ] T1–T10 passent ; T1 et T7 portent en doc-comment la raison de leur existence.
+- [ ] T7 est livré **armé, allowlist vide**, et exclut son propre module `#[cfg(test)]`
+      du scan (§ *Fire-Disposition*). Un échec au land time se solde par une halte, pas
+      par une exemption.
 - [ ] `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test -p mika-agent` verts.
 - [ ] Root `CLAUDE.md` § *auto-pull stuck-ready reconciler* : le vocabulaire de filtres
       gagne la paire `operator_review_or_blocked` / `abandoned_operator_held` et ses
@@ -479,3 +540,24 @@ toucher au budget de re-drive par réflexe.
 pose) et `grep auto_pull_reentry_ledger_unreadable $MIKA_SPIRIT_LOG_FILE` — **doit
 rester vide** ; toute occurrence est un ledger illisible, donc un commentaire refusé par
 fail-closed et un opérateur laissé sans remède sur le ticket.
+
+---
+
+## Revision history
+
+- **rev 2 (2026-09-17)** — adressé F1 (BLOCKING) par l'ajout d'une section
+  `## Fire-Disposition` (Fire-Disposition Gate, mika#1574), placée après § 5.3 pour ne
+  renuméroter aucune section existante. Option canonique **(c) halt-and-surface**
+  retenue, avec sa condition de disponibilité vérifiée plutôt que supposée : l'état
+  courant du dépôt est à zéro violation pour les dix détecteurs, dont T7 dont les deux
+  appelants attendus sont mesurés au § 1.2. La section traite séparément les trois
+  familles de détecteurs (T7 scan structurel sur `src/` ; T1–T6 sur fixtures ; T8–T10 sur
+  DB temporaire), nomme l'auto-exclusion `#[cfg(test)]` que T7 doit implémenter, et
+  traite le seul préexistant réel — les lignes `audit_events` historiques portant
+  `operator_review_or_blocked`, non réécrites, dont la scission est datée du déploiement.
+  La halte de T7 est explicitement reliée à la halte S3 du § 9 : dans les deux cas le
+  remède est de chercher l'écrivain, jamais d'élargir un allowlist. Une case de DoD
+  couvre l'armement et la vacuité de l'allowlist.
+- Aucune autre section modifiée ; aucun AC affaibli ni ajouté (la disposition retenue
+  n'introduit pas de comportement neuf, elle documente celui des détecteurs déjà
+  spécifiés au § 5).
