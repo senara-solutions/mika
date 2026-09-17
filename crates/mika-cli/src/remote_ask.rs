@@ -16,11 +16,11 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-pub use mika_a2a::CALLER_SESSION_ID_KEY;
 use mika_a2a::client::{A2aClient, RECOVERY_TIMEOUT};
 use mika_a2a::error::TransportFailure;
 pub use mika_a2a::render::{EmptyKind, TaskRenderEmpty};
 use mika_a2a::{A2aError, Message, MessageSendParams, Part, Role, Task, TaskState};
+pub use mika_a2a::{CALLER_SESSION_ID_KEY, ONLY_SKILLS_KEY};
 use uuid::Uuid;
 
 /// Output format selector. Mirrors `crate::cli::OutputFormat` to keep the
@@ -71,17 +71,43 @@ pub fn render_task_parts(task: &Task) -> Result<String, TaskRenderEmpty> {
 /// `context_id` is the caller's own handle on this exchange (mika#2036). The
 /// server persists it beside the task it mints, which makes it the one name the
 /// caller can still use to find its answer if the response never arrives.
+///
+/// `only_skills` names the skills the turn should keep, under
+/// [`ONLY_SKILLS_KEY`] (mika#2363). Empty leaves the key absent.
+///
+/// The two metadata keys are independent and either may be absent. When both
+/// are, `metadata` itself stays absent so the serialized body is byte-identical
+/// to the pre-mika#2070 shape — the property that makes a caller declaring
+/// nothing indistinguishable from a caller that predates these keys.
 fn build_send_params(
     message: &str,
     caller_session_id: Option<&str>,
     context_id: &str,
+    only_skills: &[String],
 ) -> MessageSendParams {
-    let metadata = caller_session_id.map(|sid| {
-        std::collections::HashMap::from([(
+    let mut fields = std::collections::HashMap::new();
+    if let Some(sid) = caller_session_id {
+        fields.insert(
             CALLER_SESSION_ID_KEY.to_string(),
             serde_json::Value::String(sid.to_string()),
-        )])
-    });
+        );
+    }
+    if !only_skills.is_empty() {
+        fields.insert(
+            ONLY_SKILLS_KEY.to_string(),
+            serde_json::Value::Array(
+                only_skills
+                    .iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    let metadata = if fields.is_empty() {
+        None
+    } else {
+        Some(fields)
+    };
     MessageSendParams {
         message: Message {
             message_id: Uuid::new_v4().to_string(),
@@ -218,6 +244,7 @@ pub async fn send_message_to_agent(
     message: &str,
     url: &str,
     caller_session_id: Option<&str>,
+    only_skills: &[String],
 ) -> Result<Task> {
     let auth_token = std::env::var("MIKA_INTERNAL_TOKEN")
         .ok()
@@ -230,7 +257,12 @@ pub async fn send_message_to_agent(
     let context_id = Uuid::new_v4().to_string();
 
     let task = match client
-        .send_message(build_send_params(message, caller_session_id, &context_id))
+        .send_message(build_send_params(
+            message,
+            caller_session_id,
+            &context_id,
+            only_skills,
+        ))
         .await
     {
         Ok(task) => task,
@@ -327,7 +359,11 @@ pub async fn dispatch_remote(
     // gateway proxies back to this same spirit is the exception — correlation
     // would work there — but `--remote` is not the measured path, so we do not
     // count on it.
-    let task = send_message_to_agent(message, remote_url, None).await?;
+    // `--remote` sends no skill restriction either (mika#2363): `--only-skill`
+    // is refused in team mode but accepted with `--remote`, and a remote agent's
+    // skill names are not this machine's to guess. The flag is honoured on the
+    // local spirit path, which is the one `_arch_ask` uses.
+    let task = send_message_to_agent(message, remote_url, None, &[]).await?;
     render(&task, format, verbose)
 }
 
@@ -820,7 +856,7 @@ mod tests {
 
     #[test]
     fn send_params_carry_the_caller_session_id() {
-        let params = build_send_params("hello", Some("rt005-c1-r7"), "ctx-1");
+        let params = build_send_params("hello", Some("rt005-c1-r7"), "ctx-1", &[]);
         let metadata = params.metadata.expect("metadata should be present");
         assert_eq!(metadata.len(), 1);
         assert_eq!(
@@ -831,7 +867,7 @@ mod tests {
 
     #[test]
     fn send_params_without_a_session_serialize_without_metadata() {
-        let params = build_send_params("hello", None, "ctx-1");
+        let params = build_send_params("hello", None, "ctx-1", &[]);
         assert!(params.metadata.is_none());
         // The pre-mika#2070 body shape is preserved byte-for-byte: `metadata` is
         // `skip_serializing_if = "Option::is_none"`, so the key must be absent
@@ -840,6 +876,49 @@ mod tests {
         assert!(
             body.get("metadata").is_none(),
             "unexpected metadata key in {body}"
+        );
+    }
+
+    // --- mika#2363: the skill restriction on the wire --------------------------
+
+    #[test]
+    fn send_params_carry_only_skills_as_an_array_of_strings() {
+        let only = vec!["mika-arch-groom-ticket".to_string()];
+        let params = build_send_params("hello", None, "ctx-1", &only);
+        let body = serde_json::to_value(&params).unwrap();
+        assert_eq!(
+            body["metadata"][ONLY_SKILLS_KEY],
+            serde_json::json!(["mika-arch-groom-ticket"]),
+            "the server reads an array of strings; any other shape degrades to \
+             no restriction and the flag would be a silent no-op: {body}"
+        );
+    }
+
+    #[test]
+    fn the_two_metadata_keys_are_independent() {
+        // Both halves present is the `_arch_ask` shape: a session to continue and
+        // a pass to declare. Neither key may shadow the other.
+        let only = vec!["mika-arch-second-review".to_string()];
+        let params = build_send_params("hello", Some("sess-7"), "ctx-1", &only);
+        let metadata = params.metadata.expect("metadata should be present");
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(
+            metadata.get(CALLER_SESSION_ID_KEY).and_then(|v| v.as_str()),
+            Some("sess-7")
+        );
+        assert!(metadata.contains_key(ONLY_SKILLS_KEY));
+    }
+
+    #[test]
+    fn an_empty_restriction_leaves_the_key_absent() {
+        // R3: a caller that declares nothing must produce the pre-mika#2363 body.
+        // An empty array on the wire would be a different statement — and one the
+        // server would have to decide the meaning of.
+        let params = build_send_params("hello", Some("sess-7"), "ctx-1", &[]);
+        let body = serde_json::to_value(&params).unwrap();
+        assert!(
+            body["metadata"].get(ONLY_SKILLS_KEY).is_none(),
+            "unexpected only_skills key in {body}"
         );
     }
 }

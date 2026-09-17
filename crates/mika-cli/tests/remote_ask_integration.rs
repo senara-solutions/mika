@@ -341,7 +341,7 @@ async fn spirit_dispatch_carries_the_caller_session_id_over_the_wire() {
     .await;
 
     let url = format!("http://{addr}/a2a/cust-9/mika-prime");
-    let _ = send_message_to_agent("hi", &url, Some("rt005-c1-r7"))
+    let _ = send_message_to_agent("hi", &url, Some("rt005-c1-r7"), &[])
         .await
         .expect("send should succeed");
 
