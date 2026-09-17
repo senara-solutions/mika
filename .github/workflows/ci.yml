@@ -93,6 +93,9 @@ jobs:
       - name: Rescue-into-open-PR signal suite (mika#2151)
         run: make test-rescue-signal
 
+      - name: Rescue pipeline-verified producer suite (mika#2354)
+        run: make test-rescue-pipeline-verified
+
       - name: Pilot sandbox secret-channel guards (mika#2039)
         run: |
           make test-sandbox-secret-argv

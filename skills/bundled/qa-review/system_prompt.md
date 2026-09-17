@@ -129,6 +129,8 @@ This step determines whether the PR is an auto-rescued dispatch-lib PR and, if s
 
    *Scope of "operator un-drafted it"* (mika#2286): the `wip_rescue` daemon un-drafts too, so `isDraft: false` is not by itself a human gesture. It became trustworthy again only for the sensitive class — since mika#2286 the daemon un-drafts a DECISION-CORE rescue draft **only** on marker `yes`, otherwise it parks it (PR #2285 was the breach). It still un-drafts MECHANICAL at `no`, deliberately.
 
+   *Scope of "the marker reads `yes`"* (mika#2354): `yes` may have been set by dispatch-lib's mechanical producer (`_measure_pipeline_verified`), not by a human hand. It attests that the LOCAL pipeline is complete — clean worktree, code diff carried, `cargo fmt --check`, `cargo clippy -D warnings`, `verify-pipeline.sh` all green on the rescue worktree — **not** that the work is of acceptable quality. A `yes` opens the door to Step 2; it never stands in for the review that follows.
+
 5. **Route based on verification state:**
    - **Verified:** Note "Rescue PR (class: `<class>`), pipeline verified — proceeding to standard review." Continue to Step 2 normally. The rescue boilerplate text is not treated as a review gate.
    - **Not verified** (marker is `no` AND PR is still draft): Emit `hold[review]` with reason: "Auto-rescued PR (class: `<class>`) is still in draft with pipeline-verification marker set to `no`. Operator must verify pipeline completion and either mark the PR as Ready for Review or edit the body to set `<!-- rescue-pipeline-verified: yes -->`." End the review — do not proceed to Step 2.

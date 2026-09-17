@@ -259,6 +259,72 @@ fn inject_dispatch_worktree_env(
     Some(path)
 }
 
+/// The two operator settings `dispatch-lib.sh`'s rescue-pipeline measurement
+/// honours (mika#2354): the kill-switch and the measurement's global budget.
+///
+/// `MIKA_`-prefixed and relayed explicitly, for the reason spelled out on
+/// [`inject_rescue_verify_env`]: [`sandboxed_pilot_env`] rebuilds the child env
+/// from a **positive** allowlist, so no name crosses by inheritance — prefixed
+/// or not. A same-named-but-unprefixed variable would propagate exactly as
+/// little and cost a vocabulary divergence for nothing.
+const RESCUE_VERIFY_ENV: &[&str] = &[
+    "MIKA_RESCUE_VERIFY_ENABLED",
+    "MIKA_RESCUE_VERIFY_BUDGET_SECS",
+];
+
+/// Decide which of [`RESCUE_VERIFY_ENV`] to set on the child, given a reader of
+/// the spirit process environment.
+///
+/// Extracted as a pure function for the same reason [`is_sandbox_env_allowed`]
+/// is: the shape is verifiable without spawning a subprocess or mutating
+/// process-wide env state.
+///
+/// **Only a present, non-empty value is relayed.** This is where this injection
+/// differs from its two siblings ([`inject_pilot_transcript_env`],
+/// [`inject_dispatch_worktree_env`]), and the difference is deliberate: they
+/// relay a path the engine *computed*, this one relays a value the *operator*
+/// set. An absence must therefore stay an absence — the shell keeps its own
+/// default instead of silently inheriting one, which is what keeps "no setting"
+/// and "setting posed at the default value" two states an operator can tell
+/// apart.
+fn rescue_verify_env_pairs<F>(read: F) -> Vec<(&'static str, String)>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    RESCUE_VERIFY_ENV
+        .iter()
+        .filter_map(|key| {
+            let value = read(key)?;
+            if value.is_empty() {
+                return None;
+            }
+            Some((*key, value))
+        })
+        .collect()
+}
+
+/// Relay the mika#2354 rescue-verification settings to `dispatch-lib.sh`.
+///
+/// MUST be called AFTER [`sandboxed_pilot_env`], like `GH_TOKEN` and the two
+/// sibling injections above it — that function does `env_clear()` and then
+/// copies back only the positive allowlist, so anything injected before it is
+/// erased. Neither name is in that allowlist and neither may be added: the
+/// allowlist stays the guard, this injection stays the named exception
+/// (mika#2354 AC9).
+///
+/// The measurement itself runs in `dispatch-lib.sh`'s rescue tail, which is
+/// **outside** bubblewrap (bwrap wraps only the claude-pilot invocation), so no
+/// `--setenv` allowlist is on this path.
+///
+/// Best-effort and silent: a dispatch that does not carry the settings falls
+/// back to the shell's own defaults (armed, 900 s), which is the shipped
+/// behaviour — never a blocked dispatch.
+fn inject_rescue_verify_env(cmd: &mut tokio::process::Command) {
+    for (key, value) in rescue_verify_env_pairs(|k| std::env::var(k).ok()) {
+        cmd.env(key, value);
+    }
+}
+
 /// Maximum raw image file size (5 MB).
 const MAX_IMAGE_SIZE: u64 = 5 * 1024 * 1024;
 
@@ -3212,6 +3278,10 @@ pub(crate) fn spawn_long_running_exec(
         // reaper reads. Same placement rationale as the line above — injected
         // after the env sandbox so the var survives.
         let expected_worktree_file = inject_dispatch_worktree_env(&mut cmd, &skill_dir, &task_id);
+        // mika#2354: relay the rescue-verification settings the rescue tail
+        // reads. Same placement rationale as the two lines above — injected
+        // after the env sandbox so the vars survive its positive allowlist.
+        inject_rescue_verify_env(&mut cmd);
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -3444,6 +3514,70 @@ mod tests {
         // to the core allowlist: the MIKA_ prefix check runs first.
         assert!(!is_sandbox_env_allowed("MIKA_PATH"));
         assert!(!is_sandbox_env_allowed("MIKA_"));
+    }
+
+    /// mika#2354 AC9(a): an absent or empty setting on the spirit side is not
+    /// posed on the child. The shell keeps its own default rather than
+    /// inheriting one, so "unset" and "set to the default" stay distinguishable.
+    #[test]
+    fn mika2354_rescue_verify_env_relays_only_present_non_empty_values() {
+        let absent = rescue_verify_env_pairs(|_| None);
+        assert!(
+            absent.is_empty(),
+            "an unset setting must not be posed on the child, got {absent:?}"
+        );
+
+        let empty = rescue_verify_env_pairs(|_| Some(String::new()));
+        assert!(
+            empty.is_empty(),
+            "an empty setting must not be posed on the child, got {empty:?}"
+        );
+
+        let one = rescue_verify_env_pairs(|k| {
+            (k == "MIKA_RESCUE_VERIFY_ENABLED").then(|| "0".to_string())
+        });
+        assert_eq!(one, vec![("MIKA_RESCUE_VERIFY_ENABLED", "0".to_string())]);
+
+        let both = rescue_verify_env_pairs(|k| match k {
+            "MIKA_RESCUE_VERIFY_ENABLED" => Some("1".to_string()),
+            "MIKA_RESCUE_VERIFY_BUDGET_SECS" => Some("300".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            both,
+            vec![
+                ("MIKA_RESCUE_VERIFY_ENABLED", "1".to_string()),
+                ("MIKA_RESCUE_VERIFY_BUDGET_SECS", "300".to_string()),
+            ]
+        );
+    }
+
+    /// mika#2354 AC9(b): the positive allowlist stays the guard and the explicit
+    /// injection stays the named exception. Adding either name to
+    /// [`SANDBOX_ENV_CORE_ALLOWLIST`] — or covering it with a new entry in
+    /// [`SANDBOX_ENV_ALLOWED_PREFIXES`] — would make the settings arrive by
+    /// inheritance, which is the shape mika#2165 named a decorative setting:
+    /// the channel would then differ from the one this ticket documented, and
+    /// nothing would say so.
+    #[test]
+    fn mika2354_rescue_verify_env_never_joins_the_sandbox_allowlist() {
+        for key in RESCUE_VERIFY_ENV {
+            assert!(
+                !is_sandbox_env_allowed(key),
+                "{key} must reach dispatch-lib by explicit injection, never by \
+                 inheritance — it is not the allowlist's job to carry it"
+            );
+            assert!(
+                !SANDBOX_ENV_CORE_ALLOWLIST.contains(key),
+                "{key} must not be added to SANDBOX_ENV_CORE_ALLOWLIST"
+            );
+            assert!(
+                !SANDBOX_ENV_ALLOWED_PREFIXES
+                    .iter()
+                    .any(|p| key.starts_with(p)),
+                "{key} must not be covered by SANDBOX_ENV_ALLOWED_PREFIXES"
+            );
+        }
     }
 
     /// Write a script file and make it executable, with fsync to avoid races.
