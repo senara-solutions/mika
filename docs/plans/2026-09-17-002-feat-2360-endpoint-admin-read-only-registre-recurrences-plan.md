@@ -53,9 +53,20 @@ et cet ensemble de champs ne les sépare pas :
 - **Absence pure** — rien n'a jamais enregistré ce label.
 - **Veto zombie mika#1742** — une ligne `failed | cancelled | expired` de moins de 24 h sur
   le même `(agent_id, label)` **refuse** la re-registration à chaque démarrage
-  (`db.rs:38-49`, `RECURRING_ZOMBIE_GRACE_HOURS = 24`). Trois marqueurs `metadata` modulent
-  ce veto : `$.config_cancel_reverted` (mika#2271), `$.unknown_trigger_death` et
-  `$.unknown_trigger_lift_spent` (mika#2337).
+  (`db.rs:45`, `RECURRING_ZOMBIE_GRACE_HOURS = 24`). Trois marqueurs `metadata` modulent
+  ce veto, et leurs chemins JSON sont à lire par leurs constantes plutôt que recopiés :
+  `RECURRING_CONFIG_CANCEL_REVERTED_PATH` = `$.config_cancel_reverted` (`db.rs:66`,
+  mika#2271), `RECURRING_UNKNOWN_TRIGGER_PATH` = `$.unknown_trigger_death` (`db.rs:86`) et
+  `RECURRING_UNKNOWN_TRIGGER_LIFT_CONSUMED_PATH` = `$.unknown_trigger_lift_consumed`
+  (`db.rs:102`, mika#2337).
+
+  **Le troisième nom est celui-là et pas un autre.** Une passe antérieure de ce plan l'avait
+  écrit `$.unknown_trigger_lift_spent` — un nom qui n'existe nulle part dans l'arbre. Un
+  chemin JSON erroné dans un `json_extract` ne casse pas la compilation et ne lève aucune
+  erreur SQLite : il rend `NULL`, donc le marqueur est lu comme absent et le booléen répond
+  **faux avec assurance**. C'est-à-dire précisément le faux `false` contre lequel le repli
+  `Option<bool>` de §3.1 existe, obtenu par une faute de frappe plutôt que par une
+  incertitude assumée.
 
 Deux conséquences.
 
@@ -147,6 +158,73 @@ style de handler et le montage sous `/api/v1` sont repris tels quels. Ce qui n'e
 réutilisé est la **projection** — et c'est le ticket lui-même qui le demande en interdisant
 le contenu de message.
 
+### T5 — un jeton admin global retire la validation qui protégeait `container_url_str`
+
+C'est la lecture la plus importante de la passe, et elle inverse le signe du ticket si on
+l'ignore : **le chemin le moins privilégié, écrit naïvement, exfiltre le jeton d'écriture.**
+
+`container_url_str` (`routes.rs:679`) interpole son argument dans une URL sans le valider
+d'aucune manière :
+
+```rust
+None => format!("http://mika-{customer_id}.{agents_namespace}.svc.cluster.local:8080"),
+```
+
+Sur les chemins qui l'appellent aujourd'hui, c'est sans danger — mais **pas grâce à cette
+fonction**. `handle_a2a_proxy` et `handle_agent_card_proxy` valident d'abord une clé API
+qui *résout un customer* (`a2a_routes.rs`, `validate_a2a_api_key`) : un `customer_id` inventé
+est refusé en `401` avant que l'interpolation ait lieu. La sûreté vient du **préalable**, pas
+du formatage.
+
+Or le jeton de R6 est **global** : il n'est lié à aucun customer. Le préalable disparaît, et
+avec lui la seule chose qui contraignait l'argument. Un `customer_id` choisi par l'appelant
+devient alors le début d'un nom d'hôte :
+
+```
+customer_id = "x.attacker.example/"
+→ http://mika-x.attacker.example/.mika-agents.svc.cluster.local:8080
+   ^ hôte = mika-x.attacker.example
+```
+
+et la requête que la gateway envoie à cet hôte porte `Bearer {internal_token}` (T3, hop
+interne). **Le jeton d'écriture — superuser sur `/admin/*` — partirait vers un hôte
+arbitraire.** Un ticket dont le propos est de *réduire* le privilège nécessaire à une lecture
+aurait livré une exfiltration du privilège maximal. Le porteur du jeton read est certes déjà
+un opérateur de confiance, mais c'est exactement la confiance que R6 cherche à pouvoir
+distribuer plus largement : le gain organisationnel de T3 n'a de sens que si le jeton read ne
+vaut pas le jeton write.
+
+**La parade est double, bon marché, et déjà idiomatique à quinze lignes de la route à
+créer.** `handle_get_customer` (`routes.rs:1432`), l'admin voisin, la porte entière :
+
+```rust
+async fn handle_get_customer(
+    State(state): State<AppState>,
+    Path(customer_id): Path<Uuid>,          // ← Axum refuse en 400 tout non-UUID
+) -> impl IntoResponse {
+    let sql = format!("SELECT {CUSTOMER_SAFE_COLUMNS} FROM customers WHERE id = $1");
+    // … Ok(None) => 404
+```
+
+`customers.id` est un `UUID PRIMARY KEY` (`migrations/001_customers.sql`), donc :
+
+1. **`Path<Uuid>`** — l'extracteur rejette en `400` avant l'entrée du handler. Aucun caractère
+   capable de détourner une autorité d'URL ne survit à un parse d'UUID. C'est une garantie de
+   **type**, pas une liste de caractères interdits à maintenir.
+2. **Résolution en base** — `SELECT 1 FROM customers WHERE id = $1`, `404` si inconnu. Ce
+   second terme n'est pas redondant : il empêche d'énumérer des pods pour des customers qui
+   n'existent pas, et il aligne la route sur le comportement de son voisin `/admin/customers/{id}`.
+
+Les deux, et dans cet ordre. Le premier suffit à fermer la SSRF ; le second est ce qui rend
+la réponse honnête.
+
+**Corollaire à écrire plutôt qu'à découvrir :** en mode single-tenant (`agent_base_url =
+Some`), `container_url_str` **ignore** `customer_id` et rend la même base pour tout le monde.
+La route répond donc avec le registre de l'unique agent local quel que soit l'id passé — et
+la résolution en base du point 2 reste néanmoins exigée, sans quoi un id inconnu rendrait
+`200` avec le registre de quelqu'un d'autre. C'est le mode de dev, pas le mode canari ; le
+nommer évite de lire un test local vert comme une preuve de routage.
+
 ---
 
 ## Requirements
@@ -191,11 +269,31 @@ webhooks GitHub, `/send` de tous les tenants — pour une route d'inspection ser
 rançon. Le fail-closed local ne prend personne en otage, et le `WARN` rend la cause lisible.
 
 **R9 — Traçabilité des accès.** Chaque appel servi écrit une ligne INFO structurée et une
-ligne `audit_events` (`tool_name = 'admin_read'`, `target_key = 'tenant:{customer_id}'`).
-Cet endpoint lit les données d'un tenant tiers : « qui a lu le registre d'Al, et quand »
-doit être une requête SQL, pas un grep. L'écriture est fire-and-forget sur le modèle de
-`audit_events::log_webhook_drop` — un échec d'audit journalise un `WARN` et ne change pas la
-réponse (R4 interdit de faire dépendre une lecture d'une écriture).
+ligne `audit_events` côté gateway. Cet endpoint lit les données d'un tenant tiers : « qui a
+lu le registre d'Al, et quand » doit être une requête SQL, pas un grep. L'écriture est
+fire-and-forget sur le modèle de `audit_events::log_webhook_drop`
+(`crates/mika-gateway/src/audit_events.rs:83`) — un échec d'audit journalise un `WARN` et ne
+change pas la réponse (R4 interdit de faire dépendre une lecture d'une écriture).
+
+Trois précisions vérifiées dans l'arbre, qui font de R9 un ajout de quelques lignes et non un
+chantier :
+
+- **Aucune migration n'est nécessaire.** La table gateway (Postgres,
+  `migrations/009_audit_events.sql`) déclare `tool_name TEXT NOT NULL` **sans contrainte
+  `CHECK`** — un second `tool_name` s'y écrit sans DDL. L'index existant
+  `audit_events_lookup_idx (tool_name, target_key, created_at DESC)` sert directement la
+  requête opérateur ci-dessous, préfixe compris.
+- **Constante dédiée, jamais la constante existante.** `audit_events::TOOL_NAME` vaut
+  `"gateway_webhook"` et son doc-comment le déclare porteur pour la requête de mika#1774 ;
+  y verser des lignes d'admin-read couperait cette population en deux sans le dire. Nouvelle
+  constante `TOOL_NAME_ADMIN_READ: &str = "gateway_admin_read"` — préfixée `gateway_` pour
+  rester dans la famille du fil, plutôt que l'`admin_read` nu d'une passe antérieure de ce
+  plan.
+- **`target_key = "tenant:{customer_id}"`**, avec le `customer_id` déjà validé par R12 (donc
+  toujours un UUID canonique, jamais du texte libre de l'appelant dans la colonne indexée).
+
+Requête opérateur : `SELECT target_key, created_at FROM audit_events WHERE tool_name =
+'gateway_admin_read' ORDER BY created_at DESC;`
 
 **R10 — Borne de volume.** `per_page` est déjà borné à 200 par `resolve_pagination`, et la
 réponse porte son `total`. Un tenant pathologiquement dupliqué — c'est-à-dire précisément le
@@ -204,6 +302,26 @@ cas D1 — reste lisible page par page, et `total` dit l'ampleur sans rapatrier 
 **R11 — Périmètre.** Aucun endpoint d'écriture. Dédoublonner ou réinitialiser une récurrence
 (D1/D3 de `mika issue#2358`) sont des endpoints séparés, derrière un scope write, dans leur
 propre ticket.
+
+**R12 — `customer_id` est validé avant toute interpolation d'URL.** Deux termes, dans cet
+ordre, motivés en T5 :
+
+1. **`Path<Uuid>`** sur le handler gateway — un non-UUID est refusé en `400` par
+   l'extracteur, avant le corps du handler. Le type est la garantie ; pas de liste de
+   caractères interdits.
+2. **Résolution en base** — `customer_id` inconnu de la table `customers` → `404`, jamais un
+   forward. Sur le modèle de `handle_get_customer` (`routes.rs:1432`).
+
+`container_url_str` n'est appelée qu'**après** les deux. Cette exigence n'est pas
+cosmétique : sans elle le hop interne, qui porte `Bearer {internal_token}`, est dirigeable
+par l'appelant (T5).
+
+**Cette exigence ne modifie pas `container_url_str`** et ne touche donc aucun appelant
+existant. Durcir la fonction elle-même serait la parade la plus générale, mais elle change le
+comportement de deux chemins A2A en production pour un risque qu'ils ne portent pas (leur
+préalable de clé API les couvre) : hors périmètre, à faire dans son propre ticket si un
+troisième appelant sans préalable apparaît un jour. Ce qui est livré ici est la garantie au
+point d'entrée neuf, qui est le seul point d'entrée exposé.
 
 ---
 
@@ -370,12 +488,28 @@ sur un secret, ici pas plus qu'ailleurs.
 )
 ```
 
-**Handler proxy** — décalque de `handle_a2a_proxy` (`a2a_routes.rs:75-110`), en `GET` :
+**Handler proxy** — le décalque est `handle_agent_card_proxy` (`a2a_routes.rs:~210`) et **non**
+`handle_a2a_proxy` (`:31`) : le premier est déjà un `GET` qui forwarde avec
+`state.http_client.get(...)`, pose `Bearer {internal_token}`, relaie statut + corps et rend
+`BAD_GATEWAY` sur **les deux** échecs (envoi et lecture du corps). C'est la forme exacte
+cherchée ici ; le `POST` A2A ajoute un corps et une validation de clé API dont ce chemin n'a
+que faire.
 
 ```rust
-let container = container_url_str(&customer_id, state.agent_base_url.as_deref(),
-                                  &state.agents_namespace);
-let forward_url = format!("{container}/api/v1/recurring-tasks");
+async fn handle_admin_tenant_recurring_tasks(
+    State(state): State<AppState>,
+    Path(customer_id): Path<Uuid>,          // R12 terme 1 — 400 sur non-UUID
+    Query(q): Query<AdminRecurringQuery>,
+) -> impl IntoResponse {
+    // R12 terme 2 — 404 si le customer n'existe pas, AVANT toute interpolation
+    // …SELECT 1 FROM customers WHERE id = $1 → Ok(None) ⇒ 404
+
+    let container = container_url_str(
+        &customer_id.to_string(),
+        state.agent_base_url.as_deref(),
+        &state.agents_namespace,
+    );
+    let forward_url = format!("{container}/api/v1/recurring-tasks");
 ```
 
 - `Bearer {internal_token}` sur le hop interne (T3).
@@ -448,6 +582,49 @@ Le fichier porte déjà ce style (`.header("authorization", "Bearer test-token-s
 | `mika2360_admin_read_forwards_only_allowlisted_query_params` | `?agent_id=x&per_page=5&evil=1` → l'amont voit les deux premiers, jamais le troisième. |
 | `mika2360_admin_read_upstream_failure_is_502_not_empty_200` | Amont injoignable → `502`. |
 | `mika2360_no_mutating_method_on_admin_read_route` | `POST`/`PUT`/`DELETE`/`PATCH` sur le chemin → `405`. AC3, tenue par le routeur. |
+| `mika2360_non_uuid_customer_id_is_rejected_before_any_forward` | **R12/T5, le test qui compte.** `customer_id = "x.attacker.example/"` (et un jeu de variantes : `../`, `a@b`, `id:8080`) → `400`, **et le serveur amont factice n'a reçu aucune requête**. L'assertion porte sur le compteur de l'amont, pas seulement sur le code : un `400` rendu *après* un forward aurait déjà fui le jeton. |
+| `mika2360_unknown_customer_id_is_404_and_does_not_forward` | Un UUID bien formé mais absent de `customers` → `404`, zéro requête amont. R12 terme 2. |
+| `mika2360_internal_token_never_reaches_an_unvalidated_host` | Garde de non-régression de la classe T5 : sur l'ensemble des entrées refusées ci-dessus, aucune requête sortante n'est émise — donc `internal_token` n'a pu partir nulle part. Le test échoue si quelqu'un déplace un jour la validation *après* la construction de l'URL. |
+
+### Ce que le harnais de test de la gateway permet, et ce qu'il interdit
+
+À vérifier avant d'écrire les tests, sous peine d'en écrire quatre qui ne peuvent pas passer.
+**La gateway n'a pas de Postgres en test.** Le harnais construit un pool paresseux sur un DSN
+factice — `PgPoolOptions::new().connect_lazy("postgres://fake:fake@localhost/fake")`
+(`tests/admin_customers_read.rs:25`, `tests/audit_events_gateway_webhook.rs:54`,
+`orchestrator_inbox.rs:531`) — et `orchestrator_inbox.rs:419-420` écrit noir sur blanc que
+tout test touchant réellement la base « 1s-timeout on a real DELETE. Needs a docker-postgres
+or `sqlx::test!` harness — out of scope ».
+
+Conséquences, et elles tombent du bon côté :
+
+- **Le terme 1 de R12 est pleinement testable**, et c'est celui qui ferme la SSRF :
+  `Path<Uuid>` rejette dans l'extracteur, donc **avant** le handler et avant toute requête
+  DB. Les trois tests T5 du tableau ci-dessus tournent sans Postgres.
+- **La propriété de sécurité elle-même est testable dans les deux cas.** Sur un
+  `customer_id` non-UUID → `400` sans requête ; sur un UUID valide avec pool factice → la
+  résolution échoue et le handler **ne forwarde pas** non plus. Dans les deux branches
+  l'assertion « le serveur amont factice n'a reçu aucune requête » tient, donc
+  « `internal_token` n'a pu partir nulle part » est vérifié sans base de données. C'est la
+  raison de préférer une assertion sur le compteur de l'amont à une assertion sur le code de
+  retour.
+- **Les tests d'auth ne touchent pas la base** (le middleware ne lit que l'`AppState`) : les
+  cinq tests `401` / `403` / `404` du tableau tournent tels quels.
+- **`mika2360_admin_read_forwards_with_internal_token` (le chemin nominal complet) ne peut
+  pas passer** avec ce harnais : il exige de franchir la résolution en base. Il est donc
+  marqué `#[ignore]` avec un commentaire nommant la raison et la levée (harnais
+  docker-postgres / `sqlx::test`), sur le précédent exact d'`orchestrator_inbox.rs`. **AC1
+  est alors portée par le tenant** (`mika2360_recurring_registry_returns_paginated_shape`,
+  côté SQLite, sans contrainte) **plus la vérification manuelle post-déploiement.** Le dire
+  ici évite qu'un implémenteur conclue à un défaut de son code devant un timeout d'une
+  seconde.
+
+**Décision de conception qui en découle — l'échec de la résolution est fail-closed.** Si la
+requête `SELECT 1 FROM customers WHERE id = $1` échoue (base indisponible, pool mort), le
+handler rend `503` et **ne forwarde pas**. Jamais l'inverse : un fail-open « la base ne répond
+pas, forwardons quand même » rouvrirait T5 en entier le jour d'une panne Postgres, c'est-à-dire
+le jour où l'opérateur a le plus de raisons d'appeler cet endpoint. Le sens du repli est le
+même que celui de R7/R8 : sur ce chemin, l'indisponibilité refuse, elle n'élargit pas.
 
 ### Vérification manuelle (post-merge, après le compagnon cloud)
 
@@ -463,6 +640,21 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 
 # AC4 — aucune sentinelle de contenu dans la réponse
 # (aucun champ *_preview, action_config, result, input_context, metadata)
+
+# R12/T5 — un customer_id qui tente de détourner l'URL est refusé en 400,
+# et l'hôte visé ne voit jamais passer de requête (à vérifier côté cible).
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H "Authorization: Bearer $MIKA_GATEWAY_ADMIN_READ_TOKEN" \
+  "$GW/admin/tenants/x.attacker.example%2F/recurring-tasks"   # attendu : 400
+
+# R12 — un UUID bien formé mais inconnu
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H "Authorization: Bearer $MIKA_GATEWAY_ADMIN_READ_TOKEN" \
+  "$GW/admin/tenants/00000000-0000-0000-0000-000000000000/recurring-tasks"  # attendu : 404
+
+# R9 — l'accès a laissé une trace
+# SELECT target_key, created_at FROM audit_events
+#   WHERE tool_name = 'gateway_admin_read' ORDER BY created_at DESC LIMIT 5;
 ```
 
 ### Commandes
@@ -485,14 +677,23 @@ curl -s -o /dev/null -w '%{http_code}\n' \
       rédigé dans le `Debug` manuel.
 - [ ] R8 résolu à la construction de l'`AppState` (jamais par requête), `WARN` nommé.
 - [ ] `require_admin_read_token` avec ses cinq branches dans l'ordre spécifié.
-- [ ] Route gateway + handler proxy, query string en liste blanche, `502` sur échec amont.
+- [ ] Route gateway + handler proxy sur le décalque `handle_agent_card_proxy`, query string en
+      liste blanche, `502` sur échec amont.
+- [ ] **R12 : `Path<Uuid>` + résolution en base, tous deux AVANT `container_url_str`.** La
+      garde de non-régression T5 passe (aucune requête sortante sur entrée refusée).
 - [ ] Ligne INFO de démarrage disant l'état d'armement (R7).
-- [ ] Ligne `audit_events` `tool_name = 'admin_read'` par accès servi, fire-and-forget (R9).
+- [ ] Ligne `audit_events` `tool_name = 'gateway_admin_read'` par accès servi,
+      fire-and-forget, via une constante dédiée distincte de `audit_events::TOOL_NAME` (R9).
+      Aucune migration Postgres.
 - [ ] `openapi.rs` de la gateway à jour.
-- [ ] Les 19 tests ci-dessus passent ; clippy et fmt propres.
+- [ ] Les 22 tests ci-dessus passent ; clippy et fmt propres.
 - [ ] Root `CLAUDE.md` : `MIKA_GATEWAY_ADMIN_READ_TOKEN` documenté (valeur, défaut, R7/R8,
       surfaces opérateur) ; `.env.example` mis à jour.
-- [ ] Corps de PR : nomme la divergence 401/403 (T3) et le ticket compagnon mika-cloud.
+- [ ] Échec de la résolution en base → `503` sans forward (fail-closed, §*harnais de test*).
+- [ ] Le test du chemin nominal complet est `#[ignore]` avec sa raison écrite, et AC1 est
+      portée par le test tenant + la vérification manuelle.
+- [ ] Corps de PR : nomme la divergence 401/403 (T3), **la parade SSRF R12/T5**, et le ticket
+      compagnon mika-cloud.
 - [ ] Ticket compagnon mika-cloud ouvert (§3.4).
 
 ---
@@ -503,8 +704,13 @@ Transcrits verbatim du corps de `mika issue#2360`, suivis de ce qui les rend vé
 
 - **AC1** — `GET /admin/tenants/{id}/recurring-tasks` avec token admin read → JSON du
   registre récurrent du tenant.
-  → `mika2360_admin_read_forwards_with_internal_token` +
-  `mika2360_recurring_registry_returns_paginated_shape` + la vérification manuelle.
+  → `mika2360_recurring_registry_returns_paginated_shape` (tenant, SQLite, sans contrainte de
+  harnais) + `mika2360_admin_read_forwards_only_allowlisted_query_params` pour la forme du hop
+  + la vérification manuelle pour le bout-en-bout. Le test du chemin nominal complet
+  (`mika2360_admin_read_forwards_with_internal_token`) est `#[ignore]` faute de Postgres en
+  test — raison et levée écrites au-dessus du test, cf. § *harnais de test*. **C'est une
+  limite du harnais, pas une AC affaiblie :** le bout-en-bout est vérifié manuellement au
+  déploiement, et c'est de toute façon là que se juge AC1 (elle traverse un pod réel).
 
 - **AC2** — token write-seul / absent / mauvais scope → 403 (gated).
   → `mika2360_admin_read_rejects_internal_token_with_403` pour le cas « write-seul », qui est
@@ -532,6 +738,12 @@ Transcrits verbatim du corps de `mika issue#2360`, suivis de ce qui les rend vé
   qui puisse porter des mots choisis par l'utilisateur. Le plan le **livre** (le ticket le
   demande) et l'**écrit** ici pour que ce soit une décision plutôt qu'un oubli.
 
+**Deux exigences ne répondent à aucune AC du ticket, et c'est assumé.** R9 (traçabilité) et
+**R12 (parade SSRF)** sont des ajouts. R12 n'est pas optionnel pour autant : sans elle le
+livrable satisferait les quatre AC à la lettre tout en ouvrant un chemin d'exfiltration du
+jeton d'écriture (T5) — une AC verte sur un endpoint qu'il faudrait retirer de production le
+lendemain. Les quatre AC restent un sous-ensemble strict de ce qui est livré.
+
 ---
 
 ## Risques et hors périmètre
@@ -545,6 +757,9 @@ Transcrits verbatim du corps de `mika issue#2360`, suivis de ce qui les rend vé
 | Le secret read n'est pas déployé et l'opérateur débogue la mauvaise couche | `404` + ligne INFO de démarrage (R7). |
 | Les deux secrets sont identiques et AC2 est annulée en silence | Désarmement + `WARN` (R8), résolu à la construction de l'`AppState`. |
 | Un `403` est lu comme « l'INTERNAL_TOKEN ne peut pas lire ce tenant » | T3 l'écrit noir sur blanc : le porteur du write est superuser ailleurs sur `/admin/*`. Le gain est organisationnel. |
+| **SSRF via `customer_id` → exfiltration de l'`internal_token`** (T5) — le risque le plus grave du ticket, et celui qui inverserait son propos | R12 : `Path<Uuid>` puis résolution en base, tous deux avant `container_url_str`. Épinglé par trois tests dont une garde qui assert **l'absence de requête sortante**, pas seulement le code de retour. |
+| Le veto est lu par un chemin JSON inexistant et répond `false` avec assurance | Les trois chemins sont consommés par leurs constantes (`db.rs:66`, `:86`, `:102`), jamais recopiés — cf. la note de T2 sur `_lift_spent`, qui est exactement cette faute commise une fois. |
+| En single-tenant (`agent_base_url = Some`) un id inconnu rendrait le registre d'un autre | R12 terme 2 exigé même dans ce mode ; nommé en fin de T5 pour qu'un test local vert ne soit pas lu comme une preuve de routage. |
 
 **Hors périmètre, délibérément.**
 
