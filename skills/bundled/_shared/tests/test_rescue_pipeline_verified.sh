@@ -9,12 +9,31 @@
 # unblocks it had no producer.
 #
 # Every case below builds a REAL temporary git repository — with a real
-# `origin/main` ref, a real (tiny) cargo crate, and a real copy of
-# `scripts/verify-pipeline.sh` — and runs the real measurement over it. Nothing
-# is stubbed, for the reason `test_rescue_closes_guard.sh` states about its own
-# probes: a measurement reconstructed from the plan would only test the plan.
-# Here it matters twice over, because the whole point of mika#2354 is that `yes`
-# attests an EXECUTION and not a shape (mika#2286's lesson).
+# `origin/main` ref planted as a remote-tracking ref — and runs the real
+# measurement over it: the diff predicate, the worktree-status term, the budget
+# clock, the excerpt selection and the term naming all traverse actual git state,
+# for the reason `test_rescue_closes_guard.sh` states about its own probes: a
+# measurement reconstructed from the plan would only test the plan.
+#
+# The three EXTERNAL tools the measurement shells out to — `cargo fmt`, `cargo
+# clippy`, `scripts/verify-pipeline.sh` — are shims with CONTROLLED output, not
+# the real programs. Two reasons, both hard:
+#   - Hermeticity. The fixture lives under `mktemp -d`, outside the repo's
+#     `rust-toolchain.toml`; on the CI runner rustup then has no toolchain to
+#     pick and every cargo call dies with `error: rustup could not choose a
+#     version of cargo to run` — the suite read 55/8 there while reading 63/0
+#     on a host with a default toolchain. And the real `verify-pipeline.sh`
+#     calls `gh pr view` (network) when `gh` is on PATH.
+#   - Scope. What this suite proves is what `_measure_pipeline_verified` DOES
+#     with each tool's outcome — which term it names, which lines it keeps,
+#     that success prints nothing, that it never lands fail-open. Whether
+#     rustfmt or clippy is right about a given source file is those tools'
+#     contract, tested upstream, not the producer's.
+# What is NOT reconstructed: the shims log every invocation (cwd + argv), and
+# T1 asserts the exact commands the producer ran, from inside the fixture, in
+# the house shape (`--check`, `-D warnings`, `origin/main`) — so a producer that
+# drifted from those invocations would go red here even though every shim
+# answers green.
 #
 # Run: bash skills/bundled/_shared/tests/test_rescue_pipeline_verified.sh
 # Expected: all assertions pass, exit 0.
@@ -24,7 +43,6 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISPATCH_LIB="$SCRIPT_DIR/../dispatch-lib.sh"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
-REAL_VERIFY_PIPELINE="$REPO_ROOT/scripts/verify-pipeline.sh"
 
 # shellcheck source=skills/bundled/_shared/dispatch-lib.sh
 source "$DISPATCH_LIB"
@@ -61,22 +79,69 @@ assert_not_contains() {
     fi
 }
 
-if [ ! -x "$REAL_VERIFY_PIPELINE" ]; then
-    echo "FATAL: $REAL_VERIFY_PIPELINE is absent or not executable — term 5 cannot be exercised" >&2
-    exit 1
-fi
-if ! command -v cargo >/dev/null 2>&1; then
-    echo "FATAL: cargo is not on PATH — terms 3 and 4 cannot be exercised" >&2
-    exit 1
-fi
-
 TMP_ROOT=$(mktemp -d)
 trap 'rm -rf "$TMP_ROOT"' EXIT
 
-# One shared target dir across every case: the crates below are byte-identical
-# apart from the one file each case perturbs, so cargo compiles once and the
-# suite stays a few seconds rather than a few minutes.
-export CARGO_TARGET_DIR="$TMP_ROOT/target"
+# ── Shims ───────────────────────────────────────────────────────────────────
+# One `cargo` shim ahead of PATH for the whole suite, and one
+# `verify-pipeline.sh` planted in every fixture (the producer runs it by path,
+# `./scripts/verify-pipeline.sh origin/main`, never via PATH). Each answers
+# green unless its control variable says `fail`, in which case it emits a
+# diagnostic in the REAL tool's shape — `Compiling` noise ahead of the clippy
+# `error:` line, rustfmt's `Diff in`, the verifier's own `FAIL:` first line —
+# so the excerpt assertions below exercise `_rescue_verify_excerpt` against
+# the output shapes it was written for. Every call is appended to
+# `$STUB_LOG` as `<cwd>\t<argv>` so a test can assert WHAT was run and WHERE.
+#
+# Control:  RESCUE_STUB_FMT=fail | RESCUE_STUB_CLIPPY=fail | RESCUE_STUB_VERIFY=fail
+STUB_BIN="$TMP_ROOT/stub-bin"
+STUB_LOG="$TMP_ROOT/stub-calls.log"
+mkdir -p "$STUB_BIN"
+: > "$STUB_LOG"
+export STUB_LOG
+
+cat > "$STUB_BIN/cargo" <<'EOF'
+#!/bin/sh
+printf '%s\t%s\n' "$PWD" "$*" >> "$STUB_LOG"
+case "$1" in
+    fmt)
+        if [ "${RESCUE_STUB_FMT:-}" = "fail" ]; then
+            printf 'Diff in %s/src/lib.rs:1:\n-pub fn describe( items : &[i32] )->usize{items.len()}\n+pub fn describe(items: &[i32]) -> usize {\n+    items.len()\n+}\n' "$PWD"
+            exit 1
+        fi
+        exit 0 ;;
+    clippy)
+        if [ "${RESCUE_STUB_CLIPPY:-}" = "fail" ]; then
+            printf '   Compiling mika2354-fixture v0.1.0 (%s)\n' "$PWD"
+            printf 'error: writing `&Vec` instead of `&[_]` involves a new object where a slice will do\n'
+            printf ' --> src/lib.rs:1:24\n  |\n1 | pub fn describe(items: &Vec<i32>) -> usize {\n  |                        ^^^^^^^^^ help: change this to: `&[i32]`\n  |\n'
+            printf '  = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#ptr_arg\n'
+            printf '  = note: `-D clippy::ptr-arg` implied by `-D warnings`\n\n'
+            printf 'error: could not compile `mika2354-fixture` (lib) due to 1 previous error\n'
+            exit 101
+        fi
+        printf '   Compiling mika2354-fixture v0.1.0 (%s)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.42s\n' "$PWD"
+        exit 0 ;;
+    *)
+        printf 'error: no such command: `%s`\n' "$1" >&2
+        exit 101 ;;
+esac
+EOF
+chmod +x "$STUB_BIN/cargo"
+
+VERIFY_PIPELINE_STUB='#!/usr/bin/env bash
+printf '"'"'%s\t%s\n'"'"' "$PWD" "verify-pipeline.sh $*" >> "$STUB_LOG"
+if [ "${RESCUE_STUB_VERIFY:-}" = "fail" ]; then
+    echo "FAIL: code-only PR — source files changed but no docs/plans/ or docs/solutions/ file in the diff"
+    echo "  Base ref: $1"
+    echo "  Run /mika to produce the plan artefact, or add a Pipeline-Exempt: code-only trailer."
+    exit 1
+fi
+echo "PASS: docs && source — pipeline artefacts present (base: $1)"
+exit 0
+'
+
+export PATH="$STUB_BIN:$PATH"
 
 # The composer reads these from the environment, as the pre-mika#2157 heredoc
 # did. Pinned so the metadata block stays deterministic — the AC4 byte-identity
@@ -85,21 +150,13 @@ export SESSION_ID="test-session" TURNS="7" COST="0.42"
 
 # ── Fixtures ────────────────────────────────────────────────────────────────
 
-# A crate whose source is rustfmt-clean and clippy-clean.
-CLEAN_LIB='pub fn describe(items: &[i32]) -> usize {
+# The one source file each case adds. Its CONTENT is inert here — the shims
+# decide fmt/clippy outcomes, not rustfmt/clippy — it exists so the diff
+# against `origin/main` carries a source-bucket path (term 1, and the shape
+# `verify-pipeline.sh` classifies).
+LIB_SRC='pub fn describe(items: &[i32]) -> usize {
     items.len()
 }
-'
-# Same crate, rustfmt-clean but tripping `clippy::ptr_arg` — a warning, which
-# `-D warnings` turns into a failure, exactly as `ci.yml` and `wip_rescue`'s own
-# clippy gate do.
-CLIPPY_DIRTY_LIB='pub fn describe(items: &Vec<i32>) -> usize {
-    items.len()
-}
-'
-# Same crate, clippy-clean but NOT rustfmt-clean (collapsed body, no trailing
-# newline discipline).
-FMT_DIRTY_LIB='pub fn describe( items : &[i32] )->usize{items.len()}
 '
 
 PLAN_DOC='# A plan
@@ -109,18 +166,10 @@ PLAN_DOC='# A plan
 - [ ] AC1 — something measurable.
 '
 
-CARGO_TOML='[package]
-name = "mika2354-fixture"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-'
-
-# make_repo <name> [lib-source] — a git repo on `main` with `origin/main`
-# planted as a bare remote-tracking ref (exactly what a fetched branch looks
-# like to `git diff origin/main...HEAD` — no network, no daemon), carrying a
-# real cargo crate and a real copy of verify-pipeline.sh.
+# make_repo <name> — a git repo on `main` with `origin/main` planted as a bare
+# remote-tracking ref (exactly what a fetched branch looks like to `git diff
+# origin/main...HEAD` — no network, no daemon), carrying the verify-pipeline
+# shim at the path the producer requires.
 #
 # The base commit holds only the scaffolding, so the *diff against origin/main*
 # is what each case adds on top — which is what the measurement reads.
@@ -131,8 +180,7 @@ make_repo() {
     git -C "$dir" config user.email "test@example.com"
     git -C "$dir" config user.name "test"
     git -C "$dir" config commit.gpgsign false
-    printf '%s' "$CARGO_TOML" > "$dir/Cargo.toml"
-    cp "$REAL_VERIFY_PIPELINE" "$dir/scripts/verify-pipeline.sh"
+    printf '%s' "$VERIFY_PIPELINE_STUB" > "$dir/scripts/verify-pipeline.sh"
     chmod +x "$dir/scripts/verify-pipeline.sh"
     git -C "$dir" add -A
     git -C "$dir" commit -q --no-verify -m "base"
@@ -140,22 +188,24 @@ make_repo() {
     printf '%s' "$dir"
 }
 
-# add_work <dir> <lib-source> — the shape of a nominal dispatch's diff: one
-# source file plus one plan doc, which is what `verify-pipeline.sh` requires
-# (docs && source -> pass).
+# add_work <dir> — the shape of a nominal dispatch's diff: one source file plus
+# one plan doc, which is what `verify-pipeline.sh` requires (docs && source ->
+# pass).
 add_work() {
-    local dir="$1" lib="$2"
+    local dir="$1"
     mkdir -p "$dir/src" "$dir/docs/plans"
-    printf '%s' "$lib" > "$dir/src/lib.rs"
+    printf '%s' "$LIB_SRC" > "$dir/src/lib.rs"
     printf '%s' "$PLAN_DOC" > "$dir/docs/plans/2026-09-17-002-fix-2354-x-plan.md"
     git -C "$dir" add -A
     git -C "$dir" commit -q --no-verify -m "work"
 }
 
 # measure <dir> — run the real measurement, capturing verdict + output.
+# Truncates the shim log first so each case reads only its own calls.
 # Returns the rc; sets MEASURE_OUT / MEASURE_TERM / MEASURE_EXCERPT.
 measure() {
     local rc
+    : > "$STUB_LOG"
     if MEASURE_OUT=$(_measure_pipeline_verified "$1"); then rc=0; else rc=$?; fi
     MEASURE_TERM=$(head -1 <<<"$MEASURE_OUT")
     MEASURE_EXCERPT=$(tail -n +2 <<<"$MEASURE_OUT")
@@ -165,7 +215,7 @@ measure() {
 # ── T1 (AC1) — every term holds: the marker reads `yes` ─────────────────────
 echo "-- T1: a complete, clean pipeline (AC1) --"
 R1=$(make_repo t1)
-add_work "$R1" "$CLEAN_LIB"
+add_work "$R1"
 if measure "$R1"; then
     PASS=$((PASS + 1)); echo "  ✓ T1 the measurement succeeds"
 else
@@ -174,6 +224,14 @@ else
     echo "    excerpt: '$MEASURE_EXCERPT'"
 fi
 assert_eq "T1 a success prints nothing" "" "$MEASURE_OUT"
+# The shims answered green; what makes that a measurement rather than a
+# reconstruction is that the producer ran the HOUSE invocations, inside the
+# worktree, in order — `--check` (never a rewriting `cargo fmt`), `-D warnings`
+# (ci.yml and wip_rescue's own gate), `origin/main` (load-bearing, see the
+# producer's comment: a stale local `main` would classify the wrong diff).
+assert_eq "T1 the producer ran exactly fmt, clippy, verify-pipeline — in that order, from the worktree" \
+    "$(printf '%s\tfmt --all --check\n%s\tclippy --workspace --all-targets -- -D warnings\n%s\tverify-pipeline.sh origin/main' "$R1" "$R1" "$R1")" \
+    "$(cat "$STUB_LOG")"
 B1=$(_compose_rescue_pr_body "$R1" "dirty-worktree" "Class fact." "2354" "yes" "" "")
 assert_contains "T1 body carries the verified marker" "$B1" "<!-- rescue-pipeline-verified: yes -->"
 assert_not_contains "T1 body carries no unverified marker" "$B1" "rescue-pipeline-verified: no"
@@ -195,7 +253,7 @@ assert_eq "T2 names the \`diff\` term" "diff" "$MEASURE_TERM"
 # ── T3 (AC2, term 2) — content left outside the PR's commit ─────────────────
 echo "-- T3: dirty worktree (AC2, term \`worktree-dirty\`) --"
 R3=$(make_repo t3)
-add_work "$R3" "$CLEAN_LIB"
+add_work "$R3"
 printf 'left behind\n' > "$R3/src/stranded.rs"
 measure "$R3" && { FAIL=$((FAIL + 1)); echo "  ✗ T3 refuses a dirty worktree"; }
 assert_eq "T3 names the \`worktree-dirty\` term" "worktree-dirty" "$MEASURE_TERM"
@@ -208,7 +266,7 @@ assert_contains "T3 excerpt names the stranded path" "$MEASURE_EXCERPT" "src/str
 # `no` on every single dispatch, since `_set_up_worktree` copies these in.
 echo "-- T3b: a scaffold path left behind is not dirtiness --"
 R3B=$(make_repo t3b)
-add_work "$R3B" "$CLEAN_LIB"
+add_work "$R3B"
 mkdir -p "$R3B/.claude"
 printf '{}\n' > "$R3B/.claude/claude-pilot.json"
 printf '{}\n' > "$R3B/.claude/settings.local.json"
@@ -223,15 +281,17 @@ fi
 # ── T4 (AC2, term 3) — unformatted source ──────────────────────────────────
 echo "-- T4: unformatted source (AC2, term \`fmt\`) --"
 R4=$(make_repo t4)
-add_work "$R4" "$FMT_DIRTY_LIB"
-measure "$R4" && { FAIL=$((FAIL + 1)); echo "  ✗ T4 refuses unformatted source"; }
+add_work "$R4"
+RESCUE_STUB_FMT=fail measure "$R4" && { FAIL=$((FAIL + 1)); echo "  ✗ T4 refuses unformatted source"; }
 assert_eq "T4 names the \`fmt\` term" "fmt" "$MEASURE_TERM"
+assert_contains "T4 excerpt keeps rustfmt's \`Diff in\` line" "$MEASURE_EXCERPT" "Diff in"
+assert_not_contains "T4 a red fmt short-circuits: clippy never runs" "$(cat "$STUB_LOG")" "clippy"
 
 # ── T5 (AC2, term 4) — a clippy warning, which `-D warnings` makes fatal ────
 echo "-- T5: a clippy lint (AC2, term \`clippy\`) --"
 R5=$(make_repo t5)
-add_work "$R5" "$CLIPPY_DIRTY_LIB"
-measure "$R5" && { FAIL=$((FAIL + 1)); echo "  ✗ T5 refuses a clippy lint"; }
+add_work "$R5"
+RESCUE_STUB_CLIPPY=fail measure "$R5" && { FAIL=$((FAIL + 1)); echo "  ✗ T5 refuses a clippy lint"; }
 assert_eq "T5 names the \`clippy\` term" "clippy" "$MEASURE_TERM"
 # `_rescue_verify_excerpt` keeps the `error:` line — the one clippy prints for
 # `ptr_arg` reads `error: writing \`&Vec\` instead of \`&[_]\` …`. The lint's
@@ -239,15 +299,20 @@ assert_eq "T5 names the \`clippy\` term" "clippy" "$MEASURE_TERM"
 # the assertion targets what the excerpt retains, not what the lint is called.
 assert_contains "T5 excerpt carries the diagnostic, not the \`Compiling\` noise" \
     "$MEASURE_EXCERPT" "error: writing \`&Vec\`"
+assert_not_contains "T5 excerpt drops the \`Compiling\` line" "$MEASURE_EXCERPT" "Compiling"
+assert_not_contains "T5 excerpt drops the indented \`= help:\` line" "$MEASURE_EXCERPT" "= help:"
+assert_not_contains "T5 a red clippy short-circuits: verify-pipeline never runs" "$(cat "$STUB_LOG")" "verify-pipeline.sh"
 
 # ── T6 (AC2, term 5) — a pathological split verify-pipeline.sh rejects ──────
 echo "-- T6: code-only diff (AC2, term \`verify-pipeline\`) --"
 R6=$(make_repo t6)
 mkdir -p "$R6/src"
-printf '%s' "$CLEAN_LIB" > "$R6/src/lib.rs"
+printf '%s' "$LIB_SRC" > "$R6/src/lib.rs"
 git -C "$R6" add -A && git -C "$R6" commit -q --no-verify -m "source only"
-measure "$R6" && { FAIL=$((FAIL + 1)); echo "  ✗ T6 refuses a code-only diff"; }
+RESCUE_STUB_VERIFY=fail measure "$R6" && { FAIL=$((FAIL + 1)); echo "  ✗ T6 refuses a code-only diff"; }
 assert_eq "T6 names the \`verify-pipeline\` term" "verify-pipeline" "$MEASURE_TERM"
+assert_contains "T6 excerpt keeps the verifier's \`FAIL:\` line" "$MEASURE_EXCERPT" "FAIL: code-only PR"
+assert_contains "T6 the verifier was handed \`origin/main\`, not a local ref" "$(cat "$STUB_LOG")" "verify-pipeline.sh origin/main"
 
 # ── T7 (AC3) — an empty worktree dir must not measure the dispatch host ─────
 # `git -C ""` silently runs against the dispatch process CWD. Without the guard
@@ -260,7 +325,7 @@ assert_eq "T7 names the \`worktree-unusable\` term" "worktree-unusable" "$MEASUR
 # ── T8 (AC3) — an absent verify-pipeline.sh is not a free pass ──────────────
 echo "-- T8: verify-pipeline.sh absent (AC3) --"
 R8=$(make_repo t8)
-add_work "$R8" "$CLEAN_LIB"
+add_work "$R8"
 git -C "$R8" rm -q -- scripts/verify-pipeline.sh
 git -C "$R8" commit -q --no-verify -m "drop the verifier"
 measure "$R8" && { FAIL=$((FAIL + 1)); echo "  ✗ T8 refuses an absent verifier"; }
@@ -269,17 +334,15 @@ assert_contains "T8 excerpt says the script is absent or not executable" \
     "$MEASURE_EXCERPT" "absent or not executable"
 
 # ── T9 (AC3) — an exhausted budget yields `no`, never a partial `yes` ───────
-# The budget is in whole seconds and 1 is its floor; on a host where the
-# shared `CARGO_TARGET_DIR` is already warm from T1–T8, a clean fixture crate
-# clears all five terms in well under a second and a 1s budget is never
-# exhausted (the assertion then flips on cache temperature, not on the
-# product). So the clock is pinned rather than raced: a `cargo` shim ahead of
-# PATH that sleeps past the budget. Under `timeout` it is killed at 1s (124 →
+# The budget is in whole seconds and 1 is its floor; the suite's own shims
+# answer instantly, so a 1s budget would never be exhausted by them. The clock
+# is pinned rather than raced: a second `cargo` shim, ahead of the suite's on
+# PATH, that sleeps past the budget. Under `timeout` it is killed at 1s (124 →
 # `budget`); without `timeout` the next deadline check catches the overrun —
 # both branches of `_rescue_verify_run` yield the same term.
 echo "-- T9: exhausted budget (AC3) --"
 R9=$(make_repo t9)
-add_work "$R9" "$CLEAN_LIB"
+add_work "$R9"
 SLOW_BIN="$TMP_ROOT/slow-bin"
 mkdir -p "$SLOW_BIN"
 printf '#!/bin/sh\nexec sleep 5\n' > "$SLOW_BIN/cargo"
