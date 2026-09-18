@@ -21,11 +21,13 @@ use crate::async_db::AsyncDatabase;
 use crate::compaction;
 use crate::evidence::guards::{
     ASSERT_GROUNDED_LABEL, ASSERTED_UNAVAILABILITY_LABEL, DOCTRINE_PUBLIC_PROMO_LABEL,
-    EQUIVALENCE_CLAIM_LABEL, FALSE_LOCAL_HOSTING_LABEL, assert_grounded_satisfied,
+    DeliveryRecord, EQUIVALENCE_CLAIM_LABEL, FALSE_LOCAL_HOSTING_LABEL,
+    UNACKNOWLEDGED_SEND_FAILURE_LABEL, UndeliveredSends, assert_grounded_satisfied,
     asserted_unavailability_satisfied, detect_affirmative_state_claim,
     detect_asserted_unavailability, detect_doctrine_public_promo, detect_equivalence_claim,
     detect_fabricated_action_claim, detect_false_local_hosting_claim,
     detect_unverified_callback_state_claim, equivalence_claim_satisfied,
+    undelivered_send_correction, undelivered_sends,
 };
 use crate::mcp::McpManager;
 use crate::messaging::MessageSender;
@@ -373,6 +375,28 @@ pub struct AgentOutput {
     /// everywhere else, including max-steps continuation — a turn that ran out
     /// of *steps* did produce a summary and is not this class.
     pub deadline_exceeded: Option<DeadlineOverrun>,
+    /// A `send_message` of this turn failed and nothing repaired it
+    /// (mika#2136).
+    ///
+    /// **Why this field exists at all**, on the same reasoning as
+    /// [`Self::deadline_exceeded`] one field above: `text` cannot answer the
+    /// question. The 2026-09-01 turn returned « Le voici en entier 👆 » as
+    /// ordinary `text`, and the call site — which sends that text on the very
+    /// channel the delivery failed on — had no way to tell "the turn answered"
+    /// from "the turn asserted a delivery that never happened".
+    ///
+    /// `Some` only when the guard's re-prompt budget was spent AND the failure
+    /// is still unrepaired, so an agent that resends successfully never
+    /// produces one. The caller in `server::handlers` appends a minimal factual
+    /// line to the outgoing text before sending it: D5's divergence from 5d,
+    /// which settles for a WARN on an exhausted budget, is paid for by the
+    /// difference in damage — a false sentence more, versus a document that
+    /// never arrived and a recipient who believes it did.
+    ///
+    /// Conversation mode only in practice: a silent turn's text reaches nobody,
+    /// so there the residue is the WARN and the audit row, whose correct reader
+    /// is the operator.
+    pub undelivered_sends: Option<UndeliveredSends>,
 }
 
 /// What a caller needs to know about a turn cut off by its envelope (mika#2276).
@@ -981,6 +1005,12 @@ async fn run_loop(
     // CLI / silent / team / delegate / non-streaming A2A / gateway; `Some`
     // for A2A `message/stream`.
     stream_ctx: Option<&Arc<mika_a2a::streaming::ToolCallStreamContext>>,
+    // mika#2136 — the turn's `send_message` sequence, accumulated by
+    // `process_tool_calls` and read by the `unacknowledged_send_failure` guard
+    // (6f) at EndTurn. Created by each of the three callers, which read it after
+    // the return; see the parameter's doc in `tool_execution::dispatch` for why
+    // it travels by `&mut` rather than in `LoopResult`.
+    delivery_log: &mut Vec<crate::evidence::guards::DeliveryRecord>,
 ) -> Result<LoopResult> {
     // Filter required_tools to only include tools that are actually available in the
     // current tool set (builtins + skill tools + MCP). See #516, #517.
@@ -1460,6 +1490,7 @@ async fn run_loop(
                         &mut send_message_text_capture,
                         mode.is_conversation(),
                         stream_ctx,
+                        delivery_log,
                     )
                     .await;
                     all_tool_summaries.extend(step_summaries);
@@ -2580,6 +2611,129 @@ async fn run_loop(
                         continue;
                     }
 
+                    // mika#2136 — Unacknowledged send-failure guard (6f).
+                    //
+                    // Refuses an EndTurn that closes over a `send_message` the
+                    // engine watched fail and nothing repaired. Founding
+                    // incident, 2026-09-01 on Al's Telegram: a 12 000-character
+                    // document refused for length, answered with « Le voici en
+                    // entier 👆 »; then a split whose part 1/4 died at the
+                    // transport, with the agent moving on to « Partie 2/4 »
+                    // without a word. The model had been told, both times, with
+                    // the exact figures in the `tool_result`.
+                    //
+                    // **The satisfaction is an act, never an admission read from
+                    // the text — and that is the least intuitive point of the
+                    // design.** Guards 5c and 5d do use bilingual lexicons, but to
+                    // detect a *violation*: failing to recognize costs a false
+                    // negative there. Here a lexicon would recognize a
+                    // *satisfaction*: failing to recognize would re-prompt every
+                    // agent that did tell the truth in unexpected words, and
+                    // recognizing wrongly would let through exactly the case this
+                    // ticket is made of. So there is no honesty detector; the only
+                    // satisfaction is structural — the content left, or the budget
+                    // is spent and the engine states the fact itself (D5).
+                    //
+                    // Accepted cost: one extra LLM turn on every unrepaired send
+                    // failure, INCLUDING when the agent had already explained
+                    // itself well. That cost does not touch the happy path (a turn
+                    // with no failure feeds nothing into the predicate — AC4); it
+                    // touches the failure path, where one more turn is the right
+                    // default.
+                    //
+                    // Single retry via `intent_guard_retries`. NOT skipped by
+                    // `skip_remaining_guards` (#1178) — a posted PR review makes
+                    // no message arrive to anyone, the same literal reason as
+                    // 5c/5d/6c/6d.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !intent_guard_retries.contains(UNACKNOWLEDGED_SEND_FAILURE_LABEL)
+                        && let Some(undelivered) = undelivered_sends(delivery_log)
+                    {
+                        intent_guard_retries.insert(UNACKNOWLEDGED_SEND_FAILURE_LABEL);
+                        let corr_id =
+                            format!("{}:{}:unacknowledged_send_failure", tool_ctx.trace_id, step);
+                        guard_correlation = Some(GuardCorrelation {
+                            correlation_id: corr_id.clone(),
+                            guard_label: "unacknowledged_send_failure",
+                            step,
+                        });
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
+                            stage = ?undelivered.stage,
+                            failed_index = undelivered.failed_index,
+                            failed_count = undelivered.failed_count,
+                            guard_correlation_id = %corr_id,
+                            label = mode.label(),
+                            event = "guard.unacknowledged_send_failure",
+                            "Unacknowledged send-failure guard fired — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(undelivered_send_correction(&undelivered)),
+                        });
+                        continue;
+                    }
+
+                    // mika#2136 — the residue of 6f's single-retry budget, named.
+                    //
+                    // Once the label is in `intent_guard_retries` the guard above
+                    // cannot fire again, so a second unrepaired failure would go
+                    // out silently and be indistinguishable from a healthy turn —
+                    // the blind spot the Fire-Disposition gate (mika#1574) exists
+                    // to close, and the gesture 4b and 5d already make. In
+                    // conversation mode D5 takes over from here and writes the
+                    // fact into the outgoing text; in silent mode there is no
+                    // channel to the user at all, so this line and its audit row
+                    // ARE the residue, and the operator is their correct reader.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && intent_guard_retries.contains(UNACKNOWLEDGED_SEND_FAILURE_LABEL)
+                        && let Some(undelivered) = undelivered_sends(delivery_log)
+                    {
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
+                            stage = ?undelivered.stage,
+                            failed_index = undelivered.failed_index,
+                            failed_count = undelivered.failed_count,
+                            label = mode.label(),
+                            event = "guard.unacknowledged_send_failure_uncorrected",
+                            "Unacknowledged send-failure guard already fired this turn — \
+                             accepting EndTurn with the failure unrepaired (budget exhausted)"
+                        );
+                        let _ = db
+                            .log_audit_event(
+                                session_id,
+                                "unacknowledged_send_failure",
+                                mode.label(),
+                                None,
+                                Some(&format!(
+                                    "stage={:?} failed_index={} failed_count={}",
+                                    undelivered.stage,
+                                    undelivered.failed_index,
+                                    undelivered.failed_count
+                                )),
+                                Some(
+                                    "mika#2136: re-prompt budget exhausted, send failure left \
+                                     unrepaired",
+                                ),
+                                Some(tool_ctx.trace_id),
+                            )
+                            .await;
+                    }
+
                     // #1313 — Dispatch-arg-fabrication guard. When a ready-label
                     // webhook fires for repo#N, the LLM must dispatch
                     // run_claude_pilot / run_claude_pilot_groom with
@@ -3235,6 +3389,44 @@ async fn run_loop(
                         continue;
                     }
 
+                    // mika#2136 — unacknowledged send-failure guard (6f) for
+                    // empty-text exits. Mirror of the inline guard on the
+                    // non-empty path, and the one that matters most here: a
+                    // silent turn whose send failed typically closes with NO
+                    // text at all, which is precisely the shape the registry
+                    // never sees.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !intent_guard_retries.contains(UNACKNOWLEDGED_SEND_FAILURE_LABEL)
+                        && let Some(undelivered) = undelivered_sends(delivery_log)
+                    {
+                        intent_guard_retries.insert(UNACKNOWLEDGED_SEND_FAILURE_LABEL);
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
+                            stage = ?undelivered.stage,
+                            failed_index = undelivered.failed_index,
+                            failed_count = undelivered.failed_count,
+                            label = mode.label(),
+                            event = "guard.unacknowledged_send_failure",
+                            "Unacknowledged send-failure guard fired on empty-text exit — \
+                             re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(undelivered_send_correction(&undelivered)),
+                        });
+                        continue;
+                    }
+
                     apply_nudge_turn_end(tool_use_occurred);
                     info!(step, label = mode.label(), "agent done");
                     return Ok(LoopResult::Done {
@@ -3316,6 +3508,7 @@ async fn run_loop(
                     &mut send_message_text_capture,
                     mode.is_conversation(),
                     stream_ctx,
+                    delivery_log,
                 )
                 .await;
                 all_tool_summaries.extend(step_summaries);
@@ -3349,6 +3542,55 @@ async fn run_loop(
                             "send_message_turn_boundary_enforced: forcing EndTurn after send_message"
                         );
                     }
+                    // mika#2136 — unacknowledged send-failure guard (6f), third
+                    // and least obvious mirror.
+                    //
+                    // This `return` is a FOURTH exit from `run_loop`, and it
+                    // does not traverse the EndTurn guard chain at all: it fires
+                    // on `stop_reason == ToolUse`, before any of the eleven
+                    // post-conditions are evaluated. Without this mirror the
+                    // measured 2026-09-01 sequence would close in silence on the
+                    // exact mode it happened in — part 1/4 dies, part 2/4 lands,
+                    // the boundary arms on that success, and the turn ends here
+                    // with no guard ever consulted. The two other mirrors (the
+                    // non-empty-text site and the silent empty-text site) are
+                    // both downstream of this one.
+                    //
+                    // `continue` rather than falling through: the model gets its
+                    // one turn to say what failed. It cannot repair by resending
+                    // — the boundary stays armed and #771 would suppress the
+                    // call — and that is #771's decision about how many sends a
+                    // turn carries, deliberately out of scope here. Saying the
+                    // failure is the half this ticket owns; if the model does
+                    // not, the budget is spent and D5's factual line goes out.
+                    if !intent_guard_retries.contains(UNACKNOWLEDGED_SEND_FAILURE_LABEL)
+                        && let Some(undelivered) = undelivered_sends(delivery_log)
+                    {
+                        intent_guard_retries.insert(UNACKNOWLEDGED_SEND_FAILURE_LABEL);
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
+                            stage = ?undelivered.stage,
+                            failed_index = undelivered.failed_index,
+                            failed_count = undelivered.failed_count,
+                            label = mode.label(),
+                            event = "guard.unacknowledged_send_failure",
+                            "Unacknowledged send-failure guard fired on the send-message \
+                             turn boundary — re-prompting"
+                        );
+                        // `process_tool_calls` already pushed this step's
+                        // assistant blocks and tool results, so only the
+                        // correction is owed here.
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(undelivered_send_correction(&undelivered)),
+                        });
+                        continue;
+                    }
+
                     // Force EndTurn — return Done directly instead of breaking
                     // to the MaxStepsExceeded path (which would trigger a
                     // continuation turn). The send_message was delivered; the
@@ -4262,8 +4504,10 @@ async fn run_agent_inner(
             mode = "conversation",
             "agent deadline exceeded during prelude — skipping loop"
         );
-        // Prelude gate: the loop was never entered, so zero steps ran.
-        return persist_deadline_fallback(db, session_id, trace_id, params.internal, None, 0).await;
+        // Prelude gate: the loop was never entered, so zero steps ran and no
+        // send was attempted.
+        return persist_deadline_fallback(db, session_id, trace_id, params.internal, None, 0, None)
+            .await;
     }
 
     let store_llm = params.settings.is_none_or(|s| s.store_llm_calls);
@@ -4280,6 +4524,11 @@ async fn run_agent_inner(
         interval: ctx.identity.skills.resolved_nudge_interval(),
         authoring_enabled: ctx.identity.skills.authoring_enabled(),
     });
+
+    // mika#2136 — the turn's delivery sequence. Created here, filled by
+    // `process_tool_calls` through `run_loop`, read after the return so every
+    // exit (concluded, max-steps, deadline) carries the same admission.
+    let mut delivery_log: Vec<DeliveryRecord> = Vec::new();
 
     let result = run_loop(
         effective_llm,
@@ -4311,8 +4560,13 @@ async fn run_agent_inner(
         scope_task_id,
         skill_nudge_ctx.as_ref(),
         params.stream_ctx.as_ref(),
+        &mut delivery_log,
     )
     .await?;
+
+    // `None` on the happy path by construction, not by precaution: a turn with
+    // no failed send feeds nothing into the predicate (AC4).
+    let undelivered = undelivered_sends(&delivery_log);
 
     // Track skill usage at turn-end (one increment per turn, not per step).
     let injected_skill_names: Vec<String> = per_skill_bytes.keys().cloned().collect();
@@ -4336,6 +4590,7 @@ async fn run_agent_inner(
             thinking,
             usage,
             deadline_exceeded: None,
+            undelivered_sends: undelivered,
         }),
         LoopResult::MaxStepsExceeded {
             thinking,
@@ -4365,6 +4620,7 @@ async fn run_agent_inner(
                     // full step budget, then the deadline was too close for a
                     // continuation turn.
                     crate::planning::policy::MAX_TOOL_STEPS,
+                    undelivered,
                 )
                 .await;
             }
@@ -4402,6 +4658,10 @@ async fn run_agent_inner(
                 // Max-steps continuation, not a deadline overrun: the turn
                 // produced a summary. mika#2276's net must not fire here.
                 deadline_exceeded: None,
+                // A dead send is a dead send whether the turn concluded or ran
+                // out of steps — the continuation summary says nothing about
+                // delivery.
+                undelivered_sends: undelivered,
             })
         }
         LoopResult::DeadlineExceeded {
@@ -4414,6 +4674,7 @@ async fn run_agent_inner(
                 params.internal,
                 scope_task_id,
                 steps_completed,
+                undelivered,
             )
             .await
         }
@@ -4437,6 +4698,10 @@ async fn persist_deadline_fallback(
     internal: bool,
     scope_task_id: Option<&str>,
     steps_completed: usize,
+    // mika#2136 — a turn cut off by its envelope after a dead send owes the same
+    // admission as one that concludes; carried in rather than recomputed so this
+    // function stays the single stamping site for both fields.
+    undelivered_sends: Option<UndeliveredSends>,
 ) -> Result<AgentOutput> {
     let fallback = "I'm sorry, that took too long. Let me try a simpler approach next time.";
     db.save_message_with_task_context(
@@ -4455,6 +4720,7 @@ async fn persist_deadline_fallback(
         usage: None,
         // mika#2276 M2: the one place that says "cut off, not concluded".
         deadline_exceeded: Some(DeadlineOverrun { steps_completed }),
+        undelivered_sends,
     })
 }
 
@@ -5201,6 +5467,11 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
     // `callback_safe_skills()`, which is exactly where B1 made
     // `qa-review-build-callback` reachable.
     let loaded_skill_names = skill_names_of(&matched);
+    // mika#2136 — the guard reads this inside `run_loop`. Silent mode has no
+    // channel to the user, so there is nothing to annex afterwards: the residue
+    // is the WARN and the audit row the guard itself writes, whose correct
+    // reader is the operator.
+    let mut delivery_log: Vec<DeliveryRecord> = Vec::new();
     let result = run_loop(
         llm,
         tools,
@@ -5229,8 +5500,9 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         false, // silent mode messages are never internal
         deadline,
         scope_task_id.as_deref(),
-        None, // mika#1583: silent-mode turns do not nudge
-        None, // mika#1757: silent turns have no A2A streaming subscriber
+        None,              // mika#1583: silent-mode turns do not nudge
+        None,              // mika#1757: silent turns have no A2A streaming subscriber
+        &mut delivery_log, // mika#2136
     )
     .await?;
 
@@ -5744,6 +6016,10 @@ async fn run_team_agent_inner_impl(
         return Ok(TeamAgentOutcome::TimedOut(fallback.to_string()));
     }
 
+    // mika#2136 — team agents are constructed with `message_sender: None`, so
+    // this stays empty in practice; created here so the guard's contract holds
+    // uniformly across the three callers rather than by accident of wiring.
+    let mut delivery_log: Vec<DeliveryRecord> = Vec::new();
     let result = run_loop(
         effective_llm,
         tools,
@@ -5771,9 +6047,10 @@ async fn run_team_agent_inner_impl(
         prompt_variant.as_deref(),
         false, // team mode messages are never internal
         deadline,
-        None, // team mode: no task context for parallel narrative
-        None, // mika#1583: team-mode turns do not nudge
-        None, // mika#1757: team turns have no A2A streaming subscriber
+        None,              // team mode: no task context for parallel narrative
+        None,              // mika#1583: team-mode turns do not nudge
+        None,              // mika#1757: team turns have no A2A streaming subscriber
+        &mut delivery_log, // mika#2136
     )
     .await?;
 

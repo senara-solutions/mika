@@ -170,6 +170,10 @@ mod eval {
     // send_message in conversation mode (#771).
     mod test_send_message_boundary;
 
+    // Un `send_message` échoué ne peut pas se clore en silence : guard 6f,
+    // prédicat structurel, et le rejeu du 2026-09-01 (mika#2136).
+    mod test_undelivered_send_2136;
+
     // Multi-agent corpus parity: regression guard for #1155 search_content gap
     mod kg_multi_agent_corpus_parity;
 
