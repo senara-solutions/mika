@@ -154,6 +154,45 @@ fragments partageant leur début — et la direction de l'erreur est mauvaise : 
 réparé un fragment mort, donc on se tairait. C'est exactement le silence dont le ticket est
 né. D'où D2.
 
+### E9 — `dispatch.rs` ne voit que le texte **brut**, jamais celui qui part
+
+`dispatch.rs:358` lit `arguments.get("text")` — la valeur telle que le LLM l'a émise. Mais
+`send_message` travaille sur `cleaned = strip_internal_tags(text)` (`:48`), et ce `cleaned`
+est **ce que la garde de longueur mesure** (`:57`, `text_len_utf16(&cleaned)`) **et ce que le
+sender envoie** (`:85`, `sender.send(&cleaned)`). Les deux registres ne coïncident pas : le
+commentaire du code dit que le strip existe parce que le LLM *« may have echoed »* des tags
+internes, c'est-à-dire précisément une population où brut ≠ nettoyé.
+
+**Conséquence pour D3, et sa direction d'erreur.** L'étage transport répare par égalité de
+texte. Si le record portait le texte brut, un ré-essai ré-émettant le même contenu avec un tag
+interne en plus ou en moins donnerait deux bruts **différents** pour un seul `cleaned` : la
+réparation ne serait pas reconnue, le champ resterait `Some`, et **une annexe affirmant une
+perte partirait dans le canal utilisateur alors que le message est bien arrivé**. C'est le
+faux positif que la halte 4 de la sonde interdit de laisser vivre. La collision inverse
+existe aussi (deux bruts distincts nettoyant vers un même `cleaned`), et elle penche du côté
+du silence. D'où la provenance imposée en D2 : le texte est posé par `send_message`, seul
+détenteur de `cleaned`, et n'est jamais relu depuis `arguments`.
+
+### E10 — Le boundary #771 borne à **un** envoi réussi par tour en mode conversation
+
+`dispatch.rs:156` : `if *send_message_boundary_active && name == "send_message" && conversation_mode`
+→ `continue` **avant** `execute`, avec un `tool_result` `is_error: true`. Le boundary s'arme
+après le premier `send_message` **réussi** (`:350`, conditionné à `tool_succeeded`), et
+`agent_loop/mod.rs:3336` force en outre EndTurn au pas suivant. `conversation_mode` vaut
+`LoopMode::Conversation` seul (`:452`) — le mode d'Al.
+
+Trois conséquences, toutes portantes :
+
+1. **C'est ce qui a rendu la séquence d'Al possible.** La partie 1/4 échoue, donc
+   `tool_succeeded == false`, donc le boundary ne s'arme pas, donc la partie 2/4 passe. Un
+   premier fragment *réussi* aurait fait supprimer tous les suivants. Le défaut mesuré n'est
+   pas « quatre fragments dont un meurt » : c'est « un mort, un vivant, et le tour se ferme ».
+2. **Les scénarios AC3 et AC4 du § 8 sont infaisables tels qu'écrits en mode conversation** —
+   « quatre fragments tous livrés » ne peut pas exister là-bas. D'où D9.
+3. **Une suppression ne pose aucun `DeliveryOutcome`** (le `continue` précède `execute`), donc
+   elle ne pollue pas le prédicat. Elle en est en revanche invisible — troisième faux négatif,
+   nommé en D3 et rangé hors périmètre.
+
 ---
 
 ## Décisions
@@ -179,11 +218,18 @@ d'intention et non comme garantie.
 
 ### D2 — Un canal typé sur `ToolOutput`, pas une relecture de la prose d'erreur
 
-`ToolOutput` gagne `delivery: Option<DeliveryOutcome>`, sur le modèle de
+`ToolOutput` gagne `delivery: Option<DeliveryVerdict>`, sur le modèle de
 `substrate_diagnostic` (E6) : posé par `send_message` seul, jamais rendu au LLM, `None`
 partout ailleurs.
 
 ```rust
+pub struct DeliveryVerdict {
+    /// The text as it was actually measured and sent — `cleaned`, never the raw
+    /// argument. Posé par `send_message`, jamais relu depuis `arguments` (E9).
+    pub text: String,
+    pub outcome: DeliveryOutcome,
+}
+
 pub enum DeliveryOutcome {
     Delivered,
     RefusedTooLong { len_utf16: usize, limit: usize },
@@ -192,6 +238,13 @@ pub enum DeliveryOutcome {
     NoSender,
 }
 ```
+
+**Le texte voyage avec le verdict, et c'est une décision, pas un détail de portage.**
+`dispatch.rs` n'a accès qu'au texte brut ; la garde mesure et le sender envoie `cleaned`
+(E9). Faire porter le texte par le verdict est le seul moyen d'obtenir dans le prédicat le
+registre qui a effectivement été livré ou refusé. Le coût est nul en surface — c'est le même
+`String` qu'il fallait cloner de toute façon (D7) — et son absence coûterait une annexe fausse
+dans le canal utilisateur, c'est-à-dire le dégât qu'on répare, retourné.
 
 **Six sorties, cinq variantes, et la fusion est délibérée.** `send_message` a six sorties
 portant un verdict de livraison ; `SendOutcome::Failed` (`:93-95`) et `Err(e)` (`:115-118`)
@@ -246,6 +299,14 @@ le moteur sait *qu'un* envoi est parti, jamais *que le contenu refusé* est part
 
 - **Couverture partielle.** Un agent qui découpe en quatre, n'envoie que deux parties et dit
   « voilà tout » passe sous le prédicat.
+- **Suppression par le boundary #771.** Un `send_message` supprimé n'atteint jamais `execute`
+  et ne pose donc aucun verdict (E10) : il est invisible au prédicat. En mode conversation, un
+  agent dont le premier fragment **réussit** voit les suivants supprimés, et le prédicat reste
+  `None` alors que trois fragments ne sont jamais arrivés. Ce trou-là n'est pas un défaut de
+  livraison — le `tool_result` de suppression est explicite et `is_error: true` — c'est le
+  boundary qui décide qu'un tour ne porte qu'un envoi. Nommé ici parce qu'il vit dans le mode
+  exact où le dégât d'Al s'est produit ; rangé hors périmètre parce que le traiter serait
+  rouvrir #771.
 - **Extinction par un envoi sans rapport.** Après un `RefusedTooLong` de 12 000 caractères,
   un unique « désolé, c'est trop long, je te le résume » de 80 caractères délivré avec succès
   éteint l'étage refus — alors que le document n'est toujours jamais parti. C'est la forme la
@@ -369,24 +430,50 @@ couverture des sorties `MaxStepsExceeded` et `DeadlineExceeded` — un tour coup
 enveloppe après un envoi mort doit annexer le fait tout autant qu'un tour qui conclut.
 Précédent de threading à trois sites : `loaded_skill_names` (mika#2355).
 
+### D9 — Le mode de chaque scénario de test est imposé, parce que le boundary le décide
+
+**Décision : les scénarios multi-fragments tournent en `LoopMode::Silent`, et le rejeu du cas
+d'Al en `LoopMode::Conversation`.**
+
+Raison. E10 mesure qu'en mode conversation un seul `send_message` réussi existe par tour :
+« quatre fragments tous livrés » n'y est pas un scénario difficile, c'est un scénario
+**impossible**, et un implémenteur qui écrirait AC4 sous cette forme perdrait un cycle à
+débugger une suppression légitime. Le mode silencieux est exempté du boundary (`:156`,
+conditionné à `conversation_mode`), donc c'est là que vit une vraie séquence multi-envois — et
+c'est aussi le mode où D5 ne peut pas annexer (sa limite déjà nommée), ce qui rend la
+distinction utile plutôt que commode.
+
+Conséquence sur la répartition : AC3 et AC4 portent sur le **prédicat** et sa neutralité, donc
+en `Silent` où la séquence existe. AC6-a et AC6-b rejouent le **dégât** — qui est arrivé sur
+Telegram, en conversation — et s'y tiennent : AC6-b est dès lors « un fragment mort, puis un
+second envoi qui passe, puis clôture », ce qui est la forme exacte du 2026-09-01 (E10-1) et
+non un affaiblissement du scénario.
+
 ---
 
 ## Changements
 
 ### 1. `crates/mika-agent/src/tools/mod.rs`
 
-- `ToolOutput.delivery: Option<DeliveryOutcome>` + `DeliveryOutcome` (D2). `None` dans les
-  constructeurs existants (`success`, `error`, `success_with_images`,
-  `substrate_unavailable`, …) ; nouveau constructeur `ToolOutput::delivery(content, is_error, outcome)`.
+- `ToolOutput.delivery: Option<DeliveryVerdict>` + `DeliveryVerdict` + `DeliveryOutcome` (D2).
+  `None` dans les constructeurs existants (`success`, `error`, `success_with_images`,
+  `substrate_unavailable`, …) ; nouveau constructeur
+  `ToolOutput::delivery(content, is_error, text, outcome)` — le `text` est un paramètre du
+  constructeur précisément pour qu'aucun site ne puisse poser un verdict sans dire de quel
+  texte il parle (E9).
 - Doc de champ sur le modèle de `substrate_diagnostic` : jamais sérialisé vers le LLM, canal
   outil→moteur.
 
 ### 2. `crates/mika-agent/src/tools/send_message.rs`
 
-- **Les six sorties** posent leur `DeliveryOutcome` — y compris `Delivered`, `NoChannel`,
+- **Les six sorties** posent leur `DeliveryVerdict` — y compris `Delivered`, `NoChannel`,
   `NoSender`, et `Err(e)` du sender qui se range sous `Failed` (D2). Les deux sorties qui ne
   sont pas des verdicts de livraison (`'text' is required` `:44`, texte vide après
   strip-tags `:50`) restent à `None` : rien n'a été tenté, il n'y a pas d'échec à acquitter.
+- **Le `text` du verdict est `cleaned`, sur les six sorties sans exception** (E9) — y compris
+  `RefusedTooLong`, dont la garde mesure `cleaned` et non l'argument brut. Un test épingle
+  l'invariant sur une entrée portant un tag interne : le verdict doit porter le texte
+  post-strip, sans quoi un ré-essai ne serait jamais reconnu comme réparation.
 - Reformulation des deux messages d'erreur (D6). La garde de longueur et son test de borne
   (`accepte_4096_a_la_borne`, `fenetre_5000_refusee_par_l_outil`) sont **inchangés** :
   mika#2134 est en amont et hors périmètre.
@@ -396,8 +483,14 @@ Précédent de threading à trois sites : `loaded_skill_names` (mika#2355).
 
 - Nouveau paramètre `delivery_log: &mut Vec<DeliveryRecord>` (D8), à côté de
   `send_message_boundary_active`. Quand `output.delivery` est `Some`, pousse
-  `DeliveryRecord { step, text: String, outcome }` — **texte complet**, capté à la source
-  avant toute troncature (E8). Le champ ne quitte jamais le tour et n'est pas persisté.
+  `DeliveryRecord { step, text, outcome }` en **reprenant le texte du verdict** — jamais
+  `arguments.get("text")`, qui est le registre brut et non celui qui a été mesuré puis envoyé
+  (E9). Texte complet, aucune troncature (E8). Le champ ne quitte jamais le tour et n'est pas
+  persisté.
+- **La suppression boundary (`:156`) ne pousse rien**, et n'a besoin d'aucun geste : son
+  `continue` précède `execute`, donc aucun verdict n'existe (E10-3). À ne pas « réparer » en
+  synthétisant un record — un envoi supprimé n'a pas échoué à la livraison, il n'a pas été
+  tenté, et le compter ferait mentir `failed_count` sur le nombre lu par l'utilisateur.
 - Interaction avec le dedup per-tour (#582) : **le mécanisme existe déjà et se réemploie tel
   quel**. Le chemin de replay clone le `ToolOutput` caché puis efface ce qui ne doit pas être
   ré-émis (`reused.images.clear()`, `:207-213`, avec sa raison écrite) ; `delivery` rejoint
@@ -475,14 +568,23 @@ scénarios sur `run_agent` via `EvalHarness` + `MockLlmProvider` + un `MessageSe
   Al n'a rien reçu du tout. Un scénario qui glisserait un message d'excuse délivré entre le
   refus et la clôture passerait sous le faux négatif nommé en D3 — le test le dit en commentaire
   pour que personne ne le « répare » en le rendant vert par accident.
-- **AC6-b** — rejeu du 2026-09-01, étage 2 : quatre fragments, le premier échoue au
-  transport, réponse scriptée qui enchaîne sur « Partie 2/4 » sans le dire ⇒ refus, puis
-  annexe nommant la partie 1.
-- **AC3** — l'échec du premier fragment n'est pas masqué par la réussite des trois suivants
-  (assertion sur la séquence, pas sur un envoi isolé).
-- **AC4** — contrôle négatif : quatre fragments tous livrés ⇒ `undelivered_sends == None`,
-  aucun appel LLM supplémentaire (comptage sur le `MockLlmProvider`), texte final identique
-  octet pour octet à la réponse scriptée, zéro occurrence du vocabulaire d'échec.
+- **AC6-b** — rejeu du 2026-09-01, étage 2, en `LoopMode::Conversation` (D9) : la partie 1/4
+  échoue au transport, la partie 2/4 passe, réponse scriptée qui enchaîne sur « Partie 2/4 »
+  sans rien dire ⇒ refus, puis annexe nommant la partie 1. **Le scénario s'arrête à deux
+  envois, et c'est la forme exacte du cas mesuré, pas une simplification** : le boundary #771
+  s'arme sur le succès de la partie 2 et supprimerait les parties 3 et 4 (E10-1). Un test
+  écrit avec quatre envois échouerait sur une suppression légitime et ferait chercher le
+  défaut au mauvais endroit — le commentaire du test le dit.
+- **AC3** — en `LoopMode::Silent` (D9, où le boundary ne s'applique pas) : l'échec du premier
+  fragment n'est pas masqué par la réussite des trois suivants (assertion sur la séquence, pas
+  sur un envoi isolé).
+- **AC4** — contrôle négatif, en `LoopMode::Silent` pour la même raison : quatre fragments tous
+  livrés ⇒ `undelivered_sends == None`, aucun appel LLM supplémentaire (comptage sur le
+  `MockLlmProvider`), texte final identique octet pour octet à la réponse scriptée, zéro
+  occurrence du vocabulaire d'échec.
+- **AC4-bis** — contrôle négatif du chemin nominal en conversation : un envoi unique livré ⇒
+  mêmes assertions. Sans lui, AC4 n'attesterait la neutralité que dans un mode où l'annexe de
+  D5 ne s'applique pas, et le chemin d'Al réussi resterait non couvert.
 
 ### 9. `crates/mika-agent/CLAUDE.md` + `mika/CLAUDE.md`
 
@@ -553,10 +655,16 @@ Sur 7 jours :
   #650 a fermée sur une condition permanente, et la garde de régression mika#1090 l'interdit
   nommément. Les deux variantes sont **dans** l'enum de D2 pour que cette population soit
   comptable le jour où elle aura son ticket ; elles ne sont pas dans le prédicat de D3.
-- **La couverture d'une découpe et l'extinction par un envoi sans rapport** (les deux faux
-  négatifs nommés en D3) — demandent une comparaison sémantique entre un texte refusé et des
-  fragments reformulés, ou un seuil de longueur arbitraire dont l'erreur pencherait du côté de
-  l'annexe fausse. Frontière assumée, épinglée par un test unitaire.
+- **La couverture d'une découpe et l'extinction par un envoi sans rapport** (deux des trois
+  faux négatifs nommés en D3) — demandent une comparaison sémantique entre un texte refusé et
+  des fragments reformulés, ou un seuil de longueur arbitraire dont l'erreur pencherait du côté
+  de l'annexe fausse. Frontière assumée, épinglée par un test unitaire.
+- **Le boundary de tour #771** (le troisième faux négatif, E10) — en mode conversation, un
+  premier fragment réussi fait supprimer les suivants, qui n'arrivent jamais et restent
+  invisibles au prédicat. C'est une décision de #771 sur le nombre d'envois par tour, pas un
+  échec de livraison, et son `tool_result` est explicite. Le rouvrir ici mélangerait deux
+  questions ; il mérite son propre ticket si la découpe multi-fragments doit devenir un usage
+  soutenu en conversation.
 - **La taxonomie de `google-workspace`** — mika#2118. **Le markdown Telegram** — mika#2126.
 - **`failed_sends` et son flush** — le mécanisme de reprise existe et n'est pas touché ; ce
   plan porte sur ce que l'agent *dit* du tour en cours, pas sur la re-livraison différée.
@@ -569,6 +677,11 @@ Sur 7 jours :
 - `ToolOutput.delivery` posé par les **six** sorties de livraison de `send_message` (dont
   `Err(e)` → `Failed`), `None` sur les deux sorties qui ne tentent aucune livraison et partout
   ailleurs, jamais sérialisé vers le LLM, et effacé sur le chemin de replay du dedup (§ 3).
+- Le `text` du verdict est `cleaned` sur les six sorties, épinglé par un test sur une entrée
+  portant un tag interne (E9) ; `dispatch.rs` ne lit jamais `arguments.get("text")` pour le
+  record.
+- Le mode de chaque scénario du § 8 est celui que D9 impose, et le test AC6-b porte en
+  commentaire la raison pour laquelle il s'arrête à deux envois.
 - `undelivered_sends` est une fonction pure, couverte par les neuf cas unitaires listés en § 4,
   dont celui qui épingle le faux négatif de D3 plutôt que de le laisser dériver.
 - Guard 6f en place avec son miroir texte-vide, son budget unique et sa télémétrie #953.
@@ -606,5 +719,5 @@ Transcrits depuis le corps de senara-solutions/mika#2136.
 
 Correspondance : AC1 → D2 + § 4 (tests unitaires du prédicat) ; AC2 → D4 (guard 6f) + D5
 (`AgentOutput.undelivered_sends`, le constat porté au-delà du tour) ; AC3 → D3 (prédicat sur
-la séquence) + § 8 scénario AC3 ; AC4 → D7 + § 8 scénario AC4 ; AC5 → D1 ; AC6 → § 8 scénarios
-AC6-a et AC6-b.
+la séquence) + § 8 scénario AC3 ; AC4 → D7 + § 8 scénarios AC4 et AC4-bis ; AC5 → D1 ; AC6 →
+§ 8 scénarios AC6-a et AC6-b, dont D9 fixe le mode.
