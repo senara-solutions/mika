@@ -39,15 +39,45 @@ pub(crate) fn admin_read_target_key(customer_id: &uuid::Uuid) -> String {
     format!("tenant:{customer_id}")
 }
 
-/// mika#2360 — persist one admin read of a tenant's recurring registry.
-/// Fire-and-forget on the model of [`log_webhook_drop`]: a DB failure logs a
-/// WARN and never changes the response (a read must not depend on a write).
-pub(crate) async fn log_admin_read(pool: &PgPool, customer_id: &uuid::Uuid) {
-    let target_key = admin_read_target_key(customer_id);
-    let metadata = json!({
-        "route": "GET /admin/tenants/{customer_id}/recurring-tasks",
+/// mika#2360 — `metadata.route` of a read of the tenant's recurring registry.
+pub(crate) const ADMIN_READ_ROUTE_RECURRING_TASKS: &str =
+    "GET /admin/tenants/{customer_id}/recurring-tasks";
+
+/// mika#2387 — `metadata.route` of a read of the tenant's outbound-send
+/// history. Distinct from [`ADMIN_READ_ROUTE_RECURRING_TASKS`], and that
+/// distinction is the whole reason [`log_admin_read`] takes a `route`: both
+/// routes share one `tool_name` (one auth scope, one population, one operator
+/// query "who read this tenant's data"), so `metadata->>'route'` is the only
+/// thing that can tell them apart. An audit row naming the wrong route is
+/// worse than no audit row at all.
+pub(crate) const ADMIN_READ_ROUTE_OUTBOUND_MESSAGES: &str =
+    "GET /admin/tenants/{customer_id}/outbound-messages";
+
+/// Serialize the `metadata` JSONB shape of one admin read. Split out from the
+/// DB write for the same reason as [`build_drop_metadata`]: the shape — and in
+/// particular which route the row names — is then exercisable by a pure unit
+/// test, with no Postgres.
+pub(crate) fn build_admin_read_metadata(
+    customer_id: &uuid::Uuid,
+    route: &str,
+) -> serde_json::Value {
+    json!({
+        "route": route,
         "customer_id": customer_id,
-    });
+    })
+}
+
+/// mika#2360 — persist one admin read of a tenant's data under the shared
+/// `gateway_admin_read` scope. Fire-and-forget on the model of
+/// [`log_webhook_drop`]: a DB failure logs a WARN and never changes the
+/// response (a read must not depend on a write).
+///
+/// `route` must be one of the `ADMIN_READ_ROUTE_*` constants — mika#2387 made
+/// it a parameter rather than a literal, because a second caller writing rows
+/// that name the first caller's route would make the audit answer false.
+pub(crate) async fn log_admin_read(pool: &PgPool, customer_id: &uuid::Uuid, route: &str) {
+    let target_key = admin_read_target_key(customer_id);
+    let metadata = build_admin_read_metadata(customer_id, route);
     let result = sqlx::query(
         r#"
         INSERT INTO audit_events (tool_name, target_key, metadata)
@@ -63,6 +93,7 @@ pub(crate) async fn log_admin_read(pool: &PgPool, customer_id: &uuid::Uuid) {
     if let Err(e) = result {
         warn!(
             target_key,
+            route,
             error = %e,
             "failed to persist gateway_admin_read audit_event (response unchanged)"
         );
@@ -170,6 +201,48 @@ mod tests {
         assert_eq!(
             admin_read_target_key(&id),
             "tenant:a0394c24-9558-4cb6-9078-52043912ecbc"
+        );
+    }
+
+    /// mika#2387 T3 — the audit row of an outbound-messages read names **its
+    /// own** route. The `assert_ne!` half is what carries the test: a writer
+    /// left hard-coded on mika#2360's literal would still produce a row with a
+    /// plausible `route` field, and only a comparison against that literal
+    /// catches it.
+    ///
+    /// The `assert_eq!` on the recurring-tasks metadata is the non-regression
+    /// half of U1: parameterizing `route` must leave mika#2360's own audit
+    /// value unchanged, byte for byte.
+    #[test]
+    fn mika2387_audit_route_names_this_endpoint() {
+        let id = uuid::Uuid::parse_str("a0394c24-9558-4cb6-9078-52043912ecbc").unwrap();
+
+        let outbound = build_admin_read_metadata(&id, ADMIN_READ_ROUTE_OUTBOUND_MESSAGES);
+        assert_eq!(
+            outbound["route"],
+            "GET /admin/tenants/{customer_id}/outbound-messages"
+        );
+        assert_ne!(
+            outbound["route"], ADMIN_READ_ROUTE_RECURRING_TASKS,
+            "an outbound-messages read must not be recorded as a registry read"
+        );
+        assert_eq!(
+            outbound["customer_id"],
+            "a0394c24-9558-4cb6-9078-52043912ecbc"
+        );
+
+        // Non-regression: mika#2360's row is unchanged by the parameterization.
+        let recurring = build_admin_read_metadata(&id, ADMIN_READ_ROUTE_RECURRING_TASKS);
+        assert_eq!(
+            recurring["route"],
+            "GET /admin/tenants/{customer_id}/recurring-tasks"
+        );
+
+        // One scope, one population: the discriminant is the route, not the
+        // tool_name (mika#2387 D1).
+        assert_ne!(
+            ADMIN_READ_ROUTE_OUTBOUND_MESSAGES,
+            ADMIN_READ_ROUTE_RECURRING_TASKS
         );
     }
 
