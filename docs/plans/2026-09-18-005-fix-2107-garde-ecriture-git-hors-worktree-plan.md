@@ -3,8 +3,11 @@
 > Plan de grooming — `senara-solutions/mika#2107`
 > Mesures prises le 2026-09-18 depuis une dispatche `dev-groom` (sandbox bwrap), git 2.53.0, machine `gentux`.
 > Re-mesurées le 2026-09-18 au soir depuis une seconde dispatche (re-groom après non-convergence
-> du dispatch précédent) : les cinq constats du § 2 tiennent, et trois d'entre eux se renforcent
+> du dispatch précédent) : les cinq constats M-1 à M-5 tiennent, et trois d'entre eux se renforcent
 > d'une mesure directe — elles sont citées à leur place.
+> Troisième passage, 2026-09-18 nuit : M-1 et M-5 re-confirmés à l'identique, les cinq ancrages de
+> ligne du plan vérifiés exacts (`dispatch-lib.sh:720`, `:2400`, `:3104` ; `ci.yml:216` ;
+> `Makefile:86-98`), et **un constat neuf, M-6**, qui décide qui peut exécuter M0.
 
 ---
 
@@ -29,7 +32,7 @@ le même répertoire**. Ce plan ne rouvre pas ce débat.
 
 ---
 
-## 2. Ce que la mesure déplace — cinq constats, chacun vérifiable
+## 2. Ce que la mesure déplace — six constats, chacun vérifiable
 
 Le ticket propose deux surfaces « sans préjuger de la bonne ». Les mesures ci-dessous
 disqualifient la surface 2, montrent que la surface 1 est **déjà livrée** pour la population
@@ -173,6 +176,29 @@ Donc : dans un spawn, une commande git passe sans aucune interposition, et **le 
 `PreToolUse` d'un `settings.json` suivi par le dépôt est libre et à coût de geste nul** — il
 arrive avec le checkout, sans étape d'installation. C'est exactement ce que M-4 exige.
 
+### M-6. Les deux sondes bloquantes de M0 sont hors de portée d'une dispatche
+
+Mesuré au troisième passage, en tentant de les trancher depuis ici :
+
+- **M0-b n'est pas tranchable documentairement depuis une dispatche.** `WebFetch` vers la
+  documentation du harnais est refusé par la permission-policy
+  (`no matching policy rule -- denied by default`). La sémantique de précédence entre un
+  `permissionDecision: "deny"` de hook et un `permissions.allow` ne peut donc être établie ici
+  ni par la mesure, ni par la lecture.
+- **M0-e n'est pas mesurable depuis une dispatche**, ce que la rédaction précédente déduisait de
+  `mountinfo` et qui se mesure maintenant directement : `~/.claude/commands/` ne porte aucune
+  définition `mika-spawn`, et `/data/workspace/mika-platform/.claude/` n'expose que `worktrees`.
+
+**Conséquence de conception, et c'est le point :** M0 n'est pas un livrable que le pilote
+d'implémentation peut produire. Assigné à une dispatche, il échouerait sur ses deux termes
+bloquants — et il échouerait *par indisponibilité de la mesure*, forme qui ressemble à s'y
+méprendre à un échec de faisabilité. Le plan mourrait à son premier livrable pour une raison qui
+n'a rien à voir avec sa validité.
+
+**M0 est donc un livrable opérateur**, ou d'un spawn non sandboxé — c'est-à-dire exécuté depuis
+la population même que la garde vise, ce qui est cohérent : on ne peut pas sonder depuis
+l'intérieur du bac à sable une garde conçue pour ce qui est en dehors.
+
 ---
 
 ## 3. Décision d'architecture
@@ -287,6 +313,14 @@ exécutera donc le hook avant chacun de ses appels Bash. Trois conséquences, to
 Le correctif entier repose sur cinq propriétés — quatre du harnais Claude Code installé, une du
 mode de lancement des spawns. Elles sont **vérifiées avant d'écrire la garde**, pas supposées.
 M0-e demande de lancer un spawn réel, d'où l'enveloppe un peu plus large.
+
+> **Qui exécute M0 : l'opérateur, ou un spawn non sandboxé — jamais la dispatche
+> d'implémentation** (M-6). Depuis une dispatche, M0-b et M0-e sont l'un et l'autre hors de
+> portée — non pas *faux*, mais **non mesurables**, ce qui produit un échec de forme identique à
+> un échec de faisabilité. Une dispatche à qui l'on confierait M0 rendrait « sonde bloquante non
+> satisfaite » et tuerait le plan pour une raison qui ne le concerne pas. Les résultats de M0 sont
+> une **entrée** du dispatch d'implémentation, consignée dans le ticket ou la PR, pas un travail
+> qu'il accomplit.
 
 - **M0-a** — un hook `PreToolUse` avec `matcher: "Bash"` se déclenche bien sur l'outil Bash.
 - **M0-b** — **la plus critique** : un `permissionDecision: "deny"` du hook bloque la commande
@@ -435,6 +469,7 @@ c'est lui qui produit et éprouve le script que l'autre consommera.
 |---|---|
 | **M0-b est faux** : le hook ne prime pas sur `permissions.allow` | Sonde bloquante avant toute écriture ; repli nommé ; remontée opérateur |
 | **M0-e est faux** : le project-dir d'un spawn n'est pas son worktree → garde **inerte sur la population mesurée tout en paraissant livrée** | Sonde bloquante M0-e ; l'échec change le **prédicat**, pas le code, et remonte à l'opérateur avant M1 |
+| **M0 est confié à la dispatche d'implémentation** → elle rend « sonde non satisfaite » sur deux termes simplement **non mesurables** depuis la sandbox, et le plan meurt d'un échec de forme (M-6) | M0 est un livrable opérateur ; ses résultats sont une **entrée** du dispatch, consignés avant lui. Le dispatch d'implémentation démarre à M1 |
 | **Garde cassée = garde silencieuse** (conséquence assumée du fail-open) | Ligne d'armement `SessionStart` (M4), qui est la seule chose distinguant « rien à refuser » de « rien n'est armé » |
 | **L'échec d'écriture du journal fait refuser** (fail-closed déguisé, `~/.mika/state/` non inscriptible en sandbox) | Journaliser n'est jamais un terme du prédicat ; test dédié en M1b |
 | **Faux positif** bloquant une commande légitime et calant une dispatche | Prédicat à quatre termes conjoints, tous positifs ; contrôles négatifs en M1b ; dérogation `MIKA_GUARD_SHARED_CHECKOUT=0` sans redéploiement. Coût borné : un refus n'est pas une destruction, la session retente autrement |
@@ -454,8 +489,9 @@ c'est lui qui produit et éprouve le script que l'autre consommera.
 - Les quatre occurrences mesurées sont des fixtures nommées du test ; les contrôles négatifs du
   § M1b passent.
 - `CONTRIBUTING.md` documente la garde, la dérogation et la sonde d'armement.
-- Les résultats de M0 (a–e) sont consignés dans la description de la PR, y compris la mesure
-  d'ordre de `git checkout` (M0-c) et le `$CLAUDE_PROJECT_DIR` observé d'un spawn (M0-e).
+- Les résultats de M0 (a–e) sont consignés **avant le dispatch d'implémentation** (M-6 : ils ne
+  sont pas mesurables depuis une dispatche) et repris dans la description de la PR, y compris la
+  mesure d'ordre de `git checkout` (M0-c) et le `$CLAUDE_PROJECT_DIR` observé d'un spawn (M0-e).
 - La PR nomme explicitement la couverture 2/4 et le ticket de suivi `claude-pilot`.
 
 ## Acceptance criteria
@@ -496,3 +532,9 @@ c'est lui qui produit et éprouve le script que l'autre consommera.
     prédicat est reformulé et l'écart est remonté à l'opérateur avant M1 — livrer une garde
     inerte sur les quatre occurrences du ticket serait le pire résultat possible, puisqu'elle
     aurait l'apparence d'un correctif.
+11. **AC11 — M0 est établi hors dispatche, et avant elle.** Les résultats de M0 sont consignés
+    dans le ticket ou la PR **avant** que le dispatch d'implémentation démarre ; celui-ci
+    commence à M1 et ne re-sonde rien. Depuis une dispatche, M0-b et M0-e sont **non mesurables**
+    et non pas faux (M-6) — un dispatch à qui l'on confierait M0 rendrait un échec de sonde
+    indiscernable d'un échec de faisabilité, et tuerait le plan pour une raison étrangère à sa
+    validité.
