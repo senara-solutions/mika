@@ -1392,4 +1392,23 @@ mod tests {
             .is_none()
         );
     }
+
+    /// mika#2289 AC7 — les deux causes ne sont jamais confondues : un tour
+    /// coupé et un tour mort produisent deux corps distincts, chacun signé de
+    /// son ticket.
+    #[test]
+    fn mika2289_the_two_causes_are_never_collapsed() {
+        let (envelope, _) = deadline_verdict_target(overrun(5).into(), REVIEW_REQUESTED)
+            .expect("un dépassement n'est pas une conclusion");
+        let (error, _) = deadline_verdict_target(died("transport_timeout"), REVIEW_REQUESTED)
+            .expect("une mort n'est pas une conclusion");
+
+        assert_ne!(envelope, error);
+        let envelope_body = build_verdict_body(&envelope, "t");
+        let error_body = build_verdict_body(&error, "t");
+        assert!(envelope_body.contains("<sub>mika#2276</sub>"));
+        assert!(error_body.contains("<sub>mika#2289</sub>"));
+        assert!(!error_body.contains("enveloppe de temps"));
+        assert!(!envelope_body.contains("transport_timeout"));
+    }
 }
