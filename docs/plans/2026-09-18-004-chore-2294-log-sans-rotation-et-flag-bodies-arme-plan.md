@@ -450,6 +450,35 @@ n'a pu être avancée d'un pouce entre les trois passes de grooming, et ce n'est
 manque de diligence : c'est la frontière du worktree. **Le plan ne peut pas être « fini »
 au sens où sa première étape est un geste opérateur.**
 
+### Passe suivante (2026-09-19, re-dispatch après `ready` de nuit) — aucune dérive
+
+La branche porte désormais **six** commits de grooming (le précédent daté du 19/09 00:01),
+tous soldés sans revue d'architecte. Le motif est constant et il est consigné au ticket par
+mika-platform-dev : `PIPELINE_INCOMPLETE — _arch_ask failed`. **Aucune des passes n'a produit
+de verdict sur le contenu** ; l'absence de `GROOMED` sur ce ticket ne mesure donc rien du
+plan, et un relecteur qui verrait six tentatives ne doit pas la lire comme six refus.
+
+Les dix sondes du tableau ci-dessus ont été rejouées intégralement à cette passe : **toutes
+tiennent, aucune correction n'en découle.** Deux résultats méritent d'être écrits plutôt que
+tus, parce que leur silence se lirait de travers :
+
+- **`crates/mika-agent/CLAUDE.md` § *Log Sinks* est toujours à `:1844-1845`.** La dérive de
+  45 lignes qu'E11 a mesurée en 24 h ne s'est **pas** reproduite sur les 24 h suivantes. Cela
+  n'infirme pas E11 — un repère qui dérive par à-coups est exactement aussi inutilisable
+  qu'un repère qui dérive tous les jours, et A3b reste ancré sur le titre de section. Cela
+  en borne seulement l'ampleur, et évite qu'un relecteur rejouant la sonde lise la stabilité
+  du jour comme une contradiction du plan.
+- **`grep -rln logrotate packaging/ docs/ scripts/ os/` ne rend toujours que ce plan.** Aucun
+  des six groomings n'a laissé d'artefact derrière lui : le volet A est intégralement à
+  faire, et rien n'a été à demi-livré entre les passes. C'est la vérification qui manquerait
+  le plus si elle était omise — un fichier `packaging/logrotate/mika` à moitié écrit par une
+  passe morte serait précisément le genre de résidu qu'une sixième passe recouvrirait sans
+  le voir.
+
+Le corps du plan est **inchangé** par cette passe. C'est un fait à dire, non une formalité :
+les quatre volets, les onze points de vérification et les sept critères d'acceptation ont été
+écrits contre une base qui n'a pas bougé sous eux.
+
 ---
 
 ## Décisions
