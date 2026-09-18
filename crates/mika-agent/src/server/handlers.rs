@@ -1175,21 +1175,21 @@ async fn post_deadline_verdict_if_cut_off(
     session_id: &str,
 ) {
     use crate::server::deadline_verdict::{
-        DeadlineVerdictInput, maybe_post_deadline_verdict, parse_pr_target,
+        DeadlineVerdictInput, deadline_verdict_target, maybe_post_deadline_verdict,
     };
 
     // Sortie immédiate sur le chemin nominal — pas de résolution de token, pas
     // de log, rien, quand le tour a conclu ou ne portait pas sur une PR.
     //
-    // `parse_pr_target` est appelé deux fois — ici pour décider si l'on paie la
-    // résolution de token (asynchrone, potentiellement un échange App), et une
-    // seconde fois dans le filet pour construire la requête. Un seul lecteur de
-    // la grammaire, donc aucun risque de divergence ; le coût est un match de
-    // regex sur un chemin déjà rare. Passer une `PrTarget` pré-parsée ferait
-    // dépendre le filet d'un parse fait par l'appelant, pour rien.
-    if output.deadline_exceeded.is_none() || parse_pr_target(&req.text).is_none() {
+    // Les deux gardes d'entrée vivaient dans le filet jusqu'à mika#2368 ; elles
+    // sont descendues dans `deadline_verdict_target` avec le motif, parce que
+    // « le tour a conclu » décrit désormais exactement le périmètre du second
+    // motif et ne peut plus être un refus du filet. Le parse a lieu une seule
+    // fois et sa cible est passée résolue : le filet ne devine plus de PR.
+    let Some((reason, target)) = deadline_verdict_target(output.deadline_exceeded, &req.text)
+    else {
         return;
-    }
+    };
 
     let Some(token) = agent_state
         .settings
@@ -1197,7 +1197,7 @@ async fn post_deadline_verdict_if_cut_off(
         .await
     else {
         warn!(
-            event = crate::server::deadline_verdict::DEADLINE_VERDICT_EVENT,
+            event = reason.event_name(),
             agent_id = %agent_state.db.agent_id(),
             trace_id = %req.request_id,
             outcome = "no_token",
@@ -1209,8 +1209,8 @@ async fn post_deadline_verdict_if_cut_off(
 
     maybe_post_deadline_verdict(
         DeadlineVerdictInput {
-            overrun: output.deadline_exceeded,
-            event_text: &req.text,
+            reason,
+            target,
             session_id,
             trace_id: &req.request_id,
             agent_id: agent_state.db.agent_id(),

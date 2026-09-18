@@ -2960,6 +2960,22 @@ fn extract_pr_url(metadata: &Option<String>) -> Option<String> {
 /// The inert reaper was born of a fixture that wrote a status production never
 /// writes on this row, so the fixture has to come through the production
 /// construction site or it is measuring itself.
+///
+/// `metadata` (mika#2368 C3) carries the row's initial metadata JSON — today,
+/// only the QA-review PR target stamped by `execute_long_running` on a build
+/// dispatch (`deadline_verdict::QA_REVIEW_PR_TARGET_KEY`). It is **a parameter
+/// on the single signature, never a second constructor**: the doc-comment above
+/// forbids drift between construction sites, and a `build_callback_task_with_*`
+/// sibling is exactly how that drift starts. Every other caller passes `None`,
+/// which is what the hard-coded `None` here used to mean.
+///
+/// The eighth parameter crosses clippy's arity threshold, and the `allow` is the
+/// honest answer rather than the lazy one: the two ways out of the lint are a
+/// second constructor — forbidden above, and forbidden for a measured reason —
+/// or a parameter struct, which would rewrite all seven call sites inside a
+/// ticket about a QA verdict net. The arity is a symptom of the callback
+/// contract's own width, not of this change.
+#[allow(clippy::too_many_arguments)]
 pub fn build_callback_task(
     agent_id: String,
     parent_task_id: Option<String>,
@@ -2968,6 +2984,7 @@ pub fn build_callback_task(
     timeout_secs: u64,
     session_id: &str,
     trace_id: &str,
+    metadata: Option<String>,
 ) -> NewTask {
     NewTask {
         agent_id,
@@ -3001,12 +3018,77 @@ pub fn build_callback_task(
         created_trace_id: Some(trace_id.to_string()),
         reference_url: None,
         source: None,
-        metadata: None,
+        metadata,
         r#type: None,
         dispatch_class: Some(
             derive_dispatch_class(input.get("skill").and_then(|v| v.as_str())).to_string(),
         ),
     }
+}
+
+/// Le `metadata` JSON initial d'une tâche callback de **build** — la PR que le
+/// filet mika#2368 pourra verdicter si ce dispatch conclut sans verdict.
+///
+/// Trois raisons de rendre `None`, et toutes les trois laissent le filet muet
+/// (AC6 : un signal qu'on ne peut pas lire n'est jamais un terme satisfait) :
+///
+/// 1. l'outil n'est pas `build_mika` — les cinq autres flux `long_running` ne
+///    doivent aucun verdict à personne, et un stamp posé là ferait entrer une
+///    population que le filet n'a pas à couvrir ;
+/// 2. `originating_message` est absent — c'est le cas d'un tour silencieux, qui
+///    n'a pas de message utilisateur frais (mika#933) ;
+/// 3. le texte n'est pas un événement PR lisible par `parse_pr_target`.
+///
+/// **La résolution passe par le lecteur unique de la grammaire**
+/// (`deadline_verdict::parse_pr_target`), jamais par une regex recopiée : une
+/// grammaire de fil dupliquée est ce qui a laissé deux lecteurs diverger dans
+/// mika#2158.
+///
+/// L'abstention est journalisée sur-le-champ, à l'instant où elle est encore
+/// rattachable à un dispatch — c'est toute la différence avec une dérivation
+/// faite plus tard par le filet, dont l'échec ne se journalise nulle part.
+fn resolve_qa_review_pr_target(
+    tool_name: &str,
+    originating_message: Option<&str>,
+    trace_id: &str,
+) -> Option<String> {
+    use crate::server::deadline_verdict::{QA_REVIEW_PR_TARGET_KEY, parse_pr_target};
+
+    if tool_name != crate::qa_build_callback::BUILD_MIKA_TOOL {
+        return None;
+    }
+
+    let Some(message) = originating_message else {
+        warn!(
+            event = "qa_review_pr_target_unresolved",
+            trace_id,
+            reason = "no_originating_message",
+            "mika#2368 : dispatch de build sans message d'origine — le filet ne \
+             pourra pas poser de verdict si ce callback revient muet"
+        );
+        return None;
+    };
+
+    let Some(target) = parse_pr_target(message) else {
+        warn!(
+            event = "qa_review_pr_target_unresolved",
+            trace_id,
+            reason = "not_a_pr_event",
+            "mika#2368 : le message d'origine de ce dispatch de build ne désigne \
+             aucune PR — le filet ne pourra pas poser de verdict si ce callback \
+             revient muet"
+        );
+        return None;
+    };
+
+    let value = target.to_metadata_value();
+    info!(
+        event = "qa_review_pr_target_stamped",
+        trace_id,
+        target = %value,
+        "mika#2368 : cible PR stampée sur la tâche callback de build"
+    );
+    Some(serde_json::json!({ QA_REVIEW_PR_TARGET_KEY: value }).to_string())
 }
 
 async fn execute_long_running(
@@ -3172,6 +3254,18 @@ async fn execute_long_running(
          validate_required_fields should have caught this"
     );
 
+    // mika#2368 C2 — la cible PR que le filet moteur pourra verdicter si ce
+    // dispatch revient sans verdict. Résolue ICI, au spawn, depuis le texte de
+    // l'événement d'origine, et stampée sur la row : le filet lira un stamp et
+    // ne parsera rien. Ce qui est condamné, c'est la dérivation tardive — celle
+    // qui se ferait au moment du filet, quand l'échec n'est plus rattrapable et
+    // ne se journalise nulle part.
+    let qa_review_pr_target = resolve_qa_review_pr_target(
+        &skill_tool.definition.name,
+        ctx.originating_message.as_deref(),
+        &ctx.trace_id,
+    );
+
     let task = build_callback_task(
         ctx.db.agent_id.clone(),
         parent_task_id,
@@ -3180,6 +3274,7 @@ async fn execute_long_running(
         timeout_secs,
         &ctx.session_id,
         &ctx.trace_id,
+        qa_review_pr_target,
     );
 
     let task_id = match ctx.db.create_task(task).await {
@@ -3457,6 +3552,131 @@ mod tests {
     use mika_common::claude::ToolDefinition;
     use std::fs;
     use std::path::PathBuf;
+
+    // -----------------------------------------------------------------------
+    // mika#2368 C2 — la cible PR stampée au spawn
+    // -----------------------------------------------------------------------
+
+    /// Le texte qu'un webhook `review_requested` produit réellement — la forme
+    /// dont `originating_message` est peuplé sur le tour QA qui lance le build.
+    const REVIEW_REQUESTED: &str = "[GitHub] PR review_requested: senara-solutions/mika#2368 — fix(mika#2355) (branch: fix/2368)\nhttps://github.com/senara-solutions/mika/pull/2368\nRequested reviewer: @mika-platform-qa";
+
+    /// **T5** — l'écrivain et le lecteur du stamp sont épinglés **ensemble**.
+    ///
+    /// Le producteur (`resolve_qa_review_pr_target`, ici) et le consommateur
+    /// (`task_engine::dispatcher::read_qa_review_pr_target`, le filet) sont deux
+    /// moitiés d'une même grammaire de fil. Les tester séparément laisserait
+    /// chacun vert pendant qu'ils cessent de se parler — c'est la classe exacte
+    /// que mika#2158 a dû refermer.
+    ///
+    /// Le test reconstruit aussi la cible attendue par `parse_pr_target` sur un
+    /// texte d'événement réel : si `originating_message` était un jour peuplé
+    /// autrement, c'est ici que ça rougit, plutôt que dans un filet qui se
+    /// désarme en silence.
+    #[test]
+    fn mika2368_the_stamp_written_at_spawn_is_the_one_the_net_reads() {
+        let stamped = resolve_qa_review_pr_target(
+            crate::qa_build_callback::BUILD_MIKA_TOOL,
+            Some(REVIEW_REQUESTED),
+            "trace-2368",
+        )
+        .expect("un dispatch de build sur une PR doit produire un stamp");
+
+        let read = crate::task_engine::dispatcher::read_qa_review_pr_target(Some(&stamped))
+            .expect("le filet doit relire ce que le spawn a écrit");
+
+        let expected = crate::server::deadline_verdict::parse_pr_target(REVIEW_REQUESTED)
+            .expect("le lecteur unique de la grammaire doit voir cette PR");
+        assert_eq!(read, expected);
+        assert_eq!(read.repo, "senara-solutions/mika");
+        assert_eq!(read.pr_number, 2368);
+    }
+
+    /// **AC6, côté producteur** — trois raisons de ne rien stamper, chacune
+    /// séparément, et aucune ne produit une cible devinée.
+    #[test]
+    fn mika2368_a_non_build_dispatch_is_never_stamped() {
+        for tool in [
+            "run_claude_pilot",
+            "run_claude_pilot_groom",
+            "deploy_mika",
+            "address_pr_comments",
+            "resolve_pr_conflicts",
+        ] {
+            assert!(
+                resolve_qa_review_pr_target(tool, Some(REVIEW_REQUESTED), "trace").is_none(),
+                "{tool} ne doit aucun verdict — le stamper ferait entrer une \
+                 population que le filet n'a pas à couvrir"
+            );
+        }
+    }
+
+    #[test]
+    fn mika2368_a_build_without_an_originating_message_is_not_stamped() {
+        assert!(
+            resolve_qa_review_pr_target(crate::qa_build_callback::BUILD_MIKA_TOOL, None, "trace")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn mika2368_a_build_whose_message_names_no_pr_is_not_stamped() {
+        assert!(
+            resolve_qa_review_pr_target(
+                crate::qa_build_callback::BUILD_MIKA_TOOL,
+                Some("Salut, tu peux relancer le build ?"),
+                "trace",
+            )
+            .is_none()
+        );
+    }
+
+    /// Le stamp voyage par la **signature unique** de `build_callback_task`, et
+    /// atterrit sur `NewTask.metadata` — jamais par un second constructeur.
+    #[test]
+    fn mika2368_the_stamp_rides_on_the_single_callback_builder() {
+        let stamped = resolve_qa_review_pr_target(
+            crate::qa_build_callback::BUILD_MIKA_TOOL,
+            Some(REVIEW_REQUESTED),
+            "trace-2368",
+        );
+        let task = build_callback_task(
+            "mika-qa".to_string(),
+            Some("parent".to_string()),
+            crate::qa_build_callback::BUILD_MIKA_TOOL,
+            &serde_json::json!({"task_id": "parent"}),
+            600,
+            "session",
+            "trace-2368",
+            stamped,
+        );
+        assert_eq!(
+            task.label,
+            crate::qa_build_callback::BUILD_CALLBACK_LABEL,
+            "le label est ce que le discriminant de mika#2355 lit"
+        );
+        let read =
+            crate::task_engine::dispatcher::read_qa_review_pr_target(task.metadata.as_deref())
+                .expect("la row construite par la production doit porter la cible");
+        assert_eq!(read.pr_number, 2368);
+
+        // Et le contrôle négatif sur la même signature : les autres appelants
+        // passent `None`, et la row ne porte alors aucune cible.
+        let other = build_callback_task(
+            "mika-dev".to_string(),
+            Some("parent".to_string()),
+            "run_claude_pilot",
+            &serde_json::json!({"task_id": "parent"}),
+            600,
+            "session",
+            "trace",
+            None,
+        );
+        assert_eq!(
+            crate::task_engine::dispatcher::read_qa_review_pr_target(other.metadata.as_deref()),
+            Err("no_metadata")
+        );
+    }
 
     #[test]
     fn sandbox_env_allows_core_vars() {

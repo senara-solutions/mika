@@ -33,10 +33,14 @@
 //! partager une constante Rust : `tests::mika2355_the_scope_header_quotes_the_engine_marker`
 //! épingle que la chaîne qu'il cite est bien celle que le moteur émet.
 //!
-//! Le filet moteur qui posterait `hold[review]` quand le re-prompt lui-même
-//! échoue (plan mika#2355 § B3, AC5–AC7) n'est **pas** dans ce module : il
-//! généralise `server::deadline_verdict` et suit sous mika#2368. Quand
-//! il arrive, il lit [`pr_review_posted_in_turn`] et rien d'autre.
+//! Le filet moteur qui poste `hold[review]` quand le re-prompt lui-même échoue
+//! est arrivé sous mika#2368. Il n'est pas dans ce module — il généralise
+//! `server::deadline_verdict` et se câble dans `task_engine::dispatcher` — mais
+//! son **prédicat de déclenchement** l'est : [`verdict_unmet_after_retry`], le
+//! complémentaire exact de la garde, lu par les deux sites de sortie EndTurn.
+//! Il lit [`pr_review_posted_in_turn`] et rien d'autre.
+
+use std::collections::HashSet;
 
 use crate::tool_execution::ToolCallSummary;
 
@@ -120,6 +124,43 @@ pub fn pr_review_posted_in_turn(summaries: &[ToolCallSummary]) -> bool {
 
 /// Label de la garde positive, pour `intent_guard_retries`.
 pub const QA_VERDICT_REQUIRED_LABEL: &str = "qa_build_callback_verdict";
+
+/// Ce tour devait un verdict, son budget de re-prompt est épuisé, et rien n'a
+/// été posté (mika#2368 C4).
+///
+/// C'est le **complémentaire exact** de la garde `qa_build_callback_verdict` :
+/// même conjonction, le terme de budget inversé. Là où la garde re-prompte
+/// (budget non consommé), ceci arme le filet (budget consommé).
+///
+/// # Pourquoi une fonction et pas trois termes recopiés
+///
+/// Le site où le budget est « déjà consommé » **n'existe pas comme branche** :
+/// la condition `!intent_guard_retries.contains(…)` est *dans* le `if` du
+/// re-prompt, et budget épuisé on tombe à travers, sans `else`. Le prédicat se
+/// pose donc sur les deux **chemins de sortie** EndTurn — texte non vide et
+/// miroir texte vide — et deux copies d'une conjonction à trois termes
+/// divergent : la leçon que `grooming_marker` a dû engraver une fois
+/// (mika#2158). Les deux sites de la garde elle-même sont déjà une duplication
+/// qu'on n'aggrave pas.
+///
+/// # Les deux sites comptent, et le second est le plus probable
+///
+/// Le commentaire du miroir texte vide le dit en propres termes : *« a bare
+/// EndTurn is exactly the shape a turn that has nothing to say takes, and it is
+/// the one the registry never sees »*. Un tour de callback qui conclut sans
+/// rien dire **est** le cas nominal de mika#2368. Un signal posé au seul site
+/// texte-non-vide laisserait le filet aveugle sur la moitié la plus probable de
+/// sa population — et rien ne le signalerait : le filet resterait silencieux,
+/// ce qui est indistinguable d'un filet qui n'a rien à faire.
+pub fn verdict_unmet_after_retry(
+    qa_verdict_due: bool,
+    intent_guard_retries: &HashSet<&'static str>,
+    summaries: &[ToolCallSummary],
+) -> bool {
+    qa_verdict_due
+        && intent_guard_retries.contains(QA_VERDICT_REQUIRED_LABEL)
+        && !pr_review_posted_in_turn(summaries)
+}
 
 /// Le re-prompt de la garde positive.
 ///
@@ -246,6 +287,39 @@ mod tests {
             summary("send_message", "{}", true),
         ];
         assert!(!pr_review_posted_in_turn(&self_dev));
+    }
+
+    /// mika#2368 — le complémentaire de la garde : les trois termes, chacun
+    /// avec son contrôle négatif.
+    #[test]
+    fn mika2368_the_net_predicate_is_the_exact_complement_of_the_guard() {
+        let mut spent: HashSet<&'static str> = HashSet::new();
+        spent.insert(QA_VERDICT_REQUIRED_LABEL);
+        let fresh: HashSet<&'static str> = HashSet::new();
+        let nothing: Vec<ToolCallSummary> = vec![];
+        let posted = vec![summary(
+            "run_gh",
+            r#"{"args":["pr","review","2368","--comment"]}"#,
+            true,
+        )];
+
+        // Le cas du ticket : verdict dû, budget épuisé, rien de posté.
+        assert!(verdict_unmet_after_retry(true, &spent, &nothing));
+
+        // Budget NON consommé : c'est à la garde de re-prompter, pas au filet.
+        // Sans ce terme, le filet doublerait le re-prompt au lieu de lui succéder.
+        assert!(!verdict_unmet_after_retry(true, &fresh, &nothing));
+
+        // La revue a été postée : rien n'est dû (AC7).
+        assert!(!verdict_unmet_after_retry(true, &spent, &posted));
+
+        // Aucun verdict dû sur ce tour (le cas mika-dev, AC4b).
+        assert!(!verdict_unmet_after_retry(false, &spent, &nothing));
+
+        // Un budget consommé par une AUTRE garde ne compte pas.
+        let mut other: HashSet<&'static str> = HashSet::new();
+        other.insert("callback_terminal_action");
+        assert!(!verdict_unmet_after_retry(true, &other, &nothing));
     }
 
     /// AC1b — l'en-tête de portée du prompt cite **la** chaîne que le moteur
