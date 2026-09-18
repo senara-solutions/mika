@@ -367,6 +367,100 @@ make verify-bundled-skills
 
 ---
 
+## Fire-Disposition
+
+*(Exigée par le Fire-Disposition Gate — mika#1574. Ce plan livre des deliverables
+de classe détecteur ; cette section dit comment chacun se comporte face aux
+données **préexistantes**.)*
+
+**Disposition retenue : (c) halt-and-surface. Allowlist vide, aucun détecteur
+livré désarmé.**
+
+### Trois détecteurs, pas un
+
+L'architecte nomme R6. Le plan en livre trois, et les trois sont traités ici
+plutôt qu'un seul :
+
+| Détecteur | Portée sur le préexistant |
+|---|---|
+| **R6** — scan de source sur les `system_prompt.md` | **le seul qui tire sur du préexistant** |
+| **Assertions de contenu de prompt** (R1, R5 — § *Tests de prompt*) | tirent sur les octets que ce PR édite |
+| **Scan structurel « pas de bras `_ =>` »** (§ *Tests unitaires*, contrôle négatif) | porte sur la fonction que ce PR écrit — périmètre préexistant nul |
+
+### R6 — l'état est vérifié avant l'écriture, pas espéré
+
+*État à l'écriture du plan*, mesuré sur les deux arbres scannés (11
+`system_prompt.md` sous `crates/mika-agent/templates/skills/`, 25 sous
+`skills/bundled/`) :
+
+- **deux** violations, toutes deux dans `templates/skills/` — `google-workspace`
+  l63 et l74, `browser-control` l5–9 ;
+- **zéro** dans `skills/bundled/`, ce que § M4 avait déjà relevé ;
+- les deux sont retirées par **R1 et R5, dans ce même PR**.
+
+Donc à l'instant du land, le détecteur passe au vert sans qu'aucune ligne ne soit
+tolérée *pour lui* : les seules lignes qu'il aurait attrapées sont précisément
+celles que le correctif supprime. **C'est cette coïncidence — le périmètre du
+détecteur est exactement le périmètre du fix — qui rend (c) disponible ici**, et
+elle est vérifiée par décompte avant l'écriture. Sans elle, (c) aurait été une
+prudence déguisée en décision.
+
+*Allowlist : vide, et la vacuité est l'invariant.* Les trois occurrences
+légitimes de § M4 (`mcp:49`, `github:41`, `shell-exec:59`) ne sont **pas** des
+exemptions : elles sont hors prédicat par construction — leur destinataire est
+l'agent, qui a un shell. Elles vivent dans le test comme **contrôle négatif**
+(le prédicat doit rester vert dessus), jamais comme entrées tolérées. La
+distinction n'est pas cosmétique : une allowlist qui les nommerait dirait que le
+prédicat les attrape et qu'on ferme les yeux, alors que le plan tout entier
+repose sur le fait qu'il ne les attrape pas (§ M4 : « une garde qui confondrait
+les deux crierait sur trois prompts sains et serait désarmée dans la semaine »).
+
+### Si R6 tire au land time — la halte, et ce qu'elle interdit
+
+Un troisième positif signifierait que le balayage AC4 de § M4 est **incomplet**,
+donc que la table destinataire qui porte tout le prédicat a manqué une forme
+d'écriture. Le remède **n'est ni d'ajouter le fichier à un allowlist, ni
+d'assouplir le prédicat** : c'est de lire l'occurrence, de reprendre § M4, et de
+décider si elle relève de R1/R5 (retrait dans ce PR) ou d'un suivi. Un
+assouplissement rendrait le détecteur vert en lui retirant exactement la capacité
+pour laquelle il est livré.
+
+Note de conception à l'appui : les deux violations connues sont écrites sous
+**deux formes différentes** — impératif inline (« Ask the user to run … ») et
+adresse suivie d'un bloc de commande (« tell the user : … » + fence). Le
+prédicat doit couvrir les deux, ce qui est aussi la raison pour laquelle une
+troisième forme est plausible et pour laquelle la halte est écrite plutôt que
+supposée impossible.
+
+### Auto-comptage : pas d'exclusion nécessaire, et c'est une propriété du périmètre
+
+Le fichier de test R6 contiendra **littéralement** les chaînes proscrites (ses
+contrôles négatifs et ses cas rouges). Il ne se compte pourtant pas lui-même,
+parce que le scan énumère des `system_prompt.md` par glob sur deux arbres de
+prompts — et non `src/`, comme le faisait le T7 de mika#2361, qui a dû
+s'auto-exclure pour cette raison exacte.
+
+**Cette absence d'exclusion est une conséquence du périmètre, pas une garantie
+du prédicat.** Élargir un jour le scan à `src/` ou à `tests/` ferait
+silencieusement rougir la garde sur ses propres fixtures. Le test doit donc
+épingler son périmètre (les deux globs), pas seulement son verdict — sans quoi
+l'élargissement se lirait comme une découverte.
+
+### Pourquoi ni (a) ni (b)
+
+- **(a) allowlist nommée** — écartée : il n'y a rien à exempter (le décompte
+  ci-dessus rend zéro après R1/R5). Une entrée d'allowlist légitimerait une
+  prescription utilisateur survivante, c'est-à-dire précisément la classe que ce
+  ticket ferme, et elle survivrait au suivi censé la retirer.
+- **(b) land disabled** — écartée, et c'est l'argument le plus fort du plan
+  contre elle : **R5 est prompt-seul** (§ R5 : « pas de handler Rust équivalent
+  … c'est la garde R6 qui empêche la réintroduction »). Livrer R6 désarmé
+  laisserait la moitié `browser-control` du correctif sans aucune protection
+  anti-régression — le détecteur désarmé n'est pas un moindre mal ici, c'est la
+  suppression de la seule enforcement de R5.
+
+---
+
 ## Definition of Done
 
 - [ ] `grep -c "gws auth login" crates/mika-agent/templates/skills/google-workspace/system_prompt.md` rend `0`.
@@ -375,6 +469,8 @@ make verify-bundled-skills
 - [ ] Le prédicat de code 2 refuse `Exit code: 23`, en test.
 - [ ] `browser-control` ne prescrit plus de commande à l'utilisateur.
 - [ ] La garde R6 est verte, non vacue, et ne rougit pas sur les trois cas légitimes.
+- [ ] La garde R6 est verte **sans aucune entrée d'allowlist** (§ *Fire-Disposition* : la vacuité est l'invariant). Un positif au land time est une **halte**, pas une exemption.
+- [ ] Le test R6 épingle son périmètre (les deux globs `templates/skills/**/system_prompt.md` et `skills/bundled/**/system_prompt.md`), et pas seulement son verdict.
 - [ ] `cargo test -p mika-agent`, `clippy -D warnings`, `fmt --check`, `make verify-bundled-skills` passent.
 - [ ] Aucun test existant n'est affaibli ou supprimé pour faire passer ce travail.
 
@@ -477,4 +573,31 @@ sonde silencieuse et une sonde saine se ressemblent, mika#2205).
 | Un opérateur `Local` sans `MIKA_DEPLOYMENT` perd le geste terminal, qui était correct pour lui | Réel, assumé | Exactement le coût nommé par mika#2290 pour la ligne de hosting : une ligne dans `~/.mika/.env`. Ce que l'agent dit entre-temps reste vrai. Le sens de l'asymétrie est le bon — un opérateur sait lire « je ne peux pas rétablir ça depuis ici », un champion non technique ne sait pas ouvrir un terminal qui n'existe pas. |
 | Le modèle reformule le texte annexé et réintroduit le geste | Faible | Le prompt ne contient plus rien à réintroduire. Mesuré par la sonde (b) ; la garde EndTurn est le suivi si elle rend un positif. |
 | Le prédicat de la garde R6 dérive et crie sur des prompts sains | Moyen | Contrôle négatif obligatoire sur les trois occurrences de M4, dans le test lui-même. Une garde désarmée pour cause de faux positifs est pire que pas de garde. |
-| `browser-control` reste prompt-seul | Assumé, écrit | Pas de handler Rust à conditionner (capacité MCP). R6 couvre la réintroduction. |
+| `browser-control` reste prompt-seul | Assumé, écrit | Pas de handler Rust à conditionner (capacité MCP). R6 couvre la réintroduction — et c'est pourquoi § *Fire-Disposition* écarte l'option (b) : R6 désarmé laisserait R5 sans aucune enforcement. |
+
+---
+
+## Revision history
+
+- **rev 2 (2026-09-18)** — adressé **F1** (BLOCKING, Fire-Disposition Gate,
+  mika#1574) par l'ajout d'une section `## Fire-Disposition` retenant l'option
+  **(c) halt-and-surface** avec allowlist vide. La disposition n'est pas posée par
+  prudence mais sur un décompte vérifié avant l'écriture — 36 `system_prompt.md`
+  scannés (11 `templates/skills/` + 25 `skills/bundled/`), exactement deux
+  violations, toutes deux retirées par R1/R5 dans ce même PR : le périmètre du
+  détecteur coïncide avec celui du fix, ce qui est la condition qui rend (c)
+  disponible. Trois points sont allés au-delà de la lettre du finding, parce que
+  les écrire coûtait moins que de les laisser au pilote : (1) l'inventaire nomme
+  **trois** deliverables de classe détecteur et non le seul R6 (les assertions de
+  contenu de prompt R1/R5 et le scan structurel « pas de bras `_ =>` » en sont
+  aussi) ; (2) la question de l'auto-comptage est tranchée — le fichier de test R6
+  contiendra littéralement les chaînes proscrites, et s'il ne se compte pas
+  lui-même c'est une propriété du périmètre (glob sur des `system_prompt.md`, non
+  sur `src/` comme le T7 de mika#2361 qui a dû s'auto-exclure), d'où l'obligation
+  d'épingler le périmètre et pas seulement le verdict ; (3) le rejet de l'option
+  (b) est argumenté sur le plan lui-même — R5 étant prompt-seul, livrer R6 désarmé
+  ne serait pas un moindre mal mais la suppression de la seule enforcement de R5.
+  Deux lignes ajoutées à la *Definition of Done* pour rendre la disposition
+  vérifiable (allowlist vide ; périmètre épinglé). **Aucune AC affaiblie, aucun
+  requirement retiré** : F1 était un manque de spécification, pas une objection de
+  conception, et la Piste C reste intacte.

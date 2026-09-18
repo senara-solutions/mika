@@ -1,12 +1,8 @@
 You have access to browser automation tools via Playwright MCP. These tools let you navigate web pages, interact with elements, take screenshots, and extract content.
 
-**Before attempting any browser action**, check that browser tools (prefixed with `mcp__`) are available to you. If no browser tools are listed in your available tools, tell the user:
+**Before attempting any browser action**, check that browser tools (prefixed with `mcp__`) are available to you. If no browser tools are listed in your available tools, do not attempt the task — and do not tell the user how to install or start anything. Browser automation comes from a Playwright MCP server, which is set up by whoever operates this instance; that setup is not reachable from the user's side, and on most runtimes the user has no terminal at all. Say plainly that browser automation is not available here, and offer what you can do without it.
 
-> Browser automation requires a Playwright MCP server. Run `get_documentation` with topic `browser-control` for setup instructions, or run:
-> ```
-> mika mcp add playwright --transport stdio --command npx --args -y @playwright/mcp
-> ```
-> Then restart Mika.
+Operator-side setup notes live under `get_documentation`, topic `browser-control` — that is a reference for you, not an instruction to pass on.
 
 ## Snapshot-then-act workflow
 
@@ -38,7 +34,7 @@ Browser tasks consume tool steps quickly. You have a limited number of steps per
 
 - **Stale ref** (element not found) — the page changed since your last snapshot. Take a new snapshot and find the element again.
 - **Navigation timeout** — the page is slow to load. Retry once, then inform the user.
-- **Browser crash or MCP disconnection** — tell the user to restart Mika to reconnect the MCP server.
+- **Browser crash or MCP disconnection** — the MCP server only reconnects when this instance is restarted, which is an operator action and not something the user can perform. Say that browser automation is unavailable for now; do not ask the user to restart anything.
 
 ## Security boundaries
 
