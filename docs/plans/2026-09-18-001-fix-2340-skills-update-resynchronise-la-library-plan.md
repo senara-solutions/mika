@@ -114,8 +114,10 @@ inscrit à côté de la library, et rien ne les imprime sur le chemin `skills`.
 - **R4** — La sortie de la commande nomme ce qui a été fait, et **quel binaire**
   l'a fait : impossible de lire « à jour » d'une resynchronisation opérée par un
   binaire périmé.
-- **R5** — La library porte une trace durable de son écrivain, lisible sans
-  lancer de commande (`cat`), et une régression de version est **dite**.
+- **R5** — La library porte une trace durable du binaire qui a produit son état,
+  lisible sans lancer de commande (`cat`), rafraîchie par **toute** passe de seed
+  — y compris celle qui se contente de confirmer — et une régression de version
+  est **dite**.
 - **R6** — La documentation nomme la chaîne réelle de déploiement d'un prompt
   bundled, et dit que `mika skills update` n'est pas, seule, cette chaîne.
 - **R7** — Un test automatique échoue si `update` retombe sur le symlink seul.
@@ -160,19 +162,56 @@ rétablirait exactement le silence qu'on ferme.
 **Portée : `name.is_none()` seulement.** `mika skills update <nom>` vise un skill
 marketplace nommé ; la garde `if name.is_none()` déjà présente reste, inchangée.
 
-### B2 — La library dit qui l'a écrite (`.manifest-writer`)
+### B2 — La library dit quel binaire a produit son état (`.manifest-writer`)
 
-`seed_bundled_skill_library` écrit, **au même endroit et au même moment** que
-`.manifest-hash` (donc en dernier, pour la raison déjà écrite là : une extraction
-partiellement échouée ne doit pas masquer un état périmé), un sidecar JSON
-`.manifest-writer` :
+`seed_bundled_skill_library` écrit un sidecar JSON `.manifest-writer` à côté de
+`.manifest-hash` :
 
 ```json
-{"version":"0.12.2","git_hash":"968dbe94","written_at":"2026-09-18T09:14:02Z","manifest_hash":"a1b2c3d4e5f60718"}
+{"version":"0.12.2","git_hash":"968dbe94","attested_at":"2026-09-18T09:14:02Z","manifest_hash":"a1b2c3d4e5f60718","extracted":true}
 ```
 
-`version` et `git_hash` viennent de `mika_common::build_info` ; `written_at` de
+`version` et `git_hash` viennent de `mika_common::build_info` ; `attested_at` de
 `crate::timestamp::now()`.
+
+**Il est écrit sur TOUTES les passes de seed, y compris celle qui n'extrait
+rien** — c'est la décision centrale de ce bloc, et elle est imposée par une
+lecture du code plutôt que par goût. `seed_bundled_skill_library`
+(`bundled_skills.rs:470-483`) **retourne tôt** quand le `.manifest-hash` présent
+égale celui du binaire, et `compute_manifest_hash` (`bundled_skills.rs:427-439`)
+ne hache **que** les noms, `content_hash` et chemins de fichiers des skills.
+Deux binaires séparés par des semaines de commits Rust, sans changement sous
+`skills/bundled/`, ont donc le **même** hash de manifeste.
+
+Conséquence si le sidecar n'était écrit que sur le chemin d'extraction : un
+opérateur qui vient de reconstruire et dont le PR ne touche aucun prompt bundled
+lirait un `git_hash` antérieur sur une library pourtant parfaitement conforme —
+et conclurait à un défaut de déploiement. **C'est le symptôme même du ticket,
+retourné en faux positif.** Un instrument posé pour clore une lecture fausse ne
+doit pas en ouvrir la réciproque.
+
+D'où le sens exact du fichier, à écrire dans le code comme ici : *quel binaire a
+produit l'état actuel de cette library, et quand l'a-t-il attesté.* Le champ
+`extracted` distingue les deux passes (`true` : cette passe a réellement écrit du
+contenu ; `false` : la porte de hash a confirmé la conformité sans réécrire).
+Après `make deploy` suivi de n'importe quel seed, le sha inscrit est celui du
+binaire déployé **dans les deux cas** — ce qui est précisément la propriété que
+R4 et R5 demandent.
+
+**Ordre d'écriture, et pourquoi il diffère de celui de `.manifest-hash`.** Sur le
+chemin d'extraction, le sidecar est écrit **en dernier, après `.manifest-hash`**,
+pour la raison déjà inscrite là : une extraction partiellement échouée ne doit pas
+laisser une attestation qui masque un état périmé. Sur le chemin de confirmation,
+il est écrit avant le retour anticipé — il n'y a rien à faire échouer.
+
+**Écriture atomique (tmp + `rename`), au motif que deux processus écrivent.**
+mika-spirit et le CLI `mika` peuvent semer en même temps (c'est T3) ; une
+écriture en place exposerait un JSON tronqué à un lecteur concurrent, et le
+lecteur de B3 est justement une seconde passe du CLI. Le motif tmp-dans-le-même-
+répertoire-puis-`rename` est celui qu'emploient déjà `marketplace.rs:87`,
+`oauth.rs:285` et `well_known_agents.rs:681`. Un échec d'écriture du sidecar est
+un WARN, jamais un abandon du seed (même hiérarchie que V4 : le fait prime sur sa
+trace).
 
 **Garde de régression (R5).** Avant d'écrire, si le `.manifest-writer` présent
 porte une `version` sémantique **strictement supérieure** à celle du binaire qui
@@ -202,12 +241,19 @@ mémoire.
   Refreshed bundled-skill library and symlinks.
     library: ~/.mika/skills
     manifest: a1b2c3d4e5f60718
-    written by: mika 0.12.2 (968dbe94) at 2026-09-18T09:14:02Z
+    attested by: mika 0.12.2 (968dbe94) at 2026-09-18T09:14:02Z
 ```
 
-La ligne `written by` est celle qui répond à la question du ticket. Un opérateur
+La ligne `attested by` est celle qui répond à la question du ticket. Un opérateur
 qui vient de fusionner #2339 et lit un sha antérieur a sa réponse dans la ligne
 qu'il est déjà en train de lire, sans `diff` ni `stat`.
+
+Le verbe est « attested », pas « written », **parce que c'est ce que le fichier
+sait dire** : par B2 il est réécrit aussi quand la porte de hash confirme sans
+extraire, et écrire « written by » là serait faux à la lettre. Le champ
+`extracted` n'est **pas** imprimé — il sert au diagnostic et à V4 ; l'afficher
+inviterait à lire `false` comme « rien n'a été fait », c'est-à-dire exactement la
+confusion lien-contre-contenu que ce plan ferme.
 
 Sous `MIKA_DISABLE_BUNDLED_SKILLS`, la sortie le dit explicitement plutôt que
 d'afficher un couple manifeste/écrivain périmé sans commentaire.
@@ -249,11 +295,39 @@ périmé et son hash cohérent). C'est le bon état à tester : c'est celui qu'u
 `skills update` doit désormais réparer. L'incident littéral n'est pas réparable
 par du code, il l'est par une reconstruction, et c'est B4 qui le dit.
 
-**Pas de garde structurelle en plus, et voici pourquoi.** Une régression vers
+**Pas de scan de source en plus, et voici pourquoi.** Une régression vers
 `materialize_agent_skill_links` seule fait **échouer V1** : le fichier `STALE`
 survit. C'est la différence avec les classes d'observabilité de ce dépôt (où une
 régression ne rend aucune décision fausse et ne peut être vue que par un scan de
-source) — ici le comportement bouge, donc un test de comportement suffit.
+source) — ici le comportement bouge, donc un test de comportement suffit. Mais
+cette phrase est une affirmation **sur** V1, faite dans la prose du plan ; la
+mesurer demande un second test. C'est V1.5, et c'est tout ce que porte AC7.
+
+### V1.5 — Test négatif : le symlink seul ne répare rien (AC7)
+
+Test **séparé** de V1, même module. Montage identique jusqu'à l'étape 3 (library
+périmée, `.manifest-hash` à `stale`), puis appel de
+`materialize_agent_skill_links` **seule** — jamais `update_skills` — et
+assertion que le contenu `STALE` **survit** des deux côtés (fichier de library et
+fichier résolu via le symlink).
+
+Ce qu'il épingle n'est pas `update_skills` : c'est le **pouvoir discriminant de
+V1**. Il mesure que le composant vers lequel une régression retomberait est bien
+incapable de produire le résultat que V1 exige. Sans lui, AC7 restait une
+affirmation sur un test, invérifiable — la circularité relevée en première passe
+(F2) : V1 ne peut pas être à la fois la preuve du correctif et la preuve de sa
+propre sensibilité.
+
+**Le cas qui le fait rougir légitimement, et c'est voulu.** Si
+`materialize_agent_skill_links` apprenait un jour à réécrire le contenu de la
+library, V1.5 rougirait alors que rien ne serait cassé. Ce n'est pas un faux
+positif : c'est le seul signal possible que V1 a cessé d'être discriminant — V1
+resterait vert en prouvant strictement moins qu'on ne croit. Le message d'échec
+doit le dire dans ces termes, sinon le prochain lecteur le « réparera » en
+supprimant le test.
+
+*Citation : review-guide.md § Single Responsibility (un test, un invariant) —
+V1 atteste le comportement, V1.5 atteste la sensibilité de V1.*
 
 ### V2 — `_shared/dispatch-lib.sh` (R2)
 
@@ -272,10 +346,19 @@ le test ne mute aucun état global de processus.
 
 - `.manifest-writer` existe après un seed, parse en JSON, porte
   `build_info::VERSION` et `build_info::GIT_HASH`.
+- **Le sidecar est rafraîchi par la passe qui n'extrait rien** (le cœur de B2).
+  Semer une fois, altérer `attested_at` et `git_hash` dans le sidecar **sans
+  toucher au contenu ni à `.manifest-hash`**, re-semer : le sidecar est revenu
+  aux constantes du binaire et porte `extracted: false`, alors que le contenu des
+  skills n'a pas été réécrit. Ce test est le seul qui distingue la conception
+  retenue de celle qui produirait le faux positif décrit en B2 — sans lui, la
+  variante « écrire seulement sur extraction » passerait tous les autres.
 - Planter un `.manifest-writer` avec une `version` future → un seed émet
   `bundled_library_downgrade` et **écrit quand même**.
 - Un `.manifest-writer` illisible ou malformé n'empêche pas le seed (fail-open :
   un sidecar d'observabilité ne doit jamais bloquer une écriture de contenu).
+- Aucun fichier temporaire d'écriture atomique ne subsiste dans la library après
+  un seed, et le sidecar n'est jamais observé tronqué.
 
 ### V5 — Sonde post-déploiement, avec sa halte
 
@@ -283,7 +366,7 @@ Après `make deploy` :
 
 ```bash
 cat ~/.mika/skills/.manifest-writer          # le sha doit être celui qu'on vient de déployer
-mika skills --agent mika-arch update         # même sha sur la ligne « written by »
+mika skills --agent mika-arch update         # même sha sur la ligne « attested by »
 diff ~/.mika/agents/mika-arch/skills/mika-arch-groom-ticket/system_prompt.md \
      skills/bundled/mika-arch-groom-ticket/system_prompt.md   # vide
 ```
@@ -295,14 +378,85 @@ reconstruction qu'il faut examiner.
 
 ---
 
+## Fire-Disposition
+
+Requis par le Fire-Disposition Gate (mika#1574), soulevé par mika-arch en
+première passe (F1). Ce plan porte deux livrables de classe détecteur — V1–V4
+(et V1.5) d'un côté, la garde `bundled_library_downgrade` de B2 de l'autre. Ils
+ne tirent pas sur la même population, donc la disposition est dite par livrable
+plutôt qu'une fois pour le plan.
+
+### V1–V4 et V1.5 — Option (a), allowlist nommée, aujourd'hui vide
+
+Ces tests s'exécutent **intégralement sur un home temporaire que le test
+fabrique** (`<tmp>/agents/…`, `<tmp>/skills/…`) et comparent au manifeste
+compilé dans le binaire de test. Aucune donnée pré-existante du dépôt ni du poste
+de l'opérateur n'entre dans leur population, donc aucune violation antérieure ne
+peut être surfacée : **l'allowlist naît vide, et c'est un fait sur le montage du
+test, pas une espérance sur les données.**
+
+L'engagement est la moitié utile de l'option (a). Si l'implémentation découvre
+malgré tout un échec — le cas plausible étant un skill bundled dont l'extraction
+ne reproduit pas son manifeste à l'octet près — il est traité ainsi :
+
+1. **Donnée nommée** — le skill exact, jamais une tolérance générale sur le
+   prédicat. Un test rendu permissif pour passer aurait exactement la propriété
+   que ce plan reproche à la ligne « Refreshed » : dire vert sans rien garantir.
+2. **Ticket de suivi** déposé sur la cause d'extraction.
+3. **Assertion auto-nettoyante** — l'entrée d'exception rougit quand le suivi se
+   ferme, avec pour message « retirer cette entrée ».
+
+L'exception vivrait dans `#[cfg(test)] mod tests`, jamais sur un chemin que le
+semeur de production puisse consulter au runtime.
+
+**Ce qui est explicitement refusé ici : l'option (b)** (atterrir sous
+`#[ignore]`). V1 est le seul détecteur qui tienne R7 ; le désarmer laisserait
+vivre précisément la régression pour laquelle il existe. L'option (c) ne
+s'applique pas non plus : la forme de la résolution n'est pas une question de
+cadrage opérateur, c'est un défaut d'extraction avec une réponse technique.
+
+### `bundled_library_downgrade` — avertir et procéder, par conception
+
+C'est le seul détecteur de ce plan qui tire sur des **données de production
+réelles** : la library du poste de l'opérateur. Sa disposition est celle déjà
+écrite en B2 et vaut ici comme fire-disposition — **il émet un WARN et écrit
+quand même**. Ce n'est aucune des trois options canoniques, et pour une raison
+structurelle : les trois supposent un détecteur dont le tir empêche quelque
+chose. Celui-ci n'empêche rien, par décision. Un rollback délibéré est un geste
+légitime, et une garde qui le refuserait serait un mode de panne pire que celui
+qu'elle signale — même arbitrage que la garde mika#2293, où refuser de démarrer
+sur un réglage sous-optimal mais fonctionnel coucherait la flotte.
+
+Deux bornes de population, dites plutôt que découvertes à l'implémentation :
+
+- **Au déploiement de ce correctif lui-même, la garde ne peut pas tirer.**
+  `.manifest-writer` n'existe encore sur aucun poste ; une absence n'est pas une
+  comparaison. Le premier seed l'écrit, et le premier tir possible est le
+  suivant. Il n'y a donc pas de rafale de WARN à prévoir le jour du déploiement.
+- **Un `.manifest-writer` illisible, malformé, ou sans `version` parsable ne
+  tire pas et ne bloque pas** (V4). Un sidecar d'observabilité qui empêcherait
+  une écriture de contenu inverserait la hiérarchie entre le fait et sa trace.
+
+Répond aussi à S1 : c'est la ligne WARN qui porte la trace, et elle nomme les
+deux versions, les deux sha et l'agent — la « donnée spécifique » que l'option
+(a) exige d'une exception, portée ici par l'événement plutôt que par une entrée
+d'allowlist, faute de population à exempter.
+
+*Citation : review-guide.md § Fire-Disposition Gate (mika#1574) ;
+`docs/solutions/best-practices/fire-disposition-doctrine.md`.*
+
+---
+
 ## Definition of Done
 
 - `mika skills update` (sans argument) resynchronise library + `_shared/` +
   symlinks via `seed_bundled_skills_if_needed`, et rien n'est recomposé sur place.
 - `MIKA_DISABLE_BUNDLED_SKILLS` est lu via `Settings` et honoré à l'identique.
-- `.manifest-writer` est écrit par le semeur et imprimé par la commande.
+- `.manifest-writer` est écrit atomiquement par le semeur sur **toute** passe
+  (extraction comme confirmation) et imprimé par la commande.
 - Une régression de version émet `bundled_library_downgrade` sans refuser.
-- V1–V4 passent ; `cargo test`, `cargo clippy`, `cargo fmt --check` verts.
+- V1, V1.5 et V2–V4 passent ; `cargo test`, `cargo clippy`, `cargo fmt --check`
+  verts.
 - `docs/skills.md` et la racine `CLAUDE.md` portent la chaîne de déploiement
   réelle.
 
@@ -310,8 +464,37 @@ reconstruction qu'il faut examiner.
 
 ## Acceptance criteria
 
-Le corps du ticket ne porte pas de section `## Acceptance criteria` ; les
-critères ci-dessous sont dérivés des Requirements et du Verification contract.
+Le corps du ticket ne porte pas de section `## Acceptance criteria` : il énonce
+ses exigences sous « Requirements » et « Verification contract ». **La dérive de
+gabarit est confirmée comme acceptée, sans gap fonctionnel** (F3) — et la
+confirmation est rendue vérifiable plutôt que déclarative par la table de
+traçabilité ci-dessous, où chaque critère remonte à une exigence du ticket ou est
+nommé comme un dépassement assumé.
+
+| AC | Exigence du plan | Origine dans le ticket |
+|----|------------------|------------------------|
+| AC1 | R1 | L'exigence centrale : `update` doit resynchroniser le contenu de la library (lecture T1) |
+| AC2 | R2 | Le second contournement manuel décrit par le ticket : `_shared/dispatch-lib.sh` (T4) |
+| AC3 | R3 | `MIKA_DISABLE_BUNDLED_SKILLS`, que le ticket demande de laisser honoré tel quel |
+| AC4 | R4 | Le symptôme fondateur : la commande rend un compte-rendu que l'opérateur lit à faux |
+| AC5 | R5 | **Dépassement assumé**, dérivé de la lecture T5 : le ticket ne nomme pas `.manifest-writer`, il pose la question (« cette library est-elle à jour ? ») à laquelle le hash seul ne sait pas répondre |
+| AC6 | R6 | Verification contract du ticket, plus la correction T2 (la library est une projection du binaire) |
+| AC7 | R7 | « Un test automatique échoue si `update` retombe sur le symlink seul » |
+
+**Aucune exigence du ticket ne reste sans critère, et le seul critère qui dépasse
+le ticket est nommé comme tel.** C'est la forme du gap que la Acceptance-Criteria
+Gate cherche, et elle est vide dans les deux sens.
+
+Deux précisions d'honnêteté. (a) Cette confirmation s'appuie sur la transcription
+du corps du ticket faite en première passe de ce plan (§ *Le besoin*, T1–T5) : la
+session de révision n'a pas de jeton GitHub et n'a pas pu relire le corps. Un
+architecte de seconde passe, qui l'a sous les yeux, peut contredire une ligne de
+la table d'un mot. (b) **Écrire ces critères dans le corps du ticket est un geste
+GitHub, hors du périmètre content-only de cette révision** (`/mika-revise-plan`
+interdit `gh issue edit`) ; il appartient au pas de grooming qui attache le plan
+au ticket, s'il est jugé souhaitable.
+
+*Citation : review-guide.md § Acceptance-Criteria Gate (mika#1559).*
 
 - **AC1** — Partant d'une library dont le contenu d'un skill bundled diverge du
   manifeste du binaire, `mika skills --agent <a> update` rend le fichier résolu
@@ -324,18 +507,26 @@ critères ci-dessous sont dérivés des Requirements et du Verification contract
   `Settings`, aucune ré-interprétation locale de la variable n'est introduite.
   Attesté par V3 + revue.
 - **AC4** — La sortie de la commande nomme la library, le hash de manifeste, et
-  la version + le sha du binaire qui a écrit — de sorte qu'une resynchronisation
-  faite par un binaire périmé soit lisible comme telle.
+  la version + le sha du binaire qui a attesté l'état — de sorte qu'une
+  resynchronisation faite par un binaire périmé soit lisible comme telle.
 - **AC5** — `~/.mika/skills/.manifest-writer` existe après tout seed et porte
-  `version`, `git_hash`, `written_at`, `manifest_hash` ; un seed par un binaire
-  de version strictement inférieure à celle inscrite émet
-  `bundled_library_downgrade` (WARN) et procède. Attesté par V4.
+  `version`, `git_hash`, `attested_at`, `manifest_hash`, `extracted` ; il est
+  rafraîchi **y compris par une passe que la porte de hash court-circuite**, de
+  sorte qu'un binaire reconstruit sans changement de skill n'affiche jamais un
+  sha antérieur sur une library conforme ; un seed par un binaire de version
+  strictement inférieure à celle inscrite émet `bundled_library_downgrade` (WARN)
+  et procède. Attesté par V4.
 - **AC6** — `docs/skills.md` et la racine `CLAUDE.md` § `make deploy` énoncent
   que la library est une projection du binaire, que la chaîne de déploiement
   d'un prompt bundled passe par une reconstruction, et nomment
   `.manifest-writer` comme sonde.
-- **AC7** — Un retour de `update_skills` au seul `materialize_agent_skill_links`
-  fait échouer V1.
+- **AC7** — Le pouvoir discriminant de V1 est **mesuré, pas affirmé** : un appel
+  à `materialize_agent_skill_links` seule, sur la même library périmée, laisse le
+  contenu `STALE` en place des deux côtés. Attesté par V1.5, test distinct de V1.
+  *Corollaire, qui est la formulation initiale de ce critère :* un retour
+  d'`update_skills` au seul symlink fait donc échouer V1 — mais c'est une
+  conséquence de la mesure, plus une affirmation que V1 porterait sur lui-même
+  (F2).
 
 ---
 
@@ -355,6 +546,32 @@ critères ci-dessous sont dérivés des Requirements et du Verification contract
 - **R-c — Un prompt peut rester périmé pour une cause en amont** (découverte
   `build.rs`, extraction). V5 porte la halte correspondante : ne pas relancer
   `update` en boucle.
+- **R-d — La ligne de sortie change de texte, et rien dans le dépôt ne la lit.**
+  `Refreshed bundled-skill symlinks.` devient `Refreshed bundled-skill library
+  and symlinks.`. Recherche faite sur `*.rs`, `*.sh`, `*.md`, `Makefile`,
+  `.github/`, `scripts/` et `skills/` : **un seul producteur**
+  (`crates/mika-cli/src/commands/skills.rs:1443`) et **aucun consommateur** —
+  aucun script n'appelle `mika skills update` ni ne filtre sa sortie. La ligne
+  n'est lue que par un humain, ce qui est exactement le défaut que B3 corrige.
+  Répond à la vérification de compatibilité de format soulevée en première passe.
+- **R-e — Le sidecar rapporte le _dernier_ attesteur, pas le plus récemment
+  construit.** Écrire sur toute passe (B2) ferme le faux positif « sha ancien sur
+  library conforme » dans le cas nominal, mais l'ouvre dans un cas rare et
+  symétrique : un binaire `mika` périmé dont le manifeste de skills est identique
+  à celui du binaire courant passe la porte de hash, n'altère **aucun** contenu,
+  et inscrit pourtant son propre sha. La library reste juste, l'attestation
+  recule. La garde `bundled_library_downgrade` le dit dès que la *version*
+  diffère ; à version égale elle reste muette — c'est la même borne que R-a,
+  héritée du fait qu'aucun ordre total sur les builds n'existe côté CLI. Le
+  remède opérateur est celui de V5 : l'attestation se corrige en re-semant depuis
+  le binaire attendu, et le champ `extracted: false` dit que rien n'a été
+  réécrit entre-temps. **Ce n'est pas un échange de défaut mais une réduction :**
+  le cas fermé est le geste nominal (reconstruire, puis lire), le cas ouvert
+  demande un binaire périmé exécuté après le neuf, qui est déjà la situation que
+  R-a déclare non fermée.
+  Si un parseur hors dépôt existe, le changement lui apparaît comme un échec de
+  correspondance franc, pas comme un silence — la bonne direction pour un défaut
+  dont le sujet est précisément une phrase trop rassurante.
 
 ### Hors périmètre, délibérément
 
@@ -371,3 +588,83 @@ critères ci-dessous sont dérivés des Requirements et du Verification contract
   qui sème déjà la library sans rien dire.** B2 le rend lisible a posteriori via
   `.manifest-writer` ; décider si ces chemins doivent aussi *imprimer* quelque
   chose est une question de surface CLI, pas de ce défaut.
+
+---
+
+## Revision history
+
+- **rev 3 (2026-09-18)** — révision issue d'une relecture du code contre les
+  affirmations du plan. Les cinq lectures T1–T5 sont confirmées à la ligne près
+  (`skills.rs:1424-1443` n'appelle que `materialize_agent_skill_links` et
+  `skills::run` ne passe pas par `init_base_for_agent` ; `startup.rs:68` appelle
+  `seed_support_dirs` avant la garde `disabled` ; `all_bundled_skills` ne lit que
+  la constante compilée ; `server/mod.rs:486` et `init.rs:68` sont bien les deux
+  écrivains). **Un défaut de conception est en revanche apparu dans B2**, non
+  relevé en première passe :
+  - `seed_bundled_skill_library` **retourne tôt** quand `.manifest-hash`
+    correspond (`bundled_skills.rs:470-483`), et `compute_manifest_hash`
+    (`427-439`) ne hache que le contenu des skills. Écrire le sidecar uniquement
+    sur le chemin d'extraction aurait donc laissé un `git_hash` antérieur sur une
+    library parfaitement conforme dès que le PR déployé ne touche aucun prompt
+    bundled — **le symptôme du ticket retourné en faux positif**, sur
+    l'instrument même posé pour le clore.
+  - B2 écrit désormais le sidecar sur **toute** passe de seed, avec un champ
+    `extracted` distinguant extraction et confirmation, et `written_at` devient
+    `attested_at` (le fichier ne peut plus prétendre décrire une écriture).
+    Écriture atomique tmp + `rename`, au motif explicite des deux écrivains
+    concurrents de T3, sur le motif déjà employé par `marketplace.rs:87`,
+    `oauth.rs:285` et `well_known_agents.rs:681`.
+  - Propagé en B3 (« attested by », et le refus argumenté d'imprimer
+    `extracted`), R5, V4 (un cas de test dédié, seul à séparer la conception
+    retenue de la variante fautive), AC5 et la Definition of Done.
+  - **R-e** nomme la borne symétrique que ce choix ouvre — un binaire périmé au
+    manifeste identique fait *reculer* l'attestation sans rien dégrader — et
+    pourquoi c'est une réduction du défaut plutôt qu'un échange (le cas fermé est
+    le geste nominal, le cas ouvert est déjà couvert par la non-fermeture
+    déclarée en R-a).
+  - Aucun critère d'acceptation n'est affaibli ; AC5 est renforcé d'une clause.
+- **rev 2 (2026-09-18)** — révision adressant la première passe architecte
+  (`Disposition: ITERATE`, findings F1–F3, sharpening S1 + vérification de
+  compatibilité de format).
+  - **F1 adressé** par l'ajout d'une section `## Fire-Disposition` qui traite
+    séparément les deux populations de détecteurs : option (a) à allowlist vide
+    pour V1–V4/V1.5 (montage intégralement en home temporaire, donc aucune
+    violation pré-existante possible) avec l'engagement de nommage + suivi +
+    assertion auto-nettoyante si l'implémentation en découvre une, et un refus
+    argumenté de l'option (b) ; puis la disposition « avertir et procéder » de
+    `bundled_library_downgrade`, seul détecteur tirant sur des données de
+    production, avec ses deux bornes de population (le sidecar absent au
+    déploiement ne peut pas tirer ; un sidecar illisible ne bloque pas).
+    Citation : review-guide.md § Fire-Disposition Gate (mika#1574).
+  - **S1 adressé dans le même mouvement** : l'émission du WARN y est documentée
+    comme portant la « donnée spécifique » exigée par l'option (a), via
+    l'événement plutôt qu'une entrée d'allowlist faute de population à exempter.
+  - **F2 adressé** par la branche « test négatif séparé » que le finding laissait
+    au choix : ajout de **V1.5**, qui appelle `materialize_agent_skill_links`
+    seule sur la library périmée et asserte la survie de `STALE`. AC7 est
+    reformulé pour porter cette mesure au lieu d'une affirmation de V1 sur
+    lui-même, l'énoncé initial devenant un corollaire explicite. Le paragraphe
+    correspondant de V1 est ajusté (« pas de scan de source » plutôt que « pas de
+    garde structurelle ») et le cas où V1.5 rougit légitimement — si
+    `materialize_agent_skill_links` apprenait à réécrire le contenu — est écrit
+    comme le seul signal possible de la perte du pouvoir discriminant, pour qu'il
+    ne soit pas « réparé » par suppression. Citations : review-guide.md § YAGNI,
+    § Single Responsibility.
+  - **F3 adressé** par la première branche du finding : la dérive de gabarit du
+    corps du ticket est **confirmée acceptée, sans gap fonctionnel**, et la
+    confirmation est rendue vérifiable par une table de traçabilité AC →
+    exigence du plan → origine dans le ticket. AC5 y est nommé comme le seul
+    dépassement assumé. Deux précisions d'honnêteté accompagnent la table : la
+    session de révision n'a pas de jeton GitHub et s'appuie sur la transcription
+    de première passe (contredisible d'un mot en seconde passe), et l'écriture
+    des AC dans le corps du ticket est un geste GitHub hors du périmètre
+    content-only de `/mika-revise-plan`. Citation : review-guide.md §
+    Acceptance-Criteria Gate (mika#1559).
+  - **Vérification de compatibilité de format adressée** par le risque **R-d** :
+    recherche faite sur le dépôt (`*.rs`, `*.sh`, `*.md`, `Makefile`, `.github/`,
+    `scripts/`, `skills/`) — un seul producteur de la ligne `Refreshed
+    bundled-skill symlinks.` (`skills.rs:1443`) et **aucun consommateur**, aucun
+    script n'appelant `mika skills update` ni ne filtrant sa sortie.
+  - Cohérence : la Definition of Done nomme désormais V1.5.
+  - Aucun critère d'acceptation n'a été affaibli ; AC7 est renforcé (une mesure
+    remplace une affirmation) et aucun autre n'a changé de portée.
