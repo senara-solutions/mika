@@ -449,6 +449,13 @@ _BODILESS_STATUSES = frozenset({204, 304})
 # uses `bytes.isdigit()`, which is exactly `^[0-9]+$` on a byte string.
 _CHUNK_SIZE_RE = re.compile(rb"^[0-9A-Fa-f]{1,15}$", re.ASCII)
 
+# Bound on ONE chunk-size or trailer line pathologically split across many small
+# reads. It borrows `RESPONSE_HEAD_CAP`'s magnitude — 64 KiB is ample for any
+# legitimate line — but it is a distinct cap with a distinct meaning: that one
+# bounds the whole response HEAD, this one bounds a single line inside the BODY.
+# Named apart so retuning either cannot silently retune the other.
+_CHUNK_LINE_CAP = RESPONSE_HEAD_CAP
+
 
 def _header_values(head: bytes, name: str) -> list[bytes]:
     """Every value of `name` in a response head, in upstream order.
@@ -558,7 +565,7 @@ class _ChunkedDecoder:
     _DATA_CRLF = "data-crlf"
     _TRAILERS = "trailers"
 
-    def __init__(self, cap: int = RESPONSE_HEAD_CAP) -> None:
+    def __init__(self, cap: int = _CHUNK_LINE_CAP) -> None:
         self._buf = bytearray()
         self._cap = cap
         self._state = self._SIZE
