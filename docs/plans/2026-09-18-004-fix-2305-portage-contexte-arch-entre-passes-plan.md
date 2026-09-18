@@ -26,7 +26,9 @@ pilote ». Ce plan ne change aucun comportement de produit. Il tranche la questi
 
 ## Ce qui est établi, et comment le vérifier
 
-Quatre faits lus dans le code, chacun vérifiable par une commande.
+Quatre faits lus dans le code, chacun vérifiable par une commande. **Les numéros de ligne
+sont relevés sur `main` au 2026-09-18** et périment ; ce sont des aides à la relecture, et
+c'est la commande de vérification donnée sous chaque fait qui fait foi — pas le nombre.
 
 ### E1 — `--session-id` est explicite et délibéré. La prémisse du ticket est fausse sur son axe nommé
 
@@ -252,6 +254,15 @@ portage est ici la **condition de correction** du mécanisme, pas sa contaminati
 - **Ungated** : `context_window_assembled` l'est déjà ; c'est un événement de
   configuration de fenêtre et il doit rester lisible quand la télémétrie d'appel est
   coupée.
+- **Coût connu d'avance, pour qu'il ne soit pas découvert :** `build_context_window_fields`
+  est une fonction **pure à cinq paramètres**, appelée par au moins trois tests existants
+  (`mika2295_distinct_sessions_is_the_cross_ticket_contamination_detector` et voisins,
+  `agent_loop/mod.rs` ~l. 13853, 13865, 13924, 14050). Le sixième paramètre les casse tous
+  — mécaniquement, pas sémantiquement. Le passer **au site d'émission** plutôt qu'au
+  constructeur éviterait ces retouches, et c'est précisément pourquoi on ne le fait pas :
+  le `match` exhaustif de T4 doit vivre dans la fonction pure, seul endroit où il est
+  assertable sans souscripteur `tracing`. La retouche des call-sites est le prix de la
+  testabilité, payé sciemment.
 
 ### V2 — garde comportemental au site de production (D3)
 
@@ -267,6 +278,17 @@ et de la désérialisation. Motif maison (`mika2205_periodic_scans_do_not_read_t
 `grooming_marker::tests::no_grooming_regex_outside_this_module`) : un deuxième lecteur ne
 rendrait aucune décision fausse, il ferait diverger deux réponses à une même question —
 la classe que `grooming_marker` a dû engraver une fois.
+
+**Le périmètre du scan est la partie difficile, et l'écrire ici évite le réflexe qui le
+viderait.** `HistoryScope::Session` / `HistoryScope::Agent` apparaissent aujourd'hui à sept
+endroits légitimes qui ne sont **pas** des lecteurs : trois assertions d'égalité dans
+`well_known_agents.rs` (l. 1672, 1765, 1777) et quatre dans `prompt.rs` (l. 4241, 4258,
+4263, 4297) — toutes sous `#[cfg(test)]`. Un scan qui refuserait « toute mention » rougirait
+donc **immédiatement sur du code sain**, et la réparation naturelle serait de l'élargir
+jusqu'à ce qu'il n'attrape plus rien. Le prédicat porte sur la **construction `match`**, pas
+sur le nom du type, et exclut les modules de test. Contrôle de bonne foi obligatoire : le
+scan doit rougir sur un `match` décisionnel ajouté ailleurs — sans quoi il est vert parce
+qu'il ne regarde rien, ce qui est la panne que T2 rend visible sur l'autre axe.
 
 ### V4 — documentation
 
@@ -291,7 +313,8 @@ mika#2327 n'avait pas et qui lui a coûté trois semaines d'inertie.
 | T2 | **contrôle négatif** : `scope = agent`, mêmes données → la fenêtre contient les deux | T1 passait parce que `rebuild_context` ne rendait rien |
 | T3 | `context_window_assembled` porte `history_scope`, valeur conforme au scope résolu | l'instrument redevient incapable de séparer les deux causes de `distinct_sessions > 1` |
 | T4 | `match` exhaustif sur `HistoryScope` (pas de `_ =>`) au constructeur de champs | une variante future hérite silencieusement d'une étiquette fausse |
-| T5 | scan de source : un seul lecteur du scope hors désérialisation | un second lecteur diverge sans rien casser de visible |
+| T5 | scan de source : un seul `match` décisionnel sur `HistoryScope` hors désérialisation, **modules de test exclus** | un second lecteur diverge sans rien casser de visible |
+| T5b | **contrôle de bonne foi de T5** : un `match` décisionnel ajouté hors du site de production le fait rougir | T5 est vert parce que son prédicat ne regarde rien |
 | T6 | mika-arch : `scope = Session` **et** `context.history` ∈ `CODE_OWNED_IDENTITY_SECTIONS` (tests existants, inchangés) | retour de la classe mika#2330 (ship inerte) |
 | T7 | `_arch_ask` passe `--session-id` ssl `$3` non vide ; `_iterate_groom_loop` ne le passe pas en 1ʳᵉ passe et le passe en 2ᵉ et au retry (`test-dispatch-lib.sh`) | le contrat E1 dérive sans que personne le remarque |
 | T8 | `cargo clippy -D warnings` + suite verte | — |
