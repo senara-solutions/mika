@@ -313,6 +313,17 @@ async fn test_send_message_gateway_failure_surfaces_error() {
         .responses(vec![
             tool_call_response("send_message", json!({"text": "Sprint started"})),
             text_response("I tried to send the message but delivery failed."),
+            // mika#2136: the `unacknowledged_send_failure` guard (6f) refuses
+            // this turn's first close and re-prompts, so a third response is
+            // owed. It refuses even though the scripted text DOES admit the
+            // failure — and that is the accepted cost of D4, written down here
+            // because this test is its first concrete instance: the guard makes
+            // no attempt to recognize an admission in the text. Reading one
+            // would mean a lexicon that re-prompts every agent telling the truth
+            // in unexpected words, and waves through the one case the ticket is
+            // made of. The only satisfaction is structural — the content left,
+            // or the budget is spent.
+            text_response("I tried to send the message but delivery failed."),
         ])
         .message_sender(sender)
         .build()

@@ -1318,7 +1318,14 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
          GOOD: Build tool returns \"Compilation succeeded\" → you say \"The build passed.\"\n  \
          GOOD: run_gh posts a comment → you report the URL from the tool result.\n  \
          If you need downstream status, call the appropriate tool (e.g., check_task, \
-         query_timeline) to verify it first.\n",
+         query_timeline) to verify it first.\n  \
+         This covers message delivery too (mika#2136): an errored send_message result \
+         means the user received NOTHING. Never announce a delivery a tool refused, and \
+         when you send content in parts, name the part that failed before moving on to \
+         the next one.\n  \
+         BAD: send_message returns \"too long\" → you say \"Here it is in full 👆\"\n  \
+         GOOD: send_message returns \"too long\" → you say it is too long to send at once, \
+         then send it split into parts.\n",
     );
     prompt.push_str(
         "- **Confirmation before action:** When the user asks an informational or status question \

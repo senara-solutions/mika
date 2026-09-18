@@ -461,6 +461,8 @@ mod tests {
                 usage: None,
                 // Fixture replaying a recorded response: the turn concluded.
                 deadline_exceeded: None,
+                // …and delivered whatever it sent (mika#2136).
+                undelivered_sends: None,
             },
             llm_calls: vec![],
             tool_calls,

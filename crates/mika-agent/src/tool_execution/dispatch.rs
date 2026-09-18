@@ -128,6 +128,14 @@ pub(crate) async fn process_tool_calls(
     // A2A `message/send`, and gateway `/message`; `Some` for A2A
     // `message/stream`. See docstring above for emission semantics.
     stream_ctx: Option<&Arc<mika_a2a::streaming::ToolCallStreamContext>>,
+    // mika#2136 — the turn's delivery sequence, in call order, accumulated
+    // across steps. Travels by `&mut` rather than in `LoopResult`: that enum has
+    // three variants each carrying a `Vec<ToolCallSummary>`, so a field would be
+    // three writes to keep in sync, and the `&mut` gives the `MaxStepsExceeded`
+    // / `DeadlineExceeded` exits their coverage for free — a turn cut off by its
+    // envelope after a dead send owes the same admission as one that concludes.
+    // Never persisted, never serialized; it dies with the turn.
+    delivery_log: &mut Vec<crate::evidence::guards::DeliveryRecord>,
 ) -> Vec<ToolCallSummary> {
     let mut tool_results: Vec<LlmContentBlock> = Vec::new();
     let mut summaries = Vec::new();
@@ -194,7 +202,7 @@ pub(crate) async fn process_tool_calls(
                 name.clone(),
                 serde_json::to_string(arguments).unwrap_or_default(),
             );
-            let output = if let Some(cached) = dedup_cache.get(&dedup_key) {
+            let mut output = if let Some(cached) = dedup_cache.get(&dedup_key) {
                 warn!(
                     trace_id = %tool_ctx.trace_id,
                     tool = %name,
@@ -210,6 +218,15 @@ pub(crate) async fn process_tool_calls(
                 // duplicate tool_use id still gets a meaningful pair.
                 let mut reused = cached.clone();
                 reused.images.clear();
+                // mika#2136 — same reasoning, one field over: the delivery
+                // verdict belongs to the one execution that actually happened.
+                // Left on the clone, a replayed duplicate would push a SECOND
+                // `DeliveryRecord` for a tool that ran once. The guard predicate
+                // would stay correct (a duplicated `Failed` is still a `Failed`),
+                // but `failed_count` would say two dead fragments where there is
+                // one, and the line the engine writes to the user would be wrong
+                // about the number.
+                reused.delivery = None;
                 reused
             } else {
                 debug!(tool = %name, "executing tool");
@@ -361,6 +378,30 @@ pub(crate) async fn process_tool_calls(
                 dedup_cache.insert(dedup_key, output.clone());
                 output
             };
+
+            // mika#2136 — record what became of a user-facing message, so the
+            // EndTurn guard can refuse a turn that closes over an unrepaired
+            // delivery failure. The text is TAKEN FROM THE VERDICT and never
+            // re-read from `arguments`: the raw argument is a different register
+            // (the tool measures and sends `cleaned`), it is truncated to 200
+            // chars at the only site that captures it, and it is never captured
+            // at all on a failed send — so a record built from it would be wrong
+            // in three directions at once (E9). Full text, no truncation: the
+            // repair predicate is an equality, and a shared prefix between two
+            // fragments would read as a repair that did not happen.
+            //
+            // The boundary suppression above pushes nothing, and needs no
+            // gesture: its `continue` precedes `execute`, so no verdict exists.
+            // Do not "fix" that by synthesizing a record — a suppressed send did
+            // not fail to deliver, it was never attempted, and counting it would
+            // make `failed_count` lie about what the user did not read.
+            if let Some(verdict) = output.delivery.take() {
+                delivery_log.push(crate::evidence::guards::DeliveryRecord {
+                    step,
+                    text: verdict.text,
+                    outcome: verdict.outcome,
+                });
+            }
 
             let image_count = output.images.len();
             let content = if output.images.is_empty() {
