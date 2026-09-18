@@ -154,14 +154,39 @@ fragments partageant leur début — et la direction de l'erreur est mauvaise : 
 réparé un fragment mort, donc on se tairait. C'est exactement le silence dont le ticket est
 né. D'où D2.
 
-### E9 — `dispatch.rs` ne voit que le texte **brut**, jamais celui qui part
+### E9 — `dispatch.rs` ne capte aucun texte utilisable, et **jamais sur un échec**
 
-`dispatch.rs:358` lit `arguments.get("text")` — la valeur telle que le LLM l'a émise. Mais
-`send_message` travaille sur `cleaned = strip_internal_tags(text)` (`:48`), et ce `cleaned`
-est **ce que la garde de longueur mesure** (`:57`, `text_len_utf16(&cleaned)`) **et ce que le
-sender envoie** (`:85`, `sender.send(&cleaned)`). Les deux registres ne coïncident pas : le
-commentaire du code dit que le strip existe parce que le LLM *« may have echoed »* des tags
-internes, c'est-à-dire précisément une population où brut ≠ nettoyé.
+Le seul site où `dispatch.rs` touche au texte d'un envoi est `:354-358`, et il est inutilisable
+pour le prédicat de D3 pour **trois** raisons cumulées, dont la troisième est décisive :
+
+1. **Mauvais registre.** Il lit `arguments.get("text")` (`:355`) — la valeur telle que le LLM
+   l'a émise. Mais `send_message` travaille sur `cleaned = strip_internal_tags(text)` (`:48`),
+   et ce `cleaned` est **ce que la garde de longueur mesure** (`:57`,
+   `text_len_utf16(&cleaned)`) **et ce que le sender envoie** (`:85`, `sender.send(&cleaned)`).
+   Le commentaire du code dit que le strip existe parce que le LLM *« may have echoed »* des
+   tags internes — c'est-à-dire précisément une population où brut ≠ nettoyé.
+2. **Tronqué.** La valeur captée est `truncate_summary(text_val, 200)` (`:357`) : 200
+   caractères. Une égalité de texte sur ce préfixe a exactement le défaut d'E8, en pire.
+3. **Jamais posé sur un échec.** Le bloc entier est sous
+   `if name == "send_message" && tool_succeeded && conversation_mode` (`:350`), et il ne
+   s'exécute qu'`if send_message_text_capture.is_empty()` — donc au plus une fois par tour.
+   **Le texte d'un envoi échoué n'est capté nulle part aujourd'hui**, et celui du second envoi
+   d'un tour non plus.
+
+**Conséquence pour D2, et elle est plus forte que « préférable ».** Faire porter le texte par
+le verdict n'est pas le meilleur des chemins disponibles : c'est le **seul**. Aucun autre site
+ne détient le texte d'un envoi échoué, ni en entier, ni dans le registre qui a été mesuré puis
+envoyé. Un plan qui réutiliserait `send_message_text_capture` obtiendrait un prédicat faux dans
+les trois directions à la fois.
+
+**La direction de l'erreur, si on l'ignorait.** L'étage transport répare par égalité de texte.
+Un ré-essai ré-émettant le même contenu avec un tag interne en plus ou en moins donnerait deux
+bruts **différents** pour un seul `cleaned` : la réparation ne serait pas reconnue, le champ
+resterait `Some`, et **une annexe affirmant une perte partirait dans le canal utilisateur alors
+que le message est bien arrivé**. C'est le faux positif que la halte 4 de la sonde interdit de
+laisser vivre. La collision inverse (deux bruts distincts nettoyant vers un même `cleaned`)
+existe aussi, et elle penche du côté du silence. D'où la provenance imposée en D2 : le texte est
+posé par `send_message`, seul détenteur de `cleaned`, et n'est jamais relu depuis `arguments`.
 
 **Conséquence pour D3, et sa direction d'erreur.** L'étage transport répare par égalité de
 texte. Si le record portait le texte brut, un ré-essai ré-émettant le même contenu avec un tag
@@ -178,8 +203,9 @@ détenteur de `cleaned`, et n'est jamais relu depuis `arguments`.
 `dispatch.rs:156` : `if *send_message_boundary_active && name == "send_message" && conversation_mode`
 → `continue` **avant** `execute`, avec un `tool_result` `is_error: true`. Le boundary s'arme
 après le premier `send_message` **réussi** (`:350`, conditionné à `tool_succeeded`), et
-`agent_loop/mod.rs:3336` force en outre EndTurn au pas suivant. `conversation_mode` vaut
-`LoopMode::Conversation` seul (`:452`) — le mode d'Al.
+`agent_loop/mod.rs:3336` force en outre EndTurn au pas suivant. `conversation_mode` n'est pas
+calculé dans `dispatch.rs` : c'est un **paramètre** (`:125`), alimenté par `mode.is_conversation()`
+aux deux sites d'appel d'`agent_loop` — le mode d'Al.
 
 Trois conséquences, toutes portantes :
 
@@ -240,9 +266,11 @@ pub enum DeliveryOutcome {
 ```
 
 **Le texte voyage avec le verdict, et c'est une décision, pas un détail de portage.**
-`dispatch.rs` n'a accès qu'au texte brut ; la garde mesure et le sender envoie `cleaned`
-(E9). Faire porter le texte par le verdict est le seul moyen d'obtenir dans le prédicat le
-registre qui a effectivement été livré ou refusé. Le coût est nul en surface — c'est le même
+`dispatch.rs` ne détient, sur un envoi **échoué**, aucun texte du tout : son unique site de
+capture est sous `tool_succeeded` et tronqué à 200 caractères (E9). Faire porter le texte par
+le verdict n'est donc pas le meilleur chemin disponible, c'est le **seul** : `send_message` est
+le seul détenteur de `cleaned`, c'est-à-dire du registre qui a effectivement été mesuré, refusé
+ou envoyé. Le coût est nul en surface — c'est le même
 `String` qu'il fallait cloner de toute façon (D7) — et son absence coûterait une annexe fausse
 dans le canal utilisateur, c'est-à-dire le dégât qu'on répare, retourné.
 
@@ -493,7 +521,7 @@ non un affaiblissement du scénario.
   tenté, et le compter ferait mentir `failed_count` sur le nombre lu par l'utilisateur.
 - Interaction avec le dedup per-tour (#582) : **le mécanisme existe déjà et se réemploie tel
   quel**. Le chemin de replay clone le `ToolOutput` caché puis efface ce qui ne doit pas être
-  ré-émis (`reused.images.clear()`, `:207-213`, avec sa raison écrite) ; `delivery` rejoint
+  ré-émis (`reused.images.clear()`, `:211-212`, avec sa raison écrite) ; `delivery` rejoint
   cette liste — `reused.delivery = None`. Sans ce geste, le clone porterait le `delivery` de
   l'appel d'origine et pousserait un **second** `DeliveryRecord` pour un outil qui n'a tourné
   qu'une fois : le prédicat de D3 resterait juste (un `Failed` dupliqué reste un `Failed`),
