@@ -107,6 +107,34 @@ Telegram, la perte est totale et silencieuse.**
 C'est exactement le mode de panne que mika#2126 refusait d'ouvrir. Toute la conception
 ci-dessous est organisée autour de son élimination.
 
+### F8 — Le gateway n'a aucun champ `bool` dans ses réglages, et c'est une décision
+
+`GatewaySettings::load` (`settings.rs:162-180`) désérialise l'environnement par config-rs.
+Les deux drapeaux booléens du crate — `telegram_single_bot_mode` (`settings.rs:30`) et
+`orchestrator_inbox_enabled` (`settings.rs:85`) — sont `Option<String>`, analysés par une
+fonction libre testée à part (`:389`, `:403`). Un `bool` ferait de toute valeur
+non-booléenne une erreur **dure** de `load()`. Ce fait décide la forme du kill-switch
+(Décision 5) et il est la raison pour laquelle la première rédaction de ce plan, qui
+prescrivait `telegram_html_render: bool`, était infaisable avec son propre contrôle C3.
+
+### F9 — Le préfixe `[agent] ` traverse le rendu, et il porte le routage des réponses
+
+`routes.rs:2165` compose `format!("[{name}] {text}")` **avant** l'appel à `send_message`.
+Le préfixe entre donc dans `send_message_impl` comme du texte ordinaire et traversera le
+tokenizer. Ce n'est pas cosmétique : `resolve_reply_agent` (`routes.rs:2470-2484`) relit ce
+préfixe **sur le texte du message cité** via `parse_agent_prefix` (`telegram.rs:145-158`),
+qui exige littéralement `text.strip_prefix('[')` puis `split_once("] ")`, pour router la
+réponse de l'utilisateur vers le bon agent.
+
+La grammaire actuelle du reconnaisseur laisse ce préfixe intact — `[mika-dev]` n'est pas
+suivi d'une `(`, donc `parse_markdown_link` rend `None` et le segment reste `Plain` ; les
+noms d'agent sont `[a-z0-9-]`, donc aucun `_` ni `*` n'y est délimiteur. **La propriété est
+vraie aujourd'hui et n'est gardée par aucun test.** Un élargissement ultérieur du
+reconnaisseur la casserait en silence. Portée exacte de la casse, à dire honnêtement : la
+route **primaire** serait perdue et le repli DB sur `telegram_message_id`
+(`routes.rs:2487-2493`) continuerait de router — donc une dégradation, pas une panne, et
+c'est précisément la forme qui ne se remarque pas. D'où le contrôle négatif N13.
+
 ---
 
 ## Les décisions
@@ -217,6 +245,32 @@ plus tard.
 absent/vide → défaut ; illisible → défaut + WARN nommant la valeur **entre guillemets**
 (mika#2220 : sans les guillemets, une espace parasite est invisible) ; `0` / `false` /
 `off` / `no` (insensible à la casse) → désarmé.
+
+**Le type du champ n'est pas `bool`, et ce n'est pas un détail de style (F8).**
+`GatewaySettings::load` désérialise l'environnement par config-rs
+(`Environment::with_prefix("MIKA")` + `try_deserialize()`, `settings.rs:162-180`). Un
+champ `bool` recevant `"plif"` fait donc échouer `load()` — le gateway **refuse de
+démarrer**, sur un message d'erreur générique qui renvoie vers `mika setup` sans nommer
+la variable fautive. Deux conséquences : C3 (« illisible → armé + WARN ») serait
+**inécrivable**, et un typo dans une variable p2 cosmétique coucherait tout le trafic
+Telegram. C'est le mode de panne que le `CLAUDE.md` racine documente déjà pour
+`MIKA_LOG_LLM_BODIES` côté spirit — « config-rs makes it a hard `Settings::load` error
+(mika-spirit refuses to boot) » — et qu'on ne rejoue pas ici, parce que l'arbitrage n'est
+pas le même : refuser de démarrer sur un budget LLM invalide protège d'un agent muet,
+refuser de démarrer sur un drapeau de rendu protège de rien.
+
+Le crate a déjà tranché cette classe, deux fois : **aucun champ `bool` dans
+`GatewaySettings`**. `telegram_single_bot_mode` et `orchestrator_inbox_enabled` sont tous
+deux `Option<String>` (`settings.rs:30,85`), analysés par une fonction libre testée à part
+(`telegram_single_bot_mode_is_enabled:389`, `orchestrator_inbox_is_enabled:403`). Ce plan
+suit la convention : `Option<String>` + `telegram_html_render_is_enabled(raw: Option<&str>)`.
+
+**Mais la polarité est inversée par rapport à ses deux voisines, et le nom doit le dire.**
+Les deux existantes rendent `false` sur `None` et absorbent toute valeur inconnue en
+`false`, **sans WARN**. Celle-ci rend `true` sur `None` *et* sur valeur inconnue, avec un
+WARN sur le second cas. Copier le corps d'une voisine donnerait donc un kill-switch
+désarmé par défaut — l'inverse exact de la Décision. Le doc-comment de la fonction pose la
+polarité en première ligne, et C1/C3 la gèlent chacune pour elle-même.
 
 **Armé par défaut**, contrairement à la prudence réflexe, et pour une raison mesurée
 ailleurs : mika#2272 a dû constater qu'un détecteur livré désarmé derrière une
@@ -367,8 +421,12 @@ rendrait la prochaine tentative de passage à MarkdownV2 aussi coûteuse qu'avan
 
 ### Brique 4 — réglage + documentation
 
-- `crates/mika-gateway/src/settings.rs` : champ `telegram_html_render: bool`, défaut
-  `true`, analyse trois paliers.
+- `crates/mika-gateway/src/settings.rs` : champ
+  `telegram_html_render: Option<String>` (`#[serde(default)]`) **et non `bool`** (F8,
+  Décision 5) + fonction libre `telegram_html_render_is_enabled(raw: Option<&str>) -> bool`,
+  au modèle exact de ses deux voisines `:389` / `:403`, mais de polarité inverse et
+  documentée comme telle. Ajouter aussi le champ au `Debug` manuel (`settings.rs:299-322`),
+  qui énumère les champs un à un : un champ omis y devient invisible au diagnostic.
 - `crates/mika-gateway/src/main.rs` : initialisation unique du `OnceLock` après
   `Settings::load`.
 - `.env.example` : la variable, son défaut, son sens.
@@ -391,7 +449,7 @@ rendrait la prochaine tentative de passage à MarkdownV2 aussi coûteuse qu'avan
 | 1 | `crates/mika-gateway/src/telegram_markdown.rs` | **neuf** — `Segment`, `tokenize`, `render_plain`, `render_html`, `html_render_enabled()`, `init_html_render()`, `#[cfg(test)] mod tests` |
 | 2 | `crates/mika-gateway/src/main.rs` | `mod telegram_markdown;` + initialisation du `OnceLock` |
 | 3 | `crates/mika-gateway/src/telegram.rs` | `SendMessagePayload.parse_mode` ; doc-comment réécrit ; `send_message_impl` : tokenize + deux rendus + repli ; **`strip_markdown_around_urls` et ses quatre auxiliaires inchangés** ; commentaire de portée sur le test F4 + test frère pipeline |
-| 4 | `crates/mika-gateway/src/settings.rs` | champ `telegram_html_render` |
+| 4 | `crates/mika-gateway/src/settings.rs` | champ `telegram_html_render: Option<String>` (**pas `bool`**, F8) + `telegram_html_render_is_enabled()` + entrée dans le `Debug` manuel |
 | 5 | `.env.example` | la variable |
 | 6 | `crates/mika-gateway/CLAUDE.md` | § « Rendu du texte sortant » |
 | 7 | `CLAUDE.md` (racine) | la variable dans la liste |
@@ -443,6 +501,19 @@ Chacun asserte `render_plain(tokenize(x)) == x`, pas « a l'air correct ».
 | N10 | `Éh 🌸 https://example.com/été — ça va ?` | aucune indexation d'octets brute (KTD6) |
 | N11 | `[x](https://example.com/a b)` | **grammaire de lien refusée** — `parse_markdown_link` rend `None` sur une URL portant une espace (gelé par `test_strip_markdown_link_with_space_in_url_unchanged`, `telegram.rs:1909`). `tokenize` doit alors laisser le texte `Plain`, **dans les deux rendus** : un `<a href>` posé sur une forme que la grammaire a refusée serait un lien que le reconnaisseur aurait inventé. |
 
+**N13 — le préfixe d'agent survit au rendu, dans les deux modes** (F9). Entrée
+`[mika-dev] C'est **important** de le savoir.` L'assertion n'est pas « ça a l'air bon » :
+`render_plain(tokenize(x))` **et** `render_html(tokenize(x))` commencent tous deux par la
+chaîne exacte `[mika-dev] `, et `parse_agent_prefix` appliqué à chacune des deux sorties
+rend `Some("mika-dev")`. Le contrôle passe par la fonction réelle, pas par une égalité de
+préfixe réécrite à la main, parce que c'est sa grammaire à elle — `strip_prefix('[')` puis
+`split_once("] ")` — qui décide du routage.
+
+Ce test gèle une propriété **déjà vraie**, ce qui est tout son intérêt : il n'attrape rien
+aujourd'hui et rougira le jour où quelqu'un élargira le reconnaisseur à `[texte]` nu. Sans
+lui, cet élargissement ferait tomber la route primaire de `resolve_reply_agent` sur son
+repli DB, c'est-à-dire dégraderait le routage des réponses sans rien casser de visible.
+
 **N12 — le contrôle porte sur ce qui part, pas sur une fonction intermédiaire.** Les dix
 premiers négatifs asserted `render_plain(tokenize(x)) == x`, mais le chemin plat émet
 `strip_markdown_around_urls(render_plain(tokenize(x)))`. Tant que le contrôle s'arrête
@@ -476,12 +547,16 @@ d'utilisateur relayé par l'agent pourrait poser des entités Telegram arbitrair
 
 ### Réglage
 
+Sur `telegram_html_render_is_enabled`, dans `settings.rs`, au modèle des tests existants
+de ses deux voisines (`settings.rs:533-599`).
+
 | # | Assertion |
 |---|---|
-| C1 | absent / vide → armé |
-| C2 | `0`, `false`, `FALSE`, `off`, `no` → désarmé |
-| C3 | `plif` → armé + WARN nommant `"plif"` **entre guillemets** |
+| C1 | absent / vide → armé. **Gèle la polarité inverse de celle des deux voisines** (F8) : un corps copié de `orchestrator_inbox_is_enabled` rend `false` ici et fait rougir ce test. |
+| C2 | `0`, `false`, `FALSE`, `off`, `no` → désarmé ; espaces autour tolérés (`" 0 "`, `"\tfalse\n"`), comme `:598-599` |
+| C3 | `plif` → **armé** + WARN nommant `"plif"` **entre guillemets**. Une valeur inconnue penche vers le défaut armé, non vers le désarmement : un typo ne doit pas éteindre silencieusement le rendu. |
 | C4 | jamais initialisé (binaire de test) → armé, sans panic |
+| C5 | **`GatewaySettings::load` ne peut pas échouer sur ce champ.** Une valeur arbitraire (`"plif"`) se désérialise sans erreur — c'est la propriété que `Option<String>` achète et qu'un `bool` perdrait (F8). Sans ce test, la régression `Option<String>` → `bool` passerait la revue : elle ne rendrait aucune sortie fausse, elle rendrait le gateway **non démarrable** sur un typo, et C1–C4 resteraient tous verts puisqu'ils portent sur la fonction, pas sur la désérialisation. |
 
 ### Non-régression mika#2126 — `telegram.rs`
 
@@ -538,7 +613,12 @@ churn — le journal suffit pour une population attendue vide.
 4. **Contrôle négatif.** Un message sans aucun markdown (accusé de réception, message
    système de `routes.rs`) doit arriver **inchangé**. S'il change, le reconnaisseur
    sur-interprète et c'est la classe AC3 que mika#2126 a payée une fois.
-5. **Halte explicite.** Si le markdown brut **réapparaît** alors que
+5. **Le routage des réponses, une fois.** Répondre dans Telegram à un message préfixé
+   `[mika-dev] ` et vérifier que la réponse atteint bien `mika-dev`. La route primaire
+   lit le préfixe dans le texte cité (F9) et son échec est masqué par le repli DB : sans
+   cette vérification manuelle, une dégradation du routage ressemblerait trait pour trait
+   à un routage sain.
+6. **Halte explicite.** Si le markdown brut **réapparaît** alors que
    `telegram_html_render_fallback` est vide : ne pas élargir le reconnaisseur. Cela
    signifie que le texte est parti par un chemin qui ne traverse pas
    `send_message_impl` — et établir lequel passe avant toute correction. F3 dit qu'il
@@ -599,6 +679,8 @@ churn — le journal suffit pour une population attendue vide.
 | 5 | Divergence entre les deux rendus | Le désarmement emprunterait un chemin non testé | Un seul reconnaisseur (Décision 4) ; S1 asserte l'identité repli/désarmé |
 | 6 | Régression de mika#2126 | Liens cassés, déjà payés une fois | `strip_markdown_around_urls` inchangée + conservée en second passage (chemin plat) ; **R5 pour le chemin HTML, qui ne la traverse pas** ; R1–R4 |
 | 7 | Le `OnceLock` global | Odeur architecturale | Assumée et nommée (Décision 5) ; achetée contre la propriété « le kill-switch éteint tout le circuit » |
+| 9 | **Le réglage est typé `bool`** et un typo empêche le gateway de démarrer | Tout le trafic Telegram, sur une variable p2 cosmétique | F8 ; `Option<String>` + fonction libre, convention du crate ; **C5** épingle la désérialisation elle-même, que C1–C4 ne voient pas |
+| 10 | **Le préfixe `[agent] ` est mangé par le reconnaisseur** | Route primaire de `resolve_reply_agent` ; dégradation silencieuse, repli DB survit | F9 ; **N13** gèle la propriété dans les deux rendus, via `parse_agent_prefix` elle-même |
 | 8 | La sémantique de longueur 4096 est autre que supposée | Un long message en HTML prendrait un 400 | Le repli couvre ; vérification explicite à l'implémentation ; le texte plat est toujours plus court que l'entrée |
 
 ---
@@ -615,7 +697,7 @@ code neuf.
 |---|---|---|---|
 | D1 | Chemin de repli 400 → texte plat (Brique 2) | **Non vide** — tout message sortant après déploiement | **(a) Auto-remédiation silencieuse**, détail ci-dessous |
 | D2 | Garde structurelle S3 (`unwrap` / `panic!` / indexation d'octets dans `telegram_markdown.rs`) | **Vide par construction** — le fichier n'existe pas avant ce ticket | Sans objet, zéro exception, **pas d'allowlist** |
-| D3 | Contrôles négatifs N1–N12, positifs P1–P9, échappement H1–H4, non-régression R5 | **Vide** — les fixtures sont écrites par ce ticket | Sans objet, zéro exception |
+| D3 | Contrôles négatifs N1–N13, positifs P1–P9, échappement H1–H4, non-régression R5 | **Vide** — les fixtures sont écrites par ce ticket | Sans objet, zéro exception |
 | D4 | WARN de valeur illisible du kill-switch (C3) | **Vide** — la variable n'existe pas avant ce ticket | Sans objet |
 
 ### D1 — option (a), et pourquoi le silence est ici le bon choix
@@ -665,12 +747,15 @@ rendu » comme un oubli.
    le texte plat sans `parse_mode`, et ne replie que sur 400.
 4. `strip_markdown_around_urls` et ses quatre auxiliaires sont **inchangés** et
    conservés en second passage du rendu plat ; leurs 25 tests sont verts.
-5. `MIKA_TELEGRAM_HTML_RENDER` : `Settings`, analyse trois paliers, défaut armé, lu une
-   fois au démarrage, documenté dans `.env.example` et les deux `CLAUDE.md`.
+5. `MIKA_TELEGRAM_HTML_RENDER` : champ `Option<String>` (**jamais `bool`**, F8) +
+   `telegram_html_render_is_enabled()`, analyse trois paliers, défaut armé, entrée dans le
+   `Debug` manuel, lu une fois au démarrage, documenté dans `.env.example` et les deux
+   `CLAUDE.md`. `GatewaySettings::load` reste infaillible sur ce champ quelle que soit la
+   valeur posée.
 6. Les trois événements opérateur sont émis, sans jamais journaliser le corps d'un
    message.
-7. Tous les tests du contrat de vérification passent : P1–P9, N1–N12, H1–H4, S1–S3,
-   C1–C4, R1–R5.
+7. Tous les tests du contrat de vérification passent : P1–P9, N1–N13, H1–H4, S1–S3,
+   C1–C5, R1–R5.
 8. `cargo build`, `cargo test`, `cargo clippy` (zéro warning), `cargo fmt --check`
    verts sur le workspace.
 9. Aucune dépendance ajoutée ; `crates/mika-gateway/src/lib.rs` inchangé.
@@ -706,10 +791,14 @@ vérification.
   échappé, y compris dans `code`, `pre` et l'attribut `href`. `<b>déjà</b>` écrit par
   l'agent arrive **littéral**. Épinglé par H1–H4.
 
-- **AC5 — Le rendu est désarmable sans redéploiement.** `MIKA_TELEGRAM_HTML_RENDER=0`
-  restitue un chemin **octet-identique** à celui du repli. Analyse trois paliers ;
-  absent → armé ; illisible → armé + WARN nommant la valeur entre guillemets ; lu une
-  fois par process. Épinglé par C1–C4 et S1.
+- **AC5 — Le rendu est désarmable sans redéploiement, et aucune valeur ne peut empêcher
+  le gateway de démarrer.** `MIKA_TELEGRAM_HTML_RENDER=0` restitue un chemin
+  **octet-identique** à celui du repli. Analyse trois paliers ; absent → armé ; illisible
+  → armé + WARN nommant la valeur entre guillemets ; lu une fois par process. Le champ est
+  `Option<String>` et **jamais `bool`** : sous config-rs un `bool` ferait de toute valeur
+  non-booléenne une erreur dure de `GatewaySettings::load` (F8), ce qui rendrait ce
+  critère contradictoire avec lui-même. Épinglé par C1–C5 et S1 — **C5 séparément**,
+  puisqu'il porte sur la désérialisation et non sur la fonction d'analyse.
 
 - **AC6 — mika#2126 n'est pas rouvert.** Les cinq fonctions et les 25 tests de
   `strip_markdown_around_urls` sont inchangés et verts ; elle est conservée en second
@@ -743,12 +832,21 @@ vérification.
   400 non propagée) sont nommés hors périmètre avec ticket de suivi, et non corrigés
   ici.
 
+- **AC11 — Le routage des réponses n'est pas dégradé.** Un message préfixé
+  `[mika-dev] ` ressort des **deux** rendus en commençant par cette chaîne exacte, et
+  `parse_agent_prefix` appliqué à chacune des deux sorties rend toujours
+  `Some("mika-dev")`. La propriété est déjà vraie avant ce ticket (F9) ; elle devient
+  **gardée**, faute de quoi un élargissement ultérieur du reconnaisseur ferait tomber la
+  route primaire de `resolve_reply_agent` sur son repli DB — une dégradation qui ne casse
+  rien de visible. Épinglé par N13.
+
 ---
 
 ## Revision history
 
 | Date | Auteur | Changement |
 |---|---|---|
+| 2026-09-18 | dev-groom (mika#2291) | Re-groom idempotent. **Deux prescriptions du plan étaient infaisables ou non gardées contre le code réel, et l'une contredisait son propre contrat.** (1) **F8** — la Brique 4 posait `telegram_html_render: bool`. Or `GatewaySettings::load` désérialise par config-rs (`settings.rs:162-180`) et le crate ne contient **aucun** champ `bool` : ses deux drapeaux, `telegram_single_bot_mode` (`:30`) et `orchestrator_inbox_enabled` (`:85`), sont `Option<String>` + fonction libre testée (`:389`, `:403`). Un `bool` recevant `"plif"` fait échouer `load()` — le gateway **refuse de démarrer** sur un typo dans une variable p2 cosmétique, et C3 (« illisible → armé + WARN ») devenait littéralement inécrivable. Le champ passe à `Option<String>` + `telegram_html_render_is_enabled()`, **de polarité inverse à ses deux voisines** (armé sur `None`) — un corps copié d'une voisine donnerait un kill-switch désarmé par défaut, d'où C1 qui gèle la polarité et **C5** qui épingle la désérialisation elle-même, que C1–C4 ne peuvent pas voir puisqu'elles portent sur la fonction. Entrée ajoutée au `Debug` manuel (`:299-322`), qui énumère les champs un à un. (2) **F9** — `routes.rs:2165` compose `format!("[{name}] {text}")` **avant** l'envoi, donc le préfixe d'agent traverse le tokenizer, et `resolve_reply_agent` (`routes.rs:2470-2484`) le relit via `parse_agent_prefix` (`telegram.rs:145-158`, `strip_prefix('[')` + `split_once("] ")`) pour router les réponses. La grammaire actuelle le laisse intact — la propriété est donc **vraie et non gardée**, et sa casse future dégraderait le routage vers le repli DB sans rien rendre visible. **N13** la gèle dans les deux rendus, via `parse_agent_prefix` elle-même plutôt qu'une égalité de préfixe réécrite à la main, plus AC11 et une sonde manuelle. |
 | 2026-09-18 | dev-groom (mika#2291) | Re-groom idempotent. Les sept faits porteurs sont re-vérifiés exacts contre le code (25 tests `test_strip_markdown_*` lignes 1758–1922 ; `sendMessage` unique à `telegram.rs:619` ; `SendMessagePayload` à 332 ; `strip_markdown_around_urls` et ses quatre auxiliaires à 430/438/467/519/543 ; test gelé F4 à 1884 ; `routes.rs:2193` ne contrôle que `50_000` ; les 7 sites de construction non-test). **Une affirmation du plan était plus large que ce qu'il livre et a été corrigée** : « une régression du reconnaisseur ne peut pas rouvrir mika#2126 » ne vaut que pour le **chemin plat**, puisque la branche HTML — le mode par **défaut** — poste `render_html` sans repasser par `strip_markdown_around_urls`. La Brique 2 nomme désormais la portée exacte du filet, dit pourquoi la symétrie est écartée (l'auxiliaire réécrit `[label](url)` en `label : url` et détruirait le `Link` que `render_html` doit rendre en `<a href>`), et **R5** rejoue le corpus URL de mika#2126 contre `render_html` — le contrôle que R1 ne peut structurellement pas donner. Deux trous de contrat comblés au passage : **N11** (grammaire de lien refusée, `[x](https://example.com/a b)`, gelée par `telegram.rs:1909` — un `<a href>` posé sur une forme que `parse_markdown_link` a refusée serait un lien inventé) et **N12** (AC3 était posée sur `render_plain` seul alors que le chemin plat émet `strip_markdown_around_urls(render_plain(tokenize(x)))` — le contrôle s'arrêtait à une valeur que l'utilisateur ne reçoit jamais, et la seule composition capable de réécrire un message sain restait un angle mort). |
 | 2026-09-18 | dev-groom (mika#2291) | Re-groom idempotent. Recomptage de la population mika#2126 contre le code : **25** tests `test_strip_markdown_*` (lignes 1758–1922), pas 30 — le chiffre apparaissait six fois, dont dans la Definition of Done et dans AC6, où il rendait le critère invérifiable. R1 nomme désormais la commande qui le recompte. Les six autres faits porteurs sont re-vérifiés exacts contre le code : F1 (doc-comment `parse_mode` à `telegram.rs:312`), F3 (site `sendMessage` unique à `telegram.rs:619`), F4 (test gelé à `telegram.rs:1884`), F6 (aucun parser markdown au workspace), F7 (`handle_send` rend un 502 au corps vide par sa branche `Err(e)`, les branches `BadRequest` de `routes.rs:908/917` étant sur `download_image`, chemin distinct), et les 7 sites de construction non-test de la Décision 5. La garde miroir 4096 est bien absente (`routes.rs:2193` ne contrôle que `50_000`). |
 | 2026-09-18 | dev-groom (mika#2291) | Plan initial. Trois faits du code déplacent le corps du ticket : `parse_mode` est une décision datée avec sa condition de levée (F1), une transformation markdown de périmètre URL existe déjà (F2), et un test gelé pose le symptôme comme attendu (F4). Retenu : HTML plutôt que MarkdownV2 (surface d'échappement de 3 caractères contre 18), avec un repli sur 400 qui fait du pire cas le comportement d'aujourd'hui — ce qui supprime la prémisse de mika#2126 au lieu de la contredire. Parser CommonMark écarté sur une contrainte testée (préservation octet-pour-octet des espaces, F5), pas sur une préférence. |
