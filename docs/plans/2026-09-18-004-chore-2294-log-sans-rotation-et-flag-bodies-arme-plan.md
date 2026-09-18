@@ -64,7 +64,7 @@ abaisser ; il est déjà au plancher, sur une cible que le filtre par défaut n'
 Un seul site ajoute la directive, dans les deux constructeurs de souscripteur :
 
 ```rust
-// crates/mika-common/src/logging.rs:374 (init) et :503 (init_pretty)
+// crates/mika-common/src/logging.rs:375 (init) et :504 (init_pretty)
 if log_llm_bodies {
     filter = filter.add_directive("mika::llm_debug=debug".parse().unwrap());
 }
@@ -169,6 +169,50 @@ grep flags /proc/$pid/fdinfo/<fd>                # attendu : bit 0o2000 (O_APPEN
 `supervise-daemon` fait de même pour ses redirections. Les deux sont **attendus**
 conformes ; la sonde existe pour que ce soit constaté plutôt que supposé, parce qu'un
 faux sur ce point transforme le correctif en aggravation.
+
+### E6b — Deux directives logrotate ne font pas ce que leur nom suggère, et la première version de ce plan s'y est prise
+
+Trois pièges de syntaxe, dont deux étaient présents dans la version initiale du volet A1
+de ce plan. Ils sont nommés ici parce qu'aucun ne produit d'erreur : un fichier logrotate
+qui les porte s'installe, se recharge et *paraît* correct.
+
+**(a) `size` est mutuellement exclusif avec `daily`, et le dernier lu gagne.** Le manuel
+range `hourly` / `daily` / `weekly` / `monthly` / `yearly` / `size` dans un même groupe de
+directives dont *la dernière rencontrée l'emporte, les précédentes étant ignorées*. Un
+bloc portant `daily` **puis** `size 200M` ne tourne donc **pas** quotidiennement : seule la
+taille compte. La version initiale de A1 commentait l'inverse (« logrotate tourne dès
+qu'une des deux conditions est remplie ») — c'est la sémantique de **`maxsize`**, pas celle
+de `size` :
+
+> `maxsize size` — *Log files are rotated when they grow bigger than size bytes even before
+> the additionally specified time interval.*
+
+La directive voulue est donc `maxsize`. Le coût de l'erreur est modeste mais réel et
+silencieux : un journal calme ne tourne jamais, donc `rotate 14` ne s'applique jamais, et
+la rétention annoncée n'existe pas tant que le seuil n'est pas franchi.
+
+**(b) `create` n'a aucun effet en présence de `copytruncate`.** Le fichier d'origine reste
+en place — il n'est jamais renommé — donc il n'y a rien à recréer. La version initiale de
+A1 posait les deux, ce qui **contredisait son propre test V4** (lequel exige l'absence de
+`create`). La contradiction est levée en retirant `create` : c'est `copytruncate` qui est
+porteur, et les permissions du fichier courant sont préservées par construction.
+
+**(c) `delaycompress` est superflu ici.** Il existe pour le cas où un écrivain continue
+d'écrire dans l'archive après rotation. Avec `copytruncate` l'archive est une copie close
+dès sa création : personne n'y écrit jamais. Le garder ne casse rien mais laisse une
+archive non compressée sans raison.
+
+**Ce point n'est pas vérifiable depuis le worktree** — `logrotate` n'est pas installé dans
+le sandbox du pilote et la documentation en ligne n'y est pas joignable. Les trois
+affirmations ci-dessus sont donc à **confirmer par exécution** avant installation, ce qui
+est de toute façon l'étape A5 :
+
+```bash
+logrotate --debug packaging/logrotate/mika    # n'écrit rien ; affiche le plan de rotation
+```
+
+La sortie doit nommer une rotation périodique **et** le seuil de taille. Si elle ne
+mentionne que la taille, la lecture (a) est confirmée et le fichier porte encore `size`.
 
 ### E7 — Tronquer les bodies casserait deux sondes documentées
 
@@ -300,6 +344,10 @@ grep -a llm_body_capture /var/log/mika/server.log | tail -3   # le WARN de déma
 # Q3 — précondition de copytruncate (E6)
 ls -l /proc/$pid/fd | grep server.log
 grep flags /proc/$pid/fdinfo/<fd>
+
+# Q4 — où le gateway écrit-il réellement ? (décide le second glob de A1)
+ls -l /var/log/mika-gateway/ /var/log/mika/ 2>&1
+tr '\0' '\n' < /proc/$(pgrep -f mika-gateway)/environ | grep MIKA_GATEWAY_LOG_FILE
 ```
 
 Branches :
@@ -316,31 +364,39 @@ Branches :
 **A1.** Créer `packaging/logrotate/mika` :
 
 ```
-/var/log/mika/*.log {
+/var/log/mika/*.log /var/log/mika-gateway/*.log {
     daily
+    maxsize 200M
     rotate 14
-    size 200M
     compress
-    delaycompress
     missingok
     notifempty
     copytruncate
     su samidarko samidarko
-    create 0644 samidarko samidarko
 }
 ```
 
 Notes de conception, à porter en commentaire dans le fichier :
 - `copytruncate` est **obligatoire** et non un choix de style — voir D2/E6 ; le
-  remplacer par `create` casse silencieusement les deux écrivains.
-- `size 200M` **avec** `daily` : logrotate tourne dès qu'une des deux conditions est
-  remplie, ce qui borne le pire cas (un jour de bodies armés dépasse largement 200 Mo)
-  sans fragmenter un log calme.
+  remplacer par `create` casse silencieusement les deux écrivains. Corollaire (E6b-b) :
+  **ne pas** ajouter de directive `create`, elle serait sans effet et contredirait V4.
+- `maxsize 200M` **et non `size 200M`** : seul `maxsize` se compose avec `daily` pour
+  donner « tourne à l'échéance **ou** au dépassement ». Avec `size`, `daily` serait
+  ignoré (E6b-a) et un journal calme ne tournerait jamais.
+- Pas de `delaycompress` : superflu avec `copytruncate` (E6b-c).
 - `rotate 14` + `compress` : la borne dure. À 200 Mo par archive compressée ~10×, le
   plafond est de l'ordre de quelques centaines de Mo — contre 22 Go aujourd'hui.
-- `su`/`create` nomment l'utilisateur propriétaire : le service tourne en `samidarko`
+- `su` nomme l'utilisateur propriétaire : le service tourne en `samidarko`
   (`command_user="samidarko"` dans l'init OpenRC), pas en `mika` comme le suppose le
   `postinst` Debian. Les deux cas sont à couvrir en doc plutôt qu'à deviner.
+- **Deux globs, parce que le gateway n'écrit pas dans le même répertoire.** La seule
+  référence de chemin du dépôt pour ce binaire est
+  `MIKA_GATEWAY_LOG_FILE=/var/log/mika-gateway/gateway.log`
+  (`crates/mika-gateway/docs/egress-search-no-log-audit.md:290`) — donc un glob sur
+  `/var/log/mika/` **ne l'aurait pas couvert**, alors que `docs/runtime-structure.md`
+  lui porte le même `Rotation: None`. `missingok` rend le second glob inoffensif sur une
+  machine sans gateway. Le chemin réellement en vigueur reste à constater à
+  l'installation (Q4 du volet 0) : le corriger dans le fichier est alors une ligne.
 
 **A2.** `packaging/debian/mika-spirit.postinst` : installer le fichier sous
 `/etc/logrotate.d/mika` (avec la variante `su mika mika` pour ce paquet), après la
@@ -353,6 +409,32 @@ borne.* Plus le chemin du fichier versionné et le geste d'installation OpenRC.
 
 **A4.** `docs/configuration.md`, entrée `spirit_log_file` : ajouter la même mention
 (c'est la page qu'un opérateur lit quand il pose la variable).
+
+**A5. Synchroniser les copies crate-local — sinon la CI rouge, et pour une raison sans
+rapport avec ce ticket.** `runtime-structure.md` et `configuration.md` sont **tous deux**
+dans la liste de `scripts/sync-agent-docs.sh` (lignes 16 et 19), et le job `docs-sync` de
+`.github/workflows/ci.yml:147` le rejoue sur chaque PR. Toute PR qui touche A3 ou A4 sans
+lancer le script échoue :
+
+```bash
+bash scripts/sync-agent-docs.sh      # met à jour crates/mika-agent/docs/*
+git add crates/mika-agent/docs/runtime-structure.md crates/mika-agent/docs/configuration.md
+```
+
+À faire dans le **même commit** que A3/A4. C'est mécanique, mais c'est la seule étape de ce
+plan dont l'oubli est garanti de bloquer la PR.
+
+**A6. Valider le fichier avant de l'installer** (E6b) :
+
+```bash
+logrotate --debug packaging/logrotate/mika
+```
+
+Mode simulation : n'écrit rien. La sortie doit nommer une rotation périodique **et** le
+seuil de taille. Si elle ne mentionne que la taille, le fichier porte encore `size` au
+lieu de `maxsize`. **Non exécutable depuis le sandbox du pilote** (`logrotate` absent) —
+c'est une étape de l'implémentation ou de l'installation, et V4 en porte le substitut
+statique pour la CI.
 
 ### Volet B — Le flag, conditionné à la branche du volet 0
 
@@ -384,8 +466,17 @@ symptôme dont la cause n'est pas encore établie.
 `tracing_appender::rolling::daily(dir, "mika.log")` par le `Builder` équivalent avec
 `.max_log_files(14)`.
 
+Ces deux sites sont les **seuls** `rolling::daily` du dépôt (`grep -rn 'rolling::' crates/`
+: quatre occurrences, deux `never` en `init`, deux `daily` en `init_pretty`). Le sink
+**team** est donc couvert par le même geste, sans site supplémentaire : les deux variantes
+de `init_team_logging` (`crates/mika-cli/src/main.rs:432` et `:464`, `cfg(telemetry)` et
+son inverse) délèguent à `init_pretty` avec `LogOutput::FileOnly`. La ligne `mika` (team
+mode) du tableau de `docs/runtime-structure.md` est donc à corriger elle aussi — sans quoi
+la doc dirait deux politiques de rétention là où le code n'en a qu'une.
+
 **C2.** Le tableau de `docs/runtime-structure.md` passe de `Daily (tracing_appender)` à
-`Daily, 14 jours retenus`.
+`Daily, 14 jours retenus`, sur les lignes CLI **et** team mode. Suivi de A5
+(`scripts/sync-agent-docs.sh`), même raison.
 
 **C3.** Ce volet **supprime des fichiers** — donc il porte son propre test (voir contrat
 ci-dessous) et il est séparable : si le relecteur le juge hors périmètre d'un p3, il
@@ -400,22 +491,26 @@ part dans son propre ticket sans rien retirer aux volets A et B.
 | V1 | Aucun body LLM n'est émis en INFO | Test de source dans `logging.rs::tests` : les six sites `llm re{quest,sponse} body` sont tous `debug!` sur `mika::llm_debug`. Une régression vers `info!` ou vers la cible par défaut rougit |
 | V2 | Désarmé, aucun body n'est écrit | Test existant `crates/mika-common/tests/tui_llm_body_capture.rs` — étendre si besoin pour asserter l'absence des marqueurs quand `log_llm_bodies = false` |
 | V3 | Le body n'est **pas** tronqué quand armé | Test : un body dépassant 60 Ko (taille du prompt système mika-arch) traverse intact. Garde contre une « optimisation » future qui reprendrait le remède (2) du ticket et casserait les sondes mika#2290 / mika#2331 |
-| V4 | Le fichier logrotate est syntaxiquement valide et emploie `copytruncate` | `logrotate --debug packaging/logrotate/mika` en CI si `logrotate` est disponible ; sinon test de source : le fichier contient `copytruncate` et **ne contient pas** `create` en directive de rotation. La seconde moitié est la garde utile — la substitution est silencieuse et destructrice (D2/E6) |
+| V4 | Le fichier logrotate emploie `copytruncate`, et **aucune** des trois directives-pièges | Test de source (CI, sans dépendre de `logrotate` sur le runner) : le fichier contient `copytruncate` ; il ne contient **ni** `create` (sans effet avec `copytruncate`, E6b-b), **ni** `size ` en début de directive (qui ferait taire `daily`, E6b-a — noter l'espace : `maxsize` ne doit pas déclencher la garde). Ces gardes existent parce que les trois erreurs sont **silencieuses** : le fichier reste valide et la rotation paraît configurée. Complété par `logrotate --debug` à l'installation (A6) |
 | V5 | L'invariant mika#2195 survit | `json_stdout_layer_enabled` et ses tests sont inchangés ; le volet A ne touche pas `logging.rs` |
 | V6 | La rétention par-agent borne bien | Test sur `Builder::max_log_files` : au-delà de N fichiers, les plus anciens disparaissent. Test d'intégration avec un `tempdir`, pas un test de source |
 | V7 | Aucune sonde opérateur ne change de chemin | Test de source : `MIKA_SPIRIT_LOG_FILE` et `/var/log/mika/server.log` restent les seules cibles documentées ; aucun `rolling::daily` n'apparaît dans `init` (le constructeur serveur). Cette garde existe parce que la régression serait **muette** — des dizaines de `grep` rendraient zéro ligne, ce qui se lit comme régime nominal |
 | V8 | La mesure du volet 0 est reproductible | Les commandes du volet 0 sont copiables telles quelles dans le corps de PR et dans `docs/runtime-structure.md` |
+| V9 | Les copies crate-local des docs sont à jour | Le job CI `docs-sync` (`ci.yml:147`) rejoue `scripts/sync-agent-docs.sh` et rougit sur toute divergence. Rien à écrire : la garde existe. A5 est l'étape qui la satisfait |
 
 ---
 
 ## Fire-Disposition
 
-- **Portée :** packaging (nouveau fichier), documentation (trois fichiers), un
-  changement de code borné (volet C, deux lignes + tests), un ajout facultatif au CLI
-  (volet B4). Aucun changement au chemin d'exécution de l'agent, aucun changement au
-  filtre de log, aucune nouvelle variable d'environnement.
+- **Portée :** packaging (nouveau fichier + `postinst`), documentation (trois fichiers,
+  plus leurs deux copies crate-local régénérées par A5), un changement de code borné
+  (volet C, deux lignes + tests), un ajout facultatif au CLI (volet B4). Aucun changement
+  au chemin d'exécution de l'agent, aucun changement au filtre de log, aucune nouvelle
+  variable d'environnement.
 - **Risque principal :** la précondition `O_APPEND` du volet A (E6). Elle est
   vérifiable avant installation et la halte est écrite.
+- **Risque de syntaxe :** les trois directives-pièges de E6b, toutes silencieuses.
+  Couvertes par V4 (statique, en CI) et A6 (`logrotate --debug`, à l'installation).
 - **Risque secondaire :** le volet C supprime des fichiers. Séparable.
 - **Réversibilité :** volet A — `rm /etc/logrotate.d/mika`. Volet B — reposer la ligne
   dans `.env`. Volet C — revert d'une ligne.
@@ -425,7 +520,11 @@ part dans son propre ticket sans rien retirer aux volets A et B.
 ## Definition of Done
 
 - `packaging/logrotate/mika` existe, versionné, commenté sur le pourquoi de
-  `copytruncate`, et installé sur la machine de production après la vérification Q3.
+  `copytruncate` **et sur les trois directives-pièges de E6b**, validé par
+  `logrotate --debug` (A6), et installé sur la machine de production après la
+  vérification Q3.
+- `scripts/sync-agent-docs.sh` a été lancé et ses sorties commitées (A5) — le job CI
+  `docs-sync` passe.
 - `packaging/debian/mika-spirit.postinst` l'installe pour le paquet Debian.
 - `docs/runtime-structure.md` ne dit plus `Rotation: None` sans dire ce qu'il faut faire
   pour que ce soit faux.
@@ -452,8 +551,9 @@ dérivés de son §Fix et du contrat de vérification.
   (mika#2290, mika#2331) arment explicitement le flag et exigent le corps entier — d'où
   le refus de tronquer, et le test V3 qui le fige.
 - **AC3 — Une rotation et une rétention existent pour `server.log`.** Fichier logrotate
-  versionné, installé, avec une borne dure (`rotate 14` + `size 200M` + `compress`), et
-  sans changer le chemin que les sondes opérateur visent (D2, V7).
+  versionné, installé, avec une borne dure (`rotate 14` + `maxsize 200M` + `compress` —
+  `maxsize` et non `size`, E6b-a), et sans changer le chemin que les sondes opérateur
+  visent (D2, V7). Couvre aussi `mika-gateway`, dont le répertoire de log est distinct.
 - **AC4 — La cause du volume est établie par mesure, pas par inférence.** Volet 0
   exécuté, branche consignée. Si la mesure infirme le diagnostic du ticket, c'est un
   résultat à écrire, pas un échec à contourner.
@@ -498,10 +598,14 @@ C'est précisément la classe de panne dont la signature est l'absence de signat
   pas les bodies en log. Élargir sa portée touche un chemin chaud et mérite d'être
   arbitré pour lui-même — la borne de rétention réduit la fenêtre d'exposition, elle ne
   la ferme pas. **Ticket de suivi.**
-- **`mika-gateway`, même trou.** `docs/runtime-structure.md` porte `Rotation: None` sur
-  ses deux lignes aussi. Le glob `/var/log/mika/*.log` du fichier logrotate le couvre
-  **si** son log vit là ; sinon il lui faut sa propre entrée. À vérifier dans le même
-  geste d'installation, à ticketer s'il a un chemin distinct.
+- **`mika-gateway` — tranché, et ramené dans le périmètre.** Il porte le même
+  `Rotation: None` sur ses deux lignes. La question « son log vit-il sous
+  `/var/log/mika/` ? » se répond depuis le dépôt : **non**, la seule référence de chemin
+  est `/var/log/mika-gateway/gateway.log`
+  (`crates/mika-gateway/docs/egress-search-no-log-audit.md:290`). Un glob unique l'aurait
+  donc manqué en silence — d'où le second glob de A1, rendu inoffensif par `missingok`.
+  Reste à constater le chemin en vigueur à l'installation (Q4). Ce point n'est plus un
+  suivi.
 - **Le volume nominal lui-même.** Si le volet 0 branche « halte » (flag désarmé), la
   question « quel `event` domine le journal ? » est un diagnostic distinct, avec ses
   propres arbitrages de cadence — et le `CLAUDE.md` racine porte déjà une doctrine
