@@ -77,6 +77,25 @@ Ces mesures s'étendent au 14 septembre : `git log --since=2026-09-01 --
 tools/mika_permission_policy/` est vide, donc l'étage déterministe n'a pas changé entre
 les deux dates.
 
+**Deux mesures de plus, faites le même jour pendant l'implémentation** (rôle dev-pilot
+cette fois, donc la conclusion ne tient pas au rôle) :
+
+| # | Commande émise | Verdict |
+|---|---|---|
+| M5 | `cd tools/mika_permission_policy && uv run pytest -q` | **deny** — puis `uv run --directory tools/mika_permission_policy pytest -q`, **allow** : même travail, même fichiers, forme non chaînée |
+| M6 | `git diff --stat -- <path> ; echo "…$(… \| wc -l)"` | **veto** — `policy allow (bash-git-readonly) vetoed — command chains a tier3-dangerous or command-substitution tail onto the allowed prefix` |
+
+M6 est la reproduction directe de M4 sur un autre binaire, et M5 est la doctrine en
+action : la commande refusée a été **réémise autrement** et a abouti, sans qu'aucune
+règle soit élargie. C'est ce qu'un pilote doit faire d'un deny, et ce que mika#1410 doit
+lui permettre de faire sans mourir.
+
+À noter au passage, parce que l'information est utile et n'est écrite nulle part :
+`make test-permission-policy-plugin` est refusé en sandbox — `SAFE_MAKE_TARGETS` ne
+contient que `verify-bundled-skills` — alors que la même suite passe par
+`uv run --directory tools/mika_permission_policy pytest -q`. Là encore, c'est la
+commande qui est refusée, pas ce qu'elle lit.
+
 ---
 
 ## La règle de lecture d'un `[policy:deny]`
