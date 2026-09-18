@@ -2479,7 +2479,7 @@ async fn handle_admin_tenant_outbound_messages(
     };
 
     let has_more = items.len() > per_page as usize;
-    items.truncate(per_page as usize);
+    items.truncate(per_page as usize); // safe-byte-slice: Vec — element count (pagination), no char boundary
 
     Json(OutboundMessagesResponse {
         items,
