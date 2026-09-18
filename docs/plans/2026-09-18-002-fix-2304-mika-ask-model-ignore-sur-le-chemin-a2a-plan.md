@@ -127,7 +127,50 @@ pour la durée d'un tour via `settings.make_provider_for(provider_kind, model)`
 `server/a2a.rs:224`), donc le constructeur est atteignable au site exact où la
 clé est lue.
 
-### E6 — Ce qui n'est PAS établi
+### E6 — `--remote` est délibérément dépouillé de ses deux clés sœurs, avec raisons écrites
+
+`dispatch_remote` (`remote_ask.rs:350-362`) n'envoie **ni** `mika.caller_session_id`
+**ni** `mika.only_skills`, et le commentaire donne les deux raisons :
+
+> `--remote` sends no caller session id (mika#2070). The local bookkeeping
+> session lives in this machine's database; a remote agent normally holds a
+> different one and would refuse the id. […] `--remote` sends no skill
+> restriction either (mika#2363): a remote agent's skill names are not this
+> machine's to guess.
+
+Le ticket porte pourtant explicitement sur `--remote`. Faire traverser une
+troisième clé là où les deux premières sont refusées demande donc une raison qui
+sépare — pas un oubli de lecture. Elle est écrite en D9.
+
+### E7 — Le provider qui sert le tour n'est pas celui que `a2a.rs` connaît
+
+C'est la lecture qui décide du **site** de l'attestation, et elle contredit une
+rédaction antérieure de ce plan (voir *Revision history*).
+
+`run_a2a_agent` passe `llm: agent_state.llm.as_ref()` (`server/a2a.rs:201`). Mais
+en aval, `agent_loop` recalcule le provider effectif à **deux** sites
+(`mod.rs:3901-3906` et `mod.rs:5601-5606`), identiques :
+
+```rust
+let skill_llm_override = resolve_skill_llm_override(&matched, params.settings, llm);
+let effective_llm: &dyn LlmProvider = match &skill_llm_override {
+    Some(override_llm) => override_llm.as_ref(),
+    None => llm,
+};
+```
+
+Donc une attestation prise dans `a2a.rs` rapporterait le provider **d'entrée**,
+pas celui qui a servi. Sur un tour où un skill porte un override `[llm]`, elle
+affirmerait avec autorité un modèle qui n'a pas tourné — c'est-à-dire qu'elle
+reconstruirait exactement la classe de défaut E3 que ce ticket existe pour
+fermer, déplacée d'un champ.
+
+`AgentOutput` (`mod.rs:350-375`) est le canal de retour, et son propre
+doc-commentaire porte le précédent : mika#2276 a ajouté `deadline_exceeded`
+comme **champ** plutôt qu'en élargissant le retour en `LoopResult`, avec la
+raison (*« les appelants de `run_agent` consomment déjà cette struct »*).
+
+### E8 — Ce qui n'est PAS établi
 
 La mesure du 11/09 ne dit pas par quelle porte elle est passée (locale ou
 `--remote`), et les logs de ce jour ne sont pas rejoués ici. Cela ne bloque pas :
@@ -188,7 +231,9 @@ défaut qu'on vient de mesurer. Donc :
 
 - le serveur pose le modèle **effectivement utilisé** dans `Task.metadata`
   (le champ existe déjà, `mika-a2a/src/types.rs:147`), sur tout tour, override ou
-  pas ;
+  pas — **pris sur `effective_llm`, en aval de l'override per-skill** (E7), et
+  remonté par `AgentOutput`. Une attestation prise au site d'entrée serait un
+  second champ qui affirme un modèle qu'il n'a pas vu servir ;
 - le CLI rend **cette** valeur sous `--verbose`, et cesse de lire `ctx.settings` ;
 - **en l'absence d'attestation, le CLI n'affiche pas de modèle** — il dit que le
   serveur n'en a pas attesté un. Un serveur antérieur au correctif, ou un agent
@@ -243,13 +288,42 @@ s'abstient quand le tour porte un override explicite d'appelant.
 L'attestation (D3) reste le filet : si cette précédence était mal câblée,
 l'opérateur lirait le modèle réel plutôt que celui qu'il a demandé.
 
-### D8 — Angle mort déclaré : le per-skill continue de n'attester que par D3
+### D8 — Angle mort déclaré : le per-skill n'a que l'attestation, pas l'événement
 
 Comme mika#2293 l'a fait pour `llm_budget_resolved`, l'angle mort est écrit au
-site d'émission plutôt que découvert : l'événement de configuration n'est pas
-étendu au chemin per-skill par ce ticket. L'attestation du modèle effectif, elle,
-couvre ce chemin par construction puisqu'elle est prise sur le provider qui a
-servi le tour.
+site d'émission plutôt que découvert : l'événement de configuration
+(`a2a_model_override_applied`) n'est **pas** étendu au chemin per-skill par ce
+ticket — il ne dit que les overrides d'appelant.
+
+L'attestation du modèle effectif, elle, couvre ce chemin — **mais par le site
+choisi en E7, pas « par construction »**. C'est une propriété du câblage, donc
+elle se teste (T10) au lieu d'être supposée.
+
+### D9 — `--model` traverse `--remote`, quand ses deux clés sœurs ne traversent pas
+
+L'asymétrie est réelle (E6) et demandée par le ticket, qui nomme `--remote` dans
+son titre même. Les raisons écrites sur les deux refus ne se transposent pas :
+
+- `caller_session_id` est refusé parce qu'il désigne **une ligne de la base de
+  cette machine**, que le distant n'a pas ;
+- `only_skills` est refusé parce qu'il désigne **des noms de skills de cette
+  machine**, que le distant ne porte pas forcément.
+
+Les deux sont des références locales que l'appelant *devine*. Un model-id n'en
+est pas une : c'est une chaîne que l'opérateur a tapée, résolue contre le
+fournisseur **de l'exécutant** (D4), et sa validité est une propriété du
+fournisseur distant — pas une inférence de cette machine.
+
+Et le fail-closed (D2) est ce qui rend l'asymétrie sûre : un id que le distant ne
+peut pas servir fait échouer le tour en nommant le modèle et le fournisseur.
+C'est le comportement que le ticket réclame explicitement en repli (« faire
+échouer avec un message clair »), obtenu ici sans renoncer à la capacité.
+
+**Ce que ça ne fait pas :** `--remote` n'affiche aucun modèle aujourd'hui —
+`render` ne rend que `remote_task_id` sous `--verbose`
+(`remote_ask.rs:378-384`). Sur ce chemin, D3 est donc un **ajout** d'attestation,
+pas la correction d'un mensonge. Le faux vert mesuré en E3 est propre au chemin
+local, et il ne faut pas le sur-attribuer à `--remote`.
 
 ---
 
@@ -280,10 +354,16 @@ structurelle en T6.
 
 `build_send_params` gagne le paramètre `model_override: Option<&str>` et pose la
 clé. `send_message_to_agent` et `dispatch_remote` la threadent. `dispatch_remote`
-**reçoit enfin le modèle** — aujourd'hui il ne le reçoit pas (E1).
+**reçoit enfin le modèle** — aujourd'hui il ne le reçoit pas (E1), et il passe
+délibérément `None`/`&[]` pour les deux clés sœurs : ce commentaire est **mis à
+jour**, pas contourné, pour porter la raison qui sépare les trois cas (D9).
+Laisser le commentaire dire « `--remote` n'envoie pas de configuration » pendant
+qu'une clé la traverse recréerait la divergence commentaire-vs-code que E1 vient
+de mesurer sur `ask.rs:316-319`.
 
 Le `Task` rendu expose son modèle attesté via un accesseur (lecture de
-`Task.metadata`), pour que les deux surfaces d'affichage lisent la même chose.
+`Task.metadata`), pour que les deux surfaces d'affichage — `render` ici,
+l'enveloppe de `ask.rs` — lisent la même chose.
 
 ### V5 — `crates/mika-cli/src/main.rs`
 
@@ -304,18 +384,50 @@ La branche `run_remote` passe `args.model.as_deref()`.
 
 - `requested_model_override(&MessageSendParams) -> Option<&str>` : fail-soft en
   lecture (absent / `null` / non-chaîne / vide ⇒ `None`), sœur de
-  `requested_only_skills` ;
-- `run_a2a_agent` construit le provider par tour via `make_provider_for` (E5) et
-  **échoue le tour** si la construction échoue (D2), en nommant le modèle et le
-  fournisseur ;
-- le modèle effectif (`provider.provider_name()` / `model_name()`) est posé dans
-  le `Task` au point d'intervention mika#2270, sur **tout** tour ;
+  `requested_only_skills` (`a2a.rs:268-284`) ;
+- `run_a2a_agent` construit le provider par tour via
+  `agent_state.settings.make_provider_for(...)` (E5) et **échoue le tour** si la
+  construction ou la vérification de clé échoue (D2), en nommant le modèle et le
+  fournisseur.
+
+  Forme imposée par les types : `AgentParams.llm` est un `&'a dyn LlmProvider`
+  (`mod.rs:3563`) et `make_provider_for` rend un `Arc`. L'`Arc` est donc lié à une
+  variable de la portée de `run_a2a_agent` et `params.llm` reçoit `arc.as_ref()`.
+  Sans override, `agent_state.llm.as_ref()` est passé inchangé — aucun provider
+  construit, aucun coût sur le chemin nominal ;
+- le modèle attesté est lu sur `AgentOutput` (V8) et posé dans `Task.metadata` au
+  point d'intervention mika#2270 — le bras `Ok(Some(mut task))` de
+  `a2a_build_task` (`a2a.rs:~742`), où le `Task` est déjà `mut` et où
+  `ensure_send_task_carries_text` intervient déjà ;
+- **périmètre d'attestation, nommé plutôt que supposé** : le chemin couvert est
+  `message/send` **synchrone**, celui qu'emprunte `send_message_to_agent`, donc
+  les deux portes du ticket. `message/stream` et la branche `returnImmediately`
+  ne sont pas couverts par ce ticket — la seconde ne fait tourner aucun tour, il
+  n'y a donc rien à attester. Ces chemins tombent dans la population « pas
+  d'attestation », que D3 traite déjà honnêtement : le CLI n'affiche rien plutôt
+  qu'une valeur locale ;
 - un événement INFO `a2a_model_override_applied` (agent, task_id, demandé,
-  résolu), sœur de `a2a_only_skills_applied`.
+  résolu), sœur de `a2a_only_skills_applied` (`a2a.rs:183`).
 
-### V8 — `crates/mika-agent/src/agent_loop/mod.rs`
+### V8 — `crates/mika-agent/src/agent_loop/mod.rs` — les deux moitiés manquantes
 
-`resolve_skill_llm_override` s'abstient sous override d'appelant (D7).
+**(a) L'attestation remonte.** `AgentOutput` (`mod.rs:350`) gagne
+`effective_model: Option<String>`, peuplé depuis `effective_llm.provider_name()`
+/ `model_name()` — les valeurs sont **déjà lues** à ces deux sites
+(`mod.rs:3913-3914`, `mod.rs:5610-5611`), il n'y a pas de calcul à ajouter. Champ
+plutôt qu'élargissement du retour : le motif que `deadline_exceeded` documente
+déjà sur cette même struct (mika#2276).
+
+**(b) La précédence a besoin d'un canal.** D7 dit que `--model` gagne sur un
+override per-skill, mais `resolve_skill_llm_override(&matched, params.settings,
+llm)` ne reçoit aujourd'hui **aucune** information d'appelant. `AgentParams`
+gagne donc un champ (`caller_model_override: bool`, `false` partout ailleurs) que
+la fonction consulte pour s'abstenir.
+
+**Les deux sites d'appel doivent bouger ensemble** (`mod.rs:3901` et
+`mod.rs:5601`, aujourd'hui identiques). N'en traiter qu'un donnerait deux
+précédences opposées selon le chemin — la classe exacte que T7 et mika#2158
+nomment, et qu'un test comportemental sur un seul chemin ne verrait pas.
 
 ### V9 — Documentation
 
@@ -385,7 +497,29 @@ déplacement et non une réécriture.
 ### T9 — Précédence (D7)
 
 Un tour portant un override d'appelant **et** un skill à override `[llm]` tourne
-sous le modèle de l'appelant.
+sous le modèle de l'appelant. Le test couvre **les deux** sites d'appel de
+`resolve_skill_llm_override` (`mod.rs:3901` et `mod.rs:5601`) : un seul couvert
+laisserait l'autre chemin avec la précédence inverse, sans qu'aucune assertion ne
+rougisse (V8b).
+
+### T10 — L'attestation suit le provider qui a servi, pas celui d'entrée (E7)
+
+Le test qui aurait rougi sur la rédaction précédente de ce plan, donc le test qui
+décide que la correction a pris.
+
+Un tour **sans** override d'appelant mais **avec** un skill à override `[llm]`
+atteste le modèle **du skill**, pas celui de `agent_state.llm`. Une attestation
+prise au site d'entrée passerait T5 (« l'attestation existe ») et T6 (« le CLI
+n'invente rien ») en affirmant tranquillement le mauvais modèle : c'est la
+répétition de E3 un champ plus loin.
+
+### T11 — L'aller-retour complet, sur la mesure fondatrice
+
+Test d'intégration : un `message/send` portant `mika.model_override` fait tourner
+le tour sous ce modèle **et** le `Task` rendu l'atteste. C'est le seul test qui
+relie les deux moitiés (propagation D1 + attestation D3) ; T1..T6 les vérifient
+chacune de son côté et ne peuvent pas voir un câblage où les deux marchent en
+décrivant deux modèles différents.
 
 ---
 
@@ -405,6 +539,17 @@ sortie du tour est du texte destiné à l'opérateur, y injecter de la télémé
 recréerait la classe que mika#2270 a dû nettoyer. Établir d'abord qui écrit ce
 champ.
 
+**FD5 — T10 rougit en rapportant le modèle de config sur un tour à skill
+override.** L'attestation a été câblée au site d'entrée. Ne pas ajuster le test
+et ne pas restreindre son périmètre : c'est exactement le défaut E7, et le laisser
+passer livrerait un champ qui ment sur la population per-skill tout en portant
+l'autorité d'une attestation serveur.
+
+**FD6 — T9 passe sur un site et rougit sur l'autre.** Les deux appels de
+`resolve_skill_llm_override` n'ont pas bougé ensemble. Ne pas marquer le site
+rouge « hors périmètre » : deux précédences opposées selon le chemin sont pires
+que la précédence inverse partout, parce qu'elles ne sont pas reproductibles.
+
 **FD4 — Après déploiement, le body a2a porte toujours le modèle de config alors
 que T1..T5 sont verts.** Le corps observé ne vient pas de ce chemin. Halte :
 **ne pas élargir la clé**. Établir quel processus l'a émis (l'attestation le dit :
@@ -419,7 +564,9 @@ un problème de déploiement, pas de code).
       (local spirit et `--remote`).
 - [ ] Un override inapplicable fait échouer le tour avec un message nommant le
       modèle et le fournisseur, jamais un repli silencieux.
-- [ ] `--verbose` rapporte le modèle **attesté par le serveur**, ou rien.
+- [ ] `--verbose` rapporte le modèle **attesté par le serveur**, ou rien — et
+      l'attestation est prise sur le provider qui a servi le tour, override
+      per-skill compris.
 - [ ] Un appelant qui ne déclare pas d'override produit le corps A2A d'avant le
       correctif, byte pour byte.
 - [ ] La résolution alias/préfixe/clé-API vit à un seul endroit, avec une garde
@@ -453,8 +600,13 @@ dérivés des Requirements et du Verification contract ci-dessus.)*
 - **AC7** — La sémantique mika#1591 est conservée : le préfixe d'un id ne
   re-dispatche jamais vers un fournisseur natif, et n'est retiré que s'il nomme
   le fournisseur **exécutant**. Vérifié par T7 + T8.
-- **AC8** — Un override d'appelant l'emporte sur un override `[llm]` per-skill.
-  Vérifié par T9.
+- **AC8** — Un override d'appelant l'emporte sur un override `[llm]` per-skill,
+  **sur les deux sites d'appel** de `resolve_skill_llm_override`. Vérifié par T9.
+- **AC9** — L'attestation rapporte le provider qui a **servi** le tour, y compris
+  quand un override per-skill l'a substitué en aval du site d'entrée (E7).
+  Vérifié par T10.
+- **AC10** — Propagation et attestation décrivent le même modèle sur un
+  aller-retour réel. Vérifié par T11.
 
 ---
 
@@ -515,3 +667,25 @@ déploiement.
 ## Revision history
 
 - 2026-09-18 — rédaction initiale (contenu seul ; revue architecte en aval).
+- 2026-09-18 — seconde passe de grooming, relecture du plan contre le code. E1 à
+  E5 sont confirmées ligne à ligne et inchangées. Trois corrections :
+  - **E7 / D8 / V7 / V8a / T10 / FD5 — contradiction interne levée.** D8
+    affirmait que l'attestation couvrait le chemin per-skill « par construction »,
+    alors que le site nommé en V7 (`a2a.rs`) ne connaît que le provider d'entrée :
+    `agent_loop` recalcule `effective_llm` en aval, à deux endroits. Livrée telle
+    quelle, cette moitié aurait posé un champ affirmant un modèle qui n'a pas
+    servi — la classe E3, déplacée d'un cran et revêtue de l'autorité d'une
+    attestation serveur. L'attestation remonte désormais par `AgentOutput`, avec
+    le test qui discrimine.
+  - **E6 / D9 / V4 — l'asymétrie de `--remote` était passée sous silence.** Les
+    deux clés sœurs sont délibérément *non* envoyées sur ce chemin, avec leurs
+    raisons écrites dans le code. Faire traverser la troisième exigeait de dire
+    ce qui sépare ; c'est écrit, et le commentaire du code est mis à jour plutôt
+    que contourné.
+  - **V8b / T9 / FD6 — D7 n'avait pas de canal.** `resolve_skill_llm_override` ne
+    reçoit aucune information d'appelant ; la précédence demandée exigeait un
+    champ `AgentParams` et le traitement conjoint des deux sites d'appel.
+  - Ajouts mineurs : durée de vie de l'`Arc` du provider par tour (contrainte de
+    `AgentParams.llm: &dyn`), périmètre d'attestation nommé (`message/send`
+    synchrone ; `message/stream` et `returnImmediately` hors périmètre, et
+    honnêtement lus comme « non attesté »), T11 sur l'aller-retour complet.
