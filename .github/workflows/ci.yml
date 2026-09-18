@@ -84,6 +84,15 @@ jobs:
       - name: Dispatch-lib assertion suite (mika#1772)
         run: make test-dispatch-lib
 
+      # mika#2312: the permission-policy plugin suite — including the AST guard
+      # that refuses the registry any filesystem/network capability — ran in no
+      # workflow at all, so a carve-out could merge green past the very guard
+      # written to stop it. The suite carries its own negative-behaviour pins
+      # (TestTheGuardBites), the discipline the three structural lints below
+      # apply as a separate step.
+      - name: Permission-policy plugin suite (mika#1817, mika#2312)
+        run: make test-permission-policy-plugin
+
       - name: Plan-discovery suite (mika#2038)
         run: make test-find-issue-plan
 

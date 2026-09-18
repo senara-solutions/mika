@@ -2989,6 +2989,22 @@ assert_contains "Class C message explicitly NOT drift" \
     'not LLM drift' "$DRIFT_BLOCK"
 assert_contains "Class C message links to investigation doc" \
     'drift-misdiagnosis-policy-deny-halt' "$DRIFT_BLOCK"
+# mika#2312: the remedies paragraph used to send the reader straight to
+# "widen the policy" / "rewrite the dispatch context" without ever saying the
+# deny names a refused CALL and a RULE. That reading is what produced mika#2312's
+# inference that the CONTENT of a system_prompt.md was protected.
+assert_contains "Class C message teaches rule-id reading first (dev-groom site)" \
+    "Read the halt event's bracketed [rule-id] FIRST" "$DRIFT_BLOCK"
+# The absent-rule-id semantics are the half mika#2312's first attempt got
+# BACKWARDS: rule_id=None is claude-pilot's policy DEFAULT deny (policy.py
+# returns rule_id=None when no rule matched; ui.py renders no tag for it), and
+# permissions.yaml's default reason prescribes widening. Pin the corrected
+# claim, not merely the sentence's presence — a message that is present and
+# false is what this ticket exists to repair.
+assert_contains "Class C message says an absent rule-id is the policy DEFAULT (dev-groom site)" \
+    'NO [rule-id] means the policy DEFAULT fired' "$DRIFT_BLOCK"
+assert_not_contains "Class C message does not blame the judgment stage (dev-groom site)" \
+    'canUseTool judgment stage' "$DRIFT_BLOCK"
 
 # Branch ordering: the POLICY_DENY branch must be the FIRST elif/if, so it wins
 # over the drift messages when both conditions could fire.
@@ -3081,6 +3097,32 @@ assert_contains "Class C message — halted by policy deny, NOT generic exit" \
     'halted by policy deny — not generic exit' "$POSTFLIGHT_BLOCK"
 assert_contains "Links to investigation doc" \
     'drift-misdiagnosis-policy-deny-halt' "$POSTFLIGHT_BLOCK"
+# mika#2312 — companion of the dev-groom assertions in Test 13. Same phrases,
+# second site: the two class-C blocks are NOT copies of one another (their
+# headers and remedies paragraphs legitimately differ), so a single assertion
+# would only bite on one of them.
+assert_contains "Class C message teaches rule-id reading first (dev-pilot site)" \
+    "Read the halt event's bracketed [rule-id] FIRST" "$POSTFLIGHT_BLOCK"
+assert_contains "Class C message says an absent rule-id is the policy DEFAULT (dev-pilot site)" \
+    'NO [rule-id] means the policy DEFAULT fired' "$POSTFLIGHT_BLOCK"
+assert_not_contains "Class C message does not blame the judgment stage (dev-pilot site)" \
+    'canUseTool judgment stage' "$POSTFLIGHT_BLOCK"
+
+# Reading ORDER, not just presence (mika#2312): the rule-id instruction must
+# come BEFORE the allow-list-gap paragraph — a reader who reaches "widen the
+# policy" first goes hunting for a gap without knowing which rule fired, which
+# is the sequence that produced this ticket. assert_contains cannot see order,
+# so compare source line numbers the way the POLICY_DENY branch-ordering check
+# below already does.
+RULEID_LINE=$(echo "$POSTFLIGHT_BLOCK" | grep -n "bracketed \[rule-id\] FIRST" | head -1 | cut -d: -f1)
+ALLOWLIST_LINE=$(echo "$POSTFLIGHT_BLOCK" | grep -n 'Likely a tier1 or tier2 allow-list gap' | head -1 | cut -d: -f1)
+if [ -n "$RULEID_LINE" ] && [ -n "$ALLOWLIST_LINE" ] && [ "$RULEID_LINE" -lt "$ALLOWLIST_LINE" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ rule-id instruction precedes the allow-list-gap paragraph (dev-pilot site)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ rule-id instruction must precede the allow-list-gap paragraph (dev-pilot site)"
+fi
 
 # Branch ordering: POLICY_DENY must precede BOTH the dev-groom-re-dispatch
 # Note AND the generic "Zero new commits" message in source order.
