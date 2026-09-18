@@ -150,6 +150,7 @@ struct OpenAiErrorDetail {
 use super::DEFAULT_ATTEMPTS_HARD_CAP as MAX_ATTEMPTS_HARD_CAP;
 
 use super::LlmTimeoutBudget;
+use super::budget::output_tokens_per_sec_floor;
 
 /// OpenAI-compatible provider that works with OpenAI, Ollama, vLLM, Groq, etc.
 pub struct OpenAiCompatibleProvider {
@@ -209,13 +210,42 @@ impl OpenAiCompatibleProvider {
         format!("{}/models", self.base_url)
     }
 
-    async fn send_once(&self, request: &OpenAiRequest) -> Result<OpenAiResponse, LlmError> {
+    /// One HTTP round-trip, plus the mika#2280 plafond discriminator.
+    ///
+    /// # Why the error type is a pair
+    ///
+    /// The `bool` is `cap_exhausted`: the body stopped arriving at ≈ the
+    /// per-call plafond, i.e. *the model was still generating*, as opposed to
+    /// stopping at an arbitrary instant, i.e. *the transport died*. Both are
+    /// `LlmError::Transport` and both answer `transport_timeout` to
+    /// `error_class`, so nothing in the error itself can carry the distinction
+    /// — and **nothing in `LlmError` is allowed to move** (mika#2280 D2): the
+    /// class is a wire format grouped on by mika#2179's
+    /// `callback_delivery_failed`, and the retryability of this branch is what
+    /// mika#2015 measured and must not be reopened for an observability need.
+    ///
+    /// Returned by the signature rather than through a `Cell` or a shared
+    /// field: this method is private and has exactly **one** caller, so the pair
+    /// propagates at one site. Side state would cost the same lines while making
+    /// the flag reachable from anywhere.
+    async fn send_once(
+        &self,
+        request: &OpenAiRequest,
+    ) -> Result<OpenAiResponse, (LlmError, bool)> {
+        // mika#2280 D2: the attempt's own clock. `send_message_inner` measures
+        // one too, around this call, but the discriminator has to compare a
+        // duration with the plafond that bounded *this* request — reading the
+        // outer measure would fold in whatever the caller does around it.
+        let started = Instant::now();
+        // Only a failure ever carries the flag; every early exit is `false`.
+        let plain = |e: LlmError| (e, false);
+
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         if let Some(ref key) = self.api_key {
             let auth = HeaderValue::from_str(&format!("Bearer {key}"))
-                .map_err(|e| LlmError::ProviderError(format!("invalid API key: {e}")))?;
+                .map_err(|e| plain(LlmError::ProviderError(format!("invalid API key: {e}"))))?;
             headers.insert(AUTHORIZATION, auth);
         }
 
@@ -232,11 +262,19 @@ impl OpenAiCompatibleProvider {
             .headers(headers)
             .json(request)
             .send()
-            .await?;
+            .await
+            .map_err(|e| plain(LlmError::from(e)))?;
 
         let status = response.status();
         if !status.is_success() {
             let status_code = status.as_u16();
+            // mika#2280 E6/AC5: this `response.text()` is deliberately NOT
+            // instrumented. It reads the body of a non-2xx response and its
+            // error is already swallowed by `unwrap_or_default`. A slow 429 —
+            // whose error body arrives late — would otherwise enter a
+            // population that asserts "the model was still generating", which
+            // is exactly the false attribution the discriminator exists to
+            // avoid.
             let body = response.text().await.unwrap_or_default();
             let message = serde_json::from_str::<OpenAiErrorResponse>(&body)
                 .map(|e| e.error.message)
@@ -246,11 +284,11 @@ impl OpenAiCompatibleProvider {
                 });
             warn!(status = status_code, error_message = %message, "OpenAI-compatible API error");
             let retryable = matches!(status_code, 429 | 500 | 503);
-            return Err(LlmError::HttpError {
+            return Err(plain(LlmError::HttpError {
                 status: status_code,
                 message,
                 retryable,
-            });
+            }));
         }
 
         // Read the body as text before deserializing, so a parse failure can say
@@ -290,9 +328,48 @@ impl OpenAiCompatibleProvider {
                     error = %chain,
                     "LLM response body read failed mid-stream (retryable transport)"
                 );
-                return Err(LlmError::Transport(format!(
-                    "failed to read response body: {chain}"
-                )));
+
+                // mika#2280 D2 — the whole point of the ticket. This arm is
+                // already structurally narrow: the status has been read, so a
+                // connection failure or a connect timeout left through the `?`
+                // on `.send()` above and never reaches here. It means, exactly:
+                // *the headers arrived, the body did not finish*. What it does
+                // NOT say is why — and `error_class` answers `transport_timeout`
+                // either way.
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                let cap_exhausted = self.budget.is_cap_exhaustion(elapsed_ms);
+                if cap_exhausted {
+                    warn!(
+                        target: "mika::llm",
+                        event = "llm_call_cap_exhausted",
+                        provider = %self.provider_kind,
+                        model = %request.model,
+                        max_tokens = request.max_tokens,
+                        http_timeout_secs = self.budget.http_timeout_secs(),
+                        elapsed_ms,
+                        reachable_output_tokens = self
+                            .budget
+                            .reachable_output_tokens(output_tokens_per_sec_floor()),
+                        // Corroborating, never deciding (D2): reqwest says
+                        // `timed out` for a guillotine and `unexpected EOF` /
+                        // `reset` for a breakdown. A `true` above with a `false`
+                        // here is worth looking at; the elapsed time carries the
+                        // verdict either way.
+                        cause_is_timeout = chain.contains("timed out"),
+                        "LLM call cut at its per-call plafond — the model was still generating \
+                         (mika#2280)"
+                    );
+                }
+
+                return Err((
+                    // The variant, the class and the retryability are UNCHANGED
+                    // (D2 / AC6): mika#2015 moved this branch from `ParseError`
+                    // to `Transport` after measuring 48 of 48 parse errors in
+                    // one hour were cut bodies. Touching it for an observability
+                    // need would reopen that.
+                    LlmError::Transport(format!("failed to read response body: {chain}")),
+                    cap_exhausted,
+                ));
             }
         };
 
@@ -311,11 +388,11 @@ impl OpenAiCompatibleProvider {
                 body_excerpt = %excerpt,
                 "LLM response body did not parse"
             );
-            LlmError::ParseError(format!(
+            plain(LlmError::ParseError(format!(
                 "failed to parse response: {e} (body {} bytes, starts: {})",
                 body.len(),
                 excerpt.chars().take(120).collect::<String>()
-            ))
+            )))
         })?;
 
         // Dev-mode body logging
@@ -435,6 +512,13 @@ impl OpenAiCompatibleProvider {
                             last_error.as_ref().map(|e| e.error_class()).as_deref(),
                             self.budget.http_timeout_secs(),
                             Some(remaining.as_millis() as u64),
+                            openai_request.max_tokens,
+                            // mika#2280 AC7: **absent**, never `false`. No call
+                            // was made, so asserting it was not guillotined
+                            // would assert something about a call that does not
+                            // exist — the same discipline as mika#2342's
+                            // `request_bytes`, which is never `0`.
+                            None,
                         );
                         break;
                     }
@@ -471,7 +555,15 @@ impl OpenAiCompatibleProvider {
             // of how many attempts the chain ran. The mika#2342 line above marks
             // the start of the attempt; this one says how it ended.
             let attempt_start = Instant::now();
-            let attempt_result = self.send_once(&openai_request).await;
+            // mika#2280: `send_once` returns the plafond verdict beside its
+            // error. Split it here — the single site the pair travels through —
+            // so everything below reasons about an ordinary `Result` and no
+            // `LlmError` variant had to change.
+            let (attempt_result, attempt_cap_exhausted) = match self.send_once(&openai_request).await
+            {
+                Ok(response) => (Ok(response), false),
+                Err((e, cap_exhausted)) => (Err(e), cap_exhausted),
+            };
             let attempt_elapsed_ms = attempt_start.elapsed().as_millis() as u64;
             let deadline_remaining_ms =
                 deadline.map(|dl| dl.saturating_duration_since(Instant::now()).as_millis() as u64);
@@ -504,6 +596,10 @@ impl OpenAiCompatibleProvider {
                     .as_deref(),
                 self.budget.http_timeout_secs(),
                 deadline_remaining_ms,
+                openai_request.max_tokens,
+                // The attempt ran, so the flag is a measurement rather than an
+                // absence — `Some`, both ways (mika#2280 AC7).
+                Some(attempt_cap_exhausted),
             );
 
             match attempt_result {

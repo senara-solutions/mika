@@ -208,10 +208,42 @@ pub mod attempt_outcome {
 /// is a known blind spot, payable the day a measurement asks for it.
 /// The `error_class` field is **absent** on a success rather than carrying a
 /// `"null"` string, and `deadline_remaining_ms` is absent when the call carries
-/// no deadline — hence the two emission arms below. A string spelling "null"
+/// no deadline — hence the emission arms below. A string spelling "null"
 /// would be indistinguishable, under `jq`, from a class genuinely named that;
 /// an absent field lets `select(.error_class)` be the exact filter for failed
 /// attempts.
+///
+/// # `max_tokens` and `cap_exhausted` (mika#2280)
+///
+/// `max_tokens` says what the attempt **asked for**. It is not optional: all six
+/// call sites have a non-optional `u32` in scope and already log it on
+/// `llm_call started`.
+///
+/// `cap_exhausted` says whether the attempt was **cut at its plafond** — a body
+/// that stopped arriving at ≈ the per-call cap, which means the model was still
+/// generating, as opposed to a body that stopped at an arbitrary instant, which
+/// means the transport died. [`error::LlmError::error_class`] answers
+/// `transport_timeout` to both, so nothing before this could separate them.
+///
+/// It is an `Option` for two distinct reasons, and conflating them is the one
+/// misreading to avoid:
+///
+/// - **The attempt did not happen.** On `deadline_abort` no call was made, so
+///   writing `false` would assert that a call was not guillotined when there was
+///   no call. `null` is never `false`, exactly as mika#2342's `request_bytes` is
+///   never `0`.
+/// - **The rail is not instrumented.** The Anthropic rail hands `reqwest` its own
+///   `120s` literal instead of reading the plafond (mika#2189 named that
+///   inconsistency and left it to its own ticket), so "elapsed ≈ plafond" there
+///   would compare against a bound that does not govern the call. Both its call
+///   sites pass `None`, always. It passes the `max_tokens` — a declaration, true
+///   everywhere — without passing the flag — a judgment, which needs an applied
+///   plafond.
+///
+/// **Consequence for reading, named rather than discovered:**
+/// `select(.cap_exhausted == true)` stays exact, but **counting the `false`s
+/// yields the OpenAI-compatible population only**. The `provider` field, already
+/// carried here, separates the two causes of an absent flag.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_llm_call_attempt(
     provider: &str,
@@ -223,6 +255,8 @@ pub fn emit_llm_call_attempt(
     error_class: Option<&str>,
     http_timeout_secs: u64,
     deadline_remaining_ms: Option<u64>,
+    max_tokens: u32,
+    cap_exhausted: Option<bool>,
 ) {
     macro_rules! emit {
         ($($extra:tt)*) => {
@@ -236,18 +270,30 @@ pub fn emit_llm_call_attempt(
                 elapsed_ms,
                 outcome = %outcome,
                 http_timeout_secs,
+                max_tokens,
                 $($extra)*
                 "llm call attempt"
             )
         };
     }
+    // Second level rather than eight hand-written arms: `cap_exhausted` is
+    // orthogonal to the other two Options, and spelling out the cross product
+    // would be four opportunities to transpose a field.
+    macro_rules! emit_with_cap {
+        ($($extra:tt)*) => {
+            match cap_exhausted {
+                Some(flag) => emit!($($extra)* cap_exhausted = flag,),
+                None => emit!($($extra)*),
+            }
+        };
+    }
     match (error_class, deadline_remaining_ms) {
         (Some(class), Some(remaining)) => {
-            emit!(error_class = %class, deadline_remaining_ms = remaining,);
+            emit_with_cap!(error_class = %class, deadline_remaining_ms = remaining,);
         }
-        (Some(class), None) => emit!(error_class = %class,),
-        (None, Some(remaining)) => emit!(deadline_remaining_ms = remaining,),
-        (None, None) => emit!(),
+        (Some(class), None) => emit_with_cap!(error_class = %class,),
+        (None, Some(remaining)) => emit_with_cap!(deadline_remaining_ms = remaining,),
+        (None, None) => emit_with_cap!(),
     }
 }
 

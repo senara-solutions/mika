@@ -113,6 +113,19 @@ pub const DEFAULT_OUTPUT_TOKENS_PER_SEC_FLOOR: u64 = 50;
 /// Environment variable overriding [`DEFAULT_OUTPUT_TOKENS_PER_SEC_FLOOR`].
 pub const OUTPUT_TOKENS_PER_SEC_FLOOR_ENV_VAR: &str = "MIKA_LLM_OUTPUT_TOKENS_PER_SEC_FLOOR";
 
+/// Numerator of the tolerance under which an elapsed time still counts as
+/// "cut at the plafond" (mika#2280 D3).
+///
+/// `98 / 100`. Derived from the measured distribution rather than picked for
+/// roundness: mika#2189's 209 failures have **no tail**, only two values —
+/// 171 at exactly 240 s and 37 at exactly 120 s. The events pile up on the
+/// exact figure, so a tight tolerance suffices, and tight is the right side of
+/// the risk: a false positive would send an operator to raise a plafond that
+/// was not the cause.
+const CAP_EXHAUSTION_TOLERANCE_NUM: u64 = 98;
+/// Denominator of the cap-exhaustion tolerance (see [`CAP_EXHAUSTION_TOLERANCE_NUM`]).
+const CAP_EXHAUSTION_TOLERANCE_DEN: u64 = 100;
+
 /// Numerator of the typical-call-duration fraction of the per-call cap.
 ///
 /// `90 / 120 = 0.75` — the pre-mika#2189 literal `TYPICAL_CALL_DURATION_SECS`
@@ -406,6 +419,31 @@ impl LlmTimeoutBudget {
             reachable += 1;
         }
         reachable
+    }
+
+    /// Did an attempt that lasted `elapsed_ms` run out of **plafond**, as
+    /// opposed to running into a network failure (mika#2280 D2/D3)?
+    ///
+    /// `elapsed_ms >= cap × 98 / 100`. A body that stops arriving at ≈ the cap
+    /// is a guillotine — the model was still generating; a body that stops at an
+    /// arbitrary instant is a breakdown. Both surface as
+    /// `LlmError::Transport` and both answer `transport_timeout` to
+    /// [`super::error::LlmError::error_class`], which is precisely why the
+    /// discriminator has to be the elapsed time.
+    ///
+    /// **Only meaningful on a rail that applies the budget it was built with.**
+    /// The Anthropic rail hands `reqwest` its own literal instead of reading
+    /// the plafond (mika#2189), so this must not be asked there — it would
+    /// compare against a bound that does not govern the call.
+    ///
+    /// This is the **only** site where the tolerance is written. Two rails ask
+    /// the question and neither carries a copy — the lesson `retry_gate` had to
+    /// engrave in mika#2362, where three copies of one threshold drifted apart.
+    pub fn is_cap_exhaustion(&self, elapsed_ms: u64) -> bool {
+        let cap_ms = self.http_timeout_secs.saturating_mul(1_000);
+        let floor_ms = cap_ms.saturating_mul(CAP_EXHAUSTION_TOLERANCE_NUM)
+            / CAP_EXHAUSTION_TOLERANCE_DEN.max(1);
+        elapsed_ms >= floor_ms
     }
 
     /// How many output tokens this plafond can physically carry, at an assumed
@@ -868,6 +906,33 @@ mod tests {
         let budget = LlmTimeoutBudget::default();
         assert_eq!(budget.reachable_output_tokens(0), 0);
         assert_eq!(budget.reachable_output_tokens(u64::MAX), u64::MAX);
+    }
+
+    /// D3 — the tolerance, with both controls in the same call.
+    ///
+    /// A probe that only saw the firing side could not tell a discriminator
+    /// that works from one that answers `true` to everything — and `true` to
+    /// everything is exactly what turns this instrument into a liar.
+    #[test]
+    fn mika2280_cap_exhaustion_is_the_measured_two_percent() {
+        let fleet = LlmTimeoutBudget::default(); // 120 s
+
+        // Positive control: the measured signature — a body cut AT the cap.
+        assert!(fleet.is_cap_exhaustion(120_000));
+        // And just inside the tolerance: 98 % of 120 s.
+        assert!(fleet.is_cap_exhaustion(117_600));
+
+        // Negative control: a body that stopped at an arbitrary instant. That
+        // is a breakdown, and it must not read as a guillotine.
+        assert!(!fleet.is_cap_exhaustion(117_599));
+        assert!(!fleet.is_cap_exhaustion(3_000));
+        assert!(!fleet.is_cap_exhaustion(0));
+
+        // It follows the plafond rather than a literal: at 240 s the same 120 s
+        // elapsed is now early, not late.
+        let arch = LlmTimeoutBudget::new(240, 900).expect("valid geometry");
+        assert!(!arch.is_cap_exhaustion(120_000));
+        assert!(arch.is_cap_exhaustion(240_000));
     }
 
     // -- AC2: the throughput floor, three tiers --
