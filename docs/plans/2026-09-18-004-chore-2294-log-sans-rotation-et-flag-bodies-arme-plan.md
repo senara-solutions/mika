@@ -53,8 +53,12 @@ crates/mika-common/src/llm/ollama.rs:464  llm request body
 crates/mika-common/src/llm/ollama.rs:562  llm response body
 ```
 
-Vérification : `grep -rn 'llm request body\|llm response body' crates/` — six lignes,
-zéro `info!`.
+Vérification : `grep -rn 'llm request body\|llm response body' crates/` — **huit** lignes,
+zéro `info!`. Les six ci-dessus, plus deux dans
+`crates/mika-common/tests/tui_llm_body_capture.rs:46-47`, qui émettent les mêmes marqueurs
+pour éprouver la capture (V2). Le compte à opposer au ticket est donc « six sites de
+production », et la commande brute en rend huit — le dire ici évite que le relecteur qui la
+rejoue lise l'écart comme une erreur du plan.
 
 **Conséquence directe : le remède (1) du ticket est un no-op.** Il n'y a pas de niveau à
 abaisser ; il est déjà au plancher, sur une cible que le filtre par défaut n'admet pas.
@@ -101,7 +105,10 @@ l'étape 0 ci-dessous, avec ses branches — et non une affirmation.
 
 - `.env.example:136` le pose **commenté**, à `false`.
 - `/etc/conf.d/mika-spirit` (hors dépôt, lu pendant l'étude) ne le mentionne pas.
-- `packaging/systemd/mika-spirit.service` ne le mentionne pas.
+- `packaging/systemd/mika-spirit.service` ne le mentionne pas — **mais il pose
+  `MIKA_SPIRIT_LOG_FILE=/var/log/mika/server.log` et `User=mika`**, ce qui est sans effet
+  sur *ce* point et décisif pour E9 : c'est un troisième déploiement, versionné, qui écrit
+  au chemin de gentux sous un autre propriétaire.
 
 Il vient donc de `~/.mika/.env`, que le script OpenRC source (`set -a ; . /home/samidarko/.mika/.env ; set +a`), ou de l'environnement du service. C'est une variable posée à la main, un jour, pour un diagnostic — et jamais retirée. Le code **dit déjà qu'elle est armée** : `announce_llm_body_capture` émet un `warn!` `llm_body_capture` au démarrage, nommant le fichier de destination (`logging.rs:296`).
 
@@ -267,20 +274,27 @@ est local), mais c'est une raison indépendante de borner la rétention plutôt 
 garder 22 Go de prompts complets *ad vitam*. Élargir le scrubber au journal est hors
 périmètre — voir la dernière section.
 
-### E9 — Il y a **deux** déploiements, et celui que le dépôt versionne n'écrit pas où ce plan regardait
+### E9 — Il y a **trois** déploiements, et deux d'entre eux écrivent au même chemin sous deux propriétaires différents
 
 La première version de ce plan a raisonné sur un seul chemin, `/var/log/mika/server.log`,
-et a qualifié sa configuration de « hors dépôt, lue pendant l'étude ». C'est exact pour la
-machine de Vincent — et c'est **la seule des deux** installations à être hors dépôt. Le
-dépôt en versionne une autre, sous `os/` :
+et a qualifié sa configuration de « hors dépôt, lue pendant l'étude ». La deuxième en a
+trouvé un second sous `os/`. Il y en a **trois**, et c'est le troisième — le paquet
+Debian, que les deux versions précédentes ont traité comme un cas hypothétique — qui rend
+le volet A non installable en l'état (E9b) :
 
-| | gentux (poste opérateur) | mika-os (`os/`, versionné) |
-|---|---|---|
-| Utilisateur | `samidarko` | `mika:mika` (`init.d/mika-spirit`) |
-| `MIKA_SPIRIT_LOG_FILE` | posé hors dépôt | `/home/mika/.mika/logs/mika-spirit.log` (`conf.d/mika-spirit:12`) |
-| `output_log` / `error_log` | `/var/log/mika/server.log` | **le même** `/home/mika/.mika/logs/mika-spirit.log` (`init.d:15-16`) |
-| Log gateway | `/var/log/mika-gateway/` (supposé, cf. A1) | `/home/mika/.mika/logs/mika-gateway.log` (`conf.d/mika-gateway:31`) |
-| Dans la CI | non | **oui** — 5 cibles buildées (`ci.yml:385-395`) |
+| | gentux (poste opérateur) | Debian / systemd (`packaging/`, versionné) | mika-os (`os/`, versionné) |
+|---|---|---|---|
+| Utilisateur | `samidarko` | `mika` (`mika-spirit.service`, `User=`) | `mika:mika` (`init.d/mika-spirit`) |
+| `MIKA_SPIRIT_LOG_FILE` | posé hors dépôt | **`/var/log/mika/server.log`** (posé dans l'unité, `Environment=`) | `/home/mika/.mika/logs/mika-spirit.log` (`conf.d/mika-spirit:11`) |
+| `output_log` / `error_log` | `/var/log/mika/server.log` | s.o. (systemd, pas de redirection) | **le même** `/home/mika/.mika/logs/mika-spirit.log` (`init.d:15-16`) |
+| Log gateway | `/var/log/mika-gateway/` (supposé, cf. A1) | pas d'unité gateway (`packaging/systemd/` n'en contient qu'une) | `/home/mika/.mika/logs/mika-gateway.log` (`conf.d/mika-gateway:31`) |
+| Dans la CI | non | non | **oui** — 5 cibles buildées (`ci.yml:385-395`) |
+| logrotate applicable ? | oui | oui | **non** (E10) |
+
+Le paquet Debian n'est pas une hypothèse de packaging : son `postinst` crée
+`/var/log/mika` en `mika:mika` (`install -d -m 0755 -o mika -g mika`) et son unité y dirige
+le journal. C'est le seul des trois où la rotation est à la fois applicable **et**
+automatisable par le dépôt lui-même.
 
 Et ce second déploiement n'est pas une relique de démonstration : `os/README.md` nomme
 `mika-runtime-server` « mika-cloud per-customer agent container » et `mika-runtime-gateway`
@@ -293,6 +307,40 @@ déploiement versionné, buildé en CI et servi aux tenants, n'est couvert par a
 `missingok` — présent à juste titre — fait que le fichier s'installe **sans erreur** sur
 une machine où il ne fait rien. C'est exactement la classe de panne que E6b nomme pour la
 syntaxe : *le fichier reste valide et la rotation paraît configurée.*
+
+### E9b — Un même glob, deux propriétaires : `su` ne peut pas être résolu dans un fichier unique
+
+`/var/log/mika/*.log` est écrit par **deux** des trois déploiements, sous **deux**
+utilisateurs : `samidarko` sur gentux, `mika` sous Debian/systemd. La version précédente
+du volet A posait `su samidarko samidarko` sur ce glob dans un fichier annoncé comme
+versionné et unique, puis mentionnait en A2 « la variante `su mika mika` pour ce paquet ».
+Les deux moitiés ne décrivent pas le même artefact, et la contradiction n'est pas
+rattrapable par la syntaxe :
+
+- **`su` est par bloc**, donc il faudrait deux blocs pour deux propriétaires ;
+- **mais logrotate refuse qu'un même chemin apparaisse dans deux blocs** — il échoue sur
+  `duplicate log entry for /var/log/mika/*.log` et **n'exécute aucune des deux
+  définitions** du fichier concerné ;
+- et `missingok` ne rattrape ni l'un ni l'autre : le plan le dit déjà lui-même — *il tait
+  l'absence de fichier, pas un refus de permission*.
+
+Autrement dit, sur ce glob, le fichier versionné doit choisir **un** propriétaire. Il ne
+peut pas servir gentux et le paquet Debian à la fois.
+
+**Et `su` n'est peut-être pas nécessaire du tout.** Il ne sert qu'à faire opérer logrotate
+sous une identité non-root dans un répertoire dont il refuserait autrement les permissions
+(« parent directory has insecure permissions »). logrotate tourne en root sous cron ;
+`/var/log/mika` est en `0755 root`-lisible dans les deux cas. Poser un `su` faux est donc
+plus dangereux que ne pas en poser, puisqu'il abaisse délibérément les privilèges vers un
+utilisateur qui peut ne pas exister sur la machine (`samidarko` n'existe pas sur une
+install Debian, et logrotate échoue alors sur l'utilisateur inconnu).
+
+**Non vérifiable depuis le worktree** (logrotate absent du sandbox, comme en E6b). Les
+trois affirmations ci-dessus — refus du chemin dupliqué, échec sur utilisateur inconnu,
+inutilité de `su` sous root — sont donc à **confirmer par `logrotate --debug`** (A6) avant
+installation. La conception de A1 ci-dessous est bâtie pour être juste dans les deux cas :
+elle ne pose aucun chemin en double, et elle traite `su` comme un ajustement
+d'installation plutôt que comme un invariant versionné.
 
 ### E10 — Dans les conteneurs, logrotate ne peut pas fonctionner, et la voie de repli est fermée
 
@@ -448,11 +496,19 @@ grep flags /proc/$pid/fdinfo/<fd>
 ls -l /var/log/mika-gateway/ /var/log/mika/ 2>&1
 tr '\0' '\n' < /proc/$(pgrep -f mika-gateway)/environ | grep MIKA_GATEWAY_LOG_FILE
 
-# Q5 — quel déploiement est devant moi ? (E9 : il y en a deux, et un seul est dans le dépôt)
-id -un $(stat -c %U /proc/$pid)          # samidarko => gentux ; mika => install `mika`
+# Q5 — quel déploiement est devant moi ? (E9 : il y en a TROIS)
+stat -c %U /proc/$pid                    # samidarko => gentux ; mika => Debian ou mika-os
 tr '\0' '\n' < /proc/$pid/environ | grep MIKA_SPIRIT_LOG_FILE
+#   /var/log/mika/server.log   + user mika       => paquet Debian/systemd
+#   /home/mika/.mika/logs/...  + user mika       => mika-os (E10 : non couvert)
 command -v logrotate && ls /etc/cron*/ 2>/dev/null | head
 #   ^ absence des DEUX => E10 : le fichier de A1 ne tournera pas ici, quoi qu'on installe
+
+# Q6 — faut-il un `su` ? (E9b : il n'est PAS dans le fichier versionné)
+stat -c '%U %G %a' /var/log/mika /var/log/mika-gateway /home/mika/.mika/logs 2>/dev/null
+logrotate --debug packaging/logrotate/mika 2>&1 | grep -i 'insecure\|skipping\|duplicate'
+#   ^ « insecure permissions » => ajouter `su <proprietaire constate>` À L'INSTALLATION
+#   ^ « duplicate log entry »  => un glob a ete dedouble : corriger le fichier, pas le su
 ```
 
 Branches :
@@ -470,22 +526,25 @@ Branches :
 **A1.** Créer `packaging/logrotate/mika` :
 
 ```
-# Bloc 1 — installation opérateur (gentux) : service sous samidarko.
-/var/log/mika/*.log /var/log/mika-gateway/*.log {
-    daily
-    maxsize 200M
-    rotate 14
-    compress
-    missingok
-    notifempty
-    copytruncate
-    su samidarko samidarko
-}
+# Rotation des journaux Mika. Voir docs/runtime-structure.md § Log File Locations.
+#
+# copytruncate est OBLIGATOIRE, pas un choix de style : l'appender (tracing_appender)
+# et supervise-daemon gardent leur descripteur ouvert et aucun des deux ne sait rouvrir
+# sur signal. Un `create` les laisserait écrire dans l'inode renommé — le fichier
+# courant resterait vide pour toujours, en silence. Ne PAS ajouter `create` : sans
+# effet ici, et contredit la garde CI.
+#
+# maxsize (et non size) : seul maxsize se compose avec `daily`. Avec `size`, `daily`
+# serait ignoré et un journal calme ne tournerait jamais.
+#
+# Aucun `su` : logrotate tourne en root sous cron et les répertoires visés sont
+# root-traversables. Un `su` nommant un utilisateur absent de la machine fait échouer
+# le bloc. Si logrotate signale « parent directory has insecure permissions », ajouter
+# le `su` correspondant au propriétaire CONSTATÉ (Q4/Q5 du volet 0) — c'est un
+# ajustement d'installation, pas une valeur versionnable : le même chemin est écrit
+# par `samidarko` sur gentux et par `mika` sous Debian (E9b).
 
-# Bloc 2 — installation sous l'utilisateur `mika` (paquet Debian, mika-os bare-metal).
-# Voir E10 : dans l'IMAGE mika-os ce bloc ne s'exécute jamais (ni logrotate ni cron) —
-# il sert les installations où le service tourne sous `mika` avec un logrotate système.
-/home/mika/.mika/logs/*.log {
+/var/log/mika/*.log /var/log/mika-gateway/*.log /home/mika/.mika/logs/*.log {
     daily
     maxsize 200M
     rotate 14
@@ -493,15 +552,19 @@ Branches :
     missingok
     notifempty
     copytruncate
-    su mika mika
 }
 ```
 
-**Deux blocs et non trois globs dans un seul, parce que `su` est par bloc.** Les fichiers
-de gentux appartiennent à `samidarko`, ceux de l'installation `mika` à `mika:mika`
-(`init.d/mika-spirit` : `command_user="mika:mika"`). Un bloc unique portant un seul `su`
-échouerait sur la moitié des chemins — et `missingok` ne couvre pas ce cas : il tait
-l'absence de fichier, pas un refus de permission.
+**Un seul bloc, et c'est E9b qui l'impose.** La version précédente en posait deux, pour
+porter deux `su`. C'est non installable : `/var/log/mika/*.log` est écrit par gentux
+(`samidarko`) **et** par le paquet Debian (`mika`, via `Environment=MIKA_SPIRIT_LOG_FILE`
+dans l'unité), donc les deux blocs auraient dû se partager le même glob — ce que logrotate
+refuse (`duplicate log entry`), en n'exécutant **aucune** des deux définitions. Le fichier
+versionné porte donc la forme qui vaut partout, et `su` redevient ce qu'il est : une
+correction locale, à poser seulement si `logrotate --debug` la réclame.
+
+`missingok` reste porteur — il rend chaque glob inoffensif là où il ne correspond à rien,
+ce qui est le cas de deux globs sur trois dans chaque installation.
 
 Notes de conception, à porter en commentaire dans le fichier :
 - `copytruncate` est **obligatoire** et non un choix de style — voir D2/E6 ; le
@@ -513,9 +576,12 @@ Notes de conception, à porter en commentaire dans le fichier :
 - Pas de `delaycompress` : superflu avec `copytruncate` (E6b-c).
 - `rotate 14` + `compress` : la borne dure. À 200 Mo par archive compressée ~10×, le
   plafond est de l'ordre de quelques centaines de Mo — contre 22 Go aujourd'hui.
-- `su` nomme l'utilisateur propriétaire : le service tourne en `samidarko`
-  (`command_user="samidarko"` dans l'init OpenRC), pas en `mika` comme le suppose le
-  `postinst` Debian. Les deux cas sont à couvrir en doc plutôt qu'à deviner.
+- Pas de `su` dans le fichier versionné (E9b). Le propriétaire du **même** chemin diffère
+  d'une installation à l'autre — `samidarko` sur gentux (`command_user="samidarko"` dans
+  l'init OpenRC), `mika` sous Debian (`User=mika` dans l'unité, et `postinst` qui crée
+  `/var/log/mika` en `mika:mika`). Un `su` versionné serait faux sur l'une des deux et
+  échouerait sur un utilisateur inexistant. Le geste, s'il est nécessaire, est documenté
+  en A3 et décidé sur la sortie de `logrotate --debug`.
 - **Le gateway n'écrit pas dans le même répertoire, et le dépôt donne _trois_ chemins
   différents — aucun ne fait autorité.** La version initiale de ce plan affirmait que
   `/var/log/mika-gateway/gateway.log` était « la seule référence de chemin du dépôt ».
@@ -527,19 +593,31 @@ Notes de conception, à porter en commentaire dans le fichier :
   - `scripts/audit-egress-no-log.sh:38` — un **défaut de repli** vers
     `$HOME/.mika/logs/mika-gateway.log`.
 
-  Les deux blocs ci-dessus couvrent le premier et le deuxième. `missingok` rend chaque
+  Le bloc ci-dessus couvre le premier et le deuxième. `missingok` rend chaque
   glob inoffensif là où il ne correspond à rien. Le chemin réellement en vigueur reste à
   **constater** à l'installation (Q4 du volet 0) plutôt qu'à déduire de la documentation :
   le corriger dans le fichier est alors une ligne.
 
-**A2.** `packaging/debian/mika-spirit.postinst` : installer le fichier sous
-`/etc/logrotate.d/mika` (avec la variante `su mika mika` pour ce paquet), après la
-création de `/var/log/mika`.
+**A2.** `packaging/debian/mika-spirit.postinst` : installer le fichier **tel quel** sous
+`/etc/logrotate.d/mika`, après la création de `/var/log/mika` (ligne 16). Pas de variante,
+pas de réécriture de `su` — c'est ce que E9b rend impossible et que A1 a supprimé.
+
+Ce volet est le seul des trois déploiements où le dépôt peut **automatiser** la rotation :
+l'unité pose `MIKA_SPIRIT_LOG_FILE=/var/log/mika/server.log`, le `postinst` crée le
+répertoire, et une machine Debian a logrotate et cron. Gentux reste un geste manuel (A3)
+et mika-os reste non couvert (E10).
+
+Le paquet ne livre **pas** d'unité gateway (`packaging/systemd/` n'en contient qu'une), donc
+le glob `/var/log/mika-gateway/*.log` y est inerte — couvert par `missingok`, comme prévu.
 
 **A3.** Doc — `docs/runtime-structure.md` : la colonne `Rotation` des quatre lignes
 `None` devient une référence à la politique logrotate, avec la phrase qui manque
 aujourd'hui : *sans installation de `/etc/logrotate.d/mika`, ce fichier croît sans
-borne.* Plus le chemin du fichier versionné et le geste d'installation OpenRC.
+borne.* Plus le chemin du fichier versionné et le geste d'installation OpenRC
+(`install -m 0644 packaging/logrotate/mika /etc/logrotate.d/mika`, en root), **et** la
+note `su` de E9b : le fichier n'en porte pas, et il faut l'ajouter à la main si
+`logrotate --debug` signale « insecure permissions » — avec le propriétaire constaté, qui
+diffère selon l'installation.
 
 **La mention doit dire _quel déploiement_ la politique couvre** (E9/E10), sans quoi elle
 troque `None` — qui est vrai — contre une rotation qui n'a pas lieu dans l'image, ce qui
@@ -584,12 +662,25 @@ statique pour la CI.
 `grep -c '"llm request body' /var/log/mika/server.log` sur la fenêtre post-redémarrage
 (attendu : 0) et par l'absence du WARN `llm_body_capture` au démarrage suivant.
 
-**B2.** Doc — `docs/configuration.md`, entrée `MIKA_LOG_LLM_BODIES` : ajouter la phrase
-que l'incident rend nécessaire. Le flag est **dev-only et à retirer après usage** ; armé
-en permanence sur un mika-spirit il produit l'essentiel du volume du journal ; son
-armement est constatable par `grep llm_body_capture $MIKA_SPIRIT_LOG_FILE` (le WARN de
-démarrage) et le désarmer exige un **redémarrage** (lu une fois par process,
-non-hot-swappable — même contrat que `MIKA_AGENT_TIER` et `MIKA_DEPLOYMENT`).
+**B2.** Doc — `docs/configuration.md` : **créer** l'entrée `MIKA_LOG_LLM_BODIES`. Elle
+n'existe pas — `grep -rn 'log_llm_bodies\|LOG_LLM_BODIES' docs/*.md` ne rend **rien**,
+alors que `spirit_log_file` est documenté (ligne 414) et que `MIKA_GATEWAY_LOG_FILE` l'est
+(ligne 776). La variable n'est décrite aujourd'hui qu'au `CLAUDE.md` racine (§ *runtime
+observability*, enrichi par mika#2220) et en commentaire dans `.env.example:136`.
+
+C'est un écart qui mérite d'être nommé plutôt que corrigé en passant : la page qu'un
+opérateur lit pour poser une variable est justement celle qui ne mentionne pas celle-ci —
+et c'est la seule dont l'armement permanent produit un journal de 22 Go. L'entrée doit
+dire : le flag est **dev-only et à retirer après usage** ; armé en permanence sur un
+mika-spirit il produit l'essentiel du volume du journal ; son armement est constatable par
+`grep llm_body_capture $MIKA_SPIRIT_LOG_FILE` (le WARN de démarrage) ; le désarmer exige un
+**redémarrage** (lu une fois par process, non-hot-swappable — même contrat que
+`MIKA_AGENT_TIER` et `MIKA_DEPLOYMENT`) ; et il doit être armé **sur le process qui exécute
+le tour**, qui depuis mika#1727 est mika-spirit et non le CLI.
+
+Rédiger l'entrée **en accord** avec le `CLAUDE.md` racine, qui porte déjà la table de
+vérité des valeurs acceptées et le piège « armé sur le mauvais process » : la doc de
+référence doit renvoyer à cette section, pas la paraphraser de travers.
 
 **B3.** `.env.example:136` : le commentaire dit « dev-only » ; y ajouter « — retirer
 après le diagnostic ; armé en permanence, c'est le premier poste de volume du journal ».
@@ -633,7 +724,7 @@ part dans son propre ticket sans rien retirer aux volets A et B.
 | V1 | Aucun body LLM n'est émis en INFO | Test de source dans `logging.rs::tests` : les six sites `llm re{quest,sponse} body` sont tous `debug!` sur `mika::llm_debug`. Une régression vers `info!` ou vers la cible par défaut rougit |
 | V2 | Désarmé, aucun body n'est écrit | Test existant `crates/mika-common/tests/tui_llm_body_capture.rs` — étendre si besoin pour asserter l'absence des marqueurs quand `log_llm_bodies = false` |
 | V3 | Le body n'est **pas** tronqué quand armé | Test : un body dépassant 60 Ko (taille du prompt système mika-arch) traverse intact. Garde contre une « optimisation » future qui reprendrait le remède (2) du ticket et casserait les sondes mika#2290 / mika#2331 |
-| V4 | Le fichier logrotate emploie `copytruncate`, et **aucune** des trois directives-pièges | `scripts/check-logrotate-directives.sh` + job CI dédié, **et** son test négatif `scripts/test-check-logrotate-directives.sh` — le pattern établi du dépôt (`check-byte-slices`, `check-image-tags-immutable`, `check-dispatch-seats-declared`), retenu ici plutôt qu'un test Rust : le fichier vit sous `packaging/`, hors de tout crate, et `ci.yml` porte la doctrine en toutes lettres — *« A guard nobody has watched go red is a decoration — mika#2103 »*. Le garde assert : présence de `copytruncate` ; **absence** de `create` (sans effet avec `copytruncate`, E6b-b) ; **absence** de `size ` en début de directive (qui ferait taire `daily`, E6b-a — noter l'espace, `maxsize` ne doit pas déclencher la garde) ; et **un `su` par bloc** (A1). Ces gardes existent parce que les quatre erreurs sont **silencieuses** : le fichier reste valide et la rotation paraît configurée. Complété par `logrotate --debug` à l'installation (A6) |
+| V4 | Le fichier logrotate emploie `copytruncate`, et **aucune** des trois directives-pièges | `scripts/check-logrotate-directives.sh` + job CI dédié, **et** son test négatif `scripts/test-check-logrotate-directives.sh` — le pattern établi du dépôt (`check-byte-slices`, `check-image-tags-immutable`, `check-dispatch-seats-declared`), retenu ici plutôt qu'un test Rust : le fichier vit sous `packaging/`, hors de tout crate, et `ci.yml` porte la doctrine en toutes lettres — *« A guard nobody has watched go red is a decoration — mika#2103 »*. Le garde assert : présence de `copytruncate` ; **absence** de `create` (sans effet avec `copytruncate`, E6b-b) ; **absence** de `size ` en début de directive (qui ferait taire `daily`, E6b-a — noter l'espace, `maxsize` ne doit pas déclencher la garde) ; **aucun chemin en double** entre blocs (E9b : logrotate échoue sur `duplicate log entry` et n'exécute alors **aucune** des deux définitions) ; et **aucune directive `su`** dans le fichier versionné (E9b : le propriétaire du même chemin diffère selon l'installation, un `su` versionné est faux sur l'une des deux et échoue sur un utilisateur inexistant). Ces gardes existent parce que les cinq erreurs sont **silencieuses ou mal attribuées** : le fichier reste valide et la rotation paraît configurée. Complété par `logrotate --debug` à l'installation (A6) |
 | V10 | Le fichier couvre les chemins des deux déploiements | Le même garde vérifie la présence des globs de `/var/log/mika/` **et** de `/home/mika/.mika/logs/` (E9). Sans cette ligne, une régression qui retire un glob ne se voit nulle part : `missingok` la rend silencieuse sur la machine qui n'est pas concernée |
 | V5 | L'invariant mika#2195 survit | `json_stdout_layer_enabled` et ses tests sont inchangés ; le volet A ne touche pas `logging.rs` |
 | V6 | La rétention par-agent borne bien | Test sur `Builder::max_log_files` : au-delà de N fichiers, les plus anciens disparaissent. Test d'intégration avec un `tempdir`, pas un test de source |
@@ -669,9 +760,10 @@ part dans son propre ticket sans rien retirer aux volets A et B.
 ## Definition of Done
 
 - `packaging/logrotate/mika` existe, versionné, commenté sur le pourquoi de
-  `copytruncate` **et sur les trois directives-pièges de E6b**, en **deux blocs** (un par
-  propriétaire, A1), validé par `logrotate --debug` (A6), et installé sur la machine de
-  production après la vérification Q3.
+  `copytruncate` **et sur les trois directives-pièges de E6b**, en **un bloc unique et
+  sans directive `su`** (E9b : le même chemin a deux propriétaires selon l'installation, et
+  logrotate refuse un chemin dupliqué entre blocs), validé par `logrotate --debug` (A6), et
+  installé sur la machine de production après la vérification Q3.
 - `scripts/check-logrotate-directives.sh`, son test négatif et son job CI existent (V4/V10)
   — le pattern `check-*` / `test-check-*` du dépôt, pas un test Rust.
 - La restriction du déploiement conteneur (E10) est écrite dans `docs/runtime-structure.md`
@@ -707,7 +799,9 @@ dérivés de son §Fix et du contrat de vérification.
   qui peuvent l'exécuter.** Fichier logrotate versionné, installé, avec une borne dure
   (`rotate 14` + `maxsize 200M` + `compress` — `maxsize` et non `size`, E6b-a), et sans
   changer le chemin que les sondes opérateur visent (D2, V7). Couvre `mika-gateway`, dont
-  le répertoire de log est distinct, et les deux propriétaires via deux blocs `su` (A1).
+  le répertoire de log est distinct, et **installable sans modification sur les deux
+  déploiements qui peuvent l'exécuter** — un bloc unique, aucun `su` versionné (E9b), le
+  `postinst` Debian l'installe tel quel (A2) et gentux par un geste documenté (A3).
   **Ne couvre pas les images `os/Dockerfile`** (E10) : la restriction est écrite dans la
   doc et portée par un ticket de suivi (D6), elle n'est pas passée sous silence.
 - **AC4 — La cause du volume est établie par mesure, pas par inférence.** Volet 0
@@ -764,8 +858,10 @@ C'est précisément la classe de panne dont la signature est l'absence de signat
 - **`mika-gateway` — tranché, et ramené dans le périmètre.** Il porte le même
   `Rotation: None` sur ses deux lignes, et son log ne vit pas sous `/var/log/mika/`. Le
   dépôt donne **trois** chemins divergents et aucun ne fait autorité (voir la note de A1) ;
-  les deux blocs couvrent les deux plausibles, `missingok` rend chaque glob inoffensif
-  ailleurs, et Q4 tranche à l'installation. Ce point n'est plus un suivi.
+  le bloc unique de A1 couvre les deux plausibles, `missingok` rend chaque glob inoffensif
+  ailleurs, et Q4 tranche à l'installation. Ce point n'est plus un suivi. À noter que le
+  paquet Debian ne livre **aucune** unité gateway : sur ce déploiement le glob est inerte
+  par construction, pas par accident.
 - **Rotation des journaux dans les images `os/Dockerfile` — suivi, avec son constat.**
   E9/E10 : le déploiement versionné (et servi aux tenants via `mika-runtime-server`)
   n'exécute pas logrotate — ni binaire ni cron — et `MIKA_SPIRIT_LOG_FILE` y ferme la
