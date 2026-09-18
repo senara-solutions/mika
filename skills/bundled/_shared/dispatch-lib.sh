@@ -286,15 +286,6 @@ _PILOT_EGRESS_SOCK="/tmp/mika-pilot-egress.sock"
 _PILOT_EGRESS_TCP_PORT="8891"
 _PILOT_EGRESS_PROXY_BIN="$HOME/.local/bin/mika-pilot-egress-proxy"
 
-# mika#2313: sandbox-safe ~/.claude.json emitter (installed alongside the
-# proxy by `make install`). The sandbox blanks /home (--tmpfs) and never binds
-# ~/.claude.json, so the CLI loses its cached GrowthBook feature flags — which
-# govern the prompt-cache cache_control strategy. Result before this: every
-# turn re-creates the full 100-250k-token context (cache_read=0), 355s turns,
-# subscription burn. The emitter is an allowlist of feature-flag/cache keys
-# ONLY (never account/credential keys — mika#2039). See scripts/.
-_PILOT_SANITIZE_CLAUDE_JSON_BIN="$HOME/.local/bin/mika-pilot-sanitize-claude-json"
-
 # Helper daemon for anthropic api chain (2026-08-05).
 # Addon path = installed alongside the proxy binary in ~/.local/bin/ (see
 # Makefile install target); NOT a hardcoded repo path (would fail when
@@ -967,25 +958,6 @@ _run_pilot_sandboxed() {
     local -a _PILOT_LOG_BIND_ARGS=()
     _pilot_log_bind_args
 
-    # mika#2313: regenerate a sandbox-safe ~/.claude.json fresh each dispatch
-    # (the GrowthBook flags carry an expiry) and ro-bind it, restoring the
-    # prompt cache (measured: cache_read 0 -> 31226). Like the log bind, this
-    # never refuses the launch — a missing/failed emitter degrades to the old
-    # cache-cold behaviour, not a lost dispatch. mika#2039: the emitter is a
-    # key allowlist, so no credential can reach the sandbox by construction.
-    local -a _PILOT_CLAUDE_JSON_BIND_ARGS=()
-    local _PILOT_CLAUDE_JSON=""
-    if [ -f "$HOME/.claude.json" ] && [ -x "$_PILOT_SANITIZE_CLAUDE_JSON_BIN" ]; then
-        _PILOT_CLAUDE_JSON="$(mktemp "${TMPDIR:-/tmp}/mika-pilot-claude-json.XXXXXX")"
-        trap 'rm -f "$_PILOT_CLAUDE_JSON"' RETURN
-        if "$_PILOT_SANITIZE_CLAUDE_JSON_BIN" "$HOME/.claude.json" > "$_PILOT_CLAUDE_JSON" 2>/dev/null && [ -s "$_PILOT_CLAUDE_JSON" ]; then
-            _PILOT_CLAUDE_JSON_BIND_ARGS=(--ro-bind "$_PILOT_CLAUDE_JSON" "$HOME/.claude.json")
-        else
-            echo "dispatch-lib: ~/.claude.json emitter produced nothing — pilot runs cache-cold (mika#2313)" >&2
-            rm -f "$_PILOT_CLAUDE_JSON"; _PILOT_CLAUDE_JSON=""
-        fi
-    fi
-
     # Phase 2b: launch host-side egress proxy (idempotent). If it's not
     # available (binary missing, first deploy), returns non-zero and we run
     # in Phase 2a mode (fs cut only, network open) — degraded but functional.
@@ -1194,7 +1166,6 @@ _run_pilot_sandboxed() {
             --ro-bind-try "/data/workspace/mika-platform/claude-pilot/src" "/data/workspace/mika-platform/claude-pilot/src" \
             --ro-bind-try "$HOME/.claude/plugins" "$HOME/.claude/plugins" \
             --ro-bind-try "$HOME/.claude/settings.json" "$HOME/.claude/settings.json" \
-            ${_PILOT_CLAUDE_JSON_BIND_ARGS[@]+"${_PILOT_CLAUDE_JSON_BIND_ARGS[@]}"} \
             --ro-bind-try "$HOME/.claude/commands" "$HOME/.claude/commands" \
             --ro-bind-try "$HOME/.claude/hooks" "$HOME/.claude/hooks" \
             --ro-bind-try "$HOME/.nvm/versions" "$HOME/.nvm/versions" \
@@ -1279,7 +1250,6 @@ $quoted_argv
             --ro-bind-try "/data/workspace/mika-platform/claude-pilot/src" "/data/workspace/mika-platform/claude-pilot/src" \
             --ro-bind-try "$HOME/.claude/plugins" "$HOME/.claude/plugins" \
             --ro-bind-try "$HOME/.claude/settings.json" "$HOME/.claude/settings.json" \
-            ${_PILOT_CLAUDE_JSON_BIND_ARGS[@]+"${_PILOT_CLAUDE_JSON_BIND_ARGS[@]}"} \
             --ro-bind-try "$HOME/.claude/commands" "$HOME/.claude/commands" \
             --ro-bind-try "$HOME/.claude/hooks" "$HOME/.claude/hooks" \
             --ro-bind-try "$HOME/.nvm/versions" "$HOME/.nvm/versions" \
