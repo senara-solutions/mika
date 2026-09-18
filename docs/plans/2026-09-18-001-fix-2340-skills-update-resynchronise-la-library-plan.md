@@ -137,10 +137,30 @@ let disabled = settings.as_ref().is_some_and(|s| s.disable_bundled_skills);
 mika_agent::startup::seed_bundled_skills_if_needed(agent_home, disabled);
 ```
 
-`seed_bundled_skills_if_needed` compose déjà, dans cet ordre : création de la
-library, `seed_support_dirs` inconditionnel, garde `disabled` (avec détection de
-drift), `seed_bundled_skill_library` (gardé par hash, sync-shape, élagage des
+`seed_bundled_skills_if_needed` compose déjà, dans cet ordre : réparation des
+variantes orphelines, création de la library, `seed_support_dirs`
+inconditionnel, garde `disabled` (avec détection de drift),
+`seed_bundled_skill_library` (gardé par hash, sync-shape, élagage des
 orphelins), puis `materialize_agent_skill_links` avec l'allowlist d'identité.
+
+**Une différence de comportement à nommer, pour qu'elle n'arrête pas
+l'implémenteur : le layout legacy single-agent.** `seed_bundled_skills_if_needed`
+retourne **avant** `materialize_agent_skill_links` quand `resolve_global_home`
+(`startup.rs:129-137`) rend `is_multi_agent = false` — c'est-à-dire quand le
+parent d'`agent_home` ne s'appelle pas `agents`. Le code actuel d'`update_skills`
+appelle `materialize_agent_skill_links` **toujours**. La bascule supprime donc
+cet appel dans ce seul layout, et **c'est correct** : en legacy la library *est*
+le répertoire de skills de l'agent, donc la passe s'exécuterait contre elle-même
+— le commentaire de `startup.rs:108-111` le dit dans ces termes. La topologie du
+ticket (`~/.mika/agents/mika-arch/skills`) est multi-agent, donc le chemin du
+défaut est inchangé.
+
+**Nombre d'appelants, pour la même raison.** Le composite a **quatre** sites de
+production (`init.rs:68`, `agents.rs:126`, `server/mod.rs:486`,
+`create_agent.rs:119`) plus quatre appels dans
+`tests/bundled_skill_library_e2e.rs`. C'est ce nombre qui justifie la lecture du
+sidecar par le CLI plutôt qu'un élargissement de signature (voir B2, *Lecture par
+le CLI*), et il n'a pas besoin d'être plus grand pour le justifier.
 
 **Pourquoi le composite et pas les deux appels côte à côte.** Recomposer ici
 produirait une seconde définition de « que veut dire rafraîchir les skills
@@ -228,9 +248,32 @@ Un ordre total sur les commits n'existe pas côté CLI — il faudrait interroge
 dépôt que le binaire, lancé depuis `~/.local/bin` avec un CWD arbitraire, n'a
 aucun moyen fiable de localiser.
 
+**Seconde borne, qui tient au champ lui-même : `git_hash` peut valoir
+`"unknown"`.** `build_info::GIT_HASH` (`build_info.rs:14-18`) est
+`option_env!("GIT_HASH")` avec repli sur la chaîne `"unknown"` — le repli est le
+cas d'un binaire construit hors checkout git (couche Docker, tarball source), et
+son doc-comment l'énonce déjà. Trois conséquences, écrites ici pour qu'aucune ne
+soit découverte en production :
+
+- Sur le poste opérateur, où le geste est `make deploy` depuis le checkout, le
+  sha est réel. **C'est le cas nominal du ticket et il est couvert.**
+- En container, la ligne `attested by` affichera `mika 0.12.2 (unknown)`. Ce
+  n'est pas un défaut de déploiement et la sonde V5 ne s'y applique pas : dire
+  `unknown` est la réponse honnête, et la laisser lire comme une panne serait
+  rouvrir la classe même que ce plan ferme. La documentation de B4 le dit d'une
+  phrase.
+- La garde `bundled_library_downgrade` **ne dépend pas de ce champ** : elle
+  compare les `version`, et `VERSION` est `env!("CARGO_PKG_VERSION")`, toujours
+  présent. Un sha `unknown` n'affaiblit donc pas la garde ; il n'affaiblit que la
+  précision de l'attestation.
+
+Aucun cas particulier n'est écrit dans le code pour `"unknown"` : le sidecar
+enregistre la constante telle quelle. Une valeur sentinelle réécrite par
+l'écrivain serait une seconde source de vérité sur la provenance du binaire.
+
 **Lecture par le CLI, pas retour de fonction.** `seed_bundled_skills_if_needed`
-rend `()` et a cinq appelants. Élargir sa signature pour qu'un seul imprime un
-résumé coûterait cinq sites pour un afficheur. Le CLI **relit**
+rend `()` et a quatre sites de production. Élargir sa signature pour qu'un seul
+imprime un résumé coûterait quatre sites pour un afficheur. Le CLI **relit**
 `.manifest-writer` après l'appel et imprime ce qu'il y trouve — ce qui a en plus
 la propriété d'être honnête : il rapporte le fait inscrit, pas une intention en
 mémoire.
@@ -268,16 +311,41 @@ d'afficher un couple manifeste/écrivain périmé sans commentaire.
 - Racine `CLAUDE.md` § `make deploy` — une phrase : un changement de
   `skills/bundled/**` n'est effectif qu'après reconstruction, et
   `~/.mika/skills/.manifest-writer` est la sonde de vérification.
+- Dans les deux endroits, **une phrase sur `git_hash: "unknown"`** : c'est un
+  binaire construit hors checkout git, pas un déploiement manqué (R-f).
 
 ---
 
 ## Verification contract
 
+### V0 — Où vivent ces tests, et le harnais qui existe déjà
+
+Les cinq vérifications ne portent pas sur la même unité, donc elles ne vivent pas
+au même endroit — et l'une des deux maisons est déjà construite.
+
+- **V1 et V1.5** portent sur `update_skills`, **privé au binaire** `mika-cli`.
+  Un module `#[cfg(test)]` inline dans `crates/mika-cli/src/commands/skills.rs`
+  est la surface minimale (`lib.rs` doit rester minimal par la consigne du
+  crate) : aucun autre emplacement ne peut appeler la fonction.
+- **V2, V3 et V4** portent sur le **semeur** (`mika-agent`), pas sur la commande.
+  `crates/mika-agent/tests/bundled_skill_library_e2e.rs` existe déjà pour
+  exactement cette unité : il fournit un helper `provision_agent(tmp, name,
+  allowlist)` qui monte le layout multi-agent temporaire, et un test
+  `second_seed_is_a_noop_via_hash_gate` qui exerce **déjà** le chemin de
+  confirmation — c'est-à-dire le chemin dont V4 doit prouver qu'il rafraîchit
+  malgré tout le sidecar. Y ajouter les cas plutôt que recréer un montage évite
+  une seconde définition de « un home d'agent de test », qui est la même classe
+  de duplication que B1 refuse côté production.
+
+Cette répartition n'ajoute pas de fichier de test : elle en réutilise un et en
+crée un module inline. Elle est nommée ici parce qu'un implémenteur qui suit V1 à
+la lettre sans lire ce paragraphe écrirait les cinq au même endroit — et devrait
+alors rendre `update_skills` publique pour trois tests qui ne l'appellent pas.
+
 ### V1 — Test d'intégration : la library converge (R1, R7)
 
 Module `#[cfg(test)]` inline dans `crates/mika-cli/src/commands/skills.rs`
-(`update_skills` est privé au binaire ; un test inline est la surface minimale —
-`lib.rs` doit rester minimal par la consigne du crate).
+(voir V0 pour le motif).
 
 1. Home multi-agents temporaire : `<tmp>/agents/<a>/identity.toml` avec une
    allowlist d'un skill bundled connu.
@@ -331,21 +399,31 @@ V1 atteste le comportement, V1.5 atteste la sensibilité de V1.*
 
 ### V2 — `_shared/dispatch-lib.sh` (R2)
 
-Dans le même test : corrompre `<tmp>/skills/_shared/dispatch-lib.sh`, relancer,
+Dans `bundled_skill_library_e2e.rs` (V0), sur un home monté par
+`provision_agent` : corrompre `<tmp>/skills/_shared/dispatch-lib.sh`, re-semer,
 asserter le retour au contenu du manifeste. Couvre le second contournement du
 ticket.
 
 ### V3 — `MIKA_DISABLE_BUNDLED_SKILLS` (R3)
 
-Test asserant que sous `disabled = true` le contenu de skill corrompu **survit**
+Même fichier. Test asserant que sous `disabled = true` le contenu de skill
+corrompu **survit**
 (la garde est honorée) tandis que `_shared/` est **quand même** réécrit — la
 composition exacte de `startup.rs:68-103`. Le flag est passé en paramètre, donc
 le test ne mute aucun état global de processus.
 
 ### V4 — Écrivain et régression (R4, R5)
 
+Même fichier que V2/V3 (V0). Le cas central ci-dessous est le jumeau de
+`second_seed_is_a_noop_via_hash_gate`, qui y exerce déjà la porte de hash.
+
 - `.manifest-writer` existe après un seed, parse en JSON, porte
   `build_info::VERSION` et `build_info::GIT_HASH`.
+- **Le champ `git_hash` est asserté égal à la constante, jamais à un motif de
+  sha.** `GIT_HASH` vaut `"unknown"` hors checkout git (`build_info.rs:14-18`),
+  donc une assertion de forme (« 8 caractères hexadécimaux ») rougirait en CI
+  container sans qu'aucun comportement soit cassé — un test qui échoue là où le
+  produit est sain est un test qu'on finit par désarmer.
 - **Le sidecar est rafraîchi par la passe qui n'extrait rien** (le cœur de B2).
   Semer une fois, altérer `attested_at` et `git_hash` dans le sidecar **sans
   toucher au contenu ni à `.manifest-hash`**, re-semer : le sidecar est revenu
@@ -375,6 +453,12 @@ diff ~/.mika/agents/mika-arch/skills/mika-arch-groom-ticket/system_prompt.md \
 que le `diff` est non vide, le défaut n'est pas ici : il est dans la découverte
 `build.rs` ou dans l'extraction. Ne pas relancer `update` — c'est la
 reconstruction qu'il faut examiner.
+
+**Condition d'applicabilité de cette sonde.** Elle compare un sha, donc elle
+suppose un binaire construit dans un checkout git. Sur un binaire de container ou
+de tarball, `git_hash` est `"unknown"` (B2) et **les deux premières lignes ne
+décident rien** — seul le `diff` reste probant. Lire `unknown` comme un échec de
+déploiement serait le faux positif symétrique de celui que ce plan ferme.
 
 ---
 
@@ -572,6 +656,17 @@ au ticket, s'il est jugé souhaitable.
   Si un parseur hors dépôt existe, le changement lui apparaît comme un échec de
   correspondance franc, pas comme un silence — la bonne direction pour un défaut
   dont le sujet est précisément une phrase trop rassurante.
+- **R-f — L'attestation est muette sur un binaire construit hors git.**
+  `GIT_HASH` vaut alors `"unknown"` (`build_info.rs:14-18`) et la ligne
+  `attested by` perd sa moitié discriminante, sans que rien ne soit cassé. La
+  borne est **héritée, pas créée** : elle appartient à `build_info` depuis
+  mika#2066 et vaut pour toute sonde de déploiement du dépôt. Elle est sans
+  effet sur le geste du ticket (`make deploy` depuis le checkout) et sans effet
+  sur la garde de régression, qui compare les `version`. Elle est écrite ici,
+  dans B2 et dans la halte de V5 parce que l'unique danger qu'elle porte est de
+  *se lire* comme le défaut : un opérateur en container qui prendrait `unknown`
+  pour une preuve de non-déploiement referait le contournement `cp -f` du
+  ticket.
 
 ### Hors périmètre, délibérément
 
@@ -593,6 +688,41 @@ au ticket, s'il est jugé souhaitable.
 
 ## Revision history
 
+- **rev 4 (2026-09-18)** — passe de fidélité au code. Aucun changement de
+  conception, aucun critère d'acceptation affaibli ; trois écarts entre ce que le
+  plan affirmait du code et ce que le code fait, tous relevés par relecture
+  directe des fichiers cités.
+  - **B1 nomme la borne `is_multi_agent`.** `seed_bundled_skills_if_needed`
+    retourne **avant** `materialize_agent_skill_links` quand
+    `resolve_global_home` (`startup.rs:129-137`) rend `false`, alors
+    qu'`update_skills` appelle cette passe inconditionnellement aujourd'hui. La
+    bascule la supprime donc en layout legacy single-agent — sans régression (la
+    library *est* alors le répertoire de l'agent, l'appel s'exécuterait contre
+    lui-même) et sans toucher la topologie du ticket, qui est multi-agent. Non
+    dit, cet écart aurait arrêté l'implémenteur au moment précis où il compare
+    l'ancien appel au nouveau. Le compte d'appelants est corrigé de « cinq » à
+    **quatre sites de production**, ce qui justifie toujours la lecture du
+    sidecar par le CLI plutôt qu'un élargissement de signature.
+  - **B2 nomme la seconde borne du sidecar :** `build_info::GIT_HASH` vaut
+    `"unknown"` hors checkout git (`build_info.rs:14-18`, repli documenté depuis
+    mika#2066). Propagé en V4 (le test asserte l'égalité à la constante, jamais
+    un motif de sha — une assertion de forme rougirait en CI container sur un
+    produit sain), dans la halte de V5 (la sonde par sha n'y décide rien, seul le
+    `diff` reste probant), en B4 (une phrase de documentation) et au risque
+    **R-f**. La borne est héritée, pas créée, et sans effet sur la garde
+    `bundled_library_downgrade`, qui compare les `version` — toujours présentes.
+    Son seul danger est de *se lire* comme le défaut, ce qui ferait refaire le
+    contournement `cp -f` du ticket.
+  - **V0 ajouté : le harnais de test existe déjà.**
+    `crates/mika-agent/tests/bundled_skill_library_e2e.rs` fournit
+    `provision_agent` et un test `second_seed_is_a_noop_via_hash_gate` qui
+    exerce exactement le chemin de confirmation dont V4 doit prouver qu'il
+    rafraîchit tout de même le sidecar. V2/V3/V4 y vivent (ils portent sur le
+    semeur, crate `mika-agent`) ; V1/V1.5 restent inline dans `mika-cli`
+    (`update_skills` est privé au binaire). Sans cette répartition, un
+    implémenteur suivant V1 à la lettre aurait écrit les cinq au même endroit et
+    aurait dû rendre `update_skills` publique pour trois tests qui ne l'appellent
+    pas.
 - **rev 3 (2026-09-18)** — révision issue d'une relecture du code contre les
   affirmations du plan. Les cinq lectures T1–T5 sont confirmées à la ligne près
   (`skills.rs:1424-1443` n'appelle que `materialize_agent_skill_links` et
