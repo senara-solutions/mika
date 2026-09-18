@@ -382,6 +382,70 @@ porter la sortie.
 
 ---
 
+## Fire-Disposition
+
+*(Exigée par le Fire-Disposition Gate — mika#1574, `docs/solutions/best-practices/fire-disposition-doctrine.md`.
+Ce plan livre des détecteurs : T1 allowlist exacte des clés de réponse, T2 scan de la
+constante de projection SQL, T3 `assert_ne!` sur le nom de la route auditée, plus les
+détecteurs d'auth / 405 / 400 / clamp / fail-closed. Cette section dit comment chacun se
+comporte face aux données et au code **préexistants**.)*
+
+**Disposition retenue : (c) halt-and-surface.** Aucun allowlist d'exception, aucun
+détecteur livré désarmé. La justification est **mesurée avant l'écriture**, pas
+prudentielle : l'état courant du dépôt est à zéro violation pour chacun des détecteurs,
+donc il n'y a rien à tolérer.
+
+### Pourquoi (a) n'est pas retenue, alors qu'elle est le défaut de la doctrine
+
+L'option (a) demande, par entrée, un nom de donnée spécifique, un ticket de suivi et une
+assertion auto-nettoyante. Ici l'ensemble des entrées serait **vide** : un allowlist à
+zéro entrée n'est pas un allowlist, c'est une égalité exacte — et c'est très exactement ce
+que T1 et T2 écrivent déjà. L'introduire comme structure ajouterait une porte ouverte sans
+rien tolérer aujourd'hui, sur les deux détecteurs qui gardent la contrainte STRICTE du
+ticket. C3 dit pourquoi cette porte serait coûteuse : le mode de panne de l'AC3 est
+précisément un garde qui ne voit pas ce qu'il n'a pas anticipé.
+
+### État du préexistant, détecteur par détecteur
+
+| Détecteur | Ce sur quoi il tire | État vérifié à l'écriture |
+|---|---|---|
+| T1 (clés de réponse) | Struct **neuve** de ce ticket | Le schéma n'a que les quatre colonnes autorisées (`migrations/002_outbound_messages.sql:2-5`). Rien à exclure. |
+| T2 (projection SQL) | Constante **neuve** de ce ticket | Idem. Aucune colonne de contenu n'existe. |
+| T3 (`assert_ne!` sur `metadata.route`) | **Code existant** — `log_admin_read` (`audit_events.rs:45`) | **Seul détecteur qui touche du préexistant.** `log_admin_read` a exactement **un** appelant de production (`routes.rs:2079`, la route #2360), et U1 lui fait passer littéralement la chaîne qu'il codait en dur : la route auditée de #2360 est inchangée, octet pour octet. Zéro violation. |
+| Auth / 405 / 400 / clamp / fail-closed | Route **neuve** | Sans préexistant par construction. |
+
+**U1 et son test de non-régression sont ce qui rend T3 vert sans toucher au comportement
+de #2360.** C'est la condition qui rend (c) disponible ici, et elle est vérifiée, pas
+espérée : si U1 devait changer la valeur observée par l'audit de #2360, la disposition
+serait à rouvrir avant d'écrire la ligne.
+
+### Ce qui se passe si un détecteur tire plus tard
+
+**Toute violation future est une régression bloquante, et son remède n'est jamais
+l'élargissement du détecteur.** Concrètement :
+
+- **T1 ou T2 rougit après l'ajout d'une colonne à `outbound_messages`** (p. ex. un
+  `message_snippet`, une `payload`) : **halte**. Ajouter la clé à l'allowlist pour faire
+  repasser la CI publierait la donnée — c'est-à-dire exécuterait la violation que le
+  détecteur venait d'attraper, en croyant réparer un test. Publier une nouvelle colonne
+  sur cet endpoint est une **décision d'exposition de donnée**, qui remonte à l'opérateur
+  et se tranche dans son propre ticket ; l'allowlist ne s'élargit que sur cette décision
+  explicite, et le rouge est le comportement correct jusque-là.
+- **T3 rougit** : un appelant de `log_admin_read` a cessé de nommer sa propre route, ou
+  les deux routes ont convergé sur la même valeur. Le remède est de réparer l'appelant,
+  jamais d'assouplir l'assertion — un audit qui répond faux est pire qu'un audit absent
+  (D1).
+- **Un détecteur d'auth rougit** : la route est servie sans `route_layer` (R1). Halte
+  immédiate, avant merge — c'est le seul chemin par lequel cet endpoint devient public.
+
+Aucun de ces cas n'est traité par `#[ignore]` : l'option (b) supposerait une violation
+préexistante dangereuse à laisser non signalée, et il n'y en a aucune. Les cinq tests
+`#[ignore]` du § *Contrat de vérification* relèvent de la disposition du crate (C4), pas
+d'une disposition de tir — la distinction est faite ici pour qu'on ne lise pas l'une comme
+l'autre.
+
+---
+
 ## Découpage
 
 | # | Unité | Fichiers |
@@ -470,7 +534,7 @@ qu'on croie ce plan capable de sauver l'historique après coup.
 | Risque | Traitement |
 |---|---|
 | Fuite inter-tenants via un `chat_id` NULL (C5) | D6 : court-circuit **avant** toute requête ; part testable en CI (fonction pure), part réelle en test `#[ignore]` exécuté à la main. |
-| Une colonne de contenu ajoutée plus tard et exposée | R6 + T1 (allowlist exacte des clés) + T2 (projection nommée). La liste noire, elle, ne l'aurait pas vue. |
+| Une colonne de contenu ajoutée plus tard et exposée | R6 + T1 (allowlist exacte des clés) + T2 (projection nommée). La liste noire, elle, ne l'aurait pas vue. Le rouge est alors le comportement correct : § *Fire-Disposition* nomme la halte plutôt que l'élargissement de l'allowlist. |
 | Un test négatif vert par absence d'exécution (C4) | Contrat de vérification scindé CI / manuel, et la limite écrite en § *Ce que la CI ne garantit pas*. |
 | Audit mensonger sur la route lue (D1) | `route` paramétrée (U1) + `assert_ne!` contre la route de #2360. |
 | Jeton non armé en production → 404 au moment de l'inspection | § *Chemin critique* : sonde au démarrage + sonde `curl`, à exécuter avant le 24/09. |
@@ -489,3 +553,25 @@ qu'on croie ce plan capable de sauver l'historique après coup.
   lisible avant sa purge ; il ne le préserve pas.
 - **L'analyse de #2358 elle-même** — cet endpoint fournit la donnée, il ne conclut pas sur
   les doublons vécus par Al.
+
+---
+
+## Revision history
+
+- **rev 2 (2026-09-18)** : adressé **F1** (BLOCKING, Fire-Disposition Gate — mika#1574) en
+  ajoutant la section `## Fire-Disposition` entre le contrat de vérification et le
+  découpage. L'option canonique retenue est **(c) halt-and-surface**, et non (a) comme le
+  suggérait le finding : l'ensemble des exceptions serait vide (le schéma
+  `outbound_messages` n'a que les quatre colonnes autorisées, vérifié à
+  `migrations/002_outbound_messages.sql:2-5`), or un allowlist à zéro entrée n'est pas un
+  allowlist mais l'égalité exacte que T1 et T2 écrivent déjà — l'introduire ouvrirait une
+  porte sans rien tolérer, sur les deux détecteurs qui gardent la contrainte STRICTE du
+  ticket. La section couvre le reste du *Change required* tel quel : état du préexistant
+  détecteur par détecteur (T3 est le seul à toucher du code existant — `log_admin_read`
+  a un unique appelant de production, `routes.rs:2079`, dont U1 laisse la route inchangée
+  octet pour octet), et clause explicite de traitement des violations futures — ajout
+  d'une colonne dans la projection ou la struct ⇒ **régression bloquante**, halte, jamais
+  l'élargissement de l'allowlist pour faire repasser la CI, la publication d'une colonne
+  étant une décision d'exposition de donnée qui remonte à l'opérateur. Renvoi ajouté
+  depuis la ligne correspondante du § *Risques*. Aucune AC modifiée ni affaiblie ; aucune
+  autre section touchée.
