@@ -85,6 +85,23 @@ impl TurnGuard {
     fn disarm(&mut self) {
         self.armed = false;
     }
+
+    /// Disarm only if the turn's own terminal write landed. A failed write
+    /// (e.g. `SQLITE_BUSY` on the shared database) leaves the guard armed, so
+    /// its conditional close becomes a second attempt instead of the row
+    /// staying `in_progress` until the next daemon restart.
+    fn settle(&mut self, terminal_write: anyhow::Result<()>) {
+        match terminal_write {
+            Ok(()) => self.disarm(),
+            Err(e) => tracing::warn!(
+                agent = %self.db.agent_id(),
+                task_id = %self.task_id,
+                port = self.port,
+                error = %e,
+                "a2a terminal write failed; the turn guard stays armed to close the row"
+            ),
+        }
+    }
 }
 
 impl Drop for TurnGuard {
@@ -813,24 +830,27 @@ async fn handle_message_send(
         .await
         {
             Ok(text) => {
-                let _ = agent_state
-                    .db
-                    .a2a_update_task_state(&task_id, "completed")
-                    .await;
+                turn_guard.settle(
+                    agent_state
+                        .db
+                        .a2a_update_task_state(&task_id, "completed")
+                        .await,
+                );
 
                 info!(task_id = %task_id, "A2A task completed via agent loop");
                 TurnText::Produced(text)
             }
             Err(e) => {
                 error!(error = %e, task_id = %task_id, "A2A agent loop failed");
-                let _ = agent_state
-                    .db
-                    .a2a_update_task_state(&task_id, "failed")
-                    .await;
+                turn_guard.settle(
+                    agent_state
+                        .db
+                        .a2a_update_task_state(&task_id, "failed")
+                        .await,
+                );
                 TurnText::LoopFailed
             }
         };
-        turn_guard.disarm();
 
         match agent_state
             .db
@@ -1021,12 +1041,11 @@ async fn handle_message_stream(
             biased;
             _ = turn.tx.closed() => {
                 info!(task_id = %turn.task_id, "a2a_queue_abandoned");
-                let _ = turn
+                turn_guard.settle(turn
                     .agent_state
                     .db
                     .a2a_update_task_state(&turn.task_id, "canceled")
-                    .await;
-                turn_guard.disarm();
+                    .await);
                 return;
             }
             result = a2a_wait_queue::wait_for_agent_lock(
@@ -1073,12 +1092,12 @@ async fn handle_message_stream(
                     task_id = %turn.task_id,
                     "a2a_queue_reject"
                 );
-                let _ = turn
-                    .agent_state
-                    .db
-                    .a2a_update_task_state(&turn.task_id, "failed")
-                    .await;
-                turn_guard.disarm();
+                turn_guard.settle(
+                    turn.agent_state
+                        .db
+                        .a2a_update_task_state(&turn.task_id, "failed")
+                        .await,
+                );
                 let _ = turn
                     .tx
                     .send(StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
@@ -1227,11 +1246,12 @@ async fn run_a2a_stream_turn(
             let text = response_text.unwrap_or_else(|| COMPLETED_WITHOUT_TEXT.to_string());
             let response_message = agent_text_message(&task_id, context_id.clone(), text);
 
-            let _ = agent_state
-                .db
-                .a2a_update_task_state(&task_id, "completed")
-                .await;
-            turn_guard.disarm();
+            turn_guard.settle(
+                agent_state
+                    .db
+                    .a2a_update_task_state(&task_id, "completed")
+                    .await,
+            );
 
             // Send completion event
             let _ = tx.send(StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
@@ -1248,11 +1268,12 @@ async fn run_a2a_stream_turn(
         }
         Err(e) => {
             error!(error = %e, task_id = %task_id, "A2A streaming agent loop failed");
-            let _ = agent_state
-                .db
-                .a2a_update_task_state(&task_id, "failed")
-                .await;
-            turn_guard.disarm();
+            turn_guard.settle(
+                agent_state
+                    .db
+                    .a2a_update_task_state(&task_id, "failed")
+                    .await,
+            );
 
             let _ = tx.send(StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
                 task_id: task_id.clone(),
@@ -2073,6 +2094,31 @@ mod tests {
         );
 
         assert_eq!(settled_row(&db).await.0, "cancelled");
+    }
+
+    /// A terminal write that fails leaves the guard armed, so the row is still
+    /// closed rather than left `in_progress` until the next restart.
+    #[tokio::test]
+    async fn mika2379_a_failed_terminal_write_keeps_the_guard_armed() {
+        let db = guard_db().await;
+        db.a2a_update_task_state("t1", "working").await.unwrap();
+        let mut guard = TurnGuard::arm(&db, "t1", "send");
+        guard.settle(Err(anyhow::anyhow!("database is locked")));
+        drop(guard);
+
+        assert_eq!(settled_row(&db).await.0, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn mika2379_a_landed_terminal_write_disarms_the_guard() {
+        let db = guard_db().await;
+        db.a2a_update_task_state("t1", "working").await.unwrap();
+        let mut guard = TurnGuard::arm(&db, "t1", "send");
+        guard.settle(db.a2a_update_task_state("t1", "completed").await);
+        drop(guard);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(row(&db).await.0, "completed");
     }
 
     #[tokio::test]
