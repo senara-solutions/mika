@@ -38,7 +38,9 @@ généraliser énonce en propres termes :
 
 ## Ce que la lecture du code établit, avant d'écrire une ligne
 
-Sept faits, tous vérifiés dans l'arbre, qui contraignent la forme du correctif.
+Huit faits, tous vérifiés dans l'arbre **post-merge de #2359**, qui contraignent la
+forme du correctif. F8 est celui que la relecture a ajouté, et il change une
+prescription de conception — voir C4.
 
 **(F1) La porte d'entrée du filet existant refuse précisément notre cas.**
 `deadline_verdict.rs:231` :
@@ -82,9 +84,9 @@ un webhook PR, donc `originating_message` porte le texte que `parse_pr_target` s
 lire.
 
 **(F5) Le chemin silencieux ne porte pas le registre anti-double-post, et le code
-dit déjà que c'est une anomalie.** `agent_loop/mod.rs:4867` :
+dit déjà que c'est une anomalie.** `agent_loop/mod.rs:4994` :
 `pr_reviews_posted: None, // Silent mode: no session-scoped dedup needed`. Or
-`skills/builtin_handlers.rs:2922` porte :
+`skills/builtin_handlers.rs:2924` porte :
 
 ```rust
 debug_assert!(
@@ -106,27 +108,49 @@ registre par `session_id` **après** le run (`dispatcher.rs:911-913`) — le fil
 donc être appelé avant cette éviction.
 
 **(F7) `run_silent_agent` retourne `Result<()>` et le signal ne remonte pas.**
-`agent_loop/mod.rs:4397`. Les tool summaries du tour vivent dans `run_loop` et
+`agent_loop/mod.rs:4524`. Les tool summaries du tour vivent dans `run_loop` et
 n'en sortent pas. Le call-site du filet (le dispatcher) ne peut donc pas savoir, en
 l'état, qu'un verdict était dû et n'a pas été posté.
 
-## Précondition bloquante, nommée plutôt que découverte
+**(F8) La garde de #2359 a DEUX sites d'enforcement, et le second est précisément
+notre population.** `agent_loop/mod.rs:2317` (chemin texte non vide) et `:3146`
+(miroir sur la sortie à texte vide). Les deux portent la même conjonction
+(`EndTurn` + `qa_verdict_due` + budget non consommé + `!pr_review_posted_in_turn`).
+Le commentaire du second le décrit lui-même :
 
-**PR #2359 (mika#2355) n'est pas mergée.** Vérifié sur l'arbre :
-`git merge-base --is-ancestor 2be7f600 origin/main` → faux ; `origin/main` est à
-`5e243d57` et ne contient pas `crates/mika-agent/src/qa_build_callback.rs`.
+> *« a bare EndTurn is exactly the shape a turn that has nothing to say takes, and
+> it is the one the registry never sees. »*
 
-Ce ticket **dépend structurellement** de ce merge : le prédicat de satisfaction
-(`qa_build_callback::pr_review_posted_in_turn`), le discriminant de flux
-(`qa_verdict_required`) et le point de sortie où la garde consomme son budget sont
-tous nés dans #2359. L'implémentation se rebase sur `main` **après** ce merge ; elle
-ne réécrit aucun de ces trois éléments (les recopier serait exactement la classe de
-duplication que `qa_build_callback.rs` a été créé pour fermer — voir son doc-comment,
-qui cite mika#2158).
+Un tour de callback qui conclut sans rien dire **est** le cas nominal de ce ticket.
+Un signal posé au seul site texte-non-vide laisserait le filet aveugle sur la moitié
+la plus probable de sa population — et rien ne le signalerait : le filet resterait
+silencieux, ce qui est indistinguable d'un filet qui n'a rien à faire.
 
-Conséquence pratique, à dire : si #2359 change de forme en revue, ce plan se relit
-avant d'être implémenté. Les trois points d'accroche sont nommés ci-dessus ; s'ils
-ont bougé, c'est là qu'il faut regarder, pas dans le filet.
+Second point, structurel : **le site où le budget est « déjà consommé » n'existe pas
+comme branche.** La condition `!intent_guard_retries.contains(…)` est *dans* le `if`
+du re-prompt ; budget épuisé, on tombe à travers le `if`, sans `else`. Le signal ne
+se pose donc pas « dans la garde » mais sur les deux chemins de sortie, sous le
+prédicat complémentaire — voir C4.
+
+## Précondition : levée, et les points d'accroche re-vérifiés
+
+**PR #2359 (mika#2355) est mergée** — `5091b525`, ancêtre d'`origin/main`, et
+`crates/mika-agent/src/qa_build_callback.rs` est dans l'arbre. La rédaction
+précédente de ce plan affirmait le contraire ; c'était vrai à l'heure où elle a été
+écrite et ne l'est plus. Le ticket est actionnable sans attendre.
+
+Ce plan prescrivait de relire ses trois points d'accroche si #2359 bougeait. Fait,
+sur l'arbre mergé :
+
+| point d'accroche | état |
+|---|---|
+| `qa_build_callback::pr_review_posted_in_turn` | présent (`qa_build_callback.rs:112`), signature `(&[ToolCallSummary]) -> bool` |
+| `qa_build_callback::qa_verdict_required` | présent (`:93`), conjonctif (message **et** skills chargées) |
+| le point où la garde consomme son budget | **deux sites, pas un** — voir F8 ci-dessous, c'est la correction de fond de cette relecture |
+
+L'implémentation ne réécrit aucun des trois : les recopier serait exactement la
+classe de duplication que `qa_build_callback.rs` a été créé pour fermer (voir son
+doc-comment, qui cite mika#2158).
 
 ## Conception
 
@@ -204,8 +228,8 @@ qu'on ne peut pas lire n'est jamais un terme satisfait.
 ### C3 — un paramètre de plus sur la signature unique, jamais un second constructeur
 
 `build_callback_task` gagne un paramètre `metadata: Option<String>` en dernière
-position, qui remplace le `None` en dur de la ligne 3004. Neuf sites à toucher, huit
-passent `None` :
+position, qui remplace le `None` en dur de la ligne 3004. **Sept** sites d'appel à
+toucher, six passent `None` :
 
 | site | valeur |
 |---|---|
@@ -214,7 +238,14 @@ passent `None` :
 | `dispatcher.rs:3134` | `None` |
 | `dispatcher.rs:5881` | `None` |
 | `verdict_handler.rs:833` | `None` |
-| 4 tests d'eval (mika#2272/#2277/#2279 + supersede) | `None` |
+| `test_reaper_liveness_all_surfaces_2277.rs:218` | `None` |
+| `test_reaper_reaps_live_pending_pilot_2272.rs:217` | `None` |
+
+Deux autres fichiers d'eval (`test_ready_label_live_pilot_noop_2279.rs`,
+`test_supersede_kills_live_pilot.rs`) **nomment** la fonction en doc-comment pour
+décrire la forme de la row qu'ils fabriquent, sans l'appeler : ils ne compilent pas
+contre la signature et ne sont pas à toucher. La distinction vaut d'être écrite —
+elle change ce qu'un `cargo build` cassé signifie.
 
 Un second constructeur est explicitement exclu : le doc-comment de la fonction
 interdit la dérive entre sites de construction, et c'est la classe de bug que sa
@@ -235,12 +266,28 @@ a posté — c'est la granularité voulue, et c'est ce qui rend AC7 vrai sans aj
 d'état.
 
 **Vers le haut — le fait que le verdict était dû et n'a pas été posé.** `run_loop`
-gagne un out-param `qa_verdict_unmet: Option<&AtomicBool>`, posé à **un seul site** :
-celui où la garde `qa_build_callback_verdict` de #2359 constate que le verdict est dû,
-qu'il n'est pas posté, et que son budget de re-prompt est **déjà consommé** — donc
-l'EndTurn est accepté. `run_silent_inner` le lit après `run_loop` et le rend dans la
-valeur de retour ; `run_silent_agent` passe de `Result<()>` à
-`Result<SilentTurnOutcome>` avec un seul champ pour l'instant.
+gagne un out-param `qa_verdict_unmet: Option<&AtomicBool>`, posé aux **deux** sites
+de sortie que F8 établit — texte non vide (`:2317`) et miroir texte vide (`:3146`) —
+sous le prédicat complémentaire de la garde : `qa_verdict_due` **et**
+`!pr_review_posted_in_turn(&all_tool_summaries)` **et** budget déjà consommé
+(`intent_guard_retries.contains(QA_VERDICT_REQUIRED_LABEL)`), immédiatement après le
+`if` du re-prompt, sur le chemin où l'EndTurn est accepté. `run_silent_inner` le lit
+après `run_loop` et le rend dans la valeur de retour ; `run_silent_agent` passe de
+`Result<()>` à `Result<SilentTurnOutcome>` avec un seul champ pour l'instant.
+
+**Deux sites et non un — c'est la correction que la relecture post-merge a apportée,
+et elle n'est pas cosmétique.** Le miroir texte vide est la forme que prend « un tour
+qui n'a rien à dire », c'est-à-dire la moitié la plus probable de la population visée.
+Le couvrir à moitié produirait un filet silencieux, indistinguable d'un filet qui n'a
+rien à faire — exactement le mode de panne que ce ticket existe pour fermer. D'où
+**T10** (§ Tests) : un contrôle positif par site, et non un test qui n'exercerait que
+le chemin texte non vide.
+
+Le prédicat lui-même n'est pas recopié : il est extrait dans
+`qa_build_callback::verdict_unmet_after_retry(qa_verdict_due, retries, summaries)`,
+appelé aux deux sites. Deux copies d'une conjonction à trois termes divergent — c'est
+la leçon que `grooming_marker` a dû engraver une fois (mika#2158), et les deux sites
+de la garde #2359 sont déjà une duplication qu'on n'aggrave pas.
 
 Trois choix, et leurs raisons :
 
@@ -324,9 +371,9 @@ tombe remplacerait un silence par une panne.
 | `crates/mika-agent/src/server/ready_label_handler.rs` | C3 (`None`) |
 | `crates/mika-agent/src/server/verdict_handler.rs` | C3 (`None`) |
 | `crates/mika-agent/src/task_engine/dispatcher.rs` | C3 (`None` ×2), C4 (registre ×5), câblage du filet + kill-switch |
-| `crates/mika-agent/src/agent_loop/mod.rs` | C4 (registre en silent, out-param `run_loop`, `SilentTurnOutcome`), commentaire `:4867` corrigé |
-| `crates/mika-agent/src/qa_build_callback.rs` | doc-comment : le filet n'est plus « à venir » (le module l'annonce aujourd'hui) |
-| 4 tests d'eval appelant `build_callback_task` | C3 (`None`) |
+| `crates/mika-agent/src/agent_loop/mod.rs` | C4 (registre en silent, out-param `run_loop` posé aux **deux** sites de sortie `:2317`/`:3146`, `SilentTurnOutcome`), commentaire `:4994` corrigé |
+| `crates/mika-agent/src/qa_build_callback.rs` | `verdict_unmet_after_retry` (le prédicat complémentaire, lecteur unique) ; doc-comment `:38` : le filet n'est plus « à venir » |
+| 2 tests d'eval appelant `build_callback_task` (#2272, #2277) | C3 (`None`) |
 | `crates/mika-agent/CLAUDE.md`, `CLAUDE.md` racine | § Deadline Verdict Net généralisée ; env var ; signaux opérateur |
 
 ## Tests
@@ -378,10 +425,19 @@ Tous rouge-avant. Le fichier neuf : `crates/mika-agent/tests/eval/test_qa_callba
   cesseraient de discriminer.
 - **T9 (kill-switch)** — désarmé, le filet ne poste rien et le dit ; armé par défaut
   en l'absence de variable.
+- **T10 (F8/C4) — un contrôle positif PAR SITE DE SORTIE.** Deux tests distincts
+  pilotant `run_silent_agent` comme le fait
+  `test_qa_build_callback_verdict_2355.rs` : (a) second EndTurn **avec** texte, (b)
+  second EndTurn **à texte vide**. Chacun doit produire son POST. Deux tests et non
+  un paramétré sur la forme du texte : c'est la seule construction qui rougisse quand
+  un seul des deux sites est câblé, et le site vide est le plus probable en
+  production. Contrôle négatif commun : un tour dont le budget n'est **pas** consommé
+  (la garde re-prompte) ne doit pas armer le signal — sinon le filet doublerait le
+  re-prompt au lieu de lui succéder.
 
 **Fire-Disposition (mika#1574).** Population pré-existante : **vide par
-construction** pour chacun des neuf détecteurs. T1/T2/T4/T6/T7/T9 portent sur du code
-qui n'existe pas encore ; T3 fige un comportement en place et ne peut donc pas
+construction** pour chacun des dix détecteurs. T1/T2/T4/T6/T7/T9/T10 portent sur du
+code qui n'existe pas encore ; T3 fige un comportement en place et ne peut donc pas
 révéler d'arriéré ; T5 et T8 scannent des sites que ce ticket crée. Aucune
 disposition à prendre, et l'énoncé de cette absence est ce qui la distingue d'un
 oubli.
