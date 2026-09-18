@@ -40,6 +40,40 @@ ni décidable, et il inscrit le dormeur là où le prochain qui touchera
 raisonnement* (PR #2332). Mergé. mika#2295 (AC2-7, la latence arch, que le corps
 du ticket pose aussi comme préalable) l'est également : `5a7a50fb` / PR #2327.
 
+### E1b — La base de U2 est vérifiée, et l'ITERATE cité est antérieur au merge
+
+U2 repose sur `llm_budget_resolved` (mika#2293). Un `store_fact` mika-arch du
+**2026-09-15** enregistre ce ticket en `Disposition: ITERATE` (F1 : décision non
+résolue sur la méthode de résolution de provenance). Cette disposition est un
+verdict de **grooming**, pas un état de `main` : le travail a été livré le
+lendemain. Mesuré sur cette branche :
+
+```
+git merge-base --is-ancestor 1b7acca9 HEAD   → 0   (ancêtre de HEAD)
+git log -1 --date=short 1b7acca9
+  → 2026-09-16  wip(mika#2293): … (#2333)
+git merge-base --is-ancestor 09bc473c HEAD   → 0   (mika#2296, idem)
+```
+
+**La vérification ne s'arrête pas au titre du commit**, et pour une raison
+précise : `1b7acca9` est une promotion de brouillon `wip-rescue` (PR #2333), donc
+un merge dont le message n'atteste pas la complétude du contenu. Ce qui atteste,
+c'est la surface elle-même, présente sur cette branche :
+
+| Surface attendue par U2 | État |
+|---|---|
+| `crates/mika-common/src/llm/budget_provenance.rs` | présent |
+| `BudgetProvenance::resolve` + `CascadeLayers::resolve_key` | présents (`:210`, `:286`) |
+| `log_llm_budget_resolved` + `dedup_signature` | présents (`:402`, `:390`) |
+| `mika2293_reconstruction_equals_load_for_agent_on_every_cascade_position` | présent (`:519`) — le gabarit de test que U2 cite |
+| `crates/mika-agent/src/server/budget_guard.rs` | présent |
+
+**Conséquence pour le plan :** aucune supposition de rebase à documenter dans le
+corps de PR, et l'étape 0 de U4 — qui lit `llm_budget_resolved` — est exécutable
+dès aujourd'hui. Si une future relecture trouve cette table en défaut, c'est la
+base qui a bougé : **halte**, et rebaser avant d'implémenter U2, jamais
+contourner par une réimplémentation locale de la cascade.
+
 ### E2 — Le dépôt n'a JAMAIS porté glm-5.3 pour mika-qa
 
 ```
@@ -203,30 +237,50 @@ Ajouter `model` et `model_source` à l'événement, au même site d'émission, e
 intégrer à la signature de déduplication (motif mika#2362 : un changement qui ne
 bouge que ce champ doit être ré-émis, pas tu).
 
-**Point d'implémentation à vérifier, avec sa halte.** `budget_provenance`
-reconstruit la cascade pour **deux clés fixes** (`llm_http_timeout_secs`,
-`agent_total_timeout_secs`). La clé du modèle dépend du provider (`zai_model`,
-`openrouter_model`, `anthropic_model`, …), ce qui n'est pas la même forme. Deux
-issues :
+**Point d'implémentation, avec sa halte — et le discriminant réel a été mesuré
+(E1b).** `BudgetProvenance::resolve` est écrit pour **deux clés fixes**, mais la
+cascade sous-jacente ne l'est pas : `CascadeLayers::resolve_key(config_key,
+env_var)` (`budget_provenance.rs:286`) prend déjà ses deux noms en paramètres et
+parcourt les quatre portes sans rien savoir de la clé. L'obstacle n'est donc pas
+la cascade — c'est le **type de la valeur** : `ResolvedBudgetValue.value` est un
+`Option<u64>` (`:166`) et `from_raw` fait un `parse::<u64>()` (`:183`), tandis
+qu'un modèle est une chaîne. Deux issues, et le critère qui tranche est celui-là :
 
-- le lecteur se généralise proprement sur un nom de clé résolu depuis
-  `ProviderKind::config_prefix()` → on l'étend ;
-- il ne se généralise pas sans réécrire la cascade → **halte** : n'émettre que
-  `model` sans `model_source`, et ouvrir le suivi. Un modèle nommé sans
-  provenance vaut déjà mieux qu'un modèle tu ; une provenance **fausse** est
-  strictement pire que pas de provenance (mika#2293 le dit pour ses deux clés,
-  et la raison vaut ici mot pour mot).
+- un jumeau typé chaîne (ou une généralisation du parse) suffit, la cascade et
+  son ordre étant réutilisés tels quels → on l'étend, et le test-gabarit de V3
+  s'applique directement ;
+- l'extension oblige à **réécrire l'ordre de la cascade** ou à dupliquer
+  `CascadeLayers` → **halte** : n'émettre que `model` sans `model_source`, et
+  ouvrir le suivi. Un modèle nommé sans provenance vaut déjà mieux qu'un modèle
+  tu ; une provenance **fausse** est strictement pire que pas de provenance
+  (mika#2293 le dit pour ses deux clés, et la raison vaut ici mot pour mot).
+
+Reste vrai quelle que soit l'issue : la clé du modèle dépend du provider
+(`zai_model`, `openrouter_model`, `anthropic_model`, …), donc son nom doit être
+résolu depuis le provider en vigueur et non codé en dur — une clé fixe
+rapporterait `default` pour un agent dont le modèle est bel et bien déclaré,
+c'est-à-dire une provenance fausse.
 
 L'ordre de la cascade reste celui de mika#2218 (`.env` per-agent > env du process
 > `config.toml` per-agent > `config.toml` global > constante), et l'épinglage
 existant (`mika2293_reconstruction_equals_load_for_agent_on_every_cascade_position`)
 est le gabarit du test à écrire pour la clé modèle.
 
-### U3 — Garde : un modèle déclaré sans calibration ne compile pas vert
+### U3 — Garde : un modèle **déclaré dans le dépôt** sans calibration ne compile pas vert
 
 Test structurel sur `WELL_KNOWN_AGENTS` : pour chaque `config_toml` déclarant un
 modèle, exiger qu'un artefact JSON sous `docs/eval/calibration/` porte ce couple
 `provider/model` pour ce rôle.
+
+**Portée, écrite ici plutôt que déduite du titre.** U3 lit les **déclarations du
+dépôt** et rien d'autre. Il ne lit aucun `config.toml` sur disque, donc il est
+**structurellement aveugle à la dérive dépôt ↔ runtime de E2b** : un opérateur
+qui fait tourner `glm-5.3` en éditant le fichier hors dépôt laisse U3 vert, et
+c'est exactement ce qui s'est passé pour mika#2328. La moitié qui a mordu est
+couverte par **U2** — la dérive devient lisible dans `llm_budget_resolved` — et
+par personne d'autre dans ce plan. Prétendre l'inverse ferait de U3 une garde
+qu'on croit protectrice sur une classe qu'elle ne voit pas, ce qui est pire que
+son absence (review-guide § YAGNI + anchoring).
 
 - Population = les **déclarations**, jamais les absences (motif
   `mika2296_no_well_known_config_declares_an_output_budget_below_8192`) : un agent
@@ -321,7 +375,7 @@ grep qa_deadline_verdict "$MIKA_SPIRIT_LOG_FILE" | jq 'select(.outcome == "poste
 | V2 | `llm_budget_resolved` porte `model` (+ `model_source` si U2 aboutit) | test unitaire sur la construction de l'événement ; grep sur un démarrage local |
 | V3 | La provenance du modèle est exacte | test sur le modèle de `mika2293_reconstruction_equals_load_for_agent_on_every_cascade_position`, sur chaque position de la cascade. **Rouge ⇒ n'émettre que `model`** (halte U2) |
 | V4 | La déduplication ré-émet sur changement de modèle | deux résolutions ne différant que par le modèle produisent deux lignes |
-| V5 | U3 attrape un modèle non calibré | contrôle négatif : un `config_toml` de test déclarant un modèle inconnu fait rougir le garde |
+| V5 | U3 attrape un modèle non calibré **déclaré dans le dépôt** (jamais une dérive runtime — voir U3 § Portée) | contrôle négatif : un `config_toml` de test déclarant un modèle inconnu fait rougir le garde |
 | V6 | U3 ne rougit pas sur l'existant | le test passe sur les trois déclarations réelles — **si non, U3 tombe (D4/U3)** |
 | V7 | Le protocole est exécutable tel qu'écrit | les deux commandes `jq` de U4 rendent des lignes sur un log réel ; les cibles `make` existent (`Makefile:119`) |
 
@@ -342,6 +396,14 @@ existe pour nommer.
 - **U3 rougit en CI, jamais en production.** C'est un test, pas une garde de
   démarrage. Un modèle non calibré déjà en service n'est pas cassé par ce test —
   il est nommé au prochain PR qui touche la déclaration.
+- **U3 protège les déclarations du dépôt, pas la dérive dépôt ↔ runtime.** Il
+  n'attrape que le swap *par le dépôt*. Le swap *hors dépôt* — celui qui a produit
+  mika#2328 (E2a/E2b : édition du `config.toml` sur disque, persistante sous
+  `MIKA_DISABLE_AGENT_PROVISIONING`) — laisse U3 vert, par construction et non par
+  défaut d'implémentation. Cette moitié est couverte par **U2**, qui la rend
+  lisible, et par aucune garde de ce plan : rien ici ne l'**empêche**. À dire tel
+  quel dans le corps de PR, pour qu'aucun lecteur ne prenne un test vert sur les
+  déclarations pour une attestation que le runtime est calibré.
 - **U4 ne dispose de rien** : c'est une procédure, et son étape 3 est la seule à
   toucher un agent, sous fenêtre annoncée et retour arrière d'une ligne
   (`zai_model` sur disque + restart).
@@ -358,6 +420,9 @@ existe pour nommer.
 - [ ] La déduplication de l'événement intègre le nouveau champ.
 - [ ] U3 livré avec son contrôle négatif, **ou** son abandon motivé dans le corps
       de PR et son suivi ouvert (critère V6).
+- [ ] Si U3 est livré, le corps de PR dit **explicitement** que la garde couvre
+      les déclarations du dépôt et non la dérive dépôt ↔ runtime, et nomme U2
+      comme la seule couverture de cette seconde moitié.
 - [ ] `docs/eval/calibration/mika-qa-2328/README.md` porte les quatre étapes, les
       trois tables de lecture et les trois haltes.
 - [ ] `cargo test`, `cargo clippy`, `cargo fmt --check` verts.
@@ -440,12 +505,56 @@ lignes après des jours d'exécution est le régime normal.
   ce qui est une autre décision et un autre blast radius.
 - **La dérive dépôt ↔ runtime en général** (les trois agents, pas seulement
   mika-qa, et le fait que `MIKA_DISABLE_AGENT_PROVISIONING` gèle `config.toml`
-  entier). U2 la rend visible ; la résoudre — réconcilier par section plutôt que
-  par fichier, comme mika#2330 l'a fait pour `identity.toml` — est un travail à
-  part entière.
+  entier). U2 la rend **visible** ; **U3 ne la voit pas** (il ne lit que les
+  déclarations — U3 § Portée) ; la **résoudre** — réconcilier par section plutôt
+  que par fichier, comme mika#2330 l'a fait pour `identity.toml` — est un travail
+  à part entière. Ce plan livre donc une mesure de cette classe, pas une garde
+  contre elle, et c'est le suivi qui portera la garde.
 - **Un scénario de calibration multi-step** qui mesurerait le cumul contre une
   enveloppe et ferait du gate mika#1190 un prédicteur de la classe mika#2328
   (E3). Réel et attirant ; c'est un sous-système, pas une ligne, et ce ticket
   n'a pas la mesure qui dimensionnerait son enveloppe.
 - **Le transport OpenRouter** (mika#2326), distinct et nommé comme tel par le
   corps du ticket.
+
+---
+
+## Revision history
+
+- **rev 2 (2026-09-18)** — première passe architecte, `Disposition: ITERATE`
+  (F1, F2 — tous deux BLOCKING).
+  - **F1 traité par la mesure, pas par une clause de PR.** L'ITERATE de mika#2293
+    cité par le finding date du 2026-09-15 et est un verdict de *grooming* ; le
+    travail a été mergé le 2026-09-16 (`1b7acca9`, PR #2333). Nouveau **E1b** :
+    ancestralité vérifiée sur cette branche pour mika#2293 **et** mika#2296
+    (`09bc473c`), plus une table des cinq surfaces attendues par U2, parce que
+    `1b7acca9` est une promotion `wip-rescue` dont le titre n'atteste pas la
+    complétude du contenu. Le finding proposait *soit* la vérification *soit* une
+    note de rebase dans le corps de PR : la vérification a rendu la note inutile,
+    et E1b porte la halte inverse (si la table est un jour en défaut, rebaser —
+    jamais réimplémenter la cascade localement).
+  - **Effet de bord de cette vérification, versé dans U2.** Le discriminant de la
+    halte de U2 était supposé (« la cascade se généralise-t-elle ? ») ; il est
+    maintenant mesuré : `CascadeLayers::resolve_key(config_key, env_var)` est
+    **déjà** paramétrique, et le seul obstacle est le **type de la valeur**
+    (`Option<u64>` / `parse::<u64>()` contre une chaîne). Le critère de halte est
+    reformulé sur ce fait ; la règle « clé résolue depuis le provider, jamais
+    codée en dur » est conservée, avec sa raison (une clé fixe rapporterait
+    `default` pour un modèle bel et bien déclaré — une provenance fausse).
+  - **F2 traité aux quatre endroits qui laissaient croire la portée plus large**,
+    et non au seul endroit demandé. Le finding demandait une note dans
+    Fire-Disposition ou Hors-Périmètre ; la prétention venait de trois autres
+    surfaces également. (1) **U3** gagne un § *Portée* — la garde lit les
+    déclarations du dépôt, ne lit aucun `config.toml` sur disque, et est donc
+    **structurellement** aveugle à E2b ; (2) le titre de U3 dit désormais « déclaré
+    **dans le dépôt** » ; (3) **V5**, dont le libellé « U3 attrape un modèle non
+    calibré » était la formulation la plus trompeuse du plan, est requalifié ;
+    (4) **Fire-Disposition** porte le point explicite demandé, et
+    **Hors-périmètre** distingue « U2 la rend visible » de « rien ici ne
+    l'empêche ». Une ligne de **DoD** exige que le corps de PR le dise si U3 est
+    livré. Citation du finding préservée (review-guide § YAGNI + anchoring : ne
+    pas prétendre qu'une garde détecte une classe hors de sa portée).
+  - **Aucun AC affaibli, aucune valeur touchée.** AC5 (`zai_model` et
+    `llm_max_tokens` inchangés) et D1 (la PR ne swappe pas) sont intacts ; les
+    deux findings portaient sur ce que le plan *affirme*, pas sur ce qu'il livre,
+    donc le périmètre d'implémentation est inchangé.
