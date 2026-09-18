@@ -34,12 +34,12 @@ Doctrine : ``docs/solutions/security-issues/`` →
 from __future__ import annotations
 
 import ast
-from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
 import mika_permission_policy
+from mika_permission_policy import PolicyFn
 from mika_permission_policy._binaries import (
     is_safe_cat,
     is_safe_grep,
@@ -164,8 +164,9 @@ PATHS: tuple[str, ...] = (
 #: chemins ci-dessus. Les formes à flags sont incluses pour que le pin porte
 #: aussi sur les chemins de décision non triviaux (``sed -i`` dénie, et il doit
 #: dénier pour TOUS les chemins).
-PolicyFn = Callable[[list[str], str], bool]
-
+#: ``PolicyFn`` vient du package (``mika_permission_policy.__all__``) plutôt
+#: que d'être redéclaré ici : c'est le contrat que ce fichier épingle, et deux
+#: écritures du même contrat dériveraient en silence.
 CASES: tuple[tuple[PolicyFn, list[str]], ...] = (
     (is_safe_cat, ["cat"]),
     (is_safe_head, ["head", "-5"]),
