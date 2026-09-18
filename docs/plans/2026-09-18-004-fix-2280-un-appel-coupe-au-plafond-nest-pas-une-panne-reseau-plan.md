@@ -118,6 +118,16 @@ ou un timeout de connexion sortent par le `?` sur `.send()` et ne l'atteignent
 jamais. Ce bras signifie donc déjà, exactement : *les en-têtes sont arrivés, le
 corps n'a pas fini*. C'est le point d'ancrage naturel du discriminant.
 
+**Mais « le bras » n'est pas « le seul appel » sur le rail ollama, et la nuance
+décide de la justesse de l'attribution.** `ollama.rs` lit le corps à **deux**
+endroits : `487`, dans la branche `!status.is_success()`, avec un
+`unwrap_or_default()` qui avale l'erreur pour composer un message de diagnostic
+HTTP ; et `521`, le `match` qui est le jumeau du bras d'`openai.rs`. Seul le
+second est la population du ticket. Instrumenter le premier ferait entrer un
+429 lent — dont le corps d'erreur arrive tard — dans une population qui affirme
+« le modèle générait encore », c'est-à-dire produirait exactement l'attribution
+fausse que D2 existe pour éviter.
+
 ### E7 — Rien ne distingue « le modèle générait encore » de « le réseau est mort »
 
 `error_class()` (`llm/error.rs:122`) rend `transport_timeout` dans les deux cas.
@@ -331,17 +341,26 @@ changement ».
 
 ### 4. `crates/mika-common/src/llm/openai.rs` et `.../ollama.rs`
 
-- `send_once` mesure son propre `Instant` d'entrée et, dans le **seul** bras
-  d'erreur de `response.text()` (E6), applique le discriminant de D2/D3. Sur
-  franchissement : `warn!(event = "llm_call_cap_exhausted", …)` portant
+- `send_once` mesure son propre `Instant` d'entrée et applique le discriminant
+  de D2/D3 dans le bras d'erreur du `match response.text()` — `openai.rs:277`,
+  `ollama.rs:521`. **Pas `ollama.rs:487`** : ce site-là lit le corps d'une
+  réponse non-2xx et son erreur est déjà avalée par `unwrap_or_default()` (E6).
+  Sur franchissement : `warn!(event = "llm_call_cap_exhausted", …)` portant
   `provider`, `model`, `max_tokens`, `http_timeout_secs`, `elapsed_ms`,
   `reachable_output_tokens`.
-- `send_once` rend l'information au boucleur — signature
-  `Result<OpenAiResponse, (LlmError, bool)>` ou, plus simplement, un
-  `Cell<bool>`/valeur de retour dédiée ; la forme retenue ne doit **pas**
-  modifier `LlmError` (D2).
-- Les deux appels à `emit_llm_call_attempt` passent `request.max_tokens` et le
-  drapeau (`None` sur le site `deadline_abort`).
+- `send_once` rend l'information au boucleur **par sa signature**, pas par un
+  `Cell` ni un champ partagé : elle est privée et n'a qu'**un seul appelant**
+  (`openai.rs:474`, `let attempt_result = self.send_once(…)`), donc
+  `Result<OpenAiResponse, (LlmError, bool)>` se propage en un site. Un état
+  latéral coûterait la même écriture en rendant le drapeau atteignable depuis
+  ailleurs. La forme retenue ne doit **pas** modifier `LlmError` (D2).
+- Les deux appels à `emit_llm_call_attempt` (`openai.rs:428` et `:493`) passent
+  `request.max_tokens` — déjà un `u32` non-optionnel sur `OpenAiRequest:24`,
+  donc aucune question d'absence à trancher — et le drapeau (`None` sur le site
+  `deadline_abort`).
+- Le passage de 9 à 11 paramètres ne rougit pas clippy : `mod.rs:215` porte déjà
+  `#[allow(clippy::too_many_arguments)]`. Noté parce que la DoD exige
+  `-D warnings` et que la question se pose sinon à l'implémentation.
 
 ### 5. `mika/CLAUDE.md`
 
@@ -403,6 +422,12 @@ valeurs, pas sur le fichier.
   précoce (corps tronqué immédiatement) porte `false` ; (c) dans les deux cas la
   variante d'erreur reste `Transport` et `is_retryable()` reste `true` — la
   non-régression de mika#2015, assertée plutôt qu'espérée.
+- `ollama.rs` tests — **contrôle négatif de site** : une réponse non-2xx dont le
+  corps d'erreur n'arrive qu'après le plafond n'émet aucun
+  `llm_call_cap_exhausted` (AC5). Sans lui, instrumenter le mauvais des deux
+  sites `response.text()` laisserait tous les autres tests verts tout en
+  gonflant la population que la sonde (c) doit lire — une attribution fausse ne
+  rend aucune décision incorrecte, elle rend la mesure menteuse.
 - `llm/mod.rs` tests — `deadline_abort` porte `cap_exhausted` absent, jamais
   `false`.
 
@@ -570,7 +595,10 @@ fuité dans la rétryabilité et il faut désarmer (mika#2015).
 - **AC5** — dans `openai.rs` et `ollama.rs`, une coupure de corps dont l'écoulé
   atteint 98 % du plafond émet `llm_call_cap_exhausted` (WARN) portant
   `provider`, `model`, `max_tokens`, `http_timeout_secs`, `elapsed_ms` et
-  `reachable_output_tokens` ; une coupure précoce n'en émet pas.
+  `reachable_output_tokens` ; une coupure précoce n'en émet pas. L'émission vit
+  **uniquement** dans le bras d'erreur du `match response.text()` ; une réponse
+  non-2xx dont le corps d'erreur arrive tard (`ollama.rs:487`) n'émet rien —
+  assertée par un test, sans quoi un 429 lent serait compté comme guillotine.
 - **AC6** — dans les deux cas d'AC5, l'erreur rendue reste
   `LlmError::Transport`, `is_retryable()` reste `true` et `error_class()` reste
   `transport_timeout` — assertés, pas supposés (non-régression mika#2015 /
