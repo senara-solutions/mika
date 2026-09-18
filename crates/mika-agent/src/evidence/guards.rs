@@ -1323,6 +1323,213 @@ pub fn parse_repeat_window(raw: Option<&str>) -> i64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// mika#2136 — un envoi échoué ne peut pas se clore en silence
+// ---------------------------------------------------------------------------
+
+/// One `send_message` attempt, in the order the turn made it (mika#2136).
+///
+/// The engine builds this sequence in `process_tool_calls` from the verdict the
+/// tool posts on its `ToolOutput`. It is a per-turn value: born at the first
+/// step, dead with the turn, never persisted and never serialized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryRecord {
+    /// Tool step the attempt was made at. Carried for the operator log and the
+    /// re-prompt, never read by the predicate.
+    pub step: u32,
+    /// The text as it was measured and sent (`cleaned`), in full.
+    pub text: String,
+    /// What became of it.
+    pub outcome: crate::tools::DeliveryOutcome,
+}
+
+/// What the engine must make the turn admit (mika#2136).
+///
+/// Carries enough to write both the re-prompt and the user-facing line without
+/// re-reading the lost text: which stage failed, where in the sequence, why, and
+/// a short prefix of the content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndeliveredSends {
+    /// How many attempts are unrepaired.
+    pub failed_count: usize,
+    /// 1-based index, within the turn's delivery sequence, of the first
+    /// unrepaired attempt. What the user reads as "part N".
+    pub failed_index: usize,
+    /// Which of the two damages this is.
+    pub stage: UndeliveredStage,
+    /// The sender's prose, for the transport stage. `None` for a length refusal
+    /// — nothing was attempted, so there is no transport reason to give.
+    pub reason: Option<String>,
+    /// Up to 80 characters of the lost content, for the re-prompt and the line.
+    pub preview: String,
+}
+
+/// The two damages a `send_message` failure can be, because their repairs
+/// differ (mika#2136 E2).
+///
+/// A length refusal is repaired by splitting; a transport death by resending
+/// the same text. A predicate conflating them would produce noise on the more
+/// frequent case — an agent writing 5 000 characters is refused every day,
+/// splits, and is right to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UndeliveredStage {
+    /// The tool refused it for length and nothing left. This is the
+    /// « Le voici en entier 👆 » case.
+    RefusedTooLong,
+    /// It left and died. This is the « Partie 1/4 » case.
+    Failed,
+}
+
+/// Maximum characters of lost content carried into the re-prompt and the line.
+const UNDELIVERED_PREVIEW_MAX: usize = 80;
+
+/// Single-retry budget label for the EndTurn guard 6f (mika#2136).
+pub const UNACKNOWLEDGED_SEND_FAILURE_LABEL: &str = "unacknowledged_send_failure";
+
+/// Is there, at the close of this turn, a `send_message` failure that nothing
+/// repaired? (mika#2136 D3)
+///
+/// Entirely structural — no lexicon, no reading of the assistant's text. Two
+/// stages, because the two damages have different repairs:
+///
+/// ```text
+/// transport : ∃ R with outcome = Failed
+///             AND ∄ later R' with the same text AND outcome = Delivered
+///             → that content is lost
+///
+/// refusal   : ∃ R with outcome = RefusedTooLong
+///             AND ∄ later R' with outcome = Delivered
+///             → nothing left at all
+/// ```
+///
+/// `Delivered` is never a term on its own — it appears only as a *repair*. A
+/// turn with no failure feeds nothing into the predicate, which is what makes
+/// the happy path free by construction rather than by precaution.
+///
+/// **Three false negatives, named rather than hidden.** They are one limit seen
+/// three times: the engine knows *that* a send left, never *that the refused
+/// content* did.
+///
+/// 1. **Partial coverage.** An agent that splits into four, sends two and says
+///    "that's everything" passes under the predicate.
+/// 2. **Extinction by an unrelated send.** After a 12 000-character refusal, one
+///    delivered "sorry, too long, here's a summary" of 80 characters puts out
+///    the refusal stage — while the document still never left. Verifying
+///    coverage would mean comparing the concatenated fragments to the refused
+///    text, which the agent's own rewording ("Part 1/4", summaries, transitions)
+///    makes impossible by construction; and a length floor was declined on
+///    purpose, because its error leans the wrong way — a user who asked for a
+///    summary would receive a line asserting a loss that did not occur.
+/// 3. **Boundary suppression (#771).** A suppressed `send_message` never reaches
+///    `execute`, so it posts no verdict and is invisible here. That is #771
+///    deciding how many sends a turn carries, not a delivery failure; its
+///    `tool_result` is explicit and `is_error`.
+///
+/// The transport stage has none of the first two holes: its repair is the
+/// equality of a text with itself.
+pub fn undelivered_sends(records: &[DeliveryRecord]) -> Option<UndeliveredSends> {
+    use crate::tools::DeliveryOutcome;
+
+    let mut first: Option<(usize, &DeliveryRecord, UndeliveredStage)> = None;
+    let mut failed_count = 0usize;
+
+    for (i, rec) in records.iter().enumerate() {
+        let stage = match &rec.outcome {
+            DeliveryOutcome::Failed { .. } => {
+                // Repaired only by a LATER send of the same text that landed.
+                let repaired = records[i + 1..].iter().any(|later| {
+                    later.text == rec.text && matches!(later.outcome, DeliveryOutcome::Delivered)
+                });
+                if repaired {
+                    continue;
+                }
+                UndeliveredStage::Failed
+            }
+            DeliveryOutcome::RefusedTooLong { .. } => {
+                // The engine cannot verify that a split covers the refused
+                // document, but it can observe the measured case: a refusal
+                // followed by no successful send at all — a document of which
+                // nothing left. The stage goes out as soon as a fragment does.
+                let anything_left = records[i + 1..]
+                    .iter()
+                    .any(|later| matches!(later.outcome, DeliveryOutcome::Delivered));
+                if anything_left {
+                    continue;
+                }
+                UndeliveredStage::RefusedTooLong
+            }
+            // Deliberately outside the predicate: both return success by design
+            // (#650, regression-guarded by mika#1090) because they are permanent
+            // session conditions, and making them fire here would reopen the
+            // retry loop that ticket closed. They are in the enum so the
+            // population stays countable the day it gets its own ticket.
+            DeliveryOutcome::Delivered | DeliveryOutcome::NoChannel | DeliveryOutcome::NoSender => {
+                continue;
+            }
+        };
+
+        failed_count += 1;
+        if first.is_none() {
+            first = Some((i, rec, stage));
+        }
+    }
+
+    let (idx, rec, stage) = first?;
+    let reason = match &rec.outcome {
+        DeliveryOutcome::Failed { reason } => Some(reason.clone()),
+        _ => None,
+    };
+    Some(UndeliveredSends {
+        failed_count,
+        failed_index: idx + 1,
+        stage,
+        reason,
+        preview: rec.text[..rec.text.floor_char_boundary(UNDELIVERED_PREVIEW_MAX)].to_string(),
+    })
+}
+
+/// The corrective re-prompt for guard 6f (mika#2136).
+///
+/// Shared by the non-empty-text site and the silent-mode empty-text mirror so
+/// the two cannot drift — the same reason `CALLBACK_TERMINAL_ACTION_CORRECTION`
+/// is a const rather than two `format!`s.
+///
+/// It names the stage, the index and a prefix of the lost content, and asks for
+/// an admission. It deliberately does **not** prescribe wording: the register
+/// belongs to the agent's persona (mika#2290 established that one fact needs two
+/// formulations, and that deriving the register from a technical field is a
+/// product choice in disguise). The engine states the fact; the agent says it.
+pub fn undelivered_send_correction(u: &UndeliveredSends) -> String {
+    match u.stage {
+        UndeliveredStage::RefusedTooLong => format!(
+            "[mika-engine] The `send_message` call at position {index} of this turn was \
+             REFUSED for length, and no message has left since. The user has received \
+             NOTHING of that content (it begins: \"{preview}…\"). Your response must not \
+             claim, imply, or let it be understood that it was delivered. Tell the user \
+             plainly that it is too long to send in one message, and either send it split \
+             into parts under the limit — announcing that you are doing so — or ask them \
+             how they would like it. Rewrite your response now.",
+            index = u.failed_index,
+            preview = u.preview,
+        ),
+        UndeliveredStage::Failed => format!(
+            "[mika-engine] {count} message(s) of this turn were NOT delivered, and nothing \
+             has resent them. The first is at position {index} and begins: \"{preview}…\"{reason}. \
+             The user never received it. Do not present the sequence as complete and do not \
+             skip over the gap: name the part that failed, and either resend exactly that \
+             text or tell the user it did not get through. Rewrite your response now.",
+            count = u.failed_count,
+            index = u.failed_index,
+            preview = u.preview,
+            reason = u
+                .reason
+                .as_deref()
+                .map(|r| format!(" (transport said: {r})"))
+                .unwrap_or_default(),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2848,5 +3055,208 @@ mod tests {
             parse_repeat_window(Some("-1")),
             REPEAT_ACTION_WINDOW_DEFAULT_SECS
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2136 — `undelivered_sends`
+    // -----------------------------------------------------------------------
+
+    mod undelivered {
+        use super::super::*;
+        use crate::tools::DeliveryOutcome;
+
+        fn rec(step: u32, text: &str, outcome: DeliveryOutcome) -> DeliveryRecord {
+            DeliveryRecord {
+                step,
+                text: text.to_string(),
+                outcome,
+            }
+        }
+
+        fn delivered(step: u32, text: &str) -> DeliveryRecord {
+            rec(step, text, DeliveryOutcome::Delivered)
+        }
+
+        fn failed(step: u32, text: &str) -> DeliveryRecord {
+            rec(
+                step,
+                text,
+                DeliveryOutcome::Failed {
+                    reason: "gateway /send returned 502 Bad Gateway".to_string(),
+                },
+            )
+        }
+
+        fn refused(step: u32, text: &str) -> DeliveryRecord {
+            rec(
+                step,
+                text,
+                DeliveryOutcome::RefusedTooLong {
+                    len_utf16: text.chars().count(),
+                    limit: 4096,
+                },
+            )
+        }
+
+        /// AC4 by construction: a turn that sent nothing feeds nothing in.
+        #[test]
+        fn sequence_vide() {
+            assert_eq!(undelivered_sends(&[]), None);
+        }
+
+        /// AC4: four fragments all delivered produce no mention of failure.
+        #[test]
+        fn tout_livre() {
+            let seq = [
+                delivered(1, "Partie 1/4"),
+                delivered(2, "Partie 2/4"),
+                delivered(3, "Partie 3/4"),
+                delivered(4, "Partie 4/4"),
+            ];
+            assert_eq!(undelivered_sends(&seq), None);
+        }
+
+        /// AC3: a dead fragment in the middle of successful ones is NOT masked
+        /// by them. Asserted on the sequence, not on an isolated send.
+        #[test]
+        fn un_fragment_mort_au_milieu_de_trois_reussis() {
+            let seq = [
+                delivered(1, "Partie 1/4"),
+                failed(2, "Partie 2/4"),
+                delivered(3, "Partie 3/4"),
+                delivered(4, "Partie 4/4"),
+            ];
+            let out = undelivered_sends(&seq).expect("the dead fragment must surface");
+            assert_eq!(out.failed_count, 1);
+            assert_eq!(out.failed_index, 2);
+            assert_eq!(out.stage, UndeliveredStage::Failed);
+            assert_eq!(out.preview, "Partie 2/4");
+            assert!(out.reason.unwrap().contains("502"));
+        }
+
+        /// The one repair the engine can verify: the same text, later, landed.
+        #[test]
+        fn un_fragment_mort_suivi_de_son_reessai_reussi() {
+            let seq = [
+                failed(1, "Partie 1/4"),
+                delivered(2, "Partie 1/4"),
+                delivered(3, "Partie 2/4"),
+            ];
+            assert_eq!(undelivered_sends(&seq), None);
+        }
+
+        /// Equality is on the text, not on the position: a retry of ANOTHER
+        /// fragment does not repair this one.
+        #[test]
+        fn un_reessai_d_un_autre_texte_ne_repare_rien() {
+            let seq = [
+                failed(1, "Partie 1/4"),
+                failed(2, "Partie 2/4"),
+                delivered(3, "Partie 2/4"),
+            ];
+            let out = undelivered_sends(&seq).expect("fragment 1 is still lost");
+            assert_eq!(out.failed_count, 1);
+            assert_eq!(out.failed_index, 1);
+            assert_eq!(out.preview, "Partie 1/4");
+        }
+
+        /// The repair must be LATER. An earlier success on the same text does
+        /// not undo a subsequent death — the direction of time is what makes
+        /// the predicate a repair rather than a coincidence.
+        #[test]
+        fn un_succes_anterieur_ne_repare_pas_une_mort_posterieure() {
+            let seq = [delivered(1, "même texte"), failed(2, "même texte")];
+            let out = undelivered_sends(&seq).expect("the later death still stands");
+            assert_eq!(out.failed_index, 2);
+            assert_eq!(out.stage, UndeliveredStage::Failed);
+        }
+
+        /// The refusal stage goes out as soon as a fragment leaves.
+        #[test]
+        fn refus_de_longueur_suivi_de_quatre_fragments_reussis() {
+            let seq = [
+                refused(1, "document de douze mille caractères"),
+                delivered(2, "Partie 1/4"),
+                delivered(3, "Partie 2/4"),
+                delivered(4, "Partie 3/4"),
+                delivered(5, "Partie 4/4"),
+            ];
+            assert_eq!(undelivered_sends(&seq), None);
+        }
+
+        /// AC6-a, predicate side: the measured 2026-09-01 case. A refusal, then
+        /// nothing — the document of which nothing left.
+        #[test]
+        fn refus_de_longueur_suivi_de_rien() {
+            let seq = [refused(1, "Le document entier, douze mille caractères…")];
+            let out = undelivered_sends(&seq).expect("nothing left at all");
+            assert_eq!(out.failed_count, 1);
+            assert_eq!(out.failed_index, 1);
+            assert_eq!(out.stage, UndeliveredStage::RefusedTooLong);
+            assert_eq!(
+                out.reason, None,
+                "a refusal has no transport reason to give — nothing was attempted"
+            );
+        }
+
+        /// Two dead fragments count as two, and the index names the first.
+        #[test]
+        fn deux_fragments_morts_comptage() {
+            let seq = [
+                failed(1, "Partie 1/4"),
+                delivered(2, "Partie 2/4"),
+                failed(3, "Partie 3/4"),
+            ];
+            let out = undelivered_sends(&seq).expect("two are lost");
+            assert_eq!(out.failed_count, 2);
+            assert_eq!(out.failed_index, 1);
+        }
+
+        /// `NoChannel` and `NoSender` are in the enum and outside the predicate
+        /// (E3). Making them fire would reopen the #650 retry loop.
+        #[test]
+        fn no_channel_et_no_sender_sont_hors_du_predicat() {
+            let seq = [
+                rec(1, "coucou", DeliveryOutcome::NoChannel),
+                rec(2, "coucou", DeliveryOutcome::NoSender),
+            ];
+            assert_eq!(undelivered_sends(&seq), None);
+        }
+
+        /// **Pins the false negative of D3 instead of letting it drift.** After
+        /// a refusal, one short unrelated delivered message puts the refusal
+        /// stage out — while the document still never left.
+        ///
+        /// This test exists so that the day someone wants to close that hole,
+        /// it reddens and names it, rather than letting anyone believe the
+        /// predicate already covered the case. Closing it would take either a
+        /// semantic comparison between the refused text and reworded fragments,
+        /// or an arbitrary length floor whose error leans toward asserting a
+        /// loss that did not happen — which is exactly what halt 4 of the probe
+        /// forbids leaving alive.
+        #[test]
+        fn faux_negatif_epingle_refus_eteint_par_un_envoi_sans_rapport() {
+            let seq = [
+                refused(1, "Le document entier, douze mille caractères…"),
+                delivered(2, "Désolé, c'est trop long — je te le résume."),
+            ];
+            assert_eq!(
+                undelivered_sends(&seq),
+                None,
+                "known false negative (mika#2136 D3, out of scope): a delivered \
+                 unrelated message extinguishes the refusal stage"
+            );
+        }
+
+        /// The preview is cut on a character boundary, never mid-codepoint.
+        #[test]
+        fn le_preview_ne_coupe_pas_un_caractere_multioctet() {
+            let text = "é".repeat(200);
+            let seq = [failed(1, &text)];
+            let out = undelivered_sends(&seq).expect("lost");
+            assert!(out.preview.chars().all(|c| c == 'é'));
+            assert!(out.preview.len() <= 80);
+            assert!(!out.preview.is_empty());
+        }
     }
 }

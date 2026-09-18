@@ -235,6 +235,90 @@ pub struct ToolOutput {
     /// discipline is enforced at the type layer — a handler cannot accidentally
     /// leak operator instructions into `content`. See mika#1783.
     pub substrate_diagnostic: Option<String>,
+    /// Delivery verdict — when present, this is `send_message`'s structured
+    /// statement of what happened to a user-facing message (mika#2136). Like
+    /// [`Self::substrate_diagnostic`] it is a tool→engine channel and is
+    /// **never** serialized to the LLM; `content` carries the model-facing
+    /// prose independently.
+    ///
+    /// `None` everywhere except the six `send_message` exits that attempt (or
+    /// refuse) a delivery. The engine reads it in `process_tool_calls` to build
+    /// the turn's `DeliveryRecord` sequence, which the EndTurn guard 6f then
+    /// statues on. The reason it exists rather than re-reading the error prose:
+    /// the three `is_error` exits of `send_message` do not describe the same
+    /// damage (a length refusal is repaired by splitting, a transport death by
+    /// resending the same text), and telling them apart by parsing an English
+    /// sentence would make a message meant for the model into a wire format.
+    ///
+    /// Constructed exclusively via [`ToolOutput::delivery`] so no call site can
+    /// state a verdict without saying which text it is about.
+    ///
+    /// **Boxed on purpose.** `ToolOutput` is the `Err` variant of a dozen
+    /// validation helpers across `skills::builtin_handlers`, so its inline size
+    /// is paid by every one of them; an unboxed `DeliveryVerdict` (a `String`
+    /// plus an enum carrying another `String`) pushes the struct past clippy's
+    /// `result_large_err` threshold and makes a dozen unrelated signatures
+    /// lint-fail. The indirection costs one allocation, and only on the
+    /// `send_message` path that actually states a verdict.
+    pub delivery: Option<Box<DeliveryVerdict>>,
+}
+
+/// What `send_message` did with one outbound message (mika#2136).
+///
+/// Carries the text **as it was measured and sent** — `cleaned`, after
+/// `strip_internal_tags` — and never the raw tool argument. That is not a
+/// portability detail: the engine's repair predicate compares a dead message's
+/// text to a later successful one, `send_message` is the only holder of
+/// `cleaned`, and the raw argument is a different register (the tool measures
+/// and sends `cleaned`; the LLM may have echoed internal tags into the raw
+/// value). A record built from `arguments["text"]` would fail to recognize a
+/// legitimate retry and make the engine annex a loss that did not happen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryVerdict {
+    /// The cleaned text this verdict is about. Full, never truncated.
+    pub text: String,
+    /// What became of it.
+    pub outcome: DeliveryOutcome,
+}
+
+/// The fate of one `send_message` attempt (mika#2136).
+///
+/// Five variants for six exits: `SendOutcome::Failed` and the sender's `Err`
+/// share [`Self::Failed`] deliberately — the guard predicate and the engine's
+/// factual annex do nothing with the difference (in both cases the content is
+/// lost and the repair is resending the same text), so separating them would
+/// cost a variant no reader exploits. What does separate them — one populates
+/// `failed_sends`, the other guarantees nothing — stays readable in `reason`.
+///
+/// [`Self::NoChannel`] and [`Self::NoSender`] are **in the enum but outside the
+/// guard predicate**: both are real "delivery claimed, nothing delivered"
+/// populations, but both return `ToolOutput::success` on purpose (#650,
+/// regression-guarded by mika#1090) because they are permanent session
+/// conditions and an error there loops the LLM. Enumerating them costs two
+/// variants and makes that population countable the day it gets its own ticket;
+/// omitting them would mean reopening this type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliveryOutcome {
+    /// The gateway accepted it.
+    Delivered,
+    /// Refused by the tool's own length guard (mika#2134) — nothing was
+    /// persisted, nothing reached the transport, the user received nothing.
+    RefusedTooLong {
+        /// Measured length of `cleaned`, in UTF-16 units (how Telegram counts).
+        len_utf16: usize,
+        /// The ceiling it exceeded.
+        limit: usize,
+    },
+    /// It left and died: the transport refused it, or the sender itself errored.
+    Failed {
+        /// The sender's own prose. Keeps the `failed_sends`-populated case
+        /// distinguishable from the infrastructure-error case.
+        reason: String,
+    },
+    /// No reply channel for this session (`chat_id == 0`).
+    NoChannel,
+    /// No outbound sender is configured at all.
+    NoSender,
 }
 
 impl ToolOutput {
@@ -244,6 +328,7 @@ impl ToolOutput {
             is_error: false,
             images: vec![],
             substrate_diagnostic: None,
+            delivery: None,
         }
     }
 
@@ -253,6 +338,7 @@ impl ToolOutput {
             is_error: true,
             images: vec![],
             substrate_diagnostic: None,
+            delivery: None,
         }
     }
 
@@ -262,6 +348,32 @@ impl ToolOutput {
             is_error: false,
             images,
             substrate_diagnostic: None,
+            delivery: None,
+        }
+    }
+
+    /// Construct a tool result carrying a delivery verdict (mika#2136).
+    ///
+    /// `text` is a constructor parameter rather than something the engine
+    /// recovers later, precisely so a call site cannot state an outcome without
+    /// saying which text it concerns — the raw tool argument is a different
+    /// register from what was measured and sent, and rebuilding the record from
+    /// it is the failure mode this signature forbids.
+    pub fn delivery(
+        content: impl Into<String>,
+        is_error: bool,
+        text: impl Into<String>,
+        outcome: DeliveryOutcome,
+    ) -> Self {
+        Self {
+            content: content.into(),
+            is_error,
+            images: vec![],
+            substrate_diagnostic: None,
+            delivery: Some(Box::new(DeliveryVerdict {
+                text: text.into(),
+                outcome,
+            })),
         }
     }
 
@@ -288,6 +400,7 @@ impl ToolOutput {
             is_error: true,
             images: vec![],
             substrate_diagnostic: Some(diagnostic.into()),
+            delivery: None,
         }
     }
 }

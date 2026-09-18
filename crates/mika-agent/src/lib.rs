@@ -8,6 +8,7 @@ pub mod agent {
 pub mod async_db;
 pub mod auth_boundary_ledger;
 pub mod auto_pull;
+pub mod auto_pull_stop;
 pub mod bundled_skills;
 pub mod calibration;
 pub mod compaction;
@@ -16,6 +17,7 @@ pub mod db;
 pub mod evidence;
 pub(crate) mod github_graphql;
 pub mod grooming_marker;
+pub mod image_disposition;
 pub mod kg;
 pub mod live_pilot;
 pub mod mcp;

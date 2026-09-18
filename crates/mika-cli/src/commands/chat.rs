@@ -187,6 +187,11 @@ async fn spawn_agent_worker(
         tools: tool_registry.clone(),
         skills: skill_registry.clone(),
         home_dir: ctx.home_dir.clone(),
+        // mika#2329 — le home global porte le fichier sentinelle du STOP à chaud.
+        // `auto_pull` ne tourne pas en mode CLI, mais le champ décrit le
+        // dispatcher, pas le scan : le renseigner faussement ici ferait mentir
+        // n'importe quel futur lecteur.
+        global_home_dir: ctx.global_home.clone(),
         message_sender: message_sender.clone(),
         embedding_client: embedding_client.clone(),
         brave_api_key: brave_api_key.clone(),
@@ -210,6 +215,7 @@ async fn spawn_agent_worker(
         cli_mode: true,
         settings: ctx.settings.clone(),
         pr_reviews_posted: None, // CLI mode: no session-scoped dedup needed
+        auto_pull_stop_armed: AtomicBool::new(false),
     });
     let task_engine = Arc::new(tokio::sync::Mutex::new(TaskEngine::new(
         ctx.async_db.clone(),

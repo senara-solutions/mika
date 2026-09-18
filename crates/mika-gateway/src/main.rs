@@ -11,6 +11,7 @@ pub(crate) mod orchestrator_inbox;
 mod routes;
 mod settings;
 mod telegram;
+mod telegram_markdown;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -71,6 +72,15 @@ async fn main() -> Result<()> {
     }
 
     info!(settings = ?settings, "starting mika-gateway");
+
+    // mika#2291 — resolve the Telegram HTML-rendering kill-switch once, here.
+    // Same contract as MIKA_AGENT_TIER / MIKA_DEPLOYMENT: read once per process,
+    // not hot-swappable, to be set in the service EnvironmentFile / ConfigMap
+    // BEFORE startup. Default armed; disarming emits its own INFO line, because a
+    // disarmed renderer is silent in exactly the way a healthy one is.
+    telegram_markdown::init_html_render(settings::telegram_html_render_is_enabled(
+        settings.telegram_html_render.as_deref(),
+    ));
 
     let ready = Arc::new(AtomicBool::new(false));
 

@@ -6,7 +6,7 @@ use tracing::{debug, error, warn};
 
 use crate::messaging::SendOutcome;
 
-use super::{Tool, ToolContext, ToolOutput};
+use super::{DeliveryOutcome, Tool, ToolContext, ToolOutput};
 
 pub struct SendMessageTool;
 
@@ -56,14 +56,25 @@ impl Tool for SendMessageTool {
         // refuse to send never enters conversation history (mika#2134).
         let len_utf16 = mika_common::telegram::text_len_utf16(&cleaned);
         if len_utf16 > mika_common::telegram::MAX_TEXT_UTF16_UNITS {
-            return Ok(ToolOutput::error(format!(
-                "Telegram accepts at most {} characters per message; this text is {len_utf16}. \
-                 The gateway does not split messages — split it yourself into chunks under \
-                 {} characters and send them in order, and tell the user you are sending \
-                 it in parts.",
-                mika_common::telegram::MAX_TEXT_UTF16_UNITS,
-                mika_common::telegram::MAX_TEXT_UTF16_UNITS,
-            )));
+            return Ok(ToolOutput::delivery(
+                format!(
+                    "NOTHING WAS SENT — the user has received nothing. Telegram accepts at \
+                     most {} characters per message; this text is {len_utf16}. \
+                     The gateway does not split messages — split it yourself into chunks under \
+                     {} characters and send them in order, and tell the user you are sending \
+                     it in parts. Do NOT tell the user you have delivered this content.",
+                    mika_common::telegram::MAX_TEXT_UTF16_UNITS,
+                    mika_common::telegram::MAX_TEXT_UTF16_UNITS,
+                ),
+                true,
+                // `cleaned`, not the raw argument: this is what the guard above
+                // measured, and it is the register a later retry must match.
+                cleaned.clone(),
+                DeliveryOutcome::RefusedTooLong {
+                    len_utf16,
+                    limit: mika_common::telegram::MAX_TEXT_UTF16_UNITS,
+                },
+            ));
         }
 
         // Persist the outbound message for conversation history.
@@ -86,13 +97,28 @@ impl Tool for SendMessageTool {
                 match sender.send(&cleaned).await {
                     Ok(SendOutcome::Delivered) => {
                         debug!("send_message: delivered successfully");
-                        Ok(ToolOutput::success("Message sent."))
+                        Ok(ToolOutput::delivery(
+                            "Message sent.",
+                            false,
+                            cleaned.clone(),
+                            DeliveryOutcome::Delivered,
+                        ))
                     }
                     Ok(SendOutcome::Failed { reason }) => {
                         warn!(reason = %reason, "send_message: delivery failed");
-                        Ok(ToolOutput::error(format!(
-                            "Message delivery failed: {reason}"
-                        )))
+                        Ok(ToolOutput::delivery(
+                            format!(
+                                "Message delivery failed: {reason}. This message was NOT \
+                                 delivered — the user has not received it. If you are sending \
+                                 content in parts, say which part failed before continuing \
+                                 with the next one; do not present the sequence as complete."
+                            ),
+                            true,
+                            cleaned.clone(),
+                            DeliveryOutcome::Failed {
+                                reason: reason.clone(),
+                            },
+                        ))
                     }
                     // Intentionally returns success, not error. chat_id == 0 is a
                     // permanent session condition (GitHub webhook / non-Telegram
@@ -105,16 +131,33 @@ impl Tool for SendMessageTool {
                             session_id = %ctx.session_id,
                             "send_message_nochannel: tool returned success but message was NOT delivered — chat_id=0"
                         );
-                        Ok(ToolOutput::success(
+                        Ok(ToolOutput::delivery(
                             "No reply channel for this session (chat_id is zero). \
                              The user cannot receive messages via send_message. \
                              Use channel-appropriate tools (e.g., run_gh for GitHub) \
                              to deliver your response.",
+                            false,
+                            cleaned.clone(),
+                            DeliveryOutcome::NoChannel,
                         ))
                     }
                     Err(e) => {
                         warn!(error = %e, "send_message: sender error");
-                        Ok(ToolOutput::error(format!("Message delivery error: {e}")))
+                        // Ranged under `Failed` (mika#2136 D2): same damage, same
+                        // repair. `reason` keeps the two distinguishable.
+                        Ok(ToolOutput::delivery(
+                            format!(
+                                "Message delivery error: {e}. This message was NOT delivered \
+                                 — the user has not received it. If you are sending content \
+                                 in parts, say which part failed before continuing with the \
+                                 next one; do not present the sequence as complete."
+                            ),
+                            true,
+                            cleaned.clone(),
+                            DeliveryOutcome::Failed {
+                                reason: e.to_string(),
+                            },
+                        ))
                     }
                 }
             }
@@ -126,9 +169,12 @@ impl Tool for SendMessageTool {
             // inform the user.
             None => {
                 warn!("send_message called but no outbound sender configured");
-                Ok(ToolOutput::success(
+                Ok(ToolOutput::delivery(
                     "No outbound sender configured — message was NOT delivered. \
                      To enable Telegram delivery, set MIKA_ROUTING_URL and MIKA_INTERNAL_TOKEN.",
+                    false,
+                    cleaned.clone(),
+                    DeliveryOutcome::NoSender,
                 ))
             }
         }
@@ -707,6 +753,245 @@ mod tests {
             result.content.contains("run_gh"),
             "expected tool redirect hint in output: {}",
             result.content
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2136 — every delivery exit states its verdict, and states it about
+    // `cleaned`
+    // -----------------------------------------------------------------------
+
+    /// AC1, tool side: the six delivery exits each carry the outcome that
+    /// describes them. Without this the engine's turn state would be built from
+    /// the English prose of an error message.
+    #[tokio::test]
+    async fn mika2136_chaque_sortie_pose_son_verdict() {
+        let harness = TestHarness::new();
+        let skills_dirty = std::sync::atomic::AtomicBool::new(false);
+        let pr_review_posted = std::sync::atomic::AtomicBool::new(false);
+        let tool_arg_suffix_rejected = std::sync::atomic::AtomicBool::new(false);
+        let tool = SendMessageTool;
+
+        // (1) Delivered.
+        let mock = Arc::new(MockSender::new());
+        let ctx = ctx_with_sender(
+            &harness,
+            mock.clone(),
+            &skills_dirty,
+            &pr_review_posted,
+            &tool_arg_suffix_rejected,
+        );
+        let out = tool
+            .execute(serde_json::json!({"text": "bonjour"}), &ctx)
+            .await
+            .unwrap();
+        let v = out.delivery.expect("Delivered must carry a verdict");
+        assert_eq!(v.outcome, DeliveryOutcome::Delivered);
+        assert_eq!(v.text, "bonjour");
+
+        // (2) RefusedTooLong — the exact shape of the 2026-09-01 document.
+        let mock = Arc::new(MockSender::new());
+        let ctx = ctx_with_sender(
+            &harness,
+            mock.clone(),
+            &skills_dirty,
+            &pr_review_posted,
+            &tool_arg_suffix_rejected,
+        );
+        let long = "a".repeat(12_000);
+        let out = tool
+            .execute(serde_json::json!({ "text": long.clone() }), &ctx)
+            .await
+            .unwrap();
+        let v = out.delivery.expect("RefusedTooLong must carry a verdict");
+        assert_eq!(
+            v.outcome,
+            DeliveryOutcome::RefusedTooLong {
+                len_utf16: 12_000,
+                limit: mika_common::telegram::MAX_TEXT_UTF16_UNITS,
+            }
+        );
+        assert_eq!(v.text, long, "the verdict is about the refused text itself");
+        assert!(
+            out.content.contains("NOTHING WAS SENT"),
+            "D6 reformulation: {}",
+            out.content
+        );
+
+        // (3) Failed (transport).
+        let mock = Arc::new(MockSender::with_outcome(SendOutcome::Failed {
+            reason: "gateway /send returned 502 Bad Gateway".to_string(),
+        }));
+        let ctx = ctx_with_sender(
+            &harness,
+            mock.clone(),
+            &skills_dirty,
+            &pr_review_posted,
+            &tool_arg_suffix_rejected,
+        );
+        let out = tool
+            .execute(serde_json::json!({"text": "Partie 1/4"}), &ctx)
+            .await
+            .unwrap();
+        let v = out.delivery.expect("Failed must carry a verdict");
+        assert!(matches!(v.outcome, DeliveryOutcome::Failed { .. }));
+        assert_eq!(v.text, "Partie 1/4");
+        assert!(
+            out.content.contains("NOT delivered") && out.content.contains("which part failed"),
+            "D6 reformulation: {}",
+            out.content
+        );
+
+        // (4) The sender's own `Err` ranges under `Failed` (D2).
+        let mock = Arc::new(MockSender::with_error("chat_id not configured"));
+        let ctx = ctx_with_sender(
+            &harness,
+            mock.clone(),
+            &skills_dirty,
+            &pr_review_posted,
+            &tool_arg_suffix_rejected,
+        );
+        let out = tool
+            .execute(serde_json::json!({"text": "coucou"}), &ctx)
+            .await
+            .unwrap();
+        let v = out.delivery.expect("sender Err must carry a verdict");
+        match v.outcome {
+            DeliveryOutcome::Failed { ref reason } => {
+                assert!(
+                    reason.contains("chat_id not configured"),
+                    "reason: {reason}"
+                );
+            }
+            other => panic!("sender Err must range under Failed, got {other:?}"),
+        }
+
+        // (5) NoChannel — in the enum, outside the predicate.
+        let mock = Arc::new(MockSender::with_outcome(SendOutcome::NoChannel));
+        let ctx = ctx_with_sender(
+            &harness,
+            mock.clone(),
+            &skills_dirty,
+            &pr_review_posted,
+            &tool_arg_suffix_rejected,
+        );
+        let out = tool
+            .execute(serde_json::json!({"text": "coucou"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error, "#650/mika#1090: NoChannel stays a success");
+        assert_eq!(
+            out.delivery
+                .expect("NoChannel must carry a verdict")
+                .outcome,
+            DeliveryOutcome::NoChannel
+        );
+
+        // (6) NoSender.
+        let ctx = harness.ctx();
+        let out = tool
+            .execute(serde_json::json!({"text": "coucou"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert_eq!(
+            out.delivery.expect("NoSender must carry a verdict").outcome,
+            DeliveryOutcome::NoSender
+        );
+    }
+
+    /// The two exits that attempt no delivery state no verdict. Nothing was
+    /// tried, so there is no failure for the turn to acknowledge — and a record
+    /// here would make `failed_count` lie.
+    #[tokio::test]
+    async fn mika2136_les_sorties_sans_tentative_ne_posent_rien() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = SendMessageTool;
+
+        let out = tool
+            .execute(serde_json::json!({"text": ""}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(
+            out.delivery.is_none(),
+            "'text' is required states no verdict"
+        );
+
+        let out = tool
+            .execute(serde_json::json!({"text": "<context>x</context>"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(
+            out.delivery.is_none(),
+            "empty-after-strip states no verdict"
+        );
+    }
+
+    /// The verdict's text is the POST-strip text, on every exit — including the
+    /// length refusal, whose guard measures `cleaned` and not the raw argument.
+    ///
+    /// This is the invariant the repair predicate rests on (mika#2136 E9): a
+    /// retry re-emitting the same content with one internal tag more or less
+    /// yields two different raw values for a single `cleaned`. Were the record
+    /// built from `arguments["text"]`, the repair would go unrecognized and the
+    /// engine would annex a loss to the user for a message that did arrive.
+    #[tokio::test]
+    async fn mika2136_le_verdict_porte_le_texte_nettoye() {
+        let harness = TestHarness::new();
+        let skills_dirty = std::sync::atomic::AtomicBool::new(false);
+        let pr_review_posted = std::sync::atomic::AtomicBool::new(false);
+        let tool_arg_suffix_rejected = std::sync::atomic::AtomicBool::new(false);
+        let tool = SendMessageTool;
+
+        // Delivered: raw carries an internal tag, the verdict must not.
+        let mock = Arc::new(MockSender::new());
+        let ctx = ctx_with_sender(
+            &harness,
+            mock.clone(),
+            &skills_dirty,
+            &pr_review_posted,
+            &tool_arg_suffix_rejected,
+        );
+        let raw = "<context>bruit interne</context>Voici le résumé.";
+        let out = tool
+            .execute(serde_json::json!({ "text": raw }), &ctx)
+            .await
+            .unwrap();
+        let v = out.delivery.expect("verdict");
+        assert_eq!(v.text, "Voici le résumé.");
+        assert_eq!(
+            mock.sent(),
+            vec![v.text.clone()],
+            "the verdict's text is exactly what the transport received"
+        );
+
+        // RefusedTooLong: the refused text is `cleaned`, so a raw prefix that
+        // strips away must not appear in the record.
+        let mock = Arc::new(MockSender::new());
+        let ctx = ctx_with_sender(
+            &harness,
+            mock.clone(),
+            &skills_dirty,
+            &pr_review_posted,
+            &tool_arg_suffix_rejected,
+        );
+        let body = "b".repeat(9_000);
+        let raw = format!("<context>bruit</context>{body}");
+        let out = tool
+            .execute(serde_json::json!({ "text": raw }), &ctx)
+            .await
+            .unwrap();
+        let v = out.delivery.expect("verdict");
+        assert_eq!(v.text, body, "the refusal is about the cleaned text");
+        assert_eq!(
+            v.outcome,
+            DeliveryOutcome::RefusedTooLong {
+                len_utf16: 9_000,
+                limit: mika_common::telegram::MAX_TEXT_UTF16_UNITS,
+            }
         );
     }
 

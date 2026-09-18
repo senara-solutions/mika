@@ -14,6 +14,7 @@ pub mod guards;
 
 pub use audit::AuditEvent;
 pub use guards::{
-    ASSERT_GROUNDED_LABEL, AffirmativeStateClaim, EQUIVALENCE_CLAIM_LABEL, EquivalenceClaim,
-    GROUNDING_TOOLS,
+    ASSERT_GROUNDED_LABEL, AffirmativeStateClaim, DeliveryRecord, EQUIVALENCE_CLAIM_LABEL,
+    EquivalenceClaim, GROUNDING_TOOLS, UNACKNOWLEDGED_SEND_FAILURE_LABEL, UndeliveredSends,
+    UndeliveredStage, undelivered_send_correction, undelivered_sends,
 };

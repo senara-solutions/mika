@@ -93,6 +93,8 @@ fn test_dispatcher_with_grace(db: AsyncDatabase, grace_secs: Option<u64>) -> Arc
         skills: Arc::new(SkillRegistry::empty()),
         message_sender: Some(Arc::new(NoopSender)),
         home_dir: PathBuf::from("/tmp"),
+        // mika#2329 — home global inexistant : aucun STOP n'y est armé, chemin nominal.
+        global_home_dir: PathBuf::from("/tmp/mika-test-global-home-absent"),
         embedding_client: None,
         brave_api_key: None,
         gateway_url: None,
@@ -104,6 +106,7 @@ fn test_dispatcher_with_grace(db: AsyncDatabase, grace_secs: Option<u64>) -> Arc
         cli_mode: true,
         settings,
         pr_reviews_posted: None,
+        auto_pull_stop_armed: AtomicBool::new(false),
     })
 }
 

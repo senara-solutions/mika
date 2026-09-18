@@ -156,6 +156,7 @@ test: ## Run all tests
 	@bash scripts/check-dispatch-seats-declared.sh
 	@bash scripts/test-check-dispatch-seats-declared.sh
 	@python3 -B scripts/test-pilot-egress-proxy-status.py
+	@python3 -B scripts/test-pilot-egress-keepalive.py
 
 test-async-db-saturation: ## Run async DB channel saturation regression test (mika#1258)
 	cargo test -p mika-agent --lib -- async_db::tests::test_async_db_saturated_channel_does_not_pin_workers --nocapture
@@ -216,8 +217,9 @@ verify-no-sigpipe-grep: ## Reject `printf|echo | grep -q` under pipefail (SIGPIP
 	@bash scripts/verify-no-sigpipe-grep.sh
 	@bash scripts/test-verify-no-sigpipe-grep.sh
 
-test-pilot-egress-proxy: ## Verify the pilot egress-proxy upstream-status tap (mika#1901)
+test-pilot-egress-proxy: ## Verify the pilot egress-proxy status tap + framing (mika#1901, #2317)
 	@python3 -B scripts/test-pilot-egress-proxy-status.py
+	@python3 -B scripts/test-pilot-egress-keepalive.py
 
 verify-bundled-skills: ## Verify structural invariants on bundled skills — pre-merge counterpart to AC2 (mika#1575)
 	cargo run -q --bin verify-bundled-skills
