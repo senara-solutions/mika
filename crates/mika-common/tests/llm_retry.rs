@@ -54,6 +54,21 @@ enum Reply {
     /// A complete 200 response whose body is not the expected schema — a
     /// genuine parse failure, which must stay terminal.
     Unparseable,
+    /// Send a 2xx head announcing a long body, then **go silent without
+    /// closing** (mika#2280).
+    ///
+    /// This is not `TruncatedBody` with a pause: the connection stays open, so
+    /// the client does not see an EOF — it sits in `response.text()` until its
+    /// own per-call plafond cuts it. That is the measured signature of
+    /// mika#2189/#2280 (`error decoding response body: … operation timed out`),
+    /// and the only fixture that can drive `elapsed ≈ plafond`.
+    HeadersThenSilence,
+    /// The same silence, behind a **non-2xx** head (mika#2280 AC5).
+    ///
+    /// The negative control of site: this body is read by the `!is_success()`
+    /// branch, whose error is swallowed by `unwrap_or_default`. A slow 429 must
+    /// never enter a population that asserts "the model was still generating".
+    StatusHeadersThenSilence(u16),
 }
 
 struct FakeApi {
@@ -84,34 +99,61 @@ impl FakeApi {
                     .cloned()
                     .unwrap_or_else(|| script.last().expect("non-empty").clone());
 
-                // Drain the request head (and, best effort, its body) so the
-                // client never sees a reset before it finished writing.
-                let mut buf = vec![0u8; 64 * 1024];
-                let _ = socket.read(&mut buf).await;
+                // One task per connection since mika#2280: a `…ThenSilence`
+                // reply holds its socket open for the client's whole plafond,
+                // and handling connections inline would stall `accept()` for
+                // that long — the retry's second request would never be served,
+                // which reads as "the chain did not retry".
+                tokio::spawn(async move {
+                    // Drain the request head (and, best effort, its body) so the
+                    // client never sees a reset before it finished writing.
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let _ = socket.read(&mut buf).await;
 
-                let wire = match reply {
-                    Reply::TruncatedBody => {
-                        let partial = br#"{"id":"msg_trunc","cont"#;
-                        // The announced length is deliberately far larger than
-                        // what is written: that gap, plus the close below, is
-                        // the whole fixture.
-                        let mut out = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                             Content-Length: 4096\r\nConnection: close\r\n\r\n"
-                            .to_vec();
-                        out.extend_from_slice(partial);
-                        out
+                    let hold_open = matches!(
+                        reply,
+                        Reply::HeadersThenSilence | Reply::StatusHeadersThenSilence(_)
+                    );
+
+                    let wire = match reply {
+                        Reply::TruncatedBody => {
+                            let partial = br#"{"id":"msg_trunc","cont"#;
+                            // The announced length is deliberately far larger
+                            // than what is written: that gap, plus the close
+                            // below, is the whole fixture.
+                            let mut out = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                                 Content-Length: 4096\r\nConnection: close\r\n\r\n"
+                                .to_vec();
+                            out.extend_from_slice(partial);
+                            out
+                        }
+                        Reply::Ok(body) => http_response(200, &body),
+                        Reply::Status(code, body) => http_response(code, &body),
+                        Reply::Unparseable => {
+                            http_response(200, r#"{"not":"the expected schema"}"#)
+                        }
+                        // mika#2280: head only, and no close — see the two
+                        // variants' doc comments. The hang IS the fixture, so
+                        // these two must only ever be used with a plafond of a
+                        // second or two.
+                        Reply::HeadersThenSilence => silent_head(200),
+                        Reply::StatusHeadersThenSilence(code) => silent_head(code),
+                    };
+
+                    let _ = socket.write_all(&wire).await;
+                    let _ = socket.flush().await;
+                    if hold_open {
+                        // Hold the socket until the client's plafond cuts it.
+                        // The sleep only has to outlast that plafond; the
+                        // connection dies with this task when the test ends.
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        return;
                     }
-                    Reply::Ok(body) => http_response(200, &body),
-                    Reply::Status(code, body) => http_response(code, &body),
-                    Reply::Unparseable => http_response(200, r#"{"not":"the expected schema"}"#),
-                };
-
-                let _ = socket.write_all(&wire).await;
-                let _ = socket.flush().await;
-                // Closing here is what turns a short body into an EOF rather
-                // than a hang: without it the client would wait out its full
-                // HTTP timeout for bytes that never come.
-                let _ = socket.shutdown().await;
+                    // Closing here is what turns a short body into an EOF rather
+                    // than a hang: without it the client would wait out its full
+                    // HTTP timeout for bytes that never come.
+                    let _ = socket.shutdown().await;
+                });
             }
         });
 
@@ -125,6 +167,19 @@ impl FakeApi {
     fn hits(&self) -> usize {
         self.hits.load(Ordering::SeqCst)
     }
+}
+
+/// A response head announcing a body that will never be sent (mika#2280).
+///
+/// `Connection: keep-alive` and no close: the client must **wait**, not see an
+/// EOF. That is what makes the failure a plafond crossing rather than the
+/// mika#2015 `unexpected EOF` the fixture above produces.
+fn silent_head(status: u16) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\n\
+         Content-Length: 65536\r\nConnection: keep-alive\r\n\r\n"
+    )
+    .into_bytes()
 }
 
 fn http_response(status: u16, body: &str) -> Vec<u8> {
@@ -492,6 +547,25 @@ struct Attempt {
     attempt: u64,
     outcome: String,
     elapsed_ms: u64,
+    /// The raw `cap_exhausted` field, `None` when the line does **not carry
+    /// it** (mika#2280 AC7).
+    ///
+    /// Kept as an `Option<String>` rather than parsed to a bool on purpose: the
+    /// assertion that matters is *absent* versus *present and false*, and an
+    /// `Option<bool>` built by `.map(parse)` would collapse "no field" into the
+    /// same `None` as "unparseable field".
+    cap_exhausted: Option<String>,
+    max_tokens: Option<u64>,
+}
+
+/// One `llm_call_cap_exhausted` line (mika#2280 AC5).
+#[derive(Debug)]
+struct CapExhausted {
+    model: String,
+    max_tokens: u64,
+    http_timeout_secs: u64,
+    elapsed_ms: u64,
+    reachable_output_tokens: u64,
 }
 
 /// Why **every** test in this file carries `#[serial]`, not just the capturing
@@ -516,7 +590,7 @@ mod capture {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
-    use super::Attempt;
+    use super::{Attempt, CapExhausted};
 
     #[derive(Default)]
     pub struct Sink(pub Arc<Mutex<Vec<HashMap<String, String>>>>);
@@ -598,6 +672,29 @@ mod capture {
                     attempt: f["attempt"].parse().expect("attempt is a number"),
                     outcome: f["outcome"].clone(),
                     elapsed_ms: f["elapsed_ms"].parse().expect("elapsed_ms is a number"),
+                    cap_exhausted: f.get("cap_exhausted").cloned(),
+                    max_tokens: f.get("max_tokens").and_then(|v| v.parse().ok()),
+                })
+                .collect()
+        }
+
+        /// The `llm_call_cap_exhausted` lines, in order (mika#2280).
+        pub fn cap_exhausted(&self) -> Vec<CapExhausted> {
+            self.0
+                .lock()
+                .expect("sink")
+                .iter()
+                .filter(|f| f.get("event").map(String::as_str) == Some("llm_call_cap_exhausted"))
+                .map(|f| CapExhausted {
+                    model: f["model"].clone(),
+                    max_tokens: f["max_tokens"].parse().expect("max_tokens is a number"),
+                    http_timeout_secs: f["http_timeout_secs"]
+                        .parse()
+                        .expect("http_timeout_secs is a number"),
+                    elapsed_ms: f["elapsed_ms"].parse().expect("elapsed_ms is a number"),
+                    reachable_output_tokens: f["reachable_output_tokens"]
+                        .parse()
+                        .expect("reachable_output_tokens is a number"),
                 })
                 .collect()
         }
