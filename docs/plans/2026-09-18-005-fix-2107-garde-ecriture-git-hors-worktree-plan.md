@@ -479,6 +479,93 @@ c'est lui qui produit et éprouve le script que l'autre consommera.
 
 ---
 
+## Fire-Disposition
+
+*(Exigée par le Fire-Disposition Gate — mika#1574,
+`docs/solutions/best-practices/fire-disposition-doctrine.md`. Ce plan livre quatre détecteurs —
+le test M1b, le job CI M3, le test structurel M3, et la garde elle-même ; cette section dit ce
+que chacun fait face au **préexistant**.)*
+
+> **Disposition retenue : option (a) — exception nommée, `allowlist: zero entries`.**
+> La vacuité est **mesurée, pas supposée** ; les mesures sont ci-dessous, chacune rejouable en une
+> commande. Et elle est **assertée**, sinon elle ne serait qu'une affirmation de plan.
+
+### Les quatre détecteurs et leur population préexistante
+
+| Détecteur | Ce sur quoi il tire | Préexistant, mesuré le 2026-09-18 |
+|---|---|---|
+| **M1b** `scripts/test-guard-shared-checkout.sh` | ses propres fixtures — chaînes de commande, project-dirs synthétiques, dépôts jetables qu'il construit | **néant par construction** : il ne lit aucun fichier du dépôt |
+| **M3** job CI `shared-checkout-guard-lint` | n'exécute que M1b | néant, hérité de M1b |
+| **M3** test structurel | `.claude/settings.json` | **zéro fichier** : `git ls-files \| grep -i 'settings.*json'` rend vide sur **tout** le dépôt. Le fichier que le test asserte est créé par M2, dans le même PR |
+| **La garde** `scripts/guard-shared-checkout` | les appels **Bash du modèle** d'une session enracinée dans un worktree lié | deux populations à ne pas confondre — ci-dessous |
+
+Les trois premières lignes donnent la mesure directe : **allowlist : zéro entrée.** Aucun code,
+aucune donnée, aucun fichier suivi n'est en violation au moment où ces détecteurs atterrissent —
+deux d'entre eux n'ont aucune population de dépôt, et le troisième asserte un fichier que le même
+PR crée. Il n'y a donc rien à tolérer, et tolérer par anticipation reviendrait à s'aveugler sur
+exactement la classe que ce plan existe pour fermer.
+
+### La garde runtime — deux populations, et les confondre coûterait une fausse ligne d'allowlist
+
+**(i) Des gestes git aujourd'hui pratiqués que la garde refuserait dès son armement ?**
+Population mesurée vide, pour deux raisons indépendantes :
+
+- Les 119 `git -C` de `dispatch-lib.sh` visent tous `$wt` / `$worktree_dir` / `$sub_repo_dir` —
+  jamais le checkout partagé. Et surtout, ce sont des commandes de **processus shell** : un hook
+  `PreToolUse` ne voit que l'outil Bash de la session, pas la plomberie qui l'entoure. Cette
+  population est hors du champ du détecteur, pas tolérée par lui.
+- Depuis une dispatche, l'arbre de travail du checkout partagé **n'est pas monté** (M-1) : une
+  commande git le visant échoue *déjà aujourd'hui*. Il ne peut pas exister de geste légitime
+  préexistant dans cette population.
+
+Reste la population que la garde vise — les spawns non sandboxés — et c'est précisément celle
+qu'on veut refuser : il n'y a pas d'exception à y écrire. Le faux positif y est borné par les
+contrôles négatifs de M1b (AC2), et l'échappatoire pour un geste légitime non anticipé est
+nommée et journalisée : `MIKA_GUARD_SHARED_CHECKOUT=0` (AC5). C'est la forme « exception
+nommée » de l'option (a), appliquée au runtime plutôt qu'en table — visible, datée dans le
+journal, et jamais silencieuse.
+
+**(ii) Un worktree créé sur une branche antérieure au correctif** — le cas que le finding exige
+de traiter nommément. **Ce n'est pas une violation préexistante, et la distinction est porteuse.**
+Une violation préexistante est une donnée que le détecteur *surface* et qu'on choisit de tolérer ;
+ici le détecteur est **absent** — cette branche ne porte ni `.claude/settings.json`, ni
+`scripts/guard-shared-checkout`. Rien ne tire, donc il n'y a rien à mettre en allowlist. Le
+comportement est déjà décidé ailleurs et explicitement : **fail-open** (§ 3, AC9) — la session
+garde Bash, la garde ne mord pas, et c'est la ligne d'armement `SessionStart` qui rend cet état
+*lisible* plutôt que silencieux (§ 3, M4, AC4). Écrire une entrée d'allowlist pour ce cas
+reviendrait à poser dans la table une ligne que rien ne peut faire rougir : **une allowlist qui
+contient un non-cas est pire que vide**, elle donne à croire qu'un détecteur couvre ce qu'il ne
+voit pas — la classe même que ce dépôt a payée en mika#2205, mika#2327 et mika#2340, déjà citée
+au § 3. Le remède n'est pas une exception, c'est un geste : rebaser le worktree sur la branche
+portant le correctif, ou en créer un neuf.
+
+### L'assertion auto-nettoyante
+
+L'allowlist étant vide, l'assertion auto-nettoyante de la doctrine se réduit à son cas limite, et
+doit être écrite comme telle plutôt que sous-entendue : **M1b asserte que la table d'exceptions
+est vide**, et le commentaire porté par cette assertion nomme la forme obligatoire d'une future
+entrée — donnée exacte, ticket de suivi, assertion de péremption qui rougit quand le suivi se
+résout. Sans elle, « zéro entrée » serait une phrase de plan que rien ne tient ; avec elle, la
+première entrée ajoutée sans sa forme complète fait rougir la CI.
+
+Cette table et son assertion vivent **dans le harnais de test, jamais dans le script de
+production** — la garde ne consulte aucune table d'exceptions à l'exécution. Une allowlist lue au
+runtime serait un cinquième terme non mesuré devant le prédicat du § 3, dont toute la conception
+tient au fait qu'il a exactement quatre termes conjoints et positifs. *(Doctrine mika#1574 :
+« scope it inside `#[cfg(test)] mod tests` so the production loader cannot consult it at
+runtime » — transposé ici au découpage script/harnais, ce dépôt n'étant pas en Rust sur cette
+surface.)*
+
+### La halte
+
+Si l'un des trois détecteurs CI rougit sur du préexistant contre la mesure ci-dessus — un
+`settings.json` suivi qui apparaît ailleurs, ou M1b qui échoue sur autre chose que ses propres
+fixtures — **la réponse n'est pas d'ajouter une entrée d'allowlist.** C'est que la mesure a cessé
+d'être vraie, et ce qu'il faut chercher est ce qui l'a écrite. Une allowlist qu'on ouvre au
+premier rouge est un détecteur qu'on désarme en croyant l'accommoder.
+
+---
+
 ## Definition of Done
 
 - `scripts/guard-shared-checkout` et `scripts/test-guard-shared-checkout.sh` existent, sont
@@ -493,6 +580,9 @@ c'est lui qui produit et éprouve le script que l'autre consommera.
   sont pas mesurables depuis une dispatche) et repris dans la description de la PR, y compris la
   mesure d'ordre de `git checkout` (M0-c) et le `$CLAUDE_PROJECT_DIR` observé d'un spawn (M0-e).
 - La PR nomme explicitement la couverture 2/4 et le ticket de suivi `claude-pilot`.
+- La table d'exceptions de M1b est vide et **assertée vide**, avec le commentaire nommant la forme
+  obligatoire d'une future entrée (donnée exacte, ticket de suivi, assertion de péremption) ; le
+  script de production ne consulte aucune table d'exceptions (§ *Fire-Disposition*).
 
 ## Acceptance criteria
 
@@ -538,3 +628,37 @@ c'est lui qui produit et éprouve le script que l'autre consommera.
     et non pas faux (M-6) — un dispatch à qui l'on confierait M0 rendrait un échec de sonde
     indiscernable d'un échec de faisabilité, et tuerait le plan pour une raison étrangère à sa
     validité.
+
+---
+
+## Revision history
+
+*(Numérotation des révisions **post-revue architecte**. Elle ne compte pas les trois passages de
+re-mesure de l'en-tête, qui ont produit la rev 1.)*
+
+- **rev 2 (2026-09-18)** — addressed F1 (BLOCKING, section `## Fire-Disposition` manquante) en
+  ajoutant cette section après le § 7, sans renuméroter aucune section existante. Option
+  canonique **(a) — exception nommée, `allowlist: zero entries`** retenue, comme le finding
+  l'indiquait, avec sa condition de disponibilité **vérifiée plutôt que supposée** : trois mesures
+  du 2026-09-18 (`git ls-files | grep -i 'settings.*json'` vide sur tout le dépôt ; aucun
+  `scripts/guard-*` existant ; les 119 `git -C` de `dispatch-lib.sh` visant tous le worktree
+  courant). La section traite les quatre détecteurs séparément, nomme l'assertion auto-nettoyante
+  dégénérée en son cas limite et son emplacement obligatoire (harnais de test, jamais le script de
+  production — doctrine mika#1574 transposée du `#[cfg(test)]` au découpage script/harnais), et
+  pose la halte : un rouge sur du préexistant se traite en cherchant l'écrivain, jamais en ouvrant
+  l'allowlist.
+  Traité nommément, comme le finding l'exigeait, le cas **« worktree créé sur une branche
+  antérieure au correctif »** — mais **requalifié** : ce n'est pas une violation préexistante que
+  le détecteur surface, c'est une **absence de détecteur** (la branche ne porte ni
+  `.claude/settings.json` ni le script). Rien ne tire, donc rien n'est à mettre en allowlist ; le
+  comportement est déjà décidé au § 3 et en AC9 (fail-open), et rendu lisible par la ligne
+  d'armement `SessionStart` (M4, AC4). Y écrire une entrée poserait dans la table une ligne que
+  rien ne peut faire rougir, ce qui est strictement pire qu'une table vide. Cette requalification
+  est le seul écart à la lettre du finding, et il est motivé dans le corps de la section.
+  Une case de DoD couvre la vacuité assertée et l'emplacement de la table.
+  *Citation préservée : review-guide.md § Fire-Disposition Gate / mika#1574 /
+  `docs/solutions/best-practices/fire-disposition-doctrine.md`.*
+- Aucun autre contenu modifié ; aucun AC affaibli, aucun AC ajouté — la disposition retenue est
+  une contrainte d'implémentation, et les onze AC existants la couvrent déjà par AC2 (contrôles
+  négatifs), AC5 (dérogation nommée et journalisée), AC7 (régression « garde absente ») et AC9
+  (fail-open, y compris sur le cas du worktree antérieur).
