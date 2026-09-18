@@ -846,6 +846,17 @@ Optional (log format and files):
 - `MIKA_LOG_FORMAT` — Stdout log format for mika-spirit and mika-gateway: `json` (default) or `pretty` (human-readable, for local dev). CLI always uses pretty.
 - `MIKA_SPIRIT_LOG_FILE` — File path for mika-spirit log output (always JSON regardless of `MIKA_LOG_FORMAT`)
 
+Optional (Telegram outbound rendering — mika#2291):
+- `MIKA_TELEGRAM_HTML_RENDER` — Kill-switch for Telegram HTML rendering in the **gateway**. **Default armed**: outbound text is rendered with `parse_mode=HTML`, so the markdown an agent writes arrives rendered instead of raw. `0` / `false` / `off` / `no` (case-insensitive, whitespace tolerated) disarm; absent, empty, or **unrecognized stays armed** with a WARN naming the value between quotes — a typo must not silently switch the rendering off. **Read once per process, not hot-swappable** (same contract as `MIKA_AGENT_TIER` and `MIKA_DEPLOYMENT`): set it in the service EnvironmentFile / ConfigMap **before** startup.
+
+  **The defect it closes, measured 2026-09-11 on Al's cloud tenant.** Telegram replies showed `**gras**` literally. Not a regression of mika#2126 but the complement of its perimeter, which that ticket left open and named in writing (`strip_markdown_around_urls`: *"the perimeter is URLs, not markdown rendering"*).
+
+  **What makes `parse_mode` acceptable now, when mika#2126 rejected it.** Its argument — *"we would have traded a broken link for an absent message"* — was correct and remains so **against `parse_mode` bare**. mika#2291 removes the premise rather than contradicting the reasoning: on a 400 while `parse_mode` was set, the gateway re-sends **once**, without `parse_mode`, with the plain text. **The worst case of the HTML path is exactly the old behaviour minus the raw markers**, so a message can no longer be lost to a rendering — a raw marker is traded for a raw marker. HTML rather than MarkdownV2 for the escaping surface: three reserved characters instead of eighteen, and local (escape the content, emit the tags) instead of global. The fallback trigger is the **status 400**, never a substring of Telegram's `description` (mika#2179's rule).
+
+  **The field is `Option<String>` and never `bool`.** `GatewaySettings::load` deserializes through config-rs, so a `bool` receiving `"plif"` is a hard `load()` error and the gateway **refuses to start** — on a p2 cosmetic flag. Refusing to boot on an invalid LLM budget protects against a mute agent; refusing to boot on a rendering flag protects against nothing. The gateway crate has no `bool` field at all, and `mika2291_c5_*` pins the deserialization itself, which the parse-function tests structurally cannot see.
+
+  **Operator surfaces** (gateway log): `telegram_html_render_fallback` (WARN) and `telegram_html_fallback_failed` (WARN) — **expected regime for both: zero lines**; the second is the population where the user receives nothing. Plus `telegram_html_render_disabled` (INFO at startup, only when disarmed), because the silence of a disarmed renderer looks exactly like the silence of a healthy one (mika#2205). No message body is ever logged. Full contract, post-deploy probe and its two halts: `crates/mika-gateway/CLAUDE.md` § *Outbound Text Rendering*.
+
 Gateway mode: See `crates/mika-gateway/CLAUDE.md` for gateway-specific env vars.
 
 ## Pending Work

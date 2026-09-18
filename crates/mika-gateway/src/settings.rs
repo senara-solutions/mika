@@ -29,6 +29,25 @@ pub struct GatewaySettings {
     #[serde(default)]
     pub telegram_single_bot_mode: Option<String>,
 
+    /// Telegram HTML rendering kill-switch (mika#2291). **Default: armed.**
+    ///
+    /// `0` / `false` / `off` / `no` (case-insensitive, whitespace tolerated) disarm
+    /// it; absent, empty, or anything unrecognized leaves it **armed**. See
+    /// [`telegram_html_render_is_enabled`] — note its polarity is the inverse of its
+    /// two neighbours here.
+    ///
+    /// **`Option<String>` and never `bool`, which is not a style detail.**
+    /// [`GatewaySettings::load`] deserializes the environment through config-rs, so a
+    /// `bool` field receiving `"plif"` makes `load()` fail — the gateway **refuses to
+    /// start**, on a generic error pointing at `mika setup` without naming the
+    /// offending variable. A typo in a p2 cosmetic flag would then take down all
+    /// Telegram traffic. Refusing to boot on an invalid LLM budget protects against a
+    /// mute agent; refusing to boot on a rendering flag protects against nothing.
+    /// The crate has settled this class twice already: no `bool` lives in this
+    /// struct.
+    #[serde(default)]
+    pub telegram_html_render: Option<String>,
+
     /// Shared bearer token for gateway ↔ container auth
     pub internal_token: SecretString,
 
@@ -297,6 +316,7 @@ impl std::fmt::Debug for GatewaySettings {
             )
             .field("telegram_webhook_url", &self.telegram_webhook_url)
             .field("telegram_single_bot_mode", &self.telegram_single_bot_mode)
+            .field("telegram_html_render", &self.telegram_html_render)
             .field("internal_token", &"[REDACTED]")
             .field("gateway_port", &self.gateway_port)
             .field("log_level", &self.log_level)
@@ -396,6 +416,47 @@ pub fn telegram_single_bot_mode_is_enabled(raw: Option<&str>) -> bool {
     }
 }
 
+/// Parse `MIKA_TELEGRAM_HTML_RENDER` (mika#2291).
+///
+/// **The polarity is the inverse of both its neighbours in this file, and this line
+/// is here so a copy-paste cannot get it silently wrong.** Returns `true` (armed) on
+/// `None`, on empty, **and on any unrecognized value**;  returns `false` only for an
+/// explicit `0` / `false` / `off` / `no` (case-insensitive, surrounding whitespace
+/// tolerated). [`telegram_single_bot_mode_is_enabled`] and
+/// [`orchestrator_inbox_is_enabled`] both do the opposite — they return `false` on
+/// `None` and absorb every unknown value into `false`, without a WARN — so a body
+/// copied from either of them would yield a kill-switch **disarmed by default**, the
+/// exact inverse of the decision.
+///
+/// An unrecognized value leans toward the armed default rather than toward
+/// disarming: a typo must not silently switch the rendering off. It is named in a
+/// WARN **between quotes** — without the quotes a stray space is invisible
+/// (mika#2220).
+pub fn telegram_html_render_is_enabled(raw: Option<&str>) -> bool {
+    let Some(value) = raw.map(str::trim) else {
+        return true;
+    };
+    if value.is_empty() {
+        return true;
+    }
+    match value.to_ascii_lowercase().as_str() {
+        "0" | "false" | "off" | "no" => false,
+        "1" | "true" | "on" | "yes" => true,
+        _ => {
+            // The **trimmed original**, not the lowercased match subject: quoting the
+            // value exists to preserve diagnostic fidelity (mika#2220), and folding
+            // its case throws away part of what the operator actually typed.
+            tracing::warn!(
+                event = "telegram_html_render_unrecognized_value",
+                value = %format!("{value:?}"),
+                "mika#2291: MIKA_TELEGRAM_HTML_RENDER carries an unrecognized value — \
+                 HTML rendering stays ARMED (the default). Use 0/false/off/no to disarm."
+            );
+            true
+        }
+    }
+}
+
 /// Parse `MIKA_ORCHESTRATOR_INBOX_ENABLED`. Treats `1` / `true` (case-insensitive)
 /// as enabled; everything else (unset, empty, `0`, `false`, or any other value)
 /// as disabled. The `2` (gateway-only) value is reserved for a future ticket
@@ -465,6 +526,7 @@ mod tests {
                 telegram_webhook_secret: Some(SecretString::from("a".repeat(64))),
                 telegram_webhook_url: Some("https://example.com/webhook".to_string()),
                 telegram_single_bot_mode: Some("1".to_string()),
+                telegram_html_render: None,
                 internal_token: SecretString::from("b".repeat(64)),
                 gateway_port: 8080,
                 log_level: "info".to_string(),
@@ -567,6 +629,108 @@ mod tests {
         assert!(orchestrator_inbox_is_enabled(Some("\ttrue\n")));
     }
 
+    // -- MIKA_TELEGRAM_HTML_RENDER (mika#2291, C1–C5) --
+
+    /// C1 — absent / empty ⇒ **armed**.
+    ///
+    /// This freezes the polarity, which is the inverse of both neighbours in this
+    /// file (F8). A body copied from `orchestrator_inbox_is_enabled` returns `false`
+    /// here and makes this test red — which is the whole reason it exists as its own
+    /// assertion rather than as a line in a shared table.
+    #[test]
+    fn mika2291_c1_html_render_default_is_armed() {
+        assert!(telegram_html_render_is_enabled(None));
+        assert!(telegram_html_render_is_enabled(Some("")));
+        assert!(telegram_html_render_is_enabled(Some("   ")));
+    }
+
+    /// C2 — the explicit disarming vocabulary, whitespace tolerated.
+    #[test]
+    fn mika2291_c2_explicit_values_disarm() {
+        for raw in [
+            "0",
+            "false",
+            "FALSE",
+            "False",
+            "off",
+            "OFF",
+            "no",
+            "NO",
+            " 0 ",
+            "\tfalse\n",
+        ] {
+            assert!(
+                !telegram_html_render_is_enabled(Some(raw)),
+                "{raw:?} must disarm"
+            );
+        }
+        for raw in ["1", "true", "TRUE", "on", "yes", " 1 ", "\ttrue\n"] {
+            assert!(
+                telegram_html_render_is_enabled(Some(raw)),
+                "{raw:?} must arm"
+            );
+        }
+    }
+
+    /// C3 — an unrecognized value leans toward the **armed** default.
+    ///
+    /// A typo must not silently switch the rendering off. (The WARN naming the value
+    /// between quotes is a side effect this assertion cannot observe; the quoting
+    /// itself matters because a stray space is otherwise invisible — mika#2220.)
+    #[test]
+    fn mika2291_c3_unrecognized_value_stays_armed() {
+        for raw in ["plif", "2", "maybe", "0x0", "-1"] {
+            assert!(
+                telegram_html_render_is_enabled(Some(raw)),
+                "{raw:?} must stay armed"
+            );
+        }
+    }
+
+    /// C5 — **`GatewaySettings::load` cannot fail on this field, whatever is set.**
+    ///
+    /// This is the property `Option<String>` buys and a `bool` would lose, and it is
+    /// invisible to C1–C4: those test the *parse function*, not the
+    /// *deserialization*. Without this test the regression `Option<String>` → `bool`
+    /// would pass review — it would make no output wrong, it would make the gateway
+    /// **unbootable** on a typo, and C1–C4 would all stay green.
+    ///
+    /// The second half is the anti-vacuity control: it proves config-rs really does
+    /// hard-fail a `bool`, so the first half is testing something.
+    #[test]
+    fn mika2291_c5_load_cannot_fail_on_this_field() {
+        let built = Config::builder()
+            .set_override("database_url", "postgres://localhost/test")
+            .and_then(|b| b.set_override("internal_token", "a".repeat(64)))
+            .and_then(|b| b.set_override("telegram_html_render", "plif"))
+            .and_then(|b| b.build());
+        let settings: GatewaySettings = built
+            .expect("config builds")
+            .try_deserialize()
+            .expect("an arbitrary MIKA_TELEGRAM_HTML_RENDER must not fail deserialization");
+        assert_eq!(settings.telegram_html_render.as_deref(), Some("plif"));
+        // …and it resolves to the armed default rather than taking the gateway down.
+        assert!(telegram_html_render_is_enabled(
+            settings.telegram_html_render.as_deref()
+        ));
+
+        #[derive(Deserialize)]
+        struct BoolFlagProbe {
+            #[allow(dead_code)]
+            flag: bool,
+        }
+        let probe = Config::builder()
+            .set_override("flag", "plif")
+            .and_then(|b| b.build())
+            .expect("config builds")
+            .try_deserialize::<BoolFlagProbe>();
+        assert!(
+            probe.is_err(),
+            "config-rs no longer hard-fails a bool field — the F8 rationale for \
+             Option<String> must be re-examined before relying on it"
+        );
+    }
+
     // -- telegram_single_bot_mode tests --
 
     #[test]
@@ -609,6 +773,7 @@ mod tests {
             telegram_webhook_secret: None,
             telegram_webhook_url: None,
             telegram_single_bot_mode: None,
+            telegram_html_render: None,
             internal_token: SecretString::from("a".repeat(64)),
             gateway_port: 8080,
             log_level: "info".to_string(),
