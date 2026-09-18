@@ -57,6 +57,61 @@
 //! start at exactly `remaining == threshold` and carry the failure to 360 s,
 //! past the 300 s envelope. That boundary case is now closed. Saying it is a
 //! no-op would be more comfortable and less true.
+//!
+//! # What a plafond can physically carry (mika#2280)
+//!
+//! The plafond bounds the **whole** request, body read included, and it is a
+//! property of the *client* rather than of the request — so a 200-token tool
+//! call and an 8 000-token plan draft run under the same guillotine. That makes
+//! a second quantity meaningful: how many output tokens a cap can carry at all.
+//!
+//! The arithmetic is not invented here. `well_known_agents.rs` already wrote it
+//! for mika-arch (mika#2296): *"the measured throughput is ~66 tok/s (8192
+//! tokens in 123 s), so the 240 s plafond caps one call at ~16 000 tokens: the
+//! TIME budget is the real brake"*. [`LlmTimeoutBudget::reachable_output_tokens`]
+//! is that sentence made callable, minus a prefill reserve.
+//!
+//! **It is reported, never enforced.** Nothing in the retry path, in client
+//! construction, or in any validation reads it. It exists so an operator can
+//! tell a call cut at its plafond ("the model was still generating") from a call
+//! cut anywhere else ("the network died") — a distinction
+//! [`super::error::LlmError::error_class`] cannot make, since both answer
+//! `transport_timeout`.
+
+/// Numerator of the share of the plafond reserved for connection, request
+/// upload and prefill — i.e. everything that is not output generation.
+///
+/// `1 / 4`, in the fractional form this module already uses for its three retry
+/// thresholds (mika#2189 D3), so it follows any later plafond automatically
+/// instead of describing a geometry that stopped existing.
+const PREFILL_RESERVE_NUM: u64 = 1;
+/// Denominator of the prefill-reserve fraction (see [`PREFILL_RESERVE_NUM`]).
+const PREFILL_RESERVE_DEN: u64 = 4;
+
+/// Default assumed **floor** on output-token throughput, in tokens per second.
+///
+/// # Where 50 comes from, and why it is not 66
+///
+/// The only throughput measured in this repository is `~66 tok/s` (8192 tokens
+/// in 123 s on `moonshotai/kimi-k2.5`, recorded in `MIKA_ARCH_CONFIG` by
+/// mika#2296). 50 is that figure with ~25 % of margin downwards.
+///
+/// The margin is not decorative prudence, it corrects a **censored**
+/// population: throughput is only observable on calls that *succeeded*, and the
+/// slow ones were killed at the plafond — which is the very failure mika#2280
+/// exists to attribute. So the observed floor is itself an **over**estimate of
+/// the true floor, and a constant posed on the observed value would describe a
+/// world with the interesting cases removed from it.
+///
+/// The number serves a **reading context**, never a brake. A coarse constant is
+/// acceptable for that and would not be for a per-request plafond — which is the
+/// second reason that remedy is a follow-up rather than part of this change.
+///
+/// Re-measure with the query in the mika#2280 plan (§ D6) before moving it.
+pub const DEFAULT_OUTPUT_TOKENS_PER_SEC_FLOOR: u64 = 50;
+
+/// Environment variable overriding [`DEFAULT_OUTPUT_TOKENS_PER_SEC_FLOOR`].
+pub const OUTPUT_TOKENS_PER_SEC_FLOOR_ENV_VAR: &str = "MIKA_LLM_OUTPUT_TOKENS_PER_SEC_FLOOR";
 
 /// Numerator of the typical-call-duration fraction of the per-call cap.
 ///
@@ -351,6 +406,85 @@ impl LlmTimeoutBudget {
             reachable += 1;
         }
         reachable
+    }
+
+    /// How many output tokens this plafond can physically carry, at an assumed
+    /// throughput floor (mika#2280 AC1).
+    ///
+    /// `cap × (1 − prefill reserve) × floor`, with the reserve expressed as the
+    /// fraction [`PREFILL_RESERVE_NUM`] / [`PREFILL_RESERVE_DEN`] of the cap —
+    /// never as a literal in seconds, so the figure tracks a plafond an operator
+    /// later moves.
+    ///
+    /// On mika-arch's shipped geometry (240 s) at the measured 66 tok/s this
+    /// gives `240 × 3/4 × 66 = 11 880`. The `~16 000` quoted in
+    /// `MIKA_ARCH_CONFIG` is the same arithmetic **without** the prefill
+    /// reserve (`240 × 66 = 15 840`); the gap between the two figures is the
+    /// reserve, and it is deliberate rather than a disagreement.
+    ///
+    /// # Reported, not enforced
+    ///
+    /// **Nothing in the retry path, in client construction, or in any
+    /// validation reads this.** It is neither validated nor clamped against
+    /// `llm_max_tokens`: a declared budget above what a plafond can carry is not
+    /// a defect in itself — mika#2296 chose exactly that for mika-arch, as "a
+    /// ceiling made non-binding", knowing time is the brake. A guard firing on
+    /// the declaration would contradict a documented decision at every startup,
+    /// and a warning that contradicts a decision is a warning that gets muted.
+    /// What warrants an operator's attention is a *crossing*, once per cut call
+    /// — see `llm_call_cap_exhausted` on the two OpenAI-shaped rails.
+    pub fn reachable_output_tokens(&self, floor_tok_per_sec: u64) -> u64 {
+        let generating_secs = self
+            .http_timeout_secs
+            .saturating_mul(PREFILL_RESERVE_DEN.saturating_sub(PREFILL_RESERVE_NUM))
+            / PREFILL_RESERVE_DEN.max(1);
+        generating_secs.saturating_mul(floor_tok_per_sec)
+    }
+}
+
+/// The assumed output-throughput floor, from the environment (mika#2280 AC2).
+///
+/// Three-tier, like every other budget knob here: absent or empty → default;
+/// unparseable, `0` or negative → default **with a WARN**, because a silent
+/// fallback on a value an operator deliberately typed is how a setting becomes
+/// decorative.
+///
+/// **Never panics**, unlike [`super::http_timeout_secs`]: this is read from the
+/// same cold paths mika#2293's non-panicking reader serves, and a diagnostic
+/// constant must not be able to abort a process.
+pub fn output_tokens_per_sec_floor() -> u64 {
+    parse_output_tokens_per_sec_floor(
+        std::env::var(OUTPUT_TOKENS_PER_SEC_FLOOR_ENV_VAR)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure resolver behind [`output_tokens_per_sec_floor`].
+///
+/// Split out so parsing is testable without mutating the process-global
+/// environment, which would race parallel tests — the same reason
+/// [`parse_agent_total_timeout`] exists.
+fn parse_output_tokens_per_sec_floor(raw: Option<&str>) -> u64 {
+    let Some(raw) = raw else {
+        return DEFAULT_OUTPUT_TOKENS_PER_SEC_FLOOR;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return DEFAULT_OUTPUT_TOKENS_PER_SEC_FLOOR;
+    }
+    match trimmed.parse::<u64>() {
+        Ok(0) | Err(_) => {
+            tracing::warn!(
+                event = "output_tokens_per_sec_floor_invalid",
+                raw = %raw,
+                default = DEFAULT_OUTPUT_TOKENS_PER_SEC_FLOOR,
+                "{OUTPUT_TOKENS_PER_SEC_FLOOR_ENV_VAR} is not a positive integer number of \
+                 tokens per second; falling back to the default"
+            );
+            DEFAULT_OUTPUT_TOKENS_PER_SEC_FLOOR
+        }
+        Ok(v) => v,
     }
 }
 
@@ -654,6 +788,140 @@ mod tests {
     fn envelope_parse_accepts_a_valid_override() {
         assert_eq!(parse_agent_total_timeout(Some("900")), 900);
         assert_eq!(parse_agent_total_timeout(Some(" 900 ")), 900);
+    }
+
+    // -- mika#2280: what a plafond can physically carry --
+
+    /// AC1 — the formula reproduces mika#2296's own arithmetic on its own
+    /// numbers, and **documents the gap** rather than pretending to match a
+    /// figure that was rounded by hand.
+    ///
+    /// `MIKA_ARCH_CONFIG` says a 240 s plafond "caps one call at ~16 000
+    /// tokens" at ~66 tok/s. That is `240 × 66 = 15 840`, computed without a
+    /// prefill reserve. This method subtracts the reserve on purpose, so it
+    /// answers `240 × 3/4 × 66 = 11 880`. Both are asserted: the raw product to
+    /// show the comment's figure is the same arithmetic, the reserved one to
+    /// pin what this method returns.
+    #[test]
+    fn mika2280_reachable_tokens_reproduces_the_mika2296_arithmetic() {
+        const MEASURED_TOK_PER_SEC: u64 = 66;
+
+        let arch = LlmTimeoutBudget::new(240, 900).expect("mika-arch geometry");
+
+        // The figure MIKA_ARCH_CONFIG quotes, un-reserved: "~16 000".
+        assert_eq!(240 * MEASURED_TOK_PER_SEC, 15_840);
+
+        // What this method reports — the same arithmetic minus the 1/4 reserve.
+        assert_eq!(
+            arch.reachable_output_tokens(MEASURED_TOK_PER_SEC),
+            11_880,
+            "240 s × 3/4 × 66 tok/s — the gap with the ~16 000 of MIKA_ARCH_CONFIG \
+             IS the prefill reserve, and it is deliberate"
+        );
+
+        // And mika-arch's declared 32768 sits well above it — which mika#2296
+        // decided knowingly ("a ceiling made non-binding"), so nothing here
+        // treats it as a defect.
+        assert!(arch.reachable_output_tokens(MEASURED_TOK_PER_SEC) < 32_768);
+    }
+
+    /// The figure is a fraction of the plafond, never a literal in seconds:
+    /// doubling the cap must double what it can carry.
+    #[test]
+    fn mika2280_reachable_tokens_follows_the_plafond() {
+        let fleet = LlmTimeoutBudget::default(); // 120/300
+        let arch = LlmTimeoutBudget::new(240, 900).expect("valid geometry");
+
+        assert_eq!(fleet.reachable_output_tokens(50), 120 * 3 / 4 * 50);
+        assert_eq!(
+            arch.reachable_output_tokens(50),
+            2 * fleet.reachable_output_tokens(50),
+            "twice the plafond carries twice the output"
+        );
+    }
+
+    /// The fleet default (120 s) against the two declared output budgets the
+    /// ticket measures — the constatation E2, expressed on this side of the
+    /// crate boundary. The agent-side companion lives in
+    /// `mika-agent`'s `well_known_agents::tests`, which is the only crate that
+    /// can see those constants **and** this method.
+    #[test]
+    fn mika2280_the_fleet_plafond_carries_less_than_mika_dev_declares() {
+        let fleet = LlmTimeoutBudget::default();
+        let reachable = fleet.reachable_output_tokens(DEFAULT_OUTPUT_TOKENS_PER_SEC_FLOOR);
+
+        assert_eq!(reachable, 4_500, "120 s × 3/4 × 50 tok/s");
+        assert!(
+            reachable < 8_192,
+            "mika-dev declares 8192 under a 120 s plafond that carries {reachable}"
+        );
+        assert!(
+            reachable < 16_384,
+            "mika-qa declares 16384 under the same plafond"
+        );
+    }
+
+    /// A zero floor is arithmetic, not a configuration: `output_tokens_per_sec_floor`
+    /// refuses it upstream, and this method must not divide by anything.
+    #[test]
+    fn mika2280_reachable_tokens_is_total_on_degenerate_input() {
+        let budget = LlmTimeoutBudget::default();
+        assert_eq!(budget.reachable_output_tokens(0), 0);
+        assert_eq!(budget.reachable_output_tokens(u64::MAX), u64::MAX);
+    }
+
+    // -- AC2: the throughput floor, three tiers --
+
+    #[test]
+    fn mika2280_floor_defaults_when_absent_or_blank() {
+        assert_eq!(
+            parse_output_tokens_per_sec_floor(None),
+            DEFAULT_OUTPUT_TOKENS_PER_SEC_FLOOR
+        );
+        assert_eq!(
+            parse_output_tokens_per_sec_floor(Some("")),
+            DEFAULT_OUTPUT_TOKENS_PER_SEC_FLOOR
+        );
+        assert_eq!(
+            parse_output_tokens_per_sec_floor(Some("   ")),
+            DEFAULT_OUTPUT_TOKENS_PER_SEC_FLOOR
+        );
+    }
+
+    #[test]
+    fn mika2280_floor_defaults_on_zero_or_garbage() {
+        assert_eq!(
+            parse_output_tokens_per_sec_floor(Some("0")),
+            DEFAULT_OUTPUT_TOKENS_PER_SEC_FLOOR
+        );
+        assert_eq!(
+            parse_output_tokens_per_sec_floor(Some("-1")),
+            DEFAULT_OUTPUT_TOKENS_PER_SEC_FLOOR
+        );
+        assert_eq!(
+            parse_output_tokens_per_sec_floor(Some("soixante-six")),
+            DEFAULT_OUTPUT_TOKENS_PER_SEC_FLOOR
+        );
+    }
+
+    #[test]
+    fn mika2280_floor_accepts_a_valid_override() {
+        assert_eq!(parse_output_tokens_per_sec_floor(Some("66")), 66);
+        assert_eq!(parse_output_tokens_per_sec_floor(Some(" 66 ")), 66);
+    }
+
+    /// The default is below the only throughput ever measured in this repo
+    /// (66 tok/s, mika#2296) — the censored-population margin the constant's
+    /// doc comment argues for. If someone raises it to the observed value, this
+    /// goes red and the reasoning has to be re-read.
+    #[test]
+    fn mika2280_the_default_floor_stays_under_the_measured_throughput() {
+        assert!(
+            DEFAULT_OUTPUT_TOKENS_PER_SEC_FLOOR < 66,
+            "the observable throughput distribution is censored — the slow calls \
+             were killed at the plafond, so the observed floor overestimates the \
+             real one (see DEFAULT_OUTPUT_TOKENS_PER_SEC_FLOOR)"
+        );
     }
 
     #[test]
