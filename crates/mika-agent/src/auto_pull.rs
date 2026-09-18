@@ -6841,6 +6841,18 @@ This ticket has been GROOMED and is ready.
     /// The `mod tests` of this very module is excluded: it is `#[cfg(test)]`, it
     /// names the method by construction, and without the exclusion the detector
     /// would fail on its own existence.
+    ///
+    /// **Test code elsewhere is excluded by its PATH (mika#2321).** This guard
+    /// shipped with a narrower premise than the one above — *"everywhere else
+    /// the file is production in full"* — which holds only while no other file
+    /// is a test module. That was already false when it was written
+    /// (`db/tests/harnais_porte.rs`, `perimeter/tests.rs`) and merely benign,
+    /// because neither names this method. mika#2321 moved 431 tests into
+    /// `db/tests/**`, three of which call `reset_auto_pull_redrive` on a
+    /// fixture, and the premise stopped being benign: the guard counted five
+    /// "production" callers. The repair is the classification, never an
+    /// allowlist — see [`crate::source_scan`], and note the assertion below
+    /// refuses an allowlist entry in as many words.
     #[test]
     fn mika2361_reset_auto_pull_redrive_has_exactly_two_production_callers() {
         // Split so the guard's own body is not what it catches first.
@@ -6865,7 +6877,10 @@ This ticket has been GROOMED and is ready.
                     stack.push(path);
                     continue;
                 }
-                if path.extension().is_none_or(|e| e != "rs") || definitions.contains(&path) {
+                if path.extension().is_none_or(|e| e != "rs")
+                    || definitions.contains(&path)
+                    || crate::source_scan::is_test_source_path(&path)
+                {
                     continue;
                 }
                 let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
@@ -6873,8 +6888,9 @@ This ticket has been GROOMED and is ready.
                 });
                 scanned += 1;
 
-                // `auto_pull.rs` carries its own `mod tests`; everywhere else the
-                // file is production in full.
+                // `auto_pull.rs` carries its own inline `mod tests`. Test code
+                // living in its own file was skipped by path above (mika#2321);
+                // everything left here is production in full.
                 let production: &str = if path == this_module {
                     content
                         .split_once("mod tests {")

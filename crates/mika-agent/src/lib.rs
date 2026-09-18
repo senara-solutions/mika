@@ -39,6 +39,10 @@ pub mod rewind;
 pub mod secret_scrubber;
 pub mod server;
 pub mod skills;
+/// Classification des fichiers source pour les gardes structurelles (mika#2321).
+/// `#[cfg(test)]` : aucune garde ne tourne en production.
+#[cfg(test)]
+pub(crate) mod source_scan;
 pub mod startup;
 pub mod task_engine;
 pub mod task_state;

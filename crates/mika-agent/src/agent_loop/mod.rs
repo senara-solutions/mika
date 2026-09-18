@@ -14275,11 +14275,30 @@ mod tests {
     /// refused "any mention" would redden immediately on healthy code, and the
     /// natural repair would be to widen it until it caught nothing — which is the
     /// failure the negative control below exists to prevent.
+    ///
+    /// **This truncation is no longer the whole story (mika#2321).** It assumes
+    /// test code lives behind a `#[cfg(test)]` *inline in the same file*. That
+    /// stopped being true with mika#2310, which moved `db/tests/harnais_porte.rs`
+    /// into its own file: an extracted test module carries no `#[cfg(test)]`
+    /// literal at all — the attribute stays on the parent's `mod …;` declaration
+    /// — so `find` returns `None` and the whole test file is scanned as
+    /// production. A file is now classified by its **path** first (see
+    /// [`crate::source_scan`]); this truncation still applies, unchanged, to the
+    /// production files that survive that classification.
     fn production_half(src: &str) -> &str {
         match src.find("#[cfg(test)]") {
             Some(cut) => &src[..cut],
             None => src,
         }
+    }
+
+    /// `HistoryScope` reader sites in one file: none when the file is test code
+    /// (by path, mika#2321), otherwise those of its production half.
+    fn scope_reader_sites(path: &std::path::Path, src: &str) -> Vec<Vec<(usize, String)>> {
+        if crate::source_scan::is_test_source_path(path) {
+            return Vec::new();
+        }
+        scope_match_sites(production_half(src))
     }
 
     /// **T5** — the scope has one decisional reader, and it is
@@ -14320,7 +14339,7 @@ mod tests {
                 });
                 scanned += 1;
                 let rel = path.strip_prefix(&src_root).unwrap_or(&path).display();
-                for site in scope_match_sites(production_half(&content)) {
+                for site in scope_reader_sites(&path, &content) {
                     sites.push(format!("{rel}:{}: {}", site[0].0, site[0].1));
                 }
             }
@@ -14393,6 +14412,52 @@ mod tests {
             scope_match_sites(production_half(with_test_tail)).is_empty(),
             "the test tail must be stripped before scanning"
         );
+    }
+
+    /// **T5c — good-faith control for the mika#2321 path classification.**
+    ///
+    /// Sibling of T5b on the other axis: T5b proves the *predicate* still sees a
+    /// decisional match, this one proves the *file classification* has not been
+    /// widened into uselessness. A classification that exempted too much would
+    /// leave T5 green while it scanned nothing — the same vacuous-guard failure,
+    /// reached from the other side.
+    ///
+    /// The file it exists for is the extracted test module: one carries no
+    /// `#[cfg(test)]` literal, so `production_half` alone returns it whole and
+    /// every legitimate mention in a fixture counts as a production reader.
+    #[test]
+    fn mika2321_scope_reader_sites_keeps_production_and_drops_test_paths() {
+        let offending = r#"
+            fn somewhere_else(scope: HistoryScope) -> usize {
+                match scope {
+                    HistoryScope::Session => 1,
+                    HistoryScope::Agent => 20,
+                }
+            }
+        "#;
+
+        assert_eq!(
+            scope_reader_sites(
+                std::path::Path::new("/repo/crates/mika-agent/src/server/new_path.rs"),
+                offending,
+            )
+            .len(),
+            1,
+            "the guard no longer sees a decisional match in a production file — \
+             it has gone vacuous"
+        );
+
+        for test_path in [
+            // `/tests/` segment — the shape mika#2321 creates in bulk.
+            "/repo/crates/mika-agent/src/db/tests/tasks.rs",
+            // bare `tests.rs` — the shape that was already in the hole.
+            "/repo/crates/mika-agent/src/perimeter/tests.rs",
+        ] {
+            assert!(
+                scope_reader_sites(std::path::Path::new(test_path), offending).is_empty(),
+                "{test_path} is still scanned as production"
+            );
+        }
     }
 
     // ===========================================================================
