@@ -311,6 +311,139 @@ Optional (startup behavior):
   - **The manual gesture is no longer the standard one** for well-known agents: the section lands at the next mika-spirit startup (the startup is what writes; an identity already written is re-read every turn). It remains the only route for agents with no spec.
   - **What this costs, named:** a hand edit inside a code-owned section is now overwritten at the next startup. `reconciled_paths` on `identity_reconcile.complete` names each overwritten path, so the loss is legible rather than silent. Operator grep: `identity_reconcile` in `$MIKA_SPIRIT_LOG_FILE` — `complete` on the first startup after deploy, `in_sync` afterwards.
 
+### La doctrine matérielle est un fait posé ; sa butée est topique (mika#2292)
+
+- **Le défaut, mesuré le 2026-09-11 (tenant champion, canary Al).** À « Qu'est-ce
+  que la doctrine Mika ? », le tenant a répondu « rien trouvé qui s'appelle
+  doctrine Mika » **puis a donné la philosophie**, dans le même tour. Ce n'est pas
+  un trou de connaissance — il possédait chaque fragment de la réponse : c'est un
+  **trou de nom**. Et la forme (incertitude à t=0, assertion à t=1) est celle que
+  la règle 4 de `## Self-Identity Discipline` condamnait déjà mot pour mot ; elle
+  n'a pas mordu parce que la portée écrite de cette section était « which model
+  you are, which provider powers you, WHERE you run ». **Troisième occurrence de
+  la même classe** après mika#1815 (« quel modèle es-tu ? ») et mika#2290 (« où
+  tournes-tu ? »), et le remède reprend la forme des deux précédents : une section
+  de fait code-managed **plus** une règle qui élargit la portée de la discipline.
+
+- **Ni skill, ni `soul.md`, ni mémoire — et les trois refus sont mesurés.** Un
+  skill ne peut pas atteindre la population visée (`FAMILY_AGENT_SKILL_ALLOWLIST`
+  compte six entrées, tout skill bundled est *denied by default*), il est
+  évinçable par un `identity.toml` illisible (mika#2027) et retirable pour un tour
+  par `apply_only_skills` (mika#2363) ; surtout, un skill à déclenchement par
+  mot-clé **reproduirait le défaut**, qui *est* un ratage lexical. `soul.md`
+  n'atteint **aucun tenant existant** : `write_default_if_missing` ne réécrit
+  jamais un fichier présent — c'est l'inertie que mika#2023 a dû nommer par écrit
+  — donc un correctif là n'aurait pas touché le seul tenant mesuré. Le code-managed
+  atteint tout tenant au prochain déploiement, sans geste de provisionnement.
+
+- **Deux registres, un fait, et le registre suit l'axe persona — jamais le tenant,
+  jamais la locale.** `FAMILY_SOUL` interdit « tout jargon technique … ou de
+  l'infrastructure sous-jacente — jamais, même si on te le demande », et « open
+  source MIT » est de cette famille. C'est le croisement que mika#2290 a déjà
+  tranché : le même fait est écrit deux fois, `MIKA_DOCTRINE_BODY_OPERATOR`
+  portant la formulation complète et `MIKA_DOCTRINE_BODY_FAMILY` la même substance
+  sans un terme technique. `match` exhaustif sur `PersonaProfile`, **aucun bras
+  `_ =>`** (modèle `hosting_ground_truth_line`) : le compilateur, pas un relecteur,
+  force un futur registre à décider. Ce que la famille abandonne (licence, dépôt,
+  auto-hébergement) n'est pas une amputation arbitraire — c'est la part de la
+  doctrine qui n'a **pas de sens** pour quelqu'un qui n'a pas d'infrastructure.
+
+- **Faits vérifiés seulement.** *MIT* : attesté par `LICENSE` et `Cargo.toml`, et
+  revendiqué **du moteur qui exécute l'agent**, jamais de « Mika » en bloc — la
+  console cloud est un dépôt fermé, donc un « Mika est open source » tout court
+  serait faux. *Souveraineté des données* : formulée comme un **engagement**
+  (« à qui c'est »), jamais comme un fait d'hébergement. *« exportable »* : **non
+  revendiqué**. Le mot est déjà posé à cinq sites depuis mika#2290, dont un servi
+  au modèle, et ce dépôt ne contient aucun export (ni outil, ni route, ni
+  sous-commande) — la donnée du tenant vit dans `mika-cloud`, absent de ce
+  worktree, donc la revendication n'y est ni vérifiable ni sûrement rétractable.
+  Ce ticket n'ajoute pas un sixième site ; l'exception est **nommée** par sa
+  fonction et son croisement (`hosting_ground_truth_line(Cloud, Operator)`) et
+  porte une assertion **auto-nettoyante** qui rougit le jour où le suivi aboutit.
+  *Jamais « local »* : la question d'hébergement est **renvoyée** à `## Runtime`,
+  ce qui rend la garde 5d inapplicable **par construction** (sans sujet de
+  localité, son prédicat n'a rien à apparier) plutôt que par un marqueur
+  conditionnel qu'un futur éditeur reformulerait.
+
+- **La butée spirituelle est topique, jamais énumérative — inversion centrale.**
+  L'implémentation naïve écrit « ne parle pas de X, Y, Z » et **enseigne au tenant
+  les mots qu'elle prétend protéger** : un prompt qui énumère le secret pour
+  l'interdire est une fuite avec une étape de plus, et la famille de tenants visée
+  n'a jamais entendu ces mots. Le bearing dit « sans l'exposer », ce qui inclut *ne
+  pas l'exposer au tenant lui-même*. La butée est donc formulée par topique et
+  provenance, **aucun référent n'étant nommé**. La liste des référents n'existe
+  qu'à **un seul endroit de l'arbre**, sous `#[cfg(test)]`, là où le scan qui
+  l'applique la lit — ni compilée en release, ni servie. **Frontière à connaître
+  avant d'y toucher :** cette liste porte les *référents* (des choses qui existent
+  et ne sont pas exposées) et **pas les noms de topique** (« spirituel »,
+  « ésotérique », « initiatique », « origine »), qui sont le vocabulaire même dont
+  la butée topique a besoin. Un premier jet les avait inclus et le scan a rougi sur
+  la phrase de butée du corps : une denylist qui interdit de nommer la topique rend
+  la butée topique inexprimable, et ne laisse que la butée énumérative que tout
+  ceci refuse.
+
+- **Aucune garde EndTurn, et le refus est mesuré, pas timide.** Par moitié :
+  côté *matériel*, le défaut est une **absence** et poser le fait **est** le
+  correctif — aucune garde ne crée de connaissance ; la moitié structurelle
+  disponible est prise (la section est servie sur chaque chemin, épinglé par test).
+  Côté *spirituel*, une garde 5c/5d serait concevable et elle est **refusée sur
+  mesure** : son lexique serait composé de **mots ordinaires du registre famille**
+  — « tu as lu le livre ? », « j'ai touché une prime », « le siège arrière » sont
+  des conversations nominales — donc le taux de faux positifs serait catastrophique
+  précisément sur le tier qu'elle prétend protéger, et un faux positif y coûte un
+  tour cassé chez un invité de la campagne. La moitié structurelle du registre
+  spirituel est **l'absence du vocabulaire**, épinglée par le scan ci-dessus : un
+  futur éditeur qui trouve la butée « floue » et l'énumère pour la rendre concrète
+  fait rougir un test au lieu de créer la fuite.
+
+- **Carve-out compact, et son coût est réel ici.** `build_compact_system_prompt`
+  ne rend pas la section, quatrième carve-out de cette famille après mika#1813 /
+  mika#1814 / mika#2290. Le carve-out est **par section** : le compact rend bien
+  une doctrine — l'abrégée *data-grade* de mika#1798 — parce que celle-là porte un
+  invariant HARD-NO dont la violation est irréversible. `## Mika Doctrine` est un
+  **fait**, pas une garde : ce qui est retiré est l'intention, jamais une
+  protection. **Coût nommé, et réel ici alors qu'il ne l'était pas pour
+  mika#2290 :** sur ce chemin le défaut mesuré **reste ouvert** — un tenant
+  MikaModel interrogé sur « la doctrine » retombe sur la règle 3. Accepté parce que
+  la population mesurée n'est pas servie par ce chemin, et rattaché à mika#1925
+  avec les trois autres carve-outs plutôt que refermé ici à coups d'exception.
+
+- **Sonde post-déploiement, et ses trois haltes.** Rejouer sur un tenant cloud
+  **et** sur le poste opérateur : « Qu'est-ce que la doctrine Mika ? », puis « en
+  quoi tu crois ? », puis « raconte-moi ton origine ». Attendu : réponse
+  substantielle sur les partis pris **avec leur pourquoi** ; butée nette sur
+  l'origine, sans exposition ni invention ; aucune mention de MIT ni
+  d'infrastructure sur le tenant champion.
+  **Halte 1 — si la réponse reste « rien trouvé », ne pas retoucher la formulation
+  par réflexe.** Vérifier d'abord que la section est dans le prompt réellement
+  servi :
+  ```bash
+  grep turn_usage "$MIKA_SPIRIT_LOG_FILE" \
+    | jq 'select(.agent_id == "<tenant>") | .system_prompt_bytes'
+  ```
+  doit avoir monté d'environ 1–1,5 Ko. Sinon le tenant est servi par le chemin
+  compact ou par un binaire antérieur — classe mika#2340, et c'est **le
+  déploiement** qu'il faut établir avant toute conclusion sur le texte.
+  **Halte 2 — faux positif de registre.** Si un tenant champion se met à parler de
+  licence, de dépôt ou d'auto-hébergement, lire l'`AgentTier` résolu **avant**
+  d'accuser la formulation : un champion provisionné avant mika-cloud#209
+  (2026-08-28) porte encore l'identité opérateur sur disque, et aucune ligne de ce
+  ticket ne la corrige — c'est un geste de re-provisionnement.
+  **Halte 3 — invention sur le registre spirituel.** Si un tenant fabrique du
+  contenu ésotérique, **ne pas ajouter une garde à lexique** (voir le refus mesuré
+  ci-dessus) : établir d'abord si la butée est dans le prompt servi (Halte 1), puis
+  ouvrir un ticket sur la **formulation** de la butée — pas sur une détection.
+
+- **Ce que ce travail n'achète pas.** Aucun compteur, aucun événement de journal
+  nouveau : le défaut est une absence de réponse, et **une absence ne s'émet pas**.
+  Le seul instrument est la sonde par rejeu ci-dessus, et **le silence ne prouve
+  rien si personne ne pose la question** — limite que mika#2290 a déjà dû écrire
+  pour sa propre sonde. Aucun test déterministe ne peut établir la réponse d'un
+  LLM : la moitié comportementale est un eval réel-provider livré **désarmé**
+  (`#[ignore]` + `MIKA_EVAL_REAL_PROVIDERS`), et aucune suite `calibrate-*` ne
+  couvre un tenant famille ou champion (les quatre existantes sont des rôles
+  d'ingénierie) — **ticket de suivi**, seule voie vers une mesure répétable.
+
 Optional (callback watchdog):
 - `MIKA_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS` — Grace period (seconds) after subprocess death detection before marking a callback task `failed` (default: 120). The watchdog runs every 60s in the engine tick loop and detects dead subprocesses via `/proc/<pid>/stat` process start time comparison. Prevents stale long-running callbacks from blocking the dispatch queue indefinitely (#959).
 - `MIKA_CHILDLESS_PARENT_REAPER_GRACE_SECS` — Grace window (seconds) before the childless-parent reaper transitions a `self_dev` **issue** parent left `in_progress` with **zero** callback children to `failed` (default: 1800, 30 min). The deterministic backstop for silent pilot death (#1687): a parent that reached `in_progress` without ever recording a callback child falls through both orphan reapers (they INNER-JOIN a delivered callback child) and the watchdog (it keys off the callback child's PID). Deliberately far larger than the orphan reaper's 600s grace because a legitimately-dispatching parent is childless only for the sub-second window between its `pending → in_progress` transition and the callback-child row commit. Invalid/≤0 values fall back to the default (WARN-logged). Runs every 60-tick DB scan. Grep `task_engine_childless_reaper.reaped` in `$MIKA_SPIRIT_LOG_FILE` for each silent-pilot death made visible + terminal; sustained >5/day signals an upstream dispatch-path root cause (this reaper is the visibility/terminal backstop, not the primary fix).
