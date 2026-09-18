@@ -1454,6 +1454,139 @@ mod tests {
         }
     }
 
+    /// Le **seul** handler de callback dont l'inatteignabilité est tolérée, et
+    /// il l'est sous exception nommée avec son numéro de suivi (mika#2355,
+    /// § Fire-Disposition D-A).
+    ///
+    /// `self-dev/skill.toml` ne déclare pas `self-dev-callback` — même défaut,
+    /// même classe. Il est hors périmètre **délibérément** : le contrat terminal
+    /// du flux self_dev est porté en dur par le moteur
+    /// (`build_callback_trigger_context` + la garde `callback_terminal_action`),
+    /// donc rendre ce skill soudainement actif changerait le comportement du
+    /// chemin le plus chaud du dépôt sans que personne l'ait décidé. Sa bonne
+    /// forme est l'axe manifeste `callback_handler` — une dépendance résolue
+    /// **uniquement** sur les tours de callback, qui rendrait aussi l'en-tête de
+    /// portée de `qa-review-build-callback` sans objet.
+    ///
+    /// Une exception dont la forme serait un motif (« les skills déjà
+    /// existants ») ré-autoriserait en silence le troisième handler du même
+    /// défaut : celle-ci nomme une chaîne et une seule. Elle vit en
+    /// `#[cfg(test)]` — le chargeur de production ne doit pas pouvoir la
+    /// consulter à l'exécution.
+    const CALLBACK_REACHABILITY_EXCEPTION: &str = "self-dev-callback";
+
+    /// Ticket de suivi porteur de l'exception ci-dessus. Une exception sans
+    /// numéro est une exception permanente.
+    const CALLBACK_REACHABILITY_EXCEPTION_TRACKER: &str = "mika#2356";
+
+    /// Construit un `SkillRegistry` depuis les manifestes **réellement
+    /// embarqués**, pour interroger le vrai `callback_safe_skills()`.
+    ///
+    /// Une fixture synthétique répondrait sur une topologie inventée ; c'est la
+    /// topologie livrée qui est en cause. Seuls `name`, `always_on` et
+    /// `dependencies` sont lus — le BFS ne regarde rien d'autre.
+    #[cfg(test)]
+    fn registry_from_bundled_manifests() -> crate::skills::SkillRegistry {
+        use crate::skills::index::SkillEntry;
+
+        let skills: Vec<SkillEntry> = all_bundled_skills()
+            .into_iter()
+            .filter_map(|s| {
+                let toml_src = s.files.iter().find(|f| f.path == "skill.toml")?.content;
+                let manifest: crate::skills::manifest::SkillManifest = toml::from_str(toml_src)
+                    .unwrap_or_else(|e| panic!("{} skill.toml must parse: {e}", s.name));
+                Some(SkillEntry {
+                    dir: std::path::PathBuf::from(format!("/skills/{}", manifest.skill.name)),
+                    keywords_lower: vec![],
+                    prompt_snippet: String::new(),
+                    skill_tools: vec![],
+                    enabled: true,
+                    has_override: false,
+                    provider_overrides: std::collections::HashMap::new(),
+                    prompt_sources: SkillEntry::empty_prompt_sources(),
+                    model_overrides: std::collections::HashMap::new(),
+                    manifest,
+                })
+            })
+            .collect();
+
+        crate::skills::SkillRegistry::from_test_entries(skills)
+    }
+
+    /// mika#2355 AC1 + AC1c — **tout** handler de callback bundled est
+    /// atteignable sur un tour de callback.
+    ///
+    /// Écrit sur la CLASSE (tout skill dont le nom finit par `-callback`) et non
+    /// sur le seul skill corrigé, parce qu'un test nommé serait vert sans rien
+    /// compter : c'est l'absence de ce détecteur — et non l'absence de correctif
+    /// — qui a laissé la classe mika#1251 à moitié fermée pendant des mois.
+    ///
+    /// Sœur de [`test_self_dev_declares_both_dispatch_siblings_as_dependencies`],
+    /// qui ne peut structurellement pas voir cette classe : il raisonne sur des
+    /// **noms d'outils** référencés par le moteur
+    /// (`ENGINE_REFERENCED_SKILL_TOOLS`), et `qa-review-build-callback`
+    /// n'apporte aucun outil — seulement du prompt.
+    ///
+    /// **Coût nommé.** L'heuristique « nom terminant par `-callback` » n'est pas
+    /// l'axe manifeste `callback_handler` : un futur handler nommé autrement
+    /// passerait à travers en faux négatif. Accepté comme **borne inférieure** —
+    /// le détecteur compte aujourd'hui deux cas sur deux, là où il n'en comptait
+    /// zéro — et c'est précisément ce que le ticket de suivi supprime en rendant
+    /// le rôle déclaratif plutôt que devinable au nom.
+    #[test]
+    fn mika2355_every_bundled_callback_handler_is_reachable_on_a_callback_turn() {
+        let registry = registry_from_bundled_manifests();
+        let reachable: Vec<String> = registry
+            .callback_safe_skills()
+            .iter()
+            .map(|e| e.manifest.skill.name.to_ascii_lowercase())
+            .collect();
+
+        let handlers: Vec<String> = registry
+            .skills()
+            .iter()
+            .map(|e| e.manifest.skill.name.to_ascii_lowercase())
+            .filter(|n| n.ends_with("-callback"))
+            .collect();
+
+        assert!(
+            !handlers.is_empty(),
+            "population vide — le détecteur ne compte plus rien, vérifier la \
+             découverte des skills bundled avant de croire ce test vert"
+        );
+
+        for handler in &handlers {
+            if handler == CALLBACK_REACHABILITY_EXCEPTION {
+                continue;
+            }
+            assert!(
+                reachable.contains(handler),
+                "'{handler}' n'est atteignable par aucun tour de callback : \
+                 `callback_safe_skills()` amorce sur les skills `always_on` et ne \
+                 suit que les dépendances SORTANTES. Déclarer `{handler}` dans les \
+                 `dependencies` du skill qu'il prolonge (classe mika#1251, \
+                 mika#2355). Atteignables aujourd'hui : {reachable:?}"
+            );
+        }
+
+        // Assertion auto-nettoyante — sans cette moitié, le ticket de suivi peut
+        // atterrir et laisser derrière lui une exception qui re-couvre la classe
+        // pour le handler suivant.
+        assert!(
+            handlers
+                .iter()
+                .any(|h| h == CALLBACK_REACHABILITY_EXCEPTION),
+            "l'exception '{CALLBACK_REACHABILITY_EXCEPTION}' ne désigne plus aucun \
+             skill bundled — elle est périmée, retirez cette entrée"
+        );
+        assert!(
+            !reachable.contains(&CALLBACK_REACHABILITY_EXCEPTION.to_string()),
+            "'{CALLBACK_REACHABILITY_EXCEPTION}' est désormais atteignable : \
+             l'exception est périmée et doit être retirée, avec son tracker \
+             {CALLBACK_REACHABILITY_EXCEPTION_TRACKER}"
+        );
+    }
+
     /// Engine post-condition guards (agent.rs, engine.rs, executor.rs) reference
     /// these skill tool names by string literal. The guards fire regardless of
     /// which skills are loaded — a missing tool means the guard silently no-ops

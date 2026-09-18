@@ -16,6 +16,31 @@ use crate::types::{Message, TaskPushNotificationConfig};
 /// [`MessageSendParams`], so neither side can rename it alone.
 pub const CALLER_SESSION_ID_KEY: &str = "mika.caller_session_id";
 
+/// Request-metadata key naming the ONLY skills this turn should carry (mika#2363).
+///
+/// A `message/send` caller that knows which pass it is running may name it. The
+/// server then restricts the turn's skill registry to the named set — **by
+/// subtraction only**: every skill whose name is absent from the list is
+/// transiently disabled, and a named skill that would not otherwise have been
+/// active is *not* resurrected. The field can therefore never widen a turn's
+/// surface, which is what makes it safe on an endpoint any authenticated caller
+/// can reach.
+///
+/// The founding measurement: mika-arch declares three `always_on` skills
+/// (`mika-arch-groom-ticket`, `mika-arch-second-review`,
+/// `mika-arch-groom-milestone`, 39 798 bytes of prompt in total) and every turn
+/// runs exactly **one** of those passes — so 23.5 KB of every architect system
+/// prompt described two tasks the turn was not doing.
+///
+/// Advisory in both directions: a server free to ignore the key, a caller free
+/// to omit it. Absent, empty, or not an array of strings all mean "no
+/// restriction", so an older caller and a newer one produce the same turn.
+///
+/// The spelling is the wire contract between `mika-cli` and `mika-agent`, which
+/// share no dependency edge of their own — it lives here, in the crate that owns
+/// [`MessageSendParams`], so neither side can rename it alone.
+pub const ONLY_SKILLS_KEY: &str = "mika.only_skills";
+
 /// Parameters for `message/send` and `message/stream`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -66,5 +91,13 @@ mod tests {
         // External A2A clients may send this key, so its spelling is a published
         // contract, not an internal detail. Changing it is a protocol change.
         assert_eq!(CALLER_SESSION_ID_KEY, "mika.caller_session_id");
+    }
+
+    #[test]
+    fn only_skills_key_is_the_wire_spelling() {
+        // mika#2363. Same contract as above: `mika-cli` writes this key and
+        // `mika-agent` reads it, with no dependency edge between them that a
+        // rename could travel along.
+        assert_eq!(ONLY_SKILLS_KEY, "mika.only_skills");
     }
 }

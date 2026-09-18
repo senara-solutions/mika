@@ -98,6 +98,7 @@ pub async fn run(
     model_override: Option<&str>,
     enable_skill: &[String],
     disable_skill: &[String],
+    only_skill: &[String],
     verbose: bool,
 ) -> Result<()> {
     let mut ctx = init::init_for_agent(agent_name)?;
@@ -319,6 +320,15 @@ pub async fn run(
     //   * per-run token usage (verbose `tokens.*`) is not carried by the A2A
     //     `Task`, so it degrades to absent until threaded through the protocol.
     //
+    // Partially resolved (mika#2363): `--only-skill` DOES reach spirit, through
+    // `message/send` request metadata. It is deliberately only the **subtractive**
+    // half of that missing config channel — it can evict a skill from the turn,
+    // never activate one. The additive half (`--enable-skill` →
+    // `apply_transient_always_on` server-side) stays deferred with its reason:
+    // it would let any authenticated caller of `/a2a/{agent}` force one of the
+    // agent's skills to `always_on`, and it buys nothing for the case that
+    // motivated the channel — the skill `_arch_ask` needs is already `always_on`.
+    //
     // Resolved (mika#2070): the local bookkeeping session is no longer orphaned.
     // Its id travels to spirit in `message/send` request metadata, and spirit runs
     // the turn under it whenever it already owns that session row — so the agent
@@ -372,6 +382,7 @@ pub async fn run(
         &user_message,
         &spirit_endpoint,
         Some(session_id.as_str()),
+        only_skill,
     )
     .await
     .map_err(|e| wrap_send_error(&e, &spirit_endpoint))?;

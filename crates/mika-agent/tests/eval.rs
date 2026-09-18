@@ -153,6 +153,10 @@ mod eval {
     // qa-review skill-scoped run_gh validator wiring test (mika#1196)
     mod test_qa_review_run_gh_scope_validator;
 
+    // mika#2355 — le callback de build QA poste son verdict : B2 (carve-out
+    // #870 + framing) et B3 (garde positive) sur le chemin silencieux réel.
+    mod test_qa_build_callback_verdict_2355;
+
     // Self-dev-callback engine consistency: documented callback-handler branches
     // produce tool calls the engine accepts or defers (mika#806).
     mod test_self_dev_callback_engine_consistency;

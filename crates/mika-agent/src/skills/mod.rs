@@ -254,7 +254,27 @@ pub fn apply_filter<'a>(
     })
 }
 
-#[derive(Debug)]
+/// Result of [`SkillRegistry::apply_only_skills`] (mika#2363).
+///
+/// Reports what the restriction actually did, so the caller can log a decision
+/// rather than an intention. `unknown` is the diagnostic half: a name the
+/// registry has never heard of keeps nothing, which — if it is the only name —
+/// leaves a turn with no skills at all. That outcome is loud by construction
+/// (`active_skill_count = 0` on `system_prompt_assembled`, no output-contract
+/// guard armed) and it is deliberately not softened into a silent no-op: a
+/// caller naming a skill this agent cannot carry has made a mistake worth
+/// seeing.
+#[derive(Debug, Default)]
+pub struct OnlySkillsResult {
+    /// Skill names from the request that matched a loaded entry and were kept.
+    pub kept: Vec<String>,
+    /// Loaded skills evicted because the request did not name them.
+    pub evicted: Vec<String>,
+    /// Requested names matching neither a loaded nor a disabled skill.
+    pub unknown: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct SkillRegistry {
     skills: Vec<SkillEntry>,
     skipped: Vec<SkippedSkill>,
@@ -852,6 +872,29 @@ impl SkillRegistry {
         result
     }
 
+    /// Is a skill by this name currently loaded? Case-insensitive, like every
+    /// other name comparison in this module.
+    fn is_loaded_skill_name(&self, name: &str) -> bool {
+        self.skills
+            .iter()
+            .any(|e| e.manifest.skill.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Does this registry know a skill by this name at all — loaded, or evicted
+    /// into `disabled`?
+    ///
+    /// The distinction matters to two callers that answer opposite questions with
+    /// it: `apply_transient_disable` reports an unknown name as `not_found`, and
+    /// `apply_only_skills` reports it as `unknown`. "Known but disabled" is a
+    /// no-op for both and must not be confused with "never heard of it".
+    fn is_known_skill_name(&self, name: &str) -> bool {
+        self.is_loaded_skill_name(name)
+            || self
+                .disabled
+                .iter()
+                .any(|d| d.name.eq_ignore_ascii_case(name))
+    }
+
     /// Apply transient disable overrides from CLI flags.
     ///
     /// For each skill name, finds the matching entry (case-insensitive) and evicts
@@ -870,17 +913,9 @@ impl SkillRegistry {
         let disable_names: Vec<&String> = skill_names
             .iter()
             .filter(|name| {
-                // Check if the skill is loaded
-                let in_loaded = self
-                    .skills
-                    .iter()
-                    .any(|e| e.manifest.skill.name.eq_ignore_ascii_case(name));
-                // Check if already disabled (no-op)
-                let in_disabled = self
-                    .disabled
-                    .iter()
-                    .any(|d| d.name.eq_ignore_ascii_case(name));
-                if !in_loaded && !in_disabled {
+                let in_loaded = self.is_loaded_skill_name(name);
+                // Already disabled is a no-op, not a not-found.
+                if !in_loaded && !self.is_known_skill_name(name) {
                     result.not_found.push((*name).clone());
                     false
                 } else {
@@ -909,6 +944,73 @@ impl SkillRegistry {
             self.disabled.extend(evicted);
         }
 
+        result
+    }
+
+    /// Restrict this registry to the named skills, **by subtraction only**
+    /// (mika#2363).
+    ///
+    /// Every loaded skill whose name is not in `only_names` is evicted, exactly
+    /// as [`apply_transient_disable`](Self::apply_transient_disable) would evict
+    /// it — this method computes the complement and delegates, so there is one
+    /// eviction path and not two that could drift apart.
+    ///
+    /// **It never calls [`apply_transient_always_on`](Self::apply_transient_always_on),
+    /// and that asymmetry is the whole safety argument.** The additive half would
+    /// let any authenticated caller of `/a2a/{agent}` force one of the agent's
+    /// skills to `always_on`; the subtractive half can only ever remove. A skill
+    /// named here that would not otherwise have been active is *not* resurrected
+    /// — naming it buys nothing.
+    ///
+    /// An empty `only_names` is a no-op, treated as "no restriction requested"
+    /// rather than as "keep nothing": the second reading would turn a caller
+    /// sending an empty array into a turn with no skills, which nobody means.
+    ///
+    /// Call this **after** `apply_overrides()` and the transient flags, on a
+    /// per-turn clone. It must never be applied to the registry cached on
+    /// `AgentState`, which concurrent turns share.
+    pub fn apply_only_skills(&mut self, only_names: &[String]) -> OnlySkillsResult {
+        let mut result = OnlySkillsResult::default();
+        if only_names.is_empty() {
+            return result;
+        }
+
+        let named = |name: &str| {
+            only_names
+                .iter()
+                .any(|wanted| wanted.eq_ignore_ascii_case(name))
+        };
+
+        let to_evict: Vec<String> = self
+            .skills
+            .iter()
+            .map(|e| e.manifest.skill.name.clone())
+            .filter(|name| !named(name))
+            .collect();
+
+        result.kept = self
+            .skills
+            .iter()
+            .map(|e| e.manifest.skill.name.clone())
+            .filter(|name| named(name))
+            .collect();
+
+        for wanted in only_names {
+            if !self.is_known_skill_name(wanted) {
+                result.unknown.push(wanted.clone());
+            }
+        }
+
+        if !result.unknown.is_empty() {
+            tracing::warn!(
+                event = "only_skills_unknown_name",
+                unknown = %result.unknown.join(","),
+                "only_skills named a skill this registry does not carry — it keeps nothing"
+            );
+        }
+
+        self.apply_transient_disable(&to_evict);
+        result.evicted = to_evict;
         result
     }
 
@@ -3593,6 +3695,174 @@ keywords = ["big-test"]
         let always_on = registry.always_on_skills();
         assert_eq!(always_on.len(), 1);
         assert_eq!(always_on[0].manifest.skill.name, "qa-review");
+    }
+
+    // ── apply_only_skills tests (mika#2363, V1/V5) ───────────────────────
+
+    fn arch_registry() -> SkillRegistry {
+        // The production shape this ticket is about: mika-arch's three always_on
+        // architect skills, of which any one turn runs exactly one.
+        SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![
+                make_entry("mika-arch-groom-ticket", true, true),
+                make_entry("mika-arch-second-review", true, true),
+                make_entry("mika-arch-groom-milestone", true, true),
+            ],
+        }
+    }
+
+    #[test]
+    fn mika2363_only_skills_keeps_exactly_the_named_skill() {
+        let mut registry = arch_registry();
+
+        let outcome = registry.apply_only_skills(&["mika-arch-groom-ticket".to_string()]);
+
+        assert_eq!(registry.skills.len(), 1);
+        assert_eq!(
+            registry.skills[0].manifest.skill.name,
+            "mika-arch-groom-ticket"
+        );
+        assert_eq!(outcome.kept, vec!["mika-arch-groom-ticket"]);
+        assert_eq!(outcome.evicted.len(), 2);
+        assert!(outcome.unknown.is_empty());
+        // The two sisters are evicted the same way `--disable-skill` evicts.
+        assert_eq!(registry.disabled.len(), 2);
+    }
+
+    #[test]
+    fn mika2363_only_skills_narrows_the_matched_set_to_one() {
+        use super::matcher::match_skills;
+
+        let mut registry = arch_registry();
+        assert_eq!(
+            match_skills(&registry.skills, "review this plan").len(),
+            3,
+            "all three are always_on, which is the whole defect"
+        );
+
+        registry.apply_only_skills(&["mika-arch-second-review".to_string()]);
+
+        let matched = match_skills(&registry.skills, "review this plan");
+        assert_eq!(matched.len(), 1);
+        assert_eq!(
+            matched[0].entry.manifest.skill.name,
+            "mika-arch-second-review"
+        );
+    }
+
+    #[test]
+    fn mika2363_only_skills_never_resurrects_a_disabled_skill() {
+        // R2/AC4, the safety property: the channel subtracts, it never adds. A
+        // skill the registry already evicted stays evicted even when the caller
+        // names it — naming buys nothing.
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: vec![DisabledSkill {
+                name: "shell-exec".to_string(),
+            }],
+            validated_warnings: Vec::new(),
+            skills: vec![make_entry("mika-arch-groom-ticket", true, true)],
+        };
+
+        let outcome = registry.apply_only_skills(&["shell-exec".to_string()]);
+
+        assert!(
+            registry.skills.is_empty(),
+            "naming a disabled skill must not bring it back; it keeps nothing"
+        );
+        assert!(
+            outcome.unknown.is_empty(),
+            "a DB-disabled skill is known, just not loaded"
+        );
+        assert!(outcome.kept.is_empty());
+    }
+
+    #[test]
+    fn mika2363_only_skills_does_not_set_always_on_on_anything() {
+        // The additive half stays deferred (B1.2). A skill that was not always_on
+        // and is named must not become always_on — otherwise any caller of
+        // /a2a/{agent} could force a skill into every turn's prompt.
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![
+                make_entry("keyword-only", false, true),
+                make_entry("mika-arch-groom-ticket", true, true),
+            ],
+        };
+
+        registry.apply_only_skills(&["keyword-only".to_string()]);
+
+        assert_eq!(registry.skills.len(), 1);
+        assert!(
+            !registry.skills[0].manifest.skill.always_on,
+            "apply_only_skills must never call apply_transient_always_on"
+        );
+    }
+
+    #[test]
+    fn mika2363_an_unknown_name_is_reported_and_keeps_nothing() {
+        let mut registry = arch_registry();
+
+        let outcome = registry.apply_only_skills(&["mika-arch-groom-tickets".to_string()]);
+
+        assert_eq!(outcome.unknown, vec!["mika-arch-groom-tickets"]);
+        assert!(
+            registry.skills.is_empty(),
+            "a typo must fail loudly (zero skills, no output-contract guard armed) \
+             rather than quietly leaving the turn unrestricted"
+        );
+    }
+
+    #[test]
+    fn mika2363_an_empty_request_is_a_no_op() {
+        // R3: a caller declaring nothing gets today's registry, untouched.
+        let mut registry = arch_registry();
+
+        let outcome = registry.apply_only_skills(&[]);
+
+        assert_eq!(registry.skills.len(), 3);
+        assert!(registry.disabled.is_empty());
+        assert!(outcome.kept.is_empty());
+        assert!(outcome.evicted.is_empty());
+        assert!(outcome.unknown.is_empty());
+    }
+
+    #[test]
+    fn mika2363_only_skills_is_case_insensitive_like_its_siblings() {
+        let mut registry = arch_registry();
+
+        registry.apply_only_skills(&["MIKA-ARCH-GROOM-TICKET".to_string()]);
+
+        assert_eq!(registry.skills.len(), 1);
+        assert_eq!(
+            registry.skills[0].manifest.skill.name,
+            "mika-arch-groom-ticket"
+        );
+    }
+
+    /// V5 / R4 — the per-turn clone is what keeps a restriction off the registry
+    /// two concurrent turns share. This asserts the mechanism the server relies
+    /// on: restricting a clone leaves the original whole. Nothing else in the
+    /// suite would notice a `&mut` applied to the cached `Arc`'s contents.
+    #[test]
+    fn mika2363_restricting_a_clone_leaves_the_shared_registry_intact() {
+        let shared = std::sync::Arc::new(arch_registry());
+
+        let mut per_turn = (*shared).clone();
+        per_turn.apply_only_skills(&["mika-arch-groom-ticket".to_string()]);
+
+        assert_eq!(per_turn.skills.len(), 1);
+        assert_eq!(
+            shared.skills.len(),
+            3,
+            "the cached registry must still carry all three for the next turn"
+        );
+        assert!(shared.disabled.is_empty());
     }
 
     // -- apply_identity_allowlist tests --

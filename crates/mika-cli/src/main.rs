@@ -345,6 +345,7 @@ async fn main() -> Result<()> {
                 args.model.as_deref(),
                 &args.enable_skill,
                 &args.disable_skill,
+                &args.only_skill,
                 args.verbose,
             )
             .await

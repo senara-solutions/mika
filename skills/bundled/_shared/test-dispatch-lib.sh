@@ -576,6 +576,14 @@ assert_eq "_arch_ask rejects unreadable plan_path" "2" \
 # Argv is joined with `|` so we can grep substrings; needles are prefixed with
 # `|` to avoid grep treating `--`-leading strings as flags.
 #
+# mika#2363: the selection flag is now `--only-skill`, not `--enable-skill`. The
+# latter was measured to be abandoned in transit since mika#1727 (`mika ask` is a
+# thin A2A client; the flag configures a local registry that is no longer the
+# execution surface), so mika-arch received all three of its always_on prompts on
+# every turn. `--only-skill` is the subtractive half of that channel and it does
+# reach spirit. The two are mutually exclusive in clap, so this is a replacement:
+# keeping both would fail every architect call at argument parsing.
+#
 # mika#1283: _arch_ask passes plan content via stdin (mika ask "-" reads stdin),
 # NOT as @-file argument (mika ask doesn't expand @<path>). The argv should
 # contain a literal "-" marker and the stub should receive the plan content
@@ -584,8 +592,9 @@ ARCH_PLAN_TMP=$(mktemp /tmp/arch-plan-XXXXXX.md)
 printf 'plan content for arch ask test\n' > "$ARCH_PLAN_TMP"
 mika() { printf '|%s' "$@"; printf '|'; }  # leading | so first arg also has separator
 ARCH_ARGV=$(_arch_ask "mika-arch-groom-ticket" "$ARCH_PLAN_TMP")
-assert_contains "_arch_ask uses enable-skill flag (not the wrong skill flag)" "|--enable-skill|" "$ARCH_ARGV"
-assert_contains "_arch_ask threads skill name after enable-skill" "|--enable-skill|mika-arch-groom-ticket|" "$ARCH_ARGV"
+assert_contains "_arch_ask uses only-skill flag (not the wrong skill flag) — mika#2363" "|--only-skill|" "$ARCH_ARGV"
+assert_contains "_arch_ask threads skill name after only-skill" "|--only-skill|mika-arch-groom-ticket|" "$ARCH_ARGV"
+assert_not_contains "_arch_ask no longer passes --enable-skill (exclusive with --only-skill, mika#2363)" "|--enable-skill|" "$ARCH_ARGV"
 assert_contains "_arch_ask sets agent mika-arch" "|--agent|mika-arch|" "$ARCH_ARGV"
 assert_contains "_arch_ask sets format json" "|--format|json|" "$ARCH_ARGV"
 assert_contains "_arch_ask sets verbose flag" "|--verbose|" "$ARCH_ARGV"
@@ -5895,6 +5904,71 @@ assert_contains "mika#2296: le message session_id se démarque du cas content vi
 MIKA2296_CALLSITES=$(grep -c '_groom_warn_empty_content "' "$DISPATCH_LIB" || true)
 assert_eq "mika#2296: les trois sites de lecture de .content partagent le message" \
     "3" "$MIKA2296_CALLSITES"
+
+# ============================================================================
+# mika#2363 — `_arch_ask` déclare la passe qu'il exécute
+# ============================================================================
+#
+# mika-arch porte trois skills `always_on` (39 798 o de prompt) et un tour n'en
+# exécute qu'une : ~23,5 Ko de chaque prompt système architecte décrivaient deux
+# tâches que le tour ne fait pas. `--only-skill` est le canal — strictement
+# soustractif — qui le dit au serveur.
+#
+# Test comportemental : on éclipse `mika` par une fonction shell qui rend son
+# argv, puis on appelle le vrai `_arch_ask`. Une assertion sur le texte du
+# fichier prouverait que la ligne existe ; celle-ci prouve ce que la commande
+# *émet*.
+
+echo ""
+echo "Test: _arch_ask — déclaration de passe (mika#2363)"
+echo "---------------------------------------------------"
+
+# _arch_ask_argv <skill> [session_id] → l'argv que `_arch_ask` remet à `mika`.
+_arch_ask_argv() {
+    local skill="$1" session_id="${2:-}"
+    local tmp plan
+    tmp=$(mktemp -d)
+    plan="$tmp/plan.md"
+    echo "# Plan: fixture mika#2363" > "$plan"
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB"
+        # Éclipse le binaire : une fonction shell l'emporte sur $PATH.
+        mika() { printf '%s\n' "$*"; }
+        _arch_ask "$skill" "$plan" "$session_id"
+    )
+    rm -rf "$tmp"
+}
+
+# Les trois passes, une par une. Le test échouerait aussi bien sur une skill
+# oubliée que sur un `--only-skill` retiré.
+for _MIKA2363_SKILL in mika-arch-groom-ticket mika-arch-second-review mika-arch-groom-milestone; do
+    _MIKA2363_ARGV=$(_arch_ask_argv "$_MIKA2363_SKILL")
+    assert_contains "mika#2363: _arch_ask déclare $_MIKA2363_SKILL" \
+        "--only-skill $_MIKA2363_SKILL" "$_MIKA2363_ARGV"
+
+    # `--enable-skill` et `--only-skill` sont exclusifs côté clap : les garder
+    # tous les deux ferait mourir chaque appel architecte au parsing d'arguments.
+    assert_not_contains "mika#2363: $_MIKA2363_SKILL — plus de --enable-skill (exclusif de --only-skill)" \
+        "--enable-skill" "$_MIKA2363_ARGV"
+
+    # La passe demandée est la seule nommée. Le vocabulaire des trois skills
+    # vit dans MIKA_ARCH_SKILL_ALLOWLIST (well_known_agents.rs) ; une seconde
+    # copie en shell dériverait en silence.
+    for _MIKA2363_SISTER in mika-arch-groom-ticket mika-arch-second-review mika-arch-groom-milestone; do
+        [ "$_MIKA2363_SISTER" = "$_MIKA2363_SKILL" ] && continue
+        assert_not_contains "mika#2363: $_MIKA2363_SKILL n'énumère pas $_MIKA2363_SISTER" \
+            "$_MIKA2363_SISTER" "$_MIKA2363_ARGV"
+    done
+done
+
+# La continuation de session reste orthogonale à la déclaration de passe : la
+# seconde passe relit la première dans la même session architecte.
+_MIKA2363_ARGV_SESSION=$(_arch_ask_argv "mika-arch-second-review" "sess-2363")
+assert_contains "mika#2363: --session-id survit à la déclaration de passe" \
+    "--session-id sess-2363" "$_MIKA2363_ARGV_SESSION"
+assert_contains "mika#2363: --only-skill survit à --session-id" \
+    "--only-skill mika-arch-second-review" "$_MIKA2363_ARGV_SESSION"
 
 # --- Summary ---
 
