@@ -7,11 +7,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
+use super::budget::output_tokens_per_sec_floor;
 use super::error::LlmError;
 use super::openai::extract_think_block;
 use super::retry_gate::{RetryThresholds, RetryVerdict, deadline_verdict, next_attempt_verdict};
 use super::types::*;
-use super::budget::output_tokens_per_sec_floor;
 use super::{LlmProvider, LlmTimeoutBudget};
 
 /// One-shot debug-flag-gated payload dump (mika#1387).
@@ -719,11 +719,11 @@ impl OllamaProvider {
             // mika#2331 AC2 — the outcome line; see the twin comment in `openai.rs`.
             let attempt_start = Instant::now();
             // mika#2280 — the pair is split at its single site; see `openai.rs`.
-            let (attempt_result, attempt_cap_exhausted) = match self.send_once(&ollama_request).await
-            {
-                Ok(response) => (Ok(response), false),
-                Err((e, cap_exhausted)) => (Err(e), cap_exhausted),
-            };
+            let (attempt_result, attempt_cap_exhausted) =
+                match self.send_once(&ollama_request).await {
+                    Ok(response) => (Ok(response), false),
+                    Err((e, cap_exhausted)) => (Err(e), cap_exhausted),
+                };
             let attempt_elapsed_ms = attempt_start.elapsed().as_millis() as u64;
             let deadline_remaining_ms =
                 deadline.map(|dl| dl.saturating_duration_since(Instant::now()).as_millis() as u64);

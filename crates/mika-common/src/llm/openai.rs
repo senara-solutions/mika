@@ -228,10 +228,7 @@ impl OpenAiCompatibleProvider {
     /// field: this method is private and has exactly **one** caller, so the pair
     /// propagates at one site. Side state would cost the same lines while making
     /// the flag reachable from anywhere.
-    async fn send_once(
-        &self,
-        request: &OpenAiRequest,
-    ) -> Result<OpenAiResponse, (LlmError, bool)> {
+    async fn send_once(&self, request: &OpenAiRequest) -> Result<OpenAiResponse, (LlmError, bool)> {
         // mika#2280 D2: the attempt's own clock. `send_message_inner` measures
         // one too, around this call, but the discriminator has to compare a
         // duration with the plafond that bounded *this* request — reading the
@@ -559,11 +556,11 @@ impl OpenAiCompatibleProvider {
             // error. Split it here — the single site the pair travels through —
             // so everything below reasons about an ordinary `Result` and no
             // `LlmError` variant had to change.
-            let (attempt_result, attempt_cap_exhausted) = match self.send_once(&openai_request).await
-            {
-                Ok(response) => (Ok(response), false),
-                Err((e, cap_exhausted)) => (Err(e), cap_exhausted),
-            };
+            let (attempt_result, attempt_cap_exhausted) =
+                match self.send_once(&openai_request).await {
+                    Ok(response) => (Ok(response), false),
+                    Err((e, cap_exhausted)) => (Err(e), cap_exhausted),
+                };
             let attempt_elapsed_ms = attempt_start.elapsed().as_millis() as u64;
             let deadline_remaining_ms =
                 deadline.map(|dl| dl.saturating_duration_since(Instant::now()).as_millis() as u64);
