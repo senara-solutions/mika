@@ -334,6 +334,49 @@ canonical_id = "00000000-0000-0000-0000-000000000000"  # optional
 
 **Concurrency:** the singleton merges all channels into one thread. For a single-surface, zero-skill oracle (mika-prime's profile) this is the designed intent, not a defect. High-concurrency multi-surface agents should not opt in.
 
+### Session contract of the architect passes (mika#2305)
+
+**The contract already in force, on both halves.** *New by default:* `mika ask`
+without `--session-id` falls back to the canonical session only when the agent is
+singleton, and `resolve_canonical_session_id` returns `None` for a non-singleton
+one. mika-arch declares **no** `[session]` block — `grep -c singleton
+crates/mika-agent/src/well_known_agents.rs` returns `0` — so it mints a fresh
+UUID per ask. *Continued on explicit request:* `_arch_ask`
+(`skills/bundled/_shared/dispatch-lib.sh`) takes an **optional** `session_id` in
+`$3` and passes `--session-id` only when it is non-empty.
+
+**The three usages in `_iterate_groom_loop`, all deliberate:**
+
+| call | `session_id`? | why |
+|---|---|---|
+| 1st pass `mika-arch-groom-ticket` | **no** | fresh session |
+| UNPARSED retry | **yes** | the architect must see **its own prior turn** — the retry does not re-ask for the review, it asks the architect to *complete* its answer with the missing `Disposition:` line. Without the session the request is unintelligible: the carry-over is the mechanism's **condition of correctness**, not its contamination |
+| 2nd pass `mika-arch-second-review` (both branches) | **yes** | continuing the session so findings stay in conversation memory, per that skill's session-continuity contract |
+
+The session id is even written into the body-callout published on the ticket
+(`_write_canonical_callout`).
+
+**The leak mika#2305 suspected was real, and on the other axis.** It did not live
+in `--session-id`; it lived in `HistoryScope::Agent`, the **default** of the
+conversation window, where `rebuild_context(None, …, 20)` draws the agent's last
+20 messages **across all sessions** — for an architect, twenty whole plans and
+reviews. Closed by mika#2295 (the setting) + mika#2330 (putting it in force).
+What mika#2305 adds is the means to *see* it: `context_window_assembled` now
+carries `history_scope` next to `distinct_sessions`, because that count alone has
+two causes of opposite sign (scope fell back to `agent`, or one session iterated
+legitimately). Reading table and post-deploy probe: root `CLAUDE.md`
+§ *Portage de contexte entre passes architecte*.
+
+**Not bounded by `scope`, and deliberately left intact:** the agent-scoped memory
+(`update_core_memory`, `store_fact`, `update_fact`, `search_memory`), which
+crosses every session by design and is pinned as constitutive of being an agent
+(`test_mika_arch_disabled_tools_excludes_agent_self_state`). Naming it is what
+closes the ticket's question; pretending it does not exist would not.
+
+**Guards:** `test-dispatch-lib.sh` pins the table above. If those assertions
+redden, someone "fixed" the intra-invocation carry-over believing they were
+closing mika#2305 — restore, and read the retry row.
+
 ## Tools
 
 Each tool validates inputs. Control fields capped at `MAX_INPUT_LEN = 10_000` chars; payload fields capped at `MAX_PAYLOAD_BYTES = 200 * 1024` bytes (200 KB).

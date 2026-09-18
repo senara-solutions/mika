@@ -65,6 +65,11 @@ mod eval {
     mod test_completion_claim_guard;
     mod test_context_summary_inject;
 
+    // mika#2305 — the scope that decided the window is emitted next to the count
+    // it explains, and it is the one the identity declared. Its sibling below
+    // asserts the window; this one asserts what the instrument says about it.
+    mod test_context_scope_observability_2305;
+
     // mika#2295 briques 1 & 2 — the two window bounds, asserted on the window the
     // model actually received rather than on the predicates that compute it.
     mod test_context_window_budget_2295;
@@ -81,6 +86,9 @@ mod eval {
     mod test_dispatch_task_has_open_pr_guard;
     mod test_error_handling;
 
+    // mika#2289 AC1 — la porte : `tour mort sur erreur LLM ⇒ verdict posté`.
+    // Frère de `test_deadline_verdict_2276`, sur la branche `Err` de `run_agent`.
+    mod test_error_verdict_2289;
     // mika#1784 — une image non lue est un fait dit. Les unités de
     // `image_disposition` ne verraient pas un `decide()` appelé au mauvais moment
     // dans la boucle ; ces tests lisent ce que le modèle a reçu.
