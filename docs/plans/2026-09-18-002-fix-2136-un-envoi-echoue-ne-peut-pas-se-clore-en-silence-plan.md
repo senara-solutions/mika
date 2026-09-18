@@ -700,8 +700,69 @@ Sur 7 jours :
 
 ---
 
+## Fire-Disposition
+
+Trois livrables de classe détecteur : (1) le guard EndTurn **6f**
+`unacknowledged_send_failure`, dont le chemin de succès est « aucune violation trouvée » ;
+(2) le prédicat structurel `undelivered_sends(&[DeliveryRecord])` (D3) ; (3) les suites de
+tests unitaires (§ 4) et d'intégration (§ 8).
+
+**Disposition : option (a), allowlist nommée — avec une liste vide. Aucune exception n'est
+écrite, et cette absence est un choix explicite, pas un oubli.**
+
+**La population préexistante est vide par construction, pas par chance.** Le
+`Vec<DeliveryRecord>` sur lequel le prédicat statue naît au premier pas du tour et meurt avec
+lui : il voyage en `&mut` et n'est porté par aucune variante de `LoopResult` (D8), il n'est ni
+persisté ni sérialisé (D7, § 3), et `ToolOutput.delivery` n'est jamais rendu au LLM (D2, E6).
+Au déploiement il n'existe donc **aucune** donnée en base, aucun fichier de l'arbre et aucune
+ligne de journal sur lesquels le détecteur puisse fire rétroactivement ; les tours en vol ne
+survivent pas au redémarrage du process. C'est ce qui sépare ce détecteur de la famille de
+l'incident fondateur de mika#1574 (`verify-bundled-skills`, qui balaie un corpus existant de
+manifestes) : ici une allowlist non vide n'aurait pas un seul membre à nommer.
+
+**Et l'état d'avant n'était pas une violation.** Le 2026-09-01, aucune règle n'était
+enfreinte : il n'y avait pas de règle. E1 le mesure — `grep -c "send_message"
+crates/mika-agent/src/evidence/guards.rs` rend `0`, aucun des onze guards ne regardait la
+livraison. Le guard 6f est donc **bloquant dès le land, sans exemption ni période de grâce** :
+grandfatherer quoi que ce soit reviendrait à exempter d'une règle neuve un comportement qui
+n'a jamais été gardé, c'est-à-dire à écrire une exception dont le prédicat n'aurait pas de
+population.
+
+**Ce que le détecteur fait au premier tour post-déploiement, et pourquoi ce n'est pas un
+incident.** Un tour dont un envoi a échoué sans réparation coûte un re-prompt (D4) et, budget
+épuisé, l'annexe factuelle de D5 — sur des tours **neufs**, et sur eux seuls. C'est l'effet
+recherché, et le régime attendu est déjà écrit en § Surfaces opérateur : non nul mais faible.
+Un flot soutenu ne serait pas un fire sur des données historiques — il n'en existe pas — mais
+un transport en panne, et la **halte 3** de la sonde dit où regarder plutôt que d'élargir ou de
+relâcher la garde.
+
+**Aucun risque de CI rouge au land.** La seule surface CI de ces trois livrables est leurs
+propres tests, qui construisent leurs fixtures (§ 4 : séquences de `DeliveryRecord`
+littérales ; § 8 : `EvalHarness` + `MockLlmProvider` + `MessageSender` scripté, E7). Aucun
+n'est un scan de l'arbre source — contrairement à la garde structurelle de mika#2131 — donc
+aucune donnée du dépôt ne peut les faire rougir. Le contrôle négatif 4095/4096 de mika#2134
+reste vert sans être touché (§ 2).
+
+**L'assertion auto-nettoyante est sans objet, et il faut le dire plutôt que la simuler.** La
+doctrine l'exige *par entrée d'allowlist* ; à liste vide il n'y a aucune entrée à faire périmer
+et aucun ticket de suivi à référencer. Ce qui tient la discipline à sa place est le contrôle
+négatif **AC4 / AC4-bis** (§ 8, D7) : il rougit si le détecteur se met à fire sur un tour
+entièrement livré — c'est-à-dire précisément l'événement qu'une exception aurait masqué.
+
+**Pas de kill-switch, et c'est aligné sur la maison.** Aucun des onze guards EndTurn n'en
+porte : `grep MIKA_ crates/mika-agent/src/evidence/guards.rs` ne rend qu'une fenêtre de temps
+(`MIKA_DEV_REPEAT_ACTION_WINDOW_SECS`, mika#1646) et jamais un désarmement. La sortie de
+secours d'un fire massif est le revert du guard, pas une variable d'environnement : en poser
+une ici donnerait un moyen de rendre muette la seule protection du destinataire, quand la
+**halte 4** de la sonde traite déjà le seul cas où désarmer se justifie — et impose de désarmer
+D5 **et** de réparer D3, jamais de désarmer sans réparer.
+
+---
+
 ## Definition of Done
 
+- **Aucune allowlist, aucune exception, aucun kill-switch ajoutés** : la disposition de
+  § Fire-Disposition est l'option (a) à liste vide, vérifiable par la seule lecture du diff.
 - `ToolOutput.delivery` posé par les **six** sorties de livraison de `send_message` (dont
   `Err(e)` → `Failed`), `None` sur les deux sorties qui ne tentent aucune livraison et partout
   ailleurs, jamais sérialisé vers le LLM, et effacé sur le chemin de replay du dedup (§ 3).
@@ -749,3 +810,27 @@ Correspondance : AC1 → D2 + § 4 (tests unitaires du prédicat) ; AC2 → D4 (
 (`AgentOutput.undelivered_sends`, le constat porté au-delà du tour) ; AC3 → D3 (prédicat sur
 la séquence) + § 8 scénario AC3 ; AC4 → D7 + § 8 scénarios AC4 et AC4-bis ; AC5 → D1 ; AC6 →
 § 8 scénarios AC6-a et AC6-b, dont D9 fixe le mode.
+
+---
+
+## Revision history
+
+- **rev 2 (2026-09-18)** : adressé **F1** (BLOCKING, citation mika#1574 Fire-Disposition Gate)
+  par l'ajout d'une section `## Fire-Disposition` qui énumère les trois livrables de classe
+  détecteur (guard 6f, prédicat `undelivered_sends`, suites de tests § 4 / § 8) et nomme
+  l'option canonique **(a) allowlist nommée, liste vide**, comme le demandait le (b) du
+  finding. La section écrit les quatre points qui font tenir cette disposition plutôt que de
+  l'affirmer : (i) la population préexistante est vide **par construction** — le
+  `Vec<DeliveryRecord>` naît et meurt avec le tour (D7/D8, § 3), donc rien en base, dans
+  l'arbre ou dans les journaux ne peut faire fire le détecteur rétroactivement, ce qui sépare
+  ce cas de l'incident fondateur `verify-bundled-skills` de mika#1574 ; (ii) **l'absence
+  d'exception est un choix explicite**, motivé par E1 (`grep -c "send_message"
+  .../guards.rs` = 0) — l'état d'avant était un comportement non gardé, pas la violation d'une
+  règle existante, donc rien à grandfatherer ; (iii) l'assertion auto-nettoyante qu'exige la
+  doctrine est **sans objet à liste vide**, et c'est le contrôle négatif AC4 / AC4-bis (§ 8,
+  D7) qui tient sa place en rougissant si le détecteur fire sur un tour sain ; (iv) **pas de
+  kill-switch**, aligné sur les onze guards EndTurn existants (aucune variable de désarmement
+  dans `guards.rs`), la sortie de secours restant le revert et la halte 4 de la sonde.
+  Ajout corollaire d'une ligne de *Definition of Done* rendant la disposition vérifiable par
+  lecture du diff. Aucun AC n'a été modifié ni affaibli ; aucune autre section n'a été
+  réécrite.
