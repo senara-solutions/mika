@@ -109,6 +109,74 @@ impl PeriodicScan {
 /// comportement d'avant ; ce qui change est qu'il le **dit** — WARN au lieu de
 /// DEBUG, parce qu'un scan silencieusement inactif se lit comme un scan qui n'a
 /// rien trouvé à faire.
+/// Kill-switch du filet mika#2368.
+pub(crate) const QA_CALLBACK_VERDICT_NET_ENV: &str = "MIKA_QA_CALLBACK_VERDICT_NET";
+
+/// Le filet mika#2368 peut-il poster ? Défaut : **armé**.
+///
+/// Il n'est pas là par prudence de principe. La sonde 2c du plan mika#2355
+/// prescrit « désarmer le filet avant tout diagnostic » si une PR est mergée
+/// sans revue — une prescription qui n'est exécutable que si le levier existe,
+/// et sans redéploiement.
+///
+/// Absence ou valeur vide → armé : le filet est le comportement voulu, pas une
+/// option. Une valeur non reconnue est **dite** et laisse armé — un désarmement
+/// par coquille sur un filet de sûreté serait la panne silencieuse que tout ce
+/// ticket existe pour fermer.
+fn qa_callback_verdict_net_enabled() -> bool {
+    parse_qa_callback_verdict_net(std::env::var(QA_CALLBACK_VERDICT_NET_ENV).ok().as_deref())
+}
+
+/// La moitié pure de [`qa_callback_verdict_net_enabled`].
+///
+/// Séparée de la lecture d'environnement pour être testable sans muter une
+/// variable globale au processus — que les tests d'une même binaire partagent.
+fn parse_qa_callback_verdict_net(raw: Option<&str>) -> bool {
+    let Some(raw) = raw else {
+        return true;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => true,
+        "0" | "false" | "off" | "no" => false,
+        "1" | "true" | "on" | "yes" => true,
+        other => {
+            warn!(
+                event = "qa_callback_verdict_net_invalid",
+                value = %other,
+                "valeur non reconnue pour {QA_CALLBACK_VERDICT_NET_ENV} — le \
+                 filet reste armé"
+            );
+            true
+        }
+    }
+}
+
+/// Lit la cible PR stampée sur une tâche callback (mika#2368 AC6).
+///
+/// Quatre motifs d'abstention, nommés séparément parce qu'ils appellent des
+/// remèdes différents : `no_metadata` (le dispatch n'a rien stampé — voir
+/// `qa_review_pr_target_unresolved` côté producteur), `metadata_unreadable`
+/// (JSON cassé), `no_target_stamp` (metadata présent, clé absente — le cas
+/// nominal d'un callback qui n'est pas un build), `target_unreadable` (la clé
+/// est là, sa valeur ne se relit pas).
+///
+/// `Err` dans les quatre cas, et jamais une cible devinée.
+pub(crate) fn read_qa_review_pr_target(
+    metadata: Option<&str>,
+) -> Result<crate::server::deadline_verdict::PrTarget, &'static str> {
+    use crate::server::deadline_verdict::{PrTarget, QA_REVIEW_PR_TARGET_KEY};
+
+    let raw = metadata
+        .filter(|m| !m.trim().is_empty())
+        .ok_or("no_metadata")?;
+    let parsed: serde_json::Value = serde_json::from_str(raw).map_err(|_| "metadata_unreadable")?;
+    let stamped = parsed
+        .get(QA_REVIEW_PR_TARGET_KEY)
+        .and_then(|v| v.as_str())
+        .ok_or("no_target_stamp")?;
+    PrTarget::from_metadata_value(stamped).ok_or("target_unreadable")
+}
+
 async fn resolve_periodic_scan_token(
     settings: &Settings,
     github_app: Option<&mika_common::github_app::GitHubApp>,
@@ -238,12 +306,15 @@ fn delivery_backoff_secs(base: u64, max: u64, attempts: u32, quarantine_at: u32)
 /// `other` for a failure that is not an LLM failure at all. The four tests
 /// below this function are unchanged by that move, which is what attests the
 /// wire format did not shift.
+///
+/// **mika#2289 moved the adapter too.** A second consumer appeared — the
+/// engine-side `hold[review]` net, which classifies the error that killed a
+/// turn — and it needs the same cause-chain walk and the same `other`. Two
+/// copies of four lines writing into one operator vocabulary is the divergence
+/// this file's own doc comment argues against, so the walk now lives beside the
+/// mapping in `mika-common` and this stays a named call site.
 fn classify_delivery_error(err: &anyhow::Error) -> std::borrow::Cow<'static, str> {
-    use mika_common::llm::error::{LlmError, error_class};
-    use std::borrow::Cow;
-
-    err.downcast_ref::<LlmError>()
-        .map_or(Cow::Borrowed(error_class::OTHER), LlmError::error_class)
+    mika_common::llm::error::classify_anyhow_error(err)
 }
 
 /// Parent statuses from which no dispatch can ever be produced (mika#2169).
@@ -564,6 +635,10 @@ impl TaskDispatcher {
             skills_dirty: &self.skills_dirty,
             settings: Some(&self.settings),
             trace_id: Some(trace_id.clone()),
+            // mika#2368 AC7 — le registre anti-double-post atteint le tour
+            // silencieux. `None` en test (voir `test_dispatcher`), ce qui fait
+            // simplement s'abstenir le filet.
+            pr_reviews_posted: self.pr_reviews_posted.as_ref(),
         };
 
         if let Err(e) = run_silent_agent(&params).await {
@@ -593,6 +668,129 @@ impl TaskDispatcher {
     ///
     /// Returns `Err` with a specific message when the agent is busy so the caller
     /// can re-queue the task instead of losing the callback result.
+    /// Le filet moteur mika#2368 : une PR de la boucle n'est plus jamais muette.
+    ///
+    /// Appelé après qu'un tour de callback a rendu `Ok`, **avant** l'éviction du
+    /// registre anti-double-post. Il ne poste que si le tour a lui-même signalé
+    /// qu'un verdict était dû et n'a pas été posté après le re-prompt de la
+    /// garde `qa_build_callback_verdict` — le prédicat vit dans
+    /// [`crate::qa_build_callback::verdict_unmet_after_retry`], et ce n'est pas
+    /// un hasard qu'il soit ailleurs : le filet n'a rien à re-décider.
+    ///
+    /// # Chemin nominal : silencieux, et gratuit
+    ///
+    /// Un tour qui a posté son verdict — ou qui n'en devait aucun — sort à la
+    /// première ligne. Pas de lecture de metadata, pas de résolution de token,
+    /// pas de ligne de journal. Le filet est strictement additif.
+    ///
+    /// # Il ne rend jamais d'erreur
+    ///
+    /// Aucun échec ici ne fait échouer le tick : un filet qui tombe
+    /// remplacerait un silence par une panne.
+    async fn post_callback_verdict_net(
+        &self,
+        task: &Task,
+        outcome: &crate::agent::SilentTurnOutcome,
+        session_id: &str,
+        trace_id: &str,
+    ) {
+        use crate::server::deadline_verdict::{
+            CALLBACK_VERDICT_EVENT, DeadlineVerdictInput, VerdictReason,
+            maybe_post_deadline_verdict,
+        };
+
+        if !outcome.qa_verdict_unmet {
+            return;
+        }
+
+        if !qa_callback_verdict_net_enabled() {
+            warn!(
+                event = CALLBACK_VERDICT_EVENT,
+                agent_id = %self.db.agent_id(),
+                task_id = %task.id,
+                trace_id = %trace_id,
+                outcome = "disarmed",
+                "un verdict était dû et n'a pas été posté, mais le filet est \
+                 désarmé ({QA_CALLBACK_VERDICT_NET_ENV}=0) — la PR reste muette"
+            );
+            return;
+        }
+
+        // AC6 — la cible est **dite**. Absence, illisibilité ou cible non
+        // résoluble : zéro POST, et une ligne qui nomme l'abstention et son
+        // motif. Le filet ne devine jamais une PR.
+        let target = match read_qa_review_pr_target(task.metadata.as_deref()) {
+            Ok(t) => t,
+            Err(reason) => {
+                warn!(
+                    event = CALLBACK_VERDICT_EVENT,
+                    agent_id = %self.db.agent_id(),
+                    task_id = %task.id,
+                    trace_id = %trace_id,
+                    outcome = reason,
+                    "callback de build QA conclu sans verdict, mais la cible PR \
+                     n'est pas lisible sur la tâche — rien n'a été posté"
+                );
+                return;
+            }
+        };
+
+        // Identité (ADR-008) : PAT d'abord. Poster une review est une opération
+        // dont GitHub lit l'auteur — le verdict doit apparaître sous l'identité
+        // machine de la QA. C'est le convertisseur canonique, le même que le
+        // call-site mika#2276 (`handlers.rs`), et délibérément **pas**
+        // `resolve_periodic_scan_token`, dont le doc-comment exclut en toutes
+        // lettres les chemins qui exigent l'identité machine (revue/merge de PR)
+        // et qui n'est de toute façon pas un scan périodique.
+        let Some(token) = self
+            .settings
+            .resolve_github_token(self.github_app.as_deref())
+            .await
+        else {
+            warn!(
+                event = CALLBACK_VERDICT_EVENT,
+                agent_id = %self.db.agent_id(),
+                task_id = %task.id,
+                trace_id = %trace_id,
+                repo = %target.repo,
+                pr = target.pr_number,
+                outcome = "no_token",
+                "callback de build QA conclu sans verdict mais aucun token GitHub \
+                 résolu — verdict de secours non posté"
+            );
+            return;
+        };
+
+        maybe_post_deadline_verdict(
+            DeadlineVerdictInput {
+                reason: VerdictReason::CallbackConcludedWithoutVerdict,
+                target,
+                session_id,
+                trace_id,
+                agent_id: self.db.agent_id(),
+                pr_reviews_posted: self.pr_reviews_posted.as_deref(),
+            },
+            |request| async move {
+                let pr = request.pr_number.to_string();
+                crate::tools::pr_merge_with_gate::run_gh_subprocess(
+                    &[
+                        "pr",
+                        "review",
+                        &pr,
+                        "--comment",
+                        "--body",
+                        &request.body,
+                        "--repo",
+                        &request.repo,
+                    ],
+                    &token,
+                )
+                .await
+            },
+        )
+        .await;
+    }
+
     pub(crate) async fn dispatch_resume_agent(&self, task: &Task) -> Result<(), DispatchError> {
         let is_callback = task.trigger_type == "callback";
 
@@ -774,36 +972,61 @@ impl TaskDispatcher {
             skills_dirty: &self.skills_dirty,
             settings: Some(&self.settings),
             trace_id: Some(trace_id.clone()),
+            // mika#2368 AC7 — le registre anti-double-post atteint le tour
+            // silencieux. `None` en test (voir `test_dispatcher`), ce qui fait
+            // simplement s'abstenir le filet.
+            pr_reviews_posted: self.pr_reviews_posted.as_ref(),
         };
 
-        if let Err(e) = run_silent_agent(&params).await {
-            warn!(task_id = %task.id, error = %e, "resume_agent run failed");
+        // mika#2368 — le tour rend désormais un `SilentTurnOutcome` (« un verdict
+        // était dû et n'a pas été posté »), que le filet lit plus bas. `None`
+        // porte l'ancien sens de la branche `Err` : le tour a planté, il n'a pas
+        // « conclu », et le signal n'existe que sur la branche `Ok`.
+        let turn_outcome = match run_silent_agent(&params).await {
+            Ok(outcome) => Some(outcome),
+            Err(e) => {
+                warn!(task_id = %task.id, error = %e, "resume_agent run failed");
 
-            // mika#2179 — record the failure and back the row off BEFORE the
-            // re-arm below. Order matters twice over: the re-arm creates a new
-            // `pending` row and returns early on some paths, and this row is
-            // the one that keeps being re-selected every 60s scan. Until this
-            // call existed, the branch wrote a `warn!` and nothing else — no
-            // counter, no audit event, no `next_fire_at` — so callback
-            // `800d739f` re-took the agent lock once a minute for five hours
-            // while its parent died of age waiting for the return.
-            if is_callback {
-                self.record_callback_delivery_failure(task, &e, &session_id, &trace_id)
-                    .await;
-            }
+                // mika#2179 — record the failure and back the row off BEFORE the
+                // re-arm below. Order matters twice over: the re-arm creates a new
+                // `pending` row and returns early on some paths, and this row is
+                // the one that keeps being re-selected every 60s scan. Until this
+                // call existed, the branch wrote a `warn!` and nothing else — no
+                // counter, no audit event, no `next_fire_at` — so callback
+                // `800d739f` re-took the agent lock once a minute for five hours
+                // while its parent died of age waiting for the return.
+                if is_callback {
+                    self.record_callback_delivery_failure(task, &e, &session_id, &trace_id)
+                        .await;
+                }
 
-            // mika#2045 — a deferred wrapper whose turn errored is consumed all
-            // the same: promotion already set it `completed`, so it has left the
-            // pending queue for good. This branch used to do nothing at all — no
-            // mark_delivered, no R9 detection, no event — which is why the
-            // 2026-08-29 09:10-09:51Z occurrence stranded four tasks without a
-            // single `deferred_dispatch_noop_completion` in the log. Re-arm here
-            // too, or the loudest failure mode stays the silent one.
-            if is_callback && task.label == crate::agent::DEFERRED_DISPATCH_LABEL {
-                self.rearm_consumed_deferred_wrapper(task, "silent_turn_error")
-                    .await;
+                // mika#2045 — a deferred wrapper whose turn errored is consumed all
+                // the same: promotion already set it `completed`, so it has left the
+                // pending queue for good. This branch used to do nothing at all — no
+                // mark_delivered, no R9 detection, no event — which is why the
+                // 2026-08-29 09:10-09:51Z occurrence stranded four tasks without a
+                // single `deferred_dispatch_noop_completion` in the log. Re-arm here
+                // too, or the loudest failure mode stays the silent one.
+                if is_callback && task.label == crate::agent::DEFERRED_DISPATCH_LABEL {
+                    self.rearm_consumed_deferred_wrapper(task, "silent_turn_error")
+                        .await;
+                }
+                None
             }
-        } else if is_callback {
+        };
+
+        if let Some(outcome) = turn_outcome
+            && is_callback
+        {
+            // mika#2368 — le filet moteur. Placé ICI, en tête de la branche,
+            // pour deux raisons qui sont l'une et l'autre structurelles :
+            // l'éviction du registre anti-double-post a lieu à la sortie de
+            // cette fonction (`map.remove(&session_id)`), et le verdict doit
+            // partir avant que la tâche ne soit marquée délivrée — la PR ne
+            // doit pas rester muette une seconde de plus que nécessaire.
+            self.post_callback_verdict_net(task, &outcome, &session_id, &trace_id)
+                .await;
+
             // Mark delivered so TUI polling doesn't re-process this callback.
             // Only for callbacks — reminder lifecycle is managed by fire_task().
             match self.db.mark_task_delivered(&task.id).await {
@@ -1180,6 +1403,10 @@ impl TaskDispatcher {
             skills_dirty: &self.skills_dirty,
             settings: Some(&self.settings),
             trace_id: Some(trace_id.clone()),
+            // mika#2368 AC7 — le registre anti-double-post atteint le tour
+            // silencieux. `None` en test (voir `test_dispatcher`), ce qui fait
+            // simplement s'abstenir le filet.
+            pr_reviews_posted: self.pr_reviews_posted.as_ref(),
         };
 
         if let Err(e) = run_silent_agent(&params).await {
@@ -1717,10 +1944,16 @@ impl TaskDispatcher {
             skills_dirty: &self.skills_dirty,
             settings: Some(&self.settings),
             trace_id: Some(trace_id.clone()),
+            // mika#2368 AC7 — le registre anti-double-post atteint le tour
+            // silencieux. `None` en test (voir `test_dispatcher`), ce qui fait
+            // simplement s'abstenir le filet.
+            pr_reviews_posted: self.pr_reviews_posted.as_ref(),
         };
 
         match run_silent_agent(&params).await {
-            Ok(()) => {
+            // mika#2368 : la réflexion n'est pas un callback de build, donc son
+            // `SilentTurnOutcome` n'a rien à dire ici.
+            Ok(_) => {
                 if let Err(e) = self.db.record_reflection_run("completed", 0, None).await {
                     warn!(task_id = %task.id, error = %e, "failed to record reflection run");
                 }
@@ -2482,6 +2715,10 @@ impl TaskDispatcher {
             skills_dirty: &self.skills_dirty,
             settings: Some(&self.settings),
             trace_id: Some(trace_id.clone()),
+            // mika#2368 AC7 — le registre anti-double-post atteint le tour
+            // silencieux. `None` en test (voir `test_dispatcher`), ce qui fait
+            // simplement s'abstenir le filet.
+            pr_reviews_posted: self.pr_reviews_posted.as_ref(),
         };
 
         if let Err(e) = run_silent_agent(&params).await {
@@ -3294,6 +3531,8 @@ async fn try_dispatch_pilot_after_groom_success(
         timeout_secs,
         &system_session,
         &trace_id,
+        // mika#2368 : pas de cible QA à stamper — ce n'est pas un build.
+        None,
     );
     let callback_task_id = match db.create_task(callback_task).await {
         Ok(id) => id,
@@ -3501,6 +3740,88 @@ mod tests {
         async fn send(&self, _text: &str) -> anyhow::Result<SendOutcome> {
             Ok(SendOutcome::Delivered)
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2368 — le filet moteur : lecture de la cible et kill-switch
+    // -----------------------------------------------------------------------
+
+    /// **AC6, T4** — quatre contrôles négatifs **séparés**, un par terme.
+    ///
+    /// Quatre et non un seul : une conjonction de termes fail-safe ne se prouve
+    /// pas en les neutralisant tous à la fois — un test unique passerait sur une
+    /// implémentation qui n'en lit qu'un (la leçon de mika#2277, dont les quatre
+    /// négatifs à un terme sont le gabarit). Chaque motif est nommé
+    /// distinctement parce qu'ils appellent des remèdes différents.
+    #[test]
+    fn mika2368_a_missing_metadata_yields_no_target() {
+        assert_eq!(read_qa_review_pr_target(None), Err("no_metadata"));
+        assert_eq!(read_qa_review_pr_target(Some("")), Err("no_metadata"));
+        assert_eq!(read_qa_review_pr_target(Some("   ")), Err("no_metadata"));
+    }
+
+    #[test]
+    fn mika2368_an_unreadable_metadata_yields_no_target() {
+        assert_eq!(
+            read_qa_review_pr_target(Some("{ pas du json")),
+            Err("metadata_unreadable")
+        );
+    }
+
+    #[test]
+    fn mika2368_a_metadata_without_the_key_yields_no_target() {
+        // Le cas nominal d'un callback qui n'est pas un build : la row porte
+        // d'autres stamps, pas celui-ci.
+        assert_eq!(
+            read_qa_review_pr_target(Some(r#"{"process_start_time":"123"}"#)),
+            Err("no_target_stamp")
+        );
+        // Une valeur non-chaîne n'est pas une cible non plus.
+        assert_eq!(
+            read_qa_review_pr_target(Some(r#"{"qa_review_pr_target":42}"#)),
+            Err("no_target_stamp")
+        );
+    }
+
+    #[test]
+    fn mika2368_an_unparsable_target_yields_no_target() {
+        assert_eq!(
+            read_qa_review_pr_target(Some(r#"{"qa_review_pr_target":"pas-une-pr"}"#)),
+            Err("target_unreadable")
+        );
+    }
+
+    /// Le contrôle positif du lecteur : la forme que le producteur écrit.
+    #[test]
+    fn mika2368_a_stamped_target_is_read_back() {
+        let target = read_qa_review_pr_target(Some(
+            r#"{"qa_review_pr_target":"senara-solutions/mika#2368"}"#,
+        ))
+        .expect("cible lisible");
+        assert_eq!(target.repo, "senara-solutions/mika");
+        assert_eq!(target.pr_number, 2368);
+    }
+
+    /// **T9** — le kill-switch. Armé par défaut ; une valeur non reconnue
+    /// laisse armé, parce qu'un désarmement par coquille sur un filet de sûreté
+    /// serait la panne silencieuse que ce ticket ferme.
+    #[test]
+    fn mika2368_the_kill_switch_defaults_to_armed() {
+        assert!(parse_qa_callback_verdict_net(None), "absence → armé");
+        assert!(parse_qa_callback_verdict_net(Some("")), "vide → armé");
+        for off in ["0", "false", "FALSE", "off", "no", " 0 "] {
+            assert!(
+                !parse_qa_callback_verdict_net(Some(off)),
+                "{off:?} doit désarmer"
+            );
+        }
+        for on in ["1", "true", "on", "yes", "TRUE"] {
+            assert!(parse_qa_callback_verdict_net(Some(on)), "{on:?} doit armer");
+        }
+        assert!(
+            parse_qa_callback_verdict_net(Some("peut-être")),
+            "une valeur non reconnue laisse armé"
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -6330,6 +6651,7 @@ mod tests {
             7200,
             "system-mika",
             "trace-xyz",
+            None,
         );
         let cb_id = db
             .create_task(callback)

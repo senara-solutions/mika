@@ -311,6 +311,7 @@ async fn run_reminder(harness: &EvalHarness, sender: Arc<ScriptedSender>, messag
         skills_dirty: &skills_dirty,
         settings: Some(&harness.settings),
         trace_id: Some(harness.trace_id.clone()),
+        pr_reviews_posted: None,
     };
     run_silent_agent(&params).await.expect("silent turn runs");
 }
