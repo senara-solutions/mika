@@ -662,7 +662,9 @@ Observabilité du budget effectif + garde de demi-configuration (mika#2293) :
   Champs : `agent_id`, `http_timeout_secs`, `agent_total_timeout_secs`,
   `max_attempts`, `effective_max_attempts`, `retry_reachable`,
   `worst_case_failure_secs`, `http_source`, `total_source`,
-  `http_raw`, `total_raw`. **Indépendant de `MIKA_STORE_LLM_CALLS`** : c'est un
+  `http_raw`, `total_raw` — et, depuis mika#2328, la moitié **modèle** :
+  `provider`, `provider_source`, `model`, `model_source`, `model_config_key`.
+  **Indépendant de `MIKA_STORE_LLM_CALLS`** : c'est un
   événement de *configuration*, pas de télémétrie d'appel, et il doit rester
   lisible précisément quand on a coupé la télémétrie pour réduire le bruit.
   Dédupliqué sur le couple résolu — une répétition à l'identique est tue, un
@@ -708,6 +710,35 @@ Observabilité du budget effectif + garde de demi-configuration (mika#2293) :
   plafond qu'on remonte. Cinquième valeur `global_config`, distincte d'`agent_config`
   à dessein : répondre « per-agent » pour une valeur venant du `~/.mika/config.toml`
   partagé répondrait faux à la seule question que l'instrument existe pour trancher.
+- **Le modèle est la moitié manquante, et elle est lue de la même façon (mika#2328).**
+  `llm_budget_resolved` disait quel **couple de timeouts** tourne, jamais quel
+  **modèle**. Or la panne mesurée le 2026-09-15 sur mika-qa vient d'un `glm-5.3`
+  en service pendant que `well_known_agents.rs` n'a **jamais** déclaré autre chose
+  que `zai_model = "glm-5.2"` : une édition **hors dépôt** du `config.toml` de
+  l'agent, que `reconcile_well_known_config` préserve tant que le provisionnement
+  est gelé. `turn_usage` porte bien `provider`/`model`, mais par tour, dans 19 Go
+  de journal, sans provenance. La lecture :
+  ```bash
+  grep llm_budget_resolved "$MIKA_SPIRIT_LOG_FILE" \
+    | jq '{agent_id, provider, model, model_source, model_config_key,
+           http_timeout_secs, agent_total_timeout_secs, http_source, total_source}'
+  ```
+  `model_source` prend les cinq mêmes portes que `http_source` — plus un sixième
+  mot, `unknown_provider`, quand une porte porte un `llm_provider` illisible (état
+  inatteignable en production, `Settings::load_for_agent` refusant le fichier ;
+  répondre `default` y affirmerait « aucune porte ne porte le modèle », ce qui est
+  inconnu et possiblement faux). `model_config_key` nomme la clé qu'un opérateur
+  devrait éditer (`zai_model`, `openrouter_model`, …) : le nom de la clé est
+  **dérivé du provider en vigueur**, jamais codé en dur — une clé fixe rapporterait
+  `default` pour un modèle bel et bien déclaré, c'est-à-dire une provenance fausse.
+  **Sonde post-déploiement, avec sa halte :** au premier démarrage, les quatre
+  agents bien connus doivent produire une ligne portant un `model` non vide. Un
+  `model` de mika-qa ≠ `glm-5.2` **confirme et mesure la dérive** — c'est un
+  résultat, pas une panne : noter la valeur, sa provenance et la date **avant** de
+  corriger le disque. Aucune ligne du tout → ne pas élargir l'émission par réflexe,
+  établir d'abord quel site d'initialisation a servi cet agent (angle mort connu :
+  le chemin per-skill n'émet rien). **Cet événement mesure la dérive ; rien ne
+  l'empêche** — la garde correspondante est le ticket de suivi.
 - **La cascade est reconstruite, pas devinée — et l'ordre est INVERSÉ.** `Settings` a
   déjà fusionné ses sources quand on lit le champ, donc `llm::budget_provenance`
   refait la résolution pour ces deux clés seulement, dans l'ordre réel :
