@@ -117,6 +117,9 @@ mod eval {
     // mika#2347 — le ledger devient décisionnel : cooldown et budget keyés
     // (dépôt, PR, head SHA), plus l'invariant « un tour par agent » épinglé.
     mod test_qa_review_reconcile_2347;
+    // mika#2323 — un `labeled ready` reçu laisse toujours une trace, et cette
+    // trace nomme la porte qui a décidé (il n'y a aucun filtre acteur).
+    mod test_ready_label_attribution_2323;
     mod test_ready_label_blocked_skip;
     mod test_ready_label_grooming_guard;
 

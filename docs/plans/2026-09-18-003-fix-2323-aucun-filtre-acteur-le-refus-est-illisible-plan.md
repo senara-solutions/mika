@@ -318,7 +318,82 @@ le seam existe déjà et sa raison d'être documentée est exactement celle-ci) 
 
 ---
 
-## 6. Definition of Done
+## 6. Fire-Disposition
+
+Trois livrables de §5 sont de classe **détecteur** au sens de mika#1574. Chacun doit
+dire ce qui se passe quand il tire sur du code existant — sinon le contrat de résolution
+est décidé en urgence, par la personne qui voit le test rouge, au pire moment.
+
+### Détecteur 1 — `mika2323_no_gate_predicate_reads_the_actor` (scan de source, R4 / AC5)
+
+**Disposition : (a) allowlist nommée, à zéro entrée, avec assertion autonettoyante.**
+
+**Pourquoi (a) et pas (b) ni (c).** La population de violations préexistantes est **vide
+par construction, et c'est vérifiable avant d'écrire une ligne** : le champ que le
+détecteur interdit de lire n'existe pas encore côté agent — c'est l'axe 2 de ce même plan
+qui l'introduit. M2 l'établit (`event.sender` est désérialisé côté gateway et n'est jamais
+émis ; aucun prédicat côté agent ne peut lire aujourd'hui une identité qu'il ne reçoit
+pas). *(b) Land disabled* livrerait un détecteur inerte pendant précisément la fenêtre où
+le champ qu'il surveille naît — le seul moment où une lecture accidentelle peut être
+introduite. *(c) Halt-and-surface* n'a rien à remonter : il n'y a pas de violation à
+arbitrer.
+
+**Forme.**
+
+```rust
+/// Prédicats autorisés à lire l'identité d'acteur. DOIT RESTER VIDE.
+/// Toute entrée ajoutée ici est une politique de filtrage par identité que
+/// personne n'a décidée (R4 ; explicitement hors périmètre, §9) et exige un
+/// ticket nommé en second membre.
+const ACTOR_READING_PREDICATES_ALLOWED: &[(&str, &str)] = &[]; // (fonction, ticket)
+```
+
+**Périmètre du scan, nommé pour que l'échec soit lisible.** Le test lit
+`crates/mika-agent/src/server/ready_label_handler.rs`, le découpe par fonction, et refuse
+l'apparition de l'identifiant d'acteur dans le corps de toute fonction qui n'est pas un
+site d'émission déclaré (`emit_ready_label_received`, `emit_ready_label_outcome`). Même
+forme heuristique que `mika2205_periodic_scans_do_not_read_the_pat_field_directly`, qui
+scanne le corps de deux fonctions nommées — et pour la même raison : un test comportemental
+ne peut pas voir cette classe, puisqu'une lecture d'acteur ne rendrait aucune décision
+fausse, elle introduirait une politique.
+
+**Ce qui se passe quand il tire.** Le test rougit et nomme la fonction fautive. **La
+résolution par défaut est de retirer la lecture, jamais d'ajouter une entrée.** Ajouter une
+entrée revient à décider une politique de filtrage par identité, c'est-à-dire exactement le
+mécanisme dont ce ticket établit qu'il n'existe pas et que §9 place hors périmètre ; cela
+exige son propre ticket, nommé dans le second membre du couple.
+
+**L'assertion autonettoyante, et pourquoi elle existe à zéro entrée.** Le test refuse
+(i) toute lecture d'acteur hors allowlist **et** (ii) toute entrée d'allowlist qui ne
+correspond plus à une violation réelle. À zéro entrée, (ii) est vraie sans rien vérifier —
+elle est écrite maintenant parce qu'une allowlist qui ne se nettoie pas transforme la
+première entrée en permission permanente que plus personne ne relit, et que le moment
+d'écrire ce garde-fou est avant qu'il y ait quoi que ce soit à garder.
+
+### Détecteur 2 — `mika2323_every_gate_variant_has_a_wire_name`
+
+**Disposition : sans objet — population préexistante structurellement vide.** Ce n'est pas
+un scan mais une exhaustivité de compilation sur `ReadyLabelGate`, un type qui naît dans ce
+ticket : il ne peut tirer que sur une variante ajoutée **après** lui. Le mode d'échec est un
+défaut de compilation dans la PR qui ajoute la variante, et il s'y résout — en nommant la
+porte, ce qui est tout l'objet de R3.
+
+### Détecteur 3 — `mika2323_gate_names_are_a_wire_format`
+
+**Disposition : sans objet à l'introduction ; résolution par défaut = annuler le
+changement.** Il épingle des valeurs nées ici, donc zéro violation préexistante. Quand il
+tire, il tire sur un **renommage** : ces valeurs atterrissent dans
+`audit_events.after_value` et l'opérateur en fait des `GROUP BY` (doctrine mika#2131), donc
+un renommage coupe une population en deux sans le dire. Le changer volontairement exige de
+dater la rupture dans `CLAUDE.md`, jamais de mettre le test à jour en silence.
+
+*(Les tests « un test par porte refusante » de §5 ne sont pas de classe détecteur : ils
+assertent un comportement sur du code que ce ticket écrit, pas un invariant sur du code
+existant.)*
+
+---
+
+## 7. Definition of Done
 
 - [ ] Étape 0 exécutée, ses quatre résultats consignés dans le corps de la PR, et la
       branche retenue (a/b/c) nommée explicitement.
@@ -329,6 +404,8 @@ le seam existe déjà et sa raison d'être documentée est exactement celle-ci) 
 - [ ] `format_event_text` porte l'acteur ; lecture tolérante côté agent ; tests du
       gateway mis à jour. *(Suspendu si étape 0 = branche c.)*
 - [ ] Les six tests unitaires et le test d'intégration passent.
+- [ ] `ACTOR_READING_PREDICATES_ALLOWED` introduite **vide**, avec son assertion
+      autonettoyante et le commentaire qui dit pourquoi elle doit le rester (§6).
 - [ ] `CLAUDE.md` : sous-section portant la réponse au ticket, le geste `remove → add`,
       l'inventaire des quinze sorties, les deux requêtes SQL.
 - [ ] `cargo test`, `cargo clippy`, `cargo fmt --check` verts.
@@ -337,7 +414,7 @@ le seam existe déjà et sa raison d'être documentée est exactement celle-ci) 
 
 ---
 
-## 7. Acceptance criteria
+## 8. Acceptance criteria
 
 *Dérivés des Requirements et du Verification contract — le corps du ticket ne porte pas
 de section `## Acceptance criteria`, mais il pose une question à laquelle AC1 répond
@@ -362,7 +439,8 @@ formellement.*
 - **AC5 — L'acteur est lisible et ne décide de rien.** `ready_label_received` porte
   `actor` quand le gateway le fournit ; un acteur absent ou malformé rend `None` et ne
   change aucune sortie ; un test de scan de source refuse la lecture de l'acteur dans un
-  prédicat de refus.
+  prédicat de refus, et son allowlist (`ACTOR_READING_PREDICATES_ALLOWED`) est livrée
+  **vide**, avec l'assertion autonettoyante décrite en §6.
 - **AC6 — Le geste opérateur est écrit.** `CLAUDE.md` énonce que `--add-label ready` sur
   un ticket portant déjà `ready` n'émet aucun webhook, et que le geste canonique est
   `remove → add`.
@@ -373,7 +451,7 @@ formellement.*
 
 ---
 
-## 8. Hors périmètre, délibérément
+## 9. Hors périmètre, délibérément
 
 - **Le re-arm indû du reaper sur ticket parqué** — mika#2315, que le ticket écarte
   lui-même. Distinct : il dispatche, mais sur les mauvais tickets.
@@ -389,3 +467,35 @@ formellement.*
 - **Les treize autres handlers structuraux** (`ci_failure_handler`, `verdict_handler`,
   `merge_ready_handler`…), qui partagent probablement le même angle mort d'attribution.
   Généraliser demande une mesure par handler ; ce ticket en ferme un, mesuré.
+
+---
+
+## Revision history
+
+- **rev 2 (2026-09-18)** : addressed **F1 (BLOCKING)** en ajoutant la section
+  `## Fire-Disposition` (nouveau §6, sections suivantes renumérotées 6→7, 7→8, 8→9),
+  requise par le Fire-Disposition Gate (mika#1574) dès qu'un plan livre un détecteur.
+  Les trois livrables de classe détecteur de §5 y sont traités séparément plutôt que
+  globalement, parce que leur population préexistante n'est pas de même nature :
+  - `mika2323_no_gate_predicate_reads_the_actor` (le détecteur visé par F1) →
+    **option (a), allowlist nommée à zéro entrée**, avec assertion autonettoyante,
+    périmètre de scan nommé, et la règle de résolution écrite (**retirer la lecture**,
+    jamais ajouter une entrée — une entrée serait la politique de filtrage par identité
+    que §9 place hors périmètre). Le choix de (a) sur (b)/(c) est justifié par M2 : le
+    champ surveillé n'existe pas encore côté agent, donc la population préexistante est
+    vide *par construction et vérifiable avant implémentation* ; « land disabled »
+    livrerait un détecteur inerte pendant la fenêtre exacte où le champ naît.
+  - `mika2323_every_gate_variant_has_a_wire_name` → **sans objet** (exhaustivité de
+    compilation sur un type né dans ce ticket ; ne peut tirer que sur une variante
+    ultérieure, et se résout dans la PR qui l'ajoute).
+  - `mika2323_gate_names_are_a_wire_format` → **sans objet à l'introduction**, résolution
+    par défaut = annuler le renommage (format de fil, doctrine mika#2131).
+
+  Conséquences hors de la nouvelle section : une ligne de Definition of Done sur la
+  livraison de `ACTOR_READING_PREDICATES_ALLOWED` vide, et **AC5 renforcé** (l'allowlist
+  vide et l'assertion autonettoyante deviennent exigibles). Aucun AC affaibli, aucun
+  requirement modifié, aucun changement de périmètre.
+
+  R2 (conditionnalité de l'axe 2) et R3/R4 (gates PASS) n'appelaient aucune action —
+  R2 est explicitement marqué non bloquant et conclut que « le plan reste cohérent malgré
+  la conditionnalité ».
