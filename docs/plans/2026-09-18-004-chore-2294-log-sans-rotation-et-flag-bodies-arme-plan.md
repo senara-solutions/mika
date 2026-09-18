@@ -114,14 +114,18 @@ Il vient donc de `~/.mika/.env`, que le script OpenRC source (`set -a ; . /home/
 
 ### E5 — Le vrai défaut structurel : `Rotation: None`, et c'est documenté
 
-`docs/runtime-structure.md:239-247` :
+`docs/runtime-structure.md:240-247` — **six** lignes, pas quatre ; le gateway en porte
+deux comme le serveur, et c'est ce qui donne son compte à A3 (« les quatre lignes `None` »)
+et à C2 (« les lignes CLI **et** team mode ») :
 
 | Binary | Location | Format | Rotation |
 |--------|----------|--------|----------|
 | `mika` (CLI) | `{agent_home}/logs/mika.log` | JSON | Daily (tracing_appender) |
+| `mika` (team mode) | `{team_dir}/logs/mika.log` | JSON | Daily |
 | `mika-spirit` | stdout — **only when no log file is set** | JSON | **None** |
 | `mika-spirit` | `$MIKA_SPIRIT_LOG_FILE` (optional) | JSON | **None** |
-| `mika-gateway` | (idem) | JSON | **None** |
+| `mika-gateway` | stdout — **only when no log file is set** | JSON | **None** |
+| `mika-gateway` | `$MIKA_GATEWAY_LOG_FILE` (optional) | JSON | **None** |
 
 Et dans le code, le nom de la fonction le dit : `tracing_appender::rolling::**never**`
 (`logging.rs:393` et `:427`), contre `rolling::daily` pour le sink par-agent (`:517`,
@@ -367,6 +371,40 @@ du `conf.d` pour rendre le journal au collecteur — ce qui touche l'invariant m
 toutes les sondes qui lisent un fichier). Voir D6 : c'est un suivi, et la Definition of Done
 ci-dessous est bornée en conséquence plutôt que d'annoncer un défaut clos partout.
 
+### E11 — La politique de rotation est écrite sur **deux** surfaces documentaires, et `docs-sync` n'en garde qu'une
+
+Les versions précédentes de ce plan ont traité `docs/runtime-structure.md` comme la seule
+doc portant la rotation, et A5 comme le seul risque de divergence. Il y en a une seconde,
+et elle échappe à la garde :
+
+```
+crates/mika-agent/CLAUDE.md:1799-1802   § Log Sinks — colonne « Rotation »
+  | **Server log**        | … | None — single file via `tracing_appender::rolling::never` |
+  | **Per-agent CLI log** | … | Daily via `tracing_appender::rolling::daily`              |
+```
+
+Ce tableau affirme exactement ce que les volets A et C rendent faux. Or
+**`crates/mika-agent/CLAUDE.md` n'est pas dans `scripts/sync-agent-docs.sh`** : sa liste
+`DOCS=()` (lignes 13-23) énumère neuf fichiers de `docs/`, et ce `CLAUDE.md` n'en fait pas
+partie — il n'est la copie de rien, c'est une source autonome. Le job CI `docs-sync`
+(V9/A5) ne peut donc pas le voir.
+
+Trois conséquences, dans l'ordre de gravité :
+
+1. **A3 et C2 corrigés sans lui laissent le dépôt affirmant deux politiques contradictoires** —
+   ce qui est précisément ce qu'AC6 interdit, et dans le sens le plus coûteux : la ligne
+   `None — single file via rolling::never` resterait exacte *sur le code* tout en étant fausse
+   *sur le comportement*, puisque la rotation viendrait désormais de logrotate, hors du code.
+2. **C'est la surface la plus lue — par l'agent lui-même.** Claude Code charge le `CLAUDE.md`
+   du répertoire courant : quiconque travaille dans `crates/mika-agent/` reçoit ce tableau
+   en contexte, et pas `docs/runtime-structure.md`.
+3. **Aucune garde ne rougit sur l'oubli.** Contrairement à A5, où `docs-sync` est un filet
+   préexistant, ici l'oubli est silencieux — la classe de panne que ce plan nomme partout
+   ailleurs.
+
+Le geste est une ligne de tableau et une phrase ; ce qui manquait n'était pas l'effort mais
+le fait de savoir que ce fichier existe. D'où A3b, et la ligne correspondante en DoD.
+
 ---
 
 ## Décisions
@@ -495,6 +533,11 @@ grep flags /proc/$pid/fdinfo/<fd>
 # Q4 — où le gateway écrit-il réellement ? (décide le glob gateway de A1)
 ls -l /var/log/mika-gateway/ /var/log/mika/ 2>&1
 tr '\0' '\n' < /proc/$(pgrep -f mika-gateway)/environ | grep MIKA_GATEWAY_LOG_FILE
+#   variable PRÉSENTE => ce chemin est le journal ; le porter au glob
+#   variable ABSENTE  => `gateway_log_file` est un Option sans défaut (settings.rs:74) :
+#                        AUCUN fichier n'est ouvert. Le journal est là où le launcher
+#                        redirige — lire `output_log` dans l'init script, et porter CE
+#                        chemin. Ne pas conclure du répertoire vide que le chemin diffère.
 
 # Q5 — quel déploiement est devant moi ? (E9 : il y en a TROIS)
 stat -c %U /proc/$pid                    # samidarko => gentux ; mika => Debian ou mika-os
@@ -598,6 +641,24 @@ Notes de conception, à porter en commentaire dans le fichier :
   **constater** à l'installation (Q4 du volet 0) plutôt qu'à déduire de la documentation :
   le corriger dans le fichier est alors une ligne.
 
+  **Et il y a une quatrième lecture, qui n'est pas un chemin : _aucun fichier_.**
+  `gateway_log_file` est un `Option<String>` **sans valeur par défaut**
+  (`crates/mika-gateway/src/settings.rs:74`, consommé en `.as_deref()` à
+  `main.rs:64`). Variable non posée ⇒ le gateway n'ouvre **aucun** fichier : il écrit sur
+  stdout, et ce que le launcher en fait n'est plus décidé par une variable Mika mais par
+  la redirection de l'init script. C'est le cas du déploiement versionné — `conf.d/mika-gateway`
+  pose la variable en **commentaire**, tandis que `init.d/mika-gateway` redirige bel et bien
+  `output_log`/`error_log`.
+
+  Conséquence sur la lecture de Q4 : constater qu'aucun `/var/log/mika-gateway/*.log`
+  n'existe **ne prouve pas** que le chemin est ailleurs — cela peut vouloir dire qu'aucun
+  fichier n'est configuré et que le journal gateway vit là où le launcher l'a redirigé. Les
+  deux se distinguent par `tr '\0' '\n' < /proc/<pid>/environ | grep MIKA_GATEWAY_LOG_FILE`
+  (déjà en Q4) : variable **absente** ⇒ lire `output_log` dans l'init script, et c'est *ce*
+  chemin-là qu'il faut porter au glob. Sans cette distinction, on ajoute un glob sur un
+  chemin qui n'existera jamais et `missingok` rend l'erreur muette — la même classe de
+  panne que E9.
+
 **A2.** `packaging/debian/mika-spirit.postinst` : installer le fichier **tel quel** sous
 `/etc/logrotate.d/mika`, après la création de `/var/log/mika` (ligne 16). Pas de variante,
 pas de réécriture de `su` — c'est ce que E9b rend impossible et que A1 a supprimé.
@@ -624,6 +685,18 @@ troque `None` — qui est vrai — contre une rotation qui n'a pas lieu dans l'i
 est pire. Formulation attendue : la politique s'applique aux installations disposant d'un
 logrotate système ; **dans les images `os/Dockerfile` elle ne s'exécute pas** (ni binaire
 ni cron), et le journal y reste non borné — avec le renvoi au ticket de suivi de D6.
+
+**A3b. `crates/mika-agent/CLAUDE.md` § *Log Sinks* — la seconde surface, que `docs-sync`
+ne voit pas** (E11). La colonne `Rotation` de ses deux lignes (`:1801`, `:1802`) doit dire
+la même chose qu'A3 et C2, avec la distinction qui compte : la rotation du **server log**
+ne vient pas du code (`rolling::never` est inchangé — V5/V7 l'exigent) mais de logrotate,
+donc la cellule dit *« `rolling::never` côté code ; rotation par `/etc/logrotate.d/mika`
+là où elle est installée — non exécutée dans les images `os/` (E10) »*. La ligne per-agent
+passe à *« Daily, 14 jours retenus »* avec le volet C.
+
+À faire dans le **même commit** qu'A3/C2. Ce fichier n'est la copie d'aucun autre : ne pas
+le passer à `sync-agent-docs.sh`, qui l'ignore (et dont la liste n'a pas à s'allonger —
+l'élargir ferait de ce `CLAUDE.md` une copie générée, ce qu'il n'est pas).
 
 **A4.** `docs/configuration.md`, entrée `spirit_log_file` : ajouter la même mention
 (c'est la page qu'un opérateur lit quand il pose la variable).
@@ -730,15 +803,18 @@ part dans son propre ticket sans rien retirer aux volets A et B.
 | V6 | La rétention par-agent borne bien | Test sur `Builder::max_log_files` : au-delà de N fichiers, les plus anciens disparaissent. Test d'intégration avec un `tempdir`, pas un test de source |
 | V7 | Aucune sonde opérateur ne change de chemin | Test de source : `MIKA_SPIRIT_LOG_FILE` et `/var/log/mika/server.log` restent les seules cibles documentées ; aucun `rolling::daily` n'apparaît dans `init` (le constructeur serveur). Cette garde existe parce que la régression serait **muette** — des dizaines de `grep` rendraient zéro ligne, ce qui se lit comme régime nominal |
 | V8 | La mesure du volet 0 est reproductible | Les commandes du volet 0 sont copiables telles quelles dans le corps de PR et dans `docs/runtime-structure.md` |
-| V9 | Les copies crate-local des docs sont à jour | Le job CI `docs-sync` (`ci.yml:147`) rejoue `scripts/sync-agent-docs.sh` et rougit sur toute divergence. Rien à écrire : la garde existe. A5 est l'étape qui la satisfait |
+| V9 | Les copies crate-local des docs sont à jour | Le job CI `docs-sync` (`ci.yml:156`) rejoue `scripts/sync-agent-docs.sh` et rougit sur toute divergence. Rien à écrire : la garde existe. A5 est l'étape qui la satisfait |
+| V11 | Les **deux** surfaces documentaires disent la même politique | Relecture, **pas** de garde automatique — et c'est un choix, pas un oubli. `crates/mika-agent/CLAUDE.md` n'est dans aucune liste de synchronisation (E11) ; l'y ajouter en ferait une copie générée, ce qu'il n'est pas, et écraserait ses 60 lignes de prose qui n'existent nulle part ailleurs. Un garde textuel comparant deux tableaux de formats différents serait fragile pour une divergence qui ne se produit qu'aux rares PR touchant la rotation. La contre-mesure est donc A3b dans le **même commit** qu'A3/C2, plus cette ligne pour que l'oubli soit une omission constatable en revue plutôt qu'un angle mort |
 
 ---
 
 ## Fire-Disposition
 
 - **Portée :** packaging (nouveau fichier + `postinst`), un garde CI (`check-*` +
-  `test-check-*` + job), documentation (trois fichiers, plus leurs deux copies crate-local
-  régénérées par A5), un changement de code borné (volet C, deux lignes + tests), un ajout
+  `test-check-*` + job), documentation (**quatre** fichiers — `runtime-structure.md`,
+  `configuration.md`, `.env.example` et `crates/mika-agent/CLAUDE.md`, ce dernier hors
+  portée de `docs-sync`, E11 — plus les deux copies crate-local régénérées par A5), un
+  changement de code borné (volet C, deux lignes + tests), un ajout
   facultatif au CLI (volet B4). Aucun changement au chemin d'exécution de l'agent, aucun
   changement au filtre de log, aucune nouvelle variable d'environnement, **aucune
   modification de `os/Dockerfile`** (D6).
@@ -773,6 +849,10 @@ part dans son propre ticket sans rien retirer aux volets A et B.
 - `packaging/debian/mika-spirit.postinst` l'installe pour le paquet Debian.
 - `docs/runtime-structure.md` ne dit plus `Rotation: None` sans dire ce qu'il faut faire
   pour que ce soit faux.
+- **`crates/mika-agent/CLAUDE.md` § *Log Sinks* dit la même chose** (A3b/E11), dans le même
+  commit. C'est la seconde surface portant la politique, et la seule que le job `docs-sync`
+  ne peut pas garder — l'oublier laisserait le dépôt affirmer deux politiques contradictoires,
+  sur la surface que Claude Code charge quand on travaille dans ce crate.
 - `docs/configuration.md` et `.env.example` disent que `MIKA_LOG_LLM_BODIES` est à
   retirer après usage, comment constater qu'il est armé, et qu'un redémarrage est requis.
 - Le volet 0 a été exécuté et sa branche est consignée dans le corps de la PR — y compris
@@ -810,10 +890,13 @@ dérivés de son §Fix et du contrat de vérification.
 - **AC5 — Le geste de désarmement est documenté et exécuté si la mesure le justifie.**
   Ligne retirée de `~/.mika/.env`, service redémarré, extinction constatée (B1).
 - **AC6 — La documentation ne laisse plus croire à une rotation qui n'existe pas.**
-  `docs/runtime-structure.md` et `docs/configuration.md` à jour — **dans les deux sens** :
-  ni « `None` » là où la politique s'applique, ni « rotation » là où elle ne s'exécute pas
-  (E10). C'est la même exigence que celle qui a fait écarter `rolling::daily` en D2 :
-  l'instrument ne doit pas annoncer un état qu'il n'a pas.
+  `docs/runtime-structure.md`, `docs/configuration.md` **et `crates/mika-agent/CLAUDE.md`
+  § *Log Sinks*** à jour — **dans les deux sens** : ni « `None` » là où la politique
+  s'applique, ni « rotation » là où elle ne s'exécute pas (E10). C'est la même exigence que
+  celle qui a fait écarter `rolling::daily` en D2 : l'instrument ne doit pas annoncer un
+  état qu'il n'a pas. La troisième surface est nommée explicitement parce qu'elle est la
+  seule que `docs-sync` ne garde pas (E11) : y satisfaire est une relecture, pas une CI
+  verte.
 - **AC7 — Le trou du déploiement conteneur est constaté, écrit et tracé.** E9/E10 figurent
   au plan, la restriction figure dans `runtime-structure.md`, et un ticket de suivi est
   ouvert avec les deux mesures en main (`grep` logrotate/cron vide dans `os/`, et
