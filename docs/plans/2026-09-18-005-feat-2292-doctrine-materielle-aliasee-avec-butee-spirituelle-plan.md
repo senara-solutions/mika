@@ -130,7 +130,8 @@ avec sa question de vérification écrite.
 
 ### F6 — La formulation ne doit pas faire firer la garde 5d sur son propre remède
 
-`CLAIM_CONDITIONAL_MARKERS` (`guards.rs:844-872`) est **délibérément étroit** :
+`CLAIM_CONDITIONAL_MARKERS` (`crates/mika-agent/src/evidence/guards.rs:844-872`
+— le module est sous `evidence/`, pas sous `agent_loop/`) est **délibérément étroit** :
 les fragments exacts du remède de mika#2290, pas une liste modale générale. Toute
 phrase du corps de doctrine qui parle de localité doit donc porter un de ces
 marqueurs (`self-host`, `auto-héberg`, `can be run`, …) ou n'en pas parler du
@@ -381,7 +382,7 @@ et la sonde post-déploiement avec ses haltes.
 | **V1** | la section est rendue dans les deux builders, dans les deux registres | 4 assertions `contains(MIKA_DOCTRINE_HEADING)` |
 | **V2** | le carve-out compact tient | `build_compact_system_prompt` ne contient pas l'en-tête |
 | **V3** | **aucun référent spirituel n'est nommé** — scan des deux constantes contre une liste de référents interdits | test dédié, `assert!(!body.to_lowercase().contains(r))` pour chaque `r` |
-| **V4** | aucun des deux corps ne fait firer la garde 5d | `detect_false_local_hosting_claim(body, Deployment::Cloud).is_none()` sur les deux |
+| **V4** | aucun des deux corps ne fait firer la garde 5d | `crate::evidence::guards::detect_false_local_hosting_claim(body, Deployment::Cloud).is_none()` sur les deux — le prédicat est `pub(crate)`, donc appelable depuis `prompt.rs::tests` sans élargir sa visibilité |
 | **V5** | le corps famille ne porte aucun jargon d'infrastructure | modèle `mika2290_family_cloud_line_carries_no_infrastructure_jargon` |
 | **V6** | le corps famille n'établit aucun référent créateur (D4) | scan de la constante |
 | **V7** | « exportable » n'est revendiqué dans aucun des deux corps (F5) | scan des deux constantes |
