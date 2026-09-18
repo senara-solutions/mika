@@ -81,6 +81,9 @@ mod eval {
     mod test_dispatch_task_has_open_pr_guard;
     mod test_error_handling;
 
+    // mika#2289 AC1 — la porte : `tour mort sur erreur LLM ⇒ verdict posté`.
+    // Frère de `test_deadline_verdict_2276`, sur la branche `Err` de `run_agent`.
+    mod test_error_verdict_2289;
     // mika#1784 — une image non lue est un fait dit. Les unités de
     // `image_disposition` ne verraient pas un `decide()` appelé au mauvais moment
     // dans la boucle ; ces tests lisent ce que le modèle a reçu.

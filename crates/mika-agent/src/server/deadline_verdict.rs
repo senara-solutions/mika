@@ -66,6 +66,37 @@
 //! `posted` du motif neuf se lirait comme une régression de l'ancien. Même
 //! principe que `phantom_aged_out` / `phantom_sweep_spared` (mika#2156) ou
 //! `auto_pull_no_token` / `wip_rescue_no_token` (mika#2205).
+//!
+//! # La troisième façon de mourir (mika#2289)
+//!
+//! Le filet webhook n'a jamais vu qu'une branche : celle où `run_agent` rend
+//! `Ok`. Quand le tour meurt sur une **erreur** du loop — la chaîne de retry
+//! transport épuisée, un provider absent, une réponse impossible à parser —
+//! `run_agent` rend `Err`, il n'existe aucun `AgentOutput`, et le call-site se
+//! contentait d'un `error!` et d'un message de secours sur le canal de réponse.
+//! Mot pour mot le symptôme de mika#2276 : **canal notifié, PR muette.**
+//!
+//! Troisième motif, donc : [`VerdictReason::TurnFailed`]. L'entrée du call-site
+//! webhook passe de « le tour a-t-il dépassé sa deadline ? » à « le tour
+//! a-t-il conclu ? » ([`TurnConclusion`]).
+//!
+//! **Le filet fire sur TOUTE erreur, pas seulement sur la classe transport**
+//! (D4). La classe est *reportée* — dans le corps du verdict et dans le champ
+//! `error_class` du journal — mais elle n'est pas une condition. `hold[review]`
+//! veut dire *« ce tour n'a pas conclu, un humain regarde »*, un sens qui ne
+//! dépend pas de la cause ; et restreindre au transport créerait une **seconde
+//! population muette** (parse, provider, configuration) indiscernable de la
+//! première depuis l'extérieur.
+//!
+//! **Nom d'événement :** le motif écrit [`DEADLINE_VERDICT_EVENT`] avec
+//! `cause = "error"` (voir [`CAUSE_ERROR`]) — décision de mika#2289, prise avant
+//! la séparation des noms par mika#2368. Les deux populations restent comptables
+//! séparément par le champ `cause` ; une ligne deadline ne porte pas de `cause`
+//! (AC5c de mika#2368 la fige à l'identique).
+//!
+//! **Coût assumé (D5) :** une review postée par `mika-platform-qa` sort la PR de
+//! la population du réconciliateur mika#2334 pour de bon. Le filet remplace donc
+//! un rattrapage partiel et différé par une notification immédiate.
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -111,6 +142,52 @@ pub const CALLBACK_VERDICT_EVENT: &str = "qa_callback_verdict";
 /// résoluble ⇒ zéro POST et une ligne nommant l'abstention (AC6).
 pub const QA_REVIEW_PR_TARGET_KEY: &str = "qa_review_pr_target";
 
+/// Valeur du champ `cause` de [`DEADLINE_VERDICT_EVENT`] quand le tour est mort
+/// sur une erreur du loop (mika#2289). **Format de fil** : l'opérateur en fait
+/// des `GROUP BY` — confondre « la QA n'a pas eu le temps » et « la QA est
+/// morte » ferait disparaître le signal que mika#2276 a construit.
+pub const CAUSE_ERROR: &str = "error";
+
+/// Comment un tour webhook s'est terminé, du point de vue du filet (mika#2289 D3).
+///
+/// Remplace le `Option<DeadlineOverrun>` de mika#2276 à l'entrée de
+/// [`deadline_verdict_target`] : avec une troisième façon de mourir, `None`
+/// voudrait dire à la fois « a conclu » et « n'a pas dépassé sa deadline, mais
+/// est peut-être mort autrement ».
+///
+/// Consommé par un `match` **sans bras `_`** : une quatrième façon de mourir
+/// devra *décider* au lieu de tomber dans un silence par défaut.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnConclusion {
+    /// Le tour a produit une réponse dans son enveloppe. Le filet ne s'applique
+    /// pas — chemin nominal, aucune résolution de token, aucun log.
+    Concluded,
+    /// Le tour a été coupé par son enveloppe sans rédiger de verdict
+    /// (mika#2276). `steps_completed` vient de
+    /// [`crate::agent_loop::DeadlineOverrun`].
+    DeadlineExceeded { steps_completed: usize },
+    /// `run_agent` a rendu `Err` : le tour est mort (mika#2289).
+    ///
+    /// `error_class` est le vocabulaire de fil de
+    /// `mika_common::llm::error::error_class`, lu depuis la *variante* de
+    /// `LlmError` via `downcast_ref` — jamais un `contains()` sur le message
+    /// rendu. `detail` est le message d'erreur, tronqué par le call-site.
+    Failed { error_class: String, detail: String },
+}
+
+impl From<Option<crate::agent_loop::DeadlineOverrun>> for TurnConclusion {
+    /// La traduction d'un `AgentOutput` : un tour qui a rendu `Ok` a conclu ou
+    /// a été coupé — il n'est pas mort.
+    fn from(overrun: Option<crate::agent_loop::DeadlineOverrun>) -> Self {
+        match overrun {
+            None => Self::Concluded,
+            Some(o) => Self::DeadlineExceeded {
+                steps_completed: o.steps_completed,
+            },
+        }
+    }
+}
+
 /// La PR qu'un tour était en train de traiter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrTarget {
@@ -154,6 +231,9 @@ pub enum VerdictReason {
     /// mika#2368 — le tour de callback de build QA a conclu sans poster de
     /// verdict, re-prompt de la garde `qa_build_callback_verdict` compris.
     CallbackConcludedWithoutVerdict,
+    /// mika#2289 — le tour webhook est mort sur une erreur du loop (`run_agent`
+    /// a rendu `Err`). `error_class` est reportée, jamais une condition (D4).
+    TurnFailed { error_class: String, detail: String },
 }
 
 impl VerdictReason {
@@ -163,6 +243,8 @@ impl VerdictReason {
         match self {
             Self::CutOffByDeadline(_) => DEADLINE_VERDICT_EVENT,
             Self::CallbackConcludedWithoutVerdict => CALLBACK_VERDICT_EVENT,
+            // mika#2289 : même nom que le motif deadline, distingué par `cause`.
+            Self::TurnFailed { .. } => DEADLINE_VERDICT_EVENT,
         }
     }
 }
@@ -261,15 +343,32 @@ pub fn parse_pr_target(text: &str) -> Option<PrTarget> {
 ///
 /// Le call-site l'appelle **avant** de résoudre un token : sur le chemin nominal
 /// (tour conclu, ou tour non-PR) rien n'est payé, rien n'est journalisé.
+///
+/// Depuis mika#2289 l'entrée est une [`TurnConclusion`] : un tour **mort** sur
+/// une erreur du loop appelle le filet au même titre qu'un tour coupé.
 pub fn deadline_verdict_target(
-    deadline_exceeded: Option<crate::agent_loop::DeadlineOverrun>,
+    conclusion: TurnConclusion,
     event_text: &str,
 ) -> Option<(VerdictReason, PrTarget)> {
-    let overrun = deadline_exceeded?;
+    // `match` exhaustif, sans bras générique, à dessein (mika#2289 D3).
+    let reason = match conclusion {
+        TurnConclusion::Concluded => return None,
+        TurnConclusion::DeadlineExceeded { steps_completed } => {
+            VerdictReason::CutOffByDeadline(crate::agent_loop::DeadlineOverrun { steps_completed })
+        }
+        TurnConclusion::Failed {
+            error_class,
+            detail,
+        } => VerdictReason::TurnFailed {
+            error_class,
+            detail,
+        },
+    };
     // Un tour Telegram, un heartbeat ou un événement non-PR peut dépasser sa
-    // deadline : il n'y a alors rien sur quoi poster, et ce n'est pas un défaut.
+    // deadline ou mourir : il n'y a alors rien sur quoi poster, et ce n'est pas
+    // un défaut.
     let target = parse_pr_target(event_text)?;
-    Some((VerdictReason::CutOffByDeadline(overrun), target))
+    Some((reason, target))
 }
 
 /// Le registre anti-double-post porte-t-il déjà une review pour cette PR ?
@@ -354,6 +453,32 @@ fn build_verdict_body(reason: &VerdictReason, trace_id: &str) -> String {
              `{CALLBACK_VERDICT_EVENT}` dans `$MIKA_SPIRIT_LOG_FILE`.\n\
              \n\
              <sub>mika#2368</sub>"
+        ),
+        VerdictReason::TurnFailed {
+            error_class,
+            detail,
+        } => format!(
+            "{DEADLINE_VERDICT_LINE}\n\
+             \n\
+             Ce verdict est posté par le moteur, pas par le tour de revue.\n\
+             \n\
+             Le tour de revue QA est mort avant d'avoir rédigé un verdict : le moteur \
+             a rendu une erreur de classe `{error_class}`.\n\
+             \n\
+             ```\n{detail}\n```\n\
+             \n\
+             Aucune conclusion de revue n'a été produite — ce `hold[review]` ne dit rien \
+             du contenu de la PR, seulement que la revue n'a pas abouti.\n\
+             \n\
+             Relancer la revue (retirer puis remettre le reviewer) suffit quand la cause \
+             est transitoire — un `transport_timeout` en est une. Si la classe est \
+             `provider`, `parse` ou `unsupported`, ou si l'échec se répète sur cette PR, \
+             la panne est en amont du tour : la relance ne la traversera pas.\n\
+             \n\
+             Trace : `{trace_id}` — chercher `{DEADLINE_VERDICT_EVENT}` dans \
+             `$MIKA_SPIRIT_LOG_FILE`.\n\
+             \n\
+             <sub>mika#2289</sub>"
         ),
     }
 }
@@ -475,6 +600,18 @@ where
                     "callback de build QA conclu sans verdict — verdict hold[review] \
                      posté par le moteur"
                 ),
+                VerdictReason::TurnFailed { error_class, .. } => warn!(
+                    event,
+                    agent_id = %input.agent_id,
+                    trace_id = %input.trace_id,
+                    repo = %target.repo,
+                    pr = target.pr_number,
+                    cause = CAUSE_ERROR,
+                    error_class = %error_class,
+                    outcome = "posted",
+                    "tour de revue mort sur une erreur du loop — verdict hold[review] \
+                     posté par le moteur"
+                ),
             }
             DeadlineVerdictOutcome::Posted
         }
@@ -532,6 +669,22 @@ mod tests {
     /// jamais écrite à la main, pour que le test casse si la grammaire bouge.
     fn requested_target() -> PrTarget {
         parse_pr_target(REVIEW_REQUESTED).expect("PR target")
+    }
+
+    /// Le tour est mort sur une erreur de transport — la forme mesurée de
+    /// mika#2289 (PR #2288, timeout OpenRouter).
+    fn died(class: &str) -> TurnConclusion {
+        TurnConclusion::Failed {
+            error_class: class.to_string(),
+            detail: "failed to read response body: operation timed out".to_string(),
+        }
+    }
+
+    /// Ce que le call-site webhook passe au filet pour un tour mort.
+    fn died_reason(class: &str) -> VerdictReason {
+        deadline_verdict_target(died(class), REVIEW_REQUESTED)
+            .expect("un tour mort sur une PR appelle le filet")
+            .0
     }
 
     #[test]
@@ -766,7 +919,7 @@ mod tests {
     #[test]
     fn a_completed_turn_never_reaches_the_net() {
         assert!(
-            deadline_verdict_target(None, REVIEW_REQUESTED).is_none(),
+            deadline_verdict_target(TurnConclusion::Concluded, REVIEW_REQUESTED).is_none(),
             "un tour conclu ne doit produire aucun motif deadline"
         );
     }
@@ -776,7 +929,8 @@ mod tests {
     #[test]
     fn a_non_pr_deadline_overrun_never_reaches_the_net() {
         assert!(
-            deadline_verdict_target(overrun(9), "Salut, tu peux me résumer ma semaine ?").is_none()
+            deadline_verdict_target(overrun(9).into(), "Salut, tu peux me résumer ma semaine ?")
+                .is_none()
         );
     }
 
@@ -785,7 +939,7 @@ mod tests {
     #[test]
     fn a_cut_off_pr_turn_produces_the_deadline_reason_and_its_target() {
         let (reason, target) =
-            deadline_verdict_target(overrun(5), REVIEW_REQUESTED).expect("motif + cible");
+            deadline_verdict_target(overrun(5).into(), REVIEW_REQUESTED).expect("motif + cible");
         assert_eq!(reason, cut_off(5));
         assert_eq!(reason.event_name(), DEADLINE_VERDICT_EVENT);
         assert_eq!(target, requested_target());
@@ -1133,5 +1287,109 @@ mod tests {
                 writers[0]
             );
         }
+    }
+
+    /// mika#2289 AC1 — un tour mort sur une erreur LLM poste un verdict, et le
+    /// corps nomme la classe et le détail.
+    #[tokio::test]
+    async fn mika2289_a_turn_that_died_on_an_llm_error_posts_a_verdict() {
+        let registry: DashMap<String, HashSet<String>> = DashMap::new();
+        let captured = Arc::new(std::sync::Mutex::new(None::<PostReviewRequest>));
+        let sink = captured.clone();
+        let outcome = maybe_post_deadline_verdict(
+            DeadlineVerdictInput {
+                reason: died_reason("transport_timeout"),
+                target: requested_target(),
+                session_id: "qa-session",
+                trace_id: "trace-2289",
+                agent_id: "mika-qa",
+                pr_reviews_posted: Some(&registry),
+            },
+            move |req| {
+                *sink.lock().unwrap() = Some(req);
+                async { Ok(String::new()) }
+            },
+        )
+        .await;
+
+        assert_eq!(outcome, DeadlineVerdictOutcome::Posted);
+        let req = captured.lock().unwrap().clone().expect("un POST");
+        assert_eq!(req.repo, "senara-solutions/mika");
+        assert_eq!(req.pr_number, 2275);
+        assert!(req.body.starts_with(DEADLINE_VERDICT_LINE), "{}", req.body);
+        assert!(req.body.contains("`transport_timeout`"), "{}", req.body);
+        assert!(req.body.contains("operation timed out"), "{}", req.body);
+        assert!(req.body.contains("trace-2289"), "{}", req.body);
+        assert!(req.body.contains("mika#2289"), "{}", req.body);
+        assert!(
+            !req.body.contains("enveloppe de temps"),
+            "un tour mort n'a pas été coupé : {}",
+            req.body
+        );
+        assert!(
+            registry
+                .get("qa-session")
+                .is_some_and(|s| s.contains("senara-solutions/mika|2275")),
+            "le filet inscrit son propre POST"
+        );
+    }
+
+    /// mika#2289 D4 — le filet ne se restreint pas à la classe transport.
+    #[test]
+    fn mika2289_the_net_does_not_restrict_itself_to_the_transport_class() {
+        for class in [
+            "transport_timeout",
+            "provider",
+            "parse",
+            "unsupported",
+            "other",
+        ] {
+            let (reason, target) = deadline_verdict_target(died(class), REVIEW_REQUESTED)
+                .unwrap_or_else(|| panic!("classe {class} : le filet doit s'appliquer"));
+            assert_eq!(target.pr_number, 2275);
+            assert_eq!(reason.event_name(), DEADLINE_VERDICT_EVENT);
+            assert!(build_verdict_body(&reason, "t").contains(&format!("`{class}`")));
+        }
+    }
+
+    /// mika#2289 AC3 — une PR déjà reviewée supprime aussi le verdict d'erreur.
+    #[tokio::test]
+    async fn mika2289_an_already_reviewed_pr_suppresses_the_error_verdict_too() {
+        let registry: DashMap<String, HashSet<String>> = DashMap::new();
+        registry
+            .entry("qa-session".to_string())
+            .or_default()
+            .insert("senara-solutions/mika|2275".to_string());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let outcome = maybe_post_deadline_verdict(
+            DeadlineVerdictInput {
+                reason: died_reason("transport_timeout"),
+                target: requested_target(),
+                session_id: "qa-session",
+                trace_id: "trace",
+                agent_id: "mika-qa",
+                pr_reviews_posted: Some(&registry),
+            },
+            move |_req| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async { Ok(String::new()) }
+            },
+        )
+        .await;
+        assert_eq!(outcome, DeadlineVerdictOutcome::AlreadyReviewed);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// mika#2289 — un tour non-PR qui meurt n'appelle pas le filet.
+    #[test]
+    fn mika2289_a_non_pr_turn_that_dies_posts_nothing() {
+        assert!(
+            deadline_verdict_target(
+                died("transport_timeout"),
+                "Salut, tu peux me résumer ma semaine ?"
+            )
+            .is_none()
+        );
     }
 }

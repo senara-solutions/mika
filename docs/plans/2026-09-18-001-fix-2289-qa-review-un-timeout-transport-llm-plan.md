@@ -325,12 +325,15 @@ trois appelants de `run_agent_for_message` (`handlers.rs:479`, `:898`, `:1048`, 
 dernier étant le drain worker de la file bornée mika#1870) en héritent sans
 modification.
 
-**A5. Garde structurelle.** Un test de scan de source refusant qu'une branche de
-sortie de `run_agent` dans `run_agent_for_message` n'appelle pas le filet.
-Motivation écrite dans le test : **une régression ici ne rend aucune décision
-fausse, elle rend une mort muette** — toutes les assertions existantes restent
-vertes pendant que la PR redevient silencieuse. C'est la classe que
-`mika2342_every_llm_call_is_wrapped_in_a_timeout` et
+**A5. Garde structurelle.** Un test de scan de source sur les **appels de
+production à `agent::run_agent`** (deux aujourd'hui, inventaire clos), refusant
+qu'une branche de sortie n'appelle pas le filet. Une seule entrée d'allowlist,
+`server/a2a.rs::run_a2a_agent`, avec son assertion auto-nettoyante ; un troisième
+site est halt-and-surface. Voir § Fire-Disposition pour la population mesurée et
+le raisonnement de l'exemption. Motivation écrite dans le test : **une régression
+ici ne rend aucune décision fausse, elle rend une mort muette** — toutes les
+assertions existantes restent vertes pendant que la PR redevient silencieuse.
+C'est la classe que `mika2342_every_llm_call_is_wrapped_in_a_timeout` et
 `mika2131_exclusion_skips_never_return_to_an_uncollected_debug` couvrent déjà,
 chacune pour la même raison.
 
@@ -403,10 +406,146 @@ que le défaut n'est pas transitoire, et ce n'est pas le budget qu'il faut monte
 
 ---
 
+## Fire-Disposition
+
+Requis par le Fire-Disposition Gate (mika#1574), soulevé par mika-arch en
+première passe (F1). Ce plan porte quatre livrables de classe détecteur : la
+garde structurelle A5, l'exhaustivité du `match` de D3 (V6, où le détecteur est
+le compilateur), le contrat V1–V10, et les tests shell B5. Les quatre sont
+traités ci-dessous, sur une population **comptée dans l'arbre à `c1033bc2`**,
+pas supposée — et la mesure déplace la disposition de A5 sur un point que le
+plan n'avait pas vu.
+
+### A5 — garde structurelle : une violation préexistante, nommée
+
+**Population.** Deux sites de production appellent `agent::run_agent` :
+
+| Site | Branche `Err` aujourd'hui | Après le volet A |
+|---|---|---|
+| `server/handlers.rs:1526` (`run_agent_for_message`) | `error!` + `AGENT_ERROR_REPLY`, **PR muette** — le défaut du ticket | couvert par A4 |
+| `server/a2a.rs:232` (`run_a2a_agent`) | `Err(e) => Err(e.to_string())`, **aucun filet, ni deadline ni erreur** | **non couvert** |
+
+(`tests/eval/harness.rs:124,239` sont du test, hors population de production.)
+
+**La mesure corrige le plan.** A5 était écrit comme un scan borné à
+`run_agent_for_message`, sous lequel `a2a.rs` n'est pas une exemption mais un
+hors-population — c'est-à-dire un silence commode. Ce n'en est pas un : la voie
+A2A **échappe déjà** au filet deadline de mika#2276 M2, pour la même raison de
+forme, et rien dans les types n'y interdit un texte d'événement PR (elle porte
+`pr_reviews_posted: Some(&state.pr_reviews_posted)`, `a2a.rs:228`, donc le filet
+y serait techniquement appelable). Un scan borné à une fonction ne voit pas non
+plus l'apparition d'un **troisième** appelant, qui est précisément la classe que
+A5 existe pour attraper.
+
+**Disposition : (a) exception d'allowlist nommée**, sur les trois sous-points du
+doctrine :
+
+1. **Donnée nommée** — l'allowlist contient exactement une entrée,
+   `server/a2a.rs::run_a2a_agent`, pas un motif ni un répertoire. Le scan porte
+   donc sur les appels de production à `agent::run_agent`, pas sur une seule
+   fonction. Allowlist scopée dans `#[cfg(test)] mod tests` (doctrine, option a)
+   — aucun chargeur de production ne la consulte.
+2. **Suivi référencé** — l'exemption est adossée au nouvel item « la voie A2A »
+   de § Hors périmètre, **dont l'ouverture en ticket de suivi fait partie de la
+   Definition of Done**. L'exemption ne couvre pas la lacune, elle la date.
+3. **Assertion auto-nettoyante** — l'entrée porte son propre test : le jour où
+   `run_a2a_agent` appelle le filet, le scan rougit avec « retirez cette
+   entrée ». Sans quoi l'exemption survivrait à sa raison d'être, ce qui est la
+   dette que le sous-point (3) existe pour éviter.
+
+**Pourquoi l'exemption plutôt que la couverture, et ce qu'elle coûte.** Le coût
+est réel mais non mesuré : la population « tour A2A traitant un événement PR »
+est vraisemblablement vide en usage (le gateway livre les webhooks sur
+`POST /message`, pas sur `/a2a`), et `parse_pr_target` la filtrerait de toute
+façon en `NotApplicable("not_a_pr_event")`. Ce qui décide n'est donc pas le
+bénéfice mais le risque : A4 restructure un `match` sur un chemin chaud (risque 1
+ci-dessous, trois appelants dont le drain worker de la file bornée). En
+restructurer deux double ce risque pour couvrir une population que personne n'a
+comptée. Mesurer d'abord — la ligne `cause="error"` d'A6 dira si des tours A2A
+meurent sur des événements PR — étendre ensuite.
+
+**Un troisième site : (c) halt-and-surface.** Si le poseur découvre en écrivant
+le scan un appelant de production hors de ces deux-là, il **s'arrête et remonte à
+l'opérateur** au lieu d'ajouter une seconde entrée d'allowlist ou de câbler le
+filet lui-même : un troisième assembleur de tour est un fait d'architecture, pas
+un geste de poseur. C'est la disposition retenue par
+`mika2342_every_llm_call_is_wrapped_in_a_timeout` sur exactement la même forme de
+question (« inventaire fermé à deux sites, pas d'allowlist née vide »), et la
+divergence assumée ici est qu'**une** entrée est écrite, parce qu'une violation
+réelle existe — une allowlist née vide serait un endroit où déposer la
+prochaine.
+
+### V6 / D3 — enum fermé : zéro violation, et aucune exemption écrite
+
+**Population.** Trois lectures du signal hors de `agent_loop` :
+`handlers.rs:1131` (le garde d'entrée du filet), `handlers.rs:1153` (la
+construction de `DeadlineVerdictInput`) et `deadline_verdict.rs:231` (le
+`let Some(overrun) = … else`). Les trois sont réécrites par A1 et A4 dans le même
+PR. **Violations existantes après le volet A : zéro.**
+
+**Disposition : (a), avec une liste vide — et aucune exemption n'est écrite.**
+Le `match` land exhaustif dès le premier commit, sans bras `_ =>` et sans
+période de grâce, parce qu'il n'y a rien à exempter. Exempter d'un détecteur ce
+qui le passe déjà crée une dispense morte que plus rien ne nettoie.
+
+### V1–V10 — landent tous ACTIVÉS, aucun sous drapeau de report
+
+Aucun `#[ignore]`, aucun `#[cfg(skip)]`, aucune variable d'environnement de
+report. Justification par moitié :
+
+- **V1–V6 (Rust)** — tournent sous `cargo test`, donc en CI sur chaque PR.
+- **V7–V10 (shell)** — `make test-dispatch-lib` est déjà câblé en CI
+  (`.github/workflows/ci.yml:85`, mika#1772) et `make verify-bundled-skills` à
+  la ligne 82. Il n'y a pas de câblage à ajouter, donc pas de raison de différer.
+
+**Le seul détecteur qui tire sur des données préexistantes est V5**, et il tire
+pour de bon : A1 change le type du champ `overrun`, donc les **douze** sites
+construisant `DeadlineVerdictInput` cessent de compiler — 8 tests inline
+(`deadline_verdict.rs:379,439,474,502,550,574,602,630`), 1 site de production
+(`handlers.rs:1152`), 3 tests d'intégration
+(`tests/eval/test_deadline_verdict_2276.rs:142,214,271`).
+
+**Disposition : (a), exception mécanique bornée par sa forme.** Les douze sites
+sont mis à jour dans le même commit, et la frontière est explicite :
+
+- **Autorisé** — traduire la construction du champ (`overrun: None` →
+  `Concluded`, `overrun: Some(DeadlineOverrun { … })` →
+  `DeadlineExceeded { … }`). C'est un changement de forme, pas de sens.
+- **Interdit** — toucher une assertion, supprimer un cas, ou changer un littéral
+  de sortie pour faire passer la compilation. En particulier les littéraux
+  `"turn_completed"` et `"not_a_pr_event"` de `NotApplicable` sont un **format de
+  fil** (ils atterrissent dans le champ `outcome` de `qa_deadline_verdict`, que
+  l'opérateur agrège) : la variante `Concluded` de D3 doit rendre
+  `"turn_completed"` inchangé. Un test qui compile parce qu'on a déplacé sa
+  cible n'atteste plus rien, et V5 est précisément l'assertion que la branche
+  deadline n'a pas bougé.
+
+Si un site refuse la traduction mécanique — c'est-à-dire si un test existant
+n'a pas d'image dans le nouvel enum — c'est **(c) halt-and-surface** : cela
+signifierait que D3 perd un état que mika#2276 M2 distinguait, ce qui est une
+décision de périmètre et non une correction de compilation.
+
+### B5 — tests shell : le gate est N/A, et c'est dit
+
+Les quatre assertions de B5 fabriquent leur `mika` bouchonné et leurs réponses ;
+elles ne s'exécutent sur aucune donnée préexistante. Il n'existe donc **aucune
+population à exempter** et le gate ne les concerne pas — énoncé plutôt que tu,
+pour qu'un lecteur ne prenne pas le silence pour un oubli (arbre de décision du
+gate, branche 3).
+
+*Citation : mika#1574 (Fire-Disposition Gate),
+`docs/solutions/best-practices/fire-disposition-doctrine.md`.*
+
+---
+
 ## Definition of Done
 
 - Les volets A et B sont implémentés selon D1–D8.
-- V1–V10 passent.
+- V1–V10 passent, tous activés (aucun `#[ignore]`, aucun drapeau de report —
+  § Fire-Disposition).
+- L'allowlist de A5 contient exactement une entrée, et le **ticket de suivi sur
+  la voie A2A est ouvert** (§ Hors périmètre, premier item). Une exemption sans
+  son suivi est une dispense, pas une exception.
 - `cargo test`, `cargo clippy`, `cargo fmt --check` verts.
 - `make verify-bundled-skills` vert (le volet B touche `_shared/`).
 - Les surfaces opérateur (A6, B4) sont documentées dans le `CLAUDE.md` racine et
@@ -430,7 +569,9 @@ sont dérivés de son « Attendu » et du contrat de vérification ci-dessus.
   422 lu comme succès idempotent), vérifiées séparément.
 - **AC4** — Le filet est atteint depuis **toutes** les branches de sortie de
   `run_agent` dans `run_agent_for_message`, et une garde structurelle refuse
-  qu'une branche future y échappe.
+  qu'une branche future y échappe. L'inventaire des appelants de production est
+  clos et l'unique exemption (`server/a2a.rs::run_a2a_agent`) est nommée,
+  datée et auto-nettoyante — voir § Fire-Disposition.
 - **AC5** — `_arch_ask` retente **une fois** un échec rejouable (transport,
   `AGENT_BUSY`, `StillRunning`) et **ne retente pas** un échec non rejouable
   (`.content` vide, enveloppe incomplète, `UNPARSED`).
@@ -451,6 +592,14 @@ sont dérivés de son « Attendu » et du contrat de vérification ci-dessus.
   *« the engine-side `hold[review]` net that would cover that case … is
   mika#2368 »*). Empiéter dessus doublonnerait un ticket ouvert. Ce plan traite la
   voie webhook/conversationnelle, qui est celle du symptôme mesuré.
+- **La voie A2A** (`server/a2a.rs::run_a2a_agent`). Elle échappe au filet sur ses
+  deux branches, et pas seulement sur `Err` : elle n'a jamais été couverte par le
+  filet deadline de mika#2276 M2 non plus. C'est l'unique entrée d'allowlist de
+  la garde A5 (§ Fire-Disposition), donc une lacune **datée et comptée**, pas une
+  omission. **Ticket de suivi à ouvrir** — sa décision d'ouverture ne dépend pas
+  d'une mesure, seule sa priorité en dépend : la ligne `cause="error"` d'A6 dira
+  si des tours A2A meurent sur des événements PR, c'est-à-dire si la population
+  est vide en usage comme on le suppose ici.
 - **La cause des timeouts OpenRouter** (classe #2280, « 5e/6e occurrence du jour »
   selon le commentaire). Ce travail rend la mort visible et borne le groom ; il ne
   fait pas disparaître la panne fournisseur.
@@ -490,3 +639,45 @@ sont dérivés de son « Attendu » et du contrat de vérification ci-dessus.
 4. **`gh` non authentifié dans ce worktree** (E6) : les identifiants d'incident du
    ticket n'ont pas été re-vérifiés contre l'API. Aucune décision de ce plan n'en
    dépend — toutes s'appuient sur le code.
+5. **L'exemption A2A de la Fire-Disposition repose sur une population supposée
+   vide, non mesurée.** L'argument est que le gateway livre les webhooks sur
+   `POST /message` et non sur `/a2a`, donc qu'aucun tour A2A ne traite un
+   événement PR. C'est une propriété d'usage, pas une propriété de type. Si elle
+   est fausse, la voie A2A porte une seconde population muette — exactement le
+   défaut de ce ticket, sous un autre nom. Mitigation : la ligne `cause="error"`
+   d'A6 la rend mesurable dès le premier jour, et l'entrée d'allowlist la garde
+   nommée plutôt que tue.
+
+---
+
+## Revision history
+
+- **rev 2 (2026-09-18)** — addressed F1 (Fire-Disposition Gate, mika#1574) by
+  adding a `## Fire-Disposition` section covering the four detector-class
+  deliverables, on a population counted in the tree at `c1033bc2`:
+  - **A5** — measuring the population moved the disposition. Two production
+    callers of `agent::run_agent` exist (`handlers.rs:1526`, `a2a.rs:232`), and
+    the second escapes the net on both branches, so the scan is widened from
+    "inside `run_agent_for_message`" to "production callers of `run_agent`" and
+    lands under **option (a)**: one named allowlist entry
+    (`server/a2a.rs::run_a2a_agent`), scoped inside `#[cfg(test)] mod tests`,
+    with a self-cleaning assertion, a follow-up item added to § Hors périmètre
+    whose opening is now a DoD line, and **(c) halt-and-surface** for a third
+    site. A5 in § Travail and AC4 were updated to match; the scan predicate is
+    the change, AC4 is not weakened.
+  - **V6 / D3** — option (a) with an **empty** list: the three readers of the
+    signal are all rewritten by A1/A4 in the same PR, so zero pre-existing
+    violations and deliberately no exemption written (an exemption for what
+    already passes is dead weight the doctrine's sub-point 3 exists to avoid).
+  - **V1–V10** — stated to land **enabled**, no `#[ignore]`, no deferral flag:
+    `make test-dispatch-lib` and `make verify-bundled-skills` are already wired
+    in CI (`.github/workflows/ci.yml:82,85`). V5 is the one detector firing on
+    pre-existing data — A1's type change breaks the twelve
+    `DeadlineVerdictInput` construction sites — so the mechanical/forbidden
+    boundary is written explicitly (translating field construction is allowed;
+    touching an assertion or the `"turn_completed"` / `"not_a_pr_event"` wire
+    literals is not), with halt-and-surface if a site has no image in the new
+    enum.
+  - **B5** — gate declared N/A in writing rather than left silent (shell tests
+    build their own stubs; no pre-existing population).
+  - Risk 5 added, naming what the A2A exemption rests on and how it is measured.

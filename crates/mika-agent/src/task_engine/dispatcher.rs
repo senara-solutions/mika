@@ -306,12 +306,15 @@ fn delivery_backoff_secs(base: u64, max: u64, attempts: u32, quarantine_at: u32)
 /// `other` for a failure that is not an LLM failure at all. The four tests
 /// below this function are unchanged by that move, which is what attests the
 /// wire format did not shift.
+///
+/// **mika#2289 moved the adapter too.** A second consumer appeared — the
+/// engine-side `hold[review]` net, which classifies the error that killed a
+/// turn — and it needs the same cause-chain walk and the same `other`. Two
+/// copies of four lines writing into one operator vocabulary is the divergence
+/// this file's own doc comment argues against, so the walk now lives beside the
+/// mapping in `mika-common` and this stays a named call site.
 fn classify_delivery_error(err: &anyhow::Error) -> std::borrow::Cow<'static, str> {
-    use mika_common::llm::error::{LlmError, error_class};
-    use std::borrow::Cow;
-
-    err.downcast_ref::<LlmError>()
-        .map_or(Cow::Borrowed(error_class::OTHER), LlmError::error_class)
+    mika_common::llm::error::classify_anyhow_error(err)
 }
 
 /// Parent statuses from which no dispatch can ever be produced (mika#2169).

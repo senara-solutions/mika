@@ -130,6 +130,28 @@ impl LlmError {
     }
 }
 
+/// The wire-format error class of an `anyhow` error that may wrap an
+/// [`LlmError`] (mika#2289 A2).
+///
+/// `downcast_ref` walks the whole `anyhow` cause chain, so this reads the
+/// **variant** wherever in the chain it sits — never a `contains()` on a
+/// rendered message. Anything that is not an [`LlmError`] is
+/// [`error_class::OTHER`], which is a statement ("not an LLM failure"), not a
+/// fallback.
+///
+/// **One definition, two consumers.** `mika-agent` calls it from
+/// `task_engine::dispatcher::classify_delivery_error` (mika#2179, the callback
+/// delivery ladder) and from `server::handlers` (mika#2289, the engine-side
+/// `hold[review]` net). Those two write into the same operator vocabulary —
+/// `audit_events.callback_delivery_failed` and the `error_class` field of
+/// `qa_deadline_verdict` — and a second copy of these four lines is exactly how
+/// one population splits into two spellings without saying so.
+#[must_use]
+pub fn classify_anyhow_error(err: &anyhow::Error) -> Cow<'static, str> {
+    err.downcast_ref::<LlmError>()
+        .map_or(Cow::Borrowed(error_class::OTHER), LlmError::error_class)
+}
+
 impl From<reqwest::Error> for LlmError {
     fn from(e: reqwest::Error) -> Self {
         LlmError::Transport(e.to_string())
