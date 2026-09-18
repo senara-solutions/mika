@@ -342,6 +342,18 @@ pub fn build_router(state: AppState) -> Router {
                 require_admin_read_token,
             )),
         )
+        // Admin: read-only outbound-send history of a tenant (mika#2387),
+        // served from the gateway's own `outbound_messages` table — no proxy
+        // hop, so the internal token never leaves the process here. Same READ
+        // token, same audit population, same per-route auth caveat as the
+        // sibling above: without this `.route_layer` the route is public.
+        .route(
+            "/admin/tenants/{customer_id}/outbound-messages",
+            get(handle_admin_tenant_outbound_messages).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_admin_read_token,
+            )),
+        )
         // Health probes and version (no auth)
         .route("/health", get(handle_readiness))
         .route("/readyz", get(handle_readiness))
@@ -2076,7 +2088,12 @@ async fn handle_admin_tenant_recurring_tasks(
     }
 
     info!(%customer_id, "mika#2360: admin read of tenant recurring registry");
-    crate::audit_events::log_admin_read(&state.pool, &customer_id).await;
+    crate::audit_events::log_admin_read(
+        &state.pool,
+        &customer_id,
+        crate::audit_events::ADMIN_READ_ROUTE_RECURRING_TASKS,
+    )
+    .await;
 
     forward_recurring_registry(&state, &customer_id, &q).await
 }
@@ -2137,6 +2154,340 @@ pub(crate) async fn forward_recurring_registry(
         .header("content-type", "application/json")
         .body(axum::body::Body::from(body))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+// ── mika#2387 — GET /admin/tenants/{customer_id}/outbound-messages ───────────
+//
+// Unlike its mika#2360 sibling this is NOT a proxy: `outbound_messages` is the
+// gateway's own table, so the query is *executed* here rather than forwarded.
+// Three consequences shape everything below: the internal token never leaves
+// the process on this path, the pagination cap is the gateway's own
+// responsibility (an unbounded `per_page` is a denial of service on its own
+// database), and the parameters are validated before they can reach SQL.
+
+/// The four metadata fields this endpoint is allowed to publish — the whole of
+/// `outbound_messages` today (`migrations/002_outbound_messages.sql`).
+///
+/// **This is an allowlist by exact equality, never a blacklist.** A blacklist
+/// (`!body.contains("text")`) is true today and would stay true the day someone
+/// adds a `message_snippet` column and exposes it: it cannot see what it did not
+/// anticipate, which is precisely the case it exists to catch. Two independent
+/// guards read this constant — one on the serialized response keys, one on the
+/// SQL projection — because the struct alone would not see a switch to
+/// `serde_json::Value`, and the projection alone would not see a field added to
+/// the struct.
+///
+/// **If either guard ever goes red, the fix is never to add the new key here.**
+/// Publishing a new column on this endpoint is a data-exposure decision that
+/// belongs to the operator and its own ticket; red is the correct behaviour
+/// until then.
+///
+/// `#[cfg(test)]` on purpose: this is the reference the guards fire *at*, not a
+/// production datum. Production carries two **independent** declarations — the
+/// fields of [`OutboundMessageRow`] and the columns of
+/// [`OUTBOUND_MESSAGES_SELECT_LIST`] — and it is exactly their independence
+/// that makes two guards worth more than one. Deriving either from this array
+/// would collapse them into a single point and cost the check its value.
+#[cfg(test)]
+pub(crate) const OUTBOUND_MESSAGE_METADATA_FIELDS: [&str; 4] =
+    ["telegram_message_id", "chat_id", "agent_name", "created_at"];
+
+/// The SQL projection, spelled out. `SELECT *` is proscribed here: it would
+/// make a future migration, on its own, publish a new column.
+pub(crate) const OUTBOUND_MESSAGES_SELECT_LIST: &str =
+    "telegram_message_id, chat_id, agent_name, created_at";
+
+/// Default page size, and the hard cap the gateway applies to its own database.
+pub(crate) const OUTBOUND_DEFAULT_PER_PAGE: u32 = 100;
+pub(crate) const OUTBOUND_MAX_PER_PAGE: u32 = 1000;
+
+/// Default lower bound when `since` is omitted: the whole retention window.
+/// `cleanup_old_outbound_messages` purges anything older, so the default cannot
+/// return less than everything the table can hold.
+pub(crate) const OUTBOUND_RETENTION_DAYS: i64 = 7;
+
+/// One row of the send history. Metadata only — the table carries no content
+/// column, and this struct is the guard that keeps it that way.
+#[derive(Debug, serde::Serialize, sqlx::FromRow)]
+pub(crate) struct OutboundMessageRow {
+    pub telegram_message_id: i64,
+    pub chat_id: i64,
+    pub agent_name: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Response envelope. `has_more` rather than `total`: it comes free from
+/// `LIMIT per_page + 1`, where a total would cost a second `COUNT(*)` for a
+/// number nobody needs over a seven-day window.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct OutboundMessagesResponse {
+    pub items: Vec<OutboundMessageRow>,
+    pub page: u32,
+    pub per_page: u32,
+    pub has_more: bool,
+}
+
+/// Query parameters — an allowlist, like its mika#2360 sibling: anything else
+/// is dropped at deserialization.
+///
+/// `since` / `until` are `String` rather than a date type on purpose: a typed
+/// field would be refused by the extractor with a message that does not name
+/// the offending value, and the refusal would not be ours to shape.
+#[derive(Debug, Default, serde::Deserialize)]
+pub(crate) struct AdminOutboundQuery {
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub page: Option<u32>,
+    pub per_page: Option<u32>,
+}
+
+/// The resolved time window. `until == None` means "no upper bound".
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct OutboundWindow {
+    pub since: chrono::DateTime<chrono::Utc>,
+    pub until: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// What the handler is allowed to do once `customers.telegram_chat_id` is read.
+///
+/// `outbound_messages` carries no `customer_id`; the tenant link is `chat_id`,
+/// and that column is nullable (a provisioned-but-unpaired tenant, or one
+/// unlinked by `POST /admin/customers/{id}/unlink`). The reflex "optional
+/// filter" — `WHERE ($1::bigint IS NULL OR chat_id = $1)` — returns **every row
+/// of every tenant** for such a tenant. Its competitor, `WHERE chat_id = $1`
+/// with a NULL bind, returns nothing, which is right by accident rather than by
+/// design. Neither decides: a `None` short-circuits before any query is built,
+/// so no nullable value ever reaches a `WHERE` clause.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OutboundScope {
+    /// The tenant has a chat: query, filtered on this value.
+    Query(i64),
+    /// No chat: an empty list, and `outbound_messages` is never touched. Not an
+    /// error — the tenant exists and has sent nothing on Telegram.
+    EmptyWithoutQuery,
+}
+
+/// R7/D6 — the fail-closed decision, as a pure function so CI can hold it
+/// without a database (the crate's integration tests are all `#[ignore]`).
+pub(crate) fn outbound_scope(telegram_chat_id: Option<i64>) -> OutboundScope {
+    match telegram_chat_id {
+        Some(chat_id) => OutboundScope::Query(chat_id),
+        None => OutboundScope::EmptyWithoutQuery,
+    }
+}
+
+/// Page size, clamped to `[1, OUTBOUND_MAX_PER_PAGE]`. The cap is the
+/// gateway's because the gateway runs the query (mika#2360 only relayed it).
+pub(crate) fn clamp_per_page(requested: Option<u32>) -> u32 {
+    requested
+        .unwrap_or(OUTBOUND_DEFAULT_PER_PAGE)
+        .clamp(1, OUTBOUND_MAX_PER_PAGE)
+}
+
+/// Page number, 1-based. A `0` is a caller's off-by-one, not a request for
+/// page zero.
+pub(crate) fn clamp_page(requested: Option<u32>) -> u32 {
+    requested.unwrap_or(1).max(1)
+}
+
+/// Accepted `since` / `until` spellings, quoted verbatim in the 400 body.
+const OUTBOUND_TIMESTAMP_FORMS: &str = "RFC 3339 (2026-09-17T00:00:00Z), a naive timestamp (2026-09-17T00:00:00) or a bare date (2026-09-17), all read as UTC";
+
+/// Parse one bound. RFC 3339 first; a naive timestamp and a bare date are
+/// accepted as UTC because an operator inspecting an incident types
+/// `since=2026-09-17`, and refusing that on a deadline-bound endpoint is
+/// friction with nothing behind it. Detection is permissive, the decision is
+/// not: anything else is refused rather than defaulted.
+fn parse_bound(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let raw = raw.trim();
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    if let Ok(naive) = raw.parse::<chrono::NaiveDateTime>() {
+        return Some(naive.and_utc());
+    }
+    if let Ok(date) = raw.parse::<chrono::NaiveDate>() {
+        return Some(date.and_hms_opt(0, 0, 0)?.and_utc());
+    }
+    None
+}
+
+/// D2 — resolve the window, or say why it cannot be resolved.
+///
+/// An unreadable bound is a **400 quoting the offending value**, never a silent
+/// fallback to the default: replacing `since=2026-09-17` by "seven days ago"
+/// would have the operator believe they are counting sends since the 17th while
+/// they are counting since the 11th — an instrument lying about its own window,
+/// on the very ticket whose purpose is to count sends inside a window.
+///
+/// An empty window (`until <= since`) is a 400 too, not an empty list: an empty
+/// list reads as "this tenant sent nothing", which is a false answer to a
+/// badly-posed question.
+pub(crate) fn resolve_window(
+    since: Option<&str>,
+    until: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<OutboundWindow, String> {
+    let since = match since {
+        None => now - chrono::Duration::days(OUTBOUND_RETENTION_DAYS),
+        Some(raw) => parse_bound(raw).ok_or_else(|| {
+            format!("unreadable `since`: {raw:?} — expected {OUTBOUND_TIMESTAMP_FORMS}")
+        })?,
+    };
+    let until = match until {
+        None => None,
+        Some(raw) => Some(parse_bound(raw).ok_or_else(|| {
+            format!("unreadable `until`: {raw:?} — expected {OUTBOUND_TIMESTAMP_FORMS}")
+        })?),
+    };
+
+    if let Some(until) = until
+        && until <= since
+    {
+        return Err(format!(
+            "empty window: `until` ({until:?}) is not after `since` ({since:?})"
+        ));
+    }
+
+    Ok(OutboundWindow { since, until })
+}
+
+/// `GET /admin/tenants/{customer_id}/outbound-messages` (mika#2387) — the
+/// tenant's outbound-send history, metadata only, to an operator holding the
+/// admin READ token.
+///
+/// Order of operations is load-bearing (D7): **validate, then resolve, then
+/// read**. A malformed `since` must not reach the database before being
+/// refused, and — since CI provisions no Postgres for this crate — putting the
+/// parse after the tenant lookup would also make the 400 untestable in CI,
+/// because the lazy pool answers 503 first. Good design and testability push
+/// the same way here.
+///
+/// Retention: `cleanup_old_outbound_messages` purges rows older than seven
+/// days. An absence in this response past that horizon says nothing about what
+/// was sent.
+async fn handle_admin_tenant_outbound_messages(
+    State(state): State<AppState>,
+    Path(customer_id): Path<Uuid>,
+    Query(q): Query<AdminOutboundQuery>,
+) -> Response {
+    // 1. Parameters, before any database access (D7).
+    let window = match resolve_window(q.since.as_deref(), q.until.as_deref(), chrono::Utc::now()) {
+        Ok(w) => w,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": message})),
+            )
+                .into_response();
+        }
+    };
+    let per_page = clamp_per_page(q.per_page);
+    let page = clamp_page(q.page);
+
+    // 2. Resolve the tenant, and with it the only chat_id this read may see.
+    let chat_id = match sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT telegram_chat_id FROM customers WHERE id = $1",
+    )
+    .bind(customer_id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(Some(chat_id)) => chat_id,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "customer not found"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            // Never an empty list here: that would read as "this tenant sent
+            // nothing" when the truth is "the gateway could not look".
+            error!(error = %e, %customer_id, "admin outbound-messages: customer lookup failed");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "database unavailable"})),
+            )
+                .into_response();
+        }
+    };
+
+    info!(%customer_id, "mika#2387: admin read of tenant outbound-send history");
+    crate::audit_events::log_admin_read(
+        &state.pool,
+        &customer_id,
+        crate::audit_events::ADMIN_READ_ROUTE_OUTBOUND_MESSAGES,
+    )
+    .await;
+
+    // 3. The fail-closed decision — no nullable chat_id ever reaches a WHERE.
+    let chat_id = match outbound_scope(chat_id) {
+        OutboundScope::Query(chat_id) => chat_id,
+        OutboundScope::EmptyWithoutQuery => {
+            return Json(OutboundMessagesResponse {
+                items: Vec::new(),
+                page,
+                per_page,
+                has_more: false,
+            })
+            .into_response();
+        }
+    };
+
+    // `has_more` for free: ask for one row past the page and truncate.
+    let limit = i64::from(per_page) + 1;
+    let offset = i64::from(page - 1) * i64::from(per_page);
+
+    // The upper bound uses COALESCE onto `infinity` rather than the
+    // `($n IS NULL OR ...)` shape deliberately: on `chat_id` that shape is the
+    // cross-tenant leak described on `OutboundScope`, and it should not be
+    // spelled anywhere on this query — even where it would be harmless.
+    //
+    // ORDER BY is total. The PK is `(telegram_message_id, chat_id)` and a burst
+    // of sends shares `created_at` to the millisecond; without the tiebreak,
+    // OFFSET pagination can duplicate or skip a row across pages — and a burst
+    // of near-simultaneous sends is exactly what mika#2358 is counting.
+    let sql = format!(
+        "SELECT {OUTBOUND_MESSAGES_SELECT_LIST} \
+         FROM outbound_messages \
+         WHERE chat_id = $1 \
+           AND created_at >= $2 \
+           AND created_at < COALESCE($3::timestamptz, 'infinity'::timestamptz) \
+         ORDER BY created_at DESC, telegram_message_id DESC \
+         LIMIT $4 OFFSET $5"
+    );
+
+    let mut items = match sqlx::query_as::<_, OutboundMessageRow>(&sql)
+        .bind(chat_id)
+        .bind(window.since)
+        .bind(window.until)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&state.pool)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            error!(error = %e, %customer_id, "admin outbound-messages: query failed");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "database unavailable"})),
+            )
+                .into_response();
+        }
+    };
+
+    let has_more = items.len() > per_page as usize;
+    items.truncate(per_page as usize); // safe-byte-slice: Vec — element count (pagination), no char boundary
+
+    Json(OutboundMessagesResponse {
+        items,
+        page,
+        per_page,
+        has_more,
+    })
+    .into_response()
 }
 
 // -- Send handler --
@@ -3227,14 +3578,21 @@ mod tests {
         use wiremock::matchers::{header, method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        const INTERNAL: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        const READ: &str = "read-only-admin-token";
-        const CUSTOMER: &str = "a0394c24-9558-4cb6-9078-52043912ecbc";
+        pub(super) const INTERNAL: &str =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        pub(super) const READ: &str = "read-only-admin-token";
+        pub(super) const CUSTOMER: &str = "a0394c24-9558-4cb6-9078-52043912ecbc";
 
         /// Lazy Postgres pool that never connects: auth rejection, the
         /// extractor gate and the 405 fallback run without a DB; the customer
         /// lookup fails fast and must answer 503 without forwarding.
-        fn state(admin_read_token: Option<&str>, agent_base_url: Option<String>) -> AppState {
+        /// `pub(super)` so the mika#2387 sibling module reuses this harness
+        /// rather than cloning a second twenty-field `AppState` literal that
+        /// would silently drift from this one.
+        pub(super) fn state(
+            admin_read_token: Option<&str>,
+            agent_base_url: Option<String>,
+        ) -> AppState {
             let http_client = reqwest::Client::new();
             let pool = PgPoolOptions::new()
                 .acquire_timeout(Duration::from_millis(100))
@@ -3269,7 +3627,12 @@ mod tests {
             }
         }
 
-        async fn call(app: Router, method: &str, uri: &str, bearer: Option<&str>) -> Response {
+        pub(super) async fn call(
+            app: Router,
+            method: &str,
+            uri: &str,
+            bearer: Option<&str>,
+        ) -> Response {
             let mut req = Request::builder().method(method).uri(uri);
             if let Some(b) = bearer {
                 req = req.header("authorization", format!("Bearer {b}"));
@@ -3490,6 +3853,288 @@ mod tests {
             assert!(!armed.contains(READ));
             let disarmed = format!("{:?}", state(None, None));
             assert!(disarmed.contains("admin_read_token: None"), "{disarmed}");
+        }
+    }
+
+    // ── mika#2387 — GET /admin/tenants/{customer_id}/outbound-messages ────
+    //
+    // Every test here runs **in CI, without Postgres**. That is the point, not
+    // a convenience: the five integration tests of `crates/mika-gateway/tests/`
+    // are all `#[ignore]` because CI provisions no database for this crate, so
+    // a negative test written only as a DB-backed test would be green by never
+    // running — the failure class this repo names everywhere (mika#2205: a
+    // silently inert scan reads exactly like a scan that found nothing).
+    //
+    // What CI cannot hold — real SQL semantics, and therefore the two tests
+    // that prove the absence of a cross-tenant leak — lives in
+    // `tests/admin_tenant_outbound_messages.rs` and is run by hand before
+    // merge. D6 exists so the testable half of that invariant becomes a pure
+    // function CI *can* hold.
+    mod mika2387 {
+        use super::super::*;
+        use super::mika2360::{CUSTOMER, INTERNAL, READ, call, state};
+        use http_body_util::BodyExt;
+        use std::collections::BTreeSet;
+
+        fn route(customer: &str) -> String {
+            format!("/admin/tenants/{customer}/outbound-messages")
+        }
+
+        fn ts(s: &str) -> chrono::DateTime<chrono::Utc> {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        }
+
+        /// **AC3, the negative test.** Serializes a *populated* instance — the
+        /// positive control, so an empty object fails instead of passing — and
+        /// asserts the key set equals the allowlist exactly.
+        ///
+        /// Exact equality, not a blacklist: a blacklist goes green on a
+        /// `message_snippet` column nobody thought to forbid, which is the one
+        /// case worth catching.
+        #[test]
+        fn mika2387_response_keys_are_exactly_the_four_metadata_fields() {
+            let row = OutboundMessageRow {
+                telegram_message_id: 4242,
+                chat_id: 987_654_321,
+                agent_name: "mika".to_string(),
+                created_at: ts("2026-09-17T08:30:00Z"),
+            };
+            let value = serde_json::to_value(&row).expect("serialize row");
+            let object = value.as_object().expect("row serializes to an object");
+
+            // Positive control: the instance really is populated, so the key
+            // set below is the key set of a real row.
+            assert_eq!(object["telegram_message_id"], 4242);
+            assert_eq!(object["agent_name"], "mika");
+            assert!(!object.is_empty());
+
+            let keys: BTreeSet<&str> = object.keys().map(String::as_str).collect();
+            let allowed: BTreeSet<&str> =
+                OUTBOUND_MESSAGE_METADATA_FIELDS.iter().copied().collect();
+            assert_eq!(
+                keys, allowed,
+                "the response must publish exactly the four metadata fields — adding a key \
+                 here is a data-exposure decision, not a test fix"
+            );
+
+            // The envelope adds pagination, and no content either.
+            let envelope = serde_json::to_value(OutboundMessagesResponse {
+                items: vec![row],
+                page: 1,
+                per_page: 100,
+                has_more: false,
+            })
+            .expect("serialize envelope");
+            let envelope_keys: BTreeSet<&str> = envelope
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                envelope_keys,
+                BTreeSet::from(["items", "page", "per_page", "has_more"])
+            );
+        }
+
+        /// R6, second guard. The struct guard above would not see a switch to
+        /// `serde_json::Value`; this one reads the SQL projection itself.
+        #[test]
+        fn mika2387_select_list_is_an_explicit_allowlist() {
+            assert!(
+                !OUTBOUND_MESSAGES_SELECT_LIST.contains('*'),
+                "SELECT * would let a future migration publish a column on its own"
+            );
+            let projected: BTreeSet<&str> = OUTBOUND_MESSAGES_SELECT_LIST
+                .split(',')
+                .map(str::trim)
+                .collect();
+            let allowed: BTreeSet<&str> =
+                OUTBOUND_MESSAGE_METADATA_FIELDS.iter().copied().collect();
+            assert_eq!(projected, allowed);
+        }
+
+        /// R2 — an unarmed token answers 404 before any header is read, and
+        /// the write token does not open it either.
+        #[tokio::test]
+        async fn mika2387_admin_read_route_404_when_token_unconfigured() {
+            let app = build_router(state(None, None));
+            let resp = call(app.clone(), "GET", &route(CUSTOMER), Some(READ)).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            let resp = call(app, "GET", &route(CUSTOMER), Some(INTERNAL)).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        /// R2 — authenticated, not authorized: inspecting must not require
+        /// holding the write secret.
+        #[tokio::test]
+        async fn mika2387_admin_read_rejects_internal_token_with_403() {
+            let app = build_router(state(Some(READ), None));
+            let resp = call(app, "GET", &route(CUSTOMER), Some(INTERNAL)).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            assert!(String::from_utf8_lossy(&body).contains("admin read scope required"));
+        }
+
+        /// R2 — and this 403 is what proves the `.route_layer` is mounted at
+        /// all: this router has no auth by prefix, so a missing layer would
+        /// serve the route to anyone.
+        #[tokio::test]
+        async fn mika2387_admin_read_rejects_missing_and_unknown_token_with_403() {
+            let app = build_router(state(Some(READ), None));
+            for bearer in [None, Some("nope"), Some(&READ[..8])] {
+                let resp = call(app.clone(), "GET", &route(CUSTOMER), bearer).await;
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{bearer:?}");
+            }
+        }
+
+        /// R3 — read-only is held by the router: only `get` is mounted.
+        #[tokio::test]
+        async fn mika2387_no_mutating_method_on_outbound_messages_route() {
+            let app = build_router(state(Some(READ), None));
+            for m in ["POST", "PUT", "DELETE", "PATCH"] {
+                let resp = call(app.clone(), m, &route(CUSTOMER), Some(READ)).await;
+                assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED, "{m}");
+            }
+        }
+
+        /// R4 — a non-UUID is refused by the extractor, before the handler and
+        /// therefore before any query.
+        #[tokio::test]
+        async fn mika2387_non_uuid_customer_id_is_rejected_by_the_extractor() {
+            let app = build_router(state(Some(READ), None));
+            for bad in [
+                "not-a-uuid",
+                "a@b",
+                "..%2F..%2Fadmin",
+                "a0394c24-9558-4cb6-9078-52043912ecb", // one char short
+            ] {
+                let resp = call(app.clone(), "GET", &route(bad), Some(READ)).await;
+                assert!(
+                    matches!(
+                        resp.status(),
+                        StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND
+                    ),
+                    "{bad}: got {}",
+                    resp.status()
+                );
+            }
+        }
+
+        /// **D2/D7.** An unreadable bound is a 400 quoting the value, never a
+        /// silent default.
+        ///
+        /// This test only reaches the handler's 400 because validation
+        /// precedes the tenant lookup — the harness pool never connects, so a
+        /// parse placed after the lookup would answer 503 here. That makes
+        /// this test the pin on the *order*, not merely on the status.
+        #[tokio::test]
+        async fn mika2387_unparseable_since_is_a_400_never_a_silent_default() {
+            let app = build_router(state(Some(READ), None));
+            let uri = format!("{}?since=pas-une-date", route(CUSTOMER));
+            let resp = call(app.clone(), "GET", &uri, Some(READ)).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let body = String::from_utf8_lossy(&body);
+            assert!(
+                body.contains("pas-une-date"),
+                "the 400 must quote the offending value: {body}"
+            );
+
+            // `until` is held to the same grammar and the same refusal.
+            let uri = format!("{}?until=hier", route(CUSTOMER));
+            let resp = call(app, "GET", &uri, Some(READ)).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+            // Negative control: a valid bound is NOT refused at the parse — it
+            // gets past it and dies on the (absent) database instead.
+            let app = build_router(state(Some(READ), None));
+            let uri = format!("{}?since=2026-09-17T00:00:00Z", route(CUSTOMER));
+            let resp = call(app, "GET", &uri, Some(READ)).await;
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+
+        /// D2 — an empty window is a 400, not an empty list: an empty list
+        /// reads as "this tenant sent nothing".
+        #[tokio::test]
+        async fn mika2387_empty_window_is_a_400() {
+            let app = build_router(state(Some(READ), None));
+            for (since, until) in [
+                ("2026-09-17T00:00:00Z", "2026-09-16T00:00:00Z"), // inverted
+                ("2026-09-17T00:00:00Z", "2026-09-17T00:00:00Z"), // degenerate
+            ] {
+                let uri = format!("{}?since={since}&until={until}", route(CUSTOMER));
+                let resp = call(app.clone(), "GET", &uri, Some(READ)).await;
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{since}..{until}");
+            }
+
+            // And the pure function says the same thing, with both bounds read.
+            let now = ts("2026-09-18T00:00:00Z");
+            assert!(
+                resolve_window(Some("2026-09-17"), Some("2026-09-16"), now).is_err(),
+                "an inverted window must be refused"
+            );
+            let ok = resolve_window(Some("2026-09-17"), Some("2026-09-18"), now).expect("valid");
+            assert_eq!(ok.since, ts("2026-09-17T00:00:00Z"));
+            assert_eq!(ok.until, Some(ts("2026-09-18T00:00:00Z")));
+
+            // Omitted `since` defaults to the whole retention window — the
+            // table cannot hold anything older.
+            let default = resolve_window(None, None, now).expect("valid");
+            assert_eq!(default.since, now - chrono::Duration::days(7));
+            assert_eq!(default.until, None);
+        }
+
+        /// D3 — the cap is the gateway's, because the gateway runs the query.
+        #[test]
+        fn mika2387_per_page_is_clamped() {
+            assert_eq!(clamp_per_page(None), 100);
+            assert_eq!(clamp_per_page(Some(0)), 1);
+            assert_eq!(clamp_per_page(Some(50)), 50);
+            assert_eq!(clamp_per_page(Some(1000)), 1000);
+            assert_eq!(clamp_per_page(Some(10_000)), 1000);
+
+            assert_eq!(clamp_page(None), 1);
+            assert_eq!(clamp_page(Some(0)), 1);
+            assert_eq!(clamp_page(Some(7)), 7);
+        }
+
+        /// **R7/D6 — the anti-leak guard, testable without a database.**
+        ///
+        /// The cross-tenant leak of a nullable `chat_id` cannot reach a `WHERE`
+        /// clause because the decision short-circuits first, and that decision
+        /// is a pure function over `Option<i64>`.
+        #[test]
+        fn mika2387_tenant_without_chat_id_yields_an_empty_list_without_querying() {
+            assert_eq!(outbound_scope(None), OutboundScope::EmptyWithoutQuery);
+            assert_eq!(
+                outbound_scope(Some(987_654_321)),
+                OutboundScope::Query(987_654_321)
+            );
+            // A chat id of 0 is a value, not an absence.
+            assert_eq!(outbound_scope(Some(0)), OutboundScope::Query(0));
+        }
+
+        /// **D1** — the route this handler audits under. The contract of the
+        /// audit row itself (its shape, and the `assert_ne!` against
+        /// mika#2360's literal) is held where the writer lives:
+        /// `audit_events::tests::mika2387_audit_route_names_this_endpoint`.
+        /// What is pinned *here* is the choice of scope — one `tool_name` and
+        /// one `target_key` shared with mika#2360, so that "who read this
+        /// tenant's data?" stays one SQL query.
+        #[test]
+        fn mika2387_audit_scope_is_shared_and_the_route_discriminates() {
+            let id = Uuid::parse_str(CUSTOMER).unwrap();
+            assert_eq!(
+                crate::audit_events::admin_read_target_key(&id),
+                format!("tenant:{CUSTOMER}")
+            );
+            assert_ne!(
+                crate::audit_events::ADMIN_READ_ROUTE_OUTBOUND_MESSAGES,
+                crate::audit_events::ADMIN_READ_ROUTE_RECURRING_TASKS
+            );
         }
     }
 }
