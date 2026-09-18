@@ -145,7 +145,20 @@ Ce plan ferme D2 et déclare la décision. **D1 reste à #1410.**
 ### U1 — Déclarer la décision (le cœur)
 
 Un document de solution :
-`docs/solutions/security-issues/2026-09-18-le-classifier-ne-decide-jamais-sur-le-contenu-dun-fichier.md`
+`docs/solutions/security-issues/le-classifier-ne-decide-jamais-sur-le-contenu-dun-fichier-2026-09-18.md`
+
+**Nom vérifié contre le corpus** (F2). La préoccupation portait sur une apostrophe
+dans le slug : il n'y en a pas — `dun` *est* la forme déjà dé-apostrophée de « d'un »,
+et deux précédents du corpus portent exactement cette élision
+(`best-practices/deux-lecteurs-dune-meme-variable-denv-divergent-en-silence-2026-09-07.md`,
+`best-practices/verifier-un-creneau-nest-pas-le-reclamer-2026-08-30.md`). La forme est
+donc établie, pas une exception à négocier. En revanche la vérification a trouvé un
+écart réel que la rédaction initiale portait : **la date était en préfixe**, alors que
+le corpus la met en suffixe à 300 fichiers contre 26
+(`ls docs/solutions/*/*.md | grep -cE '\-20[0-9]{2}-[0-9]{2}-[0-9]{2}\.md$'` → `300` ;
+`… grep -cE '/20[0-9]{2}-[0-9]{2}-[0-9]{2}-'` → `26`). Le nom ci-dessus est corrigé en
+conséquence. Le fichier de *plan* garde son préfixe daté : c'est la convention de
+`docs/plans/`, qui est distincte et que dispatch-lib lit par motif.
 
 Frontmatter YAML de la maison (`module`, `tags`, `problem_type: architecture-pattern`,
 `category: security-issues`, `applies_when`, `resolution_type: pattern`).
@@ -250,7 +263,7 @@ aucun prédicat, aucun flux.
 
 | # | Fichier | Nature | Dépend de |
 |---|---|---|---|
-| U1 | `docs/solutions/security-issues/2026-09-18-le-classifier-ne-decide-jamais-sur-le-contenu-dun-fichier.md` | création | — |
+| U1 | `docs/solutions/security-issues/le-classifier-ne-decide-jamais-sur-le-contenu-dun-fichier-2026-09-18.md` | création | — |
 | U2a | `tools/mika_permission_policy/tests/test_no_filesystem_access.py` | création (garde AST) | — |
 | U2b | idem, second bloc | création (pin comportemental) | U2a |
 | U3a | `skills/bundled/_shared/dispatch-lib.sh` (2 sites : 3604, 3793) | édition texte | U1 |
@@ -262,6 +275,50 @@ indépendante et vérifiable seule.
 ---
 
 ## Fire-Disposition
+
+U2 livre deux détecteurs — la garde AST (U2a) et le pin comportemental (U2b) —, donc
+cette section doit nommer une des trois options canoniques de
+`docs/solutions/best-practices/fire-disposition-doctrine.md` (mika#1574).
+
+**Option (a) — exception d'allowlist nommée, avec ZÉRO entrée.**
+
+La base actuelle ne porte **aucune violation préexistante**, et c'est mesuré plutôt
+que supposé :
+
+| Vérification | Commande | Résultat 2026-09-18 |
+|---|---|---|
+| Imports du registre | `grep -nE '^\s*(import\|from)\s' …/_binaries.py …/__init__.py` | `__future__`, `collections.abc.Callable`, `_binaries` — aucun module interdit |
+| Appel à `open` | `grep -nE '\bopen\s*\(' …/_binaries.py …/__init__.py` | aucune occurrence |
+| Indifférence au chemin | toutes les fonctions ont la signature `(argv, cwd) -> bool` ; `is_safe_cat` rend `True` inconditionnellement | aucun verdict dépendant d'un chemin |
+
+Les deux gardes sont donc **vertes sur la base actuelle sans aucune exception**, ce
+qui est le cas nominal de l'option (a).
+
+**Ce que l'implémenteur fait, et ne fait pas.** Il n'écrit **aucun scaffold
+d'allowlist** — pas de const vide, pas de set d'exceptions, pas de commentaire
+« ajouter ici les cas tolérés ». Une allowlist vide qui existe est une invitation à
+la remplir ; la liste des modules interdits est nommée *dans le test* (U2a), et c'est
+la seule structure de données que ce travail introduit. Il n'utilise **pas** `#[ignore]`
+ni son équivalent pytest (option (b) refusée : il n'y a rien à désarmer). Il **ne
+halte pas** (option (c) refusée : aucune décision de périmètre n'est en attente — la
+disposition est tranchée ici). Si la garde rougit à l'implémentation, ce n'est pas une
+violation préexistante à tolérer, c'est que la garde est mal écrite : la réparer.
+
+**Ce que doit porter une future violation.** Le jour où du code introduit
+légitimement un import interdit ou un verdict dépendant du chemin, l'option (a)
+s'applique avec ses trois obligations, telles que la doctrine les pose :
+
+1. **Nom spécifique** — la fonction et le module exacts, jamais une tolérance en bloc
+   sur `_binaries.py`.
+2. **Ticket de suivi référencé** dans l'entrée elle-même, nommant ce qui rendrait
+   l'exception caduque.
+3. **Assertion auto-nettoyante** — l'entrée porte son propre test, qui rougit quand
+   l'exception devient obsolète, de sorte qu'elle ne survive pas à sa raison d'être.
+
+Et l'obligation qui vaut pour ce ticket-ci en particulier : une telle entrée
+réintroduirait, ne serait-ce que localement, la dimension « chemin » que AC2 interdit
+d'ajouter au classifier. Elle relève donc d'une décision de sûreté avec son propre
+ticket, pas d'un ajustement en passant pour faire taire une garde.
 
 **Rien ne change de comportement à l'exécution.** Aucun prédicat, aucun seuil, aucune
 variable d'environnement, aucun flux de dispatch n'est touché. Le classifier rend
@@ -282,6 +339,7 @@ Aucun déploiement n'est requis pour U1 et U2. U3 prend effet au prochain
 |---|---|---|
 | Garde AST | `make test-permission-policy-plugin` | vert sur la base actuelle |
 | Garde AST mord | ajouter `import os` à `_binaries.py`, relancer | **rouge**, en nommant le module |
+| Zéro exception (Fire-Disposition) | `grep -riE 'allowlist\|exception\|skip\|ignore' tools/mika_permission_policy/tests/test_no_filesystem_access.py` | aucune entrée d'exception ; seule la liste des modules **interdits** est présente |
 | Pin comportemental | idem cible | vert, chemins indifférents |
 | Message classe C | `make test-dispatch-lib` | vert, 2 assertions sur la 3ᵉ voie |
 | Symétrie des 2 sites | `grep -c 'Read the .rule-id. in brackets' skills/bundled/_shared/dispatch-lib.sh` | `2` |
@@ -419,3 +477,24 @@ l'opérateur lit, pas de le réécrire plus fort.
   recherche de forme ; la cause de #2295 est déclarée indéterminée avec sa procédure
   de résolution (Sonde 0). La conclusion principale — aucune règle de contenu — est
   inchangée et repose désormais sur un ancrage structurel plutôt que documentaire.
+- rev 3 (2026-09-18) — **révision après premier passage architecte (findings-1).**
+  Addressed **F1** (BLOCKING) : la section `## Fire-Disposition` décrivait les
+  symptômes du changement sans choisir parmi les trois options canoniques. Elle
+  déclare désormais explicitement **Option (a) — exception d'allowlist nommée, avec
+  zéro entrée**, justifiée par trois vérifications mesurées sur la base actuelle
+  (aucun import interdit, aucun `open`, aucun verdict dépendant d'un chemin), et
+  dit à l'implémenteur ce qu'il fait — aucun scaffold d'allowlist, pas de `#[ignore]`,
+  pas de halte — ainsi que les trois obligations (nom spécifique, ticket de suivi,
+  assertion auto-nettoyante) que devra porter une future exception, avec la contrainte
+  supplémentaire que ce ticket lui impose : une entrée réintroduirait la dimension
+  « chemin » qu'AC2 interdit, donc elle relève d'un ticket de sûreté propre. Une ligne
+  « Zéro exception » est ajoutée au contrat de vérification pour que la déclaration
+  soit contrôlable. Citation : `docs/solutions/best-practices/fire-disposition-doctrine.md`
+  (review-guide § Fire-Disposition Gate, mika#1574).
+  Addressed **F2** (sharpening) en réfutant sa prémisse et en corrigeant l'écart réel
+  qu'elle a fait trouver : le slug ne porte aucune apostrophe (`dun` est la forme
+  déjà dé-apostrophée, et deux précédents du corpus la portent), mais la **date était
+  en préfixe** alors que le corpus la met en suffixe à 300 contre 26. Le document U1
+  est renommé `le-classifier-ne-decide-jamais-sur-le-contenu-dun-fichier-2026-09-18.md`,
+  et le tableau des unités d'implémentation suit. Le fichier de plan garde son préfixe
+  daté : `docs/plans/` a sa propre convention, lue par motif par dispatch-lib.
