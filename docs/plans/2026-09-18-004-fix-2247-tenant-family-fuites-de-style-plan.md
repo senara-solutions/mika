@@ -94,8 +94,28 @@ l'hébergement : *« il n'y avait rien à conditionner : il y avait un fait à p
 et une fabrication à empêcher »*.
 
 Et le chemin compact (`build_compact_system_prompt`, ≤ 5 Ko, `ProviderKind::MikaModel`)
-ne rend **aucune** section temporelle du tout — vérifié : pas de `## Current Time`
-entre les lignes 1624 et 1740.
+ne rend **aucune** section temporelle du tout. Ce n'est pas un oubli : deux
+assertions le tiennent (`prompt.rs:4422` refuse littéralement `## Current Time`,
+et le `section_count <= 4` juste au-dessus énumère en commentaire les quatre
+sections admises). § 5a en tire la conséquence, qui n'est pas celle qu'on croit.
+
+### R3b — Il y a **trois** assembleurs, pas deux, et le troisième est le plus suspect
+
+`build_system_prompt` (1219), `build_compact_system_prompt` (1624) et
+`build_silent_prompt` (1738). Le troisième appelle `write_time_section` (1764)
+et `write_runtime_section` (1752) — donc les moitiés intention des axes 2 et 3
+l'atteignent **sans threading nouveau**, les deux fonctions étant partagées.
+
+Il mérite d'être nommé plutôt que couvert par accident : les tours silencieux
+(heartbeat, reflection, reminder) sont précisément ceux qui **ouvrent** un
+échange sans message entrant. « Belle journée » envoyé le soir est bien plus
+plausiblement un heartbeat proactif qu'une réponse — c'est le seul des trois
+chemins qui salue sans qu'on lui ait parlé. Un plan qui ne le nommerait pas
+livrerait AC3 sur le chemin où le symptôme a le moins de chances de naître.
+
+Côté axe 1, les trois sites de sortie de § 3b couvrent le silencieux aussi : un
+tour silencieux n'a pas de texte livré et passe obligatoirement par
+`send_message` (site 3).
 
 ### R4 — Ce que le ticket propose en alternative n'est pas livrable dans ce dépôt
 
@@ -303,11 +323,29 @@ horodatée. Laisser le vide est ce qui a produit « belle journée » le soir : 
 modèle a répondu sur son prior parce qu'aucune section ne disait l'heure — la
 leçon mika#2290 à la lettre.
 
-**Chemin compact : on rend la ligne** (~60 octets), et on assume la divergence
-avec le précédent mika#2290, qui retire la ligne d'hébergement du prompt compact.
-Le coût y était d'un bloc entier ; ici c'est une ligne, AC3 vise une population
-famille, et MikaModel peut servir un tenant famille demain (suivi mika#1925). Un
-test épingle que le budget ≤ 5 Ko tient.
+**Chemin compact : on ne rend rien, et on suit mika#2290 au lieu d'en diverger.**
+C'est une rectification d'une version antérieure de ce plan, qui proposait d'y
+rendre la ligne en « assumant la divergence ». Trois faits la refusent, et le
+troisième est le seul qui compte.
+
+1. Le compact **refuse explicitement** `## Current Time` (`prompt.rs:4422`), et
+   le `section_count <= 4` au-dessus énumère les quatre sections admises. Rendre
+   la ligne demande donc de modifier **deux décisions épinglées** — le prix
+   qu'un plan doit annoncer, pas découvrir à l'implémentation.
+2. Le carve-out mika#2290 est écrit sur le site lui-même, avec son raisonnement :
+   *« it withholds the intent half from this path, never the protection: the 5d
+   guard reads outgoing text, not the prompt »*.
+3. **Ce raisonnement s'applique ici mot pour mot.** La garde 5f (§ 5b) lit le
+   texte sortant, pas le prompt — donc elle protège le chemin compact que la
+   ligne y soit rendue ou non. La divergence coûtait deux décisions épinglées
+   pour un bénéfice que la moitié structurelle fournit déjà.
+
+Le coût est nommé et il est réel : sur MikaModel le modèle n'a pas le fait posé,
+donc la garde 5f y travaille seule, sans la moitié intention. C'est exactement
+le régime que mika#2290 a accepté pour l'hébergement, et il se joint au même
+suivi (mika#1925). Épinglé par `mika2247_compact_prompt_omits_the_local_time_line`,
+rédigé sur le modèle du test frère — **comme décision, pas comme oubli**, pour
+que le prochain lecteur trouve l'argument au lieu de le refaire.
 
 ### 5b. Moitié structurelle — garde `time_of_day_greeting_mismatch`
 
@@ -342,7 +380,8 @@ contredire.
 | 2 | `tests/eval/doctrine_regressions/` : le fil mesuré (EN puis FR), **plus** un contrôle négatif par état | une garde qui fire en `Unknown` |
 | 3 | `prompt::tests::mika2247_local_time_is_computed_not_inferred` | le retour à UTC seul |
 | 3 | `prompt::tests::mika2247_unknown_timezone_says_so` | le vide silencieux |
-| 3 | `prompt::tests::mika2247_compact_prompt_stays_under_budget` | le dépassement des 5 Ko |
+| 3 | `prompt::tests::mika2247_compact_prompt_omits_the_local_time_line` | la réouverture du carve-out compact **comme si c'était un oubli** |
+| 3 | `prompt::tests::mika2247_silent_prompt_carries_the_local_time_line` | la salutation proactive laissée sans heure (R3b) |
 
 **Un contrôle négatif par terme, jamais un seul pour tous** (leçon mika#2277) :
 un test qui neutraliserait les trois conditions à la fois passerait au vert sur
@@ -397,8 +436,10 @@ borne, et son effet est vérifiable par test plutôt que par grep.
   ne l'attend pas.
 - **Toute langue hors `{fr, en}`.** Le détecteur ne sait pas les mesurer ; elles
   tombent en `Unknown`, donc au comportement d'aujourd'hui. Suivi.
-- **Le prompt compact et mika#1925.** Cet axe y rend la ligne d'heure locale
-  (§ 5a) ; le reste du carve-out compact ne bouge pas.
+- **Le prompt compact et mika#1925.** Le carve-out ne bouge pas : § 5a explique
+  pourquoi l'axe 3 le **suit** au lieu d'y déroger, et la moitié intention y
+  reste retenue — protection assurée par la garde 5f, qui lit le texte sortant.
+  Même suivi que mika#2290.
 - **mika#2245** (défaut-racine de contexte) et le ticket frère « boilerplate ».
   Le ticket le pose lui-même dans sa section *Portée* — trois clusters distincts.
 - **Un filet moteur pour la langue** (forme mika#2368). Conditionné à la mesure
@@ -407,7 +448,7 @@ borne, et son effet est vérifiable par test plutôt que par grep.
 
 ---
 
-## 8. Definition of Done
+## Definition of Done
 
 - [ ] `FAMILY_SOUL` ne porte plus aucun U+2014 / U+2013 / U+2026, **aucun mot
       changé**, et un test de constant le refuse en retour.
@@ -423,7 +464,9 @@ borne, et son effet est vérifiable par test plutôt que par grep.
       indécidable, résidu nommé par `_uncorrected`.
 - [ ] `write_time_section` pose l'heure locale et le moment de la journée
       calculés, parse `Tz` **et** `FixedOffset`, et **dit** l'absence de fuseau.
-- [ ] Le prompt compact porte la ligne d'heure locale et tient ≤ 5 Ko (épinglé).
+- [ ] Les **trois** assembleurs sont traités nommément (R3b) : full et silencieux
+      portent la ligne par `write_time_section` partagée ; le compact ne la porte
+      pas, et un test l'épingle **comme décision** avec l'argument de § 5a.
 - [ ] Garde 5f `time_of_day_greeting_mismatch`, ensemble fermé bilingue,
       fail-open sans heure connue.
 - [ ] Contrôle négatif opérateur vert : aucun des trois axes ne mord hors famille.
@@ -436,7 +479,7 @@ borne, et son effet est vérifiable par test plutôt que par grep.
       fabrication/registre, et `crates/mika-common/CLAUDE.md` le normaliseur dans
       § *Text*.
 
-## 9. Acceptance criteria
+## Acceptance criteria
 
 Reprises verbatim du corps du ticket, avec la borne de livraison de chacune.
 
@@ -457,6 +500,11 @@ Reprises verbatim du corps du ticket, avec la borne de livraison de chacune.
 
 - **AC3 — Salutations cohérentes avec l'heure locale du tenant.** L'heure locale
   et le moment de la journée cessent d'être une inférence : ils sont calculés et
-  posés (§ 5a). Une incohérence résiduelle est rattrapée une fois par la garde
-  5f. Fuseau non déclaré : la cohérence n'est pas asserted — l'ignorance est dite
-  et la salutation horodatée interdite, ce qui est **vrai** plutôt que deviné.
+  posés (§ 5a), sur les deux assembleurs qui servent un tour famille — y compris
+  le silencieux, qui est celui où la salutation proactive naît (R3b). Une
+  incohérence résiduelle est rattrapée une fois par la garde 5f. Deux bornes
+  dites plutôt que découvertes : fuseau non déclaré, la cohérence n'est pas
+  asserted — l'ignorance est dite et la salutation horodatée interdite, ce qui est
+  **vrai** plutôt que deviné ; et sur le chemin compact (MikaModel) la garde 5f
+  travaille seule, sans moitié intention, régime hérité de mika#2290 et joint à
+  son suivi.
