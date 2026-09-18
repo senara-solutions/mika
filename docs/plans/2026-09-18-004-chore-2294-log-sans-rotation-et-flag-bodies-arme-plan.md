@@ -378,10 +378,18 @@ doc portant la rotation, et A5 comme le seul risque de divergence. Il y en a une
 et elle échappe à la garde :
 
 ```
-crates/mika-agent/CLAUDE.md:1799-1802   § Log Sinks — colonne « Rotation »
+crates/mika-agent/CLAUDE.md § Log Sinks — colonne « Rotation » (deux lignes)
   | **Server log**        | … | None — single file via `tracing_appender::rolling::never` |
   | **Per-agent CLI log** | … | Daily via `tracing_appender::rolling::daily`              |
 ```
+
+**L'ancre est le titre de section, pas un numéro de ligne — et ce plan vient de payer le
+contre-exemple.** Sa version précédente citait `:1799-1802` ; à la re-vérification (cf. la
+section *Re-vérification* ci-dessous) ces deux lignes sont à `:1844-1845`, soit **45 lignes
+de dérive en une journée**, sans que le tableau lui-même ait changé d'un caractère. Ce
+`CLAUDE.md` est la surface la plus fréquemment augmentée du dépôt : tout repère numérique
+qu'on y pose est périmé avant d'être lu. A3b se repère donc sur `§ Log Sinks` et sur le
+contenu des cellules, jamais sur une ligne.
 
 Ce tableau affirme exactement ce que les volets A et C rendent faux. Or
 **`crates/mika-agent/CLAUDE.md` n'est pas dans `scripts/sync-agent-docs.sh`** : sa liste
@@ -404,6 +412,43 @@ Trois conséquences, dans l'ordre de gravité :
 
 Le geste est une ligne de tableau et une phrase ; ce qui manquait n'était pas l'effort mais
 le fait de savoir que ce fichier existe. D'où A3b, et la ligne correspondante en DoD.
+
+---
+
+## Re-vérification (2026-09-19, re-groom)
+
+Ce ticket a été re-dispatché après deux groomings soldés `PIPELINE_INCOMPLETE`
+(`_arch_ask failed` — le plan n'a jamais été relu par l'architecte ; c'est une panne de
+pipeline, pas un verdict sur le contenu). Avant d'y ajouter quoi que ce soit, **toutes les
+affirmations porteuses ont été rejouées contre HEAD**, parce qu'un plan écrit la veille et
+relu le lendemain sur une base qui a bougé est exactement ce qui produit un ITERATE
+évitable.
+
+| Affirmation | Sonde | Résultat |
+|---|---|---|
+| E1 — six sites de production, tous `debug!`, zéro `info!` | `grep -rn 'llm re[qs]...t body' crates/` | **tient** — 8 lignes (6 production + 2 dans `tui_llm_body_capture.rs`), 0 `info!` |
+| E2 — une seule directive arme la cible | `grep -rn 'llm_debug=debug' crates/` | **tient** — `logging.rs:375` et `:504`, inchangés |
+| E3 — la mesure du 2026-09-03 (517/517) | `auto_pull.rs` | **tient** — `:1129` (commentaire) et `:6492` (message de test) |
+| E5 — `rolling::never` côté serveur, `daily` côté agent | `grep -rn 'rolling::' crates/` | **tient** — `never` à `:393`/`:427`, `daily` à `:517`/`:541`. Quatre occurrences, comme énoncé en C1 |
+| E5 — six lignes `Rotation` dont quatre `None` | `docs/runtime-structure.md:240-247` | **tient** — lignes exactes |
+| E5 — aucune rétention par-agent | `grep -rn max_log_files crates/` | **tient** — zéro résultat |
+| E9 — trois déploiements, deux propriétaires sur `/var/log/mika/` | `packaging/systemd/mika-spirit.service`, `os/openrc/*` | **tient** — `User=mika` + `Environment=MIKA_SPIRIT_LOG_FILE=/var/log/mika/server.log` (`:8`, `:15`) ; mika-os pose `/home/mika/.mika/logs/mika-spirit.log` en `conf.d:11` **et** en `init.d:15-16` (les deux écrivains du même inode, E5) |
+| E10 — aucun logrotate nulle part | `grep -rn logrotate packaging/ docs/ scripts/ os/` | **tient** — les seules occurrences sont dans ce plan |
+| E11 — `crates/mika-agent/CLAUDE.md` hors de `sync-agent-docs.sh` | `sed -n '10,26p' scripts/sync-agent-docs.sh` | **tient** — neuf fichiers de `docs/`, ce `CLAUDE.md` n'en fait pas partie |
+| A1 note gateway — `gateway_log_file` sans défaut | `crates/mika-gateway/src/settings.rs:74` | **tient** — `Option<String>`, `None` dans les constructeurs de test |
+| V4 — le pattern `check-*` / `test-check-*` existe | `ls scripts/` | **tient** — six `check-*`, trois `test-check-*` ; le garde de V4 s'insère dans une famille établie, il n'en fonde pas une |
+| E11 — **numéros de ligne** du tableau § Log Sinks | lecture directe | **a dérivé** : `:1799-1802` → `:1844-1845` en une journée. Corrigé en ancrant sur le titre de section (E11, A3b) |
+
+**Une seule dérive, et elle n'invalide rien** — elle confirme au contraire le point d'E11 :
+la surface la plus lue du dépôt est aussi la plus mouvante, donc la plus mal repérée par un
+numéro. Le reste du plan est inchangé par cette passe.
+
+**Ce que la re-vérification ne peut toujours pas établir**, et qui reste donc au volet 0 :
+tout ce qui exige la machine de production. `/var/log/mika/` et `~/.mika/.env` sont hors du
+sandbox du pilote, `logrotate` n'y est pas installé. Aucune des quatre questions du volet 0
+n'a pu être avancée d'un pouce entre les trois passes de grooming, et ce n'est pas un
+manque de diligence : c'est la frontière du worktree. **Le plan ne peut pas être « fini »
+au sens où sa première étape est un geste opérateur.**
 
 ---
 
@@ -687,8 +732,11 @@ logrotate système ; **dans les images `os/Dockerfile` elle ne s'exécute pas** 
 ni cron), et le journal y reste non borné — avec le renvoi au ticket de suivi de D6.
 
 **A3b. `crates/mika-agent/CLAUDE.md` § *Log Sinks* — la seconde surface, que `docs-sync`
-ne voit pas** (E11). La colonne `Rotation` de ses deux lignes (`:1801`, `:1802`) doit dire
-la même chose qu'A3 et C2, avec la distinction qui compte : la rotation du **server log**
+ne voit pas** (E11). La colonne `Rotation` de ses deux lignes — repérées par le titre
+`§ Log Sinks` et par le libellé de leur première cellule (`**Server log**`,
+`**Per-agent CLI log**`), **jamais par un numéro de ligne**, qui dérive de dizaines de
+lignes par jour sur ce fichier (E11) — doit dire la même chose qu'A3 et C2, avec la
+distinction qui compte : la rotation du **server log**
 ne vient pas du code (`rolling::never` est inchangé — V5/V7 l'exigent) mais de logrotate,
 donc la cellule dit *« `rolling::never` côté code ; rotation par `/etc/logrotate.d/mika`
 là où elle est installée — non exécutée dans les images `os/` (E10) »*. La ligne per-agent
