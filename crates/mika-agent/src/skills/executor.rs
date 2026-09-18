@@ -272,8 +272,18 @@ const RESCUE_VERIFY_ENV: &[&str] = &[
     "MIKA_RESCUE_VERIFY_BUDGET_SECS",
 ];
 
-/// Decide which of [`RESCUE_VERIFY_ENV`] to set on the child, given a reader of
-/// the spirit process environment.
+/// The two operator settings `dispatch-lib.sh`'s architect-call retry honours
+/// (mika#2278): the kill-switch and the delay before the single retry.
+///
+/// Relayed for the same reason and by the same route as [`RESCUE_VERIFY_ENV`].
+/// Without this, `MIKA_ARCH_ASK_RETRY=0` would be a setting only its reader
+/// honours — mika#2165's definition of a decorative setting — and the plan's
+/// R7 ("disarmable without redeploying the binary") would be false in a way no
+/// test of the shell half could see.
+const ARCH_ASK_RETRY_ENV: &[&str] = &["MIKA_ARCH_ASK_RETRY", "MIKA_ARCH_ASK_RETRY_DELAY_SECS"];
+
+/// Decide which of `keys` to set on the child, given a reader of the spirit
+/// process environment.
 ///
 /// Extracted as a pure function for the same reason [`is_sandbox_env_allowed`]
 /// is: the shape is verifiable without spawning a subprocess or mutating
@@ -287,12 +297,11 @@ const RESCUE_VERIFY_ENV: &[&str] = &[
 /// default instead of silently inheriting one, which is what keeps "no setting"
 /// and "setting posed at the default value" two states an operator can tell
 /// apart.
-fn rescue_verify_env_pairs<F>(read: F) -> Vec<(&'static str, String)>
+fn relayed_env_pairs<F>(keys: &[&'static str], read: F) -> Vec<(&'static str, String)>
 where
     F: Fn(&str) -> Option<String>,
 {
-    RESCUE_VERIFY_ENV
-        .iter()
+    keys.iter()
         .filter_map(|key| {
             let value = read(key)?;
             if value.is_empty() {
@@ -320,7 +329,20 @@ where
 /// back to the shell's own defaults (armed, 900 s), which is the shipped
 /// behaviour — never a blocked dispatch.
 fn inject_rescue_verify_env(cmd: &mut tokio::process::Command) {
-    for (key, value) in rescue_verify_env_pairs(|k| std::env::var(k).ok()) {
+    for (key, value) in relayed_env_pairs(RESCUE_VERIFY_ENV, |k| std::env::var(k).ok()) {
+        cmd.env(key, value);
+    }
+}
+
+/// Relay the mika#2278 architect-retry settings to `dispatch-lib.sh`.
+///
+/// Same placement contract as [`inject_rescue_verify_env`] — it MUST run after
+/// [`sandboxed_pilot_env`], whose `env_clear()` would otherwise erase it — and
+/// the same best-effort discipline: a dispatch that does not carry the settings
+/// falls back to the shell's own defaults (armed, 30 s), never a blocked
+/// dispatch.
+fn inject_arch_ask_retry_env(cmd: &mut tokio::process::Command) {
+    for (key, value) in relayed_env_pairs(ARCH_ASK_RETRY_ENV, |k| std::env::var(k).ok()) {
         cmd.env(key, value);
     }
 }
@@ -3377,6 +3399,9 @@ pub(crate) fn spawn_long_running_exec(
         // reads. Same placement rationale as the two lines above — injected
         // after the env sandbox so the vars survive its positive allowlist.
         inject_rescue_verify_env(&mut cmd);
+        // mika#2278: relay the architect-retry settings the grooming loop reads.
+        // Same placement rationale as the three lines above.
+        inject_arch_ask_retry_env(&mut cmd);
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -3741,24 +3766,24 @@ mod tests {
     /// inheriting one, so "unset" and "set to the default" stay distinguishable.
     #[test]
     fn mika2354_rescue_verify_env_relays_only_present_non_empty_values() {
-        let absent = rescue_verify_env_pairs(|_| None);
+        let absent = relayed_env_pairs(RESCUE_VERIFY_ENV, |_| None);
         assert!(
             absent.is_empty(),
             "an unset setting must not be posed on the child, got {absent:?}"
         );
 
-        let empty = rescue_verify_env_pairs(|_| Some(String::new()));
+        let empty = relayed_env_pairs(RESCUE_VERIFY_ENV, |_| Some(String::new()));
         assert!(
             empty.is_empty(),
             "an empty setting must not be posed on the child, got {empty:?}"
         );
 
-        let one = rescue_verify_env_pairs(|k| {
+        let one = relayed_env_pairs(RESCUE_VERIFY_ENV, |k| {
             (k == "MIKA_RESCUE_VERIFY_ENABLED").then(|| "0".to_string())
         });
         assert_eq!(one, vec![("MIKA_RESCUE_VERIFY_ENABLED", "0".to_string())]);
 
-        let both = rescue_verify_env_pairs(|k| match k {
+        let both = relayed_env_pairs(RESCUE_VERIFY_ENV, |k| match k {
             "MIKA_RESCUE_VERIFY_ENABLED" => Some("1".to_string()),
             "MIKA_RESCUE_VERIFY_BUDGET_SECS" => Some("300".to_string()),
             _ => None,
@@ -3772,6 +3797,46 @@ mod tests {
         );
     }
 
+    /// mika#2278 R7: the retry's kill-switch must actually reach the shell that
+    /// reads it.
+    ///
+    /// `sandboxed_pilot_env` does `env_clear()` then re-adds a **positive**
+    /// allowlist, so nothing `MIKA_*` crosses by inheritance. Without the
+    /// explicit relay, `MIKA_ARCH_ASK_RETRY=0` set on the service would be read
+    /// by nobody and the budget would be undisarmable without a redeploy —
+    /// mika#2165's decorative setting, and a plan requirement silently false.
+    ///
+    /// The "present and non-empty only" rule matters here as much as for its
+    /// sibling: `MIKA_ARCH_ASK_RETRY_DELAY_SECS=""` is the shape a half-written
+    /// `.env` line takes, and relaying it would make the shell's three-tier
+    /// reader warn about a value the operator never set.
+    #[test]
+    fn mika2278_arch_ask_retry_env_relays_only_present_non_empty_values() {
+        assert!(relayed_env_pairs(ARCH_ASK_RETRY_ENV, |_| None).is_empty());
+        assert!(
+            relayed_env_pairs(ARCH_ASK_RETRY_ENV, |_| Some(String::new())).is_empty(),
+            "an empty setting must stay an absence on the child"
+        );
+
+        let disarmed = relayed_env_pairs(ARCH_ASK_RETRY_ENV, |k| {
+            (k == "MIKA_ARCH_ASK_RETRY").then(|| "0".to_string())
+        });
+        assert_eq!(disarmed, vec![("MIKA_ARCH_ASK_RETRY", "0".to_string())]);
+
+        let both = relayed_env_pairs(ARCH_ASK_RETRY_ENV, |k| match k {
+            "MIKA_ARCH_ASK_RETRY" => Some("1".to_string()),
+            "MIKA_ARCH_ASK_RETRY_DELAY_SECS" => Some("45".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            both,
+            vec![
+                ("MIKA_ARCH_ASK_RETRY", "1".to_string()),
+                ("MIKA_ARCH_ASK_RETRY_DELAY_SECS", "45".to_string()),
+            ]
+        );
+    }
+
     /// mika#2354 AC9(b): the positive allowlist stays the guard and the explicit
     /// injection stays the named exception. Adding either name to
     /// [`SANDBOX_ENV_CORE_ALLOWLIST`] — or covering it with a new entry in
@@ -3779,9 +3844,13 @@ mod tests {
     /// inheritance, which is the shape mika#2165 named a decorative setting:
     /// the channel would then differ from the one this ticket documented, and
     /// nothing would say so.
+    ///
+    /// mika#2278 joins [`ARCH_ASK_RETRY_ENV`] to the same population: it reaches
+    /// `dispatch-lib.sh` by the same named exception and must stay outside the
+    /// allowlist for the same reason.
     #[test]
     fn mika2354_rescue_verify_env_never_joins_the_sandbox_allowlist() {
-        for key in RESCUE_VERIFY_ENV {
+        for key in RESCUE_VERIFY_ENV.iter().chain(ARCH_ASK_RETRY_ENV.iter()) {
             assert!(
                 !is_sandbox_env_allowed(key),
                 "{key} must reach dispatch-lib by explicit injection, never by \
