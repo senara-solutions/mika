@@ -1287,6 +1287,93 @@ pub fn check_bundled_skill_drift(skills_dir: &Path) -> usize {
 mod tests {
     use super::*;
 
+    // -- mika#2024: no skill prompt prescribes a gesture the runtime forbids --
+    //
+    // These assertions bear on the **embedded** bytes, not on a disk path: it is
+    // the `include_str!` content that is compiled into the binary, seeded into the
+    // library and lazy-read through the agent's symlink (root CLAUDE.md § *Deploying
+    // a bundled-skill change*). A disk-path assertion would answer a question
+    // nobody asks — the checkout — instead of the one that matters: what reaches
+    // the agent.
+    //
+    // The permanent scan that refuses a *re-introduction anywhere* is the sibling
+    // guard in `tests/skill_prompt_user_prescription_guard_2024.rs`.
+
+    /// Read one embedded file of a legacy bundled skill.
+    fn embedded_file(skill_name: &str, path: &str) -> &'static str {
+        let skill = all_bundled_skills()
+            .into_iter()
+            .find(|s| s.name == skill_name)
+            .unwrap_or_else(|| panic!("bundled skill {skill_name} not found"));
+        skill
+            .files
+            .iter()
+            .find(|f| f.path == path)
+            .unwrap_or_else(|| panic!("{skill_name} has no embedded {path}"))
+            .content
+    }
+
+    /// R1 / AC1. The founding incident is a *first* message: `google-workspace` is
+    /// `always_on`, so this prompt sat in the system prompt of every tenant that
+    /// carried the skill, on every turn, and the model recited it with no failing
+    /// tool call in front of it. Removing the prescription — a sentence LESS, not a
+    /// conditioning sentence more — is what closes that case; the handler-side
+    /// remediation (`builtin_handlers::gws_auth_remediation`) is what keeps the
+    /// answer useful when the error genuinely happens.
+    #[test]
+    fn mika2024_google_workspace_prompt_prescribes_no_terminal_gesture() {
+        let prompt = embedded_file("google-workspace", "system_prompt.md");
+        assert!(
+            !prompt.contains("gws auth login"),
+            "the google-workspace prompt names `gws auth login` again. It must not: \
+             the remediation is posed by the tool result, conditioned on the runtime \
+             (mika#2024). A cloud tenant has no terminal, and this prompt is injected \
+             on every turn whether or not a call failed."
+        );
+        let lowered = prompt.to_ascii_lowercase();
+        for needle in ["your terminal", "the user to run", "user to run"] {
+            assert!(
+                !lowered.contains(needle),
+                "the google-workspace prompt prescribes a terminal gesture again \
+                 ({needle:?})"
+            );
+        }
+    }
+
+    /// R5. Same class, second occurrence found by the AC4 sweep — and unlike
+    /// `google-workspace` this half is **prompt-only**: the capability comes from an
+    /// MCP server, not from a Rust builtin, so there is no handler to condition.
+    /// That is precisely why the permanent scan guard ships armed rather than
+    /// disabled (plan § Fire-Disposition): it is the only enforcement R5 has.
+    #[test]
+    fn mika2024_browser_control_prompt_prescribes_nothing_to_the_user() {
+        let prompt = embedded_file("browser-control", "system_prompt.md");
+        let lowered = prompt.to_ascii_lowercase();
+        // These are the exact strings mika#2024 removes, not a general predicate.
+        // The general property — "no skill prompt prescribes a host gesture to the
+        // user" — has a single reader, the scan guard in
+        // `tests/skill_prompt_user_prescription_guard_2024.rs`, and restating it here
+        // would be the two-readers-drift class `grooming_marker` had to close once
+        // (mika#2158). Note in passing why a naive substring check could not be that
+        // reader: the replacement prose below legitimately contains "the user to
+        // restart", under a prohibition.
+        for needle in ["mika mcp add", "then restart mika"] {
+            assert!(
+                !lowered.contains(needle),
+                "the browser-control prompt hands the user a host gesture again \
+                 ({needle:?}) — MCP setup and service restarts are operator actions, \
+                 and a cloud tenant can perform neither (mika#2024)"
+            );
+        }
+        // Positive half: the rewrite must still say the capability is unavailable,
+        // rather than having deleted the branch along with the prescription.
+        assert!(
+            lowered.contains("not available here") || lowered.contains("unavailable"),
+            "the browser-control prompt no longer tells the user anything when browser \
+             tools are missing — the prescription was removed but so was the answer"
+        );
+    }
+
     #[test]
     fn test_seed_creates_all_skills() {
         let tmp = tempfile::tempdir().unwrap();
