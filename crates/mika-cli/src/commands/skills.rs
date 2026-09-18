@@ -1980,3 +1980,178 @@ mod coherence_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[cfg(unix)]
+mod bundled_resync_tests {
+    //! mika#2340: `mika skills update` resynchronises the bundled-skill
+    //! library, not just the per-agent symlinks.
+    //!
+    //! Two tests, one invariant each:
+    //!
+    //! - V1 attests the *behaviour*: a library whose content diverges from the
+    //!   binary's manifest converges after `update_skills`, both in the library
+    //!   and through the agent's symlink.
+    //! - V1.5 attests V1's *sensitivity*: the component a regression would fall
+    //!   back to (`materialize_agent_skill_links` alone — the pre-#2340 body of
+    //!   `update_skills`) is measured to be incapable of producing the result
+    //!   V1 demands. Without it, "V1 fails on the symlink-only regression" is
+    //!   an assertion made in prose about a test, not a measurement.
+    //!
+    //! Inline in this file because `update_skills` is private to the `mika`
+    //! binary and `lib.rs` must stay minimal: no other location can call it.
+    use super::*;
+    use std::fs;
+
+    const SKILL: &str = "tmux";
+    const STALE: &str = "STALE";
+
+    /// A multi-agent home whose library was seeded by this binary and then
+    /// deliberately aged: the skill prompt reads `STALE` and `.manifest-hash`
+    /// no longer matches, i.e. a library written by an earlier manifest.
+    ///
+    /// This simulates the *post-rebuild* state — the one `skills update` must
+    /// now repair — not the literal incident (a stale CLI binary whose hash
+    /// was self-consistent; that is fixed by a rebuild, not by code).
+    struct StaleHome {
+        global_home: std::path::PathBuf,
+        agent_home: std::path::PathBuf,
+        /// `<agent_home>/skills` — the exact `skills_dir` that `run` computes
+        /// and hands to `update_skills`.
+        skills_dir: std::path::PathBuf,
+        library_prompt: std::path::PathBuf,
+        agent_prompt: std::path::PathBuf,
+        /// The prompt as the binary's manifest writes it, captured from the
+        /// first seed so the assertions compare against this binary and not
+        /// against a copy of the source tree.
+        fresh_prompt: String,
+    }
+
+    fn provision_stale_home(tmp: &Path) -> StaleHome {
+        let global_home = tmp.to_path_buf();
+        let agent_home = global_home.join("agents").join("mika-test");
+        fs::create_dir_all(&agent_home).unwrap();
+        fs::write(
+            agent_home.join("identity.toml"),
+            format!("name = \"Test\"\nemoji = \"🧪\"\n\n[skills]\nallowlist = [\"{SKILL}\"]\n"),
+        )
+        .unwrap();
+
+        mika_agent::startup::seed_bundled_skills_if_needed(&agent_home, false);
+
+        let library_dir = home::library_skills_dir(&global_home);
+        let skills_dir = agent_home.join("skills");
+        let library_prompt = library_dir.join(SKILL).join("system_prompt.md");
+        let agent_prompt = skills_dir.join(SKILL).join("system_prompt.md");
+
+        let fresh_prompt = fs::read_to_string(&library_prompt).unwrap();
+        assert_ne!(
+            fresh_prompt, STALE,
+            "test setup: sentinel collides with real prompt"
+        );
+        assert_eq!(
+            fs::read_to_string(&agent_prompt).unwrap(),
+            fresh_prompt,
+            "test setup: agent symlink must resolve into the library after the first seed"
+        );
+
+        fs::write(&library_prompt, STALE).unwrap();
+        fs::write(library_dir.join(".manifest-hash"), "stale").unwrap();
+
+        StaleHome {
+            global_home,
+            agent_home,
+            skills_dir,
+            library_prompt,
+            agent_prompt,
+            fresh_prompt,
+        }
+    }
+
+    /// V1 — AC1/AC7: `update` converges a stale library back to the binary's
+    /// manifest, and the agent reads the converged content through the symlink
+    /// materialised in the `skills_dir` the command was given.
+    #[test]
+    fn update_resyncs_stale_library_content_through_agent_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = provision_stale_home(tmp.path());
+
+        update_skills(&h.global_home, &h.agent_home, &h.skills_dir, None, None).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&h.library_prompt).unwrap(),
+            h.fresh_prompt,
+            "library content must be resynced from the binary's manifest by `skills update` \
+             (mika#2340: a symlink-only refresh leaves it STALE)"
+        );
+        assert_eq!(
+            fs::read_to_string(&h.agent_prompt).unwrap(),
+            h.fresh_prompt,
+            "the prompt the agent resolves through its symlink must be the resynced one"
+        );
+
+        // B1 precondition made measurable: the symlink the agent reads lives in
+        // the `skills_dir` passed to `update_skills`, and points into the
+        // library of the `global_home` passed alongside — not into a directory
+        // the composite might have recomputed elsewhere. A fixture where both
+        // paths coincide proves nothing on its own; the assertion has to name
+        // `skills_dir` explicitly.
+        let link = h.skills_dir.join(SKILL);
+        let meta = fs::symlink_metadata(&link).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "{} must be a symlink into the library",
+            link.display()
+        );
+        let target = fs::read_link(&link).unwrap();
+        let target = if target.is_absolute() {
+            target
+        } else {
+            h.skills_dir.join(target)
+        };
+        assert_eq!(
+            target.canonicalize().unwrap(),
+            home::library_skills_dir(&h.global_home)
+                .join(SKILL)
+                .canonicalize()
+                .unwrap(),
+            "agent symlink must resolve into `<global_home>/skills/<skill>`"
+        );
+    }
+
+    /// V1.5 — AC7: the symlink-only refresh (what `update_skills` did before
+    /// mika#2340) leaves the stale content in place on both sides. This pins
+    /// V1's discriminating power, not `update_skills`.
+    ///
+    /// If this test ever goes red while nothing is broken, read it as: V1 has
+    /// stopped being discriminating. `materialize_agent_skill_links` learned to
+    /// rewrite library content, so a regression of `update_skills` to that call
+    /// alone would no longer fail V1 — V1 would stay green proving strictly less
+    /// than it claims. Do not "fix" this by deleting the test; find V1 a new
+    /// negative control.
+    #[test]
+    fn symlink_only_refresh_leaves_stale_library_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = provision_stale_home(tmp.path());
+
+        let library_dir = home::library_skills_dir(&h.global_home);
+        let identity = mika_agent::prompt::load_identity(&h.agent_home);
+        let allowlist = identity.skills.allowlist.as_deref();
+        bundled_skills::materialize_agent_skill_links(&library_dir, &h.skills_dir, allowlist);
+
+        const WHY: &str = "V1's negative control: `materialize_agent_skill_links` alone is expected \
+             to leave library content untouched. If it now resyncs content, V1 no longer \
+             discriminates a symlink-only regression of `update_skills` — give V1 a new \
+             negative control instead of deleting this test";
+        assert_eq!(
+            fs::read_to_string(&h.library_prompt).unwrap(),
+            STALE,
+            "{WHY} (library side)"
+        );
+        assert_eq!(
+            fs::read_to_string(&h.agent_prompt).unwrap(),
+            STALE,
+            "{WHY} (agent symlink side)"
+        );
+    }
+}

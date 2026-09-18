@@ -87,7 +87,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `cargo run --bin mika-spirit` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
 - `VITE_MIKA_DASHBOARD_TOKEN=<token> npm run dev:dashboard` — Run dashboard dev server (builds `@samidarko/ui` first, requires mika-spirit on :8080)
 - `npm run build --prefix dashboard` — Build dashboard for production (sets `VITE_BASE_PATH=/dashboard/` automatically)
-- `make deploy` — Full deploy: build dashboard + release binaries with telemetry, install to `~/.local/bin/`, restart services. Prints the built SHA and warns when local HEAD is behind `origin/main`.
+- `make deploy` — Full deploy: build dashboard + release binaries with telemetry, install to `~/.local/bin/`, restart services. Prints the built SHA and warns when local HEAD is behind `origin/main`. A change under `skills/bundled/` reaches an agent **only through this rebuild** — see [Deploying a bundled-skill change](#deploying-a-bundled-skill-change-mika2340) below.
 - `cargo clippy` — Lint
 - `cargo fmt` — Format
 - `docker build -f Dockerfile.agent -t mika-agent:dev .` — Build agent container image
@@ -97,6 +97,44 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `make calibrate-mika-arch MODEL=anthropic/claude-opus-4-6` — Run mika-arch calibration suite
 - `make calibrate-mika-qa MODEL=anthropic/claude-sonnet-4-6` — Run mika-qa calibration suite
 - `scripts/pr-origin-report.sh --since <date> --until <date>` — Merged PRs over a window, split by origin (see below)
+
+### Deploying a bundled-skill change (mika#2340)
+
+**`~/.mika/skills/` is a projection of the binary, not of the checkout.** Nothing
+reads `skills/bundled/` at runtime: `build.rs` compiles it into
+`BUNDLED_SKILL_MANIFESTS`, and the library every agent symlinks into is written
+from that constant by `seed_bundled_skill_library()`. An edited prompt in the
+working tree is invisible to every agent until a binary that embeds it runs a
+seed. The chain is **rebuild → seed → read**:
+
+1. `make deploy` embeds the new manifest set and its hash.
+2. Any `mika` subcommand routed through `init_base_for_agent`, the daemon at
+   startup, and `mika skills --agent <a> update` call
+   `seed_bundled_skills_if_needed()` — hash-gated re-extraction of the library,
+   then re-materialisation of the agent's symlinks. Since mika#2340 `update`
+   resyncs the library **content**; before, it refreshed the symlinks alone and
+   printed "Refreshed bundled-skill symlinks.", which read as a content refresh
+   while `system_prompt.md` stayed a week old (2026-09-16, deploy of #2339).
+3. `system_prompt.md` is lazy-loaded through the symlink on the next turn.
+
+Running `update` from a stale binary re-extracts a stale library and reports
+success honestly — the hash it checks is its own. The remedy is step 1, never a
+second run of step 2.
+
+**Probe:** `cat ~/.mika/skills/.manifest-writer` — a JSON sidecar
+(`version`, `git_hash`, `attested_at`, `manifest_hash`, `extracted`) written
+atomically on **every** seed pass, including the ones the hash gate
+short-circuits, so a rebuild that touched no bundled prompt never shows an older
+sha on a conformant library. `mika skills --agent <a> update` prints the same
+record as `attested by: mika <version> (<sha>) at <instant>`. After a deploy that
+sha must be the one you just built; if it is and the agent's resolved prompt
+still differs from the checkout, the defect is upstream (build-time discovery or
+extraction), not in the seed. `git_hash: "unknown"` means a binary built outside
+a git checkout, not a failed deploy. A seed by a binary whose `version` is
+strictly lower than the recorded one emits `bundled_library_downgrade` (WARN)
+and proceeds — the daemon and the CLI both write this library and nothing orders
+them; the guard names the rollback, it does not refuse it. Full reference in
+`docs/skills.md § Deploying a change to a bundled skill`.
 
 ### PR origin (mika#2026)
 
