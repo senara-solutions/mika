@@ -1430,17 +1430,95 @@ fn update_skills(
 ) -> Result<()> {
     use mika_agent::skills::install::UpdateResult;
 
-    // Refresh bundled-skill symlinks first (mika#1213): walk the agent's
-    // identity allowlist and (re)materialize `<skills_dir>/<skill>` as a
-    // symlink into the canonical library at `<global_home>/skills/<skill>`.
-    // Idempotent — no-op when symlinks are already correct. Runs even
-    // when no marketplace skills are installed.
+    // Refresh the bundled-skill library AND the per-agent symlinks (mika#2340).
+    //
+    // This used to call `materialize_agent_skill_links` alone and print
+    // "Refreshed bundled-skill symlinks." — a sentence about the *link*, read by
+    // the operator as a sentence about the *content*. Every other `mika`
+    // subcommand seeds the library on its way through `init::init_base_for_agent`;
+    // `skills` was the only one that did not, and it is the one the deployment
+    // procedure names. The gap sat exactly where the documented gesture crossed.
+    //
+    // Route through the canonical composite rather than recomposing its parts
+    // here: a second definition of "refresh the bundled skills" is free to
+    // diverge from the first at the next change — the class this repo has
+    // already had to undo twice (`grooming_marker`, mika#2158; the dead
+    // supersede query, mika#2335).
+    //
+    // Precondition that makes the switch safe, verified rather than assumed:
+    // the symlink target does not move. The call being replaced was
+    // *parameterised* on `skills_dir`, while the composite *recomputes*
+    // `agent_home.join("skills")` internally — and `run` above builds
+    // `skills_dir` with that same expression from that same `agent_home`.
+    // `skills_dir` does NOT become dead: the marketplace branch below still
+    // reads it.
     if name.is_none() {
+        // `Settings` rather than a local `std::env::var`: hand-reading
+        // `MIKA_DISABLE_BUNDLED_SKILLS` would reopen the divergent truth table
+        // mika#2220 measured (`MIKA_LOG_LLM_BODIES=True` armed the daemon and
+        // was a silent no-op CLI-side). The loader is already in reach — line
+        // ~288 loads it for the git token.
+        //
+        // A load failure means enabled + WARN: that is the production default,
+        // and refusing to refresh because the config is unreadable would
+        // restore precisely the silence this closes.
+        let disabled = match mika_common::config::Settings::load_for_agent(global_home, agent_home)
+        {
+            Ok(s) => s.disable_bundled_skills,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to load settings while refreshing bundled skills; \
+                     assuming MIKA_DISABLE_BUNDLED_SKILLS=false"
+                );
+                false
+            }
+        };
+
+        mika_agent::startup::seed_bundled_skills_if_needed(agent_home, disabled);
+
         let library_dir = home::library_skills_dir(global_home);
-        let identity = mika_agent::prompt::load_identity(agent_home);
-        let allowlist = identity.skills.allowlist.as_deref();
-        bundled_skills::materialize_agent_skill_links(&library_dir, skills_dir, allowlist);
-        println!("\n  Refreshed bundled-skill symlinks.");
+        if disabled {
+            // Say it rather than printing a manifest/writer pair that describes
+            // a state this run deliberately did not refresh.
+            println!("\n  Refreshed bundled-skill symlinks and support dirs only.");
+            println!("    MIKA_DISABLE_BUNDLED_SKILLS is set — skill content was NOT resynced.");
+            println!("    library: {}", library_dir.display());
+        } else {
+            println!("\n  Refreshed bundled-skill library and symlinks.");
+            println!("    library: {}", library_dir.display());
+            // Read the sidecar back instead of widening the composite's
+            // signature for one printer (it returns `()` and has four
+            // production call sites). The read-back is also the more honest
+            // report: it states the fact on disk, not an intention in memory.
+            match bundled_skills::read_manifest_writer(&library_dir) {
+                Some(w) => {
+                    println!("    manifest: {}", w.manifest_hash);
+                    // "attested", not "written": by mika#2340 the record is
+                    // refreshed on the confirming pass too, so "written by"
+                    // would be false to the letter. `extracted` is deliberately
+                    // not printed — reading `false` as "nothing happened" is
+                    // the very link-versus-content confusion this closes.
+                    println!(
+                        "    attested by: mika {} ({}) at {}",
+                        w.version, w.git_hash, w.attested_at
+                    );
+                    if w.git_hash == "unknown" {
+                        println!(
+                            "    note: a binary built outside a git checkout stamps \
+                             \"unknown\" — not a failed deploy."
+                        );
+                    }
+                }
+                None => {
+                    println!(
+                        "    attested by: (no {} record — see docs/skills.md \
+                         § Deploying a change to a bundled skill)",
+                        bundled_skills::MANIFEST_WRITER_FILE
+                    );
+                }
+            }
+        }
     }
 
     let lock = marketplace::read_lock(agent_home);
