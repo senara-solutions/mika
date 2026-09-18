@@ -1770,7 +1770,18 @@ fi
 # _rescue_dirty_worktree(), so the extraction anchors on the function rather than
 # on the inline `Unit 1` comment. Same assertions, same block — new address.
 RESCUE_BLOCK=$(sed -n '/^_rescue_dirty_worktree() {/,/^}$/p' "$DISPATCH_LIB")
-assert_contains "Rescue uses pathspec exclusion :!.claude/commands/" ":!.claude/commands/" "$RESCUE_BLOCK"
+# mika#2348 D2 hoisted the literal exclusions into the shared
+# RESCUE_EXCLUDE_PATHSPEC array (one list, every add site). The intent is
+# unchanged — scaffold paths never land in a rescue commit — so the assertion
+# follows the array: the add line must expand it, and the definition must still
+# carry the scaffold exclusions.
+RESCUE_EXCLUDE_DEF=$(grep -E '^RESCUE_EXCLUDE_PATHSPEC=\(' "$DISPATCH_LIB" | head -1)
+assert_contains "Rescue git add expands RESCUE_EXCLUDE_PATHSPEC (mika#2348 D2)" \
+    'add -A -- "${RESCUE_EXCLUDE_PATHSPEC[@]}"' "$RESCUE_BLOCK"
+assert_contains "RESCUE_EXCLUDE_PATHSPEC excludes :!.claude/commands/" \
+    ":!.claude/commands/" "$RESCUE_EXCLUDE_DEF"
+assert_contains "RESCUE_EXCLUDE_PATHSPEC excludes :!.claude/claude-pilot.json" \
+    ":!.claude/claude-pilot.json" "$RESCUE_EXCLUDE_DEF"
 assert_contains "Rescue has empty-index guard (diff --cached --quiet)" "diff --cached --quiet" "$RESCUE_BLOCK"
 assert_contains "Rescue uses RESCUED_FILES for message" 'RESCUED_FILES' "$RESCUE_BLOCK"
 
@@ -3113,8 +3124,17 @@ assert_contains "Gate fires only when HEAD has advanced (PRE != POST)" \
     'PRE_RUN_HEAD" != "$POST_RUN_HEAD"' "$GATE_BLOCK"
 assert_contains "Phase A: trailing dirty rescue with wip() prefix" \
     'wip(${REPO}#${ISSUE_NUM}): trailing content after pilot end_turn (mika#1383)' "$GATE_BLOCK"
-assert_contains "Phase A: same scaffold-path exclusion as mika#1282 (.claude/commands, claude-pilot.json)" \
-    ":!.claude/commands/" "$GATE_BLOCK"
+# mika#2348 D2: the exclusion is the shared RESCUE_EXCLUDE_PATHSPEC array, not
+# a literal on the add line — assert the gate expands it, and that the array
+# still carries the two scaffold exclusions (same list as mika#1282, by
+# construction rather than by copy).
+GATE_EXCLUDE_DEF=$(grep -E '^RESCUE_EXCLUDE_PATHSPEC=\(' "$DISPATCH_LIB" | head -1)
+assert_contains "Phase A: same scaffold-path exclusion as mika#1282 (git add expands RESCUE_EXCLUDE_PATHSPEC)" \
+    'add -A -- "${RESCUE_EXCLUDE_PATHSPEC[@]}"' "$GATE_BLOCK"
+assert_contains "Phase A: RESCUE_EXCLUDE_PATHSPEC excludes :!.claude/commands/" \
+    ":!.claude/commands/" "$GATE_EXCLUDE_DEF"
+assert_contains "Phase A: RESCUE_EXCLUDE_PATHSPEC excludes :!.claude/claude-pilot.json" \
+    ":!.claude/claude-pilot.json" "$GATE_EXCLUDE_DEF"
 
 # mika#1679 (AC1): the gate must NOT create a PR. Path A creating a PR is what
 # set PR_URL and shadowed Path B. The negative checks run against the CODE only
