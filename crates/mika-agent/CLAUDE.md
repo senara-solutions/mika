@@ -665,6 +665,64 @@ that commit can emit, and the death did the rest. See § *Unknown-Trigger Veto L
 below; the root cause (merged code ≠ running code) is not in this repo and is
 tracked as follow-up.
 
+### Hot STOP for `auto_pull` (mika#2329)
+
+`crates/mika-agent/src/auto_pull_stop.rs` — **sole reader** of the sentinel file
+`~/.mika/state/auto-pull-stop`. Its existence stops the feeder at the next tick
+(≤ 10 min, `AUTO_PULL_CRON`); removing it resumes it. The content is never read.
+
+**Why a file and not the env var the ticket proposed first.** `mika-spirit` calls
+`load_dotenv` **once** at startup and nothing watches the file afterwards; a live
+Linux process's environment is not mutable from outside, so **editing `~/.mika/.env`
+changes nothing about what `std::env::var` returns**, even called every tick.
+Re-reading the variable at tick time would have moved the defect one notch and made
+it *harder* to see, since the code would then look like it re-reads. And the house
+deliberately freezes its `MIKA_*` variables (four are documented "not
+hot-swappable"): making one of them hot would create an invisible exception between
+two variables nothing distinguishes — notably `MIKA_DEV_WIP_RESCUE`, the twin form
+that does not re-read.
+
+**The row is never touched, and that is the design.** The short-circuit sits at the
+**head** of `dispatch_auto_pull_groomed`, before `resolve_periodic_scan_token` (two
+token resolutions, one potentially a GitHub App exchange over the network) and
+before the two `gh` fetches — same placement reasoning as mika#2279's gate 2c. The
+recurring row keeps ticking; only its dispatch returns early. **Reversibility is
+therefore not machinery but the absence of machinery**: no contact with the
+mika#1742 anti-zombie guard, the mika#2271 config-cancel exemption, or
+`RECURRING_ZOMBIE_GRACE_HOURS`. The boot-time knob, by contrast, *cancels* the row —
+which is precisely what cost mika#2271 and its still-present repair machinery.
+
+**The WARN is what actually closes the incident.** On the non-short-circuited path
+(the predicate's population — if the process had booted with the knob, the row would
+be cancelled and no tick would run at all), `stale_env_knob` reads the `.env`
+**files** — per-agent then global, the mika#2218 order — and emits
+`auto_pull_stop_stale_env_knob` when one carries `MIKA_DEV_AUTO_PULL=0`. Without it
+the defect stays open in its most dangerous form: **a silently inoperative STOP reads
+exactly like a STOP that works.** Inverse mirror of mika#2205.
+
+**SOLE WRITER** of `tool_name = 'auto_pull_stop'`, one row per **transition**
+(`armed` / `lifted`) — never per tick (mika#2131 doctrine). The INFO line, by
+contrast, fires on every short-circuited tick: for a switch, liveness *is* the
+information (Signal P precedent, mika#2156). Transition state is an `AtomicBool` on
+the dispatcher and is **lost on restart, deliberately** — a fresh process
+re-photographs what it finds.
+
+**Fail-open, named:** `Path::exists()` returns `false` on any access error. Fail-closed
+is not cleanly implementable (`exists()` cannot separate "absent" from "unreadable",
+and `symlink_metadata()` would make the nominal "no `state/` dir" case a permanent
+STOP). What makes that acceptable is the **visibility**, not the reasoning: the
+operator sees the effect in ≤ 10 min. If the reader ever becomes fallible in a way
+the operator cannot observe (DB, network), redo the trade-off rather than transport it.
+
+**Scope:** `auto_pull` only. `is_stopped`/`stop_file_path` are parameterized by scan
+name so extending to `wip_rescue` / `qa_review_reconcile` is one line each — not done
+here, because stopping QA review is not the same decision as stopping the feeder.
+Structural guard `mika2329_le_chemin_du_fichier_sentinelle_a_un_seul_lecteur` refuses
+a second occurrence of the path literal under `src/`; a copy would make no decision
+wrong the day it is written, which is exactly why no behavioural test can see it
+(`grooming_marker` precedent). Operator surfaces, the exact gesture, and the
+post-deploy probe: root `CLAUDE.md` § *Optional (STOP global à chaud — mika#2329)*.
+
 ### Unknown-Trigger Veto Lift (mika#2337)
 
 **The failure this closes is a veto, not a missing wire.** A `run_skill` recurrence

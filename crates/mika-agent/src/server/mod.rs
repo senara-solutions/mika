@@ -556,6 +556,12 @@ async fn init_agent(
         tools: tool_registry.clone(),
         skills: skill_registry.clone(),
         home_dir: agent_home.to_path_buf(),
+        // mika#2329 — le home global, pour le fichier sentinelle du STOP à chaud.
+        // `home_dir` juste au-dessus est per-agent ; le précédent maison des
+        // fichiers d'état (`state/pilot-gitconfig`, `state/pr-origin-epoch`) est
+        // global. `global_home` est déjà un paramètre de cette fonction, donc le
+        // câblage n'a rien à dériver.
+        global_home_dir: global_home.to_path_buf(),
         message_sender: Some(engine_sender),
         embedding_client: embedding_client.clone(),
         brave_api_key,
@@ -570,6 +576,10 @@ async fn init_agent(
         cli_mode: false,
         settings: agent_settings.clone(),
         pr_reviews_posted: Some(pr_reviews_posted),
+        // mika#2329 — état initial « non armé ». Perdu au redémarrage à dessein :
+        // un process neuf re-photographie l'état qu'il trouve et écrit une
+        // transition si le STOP est déjà armé au premier tick.
+        auto_pull_stop_armed: AtomicBool::new(false),
     });
 
     let task_engine = Arc::new(tokio::sync::Mutex::new(TaskEngine::new(
@@ -1851,6 +1861,7 @@ mod tests {
             skills: Arc::new(SkillRegistry::empty()),
             message_sender: None,
             home_dir: std::path::PathBuf::from("/tmp/mika-test"),
+            global_home_dir: std::path::PathBuf::from("/tmp/mika-test"),
             embedding_client: None,
             brave_api_key: None,
             github_token: None,
@@ -1862,6 +1873,7 @@ mod tests {
             cli_mode: false,
             settings: test_settings(),
             pr_reviews_posted: None,
+            auto_pull_stop_armed: AtomicBool::new(false),
         });
         let engine = Arc::new(tokio::sync::Mutex::new(TaskEngine::new(
             db,

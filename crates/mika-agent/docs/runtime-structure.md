@@ -21,6 +21,10 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 ├── data/
 │   ├── mika.db                       # Shared SQLite database (all agents)
 │   └── mika.db.vN-backup             # Auto-backup before migrations
+├── state/                            # Operator-writable runtime state (global, not per-agent)
+│   ├── pilot-gitconfig               # Pilot git identity (dispatch-lib.sh)
+│   ├── pr-origin-epoch               # PR-origin marker cut-off (mika#2026)
+│   └── auto-pull-stop                # Presence = auto_pull STOP (mika#2329, hot)
 ├── skills/                           # Canonical bundled-skill library (0700)
 │   ├── .manifest-hash                # Hash gate — idempotent across restarts
 │   ├── _shared/                      # Support directory (dispatch plumbing)
@@ -81,6 +85,8 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 ```
 
 **Key invariant:** The database is shared across all agents (`~/.mika/data/mika.db`). Agent/team home directories are used only for config, skills, and file I/O — never for database paths. Always use `home::container_db_path()`.
+
+**`state/` is global, never per-agent.** Every file under it is a runtime fact about the installation, not about one agent, and the three current entries were all written that way independently (`dispatch-lib.sh` resolves `$HOME/.mika/state/` and `${MIKA_HOME:-$HOME/.mika}/state/`). `~/.mika/state/auto-pull-stop` (mika#2329) is the one an operator poses by hand: **its existence stops the `auto_pull` feeder at the next tick (≤ 10 min), and removing it resumes it** — no restart, no row touched. The content is never read, so an empty file is a valid STOP. On a fresh installation `state/` may not exist yet; `mkdir -p` first. See the root `CLAUDE.md` § *Optional (STOP global à chaud — mika#2329)* for the gesture, the log signals, and the distinction from the boot-time `MIKA_DEV_AUTO_PULL` knob, **which does not cut anything hot**.
 
 **Remote mode bypass (R1 ascension architecture, 2026-06-09):** `mika ask --remote <URL>` (or `MIKA_REMOTE_AGENT_URL`) dispatches via A2A to a cloud Mika agent. The local `~/.mika/data/mika.db` is **not touched** in this path — no session row, no messages, no LLM call accounting. Session state for the conversation lives on the cloud agent's container. The runtime directory is still consulted for `.env` loading (auth tokens), but no writes occur.
 
