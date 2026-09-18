@@ -3412,6 +3412,101 @@ pub async fn check_onboarding(db: &AsyncDatabase) -> bool {
         .unwrap_or(true)
 }
 
+/// Les effets de bord d'une image retenue (mika#1784) : la ligne marqueur, la
+/// ligne d'audit, le `warn!`.
+///
+/// Séparés de [`crate::image_disposition::decide`], qui reste pure. Ce qui vit
+/// ici est ce qui ne peut vivre là-bas : la base et la session.
+///
+/// **Le tour n'est PAS mis en échec.** Sur `Withheld`, il tourne normalement avec
+/// la légende seule — et, grâce au marqueur, le modèle répond correctement
+/// *qu'il ne peut pas lire l'image* au lieu de devoir le deviner. C'est l'AC1
+/// branche B, obtenue sans branche d'erreur.
+///
+/// **Pourquoi aucune ligne marqueur sur `Transmitted`** (symétrie apparente) :
+/// elle ajouterait une écriture en base à *chaque* tour avec image pour dire ce
+/// que l'image elle-même dit déjà mieux. La ligne n'est écrite que sur la
+/// population fautive, et sa seule présence est un signal.
+///
+/// Fail-open : un échec d'écriture ne fait pas échouer le tour. Il est
+/// journalisé — perdre la trace est un défaut d'observabilité, perdre le tour
+/// serait le défaut d'Al.
+async fn record_withheld_images(
+    db: &AsyncDatabase,
+    session_id: &str,
+    trace_id: &str,
+    scope_task_id: Option<&str>,
+    disposition: &crate::image_disposition::ImageDisposition,
+) {
+    use crate::image_disposition::{
+        IMAGE_WITHHELD_AUDIT_TOOL_NAME, ImageDisposition, withheld_context_marker,
+    };
+
+    let ImageDisposition::Withheld {
+        count,
+        provider,
+        model,
+    } = disposition
+    else {
+        return;
+    };
+
+    // Le compteur de la capacité manquante, et l'entrée de l'AC3 : chaque ligne
+    // est une image qu'un utilisateur a envoyée et que Mika n'a pas lue.
+    warn!(
+        event = "image_withheld_no_vision",
+        provider = %provider,
+        model = %model,
+        count = *count,
+        agent_id = %db.agent_id,
+        session_id = %session_id,
+        "provider does not declare vision; user images withheld and the model told so"
+    );
+
+    // Rôle `system` : déjà le véhicule des marqueurs de contexte du substrat
+    // (converti en `User` pour les providers, « e.g. rewind notices »).
+    if let Err(e) = db
+        .save_message_with_task_context(
+            session_id,
+            "system",
+            &withheld_context_marker(*count),
+            None,
+            Some(trace_id),
+            false,
+            scope_task_id,
+        )
+        .await
+    {
+        warn!(
+            event = "image_withheld_marker_write_failed",
+            error = %e,
+            session_id = %session_id,
+            "could not persist the image-withheld context marker; the model may infer contents"
+        );
+    }
+
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            IMAGE_WITHHELD_AUDIT_TOOL_NAME,
+            &format!("agent:{}", db.agent_id),
+            None,
+            Some(&format!("{provider}/{model}")),
+            Some(&format!(
+                "{count} image(s) withheld — provider declares no vision"
+            )),
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(
+            event = "image_withheld_audit_write_failed",
+            error = %e,
+            "could not write the image_withheld_no_vision audit row"
+        );
+    }
+}
+
 /// After onboarding, extract the user's name from user_summary and create
 /// a people record. This guarantees the user exists in the people table
 /// regardless of whether the agent called store_fact.
@@ -3574,15 +3669,16 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
     // Skip for callback turns — the raw result is already persisted as role='tool_result'
     // by the caller, and the framing wrapper is an internal prompt construct.
     if !params.is_callback_turn {
-        let save_text = if params.user_images.is_empty() {
-            params.user_message.to_string()
-        } else {
-            format!(
-                "[{} image(s) attached]\n{}",
-                params.user_images.len(),
-                params.user_message
-            )
-        };
+        // mika#1784 — `received`, jamais `attached`. La disposition n'est pas
+        // connaissable ici : le provider effectif dépend du skill matching, qui
+        // n'a pas encore eu lieu. Affirmer la transmission à ce point écrivait
+        // `[1 image(s) attached]` en base même quand l'image était droppée, et
+        // l'historique répétait ensuite cette affirmation au modèle à chaque
+        // tour suivant — l'invitation à la fabrication que l'AC2 ferme.
+        let save_text = crate::image_disposition::user_message_save_text(
+            params.user_message,
+            params.user_images.len(),
+        );
         params
             .db
             .save_message_with_task_context(
@@ -3672,15 +3768,14 @@ pub async fn run_agent_with_deadline(
         .clone()
         .unwrap_or_else(mika_common::trace::generate_trace_id);
     if !params.is_callback_turn {
-        let save_text = if params.user_images.is_empty() {
-            params.user_message.to_string()
-        } else {
-            format!(
-                "[{} image(s) attached]\n{}",
-                params.user_images.len(),
-                params.user_message
-            )
-        };
+        // mika#1784 — même contrat que `run_agent` : `received`, jamais
+        // `attached`. Ce chemin n'est pas un chemin de production (seul
+        // `tests/eval/harness.rs` l'appelle), mais un harness qui diverge de la
+        // production ne teste plus la production.
+        let save_text = crate::image_disposition::user_message_save_text(
+            params.user_message,
+            params.user_images.len(),
+        );
         params
             .db
             .save_message_with_metadata(
@@ -3904,6 +3999,18 @@ async fn run_agent_inner(
     // counted, `max_tokens` bounds *how large* the result may be, and they close
     // two different axes — a session that iterates (plan v1, review, plan v2 …)
     // is bounded by the second and not the first.
+    // mika#1784 — le sort des images de ce tour, décidé UNE fois, ici.
+    //
+    // L'emplacement n'est pas libre. Il doit être APRÈS la résolution
+    // d'`effective_llm` (le provider qui recevra vraiment la requête : plus haut,
+    // seul `llm` est connu, et décider sur lui est l'affirmation non fondée que
+    // ce bloc existe pour supprimer) et AVANT le rechargement de l'historique
+    // juste en dessous, qui est ce qui fait qu'un seul geste ferme le tour
+    // courant ET tous les suivants : la ligne marqueur écrite ici est reprise par
+    // ce rechargement.
+    let image_disposition = crate::image_disposition::decide(params.user_images, effective_llm);
+    record_withheld_images(db, session_id, trace_id, scope_task_id, &image_disposition).await;
+
     let history_config = &ctx.identity.context.history;
     let scoped_session_id = match history_config.scope {
         prompt::HistoryScope::Session => Some(session_id),
@@ -3973,10 +4080,14 @@ async fn run_agent_inner(
         })
         .collect();
 
-    // Attach images to the last user message if present and provider supports vision
-    if let Some(last) = messages.last_mut().filter(|m| {
-        m.role == LlmRole::User && !params.user_images.is_empty() && llm.supports_vision()
-    }) {
+    // Attach images to the last user message — only on `Transmitted` (mika#1784).
+    // La valeur vient de `decide()` ci-dessus, appelée avec `effective_llm` : ce
+    // site posait la question à `llm`, le provider de base, alors que la requête
+    // part sur `effective_llm`.
+    if let Some(last) = messages
+        .last_mut()
+        .filter(|m| m.role == LlmRole::User && image_disposition.transmits())
+    {
         let text = match &last.content {
             LlmContent::Text(t) => t.clone(),
             LlmContent::Blocks(_) => String::new(),
@@ -4069,13 +4180,11 @@ async fn run_agent_inner(
         None
     };
 
-    if !params.user_images.is_empty() && !llm.supports_vision() {
-        warn!(
-            provider = llm.provider_name(),
-            model = llm.model_name(),
-            "provider does not support vision; images will be ignored"
-        );
-    }
+    // mika#1784 — le `warn!` qui vivait ici est REMPLACÉ, pas doublé, par
+    // `record_withheld_images` plus haut : il ne nommait ni l'agent ni la
+    // session, donc il ne permettait pas de répondre « quel tenant a perdu une
+    // image ? », qui est la question de l'AC3. Il posait aussi la question à
+    // `llm` et non au provider qui reçoit la requête.
 
     info!(
         tool_count = tools_for_request.as_ref().map_or(0, |t| t.len()),

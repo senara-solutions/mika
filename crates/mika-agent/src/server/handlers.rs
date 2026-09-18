@@ -1567,8 +1567,48 @@ async fn run_agent_for_message(
             }
         }
         Err(e) => {
-            error!(error = %e, "agent loop failed");
-            let _ = sender_arc.send(AGENT_ERROR_REPLY).await;
+            // mika#1784 — un refus du provider sur un tour portant une image
+            // n'est plus un « hiccup ». Ferme le symptôme 1/3 d'Al : le cas où
+            // `supports_vision()` a répondu `true` à tort (il répond par rail,
+            // jamais par modèle), l'image est partie et le provider a refusé.
+            //
+            // L'attribution est conjonctive et étroite — voir
+            // `image_disposition::image_refusal_status`. Tout le reste (transport,
+            // timeout, 5xx, 429, parse, provider, other) garde le hiccup
+            // générique : attribuer un timeout à l'image serait une fausse
+            // attribution, c'est-à-dire de la fabrication.
+            match crate::image_disposition::image_refusal_status(&e, user_images.len()) {
+                Some(status) => {
+                    // Régime attendu : ZÉRO ligne. Toute occurrence est un rail
+                    // qui déclare la vision et dont le modèle ne l'a pas — la
+                    // moitié « trop permissive » du prédicat, rendue visible.
+                    //
+                    // `agent_provider`/`agent_model` et non `provider`/`model` :
+                    // la requête a pu être servie par un override `[llm]` de
+                    // skill, invisible depuis ici. Les nommer `provider`
+                    // laisserait la sonde 3 comparer deux champs qui ne
+                    // désignent pas toujours la même chose. L'écart entre ce
+                    // champ et le `provider` de `image_withheld_no_vision` est
+                    // précisément ce qui dénonce un override en jeu.
+                    warn!(
+                        event = "image_request_refused",
+                        error_class = %mika_common::llm::error::error_class::http(status),
+                        status,
+                        image_count = user_images.len(),
+                        agent_provider = a.llm.provider_name(),
+                        agent_model = a.llm.model_name(),
+                        error = %e,
+                        "provider refused a request carrying user images"
+                    );
+                    let reply =
+                        crate::image_disposition::image_refused_reply(a.tier.persona_profile());
+                    let _ = sender_arc.send(reply).await;
+                }
+                None => {
+                    error!(error = %e, "agent loop failed");
+                    let _ = sender_arc.send(AGENT_ERROR_REPLY).await;
+                }
+            }
         }
     }
 

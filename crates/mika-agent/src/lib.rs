@@ -16,6 +16,7 @@ pub mod db;
 pub mod evidence;
 pub(crate) mod github_graphql;
 pub mod grooming_marker;
+pub mod image_disposition;
 pub mod kg;
 pub mod live_pilot;
 pub mod mcp;

@@ -80,6 +80,11 @@ mod eval {
     mod test_dispatch_no_grooming_marker_guard;
     mod test_dispatch_task_has_open_pr_guard;
     mod test_error_handling;
+
+    // mika#1784 — une image non lue est un fait dit. Les unités de
+    // `image_disposition` ne verraient pas un `decide()` appelé au mauvais moment
+    // dans la boucle ; ces tests lisent ce que le modèle a reçu.
+    mod test_image_disposition_1784;
     mod test_intent_precondition_guard;
     mod test_internal_tagging;
     mod test_kg_budget_757;
