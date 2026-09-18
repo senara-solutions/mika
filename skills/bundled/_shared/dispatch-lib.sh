@@ -3571,7 +3571,7 @@ _post_flight_recovery() {
 
 Halt event: ${POLICY_DENY}
 
-Read the [rule-id] in brackets at the end of the halt event FIRST: the deny names a command and a rule, never a file it reads. A deny with no [rule-id] did not come from the deterministic classifier at all — it came from the canUseTool judgment stage, and no allow-list change will affect it. Widening the policy (a) or rewriting the dispatch context (b) are only meaningful once the rule is known.
+Read the halt event's bracketed [rule-id] FIRST — it is the last bracketed token, before the trailing (terminal)/(non-terminal) lethality marker. The deny names the refused tool call (a command, or the target path for Write/Edit/Read), never the contents of a file it read. A named [rule-id] is the rule that matched: read that rule. NO [rule-id] means the policy DEFAULT fired — no rule matched the call at all — and there, widening the allow-list to cover the legitimate shape (a) is exactly the remedy, not a dead end. Establish which of the two you have before choosing between (a) and rewriting the dispatch context (b).
 
 Likely a tier1 or tier2 allow-list gap in claude-pilot-py. Investigate the deny rule and either (a) widen the policy to include the legitimate command shape, or (b) rewrite the dispatch context so the pilot avoids the denied command. The pilot was prevented from completing its work — re-dispatching without addressing the substrate gap will hit the same wall.
 
@@ -3749,7 +3749,12 @@ dispatch-lib (mika#1383): rescued trailing dirty content into wip() commit; PR c
         _pilot_log_dir; PERSISTENT_STDERR_PATH="$_PILOT_LOG_DIR/${LOG_ID}.stderr"
         if [ -f "$PERSISTENT_STDERR_PATH" ] && [ -r "$PERSISTENT_STDERR_PATH" ]; then
             # Strip ANSI color codes, then extract the first [policy:deny] line.
-            # The line shape is `[policy:deny] <Tool>: <command>[ \[rule-id\]]`.
+            # The line shape is
+            #   `[policy:deny] <Tool>: <detail>[ \[rule-id\]] (terminal|non-terminal)`
+            # mika#2312: the trailing lethality marker (cpp#151) FOLLOWS the
+            # rule-id tag, so the rule-id is the last *bracketed* token, not the
+            # last token. An absent tag means `rule_id=None` — the policy default
+            # deny (no rule matched), NOT a non-deterministic refusal.
             POLICY_DENY=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$PERSISTENT_STDERR_PATH" 2>/dev/null \
                 | grep -m1 '\[policy:deny\]' || true)
         fi
@@ -3763,7 +3768,7 @@ dispatch-lib (mika#1383): rescued trailing dirty content into wip() commit; PR c
 
 Halt event: ${POLICY_DENY}
 
-Read the [rule-id] in brackets at the end of the halt event FIRST: the deny names a command and a rule, never a file it reads. A deny with no [rule-id] did not come from the deterministic classifier at all — it came from the canUseTool judgment stage, and no allow-list change will affect it. Widening the policy (a) or rewriting the dispatch context (b) are only meaningful once the rule is known.
+Read the halt event's bracketed [rule-id] FIRST — it is the last bracketed token, before the trailing (terminal)/(non-terminal) lethality marker. The deny names the refused tool call (a command, or the target path for Write/Edit/Read), never the contents of a file it read. A named [rule-id] is the rule that matched: read that rule. NO [rule-id] means the policy DEFAULT fired — no rule matched the call at all — and there, widening the allow-list to cover the legitimate shape (a) is exactly the remedy, not a dead end. Establish which of the two you have before choosing between (a) and rewriting the dispatch context (b).
 
 Likely a tier1 or tier2 allow-list gap in claude-pilot-py. Investigate the deny rule and either (a) widen the policy to include the legitimate research command shape, or (b) rewrite the dispatch context so the pilot avoids the denied command. The pilot was prevented from completing its work — re-grooming this ticket without addressing the substrate gap will hit the same wall.
 

@@ -23,10 +23,12 @@ toutes ses fonctions ont la signature `(argv, cwd) -> bool`, et `is_safe_cat` re
 `True` inconditionnellement. Les tickets dont l'objet est le contenu d'un prompt sont
 donc **groomables en sandbox**, et aucune contrainte de routage ne s'applique.
 
-Le marqueur `[policy:deny]` a la forme `[policy:deny] <Tool>: <commande> [<rule-id>]`.
-**Le `[<rule-id>]` final est ce qui attribue la cause** — et c'est la première chose à
-lire. Un refus **sans** `rule-id` ne vient pas de l'étage déterministe du tout, mais du
-jugement LLM atteint par `canUseTool` : aucun élargissement d'allow-list ne l'affectera.
+Le marqueur a la forme
+`[policy:deny] <Tool>: <detail>[ [<rule-id>]] (terminal|non-terminal)`.
+**Le `[<rule-id>]` est ce qui attribue la cause** — et c'est la première chose à lire.
+Son **absence** ne sort pas de l'étage déterministe : elle signifie `rule_id=None`,
+c'est-à-dire le **refus par défaut** de la policy — aucune règle n'a matché — et là,
+élargir l'allow-list est précisément le remède.
 
 ---
 
@@ -73,6 +75,19 @@ même boucle `for … do … done` — et elle passe. M1 réfute la thèse du co
 aussi la thèse de la forme `for`. M4 est la seule mesure *positive* : ce qui est refusé
 ce jour-là est la **chaîne composée**, et le classifier le dit dans son propre message.
 
+**Une tension non résolue, signalée plutôt que comblée.**
+`1817-mika-side-plugin-per-binary-safety-functions.md` énonce que `per_spawn.decompose()`
+refuse le control flow (`if`, `for`, `while`, …) « at the raw-source level ». M3 est une
+boucle `for` et elle passe. Les deux ne peuvent pas être vrais du même chemin de
+décision, et **ce document ne tranche pas lequel a tourné le 18 septembre** : le mode
+réellement armé (`MIKA_PERMISSION_POLICY_MODE`) n'est pas lisible depuis le sandbox. Une
+explication plausible existe — le mode `per_spawn` est un opt-in de Phase 1, et le chemin
+classique tier1/tier2 n'a pas cette règle — mais elle n'est pas mesurée, donc elle n'est
+pas écrite ici comme un fait. C'est exactement le genre de déduction qui a coûté trois
+erreurs à ce ticket. **Un lecteur qui bute sur la phrase de 1817 n'a pas tort de s'y
+fier ; il lui manque de savoir quel mode tournait.** Le trancher demande de lire
+l'environnement du service, hors sandbox.
+
 Ces mesures s'étendent au 14 septembre : `git log --since=2026-09-01 --
 tools/mika_permission_policy/` est vide, donc l'étage déterministe n'a pas changé entre
 les deux dates.
@@ -100,29 +115,52 @@ commande qui est refusée, pas ce qu'elle lit.
 
 ## La règle de lecture d'un `[policy:deny]`
 
-C'est la doctrine utile, et elle tient en quatre points.
+C'est la doctrine utile, et elle tient en quatre points. **Chacun est vérifié dans la
+source de `claude-pilot`, pas déduit** — voir l'avertissement de méthode plus bas, qui
+existe parce que la première rédaction de cette section s'est trompée exactement là.
 
-1. **Le marqueur nomme une commande et une règle, jamais un fichier qu'elle lit.** La
-   forme est `[policy:deny] <Tool>: <commande> [<rule-id>]` — documentée au commentaire
-   de `skills/bundled/_shared/dispatch-lib.sh` (« The line shape is
-   `[policy:deny] <Tool>: <command>[ \[rule-id\]]` ») et confirmée par la regex
-   d'extraction de `docs/solutions/workflow-issues/2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md`
-   (`\[policy:deny\] [A-Za-z]+: [^[]+\[[a-z-]+\]`).
+1. **Le marqueur nomme l'appel d'outil refusé, jamais le contenu d'un fichier lu.** La
+   forme réelle est :
 
-2. **Lire d'abord le `[<rule-id>]` en fin de ligne.** C'est lui qui attribue la cause, et
-   il est déjà dans le message que l'opérateur a sous les yeux. Aucune enquête n'est
-   nécessaire avant de l'avoir lu.
+   ```
+   [policy:deny] <Tool>: <detail>[ [<rule-id>]] (terminal|non-terminal)
+   ```
+
+   `<detail>` est le résumé de l'entrée de l'outil (`_summarize_input`,
+   `permissions.py`) : la **commande** pour `Bash`, le **chemin cible** pour
+   `Write`/`Edit`/`Read`. Un deny sur un `Write` nomme donc bien un fichier — celui
+   qu'on voulait écrire, jamais un fichier dont le contenu aurait été jugé. Le suffixe
+   de léthalité `(terminal)`/`(non-terminal)` (cpp#151, `ui.py`) **suit** le tag, donc
+   le `rule-id` est le dernier jeton *entre crochets*, pas le dernier jeton.
+
+2. **Lire d'abord le `[<rule-id>]`.** C'est lui qui attribue la cause, et il est déjà
+   dans le message que l'opérateur a sous les yeux. Aucune enquête n'est nécessaire
+   avant de l'avoir lu.
 
 3. **Ne jamais tronquer la commande en la rapportant.** mika#2312 coupe la commande à
    `do …` et s'arrête avant le crochet : le `…` a emporté exactement l'information qui
    aurait clos l'enquête, et le corps de la boucle avec — or un corps qui chaîne (`|`,
    `&&`) ou substitue (`$(…)`) est justement ce que M4 montre refusé.
 
-4. **Un refus sans `rule-id` désigne le troisième étage**, le jugement LLM atteint par
-   `canUseTool` (`.claude/claude-pilot.json` → `mika --agent mika-dev ask`, timeout
-   120 s). Étant un jugement, il peut diverger entre deux dates sans qu'aucun code ait
-   changé, et **aucun carve-out déterministe n'y changera rien**. Les règles
-   déterministes portent un `rule-id` ; un jugement n'en a pas.
+4. **Un refus SANS `rule-id` est le refus par défaut de la policy — et il est
+   déterministe.** `policy.py` rend `PolicyDecision(…, rule_id=None)` quand aucune règle
+   n'a matché ; `permissions.py` passe ce `None` tel quel à `log_policy_deny` ; `ui.py`
+   fait `tag = f" [{rule_id}]" if rule_id else ""`, donc la ligne s'affiche sans
+   crochets. Le `reason` correspondant, dans `policies/permissions.yaml`, est :
+
+   > `no matching policy rule -- denied by default (production posture; widen rules to
+   > allow new tool footprints)`
+
+   **Élargir l'allow-list est donc le remède de cette classe, pas une impasse.**
+   Attention : ce `reason` part dans le message de refus rendu à l'agent, pas dans la
+   ligne de log — l'opérateur qui lit le journal voit l'absence de tag, pas la phrase
+   qui l'explique. C'est ce que ce point existe pour traduire.
+
+   **Le relais `canUseTool` n'est pas la réponse** : il journalise par `log_relay_recv`,
+   jamais par `log_policy_deny`, donc il ne produit aucune ligne `[policy:deny]` — et il
+   n'est de toute façon atteignable que sous `MIKA_PILOT_POLICY_DISABLED=1` (rollback
+   d'urgence). Un refus qui n'émet aucune ligne `[policy:deny]` du tout est le seul
+   signal qui pointe hors de l'étage déterministe.
 
 ---
 
@@ -146,8 +184,9 @@ réparer un défaut inexistant.
 
 **Ce que la prochaine occurrence doit faire à la place :** lire le `rule-id`. S'il nomme
 une règle de chaîne ou de substitution, la commande est à réémettre autrement (un `head`
-simple plutôt qu'une chaîne composée). S'il est absent, c'est le troisième étage, et la
-réponse n'est pas dans ce registre.
+simple plutôt qu'une chaîne composée). S'il est **absent**, c'est le refus par défaut :
+aucune règle ne couvrait cet appel, et la question à poser est « cette forme mérite-t-elle
+une règle ? » — pas « quel fichier était protégé ? ».
 
 ---
 
@@ -156,32 +195,51 @@ réponse n'est pas dans ce registre.
 Les éléments cités par le ticket ne permettent pas de l'établir, et il faut le dire
 plutôt que de lui substituer une hypothèse. Trois causes restent compatibles :
 
-1. **Le corps tronqué de la boucle** — s'il chaînait ou substituait, c'est M4 qui
+1. **Le refus par défaut** — aucune règle ne couvrait la forme émise. C'est la classe la
+   plus fréquente, et elle est **déterministe** : voir le point 4 de la règle de lecture.
+2. **Le corps tronqué de la boucle** — s'il chaînait ou substituait, c'est M4 qui
    s'applique.
-2. **Le veto de chaîne**, dont `_split_compound_command` a un historique documenté de
+3. **Le veto de chaîne**, dont `_split_compound_command` a un historique documenté de
    faux positifs sur des greps à alternation
    (`2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md`, § Gap 1).
-3. **Le troisième étage** (jugement LLM), que M1–M3 ne peuvent pas exclure — un jugement
-   peut avoir refusé le 14 ce qu'il autorise le 18.
+
+Le jugement LLM, lui, **ne figure pas dans cette liste** : il ne produit aucune ligne
+`[policy:deny]` et n'est atteignable que sous `MIKA_PILOT_POLICY_DISABLED=1`. Une
+rédaction antérieure de ce document le désignait comme l'explication d'un refus sans
+`rule-id` ; c'était faux, et c'est la revue de code de mika#2312 qui l'a établi en
+citant la source.
 
 **Aucune des trois n'est une règle de contenu.** La conclusion de ce document ne dépend
 donc pas de savoir laquelle a mordu.
 
 **Pour trancher, si quelqu'un y revient :** récupérer la ligne complète sur l'hôte, hors
-sandbox — `grep -m1 'policy:deny' /var/log/claude-pilot/3587fe25.stderr` — et lire le
-`[rule-id]` final. Si ce `rule-id` nomme une règle de chemin ou de fichier, ce document
-est réfuté et la branche « over-block » redevient ouverte — mais elle se traiterait alors
+sandbox — `grep -m1 'policy:deny' /var/log/claude-pilot/3587fe25.stderr` — et lire son
+`[rule-id]`. Si ce `rule-id` nomme une règle de chemin ou de fichier, ce document est
+réfuté et la branche « over-block » redevient ouverte — mais elle se traiterait alors
 dans `claude-pilot`, pas dans ce dépôt.
 
 ---
 
 ## Le piège de méthode, nommé comme tel
 
-La première rédaction du plan de mika#2312 avait conclu « c'est la boucle `for` qui est
-refusée », sur la foi d'un document décrivant `decompose()` — et M3 l'a réfutée en une
-commande. C'est la même erreur que celle du ticket, d'un cran plus haut : une doctrine
-tirée d'une documentation plutôt que d'une mesure reproduit exactement l'inférence
-qu'elle prétend corriger.
+**Trois fois de suite, la même erreur, dont deux fois dans ce document.**
+
+1. Le ticket infère « le contenu est protégé » de deux commandes qui diffèrent sur deux
+   axes — l'inférence non contrôlée qui l'a ouvert.
+2. La première rédaction du plan conclut « c'est la boucle `for` qui est refusée », sur
+   la foi d'un document décrivant `decompose()` — M3 la réfute en une commande.
+3. La première rédaction de **ce document** affirme qu'un refus sans `rule-id` vient du
+   jugement LLM, par déduction d'architecture. La revue de code l'a réfutée en citant
+   `policy.py`, `ui.py` et `permissions.yaml` : c'est le refus par défaut, il est
+   déterministe, et son propre `reason` prescrit le remède que la phrase déclarait
+   inutile. Pire : la session qui écrivait cette phrase avait reçu **quatre fois** le
+   refus par défaut, sans `rule-id`, avec le mot « widen » dedans — la mesure était sous
+   les yeux de l'auteur pendant qu'il écrivait le contraire.
+
+La leçon n'est donc pas « mesurer plutôt que déduire », qui était déjà écrite ici et n'a
+pas suffi. C'est : **une affirmation causale sur un mécanisme se vérifie dans le code de
+ce mécanisme, ou ne s'écrit pas.** `claude-pilot` est lisible depuis le dépôt voisin ;
+rien n'obligeait à déduire.
 
 C'est la raison d'être du point 2 de la règle de lecture. Le `rule-id` est une **mesure**
 que le système émet lui-même ; tout le reste est une reconstruction.
@@ -191,22 +249,30 @@ que le système émet lui-même ; tout le reste est une reconstruction.
 ## Ce qui garde l'invariant
 
 - `tools/mika_permission_policy/tests/test_no_filesystem_access.py` — deux gardes
-  complémentaires. **(a)** une garde AST qui refuse tout import d'un module d'accès au
-  monde extérieur et tout appel au builtin `open` dans le registre : elle refuse la
-  *capacité*, pas une instance, donc un carve-out ajouté plus tard la fait rougir même si
-  personne n'a pensé à tester son chemin exact. **(b)** un pin comportemental qui affirme
-  l'**indifférence au chemin** des fonctions de lecture — même verdict pour un
-  `system_prompt.md`, un `skill.toml` voisin, un chemin inexistant et un chemin hors
-  worktree. Cible : `make test-permission-policy-plugin`.
-- Le message de classe C de `dispatch-lib.sh` (deux sites) enseigne désormais la règle de
-  lecture ci-dessus, avant d'envoyer chercher un trou d'allow-list.
+  complémentaires, **et chacune couvre ce que l'autre ne peut pas voir**. **(a)** une
+  garde AST qui refuse au registre toute *capacité* d'atteindre le monde extérieur :
+  import hors d'une **allow-list nommée** (pas une liste d'interdits, qui ne protège
+  qu'une écriture du défaut), appel à `open`, et les deux portes dynamiques `__import__`
+  et `importlib` par lesquelles une liste de noms se contourne. **(b)** un pin
+  comportemental qui affirme l'**indifférence au chemin et au cwd** sur **toute** entrée
+  de `get_policy()` — pas sur un échantillon.
+- **La limite, dite plutôt que sous-entendue :** (a) refuse une capacité, donc elle ne
+  voit pas un carve-out qui n'en demande aucune — `if argv[-1].endswith("system_prompt.md")`
+  n'importe rien et n'ouvre rien. C'est (b), et (b) seule, qui attrape cette forme ; c'est
+  pourquoi (b) balaie le registre entier. Un test épingle cette limite elle-même, pour
+  qu'elle reste une propriété vérifiée et non une phrase. Contre un auteur *déterminé*,
+  ni l'une ni l'autre n'est une frontière de sûreté : elles bornent la dérive de bonne foi.
+- Les deux gardes portent leur propre **pin d'anti-vacuité** (`TestTheGuardBites`) et
+  tournent en CI (`ci.yml`, job `Check`). Elles n'y tournaient pas quand ce document a
+  été écrit la première fois : une garde qu'aucun gate n'exécute est une décoration, et
+  c'est la revue de code qui l'a relevé.
+- Le message de classe C de `dispatch-lib.sh` (deux sites) enseigne la règle de lecture
+  ci-dessus, avant d'envoyer chercher un trou d'allow-list.
 
 **Ce que ces gardes ne couvrent pas :** les étages tier1/tier2 vivent dans `claude-pilot`,
 hors du périmètre dispatchable. L'invariant y est vrai aujourd'hui (listes de binaires,
 regex sur chaînes de commande — aucune lecture de fichier), mais rien ne l'y garde. Un
-jumeau de la garde côté `claude-pilot` est un ticket de suivi. Et le troisième étage, par
-nature, ne peut pas être gardé par un test déterministe : son signal distinctif est
-l'absence de `rule-id`, documenté ici et porté par le message de deny.
+jumeau de la garde côté `claude-pilot` est un ticket de suivi.
 
 ---
 
