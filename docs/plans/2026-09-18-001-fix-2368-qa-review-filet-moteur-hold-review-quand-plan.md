@@ -113,7 +113,7 @@ n'en sortent pas. Le call-site du filet (le dispatcher) ne peut donc pas savoir,
 l'état, qu'un verdict était dû et n'a pas été posté.
 
 **(F8) La garde de #2359 a DEUX sites d'enforcement, et le second est précisément
-notre population.** `agent_loop/mod.rs:2317` (chemin texte non vide) et `:3146`
+notre population.** `agent_loop/mod.rs:2319` (chemin texte non vide) et `:3147`
 (miroir sur la sortie à texte vide). Les deux portent la même conjonction
 (`EndTurn` + `qa_verdict_due` + budget non consommé + `!pr_review_posted_in_turn`).
 Le commentaire du second le décrit lui-même :
@@ -151,6 +151,15 @@ sur l'arbre mergé :
 L'implémentation ne réécrit aucun des trois : les recopier serait exactement la
 classe de duplication que `qa_build_callback.rs` a été créé pour fermer (voir son
 doc-comment, qui cite mika#2158).
+
+**Troisième relecture, sur l'arbre incluant #2369** (`53ddc37a`, mika#2363 — réduction
+de la taille d'entrée du tour arch). Aucune collision : ce correctif ne touche ni
+`pr_reviews_posted`, ni `deadline_verdict`, ni `build_callback_task`. Les huit faits
+ci-dessus ont été re-vérifiés un par un sur cet arbre ; trois divergences relevées et
+corrigées ici (les deux numéros de ligne de F8, le décompte des fichiers d'eval en
+C3, le terme d'abstention hérité en C4). Les numéros de ligne de ce plan dérivent à
+chaque merge et n'ont valeur que d'ancrage de relecture — ce qui ne dérive pas, ce
+sont les symboles nommés.
 
 ## Conception
 
@@ -241,11 +250,14 @@ toucher, six passent `None` :
 | `test_reaper_liveness_all_surfaces_2277.rs:218` | `None` |
 | `test_reaper_reaps_live_pending_pilot_2272.rs:217` | `None` |
 
-Deux autres fichiers d'eval (`test_ready_label_live_pilot_noop_2279.rs`,
-`test_supersede_kills_live_pilot.rs`) **nomment** la fonction en doc-comment pour
-décrire la forme de la row qu'ils fabriquent, sans l'appeler : ils ne compilent pas
-contre la signature et ne sont pas à toucher. La distinction vaut d'être écrite —
-elle change ce qu'un `cargo build` cassé signifie.
+**Trois** autres fichiers d'eval (`test_ready_label_live_pilot_noop_2279.rs:165`,
+`test_supersede_kills_live_pilot.rs:152`, `test_pilot_silent_stall_reaper.rs:21`)
+**nomment** la fonction en doc-comment pour décrire la forme de la row qu'ils
+fabriquent, sans l'appeler : ils ne compilent pas contre la signature et ne sont pas
+à toucher. La distinction vaut d'être écrite — elle change ce qu'un `cargo build`
+cassé signifie. Le discriminant est mécanique et se relit en une commande :
+`grep -rn 'build_callback_task(' crates/mika-agent/tests/eval/` rend exactement les
+deux appels ; toute autre occurrence est de la prose.
 
 Un second constructeur est explicitement exclu : le doc-comment de la fonction
 interdit la dérive entre sites de construction, et c'est la classe de bug que sa
@@ -260,14 +272,24 @@ Deux propagations, de sens inverse.
 `agent_loop/mod.rs:4867` le lit au lieu de poser `None`, et le commentaire qui
 affirme le contraire est corrigé. Les cinq constructions de `SilentAgentParams` dans
 `dispatcher.rs` (`:517`, `:729`, `:1135`, `:1545`, `:2310`) passent
-`self.pr_reviews_posted.as_ref()` ; les sites hors dispatcher passent `None`. La
-session du callback est neuve, donc le registre porte exactement ce que **ce tour-là**
-a posté — c'est la granularité voulue, et c'est ce qui rend AC7 vrai sans ajouter
-d'état.
+`self.pr_reviews_posted.as_ref()` ; les sites hors dispatcher passent `None`
+(`agent_loop/mod.rs:5583`, mode équipe, et le constructeur de test
+`dispatcher.rs:3547`). La session du callback est neuve, donc le registre porte
+exactement ce que **ce tour-là** a posté — c'est la granularité voulue, et c'est ce
+qui rend AC7 vrai sans ajouter d'état.
+
+**Un terme d'abstention de plus, hérité et non ajouté :** `DeadlineVerdictInput`
+documente déjà `pr_reviews_posted: None` comme *« hors mode serveur — le filet
+s'abstient alors, faute de pouvoir répondre à AC3 »*. Le filet généralisé garde ce
+terme tel quel. En production il ne retire rien de la population — le dispatcher
+reçoit le registre depuis `server/mod.rs:572`, et un callback de build QA n'existe
+pas hors mode serveur — mais il vaut d'être énuméré avec les quatre autres : un
+lecteur qui ne le trouve pas dans AC6 le lira comme un trou d'AC7 plutôt que comme
+le fail-safe qu'il est.
 
 **Vers le haut — le fait que le verdict était dû et n'a pas été posé.** `run_loop`
 gagne un out-param `qa_verdict_unmet: Option<&AtomicBool>`, posé aux **deux** sites
-de sortie que F8 établit — texte non vide (`:2317`) et miroir texte vide (`:3146`) —
+de sortie que F8 établit — texte non vide (`:2319`) et miroir texte vide (`:3147`) —
 sous le prédicat complémentaire de la garde : `qa_verdict_due` **et**
 `!pr_review_posted_in_turn(&all_tool_summaries)` **et** budget déjà consommé
 (`intent_guard_retries.contains(QA_VERDICT_REQUIRED_LABEL)`), immédiatement après le
@@ -371,7 +393,7 @@ tombe remplacerait un silence par une panne.
 | `crates/mika-agent/src/server/ready_label_handler.rs` | C3 (`None`) |
 | `crates/mika-agent/src/server/verdict_handler.rs` | C3 (`None`) |
 | `crates/mika-agent/src/task_engine/dispatcher.rs` | C3 (`None` ×2), C4 (registre ×5), câblage du filet + kill-switch |
-| `crates/mika-agent/src/agent_loop/mod.rs` | C4 (registre en silent, out-param `run_loop` posé aux **deux** sites de sortie `:2317`/`:3146`, `SilentTurnOutcome`), commentaire `:4994` corrigé |
+| `crates/mika-agent/src/agent_loop/mod.rs` | C4 (registre en silent, out-param `run_loop` posé aux **deux** sites de sortie `:2319`/`:3147`, `SilentTurnOutcome`), commentaire `:4994` corrigé |
 | `crates/mika-agent/src/qa_build_callback.rs` | `verdict_unmet_after_retry` (le prédicat complémentaire, lecteur unique) ; doc-comment `:38` : le filet n'est plus « à venir » |
 | 2 tests d'eval appelant `build_callback_task` (#2272, #2277) | C3 (`None`) |
 | `crates/mika-agent/CLAUDE.md`, `CLAUDE.md` racine | § Deadline Verdict Net généralisée ; env var ; signaux opérateur |
