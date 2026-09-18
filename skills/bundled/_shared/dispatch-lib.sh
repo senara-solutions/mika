@@ -3571,9 +3571,12 @@ _post_flight_recovery() {
 
 Halt event: ${POLICY_DENY}
 
+Read the [rule-id] in brackets at the end of the halt event FIRST: the deny names a command and a rule, never a file it reads. A deny with no [rule-id] did not come from the deterministic classifier at all — it came from the canUseTool judgment stage, and no allow-list change will affect it. Widening the policy (a) or rewriting the dispatch context (b) are only meaningful once the rule is known.
+
 Likely a tier1 or tier2 allow-list gap in claude-pilot-py. Investigate the deny rule and either (a) widen the policy to include the legitimate command shape, or (b) rewrite the dispatch context so the pilot avoids the denied command. The pilot was prevented from completing its work — re-dispatching without addressing the substrate gap will hit the same wall.
 
 See: docs/solutions/workflow-issues/2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md
+See: docs/solutions/security-issues/le-classifier-ne-decide-jamais-sur-le-contenu-dun-fichier-2026-09-18.md
 
 ${RESULT}"
             elif [ "$SKILL" = "dev-groom" ] && [ -n "$VALID_PLAN" ]; then
@@ -3760,9 +3763,12 @@ dispatch-lib (mika#1383): rescued trailing dirty content into wip() commit; PR c
 
 Halt event: ${POLICY_DENY}
 
+Read the [rule-id] in brackets at the end of the halt event FIRST: the deny names a command and a rule, never a file it reads. A deny with no [rule-id] did not come from the deterministic classifier at all — it came from the canUseTool judgment stage, and no allow-list change will affect it. Widening the policy (a) or rewriting the dispatch context (b) are only meaningful once the rule is known.
+
 Likely a tier1 or tier2 allow-list gap in claude-pilot-py. Investigate the deny rule and either (a) widen the policy to include the legitimate research command shape, or (b) rewrite the dispatch context so the pilot avoids the denied command. The pilot was prevented from completing its work — re-grooming this ticket without addressing the substrate gap will hit the same wall.
 
 See: docs/solutions/workflow-issues/2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md
+See: docs/solutions/security-issues/le-classifier-ne-decide-jamais-sur-le-contenu-dun-fichier-2026-09-18.md
 
 ${RESULT}"
         elif [ -z "$VALID_PLAN" ] && [ "$CE_PLAN_INVOKED" = "unknown" ]; then

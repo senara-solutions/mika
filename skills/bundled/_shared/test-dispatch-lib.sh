@@ -2989,6 +2989,14 @@ assert_contains "Class C message explicitly NOT drift" \
     'not LLM drift' "$DRIFT_BLOCK"
 assert_contains "Class C message links to investigation doc" \
     'drift-misdiagnosis-policy-deny-halt' "$DRIFT_BLOCK"
+# mika#2312: the remedies paragraph used to send the reader straight to
+# "widen the policy" / "rewrite the dispatch context" without ever saying the
+# deny names a COMMAND and a RULE. That reading is what produced mika#2312's
+# inference that the CONTENT of a system_prompt.md was protected. The rule-id
+# line must precede the allow-list-gap paragraph, on BOTH class-C sites — one
+# repaired site would make the message right one time in two.
+assert_contains "Class C message teaches rule-id reading first (dev-groom site)" \
+    'Read the [rule-id] in brackets at the end of the halt event FIRST' "$DRIFT_BLOCK"
 
 # Branch ordering: the POLICY_DENY branch must be the FIRST elif/if, so it wins
 # over the drift messages when both conditions could fire.
@@ -3081,6 +3089,12 @@ assert_contains "Class C message — halted by policy deny, NOT generic exit" \
     'halted by policy deny — not generic exit' "$POSTFLIGHT_BLOCK"
 assert_contains "Links to investigation doc" \
     'drift-misdiagnosis-policy-deny-halt' "$POSTFLIGHT_BLOCK"
+# mika#2312 — companion of the dev-groom assertion in Test 13. Same phrase,
+# second site: the two class-C blocks are NOT copies of one another (their
+# headers and remedies paragraphs legitimately differ), so a single assertion
+# would only bite on one of them.
+assert_contains "Class C message teaches rule-id reading first (dev-pilot site)" \
+    'Read the [rule-id] in brackets at the end of the halt event FIRST' "$POSTFLIGHT_BLOCK"
 
 # Branch ordering: POLICY_DENY must precede BOTH the dev-groom-re-dispatch
 # Note AND the generic "Zero new commits" message in source order.
