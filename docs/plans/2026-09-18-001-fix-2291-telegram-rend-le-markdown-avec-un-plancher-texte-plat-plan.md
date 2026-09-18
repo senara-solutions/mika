@@ -163,7 +163,7 @@ c'est une propriété testée que la dépendance ferait rougir.
 
 S'y ajoute F6 (nouvelle dépendance workspace + `deny.toml`) et le précédent de la
 maison : mika#2126 a écrit ses cinq fonctions à la main, « infallible by construction.
-No `Result`, no `unwrap`, no panic, no raw byte indexing », et elles portent 30 tests.
+No `Result`, no `unwrap`, no panic, no raw byte indexing », et elles portent 25 tests.
 
 **Critère de révision, écrit pour ne pas être redécouvert :** si un jour la sortie doit
 porter des tableaux, des listes imbriquées ou des blocs de citation structurés, le
@@ -201,7 +201,7 @@ Trois conséquences, toutes désirables :
    mika#2363 « un seul prédicat ») ; ici elle est obtenue par la signature.
 
 **`strip_markdown_around_urls` n'est ni retirée ni modifiée.** `render_plain` passe par
-elle en second temps (voir Implémentation §3). Ses 30 tests restent verts et gardent
+elle en second temps (voir Implémentation §3). Ses 25 tests restent verts et gardent
 leur sens : ils épinglent l'auxiliaire *URL*, et une régression du nouveau
 reconnaisseur ne peut pas rouvrir mika#2126. Le test F4 reste vert **et reçoit un
 commentaire** disant ce qu'il épingle désormais (la fonction, pas le pipeline), avec un
@@ -456,7 +456,7 @@ d'utilisateur relayé par l'agent pourrait poser des entités Telegram arbitrair
 
 | # | Assertion |
 |---|---|
-| R1 | Les **30 tests existants** de `strip_markdown_around_urls` restent verts, inchangés. |
+| R1 | Les **25 tests existants** de `strip_markdown_around_urls` restent verts, inchangés. Population nommée pour être recomptable : la famille `test_strip_markdown_*` de `telegram.rs`, aujourd'hui lignes 1758–1922 (`grep -c "fn test_strip_markdown" crates/mika-gateway/src/telegram.rs` → 25). Un chiffre qu'on ne peut pas recompter est une AC qu'on ne peut pas vérifier. |
 | R2 | `test_strip_markdown_bold_text_without_url_unchanged` (F4) reste vert et reçoit un commentaire disant ce qu'il épingle désormais : la fonction, pas le pipeline. |
 | R3 | Test frère neuf, au niveau pipeline : `C'est **important** de le savoir.` **change** maintenant. R2 et R3 côte à côte sont la trace lisible du déplacement de périmètre. |
 | R4 | `**https://example.com/a**` : en mode HTML le lien cliqué est `https://example.com/a` (le gras devient `<b>`, la borne du lien est la balise) ; en mode plat, idem via le second passage. Le défaut fondateur de mika#2126 est clos **dans les deux modes**. |
@@ -609,7 +609,7 @@ Zone **gateway / sortie Telegram**. Deux tickets antérieurs y ont posé des dé
 que ce plan touche, et aucun des deux n'est contredit :
 
 - **mika#2126** — `strip_markdown_around_urls`, absence de `parse_mode`. Ses cinq
-  fonctions et ses 30 tests sont **inchangés**. Sa décision est levée par la procédure
+  fonctions et ses 25 tests sont **inchangés**. Sa décision est levée par la procédure
   qu'elle prescrivait elle-même (« take it back through grooming »), et son argument
   reste écrit dans le code réécrit.
 - **mika#2134** — limite 4096, découpage côté agent. Inchangé. Sa moitié inachevée (la
@@ -632,7 +632,7 @@ rendu » comme un oubli.
 3. `send_message_impl` tokenize une fois, rend en HTML si armé, **replie sur 400** vers
    le texte plat sans `parse_mode`, et ne replie que sur 400.
 4. `strip_markdown_around_urls` et ses quatre auxiliaires sont **inchangés** et
-   conservés en second passage du rendu plat ; leurs 30 tests sont verts.
+   conservés en second passage du rendu plat ; leurs 25 tests sont verts.
 5. `MIKA_TELEGRAM_HTML_RENDER` : `Settings`, analyse trois paliers, défaut armé, lu une
    fois au démarrage, documenté dans `.env.example` et les deux `CLAUDE.md`.
 6. Les trois événements opérateur sont émis, sans jamais journaliser le corps d'un
@@ -677,7 +677,7 @@ vérification.
   absent → armé ; illisible → armé + WARN nommant la valeur entre guillemets ; lu une
   fois par process. Épinglé par C1–C4 et S1.
 
-- **AC6 — mika#2126 n'est pas rouvert.** Les cinq fonctions et les 30 tests de
+- **AC6 — mika#2126 n'est pas rouvert.** Les cinq fonctions et les 25 tests de
   `strip_markdown_around_urls` sont inchangés et verts ; elle est conservée en second
   passage du rendu plat. `**https://example.com/a**` donne un lien cliqué
   `https://example.com/a` **dans les deux modes**. Le test gelé de F4 reste vert et
@@ -712,4 +712,5 @@ vérification.
 
 | Date | Auteur | Changement |
 |---|---|---|
+| 2026-09-18 | dev-groom (mika#2291) | Re-groom idempotent. Recomptage de la population mika#2126 contre le code : **25** tests `test_strip_markdown_*` (lignes 1758–1922), pas 30 — le chiffre apparaissait six fois, dont dans la Definition of Done et dans AC6, où il rendait le critère invérifiable. R1 nomme désormais la commande qui le recompte. Les six autres faits porteurs sont re-vérifiés exacts contre le code : F1 (doc-comment `parse_mode` à `telegram.rs:312`), F3 (site `sendMessage` unique à `telegram.rs:619`), F4 (test gelé à `telegram.rs:1884`), F6 (aucun parser markdown au workspace), F7 (`handle_send` rend un 502 au corps vide par sa branche `Err(e)`, les branches `BadRequest` de `routes.rs:908/917` étant sur `download_image`, chemin distinct), et les 7 sites de construction non-test de la Décision 5. La garde miroir 4096 est bien absente (`routes.rs:2193` ne contrôle que `50_000`). |
 | 2026-09-18 | dev-groom (mika#2291) | Plan initial. Trois faits du code déplacent le corps du ticket : `parse_mode` est une décision datée avec sa condition de levée (F1), une transformation markdown de périmètre URL existe déjà (F2), et un test gelé pose le symptôme comme attendu (F4). Retenu : HTML plutôt que MarkdownV2 (surface d'échappement de 3 caractères contre 18), avec un repli sur 400 qui fait du pire cas le comportement d'aujourd'hui — ce qui supprime la prémisse de mika#2126 au lieu de la contredire. Parser CommonMark écarté sur une contrainte testée (préservation octet-pour-octet des espaces, F5), pas sur une préférence. |
