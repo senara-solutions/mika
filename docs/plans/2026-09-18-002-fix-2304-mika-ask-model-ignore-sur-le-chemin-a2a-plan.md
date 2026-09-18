@@ -148,8 +148,7 @@ C'est la lecture qui décide du **site** de l'attestation, et elle contredit une
 rédaction antérieure de ce plan (voir *Revision history*).
 
 `run_a2a_agent` passe `llm: agent_state.llm.as_ref()` (`server/a2a.rs:201`). Mais
-en aval, `agent_loop` recalcule le provider effectif à **deux** sites
-(`mod.rs:3901-3906` et `mod.rs:5601-5606`), identiques :
+en aval, `agent_loop` recalcule le provider effectif :
 
 ```rust
 let skill_llm_override = resolve_skill_llm_override(&matched, params.settings, llm);
@@ -163,12 +162,77 @@ Donc une attestation prise dans `a2a.rs` rapporterait le provider **d'entrée**,
 pas celui qui a servi. Sur un tour où un skill porte un override `[llm]`, elle
 affirmerait avec autorité un modèle qui n'a pas tourné — c'est-à-dire qu'elle
 reconstruirait exactement la classe de défaut E3 que ce ticket existe pour
-fermer, déplacée d'un champ.
+fermer, déplacée d'un champ. **Cette conclusion est confirmée et elle décide le
+site de l'attestation.**
 
-`AgentOutput` (`mod.rs:350-375`) est le canal de retour, et son propre
-doc-commentaire porte le précédent : mika#2276 a ajouté `deadline_exceeded`
-comme **champ** plutôt qu'en élargissant le retour en `LoopResult`, avec la
-raison (*« les appelants de `run_agent` consomment déjà cette struct »*).
+`AgentOutput` est le canal de retour, et son propre doc-commentaire porte le
+précédent : mika#2276 a ajouté `deadline_exceeded` comme **champ** plutôt qu'en
+élargissant le retour en `LoopResult`, avec la raison (*« les appelants de
+`run_agent` consomment déjà cette struct »*).
+
+### E7b — Les deux sites de recalcul ne sont pas deux chemins du même tour
+
+La rédaction précédente de ce plan traitait les deux appels de
+`resolve_skill_llm_override` comme deux chemins interchangeables d'un même tour,
+et en tirait deux exigences (attestation sur les deux, précédence sur les deux).
+L'inventaire des fonctions porteuses réduit le périmètre, et c'est le livrable
+principal de cette troisième passe. Les citations sont par **nom de fonction** :
+les numéros de ligne de la passe précédente ont dérivé de ~285 lignes en un
+rebase, ce qui est précisément la raison de ne pas s'y ancrer.
+
+| Site | Fonction porteuse | Struct de params | Type de retour |
+|---|---|---|---|
+| #1 | `run_agent_inner` | `AgentParams` | `AgentOutput` |
+| #2 | `run_team_agent_inner_impl` | `TeamAgentParams` | `TeamAgentOutcome` |
+
+Trois conséquences, chacune vérifiable :
+
+1. **`run_a2a_agent` n'atteint que le site #1.** Il appelle `agent::run_agent`
+   (`server/a2a.rs:232`), donc `run_agent_inner`. Le chemin team n'est pas
+   joignable par `message/send`.
+2. **`run_silent_inner` n'appelle `resolve_skill_llm_override` à aucun endroit.**
+   Aucun tour silencieux (callback, heartbeat, réflexion) ne porte d'override
+   per-skill. Le périmètre du recalcul est donc exactement deux fonctions, pas
+   « partout dans le moteur ».
+3. **`TeamAgentParams` est une struct distincte d'`AgentParams`.** Un champ ajouté
+   à la seconde est invisible depuis le chemin team, par typage.
+
+Vérification : `grep -n "resolve_skill_llm_override" crates/mika-agent/src/agent_loop/mod.rs`
+rend deux sites d'appel et une définition ; croiser leurs numéros avec
+`grep -n "^async fn \|^pub async fn " ` sur le même fichier donne les deux
+fonctions porteuses.
+
+### E7c — Le fail-closed ne peut pas être délégué au constructeur de provider
+
+Lecture qui décide de **l'ordre des opérations** en V7 et de la construction de
+T4. `make_provider_for` appelle `create_provider_with_budget`, dont la branche
+`_ =>` couvre dix variantes OpenAI-compatibles — **dont OpenRouter, le rail des
+quatre passes mesurées du ticket**. Cette branche construit
+`OpenAiCompatibleProvider::new(...)`, qui **ne rend pas de `Result`** et ne
+consulte jamais `api_key` :
+
+```rust
+let provider = openai::OpenAiCompatibleProvider::new(
+    base_url, spec.api_key.clone(), spec.model.clone(), /* … */
+);
+Ok(Arc::new(provider))
+```
+
+Donc **`make_provider_for` réussit avec une clé API absente sur le rail qui porte
+le ticket.** Les seules causes d'échec à la construction y sont une `base_url`
+absente et un budget de timeout invalide (mika#2189). Deux populations à séparer,
+que la rédaction précédente de D2 rangeait ensemble :
+
+| Cause | Détectable avant l'appel réseau ? | Qui l'attrape |
+|---|---|---|
+| Clé API absente sur un fournisseur qui en exige une | **oui** | un `check_provider_key` **explicite**, à écrire côté serveur |
+| `base_url` absente | oui | `create_provider_with_budget` |
+| Modèle inexistant chez le fournisseur | **non, à aucun endroit** | le fournisseur, en 400/404 au premier appel |
+
+Conséquence pour D2 : le fail-closed sur la clé doit être **posé**, jamais espéré
+du constructeur. Et « modèle inconnu du fournisseur » n'est pas une validation
+préalable implémentable — c'est un échec de tour qui survient à l'appel, et il
+n'y a rien à écrire pour l'obtenir.
 
 ### E8 — Ce qui n'est PAS établi
 
@@ -196,9 +260,24 @@ ci-dessous tient seule et ferme le faux vert quand même.
 
 ### D2 — Fail-**closed** sur l'application, à l'inverse de `only_skills`
 
-Un override de modèle que le serveur ne peut pas appliquer — modèle inconnu du
-fournisseur configuré, fournisseur sans clé API — **fait échouer le tour**. Il
-n'est jamais dégradé en « pas d'override ».
+Un override de modèle que le serveur ne peut pas appliquer **fait échouer le
+tour**. Il n'est jamais dégradé en « pas d'override ».
+
+**Ce que « ne peut pas appliquer » recouvre, et par quel mécanisme** — la
+distinction vient de E7c et elle est load-bearing pour V7 et T4 :
+
+- **clé API absente** sur un fournisseur qui en exige une → refusé **avant**
+  l'appel, par un `check_provider_key` explicite côté serveur. C'est la seule
+  branche que le correctif doit écrire, et la seule que T4 peut tester sans
+  réseau ;
+- **`base_url` absente** → `create_provider_with_budget` échoue déjà ;
+- **modèle inexistant chez le fournisseur** → non détectable avant l'appel, à
+  aucun endroit. Le tour échoue à l'appel, sur l'erreur du fournisseur. Aucun
+  code à écrire : c'est déjà un échec de tour, et c'est déjà fail-closed.
+
+Formulation à ne pas reprendre : *« modèle inconnu du fournisseur configuré »*
+comme condition d'un refus préalable. Elle suggère une validation qui n'existe
+pas et qui demanderait un aller-retour réseau pour exister.
 
 L'asymétrie avec mika#2363 est délibérée et sa raison est mesurée par ce
 ticket même :
@@ -279,11 +358,23 @@ Clé absente ⇒ `metadata` reste absent quand les autres clés le sont aussi
 (propriété R3 de mika#2363 : un appelant qui ne déclare rien produit le corps
 d'avant).
 
-### D7 — `--model` gagne sur un override per-skill
+### D7 — `--model` gagne sur un override per-skill, sur le seul site où la question se pose
 
 Un opérateur qui nomme un modèle ne veut pas qu'un skill le remplace en silence :
 ce serait le même faux vert déplacé d'un cran. `resolve_skill_llm_override`
 s'abstient quand le tour porte un override explicite d'appelant.
+
+**Périmètre : le site `run_agent_inner` uniquement** (E7b). Le canal de la
+précédence est un champ d'`AgentParams` ; `run_team_agent_inner_impl` lit
+`TeamAgentParams`, donc il ne peut pas le voir — et n'a rien à en faire, aucun
+appelant de tour d'équipe ne pouvant demander un modèle. Le site team **garde son
+comportement actuel**, qui est correct.
+
+La rédaction précédente exigeait de traiter « les deux sites ensemble » et en
+faisait un mode de défaillance (FD6). Cette exigence tombe : l'asymétrie n'est pas
+une divergence, c'est un typage. Ce qui reste utile est **une note au site team**
+disant pourquoi il ne consulte rien — sans elle, un lecteur futur ne peut pas
+distinguer « délibérément hors canal » de « oubli ».
 
 L'attestation (D3) reste le filet : si cette précédence était mal câblée,
 l'opérateur lirait le modèle réel plutôt que celui qu'il a demandé.
@@ -298,6 +389,11 @@ ticket — il ne dit que les overrides d'appelant.
 L'attestation du modèle effectif, elle, couvre ce chemin — **mais par le site
 choisi en E7, pas « par construction »**. C'est une propriété du câblage, donc
 elle se teste (T10) au lieu d'être supposée.
+
+Second angle mort, nommé par E7b : **le chemin team n'atteste rien.** Il ne
+retourne pas d'`AgentOutput` et n'est pas joignable par `message/send`, donc il
+n'y a pas de surface d'affichage à qui mentir. Étendre l'attestation à
+`TeamAgentOutcome` serait du travail sans lecteur.
 
 ### D9 — `--model` traverse `--remote`, quand ses deux clés sœurs ne traversent pas
 
@@ -385,10 +481,15 @@ La branche `run_remote` passe `args.model.as_deref()`.
 - `requested_model_override(&MessageSendParams) -> Option<&str>` : fail-soft en
   lecture (absent / `null` / non-chaîne / vide ⇒ `None`), sœur de
   `requested_only_skills` (`a2a.rs:268-284`) ;
-- `run_a2a_agent` construit le provider par tour via
-  `agent_state.settings.make_provider_for(...)` (E5) et **échoue le tour** si la
-  construction ou la vérification de clé échoue (D2), en nommant le modèle et le
-  fournisseur.
+- `run_a2a_agent` **vérifie la clé d'abord, construit ensuite** : le
+  `check_provider_key` remonté en V2 est appelé **avant**
+  `agent_state.settings.make_provider_for(...)` (E5), parce que le constructeur ne
+  peut pas attraper ce cas sur le rail du ticket (E7c). Les deux échecs font
+  échouer le tour en nommant le modèle et le fournisseur.
+
+  Ordre imposé, pas cosmétique : inverser les deux donnerait un provider
+  construit avec succès, une clé absente, et un tour qui part quand même — le
+  fail-closed serait écrit dans le plan et absent du binaire ;
 
   Forme imposée par les types : `AgentParams.llm` est un `&'a dyn LlmProvider`
   (`mod.rs:3563`) et `make_provider_for` rend un `Arc`. L'`Arc` est donc lié à une
@@ -411,12 +512,32 @@ La branche `run_remote` passe `args.model.as_deref()`.
 
 ### V8 — `crates/mika-agent/src/agent_loop/mod.rs` — les deux moitiés manquantes
 
-**(a) L'attestation remonte.** `AgentOutput` (`mod.rs:350`) gagne
+**(a) L'attestation remonte.** `AgentOutput` gagne
 `effective_model: Option<String>`, peuplé depuis `effective_llm.provider_name()`
-/ `model_name()` — les valeurs sont **déjà lues** à ces deux sites
-(`mod.rs:3913-3914`, `mod.rs:5610-5611`), il n'y a pas de calcul à ajouter. Champ
-plutôt qu'élargissement du retour : le motif que `deadline_exceeded` documente
-déjà sur cette même struct (mika#2276).
+/ `model_name()` — les valeurs sont **déjà lues** au site `run_agent_inner`
+(elles alimentent `turn_usage` et la construction de la requête), il n'y a pas de
+calcul à ajouter. Champ plutôt qu'élargissement du retour : le motif que
+`deadline_exceeded` documente déjà sur cette même struct (mika#2276).
+
+Coût chiffré, que la rédaction précédente ne donnait pas — **trois sites de
+construction** en production :
+
+| Site | Fonction | Ce qu'il porte |
+|---|---|---|
+| `LoopResult::Done` | `run_agent_inner` | tour conclu — variable locale, triviale |
+| continuation max-steps | `run_agent_inner` | idem, même portée |
+| repli deadline | `persist_deadline_fallback` | **fonction auxiliaire** : reçoit la valeur en paramètre |
+
+Le troisième est le seul qui demande un changement de signature, et il porte le
+chemin mika#2276 : un tour coupé par sa deadline a bien tourné sous un modèle, et
+c'est une population où l'opérateur a particulièrement besoin de savoir lequel.
+
+Un tour qui échoue **avant** le recalcul (`load_agent_context`,
+`get_customer_config`) ne produit aucun `AgentOutput` — il rend `Err`, servi en
+tâche `failed`. Il n'y a donc rien à attester, et cette population tombe
+honnêtement dans « pas d'attestation » que D3 traite déjà. C'est ce qui rend T5
+atteignable dans sa forme exacte : *tout tour qui produit un `AgentOutput`
+atteste*.
 
 **(b) La précédence a besoin d'un canal.** D7 dit que `--model` gagne sur un
 override per-skill, mais `resolve_skill_llm_override(&matched, params.settings,
@@ -424,10 +545,11 @@ llm)` ne reçoit aujourd'hui **aucune** information d'appelant. `AgentParams`
 gagne donc un champ (`caller_model_override: bool`, `false` partout ailleurs) que
 la fonction consulte pour s'abstenir.
 
-**Les deux sites d'appel doivent bouger ensemble** (`mod.rs:3901` et
-`mod.rs:5601`, aujourd'hui identiques). N'en traiter qu'un donnerait deux
-précédences opposées selon le chemin — la classe exacte que T7 et mika#2158
-nomment, et qu'un test comportemental sur un seul chemin ne verrait pas.
+**Un seul site d'appel est concerné** (E7b) : `run_agent_inner`. La fonction
+`resolve_skill_llm_override` étant partagée, le paramètre qu'elle gagne est passé
+`false` depuis `run_team_agent_inner_impl`, **avec le commentaire qui dit
+pourquoi** (D7) — un `false` littéral sans raison écrite se lit comme un oubli, et
+c'est la forme sous laquelle un futur ticket le « corrigerait » à tort.
 
 ### V9 — Documentation
 
@@ -462,16 +584,37 @@ sérialisé, pas `null` (motif `send_params_without_a_session_serialize_without_
 
 ### T4 — L'application est fail-closed (D2, le cœur du ticket)
 
-Un override déclaré et inapplicable (fournisseur sans clé API) **fait échouer le
-tour** avec l'erreur nommée. Contrôle négatif explicite : il ne tombe **pas** en
-silence sur le provider de config — c'est l'assertion qui rougirait si quelqu'un
-alignait cette clé sur la politique fail-soft de `only_skills`.
+Un override déclaré et inapplicable **fait échouer le tour** avec l'erreur
+nommée. Contrôle négatif explicite : il ne tombe **pas** en silence sur le
+provider de config — c'est l'assertion qui rougirait si quelqu'un alignait cette
+clé sur la politique fail-soft de `only_skills`.
 
-### T5 — L'attestation existe sur tout tour, override ou non
+**Le cas à choisir est « fournisseur sans clé API », et c'est le seul testable
+sans réseau** (E7c). Deux pièges de construction, chacun rendant le test vert pour
+la mauvaise raison :
+
+- viser « modèle inexistant » : aucune validation préalable ne l'attrape, le test
+  ne pourrait passer qu'en atteignant le fournisseur — ce n'est plus un test
+  unitaire et il mesure OpenRouter, pas ce correctif ;
+- viser une clé absente **sur le rail OpenAI-compatible en s'appuyant sur l'échec
+  de `make_provider_for`** : ce constructeur réussit (E7c). Le test rougirait, et
+  le remède qu'il suggérerait — « rendre le constructeur faillible » — modifierait
+  la classe d'erreur de tout le moteur sur ce rail.
+
+Le test doit donc viser la branche `check_provider_key` explicitement, et une
+assertion structurelle doit vérifier qu'elle est appelée **avant** la
+construction (V7).
+
+### T5 — L'attestation existe sur tout tour qui produit un `AgentOutput`
 
 Un tour **sans** override atteste quand même le modèle utilisé. Sans cela,
 l'absence d'attestation serait ambiguë entre « vieux serveur » et « pas
 d'override », et D3 ne tiendrait plus.
+
+Formulation exacte : *tout tour qui produit un `AgentOutput`*, non pas « tout
+tour » (V8a). Les trois sites de construction sont couverts, **le repli deadline
+compris** — c'est celui qui passe par une fonction auxiliaire et donc le seul qui
+peut être oublié sans qu'aucun autre test ne rougisse.
 
 ### T6 — Le CLI n'affiche jamais un modèle qu'il n'a pas reçu (D3)
 
@@ -497,10 +640,14 @@ déplacement et non une réécriture.
 ### T9 — Précédence (D7)
 
 Un tour portant un override d'appelant **et** un skill à override `[llm]` tourne
-sous le modèle de l'appelant. Le test couvre **les deux** sites d'appel de
-`resolve_skill_llm_override` (`mod.rs:3901` et `mod.rs:5601`) : un seul couvert
-laisserait l'autre chemin avec la précédence inverse, sans qu'aucune assertion ne
-rougisse (V8b).
+sous le modèle de l'appelant, au site `run_agent_inner`.
+
+**Le test ne couvre pas le chemin team, et c'est une décision** (E7b) : ce chemin
+lit `TeamAgentParams`, qui ne porte pas le champ, donc il n'existe aucun état où
+un override d'appelant l'atteindrait. Un test qui y poserait un override
+n'exercerait que sa propre plomberie. La garde qui vaut est **structurelle** : le
+`false` passé depuis le site team porte un commentaire, et T7 (scan de source)
+refuse qu'il devienne un `true` sans canal.
 
 ### T10 — L'attestation suit le provider qui a servi, pas celui d'entrée (E7)
 
@@ -530,6 +677,13 @@ contrôle négatif ne discrimine pas. Halte : reconstruire le test contre un
 fournisseur réellement dépourvu de clé avant d'aller plus loin — un test qui ne
 peut pas rougir sur le défaut central du ticket ne l'atteste pas.
 
+**FD1b — T4 rougit en signalant que `make_provider_for` a réussi.** Ce n'est pas
+un défaut du test : c'est E7c, et le test dit la vérité. Ne pas rendre
+`OpenAiCompatibleProvider::new` faillible pour le satisfaire — ça changerait la
+classe d'erreur de tout le moteur sur le rail qui porte la majorité du trafic,
+c'est-à-dire un format de fil, pour un p1 de CLI. Le remède est le
+`check_provider_key` explicite de V7, en amont de la construction.
+
 **FD2 — T8 rougit.** Le déplacement V2/V3 a changé un comportement. Ne pas
 ajuster le test : c'est `mika chat` qui a régressé, et il fonctionnait.
 
@@ -545,10 +699,19 @@ et ne pas restreindre son périmètre : c'est exactement le défaut E7, et le la
 passer livrerait un champ qui ment sur la population per-skill tout en portant
 l'autorité d'une attestation serveur.
 
-**FD6 — T9 passe sur un site et rougit sur l'autre.** Les deux appels de
-`resolve_skill_llm_override` n'ont pas bougé ensemble. Ne pas marquer le site
-rouge « hors périmètre » : deux précédences opposées selon le chemin sont pires
-que la précédence inverse partout, parce qu'elles ne sont pas reproductibles.
+**FD6 — retirée.** Elle décrivait « deux précédences opposées selon le chemin »
+comme un risque à surveiller sur les deux sites d'appel. E7b établit que le canal
+de la précédence est un champ d'`AgentParams` et que le chemin team lit
+`TeamAgentParams` : l'état redouté n'est pas atteignable par typage. La garde
+résiduelle est celle de T9 (commentaire au site team + scan de source), pas une
+disposition de tir.
+
+**FD7 — l'attestation manque sur le repli deadline seul.** T5 est vert sur les
+tours conclus et le champ est `None` après une coupure d'enveloppe. Signifie que
+`persist_deadline_fallback` n'a pas reçu la valeur en paramètre (V8a, le seul des
+trois sites hors portée locale). Ne pas requalifier la population en « pas
+d'attestation légitime » : un tour coupé **a** tourné sous un modèle, et c'est
+précisément la population où l'opérateur enquête.
 
 **FD4 — Après déploiement, le body a2a porte toujours le modèle de config alors
 que T1..T5 sont verts.** Le corps observé ne vient pas de ce chemin. Halte :
@@ -588,8 +751,10 @@ dérivés des Requirements et du Verification contract ci-dessus.)*
   params `message/send`. Le flag n'est plus muet sur ce chemin (E1). Vérifié par
   T1 et par la lecture de `main.rs`.
 - **AC3** — Un override déclaré que le serveur ne peut pas appliquer fait
-  **échouer** le tour ; il n'est jamais dégradé en « pas d'override ». Vérifié
-  par T4, contrôle négatif compris.
+  **échouer** le tour ; il n'est jamais dégradé en « pas d'override ». Le refus
+  sur clé API absente est **posé explicitement en amont de la construction du
+  provider** (E7c) ; le modèle inexistant échoue à l'appel du fournisseur, sans
+  code dédié. Vérifié par T4, contrôle négatif compris.
 - **AC4** — La lecture de la clé reste tolérante : absente, `null`, non-chaîne,
   vide ⇒ aucun override, aucun échec. Vérifié par T3.
 - **AC5** — Un appelant ne déclarant aucune des trois clés `mika.*` produit un
@@ -600,11 +765,14 @@ dérivés des Requirements et du Verification contract ci-dessus.)*
 - **AC7** — La sémantique mika#1591 est conservée : le préfixe d'un id ne
   re-dispatche jamais vers un fournisseur natif, et n'est retiré que s'il nomme
   le fournisseur **exécutant**. Vérifié par T7 + T8.
-- **AC8** — Un override d'appelant l'emporte sur un override `[llm]` per-skill,
-  **sur les deux sites d'appel** de `resolve_skill_llm_override`. Vérifié par T9.
+- **AC8** — Un override d'appelant l'emporte sur un override `[llm]` per-skill au
+  site `run_agent_inner`, le seul que `message/send` atteint. Le chemin team est
+  hors canal par typage et garde son comportement, avec la raison écrite au site
+  (E7b, D7). Vérifié par T9.
 - **AC9** — L'attestation rapporte le provider qui a **servi** le tour, y compris
-  quand un override per-skill l'a substitué en aval du site d'entrée (E7).
-  Vérifié par T10.
+  quand un override per-skill l'a substitué en aval du site d'entrée (E7), et sur
+  les trois sites de construction d'`AgentOutput` — repli deadline compris.
+  Vérifié par T10 + T5.
 - **AC10** — Propagation et attestation décrivent le même modèle sur un
   aller-retour réel. Vérifié par T11.
 
@@ -689,3 +857,35 @@ déploiement.
     `AgentParams.llm: &dyn`), périmètre d'attestation nommé (`message/send`
     synchrone ; `message/stream` et `returnImmediately` hors périmètre, et
     honnêtement lus comme « non attesté »), T11 sur l'aller-retour complet.
+- 2026-09-18 — troisième passe. E1 à E6 re-vérifiées ligne à ligne et
+  **inchangées** (`build_send_params` aux lignes 82-123, `override_model` →
+  `set_provider_model` → lecture par `ask.rs`, `run_remote` sans `model`,
+  `make_provider_for` passant bien `llm_timeout_budget()`, point d'intervention
+  `Ok(Some(mut task))` présent avec `task` déjà `mut`). Deux corrections majeures,
+  toutes deux réduisant le périmètre :
+  - **E7b / D7 / D8 / V8 / T9 / FD6 — l'inventaire des deux sites de recalcul
+    était faux, et il gonflait le travail.** Les deux appels de
+    `resolve_skill_llm_override` ne sont pas deux chemins du même tour : ce sont
+    `run_agent_inner` (`AgentParams` → `AgentOutput`) et
+    `run_team_agent_inner_impl` (`TeamAgentParams` → `TeamAgentOutcome`).
+    `run_a2a_agent` n'atteint que le premier, et `run_silent_inner` n'appelle la
+    fonction nulle part. Donc l'attestation par `AgentOutput` couvre exactement le
+    périmètre déclaré, et la précédence n'a qu'un site : l'état que FD6 redoutait
+    n'est pas atteignable par typage. FD6 est retirée, remplacée par une garde
+    structurelle et un commentaire au site team.
+  - **E7c / D2 / V7 / T4 / FD1b — le fail-closed reposait sur une validation que
+    le rail du ticket ne fait pas.** `create_provider_with_budget` construit
+    `OpenAiCompatibleProvider::new` — qui ne rend pas de `Result` et ne consulte
+    pas `api_key` — pour les dix variantes OpenAI-compatibles, OpenRouter compris.
+    `make_provider_for` réussit donc sur une clé absente, sur le rail des quatre
+    passes mesurées. Le refus doit être **posé** par un `check_provider_key`
+    explicite en amont de la construction. Et « modèle inconnu du fournisseur »,
+    que D2 rangeait avec la clé absente, n'est détectable à aucun endroit avant
+    l'appel réseau : les deux populations sont désormais séparées, avec le
+    mécanisme qui attrape chacune.
+  - Ajouts mineurs : coût chiffré de V8a (trois constructeurs d'`AgentOutput`,
+    dont un dans `persist_deadline_fallback` qui demande un changement de
+    signature — nouvelle FD7) ; T5 reformulée en « tout tour qui produit un
+    `AgentOutput` », les échecs antérieurs au recalcul ne produisant pas de sortie
+    à attester ; citations par nom de fonction, les numéros de ligne de la passe
+    précédente ayant dérivé de ~285 lignes en un rebase.
