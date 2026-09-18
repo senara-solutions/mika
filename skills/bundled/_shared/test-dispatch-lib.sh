@@ -6032,6 +6032,76 @@ assert_contains "mika#2363: --session-id survit à la déclaration de passe" \
 assert_contains "mika#2363: --only-skill survit à --session-id" \
     "--only-skill mika-arch-second-review" "$_MIKA2363_ARGV_SESSION"
 
+# =============================================================================
+# mika#2305 — le contrat de session des passes architecte, épinglé
+# =============================================================================
+#
+# Le ticket soupçonnait une FUITE : « le contexte de mika-arch semble porté d'une
+# passe à l'autre SANS --session-id explicite ». La lecture du code dit l'inverse
+# sur cet axe — le portage intra-invocation est explicite, délibéré et commenté,
+# et c'est même le contrat que la « Piste » du ticket appelle de ses vœux. La
+# fuite réelle vivait dans l'assembleur de prompt (HistoryScope::Agent, refermée
+# par mika#2295 + mika#2330), pas ici.
+#
+# D'où ces assertions : elles n'ajoutent aucun comportement, elles empêchent
+# qu'une prochaine lecture « corrige » le portage en croyant fermer #2305. Le
+# retry UNPARSED en particulier ne re-demande pas la revue — il demande à
+# l'architecte de COMPLÉTER sa propre réponse en y ajoutant la ligne
+# `Disposition:` manquante. Sans la session, la demande serait inintelligible :
+# le portage y est la condition de correction du mécanisme, pas sa contamination.
+
+# --- Moitié 1 : _arch_ask ne pose --session-id que si $3 est non vide ---
+
+_MIKA2305_ARGV_FRESH=$(_arch_ask_argv "mika-arch-groom-ticket")
+assert_not_contains "mika#2305: session neuve par défaut (pas de \$3 → pas de --session-id)" \
+    "--session-id" "$_MIKA2305_ARGV_FRESH"
+
+_MIKA2305_ARGV_CONT=$(_arch_ask_argv "mika-arch-groom-ticket" "sess-2305")
+assert_contains "mika#2305: continuation sur demande explicite (\$3 → --session-id)" \
+    "--session-id sess-2305" "$_MIKA2305_ARGV_CONT"
+
+# --- Moitié 2 : les trois usages de _iterate_groom_loop ---
+#
+# `_iterate_groom_loop` ne s'exécute pas en isolation (il veut gh, un plan, un
+# ticket), donc le contrat est lu sur la source. Le prédicat porte sur la
+# PRÉSENCE d'un troisième argument à l'appel, ce qui est exactement ce que
+# `_arch_ask` teste à la ligne 4688.
+
+_MIKA2305_BODY=$(awk '/^_iterate_groom_loop\(\) \{/,/^\}/' "$DISPATCH_LIB")
+assert_contains "mika#2305: le corps de _iterate_groom_loop est lisible" \
+    "_arch_ask" "$_MIKA2305_BODY"
+
+# 1ʳᵉ passe : session neuve. C'est le SEUL appel architecte de la boucle qui ne
+# nomme pas "$session_id" — d'où un prédicat sur l'absence plutôt que sur la
+# forme exacte de la fin de ligne, qui porte aussi une redirection stderr.
+_MIKA2305_CALLS=$(printf '%s\n' "$_MIKA2305_BODY" | grep '_arch_ask "' || true)
+_MIKA2305_FRESH_CALLS=$(printf '%s\n' "$_MIKA2305_CALLS" | grep -v '"\$session_id"' || true)
+assert_eq "mika#2305: un seul appel architecte sans session portée" \
+    "1" "$(printf '%s\n' "$_MIKA2305_FRESH_CALLS" | grep -c '_arch_ask "' || true)"
+assert_contains "mika#2305: et c'est la 1ʳᵉ passe groom-ticket sur le plan" \
+    '_arch_ask "mika-arch-groom-ticket" "$plan_path"' "$_MIKA2305_FRESH_CALLS"
+
+# Retry UNPARSED : session portée, pour que l'architecte voie sa propre réponse
+# et puisse la compléter.
+_MIKA2305_RETRY=$(printf '%s\n' "$_MIKA2305_BODY" \
+    | grep -c '_arch_ask "mika-arch-groom-ticket" "\$retry_prompt" "\$session_id"' || true)
+assert_eq "mika#2305: le retry UNPARSED continue la session (D6)" \
+    "1" "$_MIKA2305_RETRY"
+
+# 2ᵉ passe : session portée, sur les deux branches (après READY et après ITERATE).
+# Le contrat de continuité de session est déclaré par mika-arch-second-review.
+_MIKA2305_SECOND=$(printf '%s\n' "$_MIKA2305_BODY" \
+    | grep -c '_arch_ask "mika-arch-second-review" "\$plan_path" "\$session_id"' || true)
+assert_eq "mika#2305: les deux branches de 2ᵉ passe continuent la session" \
+    "2" "$_MIKA2305_SECOND"
+
+# Aucun appel architecte n'échappe à l'inventaire ci-dessus : 1 + 1 + 2 = 4.
+# Un cinquième appel est un halt-and-surface — il porte ou ne porte pas la
+# session, et c'est une décision, pas une ligne à ajouter au compte.
+_MIKA2305_TOTAL=$(printf '%s\n' "$_MIKA2305_BODY" | grep -c '_arch_ask "' || true)
+assert_eq "mika#2305: inventaire clos des appels _arch_ask (1 neuf + 3 continués)" \
+    "4" "$_MIKA2305_TOTAL"
+
 # --- Summary ---
 
 echo ""
