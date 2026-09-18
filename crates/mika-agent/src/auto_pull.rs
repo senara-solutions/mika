@@ -1249,6 +1249,21 @@ const FILTER_LIVE_PILOT: &str = "live_pilot_orphaned_parent";
 /// This is the row that answers "why is this ticket no longer promoted?". It is
 /// a decision, not a failure — it does not touch the circuit breaker.
 const FILTER_READY_PARKED: &str = "ready_parked";
+/// The ticket is held by an operator label **and** carries an abandonment stamp
+/// (mika#2361).
+///
+/// Deliberately distinct from [`FILTER_OPERATOR_HELD`], for the reason that
+/// already separated `below_threshold` from [`FILTER_NO_READY_LABEL_EVENT`]
+/// (mika#2131) and `in_flight_self_dev` from [`FILTER_LIVE_PILOT`] (mika#2279):
+/// the two states look alike and their remedies differ. An ordinary held ticket
+/// is legitimately waiting for its operator; an **abandoned** held ticket is
+/// waiting for an operator who believes they have already acted — it is the
+/// population where re-applying `ready` does nothing at all, because the hold
+/// label is what excludes it and the `ready` laid on top lifts nothing.
+///
+/// That is the whole of mika#2361: the gesture the operator makes is not the
+/// gesture that re-enters, and until this name existed nothing said so.
+const FILTER_ABANDONED_OPERATOR_HELD: &str = "abandoned_operator_held";
 
 /// `audit_events.tool_name` for per-ticket exclusion rows.
 ///
@@ -1256,6 +1271,31 @@ const FILTER_READY_PARKED: &str = "ready_parked";
 /// that spelled it by hand would be invisible to
 /// `WHERE tool_name = 'auto_pull_exclusion'` on the day it mattered.
 const EXCLUSION_AUDIT_TOOL_NAME: &str = "auto_pull_exclusion";
+
+/// `audit_events.tool_name` for the re-entry-blocked comment ledger (mika#2361).
+///
+/// SOLE WRITER: [`comment_reentry_blocked`]. The row is both the dedup bound and
+/// the operator's answer to "has this ticket been told?" — a second site
+/// spelling the literal by hand would split the count without saying so.
+///
+/// Its `target_key` is `issue:<n>@<label>`, and the `@` is load-bearing rather
+/// than decorative: mika#2347 named the trap of a `LIKE` over a bare ticket key
+/// (`#234` matches `#2343`). `LIKE 'issue:2360@%'` cannot match
+/// `issue:23600@blocked`, whose character after the prefix is `0`, not `@`.
+const REENTRY_BLOCKED_TOOL_NAME: &str = "auto_pull_reentry_blocked";
+
+/// `audit_events.tool_name` for a re-entry that actually happened (mika#2361).
+///
+/// SOLE WRITER: the [`StuckReadyVerdict::ReEntry`] arm of
+/// [`phase2_reconcile_stuck_ready`]. Before this row existed, clearing an
+/// abandonment left an `info!` and nothing else — which is why the founding
+/// ticket had to ask "what erased the abandonment?" and why answering it took a
+/// reading of the code rather than a query.
+///
+/// Because this site is the only writer, the row's **absence** under a
+/// disappeared `redrive_abandoned_at` is itself information: it says there is a
+/// writer the structural guard did not see.
+const REENTRY_AUDIT_TOOL_NAME: &str = "auto_pull_redrive_reentry";
 
 /// Ceiling on the dedup map. Bounds a theoretical leak: the real population is
 /// (open issues × filters), a few hundred at most, so reaching this means
@@ -1600,6 +1640,41 @@ fn classify_stuck_ready_in_memory(issue: &Issue) -> Option<StuckReadyVerdict> {
     None
 }
 
+/// Rename — never re-decide — an operator-held skip that also carries an
+/// abandonment stamp (mika#2361).
+///
+/// The verdict **variant** is strictly unchanged; only the label moves. That
+/// shape is the point: it makes the absence of a behavioural change evident at
+/// the call site instead of asserted in a comment, which is what lets AC8 ("no
+/// ticket changes verdict") be read rather than trusted.
+///
+/// A seat refusal is deliberately **not** requalified. It is also a
+/// `Skip`, it can also coexist with an abandonment stamp, and its remedy has
+/// nothing to do with this one — the ticket belongs to another dispatch seat,
+/// and telling its operator to remove a hold label would be a confident wrong
+/// answer.
+///
+/// Shared by [`classify_stuck_ready`] and by the in-memory short-circuit of
+/// [`phase2_reconcile_stuck_ready`], because those are two entrances to one
+/// decision. Writing the rule at only one of them is the mika#2158 shape: two
+/// readers of the same question, drifting for months without breaking anything.
+fn requalify_operator_held_when_abandoned(
+    verdict: StuckReadyVerdict,
+    abandoned: bool,
+) -> StuckReadyVerdict {
+    if abandoned
+        && verdict
+            == (StuckReadyVerdict::Skip {
+                reason: FILTER_OPERATOR_HELD,
+            })
+    {
+        return StuckReadyVerdict::Skip {
+            reason: FILTER_ABANDONED_OPERATOR_HELD,
+        };
+    }
+    verdict
+}
+
 /// The whole Phase 2 decision for one ticket (mika#2020). Pure — every input is
 /// already resolved.
 fn classify_stuck_ready(
@@ -1608,7 +1683,7 @@ fn classify_stuck_ready(
     redrive_budget: i64,
 ) -> StuckReadyVerdict {
     if let Some(verdict) = classify_stuck_ready_in_memory(issue) {
-        return verdict;
+        return requalify_operator_held_when_abandoned(verdict, facts.abandoned);
     }
 
     // Progress: an open PR means the re-drives worked. It is an already-computed
@@ -1701,10 +1776,16 @@ fn classify_stuck_ready(
 ///
 /// Only the two skip verdicts are exclusions that carry no trace of their own.
 /// `Eligible` is not an exclusion; `ReEntry` emits `auto_pull_redrive_reentry`
-/// INFO; `Abandon` emits `auto_pull_redrive_abandoned` WARN plus its own audit
-/// row plus a comment on the ticket. Recording those here would double-count
-/// them in the tick aggregate and make the number unusable for the one thing it
-/// is for — sizing how much the loop is refusing.
+/// INFO **plus its own audit row** since mika#2361; `Abandon` emits
+/// `auto_pull_redrive_abandoned` WARN plus its own audit row plus a comment on
+/// the ticket. Recording those here would double-count them in the tick
+/// aggregate and make the number unusable for the one thing it is for — sizing
+/// how much the loop is refusing.
+///
+/// A `Skip` under [`FILTER_ABANDONED_OPERATOR_HELD`] *does* also post a comment
+/// (mika#2361), and that is deliberately not an exception to the rule above: it
+/// is an exclusion, it belongs in the tick aggregate, and the comment is a
+/// second surface for the same fact rather than a trace that replaces this one.
 ///
 /// Shared by the async loop and the AC4 replay test, so the test exercises the
 /// production mapping rather than a copy of it that can drift.
@@ -2478,15 +2559,25 @@ impl AbandonReason {
 
     /// The comment body posted on the abandoned ticket. Names the three things a
     /// predictable refusal owes its reader: the ticket, the reason, the remedy.
+    ///
+    /// mika#2361 — the remedy no longer names `operator-review` as if it were the
+    /// only hold. This body does not know the ticket's labels, so it states the
+    /// rule instead of one case: the abandonment posts `operator-review`, but a
+    /// ticket already carrying `blocked` or `operator-gated` is held by that one
+    /// too, and removing only `operator-review` would leave it excluded from all
+    /// three phases. That was the #2360 shape, and the old text asserted the
+    /// opposite.
     fn comment_body(&self, issue_number: u64) -> String {
         format!(
             "## Auto-pull : re-drive abandonné pour #{issue_number}\n\n\
              **Raison.** {}\n\n\
              **Ce qu'il faudrait pour passer.** Pour remettre ce ticket en jeu : {}, \
-             puis retire le label `operator-review`.\n\n\
+             puis retire son label de tenue — `operator-review` (posé ci-dessus), ou \
+             `blocked` / `operator-gated` si le ticket en porte un.\n\n\
              Le label `ready` a été retiré et `operator-review` posé — l'auto-pull ne \
-             re-drivera plus ce ticket tant qu'il porte ce label. Retirer `operator-review` \
-             remet son compteur de re-drives à zéro.\n\n\
+             re-drivera plus ce ticket tant qu'il porte un label de tenue. Reposer `ready` \
+             par-dessus ne lève rien. Retirer le label de tenue remet son compteur de \
+             re-drives à zéro.\n\n\
              <sub>Émis par le reconciler stuck-ready (mika#1824), borné par mika#2020. \
              Événement : `auto_pull_redrive_abandoned` (`reason={}`).</sub>",
             self.reason(issue_number),
@@ -2582,6 +2673,200 @@ async fn abandon_stuck_ready(
     {
         warn!(error = %e, "auto_pull: failed to write abandonment audit event");
     }
+}
+
+// ───────── Re-entry-blocked comment (mika#2361) ─────────
+
+/// Enact a Phase 2 `Skip`. For every filter but one this is a no-op — the
+/// ledger row recorded by the caller is the whole action.
+///
+/// The exception is [`FILTER_ABANDONED_OPERATOR_HELD`], which owes its operator
+/// a word on the ticket (D4).
+///
+/// Shared by the two `Skip` arms of [`phase2_reconcile_stuck_ready`]. Only the
+/// in-memory one can reach the abandoned-held filter today — a held ticket never
+/// gets past the short-circuit — but the second arm calls this all the same:
+/// two arms of one verdict that enact it differently is how a rename becomes a
+/// silent behaviour change.
+#[allow(clippy::too_many_arguments)]
+async fn enact_stuck_ready_skip(
+    db: &AsyncDatabase,
+    github_token: &str,
+    issue: &Issue,
+    reason: &'static str,
+    redrive_count: i64,
+    trace_id: &str,
+    session_id: &str,
+) {
+    if reason == FILTER_ABANDONED_OPERATOR_HELD {
+        comment_reentry_blocked(db, github_token, issue, redrive_count, trace_id, session_id).await;
+    }
+}
+
+/// What the comment ledger says about one `(ticket, hold label, abandonment)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReentryCommentVerdict {
+    /// Nothing recorded since this abandonment — say it once.
+    Post,
+    /// Already said for this abandonment and this label.
+    AlreadyPosted,
+    /// The ledger could not be read. **Fail-closed** — see [`decide_reentry_comment`].
+    Unreadable,
+}
+
+/// Decide from the ledger count alone, so the fail-closed rule is a value rather
+/// than a branch buried in an I/O function (mika#2361 D6).
+///
+/// **The asymmetry that picks the direction.** A false negative leaves an
+/// operator without this comment — but they already have the abandonment comment
+/// on the same ticket, so they are not left with nothing. A false positive posts
+/// every 10-minute tick: ~144 comments a day on one ticket, which is the churn
+/// mika#2347 had to bound on another surface. Same direction as `wip_rescue`
+/// (mika#2199) and `qa_review_reconcile` (mika#2347); the deliberate inverse of
+/// `ci_success_handler`.
+fn decide_reentry_comment(prior_rows: Result<i64>) -> ReentryCommentVerdict {
+    match prior_rows {
+        Ok(0) => ReentryCommentVerdict::Post,
+        Ok(_) => ReentryCommentVerdict::AlreadyPosted,
+        Err(_) => ReentryCommentVerdict::Unreadable,
+    }
+}
+
+/// The ledger key for one `(ticket, hold label)` pair — see
+/// [`REENTRY_BLOCKED_TOOL_NAME`] for why the separator is `@`.
+fn reentry_ledger_key(issue_number: u64, held_by: &str) -> String {
+    format!("issue:{issue_number}@{held_by}")
+}
+
+/// The comment body. It states a **state**, never a gesture it imputes.
+///
+/// That restraint is required, not stylistic: `abandon_stuck_ready` only
+/// `warn!`s when removing `ready` fails, so a ticket can carry `ready` + a hold
+/// label + an abandonment stamp with nobody having done anything. A body reading
+/// "you re-applied `ready`" would then be simply false, on the exact surface
+/// whose job is to be trustworthy.
+fn reentry_blocked_comment_body(issue_number: u64, held_by: &str, redrives: i64) -> String {
+    format!(
+        "## Auto-pull : ré-entrée bloquée pour #{issue_number}\n\n\
+         Ce ticket porte à la fois le label `ready` et le label `{held_by}`, et son \
+         compteur de re-drives a été abandonné ({redrives} re-drives).\n\n\
+         **L'auto-pull ne le reprendra pas dans cet état.** Reposer `ready` ne suffit \
+         pas : c'est le label `{held_by}` qui l'exclut de toutes les phases, et le \
+         `ready` posé par-dessus ne lève rien.\n\n\
+         **Le geste de ré-entrée est : retirer `{held_by}`.** Au tick suivant, le \
+         compteur de re-drives repart à zéro et le ticket redevient éligible.\n\n\
+         <sub>Émis une fois par abandon et par label tenant. Événement : \
+         `{REENTRY_BLOCKED_TOOL_NAME}`. Le détail du refus est aussi en base : \
+         `SELECT * FROM audit_events WHERE tool_name = '{EXCLUSION_AUDIT_TOOL_NAME}' \
+         AND target_key = 'issue:{issue_number}';`</sub>"
+    )
+}
+
+/// Tell the operator, on the ticket, that the gesture they are making is not the
+/// one that re-enters (mika#2361 D4).
+///
+/// Posted when Phase 2 classifies a ticket under [`FILTER_ABANDONED_OPERATOR_HELD`].
+/// The operator does not read `$MIKA_SPIRIT_LOG_FILE` while they wait, and the
+/// exclusion ledger row — which they would have to know to look for — names the
+/// filter but cannot name the label to remove.
+///
+/// **The dedup bound is the abandonment itself, not a chosen window** (D5): the
+/// count reads `audit_events` with `since = redrive_abandoned_at`, giving exactly
+/// one comment per abandonment and per holding label. A later re-entry followed
+/// by a fresh abandonment stamps a newer instant and reopens the right to speak —
+/// idempotence from the shape of the bound rather than from one more column.
+///
+/// The audit row is written **after** the comment lands: a failed post must
+/// retry on the next tick, the same discipline as [`ExclusionLedger::flush`],
+/// which marks only on success.
+async fn comment_reentry_blocked(
+    db: &AsyncDatabase,
+    github_token: &str,
+    issue: &Issue,
+    redrives: i64,
+    trace_id: &str,
+    session_id: &str,
+) {
+    let n = issue.number;
+
+    // The holding label is read through the canonical reader — the very function
+    // `feeder_exclusion_label` consults — never re-tested here (D3). A second
+    // reader of `OPERATOR_HELD_LABELS` is what mika#2263 already paid for once.
+    // Free: the labels are in memory.
+    let Some(held_by) =
+        crate::webhook_dispatch::operator_held_label(issue.labels.iter().map(|l| l.name.as_str()))
+    else {
+        // Classified as held, yet no hold label: an incoherent state, so say
+        // nothing rather than guess which label to name.
+        warn!(
+            issue = n,
+            "auto_pull: abandoned-held ticket carries no hold label; no comment posted"
+        );
+        return;
+    };
+
+    // Fail-closed on the bound too: with no readable abandonment instant there is
+    // no window, and an unbounded count would either never post or post for ever.
+    let abandoned_at = match db.get_auto_pull_redrive_abandoned_at(DEFAULT_REPO, n).await {
+        Ok(Some(at)) => at,
+        Ok(None) => return,
+        Err(e) => {
+            warn!(error = %e, issue = n, "auto_pull_reentry_ledger_unreadable");
+            return;
+        }
+    };
+
+    let key = reentry_ledger_key(n, held_by);
+    let prior = db
+        .count_recent_audit_events_for_target(REENTRY_BLOCKED_TOOL_NAME, &key, &abandoned_at)
+        .await;
+    match decide_reentry_comment(prior) {
+        ReentryCommentVerdict::AlreadyPosted => return,
+        ReentryCommentVerdict::Unreadable => {
+            warn!(
+                issue = n,
+                key = %key,
+                "auto_pull_reentry_ledger_unreadable"
+            );
+            return;
+        }
+        ReentryCommentVerdict::Post => {}
+    }
+
+    // `github_token`, not `label_auth`: no label is written here, so the
+    // mika#2228 class (a label write refused under PAT) does not apply.
+    if let Err(e) = gh_comment_issue(
+        github_token,
+        n,
+        &reentry_blocked_comment_body(n, held_by, redrives),
+    )
+    .await
+    {
+        warn!(error = %e, issue = n, "auto_pull: could not post re-entry-blocked comment");
+        return;
+    }
+
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            REENTRY_BLOCKED_TOOL_NAME,
+            &key,
+            None,
+            Some(held_by),
+            Some("stuck_ready_reentry_blocked"),
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(error = %e, issue = n, "auto_pull: failed to write re-entry-blocked ledger row");
+    }
+
+    info!(
+        issue = n,
+        held_by = held_by,
+        prior_redrives = redrives,
+        "auto_pull_reentry_blocked"
+    );
 }
 
 /// Age in seconds since the `ready` label was last applied, read from an
@@ -3259,10 +3544,48 @@ async fn phase2_reconcile_stuck_ready(
         // Filters 2–3 (in-mem): operator-held tickets and misattributed plans.
         // Decided before any I/O (mika#2020 KTD6).
         if let Some(verdict) = classify_stuck_ready_in_memory(issue) {
+            // mika#2361 — exactly one in-memory verdict needs one more fact, and
+            // it is charged to that population alone. This short-circuit is the
+            // site the production loop actually reaches: a held ticket never
+            // gets as far as `classify_stuck_ready`, which is precisely why the
+            // requalification could not live only in the pure function.
+            //
+            // Fail-open on the read, like filter 6 below: an unreadable counter
+            // keeps the historic name rather than stranding the ticket.
+            let (verdict, redrive_count) = if verdict
+                == (StuckReadyVerdict::Skip {
+                    reason: FILTER_OPERATOR_HELD,
+                }) {
+                let (count, abandoned) = match db.get_auto_pull_redrive_state(DEFAULT_REPO, n).await
+                {
+                    Ok(state) => state,
+                    Err(e) => {
+                        warn!(error = %e, issue = n, "auto_pull: phase 2 re-drive state read failed on a held ticket; keeping the historic filter name");
+                        (0, false)
+                    }
+                };
+                (
+                    requalify_operator_held_when_abandoned(verdict, abandoned),
+                    count,
+                )
+            } else {
+                (verdict, 0)
+            };
+
             record_stuck_ready_verdict(ledger, n, &verdict);
             match verdict {
-                // Recorded above — the skip itself is the whole action.
-                StuckReadyVerdict::Skip { .. } => {}
+                StuckReadyVerdict::Skip { reason } => {
+                    enact_stuck_ready_skip(
+                        db,
+                        github_token,
+                        issue,
+                        reason,
+                        redrive_count,
+                        trace_id,
+                        session_id,
+                    )
+                    .await;
+                }
                 StuckReadyVerdict::Abandon(reason) => {
                     abandon_stuck_ready(
                         db,
@@ -3350,8 +3673,18 @@ async fn phase2_reconcile_stuck_ready(
         record_stuck_ready_verdict(ledger, n, &verdict);
         match verdict {
             StuckReadyVerdict::Eligible => survivors.push(n),
-            // Recorded above — the skip itself is the whole action.
-            StuckReadyVerdict::Skip { .. } => {}
+            StuckReadyVerdict::Skip { reason } => {
+                enact_stuck_ready_skip(
+                    db,
+                    github_token,
+                    issue,
+                    reason,
+                    redrive_count,
+                    trace_id,
+                    session_id,
+                )
+                .await;
+            }
             StuckReadyVerdict::SkipAndResetBudget { .. } => {
                 if redrive_count > 0
                     && let Err(e) = db.reset_auto_pull_redrive(DEFAULT_REPO, n).await
@@ -3363,6 +3696,25 @@ async fn phase2_reconcile_stuck_ready(
                 if let Err(e) = db.reset_auto_pull_redrive(DEFAULT_REPO, n).await {
                     warn!(error = %e, issue = n, "auto_pull: failed to clear abandonment on re-entry");
                     continue;
+                }
+                // mika#2361 — the `info!` alone cost the founding ticket a
+                // reading of the code to answer "what erased the abandonment?".
+                // This site is the sole writer of the name, so its ABSENCE under
+                // a vanished stamp is itself information: there would be a
+                // writer the structural guard did not see.
+                if let Err(e) = db
+                    .log_audit_event(
+                        session_id,
+                        REENTRY_AUDIT_TOOL_NAME,
+                        &format!("issue:{n}"),
+                        None,
+                        Some(&redrive_count.to_string()),
+                        Some("stuck_ready_reentry"),
+                        Some(trace_id),
+                    )
+                    .await
+                {
+                    warn!(error = %e, issue = n, "auto_pull: failed to write re-entry audit event");
                 }
                 info!(
                     issue = n,
@@ -5477,18 +5829,183 @@ This ticket has been GROOMED and is ready.
         );
     }
 
+    /// **T1 (mika#2361) — the negative control, and the letter of the ticket.**
+    ///
+    /// An abandoned ticket that still carries a hold label is a `Skip`, never a
+    /// `ReEntry`, however recently `ready` was re-applied. Re-applying `ready`
+    /// **is not** the re-entry gesture, and this test exists so a future reading
+    /// of #2361 that "repairs" the defect by letting a fresh `labeled(ready)`
+    /// through breaks here and reads why:
+    ///
+    /// - **R1.** [`crate::webhook_dispatch::OPERATOR_HELD_LABELS`] is shared with
+    ///   the `ready_label_handler` gate. mika#2263 measured what a divergence
+    ///   between the two costs: `blocked` excluded #1781 from the feeder and from
+    ///   nothing else, and the handler re-dispatched it twice. Letting a later
+    ///   `ready` win would state *applying `ready` to a `blocked` ticket
+    ///   dispatches it* — that is not lifting the hold, it is deleting it.
+    /// - **R2.** A `labeled(ready)` is not evidence of operator intent. mika#2279
+    ///   measured every such event on #2276 coming from `mika-platform-bot`, and
+    ///   the Phase 2 re-drive *is itself* a `remove` → `add`. Making that event
+    ///   lift a guard hands the engine a way to lift its own guards, and it would
+    ///   self-re-arm: each re-drive re-applies `ready`, producing the very event
+    ///   that authorises the next round.
+    ///
+    /// What the ticket asked for in substance — a reliable operator gesture, and
+    /// a refusal legible where the operator is looking — is T2 and the
+    /// requalified filter name asserted below.
     #[test]
-    fn test_classify_abandoned_and_still_labelled_stays_silent() {
-        // R13: no second comment on subsequent ticks.
-        let issue = make_issue(1901, UNGROOMED_BODY, &["ready", "operator-review"], "t");
+    fn mika2361_re_ready_on_a_held_abandoned_ticket_is_not_a_reentry() {
+        let issue = make_issue(2360, UNGROOMED_BODY, &["ready", "operator-review"], "t");
+        let mut f = facts(3);
+        f.abandoned = true;
+
+        let verdict = classify_stuck_ready(&issue, &f, 3);
+        assert_eq!(
+            verdict,
+            StuckReadyVerdict::Skip {
+                reason: FILTER_ABANDONED_OPERATOR_HELD
+            },
+            "an abandoned held ticket must be named apart from an ordinary held one"
+        );
+        assert_ne!(
+            verdict,
+            StuckReadyVerdict::ReEntry,
+            "re-applying `ready` over a hold label must never re-enter (R1, R2)"
+        );
+    }
+
+    /// **T2 (mika#2361) — the substance of the request: the gesture that works.**
+    ///
+    /// Removing the hold label is the re-entry, and it needs no restart — the
+    /// founding ticket's open question. Same fixture as T1 minus the hold label.
+    #[test]
+    fn mika2361_lifting_the_hold_is_the_reentry() {
+        let issue = make_issue(2360, UNGROOMED_BODY, &["ready"], "t");
+        let mut f = facts(3);
+        f.abandoned = true;
+        assert_eq!(
+            classify_stuck_ready(&issue, &f, 3),
+            StuckReadyVerdict::ReEntry,
+            "with the hold lifted, the abandonment stamp is the re-entry signal"
+        );
+    }
+
+    /// **T3 (mika#2361) — every hold label names itself.**
+    ///
+    /// Loops over the shared constant rather than a copied list: a fourth hold
+    /// label added to [`crate::webhook_dispatch::OPERATOR_HELD_LABELS`] must be
+    /// covered here the day it lands, not the day someone remembers.
+    ///
+    /// Two halves, and the second is what the comment body depends on: the
+    /// verdict is the same for all three, **and** the canonical reader returns
+    /// the one actually present — which is the information `feeder_exclusion_label`
+    /// produces and then throws away one line later, leaving the operator unable
+    /// to know which label to remove.
+    #[test]
+    fn mika2361_each_held_label_names_itself() {
+        for label in crate::webhook_dispatch::OPERATOR_HELD_LABELS {
+            let issue = make_issue(2360, UNGROOMED_BODY, &["ready", label], "t");
+            let mut f = facts(3);
+            f.abandoned = true;
+            assert_eq!(
+                classify_stuck_ready(&issue, &f, 3),
+                StuckReadyVerdict::Skip {
+                    reason: FILTER_ABANDONED_OPERATOR_HELD
+                },
+                "`{label}` must classify like its siblings"
+            );
+            assert_eq!(
+                crate::webhook_dispatch::operator_held_label(
+                    issue.labels.iter().map(|l| l.name.as_str())
+                ),
+                Some(*label),
+                "the canonical reader must name `{label}`, not a bare boolean"
+            );
+        }
+    }
+
+    /// **T5 (mika#2361) — non-regression of the historic aggregate.**
+    ///
+    /// A ticket merely held, with no abandonment stamp, keeps
+    /// `operator_review_or_blocked`. The population does not split under the
+    /// operator's feet: the series stays comparable across the deployment on the
+    /// part of it that did not change name (AC7).
+    #[test]
+    fn mika2361_an_unabandoned_held_ticket_keeps_its_historic_filter_name() {
+        let issue = make_issue(2360, UNGROOMED_BODY, &["ready", "operator-review"], "t");
+        assert_eq!(
+            classify_stuck_ready(&issue, &facts(3), 3),
+            StuckReadyVerdict::Skip {
+                reason: FILTER_OPERATOR_HELD
+            },
+            "only the abandoned half of the population is renamed"
+        );
+    }
+
+    /// **T6 (mika#2361) — a seat refusal is never requalified.**
+    ///
+    /// It is also a `Skip`, it can also carry an abandonment stamp, and its
+    /// remedy has nothing in common: the ticket belongs to another dispatch
+    /// seat, and naming a hold label to remove would be a confident wrong answer.
+    #[test]
+    fn mika2361_a_seat_refusal_is_never_requalified() {
+        let issue = make_issue(2360, UNGROOMED_BODY, &["ready", "dispatch:ssc"], "t");
         let mut f = facts(3);
         f.abandoned = true;
         assert_eq!(
             classify_stuck_ready(&issue, &f, 3),
             StuckReadyVerdict::Skip {
-                reason: "operator_review_or_blocked"
+                reason: "seat_owned_by_other"
+            },
+            "a seat collision keeps its own reason (mika#2084 AC5)"
+        );
+    }
+
+    /// **mika#2361 — the requalification renames, it never re-decides.**
+    ///
+    /// Direct coverage of the shared predicate both entrances use: the verdict
+    /// variant is invariant, and nothing but the operator-held `Skip` is touched.
+    #[test]
+    fn mika2361_requalification_only_ever_moves_one_label() {
+        let held = StuckReadyVerdict::Skip {
+            reason: FILTER_OPERATOR_HELD,
+        };
+        assert_eq!(
+            requalify_operator_held_when_abandoned(held.clone(), false),
+            held,
+            "no stamp, no rename"
+        );
+        assert_eq!(
+            requalify_operator_held_when_abandoned(held, true),
+            StuckReadyVerdict::Skip {
+                reason: FILTER_ABANDONED_OPERATOR_HELD
             }
         );
+
+        // Every other verdict passes through untouched, stamp or no stamp.
+        for verdict in [
+            StuckReadyVerdict::Eligible,
+            StuckReadyVerdict::ReEntry,
+            StuckReadyVerdict::Skip {
+                reason: FILTER_IN_FLIGHT,
+            },
+            StuckReadyVerdict::Skip {
+                reason: FILTER_LIVE_PILOT,
+            },
+            StuckReadyVerdict::SkipAndResetBudget {
+                reason: FILTER_OPEN_PR,
+            },
+            StuckReadyVerdict::Abandon(AbandonReason::RedriveBudgetExhausted {
+                redrives: 3,
+                budget: 3,
+            }),
+        ] {
+            assert_eq!(
+                requalify_operator_held_when_abandoned(verdict.clone(), true),
+                verdict,
+                "the requalification must touch exactly one filter name"
+            );
+        }
     }
 
     #[test]
@@ -5978,6 +6495,435 @@ This ticket has been GROOMED and is ready.
         );
     }
 
+    /// **mika#2361 — the wiring, end to end and without a network.**
+    ///
+    /// This is the test that makes the fix true in production rather than only
+    /// in the pure function, and the reason it exists is worth writing down.
+    ///
+    /// `phase2_reconcile_stuck_ready` short-circuits on
+    /// `classify_stuck_ready_in_memory` **before** it resolves any fact, so a
+    /// held ticket never reaches `classify_stuck_ready`. A requalification
+    /// placed only in the pure function would therefore be green under T1, T3
+    /// and T5 — and **inert on the loop**: the ledger would keep writing
+    /// `operator_review_or_blocked`, no comment would ever be posted, and the
+    /// ticket the whole change exists for would be exactly as silent as before.
+    /// Only a test that drives the loop can tell those two states apart.
+    ///
+    /// Hermetic: the abandonment is dated in the past and the ledger row is
+    /// written ahead of time, so the comment path resolves `AlreadyPosted` and
+    /// no `gh` subprocess is spawned. The posting decision itself is T9/T10.
+    ///
+    /// Red-before: revert the requalification block in the loop's in-memory
+    /// short-circuit — the ledger reverts to `operator_review_or_blocked` and
+    /// the first assertion fails.
+    #[tokio::test]
+    async fn mika2361_phase2_names_an_abandoned_held_ticket_under_its_own_filter() {
+        use crate::db::Database;
+        use mika_common::label_write::{LabelWriteToken, LabelWriteTokenSource};
+
+        let n = 2360u64;
+        let raw = Database::open_in_memory().expect("open in-memory DB");
+        // Dated in the past so the pre-written ledger row falls inside the
+        // dedup window — `created_at > since` at second resolution would
+        // otherwise be a coin flip on how fast the machine is.
+        raw.conn
+            .execute(
+                "INSERT INTO auto_pull_stats
+                   (repo_full_name, issue_number, redrive_count, redrive_abandoned_at)
+                 VALUES (?1, ?2, 3, '2020-01-01T00:00:00Z')",
+                rusqlite::params![DEFAULT_REPO, n as i64],
+            )
+            .expect("seed an abandoned ticket");
+        let db = AsyncDatabase::new_with_agent(raw, "mika");
+
+        db.log_audit_event(
+            "s",
+            REENTRY_BLOCKED_TOOL_NAME,
+            &reentry_ledger_key(n, "blocked"),
+            None,
+            Some("blocked"),
+            Some("stuck_ready_reentry_blocked"),
+            None,
+        )
+        .await
+        .expect("pre-write the comment ledger row");
+
+        // The #2360 state: the operator re-applied `ready` over a hold label.
+        let issues = vec![make_issue(n, GROOMED_BODY, &["ready", "blocked"], "t")];
+        let auth = LabelWriteToken::new("fake-token".to_string(), LabelWriteTokenSource::Pat);
+        let mut ledger = ExclusionLedger::default();
+
+        let rescued = phase2_reconcile_stuck_ready(
+            &db,
+            "fake-token",
+            &auth,
+            &issues,
+            &HashSet::new(),
+            "trace",
+            "session",
+            &mut ledger,
+        )
+        .await;
+
+        assert_eq!(rescued, 0, "a held ticket is never re-driven");
+        assert!(
+            ledger.entries.contains(&(
+                ExclusionPhase::Phase2StuckReady,
+                n,
+                FILTER_ABANDONED_OPERATOR_HELD
+            )),
+            "the loop itself must name this population apart — this is the \
+             assertion the pure-function tests cannot make; ledger = {:?}",
+            ledger.entries
+        );
+        assert!(
+            !ledger
+                .entries
+                .contains(&(ExclusionPhase::Phase2StuckReady, n, FILTER_OPERATOR_HELD)),
+            "and must not also count it under the historic name, or the two \
+             populations stay indistinguishable in SQL; ledger = {:?}",
+            ledger.entries
+        );
+
+        let (redrives, abandoned) = db
+            .get_auto_pull_redrive_state(DEFAULT_REPO, n)
+            .await
+            .expect("read redrive state");
+        assert_eq!(redrives, 3, "naming a refusal does not spend the budget");
+        assert!(
+            abandoned,
+            "and does not clear the abandonment — only lifting the hold does (T2)"
+        );
+    }
+
+    /// Negative control for the wiring test above: **the same loop, the same
+    /// ticket, no abandonment stamp** must still write the historic name.
+    ///
+    /// Without this, the assertion above is satisfied by a loop that renamed the
+    /// filter unconditionally — which would split the historic aggregate under
+    /// the operator's feet (AC7) while looking exactly as green.
+    #[tokio::test]
+    async fn mika2361_phase2_keeps_the_historic_name_when_nothing_was_abandoned() {
+        use crate::db::Database;
+        use mika_common::label_write::{LabelWriteToken, LabelWriteTokenSource};
+
+        let n = 2360u64;
+        let db = AsyncDatabase::new_with_agent(
+            Database::open_in_memory().expect("open in-memory DB"),
+            "mika",
+        );
+
+        let issues = vec![make_issue(n, GROOMED_BODY, &["ready", "blocked"], "t")];
+        let auth = LabelWriteToken::new("fake-token".to_string(), LabelWriteTokenSource::Pat);
+        let mut ledger = ExclusionLedger::default();
+
+        let rescued = phase2_reconcile_stuck_ready(
+            &db,
+            "fake-token",
+            &auth,
+            &issues,
+            &HashSet::new(),
+            "trace",
+            "session",
+            &mut ledger,
+        )
+        .await;
+
+        assert_eq!(rescued, 0);
+        assert!(
+            ledger
+                .entries
+                .contains(&(ExclusionPhase::Phase2StuckReady, n, FILTER_OPERATOR_HELD)),
+            "an ordinary held ticket keeps `operator_review_or_blocked`; \
+             ledger = {:?}",
+            ledger.entries
+        );
+    }
+
+    /// **T10 (mika#2361) — fail-closed on the ledger (D6).**
+    ///
+    /// An unreadable `audit_events` refuses the comment. The asymmetry that picks
+    /// this direction: a false negative leaves an operator without *this*
+    /// comment while the abandonment comment is already on the same ticket; a
+    /// false positive posts on every 10-minute tick — ~144 comments a day on one
+    /// ticket. Same direction as `wip_rescue` (mika#2199) and
+    /// `qa_review_reconcile` (mika#2347), the deliberate inverse of
+    /// `ci_success_handler`.
+    #[test]
+    fn mika2361_an_unreadable_ledger_refuses_the_comment() {
+        assert_eq!(
+            decide_reentry_comment(Ok(0)),
+            ReentryCommentVerdict::Post,
+            "nothing recorded since this abandonment — say it once"
+        );
+        assert_eq!(
+            decide_reentry_comment(Ok(1)),
+            ReentryCommentVerdict::AlreadyPosted
+        );
+        assert_eq!(
+            decide_reentry_comment(Err(anyhow::anyhow!("database is locked"))),
+            ReentryCommentVerdict::Unreadable,
+            "an unreadable ledger must never read as `Post` — that is the \
+             144-comments-a-day failure"
+        );
+        assert_ne!(
+            decide_reentry_comment(Err(anyhow::anyhow!("database is locked"))),
+            ReentryCommentVerdict::Post
+        );
+    }
+
+    /// **T9 (mika#2361) — one comment per abandonment and per holding label.**
+    ///
+    /// The dedup bound is the abandonment instant itself, not a chosen window
+    /// (D5): the same state, tick after tick, writes once; a **fresh**
+    /// abandonment stamps a newer instant, which leaves the old row outside the
+    /// window and reopens the right to speak. Idempotence from the shape of the
+    /// bound rather than from one more column.
+    ///
+    /// The instants are written directly rather than through `now()`: the
+    /// columns are second-resolution, so a test relying on wall-clock ordering
+    /// would be the kind that passes until a machine is fast.
+    #[tokio::test]
+    async fn mika2361_the_reentry_comment_is_posted_once_per_abandonment() {
+        use crate::db::Database;
+
+        let db = AsyncDatabase::new_with_agent(
+            Database::open_in_memory().expect("open in-memory DB"),
+            "mika",
+        );
+        let n = 2360u64;
+        let key = reentry_ledger_key(n, "blocked");
+
+        // A first abandonment, dated well in the past.
+        let first_abandonment = "2026-09-17T13:40:07Z";
+        let prior = db
+            .count_recent_audit_events_for_target(
+                REENTRY_BLOCKED_TOOL_NAME,
+                &key,
+                first_abandonment,
+            )
+            .await;
+        assert_eq!(
+            decide_reentry_comment(prior),
+            ReentryCommentVerdict::Post,
+            "nothing said yet for this abandonment"
+        );
+
+        // The comment lands; the ledger row follows it.
+        db.log_audit_event(
+            "s",
+            REENTRY_BLOCKED_TOOL_NAME,
+            &key,
+            None,
+            Some("blocked"),
+            Some("stuck_ready_reentry_blocked"),
+            None,
+        )
+        .await
+        .expect("write ledger row");
+
+        let prior = db
+            .count_recent_audit_events_for_target(
+                REENTRY_BLOCKED_TOOL_NAME,
+                &key,
+                first_abandonment,
+            )
+            .await;
+        assert_eq!(
+            decide_reentry_comment(prior),
+            ReentryCommentVerdict::AlreadyPosted,
+            "the same state on the next tick is one fact, not 144 of them"
+        );
+
+        // A re-entry, then a FRESH abandonment: the new stamp is later than the
+        // row above, so the window no longer contains it.
+        let second_abandonment = "2099-01-01T00:00:00Z";
+        let prior = db
+            .count_recent_audit_events_for_target(
+                REENTRY_BLOCKED_TOOL_NAME,
+                &key,
+                second_abandonment,
+            )
+            .await;
+        assert_eq!(
+            decide_reentry_comment(prior),
+            ReentryCommentVerdict::Post,
+            "a new abandonment reopens the right to speak — the bound is the \
+             abandonment, not a window someone chose"
+        );
+
+        // A different holding label is a different key: the operator who lifted
+        // `blocked` and met `operator-review` is owed the second sentence too.
+        let other = reentry_ledger_key(n, "operator-review");
+        let prior = db
+            .count_recent_audit_events_for_target(
+                REENTRY_BLOCKED_TOOL_NAME,
+                &other,
+                first_abandonment,
+            )
+            .await;
+        assert_eq!(decide_reentry_comment(prior), ReentryCommentVerdict::Post);
+    }
+
+    /// **mika#2361** — the ledger key cannot be confused by a `LIKE` prefix.
+    ///
+    /// mika#2347 named this trap on another surface: `LIKE 'issue:234%'` matches
+    /// `issue:2343`. The `@` separator closes it — the character after the
+    /// ticket number is `@` for this ticket and a digit for any longer one.
+    #[test]
+    fn mika2361_the_ledger_key_prefix_cannot_match_a_longer_ticket() {
+        assert_eq!(reentry_ledger_key(2360, "blocked"), "issue:2360@blocked");
+        assert!(!reentry_ledger_key(23600, "blocked").starts_with("issue:2360@"));
+        assert!(reentry_ledger_key(2360, "operator-review").starts_with("issue:2360@"));
+    }
+
+    /// **mika#2361** — the comment states a state, never a gesture it imputes.
+    ///
+    /// `abandon_stuck_ready` only `warn!`s when removing `ready` fails, so a
+    /// ticket can carry `ready` + a hold label + an abandonment stamp with nobody
+    /// having done anything. A body reading "you re-applied `ready`" would then
+    /// be false on the very surface whose job is to be trustworthy.
+    #[test]
+    fn mika2361_the_comment_names_the_label_and_imputes_no_gesture() {
+        let body = reentry_blocked_comment_body(2360, "blocked", 3);
+
+        assert!(
+            body.contains("`blocked`"),
+            "the comment must name the label actually present: {body}"
+        );
+        assert!(
+            !body.contains("operator-review"),
+            "naming a label the ticket does not carry is the #2360 defect: {body}"
+        );
+        assert!(
+            body.contains("retirer `blocked`") || body.contains("retirer `blocked`."),
+            "the remedy must be the gesture, spelled out: {body}"
+        );
+        for imputed in ["tu as reposé", "vous avez reposé", "you re-applied"] {
+            assert!(
+                !body.contains(imputed),
+                "the body must not impute a gesture nobody is proven to have made: {body}"
+            );
+        }
+    }
+
+    /// **T7 (mika#2361) — exactly two production callers clear a re-drive budget.**
+    ///
+    /// # Why a source scan and not a behavioural test
+    ///
+    /// A third writer of `redrive_abandoned_at` — a reset at startup, say, which
+    /// is the exact hypothesis this ticket had to refute by hand — would make no
+    /// decision wrong. It would make **attribution impossible** while every
+    /// assertion stayed green: an abandonment would vanish and the
+    /// `auto_pull_redrive_reentry` row would not be there to say who cleared it,
+    /// which is the whole value of that row being sole-written. Same family as
+    /// [`mika2131_exclusion_skips_never_return_to_an_uncollected_debug`].
+    ///
+    /// # Disposition if this fires (§ Fire-Disposition of the plan)
+    ///
+    /// **Halt-and-surface — no allowlist, and the allowlist's emptiness is the
+    /// invariant.** The two expected sites are the assertion's expected value,
+    /// not exemptions: a guard tolerating "N callers of which two are named"
+    /// says nothing the day a third appears. A third writer invalidates § 1.2's
+    /// refutation ("the restart cannot have erased the abandonment") and
+    /// therefore the diagnosis this whole change rests on. Read the new writer,
+    /// redo § 1.2, and reopen the scope if the measured cause has changed. Probe
+    /// S3 states the same halt on the production side; the two answer each other
+    /// deliberately.
+    ///
+    /// # Form
+    ///
+    /// Runtime read from `env!("CARGO_MANIFEST_DIR")`, so the guard has no
+    /// compile coupling to the files it scans and no dependency on the current
+    /// directory. Same shape as
+    /// `ready_label::tests::no_ready_label_write_outside_this_module`.
+    ///
+    /// The `mod tests` of this very module is excluded: it is `#[cfg(test)]`, it
+    /// names the method by construction, and without the exclusion the detector
+    /// would fail on its own existence.
+    #[test]
+    fn mika2361_reset_auto_pull_redrive_has_exactly_two_production_callers() {
+        // Split so the guard's own body is not what it catches first.
+        let needle = ["reset_auto_pull", "_redrive"].concat();
+
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let this_module = src_root.join("auto_pull.rs");
+        // Definition sites, not call sites: `Database` and its async mirror.
+        let definitions = [src_root.join("db.rs"), src_root.join("async_db.rs")];
+
+        let mut callers = Vec::new();
+        let mut stack = vec![src_root.clone()];
+        let mut scanned = 0usize;
+
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| {
+                panic!("the guard must be able to read {}: {e}", dir.display())
+            });
+            for entry in entries {
+                let path = entry.expect("readable directory entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") || definitions.contains(&path) {
+                    continue;
+                }
+                let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                    panic!("the guard must be able to read {}: {e}", path.display())
+                });
+                scanned += 1;
+
+                // `auto_pull.rs` carries its own `mod tests`; everywhere else the
+                // file is production in full.
+                let production: &str = if path == this_module {
+                    content
+                        .split_once("mod tests {")
+                        .map_or(content.as_str(), |(before, _)| before)
+                } else {
+                    content.as_str()
+                };
+
+                for (n, line) in production.lines().enumerate() {
+                    let t = line.trim_start();
+                    // Calls only: not doc comments, not prose.
+                    if t.starts_with("//") || t.starts_with("*") {
+                        continue;
+                    }
+                    if line.contains(&needle) {
+                        callers.push(format!(
+                            "{}:{}: {}",
+                            path.strip_prefix(&src_root).unwrap_or(&path).display(),
+                            n + 1,
+                            line.trim()
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert!(scanned > 0, "the guard scanned no file — broken path");
+        assert!(
+            production_carries_the_reentry_arm(&std::fs::read_to_string(&this_module).unwrap()),
+            "the scan is not reading the module it is about"
+        );
+        assert_eq!(
+            callers.len(),
+            2,
+            "mika#2361 — the re-drive budget must be cleared from exactly two \
+             production sites (the `SkipAndResetBudget` arm and the `ReEntry` \
+             arm of `phase2_reconcile_stuck_ready`). A third writer makes the \
+             disappearance of `redrive_abandoned_at` unattributable while every \
+             behavioural assertion stays green — read it and redo § 1.2 of the \
+             plan; do NOT add it to an allowlist.\n{}",
+            callers.join("\n")
+        );
+    }
+
+    /// Non-vacuity helper for T7: the arm it is about is still in this module.
+    fn production_carries_the_reentry_arm(source: &str) -> bool {
+        source.contains("StuckReadyVerdict::ReEntry =>")
+    }
+
     /// The dedup that makes the per-ticket audit affordable: a ticket held by the
     /// same filter tick after tick writes one row, not one per tick. A change of
     /// filter is a state change and writes again.
@@ -6068,6 +7014,10 @@ This ticket has been GROOMED and is ready.
         assert_eq!(FILTER_SEAT_REFUSED, "seat_refused");
         assert_eq!(FILTER_READY_PARKED, "ready_parked");
         assert_eq!(EXCLUSION_AUDIT_TOOL_NAME, "auto_pull_exclusion");
+        // mika#2361 — the audit `tool_name`s are wire format too: an operator
+        // greps them by hand, so a rename silently empties their query.
+        assert_eq!(REENTRY_BLOCKED_TOOL_NAME, "auto_pull_reentry_blocked");
+        assert_eq!(REENTRY_AUDIT_TOOL_NAME, "auto_pull_redrive_reentry");
 
         // The Phase 2 classifier reaches the same vocabulary. These four are the
         // ones a rename would silently fork.
