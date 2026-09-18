@@ -88,6 +88,14 @@ Le ticket a dû recopier `~/.mika/skills/_shared/dispatch-lib.sh` à la main.
 `disabled`, et hors de la porte de hash. Router `update` par la fonction
 canonique couvre donc `_shared/` sans second mécanisme.
 
+**Il y a un second appel, et c'est celui de `startup.rs:80` qui porte la
+garantie.** `seed_bundled_skill_library` rappelle `seed_support_dirs` à
+`bundled_skills.rs:486`, c'est-à-dire **après** son retour anticipé de porte de
+hash (`470-483`) : redondant sur le chemin d'extraction, absent sur le chemin de
+confirmation. T4 tient donc par l'appel de `startup.rs:80` seul, jamais par
+celui-ci. Dit ici parce que l'implémenteur de B2 pose son écriture dans cette
+même fonction et doit savoir lequel des deux appels garantit quoi.
+
 ### T5 — Ce que le hash sait dire, et ce qu'il ne sait pas dire
 
 `.manifest-hash` répond à « cette library correspond-elle au binaire qui l'a
@@ -143,6 +151,22 @@ inconditionnel, garde `disabled` (avec détection de drift),
 `seed_bundled_skill_library` (gardé par hash, sync-shape, élagage des
 orphelins), puis `materialize_agent_skill_links` avec l'allowlist d'identité.
 
+**La précondition qui décide de la sûreté de cette bascule, vérifiée plutôt que
+supposée : la cible des symlinks ne bouge pas.** L'appel actuel est *paramétré*
+— `materialize_agent_skill_links(&library_dir, skills_dir, allowlist)`, où
+`skills_dir` arrive par la signature d'`update_skills` — tandis que le composite
+**recalcule** sa cible en interne (`agent_skills_dir = agent_home.join("skills")`,
+`startup.rs:66`). Remplacer un appel paramétré par un appel auto-résolvant n'est
+sûr que si les deux chemins coïncident, et ils coïncident **par construction** :
+`commands::skills::run` pose `let skills_dir = agent_home.join("skills")`
+(`skills.rs:25`), la même expression, à partir du même `agent_home` qu'il
+transmet. Sans cette vérification la bascule pourrait déplacer les symlinks de
+tous les skills bundled vers un autre répertoire — un défaut silencieux de la
+même famille que celui qu'on ferme, et il n'aurait été découvert qu'en
+production. **Corollaire pour l'implémenteur :** le paramètre `skills_dir` ne
+devient pas mort et ne doit pas être supprimé — il reste lu plus bas par
+`install::update_skill(agent_home, skills_dir, …)`, sur la branche marketplace.
+
 **Une différence de comportement à nommer, pour qu'elle n'arrête pas
 l'implémenteur : le layout legacy single-agent.** `seed_bundled_skills_if_needed`
 retourne **avant** `materialize_agent_skill_links` quand `resolve_global_home`
@@ -154,6 +178,25 @@ le répertoire de skills de l'agent, donc la passe s'exécuterait contre elle-m�
 — le commentaire de `startup.rs:108-111` le dit dans ces termes. La topologie du
 ticket (`~/.mika/agents/mika-arch/skills`) est multi-agent, donc le chemin du
 défaut est inchangé.
+
+Cette borne est en outre **plus étroite que sa formulation** : `commands::skills::run`
+appelle `home::migrate_to_multi_agent(&global_home)?` (`skills.rs:23`) *avant* de
+résoudre `agent_home`, donc sur ce chemin précis le layout est déjà migré quand
+la question se pose. Et en legacy `resolve_agent_home` rend `global_home`
+lui-même (`home.rs:344-350`), si bien que `skills_dir` et la library désignent
+littéralement le même répertoire — le chemin confirme ce que rev 4 déduisait du
+commentaire.
+
+**Ce que la bascule ajoute par ailleurs, nommé plutôt que découvert.** Le
+composite ouvre par `migrate_generated_variant_provider_dirs(agent_home)`
+(`startup.rs:62`), qui **renomme physiquement** des répertoires de variantes
+générées (mika#1663) — et, les dossiers de skills étant des symlinks vers la
+library, ce renommage atterrit dans la library partagée (son doc-comment le dit,
+`startup.rs:151-156`). `mika skills update` n'effectuait pas cette mutation
+jusqu'ici. Elle est idempotente, warn-and-continue, et bornée aux répertoires
+`generated/<provider>/` — mais c'est un élargissement réel du périmètre d'effet
+de la commande, et un plan qui route par un composite doit énoncer tout ce que ce
+composite fait, pas seulement la partie qu'il vient chercher.
 
 **Nombre d'appelants, pour la même raison.** Le composite a **quatre** sites de
 production (`init.rs:68`, `agents.rs:126`, `server/mod.rs:486`,
@@ -184,8 +227,10 @@ marketplace nommé ; la garde `if name.is_none()` déjà présente reste, inchan
 
 ### B2 — La library dit quel binaire a produit son état (`.manifest-writer`)
 
-`seed_bundled_skill_library` écrit un sidecar JSON `.manifest-writer` à côté de
-`.manifest-hash` :
+`seed_bundled_skill_library` — dans **`crates/mika-agent/src/bundled_skills.rs`**,
+à la racine de `src/`, *pas* sous `src/skills/` où la proximité avec le reste du
+sous-système le ferait chercher — écrit un sidecar JSON `.manifest-writer` à côté
+de `.manifest-hash` (`MANIFEST_HASH_FILE`, `bundled_skills.rs:32`) :
 
 ```json
 {"version":"0.12.2","git_hash":"968dbe94","attested_at":"2026-09-18T09:14:02Z","manifest_hash":"a1b2c3d4e5f60718","extracted":true}
@@ -271,6 +316,16 @@ Aucun cas particulier n'est écrit dans le code pour `"unknown"` : le sidecar
 enregistre la constante telle quelle. Une valeur sentinelle réécrite par
 l'écrivain serait une seconde source de vérité sur la provenance du binaire.
 
+**Le WARN atteint bien la surface que le ticket vise — vérifié, pas supposé.**
+La garde ci-dessus n'a de valeur que si son `warn!` est rendu sur la commande
+qu'un opérateur tape. `main.rs:222-238` : `suppress_stderr` ne couvre que `Chat`
+et `Ask`, donc `mika skills` initialise `init_pretty` en `LogOutput::PrettyAndFile`
+et le WARN part sur stderr en plus du fichier. Prescrire un signal sur une
+commande qui n'installe pas de subscriber — ou qui filtre son propre niveau —
+serait prescrire un signal invisible, c'est-à-dire reproduire en petit la classe
+de défaut du ticket : un compte-rendu rassurant qui ne dit rien. La même
+vérification vaut pour AC5.
+
 **Lecture par le CLI, pas retour de fonction.** `seed_bundled_skills_if_needed`
 rend `()` et a quatre sites de production. Élargir sa signature pour qu'un seul
 imprime un résumé coûterait quatre sites pour un afficheur. Le CLI **relit**
@@ -355,6 +410,15 @@ Module `#[cfg(test)]` inline dans `crates/mika-cli/src/commands/skills.rs`
 4. Appeler `update_skills(global_home, agent_home, skills_dir, None, None)`.
 5. Asserter : le fichier de library **et** le fichier résolu via le symlink de
    l'agent sont revenus au contenu du manifeste du binaire.
+6. Asserter que le symlink lu à l'étape 5 est bien celui de
+   `<agent_home>/skills/<skill>` — c'est-à-dire du `skills_dir` passé à
+   `update_skills`, et non d'un répertoire que le composite aurait recalculé
+   ailleurs. C'est la précondition de B1 (*la cible des symlinks ne bouge pas*)
+   rendue mesurable : sans elle, une bascule qui resynchroniserait correctement
+   la library tout en matérialisant les liens dans un autre répertoire passerait
+   les étapes 1 à 5 en laissant l'agent sur ses anciens liens. Un montage de test
+   où les deux chemins coïncident déjà ne prouve rien tout seul — l'assertion
+   doit nommer `skills_dir` explicitement.
 
 **Fidélité de la simulation, dite explicitement.** L'étape 3 simule l'état
 *post-reconstruction* — une library écrite par un manifeste antérieur à celui du
@@ -688,6 +752,46 @@ au ticket, s'il est jugé souhaitable.
 
 ## Revision history
 
+- **rev 5 (2026-09-18)** — passe de préconditions d'implémentation. Aucune
+  conception n'est changée, aucun critère d'acceptation affaibli ; cinq faits
+  relus dans le code, dont un qui décide de la sûreté de B1 et que ni la rev 3
+  ni la rev 4 n'avaient posé.
+  - **B1 vérifie que la bascule ne déplace pas les symlinks.** L'appel actuel est
+    *paramétré* (`materialize_agent_skill_links(&library_dir, skills_dir, …)`)
+    et le composite **recalcule** sa cible (`agent_home.join("skills")`,
+    `startup.rs:66`). La substitution n'est sûre que si les deux chemins
+    coïncident : `skills.rs:25` pose exactement la même expression à partir du
+    même `agent_home`. C'est la seule précondition du plan dont la fausseté
+    produirait un défaut *silencieux* — library correctement resynchronisée,
+    agent laissé sur ses anciens liens — donc la seule qui ne pouvait pas rester
+    implicite. Rendue mesurable par une sixième assertion de V1, qui nomme
+    `skills_dir` plutôt que de se reposer sur un montage où les deux chemins
+    coïncident déjà. Corollaire ajouté pour éviter une suppression de bonne foi :
+    `skills_dir` ne devient pas un paramètre mort (`install::update_skill` le lit
+    encore, sur la branche marketplace).
+  - **B2 vérifie que sa garde de régression est visible sur la surface visée.**
+    `main.rs:222-238` : `suppress_stderr` ne couvre que `Chat` et `Ask`, donc
+    `mika skills` initialise `LogOutput::PrettyAndFile` et le `warn!` de
+    `bundled_library_downgrade` atteint stderr. Prescrire un WARN sur une
+    commande qui n'installe pas de subscriber aurait reproduit en petit la classe
+    du ticket : un compte-rendu qui ne dit rien. Vaut aussi pour AC5.
+  - **T4 nomme le second appel à `seed_support_dirs`** (`bundled_skills.rs:486`),
+    postérieur au retour anticipé de la porte de hash — donc redondant sur le
+    chemin d'extraction et **absent** sur le chemin de confirmation. T4 tient par
+    l'appel de `startup.rs:80` seul ; l'implémenteur de B2 pose son écriture dans
+    cette même fonction et doit savoir lequel des deux garantit quoi.
+  - **Le chemin exact du fichier est donné :**
+    `crates/mika-agent/src/bundled_skills.rs`, à la racine de `src/` et non sous
+    `src/skills/` où le sous-système le fait chercher.
+  - **B1 nomme la mutation de disque que la bascule ajoute** —
+    `migrate_generated_variant_provider_dirs` (`startup.rs:62`), un renommage
+    physique de répertoires de variantes qui atterrit dans la library partagée.
+    Idempotent, warn-and-continue, borné — mais réel, et un plan qui route par un
+    composite doit énoncer tout ce que ce composite fait. La borne
+    `is_multi_agent` de la rev 4 est par ailleurs confirmée **plus étroite**
+    qu'annoncée : `skills.rs:23` migre le layout avant de résoudre `agent_home`,
+    et en legacy `resolve_agent_home` rend `global_home` lui-même
+    (`home.rs:344-350`), donc les deux répertoires sont littéralement le même.
 - **rev 4 (2026-09-18)** — passe de fidélité au code. Aucun changement de
   conception, aucun critère d'acceptation affaibli ; trois écarts entre ce que le
   plan affirmait du code et ce que le code fait, tous relevés par relecture
