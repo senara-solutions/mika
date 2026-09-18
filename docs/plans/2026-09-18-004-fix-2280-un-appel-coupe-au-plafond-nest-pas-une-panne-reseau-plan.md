@@ -351,6 +351,15 @@ attendu, et la **halte** de la § *Sonde post-déploiement* ci-dessous. Plus les
 quatre nouveaux champs de `llm_budget_resolved` et la variable
 `MIKA_LLM_OUTPUT_TOKENS_PER_SEC_FLOOR` dans la liste des variables optionnelles.
 
+### 6. `crates/mika-agent/src/well_known_agents.rs` — **le test d'AC8, et rien d'autre**
+
+Ce fichier apparaît dans les Changements uniquement pour lever une ambiguïté que
+son absence créerait : il reçoit le test de l'AC8 (module `tests`, voir la § Tests
+pour la contrainte de dépendance qui l'y oblige) et **aucune de ses constantes
+n'est touchée**. `MIKA_DEV_CONFIG`, `MIKA_QA_CONFIG` et la config de mika-arch
+sont lues, jamais écrites — l'interdiction de D1.3 et d'AC9 porte sur les
+valeurs, pas sur le fichier.
+
 ---
 
 ## Tests
@@ -361,7 +370,7 @@ quatre nouveaux champs de `llm_budget_resolved` et la variable
   cite — le test asserte la formule et **documente l'écart**, il ne prétend pas
   reproduire un nombre arrondi à la main).
 - `budget::tests` — les trois paliers du lecteur d'environnement.
-- **`budget_provenance::tests::mika2280_les_trois_geometries_livrees_et_leur_verdict`**
+- **`well_known_agents::tests::mika2280_les_trois_geometries_livrees_et_leur_verdict`**
   — la constatation de E2, figée : mika-dev (120 s / 8 192) et mika-qa
   (120 s / 16 384) sont au-dessus de leur atteignable, mika-arch (240 s / 32 768)
   aussi **et c'est décidé** (mika#2296). Le test n'exige aucune correction ; il
@@ -369,6 +378,22 @@ quatre nouveaux champs de `llm_budget_resolved` et la variable
   l'arithmétique. C'est la garde que E2 appelle : elle ne peut pas être
   comportementale, parce qu'aucune décision ne deviendrait fausse — seule la
   cohérence entre deux constantes le deviendrait.
+
+  **L'emplacement est contraint, pas préféré.** `mika-agent` dépend de
+  `mika-common` et jamais l'inverse (`crates/mika-common/Cargo.toml` ne porte
+  aucune dépendance vers `mika-agent`), donc un test vivant dans
+  `budget_provenance::tests` **ne peut pas** lire `MIKA_DEV_CONFIG`,
+  `MIKA_QA_CONFIG` ni `MIKA_ARCH_CONFIG`, qui sont des constantes de
+  `crates/mika-agent/src/well_known_agents.rs`. Le sens légal est l'autre : le
+  test vit dans `mika-agent` et appelle `reachable_output_tokens` depuis
+  `mika-common`. Il se place à côté de
+  `mika2296_no_well_known_config_declares_an_output_budget_below_8192`, dont il
+  reprend la forme exacte (scan de `WELL_KNOWN_AGENTS`, lecture du `config_toml`
+  en TOML, `continue` sur une absence de déclaration — une absence est un
+  non-choix, jamais une violation) et dont il est le **complément
+  d'orientation** : cette garde-là pose un *plancher* (`declared >= 8192`),
+  celui-ci lit le *rapport* entre le budget déclaré et ce que le plafond temps
+  peut porter. Les deux cohabitent sans se recouvrir.
 - `mika2293_reconstruction_equals_load_for_agent_on_every_cascade_position`
   étendu à la troisième clé, sur les quatre positions.
 - `budget_provenance::tests` — une géométrie qui ne change *que* `llm_max_tokens`
@@ -556,6 +581,9 @@ fuité dans la rétryabilité et il faut désarmer (mika#2015).
 - **AC8** — un test fige les trois géométries livrées (mika-dev 120/8192,
   mika-qa 120/16384, mika-arch 240/32768) avec leur verdict d'atteignabilité, et
   rougit si l'un de ces six nombres bouge sans que l'arithmétique soit refaite.
+  Il vit dans `crates/mika-agent/src/well_known_agents.rs` (module `tests`), le
+  seul crate d'où les trois constantes **et** `reachable_output_tokens` sont
+  simultanément visibles — `mika-common` ne voit pas `mika-agent`.
 - **AC9** — aucune constante de configuration n'est modifiée : ni
   `MIKA_DEV_CONFIG`, ni `MIKA_QA_CONFIG`, ni la config de mika-arch, ni
   `DEFAULT_HTTP_TIMEOUT_SECS`, ni `DEFAULT_AGENT_TOTAL_TIMEOUT_SECS`.
