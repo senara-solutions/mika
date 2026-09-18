@@ -11970,6 +11970,34 @@ impl Database {
         Ok(state)
     }
 
+    /// The instant a ticket was abandoned by the re-drive reconciler, or `None`
+    /// when it is not abandoned (mika#2361).
+    ///
+    /// Deliberately separate from [`Self::get_auto_pull_redrive_state`], which
+    /// returns the boolean the Phase 2 decision needs. The *date* is not an input
+    /// of that decision — it is only the bound of the re-entry-blocked comment's
+    /// dedup window. Widening the existing tuple would have made
+    /// `StuckReadyFacts`, and every test that builds one, carry a value the pure
+    /// function has no use for.
+    pub fn get_auto_pull_redrive_abandoned_at(
+        &self,
+        repo_full_name: &str,
+        issue_number: u64,
+    ) -> Result<Option<String>> {
+        let at = self
+            .conn
+            .query_row(
+                "SELECT redrive_abandoned_at
+                 FROM auto_pull_stats
+                 WHERE repo_full_name = ?1 AND issue_number = ?2",
+                params![repo_full_name, issue_number as i64],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(at)
+    }
+
     /// Increment a ticket's re-drive counter after a successful Phase 2 rescue.
     pub fn increment_auto_pull_redrive(
         &self,
@@ -15668,6 +15696,57 @@ pub(crate) mod tests {
         assert_eq!(
             db.get_auto_pull_redrive_state(repo, 1887).unwrap(),
             (0, true)
+        );
+    }
+
+    /// **T8 (mika#2361)** — the abandonment *instant*, which is the bound of the
+    /// re-entry-blocked comment's dedup window (D5).
+    ///
+    /// Three states, and the third is the one that matters: after a re-entry the
+    /// accessor must read `None` again, or a ticket abandoned a second time
+    /// would be bounded by a stale window and the comment would never be posted
+    /// twice — an idempotence that outlives the thing it is idempotent about.
+    #[test]
+    fn mika2361_abandoned_at_is_readable_and_none_when_not_abandoned() {
+        let db = db();
+        let repo = "senara-solutions/mika";
+
+        assert_eq!(
+            db.get_auto_pull_redrive_abandoned_at(repo, 2360).unwrap(),
+            None,
+            "a ticket with no row at all is not abandoned"
+        );
+
+        db.increment_auto_pull_redrive(repo, 2360).unwrap();
+        assert_eq!(
+            db.get_auto_pull_redrive_abandoned_at(repo, 2360).unwrap(),
+            None,
+            "a row exists but nothing was abandoned — NULL is not an instant"
+        );
+
+        db.mark_auto_pull_redrive_abandoned(repo, 2360).unwrap();
+        let at = db
+            .get_auto_pull_redrive_abandoned_at(repo, 2360)
+            .unwrap()
+            .expect("an abandoned ticket carries its instant");
+        assert!(
+            crate::timestamp::parse(&at).is_ok(),
+            "the instant must be parseable ISO 8601 — it is compared as a string \
+             against `audit_events.created_at`, so a different shape would make \
+             the dedup window meaningless rather than wrong-looking: {at}"
+        );
+        assert_eq!(
+            db.get_auto_pull_redrive_state(repo, 2360).unwrap(),
+            (1, true),
+            "the boolean the decision reads and the instant the comment reads \
+             must agree — they are two readings of one column"
+        );
+
+        db.reset_auto_pull_redrive(repo, 2360).unwrap();
+        assert_eq!(
+            db.get_auto_pull_redrive_abandoned_at(repo, 2360).unwrap(),
+            None,
+            "re-entry clears the instant, so a later abandonment gets a fresh window"
         );
     }
 
