@@ -154,10 +154,23 @@ script :
 périmètre est **fermé et nommé**, pas « les sept crates ».
 
 **Règle A1 — aucun littéral au site de bornage.** Dans le périmètre, l'argument de
-`.timeout(`, `.connect_timeout(`, `with_timeout(`, `tokio::time::timeout(` ne peut pas être un
-`Duration::from_*(…)` inline. Il doit être un identifiant ou un appel de fonction. Mesuré
-aujourd'hui : conforme partout sur le chemin a2a — `client.rs:97` reçoit la variable `timeout`,
-`openai.rs:185` reçoit `budget.http_timeout_secs()`. **Vert à la naissance, rouge sur régression.**
+`.timeout(`, `.connect_timeout(`, `with_timeout(`, `tokio::time::timeout(` ne peut pas être une
+**durée littérale**. Le prédicat porte sur ce que reçoit `from_secs`, pas sur la présence de
+`from_secs` : `from_secs(<littéral>)` et `from_secs(<expression purement arithmétique>)` sont
+refusés ; `from_secs(<identifiant>)`, `from_secs(<appel de fonction>)` et un argument qui n'est pas
+un `Duration::from_*` du tout sont admis.
+
+Cette précision n'est pas cosmétique : la formulation large (« pas de `Duration::from_*` inline »)
+rougit à la naissance sur deux sites parfaitement single-sourcés —
+`openai.rs:185` et `ollama.rs:233` écrivent tous deux
+`.timeout(Duration::from_secs(budget.http_timeout_secs()))`, où le budget vient du résolveur. Elle
+reproduirait donc, à l'intérieur de sa propre règle, le mode de panne que M1 démonte. AC1 portait
+déjà sur le littéral ; c'est la prose qui était plus large que son critère. Voir § *Fire-Disposition*,
+surface 1.
+
+Mesuré au 18/09 (`e1342dfa`) sur le périmètre déclaré : zéro littéral au site de bornage —
+`client.rs:97` reçoit la variable `timeout`, `openai.rs:185` et `ollama.rs:233` reçoivent
+`budget.http_timeout_secs()`. **Vert à la naissance, rouge sur régression.**
 
 Cette règle est immunisée contre M2 : le contournement arithmétique porte sur la valeur, la règle
 porte sur la forme du site.
@@ -177,8 +190,12 @@ L'évaluation de `<expr>` se fait après validation que l'expression ne contient
 `check-dispatch-seats-declared.sh` : une entrée allowlistée qui ne correspond plus à aucun site
 **fait échouer** le script au même titre qu'un site non allowlisté. Une allowlist qu'on ne nettoie
 pas devient le fourre-tout de M1 ; la comparer dans les deux sens est ce qui l'en empêche.
-Population attendue à la livraison : `RECOVERY_TIMEOUT` (30 s — sous le seuil, donc hors
-population ; mentionné ici pour que le lecteur sache qu'il a été examiné) et **zéro** entrée.
+Population attendue à la livraison : **zéro** entrée. Comptée le 18/09 (`e1342dfa`), le périmètre
+ne contient que deux `const … : Duration` : `client.rs:24` `DEFAULT_TIMEOUT` (600 s — conforme,
+`DEFAULT_*` + `TIMEOUT_ENV`) et `client.rs:61` `RECOVERY_TIMEOUT` (30 s — sous le seuil, donc hors
+population ; mentionné pour que le lecteur sache qu'il a été examiné). A2 naît donc sur une
+population d'une seule entrée conforme : sa valeur est **prospective**, elle borne ce qu'on ajoutera,
+et c'est A1 qui porte le travail sur le code en vigueur.
 
 **Seuil.** 60 s, repris du ticket, porté par une constante nommée en tête de script. Coût nommé :
 un littéral de 59 s posé au site de bornage passerait A2 — mais il ne passe pas A1, qui ne regarde
@@ -186,10 +203,15 @@ pas la valeur. Le seuil ne protège rien tout seul ; il borne le volume de A2.
 
 ### Garde B — test Rust de transitivité
 
-`crates/mika-common/src/llm/budget.rs`, module de tests, ou un test d'intégration dédié selon ce
-que la visibilité de `resolve_timeout_secs` permet (elle est privée aujourd'hui : soit elle
-devient `pub(crate)` + réexport de test, soit le test passe par `resolve_send_timeout()` avec env
-posée — **à trancher à l'implémentation, en préférant la voie qui n'élargit pas l'API publique**).
+**Lieu contraint par le graphe de dépendances, et ce n'est pas le lieu proposé d'abord.**
+`mika-common` ne dépend pas de `mika-a2a` (vérifié : `mika-a2a/Cargo.toml` n'a aucune dépendance
+maison, et c'est `mika-agent` qui tire les deux). Un test posé dans `crates/mika-common/src/llm/budget.rs`
+ne peut donc pas voir `client`, et la chaîne s'y réduirait à `total > http` — la moitié que
+`budget_guard` tient déjà (M5). Le test vit dans **`mika-agent`** (module de tests ou
+`tests/`), seul crate qui voit les trois valeurs. La visibilité de `resolve_timeout_secs` reste à
+trancher à l'implémentation — elle est privée aujourd'hui : soit le test passe par
+`resolve_send_timeout()` avec env posée, soit le cœur pur est exposé — **en préférant la voie qui
+n'élargit pas l'API publique**.
 
 Le test affirme, en appelant les résolveurs de production :
 
@@ -210,6 +232,14 @@ paramétré — `resolve_timeout_secs` a justement été séparé pour ça, cf. 
 
 **Ce que ce test n'est pas :** une réimplémentation. S'il recopie `600`, `300`, `120`, il teste sa
 copie (M6). Il lit les constantes exportées et appelle les fonctions réelles.
+
+**Ce que ce test ne peut pas attraper, et il faut le dire ici plutôt que le découvrir après.** Sur la
+voie env, `client >= total` est vrai **par construction** : `resolve_timeout_secs` applique
+`.max(total)` (`client.rs:53`). Le premier `assert` est donc un épinglage de ce plancher — il rougit
+si quelqu'un retire le `.max()`, ce qui est une régression réelle — mais il ne peut pas découvrir une
+divergence, parce que la seule cascade que le client sache lire est celle de l'env du process. La
+cascade **per-agent** lui est invisible, et c'est là qu'une divergence existe aujourd'hui : voir
+§ *Fire-Disposition*, surface 3.
 
 ### Garde C — le test négatif (R5)
 
@@ -254,9 +284,118 @@ La garde B tourne dans `cargo test` (job `check`), sans job dédié.
 5. **Ajouter un `MIKA_*` pour désarmer la garde.** Une garde CI se désarme en retirant son job,
    visiblement, dans un diff relu — pas par une variable d'environnement qu'un runner peut porter
    en silence.
-6. **Étendre la garde à `from_millis` / `from_secs_f64` / `from_mins`.** Mesuré : zéro occurrence
+6. **Allowlister `openai.rs:185` et `ollama.rs:233`.** Refusé : ces deux sites sont conformes, c'est
+   le prédicat qui était trop large. On répare la règle, on ne gèle pas deux sites corrects dans le
+   fichier qui sert à prouver que la garde discrimine (§ Fire-Disposition, surface 1).
+7. **Corriger ici la divergence client 600 / enveloppe arch 900.** Refusé : c'est un changement de
+   comportement runtime, que ce ticket s'interdit. Il est mesuré, épinglé par un contrôle positif
+   auto-nettoyant et remonté dans son propre ticket (§ Fire-Disposition, surface 3).
+8. **Étendre la garde à `from_millis` / `from_secs_f64` / `from_mins`.** Mesuré : zéro occurrence
    dans le workspace. Les ajouter serait de la couverture spéculative ; le motif du script les
    nommera en commentaire pour que l'extension soit une ligne le jour où l'une apparaît.
+
+---
+
+## Fire-Disposition
+
+*(Exigée par la Fire-Disposition Gate — mika#1574, `docs/solutions/best-practices/fire-disposition-doctrine.md` ;
+première passe mika-arch, F1 bloquant. Les gardes A, B et C sont toutes de classe détecteur : leur
+chemin de succès est « aucune violation ».)*
+
+La question de la porte est : **que fait l'implémentation quand un détecteur tire sur des données
+préexistantes ?** Il y a quatre surfaces de tir et elles n'appellent pas la même disposition — dont
+deux qui tirent réellement, mesurées le 18/09 à `e1342dfa`.
+
+### Surface 1 — Règle A1 sur le code en vigueur : **tir certain** sur la formulation large
+
+Mesure, pas hypothèse. Sur le périmètre déclaré, deux sites écrivent un `Duration::from_*` inline en
+argument de `.timeout(` :
+
+| Site | Écriture | Budget |
+|---|---|---|
+| `crates/mika-common/src/llm/openai.rs:185` | `.timeout(Duration::from_secs(budget.http_timeout_secs()))` | résolveur |
+| `crates/mika-common/src/llm/ollama.rs:233` | `.timeout(Duration::from_secs(budget.http_timeout_secs()))` | résolveur |
+
+Les deux sont **exemplaires** : le budget vient de `LlmTimeoutBudget`, c'est-à-dire du single-sourcing
+que ce ticket existe pour protéger. Le prédicat « pas de `Duration::from_*` inline au site de
+bornage » les refuserait tous les deux le jour de sa naissance.
+
+**Disposition : réparation du prédicat dans le périmètre — ni allowlist, ni `#[ignore]`.**
+
+Le choix mérite sa justification, la disposition par défaut de la doctrine étant (a) l'exception
+nommée. Elle ne convient pas : une allowlist existe pour **isoler une violation réelle** que le
+correctif ne traite pas. Ici il n'y a aucune violation — le prédicat est simplement plus large que
+ce qu'il veut dire, et l'allowlist gèlerait deux sites corrects dans le fichier même qui sert à
+prouver que la garde discrimine. Ce serait le fourre-tout de M1, atteint par le remède, une seconde
+fois. Et c'est **une réparation, pas un arbitrage** : AC1 écrivait déjà « `Duration::from_secs(<littéral>)` »,
+donc la prose de la Conception contredisait son propre critère. La règle porte sur l'argument de
+`from_secs` (§ Conception, Règle A1). Après réparation : population de violations = **0**.
+
+### Surface 2 — Règle A2 sur le code en vigueur : **population vide, comptée**
+
+Deux `const … : Duration` dans le périmètre entier : `DEFAULT_TIMEOUT` (600 s, conforme) et
+`RECOVERY_TIMEOUT` (30 s, sous le seuil). Zéro violation, donc **aucune disposition n'est due** ; ce
+qui est dû, c'est de dire que la population a été comptée et à quelle date — pour que le prochain
+lecteur sache que le zéro est mesuré et non supposé. Allowlist livrée **vide** (AC6), et c'est la
+comparaison bidirectionnelle (AC4) qui la maintient vide.
+
+### Surface 3 — Garde B sur la cascade per-agent : **divergence vivante, hors périmètre de ce ticket**
+
+Mesurée : `crates/mika-agent/src/well_known_agents.rs:1478` pose `agent_total_timeout_secs = 900`
+pour mika-arch (mika#2189), tandis que `resolve_timeout_secs` (`client.rs:51`) ne lit que
+`MIKA_AGENT_TOTAL_TIMEOUT_SECS` dans l'env du process — jamais le `config.toml` per-agent. Sur un
+appel vers mika-arch, le client résout donc **600 s** face à une enveloppe de **900 s** : le plancher
+`client ≥ total` de mika#2297 **n'est pas tenu**, et le client abandonne une génération que le moteur
+a encore le droit de finir — exactement le sinistre du 11/09 qui a motivé le passage de 300 à 600.
+
+C'est une violation préexistante de l'invariant que la Garde B affirme, et il faut être précis sur ce
+qu'elle est : elle n'est **pas** dans le code que ce plan touche, elle est dans la portée de lecture
+du résolveur. La corriger, c'est apprendre au client a2a à lire la cascade per-agent — un changement
+de **comportement runtime**, que ce ticket exclut en tête (« substrat borné, pas de changement de
+comportement runtime »), et dont la forme même est la question : le client ne connaît pas l'agent
+visé au moment où il résout son budget.
+
+**Disposition : (c) halte-et-remontée, bornée — avec un contrôle positif auto-nettoyant.**
+
+L'option (c) est ici la bonne au sens strict de la doctrine (« la résolution de la violation
+préexistante *est* la question de périmètre »), mais elle n'autorise pas à surfacer et passer à
+autre chose. Concrètement :
+
+- La Garde B affirme la chaîne sur la cascade que le client sait réellement lire (défauts + env),
+  comme le dit déjà AC5. Elle ne prétend pas couvrir le per-agent.
+- Un **contrôle positif** épingle la divergence au lieu de la taire : un test lit les deux valeurs
+  réelles — `mika_a2a::client::DEFAULT_TIMEOUT` et le `agent_total_timeout_secs` de `MIKA_ARCH_CONFIG` —
+  et asserte que le défaut client est **strictement inférieur** à l'enveloppe d'arch. Il documente
+  l'écart comme connu et mesuré ; **il rougit le jour où l'écart disparaît** (alignement des valeurs,
+  ou client apprenant à lire le per-agent), ce qui est l'assertion auto-nettoyante de la doctrine :
+  elle force à retirer l'exception au lieu de la laisser survivre à sa cause. Il vit dans `mika-agent`,
+  seul crate voyant les deux constantes.
+- **Suivi :** l'implémenteur ouvre un ticket nommant la divergence (portée de lecture du plancher
+  mika#2297 face aux cascades per-agent de mika#2189) et le cite dans le commentaire du contrôle
+  positif. Le ticket est la remontée ; le test est ce qui l'empêche de se périmer en silence.
+- **Ce qui est interdit à l'implémenteur :** aligner `DEFAULT_TIMEOUT` sur 900 de sa propre autorité,
+  ou faire lire le `config.toml` per-agent au client. Les deux changent un budget de production dans
+  un ticket qui s'interdit d'en bouger aucun.
+
+### Surface 4 — Garde C : hors doctrine, et il vaut mieux le dire que l'omettre
+
+Le test négatif ne tire pas sur des données préexistantes : sa population est **fabriquée** dans un
+répertoire temporaire, close et connue à l'écriture. Une disposition de tir n'a pas d'objet pour lui.
+Il est listé ici pour que son absence des trois surfaces précédentes se lise comme une décision et
+non comme un oubli.
+
+### Déclencheur de halte-et-remontée (transverse, borné)
+
+Les surfaces 1 et 2 sont mesurées au 18/09 à `e1342dfa` ; l'implémentation arrive après, et le
+périmètre couvre `crates/mika-common/src/llm/**`, qui bouge.
+
+> Si, au moment d'implémenter, la re-mesure fait apparaître **une seule** violation de A1 ou de A2 qui
+> ne figure pas dans les surfaces 1 et 2 ci-dessus, l'implémenteur **s'arrête et remonte** avec le
+> chemin, la ligne et l'écriture fautive. Il n'ajoute pas d'entrée d'allowlist de sa propre autorité
+> et n'assouplit pas la règle pour faire passer le cas.
+
+La raison est celle de la doctrine : une allowlist posée sans que personne ait regardé la violation
+est le fourre-tout de M1, et c'est sous ce genre de couverture que la couche-6 réapparaîtrait.
 
 ---
 
@@ -272,6 +411,8 @@ La garde B tourne dans `cargo test` (job `check`), sans job dédié.
 | V6 | La transitivité tient sur une cascade non-défaut | idem, cas env-posé | vert |
 | V7 | Pas de régression | `make lint && make test` | vert |
 | V8 | Le job CI tourne sur PR | inspection du run de la PR | `A2A Timeout Literal Lint` présent et vert |
+| V9 | A1 n'accuse pas les deux sites conformes | `bash scripts/check-a2a-timeout-literals.sh` | `openai.rs:185` et `ollama.rs:233` ne sont pas signalés (§ Fire-Disposition, surface 1) |
+| V10 | La divergence per-agent est épinglée | `cargo test -p mika-agent` (contrôle positif) | vert, et son commentaire cite le ticket de suivi |
 
 **Sonde de réalité (obligatoire avant merge).** Introduire localement, sans commit, un
 `.timeout(Duration::from_secs(900))` dans `crates/mika-a2a/src/client.rs`, vérifier que V1 devient
@@ -288,7 +429,10 @@ seulement sur une fixture — n'a pas démontré qu'elle couvre son périmètre.
   prédicat naïf).
 - `scripts/test-check-a2a-timeout-literals.sh` livré, couvrant A1, A2, le contournement
   arithmétique et l'allowlist bidirectionnelle.
-- Garde B livrée avec les deux cas (défauts + cascade).
+- Garde B livrée avec les deux cas (défauts + cascade), dans `mika-agent` — seul crate voyant les
+  trois valeurs.
+- Contrôle positif auto-nettoyant de la surface 3 livré, citant le ticket de suivi ouvert pour la
+  divergence client / enveloppe per-agent.
 - Job `a2a-timeout-literal-lint` ajouté à `ci.yml` sur le gabarit à deux étapes.
 - V1–V8 verts, sonde de réalité effectuée et mentionnée dans le corps de PR.
 - `crates/mika-a2a/CLAUDE.md` : une ligne renvoyant à la garde depuis la section
@@ -318,6 +462,12 @@ des *Requirements* et du *Contrat de vérification*.
 - **AC7** — Le job CI comporte les deux étapes (lint + test négatif), conformément à mika#2103.
 - **AC8** — Le périmètre est déclaré explicitement dans le script et ne nomme aucun crate
   inexistant.
+- **AC9** — La garde A ne signale ni `openai.rs:185` ni `ollama.rs:233` : le prédicat porte sur
+  l'argument de `from_secs`, pas sur sa présence (§ Fire-Disposition, surface 1).
+- **AC10** — Un contrôle positif épingle la divergence mesurée entre le défaut client (600 s) et
+  l'enveloppe per-agent de mika-arch (900 s) en lisant les deux valeurs réelles ; il rougit le jour
+  où l'écart disparaît, et son commentaire cite le ticket de suivi
+  (§ Fire-Disposition, surface 3).
 
 ---
 
@@ -349,5 +499,37 @@ surface d'un ticket substrat borné.
   correctif change une classe d'erreur ; il garde son ticket.
 - `pool_idle_timeout(90)` du gateway (`gateway/src/main.rs:106`) : un idle de pool n'est pas un
   budget de requête, et le gateway n'est pas dans le périmètre déclaré.
-- Toute modification de valeur. Ce travail ne bouge aucun budget : 600 / 300 / 120 restent ce
-  qu'ils sont. Il rend leur ordre non-régressable.
+- La *correction* de la divergence entre le plancher client (mika#2297, lu sur l'env du process) et
+  les cascades per-agent (mika#2189, lues dans le `config.toml` de l'agent). Mesurée, épinglée,
+  remontée dans son propre ticket — § Fire-Disposition, surface 3. Elle change un comportement
+  runtime ; ce ticket n'en change aucun.
+- Toute modification de valeur. Ce travail ne bouge aucun budget : 600 / 300 / 120 — ni le 240 / 900
+  de mika-arch — restent ce qu'ils sont. Il rend leur ordre non-régressable.
+
+---
+
+## Revision history
+
+- **rev 2 (2026-09-18)** — première passe architecte, `Disposition: ITERATE`, F1 bloquant.
+  - **F1 (§ Fire-Disposition manquante, mika#1574) : adressée.** Section ajoutée, couvrant les trois
+    gardes sur quatre surfaces de tir. Le finding suggérait l'option (a) avec allowlist vide comme
+    disposition naturelle ; la mesure faite pour écrire la section montre que ce n'est le bon choix
+    sur **aucune** des surfaces, et la section dit pourquoi à chaque fois. Surface 1 (Règle A1) :
+    tir certain mesuré sur `openai.rs:185` et `ollama.rs:233`, deux sites conformes — disposition
+    *réparation du prédicat*, parce qu'une allowlist y gèlerait deux sites corrects et reproduirait
+    le mode de panne M1 à l'intérieur du remède. Surface 2 (Règle A2) : population comptée, vide,
+    allowlist livrée vide comme prévu. Surface 3 (Garde B) : divergence vivante mesurée entre le
+    défaut client (600 s) et l'enveloppe per-agent de mika-arch (900 s, `well_known_agents.rs:1478`) —
+    disposition *(c) halte-et-remontée* bornée par un contrôle positif auto-nettoyant, parce que la
+    corriger serait un changement de comportement runtime que ce ticket s'interdit. Surface 4
+    (Garde C) : hors doctrine, population fabriquée — dit plutôt qu'omis. Plus un déclencheur de
+    halte-et-remontée transverse, les mesures ayant une date et l'implémentation arrivant après.
+  - **Trois corrections dérivées de la mesure faite pour F1**, sans lesquelles la disposition
+    n'aurait pas de sens : (i) la prose de la Règle A1 était plus large que son propre AC1 et
+    rougissait sur deux sites sains — la prose est alignée sur l'AC, aucun critère affaibli ;
+    (ii) la Garde B était proposée dans `mika-common`, qui ne dépend pas de `mika-a2a` et ne peut donc
+    pas compiler la chaîne complète — elle est déplacée dans `mika-agent` ; (iii) la Garde B est verte
+    par construction sur la voie env (le `.max()` de `client.rs:53`), ce qui est maintenant écrit au
+    lieu d'être découvert à l'implémentation.
+  - **AC9 et AC10 ajoutés**, V9 et V10 au contrat de vérification, deux entrées aux refus délibérés
+    et une au hors-périmètre. Aucun AC existant n'a été affaibli ni retiré.
