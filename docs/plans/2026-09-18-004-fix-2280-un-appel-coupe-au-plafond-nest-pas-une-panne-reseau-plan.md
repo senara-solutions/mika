@@ -338,6 +338,27 @@ changement ».
   appel n'a été fait. `null` n'est jamais `false`, comme `request_bytes` de
   mika#2342 n'est jamais `0`.
 - La macro interne s'étend aux nouvelles combinaisons d'`Option`.
+- **Les sites d'appel sont six, sur les trois rails, et `claude.rs` en porte
+  deux** — constatés plutôt que supposés :
+  `openai.rs:428` / `:493`, `ollama.rs:628` / `:682`, **`claude.rs:656` /
+  `:725`**. Élargir la signature est donc une mise à jour de six sites, pas de
+  deux. Sur les six, `request.max_tokens` est un `u32` non-optionnel déjà en
+  portée et déjà journalisé (`claude.rs:596`, `ollama.rs:602` / `:763`), donc
+  aucune question d'absence à trancher nulle part.
+- **`cap_exhausted` vaut `None` aux deux sites d'`claude.rs`, toujours**, et
+  c'est la conséquence directe de D7 : ce rail n'applique pas le plafond qu'il
+  déclare (E8), donc y poser `false` affirmerait qu'un appel n'a pas été
+  guillotiné par une borne qui ne le gouvernait pas — l'attribution fausse que
+  D7 existe pour refuser. Le rail passe le `max_tokens` (une déclaration, vraie
+  partout) sans passer le drapeau (un jugement, qui demande un plafond
+  appliqué).
+- **Ce que cela coûte à la lecture, nommé plutôt que découvert :** `cap_exhausted`
+  absent a désormais **deux** causes — la tentative n'a pas eu lieu
+  (`deadline_abort`, tous rails) ou le rail n'est pas instrumenté (Anthropic,
+  toutes tentatives). `select(.cap_exhausted == true)` reste exact ; c'est
+  **compter les `false`** qui ne rend que la population OpenAI-compatible. Le
+  champ `provider`, déjà porté par l'événement, tranche les deux cas — la
+  § *Surfaces opérateur* le dit.
 
 ### 4. `crates/mika-common/src/llm/openai.rs` et `.../ollama.rs`
 
@@ -354,10 +375,11 @@ changement ».
   `Result<OpenAiResponse, (LlmError, bool)>` se propage en un site. Un état
   latéral coûterait la même écriture en rendant le drapeau atteignable depuis
   ailleurs. La forme retenue ne doit **pas** modifier `LlmError` (D2).
-- Les deux appels à `emit_llm_call_attempt` (`openai.rs:428` et `:493`) passent
-  `request.max_tokens` — déjà un `u32` non-optionnel sur `OpenAiRequest:24`,
-  donc aucune question d'absence à trancher — et le drapeau (`None` sur le site
-  `deadline_abort`).
+- Les quatre appels à `emit_llm_call_attempt` de ces deux rails (`openai.rs:428`
+  et `:493`, `ollama.rs:628` et `:682`) passent `request.max_tokens` — déjà un
+  `u32` non-optionnel sur `OpenAiRequest:24`, donc aucune question d'absence à
+  trancher — et le drapeau (`None` sur les deux sites `deadline_abort`). Les
+  deux sites restants sont ceux d'`claude.rs`, traités au § 3 ci-dessus.
 - Le passage de 9 à 11 paramètres ne rougit pas clippy : `mod.rs:215` porte déjà
   `#[allow(clippy::too_many_arguments)]`. Noté parce que la DoD exige
   `-D warnings` et que la question se pose sinon à l'implémentation.
@@ -450,6 +472,13 @@ grep llm_budget_resolved $MIKA_SPIRIT_LOG_FILE \
 grep llm_call_attempt $MIKA_SPIRIT_LOG_FILE \
   | jq 'select(.event == "llm_call_attempt" and .cap_exhausted == true)'
 ```
+
+**Lire un `cap_exhausted` absent : deux causes, et `provider` les sépare.** Le
+champ manque quand la tentative n'a pas eu lieu (`deadline_abort`, tous rails) et
+quand le rail n'est pas instrumenté (Anthropic, **toutes** ses tentatives — D7 /
+E8). La requête ci-dessus est donc exacte, mais **compter les `false` ne rend que
+la population OpenAI-compatible** ; pour la borner explicitement, ajouter
+`.provider != "anthropic"` au filtre plutôt que conclure d'une absence.
 
 **Régime attendu de `llm_call_cap_exhausted` : NON VIDE.** C'est l'objet de ce
 travail — la ligne n'existe que pour compter une population dont le ticket
@@ -556,6 +585,93 @@ fuité dans la rétryabilité et il faut désarmer (mika#2015).
 
 ---
 
+## Fire-Disposition
+
+Ce plan porte trois livrables de classe détecteur dont le firing peut porter sur
+des **données existantes** (mika#1574). Chacun reçoit sa disposition ; les autres
+détecteurs du plan sont inventoriés et écartés en clôture.
+
+### FD1 — AC8, la garde de géométrie : **option (a), allowlist nommée**
+
+Le détecteur fige les trois géométries livrées et leur verdict d'atteignabilité.
+Les trois sont **déjà** au-dessus de leur atteignable au moment où le test est
+écrit : ce sont trois violations préexistantes de l'invariant naïf « déclaré ≤
+atteignable », et le test doit les porter nommément plutôt que les interdire —
+sinon il rougit au premier `cargo test` contre une configuration de production
+qui n'a rien fait de mal.
+
+| donnée nommée (1) | pourquoi elle est exceptée | suivi (2) |
+|---|---|---|
+| mika-arch, 240 s / 32 768 (`well_known_agents.rs:1461`) | **décidé et argumenté** : mika#2296 pose 32768 comme « un plafond rendu non contraignant », en sachant que le temps est le frein. Rien à corriger. | aucun — l'exception est terminale |
+| mika-dev, 120 s / 8 192 (`MIKA_DEV_CONFIG:186`) | à 4 % de son atteignable ; c'est la mesure que ce ticket produit, pas un défaut qu'il tranche (D1) | conditionné aux sondes (b)/(c) |
+| mika-qa, 120 s / 16 384 (`MIKA_QA_CONFIG:203`) | le double de son atteignable ; idem | conditionné aux sondes (b)/(c) |
+
+**L'assertion auto-nettoyante (3) est la forme même du test** : il asserte les
+six nombres et leur verdict, donc il rougit le jour où l'un d'eux bouge. Quand le
+suivi baissera `llm_max_tokens` de mika-dev sous son atteignable, la ligne
+d'allowlist correspondante devient périmée **et le test le dit**, en exigeant que
+l'arithmétique soit refaite plutôt qu'en passant en silence. C'est la propriété
+que la clause (3) demande, obtenue par l'orientation du test (il fige un rapport)
+et non par un mécanisme d'expiration ajouté à côté.
+
+**Ce que la clause (2) ne peut pas avoir ici, dit plutôt que simulé :** le ticket
+de suivi **n'existe pas encore**, parce que son ouverture est conditionnée aux
+sondes (b) et (c) par D1 — ouvrir un tracker maintenant serait décider par avance
+ce que la mesure doit décider. La référence portée par les deux lignes est donc
+**mika#2280 lui-même**, et la § *Hors périmètre* y décrit la forme du suivi. Le
+remplacement de cette référence par le numéro réel est le premier geste du suivi
+le jour où il s'ouvre. Une référence morte vers un ticket inventé coûterait plus
+que cette honnêteté.
+
+### FD2 — `llm_call_cap_exhausted`, le détecteur runtime : **option (a), population nommée**
+
+Il fire sur données existantes **dès le déploiement**, et c'est l'objet du
+travail : la population est nommée — les **~32 coupures/jour** mesurées le
+2026-09-10 sur `z-ai/glm-5.3` et `moonshotai/kimi-k2.5` via openrouter (1). Le
+détecteur **ne gate rien** : pas de refus de démarrage, pas de refus d'appel, pas
+de changement de rétryabilité (AC6). Il rend lisible une condition qui existait
+déjà et que `error_class` ne pouvait pas distinguer (E7) ; son taux de firing est
+l'**entrée** du suivi (2, même référence conditionnée qu'en FD1), jamais une
+alarme qui halte.
+
+**La clause (3) n'est pas assertable sur ce détecteur, et c'est une limite de
+nature, pas un oubli.** Un WARN runtime n'a pas de site où poser une assertion
+qui échoue quand l'exception devient périmée : le jour où le suivi corrige les
+plafonds, la population tombera à zéro et **rien ne le dira**, parce que zéro
+ligne est aussi ce que produit un détecteur cassé. Ce qui tient ce rôle est
+daté et déjà écrit : la sonde **(b)** (48 h, contrôle négatif — zéro ligne
+pendant que `LLM response body read failed mid-stream` continue ⇒ **halte**, le
+diagnostic d'E2 est faux, le suivi ne s'ouvre pas) et la sonde **(c)** (7 jours,
+distribution par modèle). La règle explicite de (b) — *ne pas élargir la
+tolérance de D3 pour faire apparaître des lignes* — est ce qui empêche
+l'auto-nettoyage manquant de devenir un instrument menteur.
+
+### FD3 — AC3, l'extension de la garde de reconstruction : **option (c), halt-and-surface**
+
+`mika2293_reconstruction_equals_load_for_agent_on_every_cascade_position`
+existe déjà et passe sur deux clés ; l'étendre à `llm_max_tokens` peut le faire
+rougir sur l'**ordre de cascade en vigueur**, qui est une donnée existante que ce
+plan ne crée pas. Si cela arrive, l'implémentation **s'arrête et remonte à
+l'opérateur** : ni allowlist, ni `#[ignore]`. La raison est celle que mika#2293 a
+dû énoncer pour sa propre garde — une provenance **fausse** est strictement pire
+qu'aucune provenance —, et un rouge ici signifierait que `max_tokens_source`
+mentirait sur la porte d'où la valeur vient, c'est-à-dire que la sonde (a), qui
+existe pour choisir entre « retirer une variable de service » et « ne toucher à
+rien », enverrait l'opérateur au mauvais remède. La résolution de cette
+divergence **est** la décision de portée, ce qui est exactement le critère
+d'emploi de l'option (c).
+
+### Clôture de l'inventaire
+
+Les autres détecteurs du plan — tests d'`openai.rs` / `ollama.rs` (AC5/AC6), le
+contrôle négatif de site sur `ollama.rs:487`, le test de déduplication (AC4/D8),
+le test de `deadline_abort` (AC7) — portent **uniquement sur du code introduit
+par cette PR**. Ils n'ont pas de données préexistantes sur lesquelles firer, donc
+la gate est N/A pour eux (décision 3 de l'arbre mika#1574). Ils sont couverts par
+la § *Tests*, pas ici.
+
+---
+
 ## Definition of Done
 
 - `reachable_output_tokens` est calculable depuis un `LlmTimeoutBudget` et un
@@ -569,8 +685,13 @@ fuité dans la rétryabilité et il faut désarmer (mika#2015).
 - `llm_call_attempt` porte ce que l'appel demandait (`max_tokens`) et s'il a été
   guillotiné (`cap_exhausted`, absent quand aucun appel n'a eu lieu).
 - Aucune valeur de configuration n'est modifiée.
-- `cargo test -p mika-common`, `cargo clippy --all-targets -- -D warnings` et
-  `cargo fmt --all --check` passent.
+- `cargo test -p mika-common` **et `cargo test -p mika-agent`**,
+  `cargo clippy --all-targets -- -D warnings` et `cargo fmt --all --check`
+  passent. Les deux crates, pas un : le test d'AC8 vit dans `mika-agent`
+  (contrainte de dépendance, cf. § Tests), donc un `-p mika-common` seul
+  sauterait la garde de géométrie — exactement le détecteur que ce plan ajoute.
+  `cargo test --workspace` convient aussi ; c'est la couverture qui est exigée,
+  pas la forme de l'invocation.
 - `mika/CLAUDE.md` porte les greps, la requête SQL, le régime attendu et les
   haltes.
 
@@ -611,7 +732,10 @@ fuité dans la rétryabilité et il faut désarmer (mika#2015).
   rougit si l'un de ces six nombres bouge sans que l'arithmétique soit refaite.
   Il vit dans `crates/mika-agent/src/well_known_agents.rs` (module `tests`), le
   seul crate d'où les trois constantes **et** `reachable_output_tokens` sont
-  simultanément visibles — `mika-common` ne voit pas `mika-agent`.
+  simultanément visibles — `mika-common` ne voit pas `mika-agent`. Les trois
+  lignes sont portées comme l'allowlist nommée de **FD1** (donnée, motif,
+  référence de suivi), et le test **n'exige aucune correction** sur aucune des
+  trois.
 - **AC9** — aucune constante de configuration n'est modifiée : ni
   `MIKA_DEV_CONFIG`, ni `MIKA_QA_CONFIG`, ni la config de mika-arch, ni
   `DEFAULT_HTTP_TIMEOUT_SECS`, ni `DEFAULT_AGENT_TOTAL_TIMEOUT_SECS`.
@@ -620,3 +744,45 @@ fuité dans la rétryabilité et il faut désarmer (mika#2015).
   d'environnement, et la halte du contrôle négatif (b) — « zéro ligne pendant
   que les timeouts continuent : le diagnostic est faux, ne pas ouvrir le
   suivi ».
+
+---
+
+## Revision history
+
+- **rev 2 (2026-09-18)** — première passe architecte (`Disposition: ITERATE`),
+  trois findings, tous adressés.
+  - **F1 (BLOCKING)** adressé par une section `## Fire-Disposition` à trois
+    entrées, chacune nommant son option canonique plutôt qu'une disposition
+    unique plaquée sur trois détecteurs de natures différentes. **FD1** (AC8,
+    garde de géométrie) prend l'**option (a)** suggérée par le finding : les
+    trois géométries livrées sont portées comme allowlist nommée (donnée, motif,
+    référence), et l'auto-nettoyage de la clause (3) est la forme même du test —
+    il fige un *rapport*, donc il rougit quand le suivi corrige un des six
+    nombres. **FD2** (`llm_call_cap_exhausted`) prend aussi l'**option (a)** avec
+    la population préexistante nommée (~32/jour, 2026-09-10), en disant que la
+    clause (3) **n'est pas assertable** sur un WARN runtime et que ce rôle est
+    tenu par les sondes datées (b) et (c) — limite écrite plutôt que simulée par
+    un mécanisme décoratif. **FD3** est un détecteur que le finding n'avait pas
+    inventorié (AC3, l'extension de
+    `mika2293_reconstruction_equals_load_for_agent_on_every_cascade_position`,
+    qui peut rougir sur l'ordre de cascade **existant**) : il prend l'**option
+    (c) halt-and-surface**, parce qu'une provenance fausse est « strictement pire
+    qu'aucune provenance » (mika#2293) et que sa résolution serait elle-même la
+    décision de portée. Clôture d'inventaire : les quatre autres détecteurs du
+    plan ne portent que sur du code neuf, gate N/A (arbre mika#1574, décision 3).
+    AC8 renvoie désormais à FD1 pour la forme de l'allowlist.
+  - **F2** adressé : la DoD exige `cargo test -p mika-agent` en plus de
+    `cargo test -p mika-common` (ou `--workspace`), avec la raison — c'est la
+    couverture qui est exigée, pas la forme de l'invocation.
+  - **F3** adressé, et la vérification **contredit l'hypothèse implicite du
+    plan** : `claude.rs` **appelle bien** `emit_llm_call_attempt`, à deux sites
+    (`:656`, `:725`). Les sites d'appel sont donc **six** sur trois rails, pas
+    deux — le plan n'en citait que deux et omettait aussi les deux d'`ollama.rs`
+    (`:628`, `:682`). Le nouveau `max_tokens` y est renseignable trivialement
+    (`request.max_tokens`, déjà en portée et déjà journalisé) ; `cap_exhausted`
+    y vaut **toujours `None`**, par D7 — le rail n'applique pas le plafond qu'il
+    déclare (E8), donc `false` y affirmerait une non-guillotine sous une borne
+    qui ne gouverne pas l'appel. Conséquence de lecture nommée dans les Changements
+    **et** dans les Surfaces opérateur : un `cap_exhausted` absent a désormais
+    deux causes, `select(.cap_exhausted == true)` reste exact, mais compter les
+    `false` demande de filtrer sur `provider`.
