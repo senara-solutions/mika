@@ -175,7 +175,11 @@ fn dev_registry() -> SkillRegistry {
 // Pilotage du tour silencieux
 // ---------------------------------------------------------------------------
 
-async fn run_callback(harness: &EvalHarness, label: &str, result: &str) {
+async fn run_callback(
+    harness: &EvalHarness,
+    label: &str,
+    result: &str,
+) -> mika_agent::agent::SilentTurnOutcome {
     let skills_dirty = AtomicBool::new(false);
     let params = SilentAgentParams {
         tier: harness.tier,
@@ -203,8 +207,12 @@ async fn run_callback(harness: &EvalHarness, label: &str, result: &str) {
         skills_dirty: &skills_dirty,
         settings: Some(&harness.settings),
         trace_id: Some(harness.trace_id.clone()),
+        // mika#2368 : hors dispatcher, le registre est absent — le filet
+        // s'abstient alors, ce qui est le terme que `DeadlineVerdictInput`
+        // documente déjà.
+        pr_reviews_posted: None,
     };
-    run_silent_agent(&params).await.expect("silent turn runs");
+    run_silent_agent(&params).await.expect("silent turn runs")
 }
 
 /// Les messages `User` d'une requête capturée, à plat.
@@ -434,7 +442,13 @@ async fn a_qa_build_callback_that_posts_its_review_first_is_not_reprompted() {
 
 /// Après le re-prompt, un second EndTurn sans revue est **accepté** — la
 /// garde est à un coup (`intent_guard_retries`), comme toutes ses voisines.
-/// Ce qui reste alors est du ressort du filet (plan § B3, hors de cette PR).
+///
+/// Ce qui reste alors est du ressort du filet moteur (mika#2368), qui vit dans
+/// le dispatcher et non ici : `run_silent_agent` ne poste toujours rien. Ce
+/// qu'il fait désormais, c'est le **dire** — `SilentTurnOutcome.qa_verdict_unmet`
+/// est le signal que le filet lit. Sans cette assertion, la ligne « rien n'a été
+/// posté » resterait vraie pendant que le signal cesserait d'être levé, et le
+/// filet redeviendrait silencieux sans qu'aucun test ne rougisse.
 #[tokio::test]
 async fn the_verdict_guard_fires_once_and_does_not_loop() {
     let (tools, gh_calls) = tools_with_recording_run_gh();
@@ -451,7 +465,7 @@ async fn the_verdict_guard_fires_once_and_does_not_loop() {
         .await
         .unwrap();
 
-    run_callback(&harness, BUILD_CALLBACK_LABEL, "Build succeeded").await;
+    let outcome = run_callback(&harness, BUILD_CALLBACK_LABEL, "Build succeeded").await;
 
     let requests = harness.mock().captured_requests();
     assert_eq!(
@@ -466,7 +480,12 @@ async fn the_verdict_guard_fires_once_and_does_not_loop() {
     );
     assert!(
         gh_calls.lock().unwrap().is_empty(),
-        "nothing was posted — the net's job"
+        "nothing was posted here — the net's job, and it lives in the dispatcher"
+    );
+    assert!(
+        outcome.qa_verdict_unmet,
+        "mika#2368 : le tour doit SIGNALER qu'un verdict était dû et n'a pas été \
+         posté — c'est ce signal, et rien d'autre, qui arme le filet"
     );
 }
 

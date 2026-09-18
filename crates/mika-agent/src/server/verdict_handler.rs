@@ -838,6 +838,9 @@ async fn try_engine_dispatch(
         timeout_secs,
         session_id,
         trace_id,
+        // mika#2368 : pas de cible QA à stamper — ce dispatch est un pilote de
+        // correction, pas un build de revue.
+        None,
     );
     let callback_task_id = match db.create_task(callback_task).await {
         Ok(id) => id,

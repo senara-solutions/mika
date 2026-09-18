@@ -162,6 +162,10 @@ mod eval {
     // #870 + framing) et B3 (garde positive) sur le chemin silencieux réel.
     mod test_qa_build_callback_verdict_2355;
 
+    // mika#2368 — le filet moteur : le signal levé sur les DEUX sites de sortie
+    // EndTurn du tour silencieux, et le registre anti-double-post qui l'atteint.
+    mod test_qa_callback_verdict_net_2368;
+
     // Self-dev-callback engine consistency: documented callback-handler branches
     // produce tool calls the engine accepts or defers (mika#806).
     mod test_self_dev_callback_engine_consistency;

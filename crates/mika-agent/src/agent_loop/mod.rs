@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
 use tracing::{Instrument, debug, error, info, info_span, warn};
@@ -993,6 +993,19 @@ async fn run_loop(
     // (build-callback message AND `qa-review` loaded) and therefore cannot be
     // an `INTENT_GUARDS` entry (`fn(&str) -> bool` sees the message alone).
     loaded_skill_names: &[String],
+    // mika#2368 — out-param : posé quand le tour sort sur un EndTurn accepté
+    // alors qu'un verdict était dû, que le budget de re-prompt de la garde
+    // `qa_build_callback_verdict` est épuisé et qu'aucune revue n'a été postée.
+    // Lu par `run_silent_inner`, qui le rend dans `SilentTurnOutcome`, pour que
+    // le dispatcher puisse armer le filet.
+    //
+    // Un out-param par référence plutôt qu'une variante de `LoopResult` : cet
+    // enum sans `#[non_exhaustive]` est un contrat dont l'exhaustivité force les
+    // trois handlers externes à traiter chaque mode de terminaison, et « le tour
+    // a conclu sans poster » n'est pas un mode de terminaison alternatif — un
+    // tour peut être `Done` *et* muet. C'est aussi le motif déjà employé dans ce
+    // fichier (`pr_review_posted`, `tool_arg_suffix_rejected`, `skills_dirty`).
+    qa_verdict_unmet: Option<&AtomicBool>,
     store_llm_calls: bool,
     store_tool_calls: bool,
     prompt_variant: Option<&str>,
@@ -3248,6 +3261,20 @@ async fn run_loop(
                         }
                     }
 
+                    // mika#2368 — chemin de sortie 1/2 (texte non vide). Le
+                    // budget de la garde `qa_build_callback_verdict` est
+                    // épuisé, l'EndTurn est accepté, et rien n'a été posté : le
+                    // filet moteur prend le relais côté dispatcher.
+                    if let Some(flag) = qa_verdict_unmet
+                        && crate::qa_build_callback::verdict_unmet_after_retry(
+                            qa_verdict_due,
+                            &intent_guard_retries,
+                            &all_tool_summaries,
+                        )
+                    {
+                        flag.store(true, Ordering::Relaxed);
+                    }
+
                     apply_nudge_turn_end(tool_use_occurred);
                     info!(step, stop_reason = ?response.stop_reason, label = mode.label(), "agent done");
                     return Ok(LoopResult::Done {
@@ -3425,6 +3452,22 @@ async fn run_loop(
                             content: LlmContent::Text(undelivered_send_correction(&undelivered)),
                         });
                         continue;
+                    }
+
+                    // mika#2368 — chemin de sortie 2/2 (texte vide), et c'est
+                    // **le plus probable** : un EndTurn sec est la forme que
+                    // prend un tour qui n'a rien à dire, donc le cas nominal de
+                    // ce ticket. Le couvrir à moitié produirait un filet
+                    // silencieux, indistinguable d'un filet qui n'a rien à
+                    // faire — exactement le mode de panne qu'on ferme ici.
+                    if let Some(flag) = qa_verdict_unmet
+                        && crate::qa_build_callback::verdict_unmet_after_retry(
+                            qa_verdict_due,
+                            &intent_guard_retries,
+                            &all_tool_summaries,
+                        )
+                    {
+                        flag.store(true, Ordering::Relaxed);
                     }
 
                     apply_nudge_turn_end(tool_use_occurred);
@@ -4552,6 +4595,9 @@ async fn run_agent_inner(
         &enabled_tool_names,
         is_verdict_producer,
         &loaded_skill_names,
+        // mika#2368 : un callback de build est toujours un tour silencieux, donc
+        // ce mode n'a pas de population pour le filet.
+        None,
         store_llm,
         store_tools,
         prompt_variant.as_deref(),
@@ -4889,6 +4935,44 @@ pub struct SilentAgentParams<'a> {
     /// When `Some`, the agent reuses this trace_id instead of generating a fresh one,
     /// enabling correlation of silent agent execution with the triggering task.
     pub trace_id: Option<String>,
+    /// Session-scoped PR review dedup map (#821), threaded from `AppState`
+    /// through `TaskDispatcher` (mika#2368 C4, AC7).
+    ///
+    /// Until mika#2368 this path posed `None` with the comment « Silent mode:
+    /// no session-scoped dedup needed », while `builtin_handlers` carried a
+    /// `debug_assert!(ctx.pr_reviews_posted.is_some())` reading *"must be
+    /// threaded for production pr review calls"*. A QA build callback that
+    /// posts its review **is** a production pr review call: the two statements
+    /// have contradicted each other since the build callback became a flow that
+    /// posts reviews. AC7 corrects an inconsistency the source already
+    /// declared; it does not introduce one.
+    ///
+    /// The callback's session is fresh, so the registry carries exactly what
+    /// **this turn** posted — which is the granularity AC7 wants, and what makes
+    /// it true without adding state.
+    ///
+    /// `None` outside the dispatcher (team mode, CLI, tests) — the filet
+    /// abstains there, which is the term `DeadlineVerdictInput` already
+    /// documents.
+    pub pr_reviews_posted:
+        Option<&'a Arc<dashmap::DashMap<String, std::collections::HashSet<String>>>>,
+}
+
+/// Ce qu'un tour silencieux rend à son appelant (mika#2368 C4).
+///
+/// `run_silent_agent` rendait `Result<()>` : le signal « ce tour devait un
+/// verdict et n'en a pas posté » vivait dans `run_loop` et n'en sortait pas, de
+/// sorte que le dispatcher — le seul endroit d'où le filet peut poster — ne
+/// pouvait pas le savoir.
+///
+/// Un seul champ pour l'instant, et un struct plutôt qu'un `bool` : le prochain
+/// fait qu'un tour silencieux doit rendre s'ajoute ici sans re-toucher les cinq
+/// appelants.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SilentTurnOutcome {
+    /// Un verdict était dû sur ce tour, le budget de re-prompt de la garde
+    /// `qa_build_callback_verdict` est épuisé, et aucune revue n'a été postée.
+    pub qa_verdict_unmet: bool,
 }
 
 /// Run a silent-mode agent loop for background tasks (heartbeat, reminders).
@@ -4896,7 +4980,7 @@ pub struct SilentAgentParams<'a> {
 /// Unlike `run_agent`, the agent's text output is NOT delivered to the user.
 /// The agent must use `send_message` tool to contact the user.
 /// If no `send_message` call is made, the run is a silent no-op.
-pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<()> {
+pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<SilentTurnOutcome> {
     let trigger_label = match &params.trigger {
         SilentTrigger::Heartbeat => "heartbeat",
         SilentTrigger::Reflection => "reflection",
@@ -4930,11 +5014,14 @@ pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<()> {
 pub async fn run_silent_agent_with_deadline(
     params: &SilentAgentParams<'_>,
     deadline: Instant,
-) -> Result<()> {
+) -> Result<SilentTurnOutcome> {
     run_silent_inner(params, deadline).await
 }
 
-async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> Result<()> {
+async fn run_silent_inner(
+    params: &SilentAgentParams<'_>,
+    deadline: Instant,
+) -> Result<SilentTurnOutcome> {
     let db = params.db;
     let llm = params.llm;
     let tools = params.tools;
@@ -5366,7 +5453,12 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
             .settings
             .map_or(25, |s| s.max_agent_tasks_per_session),
         pr_review_posted: &pr_review_posted,
-        pr_reviews_posted: None, // Silent mode: no session-scoped dedup needed
+        // mika#2368 AC7 — le registre atteint le chemin silencieux. Voir le
+        // doc-comment de `SilentAgentParams::pr_reviews_posted` : le `None` et
+        // son commentaire « no session-scoped dedup needed » contredisaient le
+        // `debug_assert!` de `builtin_handlers` depuis que le callback de build
+        // est devenu un flux qui poste des revues.
+        pr_reviews_posted: params.pr_reviews_posted,
         callback_task_id,
         required_tool_arg_suffixes: &required_tool_arg_suffixes_silent,
         tool_arg_suffix_rejected: &tool_arg_suffix_rejected_silent,
@@ -5438,7 +5530,9 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
                 .record_reflection_run("failed", 0, Some("Timed out"))
                 .await;
         }
-        return Ok(());
+        // mika#2368 : le tour n'a pas eu lieu. Un tour qui n'a pas conclu ne
+        // « conclut pas sans verdict » — le filet ne s'arme pas ici.
+        return Ok(SilentTurnOutcome::default());
     }
 
     // Construct LongRunningContext for DeferredDispatch triggers only (mika#1058).
@@ -5472,6 +5566,9 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
     // is the WARN and the audit row the guard itself writes, whose correct
     // reader is the operator.
     let mut delivery_log: Vec<DeliveryRecord> = Vec::new();
+    // mika#2368 — le signal que `run_loop` pose sur ses deux chemins de sortie
+    // EndTurn quand un verdict était dû et n'a pas été posté après le re-prompt.
+    let qa_verdict_unmet = AtomicBool::new(false);
     let result = run_loop(
         llm,
         tools,
@@ -5494,6 +5591,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         &enabled_tool_names,
         false, // silent mode: mode.is_conversation() gate handles callback turns (#1254)
         &loaded_skill_names, // mika#2355: callback_safe_skills() — where qa-review is or isn't
+        Some(&qa_verdict_unmet), // mika#2368: le seul mode où le filet a une population
         store_llm,
         store_tools,
         prompt_variant.as_deref(),
@@ -5549,7 +5647,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
                         .record_reflection_run("failed", 0, Some("Timed out"))
                         .await;
                 }
-                return Ok(());
+                return Ok(SilentTurnOutcome::default());
             }
 
             let cont = attempt_continuation_turn(
@@ -5588,7 +5686,12 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
                     .record_reflection_run("failed", 0, Some("Timed out"))
                     .await;
             }
-            return Ok(());
+            // mika#2368 — un tour coupé par sa deadline **n'a pas conclu**, et
+            // c'est le périmètre de l'autre motif (`CutOffByDeadline`,
+            // mika#2276), pas de celui-ci. Deux motifs, deux populations : les
+            // confondre ferait compter un dépassement comme une conclusion
+            // muette, et le nom d'événement mentirait sur la cause.
+            return Ok(SilentTurnOutcome::default());
         }
     }
 
@@ -5633,7 +5736,9 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         );
     }
 
-    Ok(())
+    Ok(SilentTurnOutcome {
+        qa_verdict_unmet: qa_verdict_unmet.load(Ordering::Relaxed),
+    })
 }
 
 // -- Team Agent Loop --
@@ -6042,6 +6147,7 @@ async fn run_team_agent_inner_impl(
         &enabled_tool_names,
         has_verdict_producer_skill(params.skills.skills()),
         &skill_names_of(&matched_entries), // mika#2355
+        None,                              // mika#2368 : pas de callback de build en mode équipe
         store_llm,
         store_tools,
         prompt_variant.as_deref(),

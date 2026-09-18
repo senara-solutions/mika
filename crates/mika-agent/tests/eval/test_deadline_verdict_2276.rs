@@ -24,8 +24,12 @@
 //! Voir le corps de PR. Le rouge s'obtient en faisant rendre `None` à
 //! `persist_deadline_fallback` pour `deadline_exceeded` — c'est-à-dire en
 //! restaurant la sémantique de `main`, où rien ne distingue « coupé » de
-//! « conclu ». Le test tombe alors sur `NotApplicable("turn_completed")` : zéro
-//! POST, PR muette. Exactement le symptôme du ticket.
+//! « conclu ». `deadline_verdict_target` rend alors `None`, le filet n'est
+//! jamais appelé : zéro POST, PR muette. Exactement le symptôme du ticket.
+//! (Avant mika#2368 ce refus vivait dans le filet lui-même et s'appelait
+//! `NotApplicable("turn_completed")` ; il est descendu dans la décision
+//! d'entrée du call-site, parce que « le tour a conclu » décrit désormais
+//! exactement le périmètre du second motif.)
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -39,7 +43,7 @@ use tokio::time::Instant;
 
 use mika_agent::server::deadline_verdict::{
     DEADLINE_VERDICT_LINE, DeadlineVerdictInput, DeadlineVerdictOutcome, PostReviewRequest,
-    maybe_post_deadline_verdict,
+    deadline_verdict_target, maybe_post_deadline_verdict,
 };
 
 use super::harness::EvalHarness;
@@ -136,12 +140,19 @@ async fn ac2_a_qa_turn_cut_off_by_its_deadline_posts_a_verdict() {
     let captured = Arc::new(std::sync::Mutex::new(None::<PostReviewRequest>));
     let calls = Arc::new(AtomicUsize::new(0));
 
+    // mika#2368 : la décision d'entrée du call-site webhook vit désormais dans
+    // `deadline_verdict_target` — l'appeler ici, c'est rester « branché comme en
+    // production ».
+    let (reason, target) =
+        deadline_verdict_target(output.deadline_exceeded, REVIEW_REQUESTED_EVENT)
+            .expect("un tour coupé sur une PR doit produire un motif et une cible");
+
     let sink = captured.clone();
     let counter = calls.clone();
     let outcome = maybe_post_deadline_verdict(
         DeadlineVerdictInput {
-            overrun: output.deadline_exceeded,
-            event_text: REVIEW_REQUESTED_EVENT,
+            reason,
+            target,
             session_id: SESSION_ID_HINT,
             trace_id: TRACE_ID,
             agent_id: "mika-qa",
@@ -208,12 +219,16 @@ async fn ac3_a_turn_that_already_posted_its_review_adds_no_second_verdict() {
         .or_default()
         .insert("senara-solutions/mika|2275".to_string());
 
+    let (reason, target) =
+        deadline_verdict_target(output.deadline_exceeded, REVIEW_REQUESTED_EVENT)
+            .expect("un tour coupé sur une PR doit produire un motif et une cible");
+
     let calls = Arc::new(AtomicUsize::new(0));
     let counter = calls.clone();
     let outcome = maybe_post_deadline_verdict(
         DeadlineVerdictInput {
-            overrun: output.deadline_exceeded,
-            event_text: REVIEW_REQUESTED_EVENT,
+            reason,
+            target,
             session_id: SESSION_ID_HINT,
             trace_id: TRACE_ID,
             agent_id: "mika-qa",
@@ -264,28 +279,14 @@ async fn a_turn_that_concludes_in_budget_posts_nothing() {
         "un tour qui conclut ne doit jamais être marqué comme coupé"
     );
 
-    let registry: DashMap<String, HashSet<String>> = DashMap::new();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let counter = calls.clone();
-    let outcome = maybe_post_deadline_verdict(
-        DeadlineVerdictInput {
-            overrun: trace.output.deadline_exceeded,
-            event_text: REVIEW_REQUESTED_EVENT,
-            session_id: SESSION_ID_HINT,
-            trace_id: TRACE_ID,
-            agent_id: "mika-qa",
-            pr_reviews_posted: Some(&registry),
-        },
-        move |_req| {
-            counter.fetch_add(1, Ordering::SeqCst);
-            async { Ok(String::new()) }
-        },
-    )
-    .await;
-
-    assert_eq!(
-        outcome,
-        DeadlineVerdictOutcome::NotApplicable("turn_completed")
+    // mika#2368 : la garde `turn_completed` est descendue du filet dans
+    // `deadline_verdict_target`, parce que « le tour a conclu » décrit désormais
+    // exactement le périmètre du second motif et ne peut plus être un refus du
+    // filet. L'assertion n'est pas affaiblie — elle porte sur le fait que le
+    // call-site **n'appelle pas** le filet, ce qui est un zéro POST plus fort
+    // qu'un `NotApplicable`.
+    assert!(
+        deadline_verdict_target(trace.output.deadline_exceeded, REVIEW_REQUESTED_EVENT).is_none(),
+        "un tour qui conclut ne doit produire aucun motif, donc aucun POST possible"
     );
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }

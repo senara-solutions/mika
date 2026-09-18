@@ -454,6 +454,84 @@ Optional (bounded A2A wait line — mika#2163):
   bound is in memory; waiters are lost on restart, as today), and a client-side retry
   in `mika ask` (`retry_after_ms` gives a future one something to tune against).
 
+Optional (filet moteur du verdict QA — mika#2368):
+- **Le défaut que ça ferme, écrit mot pour mot dans le test que mika#2355 a
+  lui-même posé.** `the_verdict_guard_fires_once_and_does_not_loop` le dit :
+  après le re-prompt unique de la garde `qa_build_callback_verdict`, un second
+  EndTurn sans revue est **accepté** et `run_gh` n'a pas été appelé — *« nothing
+  was posted — the net's job »*. Ce n'est pas un défaut de la garde, c'est son
+  contrat : toutes les gardes `intent_guard_retries` ont un budget d'un coup,
+  délibérément, parce qu'une garde qui re-prompte indéfiniment transforme un
+  silence en boucle. Le budget épuisé, il restait une injonction ignorée deux
+  fois et une PR muette — la forme exacte que
+  `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate` prédit.
+- **Le filet généralise `server::deadline_verdict`, il ne le duplique pas.** Le
+  motif devient énuméré : `CutOffByDeadline` (mika#2276, le tour n'a pas conclu)
+  | `CallbackConcludedWithoutVerdict` (mika#2368, le tour de callback de build QA
+  **a** conclu, proprement, sans rien poster). Le motif décide du corps, de la
+  ligne de journal et du **nom d'événement** ; il ne décide rien d'autre.
+- `MIKA_QA_CALLBACK_VERDICT_NET` — kill-switch (**défaut armé** ; `0` désarme
+  sans redéploiement). Il n'est pas là par prudence de principe : la sonde 2c du
+  plan mika#2355 prescrit « désarmer le filet avant tout diagnostic » si une PR
+  est mergée sans revue, et cette prescription n'est exécutable que si le levier
+  existe. Absence ou valeur vide → armé ; `0`/`false`/`off`/`no` → désarmé ; une
+  valeur non reconnue est **dite** et laisse armé — un désarmement par coquille
+  sur un filet de sûreté serait la panne silencieuse que tout ce ticket ferme.
+- **Token `hold[review]` et rien d'autre — contrainte de sûreté, pas de
+  registre.** `verdict_handler` route `pass` vers un **merge** ; un filet qui
+  poserait `pass` au motif que le build a réussi **mergerait une PR dont aucun
+  diff n'a été revu**, ce qui est strictement pire que le silence qu'il remplace.
+  Asserté sur la constante `DEADLINE_VERDICT_LINE` **et** en passant le corps
+  produit au parseur de `server::verdict` — la constante seule ne prouve pas ce
+  que la machine d'état lira.
+- **La cible PR est dite, jamais dérivée.** Résolue au **spawn** par
+  `execute_long_running` depuis `originating_message`, via le lecteur unique de
+  la grammaire (`parse_pr_target`), et stampée sur la tâche callback
+  (`metadata.qa_review_pr_target`) — même trajectoire que
+  `metadata.dispatch_worktree_file` (mika#2249) et
+  `metadata.pilot_transcript_expected` (mika#2040). Ce qui est condamné, c'est la
+  dérivation **tardive**, celle qui se ferait au moment du filet, quand l'échec
+  n'est plus rattrapable et ne se journalise nulle part.
+- **Surfaces opérateur — deux noms, et c'est ce qui sauve les sondes.**
+  `qa_deadline_verdict` (motif mika#2276) et `qa_callback_verdict` (motif
+  mika#2368), chacun **SOLE WRITER** du sien, épinglé par un scan de source. La
+  sonde de contrôle négatif de mika#2355 est littéralement
+  `grep qa_deadline_verdict $MIKA_SPIRIT_LOG_FILE | jq 'select(.outcome == "posted")'`
+  — *le filet mika#2276 ne doit pas se mettre à firer* ; un nom partagé
+  fusionnerait deux populations qui doivent rester comptables séparément.
+  `grep qa_callback_verdict $MIKA_SPIRIT_LOG_FILE | jq 'select(.outcome | startswith("no_"))'`
+  donne les abstentions (`no_metadata`, `metadata_unreadable`, `no_target_stamp`,
+  `target_unreadable`, `no_token`, `no_registry`) ; une abstention soutenue sur
+  le même motif signifie que la trajectoire du stamp est cassée **en amont** —
+  **ne pas élargir la résolution de cible**, établir d'abord pourquoi
+  `originating_message` ne porte plus le webhook. Côté producteur :
+  `qa_review_pr_target_stamped` (INFO, un par dispatch de build) et
+  `qa_review_pr_target_unresolved` (WARN).
+- **Sondes post-déploiement, et leurs haltes.** (a) *Symptôme, 48 h* : toute PR
+  ayant reçu une demande de revue `mika-platform-qa` porte une revue soumise.
+  (b) *Attribution* :
+  `SELECT count(*) FROM audit_events WHERE tool_name = 'qa_callback_verdict';`
+  — **doit rester proche de zéro**. Un filet qui porte le trafic nominal a
+  remplacé un silence par un `hold[review]` systématique : B1/B2 et la garde de
+  mika#2355 n'ont alors pas pris, et c'est **là** qu'il faut chercher, pas dans
+  le réglage du filet. *Ce filet est un filet, pas un chemin* — s'il porte le
+  trafic nominal, il a en plus effacé le signal qui permettrait de le voir.
+  (c) *Aucun merge non revu* : **halte immédiate** si une PR est mergée sans
+  revue soumise — `MIKA_QA_CALLBACK_VERDICT_NET=0` d'abord, diagnostic ensuite.
+  (d) *Halte générale* : si les PR restent muettes alors que les sondes (b) et
+  les abstentions sont propres, c'est que le tour de callback n'a pas lieu du
+  tout — un autre défaut, dont la piste est la livraison des callbacks
+  (quarantaine mika#2179, file) et non le contrat de reprise.
+- **Hors périmètre, délibérément :** le tour de callback qui **échoue**
+  (`run_silent_agent` rend `Err`) — il laisse aussi la PR muette, mais son
+  silence est déjà borné et instrumenté par mika#2179 (réessais, quarantaine,
+  télémétrie), et le signal `concluded_without_verdict` n'existe que sur la
+  branche `Ok` : un tour qui a planté n'a pas « conclu ». Population nommée, non
+  couverte, **ticket de suivi** si les sondes montrent qu'elle est non
+  négligeable. Les cinq autres flux `long_running` ne bougent pas — le
+  discriminant est `qa_build_callback::qa_verdict_required`, dont la conjonction
+  les exclut chacun (mika#2355 AC9).
+
 Optional (destructive-action grounding gate — mika#1646):
 - `MIKA_DEV_REPEAT_ACTION_WINDOW_SECS` — Window (seconds) within which a second `gh pr close` / `gh issue close` on the same target counts as a **repeat** and must acknowledge the prior one in its `--comment` (default `1800` = 30 min). Absent/empty → default; unparseable, `0`, or negative → default with a `destructive_window_invalid` WARN. Note `0` does **not** disable the check: on a destructive action an operator typo must not silently reopen the hole. Repeat detection reads the persisted `tool_calls` table scoped to the agent, so it survives a process restart and a deferred webhook replay — the founding incident's second close came from exactly such a replay, from a context sharing no memory with the first. Operator grep signal: `destructive_action_blocked` in `$MIKA_SPIRIT_LOG_FILE`; SQL surface: `SELECT * FROM audit_events WHERE tool_name = 'destructive_action_grounding'`.
 

@@ -225,6 +225,7 @@ async fn seed_live_dispatch(
         3600,
         session_id,
         "trace-2272",
+        None,
     );
     let id = db.create_task(task).await?;
 
