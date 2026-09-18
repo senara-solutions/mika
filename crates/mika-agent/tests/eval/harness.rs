@@ -60,6 +60,13 @@ pub struct EvalHarness {
     brave_api_key: Option<String>,
     github_token: Option<String>,
     mcp_manager: Option<McpManager>,
+    /// User-attached images threaded into every `AgentParams` (mika#1784).
+    ///
+    /// Empty unless `.user_images()` was called on the builder, so every
+    /// pre-existing scenario is byte-identical. A field rather than a
+    /// `run_with_images` method: the three run sites must agree on what a turn
+    /// carries, and a fourth entry point is a fourth place to forget.
+    user_images: Vec<mika_common::llm::LlmImage>,
     /// Session-scoped PR review dedup map (#821, #736).
     /// When `Some`, enables the session-scope dedup guard in the agent loop.
     pub pr_reviews_posted: Option<Arc<DashMap<String, HashSet<String>>>>,
@@ -102,7 +109,7 @@ impl EvalHarness {
             skip_compaction: self.skip_compaction,
             embedding_client: self.embedding_client.as_ref(),
             thinking: None,
-            user_images: &[],
+            user_images: &self.user_images,
             brave_api_key: self.brave_api_key.as_deref(),
             github_token: self.github_token.as_deref(),
             gateway_url: None,
@@ -154,7 +161,7 @@ impl EvalHarness {
             skip_compaction: self.skip_compaction,
             embedding_client: self.embedding_client.as_ref(),
             thinking: None,
-            user_images: &[],
+            user_images: &self.user_images,
             brave_api_key: self.brave_api_key.as_deref(),
             github_token: self.github_token.as_deref(),
             gateway_url: None,
@@ -217,7 +224,7 @@ impl EvalHarness {
             skip_compaction: self.skip_compaction,
             embedding_client: None,
             thinking: None,
-            user_images: &[],
+            user_images: &self.user_images,
             brave_api_key: None,
             github_token: None,
             gateway_url: None,
@@ -255,6 +262,7 @@ pub struct EvalHarnessBuilder {
     deployment: mika_common::home::Deployment,
     provider_name: Option<String>,
     model_name: Option<String>,
+    supports_vision: Option<bool>,
     message_sender: Option<Arc<dyn MessageSender>>,
     /// When set, uses this real provider instead of creating a MockLlmProvider.
     real_llm_provider: Option<Arc<dyn LlmProvider>>,
@@ -262,6 +270,7 @@ pub struct EvalHarnessBuilder {
     brave_api_key: Option<String>,
     github_token: Option<String>,
     mcp_manager: Option<McpManager>,
+    user_images: Vec<mika_common::llm::LlmImage>,
     pr_reviews_posted: Option<Arc<DashMap<String, HashSet<String>>>>,
     stream_ctx: Option<Arc<mika_a2a::streaming::ToolCallStreamContext>>,
 }
@@ -281,12 +290,14 @@ impl Default for EvalHarnessBuilder {
             deployment: mika_common::home::Deployment::Unknown,
             provider_name: None,
             model_name: None,
+            supports_vision: None,
             message_sender: None,
             real_llm_provider: None,
             embedding_client: None,
             brave_api_key: None,
             github_token: None,
             mcp_manager: None,
+            user_images: Vec::new(),
             pr_reviews_posted: None,
             stream_ctx: None,
         }
@@ -378,6 +389,16 @@ impl EvalHarnessBuilder {
         self
     }
 
+    /// Set whether the mock provider declares vision (mika#1784).
+    ///
+    /// Default: `false`, which is `MockProviderConfig`'s own default and the
+    /// answer the real predicate gives for `ZAi` / `Groq` / `Kimi` / `Qwen` /
+    /// `MiniMax` — the rails a family tenant is most likely to be on.
+    pub fn supports_vision(mut self, supports: bool) -> Self {
+        self.supports_vision = Some(supports);
+        self
+    }
+
     /// Set a custom message sender. Default: `None`.
     pub fn message_sender(mut self, sender: Arc<dyn MessageSender>) -> Self {
         self.message_sender = Some(sender);
@@ -430,6 +451,16 @@ impl EvalHarnessBuilder {
     /// broadcast to any subscriber of the underlying `broadcast::Sender`.
     pub fn stream_ctx(mut self, ctx: Arc<mika_a2a::streaming::ToolCallStreamContext>) -> Self {
         self.stream_ctx = Some(ctx);
+        self
+    }
+
+    /// Attach user images to every turn this harness runs (mika#1784).
+    ///
+    /// Pair with `MockLlmProviderBuilder::supports_vision(false)` to exercise the
+    /// withheld path — the one Al hit, where the image was dropped in silence and
+    /// the model answered honestly that it could not see it.
+    pub fn user_images(mut self, images: Vec<mika_common::llm::LlmImage>) -> Self {
+        self.user_images = images;
         self
     }
 
@@ -489,6 +520,9 @@ impl EvalHarnessBuilder {
                 if let Some(name) = self.model_name {
                     builder = builder.model_name(name);
                 }
+                if let Some(supports) = self.supports_vision {
+                    builder = builder.supports_vision(supports);
+                }
                 let mock = Arc::new(builder.responses(self.responses).build());
                 (mock.clone() as Arc<dyn LlmProvider>, Some(mock))
             };
@@ -519,6 +553,7 @@ impl EvalHarnessBuilder {
             brave_api_key: self.brave_api_key,
             github_token: self.github_token,
             mcp_manager: self.mcp_manager,
+            user_images: self.user_images,
             pr_reviews_posted: self.pr_reviews_posted,
             stream_ctx: self.stream_ctx,
         })
