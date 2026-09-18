@@ -47,12 +47,6 @@ install: ## Copy release binaries + scripts to INSTALL_DIR (safe while services 
 	@chmod +x $(INSTALL_DIR)/mika-pilot-egress-proxy.tmp
 	@mv $(INSTALL_DIR)/mika-pilot-egress-proxy.tmp $(INSTALL_DIR)/mika-pilot-egress-proxy
 	@echo "Installed mika-pilot-egress-proxy -> $(INSTALL_DIR)/mika-pilot-egress-proxy"
-	@# mika#2313: sandbox-safe ~/.claude.json emitter — dispatch-lib.sh calls it
-	@# by the stable path so the contained pilot keeps its prompt cache.
-	@cp scripts/mika-pilot-sanitize-claude-json $(INSTALL_DIR)/mika-pilot-sanitize-claude-json.tmp
-	@chmod +x $(INSTALL_DIR)/mika-pilot-sanitize-claude-json.tmp
-	@mv $(INSTALL_DIR)/mika-pilot-sanitize-claude-json.tmp $(INSTALL_DIR)/mika-pilot-sanitize-claude-json
-	@echo "Installed mika-pilot-sanitize-claude-json -> $(INSTALL_DIR)/mika-pilot-sanitize-claude-json"
 	@# addon deployed at stable path (2026-08-05).
 	@cp scripts/mika-pilot-anthropic-auth-addon.py $(INSTALL_DIR)/mika-pilot-anthropic-auth-addon.py.tmp
 	@mv $(INSTALL_DIR)/mika-pilot-anthropic-auth-addon.py.tmp $(INSTALL_DIR)/mika-pilot-anthropic-auth-addon.py
@@ -156,6 +150,7 @@ test: ## Run all tests
 	@bash scripts/check-dispatch-seats-declared.sh
 	@bash scripts/test-check-dispatch-seats-declared.sh
 	@python3 -B scripts/test-pilot-egress-proxy-status.py
+	@python3 -B scripts/test-pilot-egress-keepalive.py
 
 test-async-db-saturation: ## Run async DB channel saturation regression test (mika#1258)
 	cargo test -p mika-agent --lib -- async_db::tests::test_async_db_saturated_channel_does_not_pin_workers --nocapture
@@ -216,8 +211,9 @@ verify-no-sigpipe-grep: ## Reject `printf|echo | grep -q` under pipefail (SIGPIP
 	@bash scripts/verify-no-sigpipe-grep.sh
 	@bash scripts/test-verify-no-sigpipe-grep.sh
 
-test-pilot-egress-proxy: ## Verify the pilot egress-proxy upstream-status tap (mika#1901)
+test-pilot-egress-proxy: ## Verify the pilot egress-proxy status tap + framing (mika#1901, #2317)
 	@python3 -B scripts/test-pilot-egress-proxy-status.py
+	@python3 -B scripts/test-pilot-egress-keepalive.py
 
 verify-bundled-skills: ## Verify structural invariants on bundled skills — pre-merge counterpart to AC2 (mika#1575)
 	cargo run -q --bin verify-bundled-skills

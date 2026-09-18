@@ -1,0 +1,836 @@
+# mika#2136 — un `send_message` échoué ne peut pas se clore en silence
+
+- **Ticket :** senara-solutions/mika#2136
+- **Priorité :** p2-normal (ne casse pas la boucle ; casse la confiance du destinataire)
+- **Branche :** `fix/2136/agent-l-agent-affirme-une-livraison-qu`
+- **Lignage :** mika#2134 (la garde de longueur, qui est en amont et déjà livrée), mika#2118
+  (dire la vérité opérationnelle plutôt qu'une réussite de façade — même racine, autre site),
+  mika#2126 (markdown Telegram, hors sujet ici), mika#650/#1090 (`NoChannel`, dont le
+  traitement est délibérément asymétrique et le reste), mika#1331 (assert-grounded),
+  mika#1645 (equivalence-claim), mika#2290 (5d), mika#2276 M2 (`deadline_verdict` — le
+  précédent structurel exact), mika#1783 (`substrate_diagnostic` — le canal typé
+  outil→moteur qu'on réemploie)
+
+---
+
+## Contexte
+
+Le 2026-09-01, sur le Telegram d'Al, deux dégâts distincts dans la même conversation :
+
+1. Un document de plus de 12 000 caractères est refusé par la garde de l'outil. L'agent
+   répond **« Le voici en entier 👆 »**. Rien n'est jamais arrivé. Al doit insister pour
+   que l'agent admette la limite — qu'il **connaissait avant de répondre**, chiffrée, dans
+   le `tool_result`.
+2. Al demande la découpe. L'agent envoie en commençant par **« Partie 2/4 »**. La partie
+   1/4 est morte au transport, et l'agent enchaîne sans le dire.
+
+Le ticket pose la question de conception plutôt que le remède : *« quelle structure rend
+inignorable l'échec d'un `send_message` »*, et nomme trois pistes — un état de tour qui ne
+peut pas se clore sur un envoi échoué non acquitté, une reformulation du `ToolOutput`, ou
+autre chose. Il rappelle aussi que
+`feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate` interdit de traiter
+ça par une ligne de prompt.
+
+Le ticket ajoute une contrainte de méthode : le harnais `tests/eval/golden/` rejoue des
+réponses scriptées et *« ne peut donc pas attester une règle de comportement »*. C'est
+exact, et **c'est un argument pour la structure** : un refus décidé par le moteur se teste
+précisément avec des réponses scriptées, puisque ce n'est pas le modèle qui décide. Voir
+E7.
+
+---
+
+## Ce qui est établi, et comment le vérifier
+
+### E1 — Le moteur voit l'échec, et aucun des onze guards ne le regarde
+
+`tool_execution/dispatch.rs:320` : `let tool_succeeded = !output.is_error && !non_zero_exit;`
+puis ligne 343 `success: tool_succeeded` dans le `ToolCallSummary` poussé dans
+`all_tool_summaries`. Un `send_message` refusé ou mort produit donc **déjà** une entrée
+`{ name: "send_message", success: false }` que la boucle détient au moment du EndTurn.
+
+Et onze guards lisent `all_tool_summaries` à la clôture (required-tools, completion-claim,
+milestone-close, fabricated-action, dev-groom, 6c, 6d, 6e…). Aucun ne regarde la livraison :
+
+```
+$ grep -c "send_message" crates/mika-agent/src/evidence/guards.rs
+0
+```
+
+**Conséquence pour AC1.** Le fait brut « un envoi a échoué » est déjà dans l'état du tour ;
+ce qui manque est (a) sa **qualification** (voir E2), et (b) un lecteur à la clôture. Le
+plan ne prétend donc pas créer une information qui existe : il la type et la lit.
+
+### E2 — Les deux étages sont typés à la source et perdus dès la sortie de l'outil
+
+`crates/mika-agent/src/tools/send_message.rs` a trois sorties `is_error = true`, qui ne
+disent pas la même chose :
+
+| ligne | cause | ce qui est parti |
+|---|---|---|
+| `:59-66` | garde de longueur (mika#2134) | **rien** — refus avant persistance et avant transport |
+| `:93-95` | `SendOutcome::Failed` | le message est parti et est **mort** ; sauvegardé dans `failed_sends` |
+| `:115-118` | `Err(e)` — erreur infra du sender | rien de garanti, et **rien dans `failed_sends`** |
+
+En aval, ces trois cas sont indistinguables autrement qu'en relisant la prose anglaise du
+message d'erreur (`output_summary`, tronqué et scrubbé). **La réparation attendue n'est pas
+la même** : pour un refus de longueur, elle est une découpe ; pour un échec transport, elle
+est un ré-essai du même texte. Un prédicat qui confondrait les deux produirait du bruit sur
+le cas le plus fréquent — un agent qui rédige 5 000 caractères se fait refuser tous les
+jours, découpe, et a raison.
+
+**Il y a bien trois sorties `is_error`, pas deux.** Le ticket n'en cite que deux ; la
+troisième (`Err(e)`, `:115-118`) est une erreur du sender lui-même et non un verdict de
+livraison. AC1 porte sur *« quand un `send_message` rend `is_error == true` »*, donc elle est
+dans le périmètre, et un plan qui ne l'énumérerait pas laisserait un trou exactement de la
+forme du défaut d'origine. Elle se range sous `Failed` (D2) : même dégât, même réparation.
+
+**Et `SendOutcome::Failed` n'est pas définitif.** `messaging.rs:14` : le message est
+*« saved to `failed_sends` for later flush »*. Un flush ultérieur peut donc le délivrer après
+la fin du tour. Ça ne change rien au prédicat — au moment où l'agent parle, rien n'est arrivé,
+et c'est de ça qu'il est question — mais ça contraint la **formulation** de l'annexe (D5) et
+la lecture de la halte 4 de la sonde.
+
+### E3 — Deux sorties qui ne délivrent rien rendent pourtant `success`
+
+`SendOutcome::NoChannel` (`:102-113`) et l'absence de sender configuré (`:127-133`)
+retournent `ToolOutput::success` **à dessein**, avec le commentaire qui en donne la raison :
+`ToolOutput::error` y déclencherait une boucle de ré-essai sur une condition permanente
+(#650, garde de régression mika#1090 citée dans le test `test_send_message_no_channel`).
+C'est une population réelle de « livraison affirmée sans livraison », et elle est **hors
+périmètre** (voir § Hors périmètre) : la traiter ici rouvrirait la boucle que #650 a fermée.
+
+### E4 — En mode conversation, le texte final EST le canal
+
+`server/handlers.rs:1541` : `if let Some(response) = output.text { … sender_arc.send(&response) }`.
+Le texte de clôture part sur Telegram comme n'importe quel message. « Le voici en entier 👆 »
+est arrivé par là. C'est donc à la fois le lieu du dégât et le seul point où le moteur peut
+faire arriver un fait à l'utilisateur sans passer par le modèle.
+
+**Mais c'est le même canal que celui qui vient d'échouer, et il faut le dire.** Les lignes
+`:1542-1551` traitent déjà l'échec de *cet* envoi-là — `Failed`, `NoChannel`, `Err` — par un
+simple `warn!`. Conséquence pour D5 : l'annexe est **garantie de partir** sur l'étage
+`RefusedTooLong` (le canal fonctionne, c'est la longueur qui était refusée — le cas d'Al) et
+**seulement tentée** sur l'étage `Failed`, où le transport était mort quelques pas plus tôt et
+peut l'être encore. La limite est de la même famille que celle du mode silencieux déjà nommée
+en D5, et son résidu est le même : le WARN et la ligne d'audit, dont le destinataire est
+l'opérateur. Ce plan ne prétend donc pas rendre l'aveu indéfectible ; il le rend **structurel
+et mesuré**, ce qu'AC2 demande.
+
+### E5 — Le précédent structurel existe, il est récent, et il est à la même place
+
+mika#2276 M2 a posé `AgentOutput.deadline_exceeded: Option<DeadlineOverrun>` avec, dans sa
+propre doc, le raisonnement qu'on reprend mot pour mot :
+
+> **Why this field exists at all.** `text` cannot answer the question. […] the call site
+> could not tell "the turn answered" from "the turn was cut off".
+
+et `post_deadline_verdict_if_cut_off(state, a, &output, …)` appelé en `handlers.rs:1537`,
+**avant** l'envoi du texte, avec le commentaire « Placé AVANT l'envoi sur le canal de
+réponse, à dessein ». Ici la question est « le tour s'est terminé » ≠ « ce qu'il dit avoir
+livré est parti », et le point d'insertion est le même.
+
+### E6 — `ToolOutput` porte déjà un canal typé outil→moteur
+
+`tools/mod.rs:237` : `pub substrate_diagnostic: Option<String>` (mika#1783), **jamais rendu
+au LLM**, construit exclusivement par un constructeur dédié « so the discipline is enforced
+at the type layer ». C'est exactement la forme dont on a besoin, et son coût est mesuré :
+aucune construction littérale `ToolOutput { … }` n'existe hors de `tools/mod.rs`
+(`grep -rn "ToolOutput {" crates/mika-agent/src/ | grep -v tools/mod.rs` ne rend que des
+types de retour), donc ajouter un champ ne touche aucun site appelant.
+
+### E7 — Le harnais peut attester ce correctif-ci
+
+`tests/eval/harness.rs:382` : `pub fn message_sender(mut self, sender: Arc<dyn MessageSender>) -> Self`.
+Un `MessageSender` de test qui refuse le premier fragment et accepte les suivants est
+injectable dans `run_agent` de bout en bout. Le harnais ne peut pas attester qu'un **modèle**
+dira la vérité — le ticket a raison — mais il atteste parfaitement qu'un **moteur** refuse
+de clore. AC6 est donc atteignable sans provider réel.
+
+### E8 — Le `ToolCallSummary` ne suffit pas pour décider « réparé »
+
+`input_summary` est tronqué à `INPUT_SUMMARY_MAX` puis scrubbé (`dispatch.rs:216`). Décider
+« ce fragment a été renvoyé avec succès » par égalité sur un préfixe tronqué confondrait deux
+fragments partageant leur début — et la direction de l'erreur est mauvaise : on croirait
+réparé un fragment mort, donc on se tairait. C'est exactement le silence dont le ticket est
+né. D'où D2.
+
+### E9 — `dispatch.rs` ne capte aucun texte utilisable, et **jamais sur un échec**
+
+Le seul site où `dispatch.rs` touche au texte d'un envoi est `:354-358`, et il est inutilisable
+pour le prédicat de D3 pour **trois** raisons cumulées, dont la troisième est décisive :
+
+1. **Mauvais registre.** Il lit `arguments.get("text")` (`:355`) — la valeur telle que le LLM
+   l'a émise. Mais `send_message` travaille sur `cleaned = strip_internal_tags(text)` (`:48`),
+   et ce `cleaned` est **ce que la garde de longueur mesure** (`:57`,
+   `text_len_utf16(&cleaned)`) **et ce que le sender envoie** (`:85`, `sender.send(&cleaned)`).
+   Le commentaire du code dit que le strip existe parce que le LLM *« may have echoed »* des
+   tags internes — c'est-à-dire précisément une population où brut ≠ nettoyé.
+2. **Tronqué.** La valeur captée est `truncate_summary(text_val, 200)` (`:357`) : 200
+   caractères. Une égalité de texte sur ce préfixe a exactement le défaut d'E8, en pire.
+3. **Jamais posé sur un échec.** Le bloc entier est sous
+   `if name == "send_message" && tool_succeeded && conversation_mode` (`:350`), et il ne
+   s'exécute qu'`if send_message_text_capture.is_empty()` — donc au plus une fois par tour.
+   **Le texte d'un envoi échoué n'est capté nulle part aujourd'hui**, et celui du second envoi
+   d'un tour non plus.
+
+**Conséquence pour D2, et elle est plus forte que « préférable ».** Faire porter le texte par
+le verdict n'est pas le meilleur des chemins disponibles : c'est le **seul**. Aucun autre site
+ne détient le texte d'un envoi échoué, ni en entier, ni dans le registre qui a été mesuré puis
+envoyé. Un plan qui réutiliserait `send_message_text_capture` obtiendrait un prédicat faux dans
+les trois directions à la fois.
+
+**La direction de l'erreur, si on l'ignorait.** L'étage transport répare par égalité de texte.
+Un ré-essai ré-émettant le même contenu avec un tag interne en plus ou en moins donnerait deux
+bruts **différents** pour un seul `cleaned` : la réparation ne serait pas reconnue, le champ
+resterait `Some`, et **une annexe affirmant une perte partirait dans le canal utilisateur alors
+que le message est bien arrivé**. C'est le faux positif que la halte 4 de la sonde interdit de
+laisser vivre. La collision inverse (deux bruts distincts nettoyant vers un même `cleaned`)
+existe aussi, et elle penche du côté du silence. D'où la provenance imposée en D2 : le texte est
+posé par `send_message`, seul détenteur de `cleaned`, et n'est jamais relu depuis `arguments`.
+
+**Conséquence pour D3, et sa direction d'erreur.** L'étage transport répare par égalité de
+texte. Si le record portait le texte brut, un ré-essai ré-émettant le même contenu avec un tag
+interne en plus ou en moins donnerait deux bruts **différents** pour un seul `cleaned` : la
+réparation ne serait pas reconnue, le champ resterait `Some`, et **une annexe affirmant une
+perte partirait dans le canal utilisateur alors que le message est bien arrivé**. C'est le
+faux positif que la halte 4 de la sonde interdit de laisser vivre. La collision inverse
+existe aussi (deux bruts distincts nettoyant vers un même `cleaned`), et elle penche du côté
+du silence. D'où la provenance imposée en D2 : le texte est posé par `send_message`, seul
+détenteur de `cleaned`, et n'est jamais relu depuis `arguments`.
+
+### E10 — Le boundary #771 borne à **un** envoi réussi par tour en mode conversation
+
+`dispatch.rs:156` : `if *send_message_boundary_active && name == "send_message" && conversation_mode`
+→ `continue` **avant** `execute`, avec un `tool_result` `is_error: true`. Le boundary s'arme
+après le premier `send_message` **réussi** (`:350`, conditionné à `tool_succeeded`), et
+`agent_loop/mod.rs:3336` force en outre EndTurn au pas suivant. `conversation_mode` n'est pas
+calculé dans `dispatch.rs` : c'est un **paramètre** (`:125`), alimenté par `mode.is_conversation()`
+aux deux sites d'appel d'`agent_loop` — le mode d'Al.
+
+Trois conséquences, toutes portantes :
+
+1. **C'est ce qui a rendu la séquence d'Al possible.** La partie 1/4 échoue, donc
+   `tool_succeeded == false`, donc le boundary ne s'arme pas, donc la partie 2/4 passe. Un
+   premier fragment *réussi* aurait fait supprimer tous les suivants. Le défaut mesuré n'est
+   pas « quatre fragments dont un meurt » : c'est « un mort, un vivant, et le tour se ferme ».
+2. **Les scénarios AC3 et AC4 du § 8 sont infaisables tels qu'écrits en mode conversation** —
+   « quatre fragments tous livrés » ne peut pas exister là-bas. D'où D9.
+3. **Une suppression ne pose aucun `DeliveryOutcome`** (le `continue` précède `execute`), donc
+   elle ne pollue pas le prédicat. Elle en est en revanche invisible — troisième faux négatif,
+   nommé en D3 et rangé hors périmètre.
+
+---
+
+## Décisions
+
+### D1 — Structure, sur les deux moitiés ; le prompt garde une part nommée (AC5)
+
+**Décision : le correctif est structurel, en trois pièces, et la part laissée au prompt est
+la *formulation* de l'aveu, jamais son *déclenchement*.**
+
+Raison. `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate` mesure neuf
+récidives sous application par prompt contre zéro quand le fait est posé par le code
+(mika#2120). Le ticket est un cas d'école : l'information était **déjà** dans le contexte du
+modèle, chiffrée, et il a répondu le contraire. Ajouter une phrase à la Grounding rule
+reviendrait à répéter plus fort ce qui n'a pas marché.
+
+Ce qui reste au prompt, et pourquoi ça ne peut pas être structurel : **dire à l'utilisateur
+ce qui s'est passé**, dans sa langue et dans le registre de sa persona. mika#2290 a établi
+qu'un même fait demande deux formulations (`PersonaProfile::Operator` vs `Family`) et que
+dériver le registre d'un champ technique est un choix produit déguisé. Le moteur ne peut donc
+pas rédiger l'explication ; il peut poser un fait minimal (D5) et refuser une clôture (D4).
+Une ligne d'intention est ajoutée au prompt (§ Changements 5), explicitement comme moitié
+d'intention et non comme garantie.
+
+### D2 — Un canal typé sur `ToolOutput`, pas une relecture de la prose d'erreur
+
+`ToolOutput` gagne `delivery: Option<DeliveryVerdict>`, sur le modèle de
+`substrate_diagnostic` (E6) : posé par `send_message` seul, jamais rendu au LLM, `None`
+partout ailleurs.
+
+```rust
+pub struct DeliveryVerdict {
+    /// The text as it was actually measured and sent — `cleaned`, never the raw
+    /// argument. Posé par `send_message`, jamais relu depuis `arguments` (E9).
+    pub text: String,
+    pub outcome: DeliveryOutcome,
+}
+
+pub enum DeliveryOutcome {
+    Delivered,
+    RefusedTooLong { len_utf16: usize, limit: usize },
+    Failed { reason: String },
+    NoChannel,
+    NoSender,
+}
+```
+
+**Le texte voyage avec le verdict, et c'est une décision, pas un détail de portage.**
+`dispatch.rs` ne détient, sur un envoi **échoué**, aucun texte du tout : son unique site de
+capture est sous `tool_succeeded` et tronqué à 200 caractères (E9). Faire porter le texte par
+le verdict n'est donc pas le meilleur chemin disponible, c'est le **seul** : `send_message` est
+le seul détenteur de `cleaned`, c'est-à-dire du registre qui a effectivement été mesuré, refusé
+ou envoyé. Le coût est nul en surface — c'est le même
+`String` qu'il fallait cloner de toute façon (D7) — et son absence coûterait une annexe fausse
+dans le canal utilisateur, c'est-à-dire le dégât qu'on répare, retourné.
+
+**Six sorties, cinq variantes, et la fusion est délibérée.** `send_message` a six sorties
+portant un verdict de livraison ; `SendOutcome::Failed` (`:93-95`) et `Err(e)` (`:115-118`)
+partagent la variante `Failed`. Raison : le prédicat de D3 et l'annexe de D5 ne font rien de
+la différence — dans les deux cas le contenu est perdu et la réparation est le ré-essai du
+même texte. Les séparer coûterait une variante pour une distinction qu'aucun lecteur
+n'exploite. Ce qui les sépare (`failed_sends` peuplé d'un côté, rien de l'autre — E2) reste
+lisible dans `reason`, qui est déjà la prose du sender.
+
+Raison. Les trois alternatives ont été écartées pour des raisons mesurables :
+
+- **relire `output_summary`** — dépend du format d'un message d'erreur anglais, tronqué
+  (E2), et fait d'une phrase destinée au modèle un format de fil ;
+- **comparer les `input_summary`** — préfixe tronqué, faux « réparé » possible, et l'erreur
+  penche du côté du silence (E8) ;
+- **un ledger sur `ToolContext`** (le motif `pr_review_posted: &AtomicBool`) — il faudrait
+  ajouter un champ à une structure dont **chaque** construction littérale de test énumère
+  tous les champs. `ToolOutput` n'a que des constructeurs (E6) : même information, diff
+  mécanique nul.
+
+`NoChannel` et `NoSender` sont **dans l'enum mais hors du prédicat** (D3) : les énumérer
+coûte deux variantes et rend la population de E3 comptable le jour où quelqu'un l'ouvrira ;
+les omettre obligerait à rouvrir le type.
+
+### D3 — Le prédicat est entièrement structurel : zéro lexique, deux étages
+
+`evidence::guards::undelivered_sends(&[DeliveryRecord]) -> Option<UndeliveredSends>`,
+fonction **pure** (le shape de ses voisines `detect_affirmative_state_claim` /
+`assert_grounded_satisfied`), sur la séquence complète du tour :
+
+```
+étage transport : ∃ R avec outcome = Failed{..}
+                  ET ∄ R' postérieur avec même texte ET outcome = Delivered
+                  → ce contenu-là est perdu
+
+étage refus     : ∃ R avec outcome = RefusedTooLong{..}
+                  ET ∄ R' postérieur avec outcome = Delivered
+                  → rien n'est parti du tout
+```
+
+Les deux étages ont des réparations différentes parce que leurs dégâts le sont (E2) :
+
+- après un **échec transport**, la seule réparation vérifiable est le ré-essai du *même*
+  texte (comparé sur le texte complet capté à la source — d'où D2, et non un préfixe) ;
+- après un **refus de longueur**, la réparation est une découpe dont le moteur ne peut pas
+  vérifier la couverture. Il peut en revanche constater le cas mesuré d'Al : **un refus suivi
+  d'aucun envoi réussi**, c'est-à-dire un document dont rien n'est parti. C'est le prédicat
+  retenu, et il s'éteint dès qu'un fragment part.
+
+**Deux faux négatifs sont nommés, pas cachés**, et ils sont la même limite vue deux fois :
+le moteur sait *qu'un* envoi est parti, jamais *que le contenu refusé* est parti.
+
+- **Couverture partielle.** Un agent qui découpe en quatre, n'envoie que deux parties et dit
+  « voilà tout » passe sous le prédicat.
+- **Suppression par le boundary #771.** Un `send_message` supprimé n'atteint jamais `execute`
+  et ne pose donc aucun verdict (E10) : il est invisible au prédicat. En mode conversation, un
+  agent dont le premier fragment **réussit** voit les suivants supprimés, et le prédicat reste
+  `None` alors que trois fragments ne sont jamais arrivés. Ce trou-là n'est pas un défaut de
+  livraison — le `tool_result` de suppression est explicite et `is_error: true` — c'est le
+  boundary qui décide qu'un tour ne porte qu'un envoi. Nommé ici parce qu'il vit dans le mode
+  exact où le dégât d'Al s'est produit ; rangé hors périmètre parce que le traiter serait
+  rouvrir #771.
+- **Extinction par un envoi sans rapport.** Après un `RefusedTooLong` de 12 000 caractères,
+  un unique « désolé, c'est trop long, je te le résume » de 80 caractères délivré avec succès
+  éteint l'étage refus — alors que le document n'est toujours jamais parti. C'est la forme la
+  plus probable en conditions réelles, et il faut la dire : **le prédicat retenu attrape le cas
+  d'Al tel qu'il s'est produit** (refus, puis affirmation de livraison dans le texte de clôture,
+  sans autre `send_message`), **pas toutes ses variantes**.
+
+Vérifier la couverture demanderait de comparer la concaténation des fragments au texte refusé,
+ce que la reformulation par l'agent (« Partie 1/4 », résumés, transitions) rend impossible par
+construction. **Et un plancher de longueur est délibérément écarté** — exiger que les envois
+réussis postérieurs totalisent une fraction de la longueur refusée fermerait le second cas,
+mais le seuil serait arbitraire et sa direction d'erreur est la mauvaise : un utilisateur qui a
+demandé un résumé recevrait une annexe affirmant une perte qui n'a pas eu lieu, c'est-à-dire
+exactement ce que la halte 4 de la sonde interdit de laisser vivre. Le prédicat reste du côté
+structurel ; l'étage transport, lui, n'a aucun de ces deux trous, puisque sa réparation est
+l'égalité d'un texte avec lui-même.
+
+`Delivered` n'est pas un terme du prédicat isolé : il n'y figure que comme **réparation**.
+Un tour sans aucun échec ne fait entrer aucune donnée dans le prédicat — c'est ce qui rend
+AC4 vrai par construction plutôt que par précaution (D7).
+
+### D4 — La satisfaction du guard est un acte, jamais un aveu reconnu au lexique
+
+Le guard `unacknowledged_send_failure` fire quand le prédicat de D3 est vrai, et **ne cherche
+pas à lire un aveu dans le texte**.
+
+Raison, et c'est le point le plus contre-intuitif du plan. Les guards 5c et 5d utilisent du
+lexique bilingue, mais pour détecter une **violation** : ne pas reconnaître y coûte un faux
+négatif (fail-open). Ici le lexique servirait à reconnaître une **satisfaction** : ne pas
+reconnaître coûterait un re-prompt à chaque agent qui a bien dit la vérité dans des mots
+inattendus, et reconnaître à tort laisserait passer exactement le cas du ticket. On refuse
+donc d'inventer un détecteur d'honnêteté ; la seule satisfaction est structurelle — le
+contenu est reparti, ou le budget de re-prompt est épuisé et D5 prend le relais.
+
+Coût assumé : un tour LLM supplémentaire à chaque échec d'envoi non réparé, **y compris**
+quand l'agent avait déjà bien expliqué. Ce coût ne touche pas le chemin heureux (AC4), il
+touche le chemin de panne, où un tour de plus est le bon défaut.
+
+Position : **6f**, dans la famille inline 6c/6d/6e, budget unique via `intent_guard_retries`
+(label `UNACKNOWLEDGED_SEND_FAILURE_LABEL`), **non** court-circuité par
+`skip_remaining_guards` — une revue de PR postée ne fait arriver aucun message à personne,
+littéralement la même raison que 5c/5d/6c/6d. Miroir obligatoire sur la sortie texte-vide du
+mode silencieux (`agent_loop/mod.rs:3108+`), comme 6(e)/6a/6b : un tour silencieux dont
+l'envoi a échoué se clôt typiquement **sans texte**, ce qui est précisément la forme que la
+panne prend là-bas.
+
+### D5 — Le moteur écrit lui-même le fait quand le budget est épuisé
+
+`AgentOutput.undelivered_sends: Option<UndeliveredSends>` (le champ frère de
+`deadline_exceeded`, E5). Dans `handlers.rs`, **avant** `sender_arc.send(&response)`, une
+ligne factuelle minimale est annexée au texte sortant quand le champ est `Some` :
+
+> ⚠️ 1 message n'a pas pu être délivré (partie 1 : échec du transport). Rien n'a été reçu
+> pour cette partie.
+
+**La formulation est au passé et n'exclut pas une arrivée différée, à dessein.** Un
+`SendOutcome::Failed` est sauvegardé dans `failed_sends` pour un flush ultérieur (E2), donc le
+fragment peut arriver après l'annexe. « Rien n'a été reçu » reste vrai à l'instant où le
+moteur l'écrit ; « ce message n'arrivera pas » serait faux. La nuance n'est pas cosmétique :
+c'est elle qui empêche de lire un flush réussi comme un faux positif de D5 — voir la halte 4
+de la sonde.
+
+Raison. 5d, sur budget épuisé, se contente d'un WARN `..._uncorrected` et laisse passer.
+Diverger ici doit se payer, et ça se paie : pour 5d le dégât d'un budget épuisé est une
+phrase fausse de plus, visible dans le log ; ici le dégât est **un document qui n'est jamais
+arrivé et un destinataire qui croit l'avoir reçu**. Et l'annexe n'est pas une correction du
+modèle : c'est un fait que le moteur a mesuré, du même ordre que le verdict que
+`deadline_verdict` poste lui-même quand le tour n'a pas conclu (E5).
+
+**Le doublon est accepté, explicitement.** Un agent qui a correctement avoué recevra quand
+même la ligne. C'est le prix du refus de D4 (ne pas prétendre reconnaître un aveu), et il
+penche du bon côté : *un doublon est visible et corrigible, un silence ne l'est pas* — même
+forme d'arbitrage que le gate destructif mika#1646. Le doublon est de surcroît confiné : le
+champ n'est `Some` que si **rien** n'a réparé l'échec, donc un agent qui ré-essaie avec
+succès ne voit jamais l'annexe.
+
+**Limite assumée, mode silencieux.** Le texte d'un tour silencieux n'est délivré à personne :
+l'annexe y serait une réparation de façade. Dans ce mode, le résidu est un WARN + une ligne
+`audit_events`, dont le destinataire correct est l'opérateur — un échec de `send_message` en
+mode silencieux signifie justement qu'il n'existe aucun canal vers l'utilisateur pour le lui
+dire.
+
+### D6 — La reformulation du `ToolOutput` est faite, et nommée pour ce qu'elle vaut
+
+Les deux messages d'erreur gagnent une phrase sans ambiguïté (« NOTHING WAS SENT — the user
+has received nothing », « this message was NOT delivered; if you continue with other parts,
+say which part failed »). C'est la piste que le ticket cite en deuxième, et elle est bon
+marché. Mais elle est de la même nature que l'information dont l'agent disposait déjà le
+2026-09-01 : une amélioration du signal, **pas** une garantie. Elle ne porte aucun AC à elle
+seule et le plan ne la compte pas comme telle.
+
+### D7 — Le chemin heureux ne paie rien, et c'est vérifié par un test, pas par une intention
+
+Le prédicat de D3 s'éteint sur un `Vec<DeliveryRecord>` ne contenant aucun `RefusedTooLong`
+ni `Failed` — aucune lecture de texte, aucun appel LLM, aucun tour supplémentaire. Le vecteur
+est vide pour tout tour sans `send_message`.
+
+**Le seul coût du chemin heureux est nommé plutôt qu'affirmé absent** : `DeliveryRecord.text`
+clone le texte de *chaque* envoi, y compris réussi, parce que l'étage transport compare un
+texte mort au texte d'une réparation **postérieure** et ne peut donc pas savoir à l'avance
+lequel il faudra. La borne est dure et petite : `MAX_TOOL_STEPS = 20` × la limite de 4096
+unités UTF-16, soit ~80 Ko par tour au pire, alloués dans le tour et libérés avec lui, sans
+persistance ni sérialisation. Un hash à la place du texte supprimerait ce clone mais rendrait
+une collision indistinguable d'une réparation — donc un silence sur un fragment mort, c'est-à-dire
+le défaut d'origine. Le clone est payé sciemment.
+
+AC4 porte sur le **comportement observable**, et exige de le montrer : un test d'intégration
+assertant qu'une séquence de quatre fragments tous livrés produit exactement un appel LLM de
+clôture, un texte final inchangé octet pour octet, et `undelivered_sends == None`.
+
+### D8 — Le vecteur voyage en `&mut`, pas dans les trois variantes de `LoopResult`
+
+`run_loop` reçoit `delivery_log: &mut Vec<DeliveryRecord>`, le passe à `process_tool_calls`
+(qui a déjà exactement ce motif pour `send_message_boundary_active: &mut bool` et
+`send_message_text_capture: &mut String`, `dispatch.rs:347-360`), et les trois appelants le
+créent puis le lisent après le retour.
+
+Raison. `LoopResult` a trois variantes portant chacune un `Vec<ToolCallSummary>` ; y ajouter
+un champ ferait trois écritures à tenir synchrones. Le `&mut` donne en outre gratuitement la
+couverture des sorties `MaxStepsExceeded` et `DeadlineExceeded` — un tour coupé par son
+enveloppe après un envoi mort doit annexer le fait tout autant qu'un tour qui conclut.
+Précédent de threading à trois sites : `loaded_skill_names` (mika#2355).
+
+### D9 — Le mode de chaque scénario de test est imposé, parce que le boundary le décide
+
+**Décision : les scénarios multi-fragments tournent en `LoopMode::Silent`, et le rejeu du cas
+d'Al en `LoopMode::Conversation`.**
+
+Raison. E10 mesure qu'en mode conversation un seul `send_message` réussi existe par tour :
+« quatre fragments tous livrés » n'y est pas un scénario difficile, c'est un scénario
+**impossible**, et un implémenteur qui écrirait AC4 sous cette forme perdrait un cycle à
+débugger une suppression légitime. Le mode silencieux est exempté du boundary (`:156`,
+conditionné à `conversation_mode`), donc c'est là que vit une vraie séquence multi-envois — et
+c'est aussi le mode où D5 ne peut pas annexer (sa limite déjà nommée), ce qui rend la
+distinction utile plutôt que commode.
+
+Conséquence sur la répartition : AC3 et AC4 portent sur le **prédicat** et sa neutralité, donc
+en `Silent` où la séquence existe. AC6-a et AC6-b rejouent le **dégât** — qui est arrivé sur
+Telegram, en conversation — et s'y tiennent : AC6-b est dès lors « un fragment mort, puis un
+second envoi qui passe, puis clôture », ce qui est la forme exacte du 2026-09-01 (E10-1) et
+non un affaiblissement du scénario.
+
+---
+
+## Changements
+
+### 1. `crates/mika-agent/src/tools/mod.rs`
+
+- `ToolOutput.delivery: Option<DeliveryVerdict>` + `DeliveryVerdict` + `DeliveryOutcome` (D2).
+  `None` dans les constructeurs existants (`success`, `error`, `success_with_images`,
+  `substrate_unavailable`, …) ; nouveau constructeur
+  `ToolOutput::delivery(content, is_error, text, outcome)` — le `text` est un paramètre du
+  constructeur précisément pour qu'aucun site ne puisse poser un verdict sans dire de quel
+  texte il parle (E9).
+- Doc de champ sur le modèle de `substrate_diagnostic` : jamais sérialisé vers le LLM, canal
+  outil→moteur.
+
+### 2. `crates/mika-agent/src/tools/send_message.rs`
+
+- **Les six sorties** posent leur `DeliveryVerdict` — y compris `Delivered`, `NoChannel`,
+  `NoSender`, et `Err(e)` du sender qui se range sous `Failed` (D2). Les deux sorties qui ne
+  sont pas des verdicts de livraison (`'text' is required` `:44`, texte vide après
+  strip-tags `:50`) restent à `None` : rien n'a été tenté, il n'y a pas d'échec à acquitter.
+- **Le `text` du verdict est `cleaned`, sur les six sorties sans exception** (E9) — y compris
+  `RefusedTooLong`, dont la garde mesure `cleaned` et non l'argument brut. Un test épingle
+  l'invariant sur une entrée portant un tag interne : le verdict doit porter le texte
+  post-strip, sans quoi un ré-essai ne serait jamais reconnu comme réparation.
+- Reformulation des deux messages d'erreur (D6). La garde de longueur et son test de borne
+  (`accepte_4096_a_la_borne`, `fenetre_5000_refusee_par_l_outil`) sont **inchangés** :
+  mika#2134 est en amont et hors périmètre.
+- Tests : chaque sortie pose l'outcome attendu ; le contrôle négatif 4095/4096 reste vert.
+
+### 3. `crates/mika-agent/src/tool_execution/dispatch.rs`
+
+- Nouveau paramètre `delivery_log: &mut Vec<DeliveryRecord>` (D8), à côté de
+  `send_message_boundary_active`. Quand `output.delivery` est `Some`, pousse
+  `DeliveryRecord { step, text, outcome }` en **reprenant le texte du verdict** — jamais
+  `arguments.get("text")`, qui est le registre brut et non celui qui a été mesuré puis envoyé
+  (E9). Texte complet, aucune troncature (E8). Le champ ne quitte jamais le tour et n'est pas
+  persisté.
+- **La suppression boundary (`:156`) ne pousse rien**, et n'a besoin d'aucun geste : son
+  `continue` précède `execute`, donc aucun verdict n'existe (E10-3). À ne pas « réparer » en
+  synthétisant un record — un envoi supprimé n'a pas échoué à la livraison, il n'a pas été
+  tenté, et le compter ferait mentir `failed_count` sur le nombre lu par l'utilisateur.
+- Interaction avec le dedup per-tour (#582) : **le mécanisme existe déjà et se réemploie tel
+  quel**. Le chemin de replay clone le `ToolOutput` caché puis efface ce qui ne doit pas être
+  ré-émis (`reused.images.clear()`, `:211-212`, avec sa raison écrite) ; `delivery` rejoint
+  cette liste — `reused.delivery = None`. Sans ce geste, le clone porterait le `delivery` de
+  l'appel d'origine et pousserait un **second** `DeliveryRecord` pour un outil qui n'a tourné
+  qu'une fois : le prédicat de D3 resterait juste (un `Failed` dupliqué reste un `Failed`),
+  mais `failed_count` compterait deux fragments morts là où il y en a un, et l'annexe lue par
+  l'utilisateur serait fausse sur le nombre. Test dédié.
+
+### 4. `crates/mika-agent/src/evidence/guards.rs`
+
+- `DeliveryRecord`, `UndeliveredSends`, `undelivered_sends(&[DeliveryRecord]) -> Option<UndeliveredSends>` (D3),
+  fonction pure.
+- `UndeliveredSends` porte de quoi rédiger le re-prompt et l'annexe sans relire le texte :
+  nombre, index de l'envoi dans la séquence, étage (`RefusedTooLong` / `Failed`), raison,
+  préfixe court (80 car.) du contenu perdu.
+- Tests unitaires (AC1/AC3/AC4) : séquence vide ; tout livré ; un fragment mort au milieu de
+  trois réussis ; un fragment mort **suivi** de son ré-essai réussi (→ `None`) ; refus de
+  longueur suivi de quatre fragments réussis (→ `None`) ; refus de longueur suivi de rien
+  (→ `Some`) ; deux fragments morts (comptage) ; texte identique envoyé deux fois dont un
+  seul réussit ; **refus de longueur suivi d'un unique envoi court sans rapport** (→ `None`) —
+  ce dernier **épingle le faux négatif de D3 au lieu de le laisser dériver** : le jour où
+  quelqu'un voudra le fermer, ce test rougit et le nomme, plutôt que de laisser croire que le
+  prédicat couvrait déjà le cas.
+
+### 5. `crates/mika-agent/src/agent_loop/mod.rs`
+
+- `run_loop` : paramètre `delivery_log: &mut Vec<DeliveryRecord>`, threadé aux trois sites
+  d'appel (conversation, silent, team) (D8).
+- Guard **6f** `unacknowledged_send_failure` après 6e : détection par `undelivered_sends`,
+  budget unique `intent_guard_retries`, `guard_correlation_id` + WARN
+  `event = "guard.unacknowledged_send_failure"` sur `target: "mika::otel"` (famille #953),
+  re-prompt nommant l'étage, l'index du fragment et son préfixe. **Non** court-circuité par
+  `skip_remaining_guards`.
+- Miroir sur la sortie texte-vide du mode silencieux (D4).
+- Résidu : `guard.unacknowledged_send_failure_uncorrected` (WARN) quand le budget est épuisé,
+  sur le modèle de 5d.
+- `AgentOutput.undelivered_sends: Option<UndeliveredSends>` (D5), renseigné sur les trois
+  sorties, doc rédigée sur le modèle de `deadline_exceeded`.
+- Une ligne d'intention dans le prompt reste **hors** de ce fichier (§ 7).
+
+### 6. `crates/mika-agent/src/server/handlers.rs`
+
+- Annexe de la ligne factuelle avant `sender_arc.send(&response)` (`:1541`), dans le même
+  voisinage que `post_deadline_verdict_if_cut_off` (`:1537`) (D5, E5). Deux registres
+  (`PersonaProfile::Operator` / `Family`) par `match` exhaustif sans `_ =>`, modèle mika#2290.
+- **Chemin d'accès de la persona, à ne pas chercher :** `handlers.rs` n'importe aujourd'hui
+  aucun `PersonaProfile` (`grep` : zéro occurrence), mais il porte déjà le tier — `a.tier` et
+  `a.deployment` sont lus à `:1493` pour construire le contexte de prompt. Le registre est donc
+  `a.tier.persona_profile()` (`mika_common::home`, `:137`), le même convertisseur que
+  `prompt.rs`, sans nouveau champ sur `AgentState` ni nouvelle dérivation.
+- Cas `output.text == None` : l'annexe remplace `EMPTY_RESPONSE_FALLBACK` plutôt que de s'y
+  ajouter — un tour muet dont l'envoi a échoué doit dire l'échec, pas « je n'ai rien à dire ».
+- INFO `send_failure_annexed` + ligne `audit_events` (`tool_name = 'undelivered_send_annexed'`,
+  **SOLE WRITER**).
+
+### 7. `crates/mika-agent/src/prompt.rs`
+
+- Extension d'une phrase à la **Grounding rule** (`:1310`) : un `tool_result` d'envoi en
+  erreur signifie que *rien n'est arrivé* ; ne jamais annoncer une livraison qu'un outil a
+  refusée, et nommer le fragment échoué avant de passer au suivant. Moitié d'intention,
+  déclarée comme telle (D1). Carve-out `build_compact_system_prompt` (≤5 Ko) inchangé — comme
+  pour 5d, la garde lit le texte sortant, pas le prompt.
+
+### 8. `crates/mika-agent/tests/eval/test_undelivered_send_2136.rs` (nouveau)
+
+Enregistré dans `tests/eval/mod.rs` (gardé par `test_eval_modules_declared.rs`). Quatre
+scénarios sur `run_agent` via `EvalHarness` + `MockLlmProvider` + un `MessageSender` scripté
+(E7) :
+
+- **AC6-a** — rejeu du 2026-09-01, étage 1 : envoi de 12 000 caractères refusé, puis réponse
+  scriptée « Le voici en entier 👆 » ⇒ le tour est refusé une fois ; sur la seconde clôture
+  non réparée, `undelivered_sends` est `Some` et le texte délivré porte le fait. **Le scénario
+  ne contient aucun autre `send_message`, et c'est fidèle au cas mesuré, pas une commodité** :
+  Al n'a rien reçu du tout. Un scénario qui glisserait un message d'excuse délivré entre le
+  refus et la clôture passerait sous le faux négatif nommé en D3 — le test le dit en commentaire
+  pour que personne ne le « répare » en le rendant vert par accident.
+- **AC6-b** — rejeu du 2026-09-01, étage 2, en `LoopMode::Conversation` (D9) : la partie 1/4
+  échoue au transport, la partie 2/4 passe, réponse scriptée qui enchaîne sur « Partie 2/4 »
+  sans rien dire ⇒ refus, puis annexe nommant la partie 1. **Le scénario s'arrête à deux
+  envois, et c'est la forme exacte du cas mesuré, pas une simplification** : le boundary #771
+  s'arme sur le succès de la partie 2 et supprimerait les parties 3 et 4 (E10-1). Un test
+  écrit avec quatre envois échouerait sur une suppression légitime et ferait chercher le
+  défaut au mauvais endroit — le commentaire du test le dit.
+- **AC3** — en `LoopMode::Silent` (D9, où le boundary ne s'applique pas) : l'échec du premier
+  fragment n'est pas masqué par la réussite des trois suivants (assertion sur la séquence, pas
+  sur un envoi isolé).
+- **AC4** — contrôle négatif, en `LoopMode::Silent` pour la même raison : quatre fragments tous
+  livrés ⇒ `undelivered_sends == None`, aucun appel LLM supplémentaire (comptage sur le
+  `MockLlmProvider`), texte final identique octet pour octet à la réponse scriptée, zéro
+  occurrence du vocabulaire d'échec.
+- **AC4-bis** — contrôle négatif du chemin nominal en conversation : un envoi unique livré ⇒
+  mêmes assertions. Sans lui, AC4 n'attesterait la neutralité que dans un mode où l'annexe de
+  D5 ne s'applique pas, et le chemin d'Al réussi resterait non couvert.
+
+### 9. `crates/mika-agent/CLAUDE.md` + `mika/CLAUDE.md`
+
+Guard 6f dans la liste des post-conditions ; `undelivered_sends` dans la doc d'`AgentOutput` ;
+les trois signaux opérateur ; les **deux** faux négatifs de D3 écrits là où on les cherchera —
+en particulier que l'absence d'annexe ne prouve pas qu'un document est arrivé.
+
+---
+
+## Surfaces opérateur
+
+Journal (`$MIKA_SPIRIT_LOG_FILE`) :
+
+- `guard.unacknowledged_send_failure` (WARN, famille #953 — champs `stage`, `failed_index`,
+  `failed_count`, `guard_correlation_id`, joignable à `guard.correction_accepted`).
+  **Régime attendu : non nul mais faible.** Chaque ligne est un envoi mort que l'agent
+  s'apprêtait à taire. Un flot soutenu ne se traite pas en élargissant la garde : il dit que
+  le gateway ou Telegram refuse, et c'est ça qu'il faut traiter.
+- `guard.unacknowledged_send_failure_uncorrected` (WARN) — le budget est épuisé, D5 a pris le
+  relais. **Régime attendu : proche de zéro.** Sustained sur un même agent = le modèle
+  n'utilise pas le re-prompt, et c'est la moitié D4 qu'il faut interroger, pas D5.
+- `send_failure_annexed` (INFO) — le moteur a écrit le fait lui-même.
+
+SQL :
+
+```sql
+SELECT count(*) FROM audit_events WHERE tool_name = 'undelivered_send_annexed';
+```
+
+**SOLE WRITER** : `handlers.rs` est le seul site écrivant ce `tool_name`. Son **absence**
+sous une plainte utilisateur est donc une information — elle dit que l'envoi n'a pas échoué
+là où on le croit, et renvoie vers `NoChannel` (E3) ou vers le gateway.
+
+---
+
+## Sonde post-déploiement, et sa halte
+
+Sur 7 jours :
+
+1. `grep guard.unacknowledged_send_failure $MIKA_SPIRIT_LOG_FILE | jq '{stage, failed_count}'` —
+   la distribution par étage dit laquelle des deux moitiés porte le trafic réel. Si l'étage
+   `RefusedTooLong` domine largement, la garde de longueur de mika#2134 est franchie
+   quotidiennement et c'est **son** seuil qu'il faut réinterroger, pas cette garde-ci.
+2. `SELECT count(*) FROM audit_events WHERE tool_name = 'undelivered_send_annexed';` — chaque
+   ligne est une annexe lue par un utilisateur.
+3. **Halte.** Si un utilisateur signale à nouveau un document annoncé et jamais reçu alors que
+   les trois greps sont **vides**, ne pas élargir le prédicat : l'envoi a réussi du point de
+   vue du moteur et la perte est en aval (gateway, Telegram, mika#2126 côté rendu) ou dans la
+   population `NoChannel` de E3. Établir lequel vient d'abord.
+4. **Halte (faux positif), et son piège.** Si l'annexe apparaît sur un tour où tout est bien
+   arrivé, désarmer D5 et réparer le prédicat de D3 — une annexe fausse dans le canal
+   utilisateur est un dégât du même ordre que celui qu'on répare, et ne se rattrape pas par un
+   seuil. **Mais vérifier d'abord le flush de `failed_sends`** (E2) : un fragment `Failed` puis
+   délivré par le flush arrive *après* l'annexe, et l'utilisateur voit alors une annexe suivie
+   du message qu'elle disait manquant. Ce n'est **pas** un faux positif — l'annexe disait vrai
+   à l'instant où elle a été écrite (D5) — et désarmer D5 pour cette raison rouvrirait le
+   défaut d'origine. Le discriminant est une ligne de flush postérieure au tour sur le même
+   contenu ; en son absence seulement, le faux positif est réel.
+
+---
+
+## Hors périmètre, délibérément
+
+- **La fenêtre 4096 / 10 000** — mika#2134, en amont et livrée. Ce plan ne touche ni la borne,
+  ni sa mesure en unités UTF-16, ni ses tests.
+- **`SendOutcome::NoChannel` et l'absence de sender** (E3) — vraie population de « livraison
+  affirmée sans livraison », mais les rendre `is_error` rouvrirait la boucle de ré-essai que
+  #650 a fermée sur une condition permanente, et la garde de régression mika#1090 l'interdit
+  nommément. Les deux variantes sont **dans** l'enum de D2 pour que cette population soit
+  comptable le jour où elle aura son ticket ; elles ne sont pas dans le prédicat de D3.
+- **La couverture d'une découpe et l'extinction par un envoi sans rapport** (deux des trois
+  faux négatifs nommés en D3) — demandent une comparaison sémantique entre un texte refusé et
+  des fragments reformulés, ou un seuil de longueur arbitraire dont l'erreur pencherait du côté
+  de l'annexe fausse. Frontière assumée, épinglée par un test unitaire.
+- **Le boundary de tour #771** (le troisième faux négatif, E10) — en mode conversation, un
+  premier fragment réussi fait supprimer les suivants, qui n'arrivent jamais et restent
+  invisibles au prédicat. C'est une décision de #771 sur le nombre d'envois par tour, pas un
+  échec de livraison, et son `tool_result` est explicite. Le rouvrir ici mélangerait deux
+  questions ; il mérite son propre ticket si la découpe multi-fragments doit devenir un usage
+  soutenu en conversation.
+- **La taxonomie de `google-workspace`** — mika#2118. **Le markdown Telegram** — mika#2126.
+- **`failed_sends` et son flush** — le mécanisme de reprise existe et n'est pas touché ; ce
+  plan porte sur ce que l'agent *dit* du tour en cours, pas sur la re-livraison différée.
+- **Une refonte de la véracité de l'agent** — le ticket l'exclut, ce plan aussi.
+
+---
+
+## Fire-Disposition
+
+Trois livrables de classe détecteur : (1) le guard EndTurn **6f**
+`unacknowledged_send_failure`, dont le chemin de succès est « aucune violation trouvée » ;
+(2) le prédicat structurel `undelivered_sends(&[DeliveryRecord])` (D3) ; (3) les suites de
+tests unitaires (§ 4) et d'intégration (§ 8).
+
+**Disposition : option (a), allowlist nommée — avec une liste vide. Aucune exception n'est
+écrite, et cette absence est un choix explicite, pas un oubli.**
+
+**La population préexistante est vide par construction, pas par chance.** Le
+`Vec<DeliveryRecord>` sur lequel le prédicat statue naît au premier pas du tour et meurt avec
+lui : il voyage en `&mut` et n'est porté par aucune variante de `LoopResult` (D8), il n'est ni
+persisté ni sérialisé (D7, § 3), et `ToolOutput.delivery` n'est jamais rendu au LLM (D2, E6).
+Au déploiement il n'existe donc **aucune** donnée en base, aucun fichier de l'arbre et aucune
+ligne de journal sur lesquels le détecteur puisse fire rétroactivement ; les tours en vol ne
+survivent pas au redémarrage du process. C'est ce qui sépare ce détecteur de la famille de
+l'incident fondateur de mika#1574 (`verify-bundled-skills`, qui balaie un corpus existant de
+manifestes) : ici une allowlist non vide n'aurait pas un seul membre à nommer.
+
+**Et l'état d'avant n'était pas une violation.** Le 2026-09-01, aucune règle n'était
+enfreinte : il n'y avait pas de règle. E1 le mesure — `grep -c "send_message"
+crates/mika-agent/src/evidence/guards.rs` rend `0`, aucun des onze guards ne regardait la
+livraison. Le guard 6f est donc **bloquant dès le land, sans exemption ni période de grâce** :
+grandfatherer quoi que ce soit reviendrait à exempter d'une règle neuve un comportement qui
+n'a jamais été gardé, c'est-à-dire à écrire une exception dont le prédicat n'aurait pas de
+population.
+
+**Ce que le détecteur fait au premier tour post-déploiement, et pourquoi ce n'est pas un
+incident.** Un tour dont un envoi a échoué sans réparation coûte un re-prompt (D4) et, budget
+épuisé, l'annexe factuelle de D5 — sur des tours **neufs**, et sur eux seuls. C'est l'effet
+recherché, et le régime attendu est déjà écrit en § Surfaces opérateur : non nul mais faible.
+Un flot soutenu ne serait pas un fire sur des données historiques — il n'en existe pas — mais
+un transport en panne, et la **halte 3** de la sonde dit où regarder plutôt que d'élargir ou de
+relâcher la garde.
+
+**Aucun risque de CI rouge au land.** La seule surface CI de ces trois livrables est leurs
+propres tests, qui construisent leurs fixtures (§ 4 : séquences de `DeliveryRecord`
+littérales ; § 8 : `EvalHarness` + `MockLlmProvider` + `MessageSender` scripté, E7). Aucun
+n'est un scan de l'arbre source — contrairement à la garde structurelle de mika#2131 — donc
+aucune donnée du dépôt ne peut les faire rougir. Le contrôle négatif 4095/4096 de mika#2134
+reste vert sans être touché (§ 2).
+
+**L'assertion auto-nettoyante est sans objet, et il faut le dire plutôt que la simuler.** La
+doctrine l'exige *par entrée d'allowlist* ; à liste vide il n'y a aucune entrée à faire périmer
+et aucun ticket de suivi à référencer. Ce qui tient la discipline à sa place est le contrôle
+négatif **AC4 / AC4-bis** (§ 8, D7) : il rougit si le détecteur se met à fire sur un tour
+entièrement livré — c'est-à-dire précisément l'événement qu'une exception aurait masqué.
+
+**Pas de kill-switch, et c'est aligné sur la maison.** Aucun des onze guards EndTurn n'en
+porte : `grep MIKA_ crates/mika-agent/src/evidence/guards.rs` ne rend qu'une fenêtre de temps
+(`MIKA_DEV_REPEAT_ACTION_WINDOW_SECS`, mika#1646) et jamais un désarmement. La sortie de
+secours d'un fire massif est le revert du guard, pas une variable d'environnement : en poser
+une ici donnerait un moyen de rendre muette la seule protection du destinataire, quand la
+**halte 4** de la sonde traite déjà le seul cas où désarmer se justifie — et impose de désarmer
+D5 **et** de réparer D3, jamais de désarmer sans réparer.
+
+---
+
+## Definition of Done
+
+- **Aucune allowlist, aucune exception, aucun kill-switch ajoutés** : la disposition de
+  § Fire-Disposition est l'option (a) à liste vide, vérifiable par la seule lecture du diff.
+- `ToolOutput.delivery` posé par les **six** sorties de livraison de `send_message` (dont
+  `Err(e)` → `Failed`), `None` sur les deux sorties qui ne tentent aucune livraison et partout
+  ailleurs, jamais sérialisé vers le LLM, et effacé sur le chemin de replay du dedup (§ 3).
+- Le `text` du verdict est `cleaned` sur les six sorties, épinglé par un test sur une entrée
+  portant un tag interne (E9) ; `dispatch.rs` ne lit jamais `arguments.get("text")` pour le
+  record.
+- Le mode de chaque scénario du § 8 est celui que D9 impose, et le test AC6-b porte en
+  commentaire la raison pour laquelle il s'arrête à deux envois.
+- `undelivered_sends` est une fonction pure, couverte par les neuf cas unitaires listés en § 4,
+  dont celui qui épingle le faux négatif de D3 plutôt que de le laisser dériver.
+- Guard 6f en place avec son miroir texte-vide, son budget unique et sa télémétrie #953.
+- `AgentOutput.undelivered_sends` renseigné sur les trois sorties, y compris
+  `DeadlineExceeded` et `MaxStepsExceeded`.
+- Annexe posée dans `handlers.rs` avant l'envoi, deux registres par `match` exhaustif.
+- `test_undelivered_send_2136.rs` : quatre scénarios verts, dont le contrôle négatif AC4
+  assertant l'absence de tour supplémentaire.
+- `cargo test -p mika-agent`, `cargo clippy`, `cargo fmt --all -- --check` verts.
+- `crates/mika-agent/CLAUDE.md` et `mika/CLAUDE.md` à jour ; `docs-sync` vert si `docs/` bouge.
+- Aucun changement de comportement sur un tour sans `send_message` en échec — attesté par AC4,
+  pas affirmé.
+
+---
+
+## Acceptance criteria
+
+Transcrits depuis le corps de senara-solutions/mika#2136.
+
+- **AC1** — Quand un `send_message` rend `is_error == true`, l'état du tour porte cet échec de
+  façon **lisible par le moteur**, pas seulement par le modèle. Test unitaire.
+- **AC2** — Un tour ne peut pas se clore sur un envoi échoué **non acquitté** sans que le
+  moteur l'ait constaté. La forme de la contrainte est à trancher au grooming ; la décision et
+  sa raison sont écrites.
+- **AC3** — Sur une séquence multi-fragments dont un fragment échoue, l'échec est signalé et
+  n'est pas masqué par la réussite des suivants. Test sur la séquence, pas sur un envoi isolé.
+- **AC4** — **Contrôle négatif** : une séquence dont tous les fragments passent ne produit
+  **aucune** mention d'échec et aucun tour supplémentaire. Un correctif qui alourdirait le
+  chemin heureux n'aurait pas réparé, il aurait taxé.
+- **AC5** — La décision « structure vs prompt » est prise et écrite, avec sa raison. Si une
+  part reste au prompt, dire laquelle et pourquoi elle ne peut pas être structurelle.
+- **AC6** — Preuve de non-vacuité : rejouer la séquence du 2026-09-01 — un envoi refusé pour
+  longueur, puis une découpe dont le premier fragment échoue — et montrer que ni l'affirmation
+  de livraison ni le silence sur le fragment ne sont plus possibles.
+
+Correspondance : AC1 → D2 + § 4 (tests unitaires du prédicat) ; AC2 → D4 (guard 6f) + D5
+(`AgentOutput.undelivered_sends`, le constat porté au-delà du tour) ; AC3 → D3 (prédicat sur
+la séquence) + § 8 scénario AC3 ; AC4 → D7 + § 8 scénarios AC4 et AC4-bis ; AC5 → D1 ; AC6 →
+§ 8 scénarios AC6-a et AC6-b, dont D9 fixe le mode.
+
+---
+
+## Revision history
+
+- **rev 2 (2026-09-18)** : adressé **F1** (BLOCKING, citation mika#1574 Fire-Disposition Gate)
+  par l'ajout d'une section `## Fire-Disposition` qui énumère les trois livrables de classe
+  détecteur (guard 6f, prédicat `undelivered_sends`, suites de tests § 4 / § 8) et nomme
+  l'option canonique **(a) allowlist nommée, liste vide**, comme le demandait le (b) du
+  finding. La section écrit les quatre points qui font tenir cette disposition plutôt que de
+  l'affirmer : (i) la population préexistante est vide **par construction** — le
+  `Vec<DeliveryRecord>` naît et meurt avec le tour (D7/D8, § 3), donc rien en base, dans
+  l'arbre ou dans les journaux ne peut faire fire le détecteur rétroactivement, ce qui sépare
+  ce cas de l'incident fondateur `verify-bundled-skills` de mika#1574 ; (ii) **l'absence
+  d'exception est un choix explicite**, motivé par E1 (`grep -c "send_message"
+  .../guards.rs` = 0) — l'état d'avant était un comportement non gardé, pas la violation d'une
+  règle existante, donc rien à grandfatherer ; (iii) l'assertion auto-nettoyante qu'exige la
+  doctrine est **sans objet à liste vide**, et c'est le contrôle négatif AC4 / AC4-bis (§ 8,
+  D7) qui tient sa place en rougissant si le détecteur fire sur un tour sain ; (iv) **pas de
+  kill-switch**, aligné sur les onze guards EndTurn existants (aucune variable de désarmement
+  dans `guards.rs`), la sortie de secours restant le revert et la halte 4 de la sonde.
+  Ajout corollaire d'une ligne de *Definition of Done* rendant la disposition vérifiable par
+  lecture du diff. Aucun AC n'a été modifié ni affaibli ; aucune autre section n'a été
+  réécrite.

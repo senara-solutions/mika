@@ -7,7 +7,7 @@ use regex::Regex;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info, warn};
 
 /// Typed dispatch errors so callers can match on specific failure modes
@@ -285,6 +285,21 @@ pub struct TaskDispatcher {
     pub skills: Arc<SkillRegistry>,
     pub message_sender: Option<Arc<dyn MessageSender>>,
     pub home_dir: PathBuf,
+    /// Le home **global** (`~/.mika`), pas celui de l'agent (mika#2329).
+    ///
+    /// [`Self::home_dir`] est per-agent (`server/mod.rs` le construit avec
+    /// `agent_home.to_path_buf()`), et le précédent maison des fichiers d'état est
+    /// global : `dispatch-lib.sh` écrit `$HOME/.mika/state/pilot-gitconfig` et
+    /// `${MIKA_HOME:-$HOME/.mika}/state/pr-origin-epoch`. Un STOP global doit se
+    /// poser à un endroit unique, pas une fois par agent.
+    ///
+    /// Câblé depuis le paramètre `global_home` d'`init_agent`, qui construit le
+    /// dispatcher dans la même fonction. Deux pièges évités en le disant : dériver
+    /// le global par `../..` depuis l'agent home (fragile, et faux dès que la
+    /// disposition change), ou appeler `resolve_home_dir()` au tick — qui relit
+    /// `MIKA_HOME`/`HOME` et réintroduirait exactement la dépendance à
+    /// l'environnement que ce ticket retire (précédent du piège : mika#1968).
+    pub global_home_dir: PathBuf,
     pub embedding_client: Option<EmbeddingClient>,
     pub brave_api_key: Option<String>,
     pub github_token: Option<String>,
@@ -313,6 +328,19 @@ pub struct TaskDispatcher {
     /// Session-scoped PR review dedup map (#821). Shared with `AppState`.
     /// Entries evicted at each `end_session()` callsite.
     pub pr_reviews_posted: Option<Arc<dashmap::DashMap<String, std::collections::HashSet<String>>>>,
+    /// Dernier état connu de l'interrupteur STOP d'`auto_pull` (mika#2329).
+    ///
+    /// Sert **uniquement** à détecter une transition, pour écrire une ligne
+    /// `audit_events` à l'armement et à la levée plutôt qu'à chaque tick
+    /// (doctrine mika#2131 : l'information durable est « le STOP a été armé à
+    /// telle heure », pas « il l'était encore à 14 h 32 »).
+    ///
+    /// `AtomicBool` parce que le dispatcher vit dans un `Arc` et que le
+    /// court-circuit est derrière `&self`. **L'état est perdu au redémarrage, à
+    /// dessein** : un process neuf re-photographie l'état qu'il trouve et écrit
+    /// une transition si le STOP est armé au premier tick — même raisonnement que
+    /// le jeu de déduplication mika#2131.
+    pub auto_pull_stop_armed: AtomicBool,
 }
 
 impl TaskDispatcher {
@@ -1175,6 +1203,51 @@ impl TaskDispatcher {
         Ok(())
     }
 
+    /// Écrit une ligne `audit_events` à chaque **transition** de l'interrupteur
+    /// STOP d'`auto_pull` — jamais à chaque tick (mika#2329 D5).
+    ///
+    /// La ligne INFO par tick dit « le STOP est armé maintenant » ; cette
+    /// ligne-ci dit « le STOP a été armé à telle heure », qui est l'information
+    /// durable et la réponse directe à « la boucle a-t-elle été arrêtée pendant
+    /// cet incident, et de quand à quand ? ». Écrire 144 lignes/jour en audit
+    /// déplacerait dans la table le churn que la doctrine mika#2131 borne.
+    ///
+    /// **SOLE WRITER** de `tool_name = 'auto_pull_stop'`. L'écriture est
+    /// fire-and-forget : un échec d'audit ne doit pas changer le verdict du
+    /// court-circuit — l'interrupteur mord même si la table est illisible.
+    async fn record_auto_pull_stop_transition(&self, task: &Task, state: &str) {
+        if let Err(e) = self
+            .db
+            .log_audit_event(
+                // Underscores, comme le `tool_name` et le nom d'événement — et
+                // surtout pas le littéral du chemin du fichier, que la garde
+                // structurelle T7 réserve à `auto_pull_stop.rs`.
+                &format!("auto_pull_stop-{}", task.id),
+                "auto_pull_stop",
+                "scan:auto_pull_groomed",
+                None,
+                Some(state),
+                Some(&format!(
+                    "fichier sentinelle : {}",
+                    crate::auto_pull_stop::stop_file_path(
+                        &self.global_home_dir,
+                        crate::auto_pull_stop::AUTO_PULL_SCAN,
+                    )
+                    .display()
+                )),
+                None,
+            )
+            .await
+        {
+            warn!(
+                task_id = %task.id,
+                state = %state,
+                error = %e,
+                "failed to record auto_pull_stop transition"
+            );
+        }
+    }
+
     /// Run the auto-pull groomed ticket logic (mika#1363).
     ///
     /// This does NOT run a silent agent turn — it directly executes the
@@ -1182,6 +1255,88 @@ impl TaskDispatcher {
     /// label on the selected ticket. The webhook-driven dispatch flow then
     /// picks up the labelled ticket.
     async fn dispatch_auto_pull_groomed(&self, task: &Task) -> Result<()> {
+        // mika#2329 — court-circuit STOP, en TÊTE et avant toute résolution de
+        // token. Placement raisonné : ce qui suit résout deux tokens (PAT puis
+        // repli App, donc potentiellement un échange App sur le réseau, puis une
+        // seconde résolution pour l'identité de label — mika#2228) avant d'appeler
+        // `auto_pull_groomed_ticket`, dont les deux premières instructions sont
+        // deux fetchs `gh`. Placer la garde plus bas ferait payer au STOP deux
+        // résolutions de token par tick pour rien. Précédent de placement au
+        // raisonnement littéralement identique : la porte 2c de mika#2279, placée
+        // avant `gh issue view` parce que « le prédicat lit l'URL de l'issue,
+        // jamais son corps ».
+        //
+        // La row récurrente n'est **jamais** touchée : ni annulée, ni marquée, ni
+        // reprogrammée. C'est son dispatch qui rend la main. La réversibilité
+        // n'est donc pas une machinerie, c'est l'absence de machinerie — aucun
+        // contact avec la garde anti-zombie mika#1742, ni avec l'exemption
+        // config-cancel mika#2271, ni avec `RECURRING_ZOMBIE_GRACE_HOURS`. Rien à
+        // ressusciter, donc rien qui puisse refuser de ressusciter. (Le mécanisme
+        // boot-time, lui, annule la row : c'est exactement ce qui a coûté
+        // mika#2271 et sa machinerie de réparation, encore en place.)
+        if crate::auto_pull_stop::is_stopped(
+            &self.global_home_dir,
+            crate::auto_pull_stop::AUTO_PULL_SCAN,
+        ) {
+            let was_armed = self.auto_pull_stop_armed.swap(true, Ordering::Relaxed);
+            // INFO **à chaque tick**, comme le ticket l'exige explicitement : pour
+            // un interrupteur, la vivacité EST l'information — un opérateur qui
+            // grep veut savoir que le STOP est armé *maintenant*, pas qu'il l'a été
+            // un jour. Un STOP prolongé écrit 144 lignes/jour et c'est voulu.
+            // Précédent assumé et identiquement raisonné : Signal P (mika#2156),
+            // où une ligne par minute pendant qu'un dispatch tourne est « attendu,
+            // pas une fuite ».
+            info!(
+                task_id = %task.id,
+                stop_file = %crate::auto_pull_stop::stop_file_path(
+                    &self.global_home_dir,
+                    crate::auto_pull_stop::AUTO_PULL_SCAN,
+                ).display(),
+                event = "auto_pull_stop_armed",
+                "auto_pull: STOP armé — tick court-circuité, aucune row touchée"
+            );
+            if !was_armed {
+                self.record_auto_pull_stop_transition(task, "armed").await;
+            }
+            return Ok(());
+        }
+        if self.auto_pull_stop_armed.swap(false, Ordering::Relaxed) {
+            info!(
+                task_id = %task.id,
+                event = "auto_pull_stop_lifted",
+                "auto_pull: STOP levé — reprise du feeder"
+            );
+            self.record_auto_pull_stop_transition(task, "lifted").await;
+        }
+
+        // mika#2329 D4 — le piège vécu, fermé par un WARN plutôt que par un
+        // mécanisme. Exécuté ici, sur le chemin **non** court-circuité : c'est la
+        // population du prédicat. Si le process avait démarré avec le knob, la row
+        // serait annulée et aucun tick ne tournerait, donc ce code ne serait jamais
+        // atteint — la garde ne peut émettre que sur un `.env` édité après le boot,
+        // qui est exactement le geste du ticket.
+        if let Some(stale) =
+            crate::auto_pull_stop::stale_env_knob(&self.global_home_dir, &self.home_dir)
+        {
+            warn!(
+                task_id = %task.id,
+                event = "auto_pull_stop_stale_env_knob",
+                env_file = %stale.env_path.display(),
+                knob = crate::auto_pull_stop::env_knob_name(),
+                value = %stale.value,
+                stop_file = %crate::auto_pull_stop::stop_file_path(
+                    &self.global_home_dir,
+                    crate::auto_pull_stop::AUTO_PULL_SCAN,
+                ).display(),
+                "auto_pull: {}=0 est posé sur disque mais ne coupe RIEN à chaud — \
+                 il n'est lu qu'au démarrage, et l'environnement d'un process vivant \
+                 n'est pas modifiable de l'extérieur. Pour couper maintenant : \
+                 `touch` le fichier STOP nommé ci-dessus (effet au tick suivant, \
+                 ≤ 10 min) ; pour que le knob prenne, redémarrez mika-spirit.",
+                crate::auto_pull_stop::env_knob_name()
+            );
+        }
+
         // mika#2205 — PAT d'abord, App en repli. Voir `resolve_periodic_scan_token`
         // pour le raisonnement d'identité ADR-008 : la bascule du label `ready` ne
         // lit pas l'auteur, donc l'identité bot de l'App convient ici.
@@ -3517,12 +3672,72 @@ mod tests {
         }
     }
 
+    /// T1, moitié « tôt » — garde structurelle sur le **placement** du
+    /// court-circuit mika#2329.
+    ///
+    /// Ce qui suit la garde résout deux tokens (PAT puis repli App, donc
+    /// potentiellement un échange App sur le réseau, puis une seconde résolution
+    /// pour l'identité de label — mika#2228) avant deux fetchs `gh`. Placer la
+    /// garde plus bas ferait payer au STOP deux résolutions de token par tick pour
+    /// rien.
+    ///
+    /// **Aucun test comportemental ne peut voir cet ordre** : sans token
+    /// configuré, le chemin non court-circuité rend `Ok(())` exactement comme le
+    /// chemin court-circuité, et avec un token il faudrait le réseau. Une
+    /// régression qui descendrait la garde ne rendrait aucune décision fausse —
+    /// elle coûterait seulement, en silence. C'est la même classe, et la même
+    /// forme, que la garde mika#2205 voisine.
+    #[test]
+    fn mika2329_le_court_circuit_precede_la_resolution_de_token() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/task_engine/dispatcher.rs"),
+        )
+        .expect("la garde doit pouvoir lire dispatcher.rs");
+
+        let sig = "async fn dispatch_auto_pull_groomed(";
+        let start = src
+            .find(sig)
+            .expect("dispatch_auto_pull_groomed doit exister");
+        let rest = &src[start + sig.len()..];
+        let end = rest.find("\n    async fn ").unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        let stop_at = body
+            .find("auto_pull_stop::is_stopped")
+            .expect("le court-circuit STOP mika#2329 doit être dans dispatch_auto_pull_groomed");
+        let token_at = body
+            .find("resolve_periodic_scan_token")
+            .expect("la résolution de token doit être dans dispatch_auto_pull_groomed");
+
+        assert!(
+            stop_at < token_at,
+            "mika#2329 — le court-circuit STOP doit précéder toute résolution de \
+             token, sinon un STOP armé paie deux résolutions (dont un échange \
+             GitHub App sur le réseau) à chaque tick pour ne rien faire"
+        );
+    }
+
     fn test_db() -> AsyncDatabase {
         let db = Database::open_in_memory().unwrap();
         AsyncDatabase::new_with_agent(db, "mika")
     }
 
     fn test_dispatcher(db: AsyncDatabase) -> TaskDispatcher {
+        test_dispatcher_with_homes(db, PathBuf::from("/tmp"), TEST_GLOBAL_HOME.into())
+    }
+
+    /// Un home global qui n'existe pas sur disque — donc aucun STOP mika#2329 n'y
+    /// est armé, et le chemin nominal est celui que tous les tests historiques
+    /// prennent. Volontairement distinct de `/tmp` : `{global_home}/state/…` sous
+    /// `/tmp` serait un chemin qu'un opérateur peut créer par mégarde sur sa
+    /// machine, et les tests s'en trouveraient couplés à son disque.
+    const TEST_GLOBAL_HOME: &str = "/tmp/mika-test-global-home-absent";
+
+    fn test_dispatcher_with_homes(
+        db: AsyncDatabase,
+        home_dir: PathBuf,
+        global_home_dir: PathBuf,
+    ) -> TaskDispatcher {
         let tmp = tempfile::tempdir().unwrap();
         let settings = Settings::load(tmp.path()).unwrap();
         TaskDispatcher {
@@ -3533,7 +3748,8 @@ mod tests {
             tools: Arc::new(crate::tools::default_tools()),
             skills: Arc::new(crate::skills::SkillRegistry::empty()),
             message_sender: Some(Arc::new(NoopSender)),
-            home_dir: PathBuf::from("/tmp"),
+            home_dir,
+            global_home_dir,
             embedding_client: None,
             brave_api_key: None,
             github_token: None,
@@ -3545,7 +3761,235 @@ mod tests {
             cli_mode: false,
             settings,
             pr_reviews_posted: None,
+            auto_pull_stop_armed: AtomicBool::new(false),
         }
+    }
+
+    // ---- mika#2329 — STOP global à chaud -----------------------------------
+
+    /// Arme le STOP en posant le fichier sentinelle sous le home global donné.
+    fn arm_auto_pull_stop(global_home: &std::path::Path) {
+        let path = crate::auto_pull_stop::stop_file_path(
+            global_home,
+            crate::auto_pull_stop::AUTO_PULL_SCAN,
+        );
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "").unwrap();
+    }
+
+    fn lift_auto_pull_stop(global_home: &std::path::Path) {
+        std::fs::remove_file(crate::auto_pull_stop::stop_file_path(
+            global_home,
+            crate::auto_pull_stop::AUTO_PULL_SCAN,
+        ))
+        .unwrap();
+    }
+
+    /// La row récurrente `auto_pull_groomed`, créée comme
+    /// `task_engine::ensure_recurring_task` la crée en production.
+    async fn seed_auto_pull_row(db: &AsyncDatabase) -> String {
+        db.create_recurring_task_if_absent(NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "auto_pull_groomed".to_string(),
+            trigger_type: "recurring".to_string(),
+            cron_expr: Some("0 */10 * * * *".to_string()),
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RUN_SKILL.to_string(),
+            action_config: r#"{"trigger":"auto_pull_groomed"}"#.to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        })
+        .await
+        .unwrap()
+        .expect("la row récurrente doit être créée")
+    }
+
+    async fn stop_audit_states(db: &AsyncDatabase) -> Vec<String> {
+        db.get_audit_event_rows_by_tool_name("auto_pull_stop")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, after, _)| after.unwrap_or_default())
+            .collect()
+    }
+
+    /// T1 / AC1 / AC4 — le fichier présent court-circuite le tick.
+    ///
+    /// Le discriminant est la ligne d'audit, pas le `Ok(())` : le chemin nominal
+    /// rend `Ok(())` lui aussi dans ce harnais (aucun token configuré → le scan
+    /// saute ce tick en émettant `auto_pull_no_token`). Un `Ok(())` seul ne
+    /// prouverait donc rien. La transition `armed` écrite en audit n'est
+    /// atteignable que par le court-circuit.
+    ///
+    /// Ce test prouve **qu'il** court-circuite ; c'est
+    /// [`mika2329_le_court_circuit_precede_la_resolution_de_token`] qui prouve
+    /// qu'il le fait **tôt** — les deux chemins rendent `Ok(())` sans réseau, donc
+    /// aucune assertion comportementale ne peut voir leur ordre.
+    #[tokio::test]
+    async fn mika2329_le_stop_arme_court_circuite_le_tick() {
+        let db = test_db();
+        let global = tempfile::tempdir().unwrap();
+        let task_id = seed_auto_pull_row(&db).await;
+        let task = db.get_task(&task_id).await.unwrap().unwrap();
+
+        arm_auto_pull_stop(global.path());
+        let dispatcher = test_dispatcher_with_homes(
+            db.clone(),
+            PathBuf::from("/tmp"),
+            global.path().to_path_buf(),
+        );
+
+        dispatcher.dispatch_auto_pull_groomed(&task).await.unwrap();
+
+        assert_eq!(
+            stop_audit_states(&db).await,
+            vec!["armed".to_string()],
+            "un tick court-circuité doit écrire la transition d'armement"
+        );
+    }
+
+    /// T2 / AC7 — le fichier absent laisse le chemin nominal strictement
+    /// inchangé : aucune transition écrite, donc aucune ligne nouvelle.
+    #[tokio::test]
+    async fn mika2329_sans_stop_le_chemin_nominal_est_inchange() {
+        let db = test_db();
+        let global = tempfile::tempdir().unwrap();
+        let task_id = seed_auto_pull_row(&db).await;
+        let task = db.get_task(&task_id).await.unwrap().unwrap();
+
+        let dispatcher = test_dispatcher_with_homes(
+            db.clone(),
+            PathBuf::from("/tmp"),
+            global.path().to_path_buf(),
+        );
+
+        dispatcher.dispatch_auto_pull_groomed(&task).await.unwrap();
+
+        assert!(
+            stop_audit_states(&db).await.is_empty(),
+            "le régime nominal — l'écrasante majorité des ticks — n'écrit rien"
+        );
+    }
+
+    /// T3 / AC2 / AC3 — **l'AC central.** La réversibilité ne touche aucune row.
+    ///
+    /// C'est ce qui distingue ce correctif du mécanisme boot-time : celui-ci
+    /// annule la row récurrente, et la réparation de cette annulation a coûté
+    /// mika#2271 (garde anti-zombie mika#1742, exemption `config_cancel_reverted`,
+    /// `revert_config_cancel_recurring_task`). Ici la row continue de tourner ;
+    /// seul son dispatch rend la main. Rien à ressusciter, donc rien qui puisse
+    /// refuser de ressusciter.
+    #[tokio::test]
+    async fn mika2329_la_reversibilite_ne_touche_aucune_row() {
+        let db = test_db();
+        let global = tempfile::tempdir().unwrap();
+        let task_id = seed_auto_pull_row(&db).await;
+        let before = db.get_task(&task_id).await.unwrap().unwrap();
+
+        let dispatcher = test_dispatcher_with_homes(
+            db.clone(),
+            PathBuf::from("/tmp"),
+            global.path().to_path_buf(),
+        );
+
+        arm_auto_pull_stop(global.path());
+        dispatcher
+            .dispatch_auto_pull_groomed(&before)
+            .await
+            .unwrap();
+        let during = db.get_task(&task_id).await.unwrap().unwrap();
+
+        lift_auto_pull_stop(global.path());
+        dispatcher
+            .dispatch_auto_pull_groomed(&before)
+            .await
+            .unwrap();
+        let after = db.get_task(&task_id).await.unwrap().unwrap();
+
+        for (stage, row) in [("pendant", &during), ("après", &after)] {
+            assert_eq!(
+                row.status, before.status,
+                "{stage} le STOP, le status de la row récurrente doit être intact"
+            );
+            assert_eq!(
+                row.metadata, before.metadata,
+                "{stage} le STOP, la metadata de la row récurrente doit être intacte"
+            );
+            assert_eq!(
+                row.cron_expr, before.cron_expr,
+                "{stage} le STOP, le cron doit être intact"
+            );
+            assert_eq!(
+                row.next_fire_at, before.next_fire_at,
+                "{stage} le STOP, la prochaine échéance doit être intacte"
+            );
+        }
+
+        // Le marqueur que mika#2271 a dû introduire pour réparer l'annulation
+        // n'a aucune raison d'exister ici : aucune annulation n'a eu lieu.
+        let metadata = after.metadata.unwrap_or_default();
+        assert!(
+            !metadata.contains("config_cancel_reverted"),
+            "aucun marqueur de réparation d'annulation ne doit apparaître — \
+             le STOP à chaud n'annule rien (métadonnée lue : {metadata:?})"
+        );
+    }
+
+    /// T6 / AC5 — l'audit écrit une **transition**, pas un tick.
+    ///
+    /// Trois ticks armés → une ligne. Levée puis ré-armement → deux de plus. La
+    /// ligne INFO, elle, sort à chaque tick : pour un interrupteur, la vivacité
+    /// est l'information, mais l'information *durable* est « armé à telle heure ».
+    #[tokio::test]
+    async fn mika2329_laudit_compte_les_transitions_pas_les_ticks() {
+        let db = test_db();
+        let global = tempfile::tempdir().unwrap();
+        let task_id = seed_auto_pull_row(&db).await;
+        let task = db.get_task(&task_id).await.unwrap().unwrap();
+
+        let dispatcher = test_dispatcher_with_homes(
+            db.clone(),
+            PathBuf::from("/tmp"),
+            global.path().to_path_buf(),
+        );
+
+        arm_auto_pull_stop(global.path());
+        for _ in 0..3 {
+            dispatcher.dispatch_auto_pull_groomed(&task).await.unwrap();
+        }
+        assert_eq!(
+            stop_audit_states(&db).await,
+            vec!["armed".to_string()],
+            "trois ticks armés doivent écrire UNE ligne, pas trois"
+        );
+
+        lift_auto_pull_stop(global.path());
+        dispatcher.dispatch_auto_pull_groomed(&task).await.unwrap();
+        arm_auto_pull_stop(global.path());
+        dispatcher.dispatch_auto_pull_groomed(&task).await.unwrap();
+
+        assert_eq!(
+            stop_audit_states(&db).await,
+            vec![
+                "armed".to_string(),
+                "lifted".to_string(),
+                "armed".to_string()
+            ],
+            "la levée puis le ré-armement ajoutent exactement deux lignes"
+        );
     }
 
     #[tokio::test]

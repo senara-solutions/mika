@@ -80,6 +80,11 @@ mod eval {
     mod test_dispatch_no_grooming_marker_guard;
     mod test_dispatch_task_has_open_pr_guard;
     mod test_error_handling;
+
+    // mika#1784 — une image non lue est un fait dit. Les unités de
+    // `image_disposition` ne verraient pas un `decide()` appelé au mauvais moment
+    // dans la boucle ; ces tests lisent ce que le modèle a reçu.
+    mod test_image_disposition_1784;
     mod test_intent_precondition_guard;
     mod test_internal_tagging;
     mod test_kg_budget_757;
@@ -164,6 +169,10 @@ mod eval {
     // Send-message turn boundary guard: prevents write tools after
     // send_message in conversation mode (#771).
     mod test_send_message_boundary;
+
+    // Un `send_message` échoué ne peut pas se clore en silence : guard 6f,
+    // prédicat structurel, et le rejeu du 2026-09-01 (mika#2136).
+    mod test_undelivered_send_2136;
 
     // Multi-agent corpus parity: regression guard for #1155 search_content gap
     mod kg_multi_agent_corpus_parity;

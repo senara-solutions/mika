@@ -239,6 +239,16 @@ impl MockLlmProviderBuilder {
         self
     }
 
+    /// Set whether vision (user-attached images) is supported.
+    ///
+    /// The real predicate answers **per rail, never per model** (mika#1784), so
+    /// a test that wants the withheld path asks for `false` here regardless of
+    /// which `model_name` it also sets.
+    pub fn supports_vision(mut self, supports: bool) -> Self {
+        self.config.supports_vision = supports;
+        self
+    }
+
     /// Configure `check_health()` to return an error on every call.
     ///
     /// When set, `check_health()` returns `Err(error.clone())` instead of `Ok(())`.

@@ -448,14 +448,24 @@ echo ""
 echo "T8 (AC1/AC4): static guard — every rescue site feeds, every push site signals"
 echo "----------------------------------------------------------------------------"
 
-# The rescue-commit site count is pinned by test_rescue_commit_no_verify.sh at
-# 3. Re-assert it here so the two counts below are known to be about the SAME
-# three sites: a 4th rescue commit added without a recorder trips this pair.
-RESCUE_SITES=$(grep -c 'git -C "\$WORKTREE_DIR" commit -m "wip(' "$DISPATCH_LIB" || true)
-assert_eq "T8 rescue-commit sites in dispatch-lib" "3" "$RESCUE_SITES"
+# Rescue commits come in two families, and both must feed RESCUE_COMMITS:
+#   - `wip(`   — uncommitted-content rescues (mika#1282 / mika#1383), pinned at
+#                3 by test_rescue_commit_no_verify.sh;
+#   - `style(` — the post-flight `cargo fmt` normalization of the pilot's own
+#                committed Rust (mika#2348 D3), pinned at 1. It is a rescue
+#                commit in every way that matters here: --no-verify, advances
+#                POST_RUN_HEAD, lands on the pushed branch unreviewed.
+# Each family is pinned separately so the recorder count below is known to be
+# about the SAME sites: a new rescue commit of either family added without a
+# recorder trips the equality.
+WIP_SITES=$(grep -c 'git -C "\$WORKTREE_DIR" commit -m "wip(' "$DISPATCH_LIB" || true)
+assert_eq "T8 wip( rescue-commit sites in dispatch-lib" "3" "$WIP_SITES"
+STYLE_SITES=$(grep -c 'git -C "\$WORKTREE_DIR" commit -m "style(' "$DISPATCH_LIB" || true)
+assert_eq "T8 style( rescue-commit sites in dispatch-lib (mika#2348)" "1" "$STYLE_SITES"
+RESCUE_SITES=$((WIP_SITES + STYLE_SITES))
 
 RECORDERS=$(grep -cE '^[[:space:]]*_record_rescue_commit[[:space:]]*$' "$DISPATCH_LIB" || true)
-assert_eq "T8 one _record_rescue_commit call per rescue site" "$RESCUE_SITES" "$RECORDERS"
+assert_eq "T8 one _record_rescue_commit call per rescue site (wip + style)" "$RESCUE_SITES" "$RECORDERS"
 
 SIGNAL_SITES=$(grep -cE '^[[:space:]]*_signal_rescue_into_open_pr[[:space:]]*$' "$DISPATCH_LIB" || true)
 assert_eq "T8 _signal_rescue_into_open_pr called at both push sites" "2" "$SIGNAL_SITES"

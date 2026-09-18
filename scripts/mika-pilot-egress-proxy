@@ -315,6 +315,17 @@ class _ResponseHeadTap:
         self._cap = cap
         self.complete = False
         self.overflowed = False
+        # Stream offset of `self._buf[0]`. Only ever advanced by what is
+        # deleted off the FRONT, so it stays exact across an arbitrary number
+        # of discarded 1xx preambles.
+        self._origin = 0
+        # mika#2317 — number of stream bytes consumed up to and including the
+        # terminator of the FINAL head, discarded 1xx preambles counted. The
+        # body-framing tap needs it to know where the body starts inside the
+        # very chunk that completed the head; this tap is the only object that
+        # knows how many preamble bytes it threw away, so it is the one that
+        # counts. None until the head completes (and forever on overflow).
+        self.head_end_offset: int | None = None
 
     def feed(self, chunk: bytes) -> None:
         if self.complete or self.overflowed:
@@ -330,12 +341,15 @@ class _ResponseHeadTap:
             status = _parse_status_line(bytes(self._buf[:idx]))
             if status is None or status >= _INTERIM_STATUS_CEILING:
                 self.complete = True
+                self.head_end_offset = self._origin + idx + len(_HEAD_TERMINATOR)
                 del self._buf[idx:]  # keep the head, drop the body
                 return
             # An interim 1xx head is a preamble, not the answer. Drop it and
             # keep reading, or the log would report `-> 100` and hide the real
             # verdict behind a status that merely looks like one.
-            del self._buf[: idx + len(_HEAD_TERMINATOR)]
+            consumed = idx + len(_HEAD_TERMINATOR)
+            del self._buf[:consumed]
+            self._origin += consumed
 
     @property
     def head(self) -> bytes:
@@ -390,6 +404,304 @@ def _format_quota_headers(pairs: list[tuple[str, str]]) -> str:
     return " ".join(f"{name}={value}" for name, value in pairs)
 
 
+# ---------------------------------------------------------------------------
+# Response body framing (mika#2317)
+#
+# WHY: the relay loops on `up_reader.read()` until the UPSTREAM closes, so the
+# duration of a turn is bounded by the upstream's connection policy, not by the
+# length of its answer. mika#2313 made those two instants near-simultaneous by
+# no longer forwarding the client's `Connection: keep-alive` — upstream now sees
+# only our `Connection: close` and closes right after responding. That fix is
+# correct and holds, but it rests on an upstream POLICY. An upstream that
+# ignored `close` one day would reproduce mika#2313 exactly: the relay would
+# wait out the ~360 s idle-timeout, the CLI's already-sent second request would
+# sit unread, and the 5-min prompt-cache TTL would be blown on every turn.
+#
+# The end of the body is readable ON THE STREAM, so the relay can establish it
+# itself. Below is the decoder that does; the relay returns the moment it says
+# the body is over. Two properties govern every line of it:
+#
+#   * PASSIVE. It is fed a copy of bytes ALREADY written and drained to the
+#     client (write-then-tap, the `_ResponseHeadTap` pattern). It retains
+#     nothing, reorders nothing, rewrites nothing. It cannot truncate a
+#     response by construction — it can only declare an end too early.
+#   * ASYMMETRIC FAIL-SAFE. Declaring an end too early cuts a live LLM stream:
+#     a lost turn, and downstream a partial answer that does not present itself
+#     as partial. Failing to detect a real end costs nothing at all — the relay
+#     reads to EOF, exactly as it did before this code existed. So anything
+#     unprovable is `UNDETERMINED`, which IS today's behaviour.
+#
+# In particular the chunked terminator is NOT a substring. A body is a run of
+# `<hex-size>\r\n<data>\r\n` closed by `0\r\n<trailers?>\r\n`, and the literal
+# `0\r\n\r\n` can occur INSIDE chunk data — which here is arbitrary SSE JSON.
+# Hence a state machine, not an `in chunk`.
+# ---------------------------------------------------------------------------
+
+_FRAMING_UNDETERMINED = "undetermined"
+_FRAMING_NO_BODY = "no-body"
+_FRAMING_LENGTH = "length"
+_FRAMING_CHUNKED = "chunked"
+
+# Statuses that carry no response body whatever the headers say.
+_BODILESS_STATUSES = frozenset({204, 304})
+
+# No `bytes.ishexdigit()` exists, hence the regex here; the decimal half below
+# uses `bytes.isdigit()`, which is exactly `^[0-9]+$` on a byte string.
+_CHUNK_SIZE_RE = re.compile(rb"^[0-9A-Fa-f]{1,15}$", re.ASCII)
+
+# Bound on ONE chunk-size or trailer line pathologically split across many small
+# reads. It borrows `RESPONSE_HEAD_CAP`'s magnitude — 64 KiB is ample for any
+# legitimate line — but it is a distinct cap with a distinct meaning: that one
+# bounds the whole response HEAD, this one bounds a single line inside the BODY.
+# Named apart so retuning either cannot silently retune the other.
+_CHUNK_LINE_CAP = RESPONSE_HEAD_CAP
+
+
+def _header_values(head: bytes, name: str) -> list[bytes]:
+    """Every value of `name` in a response head, in upstream order.
+
+    Returns one entry per occurrence of the header — the duplicates matter:
+    two disagreeing `Content-Length` lines are a framing contradiction, and
+    collapsing them here would hide it.
+    """
+    wanted = name.lower().encode("ascii")
+    values: list[bytes] = []
+    for raw in head.split(b"\r\n")[1:]:  # [0] is the status line
+        key, sep, value = raw.partition(b":")
+        if not sep:
+            continue
+        if key.strip().lower() == wanted:
+            values.append(value.strip())
+    return values
+
+
+def _content_length_of(values: list[bytes]) -> int | None:
+    """The single agreed `Content-Length`, or None when it is not provable.
+
+    None on: a non-numeric token, an empty value, or two tokens that disagree
+    (across duplicate headers or inside one comma list). RFC 9112 §6.3 permits
+    a repeated identical value; anything else is a contradiction we decline to
+    resolve rather than pick a side of.
+    """
+    tokens: list[bytes] = []
+    for value in values:
+        tokens.extend(part.strip() for part in value.split(b","))
+    if not tokens:
+        return None
+    seen: set[int] = set()
+    for token in tokens:
+        if not token.isdigit():
+            return None
+        seen.add(int(token))
+    return seen.pop() if len(seen) == 1 else None
+
+
+def _last_transfer_coding(values: list[bytes]) -> bytes | None:
+    """The final coding of the `Transfer-Encoding` chain, lowercased.
+
+    Only the LAST one decides the framing: `gzip, chunked` is chunked-framed,
+    `chunked, gzip` is not framed at all (and is illegal, which is why it
+    lands in `UNDETERMINED`).
+    """
+    codings: list[bytes] = []
+    for value in values:
+        for part in value.split(b","):
+            token = part.split(b";", 1)[0].strip().lower()
+            if token:
+                codings.append(token)
+    return codings[-1] if codings else None
+
+
+def _classify_response_framing(head: bytes, method: str) -> tuple[str, int]:
+    """Framing mode implied by a COMPLETE response head, and its length.
+
+    Every branch that is not a proof returns `UNDETERMINED`; see the module
+    comment above for why that asymmetry is the whole design.
+    """
+    status = _parse_status_line(head)
+    if status is not None and (
+        method.upper() == "HEAD" or status in _BODILESS_STATUSES
+    ):
+        # A HEAD response carries the `Content-Length` of the body it is NOT
+        # sending. Without this branch the relay would wait for n bytes that
+        # never come — fail-safe, but one line buys the real answer.
+        return _FRAMING_NO_BODY, 0
+
+    te_values = _header_values(head, "transfer-encoding")
+    cl_values = _header_values(head, "content-length")
+
+    if te_values and cl_values:
+        # RFC 9112 §6.3 says follow chunked and ignore Content-Length, but this
+        # pair is also the classic request-smuggling signature. We do not
+        # arbitrate a self-contradicting response — and concluding nothing is
+        # free here, since nothing is exactly what the relay did before.
+        return _FRAMING_UNDETERMINED, 0
+    if te_values:
+        if _last_transfer_coding(te_values) == b"chunked":
+            return _FRAMING_CHUNKED, 0
+        return _FRAMING_UNDETERMINED, 0
+    if cl_values:
+        length = _content_length_of(cl_values)
+        if length is None:
+            return _FRAMING_UNDETERMINED, 0
+        return _FRAMING_LENGTH, length
+    # Neither header: the body ends at EOF. That is the RFC rule, not a
+    # shortcoming — there is nothing to detect.
+    return _FRAMING_UNDETERMINED, 0
+
+
+class _ChunkedDecoder:
+    """Strict `Transfer-Encoding: chunked` framing decoder.
+
+    Consumes body bytes and reports when the terminating zero-size chunk and
+    its trailer section have been fully read. Strict on purpose: a size that is
+    not hexadecimal, a missing CRLF where one is required, or a size/trailer
+    line longer than `cap` sets `failed`, and a failed decoder disarms the
+    detection for the rest of the connection. It never guesses.
+    """
+
+    _SIZE = "size"
+    _DATA = "data"
+    _DATA_CRLF = "data-crlf"
+    _TRAILERS = "trailers"
+
+    def __init__(self, cap: int = _CHUNK_LINE_CAP) -> None:
+        self._buf = bytearray()
+        self._cap = cap
+        self._state = self._SIZE
+        self._remaining = 0
+        self.done = False
+        self.failed = False
+
+    def feed(self, data: bytes) -> None:
+        if self.done or self.failed:
+            return
+        self._buf += data
+        # One upstream read coalesces many small SSE frames, so a single `feed`
+        # routinely crosses dozens of framing tokens. Advance a cursor and trim
+        # ONCE, at the end: trimming per token would memmove the whole
+        # remaining buffer each time — the quadratic cost hiding behind an
+        # innocuous-looking `del buf[:n]` on a streaming body.
+        pos = 0
+        try:
+            while not self.done and not self.failed:
+                available = len(self._buf) - pos
+                if self._state == self._DATA:
+                    take = min(self._remaining, available)
+                    pos += take
+                    self._remaining -= take
+                    if self._remaining:
+                        return  # mid-chunk; wait for more bytes
+                    self._state = self._DATA_CRLF
+                    continue
+                if self._state == self._DATA_CRLF:
+                    if available < 2:
+                        return
+                    if self._buf[pos:pos + 2] != b"\r\n":
+                        self.failed = True
+                        return
+                    pos += 2
+                    self._state = self._SIZE
+                    continue
+                # _SIZE or _TRAILERS: both need one CRLF-terminated line.
+                idx = self._buf.find(b"\r\n", pos)
+                if idx < 0:
+                    if available > self._cap:
+                        self.failed = True
+                    return
+                line = bytes(self._buf[pos:idx])
+                pos = idx + 2
+                if self._state == self._SIZE:
+                    size = _parse_chunk_size(line)
+                    if size is None:
+                        self.failed = True
+                        return
+                    if size == 0:
+                        self._state = self._TRAILERS
+                        continue
+                    self._remaining = size
+                    self._state = self._DATA
+                    continue
+                if not line:  # empty line closes the trailer section
+                    self.done = True
+                    return
+                # another trailer field; keep reading
+        finally:
+            if self.done or self.failed:
+                self._buf.clear()  # nothing will read it again
+            else:
+                del self._buf[:pos]
+
+
+def _parse_chunk_size(line: bytes) -> int | None:
+    """Chunk size from a chunk-size line, or None when it is not one.
+
+    Chunk extensions (`;name=value`) are dropped; the remainder must be pure
+    hexadecimal with no surrounding whitespace, as RFC 9112 §7.1 requires.
+    """
+    token = line.split(b";", 1)[0]
+    if not _CHUNK_SIZE_RE.match(token):
+        return None
+    return int(token, 16)
+
+
+class _BodyFramingTap:
+    """Passive detector for the end of a response BODY.
+
+    Constructed from the final response head, then fed a copy of each body byte
+    already relayed to the client. `done` flips exactly once, on proof. It has
+    no other output and holds no bytes.
+    """
+
+    def __init__(self, head: bytes, method: str) -> None:
+        self.mode, self._remaining = _classify_response_framing(head, method)
+        self._decoder = (
+            _ChunkedDecoder() if self.mode == _FRAMING_CHUNKED else None
+        )
+        # `Content-Length: 0` and a bodiless status both finish at the head.
+        self.done = self.mode == _FRAMING_NO_BODY or (
+            self.mode == _FRAMING_LENGTH and self._remaining == 0
+        )
+
+    @classmethod
+    def undetermined(cls) -> "_BodyFramingTap":
+        """A tap for a head that could not be read at all (overflow).
+
+        Not the same as `_BodyFramingTap(b"", method)`: for a HEAD request that
+        would classify as `NO_BODY`, and a head we never found the end of gives
+        no idea where the body starts.
+        """
+        tap = cls.__new__(cls)
+        tap.mode = _FRAMING_UNDETERMINED
+        tap._remaining = 0
+        tap._decoder = None
+        tap.done = False
+        return tap
+
+    @property
+    def determinate(self) -> bool:
+        """Whether this tap can prove an end at all, for this connection."""
+        return self.mode != _FRAMING_UNDETERMINED
+
+    def feed(self, body: bytes) -> None:
+        if self.done or self.mode == _FRAMING_UNDETERMINED:
+            return
+        if self.mode == _FRAMING_LENGTH:
+            self._remaining -= len(body)
+            if self._remaining <= 0:
+                self.done = True
+            return
+        if self._decoder is not None:
+            self._decoder.feed(body)
+            if self._decoder.failed:
+                # Unreadable framing disarms detection for the rest of this
+                # connection rather than guessing where the body stops.
+                self.mode = _FRAMING_UNDETERMINED
+                self._decoder = None
+            elif self._decoder.done:
+                self.done = True
+
+
 # Opt-in debug gate for benign, high-frequency egress events. Off by default;
 # an operator sets MIKA_EGRESS_DEBUG=1 to see the aggregate. It gates ONLY the
 # benign classes below — a real error is never gated, it always prints.
@@ -423,6 +735,43 @@ def _note_readiness_probe() -> None:
             "[egress] DEBUG readiness-probe (connect+close, no CONNECT) "
             f"count={_readiness_probe_count}"
         )
+
+
+# How each relay ended, counted per class (mika#2317). A net that never says it
+# served is indistinguishable from a no-op (mika#2156, mika#2249) — but be exact
+# about what is observable. "Upstream held the connection" versus "the EOF had
+# not surfaced yet" is NOT decidable for free: after our last read, a false
+# `at_eof()` proves nothing, it is a race, and any reliable distinction costs a
+# wait — which is precisely the delay this work removes. So no per-request
+# "the net served" verdict is built; that line would be noise AND wrong.
+#
+# What IS decidable is the termination class, and the one carrying information
+# is `undetermined`: non-zero, it names requests this work protects not at all,
+# which is a fact an operator can act on. Exact mirror of
+# `pilot_stall_signal_unavailable` (mika#2277) — a net must say who it cannot see.
+_RELAY_BODY_END = "body-end"
+_RELAY_EOF = "eof"
+_RELAY_UNDETERMINED = "undetermined"
+_relay_termination_counts = {
+    _RELAY_BODY_END: 0,
+    _RELAY_EOF: 0,
+    _RELAY_UNDETERMINED: 0,
+}
+
+
+def _note_relay_termination(kind: str) -> None:
+    """Record how one relayed response ended.
+
+    Same discipline as `_note_readiness_probe`: silent by default, an aggregate
+    of the running counts under MIKA_EGRESS_DEBUG, never an error.
+    """
+    _relay_termination_counts[kind] = _relay_termination_counts.get(kind, 0) + 1
+    if _EGRESS_DEBUG:
+        detail = " ".join(
+            f"{name}={count}"
+            for name, count in sorted(_relay_termination_counts.items())
+        )
+        _log(f"[anthropic-proxy] DEBUG relay-termination {detail}")
 
 
 def _log_upstream_outcome(
@@ -472,9 +821,19 @@ async def _relay_response_with_status_tap(
     in precisely the shape this instrumentation exists for: upstream answers
     429, the pilot stalls, the guardrail kills it, the client socket closes,
     `drain()` raises — and the proxy prints nothing at all.
+
+    **Return on proof of body end, not on upstream EOF** (mika#2317). Once the
+    framing tap says the body is over, this returns; the callers' `finally`
+    blocks then close upstream and client. A turn can therefore never outlast
+    the response itself, even against an upstream that keeps the connection
+    open. Anything the framing cannot prove keeps the previous behaviour — read
+    until the upstream closes.
     """
     tap = _ResponseHeadTap()
+    framing: _BodyFramingTap | None = None
     reported = False
+    offset = 0
+    terminated_on_body_end = False
     try:
         while True:
             chunk = await up_reader.read(BUFFER_SIZE)
@@ -482,16 +841,49 @@ async def _relay_response_with_status_tap(
                 break
             writer.write(chunk)
             await writer.drain()
-            if reported:
-                continue
-            tap.feed(chunk)
-            if tap.complete:
-                _log_upstream_outcome(
-                    method, path,
-                    _parse_status_line(tap.head),
-                    _select_quota_headers(tap.head),
-                )
-                reported = True
+            chunk_start = offset
+            offset += len(chunk)
+
+            if framing is None:
+                tap.feed(chunk)
+                if tap.complete:
+                    _log_upstream_outcome(
+                        method, path,
+                        _parse_status_line(tap.head),
+                        _select_quota_headers(tap.head),
+                    )
+                    reported = True
+                    framing = _BodyFramingTap(tap.head, method)
+                    # The chunk that completed the head usually carries the
+                    # first body bytes too. Hand the tap only that tail.
+                    body_start = tap.head_end_offset
+                    if body_start is not None and body_start < offset:
+                        framing.feed(chunk[max(0, body_start - chunk_start):])
+                elif tap.overflowed:
+                    # The head never ended within the cap, so where the body
+                    # starts is unknown. Stay on the EOF path, and leave the
+                    # verdict to the `finally` exactly as before.
+                    framing = _BodyFramingTap.undetermined()
+            else:
+                framing.feed(chunk)
+
+            if framing is not None and framing.done:
+                terminated_on_body_end = True
+                break
+        # Counted here and NOT in the `finally`: a relay that dies in flight —
+        # the founding mika#1901 shape, client killed by the guardrail and
+        # `drain()` raising — ended neither on a body end nor on an upstream
+        # EOF, and we have no idea how its body would have finished. Counting
+        # it would pour that population into `undetermined`, which is the one
+        # class carrying an actionable fact. So these counters total the relays
+        # that finished cleanly, not the requests served. The verdict line
+        # below keeps its `finally`: it must survive exactly that death.
+        if terminated_on_body_end:
+            _note_relay_termination(_RELAY_BODY_END)
+        elif framing is not None and framing.determinate:
+            _note_relay_termination(_RELAY_EOF)
+        else:
+            _note_relay_termination(_RELAY_UNDETERMINED)
     finally:
         if not reported:
             head = tap.head
@@ -667,10 +1059,15 @@ async def handle_anthropic_reverse_proxy(
                 up_writer.write(chunk)
                 await up_writer.drain()
                 remaining -= len(chunk)
-        # Stream response upstream → client until upstream closes, reading the
-        # status line off the stream on the way past and logging the verdict
-        # (mika#1901). The tap never holds a byte back and always logs exactly
-        # once — see _relay_response_with_status_tap.
+        # Stream response upstream → client until the response BODY ends
+        # (mika#2317) or, when its framing is not provable, until upstream
+        # closes. The status line is read off the stream on the way past and
+        # the verdict logged (mika#1901). The taps never hold a byte back and
+        # the verdict is logged exactly once — see
+        # _relay_response_with_status_tap. Returning here reaches the `finally`
+        # below (up_writer.close()) and, one frame up, handle_host_client's own
+        # `finally` (writer.close()) — so both ends close on body end, which is
+        # what the ticket asks for; no extra close is needed here.
         await _relay_response_with_status_tap(
             up_reader, writer,
             method.decode("ascii"),

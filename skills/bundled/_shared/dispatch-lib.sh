@@ -286,15 +286,6 @@ _PILOT_EGRESS_SOCK="/tmp/mika-pilot-egress.sock"
 _PILOT_EGRESS_TCP_PORT="8891"
 _PILOT_EGRESS_PROXY_BIN="$HOME/.local/bin/mika-pilot-egress-proxy"
 
-# mika#2313: sandbox-safe ~/.claude.json emitter (installed alongside the
-# proxy by `make install`). The sandbox blanks /home (--tmpfs) and never binds
-# ~/.claude.json, so the CLI loses its cached GrowthBook feature flags — which
-# govern the prompt-cache cache_control strategy. Result before this: every
-# turn re-creates the full 100-250k-token context (cache_read=0), 355s turns,
-# subscription burn. The emitter is an allowlist of feature-flag/cache keys
-# ONLY (never account/credential keys — mika#2039). See scripts/.
-_PILOT_SANITIZE_CLAUDE_JSON_BIN="$HOME/.local/bin/mika-pilot-sanitize-claude-json"
-
 # Helper daemon for anthropic api chain (2026-08-05).
 # Addon path = installed alongside the proxy binary in ~/.local/bin/ (see
 # Makefile install target); NOT a hardcoded repo path (would fail when
@@ -967,25 +958,6 @@ _run_pilot_sandboxed() {
     local -a _PILOT_LOG_BIND_ARGS=()
     _pilot_log_bind_args
 
-    # mika#2313: regenerate a sandbox-safe ~/.claude.json fresh each dispatch
-    # (the GrowthBook flags carry an expiry) and ro-bind it, restoring the
-    # prompt cache (measured: cache_read 0 -> 31226). Like the log bind, this
-    # never refuses the launch — a missing/failed emitter degrades to the old
-    # cache-cold behaviour, not a lost dispatch. mika#2039: the emitter is a
-    # key allowlist, so no credential can reach the sandbox by construction.
-    local -a _PILOT_CLAUDE_JSON_BIND_ARGS=()
-    local _PILOT_CLAUDE_JSON=""
-    if [ -f "$HOME/.claude.json" ] && [ -x "$_PILOT_SANITIZE_CLAUDE_JSON_BIN" ]; then
-        _PILOT_CLAUDE_JSON="$(mktemp "${TMPDIR:-/tmp}/mika-pilot-claude-json.XXXXXX")"
-        trap 'rm -f "$_PILOT_CLAUDE_JSON"' RETURN
-        if "$_PILOT_SANITIZE_CLAUDE_JSON_BIN" "$HOME/.claude.json" > "$_PILOT_CLAUDE_JSON" 2>/dev/null && [ -s "$_PILOT_CLAUDE_JSON" ]; then
-            _PILOT_CLAUDE_JSON_BIND_ARGS=(--ro-bind "$_PILOT_CLAUDE_JSON" "$HOME/.claude.json")
-        else
-            echo "dispatch-lib: ~/.claude.json emitter produced nothing — pilot runs cache-cold (mika#2313)" >&2
-            rm -f "$_PILOT_CLAUDE_JSON"; _PILOT_CLAUDE_JSON=""
-        fi
-    fi
-
     # Phase 2b: launch host-side egress proxy (idempotent). If it's not
     # available (binary missing, first deploy), returns non-zero and we run
     # in Phase 2a mode (fs cut only, network open) — degraded but functional.
@@ -1194,7 +1166,6 @@ _run_pilot_sandboxed() {
             --ro-bind-try "/data/workspace/mika-platform/claude-pilot/src" "/data/workspace/mika-platform/claude-pilot/src" \
             --ro-bind-try "$HOME/.claude/plugins" "$HOME/.claude/plugins" \
             --ro-bind-try "$HOME/.claude/settings.json" "$HOME/.claude/settings.json" \
-            ${_PILOT_CLAUDE_JSON_BIND_ARGS[@]+"${_PILOT_CLAUDE_JSON_BIND_ARGS[@]}"} \
             --ro-bind-try "$HOME/.claude/commands" "$HOME/.claude/commands" \
             --ro-bind-try "$HOME/.claude/hooks" "$HOME/.claude/hooks" \
             --ro-bind-try "$HOME/.nvm/versions" "$HOME/.nvm/versions" \
@@ -1279,7 +1250,6 @@ $quoted_argv
             --ro-bind-try "/data/workspace/mika-platform/claude-pilot/src" "/data/workspace/mika-platform/claude-pilot/src" \
             --ro-bind-try "$HOME/.claude/plugins" "$HOME/.claude/plugins" \
             --ro-bind-try "$HOME/.claude/settings.json" "$HOME/.claude/settings.json" \
-            ${_PILOT_CLAUDE_JSON_BIND_ARGS[@]+"${_PILOT_CLAUDE_JSON_BIND_ARGS[@]}"} \
             --ro-bind-try "$HOME/.claude/commands" "$HOME/.claude/commands" \
             --ro-bind-try "$HOME/.claude/hooks" "$HOME/.claude/hooks" \
             --ro-bind-try "$HOME/.nvm/versions" "$HOME/.nvm/versions" \
@@ -3107,6 +3077,186 @@ ${_files}"
     fi
 }
 
+# The scaffold paths every rescue staging gesture excludes, written ONCE
+# (mika#2348 D2). Each entry was added by a distinct incident, and by the time
+# mika#2348 read this file the four-entry list had been copied verbatim to five
+# sites:
+#   - .claude/commands/            slash-command snapshots from mika-platform
+#                                  (mika#1288)
+#   - .claude/claude-pilot.json    relay config cp'd from $PLATFORM_DIR at :489.
+#                                  Without this one the rescue re-introduces the
+#                                  intentional deletion that shipped in PR #1348
+#                                  (mika#1193 Phase C) — the founding incident
+#                                  for mika#1419.
+#   - .claude/settings.local.json  operator permission allowlist cp'd at :490.
+#                                  cm#5 (2026-06-16) produced PR #16 whose only
+#                                  "rescued" content was a 143-line allowlist
+#                                  leak (mika#1552 founding incident).
+#   - .claude/*.local.*            general guard for the .env-class of
+#                                  operator-machine-specific Claude-local files.
+# None of them is pilot-authored content.
+#
+# A fifth copy would diverge — that is exactly the drift class that produced
+# mika#2348's T1: the mika#1383 block says "Same exclusion pattern as mika#1282",
+# which is true of this pathspec and was false of the formatting beside it.
+RESCUE_EXCLUDE_PATHSPEC=(':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*')
+
+# Format the staged Rust and re-stage it, for a caller that is about to commit
+# (mika#1336, extracted and generalized by mika#2348 D2).
+#
+# WHY THIS IS A FUNCTION. mika#1336 wrote this block inline in
+# _rescue_dirty_worktree, and the sibling rescue site — mika#1383's trailing
+# content, twelve hundred lines below — never received it. So PR #2344 shipped an
+# unformatted `wip(` commit, the CI `Check` job failed on `cargo fmt --all
+# --check`, and an operator paid for it by hand (d062f716, "cargo fmt seul").
+# Two sites staging pilot Rust and one of them formatting it is the shape the
+# defect took; one callee is the shape that cannot drift.
+#
+# FAIL-SAFE, ALWAYS (mika#2348 D4). `cargo fmt` fails on syntactically invalid
+# Rust, and a pilot interrupted mid-file produces exactly that. The rescue is
+# salvage, not a gate (mika#1685): a failed fmt leaves CI red, which is the state
+# of the world today and costs nothing, whereas a hard failure here would lose
+# the pilot's content outright. So: say so, continue, let the caller commit.
+#
+# Gated on staged *.rs so a docs-only or non-Rust pilot pays no cargo startup.
+# Reads: WORKTREE_DIR. Writes: the index (stages the reformatted files).
+_fmt_and_stage_rust() {
+    git -C "$WORKTREE_DIR" diff --cached --name-only 2>&9 | grep -q '\.rs$' || return 0
+
+    local _fmt_out _fmt_rc
+    # `if _x=$(…); then rc=0; else rc=$?; fi` rather than a plain assignment
+    # followed by `$?`: the handlers source this file under `set -e`, where a
+    # failing command substitution inside an assignment terminates the dispatch
+    # outright (same reason as _rescue_verify_pipeline's own note).
+    if _fmt_out=$( (cd "$WORKTREE_DIR" && cargo fmt --all) 2>&1 ); then _fmt_rc=0; else _fmt_rc=$?; fi
+    if [ "$_fmt_rc" -ne 0 ]; then
+        echo "rescue_fmt_failed: cargo fmt exited ${_fmt_rc} — rescue continues with unformatted content (worktree=${WORKTREE_DIR}): ${_fmt_out}" >&2
+    elif [ -n "$_fmt_out" ]; then
+        echo "NOTE: proactive cargo fmt: ${_fmt_out}" >&2
+    fi
+
+    # Same exclusion pathspec as the caller's own `git add`: a path the rescue
+    # refuses to stage must not re-enter through the post-fmt re-add.
+    git -C "$WORKTREE_DIR" add -u -- "${RESCUE_EXCLUDE_PATHSPEC[@]}" 2>&9
+}
+
+# Normalize Rust the PILOT ITSELF committed, before the branch is published
+# (mika#2348, closes T2).
+#
+# WHY A SECOND FUNCTION, AND WHY IT IS NOT AT THE COMMIT LEVEL. mika#2348 was
+# filed with two pieces of evidence, and only one of them comes from a rescue
+# path at all: PR #2345's unformatted commit is `0931d86c`, an ORDINARY commit
+# written by the pilot session — no `wip(` prefix, no rescue anywhere near it.
+# The `lefthook` `rust-fmt` gate that should have caught it is declared in
+# `lefthook.yml` and IS NOT INSTALLED on the dispatch machine (no `.git/hooks/`,
+# no `core.hooksPath` in any scope), so it has never run. A remedy confined to
+# the rescue sites would close #2344 and leave #2345 entirely open.
+#
+# Installing lefthook is deliberately NOT the fix here: it would re-arm
+# `rust-clippy` as a pre-commit gate, which mika#1685 refused on this path with
+# measurements — a one-line clippy nit rejecting a rescue commit and stranding a
+# 29-turn pilot was the modal loop-wedge cause (n>=3 on 2026-06-30, Mika Prime
+# bearing the same day ~16:32Z). This normalizes AFTER every producer instead of
+# gating each one.
+#
+# PERIMETER (mika#2348 D3). `cargo fmt --all` walks the whole workspace, and
+# since no hook runs it is plausible that `main` already carries unformatted
+# files unrelated to this branch. Only files inside the branch's own diff are
+# committed; everything else the fmt touched is restored. Named cost, accepted: a
+# file left unformatted on `main` and untouched by this branch stays unformatted.
+# That is the ticket's perimeter, and CI will say so on the PR that does touch it.
+#
+# A FILE THE PILOT LEFT DIRTY IS NEVER TOUCHED. This runs before the mika#1383
+# Phase A block, so the worktree may still carry the pilot's uncommitted trailing
+# content. Those paths are captured BEFORE the fmt and are then neither staged
+# (that would steal content into a `style()` commit) nor restored (that would
+# destroy it). They are left dirty — reformatted, which is what Phase A wants
+# anyway, and it commits them a few lines later.
+#
+# Reads: WORKTREE_DIR, SKILL, REPO, ISSUE_NUM, BRANCH.
+# Writes: POST_RUN_HEAD (advanced past the style commit so the push sees it),
+#         RESCUE_COMMITS (via _record_rescue_commit).
+_normalize_committed_rust() {
+    [ -n "${WORKTREE_DIR:-}" ] && [ -n "${REPO:-}" ] || return 0
+    case "${SKILL:-}" in
+        dev-pilot|dev-groom) ;;
+        *) return 0 ;;
+    esac
+
+    # The branch perimeter, resolved first: it is also the cheap gate. No Rust in
+    # the branch diff means nothing this function could ever commit, so a
+    # docs-only branch pays no cargo startup.
+    local _base _branch_files
+    _base=$(git -C "$WORKTREE_DIR" merge-base origin/main HEAD 2>&9) || _base=""
+    if [ -z "$_base" ]; then
+        # Fail-safe: with no base there is no perimeter, and a normalization that
+        # cannot tell in-branch from out-of-branch would commit the workspace.
+        echo "rescue_fmt_skipped: no merge-base with origin/main — post-flight fmt normalization skipped (branch=${BRANCH:-<unknown>})" >&2
+        return 0
+    fi
+    _branch_files=$(git -C "$WORKTREE_DIR" diff --name-only "${_base}..HEAD" 2>&9)
+    grep -q '\.rs$' <<<"$_branch_files" || return 0
+
+    # Captured BEFORE the fmt: everything already dirty belongs to the pilot.
+    # `git status --porcelain` (not `git diff`) so a staged-but-uncommitted path
+    # counts too — _rescue_dirty_worktree can leave the index populated when its
+    # own commit failed.
+    local _pre_dirty
+    _pre_dirty=$(git -C "$WORKTREE_DIR" -c core.quotePath=false status --porcelain 2>&9 | cut -c4-)
+
+    local _fmt_out _fmt_rc
+    if _fmt_out=$( (cd "$WORKTREE_DIR" && cargo fmt --all) 2>&1 ); then _fmt_rc=0; else _fmt_rc=$?; fi
+    if [ "$_fmt_rc" -ne 0 ]; then
+        # D4 again: say it, change nothing. CI stays red, which is today's state.
+        echo "rescue_fmt_failed: cargo fmt exited ${_fmt_rc} during post-flight normalization — nothing normalized (worktree=${WORKTREE_DIR}): ${_fmt_out}" >&2
+        return 0
+    fi
+
+    local _touched _file _staged=0
+    _touched=$(git -C "$WORKTREE_DIR" -c core.quotePath=false diff --name-only 2>&9)
+    while IFS= read -r _file; do
+        [ -n "$_file" ] || continue
+        # The pilot's own dirty content — not ours to stage, not ours to destroy.
+        grep -qxF -- "$_file" <<<"$_pre_dirty" && continue
+        if grep -qxF -- "$_file" <<<"$_branch_files"; then
+            git -C "$WORKTREE_DIR" add -- "$_file" 2>&9 && _staged=1
+        else
+            # Out of perimeter (D3): unformatted on main, untouched by this
+            # branch. Put it back rather than inflate an already fragile PR.
+            git -C "$WORKTREE_DIR" checkout -- "$_file" 2>&9 || true
+        fi
+    done <<<"$_touched"
+
+    # The no-op half, and it is the half that is easy to forget: a tree that was
+    # already fmt-clean produces NO commit. A normalization that fires
+    # unconditionally is indistinguishable from one that never fires.
+    [ "$_staged" -eq 1 ] || return 0
+    if git -C "$WORKTREE_DIR" diff --cached --quiet 2>&9; then
+        return 0
+    fi
+
+    local _count
+    _count=$(git -C "$WORKTREE_DIR" diff --cached --name-only 2>&9 | grep -c '' || true)
+
+    # --no-verify for the same reason as every other rescue commit (mika#1685):
+    # this path exists precisely because the commit-level gate does not run, and
+    # a normalization blocked by a clippy nit would be a gate wearing a fix's
+    # clothes.
+    if git -C "$WORKTREE_DIR" commit -m "style(${REPO}#${ISSUE_NUM}): normalisation cargo fmt post-flight (mika#2348)
+
+The pilot committed Rust that \`cargo fmt --all -- --check\` rejects, and no
+pre-commit hook is installed on the dispatch machine to have stopped it. Scoped
+to this branch's own diff (mika#2348 D3)." --no-verify 2>&9; then
+        _record_rescue_commit
+        POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
+        echo "rescue_fmt_normalized: ${_count} file(s) reformatted into a style() commit on branch ${BRANCH:-<unknown>} (mika#2348)" >&2
+    else
+        # Fail-open: the content is committed and pushable either way; only the
+        # formatting is lost, and CI will name it on the PR.
+        echo "rescue_fmt_failed: style() commit failed — branch left unformatted (branch=${BRANCH:-<unknown>})" >&2
+    fi
+}
+
 # Preserve a zero-commit session's uncommitted content, then let the caller
 # unblock on it (mika#1282; opened to dev-groom by mika#2031).
 #
@@ -3162,20 +3312,11 @@ _rescue_dirty_worktree() {
         _rescue_what="impl staged by post-flight recovery (mika#1282)"
     fi
 
-    # Stage all dirty files EXCEPT worktree-scaffold paths copied by
-    # _set_up_worktree (mika#1288, mika#1419, mika#1552):
-    #   - .claude/commands/         slash-command snapshots from mika-platform
-    #   - .claude/claude-pilot.json relay config cp'd from $PLATFORM_DIR at :489
-    #   - .claude/settings.local.json  permission allowlist cp'd at :490 (mika#1552)
-    #   - .claude/*.local.*          general guard for any future Claude-local
-    #                                files (.env-class — operator-machine-specific)
-    # None is pilot-authored content. Without the second exclusion, the rescue
-    # commit re-introduces .claude/claude-pilot.json whose intentional deletion
-    # shipped in PR #1348 (mika#1193 Phase C) — the founding incident for
-    # mika#1419. The third + fourth catch the .claude/settings.local.json class
-    # — cm#5 dispatch (2026-06-16) produced PR #16 whose only "rescued" content
-    # was a 143-line operator allowlist leak (mika#1552 founding incident).
-    git -C "$WORKTREE_DIR" add -A -- ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9
+    # Stage all dirty files EXCEPT the worktree-scaffold paths copied by
+    # _set_up_worktree. The list and the incident behind each entry live on
+    # RESCUE_EXCLUDE_PATHSPEC (mika#1288, mika#1419, mika#1552; extracted by
+    # mika#2348 D2).
+    git -C "$WORKTREE_DIR" add -A -- "${RESCUE_EXCLUDE_PATHSPEC[@]}" 2>&9
 
     # Guard: if pathspec exclusion left nothing staged, skip the rescue
     # commit. Handles the edge case where the pilot wrote ONLY to scaffold
@@ -3191,20 +3332,12 @@ _rescue_dirty_worktree() {
         RESCUED_FILES=$(git -C "$WORKTREE_DIR" diff --cached --name-only 2>&9)
 
         # Proactive formatting (mika#1336): the dominant rescue-failure class is
-        # pilot-authored Rust that was never `cargo fmt`-ed, so the first commit
-        # trips the lefthook rust-fmt gate. Formatting up front makes the first
-        # commit succeed, halves wall-clock (one clippy compile, not two), and
-        # removes reliance on parsing lefthook stdout to detect a fmt rejection.
-        # The reactive rust-fmt retry below remains as belt-and-suspenders.
-        # Gated on staged *.rs so docs-only / non-Rust pilots don't pay cargo startup.
-        if git -C "$WORKTREE_DIR" diff --cached --name-only 2>&9 | grep -q '\.rs$'; then
-            PROACTIVE_FMT_ERR=$( (cd "$WORKTREE_DIR" && cargo fmt --all) 2>&1 ) || true
-            [ -n "$PROACTIVE_FMT_ERR" ] && echo "NOTE: proactive cargo fmt: ${PROACTIVE_FMT_ERR}" >&2
-            # Same exclusion pathspec as the initial `git add -A` above
-            # (mika#1288, mika#1419) — keeps scaffold paths out of the
-            # post-fmt re-add.
-            git -C "$WORKTREE_DIR" add -u -- ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9
-        fi
+        # pilot-authored Rust that was never `cargo fmt`-ed, so the commit ships
+        # content the CI `Check` job rejects. The body moved to
+        # _fmt_and_stage_rust in mika#2348 so the mika#1383 site below can call
+        # the same one — this call is byte-for-byte the previous behaviour and is
+        # the negative control of that extraction.
+        _fmt_and_stage_rust
 
         # Attempt rescue commit — capture stderr for hook-failure diagnosis (mika#1296).
         # mika#1341: scratch file MUST live outside the worktree tree, NOT under
@@ -3292,10 +3425,9 @@ ${RESULT}"
             CARGO_FMT_ERR=""
             echo "NOTE: rescue commit rejected by rust-fmt hook — running cargo fmt and retrying" >&2
             CARGO_FMT_ERR=$( (cd "$WORKTREE_DIR" && cargo fmt --all) 2>&1 ) || true
-            # Same exclusion pathspec as the initial `git add -A` above
-            # (mika#1288, mika#1419) — scaffold paths stay excluded on the
-            # post-fmt retry path too.
-            git -C "$WORKTREE_DIR" add -A -- ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9
+            # Same exclusion pathspec as the initial `git add -A` above —
+            # scaffold paths stay excluded on the post-fmt retry path too.
+            git -C "$WORKTREE_DIR" add -A -- "${RESCUE_EXCLUDE_PATHSPEC[@]}" 2>&9
 
             # mika#1310: capture both stdout+stderr (see above).
             if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): ${_rescue_what}
@@ -3481,6 +3613,18 @@ ${RESULT}"
         # exercise it directly instead of reimplementing it.
         _rescue_dirty_worktree
 
+        # mika#2348 (T2): normalize Rust the PILOT committed itself. PR #2345's
+        # unformatted commit came from no rescue at all, and the lefthook gate
+        # that should have caught it is not installed on this machine.
+        #
+        # ORDER IS LOAD-BEARING, IN BOTH DIRECTIONS. After _rescue_dirty_worktree
+        # so a just-rescued commit is in scope; BEFORE the mika#1383 block below,
+        # which pushes INLINE (`git push origin "$BRANCH"`, mika#2151) — a
+        # normalization placed after it would leave its commit behind the push.
+        # Placed here, the dirt it produces is either committed by itself or, if
+        # it already committed, absent, and Phase A finds the tree it expects.
+        _normalize_committed_rust
+
         # mika#1383: structural completion gate for HEAD-advanced-no-PR.
         # The pilot session ran content and committed, but ended its turn
         # before invoking `gh pr create` (Mode 1 = bare `/ce-work` launch
@@ -3513,9 +3657,14 @@ ${RESULT}"
             # mika#1282 (scaffold paths must not be re-committed).
             DIRTY_AFTER_COMMITS=$(git -C "$WORKTREE_DIR" status --porcelain 2>/dev/null | head -5)
             if [ -n "$DIRTY_AFTER_COMMITS" ]; then
-                git -C "$WORKTREE_DIR" add -A -- \
-                    ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9 || true
+                git -C "$WORKTREE_DIR" add -A -- "${RESCUE_EXCLUDE_PATHSPEC[@]}" 2>&9 || true
                 if ! git -C "$WORKTREE_DIR" diff --cached --quiet 2>&9; then
+                    # mika#2348 (T1): this site staged pilot Rust and committed it
+                    # WITHOUT formatting, while its mika#1282 sibling has formatted
+                    # since mika#1336 — the comment above says "Same exclusion
+                    # pattern as mika#1282", which was true of the pathspec and
+                    # false of this. PR #2344's `868e90e4` is the measured cost.
+                    _fmt_and_stage_rust
                     # mika#1685: bypass pre-commit hook — see rationale on the
                     # mika#1282 rescue commit above. Same salvage-not-gate principle.
                     if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): trailing content after pilot end_turn (mika#1383)" --no-verify 2>&9; then
@@ -5828,14 +5977,13 @@ _measure_pipeline_verified() {
     fi
 
     # ── Term 2: nothing left outside the commit the PR will publish ─────────
-    # Same scaffold exclusions as the rescue commit's own `git add -A`
-    # (mika#1288, mika#1419, mika#1552): a path the rescue refuses to stage is
-    # not pilot content and must not make the worktree read dirty. `-c
-    # core.quotePath=false` for the reason `_rescue_diff_carries_work` states —
-    # this repo's paths are written in French.
+    # Same scaffold exclusions as the rescue commit's own `git add -A`: a path
+    # the rescue refuses to stage is not pilot content and must not make the
+    # worktree read dirty. One list, on RESCUE_EXCLUDE_PATHSPEC (mika#2348 D2).
+    # `-c core.quotePath=false` for the reason `_rescue_diff_carries_work`
+    # states — this repo's paths are written in French.
     out=$(git -C "$wt_dir" -c core.quotePath=false status --porcelain -- \
-        ':!.claude/commands/' ':!.claude/claude-pilot.json' \
-        ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&1) || {
+        "${RESCUE_EXCLUDE_PATHSPEC[@]}" 2>&1) || {
         printf 'worktree-dirty\ncould not read worktree status\n%s\n' "$(_rescue_verify_excerpt "$out")"
         return 1
     }

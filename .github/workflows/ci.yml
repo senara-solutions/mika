@@ -273,8 +273,13 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
-      - name: Verify the pilot egress-proxy upstream-status tap (mika#1901)
+      - name: Verify the pilot egress-proxy status tap + body framing (mika#1901, #2317)
         run: python3 -B scripts/test-pilot-egress-proxy-status.py
+      # mika#2313's AC1 guard. It existed since 2026-09-16 and was referenced by
+      # no Makefile target and no CI job — a test that ran nowhere. Wired here
+      # because mika#2317 already touches this job (plan R3).
+      - name: Verify the mika#2313 hop-by-hop header guard
+        run: python3 -B scripts/test-pilot-egress-keepalive.py
 
   pipeline-artifacts:
     name: Pipeline Artifacts

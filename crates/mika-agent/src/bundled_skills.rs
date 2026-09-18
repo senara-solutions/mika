@@ -14,6 +14,8 @@
 //! directory copy with a `.copy-managed` marker so library sync leaves it alone —
 //! the operator who used `--copy` owns that lifecycle (mika#1213).
 
+use mika_common::build_info;
+use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
@@ -30,6 +32,15 @@ const COPY_MARKER_FILE: &str = ".copy-managed";
 /// if the binary's manifest hash equals the on-disk value, the library is
 /// already in sync and extraction is skipped (idempotent across restarts).
 const MANIFEST_HASH_FILE: &str = ".manifest-hash";
+
+/// Provenance sidecar written next to [`MANIFEST_HASH_FILE`] (mika#2340).
+///
+/// `.manifest-hash` answers "does this library match the binary that wrote it
+/// last?" — tautologically yes right after a write. The operator's question is
+/// "does this library match the commit I just pulled?", and only the *writer's*
+/// provenance can approach it. This file carries that provenance so it is
+/// readable with `cat`, without running a command.
+pub const MANIFEST_WRITER_FILE: &str = ".manifest-writer";
 
 /// A single file within a bundled skill.
 struct SkillFile {
@@ -440,6 +451,150 @@ fn compute_manifest_hash() -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// What produced the library's current state, and when it attested to it.
+///
+/// Written by [`seed_bundled_skill_library`] on **every** seed pass — the one
+/// that extracts content and the one the hash gate short-circuits alike. That
+/// is the load-bearing decision of mika#2340 and it follows from
+/// [`compute_manifest_hash`]: the hash covers only skill names, content hashes
+/// and file paths, so two binaries separated by weeks of Rust commits — with no
+/// change under `skills/bundled/` — carry the *same* manifest hash. Were the
+/// sidecar written on the extraction path only, an operator who had just
+/// rebuilt and whose PR touched no bundled prompt would read an older
+/// `git_hash` on a perfectly conformant library and conclude the deploy had
+/// failed. That is the symptom of mika#2340 turned into its own false
+/// positive; an instrument laid down to close one misreading must not open the
+/// converse.
+///
+/// Hence the exact meaning of the file, written here as in the ticket: *which
+/// binary produced the current state of this library, and when did it attest to
+/// it.* [`ManifestWriter::extracted`] separates the two passes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestWriter {
+    /// `build_info::VERSION` of the binary that seeded (workspace semver).
+    pub version: String,
+    /// `build_info::GIT_HASH` of that binary. **May be the literal `"unknown"`**
+    /// when the binary was built outside a git checkout (Docker layer, source
+    /// tarball) — that is `build_info`'s documented fallback since mika#2066,
+    /// not a deployment failure. No sentinel is rewritten here: a value
+    /// invented by this writer would be a second source of truth on the
+    /// binary's provenance.
+    pub git_hash: String,
+    /// ISO 8601 UTC instant of the attestation.
+    pub attested_at: String,
+    /// The binary's manifest hash at attestation time — the same value written
+    /// to `.manifest-hash`.
+    pub manifest_hash: String,
+    /// `true` when this pass actually wrote skill content; `false` when the
+    /// hash gate confirmed conformance without re-extracting.
+    pub extracted: bool,
+}
+
+/// Read the library's provenance sidecar, if it is present and parseable.
+///
+/// Fail-open by construction: every failure (absent, unreadable, malformed)
+/// collapses to `None`. An observability sidecar must never be the reason a
+/// caller refuses to act.
+pub fn read_manifest_writer(library_dir: &Path) -> Option<ManifestWriter> {
+    let raw = std::fs::read_to_string(library_dir.join(MANIFEST_WRITER_FILE)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Parse `major.minor.patch` out of a semver string, ignoring any pre-release
+/// or build metadata. Returns `None` on anything it cannot read as a triple —
+/// which makes the downgrade guard below silent rather than wrong.
+fn parse_version_triple(v: &str) -> Option<(u64, u64, u64)> {
+    let core = v.trim().split(['-', '+']).next()?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
+}
+
+/// Write the provenance sidecar for this seed pass.
+///
+/// Atomic (tmp + `rename`) because **two processes seed this library**:
+/// mika-spirit at startup and the `mika` CLI through `init_base_for_agent` (and
+/// now `mika skills update`). An in-place write would expose a truncated JSON
+/// to a concurrent reader, and the CLI's own read-back is exactly such a
+/// reader. Same motif as `marketplace.rs`, `oauth.rs` and `well_known_agents.rs`.
+///
+/// Every failure is a WARN and never aborts the seed: the fact outranks its
+/// trace.
+fn write_manifest_writer(library_dir: &Path, manifest_hash: &str, extracted: bool) {
+    // R5 regression guard. Nothing orders the two writers, so a `mika` binary
+    // older than the running mika-spirit can re-seed the shared library and
+    // silently roll its prompts back. This SAYS SO and proceeds: a deliberate
+    // rollback is a legitimate gesture, and a guard that refused one would be a
+    // worse failure mode than the one it reports (same arbitration as the
+    // mika#2293 boot guard).
+    //
+    // Stated bound: it cannot see a regression at equal version (two different
+    // builds of `0.12.2`). It catches the class that crosses a release and
+    // lets through the class that does not — no total order on commits exists
+    // CLI-side. `git_hash` is reported, never compared, so an `"unknown"`
+    // stamp does not weaken the guard (`VERSION` is always present).
+    //
+    // The library is shared by every agent of the home, so the event names the
+    // library rather than an agent: an agent name here would invite reading a
+    // shared-library warning as agent-scoped.
+    if let Some(prev) = read_manifest_writer(library_dir)
+        && let (Some(prev_v), Some(mine)) = (
+            parse_version_triple(&prev.version),
+            parse_version_triple(build_info::VERSION),
+        )
+        && prev_v > mine
+    {
+        warn!(
+            event = "bundled_library_downgrade",
+            library = %library_dir.display(),
+            previous_version = %prev.version,
+            previous_git_hash = %prev.git_hash,
+            writing_version = build_info::VERSION,
+            writing_git_hash = build_info::GIT_HASH,
+            "bundled-skill library was last attested by a NEWER binary; re-seeding \
+             from an older one will roll its prompts back — proceeding"
+        );
+    }
+
+    let record = ManifestWriter {
+        version: build_info::VERSION.to_string(),
+        git_hash: build_info::GIT_HASH.to_string(),
+        attested_at: crate::timestamp::now(),
+        manifest_hash: manifest_hash.to_string(),
+        extracted,
+    };
+    let json = match serde_json::to_string(&record) {
+        Ok(j) => j,
+        Err(e) => {
+            warn!(error = %e, "failed to serialize bundled-skill library provenance record");
+            return;
+        }
+    };
+
+    let final_path = library_dir.join(MANIFEST_WRITER_FILE);
+    let tmp_path = library_dir.join(format!("{MANIFEST_WRITER_FILE}.tmp"));
+    if let Err(e) = std::fs::write(&tmp_path, &json) {
+        warn!(
+            path = %tmp_path.display(),
+            error = %e,
+            "failed to stage bundled-skill library provenance record"
+        );
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
+        warn!(
+            path = %final_path.display(),
+            error = %e,
+            "failed to commit bundled-skill library provenance record"
+        );
+        // Never leave the staging file behind — `prune_library_orphans`
+        // preserves dotfiles, so it would linger in the library for ever.
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+}
+
 /// Seed the canonical bundled-skill library at `library_dir`.
 ///
 /// Sync-shape (mika#1213): after this returns, `library_dir` contains exactly
@@ -479,6 +634,11 @@ pub fn seed_bundled_skill_library(library_dir: &Path) {
             hash = %target_hash,
             "bundled-skill library is in sync with binary manifest; skipping extraction"
         );
+        // Confirmation path: nothing was written, but this binary DID attest to
+        // the library's state, and that is what the sidecar records (mika#2340).
+        // Written before the early return — there is nothing left to fail here,
+        // so the ordering constraint of the extraction path does not apply.
+        write_manifest_writer(library_dir, &target_hash, false);
         return;
     }
 
@@ -530,14 +690,19 @@ pub fn seed_bundled_skill_library(library_dir: &Path) {
     // Record the new manifest hash last so a partial extraction failure
     // (some skill failed to write) does not mask a stale on-disk state on
     // the next restart — the gate will re-run.
-    if wrote > 0
-        && let Err(e) = std::fs::write(&hash_path, &target_hash)
-    {
-        warn!(
-            path = %hash_path.display(),
-            error = %e,
-            "failed to write bundled-skill manifest hash record"
-        );
+    if wrote > 0 {
+        match std::fs::write(&hash_path, &target_hash) {
+            // Provenance sidecar AFTER the hash record, and gated on it landing,
+            // for the reason already inscribed above: an extraction that failed
+            // to record its state must not leave an attestation claiming
+            // otherwise (mika#2340).
+            Ok(()) => write_manifest_writer(library_dir, &target_hash, true),
+            Err(e) => warn!(
+                path = %hash_path.display(),
+                error = %e,
+                "failed to write bundled-skill manifest hash record"
+            ),
+        }
     }
 }
 

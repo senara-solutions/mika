@@ -1093,6 +1093,65 @@ async fn drain_one_webhook(
 const AGENT_ERROR_REPLY: &str =
     "Sorry, I had a hiccup processing your message. Could you try again?";
 
+/// La ligne factuelle que le moteur annexe au texte sortant quand un
+/// `send_message` a échoué et que rien ne l'a réparé (mika#2136 D5).
+///
+/// **Deux registres pour un fait, et le registre suit l'axe persona.**
+/// `FAMILY_SOUL` interdit « toute mention … de l'infrastructure sous-jacente »,
+/// donc la formulation opérateur — qui nomme l'étage et le transport — ne peut
+/// pas être servie telle quelle à un tenant family. Servir *rien* laisserait le
+/// vide qui a produit l'affirmation. Le croisement persona × étage est un
+/// `match` exhaustif sans `_ =>`, modèle mika#2290 : le compilateur force
+/// chaque nouveau profil à décider plutôt que d'hériter d'un choix que personne
+/// n'a pris pour lui.
+///
+/// **La formulation est au passé et n'exclut pas une arrivée différée, à
+/// dessein.** Un `SendOutcome::Failed` est sauvegardé dans `failed_sends` pour
+/// un flush ultérieur, donc le fragment peut arriver *après* cette ligne.
+/// « n'a pas été reçu » reste vrai à l'instant où le moteur l'écrit ;
+/// « n'arrivera pas » serait faux. La nuance est ce qui empêche de lire un flush
+/// réussi comme un faux positif — voir la halte 4 de la sonde post-déploiement.
+///
+/// **Coût nommé, hérité de mika#2023 :** `PersonaProfile::Family` prescrit le
+/// français, donc un champion anglophone reçoit cette ligne en français. C'est
+/// une inadéquation de registre, pas une fuite ; elle se résoudra avec la voix
+/// du champion, et surtout pas en dérivant le registre de la locale du compte —
+/// un choix produit déguisé en défaut technique (arbitrage Prime, 2026-09-09).
+fn undelivered_send_line(
+    u: &crate::evidence::guards::UndeliveredSends,
+    persona: mika_common::home::PersonaProfile,
+) -> String {
+    use crate::evidence::guards::UndeliveredStage;
+    use mika_common::home::PersonaProfile;
+
+    match (persona, u.stage) {
+        (PersonaProfile::Operator, UndeliveredStage::RefusedTooLong) => {
+            "⚠️ Engine note: the content above was refused for length by \
+             `send_message` and nothing was sent in its place. You have received \
+             none of it."
+                .to_string()
+        }
+        (PersonaProfile::Operator, UndeliveredStage::Failed) => format!(
+            "⚠️ Engine note: {count} message(s) of this turn were not delivered \
+             (starting with part {index}: transport failure). Nothing was received \
+             for that part.",
+            count = u.failed_count,
+            index = u.failed_index,
+        ),
+        (PersonaProfile::Family, UndeliveredStage::RefusedTooLong) => {
+            "⚠️ Attention : ce que je voulais t'envoyer était trop long pour \
+             passer en un seul message, et rien n'est parti. Tu ne l'as pas reçu."
+                .to_string()
+        }
+        (PersonaProfile::Family, UndeliveredStage::Failed) => format!(
+            "⚠️ Attention : {count} message n'a pas pu t'être envoyé (à partir de \
+             la partie {index}). Tu ne l'as pas reçu.",
+            count = u.failed_count,
+            index = u.failed_index,
+        ),
+    }
+}
+
 /// Câblage du filet mika#2276 : poser un verdict sur la PR quand le tour a été
 /// coupé par son enveloppe au lieu de conclure.
 ///
@@ -1524,7 +1583,7 @@ async fn run_agent_for_message(
     };
 
     match agent::run_agent(&params).await {
-        Ok(output) => {
+        Ok(mut output) => {
             // mika#2276 M2 — le filet. Si le tour a été COUPÉ par son enveloppe
             // (et non conclu) alors qu'il traitait une PR, le moteur pose
             // lui-même `VERDICT: hold[review]` sur cette PR.
@@ -1536,7 +1595,67 @@ async fn run_agent_for_message(
             // remplace pas.
             post_deadline_verdict_if_cut_off(state, a, &output, &req, &session_id).await;
 
-            if let Some(response) = output.text {
+            // mika#2136 — l'aveu que le moteur écrit lui-même. Placé ici, dans
+            // le même voisinage que le filet mika#2276 et pour la même raison :
+            // en mode conversation le texte de clôture EST le canal, c'est par
+            // lui qu'est parti « Le voici en entier 👆 », et c'est le seul point
+            // où le moteur peut faire arriver un fait à l'utilisateur sans
+            // passer par le modèle.
+            //
+            // Le champ n'est `Some` que si le budget de re-prompt du guard 6f
+            // est épuisé ET que rien n'a réparé l'envoi : un agent qui ré-essaie
+            // avec succès ne voit jamais cette ligne. Le doublon — un agent qui
+            // avait correctement avoué la reçoit quand même — est accepté
+            // explicitement : c'est le prix du refus de D4 (ne pas prétendre
+            // reconnaître un aveu au lexique), et il penche du bon côté, un
+            // doublon étant visible et corrigible là où un silence ne l'est pas.
+            let annex = output.undelivered_sends.take().map(|u| {
+                let line = undelivered_send_line(&u, a.tier.persona_profile());
+                info!(
+                    trace_id = %req.request_id,
+                    agent_id = %a.db.agent_id,
+                    stage = ?u.stage,
+                    failed_index = u.failed_index,
+                    failed_count = u.failed_count,
+                    event = "send_failure_annexed",
+                    "engine appended the undelivered-send fact to the outgoing text"
+                );
+                let a_db = a.db.clone();
+                let sid = session_id.clone();
+                let trace = req.request_id.clone();
+                let detail = format!(
+                    "stage={:?} failed_index={} failed_count={}",
+                    u.stage, u.failed_index, u.failed_count
+                );
+                // Fire-and-forget: a monitoring gap must never hold back the
+                // admission it records.
+                tokio::spawn(async move {
+                    let _ = a_db
+                        .log_audit_event(
+                            &sid,
+                            "undelivered_send_annexed",
+                            "send_message",
+                            None,
+                            Some(&detail),
+                            Some("mika#2136: engine stated the undelivered send itself"),
+                            Some(&trace),
+                        )
+                        .await;
+                });
+                line
+            });
+
+            // A mute turn whose send failed must say the failure, not "I have
+            // nothing to say" — so on the `None` path the line REPLACES the
+            // empty-response fallback rather than being appended to it.
+            let response_text = match (output.text, annex) {
+                (Some(text), Some(line)) => Some(format!("{text}\n\n{line}")),
+                (Some(text), None) => Some(text),
+                (None, Some(line)) => Some(line),
+                (None, None) => None,
+            };
+
+            if let Some(response) = response_text {
                 info!("agent loop completed");
                 match sender_arc.send(&response).await {
                     Ok(crate::messaging::SendOutcome::Delivered) => {}
@@ -1567,8 +1686,48 @@ async fn run_agent_for_message(
             }
         }
         Err(e) => {
-            error!(error = %e, "agent loop failed");
-            let _ = sender_arc.send(AGENT_ERROR_REPLY).await;
+            // mika#1784 — un refus du provider sur un tour portant une image
+            // n'est plus un « hiccup ». Ferme le symptôme 1/3 d'Al : le cas où
+            // `supports_vision()` a répondu `true` à tort (il répond par rail,
+            // jamais par modèle), l'image est partie et le provider a refusé.
+            //
+            // L'attribution est conjonctive et étroite — voir
+            // `image_disposition::image_refusal_status`. Tout le reste (transport,
+            // timeout, 5xx, 429, parse, provider, other) garde le hiccup
+            // générique : attribuer un timeout à l'image serait une fausse
+            // attribution, c'est-à-dire de la fabrication.
+            match crate::image_disposition::image_refusal_status(&e, user_images.len()) {
+                Some(status) => {
+                    // Régime attendu : ZÉRO ligne. Toute occurrence est un rail
+                    // qui déclare la vision et dont le modèle ne l'a pas — la
+                    // moitié « trop permissive » du prédicat, rendue visible.
+                    //
+                    // `agent_provider`/`agent_model` et non `provider`/`model` :
+                    // la requête a pu être servie par un override `[llm]` de
+                    // skill, invisible depuis ici. Les nommer `provider`
+                    // laisserait la sonde 3 comparer deux champs qui ne
+                    // désignent pas toujours la même chose. L'écart entre ce
+                    // champ et le `provider` de `image_withheld_no_vision` est
+                    // précisément ce qui dénonce un override en jeu.
+                    warn!(
+                        event = "image_request_refused",
+                        error_class = %mika_common::llm::error::error_class::http(status),
+                        status,
+                        image_count = user_images.len(),
+                        agent_provider = a.llm.provider_name(),
+                        agent_model = a.llm.model_name(),
+                        error = %e,
+                        "provider refused a request carrying user images"
+                    );
+                    let reply =
+                        crate::image_disposition::image_refused_reply(a.tier.persona_profile());
+                    let _ = sender_arc.send(reply).await;
+                }
+                None => {
+                    error!(error = %e, "agent loop failed");
+                    let _ = sender_arc.send(AGENT_ERROR_REPLY).await;
+                }
+            }
         }
     }
 

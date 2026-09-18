@@ -60,6 +60,112 @@ The DLQ respects the shared 30-permit webhook semaphore — if all permits are h
 - Parses `reply_to_message` from Telegram updates; looks up the originating agent via `outbound_messages` and forwards the inbound message with `"agent": "<name>"` to the correct agent in the container
 - Periodic cleanup: purges `outbound_messages` older than 7 days (batched, every ~100 webhooks)
 
+## Outbound Text Rendering (mika#2126 → mika#2291)
+
+**This section is the documentation debt mika#2291 paid on the way.** Until it was
+written, all three rendering decisions lived only in doc-comments — which is
+plausibly why "the gateway does not apply Telegram rendering" was filed as an
+oversight rather than found as a dated decision.
+
+`telegram.rs::send_message_impl` is the **single** `sendMessage` call site of the
+crate; both `TelegramClient` and `CustomerTelegramClient` converge on it, so the
+~12 `let _ = tg.send_message(...)` sites inherit everything below without having to
+remember it.
+
+**One recognizer, two renderings** (`telegram_markdown.rs`):
+
+```
+tokenize(text) -> Vec<Segment>        // recognition, once
+    render_html(&segments)  -> String // armed mode (default)
+    render_plain(&segments) -> String // floor: disarmed mode AND the fallback
+```
+
+- **HTML, never MarkdownV2.** MarkdownV2 requires escaping eighteen characters over
+  the *entire* text, URLs included; HTML mode reserves three (`<`, `>`, `&`) and only
+  outside tags, so the escaping is local instead of global. A third mode goes back
+  through grooming, not into the payload.
+- **The fallback is what makes it tenable.** On a 400 *while `parse_mode` was set*,
+  the gateway re-sends **once**, without `parse_mode`, with the plain text. The worst
+  case of the HTML path is therefore exactly the pre-mika#2291 behaviour minus the raw
+  markers: **a message can no longer be lost because of a rendering.** The trigger is
+  the **status 400**, never a substring of Telegram's `description` (mika#2179's rule:
+  classes come from the variant, not from the rendered message). 401 / 403 / 429 / 5xx
+  are returned unchanged — replaying them would double a doomed call and, on 429,
+  worsen the limit. The second send has no fallback of its own.
+- **The recognition table is closed.** `**bold**` / `__bold__`, `*ital*`, `_ital_`
+  (not intra-word), `~~struck~~`, `` `code` ``, ` ```fenced``` `, `[label](url)`,
+  `# ` headings and `* ` / `+ ` bullets. **Everything else stays verbatim** — `>`
+  quotes, `1. ` lists, `---`, four-space indentation, tables. That is mika#2126's AC3
+  doctrine: a fix that rewrites a healthy message has repaired nothing, it has added a
+  second way to break it.
+- **No markdown parser, and the reason is a tested property.** mika#2126 froze
+  byte-for-byte preservation including double spaces and a tab; a CommonMark
+  round-trip normalizes whitespace and over-interprets conversational prose. The day
+  the output must carry tables or nested lists, a parser becomes justifiable — but
+  that constraint must be renegotiated explicitly first, because the two are
+  incompatible.
+- **`strip_markdown_around_urls` (mika#2126) is unchanged** and kept as a second pass
+  on the **plain path only**, via `plain_body` — the single construction site of the
+  plain body, which is what makes "disarming and the fallback emit the same byte" a
+  property of the code. It is deliberately *not* run before `render_html`: it rewrites
+  `[label](url)` as `label : url` and would destroy the `Link` that `render_html` must
+  emit as `<a href>`. So in the **armed mode — the default — what holds mika#2126's
+  founding defect is the recognizer, not the net**: paired decoration around a URL
+  becomes a tag (so the link's boundary is the tag) and unpaired decoration stays
+  verbatim (so the URL passes intact). `mika2291_r5_*` controls exactly that.
+- **`[agent] ` prefixes survive both renderings.** `routes.rs` composes
+  `format!("[{name}] {text}")` *before* the send, and `resolve_reply_agent` reads that
+  prefix back off the quoted text to route the user's reply. Frozen by
+  `mika2291_n13_*` through `parse_agent_prefix` itself; widening the recognizer to
+  bare `[text]` would drop the primary route onto its DB fallback — a degradation that
+  breaks nothing visible.
+
+**Kill-switch: `MIKA_TELEGRAM_HTML_RENDER`**, default **armed**, read once per process
+(`OnceLock`), not hot-swappable — set it in the EnvironmentFile / ConfigMap **before**
+startup. `0` / `false` / `off` / `no` disarm; absent, empty, or unrecognized stays
+armed (a typo must not silently switch rendering off) with a WARN naming the value
+between quotes. The field is `Option<String>` and **never `bool`**: under config-rs a
+`bool` makes any non-boolean value a hard `GatewaySettings::load` error, so a typo in
+a p2 cosmetic flag would stop the gateway from booting. No `bool` lives in
+`GatewaySettings`.
+
+**Operator surfaces** (`$MIKA_GATEWAY_LOG_FILE` or stdout). No `audit_events` row per
+send: for a population expected to be empty, the log is enough and a row per message
+would be churn.
+
+- `telegram_html_render_fallback` (WARN — `chat_id`, `description`, `len_html`).
+  **Expected regime: zero lines.** Any occurrence is a message the HTML rendering
+  broke and the fallback saved — both proof the net works and a recognizer case to
+  fix. The message body is **never** logged.
+- `telegram_html_fallback_failed` (WARN). **Expected regime: zero lines.** This is the
+  population where the user actually receives nothing; without the event it would be
+  indistinguishable from an ordinary 502.
+- `telegram_html_render_disabled` (INFO, once at startup, only when disarmed) and
+  `telegram_html_render_unrecognized_value` (WARN). The first exists because the
+  silence of a disarmed renderer looks exactly like the silence of a healthy one
+  (mika#2205).
+
+**Post-deploy probe, with its halt.** Ask a tenant for a reply carrying emphasis and
+check Telegram shows it **rendered** with no `*` visible. Then over 48 h:
+`telegram_html_fallback_failed` must be empty (any line is a user who received
+nothing — treat first), and `telegram_html_render_fallback` should be empty too — a
+few isolated lines mean *read the `description` and fix the recognizer*, not disarm.
+**Halt at a sustained rate (> 1 % of sends): disarm with
+`MIKA_TELEGRAM_HTML_RENDER=0`, fix the recognizer, then re-arm** — a net carrying
+nominal traffic is no longer a net, and it hides the signal that would show the fault
+(mika#2334 doctrine). **Second halt:** if raw markdown **reappears** while
+`telegram_html_render_fallback` is empty, do **not** widen the recognizer — it means
+the text left by a path that does not traverse `send_message_impl`, and establishing
+which path comes before any fix. There is no such path today, so that finding would be
+information about the architecture before it is information about the rendering.
+
+**Known adjacent gap, deliberately out of scope.** `mika-common/src/telegram.rs`
+claims the gateway refuses text at 4096 "as it will be sent, prefix included"; that
+mirror guard **does not exist** — `handle_send` only checks `text.len() > 50_000`
+bytes (`routes.rs`). The unfinished half of mika#2134, unrelated to rendering, and
+covered incidentally by the fallback (a length 400 fails identically on the second
+send and returns that error). Follow-up ticket to open.
+
 ## A2A Auth
 
 API keys are SHA-256 hashed and stored in Postgres `a2a_api_keys` table (migration 003); validated via `validate_a2a_api_key()` with expiry and revocation checks. See `crates/mika-a2a/CLAUDE.md` for A2A protocol details.
@@ -90,6 +196,7 @@ API keys are SHA-256 hashed and stored in Postgres `a2a_api_keys` table (migrati
 - `MIKA_TELEGRAM_WEBHOOK_SECRET` — 64-char hex secret for inbound webhook validation. Required only in single-bot mode (inbound registration).
 - `MIKA_TELEGRAM_WEBHOOK_URL` — Public HTTPS URL for inbound Telegram webhook delivery. Required only in single-bot mode (inbound registration).
 - `MIKA_TELEGRAM_SINGLE_BOT_MODE` — Exclusively controls **inbound global webhook registration**. When `1` or `true`, the gateway registers the global webhook with Telegram for inbound messages (requires all three: `MIKA_TELEGRAM_BOT_TOKEN`, `MIKA_TELEGRAM_WEBHOOK_SECRET`, `MIKA_TELEGRAM_WEBHOOK_URL`). Default: off (per-customer inbound mode). **Semantic narrowing (mika#1590):** pre-fix, this flag gated both inbound webhook registration and outbound client construction; post-fix, it gates inbound registration only — the global outbound client is built whenever `MIKA_TELEGRAM_BOT_TOKEN` is configured.
+- `MIKA_TELEGRAM_HTML_RENDER` — Outbound Telegram rendering kill-switch (mika#2291). **Default: armed** (`parse_mode=HTML`, with a one-shot plain-text fallback on 400). `0` / `false` / `off` / `no` disarm; absent, empty, or unrecognized stays **armed** with a WARN naming the value. `Option<String>`, never `bool` — a `bool` would make a typo a hard `load()` error and stop the gateway from booting. Read once per process, **not hot-swappable**: set it before startup. See § *Outbound Text Rendering*.
 - `MIKA_INTERNAL_TOKEN` — Shared 64-char hex bearer token
 - `MIKA_GATEWAY_ADMIN_READ_TOKEN` — Admin **read-only** bearer token (mika#2360). Opens `GET /admin/tenants/{customer_id}/recurring-tasks` and nothing else. Optional: when absent the route answers 404 (an INFO line at startup says so). Must be **distinct** from `MIKA_INTERNAL_TOKEN` — an equal value disarms the route with a WARN rather than silently voiding the read/write segregation. Never fails startup: a malformed value disarms the route, it does not take the gateway down.
 - `MIKA_AGENTS_NAMESPACE` — K8s namespace where agent pods run (default: `mika-agents`). Used for FQDN construction in cross-namespace DNS resolution (`http://mika-{id}.{ns}.svc.cluster.local:8080`). Override for environment-scoped namespaces (e.g. `mika-agents-prd`).
