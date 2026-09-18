@@ -108,9 +108,20 @@ le **nom** « doctrine », et la butée.
 ### F5 — « exportable » est revendiqué aujourd'hui et n'est vérifiable nulle part ici
 
 Le ticket exige : « ne pas revendiquer 'exportable' tant que non vérifié ». Or la
-revendication est **déjà dans le prompt** depuis mika#2290 (`prompt.rs:1000`,
-bras `Operator/Cloud`), dans le texte de remède de la garde
-(`guards.rs:2732`), dans `agent_loop/mod.rs:2222` et dans `docs/architecture.md:26`.
+revendication est **déjà dans le prompt** depuis mika#2290. Inventaire exhaustif —
+**cinq** sites, dont un doc-comment :
+
+| site | nature |
+|---|---|
+| `prompt.rs:1000` | bras `(Operator, Cloud)` de `hosting_ground_truth_line` — servi au modèle |
+| `prompt.rs:983` | doc-comment de la même fonction — non servi, mais c'est lui qui **motive** les quatre autres |
+| `guards.rs:2732` | texte de remède de la garde 5d |
+| `agent_loop/mod.rs:2222` | ligne de re-prompt |
+| `docs/architecture.md:26` | documentation publique |
+
+```bash
+grep -rn "exportable" crates/mika-agent/src/ docs/architecture.md
+```
 
 Recherche exhaustive d'une fonctionnalité d'export dans ce dépôt : **zéro**.
 
@@ -141,11 +152,20 @@ devient un test (§ *Verification contract* V4).
 ### F7 — Les deux builders portent déjà `persona_profile`
 
 `PromptContext.persona_profile` (`prompt.rs:902`) et
-`SilentPromptContext.persona_profile` (`prompt.rs:1711`). Le créneau
-d'insertion est libre et évident : juste après `write_distribution_doctrine_section`,
-avant `write_identity_section`, dans `build_system_prompt` (`prompt.rs:1227`) et
-`build_silent_prompt` (`prompt.rs:1745`). **Aucun élargissement de signature
-n'est nécessaire.**
+`SilentPromptContext.persona_profile` (`prompt.rs:1711`). **Aucun élargissement
+de signature n'est nécessaire** : la fonction d'écriture prend le persona en
+argument, exactement comme `write_runtime_section` le fait déjà.
+
+L'ordre réel des deux builders est identique, et c'est lui qui contraint le
+créneau :
+
+```
+soul → Distribution Doctrine → Identity → Runtime → Self-Identity Discipline
+     → data-grade → Time → Channel → core-memory → …
+```
+
+Deux créneaux sont admissibles, et le plan choisit le premier — **motivé en D10**,
+parce que c'est la décision que ce plan prend le moins mécaniquement.
 
 ---
 
@@ -284,13 +304,32 @@ vocabulaire**, et elle est épinglée par un scan de constantes (V3) : un futur
 éditeur qui trouve la butée « floue » et l'énumère pour la rendre concrète fait
 rougir un test au lieu de créer la fuite.
 
-### D7 — Carve-out compact, comme ses deux sœurs
+### D7 — Carve-out compact, comme ses deux sœurs — et le carve-out est **par section**, pas global
 
-`build_compact_system_prompt` (MikaModel, ≤ 5 KB) ne rend ni
-`## Distribution Doctrine` (mika#1814), ni la ligne d'hébergement
-(`mika2290_compact_prompt_omits_the_hosting_line`), ni le bloc stop-topics
-(mika#1813). `## Mika Doctrine` non plus — **décision épinglée par un test, pas
-un oubli**, et rattachée au suivi mika#1925 comme les trois autres.
+Précision qui évite une lecture fausse du plan : `build_compact_system_prompt`
+**rend bien une doctrine**, la *data-grade* abrégée de mika#1798
+(`write_data_grade_doctrine_section_compact`, ~250 car., capée à 400, épinglée
+par `build_compact_system_prompt_includes_abbreviated_doctrine`). Le compact
+n'est donc pas « sans doctrine » : chaque section y est arbitrée séparément, et
+une seule a payé le budget — celle qui porte un invariant HARD-NO dont la
+violation est irréversible.
+
+Ce qu'il ne rend pas : `## Distribution Doctrine` (mika#1814), la ligne
+d'hébergement (`mika2290_compact_prompt_omits_the_hosting_line`), le bloc
+stop-topics (mika#1813), et `## Self-Identity Discipline` en entier — le
+commentaire du site le dit mot pour mot (« the MikaModel compact budget cannot
+afford the full Self-Identity Discipline block »).
+
+`## Mika Doctrine` rejoint ce second groupe — **décision épinglée par un test, pas
+un oubli** — et le motif est celui que le site écrit déjà pour la ligne
+d'hébergement : ce carve-out retire *l'intention*, jamais une protection, parce
+que le registre matériel est un fait et non une garde. Coût nommé, et il est réel
+ici alors qu'il ne l'était pas pour mika#2290 : sur le chemin compact le défaut
+mesuré **reste ouvert** — un tenant MikaModel interrogé sur « la doctrine »
+retombe sur la règle 3 (« je ne sais pas ») faute de la section. C'est accepté
+parce que la population mesurée (tenant champion d'Al) n'est pas servie par ce
+chemin, et rattaché au suivi mika#1925 avec les trois autres carve-outs plutôt
+que refermé ici à coups d'exception.
 
 ### D8 — Mode silencieux : oui, et pour une raison qui lui est propre
 
@@ -317,6 +356,40 @@ dans chaque prompt. Section rendue à l'identique, ce motif écrit au site.
 - **jamais « local » sur un tenant cloud** : déjà posé et déjà gardé par
   mika#2290 (règle 5 + garde 5d). **Cité, pas re-narré** (F4), et la formulation
   est testée contre le prédicat de la garde (F6, V4).
+
+### D10 — Le créneau : **adossé à `## Distribution Doctrine`**, pas à `## Runtime`
+
+Les deux placements satisfont V8 (la section précède la discipline qui la cite).
+Ils diffèrent par ce qu'ils rendent adjacent, et l'alternative mérite d'être
+écrite parce qu'elle a un vrai argument.
+
+**Alternative — juste après `write_runtime_section`, avant la discipline.**
+Argument : c'est la trajectoire exacte de mika#2290, qui a posé son fait
+d'hébergement *dans* `## Runtime`, collé à la règle 5 qui le cite. La proximité
+physique entre le fait et la règle qui l'invoque aide le modèle.
+
+**Choix retenu — juste après `write_distribution_doctrine_section`, avant
+`write_identity_section`.** Trois motifs, par ordre de force :
+
+1. **`## Runtime` est un bloc de faits *machine*, peuplé à l'exécution** —
+   provider, modèle, hébergement résolu. `## Mika Doctrine` est un bloc de faits
+   *projet*, constants au binaire. Les glisser dans le même bloc ferait de
+   `## Runtime` deux choses, et la première section qui grossit sans frontière
+   est celle qu'un futur ticket coupera au mauvais endroit.
+2. **Les deux doctrines se lisent ensemble.** F4 établit que le corps *cite*
+   `## Distribution Doctrine` au lieu de re-narrer la croissance par invitation.
+   Un renvoi vers la section immédiatement précédente est une adjacence ; un
+   renvoi par-dessus `## Identity` et `## Runtime` est une référence à distance,
+   et c'est précisément la distance qui a produit le défaut mesuré.
+3. **La priorité de contexte le dit déjà.** Le commentaire du site mika#1814
+   motive sa position par « binds before identity/time/channel context so the
+   invitation-only limit is the first per-agent rule the model reads ». Le même
+   argument vaut mot pour mot ici.
+
+Ce que le choix coûte, nommé : la règle 6 cite une section qui n'est plus sa
+voisine immédiate. C'est atténué par la forme de la citation — la règle 6 nomme
+`## Mika Doctrine` **par son en-tête**, pas par « la section ci-dessus », ce qui
+est aussi la raison pour laquelle V8 vérifie l'**ordre** et non l'adjacence.
 
 ---
 
@@ -351,6 +424,87 @@ Ajoutée après la règle 5, avant le paragraphe de clôture auto-référentiel.
 porte les trois clauses de D5 : élargissement de portée, désignation de
 `## Mika Doctrine` comme vérité de terrain, refus nommé de « rien trouvé qui
 s'appelle ainsi ». Aucun changement de signature.
+
+### V-B bis — Le contenu prescrit des deux corps
+
+Un plan de prompt qui ne pose que la forme laisse à l'implémenteur la décision la
+plus sensible du ticket — la formulation de la butée et le *pourquoi* de chaque
+parti pris — et laisse V3/V5/V6/V7 scanner un texte que personne n'a arbitré. La
+substance est donc prescrite ici. **La rédaction finale peut varier ; les
+contraintes en gras ne le peuvent pas.**
+
+**Registre de langue : l'anglais, dans les deux corps.** Ce n'est pas une
+incohérence avec `FAMILY_SOUL`, qui est en français : une constante de prompt est
+une **directive au modèle**, pas du texte servi à l'utilisateur, et
+`hosting_ground_truth_line` écrit déjà son bras `(Family, Cloud)` en anglais
+(« You run on a server, not on the person's phone or computer »). Le précédent
+pour une formulation-exemple servie telle quelle existe aussi
+(`DISTRIBUTION_DOCTRINE_BODY` cite une phrase FR en bloc `>`) et reste
+disponible si la butée famille gagne à être donnée mot pour mot.
+
+#### `MIKA_DOCTRINE_BODY_OPERATOR` — substance
+
+1. **Le nom et ses alias, en tête.** « doctrine », « la doctrine Mika », « tes
+   partis pris », « ta philosophie », « en quoi tu crois », « what do you stand
+   for » désignent **cette section**. C'est la ligne qui ferme le défaut mesuré,
+   et elle vient en premier parce que c'est le chaînon qui manquait.
+2. **Les partis pris, chacun avec son pourquoi** — le *pourquoi* est l'exigence
+   du ticket (AC2), et c'est lui qui distingue une doctrine d'une liste de
+   fonctionnalités :
+   - *moteur open source (MIT)* — pour que personne ne dépende d'une seule
+     entreprise pour l'assistant qui connaît sa vie. **Porté sur le moteur**,
+     jamais sur « Mika » en bloc (D9) ;
+   - *les données de la personne lui appartiennent* — **c'est un engagement, pas
+     un fait d'hébergement** ; formulation qui rend V4 vrai par construction
+     plutôt que par prudence rédactionnelle (voir la contrainte ci-dessous) ;
+   - *proactivité* — parce qu'un assistant qui attend qu'on lui demande reporte
+     la charge mentale sur la personne au lieu de la prendre ;
+   - *mémoire persistante* — parce que devoir se re-présenter à chaque
+     conversation est le contraire d'être assisté ; c'est un choix, pas un effet
+     de bord technique ;
+   - *croissance par invitation* — **renvoi** à `## Distribution Doctrine`, sans
+     re-narration (F4).
+3. **Renvoi d'hébergement.** Une question sur *où* tu tournes ou *où* vivent les
+   données se répond depuis la ligne d'hébergement de `## Runtime`, **jamais
+   depuis cette section**.
+4. **La butée topique** (D3), sans aucun référent : si on t'interroge sur une
+   dimension spirituelle, ésotérique ou initiatique de Mika, sur son origine, ou
+   sur quoi que ce soit qui n'est pas écrit ici — tu ne sais pas, tu n'inventes
+   pas, et tu dis que c'est un choix du créateur de Mika, qui n'est pas exposé.
+
+**Contraintes dures sur ce corps :**
+
+- **Aucune phrase de localité**, même vraie. Le parti pris « les données
+  appartiennent à la personne » est formulé comme un **engagement** et le corps
+  **renvoie** à `## Runtime` pour le fait physique. C'est ce qui rend V4 vrai par
+  construction : sans sujet de localité, le prédicat de la garde 5d n'a rien à
+  apparier, et on ne dépend pas de la présence d'un marqueur conditionnel dans
+  une phrase qu'un futur éditeur reformulerait.
+- **Le mot « exportable » n'apparaît pas** (F5, V7).
+- **Aucun référent spirituel n'est nommé** (D3, V3).
+
+#### `MIKA_DOCTRINE_BODY_FAMILY` — substance
+
+Même ossature, **sans un seul terme d'infrastructure** : ni licence, ni dépôt,
+ni open source, ni auto-hébergement, ni serveur. Ce n'est pas une amputation
+arbitraire — c'est la part de la doctrine qui n'a pas de sens pour quelqu'un qui
+n'a pas d'infrastructure (D2).
+
+1. Les mêmes alias désignent cette section.
+2. Ce qui est conservé, en mots de tous les jours : *ce que la personne te confie
+   lui appartient* ; *tu te souviens de ce qui compte pour elle, et c'est
+   voulu* ; *tu remarques et tu proposes au lieu d'attendre qu'on te demande* ;
+   *on te découvre par quelqu'un qui te connaît déjà, jamais par une publicité*.
+   Chacun avec son pourquoi, en une proposition.
+3. La butée, **sans référent créateur** (D4) : « il y a des choses que tu ne sais
+   pas et que tu n'inventeras pas ; dis-le simplement ». Aucun « créateur »,
+   aucun nom, aucune histoire d'origine — ce qui satisfait simultanément le
+   bearing de Prime et la clôture `the-being-does-not-have-a-maker-it-knows-about`
+   de mika#1783.
+4. Renvoi d'hébergement identique, vers la ligne famille de `## Runtime`.
+
+**Contraintes dures :** les trois du corps opérateur, **plus** l'absence de
+jargon (V5) et l'absence de référent créateur (V6).
 
 ### V-C — Les tests (`prompt.rs::tests`, préfixe `mika2292_`)
 
@@ -415,6 +569,11 @@ décision fausse, elle créerait la fuite en silence.
 
 - [ ] `MIKA_DOCTRINE_HEADING` + les deux corps, chacun avec son doc-comment
       portant provenance des faits et motifs de refus
+- [ ] les deux corps portent la substance prescrite en V-B bis, alias en tête et
+      *pourquoi* par parti pris (AC2), et respectent leurs contraintes dures :
+      aucune phrase de localité (V4 vrai par construction, non par prudence
+      rédactionnelle), aucun « exportable » (V7), aucun référent spirituel (V3),
+      et pour le corps famille aucun jargon (V5) ni référent créateur (V6)
 - [ ] `doctrine_body` / `write_mika_doctrine_section`, `match` exhaustif
 - [ ] rendue dans `build_system_prompt` et `build_silent_prompt`, omise du
       compact avec le motif écrit au point d'omission
@@ -530,9 +689,10 @@ si personne ne pose la question** — c'est la limite que mika#2290 a déjà dû
 
 ## Hors périmètre (suivi à ouvrir)
 
-1. **« exportable » revendiqué sans fonctionnalité vérifiable (F5).** Quatre
-   sites : `prompt.rs:1000`, `guards.rs:2732`, `agent_loop/mod.rs:2222`,
-   `docs/architecture.md:26`. Question de vérification à porter dans le ticket :
+1. **« exportable » revendiqué sans fonctionnalité vérifiable (F5).** Cinq
+   sites, inventoriés en F5 — dont le doc-comment `prompt.rs:983`, à corriger
+   avec les quatre autres puisque c'est lui qui les motive. Question de
+   vérification à porter dans le ticket :
    *`mika-cloud` expose-t-il un export des données du tenant ?* Si oui, nommer la
    surface dans la doctrine ; si non, retirer le mot des quatre sites. **Ne pas
    trancher depuis ce dépôt** : la donnée du tenant n'y vit pas.
