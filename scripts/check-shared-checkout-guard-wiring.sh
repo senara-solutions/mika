@@ -16,7 +16,11 @@
 # La racine est un argument pour que l'anti-vacuité puisse l'exercer sur des
 # arborescences dégradées — même motif que check-dispatch-seats-declared.sh.
 
-set -uo pipefail
+# `-e` comme les six autres check-*.sh du répertoire (unanimité mesurée) : il
+# est inerte tant que chaque commande vit dans une conditionnelle, et c'est
+# précisément pourquoi il doit être posé maintenant — la ligne non conditionnée
+# qu'un futur correctif ajoutera continuerait sinon en silence après son échec.
+set -euo pipefail
 
 REPO_ROOT=${1:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}
 SETTINGS="$REPO_ROOT/.claude/settings.json"
@@ -124,6 +128,35 @@ if jq -e 'has("permissions")' "$SETTINGS" >/dev/null 2>&1; then
 		"la retirer: le settings.local.json copié dans chaque worktree ne porte QUE 'permissions', et la disjonction des clés est ce qui rend la cohabitation sûre"
 else
 	pass ".claude/settings.json ne porte pas 'permissions' (clés disjointes du settings.local.json)"
+fi
+
+# --- 4. Le fichier ne déclare RIEN D'AUTRE ----------------------------------
+# Les contrôles ci-dessus vérifient une PRÉSENCE. Sur un fichier suivi qui fait
+# exécuter du code à chaque collaborateur avant chaque appel Bash, l'absence
+# compte autant : un second hook, un autre évènement, ou une commande
+# supplémentaire glissée dans la même entrée passerait tous les tests de
+# présence. Ce qu'on épingle ici est la SURFACE, pas le câblage.
+if jq -e '[keys[]] - ["$comment", "hooks"] | length == 0' "$SETTINGS" >/dev/null 2>&1; then
+	pass ".claude/settings.json ne déclare que \$comment et hooks"
+else
+	fail ".claude/settings.json déclare une clé de premier niveau inattendue" \
+		"ce fichier ne porte que la garde: toute autre clé élargit ce que le dépôt impose à chaque session, et doit être décidée pour elle-même"
+fi
+
+if jq -e '[.hooks | keys[]] - ["PreToolUse", "SessionStart"] | length == 0' "$SETTINGS" >/dev/null 2>&1; then
+	pass "aucun évènement de hook autre que PreToolUse et SessionStart"
+else
+	fail ".claude/settings.json déclare un évènement de hook inattendu" \
+		"seuls PreToolUse (la garde) et SessionStart (la preuve d'armement) sont prévus ici"
+fi
+
+if jq -e --arg g "$GUARD_REL" \
+	'[.hooks[][].hooks[].command] | length == 2 and (map(contains($g)) | all)' \
+	"$SETTINGS" >/dev/null 2>&1; then
+	pass "les deux seules commandes déclarées invoquent la garde"
+else
+	fail ".claude/settings.json déclare une commande de hook qui n'est pas la garde" \
+		"ce fichier fait tourner du code sur chaque machine qui clone le dépôt: il ne doit invoquer que $GUARD_REL, et exactement deux fois"
 fi
 
 if [ "$FAIL" -ne 0 ]; then

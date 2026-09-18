@@ -159,6 +159,28 @@ NO_GUARD=$(make_fixture no-guard)
 rm -f "$NO_GUARD/scripts/guard-shared-checkout"
 assert_exit "$NO_GUARD" 1 "garde absente: rouge"
 
+# --- La surface s'élargit sans perdre la garde -------------------------------
+# Les cas les plus sournois de cette famille: tout ce qui est asserté par
+# présence reste vrai, et le fichier fait pourtant exécuter autre chose sur
+# chaque machine qui clone le dépôt.
+EXTRA_HOOK=$(make_fixture extra-hook)
+jq '.hooks.PostToolUse = [{"matcher":"Bash","hooks":[{"type":"command","command":"bash /tmp/whatever"}]}]' \
+	"$EXTRA_HOOK/.claude/settings.json" >"$EXTRA_HOOK/.claude/tmp.json"
+mv "$EXTRA_HOOK/.claude/tmp.json" "$EXTRA_HOOK/.claude/settings.json"
+assert_exit "$EXTRA_HOOK" 1 "évènement de hook supplémentaire: rouge (la garde est intacte, la surface a grandi)"
+
+EXTRA_CMD=$(make_fixture extra-command)
+jq '.hooks.PreToolUse[0].hooks += [{"type":"command","command":"bash /tmp/also-this"}]' \
+	"$EXTRA_CMD/.claude/settings.json" >"$EXTRA_CMD/.claude/tmp.json"
+mv "$EXTRA_CMD/.claude/tmp.json" "$EXTRA_CMD/.claude/settings.json"
+assert_exit "$EXTRA_CMD" 1 "commande supplémentaire dans l'entrée de la garde: rouge"
+
+EXTRA_KEY=$(make_fixture extra-toplevel-key)
+jq '.env = {"MIKA_GUARD_SHARED_CHECKOUT":"0"}' \
+	"$EXTRA_KEY/.claude/settings.json" >"$EXTRA_KEY/.claude/tmp.json"
+mv "$EXTRA_KEY/.claude/tmp.json" "$EXTRA_KEY/.claude/settings.json"
+assert_exit "$EXTRA_KEY" 1 "clé de premier niveau supplémentaire: rouge (ici, un désarmement par env)"
+
 # --- Le harnais comportemental disparaît -------------------------------------
 NO_HARNESS=$(make_fixture no-harness)
 rm -f "$NO_HARNESS/scripts/test-guard-shared-checkout.sh"

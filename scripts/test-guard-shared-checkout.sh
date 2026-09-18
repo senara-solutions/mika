@@ -149,6 +149,36 @@ expect deny "git push depuis un cwd dérivé" "$WT" "$MAIN" "git push --force or
 expect deny "git clean -fdx depuis un cwd dérivé" "$WT" "$MAIN" "git clean -fdx"
 
 # ---------------------------------------------------------------------------
+# Portée du répertoire simulé — la direction CHÈRE.
+#
+# Un `cd` qui ne revient jamais impute au mauvais arbre toutes les commandes qui
+# suivent : la garde refuse alors un geste que le vrai shell exécute dans le
+# worktree. Chaque cas porte son jumeau inverse, sinon un simulateur devenu
+# constant rendrait la moitié des lignes vertes tout seul.
+# ---------------------------------------------------------------------------
+printf '\n== Portée du cd : le sous-shell rend le répertoire ==\n'
+expect allow "(cd <partagé> && ls) puis git rebase dans le worktree" \
+	"$WT" "$WT" "(cd $MAIN && ls -la) && git rebase origin/main"
+expect deny "… mais une mutation git DANS le sous-shell est bien vue" \
+	"$WT" "$WT" "(cd $MAIN && git fetch origin)"
+expect allow "cd <partagé> && git log && cd - && git add -A" \
+	"$WT" "$WT" "cd $MAIN && git log --oneline && cd - && git add -A"
+expect deny "… mais le git log n'était pas une mutation, celui-ci en est une" \
+	"$WT" "$WT" "cd $MAIN && git add -A && cd -"
+expect allow "pushd <partagé> … popd puis git commit dans le worktree" \
+	"$WT" "$WT" "pushd $MAIN && git status && popd && git commit -m x"
+expect deny "… mais la mutation entre pushd et popd est vue" \
+	"$WT" "$WT" "pushd $MAIN && git reset --hard && popd"
+expect deny "parenthèses déséquilibrées : on retombe sur le cwd de session, sans rater la cible explicite" \
+	"$WT" "$WT" "(cd $MAIN && git status) ) ) && git -C $MAIN add ."
+
+printf '\n== Préfixes de segment : lanceur puis assignation ==\n'
+expect deny "env GIT_WORK_TREE=<partagé> git add (assignation APRÈS le lanceur)" \
+	"$WT" "$WT" "env GIT_WORK_TREE=$MAIN git add ."
+expect allow "env GIT_WORK_TREE=<son worktree> git add" \
+	"$WT" "$WT" "env GIT_WORK_TREE=$WT git add ."
+
+# ---------------------------------------------------------------------------
 # AC3 — allow-list de lecture, pas deny-list de mutation
 # ---------------------------------------------------------------------------
 printf '\n== AC3 — un verbe non classé visant hors du worktree est refusé ==\n'
@@ -156,6 +186,20 @@ expect deny "verbe inconnu « frobnicate » (absent des DEUX listes)" \
 	"$WT" "$MAIN" "git frobnicate --wildly"
 expect deny "verbe inconnu « sparse-checkout »" "$WT" "$WT" "git -C $MAIN sparse-checkout set x"
 expect deny "alias local non résoluble (« st »)" "$WT" "$MAIN" "git st"
+# Sous-formes mutantes qui ne portent qu'un positionnel, donc qu'un comptage
+# de positionnels seul classait en lecture.
+expect deny "symbolic-ref -d HEAD (supprime HEAD, un seul positionnel)" \
+	"$WT" "$WT" "git -C $MAIN symbolic-ref -d HEAD"
+expect deny "symbolic-ref --delete HEAD" "$WT" "$WT" "git -C $MAIN symbolic-ref --delete HEAD"
+expect deny "config --unset" "$WT" "$WT" "git -C $MAIN config --unset user.name"
+expect deny "reflog expire" "$WT" "$WT" "git -C $MAIN reflog expire --all"
+expect deny "notes add" "$WT" "$WT" "git -C $MAIN notes add -m x"
+# … et leurs jumelles lisantes, pour que le refus ci-dessus ne soit pas un
+# refus de toute la famille.
+expect allow "branch --list avec motif (ne mute rien)" "$WT" "$WT" "git -C $MAIN branch --list 'fix/*'"
+expect allow "branch -a avec motif" "$WT" "$WT" "git -C $MAIN branch -a 'rel/*'"
+expect deny "branch --list -d x (la recherche de mutation passe d'abord)" \
+	"$WT" "$WT" "git -C $MAIN branch --list -d x"
 
 # ---------------------------------------------------------------------------
 # AC2 — la garde ne coûte rien au nominal.
@@ -272,6 +316,32 @@ if [ -f "$DENY_LOG" ] && grep -q "deny project=$WT" "$DENY_LOG" && grep -q "targ
 	ok "le refus journalise project-dir, cible et commande"
 else
 	ko "le refus journalise project-dir, cible et commande" "contenu: $(cat "$DENY_LOG" 2>/dev/null)"
+fi
+
+# ---------------------------------------------------------------------------
+# AC6 (suite) — le journal ne publie pas de secret.
+#
+# La ligne de refus porte la commande, et une commande de ce dépôt peut porter
+# un jeton. Le test asserte les DEUX directions : le secret est absent, ET les
+# champs exploitables survivent — un scrub qui viderait la ligne passerait la
+# première assertion en détruisant la valeur de l'instrument.
+# ---------------------------------------------------------------------------
+printf '\n== AC6 — aucun secret ne survit dans le journal ==\n'
+SECRET_LOG="$TMPROOT/secret.log"
+SECRET_CMD="GH_TOKEN=ghp_AbCdEfGhIjKlMnOpQrSt git -C $MAIN push https://user:hunter2seekrit@github.com/o/r"
+MIKA_GUARD_SHARED_CHECKOUT_LOG="$SECRET_LOG" \
+	bash "$GUARD" --decide "$WT" "$WT" "$SECRET_CMD" >/dev/null 2>&1
+for secret in 'ghp_AbCdEfGhIjKlMnOpQrSt' 'hunter2seekrit'; do
+	if grep -q "$secret" "$SECRET_LOG" 2>/dev/null; then
+		ko "le journal ne porte pas « $secret »" "le secret est en clair dans $SECRET_LOG"
+	else
+		ok "le journal ne porte pas « $secret »"
+	fi
+done
+if grep -q "verb=push" "$SECRET_LOG" 2>/dev/null && grep -q "target=$MAIN" "$SECRET_LOG" 2>/dev/null; then
+	ok "le journal garde verbe et cible (le scrub n'a pas vidé l'instrument)"
+else
+	ko "le journal garde verbe et cible" "contenu: $(cat "$SECRET_LOG" 2>/dev/null)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -403,6 +473,19 @@ fi
 # refuser » de « rien n'est armé » — et donc ce qui rend le fail-open ci-dessus
 # un arbitrage observable plutôt qu'un désarmement silencieux.
 # ---------------------------------------------------------------------------
+# Le pré-filtre d'armement a d'abord été écrit sur la charge BRUTE, et une
+# commande portant le littéral « SessionStart » désarmait donc la garde pour ce
+# tour. Contrôle négatif du filtre : les deux directions, parce qu'un filtre
+# devenu constant rendrait le premier cas vert tout seul.
+HOOK_SESSIONSTART_LITERAL=$(printf 'grep SessionStart .claude/settings.json && git -C %s reset --hard' "$MAIN")
+hook_payload "$WT" "$HOOK_SESSIONSTART_LITERAL" | CLAUDE_PROJECT_DIR="$WT" bash "$GUARD" >/dev/null 2>&1
+if [ "$?" -eq 2 ]; then
+	ok "une commande portant le littéral « SessionStart » ne désarme pas la garde"
+else
+	ko "une commande portant le littéral « SessionStart » ne désarme pas la garde" \
+		"la branche d'armement a avalé une charge PreToolUse: le pré-filtre décide au lieu d'écarter"
+fi
+
 printf '\n== AC4 — ligne d'"'"'armement SessionStart ==\n'
 ARM_LOG="$TMPROOT/arm.log"
 jq -nc '{hook_event_name:"SessionStart",source:"startup"}' |

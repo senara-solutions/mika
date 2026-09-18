@@ -95,6 +95,12 @@ Le chemin du journal est surchargeable par `MIKA_GUARD_SHARED_CHECKOUT_LOG`.
 une observation, pas un terme du prédicat ; une garde qui refuserait parce
 qu'elle n'a pas pu écrire son log serait un fail-closed déguisé.
 
+La commande journalisée est **scrubée avant d'être tronquée** (motifs alignés
+sur `crates/mika-agent/src/secret_scrubber.rs`, qui fait foi en cas de
+divergence) et le fichier est créé en `0600`. Ce scrub couvre les formes de
+jeton que ce dépôt connaît, pas toutes les formes possibles : le journal reste
+un fichier à ne pas publier tel quel.
+
 ### Portée
 
 La garde ne gouverne que les sessions enracinées dans **ce** dépôt : elle ferme
