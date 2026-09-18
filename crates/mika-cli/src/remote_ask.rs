@@ -32,6 +32,151 @@ pub enum OutputFormat {
     Json,
 }
 
+/// Exit code for a transport-class failure — `EX_TEMPFAIL` from `sysexits.h`,
+/// "temporary failure, retry later" (mika#2278).
+///
+/// It collides with nothing: this CLI emits only `0` and `1` of its own, plus
+/// clap's own codes for an argument error. The other `mika ask` callers under
+/// `skills/bundled/**` are all `--task-complete`, a path that returns *before*
+/// the A2A send and therefore can never produce this code.
+pub const EXIT_TRANSPORT_FAILURE: i32 = 75;
+
+/// Whether a `mika ask` failure is worth attempting again (mika#2278).
+///
+/// # The class comes from the variant, never from the message text
+///
+/// The caller that needs this distinction is a shell loop, and the cheapest
+/// thing it could have done is `grep` the error text for "Retry." — which would
+/// turn a sentence written for a human into a wire format. The house has ruled
+/// on this twice already: mika#2179 takes its error classes from the `LlmError`
+/// *variant* via `downcast_ref` and never from a substring of the rendered
+/// message, and mika#2291 triggers its fallback on the HTTP *status* and never
+/// on a substring of Telegram's `description`. So the class travels as a typed
+/// marker on the error ([`TransportClass`]) and surfaces as a dedicated process
+/// exit code; not one byte of any message changes.
+///
+/// # Which way the doubtful cases lean, and why
+///
+/// A false `Transport` costs one architect turn paid twice — a few minutes and
+/// a few cents. A false `Contract` costs the whole pass, the dispatch slot, and
+/// one point of the re-drive budget; three of those abandon a healthy ticket in
+/// `operator-review` (mika#2020). The costs are not of the same order, so the
+/// transport family leans entirely towards `Transport` — bounded to a single
+/// retry, like every budget in this codebase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureClass {
+    /// Transient: the exchange failed on the way, and the same request may well
+    /// succeed. Surfaces as [`EXIT_TRANSPORT_FAILURE`].
+    Transport,
+    /// Definitive: a broken contract, a usage error, or a turn the server ran
+    /// and refused. Re-sending the same request does not change the answer.
+    Contract,
+}
+
+/// A failure the caller may retry, carried as a type on the `anyhow` chain.
+///
+/// The marker *is* the error: its `Display` is the operator-facing message, so
+/// attaching the class costs the printed text nothing. Readers ask
+/// [`is_transport_failure`], never a string comparison.
+#[derive(Debug)]
+pub struct TransportClass {
+    message: String,
+}
+
+impl TransportClass {
+    /// Wrap an already-composed operator-facing message as transport-class.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for TransportClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TransportClass {}
+
+/// Build a failure carrying its class, with `message` as the visible text.
+///
+/// Both arms render identically under `{e}` and `{e:#}`; only the type differs.
+fn classified(class: FailureClass, message: String) -> anyhow::Error {
+    match class {
+        FailureClass::Transport => anyhow::Error::new(TransportClass::new(message)),
+        FailureClass::Contract => anyhow::anyhow!("{message}"),
+    }
+}
+
+/// Whether this failure is transport-class.
+///
+/// Walks the whole `anyhow` cause chain rather than inspecting only the
+/// outermost error: `wrap_send_error` re-composes the message at the CLI
+/// boundary, and a future context layer must not silently demote the class.
+pub fn is_transport_failure(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| cause.is::<TransportClass>())
+}
+
+/// The process exit code a failed `mika ask` must leave behind.
+///
+/// Fail-safe in the house direction (mika#2278 D4): anything not *positively*
+/// known to be transport exits `1`. A shell wrapper retries on `75` only, so an
+/// unforeseen failure mode becomes a loud single failure rather than a silent
+/// retry loop.
+pub fn exit_code_for(err: &anyhow::Error) -> i32 {
+    if is_transport_failure(err) {
+        EXIT_TRANSPORT_FAILURE
+    } else {
+        1
+    }
+}
+
+/// Class of an [`A2aError`] raised by `message/send`.
+///
+/// Exhaustive on purpose, with no `_` arm: a new variant must be classified by
+/// whoever adds it, not silently absorbed into the safe-looking default.
+fn a2a_error_class(err: &A2aError) -> FailureClass {
+    match err {
+        // Everything reqwest could not complete: connection refused (the
+        // restart this ticket is about — the port simply does not answer),
+        // timeout, non-2xx status, unreadable body, socket closed mid-flight.
+        A2aError::ClientError(_) => FailureClass::Transport,
+        // A malformed envelope, a body that would not serialize, a state
+        // machine that refused a transition. None of these is repaired by
+        // sending the same thing again.
+        A2aError::InvalidJsonRpc(_)
+        | A2aError::SerializationError(_)
+        | A2aError::InvalidStateTransition { .. } => FailureClass::Contract,
+    }
+}
+
+/// Class of a `Task` state that a synchronous `message/send` should not have
+/// returned, or returned as a refusal.
+///
+/// Exhaustive for the same reason as [`a2a_error_class`].
+fn terminal_state_class(state: TaskState) -> FailureClass {
+    match state {
+        // Async-dispatch states the server owes us no answer in: per A2A v0.3
+        // §6 a synchronous send returns a terminal-or-pending state, so seeing
+        // one of these is an anomaly of the server's own making — exactly the
+        // kind a second attempt clears.
+        TaskState::Submitted | TaskState::Working | TaskState::Unknown => FailureClass::Transport,
+        // A turn the server actually ran and ended without an answer. Re-sending
+        // the same brief does not change that verdict. (The *other* `failed` —
+        // the one `startup_recovery` writes on a turn a restart killed — never
+        // reaches here: its exchange died at transport and is read through
+        // `Recovery::Ended` inside the `ClientError` arm above.)
+        TaskState::Failed | TaskState::Canceled | TaskState::Rejected => FailureClass::Contract,
+        // Not failures at all; listed so that adding a state cannot compile
+        // without a decision being taken about it.
+        TaskState::Completed | TaskState::InputRequired | TaskState::AuthRequired => {
+            FailureClass::Contract
+        }
+    }
+}
+
 /// Render an A2A `Task`'s text content, or report that there is none to render.
 ///
 /// Thin CLI-facing name for [`mika_a2a::render::render_task_text`]. The reading
@@ -260,39 +405,59 @@ pub async fn send_message_to_agent(
         .await
     {
         Ok(task) => task,
-        Err(A2aError::InvalidJsonRpc(msg)) => anyhow::bail!("remote error: {msg}"),
-        Err(A2aError::ClientError(e)) => {
-            let failure = TransportFailure::classify(&e);
-            // Only attempt recovery when the request actually left. A server
-            // that was never reached cannot hold a task, and asking it for one
-            // would be a phantom recovery.
-            let recovery = if failure.request_was_sent() {
-                Some(recover_by_context(url, auth_token, &context_id).await)
-            } else {
-                None
-            };
-            match recovery {
-                Some(Recovery::Recovered(recovered)) => {
-                    tracing::warn!(
-                        context_id = %context_id,
-                        task_id = %recovered.id,
-                        failure = ?failure,
-                        "reclaimed a generated A2A response after a transport failure"
-                    );
-                    *recovered
+        // The class is read off the variant *before* destructuring (mika#2278):
+        // every arm below then carries it without re-deciding, so the exit code
+        // and the message can never disagree about what happened.
+        Err(err) => {
+            let class = a2a_error_class(&err);
+            match err {
+                A2aError::InvalidJsonRpc(msg) => {
+                    return Err(classified(class, format!("remote error: {msg}")));
                 }
-                other => anyhow::bail!(transport_error_message(
-                    failure,
-                    url,
-                    client.timeout(),
-                    &context_id,
-                    other.as_ref(),
-                )),
+                A2aError::ClientError(e) => {
+                    let failure = TransportFailure::classify(&e);
+                    // Only attempt recovery when the request actually left. A server
+                    // that was never reached cannot hold a task, and asking it for one
+                    // would be a phantom recovery.
+                    let recovery = if failure.request_was_sent() {
+                        Some(recover_by_context(url, auth_token, &context_id).await)
+                    } else {
+                        None
+                    };
+                    match recovery {
+                        Some(Recovery::Recovered(recovered)) => {
+                            tracing::warn!(
+                                context_id = %context_id,
+                                task_id = %recovered.id,
+                                failure = ?failure,
+                                "reclaimed a generated A2A response after a transport failure"
+                            );
+                            *recovered
+                        }
+                        other => {
+                            return Err(classified(
+                                class,
+                                transport_error_message(
+                                    failure,
+                                    url,
+                                    client.timeout(),
+                                    &context_id,
+                                    other.as_ref(),
+                                ),
+                            ));
+                        }
+                    }
+                }
+                A2aError::SerializationError(e) => {
+                    return Err(classified(class, format!("serialization error: {e}")));
+                }
+                A2aError::InvalidStateTransition { from, to } => {
+                    return Err(classified(
+                        class,
+                        format!("invalid state transition from {from} to {to}"),
+                    ));
+                }
             }
-        }
-        Err(A2aError::SerializationError(e)) => anyhow::bail!("serialization error: {e}"),
-        Err(A2aError::InvalidStateTransition { from, to }) => {
-            anyhow::bail!("invalid state transition from {from} to {to}")
         }
     };
 
@@ -306,19 +471,20 @@ pub async fn send_message_to_agent(
     // shell exit code matches the local `mika ask` contract.
     match task.status.state {
         TaskState::Completed | TaskState::InputRequired | TaskState::AuthRequired => {}
-        TaskState::Failed | TaskState::Canceled | TaskState::Rejected => {
-            anyhow::bail!(
-                "remote task {} ended in state '{}'",
-                task.id,
-                task.status.state
-            );
+        state @ (TaskState::Failed | TaskState::Canceled | TaskState::Rejected) => {
+            return Err(classified(
+                terminal_state_class(state),
+                format!("remote task {} ended in state '{}'", task.id, state),
+            ));
         }
-        TaskState::Submitted | TaskState::Working | TaskState::Unknown => {
-            anyhow::bail!(
-                "remote task {} is still in state '{}' — sync dispatch expected a terminal state",
-                task.id,
-                task.status.state
-            );
+        state @ (TaskState::Submitted | TaskState::Working | TaskState::Unknown) => {
+            return Err(classified(
+                terminal_state_class(state),
+                format!(
+                    "remote task {} is still in state '{state}' — sync dispatch expected a terminal state",
+                    task.id
+                ),
+            ));
         }
     }
 
@@ -901,6 +1067,132 @@ mod tests {
             Some("sess-7")
         );
         assert!(metadata.contains_key(ONLY_SKILLS_KEY));
+    }
+
+    // --- mika#2278: the class is a variant, and it reaches the exit code ------
+
+    /// **AC2, the whole point of the ticket.** The classification is decided by
+    /// the error *variant*. Every assertion below compares `FailureClass`
+    /// values — never a substring of a message — because a test that matched on
+    /// the text would re-introduce exactly the coupling D1 refuses, and would
+    /// then certify it.
+    #[tokio::test]
+    async fn the_a2a_variants_split_transport_from_contract() {
+        // A transport failure: the only shape `reqwest` produces that we can
+        // build without a network is a URL that cannot be parsed into a
+        // request, which `classify` reads as `Unreachable` — the restart case.
+        let client_error = reqwest::Client::new()
+            .get("http://")
+            .build()
+            .expect_err("an authority-less URL cannot be built into a request");
+        assert_eq!(
+            a2a_error_class(&A2aError::ClientError(client_error)),
+            FailureClass::Transport,
+            "a failed exchange is the retryable family — a restarting server is \
+             its canonical member"
+        );
+
+        // The negative controls. Without these, a classifier that answered
+        // `Transport` unconditionally would pass the assertion above.
+        assert_eq!(
+            a2a_error_class(&A2aError::InvalidJsonRpc("bad envelope".into())),
+            FailureClass::Contract
+        );
+        let serde_error = serde_json::from_str::<serde_json::Value>("{")
+            .expect_err("truncated JSON must not parse");
+        assert_eq!(
+            a2a_error_class(&A2aError::SerializationError(serde_error)),
+            FailureClass::Contract
+        );
+        assert_eq!(
+            a2a_error_class(&A2aError::InvalidStateTransition {
+                from: TaskState::Completed,
+                to: TaskState::Working,
+            }),
+            FailureClass::Contract
+        );
+    }
+
+    /// The state machine's half of the same split (plan step 3).
+    #[test]
+    fn only_the_async_dispatch_states_are_retryable() {
+        for state in [TaskState::Submitted, TaskState::Working, TaskState::Unknown] {
+            assert_eq!(
+                terminal_state_class(state),
+                FailureClass::Transport,
+                "{state} is a state a synchronous send should never return"
+            );
+        }
+        for state in [
+            TaskState::Failed,
+            TaskState::Canceled,
+            TaskState::Rejected,
+            TaskState::Completed,
+            TaskState::InputRequired,
+            TaskState::AuthRequired,
+        ] {
+            assert_eq!(
+                terminal_state_class(state),
+                FailureClass::Contract,
+                "{state} is a verdict the server reached, not an accident on the way"
+            );
+        }
+    }
+
+    /// **AC1.** The class survives the trip to the process exit code, and the
+    /// two families land on different codes.
+    #[test]
+    fn the_class_reaches_the_exit_code() {
+        let transport = classified(FailureClass::Transport, "server restarting".into());
+        let contract = classified(
+            FailureClass::Contract,
+            "session belongs to someone else".into(),
+        );
+
+        assert!(is_transport_failure(&transport));
+        assert!(!is_transport_failure(&contract));
+        assert_eq!(exit_code_for(&transport), EXIT_TRANSPORT_FAILURE);
+        assert_eq!(exit_code_for(&contract), 1);
+        // The retry budget keys on this literal; a silent drift would disarm
+        // `_arch_ask_with_retry` without failing anything else.
+        assert_eq!(EXIT_TRANSPORT_FAILURE, 75);
+    }
+
+    /// **D1, said as an assertion.** Attaching the class must not move a single
+    /// byte of what the operator reads.
+    #[test]
+    fn carrying_the_class_does_not_change_the_message() {
+        const TEXT: &str = "unreachable: no request reached http://127.0.0.1:8080/a2a/mika-arch";
+        for class in [FailureClass::Transport, FailureClass::Contract] {
+            let err = classified(class, TEXT.to_string());
+            assert_eq!(format!("{err}"), TEXT, "{class:?} altered the plain form");
+            assert_eq!(
+                format!("{err:#}"),
+                TEXT,
+                "{class:?} altered the chained form"
+            );
+        }
+    }
+
+    /// **D4, fail-safe.** An error carrying no class at all — every failure
+    /// raised before the send, and anything a future path forgets to classify —
+    /// is definitive. The inverse default would turn an unforeseen failure mode
+    /// into a silent retry loop.
+    #[test]
+    fn an_unclassified_failure_is_never_retryable() {
+        let plain = anyhow::anyhow!("--session-id value must not be empty");
+        assert!(!is_transport_failure(&plain));
+        assert_eq!(exit_code_for(&plain), 1);
+    }
+
+    /// The class must survive a context layer. `wrap_send_error` re-poses it
+    /// deliberately (it flattens the chain for mika#1985), but an ordinary
+    /// `.context()` added anywhere on this path must not demote it either.
+    #[test]
+    fn a_context_layer_does_not_demote_the_class() {
+        let wrapped = classified(FailureClass::Transport, "interrupted after send".into())
+            .context("mika ask to http://127.0.0.1:8080/a2a/mika-arch failed");
+        assert_eq!(exit_code_for(&wrapped), EXIT_TRANSPORT_FAILURE);
     }
 
     #[test]
