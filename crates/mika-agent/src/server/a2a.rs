@@ -42,7 +42,8 @@ impl Drop for BroadcasterGuard {
     }
 }
 
-/// Why an abandoned turn's row was closed, written to `tasks.result` (mika#2379).
+/// Why an abandoned turn's row was closed (mika#2379). Stored in `tasks.result`
+/// as `{"a2a_close_reason": ...}` so `tasks/get` still reads the row.
 const TURN_ABANDONED_REASON: &str = "abandoned: the turn ended before writing a terminal \
                                      state (caller disconnected, or the turn panicked)";
 
@@ -2020,7 +2021,10 @@ mod tests {
 
         let (status, result) = settled_row(&db).await;
         assert_eq!(status, "cancelled");
-        assert_eq!(result.as_deref(), Some(TURN_ABANDONED_REASON));
+        assert_eq!(
+            result.as_deref(),
+            Some(crate::a2a_db::a2a_close_reason_metadata(TURN_ABANDONED_REASON).as_str())
+        );
     }
 
     #[tokio::test]

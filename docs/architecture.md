@@ -841,9 +841,12 @@ Every A2A task ends in a terminal state (mika#2379): `completed` or `failed` whe
 the turn finishes; `cancelled` when the turn ends without writing either — the
 caller hung up and the `message/send` handler future was dropped, or the
 `message/stream` task panicked — with an `a2a_turn_abandoned` WARN; and `failed`
-at the next startup for a row a dead process left `pending` or `in_progress`,
-with one `a2a_orphans_swept` WARN per agent. `tasks.result` names which. A task
-reads `in_progress` only while its turn is running.
+at the next daemon startup for a row a dead process left `pending` or
+`in_progress`, with one `a2a_orphans_swept` WARN per agent (a `mika chat`
+process, which shares the database with a live daemon, never sweeps).
+`tasks.result` names which as the JSON object `{"a2a_close_reason": "..."}`,
+which `tasks/get` returns as `Task.metadata.a2a_close_reason`. A task reads
+`in_progress` only while its turn is running.
 
 ### Agent Card
 
