@@ -8,6 +8,7 @@ pub mod agent {
 pub mod async_db;
 pub mod auth_boundary_ledger;
 pub mod auto_pull;
+pub mod auto_pull_stop;
 pub mod bundled_skills;
 pub mod calibration;
 pub mod compaction;

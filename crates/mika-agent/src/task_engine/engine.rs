@@ -4143,6 +4143,9 @@ mod tests {
             skills: Arc::new(crate::skills::SkillRegistry::empty()),
             message_sender: Some(Arc::new(NoopSender)),
             home_dir: PathBuf::from("/tmp"),
+            // mika#2329 — un home global qui n'existe pas : aucun STOP n'y est
+            // armé, donc ces tests prennent le chemin nominal.
+            global_home_dir: PathBuf::from("/tmp/mika-test-global-home-absent"),
             embedding_client: None,
             brave_api_key: None,
             github_token: None,
@@ -4154,6 +4157,7 @@ mod tests {
             cli_mode: false,
             settings,
             pr_reviews_posted: None,
+            auto_pull_stop_armed: AtomicBool::new(false),
         })
     }
 
@@ -4562,6 +4566,9 @@ mod tests {
             skills: Arc::new(crate::skills::SkillRegistry::empty()),
             message_sender: Some(Arc::new(NoopSender)),
             home_dir: PathBuf::from("/tmp"),
+            // mika#2329 — un home global qui n'existe pas : aucun STOP n'y est
+            // armé, donc ces tests prennent le chemin nominal.
+            global_home_dir: PathBuf::from("/tmp/mika-test-global-home-absent"),
             embedding_client: None,
             brave_api_key: None,
             github_token: None,
@@ -4573,6 +4580,7 @@ mod tests {
             cli_mode: true,
             settings,
             pr_reviews_posted: None,
+            auto_pull_stop_armed: AtomicBool::new(false),
         });
         let mut engine = TaskEngine::new(db.clone(), dispatcher);
 
