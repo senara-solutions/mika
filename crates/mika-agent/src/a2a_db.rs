@@ -27,6 +27,25 @@ struct A2aMessageMeta {
     a2a_metadata: Option<HashMap<String, serde_json::Value>>,
 }
 
+/// Key under which the abandon and sweep writers record why they closed an A2A
+/// row (mika#2379).
+///
+/// `a2a_build_task` reads `tasks.result` as the Task's JSON `metadata` and parses
+/// it with `serde_json::from_str(..)?`, so a plain-text reason there makes every
+/// `tasks/get` on the row fail with `INTERNAL_ERROR` — including the mika#2036
+/// recovery read, i.e. exactly the caller that just hung up. The reason is
+/// therefore written as `{"a2a_close_reason": "..."}` and reaches the caller as
+/// `Task.metadata.a2a_close_reason`.
+pub(crate) const A2A_CLOSE_REASON_KEY: &str = "a2a_close_reason";
+
+/// Serialize a close reason as the JSON object `a2a_build_task` expects in
+/// `tasks.result` (see [`A2A_CLOSE_REASON_KEY`]).
+pub(crate) fn a2a_close_reason_metadata(reason: &str) -> String {
+    let mut m = serde_json::Map::new();
+    m.insert(A2A_CLOSE_REASON_KEY.to_owned(), reason.into());
+    serde_json::Value::Object(m).to_string()
+}
+
 /// The two counts that make an empty rebuilt Task diagnosable (mika#2270).
 ///
 /// Read them as a pair: `session_rows == 0 && trace_rows == 0` says nothing was
@@ -255,6 +274,55 @@ impl Database {
             anyhow::bail!("a2a task not found: {a2a_task_id}");
         }
         Ok(())
+    }
+
+    /// Close an A2A task whose turn ended without writing a terminal state
+    /// (mika#2379): the caller hung up and hyper dropped the handler future, or
+    /// the turn's task panicked.
+    ///
+    /// Writes `cancelled` — A2A `canceled`, the client walked away — only while
+    /// the row is still `pending` / `in_progress`, so a terminal state already
+    /// written is never overwritten. Returns whether a row changed; an unknown id
+    /// is `false`, not an error, because the caller is a `Drop` guard that must
+    /// never fail loudly on a row that is not there.
+    ///
+    /// `reason` is stored as `{"a2a_close_reason": reason}` so the row stays
+    /// readable through `a2a_build_task` (see [`A2A_CLOSE_REASON_KEY`]).
+    pub fn a2a_abandon_task_if_live(&self, a2a_task_id: &str, reason: &str) -> Result<bool> {
+        let now = timestamp::now();
+        let result = a2a_close_reason_metadata(reason);
+        let rows = self.conn.execute(
+            "UPDATE tasks SET status = 'cancelled', updated_at = ?1, completed_at = ?1, result = ?2
+             WHERE id = (SELECT task_id FROM a2a_task_map WHERE a2a_task_id = ?3)
+               AND status IN ('pending', 'in_progress')",
+            rusqlite::params![&now, &result, a2a_task_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Fail every A2A task of `agent_id` still `pending` / `in_progress`
+    /// (mika#2379). Called once at daemon startup, before the router serves: no
+    /// turn survives the process that ran it, and A2A rows are created only by
+    /// the daemon's handlers, so every such row belongs to a dead process. That
+    /// argument holds for the daemon only — `TaskEngine::startup_recovery` skips
+    /// this sweep in CLI mode (`mika chat`), which shares the container database
+    /// with a daemon that may be serving live turns.
+    ///
+    /// `pending` is included on purpose: a `message/stream` turn still waiting
+    /// for the agent lock when the process died never reached `in_progress`.
+    /// `reason` is stored as `{"a2a_close_reason": reason}` (see
+    /// [`A2A_CLOSE_REASON_KEY`]). Returns the number of rows closed.
+    pub fn a2a_sweep_orphans(&self, agent_id: &str, reason: &str) -> Result<usize> {
+        let now = timestamp::now();
+        let result = a2a_close_reason_metadata(reason);
+        let rows = self.conn.execute(
+            "UPDATE tasks SET status = 'failed', updated_at = ?1, completed_at = ?1, result = ?2
+             WHERE agent_id = ?3
+               AND trigger_type = 'a2a'
+               AND status IN ('pending', 'in_progress')",
+            rusqlite::params![&now, &result, agent_id],
+        )?;
+        Ok(rows)
     }
 
     // === A2A Messages (via messages table) ===
@@ -1504,5 +1572,189 @@ mod tests {
         let db = db();
         let result = db.a2a_get_session_id("nonexistent").unwrap();
         assert!(result.is_none());
+    }
+
+    // --- mika#2379: abandoned turns and orphans end in a terminal state -------
+
+    fn status_of(db: &Database, a2a_task_id: &str) -> (String, Option<String>, Option<String>) {
+        db.conn
+            .query_row(
+                "SELECT t.status, t.completed_at, t.result FROM tasks t
+                 JOIN a2a_task_map m ON m.task_id = t.id
+                 WHERE m.a2a_task_id = ?1",
+                rusqlite::params![a2a_task_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    /// The reason the abandon/sweep writers stored, read back through the JSON
+    /// object `a2a_build_task` parses.
+    fn close_reason(result: Option<String>) -> Option<String> {
+        let v: serde_json::Value = serde_json::from_str(result.as_deref()?).ok()?;
+        v.get(A2A_CLOSE_REASON_KEY)?.as_str().map(str::to_owned)
+    }
+
+    /// Reads the row the way `tasks/get` does and returns its close reason from
+    /// `Task.metadata` — the regression the raw-SQL assertions above cannot see:
+    /// a non-JSON `tasks.result` makes `a2a_build_task` fail, and `tasks/get`
+    /// answers INTERNAL_ERROR on exactly the rows mika#2379 closes.
+    fn close_reason_via_build_task(db: &Database, a2a_task_id: &str) -> Option<String> {
+        let task = db
+            .a2a_build_task(a2a_task_id, None)
+            .expect("a2a_build_task must read a closed row")
+            .expect("the closed row exists");
+        task.metadata?
+            .get(A2A_CLOSE_REASON_KEY)?
+            .as_str()
+            .map(str::to_owned)
+    }
+
+    #[test]
+    fn mika2379_an_abandoned_row_stays_readable_through_a2a_build_task() {
+        let db = db();
+        db.a2a_create_task("t1", "mika", None, None).unwrap();
+        db.a2a_update_task_state("t1", "working").unwrap();
+        assert!(
+            db.a2a_abandon_task_if_live("t1", "abandoned: test")
+                .unwrap()
+        );
+
+        assert_eq!(
+            close_reason_via_build_task(&db, "t1").as_deref(),
+            Some("abandoned: test")
+        );
+    }
+
+    #[test]
+    fn mika2379_a_swept_row_stays_readable_through_a2a_build_task() {
+        let db = db();
+        db.a2a_create_task("t1", "mika", None, None).unwrap();
+        db.a2a_update_task_state("t1", "working").unwrap();
+        db.a2a_create_task("t2", "mika", None, None).unwrap(); // pending
+        assert_eq!(db.a2a_sweep_orphans("mika", "orphaned: test").unwrap(), 2);
+
+        for id in ["t1", "t2"] {
+            assert_eq!(
+                close_reason_via_build_task(&db, id).as_deref(),
+                Some("orphaned: test"),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn mika2379_abandon_cancels_a_working_row_and_names_why() {
+        let db = db();
+        db.a2a_create_task("t1", "mika", None, None).unwrap();
+        db.a2a_update_task_state("t1", "working").unwrap();
+
+        assert!(
+            db.a2a_abandon_task_if_live("t1", "abandoned: test")
+                .unwrap()
+        );
+
+        let (status, completed_at, result) = status_of(&db, "t1");
+        assert_eq!(status, "cancelled");
+        assert!(
+            completed_at.is_some(),
+            "a terminal row carries completed_at"
+        );
+        assert_eq!(close_reason(result).as_deref(), Some("abandoned: test"));
+    }
+
+    #[test]
+    fn mika2379_abandon_cancels_a_pending_row() {
+        let db = db();
+        db.a2a_create_task("t1", "mika", None, None).unwrap();
+
+        assert!(
+            db.a2a_abandon_task_if_live("t1", "abandoned: test")
+                .unwrap()
+        );
+        assert_eq!(status_of(&db, "t1").0, "cancelled");
+    }
+
+    #[test]
+    fn mika2379_abandon_never_overwrites_a_terminal_state() {
+        for terminal in ["completed", "failed", "canceled"] {
+            let db = db();
+            db.a2a_create_task("t1", "mika", None, None).unwrap();
+            db.a2a_update_task_state("t1", terminal).unwrap();
+            let before = status_of(&db, "t1");
+
+            assert!(
+                !db.a2a_abandon_task_if_live("t1", "abandoned: test")
+                    .unwrap(),
+                "a {terminal} row must not be reported as transitioned"
+            );
+            assert_eq!(status_of(&db, "t1"), before, "{terminal} row was rewritten");
+        }
+    }
+
+    #[test]
+    fn mika2379_abandon_on_an_unknown_id_is_false_not_an_error() {
+        let db = db();
+        assert!(
+            !db.a2a_abandon_task_if_live("nope", "abandoned: test")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn mika2379_sweep_fails_only_this_agents_live_a2a_rows() {
+        let db = db();
+        db.conn
+            .execute(
+                "INSERT OR IGNORE INTO agents (id, name, home_dir) VALUES ('other', 'Other', '')",
+                [],
+            )
+            .unwrap();
+        db.a2a_create_task("live1", "mika", None, None).unwrap();
+        db.a2a_update_task_state("live1", "working").unwrap();
+        db.a2a_create_task("live2", "mika", None, None).unwrap();
+        db.a2a_update_task_state("live2", "working").unwrap();
+        db.a2a_create_task("queued", "mika", None, None).unwrap(); // pending
+        db.a2a_create_task("done", "mika", None, None).unwrap();
+        db.a2a_update_task_state("done", "completed").unwrap();
+        db.a2a_create_task("elsewhere", "other", None, None)
+            .unwrap();
+        db.a2a_update_task_state("elsewhere", "working").unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO tasks (id, agent_id, label, trigger_type, action_type, status)
+                 VALUES ('manual-1', 'mika', 'human work', 'manual', 'none', 'in_progress')",
+                [],
+            )
+            .unwrap();
+
+        let swept = db.a2a_sweep_orphans("mika", "orphaned: test").unwrap();
+        assert_eq!(swept, 3);
+
+        for id in ["live1", "live2", "queued"] {
+            let (status, completed_at, result) = status_of(&db, id);
+            assert_eq!(status, "failed", "{id}");
+            assert!(completed_at.is_some(), "{id} carries completed_at");
+            assert_eq!(
+                close_reason(result).as_deref(),
+                Some("orphaned: test"),
+                "{id}"
+            );
+        }
+        assert_eq!(status_of(&db, "done").0, "completed");
+        assert_eq!(status_of(&db, "elsewhere").0, "in_progress");
+        let manual: String = db
+            .conn
+            .query_row("SELECT status FROM tasks WHERE id = 'manual-1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(manual, "in_progress");
+    }
+
+    #[test]
+    fn mika2379_sweep_on_a_clean_db_is_zero() {
+        let db = db();
+        assert_eq!(db.a2a_sweep_orphans("mika", "orphaned: test").unwrap(), 0);
     }
 }
