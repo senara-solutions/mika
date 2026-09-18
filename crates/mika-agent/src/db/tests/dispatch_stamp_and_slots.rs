@@ -166,19 +166,6 @@ fn test_fresh_db_has_dispatcher_source_and_lease_table() {
         .expect("fresh DB must have the dispatch_slot_leases table");
 }
 
-#[test]
-fn test_migrate_v50_to_v51_is_idempotent() {
-    let mut db = db();
-    // Already at CURRENT (>=51) — must no-op rather than double-apply.
-    db.migrate_v50_to_v51().unwrap();
-    db.migrate_v50_to_v51().unwrap();
-    let version: i64 = db
-        .conn
-        .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(version, CURRENT_SCHEMA_VERSION);
-}
-
 // ---- mika#2160: the lease cap becomes choosable ----
 
 /// A fresh DB must carry the v52 surface without any migration running —
@@ -202,19 +189,6 @@ fn test_fresh_db_lease_table_has_slot_index_in_its_key() {
     );
 }
 
-#[test]
-fn test_migrate_v51_to_v52_is_idempotent() {
-    let mut db = db();
-    // Already at CURRENT (>=52) — must no-op rather than double-apply.
-    db.migrate_v51_to_v52().unwrap();
-    db.migrate_v51_to_v52().unwrap();
-    let version: i64 = db
-        .conn
-        .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(version, CURRENT_SCHEMA_VERSION);
-}
-
 /// mika#2189 D5: the column exists on a **fresh** install, not only after
 /// the ALTER. A migration that adds a column the `CREATE TABLE` forgot
 /// leaves every new database silently missing it — and the write path,
@@ -226,75 +200,6 @@ fn fresh_db_has_llm_calls_request_bytes() {
     assert!(
         db.column_exists("llm_calls", "request_bytes").unwrap(),
         "a fresh database must carry llm_calls.request_bytes"
-    );
-}
-
-#[test]
-fn test_migrate_v52_to_v53_is_idempotent() {
-    let mut db = db();
-    // Already at CURRENT (>=53) — must no-op rather than double-apply.
-    db.migrate_v52_to_v53().unwrap();
-    db.migrate_v52_to_v53().unwrap();
-    let version: i64 = db
-        .conn
-        .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(version, CURRENT_SCHEMA_VERSION);
-}
-
-/// The ALTER path itself, exercised from a v52-shaped `llm_calls`.
-///
-/// The idempotence test above runs against an already-migrated database, so
-/// it proves the guard and never the migration. This drops the column and
-/// rewinds the version so the `ALTER TABLE` actually executes — otherwise a
-/// broken statement would ship green.
-#[test]
-fn migrate_v52_to_v53_adds_the_column_and_preserves_rows() {
-    let mut db = db();
-    db.conn
-        .execute("ALTER TABLE llm_calls DROP COLUMN request_bytes", [])
-        .unwrap();
-    db.conn
-        .execute(
-            "INSERT INTO llm_calls (id, agent_id, session_id, provider, model)
-                 VALUES ('pre-v53', 'a', 's', 'openrouter', 'kimi')",
-            [],
-        )
-        .unwrap();
-    db.conn.execute("DELETE FROM schema_version", []).unwrap();
-    db.conn
-        .execute("INSERT INTO schema_version (version) VALUES (52)", [])
-        .unwrap();
-
-    db.migrate_v52_to_v53().unwrap();
-
-    assert!(db.column_exists("llm_calls", "request_bytes").unwrap());
-    let carried: Option<i64> = db
-        .conn
-        .query_row(
-            "SELECT request_bytes FROM llm_calls WHERE id = 'pre-v53'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        carried, None,
-        "a pre-v53 row must read NULL — the column is not retroactive, and a \
-             default of 0 would be indistinguishable from a genuinely empty request"
-    );
-}
-
-#[test]
-fn test_migrate_v51_to_v52_bails_on_unexpected_baseline() {
-    let mut db = db();
-    db.conn.execute("DELETE FROM schema_version", []).unwrap();
-    db.conn
-        .execute("INSERT INTO schema_version (version) VALUES (49)", [])
-        .unwrap();
-    let err = db.migrate_v51_to_v52().unwrap_err();
-    assert!(
-        err.to_string().contains("unexpected baseline version 49"),
-        "migration must name the baseline it refused — got {err}"
     );
 }
 
@@ -506,22 +411,6 @@ fn test_cap_zero_lifts_the_lease_cap() {
         })
         .unwrap();
     assert_eq!(rows, 4, "each holder gets its own appended index");
-}
-
-#[test]
-fn test_migrate_v50_to_v51_bails_on_unexpected_baseline() {
-    let mut db = db();
-    // Forge a baseline the migration must refuse: below 50, so the
-    // idempotency guard does not return, but not the expected 50 either.
-    db.conn.execute("DELETE FROM schema_version", []).unwrap();
-    db.conn
-        .execute("INSERT INTO schema_version (version) VALUES (48)", [])
-        .unwrap();
-    let err = db.migrate_v50_to_v51().unwrap_err();
-    assert!(
-        err.to_string().contains("unexpected baseline version 48"),
-        "bail must name the offending baseline — got: {err}"
-    );
 }
 
 #[test]
@@ -962,82 +851,6 @@ fn mika2361_abandoned_at_is_readable_and_none_when_not_abandoned() {
         db.get_auto_pull_redrive_abandoned_at(repo, 2360).unwrap(),
         None,
         "re-entry clears the instant, so a later abandonment gets a fresh window"
-    );
-}
-
-#[test]
-fn test_migrate_v49_to_v50_alters_a_real_v49_table_and_preserves_rows() {
-    // The idempotence test below runs against a fresh DB, which the v1
-    // inline schema already builds at v50 — so it exercises the no-op
-    // branch, not the ALTER. This one builds the actual v49 shape, puts a
-    // row in it, and proves the upgrade path keeps existing circuit-breaker
-    // state while defaulting the new counters.
-    let mut db = db();
-    db.conn
-        .execute_batch(
-            "DROP TABLE auto_pull_stats;
-                 CREATE TABLE auto_pull_stats (
-                     repo_full_name TEXT NOT NULL,
-                     issue_number INTEGER NOT NULL,
-                     failure_count INTEGER NOT NULL DEFAULT 0,
-                     last_auto_pull_at TEXT,
-                     last_failure_at TEXT,
-                     PRIMARY KEY (repo_full_name, issue_number)
-                 );
-                 INSERT INTO auto_pull_stats
-                     (repo_full_name, issue_number, failure_count, last_auto_pull_at)
-                 VALUES ('senara-solutions/mika', 1901, 2, '2026-08-29T00:00:00Z');
-                 DELETE FROM schema_version;
-                 INSERT INTO schema_version (version) VALUES (49);",
-        )
-        .unwrap();
-    assert_eq!(db.schema_version().unwrap(), 49);
-    assert!(
-        !db.column_exists("auto_pull_stats", "redrive_count")
-            .unwrap(),
-        "precondition: the v49 shape has no re-drive columns"
-    );
-
-    db.migrate_v49_to_v50().unwrap();
-
-    assert_eq!(db.schema_version().unwrap(), 50);
-    assert_eq!(
-        db.get_auto_pull_failure_count("senara-solutions/mika", 1901)
-            .unwrap(),
-        2,
-        "existing circuit-breaker state survives the upgrade"
-    );
-    assert_eq!(
-        db.get_auto_pull_redrive_state("senara-solutions/mika", 1901)
-            .unwrap(),
-        (0, false),
-        "a pre-existing row starts with a clean re-drive budget"
-    );
-
-    // Second call must recognise v50 and no-op rather than re-ALTER.
-    db.migrate_v49_to_v50().unwrap();
-    assert_eq!(db.schema_version().unwrap(), 50);
-}
-
-#[test]
-fn test_migrate_v49_to_v50_is_idempotent() {
-    let mut db = db();
-    // A fresh DB is already at v50 via the v1 inline schema; the migration
-    // must recognise that and no-op rather than re-ALTER.
-    db.migrate_v49_to_v50().unwrap();
-    db.migrate_v49_to_v50().unwrap();
-    assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-    assert!(
-        db.column_exists("auto_pull_stats", "redrive_count")
-            .unwrap()
-    );
-    assert!(
-        db.column_exists("auto_pull_stats", "last_redrive_at")
-            .unwrap()
-    );
-    assert!(
-        db.column_exists("auto_pull_stats", "redrive_abandoned_at")
-            .unwrap()
     );
 }
 

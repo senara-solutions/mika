@@ -1,10 +1,8 @@
-//! Tests de `crate::db` — thème `kg_schema_migration` (mika#2321).
+//! Harnais de convergence avant du schéma KG (v24 → v25) — mika#2321.
 //!
-//! Le harnais de convergence avant du schéma KG (v24 → v25) et les requêtes
-//! `count_chunks_for_docs_root_hash` (#778).
-//!
-//! Enfant de `db::tests`, donc descendant de `db` : les items privés de `db` et
-//! les helpers de `db::tests` restent visibles via `use super::*`.
+//! Descendu de `db::tests` avec l'échelle de migrations : chacun de ses cas
+//! appelle une `migrate_vN_to_vM` privée, et le harnais de snapshot de schéma
+//! qu'il partage avec eux n'avait aucun autre lecteur.
 
 use super::*;
 
