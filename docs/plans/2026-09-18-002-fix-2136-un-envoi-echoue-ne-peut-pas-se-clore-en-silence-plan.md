@@ -69,7 +69,7 @@ disent pas la même chose :
 |---|---|---|
 | `:59-66` | garde de longueur (mika#2134) | **rien** — refus avant persistance et avant transport |
 | `:93-95` | `SendOutcome::Failed` | le message est parti et est **mort** ; sauvegardé dans `failed_sends` |
-| `:117` | erreur infra du sender | rien de garanti |
+| `:115-118` | `Err(e)` — erreur infra du sender | rien de garanti, et **rien dans `failed_sends`** |
 
 En aval, ces trois cas sont indistinguables autrement qu'en relisant la prose anglaise du
 message d'erreur (`output_summary`, tronqué et scrubbé). **La réparation attendue n'est pas
@@ -77,6 +77,18 @@ la même** : pour un refus de longueur, elle est une découpe ; pour un échec t
 est un ré-essai du même texte. Un prédicat qui confondrait les deux produirait du bruit sur
 le cas le plus fréquent — un agent qui rédige 5 000 caractères se fait refuser tous les
 jours, découpe, et a raison.
+
+**Il y a bien trois sorties `is_error`, pas deux.** Le ticket n'en cite que deux ; la
+troisième (`Err(e)`, `:115-118`) est une erreur du sender lui-même et non un verdict de
+livraison. AC1 porte sur *« quand un `send_message` rend `is_error == true` »*, donc elle est
+dans le périmètre, et un plan qui ne l'énumérerait pas laisserait un trou exactement de la
+forme du défaut d'origine. Elle se range sous `Failed` (D2) : même dégât, même réparation.
+
+**Et `SendOutcome::Failed` n'est pas définitif.** `messaging.rs:14` : le message est
+*« saved to `failed_sends` for later flush »*. Un flush ultérieur peut donc le délivrer après
+la fin du tour. Ça ne change rien au prédicat — au moment où l'agent parle, rien n'est arrivé,
+et c'est de ça qu'il est question — mais ça contraint la **formulation** de l'annexe (D5) et
+la lecture de la halte 4 de la sonde.
 
 ### E3 — Deux sorties qui ne délivrent rien rendent pourtant `success`
 
@@ -93,6 +105,16 @@ périmètre** (voir § Hors périmètre) : la traiter ici rouvrirait la boucle q
 Le texte de clôture part sur Telegram comme n'importe quel message. « Le voici en entier 👆 »
 est arrivé par là. C'est donc à la fois le lieu du dégât et le seul point où le moteur peut
 faire arriver un fait à l'utilisateur sans passer par le modèle.
+
+**Mais c'est le même canal que celui qui vient d'échouer, et il faut le dire.** Les lignes
+`:1542-1551` traitent déjà l'échec de *cet* envoi-là — `Failed`, `NoChannel`, `Err` — par un
+simple `warn!`. Conséquence pour D5 : l'annexe est **garantie de partir** sur l'étage
+`RefusedTooLong` (le canal fonctionne, c'est la longueur qui était refusée — le cas d'Al) et
+**seulement tentée** sur l'étage `Failed`, où le transport était mort quelques pas plus tôt et
+peut l'être encore. La limite est de la même famille que celle du mode silencieux déjà nommée
+en D5, et son résidu est le même : le WARN et la ligne d'audit, dont le destinataire est
+l'opérateur. Ce plan ne prétend donc pas rendre l'aveu indéfectible ; il le rend **structurel
+et mesuré**, ce qu'AC2 demande.
 
 ### E5 — Le précédent structurel existe, il est récent, et il est à la même place
 
@@ -170,6 +192,14 @@ pub enum DeliveryOutcome {
     NoSender,
 }
 ```
+
+**Six sorties, cinq variantes, et la fusion est délibérée.** `send_message` a six sorties
+portant un verdict de livraison ; `SendOutcome::Failed` (`:93-95`) et `Err(e)` (`:115-118`)
+partagent la variante `Failed`. Raison : le prédicat de D3 et l'annexe de D5 ne font rien de
+la différence — dans les deux cas le contenu est perdu et la réparation est le ré-essai du
+même texte. Les séparer coûterait une variante pour une distinction qu'aucun lecteur
+n'exploite. Ce qui les sépare (`failed_sends` peuplé d'un côté, rien de l'autre — E2) reste
+lisible dans `reason`, qui est déjà la prose du sender.
 
 Raison. Les trois alternatives ont été écartées pour des raisons mesurables :
 
@@ -271,6 +301,13 @@ ligne factuelle minimale est annexée au texte sortant quand le champ est `Some`
 > ⚠️ 1 message n'a pas pu être délivré (partie 1 : échec du transport). Rien n'a été reçu
 > pour cette partie.
 
+**La formulation est au passé et n'exclut pas une arrivée différée, à dessein.** Un
+`SendOutcome::Failed` est sauvegardé dans `failed_sends` pour un flush ultérieur (E2), donc le
+fragment peut arriver après l'annexe. « Rien n'a été reçu » reste vrai à l'instant où le
+moteur l'écrit ; « ce message n'arrivera pas » serait faux. La nuance n'est pas cosmétique :
+c'est elle qui empêche de lire un flush réussi comme un faux positif de D5 — voir la halte 4
+de la sonde.
+
 Raison. 5d, sur budget épuisé, se contente d'un WARN `..._uncorrected` et laisse passer.
 Diverger ici doit se payer, et ça se paie : pour 5d le dégât d'un budget épuisé est une
 phrase fausse de plus, visible dans le log ; ici le dégât est **un document qui n'est jamais
@@ -346,8 +383,10 @@ Précédent de threading à trois sites : `loaded_skill_names` (mika#2355).
 
 ### 2. `crates/mika-agent/src/tools/send_message.rs`
 
-- Les cinq sorties posent leur `DeliveryOutcome` (y compris `Delivered`, `NoChannel`,
-  `NoSender` — D2).
+- **Les six sorties** posent leur `DeliveryOutcome` — y compris `Delivered`, `NoChannel`,
+  `NoSender`, et `Err(e)` du sender qui se range sous `Failed` (D2). Les deux sorties qui ne
+  sont pas des verdicts de livraison (`'text' is required` `:44`, texte vide après
+  strip-tags `:50`) restent à `None` : rien n'a été tenté, il n'y a pas d'échec à acquitter.
 - Reformulation des deux messages d'erreur (D6). La garde de longueur et son test de borne
   (`accepte_4096_a_la_borne`, `fenetre_5000_refusee_par_l_outil`) sont **inchangés** :
   mika#2134 est en amont et hors périmètre.
@@ -359,9 +398,14 @@ Précédent de threading à trois sites : `loaded_skill_names` (mika#2355).
   `send_message_boundary_active`. Quand `output.delivery` est `Some`, pousse
   `DeliveryRecord { step, text: String, outcome }` — **texte complet**, capté à la source
   avant toute troncature (E8). Le champ ne quitte jamais le tour et n'est pas persisté.
-- Interaction avec le dedup per-tour (#582) : un duplicata réutilise le `ToolOutput` caché,
-  donc **un seul** `DeliveryRecord` par appel dédupliqué — ce qui est correct (l'outil n'a
-  tourné qu'une fois). Test dédié.
+- Interaction avec le dedup per-tour (#582) : **le mécanisme existe déjà et se réemploie tel
+  quel**. Le chemin de replay clone le `ToolOutput` caché puis efface ce qui ne doit pas être
+  ré-émis (`reused.images.clear()`, `:207-213`, avec sa raison écrite) ; `delivery` rejoint
+  cette liste — `reused.delivery = None`. Sans ce geste, le clone porterait le `delivery` de
+  l'appel d'origine et pousserait un **second** `DeliveryRecord` pour un outil qui n'a tourné
+  qu'une fois : le prédicat de D3 resterait juste (un `Failed` dupliqué reste un `Failed`),
+  mais `failed_count` compterait deux fragments morts là où il y en a un, et l'annexe lue par
+  l'utilisateur serait fausse sur le nombre. Test dédié.
 
 ### 4. `crates/mika-agent/src/evidence/guards.rs`
 
@@ -488,9 +532,15 @@ Sur 7 jours :
    les trois greps sont **vides**, ne pas élargir le prédicat : l'envoi a réussi du point de
    vue du moteur et la perte est en aval (gateway, Telegram, mika#2126 côté rendu) ou dans la
    population `NoChannel` de E3. Établir lequel vient d'abord.
-4. **Halte (faux positif).** Si l'annexe apparaît sur un tour où tout est bien arrivé, désarmer
-   D5 et réparer le prédicat de D3 — une annexe fausse dans le canal utilisateur est un dégât
-   du même ordre que celui qu'on répare, et ne se rattrape pas par un seuil.
+4. **Halte (faux positif), et son piège.** Si l'annexe apparaît sur un tour où tout est bien
+   arrivé, désarmer D5 et réparer le prédicat de D3 — une annexe fausse dans le canal
+   utilisateur est un dégât du même ordre que celui qu'on répare, et ne se rattrape pas par un
+   seuil. **Mais vérifier d'abord le flush de `failed_sends`** (E2) : un fragment `Failed` puis
+   délivré par le flush arrive *après* l'annexe, et l'utilisateur voit alors une annexe suivie
+   du message qu'elle disait manquant. Ce n'est **pas** un faux positif — l'annexe disait vrai
+   à l'instant où elle a été écrite (D5) — et désarmer D5 pour cette raison rouvrirait le
+   défaut d'origine. Le discriminant est une ligne de flush postérieure au tour sur le même
+   contenu ; en son absence seulement, le faux positif est réel.
 
 ---
 
@@ -516,8 +566,9 @@ Sur 7 jours :
 
 ## Definition of Done
 
-- `ToolOutput.delivery` posé par les cinq sorties de `send_message`, `None` partout ailleurs,
-  jamais sérialisé vers le LLM.
+- `ToolOutput.delivery` posé par les **six** sorties de livraison de `send_message` (dont
+  `Err(e)` → `Failed`), `None` sur les deux sorties qui ne tentent aucune livraison et partout
+  ailleurs, jamais sérialisé vers le LLM, et effacé sur le chemin de replay du dedup (§ 3).
 - `undelivered_sends` est une fonction pure, couverte par les neuf cas unitaires listés en § 4,
   dont celui qui épingle le faux négatif de D3 plutôt que de le laisser dériver.
 - Guard 6f en place avec son miroir texte-vide, son budget unique et sa télémétrie #953.
