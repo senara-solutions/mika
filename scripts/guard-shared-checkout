@@ -1,0 +1,583 @@
+#!/usr/bin/env bash
+# guard-shared-checkout — mika#2107
+#
+# La garde qui s'interpose entre « une session tape une commande git » et
+# « la commande s'exécute dans l'arbre partagé dont dépend le déploiement ».
+#
+# QUATRE OCCURRENCES EN VINGT-SIX HEURES l'ont motivée (mika#2107) :
+#   1. 30/08 matin  mika/          `git reset --hard`  → travail indexé d'une autre session effacé
+#   2. 30/08 16:54  mika/          `git checkout <br>` → checkout de déploiement détaché 3 h 15
+#   3. 30/08 20:56  claude-pilot/  `git add` via -C    → 12 min de dispatches sur un classifieur non revu
+#   4. 31/08 09:31  claude-pilot/  `git checkout <sha>`→ artefact déployé hors main
+# Cause unique : la session croit être dans son worktree et ne l'est pas.
+#
+# POURQUOI ICI ET PAS DANS UN HOOK GIT. `pre-checkout` et `pre-reset` n'existent
+# pas (git 2.53) ; `reference-transaction` ne voit ni `git add` ni un
+# `reset --hard` nu et ne s'exécute qu'après la bascule de l'arbre ; et les deux
+# mécanismes de hook de ce dépôt (.githooks + lefthook.yml) ont un taux
+# d'installation mesuré de ZÉRO. Un `PreToolUse` livré par un settings.json
+# suivi arrive avec le checkout, sans geste d'installation — la seule forme que
+# le ticket n'a pas déjà réfutée par l'expérience.
+#
+# DEUX MODES :
+#   hook      — charge utile JSON du hook Claude Code sur stdin (production)
+#   --decide  — fonction pure (project-dir, cwd, commande) pour le harnais de test
+#
+# CETTE GARDE DÉFEND CONTRE L'ACCIDENT, PAS CONTRE UN ADVERSAIRE. Un chemin
+# obfusqué n'est pas la classe mesurée ; le mur, c'est le bac à sable de
+# mika#2141, et il est déjà posé.
+#
+# FAIL-OPEN, décidé et non découvert : un script absent, illisible ou perdu
+# laisse passer la commande. Un fail-closed coucherait toutes les sessions du
+# dépôt — dispatches et orchestrateur en incident compris — pour un défaut de
+# garde qui ne protège qu'une population résiduelle. Le coût de cet arbitrage
+# (une garde cassée se lit comme une garde qui n'a pas eu à firer) est payé par
+# la ligne d'armement `SessionStart` ci-dessous, qui est la SEULE chose
+# distinguant « rien à refuser » de « rien n'est armé ».
+
+set -u
+
+GUARD_NAME=shared-checkout-guard
+
+# ---------------------------------------------------------------------------
+# Journal — observation, JAMAIS un terme du prédicat.
+#
+# `~/.mika/state/` n'est pas garanti inscriptible depuis le bac à sable d'une
+# dispatche. Une garde qui refuserait parce qu'elle n'a pas pu écrire son log
+# serait un fail-closed déguisé qui contredirait la décision ci-dessus par une
+# porte dérobée. Tout échec d'écriture est donc avalé, sans exception.
+# ---------------------------------------------------------------------------
+guard_log_path() {
+	if [ -n "${MIKA_GUARD_SHARED_CHECKOUT_LOG:-}" ]; then
+		printf '%s' "$MIKA_GUARD_SHARED_CHECKOUT_LOG"
+		return
+	fi
+	printf '%s/state/%s.log' "${MIKA_HOME:-${HOME:-/tmp}/.mika}" "$GUARD_NAME"
+}
+
+guard_log() {
+	local path
+	path=$(guard_log_path) || return 0
+	local dir=${path%/*}
+	[ "$dir" = "$path" ] || mkdir -p -- "$dir" 2>/dev/null || true
+	{
+		printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || printf 'unknown-time')" "$*" >>"$path"
+	} 2>/dev/null || true
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# Normalisation lexicale de chemin, sans fork.
+# ---------------------------------------------------------------------------
+normalize_path() {
+	local path=$1 base=$2
+	case $path in
+	/*) ;;
+	*) path="$base/$path" ;;
+	esac
+	local out='' part
+	local IFS='/'
+	set -f
+	for part in $path; do
+		case $part in
+		'' | .) continue ;;
+		..) out=${out%/*} ;;
+		*) out="$out/$part" ;;
+		esac
+	done
+	set +f
+	printf '%s' "${out:-/}"
+}
+
+# Le chemin est-il le répertoire d'ancrage ou sous lui ?
+path_is_within() {
+	local candidate=$1 root=$2
+	[ "$candidate" = "$root" ] && return 0
+	case $candidate in
+	"$root"/*) return 0 ;;
+	esac
+	return 1
+}
+
+# ---------------------------------------------------------------------------
+# ALLOW-LIST DE LECTURE, PAS DENY-LIST DE MUTATION — et c'est la mesure qui
+# tranche. Une deny-list bâtie sur les mécanismes que le ticket nomme
+# (`checkout`, `reset`) aurait manqué l'occurrence 3 (`git add`) et
+# l'occurrence 1, soit la moitié de la population mesurée — dont la seule qui
+# ait réellement expédié du code non revu en production. Qui aurait classé
+# `git add` comme destructeur avant de le mesurer ?
+#
+# Donc : on énumère ce qui LIT, et tout verbe non classé est refusé quand il
+# vise hors du worktree. Un verbe git inconnu est précisément la forme du
+# prochain incident.
+# ---------------------------------------------------------------------------
+GIT_READ_VERBS="
+annotate blame cat-file check-attr check-ignore cherry count-objects
+describe diff diff-files diff-index diff-tree difftool for-each-ref grep
+help log ls-files ls-remote ls-tree merge-base name-rev range-diff rev-list
+rev-parse shortlog show show-branch show-ref status var verify-commit
+verify-tag version whatchanged
+"
+
+# Verbes dont SEULE une sous-forme lit. `git stash` nu empile (mutation),
+# `git worktree add` crée, `git branch -d` supprime, `git tag v1` pose.
+# Les traiter comme « lecture » sur le seul nom du verbe rouvrirait la classe.
+verb_subform_is_read() {
+	local verb=$1
+	shift
+	local -a args=("$@")
+	local first_positional='' tok
+	local skip_next=0
+	local has_option=0
+
+	for tok in "${args[@]}"; do
+		if [ "$skip_next" = 1 ]; then
+			skip_next=0
+			continue
+		fi
+		case $tok in
+		--) continue ;;
+		--contains | --no-contains | --merged | --no-merged | --points-at | --sort | --format)
+			has_option=1
+			skip_next=1
+			;;
+		-*)
+			has_option=1
+			;;
+		*)
+			[ -n "$first_positional" ] || first_positional=$tok
+			;;
+		esac
+	done
+
+	case $verb in
+	branch)
+		# Listage : aucun positionnel, et aucune option de mutation.
+		for tok in "${args[@]}"; do
+			case $tok in
+			-d | -D | -m | -M | -c | -C | -u | --delete | --move | --copy | \
+				--set-upstream-to* | --unset-upstream | --edit-description | --force | -f)
+				return 1
+				;;
+			esac
+		done
+		[ -z "$first_positional" ] && return 0
+		return 1
+		;;
+	tag)
+		for tok in "${args[@]}"; do
+			case $tok in
+			-l | --list) return 0 ;;
+			esac
+		done
+		[ -z "$first_positional" ] && return 0
+		return 1
+		;;
+	stash)
+		case $first_positional in
+		list | show) return 0 ;;
+		esac
+		return 1
+		;;
+	worktree)
+		[ "$first_positional" = list ] && return 0
+		return 1
+		;;
+	notes)
+		case $first_positional in
+		list | show) return 0 ;;
+		esac
+		return 1
+		;;
+	submodule)
+		case $first_positional in
+		status | summary) return 0 ;;
+		esac
+		return 1
+		;;
+	remote)
+		case $first_positional in
+		'' | show | get-url) return 0 ;;
+		esac
+		return 1
+		;;
+	config)
+		for tok in "${args[@]}"; do
+			case $tok in
+			--get | --get-all | --get-regexp | --get-urlmatch | --list | -l) return 0 ;;
+			esac
+		done
+		return 1
+		;;
+	reflog)
+		case $first_positional in
+		'' | show) return 0 ;;
+		esac
+		return 1
+		;;
+	symbolic-ref)
+		# `symbolic-ref HEAD` lit ; `symbolic-ref HEAD refs/…` écrit.
+		local positionals=0
+		skip_next=0
+		for tok in "${args[@]}"; do
+			case $tok in
+			-*) ;;
+			*) positionals=$((positionals + 1)) ;;
+			esac
+		done
+		[ "$positionals" -le 1 ] && return 0
+		return 1
+		;;
+	esac
+
+	# `has_option` n'est consulté par aucune branche ; il existe pour que le
+	# corps ci-dessus reste lisible si une forme future en a besoin.
+	: "$has_option"
+	return 1
+}
+
+verb_is_read_only() {
+	local verb=$1
+	shift
+	local known
+	for known in $GIT_READ_VERBS; do
+		[ "$verb" = "$known" ] && return 0
+	done
+	verb_subform_is_read "$verb" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# decide_command <project_dir> <cwd> <command>
+#
+# Fonction pure. Rend 0 (allow) ou 1 (deny, motif sur stdout).
+#
+# Le prédicat a exactement QUATRE termes conjoints et positifs :
+#   T1  le project-dir de la session est un worktree lié
+#   T2  la commande est une invocation git
+#   T3  le verbe n'est PAS dans l'allow-list de lecture
+#   T4  l'arbre cible effectif ≠ le project-dir de la session
+#
+# T1 exempte l'opérateur et l'humain PAR CONSTRUCTION : une session enracinée
+# dans le checkout principal ou la racine de l'espace de travail n'est jamais
+# dans la population. Le prédicat encode la signature de l'accident telle que le
+# ticket l'écrit — « la session croit être dans son worktree » — et non « toute
+# écriture git dans un arbre partagé », qui casserait la maintenance légitime
+# (/mika-platform-sync-main) dès le premier tick.
+# ---------------------------------------------------------------------------
+decide_command() {
+	local project_dir=$1 cwd=$2 command=$3
+
+	# Dérogation — geste explicite, journalisé (AC5).
+	if [ "${MIKA_GUARD_SHARED_CHECKOUT:-1}" = 0 ]; then
+		guard_log "bypass MIKA_GUARD_SHARED_CHECKOUT=0 project=$project_dir cmd=${command:0:160}"
+		return 0
+	fi
+
+	# T1 — worktree lié. Dans un worktree lié, `.git` est un FICHIER portant
+	# `gitdir: …`. Un stat, aucun fork : c'est la sortie allow immédiate du cas
+	# nominal, et le budget de ce script est un appel Bash de chaque session.
+	[ -n "$project_dir" ] || return 0
+	[ -f "$project_dir/.git" ] || return 0
+
+	project_dir=$(normalize_path "$project_dir" /)
+	[ -n "$cwd" ] || cwd=$project_dir
+	cwd=$(normalize_path "$cwd" "$project_dir")
+
+	# Pré-filtre T2 sans parsing.
+	case $command in
+	*git*) ;;
+	*) return 0 ;;
+	esac
+
+	# Découpage en segments. Les séparateurs de commande deviennent des
+	# retours à la ligne ; les parenthèses aussi, ce qui coupe les
+	# substitutions de commande en segments à part.
+	local s=$command
+	s=${s//&&/$'\n'}
+	s=${s//||/$'\n'}
+	s=${s//|/$'\n'}
+	s=${s//;/$'\n'}
+	s=${s//\`/$'\n'}
+	s=${s//\$(/$'\n'}
+	s=${s//(/$'\n'}
+	s=${s//)/$'\n'}
+	s=${s//\{/$'\n'}
+	s=${s//\}/$'\n'}
+
+	local sim_cwd=$cwd
+
+	local line
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+
+		local -a tokens=()
+		local raw
+		set -f
+		for raw in $line; do
+			# Déshabiller les guillemets d'un token entier — un chemin cité
+			# est la forme ordinaire, pas une tentative d'évasion.
+			raw=${raw#\'}
+			raw=${raw%\'}
+			raw=${raw#\"}
+			raw=${raw%\"}
+			tokens+=("$raw")
+		done
+		set +f
+		[ "${#tokens[@]}" -gt 0 ] || continue
+
+		# Assignations d'environnement en tête de segment.
+		local env_git_dir='' env_work_tree=''
+		local idx=0
+		while [ "$idx" -lt "${#tokens[@]}" ]; do
+			case ${tokens[$idx]} in
+			GIT_DIR=*) env_git_dir=${tokens[$idx]#GIT_DIR=} ;;
+			GIT_WORK_TREE=*) env_work_tree=${tokens[$idx]#GIT_WORK_TREE=} ;;
+			*=*) ;;
+			*) break ;;
+			esac
+			idx=$((idx + 1))
+		done
+		[ "$idx" -lt "${#tokens[@]}" ] || continue
+
+		local head=${tokens[$idx]}
+		case $head in
+		env | command | exec | sudo | nice | time | nohup)
+			idx=$((idx + 1))
+			[ "$idx" -lt "${#tokens[@]}" ] || continue
+			head=${tokens[$idx]}
+			;;
+		esac
+
+		# `cd` — la dérive que le ticket décrit. On la suit.
+		if [ "$head" = cd ] || [ "$head" = pushd ]; then
+			local dest=''
+			local j=$((idx + 1))
+			while [ "$j" -lt "${#tokens[@]}" ]; do
+				case ${tokens[$j]} in
+				-*) ;;
+				*)
+					dest=${tokens[$j]}
+					break
+					;;
+				esac
+				j=$((j + 1))
+			done
+			if [ -n "$dest" ] && [ "$dest" != - ]; then
+				sim_cwd=$(normalize_path "$dest" "$sim_cwd")
+			fi
+			continue
+		fi
+
+		# T2 — invocation git ?
+		case $head in
+		git | */git) ;;
+		*) continue ;;
+		esac
+
+		# Options globales de git, avant le verbe.
+		local opt_c='' opt_git_dir='' opt_work_tree='' verb=''
+		local -a verb_args=()
+		local k=$((idx + 1))
+		while [ "$k" -lt "${#tokens[@]}" ]; do
+			local tok=${tokens[$k]}
+			case $tok in
+			-C)
+				k=$((k + 1))
+				[ "$k" -lt "${#tokens[@]}" ] && opt_c=${tokens[$k]}
+				;;
+			-C*) opt_c=${tok#-C} ;;
+			--git-dir)
+				k=$((k + 1))
+				[ "$k" -lt "${#tokens[@]}" ] && opt_git_dir=${tokens[$k]}
+				;;
+			--git-dir=*) opt_git_dir=${tok#--git-dir=} ;;
+			--work-tree)
+				k=$((k + 1))
+				[ "$k" -lt "${#tokens[@]}" ] && opt_work_tree=${tokens[$k]}
+				;;
+			--work-tree=*) opt_work_tree=${tok#--work-tree=} ;;
+			-c | --namespace | --exec-path | --super-prefix | --config-env)
+				k=$((k + 1))
+				;;
+			-*) ;;
+			*)
+				verb=$tok
+				k=$((k + 1))
+				while [ "$k" -lt "${#tokens[@]}" ]; do
+					verb_args+=("${tokens[$k]}")
+					k=$((k + 1))
+				done
+				break
+				;;
+			esac
+			k=$((k + 1))
+		done
+
+		# `git --version`, `git` nu : aucun verbe, rien à muter.
+		[ -n "$verb" ] || continue
+
+		# Le cwd du segment, après un éventuel `-C`.
+		local base=$sim_cwd
+		[ -n "$opt_c" ] && base=$(normalize_path "$opt_c" "$sim_cwd")
+
+		# T4 — l'arbre cible effectif.
+		local target=$base
+		local work_tree=${opt_work_tree:-$env_work_tree}
+		local git_dir=${opt_git_dir:-$env_git_dir}
+		if [ -n "$work_tree" ]; then
+			target=$(normalize_path "$work_tree" "$base")
+		elif [ -n "$git_dir" ]; then
+			local gd
+			gd=$(normalize_path "$git_dir" "$base")
+			case $gd in
+			*/.git) target=${gd%/.git} ;;
+			*) target=$gd ;;
+			esac
+		fi
+
+		# Sous le worktree de la session → le cas nominal, sans aucun fork.
+		path_is_within "$target" "$project_dir" && continue
+
+		# T3 — l'allow-list de lecture. Un verbe de lecture est autorisé même
+		# vers l'arbre partagé : il n'a jamais rien cassé.
+		verb_is_read_only "$verb" "${verb_args[@]+"${verb_args[@]}"}" && continue
+
+		# Un répertoire qui n'existe pas fait échouer la commande d'elle-même.
+		# Refuser ici n'ajouterait qu'un faux positif à un parsing imparfait.
+		[ -d "$target" ] || continue
+
+		# La cible est-elle seulement un dépôt ? Au plus UN rev-parse, et
+		# jamais dans le cas nominal (on n'arrive ici que hors du worktree).
+		local toplevel
+		toplevel=$(git -C "$target" rev-parse --show-toplevel 2>/dev/null) || continue
+		[ -n "$toplevel" ] || continue
+		toplevel=$(normalize_path "$toplevel" /)
+		[ "$toplevel" = "$project_dir" ] && continue
+
+		# Les quatre termes tiennent. Le refus nomme l'arbre visé, le worktree
+		# de la session, le remède ET l'échappatoire — un refus qui ne nomme
+		# pas sa levée est un refus qu'on contourne au jugé (modèle mika#1475,
+		# Makefile:86-98).
+		printf 'REFUS (%s, mika#2107): cette commande git vise %s\n' "$GUARD_NAME" "$toplevel"
+		printf '       alors que la session travaille dans %s.\n' "$project_dir"
+		printf '  Commande:    %s\n' "${line# }"
+		printf '  Remède:      git -C %s %s …\n' "$project_dir" "$verb"
+		printf '  Dérogation:  MIKA_GUARD_SHARED_CHECKOUT=0 (geste explicite, journalisé)\n'
+		guard_log "deny project=$project_dir target=$toplevel verb=$verb cmd=${command:0:160}"
+		return 1
+	done <<<"$s"
+
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# Adaptateurs d'E/S
+# ---------------------------------------------------------------------------
+
+# Le project-dir est l'ANCRE, jamais le `cwd` — c'est le cwd qui dérive, et
+# c'est exactement la dérive que le ticket décrit. Repli sur le chemin du
+# script quand `CLAUDE_PROJECT_DIR` est absent : le script vit dans
+# <project-dir>/scripts/, donc il connaît son propre arbre sans dépendre d'une
+# variable que le harnais pourrait ne pas poser.
+resolve_project_dir() {
+	if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
+		printf '%s' "$CLAUDE_PROJECT_DIR"
+		return
+	fi
+	local self=${BASH_SOURCE[0]}
+	case $self in
+	/*) ;;
+	*) self="$PWD/$self" ;;
+	esac
+	local dir=${self%/*}
+	printf '%s' "${dir%/*}"
+}
+
+run_hook_mode() {
+	# Lecture builtin plutôt que `$(cat)` : ce chemin s'exécute avant CHAQUE
+	# appel Bash de CHAQUE session du dépôt, et le cas de très loin le plus
+	# fréquent — une commande sans git — doit rendre la main sans forker une
+	# seule fois. `read -d ''` sort en 1 sur un flux sans NUL tout en ayant
+	# rempli la variable : c'est le cas nominal, pas une erreur.
+	local payload=''
+	IFS= read -r -d '' payload || true
+	[ -n "$payload" ] || return 0
+
+	# Preuve d'armement. Son ABSENCE est l'information : elle dit que le hook
+	# n'est pas chargé, et non que rien n'a eu à être refusé (mika#2205,
+	# mika#2327, mika#2340 — ce dépôt a payé cette classe trois fois).
+	case $payload in
+	*SessionStart*)
+		guard_log "$GUARD_NAME: armed project=$(resolve_project_dir)"
+		return 0
+		;;
+	esac
+
+	case $payload in
+	*git*) ;;
+	*) return 0 ;;
+	esac
+
+	command -v jq >/dev/null 2>&1 || return 0
+
+	# UN SEUL appel jq pour les trois champs, et la commande en dernier parce
+	# qu'elle peut être multi-ligne : trois `printf | jq` coûtaient six forks
+	# par appel Bash de chaque session pour trois chaînes du même objet.
+	local extracted
+	extracted=$(jq -r '(.tool_name // ""), (.cwd // ""), (.tool_input.command // "")' <<<"$payload" 2>/dev/null) || return 0
+
+	local -a lines=()
+	mapfile -t lines <<<"$extracted"
+	[ "${#lines[@]}" -ge 3 ] || return 0
+
+	local tool_name=${lines[0]} cwd=${lines[1]} command=''
+	[ "$tool_name" = Bash ] || return 0
+
+	local i
+	for ((i = 2; i < ${#lines[@]}; i++)); do
+		if [ -z "$command" ]; then
+			command=${lines[i]}
+		else
+			command+=$'\n'${lines[i]}
+		fi
+	done
+	[ -n "$command" ] || return 0
+
+	local reason
+	if reason=$(decide_command "$(resolve_project_dir)" "$cwd" "$command"); then
+		return 0
+	fi
+
+	# DOUBLE CANAL, et c'est délibéré. M0-b — « un `permissionDecision: deny`
+	# de hook prime-t-il sur un `permissions.allow` qui couvre `Bash(git:*)` ? »
+	# — n'a PAS pu être mesuré depuis une dispatche (WebFetch y est refusé par
+	# la permission-policy). On émet donc les deux signaux de refus documentés :
+	# le JSON structuré ET le code de sortie 2 avec la raison sur stderr. Aucun
+	# des deux ne peut être MOINS bloquant que l'autre ; émettre les deux retire
+	# la sonde non mesurée du chemin critique au lieu de parier dessus.
+	printf '%s\n' "$reason" >&2
+	if command -v jq >/dev/null 2>&1; then
+		jq -n --arg r "$reason" \
+			'{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$r}}' 2>/dev/null || true
+	fi
+	return 2
+}
+
+main() {
+	if [ "${1:-}" = --decide ]; then
+		shift
+		[ "$#" -eq 3 ] || {
+			printf 'usage: %s --decide <project-dir> <cwd> <command>\n' "${0##*/}" >&2
+			return 64
+		}
+		local reason
+		if reason=$(decide_command "$1" "$2" "$3"); then
+			return 0
+		fi
+		printf '%s\n' "$reason"
+		return 1
+	fi
+	run_hook_mode
+}
+
+main "$@"

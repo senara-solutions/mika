@@ -221,6 +221,24 @@ jobs:
       - name: Reject tokio::select! inside run_loop (mika#848)
         run: bash scripts/check-loop-select.sh
 
+  shared-checkout-guard-lint:
+    name: Shared Checkout Guard Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      # Les quatre occurrences mesurées de mika#2107 sont des fixtures nommées.
+      - name: Pin the guard's behaviour on the four measured occurrences (mika#2107)
+        run: bash scripts/test-guard-shared-checkout.sh
+      # La régression que ce check attrape ne rend AUCUNE décision fausse : elle
+      # rend la garde absente, et les assertions comportementales ci-dessus
+      # restent toutes vertes pendant que plus aucune session ne la charge.
+      - name: Reject a settings.json that lost the PreToolUse hook (mika#2107)
+        run: bash scripts/check-shared-checkout-guard-wiring.sh
+      # A guard nobody has watched go red is a decoration — same discipline as
+      # dispatch-seats-lint above (mika#2103).
+      - name: Pin the wiring check's negative behaviour
+        run: bash scripts/test-check-shared-checkout-guard-wiring.sh
+
   egress-uniqueness-lint:
     name: Egress Uniqueness Lint
     runs-on: ubuntu-22.04
