@@ -721,6 +721,8 @@ Update behavior depends on the source type:
 - **Local snapshots:** Re-copies from the original source path. Fails with a clear message if the source directory no longer exists.
 - **Linked skills:** No-op — source changes are always current. The update summary reports these as "Linked (no-op)".
 
+The argument-less form also **resynchronises the bundled-skill library** from the running binary before touching marketplace skills (mika#2340) — see [Deploying a change to a bundled skill](#deploying-a-change-to-a-bundled-skill). It prints the library path, the manifest hash, and an `attested by: mika <version> (<git sha>) at <instant>` line naming the binary that wrote or confirmed the library's current state. Before mika#2340 the command only re-materialised the per-agent symlinks and printed "Refreshed bundled-skill symlinks." — a sentence about the *link* that operators read as a sentence about the *content*.
+
 ### Uninstalling Skills
 
 ```bash
@@ -963,6 +965,69 @@ Edit `~/.mika/skills/memory/system_prompt.md` to add custom instructions:
 ```
 
 Prompt snippet changes take effect on the next message (no restart needed), because `system_prompt.md` is lazy-loaded from disk each turn.
+
+### Deploying a change to a bundled skill
+
+**The library is a projection of the binary, not of the source tree.** No code
+path reads `skills/bundled/` at runtime: `crates/mika-agent/build.rs` compiles
+the directory into `BUNDLED_SKILL_MANIFESTS`, and `~/.mika/skills/` (the
+library every agent symlinks into) is written from that constant by
+`seed_bundled_skill_library()`. Editing `skills/bundled/<skill>/system_prompt.md`
+in the checkout therefore changes nothing on disk until a binary that embeds
+the edit runs a seed. The deployment chain of a bundled prompt is:
+
+1. **Rebuild** — `make deploy` (or `cargo build`) embeds the new manifest set
+   and its hash.
+2. **Seed** — any `mika` subcommand that goes through `init_base_for_agent`,
+   the mika-spirit daemon at startup, and `mika skills --agent <a> update`
+   (since mika#2340) call `seed_bundled_skills_if_needed()`, which compares the
+   binary's manifest hash to `~/.mika/skills/.manifest-hash` and re-extracts
+   the library when they differ, then re-materialises the agent's symlinks.
+3. **Read** — `system_prompt.md` is lazy-loaded through the symlink on the next
+   turn; no restart is needed for prompt text.
+
+Running `update` against a stale *binary* re-extracts a stale library and
+reports success honestly: the hash it checks is the binary's own. That is the
+2026-09-16 incident behind mika#2340, and it is fixed by step 1, not by
+re-running step 2.
+
+**Probe: `~/.mika/skills/.manifest-writer`.** Written atomically by every seed
+pass — including the ones the hash gate short-circuits — it records which
+binary last attested the library's state:
+
+```json
+{"version":"0.12.2","git_hash":"1a2b3c4d","attested_at":"2026-09-18T06:20:03Z","manifest_hash":"…","extracted":false}
+```
+
+- `version` / `git_hash` — `build_info` of the attesting binary. `git_hash` is
+  the literal `"unknown"` for a binary built outside a git checkout (container
+  layer, source tarball); that is not a failed deploy.
+- `manifest_hash` — the same value as `.manifest-hash`.
+- `extracted` — `true` when the pass rewrote skill content, `false` when it
+  confirmed conformance without extracting. Read `false` as "nothing was
+  stale", never as "nothing happened": the sidecar is refreshed on the
+  confirming pass too, so a rebuild whose PR touched no bundled prompt never
+  shows an older sha on a conformant library.
+
+After `make deploy`, the `attested by` sha printed by `mika skills --agent <a>
+update` must be the sha you just built. If it is **and** the agent's resolved
+prompt still differs from the checkout, the defect is upstream (build-time
+discovery or extraction) — do not re-run `update`, inspect the rebuild.
+
+**Downgrade guard.** Two processes write the shared library (the daemon and
+the CLI) and nothing orders them, so a `mika` binary older than the running
+daemon can re-seed and silently roll prompts back. When the previous
+`.manifest-writer` carries a strictly newer `version`, the seed emits a
+`bundled_library_downgrade` WARN naming both versions and shas — and proceeds:
+a deliberate rollback is legitimate, and a guard that refused one would fail
+worse than the one it reports. The guard is blind at equal version (two builds
+of `0.12.2`); `git_hash` is reported, never compared.
+
+Under `MIKA_DISABLE_BUNDLED_SKILLS=true` (below), `update` still seeds the
+`_shared/` support dirs but leaves skill content untouched (the seeder returns
+before the library and symlink passes, logging a drift count instead), and the
+command says so rather than printing an attestation for a state it did not
+refresh.
 
 ### Disabling bundled skill re-sync
 
