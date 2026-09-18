@@ -203,7 +203,9 @@ Trois conséquences, toutes désirables :
 **`strip_markdown_around_urls` n'est ni retirée ni modifiée.** `render_plain` passe par
 elle en second temps (voir Implémentation §3). Ses 25 tests restent verts et gardent
 leur sens : ils épinglent l'auxiliaire *URL*, et une régression du nouveau
-reconnaisseur ne peut pas rouvrir mika#2126. Le test F4 reste vert **et reçoit un
+reconnaisseur ne peut pas rouvrir mika#2126 **sur le chemin plat** — le mode armé, lui,
+ne la traverse pas et tient le défaut fondateur par le reconnaisseur seul (voir la
+portée exacte du filet en Brique 2, et R5). Le test F4 reste vert **et reçoit un
 commentaire** disant ce qu'il épingle désormais (la fonction, pas le pipeline), avec un
 test frère au niveau pipeline assertant que `**important**` **change** maintenant. Un
 test gelé qu'on laisse vert sans dire qu'il a changé de portée est un test qui ment
@@ -324,13 +326,30 @@ Trois propriétés à tenir, chacune testée :
 - **Un seul réessai.** Le second envoi n'a pas de repli ; son erreur est rendue. Le
   réessai à 2 s de `GatewayMessageSender` (`messaging.rs:194-224`) reste en amont et
   n'est pas touché.
-- **`strip_markdown_around_urls` est conservée en second passage.** Après
-  `render_plain`, les marqueurs reconnus ont disparu, donc elle ne trouve presque
-  jamais rien à faire (elle sort tôt sans schéma d'URL). Elle reste pour le résidu que
-  son propre doc-comment nomme — `_texte https://url_`, décoration non appariée au
-  niveau du token — que le reconnaisseur laisse volontairement `Plain`. Coût : un
-  passage sur une chaîne. Bénéfice : **une régression du nouveau reconnaisseur ne peut
-  pas rouvrir mika#2126.**
+- **`strip_markdown_around_urls` est conservée en second passage — et seulement sur le
+  chemin plat.** Après `render_plain`, les marqueurs reconnus ont disparu, donc elle ne
+  trouve presque jamais rien à faire (elle sort tôt sans schéma d'URL). Elle reste pour
+  le résidu que son propre doc-comment nomme — `_texte https://url_`, décoration non
+  appariée au niveau du token — que le reconnaisseur laisse volontairement `Plain`.
+  Coût : un passage sur une chaîne.
+
+  > **Portée exacte du filet, écrite parce qu'elle est plus étroite qu'elle n'en a
+  > l'air.** Le bénéfice « une régression du reconnaisseur ne peut pas rouvrir
+  > mika#2126 » vaut pour le **plancher**, pas pour le mode armé : la branche HTML
+  > poste `render_html(&segments)` sans repasser par `strip_markdown_around_urls`.
+  > Or le mode armé est le **défaut**. En mode HTML, ce qui tient le défaut fondateur
+  > n'est pas le filet, c'est le reconnaisseur lui-même : une décoration appariée
+  > autour d'une URL devient une balise, donc la borne du lien est la balise et non un
+  > `*` collé à l'URL (R4) ; une décoration non appariée reste `Plain`, donc l'URL
+  > traverse intacte (N3). **Ces deux propriétés sont ce qui remplace le filet sur le
+  > chemin armé, et R5 les contrôle pour elles-mêmes.**
+  >
+  > Faire tourner `strip_markdown_around_urls` **aussi** avant `render_html` serait le
+  > réflexe symétrique, et il est écarté : elle réécrit `[label](url)` en
+  > `label : url`, ce qui détruirait le `Link` que `render_html` doit rendre en
+  > `<a href>`. Les deux transformations se recouvrent au lieu de se composer — d'où
+  > un seul reconnaisseur en amont (Décision 4) et le filet en aval du seul rendu qui
+  > le tolère.
 
 Le `debug!` de métriques existant (`telegram.rs:598-610`) est conservé tel quel.
 
@@ -422,6 +441,18 @@ Chacun asserte `render_plain(tokenize(x)) == x`, pas « a l'air correct ».
 | N8 | `` ` `` seul, `**` seul, `[label](` tronqué | runs non clos → intacts, aucun panic |
 | N9 | `""` | vide |
 | N10 | `Éh 🌸 https://example.com/été — ça va ?` | aucune indexation d'octets brute (KTD6) |
+| N11 | `[x](https://example.com/a b)` | **grammaire de lien refusée** — `parse_markdown_link` rend `None` sur une URL portant une espace (gelé par `test_strip_markdown_link_with_space_in_url_unchanged`, `telegram.rs:1909`). `tokenize` doit alors laisser le texte `Plain`, **dans les deux rendus** : un `<a href>` posé sur une forme que la grammaire a refusée serait un lien que le reconnaisseur aurait inventé. |
+
+**N12 — le contrôle porte sur ce qui part, pas sur une fonction intermédiaire.** Les dix
+premiers négatifs asserted `render_plain(tokenize(x)) == x`, mais le chemin plat émet
+`strip_markdown_around_urls(render_plain(tokenize(x)))`. Tant que le contrôle s'arrête
+au milieu, AC3 est vraie d'une valeur que l'utilisateur ne reçoit jamais. N12 rejoue
+donc **N1–N11 à travers la composition complète** et asserte la même égalité
+octet-pour-octet. Le coût est d'une boucle ; le bénéfice est que la seule composition
+capable de réécrire un message sain — deux transformateurs dont chacun préserve, mis
+bout à bout — cesse d'être un angle mort. Son échec serait d'ailleurs un signal précis :
+il ne dirait pas « un des deux est faux », il dirait « ils se recouvrent », ce qui est
+la question ouverte de la Brique 2.
 
 ### Échappement HTML
 
@@ -460,6 +491,7 @@ d'utilisateur relayé par l'agent pourrait poser des entités Telegram arbitrair
 | R2 | `test_strip_markdown_bold_text_without_url_unchanged` (F4) reste vert et reçoit un commentaire disant ce qu'il épingle désormais : la fonction, pas le pipeline. |
 | R3 | Test frère neuf, au niveau pipeline : `C'est **important** de le savoir.` **change** maintenant. R2 et R3 côte à côte sont la trace lisible du déplacement de périmètre. |
 | R4 | `**https://example.com/a**` : en mode HTML le lien cliqué est `https://example.com/a` (le gras devient `<b>`, la borne du lien est la balise) ; en mode plat, idem via le second passage. Le défaut fondateur de mika#2126 est clos **dans les deux modes**. |
+| R5 | **Le mode armé tient mika#2126 sans le filet.** Le corpus URL de mika#2126 — le cas fondateur, les bornes appariées, la décoration non appariée, l'`_` final légal en URL, le lien à URL espacée (N11) — est rejoué **contre `render_html`**, en assertant que l'URL cliquable reste exactement l'URL d'origine. C'est le contrôle que R1 ne peut pas donner : R1 vérifie que l'auxiliaire *URL* est intact, or le chemin par défaut ne l'appelle pas. Sans R5, la non-régression de mika#2126 ne serait mesurée que sur le chemin de repli — celui qui, en régime nominal, ne tourne jamais. |
 
 ---
 
@@ -560,12 +592,12 @@ churn — le journal suffit pour une population attendue vide.
 
 | # | Risque | Portée | Atténuation |
 |---|---|---|---|
-| 1 | Le reconnaisseur **sur-interprète** et abîme un message sain | La classe qu'AC3 de mika#2126 existe pour fermer | Tableau de reconnaissance fermé (Décision 4) ; 10 contrôles négatifs octet-pour-octet ; S2 |
+| 1 | Le reconnaisseur **sur-interprète** et abîme un message sain | La classe qu'AC3 de mika#2126 existe pour fermer | Tableau de reconnaissance fermé (Décision 4) ; 11 contrôles négatifs octet-pour-octet, rejoués à travers la composition réellement émise (N12) ; S2 |
 | 2 | Corruption d'identifiants par `_` intra-mot | `mon_fichier_test` → `monfichiertest` | Garde CommonMark intra-mot, test N7 dédié |
 | 3 | Un 400 dû au rendu perd le message | Le mode de panne que mika#2126 refusait | **Le repli (Décision 2)** — pire cas = comportement d'aujourd'hui ; deux événements WARN ; kill-switch |
 | 4 | Injection de balise par du texte relayé | Sécurité | Échappement systématique de `< > &`, test H4 |
 | 5 | Divergence entre les deux rendus | Le désarmement emprunterait un chemin non testé | Un seul reconnaisseur (Décision 4) ; S1 asserte l'identité repli/désarmé |
-| 6 | Régression de mika#2126 | Liens cassés, déjà payés une fois | `strip_markdown_around_urls` inchangée + conservée en second passage ; R1–R4 |
+| 6 | Régression de mika#2126 | Liens cassés, déjà payés une fois | `strip_markdown_around_urls` inchangée + conservée en second passage (chemin plat) ; **R5 pour le chemin HTML, qui ne la traverse pas** ; R1–R4 |
 | 7 | Le `OnceLock` global | Odeur architecturale | Assumée et nommée (Décision 5) ; achetée contre la propriété « le kill-switch éteint tout le circuit » |
 | 8 | La sémantique de longueur 4096 est autre que supposée | Un long message en HTML prendrait un 400 | Le repli couvre ; vérification explicite à l'implémentation ; le texte plat est toujours plus court que l'entrée |
 
@@ -583,7 +615,7 @@ code neuf.
 |---|---|---|---|
 | D1 | Chemin de repli 400 → texte plat (Brique 2) | **Non vide** — tout message sortant après déploiement | **(a) Auto-remédiation silencieuse**, détail ci-dessous |
 | D2 | Garde structurelle S3 (`unwrap` / `panic!` / indexation d'octets dans `telegram_markdown.rs`) | **Vide par construction** — le fichier n'existe pas avant ce ticket | Sans objet, zéro exception, **pas d'allowlist** |
-| D3 | Contrôles négatifs N1–N10, positifs P1–P9, échappement H1–H4 | **Vide** — les fixtures sont écrites par ce ticket | Sans objet, zéro exception |
+| D3 | Contrôles négatifs N1–N12, positifs P1–P9, échappement H1–H4, non-régression R5 | **Vide** — les fixtures sont écrites par ce ticket | Sans objet, zéro exception |
 | D4 | WARN de valeur illisible du kill-switch (C3) | **Vide** — la variable n'existe pas avant ce ticket | Sans objet |
 
 ### D1 — option (a), et pourquoi le silence est ici le bon choix
@@ -637,8 +669,8 @@ rendu » comme un oubli.
    fois au démarrage, documenté dans `.env.example` et les deux `CLAUDE.md`.
 6. Les trois événements opérateur sont émis, sans jamais journaliser le corps d'un
    message.
-7. Tous les tests du contrat de vérification passent : P1–P9, N1–N10, H1–H4, S1–S3,
-   C1–C4, R1–R4.
+7. Tous les tests du contrat de vérification passent : P1–P9, N1–N12, H1–H4, S1–S3,
+   C1–C4, R1–R5.
 8. `cargo build`, `cargo test`, `cargo clippy` (zéro warning), `cargo fmt --check`
    verts sur le workspace.
 9. Aucune dépendance ajoutée ; `crates/mika-gateway/src/lib.rs` inchangé.
@@ -664,8 +696,10 @@ vérification.
   second envoi n'a pas de repli. Épinglé par les tests du chemin de repli et par S1.
 
 - **AC3 — Un message sain traverse sans être réécrit.** `render_plain(tokenize(x)) == x`
-  octet-pour-octet pour les dix entrées N1–N10, espaces doubles, tabulations,
-  multi-octets, `_` intra-mot et runs non clos compris. En mode HTML, seul
+  octet-pour-octet pour les onze entrées N1–N11 — espaces doubles, tabulations,
+  multi-octets, `_` intra-mot, runs non clos et grammaire de lien refusée comprises —
+  **et la même égalité tient à travers la composition réellement émise**
+  `strip_markdown_around_urls(render_plain(tokenize(x)))` (N12). En mode HTML, seul
   l'échappement de `<`, `>`, `&` diffère, et le rendu **perçu** est identique.
 
 - **AC4 — Aucune balise ne peut être injectée.** Tout `<`, `>`, `&` du texte est
@@ -682,7 +716,10 @@ vérification.
   passage du rendu plat. `**https://example.com/a**` donne un lien cliqué
   `https://example.com/a` **dans les deux modes**. Le test gelé de F4 reste vert et
   porte un commentaire disant ce qu'il épingle désormais, avec un test frère au niveau
-  pipeline assertant le changement de comportement. Épinglé par R1–R4.
+  pipeline assertant le changement de comportement. **Le contrôle porte sur les deux
+  modes séparément** : R1–R4 sur le chemin plat, qui traverse l'auxiliaire, et R5 sur
+  le chemin HTML, qui ne la traverse pas et doit tenir le défaut fondateur par le
+  reconnaisseur seul. Épinglé par R1–R5.
 
 - **AC7 — Le rendu est infaillible par construction.** Aucun `unwrap`, `expect`,
   `panic!` ni indexation d'octets brute dans `telegram_markdown.rs`, asserté par un
@@ -712,5 +749,6 @@ vérification.
 
 | Date | Auteur | Changement |
 |---|---|---|
+| 2026-09-18 | dev-groom (mika#2291) | Re-groom idempotent. Les sept faits porteurs sont re-vérifiés exacts contre le code (25 tests `test_strip_markdown_*` lignes 1758–1922 ; `sendMessage` unique à `telegram.rs:619` ; `SendMessagePayload` à 332 ; `strip_markdown_around_urls` et ses quatre auxiliaires à 430/438/467/519/543 ; test gelé F4 à 1884 ; `routes.rs:2193` ne contrôle que `50_000` ; les 7 sites de construction non-test). **Une affirmation du plan était plus large que ce qu'il livre et a été corrigée** : « une régression du reconnaisseur ne peut pas rouvrir mika#2126 » ne vaut que pour le **chemin plat**, puisque la branche HTML — le mode par **défaut** — poste `render_html` sans repasser par `strip_markdown_around_urls`. La Brique 2 nomme désormais la portée exacte du filet, dit pourquoi la symétrie est écartée (l'auxiliaire réécrit `[label](url)` en `label : url` et détruirait le `Link` que `render_html` doit rendre en `<a href>`), et **R5** rejoue le corpus URL de mika#2126 contre `render_html` — le contrôle que R1 ne peut structurellement pas donner. Deux trous de contrat comblés au passage : **N11** (grammaire de lien refusée, `[x](https://example.com/a b)`, gelée par `telegram.rs:1909` — un `<a href>` posé sur une forme que `parse_markdown_link` a refusée serait un lien inventé) et **N12** (AC3 était posée sur `render_plain` seul alors que le chemin plat émet `strip_markdown_around_urls(render_plain(tokenize(x)))` — le contrôle s'arrêtait à une valeur que l'utilisateur ne reçoit jamais, et la seule composition capable de réécrire un message sain restait un angle mort). |
 | 2026-09-18 | dev-groom (mika#2291) | Re-groom idempotent. Recomptage de la population mika#2126 contre le code : **25** tests `test_strip_markdown_*` (lignes 1758–1922), pas 30 — le chiffre apparaissait six fois, dont dans la Definition of Done et dans AC6, où il rendait le critère invérifiable. R1 nomme désormais la commande qui le recompte. Les six autres faits porteurs sont re-vérifiés exacts contre le code : F1 (doc-comment `parse_mode` à `telegram.rs:312`), F3 (site `sendMessage` unique à `telegram.rs:619`), F4 (test gelé à `telegram.rs:1884`), F6 (aucun parser markdown au workspace), F7 (`handle_send` rend un 502 au corps vide par sa branche `Err(e)`, les branches `BadRequest` de `routes.rs:908/917` étant sur `download_image`, chemin distinct), et les 7 sites de construction non-test de la Décision 5. La garde miroir 4096 est bien absente (`routes.rs:2193` ne contrôle que `50_000`). |
 | 2026-09-18 | dev-groom (mika#2291) | Plan initial. Trois faits du code déplacent le corps du ticket : `parse_mode` est une décision datée avec sa condition de levée (F1), une transformation markdown de périmètre URL existe déjà (F2), et un test gelé pose le symptôme comme attendu (F4). Retenu : HTML plutôt que MarkdownV2 (surface d'échappement de 3 caractères contre 18), avec un repli sur 400 qui fait du pire cas le comportement d'aujourd'hui — ce qui supprime la prémisse de mika#2126 au lieu de la contredire. Parser CommonMark écarté sur une contrainte testée (préservation octet-pour-octet des espaces, F5), pas sur une préférence. |
