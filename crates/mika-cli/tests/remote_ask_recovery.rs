@@ -186,9 +186,15 @@ fn endpoint(addr: SocketAddr) -> String {
 async fn a_generated_response_survives_a_dropped_socket() {
     let (addr, seen) = spawn_dropping_server(OnRecovery::Completed).await;
 
-    let task = send_message_to_agent("relis ce plan, s'il te plaît", &endpoint(addr), None, &[])
-        .await
-        .expect("the answer existed server-side and must be reclaimed");
+    let task = send_message_to_agent(
+        "relis ce plan, s'il te plaît",
+        &endpoint(addr),
+        None,
+        &[],
+        None,
+    )
+    .await
+    .expect("the answer existed server-side and must be reclaimed");
 
     assert_eq!(
         render_task_parts(&task).expect("a reclaimed answer must render"),
@@ -221,7 +227,7 @@ async fn a_refused_port_errors_without_attempting_a_recovery() {
         listener.local_addr().unwrap()
     };
 
-    let err = send_message_to_agent("relis ce plan", &endpoint(addr), None, &[])
+    let err = send_message_to_agent("relis ce plan", &endpoint(addr), None, &[], None)
         .await
         .expect_err("nothing is listening; this must fail");
     let visible = format!("{err:#}");
@@ -244,7 +250,7 @@ async fn a_refused_port_errors_without_attempting_a_recovery() {
 async fn a_still_running_task_says_retry_rather_than_returning_nothing() {
     let (addr, _) = spawn_dropping_server(OnRecovery::StillWorking).await;
 
-    let err = send_message_to_agent("relis ce plan", &endpoint(addr), None, &[])
+    let err = send_message_to_agent("relis ce plan", &endpoint(addr), None, &[], None)
         .await
         .expect_err("an unfinished generation is not an answer");
     let visible = format!("{err:#}");
@@ -269,13 +275,13 @@ async fn a_missing_task_is_reported_differently_from_one_in_flight() {
 
     let missing = format!(
         "{:#}",
-        send_message_to_agent("relis ce plan", &endpoint(addr_missing), None, &[])
+        send_message_to_agent("relis ce plan", &endpoint(addr_missing), None, &[], None)
             .await
             .expect_err("no task exists")
     );
     let running = format!(
         "{:#}",
-        send_message_to_agent("relis ce plan", &endpoint(addr_running), None, &[])
+        send_message_to_agent("relis ce plan", &endpoint(addr_running), None, &[], None)
             .await
             .expect_err("the task has not finished")
     );

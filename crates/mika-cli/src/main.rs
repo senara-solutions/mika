@@ -319,11 +319,17 @@ async fn main() -> Result<()> {
                     // remote_ask has its own OutputFormat without Yaml; fall back to Json
                     cli::OutputFormat::Yaml => mika_cli::remote_ask::OutputFormat::Json,
                 };
+                // mika#2304: `--model` reaches this branch. Before, `args.model`
+                // appeared nowhere in it — the flag was silently dropped on the
+                // path the founding ticket names in its own title. The string
+                // travels raw; the executing agent resolves it against its own
+                // provider (mika#1591 semantics belong to the executing side).
                 return match mika_cli::remote_ask::run_remote(
                     &args.message,
                     remote_url,
                     fmt,
                     args.verbose,
+                    args.model.as_deref(),
                 )
                 .await
                 {
@@ -961,34 +967,25 @@ mod tests {
 
     /// resolve_model_alias resolves known aliases and passes through unknown values.
     /// All aliases now include provider prefix for cross-provider correctness.
+    ///
+    /// mika#2304 moved the function to `mika_common::llm::model_override` so the
+    /// server can reach it; the assertions are unchanged, which is what attests
+    /// the move did not alter what the CLI resolves (T8).
     #[test]
     fn test_resolve_model_alias() {
+        use mika_common::llm::model_override::resolve_model_alias;
+
         // Anthropic aliases include provider prefix
-        assert_eq!(
-            crate::cli::resolve_model_alias("sonnet"),
-            "anthropic/claude-sonnet-4-6"
-        );
-        assert_eq!(
-            crate::cli::resolve_model_alias("opus"),
-            "anthropic/claude-opus-4-6"
-        );
-        assert_eq!(
-            crate::cli::resolve_model_alias("haiku"),
-            "anthropic/claude-haiku-4-5"
-        );
+        assert_eq!(resolve_model_alias("sonnet"), "anthropic/claude-sonnet-4-6");
+        assert_eq!(resolve_model_alias("opus"), "anthropic/claude-opus-4-6");
+        assert_eq!(resolve_model_alias("haiku"), "anthropic/claude-haiku-4-5");
         // Case-insensitive
-        assert_eq!(
-            crate::cli::resolve_model_alias("Sonnet"),
-            "anthropic/claude-sonnet-4-6"
-        );
+        assert_eq!(resolve_model_alias("Sonnet"), "anthropic/claude-sonnet-4-6");
         // Cross-provider aliases already had prefix (unchanged)
-        assert_eq!(
-            crate::cli::resolve_model_alias("openai/gpt-4o"),
-            "openai/gpt-4o"
-        );
+        assert_eq!(resolve_model_alias("openai/gpt-4o"), "openai/gpt-4o");
         // Unknown values pass through unchanged
         assert_eq!(
-            crate::cli::resolve_model_alias("some-custom-model"),
+            resolve_model_alias("some-custom-model"),
             "some-custom-model"
         );
     }

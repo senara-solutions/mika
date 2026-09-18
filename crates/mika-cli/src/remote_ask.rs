@@ -20,7 +20,9 @@ use mika_a2a::client::{A2aClient, RECOVERY_TIMEOUT};
 use mika_a2a::error::TransportFailure;
 pub use mika_a2a::render::{EmptyKind, TaskRenderEmpty};
 use mika_a2a::{A2aError, Message, MessageSendParams, Part, Role, Task, TaskState};
-pub use mika_a2a::{CALLER_SESSION_ID_KEY, ONLY_SKILLS_KEY};
+pub use mika_a2a::{
+    CALLER_SESSION_ID_KEY, EFFECTIVE_MODEL_KEY, MODEL_OVERRIDE_KEY, ONLY_SKILLS_KEY, attested_model,
+};
 use uuid::Uuid;
 
 /// Output format selector. Mirrors `crate::cli::OutputFormat` to keep the
@@ -75,15 +77,23 @@ pub fn render_task_parts(task: &Task) -> Result<String, TaskRenderEmpty> {
 /// `only_skills` names the skills the turn should keep, under
 /// [`ONLY_SKILLS_KEY`] (mika#2363). Empty leaves the key absent.
 ///
-/// The two metadata keys are independent and either may be absent. When both
-/// are, `metadata` itself stays absent so the serialized body is byte-identical
-/// to the pre-mika#2070 shape — the property that makes a caller declaring
-/// nothing indistinguishable from a caller that predates these keys.
+/// `model_override` is the model id **as the operator typed it**, under
+/// [`MODEL_OVERRIDE_KEY`] (mika#2304). Deliberately raw: alias resolution and
+/// prefix stripping depend on the *executing* agent's `llm_provider`
+/// (mika#1591), which on `--remote` is not this machine's. Resolving here would
+/// send an id resolved against the wrong provider — a second false green,
+/// quieter than the first.
+///
+/// The three metadata keys are independent and any may be absent. When all are,
+/// `metadata` itself stays absent so the serialized body is byte-identical to
+/// the pre-mika#2070 shape — the property that makes a caller declaring nothing
+/// indistinguishable from a caller that predates these keys.
 fn build_send_params(
     message: &str,
     caller_session_id: Option<&str>,
     context_id: &str,
     only_skills: &[String],
+    model_override: Option<&str>,
 ) -> MessageSendParams {
     let mut fields = std::collections::HashMap::new();
     if let Some(sid) = caller_session_id {
@@ -96,6 +106,12 @@ fn build_send_params(
         // A `&[String]` serializes to a JSON array of strings, which is exactly
         // the shape the server reads.
         fields.insert(ONLY_SKILLS_KEY.to_string(), serde_json::json!(only_skills));
+    }
+    if let Some(model) = model_override {
+        fields.insert(
+            MODEL_OVERRIDE_KEY.to_string(),
+            serde_json::Value::String(model.to_string()),
+        );
     }
     let metadata = if fields.is_empty() {
         None
@@ -239,6 +255,7 @@ pub async fn send_message_to_agent(
     url: &str,
     caller_session_id: Option<&str>,
     only_skills: &[String],
+    model_override: Option<&str>,
 ) -> Result<Task> {
     let auth_token = std::env::var("MIKA_INTERNAL_TOKEN")
         .ok()
@@ -256,6 +273,7 @@ pub async fn send_message_to_agent(
             caller_session_id,
             &context_id,
             only_skills,
+            model_override,
         ))
         .await
     {
@@ -341,12 +359,16 @@ pub async fn dispatch_remote(
     remote_url: &str,
     format: OutputFormat,
     verbose: bool,
+    model_override: Option<&str>,
 ) -> Result<String> {
     // Fail-fast URL validation. A2aClient itself doesn't pre-parse, so an invalid
     // URL would surface as a reqwest send error — a less actionable message.
     reqwest::Url::parse(remote_url)
         .with_context(|| format!("invalid --remote URL: {remote_url}"))?;
 
+    // Two of the three `mika.*` keys are deliberately NOT sent on this path; the
+    // third is (mika#2304). What separates them is what each one *names*.
+    //
     // `--remote` sends no caller session id (mika#2070). The local bookkeeping
     // session lives in this machine's database; a remote agent normally holds a
     // different one and would refuse the id. A single-host deployment where the
@@ -357,7 +379,20 @@ pub async fn dispatch_remote(
     // is refused in team mode but accepted with `--remote`, and a remote agent's
     // skill names are not this machine's to guess. The flag is honoured on the
     // local spirit path, which is the one `_arch_ask` uses.
-    let task = send_message_to_agent(message, remote_url, None, &[]).await?;
+    //
+    // Both refusals rest on the same property: each key names a **local
+    // reference the caller would be guessing** — a row of this machine's
+    // database, a name in this machine's skill registry. A model id is not one.
+    // It is a string the operator typed, resolved against the *executing*
+    // agent's provider (which is why it travels raw), and whose validity is a
+    // property of that remote agent, not an inference of this one. It is also
+    // what mika#2304 is about by name — the ticket's title says `--remote`.
+    //
+    // The fail-closed policy is what makes the asymmetry safe: an id the remote
+    // cannot serve fails the request with a sentence naming the model and the
+    // provider — the ticket's own fallback option ("faire échouer avec un
+    // message clair"), reached without giving up the capability.
+    let task = send_message_to_agent(message, remote_url, None, &[], model_override).await?;
     render(&task, format, verbose)
 }
 
@@ -370,8 +405,9 @@ pub async fn run_remote(
     remote_url: &str,
     format: OutputFormat,
     verbose: bool,
+    model_override: Option<&str>,
 ) -> Result<()> {
-    let output = dispatch_remote(message, remote_url, format, verbose).await?;
+    let output = dispatch_remote(message, remote_url, format, verbose, model_override).await?;
     println!("{output}");
     Ok(())
 }
@@ -383,12 +419,29 @@ pub async fn run_remote(
 /// would hide the slice census that is the whole point of failing here. Both
 /// formats share this one gate, which is why `--format json` cannot emit
 /// `"content": ""` while `--format text` errors, or the reverse.
+/// mika#2304: under `--verbose` this path now also reports the model the server
+/// attested. It reports **nothing** when the server attested nothing — a remote
+/// agent running a binary older than mika#2304 lands there, and it is exactly the
+/// population where printing anything local would be a lie. Note this is an
+/// *addition* on this path, not the repair of a false statement: `--remote` never
+/// displayed a model at all. The measured false green of the founding ticket is
+/// the local path's (`commands::ask`), and over-attributing it here would
+/// misdescribe the fix.
 fn render(task: &Task, format: OutputFormat, verbose: bool) -> Result<String> {
     let rendered = render_task_parts(task)?;
+    let model = attested_model(task);
     Ok(match format {
         OutputFormat::Text => {
             if verbose {
-                format!("{rendered}\n\nremote_task_id: {}", task.id)
+                let mut out = format!("{rendered}\n\nremote_task_id: {}", task.id);
+                match model {
+                    Some(m) => out.push_str(&format!("\nmodel: {m}")),
+                    None => {
+                        out.push('\n');
+                        out.push_str(NO_ATTESTATION_LINE);
+                    }
+                }
+                out
             } else {
                 rendered
             }
@@ -399,14 +452,27 @@ fn render(task: &Task, format: OutputFormat, verbose: bool) -> Result<String> {
                 "content": rendered,
             });
             if verbose {
-                response["metadata"] = serde_json::json!({
+                let mut metadata = serde_json::json!({
                     "remote_task_id": task.id,
                 });
+                // Absent, never null and never a local value: an absent key is
+                // the honest encoding of "this server did not say".
+                if let Some(m) = model {
+                    metadata["model"] = serde_json::Value::String(m.to_string());
+                }
+                response["metadata"] = metadata;
             }
             serde_json::to_string(&response)?
         }
     })
 }
+
+/// What text mode says when the server attested no model (mika#2304, D3).
+///
+/// A named constant because both `--remote` and `commands::ask` must say the
+/// same thing: the two surfaces answer the same question, and two wordings would
+/// read as two different situations.
+pub const NO_ATTESTATION_LINE: &str = "model: (not attested by the server)";
 
 #[cfg(test)]
 mod tests {
@@ -666,7 +732,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_url_fails_fast_with_clear_error() {
-        let err = dispatch_remote("hi", "not-a-url", OutputFormat::Text, false)
+        let err = dispatch_remote("hi", "not-a-url", OutputFormat::Text, false, None)
             .await
             .expect_err("should fail on invalid URL");
         let chain = format!("{err:#}");
@@ -850,7 +916,7 @@ mod tests {
 
     #[test]
     fn send_params_carry_the_caller_session_id() {
-        let params = build_send_params("hello", Some("rt005-c1-r7"), "ctx-1", &[]);
+        let params = build_send_params("hello", Some("rt005-c1-r7"), "ctx-1", &[], None);
         let metadata = params.metadata.expect("metadata should be present");
         assert_eq!(metadata.len(), 1);
         assert_eq!(
@@ -861,7 +927,7 @@ mod tests {
 
     #[test]
     fn send_params_without_a_session_serialize_without_metadata() {
-        let params = build_send_params("hello", None, "ctx-1", &[]);
+        let params = build_send_params("hello", None, "ctx-1", &[], None);
         assert!(params.metadata.is_none());
         // The pre-mika#2070 body shape is preserved byte-for-byte: `metadata` is
         // `skip_serializing_if = "Option::is_none"`, so the key must be absent
@@ -878,7 +944,7 @@ mod tests {
     #[test]
     fn send_params_carry_only_skills_as_an_array_of_strings() {
         let only = vec!["mika-arch-groom-ticket".to_string()];
-        let params = build_send_params("hello", None, "ctx-1", &only);
+        let params = build_send_params("hello", None, "ctx-1", &only, None);
         let body = serde_json::to_value(&params).unwrap();
         assert_eq!(
             body["metadata"][ONLY_SKILLS_KEY],
@@ -893,7 +959,7 @@ mod tests {
         // Both halves present is the `_arch_ask` shape: a session to continue and
         // a pass to declare. Neither key may shadow the other.
         let only = vec!["mika-arch-second-review".to_string()];
-        let params = build_send_params("hello", Some("sess-7"), "ctx-1", &only);
+        let params = build_send_params("hello", Some("sess-7"), "ctx-1", &only, None);
         let metadata = params.metadata.expect("metadata should be present");
         assert_eq!(metadata.len(), 2);
         assert_eq!(
@@ -908,11 +974,145 @@ mod tests {
         // R3: a caller that declares nothing must produce the pre-mika#2363 body.
         // An empty array on the wire would be a different statement — and one the
         // server would have to decide the meaning of.
-        let params = build_send_params("hello", Some("sess-7"), "ctx-1", &[]);
+        let params = build_send_params("hello", Some("sess-7"), "ctx-1", &[], None);
         let body = serde_json::to_value(&params).unwrap();
         assert!(
             body["metadata"].get(ONLY_SKILLS_KEY).is_none(),
             "unexpected only_skills key in {body}"
         );
+    }
+
+    // --- mika#2304: the model override on the wire ----------------------------
+
+    /// **T1.** The key travels, and it travels **raw**. Resolving locally would
+    /// produce, on `--remote`, an id resolved against the wrong provider — a
+    /// second false green, quieter than the one the ticket measured.
+    #[test]
+    fn send_params_carry_the_model_override_unresolved() {
+        // `sonnet` is an alias and `moonshotai/kimi-k2.5` is vendor-prefixed:
+        // between them they cover both transformations the server owns.
+        for raw in ["sonnet", "moonshotai/kimi-k2.5"] {
+            let params = build_send_params("hello", None, "ctx-1", &[], Some(raw));
+            let body = serde_json::to_value(&params).unwrap();
+            assert_eq!(
+                body["metadata"][MODEL_OVERRIDE_KEY],
+                serde_json::json!(raw),
+                "the server resolves aliases and prefixes against the *executing* \
+                 provider (mika#1591); this side must not pre-resolve: {body}"
+            );
+        }
+    }
+
+    /// **T1, second half.** With all three keys present, none shadows another.
+    /// Same shape as `the_two_metadata_keys_are_independent` one ticket earlier.
+    #[test]
+    fn the_three_metadata_keys_are_independent() {
+        let only = vec!["mika-arch-second-review".to_string()];
+        let params = build_send_params(
+            "hello",
+            Some("sess-7"),
+            "ctx-1",
+            &only,
+            Some("moonshotai/kimi-k2.5"),
+        );
+        let metadata = params.metadata.expect("metadata should be present");
+        assert_eq!(metadata.len(), 3);
+        assert_eq!(
+            metadata.get(CALLER_SESSION_ID_KEY).and_then(|v| v.as_str()),
+            Some("sess-7")
+        );
+        assert!(metadata.contains_key(ONLY_SKILLS_KEY));
+        assert_eq!(
+            metadata.get(MODEL_OVERRIDE_KEY).and_then(|v| v.as_str()),
+            Some("moonshotai/kimi-k2.5")
+        );
+    }
+
+    /// **T2 / AC5.** A caller declaring none of the three keys produces the
+    /// pre-mika#2070 body, byte for byte: `metadata` absent, not `null`.
+    #[test]
+    fn declaring_no_key_at_all_leaves_metadata_absent() {
+        let params = build_send_params("hello", None, "ctx-1", &[], None);
+        let body = serde_json::to_value(&params).unwrap();
+        assert!(
+            body.get("metadata").is_none(),
+            "unexpected metadata key in {body}"
+        );
+    }
+
+    /// A model override alone must not drag the other two keys along.
+    #[test]
+    fn a_model_override_alone_carries_only_its_own_key() {
+        let params = build_send_params("hello", None, "ctx-1", &[], Some("sonnet"));
+        let metadata = params.metadata.expect("metadata should be present");
+        assert_eq!(metadata.len(), 1);
+        assert!(metadata.contains_key(MODEL_OVERRIDE_KEY));
+    }
+
+    // --- mika#2304 T6: the CLI never shows a model it was not given -----------
+
+    fn task_attesting(model: Option<&str>) -> Task {
+        let mut task = task_with_text("ok");
+        if let Some(m) = model {
+            task.metadata = Some(std::collections::HashMap::from([(
+                EFFECTIVE_MODEL_KEY.to_string(),
+                serde_json::Value::String(m.to_string()),
+            )]));
+        }
+        task
+    }
+
+    /// **T6, positive.** An attested model is what both formats report.
+    #[test]
+    fn verbose_reports_the_attested_model_on_both_formats() {
+        let task = task_attesting(Some("openrouter/moonshotai/kimi-k2.5"));
+
+        let text = render(&task, OutputFormat::Text, true).unwrap();
+        assert!(
+            text.contains("model: openrouter/moonshotai/kimi-k2.5"),
+            "text trailer missing the attestation: {text}"
+        );
+
+        let json = render(&task, OutputFormat::Json, true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["metadata"]["model"], "openrouter/moonshotai/kimi-k2.5");
+    }
+
+    /// **T6, the one that matters.** With no attestation the requested model
+    /// must appear **nowhere** in the output. A server older than mika#2304
+    /// lands here, and printing a local value would be the very lie the
+    /// attestation exists to remove — asserted on the whole rendered string, not
+    /// just on the field, so a second display path cannot leak it either.
+    #[test]
+    fn without_an_attestation_no_model_is_shown_anywhere() {
+        let task = task_attesting(None);
+
+        let text = render(&task, OutputFormat::Text, true).unwrap();
+        assert!(
+            !text.contains("kimi"),
+            "a model leaked into an unattested render: {text}"
+        );
+        assert!(
+            text.contains(NO_ATTESTATION_LINE),
+            "the absence must be stated, not silently omitted: {text}"
+        );
+
+        let json = render(&task, OutputFormat::Json, true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            v["metadata"].get("model").is_none(),
+            "absent, never null and never local: {v}"
+        );
+    }
+
+    /// Without `--verbose` nothing changes on either format — the mika#2304
+    /// trailer is verbose-gated like every other runtime field.
+    #[test]
+    fn a_non_verbose_render_is_untouched_by_the_attestation() {
+        let task = task_attesting(Some("openrouter/moonshotai/kimi-k2.5"));
+        assert_eq!(render(&task, OutputFormat::Text, false).unwrap(), "ok");
+        let json = render(&task, OutputFormat::Json, false).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("metadata").is_none(), "unexpected metadata in {v}");
     }
 }

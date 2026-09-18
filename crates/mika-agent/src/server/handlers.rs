@@ -1609,6 +1609,9 @@ async fn run_agent_for_message(
         global_home_dir: Some(&state.global_home_dir),
         is_callback_turn: false,
         settings: Some(&a.settings),
+        // mika#2304: the inbound-message path carries no caller model override —
+        // a Telegram or GitHub webhook has no way to name one.
+        caller_model_override: false,
         trace_id: Some(req.request_id.clone()),
         correlated_task_id: None,
         internal: false,

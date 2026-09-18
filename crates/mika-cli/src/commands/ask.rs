@@ -101,10 +101,28 @@ pub async fn run(
     only_skill: &[String],
     verbose: bool,
 ) -> Result<()> {
-    let mut ctx = init::init_for_agent(agent_name)?;
+    let ctx = init::init_for_agent(agent_name)?;
 
-    if let Some(model) = model_override {
-        ctx.override_model(model)?;
+    // mika#2304: `--model` is no longer spent on `ctx.override_model`. That
+    // rebuilt a *local* provider nobody calls on this path any more (mika#1727),
+    // while also writing the requested model into `ctx.settings` — which the
+    // verbose envelope then read back and printed as if it had served. The flag
+    // now travels to the executing surface; the envelope reads the server's
+    // attestation.
+    //
+    // **Arg-level validation stays local and early, but only the part that is
+    // provider-independent.** A blank `--model` is refused here, before any round
+    // trip. The API-key check moved to the executing side deliberately: this
+    // process and the mika-spirit daemon do not share an environment — a service
+    // EnvironmentFile against an interactive shell, the exact divergence mika#2293
+    // had to make observable for the timeout keys — so a local key check can
+    // refuse an override the executing process could serve. The check is not
+    // dropped; it moved to the side that can answer it, and its refusal comes
+    // back as `remote error: Provider '…' has no API key configured. …`.
+    if let Some(model) = model_override
+        && model.trim().is_empty()
+    {
+        anyhow::bail!("--model value must not be empty");
     }
 
     // Validate task_id format — reject empty or excessively long values
@@ -313,12 +331,20 @@ pub async fn run(
     // ships the prompt and renders the returned Task.
     //
     // Deferred follow-ups (flagged for MPC review, out of scope for this slice):
-    //   * `--enable-skill` / `--disable-skill` / `--model` configure the *local*
-    //     registry/LLM, which is no longer the execution surface. Their arg-level
-    //     validation is preserved, but they do not yet reach spirit — that needs
-    //     a config channel threaded through `message/send`.
+    //   * `--enable-skill` / `--disable-skill` configure the *local* registry,
+    //     which is no longer the execution surface. Their arg-level validation is
+    //     preserved, but they do not yet reach spirit — that needs the additive
+    //     half of the config channel, deliberately still deferred (see below).
     //   * per-run token usage (verbose `tokens.*`) is not carried by the A2A
     //     `Task`, so it degrades to absent until threaded through the protocol.
+    //
+    // Resolved (mika#2304): `--model` used to sit in that first bullet, and its
+    // presence there was measured as a false green rather than a missing feature.
+    // It reached the *local* `Settings`, which the verbose envelope below then
+    // read and printed — so `--verbose` asserted the override with full authority
+    // while the turn ran under the agent's configured model. It now travels to
+    // spirit under `mika.model_override`, and the envelope reports the model the
+    // server attests instead of anything this process knows.
     //
     // Partially resolved (mika#2363): `--only-skill` DOES reach spirit, through
     // `message/send` request metadata. It is deliberately only the **subtractive**
@@ -383,6 +409,7 @@ pub async fn run(
         &spirit_endpoint,
         Some(session_id.as_str()),
         only_skill,
+        model_override,
     )
     .await
     .map_err(|e| wrap_send_error(&e, &spirit_endpoint))?;
@@ -437,11 +464,14 @@ pub async fn run(
     // when `--verbose`; unconditional fields (`task_id`, `parent_task_id`)
     // are populated whenever their CLI flag was provided.
     let elapsed_ms = started.elapsed().as_millis() as u64;
-    let model_string = {
-        let provider = ctx.settings.llm_provider;
-        let (model_name, _, _) = ctx.settings.provider_fields(provider);
-        model_name.map(|m| format!("{provider}/{m}"))
-    };
+    // mika#2304 D3: the model comes from the server's attestation on the returned
+    // Task, never from `ctx.settings`. Reading the local settings is what made
+    // `--verbose` assert an override that had not happened — the field was not
+    // absent or null, it stated the requested model with authority while the turn
+    // ran under another. `None` here means the server did not attest (a binary
+    // older than mika#2304, or a path outside synchronous `message/send`), and
+    // the only honest rendering of that is *no model at all*.
+    let model_string = mika_cli::remote_ask::attested_model(&task).map(str::to_string);
 
     let envelope = MetadataEnvelope {
         // Unconditional fields — present whenever the CLI flag was provided
@@ -493,8 +523,16 @@ pub async fn run(
                 if let Some(ref v) = meta.session_id {
                     println!("session_id: {v}");
                 }
-                if let Some(ref v) = meta.model {
-                    println!("model: {v}");
+                // mika#2304: under `--verbose` the line is always emitted, and
+                // says so when the server attested nothing. Silently omitting it
+                // would leave the operator unable to tell "no attestation" from
+                // "the trailer changed shape", and it is precisely the operator
+                // who is running a pre-flight and needs to know which of the two
+                // they are looking at.
+                match (&meta.model, verbose) {
+                    (Some(v), _) => println!("model: {v}"),
+                    (None, true) => println!("{}", mika_cli::remote_ask::NO_ATTESTATION_LINE),
+                    (None, false) => {}
                 }
                 if let Some(ref v) = meta.agent_id {
                     println!("agent_id: {v}");

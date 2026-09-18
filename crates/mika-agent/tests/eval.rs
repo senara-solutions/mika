@@ -103,6 +103,9 @@ mod eval {
     mod test_llm_watchdog_2342;
     mod test_max_steps_continuation;
     mod test_merge_identity_2248;
+    // mika#2304 — le tour dit sous quel modèle il a tourné, et un modèle nommé
+    // par l'appelant l'emporte sur la section `[llm]` d'une skill.
+    mod test_model_attestation_2304;
     mod test_multi_agent_harness_witness;
     mod test_multi_step;
     mod test_multi_turn_persistence;
