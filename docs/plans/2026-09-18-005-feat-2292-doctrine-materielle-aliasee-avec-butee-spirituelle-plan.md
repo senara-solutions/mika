@@ -305,7 +305,13 @@ raison pour laquelle V8 vérifie l'**ordre** et non l'adjacence.
 2. `MIKA_DOCTRINE_BODY_OPERATOR` et `MIKA_DOCTRINE_BODY_FAMILY`, chacune avec son
    doc-comment portant : provenance des faits (D9), interdiction de nommer un
    référent spirituel (D3), et pour la famille le motif de l'absence de référent
-   créateur (D4).
+   créateur (D4). **Le doc-comment énonce l'interdit sans l'énumérer** : la liste
+   des référents n'apparaît qu'une fois dans l'arbre, dans le module de test qui
+   la scanne (V3), sous `#[cfg(test)]` — forme prescrite par la doctrine
+   fire-disposition pour une liste structurelle (« scope it inside
+   `#[cfg(test)] mod tests` so the production loader cannot consult it at
+   runtime »). Elle n'est donc ni compilée en release, ni servie, ni lisible par
+   le tenant.
 3. `fn doctrine_body(persona: PersonaProfile) -> &'static str` — `match`
    exhaustif, aucun bras `_ =>`.
 4. `fn write_mika_doctrine_section(prompt: &mut String, persona: PersonaProfile)`.
@@ -386,7 +392,18 @@ d'hébergement identique, vers la ligne famille de `## Runtime`.
 ### V-C — Tests
 
 `prompt.rs::tests`, préfixe `mika2292_`, nommage et forme repris de la série
-`mika2290_*` déjà en place.
+`mika2290_*` déjà en place. Deux points que la § Fire-Disposition impose et qui
+sont des contraintes d'écriture, pas des détails :
+
+- **La denylist de V3 vit sous `#[cfg(test)] mod tests`**, en une seule
+  occurrence, et porte son propre **contrôle positif** : un corps factice
+  contenant un référent doit faire rougir le scan. Sans lui, une denylist vidée
+  par mégarde produit un test vert qui ne scanne rien — la panne silencieuse que
+  V3 existe précisément pour empêcher.
+- **La portée des scans V3/V4/V5/V6/V7 est les deux constantes de ce ticket**,
+  jamais le fichier ni le prompt assemblé. Motif mesuré, et il n'est pas une
+  commodité : voir § Fire-Disposition, où chaque élargissement est nommé avec la
+  violation pré-existante qu'il ferait rougir.
 
 ### V-D — Scénario d'eval
 
@@ -396,6 +413,12 @@ sur le modèle de `doctrine_prompt_section_rendered.rs` du même répertoire
 Enregistré dans `doctrine_regressions/mod.rs` avec deux entrées de vocabulaire :
 `doctrine:material-doctrine-answerable` (succès post-fix) et
 `doctrine:doctrine-not-found` (échec pré-fix — la réponse mesurée).
+
+**Ce scénario assère la forme du prompt, pas la réponse du modèle**, comme son
+modèle du même répertoire. `MockLlmProvider` est séquentiel : il rejoue une
+réponse scriptée, donc un scénario qui l'interrogerait sur « la doctrine Mika »
+vérifierait la plomberie et jamais la réponse. La moitié comportementale est
+V13b, gardée à part avec son motif (§ Fire-Disposition, option (b)).
 
 ### V-E — Documentation
 
@@ -408,11 +431,17 @@ carve-out compact, et la sonde post-déploiement avec ses haltes.
 
 ## Verification contract
 
+**Portée, valable pour V3 à V7 :** ces cinq scans lisent **les deux constantes
+que ce ticket crée**, jamais le fichier, jamais le prompt assemblé. Ce n'est pas
+un rétrécissement de confort — chaque élargissement possible est nommé en
+§ Fire-Disposition avec la violation pré-existante qu'il ferait rougir et la
+raison pour laquelle cette violation n'en est pas une.
+
 | id | ce qui est vérifié | comment |
 |---|---|---|
 | **V1** | la section est rendue dans les deux builders, dans les deux registres | 4 assertions `contains(MIKA_DOCTRINE_HEADING)` |
 | **V2** | le carve-out compact tient | `build_compact_system_prompt` ne contient pas l'en-tête |
-| **V3** | **aucun référent spirituel n'est nommé** | scan des deux constantes contre une liste de référents interdits, `assert!(!body.to_lowercase().contains(r))` |
+| **V3** | **aucun référent spirituel n'est nommé** | scan des deux constantes contre une denylist vivant sous `#[cfg(test)]`, `assert!(!body.to_lowercase().contains(r))`, plus un contrôle positif sur un corps factice |
 | **V4** | aucun des deux corps ne fait firer la garde 5d | `crate::evidence::guards::detect_false_local_hosting_claim(body, Deployment::Cloud).is_none()` — le prédicat est `pub(crate)` (`guards.rs:903`), appelable depuis `prompt.rs::tests` sans élargir sa visibilité |
 | **V5** | le corps famille ne porte aucun jargon d'infrastructure | modèle `mika2290_family_cloud_line_carries_no_infrastructure_jargon` |
 | **V6** | le corps famille n'établit aucun référent créateur (D4) | scan de la constante |
@@ -422,6 +451,8 @@ carve-out compact, et la sonde post-déploiement avec ses haltes.
 | **V10** | le `match` sur `PersonaProfile` est exhaustif | structurel : le compilateur (aucun bras `_ =>` écrit) |
 | **V11** | pas de régression de forme sur les sections voisines | la suite `prompt.rs::tests` existante passe inchangée |
 | **V12** | `cargo test -p mika-agent`, `cargo clippy`, `cargo fmt --check` | CI |
+| **V13a** | la règle 6 est **couplée** à la section, et porte l'interdit littéral | la règle est composée par interpolation de `MIKA_DOCTRINE_HEADING` (jamais un littéral recopié), donc un renommage de la section ne peut pas laisser une règle 6 pointant dans le vide ; plus une assertion que la formule interdite (« rien trouvé » / « not found ») figure bien dans le texte de la règle, et que le prompt rendu porte **les deux moitiés ensemble** |
+| **V13b** | le modèle répond effectivement | eval réel-provider `#[ignore]` + `MIKA_EVAL_REAL_PROVIDERS` — rejeu de « Qu'est-ce que la doctrine Mika ? », assertions faibles (`assert_response_forbids` sur les formules d'absence, `assert_response_contains` sur au moins deux partis pris). **Volontairement hors CI** — motif et disposition en § Fire-Disposition, option (b) |
 
 **V3 est le test porteur du ticket.** Il ne vérifie pas une décision correcte, il
 refuse une décision *inverse* qu'un futur éditeur bien intentionné prendra
@@ -429,16 +460,124 @@ naturellement (énumérer pour clarifier). C'est la seule assertion du lot dont
 aucun test comportemental ne peut tenir lieu : l'énumération ne rendrait aucune
 décision fausse, elle créerait la fuite en silence.
 
+**V13a est ce que V9 ne pouvait pas donner.** V9 assère une présence de chaîne ;
+un renommage de la section laissait la règle 6 verte tout en la faisant désigner
+une section qui n'existe plus — exactement le couplage silencieusement rompu que
+`grooming_marker` (mika#2158) a dû refermer sur une autre surface. V13a fait de
+ce couplage un fait de compilation. Il ne prétend pas vérifier la réponse du
+modèle : c'est V13b, et la part qu'aucun des deux ne couvre est déclarée en
+vérification manuelle (Sonde 1).
+
 ---
 
 ## Fire-Disposition
 
+Requis par le Fire-Disposition Gate (mika#1574) : V3 à V7 et V13a sont des
+livrables de **classe détecteur**, et un plan qui en porte doit dire ce qui se
+passe quand ils firent sur des **données existantes**. Ce qui suit nomme, pour
+chacun, l'option canonique de
+`docs/solutions/best-practices/fire-disposition-doctrine.md`.
+
+### La mesure, d'abord — la population pré-existante n'est pas vide
+
+Deux greps sur `main` au 2026-09-18, et ils décident toute la section :
+
+```bash
+grep -rn "exportable" crates/mika-agent/src/ docs/architecture.md      # 5 sites
+grep -rn -i "Prime\|hermetic" crates/mika-agent/src/prompt.rs crates/mika-common/src/home.rs   # 12 occurrences
+```
+
+**Un V7 dont la portée serait `prompt.rs` rougirait à la première exécution** :
+`prompt.rs:1000` est le bras `(Operator, Cloud)` de `hosting_ground_truth_line`,
+c'est-à-dire une constante **servie au modèle**, et elle contient le mot. Un V3
+de même portée rougirait sur 12 occurrences dont aucune n'est servie
+(`prompt.rs:20` commentaire, `:315`/`:988`/`:1099` doc-comments, huit sous
+`mod tests`, `home.rs:83` doc-comment). C'est ce qui fait de la **portée** une
+décision et pas un détail d'écriture.
+
+### V7 — « exportable » : option (a), exception nommée
+
+- **Portée du détecteur :** les deux constantes de ce ticket.
+- **Violation pré-existante :** cinq sites, dont un servi (F5).
+- **Exception nommée :** `hosting_ground_truth_line(Deployment::Cloud,
+  PersonaProfile::Operator)` — le seul site servi, nommé par sa fonction et son
+  croisement, pas par un numéro de ligne.
+- **Tracker de suivi :** § *Hors périmètre* n°1, qui porte déjà la question de
+  vérification (« `mika-cloud` expose-t-il un export ? ») et la raison de ne pas
+  trancher depuis ce dépôt.
+- **Assertion auto-nettoyante :** un test assère que ce site **contient encore**
+  le mot, avec en message d'échec *« F5 a été traité : retirer cette exception et
+  élargir V7 »*. Il rougit le jour où le suivi aboutit, ce qui est exactement la
+  propriété que la doctrine demande — et il est stable, contrairement à un
+  comptage d'occurrences qu'un doc-comment ajouté ferait varier.
+
+### V3 — référents spirituels : option (a), par la portée
+
+- **Portée du détecteur :** les deux corps **servis**. Le discriminant est
+  explicite et c'est lui la décision : **la fuite est ce que le tenant lit, pas
+  ce qu'un mainteneur lit.** Un doc-comment, un commentaire, un module de test et
+  l'identifiant d'agent `mika-prime` ne traversent jamais le prompt ; les
+  compter serait confondre l'index et la fuite, et rendrait D3 inapplicable
+  puisque le scan lui-même doit bien porter la liste quelque part.
+- **Violation pré-existante dans la portée retenue :** aucune — ce sont des
+  constantes que ce ticket crée.
+- **Où vit la liste :** sous `#[cfg(test)] mod tests`, en une seule occurrence,
+  per la doctrine (« scope it inside `#[cfg(test)] mod tests` so the production
+  loader cannot consult it at runtime »). Ni compilée en release, ni servie.
+- **Contrôle positif obligatoire :** une denylist vidée par mégarde produit un
+  test vert qui ne scanne rien. Le contrôle plante un référent dans un corps
+  factice et exige que le scan le trouve.
+
+### V4, V5, V6, V13a — population vide, et pourquoi elle le reste
+
+Aucune violation pré-existante **dans la portée retenue**, et l'élargissement est
+refusé sur mesure dans les deux cas où il serait tentant :
+
+- **V4 sur toutes les constantes de prompt** rougirait sur
+  `hosting_ground_truth_line(Deployment::Local, PersonaProfile::Operator)`, qui
+  dit « You are running **on the user's own machine** » — vrai, servi, et jamais
+  sous `Cloud`, le `match` exhaustif étant précisément ce qui le garantit
+  (mika#2290). Une violation apparente, pas réelle.
+- **V5 sur le bras famille de `## Runtime`** rougirait sur le mot « server », que
+  le doc-comment de ce bras admet nommément comme le seul nom concret retenu.
+
+Les élargir produirait des rouges sur du code correct : la voie qui use un
+détecteur jusqu'à ce que quelqu'un le désarme.
+
+### V13b — comportement du modèle : option (b), livré désarmé
+
+- **Ce que ça reconnaît (F2) :** AC1 est comportemental et **aucun test
+  déterministe ne peut l'établir**. Un LLM n'est pas déterministe : une section
+  dans le prompt garantit un même état de départ, jamais une même réponse — la
+  formulation que le dépôt a déjà dû écrire une fois (root `CLAUDE.md`
+  § *Portage de contexte entre passes architecte*). Et `MockLlmProvider` rejoue
+  une séquence scriptée, donc il ne peut pas en tenir lieu.
+- **Disposition :** le test existe, **`#[ignore]` + `MIKA_EVAL_REAL_PROVIDERS`**,
+  sur le rail déjà en place (`cargo test -p mika-agent --test eval -- --ignored`).
+  Il ne garde pas la CI — un test non déterministe en CI est un test qu'on finit
+  par désarmer, et son désarmement emporterait alors la moitié déterministe.
+- **Suivi :** aucune suite `calibrate-*` ne couvre un tenant famille ou champion
+  (les quatre existantes sont mika-dev/arch/qa/orchestrator). En créer une est un
+  ticket à part entière, pas une ligne de celui-ci.
+- **Ce qui reste en vérification manuelle, déclaré :** la **Sonde 1** est le mode
+  de vérification d'AC1 en production, avec ses trois haltes. Elle n'est pas un
+  complément de confort : c'est le seul instrument qui observe la population
+  mesurée (un tenant champion réel), et le plan le dit déjà — « le silence ne
+  prouve rien si personne ne pose la question ».
+
+### Ce qui peut casser, et la disposition de chaque signe
+
 | ce qui peut casser | signe | disposition |
 |---|---|---|
 | le corps porte une phrase de localité hors des suppresseurs de 5d | V4 rouge | reformuler le corps ; **ne pas élargir `CLAIM_CONDITIONAL_MARKERS`** — son étroitesse est le motif écrit de mika#2290 |
+| un futur éditeur énumère la butée pour la « clarifier » | V3 rouge | c'est l'effet voulu (D3, D6) ; reformuler par topique, **ne pas ajouter d'exception à la denylist** |
+| la denylist de V3 est vidée ou le scan désaligné | le contrôle positif rouge | réparer le scan ; un V3 qui ne scanne rien est pire qu'un V3 absent, il atteste |
+| F5 est traité en amont | l'assertion auto-nettoyante de V7 rouge | retirer l'exception nommée et élargir V7 aux cinq sites |
 | un `PersonaProfile` futur | erreur de compilation sur le `match` | décider explicitement pour ce registre ; c'est l'effet voulu |
+| la section est renommée | V13a rouge (ou erreur de compilation) | renommer aux deux endroits ; le couplage est la raison d'être du test |
 | le budget de prompt | `turn_usage.system_prompt_bytes` (mika#2331) monte d'environ 1–1,5 Ko, un seul registre étant rendu | attendu ; hors chemin compact par D7 |
 | la règle 6 entre en conflit avec la règle 3 | un tenant dit « je ne sais pas » sur la doctrine | cas que D5 interdit nommément ; si ça persiste, **relire d'abord si la section est dans le prompt servi** (Halte 1) avant de toucher au texte |
+| V13b rouge sur un provider | une réponse d'absence au rejeu | **ne pas retoucher la formulation en premier** : Halte 1 (la section est-elle servie ?), puis le provider, puis le texte |
 
 ---
 
@@ -454,8 +593,15 @@ décision fausse, elle créerait la fuite en silence.
 - [ ] `doctrine_body` / `write_mika_doctrine_section`, `match` exhaustif
 - [ ] rendue dans `build_system_prompt` et `build_silent_prompt`, omise du compact
       avec le motif écrit au point d'omission
-- [ ] règle 6 dans `## Self-Identity Discipline`
-- [ ] V1–V11 verts, V12 vert
+- [ ] règle 6 dans `## Self-Identity Discipline`, **composée par interpolation de
+      `MIKA_DOCTRINE_HEADING`** et non par un littéral recopié (V13a)
+- [ ] V1–V11 verts, V12 vert, V13a vert
+- [ ] V13b écrit et livré **désarmé** (`#[ignore]` + `MIKA_EVAL_REAL_PROVIDERS`),
+      avec son motif de non-déterminisme au site du test (option (b))
+- [ ] la denylist de V3 est sous `#[cfg(test)]`, en une seule occurrence, et
+      porte son contrôle positif
+- [ ] l'exception nommée de V7 porte son assertion auto-nettoyante renvoyant au
+      suivi F5
 - [ ] scénario d'eval + vocabulaire `doctrine:*` enregistrés
 - [ ] `CLAUDE.md` racine : les deux registres, le refus d'énumérer, le refus de
       garde et son motif, le carve-out, la sonde
@@ -474,12 +620,22 @@ Dérivés — le corps du ticket ne porte pas de section `## Acceptance criteria
   recevoir « rien trouvé qui s'appelle ainsi » : la section est dans le prompt
   servi sur les deux registres et sur les deux builders non-compacts, et la
   règle 6 refuse cette réponse nommément.
+  **Mode de vérification, en trois parts disjointes** (aucune n'est retirée de
+  l'AC, elles en nomment les instruments) : *déterministe* — V1 (la section est
+  servie), V9 et V13a (la règle 6 existe, porte l'interdit littéral et reste
+  couplée à la section) ; *non déterministe, désarmé* — V13b sur un vrai
+  provider, option (b) de la § Fire-Disposition ; *manuelle* — la Sonde 1, seul
+  instrument qui observe la population mesurée, avec ses trois haltes. La part
+  manuelle existe parce qu'aucun test déterministe ne peut établir la réponse
+  d'un LLM ; elle est **déclarée**, pas sous-entendue.
 - **AC2** — Le registre **Matériel** est articulé **avec son pourquoi** pour
   chaque parti pris : open source MIT (moteur), souveraineté des données,
   proactivité, mémoire persistante, croissance par invitation.
 - **AC3** — Le registre **Spirituel** dispose d'une butée nette, **topique et non
   énumérative** : aucun référent (Hermétisme, sièges, Prime, le Livre) n'apparaît
-  dans une constante de ce ticket. Vérifié par V3.
+  dans une constante **servie** de ce ticket. Vérifié par V3, dont la portée est
+  les deux corps et dont la denylist vit sous `#[cfg(test)]` — la liste ne peut
+  donc pas devenir elle-même la fuite (§ Fire-Disposition, V3).
 - **AC4** — **Faits vérifiés seulement.** MIT est revendiqué sur le moteur et
   attesté par `LICENSE`. « exportable » n'est revendiqué nulle part dans ce que ce
   ticket ajoute (V7). Aucune revendication d'hébergement local : les deux corps
@@ -495,7 +651,9 @@ Dérivés — le corps du ticket ne porte pas de section `## Acceptance criteria
   rattaché à mika#1925.
 - **AC8** — Aucune garde EndTurn n'est ajoutée, et ce refus est **écrit avec sa
   mesure** (D6 : le lexique spirituel est composé de mots ordinaires du registre
-  famille). La moitié structurelle prise est V1 + V3.
+  famille). La moitié structurelle prise est V1 + V3 + V13a : la section est
+  servie, la butée ne peut pas être énumérée, et la règle 6 ne peut pas se
+  découpler de la section qu'elle désigne.
 
 ---
 
@@ -584,3 +742,61 @@ propre sonde (mika#2205).
 6. **Re-provisionnement des tenants champion d'avant mika-cloud#209** — geste
    opérateur, porte de lancement bloquante déjà écrite dans mika#2023, aucune
    ligne de code ici.
+7. **Suite de calibration pour un tenant famille / champion.** Les quatre suites
+   existantes (`calibrate-mika-{dev,arch,qa,orchestrator}`) couvrent des rôles
+   d'ingénierie ; aucune n'observe la population de ce ticket. C'est la seule
+   voie qui rendrait AC1 mesurable de façon répétable plutôt que par rejeu
+   manuel, et c'est un ticket entier (scénarios, fixtures, manifeste, baseline),
+   pas une ligne de celui-ci. V13b + Sonde 1 tiennent en attendant, avec leurs
+   limites écrites (§ Fire-Disposition, option (b)).
+
+---
+
+## Revision history
+
+- **rev 2 (2026-09-18)** — première passe architecte, `Disposition: ITERATE`.
+
+  **F1 (BLOCKING) — section `## Fire-Disposition` absente pour des livrables de
+  classe détecteur.** *Rectification de la lettre du finding :* la section
+  existait (elle avait été ajoutée en rev 1) ; ce qui manquait était son
+  contenu — elle ne nommait **aucune** des trois options canoniques de mika#1574
+  et ne disait rien du cas que la doctrine existe pour couvrir, le détecteur qui
+  fire sur des **données existantes**. Le fond du finding est donc juste, et la
+  mesure le confirme plutôt qu'elle ne l'atténue : `grep -rn "exportable"` rend
+  cinq sites dont `prompt.rs:1000`, une constante **servie au modèle**, et
+  `grep -i "Prime\|hermetic"` douze occurrences dans `prompt.rs`/`home.rs`. Un
+  V7 ou un V3 de portée « fichier » rougirait à la première exécution. Section
+  réécrite : portée déclarée pour V3–V7 ; **option (a)** pour V7 avec exception
+  nommée (le croisement `(Cloud, Operator)` de `hosting_ground_truth_line`),
+  renvoi au tracker F5 déjà ouvert au § *Hors périmètre* n°1, et assertion
+  auto-nettoyante qui rougit le jour où le suivi aboutit ; **option (a)** pour V3
+  par la portée, avec la liste des référents confinée sous `#[cfg(test)]` —
+  forme littéralement prescrite par la doctrine — et un contrôle positif
+  obligatoire, sans lequel une denylist vidée produirait un test vert qui
+  n'atteste rien ; **population vide déclarée** pour V4/V5/V6/V13a, avec les deux
+  élargissements tentants nommés et refusés sur mesure (V4 rougirait sur le bras
+  `(Operator, Local)`, vrai et jamais servi sous Cloud ; V5 sur le mot
+  « server », que le doc-comment du bras famille admet nommément). Citation
+  préservée : `docs/solutions/best-practices/fire-disposition-doctrine.md`
+  (mika#1574).
+
+  **F2 (sharpening) — la règle 6 n'a pas de test comportemental.** Adressé par
+  les deux voies que le finding autorise, parce qu'aucune ne suffit seule.
+  *Structurel :* **V13a**, qui est ce que V9 ne pouvait pas donner — V9 assère
+  une présence de chaîne, donc un renommage de la section laissait la règle 6
+  verte tout en désignant une section disparue (le couplage silencieusement rompu
+  que `grooming_marker`/mika#2158 a dû refermer ailleurs) ; V13a exige que la
+  règle soit composée par interpolation de `MIKA_DOCTRINE_HEADING` et porte
+  l'interdit littéral. *Comportemental :* **V13b**, eval réel-provider livré
+  **désarmé** (`#[ignore]` + `MIKA_EVAL_REAL_PROVIDERS`) — **option (b)** de la
+  doctrine, avec son motif écrit : un LLM n'est pas déterministe, un test non
+  déterministe en CI finit désarmé, et son désarmement emporterait alors la
+  moitié déterministe ; `MockLlmProvider` ne peut pas en tenir lieu puisqu'il
+  rejoue une séquence scriptée. *Manuel :* la **Sonde 1** est déclarée comme le
+  mode de vérification d'AC1 en production, explicitement et non par sous-entendu
+  — c'est le seul instrument qui observe la population mesurée. AC1 n'est pas
+  affaibli : ses trois instruments sont nommés et disjoints. Suivi ouvert au
+  § *Hors périmètre* n°7 (suite de calibration pour un tenant famille/champion),
+  seule voie vers une mesure répétable, et hors périmètre d'un p2.
+
+  Aucun finding n'a été laissé sans traitement.
