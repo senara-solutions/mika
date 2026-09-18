@@ -2076,7 +2076,12 @@ async fn handle_admin_tenant_recurring_tasks(
     }
 
     info!(%customer_id, "mika#2360: admin read of tenant recurring registry");
-    crate::audit_events::log_admin_read(&state.pool, &customer_id).await;
+    crate::audit_events::log_admin_read(
+        &state.pool,
+        &customer_id,
+        crate::audit_events::ADMIN_READ_ROUTE_RECURRING_TASKS,
+    )
+    .await;
 
     forward_recurring_registry(&state, &customer_id, &q).await
 }
