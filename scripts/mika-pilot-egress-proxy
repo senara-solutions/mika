@@ -445,8 +445,9 @@ _FRAMING_CHUNKED = "chunked"
 # Statuses that carry no response body whatever the headers say.
 _BODILESS_STATUSES = frozenset({204, 304})
 
+# No `bytes.ishexdigit()` exists, hence the regex here; the decimal half below
+# uses `bytes.isdigit()`, which is exactly `^[0-9]+$` on a byte string.
 _CHUNK_SIZE_RE = re.compile(rb"^[0-9A-Fa-f]{1,15}$", re.ASCII)
-_DIGITS_RE = re.compile(rb"^\d+$", re.ASCII)
 
 
 def _header_values(head: bytes, name: str) -> list[bytes]:
@@ -482,7 +483,7 @@ def _content_length_of(values: list[bytes]) -> int | None:
         return None
     seen: set[int] = set()
     for token in tokens:
-        if not _DIGITS_RE.match(token):
+        if not token.isdigit():
             return None
         seen.add(int(token))
     return seen.pop() if len(seen) == 1 else None
@@ -569,47 +570,60 @@ class _ChunkedDecoder:
         if self.done or self.failed:
             return
         self._buf += data
-        while not self.done and not self.failed:
-            if self._state == self._DATA:
-                take = min(self._remaining, len(self._buf))
-                del self._buf[:take]
-                self._remaining -= take
-                if self._remaining:
-                    return  # mid-chunk; wait for more bytes
-                self._state = self._DATA_CRLF
-                continue
-            if self._state == self._DATA_CRLF:
-                if len(self._buf) < 2:
-                    return
-                if self._buf[:2] != b"\r\n":
-                    self.failed = True
-                    return
-                del self._buf[:2]
-                self._state = self._SIZE
-                continue
-            # _SIZE or _TRAILERS: both need one CRLF-terminated line.
-            idx = self._buf.find(b"\r\n")
-            if idx < 0:
-                if len(self._buf) > self._cap:
-                    self.failed = True
-                return
-            line = bytes(self._buf[:idx])
-            del self._buf[: idx + 2]
-            if self._state == self._SIZE:
-                size = _parse_chunk_size(line)
-                if size is None:
-                    self.failed = True
-                    return
-                if size == 0:
-                    self._state = self._TRAILERS
+        # One upstream read coalesces many small SSE frames, so a single `feed`
+        # routinely crosses dozens of framing tokens. Advance a cursor and trim
+        # ONCE, at the end: trimming per token would memmove the whole
+        # remaining buffer each time — the quadratic cost hiding behind an
+        # innocuous-looking `del buf[:n]` on a streaming body.
+        pos = 0
+        try:
+            while not self.done and not self.failed:
+                available = len(self._buf) - pos
+                if self._state == self._DATA:
+                    take = min(self._remaining, available)
+                    pos += take
+                    self._remaining -= take
+                    if self._remaining:
+                        return  # mid-chunk; wait for more bytes
+                    self._state = self._DATA_CRLF
                     continue
-                self._remaining = size
-                self._state = self._DATA
-                continue
-            if not line:  # empty line closes the trailer section
-                self.done = True
-                return
-            # another trailer field; keep reading
+                if self._state == self._DATA_CRLF:
+                    if available < 2:
+                        return
+                    if self._buf[pos:pos + 2] != b"\r\n":
+                        self.failed = True
+                        return
+                    pos += 2
+                    self._state = self._SIZE
+                    continue
+                # _SIZE or _TRAILERS: both need one CRLF-terminated line.
+                idx = self._buf.find(b"\r\n", pos)
+                if idx < 0:
+                    if available > self._cap:
+                        self.failed = True
+                    return
+                line = bytes(self._buf[pos:idx])
+                pos = idx + 2
+                if self._state == self._SIZE:
+                    size = _parse_chunk_size(line)
+                    if size is None:
+                        self.failed = True
+                        return
+                    if size == 0:
+                        self._state = self._TRAILERS
+                        continue
+                    self._remaining = size
+                    self._state = self._DATA
+                    continue
+                if not line:  # empty line closes the trailer section
+                    self.done = True
+                    return
+                # another trailer field; keep reading
+        finally:
+            if self.done or self.failed:
+                self._buf.clear()  # nothing will read it again
+            else:
+                del self._buf[:pos]
 
 
 def _parse_chunk_size(line: bytes) -> int | None:
@@ -849,6 +863,20 @@ async def _relay_response_with_status_tap(
             if framing is not None and framing.done:
                 terminated_on_body_end = True
                 break
+        # Counted here and NOT in the `finally`: a relay that dies in flight —
+        # the founding mika#1901 shape, client killed by the guardrail and
+        # `drain()` raising — ended neither on a body end nor on an upstream
+        # EOF, and we have no idea how its body would have finished. Counting
+        # it would pour that population into `undetermined`, which is the one
+        # class carrying an actionable fact. So these counters total the relays
+        # that finished cleanly, not the requests served. The verdict line
+        # below keeps its `finally`: it must survive exactly that death.
+        if terminated_on_body_end:
+            _note_relay_termination(_RELAY_BODY_END)
+        elif framing is not None and framing.determinate:
+            _note_relay_termination(_RELAY_EOF)
+        else:
+            _note_relay_termination(_RELAY_UNDETERMINED)
     finally:
         if not reported:
             head = tap.head
@@ -857,12 +885,6 @@ async def _relay_response_with_status_tap(
                 _parse_status_line(head),
                 _select_quota_headers(head),
             )
-        if terminated_on_body_end:
-            _note_relay_termination(_RELAY_BODY_END)
-        elif framing is not None and framing.determinate:
-            _note_relay_termination(_RELAY_EOF)
-        else:
-            _note_relay_termination(_RELAY_UNDETERMINED)
 
 
 async def pipe_bytes(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:

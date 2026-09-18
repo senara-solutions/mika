@@ -826,6 +826,47 @@ class RelayTerminationCountersTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(proxy._relay_termination_counts["undetermined"], 1)
 
+    async def test_a_relay_that_dies_in_flight_is_counted_in_no_class(self) -> None:
+        # The founding mika#1901 shape: upstream answers, the pilot stalls, the
+        # guardrail kills it, `drain()` raises. That relay ended neither on a
+        # body end nor on an upstream EOF, and nothing says how its body would
+        # have finished. Counting it would pour that population into
+        # `undetermined` — the one class carrying an actionable fact — so the
+        # counters deliberately total clean terminations, not requests served.
+        class DyingWriter(_CapturingWriter):
+            async def drain(self) -> None:
+                await super().drain()
+                if self.drains > 1:  # the head landed; the body does not
+                    raise ConnectionResetError("client gone")
+
+        # Two distinct reads are required, so the body is fed only once the
+        # head's drain has landed — a single pre-loaded reader hands the relay
+        # head and body in one `read()` and the client never gets to die.
+        reader = _held_open_reader_of(
+            b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\n"
+        )
+
+        async def feed_body_later() -> None:
+            await asyncio.sleep(0.01)
+            reader.feed_data(b"hello")
+
+        pump = asyncio.create_task(feed_body_later())
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            with contextlib.suppress(ConnectionResetError):
+                await proxy._relay_response_with_status_tap(
+                    reader, DyingWriter(), "POST", "/v1/messages"
+                )
+        await pump
+        self.assertEqual(
+            sum(proxy._relay_termination_counts.values()),
+            0,
+            proxy._relay_termination_counts,
+        )
+        # But the verdict still reached the log — that is what its `finally` is
+        # for, and it must not have moved with the counters.
+        self.assertIn("ALLOW", buffer.getvalue())
+
     async def test_debug_gate_emits_the_aggregate_never_an_error(self) -> None:
         before = proxy._EGRESS_DEBUG
         proxy._EGRESS_DEBUG = True
