@@ -104,6 +104,21 @@ def _reader_of(*chunks: bytes) -> asyncio.StreamReader:
     return reader
 
 
+def _held_open_reader_of(*chunks: bytes) -> asyncio.StreamReader:
+    """A StreamReader pre-loaded with `chunks` that NEVER reaches EOF.
+
+    This is the whole condition of mika#2317: an upstream that answered in full
+    and then kept the connection open. Before the fix the relay sat on
+    `up_reader.read()` here until the upstream's idle-timeout (~360 s measured
+    on 2026-08-2x), so any test using this reader hangs on the old code and is
+    bounded by `asyncio.wait_for` — the expiry IS the failure.
+    """
+    reader = asyncio.StreamReader()
+    for chunk in chunks:
+        reader.feed_data(chunk)
+    return reader
+
+
 class ParseStatusLineTests(unittest.TestCase):
     def test_complete_head_in_one_chunk(self) -> None:
         head = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n"
@@ -339,6 +354,574 @@ class RelayTapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             lines, ["[anthropic-proxy] ALLOW POST /v1/messages?beta=true -> 200"]
         )
+
+
+# ---------------------------------------------------------------------------
+# Closing on the end of the BODY, not on upstream EOF (mika#2317)
+#
+# mika#2313 fixed the ~358 s-per-turn hang by no longer forwarding the client's
+# `Connection: keep-alive` upstream. That works because the upstream HONOURS our
+# `Connection: close` — a policy, not a property of the relay. These tests fence
+# the defence in depth: the relay establishes the end of the body itself and
+# returns there, so an upstream that one day ignored `close` could not bring the
+# hang back.
+#
+# The reader used below never reaches EOF. On the pre-fix relay every one of
+# these tests hangs; `asyncio.wait_for` is what converts that hang into a
+# failure instead of a stuck suite.
+# ---------------------------------------------------------------------------
+
+_BODY_END_TIMEOUT = 2.0
+
+
+class BodyEndClosureTests(unittest.IsolatedAsyncioTestCase):
+    async def _relay_until_body_end(
+        self, reader, writer, method: str = "POST"
+    ) -> list[str]:
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            await asyncio.wait_for(
+                proxy._relay_response_with_status_tap(
+                    reader, writer, method, "/v1/messages?beta=true"
+                ),
+                timeout=_BODY_END_TIMEOUT,
+            )
+        return _strip_ts(self, buffer.getvalue().splitlines())
+
+    async def _assert_waits_for_eof(self, reader, writer, method: str = "POST") -> None:
+        """The relay must NOT return: no end of body was proven."""
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    proxy._relay_response_with_status_tap(
+                        reader, writer, method, "/v1/messages"
+                    ),
+                    timeout=0.25,
+                )
+
+    # --- U2: Content-Length ------------------------------------------------
+
+    async def test_content_length_body_closes_without_an_upstream_eof(self) -> None:
+        # The ticket's literal criterion: a complete response on a connection
+        # the upstream keeps open must still close the client immediately after
+        # the last byte of the body.
+        chunks = [
+            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n"
+            b"content-length: 21\r\n\r\n",
+            b'{"content":"hello!!"}',
+        ]
+        writer = _CapturingWriter()
+        lines = await self._relay_until_body_end(
+            _held_open_reader_of(*chunks), writer
+        )
+        self.assertEqual(writer.payload, b"".join(chunks))
+        self.assertEqual(
+            lines, ["[anthropic-proxy] ALLOW POST /v1/messages?beta=true -> 200"]
+        )
+
+    async def test_content_length_body_split_across_reads_still_closes(self) -> None:
+        head = b"HTTP/1.1 200 OK\r\ncontent-length: 12\r\n\r\n"
+        chunks = [head, b"hello", b" ", b"world!"]
+        writer = _CapturingWriter()
+        await self._relay_until_body_end(_held_open_reader_of(*chunks), writer)
+        self.assertEqual(writer.payload, b"".join(chunks))
+
+    async def test_body_that_starts_in_the_head_chunk_is_counted(self) -> None:
+        # The head terminator and the first body bytes arrive in ONE read. If
+        # the relay did not subtract the head, it would wait for 5 more bytes
+        # that never come — a silent false negative, invisible until an upstream
+        # stops closing.
+        one = b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello"
+        writer = _CapturingWriter()
+        await self._relay_until_body_end(_held_open_reader_of(one), writer)
+        self.assertEqual(writer.payload, one)
+
+    # --- U3 / U4: chunked --------------------------------------------------
+
+    async def test_chunked_body_closes_at_the_decoded_terminator(self) -> None:
+        chunks = [
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n",
+            b"5\r\nhello\r\n",
+            b"6\r\n world\r\n",
+            b"0\r\n\r\n",
+        ]
+        writer = _CapturingWriter()
+        lines = await self._relay_until_body_end(
+            _held_open_reader_of(*chunks), writer
+        )
+        self.assertEqual(writer.payload, b"".join(chunks))
+        self.assertEqual(
+            lines, ["[anthropic-proxy] ALLOW POST /v1/messages?beta=true -> 200"]
+        )
+
+    async def test_chunked_terminator_inside_chunk_data_is_not_an_end(self) -> None:
+        # THE test of this ticket (plan R1). `0\r\n\r\n` is not a substring to
+        # search for: it occurs inside chunk data, which here is arbitrary SSE
+        # JSON. An `in chunk` predicate — the one the request path still uses at
+        # the other end of this file — would cut a live LLM stream right here.
+        poison = b'data: {"text":"0\r\n\r\n"}'
+        chunks = [
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n",
+            f"{len(poison):x}\r\n".encode("ascii") + poison + b"\r\n",
+            b"9\r\nafterward\r\n",
+            b"0\r\n\r\n",
+        ]
+        writer = _CapturingWriter()
+        await self._relay_until_body_end(_held_open_reader_of(*chunks), writer)
+        self.assertEqual(
+            writer.payload,
+            b"".join(chunks),
+            "the relay cut the body at a substring inside chunk data",
+        )
+
+    async def test_chunked_extensions_and_trailers_are_decoded(self) -> None:
+        chunks = [
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"5;name=value\r\nhello\r\n",
+            b"0\r\n",
+            b"x-checksum: abc\r\n",
+            b"\r\n",
+        ]
+        writer = _CapturingWriter()
+        await self._relay_until_body_end(_held_open_reader_of(*chunks), writer)
+        self.assertEqual(writer.payload, b"".join(chunks))
+
+    async def test_gzip_then_chunked_is_still_chunked_framed(self) -> None:
+        chunks = [
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: gzip, chunked\r\n\r\n",
+            b"3\r\nabc\r\n0\r\n\r\n",
+        ]
+        writer = _CapturingWriter()
+        await self._relay_until_body_end(_held_open_reader_of(*chunks), writer)
+        self.assertEqual(writer.payload, b"".join(chunks))
+
+    # --- U5: malformed chunked disarms, it does not guess ------------------
+
+    async def test_non_hex_chunk_size_falls_back_to_the_eof_loop(self) -> None:
+        held = _held_open_reader_of(
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n",
+            b"zz\r\ngarbage\r\n0\r\n\r\n",
+        )
+        await self._assert_waits_for_eof(held, _CapturingWriter())
+
+    async def test_missing_crlf_after_chunk_data_falls_back_to_the_eof_loop(
+        self,
+    ) -> None:
+        held = _held_open_reader_of(
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n",
+            b"5\r\nhelloXX0\r\n\r\n",  # data not followed by CRLF
+        )
+        await self._assert_waits_for_eof(held, _CapturingWriter())
+
+    async def test_malformed_chunked_still_relays_every_byte_to_the_client(
+        self,
+    ) -> None:
+        # Disarming must cost fidelity nothing: with the upstream closing, the
+        # client receives the whole stream exactly as before this work.
+        chunks = [
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n",
+            b"zz\r\ngarbage bytes\r\n",
+        ]
+        writer = _CapturingWriter()
+        lines = await self._relay_until_body_end(_reader_of(*chunks), writer)
+        self.assertEqual(writer.payload, b"".join(chunks))
+        self.assertEqual(
+            lines, ["[anthropic-proxy] ALLOW POST /v1/messages?beta=true -> 200"]
+        )
+
+    # --- U7: no body at all ------------------------------------------------
+
+    async def test_content_length_zero_ends_at_the_head(self) -> None:
+        head = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n"
+        writer = _CapturingWriter()
+        await self._relay_until_body_end(_held_open_reader_of(head), writer)
+        self.assertEqual(writer.payload, head)
+
+    async def test_204_ends_at_the_head(self) -> None:
+        head = b"HTTP/1.1 204 No Content\r\n\r\n"
+        writer = _CapturingWriter()
+        await self._relay_until_body_end(_held_open_reader_of(head), writer)
+        self.assertEqual(writer.payload, head)
+
+    async def test_head_request_response_ends_at_the_head(self) -> None:
+        # A HEAD response carries the Content-Length of the body it does not
+        # send. Waiting for those bytes would wait forever.
+        head = b"HTTP/1.1 200 OK\r\ncontent-length: 4096\r\n\r\n"
+        writer = _CapturingWriter()
+        await self._relay_until_body_end(
+            _held_open_reader_of(head), writer, method="HEAD"
+        )
+        self.assertEqual(writer.payload, head)
+
+    # --- U9: still exactly one verdict -------------------------------------
+
+    async def test_early_close_still_logs_exactly_one_verdict(self) -> None:
+        chunks = [
+            b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\n"
+            b"content-length: 22\r\n\r\n",
+            b'{"error":"rate_limit"}',
+        ]
+        writer = _CapturingWriter()
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            await asyncio.wait_for(
+                proxy._relay_response_with_status_tap(
+                    _held_open_reader_of(*chunks), writer, "POST", "/v1/messages"
+                ),
+                timeout=_BODY_END_TIMEOUT,
+            )
+        emitted = buffer.getvalue()
+        self.assertEqual(emitted.count("ALLOW"), 1, emitted)
+        self.assertEqual(emitted.count("RATE_LIMITED"), 1, emitted)
+        self.assertNotIn("UPSTREAM_NO_RESPONSE", emitted)
+
+    # --- U10: framing is insensitive to packet boundaries ------------------
+
+    async def test_head_and_chunk_size_split_across_reads(self) -> None:
+        chunks = [
+            b"HTTP/1.1 200 OK\r\ntransfer-enc",          # mid header name
+            b"oding: chunked\r\n\r",                     # mid head terminator
+            b"\n1",                                      # mid chunk-size line
+            b"2\r\nhello big world!!!\r\n",               # 0x12 == 18 bytes
+            b"0\r",
+            b"\n\r\n",
+        ]
+        writer = _CapturingWriter()
+        await self._relay_until_body_end(_held_open_reader_of(*chunks), writer)
+        self.assertEqual(writer.payload, b"".join(chunks))
+
+    async def test_content_length_head_split_mid_header_value(self) -> None:
+        chunks = [b"HTTP/1.1 200 OK\r\ncontent-len", b"gth: 4\r\n\r\nabcd"]
+        writer = _CapturingWriter()
+        await self._relay_until_body_end(_held_open_reader_of(*chunks), writer)
+        self.assertEqual(writer.payload, b"".join(chunks))
+
+    # --- U8: the 1xx preamble must be counted in the offset ----------------
+
+    async def test_interim_preamble_does_not_shift_the_body_count(self) -> None:
+        # Without D4's offset counting the preamble, the body would be declared
+        # over exactly `len(preamble)` bytes early: a silent false positive that
+        # truncates the client's stream. Here the whole response arrives in one
+        # read, so a mis-count would break the payload assertion below.
+        one = (
+            b"HTTP/1.1 100 Continue\r\n\r\n"
+            b"HTTP/1.1 200 OK\r\ncontent-length: 9\r\n\r\n"
+            b"streaming"
+        )
+        writer = _CapturingWriter()
+        lines = await self._relay_until_body_end(_held_open_reader_of(one), writer)
+        self.assertEqual(writer.payload, one)
+        self.assertEqual(
+            lines, ["[anthropic-proxy] ALLOW POST /v1/messages?beta=true -> 200"]
+        )
+
+    # --- AC4: nothing provable, nothing closed -----------------------------
+
+    async def test_response_without_framing_headers_waits_for_eof(self) -> None:
+        held = _held_open_reader_of(
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n",
+            b"data: one\r\n\r\n",
+        )
+        await self._assert_waits_for_eof(held, _CapturingWriter())
+
+    async def test_overflowing_head_waits_for_eof(self) -> None:
+        # The padding carries NO head terminator, so the tap overflows before
+        # ever finding one: where the body begins is unknowable, and a
+        # `Content-Length` read out of a head we never finished reading would
+        # be a guess. The relay must stay on the EOF loop.
+        held = _held_open_reader_of(
+            b"HTTP/1.1 200 OK\r\ncontent-length: 1\r\n",
+            # Past the cap by a whole read: the tap only gives up once its
+            # buffer exceeds the cap, and one read is capped at BUFFER_SIZE.
+            b"x-pad: " + b"p" * (proxy.RESPONSE_HEAD_CAP * 2),
+            b"\r\n\r\ny",
+        )
+        await self._assert_waits_for_eof(held, _CapturingWriter())
+
+    async def test_content_length_and_transfer_encoding_together_wait_for_eof(
+        self,
+    ) -> None:
+        held = _held_open_reader_of(
+            b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n"
+            b"transfer-encoding: chunked\r\n\r\n",
+            b"hello",
+        )
+        await self._assert_waits_for_eof(held, _CapturingWriter())
+
+
+class ResponseFramingClassificationTests(unittest.TestCase):
+    """U6 — one case per row of the plan's arming table (D2)."""
+
+    def _classify(self, head: bytes, method: str = "POST"):
+        return proxy._classify_response_framing(head, method)
+
+    def test_bodiless_statuses_and_head_requests(self) -> None:
+        for head, method in (
+            (b"HTTP/1.1 204 No Content\r\n\r\n", "POST"),
+            (b"HTTP/1.1 304 Not Modified\r\netag: x\r\n\r\n", "GET"),
+            (b"HTTP/1.1 200 OK\r\ncontent-length: 99\r\n\r\n", "HEAD"),
+            (b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n", "head"),
+        ):
+            with self.subTest(head=head, method=method):
+                self.assertEqual(
+                    self._classify(head, method), (proxy._FRAMING_NO_BODY, 0)
+                )
+
+    def test_content_length_and_transfer_encoding_together_are_undetermined(
+        self,
+    ) -> None:
+        head = (
+            b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n"
+            b"transfer-encoding: chunked\r\n\r\n"
+        )
+        self.assertEqual(self._classify(head), (proxy._FRAMING_UNDETERMINED, 0))
+
+    def test_transfer_encoding_ending_in_chunked_is_chunked(self) -> None:
+        for value in (b"chunked", b"gzip, chunked", b"Chunked", b"gzip,chunked "):
+            with self.subTest(value=value):
+                head = b"HTTP/1.1 200 OK\r\ntransfer-encoding: " + value + b"\r\n\r\n"
+                self.assertEqual(self._classify(head), (proxy._FRAMING_CHUNKED, 0))
+
+    def test_transfer_encoding_not_ending_in_chunked_is_undetermined(self) -> None:
+        for value in (b"gzip", b"chunked, gzip", b"", b"identity"):
+            with self.subTest(value=value):
+                head = b"HTTP/1.1 200 OK\r\ntransfer-encoding: " + value + b"\r\n\r\n"
+                self.assertEqual(
+                    self._classify(head), (proxy._FRAMING_UNDETERMINED, 0)
+                )
+
+    def test_single_content_length_is_a_length(self) -> None:
+        head = b"HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n"
+        self.assertEqual(self._classify(head), (proxy._FRAMING_LENGTH, 1234))
+
+    def test_zero_content_length_is_a_length_of_zero(self) -> None:
+        head = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n"
+        self.assertEqual(self._classify(head), (proxy._FRAMING_LENGTH, 0))
+
+    def test_repeated_identical_content_length_is_accepted(self) -> None:
+        head = (
+            b"HTTP/1.1 200 OK\r\ncontent-length: 7\r\ncontent-length: 7\r\n\r\n"
+        )
+        self.assertEqual(self._classify(head), (proxy._FRAMING_LENGTH, 7))
+
+    def test_divergent_content_lengths_are_undetermined(self) -> None:
+        for head in (
+            b"HTTP/1.1 200 OK\r\ncontent-length: 7\r\ncontent-length: 9\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\ncontent-length: 7, 9\r\n\r\n",
+        ):
+            with self.subTest(head=head):
+                self.assertEqual(
+                    self._classify(head), (proxy._FRAMING_UNDETERMINED, 0)
+                )
+
+    def test_unparseable_content_length_is_undetermined(self) -> None:
+        for value in (b"abc", b"", b"-1", b"12.5", b"0x10"):
+            with self.subTest(value=value):
+                head = b"HTTP/1.1 200 OK\r\ncontent-length: " + value + b"\r\n\r\n"
+                self.assertEqual(
+                    self._classify(head), (proxy._FRAMING_UNDETERMINED, 0)
+                )
+
+    def test_neither_header_is_undetermined(self) -> None:
+        head = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n"
+        self.assertEqual(self._classify(head), (proxy._FRAMING_UNDETERMINED, 0))
+
+    def test_an_unreadable_head_never_claims_no_body(self) -> None:
+        # The overflow path constructs this tap explicitly; asserting it here
+        # keeps the `undetermined()` constructor from quietly becoming
+        # `_BodyFramingTap(b"", method)`, which for HEAD would say NO_BODY on a
+        # head whose end was never found.
+        tap = proxy._BodyFramingTap.undetermined()
+        self.assertEqual(tap.mode, proxy._FRAMING_UNDETERMINED)
+        self.assertFalse(tap.done)
+        self.assertFalse(tap.determinate)
+        tap.feed(b"anything at all")
+        self.assertFalse(tap.done)
+
+
+class ResponseHeadEndOffsetTests(unittest.TestCase):
+    """U8 — D4's counting, isolated from the relay."""
+
+    def test_offset_is_none_until_the_head_completes(self) -> None:
+        tap = proxy._ResponseHeadTap()
+        tap.feed(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n")
+        self.assertIsNone(tap.head_end_offset)
+
+    def test_offset_covers_the_head_terminator(self) -> None:
+        head = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n"
+        tap = proxy._ResponseHeadTap()
+        tap.feed(head + b"hi")
+        self.assertEqual(tap.head_end_offset, len(head))
+
+    def test_offset_counts_discarded_1xx_preambles(self) -> None:
+        preamble = b"HTTP/1.1 100 Continue\r\n\r\n"
+        head = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n"
+        tap = proxy._ResponseHeadTap()
+        tap.feed(preamble + head + b"hi")
+        self.assertEqual(tap.head_end_offset, len(preamble) + len(head))
+
+    def test_offset_survives_a_head_split_across_feeds(self) -> None:
+        preamble = b"HTTP/1.1 103 Early Hints\r\nlink: </x>\r\n\r\n"
+        head = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n"
+        whole = preamble + head
+        tap = proxy._ResponseHeadTap()
+        for index in range(0, len(whole), 7):
+            tap.feed(whole[index:index + 7])
+        self.assertEqual(tap.head_end_offset, len(whole))
+
+    def test_overflow_leaves_the_offset_unknown(self) -> None:
+        tap = proxy._ResponseHeadTap(cap=64)
+        tap.feed(b"HTTP/1.1 200 OK\r\n" + b"x" * 512)
+        self.assertTrue(tap.overflowed)
+        self.assertIsNone(tap.head_end_offset)
+
+
+class RelayTerminationCountersTests(unittest.IsolatedAsyncioTestCase):
+    """AC7 — the classes are counted, and by default nothing is printed."""
+
+    def setUp(self) -> None:
+        self._saved = dict(proxy._relay_termination_counts)
+        for key in proxy._relay_termination_counts:
+            proxy._relay_termination_counts[key] = 0
+
+    def tearDown(self) -> None:
+        proxy._relay_termination_counts.clear()
+        proxy._relay_termination_counts.update(self._saved)
+
+    async def _run(self, reader, writer, timeout=_BODY_END_TIMEOUT) -> str:
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    proxy._relay_response_with_status_tap(
+                        reader, writer, "POST", "/v1/messages"
+                    ),
+                    timeout=timeout,
+                )
+        return buffer.getvalue()
+
+    async def test_body_end_is_counted_and_silent_by_default(self) -> None:
+        emitted = await self._run(
+            _held_open_reader_of(
+                b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nhi"
+            ),
+            _CapturingWriter(),
+        )
+        self.assertEqual(proxy._relay_termination_counts["body-end"], 1)
+        # AC7: not one extra log line per request when the gate is off.
+        self.assertNotIn("relay-termination", emitted)
+
+    async def test_eof_termination_is_its_own_class(self) -> None:
+        await self._run(
+            _reader_of(b"HTTP/1.1 200 OK\r\ncontent-length: 9\r\n\r\nshort"),
+            _CapturingWriter(),
+        )
+        self.assertEqual(proxy._relay_termination_counts["eof"], 1)
+        self.assertEqual(proxy._relay_termination_counts["body-end"], 0)
+
+    async def test_unprovable_framing_is_counted_as_undetermined(self) -> None:
+        await self._run(
+            _reader_of(b"HTTP/1.1 200 OK\r\n\r\ndata: one\r\n\r\n"),
+            _CapturingWriter(),
+        )
+        self.assertEqual(proxy._relay_termination_counts["undetermined"], 1)
+
+    async def test_debug_gate_emits_the_aggregate_never_an_error(self) -> None:
+        before = proxy._EGRESS_DEBUG
+        proxy._EGRESS_DEBUG = True
+        try:
+            emitted = await self._run(
+                _held_open_reader_of(
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nhi"
+                ),
+                _CapturingWriter(),
+            )
+        finally:
+            proxy._EGRESS_DEBUG = before
+        lines = _strip_ts(self, emitted.splitlines())
+        aggregate = [line for line in lines if "relay-termination" in line]
+        self.assertEqual(len(aggregate), 1, lines)
+        self.assertIn("body-end=1", aggregate[0])
+        self.assertIn("eof=0", aggregate[0])
+        self.assertIn("undetermined=0", aggregate[0])
+        self.assertIn("DEBUG", aggregate[0])
+        self.assertNotIn("ERROR", emitted)
+
+
+class ChunkedDecoderTests(unittest.TestCase):
+    """The decoder alone — the object that replaces a substring search."""
+
+    def _feed(self, *pieces: bytes) -> proxy._ChunkedDecoder:
+        decoder = proxy._ChunkedDecoder()
+        for piece in pieces:
+            decoder.feed(piece)
+        return decoder
+
+    def test_terminator_inside_data_is_not_an_end(self) -> None:
+        payload = b"0\r\n\r\n"
+        decoder = self._feed(
+            f"{len(payload):x}\r\n".encode("ascii") + payload + b"\r\n"
+        )
+        self.assertFalse(decoder.done)
+        self.assertFalse(decoder.failed)
+        decoder.feed(b"0\r\n\r\n")
+        self.assertTrue(decoder.done)
+
+    def test_byte_at_a_time_delivery_decodes_identically(self) -> None:
+        body = b"4\r\nabcd\r\n0\r\n\r\n"
+        decoder = proxy._ChunkedDecoder()
+        for index in range(len(body)):
+            self.assertFalse(decoder.done, f"ended early at byte {index}")
+            decoder.feed(body[index:index + 1])
+        self.assertTrue(decoder.done)
+
+    def test_oversized_size_line_fails_rather_than_buffering(self) -> None:
+        decoder = proxy._ChunkedDecoder(cap=64)
+        decoder.feed(b"a" * 512)
+        self.assertTrue(decoder.failed)
+        self.assertFalse(decoder.done)
+
+    def test_a_failed_decoder_stays_failed(self) -> None:
+        decoder = self._feed(b"zz\r\n")
+        self.assertTrue(decoder.failed)
+        decoder.feed(b"0\r\n\r\n")
+        self.assertFalse(decoder.done)
+
+    def test_parse_chunk_size_is_strict(self) -> None:
+        self.assertEqual(proxy._parse_chunk_size(b"1f"), 31)
+        self.assertEqual(proxy._parse_chunk_size(b"0;ext=1"), 0)
+        for line in (b"", b" 5", b"5 ", b"0x5", b"-1", b"g"):
+            with self.subTest(line=line):
+                self.assertIsNone(proxy._parse_chunk_size(line))
+
+
+class SuiteWiringTests(unittest.TestCase):
+    """U11 — the sibling keep-alive suite must actually be executed.
+
+    `scripts/test-pilot-egress-keepalive.py` fences mika#2313's AC1 and was, at
+    the time of mika#2317, referenced by no Makefile target and no CI job: it
+    was a test that ran nowhere. Found in passing, wired here because this is
+    the change that already touches both files.
+    """
+
+    _REPO = pathlib.Path(__file__).resolve().parent.parent
+    _KEEPALIVE = "scripts/test-pilot-egress-keepalive.py"
+
+    def test_makefile_runs_the_keepalive_suite(self) -> None:
+        makefile = (self._REPO / "Makefile").read_text(encoding="utf-8")
+        target = makefile.partition("\ntest-pilot-egress-proxy:")[2]
+        self.assertTrue(target, "target test-pilot-egress-proxy not found")
+        body = target.partition("\n\n")[0]
+        self.assertIn(self._KEEPALIVE, body)
+
+    def test_ci_runs_the_keepalive_suite(self) -> None:
+        workflow = (
+            self._REPO / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        job = workflow.partition("\n  pilot-egress-status-tap:")[2]
+        self.assertTrue(job, "job pilot-egress-status-tap not found")
+        body = job.partition("\n\n")[0]
+        self.assertIn(self._KEEPALIVE, body)
 
 
 class UpstreamOutcomeLoggingTests(unittest.TestCase):
