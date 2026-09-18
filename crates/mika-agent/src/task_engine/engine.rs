@@ -383,6 +383,8 @@ impl TaskEngine {
     ///
     /// 1. Expires tasks past their `timeout_at`.
     /// 2. Marks orphaned `in_progress` tasks as `failed` (no process survived restart).
+    ///    A2A tasks go first, `pending` ones included, with a reason (mika#2379)
+    ///    — daemon only; skipped when `dispatcher.cli_mode` is set.
     /// 3. Loads `pending` and `recurring_active` tasks into the `BinaryHeap`.
     ///
     /// Returns `(loaded_count, queue_len)` for the caller to aggregate across agents.
@@ -398,6 +400,39 @@ impl TaskEngine {
 
         // 1b. Kill orphan processes for newly expired tasks
         self.kill_orphan_processes().await;
+
+        // 2a. A2A rows first (mika#2379). No A2A turn survives the process that
+        // ran it, and only the daemon's handlers create A2A rows, so at daemon
+        // startup every one still `pending`/`in_progress` belongs to a dead
+        // process. `pending` is included — a `message/stream` turn still waiting
+        // for the agent lock never reached `in_progress` — and the rows get a
+        // reason and a `completed_at`, which the generic loop below writes for
+        // nobody. It runs first so that loop no longer sees them.
+        //
+        // Daemon only. `mika chat` runs this same recovery (`cli_mode: true`)
+        // against the container database it shares with a daemon that may be
+        // serving A2A turns right now; there the "dead process" argument is
+        // false, and sweeping would fail live rows — pending stream turns
+        // included — and raise a false `a2a_orphans_swept`.
+        if !self.dispatcher.cli_mode {
+            match self
+                .db
+                .a2a_sweep_orphans(
+                    "orphaned: the daemon running this A2A turn exited before it finished",
+                )
+                .await
+            {
+                Ok(n) if n > 0 => warn!(
+                    event = "a2a_orphans_swept",
+                    agent = %self.db.agent_id(),
+                    count = n,
+                    "closed A2A turns a previous process left open"
+                ),
+                Ok(_) => {}
+                // The generic loop below still fails the in_progress ones, as before.
+                Err(e) => warn!(error = %e, "failed to sweep orphaned A2A tasks on startup"),
+            }
+        }
 
         // 2. Recover in_progress tasks (process couldn't have survived container restart)
         let in_progress = self
@@ -4521,6 +4556,115 @@ mod tests {
 
         let task = db.get_task(&task_id).await.unwrap().unwrap();
         assert_eq!(task.status, "failed");
+    }
+
+    /// mika#2379: A2A rows a dead process left open are closed with a reason and a
+    /// `completed_at` — including a `pending` one, which the generic loop ignores
+    /// (a `message/stream` turn still waiting for the agent lock never reached
+    /// `in_progress`). Non-A2A rows keep today's recovery.
+    #[tokio::test]
+    async fn mika2379_startup_recovery_closes_orphaned_a2a_rows() {
+        let db = test_db();
+        db.a2a_create_task("a2a-live", None, None).await.unwrap();
+        db.a2a_update_task_state("a2a-live", "working")
+            .await
+            .unwrap();
+        db.a2a_create_task("a2a-queued", None, None).await.unwrap(); // pending
+
+        let other = db
+            .create_task(make_task(
+                "non-a2a orphan",
+                &crate::timestamp::now_plus(chrono::Duration::seconds(3600)),
+            ))
+            .await
+            .unwrap();
+        db.update_task_status(&other, "in_progress").await.unwrap();
+
+        let dispatcher = test_dispatcher(db.clone());
+        let mut engine = TaskEngine::new(db.clone(), dispatcher);
+        engine.startup_recovery().await.unwrap();
+
+        for a2a_id in ["a2a-live", "a2a-queued"] {
+            let (status, completed_at, result): (String, Option<String>, Option<String>) = db
+                .with_db(move |d| {
+                    Ok(d.conn.query_row(
+                        "SELECT t.status, t.completed_at, t.result FROM tasks t
+                         JOIN a2a_task_map m ON m.task_id = t.id WHERE m.a2a_task_id = ?1",
+                        rusqlite::params![a2a_id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )?)
+                })
+                .await
+                .unwrap();
+            assert_eq!(status, "failed", "{a2a_id}");
+            assert!(completed_at.is_some(), "{a2a_id} carries completed_at");
+            let reason = result
+                .as_deref()
+                .and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok())
+                .and_then(|v| {
+                    v.get(crate::a2a_db::A2A_CLOSE_REASON_KEY)
+                        .and_then(|r| r.as_str().map(str::to_owned))
+                });
+            assert!(
+                reason
+                    .as_deref()
+                    .is_some_and(|r| r.starts_with("orphaned:")),
+                "{a2a_id} names why it was closed, got {result:?}"
+            );
+        }
+        let other = db.get_task(&other).await.unwrap().unwrap();
+        assert_eq!(other.status, "failed", "non-A2A recovery is unchanged");
+    }
+
+    /// mika#2379: `mika chat` (`cli_mode: true`) runs `startup_recovery` against
+    /// the container database a live daemon shares, so it must not sweep A2A
+    /// rows — a `pending` stream turn waiting for the agent lock is left alone.
+    #[tokio::test]
+    async fn mika2379_cli_mode_startup_recovery_leaves_a2a_rows_alone() {
+        let db = test_db();
+        db.a2a_create_task("a2a-queued", None, None).await.unwrap(); // pending
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = mika_common::config::Settings::load(tmp.path()).unwrap();
+        let dispatcher = Arc::new(TaskDispatcher {
+            db: db.clone(),
+            tier: mika_common::home::AgentTier::Default,
+            deployment: mika_common::home::Deployment::Unknown,
+            llm: mika_common::llm::dummy_provider(),
+            tools: Arc::new(crate::tools::default_tools()),
+            skills: Arc::new(crate::skills::SkillRegistry::empty()),
+            message_sender: Some(Arc::new(NoopSender)),
+            home_dir: PathBuf::from("/tmp"),
+            global_home_dir: PathBuf::from("/tmp/mika-test-global-home-absent"),
+            embedding_client: None,
+            brave_api_key: None,
+            github_token: None,
+            gateway_url: None,
+            internal_token: None,
+            github_app: None,
+            skills_dirty: Arc::new(AtomicBool::new(false)),
+            agent_lock: None,
+            cli_mode: true,
+            settings,
+            pr_reviews_posted: None,
+            auto_pull_stop_armed: AtomicBool::new(false),
+        });
+        let mut engine = TaskEngine::new(db.clone(), dispatcher);
+        engine.startup_recovery().await.unwrap();
+
+        let (status, result): (String, Option<String>) = db
+            .with_db(|d| {
+                Ok(d.conn.query_row(
+                    "SELECT t.status, t.result FROM tasks t
+                     JOIN a2a_task_map m ON m.task_id = t.id WHERE m.a2a_task_id = 'a2a-queued'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(status, "pending", "a CLI process must not sweep A2A rows");
+        assert_eq!(result, None);
     }
 
     /// Create a callback task that is already completed (as if `mika ask --task-id` ran).

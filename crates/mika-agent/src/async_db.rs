@@ -3135,6 +3135,20 @@ impl AsyncDatabase {
             .await
     }
 
+    /// See `Database::a2a_abandon_task_if_live` (mika#2379).
+    pub async fn a2a_abandon_task_if_live(&self, id: &str, reason: &str) -> Result<bool> {
+        let (i, r) = (id.to_owned(), reason.to_owned());
+        self.with_db(move |db| db.a2a_abandon_task_if_live(&i, &r))
+            .await
+    }
+
+    /// Fail this agent's A2A rows a dead process left open — see
+    /// `Database::a2a_sweep_orphans` (mika#2379).
+    pub async fn a2a_sweep_orphans(&self, reason: &str) -> Result<usize> {
+        let (a, r) = (self.agent_id.clone(), reason.to_owned());
+        self.with_db(move |db| db.a2a_sweep_orphans(&a, &r)).await
+    }
+
     pub async fn a2a_insert_message(
         &self,
         a2a_task_id: &str,

@@ -391,6 +391,9 @@ pub struct TaskDispatcher {
     /// When true, the engine skips `dispatch_undelivered_callbacks()`.
     /// CLI/TUI mode handles callbacks via `poll_callback_tasks()` instead,
     /// preventing a race where the engine steals callbacks from the TUI.
+    /// It also skips the startup A2A orphan sweep (mika#2379): a CLI process
+    /// shares the container database with a daemon that may be serving live
+    /// A2A turns.
     pub cli_mode: bool,
     /// Per-agent settings for constructing per-skill LLM overrides in silent mode.
     /// Passed as `settings: Some(&self.settings)` to all `SilentAgentParams` constructions.
