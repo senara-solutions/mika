@@ -4271,6 +4271,11 @@ async fn run_agent_inner(
     // administrative path, not a turn). This is the one place able to say how many
     // bytes and how many distinct sessions the window dragged in — and, since the
     // two bounds above landed, how much they took back out.
+    //
+    // mika#2305 — the scope that *decided* the window travels with the count it
+    // explains. `history_config.scope` is already in hand here, so nothing below
+    // needed widening: the event gains the one field that makes
+    // `distinct_sessions > 1` readable instead of ambiguous.
     emit_context_window_assembled(
         &db.agent_id,
         session_id,
@@ -4278,6 +4283,7 @@ async fn run_agent_inner(
         "conversation",
         &build_context_window_fields(
             &history,
+            history_config.scope,
             &skill_tool_defs,
             truncation.truncated_messages,
             truncation.truncated_bytes,
@@ -7132,6 +7138,22 @@ struct ContextWindowFields {
     /// and it costs one `HashSet`. Measuring the cost without it would answer
     /// "how expensive?" while missing "whose content?".
     distinct_sessions: usize,
+    /// The row set the window was actually allowed to draw from (mika#2305),
+    /// `"session"` or `"agent"`.
+    ///
+    /// **Without it `distinct_sessions` cannot be read.** A value above 1 has two
+    /// causes of opposite sign: the scope silently fell back to `agent` (the
+    /// mika#2305 defect — the identity never reached the disk, mika#2330 class),
+    /// **or** one session legitimately iterated (plan v1 → review → plan v2, the
+    /// nominal shape of an ITERATE). The count alone cannot separate them, and
+    /// telling them apart is the whole question mika#2305 was filed to settle.
+    ///
+    /// The provenance of the scope is deliberately **not** reported here, unlike
+    /// `llm_budget_resolved` (mika#2293): the budget pair comes from a five-door
+    /// cascade, this comes from one `identity.toml` and nowhere else, so a
+    /// provenance field would only ever say "identity.toml, or the default" —
+    /// which the value already says.
+    history_scope: &'static str,
     /// Age in seconds of the oldest retained message. `0` when the window is
     /// empty or the timestamp is unreadable — never negative, never a guess.
     oldest_age_secs: i64,
@@ -7143,10 +7165,29 @@ struct ContextWindowFields {
     truncated_bytes: usize,
 }
 
+/// Render a [`prompt::HistoryScope`] as the wire label the event carries
+/// (mika#2305).
+///
+/// Exhaustive on purpose, with **no `_ =>` arm**: a future variant must force a
+/// decision here rather than inherit a label that would quietly be false. This
+/// lives in the pure layer — not at the emission site — precisely so the
+/// exhaustiveness is assertable without a `tracing` subscriber.
+///
+/// Note this is a *rendering*, not a decision. The one decision made on this
+/// enum in production is `run_agent`'s `scoped_session_id` match; see the
+/// structural guard `mika2305_the_scope_has_a_single_decisional_reader`.
+fn history_scope_label(scope: prompt::HistoryScope) -> &'static str {
+    match scope {
+        prompt::HistoryScope::Session => "session",
+        prompt::HistoryScope::Agent => "agent",
+    }
+}
+
 /// Compute the window's dimensions. Pure — `now` is injected so `oldest_age_secs`
 /// is assertable without a clock.
 fn build_context_window_fields(
     history: &[crate::db::SessionMessage],
+    scope: prompt::HistoryScope,
     tool_defs: &[mika_common::claude::ToolDefinition],
     truncated_messages: usize,
     truncated_bytes: usize,
@@ -7184,6 +7225,7 @@ fn build_context_window_fields(
             .map(|s| s.len())
             .unwrap_or(0),
         distinct_sessions,
+        history_scope: history_scope_label(scope),
         oldest_age_secs,
         truncated_messages,
         truncated_bytes,
@@ -7286,6 +7328,17 @@ fn truncate_history_to_token_budget(
 /// `request_bytes − system_prompt_bytes` and `history_bytes` are two independent
 /// surfaces that must move together. If only one moves, it is the measurement
 /// that is in question, not the system.
+///
+/// **Reading `(history_scope, distinct_sessions)` together (mika#2305).** The pair
+/// is why the scope joined this event rather than getting one of its own — either
+/// number alone is mute:
+///
+/// | `history_scope` | `distinct_sessions` | reading |
+/// |---|---|---|
+/// | `session` | `1` | nominal — the pass sees only itself |
+/// | `session` | `> 1` | **halt**: the filter is not filtering; the leak is under `rebuild_context`, not in the setting |
+/// | `agent` | `> 1` | the mika#2305 defect, back: the setting never reached the disk (mika#2330 class) |
+/// | `agent` | `1` | permissive scope, thin window by accident — true today, false tomorrow |
 fn emit_context_window_assembled(
     agent_id: &str,
     session_id: &str,
@@ -7305,6 +7358,7 @@ fn emit_context_window_assembled(
         user_message_bytes = fields.user_message_bytes,
         tool_defs_bytes = fields.tool_defs_bytes,
         distinct_sessions = fields.distinct_sessions,
+        history_scope = fields.history_scope,
         oldest_age_secs = fields.oldest_age_secs,
         truncated_messages = fields.truncated_messages,
         truncated_bytes = fields.truncated_bytes,
@@ -13829,7 +13883,7 @@ mod tests {
             ),
         ];
 
-        let f = build_context_window_fields(&history, &[], 0, 0, now);
+        let f = build_context_window_fields(&history, prompt::HistoryScope::Agent, &[], 0, 0, now);
 
         assert_eq!(f.message_count, 3);
         assert_eq!(f.history_bytes, 4 + 6);
@@ -13850,7 +13904,8 @@ mod tests {
             window_msg("s1", "c", &ts),
         ];
         assert_eq!(
-            build_context_window_fields(&one_ticket, &[], 0, 0, now).distinct_sessions,
+            build_context_window_fields(&one_ticket, prompt::HistoryScope::Agent, &[], 0, 0, now)
+                .distinct_sessions,
             1,
             "a window confined to one session must report exactly 1"
         );
@@ -13862,7 +13917,15 @@ mod tests {
             window_msg("ticket-a", "review A", &ts),
         ];
         assert_eq!(
-            build_context_window_fields(&three_tickets, &[], 0, 0, now).distinct_sessions,
+            build_context_window_fields(
+                &three_tickets,
+                prompt::HistoryScope::Agent,
+                &[],
+                0,
+                0,
+                now
+            )
+            .distinct_sessions,
             3,
             "three distinct sessions in the window is the contamination signal"
         );
@@ -13879,7 +13942,7 @@ mod tests {
             window_msg("s1", "recent", &crate::timestamp::format(&at(5))),
         ];
 
-        let f = build_context_window_fields(&history, &[], 0, 0, now);
+        let f = build_context_window_fields(&history, prompt::HistoryScope::Agent, &[], 0, 0, now);
         assert!(
             (3595..=3605).contains(&f.oldest_age_secs),
             "expected ~3600s, got {}",
@@ -13896,7 +13959,8 @@ mod tests {
 
         let garbled = vec![window_msg("s1", "x", "not-a-timestamp")];
         assert_eq!(
-            build_context_window_fields(&garbled, &[], 0, 0, now).oldest_age_secs,
+            build_context_window_fields(&garbled, prompt::HistoryScope::Agent, &[], 0, 0, now)
+                .oldest_age_secs,
             0
         );
 
@@ -13906,7 +13970,15 @@ mod tests {
             &crate::timestamp::format(&(now + chrono::Duration::seconds(600))),
         )];
         assert_eq!(
-            build_context_window_fields(&from_the_future, &[], 0, 0, now).oldest_age_secs,
+            build_context_window_fields(
+                &from_the_future,
+                prompt::HistoryScope::Agent,
+                &[],
+                0,
+                0,
+                now
+            )
+            .oldest_age_secs,
             0
         );
     }
@@ -13916,7 +13988,14 @@ mod tests {
         // A fresh session assembles an empty window. The instrument must survive
         // it: an attribution event that panics on the first turn of a session
         // would take the turn down with it.
-        let f = build_context_window_fields(&[], &[], 0, 0, chrono::Utc::now());
+        let f = build_context_window_fields(
+            &[],
+            prompt::HistoryScope::Agent,
+            &[],
+            0,
+            0,
+            chrono::Utc::now(),
+        );
 
         assert_eq!(f.message_count, 0);
         assert_eq!(f.history_bytes, 0);
@@ -13936,7 +14015,14 @@ mod tests {
             &crate::timestamp::format(&at(1)),
         )];
 
-        let f = build_context_window_fields(&history, &[], 0, 0, chrono::Utc::now());
+        let f = build_context_window_fields(
+            &history,
+            prompt::HistoryScope::Agent,
+            &[],
+            0,
+            0,
+            chrono::Utc::now(),
+        );
 
         assert_eq!(f.history_bytes, 0);
         assert_eq!(f.user_message_bytes, "review this plan".len());
@@ -13951,7 +14037,14 @@ mod tests {
         let defs = full_tool_set();
         let expected = serde_json::to_string(&defs).unwrap().len();
 
-        let f = build_context_window_fields(&[], &defs, 0, 0, chrono::Utc::now());
+        let f = build_context_window_fields(
+            &[],
+            prompt::HistoryScope::Agent,
+            &defs,
+            0,
+            0,
+            chrono::Utc::now(),
+        );
 
         assert_eq!(f.tool_defs_bytes, expected);
         assert!(f.tool_defs_bytes > 0);
@@ -13962,10 +14055,238 @@ mod tests {
         // They are parameters rather than literals so the byte ceiling could be
         // lifted without reshaping the event an analyzer has already been written
         // against. Since brique 2, the production call site passes real counts.
-        let f = build_context_window_fields(&[], &[], 7, 4096, chrono::Utc::now());
+        let f = build_context_window_fields(
+            &[],
+            prompt::HistoryScope::Agent,
+            &[],
+            7,
+            4096,
+            chrono::Utc::now(),
+        );
 
         assert_eq!(f.truncated_messages, 7);
         assert_eq!(f.truncated_bytes, 4096);
+    }
+
+    // ===========================================================================
+    // mika#2305 — the scope travels with the count it explains
+    // ===========================================================================
+
+    /// **T3 (pure half)** — the field reports the scope it was handed, for both
+    /// variants.
+    ///
+    /// The values are a wire format: an operator `jq`s on them and `GROUP BY`s
+    /// them, so a rename silently splits one population in two. Pinning the two
+    /// literals here is what makes that a compile-and-test failure rather than a
+    /// dashboard that quietly stops matching.
+    #[test]
+    fn mika2305_the_field_reports_the_scope_it_was_given() {
+        let now = chrono::Utc::now();
+        let ts = crate::timestamp::format(&at(10));
+        let history = vec![window_msg("s1", "a", &ts)];
+
+        assert_eq!(
+            build_context_window_fields(&history, prompt::HistoryScope::Session, &[], 0, 0, now)
+                .history_scope,
+            "session"
+        );
+        assert_eq!(
+            build_context_window_fields(&history, prompt::HistoryScope::Agent, &[], 0, 0, now)
+                .history_scope,
+            "agent"
+        );
+    }
+
+    /// **T4** — the label match carries no `_ =>` arm.
+    ///
+    /// Rust already forces exhaustiveness; what it does **not** force is that a
+    /// future variant be *decided* rather than absorbed. A `_ => "agent"` would
+    /// compile, keep every assertion above green, and label the new scope with
+    /// somebody else's name — which is the one failure this field exists to
+    /// prevent. Hence a source scan: the defect makes no covered decision wrong.
+    #[test]
+    fn mika2305_the_label_match_has_no_wildcard_arm() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/agent_loop/mod.rs"),
+        )
+        .expect("the guard must be able to read agent_loop/mod.rs");
+
+        let sig = "fn history_scope_label(";
+        let start = src
+            .find(sig)
+            .expect("history_scope_label must exist in agent_loop/mod.rs");
+        let rest = &src[start..];
+        let end = rest.find("\n}\n").expect("the function must be closed");
+        let body = &rest[..end];
+
+        assert!(
+            !body.contains("_ =>"),
+            "mika#2305 — `history_scope_label` grew a wildcard arm. A future \
+             `HistoryScope` variant would then inherit an existing label, and \
+             `context_window_assembled` would report a scope that is not the one \
+             in force. Name the new variant explicitly instead.\nbody was:\n{body}"
+        );
+    }
+
+    /// Groups of `match` arms that **dispatch on** `HistoryScope` — i.e. read the
+    /// scope in order to decide or render something.
+    ///
+    /// The predicate is positional, not lexical, and that is what makes it usable:
+    /// the type name must appear **in the pattern**, left of the `=>`. So
+    /// `deserialize_history_scope`'s arms — which merely *produce* a
+    /// `HistoryScope` on the right of their `=>` — fall out on their own, with no
+    /// name-based allowlist that would have to be widened by hand every time a
+    /// legitimate site appears. Equality assertions (`assert_eq!(…, Scope::Agent)`)
+    /// carry no `=>` and fall out too.
+    ///
+    /// Arms within two lines of each other are one site: a `match` has several
+    /// arms and counting lines would answer a different question from the one
+    /// asked ("how many readers?").
+    fn scope_match_sites(src: &str) -> Vec<Vec<(usize, String)>> {
+        let hits: Vec<(usize, String)> = src
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| match line.find("=>") {
+                Some(arrow) => line[..arrow].contains("HistoryScope::"),
+                None => false,
+            })
+            .map(|(n, line)| (n + 1, line.trim().to_string()))
+            .collect();
+
+        let mut sites: Vec<Vec<(usize, String)>> = Vec::new();
+        for hit in hits {
+            match sites.last_mut() {
+                Some(last) if hit.0.saturating_sub(last[last.len() - 1].0) <= 2 => last.push(hit),
+                _ => sites.push(vec![hit]),
+            }
+        }
+        sites
+    }
+
+    /// Production source of a file, with its `#[cfg(test)]` tail removed.
+    ///
+    /// Test modules are full of legitimate mentions of both variants; a scan that
+    /// refused "any mention" would redden immediately on healthy code, and the
+    /// natural repair would be to widen it until it caught nothing — which is the
+    /// failure the negative control below exists to prevent.
+    fn production_half(src: &str) -> &str {
+        match src.find("#[cfg(test)]") {
+            Some(cut) => &src[..cut],
+            None => src,
+        }
+    }
+
+    /// **T5** — the scope has one decisional reader, and it is
+    /// `run_agent`'s `scoped_session_id`.
+    ///
+    /// A second reader would make no decision *wrong* the day it is written; it
+    /// would make two answers to one question able to drift apart — the class
+    /// `grooming_marker` had to engrave once (mika#2158: a copied regex whose own
+    /// comment said "Mirrors …" and then missed two widenings).
+    ///
+    /// Exactly **two** sites are expected, both in `agent_loop/mod.rs`: the
+    /// decision (`scoped_session_id`) and the rendering (`history_scope_label`).
+    /// A third is halt-and-surface, not an allowlist entry — whether it is a
+    /// legitimate rendering or a second decision is a question this guard cannot
+    /// answer for you.
+    #[test]
+    fn mika2305_the_scope_has_a_single_decisional_reader() {
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sites: Vec<String> = Vec::new();
+        let mut scanned = 0usize;
+        let mut stack = vec![src_root.clone()];
+
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| {
+                panic!("the guard must be able to read {}: {e}", dir.display())
+            });
+            for entry in entries {
+                let path = entry.expect("readable directory entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                    panic!("the guard must be able to read {}: {e}", path.display())
+                });
+                scanned += 1;
+                let rel = path.strip_prefix(&src_root).unwrap_or(&path).display();
+                for site in scope_match_sites(production_half(&content)) {
+                    sites.push(format!("{rel}:{}: {}", site[0].0, site[0].1));
+                }
+            }
+        }
+
+        assert!(scanned > 0, "the guard scanned no file — broken path");
+        assert_eq!(
+            sites.len(),
+            2,
+            "mika#2305 — expected exactly two readers of `HistoryScope` outside \
+             deserialization: the decision in `run_agent` (`scoped_session_id`) and \
+             the rendering in `history_scope_label`. Found {}:\n{}\n\nIf you added \
+             a second *decision*, route it through `scoped_session_id` instead — \
+             two answers to \"which rows may this window draw from?\" can drift \
+             apart without breaking anything visible.",
+            sites.len(),
+            sites.join("\n")
+        );
+        assert!(
+            sites.iter().all(
+                |s| s.starts_with("agent_loop/mod.rs:") || s.starts_with("agent_loop\\mod.rs:")
+            ),
+            "mika#2305 — a reader of `HistoryScope` lives outside `agent_loop/mod.rs`:\n{}",
+            sites.join("\n")
+        );
+    }
+
+    /// **T5b — good-faith control for T5.** The predicate must redden on a
+    /// decisional `match` added elsewhere, and must stay silent on the three
+    /// shapes that legitimately name the type.
+    ///
+    /// Without this, T5 could be green because it looks at nothing — which is the
+    /// exact failure mode T5 exists to make visible on the other axis.
+    #[test]
+    fn mika2305_the_scan_reddens_on_a_decisional_match_added_elsewhere() {
+        let offending = r#"
+            fn somewhere_else(scope: HistoryScope) -> usize {
+                match scope {
+                    HistoryScope::Session => 1,
+                    HistoryScope::Agent => 20,
+                }
+            }
+        "#;
+        assert_eq!(
+            scope_match_sites(offending).len(),
+            1,
+            "the scan must see a decisional match added outside the production site"
+        );
+
+        // Deserialization: the type is *produced* on the right of the arrow.
+        let deserialization = r#"
+            Some(toml::Value::String(s)) if s.eq_ignore_ascii_case("agent") => Ok(HistoryScope::Agent),
+            Some(toml::Value::String(s)) if s.eq_ignore_ascii_case("session") => Ok(HistoryScope::Session),
+        "#;
+        assert!(
+            scope_match_sites(deserialization).is_empty(),
+            "deserialization produces the type, it does not read it — it must not count"
+        );
+
+        // Equality assertions carry no arrow.
+        let assertion = "assert_eq!(identity.context.history.scope, HistoryScope::Agent);";
+        assert!(
+            scope_match_sites(assertion).is_empty(),
+            "an equality assertion is not a reader"
+        );
+
+        // A `#[cfg(test)]` tail is not production.
+        let with_test_tail = "fn prod() {}\n#[cfg(test)]\nmod tests {\n    match s { HistoryScope::Agent => 1, HistoryScope::Session => 2 };\n}\n";
+        assert!(
+            scope_match_sites(production_half(with_test_tail)).is_empty(),
+            "the test tail must be stripped before scanning"
+        );
     }
 
     // ===========================================================================
@@ -14046,8 +14367,15 @@ mod tests {
         );
         // The marker must not look like another ticket to AC7's detector.
         assert_eq!(
-            build_context_window_fields(&history, &[], 1, 4_000, chrono::Utc::now())
-                .distinct_sessions,
+            build_context_window_fields(
+                &history,
+                prompt::HistoryScope::Agent,
+                &[],
+                1,
+                4_000,
+                chrono::Utc::now()
+            )
+            .distinct_sessions,
             1,
             "the marker carries the turn's own session_id"
         );

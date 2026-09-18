@@ -65,6 +65,11 @@ mod eval {
     mod test_completion_claim_guard;
     mod test_context_summary_inject;
 
+    // mika#2305 — the scope that decided the window is emitted next to the count
+    // it explains, and it is the one the identity declared. Its sibling below
+    // asserts the window; this one asserts what the instrument says about it.
+    mod test_context_scope_observability_2305;
+
     // mika#2295 briques 1 & 2 — the two window bounds, asserted on the window the
     // model actually received rather than on the predicates that compute it.
     mod test_context_window_budget_2295;

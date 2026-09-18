@@ -675,6 +675,98 @@ Observabilité du budget effectif + garde de demi-configuration (mika#2293) :
   par une variable d'environnement fleet-wide — voir la garde ci-dessus pour
   pourquoi.
 
+Portage de contexte entre passes architecte : la question est tranchée (mika#2305) :
+- **La réponse, par axe — c'est le livrable principal, et le ticket se trompe d'axe.**
+  Le **portage intra-invocation** (1ʳᵉ passe → 2ᵉ passe, et retry UNPARSED) est
+  **VOULU**, explicite et contractuel : `_arch_ask` (`dispatch-lib.sh`) prend un
+  `session_id` **optionnel en `$3`** et ne pose `--session-id` que s'il est non vide,
+  et `_iterate_groom_loop` en fait trois usages commentés — session neuve en 1ʳᵉ
+  passe, session continuée au retry et aux deux branches de 2ᵉ passe. Le session-id
+  est même inscrit dans le body-callout publié sur le ticket. Le **portage
+  inter-invocations** était une **FUITE**, réelle et mesurée — mais elle ne vivait
+  pas dans `--session-id` : elle vivait dans `HistoryScope::Agent`, le **défaut** de
+  la fenêtre de contexte (`agent_loop/mod.rs`, `rebuild_context(None, …, 20)` tire
+  les 20 derniers messages de l'agent **toutes sessions confondues**). Elle est
+  **déjà fermée** par mika#2295 (le réglage) + mika#2330 (sa mise en vigueur) — voir
+  ces deux entrées, non re-narrées ici. Le contrat que la « Piste » du ticket appelle
+  de ses vœux (« session neuve par défaut, `--session-id` pour continuer ») **est
+  déjà celui en vigueur** sur les deux moitiés : neuve par défaut côté `ask`
+  (`resolve_canonical_session_id` rend `None` hors singleton, et mika-arch n'est pas
+  singleton), continuée sur demande explicite côté dispatch.
+- **`history_scope` sur `context_window_assembled`, et pourquoi il fallait le champ.**
+  L'événement portait déjà `distinct_sessions` — très exactement le nombre que la
+  question du ticket demande — et **ne portait pas le `scope` effectif**. Or
+  `distinct_sessions > 1` a **deux causes de signes opposés** : le scope est retombé
+  à `agent` (le défaut de #2305), **ou** la session itère légitimement (plan v1 →
+  revue → plan v2, le cas nominal d'un ITERATE). L'instrument ne pouvait pas les
+  séparer. Un champ sur l'événement existant, pas un second événement : les deux
+  nombres n'ont de sens qu'ensemble. **Refusé : émettre la provenance du scope** (à
+  la manière de `llm_budget_resolved`, mika#2293) — le scope ne vient pas d'une
+  cascade à cinq portes mais d'un `identity.toml` et d'un seul, donc la provenance se
+  réduirait à « `identity.toml` ou le défaut », ce que le nom de la valeur dit déjà.
+- **La commande, et sa table de lecture :**
+  ```bash
+  grep context_window_assembled "$MIKA_SPIRIT_LOG_FILE" \
+    | jq 'select(.agent_id == "mika-arch")
+          | {history_scope, distinct_sessions, message_count, history_bytes, truncated_messages}'
+  ```
+  | `history_scope` | `distinct_sessions` | Lecture |
+  |---|---|---|
+  | `session` | `1` | **nominal** — la passe ne voit qu'elle-même |
+  | `session` | `> 1` | **halte** — le filtre ne filtre pas ; la fuite est sous `rebuild_context`, pas dans le réglage |
+  | `agent` | `> 1` | **le défaut de #2305, revenu** — le réglage n'a pas atterri sur le disque (classe mika#2330) |
+  | `agent` | `1` | scope permissif, fenêtre pauvre par accident — vrai aujourd'hui, faux demain |
+- **Régime attendu pour mika-arch :** `history_scope: "session"` sur **toutes** les
+  lignes, `distinct_sessions: 1` sur la quasi-totalité. **Sonde, 48 h et ≥ 10 tours
+  arch, avec ses haltes :** `history_scope != "session"` ne serait-ce qu'une fois →
+  le défaut est revenu, classe mika#2330, lire `identity_reconcile` **avant** de
+  toucher au code. `history_scope == "session"` avec `distinct_sessions > 1` →
+  **halte**, et ne pas rétrécir `max_tokens` par réflexe : c'est l'autre axe et il
+  masquerait le symptôme sans toucher la cause. `history_bytes` retombé dans l'ordre
+  de grandeur pré-incident (contre les **190–205 KB sur 9–10 sessions** enregistrés
+  à l'entrée `MIKA_DISABLE_AGENT_PROVISIONING`) → la fermeture a pris. **Le silence
+  ne prouve rien si aucun tour arch n'a tourné** : vérifier `message_count` non nul
+  avant de conclure (mika#2205).
+- **Canal résiduel, nommé et laissé intact.** `scope = "session"` ne borne **pas** la
+  mémoire agent-scoped : `update_core_memory`, `store_fact`, `update_fact` et
+  `search_memory` sont délibérément actifs pour mika-arch (`MIKA_ARCH_DISABLED_TOOLS`
+  ne les contient pas, et `test_mika_arch_disabled_tools_excludes_agent_self_state`
+  le pinne comme une décision : *« agent self-state, not platform side-effect »*).
+  Ces canaux traversent **toutes** les sessions par conception. Si mika-arch mémorise
+  un jugement, la passe suivante en est teintée — ce qui est « voulu » au sens du
+  design et qui est aussi, littéralement, « le contexte d'une passe teinte la
+  suivante ». Les fermer serait amputer la mémoire d'un agent contre un pin
+  explicite, c'est-à-dire une décision produit hors du périmètre d'un ticket
+  substrat : **ticket de suivi**, avec pour préalable une mesure (ces outils sont-ils
+  seulement appelés pendant une passe de grooming ?). Rien dans l'évidence du 11/09
+  ne l'implique — le défaut `HistoryScope::Agent` explique le phénomène en entier.
+- **Ce que ce travail n'achète PAS : « même verdict 3/3 ».** (a) Un LLM n'est pas
+  déterministe — une session neuve garantit un *même état de départ*, jamais un
+  *même verdict* ; « 3/3 » reste une propriété statistique. (b) Les deux passes ne
+  posent pas la même question : `mika-arch-groom-ticket` rend READY/ITERATE/ESCALATE,
+  `mika-arch-second-review` rend GROOMED/ESCALATE, et depuis mika#2363 elles ne
+  voient même plus le même prompt (`--only-skill` évince les passes sœurs). Des
+  verdicts différents entre 1ʳᵉ et 2ᵉ passe sur un plan inchangé sont **le design**,
+  pas un symptôme. Ce que la fermeture achète est plus étroit et réel : **une passe
+  ne lit plus les plans d'autres tickets.** Le déterminisme du pré-vol (a) est une
+  question d'évaluation (famille `calibrate-mika-arch`) — **ticket de suivi.**
+- **Gardes.** Comportemental au site de production :
+  `tests/eval/test_context_scope_observability_2305.rs` — sous `scope = "session"`
+  l'événement rend `session` / `distinct_sessions = 1` et l'autre ticket est absent ;
+  **contrôle négatif** sans le bloc, l'événement rend `agent` / `2` et l'autre ticket
+  est présent. Ce second test est porteur : il distingue « le filtre filtre » de
+  « le champ est une constante » et de « la requête est cassée ». Structurel :
+  `agent_loop::tests::mika2305_the_scope_has_a_single_decisional_reader` (un seul
+  lecteur décisionnel de `HistoryScope` hors désérialisation) avec son contrôle de
+  bonne foi, et `…_the_label_match_has_no_wildcard_arm`. Côté shell, le contrat de
+  session de `_arch_ask` / `_iterate_groom_loop` est épinglé dans
+  `test-dispatch-lib.sh` — **si ces assertions rougissent, quelqu'un a « corrigé » le
+  portage intra-invocation en croyant fermer #2305 : restaurer.** Le retry UNPARSED
+  ne re-demande pas la revue, il demande à l'architecte de **compléter sa propre
+  réponse** en y ajoutant la ligne `Disposition:` manquante ; sans la session la
+  demande serait inintelligible, et le portage y est la **condition de correction**
+  du mécanisme, pas sa contamination.
+
 Optional (dispatch concurrency cap — mika#2160):
 - `MIKA_DISPATCH_MAX_CONCURRENT_IMPLEMENT` — How many `implement` dispatches may be
   in flight at once for one agent (default `1`). Three-tier parse, the same shape as
