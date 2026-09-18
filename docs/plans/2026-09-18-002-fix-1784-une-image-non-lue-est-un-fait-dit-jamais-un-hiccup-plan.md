@@ -23,11 +23,11 @@ multimodal. Il l'est, de bout en bout :
   enchaîne `getFile` puis le téléchargement, avec les trois cas d'erreur **déjà**
   traités par des messages utilisateur distincts et clairs (trop grande, format
   non reconnu, échec de téléchargement — `routes.rs:907-935`).
-- `routes.rs:941` — encodage base64, puis POST vers `{container}/message` avec un
-  tableau `images: [{media_type, data}]`.
+- `routes.rs:976-982` — encodage base64, puis POST vers `{container}/message`
+  avec un tableau `images: [{media_type, data}]`.
 - Côté agent, `crates/mika-agent/src/server/handlers.rs:146` accepte le payload,
-  `:169-185` valide le `media_type` contre `ALLOWED_IMAGE_MEDIA_TYPES`, et
-  `:451-460` convertit en `Vec<LlmImage>` passé à `run_agent_for_message`.
+  `:171-178` valide le `media_type` contre `ALLOWED_IMAGE_MEDIA_TYPES` (`:37`), et
+  `:451-456` convertit en `Vec<LlmImage>` passé à `run_agent_for_message`.
 
 **Aucune des trois réponses qu'Al a reçues n'est un message du gateway.** Les
 trois messages d'échec de téléchargement sont nommément différents du « hiccup ».
@@ -144,6 +144,17 @@ keyword-matched (#463). **La requête part sur `effective_llm`** (`mod.rs:4176`,
 Un tour servi par un override de skill décide donc de la vision d'après un
 provider qui n'est pas celui qui recevra la requête — les deux modes d'erreur du
 point (2), obtenus cette fois **sans même changer de configuration**.
+
+**Un second `effective_llm` existe et n'est PAS concerné**, ce qui vaut d'être
+écrit pour que la question ne se repose pas à la revue. `run_team_agent` résout
+son propre `effective_llm` à `mod.rs:5494` selon exactement le même motif. Il
+est hors périmètre pour une raison structurelle et non par choix de découpage :
+`user_images` est un champ d'`AgentParams` seul (`mod.rs:3484`) et n'est lu qu'à
+quatre sites, tous entre 3577 et 4072. Ni le mode team ni le mode silent ne
+portent d'images utilisateur, donc aucun d'eux ne pose la question que ce ticket
+corrige. Les `LlmImage` des lignes 9535+ sont des images de *tool results*
+(protocole `__mika_v1`) — une autre population, un autre chemin, également hors
+périmètre.
 
 **Ce site n'explique pas le défaut d'Al et ne doit pas lui être attribué.** Un
 tenant famille porte une allowlist étroite (`FAMILY_AGENT_SKILL_ALLOWLIST`), et
@@ -276,10 +287,10 @@ obtenue sans branche d'erreur.
 
 Ferme le symptôme 1/3 (le cas `supports_vision() == true` à tort).
 
-`run_agent_for_message` (`handlers.rs:1180`) reçoit `user_images: Vec<LlmImage>`
-en **paramètre** : l'information est donc en scope à la branche `Err` sous la
-forme `!user_images.is_empty()`. (Le `has_images` de `handlers.rs:146` est une
-locale de `handle_message`, une autre fonction — ne pas l'y chercher.)
+`run_agent_for_message` (`handlers.rs:1181`) reçoit `user_images: Vec<LlmImage>`
+en **paramètre** (`:1185`) : l'information est donc en scope à la branche `Err`
+sous la forme `!user_images.is_empty()`. (Le `has_images` de `handlers.rs:146`
+est une locale de `handle_message`, une autre fonction — ne pas l'y chercher.)
 
 **Décision et trace se lisent à deux endroits différents, et les confondre est le
 piège de ce bloc.** `error_class()` rend `http_<status>` comme **chaîne**
