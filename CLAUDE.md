@@ -1180,6 +1180,192 @@ Optional (QA-review reconciliation — mika#2334):
 - **What mika#2347 does NOT prove, and its halt condition.** The founding ticket's hourly evidence is not compatible with the reconciler as the **sole** source of the churn: two `hold[review]` on #2344 eleven minutes apart cannot come from a fifteen-minute scan, and the first `hold` **is a posted review**, which takes the PR out of the population on the next tick. `pull_request.synchronize`, the `check_suite` fan-out and a queue replay all remain in play. If the deadline `hold[review]` persists after 48 h while the attribution probe is clean: **halt** — do not lower `MAX_PER_TICK` further, do not lengthen the cooldown; open the follow-up ticket on the other triggers. Read mika-qa's actually-in-force envelope on the way (`grep llm_budget_resolved … | jq 'select(.agent_id == "mika-qa")'`, mika#2293): the ticket states 600 s, which neither `MIKA_QA_CONFIG` nor the repo defaults carry, so its **provenance** is what to read before concluding anything about the envelope. And an abandoned PR that deserved its review is not repaired by raising `MAX_ATTEMPTS` reflexively — an abandonment proves two catch-ups produced nothing, i.e. that the nominal path is broken upstream.
 - **Out of scope, deliberately.** The rescue-class mislabelling (link 2 of the operator's four-link chain — "do not flag rescue when the push succeeded and the implementation is complete") touches `_compose_rescue_pr_body` and qa-review Step 1.5, and its remedy has nothing to do with this one — **follow-up ticket**, together with links 3 and 4 (the operator verification gesture blocked by the classifier as self-approval). Option 2 of the ticket (sandbox-compatibilising `/ce-code-review`) belongs to the `compound-engineering` plugin, outside this repo. The "draft with no `wip-rescue` label" hole is real (no scan sees it) but belongs to the draft path. `isDraft` being unreadable by qa-review (`qa_pr_view.sh` does not expose it and `QA_REVIEW_GH_ALLOWED` forbids `gh pr view`, which makes its own Step 1.5.4 unexecutable) is a real defect found on the way, unrelated to the review request — **follow-up ticket**. And the upstream losses themselves: this scan makes them recoverable, it does not make them go away.
 
+### Une consigne de fréquence a un site d'inscription (mika#2358)
+
+**Ce ne sont pas des variables d'environnement mais des clés `customer_config`**,
+per-tenant, réglables par l'outil `set_config` **déjà exposé au modèle** et par
+le `/config set` opérateur. Elles sont ici parce qu'elles règlent le même genre
+de chose que la section ci-dessus, et parce que l'opérateur qui cherche « comment
+borner les messages proactifs d'un tenant » cherche ici.
+
+- **Le défaut, mesuré le 2026-09-17 (tenant cloud d'Al, canari famille).** Al
+  avait demandé **une** veille technique par jour et en recevait **trois**.
+  Interrogée, Mika a reconnu l'erreur et **promis une correction qu'elle n'avait
+  aucun moyen d'exécuter** : « Je vais corriger ça concrètement : plus aucun
+  message de veille technique aujourd'hui. Et demain, un seul. » Aucun outil
+  appelé.
+- **Le ticket se trompait sur ses trois défauts, et la rectification est le
+  premier livrable.** *D1* — il n'existe pas « pas d'outil de récurrence exposé » :
+  le chemin `list_reminders` → `cancel_task` → `create_reminder` existe et
+  fonctionne (ce qui manque est l'**atomicité**, pas l'accès) ; et surtout la
+  récurrence d'Al était **déjà** à `0 0 9 * * *`, une fois par jour, donc aucun
+  outil de récurrence ne pouvait corriger ce qu'il vivait. *D2* — vrai, mais pour
+  un autre motif : la consigne porte sur le **heartbeat**, dont le seul geste
+  atteignable (annuler la row) exprime « aucun » et jamais « un seul », et est
+  **levé au redémarrage suivant** par `revert_config_cancel_recurring_task`, dont
+  le prédicat est `status = 'cancelled'` sans discrimination de l'origine
+  (mika#2271). *D3* — non manifeste : la ground-truth du registre montre **une**
+  récurrence, `zombie_veto_active = false` ; la phrase du bot « instances
+  récurrentes zombies » n'est ancrée sur aucun résultat d'outil, c'est une
+  fabrication (famille #953).
+- **La cause mesurée est le heartbeat, et son plafond était le nombre rapporté.**
+  `heartbeat_should_run` portait un littéral `>= 3` — trois réveils par jour,
+  avec un framing qui invite à partager « quelque chose d'opportun et utile » et
+  **aucune connaissance d'une consigne de fréquence**. Budget vécu maximal :
+  3 (heartbeat) + 1 (la récurrence de 9 h qu'Al a demandée) = **4 messages
+  proactifs/jour**.
+
+- `proactive_daily_budget` — nombre maximal de **réveils** proactifs par jour.
+  Entier `0..=24`, défaut `3`. Trois paliers : absente/vide → défaut ;
+  illisible ou hors domaine → défaut **avec un WARN nommant la valeur entre
+  guillemets** ; `0` → honoré comme « plus aucun réveil proactif ». **Le `0`
+  n'est pas une valeur invalide** et la distinction est portante dans les deux
+  sens : c'est le levier « plus aucun message », et le confondre avec une erreur
+  rendrait la coupure impossible ; inversement une faute de frappe qui couperait
+  silencieusement les messages d'un tenant serait la panne que ce travail ferme.
+- `proactive_pause_until` — suspension **datée** : instant RFC 3339 UTC, ou la
+  chaîne `none` pour lever. Deux clés et non une, parce que la promesse d'Al a
+  deux moitiés de natures différentes : « plus aucun message **aujourd'hui** »
+  est une suspension datée, « demain, **un seul** » est un régime permanent. La
+  pause porte un instant et **jamais un booléen**, donc elle expire d'elle-même
+  et ne peut pas devenir un silence permanent que personne ne se rappelle avoir
+  armé. Une valeur illisible **ne suspend pas** (fail-open, comme chaque lecture
+  de ce pré-filtre).
+- **Pourquoi `customer_config` et pas ailleurs.** C'est le seul site que **rien
+  ne réécrit au démarrage** : une annulation de row est levée par
+  `revert_config_cancel_recurring_task` (ci-dessus), une édition d'`identity.toml`
+  est exposée à la réconciliation des sections code-owned (mika#2330). Et
+  `heartbeat_should_run` **lit déjà** cette table pour le fuseau : la lecture du
+  budget y est une ligne, au bon endroit, sans nouveau chemin d'accès.
+- **Aucun outil ajouté.** `SETTABLE_CONFIG_KEYS` **est** la surface d'outil :
+  `set_config` construit l'`enum` de son schéma et sa description depuis la
+  constante, donc ajouter une clé la rend découvrable par le modèle sans écrire
+  une ligne de prompt.
+
+- **Le budget borne les RÉVEILS, pas les envois — et le chiffre est dit.**
+  `record_heartbeat_send` est appelé **inconditionnellement** après le tour
+  silencieux, y compris quand le tour n'a rien envoyé, donc
+  `count_heartbeat_sends_today` compte des réveils. Un budget `1` laisse donc au
+  plus **1 réveil heartbeat + 1 récurrence = 2 messages/jour**, pas 1. C'est une
+  amélioration mesurable (de 4 à 2) et une borne honnête, pas la borne exacte que
+  le mot « fréquence » suggère. Rendre le compteur exact demande de déplacer
+  `record_heartbeat_send` derrière un envoi effectif, ce qui changerait **en même
+  temps** la sémantique du rate-limit horaire : **ticket de suivi**.
+
+- **Quatre producteurs de messages non sollicités, et le budget n'en borne
+  qu'un.** Le tableau est le périmètre, écrit pour que la prochaine lecture n'ait
+  pas à le redécouvrir :
+
+  | producteur | sollicité ? | actif chez Al | ce qui le borne |
+  |---|---|---|---|
+  | `SilentTrigger::Heartbeat` | non | oui (horaire) | **le budget + la pause** |
+  | `curator_review` | non | oui (quotidien, 10h locale) | **tu sur une persona `Family`** |
+  | `SilentTrigger::Reflection` | non | **non** (désactivée) | rien — hors périmètre, nommé |
+  | `SilentTrigger::Reminder` | **oui** — l'utilisateur l'a demandée | oui (la veille de 9h) | **rien, délibérément** |
+
+  Borner `Reminder` reviendrait à refuser à l'utilisateur ce qu'il a explicitement
+  demandé, c'est-à-dire l'inverse du défaut à corriger. `Reflection` *peut*
+  techniquement appeler `send_message` (le doc-comment de `run_silent_agent`
+  l'énonce pour tous les tours silencieux), mais elle est désactivée chez Al et
+  aucune mesure ne montre un tour de réflexion ayant écrit à un utilisateur :
+  **ticket de suivi**, avec pour préalable cette mesure.
+
+- **Le curateur est tu par la persona, jamais par le budget.** `dispatch_curator_review`
+  se terminait par un bloc commenté « Notify operator » écrivant dans
+  `self.message_sender` — le **même champ que le heartbeat**, qui sur un tenant
+  mono-agent route vers le `chat_id` Telegram du client. Opérateur et utilisateur
+  sont confondus par la topologie, pas par l'intention du code. Chez Al cela
+  donne un message **anglais** quotidien commençant par `[Curator]`, comptant des
+  « skills idle » et prescrivant `mika skills curator status --agent mika`, reçu
+  vers **10h locale** (le cron est UTC, il est à UTC+7) — un « rapport technique »
+  dans son vocabulaire, et une violation littérale de `FAMILY_SOUL` (« toute
+  mention … de l'infrastructure sous-jacente — jamais, même si on te le
+  demande »). **Le réflexe serait de le passer sous le budget : il est écarté.**
+  Ce n'est pas un problème de fréquence mais de **destinataire** — le borner le
+  rendrait *plus rare* chez celui qui ne devrait jamais le voir **et plus rare
+  aussi** chez l'opérateur à qui il est destiné, un réglage qui se trompe sur les
+  deux tenants à la fois. `match` exhaustif sur `PersonaProfile`, **aucun bras
+  `_ =>`** (modèle mika#2290). `emit_curator_proposal` reste **inconditionnel** :
+  seule la *notification* est retenue, la revue continue et
+  `mika skills curator status` reste la surface opérateur — elle n'a jamais eu
+  besoin de passer par Telegram.
+
+- **La promesse sans acteur est refusée (garde EndTurn 5e).** Un tour qui promet
+  de changer la fréquence de ses messages proactifs — ou de les suspendre — sans
+  avoir appelé `set_config` sur l'une des deux clés **pendant ce tour** est
+  refusé une fois et re-prompté. Trois termes conjonctifs (sujet × assertion
+  performative × absence d'acteur), l'acteur étant vérifié **en premier** pour
+  que « avoir appelé l'outil suffit » soit une propriété de la fonction pure et
+  non une branche de la boucle. La couche « assertion » **porte son propre sujet
+  grammatical** (modèle 5d) : c'est ce qui laisse passer « je ne peux pas régler
+  ça moi-même » — **l'aveu d'incapacité est une réponse correcte**, et le texte de
+  correction l'offre explicitement comme seconde branche, sans quoi la garde
+  pousserait le modèle à appeler l'outil pour s'en débarrasser. Budget d'**un
+  seul** re-prompt, comme toute la famille. *Angle mort nommé :* un `set_config`
+  **tenté** satisfait le terme (convention de la famille `callback_terminal_action`),
+  donc une promesse qui repose sur un appel refusé par l'outil passe — c'est la
+  famille `assert_grounded` (mika#1331), pas celle-ci.
+
+- **Surfaces opérateur.** Dans `$MIKA_SPIRIT_LOG_FILE` :
+  - `proactive_budget_resolved` (INFO, dédupliqué sur le couple résolu) —
+    **la question « quel budget est réellement en vigueur pour ce tenant ? »**,
+    sans lire la base, sur le modèle de `llm_budget_resolved` (mika#2293) et pour
+    la même leçon : *un réglage qu'on ne peut pas observer n'est pas un réglage.*
+    `source: "config"` → la consigne est en vigueur, un symptôme survivant est
+    imputable à un autre producteur ; `source: "default"` → l'écriture n'a pas
+    atterri et la cause est dans `set_config`, pas dans le budget.
+  - `proactive_wake_suppressed` (INFO — champs `reason` ∈ `{daily_budget, paused}`,
+    `budget`, `sends_today`, `pause_until`). **C'est la preuve directe que le frein
+    mord.** Émis **uniquement** pour ces deux causes : les trois termes
+    préexistants (heures actives, max 1/heure, activité utilisateur < 2 h) gardent
+    leur silence, sans quoi un tenant nominal écrirait ~24 lignes/jour et noierait
+    le signal (doctrine mika#2131).
+  - `curator_notification_withheld` (INFO — `agent_id`, `candidates`). **Mesure la
+    part du curateur dans le vécu d'Al** : non vide signifie qu'un message
+    `[Curator]` partait bel et bien chez lui les jours où des candidats
+    existaient ; vide signifie que l'émission n'avait pas lieu et que la part du
+    symptôme reste à imputer au heartbeat seul. Sans cette ligne, un curateur tu
+    se lirait exactement comme un curateur sans candidats (mika#2205).
+  - `guard.unactioned_frequency_promise` (WARN, famille #953 — joint à
+    `guard.correction_accepted` par `guard_correlation_id`) et
+    `guard.unactioned_frequency_promise_uncorrected` (WARN). **Régime attendu du
+    second : zéro** — c'est la population que la garde ne ferme pas, et sans cet
+    événement elle serait indistinguable d'un tour sain.
+  - `proactive_budget_invalid` / `proactive_pause_invalid` (WARN) — le palier
+    « illisible ». Ne peut venir que d'une écriture **hors de l'outil**
+    (`validate_config_value` refuse à la porte).
+  - SQL : `SELECT * FROM audit_events WHERE tool_name = 'set_config';` répond à
+    « quand cette consigne a-t-elle été posée, et par quelle session ? » —
+    `set_config` écrit déjà cette ligne, rien n'a été ajouté.
+
+- **Sonde post-déploiement, et ses deux haltes.** Sur le tenant d'Al, poser
+  `proactive_daily_budget = 1` **par la conversation** (c'est le chemin qu'on
+  teste), puis à 48 h : (a) `proactive_budget_resolved` rend
+  `budget: 1, source: "config"` ; (b) `proactive_wake_suppressed` avec
+  `reason: "daily_budget"` est **non vide** les jours où l'agent se serait réveillé
+  trois fois ; (c) Al reçoit **au plus 2** messages proactifs/jour ; (d)
+  `guard.unactioned_frequency_promise_uncorrected` est vide ; (e)
+  `curator_notification_withheld` tranche l'hypothèse ouverte sur le curateur.
+  **Halte 1 :** si Al re-vit une sur-fréquence alors que (b) est non vide et (c)
+  tenu, un producteur **hors du tableau ci-dessus** émet — **ne pas baisser le
+  budget par réflexe**, lire le tableau et établir lequel. **Halte 2 :** si (a)
+  rend `source: "default"`, l'écriture n'a pas atterri : la cause est dans
+  `set_config` ou dans le tour qui aurait dû l'appeler, pas dans le budget.
+
+- **Hors périmètre, délibérément.** Un outil `update_recurring_task_cron` /
+  `cancel_recurring_task_by_label` exposé au modèle (correctif 1 du ticket) : le
+  chemin existe par composition et la récurrence d'Al était conforme — ce qui
+  manque réellement est l'atomicité d'un changement de cron, dont aucune mesure
+  ne montre aujourd'hui le coût. **Ticket de suivi**, à ouvrir si une mesure
+  montre une veille perdue entre le `cancel` et le `create`. Le dédoublonnage
+  sémantique par label normalisé (correctif 2) : aucun doublon n'est manifeste, et
+  normaliser un label change la **clé d'identité** des récurrences — blast radius
+  large (le veto mika#1742, mika#2271 et mika#2337 s'appuient tous sur l'égalité
+  de label) pour un défaut non mesuré ; **ticket de suivi**, préalable = un
+  registre portant deux récurrences de même intention sous deux labels. Le framing
+  du tour heartbeat n'est pas touché (`feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`),
+  donc aucune régression de ton n'est introduite.
+
 Optional (runtime observability):
 - `MIKA_STORE_LLM_CALLS` — Store LLM call metadata (model, tokens, latency) in SQLite (default: true)
 - `MIKA_STORE_TOOL_CALLS` — Store full tool call input/output in SQLite (default: true, 50KB cap per field)
