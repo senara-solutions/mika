@@ -198,6 +198,18 @@ jobs:
       - name: Pin the guard's negative behaviour
         run: bash scripts/test-check-image-tags-immutable.sh
 
+  a2a-timeout-literal-lint:
+    name: A2A Timeout Literal Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      - name: Reject hardcoded timeout budgets on the a2a path (mika#2309)
+        run: bash scripts/check-a2a-timeout-literals.sh
+      # A guard nobody has watched go red is a decoration — same discipline as
+      # byte-slice-lint above (mika#2103).
+      - name: Pin the guard's negative behaviour
+        run: bash scripts/test-check-a2a-timeout-literals.sh
+
   dispatch-seats-lint:
     name: Dispatch Seat Declaration Lint
     runs-on: ubuntu-22.04

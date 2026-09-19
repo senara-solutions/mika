@@ -53,8 +53,8 @@ Drift direction: post-hoc more permissive than pre-hoc → false-positive EndTur
 
 Two predicates encoding "is the per-class dispatch slot occupied?":
 
-- **Tool-boundary gate** (`Database::has_active_callback_tasks_excluding`, `crates/mika-agent/src/db.rs:5752`) — per-class scoped, EXCLUDING the requesting parent's own callback. Did NOT exclude `:deferred` wrappers.
-- **Engine backstop** (`Database::has_any_active_callback`, `crates/mika-agent/src/db.rs:5839`) — agent-wide, label-filtered. Correctly excluded `:deferred` wrappers via `AND label NOT LIKE '%:deferred'` (fixed in mika#1070).
+- **Tool-boundary gate** (`Database::has_active_callback_tasks_excluding`, `crates/mika-agent/src/db.rs`) — per-class scoped, EXCLUDING the requesting parent's own callback. Did NOT exclude `:deferred` wrappers.
+- **Engine backstop** (`Database::has_any_active_callback`, `crates/mika-agent/src/db.rs`) — agent-wide, label-filtered. Correctly excluded `:deferred` wrappers via `AND label NOT LIKE '%:deferred'` (fixed in mika#1070).
 
 Drift direction: backstop more permissive than gate → backstop correctly identified slot-idle and promoted a wrapper, but the gate then rejected the promoted wrapper's `run_claude_pilot` call (saw OTHER parents' wrappers as occupants), re-creating another wrapper. Deadlock between two pending wrappers from different parents.
 

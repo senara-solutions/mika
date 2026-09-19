@@ -38,6 +38,8 @@ When fixing a stale issue citation, audit all related citations in the same code
 
 Historical documents (`docs/plans/`, `docs/solutions/`) should NOT be retroactively updated -- they record what was believed at the time and serve as historical records.
 
+Converting a `<file>:<line>` locator into a citation by symbol is not a retroactive update in that sense: the document keeps asserting exactly what it asserted, and the only statement removed ("this code is at line NNNN") is one nobody ever meant to make (mika#2397).
+
 ## Why This Matters
 
 Stale issue citations create misleading provenance. A developer tracing the design history of `MatchReason::Keyword`-only filtering would read mika#265, find it's about `mika ask` TUI execution, and be confused about why the code cites it for skill constraint scoping. Correct citations make design archaeology reliable.
