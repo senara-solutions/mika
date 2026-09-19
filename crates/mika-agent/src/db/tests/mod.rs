@@ -25,8 +25,8 @@
 //! module, donc il voit ses items privés ; regrouper les helpers à la racine
 //! évite d'avoir à arbitrer, helper par helper, quel thème le « possède ».
 //!
-//! Sept d'entre eux ne peuvent pas bouger : `db()`, `rust_sources_under()`,
-//! `GROOM_ISSUE_URL`, `GROOM_CALLBACK_PLAN_GROOMED`, `groom_parent`,
+//! Six d'entre eux ne peuvent pas bouger : `db()`, `GROOM_ISSUE_URL`,
+//! `GROOM_CALLBACK_PLAN_GROOMED`, `groom_parent`,
 //! `groom_callback` et `completed_groom_pair` sont importés par
 //! `skills::executor` sous le chemin `crate::db::tests::*`. **Ce chemin doit
 //! survivre octet pour octet** — c'est un contrat inter-modules, pas un détail
@@ -75,19 +75,19 @@ fn db_with_session() -> (Database, String) {
 ///
 /// Deux écartements composés, et l'ordre compte : la **classification par
 /// chemin** (mika#2321) écarte un fichier de test entièrement — il n'a pas
-/// de moitié production — avant que la **troncature** (mika#2335) ne retire
-/// la queue de test d'un fichier de production.
+/// de moitié production — avant que le **masquage** (mika#2398) ne retire
+/// les régions de test d'un fichier de production.
 fn dispatch_stamp_violations(path: &std::path::Path, src: &str) -> Vec<String> {
     if crate::source_scan::is_test_source_path(path) {
         return Vec::new();
     }
 
-    // Tronquer au premier module de test inline : ces fixtures posent
-    // légitimement des rows `in_progress` à la main.
-    let production = match src.find("#[cfg(test)]") {
-        Some(i) => &src[..i],
-        None => src,
-    };
+    // Masquer les régions de test inline : ces fixtures posent légitimement
+    // des rows `in_progress` à la main. Le masquage est celui de
+    // `mika_common::source_guard` (mika#2398), pas une troncature au premier
+    // `#[cfg(test)]` — qui perdait 14 043 lignes de production sur 22
+    // fichiers, dont `prompt.rs` coupé ligne 142 par un doc-comment.
+    let production = mika_common::source_guard::mask_test_regions(src);
 
     // Les lignes de commentaire sont neutralisées (et non supprimées,
     // pour que les numéros de ligne restent ceux du fichier) : la prose
@@ -122,28 +122,6 @@ fn dispatch_stamp_violations(path: &std::path::Path, src: &str) -> Vec<String> {
         from = at + needle.len();
     }
     violations
-}
-
-/// Énumère récursivement les `.rs` sous `root`. Utilisée par la garde de
-/// source ci-dessus ; pas de dépendance `walkdir` pour un test.
-pub(crate) fn rust_sources_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if p.extension().is_some_and(|e| e == "rs") {
-                out.push(p);
-            }
-        }
-    }
-    out.sort();
-    out
 }
 
 fn make_task(label: &str) -> NewTask {

@@ -787,8 +787,11 @@ mod tests {
     ///
     /// Two scoping rules, each of which the first run of this test proved necessary:
     ///
-    /// - **The production half only** (everything above `mod tests`). A test
-    ///   asserting with `assert_eq!` is not a fallibility in the send path.
+    /// - **The production half only.** A test asserting with `assert_eq!` is not
+    ///   a fallibility in the send path. That boundary is read by
+    ///   [`mika_common::source_guard`] since mika#2398 — "everything above
+    ///   `mod tests`" was blind to a module-level `#[cfg(test)]` helper, and a
+    ///   `.unwrap()` written below one would have gone unseen.
     /// - **Code, never prose.** Line comments are stripped first, because the module
     ///   doc-comment *names* the constructs it forbids — a guard that could not
     ///   tolerate being described would force the documentation to go quiet about
@@ -796,11 +799,9 @@ mod tests {
     ///   file uses none, and a scan that tried to parse them would be a tokenizer.)
     #[test]
     fn mika2291_s3_render_is_infallible_by_construction() {
-        let source = include_str!("telegram_markdown.rs");
-        let production = match source.find("\n#[cfg(test)]") {
-            Some(at) => &source[..at], // safe-byte-slice: `at` comes from str::find, which only ever returns a char boundary
-            None => source,
-        };
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let production = scanner.production_of(&scanner.src_root().join("telegram_markdown.rs"));
         let code: String = production
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))

@@ -1224,50 +1224,37 @@ mod tests {
     /// cette classe : un second écrivain ne rendrait aucune décision fausse, il
     /// rendrait les deux populations inséparables. Toutes les assertions
     /// resteraient vertes pendant que les sondes cesseraient de discriminer.
+    ///
+    /// Le périmètre est la **production** : un test qui assert sur la valeur
+    /// d'une constante n'est pas un écrivain, et l'inclure ferait rougir le
+    /// garde pour la raison inverse de celle qu'il surveille. Cette frontière
+    /// est lue par [`mika_common::source_guard`] depuis mika#2398 ; la coupure
+    /// au premier `\n#[cfg(test)]` qu'elle appliquait était aveugle à un helper
+    /// de niveau module, à un item mono-ligne et à un fichier intégralement de
+    /// test — donc un second écrivain posé dans l'une de ces zones serait resté
+    /// invisible, ce qui est exactement ce que la garde promet de voir.
     #[test]
     fn mika2368_each_event_name_has_exactly_one_writer_in_production() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
         let mut sites: Vec<(String, String)> = Vec::new();
 
-        fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                return;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    walk(&path, out);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    let Ok(text) = std::fs::read_to_string(&path) else {
-                        continue;
-                    };
-                    // Le périmètre est la **production** : un test qui assert
-                    // sur la valeur d'une constante n'est pas un écrivain, et
-                    // l'inclure ferait rougir le garde pour la raison inverse
-                    // de celle qu'il surveille.
-                    let production = match text.find("\n#[cfg(test)]") {
-                        Some(at) => &text[..at],
-                        None => &text[..],
-                    };
-                    let rel = path.to_string_lossy().to_string();
-                    for line in production.lines() {
-                        let trimmed = line.trim_start();
-                        // Les commentaires et la prose de doc citent les noms
-                        // abondamment — c'est du texte, pas un écrivain.
-                        if trimmed.starts_with("//") {
-                            continue;
-                        }
-                        for name in [DEADLINE_VERDICT_EVENT, CALLBACK_VERDICT_EVENT] {
-                            if line.contains(&format!("\"{name}\"")) {
-                                out.push((name.to_string(), rel.clone()));
-                            }
-                        }
+        scanner.for_each(|path, production| {
+            let rel = path.to_string_lossy().to_string();
+            for line in production.lines() {
+                let trimmed = line.trim_start();
+                // Les commentaires et la prose de doc citent les noms
+                // abondamment — c'est du texte, pas un écrivain.
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                for name in [DEADLINE_VERDICT_EVENT, CALLBACK_VERDICT_EVENT] {
+                    if line.contains(&format!("\"{name}\"")) {
+                        sites.push((name.to_string(), rel.clone()));
                     }
                 }
             }
-        }
-
-        walk(&root, &mut sites);
+        });
 
         for name in [DEADLINE_VERDICT_EVENT, CALLBACK_VERDICT_EVENT] {
             let writers: Vec<&String> = sites

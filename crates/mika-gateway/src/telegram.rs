@@ -2261,11 +2261,14 @@ mod tests {
     /// has had to impose before (mika#2131).
     #[test]
     fn mika2291_s1_plain_body_is_the_sole_floor_construction_site() {
-        let source = include_str!("telegram.rs");
-        let production = match source.find("\n#[cfg(test)]") {
-            Some(at) => &source[..at], // safe-byte-slice: `at` comes from str::find, which only ever returns a char boundary
-            None => source,
-        };
+        // The production half is read by `mika_common::source_guard`
+        // (mika#2398). Cutting at the first `\n#[cfg(test)]` was blind to a
+        // module-level `#[cfg(test)]` helper and to a single-line item, so a
+        // second composition site placed below either one would have been
+        // invisible to this guard while every assertion stayed green.
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let production = scanner.production_of(&scanner.src_root().join("telegram.rs"));
         let calls = production.matches("strip_markdown_around_urls(").count();
         // One definition + one call, inside `plain_body`.
         assert_eq!(

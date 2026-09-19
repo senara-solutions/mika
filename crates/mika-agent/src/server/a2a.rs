@@ -2206,10 +2206,12 @@ mod tests {
     fn mika2363_the_restriction_is_applied_to_a_clone_and_never_written_back() {
         // Production half only — this test module quotes the same identifiers,
         // and counting its own assertions would make the guard report itself.
-        let source = include_str!("a2a.rs")
-            .split("\n#[cfg(test)]\n")
-            .next()
-            .expect("split always yields a first element");
+        // The boundary comes from `mika_common::source_guard` (mika#2398):
+        // splitting on the first `\n#[cfg(test)]\n` was blind to a module-level
+        // helper, to a single-line item, and to this file being read as a whole.
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let source = scanner.production_of(&scanner.src_root().join("server/a2a.rs"));
 
         assert_eq!(
             source.matches("apply_only_skills(").count(),

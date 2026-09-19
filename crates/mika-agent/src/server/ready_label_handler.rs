@@ -71,6 +71,249 @@ impl ReadyLabelLocation {
     }
 }
 
+/// Exit gate of the ready-label handler — which of the fifteen ways out of
+/// [`try_handle_ready_label_dispatch_with_fetcher`] was taken (mika#2323).
+///
+/// # WIRE FORMAT
+///
+/// These values land in `audit_events.after_value` and operators `GROUP BY`
+/// them. Two spellings of one gate would split a population without saying so —
+/// the same reasoning, and the same guard shape, as mika#2131's
+/// `FILTER_*` names. Renaming one is a dated breaking change to be written down
+/// in `CLAUDE.md`, never a silent test update.
+///
+/// # Why this type exists
+///
+/// mika#2323 reported that a hand-applied `ready` label produced no dispatch,
+/// and read the absence of `ready_label_engine_dispatched` as evidence of an
+/// actor filter. There is no actor filter (see the module-level note on
+/// `parse_event_actor`) — but that absence was compatible with **fourteen**
+/// distinct causes plus four upstream losses that write nothing at all, and one
+/// of the fourteen was entirely mute. The measured defect is not a filter; it is
+/// that a non-dispatch could not be attributed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadyLabelGate {
+    /// The text is not a ready-label marker.
+    ///
+    /// **Never emitted**, deliberately: the wrapper returns before the entry
+    /// line. Every message on the `github` channel reaches this handler, so
+    /// logging here would write a line per message — an observability that
+    /// records everyone distinguishes no one (mika#2131 AC7). It is a variant
+    /// rather than an absence so the vocabulary enumerates every way out.
+    NotAMarker,
+    /// Marker recognized, `<repo>#<n>` unparseable.
+    ///
+    /// Also not carried by the entry/outcome pair: without a location there is
+    /// no `target_key` to key an audit row on, and inventing one would be worse
+    /// than the existing `ready_label_parse_failed` WARN, which already covers
+    /// this case by name.
+    ParseFailed,
+    /// Gate 2b — the repository is not in `DISPATCHABLE_REPOS` (mika#2046).
+    RepoNotDispatchable,
+    /// Gate 2c — a pilot is still running for this issue (mika#2279).
+    PilotInFlight,
+    /// Step 3 — no GitHub token resolved.
+    NoToken,
+    /// Step 4 — `gh issue view` failed.
+    BodyFetchFailed,
+    /// Gate 4b — the issue belongs to another dispatch seat (mika#2084).
+    SeatMismatch,
+    /// Gate 4c — an operator is holding the ticket (mika#2263).
+    OperatorHeld,
+    /// Step 7 — the parent tracking row could not be pre-created.
+    TaskCreateFailed,
+    /// Step 9a — the dispatch tool is not in the `SkillRegistry`.
+    ToolNotFound,
+    /// Step 9b — the dispatch tool is not a long-running exec handler.
+    ToolNotLongRunning,
+    /// Step 9d — `validate_dispatch_readiness` refused.
+    DispatchReadinessFailed,
+    /// Step 9e — the callback child could not be created.
+    CallbackCreateFailed,
+    /// Step 9f — the handler script is missing on disk.
+    HandlerNotFound,
+    /// Step 9i — the dispatch subprocess was spawned.
+    Dispatched,
+}
+
+impl ReadyLabelGate {
+    /// The wire name. An exhaustive `match`, never a `_ =>` arm — that is what
+    /// makes "a new exit cannot stay anonymous" a compile error rather than a
+    /// review convention (mika#2323 R3/AC4).
+    pub(crate) fn wire_name(self) -> &'static str {
+        match self {
+            Self::NotAMarker => "not_a_marker",
+            Self::ParseFailed => "parse_failed",
+            Self::RepoNotDispatchable => "repo_not_dispatchable",
+            Self::PilotInFlight => "pilot_in_flight",
+            Self::NoToken => "no_token",
+            Self::BodyFetchFailed => "body_fetch_failed",
+            Self::SeatMismatch => "seat_mismatch",
+            Self::OperatorHeld => "operator_held",
+            Self::TaskCreateFailed => "task_create_failed",
+            Self::ToolNotFound => "tool_not_found",
+            Self::ToolNotLongRunning => "tool_not_long_running",
+            Self::DispatchReadinessFailed => "dispatch_readiness_failed",
+            Self::CallbackCreateFailed => "callback_create_failed",
+            Self::HandlerNotFound => "handler_not_found",
+            Self::Dispatched => "dispatched",
+        }
+    }
+}
+
+/// The two exits that precede a usable location: named, and deliberately
+/// **not** reported (mika#2323).
+///
+/// Taking the gate as an argument rather than writing it in a comment is what
+/// keeps the vocabulary total — every way out of this handler has a name, and
+/// these two are marked as the ones that write nothing, in code. The assertion
+/// is what stops a later exit being quietly routed through here: any gate other
+/// than these two owes the operator an entry and an outcome line.
+fn unreported_exit(gate: ReadyLabelGate) -> VerdictAction {
+    debug_assert!(
+        matches!(
+            gate,
+            ReadyLabelGate::NotAMarker | ReadyLabelGate::ParseFailed
+        ),
+        "only the two pre-location exits are unreported; {gate:?} must go through \
+         emit_ready_label_outcome"
+    );
+    VerdictAction::Passthrough { enrichment: None }
+}
+
+/// The coarse disposition of a [`VerdictAction`], for the outcome line's
+/// `action` field. Complements `gate`: `gate` says *which* exit, `action` says
+/// what the caller does with it.
+fn action_label(action: &VerdictAction) -> &'static str {
+    match action {
+        VerdictAction::Dispatched { .. } => "dispatched",
+        VerdictAction::Handled { .. } => "handled",
+        VerdictAction::Passthrough { .. } => "passthrough",
+    }
+}
+
+/// Read the GitHub identity that applied the label, when the gateway supplied
+/// one (mika#2323).
+///
+/// # This value decides NOTHING
+///
+/// It is a log field and an audit field. **No refusal predicate in this module
+/// reads it**, and the source scan `mika2323_no_gate_predicate_reads_the_actor`
+/// refuses one. Wiring it into a gate would create precisely the actor filter
+/// mika#2323 set out to find and did not: `route_event("issues",
+/// Some("labeled"))` returns `Some("mika-dev")` with no condition on `sender`,
+/// and the gateway records that non-implementation as a decision in prose
+/// (`mika-gateway/src/github.rs`, just above the routing step). Introducing one
+/// here would be a filtering policy nobody has taken, which that ticket's
+/// out-of-scope section names explicitly.
+///
+/// # Tolerant by construction
+///
+/// A missing line, a malformed one, an empty login, an old gateway serving a
+/// new agent (or the reverse) all yield `None` — never an error, never a
+/// refusal. The line is matched on the **last** line only, which is where the
+/// producer appends it.
+pub(crate) fn parse_event_actor(text: &str) -> Option<&str> {
+    let login = text
+        .lines()
+        .next_back()?
+        .strip_prefix(mika_common::github_event_format::LABELED_BY_LINE_PREFIX)?
+        .trim();
+    (!login.is_empty()).then_some(login)
+}
+
+/// Entry line — a `labeled ready` event was received, parsed, and is about to
+/// be decided (mika#2323 R1).
+///
+/// Emitted **after** the marker match and a successful parse, never before: see
+/// [`ReadyLabelGate::NotAMarker`] and [`ReadyLabelGate::ParseFailed`] for why
+/// each of those two exits stays out of this pair.
+///
+/// Its absence is what the operator could not read before: nothing
+/// distinguished "the event never arrived" from "it arrived and was refused".
+fn emit_ready_label_received(location: &ReadyLabelLocation, actor: Option<&str>, trace_id: &str) {
+    info!(
+        event = "ready_label_received",
+        repo = %location.owner_repo(),
+        num = location.number,
+        actor = actor.unwrap_or("<unknown>"),
+        trace_id,
+        "ready_label_handler: `labeled ready` event received — deciding"
+    );
+}
+
+/// Outcome line + audit row — which gate decided, and what the caller gets
+/// (mika#2323 R2).
+///
+/// The audit row is what turns "why was this ticket never dispatched?" into one
+/// SQL query instead of a grep over nineteen gigabytes.
+///
+/// # No deduplication, and that is reasoned
+///
+/// mika#2131 had to deduplicate because one `auto_pull` tick classifies a
+/// hundred tickets every ten minutes. Here the population is a `labeled ready`
+/// event — a few dozen a day at most — and each one is a distinct dated fact the
+/// operator wants to **count**. Deduplicating would erase the very measurement
+/// the ticket asked for ("how many times was this ticket triggered?").
+///
+/// # Non-fatal
+///
+/// A failed audit write logs a WARN and changes no dispatch decision — the same
+/// contract as the four pre-existing gate audit writes, which this does not
+/// replace (mika#2323 R6).
+async fn emit_ready_label_outcome(
+    db: &AsyncDatabase,
+    session_id: &str,
+    trace_id: &str,
+    location: &ReadyLabelLocation,
+    gate: ReadyLabelGate,
+    action: &VerdictAction,
+    actor: Option<&str>,
+) {
+    let owner_repo = location.owner_repo();
+    let gate_name = gate.wire_name();
+    let action_name = action_label(action);
+    info!(
+        event = "ready_label_outcome",
+        repo = %owner_repo,
+        num = location.number,
+        gate = gate_name,
+        action = action_name,
+        actor = actor.unwrap_or("<unknown>"),
+        trace_id,
+        "ready_label_handler: `labeled ready` event decided"
+    );
+
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            "ready_label_outcome",
+            &format!("{}#{}", owner_repo, location.number),
+            None,
+            Some(gate_name),
+            Some(&format!(
+                "repo={} number={} gate={} action={} actor={}",
+                owner_repo,
+                location.number,
+                gate_name,
+                action_name,
+                actor.unwrap_or("<unknown>")
+            )),
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(
+            event = "ready_label_audit_log_failed",
+            repo = %owner_repo,
+            num = location.number,
+            gate = gate_name,
+            error = %e,
+            "ready_label_handler: failed to write outcome audit event (non-fatal)"
+        );
+    }
+}
+
 /// Attempt to handle a `[GitHub] Issue labeled ready on …` webhook structurally
 /// before the LLM turn.
 ///
@@ -117,12 +360,27 @@ pub async fn try_handle_ready_label_dispatch(
 ///
 /// `fetch_issue` receives `(owner_repo, number, token)` and yields
 /// `(body, labels)`.
+///
+/// # Shape: a thin wrapper around `…_inner` (mika#2323)
+///
+/// This function owns the two exits that precede a usable location — the mute
+/// non-marker return and the parse failure — then emits the entry line, calls
+/// `…_inner`, and emits the outcome line naming the gate that decided. The
+/// thirteen remaining exits therefore cannot forget to report themselves,
+/// because they do not report themselves: they return a
+/// [`ReadyLabelGate`] and the wrapper writes the line.
+///
+/// This is the "single reader" form the house already applies to
+/// `grooming_marker` (mika#2158) and `live_pilot` (mika#2279), and for the same
+/// reason: fifteen scattered emission sites would drift, exactly as the grooming
+/// regex drifted for months while promotion and dispatch routing answered the
+/// same question differently.
 #[allow(clippy::too_many_arguments)]
 pub async fn try_handle_ready_label_dispatch_with_fetcher<F, Fut>(
     text: &str,
     db: &AsyncDatabase,
     github_token: Option<&str>,
-    _message_sender: Option<&Arc<dyn MessageSender>>,
+    message_sender: Option<&Arc<dyn MessageSender>>,
     session_id: &str,
     trace_id: &str,
     skills: &SkillRegistry,
@@ -132,13 +390,16 @@ where
     F: FnOnce(String, u64, String) -> Fut,
     Fut: std::future::Future<Output = Result<(String, Vec<String>), String>>,
 {
-    // 1. Early-return for non-ready-label messages. Cheapest predicate.
+    // 1. Early-return for non-ready-label messages. Cheapest predicate, and
+    //    deliberately silent — see `ReadyLabelGate::NotAMarker`.
     if !text.starts_with(READY_LABEL_DISPATCH_MARKER) {
-        return VerdictAction::Passthrough { enrichment: None };
+        return unreported_exit(ReadyLabelGate::NotAMarker);
     }
 
     // 2. Parse `<repo>#<num>` from the marker text. On parse failure, pass
-    //    through and let the existing INTENT_GUARDS path log the issue.
+    //    through and let the existing INTENT_GUARDS path log the issue. No
+    //    entry/outcome pair here: without a location there is no audit
+    //    `target_key`, and `ready_label_parse_failed` already names this case.
     let location = match parse_ready_label_location(text) {
         Some(loc) => loc,
         None => {
@@ -147,10 +408,56 @@ where
                 text_excerpt = %text.chars().take(120).collect::<String>(),
                 "ready_label_handler: could not parse <repo>#<n> from marker — passthrough"
             );
-            return VerdictAction::Passthrough { enrichment: None };
+            return unreported_exit(ReadyLabelGate::ParseFailed);
         }
     };
 
+    let actor = parse_event_actor(text);
+    emit_ready_label_received(&location, actor, trace_id);
+
+    let (action, gate) = try_handle_ready_label_dispatch_inner(
+        &location,
+        text,
+        db,
+        github_token,
+        message_sender,
+        session_id,
+        trace_id,
+        skills,
+        fetch_issue,
+    )
+    .await;
+
+    emit_ready_label_outcome(db, session_id, trace_id, &location, gate, &action, actor).await;
+
+    action
+}
+
+/// The decision body of the ready-label handler: everything from the repository
+/// allowlist to the engine-side spawn.
+///
+/// Returns the action **and the gate that produced it**, so the wrapper above
+/// can attribute a non-dispatch without this function knowing how attribution
+/// is reported (mika#2323).
+///
+/// `location` is already parsed — the two exits that precede it belong to the
+/// wrapper.
+#[allow(clippy::too_many_arguments)]
+async fn try_handle_ready_label_dispatch_inner<F, Fut>(
+    location: &ReadyLabelLocation,
+    text: &str,
+    db: &AsyncDatabase,
+    github_token: Option<&str>,
+    _message_sender: Option<&Arc<dyn MessageSender>>,
+    session_id: &str,
+    trace_id: &str,
+    skills: &SkillRegistry,
+    fetch_issue: F,
+) -> (VerdictAction, ReadyLabelGate)
+where
+    F: FnOnce(String, u64, String) -> Fut,
+    Fut: std::future::Future<Output = Result<(String, Vec<String>), String>>,
+{
     // 2b. Repository allowlist (mika#2046). The earliest point at which the
     //     target repository is known, and deliberately ahead of every side
     //     effect: no task is pre-created, no `gh issue view` subprocess runs.
@@ -202,9 +509,12 @@ where
             );
         }
 
-        return VerdictAction::Handled {
-            pre_digest: format_repo_not_dispatchable_pre_digest(&location, &allowed),
-        };
+        return (
+            VerdictAction::Handled {
+                pre_digest: format_repo_not_dispatchable_pre_digest(location, &allowed),
+            },
+            ReadyLabelGate::RepoNotDispatchable,
+        );
     }
 
     // The canonical issue URL. Resolved here rather than at step 7 because the
@@ -310,14 +620,17 @@ where
             );
         }
 
-        return VerdictAction::Handled {
-            pre_digest: format_pilot_in_flight_pre_digest(
-                &location,
-                pid,
-                &child_task_id,
-                &parent_task_id,
-            ),
-        };
+        return (
+            VerdictAction::Handled {
+                pre_digest: format_pilot_in_flight_pre_digest(
+                    location,
+                    pid,
+                    &child_task_id,
+                    &parent_task_id,
+                ),
+            },
+            ReadyLabelGate::PilotInFlight,
+        );
     }
 
     // 3. Need a GitHub token to fetch the issue body. Without it we cannot
@@ -331,7 +644,10 @@ where
                 num = location.number,
                 "ready_label_handler: no GitHub token configured — passthrough"
             );
-            return VerdictAction::Passthrough { enrichment: None };
+            return (
+                VerdictAction::Passthrough { enrichment: None },
+                ReadyLabelGate::NoToken,
+            );
         }
     };
 
@@ -348,7 +664,10 @@ where
                     error = %e,
                     "ready_label_handler: gh issue view failed — passthrough"
                 );
-                return VerdictAction::Passthrough { enrichment: None };
+                return (
+                    VerdictAction::Passthrough { enrichment: None },
+                    ReadyLabelGate::BodyFetchFailed,
+                );
             }
         };
 
@@ -409,9 +728,12 @@ where
             );
         }
 
-        return VerdictAction::Handled {
-            pre_digest: format_seat_mismatch_pre_digest(&location, &seat_verdict, current),
-        };
+        return (
+            VerdictAction::Handled {
+                pre_digest: format_seat_mismatch_pre_digest(location, &seat_verdict, current),
+            },
+            ReadyLabelGate::SeatMismatch,
+        );
     }
 
     // 4c. Operator-held gate (mika#2263 défaut (c)). Same placement rationale as
@@ -475,9 +797,12 @@ where
             );
         }
 
-        return VerdictAction::Handled {
-            pre_digest: format_operator_held_pre_digest(&location, held_by),
-        };
+        return (
+            VerdictAction::Handled {
+                pre_digest: format_operator_held_pre_digest(location, held_by),
+            },
+            ReadyLabelGate::OperatorHeld,
+        );
     }
 
     // 5. Determine groomed-state via the canonical predicate. Same code path as
@@ -571,7 +896,10 @@ where
                 error = %e,
                 "ready_label_handler: failed to pre-create task — passthrough"
             );
-            return VerdictAction::Passthrough { enrichment: None };
+            return (
+                VerdictAction::Passthrough { enrichment: None },
+                ReadyLabelGate::TaskCreateFailed,
+            );
         }
     };
 
@@ -610,7 +938,7 @@ where
     //    upgrade over the prescriptive path, not a replacement of its fallback.
     let fallback = || VerdictAction::Handled {
         pre_digest: format_ready_label_pre_digest(
-            &location,
+            location,
             is_groomed,
             target_tool,
             target_skill,
@@ -629,7 +957,7 @@ where
                 "ready_label_handler: dispatch tool not in SkillRegistry — \
                  fallback to #1571 prescriptive pre-digest"
             );
-            return fallback();
+            return (fallback(), ReadyLabelGate::ToolNotFound);
         }
     };
 
@@ -652,7 +980,7 @@ where
                 "ready_label_handler: dispatch tool is not a long-running exec handler — \
                  fallback to #1571 prescriptive pre-digest"
             );
-            return fallback();
+            return (fallback(), ReadyLabelGate::ToolNotLongRunning);
         }
     };
 
@@ -689,7 +1017,7 @@ where
             "ready_label_handler: dispatch readiness check failed — \
              fallback to #1571 prescriptive pre-digest"
         );
-        return fallback();
+        return (fallback(), ReadyLabelGate::DispatchReadinessFailed);
     }
 
     // 9e. Create the callback child task (same shape as the LLM tool-call path
@@ -719,7 +1047,7 @@ where
                 "ready_label_handler: failed to create callback child — \
                  fallback to #1571 prescriptive pre-digest"
             );
-            return fallback();
+            return (fallback(), ReadyLabelGate::CallbackCreateFailed);
         }
     };
 
@@ -741,7 +1069,7 @@ where
                 &format!("handler not found: {}", cmd_path.display()),
             )
             .await;
-        return fallback();
+        return (fallback(), ReadyLabelGate::HandlerNotFound);
     }
 
     // 9g. Auto-transition the pre-created parent task to in_progress and stamp
@@ -799,16 +1127,19 @@ where
         "ready_label_handler: engine-side dispatch spawned; LLM turn acknowledges only"
     );
 
-    VerdictAction::Dispatched {
-        pre_digest: format_engine_dispatch_pre_digest(
-            &location,
-            is_groomed,
-            target_tool,
-            target_skill,
-            &task_id,
-        ),
-        task_id,
-    }
+    (
+        VerdictAction::Dispatched {
+            pre_digest: format_engine_dispatch_pre_digest(
+                location,
+                is_groomed,
+                target_tool,
+                target_skill,
+                &task_id,
+            ),
+            task_id,
+        },
+        ReadyLabelGate::Dispatched,
+    )
 }
 
 /// Parse `<repo>#<num>` from the ready-label marker text.
@@ -1188,6 +1519,410 @@ fn task_age_secs(created_at: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------
+    // mika#2323 — gate vocabulary, actor readability, and the invariant that
+    // the actor decides nothing.
+    // ---------------------------------------------------------------------
+
+    /// Test-only affordances for the gate vocabulary.
+    ///
+    /// They live **inside `mod tests`** rather than beside `wire_name`, under
+    /// their own `#[cfg(test)]`, for a reason worth knowing before moving them
+    /// back: `test_dispatch_fired_at_stamped::every_production_dispatch_path_stamps`
+    /// (mika#2335) bounds "the production half of this file" at the **first**
+    /// `#[cfg(test)]`. A `#[cfg(test)]` item placed near the top of the file
+    /// truncates that scan before it reaches `spawn_long_running_exec`, and the
+    /// mika#2335 guard fails — loudly and correctly, but for a reason that has
+    /// nothing to do with `fired_at`. Keeping test items in the test module
+    /// keeps that assumption true. (The assumption is itself fragile and
+    /// undocumented at its site; flagged, not fixed here — out of scope.)
+    impl ReadyLabelGate {
+        /// Every variant, in declaration order.
+        ///
+        /// Completeness is enforced by `index_in_all`, not by convention.
+        pub(crate) const ALL: &'static [ReadyLabelGate] = &[
+            Self::NotAMarker,
+            Self::ParseFailed,
+            Self::RepoNotDispatchable,
+            Self::PilotInFlight,
+            Self::NoToken,
+            Self::BodyFetchFailed,
+            Self::SeatMismatch,
+            Self::OperatorHeld,
+            Self::TaskCreateFailed,
+            Self::ToolNotFound,
+            Self::ToolNotLongRunning,
+            Self::DispatchReadinessFailed,
+            Self::CallbackCreateFailed,
+            Self::HandlerNotFound,
+            Self::Dispatched,
+        ];
+
+        /// Compile-time witness that [`ALL`](Self::ALL) is complete.
+        ///
+        /// Exhaustive, so a new variant fails to compile here; the index must
+        /// then point at a real `ALL` slot or
+        /// `mika2323_every_gate_variant_has_a_wire_name` reddens. Without it,
+        /// `ALL` would be a hand-kept list and a variant could be added —
+        /// correctly named by `wire_name` — while silently escaping every test
+        /// that iterates the vocabulary.
+        fn index_in_all(self) -> usize {
+            match self {
+                Self::NotAMarker => 0,
+                Self::ParseFailed => 1,
+                Self::RepoNotDispatchable => 2,
+                Self::PilotInFlight => 3,
+                Self::NoToken => 4,
+                Self::BodyFetchFailed => 5,
+                Self::SeatMismatch => 6,
+                Self::OperatorHeld => 7,
+                Self::TaskCreateFailed => 8,
+                Self::ToolNotFound => 9,
+                Self::ToolNotLongRunning => 10,
+                Self::DispatchReadinessFailed => 11,
+                Self::CallbackCreateFailed => 12,
+                Self::HandlerNotFound => 13,
+                Self::Dispatched => 14,
+            }
+        }
+    }
+
+    /// Predicates allowed to read the actor identity. **MUST STAY EMPTY.**
+    ///
+    /// Any entry added here is an identity-filtering policy nobody has decided
+    /// (mika#2323 R4; explicitly out of scope in that plan's §9) and requires a
+    /// ticket named in the second member of the pair.
+    ///
+    /// # Why it is born empty, and why it exists at all
+    ///
+    /// The pre-existing violation population is **empty by construction, and
+    /// that was verifiable before a line was written**: the field this detector
+    /// forbids reading did not exist on the agent side — this same change
+    /// introduces it. `GitHubWebhookEvent.sender` was deserialized by the
+    /// gateway and never emitted, so no predicate here *could* read an identity
+    /// it never received. "Land disabled" would have shipped an inert detector
+    /// during precisely the window in which the watched field is born — the one
+    /// moment an accidental read can be introduced.
+    ///
+    /// The self-cleaning assertion below is vacuously true at zero entries. It
+    /// is written now because an allowlist that does not clean itself turns its
+    /// first entry into a permanent permission nobody re-reads, and the moment
+    /// to write that guard is before there is anything to guard.
+    const ACTOR_READING_PREDICATES_ALLOWED: &[(&str, &str)] = &[]; // (function, ticket)
+
+    /// Functions that are *supposed* to handle the actor: the two emission
+    /// sites and the parser itself. Everything else in this module is a
+    /// decision path and must not touch it.
+    const ACTOR_EMISSION_SITES: &[&str] = &[
+        "parse_event_actor",
+        "emit_ready_label_received",
+        "emit_ready_label_outcome",
+    ];
+
+    /// Split the module source into `(fn name, body)` pairs, ignoring the test
+    /// module (which legitimately names the actor everywhere).
+    ///
+    /// **Comments are stripped first**, the same discipline as
+    /// `milestone_manager::no_dispatch_test`: without it a function's "body"
+    /// swallows the doc-comment of the function that follows it, and prose
+    /// describing what is forbidden reads as a violation of it. That is not a
+    /// hypothetical — it is what the first run of this guard reported.
+    fn production_fn_bodies(src: &str) -> Vec<(String, String)> {
+        let production = match src.find("\nmod tests {") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        let stripped: String = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut out = Vec::new();
+        let mut cursor = 0usize;
+        // Bound each body at the NEXT `fn ` at any indentation — `\nfn ` would
+        // miss `pub async fn` and every method inside an `impl`, which is how
+        // the first version of this scan let every body run to the end of file.
+        while let Some(pos) = stripped[cursor..].find("fn ") {
+            let sig_start = cursor + pos + 3;
+            let after = &stripped[sig_start..];
+            let name_end = after.find(['(', '<', ' ']).unwrap_or(after.len());
+            let name = after[..name_end].to_string();
+            let body = match after[name_end..].find("fn ") {
+                Some(next) => &after[name_end..name_end + next],
+                None => &after[name_end..],
+            };
+            out.push((name, body.to_string()));
+            cursor = sig_start + name_end;
+        }
+        out
+    }
+
+    /// The detector proper: which production functions of a given source read
+    /// the actor identity, excluding the declared emission sites.
+    ///
+    /// Extracted from the guard so it can be run against a synthetic source and
+    /// **shown to bite** — a detector whose positive control is only ever the
+    /// real file is a detector nobody has watched fail.
+    fn actor_reading_fns(src: &str) -> Vec<String> {
+        production_fn_bodies(src)
+            .into_iter()
+            .filter(|(name, _)| !ACTOR_EMISSION_SITES.contains(&name.as_str()))
+            // The wrapper resolves the actor and hands it to the two emission
+            // sites; it takes no refusal decision of its own (every gate lives
+            // in `…_inner`), so the binding itself is not a read-in-a-predicate.
+            .filter(|(name, _)| name != "try_handle_ready_label_dispatch_with_fetcher")
+            .filter(|(_, body)| {
+                body.contains("parse_event_actor") || body.contains("LABELED_BY_LINE_PREFIX")
+            })
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    /// Positive control for the guard below (mika#2323).
+    ///
+    /// Without this, `mika2323_no_gate_predicate_reads_the_actor` passing would
+    /// be compatible with a scan that matches nothing at all — the failure mode
+    /// of every source-scan guard, and the one a green test cannot distinguish
+    /// from compliance.
+    #[test]
+    fn mika2323_the_actor_guard_bites_on_a_planted_read() {
+        let planted = r#"
+fn some_refusal_gate(text: &str) -> bool {
+    let actor = parse_event_actor(text);
+    actor == Some("mika-platform-bot")
+}
+
+fn an_innocent_helper(x: u32) -> u32 {
+    x + 1
+}
+
+mod tests {
+    fn this_is_test_code(text: &str) { let _ = parse_event_actor(text); }
+}
+"#;
+        let found = actor_reading_fns(planted);
+        assert_eq!(
+            found,
+            vec!["some_refusal_gate".to_string()],
+            "the guard must catch a predicate reading the actor, must not flag an \
+             unrelated helper, and must not reach into the test module"
+        );
+    }
+
+    /// mika#2323 R4/AC5 — **no refusal predicate reads the actor.**
+    ///
+    /// A source scan, and it has to be: a read of the actor would make no
+    /// decision *wrong*, it would introduce a policy. Every behavioural
+    /// assertion in this crate would stay green while the ready-label handler
+    /// silently acquired the identity filter the founding ticket set out to
+    /// find and did not. Same shape, and same reasoning, as
+    /// `mika2205_periodic_scans_do_not_read_the_pat_field_directly`.
+    ///
+    /// **Resolution when it fires: remove the read.** Adding an allowlist entry
+    /// decides an identity-filtering policy, which is out of scope by
+    /// construction — it needs its own ticket, named in the pair.
+    #[test]
+    fn mika2323_no_gate_predicate_reads_the_actor() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/server/ready_label_handler.rs"),
+        )
+        .expect("the guard must be able to read ready_label_handler.rs");
+
+        let violations = actor_reading_fns(&src);
+
+        let allowed: Vec<&str> = ACTOR_READING_PREDICATES_ALLOWED
+            .iter()
+            .map(|(f, _)| *f)
+            .collect();
+        let unexpected: Vec<&String> = violations
+            .iter()
+            .filter(|v| !allowed.contains(&v.as_str()))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "mika#2323 R4 VIOLATED — these functions read the actor identity: {unexpected:?}. \
+             The actor is informational: no refusal decision may read it, or the handler \
+             acquires the identity filter mika#2323 established does not exist. \
+             Resolution: REMOVE the read. Adding an entry to \
+             ACTOR_READING_PREDICATES_ALLOWED decides a filtering policy and needs its own \
+             ticket."
+        );
+
+        // Self-cleaning half: an allowlist entry that no longer matches a real
+        // violation is a stale permission, and stale permissions are how an
+        // exception outlives the reason for it.
+        for (f, ticket) in ACTOR_READING_PREDICATES_ALLOWED {
+            assert!(
+                violations.iter().any(|v| v == f),
+                "stale allowlist entry {f:?} (ticket {ticket}) — it no longer reads the \
+                 actor; remove the entry"
+            );
+        }
+    }
+
+    /// mika#2323 — the gate names are a WIRE FORMAT.
+    ///
+    /// They land in `audit_events.after_value` and operators `GROUP BY` them
+    /// (mika#2131 doctrine). When this test fires it fires on a **rename**:
+    /// resolution is to revert the rename, or to date the break in `CLAUDE.md`
+    /// — never to update the expectation in silence.
+    #[test]
+    fn mika2323_gate_names_are_a_wire_format() {
+        let expected = [
+            (ReadyLabelGate::NotAMarker, "not_a_marker"),
+            (ReadyLabelGate::ParseFailed, "parse_failed"),
+            (ReadyLabelGate::RepoNotDispatchable, "repo_not_dispatchable"),
+            (ReadyLabelGate::PilotInFlight, "pilot_in_flight"),
+            (ReadyLabelGate::NoToken, "no_token"),
+            (ReadyLabelGate::BodyFetchFailed, "body_fetch_failed"),
+            (ReadyLabelGate::SeatMismatch, "seat_mismatch"),
+            (ReadyLabelGate::OperatorHeld, "operator_held"),
+            (ReadyLabelGate::TaskCreateFailed, "task_create_failed"),
+            (ReadyLabelGate::ToolNotFound, "tool_not_found"),
+            (ReadyLabelGate::ToolNotLongRunning, "tool_not_long_running"),
+            (
+                ReadyLabelGate::DispatchReadinessFailed,
+                "dispatch_readiness_failed",
+            ),
+            (
+                ReadyLabelGate::CallbackCreateFailed,
+                "callback_create_failed",
+            ),
+            (ReadyLabelGate::HandlerNotFound, "handler_not_found"),
+            (ReadyLabelGate::Dispatched, "dispatched"),
+        ];
+        for (gate, name) in expected {
+            assert_eq!(
+                gate.wire_name(),
+                name,
+                "{gate:?} renamed — this value is read by operator SQL; renaming it splits \
+                 one population in two without saying so"
+            );
+        }
+
+        let mut names: Vec<&str> = ReadyLabelGate::ALL.iter().map(|g| g.wire_name()).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(
+            before,
+            names.len(),
+            "two gates share a wire name — a GROUP BY would merge two distinct refusals"
+        );
+    }
+
+    /// mika#2323 R3/AC4 — a new exit cannot stay anonymous.
+    ///
+    /// The real guarantee is the exhaustive `match` in `wire_name` (adding a
+    /// variant is a compile error there). This asserts the second half:
+    /// `ALL` is complete, so a variant cannot be correctly named yet escape
+    /// every test that iterates the vocabulary.
+    #[test]
+    fn mika2323_every_gate_variant_has_a_wire_name() {
+        for (i, gate) in ReadyLabelGate::ALL.iter().enumerate() {
+            assert_eq!(
+                gate.index_in_all(),
+                i,
+                "{gate:?} is not at its declared index in ALL — the list and the witness \
+                 disagree, so ALL can no longer be trusted to be complete"
+            );
+            assert!(
+                !gate.wire_name().is_empty(),
+                "{gate:?} has an empty wire name"
+            );
+        }
+        assert_eq!(
+            ReadyLabelGate::ALL.len(),
+            15,
+            "the handler has fifteen ways out (mika#2323 M3); if that changed, update the \
+             inventory in CLAUDE.md in the same commit"
+        );
+    }
+
+    /// mika#2323 AC7 — appending the actor line breaks neither the marker nor
+    /// the `<repo>#<n>` parse.
+    ///
+    /// This is the compatibility claim the plan makes by reading the code; it
+    /// is asserted here rather than trusted, because the whole of axis 2 rides
+    /// on it.
+    #[test]
+    fn mika2323_actor_line_preserves_the_marker_and_the_parse() {
+        let text = "[GitHub] Issue labeled ready on senara-solutions/mika#2323 — titre\n\
+                    https://github.com/senara-solutions/mika/issues/2323\n\
+                    Labeled by: @samidarko";
+        assert!(
+            text.starts_with(READY_LABEL_DISPATCH_MARKER),
+            "the actor line must be APPENDED — a prefix change would make the handler \
+             stop recognizing its own trigger"
+        );
+        let loc = parse_ready_label_location(text).expect("location must still parse");
+        assert_eq!(loc.owner_repo(), "senara-solutions/mika");
+        assert_eq!(loc.number, 2323);
+        assert_eq!(parse_event_actor(text), Some("samidarko"));
+    }
+
+    /// mika#2323 AC5 — an absent or malformed actor yields `None`, never an
+    /// error, and never changes an outcome.
+    ///
+    /// The negative controls matter more than the positive one: an old gateway
+    /// serving a new agent (or the reverse) must behave exactly as before.
+    #[test]
+    fn mika2323_absent_actor_is_none_never_an_error() {
+        let no_actor = "[GitHub] Issue labeled ready on senara-solutions/mika#2323 — titre\n\
+                        https://github.com/senara-solutions/mika/issues/2323";
+        assert_eq!(
+            parse_event_actor(no_actor),
+            None,
+            "pre-mika#2323 gateway output must read as 'no actor', not as an error"
+        );
+        assert!(
+            parse_ready_label_location(no_actor).is_some(),
+            "and the event must still be handled exactly as before"
+        );
+
+        // Malformed shapes: the prefix without a login, whitespace only, and
+        // the line present but not last (the producer always appends it last,
+        // so anything else is not the contract and must not be trusted).
+        for malformed in [
+            "[GitHub] Issue labeled ready on a/b#1 — t\nLabeled by: @",
+            "[GitHub] Issue labeled ready on a/b#1 — t\nLabeled by: @   ",
+            "[GitHub] Issue labeled ready on a/b#1 — t\nLabeled by: samidarko",
+            "[GitHub] Issue labeled ready on a/b#1 — t\nLabeled by: @sami\nhttps://x/y",
+        ] {
+            assert_eq!(
+                parse_event_actor(malformed),
+                None,
+                "malformed actor line must read as absent, never as a login: {malformed:?}"
+            );
+        }
+    }
+
+    /// The `action` field of the outcome line tracks the three `VerdictAction`
+    /// shapes. Pinned because `gate` and `action` answer different questions
+    /// and an operator reads them together.
+    #[test]
+    fn mika2323_action_label_covers_every_verdict_shape() {
+        assert_eq!(
+            action_label(&VerdictAction::Passthrough { enrichment: None }),
+            "passthrough"
+        );
+        assert_eq!(
+            action_label(&VerdictAction::Handled {
+                pre_digest: String::new()
+            }),
+            "handled"
+        );
+        assert_eq!(
+            action_label(&VerdictAction::Dispatched {
+                pre_digest: String::new(),
+                task_id: String::new()
+            }),
+            "dispatched"
+        );
+    }
 
     // -- blocking-task identification for the failure log (mika#2045) --
 
