@@ -2659,6 +2659,69 @@ mod tests {
         }
     }
 
+    /// mika#2309 § Fire-Disposition surface 3 — **contrôle positif
+    /// auto-nettoyant** sur une divergence vivante, mesurée le 2026-09-18.
+    ///
+    /// # Le fait
+    ///
+    /// `mika_a2a::client::resolve_timeout_secs` ne lit que
+    /// `MIKA_AGENT_TOTAL_TIMEOUT_SECS` dans l'env **du process** ; il ne lit
+    /// jamais le `config.toml` **per-agent**. Or `MIKA_ARCH_CONFIG` pose
+    /// `agent_total_timeout_secs = 900` (mika#2189). Sur un appel vers
+    /// mika-arch, le client résout donc son défaut (600 s) face à une enveloppe
+    /// de 900 s : le plancher `client >= total` de mika#2297 **n'est pas tenu**,
+    /// et le client abandonne une génération que le moteur a encore le droit de
+    /// finir — exactement le sinistre du 11/09 qui a motivé le passage de 300 à
+    /// 600.
+    ///
+    /// # Pourquoi un test qui *constate* au lieu de corriger
+    ///
+    /// Corriger revient à apprendre au client a2a à lire la cascade per-agent,
+    /// c'est-à-dire un changement de **comportement runtime** que mika#2309
+    /// s'interdit en tête (« substrat borné »). Et la forme même est la
+    /// question : le client ne connaît pas l'agent visé au moment où il résout
+    /// son budget. La doctrine (`docs/solutions/best-practices/fire-disposition-doctrine.md`)
+    /// nomme ce cas — la résolution de la violation préexistante *est* la
+    /// question de périmètre — et n'autorise pas à surfacer puis passer à autre
+    /// chose : d'où ce contrôle.
+    ///
+    /// # Ce qu'il fait rougir, et c'est le point
+    ///
+    /// Il lit les **deux valeurs réelles** et affirme l'écart. Il rougit donc le
+    /// jour où l'écart disparaît — valeurs alignées, ou client apprenant à lire
+    /// le per-agent — ce qui force à retirer l'exception au lieu de la laisser
+    /// survivre à sa cause.
+    ///
+    /// # Ticket de suivi
+    ///
+    /// La divergence est remontée dans son propre ticket (portée de lecture du
+    /// plancher mika#2297 face aux cascades per-agent de mika#2189) ; son corps
+    /// intégral est reproduit dans la description de la PR qui livre mika#2309,
+    /// et son numéro s'inscrit ici à son ouverture. **Ce qui est interdit à qui
+    /// lit ce test** : aligner `DEFAULT_TIMEOUT` sur 900, ou faire lire le
+    /// `config.toml` per-agent au client, de sa propre autorité. Les deux
+    /// changent un budget de production.
+    #[test]
+    fn mika2309_client_default_is_below_the_arch_envelope() {
+        let config: toml::Value =
+            toml::from_str(MIKA_ARCH_CONFIG).expect("MIKA_ARCH_CONFIG should be valid TOML");
+        let arch_envelope = config["agent_total_timeout_secs"]
+            .as_integer()
+            .expect("mika-arch declares agent_total_timeout_secs")
+            as u64;
+
+        let client_default = mika_a2a::client::DEFAULT_TIMEOUT.as_secs();
+
+        assert!(
+            client_default < arch_envelope,
+            "mika#2309 surface 3 : l'écart mesuré entre le défaut client a2a \
+             ({client_default}s) et l'enveloppe per-agent de mika-arch \
+             ({arch_envelope}s) a disparu. Ce test est un contrôle positif \
+             auto-nettoyant : s'il rougit, la divergence est résolue et il doit \
+             être RETIRÉ avec son ticket de suivi, pas ajusté."
+        );
+    }
+
     #[test]
     fn test_mika_arch_identity_toml_has_allowlist_and_disabled_tools() {
         let rendered = build_mika_arch_identity(&test_settings_with_kg_roots())

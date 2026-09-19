@@ -37,7 +37,7 @@ impl Tool for SetConfigTool {
                     },
                     "value": {
                         "type": "string",
-                        "description": "Value to set for the key (e.g. 'Asia/Singapore' for timezone, '123456789' for chat_id, 'low'/'medium'/'high'/'off' for thinking_level)"
+                        "description": "Value to set for the key (e.g. 'Asia/Singapore' for timezone, '123456789' for chat_id, 'low'/'medium'/'high'/'off' for thinking_level, '0'-'24' for proactive_daily_budget — the maximum number of unprompted check-ins you may make per day, 0 for none — and an RFC 3339 UTC instant such as '2026-09-20T00:00:00Z' or 'none' for proactive_pause_until, which suspends every unprompted check-in until that moment)"
                     }
                 },
                 "required": ["key", "value"]

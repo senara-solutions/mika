@@ -23,7 +23,7 @@ The Couche Confiance (fidelity) breaks precisely there: **Mika RECOGNIZED the co
 
 ## The four root causes
 
-- **RC-A — history-fetch is global-recency, not per-user.** `Database::load_recent_messages(agent_id, limit)` at `crates/mika-agent/src/db.rs::8117` filters by `agent_id + role != 'summary' + channel_type != 'team'` with `ORDER BY created_at DESC LIMIT ?`. Default limit 30-50. On an active agent, 30 messages = a few hours of traffic, not 6 days. **Between 22 and 28 July, the first serve fell out of the in-context history window.** The LLM had no memory of having served the proverb.
+- **RC-A — history-fetch is global-recency, not per-user.** `Database::load_recent_messages(agent_id, limit)` at `crates/mika-agent/src/db.rs` filters by `agent_id + role != 'summary' + channel_type != 'team'` with `ORDER BY created_at DESC LIMIT ?`. Default limit 30-50. On an active agent, 30 messages = a few hours of traffic, not 6 days. **Between 22 and 28 July, the first serve fell out of the in-context history window.** The LLM had no memory of having served the proverb.
 - **RC-B — no per-user content ledger.** `messages` has no `user_id`/`chat_id`/`correspondent_id`. `people` tracks mentions but no structured content-serves. `core_memory` is `(agent_id, key)` primary key, not `(agent, person)`. Nothing tracks "Mika served X to person Y."
 - **RC-C — under-constrained requests collapse to LLM priors.** "Un proverbe zen" is maximally under-specified. LLMs have a very strong prior on canonical zen quotes ("Avant l'éveil..." is *the* most-cited zen proverb in Western contexts). Same request → same output at high probability. **Out of scope this fix** — deferred until post-deploy signal warrants.
 - **RC-D — no prompt-level dedup discipline.** `prompt.rs` guides "check conversation history and search_memory" but nothing specific to content classes. Fragile per `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate` — prompt-only fails at loop substrate.
@@ -135,4 +135,4 @@ The `/ce:review` multi-agent pass on the first-cut implementation found **7 P1 b
 - Load-bearing memory: `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate` — why structural, not prompt-only.
 - Load-bearing memory: `feedback_interactive_mika_plan_needs_ac_section_no_rename` — AC section preserved verbatim.
 - Post-Conditions #3 (required-tools gate) — `crates/mika-agent/CLAUDE.md` § Post-Conditions.
-- Schema migration pattern: `migrate_v44_to_v45` at `crates/mika-agent/src/db.rs:4495`.
+- Schema migration pattern: `migrate_v44_to_v45` at `crates/mika-agent/src/db.rs`.

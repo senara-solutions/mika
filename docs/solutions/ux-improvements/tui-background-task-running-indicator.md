@@ -16,7 +16,7 @@ The user's perception was driven by the dashboard dot (green/red) being the only
 
 ## Root Cause
 
-`get_user_visible_tasks()` in `db.rs` filters `trigger_type NOT IN ('callback')` by design (see comment at db.rs:3307-3309). Callback tasks are system-internal tasks created by long-running exec handlers. They were never meant to appear in the `[N tasks]` badge. There was simply no separate indicator for them.
+`get_user_visible_tasks()` in `db.rs` filters `trigger_type NOT IN ('callback')` by design (see comment at `db.rs::get_user_visible_tasks`). Callback tasks are system-internal tasks created by long-running exec handlers. They were never meant to appear in the `[N tasks]` badge. There was simply no separate indicator for them.
 
 ## Solution
 

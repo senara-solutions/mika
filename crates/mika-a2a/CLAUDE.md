@@ -21,6 +21,17 @@ signature and gains it; `with_timeout` overrides it, and `RECOVERY_TIMEOUT`
 (30 s) bounds a recovery read. `timeout()` reports what the client actually
 enforces, so an error can name the interval it really spent.
 
+**The policy is guarded, not merely written down (mika#2309).** CI job
+`a2a-timeout-literal-lint` runs `scripts/check-a2a-timeout-literals.sh` over a
+declared perimeter (this crate's `src/`, the two `A2aClient` call sites, and
+`mika-common/src/llm/`): a budget at a bounding site may not be a *literal*
+(`from_secs(600)` and `from_secs(10 * 60)` alike), and a `const … : Duration`
+≥ 60 s must be a `DEFAULT_*` backed by a declared `MIKA_*` env var. The predicate
+is on the **site that bounds**, never on the value — a TTL or a JWT lifetime is
+not a call budget. `crates/mika-agent/tests/a2a_budget_transitivity_2309.rs`
+asserts the full chain `client ≥ total > http` by calling the production
+resolvers; `>` is strict because the code refuses `total == http`.
+
 `TransportFailure` (in `error`) classifies a `reqwest` failure into unreachable /
 timed out / HTTP status / unreadable / interrupted. Its load-bearing question is
 `request_was_sent()`: only an **unreachable** server proves no work exists. Every

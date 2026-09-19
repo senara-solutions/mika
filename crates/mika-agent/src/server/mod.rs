@@ -580,6 +580,7 @@ async fn init_agent(
         // un process neuf re-photographie l'état qu'il trouve et écrit une
         // transition si le STOP est déjà armé au premier tick.
         auto_pull_stop_armed: AtomicBool::new(false),
+        proactive_budget_reported: std::sync::Mutex::new(None),
     });
 
     let task_engine = Arc::new(tokio::sync::Mutex::new(TaskEngine::new(
@@ -1874,6 +1875,7 @@ mod tests {
             settings: test_settings(),
             pr_reviews_posted: None,
             auto_pull_stop_armed: AtomicBool::new(false),
+            proactive_budget_reported: std::sync::Mutex::new(None),
         });
         let engine = Arc::new(tokio::sync::Mutex::new(TaskEngine::new(
             db,
