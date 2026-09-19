@@ -412,7 +412,10 @@ mod tests {
             let err = validate_config_value(PROACTIVE_PAUSE_UNTIL_KEY, value)
                 .expect_err("{value} should be refused");
             assert!(err.contains(PROACTIVE_PAUSE_UNTIL_KEY), "{err}");
-            assert!(err.contains("RFC 3339"), "error must name the domain: {err}");
+            assert!(
+                err.contains("RFC 3339"),
+                "error must name the domain: {err}"
+            );
             assert!(err.contains(PROACTIVE_PAUSE_NONE), "{err}");
         }
     }

@@ -1082,21 +1082,23 @@ const FREQUENCY_ASSERTION_ALTERNATION: &str = r"(?:
     | (?:it'?s|that'?s|it\s+is)\s+(?:fixed|done|sorted)
 )";
 
-static FREQ_ASSERT_THEN_SUBJECT_RE: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| {
+static FREQ_ASSERT_THEN_SUBJECT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
+    || {
         regex::Regex::new(&format!(
             r"(?ix)\b(?P<assert>{FREQUENCY_ASSERTION_ALTERNATION})(?P<gap>[^.!?\n]{{0,{CLAIM_GAP_MAX}}}?)(?P<subj>{FREQUENCY_SUBJECT_ALTERNATION})"
         ))
         .expect("frequency-promise assert-then-subject regex must compile")
-    });
+    },
+);
 
-static FREQ_SUBJECT_THEN_ASSERT_RE: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| {
+static FREQ_SUBJECT_THEN_ASSERT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
+    || {
         regex::Regex::new(&format!(
             r"(?ix)\b(?P<subj>{FREQUENCY_SUBJECT_ALTERNATION})(?P<gap>[^.!?\n]{{0,{CLAIM_GAP_MAX}}}?)(?P<assert>{FREQUENCY_ASSERTION_ALTERNATION})"
         ))
         .expect("frequency-promise subject-then-assert regex must compile")
-    });
+    },
+);
 
 /// Admissions of incapacity. A sentence carrying one is **the answer this
 /// guard exists to make possible**, not a violation of it — so it suppresses,

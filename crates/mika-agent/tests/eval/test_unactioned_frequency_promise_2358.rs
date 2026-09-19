@@ -80,7 +80,10 @@ async fn mika2358_the_measured_promise_is_refused_and_corrected() -> anyhow::Res
     // The promise itself is gone from what the user reads.
     grounding_assertions::assert_response_forbids(
         &trace,
-        &["Je vais corriger ça", "plus aucun message de veille technique"],
+        &[
+            "Je vais corriger ça",
+            "plus aucun message de veille technique",
+        ],
     );
 
     Ok(())
