@@ -18,7 +18,8 @@ use mika_a2a::jsonrpc::{
 };
 use mika_a2a::params::{
     CALLER_SESSION_ID_KEY, EFFECTIVE_MODEL_KEY, MODEL_OVERRIDE_KEY, MessageSendParams,
-    ONLY_SKILLS_KEY, TaskIdParams, TaskQueryParams,
+    ONLY_SKILLS_KEY, SESSION_ISOLATED_APPLIED_KEY, SESSION_ISOLATED_KEY, TaskIdParams,
+    TaskQueryParams,
 };
 use mika_a2a::state_machine::TaskStateMachine;
 use mika_a2a::streaming::{StreamEvent, TaskStatusUpdateEvent};
@@ -254,6 +255,7 @@ async fn run_a2a_agent(
     stream_ctx: Option<Arc<mika_a2a::streaming::ToolCallStreamContext>>,
     only_skills: &[String],
     model_override: Option<&Arc<dyn mika_common::llm::LlmProvider>>,
+    session_isolated: bool,
 ) -> Result<A2aTurn, String> {
     // Hot-reload skills if dirty
     let skills = if agent_state.skills_dirty.load(Ordering::Acquire) {
@@ -346,6 +348,9 @@ async fn run_a2a_agent(
         // mika#2304 D7: when the caller named the model, a matched skill's
         // `[llm]` section must not displace it.
         caller_model_override: model_override.is_some(),
+        // mika#1951: the caller asked to read its own session only. Strictly
+        // subtractive — see the field's doc comment on `AgentParams`.
+        session_isolated,
         trace_id: Some(task_id.to_string()),
         correlated_task_id: None,
         internal: false,
@@ -426,6 +431,84 @@ fn requested_only_skills(params: &MessageSendParams) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Extract the caller's session-isolation request (mika#1951).
+///
+/// # Absence is soft, a malformed value is not
+///
+/// No metadata, key absent, or `null` → `Ok(false)`: no restriction, and the turn
+/// is byte-identical to the one before this key existed. That is the property the
+/// three sister keys already hold, and it is what lets an older and a newer
+/// caller produce the same turn.
+///
+/// Any **present, non-boolean** value → `Err(INVALID_PARAMS)`. It is never read
+/// as `false`. The asymmetry with [`requested_only_skills`] is
+/// [`resolve_caller_model_override`]'s, for the same measured reason: a skill
+/// restriction silently dropped makes a turn *wider*, which is visible and
+/// falsifies no measurement; an isolation silently dropped makes the measurement
+/// **wrong while producing a plausible answer**. mika#1951's founding battery
+/// produced ten contaminated latency samples that looked valid — a silent no-op
+/// here *is* that defect.
+///
+/// `"true"` as a string is the shape a hand-written client is most likely to
+/// send, and it is exactly the one that must not pass: a bench that asked for
+/// isolation and did not get it is the incident, not a nuance.
+fn requested_session_isolation(params: &MessageSendParams) -> Result<bool, JsonRpcError> {
+    let Some(value) = params
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get(SESSION_ISOLATED_KEY))
+    else {
+        return Ok(false);
+    };
+    match value {
+        serde_json::Value::Null => Ok(false),
+        serde_json::Value::Bool(b) => Ok(*b),
+        other => Err(JsonRpcError::with_message(
+            INVALID_PARAMS,
+            format!(
+                "`{SESSION_ISOLATED_KEY}` must be a boolean; got {}. \
+                 A malformed isolation request is refused rather than read as \
+                 `false`: a turn that believes it is isolated and is not \
+                 produces plausible, contaminated measurements (mika#1951).",
+                shape_of(other)
+            ),
+        )),
+    }
+}
+
+/// Name a JSON value's shape for an operator-facing refusal, without echoing it.
+///
+/// The value came from an authenticated caller, but it lands in a JSON-RPC error
+/// that may be logged; naming the type is what the operator needs to fix the
+/// call, and it cannot carry a payload.
+fn shape_of(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// Stamp what the turn **really did** about session isolation onto the Task the
+/// caller receives (mika#1951 U3).
+///
+/// Written on **every** synchronous turn, isolated or not, for the reason
+/// [`stamp_effective_model`] spells out for its own field: without that, absence
+/// would be ambiguous between "this server predates mika#1951" and "no isolation
+/// was asked for", and the client could not safely treat absence as *I do not
+/// know* — which is the whole basis on which it refuses to print its own flag.
+fn stamp_session_isolation(task: &mut Task, isolated: bool) {
+    task.metadata
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(
+            SESSION_ISOLATED_APPLIED_KEY.to_string(),
+            serde_json::Value::Bool(isolated),
+        );
 }
 
 /// Extract the model the caller wants this turn to run under (mika#2304).
@@ -910,6 +993,24 @@ async fn handle_message_send(
         }
     };
 
+    // mika#1951: refused here for the same three reasons as the override above —
+    // before the lock, before the task row, and as a sentence rather than a
+    // `failed` task. A malformed isolation request must cost the caller an error
+    // it can read, not a turn it will misread.
+    let session_isolated = match requested_session_isolation(&params) {
+        Ok(v) => v,
+        Err(err) => {
+            warn!(
+                event = "a2a_session_isolation_refused",
+                agent = %agent_state.db.agent_id(),
+                task_id = %task_id,
+                port = "send",
+                "caller declared `{SESSION_ISOLATED_KEY}` with a non-boolean value — refusing the turn (mika#1951)"
+            );
+            return Json(JsonRpcResponse::error(request.id.clone(), err)).into_response();
+        }
+    };
+
     // Bounded wait for the agent lock (mika#2163). Take a place in the line, then
     // wait in it. The wait lives in the handler because `message/send` is
     // synchronous — the caller is holding the connection open for the completed
@@ -1025,6 +1126,7 @@ async fn handle_message_send(
             None,
             &only_skills,
             caller_model.as_ref(),
+            session_isolated,
         )
         .await
         {
@@ -1077,6 +1179,11 @@ async fn handle_message_send(
                 // already `mut` here and `a2a_build_task` is upstream, so nothing
                 // downstream can overwrite the field.
                 stamp_effective_model(&mut task, effective_model.as_deref());
+                // mika#1951 U3: same intervention point, same reason. The value
+                // is the one this handler *resolved and passed in*, not the flag
+                // the caller sent — and the two are the same only because the
+                // refusal above made every other reading impossible.
+                stamp_session_isolation(&mut task, session_isolated);
                 let result = serde_json::to_value(&task).unwrap_or_default();
                 Json(JsonRpcResponse::success(request.id, result)).into_response()
             }
@@ -1183,6 +1290,25 @@ async fn handle_message_stream(
         }
     };
 
+    // mika#1951: the *request* half is honoured on this port — an isolated
+    // stream is a legitimate thing to ask for, and refusing a malformed value
+    // must still happen before the stream opens (mid-SSE there is no way left to
+    // say "your call was wrong"). The *attestation* half is not, for the reason
+    // stated above for the model: this port serves events, not a rebuilt `Task`.
+    let session_isolated = match requested_session_isolation(&params) {
+        Ok(v) => v,
+        Err(err) => {
+            warn!(
+                event = "a2a_session_isolation_refused",
+                agent = %agent_state.db.agent_id(),
+                task_id = %task_id,
+                port = "stream",
+                "caller declared `{SESSION_ISOLATED_KEY}` with a non-boolean value — refusing the turn (mika#1951)"
+            );
+            return Json(JsonRpcResponse::error(request.id.clone(), err)).into_response();
+        }
+    };
+
     // Create task in DB
     let session_id = match agent_state
         .db
@@ -1235,6 +1361,7 @@ async fn handle_message_stream(
             tx,
             only_skills,
             caller_model,
+            session_isolated,
         };
 
         // The kill-switch path already holds the lock — it was taken in the
@@ -1407,6 +1534,11 @@ struct StreamTurn {
     /// params do not survive the spawn — and the refusal must happen before the
     /// stream opens, so it cannot be deferred here either.
     caller_model: Option<Arc<dyn mika_common::llm::LlmProvider>>,
+    /// The caller's session-isolation request (mika#1951), already validated in
+    /// the handler. Carried for the same reason as its two neighbours: `params`
+    /// does not survive the spawn, and the refusal must land before the stream
+    /// opens — a caller cannot be told mid-SSE that its request was malformed.
+    session_isolated: bool,
 }
 
 /// Run the streaming turn. The guard is taken by value and dropped with this
@@ -1426,6 +1558,7 @@ async fn run_a2a_stream_turn(
         tx,
         only_skills,
         caller_model,
+        session_isolated,
     } = turn;
 
     // Transition to working
@@ -1466,6 +1599,7 @@ async fn run_a2a_stream_turn(
         stream_ctx_for_agent,
         &only_skills,
         caller_model.as_ref(),
+        session_isolated,
     )
     .await
     {
@@ -2233,6 +2367,138 @@ mod tests {
         );
     }
 
+    // ================== mika#1951 — the session-isolation lever ==================
+
+    fn with_isolation(value: serde_json::Value) -> MessageSendParams {
+        params_with_metadata(Some(HashMap::from([(
+            SESSION_ISOLATED_KEY.to_string(),
+            value,
+        )])))
+    }
+
+    /// **Absence is soft.** No metadata, an empty map, the key absent, `null` —
+    /// all read as "no restriction", so an older caller and a newer one produce
+    /// the same turn. That is the property the three sister keys hold, and
+    /// losing it would fail turns from every client that predates this key.
+    #[test]
+    fn mika1951_an_absent_isolation_request_is_no_restriction() {
+        assert!(!requested_session_isolation(&params_with_metadata(None)).unwrap());
+        assert!(!requested_session_isolation(&params_with_metadata(Some(HashMap::new()))).unwrap());
+        assert!(!requested_session_isolation(&with_isolation(serde_json::Value::Null)).unwrap());
+        // A declared `false` is honoured literally — same turn, said explicitly.
+        assert!(!requested_session_isolation(&with_isolation(serde_json::json!(false))).unwrap());
+        assert!(requested_session_isolation(&with_isolation(serde_json::json!(true))).unwrap());
+    }
+
+    /// **Applying it is fail-closed.** A present, non-boolean value refuses the
+    /// turn; it is never read as `false`.
+    ///
+    /// `"true"` and `1` are the shapes a hand-written client is most likely to
+    /// send, and they are exactly the ones that must not pass: a bench that asked
+    /// for isolation and silently did not get it produces plausible, contaminated
+    /// measurements — which is mika#1951 itself, not a nuance of it.
+    #[test]
+    fn mika1951_a_malformed_isolation_request_refuses_the_turn() {
+        for value in [
+            serde_json::json!("true"),
+            serde_json::json!("yes"),
+            serde_json::json!(1),
+            serde_json::json!(0),
+            serde_json::json!([true]),
+            serde_json::json!({ "isolated": true }),
+            serde_json::json!(""),
+        ] {
+            let err = requested_session_isolation(&with_isolation(value.clone()))
+                .expect_err("a non-boolean must refuse the turn, never read as false");
+            assert_eq!(err.code, INVALID_PARAMS, "wrong code for {value}");
+            let message = err.message.clone();
+            assert!(
+                message.contains(SESSION_ISOLATED_KEY),
+                "the refusal must name the key an operator has to fix: {message}"
+            );
+        }
+    }
+
+    /// The refusal names the shape it received and never echoes the value.
+    ///
+    /// It lands in a JSON-RPC error that may be logged; the type is what the
+    /// operator needs to repair the call, and it cannot carry a payload.
+    #[test]
+    fn mika1951_the_refusal_names_the_shape_without_echoing_the_value() {
+        let err = requested_session_isolation(&with_isolation(serde_json::json!("hunter2")))
+            .expect_err("a string must refuse");
+        assert!(err.message.contains("a string"), "{}", err.message);
+        assert!(
+            !err.message.contains("hunter2"),
+            "the refusal must not echo the caller's value: {}",
+            err.message
+        );
+    }
+
+    /// **U3 — the attestation is written on every synchronous turn**, isolated
+    /// or not.
+    ///
+    /// Absence must mean "this server did not attest", which it cannot if the
+    /// server only writes the field when the answer is `true`: the client would
+    /// then be unable to tell a pre-mika#1951 binary from a turn that ran
+    /// unisolated, and printing its own flag in that gap is the false green
+    /// mika#2304 measured on the model field.
+    #[test]
+    fn mika1951_the_attestation_is_written_for_both_verdicts() {
+        for ran_isolated in [true, false] {
+            let mut task = completed_task(Some(agent_reply("ok")));
+            stamp_session_isolation(&mut task, ran_isolated);
+            assert_eq!(
+                mika_a2a::params::attested_session_isolation(&task),
+                Some(ran_isolated),
+                "the server must attest what it did, including when it did nothing"
+            );
+        }
+    }
+
+    /// The attestation is additive: stamping it does not disturb a model
+    /// attestation already on the Task.
+    ///
+    /// The two are written back to back at the same intervention point, on a
+    /// `metadata` map that `a2a_build_task` may already have populated. A
+    /// `metadata = Some(map)` assignment instead of an insert would silently drop
+    /// the other field, and each field's own test would still pass.
+    #[test]
+    fn mika1951_the_two_attestations_coexist() {
+        let mut task = completed_task(Some(agent_reply("ok")));
+        stamp_effective_model(&mut task, Some("openrouter/z-ai/glm-5.3"));
+        stamp_session_isolation(&mut task, true);
+        assert_eq!(
+            mika_a2a::params::attested_model(&task),
+            Some("openrouter/z-ai/glm-5.3")
+        );
+        assert_eq!(
+            mika_a2a::params::attested_session_isolation(&task),
+            Some(true)
+        );
+    }
+
+    /// **The bool reaches the loop, and it is read at exactly two sites.**
+    ///
+    /// The plan's Definition of Done says `AgentParams.session_isolated` is read
+    /// at the scoped-session resolution and the summary gate *and nowhere else*.
+    /// A third reader would not make any decision wrong on its own — it would
+    /// widen what "isolated" silently means, which no behavioural test can see.
+    /// Hence a lexical guard, on production source only.
+    #[test]
+    fn mika1951_the_isolation_flag_has_exactly_two_readers_in_the_loop() {
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let source = scanner.production_of(&scanner.src_root().join("agent_loop/mod.rs"));
+        let reads = source.matches("params.session_isolated").count();
+        assert_eq!(
+            reads, 2,
+            "expected exactly two read sites (the scope resolution and the summary \
+             gate), found {reads} — a third would widen what isolation means \
+             without failing any assertion about either channel"
+        );
+    }
+
     // ===================== mika#2304 — the model override =====================
 
     fn openrouter_settings(api_key: Option<&str>) -> mika_common::config::Settings {
@@ -2461,8 +2727,15 @@ mod tests {
     fn mika2304_both_ports_resolve_the_override_before_creating_a_task() {
         // `concat!` again: the needles must not be found in this test's own body.
         const RESOLVE_SITE: &str = concat!("resolve_caller_model_override", "(agent_state");
+        // Anchored on the override resolution so the count is this key's refusal
+        // alone: the same `return` also answers a malformed
+        // `mika.session_isolated` (mika#1951), which is a different refusal.
         const REFUSAL_SITE: &str = concat!(
-            "return Json(JsonRpcResponse::error(request.id.clone(), ",
+            "resolve_caller_model_override",
+            "(agent_state, &params, &task_id) {\n",
+            "        Ok(p) => p,\n",
+            "        Err(err) => {\n",
+            "            return Json(JsonRpcResponse::error(request.id.clone(), ",
             "err)).into_response();"
         );
 

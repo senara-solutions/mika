@@ -4052,6 +4052,28 @@ pub struct AgentParams<'a> {
     /// place for the two to disagree. `false` everywhere else, including the team
     /// path, which reads `TeamAgentParams` and so cannot see this field at all.
     pub caller_model_override: bool,
+    /// This turn's caller asked to read its own session only (mika#1951).
+    ///
+    /// `true` only when a `message/send` carried `mika.session_isolated = true`.
+    /// It closes **both** cross-session channels for this turn and no other:
+    /// the conversation window is scoped to `session_id`, and no compaction
+    /// summary is injected. `false` everywhere else, including the team path,
+    /// which reads `TeamAgentParams` and so cannot see this field at all.
+    ///
+    /// **Strictly subtractive, and that is a safety property rather than a
+    /// style.** A caller may only ever *narrow* the window. Carrying a scope
+    /// name here instead would let any authenticated caller of `/a2a/{agent}`
+    /// widen mika-arch back to an agent-wide window and make it read other
+    /// tickets' plans — mika#2295 and mika#2305 reopened through the network
+    /// door. A bool makes that inexpressible instead of merely refused.
+    ///
+    /// **A `bool` and not a mutated `Identity`.** `ctx.identity` is a shared
+    /// reference; cloning a mutated copy per turn would put the per-turn
+    /// decision into a structure other turns read, which is the "wrote into the
+    /// cache" class mika#2363 had to hold shut with a lexical test. The two read
+    /// sites are the scoped-session resolution and the `load_gated_summary`
+    /// call, and there are no others.
+    pub session_isolated: bool,
     /// Optional external trace_id (e.g. from HTTP request_id). If None, a new one is generated.
     pub trace_id: Option<String>,
     /// Optional task_id for observability correlation. When a `mika ask` call is associated
@@ -4288,7 +4310,18 @@ async fn run_agent_inner(
 
     // Axis 4 + Axis 3 summary gate (mika#1019, mika#1021).
     // Conversation mode: silent_trigger is None — Axis 3 cap does not fire.
-    if let Some(content) = load_gated_summary(db, &ctx.identity.context.summary, None).await? {
+    //
+    // mika#1951, read site 1 of 2. The compaction summary is keyed on `agent_id`
+    // alone (`Database::load_conversation_summary`), so it crosses every session
+    // by construction. An isolated turn must close this channel too: closing the
+    // window alone would ship an isolation whose partiality is invisible until a
+    // bench runs long enough to compact.
+    let summary_config = if params.session_isolated {
+        &SUPPRESSED_SUMMARY
+    } else {
+        &ctx.identity.context.summary
+    };
+    if let Some(content) = load_gated_summary(db, summary_config, None).await? {
         system.push_str("\n## Conversation Summary\n");
         system.push_str("<context type=\"summary\" trust=\"data\">\n");
         system.push_str(&content);
@@ -4463,7 +4496,18 @@ async fn run_agent_inner(
     record_withheld_images(db, session_id, trace_id, scope_task_id, &image_disposition).await;
 
     let history_config = &ctx.identity.context.history;
-    let scoped_session_id = match history_config.scope {
+    // mika#1951, read site 2 of 2. The caller may narrow this turn's scope to its
+    // own session; it may never widen it. The branch only ever *replaces* a
+    // declared scope with the narrower one, so an agent already declaring
+    // `session` (mika-arch) cannot be pushed back to `agent` from the network
+    // whatever a caller sends. That asymmetry is why the wire key is a bool: the
+    // widening request has no spelling.
+    let effective_scope = if params.session_isolated {
+        prompt::HistoryScope::Session
+    } else {
+        history_config.scope
+    };
+    let scoped_session_id = match effective_scope {
         prompt::HistoryScope::Session => Some(session_id),
         prompt::HistoryScope::Agent => None,
     };
@@ -4492,7 +4536,13 @@ async fn run_agent_inner(
         "conversation",
         &build_context_window_fields(
             &history,
-            history_config.scope,
+            // mika#1951 — the instrument reports the scope that DECIDED this
+            // window, which for an isolated turn is the caller's, not the
+            // identity's. Reporting `history_config.scope` here would make the
+            // event say `agent` about a window that really was filtered — the
+            // mika#2305 defect with the sign flipped, and it would break the
+            // post-deploy probe that reads exactly this field.
+            effective_scope,
             &skill_tool_defs,
             truncation.truncated_messages,
             truncation.truncated_bytes,
@@ -4974,6 +5024,20 @@ async fn persist_deadline_fallback(
 }
 
 // -- Summary Gating (Axis 4 + Axis 3) --
+
+/// The summary configuration an isolated turn is read under (mika#1951).
+///
+/// `inject = false` is [`load_gated_summary`]'s Axis-4 **load-prevention** gate:
+/// the summary is not read from the database, not deserialized, and not
+/// available to anything downstream in the same turn. Substituting this config
+/// is therefore the whole of "no summary for this turn", and it is done by
+/// passing a different `&ContextSummaryConfig` rather than by mutating
+/// `ctx.identity` — which is shared, and whose per-turn mutation would leak this
+/// turn's decision into the next one's.
+static SUPPRESSED_SUMMARY: prompt::ContextSummaryConfig = prompt::ContextSummaryConfig {
+    inject: false,
+    max_tokens: None,
+};
 
 /// Load the conversational summary for injection into the system prompt,
 /// applying Axis 4 (load-prevention) and Axis 3 (mode-conditional cap)
