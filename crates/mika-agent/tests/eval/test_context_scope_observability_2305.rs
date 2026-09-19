@@ -75,25 +75,35 @@ impl tracing::field::Visit for FieldVisitor<'_> {
     }
 }
 
-/// A dispatcher registered for the life of the test process, so the scoped one
-/// below is never the only one.
+/// A dispatcher kept alive for the whole test binary, so that ours is never the
+/// only live one.
 ///
-/// tracing-core caches a callsite's interest at its first hit. While exactly one
-/// dispatcher is registered, that first computation consults the *hitting
-/// thread's* default — so another `eval` test that first reaches
-/// `emit_context_window_assembled` on its own thread, while this guard is the
-/// lone registered dispatcher, caches `never` for the whole process and this test
-/// captures zero events. With two registered, the computation iterates the
-/// registry instead and sees the capturing subscriber.
-static PINNED_DISPATCH: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+/// `tracing-core` (0.1.36, `callsite.rs` `register_dispatch`) flips into a
+/// "just one dispatcher" mode whenever a single scoped dispatcher is alive. In
+/// that mode a callsite registered for the first time computes its interest
+/// from the *registering thread's* default. The `context_window_assembled`
+/// callsite is hit by every eval test that runs a turn, most of them on other
+/// threads with no subscriber: whichever gets there first while our capture is
+/// the lone dispatcher caches `Interest::never` for everyone, and this thread
+/// then skips the event — zero events captured, 8 runs in 25 under
+/// `--features telemetry`. A second live dispatcher keeps the registry in its
+/// multi-dispatcher mode, where interest is derived from every live dispatcher
+/// (`never` from this one, `always` from ours → `sometimes`, decided per event
+/// by the current thread's subscriber).
+fn keep_registry_multi_dispatcher() {
+    static KEEPER: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    KEEPER.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+}
 
 fn capture() -> (tracing::subscriber::DefaultGuard, Captured) {
     use tracing_subscriber::layer::SubscriberExt;
-    PINNED_DISPATCH.get_or_init(|| tracing::Dispatch::new(tracing_subscriber::registry()));
+    keep_registry_multi_dispatcher();
     let events: Captured = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::registry().with(CapturingLayer {
         events: Arc::clone(&events),
     });
+    // Registering our dispatcher rebuilds every cached interest against all live
+    // dispatchers, which clears a `never` cached before this test started.
     let guard = tracing::subscriber::set_default(subscriber);
     (guard, events)
 }

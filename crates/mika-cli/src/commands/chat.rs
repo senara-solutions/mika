@@ -216,6 +216,7 @@ async fn spawn_agent_worker(
         settings: ctx.settings.clone(),
         pr_reviews_posted: None, // CLI mode: no session-scoped dedup needed
         auto_pull_stop_armed: AtomicBool::new(false),
+        proactive_budget_reported: std::sync::Mutex::new(None),
     });
     let task_engine = Arc::new(tokio::sync::Mutex::new(TaskEngine::new(
         ctx.async_db.clone(),

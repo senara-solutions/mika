@@ -41,7 +41,7 @@ voir aucune preuve — et elle ne l'avait jamais pu.
 ## Problème
 
 La porte de provenance de grooming (#1620, `has_completed_groom_for_issue`,
-`crates/mika-agent/src/db.rs:9541`) exigeait une ligne `tasks` avec
+`crates/mika-agent/src/db.rs`) exigeait une ligne `tasks` avec
 `dispatch_class='groom'`, un statut terminal, et un `reference_url` égal à
 `<issue_url>?phase=groom`. Aucun producteur de grooming en production ne peut
 laisser une telle ligne :
@@ -113,7 +113,7 @@ producteurs**, sous neuf conditions dont : lecture seule, fail-closed sur tout
 cas dégradé, un seul point de vérité pour tous les producteurs, test
 anti-récursion rouge-avant bloquant, pas de `INSERT` SQL brut dans les tests.
 
-**1. La preuve est la ligne callback, jointe à son parent** (`crates/mika-agent/src/db.rs:9541-9570`) :
+**1. La preuve est la ligne callback, jointe à son parent** (`crates/mika-agent/src/db.rs::has_completed_groom_for_issue`) :
 
 ```sql
 SELECT COUNT(*) FROM tasks child
@@ -185,7 +185,7 @@ que le bypass rendait inutile de tenter.
 
 - **Demi-vie de 30 jours, sur deux lignes.** `prune_completed_tasks(THIRTY_DAYS_SECS)`
   (`crates/mika-agent/src/task_engine/mod.rs:27-28`) purge parent et callback ;
-  `parent_task_id … ON DELETE SET NULL` (`crates/mika-agent/src/db.rs:1422`) casse la jointure dès que
+  `parent_task_id … ON DELETE SET NULL` (`crates/mika-agent/src/db.rs`) casse la jointure dès que
   *l'une* des deux est purgée. La porte est consultée par **chaque** dispatch
   dev-pilot sur l'issue, y compris les relances `block[ac]`/`block[ci]` du
   verdict_handler : une PR en revue plus de 30 jours après son grooming perd ses

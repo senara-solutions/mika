@@ -146,6 +146,7 @@ fn dispatcher_with_llm(
         settings: mika_common::config::Settings::test_defaults(),
         pr_reviews_posted: None,
         auto_pull_stop_armed: AtomicBool::new(false),
+        proactive_budget_reported: std::sync::Mutex::new(None),
     })
 }
 
