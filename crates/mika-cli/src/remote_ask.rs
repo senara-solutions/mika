@@ -21,7 +21,8 @@ use mika_a2a::error::TransportFailure;
 pub use mika_a2a::render::{EmptyKind, TaskRenderEmpty};
 use mika_a2a::{A2aError, Message, MessageSendParams, Part, Role, Task, TaskState};
 pub use mika_a2a::{
-    CALLER_SESSION_ID_KEY, EFFECTIVE_MODEL_KEY, MODEL_OVERRIDE_KEY, ONLY_SKILLS_KEY, attested_model,
+    CALLER_SESSION_ID_KEY, EFFECTIVE_MODEL_KEY, MODEL_OVERRIDE_KEY, ONLY_SKILLS_KEY,
+    SESSION_ISOLATED_APPLIED_KEY, SESSION_ISOLATED_KEY, attested_model, attested_session_isolation,
 };
 use uuid::Uuid;
 
@@ -229,16 +230,32 @@ pub fn render_task_parts(task: &Task) -> Result<String, TaskRenderEmpty> {
 /// send an id resolved against the wrong provider — a second false green,
 /// quieter than the first.
 ///
-/// The three metadata keys are independent and any may be absent. When all are,
+/// `session_isolated` asks the server to run this one turn under a
+/// session-scoped conversation window with no compaction summary, under
+/// [`SESSION_ISOLATED_KEY`] (mika#1951). `false` leaves the key **absent**
+/// rather than posting `false`: absent and `false` mean the same thing to the
+/// server, and absent is the shape that keeps a non-declaring caller
+/// byte-identical to one that predates the key.
+///
+/// The four metadata keys are independent and any may be absent. When all are,
 /// `metadata` itself stays absent so the serialized body is byte-identical to
 /// the pre-mika#2070 shape — the property that makes a caller declaring nothing
 /// indistinguishable from a caller that predates these keys.
+///
+/// **This is the single site where `mika ask`'s request metadata is built, and
+/// that is what makes the isolation flag reach both doors.** Since mika#1727 the
+/// default path is an A2A client too, so it and `--remote` both arrive here
+/// through [`send_message_to_agent`]. mika#2304 had to repair exactly that half
+/// after a fix aimed only at `--remote`; posting the key here gives it to both,
+/// and `mika1951_both_ask_doors_post_the_isolation_key_through_one_site` asserts
+/// it rather than assuming it.
 fn build_send_params(
     message: &str,
     caller_session_id: Option<&str>,
     context_id: &str,
     only_skills: &[String],
     model_override: Option<&str>,
+    session_isolated: bool,
 ) -> MessageSendParams {
     let mut fields = std::collections::HashMap::new();
     if let Some(sid) = caller_session_id {
@@ -256,6 +273,14 @@ fn build_send_params(
         fields.insert(
             MODEL_OVERRIDE_KEY.to_string(),
             serde_json::Value::String(model.to_string()),
+        );
+    }
+    if session_isolated {
+        // A JSON bool, which is the one shape the server reads; anything else
+        // fails the request rather than degrading to "not isolated" (mika#1951).
+        fields.insert(
+            SESSION_ISOLATED_KEY.to_string(),
+            serde_json::Value::Bool(true),
         );
     }
     let metadata = if fields.is_empty() {
@@ -401,6 +426,7 @@ pub async fn send_message_to_agent(
     caller_session_id: Option<&str>,
     only_skills: &[String],
     model_override: Option<&str>,
+    session_isolated: bool,
 ) -> Result<Task> {
     let auth_token = std::env::var("MIKA_INTERNAL_TOKEN")
         .ok()
@@ -419,6 +445,7 @@ pub async fn send_message_to_agent(
             &context_id,
             only_skills,
             model_override,
+            session_isolated,
         ))
         .await
     {
@@ -526,14 +553,16 @@ pub async fn dispatch_remote(
     format: OutputFormat,
     verbose: bool,
     model_override: Option<&str>,
+    session_isolated: bool,
 ) -> Result<String> {
     // Fail-fast URL validation. A2aClient itself doesn't pre-parse, so an invalid
     // URL would surface as a reqwest send error — a less actionable message.
     reqwest::Url::parse(remote_url)
         .with_context(|| format!("invalid --remote URL: {remote_url}"))?;
 
-    // Two of the three `mika.*` keys are deliberately NOT sent on this path; the
-    // third is (mika#2304). What separates them is what each one *names*.
+    // Two of the four `mika.*` keys are deliberately NOT sent on this path; the
+    // other two are (mika#2304, mika#1951). What separates them is what each one
+    // *names*.
     //
     // `--remote` sends no caller session id (mika#2070). The local bookkeeping
     // session lives in this machine's database; a remote agent normally holds a
@@ -558,7 +587,22 @@ pub async fn dispatch_remote(
     // cannot serve fails the request with a sentence naming the model and the
     // provider — the ticket's own fallback option ("faire échouer avec un
     // message clair"), reached without giving up the capability.
-    let task = send_message_to_agent(message, remote_url, None, &[], model_override).await?;
+    //
+    // `--isolated` travels for the same reason (mika#1951): it names nothing
+    // local. It is a property the caller asks of the turn — read your history
+    // session-scoped, inject no summary — and it is meaningful against any
+    // agent, on any host, without this machine knowing that agent's identity.
+    // It is also strictly restrictive by the shape of its wire value, so
+    // sending it to a remote agent cannot widen anything there.
+    let task = send_message_to_agent(
+        message,
+        remote_url,
+        None,
+        &[],
+        model_override,
+        session_isolated,
+    )
+    .await?;
     render(&task, format, verbose)
 }
 
@@ -572,8 +616,17 @@ pub async fn run_remote(
     format: OutputFormat,
     verbose: bool,
     model_override: Option<&str>,
+    session_isolated: bool,
 ) -> Result<()> {
-    let output = dispatch_remote(message, remote_url, format, verbose, model_override).await?;
+    let output = dispatch_remote(
+        message,
+        remote_url,
+        format,
+        verbose,
+        model_override,
+        session_isolated,
+    )
+    .await?;
     println!("{output}");
     Ok(())
 }
@@ -596,6 +649,12 @@ pub async fn run_remote(
 fn render(task: &Task, format: OutputFormat, verbose: bool) -> Result<String> {
     let rendered = render_task_parts(task)?;
     let model = attested_model(task);
+    // mika#1951: the isolation reported is the server's, read the same way the
+    // model is, and for the same reason. The flag this process was passed is
+    // never consulted here — a spirit that ignored the key would otherwise be
+    // reported as isolated, which is the false green that makes a contaminated
+    // bench look valid.
+    let isolated = attested_session_isolation(task);
     Ok(match format {
         OutputFormat::Text => {
             if verbose {
@@ -605,6 +664,13 @@ fn render(task: &Task, format: OutputFormat, verbose: bool) -> Result<String> {
                     None => {
                         out.push('\n');
                         out.push_str(NO_ATTESTATION_LINE);
+                    }
+                }
+                match isolated {
+                    Some(v) => out.push_str(&format!("\nisolated: {v}")),
+                    None => {
+                        out.push('\n');
+                        out.push_str(NO_ISOLATION_ATTESTATION_LINE);
                     }
                 }
                 out
@@ -626,6 +692,9 @@ fn render(task: &Task, format: OutputFormat, verbose: bool) -> Result<String> {
                 if let Some(m) = model {
                     metadata["model"] = serde_json::Value::String(m.to_string());
                 }
+                if let Some(v) = isolated {
+                    metadata["isolated"] = serde_json::Value::Bool(v);
+                }
                 response["metadata"] = metadata;
             }
             serde_json::to_string(&response)?
@@ -639,6 +708,19 @@ fn render(task: &Task, format: OutputFormat, verbose: bool) -> Result<String> {
 /// same thing: the two surfaces answer the same question, and two wordings would
 /// read as two different situations.
 pub const NO_ATTESTATION_LINE: &str = "model: (not attested by the server)";
+
+/// What text mode says when the server attested no session isolation
+/// (mika#1951, U3).
+///
+/// The sibling of [`NO_ATTESTATION_LINE`], named for the same reason: both
+/// `--remote` and `commands::ask` must say the same thing, and two wordings
+/// would read as two different situations.
+///
+/// **It is what a caller sees against a server that predates the key** — the
+/// population where echoing the local `--isolated` flag would assert an
+/// isolation that did not happen. Absence is rendered as absence; it is never a
+/// fallback to what this process asked for.
+pub const NO_ISOLATION_ATTESTATION_LINE: &str = "isolated: (not attested by the server)";
 
 #[cfg(test)]
 mod tests {
@@ -898,7 +980,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_url_fails_fast_with_clear_error() {
-        let err = dispatch_remote("hi", "not-a-url", OutputFormat::Text, false, None)
+        let err = dispatch_remote("hi", "not-a-url", OutputFormat::Text, false, None, false)
             .await
             .expect_err("should fail on invalid URL");
         let chain = format!("{err:#}");
@@ -921,9 +1003,14 @@ mod tests {
         let s = render(&task, OutputFormat::Text, true).unwrap();
         // mika#2304: the verbose trailer always carries a model line; with no
         // server attestation it says so rather than printing a local value.
+        // mika#1951 adds the isolation line under the same rule — a bare `Task`
+        // attests neither, so both lines state the absence.
         assert_eq!(
             s,
-            format!("ok\n\nremote_task_id: task-test\n{NO_ATTESTATION_LINE}")
+            format!(
+                "ok\n\nremote_task_id: task-test\n{NO_ATTESTATION_LINE}\n\
+                 {NO_ISOLATION_ATTESTATION_LINE}"
+            )
         );
     }
 
@@ -1087,7 +1174,7 @@ mod tests {
 
     #[test]
     fn send_params_carry_the_caller_session_id() {
-        let params = build_send_params("hello", Some("rt005-c1-r7"), "ctx-1", &[], None);
+        let params = build_send_params("hello", Some("rt005-c1-r7"), "ctx-1", &[], None, false);
         let metadata = params.metadata.expect("metadata should be present");
         assert_eq!(metadata.len(), 1);
         assert_eq!(
@@ -1098,7 +1185,7 @@ mod tests {
 
     #[test]
     fn send_params_without_a_session_serialize_without_metadata() {
-        let params = build_send_params("hello", None, "ctx-1", &[], None);
+        let params = build_send_params("hello", None, "ctx-1", &[], None, false);
         assert!(params.metadata.is_none());
         // The pre-mika#2070 body shape is preserved byte-for-byte: `metadata` is
         // `skip_serializing_if = "Option::is_none"`, so the key must be absent
@@ -1115,7 +1202,7 @@ mod tests {
     #[test]
     fn send_params_carry_only_skills_as_an_array_of_strings() {
         let only = vec!["mika-arch-groom-ticket".to_string()];
-        let params = build_send_params("hello", None, "ctx-1", &only, None);
+        let params = build_send_params("hello", None, "ctx-1", &only, None, false);
         let body = serde_json::to_value(&params).unwrap();
         assert_eq!(
             body["metadata"][ONLY_SKILLS_KEY],
@@ -1130,7 +1217,7 @@ mod tests {
         // Both halves present is the `_arch_ask` shape: a session to continue and
         // a pass to declare. Neither key may shadow the other.
         let only = vec!["mika-arch-second-review".to_string()];
-        let params = build_send_params("hello", Some("sess-7"), "ctx-1", &only, None);
+        let params = build_send_params("hello", Some("sess-7"), "ctx-1", &only, None, false);
         let metadata = params.metadata.expect("metadata should be present");
         assert_eq!(metadata.len(), 2);
         assert_eq!(
@@ -1271,7 +1358,7 @@ mod tests {
         // R3: a caller that declares nothing must produce the pre-mika#2363 body.
         // An empty array on the wire would be a different statement — and one the
         // server would have to decide the meaning of.
-        let params = build_send_params("hello", Some("sess-7"), "ctx-1", &[], None);
+        let params = build_send_params("hello", Some("sess-7"), "ctx-1", &[], None, false);
         let body = serde_json::to_value(&params).unwrap();
         assert!(
             body["metadata"].get(ONLY_SKILLS_KEY).is_none(),
@@ -1289,7 +1376,7 @@ mod tests {
         // `sonnet` is an alias and `moonshotai/kimi-k2.5` is vendor-prefixed:
         // between them they cover both transformations the server owns.
         for raw in ["sonnet", "moonshotai/kimi-k2.5"] {
-            let params = build_send_params("hello", None, "ctx-1", &[], Some(raw));
+            let params = build_send_params("hello", None, "ctx-1", &[], Some(raw), false);
             let body = serde_json::to_value(&params).unwrap();
             assert_eq!(
                 body["metadata"][MODEL_OVERRIDE_KEY],
@@ -1311,6 +1398,7 @@ mod tests {
             "ctx-1",
             &only,
             Some("moonshotai/kimi-k2.5"),
+            false,
         );
         let metadata = params.metadata.expect("metadata should be present");
         assert_eq!(metadata.len(), 3);
@@ -1329,7 +1417,7 @@ mod tests {
     /// pre-mika#2070 body, byte for byte: `metadata` absent, not `null`.
     #[test]
     fn declaring_no_key_at_all_leaves_metadata_absent() {
-        let params = build_send_params("hello", None, "ctx-1", &[], None);
+        let params = build_send_params("hello", None, "ctx-1", &[], None, false);
         let body = serde_json::to_value(&params).unwrap();
         assert!(
             body.get("metadata").is_none(),
@@ -1340,7 +1428,7 @@ mod tests {
     /// A model override alone must not drag the other two keys along.
     #[test]
     fn a_model_override_alone_carries_only_its_own_key() {
-        let params = build_send_params("hello", None, "ctx-1", &[], Some("sonnet"));
+        let params = build_send_params("hello", None, "ctx-1", &[], Some("sonnet"), false);
         let metadata = params.metadata.expect("metadata should be present");
         assert_eq!(metadata.len(), 1);
         assert!(metadata.contains_key(MODEL_OVERRIDE_KEY));
@@ -1411,5 +1499,230 @@ mod tests {
         let json = render(&task, OutputFormat::Json, false).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(v.get("metadata").is_none(), "unexpected metadata in {v}");
+    }
+
+    // --- mika#1951 U2: the isolation lever on the wire -------------------------
+
+    /// **U2, the wire shape.** The server reads a JSON **bool**; any other shape
+    /// fails the request rather than degrading to "not isolated". A string
+    /// `"true"` here would turn the flag into a refusal, and a number into a
+    /// refusal too — both of which are better than a silent no-op, but neither
+    /// is the flag working.
+    #[test]
+    fn mika1951_send_params_carry_the_isolation_flag_as_a_json_bool() {
+        let params = build_send_params("hello", None, "ctx-1", &[], None, true);
+        let body = serde_json::to_value(&params).unwrap();
+        assert_eq!(
+            body["metadata"][SESSION_ISOLATED_KEY],
+            serde_json::Value::Bool(true),
+            "the server reads a bool; any other shape fails the request: {body}"
+        );
+    }
+
+    /// **U2, the absent half.** `--isolated` unset leaves the key **absent**, not
+    /// `false`. Both mean the same thing to the server, but only absence keeps a
+    /// non-declaring caller byte-identical to one that predates the key — the
+    /// property the three sister keys already have.
+    #[test]
+    fn mika1951_an_unisolated_call_leaves_the_key_absent_entirely() {
+        let params = build_send_params("hello", None, "ctx-1", &[], None, false);
+        let body = serde_json::to_value(&params).unwrap();
+        assert!(
+            body.get("metadata").is_none(),
+            "an unisolated call must not post a `false`: {body}"
+        );
+
+        // And it must not appear beside a sister key either — a `false` riding
+        // along on an otherwise-populated envelope would be just as much a
+        // change of shape, only harder to see.
+        let params = build_send_params("hello", Some("sess-7"), "ctx-1", &[], None, false);
+        let metadata = params.metadata.expect("metadata should be present");
+        assert!(
+            !metadata.contains_key(SESSION_ISOLATED_KEY),
+            "unexpected isolation key in {metadata:?}"
+        );
+    }
+
+    /// **U2, independence.** With all four keys present none shadows another.
+    /// The direct continuation of `the_three_metadata_keys_are_independent`.
+    #[test]
+    fn mika1951_the_four_metadata_keys_are_independent() {
+        let only = vec!["mika-arch-second-review".to_string()];
+        let params = build_send_params(
+            "hello",
+            Some("sess-7"),
+            "ctx-1",
+            &only,
+            Some("moonshotai/kimi-k2.5"),
+            true,
+        );
+        let metadata = params.metadata.expect("metadata should be present");
+        assert_eq!(metadata.len(), 4);
+        assert_eq!(
+            metadata.get(CALLER_SESSION_ID_KEY).and_then(|v| v.as_str()),
+            Some("sess-7")
+        );
+        assert!(metadata.contains_key(ONLY_SKILLS_KEY));
+        assert_eq!(
+            metadata.get(MODEL_OVERRIDE_KEY).and_then(|v| v.as_str()),
+            Some("moonshotai/kimi-k2.5")
+        );
+        assert_eq!(
+            metadata.get(SESSION_ISOLATED_KEY).and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    /// An isolation request alone must not drag the other three keys along.
+    #[test]
+    fn mika1951_the_isolation_flag_alone_carries_only_its_own_key() {
+        let params = build_send_params("hello", None, "ctx-1", &[], None, true);
+        let metadata = params.metadata.expect("metadata should be present");
+        assert_eq!(metadata.len(), 1);
+        assert!(metadata.contains_key(SESSION_ISOLATED_KEY));
+    }
+
+    /// **Both doors post the key, and it is asserted rather than assumed.**
+    ///
+    /// The plan says so in as many words, because mika#2304 had to be repaired
+    /// once for exactly this: a fix aimed at `--remote` left the default path —
+    /// an A2A client too since mika#1727 — silently dropping the flag. The
+    /// property that prevents the recurrence is structural: `build_send_params`
+    /// is called from **one** place, `send_message_to_agent`, which both doors
+    /// reach. A behavioural test cannot see a second construction site; it would
+    /// stay green while a new door posted no key at all.
+    #[test]
+    fn mika1951_both_ask_doors_post_the_isolation_key_through_one_site() {
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let source = scanner.production_of(&scanner.src_root().join("remote_ask.rs"));
+
+        // One definition, one call. The definition line is `fn build_send_params(`;
+        // the single call is inside `send_message_to_agent`.
+        let definitions = source.matches("fn build_send_params(").count();
+        let calls = source.matches("build_send_params(").count() - definitions;
+        assert_eq!(definitions, 1, "found {definitions} definitions");
+        assert_eq!(
+            calls, 1,
+            "expected exactly one production call site (inside \
+             `send_message_to_agent`, which both `mika ask` doors reach), found \
+             {calls} — a second one is a door that can drift out of sync, which \
+             is the mika#2304 recurrence this guard exists to refuse"
+        );
+
+        // And that single site is inside `send_message_to_agent`: a call moved
+        // into some other helper would keep the count at one while breaking the
+        // property the count stands for.
+        let sender = source
+            .split_once("pub async fn send_message_to_agent(")
+            .map(|(_, rest)| rest)
+            .expect("send_message_to_agent must exist in production source");
+        assert!(
+            sender
+                .split_once("\npub ")
+                .map_or(sender, |(body, _)| body)
+                .contains("build_send_params("),
+            "the one call site must live inside `send_message_to_agent`"
+        );
+    }
+
+    // --- mika#1951 U3: the CLI never claims an isolation it was not told ------
+
+    fn task_attesting_isolation(isolated: Option<bool>) -> Task {
+        let mut task = task_with_text("ok");
+        if let Some(v) = isolated {
+            task.metadata = Some(std::collections::HashMap::from([(
+                SESSION_ISOLATED_APPLIED_KEY.to_string(),
+                serde_json::Value::Bool(v),
+            )]));
+        }
+        task
+    }
+
+    /// **U3, positive — and both values matter.** `true` is the bench's green;
+    /// `false` is the answer a server gives when it understood the question and
+    /// did not isolate. Rendering only the first would leave `false` and "not
+    /// attested" indistinguishable, which is the conflation this whole unit
+    /// exists to remove.
+    #[test]
+    fn mika1951_verbose_reports_the_attested_isolation_on_both_formats() {
+        for attested in [true, false] {
+            let task = task_attesting_isolation(Some(attested));
+
+            let text = render(&task, OutputFormat::Text, true).unwrap();
+            assert!(
+                text.contains(&format!("isolated: {attested}")),
+                "text trailer missing the attestation: {text}"
+            );
+
+            let json = render(&task, OutputFormat::Json, true).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                v["metadata"]["isolated"],
+                serde_json::Value::Bool(attested),
+                "json envelope missing the attestation: {v}"
+            );
+        }
+    }
+
+    /// **U3, the one that matters.** A server that attested nothing must produce
+    /// no isolation claim at all — the population being every mika-spirit older
+    /// than mika#1951, where echoing the local flag would assert an isolation
+    /// that did not happen and make a contaminated bench read as valid.
+    #[test]
+    fn mika1951_without_an_attestation_no_isolation_is_claimed() {
+        let task = task_attesting_isolation(None);
+
+        let text = render(&task, OutputFormat::Text, true).unwrap();
+        assert!(
+            text.contains(NO_ISOLATION_ATTESTATION_LINE),
+            "the absence must be stated, not silently omitted: {text}"
+        );
+        assert!(
+            !text.contains("isolated: true") && !text.contains("isolated: false"),
+            "an isolation verdict leaked into an unattested render: {text}"
+        );
+
+        let json = render(&task, OutputFormat::Json, true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            v["metadata"].get("isolated").is_none(),
+            "absent, never null and never the local flag: {v}"
+        );
+    }
+
+    /// The rendering reads the Task and nothing else — `render` is not even
+    /// handed the flag this process was passed, which is what makes "the CLI
+    /// cannot echo its own request" a property of the signature rather than of
+    /// a reviewer's attention.
+    #[test]
+    fn mika1951_a_non_verbose_render_is_untouched_by_the_isolation_attestation() {
+        let task = task_attesting_isolation(Some(true));
+        assert_eq!(render(&task, OutputFormat::Text, false).unwrap(), "ok");
+        let json = render(&task, OutputFormat::Json, false).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("metadata").is_none(), "unexpected metadata in {v}");
+    }
+
+    /// The two attestations are read independently: a server that attests a
+    /// model and not an isolation must produce exactly one of the two lines and
+    /// the honest absence for the other. Neither may be inferred from the other.
+    #[test]
+    fn mika1951_the_two_attestations_do_not_shadow_each_other() {
+        let mut task = task_with_text("ok");
+        task.metadata = Some(std::collections::HashMap::from([(
+            EFFECTIVE_MODEL_KEY.to_string(),
+            serde_json::Value::String("openrouter/moonshotai/kimi-k2.5".to_string()),
+        )]));
+
+        let text = render(&task, OutputFormat::Text, true).unwrap();
+        assert!(
+            text.contains("model: openrouter/moonshotai/kimi-k2.5"),
+            "the model attestation must survive: {text}"
+        );
+        assert!(
+            text.contains(NO_ISOLATION_ATTESTATION_LINE),
+            "a model attestation says nothing about isolation: {text}"
+        );
     }
 }

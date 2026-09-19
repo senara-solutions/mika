@@ -71,6 +71,10 @@ pub struct EvalHarness {
     /// `.caller_model_override(true)` was called on the builder, so every
     /// pre-existing scenario keeps the #463 per-skill precedence untouched.
     pub caller_model_override: bool,
+    /// Whether this turn's caller asked to read its own session only
+    /// (mika#1951). `false` unless `.session_isolated(true)` was called, so every
+    /// pre-existing scenario keeps the window it had.
+    pub session_isolated: bool,
     /// Session-scoped PR review dedup map (#821, #736).
     /// When `Some`, enables the session-scope dedup guard in the agent loop.
     pub pr_reviews_posted: Option<Arc<DashMap<String, HashSet<String>>>>,
@@ -129,6 +133,10 @@ impl EvalHarness {
             // harness drives the loop directly, with no A2A caller to name a
             // model, so every pre-existing scenario keeps #463's precedence.
             caller_model_override: self.caller_model_override,
+            // mika#1951: `false` unless the builder was told otherwise — the
+            // harness drives the loop directly, with no A2A caller to ask for
+            // isolation, so every pre-existing scenario keeps its window.
+            session_isolated: self.session_isolated,
             trace_id: Some(self.trace_id.clone()),
             correlated_task_id: None,
             internal: self.internal,
@@ -185,6 +193,10 @@ impl EvalHarness {
             // harness drives the loop directly, with no A2A caller to name a
             // model, so every pre-existing scenario keeps #463's precedence.
             caller_model_override: self.caller_model_override,
+            // mika#1951: `false` unless the builder was told otherwise — the
+            // harness drives the loop directly, with no A2A caller to ask for
+            // isolation, so every pre-existing scenario keeps its window.
+            session_isolated: self.session_isolated,
             trace_id: Some(self.trace_id.clone()),
             correlated_task_id: None,
             internal: self.internal,
@@ -252,6 +264,8 @@ impl EvalHarness {
             // harness drives the loop directly, with no A2A caller to name a
             // model, so every pre-existing scenario keeps #463's precedence.
             caller_model_override: self.caller_model_override,
+            // mika#1951: see the identical line on the two sibling run sites.
+            session_isolated: self.session_isolated,
             trace_id: Some(turn_trace_id.clone()),
             correlated_task_id: None,
             internal: self.internal,
@@ -288,6 +302,7 @@ pub struct EvalHarnessBuilder {
     mcp_manager: Option<McpManager>,
     user_images: Vec<mika_common::llm::LlmImage>,
     caller_model_override: bool,
+    session_isolated: bool,
     pr_reviews_posted: Option<Arc<DashMap<String, HashSet<String>>>>,
     stream_ctx: Option<Arc<mika_a2a::streaming::ToolCallStreamContext>>,
 }
@@ -316,6 +331,7 @@ impl Default for EvalHarnessBuilder {
             mcp_manager: None,
             user_images: Vec::new(),
             caller_model_override: false,
+            session_isolated: false,
             pr_reviews_posted: None,
             stream_ctx: None,
         }
@@ -492,6 +508,17 @@ impl EvalHarnessBuilder {
         self
     }
 
+    /// Declare that this turn's caller asked for session isolation (mika#1951).
+    ///
+    /// In production only `server::a2a` sets this, after reading
+    /// `mika.session_isolated`. Here it is the knob that lets a test exercise
+    /// both channels — the window and the compaction summary — on an agent whose
+    /// identity declares neither.
+    pub fn session_isolated(mut self, v: bool) -> Self {
+        self.session_isolated = v;
+        self
+    }
+
     /// Build the harness, creating the in-memory DB and temp directories.
     pub async fn build(self) -> Result<EvalHarness> {
         // Create temp directory with minimal agent structure
@@ -583,6 +610,7 @@ impl EvalHarnessBuilder {
             mcp_manager: self.mcp_manager,
             user_images: self.user_images,
             caller_model_override: self.caller_model_override,
+            session_isolated: self.session_isolated,
             pr_reviews_posted: self.pr_reviews_posted,
             stream_ctx: self.stream_ctx,
         })

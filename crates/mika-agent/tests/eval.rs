@@ -73,8 +73,13 @@ mod eval {
     // mika#2295 briques 1 & 2 — the two window bounds, asserted on the window the
     // model actually received rather than on the predicates that compute it.
     mod test_context_window_budget_2295;
+
+    // mika#1951 — the per-call isolation lever, on both cross-session channels,
+    // with a negative control for each. The neighbours above cover the
+    // identity-declared scope; this one covers a caller narrowing one turn.
     mod test_correction_message_classifier_guard;
     mod test_deadline_in_flight_llm_call;
+    mod test_session_isolation_1951;
 
     // mika#2276 AC2 — la porte : `deadline dépassé ⇒ verdict posté`. Chaîne
     // complète, du vrai agent loop au POST, avec le poster injecté.
@@ -186,6 +191,11 @@ mod eval {
     // mika#2355 — le callback de build QA poste son verdict : B2 (carve-out
     // #870 + framing) et B3 (garde positive) sur le chemin silencieux réel.
     mod test_qa_build_callback_verdict_2355;
+
+    // mika#1952 — le schéma SERVI en mode réflexion déclare `evidence` requis,
+    // les autres modes sont inchangés, et la garde d'exécution reste la seule
+    // barrière dure (`"evidence": ""` satisfait `required` et échoue la garde).
+    mod test_reflection_evidence_contract_1952;
 
     // mika#2368 — le filet moteur : le signal levé sur les DEUX sites de sortie
     // EndTurn du tour silencieux, et le registre anti-double-post qui l'atteint.

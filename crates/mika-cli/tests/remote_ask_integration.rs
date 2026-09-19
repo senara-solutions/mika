@@ -10,7 +10,8 @@
 
 use axum::{Json, Router, http::StatusCode, routing::post};
 use mika_cli::remote_ask::{
-    CALLER_SESSION_ID_KEY, OutputFormat, dispatch_remote, send_message_to_agent,
+    CALLER_SESSION_ID_KEY, NO_ISOLATION_ATTESTATION_LINE, OutputFormat, SESSION_ISOLATED_KEY,
+    dispatch_remote, send_message_to_agent,
 };
 use serde_json::Value;
 use std::net::SocketAddr;
@@ -79,7 +80,7 @@ async fn dispatch_returns_text_part_in_text_mode() {
         spawn_mock(|_cap, _body| (StatusCode::OK, Json(ok_task_with_text("hello world")))).await;
 
     let url = format!("http://{addr}/a2a/cust-1/mika-prime");
-    let out = dispatch_remote("hi", &url, OutputFormat::Text, false, None)
+    let out = dispatch_remote("hi", &url, OutputFormat::Text, false, None, false)
         .await
         .expect("dispatch should succeed");
     assert_eq!(out, "hello world");
@@ -94,9 +95,16 @@ async fn dispatch_sends_user_message_as_text_part_in_jsonrpc_request() {
     .await;
 
     let url = format!("http://{addr}/a2a/cust-3/mika-prime");
-    let _ = dispatch_remote("what's on for today", &url, OutputFormat::Text, false, None)
-        .await
-        .expect("dispatch should succeed");
+    let _ = dispatch_remote(
+        "what's on for today",
+        &url,
+        OutputFormat::Text,
+        false,
+        None,
+        false,
+    )
+    .await
+    .expect("dispatch should succeed");
 
     let body = capture.lock().unwrap().last_body.clone().unwrap();
     assert_eq!(body["method"], "message/send");
@@ -120,7 +128,7 @@ async fn dispatch_surfaces_jsonrpc_error_with_remote_prefix() {
     .await;
 
     let url = format!("http://{addr}/a2a/cust-4/mika-prime");
-    let err = dispatch_remote("hi", &url, OutputFormat::Text, false, None)
+    let err = dispatch_remote("hi", &url, OutputFormat::Text, false, None, false)
         .await
         .expect_err("should fail on JSON-RPC error response");
     let chain = format!("{err:#}");
@@ -142,7 +150,7 @@ async fn dispatch_surfaces_connection_error_for_dead_endpoint() {
     drop(listener);
 
     let url = format!("http://{addr}/a2a/cust-5/mika-prime");
-    let err = dispatch_remote("hi", &url, OutputFormat::Text, false, None)
+    let err = dispatch_remote("hi", &url, OutputFormat::Text, false, None, false)
         .await
         .expect_err("should fail when no listener accepts the connection");
     let chain = format!("{err:#}");
@@ -186,7 +194,7 @@ async fn dispatch_surfaces_failed_task_state_as_error() {
     .await;
 
     let url = format!("http://{addr}/a2a/cust-7/mika-prime");
-    let err = dispatch_remote("hi", &url, OutputFormat::Text, false, None)
+    let err = dispatch_remote("hi", &url, OutputFormat::Text, false, None, false)
         .await
         .expect_err("should fail when remote task state is Failed");
     let chain = format!("{err:#}");
@@ -228,7 +236,7 @@ async fn dispatch_renders_input_required_state_to_output() {
     .await;
 
     let url = format!("http://{addr}/a2a/cust-8/mika-prime");
-    let out = dispatch_remote("hi", &url, OutputFormat::Text, false, None)
+    let out = dispatch_remote("hi", &url, OutputFormat::Text, false, None, false)
         .await
         .expect("InputRequired should render content, not error");
     assert_eq!(out, "which sprint did you mean?");
@@ -265,7 +273,7 @@ async fn dispatch_prefers_artifacts_over_status_message() {
     .await;
 
     let url = format!("http://{addr}/a2a/cust-9/mika-prime");
-    let out = dispatch_remote("hi", &url, OutputFormat::Text, false, None)
+    let out = dispatch_remote("hi", &url, OutputFormat::Text, false, None, false)
         .await
         .expect("dispatch should succeed");
     assert_eq!(out, "artifact-output");
@@ -299,7 +307,7 @@ async fn dispatch_renders_file_part_as_placeholder() {
     .await;
 
     let url = format!("http://{addr}/a2a/cust-6/mika-prime");
-    let out = dispatch_remote("hi", &url, OutputFormat::Text, false, None)
+    let out = dispatch_remote("hi", &url, OutputFormat::Text, false, None, false)
         .await
         .expect("dispatch should succeed");
     assert_eq!(out, "[file: foo.txt]");
@@ -318,14 +326,16 @@ async fn remote_dispatch_sends_no_caller_session_id() {
     .await;
 
     let url = format!("http://{addr}/a2a/cust-9/mika-prime");
-    let _ = dispatch_remote("hi", &url, OutputFormat::Text, false, None)
+    let _ = dispatch_remote("hi", &url, OutputFormat::Text, false, None, false)
         .await
         .expect("dispatch should succeed");
 
     let body = capture.lock().unwrap().last_body.clone().unwrap();
     assert!(
         body["params"].get("metadata").is_none(),
-        "remote dispatch should send no request metadata, got {}",
+        "a remote dispatch declaring nothing should send no request metadata at \
+         all (the keys it *can* carry — a model override, an isolation request — \
+         are absent here by argument), got {}",
         body["params"]
     );
 }
@@ -341,7 +351,7 @@ async fn spirit_dispatch_carries_the_caller_session_id_over_the_wire() {
     .await;
 
     let url = format!("http://{addr}/a2a/cust-9/mika-prime");
-    let _ = send_message_to_agent("hi", &url, Some("rt005-c1-r7"), &[], None)
+    let _ = send_message_to_agent("hi", &url, Some("rt005-c1-r7"), &[], None, false)
         .await
         .expect("send should succeed");
 
@@ -350,5 +360,75 @@ async fn spirit_dispatch_carries_the_caller_session_id_over_the_wire() {
         body["params"]["metadata"][CALLER_SESSION_ID_KEY], "rt005-c1-r7",
         "caller session id missing from {}",
         body["params"]
+    );
+}
+
+// --- mika#1951: the isolation lever reaches the wire, on BOTH doors ----------
+
+/// **The property the plan asks to be verified rather than assumed.**
+///
+/// `--isolated` must leave this process on the default path *and* on `--remote`.
+/// Since mika#1727 both are A2A clients, and mika#2304 had to be repaired once
+/// for a fix that reached only the second — so the two doors are exercised here
+/// against a real exchange, not inferred from the one call site they share.
+/// A structural guard in `remote_ask.rs` covers the *reason* they cannot drift;
+/// this one covers the *fact* that the bool arrives as a JSON `true`.
+#[tokio::test]
+async fn both_ask_doors_carry_the_isolation_request_over_the_wire() {
+    for door in ["spirit", "remote"] {
+        let (addr, capture) = spawn_mock(|cap, Json(body)| {
+            cap.lock().unwrap().last_body = Some(body);
+            (StatusCode::OK, Json(ok_task_with_text("reply")))
+        })
+        .await;
+        let url = format!("http://{addr}/a2a/cust-9/mika-prime");
+
+        match door {
+            "spirit" => {
+                send_message_to_agent("hi", &url, Some("sess-1"), &[], None, true)
+                    .await
+                    .expect("send should succeed");
+            }
+            _ => {
+                dispatch_remote("hi", &url, OutputFormat::Text, false, None, true)
+                    .await
+                    .expect("dispatch should succeed");
+            }
+        }
+
+        let body = capture.lock().unwrap().last_body.clone().unwrap();
+        assert_eq!(
+            body["params"]["metadata"][SESSION_ISOLATED_KEY],
+            Value::Bool(true),
+            "the `{door}` door dropped the isolation request; the server reads a \
+             JSON bool and anything else fails the turn rather than degrading to \
+             'not isolated': {}",
+            body["params"]
+        );
+    }
+}
+
+/// The attestation is the server's to make, and the CLI renders **absence** when
+/// it is missing. A mock that answers without the key stands in for every
+/// mika-spirit older than mika#1951 — the population where echoing the flag this
+/// process just sent would assert an isolation that did not happen.
+#[tokio::test]
+async fn an_unattesting_server_yields_no_isolation_claim() {
+    let (addr, _) =
+        spawn_mock(|_, Json(_)| (StatusCode::OK, Json(ok_task_with_text("reply")))).await;
+    let url = format!("http://{addr}/a2a/cust-9/mika-prime");
+
+    // Asked for isolation, and the server said nothing about it.
+    let out = dispatch_remote("hi", &url, OutputFormat::Text, true, None, true)
+        .await
+        .expect("dispatch should succeed");
+
+    assert!(
+        out.contains(NO_ISOLATION_ATTESTATION_LINE),
+        "the absence must be stated: {out}"
+    );
+    assert!(
+        !out.contains("isolated: true"),
+        "the local flag leaked into the rendering: {out}"
     );
 }

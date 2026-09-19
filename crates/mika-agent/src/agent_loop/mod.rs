@@ -4052,6 +4052,28 @@ pub struct AgentParams<'a> {
     /// place for the two to disagree. `false` everywhere else, including the team
     /// path, which reads `TeamAgentParams` and so cannot see this field at all.
     pub caller_model_override: bool,
+    /// This turn's caller asked to read its own session only (mika#1951).
+    ///
+    /// `true` only when a `message/send` carried `mika.session_isolated = true`.
+    /// It closes **both** cross-session channels for this turn and no other:
+    /// the conversation window is scoped to `session_id`, and no compaction
+    /// summary is injected. `false` everywhere else, including the team path,
+    /// which reads `TeamAgentParams` and so cannot see this field at all.
+    ///
+    /// **Strictly subtractive, and that is a safety property rather than a
+    /// style.** A caller may only ever *narrow* the window. Carrying a scope
+    /// name here instead would let any authenticated caller of `/a2a/{agent}`
+    /// widen mika-arch back to an agent-wide window and make it read other
+    /// tickets' plans — mika#2295 and mika#2305 reopened through the network
+    /// door. A bool makes that inexpressible instead of merely refused.
+    ///
+    /// **A `bool` and not a mutated `Identity`.** `ctx.identity` is a shared
+    /// reference; cloning a mutated copy per turn would put the per-turn
+    /// decision into a structure other turns read, which is the "wrote into the
+    /// cache" class mika#2363 had to hold shut with a lexical test. The two read
+    /// sites are the scoped-session resolution and the `load_gated_summary`
+    /// call, and there are no others.
+    pub session_isolated: bool,
     /// Optional external trace_id (e.g. from HTTP request_id). If None, a new one is generated.
     pub trace_id: Option<String>,
     /// Optional task_id for observability correlation. When a `mika ask` call is associated
@@ -4288,7 +4310,18 @@ async fn run_agent_inner(
 
     // Axis 4 + Axis 3 summary gate (mika#1019, mika#1021).
     // Conversation mode: silent_trigger is None — Axis 3 cap does not fire.
-    if let Some(content) = load_gated_summary(db, &ctx.identity.context.summary, None).await? {
+    //
+    // mika#1951, read site 1 of 2. The compaction summary is keyed on `agent_id`
+    // alone (`Database::load_conversation_summary`), so it crosses every session
+    // by construction. An isolated turn must close this channel too: closing the
+    // window alone would ship an isolation whose partiality is invisible until a
+    // bench runs long enough to compact.
+    let summary_config = if params.session_isolated {
+        &SUPPRESSED_SUMMARY
+    } else {
+        &ctx.identity.context.summary
+    };
+    if let Some(content) = load_gated_summary(db, summary_config, None).await? {
         system.push_str("\n## Conversation Summary\n");
         system.push_str("<context type=\"summary\" trust=\"data\">\n");
         system.push_str(&content);
@@ -4463,7 +4496,18 @@ async fn run_agent_inner(
     record_withheld_images(db, session_id, trace_id, scope_task_id, &image_disposition).await;
 
     let history_config = &ctx.identity.context.history;
-    let scoped_session_id = match history_config.scope {
+    // mika#1951, read site 2 of 2. The caller may narrow this turn's scope to its
+    // own session; it may never widen it. The branch only ever *replaces* a
+    // declared scope with the narrower one, so an agent already declaring
+    // `session` (mika-arch) cannot be pushed back to `agent` from the network
+    // whatever a caller sends. That asymmetry is why the wire key is a bool: the
+    // widening request has no spelling.
+    let effective_scope = if params.session_isolated {
+        prompt::HistoryScope::Session
+    } else {
+        history_config.scope
+    };
+    let scoped_session_id = match effective_scope {
         prompt::HistoryScope::Session => Some(session_id),
         prompt::HistoryScope::Agent => None,
     };
@@ -4492,7 +4536,13 @@ async fn run_agent_inner(
         "conversation",
         &build_context_window_fields(
             &history,
-            history_config.scope,
+            // mika#1951 — the instrument reports the scope that DECIDED this
+            // window, which for an isolated turn is the caller's, not the
+            // identity's. Reporting `history_config.scope` here would make the
+            // event say `agent` about a window that really was filtered — the
+            // mika#2305 defect with the sign flipped, and it would break the
+            // post-deploy probe that reads exactly this field.
+            effective_scope,
             &skill_tool_defs,
             truncation.truncated_messages,
             truncation.truncated_bytes,
@@ -4975,6 +5025,20 @@ async fn persist_deadline_fallback(
 
 // -- Summary Gating (Axis 4 + Axis 3) --
 
+/// The summary configuration an isolated turn is read under (mika#1951).
+///
+/// `inject = false` is [`load_gated_summary`]'s Axis-4 **load-prevention** gate:
+/// the summary is not read from the database, not deserialized, and not
+/// available to anything downstream in the same turn. Substituting this config
+/// is therefore the whole of "no summary for this turn", and it is done by
+/// passing a different `&ContextSummaryConfig` rather than by mutating
+/// `ctx.identity` — which is shared, and whose per-turn mutation would leak this
+/// turn's decision into the next one's.
+static SUPPRESSED_SUMMARY: prompt::ContextSummaryConfig = prompt::ContextSummaryConfig {
+    inject: false,
+    max_tokens: None,
+};
+
 /// Load the conversational summary for injection into the system prompt,
 /// applying Axis 4 (load-prevention) and Axis 3 (mode-conditional cap)
 /// gates in sequence.
@@ -5314,9 +5378,12 @@ async fn run_silent_inner(
              Your job: Review today's conversations and recently stored facts. Update your\n\
              memory to better serve the user tomorrow.\n\n\
              ## Available tools\n\n\
-             - update_core_memory: Edit persistent core memory blocks\n\
-             - store_fact: Store new facts (person, commitment, preference, event)\n\
-             - update_fact: Update commitment status (completed/cancelled)\n\
+             - update_core_memory: Edit persistent core memory blocks. MUST include \
+             `evidence` field in reflection mode — no exceptions.\n\
+             - store_fact: Store new facts (person, commitment, preference, event). MUST include \
+             `evidence` field in reflection mode — no exceptions.\n\
+             - update_fact: Update commitment status (completed/cancelled). MUST include \
+             `evidence` field in reflection mode — no exceptions.\n\
              - search_memory: Search existing facts\n\n\
              ## What to do\n\n\
              1. HOUSEKEEPING: Scan for duplicate or redundant facts. Consolidate them\n\
@@ -5481,7 +5548,7 @@ async fn run_silent_inner(
     let provider = llm.provider_name();
     let model = llm.model_name();
     let no_context = HashMap::new();
-    let (skill_tool_defs, prompt_variant, per_skill_bytes) = inject_skills_and_resolve_tools(
+    let (mut skill_tool_defs, prompt_variant, per_skill_bytes) = inject_skills_and_resolve_tools(
         &matched,
         tools,
         &mut system,
@@ -5491,6 +5558,20 @@ async fn run_silent_inner(
         &ctx.identity.tools.disabled,
         false, // Silent mode: never compact (engine-driven triggers, not MikaModel targets)
     );
+
+    // mika#1952 — reflection mode is the one mode where `check_reflection_evidence`
+    // bites, so it is the one mode whose served schema must say so. Computed here
+    // rather than at its former site further down: it depends only on
+    // `params.trigger`, and the mutation has to land before the
+    // `From<ToolDefinition> for LlmToolDefinition` conversion carries the schema
+    // to the API. The two other `ToolContext` construction sites (conversation,
+    // team) write `is_reflection: false` outright, so they are out of this
+    // population by construction — asserted, not assumed, by the negative control
+    // in `tests/eval/test_reflection_evidence_contract_1952.rs`.
+    let is_reflection = matches!(&params.trigger, SilentTrigger::Reflection);
+    if is_reflection {
+        apply_reflection_evidence_contract(&mut skill_tool_defs);
+    }
     let skill_tool_map = build_skill_tool_map(&matched);
     // mika#1798 Layer 4 (silent mode).
     let skill_data_grades = build_skill_data_grades(&matched);
@@ -5555,7 +5636,6 @@ async fn run_silent_inner(
         content: LlmContent::Text(user_msg),
     }];
 
-    let is_reflection = matches!(&params.trigger, SilentTrigger::Reflection);
     let trace_id = params
         .trace_id
         .clone()
@@ -7307,6 +7387,155 @@ pub(crate) fn apply_agent_tool_visibility(
             "applied identity tool-visibility filter"
         );
     }
+}
+
+/// The builtin tools whose `evidence` field is required **at runtime** in
+/// reflection mode by [`crate::tools::check_reflection_evidence`].
+///
+/// **Sole site** where this list is written (mika#1952 D2). A predicate written
+/// twice is a predicate that can diverge, and the divergence makes no decision
+/// wrong the day it is written — the class `grooming_marker` had to engrave once
+/// (mika#2158: a copied regex whose own comment said "Mirrors …" and which then
+/// missed two widenings). `tools::tests::mika1952_gated_tools_match_the_reflection_contract_constant`
+/// compares this list to the actual callers of the guard, **in both directions**,
+/// so a fourth guarded tool cannot silently keep a schema that lies.
+pub(crate) const REFLECTION_EVIDENCE_GATED_TOOLS: &[&str] =
+    &["update_fact", "store_fact", "update_core_memory"];
+
+/// Make the served JSON schema tell the truth in reflection mode: declare
+/// `evidence` in the `required` array of every tool listed in
+/// [`REFLECTION_EVIDENCE_GATED_TOOLS`] (mika#1952 U1).
+///
+/// ## The contradiction this closes
+///
+/// `check_reflection_evidence` has always refused a reflection-mode call whose
+/// `evidence` is missing or blank. The schema those same three tools declare to
+/// the model has never carried `evidence` in `required`: the declared contract
+/// said *optional*, the engine answered *mandatory*. Measured on the `mika`
+/// tenant between 2026-07-28 and 2026-08-17 (mika#1770, N=17): **8 first-attempt
+/// failures**, all carrying the guard's message verbatim. Seven self-repaired on
+/// retry within ten seconds; the eighth — commitment `id=52`, session
+/// `reflection-2026-08-17` — did not, and the cancellation never landed.
+///
+/// This is *not* a documentation gap. The reflection prompt already says the
+/// evidence field is mandatory (mika#1770 rules out class C explicitly). The
+/// model misses it anyway, at the moment it emits a parallel batch of calls and
+/// fills the fields **the schema asks it for** — so the schema is what has to
+/// stop lying.
+///
+/// ## Why here and not in `Tool::definition()`
+///
+/// `definition(&self)` takes no `ToolContext` and therefore cannot know the
+/// mode. That is what made mika#1952 propose registering twin `*_reflection`
+/// tools (its "Option 2"), which the ticket itself put out of scope for
+/// doubling the tool surface. `run_silent_agent` knows the trigger *and* still
+/// holds the schema as owned JSON before the `From<ToolDefinition> for
+/// LlmToolDefinition` conversion moves it verbatim — so the contract can be made
+/// exact with **zero** change to the tool surface. See
+/// `apply_agent_tool_visibility` just above: the same named-hook idiom at the
+/// same presentation layer.
+///
+/// ## What it does, and does not, touch
+///
+/// Additive and idempotent (D3): it appends `"evidence"` to `required` when
+/// absent, and nothing else — no reordering, no removal, no other field. The
+/// field *description* is deliberately not rewritten here: it is already
+/// written for reflection mode at the single site
+/// [`crate::tools::REFLECTION_EVIDENCE_FIELD_DESCRIPTION`], and a
+/// mode-conditional variant would be a fourth text to maintain (D5). A tool of
+/// the list that is absent from `tool_defs` — evicted by an identity denylist,
+/// or dropped by the compact-provider filter — is skipped in silence: absence
+/// is not an error.
+///
+/// Fail-soft on an unexpected schema shape (D4): the definition is left
+/// **intact** and a `warn!` names the tool. Serving a half-mutated schema would
+/// be worse than serving today's, and `check_reflection_evidence` still covers
+/// the call either way. The log line is what keeps this fail-soft from being a
+/// silence.
+///
+/// `required` **absent** is not an unexpected shape — it is a valid schema
+/// declaring nothing mandatory — so the array is created. Only a `required`
+/// that exists and is not an array is refused.
+pub(crate) fn apply_reflection_evidence_contract(
+    tool_defs: &mut [mika_common::claude::ToolDefinition],
+) {
+    let mut mutated_count = 0usize;
+
+    for def in tool_defs.iter_mut() {
+        if !REFLECTION_EVIDENCE_GATED_TOOLS
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&def.name))
+        {
+            continue;
+        }
+
+        match declare_evidence_required(&mut def.input_schema) {
+            Ok(true) => {
+                mutated_count += 1;
+                tracing::debug!(
+                    event = "reflection_evidence_contract_applied",
+                    tool = %def.name,
+                    "declared `evidence` as required in the reflection-mode tool schema"
+                );
+            }
+            Ok(false) => {}
+            Err(reason) => tracing::warn!(
+                event = "reflection_evidence_contract_unexpected_schema",
+                tool = %def.name,
+                reason,
+                "left the tool schema intact; the runtime guard still applies"
+            ),
+        }
+    }
+
+    if mutated_count > 0 {
+        tracing::info!(
+            event = "reflection_evidence_contract",
+            mutated_count,
+            gated_tools = REFLECTION_EVIDENCE_GATED_TOOLS.len(),
+            "reflection mode: served schemas now declare `evidence` as required"
+        );
+    }
+}
+
+/// Append `"evidence"` to one schema's `required` array.
+///
+/// `Ok(true)` the array gained the entry, `Ok(false)` it already carried it
+/// (idempotence), `Err(reason)` the schema has a shape this filter refuses to
+/// half-mutate — the reason is returned rather than logged here so the caller
+/// names the offending tool, and so there is one description of each refusal
+/// instead of one per branch.
+fn declare_evidence_required(input_schema: &mut serde_json::Value) -> Result<bool, &'static str> {
+    let schema = input_schema
+        .as_object_mut()
+        .ok_or("input_schema is not a JSON object")?;
+
+    // The field must already be declared: `required` naming a property that
+    // `properties` does not carry is a schema some rails reject, and the repair
+    // for a missing property is not "add it here".
+    let declares_evidence = schema
+        .get("properties")
+        .and_then(|p| p.as_object())
+        .is_some_and(|p| p.contains_key("evidence"));
+    if !declares_evidence {
+        return Err("properties.evidence is absent");
+    }
+
+    // An absent `required` is a valid schema declaring nothing mandatory, not an
+    // unexpected shape — so the array is created. Only a `required` that exists
+    // and is not an array is refused, and `or_insert_with` leaves such a value
+    // untouched, so nothing is mutated on that path.
+    let required = schema
+        .entry("required")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or("required is present but is not an array")?;
+
+    if required.iter().any(|v| v.as_str() == Some("evidence")) {
+        return Ok(false);
+    }
+    required.push(serde_json::Value::String("evidence".to_string()));
+    Ok(true)
 }
 
 /// Core tools allowed for compact providers (ProviderKind::MikaModel).
@@ -9981,6 +10210,188 @@ mod tests {
         let disabled = vec!["pr_merge_with_gate".to_string()];
         apply_agent_tool_visibility(&mut defs, &disabled);
         assert!(defs.is_empty(), "filter must match case-insensitively");
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#1952 U4-a — `apply_reflection_evidence_contract`
+    // -----------------------------------------------------------------------
+
+    /// A schema of the shape the three guarded tools actually declare:
+    /// `evidence` present in `properties`, absent from `required`.
+    fn gated_tool_def(name: &str, required: serde_json::Value) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: format!("{name} (mika#1952 fixture)"),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string"},
+                    "evidence": {"type": "string"}
+                },
+                "required": required
+            }),
+        }
+    }
+
+    fn required_of(def: &ToolDefinition) -> Vec<String> {
+        def.input_schema["required"]
+            .as_array()
+            .expect("required is an array")
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .expect("required entries are strings")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mika1952_the_three_gated_tools_declare_evidence_required() {
+        let mut defs = vec![
+            gated_tool_def(
+                "update_fact",
+                serde_json::json!(["id", "category", "updates"]),
+            ),
+            gated_tool_def("store_fact", serde_json::json!(["category"])),
+            gated_tool_def(
+                "update_core_memory",
+                serde_json::json!(["section", "action", "reasoning"]),
+            ),
+        ];
+
+        apply_reflection_evidence_contract(&mut defs);
+
+        for def in &defs {
+            assert!(
+                required_of(def).contains(&"evidence".to_string()),
+                "mika#1952 — `{}` must declare `evidence` as required in reflection mode",
+                def.name
+            );
+        }
+        // Additive, not replacing: the pre-existing entries survive, in order.
+        assert_eq!(
+            required_of(&defs[0]),
+            vec!["id", "category", "updates", "evidence"],
+            "the filter appends; it must not reorder or drop"
+        );
+    }
+
+    #[test]
+    fn mika1952_applying_the_contract_twice_changes_nothing() {
+        let mut defs = vec![gated_tool_def("update_fact", serde_json::json!(["id"]))];
+        apply_reflection_evidence_contract(&mut defs);
+        let once = defs.clone();
+        apply_reflection_evidence_contract(&mut defs);
+        assert_eq!(
+            defs[0].input_schema, once[0].input_schema,
+            "D3 — the mutation is idempotent; a second pass must add no duplicate"
+        );
+        assert_eq!(required_of(&defs[0]).len(), 2);
+    }
+
+    #[test]
+    fn mika1952_a_schema_already_declaring_evidence_is_left_alone() {
+        let mut defs = vec![gated_tool_def(
+            "store_fact",
+            serde_json::json!(["category", "evidence"]),
+        )];
+        let before = defs[0].input_schema.clone();
+        apply_reflection_evidence_contract(&mut defs);
+        assert_eq!(defs[0].input_schema, before);
+    }
+
+    #[test]
+    fn mika1952_a_tool_outside_the_list_is_untouched() {
+        let mut defs = vec![
+            gated_tool_def("search_memory", serde_json::json!(["query"])),
+            gated_tool_def("send_message", serde_json::json!(["text"])),
+        ];
+        let before: Vec<_> = defs.iter().map(|d| d.input_schema.clone()).collect();
+        apply_reflection_evidence_contract(&mut defs);
+        for (def, was) in defs.iter().zip(before) {
+            assert_eq!(
+                def.input_schema, was,
+                "`{}` does not carry the runtime guard and must not be touched",
+                def.name
+            );
+        }
+    }
+
+    /// D3 — a gated tool absent from the array (evicted by an identity denylist,
+    /// or dropped by the compact-provider filter) is not an error.
+    #[test]
+    fn mika1952_a_partial_tool_array_is_served_not_refused() {
+        let mut defs = vec![gated_tool_def(
+            "store_fact",
+            serde_json::json!(["category"]),
+        )];
+        apply_reflection_evidence_contract(&mut defs);
+        assert_eq!(defs.len(), 1, "no tool is added to cover the missing ones");
+        assert!(required_of(&defs[0]).contains(&"evidence".to_string()));
+    }
+
+    /// D4 — an unexpected shape leaves the schema **intact** rather than
+    /// half-mutated. Each case is asserted separately: a single fixture
+    /// breaking every term at once would pass against a filter that checks
+    /// only one of them.
+    #[test]
+    fn mika1952_an_unexpected_schema_is_left_intact_without_panicking() {
+        // (a) `properties.evidence` absent.
+        let mut no_field = vec![ToolDefinition {
+            name: "update_fact".to_string(),
+            description: "no evidence property".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"id": {"type": "integer"}},
+                "required": ["id"]
+            }),
+        }];
+        let before = no_field[0].input_schema.clone();
+        apply_reflection_evidence_contract(&mut no_field);
+        assert_eq!(
+            no_field[0].input_schema, before,
+            "a schema with no `evidence` property must be served unchanged"
+        );
+
+        // (b) `required` present but not an array.
+        let mut bad_required = vec![ToolDefinition {
+            name: "store_fact".to_string(),
+            description: "required is a string".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"evidence": {"type": "string"}},
+                "required": "category"
+            }),
+        }];
+        let before = bad_required[0].input_schema.clone();
+        apply_reflection_evidence_contract(&mut bad_required);
+        assert_eq!(bad_required[0].input_schema, before);
+
+        // (c) `input_schema` is not an object at all.
+        let mut not_object = vec![ToolDefinition {
+            name: "update_core_memory".to_string(),
+            description: "schema is a string".to_string(),
+            input_schema: serde_json::json!("nonsense"),
+        }];
+        apply_reflection_evidence_contract(&mut not_object);
+        assert_eq!(not_object[0].input_schema, serde_json::json!("nonsense"));
+    }
+
+    /// `required` **absent** is a valid schema declaring nothing mandatory, not
+    /// an unexpected shape — so the array is created rather than refused.
+    #[test]
+    fn mika1952_a_schema_without_a_required_array_gains_one() {
+        let mut defs = vec![ToolDefinition {
+            name: "update_fact".to_string(),
+            description: "no required array".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"evidence": {"type": "string"}}
+            }),
+        }];
+        apply_reflection_evidence_contract(&mut defs);
+        assert_eq!(required_of(&defs[0]), vec!["evidence"]);
     }
 
     #[test]

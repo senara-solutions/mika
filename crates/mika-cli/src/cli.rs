@@ -303,6 +303,26 @@ pub struct AskArgs {
     #[arg(long, conflicts_with_all = ["team", "enable_skill", "disable_skill"])]
     pub only_skill: Vec<String>,
 
+    /// Isolate this invocation's conversation window to its own session
+    /// (mika#1951). The turn reads history under `HistoryScope::Session` and
+    /// injects no compaction summary, whatever the agent's `identity.toml` says.
+    ///
+    /// Strictly restrictive, by construction: the flag is a bool on the wire
+    /// (`mika.session_isolated`), so it can narrow a window and never widen one.
+    /// A caller cannot use it to make an agent configured `session` read other
+    /// sessions' history.
+    ///
+    /// Reaches the execution surface on both paths, local and --remote — the key
+    /// is posted at the single `build_send_params` site they share.
+    ///
+    /// Under --verbose the reported isolation is the one the SERVER attests, never
+    /// this flag: a spirit predating mika#1951 accepts the flag, ignores it, and
+    /// would otherwise be reported as isolated with full authority — the false
+    /// green this ticket exists to close.
+    /// Example: --isolated --session-id <fresh-uuid>
+    #[arg(long, conflicts_with = "team")]
+    pub isolated: bool,
+
     /// Emit metadata trailer after response (e.g., session_id).
     /// Useful for cross-command integration where downstream consumers need session context.
     #[arg(long, conflicts_with = "team")]
