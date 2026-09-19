@@ -76,26 +76,52 @@ second-pass, qui ESCALATE — et l'unique itération a été dépensée pour rie
 
 ### Population
 
-Sur les 871 plans datés de `docs/plans/` :
+Mesures prises sur cette branche au 2026-09-19, **chacune avec sa commande** —
+un chiffre dont la méthode n'est pas écrite n'est pas reproductible, et se lit
+comme faux dès que le lecteur choisit une autre regex :
 
-| Mesure | Compte |
-|---|---|
-| Plans datés | 871 |
-| Avec `## Acceptance criteria` | 585 |
-| Avec `## Fire-Disposition` | 68 |
-| Dont la FD fut ajoutée **après un ITERATE architecte** | **5** |
+| Mesure | Commande | Compte |
+|---|---|---|
+| Plans datés | `ls docs/plans/ \| grep -cE '^20[0-9]{2}-[0-9]{2}-[0-9]{2}-'` | 878 |
+| Section AC, forme canonique | `grep -lE '^## Acceptance criteria' docs/plans/20*.md \| wc -l` | 322 |
+| Section AC, toute profondeur/casse | `grep -liE '^#+ *Acceptance criteria' docs/plans/20*.md \| wc -l` | 593 |
+| Section FD, forme canonique | `grep -lE '^## Fire-Disposition' docs/plans/20*.md \| wc -l` | 70 |
 
-Ces 5 plans sont la preuve directe du coût : chacun porte, en propre, la mention
-« Requis par le Fire-Disposition Gate (mika#1574), **soulevé par mika-arch en
-première passe** » ou « rev 2 — addressed F1 (Fire-Disposition Gate) ». Chacun a
-consommé une passe architecte complète pour ajouter une section de quinze lignes
-que le groomeur pouvait écrire du premier coup.
+**L'écart 322 / 593 sur la même section est lui-même un résultat**, et il porte :
+la moitié du corpus écrit le titre AC sous une autre profondeur ou une autre
+casse. Il rappelle que « la section est-elle là ? » n'a de réponse stable qu'avec
+sa regex — le fait même qui disqualifie une garde `grep` en CI (D2, motif 2).
 
-Le chiffre de 68/871 (7,8 %) ne se lit **pas** comme un taux de défaut : la
-section est **conditionnelle** (mika#1574 : « Plan has no detector-class
-deliverables ⇒ gate is N/A »). Il n'existe aucun moyen déterministe de compter la
-population qui *aurait dû* la porter — ce qui est précisément l'obstacle qui
-disqualifie la garde CI (voir § Décisions, D2).
+**La FD ajoutée après un ITERATE architecte : classe prouvée, compte borné.**
+La recherche lexicale liant `Fire-Disposition` à un finding architecte sur une
+même ligne rend **13** fichiers, dont le présent plan (qui cite le motif sans
+l'avoir subi) :
+
+```sh
+grep -liE '(Fire.Disposition.{0,80}(soulev|mika-arch|F[0-9])|(soulev|mika-arch).{0,80}Fire.Disposition)' docs/plans/20*.md
+```
+
+C'est une **borne supérieure lexicale, pas un compte vérifié** : distinguer un
+plan qui a subi l'ITERATE d'un plan qui cite la doctrine demande de lire les
+treize. Le plan ne fabrique pas ce compte. Mais l'argument ne repose pas dessus —
+il repose sur l'**existence** de la classe, et deux témoins la prouvent, nommés
+et vérifiables à la ligne près :
+
+- `docs/plans/2026-09-01-002-fix-2126-telegram-url-nue-plan.md:232` — « Requis par
+  le Fire-Disposition Gate (mika#1574), **soulevé par mika-arch en première**
+  [passe] ».
+- `docs/plans/2026-09-07-004-fix-2228-label-write-via-app-identity-plan.md:44` —
+  la section est littéralement titrée `## Fire-Disposition (F4)` : le `(F4)` est
+  le numéro du finding architecte auquel elle répond.
+
+Chacun a consommé une passe architecte pour ajouter une section d'une quinzaine
+de lignes que le groomeur pouvait écrire du premier coup. C'est le coût que ce
+plan supprime, et il suffit qu'il soit réel.
+
+Le ratio 70/878 (8,0 %) ne se lit **pas** comme un taux de défaut : la section est
+**conditionnelle** (mika#1574 : « Plan has no detector-class deliverables ⇒ gate
+is N/A »). Il n'existe aucun moyen déterministe de compter la population qui
+*aurait dû* la porter — l'obstacle même qui disqualifie la garde CI (D2).
 
 ---
 
@@ -226,9 +252,10 @@ employé au même endroit (`dispatch-lib.sh:2203`). Injecter la règle pour
 | # | Fichier | Changement |
 |---|---|---|
 | **U1** | `skills/bundled/_shared/dispatch-lib.sh` | Constante `_FIRE_DISPOSITION_RULE`, posée à côté de `_PR_BODY_CONTAINMENT_RULE` (~l.1935). Elle nomme la section, ses trois options canoniques (a)/(b)/(c) en une ligne chacune, et la règle N/A explicite. Injectée dans `PROMPT` au site mika#2178/#2211 (~l.2480), **après** `_PR_BODY_CONTAINMENT_RULE` — les trois invariants de position documentés au site restent vrais et la première ligne du `PROMPT` reste exactement `<repo>#<num>` (contrat mika#138). Conditionnée `[ "$SKILL" = "dev-groom" ]` (D5). |
-| **U2** | `skills/bundled/_shared/dispatch-lib.sh` | Dans `_launch_revise_pilot`, après la comparaison `sha256` **réussie** : si les findings réclamaient `Fire-Disposition` et que le plan révisé ne porte toujours pas `^## Fire-Disposition`, écrire un findings-file ciblé (`findings-1-fd.md`) et relancer le pilote de revise **une seule fois**. La seconde tentative est terminale quel que soit son résultat : elle ne re-teste pas le prédicat, donc aucune récursion n'est possible. Le retour reste `0` (le plan *a* changé) — la garde ajoute une tentative, elle ne crée pas de mode d'échec. |
+| **U2** | `skills/bundled/_shared/dispatch-lib.sh` | Dans `_launch_revise_pilot`, après la comparaison `sha256` **réussie** (branche `pre_hash != post_hash`, l.5255) : si les findings réclamaient `Fire-Disposition` et que le plan révisé ne porte toujours pas `^## Fire-Disposition`, écrire un findings-file ciblé (`findings-1-fd.md`) et relancer le pilote de revise **une seule fois**. Le retour reste `0` (le plan *a* changé au premier tour) — la garde ajoute une tentative, elle ne crée pas de mode d'échec. |
+| **U2b** | *(idem)* | **Terminaison, et la distinction qui la rend vraie :** après la seconde tentative, la section est re-testée **pour journaliser, jamais pour reboucler**. La relance est gardée par `_FD_REVISE_RETRIED` (U3), donc un second échec ne peut que produire `fire_disposition_still_missing_after_retry` et rendre la main — il n'existe aucun chemin qui réarme le lancement. C'est ce qui réconcilie « une seule relance » (R3, budget) et AC7 (l'événement doit savoir si la section manque encore) : le prédicat est évalué deux fois, il n'autorise l'action qu'une. |
 | **U3** | `skills/bundled/_shared/dispatch-lib.sh` | Un compteur de garde (`_FD_REVISE_RETRIED`) explicite, remis à zéro à l'entrée de `_launch_revise_pilot`, pour que la terminaison soit lisible sans dérouler le flot de contrôle. |
-| **U4** | `skills/bundled/_shared/test-dispatch-lib.sh` | Tests — voir § Verification Contract. |
+| **U4** | `skills/bundled/_shared/test-dispatch-lib.sh` | Les dix tests T1–T10 — voir § Verification Contract. Portent le harnais de 31 à 41 ; aucune famille d'assertion nouvelle. |
 | **U5** | `docs/solutions/best-practices/fire-disposition-doctrine.md` | Section « Site de production » : la doctrine décrit aujourd'hui la règle et son gate, jamais qui écrit la section. Ajouter les deux sites (prescription `PROMPT`, rattrapage revise) et le renvoi au suivi `mika-platform`. |
 
 ### Journal
@@ -253,9 +280,11 @@ elle se lit aussi « aucun groom n'a tourné ». Lire le volume de dispatches
 
 ## Verification Contract
 
-Le harnais `test-dispatch-lib.sh` existe (32 tests) et porte déjà les deux
-familles employées ici : assertions de **forme de code** (`declare -f` +
-`assert_contains`) et assertions **comportementales** sur worktree temporaire.
+Le harnais `skills/bundled/_shared/test-dispatch-lib.sh` existe — **31** fonctions
+de test au 2026-09-19 (`grep -cE '^test_[a-z0-9_]+\(\)' skills/bundled/_shared/test-dispatch-lib.sh`)
+— et porte déjà les deux familles employées ici : assertions de **forme de code**
+(`declare -f` + `assert_contains`) et assertions **comportementales** sur worktree
+temporaire. T1–T10 portent le total à 41 ; aucune famille nouvelle n'est requise.
 
 | # | Test | Ce qu'il attrape |
 |---|---|---|
@@ -268,6 +297,7 @@ familles employées ici : assertions de **forme de code** (`declare -f` +
 | T7 | **Contrôle négatif** : plan révisé portant déjà `^## Fire-Disposition` ⇒ zéro relance | R4 — le chemin nominal ne paie rien |
 | T8 | Findings-file illisible ⇒ zéro relance, retour inchangé | R5 — fail-safe |
 | T9 | Forme de code : le bras de garde ne contient aucun appel `_arch_ask` | R3 — un futur éditeur qui « améliorerait » la garde en redemandant l'avis de l'architecte doublerait le budget LLM sans qu'aucun test de comportement ne rougisse |
+| T10 | Comportemental : seconde tentative **échouée** ⇒ `fire_disposition_still_missing_after_retry` émis exactement une fois sur `stderr`, retour inchangé, et **aucune troisième** relance | AC7, et la terminaison de U2b. Sans lui, une garde qui rendrait la main en silence sur ce chemin passerait T5 en vert : l'échec de second tour deviendrait indistinguable d'un succès, ce qui est précisément l'angle mort que le plan reproche au critère `sha256` |
 
 **T3, T6 et T7 sont porteurs, pas décoratifs.** Sans eux, une garde qui relance
 *toujours* passerait T5 en vert tout en doublant le coût de chaque grooming du
@@ -308,7 +338,7 @@ critères ci-dessous sont dérivés des Requirements et du Verification Contract
   d'appels architecte par grooming reste de deux au maximum. (T9)
 - **AC7** — `fire_disposition_still_missing_after_retry` est émis, et lui seul,
   quand la seconde tentative échoue : la boucle continue vers le second-pass au
-  lieu de s'interrompre.
+  lieu de s'interrompre, et **aucune troisième relance n'a lieu**. (T10)
 - **AC8** — `docs/solutions/best-practices/fire-disposition-doctrine.md` nomme les
   deux sites de production et le ticket de suivi `mika-platform`.
 
@@ -317,15 +347,17 @@ critères ci-dessous sont dérivés des Requirements et du Verification Contract
 ## Fire-Disposition
 
 Requise par le Fire-Disposition Gate (mika#1574). Les livrables détecteurs de ce
-plan sont les neuf tests T1–T9 de U4, dont **T9 est un scan de forme de code** —
+plan sont les dix tests T1–T10 de U4, dont **T9 est un scan de forme de code** —
 la classe qui peut tirer sur de l'existant.
 
 **Option retenue : (a) exception nommée — table vide, et la vacuité est assertée.**
 
-- **T1–T8** sont des tests de comportement **sur du code que ce plan crée**
-  (`_FIRE_DISPOSITION_RULE`, le bras de garde de `_launch_revise_pilot`). Ils ne
-  peuvent structurellement pas tirer sur de l'existant : leur sujet n'existait pas
-  avant ce plan. Aucune exception concevable.
+- **T1–T8 et T10** sont des tests de comportement **sur du code que ce plan crée**
+  (`_FIRE_DISPOSITION_RULE`, le bras de garde de `_launch_revise_pilot`, le
+  compteur `_FD_REVISE_RETRIED`). Ils ne peuvent structurellement pas tirer sur de
+  l'existant : leur sujet n'existait pas avant ce plan. T10 en particulier asserte
+  l'émission d'un événement que ce plan introduit, sur un chemin que ce plan
+  introduit. Aucune exception concevable.
 - **T9** est le seul à scanner du code préexistant — le corps de
   `_launch_revise_pilot`. Son prédicat porte sur le **bras de garde introduit par
   U2**, jamais sur la fonction entière : `_launch_revise_pilot` ne contient aucun
@@ -347,9 +379,9 @@ délibéré : un U2 qui échouerait sur section manquante aurait déplacé l'ESC
 d'une porte, ce que D2 refuse explicitement.
 
 **Aucun plan existant n'est relu.** Ce travail ne touche ni `verify-pipeline.sh`
-(D2) ni aucun chemin lisant `docs/plans/**` en masse. Les 803 plans sans
-`## Fire-Disposition` restent exactement ce qu'ils sont ; aucune garde introduite
-ici ne les regarde.
+(D2) ni aucun chemin lisant `docs/plans/**` en masse. Les **808** plans sans
+`## Fire-Disposition` (878 − 70, § Population) restent exactement ce qu'ils sont ;
+aucune garde introduite ici ne les regarde.
 
 ---
 
