@@ -135,6 +135,7 @@ fn dispatcher_with_log_dir(db: &AsyncDatabase, pilot_log_dir: &Path) -> Arc<Task
         settings,
         pr_reviews_posted: None,
         auto_pull_stop_armed: AtomicBool::new(false),
+        proactive_budget_reported: std::sync::Mutex::new(None),
     })
 }
 

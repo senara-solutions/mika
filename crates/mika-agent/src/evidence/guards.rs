@@ -1004,6 +1004,286 @@ fn sentence_is_suppressed(text: &str, start: usize, end: usize) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// mika#2358 — Unactioned frequency-promise guard
+// ---------------------------------------------------------------------------
+
+/// Label used for `intent_guard_retries` tracking of the unactioned
+/// frequency-promise guard (mika#2358). Inline guard at position 5e,
+/// immediately after 5d (`false_local_hosting_claim`) whose shape, single-retry
+/// budget and `guard.*` telemetry it reuses.
+///
+/// Same family, one step further along: 5c and 5d refuse a false statement
+/// about the world; this one refuses a **promise with no actor** — a
+/// commitment to change future behaviour that the turn did nothing to bring
+/// about.
+pub(crate) const UNACTIONED_FREQUENCY_PROMISE_LABEL: &str = "unactioned_frequency_promise";
+
+/// Structured result from unactioned-frequency-promise detection.
+pub(crate) struct FrequencyPromiseMatch {
+    /// The frequency / proactive-message predicate captured by Layer A.
+    pub(crate) subject: String,
+    /// The performative assertion captured by Layer B.
+    pub(crate) assertion: String,
+}
+
+/// **Layer A — subject:** the frequency of, or the suspension of, Mika's own
+/// unprompted messages.
+///
+/// `veille` deliberately requires its qualifier (`veille technique`) rather
+/// than standing alone: the bare noun is an ordinary French word for "the day
+/// before", and a guard that fired on « je vais corriger ça la veille » would
+/// be refusing a sentence about a calendar. The general case is carried by the
+/// `plus aucun message` / `une seule fois par jour` forms instead, which are
+/// unambiguous on their own.
+const FREQUENCY_SUBJECT_ALTERNATION: &str = r"(?:
+      veilles?\s+techno\w*
+    | veilles?\s+techniques?
+    | rapports?\s+techniques?
+    | fr[ée]quence
+    | moins\s+souvent
+    | plus\s+(?:aucun|aucune|de)\s+(?:message|veille|rappel|notification|rapport)
+    | (?:un|une)\s+seule?\s+(?:\w+\s+)?par\s+jour
+    | (?:un|une)\s+seule?\s+fois
+    | (?:messages?|rappels?|notifications?|rapports?)\s+(?:proactifs?|automatiques?|spontan[ée]s?|quotidiens?)
+    | frequency
+    | fewer\s+(?:messages|notifications|updates|digests|reports|check-?ins)
+    | once\s+a\s+day
+    | (?:no|not)\s+more\s+(?:messages|notifications|updates|reports|digests)
+    | proactive\s+(?:messages?|check-?ins?|updates?)
+    | daily\s+(?:digest|update|briefing|report)s?
+)";
+
+/// **Layer B — assertion:** a promise, or an affirmation of effect, *carrying
+/// its own grammatical subject*.
+///
+/// That requirement is what makes the layer discriminating rather than lexical,
+/// and it is borrowed from 5d for the same reason: the vocabulary of the
+/// promise overlaps the vocabulary of the true sentence we want Mika to be able
+/// to say. « je ne peux pas régler ça moi-même » also speaks of settings and of
+/// frequency; it is not here, so it cannot fire the guard — and interrogative
+/// and modal forms are absent by construction rather than specially excused.
+///
+/// The optional clitic group (`le`, `la`, `les`, `l'`, `y`, `en`, `te`) is not
+/// decoration: French routinely pronominalises the object it has just named, so
+/// « la fréquence de mes veilles, je **la** réduis » is the *normal* way to
+/// write the subject-first order that this guard also has to catch.
+const FREQUENCY_ASSERTION_ALTERNATION: &str = r"(?:
+      je\s+vais\s+(?:l[ae]\s+|les\s+|l'|t'|te\s+|y\s+|en\s+)?(?:corriger|r[ée]gler|arr[êe]ter|r[ée]duire|changer|ajuster|limiter|baisser|espacer|couper)
+    | je\s+(?:l[ae]\s+|les\s+|l'|y\s+|en\s+)?(?:corrige|r[ée]gle|arr[êe]te|r[ée]duis|change|ajuste|limite|espace|coupe)\b
+    | je\s+n(?:e\s+t'?|'?)envoie\s+plus
+    | je\s+ne?\s*t'?enverrai\s+plus
+    | je\s+n'?enverrai\s+plus
+    | c'?est\s+(?:corrig[ée]|r[ée]gl[ée]|fait|bon|r[ée]par[ée])
+    | i'?ll\s+(?:fix|stop|reduce|change|adjust|limit|lower|cut|send)
+    | i\s+will\s+(?:fix|stop|reduce|change|adjust|limit|lower|cut|send)
+    | i\s+(?:won'?t|will\s+not)\s+send
+    | i'?ve\s+(?:fixed|stopped|reduced|changed|adjusted|limited|cut)
+    | i\s+have\s+(?:fixed|stopped|reduced|changed|adjusted|limited|cut)
+    | (?:it'?s|that'?s|it\s+is)\s+(?:fixed|done|sorted)
+)";
+
+static FREQ_ASSERT_THEN_SUBJECT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
+    || {
+        regex::Regex::new(&format!(
+            r"(?ix)\b(?P<assert>{FREQUENCY_ASSERTION_ALTERNATION})(?P<gap>[^.!?\n]{{0,{CLAIM_GAP_MAX}}}?)(?P<subj>{FREQUENCY_SUBJECT_ALTERNATION})"
+        ))
+        .expect("frequency-promise assert-then-subject regex must compile")
+    },
+);
+
+static FREQ_SUBJECT_THEN_ASSERT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
+    || {
+        regex::Regex::new(&format!(
+            r"(?ix)\b(?P<subj>{FREQUENCY_SUBJECT_ALTERNATION})(?P<gap>[^.!?\n]{{0,{CLAIM_GAP_MAX}}}?)(?P<assert>{FREQUENCY_ASSERTION_ALTERNATION})"
+        ))
+        .expect("frequency-promise subject-then-assert regex must compile")
+    },
+);
+
+/// Admissions of incapacity. A sentence carrying one is **the answer this
+/// guard exists to make possible**, not a violation of it — so it suppresses,
+/// at sentence scope.
+const FREQUENCY_INCAPACITY_MARKERS: &[&str] = &[
+    "je ne peux pas",
+    "je ne peux rien",
+    "je n'ai pas le moyen",
+    "je n'ai aucun moyen",
+    "je ne sais pas comment",
+    "je n'y peux rien",
+    "i can't",
+    "i cannot",
+    "i can not",
+    "i'm not able",
+    "i am not able",
+    "i don't have a way",
+    "i do not have a way",
+    "i have no way",
+];
+
+/// Detects a promise to change the frequency of Mika's own unprompted messages
+/// — or to suspend them — that the turn did nothing to bring about (mika#2358).
+///
+/// # The defect
+///
+/// Asked why she had sent three technical digests when he had asked for one,
+/// Mika answered Al: « Je vais corriger ça concrètement : plus aucun message de
+/// veille technique aujourd'hui. Et demain, un seul — pas deux, pas trois. »
+/// She called no tool. She had none to call: the only reachable gesture on the
+/// cause was cancelling the `heartbeat` row, which expresses "none" and never
+/// "one", and which `revert_config_cancel_recurring_task` undoes at the next
+/// restart (mika#2271). U1 gives the promise an actor; this guard is what makes
+/// the turn reach for it.
+///
+/// # Three terms, all required
+///
+/// - **(C) no actor** — no `set_config` on `proactive_daily_budget` or
+///   `proactive_pause_until` among the turn's summaries. Checked first: it is
+///   free, and "having called the tool is enough" is then a property of this
+///   function rather than a branch of the agent loop.
+/// - **(A) subject** — a frequency or suspension predicate about unprompted
+///   messages.
+/// - **(B) assertion** — a promise or an affirmation of effect carrying its own
+///   subject.
+///
+/// A and B must appear in the same sentence, within [`CLAIM_GAP_MAX`]
+/// characters, in **either order** (French puts the object first as readily as
+/// last), with no contrast conjunction between them and no admission of
+/// incapacity in the sentence.
+///
+/// # What term (C) accepts, and what that costs
+///
+/// An **attempted** `set_config` satisfies it, success or failure — the same
+/// convention as the `callback_terminal_action` family. The cost, named: a
+/// promise resting on a call the tool rejected passes this guard. That is not
+/// an oversight to be patched here; a claim of effect contradicted by a tool
+/// result belongs to the assert-grounded family (mika#1331), and widening this
+/// predicate to cover it would also re-prompt every agent that tried honestly
+/// and reported the failure.
+pub(crate) fn detect_unactioned_frequency_promise(
+    text: &str,
+    tool_summaries: &[ToolCallSummary],
+) -> Option<FrequencyPromiseMatch> {
+    // (C) first — an actor was reached for, so there is nothing to refuse.
+    if frequency_actor_called(tool_summaries) {
+        return None;
+    }
+
+    // Fast path: no subject atom at all → skip both regex passes. Mirrors the
+    // substring atoms of `FREQUENCY_SUBJECT_ALTERNATION`; extending that
+    // constant means extending this list.
+    let lower = text.to_lowercase();
+    let has_candidate = lower.contains("veille")
+        || lower.contains("rapport")
+        || lower.contains("fréquence")
+        || lower.contains("frequence")
+        || lower.contains("frequency")
+        || lower.contains("souvent")
+        || lower.contains("par jour")
+        || lower.contains("une seule fois")
+        || lower.contains("un seule fois")
+        || lower.contains("message")
+        || lower.contains("notification")
+        || lower.contains("rappel")
+        || lower.contains("fewer")
+        || lower.contains("once a day")
+        || lower.contains("proactive")
+        || lower.contains("digest")
+        || lower.contains("briefing")
+        || lower.contains("check-in")
+        || lower.contains("checkin")
+        || lower.contains("update");
+    if !has_candidate {
+        return None;
+    }
+
+    first_surviving_frequency_promise(text, &FREQ_ASSERT_THEN_SUBJECT_RE)
+        .or_else(|| first_surviving_frequency_promise(text, &FREQ_SUBJECT_THEN_ASSERT_RE))
+}
+
+/// Whether the turn reached for the actor U1 exposes.
+///
+/// Reads the tool **name** and its recorded input rather than the response
+/// prose, for the reason mika#2136 had to write down: a satisfaction read from
+/// text punishes every agent that told the truth in unexpected words.
+fn frequency_actor_called(tool_summaries: &[ToolCallSummary]) -> bool {
+    tool_summaries.iter().any(|s| {
+        s.name == "set_config"
+            && (s
+                .input_summary
+                .contains(crate::config_keys::PROACTIVE_DAILY_BUDGET_KEY)
+                || s.input_summary
+                    .contains(crate::config_keys::PROACTIVE_PAUSE_UNTIL_KEY))
+    })
+}
+
+/// Walk every match of `re` and return the first one no suppressor cancels.
+///
+/// Iterating rather than taking `find()` matters for the same reason it does in
+/// [`first_surviving_claim`]: an honest sentence and a bare promise can share a
+/// response, and stopping at the first *syntactic* match would let a suppressed
+/// one mask a real violation further down.
+fn first_surviving_frequency_promise(
+    text: &str,
+    re: &regex::Regex,
+) -> Option<FrequencyPromiseMatch> {
+    for caps in re.captures_iter(text) {
+        let whole = caps.get(0)?;
+        let gap = caps
+            .name("gap")
+            .map(|m| format!(" {} ", m.as_str().to_lowercase()))
+            .unwrap_or_default();
+
+        // A contrast conjunction means the two halves are not predicated of one
+        // another (« je vais corriger le bug, mais la fréquence, je n'y peux
+        // rien »). Gap negations are deliberately NOT rejected here, unlike 5d:
+        // the measured claim carries « plus aucun » inside its own subject and
+        // « pas deux, pas trois » in the same breath.
+        if CLAIM_GAP_CONTRASTS.iter().any(|c| gap.contains(c)) {
+            continue;
+        }
+        if frequency_sentence_is_suppressed(text, whole.start(), whole.end()) {
+            continue;
+        }
+
+        return Some(FrequencyPromiseMatch {
+            subject: caps.name("subj")?.as_str().to_string(),
+            assertion: caps.name("assert")?.as_str().to_string(),
+        });
+    }
+    None
+}
+
+/// Whether the sentence enclosing `[start, end)` disqualifies the match: it is
+/// a question, or it admits an incapacity.
+///
+/// Byte offsets come from regex match boundaries and from `find`/`rfind` over
+/// `char` patterns, so every slice below lands on a character boundary.
+fn frequency_sentence_is_suppressed(text: &str, start: usize, end: usize) -> bool {
+    const TERMINATORS: [char; 4] = ['.', '!', '?', '\n'];
+
+    let sentence_start = text[..start]
+        .rfind(TERMINATORS)
+        .map(|i| i + 1)
+        .unwrap_or(0)
+        .min(start);
+    let (sentence_end, terminator) = match text[end..].find(TERMINATORS) {
+        Some(offset) => (end + offset, text[end + offset..].chars().next()),
+        None => (text.len(), None),
+    };
+
+    // Asking whether to reduce is not promising to («  tu veux que je réduise
+    // la fréquence ? »).
+    if terminator == Some('?') {
+        return true;
+    }
+
+    let sentence = text[sentence_start..sentence_end].to_lowercase();
+    FREQUENCY_INCAPACITY_MARKERS
+        .iter()
+        .any(|marker| sentence.contains(marker))
+}
+
+// ---------------------------------------------------------------------------
 // mika#1646 — Destructive-action grounding guard (pre-execution)
 // ---------------------------------------------------------------------------
 //
@@ -2828,6 +3108,207 @@ mod tests {
                     Et de toute façon tout tourne en local chez toi.";
         detect_false_local_hosting_claim(text, Deployment::Cloud)
             .expect("the second sentence is a violation and must still be caught");
+    }
+
+    // -- detect_unactioned_frequency_promise tests (mika#2358) --
+
+    fn no_tools() -> Vec<ToolCallSummary> {
+        Vec::new()
+    }
+
+    fn summary(name: &str, input: &str) -> ToolCallSummary {
+        ToolCallSummary {
+            step: 0,
+            name: name.to_string(),
+            input_summary: input.to_string(),
+            output_summary: "ok".to_string(),
+            success: true,
+            non_zero_exit: false,
+        }
+    }
+
+    /// The sentence Mika actually sent Al on 2026-09-17, with no tool called.
+    #[test]
+    fn mika2358_the_measured_promise_fires_without_an_actor() {
+        let text = "Oui, tu as raison. Je t'ai encore envoyé plusieurs veilles \
+                    aujourd'hui, alors que tu m'avais explicitement demandé de ne le \
+                    faire qu'une seule fois. C'est une erreur de ma part, point. Je \
+                    vais corriger ça concrètement : plus aucun message de veille \
+                    technique aujourd'hui. Et demain, un seul — pas deux, pas trois. \
+                    Désolé pour le radotage, Alex.";
+
+        let m = detect_unactioned_frequency_promise(text, &no_tools())
+            .expect("a promise with no actor must be refused");
+        assert!(
+            m.assertion.to_lowercase().contains("corriger"),
+            "assertion = {:?}",
+            m.assertion
+        );
+    }
+
+    /// **The control that distinguishes "the guard reads the calls" from "the
+    /// guard reads a word".** Same text, one `set_config` on one of the two
+    /// keys, and the turn passes.
+    #[test]
+    fn mika2358_the_same_text_passes_once_the_actor_was_called() {
+        let text = "Je vais corriger ça concrètement : plus aucun message de veille \
+                    technique aujourd'hui. Et demain, un seul.";
+
+        for key in [
+            crate::config_keys::PROACTIVE_DAILY_BUDGET_KEY,
+            crate::config_keys::PROACTIVE_PAUSE_UNTIL_KEY,
+        ] {
+            let calls = vec![summary(
+                "set_config",
+                &format!("{{\"key\":\"{key}\",\"value\":\"1\"}}"),
+            )];
+            assert!(
+                detect_unactioned_frequency_promise(text, &calls).is_none(),
+                "a turn that reached for {key} has an actor"
+            );
+        }
+    }
+
+    /// A `set_config` on some other key is not this actor.
+    #[test]
+    fn mika2358_a_set_config_on_another_key_is_not_the_actor() {
+        let text = "Je vais corriger ça : plus aucun message de veille technique.";
+        let calls = vec![summary(
+            "set_config",
+            r#"{"key":"timezone","value":"Asia/Ho_Chi_Minh"}"#,
+        )];
+        detect_unactioned_frequency_promise(text, &calls)
+            .expect("setting the timezone changes no frequency");
+    }
+
+    /// The three shapes AC8 requires to pass. Each is a sentence the guard
+    /// exists to make *possible*, not one it exists to catch.
+    #[test]
+    fn mika2358_honest_shapes_pass() {
+        // 1. An admission of incapacity — the answer the correction offers.
+        assert!(
+            detect_unactioned_frequency_promise(
+                "Je ne peux pas régler la fréquence de mes veilles moi-même.",
+                &no_tools()
+            )
+            .is_none(),
+            "an admission of incapacity must pass"
+        );
+        assert!(
+            detect_unactioned_frequency_promise(
+                "I can't change how often I send you these reports on my own.",
+                &no_tools()
+            )
+            .is_none(),
+            "the English admission must pass too"
+        );
+
+        // 2. A question — asking is not promising.
+        assert!(
+            detect_unactioned_frequency_promise(
+                "Tu veux que je réduise la fréquence de mes veilles techniques ?",
+                &no_tools()
+            )
+            .is_none(),
+            "an interrogative restatement is not an assertion"
+        );
+
+        // 3. A post-action statement: the actor was called, so it is true.
+        let calls = vec![summary(
+            "set_config",
+            r#"{"key":"proactive_daily_budget","value":"1"}"#,
+        )];
+        assert!(
+            detect_unactioned_frequency_promise(
+                "C'est réglé : au plus un réveil par jour désormais.",
+                &calls
+            )
+            .is_none(),
+            "an affirmation that follows the call is exactly what the guard wants"
+        );
+    }
+
+    /// Speaking of frequency without promising anything passes — the guard is
+    /// a conjunction, not a keyword filter.
+    #[test]
+    fn mika2358_speaking_of_frequency_without_promising_passes() {
+        for text in [
+            "En ce moment je t'envoie jusqu'à trois veilles techniques par jour.",
+            "La fréquence de mes messages proactifs est réglable.",
+            "You currently get up to three daily digests from me.",
+        ] {
+            assert!(
+                detect_unactioned_frequency_promise(text, &no_tools()).is_none(),
+                "no performative assertion, no guard: {text:?}"
+            );
+        }
+    }
+
+    /// Promising something unrelated passes — Layer A is a real term.
+    #[test]
+    fn mika2358_a_promise_about_something_else_passes() {
+        assert!(
+            detect_unactioned_frequency_promise(
+                "Je vais corriger ça : le fichier de config avait une faute de frappe.",
+                &no_tools()
+            )
+            .is_none(),
+            "a promise with no frequency subject is none of this guard's business"
+        );
+    }
+
+    /// French puts the object first as readily as last, so both orders fire.
+    #[test]
+    fn mika2358_both_word_orders_fire() {
+        detect_unactioned_frequency_promise(
+            "La fréquence de mes veilles, je la réduis dès maintenant.",
+            &no_tools(),
+        )
+        .expect("subject-then-assertion must fire");
+
+        detect_unactioned_frequency_promise(
+            "I'll reduce the daily digests starting today.",
+            &no_tools(),
+        )
+        .expect("assertion-then-subject must fire, in English too");
+    }
+
+    /// A contrast conjunction between the two layers means they are not
+    /// predicated of one another.
+    #[test]
+    fn mika2358_a_contrast_conjunction_suppresses() {
+        assert!(
+            detect_unactioned_frequency_promise(
+                "Je vais corriger le bug, mais la fréquence de mes veilles ne dépend pas de moi.",
+                &no_tools()
+            )
+            .is_none(),
+            "`mais` breaks the predication"
+        );
+    }
+
+    /// A suppressed match must not mask a real one later in the same response.
+    #[test]
+    fn mika2358_a_suppressed_match_does_not_mask_a_later_promise() {
+        let text = "Tu veux que je réduise la fréquence ? \
+                    De toute façon je vais corriger ça : plus aucun message de veille \
+                    technique aujourd'hui.";
+        detect_unactioned_frequency_promise(text, &no_tools())
+            .expect("the second sentence is a bare promise and must still be caught");
+    }
+
+    /// `veille` alone is the ordinary French word for "the day before". It must
+    /// not, on its own, make a sentence about a calendar into a violation.
+    #[test]
+    fn mika2358_the_bare_word_veille_is_not_a_subject() {
+        assert!(
+            detect_unactioned_frequency_promise(
+                "Je vais corriger ça la veille de ton départ.",
+                &no_tools()
+            )
+            .is_none(),
+            "`la veille` = the day before; the qualifier is what makes it a subject"
+        );
     }
 
     // -- mika#1646 destructive-action grounding tests --
