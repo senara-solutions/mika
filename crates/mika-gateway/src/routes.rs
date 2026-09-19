@@ -21,13 +21,14 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::a2a_routes;
+use crate::copy::{self, UserMessage};
 use crate::egress_fetch;
 use crate::egress_search;
 use crate::github;
 use crate::orchestrator_inbox;
 use crate::telegram::{
-    CustomerTelegramClient, ParsedMessage, TelegramApiError, TelegramClient, TelegramUpdate,
-    parse_agent_prefix, parse_update,
+    CustomerTelegramClient, Locale, LocaleSource, ParsedMessage, TelegramApiError, TelegramClient,
+    TelegramUpdate, parse_agent_prefix, parse_update, resolve_locale,
 };
 
 /// Carries HTTP method and path from request to response extensions,
@@ -473,6 +474,7 @@ pub(crate) async fn handle_webhook(
     };
 
     let parsed = parse_update(&update);
+    let (locale, locale_source) = resolve_locale(&update);
 
     // Periodic cleanup of old outbound message mappings (~every 100 webhooks)
     let count = state.webhook_counter.fetch_add(1, Ordering::Relaxed);
@@ -494,7 +496,7 @@ pub(crate) async fn handle_webhook(
     let s = state.clone();
     tokio::spawn(async move {
         let _permit = permit; // held until task completes
-        dispatch_parsed_message(&s, &tg, parsed).await;
+        dispatch_parsed_message(&s, &tg, parsed, locale, locale_source).await;
     });
 
     StatusCode::OK
@@ -570,6 +572,7 @@ pub(crate) async fn handle_customer_webhook(
     };
 
     let parsed = parse_update(&update);
+    let (locale, locale_source) = resolve_locale(&update);
 
     // Periodic cleanup of old outbound message mappings (~every 100 webhooks)
     let count = state.webhook_counter.fetch_add(1, Ordering::Relaxed);
@@ -587,7 +590,7 @@ pub(crate) async fn handle_customer_webhook(
     let s = state.clone();
     tokio::spawn(async move {
         let _permit = permit; // held until task completes
-        dispatch_parsed_message(&s, &tg, parsed).await;
+        dispatch_parsed_message(&s, &tg, parsed, locale, locale_source).await;
     });
 
     StatusCode::OK
@@ -595,17 +598,43 @@ pub(crate) async fn handle_customer_webhook(
 
 /// Dispatch a parsed Telegram message to the appropriate handler.
 /// Shared between `handle_webhook` (single-bot) and `handle_customer_webhook` (per-customer).
+///
+/// `locale` is a **required** argument (mika#2025 M6). There is one dispatch
+/// site and two parse sites, so making it mandatory here means the compiler —
+/// not a convention — forces both callers to resolve a language. `locale_source`
+/// rides along for `gateway_locale_resolved`; it decides nothing.
 async fn dispatch_parsed_message(
     state: &AppState,
     tg: &CustomerTelegramClient,
     parsed: ParsedMessage,
+    locale: Locale,
+    locale_source: LocaleSource,
 ) {
+    // mika#2025 D6 — observability bounded by the rarity of the path, not by a
+    // threshold. The gateway sees every Telegram message of every tenant, so a
+    // line per resolved message would drown the signal it exists to raise
+    // (mika#2131). Commands only; the `Text` path, which carries the volume,
+    // emits nothing.
+    if let ParsedMessage::Start { chat_id, .. }
+    | ParsedMessage::BareStart { chat_id }
+    | ParsedMessage::Unlink { chat_id, .. }
+    | ParsedMessage::UnlinkConfirm { chat_id } = &parsed
+    {
+        info!(
+            event = "gateway_locale_resolved",
+            chat_id = *chat_id,
+            locale = locale.as_str(),
+            locale_source = locale_source.as_str(),
+            "resolved the language for a gateway command reply"
+        );
+    }
+
     match parsed {
         ParsedMessage::Start {
             chat_id,
             pairing_token,
         } => {
-            handle_pairing(state, tg, chat_id, &pairing_token).await;
+            handle_pairing(state, tg, chat_id, &pairing_token, locale).await;
         }
         ParsedMessage::Text {
             chat_id,
@@ -622,6 +651,7 @@ async fn dispatch_parsed_message(
                 update_id,
                 reply_to_message_id,
                 reply_to_text.as_deref(),
+                locale,
             )
             .await;
         }
@@ -642,6 +672,7 @@ async fn dispatch_parsed_message(
                 update_id,
                 reply_to_message_id,
                 reply_to_text.as_deref(),
+                locale,
             )
             .await;
         }
@@ -664,30 +695,28 @@ async fn dispatch_parsed_message(
                 update_id,
                 reply_to_message_id,
                 reply_to_text.as_deref(),
+                locale,
             )
             .await;
         }
         ParsedMessage::BareStart { chat_id } => {
             let _ = tg
-                .send_message(
-                    chat_id,
-                    "Welcome! If you have an invite link, please use it to get started. If you're already set up, just type a message.",
-                )
+                .send_message(chat_id, copy::render(UserMessage::BareStartWelcome, locale))
                 .await;
         }
-        ParsedMessage::Unlink { chat_id } => {
-            handle_unlink(state, tg, chat_id).await;
+        ParsedMessage::Unlink {
+            chat_id,
+            unrecognized_suffix,
+        } => {
+            handle_unlink(state, tg, chat_id, unrecognized_suffix.as_deref(), locale).await;
         }
         ParsedMessage::UnlinkConfirm { chat_id } => {
-            handle_unlink_confirm(state, tg, chat_id).await;
+            handle_unlink_confirm(state, tg, chat_id, locale).await;
         }
         ParsedMessage::Unsupported { chat_id } => {
             // Fire-and-forget reply for non-image media (sticker/voice/video/etc.)
             let _ = tg
-                .send_message(
-                    chat_id,
-                    "I can read text and image messages. This media type isn't supported yet.",
-                )
+                .send_message(chat_id, copy::render(UserMessage::UnsupportedMedia, locale))
                 .await;
         }
         ParsedMessage::NoMessage => {
@@ -731,6 +760,7 @@ async fn resolve_customer(
     state: &AppState,
     tg: &CustomerTelegramClient,
     chat_id: i64,
+    locale: Locale,
 ) -> Option<CustomerRow> {
     match sqlx::query_as::<_, CustomerRow>(
         "SELECT id, status FROM customers WHERE telegram_chat_id = $1",
@@ -742,16 +772,13 @@ async fn resolve_customer(
         Ok(Some(c)) => Some(c),
         Ok(None) => {
             let _ = tg
-                .send_message(
-                    chat_id,
-                    "Please pair your account first. Use your invite link to get started.",
-                )
+                .send_message(chat_id, copy::render(UserMessage::NotPaired, locale))
                 .await;
             None
         }
         Err(e) => {
             warn!(error = %e, chat_id, "customer lookup failed");
-            reply_transient_error(tg, chat_id).await;
+            reply_transient_error(tg, chat_id, locale).await;
             None
         }
     }
@@ -792,6 +819,7 @@ async fn reset_dedup(state: &AppState, customer_id: Uuid, update_id: i64) {
 
 /// Handle the result of forwarding a message to a customer container.
 /// On success: no-op. On error response: warn + reply. On network failure: reset dedup + warn + reply.
+#[allow(clippy::too_many_arguments)]
 async fn handle_forward_result(
     state: &AppState,
     tg: &CustomerTelegramClient,
@@ -800,6 +828,7 @@ async fn handle_forward_result(
     customer_id: Uuid,
     update_id: i64,
     msg_kind: &str,
+    locale: Locale,
 ) {
     match result {
         Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 202 => {
@@ -808,13 +837,13 @@ async fn handle_forward_result(
         Ok(resp) => {
             let status = resp.status().as_u16();
             warn!(status, %customer_id, "container returned error for {msg_kind}");
-            reply_transient_error(tg, chat_id).await;
+            reply_transient_error(tg, chat_id, locale).await;
         }
         Err(e) => {
             reset_dedup(state, customer_id, update_id).await;
             let is_connect = e.is_connect();
             warn!(error = %e, %customer_id, is_connect, "container unreachable for {msg_kind}, dedup reset");
-            let msg = forward_error_message(is_connect);
+            let msg = forward_error_message(is_connect, locale);
             let _ = tg.send_message(chat_id, msg).await;
         }
     }
@@ -823,6 +852,7 @@ async fn handle_forward_result(
 // -- Text message routing --
 
 /// Route a text message to the correct customer container.
+#[allow(clippy::too_many_arguments)]
 async fn handle_text_message(
     state: &AppState,
     tg: &CustomerTelegramClient,
@@ -831,8 +861,9 @@ async fn handle_text_message(
     update_id: i64,
     reply_to_message_id: Option<i64>,
     reply_to_text: Option<&str>,
+    locale: Locale,
 ) {
-    let row = match resolve_customer(state, tg, chat_id).await {
+    let row = match resolve_customer(state, tg, chat_id, locale).await {
         Some(r) => r,
         None => return,
     };
@@ -883,7 +914,10 @@ async fn handle_text_message(
         .send()
         .await;
 
-    handle_forward_result(state, tg, result, chat_id, row.id, update_id, "text").await;
+    handle_forward_result(
+        state, tg, result, chat_id, row.id, update_id, "text", locale,
+    )
+    .await;
 }
 
 // -- Photo message routing --
@@ -903,8 +937,9 @@ async fn handle_photo_message(
     update_id: i64,
     reply_to_message_id: Option<i64>,
     reply_to_text: Option<&str>,
+    locale: Locale,
 ) {
-    let row = match resolve_customer(state, tg, chat_id).await {
+    let row = match resolve_customer(state, tg, chat_id, locale).await {
         Some(r) => r,
         None => return,
     };
@@ -919,10 +954,7 @@ async fn handle_photo_message(
         Ok(img) => img,
         Err(TelegramApiError::BadRequest { ref message }) if message.contains("too large") => {
             let _ = tg
-                .send_message(
-                    chat_id,
-                    "That image is too large for me to process. Please send a smaller photo (under 5 MB).",
-                )
+                .send_message(chat_id, copy::render(UserMessage::PhotoTooLarge, locale))
                 .await;
             return;
         }
@@ -930,7 +962,7 @@ async fn handle_photo_message(
             let _ = tg
                 .send_message(
                     chat_id,
-                    "I couldn't recognize that image format. Please send a JPEG, PNG, GIF, or WebP image.",
+                    copy::render(UserMessage::PhotoUnsupportedFormat, locale),
                 )
                 .await;
             return;
@@ -940,7 +972,7 @@ async fn handle_photo_message(
             let _ = tg
                 .send_message(
                     chat_id,
-                    "Sorry, I couldn't download your photo. Please try sending it again.",
+                    copy::render(UserMessage::PhotoDownloadFailed, locale),
                 )
                 .await;
             return;
@@ -1009,7 +1041,10 @@ async fn handle_photo_message(
         .send()
         .await;
 
-    handle_forward_result(state, tg, result, chat_id, row.id, update_id, "photo").await;
+    handle_forward_result(
+        state, tg, result, chat_id, row.id, update_id, "photo", locale,
+    )
+    .await;
 }
 
 // -- Admin: customer registration (mika#1609) --
@@ -1756,11 +1791,12 @@ async fn handle_pairing(
     tg: &CustomerTelegramClient,
     chat_id: i64,
     pairing_token: &str,
+    locale: Locale,
 ) {
     // Reject malformed tokens before hitting the database
     if !is_valid_pairing_token(pairing_token) {
         let _ = tg
-            .send_message(chat_id, "Invalid or expired invite link.")
+            .send_message(chat_id, copy::render(UserMessage::InvalidInvite, locale))
             .await;
         return;
     }
@@ -1805,9 +1841,11 @@ async fn handle_pairing(
                 .await;
         }
         Ok(None) => {
-            // Don't reveal why — could be expired, used, or invalid
+            // Don't reveal why — could be expired, used, or invalid. Same key as
+            // the malformed-token branch above: they were two identical literals
+            // before mika#2025 and are one key now.
             let _ = tg
-                .send_message(chat_id, "Invalid or expired invite link.")
+                .send_message(chat_id, copy::render(UserMessage::InvalidInvite, locale))
                 .await;
         }
         Err(e) => {
@@ -1819,11 +1857,9 @@ async fn handle_pairing(
                     .is_some_and(|c| c.contains("telegram_chat_id"));
 
                 let msg = if already_linked {
-                    "This Telegram account is already linked to another Mika account. \
-                     If it's an account you control, send /unlink from that account \
-                     first, then click your invite link again. Otherwise, contact support."
+                    copy::render(UserMessage::TelegramAlreadyLinked, locale)
                 } else {
-                    "Pairing failed. Please contact support."
+                    copy::render(UserMessage::PairingFailed, locale)
                 };
 
                 // Record the guard's verdict so the console can show it
@@ -1846,7 +1882,7 @@ async fn handle_pairing(
                 return;
             }
             warn!(error = %e, chat_id, "pairing query failed");
-            reply_transient_error(tg, chat_id).await;
+            reply_transient_error(tg, chat_id, locale).await;
         }
     }
 }
@@ -1905,28 +1941,60 @@ async fn record_pairing_rejection(state: &AppState, pairing_token: &str, reason:
 /// If paired, replies with a warning message telling the user to send
 /// `/unlink confirm` to commit. This handler NEVER mutates the DB — the
 /// confirmation happens in `handle_unlink_confirm`.
-async fn handle_unlink(state: &AppState, tg: &CustomerTelegramClient, chat_id: i64) {
+///
+/// `unrecognized_suffix` (mika#2025) separates three states the handler used to
+/// answer identically: a first `/unlink`, a repeated one, and a confirmation the
+/// user *tried* and misspelled. Only the third gets a different reply — the
+/// first two are the same request and the same answer. The `Ok(None)` branch
+/// comes first and is untouched: "you are not linked" precedes the question of
+/// what the suffix said.
+async fn handle_unlink(
+    state: &AppState,
+    tg: &CustomerTelegramClient,
+    chat_id: i64,
+    unrecognized_suffix: Option<&str>,
+    locale: Locale,
+) {
     let row = sqlx::query_scalar::<_, Uuid>("SELECT id FROM customers WHERE telegram_chat_id = $1")
         .bind(chat_id)
         .fetch_optional(&state.pool)
         .await;
 
     match row {
-        Ok(Some(_)) => {
-            let msg = "⚠️ Unlinking will release your Telegram from this Mika account.\n\
-                       You will need a new invite link from your admin to re-pair.\n\
-                       This cannot be undone.\n\n\
-                       To confirm, send: /unlink confirm";
-            let _ = tg.send_message(chat_id, msg).await;
-        }
+        Ok(Some(_)) => match unrecognized_suffix {
+            Some(suffix) => {
+                // mika#2025 D6 — the refused suffix is NEVER logged: it is user
+                // content, at the standard mika#2126 set and mika#2291 restated.
+                // It is quoted to the user, not to the operator. Expected regime
+                // NON-empty: this line is the measurement of whether the
+                // `confirmer` alias covers the forms people actually type.
+                info!(
+                    event = "unlink_suffix_unrecognized",
+                    chat_id,
+                    locale = locale.as_str(),
+                    "user sent /unlink with a suffix that is not a confirmation"
+                );
+                let _ = tg
+                    .send_message(
+                        chat_id,
+                        &copy::render_unlink_suffix_unrecognized(suffix, locale),
+                    )
+                    .await;
+            }
+            None => {
+                let _ = tg
+                    .send_message(chat_id, copy::render(UserMessage::UnlinkWarning, locale))
+                    .await;
+            }
+        },
         Ok(None) => {
             let _ = tg
-                .send_message(chat_id, "Your Telegram is not linked to any Mika account.")
+                .send_message(chat_id, copy::render(UserMessage::UnlinkNotLinked, locale))
                 .await;
         }
         Err(e) => {
             warn!(error = %e, chat_id, "unlink lookup query failed");
-            reply_transient_error(tg, chat_id).await;
+            reply_transient_error(tg, chat_id, locale).await;
         }
     }
 }
@@ -1934,7 +2002,12 @@ async fn handle_unlink(state: &AppState, tg: &CustomerTelegramClient, chat_id: i
 /// Handle `/unlink confirm` — commit the self-unlink. Atomic UPDATE releases
 /// `telegram_chat_id`. Idempotent: if the chat_id is already unbound (or cold
 /// `/unlink confirm` without prior `/unlink`), replies "nothing to unlink."
-async fn handle_unlink_confirm(state: &AppState, tg: &CustomerTelegramClient, chat_id: i64) {
+async fn handle_unlink_confirm(
+    state: &AppState,
+    tg: &CustomerTelegramClient,
+    chat_id: i64,
+    locale: Locale,
+) {
     let result = sqlx::query_scalar::<_, Uuid>(
         "UPDATE customers SET telegram_chat_id = NULL WHERE telegram_chat_id = $1 RETURNING id",
     )
@@ -1950,25 +2023,20 @@ async fn handle_unlink_confirm(state: &AppState, tg: &CustomerTelegramClient, ch
                 "customer self-unlinked telegram binding"
             );
             let _ = tg
-                .send_message(
-                    chat_id,
-                    "✅ Unlinked. Your invite link (or a new one) will pair a fresh \
-                     session when you're ready.",
-                )
+                .send_message(chat_id, copy::render(UserMessage::UnlinkConfirmed, locale))
                 .await;
         }
         Ok(None) => {
             let _ = tg
                 .send_message(
                     chat_id,
-                    "Nothing to unlink. Send /unlink first if you meant to release \
-                     a Telegram binding.",
+                    copy::render(UserMessage::UnlinkNothingToUnlink, locale),
                 )
                 .await;
         }
         Err(e) => {
             warn!(error = %e, chat_id, "unlink confirm query failed");
-            reply_transient_error(tg, chat_id).await;
+            reply_transient_error(tg, chat_id, locale).await;
         }
     }
 }
@@ -2920,28 +2988,26 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     bool::from(a.as_bytes().ct_eq(b.as_bytes()))
 }
 
-/// User-facing message for transient errors (timeout, broken pipe, etc.).
-const TRANSIENT_ERROR_MSG: &str = "I'm having trouble right now. Please try again in a moment.";
-
-/// User-facing message when the agent container is unreachable (connection refused, DNS failure).
-const OFFLINE_ERROR_MSG: &str = "Your Mika assistant is currently offline. \
-     Please contact your administrator or check your subscription status \
-     at console.getmika.ai.";
-
 /// Classify a forwarding error into a user-facing reply message.
 /// Connect errors (connection refused, DNS failure) indicate the agent is offline.
 /// Other errors (timeout, broken pipe) are transient.
-fn forward_error_message(is_connect: bool) -> &'static str {
+///
+/// The two `const`s this used to select between are now `copy::` keys
+/// (mika#2025): the classification was already a pure function, so it was the
+/// exact anchor for the branch and keeps its shape.
+fn forward_error_message(is_connect: bool, locale: Locale) -> &'static str {
     if is_connect {
-        OFFLINE_ERROR_MSG
+        copy::render(UserMessage::AgentOffline, locale)
     } else {
-        TRANSIENT_ERROR_MSG
+        copy::render(UserMessage::TransientError, locale)
     }
 }
 
 /// Send a generic transient error reply (fire-and-forget).
-async fn reply_transient_error(tg: &CustomerTelegramClient, chat_id: i64) {
-    let _ = tg.send_message(chat_id, TRANSIENT_ERROR_MSG).await;
+async fn reply_transient_error(tg: &CustomerTelegramClient, chat_id: i64, locale: Locale) {
+    let _ = tg
+        .send_message(chat_id, copy::render(UserMessage::TransientError, locale))
+        .await;
 }
 
 // -- DB row types (for sqlx runtime queries) --
@@ -3220,7 +3286,7 @@ mod tests {
 
     #[test]
     fn test_forward_error_message_connect() {
-        let msg = forward_error_message(true);
+        let msg = forward_error_message(true, Locale::En);
         assert!(
             msg.contains("offline"),
             "connect errors should mention offline"
@@ -3233,7 +3299,7 @@ mod tests {
 
     #[test]
     fn test_forward_error_message_other() {
-        let msg = forward_error_message(false);
+        let msg = forward_error_message(false, Locale::En);
         assert!(
             msg.contains("try again"),
             "non-connect errors should suggest retry"
@@ -3242,6 +3308,22 @@ mod tests {
             !msg.contains("offline"),
             "non-connect errors should not mention offline"
         );
+    }
+
+    /// mika#2025 — the classification is the same in both languages, and the
+    /// console URL is an invariant rather than copy.
+    #[test]
+    fn mika2025_forward_error_message_classifies_identically_in_french() {
+        let offline = forward_error_message(true, Locale::Fr);
+        assert!(offline.contains("hors ligne"), "{offline:?}");
+        assert!(
+            offline.contains("console.getmika.ai"),
+            "the console URL is an invariant, not copy: {offline:?}"
+        );
+
+        let transient = forward_error_message(false, Locale::Fr);
+        assert!(transient.contains("Réessaie"), "{transient:?}");
+        assert!(!transient.contains("hors ligne"), "{transient:?}");
     }
 
     // -- generate_pairing_token / generate_webhook_secret tests --
@@ -4337,6 +4419,170 @@ mod tests {
                 total, 1,
                 "the literal must have exactly one production site (the constant); found: {sites:?}"
             );
+        }
+    }
+
+    /// mika#2025 — user-facing copy has one producer, and only a scan can hold it.
+    mod mika2025_copy_has_one_producer {
+        /// Call sites of `send_message` that were handed a string literal.
+        ///
+        /// Walks the argument list of every `.send_message(` with balanced
+        /// parentheses — a fixed window would stop mid-call on the multi-line
+        /// forms `rustfmt` produces, and report clean on exactly the sites the
+        /// guard exists to see. Line comments are stripped first: this module's
+        /// own prose names the construct it forbids, and a guard that could not
+        /// tolerate being described would force the documentation to go quiet
+        /// about the rule it carries.
+        fn literal_argument_sites(production: &str) -> Vec<String> {
+            let code: String = production
+                .lines()
+                .map(|l| match l.find("//") {
+                    Some(i) => &l[..i],
+                    None => l,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let mut sites = Vec::new();
+            let mut rest = code.as_str();
+            while let Some(at) = rest.find(".send_message(") {
+                let args_start = at + ".send_message(".len();
+                let mut depth = 1usize;
+                let mut end = args_start;
+                for (offset, c) in rest[args_start..].char_indices() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = args_start + offset;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let args = &rest[args_start..end];
+                if args.contains('"') {
+                    sites.push(args.split_whitespace().collect::<Vec<_>>().join(" "));
+                }
+                rest = &rest[end.max(args_start)..];
+            }
+            sites
+        }
+
+        /// Sites exempt from the rule. **Ships empty, and stays empty.**
+        ///
+        /// When the guard reddens, the resolution is to route the string through
+        /// `copy::` — never to add an entry here. An entry decides that one
+        /// message is served in English to every user, which is the defect
+        /// mika#2025 closed and needs its own ticket to reopen. Same rule, same
+        /// wording, as `ACTOR_READING_PREDICATES_ALLOWED` (mika#2323).
+        const SEND_MESSAGE_LITERAL_ALLOWED: &[(&str, &str)] = &[];
+
+        /// mika#2025 V10 / RI2 / AC4 — no literal reaches a send site.
+        ///
+        /// **No behavioural test can see this regression.** A seventeenth
+        /// hard-coded English string makes no decision wrong and fails no
+        /// assertion; it quietly restores the original defect on one key. So the
+        /// guard is structural, and it is the only thing standing between this
+        /// module and a slow return to where it started.
+        #[test]
+        fn mika2025_v10_no_string_literal_reaches_a_send_site() {
+            let scanner =
+                mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+
+            let mut violations: Vec<String> = Vec::new();
+            let mut call_sites = 0usize;
+            for file in scanner.files() {
+                let production = scanner.production_of(&file);
+                call_sites += production.matches(".send_message(").count();
+                for args in literal_argument_sites(&production) {
+                    violations.push(format!("{}: send_message({args})", file.display()));
+                }
+            }
+
+            // Anti-vacuity on the real tree (mika#2205). The fabricated-input
+            // control below proves the detector works; this proves it was
+            // pointed at something. A `files()` that returned nothing, or a
+            // masking bug that blanked production, would otherwise leave the
+            // assertion below permanently, silently green — which is the exact
+            // failure mode a structural guard exists to not have.
+            assert!(
+                call_sites >= 8,
+                "the scan found only {call_sites} send_message call sites in the \
+                 crate's production sources — it is looking at nothing, not \
+                 finding nothing"
+            );
+
+            let allowed: Vec<&str> = SEND_MESSAGE_LITERAL_ALLOWED
+                .iter()
+                .map(|(site, _)| *site)
+                .collect();
+            let unexpected: Vec<&String> = violations
+                .iter()
+                .filter(|v| !allowed.iter().any(|a| v.contains(a)))
+                .collect();
+
+            assert!(
+                unexpected.is_empty(),
+                "mika#2025 R6/AC4 VIOLATED — these send sites carry a string \
+                 literal, so they serve one language to every user whatever \
+                 their own: {unexpected:#?}. Resolution: add a `copy::UserMessage` \
+                 key and render it. Adding an entry to \
+                 SEND_MESSAGE_LITERAL_ALLOWED decides that a message stays \
+                 English-only and needs its own ticket."
+            );
+
+            // Self-cleaning half: an allowlist entry matching no real violation
+            // is a stale permission, and stale permissions are how an exception
+            // outlives its reason.
+            for (site, ticket) in SEND_MESSAGE_LITERAL_ALLOWED {
+                assert!(
+                    violations.iter().any(|v| v.contains(site)),
+                    "stale allowlist entry {site:?} (ticket {ticket}) — remove it"
+                );
+            }
+        }
+
+        /// Negative control (mika#2205) — the scan can see a violation at all.
+        ///
+        /// Without this, a detector that returned nothing would leave the guard
+        /// above permanently, silently green: "the scan found nothing" and "the
+        /// scan looked at nothing" are the same result until one of them is
+        /// falsified.
+        #[test]
+        fn mika2025_v10_the_scan_detects_a_fabricated_literal() {
+            let fabricated = r#"
+                let _ = tg
+                    .send_message(
+                        chat_id,
+                        "Welcome! If you have an invite link, use it.",
+                    )
+                    .await;
+            "#;
+            assert_eq!(
+                literal_argument_sites(fabricated).len(),
+                1,
+                "the detector must see a literal split across lines by rustfmt"
+            );
+
+            // And it must not fire on the compliant form, or the guard would be
+            // unsatisfiable and the only way out would be the allowlist.
+            let compliant = r#"
+                let _ = tg
+                    .send_message(chat_id, copy::render(UserMessage::NotPaired, locale))
+                    .await;
+                let _ = tg.send_message(chat_id, &composed).await;
+            "#;
+            assert!(literal_argument_sites(compliant).is_empty());
+
+            // A literal in a *comment* is prose, not a send site.
+            let commented = r#"
+                // .send_message(chat_id, "an example in a doc comment")
+                let _ = tg.send_message(chat_id, rendered).await;
+            "#;
+            assert!(literal_argument_sites(commented).is_empty());
         }
     }
 }
