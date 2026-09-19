@@ -2382,27 +2382,12 @@ mod tests {
     /// losing it would fail turns from every client that predates this key.
     #[test]
     fn mika1951_an_absent_isolation_request_is_no_restriction() {
-        assert_eq!(
-            requested_session_isolation(&params_with_metadata(None)).unwrap(),
-            false
-        );
-        assert_eq!(
-            requested_session_isolation(&params_with_metadata(Some(HashMap::new()))).unwrap(),
-            false
-        );
-        assert_eq!(
-            requested_session_isolation(&with_isolation(serde_json::Value::Null)).unwrap(),
-            false
-        );
+        assert!(!requested_session_isolation(&params_with_metadata(None)).unwrap());
+        assert!(!requested_session_isolation(&params_with_metadata(Some(HashMap::new()))).unwrap());
+        assert!(!requested_session_isolation(&with_isolation(serde_json::Value::Null)).unwrap());
         // A declared `false` is honoured literally — same turn, said explicitly.
-        assert_eq!(
-            requested_session_isolation(&with_isolation(serde_json::json!(false))).unwrap(),
-            false
-        );
-        assert_eq!(
-            requested_session_isolation(&with_isolation(serde_json::json!(true))).unwrap(),
-            true
-        );
+        assert!(!requested_session_isolation(&with_isolation(serde_json::json!(false))).unwrap());
+        assert!(requested_session_isolation(&with_isolation(serde_json::json!(true))).unwrap());
     }
 
     /// **Applying it is fail-closed.** A present, non-boolean value refuses the
@@ -2461,7 +2446,7 @@ mod tests {
     #[test]
     fn mika1951_the_attestation_is_written_for_both_verdicts() {
         for ran_isolated in [true, false] {
-            let mut task = a_task();
+            let mut task = completed_task(Some(agent_reply("ok")));
             stamp_session_isolation(&mut task, ran_isolated);
             assert_eq!(
                 mika_a2a::params::attested_session_isolation(&task),
@@ -2480,7 +2465,7 @@ mod tests {
     /// the other field, and each field's own test would still pass.
     #[test]
     fn mika1951_the_two_attestations_coexist() {
-        let mut task = a_task();
+        let mut task = completed_task(Some(agent_reply("ok")));
         stamp_effective_model(&mut task, Some("openrouter/z-ai/glm-5.3"));
         stamp_session_isolation(&mut task, true);
         assert_eq!(
@@ -2742,8 +2727,15 @@ mod tests {
     fn mika2304_both_ports_resolve_the_override_before_creating_a_task() {
         // `concat!` again: the needles must not be found in this test's own body.
         const RESOLVE_SITE: &str = concat!("resolve_caller_model_override", "(agent_state");
+        // Anchored on the override resolution so the count is this key's refusal
+        // alone: the same `return` also answers a malformed
+        // `mika.session_isolated` (mika#1951), which is a different refusal.
         const REFUSAL_SITE: &str = concat!(
-            "return Json(JsonRpcResponse::error(request.id.clone(), ",
+            "resolve_caller_model_override",
+            "(agent_state, &params, &task_id) {\n",
+            "        Ok(p) => p,\n",
+            "        Err(err) => {\n",
+            "            return Json(JsonRpcResponse::error(request.id.clone(), ",
             "err)).into_response();"
         );
 

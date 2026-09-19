@@ -5025,6 +5025,20 @@ async fn persist_deadline_fallback(
 
 // -- Summary Gating (Axis 4 + Axis 3) --
 
+/// The summary configuration an isolated turn is read under (mika#1951).
+///
+/// `inject = false` is [`load_gated_summary`]'s Axis-4 **load-prevention** gate:
+/// the summary is not read from the database, not deserialized, and not
+/// available to anything downstream in the same turn. Substituting this config
+/// is therefore the whole of "no summary for this turn", and it is done by
+/// passing a different `&ContextSummaryConfig` rather than by mutating
+/// `ctx.identity` — which is shared, and whose per-turn mutation would leak this
+/// turn's decision into the next one's.
+static SUPPRESSED_SUMMARY: prompt::ContextSummaryConfig = prompt::ContextSummaryConfig {
+    inject: false,
+    max_tokens: None,
+};
+
 /// Load the conversational summary for injection into the system prompt,
 /// applying Axis 4 (load-prevention) and Axis 3 (mode-conditional cap)
 /// gates in sequence.
@@ -5044,20 +5058,6 @@ async fn persist_deadline_fallback(
 /// before the `inject` gate fires, breaking Axis 4's load-prevention
 /// guarantee (mika#1016 F2). Any future refactor that reorders these checks
 /// must preserve this invariant or it ceases to be a load-prevention helper.
-/// The summary configuration an isolated turn is read under (mika#1951).
-///
-/// `inject = false` is [`load_gated_summary`]'s Axis-4 **load-prevention** gate:
-/// the summary is not read from the database, not deserialized, and not
-/// available to anything downstream in the same turn. Substituting this config
-/// is therefore the whole of "no summary for this turn", and it is done by
-/// passing a different `&ContextSummaryConfig` rather than by mutating
-/// `ctx.identity` — which is shared, and whose per-turn mutation would leak this
-/// turn's decision into the next one's.
-static SUPPRESSED_SUMMARY: prompt::ContextSummaryConfig = prompt::ContextSummaryConfig {
-    inject: false,
-    max_tokens: None,
-};
-
 async fn load_gated_summary(
     db: &AsyncDatabase,
     summary_config: &prompt::ContextSummaryConfig,

@@ -425,7 +425,7 @@ Deux précisions qui bornent cette affirmation plutôt que de la supposer :
 
 ---
 
-## 8. Acceptance criteria
+## Acceptance criteria
 
 Transcrits du corps de `senara-solutions/mika#1951` :
 
