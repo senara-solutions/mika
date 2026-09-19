@@ -182,6 +182,11 @@ mod eval {
     // #870 + framing) et B3 (garde positive) sur le chemin silencieux réel.
     mod test_qa_build_callback_verdict_2355;
 
+    // mika#1952 — le schéma SERVI en mode réflexion déclare `evidence` requis,
+    // les autres modes sont inchangés, et la garde d'exécution reste la seule
+    // barrière dure (`"evidence": ""` satisfait `required` et échoue la garde).
+    mod test_reflection_evidence_contract_1952;
+
     // mika#2368 — le filet moteur : le signal levé sur les DEUX sites de sortie
     // EndTurn du tour silencieux, et le registre anti-double-post qui l'atteint.
     mod test_qa_callback_verdict_net_2368;
