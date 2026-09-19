@@ -228,7 +228,7 @@ async fn run_one_scan(engine: &mut TaskEngine) {
 #[tokio::test]
 async fn settles_terminal_dispatch_parent() {
     tokio::time::timeout(Duration::from_secs(10), async {
-        let db = test_db();
+        let db = test_db().await;
         let dispatcher = test_dispatcher(db.clone());
         let mut engine = TaskEngine::new(db.clone(), dispatcher);
 
@@ -310,7 +310,7 @@ async fn spares_parent_whose_dispatch_child_is_alive() {
         if skip_off_linux() {
             return;
         }
-        let db = test_db();
+        let db = test_db().await;
         let dispatcher = test_dispatcher(db.clone());
         let mut engine = TaskEngine::new(db.clone(), dispatcher);
 
@@ -359,7 +359,7 @@ async fn settles_even_when_a_child_has_no_readable_start_time() {
         if skip_off_linux() {
             return;
         }
-        let db = test_db();
+        let db = test_db().await;
         let dispatcher = test_dispatcher(db.clone());
         let mut engine = TaskEngine::new(db.clone(), dispatcher);
 
@@ -395,7 +395,7 @@ async fn settles_even_when_a_child_has_no_readable_start_time() {
 #[tokio::test]
 async fn defers_while_a_sibling_is_merely_completed() {
     tokio::time::timeout(Duration::from_secs(10), async {
-        let db = test_db();
+        let db = test_db().await;
         let dispatcher = test_dispatcher(db.clone());
         let mut engine = TaskEngine::new(db.clone(), dispatcher);
 
@@ -429,7 +429,7 @@ async fn defers_while_a_sibling_is_merely_completed() {
 #[tokio::test]
 async fn self_dev_orphan_is_still_failed_by_its_own_reaper() {
     tokio::time::timeout(Duration::from_secs(10), async {
-        let db = test_db();
+        let db = test_db().await;
         let dispatcher = test_dispatcher(db.clone());
         let mut engine = TaskEngine::new(db.clone(), dispatcher);
 
