@@ -14389,6 +14389,22 @@ mod tests {
         sites
     }
 
+    /// `HistoryScope` reader sites in one file, production half only.
+    ///
+    /// Two exclusions compose, in this order: a file whose **path** is test
+    /// code has no production half at all (mika#2321, [`crate::source_scan`]);
+    /// in any other file the test regions are masked by
+    /// [`mika_common::source_guard`] (mika#2398) — never by truncating at the
+    /// first `#[cfg(test)]`, which cut `prompt.rs` at line 142 on a doc comment
+    /// that merely mentions the marker. Masking keeps the file's own line
+    /// numbers, so a site found here is named where it lives.
+    fn scope_reader_sites(path: &std::path::Path, src: &str) -> Vec<Vec<(usize, String)>> {
+        if crate::source_scan::is_test_source_path(path) {
+            return Vec::new();
+        }
+        scope_match_sites(&mika_common::source_guard::mask_test_regions(src))
+    }
+
     /// **T5** — the scope has one decisional reader, and it is
     /// `run_agent`'s `scoped_session_id`.
     ///
@@ -14417,7 +14433,7 @@ mod tests {
 
         scanner.for_each(|path, production| {
             let rel = path.strip_prefix(&src_root).unwrap_or(path).display();
-            for site in scope_match_sites(production) {
+            for site in scope_reader_sites(path, production) {
                 sites.push(format!("{rel}:{}: {}", site[0].0, site[0].1));
             }
         });
@@ -14515,6 +14531,52 @@ fn prod(scope: HistoryScope) -> usize {
             "a decisional match AFTER a module-level test helper must still be seen — \
              the truncating rule this guard used to apply would have missed it"
         );
+    }
+
+    /// **T5c — good-faith control for the mika#2321 path classification.**
+    ///
+    /// Sibling of T5b on the other axis: T5b proves the *predicate* still sees a
+    /// decisional match, this one proves the *file classification* has not been
+    /// widened into uselessness. A classification that exempted too much would
+    /// leave T5 green while it scanned nothing — the same vacuous-guard failure,
+    /// reached from the other side.
+    ///
+    /// The file it exists for is the extracted test module: one carries no
+    /// `#[cfg(test)]` literal, so `production_half` alone returns it whole and
+    /// every legitimate mention in a fixture counts as a production reader.
+    #[test]
+    fn mika2321_scope_reader_sites_keeps_production_and_drops_test_paths() {
+        let offending = r#"
+            fn somewhere_else(scope: HistoryScope) -> usize {
+                match scope {
+                    HistoryScope::Session => 1,
+                    HistoryScope::Agent => 20,
+                }
+            }
+        "#;
+
+        assert_eq!(
+            scope_reader_sites(
+                std::path::Path::new("/repo/crates/mika-agent/src/server/new_path.rs"),
+                offending,
+            )
+            .len(),
+            1,
+            "the guard no longer sees a decisional match in a production file — \
+             it has gone vacuous"
+        );
+
+        for test_path in [
+            // `/tests/` segment — the shape mika#2321 creates in bulk.
+            "/repo/crates/mika-agent/src/db/tests/tasks.rs",
+            // bare `tests.rs` — the shape that was already in the hole.
+            "/repo/crates/mika-agent/src/perimeter/tests.rs",
+        ] {
+            assert!(
+                scope_reader_sites(std::path::Path::new(test_path), offending).is_empty(),
+                "{test_path} is still scanned as production"
+            );
+        }
     }
 
     // ===========================================================================

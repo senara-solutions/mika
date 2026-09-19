@@ -6855,6 +6855,13 @@ This ticket has been GROOMED and is ready.
     /// goes. Known bound: a genuine third caller added to a file that also
     /// defines the method would be missed — the DB layer is not a place a
     /// decisional caller belongs, and that would be its own anomaly.
+    ///
+    /// **Test code elsewhere is excluded by its PATH too (mika#2321).**
+    /// mika#2321 moved 431 tests into `db/tests/**`, three of which call this
+    /// method on a fixture. The scanner already drops those files by their
+    /// `#[cfg(test)] mod` declaration; [`crate::source_scan`] drops them by path
+    /// as well, so the two classifications have to *both* be wrong before a
+    /// fixture counts as a production caller. Never an allowlist.
     #[test]
     fn mika2361_reset_auto_pull_redrive_has_exactly_two_production_callers() {
         // Split so the guard's own body is not what it catches first.
@@ -6880,7 +6887,7 @@ This ticket has been GROOMED and is ready.
 
         let mut callers = Vec::new();
         scanner.for_each(|path, production| {
-            if definition_sites.contains(path) {
+            if definition_sites.contains(path) || crate::source_scan::is_test_source_path(path) {
                 return;
             }
             for (n, line) in production.lines().enumerate() {
