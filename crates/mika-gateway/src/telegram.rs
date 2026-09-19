@@ -683,6 +683,50 @@ fn should_fall_back_to_plain(err: &TelegramApiError) -> bool {
     matches!(err, TelegramApiError::BadRequest { .. })
 }
 
+/// The upstream HTTP status this error carries, when it carries one (mika#2191).
+///
+/// **The question is "did the upstream refuse, and with what status", not "which
+/// HTTP byte went over the wire".** That distinction decides two of the six arms,
+/// and both would be got wrong by the mapping that looks obvious:
+///
+/// - **`Other { status: 200 }` is a `get_me` convention, not a refusal.** Three
+///   sites below build it to mean "Telegram answered 200 and the body is
+///   unusable": JSON parse failure, `ok: false`, missing `username`. Reporting
+///   `upstream_status: 200` on an error body would be factually true and
+///   categorically false — a consumer reading "field present ⇒ upstream refused"
+///   would be wrong exactly there. Hence the `>= 400` threshold, which states the
+///   rule (the HTTP error family) rather than the observed value, and so covers a
+///   future 3xx without a new decision.
+/// - **`BadRequest` has a double provenance, so it is not mappable.** It is built
+///   on a real HTTP `400 =>` *and* locally with no request ever issued
+///   (`validate_file_path`, media size, type sniffing). Mapping it to 400 would
+///   assert an upstream status where sometimes no upstream answer exists. The
+///   house rule applies in its usual direction — a signal that cannot be read is
+///   never a satisfied term — so it carries none.
+///
+/// **No `_` arm, deliberately** (the `dispatch_substrate_diagnostic` model): a
+/// seventh variant must *fail to compile* until someone decides whether it carries
+/// an upstream status. A `_ => None` would silently make every future addition
+/// "no status", which is precisely the mute failure mika#2191 repairs.
+pub(crate) fn upstream_status(err: &TelegramApiError) -> Option<u16> {
+    match err {
+        // Single provenance: a 401 HTTP response.
+        TelegramApiError::Unauthorized => Some(401),
+        // Single provenance: a 403 HTTP response.
+        TelegramApiError::BotBlocked => Some(403),
+        // Single provenance: a 429 HTTP response.
+        TelegramApiError::RateLimited { .. } => Some(429),
+        // The upstream did refuse, with this status — but only in the error family.
+        TelegramApiError::Other { status, .. } if *status >= 400 => Some(*status),
+        // `get_me`'s "answered but unusable" convention: received, not refused.
+        TelegramApiError::Other { .. } => None,
+        // Ambiguous provenance: sometimes no call was ever made.
+        TelegramApiError::BadRequest { .. } => None,
+        // No response arrived, so there is no status.
+        TelegramApiError::Network(_) => None,
+    }
+}
+
 /// Send a text message to a chat via the Telegram Bot API.
 ///
 /// Shared implementation for both client types — the **single** `sendMessage` call
@@ -2485,5 +2529,87 @@ mod tests {
         })
         .expect("payload serializes");
         assert!(html.contains("\"parse_mode\":\"HTML\""), "{html}");
+    }
+
+    /// mika#2191 — the six variants, one row each.
+    ///
+    /// The two negative controls are the load-bearing half: `Other { status: 200 }`
+    /// and `BadRequest` must carry **no** status. A naive mapping (`Other` → its
+    /// status, `BadRequest` → 400) passes every other assertion in this file, so
+    /// without these two rows the whole suite would stay green on the two arms the
+    /// doc comment exists to protect.
+    #[test]
+    fn mika2191_upstream_status_par_variante() {
+        let cases: Vec<(TelegramApiError, Option<u16>)> = vec![
+            (TelegramApiError::Unauthorized, Some(401)),
+            (TelegramApiError::BotBlocked, Some(403)),
+            (
+                TelegramApiError::RateLimited {
+                    retry_after: Some(30),
+                },
+                Some(429),
+            ),
+            (
+                TelegramApiError::RateLimited { retry_after: None },
+                Some(429),
+            ),
+            (
+                TelegramApiError::Other {
+                    status: 500,
+                    body: "internal".to_string(),
+                },
+                Some(500),
+            ),
+            // Negative control 1 (M3): `get_me` builds this to mean "answered 200,
+            // body unusable". Received is not refused.
+            (
+                TelegramApiError::Other {
+                    status: 200,
+                    body: "failed to parse getMe response".to_string(),
+                },
+                None,
+            ),
+            // Negative control 2 (M4): sometimes built with no request ever issued.
+            (
+                TelegramApiError::BadRequest {
+                    message: "file path traversal".to_string(),
+                },
+                None,
+            ),
+        ];
+
+        for (err, expected) in cases {
+            assert_eq!(
+                upstream_status(&err),
+                expected,
+                "upstream_status mismatch on {err:?}"
+            );
+        }
+    }
+
+    /// The rule is a threshold, not a list of the statuses we happened to observe:
+    /// a status nobody enumerated still carries, and a sub-400 one still does not.
+    #[test]
+    fn mika2191_other_au_dessus_de_400_porte_son_statut() {
+        for status in [400u16, 403, 418, 451, 500, 502, 599] {
+            assert_eq!(
+                upstream_status(&TelegramApiError::Other {
+                    status,
+                    body: String::new(),
+                }),
+                Some(status),
+                "an upstream {status} is a refusal and must carry its status"
+            );
+        }
+        for status in [200u16, 201, 204, 302, 399] {
+            assert_eq!(
+                upstream_status(&TelegramApiError::Other {
+                    status,
+                    body: String::new(),
+                }),
+                None,
+                "an upstream {status} is not a refusal and must carry no status"
+            );
+        }
     }
 }
