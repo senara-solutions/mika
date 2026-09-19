@@ -1540,6 +1540,30 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
          Core memory is agent-curated and actively maintained. Conversation summaries are lossy \
          derivatives of older history — treat them as helpful context, not authoritative.\n",
     );
+    // mika#2237 — a clause, deliberately NOT an inversion of the line above.
+    // Core memory outranking skill context is right for preferences and for the
+    // `## Stopped Topics` block (mika#1813); what it must not do is let a
+    // memory learned from a past failure quietly override an explicit
+    // operational mapping of the active skill. Measured 2026-09-08: mika-qa
+    // posted `--comment` on a `VERDICT: pass` body because it remembered the
+    // 137 self-approval refusals from before mika#2218 fixed the review
+    // identity — the skill said the right thing and the memory won in silence.
+    //
+    // This is the *intent* half and is declared as such. Per
+    // `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate` it
+    // does not hold on its own; the structural half is the pre-subprocess guard
+    // `validate_pr_review_flag_coherence`. It is still necessary: without it the
+    // prompt goes on instructing the agent to prefer the memory.
+    prompt.push_str(
+        "- **A skill's operational mapping outranks a memory of past failure:** when an active \
+         skill states an explicit conditional instruction (\"if X, then do Y\") and something you \
+         remember says Y will not work, follow the skill and try Y anyway. A remembered failure \
+         is evidence about the past, not about the case in front of you — the constraint may \
+         have been lifted since. If Y then actually fails, you may fall back, but say which \
+         attempt failed and how. Never silently substitute a different action because you \
+         recall a similar one failing before: name the conflict instead of resolving it in \
+         favour of the memory.\n",
+    );
     let section_names = core_memory_section_names();
     write!(
         prompt,
@@ -4168,6 +4192,102 @@ enabled = true
         assert!(prompt.contains("current user message > core memory > active skill context"));
         assert!(prompt.contains("conversation summary"));
         assert!(prompt.contains("conversation history > search results"));
+    }
+
+    /// mika#2237 (U3 / V9) — the skill-over-stale-memory clause is a DECISION.
+    ///
+    /// It is pinned rather than left to prose because its disappearance would
+    /// be invisible: a future editor who finds the priority bullet long will
+    /// shorten it, every other assertion stays green, and nobody learns the
+    /// intent half of mika#2237 is gone. The structural half
+    /// (`validate_pr_review_flag_coherence`) keeps working, which is exactly
+    /// what makes the loss silent.
+    ///
+    /// Note it does NOT invert the priority line above it: core memory still
+    /// outranks skill context, which is right for preferences and for the
+    /// mika#1813 `## Stopped Topics` block (D7).
+    #[test]
+    fn mika2237_skill_mapping_outranks_a_remembered_failure() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+            stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
+        };
+
+        let prompt = build_system_prompt(&ctx);
+        assert!(
+            prompt.contains("A skill's operational mapping outranks a memory of past failure"),
+            "the mika#2237 clause is missing — if it was shortened away, restore it: it is \
+             the intent half of a defect whose structural half cannot announce its loss"
+        );
+        assert!(
+            prompt.contains("try Y anyway"),
+            "the clause must prescribe the attempt, which is the whole substance of D4: \
+             degradation stays possible, but only after a measured attempt"
+        );
+        assert!(
+            prompt.contains("name the conflict"),
+            "the clause must require the conflict to be said rather than resolved in \
+             favour of the memory — that is the ticket's fix (c)"
+        );
+
+        // The priority line it qualifies is still there and still in that order.
+        assert!(
+            prompt.contains("current user message > core memory > active skill context"),
+            "mika#2237 adds a clause; it does not invert the priority line (D7)"
+        );
+    }
+
+    /// The compact path (MikaModel, ≤5 KB) renders neither the priority line
+    /// nor its mika#2237 clause — fifth carve-out of that family, joined to the
+    /// mika#1925 follow-up like the other four. Nothing is withheld but the
+    /// *intent* half: the pre-subprocess guard reads argv, not the prompt.
+    #[test]
+    fn mika2237_compact_prompt_omits_the_clause_like_its_parent_line() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+            stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
+        };
+
+        let compact = build_compact_system_prompt(&ctx);
+        assert!(
+            !compact.contains("Context priority:"),
+            "precondition: the compact path does not carry the priority line"
+        );
+        assert!(
+            !compact.contains("A skill's operational mapping outranks"),
+            "the clause must not be added to the compact path on its own — it qualifies a \
+             line that path does not render"
+        );
     }
 
     // ── KgIdentityConfig deserialization tests (#778) ─────────────────────

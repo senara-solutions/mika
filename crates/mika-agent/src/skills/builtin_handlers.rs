@@ -2873,6 +2873,230 @@ async fn validate_destructive_action_grounding(
     Ok(())
 }
 
+/// Refuse a `gh pr review` whose flag contradicts the verdict in its own body
+/// (mika#2237).
+///
+/// Sibling of `validate_destructive_action_grounding` above: pre-subprocess for
+/// the same reason (the defect is the call, not a sentence), and composed of the
+/// same two halves — a pure predicate set in `evidence::guards`, the enforcement
+/// here. See that module's mika#2237 section for the founding incident and the
+/// three design points; this function is only their application.
+///
+/// # What gates it
+///
+/// **The body, never the active skill.** `validate_review_depth_present` above
+/// is gated on `!ctx.required_tool_arg_suffixes.is_empty()`, a proxy for "the
+/// qa-review skill is loaded". This one gates on its own subject: a body whose
+/// `parse_verdict` yields `Missing` is not its business (fail-open), a body
+/// carrying a classified verdict is. Two consequences, both wanted — a human or
+/// ad-hoc review with no `VERDICT:` line is never blocked, and the guard does
+/// not vanish in silence the day qa-review reorganizes its manifest.
+///
+/// # Both directions, and the second is the dangerous one
+///
+/// The measured defect is a *degradation* (`pass` posted as `--comment`), which
+/// is conservative. Its inverse — a `block[…]` posted as `--approve` — would
+/// merge a blocked PR. Closing only the measured half and calling that "the fix"
+/// would be dishonest, so both are closed. `--request-changes` is the mapping of
+/// no verdict at all and is refused on any classified one.
+///
+/// # Which way it fails
+///
+/// Recognition is fail-open (no body, no classifiable verdict, no flag → not our
+/// business). After recognition, a mismatch is refused — *except* on the
+/// `pass → --comment` direction, where the escape hatch of D4 applies and is
+/// itself **fail-open**: the term the history carries is *the absence of an
+/// attempt*, and a term that cannot be read is never a satisfied term
+/// (mika#2277). Refusing on an unreadable history would produce the loop
+/// `--approve` fails → `--comment` refused → `--approve` fails…, i.e. a review
+/// that never leaves. The abstention is therefore **said**, not silent.
+///
+/// Named cost: with `MIKA_STORE_TOOL_CALLS=false` the turn's history reads
+/// empty, so the hatch is always open and this guard is inert on the
+/// `pass → comment` direction (the `block → approve` direction is unaffected —
+/// it consults no history). Same inertia shape as `MIKA_LOG_PILOT_TRANSCRIPTS`
+/// for the mika#2249 reaper, and made visible the same way: the abstention grep.
+async fn validate_pr_review_flag_coherence(
+    args: &[String],
+    repo: Option<&str>,
+    ctx: &ToolContext<'_>,
+) -> Result<(), ToolOutput> {
+    use crate::evidence::guards::{
+        PR_REVIEW_FLAG_AUDIT_TOOL, approve_attempt_failed_in_turn, extract_pr_review_flag,
+        pr_review_target, required_review_flag,
+    };
+    use crate::server::verdict::{Verdict, parse_verdict};
+
+    // Fail-open recognition, three terms.
+    let Some(body) = extract_pr_review_body(args) else {
+        return Ok(());
+    };
+    let verdict = parse_verdict(&body);
+    let Some(required) = required_review_flag(&verdict) else {
+        return Ok(());
+    };
+    let Some(posted) = extract_pr_review_flag(args) else {
+        return Ok(());
+    };
+
+    if posted == required {
+        return Ok(());
+    }
+
+    let verdict_label = match &verdict {
+        Verdict::Pass => "pass".to_string(),
+        Verdict::Block(reason) => format!("block[{reason}]"),
+        Verdict::Hold(reason) => format!("hold[{reason}]"),
+        Verdict::Missing { .. } => unreachable!("required_review_flag returned None for Missing"),
+    };
+    let target = pr_review_target(args).unwrap_or_else(|| "unknown".to_string());
+    let target_key = format!("pr_review:{}#{}", repo.unwrap_or("__default__"), target);
+
+    // Audit writes are warn-and-continue throughout: losing the ledger row must
+    // not change the guard's verdict in either direction.
+    async fn audit(ctx: &ToolContext<'_>, target_key: &str, outcome: &str, reasoning: &str) {
+        if let Err(e) = ctx
+            .db
+            .log_audit_event(
+                ctx.session_id,
+                PR_REVIEW_FLAG_AUDIT_TOOL,
+                target_key,
+                None,
+                Some(outcome),
+                Some(reasoning),
+                Some(ctx.trace_id),
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "failed to write pr-review-flag audit row");
+        }
+    }
+
+    // The D4 escape hatch — only on the degradation direction, and only there.
+    // A `block[…]` posted as `--approve` has no hatch: no past failure can make
+    // approving a blocked PR correct.
+    if matches!(verdict, Verdict::Pass) && posted == "--comment" {
+        let turn_calls = match ctx.db.query_tool_calls_by_trace(ctx.trace_id).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    event = "pr_review_flag_guard_abstained",
+                    agent_id = %ctx.db.agent_id(),
+                    session_id = %ctx.session_id,
+                    target = %target_key,
+                    reason = "history_unreadable",
+                    error = %e,
+                    "pr-review flag guard abstained — the turn's tool-call history could not \
+                     be read, so 'no attempt was made' cannot be established (mika#2237)"
+                );
+                audit(
+                    ctx,
+                    &target_key,
+                    "abstained",
+                    &format!("could not read this turn's tool calls: {e}"),
+                )
+                .await;
+                return Ok(());
+            }
+        };
+
+        // An empty history is the same abstention, not a refusal. It is what
+        // `MIKA_STORE_TOOL_CALLS=false` produces, and it is indistinguishable
+        // from a genuinely first call — refusing here would be refusing on an
+        // unobservable term.
+        if turn_calls.is_empty() {
+            tracing::warn!(
+                event = "pr_review_flag_guard_abstained",
+                agent_id = %ctx.db.agent_id(),
+                session_id = %ctx.session_id,
+                target = %target_key,
+                reason = "no_tool_calls_recorded",
+                "pr-review flag guard abstained — this turn has no recorded tool calls, so a \
+                 prior --approve attempt cannot be ruled out (check MIKA_STORE_TOOL_CALLS)"
+            );
+            audit(
+                ctx,
+                &target_key,
+                "abstained",
+                "no tool calls recorded for this turn — a prior --approve attempt cannot be \
+                 ruled out",
+            )
+            .await;
+            return Ok(());
+        }
+
+        if approve_attempt_failed_in_turn(
+            turn_calls.iter().map(|r| {
+                (
+                    r.tool_name.as_str(),
+                    r.input.as_deref().unwrap_or(""),
+                    r.success,
+                )
+            }),
+            &target,
+        ) {
+            tracing::info!(
+                event = "pr_review_flag_degraded_after_attempt",
+                agent_id = %ctx.db.agent_id(),
+                session_id = %ctx.session_id,
+                target = %target_key,
+                "pass verdict degraded to --comment AFTER a failed --approve attempt in the \
+                 same turn — a real constraint, not stale memory (mika#2237)"
+            );
+            audit(
+                ctx,
+                &target_key,
+                "degraded_after_attempt",
+                "a --approve attempt on this PR failed earlier in this turn",
+            )
+            .await;
+            return Ok(());
+        }
+    }
+
+    tracing::warn!(
+        event = "pr_review_flag_refused",
+        agent_id = %ctx.db.agent_id(),
+        session_id = %ctx.session_id,
+        target = %target_key,
+        verdict = %verdict_label,
+        flag_posted = %posted,
+        flag_required = %required,
+        "refused a pr review whose flag contradicts its own verdict (mika#2237)"
+    );
+    audit(
+        ctx,
+        &target_key,
+        "refused",
+        &format!("verdict {verdict_label} requires {required}, call carried {posted}"),
+    )
+    .await;
+
+    // The remedy names BOTH correct ways out (D6). Naming only "post with the
+    // required flag" would push a model held by its memory to rewrite its
+    // *verdict* instead of its flag — the same defect under another name, and
+    // one this guard cannot adjudicate since it cannot know which verdict is
+    // right. The last sentence is the ticket's fix (c) made operational: it does
+    // not ask the model to detect its own conflict, it tells it what a memory is
+    // not sufficient evidence of.
+    let body = serde_json::json!({
+        "error": "pr_review_flag_mismatch",
+        "doctrine": "mika#2237",
+        "verdict": verdict_label,
+        "flag_posted": posted,
+        "flag_required": required,
+        "remedy": format!(
+            "The VERDICT line in this body says `{verdict_label}`, which maps to \
+             `{required}`. Re-emit this call with `{required}` and the same body. If \
+             `{required}` then fails (for example GitHub refusing a self-approval), you may \
+             post `--comment` citing that failure — but a failure recorded in your memory \
+             is not evidence about THIS pull request. Do not change your verdict to match \
+             the flag: change the flag to match your verdict."
+        ),
+    });
+    Err(ToolOutput::error(body.to_string()))
+}
+
 /// Execute a GitHub CLI (`gh`) command with safe argument passing.
 ///
 /// Input: `{"command": ["pr", "list", "--state", "open"], "repo": "owner/repo"}`
@@ -2996,6 +3220,18 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
         return err;
     }
 
+    // Verdict↔flag coherence (mika#2237): refuse a `pr review` whose flag
+    // contradicts the verdict in its own body. Placed immediately after the
+    // depth check — depth is a condition of the body, the flag a condition of
+    // the act, and the chain runs from the most local to the most committing.
+    // Unlike the two checks above it is NOT gated on `required_tool_arg_suffixes`:
+    // its subject is the body itself (see the function's docs, D1).
+    if let Err(err) =
+        validate_pr_review_flag_coherence(&gh_args.args, gh_args.repo.as_deref(), ctx).await
+    {
+        return err;
+    }
+
     // Audit event for `gh api` invocations — structural observability for the
     // expanded security surface (mika#788, mika#1167 allowed_by_rule enrichment).
     if gh_args.args.first().map(|s| s.as_str()) == Some("api") {
@@ -3049,9 +3285,24 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
     let output = spawn_and_collect(cmd, "gh", "Is the GitHub CLI installed?").await;
 
     // On success, record that a PR review was posted (both per-turn and session-scoped).
-    if !output.is_error
-        && let Some(key) = pr_dedup_key
-    {
+    //
+    // mika#2237 — "success" here must mean the review actually landed, and until
+    // now it did not. `spawn_and_collect` returns `ToolOutput::success` even when
+    // `gh` exits non-zero, prefixing the content with `Exit code: N` (A2); so a
+    // `pr review --approve` that GitHub *refused* used to register its dedup key
+    // all the same, and the follow-up `--comment` was then rejected as a
+    // `duplicate_pr_review`. That silently disabled this ticket's whole escape
+    // hatch: "try --approve, and if it fails you may degrade" cannot work if the
+    // failed attempt consumes the right to post at all.
+    //
+    // The predicate is the one `tool_execution::dispatch` already computes for
+    // every tool — `!is_error && !has_non_zero_exit_prefix(content)` — so the
+    // dedup ledger and the `tool_calls.success` column now agree on what a
+    // successful review is. Registering a review nobody posted was wrong
+    // independently of this ticket; it only became load-bearing here.
+    let review_landed =
+        !output.is_error && !crate::tool_execution::has_non_zero_exit_prefix(&output.content);
+    if review_landed && let Some(key) = pr_dedup_key {
         ctx.pr_review_posted
             .store(true, std::sync::atomic::Ordering::Release);
         if let Some(map) = ctx.pr_reviews_posted {
@@ -3073,7 +3324,11 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
 ///
 /// Falls back to the original string if no number can be extracted
 /// (preserves current behavior for unknown formats).
-fn normalize_pr_identifier(s: &str) -> &str {
+///
+/// `pub(crate)` since mika#2237: `evidence::guards::pr_review_target` reads it
+/// so the flag-coherence guard and `make_pr_dedup_key` agree on what "the same
+/// PR" means. A second normalizer would be the divergence mika#2158 measured.
+pub(crate) fn normalize_pr_identifier(s: &str) -> &str {
     // Try to extract number from GitHub PR URL pattern
     if let Some(idx) = s.rfind("/pull/") {
         let after = &s[idx + 6..];

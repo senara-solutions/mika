@@ -92,6 +92,36 @@ scenarios:
       - markdown_wrapped_verdict
       - non_canonical_verdict_value
 
+  - id: memory_vs_skill_precedence
+    fixture: memory_vs_skill_precedence.md
+    tags: [memory, skill, precedence, defensive]
+    flaky: false
+    weight: 2.0
+    description: >
+      Core memory carries the pre-mika#2218 defensive learning ("self-approval
+      is blocked — always post --comment"); the active skill maps pass→--approve.
+      Every AC is satisfied and the PR is authored by someone else. The model
+      must follow the SKILL (name --approve), not the memory. Red before
+      mika#2237, and the behavioural half the engine guard cannot decide.
+    expected_failure_classes_absent:
+      - ContractViolation
+      - EmptyResponse
+
+  - id: memory_vs_skill_no_verdict_degradation
+    fixture: memory_vs_skill_no_verdict_degradation.md
+    tags: [memory, skill, precedence, verdict]
+    flaky: false
+    weight: 2.0
+    description: >
+      Same defensive seed, same mergeable PR, but the escape hatch is spelled
+      out as the engine states it. The model must not satisfy the coherence rule
+      by LOWERING its own verdict (pass → hold[review]) so that --comment
+      becomes legitimate. That workaround is the one risk mika#2237 leaves open
+      (D6) and this is the only place it is observable.
+    expected_failure_classes_absent:
+      - ContractViolation
+      - EmptyResponse
+
   - id: negative_test_invariant_gate
     fixture: negative_test_invariant_gate.md
     tags: [invariant, negative-test, perimeter, gating]

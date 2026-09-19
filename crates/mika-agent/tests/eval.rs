@@ -122,6 +122,11 @@ mod eval {
     mod test_phantom_task_row_sweep;
     mod test_pilot_silent_stall_reaper;
 
+    // mika#2237 — le mapping verdict → flag de `gh pr review`, vérifié avant le
+    // sous-processus. Chemin de production déterministe (MockLlmProvider) pour
+    // les deux directions, l'échappatoire D4 et ses trois contrôles négatifs.
+    mod test_pr_review_flag_coherence_2237;
+
     // Le contrôle positif sur processus réel du reaper D1 (mika#2272) : row
     // `pending` sémée par le chemin de production, pilote authentiquement
     // vivant, harness multi-agents pour l'attribution.

@@ -24,14 +24,38 @@ sans une ligne de journal — est refermé.
 
 Le 2026-09-08, mika#2218 a rendu `--approve` de nouveau possible (identité de
 revue `mika-platform-qa`, distincte de l'auteur). Sur la première revue
-post-déploiement (#2236, `VERDICT: pass`), mika-qa a posté en `--comment` **sans
-tenter `--approve`** — argv `tool_calls` 08:03:34Z :
+post-déploiement (#2236, corps `VERDICT: pass ✅`), mika-qa a posté en
+`--comment` **sans tenter `--approve`** — argv `tool_calls` 08:03:34Z :
 `["pr","review","2236","--comment",…]`, zéro tentative. Le prompt du skill
 mappait pourtant `pass → --approve` (`qa-review/system_prompt.md:607`). La
 déviation venait de la mémoire de l'agent : la `core_memory` (`workflows`,
 `current_priorities`) et un fact du 2026-09-07 encodaient la contrainte de l'ère
 pré-fix (137 refus self-approve). C2 — le premier merge autonome — est resté à
 moitié cassé jusqu'à une correction manuelle de la mémoire de mika-qa.
+
+**Deux défauts distincts sur la même revue, et il faut les tenir séparés (F2).**
+La revue de 08:03:23Z est aussi celle de mika#2239 : son corps portait
+`VERDICT: pass ✅`, forme décorée que `parse_verdict` ne classifiait pas alors —
+épinglée depuis comme régression fondatrice de ce ticket-là
+(`verdict.rs::parse_verdict_field_shape_pr2236`). Les deux défauts sont
+**empilés, non confondus**, et l'ordre causal les sépare : le choix du flag est
+fait par le modèle **en même temps qu'il écrit le corps**, le parser moteur
+n'intervient qu'ensuite, sur le webhook. Un parser aveugle en aval ne peut donc
+pas avoir produit le `--comment` en amont.
+
+**Ce que la re-mesure change réellement, et ce n'est pas rien.** La même
+`mika-platform-qa`, le même jour, a posté **trois revues `APPROVED`** (08:25:08Z,
+08:47:25Z, 09:29:39Z). Donc « zéro tentative » est vrai **de ce tour** et faux de
+la journée : la mémoire défensive n'était pas un blocage permanent, c'était un
+arbitrage qui a gagné *par intermittence*. Deux conséquences que le plan assume :
+
+- toute formulation suggérant un empêchement stable serait fausse, et celles du
+  plan sont corrigées en conséquence ;
+- **c'est un argument de plus pour le périmètre retenu.** Un remède côté mémoire
+  (tag, invalidation datée) suppose un état persistant à corriger ; ce qui est
+  mesuré est un arbitrage non déterministe, tour par tour. Une garde qui lit
+  l'argv mord exactement sur les tours où la mémoire gagne et se tait sur les
+  autres — la granularité du remède épouse celle du défaut. Voir scope-out (d).
 
 **Recadrage opérateur (Vincent, commentaire 1) :** le remède durable n'est pas
 un « fact d'invalidation daté » — le skill dit **déjà** la bonne chose. Le
@@ -66,6 +90,27 @@ cas : GitHub dit APPROVED mais le verdict ne classifie pas → un WARN nommé,
 the monitor can grep it ». La moitié « verdict classifie `pass` mais GitHub ne
 dit pas approved » est restée sans nom. Ce n'est pas une omission de mika#2239 —
 c'est sa population complémentaire, et personne ne l'avait mesurée avant #2236.
+
+> **Ancrage re-vérifié contre l'arbre (F1).** Le miroir **existe en code**, et la
+> divergence signalée vient de ce que le **corps du ticket** mika#2239 le
+> présente comme une intention (« Envisager qu'un `Verdict::Missing` sur une
+> review APPROVED+CLEAN émette un WARN nommé ») tandis que le **fix l'a livré** :
+> `warn!(event = "verdict_approved_but_unclassified", …)` à
+> `crates/mika-agent/src/server/verdict_handler.rs:1752`, introduit par
+> `8f3783f2` — *« fix(verdict): parse_verdict tolère la décoration de fin de
+> valeur (mika#2239) »*, PR #2241, 2026-09-08 — avec le commentaire
+> `// mika#2239 (D2c)` juste au-dessus. C'est le ticket qui est en retard sur son
+> propre correctif, pas le plan sur l'arbre. Vérifiable en une commande :
+> `grep -rn verdict_approved_but_unclassified crates/` rend deux sites, le
+> `warn!` ci-dessus et sa condition de réveil documentée dans `verdict.rs:216`.
+>
+> Conséquence pour U2, et elle **renforce** le cadrage plutôt qu'elle ne
+> l'affaiblit : U2 n'est pas le premier signal nommé de la paire, c'est le
+> **second**, et son « SOLE WRITER, pinné par un scan de source » reprend
+> délibérément la discipline que mika#2239 s'est appliquée à lui-même. Les deux
+> moitiés d'une même asymétrie se lisent alors sous deux noms distincts et
+> restent comptables séparément — ce qui est exactement ce que le scan de source
+> protège.
 
 **(M2) Le conflit n'a pas besoin d'être détecté sémantiquement : il est lisible
 dans l'argv.** Le fix (c) proposé par mika-qa — « détection forcée du conflit au
@@ -140,10 +185,15 @@ un document de solution.
   dans le prompt et reste lue, donc le tag ne ferme rien sans un changement de
   pondération qui est, lui, du prompt ; (iii) le rayon de souffle (forme de
   `store_fact`, des blocs de core memory, des lecteurs) est large pour un défaut
-  dont la manifestation est fermée structurellement par U1. **Ticket de suivi
-  conditionné à une mesure** : si U2 émet après le déploiement d'U1, ou si un
-  second mapping opérationnel est mesuré occulté, la question revient avec des
-  données plutôt qu'avec une intuition.
+  dont la manifestation est fermée structurellement par U1 ; **(iv) la
+  re-mesure de #2236 (voir Summary) montre que la mémoire défensive produit un
+  arbitrage *intermittent* — trois `APPROVED` et un `--comment` le même jour, par
+  le même agent — et non un empêchement stable.** Un remède côté mémoire suppose
+  un état persistant à corriger ; ce qui est mesuré varie d'un tour à l'autre,
+  donc le remède doit décider tour par tour, ce que fait une garde sur l'argv et
+  ne fait pas un tag. **Ticket de suivi conditionné à une mesure** : si U2 émet
+  après le déploiement d'U1, ou si un second mapping opérationnel est mesuré
+  occulté, la question revient avec des données plutôt qu'avec une intuition.
 - **Un détecteur sémantique de contradiction mémoire ↔ skill.** Voir M2 : il
   demanderait un lexique et un juge, et le conflit est déjà lisible à son point
   de manifestation. U1 **est** le fix (c), sous la seule forme qui n'ait besoin
@@ -176,6 +226,30 @@ de table recopiée depuis `qa-review/system_prompt.md` : la vérité est l'enum 
 (`pass` exige `--approve` **parce que** `verdict_handler` refuse `pass` sans
 `state == "approved"`), de sorte qu'un futur assouplissement de l'une fasse
 rougir l'autre.
+
+**Corollaire porteur, et c'est la moitié (b) de F2 : la tolérance à la décoration
+est héritée par construction, jamais réimplémentée.** La garde n'inspecte pas le
+corps elle-même — elle appelle `parse_verdict`, donc elle hérite d'un coup de
+toute la normalisation que ce lecteur porte : l'emphase markdown de mika#1828
+(`**VERDICT: pass**`, `__…__`, emphase simple, emphase déséquilibrée), les alias
+(`approved`, `changes requested`), **et le repli décoration de mika#2239**
+(`strip_trailing_decoration`, `verdict.rs:214-220`). C'est ce qui rend un corps
+`VERDICT: pass ✅` — la forme littérale de l'incident fondateur — porteur de
+`Verdict::Pass`, donc **exigeant `--approve`**, plutôt que `Missing` et donc
+hors population par fail-open.
+
+**Ce que ce corollaire ferme, dit explicitement :** une garde qui aurait recopié
+un `contains("VERDICT: pass")` ou une regex maison aurait fail-open
+**précisément sur la forme de corps qui a motivé le ticket** — muette là où elle
+devait mordre, et indistinguable d'une garde qui fonctionne. C'est la raison
+pour laquelle « lecteur unique » n'est pas ici une préférence de style
+(mika#2158) mais la condition de correction du mécanisme. Les bornes héritées le
+sont aussi, et c'est voulu : `VERDICT: pass — but see findings` reste `Missing`
+(borne mika#1821) et traverse donc sans refus. La décoration de **tête**
+(`VERDICT: ✅ pass`) est hors périmètre de `parse_verdict` (mika#2239 D-D) : la
+garde hérite de cette lacune telle quelle et ne la contourne pas — la refermer
+serait un second lecteur, c'est-à-dire la faute que cette décision interdit.
+Épinglé par U4(a) et par V11.
 
 **D3 — La garde est bidirectionnelle, et la seconde direction est la
 dangereuse.** Le défaut mesuré est une dégradation (`pass` → `--comment`), qui
@@ -243,13 +317,14 @@ contexte, donc il n'y a pas de carve-out à créer — il y a un fait à noter.
 ```
 tour de mika-qa
   │
-  ├─ run_gh ["pr","review","2236","--comment","--body","VERDICT: pass\nDEPTH: …"]
+  ├─ run_gh ["pr","review","2236","--comment","--body","VERDICT: pass ✅\nDEPTH: …"]
   │     │
   │     ├─ (chaîne existante : allowlist → scope qa-review → gh api → destructive)
   │     ├─ validate_tool_arg_suffixes            (mika#899)
   │     ├─ validate_review_depth_present         (mika#275)
   │     └─ validate_pr_review_flag_coherence     ◀── U1 (nouveau)
   │             parse_verdict(body) ─────────────── lecteur unique (server::verdict)
+  │                 ↳ hérite emphase mika#1828 + décoration mika#2239 (D2)
   │             Missing            → Ok(())        fail-open
   │             Pass   + --approve → Ok(())        nominal
   │             Pass   + --comment → query_tool_calls_by_trace(trace_id)
@@ -270,21 +345,60 @@ tour de mika-qa
 
 ### Assumptions
 
-- **A1** — `tool_execution/dispatch.rs` écrit la ligne `tool_calls` après chaque
-  appel, avant le suivant. Vérifié par le fait que mika#1646 en dépend. **À
-  reconfirmer à l'implémentation** pour le cas où le LLM émet `--approve` et
-  `--comment` dans le *même* bloc de réponse.
-- **A2** — L'échec d'un `gh pr review --approve` est lisible sur `ToolCallRow`
-  via `success == false`, `non_zero_exit`, ou un `output` préfixé `Exit code:`.
-  Le prédicat teste les trois. **À établir empiriquement** sur le chemin builtin
-  (`run_gh` n'est pas un exec handler, et l'heuristique `Exit code:` est
-  documentée pour les exec handlers).
+- **A1 — ÉTABLIE (lecture du code, F4).** `process_tool_calls`
+  (`tool_execution/dispatch.rs`) traite les appels d'un bloc de réponse dans une
+  boucle **séquentielle** et persiste via `save_tool_call` (`:298`) à l'intérieur
+  de cette boucle, donc **avant** l'appel suivant. Un `--approve` et un
+  `--comment` émis dans le même bloc de réponse sont donc ordonnés et le premier
+  est en base quand le second traverse la garde. Seule réserve, déjà nommée
+  ailleurs : la persistance est gatée par `store_tool_calls` — c'est exactement
+  le coût D5, pas une incertitude nouvelle.
+- **A2 — ÉTABLIE, et le signal porteur n'est pas celui que l'assomption
+  supposait (F4).** Elle craignait que l'heuristique `Exit code:` soit propre aux
+  exec handlers ; la lecture du code montre l'inverse, et c'est ce qui rend
+  l'échappatoire lisible :
+  - `spawn_and_collect` — le chemin de `run_gh` — rend
+    **`ToolOutput::success(…)` même sur sortie non-zéro**, avec un contenu
+    préfixé `Exit code: {code}\n` (`builtin_handlers.rs:793-817`). Le fait est
+    attesté ailleurs dans le fichier, dans le doc-comment de `GitResult` :
+    *« unlike `spawn_and_collect` which always returns `is_error: false` »*.
+  - Le calcul qui en dérive est **universel**, pas propre aux exec handlers :
+    `dispatch.rs:336-337` pose `non_zero_exit = !output.is_error &&
+    has_non_zero_exit_prefix(&output.content)` puis `success = !output.is_error
+    && !non_zero_exit`, pour *tout* outil. `has_non_zero_exit_prefix`
+    (`tool_execution/types.rs:22`) reconnaît `Exit code: <chiffre non nul>` et
+    `Killed by signal:`.
+
+  Donc un `gh pr review --approve` refusé par GitHub s'écrit
+  `success = false`, `non_zero_exit = true`, `is_error = false` — le préfixe est
+  posé par `spawn_and_collect` lui-même. **Le prédicat retenu est
+  `!row.success`**, qui couvre trois populations, toutes trois « l'agent a tenté
+  et la voie était fermée » :
+
+  | population | `is_error` | `non_zero_exit` | `success` |
+  |---|---|---|---|
+  | GitHub refuse (`gh` sort non-zéro) — le cas visé | `false` | `true` | `false` |
+  | `gh` non installé / spawn impossible | `true` | `false` | `false` |
+  | refus d'une garde amont (scope qa-review, allowlist…) | `true` | `false` | `false` |
+
+  **Un cas bénin, nommé plutôt que découvert :** `duplicate_pr_review` tombe dans
+  la troisième ligne, donc ouvrirait l'échappatoire alors que l'agent a déjà
+  posté. Sans conséquence — le dedup de session (`run_gh`, garde
+  `pr_reviews_posted`) refuse de la même façon le `--comment` qui suivrait. Ne
+  pas resserrer le prédicat sur `non_zero_exit` seul pour ce cas : ce serait
+  fermer l'échappatoire sur les deux populations légitimes d'`is_error = true`,
+  c'est-à-dire recréer la boucle que D5 existe pour empêcher.
+- **A4 — ÉTABLIE pour son premier terme.** `server::deadline_verdict` poste via
+  `run_gh_subprocess`, hors du tool `run_gh`, donc hors de la garde. Le mapping
+  y est cohérent (`hold[review]` en `--comment`), donc aucun refus n'aurait lieu
+  même s'il traversait. Reste à reconfirmer à l'implémentation qu'aucun **autre**
+  écrivain de `gh pr review` n'existe hors de ce chemin.
 - **A3** — `server::verdict::{parse_verdict, Verdict}` sont `pub(crate)`, donc
   atteignables depuis `skills::builtin_handlers`. Vérifié (`verdict.rs:37,235`).
-- **A4** — Les écrivains de `gh pr review` hors du tool `run_gh` ne traversent
-  pas cette garde. `server::deadline_verdict` poste via `run_gh_subprocess` un
-  `hold[review]` en `--comment` — cohérent avec le mapping, donc non refusé même
-  s'il traversait. **À reconfirmer.**
+**Aucune assomption ne porte plus l'échappatoire.** A1 et A2 étaient les deux
+seuls points où le mécanisme central (D4) reposait sur une lecture non vérifiée ;
+elles sont établies ci-dessus par lecture du code, et V11/V12 les tiennent en
+régression. Le risque correspondant est retiré de la section Risques.
 
 ## Implementation Units
 
@@ -371,9 +485,29 @@ la raccourcira et personne ne saura que la moitié intention a disparu.
 
 **(a) Unités du prédicat** — `evidence::guards::tests` : les deux directions du
 mismatch ; `--request-changes` sur un verdict classifié ; `Verdict::Missing`
-fail-open ; les formes markdown de mika#1828/#2239 (`**VERDICT: pass**` est un
-`pass` et exige donc `--approve`) ; l'échappatoire ouverte et fermée ;
-l'appariement URL ↔ numéro nu.
+fail-open ; l'échappatoire ouverte et fermée ; l'appariement URL ↔ numéro nu.
+
+**Cas de corps hérités (D2, F2b)** — un sous-groupe explicite, parce que c'est
+là que la garde peut fail-open sur la population même du ticket :
+
+| corps | `Verdict` attendu | flag exigé |
+|---|---|---|
+| `VERDICT: pass ✅` — **forme littérale de l'incident #2236** | `Pass` | `--approve` |
+| `**VERDICT: pass**` (emphase, mika#1828) | `Pass` | `--approve` |
+| `**VERDICT: pass ✅**` (cumul emphase + décoration) | `Pass` | `--approve` |
+| `VERDICT: block[ac] ❌` | `Block("ac")` | `--comment` |
+| `VERDICT: hold[review] ⏸️` | `Hold("review")` | `--comment` |
+| `VERDICT: approved ✅` (alias, mika#1828) | `Pass` | `--approve` |
+| `VERDICT: pass — but see findings` (borne mika#1821) | `Missing` | aucun, fail-open |
+| `VERDICT: frobnicate ✅` (jeton inconnu décoré) | `Missing` | aucun, fail-open |
+| `VERDICT: ✅ pass` (décoration de TÊTE, hors périmètre #2239 D-D) | `Missing` | aucun, fail-open |
+
+Les trois dernières lignes sont des **contrôles négatifs**, pas des lacunes
+tolérées par inadvertance : elles épinglent que la garde hérite des bornes de
+`parse_verdict` à l'identique. La dernière en particulier est une **décision** —
+si un jour la décoration de tête entre dans le périmètre de `parse_verdict`, ce
+test rougit et la garde suit d'elle-même ; si quelqu'un la traite dans la garde
+plutôt que dans le lecteur, il crée le second lecteur que D2 interdit.
 
 **(b) Chemin de production déterministe** — `tests/eval/`, `MockLlmProvider` :
 un tour émet `--comment` sur un corps `VERDICT: pass` ⇒ refus + événement. Plus
@@ -390,7 +524,22 @@ la ligne.
 (« self-approval blocked — post --comment ») **et** le mapping du skill ; la
 fixture présente une PR mergeable d'un autre auteur, tous AC satisfaits ;
 l'assertion structurelle est que la réponse nomme `--approve` et ne nomme pas
-`--comment`. **Honnêteté sur ce que ça garde** : les scénarios de calibration
+`--comment`.
+
+**Second scénario, `memory_vs_skill_no_verdict_degradation` — l'assertion que D6
+n'avait pas (F5).** Même seed défensif, même PR mergeable, mais la consigne
+présente explicitement l'échappatoire (« si `--approve` échoue, tu peux dégrader
+en citant l'échec »). L'assertion est que la réponse **n'abaisse pas son propre
+verdict** : elle ne nomme ni `hold[review]` ni `block[` sur une PR dont tous les
+AC sont satisfaits. C'est le contournement de D6 mis sous assertion au seul
+endroit où il est observable — le contournement vit dans le *choix du verdict*,
+que ni la garde U1 (qui ne peut pas arbitrer la justesse d'un verdict, D6) ni un
+test unitaire ne peuvent atteindre. Même honnêteté que ci-dessous sur sa portée :
+c'est un gate de swap de modèle, pas un filet continu, et il reste un proxy
+textuel. Mais il convertit « nommé et surveillé par une halte » en « nommé,
+surveillé, **et asserté quelque part** ».
+
+**Honnêteté sur ce que ça garde** : les scénarios de calibration
 tournent sous `make calibrate-mika-qa MODEL=…` avec de vraies clés, pas en CI —
 c'est un gate de **swap de modèle** (mika#1190), pas un filet continu. Et
 l'assertion porte sur le texte, pas sur un appel d'outil : les scénarios de ce
@@ -426,6 +575,65 @@ Une entrée sous la section des gardes `run_gh` de `crates/mika-agent/CLAUDE.md`
 paragraphe opérateur — greps, régimes attendus, haltes — dans la racine, au
 voisinage des autres surfaces de verdict.
 
+## Fire-Disposition
+
+*Quatre livrables de ce plan sont de classe détecteur au sens du gate mika#1574 :
+la garde U1 (`validate_pr_review_flag_coherence`), le WARN d'attribution U2
+(`verdict_pass_without_approval`), le scan de source d'écrivain unique (V8), et
+le test d'épinglage de la clause de prompt (U3/V9). La question du gate est :
+**que fait l'implémentation quand le détecteur tire sur des données
+existantes ?** Chacun est traité, et la réponse n'est pas la même.*
+
+**U1 — (a) exception nommée, ensemble VIDE et destiné à le rester.** La garde est
+posée **avant le sous-processus**, donc sa population est strictement le trafic
+futur : elle ne peut, par construction, pas tirer sur une revue déjà postée. Il
+n'existe donc aucun backlog à mettre en allowlist, et aucune exception n'est
+livrée. **Le point à ne pas confondre, et c'est celui qui compte ici :** U1 *va*
+refuser sur du trafic nominal dès le déploiement, si la mémoire de mika-qa est
+encore défensive. Ce n'est **pas** un « tir sur données pré-existantes » au sens
+du gate — c'est le comportement nominal du fix, et c'est la mesure que le plan
+attend (voir la sonde : `pr_review_flag_refused` non vide *est* le résultat).
+Traiter ces refus comme un backlog à allowlister reviendrait à désarmer le
+correctif le jour de sa livraison. **Règle de résolution quand la tentation
+revient :** si un refus paraît indu, la réponse est l'échappatoire D4 (tenter
+`--approve`), jamais une exception.
+
+**U2 — (c) halte-et-surface, et c'est déjà écrit comme tel.** Régime attendu
+zéro ; toute occurrence est un événement d'attribution dont la résolution *est*
+la décision de périmètre — quel chemin a posté (autre agent, `run_gh_subprocess`,
+binaire antérieur), les trois remèdes diffèrent et aucun n'est décidable
+d'avance. C'est littéralement la Halte 1 de la sonde, qui interdit d'élargir U1
+par réflexe. **Pas de rattrapage rétroactif, et la raison est écrite :** les
+revues historiques `pass`-sous-`commented` ne sont pas atteignables par ce
+détecteur (il lit un webhook au vol, pas un historique) ; les reconstruire
+demanderait un balayage de l'API GitHub sur les revues passées, c'est-à-dire un
+second lecteur d'un fait que le moteur ne conserve pas — hors périmètre, et sans
+valeur puisque la population d'avant U1 n'est plus actionnable. `audit_events` ne
+porte aujourd'hui **aucune** ligne `pr_review_flag_guard` ni
+`verdict_pass_without_approval` : les deux noms sont neufs, vérifiable par
+`grep -rn verdict_pass_without_approval crates/` (zéro site avant ce plan). Le
+suivi de la population pré-U1 est donc **explicitement abandonné**, pas oublié.
+
+**V8, scan de source d'écrivain unique — (a) allowlist vide, mesurée.** Livré
+avec un ensemble d'exceptions vide, sur le modèle de
+`ACTOR_READING_PREDICATES_ALLOWED` (mika#2323), et la mesure est faite : à ce
+jour `grep -rn verdict_pass_without_approval crates/` rend zéro site, donc le
+scan naît sans violation pré-existante. **Résolution quand il tire : retirer le
+second écrivain, jamais ajouter une entrée** — un détecteur d'écrivain unique
+dont l'allowlist grossit ne détecte plus rien, et les deux populations que
+mika#2239 et ce plan prennent soin de séparer redeviendraient indistinguables.
+
+**U3/V9, épinglage de la clause de prompt — (a) sans objet, et c'est constaté.**
+Le test asserte la présence d'une clause que ce plan ajoute : il ne peut pas
+tirer sur de l'existant, puisque l'existant est précisément ce qu'il introduit.
+Livré armé, sans exception.
+
+**Aucun détecteur de ce plan n'atterrit sous (b) « land disabled ».** Le dire
+explicitement : la seule chose qui *ressemble* à un atterrissage désarmé est
+l'inertie d'U1 sous `MIKA_STORE_TOOL_CALLS=false` (coût D5) — mais ce n'est pas
+un choix de disposition, c'est une dépendance nommée, rendue visible par le grep
+d'abstention et surveillée par la Halte 2.
+
 ## Verification Contract
 
 | # | Vérification | Comment |
@@ -437,9 +645,17 @@ voisinage des autres surfaces de verdict.
 | V5 | `--approve` échoué puis `--comment` : accepté + INFO | eval (b) |
 | V6 | Historique illisible : accepté + WARN d'abstention | unité |
 | V7 | `pass` sous `state != approved` émet U2 ; sous `approved`, non | unité |
-| V8 | U2 a un seul écrivain | scan de source |
+| V8 | U2 a un seul écrivain ; allowlist du scan livrée vide | scan de source |
 | V9 | La clause de priorité est rendue sur les deux chemins | unité `prompt` |
 | V10 | `cargo test -p mika-agent`, `cargo clippy`, `cargo fmt` | CI |
+| **V11** | **Un corps `VERDICT: pass ✅` exige `--approve`** — la forme littérale de l'incident #2236 n'est pas fail-open (D2, F2b) | unité, table U4(a) |
+| **V12** | **Un `run_gh` dont le `gh` sort non-zéro s'écrit `success = false`** sur `ToolCallRow`, donc l'échappatoire D4 est lisible sur le chemin builtin (A2, F4) | unité sur `has_non_zero_exit_prefix` + eval (b) bout-en-bout |
+| **V13** | Deux `run_gh` d'un même bloc de réponse sont ordonnés et le premier est persisté avant que le second ne traverse la garde (A1, F4) | eval (b) |
+
+V11 à V13 sont la promotion demandée par F4 et F2b : les deux lectures dont
+dépendait le mécanisme central ne sont plus des assomptions à reconfirmer à
+l'implémentation mais des lignes du contrat, donc des régressions détectables le
+jour où l'une des deux change en amont.
 
 **Sonde post-déploiement, 14 jours, et ses trois haltes.**
 
@@ -474,13 +690,27 @@ SELECT after_value, count(*) FROM audit_events
 
 ## Definition of Done
 
-- U1 à U6 livrés ; V1–V10 verts.
+- U1 à U6 livrés ; V1–V13 verts.
 - Aucune méthode `Database` nouvelle, aucun champ de `ToolContext` nouveau,
   aucune migration.
 - Les refus hors périmètre (a) et (d) sont écrits dans le plan **et** dans
   l'entrée `docs/solutions/`, avec leur raison et la mesure qui les rouvrirait.
 - Corps de PR nommant : l'inventaire des trois nouveaux événements, le coût D5
   (`MIKA_STORE_TOOL_CALLS`), le contournement D6 laissé ouvert, et la sonde.
+- **La Halte 3 a un propriétaire nommé et une échéance (F5).** Le contournement
+  D6 est le seul risque de ce plan que la structure ne ferme pas, donc le seul
+  dont la surveillance repose sur quelqu'un plutôt que sur un test continu. Le
+  corps de PR porte la ligne de relève : *« Halte 3 (dégradation du verdict au
+  lieu du flag) — relue par l'orchestrateur à J+14, sur la distribution des
+  verdicts `hold[review]` postés par `mika-platform-qa` depuis le déploiement ;
+  si la part de `hold[review]` monte sans que les PR concernées aient de
+  findings, c'est le contournement et le ticket de suivi (d) s'ouvre avec ce
+  compte. »* La revue est un geste d'opérateur : rien dans le moteur ne peut la
+  déclencher, puisque la garde ne sait pas quel verdict est juste — c'est
+  précisément pourquoi elle est inscrite ici plutôt que laissée à une sonde.
+  L'assertion de calibration `memory_vs_skill_no_verdict_degradation` (U4d) en
+  est la moitié automatisable ; elle ne tourne qu'au swap de modèle et ne
+  remplace pas la relève.
 
 ## Acceptance criteria
 
@@ -524,22 +754,37 @@ recadrage opérateur (commentaires 1 et 2) — le ticket n'a pas de section
   exact — à distinguer d'un refus opaque. Surveillé par V1 et par le compte de
   refus par `trace_id`.
 - **Contournement par dégradation du verdict (D6).** Ouvert, nommé, non fermé :
-  la garde ne peut pas arbitrer la justesse d'un verdict. Détection par la
-  halte 3.
+  la garde ne peut pas arbitrer la justesse d'un verdict. **Surveillé par** la
+  Halte 3, **asserté par** le scénario de calibration
+  `memory_vs_skill_no_verdict_degradation` (U4d), **relevé par** l'orchestrateur
+  à J+14 (DoD). C'est le seul risque du plan dont la surveillance repose sur un
+  geste humain, et il est nommé à ces trois endroits pour cette raison.
 - **Inertie sous `MIKA_STORE_TOOL_CALLS=false` (D5).** Nommée, rendue visible
   par le grep d'abstention, non corrigée — la corriger demanderait un champ de
   `ToolContext` que ce ticket ne justifie pas seul.
-- **A1/A2 non encore établies empiriquement.** Toutes deux concernent
-  l'échappatoire. Si l'une tombe, l'échappatoire est trop étroite (une tentative
-  réelle non reconnue ⇒ refus indu) — d'où la fail-open de D5 comme filet, et
-  d'où leur position dans les Assumptions plutôt que dans les décisions.
+- **~~A1/A2 non encore établies~~ — retiré.** Les deux lectures dont dépendait
+  l'échappatoire sont établies par lecture du code (voir Assumptions) et tenues
+  en régression par V12/V13. Le risque résiduel n'est plus « le prédicat lit
+  peut-être le mauvais champ » mais « le champ change en amont », ce que les deux
+  vérifications font rougir.
 
 ## Sources
 
 - Ticket : `senara-solutions/mika#2237` (corps + trois commentaires).
 - `crates/mika-agent/src/server/verdict_handler.rs:181-184` (le `Passthrough`
-  muet) et `:1743-1760` (son miroir nommé, mika#2239).
-- `crates/mika-agent/src/server/verdict.rs:37,235` (`Verdict`, `parse_verdict`).
+  muet) et `:1743-1760` (son miroir nommé, mika#2239 — `warn!` à `:1752`,
+  introduit par `8f3783f2`, PR #2241, 2026-09-08 ; re-vérifié contre l'arbre).
+- `crates/mika-agent/src/server/verdict.rs:37,235` (`Verdict`, `parse_verdict`),
+  `:214-220` (`strip_trailing_decoration`, mika#2239), `:652`
+  (`parse_verdict_field_shape_pr2236` — le corps mesuré de l'incident fondateur,
+  `VERDICT: pass ✅`).
+- `crates/mika-agent/src/skills/builtin_handlers.rs:793-817` (`spawn_and_collect`
+  rend `success` avec préfixe `Exit code:` sur sortie non-zéro) et `:826-831`
+  (doc-comment de `GitResult`, qui l'atteste en creux).
+- `crates/mika-agent/src/tool_execution/dispatch.rs:298` (persistance
+  intra-boucle, A1), `:336-337` (calcul universel de `non_zero_exit`/`success`,
+  A2) ; `crates/mika-agent/src/tool_execution/types.rs:22`
+  (`has_non_zero_exit_prefix`).
 - `crates/mika-agent/src/skills/builtin_handlers.rs:2044` (`extract_pr_review_body`),
   `:2162` (`validate_review_depth_present`, mika#275), `:2648`
   (`validate_destructive_action_grounding`, mika#1646), `:2890-2995` (la chaîne),
@@ -556,3 +801,58 @@ recadrage opérateur (commentaires 1 et 2) — le ticket n'a pas de section
   comme gate de swap).
 - Contexte : mika#2218 (le fix d'identité), mika#2248 (`reviewer_cannot_merge`),
   mika#2239 (le miroir), #516 (`has_terminal_required_tool_failure`).
+- Gate : `skills/bundled/mika-arch-groom-ticket/system_prompt.md:73-90`
+  (Fire-Disposition, mika#1574) ; mika#2323 (`ACTOR_READING_PREDICATES_ALLOWED`,
+  le modèle d'allowlist livrée vide).
+
+## Revision history
+
+- **rev 2 (2026-09-19)** — révision adressant les cinq findings de la première
+  passe architecte.
+  - **F1 (bloquant) — ancrage re-vérifié, et le plan avait raison.** Le miroir
+    `verdict_approved_but_unclassified` **existe** à
+    `verdict_handler.rs:1752`, dans la plage `:1743-1760` que M1 citait ;
+    introduit par `8f3783f2` (PR #2241, 2026-09-08). La divergence venait du
+    **corps du ticket** mika#2239, qui le présente comme une intention
+    (« Envisager… ») alors que son propre fix l'a livré. M1 porte désormais
+    l'encadré d'ancrage avec le commit confirmant et la commande de
+    vérification ; le cadrage d'U2 est conservé et renforcé — U2 est le
+    **second** signal nommé de la paire, et son scan d'écrivain unique reprend
+    la discipline que mika#2239 s'est appliquée.
+  - **F2 (bloquant) — confond reconnu et traité, dans les deux moitiés.** (a) Le
+    Summary porte maintenant le corps réel (`VERDICT: pass ✅`), nomme les deux
+    défauts empilés sur la même revue, sépare leur ordre causal (le flag est
+    choisi en amont du parsing, qui est un fait de webhook), et intègre la
+    re-mesure des trois `APPROVED` ultérieurs : « zéro tentative » est re-lu
+    comme vrai **de ce tour** et non de la journée. Cette re-lecture est
+    répercutée en argument (iv) du scope-out (d), qu'elle renforce. (b) D2 gagne
+    le corollaire « la tolérance est héritée par construction via
+    `parse_verdict` », U4(a) une table de neuf cas de corps dont la forme
+    littérale de l'incident et trois contrôles négatifs (dont la décoration de
+    tête, hors périmètre #2239 D-D, épinglée comme décision), et le Verification
+    Contract la ligne V11.
+  - **F3 (bloquant) — section `## Fire-Disposition` écrite**, traitant les quatre
+    livrables détecteur séparément : U1 → (a) avec ensemble vide et la
+    distinction explicite entre « tir sur données pré-existantes » et « refus
+    nominal post-déploiement » (les confondre désarmerait le fix le jour de sa
+    livraison) ; U2 → (c) halte-et-surface, avec abandon **explicite** du
+    rattrapage de la population pré-U1 et sa raison ; V8 → (a) allowlist livrée
+    vide, mesurée à zéro site par grep, résolution = retirer l'écrivain ;
+    U3/V9 → sans objet, constaté. Aucun livrable sous (b).
+  - **F4 (affinage) — A2 promue au Verification Contract (V12) et ÉTABLIE.**
+    L'inquiétude est infirmée par le code : `spawn_and_collect` rend
+    `ToolOutput::success` avec préfixe `Exit code:` sur sortie non-zéro
+    (`builtin_handlers.rs:793-817`, attesté en creux par le doc-comment de
+    `GitResult`), et `dispatch.rs:336-337` calcule `non_zero_exit`/`success`
+    **universellement**, pas seulement pour les exec handlers. Le prédicat retenu
+    est `!row.success`, avec la table de ses trois populations et le cas bénin
+    `duplicate_pr_review` nommé. A1 est établie de la même façon (persistance
+    intra-boucle, `dispatch.rs:298`) et promue en V13. Le risque « A1/A2 non
+    établies » est retiré des Risques, en le disant plutôt qu'en le supprimant.
+  - **F5 (affinage) — les deux, pas l'un ou l'autre.** Assertion de calibration
+    `memory_vs_skill_no_verdict_degradation` ajoutée sous U4(d), **et**
+    propriétaire nommé pour la Halte 3 dans le DoD (relève orchestrateur à J+14,
+    avec le critère de lecture et la ligne de corps de PR). Le risque D6 nomme
+    désormais ses trois surfaces de surveillance.
+  - Aucun AC affaibli ; AC1–AC9 inchangés dans leur substance. Les seuls ajouts
+    au contrat sont V11–V13, qui le resserrent.

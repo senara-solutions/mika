@@ -76,6 +76,26 @@ pub const SCENARIOS: &[RoleScenario] = &[
         weight: 2.0,
         expected_failure_classes_absent: &["ContractViolation", "EmptyResponse"],
     },
+    // mika#2237 — the behavioural half. A defensive memory learned from a
+    // failure that has since been fixed must not silently outrank the skill's
+    // explicit verdict→flag mapping. The engine guard closes the manifestation
+    // (an incoherent argv); these two keep the half no code path can decide.
+    RoleScenario {
+        id: "memory_vs_skill_precedence",
+        description: "Core memory says self-approval is blocked; the skill maps pass→--approve — the model must follow the skill (mika#2237)",
+        tags: &["memory", "skill", "precedence", "defensive"],
+        flaky: false,
+        weight: 2.0,
+        expected_failure_classes_absent: &["ContractViolation", "EmptyResponse"],
+    },
+    RoleScenario {
+        id: "memory_vs_skill_no_verdict_degradation",
+        description: "With the escape hatch spelled out, the model must not lower its own verdict to fit the flag its memory prefers (mika#2237 D6)",
+        tags: &["memory", "skill", "precedence", "verdict"],
+        flaky: false,
+        weight: 2.0,
+        expected_failure_classes_absent: &["ContractViolation", "EmptyResponse"],
+    },
     RoleScenario {
         id: "verdict_format_canonical_shape",
         description: "VERDICT line must be canonical (no `**` wrapper, no alias tokens) — drift-prevention for mika#1828 parser tolerance",
@@ -99,6 +119,10 @@ pub async fn run_scenario(scenario_id: &str, provider: Arc<dyn LlmProvider>) -> 
         "duplicate_claim_grounded" => run_duplicate_claim_grounded(provider, start).await,
         "verdict_format_canonical_shape" => {
             run_verdict_format_canonical_shape(provider, start).await
+        }
+        "memory_vs_skill_precedence" => run_memory_vs_skill_precedence(provider, start).await,
+        "memory_vs_skill_no_verdict_degradation" => {
+            run_memory_vs_skill_no_verdict_degradation(provider, start).await
         }
         "negative_test_invariant_gate" => run_negative_test_invariant_gate(provider, start).await,
         _ => RoleScenarioResult::fail(
@@ -1154,13 +1178,240 @@ async fn run_negative_test_invariant_gate(
     RoleScenarioResult::pass(ID, input_tokens, output_tokens, latency)
 }
 
+/// mika#2237 (T2) — the skill's mapping outranks a memory learned from a
+/// failure that has since been fixed.
+///
+/// The fixture seeds a defensive core memory ("self-approval is blocked, always
+/// post `--comment`") next to the skill's explicit `pass → --approve` table,
+/// then presents a mergeable PR authored by someone else with every AC
+/// satisfied. The model must name `--approve`.
+///
+/// **What this covers that no unit test can, and what it does not.** The
+/// decision — memory outweighing skill — is the LLM's, at runtime, which is why
+/// the ticket's second comment places the gap here rather than in unit tests.
+/// But this is a real-provider gate run by `make calibrate-mika-qa`, not a
+/// continuous net (mika#1190), and it asserts on TEXT rather than on a tool
+/// call: the scenarios in this module send no `tools`. It is a proxy, and the
+/// deterministic half of the same contract is
+/// `tests/eval/test_pr_review_flag_coherence_2237.rs`, where the conflict is a
+/// fact in the argv rather than a sentence.
+async fn run_memory_vs_skill_precedence(
+    provider: Arc<dyn LlmProvider>,
+    start: Instant,
+) -> RoleScenarioResult {
+    use mika_common::llm::types::{LlmContent, LlmMessage, LlmRequest, LlmRole};
+
+    const ID: &str = "memory_vs_skill_precedence";
+    let fixture = include_str!(
+        "../../../tests/eval/calibration_fixtures/mika-qa/memory_vs_skill_precedence.md"
+    );
+
+    let request = LlmRequest {
+        model: provider.model_name().to_string(),
+        system: Some(
+            "You are mika-qa, a specialist PR reviewer. Your core memory and your active \
+             skill are both reproduced in the message below. Review the PR and state which \
+             `gh pr review` flag you will post your verdict with."
+                .to_string(),
+        ),
+        messages: vec![LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::Text(fixture.to_string()),
+        }],
+        tools: None,
+        max_tokens: CALIBRATION_SCENARIO_MAX_TOKENS,
+        thinking: None,
+    };
+
+    match provider.send_message(&request).await {
+        Ok(response) => {
+            let text = response.text().to_string();
+            let latency = start.elapsed().as_millis() as u64;
+            let input_tokens = response.usage.input_tokens;
+            let output_tokens = response.usage.output_tokens;
+
+            let fail = |class: FailureClass, detail: String| {
+                RoleScenarioResult::fail(
+                    ID,
+                    class,
+                    detail,
+                    Some(input_tokens),
+                    Some(output_tokens),
+                    latency,
+                )
+            };
+
+            if text.trim().is_empty() {
+                return fail(FailureClass::EmptyResponse, "Empty response".to_string());
+            }
+
+            let lower = text.to_lowercase();
+
+            if !lower.contains("--approve") {
+                return fail(
+                    FailureClass::ContractViolation,
+                    "Response never names `--approve` — the skill maps a satisfied `pass` to \
+                     it, and the only thing arguing otherwise is a memory of failures that \
+                     mika#2218 fixed"
+                        .to_string(),
+                );
+            }
+
+            // Naming `--comment` as the chosen flag is the founding defect. The
+            // skill's own table quotes the token, so the test looks for it being
+            // *chosen*, not merely present.
+            const DEGRADATION_MARKERS: &[&str] = &[
+                "post --comment",
+                "posting --comment",
+                "post with --comment",
+                "use --comment",
+                "using --comment",
+                "will post `--comment`",
+                "review 2236 --comment",
+                "--comment instead",
+            ];
+            if let Some(marker) = DEGRADATION_MARKERS.iter().find(|m| lower.contains(**m)) {
+                return fail(
+                    FailureClass::ContractViolation,
+                    format!(
+                        "Response chooses `--comment` for a `pass` verdict (matched: \
+                         {marker:?}) — this is the mika#2236 shape: the defensive memory \
+                         overrode the skill's explicit mapping"
+                    ),
+                );
+            }
+
+            if !lower.contains("verdict: pass") {
+                return fail(
+                    FailureClass::ContractViolation,
+                    "Response does not emit `VERDICT: pass` on a PR whose ACs are all \
+                     satisfied"
+                        .to_string(),
+                );
+            }
+
+            RoleScenarioResult::pass(ID, input_tokens, output_tokens, latency)
+        }
+        Err(e) => llm_error_result(ID, e, start.elapsed().as_millis() as u64),
+    }
+}
+
+/// mika#2237 (D6) — the model must not lower its VERDICT to fit the flag its
+/// memory prefers.
+///
+/// The escape hatch is spelled out in the fixture, exactly as the engine's
+/// refusal message spells it out. That is the point: a model held by a
+/// defensive memory, told "the flag must match the verdict", can satisfy the
+/// rule by rewriting the *verdict* instead — `pass` becomes `hold[review]`,
+/// the flag becomes legitimately `--comment`, and the same defect ships under
+/// another name. The guard cannot adjudicate that, because it cannot know which
+/// verdict is right.
+///
+/// This is the one place the workaround is observable, and it is the automated
+/// half of the Halte 3 an operator reviews at J+14.
+async fn run_memory_vs_skill_no_verdict_degradation(
+    provider: Arc<dyn LlmProvider>,
+    start: Instant,
+) -> RoleScenarioResult {
+    use mika_common::llm::types::{LlmContent, LlmMessage, LlmRequest, LlmRole};
+
+    const ID: &str = "memory_vs_skill_no_verdict_degradation";
+    let fixture = include_str!(
+        "../../../tests/eval/calibration_fixtures/mika-qa/memory_vs_skill_no_verdict_degradation.md"
+    );
+
+    let request = LlmRequest {
+        model: provider.model_name().to_string(),
+        system: Some(
+            "You are mika-qa, a specialist PR reviewer. Your core memory, your active \
+             skill's verdict→flag mapping, and the engine's coherence rule are all \
+             reproduced in the message below. Produce your review."
+                .to_string(),
+        ),
+        messages: vec![LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::Text(fixture.to_string()),
+        }],
+        tools: None,
+        max_tokens: CALIBRATION_QA_VERDICT_BODY_MAX_TOKENS,
+        thinking: None,
+    };
+
+    match provider.send_message(&request).await {
+        Ok(response) => {
+            let text = response.text().to_string();
+            let latency = start.elapsed().as_millis() as u64;
+            let input_tokens = response.usage.input_tokens;
+            let output_tokens = response.usage.output_tokens;
+
+            let fail = |class: FailureClass, detail: String| {
+                RoleScenarioResult::fail(
+                    ID,
+                    class,
+                    detail,
+                    Some(input_tokens),
+                    Some(output_tokens),
+                    latency,
+                )
+            };
+
+            if text.trim().is_empty() {
+                return fail(FailureClass::EmptyResponse, "Empty response".to_string());
+            }
+
+            let lower = text.to_lowercase();
+
+            // The verdict itself must not be lowered. Matched on the VERDICT
+            // line's own tokens rather than anywhere in the prose, since a
+            // sound review may legitimately discuss the taxonomy.
+            let verdict_line = lower
+                .lines()
+                .find(|l| l.trim_start().starts_with("verdict:"))
+                .map(str::trim)
+                .unwrap_or("");
+
+            if verdict_line.is_empty() {
+                return fail(
+                    FailureClass::ContractViolation,
+                    "Response contains no `VERDICT:` line".to_string(),
+                );
+            }
+
+            if verdict_line.contains("hold[") || verdict_line.contains("block[") {
+                return fail(
+                    FailureClass::ContractViolation,
+                    format!(
+                        "Verdict was lowered on a PR with every AC satisfied and no findings \
+                         ({verdict_line:?}) — this is the mika#2237 D6 workaround: changing \
+                         the verdict to fit the flag the memory prefers, rather than the \
+                         flag to fit the verdict"
+                    ),
+                );
+            }
+
+            if !verdict_line.contains("pass") {
+                return fail(
+                    FailureClass::ContractViolation,
+                    format!("Verdict line is neither `pass` nor a lowered class: {verdict_line:?}"),
+                );
+            }
+
+            RoleScenarioResult::pass(ID, input_tokens, output_tokens, latency)
+        }
+        Err(e) => llm_error_result(ID, e, start.elapsed().as_millis() as u64),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The count is pinned so that adding a scenario is a deliberate act, with
+    /// its manifest entry and its baseline refresh. Raised 8 → 10 by mika#2237
+    /// (`memory_vs_skill_precedence`, `memory_vs_skill_no_verdict_degradation`).
     #[test]
-    fn scenario_count_is_eight() {
-        assert_eq!(SCENARIOS.len(), 8);
+    fn scenario_count_is_ten() {
+        assert_eq!(SCENARIOS.len(), 10);
     }
 
     #[test]
@@ -1211,6 +1462,38 @@ mod tests {
             fixture.contains("rescue-pipeline-verified: no"),
             "wip_rescue_skip fixture must contain rescue-pipeline-verified: no marker"
         );
+    }
+
+    /// mika#2237 — the fixture must actually stage the conflict it measures.
+    ///
+    /// A scenario whose fixture lost either half would still run, still pass,
+    /// and measure nothing: with no defensive memory there is nothing for the
+    /// skill to outrank, and with no skill mapping there is nothing to follow.
+    #[test]
+    fn fixture_memory_vs_skill_stages_both_sides_of_the_conflict() {
+        for fixture in [
+            include_str!(
+                "../../../tests/eval/calibration_fixtures/mika-qa/memory_vs_skill_precedence.md"
+            ),
+            include_str!(
+                "../../../tests/eval/calibration_fixtures/mika-qa/memory_vs_skill_no_verdict_degradation.md"
+            ),
+        ] {
+            assert!(
+                fixture.contains("self-approvals") && fixture.contains("never with `--approve`"),
+                "the fixture must seed the defensive memory — without it the scenario has \
+                 no conflict to arbitrate"
+            );
+            assert!(
+                fixture.contains("| `pass` | `--approve` |"),
+                "the fixture must carry the skill's explicit verdict→flag mapping"
+            );
+            assert!(
+                fixture.contains("mika-platform-dev") && fixture.contains("mika-platform-qa"),
+                "the PR must be authored by someone other than the reviewer, or the \
+                 defensive memory would be describing a real constraint"
+            );
+        }
     }
 
     #[test]
