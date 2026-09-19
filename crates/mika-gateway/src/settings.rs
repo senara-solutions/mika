@@ -145,6 +145,27 @@ pub struct GatewaySettings {
     #[serde(default)]
     pub brave_endpoint: Option<String>,
 
+    /// mika#2407 — does this deployment **expect** the search substrate?
+    ///
+    /// **Without a declaration the two states are one.** "This gateway does not
+    /// want search" and "this gateway wanted search and lost it" produce
+    /// identical bytes today: `search_upstream = None`. No guard, no smoke and no
+    /// heuristic can separate them without being told what is expected — which is
+    /// why the 2026-09-18 rotation could drop `MIKA_SEARCH_UPSTREAM` and leave six
+    /// tenants mute for twenty hours while `/readyz` stayed green.
+    ///
+    /// Absent or empty ⇒ **not required**: that is the legitimate shape of a dev
+    /// workstation and of every existing deployment that never wanted search, and
+    /// resolving it otherwise would refuse startup for all of them. See
+    /// [`search_substrate_is_required`] for the three tiers and why an
+    /// unrecognized value leans the other way.
+    ///
+    /// `Option<String>`, never `bool` — the same F8 reason as
+    /// [`GatewaySettings::telegram_html_render`]: under config-rs a `bool`
+    /// receiving `"oui"` is a hard `load()` error with no variable named.
+    #[serde(default)]
+    pub search_required: Option<String>,
+
     /// mika#2360 — admin READ-ONLY token. Opens
     /// `GET /admin/tenants/{customer_id}/recurring-tasks` and nothing else.
     /// Maps to `MIKA_GATEWAY_ADMIN_READ_TOKEN`.
@@ -264,7 +285,49 @@ impl GatewaySettings {
             }
         }
 
+        // mika#2407 — a deployment that DECLARES it expects search and has none
+        // does not start. Runs last on purpose: the two checks above already
+        // refuse an unrecognized selector and a `brave` without its key, so by
+        // the time we get here an unresolved upstream can only mean *absent*.
+        self.assert_search_substrate_expectation()?;
+
         Ok(())
+    }
+
+    /// mika#2407 — the half of AC1 that needs no external caller.
+    ///
+    /// **Why a startup guard rather than only a smoke.** The AC asks for a
+    /// control that *fails the deployment*. A smoke is a probe: someone must
+    /// call it, at the right moment, with the right token, and its absence of
+    /// call is indistinguishable from its success. A startup guard is
+    /// structural — the pod does not start, so the Kubernetes rollout fails on
+    /// its own, with no scheduler to wire and no upstream request spent. The two
+    /// are not redundant: the guard cannot see a key that is present but dead,
+    /// and the smoke depends on being called.
+    ///
+    /// **It reads configuration and never the network** (KTD3). Probing the
+    /// upstream at boot would sound right and cost two failure modes: a
+    /// crash-looping pod would spend the shared monthly quota it exists to
+    /// protect, and an upstream outage would then be enough to keep the gateway
+    /// — Telegram, GitHub webhooks, A2A — from starting at all.
+    fn assert_search_substrate_expectation(&self) -> anyhow::Result<()> {
+        if !search_substrate_is_required(self.search_required.as_deref()) {
+            return Ok(());
+        }
+        let upstream = self.search_upstream.as_deref().map(str::trim).unwrap_or("");
+        if !upstream.is_empty() {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "MIKA_SEARCH_REQUIRED declares this gateway expects the search substrate, \
+             but MIKA_SEARCH_UPSTREAM is not set — POST /internal/search would answer \
+             404 search_upstream_not_configured and every tenant would lose web search \
+             silently (mika#2407, 2026-09-18: six tenants mute for ~20 h). \
+             Fix: set MIKA_SEARCH_UPSTREAM=brave together with MIKA_BRAVE_API_KEY in the \
+             gateway secret. A key on its own activates nothing. \
+             If this deployment genuinely does not want search, unset MIKA_SEARCH_REQUIRED \
+             (or set it to 0)."
+        );
     }
 }
 
@@ -348,6 +411,7 @@ impl std::fmt::Debug for GatewaySettings {
                 &self.brave_api_key.as_ref().map(|_| "[REDACTED]"),
             )
             .field("brave_endpoint", &self.brave_endpoint)
+            .field("search_required", &self.search_required)
             .field(
                 "gateway_admin_read_token",
                 &self.gateway_admin_read_token.as_ref().map(|_| "[REDACTED]"),
@@ -457,6 +521,79 @@ pub fn telegram_html_render_is_enabled(raw: Option<&str>) -> bool {
     }
 }
 
+/// Parse `MIKA_SEARCH_REQUIRED` (mika#2407). Three tiers, and the lean of the
+/// fourth is the decision.
+///
+/// | value | resolution |
+/// |---|---|
+/// | absent or empty | **not required** — the legitimate shape of a dev workstation and of every deployment that never wanted search |
+/// | `1` / `true` / `on` / `yes` | **required** — a missing substrate becomes fatal at startup |
+/// | `0` / `false` / `off` / `no` | **not required**, explicitly |
+/// | non-empty and unrecognized | **required**, with a `warn!` naming the value between quotes |
+///
+/// **The last tier leans the opposite way to [`telegram_html_render_is_enabled`],
+/// and both leans are correct.** Each points toward the *noisy* outcome for its
+/// own surface: there, a rendering that still delivers (armed, with a plain-text
+/// fallback); here, a rollout that fails out loud. The cost asymmetry decides it
+/// — a rollout refused on a typo is repaired in a minute, six mute tenants are
+/// repaired only once a human notices, which on 2026-09-18 took twenty hours.
+///
+/// The value is quoted in the WARN because a stray space is otherwise invisible
+/// (mika#2220), and it is the **trimmed original** rather than the lowercased
+/// match subject — folding its case throws away part of what was typed.
+pub fn search_substrate_is_required(raw: Option<&str>) -> bool {
+    let Some(value) = raw.map(str::trim) else {
+        return false;
+    };
+    if value.is_empty() {
+        return false;
+    }
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => true,
+        "0" | "false" | "off" | "no" => false,
+        _ => {
+            tracing::warn!(
+                event = "search_required_unrecognized_value",
+                value = %format!("{value:?}"),
+                "mika#2407: MIKA_SEARCH_REQUIRED carries an unrecognized value — \
+                 the search substrate is treated as REQUIRED (fail closed). \
+                 Use 1/true/on/yes to require it, 0/false/off/no to make it optional."
+            );
+            true
+        }
+    }
+}
+
+/// Provenance of the `MIKA_SEARCH_REQUIRED` answer, for `search_upstream_resolved`.
+///
+/// `GatewaySettings` has exactly one source — the process environment through
+/// config-rs — so this reconstruction is not the five-door cascade of mika#2293:
+/// the field being `Some(non-empty)` *is* the variable being set. Reporting a
+/// richer provenance than the loader has would be a lie dressed as detail.
+///
+/// The distinction still earns its place: "not required" read off an absent
+/// variable and "not required" read off an explicit `0` call for different
+/// operator gestures — the first is the state the 2026-09-18 rotation produced.
+pub fn search_required_source(raw: Option<&str>) -> &'static str {
+    match raw.map(str::trim) {
+        Some(v) if !v.is_empty() => "process_env",
+        _ => "default",
+    }
+}
+
+/// The upstream actually resolved, as the label `search_upstream_resolved` logs.
+///
+/// Only `"brave"` and `"none"` are reachable: [`GatewaySettings::validate`] has
+/// already refused an unrecognized selector, so this function never has to
+/// invent a name for a value that cannot exist. Keeping the mapping here rather
+/// than inline in `main.rs` is what lets the label be asserted by a test.
+pub fn resolved_search_upstream_label(raw: Option<&str>) -> &'static str {
+    match raw.map(str::trim) {
+        Some(kind) if kind.eq_ignore_ascii_case("brave") => "brave",
+        _ => "none",
+    }
+}
+
 /// Parse `MIKA_ORCHESTRATOR_INBOX_ENABLED`. Treats `1` / `true` (case-insensitive)
 /// as enabled; everything else (unset, empty, `0`, `false`, or any other value)
 /// as disabled. The `2` (gateway-only) value is reserved for a future ticket
@@ -544,6 +681,7 @@ mod tests {
                 search_upstream: Some("brave".to_string()),
                 brave_api_key: Some(SecretString::from("brave-api-key-secret")),
                 brave_endpoint: None,
+                search_required: None,
                 gateway_admin_read_token: Some(SecretString::from("admin-read-sentinel")),
             }
         );
@@ -791,6 +929,7 @@ mod tests {
             search_upstream: None,
             brave_api_key: None,
             brave_endpoint: None,
+            search_required: None,
             gateway_admin_read_token: None,
         }
     }
@@ -840,6 +979,166 @@ mod tests {
         s.search_upstream = Some("BRAVE".to_string());
         s.brave_api_key = Some(SecretString::from("k"));
         assert!(s.validate().is_ok());
+    }
+
+    // -- mika#2407: the search substrate expectation is DECLARED --
+
+    /// Tier 1 — absent / empty ⇒ **not required**.
+    ///
+    /// The load-bearing half of the three tiers, and the one an over-eager
+    /// reading would get wrong: a dev workstation and every deployment that
+    /// never wanted search carry nothing, and making absence fatal would refuse
+    /// startup for all of them. mika#2023's rule, verbatim: *unrecognized values
+    /// fail closed, absence does not*.
+    #[test]
+    fn mika2407_search_required_absent_is_not_required() {
+        assert!(!search_substrate_is_required(None));
+        assert!(!search_substrate_is_required(Some("")));
+        assert!(!search_substrate_is_required(Some("   ")));
+    }
+
+    /// Tier 2 / 3 — the explicit vocabulary, whitespace tolerated.
+    #[test]
+    fn mika2407_search_required_explicit_values() {
+        for raw in ["1", "true", "TRUE", "on", "ON", "yes", " 1 ", "\ttrue\n"] {
+            assert!(
+                search_substrate_is_required(Some(raw)),
+                "{raw:?} must declare the substrate required"
+            );
+        }
+        for raw in ["0", "false", "FALSE", "off", "no", " 0 ", "\tfalse\n"] {
+            assert!(
+                !search_substrate_is_required(Some(raw)),
+                "{raw:?} must declare the substrate optional"
+            );
+        }
+    }
+
+    /// Tier 4 — an unrecognized value leans toward **required**, the inverse of
+    /// its sibling [`telegram_html_render_is_enabled`]'s lean.
+    ///
+    /// Both leans are "toward the noisy outcome", which is why they point in
+    /// opposite directions: there, armed rendering with a plain-text fallback;
+    /// here, a rollout that fails loudly. The cost asymmetry is what decides it —
+    /// a rollout refused on a typo is repaired in a minute, six mute tenants are
+    /// repaired only once a human notices.
+    #[test]
+    fn mika2407_search_required_unrecognized_value_fails_closed() {
+        for raw in ["oui", "2", "maybe", "0x0", "-1", "required"] {
+            assert!(
+                search_substrate_is_required(Some(raw)),
+                "{raw:?} must fail closed (required)"
+            );
+        }
+    }
+
+    /// The measured failure of 2026-09-18: the deployment expects search and the
+    /// selector is gone. The gateway must refuse to start.
+    #[test]
+    fn mika2407_required_without_upstream_refuses_startup() {
+        let mut s = test_settings();
+        s.search_required = Some("1".to_string());
+        let err = s.validate().unwrap_err();
+        let msg = err.to_string();
+        // The operator reads this line out of a crash-loop. All three variables
+        // and the repairing gesture must be *in it*, not in the repository.
+        for needle in [
+            "MIKA_SEARCH_REQUIRED",
+            "MIKA_SEARCH_UPSTREAM",
+            "MIKA_BRAVE_API_KEY",
+        ] {
+            assert!(msg.contains(needle), "{needle} missing from: {msg}");
+        }
+    }
+
+    /// The half-configuration of M2 line 3 — the key is there, the selector is
+    /// not. `Some("")` is the same state written differently and must not slip
+    /// past the guard through the "empty == absent" arm above it.
+    #[test]
+    fn mika2407_required_with_key_but_no_selector_refuses_startup() {
+        let mut s = test_settings();
+        s.search_required = Some("1".to_string());
+        s.brave_api_key = Some(SecretString::from("k"));
+        assert!(s.validate().is_err(), "key alone must not satisfy required");
+
+        s.search_upstream = Some("  ".to_string());
+        assert!(
+            s.validate().is_err(),
+            "a whitespace selector is an absent selector"
+        );
+    }
+
+    /// A fully wired deployment starts.
+    #[test]
+    fn mika2407_required_with_upstream_starts() {
+        let mut s = test_settings();
+        s.search_required = Some("1".to_string());
+        s.search_upstream = Some("brave".to_string());
+        s.brave_api_key = Some(SecretString::from("k"));
+        assert!(s.validate().is_ok());
+    }
+
+    /// **The negative control, and it is the one that carries the unit.**
+    ///
+    /// Without it, a guard that refused *every* startup without search would
+    /// pass all four tests above — and would take down every gateway that
+    /// legitimately runs without the substrate. V4 in one assertion.
+    #[test]
+    fn mika2407_not_required_and_no_upstream_still_starts() {
+        let s = test_settings();
+        assert!(s.search_required.is_none());
+        assert!(s.search_upstream.is_none());
+        assert!(
+            s.validate().is_ok(),
+            "a gateway that declares nothing must start exactly as before"
+        );
+
+        let mut explicit = test_settings();
+        explicit.search_required = Some("0".to_string());
+        assert!(explicit.validate().is_ok());
+    }
+
+    /// The provenance half of U1: `required_source` must say which of the two
+    /// doors answered, because "not required" read off a default and "not
+    /// required" read off an explicit `0` call for different operator gestures.
+    #[test]
+    fn mika2407_required_source_separates_declaration_from_default() {
+        assert_eq!(search_required_source(None), "default");
+        assert_eq!(search_required_source(Some("")), "default");
+        assert_eq!(search_required_source(Some("   ")), "default");
+        assert_eq!(search_required_source(Some("0")), "process_env");
+        assert_eq!(search_required_source(Some("1")), "process_env");
+        assert_eq!(search_required_source(Some("oui")), "process_env");
+    }
+
+    /// `GatewaySettings::load` cannot fail on this field, whatever is set —
+    /// the property `Option<String>` buys, invisible to every test above.
+    /// Mirrors `mika2291_c5_load_cannot_fail_on_this_field`.
+    #[test]
+    fn mika2407_load_cannot_fail_on_the_required_field() {
+        let settings: GatewaySettings = Config::builder()
+            .set_override("database_url", "postgres://localhost/test")
+            .and_then(|b| b.set_override("internal_token", "a".repeat(64)))
+            .and_then(|b| b.set_override("search_required", "oui"))
+            .and_then(|b| b.build())
+            .expect("config builds")
+            .try_deserialize()
+            .expect("an arbitrary MIKA_SEARCH_REQUIRED must not fail deserialization");
+        assert_eq!(settings.search_required.as_deref(), Some("oui"));
+        assert!(search_substrate_is_required(
+            settings.search_required.as_deref()
+        ));
+    }
+
+    /// The resolved upstream label U1 logs. `"none"` and `"brave"` only — the
+    /// unrecognized case cannot reach it (`validate` already refused).
+    #[test]
+    fn mika2407_resolved_upstream_label() {
+        assert_eq!(resolved_search_upstream_label(None), "none");
+        assert_eq!(resolved_search_upstream_label(Some("")), "none");
+        assert_eq!(resolved_search_upstream_label(Some("  ")), "none");
+        assert_eq!(resolved_search_upstream_label(Some("brave")), "brave");
+        assert_eq!(resolved_search_upstream_label(Some(" BRAVE ")), "brave");
     }
 
     #[test]
