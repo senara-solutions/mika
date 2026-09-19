@@ -91,10 +91,39 @@
 //! arm. Pinned by [`tests::mika2293_process_env_is_never_reported_as_default`].
 //! Each resolution also carries its [`ResolvedBudgetValue::raw`] string, so the
 //! reading can be checked rather than trusted.
+//!
+//! # The other half of "why was this turn cut?" — the model (mika#2328)
+//!
+//! mika#2293 answers *which timeout pair* an agent runs under. It did not answer
+//! *which model*, and mika#2328 measured why that matters: `zai_model =
+//! "glm-5.2"` is the only value `well_known_agents.rs` has ever declared for
+//! mika-qa, while the incident of 2026-09-15 was produced by a **glm-5.3** in
+//! service — an out-of-repo edit of the agent's `config.toml`, which
+//! `reconcile_well_known_config` preserves as long as provisioning is frozen.
+//! The repo said one thing, the runtime ran another, indefinitely, and nothing
+//! anywhere said so.
+//!
+//! `turn_usage` does carry `provider` and `model`, but per turn, inside 19 GB of
+//! log, with no provenance. What was missing is a *configuration* event, and the
+//! emission site already existed — hence [`ModelProvenance`], resolved through
+//! the **same** [`CascadeLayers`] as the two budget keys and emitted on the same
+//! line. The two facts are read together (a cut turn is diagnosed with the model
+//! *and* the envelope), which is also why the deduplication signature covers
+//! both: the mika#2362 motif, where a change moving only one field must be
+//! re-emitted rather than swallowed.
+//!
+//! **The model key's NAME depends on the provider** (`zai_model`,
+//! `openrouter_model`, `anthropic_model`, …), so it is derived from the provider
+//! in force rather than hard-coded. A fixed key would report `default` for an
+//! agent whose model is perfectly well declared — a *false* provenance, which
+//! this module holds to be strictly worse than none.
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
+
+use super::ProviderKind;
 
 use super::budget::{
     AGENT_TOTAL_TIMEOUT_ENV_VAR, DEFAULT_AGENT_TOTAL_TIMEOUT_SECS, LlmTimeoutBudget,
@@ -106,7 +135,31 @@ pub const HTTP_TIMEOUT_CONFIG_KEY: &str = "llm_http_timeout_secs";
 /// `config.toml` key for the per-agent envelope.
 pub const AGENT_TOTAL_TIMEOUT_CONFIG_KEY: &str = "agent_total_timeout_secs";
 
-/// Which door of the cascade a budget value came through.
+/// `config.toml` key selecting the active provider (mika#2328).
+pub const LLM_PROVIDER_CONFIG_KEY: &str = "llm_provider";
+/// Environment variable selecting the active provider (mika#2328).
+pub const LLM_PROVIDER_ENV_VAR: &str = "MIKA_LLM_PROVIDER";
+
+/// The provider that applies when no door of the cascade carries one.
+///
+/// Mirrors `config::default_llm_provider`, which is private to that module. The
+/// duplication is pinned by
+/// [`tests::mika2328_model_reconstruction_equals_load_for_agent_on_every_cascade_position`],
+/// which compares this reader against `Settings::load_for_agent` — including on
+/// the position where nothing is declared.
+const DEFAULT_PROVIDER: ProviderKind = ProviderKind::Anthropic;
+
+/// The `model_source` value used when a door carried a provider this reader
+/// cannot parse, so the model key's *name* is unknown.
+///
+/// A sixth word in the `*_source` vocabulary rather than a `default`: reporting
+/// `default` there would state "no door carried the model", which is not known
+/// and may well be false. Unreachable in production — `Settings::load_for_agent`
+/// refuses such a value outright, so the agent never starts — but this reader
+/// must never panic and must never answer wrongly (mika#2293).
+pub const MODEL_SOURCE_UNKNOWN_PROVIDER: &str = "unknown_provider";
+
+/// Which door of the cascade a value came through.
 ///
 /// Five states, where mika#2293 asks for four: `GlobalConfig` is split out of
 /// `AgentConfig` rather than folded into it. The ticket's question is "did the
@@ -190,6 +243,141 @@ impl ResolvedBudgetValue {
     }
 }
 
+/// One **string-valued** key, resolved through the same cascade (mika#2328).
+///
+/// The twin of [`ResolvedBudgetValue`] minus the `u64` parse. The obstacle to
+/// reporting a model's provenance was never the cascade —
+/// [`CascadeLayers::resolve_key`] already took its two key names as parameters
+/// and knows nothing about which key it is walking — it was the **type of the
+/// value**: `ResolvedBudgetValue::value` is an `Option<u64>` built by
+/// `parse::<u64>()`, and a model is a string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedTextValue {
+    /// The door it came through.
+    pub source: BudgetSource,
+    /// The raw string as written. `None` exactly when `source` is
+    /// [`BudgetSource::Default`].
+    pub raw: Option<String>,
+}
+
+impl ResolvedTextValue {
+    fn nothing_read() -> Self {
+        Self {
+            source: BudgetSource::Default,
+            raw: None,
+        }
+    }
+
+    /// The raw string, or `""` when nothing was read — a log-field shape.
+    pub fn raw_or_empty(&self) -> &str {
+        self.raw.as_deref().unwrap_or("")
+    }
+}
+
+/// Which model one agent actually runs, and through which door (mika#2328).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelProvenance {
+    /// The active provider, or `None` when a door carried a value this reader
+    /// cannot parse. `None` is **not** "the default applies": it is "the model
+    /// key's name is unknown", which is why the model half is `None` with it.
+    pub provider: Option<ProviderKind>,
+    /// The `llm_provider` key as resolved — door and raw string.
+    pub provider_value: ResolvedTextValue,
+    /// The per-provider model key as resolved. `None` iff `provider` is `None`.
+    pub model: Option<ResolvedTextValue>,
+}
+
+impl ModelProvenance {
+    /// Rebuild the cascade for the provider key and the model key it names.
+    ///
+    /// Never panics, for the same reason [`BudgetProvenance::resolve`] does not:
+    /// this reader precedes the paths that refuse a bad value, it does not
+    /// replace them.
+    pub fn resolve(global_home: &Path, agent_home: &Path) -> Self {
+        Self::from_layers(&CascadeLayers::read(global_home, agent_home))
+    }
+
+    fn from_layers(layers: &CascadeLayers) -> Self {
+        let provider_value = layers.resolve_text(LLM_PROVIDER_CONFIG_KEY, LLM_PROVIDER_ENV_VAR);
+
+        // An absent provider is the compiled-in default — the shape every
+        // agent without an `llm_provider` line has. A *present but unparseable*
+        // one is a different world: the key's name cannot be derived, so no
+        // model provenance can be stated at all.
+        let provider = match provider_value.raw.as_deref() {
+            None => Some(DEFAULT_PROVIDER),
+            Some(raw) => ProviderKind::from_str(raw.trim()).ok(),
+        };
+
+        let model = provider.map(|p| layers.resolve_text(&model_config_key(p), &model_env_var(p)));
+
+        Self {
+            provider,
+            provider_value,
+            model,
+        }
+    }
+
+    /// The model the agent actually runs — the declared value, or the
+    /// provider's default when no door carried one.
+    ///
+    /// Mirrors `Settings::active_llm_config` arm for arm (`model.unwrap_or(
+    /// provider.default_model())`), deliberately **without** filtering an empty
+    /// or space-padded value: the number this reports is the one the agent runs
+    /// under, not a second opinion about it. `None` when the provider itself is
+    /// unreadable.
+    pub fn effective_model(&self) -> Option<&str> {
+        let provider = self.provider?;
+        Some(match self.model.as_ref().and_then(|m| m.raw.as_deref()) {
+            Some(raw) => raw,
+            None => provider.default_model(),
+        })
+    }
+
+    /// The wire name of the door the model came through, or
+    /// [`MODEL_SOURCE_UNKNOWN_PROVIDER`] when the provider is unreadable.
+    pub fn model_source_name(&self) -> &'static str {
+        match &self.model {
+            Some(model) => model.source.as_str(),
+            None => MODEL_SOURCE_UNKNOWN_PROVIDER,
+        }
+    }
+
+    /// The `config.toml` key this agent's model is read from (`zai_model`,
+    /// `openrouter_model`, …) — the key an operator would have to edit. Empty
+    /// when the provider is unreadable.
+    pub fn model_config_key(&self) -> String {
+        self.provider.map(model_config_key).unwrap_or_default()
+    }
+
+    /// The provider as a log field: its canonical key prefix, or the raw string
+    /// that failed to parse — never a fallback silently presented as a reading.
+    pub fn provider_name(&self) -> &str {
+        match self.provider {
+            Some(p) => p.config_prefix(),
+            None => self.provider_value.raw_or_empty(),
+        }
+    }
+}
+
+/// `config.toml` key holding one provider's model (`zai` → `zai_model`).
+fn model_config_key(provider: ProviderKind) -> String {
+    format!("{}_model", provider.config_prefix())
+}
+
+/// Environment variable holding one provider's model (`zai` →
+/// `MIKA_ZAI_MODEL`).
+///
+/// Derived from the same prefix rather than tabulated, because a table would be
+/// a second place for the mapping to be wrong — and a wrong env-var name here
+/// does not fail, it reports `default` for a model the environment is in fact
+/// setting. Pinned empirically against `Settings::load_for_agent` for **every**
+/// provider by
+/// [`tests::mika2328_the_model_key_is_the_one_settings_reads_for_every_provider`].
+fn model_env_var(provider: ProviderKind) -> String {
+    format!("MIKA_{}_MODEL", provider.config_prefix().to_uppercase())
+}
+
 /// The provenance of both halves of one agent's budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BudgetProvenance {
@@ -208,7 +396,10 @@ impl BudgetProvenance {
     /// it (mika#1660 keeps that panic on its own cold path; this reader
     /// precedes it, it does not replace it).
     pub fn resolve(global_home: &Path, agent_home: &Path) -> Self {
-        let layers = CascadeLayers::read(global_home, agent_home);
+        Self::from_layers(&CascadeLayers::read(global_home, agent_home))
+    }
+
+    fn from_layers(layers: &CascadeLayers) -> Self {
         Self {
             http: layers.resolve_key(HTTP_TIMEOUT_CONFIG_KEY, HTTP_TIMEOUT_ENV_VAR),
             agent_total: layers
@@ -282,18 +473,24 @@ impl CascadeLayers {
         }
     }
 
-    /// Resolve one key through the four positions, highest priority first.
-    fn resolve_key(&self, config_key: &str, env_var: &str) -> ResolvedBudgetValue {
+    /// Resolve one key through the four positions, highest priority first —
+    /// the door it came through and the raw string as written, or `None` when
+    /// no door carried it.
+    ///
+    /// Untyped on purpose (mika#2328): the walk is identical for a timeout and
+    /// for a model name, and duplicating it for the second would be a second
+    /// place for the mika#2218 inverted order to drift.
+    fn resolve_raw(&self, config_key: &str, env_var: &str) -> Option<(BudgetSource, String)> {
         // 1. Per-agent `.env` — highest priority since mika#2218.
         if let Some(raw) = self.agent_dotenv.as_ref().and_then(|v| v.get(env_var)) {
-            return ResolvedBudgetValue::from_raw(BudgetSource::AgentDotenv, raw);
+            return Some((BudgetSource::AgentDotenv, raw.clone()));
         }
 
         // 2. Process environment.
         if let Ok(raw) = std::env::var(env_var)
             && !raw.trim().is_empty()
         {
-            return ResolvedBudgetValue::from_raw(BudgetSource::ProcessEnv, &raw);
+            return Some((BudgetSource::ProcessEnv, raw));
         }
 
         // 3. Per-agent `config.toml`.
@@ -302,7 +499,7 @@ impl CascadeLayers {
             .as_ref()
             .and_then(|t| config_key_as_string(t, config_key))
         {
-            return ResolvedBudgetValue::from_raw(BudgetSource::AgentConfig, &raw);
+            return Some((BudgetSource::AgentConfig, raw));
         }
 
         // 4. Global `config.toml`.
@@ -311,10 +508,29 @@ impl CascadeLayers {
             .as_ref()
             .and_then(|t| config_key_as_string(t, config_key))
         {
-            return ResolvedBudgetValue::from_raw(BudgetSource::GlobalConfig, &raw);
+            return Some((BudgetSource::GlobalConfig, raw));
         }
 
-        ResolvedBudgetValue::compiled_default()
+        None
+    }
+
+    /// Resolve one **integer-valued** key through the four positions.
+    fn resolve_key(&self, config_key: &str, env_var: &str) -> ResolvedBudgetValue {
+        match self.resolve_raw(config_key, env_var) {
+            Some((source, raw)) => ResolvedBudgetValue::from_raw(source, &raw),
+            None => ResolvedBudgetValue::compiled_default(),
+        }
+    }
+
+    /// Resolve one **string-valued** key through the four positions.
+    fn resolve_text(&self, config_key: &str, env_var: &str) -> ResolvedTextValue {
+        match self.resolve_raw(config_key, env_var) {
+            Some((source, raw)) => ResolvedTextValue {
+                source,
+                raw: Some(raw),
+            },
+            None => ResolvedTextValue::nothing_read(),
+        }
     }
 }
 
@@ -387,27 +603,40 @@ const REPORTED_ATTEMPT_HARD_CAP: u32 = super::DEFAULT_ATTEMPTS_HARD_CAP;
 /// `effective_max_attempts` is part of the key: without it, a geometry change
 /// that moves only *reachability* — the very thing the new fields report —
 /// would be deduplicated away as "no change".
-fn dedup_signature(provenance: &BudgetProvenance) -> String {
+///
+/// The model and its provenance are part of it for the same reason (mika#2328):
+/// an out-of-repo model swap moves neither timeout, and a signature blind to it
+/// would silence the single line that reports the swap.
+fn dedup_signature(provenance: &BudgetProvenance, model: &ModelProvenance) -> String {
     let budget = provenance.effective_budget();
     format!(
-        "{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
         budget.http_timeout_secs(),
         budget.agent_total_timeout_secs(),
         provenance.http.source.as_str(),
         provenance.agent_total.source.as_str(),
         budget.effective_max_attempts(REPORTED_ATTEMPT_HARD_CAP),
+        model.provider_name(),
+        model.provider_value.source.as_str(),
+        model.effective_model().unwrap_or(""),
+        model.model_source_name(),
     )
 }
 
 pub fn log_llm_budget_resolved(agent_id: &str, global_home: &Path, agent_home: &Path) {
-    let provenance = BudgetProvenance::resolve(global_home, agent_home);
+    // One read of the four cascade doors, two facts drawn from it: the budget
+    // pair and the model. They are read together by whoever diagnoses a cut
+    // turn, so they are resolved and emitted together.
+    let layers = CascadeLayers::read(global_home, agent_home);
+    let provenance = BudgetProvenance::from_layers(&layers);
+    let model = ModelProvenance::from_layers(&layers);
     let budget = provenance.effective_budget();
 
     let max_attempts = budget.max_attempts(REPORTED_ATTEMPT_HARD_CAP);
     let effective_max_attempts = budget.effective_max_attempts(REPORTED_ATTEMPT_HARD_CAP);
     let retry_reachable = effective_max_attempts == max_attempts;
 
-    let signature = dedup_signature(&provenance);
+    let signature = dedup_signature(&provenance, &model);
 
     let mut seen = LAST_EMITTED
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -432,6 +661,14 @@ pub fn log_llm_budget_resolved(agent_id: &str, global_home: &Path, agent_home: &
         total_source = provenance.agent_total.source.as_str(),
         http_raw = provenance.http.raw_or_empty(),
         total_raw = provenance.agent_total.raw_or_empty(),
+        // mika#2328 — the model half. `model_config_key` names the key an
+        // operator would edit, which is how the "resolved from the provider,
+        // never hard-coded" rule becomes checkable from the log alone.
+        provider = model.provider_name(),
+        provider_source = model.provider_value.source.as_str(),
+        model = model.effective_model().unwrap_or(""),
+        model_source = model.model_source_name(),
+        model_config_key = model.model_config_key(),
         "resolved LLM timeout budget (mika#2293)"
     );
 
@@ -487,7 +724,12 @@ mod tests {
     use crate::config::Settings;
     use serial_test::serial;
 
-    /// Clear both budget variables from the process env.
+    /// Clear both budget variables — and, since mika#2328, every variable that
+    /// can move the resolved model — from the process env.
+    ///
+    /// The model half has to clear `MIKA_LLM_PROVIDER` and all thirteen
+    /// `MIKA_*_MODEL` variables: an ambient one would silently put a test's
+    /// cascade one door higher than the door it means to exercise.
     ///
     /// # Safety
     /// Test-only, serialized by `#[serial]`.
@@ -495,6 +737,10 @@ mod tests {
         unsafe {
             std::env::remove_var(HTTP_TIMEOUT_ENV_VAR);
             std::env::remove_var(AGENT_TOTAL_TIMEOUT_ENV_VAR);
+            std::env::remove_var(LLM_PROVIDER_ENV_VAR);
+            for provider in ProviderKind::ALL {
+                std::env::remove_var(model_env_var(*provider));
+            }
         }
     }
 
@@ -697,7 +943,12 @@ mod tests {
 
         // Reads the emitter's own key rather than rebuilding it: a hand-written
         // copy here is what broke when mika#2362 extended the signature.
-        let signature_now = || dedup_signature(&BudgetProvenance::resolve(&global, &agent));
+        let signature_now = || {
+            dedup_signature(
+                &BudgetProvenance::resolve(&global, &agent),
+                &ModelProvenance::resolve(&global, &agent),
+            )
+        };
 
         let first = signature_now();
         log_llm_budget_resolved("mika-arch", &global, &agent);
@@ -841,5 +1092,302 @@ mod tests {
         assert_eq!(BudgetSource::AgentConfig.as_str(), "agent_config");
         assert_eq!(BudgetSource::GlobalConfig.as_str(), "global_config");
         assert_eq!(BudgetSource::Default.as_str(), "default");
+        // mika#2328 — the sixth word, on the model half only.
+        assert_eq!(MODEL_SOURCE_UNKNOWN_PROVIDER, "unknown_provider");
+    }
+
+    /// mika#2328 V3 — the load-bearing test of the model half.
+    ///
+    /// Built on the gabarit of
+    /// [`mika2293_reconstruction_equals_load_for_agent_on_every_cascade_position`]:
+    /// the model this module reports must equal the model
+    /// `Settings::load_for_agent` merges, on **each** of the four cascade
+    /// positions plus the compiled default. A reconstruction that assumed the
+    /// usual file-below-env order would report a *false* provenance, which this
+    /// module holds to be strictly worse than none.
+    #[test]
+    #[serial]
+    fn mika2328_model_reconstruction_equals_load_for_agent_on_every_cascade_position() {
+        clean_budget_env();
+        let (_tmp, global, agent) = homes();
+
+        let reported = |global: &std::path::Path, agent: &std::path::Path| {
+            let p = ModelProvenance::resolve(global, agent);
+            (
+                p.provider,
+                p.model.as_ref().map(|m| m.source),
+                p.effective_model().map(str::to_string),
+            )
+        };
+        let merged = |global: &std::path::Path, agent: &std::path::Path| {
+            let s = Settings::load_for_agent(global, agent).unwrap();
+            (s.llm_provider, s.active_llm_config().model)
+        };
+
+        // Position 5 — nothing declared anywhere: the compiled defaults.
+        let (provider, source, model) = reported(&global, &agent);
+        let (merged_provider, merged_model) = merged(&global, &agent);
+        assert_eq!(provider, Some(DEFAULT_PROVIDER));
+        assert_eq!(provider, Some(merged_provider));
+        assert_eq!(source, Some(BudgetSource::Default));
+        assert_eq!(
+            model.as_deref(),
+            Some(merged_model.as_str()),
+            "position 5 (constante compilée) : modèle reconstruit ≠ modèle fusionné"
+        );
+
+        // Position 4 — global config.toml only.
+        std::fs::write(
+            global.join("config.toml"),
+            "llm_provider = \"zai\"\nzai_model = \"glm-4.9\"\n",
+        )
+        .unwrap();
+        let (provider, source, model) = reported(&global, &agent);
+        let (merged_provider, merged_model) = merged(&global, &agent);
+        assert_eq!(provider, Some(ProviderKind::ZAi));
+        assert_eq!(provider, Some(merged_provider));
+        assert_eq!(source, Some(BudgetSource::GlobalConfig));
+        assert_eq!(model.as_deref(), Some(merged_model.as_str()));
+        assert_eq!(model.as_deref(), Some("glm-4.9"));
+
+        // Position 3 — per-agent config.toml beats the global one. This is the
+        // door mika-qa's `zai_model` actually comes through.
+        std::fs::write(
+            agent.join("config.toml"),
+            "llm_provider = \"zai\"\nzai_model = \"glm-5.2\"\n",
+        )
+        .unwrap();
+        let (provider, source, model) = reported(&global, &agent);
+        let (merged_provider, merged_model) = merged(&global, &agent);
+        assert_eq!(provider, Some(merged_provider));
+        assert_eq!(source, Some(BudgetSource::AgentConfig));
+        assert_eq!(model.as_deref(), Some(merged_model.as_str()));
+        assert_eq!(model.as_deref(), Some("glm-5.2"));
+
+        // Position 2 — the process env beats both config files. This is H2: a
+        // fleet-wide variable shadowing the per-agent file, and the reading
+        // that tells an operator the repo is not authoritative here.
+        // Safety: test-only env var, serialized by `#[serial]`.
+        unsafe { std::env::set_var(model_env_var(ProviderKind::ZAi), "glm-5.3") };
+        let (_, source, model) = reported(&global, &agent);
+        let (_, merged_model) = merged(&global, &agent);
+        assert_eq!(source, Some(BudgetSource::ProcessEnv));
+        assert_eq!(
+            model.as_deref(),
+            Some(merged_model.as_str()),
+            "position 2 (env du process) : c'est exactement l'écrasement que H2 décrit"
+        );
+        assert_eq!(model.as_deref(), Some("glm-5.3"));
+
+        // Position 1 — the per-agent `.env` beats the process env (mika#2218).
+        std::fs::write(
+            agent.join(".env"),
+            format!("{}=glm-5.4\n", model_env_var(ProviderKind::ZAi)),
+        )
+        .unwrap();
+        let (_, source, model) = reported(&global, &agent);
+        let (_, merged_model) = merged(&global, &agent);
+        assert_eq!(source, Some(BudgetSource::AgentDotenv));
+        assert_eq!(
+            model.as_deref(),
+            Some(merged_model.as_str()),
+            "position 1 (.env per-agent) : l'ordre est INVERSÉ depuis mika#2218"
+        );
+        assert_eq!(model.as_deref(), Some("glm-5.4"));
+
+        clean_budget_env();
+    }
+
+    /// mika#2328 — the model key follows the provider, on both its doors.
+    ///
+    /// Empirical rather than tabulated: for **every** provider, the key and the
+    /// env var this module derives are the ones `Settings` actually reads. A
+    /// hard-coded or mistyped name does not fail loudly — it reports `default`
+    /// for a model that is in fact declared, i.e. a false provenance. Three
+    /// providers (`kimi`, `qwen`, `zai`) are absent from `config::CONFIG_KEYS`
+    /// altogether, so asserting against that registry would have proved less
+    /// than this does.
+    #[test]
+    #[serial]
+    fn mika2328_the_model_key_is_the_one_settings_reads_for_every_provider() {
+        clean_budget_env();
+
+        for provider in ProviderKind::ALL {
+            let (_tmp, global, agent) = homes();
+            let prefix = provider.config_prefix();
+
+            // The config.toml door.
+            std::fs::write(
+                agent.join("config.toml"),
+                format!(
+                    "llm_provider = \"{prefix}\"\n{} = \"probe-from-config\"\n",
+                    model_config_key(*provider)
+                ),
+            )
+            .unwrap();
+            let settings = Settings::load_for_agent(&global, &agent).unwrap();
+            assert_eq!(
+                settings.active_llm_config().model,
+                "probe-from-config",
+                "{prefix}: la clé dérivée n'est pas celle que Settings lit"
+            );
+            let p = ModelProvenance::resolve(&global, &agent);
+            assert_eq!(p.provider, Some(*provider));
+            assert_eq!(p.effective_model(), Some("probe-from-config"));
+            assert_eq!(
+                p.model.as_ref().map(|m| m.source),
+                Some(BudgetSource::AgentConfig)
+            );
+            assert_eq!(p.model_config_key(), format!("{prefix}_model"));
+
+            // The process-env door.
+            // Safety: test-only env var, serialized by `#[serial]`.
+            unsafe { std::env::set_var(model_env_var(*provider), "probe-from-env") };
+            let settings = Settings::load_for_agent(&global, &agent).unwrap();
+            assert_eq!(
+                settings.active_llm_config().model,
+                "probe-from-env",
+                "{prefix}: la variable dérivée n'est pas celle que Settings lit — \
+                 une provenance `default` serait rapportée pour un modèle bel et bien posé"
+            );
+            let p = ModelProvenance::resolve(&global, &agent);
+            assert_eq!(p.effective_model(), Some("probe-from-env"));
+            assert_eq!(
+                p.model.as_ref().map(|m| m.source),
+                Some(BudgetSource::ProcessEnv)
+            );
+            // Safety: test-only env var, serialized by `#[serial]`.
+            unsafe { std::env::remove_var(model_env_var(*provider)) };
+        }
+
+        clean_budget_env();
+    }
+
+    /// mika#2328 — a fixed model key would report `default` for a declared model.
+    ///
+    /// The negative control of the test above: `zai_model` is on disk, the
+    /// provider is `openrouter`, and the correct answer is that **openrouter's**
+    /// model was never declared. A reader hard-coding `zai_model` would answer
+    /// `agent_config` / `glm-5.2` here — confidently, and wrongly.
+    #[test]
+    #[serial]
+    fn mika2328_a_model_key_of_another_provider_is_not_read() {
+        clean_budget_env();
+        let (_tmp, global, agent) = homes();
+        std::fs::write(
+            agent.join("config.toml"),
+            "llm_provider = \"openrouter\"\nzai_model = \"glm-5.2\"\n",
+        )
+        .unwrap();
+
+        let p = ModelProvenance::resolve(&global, &agent);
+        assert_eq!(p.provider, Some(ProviderKind::OpenRouter));
+        assert_eq!(
+            p.model.as_ref().map(|m| m.source),
+            Some(BudgetSource::Default)
+        );
+        assert_eq!(
+            p.effective_model(),
+            Some(ProviderKind::OpenRouter.default_model()),
+            "aucune clé openrouter n'est déclarée : le défaut du provider s'applique"
+        );
+        assert_eq!(p.model_config_key(), "openrouter_model");
+
+        clean_budget_env();
+    }
+
+    /// mika#2328 — an unreadable provider yields no model provenance at all.
+    ///
+    /// Not `default`, which would state "no door carried the model" — unknown,
+    /// and possibly false. Unreachable in production (`Settings::load_for_agent`
+    /// refuses the value outright, so the agent never starts), which is checked
+    /// here too: this reader must stay readable precisely where that one aborts.
+    #[test]
+    #[serial]
+    fn mika2328_an_unreadable_provider_is_never_reported_as_a_default_model() {
+        clean_budget_env();
+        let (_tmp, global, agent) = homes();
+        std::fs::write(
+            agent.join("config.toml"),
+            "llm_provider = \"zaii\"\nzai_model = \"glm-5.2\"\n",
+        )
+        .unwrap();
+
+        assert!(
+            Settings::load_for_agent(&global, &agent).is_err(),
+            "l'état est inatteignable en production — Settings refuse ce fichier"
+        );
+
+        let p = ModelProvenance::resolve(&global, &agent);
+        assert_eq!(p.provider, None);
+        assert_eq!(p.model, None);
+        assert_eq!(p.effective_model(), None);
+        assert_eq!(p.model_source_name(), MODEL_SOURCE_UNKNOWN_PROVIDER);
+        assert_eq!(
+            p.provider_name(),
+            "zaii",
+            "le champ `provider` rend la valeur qui a échoué, jamais un repli \
+             présenté comme une lecture"
+        );
+        assert_eq!(p.model_config_key(), "");
+
+        clean_budget_env();
+    }
+
+    /// mika#2328 V4 — a model change is re-emitted, not deduplicated away.
+    ///
+    /// The motif of mika#2362: an out-of-repo model swap moves neither timeout,
+    /// so a signature blind to the model would silence the one line that
+    /// reports the swap — on exactly the event that exists to report it.
+    #[test]
+    #[serial]
+    fn mika2328_dedup_re_emits_when_only_the_model_changes() {
+        clean_budget_env();
+        reset_dedup_for_test();
+        let (_tmp, global, agent) = homes();
+
+        let write_model = |model: &str| {
+            std::fs::write(
+                agent.join("config.toml"),
+                format!(
+                    "llm_provider = \"zai\"\nzai_model = \"{model}\"\n\
+                     llm_http_timeout_secs = 240\nagent_total_timeout_secs = 900\n"
+                ),
+            )
+            .unwrap();
+        };
+        let signature_now = || {
+            dedup_signature(
+                &BudgetProvenance::resolve(&global, &agent),
+                &ModelProvenance::resolve(&global, &agent),
+            )
+        };
+
+        write_model("glm-5.2");
+        let before = signature_now();
+        let budget_before = BudgetProvenance::resolve(&global, &agent);
+
+        write_model("glm-5.3");
+        let after = signature_now();
+
+        assert_eq!(
+            budget_before,
+            BudgetProvenance::resolve(&global, &agent),
+            "le couple de timeouts n'a pas bougé — c'est tout l'intérêt du cas"
+        );
+        assert_ne!(
+            before, after,
+            "un swap de modèle hors dépôt doit ré-émettre la ligne"
+        );
+
+        // And the emitter honours it: the recorded signature follows.
+        log_llm_budget_resolved("mika-qa", &global, &agent);
+        {
+            let seen = LAST_EMITTED.get().unwrap().lock().unwrap();
+            assert_eq!(seen.get("mika-qa"), Some(&after));
+        }
+
+        reset_dedup_for_test();
+        clean_budget_env();
     }
 }
