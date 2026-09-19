@@ -1424,13 +1424,36 @@ You have no skills enabled. Your purpose is to exercise the core agent loop
 - You are a plain conversational agent with no special workflows
 "#;
 
-/// mika-test identity.toml — no skills, KG disabled per mika#963.
+/// mika-test identity.toml — no skills, KG disabled per mika#963, and isolated
+/// per call per mika#1951.
 ///
 /// The allowlist uses a sentinel value `__mika_test_no_skills__` that matches
 /// no real skill. An empty `allowlist = []` would be treated as a no-op by
 /// `apply_identity_allowlist()` (which early-returns on empty), so we need a
 /// non-empty list with a value that cannot match any bundled or custom skill.
 /// This follows the same pattern as `__fail_closed_no_skills__` in `prompt.rs`.
+///
+/// # The two `[context.*]` blocks (mika#1951)
+///
+/// This agent's written purpose is to be a bench — *a bare engine exerciser*
+/// (mika#963) — and it was carrying the conversational defaults. The 2026-08-22
+/// GLM battery ran ten `mika ask --session-id <fresh-uuid>` calls with one prompt
+/// and got *« Six. Answer unchanged. »* on a brand-new session: each call read
+/// the twenty last messages **of the agent, all sessions merged**, because
+/// [`crate::prompt::HistoryScope::Agent`] is the default and no
+/// `[context.history]` block said otherwise.
+///
+/// Both blocks are here, not one. `load_conversation_summary` filters on
+/// `agent_id` **alone**, so the compaction summary crosses every session by
+/// construction; under the 50-message threshold it cannot explain the measured
+/// incident — ten calls do not compact — but it reopens the identical symptom on
+/// a longer bench. Closing the window alone would ship an isolation whose
+/// partiality is invisible, which is the failure mode this ticket exists to end.
+///
+/// The fleet default is deliberately **not** moved: on a non-singleton agent
+/// every inbound `/message` mints a fresh session id (`server/handlers.rs`), so
+/// agent scope is what carries conversational continuity on Telegram. The same
+/// aggregation is contamination on a bench and the conversation on the product.
 const MIKA_TEST_IDENTITY: &str = "\
 name = \"Test\"\n\
 emoji = \"🧪\"\n\
@@ -1441,7 +1464,13 @@ enabled = false\n\
 [skills]\n\
 allow_authoring = false\n\
 nudge_enabled = false\n\
-allowlist = [\"__mika_test_no_skills__\"]\n";
+allowlist = [\"__mika_test_no_skills__\"]\n\
+\n\
+[context.history]\n\
+scope = \"session\"\n\
+\n\
+[context.summary]\n\
+inject = false\n";
 
 const MIKA_ARCH_SOUL: &str = r#"# Mika Architect — Plan Review Agent
 
@@ -1831,6 +1860,100 @@ mod tests {
             "the code-owned window bound must reach an agent already on disk"
         );
         assert_eq!(reconciled.context.history.max_tokens, Some(8000));
+    }
+
+    /// mika#1951 U1, the load-bearing half — mika-test's isolation reaches an
+    /// `identity.toml` that is **already on disk**, provisioning disabled.
+    ///
+    /// The constant test above proves the spec; only this one proves the fix
+    /// reaches the agent the 2026-08-22 battery actually measured.
+    /// `write_default_if_missing` never rewrites an existing file, so without the
+    /// two code-owned entries this correction would merge and be inert — the
+    /// exact cost mika#2327 paid, and the reason mika#2330 exists.
+    ///
+    /// Both sections are stripped together because the defect is the pair: a
+    /// reconciler that restored only `context.history` would leave the summary
+    /// channel open, and the post-deploy probe (which reads
+    /// `context_window_assembled`) would show a clean `"session"` while a longer
+    /// bench still bled.
+    #[test]
+    fn mika1951_mika_test_isolation_reaches_an_agent_already_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        fs::create_dir_all(home.join("agents")).unwrap();
+
+        let settings = test_settings_with_kg_roots();
+        provision_well_known_agents(home, &settings, false);
+
+        let identity_path = mika_common::agent::agent_dir(home, "mika-test").join("identity.toml");
+        strip_identity_path(&identity_path, "context.history");
+        strip_identity_path(&identity_path, "context.summary");
+
+        // Sanity: the fixture really is the pre-fix state — the two defaults that
+        // produced the measured contamination.
+        let stripped: crate::prompt::Identity =
+            toml::from_str(&fs::read_to_string(&identity_path).unwrap()).unwrap();
+        assert_eq!(
+            stripped.context.history.scope,
+            crate::prompt::HistoryScope::Agent,
+            "without the section the default applies — that is the production symptom"
+        );
+        assert!(
+            stripped.context.summary.inject,
+            "without the section the summary injects — the second channel"
+        );
+
+        provision_well_known_agents(home, &settings, /* disabled = */ true);
+
+        let reconciled: crate::prompt::Identity =
+            toml::from_str(&fs::read_to_string(&identity_path).unwrap())
+                .expect("reconciled identity.toml must still parse");
+        assert_eq!(
+            reconciled.context.history.scope,
+            crate::prompt::HistoryScope::Session,
+            "the bench's window bound must reach an agent already on disk"
+        );
+        assert!(
+            !reconciled.context.summary.inject,
+            "and so must the summary gate — closing one channel is a partial \
+             isolation whose partiality is invisible (mika#1951 §1)"
+        );
+    }
+
+    /// mika#1951 U1's negative control — the fix stays inside its population.
+    ///
+    /// Halte 4 of the post-deploy probe asks exactly this question: if
+    /// conversational continuity is lost on a Telegram tenant, check that no
+    /// section was laid outside `MIKA_TEST_IDENTITY`. `HistoryScope::Agent` is
+    /// what carries continuity where the session is not a transport fact (each
+    /// `/message` on a non-singleton agent mints a fresh UUID —
+    /// `server/handlers.rs`), so switching the fleet default would break the
+    /// product. This test is that decision, asserted rather than trusted.
+    #[test]
+    fn mika1951_the_bench_isolation_does_not_leak_onto_the_other_agents() {
+        let settings = test_settings_with_kg_roots();
+        for spec in WELL_KNOWN_AGENTS {
+            if spec.name == "mika-test" {
+                continue;
+            }
+            let toml_str = render_identity_content(spec, &settings)
+                .unwrap_or_else(|e| panic!("{} identity must render: {e}", spec.name));
+            let identity: crate::prompt::Identity = toml::from_str(&toml_str)
+                .unwrap_or_else(|e| panic!("{} identity must parse: {e}", spec.name));
+            if spec.name == "mika-arch" {
+                // mika-arch is session-scoped on its own ticket's merits
+                // (mika#2295): one-shot passes on one plan. Not this fix.
+                continue;
+            }
+            assert_eq!(
+                identity.context.history.scope,
+                crate::prompt::HistoryScope::Agent,
+                "{} must keep the agent-wide window: it is what carries \
+                 conversational continuity where a session is not a transport \
+                 fact (mika#1951 §2)",
+                spec.name
+            );
+        }
     }
 
     /// mika#2330 AC4/AC5 — the disabled mode keeps the two promises it was set
@@ -2577,6 +2700,51 @@ mod tests {
             "mika-test should have sentinel-only allowlist"
         );
         assert_eq!(allowlist[0], "__mika_test_no_skills__");
+    }
+
+    /// mika#1951 U1 — the bench agent is isolated on **both** channels.
+    ///
+    /// The measured defect was the window (`HistoryScope::Agent` is the default,
+    /// and `MIKA_TEST_IDENTITY` declared no `[context.history]`), but closing the
+    /// window alone would ship a partial isolation whose partiality is invisible:
+    /// `load_conversation_summary` keys on `agent_id` alone, so above the
+    /// compaction threshold the compaction summary reopens the same symptom in a
+    /// strictly identical shape. Ten calls do not compact, which is why the
+    /// 2026-08-22 battery only exercised the first channel.
+    ///
+    /// This guards the **constant**. That it reaches an agent already on disk is
+    /// [`mika1951_mika_test_isolation_reaches_an_agent_already_on_disk`].
+    #[test]
+    fn mika1951_mika_test_identity_isolates_the_bench_on_both_channels() {
+        let identity: crate::prompt::Identity =
+            toml::from_str(MIKA_TEST_IDENTITY).expect("MIKA_TEST_IDENTITY should be valid TOML");
+
+        assert_eq!(
+            identity.context.history.scope,
+            crate::prompt::HistoryScope::Session,
+            "mika-test is a bare engine exerciser (mika#963): every call is a \
+             one-shot measurement, so an agent-wide window is contamination"
+        );
+        assert!(
+            !identity.context.summary.inject,
+            "the second channel of mika#1951 §1 — a bench must start from a known \
+             state, not from a summary whose composition it does not know"
+        );
+    }
+
+    /// mika#1951 U1's other half — both sections are DECLARED code-owned.
+    ///
+    /// Guards the constant only; the behavioural proof is the disk test below.
+    /// Separate from it so a failure names its own half (mika#2330 U4).
+    #[test]
+    fn mika1951_both_isolation_sections_are_declared_code_owned() {
+        for section in ["context.history", "context.summary"] {
+            assert!(
+                CODE_OWNED_IDENTITY_SECTIONS.contains(&section),
+                "'{section}' must be code-owned, or mika-test's isolation never \
+                 reaches an agent whose identity.toml predates this fix"
+            );
+        }
     }
 
     // -- mika-arch tests --
