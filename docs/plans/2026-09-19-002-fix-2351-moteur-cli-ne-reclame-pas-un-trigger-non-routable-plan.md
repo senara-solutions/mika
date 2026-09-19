@@ -53,6 +53,16 @@ ferme cette divergence inter-binaires, et elle seule.
   inatteignable en production, et cette classe d'erreur deviendrait silencieuse.
 - La garde #1742 et l'exemption #2337 ne sont pas touchées (AC5).
 
+## Acceptance criteria
+
+Transcrits tels quels depuis le corps de senara-solutions/mika#2351 (re-cadré le 2026-09-19).
+
+1. **AC1 — pas de claim sans route, côté CLI.** Dans `TaskEngine::fire_task` (`engine.rs:3727`), quand `dispatcher.cli_mode` est vrai, une tâche `action_type = run_skill` portant un `trigger` intégré que ce binaire ne sait pas router n'est pas réclamée. Après le tick, sa ligne est inchangée (`status`, `fired_at`, `next_fire_at`, `updated_at`). → C2, C4-a
+2. **AC2 — source unique.** Les bras de `dispatch_run_skill` et le prédicat de routabilité dérivent d'une seule définition. Un test de garde échoue si un bras existe sans entrée dans le prédicat, ou inversement. → C1, C4-c
+3. **AC3 — lisibilité.** Une tâche ignorée émet un WARN nommé (`event = "task_trigger_not_routable_here"`, avec `task_id`, `label`, `trigger`), au plus une fois par `task_id` et par processus. → C3, C4-d
+4. **AC4 — tests.** (a) Moteur `cli_mode: true` : une récurrence due, avec un trigger inconnu du binaire de test, reste `recurring_active` et **jamais** `failed` après un tick. **Contrôle positif** dans le même test : une récurrence due avec un trigger routable est réclamée et tirée. (b) Moteur `cli_mode: false` : le test existant `mika2337_un_trigger_inconnu_meurt_nomme_audite_et_marque` reste vert sans modification. → C4-a, C4-b
+5. **AC5 — #1742 et #2337 inchangées (non-objectif explicite).** Le prédicat de `create_recurring_task_if_absent`, ses tests `mika1742_*` / `mika2337_*` et le bras `UnknownTrigger` du moteur ne sont pas modifiés. Un `failed` ou un `expired` récent continue de bloquer. La demande initiale de ce ticket (« ignorer les instances terminales ») est **retirée** : elle aurait désarmé la garde dans le cas pour lequel elle existe. → Non-objectifs
+
 ## Engagements (tie-back aux AC)
 
 ### C1 — source unique des triggers routables (AC2)
@@ -93,7 +103,10 @@ Après un saut, la tâche a quitté le tas (`pop_from_heap` retire l'id de `queu
 `scan_db_for_new_tasks` suivant, toutes les `DB_SCAN_INTERVAL_TICKS`, la remettra en file tant
 qu'elle est planifiable. C'est acceptable : le daemon la tire entre-temps et replanifie
 `next_fire_at`. Le coût est une relecture par période de scan et par tâche non routable. Il
-n'y a pas de boucle serrée.
+n'y a pas de boucle serrée. Un ensemble d'exclusion valable pour toute la vie du processus
+est écarté volontairement. Si le daemon meurt et que le TUI reste seul moteur, une tâche
+exclue deviendrait invisible au seul moteur restant, y compris après une mise à jour qui le
+rendrait capable de la router (argument de mika-arch en première passe).
 
 ### C3 — lisibilité (AC3)
 
@@ -131,8 +144,11 @@ dédié n'apporterait rien et dupliquerait le harnais.
 - **C4-c — `mika2351_les_triggers_routables_sont_exactement_les_bras_du_dispatcher` (AC2).**
   L'ensemble `ROUTABLE_RUN_SKILL_TRIGGERS` doit être égal à l'ensemble `match_arm_triggers()`
   (dans les deux sens, avec un message qui nomme le côté manquant). Contrôle négatif prouvant
-  que le test mord : vérifier une fois à la main qu'ajouter un bras fictif au `match` fait
-  échouer C4-c, et le consigner dans la PR (sans le committer).
+  que le test mord, **dans les deux sens** : vérifier une fois à la main (1) qu'ajouter au
+  `match` un bras fictif absent de la const fait échouer C4-c en nommant le côté « bras sans
+  entrée », et (2) que retirer de la const une entrée dont le bras existe le fait échouer en
+  nommant le côté « entrée manquante ». Consigner les deux sorties rouges dans la PR, sans les
+  committer.
 - **C4-d — lisibilité (AC3), dans le module `#[cfg(test)]` de `engine.rs`.** Deux passages de
   `fire_task` sur la même tâche non routable laissent `not_routable_warned` de taille 1. On
   asserte sur l'ensemble, pas sur la capture de tracing.
