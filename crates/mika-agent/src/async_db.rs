@@ -1155,6 +1155,19 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Find `manual` tracking rows whose every callback child is terminal and
+    /// whose last child stopped moving past the grace window (mika#2405). See
+    /// [`Database::find_settleable_dispatch_parents`] — including why this is
+    /// not a third member of the self_dev pair above.
+    pub async fn find_settleable_dispatch_parents(
+        &self,
+        grace_seconds: i64,
+    ) -> Result<Vec<crate::db::SettleableDispatchParent>> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.find_settleable_dispatch_parents(&a, grace_seconds))
+            .await
+    }
+
     /// Find parent self_dev issue tasks left `in_progress` with zero callback
     /// children, aged past the grace window (mika#1687). See
     /// [`Database::find_childless_stuck_parent_tasks`].

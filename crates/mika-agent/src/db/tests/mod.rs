@@ -54,6 +54,7 @@ mod dispatch_stamp_and_slots;
 mod reapers;
 mod recurring_tasks;
 mod secrets_and_agent_reset;
+mod settle_dispatch_parents;
 mod skill_overrides_and_task_types;
 mod task_messages_and_groom;
 mod tool_calls_and_messages;
@@ -320,6 +321,48 @@ fn create_orphaned_parent_setup(db: &Database) -> (String, String) {
     assert!(db.mark_task_delivered(&child_id).unwrap());
 
     (parent_id, child_id)
+}
+
+/// The mika#2405 population: a `manual`/`none` tracking row left `in_progress`
+/// with **no** `source` (the shape `tools/create_task.rs` writes outside the
+/// self-dev paths), and one `delivered` callback child backdated `age_secs`
+/// into the past.
+///
+/// Deliberately different from [`create_orphaned_parent_setup`] on exactly the
+/// term that separates the two populations: `source` stays NULL here, which is
+/// what `COALESCE(parent.source,'') != 'self_dev'` is written for.
+fn create_settleable_parent_setup(db: &Database, age_secs: i64) -> (String, String) {
+    let parent = new_task("mika", "long_running:build_mika", "manual", "none");
+    let parent_id = db.create_task(&parent).unwrap();
+    db.conn
+        .execute(
+            "UPDATE tasks SET status = 'in_progress' WHERE id = ?1",
+            params![parent_id],
+        )
+        .unwrap();
+
+    let mut child = callback_task("mika");
+    child.parent_task_id = Some(parent_id.clone());
+    let child_id = db.create_task(&child).unwrap();
+    assert!(
+        db.update_task_completed(&child_id, "mika", Some("build ok"))
+            .unwrap()
+    );
+    assert!(db.mark_task_delivered(&child_id).unwrap());
+
+    backdate_task_updated_at(db, &child_id, age_secs);
+
+    (parent_id, child_id)
+}
+
+/// Push a task's `updated_at` `secs` seconds into the past.
+fn backdate_task_updated_at(db: &Database, task_id: &str, secs: i64) {
+    db.conn
+        .execute(
+            "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2) WHERE id = ?1",
+            params![task_id, format!("-{secs} seconds")],
+        )
+        .unwrap();
 }
 
 // -- find_phantom_tracking_tasks tests (mika#1712) --
