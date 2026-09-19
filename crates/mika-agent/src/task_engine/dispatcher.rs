@@ -415,6 +415,19 @@ pub struct TaskDispatcher {
     /// une transition si le STOP est armé au premier tick — même raisonnement que
     /// le jeu de déduplication mika#2131.
     pub auto_pull_stop_armed: AtomicBool,
+    /// Last `proactive_budget_resolved` couple this process announced (mika#2358).
+    ///
+    /// Deduplication only, on the same doctrine as `auto_pull_stop_armed` above
+    /// and as `llm_budget_resolved` (mika#2293): the durable information is
+    /// "this tenant's budget is 1, and it came from the config", not that it
+    /// still was at 14:32. A heartbeat row ticks hourly, so an undeduplicated
+    /// line would be 24 a day per tenant and would bury the signal it exists to
+    /// raise (doctrine mika#2131). A **change** is re-emitted.
+    ///
+    /// Lost on restart, deliberately — a fresh process re-photographs what it
+    /// finds, exactly like the STOP switch above.
+    pub proactive_budget_reported:
+        std::sync::Mutex<Option<crate::config_keys::ResolvedProactiveBudget>>,
 }
 
 impl TaskDispatcher {
@@ -1985,7 +1998,58 @@ impl TaskDispatcher {
         Ok(())
     }
 
-    /// Heartbeat pre-filter: checks active hours, rate limits, and recent user activity.
+    /// Resolve the tenant's daily proactive wake-up budget, announcing it once
+    /// per resolved couple (mika#2358 U4).
+    ///
+    /// The announcement exists because mika#2293 had to write the lesson down
+    /// for `llm_budget_resolved`: **a setting one cannot observe is not a
+    /// setting**. `source: "config"` at budget 1 says the instruction is in
+    /// force and a surviving symptom belongs to another producer;
+    /// `source: "default"` says the write never landed and the cause is in
+    /// `set_config`, not in the budget.
+    async fn resolve_proactive_budget(&self) -> crate::config_keys::ResolvedProactiveBudget {
+        let raw = self
+            .db
+            .get_customer_config(crate::config_keys::PROACTIVE_DAILY_BUDGET_KEY)
+            .await
+            .ok()
+            .flatten();
+        let resolved = crate::config_keys::resolve_proactive_daily_budget(raw.as_deref());
+
+        let changed = match self.proactive_budget_reported.lock() {
+            Ok(mut last) => {
+                let changed = *last != Some(resolved);
+                if changed {
+                    *last = Some(resolved);
+                }
+                changed
+            }
+            // A poisoned mutex must not silence the announcement: reporting the
+            // same couple twice is noise, never reporting it is a blind spot.
+            Err(_) => true,
+        };
+
+        if changed {
+            info!(
+                target: "mika::otel",
+                agent_id = %self.db.agent_id(),
+                budget = resolved.budget,
+                source = resolved.source.as_str(),
+                event = "proactive_budget_resolved",
+                "proactive daily wake-up budget resolved"
+            );
+        }
+
+        resolved
+    }
+
+    /// Heartbeat pre-filter: checks active hours, rate limits, the tenant's
+    /// proactive budget and dated pause (mika#2358), and recent user activity.
+    ///
+    /// **Only the two mika#2358 terms are observable.** The three pre-existing
+    /// ones keep their silence: a nominal tenant crosses the hourly limit
+    /// around 23 times a day, and a line per refusal would bury the signal this
+    /// work exists to raise (doctrine mika#2131).
     async fn heartbeat_should_run(&self) -> bool {
         let tz_str = self
             .db
@@ -2005,23 +2069,81 @@ impl TaskDispatcher {
             return false;
         }
 
-        // 2. Rate limit: max 1 per hour
+        // 2. Daily proactive budget (mika#2358), which replaces the literal `3`
+        //    this filter used to carry — a ceiling no setting could reach, and
+        //    the exact number Al reported receiving.
+        //
+        //    Resolved BEFORE the counting queries so that budget `0` — the
+        //    « plus aucun message » lever — refuses without issuing one.
+        let resolved = self.resolve_proactive_budget().await;
+        if resolved.budget == 0 {
+            info!(
+                target: "mika::otel",
+                agent_id = %self.db.agent_id(),
+                reason = "daily_budget",
+                budget = 0,
+                sends_today = 0,
+                event = "proactive_wake_suppressed",
+                "proactive wake-up suppressed: the tenant's budget is zero"
+            );
+            return false;
+        }
+
+        // 3. Rate limit: max 1 per hour (pre-existing, deliberately silent)
         if self.db.count_heartbeat_sends_last_hour().await.unwrap_or(0) >= 1 {
             return false;
         }
 
-        // 3. Rate limit: max 3 per day
-        if self
+        // 4. Daily budget reached.
+        let sends_today = self
             .db
             .count_heartbeat_sends_today(&tz_str)
             .await
-            .unwrap_or(0)
-            >= 3
-        {
+            .unwrap_or(0);
+        if sends_today >= resolved.budget {
+            info!(
+                target: "mika::otel",
+                agent_id = %self.db.agent_id(),
+                reason = "daily_budget",
+                budget = resolved.budget,
+                sends_today,
+                source = resolved.source.as_str(),
+                event = "proactive_wake_suppressed",
+                "proactive wake-up suppressed: the tenant's daily budget is spent"
+            );
             return false;
         }
 
-        // 4. Skip if user messaged within 2 hours
+        // 5. Dated pause (mika#2358) — the half of Al's promise the budget alone
+        //    cannot express (« plus aucun message AUJOURD'HUI »).
+        //
+        //    An unreadable value does NOT suspend: every read in this filter
+        //    fails open, and a typo that silently muted a tenant would be the
+        //    very class of failure this work closes. The WARN naming the value
+        //    is emitted by the resolver in `config_keys`.
+        let pause_raw = self
+            .db
+            .get_customer_config(crate::config_keys::PROACTIVE_PAUSE_UNTIL_KEY)
+            .await
+            .ok()
+            .flatten();
+        if let crate::config_keys::ProactivePause::Until(until) =
+            crate::config_keys::resolve_proactive_pause(pause_raw.as_deref(), now_utc)
+        {
+            info!(
+                target: "mika::otel",
+                agent_id = %self.db.agent_id(),
+                reason = "paused",
+                budget = resolved.budget,
+                sends_today,
+                pause_until = %crate::timestamp::format(&until),
+                event = "proactive_wake_suppressed",
+                "proactive wake-up suppressed: a dated pause is armed"
+            );
+            return false;
+        }
+
+        // 6. Skip if user messaged within 2 hours (pre-existing, silent)
         if let Ok(Some(last_ts)) = self.db.last_user_message_time().await {
             let elapsed = if let Ok(last_dt) = crate::timestamp::parse(&last_ts) {
                 now_utc.signed_duration_since(last_dt).num_seconds()
@@ -4086,6 +4208,7 @@ mod tests {
             settings,
             pr_reviews_posted: None,
             auto_pull_stop_armed: AtomicBool::new(false),
+            proactive_budget_reported: std::sync::Mutex::new(None),
         }
     }
 
@@ -6722,6 +6845,248 @@ mod tests {
         assert!(
             !verified,
             "a groom callback without `Outcome: PLAN_GROOMED` is not proof of grooming"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2358 — the proactive wake-up budget and the dated pause
+    // -----------------------------------------------------------------------
+
+    /// A timezone in which it is currently early afternoon, so the
+    /// `08:00–21:00` active-hours term of [`TaskDispatcher::heartbeat_should_run`]
+    /// is satisfied whatever the wall clock of the machine running the test.
+    ///
+    /// Derived rather than mocked: that function reads `chrono::Utc::now()`
+    /// directly, and threading a clock into it would be a wider change than the
+    /// two terms these tests exercise. Note the Olson sign inversion —
+    /// `Etc/GMT-K` denotes UTC**+**K.
+    fn tz_where_it_is_midday() -> String {
+        let utc_hour = chrono::Utc::now().hour() as i32;
+        let mut k = (12 - utc_hour).rem_euclid(24);
+        if k > 14 {
+            k -= 24; // keep inside the Etc/GMT+12 .. Etc/GMT-14 range
+        }
+        match k.cmp(&0) {
+            std::cmp::Ordering::Equal => "UTC".to_string(),
+            std::cmp::Ordering::Greater => format!("Etc/GMT-{k}"),
+            std::cmp::Ordering::Less => format!("Etc/GMT+{}", -k),
+        }
+    }
+
+    /// Record `n` heartbeat wake-ups that happened **today but over an hour
+    /// ago**, so they load the daily budget without tripping the hourly
+    /// rate-limit that sits in front of it.
+    async fn seed_wakes_today(db: &AsyncDatabase, n: u32) {
+        for _ in 0..n {
+            db.with_db(|d| {
+                d.execute_sql(
+                    "INSERT INTO heartbeat_sends (agent_id, sent_at) VALUES \
+                     ('mika', strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-90 minutes'))",
+                    &[],
+                )
+                .map(|_| ())
+            })
+            .await
+            .expect("seeding a heartbeat wake-up must not fail");
+        }
+    }
+
+    async fn dispatcher_in_active_hours() -> TaskDispatcher {
+        let db = test_db();
+        db.set_customer_config("timezone", &tz_where_it_is_midday())
+            .await
+            .unwrap();
+        test_dispatcher(db)
+    }
+
+    /// **The negative control the Verification Contract requires.** A tenant
+    /// that sets nothing keeps exactly the behaviour it had before mika#2358:
+    /// three wake-ups a day, the fourth refused.
+    ///
+    /// It reddens if the default drifts, which is the point — the literal `3`
+    /// removed from `heartbeat_should_run` now lives in exactly one place.
+    #[tokio::test]
+    async fn mika2358_an_unconfigured_tenant_keeps_the_pre_fix_behaviour() {
+        assert_eq!(
+            crate::config_keys::PROACTIVE_DAILY_BUDGET_DEFAULT,
+            3,
+            "the default must reproduce the literal `>= 3` this filter used to carry"
+        );
+
+        let d = dispatcher_in_active_hours().await;
+        seed_wakes_today(&d.db, 2).await;
+        assert!(
+            d.heartbeat_should_run().await,
+            "two wake-ups today is under the default budget of three"
+        );
+
+        seed_wakes_today(&d.db, 1).await;
+        assert!(
+            !d.heartbeat_should_run().await,
+            "the third wake-up spends the default budget — the number Al reported"
+        );
+    }
+
+    /// The instruction Al actually gave, made mechanical: one a day.
+    #[tokio::test]
+    async fn mika2358_budget_one_refuses_the_second_wake_of_the_day() {
+        let d = dispatcher_in_active_hours().await;
+        d.db.set_customer_config(crate::config_keys::PROACTIVE_DAILY_BUDGET_KEY, "1")
+            .await
+            .unwrap();
+
+        assert!(
+            d.heartbeat_should_run().await,
+            "the first wake-up of the day is inside a budget of one"
+        );
+
+        seed_wakes_today(&d.db, 1).await;
+        assert!(
+            !d.heartbeat_should_run().await,
+            "the second is refused — which the default budget of three would have allowed"
+        );
+    }
+
+    /// `0` is the « plus aucun message » lever, and it is honoured on a
+    /// database where no wake-up has ever been recorded.
+    #[tokio::test]
+    async fn mika2358_budget_zero_refuses_even_with_nothing_recorded() {
+        let d = dispatcher_in_active_hours().await;
+        d.db.set_customer_config(crate::config_keys::PROACTIVE_DAILY_BUDGET_KEY, "0")
+            .await
+            .unwrap();
+
+        assert!(
+            !d.heartbeat_should_run().await,
+            "a configured 0 suppresses every proactive wake-up"
+        );
+    }
+
+    /// AC5's other half, which **no behavioural test can see**: `0 >= 0` is
+    /// true, so the refusal would happen at the daily-budget term anyway and a
+    /// boolean cannot tell the short-circuit from its absence.
+    ///
+    /// What the short-circuit buys is that a tenant who asked for silence stops
+    /// paying two counting queries on every hourly tick, and that the emitted
+    /// `proactive_wake_suppressed` names the budget rather than being swallowed
+    /// by the silent hourly term. Both are properties of the *order*, so the
+    /// order is what is pinned — the house idiom for this class (mika#2205,
+    /// mika#2329).
+    #[test]
+    fn mika2358_the_zero_budget_short_circuit_precedes_the_counting_queries() {
+        let src = include_str!("dispatcher.rs");
+        let body = src
+            .split_once("async fn heartbeat_should_run")
+            .expect("heartbeat_should_run must exist")
+            .1;
+
+        let short_circuit = body
+            .find("if resolved.budget == 0")
+            .expect("the budget-zero short-circuit must exist");
+        let first_count = body
+            .find("count_heartbeat_sends_last_hour")
+            .expect("the hourly count must exist");
+
+        assert!(
+            short_circuit < first_count,
+            "budget 0 must refuse before any counting query is issued"
+        );
+    }
+
+    /// The half of Al's promise a budget cannot express: « plus aucun message
+    /// AUJOURD'HUI ». Four cases, because the pause must expire on its own and
+    /// must fail open when unreadable.
+    #[tokio::test]
+    async fn mika2358_the_dated_pause_covers_its_four_cases() {
+        let d = dispatcher_in_active_hours().await;
+        let key = crate::config_keys::PROACTIVE_PAUSE_UNTIL_KEY;
+
+        let future = crate::timestamp::format(&(chrono::Utc::now() + chrono::Duration::hours(6)));
+        d.db.set_customer_config(key, &future).await.unwrap();
+        assert!(
+            !d.heartbeat_should_run().await,
+            "an armed pause refuses the wake-up"
+        );
+
+        let past = crate::timestamp::format(&(chrono::Utc::now() - chrono::Duration::hours(6)));
+        d.db.set_customer_config(key, &past).await.unwrap();
+        assert!(
+            d.heartbeat_should_run().await,
+            "a pause carries an instant, so it lifts itself — no gesture required"
+        );
+
+        d.db.set_customer_config(key, crate::config_keys::PROACTIVE_PAUSE_NONE)
+            .await
+            .unwrap();
+        assert!(
+            d.heartbeat_should_run().await,
+            "`none` lifts the pause explicitly"
+        );
+
+        d.db.set_customer_config(key, "demain").await.unwrap();
+        assert!(
+            d.heartbeat_should_run().await,
+            "an unreadable pause must fail OPEN: every read in this filter does, and a \
+             typo that silently muted a tenant would be the very failure this closes"
+        );
+    }
+
+    /// The pause is a term of its own, not a re-spelling of the budget: it
+    /// refuses while the budget still has room.
+    #[tokio::test]
+    async fn mika2358_the_pause_refuses_a_wake_the_budget_would_have_allowed() {
+        let d = dispatcher_in_active_hours().await;
+        assert!(
+            d.heartbeat_should_run().await,
+            "control: nothing is in the way"
+        );
+
+        let future = crate::timestamp::format(&(chrono::Utc::now() + chrono::Duration::hours(6)));
+        d.db.set_customer_config(crate::config_keys::PROACTIVE_PAUSE_UNTIL_KEY, &future)
+            .await
+            .unwrap();
+        assert!(!d.heartbeat_should_run().await);
+    }
+
+    /// `proactive_budget_resolved` is deduplicated on the resolved couple, and
+    /// a **change** re-arms it (AC11).
+    ///
+    /// The emission is unconditional on the `changed` flag, so pinning the flag's
+    /// state machine is what pins the cadence: a heartbeat row ticks hourly, and
+    /// an undeduplicated line would be 24 a day per tenant (doctrine mika#2131).
+    #[tokio::test]
+    async fn mika2358_the_resolved_budget_is_announced_once_per_couple() {
+        let d = dispatcher_in_active_hours().await;
+
+        let first = d.resolve_proactive_budget().await;
+        assert_eq!(
+            first.source,
+            crate::config_keys::ProactiveBudgetSource::Default
+        );
+        assert_eq!(
+            *d.proactive_budget_reported.lock().unwrap(),
+            Some(first),
+            "the first resolution arms the dedup state, so the line is emitted"
+        );
+
+        let second = d.resolve_proactive_budget().await;
+        assert_eq!(second, first, "an unchanged couple stays silent");
+
+        d.db.set_customer_config(crate::config_keys::PROACTIVE_DAILY_BUDGET_KEY, "1")
+            .await
+            .unwrap();
+        let third = d.resolve_proactive_budget().await;
+        assert_eq!(third.budget, 1);
+        assert_eq!(
+            third.source,
+            crate::config_keys::ProactiveBudgetSource::Config,
+            "`config` is what tells an operator the instruction landed; `default` would \
+             send them to set_config instead of to the budget"
+        );
+        assert_eq!(
+            *d.proactive_budget_reported.lock().unwrap(),
+            Some(third),
+            "a change must be re-announced"
         );
     }
 }
