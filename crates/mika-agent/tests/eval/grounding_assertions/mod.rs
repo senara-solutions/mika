@@ -463,6 +463,9 @@ mod tests {
                 deadline_exceeded: None,
                 // …and delivered whatever it sent (mika#2136).
                 undelivered_sends: None,
+                // A replayed fixture never ran a provider, so there is nothing
+                // to attest (mika#2304).
+                effective_model: None,
             },
             llm_calls: vec![],
             tool_calls,

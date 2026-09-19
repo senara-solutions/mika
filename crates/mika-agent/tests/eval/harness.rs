@@ -67,6 +67,10 @@ pub struct EvalHarness {
     /// `run_with_images` method: the three run sites must agree on what a turn
     /// carries, and a fourth entry point is a fourth place to forget.
     user_images: Vec<mika_common::llm::LlmImage>,
+    /// Whether this turn's caller named the model (mika#2304). `false` unless
+    /// `.caller_model_override(true)` was called on the builder, so every
+    /// pre-existing scenario keeps the #463 per-skill precedence untouched.
+    pub caller_model_override: bool,
     /// Session-scoped PR review dedup map (#821, #736).
     /// When `Some`, enables the session-scope dedup guard in the agent loop.
     pub pr_reviews_posted: Option<Arc<DashMap<String, HashSet<String>>>>,
@@ -121,6 +125,10 @@ impl EvalHarness {
             global_home_dir: None,
             is_callback_turn: self.is_callback_turn,
             settings: Some(&self.settings),
+            // mika#2304: `false` unless the builder was told otherwise — the
+            // harness drives the loop directly, with no A2A caller to name a
+            // model, so every pre-existing scenario keeps #463's precedence.
+            caller_model_override: self.caller_model_override,
             trace_id: Some(self.trace_id.clone()),
             correlated_task_id: None,
             internal: self.internal,
@@ -173,6 +181,10 @@ impl EvalHarness {
             global_home_dir: None,
             is_callback_turn: self.is_callback_turn,
             settings: Some(&self.settings),
+            // mika#2304: `false` unless the builder was told otherwise — the
+            // harness drives the loop directly, with no A2A caller to name a
+            // model, so every pre-existing scenario keeps #463's precedence.
+            caller_model_override: self.caller_model_override,
             trace_id: Some(self.trace_id.clone()),
             correlated_task_id: None,
             internal: self.internal,
@@ -236,6 +248,10 @@ impl EvalHarness {
             global_home_dir: None,
             is_callback_turn: false,
             settings: Some(&self.settings),
+            // mika#2304: `false` unless the builder was told otherwise — the
+            // harness drives the loop directly, with no A2A caller to name a
+            // model, so every pre-existing scenario keeps #463's precedence.
+            caller_model_override: self.caller_model_override,
             trace_id: Some(turn_trace_id.clone()),
             correlated_task_id: None,
             internal: self.internal,
@@ -271,6 +287,7 @@ pub struct EvalHarnessBuilder {
     github_token: Option<String>,
     mcp_manager: Option<McpManager>,
     user_images: Vec<mika_common::llm::LlmImage>,
+    caller_model_override: bool,
     pr_reviews_posted: Option<Arc<DashMap<String, HashSet<String>>>>,
     stream_ctx: Option<Arc<mika_a2a::streaming::ToolCallStreamContext>>,
 }
@@ -298,6 +315,7 @@ impl Default for EvalHarnessBuilder {
             github_token: None,
             mcp_manager: None,
             user_images: Vec::new(),
+            caller_model_override: false,
             pr_reviews_posted: None,
             stream_ctx: None,
         }
@@ -464,6 +482,16 @@ impl EvalHarnessBuilder {
         self
     }
 
+    /// Declare that this turn's caller named the model (mika#2304, D7).
+    ///
+    /// In production only `server::a2a` sets this, after honouring a
+    /// `mika.model_override`. Here it is the knob that lets a test exercise the
+    /// precedence: with it on, a matched skill's `[llm]` section stands down.
+    pub fn caller_model_override(mut self, v: bool) -> Self {
+        self.caller_model_override = v;
+        self
+    }
+
     /// Build the harness, creating the in-memory DB and temp directories.
     pub async fn build(self) -> Result<EvalHarness> {
         // Create temp directory with minimal agent structure
@@ -554,6 +582,7 @@ impl EvalHarnessBuilder {
             github_token: self.github_token,
             mcp_manager: self.mcp_manager,
             user_images: self.user_images,
+            caller_model_override: self.caller_model_override,
             pr_reviews_posted: self.pr_reviews_posted,
             stream_ctx: self.stream_ctx,
         })

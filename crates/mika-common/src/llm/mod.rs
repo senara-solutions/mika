@@ -4,6 +4,7 @@ pub mod budget_provenance;
 pub mod error;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod mock;
+pub mod model_override;
 pub mod models;
 pub mod ollama;
 pub mod openai;
@@ -28,6 +29,10 @@ pub use budget_provenance::{
     ResolvedBudgetValue, ResolvedTextValue, log_llm_budget_resolved,
 };
 pub use error::LlmError;
+pub use model_override::{
+    MODEL_ALIASES, check_provider_key, parse_model_override, provider_requires_api_key,
+    resolve_model_alias, resolve_model_override,
+};
 pub use types::*;
 
 /// Estimated typical LLM call duration for deadline-aware retry abort, at the
