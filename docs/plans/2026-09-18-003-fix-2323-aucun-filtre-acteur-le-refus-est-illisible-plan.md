@@ -414,7 +414,7 @@ existant.)*
 
 ---
 
-## 8. Acceptance criteria
+## Acceptance criteria
 
 *Dérivés des Requirements et du Verification contract — le corps du ticket ne porte pas
 de section `## Acceptance criteria`, mais il pose une question à laquelle AC1 répond
