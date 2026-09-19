@@ -1033,6 +1033,9 @@ where
         timeout_secs,
         session_id,
         trace_id,
+        // mika#2368 : pas de cible QA à stamper — un dispatch ready-label est
+        // un pilote, pas un build de revue.
+        None,
     );
     let callback_task_id = match db.create_task(callback_task).await {
         Ok(id) => id,

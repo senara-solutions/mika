@@ -27,6 +27,13 @@
 //! - `doctrine:hosting-ground-truth-honored` — post-fix success tag (the
 //!   corrected turn says what the `## Runtime` hosting line supports, rather
 //!   than falling silent).
+//! - `doctrine:doctrine-not-found` — pre-fix failure tag (mika#2292: asked what
+//!   the Mika doctrine is, the agent answered that it found nothing of that
+//!   name — **and then gave the philosophy anyway**, in the same response. Not
+//!   a knowledge gap: a name gap).
+//! - `doctrine:material-doctrine-answerable` — post-fix success tag (the
+//!   material register is in the served prompt under its aliases, so the
+//!   question resolves to a substantial answer carrying each stance's *why*).
 //!
 //! Namespace convention per `docs/architecture/kg-implementation-conventions.md`
 //! § C3 — parallel to `#741 grounding:*` and `#740 self-knowledge:*`.
@@ -71,3 +78,18 @@ pub mod doctrine_prompt_section_rendered;
 // entries (`doctrine:false-local-hosting-*`) keep the two populations countable
 // apart.
 pub mod false_local_hosting_claim_caught;
+
+// --- mika#2292: the tenant held the answer and had no name for it ---
+//
+// Same module again, and for the reason mika#2290 already wrote here: the
+// failure class is the shape of the agent's own text against a load-bearing
+// product invariant, with no fabrication of *evidence* involved. Distinct tag
+// entries (`doctrine:doctrine-not-found`, `doctrine:material-doctrine-answerable`)
+// keep the populations countable apart.
+//
+// Two files, one axis each — the split is the plan's Fire-Disposition decision,
+// not a filing convenience. The first is deterministic and gates CI; the second
+// is the behavioural half, which no deterministic test can establish and which
+// therefore ships disarmed with its reasoning at the site.
+pub mod doctrine_mika_answer_replayed;
+pub mod doctrine_mika_section_rendered;

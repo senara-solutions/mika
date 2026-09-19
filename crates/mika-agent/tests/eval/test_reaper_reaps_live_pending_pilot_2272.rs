@@ -132,6 +132,7 @@ fn dispatcher_for(
         settings,
         pr_reviews_posted: None,
         auto_pull_stop_armed: AtomicBool::new(false),
+        proactive_budget_reported: std::sync::Mutex::new(None),
     })
 }
 
@@ -225,6 +226,7 @@ async fn seed_live_dispatch(
         3600,
         session_id,
         "trace-2272",
+        None,
     );
     let id = db.create_task(task).await?;
 

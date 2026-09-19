@@ -1,6 +1,6 @@
 //! mika#2310 — isolated harness for the mika#1620 / mika#2287 gate, predicate
-//! level. Module path: `db::tests::harnais_porte` (declared with `#[path]` from
-//! `db.rs` → `mod tests`).
+//! level. Module path: `db::tests::harnais_porte`, declared as an ordinary
+//! sibling from `db/tests/mod.rs`.
 //!
 //! The campaign (mika#2288) used live grooms as the gate's primary proof; this
 //! submodule replaces that, so a live run only exercises the layers AROUND the
@@ -12,12 +12,21 @@
 //! exit criterion interrogates (`cargo test -p mika-agent harnais_porte`) and
 //! what mika#2288 will read it by.
 //!
-//! **Why a separate file and not an inline block in `db.rs`:** `db.rs` on main
-//! weighs 1 043 979 bytes, 4.6 KB under the 1 MB cap that
-//! `scripts/check-secrets.sh` enforces in the pre-commit hook and in CI. Any
-//! test added inline crosses it. Neither weakening the guard (allowlisting a
-//! source file) nor bypassing the hook is this ticket's to do; `#[path]` keeps
-//! the module path the plan names (D3) while leaving `db.rs` under the cap.
+//! **Why a separate file, then and now.** mika#2310 extracted it because `db.rs`
+//! sat 4.6 KB under the 1 MB cap `scripts/check-secrets.sh` enforces in the
+//! pre-commit hook and in CI, so any test added inline crossed it — and neither
+//! weakening the guard nor bypassing the hook was that ticket's to do. It cost
+//! an allowlist entry all the same, and that entry was not a static exemption
+//! but an unbounded one: `db.rs` went on to take ~64 KB in silence, which is
+//! the debt mika#2321 came back to settle.
+//!
+//! What changed with mika#2321 is only *how it is reached*. The
+//! `#[path = "harnais_porte.rs"]` existed because `mod tests` was an **inline**
+//! module of `db.rs`, so natural resolution would have looked under
+//! `db/tests/tests/`. Now that `tests` is itself a file module under
+//! `db/tests/`, this file is an ordinary sibling and the attribute is gone. The
+//! module path — the thing the exit criterion actually interrogates — is
+//! unchanged, and so is `cargo test -p mika-agent harnais_porte`.
 
 use super::*;
 

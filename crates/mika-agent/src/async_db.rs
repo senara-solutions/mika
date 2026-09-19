@@ -909,6 +909,17 @@ impl AsyncDatabase {
             .await
     }
 
+    /// The instant a ticket was abandoned, or `None` when it is not (mika#2361).
+    pub async fn get_auto_pull_redrive_abandoned_at(
+        &self,
+        repo_full_name: &str,
+        issue_number: u64,
+    ) -> Result<Option<String>> {
+        let repo = repo_full_name.to_owned();
+        self.with_db(move |db| db.get_auto_pull_redrive_abandoned_at(&repo, issue_number))
+            .await
+    }
+
     /// Increment a ticket's re-drive counter (mika#2020).
     pub async fn increment_auto_pull_redrive(
         &self,
@@ -3122,6 +3133,20 @@ impl AsyncDatabase {
         let (i, s) = (id.to_owned(), state.to_owned());
         self.with_db(move |db| db.a2a_update_task_state(&i, &s))
             .await
+    }
+
+    /// See `Database::a2a_abandon_task_if_live` (mika#2379).
+    pub async fn a2a_abandon_task_if_live(&self, id: &str, reason: &str) -> Result<bool> {
+        let (i, r) = (id.to_owned(), reason.to_owned());
+        self.with_db(move |db| db.a2a_abandon_task_if_live(&i, &r))
+            .await
+    }
+
+    /// Fail this agent's A2A rows a dead process left open — see
+    /// `Database::a2a_sweep_orphans` (mika#2379).
+    pub async fn a2a_sweep_orphans(&self, reason: &str) -> Result<usize> {
+        let (a, r) = (self.agent_id.clone(), reason.to_owned());
+        self.with_db(move |db| db.a2a_sweep_orphans(&a, &r)).await
     }
 
     pub async fn a2a_insert_message(

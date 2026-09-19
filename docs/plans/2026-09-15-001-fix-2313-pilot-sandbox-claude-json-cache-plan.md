@@ -6,6 +6,28 @@ tags: [substrate, prompt-cache, bwrap, mika-2108, mika-2039, loop-breaker]
 problem_type: loop-breaker
 ---
 
+> [!WARNING]
+> **Reverted by mika#2318 (2026-09-18).** The fix described below is no longer in the
+> tree: `88b02f97` was reverted in full, minus this document. The code is still
+> readable at that SHA.
+>
+> **The real cause was the egress-proxy relay**, not the missing file — it forwarded
+> the client's keep-alive upstream, the request hung ~360 s, and the cache TTL was
+> exceeded. Fixed by mika#2313 → PR #2316 (`df13a4e3`), refined by mika#2317 →
+> PR #2374 (`55c5fd28`). The `~/.claude.json` emitter was inert with respect to the
+> cache, so mika#2318 removed it to reduce the pilot sandbox's surface.
+>
+> **The `~/.claude.json` hypothesis is untested, not refuted — and the difference
+> matters.** Measured 2026-09-18 on `gentux`, the dispatch host:
+> `~/.local/bin/mika-pilot-sanitize-claude-json` was **absent**, while its
+> `make install` neighbour `mika-pilot-egress-proxy` was present and dated the same
+> day. The block's guard requires `-x` on that binary, so the mechanism below never
+> ran there — and it said nothing about it, the only `echo` living *inside* the `if`.
+> AC4 above (*"a dispatch without the emitter/file stays cache_read = 0 — the
+> mechanism is proven, not assumed"*) has no recorded replay. So if the cache goes
+> cold again with the relay fixes in place, this document is where the hypothesis is
+> found, and `88b02f97` is where the code is.
+
 # fix(2313): the contained pilot never reads the prompt cache
 
 ## Problem (P0 loop-breaker, source-verified)

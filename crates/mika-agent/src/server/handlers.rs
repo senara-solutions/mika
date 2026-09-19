@@ -20,6 +20,7 @@ use crate::task_engine::types::{task_status, trigger_type};
 
 use super::ci_failure_handler;
 use super::ci_success_handler;
+use super::deadline_verdict::TurnConclusion;
 use super::json_extractor::JsonBody;
 use super::milestone_context_handler;
 use super::state::{AgentState, AppState};
@@ -1152,8 +1153,42 @@ fn undelivered_send_line(
     }
 }
 
-/// Câblage du filet mika#2276 : poser un verdict sur la PR quand le tour a été
-/// coupé par son enveloppe au lieu de conclure.
+/// Budget en octets du message d'erreur repris dans le corps du verdict
+/// (mika#2289).
+///
+/// Le corps est lu par un humain sur une PR : ce qu'il faut, c'est la classe et
+/// la première phrase, pas une chaîne `anyhow` complète avec toutes ses
+/// `Caused by`. Troncature UTF-8-sûre via [`mika_common::text::safe_truncate`]
+/// — un `&str[..n]` nu panique sur un caractère multi-octets, ce que
+/// `scripts/check-byte-slices.sh` refuse en CI (#764).
+const VERDICT_ERROR_DETAIL_MAX_BYTES: usize = 600;
+
+/// Traduit l'issue d'un appel à `agent::run_agent` en signal d'entrée du filet
+/// (mika#2289 A2/A4).
+///
+/// **La classe d'erreur est lue sur la VARIANTE, jamais sur le message rendu.**
+/// `classify_anyhow_error` traverse toute la chaîne de causes `anyhow` et rend
+/// le vocabulaire de fil partagé avec `callback_delivery_failed` (mika#2179) et
+/// `llm_call_attempt` (mika#2331). Un `contains()` sur le texte casserait le
+/// jour où un fournisseur reformule ses erreurs — et dédoublerait une population
+/// que l'opérateur agrège.
+fn conclusion_of(run: &anyhow::Result<agent::AgentOutput>) -> TurnConclusion {
+    match run {
+        Ok(output) => TurnConclusion::from(output.deadline_exceeded),
+        Err(e) => {
+            let rendered = format!("{e:#}");
+            TurnConclusion::Failed {
+                error_class: mika_common::llm::error::classify_anyhow_error(e).into_owned(),
+                detail: mika_common::text::safe_truncate(&rendered, VERDICT_ERROR_DETAIL_MAX_BYTES)
+                    .to_string(),
+            }
+        }
+    }
+}
+
+/// Câblage du filet : poser un verdict sur la PR quand le tour **n'a pas
+/// conclu** — coupé par son enveloppe (mika#2276) ou mort sur une erreur du loop
+/// (mika#2289).
 ///
 /// Toute la décision vit dans [`crate::server::deadline_verdict`] ; ce qui vit
 /// ici est ce qui ne peut vivre ailleurs — la résolution du token et l'exécution
@@ -1167,29 +1202,28 @@ fn undelivered_send_line(
 ///
 /// Aucune erreur ne remonte : un filet qui fait échouer le traitement du webhook
 /// remplacerait un silence par une panne.
-async fn post_deadline_verdict_if_cut_off(
+async fn post_verdict_if_turn_did_not_conclude(
     state: &AppState,
     agent_state: &Arc<AgentState>,
-    output: &agent::AgentOutput,
+    conclusion: TurnConclusion,
     req: &MessageRequest,
     session_id: &str,
 ) {
     use crate::server::deadline_verdict::{
-        DeadlineVerdictInput, maybe_post_deadline_verdict, parse_pr_target,
+        DeadlineVerdictInput, deadline_verdict_target, maybe_post_deadline_verdict,
     };
 
     // Sortie immédiate sur le chemin nominal — pas de résolution de token, pas
     // de log, rien, quand le tour a conclu ou ne portait pas sur une PR.
     //
-    // `parse_pr_target` est appelé deux fois — ici pour décider si l'on paie la
-    // résolution de token (asynchrone, potentiellement un échange App), et une
-    // seconde fois dans le filet pour construire la requête. Un seul lecteur de
-    // la grammaire, donc aucun risque de divergence ; le coût est un match de
-    // regex sur un chemin déjà rare. Passer une `PrTarget` pré-parsée ferait
-    // dépendre le filet d'un parse fait par l'appelant, pour rien.
-    if output.deadline_exceeded.is_none() || parse_pr_target(&req.text).is_none() {
+    // Les deux gardes d'entrée vivaient dans le filet jusqu'à mika#2368 ; elles
+    // sont descendues dans `deadline_verdict_target` avec le motif, parce que
+    // « le tour a conclu » décrit désormais exactement le périmètre du second
+    // motif et ne peut plus être un refus du filet. Le parse a lieu une seule
+    // fois et sa cible est passée résolue : le filet ne devine plus de PR.
+    let Some((reason, target)) = deadline_verdict_target(conclusion, &req.text) else {
         return;
-    }
+    };
 
     let Some(token) = agent_state
         .settings
@@ -1197,11 +1231,11 @@ async fn post_deadline_verdict_if_cut_off(
         .await
     else {
         warn!(
-            event = crate::server::deadline_verdict::DEADLINE_VERDICT_EVENT,
+            event = reason.event_name(),
             agent_id = %agent_state.db.agent_id(),
             trace_id = %req.request_id,
             outcome = "no_token",
-            "tour de revue coupé par sa deadline mais aucun token GitHub résolu — \
+            "tour de revue non conclu mais aucun token GitHub résolu — \
              verdict de secours non posté"
         );
         return;
@@ -1209,8 +1243,8 @@ async fn post_deadline_verdict_if_cut_off(
 
     maybe_post_deadline_verdict(
         DeadlineVerdictInput {
-            overrun: output.deadline_exceeded,
-            event_text: &req.text,
+            reason,
+            target,
             session_id,
             trace_id: &req.request_id,
             agent_id: agent_state.db.agent_id(),
@@ -1582,19 +1616,25 @@ async fn run_agent_for_message(
         stream_ctx: None,
     };
 
-    match agent::run_agent(&params).await {
-        Ok(mut output) => {
-            // mika#2276 M2 — le filet. Si le tour a été COUPÉ par son enveloppe
-            // (et non conclu) alors qu'il traitait une PR, le moteur pose
-            // lui-même `VERDICT: hold[review]` sur cette PR.
-            //
-            // Placé AVANT l'envoi sur le canal de réponse, à dessein : le
-            // symptôme du ticket est précisément que la notification part et que
-            // la PR reste muette. Le fallback conversationnel continue de partir
-            // juste après — il ne remplace pas le verdict, et le verdict ne le
-            // remplace pas.
-            post_deadline_verdict_if_cut_off(state, a, &output, &req, &session_id).await;
+    // mika#2276 M2 + mika#2289 — le filet. Si le tour n'a pas CONCLU — coupé par
+    // son enveloppe, ou mort sur une erreur du loop — alors qu'il traitait une
+    // PR, le moteur pose lui-même `VERDICT: hold[review]` sur cette PR.
+    //
+    // Le `match` est dissocié de l'appel pour que le filet soit atteint depuis
+    // les DEUX branches (mika#2289 A4) : sur `Err` il n'existe aucun
+    // `AgentOutput`, et c'est la raison de forme pour laquelle mika#2276 ne
+    // pouvait pas voir cette branche — pas un oubli.
+    //
+    // Placé AVANT l'envoi sur le canal de réponse dans les deux cas, à dessein :
+    // le symptôme du ticket est précisément que la notification part et que la
+    // PR reste muette. Le fallback conversationnel continue de partir juste
+    // après — il ne remplace pas le verdict, et le verdict ne le remplace pas.
+    // Ni l'envoi lui-même ni le `drop(_lock)` plus bas ne bougent.
+    let run = agent::run_agent(&params).await;
+    post_verdict_if_turn_did_not_conclude(state, a, conclusion_of(&run), &req, &session_id).await;
 
+    match run {
+        Ok(mut output) => {
             // mika#2136 — l'aveu que le moteur écrit lui-même. Placé ici, dans
             // le même voisinage que le filet mika#2276 et pour la même raison :
             // en mode conversation le texte de clôture EST le canal, c'est par

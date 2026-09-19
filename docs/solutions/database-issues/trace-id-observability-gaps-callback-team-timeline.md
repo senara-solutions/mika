@@ -26,7 +26,7 @@ Three observability gaps broke trace_id correlation in the `unified_timeline` da
 
 1. **`executor.rs:528`** — `LongRunningContext` carried `trace_id`, but `NewTask` hardcoded `created_trace_id: None`.
 2. **`engine.rs:195`** — `new_for_resume()` called `generate_trace_id()` unconditionally. The `team_runs` table had no `trace_id` column to persist it.
-3. **`db.rs:27-46`** — `UNIFIED_TIMELINE_VIEW_SQL` only unioned `messages`, `audit_events`, and `tasks`. `team_workspace` was excluded.
+3. **`db.rs`** — `UNIFIED_TIMELINE_VIEW_SQL` only unioned `messages`, `audit_events`, and `tasks`. `team_workspace` was excluded.
 
 ## Solution
 

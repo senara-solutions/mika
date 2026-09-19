@@ -109,6 +109,74 @@ impl PeriodicScan {
 /// comportement d'avant ; ce qui change est qu'il le **dit** — WARN au lieu de
 /// DEBUG, parce qu'un scan silencieusement inactif se lit comme un scan qui n'a
 /// rien trouvé à faire.
+/// Kill-switch du filet mika#2368.
+pub(crate) const QA_CALLBACK_VERDICT_NET_ENV: &str = "MIKA_QA_CALLBACK_VERDICT_NET";
+
+/// Le filet mika#2368 peut-il poster ? Défaut : **armé**.
+///
+/// Il n'est pas là par prudence de principe. La sonde 2c du plan mika#2355
+/// prescrit « désarmer le filet avant tout diagnostic » si une PR est mergée
+/// sans revue — une prescription qui n'est exécutable que si le levier existe,
+/// et sans redéploiement.
+///
+/// Absence ou valeur vide → armé : le filet est le comportement voulu, pas une
+/// option. Une valeur non reconnue est **dite** et laisse armé — un désarmement
+/// par coquille sur un filet de sûreté serait la panne silencieuse que tout ce
+/// ticket existe pour fermer.
+fn qa_callback_verdict_net_enabled() -> bool {
+    parse_qa_callback_verdict_net(std::env::var(QA_CALLBACK_VERDICT_NET_ENV).ok().as_deref())
+}
+
+/// La moitié pure de [`qa_callback_verdict_net_enabled`].
+///
+/// Séparée de la lecture d'environnement pour être testable sans muter une
+/// variable globale au processus — que les tests d'une même binaire partagent.
+fn parse_qa_callback_verdict_net(raw: Option<&str>) -> bool {
+    let Some(raw) = raw else {
+        return true;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => true,
+        "0" | "false" | "off" | "no" => false,
+        "1" | "true" | "on" | "yes" => true,
+        other => {
+            warn!(
+                event = "qa_callback_verdict_net_invalid",
+                value = %other,
+                "valeur non reconnue pour {QA_CALLBACK_VERDICT_NET_ENV} — le \
+                 filet reste armé"
+            );
+            true
+        }
+    }
+}
+
+/// Lit la cible PR stampée sur une tâche callback (mika#2368 AC6).
+///
+/// Quatre motifs d'abstention, nommés séparément parce qu'ils appellent des
+/// remèdes différents : `no_metadata` (le dispatch n'a rien stampé — voir
+/// `qa_review_pr_target_unresolved` côté producteur), `metadata_unreadable`
+/// (JSON cassé), `no_target_stamp` (metadata présent, clé absente — le cas
+/// nominal d'un callback qui n'est pas un build), `target_unreadable` (la clé
+/// est là, sa valeur ne se relit pas).
+///
+/// `Err` dans les quatre cas, et jamais une cible devinée.
+pub(crate) fn read_qa_review_pr_target(
+    metadata: Option<&str>,
+) -> Result<crate::server::deadline_verdict::PrTarget, &'static str> {
+    use crate::server::deadline_verdict::{PrTarget, QA_REVIEW_PR_TARGET_KEY};
+
+    let raw = metadata
+        .filter(|m| !m.trim().is_empty())
+        .ok_or("no_metadata")?;
+    let parsed: serde_json::Value = serde_json::from_str(raw).map_err(|_| "metadata_unreadable")?;
+    let stamped = parsed
+        .get(QA_REVIEW_PR_TARGET_KEY)
+        .and_then(|v| v.as_str())
+        .ok_or("no_target_stamp")?;
+    PrTarget::from_metadata_value(stamped).ok_or("target_unreadable")
+}
+
 async fn resolve_periodic_scan_token(
     settings: &Settings,
     github_app: Option<&mika_common::github_app::GitHubApp>,
@@ -238,12 +306,15 @@ fn delivery_backoff_secs(base: u64, max: u64, attempts: u32, quarantine_at: u32)
 /// `other` for a failure that is not an LLM failure at all. The four tests
 /// below this function are unchanged by that move, which is what attests the
 /// wire format did not shift.
+///
+/// **mika#2289 moved the adapter too.** A second consumer appeared — the
+/// engine-side `hold[review]` net, which classifies the error that killed a
+/// turn — and it needs the same cause-chain walk and the same `other`. Two
+/// copies of four lines writing into one operator vocabulary is the divergence
+/// this file's own doc comment argues against, so the walk now lives beside the
+/// mapping in `mika-common` and this stays a named call site.
 fn classify_delivery_error(err: &anyhow::Error) -> std::borrow::Cow<'static, str> {
-    use mika_common::llm::error::{LlmError, error_class};
-    use std::borrow::Cow;
-
-    err.downcast_ref::<LlmError>()
-        .map_or(Cow::Borrowed(error_class::OTHER), LlmError::error_class)
+    mika_common::llm::error::classify_anyhow_error(err)
 }
 
 /// Parent statuses from which no dispatch can ever be produced (mika#2169).
@@ -320,6 +391,9 @@ pub struct TaskDispatcher {
     /// When true, the engine skips `dispatch_undelivered_callbacks()`.
     /// CLI/TUI mode handles callbacks via `poll_callback_tasks()` instead,
     /// preventing a race where the engine steals callbacks from the TUI.
+    /// It also skips the startup A2A orphan sweep (mika#2379): a CLI process
+    /// shares the container database with a daemon that may be serving live
+    /// A2A turns.
     pub cli_mode: bool,
     /// Per-agent settings for constructing per-skill LLM overrides in silent mode.
     /// Passed as `settings: Some(&self.settings)` to all `SilentAgentParams` constructions.
@@ -341,6 +415,19 @@ pub struct TaskDispatcher {
     /// une transition si le STOP est armé au premier tick — même raisonnement que
     /// le jeu de déduplication mika#2131.
     pub auto_pull_stop_armed: AtomicBool,
+    /// Last `proactive_budget_resolved` couple this process announced (mika#2358).
+    ///
+    /// Deduplication only, on the same doctrine as `auto_pull_stop_armed` above
+    /// and as `llm_budget_resolved` (mika#2293): the durable information is
+    /// "this tenant's budget is 1, and it came from the config", not that it
+    /// still was at 14:32. A heartbeat row ticks hourly, so an undeduplicated
+    /// line would be 24 a day per tenant and would bury the signal it exists to
+    /// raise (doctrine mika#2131). A **change** is re-emitted.
+    ///
+    /// Lost on restart, deliberately — a fresh process re-photographs what it
+    /// finds, exactly like the STOP switch above.
+    pub proactive_budget_reported:
+        std::sync::Mutex<Option<crate::config_keys::ResolvedProactiveBudget>>,
 }
 
 impl TaskDispatcher {
@@ -564,6 +651,10 @@ impl TaskDispatcher {
             skills_dirty: &self.skills_dirty,
             settings: Some(&self.settings),
             trace_id: Some(trace_id.clone()),
+            // mika#2368 AC7 — le registre anti-double-post atteint le tour
+            // silencieux. `None` en test (voir `test_dispatcher`), ce qui fait
+            // simplement s'abstenir le filet.
+            pr_reviews_posted: self.pr_reviews_posted.as_ref(),
         };
 
         if let Err(e) = run_silent_agent(&params).await {
@@ -593,6 +684,129 @@ impl TaskDispatcher {
     ///
     /// Returns `Err` with a specific message when the agent is busy so the caller
     /// can re-queue the task instead of losing the callback result.
+    /// Le filet moteur mika#2368 : une PR de la boucle n'est plus jamais muette.
+    ///
+    /// Appelé après qu'un tour de callback a rendu `Ok`, **avant** l'éviction du
+    /// registre anti-double-post. Il ne poste que si le tour a lui-même signalé
+    /// qu'un verdict était dû et n'a pas été posté après le re-prompt de la
+    /// garde `qa_build_callback_verdict` — le prédicat vit dans
+    /// [`crate::qa_build_callback::verdict_unmet_after_retry`], et ce n'est pas
+    /// un hasard qu'il soit ailleurs : le filet n'a rien à re-décider.
+    ///
+    /// # Chemin nominal : silencieux, et gratuit
+    ///
+    /// Un tour qui a posté son verdict — ou qui n'en devait aucun — sort à la
+    /// première ligne. Pas de lecture de metadata, pas de résolution de token,
+    /// pas de ligne de journal. Le filet est strictement additif.
+    ///
+    /// # Il ne rend jamais d'erreur
+    ///
+    /// Aucun échec ici ne fait échouer le tick : un filet qui tombe
+    /// remplacerait un silence par une panne.
+    async fn post_callback_verdict_net(
+        &self,
+        task: &Task,
+        outcome: &crate::agent::SilentTurnOutcome,
+        session_id: &str,
+        trace_id: &str,
+    ) {
+        use crate::server::deadline_verdict::{
+            CALLBACK_VERDICT_EVENT, DeadlineVerdictInput, VerdictReason,
+            maybe_post_deadline_verdict,
+        };
+
+        if !outcome.qa_verdict_unmet {
+            return;
+        }
+
+        if !qa_callback_verdict_net_enabled() {
+            warn!(
+                event = CALLBACK_VERDICT_EVENT,
+                agent_id = %self.db.agent_id(),
+                task_id = %task.id,
+                trace_id = %trace_id,
+                outcome = "disarmed",
+                "un verdict était dû et n'a pas été posté, mais le filet est \
+                 désarmé ({QA_CALLBACK_VERDICT_NET_ENV}=0) — la PR reste muette"
+            );
+            return;
+        }
+
+        // AC6 — la cible est **dite**. Absence, illisibilité ou cible non
+        // résoluble : zéro POST, et une ligne qui nomme l'abstention et son
+        // motif. Le filet ne devine jamais une PR.
+        let target = match read_qa_review_pr_target(task.metadata.as_deref()) {
+            Ok(t) => t,
+            Err(reason) => {
+                warn!(
+                    event = CALLBACK_VERDICT_EVENT,
+                    agent_id = %self.db.agent_id(),
+                    task_id = %task.id,
+                    trace_id = %trace_id,
+                    outcome = reason,
+                    "callback de build QA conclu sans verdict, mais la cible PR \
+                     n'est pas lisible sur la tâche — rien n'a été posté"
+                );
+                return;
+            }
+        };
+
+        // Identité (ADR-008) : PAT d'abord. Poster une review est une opération
+        // dont GitHub lit l'auteur — le verdict doit apparaître sous l'identité
+        // machine de la QA. C'est le convertisseur canonique, le même que le
+        // call-site mika#2276 (`handlers.rs`), et délibérément **pas**
+        // `resolve_periodic_scan_token`, dont le doc-comment exclut en toutes
+        // lettres les chemins qui exigent l'identité machine (revue/merge de PR)
+        // et qui n'est de toute façon pas un scan périodique.
+        let Some(token) = self
+            .settings
+            .resolve_github_token(self.github_app.as_deref())
+            .await
+        else {
+            warn!(
+                event = CALLBACK_VERDICT_EVENT,
+                agent_id = %self.db.agent_id(),
+                task_id = %task.id,
+                trace_id = %trace_id,
+                repo = %target.repo,
+                pr = target.pr_number,
+                outcome = "no_token",
+                "callback de build QA conclu sans verdict mais aucun token GitHub \
+                 résolu — verdict de secours non posté"
+            );
+            return;
+        };
+
+        maybe_post_deadline_verdict(
+            DeadlineVerdictInput {
+                reason: VerdictReason::CallbackConcludedWithoutVerdict,
+                target,
+                session_id,
+                trace_id,
+                agent_id: self.db.agent_id(),
+                pr_reviews_posted: self.pr_reviews_posted.as_deref(),
+            },
+            |request| async move {
+                let pr = request.pr_number.to_string();
+                crate::tools::pr_merge_with_gate::run_gh_subprocess(
+                    &[
+                        "pr",
+                        "review",
+                        &pr,
+                        "--comment",
+                        "--body",
+                        &request.body,
+                        "--repo",
+                        &request.repo,
+                    ],
+                    &token,
+                )
+                .await
+            },
+        )
+        .await;
+    }
+
     pub(crate) async fn dispatch_resume_agent(&self, task: &Task) -> Result<(), DispatchError> {
         let is_callback = task.trigger_type == "callback";
 
@@ -774,36 +988,61 @@ impl TaskDispatcher {
             skills_dirty: &self.skills_dirty,
             settings: Some(&self.settings),
             trace_id: Some(trace_id.clone()),
+            // mika#2368 AC7 — le registre anti-double-post atteint le tour
+            // silencieux. `None` en test (voir `test_dispatcher`), ce qui fait
+            // simplement s'abstenir le filet.
+            pr_reviews_posted: self.pr_reviews_posted.as_ref(),
         };
 
-        if let Err(e) = run_silent_agent(&params).await {
-            warn!(task_id = %task.id, error = %e, "resume_agent run failed");
+        // mika#2368 — le tour rend désormais un `SilentTurnOutcome` (« un verdict
+        // était dû et n'a pas été posté »), que le filet lit plus bas. `None`
+        // porte l'ancien sens de la branche `Err` : le tour a planté, il n'a pas
+        // « conclu », et le signal n'existe que sur la branche `Ok`.
+        let turn_outcome = match run_silent_agent(&params).await {
+            Ok(outcome) => Some(outcome),
+            Err(e) => {
+                warn!(task_id = %task.id, error = %e, "resume_agent run failed");
 
-            // mika#2179 — record the failure and back the row off BEFORE the
-            // re-arm below. Order matters twice over: the re-arm creates a new
-            // `pending` row and returns early on some paths, and this row is
-            // the one that keeps being re-selected every 60s scan. Until this
-            // call existed, the branch wrote a `warn!` and nothing else — no
-            // counter, no audit event, no `next_fire_at` — so callback
-            // `800d739f` re-took the agent lock once a minute for five hours
-            // while its parent died of age waiting for the return.
-            if is_callback {
-                self.record_callback_delivery_failure(task, &e, &session_id, &trace_id)
-                    .await;
-            }
+                // mika#2179 — record the failure and back the row off BEFORE the
+                // re-arm below. Order matters twice over: the re-arm creates a new
+                // `pending` row and returns early on some paths, and this row is
+                // the one that keeps being re-selected every 60s scan. Until this
+                // call existed, the branch wrote a `warn!` and nothing else — no
+                // counter, no audit event, no `next_fire_at` — so callback
+                // `800d739f` re-took the agent lock once a minute for five hours
+                // while its parent died of age waiting for the return.
+                if is_callback {
+                    self.record_callback_delivery_failure(task, &e, &session_id, &trace_id)
+                        .await;
+                }
 
-            // mika#2045 — a deferred wrapper whose turn errored is consumed all
-            // the same: promotion already set it `completed`, so it has left the
-            // pending queue for good. This branch used to do nothing at all — no
-            // mark_delivered, no R9 detection, no event — which is why the
-            // 2026-08-29 09:10-09:51Z occurrence stranded four tasks without a
-            // single `deferred_dispatch_noop_completion` in the log. Re-arm here
-            // too, or the loudest failure mode stays the silent one.
-            if is_callback && task.label == crate::agent::DEFERRED_DISPATCH_LABEL {
-                self.rearm_consumed_deferred_wrapper(task, "silent_turn_error")
-                    .await;
+                // mika#2045 — a deferred wrapper whose turn errored is consumed all
+                // the same: promotion already set it `completed`, so it has left the
+                // pending queue for good. This branch used to do nothing at all — no
+                // mark_delivered, no R9 detection, no event — which is why the
+                // 2026-08-29 09:10-09:51Z occurrence stranded four tasks without a
+                // single `deferred_dispatch_noop_completion` in the log. Re-arm here
+                // too, or the loudest failure mode stays the silent one.
+                if is_callback && task.label == crate::agent::DEFERRED_DISPATCH_LABEL {
+                    self.rearm_consumed_deferred_wrapper(task, "silent_turn_error")
+                        .await;
+                }
+                None
             }
-        } else if is_callback {
+        };
+
+        if let Some(outcome) = turn_outcome
+            && is_callback
+        {
+            // mika#2368 — le filet moteur. Placé ICI, en tête de la branche,
+            // pour deux raisons qui sont l'une et l'autre structurelles :
+            // l'éviction du registre anti-double-post a lieu à la sortie de
+            // cette fonction (`map.remove(&session_id)`), et le verdict doit
+            // partir avant que la tâche ne soit marquée délivrée — la PR ne
+            // doit pas rester muette une seconde de plus que nécessaire.
+            self.post_callback_verdict_net(task, &outcome, &session_id, &trace_id)
+                .await;
+
             // Mark delivered so TUI polling doesn't re-process this callback.
             // Only for callbacks — reminder lifecycle is managed by fire_task().
             match self.db.mark_task_delivered(&task.id).await {
@@ -1180,6 +1419,10 @@ impl TaskDispatcher {
             skills_dirty: &self.skills_dirty,
             settings: Some(&self.settings),
             trace_id: Some(trace_id.clone()),
+            // mika#2368 AC7 — le registre anti-double-post atteint le tour
+            // silencieux. `None` en test (voir `test_dispatcher`), ce qui fait
+            // simplement s'abstenir le filet.
+            pr_reviews_posted: self.pr_reviews_posted.as_ref(),
         };
 
         if let Err(e) = run_silent_agent(&params).await {
@@ -1574,7 +1817,54 @@ impl TaskDispatcher {
 
         let proposals = crate::skills::curator::build_proposals(&candidates, max_idle_days);
 
+        // The review itself is unconditional, and stays so: only its
+        // *notification* is withheld below. `mika skills curator status` remains
+        // the operator surface, and it is the right one — it never needed to go
+        // through Telegram.
         crate::skills::curator::emit_curator_proposal(&self.db, &task.agent_id, &proposals).await?;
+
+        // mika#2358 — the third producer of unsolicited messages, and the one
+        // the code comment used to misname.
+        //
+        // The comment said "operator"; the channel says "user". `message_sender`
+        // is the same field the heartbeat uses, and on a mono-agent tenant it
+        // routes to the customer's Telegram `chat_id`. Operator and user are
+        // conflated by the topology, not by the intent of this code. On Al's
+        // tenant that meant a daily English message beginning `[Curator]`,
+        // counting "skills idle" and prescribing a shell command, landing at
+        // 10:00 local (the cron is UTC, he is at UTC+7) — a "technical report"
+        // in his own vocabulary, and a message `FAMILY_SOUL` forbids in as many
+        // words ("toute mention … de l'infrastructure sous-jacente — jamais").
+        //
+        // **Withheld by persona, not by the budget** (KTD8). Routing it under
+        // the mika#2358 wake-up budget would make it *rarer* for the tenant who
+        // should never see it and *rarer too* for the operator it is written
+        // for — a setting wrong on both tenants at once. This is not a problem
+        // of frequency but of addressee.
+        //
+        // Exhaustive `match`, no `_ =>` arm (model: mika#2290's
+        // `hosting_ground_truth_line`): a persona added later is forced to
+        // decide rather than inheriting a default in silence.
+        let notify = match self.tier.persona_profile() {
+            mika_common::home::PersonaProfile::Operator => true,
+            mika_common::home::PersonaProfile::Family => false,
+        };
+
+        if !notify {
+            // Without this line a withheld curator reads exactly like a curator
+            // with no candidates (mika#2205: a silently inert scan reads like an
+            // idle one). It is also the probe that measures the curator's share
+            // in what Al experienced.
+            info!(
+                target: "mika::otel",
+                agent_id = %task.agent_id,
+                candidates = candidates.len(),
+                persona = ?self.tier.persona_profile(),
+                event = "curator_notification_withheld",
+                "curator notification withheld: operator jargon does not go to a family channel"
+            );
+            return Ok(());
+        }
 
         // Notify operator if message_sender is available
         if let Some(ref sender) = self.message_sender {
@@ -1717,10 +2007,16 @@ impl TaskDispatcher {
             skills_dirty: &self.skills_dirty,
             settings: Some(&self.settings),
             trace_id: Some(trace_id.clone()),
+            // mika#2368 AC7 — le registre anti-double-post atteint le tour
+            // silencieux. `None` en test (voir `test_dispatcher`), ce qui fait
+            // simplement s'abstenir le filet.
+            pr_reviews_posted: self.pr_reviews_posted.as_ref(),
         };
 
         match run_silent_agent(&params).await {
-            Ok(()) => {
+            // mika#2368 : la réflexion n'est pas un callback de build, donc son
+            // `SilentTurnOutcome` n'a rien à dire ici.
+            Ok(_) => {
                 if let Err(e) = self.db.record_reflection_run("completed", 0, None).await {
                     warn!(task_id = %task.id, error = %e, "failed to record reflection run");
                 }
@@ -1749,7 +2045,58 @@ impl TaskDispatcher {
         Ok(())
     }
 
-    /// Heartbeat pre-filter: checks active hours, rate limits, and recent user activity.
+    /// Resolve the tenant's daily proactive wake-up budget, announcing it once
+    /// per resolved couple (mika#2358 U4).
+    ///
+    /// The announcement exists because mika#2293 had to write the lesson down
+    /// for `llm_budget_resolved`: **a setting one cannot observe is not a
+    /// setting**. `source: "config"` at budget 1 says the instruction is in
+    /// force and a surviving symptom belongs to another producer;
+    /// `source: "default"` says the write never landed and the cause is in
+    /// `set_config`, not in the budget.
+    async fn resolve_proactive_budget(&self) -> crate::config_keys::ResolvedProactiveBudget {
+        let raw = self
+            .db
+            .get_customer_config(crate::config_keys::PROACTIVE_DAILY_BUDGET_KEY)
+            .await
+            .ok()
+            .flatten();
+        let resolved = crate::config_keys::resolve_proactive_daily_budget(raw.as_deref());
+
+        let changed = match self.proactive_budget_reported.lock() {
+            Ok(mut last) => {
+                let changed = *last != Some(resolved);
+                if changed {
+                    *last = Some(resolved);
+                }
+                changed
+            }
+            // A poisoned mutex must not silence the announcement: reporting the
+            // same couple twice is noise, never reporting it is a blind spot.
+            Err(_) => true,
+        };
+
+        if changed {
+            info!(
+                target: "mika::otel",
+                agent_id = %self.db.agent_id(),
+                budget = resolved.budget,
+                source = resolved.source.as_str(),
+                event = "proactive_budget_resolved",
+                "proactive daily wake-up budget resolved"
+            );
+        }
+
+        resolved
+    }
+
+    /// Heartbeat pre-filter: checks active hours, rate limits, the tenant's
+    /// proactive budget and dated pause (mika#2358), and recent user activity.
+    ///
+    /// **Only the two mika#2358 terms are observable.** The three pre-existing
+    /// ones keep their silence: a nominal tenant crosses the hourly limit
+    /// around 23 times a day, and a line per refusal would bury the signal this
+    /// work exists to raise (doctrine mika#2131).
     async fn heartbeat_should_run(&self) -> bool {
         let tz_str = self
             .db
@@ -1769,23 +2116,81 @@ impl TaskDispatcher {
             return false;
         }
 
-        // 2. Rate limit: max 1 per hour
+        // 2. Daily proactive budget (mika#2358), which replaces the literal `3`
+        //    this filter used to carry — a ceiling no setting could reach, and
+        //    the exact number Al reported receiving.
+        //
+        //    Resolved BEFORE the counting queries so that budget `0` — the
+        //    « plus aucun message » lever — refuses without issuing one.
+        let resolved = self.resolve_proactive_budget().await;
+        if resolved.budget == 0 {
+            info!(
+                target: "mika::otel",
+                agent_id = %self.db.agent_id(),
+                reason = "daily_budget",
+                budget = 0,
+                sends_today = 0,
+                event = "proactive_wake_suppressed",
+                "proactive wake-up suppressed: the tenant's budget is zero"
+            );
+            return false;
+        }
+
+        // 3. Rate limit: max 1 per hour (pre-existing, deliberately silent)
         if self.db.count_heartbeat_sends_last_hour().await.unwrap_or(0) >= 1 {
             return false;
         }
 
-        // 3. Rate limit: max 3 per day
-        if self
+        // 4. Daily budget reached.
+        let sends_today = self
             .db
             .count_heartbeat_sends_today(&tz_str)
             .await
-            .unwrap_or(0)
-            >= 3
-        {
+            .unwrap_or(0);
+        if sends_today >= resolved.budget {
+            info!(
+                target: "mika::otel",
+                agent_id = %self.db.agent_id(),
+                reason = "daily_budget",
+                budget = resolved.budget,
+                sends_today,
+                source = resolved.source.as_str(),
+                event = "proactive_wake_suppressed",
+                "proactive wake-up suppressed: the tenant's daily budget is spent"
+            );
             return false;
         }
 
-        // 4. Skip if user messaged within 2 hours
+        // 5. Dated pause (mika#2358) — the half of Al's promise the budget alone
+        //    cannot express (« plus aucun message AUJOURD'HUI »).
+        //
+        //    An unreadable value does NOT suspend: every read in this filter
+        //    fails open, and a typo that silently muted a tenant would be the
+        //    very class of failure this work closes. The WARN naming the value
+        //    is emitted by the resolver in `config_keys`.
+        let pause_raw = self
+            .db
+            .get_customer_config(crate::config_keys::PROACTIVE_PAUSE_UNTIL_KEY)
+            .await
+            .ok()
+            .flatten();
+        if let crate::config_keys::ProactivePause::Until(until) =
+            crate::config_keys::resolve_proactive_pause(pause_raw.as_deref(), now_utc)
+        {
+            info!(
+                target: "mika::otel",
+                agent_id = %self.db.agent_id(),
+                reason = "paused",
+                budget = resolved.budget,
+                sends_today,
+                pause_until = %crate::timestamp::format(&until),
+                event = "proactive_wake_suppressed",
+                "proactive wake-up suppressed: a dated pause is armed"
+            );
+            return false;
+        }
+
+        // 6. Skip if user messaged within 2 hours (pre-existing, silent)
         if let Ok(Some(last_ts)) = self.db.last_user_message_time().await {
             let elapsed = if let Ok(last_dt) = crate::timestamp::parse(&last_ts) {
                 now_utc.signed_duration_since(last_dt).num_seconds()
@@ -2482,6 +2887,10 @@ impl TaskDispatcher {
             skills_dirty: &self.skills_dirty,
             settings: Some(&self.settings),
             trace_id: Some(trace_id.clone()),
+            // mika#2368 AC7 — le registre anti-double-post atteint le tour
+            // silencieux. `None` en test (voir `test_dispatcher`), ce qui fait
+            // simplement s'abstenir le filet.
+            pr_reviews_posted: self.pr_reviews_posted.as_ref(),
         };
 
         if let Err(e) = run_silent_agent(&params).await {
@@ -3294,6 +3703,8 @@ async fn try_dispatch_pilot_after_groom_success(
         timeout_secs,
         &system_session,
         &trace_id,
+        // mika#2368 : pas de cible QA à stamper — ce n'est pas un build.
+        None,
     );
     let callback_task_id = match db.create_task(callback_task).await {
         Ok(id) => id,
@@ -3501,6 +3912,88 @@ mod tests {
         async fn send(&self, _text: &str) -> anyhow::Result<SendOutcome> {
             Ok(SendOutcome::Delivered)
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2368 — le filet moteur : lecture de la cible et kill-switch
+    // -----------------------------------------------------------------------
+
+    /// **AC6, T4** — quatre contrôles négatifs **séparés**, un par terme.
+    ///
+    /// Quatre et non un seul : une conjonction de termes fail-safe ne se prouve
+    /// pas en les neutralisant tous à la fois — un test unique passerait sur une
+    /// implémentation qui n'en lit qu'un (la leçon de mika#2277, dont les quatre
+    /// négatifs à un terme sont le gabarit). Chaque motif est nommé
+    /// distinctement parce qu'ils appellent des remèdes différents.
+    #[test]
+    fn mika2368_a_missing_metadata_yields_no_target() {
+        assert_eq!(read_qa_review_pr_target(None), Err("no_metadata"));
+        assert_eq!(read_qa_review_pr_target(Some("")), Err("no_metadata"));
+        assert_eq!(read_qa_review_pr_target(Some("   ")), Err("no_metadata"));
+    }
+
+    #[test]
+    fn mika2368_an_unreadable_metadata_yields_no_target() {
+        assert_eq!(
+            read_qa_review_pr_target(Some("{ pas du json")),
+            Err("metadata_unreadable")
+        );
+    }
+
+    #[test]
+    fn mika2368_a_metadata_without_the_key_yields_no_target() {
+        // Le cas nominal d'un callback qui n'est pas un build : la row porte
+        // d'autres stamps, pas celui-ci.
+        assert_eq!(
+            read_qa_review_pr_target(Some(r#"{"process_start_time":"123"}"#)),
+            Err("no_target_stamp")
+        );
+        // Une valeur non-chaîne n'est pas une cible non plus.
+        assert_eq!(
+            read_qa_review_pr_target(Some(r#"{"qa_review_pr_target":42}"#)),
+            Err("no_target_stamp")
+        );
+    }
+
+    #[test]
+    fn mika2368_an_unparsable_target_yields_no_target() {
+        assert_eq!(
+            read_qa_review_pr_target(Some(r#"{"qa_review_pr_target":"pas-une-pr"}"#)),
+            Err("target_unreadable")
+        );
+    }
+
+    /// Le contrôle positif du lecteur : la forme que le producteur écrit.
+    #[test]
+    fn mika2368_a_stamped_target_is_read_back() {
+        let target = read_qa_review_pr_target(Some(
+            r#"{"qa_review_pr_target":"senara-solutions/mika#2368"}"#,
+        ))
+        .expect("cible lisible");
+        assert_eq!(target.repo, "senara-solutions/mika");
+        assert_eq!(target.pr_number, 2368);
+    }
+
+    /// **T9** — le kill-switch. Armé par défaut ; une valeur non reconnue
+    /// laisse armé, parce qu'un désarmement par coquille sur un filet de sûreté
+    /// serait la panne silencieuse que ce ticket ferme.
+    #[test]
+    fn mika2368_the_kill_switch_defaults_to_armed() {
+        assert!(parse_qa_callback_verdict_net(None), "absence → armé");
+        assert!(parse_qa_callback_verdict_net(Some("")), "vide → armé");
+        for off in ["0", "false", "FALSE", "off", "no", " 0 "] {
+            assert!(
+                !parse_qa_callback_verdict_net(Some(off)),
+                "{off:?} doit désarmer"
+            );
+        }
+        for on in ["1", "true", "on", "yes", "TRUE"] {
+            assert!(parse_qa_callback_verdict_net(Some(on)), "{on:?} doit armer");
+        }
+        assert!(
+            parse_qa_callback_verdict_net(Some("peut-être")),
+            "une valeur non reconnue laisse armé"
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -3762,6 +4255,7 @@ mod tests {
             settings,
             pr_reviews_posted: None,
             auto_pull_stop_armed: AtomicBool::new(false),
+            proactive_budget_reported: std::sync::Mutex::new(None),
         }
     }
 
@@ -6330,6 +6824,7 @@ mod tests {
             7200,
             "system-mika",
             "trace-xyz",
+            None,
         );
         let cb_id = db
             .create_task(callback)
@@ -6398,5 +6893,439 @@ mod tests {
             !verified,
             "a groom callback without `Outcome: PLAN_GROOMED` is not proof of grooming"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2358 — the proactive wake-up budget and the dated pause
+    // -----------------------------------------------------------------------
+
+    /// A timezone in which it is currently early afternoon, so the
+    /// `08:00–21:00` active-hours term of [`TaskDispatcher::heartbeat_should_run`]
+    /// is satisfied whatever the wall clock of the machine running the test.
+    ///
+    /// Derived rather than mocked: that function reads `chrono::Utc::now()`
+    /// directly, and threading a clock into it would be a wider change than the
+    /// two terms these tests exercise. Note the Olson sign inversion —
+    /// `Etc/GMT-K` denotes UTC**+**K.
+    fn tz_where_it_is_midday() -> String {
+        let utc_hour = chrono::Utc::now().hour() as i32;
+        let mut k = (12 - utc_hour).rem_euclid(24);
+        if k > 14 {
+            k -= 24; // keep inside the Etc/GMT+12 .. Etc/GMT-14 range
+        }
+        match k.cmp(&0) {
+            std::cmp::Ordering::Equal => "UTC".to_string(),
+            std::cmp::Ordering::Greater => format!("Etc/GMT-{k}"),
+            std::cmp::Ordering::Less => format!("Etc/GMT+{}", -k),
+        }
+    }
+
+    /// Record `n` heartbeat wake-ups that happened **today but over an hour
+    /// ago**, so they load the daily budget without tripping the hourly
+    /// rate-limit that sits in front of it.
+    async fn seed_wakes_today(db: &AsyncDatabase, n: u32) {
+        for _ in 0..n {
+            db.with_db(|d| {
+                d.execute_sql(
+                    "INSERT INTO heartbeat_sends (agent_id, sent_at) VALUES \
+                     ('mika', strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-90 minutes'))",
+                    &[],
+                )
+                .map(|_| ())
+            })
+            .await
+            .expect("seeding a heartbeat wake-up must not fail");
+        }
+    }
+
+    async fn dispatcher_in_active_hours() -> TaskDispatcher {
+        let db = test_db();
+        db.set_customer_config("timezone", &tz_where_it_is_midday())
+            .await
+            .unwrap();
+        test_dispatcher(db)
+    }
+
+    /// **The negative control the Verification Contract requires.** A tenant
+    /// that sets nothing keeps exactly the behaviour it had before mika#2358:
+    /// three wake-ups a day, the fourth refused.
+    ///
+    /// It reddens if the default drifts, which is the point — the literal `3`
+    /// removed from `heartbeat_should_run` now lives in exactly one place.
+    #[tokio::test]
+    async fn mika2358_an_unconfigured_tenant_keeps_the_pre_fix_behaviour() {
+        assert_eq!(
+            crate::config_keys::PROACTIVE_DAILY_BUDGET_DEFAULT,
+            3,
+            "the default must reproduce the literal `>= 3` this filter used to carry"
+        );
+
+        let d = dispatcher_in_active_hours().await;
+        seed_wakes_today(&d.db, 2).await;
+        assert!(
+            d.heartbeat_should_run().await,
+            "two wake-ups today is under the default budget of three"
+        );
+
+        seed_wakes_today(&d.db, 1).await;
+        assert!(
+            !d.heartbeat_should_run().await,
+            "the third wake-up spends the default budget — the number Al reported"
+        );
+    }
+
+    /// The instruction Al actually gave, made mechanical: one a day.
+    #[tokio::test]
+    async fn mika2358_budget_one_refuses_the_second_wake_of_the_day() {
+        let d = dispatcher_in_active_hours().await;
+        d.db.set_customer_config(crate::config_keys::PROACTIVE_DAILY_BUDGET_KEY, "1")
+            .await
+            .unwrap();
+
+        assert!(
+            d.heartbeat_should_run().await,
+            "the first wake-up of the day is inside a budget of one"
+        );
+
+        seed_wakes_today(&d.db, 1).await;
+        assert!(
+            !d.heartbeat_should_run().await,
+            "the second is refused — which the default budget of three would have allowed"
+        );
+    }
+
+    /// `0` is the « plus aucun message » lever, and it is honoured on a
+    /// database where no wake-up has ever been recorded.
+    #[tokio::test]
+    async fn mika2358_budget_zero_refuses_even_with_nothing_recorded() {
+        let d = dispatcher_in_active_hours().await;
+        d.db.set_customer_config(crate::config_keys::PROACTIVE_DAILY_BUDGET_KEY, "0")
+            .await
+            .unwrap();
+
+        assert!(
+            !d.heartbeat_should_run().await,
+            "a configured 0 suppresses every proactive wake-up"
+        );
+    }
+
+    /// AC5's other half, which **no behavioural test can see**: `0 >= 0` is
+    /// true, so the refusal would happen at the daily-budget term anyway and a
+    /// boolean cannot tell the short-circuit from its absence.
+    ///
+    /// What the short-circuit buys is that a tenant who asked for silence stops
+    /// paying two counting queries on every hourly tick, and that the emitted
+    /// `proactive_wake_suppressed` names the budget rather than being swallowed
+    /// by the silent hourly term. Both are properties of the *order*, so the
+    /// order is what is pinned — the house idiom for this class (mika#2205,
+    /// mika#2329).
+    #[test]
+    fn mika2358_the_zero_budget_short_circuit_precedes_the_counting_queries() {
+        let src = include_str!("dispatcher.rs");
+        let body = src
+            .split_once("async fn heartbeat_should_run")
+            .expect("heartbeat_should_run must exist")
+            .1;
+
+        let short_circuit = body
+            .find("if resolved.budget == 0")
+            .expect("the budget-zero short-circuit must exist");
+        let first_count = body
+            .find("count_heartbeat_sends_last_hour")
+            .expect("the hourly count must exist");
+
+        assert!(
+            short_circuit < first_count,
+            "budget 0 must refuse before any counting query is issued"
+        );
+    }
+
+    /// The half of Al's promise a budget cannot express: « plus aucun message
+    /// AUJOURD'HUI ». Four cases, because the pause must expire on its own and
+    /// must fail open when unreadable.
+    #[tokio::test]
+    async fn mika2358_the_dated_pause_covers_its_four_cases() {
+        let d = dispatcher_in_active_hours().await;
+        let key = crate::config_keys::PROACTIVE_PAUSE_UNTIL_KEY;
+
+        let future = crate::timestamp::format(&(chrono::Utc::now() + chrono::Duration::hours(6)));
+        d.db.set_customer_config(key, &future).await.unwrap();
+        assert!(
+            !d.heartbeat_should_run().await,
+            "an armed pause refuses the wake-up"
+        );
+
+        let past = crate::timestamp::format(&(chrono::Utc::now() - chrono::Duration::hours(6)));
+        d.db.set_customer_config(key, &past).await.unwrap();
+        assert!(
+            d.heartbeat_should_run().await,
+            "a pause carries an instant, so it lifts itself — no gesture required"
+        );
+
+        d.db.set_customer_config(key, crate::config_keys::PROACTIVE_PAUSE_NONE)
+            .await
+            .unwrap();
+        assert!(
+            d.heartbeat_should_run().await,
+            "`none` lifts the pause explicitly"
+        );
+
+        d.db.set_customer_config(key, "demain").await.unwrap();
+        assert!(
+            d.heartbeat_should_run().await,
+            "an unreadable pause must fail OPEN: every read in this filter does, and a \
+             typo that silently muted a tenant would be the very failure this closes"
+        );
+    }
+
+    /// The pause is a term of its own, not a re-spelling of the budget: it
+    /// refuses while the budget still has room.
+    #[tokio::test]
+    async fn mika2358_the_pause_refuses_a_wake_the_budget_would_have_allowed() {
+        let d = dispatcher_in_active_hours().await;
+        assert!(
+            d.heartbeat_should_run().await,
+            "control: nothing is in the way"
+        );
+
+        let future = crate::timestamp::format(&(chrono::Utc::now() + chrono::Duration::hours(6)));
+        d.db.set_customer_config(crate::config_keys::PROACTIVE_PAUSE_UNTIL_KEY, &future)
+            .await
+            .unwrap();
+        assert!(!d.heartbeat_should_run().await);
+    }
+
+    /// `proactive_budget_resolved` is deduplicated on the resolved couple, and
+    /// a **change** re-arms it (AC11).
+    ///
+    /// The emission is unconditional on the `changed` flag, so pinning the flag's
+    /// state machine is what pins the cadence: a heartbeat row ticks hourly, and
+    /// an undeduplicated line would be 24 a day per tenant (doctrine mika#2131).
+    #[tokio::test]
+    async fn mika2358_the_resolved_budget_is_announced_once_per_couple() {
+        let d = dispatcher_in_active_hours().await;
+
+        let first = d.resolve_proactive_budget().await;
+        assert_eq!(
+            first.source,
+            crate::config_keys::ProactiveBudgetSource::Default
+        );
+        assert_eq!(
+            *d.proactive_budget_reported.lock().unwrap(),
+            Some(first),
+            "the first resolution arms the dedup state, so the line is emitted"
+        );
+
+        let second = d.resolve_proactive_budget().await;
+        assert_eq!(second, first, "an unchanged couple stays silent");
+
+        d.db.set_customer_config(crate::config_keys::PROACTIVE_DAILY_BUDGET_KEY, "1")
+            .await
+            .unwrap();
+        let third = d.resolve_proactive_budget().await;
+        assert_eq!(third.budget, 1);
+        assert_eq!(
+            third.source,
+            crate::config_keys::ProactiveBudgetSource::Config,
+            "`config` is what tells an operator the instruction landed; `default` would \
+             send them to set_config instead of to the budget"
+        );
+        assert_eq!(
+            *d.proactive_budget_reported.lock().unwrap(),
+            Some(third),
+            "a change must be re-announced"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2358 U5 — the curator notification and the family channel
+    // -----------------------------------------------------------------------
+
+    /// Captures what actually went out on the user channel, so the operator
+    /// control can assert the text **word for word** — which is the half that
+    /// proves U5 withholds an addressee rather than disarming a function.
+    #[derive(Default)]
+    struct RecordingSender {
+        sent: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MessageSender for RecordingSender {
+        async fn send(&self, text: &str) -> anyhow::Result<SendOutcome> {
+            self.sent.lock().unwrap().push(text.to_string());
+            Ok(SendOutcome::Delivered)
+        }
+    }
+
+    /// One `active` skill never used — the shape `get_archival_candidates`
+    /// selects (`last_used_at IS NULL AND use_count = 0`).
+    async fn seed_archival_candidate(db: &AsyncDatabase) {
+        db.with_db(|d| {
+            d.execute_sql(
+                "INSERT INTO skill_overrides \
+                    (agent_id, skill_name, lifecycle_state, use_count, last_used_at) \
+                 VALUES ('mika', 'dormant-skill', 'active', 0, NULL)",
+                &[],
+            )
+            .map(|_| ())
+        })
+        .await
+        .expect("seeding an archival candidate must not fail");
+    }
+
+    async fn curator_task(db: &AsyncDatabase) -> crate::db::Task {
+        let id = db
+            .create_task(NewTask {
+                agent_id: "mika".to_string(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: "curator_review".to_string(),
+                trigger_type: "time".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: Some(crate::timestamp::now()),
+                timeout_at: None,
+                action_type: "run_skill".to_string(),
+                action_config: r#"{"trigger":"curator_review"}"#.to_string(),
+                input_context: None,
+                created_by_session: None,
+                created_trace_id: None,
+                reference_url: None,
+                source: None,
+                metadata: None,
+                r#type: None,
+                dispatch_class: None,
+            })
+            .await
+            .unwrap();
+        db.get_task(&id).await.unwrap().expect("task must exist")
+    }
+
+    async fn curator_proposal_rows(db: &AsyncDatabase) -> i64 {
+        db.with_db(|d| {
+            d.query_scalar::<i64>(
+                "SELECT COUNT(*) FROM audit_events WHERE tool_name = 'curator_review'",
+                &[],
+            )
+        })
+        .await
+        .expect("counting curator proposals must not fail")
+        .unwrap_or(0)
+    }
+
+    async fn run_curator(
+        tier: mika_common::home::AgentTier,
+    ) -> (Arc<RecordingSender>, AsyncDatabase) {
+        let db = test_db();
+        let sender = Arc::new(RecordingSender::default());
+        let mut d = test_dispatcher(db.clone());
+        d.tier = tier;
+        d.message_sender = Some(sender.clone());
+
+        let task = curator_task(&db).await;
+        d.dispatch_curator_review(&task)
+            .await
+            .expect("curator review must not error");
+        (sender, db)
+    }
+
+    /// **The negative control.** On an operator tenant nothing moves: the
+    /// notification goes out, at the word.
+    #[tokio::test]
+    async fn mika2358_an_operator_tenant_still_receives_the_curator_notification() {
+        let db = test_db();
+        seed_archival_candidate(&db).await;
+        let sender = Arc::new(RecordingSender::default());
+        let mut d = test_dispatcher(db.clone());
+        d.tier = mika_common::home::AgentTier::Default;
+        d.message_sender = Some(sender.clone());
+
+        let task = curator_task(&db).await;
+        d.dispatch_curator_review(&task).await.unwrap();
+
+        let sent = sender.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "the operator notification must still go out");
+        assert_eq!(
+            sent[0],
+            concat!(
+                "[Curator] 1 skill(s) idle >30d for agent mika. ",
+                "Run `mika skills curator status --agent mika` for details."
+            ),
+            "the operator text must be unchanged, at the word"
+        );
+    }
+
+    /// On a family tenant the same message is withheld. Not made rarer —
+    /// withheld: this is a problem of addressee, not of frequency (KTD8).
+    #[tokio::test]
+    async fn mika2358_a_family_tenant_receives_no_curator_jargon() {
+        let db = test_db();
+        seed_archival_candidate(&db).await;
+        let sender = Arc::new(RecordingSender::default());
+        let mut d = test_dispatcher(db.clone());
+        d.tier = mika_common::home::AgentTier::Family;
+        d.message_sender = Some(sender.clone());
+
+        let task = curator_task(&db).await;
+        d.dispatch_curator_review(&task).await.unwrap();
+
+        assert!(
+            sender.sent.lock().unwrap().is_empty(),
+            "`FAMILY_SOUL` forbids any mention of the underlying infrastructure — \
+             `[Curator] N skill(s) idle` is exactly that"
+        );
+    }
+
+    /// The property that separates "the notification is withheld" from "the
+    /// review is disarmed": `emit_curator_proposal` runs on both personas, so
+    /// `mika skills curator status` keeps its content.
+    #[tokio::test]
+    async fn mika2358_the_curator_review_itself_runs_on_both_personas() {
+        for tier in [
+            mika_common::home::AgentTier::Default,
+            mika_common::home::AgentTier::Family,
+        ] {
+            let db = test_db();
+            seed_archival_candidate(&db).await;
+            let sender = Arc::new(RecordingSender::default());
+            let mut d = test_dispatcher(db.clone());
+            d.tier = tier;
+            d.message_sender = Some(sender.clone());
+
+            let task = curator_task(&db).await;
+            d.dispatch_curator_review(&task).await.unwrap();
+
+            assert_eq!(
+                curator_proposal_rows(&db).await,
+                1,
+                "the proposal must be persisted for the operator whatever the persona \
+                 ({tier:?}) — the operator is the only possible actor on an archival"
+            );
+        }
+    }
+
+    /// No candidate, no send and no withholding line, on both personas: a
+    /// withheld curator must stay distinguishable from an idle one, and an idle
+    /// one must stay silent.
+    #[tokio::test]
+    async fn mika2358_no_candidate_produces_neither_a_send_nor_a_withholding() {
+        for tier in [
+            mika_common::home::AgentTier::Default,
+            mika_common::home::AgentTier::Family,
+        ] {
+            let (sender, db) = run_curator(tier).await;
+            assert!(
+                sender.sent.lock().unwrap().is_empty(),
+                "{tier:?}: nothing to report, nothing sent"
+            );
+            assert_eq!(
+                curator_proposal_rows(&db).await,
+                0,
+                "{tier:?}: an empty review emits no proposal either"
+            );
+        }
     }
 }

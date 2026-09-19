@@ -2989,6 +2989,22 @@ assert_contains "Class C message explicitly NOT drift" \
     'not LLM drift' "$DRIFT_BLOCK"
 assert_contains "Class C message links to investigation doc" \
     'drift-misdiagnosis-policy-deny-halt' "$DRIFT_BLOCK"
+# mika#2312: the remedies paragraph used to send the reader straight to
+# "widen the policy" / "rewrite the dispatch context" without ever saying the
+# deny names a refused CALL and a RULE. That reading is what produced mika#2312's
+# inference that the CONTENT of a system_prompt.md was protected.
+assert_contains "Class C message teaches rule-id reading first (dev-groom site)" \
+    "Read the halt event's bracketed [rule-id] FIRST" "$DRIFT_BLOCK"
+# The absent-rule-id semantics are the half mika#2312's first attempt got
+# BACKWARDS: rule_id=None is claude-pilot's policy DEFAULT deny (policy.py
+# returns rule_id=None when no rule matched; ui.py renders no tag for it), and
+# permissions.yaml's default reason prescribes widening. Pin the corrected
+# claim, not merely the sentence's presence — a message that is present and
+# false is what this ticket exists to repair.
+assert_contains "Class C message says an absent rule-id is the policy DEFAULT (dev-groom site)" \
+    'NO [rule-id] means the policy DEFAULT fired' "$DRIFT_BLOCK"
+assert_not_contains "Class C message does not blame the judgment stage (dev-groom site)" \
+    'canUseTool judgment stage' "$DRIFT_BLOCK"
 
 # Branch ordering: the POLICY_DENY branch must be the FIRST elif/if, so it wins
 # over the drift messages when both conditions could fire.
@@ -3081,6 +3097,32 @@ assert_contains "Class C message — halted by policy deny, NOT generic exit" \
     'halted by policy deny — not generic exit' "$POSTFLIGHT_BLOCK"
 assert_contains "Links to investigation doc" \
     'drift-misdiagnosis-policy-deny-halt' "$POSTFLIGHT_BLOCK"
+# mika#2312 — companion of the dev-groom assertions in Test 13. Same phrases,
+# second site: the two class-C blocks are NOT copies of one another (their
+# headers and remedies paragraphs legitimately differ), so a single assertion
+# would only bite on one of them.
+assert_contains "Class C message teaches rule-id reading first (dev-pilot site)" \
+    "Read the halt event's bracketed [rule-id] FIRST" "$POSTFLIGHT_BLOCK"
+assert_contains "Class C message says an absent rule-id is the policy DEFAULT (dev-pilot site)" \
+    'NO [rule-id] means the policy DEFAULT fired' "$POSTFLIGHT_BLOCK"
+assert_not_contains "Class C message does not blame the judgment stage (dev-pilot site)" \
+    'canUseTool judgment stage' "$POSTFLIGHT_BLOCK"
+
+# Reading ORDER, not just presence (mika#2312): the rule-id instruction must
+# come BEFORE the allow-list-gap paragraph — a reader who reaches "widen the
+# policy" first goes hunting for a gap without knowing which rule fired, which
+# is the sequence that produced this ticket. assert_contains cannot see order,
+# so compare source line numbers the way the POLICY_DENY branch-ordering check
+# below already does.
+RULEID_LINE=$(echo "$POSTFLIGHT_BLOCK" | grep -n "bracketed \[rule-id\] FIRST" | head -1 | cut -d: -f1)
+ALLOWLIST_LINE=$(echo "$POSTFLIGHT_BLOCK" | grep -n 'Likely a tier1 or tier2 allow-list gap' | head -1 | cut -d: -f1)
+if [ -n "$RULEID_LINE" ] && [ -n "$ALLOWLIST_LINE" ] && [ "$RULEID_LINE" -lt "$ALLOWLIST_LINE" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ rule-id instruction precedes the allow-list-gap paragraph (dev-pilot site)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ rule-id instruction must precede the allow-list-gap paragraph (dev-pilot site)"
+fi
 
 # Branch ordering: POLICY_DENY must precede BOTH the dev-groom-re-dispatch
 # Note AND the generic "Zero new commits" message in source order.
@@ -5960,6 +6002,25 @@ _arch_ask_argv() {
     rm -rf "$tmp"
 }
 
+# Idem, mais à travers le wrapper de retry (mika#2278). Sert à prouver que le
+# wrapper transmet ses trois arguments verbatim : les gardes mika#2305 portent
+# désormais sur des appels au wrapper, et sans cette assertion elles
+# épingleraient une session qui pourrait ne jamais atteindre `mika ask`.
+_arch_ask_argv_via_wrapper() {
+    local skill="$1" session_id="${2:-}"
+    local tmp plan
+    tmp=$(mktemp -d)
+    plan="$tmp/plan.md"
+    echo "# Plan: fixture mika#2278" > "$plan"
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB"
+        mika() { printf '%s\n' "$*"; }
+        _arch_ask_with_retry "$skill" "$plan" "$session_id"
+    )
+    rm -rf "$tmp"
+}
+
 # Les trois passes, une par une. Le test échouerait aussi bien sur une skill
 # oubliée que sur un `--only-skill` retiré.
 for _MIKA2363_SKILL in mika-arch-groom-ticket mika-arch-second-review mika-arch-groom-milestone; do
@@ -5989,6 +6050,245 @@ assert_contains "mika#2363: --session-id survit à la déclaration de passe" \
     "--session-id sess-2363" "$_MIKA2363_ARGV_SESSION"
 assert_contains "mika#2363: --only-skill survit à --session-id" \
     "--only-skill mika-arch-second-review" "$_MIKA2363_ARGV_SESSION"
+
+# =============================================================================
+# mika#2305 — le contrat de session des passes architecte, épinglé
+# =============================================================================
+#
+# Le ticket soupçonnait une FUITE : « le contexte de mika-arch semble porté d'une
+# passe à l'autre SANS --session-id explicite ». La lecture du code dit l'inverse
+# sur cet axe — le portage intra-invocation est explicite, délibéré et commenté,
+# et c'est même le contrat que la « Piste » du ticket appelle de ses vœux. La
+# fuite réelle vivait dans l'assembleur de prompt (HistoryScope::Agent, refermée
+# par mika#2295 + mika#2330), pas ici.
+#
+# D'où ces assertions : elles n'ajoutent aucun comportement, elles empêchent
+# qu'une prochaine lecture « corrige » le portage en croyant fermer #2305. Le
+# retry UNPARSED en particulier ne re-demande pas la revue — il demande à
+# l'architecte de COMPLÉTER sa propre réponse en y ajoutant la ligne
+# `Disposition:` manquante. Sans la session, la demande serait inintelligible :
+# le portage y est la condition de correction du mécanisme, pas sa contamination.
+
+# --- Moitié 1 : _arch_ask ne pose --session-id que si $3 est non vide ---
+
+_MIKA2305_ARGV_FRESH=$(_arch_ask_argv "mika-arch-groom-ticket")
+assert_not_contains "mika#2305: session neuve par défaut (pas de \$3 → pas de --session-id)" \
+    "--session-id" "$_MIKA2305_ARGV_FRESH"
+
+_MIKA2305_ARGV_CONT=$(_arch_ask_argv "mika-arch-groom-ticket" "sess-2305")
+assert_contains "mika#2305: continuation sur demande explicite (\$3 → --session-id)" \
+    "--session-id sess-2305" "$_MIKA2305_ARGV_CONT"
+
+# --- Moitié 2 : les trois usages de _iterate_groom_loop ---
+#
+# `_iterate_groom_loop` ne s'exécute pas en isolation (il veut gh, un plan, un
+# ticket), donc le contrat est lu sur la source. Le prédicat porte sur la
+# PRÉSENCE d'un troisième argument à l'appel, ce qui est exactement ce que
+# `_arch_ask` teste à la ligne 4688.
+
+_MIKA2305_BODY=$(awk '/^_iterate_groom_loop\(\) \{/,/^\}/' "$DISPATCH_LIB")
+assert_contains "mika#2305: le corps de _iterate_groom_loop est lisible" \
+    "_arch_ask" "$_MIKA2305_BODY"
+
+# mika#2278 a interposé `_arch_ask_with_retry` entre la boucle et `_arch_ask` :
+# le prédicat porte donc sur `_arch_ask*` et non plus sur `_arch_ask` seul. Le
+# contrat épinglé, lui, est inchangé — c'est le TROISIÈME argument qui compte,
+# pas le nom de la fonction. Le wrapper transmet `$3` verbatim (couvert par le
+# test de sa propre section), donc porter la session à son niveau la porte
+# jusqu'à `mika ask`.
+_MIKA2305_ANY_CALL='_arch_ask\(_with_retry\)\? "'
+
+# 1ʳᵉ passe : session neuve. C'est le SEUL appel architecte de la boucle qui ne
+# nomme pas "$session_id" — d'où un prédicat sur l'absence plutôt que sur la
+# forme exacte de la fin de ligne.
+_MIKA2305_CALLS=$(printf '%s\n' "$_MIKA2305_BODY" | grep "$_MIKA2305_ANY_CALL" || true)
+_MIKA2305_FRESH_CALLS=$(printf '%s\n' "$_MIKA2305_CALLS" | grep -v '"\$session_id"' || true)
+assert_eq "mika#2305: un seul appel architecte sans session portée" \
+    "1" "$(printf '%s\n' "$_MIKA2305_FRESH_CALLS" | grep -c "$_MIKA2305_ANY_CALL" || true)"
+assert_contains "mika#2305: et c'est la 1ʳᵉ passe groom-ticket sur le plan" \
+    '_arch_ask_with_retry "mika-arch-groom-ticket" "$plan_path"' "$_MIKA2305_FRESH_CALLS"
+
+# Retry UNPARSED : session portée, pour que l'architecte voie sa propre réponse
+# et puisse la compléter.
+_MIKA2305_RETRY=$(printf '%s\n' "$_MIKA2305_BODY" \
+    | grep -c '_arch_ask_with_retry "mika-arch-groom-ticket" "\$retry_prompt" "\$session_id"' || true)
+assert_eq "mika#2305: le retry UNPARSED continue la session (D6)" \
+    "1" "$_MIKA2305_RETRY"
+
+# 2ᵉ passe : session portée, sur les deux branches (après READY et après ITERATE).
+# Le contrat de continuité de session est déclaré par mika-arch-second-review.
+_MIKA2305_SECOND=$(printf '%s\n' "$_MIKA2305_BODY" \
+    | grep -c '_arch_ask_with_retry "mika-arch-second-review" "\$plan_path" "\$session_id"' || true)
+assert_eq "mika#2305: les deux branches de 2ᵉ passe continuent la session" \
+    "2" "$_MIKA2305_SECOND"
+
+# Aucun appel architecte n'échappe à l'inventaire ci-dessus : 1 + 1 + 2 = 4.
+# Un cinquième appel est un halt-and-surface — il porte ou ne porte pas la
+# session, et c'est une décision, pas une ligne à ajouter au compte.
+_MIKA2305_TOTAL=$(printf '%s\n' "$_MIKA2305_BODY" | grep -c "$_MIKA2305_ANY_CALL" || true)
+assert_eq "mika#2305: inventaire clos des appels _arch_ask (1 neuf + 3 continués)" \
+    "4" "$_MIKA2305_TOTAL"
+
+# mika#2278 : la boucle passe TOUJOURS par le wrapper. Un appel direct à
+# `_arch_ask` y serait un site sans retry et sans capture stderr — exactement
+# les deux défauts composés que ce ticket ferme, réintroduits sur un seul site
+# pendant que les trois autres restent corrects.
+_MIKA2305_BARE=$(printf '%s\n' "$_MIKA2305_BODY" | grep -c '_arch_ask "' || true)
+assert_eq "mika#2278: aucun appel direct à _arch_ask ne subsiste dans la boucle" \
+    "0" "$_MIKA2305_BARE"
+
+# Et le wrapper transmet le troisième argument verbatim : sans ça, les
+# assertions ci-dessus épingleraient une session qui n'atteint pas `mika ask`.
+_MIKA2278_WRAPPER_FRESH=$(_arch_ask_argv_via_wrapper "mika-arch-groom-ticket")
+assert_not_contains "mika#2278: le wrapper préserve la session neuve" \
+    "--session-id" "$_MIKA2278_WRAPPER_FRESH"
+_MIKA2278_WRAPPER_CONT=$(_arch_ask_argv_via_wrapper "mika-arch-second-review" "sess-2278")
+assert_contains "mika#2278: le wrapper transmet la session continuée" \
+    "--session-id sess-2278" "$_MIKA2278_WRAPPER_CONT"
+
+# ============================================================================
+# mika#2278 — un brief architecte tué par un restart est ré-émis
+# ============================================================================
+#
+# Mesuré le 2026-09-10 sur le groom de #2276 : un restart de `mika-spirit` a tué
+# la passe architecte en vol, et rien ne l'a reprise. `mika ask` sort désormais
+# en 75 (EX_TEMPFAIL) sur un échec de classe transport, et `_arch_ask_with_retry`
+# réessaie une fois — et UNE SEULE FOIS, et SEULEMENT sur 75.
+#
+# Test comportemental : on éclipse `mika` par une fonction shell qui compte ses
+# invocations et rend une séquence de codes imposée, puis on appelle le vrai
+# `_arch_ask_with_retry`. Le compte d'invocations est ce qui porte la preuve :
+# une assertion sur le seul code de sortie final passerait aussi bien sur un
+# wrapper qui ne réessaie jamais.
+
+echo ""
+echo "Test: _arch_ask_with_retry — retry borné sur 75 (mika#2278)"
+echo "------------------------------------------------------------"
+
+# _mika2278_probe <codes-séparés-par-virgule> <MIKA_ARCH_ASK_RETRY>
+# → "status=<code final> calls=<nombre d'invocations de mika>"
+_mika2278_probe() {
+    local codes="$1" retry_flag="$2"
+    local tmp plan calls
+    tmp=$(mktemp -d)
+    plan="$tmp/plan.md"
+    echo "# Plan: fixture mika#2278" > "$plan"
+    calls="$tmp/calls"
+    printf '0' > "$calls"
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB"
+        # Le délai réel est de 30 s ; la sonde n'en mesure pas la valeur, elle
+        # mesure le nombre d'appels. 1 s garde la suite rapide sans changer ce
+        # qui est asserté.
+        export MIKA_ARCH_ASK_RETRY_DELAY_SECS=1
+        export MIKA_ARCH_ASK_RETRY="$retry_flag"
+        # Éclipse le binaire : une fonction shell l'emporte sur $PATH.
+        mika() {
+            local n code
+            n=$(cat "$calls")
+            n=$((n + 1))
+            printf '%s' "$n" > "$calls"
+            code=$(printf '%s' "$codes" | cut -d, -f"$n")
+            [ -n "$code" ] || code=0
+            if [ "$code" -eq 0 ]; then
+                printf '{"content":"ok","metadata":{"session_id":"s-2278"}}'
+            else
+                echo "mika ask to http://127.0.0.1:8080/a2a/mika-arch failed: unreachable" >&2
+            fi
+            return "$code"
+        }
+        local out status
+        if out=$(_arch_ask_with_retry "mika-arch-groom-ticket" "$plan" 2>/dev/null); then
+            status=0
+        else
+            status=$?
+        fi
+        printf 'status=%s calls=%s out=%s' "$status" "$(cat "$calls")" "$out"
+    )
+    rm -rf "$tmp"
+}
+
+# Cas positif : un 75 puis un 0 → deux invocations, succès final, stdout intact.
+_MIKA2278_RETRIED=$(_mika2278_probe "75,0" "1")
+assert_contains "mika#2278: un 75 est réessayé exactement une fois" \
+    "calls=2" "$_MIKA2278_RETRIED"
+assert_contains "mika#2278: et le retry aboutit (statut final 0)" \
+    "status=0" "$_MIKA2278_RETRIED"
+assert_contains "mika#2278: le stdout du retry remonte intact à l'appelant" \
+    'out={"content":"ok"' "$_MIKA2278_RETRIED"
+
+# Contrôle négatif — c'est celui qui porte la preuve. Sans lui, un wrapper qui
+# réessaierait sur n'importe quel code non nul passerait le cas positif.
+_MIKA2278_CONTRACT=$(_mika2278_probe "1,0" "1")
+assert_contains "mika#2278: un échec de contrat (1) n'est JAMAIS réessayé" \
+    "calls=1" "$_MIKA2278_CONTRACT"
+assert_contains "mika#2278: et son code de sortie est propagé tel quel" \
+    "status=1" "$_MIKA2278_CONTRACT"
+
+# Fail-safe D4 : un code qu'on ne sait pas lire est traité comme définitif.
+# L'inverse ferait d'un futur mode d'échec imprévu une boucle de réessais.
+_MIKA2278_UNKNOWN=$(_mika2278_probe "2,0" "1")
+assert_contains "mika#2278: un code inconnu (2) n'est pas retryable (D4)" \
+    "calls=1" "$_MIKA2278_UNKNOWN"
+
+# Contrôle négatif de désarmement (R7) : la variable doit mordre.
+_MIKA2278_DISARMED=$(_mika2278_probe "75,0" "0")
+assert_contains "mika#2278: MIKA_ARCH_ASK_RETRY=0 désarme le retry" \
+    "calls=1" "$_MIKA2278_DISARMED"
+assert_contains "mika#2278: et le 75 est alors propagé à l'appelant" \
+    "status=75" "$_MIKA2278_DISARMED"
+
+# Budget de UN : deux 75 d'affilée ne produisent pas un troisième appel.
+_MIKA2278_EXHAUSTED=$(_mika2278_probe "75,75,0" "1")
+assert_contains "mika#2278: le budget est de un retry, pas d'une boucle" \
+    "calls=2" "$_MIKA2278_EXHAUSTED"
+assert_contains "mika#2278: budget épuisé → le 75 est propagé" \
+    "status=75" "$_MIKA2278_EXHAUSTED"
+
+# Lecteurs d'environnement, trois paliers (R4).
+_MIKA2278_DELAY_DEFAULT=$(
+    # shellcheck disable=SC1090
+    source "$DISPATCH_LIB"; unset MIKA_ARCH_ASK_RETRY_DELAY_SECS; _arch_ask_retry_delay_secs
+)
+assert_eq "mika#2278: délai par défaut = 30 s" "30" "$_MIKA2278_DELAY_DEFAULT"
+_MIKA2278_DELAY_SET=$(
+    # shellcheck disable=SC1090
+    source "$DISPATCH_LIB"; MIKA_ARCH_ASK_RETRY_DELAY_SECS=45 _arch_ask_retry_delay_secs
+)
+assert_eq "mika#2278: délai réglé honoré" "45" "$_MIKA2278_DELAY_SET"
+# `0` ne désarme PAS — c'est le rôle du kill-switch ; lu autrement, une coquille
+# sur le délai restaurerait en silence le défaut que ce ticket ferme.
+_MIKA2278_DELAY_ZERO=$(
+    # shellcheck disable=SC1090
+    source "$DISPATCH_LIB"; MIKA_ARCH_ASK_RETRY_DELAY_SECS=0 _arch_ask_retry_delay_secs 2>/dev/null
+)
+assert_eq "mika#2278: délai 0 retombe sur le défaut (ne désarme pas)" \
+    "30" "$_MIKA2278_DELAY_ZERO"
+_MIKA2278_DELAY_ABSURD=$(
+    # shellcheck disable=SC1090
+    source "$DISPATCH_LIB"; MIKA_ARCH_ASK_RETRY_DELAY_SECS=99999 _arch_ask_retry_delay_secs 2>/dev/null
+)
+assert_eq "mika#2278: délai absurde borné par le haut" "30" "$_MIKA2278_DELAY_ABSURD"
+
+# Garde structurelle : le retour d'un `2>/dev/null` sur un appel architecte.
+#
+# Un test comportemental ne peut pas voir cette classe. La régression ne rendrait
+# aucune décision fausse — le retry continuerait de fonctionner, toutes les
+# assertions ci-dessus resteraient vertes — elle rendrait le diagnostic aveugle :
+# l'opérateur relirait `first-pass _arch_ask failed` sans jamais apprendre
+# pourquoi. Même motif que mika#2131.
+_MIKA2278_LOOP_BODY=$(awk '/^_iterate_groom_loop\(\) \{/,/^\}/' "$DISPATCH_LIB")
+_MIKA2278_SWALLOWED=$(printf '%s\n' "$_MIKA2278_LOOP_BODY" \
+    | grep -c '_arch_ask[a-z_]* .*2>/dev/null' || true)
+assert_eq "mika#2278: aucun appel architecte ne jette plus stderr (D7)" \
+    "0" "$_MIKA2278_SWALLOWED"
+
+# Et les quatre sites font remonter ce message dans leur WARN d'échec (R5).
+_MIKA2278_SUFFIXED=$(printf '%s\n' "$_MIKA2278_LOOP_BODY" \
+    | grep -c '_groom_warn ".*_arch_ask failed.*_arch_ask_error_suffix' || true)
+assert_eq "mika#2278: les quatre WARN d'échec portent le message du CLI (R5)" \
+    "4" "$_MIKA2278_SUFFIXED"
 
 # --- Summary ---
 

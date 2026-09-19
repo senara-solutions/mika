@@ -286,15 +286,6 @@ _PILOT_EGRESS_SOCK="/tmp/mika-pilot-egress.sock"
 _PILOT_EGRESS_TCP_PORT="8891"
 _PILOT_EGRESS_PROXY_BIN="$HOME/.local/bin/mika-pilot-egress-proxy"
 
-# mika#2313: sandbox-safe ~/.claude.json emitter (installed alongside the
-# proxy by `make install`). The sandbox blanks /home (--tmpfs) and never binds
-# ~/.claude.json, so the CLI loses its cached GrowthBook feature flags — which
-# govern the prompt-cache cache_control strategy. Result before this: every
-# turn re-creates the full 100-250k-token context (cache_read=0), 355s turns,
-# subscription burn. The emitter is an allowlist of feature-flag/cache keys
-# ONLY (never account/credential keys — mika#2039). See scripts/.
-_PILOT_SANITIZE_CLAUDE_JSON_BIN="$HOME/.local/bin/mika-pilot-sanitize-claude-json"
-
 # Helper daemon for anthropic api chain (2026-08-05).
 # Addon path = installed alongside the proxy binary in ~/.local/bin/ (see
 # Makefile install target); NOT a hardcoded repo path (would fail when
@@ -967,25 +958,6 @@ _run_pilot_sandboxed() {
     local -a _PILOT_LOG_BIND_ARGS=()
     _pilot_log_bind_args
 
-    # mika#2313: regenerate a sandbox-safe ~/.claude.json fresh each dispatch
-    # (the GrowthBook flags carry an expiry) and ro-bind it, restoring the
-    # prompt cache (measured: cache_read 0 -> 31226). Like the log bind, this
-    # never refuses the launch — a missing/failed emitter degrades to the old
-    # cache-cold behaviour, not a lost dispatch. mika#2039: the emitter is a
-    # key allowlist, so no credential can reach the sandbox by construction.
-    local -a _PILOT_CLAUDE_JSON_BIND_ARGS=()
-    local _PILOT_CLAUDE_JSON=""
-    if [ -f "$HOME/.claude.json" ] && [ -x "$_PILOT_SANITIZE_CLAUDE_JSON_BIN" ]; then
-        _PILOT_CLAUDE_JSON="$(mktemp "${TMPDIR:-/tmp}/mika-pilot-claude-json.XXXXXX")"
-        trap 'rm -f "$_PILOT_CLAUDE_JSON"' RETURN
-        if "$_PILOT_SANITIZE_CLAUDE_JSON_BIN" "$HOME/.claude.json" > "$_PILOT_CLAUDE_JSON" 2>/dev/null && [ -s "$_PILOT_CLAUDE_JSON" ]; then
-            _PILOT_CLAUDE_JSON_BIND_ARGS=(--ro-bind "$_PILOT_CLAUDE_JSON" "$HOME/.claude.json")
-        else
-            echo "dispatch-lib: ~/.claude.json emitter produced nothing — pilot runs cache-cold (mika#2313)" >&2
-            rm -f "$_PILOT_CLAUDE_JSON"; _PILOT_CLAUDE_JSON=""
-        fi
-    fi
-
     # Phase 2b: launch host-side egress proxy (idempotent). If it's not
     # available (binary missing, first deploy), returns non-zero and we run
     # in Phase 2a mode (fs cut only, network open) — degraded but functional.
@@ -1194,7 +1166,6 @@ _run_pilot_sandboxed() {
             --ro-bind-try "/data/workspace/mika-platform/claude-pilot/src" "/data/workspace/mika-platform/claude-pilot/src" \
             --ro-bind-try "$HOME/.claude/plugins" "$HOME/.claude/plugins" \
             --ro-bind-try "$HOME/.claude/settings.json" "$HOME/.claude/settings.json" \
-            ${_PILOT_CLAUDE_JSON_BIND_ARGS[@]+"${_PILOT_CLAUDE_JSON_BIND_ARGS[@]}"} \
             --ro-bind-try "$HOME/.claude/commands" "$HOME/.claude/commands" \
             --ro-bind-try "$HOME/.claude/hooks" "$HOME/.claude/hooks" \
             --ro-bind-try "$HOME/.nvm/versions" "$HOME/.nvm/versions" \
@@ -1279,7 +1250,6 @@ $quoted_argv
             --ro-bind-try "/data/workspace/mika-platform/claude-pilot/src" "/data/workspace/mika-platform/claude-pilot/src" \
             --ro-bind-try "$HOME/.claude/plugins" "$HOME/.claude/plugins" \
             --ro-bind-try "$HOME/.claude/settings.json" "$HOME/.claude/settings.json" \
-            ${_PILOT_CLAUDE_JSON_BIND_ARGS[@]+"${_PILOT_CLAUDE_JSON_BIND_ARGS[@]}"} \
             --ro-bind-try "$HOME/.claude/commands" "$HOME/.claude/commands" \
             --ro-bind-try "$HOME/.claude/hooks" "$HOME/.claude/hooks" \
             --ro-bind-try "$HOME/.nvm/versions" "$HOME/.nvm/versions" \
@@ -1376,6 +1346,8 @@ _dispatch_lib_exit_trap() {
     _EXIT_CODE=$?
     # Cleanup fuzzy-match side-channel tmpfile (mika#1272)
     rm -f "${_DISPOSITION_FUZZY_FILE:-}" 2>/dev/null
+    # Cleanup architect-stderr side-channel tmpfile (mika#2278)
+    rm -f "${_ARCH_ASK_STDERR_FILE:-}" 2>/dev/null
     # Guard: skip if already delivered or no task ID
     [ "$CALLBACK_SENT" -eq 1 ] && { [ -n "$STDOUT_FILE" ] && rm -f "$STDOUT_FILE"; [ -n "$STDERR_FILE" ] && rm -f "$STDERR_FILE"; rm -f "$TRACE_FILE"; return; }
     [ -z "$TASK_ID" ] && { [ -n "$STDOUT_FILE" ] && rm -f "$STDOUT_FILE"; [ -n "$STDERR_FILE" ] && rm -f "$STDERR_FILE"; rm -f "$TRACE_FILE"; return; }
@@ -3601,9 +3573,12 @@ _post_flight_recovery() {
 
 Halt event: ${POLICY_DENY}
 
+Read the halt event's bracketed [rule-id] FIRST — it is the last bracketed token, before the trailing (terminal)/(non-terminal) lethality marker. The deny names the refused tool call (a command, or the target path for Write/Edit/Read), never the contents of a file it read. A named [rule-id] is the rule that matched: read that rule. NO [rule-id] means the policy DEFAULT fired — no rule matched the call at all — and there, widening the allow-list to cover the legitimate shape (a) is exactly the remedy, not a dead end. Establish which of the two you have before choosing between (a) and rewriting the dispatch context (b).
+
 Likely a tier1 or tier2 allow-list gap in claude-pilot-py. Investigate the deny rule and either (a) widen the policy to include the legitimate command shape, or (b) rewrite the dispatch context so the pilot avoids the denied command. The pilot was prevented from completing its work — re-dispatching without addressing the substrate gap will hit the same wall.
 
 See: docs/solutions/workflow-issues/2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md
+See: docs/solutions/security-issues/le-classifier-ne-decide-jamais-sur-le-contenu-dun-fichier-2026-09-18.md
 
 ${RESULT}"
             elif [ "$SKILL" = "dev-groom" ] && [ -n "$VALID_PLAN" ]; then
@@ -3776,7 +3751,12 @@ dispatch-lib (mika#1383): rescued trailing dirty content into wip() commit; PR c
         _pilot_log_dir; PERSISTENT_STDERR_PATH="$_PILOT_LOG_DIR/${LOG_ID}.stderr"
         if [ -f "$PERSISTENT_STDERR_PATH" ] && [ -r "$PERSISTENT_STDERR_PATH" ]; then
             # Strip ANSI color codes, then extract the first [policy:deny] line.
-            # The line shape is `[policy:deny] <Tool>: <command>[ \[rule-id\]]`.
+            # The line shape is
+            #   `[policy:deny] <Tool>: <detail>[ \[rule-id\]] (terminal|non-terminal)`
+            # mika#2312: the trailing lethality marker (cpp#151) FOLLOWS the
+            # rule-id tag, so the rule-id is the last *bracketed* token, not the
+            # last token. An absent tag means `rule_id=None` — the policy default
+            # deny (no rule matched), NOT a non-deterministic refusal.
             POLICY_DENY=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$PERSISTENT_STDERR_PATH" 2>/dev/null \
                 | grep -m1 '\[policy:deny\]' || true)
         fi
@@ -3790,9 +3770,12 @@ dispatch-lib (mika#1383): rescued trailing dirty content into wip() commit; PR c
 
 Halt event: ${POLICY_DENY}
 
+Read the halt event's bracketed [rule-id] FIRST — it is the last bracketed token, before the trailing (terminal)/(non-terminal) lethality marker. The deny names the refused tool call (a command, or the target path for Write/Edit/Read), never the contents of a file it read. A named [rule-id] is the rule that matched: read that rule. NO [rule-id] means the policy DEFAULT fired — no rule matched the call at all — and there, widening the allow-list to cover the legitimate shape (a) is exactly the remedy, not a dead end. Establish which of the two you have before choosing between (a) and rewriting the dispatch context (b).
+
 Likely a tier1 or tier2 allow-list gap in claude-pilot-py. Investigate the deny rule and either (a) widen the policy to include the legitimate research command shape, or (b) rewrite the dispatch context so the pilot avoids the denied command. The pilot was prevented from completing its work — re-grooming this ticket without addressing the substrate gap will hit the same wall.
 
 See: docs/solutions/workflow-issues/2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md
+See: docs/solutions/security-issues/le-classifier-ne-decide-jamais-sur-le-contenu-dun-fichier-2026-09-18.md
 
 ${RESULT}"
         elif [ -z "$VALID_PLAN" ] && [ "$CE_PLAN_INVOKED" = "unknown" ]; then
@@ -4721,6 +4704,169 @@ _arch_ask() {
     mika "${args[@]}" < "$plan_path"
 }
 
+# ===========================================================================
+# mika#2278 — a brief killed by a restart is re-sent, not waited on forever
+# ===========================================================================
+#
+# Measured 2026-09-10 on the groom of mika#2276: a `mika-spirit` restart at
+# 09:17 CEST killed the first-pass architect turn that had started at 08:39.
+# The pass died, the dispatch slot with it, and the operator flow hung 1 h 50
+# at an idle prompt until a manual nudge re-sent it — on a fresh session, which
+# then completed normally. The autonomous flow has no operator to nudge: it
+# just dies in PIPELINE_INCOMPLETE.
+#
+# Two composed defects made a transport blip cost a whole pass:
+#
+#  1. **No retry.** Each of the four call sites did `|| { _groom_warn …; return
+#     1; }`. A restarting server is the single most obviously transient failure
+#     there is, and it cost the pass, the slot, and one point of the re-drive
+#     budget — three of which abandon a healthy ticket (mika#2020).
+#
+#  2. **`2>/dev/null` on all four.** `mika ask` writes its diagnosis to stderr
+#     and it was thrown away, so the loop saw exit `1` and nothing else —
+#     identical for "the server is restarting" and "that session belongs to
+#     another agent". *The only channel carrying the distinction was closed by
+#     the caller.*
+#
+# The second is what made the first non-trivial: one cannot retry judiciously
+# without being able to tell transient from definitive. mika#2278 supplies the
+# discriminant as a **process exit code** (`75`, `EX_TEMPFAIL`) rather than a
+# `grep` on the message, for the reason mika#2179 and mika#2291 already
+# settled: an error sentence written for a human must not become a wire format.
+#
+# Deliberately *not* retried here: a JSON-RPC refusal the server reasoned about
+# and answered cleanly, `AGENT_BUSY` (-32000, mika#2163) included. That one
+# already waits server-side in a bounded line before refusing, and stacking a
+# second retry budget on top of it is the layering the plan's out-of-scope
+# section warns against. It exits `1` and is visible as such.
+
+# Where `mika ask`'s stderr from the most recent `_arch_ask_with_retry` is kept.
+#
+# A side channel is needed because the call sites run the wrapper inside `$( )`,
+# so a variable set in there never reaches the caller. Same tmpfile shape and
+# same `$$` (stable across subshells) as `_DISPOSITION_FUZZY_FILE` above;
+# cleaned up by `_dispatch_lib_exit_trap`.
+_ARCH_ASK_STDERR_FILE="${TMPDIR:-/tmp}/.dispatch-lib-arch-ask-stderr-$$"
+
+# The exit code `mika ask` leaves on a transport-class failure.
+# Mirrors `remote_ask::EXIT_TRANSPORT_FAILURE`; the Rust side pins the literal.
+_ARCH_ASK_RETRYABLE_EXIT=75
+
+# Is the mika#2278 retry armed?
+#
+# Default armed. `0` / `false` / `no` / `off` (case-insensitive) disarm it,
+# restoring the pre-fix behaviour exactly — one attempt, its code propagated
+# verbatim — with no binary redeploy. That switch is what makes the operator
+# probe below executable: if a retry ever fires on a *contract* error, the
+# transport/contract line has leaked and the remedy is to disarm and repair the
+# classification, never to tune the budget.
+_arch_ask_retry_enabled() {
+    local raw="${MIKA_ARCH_ASK_RETRY:-1}"
+    case "${raw,,}" in
+        0|false|no|off) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# How long to wait before the single retry, in seconds.
+#
+# A restart is not instantaneous. Retrying within the second would land on the
+# same dead port and burn the budget for nothing, so the delay is the thing
+# that makes a budget of one sufficient.
+#
+# House three-tier convention: absent/empty → default; unreadable, `0` or
+# negative → default + WARN. `0` does NOT disarm — that is
+# `MIKA_ARCH_ASK_RETRY`'s job, and reading a typo'd delay as a disarm would
+# silently restore the defect this exists to close.
+#
+# Bounded above as well, at 300s: the delay holds the groom dispatch slot, and
+# an absurd value would immobilise it far longer than the outage it absorbs.
+# 300s is already an order of magnitude past any observed restart and still
+# well inside the skill's own 600s budget.
+_arch_ask_retry_delay_secs() {
+    local raw="${MIKA_ARCH_ASK_RETRY_DELAY_SECS:-}"
+    if [ -z "$raw" ]; then
+        echo 30
+        return
+    fi
+    if ! [[ "$raw" =~ ^-?[0-9]+$ ]] || [ "$raw" -le 0 ] || [ "$raw" -gt 300 ]; then
+        echo "WARN: arch_ask_retry_delay_invalid: MIKA_ARCH_ASK_RETRY_DELAY_SECS='${raw}' is not an integer in 1..300 — falling back to 30s" >&2
+        echo 30
+        return
+    fi
+    echo "$raw"
+}
+
+# The last non-empty line `mika ask` wrote to stderr, or empty.
+#
+# One line, not the whole capture: the full stderr can carry a dotenvx banner
+# and a background-task notice, and the sentence that says what happened is the
+# last one. The whole capture has already gone to the dispatch's own stderr.
+_arch_ask_last_error() {
+    [ -r "$_ARCH_ASK_STDERR_FILE" ] || return 0
+    grep -v '^[[:space:]]*$' "$_ARCH_ASK_STDERR_FILE" 2>/dev/null | tail -n 1
+}
+
+# The same, rendered for appending to a `_groom_warn` message (R5).
+#
+# Empty when there is nothing to say, so the WARN never grows a dangling dash.
+_arch_ask_error_suffix() {
+    local last; last=$(_arch_ask_last_error)
+    [ -n "$last" ] && printf ' — %s' "$last"
+}
+
+# `_arch_ask` plus one bounded retry on a transport-class failure.
+#
+# Args: identical to `_arch_ask` ($1 skill, $2 plan path, $3 optional session).
+# Stdout: `_arch_ask`'s, verbatim. Exit: the last attempt's, verbatim.
+#
+# Retries **only** on `75`, never on "anything non-zero". A code we cannot read
+# is treated as definitive (mika#2278 D4); the inverse would turn a future
+# unforeseen failure mode into a silent retry loop.
+#
+# On the first pass `$3` is absent, so the retry departs on a fresh session —
+# which is exactly the manual gesture that unblocked mika#2276. On passes 2 to 4
+# `$3` is carried and the retry keeps it, because `mika-arch-second-review`'s
+# continuity contract needs the architect to see its own prior turn. The named
+# cost of that: if the killed turn had already persisted its user message, the
+# architect sees the same prompt twice. Harmless — it answers the last
+# occurrence — but real, and it is why the budget is one and not three.
+_arch_ask_with_retry() {
+    local skill="$1" plan_path="$2" session_id="${3:-}"
+    local out status attempt delay
+
+    for attempt in 1 2; do
+        # Capture stderr rather than discarding it (R5), then echo it onward so
+        # the dispatch log keeps it too. A retry overwrites the capture with its
+        # own attempt's stderr, which is the one the failure WARN describes; the
+        # earlier attempt has already reached the log by then.
+        if out=$(_arch_ask "$skill" "$plan_path" "$session_id" 2>"$_ARCH_ASK_STDERR_FILE"); then
+            status=0
+        else
+            status=$?
+        fi
+        [ -s "$_ARCH_ASK_STDERR_FILE" ] && cat "$_ARCH_ASK_STDERR_FILE" >&2
+
+        [ "$status" -eq "$_ARCH_ASK_RETRYABLE_EXIT" ] || break
+        [ "$attempt" -eq 1 ] || break
+        _arch_ask_retry_enabled || {
+            echo "INFO: arch_ask_retry_disarmed: skill=$skill exit=$status — MIKA_ARCH_ASK_RETRY is off, propagating" >&2
+            break
+        }
+
+        delay=$(_arch_ask_retry_delay_secs)
+        echo "INFO: arch_ask_retry: skill=$skill attempt=$attempt delay_secs=$delay reason=transport — $(_arch_ask_last_error)" >&2
+        sleep "$delay"
+    done
+
+    if [ "$status" -eq "$_ARCH_ASK_RETRYABLE_EXIT" ] && [ "$attempt" -gt 1 ]; then
+        echo "WARN: arch_ask_retry_exhausted: skill=$skill — the single retry was spent and the pass is lost anyway$(_arch_ask_error_suffix)" >&2
+    fi
+
+    printf '%s' "$out"
+    return "$status"
+}
+
 # Module-global flag: set to 1 when tier-2 fuzzy matching fires, 0 otherwise.
 # Read by _iterate_groom_loop to annotate trail entries with "(fuzzy)".
 # Side-channel design per mika#1272 rev 2 — parser stdout stays clean.
@@ -5464,8 +5610,8 @@ _iterate_groom_loop() {
     local resp1 content1 session_id disposition attempt
     for attempt in 1 2; do
         if [ "$attempt" -eq 1 ]; then
-            resp1=$(_arch_ask "mika-arch-groom-ticket" "$plan_path" 2>/dev/null) || {
-                _groom_warn "first-pass _arch_ask failed"
+            resp1=$(_arch_ask_with_retry "mika-arch-groom-ticket" "$plan_path") || {
+                _groom_warn "first-pass _arch_ask failed$(_arch_ask_error_suffix)"
                 return 1
             }
         else
@@ -5484,11 +5630,11 @@ _iterate_groom_loop() {
                 printf '    Disposition: ESCALATE\n\n'
                 printf 'The routing engine parses this line as the verdict — its absence blocks the pipeline (see mika#1823).\n'
             } > "$retry_prompt"
-            resp1=$(_arch_ask "mika-arch-groom-ticket" "$retry_prompt" "$session_id" 2>/dev/null)
+            resp1=$(_arch_ask_with_retry "mika-arch-groom-ticket" "$retry_prompt" "$session_id")
             local _retry_status=$?
             rm -f "$retry_prompt"
             [ "$_retry_status" -eq 0 ] || {
-                _groom_warn "retry _arch_ask failed"
+                _groom_warn "retry _arch_ask failed$(_arch_ask_error_suffix)"
                 return 1
             }
         fi
@@ -5527,8 +5673,8 @@ is incomplete — this is NOT the mika#2296 empty-content case)"
         READY)
             echo "iterate_groom_loop: first-pass READY; invoking mika-arch second-pass" >&2
             # Phase 2 — second-pass, continuing the architect session
-            local resp2; resp2=$(_arch_ask "mika-arch-second-review" "$plan_path" "$session_id" 2>/dev/null) || {
-                _groom_warn "second-pass _arch_ask failed"; return 1; }
+            local resp2; resp2=$(_arch_ask_with_retry "mika-arch-second-review" "$plan_path" "$session_id") || {
+                _groom_warn "second-pass _arch_ask failed$(_arch_ask_error_suffix)"; return 1; }
             local content2; content2=$(printf '%s' "$resp2" | jq -r '.content // empty' 2>/dev/null)
             [ -n "$content2" ] || {
                 _groom_warn_empty_content "second-pass"; return 1; }
@@ -5576,8 +5722,8 @@ is incomplete — this is NOT the mika#2296 empty-content case)"
             # continuing the architect session so findings stay in conversation
             # memory (per mika-arch-second-review session-continuity contract).
             echo "iterate_groom_loop: invoking mika-arch second-pass on revised plan" >&2
-            local resp2_iter; resp2_iter=$(_arch_ask "mika-arch-second-review" "$plan_path" "$session_id" 2>/dev/null) || {
-                _groom_warn "second-pass _arch_ask failed (after revise)"
+            local resp2_iter; resp2_iter=$(_arch_ask_with_retry "mika-arch-second-review" "$plan_path" "$session_id") || {
+                _groom_warn "second-pass _arch_ask failed (after revise)$(_arch_ask_error_suffix)"
                 return 1
             }
             local content2_iter; content2_iter=$(printf '%s' "$resp2_iter" | jq -r '.content // empty' 2>/dev/null)

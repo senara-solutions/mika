@@ -222,8 +222,20 @@ Twelve sequential post-conditions on assistant text responses, plus one early-ac
 
 **Predicate signature takes the deployment** (`detect_false_local_hosting_claim(text, deployment)`) rather than leaving it to a caller-side `if`, so "a declared local install may say it runs locally" is a property of the pure function and carries its own test. Single retry via `intent_guard_retries`; **not** skipped by `skip_remaining_guards` (#1178) — a successful PR review grants no licence to make a false privacy claim, the same literal reason as 5c. Applies uniformly across modes; a heartbeat that asserts local hosting is exactly as false, and the compacted history hands it to the next conversational turn. **Second violation in the same turn:** the budget is spent, the EndTurn is accepted, and a distinct `guard.false_local_hosting_claim_uncorrected` WARN is emitted — the gesture 4b already makes for the milestone-close guard, so the residual population stays countable instead of merging with healthy turns. Regression scenarios: `tests/eval/doctrine_regressions/false_local_hosting_claim_caught.rs` (the measured turn, the prescribed remedy as negative control, the declared-local exemption, the retry-exhaustion boundary).
 
+5e. **Unactioned frequency-promise guard (mika#2358):** Refuses assistant text that promises to change how often the agent sends its own **unprompted** messages — or to suspend them — while the turn called no `set_config` on `proactive_daily_budget` / `proactive_pause_until`. Position 5e, immediately after 5d, whose shape, `intent_guard_retries` budget and `guard.*` telemetry it reuses. Same family, one step further along: 5c and 5d refuse a false statement **about the world**, this one refuses a **commitment about the future** the turn did nothing to bring about.
+
+**Founding incident, 2026-09-17, Al's cloud tenant.** Asked why he had received three technical digests when he had asked for one, Mika answered « Je vais corriger ça concrètement : plus aucun message de veille technique aujourd'hui. Et demain, un seul — pas deux, pas trois. » and called nothing. **She had nothing to call**: the only gesture reachable from a conversation was cancelling the `heartbeat` row, which expresses "none" and never "one", and which `revert_config_cancel_recurring_task` undoes at the next restart (mika#2271). mika#2358's U1 gives the promise an actor; this guard is what makes the turn reach for it. The prompt half is deliberately absent — the framing of the heartbeat turn is untouched, per `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`.
+
+**Three terms, and the actor is checked FIRST.** (C) no `set_config` on either key among `all_tool_summaries`; (A) a frequency / suspension subject about unprompted messages; (B) a performative assertion. Checking (C) first is free, and it makes *"having called the tool is enough"* a property of the pure function rather than a branch of the loop — the same reasoning that put `deployment` in 5d's signature. A and B must share a sentence within `CLAIM_GAP_MAX` characters, in **either order**: French pronominalises the object it has just named, so « la fréquence de mes veilles, je **la** réduis » is the normal way to write the subject-first form, and the assertion alternation carries an optional clitic group for exactly that.
+
+**Layer B carries its own grammatical subject** (borrowed from 5d, same reason): the vocabulary of the promise overlaps the vocabulary of the true sentence we want Mika to be able to say. « je ne peux pas régler ça moi-même » also speaks of settings and frequency and is structurally unmatched rather than specially excused — and admissions of incapacity additionally suppress at sentence scope. **That honest exit is written into the correction text as its second branch**, because a correction that only pushed towards the tool would make the model call it to be rid of the guard; the text says so in as many words ("do not call the tool merely to satisfy this message"). Layer A's `veille` requires its qualifier (`veille technique`): the bare noun is the ordinary French word for "the day before", and a guard that fired on « je vais corriger ça la veille de ton départ » would be refusing a sentence about a calendar.
+
+**What term (C) accepts, and what it costs.** An **attempted** `set_config` satisfies it, success or failure — the `callback_terminal_action` convention. Named consequence: a promise resting on a call the tool rejected passes this guard. That belongs to the assert-grounded family (mika#1331), and widening the predicate to cover it would also re-prompt every agent that tried honestly and reported the failure.
+
+Single retry via `intent_guard_retries`; **not** skipped by `skip_remaining_guards` (#1178) — a posted PR review changes no setting, the same literal reason as 5c/5d/6f. Applies uniformly across modes (a promise made inside a heartbeat turn is exactly as empty, and compaction carries it into the next one). Second violation in the same turn: budget spent, EndTurn accepted, `guard.unactioned_frequency_promise_uncorrected` WARN emitted — **expected regime zero**, and without it that residue would be indistinguishable from a healthy turn. Predicate units in `evidence::guards::tests::mika2358_*` (including the control that separates "reads the calls" from "reads a word": the same text passes once `set_config` is in the summaries); production-path coverage in `tests/eval/test_unactioned_frequency_promise_2358.rs` (measured turn, honest-admission negative control, factual-description negative control, retry-budget boundary). Config keys, the four-producer perimeter, operator greps and the post-deploy probe: root `CLAUDE.md` § *Une consigne de fréquence a un site d'inscription*.
+
 6. **Intent-precondition registry (#702):** Registry-driven guard that generalizes the webhook zero-tools guard (#696). `INTENT_GUARDS` is a const array of `IntentPrecondition` entries, each with a trigger function, satisfaction check, and correction message. Retry tracking uses `HashSet<&'static str>` keyed by label (one retry per entry). Current entries: (a) `webhook_ready_label_dispatch` (#846, #907, #1089) — if user message matches the `[GitHub] Issue labeled ready on` marker, requires `run_claude_pilot` attempt (dispatch via dev-pilot, or auto-groom via dev-groom). Post-#1089: the `send_message` grooming-rejection path was removed — all legitimate paths call `run_claude_pilot`; (b) `webhook_no_unauthorized_dispatch` (#910) — if user message starts with `[GitHub]` but does NOT match the ready-label marker, rejects when `run_claude_pilot` was successfully called (only successful calls — failed attempts are already blocked by the dispatch-readiness guard in `executor.rs`). Engine-level fix for recurring unauthorized dispatch from comment events (#798, #838, #910) where prompt-level source-check rules drifted under load. Post-#933: this post-hoc EndTurn guard is **defense-in-depth** — the primary prevention is the pre-hoc tool-boundary gate in `validate_dispatch_readiness()` check (0) which rejects `run_claude_pilot` before the subprocess spawns. Post-#1102: the trigger predicate now delegates to `is_unauthorized_webhook_dispatch()` from `crate::webhook_dispatch` — the same positive-allowlist predicate used by the tool-boundary guard. PR review and check-suite events (qa/ci skill territory) no longer trip the guard. Shared predicates live in `crate::webhook_dispatch` module; (c) `webhook_zero_tools` — if user message starts with `[GitHub]` and zero successful tool calls, rejects once (unchanged #696 behavior); (d) `resume_reconcile` — if user message contains resume/continue verb + milestone/project reference and no successful `check_task` or `list_tasks` call was made, rejects once; (e) `callback_terminal_action` (#870) — if user message starts with `[callback:` (Silent mode callback trigger), requires BOTH `update_task_status` AND `send_message` before EndTurn. AND-shape: both tools must be attempted (success or failure). Also has an inline mirror guard in the empty-text exit path for Silent mode, where the INTENT_GUARDS registry is not evaluated (the registry only fires in the non-empty text branch). `CALLBACK_TERMINAL_ACTION_LABEL` and `CALLBACK_TERMINAL_ACTION_CORRECTION` shared consts keep both sites in sync. **Two carve-outs, both read by both sites because they share the `callback_trigger_active` predicate:** `[callback:deferred-dispatch]` (mika#1011, own contract) and `[callback: long_running:build_mika]` (mika#2355 — a build callback owns no self_dev parent to mark terminal; the #870 audit's "only one callback flow exists" was false, `build_mika` was a second one, and imposing this contract on it let three mika-qa turns answer "Build succeeded" via `send_message` with no PR verdict on 2026-09-17). `build_callback_trigger_context` is the framing half of the same carve-out: it prescribes the self_dev terminal contract to every callback except a build callback, which is told its own (a posted `run_gh pr review`). The discriminant — label, message marker, satisfaction predicate, correction — lives in `crate::qa_build_callback` and nowhere else.
-6a. **QA build-callback verdict guard (mika#2355):** Inline guard (not in `INTENT_GUARDS`), label `qa_build_callback_verdict`. Trigger is **conjunctive** — the user message starts with `[callback: long_running:build_mika]` AND `qa-review` is among the turn's injected skills (`loaded_skill_names`, a `run_loop` parameter threaded from all three call sites; in silent mode that is `callback_safe_skills()`, exactly where mika#2355 B1 made `qa-review-build-callback` reachable). Satisfied by a **successful** `run_gh` call whose input carries `"pr"` and `"review"` (`qa_build_callback::pr_review_posted_in_turn`, the same predicate as early-accept 3b). Single retry via `intent_guard_retries`, correction `QA_VERDICT_REQUIRED_CORRECTION` naming `run_gh pr review` and the `VERDICT:` line. Inline because the registry's `fn(&str) -> bool` sees the message alone, and the label does not distinguish mika-qa from mika-dev — mika-dev carries `build-mika` in its allowlist and launches builds that owe nobody a verdict; armed on the label alone this guard would trade the QA loop-breaker for a dev one (AC4b). Has an empty-text mirror in the Silent exit path like 6(e)/6b, because a bare EndTurn is the shape a turn with nothing to say takes. Coupled with the 6(e) carve-out above: the one removes the wrong contract from the build flow, the other supplies the right one. Production-path coverage: `tests/eval/test_qa_build_callback_verdict_2355.rs` drives `run_silent_agent` through both exit sites. What this guard does **not** do: post anything itself — a second EndTurn without a review is accepted (single-retry contract); the engine-side `hold[review]` net that would cover that case (plan mika#2355 § B3, AC5–AC7, a generalisation of `server::deadline_verdict`) is mika#2368.
+6a. **QA build-callback verdict guard (mika#2355):** Inline guard (not in `INTENT_GUARDS`), label `qa_build_callback_verdict`. Trigger is **conjunctive** — the user message starts with `[callback: long_running:build_mika]` AND `qa-review` is among the turn's injected skills (`loaded_skill_names`, a `run_loop` parameter threaded from all three call sites; in silent mode that is `callback_safe_skills()`, exactly where mika#2355 B1 made `qa-review-build-callback` reachable). Satisfied by a **successful** `run_gh` call whose input carries `"pr"` and `"review"` (`qa_build_callback::pr_review_posted_in_turn`, the same predicate as early-accept 3b). Single retry via `intent_guard_retries`, correction `QA_VERDICT_REQUIRED_CORRECTION` naming `run_gh pr review` and the `VERDICT:` line. Inline because the registry's `fn(&str) -> bool` sees the message alone, and the label does not distinguish mika-qa from mika-dev — mika-dev carries `build-mika` in its allowlist and launches builds that owe nobody a verdict; armed on the label alone this guard would trade the QA loop-breaker for a dev one (AC4b). Has an empty-text mirror in the Silent exit path like 6(e)/6b, because a bare EndTurn is the shape a turn with nothing to say takes. Coupled with the 6(e) carve-out above: the one removes the wrong contract from the build flow, the other supplies the right one. Production-path coverage: `tests/eval/test_qa_build_callback_verdict_2355.rs` drives `run_silent_agent` through both exit sites. What this guard does **not** do: post anything itself — a second EndTurn without a review is accepted (single-retry contract). What it now does on that path is **say so**: the turn raises `SilentTurnOutcome.qa_verdict_unmet`, and the engine-side `hold[review]` net reads it in the dispatcher (mika#2368 — see § *Verdict Net*, "The second reason"). The guard's one-shot budget is unchanged; the net succeeds it rather than extending it.
 6b. **Callback milestone advance guard (#991):** Inline guard (not in `INTENT_GUARDS` const array) that enforces queue advancement on milestone/project-context callback turns. Triggers on `[callback:` + `[milestone-parent: <id>]` markers in the user message (the marker is injected by `run_silent_agent` after a DB lookup of the parent task type). Satisfied by EITHER Path A: `run_claude_pilot` call (advance to next child), OR Path B: `update_task_status` targeting the parent task ID with status `blocked`/`completed` (halt or finish). Inline because the satisfied predicate needs the parent_task_id from the user message. Composes with `callback_terminal_action` (entry e) — a milestone-context callback must satisfy BOTH guards. Also has an empty-text exit mirror guard. Companion `SilentTrigger::PostCallbackAdvance` fires a second advance turn if the first callback turn did not advance; auto-blocks the milestone if the second turn also fails. **Webhook companion guard (#1218, paired with #991):** Sibling inline guard for `pull_request.closed(merged:true)` webhook turns. Triggers on the `[milestone-parent: <id>]` marker prepended by `server::milestone_context_handler` when the PR-closed event correlates to a task with a `milestone`/`project` parent. Satisfaction has three valid paths: Path A (`run_claude_pilot` or `run_claude_pilot_groom` — advance), Path B (`update_task_status` on parent with `blocked`/`completed` — halt), Path C (`deploy_mika` + `send_message` — deploy-hook ack per self-dev-webhook-qa step 5.5.b). Mutually exclusive triggers with #991: the callback prefix `[callback:` and the webhook prefix `[GitHub] PR closed:` cannot both appear on a single user message. The marker parser `extract_milestone_parent_id` and the constant `MILESTONE_PARENT_MARKER` are shared with #991.
 6c. **Asserted-unavailability guard (#862, #894):** Inline guard (not in `INTENT_GUARDS` const array) that detects when assistant text claims a tool is unavailable ("X is not callable", "X not callable", "I don't have access to X", "X is skill-scoped", "X skill-scoped", "cannot call X", "X is structurally not callable") while X is in the agent's turn-start enabled-tool set and no call to X was attempted in the turn. Five regex patterns with named `(?P<tool>...)` capture groups, normalized to lowercase for case-insensitive registry lookup. P2 and P4 use optional copula `(?:is )?` to catch elided-copula forms; P2 and P3 use optional adverb `(?:\w+ly )?` to catch adverb-interposed forms (e.g., "structurally", "currently"). Two-layer false-positive filter: snake-case capture constraint + enabled-set lookup. Inline rather than in the registry because it checks *assistant* text (not user input) and needs the `enabled_tool_names` snapshot + dynamic `format!` correction message. Uses `intent_guard_retries` with label `"asserted_unavailability"` for single-retry semantics. Not skipped by `skip_remaining_guards` (#1178) — a successful PR review does not grant license to fabricate tool unavailability claims. `enabled_tool_names: HashSet<String>` is a turn-start snapshot of the LLM tool array (after identity denylist + skill overrides + MCP), threaded to `run_loop` from all three call sites (conversation, silent, team). Structural counterpart to Rule 2 of `docs/solutions/best-practices/required-tools-gate-evasion-patterns-2026-04-28.md`.
 6d. **Assert-grounded guard (#1331):** Inline guard that detects affirmative state claims about referenced resources (issue/PR/task #N) without a grounding tool call (`run_gh`, `check_task`, `gh_read`) in the turn. Four regex patterns detect claim shapes (first-person verification claims, passive state assertions, handler/callback completion claims). Two-layer false-positive filter: narrow claim-verb + resource-type noun pairs, plus resource-ref extraction requirement (no ref → no fire). Satisfaction predicate checks `all_tool_summaries` for any attempt (success or failure) to a grounding tool with matching resource reference. Single retry via `intent_guard_retries` with label `"assert_grounded"`. Mirror of `asserted_unavailability` (negative → affirmative claims). Not skipped by `skip_remaining_guards` (#1178) — a successful PR review does not ground affirmative claims about unrelated resources.
@@ -333,6 +345,49 @@ canonical_id = "00000000-0000-0000-0000-000000000000"  # optional
 **Compaction interaction:** compaction already keys on `agent_id`, not `session_id`, so a singleton agent is unaffected — the single canonical session simply accumulates all history. The silent/callback/heartbeat paths use their own derived namespaces (`callback-*`, `heartbeat-*`) and are untouched.
 
 **Concurrency:** the singleton merges all channels into one thread. For a single-surface, zero-skill oracle (mika-prime's profile) this is the designed intent, not a defect. High-concurrency multi-surface agents should not opt in.
+
+### Session contract of the architect passes (mika#2305)
+
+**The contract already in force, on both halves.** *New by default:* `mika ask`
+without `--session-id` falls back to the canonical session only when the agent is
+singleton, and `resolve_canonical_session_id` returns `None` for a non-singleton
+one. mika-arch declares **no** `[session]` block — `grep -c singleton
+crates/mika-agent/src/well_known_agents.rs` returns `0` — so it mints a fresh
+UUID per ask. *Continued on explicit request:* `_arch_ask`
+(`skills/bundled/_shared/dispatch-lib.sh`) takes an **optional** `session_id` in
+`$3` and passes `--session-id` only when it is non-empty.
+
+**The three usages in `_iterate_groom_loop`, all deliberate:**
+
+| call | `session_id`? | why |
+|---|---|---|
+| 1st pass `mika-arch-groom-ticket` | **no** | fresh session |
+| UNPARSED retry | **yes** | the architect must see **its own prior turn** — the retry does not re-ask for the review, it asks the architect to *complete* its answer with the missing `Disposition:` line. Without the session the request is unintelligible: the carry-over is the mechanism's **condition of correctness**, not its contamination |
+| 2nd pass `mika-arch-second-review` (both branches) | **yes** | continuing the session so findings stay in conversation memory, per that skill's session-continuity contract |
+
+The session id is even written into the body-callout published on the ticket
+(`_write_canonical_callout`).
+
+**The leak mika#2305 suspected was real, and on the other axis.** It did not live
+in `--session-id`; it lived in `HistoryScope::Agent`, the **default** of the
+conversation window, where `rebuild_context(None, …, 20)` draws the agent's last
+20 messages **across all sessions** — for an architect, twenty whole plans and
+reviews. Closed by mika#2295 (the setting) + mika#2330 (putting it in force).
+What mika#2305 adds is the means to *see* it: `context_window_assembled` now
+carries `history_scope` next to `distinct_sessions`, because that count alone has
+two causes of opposite sign (scope fell back to `agent`, or one session iterated
+legitimately). Reading table and post-deploy probe: root `CLAUDE.md`
+§ *Portage de contexte entre passes architecte*.
+
+**Not bounded by `scope`, and deliberately left intact:** the agent-scoped memory
+(`update_core_memory`, `store_fact`, `update_fact`, `search_memory`), which
+crosses every session by design and is pinned as constitutive of being an agent
+(`test_mika_arch_disabled_tools_excludes_agent_self_state`). Naming it is what
+closes the ticket's question; pretending it does not exist would not.
+
+**Guards:** `test-dispatch-lib.sh` pins the table above. If those assertions
+redden, someone "fixed" the intra-invocation carry-over believing they were
+closing mika#2305 — restore, and read the retry row.
 
 ## Tools
 
@@ -453,11 +508,26 @@ even though 30 is the manifest default (mika#2276 AC5).
 ~4291, team ~4956) and all three build and thread the map. Compound entry:
 `docs/solutions/best-practices/un-budget-declare-par-un-manifeste-doit-etre-celui-applique-2026-09-10.md`.
 
-### Deadline Verdict Net (mika#2276 M2)
+### Verdict Net (mika#2276 M2, generalised by mika#2368)
 
-`server::deadline_verdict` — when a turn is **cut off by its envelope** rather than
-concluding, and it was processing a PR event, the engine itself posts
-`VERDICT: hold[review]` on that PR.
+`server::deadline_verdict` — when a turn **owed a verdict on a PR and did not post
+one**, the engine itself posts `VERDICT: hold[review]` on that PR.
+
+**Two reasons since mika#2368, and the question the module answers changed with
+them.** It is no longer *"was the turn cut off?"* but *"did this turn owe a verdict
+and fail to post one?"* — `VerdictReason::CutOffByDeadline` (mika#2276: the turn
+never reached its conclusion) and `VerdictReason::CallbackConcludedWithoutVerdict`
+(mika#2368: a QA build callback **concluded**, cleanly, posting nothing). The
+reason decides the **body**, the **log line** and the **event name**; it decides
+nothing else — target resolution, the anti-double-post registry, the 422
+classification and the never-return-an-error discipline are shared.
+
+The entry guard that used to read `overrun == None → NotApplicable("turn_completed")`
+is gone, and its removal is the shape of the generalisation rather than a
+relaxation: "the turn concluded" now describes *exactly* the second reason's
+population, so it could not stay a refusal. It moved down into
+`deadline_verdict_target`, the webhook call-site's entry decision, where it still
+costs nothing on the nominal path (no token resolution, no log, no parse).
 
 **The signal.** `AgentOutput.deadline_exceeded: Option<DeadlineOverrun>` (carrying
 `steps_completed`) is stamped in `persist_deadline_fallback` — the one function all
@@ -494,14 +564,104 @@ again.
 **Boundaries.** The POST is injected (`poster` closure) so the contract AC2 asks for
 — *a verdict IS posted* — is assertable without touching GitHub; production wires
 `run_gh_subprocess` with a PAT-first token (`Settings::resolve_github_token`, ADR-008
-— posting a review is an operation whose author GitHub reads). The net never returns
-an error: a net that fails the webhook would replace a silence with an outage. It
-does not replace the conversational fallback, which still goes out on the reply
-channel. **Operator grep signal:** `qa_deadline_verdict` in `$MIKA_SPIRIT_LOG_FILE`,
-with an `outcome` field in
-`{posted, already_reviewed, already_posted_upstream, post_failed, no_token, no_registry}`.
-Steady state after M1 is zero lines; sustained `posted` means review turns are still
-running out of budget and the cause is upstream, not here.
+— posting a review is an operation whose author GitHub reads). Both call-sites use
+that same canonical resolver, and deliberately **not** `resolve_periodic_scan_token`,
+whose own doc-comment excludes in as many words the paths that require the machine
+identity (PR review / merge). The net never returns an error: a net that fails the
+webhook would replace a silence with an outage. It does not replace the
+conversational fallback, which still goes out on the reply channel.
+
+#### The second reason: a QA build callback that concluded mute (mika#2368)
+
+**What it closes, written in the test mika#2355 itself left behind.**
+`the_verdict_guard_fires_once_and_does_not_loop` says it verbatim: after the single
+re-prompt, a second EndTurn with no review is **accepted** and `run_gh` was never
+called — *"nothing was posted — the net's job"*. That is not a defect of the
+`qa_build_callback_verdict` guard, it is its contract: every `intent_guard_retries`
+guard has a one-shot budget, deliberately, because a guard that re-prompts for ever
+turns a silence into a loop. Budget spent, what remains is an injunction the model
+ignored twice and a mute PR — the exact shape
+`feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate` predicts.
+
+**The signal travels up; it is not re-derived.** `run_loop` takes an out-param
+(`qa_verdict_unmet: Option<&AtomicBool>`) posed on **both** EndTurn exit paths —
+non-empty text and the empty-text mirror — under
+`qa_build_callback::verdict_unmet_after_retry`, the exact complement of the guard
+(same conjunction, budget term inverted). `run_silent_agent` returns it as
+`SilentTurnOutcome`; `task_engine::dispatcher::post_callback_verdict_net` reads it
+after a callback turn returns `Ok`, **before** the session's registry entry is
+evicted. Not a `LoopResult` variant: that enum's exhaustiveness is a contract
+forcing three external handlers to treat every *termination mode*, and "concluded
+without posting" is not one — a turn can be `Done` **and** mute.
+
+**Two exit sites, not one, and the second is the likelier.** The empty-text mirror's
+own comment says why: *"a bare EndTurn is exactly the shape a turn that has nothing
+to say takes, and it is the one the registry never sees."* A signal posed only on
+the non-empty path would leave the net blind on the more probable half of its
+population — and nothing would say so, because a blind net is silent, exactly like a
+net with nothing to do. Hence one positive control **per site**
+(`tests/eval/test_qa_callback_verdict_net_2368.rs`, T10a/T10b), verified red when
+either site alone is unwired.
+
+**The PR target is said, never derived.** `skills::executor::execute_long_running`
+resolves it at spawn from `LongRunningContext.originating_message` through
+`deadline_verdict::parse_pr_target` — the single reader of that grammar — and stamps
+it on the callback row under `QA_REVIEW_PR_TARGET_KEY`, the same trajectory as
+`metadata.dispatch_worktree_file` (mika#2249) and `metadata.pilot_transcript_expected`
+(mika#2040). What is condemned is the **late** derivation: the one that would happen
+at net time, when the failure is no longer recoverable and logs nowhere. Here the
+resolution happens at spawn, its failure is logged on the spot
+(`qa_review_pr_target_unresolved`), and **the net parses nothing** — it reads a
+stamp. Fail-safe: no stamp, unreadable metadata, missing key, unparsable target →
+zero POST and a line naming the abstention (`no_metadata`, `metadata_unreadable`,
+`no_target_stamp`, `target_unreadable`). Four separate negative controls, because a
+conjunction of fail-safe terms is not proven by neutralising all of them at once —
+the mika#2277 lesson.
+
+**The registry now reaches the silent path (AC7).** `agent_loop` posed
+`pr_reviews_posted: None` with the comment *"Silent mode: no session-scoped dedup
+needed"* while `skills::builtin_handlers` carried
+`debug_assert!(ctx.pr_reviews_posted.is_some(), "…must be threaded for production pr
+review calls")`. A QA callback that posts its review **is** a production pr review
+call: the two statements had contradicted each other since the build callback became
+a flow that posts reviews. AC7 corrects an inconsistency the source already
+declared. The callback's session is fresh, so the registry carries exactly what that
+turn posted.
+
+**`hold[review]` and nothing else — a safety constraint, not a registry choice.**
+`verdict_handler` routes `pass` to a **merge**. A net posting `pass` because the
+build went green would merge a PR **no diff was ever reviewed on** — strictly worse
+than the silence it replaces. Asserted on `DEADLINE_VERDICT_LINE` *and* by feeding
+the produced body to `server::verdict::parse_verdict`: the constant alone does not
+prove what the state machine will read.
+
+**Kill-switch:** `MIKA_QA_CALLBACK_VERDICT_NET` (default armed; `0` disarms with no
+redeploy). Not caution on principle — mika#2355's probe 2c prescribes *"disarm the
+net before any diagnosis"* if a PR is ever merged unreviewed, and that prescription
+is only executable if the lever exists. An unrecognised value is **said** and leaves
+it armed: a disarm by typo on a safety net would be the silent failure this whole
+ticket closes.
+
+**Operator grep signals — two names, and that is what saves the probes.**
+`qa_deadline_verdict` (reason `CutOffByDeadline`) and `qa_callback_verdict` (reason
+`CallbackConcludedWithoutVerdict`), each **SOLE WRITER** of its own name in the log
+and in `audit_events`, pinned by a source scan
+(`mika2368_each_event_name_has_exactly_one_writer_in_production`) — a behavioural
+test cannot see that class, since a second writer would make no decision wrong, only
+the two populations inseparable. mika#2355's negative-control probe is literally
+`grep qa_deadline_verdict … | jq 'select(.outcome == "posted")'` — *the mika#2276 net
+must not start firing*; a shared name would merge two populations and make a `posted`
+of the new reason read as a regression of the old. Same principle as
+`phantom_aged_out` / `phantom_sweep_spared` (mika#2156) and `auto_pull_no_token` /
+`wip_rescue_no_token` (mika#2205). Both carry an `outcome` field in
+`{posted, already_reviewed, already_posted_upstream, post_failed, no_token, no_registry}`,
+plus, for the callback reason, `disarmed` and the four abstention motives above.
+Steady state for `qa_deadline_verdict` after M1 is zero lines. For
+`qa_callback_verdict`, **near zero is the contract**: a net carrying nominal traffic
+has replaced a silence with a systematic `hold[review]`, which means mika#2355's
+B1/B2/guard did not take — and *that* is where to look, not in the net's tuning.
+*This is a net, not a path*; if it carries the nominal traffic it has also erased the
+signal that would show it.
 
 ### Structural Verdict Handler
 
@@ -1767,6 +1927,58 @@ between mika and cm): `mika-platform/docs/operator/token-rotation-procedure.md`.
 
 All SQLite timestamp columns use ISO 8601 TEXT format (`%Y-%m-%dT%H:%M:%SZ`). The `crate::timestamp` module provides centralized helpers: `now()`, `format()`, `parse()`, `now_plus()`, `now_minus()`. Fixed-width UTC format ensures correct lexicographic ordering.
 
+## DB Module Layout (mika#2321)
+
+`crate::db` is a file module (`db.rs`) with a sibling directory (`db/`) — the
+Rust 2018 layout, so **no `db/mod.rs` exists and none is needed**. Where a piece
+of the DB layer lives is decided by one rule, not by taste:
+
+| path | holds | why there |
+|---|---|---|
+| `db.rs` | types, `open`/`open_in_memory`, the ~30 thematic `impl Database` sections, free functions | the region that *churns* — methods get rewritten, replaced, deleted |
+| `db/migrations.rs` | `migrate` + every `migrate_vN_to_vM`, and their tests | **append-only**: a migration is never deleted (v1…v54, for ever) |
+| `db/tests/` | the `#[cfg(test)]` module, split by theme | **append-only**: a test is rarely deleted |
+| `db/kg_schema.rs`, `db/operational.rs` | their own `impl Database` blocks | pre-existing, same idiom |
+
+**The two split-out regions are the two whose size is monotone.** That is the
+whole criterion (plan mika#2321 E1): `db.rs` had crossed the 1 MB cap
+`scripts/check-secrets.sh` enforces, and was exempted by name in
+`LARGE_FILE_ALLOWLIST` — an exemption that was not static but **unbounded**, and
+under which the file took ~64 KB in three days without a signal. The allowlist is
+now empty and the CI gate bounds the growth on its own.
+
+**Callers did not move, and cannot need to.** A method stays `Database::foo`
+whatever file carries its `impl`, so `async_db.rs` and the ~30 modules doing
+`use crate::db::…` are untouched. `crate::db::tests::*` — a real inter-module
+contract, imported by `skills::executor` — survives byte for byte.
+
+**Two visibility rules govern any future move**, and they are what kept this
+refactor at *one* signature change in total (`migrate` → `pub(super)`):
+
+1. A child module sees its parent's private items; two siblings do not. So
+   `db::tests` and `db::migrations`, both children of `db`, still reach every
+   private item of `db` — but not each other's.
+2. Therefore **a test module travels with the code it tests**. The migration
+   tests live in `db/migrations.rs`, not in `db/tests/`, because they call ~31
+   private `migrate_vN_to_vM`; putting them with the other tests would have cost
+   ~31 widened signatures. The same rule pulled `migration_v38_to_v39_idempotent`
+   out of `db/operational.rs`.
+
+**A guard premise this invalidated, repo-wide.** Several structural guards
+isolate "production" by truncating each file at its first `#[cfg(test)]` literal.
+An extracted test module carries no such literal — the attribute stays on the
+parent's `mod tests;` declaration — so those guards scan the whole test file as
+production. The premise was already false for `db/tests/harnais_porte.rs`
+(mika#2310) and `perimeter/tests.rs`, and merely benign. Three guards now consult
+[`crate::source_scan::is_test_source_path`] (segment `/tests/` **or** filename
+`tests.rs`, the predicate `perimeter/rules.rs` already tests) — `db` (mika#2335
+F2a), `agent_loop` (mika#2305) and `auto_pull` (mika#2361). **If a fourth reddens
+after moving test code: repair the classification, never widen the needle and
+never add a file allowlist** — each of those guards refuses that in as many
+words, and each carries a negative control proving it still catches a real
+production site. Remaining `src/**/*.rs` scanners use other exclusion mechanisms
+and have not been audited against this premise (follow-up).
+
 ## Schema Version
 
 **Current: v53.** Tables: sessions, messages (with `internal` flag for agent-to-agent visibility), team_workspace, audit_events, skill_overrides (with `enabled` column for DB-backed disable state), tasks (with manual/callback/a2a trigger types and a `type` column distinguishing `issue`/`milestone`/`project`), a2a_task_map, a2a_artifacts, a2a_push_notification_configs, llm_calls (with `response_text` and `reasoning` columns for LLM output persistence, and the two size columns `system_prompt_bytes` / `request_bytes`), tool_calls, team_runs (with `delegation_count` / `solo_absorption` / `failure_context` columns and `status` CHECK expanded to include `failed_no_delegation` — mika#1676 — and `failed_transport` — mika#1671), schema_meta (migration state tracking), kg_entities, kg_relationships, operational_items (#1262 — canonical operational-item ledger with 7 kind variants, 6 status variants, source-based dedup), permission_decisions (#1733 — provenance ledger for operator permission decisions with `classifier_verdict`/`operator_decision`/`override_used`/`decision_authority`/`tenant_id`/`agent_id` columns), pilot_transcripts (#1705 — claude-pilot LLM-call transcripts ingested from JSONL files), served_content (#1867 — per-(agent, person, category) content-serve ledger for proverb/quote/joke/poem/recommendation/story/fact dedup). **Shared-corpus KG tables (keyed by `docs_root_hash`):** kg_chunks, kg_subject_entities (with `discovered` and `discovery_reason` columns for roster-grounding #1158), kg_subject_relationships, kg_chunk_subjects, kg_chunk_subject_relationships, kg_extractions (first-writer-wins via INSERT OR IGNORE). **Per-agent KG tables:** kg_subject_resolutions, kg_resolutions_log (outcome CHECK includes `skipped_discovered_subject`), agent_kg_corpora (agent_id to docs_root_hash mapping for multi-corpus fan-out). `unified_timeline` VIEW for cross-subsystem queries. Session-based message storage with FK. System sessions (`system-{agent_id}`) for compaction.
@@ -1799,7 +2011,7 @@ Recent migrations:
 - v47->v48: **Behavioral marker only — no DDL** (mika#1712). Anchors the phantom NULL-PID sweep semantics added in `TaskEngine::sweep_null_pid_phantoms` (AC3 watchdog tick) and the equivalent startup step in `TaskEngine::startup_recovery` (AC5). Reserved for future DDL if write-time enforcement (mika#1934 cause-racine) ever lands.
 - v48->v49: Expand the `team_runs.status` CHECK constraint to include `'failed_transport'` (mika#1671 D3). Composes independently with mika#1676's v46→v47 `failed_no_delegation` addition — the two terminal states cover different failure classes (all-transport-failed short-circuit vs zero-delegation gate). Table rebuild because SQLite cannot alter a CHECK in place. Uses the **build-new-then-swap** shape (CREATE `team_runs_new` → INSERT SELECT → DROP `team_runs` → RENAME `team_runs_new` → `team_runs`), NOT the rename-to-backup shape used by KG-table rebuilds (v34→v35): `team_runs` is FK-referenced by `tasks.team_run_id`, and renaming the referenced table first makes SQLite (default `legacy_alter_table = OFF`) rewrite `tasks`'s FK target to the backup name. `foreign_keys` toggled OFF around the rebuild. The rebuilt table carries forward the v46→v47 columns (`delegation_count`, `solo_absorption`, `failure_context`) and both extended CHECK values. Backs the new `RunStatus::FailedTransport(String)` terminal variant — the all-delegations-transport-failed short-circuit that fails a team run fast instead of blocking to the full timeout.
 
-- v49->v50: Additive re-drive accounting on `auto_pull_stats` (mika#2020) — three columns: `redrive_count INTEGER NOT NULL DEFAULT 0`, `last_redrive_at TEXT`, `redrive_abandoned_at TEXT`. Three `ALTER TABLE ADD COLUMN` statements, no table rebuild (nothing FK-references `auto_pull_stats`). Backs the per-ticket re-drive budget that bounds the Phase 2 stuck-ready reconciler. The columns exist because `failure_count` cannot serve this purpose: it means "the `gh` call failed" and `reset_auto_pull_failure` runs on **every** successful rescue and promotion — precisely the event the budget must count. Merging the two would rebuild the mika#1901 defect (16 `ready` re-applications in 19 h, each one zeroing the only counter that existed). `redrive_abandoned_at` is what separates "the budget just ran out, the label is not posted yet" from "the budget ran out earlier and the operator has since removed `operator-review`" — the latter being the re-entry gesture.
+- v49->v50: Additive re-drive accounting on `auto_pull_stats` (mika#2020) — three columns: `redrive_count INTEGER NOT NULL DEFAULT 0`, `last_redrive_at TEXT`, `redrive_abandoned_at TEXT`. Three `ALTER TABLE ADD COLUMN` statements, no table rebuild (nothing FK-references `auto_pull_stats`). Backs the per-ticket re-drive budget that bounds the Phase 2 stuck-ready reconciler. The columns exist because `failure_count` cannot serve this purpose: it means "the `gh` call failed" and `reset_auto_pull_failure` runs on **every** successful rescue and promotion — precisely the event the budget must count. Merging the two would rebuild the mika#1901 defect (16 `ready` re-applications in 19 h, each one zeroing the only counter that existed). `redrive_abandoned_at` is what separates "the budget just ran out, the label is not posted yet" from "the budget ran out earlier and the operator has since removed the hold label" — the latter being the re-entry gesture. **mika#2361 added no column and no migration**; it gave that same column a second reader (`get_auto_pull_redrive_abandoned_at`, the *instant* rather than the boolean) to bound a per-abandonment comment, and it corrected the vocabulary above: the gesture is removing the **hold label** — `operator-review`, `blocked` or `operator-gated` — not `operator-review` specifically, and not re-applying `ready`, which lifts nothing. See root `CLAUDE.md` § *auto-pull stuck-ready reconciler* for the `operator_review_or_blocked` / `abandoned_operator_held` pair and its operator surfaces.
 - v50->v51: `tasks.dispatcher_source` + the `dispatch_slot_leases` table (mika#1948, Porte 2). The column is nullable and CHECK-pinned to `mika_dev`/`mika_manager`/`operator`; the table makes an assigned exec slot an observable fact, one row per `(agent_id, dispatch_class)`. (Entry backfilled in mika#2160 — the list skipped it.)
 - v51->v52: `dispatch_slot_leases` rebuilt with `slot_index INTEGER NOT NULL DEFAULT 0` joining the PRIMARY KEY (mika#2160). Table rebuild — SQLite cannot extend a PRIMARY KEY in place; existing rows land at `slot_index = 0`, so a database migrated mid-dispatch keeps its live lease and its holder. **Why it had to move:** `PRIMARY KEY (agent_id, dispatch_class)` was itself a hard cap of one, independent of any predicate — a class could not hold two live leases whatever the TTL or the guard decided. Without this, `MIKA_DISPATCH_MAX_CONCURRENT_IMPLEMENT=2` would be accepted, logged, and have no effect. At the default cap of 1 exactly one index is ever written and the behaviour is the pre-v52 behaviour, bit for bit.
 - v52->v53: `llm_calls.request_bytes INTEGER` (mika#2189). Additive nullable `ALTER TABLE` with a `column_exists` guard, the same shape as v37→v38's `system_prompt_bytes` and for the same family of reason. **What it closes:** mika#2189's AC1 asks for the expiry distribution "by brief size", but the **error** path writes `input_tokens = 0` and `output_tokens = 0` as literals — a failed call carried no size at all, so the request that timed out was unrecoverable after the fact. Written on **both** paths of `run_loop` and on all three arms of the continuation turn (success, provider error, deadline-clamp timeout); writing it on the success path only would reopen the hole on exactly the side that matters. An estimated `input_tokens` was rejected (Q2): the axis exists to *correlate* size with expiry, and a correlation built on an estimate cannot settle anything. The value comes from `LlmRequest::payload_bytes()`, which sums caller-supplied bytes (system prompt, message text, tool-call arguments, tool-result content, base64 image data, tool definitions) and deliberately **excludes** the provider-specific JSON envelope so the number stays comparable across rails — a lower bound on wire size, monotonic rather than exact. KG extraction and resolution write `None`: a batch NER call runs under no agent envelope, so the axis has nothing to correlate there. Non-retroactive — pre-v53 rows read NULL, which is why the column has no `DEFAULT 0` that would be indistinguishable from a genuinely empty request.

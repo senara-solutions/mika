@@ -272,8 +272,18 @@ const RESCUE_VERIFY_ENV: &[&str] = &[
     "MIKA_RESCUE_VERIFY_BUDGET_SECS",
 ];
 
-/// Decide which of [`RESCUE_VERIFY_ENV`] to set on the child, given a reader of
-/// the spirit process environment.
+/// The two operator settings `dispatch-lib.sh`'s architect-call retry honours
+/// (mika#2278): the kill-switch and the delay before the single retry.
+///
+/// Relayed for the same reason and by the same route as [`RESCUE_VERIFY_ENV`].
+/// Without this, `MIKA_ARCH_ASK_RETRY=0` would be a setting only its reader
+/// honours — mika#2165's definition of a decorative setting — and the plan's
+/// R7 ("disarmable without redeploying the binary") would be false in a way no
+/// test of the shell half could see.
+const ARCH_ASK_RETRY_ENV: &[&str] = &["MIKA_ARCH_ASK_RETRY", "MIKA_ARCH_ASK_RETRY_DELAY_SECS"];
+
+/// Decide which of `keys` to set on the child, given a reader of the spirit
+/// process environment.
 ///
 /// Extracted as a pure function for the same reason [`is_sandbox_env_allowed`]
 /// is: the shape is verifiable without spawning a subprocess or mutating
@@ -287,12 +297,11 @@ const RESCUE_VERIFY_ENV: &[&str] = &[
 /// default instead of silently inheriting one, which is what keeps "no setting"
 /// and "setting posed at the default value" two states an operator can tell
 /// apart.
-fn rescue_verify_env_pairs<F>(read: F) -> Vec<(&'static str, String)>
+fn relayed_env_pairs<F>(keys: &[&'static str], read: F) -> Vec<(&'static str, String)>
 where
     F: Fn(&str) -> Option<String>,
 {
-    RESCUE_VERIFY_ENV
-        .iter()
+    keys.iter()
         .filter_map(|key| {
             let value = read(key)?;
             if value.is_empty() {
@@ -320,7 +329,20 @@ where
 /// back to the shell's own defaults (armed, 900 s), which is the shipped
 /// behaviour — never a blocked dispatch.
 fn inject_rescue_verify_env(cmd: &mut tokio::process::Command) {
-    for (key, value) in rescue_verify_env_pairs(|k| std::env::var(k).ok()) {
+    for (key, value) in relayed_env_pairs(RESCUE_VERIFY_ENV, |k| std::env::var(k).ok()) {
+        cmd.env(key, value);
+    }
+}
+
+/// Relay the mika#2278 architect-retry settings to `dispatch-lib.sh`.
+///
+/// Same placement contract as [`inject_rescue_verify_env`] — it MUST run after
+/// [`sandboxed_pilot_env`], whose `env_clear()` would otherwise erase it — and
+/// the same best-effort discipline: a dispatch that does not carry the settings
+/// falls back to the shell's own defaults (armed, 30 s), never a blocked
+/// dispatch.
+fn inject_arch_ask_retry_env(cmd: &mut tokio::process::Command) {
+    for (key, value) in relayed_env_pairs(ARCH_ASK_RETRY_ENV, |k| std::env::var(k).ok()) {
         cmd.env(key, value);
     }
 }
@@ -2960,6 +2982,22 @@ fn extract_pr_url(metadata: &Option<String>) -> Option<String> {
 /// The inert reaper was born of a fixture that wrote a status production never
 /// writes on this row, so the fixture has to come through the production
 /// construction site or it is measuring itself.
+///
+/// `metadata` (mika#2368 C3) carries the row's initial metadata JSON — today,
+/// only the QA-review PR target stamped by `execute_long_running` on a build
+/// dispatch (`deadline_verdict::QA_REVIEW_PR_TARGET_KEY`). It is **a parameter
+/// on the single signature, never a second constructor**: the doc-comment above
+/// forbids drift between construction sites, and a `build_callback_task_with_*`
+/// sibling is exactly how that drift starts. Every other caller passes `None`,
+/// which is what the hard-coded `None` here used to mean.
+///
+/// The eighth parameter crosses clippy's arity threshold, and the `allow` is the
+/// honest answer rather than the lazy one: the two ways out of the lint are a
+/// second constructor — forbidden above, and forbidden for a measured reason —
+/// or a parameter struct, which would rewrite all seven call sites inside a
+/// ticket about a QA verdict net. The arity is a symptom of the callback
+/// contract's own width, not of this change.
+#[allow(clippy::too_many_arguments)]
 pub fn build_callback_task(
     agent_id: String,
     parent_task_id: Option<String>,
@@ -2968,6 +3006,7 @@ pub fn build_callback_task(
     timeout_secs: u64,
     session_id: &str,
     trace_id: &str,
+    metadata: Option<String>,
 ) -> NewTask {
     NewTask {
         agent_id,
@@ -3001,12 +3040,77 @@ pub fn build_callback_task(
         created_trace_id: Some(trace_id.to_string()),
         reference_url: None,
         source: None,
-        metadata: None,
+        metadata,
         r#type: None,
         dispatch_class: Some(
             derive_dispatch_class(input.get("skill").and_then(|v| v.as_str())).to_string(),
         ),
     }
+}
+
+/// Le `metadata` JSON initial d'une tâche callback de **build** — la PR que le
+/// filet mika#2368 pourra verdicter si ce dispatch conclut sans verdict.
+///
+/// Trois raisons de rendre `None`, et toutes les trois laissent le filet muet
+/// (AC6 : un signal qu'on ne peut pas lire n'est jamais un terme satisfait) :
+///
+/// 1. l'outil n'est pas `build_mika` — les cinq autres flux `long_running` ne
+///    doivent aucun verdict à personne, et un stamp posé là ferait entrer une
+///    population que le filet n'a pas à couvrir ;
+/// 2. `originating_message` est absent — c'est le cas d'un tour silencieux, qui
+///    n'a pas de message utilisateur frais (mika#933) ;
+/// 3. le texte n'est pas un événement PR lisible par `parse_pr_target`.
+///
+/// **La résolution passe par le lecteur unique de la grammaire**
+/// (`deadline_verdict::parse_pr_target`), jamais par une regex recopiée : une
+/// grammaire de fil dupliquée est ce qui a laissé deux lecteurs diverger dans
+/// mika#2158.
+///
+/// L'abstention est journalisée sur-le-champ, à l'instant où elle est encore
+/// rattachable à un dispatch — c'est toute la différence avec une dérivation
+/// faite plus tard par le filet, dont l'échec ne se journalise nulle part.
+fn resolve_qa_review_pr_target(
+    tool_name: &str,
+    originating_message: Option<&str>,
+    trace_id: &str,
+) -> Option<String> {
+    use crate::server::deadline_verdict::{QA_REVIEW_PR_TARGET_KEY, parse_pr_target};
+
+    if tool_name != crate::qa_build_callback::BUILD_MIKA_TOOL {
+        return None;
+    }
+
+    let Some(message) = originating_message else {
+        warn!(
+            event = "qa_review_pr_target_unresolved",
+            trace_id,
+            reason = "no_originating_message",
+            "mika#2368 : dispatch de build sans message d'origine — le filet ne \
+             pourra pas poser de verdict si ce callback revient muet"
+        );
+        return None;
+    };
+
+    let Some(target) = parse_pr_target(message) else {
+        warn!(
+            event = "qa_review_pr_target_unresolved",
+            trace_id,
+            reason = "not_a_pr_event",
+            "mika#2368 : le message d'origine de ce dispatch de build ne désigne \
+             aucune PR — le filet ne pourra pas poser de verdict si ce callback \
+             revient muet"
+        );
+        return None;
+    };
+
+    let value = target.to_metadata_value();
+    info!(
+        event = "qa_review_pr_target_stamped",
+        trace_id,
+        target = %value,
+        "mika#2368 : cible PR stampée sur la tâche callback de build"
+    );
+    Some(serde_json::json!({ QA_REVIEW_PR_TARGET_KEY: value }).to_string())
 }
 
 async fn execute_long_running(
@@ -3172,6 +3276,18 @@ async fn execute_long_running(
          validate_required_fields should have caught this"
     );
 
+    // mika#2368 C2 — la cible PR que le filet moteur pourra verdicter si ce
+    // dispatch revient sans verdict. Résolue ICI, au spawn, depuis le texte de
+    // l'événement d'origine, et stampée sur la row : le filet lira un stamp et
+    // ne parsera rien. Ce qui est condamné, c'est la dérivation tardive — celle
+    // qui se ferait au moment du filet, quand l'échec n'est plus rattrapable et
+    // ne se journalise nulle part.
+    let qa_review_pr_target = resolve_qa_review_pr_target(
+        &skill_tool.definition.name,
+        ctx.originating_message.as_deref(),
+        &ctx.trace_id,
+    );
+
     let task = build_callback_task(
         ctx.db.agent_id.clone(),
         parent_task_id,
@@ -3180,6 +3296,7 @@ async fn execute_long_running(
         timeout_secs,
         &ctx.session_id,
         &ctx.trace_id,
+        qa_review_pr_target,
     );
 
     let task_id = match ctx.db.create_task(task).await {
@@ -3282,6 +3399,9 @@ pub(crate) fn spawn_long_running_exec(
         // reads. Same placement rationale as the two lines above — injected
         // after the env sandbox so the vars survive its positive allowlist.
         inject_rescue_verify_env(&mut cmd);
+        // mika#2278: relay the architect-retry settings the grooming loop reads.
+        // Same placement rationale as the three lines above.
+        inject_arch_ask_retry_env(&mut cmd);
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -3458,6 +3578,131 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    // -----------------------------------------------------------------------
+    // mika#2368 C2 — la cible PR stampée au spawn
+    // -----------------------------------------------------------------------
+
+    /// Le texte qu'un webhook `review_requested` produit réellement — la forme
+    /// dont `originating_message` est peuplé sur le tour QA qui lance le build.
+    const REVIEW_REQUESTED: &str = "[GitHub] PR review_requested: senara-solutions/mika#2368 — fix(mika#2355) (branch: fix/2368)\nhttps://github.com/senara-solutions/mika/pull/2368\nRequested reviewer: @mika-platform-qa";
+
+    /// **T5** — l'écrivain et le lecteur du stamp sont épinglés **ensemble**.
+    ///
+    /// Le producteur (`resolve_qa_review_pr_target`, ici) et le consommateur
+    /// (`task_engine::dispatcher::read_qa_review_pr_target`, le filet) sont deux
+    /// moitiés d'une même grammaire de fil. Les tester séparément laisserait
+    /// chacun vert pendant qu'ils cessent de se parler — c'est la classe exacte
+    /// que mika#2158 a dû refermer.
+    ///
+    /// Le test reconstruit aussi la cible attendue par `parse_pr_target` sur un
+    /// texte d'événement réel : si `originating_message` était un jour peuplé
+    /// autrement, c'est ici que ça rougit, plutôt que dans un filet qui se
+    /// désarme en silence.
+    #[test]
+    fn mika2368_the_stamp_written_at_spawn_is_the_one_the_net_reads() {
+        let stamped = resolve_qa_review_pr_target(
+            crate::qa_build_callback::BUILD_MIKA_TOOL,
+            Some(REVIEW_REQUESTED),
+            "trace-2368",
+        )
+        .expect("un dispatch de build sur une PR doit produire un stamp");
+
+        let read = crate::task_engine::dispatcher::read_qa_review_pr_target(Some(&stamped))
+            .expect("le filet doit relire ce que le spawn a écrit");
+
+        let expected = crate::server::deadline_verdict::parse_pr_target(REVIEW_REQUESTED)
+            .expect("le lecteur unique de la grammaire doit voir cette PR");
+        assert_eq!(read, expected);
+        assert_eq!(read.repo, "senara-solutions/mika");
+        assert_eq!(read.pr_number, 2368);
+    }
+
+    /// **AC6, côté producteur** — trois raisons de ne rien stamper, chacune
+    /// séparément, et aucune ne produit une cible devinée.
+    #[test]
+    fn mika2368_a_non_build_dispatch_is_never_stamped() {
+        for tool in [
+            "run_claude_pilot",
+            "run_claude_pilot_groom",
+            "deploy_mika",
+            "address_pr_comments",
+            "resolve_pr_conflicts",
+        ] {
+            assert!(
+                resolve_qa_review_pr_target(tool, Some(REVIEW_REQUESTED), "trace").is_none(),
+                "{tool} ne doit aucun verdict — le stamper ferait entrer une \
+                 population que le filet n'a pas à couvrir"
+            );
+        }
+    }
+
+    #[test]
+    fn mika2368_a_build_without_an_originating_message_is_not_stamped() {
+        assert!(
+            resolve_qa_review_pr_target(crate::qa_build_callback::BUILD_MIKA_TOOL, None, "trace")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn mika2368_a_build_whose_message_names_no_pr_is_not_stamped() {
+        assert!(
+            resolve_qa_review_pr_target(
+                crate::qa_build_callback::BUILD_MIKA_TOOL,
+                Some("Salut, tu peux relancer le build ?"),
+                "trace",
+            )
+            .is_none()
+        );
+    }
+
+    /// Le stamp voyage par la **signature unique** de `build_callback_task`, et
+    /// atterrit sur `NewTask.metadata` — jamais par un second constructeur.
+    #[test]
+    fn mika2368_the_stamp_rides_on_the_single_callback_builder() {
+        let stamped = resolve_qa_review_pr_target(
+            crate::qa_build_callback::BUILD_MIKA_TOOL,
+            Some(REVIEW_REQUESTED),
+            "trace-2368",
+        );
+        let task = build_callback_task(
+            "mika-qa".to_string(),
+            Some("parent".to_string()),
+            crate::qa_build_callback::BUILD_MIKA_TOOL,
+            &serde_json::json!({"task_id": "parent"}),
+            600,
+            "session",
+            "trace-2368",
+            stamped,
+        );
+        assert_eq!(
+            task.label,
+            crate::qa_build_callback::BUILD_CALLBACK_LABEL,
+            "le label est ce que le discriminant de mika#2355 lit"
+        );
+        let read =
+            crate::task_engine::dispatcher::read_qa_review_pr_target(task.metadata.as_deref())
+                .expect("la row construite par la production doit porter la cible");
+        assert_eq!(read.pr_number, 2368);
+
+        // Et le contrôle négatif sur la même signature : les autres appelants
+        // passent `None`, et la row ne porte alors aucune cible.
+        let other = build_callback_task(
+            "mika-dev".to_string(),
+            Some("parent".to_string()),
+            "run_claude_pilot",
+            &serde_json::json!({"task_id": "parent"}),
+            600,
+            "session",
+            "trace",
+            None,
+        );
+        assert_eq!(
+            crate::task_engine::dispatcher::read_qa_review_pr_target(other.metadata.as_deref()),
+            Err("no_metadata")
+        );
+    }
+
     #[test]
     fn sandbox_env_allows_core_vars() {
         for key in [
@@ -3521,24 +3766,24 @@ mod tests {
     /// inheriting one, so "unset" and "set to the default" stay distinguishable.
     #[test]
     fn mika2354_rescue_verify_env_relays_only_present_non_empty_values() {
-        let absent = rescue_verify_env_pairs(|_| None);
+        let absent = relayed_env_pairs(RESCUE_VERIFY_ENV, |_| None);
         assert!(
             absent.is_empty(),
             "an unset setting must not be posed on the child, got {absent:?}"
         );
 
-        let empty = rescue_verify_env_pairs(|_| Some(String::new()));
+        let empty = relayed_env_pairs(RESCUE_VERIFY_ENV, |_| Some(String::new()));
         assert!(
             empty.is_empty(),
             "an empty setting must not be posed on the child, got {empty:?}"
         );
 
-        let one = rescue_verify_env_pairs(|k| {
+        let one = relayed_env_pairs(RESCUE_VERIFY_ENV, |k| {
             (k == "MIKA_RESCUE_VERIFY_ENABLED").then(|| "0".to_string())
         });
         assert_eq!(one, vec![("MIKA_RESCUE_VERIFY_ENABLED", "0".to_string())]);
 
-        let both = rescue_verify_env_pairs(|k| match k {
+        let both = relayed_env_pairs(RESCUE_VERIFY_ENV, |k| match k {
             "MIKA_RESCUE_VERIFY_ENABLED" => Some("1".to_string()),
             "MIKA_RESCUE_VERIFY_BUDGET_SECS" => Some("300".to_string()),
             _ => None,
@@ -3552,6 +3797,46 @@ mod tests {
         );
     }
 
+    /// mika#2278 R7: the retry's kill-switch must actually reach the shell that
+    /// reads it.
+    ///
+    /// `sandboxed_pilot_env` does `env_clear()` then re-adds a **positive**
+    /// allowlist, so nothing `MIKA_*` crosses by inheritance. Without the
+    /// explicit relay, `MIKA_ARCH_ASK_RETRY=0` set on the service would be read
+    /// by nobody and the budget would be undisarmable without a redeploy —
+    /// mika#2165's decorative setting, and a plan requirement silently false.
+    ///
+    /// The "present and non-empty only" rule matters here as much as for its
+    /// sibling: `MIKA_ARCH_ASK_RETRY_DELAY_SECS=""` is the shape a half-written
+    /// `.env` line takes, and relaying it would make the shell's three-tier
+    /// reader warn about a value the operator never set.
+    #[test]
+    fn mika2278_arch_ask_retry_env_relays_only_present_non_empty_values() {
+        assert!(relayed_env_pairs(ARCH_ASK_RETRY_ENV, |_| None).is_empty());
+        assert!(
+            relayed_env_pairs(ARCH_ASK_RETRY_ENV, |_| Some(String::new())).is_empty(),
+            "an empty setting must stay an absence on the child"
+        );
+
+        let disarmed = relayed_env_pairs(ARCH_ASK_RETRY_ENV, |k| {
+            (k == "MIKA_ARCH_ASK_RETRY").then(|| "0".to_string())
+        });
+        assert_eq!(disarmed, vec![("MIKA_ARCH_ASK_RETRY", "0".to_string())]);
+
+        let both = relayed_env_pairs(ARCH_ASK_RETRY_ENV, |k| match k {
+            "MIKA_ARCH_ASK_RETRY" => Some("1".to_string()),
+            "MIKA_ARCH_ASK_RETRY_DELAY_SECS" => Some("45".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            both,
+            vec![
+                ("MIKA_ARCH_ASK_RETRY", "1".to_string()),
+                ("MIKA_ARCH_ASK_RETRY_DELAY_SECS", "45".to_string()),
+            ]
+        );
+    }
+
     /// mika#2354 AC9(b): the positive allowlist stays the guard and the explicit
     /// injection stays the named exception. Adding either name to
     /// [`SANDBOX_ENV_CORE_ALLOWLIST`] — or covering it with a new entry in
@@ -3559,9 +3844,13 @@ mod tests {
     /// inheritance, which is the shape mika#2165 named a decorative setting:
     /// the channel would then differ from the one this ticket documented, and
     /// nothing would say so.
+    ///
+    /// mika#2278 joins [`ARCH_ASK_RETRY_ENV`] to the same population: it reaches
+    /// `dispatch-lib.sh` by the same named exception and must stay outside the
+    /// allowlist for the same reason.
     #[test]
     fn mika2354_rescue_verify_env_never_joins_the_sandbox_allowlist() {
-        for key in RESCUE_VERIFY_ENV {
+        for key in RESCUE_VERIFY_ENV.iter().chain(ARCH_ASK_RETRY_ENV.iter()) {
             assert!(
                 !is_sandbox_env_allowed(key),
                 "{key} must reach dispatch-lib by explicit injection, never by \
