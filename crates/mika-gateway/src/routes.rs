@@ -1069,6 +1069,57 @@ fn is_valid_bot_username(username: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
+/// The message `POST /admin/customers` returns when Telegram refuses the token.
+///
+/// **This literal is a wire format, not prose.** `classify_gateway_error` in
+/// mika-cloud (mika-cloud#205) still recognises the substring `invalid bot_token`
+/// to tell "this token is dead" from "the gateway hiccuped", and that rung stays in
+/// service until mika-cloud removes it — a date this repo does not hold. Rewording
+/// it drops the Console back into its "retry without retyping the token" branch,
+/// which is the very defect mika-cloud#205 repaired, **and no test in either repo
+/// would redden**. A change here is a cross-repo break to be dated, never a wording
+/// improvement. Two tests hold it, and they hold different halves:
+/// `mika2191_ac2_le_message_du_401_est_un_format_de_fil` asserts the string **in
+/// full** rather than against this constant (asserting the constant would prove
+/// nothing — whoever reworded it would move both sides at once), and
+/// `mika2191_le_litteral_na_quun_seul_site_de_production` keeps it to this one
+/// production site.
+const INVALID_BOT_TOKEN_MESSAGE: &str = "invalid bot_token: Telegram returned 401 Unauthorized";
+
+/// Error body for a `bot_token` validation failure on `POST /admin/customers`.
+///
+/// Always carries `error` (unchanged shape, AC2), plus `upstream_status` when the
+/// upstream actually refused — the closed field that replaces reading the sentence
+/// (mika#2191 AC1). Presence and value are decided by
+/// [`crate::telegram::upstream_status`], the single reader of that question; see its
+/// doc comment for why `Other { status: 200 }` and `BadRequest` carry none.
+///
+/// The gateway's own status stays 400 on every branch: the ticket scopes the change
+/// to the body, and moving the status would break every caller that sorts 4xx from
+/// 5xx for no gain.
+fn token_validation_error_body(err: &TelegramApiError) -> serde_json::Value {
+    let message = match err {
+        TelegramApiError::Unauthorized => INVALID_BOT_TOKEN_MESSAGE.to_string(),
+        other => format!("bot token validation failed: {other}"),
+    };
+    let mut body = serde_json::json!({ "error": message });
+    if let Some(status) = crate::telegram::upstream_status(err) {
+        body["upstream_status"] = serde_json::json!(status);
+    }
+    body
+}
+
+/// Error body for a `bot_username` that does not match what `getMe` returned.
+///
+/// Extracted from the handler so AC3 is asserted rather than deduced by reading it:
+/// this branch lives on the `Ok` arm — the upstream answered 200 and refused
+/// nothing — so it carries **no** `upstream_status`.
+fn bot_username_mismatch_body(provided: &str, actual: &str) -> serde_json::Value {
+    serde_json::json!({
+        "error": format!("bot_username mismatch: provided '{provided}' but Telegram returned '{actual}'")
+    })
+}
+
 /// POST /admin/customers — register or re-register a per-customer Telegram bot.
 ///
 /// Creates a `customers` row with `status='provisioned'`, stores bot credentials,
@@ -1126,27 +1177,18 @@ async fn handle_register_customer(
             if !actual_username.eq_ignore_ascii_case(&payload.bot_username) {
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": format!(
-                            "bot_username mismatch: provided '{}' but Telegram returned '{}'",
-                            payload.bot_username, actual_username
-                        )
-                    })),
+                    Json(bot_username_mismatch_body(
+                        &payload.bot_username,
+                        &actual_username,
+                    )),
                 )
                     .into_response();
             }
         }
-        Err(TelegramApiError::Unauthorized) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "invalid bot_token: Telegram returned 401 Unauthorized"})),
-            )
-                .into_response();
-        }
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("bot token validation failed: {e}")})),
+                Json(token_validation_error_body(&e)),
             )
                 .into_response();
         }
@@ -4134,6 +4176,166 @@ mod tests {
             assert_ne!(
                 crate::audit_events::ADMIN_READ_ROUTE_OUTBOUND_MESSAGES,
                 crate::audit_events::ADMIN_READ_ROUTE_RECURRING_TASKS
+            );
+        }
+    }
+
+    /// mika#2191 — the wire contract of `POST /admin/customers`' error body.
+    ///
+    /// These assert the bodies, not the handler: `AppState.pool` is a non-optional
+    /// `PgPool` (the crate's own DB-backed tests are `#[ignore]`'d for it) and
+    /// `api_url` hard-codes `https://api.telegram.org`, whose injection the crate
+    /// already declined in writing on this same enum (`should_fall_back_to_plain`).
+    /// Extracting the bodies is what makes the contract assertable without either.
+    mod mika2191_upstream_status {
+        use super::*;
+
+        /// AC1 — a 401 upstream carries its status, as a JSON **number**.
+        #[test]
+        fn mika2191_ac1_le_401_porte_le_statut_damont() {
+            let body = token_validation_error_body(&TelegramApiError::Unauthorized);
+            assert_eq!(
+                body["upstream_status"].as_u64(),
+                Some(401),
+                "the 401 branch must carry upstream_status as a number: {body}"
+            );
+            // A string "401" would satisfy a loose reader and fail the Console's
+            // typed one, so the negative half is asserted too.
+            assert!(
+                body["upstream_status"].as_str().is_none(),
+                "upstream_status must be a number, never a string: {body}"
+            );
+        }
+
+        /// AC2 — the message is a wire format, asserted in full.
+        ///
+        /// **Deliberately not `== INVALID_BOT_TOKEN_MESSAGE`.** Asserting against
+        /// the constant would prove nothing: whoever reworded it would move both
+        /// sides at once, pass this test, and break `classify_gateway_error` in
+        /// mika-cloud (mika-cloud#205), which still matches the substring
+        /// `invalid bot_token`. Redden here, and the change becomes a cross-repo
+        /// break to be dated rather than a silent one.
+        #[test]
+        fn mika2191_ac2_le_message_du_401_est_un_format_de_fil() {
+            let body = token_validation_error_body(&TelegramApiError::Unauthorized);
+            assert_eq!(
+                body["error"].as_str(),
+                Some("invalid bot_token: Telegram returned 401 Unauthorized"),
+                "this literal is consumed by mika-cloud's classify_gateway_error"
+            );
+        }
+
+        /// AC3 — no non-401 branch carries `upstream_status: 401`, and the branches
+        /// the AC names stay distinguishable by their `error`.
+        #[test]
+        fn mika2191_ac3_les_branches_non_401_ne_portent_pas_401() {
+            let server_error = token_validation_error_body(&TelegramApiError::Other {
+                status: 500,
+                body: "internal".to_string(),
+            });
+            assert_eq!(server_error["upstream_status"].as_u64(), Some(500));
+            assert_ne!(server_error["upstream_status"].as_u64(), Some(401));
+
+            // `get_me`'s "answered 200, body unusable" convention: no refusal, so no
+            // key at all — not a null, which a consumer could read as a value.
+            let unusable = token_validation_error_body(&TelegramApiError::Other {
+                status: 200,
+                body: "failed to parse getMe response".to_string(),
+            });
+            assert!(
+                unusable.get("upstream_status").is_none(),
+                "an unusable 200 must carry no upstream_status key: {unusable}"
+            );
+
+            // The mismatch lives on the `Ok` arm — the upstream answered and refused
+            // nothing.
+            let mismatch = bot_username_mismatch_body("wanted_bot", "actual_bot");
+            assert!(
+                mismatch.get("upstream_status").is_none(),
+                "the username mismatch must carry no upstream_status: {mismatch}"
+            );
+
+            // All three stay distinguishable by `error` alone.
+            let messages = [
+                server_error["error"].as_str().unwrap(),
+                unusable["error"].as_str().unwrap(),
+                mismatch["error"].as_str().unwrap(),
+            ];
+            let unique: std::collections::HashSet<_> = messages.iter().collect();
+            assert_eq!(unique.len(), 3, "branches must stay distinguishable");
+            assert!(mismatch["error"].as_str().unwrap().contains("mismatch"));
+            assert!(
+                server_error["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("bot token validation failed")
+            );
+        }
+
+        /// AC2 holds on **every** branch, not just the 401: `error` is the key the
+        /// existing callers read, and none of them may lose it.
+        #[test]
+        fn mika2191_la_cle_error_est_toujours_presente() {
+            for err in [
+                TelegramApiError::Unauthorized,
+                TelegramApiError::BotBlocked,
+                TelegramApiError::RateLimited {
+                    retry_after: Some(30),
+                },
+                TelegramApiError::BadRequest {
+                    message: "nope".to_string(),
+                },
+                TelegramApiError::Other {
+                    status: 502,
+                    body: String::new(),
+                },
+                TelegramApiError::Other {
+                    status: 200,
+                    body: "unusable".to_string(),
+                },
+            ] {
+                let body = token_validation_error_body(&err);
+                let message = body["error"].as_str();
+                assert!(
+                    message.is_some_and(|m| !m.is_empty()),
+                    "every error branch must carry a non-empty `error`: {err:?} → {body}"
+                );
+            }
+            let mismatch = bot_username_mismatch_body("a", "b");
+            assert!(mismatch["error"].as_str().is_some_and(|m| !m.is_empty()));
+        }
+
+        /// The literal has exactly one production site (KTD7).
+        ///
+        /// The ticket's whole diagnosis is that "the coupling rests on a string
+        /// nothing obliges to stay stable". Shipping the structured field while
+        /// leaving the string as loosely held as before would repair the visible
+        /// half only, during the window where the other half still decides
+        /// (mika-cloud has not removed its textual rung).
+        ///
+        /// **The opening quote is part of the pattern, and that is what makes the
+        /// guard usable.** `source_guard` masks test regions, not prose, and the
+        /// constant's own doc comment cites the substring on purpose — a guard
+        /// counting bare occurrences would fire on the sentence explaining why it
+        /// exists, and the obvious repair (delete the citation) trades a documented
+        /// wire format for an undocumented one. Requiring the quote counts string
+        /// literals and leaves every backticked mention alone.
+        #[test]
+        fn mika2191_le_litteral_na_quun_seul_site_de_production() {
+            let scanner =
+                mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+            let mut sites = Vec::new();
+            for file in scanner.files() {
+                let production = scanner.production_of(&file);
+                let count = production.matches("\"invalid bot_token").count();
+                if count > 0 {
+                    sites.push((file, count));
+                }
+            }
+            let total: usize = sites.iter().map(|(_, n)| n).sum();
+            assert_eq!(
+                total, 1,
+                "the literal must have exactly one production site (the constant); found: {sites:?}"
             );
         }
     }
