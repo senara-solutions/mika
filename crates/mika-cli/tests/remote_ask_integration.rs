@@ -79,7 +79,7 @@ async fn dispatch_returns_text_part_in_text_mode() {
         spawn_mock(|_cap, _body| (StatusCode::OK, Json(ok_task_with_text("hello world")))).await;
 
     let url = format!("http://{addr}/a2a/cust-1/mika-prime");
-    let out = dispatch_remote("hi", &url, OutputFormat::Text, false)
+    let out = dispatch_remote("hi", &url, OutputFormat::Text, false, None)
         .await
         .expect("dispatch should succeed");
     assert_eq!(out, "hello world");
@@ -94,7 +94,7 @@ async fn dispatch_sends_user_message_as_text_part_in_jsonrpc_request() {
     .await;
 
     let url = format!("http://{addr}/a2a/cust-3/mika-prime");
-    let _ = dispatch_remote("what's on for today", &url, OutputFormat::Text, false)
+    let _ = dispatch_remote("what's on for today", &url, OutputFormat::Text, false, None)
         .await
         .expect("dispatch should succeed");
 
@@ -120,7 +120,7 @@ async fn dispatch_surfaces_jsonrpc_error_with_remote_prefix() {
     .await;
 
     let url = format!("http://{addr}/a2a/cust-4/mika-prime");
-    let err = dispatch_remote("hi", &url, OutputFormat::Text, false)
+    let err = dispatch_remote("hi", &url, OutputFormat::Text, false, None)
         .await
         .expect_err("should fail on JSON-RPC error response");
     let chain = format!("{err:#}");
@@ -142,7 +142,7 @@ async fn dispatch_surfaces_connection_error_for_dead_endpoint() {
     drop(listener);
 
     let url = format!("http://{addr}/a2a/cust-5/mika-prime");
-    let err = dispatch_remote("hi", &url, OutputFormat::Text, false)
+    let err = dispatch_remote("hi", &url, OutputFormat::Text, false, None)
         .await
         .expect_err("should fail when no listener accepts the connection");
     let chain = format!("{err:#}");
@@ -186,7 +186,7 @@ async fn dispatch_surfaces_failed_task_state_as_error() {
     .await;
 
     let url = format!("http://{addr}/a2a/cust-7/mika-prime");
-    let err = dispatch_remote("hi", &url, OutputFormat::Text, false)
+    let err = dispatch_remote("hi", &url, OutputFormat::Text, false, None)
         .await
         .expect_err("should fail when remote task state is Failed");
     let chain = format!("{err:#}");
@@ -228,7 +228,7 @@ async fn dispatch_renders_input_required_state_to_output() {
     .await;
 
     let url = format!("http://{addr}/a2a/cust-8/mika-prime");
-    let out = dispatch_remote("hi", &url, OutputFormat::Text, false)
+    let out = dispatch_remote("hi", &url, OutputFormat::Text, false, None)
         .await
         .expect("InputRequired should render content, not error");
     assert_eq!(out, "which sprint did you mean?");
@@ -265,7 +265,7 @@ async fn dispatch_prefers_artifacts_over_status_message() {
     .await;
 
     let url = format!("http://{addr}/a2a/cust-9/mika-prime");
-    let out = dispatch_remote("hi", &url, OutputFormat::Text, false)
+    let out = dispatch_remote("hi", &url, OutputFormat::Text, false, None)
         .await
         .expect("dispatch should succeed");
     assert_eq!(out, "artifact-output");
@@ -299,7 +299,7 @@ async fn dispatch_renders_file_part_as_placeholder() {
     .await;
 
     let url = format!("http://{addr}/a2a/cust-6/mika-prime");
-    let out = dispatch_remote("hi", &url, OutputFormat::Text, false)
+    let out = dispatch_remote("hi", &url, OutputFormat::Text, false, None)
         .await
         .expect("dispatch should succeed");
     assert_eq!(out, "[file: foo.txt]");
@@ -318,7 +318,7 @@ async fn remote_dispatch_sends_no_caller_session_id() {
     .await;
 
     let url = format!("http://{addr}/a2a/cust-9/mika-prime");
-    let _ = dispatch_remote("hi", &url, OutputFormat::Text, false)
+    let _ = dispatch_remote("hi", &url, OutputFormat::Text, false, None)
         .await
         .expect("dispatch should succeed");
 
@@ -341,7 +341,7 @@ async fn spirit_dispatch_carries_the_caller_session_id_over_the_wire() {
     .await;
 
     let url = format!("http://{addr}/a2a/cust-9/mika-prime");
-    let _ = send_message_to_agent("hi", &url, Some("rt005-c1-r7"), &[])
+    let _ = send_message_to_agent("hi", &url, Some("rt005-c1-r7"), &[], None)
         .await
         .expect("send should succeed");
 

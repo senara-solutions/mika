@@ -230,8 +230,12 @@ pub struct AskArgs {
     pub agent_flag: AgentFlag,
 
     /// Model-id override for this invocation (e.g., sonnet, opus, claude-sonnet-4-6).
-    /// One-shot, not persisted. Routes through the agent's configured llm_provider —
-    /// does NOT re-dispatch based on the model-name prefix.
+    /// One-shot, not persisted. Routes through the EXECUTING agent's configured
+    /// llm_provider — does NOT re-dispatch based on the model-name prefix.
+    /// Reaches the execution surface on both paths, local and --remote (mika#2304).
+    /// Fail-closed: an override the executing agent cannot serve fails the turn
+    /// with a message naming the model and the provider, never a silent fallback.
+    /// Under --verbose the reported model is the one the SERVER attests, or none.
     #[arg(long, conflicts_with = "team")]
     pub model: Option<String>,
 
@@ -1244,29 +1248,16 @@ pub struct KgValidateArgs {
     pub format: OutputFormat,
 }
 
-/// Known model shorthands: (shorthand, full_model_id, display_name).
-/// Single source of truth — used by both CLI `--model` flag and TUI `/model` command.
-pub const MODEL_ALIASES: &[(&str, &str, &str)] = &[
-    ("sonnet", "anthropic/claude-sonnet-4-6", "Claude Sonnet 4.6"),
-    ("opus", "anthropic/claude-opus-4-6", "Claude Opus 4.6"),
-    ("haiku", "anthropic/claude-haiku-4-5", "Claude Haiku 4.5"),
-    ("gpt4o", "openai/gpt-4o", "GPT-4o"),
-    ("deepseek", "deepseek/deepseek-chat", "DeepSeek Chat"),
-    ("gemini", "google/gemini-2.5-flash", "Gemini 2.5 Flash"),
-];
-
-/// Resolve a model alias (e.g., "sonnet") to its full model ID (e.g., "anthropic/claude-sonnet-4-6").
-/// All aliases include their provider prefix for cross-provider correctness.
-/// Returns the input unchanged if it's not a known alias.
-pub fn resolve_model_alias(input: &str) -> String {
-    let lower = input.to_lowercase();
-    for &(alias, full_id, _display) in MODEL_ALIASES {
-        if lower == alias || lower == full_id {
-            return full_id.to_string();
-        }
-    }
-    input.to_string()
-}
+// Model aliases and alias resolution moved to `mika_common::llm::model_override`
+// with mika#2304: since mika#1727 the turn runs in mika-spirit, so the id must be
+// resolved against the *executing* agent's provider, and `mika-agent` needs to
+// reach the same implementation this crate uses. This re-export keeps the three
+// listing call sites (`commands::model`, the TUI `/model` handler and its
+// completer) reading `crate::cli::MODEL_ALIASES` unchanged — a re-export, not a
+// second definition, which is what `mika2304_the_cli_keeps_no_second_resolver`
+// checks. `resolve_model_alias` is reached through its canonical path now that
+// `init::override_model` calls the common entry point instead.
+pub use mika_common::llm::model_override::MODEL_ALIASES;
 
 #[derive(clap::Args)]
 pub struct WebhookArgs {
