@@ -1045,12 +1045,8 @@ mod tests {
         assert_eq!(found.status, OperationalStatus::Done);
     }
 
-    #[test]
-    fn migration_v38_to_v39_idempotent() {
-        // This is tested by the convergence test, but let's also verify
-        // the idempotency of the migration function directly.
-        let mut db = test_db();
-        // DB is already at v39, calling migrate again should be a no-op
-        db.migrate_v38_to_v39().unwrap();
-    }
+    // `migration_v38_to_v39_idempotent` a déménagé dans
+    // `db::migrations::tests` avec l'échelle elle-même (mika#2321 D3) : la
+    // migration est privée à `db::migrations`, et ce module en est un *frère*.
+    // Le laisser ici aurait demandé d'élargir une signature pour un test.
 }

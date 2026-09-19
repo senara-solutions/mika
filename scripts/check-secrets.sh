@@ -41,7 +41,6 @@ LARGE_FILE_LIMIT=1048576  # 1 MB, in bytes
 # adds/modifies are scanned), so no pre-existing fixture can force an entry.
 LARGE_FILE_ALLOWLIST=(
     # "path/to/fixture.bin"  # why it is exempt + mika#<issue>
-    "crates/mika-agent/src/db.rs"  # couche DB monolithique >1Mo, split suivi mika#2321
 )
 
 # Exact-path membership test against LARGE_FILE_ALLOWLIST.
