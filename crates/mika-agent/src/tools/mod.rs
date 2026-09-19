@@ -528,8 +528,42 @@ pub(crate) async fn index_fact(
     }
 }
 
+/// The `evidence` field description served in the JSON schema of every tool
+/// guarded by [`check_reflection_evidence`] (mika#1952 AC1 / D5).
+///
+/// **Sole site** where this text is written. The three guarded tools used to
+/// carry three neighbouring paraphrases, one of which had already drifted:
+/// `update_core_memory` opened with "**Only** required in reflection mode",
+/// minimising exactly where the other two asserted. Three copies of one
+/// sentence is the shape `docs/solutions/prompt-engineering/2026-09-06-un-prompt-qui-reimplemente-une-garde-executable-derive.md`
+/// documents, seen from the declarative side.
+///
+/// The text is the one mika#1952 AC1 imposes, verbatim. It is written for
+/// reflection mode and served unchanged in conversation mode too: a
+/// mode-conditional fourth text would be a fourth thing to keep in step with
+/// the guard below, for no measured gain (D5).
+pub(crate) const REFLECTION_EVIDENCE_FIELD_DESCRIPTION: &str = "REQUIRED IN REFLECTION MODE. \
+     Format: \"[YYYY-MM-DDTHH:MM:SSZ] <one-sentence citation of the conversation content that \
+     justifies this change>\". Missing or empty evidence in reflection mode ALWAYS returns an \
+     error — no exceptions. Example: \"[2026-07-28T13:00:00Z] Reflection search found id=22 \
+     duplicate of id=25, both pending, no actionable meaning.\"";
+
 /// Check that the `evidence` field is present and non-empty when running in reflection mode.
 /// Returns `Some(ToolOutput::error(...))` if evidence is missing, `None` if valid.
+///
+/// This is the **hard** barrier, and it stays one even though mika#1952 made
+/// the served schema declare `evidence` in its `required` array: Mika does not
+/// emit `strict: true` on its tool definitions, and neither the Anthropic API
+/// nor the OpenAI-compatible rails refuse a call missing a `required` key
+/// server-side. `required` *orients* the model; it does not constrain it. And
+/// `"evidence": ""` satisfies `required` while failing this check — see
+/// `mika1952_the_runtime_guard_is_still_the_hard_barrier` before removing this
+/// function as redundant.
+///
+/// The list of tools that call it is mirrored by
+/// [`crate::agent_loop::REFLECTION_EVIDENCE_GATED_TOOLS`], and
+/// `mika1952_gated_tools_match_the_reflection_contract_constant` fails if the
+/// two diverge in either direction.
 pub(crate) fn check_reflection_evidence(
     ctx: &ToolContext<'_>,
     input: &serde_json::Value,
@@ -1182,6 +1216,170 @@ pub fn management_tools_if_needed(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    // -----------------------------------------------------------------------
+    // mika#1952 U4-e — the gated-tool list mirrors the guard's actual callers
+    // -----------------------------------------------------------------------
+
+    /// The tool name a `src/tools/*.rs` file declares, from its
+    /// `fn name(&self) -> &str { "…" }`.
+    ///
+    /// Positional rather than lexical: the literal must sit inside the body of
+    /// that signature, so a name mentioned in prose or in an error message is
+    /// not mistaken for a declaration.
+    fn declared_tool_names(src: &str) -> Vec<String> {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut names = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.contains("fn name(&self) -> &str") {
+                continue;
+            }
+            // The literal is on this line (one-liner form) or on the next
+            // non-empty one (`cargo fmt`'s usual shape).
+            let tail = line.split_once("-> &str").map(|(_, t)| t).unwrap_or("");
+            let candidate = if tail.contains('"') {
+                Some(tail)
+            } else {
+                lines.get(i + 1).copied()
+            };
+            if let Some(c) = candidate
+                && let Some(start) = c.find('"')
+                && let Some(len) = c[start + 1..].find('"')
+            {
+                names.push(c[start + 1..start + 1 + len].to_string());
+            }
+        }
+        names
+    }
+
+    /// **U4-e / R1** — the tools that call [`check_reflection_evidence`] are
+    /// exactly the tools named in
+    /// [`crate::agent_loop::REFLECTION_EVIDENCE_GATED_TOOLS`].
+    ///
+    /// Divergence is caught in **both** directions, and each direction is a
+    /// different defect. A fourth tool that adopts the runtime guard without
+    /// joining the constant keeps a schema that lies — the exact mika#1952
+    /// defect, re-opened under another name. An entry in the constant with no
+    /// caller means the reflection-mode schema declares `evidence` mandatory
+    /// where nothing enforces it, so the model is told to fill a field the tool
+    /// does not read.
+    ///
+    /// **No behavioural test can see this class.** A new guarded tool would
+    /// work: it would simply mislead. Every assertion about the three existing
+    /// tools stays green while the fourth quietly carries the contradiction.
+    #[test]
+    fn mika1952_gated_tools_match_the_reflection_contract_constant() {
+        let tools_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("tools");
+
+        let mut callers: HashSet<String> = HashSet::new();
+        let mut unnamed: Vec<String> = Vec::new();
+
+        for entry in std::fs::read_dir(&tools_dir).expect("src/tools is readable") {
+            let path = entry.expect("readable dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            if crate::source_scan::is_test_source_path(&path) {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("readable source file");
+            let production = mika_common::source_guard::mask_test_regions(&src);
+
+            // The definition site is not a caller, and neither is a doc comment
+            // that merely names the function.
+            let calls_guard = production.lines().any(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//")
+                    && line.contains("check_reflection_evidence(")
+                    && !line.contains("fn check_reflection_evidence(")
+            });
+            if !calls_guard {
+                continue;
+            }
+
+            let names = declared_tool_names(&production);
+            match names.len() {
+                1 => {
+                    callers.insert(names[0].clone());
+                }
+                _ => unnamed.push(format!(
+                    "{}: {} tool name(s) declared — {names:?}",
+                    path.file_name().unwrap().to_string_lossy(),
+                    names.len()
+                )),
+            }
+        }
+
+        assert!(
+            unnamed.is_empty(),
+            "mika#1952 — a file calling `check_reflection_evidence` must declare exactly one \
+             tool name via `fn name(&self) -> &str`, so this guard can attribute the call. \
+             Could not attribute:\n  {}",
+            unnamed.join("\n  ")
+        );
+
+        let declared: HashSet<String> = crate::agent_loop::REFLECTION_EVIDENCE_GATED_TOOLS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let mut missing: Vec<&String> = callers.difference(&declared).collect();
+        let mut extra: Vec<&String> = declared.difference(&callers).collect();
+        missing.sort();
+        extra.sort();
+
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "mika#1952 R1 — `REFLECTION_EVIDENCE_GATED_TOOLS` must mirror the callers of \
+             `check_reflection_evidence`, exactly.\n\
+             \n\
+             Calls the guard but is NOT in the constant: {missing:?}\n\
+             → its reflection-mode schema still declares `evidence` optional while the engine \
+             refuses the call. Add the name to `REFLECTION_EVIDENCE_GATED_TOOLS` \
+             (crates/mika-agent/src/agent_loop/mod.rs) and give the field the shared \
+             `REFLECTION_EVIDENCE_FIELD_DESCRIPTION`.\n\
+             \n\
+             In the constant but does NOT call the guard: {extra:?}\n\
+             → its reflection-mode schema demands a field nothing enforces. Either restore the \
+             `check_reflection_evidence` call, or remove the name from the constant."
+        );
+
+        assert_eq!(
+            callers.len(),
+            3,
+            "mika#1952 — three guarded tools were measured (update_fact, store_fact, \
+             update_core_memory). A fourth is not an allowlist entry: decide whether its \
+             declared schema, its field description and the reflection prompt say the same \
+             thing, then update this count. Found: {callers:?}"
+        );
+    }
+
+    /// **M5 / U4-d companion** — `required` is not a hard guarantee, so the
+    /// runtime guard is not redundant with mika#1952's schema fix.
+    ///
+    /// `"evidence": ""` satisfies every JSON-Schema `required` array ever
+    /// written and is exactly what this function exists to refuse. Read this
+    /// before deleting `check_reflection_evidence` as superseded.
+    #[test]
+    fn mika1952_required_does_not_cover_the_empty_string() {
+        let schema_satisfying_input = serde_json::json!({
+            "id": 52,
+            "category": "commitment",
+            "updates": {"status": "cancelled"},
+            "evidence": "   "
+        });
+        assert!(
+            schema_satisfying_input["evidence"]
+                .as_str()
+                .unwrap()
+                .trim()
+                .is_empty(),
+            "a blank `evidence` is present for the schema and empty for the guard — \
+             that gap is why the runtime check stays"
+        );
+    }
 
     /// mika#1653 — `ToolRegistry::remove` drops a tool and its cached
     /// definition; returns false when the name is absent.

@@ -63,7 +63,7 @@ impl Tool for UpdateCoreMemoryTool {
                     },
                     "evidence": {
                         "type": "string",
-                        "description": "Only required in reflection mode. Cite a specific conversation timestamp and quote as justification for this change."
+                        "description": super::REFLECTION_EVIDENCE_FIELD_DESCRIPTION
                     }
                 },
                 "required": ["section", "action", "reasoning"],
