@@ -10911,22 +10911,21 @@ pub(crate) mod tests {
     /// remplace, ferait rougir la garde. Les commentaires de bloc `/* … */` ne
     /// le sont pas : ce dépôt n'en écrit pas, et une prose qui en emploierait
     /// un pour citer l'appel proscrit se signalerait d'elle-même au premier run.
+    ///
+    /// **La frontière production/test est lue par
+    /// [`mika_common::source_guard`] (mika#2398), pas ici.** La troncature au
+    /// premier `#[cfg(test)]` que cette garde appliquait perdait **14 043
+    /// lignes de production sur 22 fichiers** — dont `builtin_handlers.rs`
+    /// (3 053) et `prompt.rs` (1 886), coupé ligne 142 par un doc-comment qui
+    /// mentionne le marqueur en prose. Une garde à périmètre arbre hérite de la
+    /// somme : elle restait verte en ayant cessé de regarder.
     #[test]
     fn mika2335_no_production_dispatch_transitions_a_parent_without_stamping() {
-        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
         let mut violations: Vec<String> = Vec::new();
 
-        for path in rust_sources_under(&src_root) {
-            let src = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("la garde doit pouvoir lire {}: {e}", path.display()));
-
-            // Tronquer au premier module de test : ces fixtures posent
-            // légitimement des rows `in_progress` à la main.
-            let production = match src.find("#[cfg(test)]") {
-                Some(i) => &src[..i],
-                None => &src[..],
-            };
-
+        scanner.for_each(|path, production| {
             // Les lignes de commentaire sont neutralisées (et non supprimées,
             // pour que les numéros de ligne restent ceux du fichier) : la prose
             // doit pouvoir décrire ce qui est interdit — y compris la doc de
@@ -10959,7 +10958,7 @@ pub(crate) mod tests {
                 }
                 from = at + needle.len();
             }
-        }
+        });
 
         assert!(
             violations.is_empty(),
@@ -10970,28 +10969,6 @@ pub(crate) mod tests {
              qu'il faut affiner — et dans les deux cas c'est une décision à \
              prendre explicitement, pas une exemption à poser en passant."
         );
-    }
-
-    /// Énumère récursivement les `.rs` sous `root`. Utilisée par la garde de
-    /// source ci-dessus ; pas de dépendance `walkdir` pour un test.
-    pub(crate) fn rust_sources_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
-        let mut out = Vec::new();
-        let mut stack = vec![root.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_dir() {
-                    stack.push(p);
-                } else if p.extension().is_some_and(|e| e == "rs") {
-                    out.push(p);
-                }
-            }
-        }
-        out.sort();
-        out
     }
 
     // ── mika#1948 Porte 2: exec-slot arbitration ──

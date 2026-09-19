@@ -207,9 +207,17 @@ async fn dispatching_never_resurrects_a_parent_cancelled_meanwhile() {
 /// Un cas par site de dispatch de production (AC4). Assertion **structurelle**
 /// — voir l'en-tête du fichier pour pourquoi cette moitié ne peut pas être
 /// comportementale, et pourquoi elle est celle qui décide du cas fondateur.
+///
+/// La frontière production/test est lue par [`mika_common::source_guard`]
+/// (mika#2398). La troncature au premier `#[cfg(test)]` qu'elle appliquait
+/// était, ici, un **faux positif** et non une cécité : le prédicat est un
+/// `contains` positif, donc élargir la zone lue ne peut que rendre la garde
+/// plus verte — jamais plus rouge. Elle bascule quand même, parce que U4 refuse
+/// la réimplémentation et non la cécité : un site laissé en place rougirait la
+/// garde anti-récidive.
 #[test]
 fn every_production_dispatch_path_stamps() {
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let scanner = mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
     // (fichier, fonction qui dispatche) — le recensement exhaustif des
     // appelants de production de la transition parente.
     for (rel, marker) in [
@@ -217,13 +225,7 @@ fn every_production_dispatch_path_stamps() {
         ("server/ready_label_handler.rs", "spawn_long_running_exec"),
         ("server/verdict_handler.rs", "spawn_long_running_exec"),
     ] {
-        let path = src.join(rel);
-        let body = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("doit pouvoir lire {}: {e}", path.display()));
-        let production = match body.find("#[cfg(test)]") {
-            Some(i) => &body[..i],
-            None => &body[..],
-        };
+        let production = scanner.production_of(&scanner.src_root().join(rel));
         assert!(
             production.contains(marker),
             "{rel} ne contient plus {marker} — le recensement des chemins de \

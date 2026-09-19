@@ -8850,18 +8850,16 @@ mod tests {
     /// adjust the guard.
     #[test]
     fn mika2342_every_llm_call_is_wrapped_in_a_timeout() {
-        let src = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/agent_loop/mod.rs"),
-        )
-        .expect("the guard must be able to read its own module");
+        // The scan reads the production half only: the test code below writes
+        // both tokens on purpose. The boundary comes from
+        // `mika_common::source_guard` (mika#2398) rather than from a local
+        // `split_once`, so a module-level `#[cfg(test)]` helper added above the
+        // test block can no longer hide the rest of the file from this guard.
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let production = scanner.production_of(&scanner.src_root().join("agent_loop/mod.rs"));
 
-        // The scan stops at this module's own `#[cfg(test)]` block: the test
-        // code below writes both tokens on purpose.
-        let production = src
-            .split_once("\n#[cfg(test)]\nmod tests {")
-            .map_or(src.as_str(), |(before, _)| before);
-
-        let offenders = unwrapped_deadline_call_sites(production);
+        let offenders = unwrapped_deadline_call_sites(&production);
         assert!(
             offenders.is_empty(),
             "mika#2342: {} LLM call site(s) in `agent_loop/mod.rs` are no longer wrapped in a \
@@ -14391,19 +14389,6 @@ mod tests {
         sites
     }
 
-    /// Production source of a file, with its `#[cfg(test)]` tail removed.
-    ///
-    /// Test modules are full of legitimate mentions of both variants; a scan that
-    /// refused "any mention" would redden immediately on healthy code, and the
-    /// natural repair would be to widen it until it caught nothing — which is the
-    /// failure the negative control below exists to prevent.
-    fn production_half(src: &str) -> &str {
-        match src.find("#[cfg(test)]") {
-            Some(cut) => &src[..cut],
-            None => src,
-        }
-    }
-
     /// **T5** — the scope has one decisional reader, and it is
     /// `run_agent`'s `scoped_session_id`.
     ///
@@ -14417,38 +14402,26 @@ mod tests {
     /// A third is halt-and-surface, not an allowlist entry — whether it is a
     /// legitimate rendering or a second decision is a question this guard cannot
     /// answer for you.
+    ///
+    /// **The production half is read by [`mika_common::source_guard`]
+    /// (mika#2398).** Truncating at the first `#[cfg(test)]`, as this guard did,
+    /// cut `prompt.rs` at line 142 — a doc comment that merely *mentions* the
+    /// marker — and left 1 886 of its lines unread. The scan was not wrong about
+    /// what it saw; it had stopped seeing.
     #[test]
     fn mika2305_the_scope_has_a_single_decisional_reader() {
-        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let src_root = scanner.src_root().to_path_buf();
         let mut sites: Vec<String> = Vec::new();
-        let mut scanned = 0usize;
-        let mut stack = vec![src_root.clone()];
 
-        while let Some(dir) = stack.pop() {
-            let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| {
-                panic!("the guard must be able to read {}: {e}", dir.display())
-            });
-            for entry in entries {
-                let path = entry.expect("readable directory entry").path();
-                if path.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                if path.extension().is_none_or(|e| e != "rs") {
-                    continue;
-                }
-                let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-                    panic!("the guard must be able to read {}: {e}", path.display())
-                });
-                scanned += 1;
-                let rel = path.strip_prefix(&src_root).unwrap_or(&path).display();
-                for site in scope_match_sites(production_half(&content)) {
-                    sites.push(format!("{rel}:{}: {}", site[0].0, site[0].1));
-                }
+        scanner.for_each(|path, production| {
+            let rel = path.strip_prefix(&src_root).unwrap_or(path).display();
+            for site in scope_match_sites(production) {
+                sites.push(format!("{rel}:{}: {}", site[0].0, site[0].1));
             }
-        }
+        });
 
-        assert!(scanned > 0, "the guard scanned no file — broken path");
         assert_eq!(
             sites.len(),
             2,
@@ -14512,8 +14485,33 @@ mod tests {
         // A `#[cfg(test)]` tail is not production.
         let with_test_tail = "fn prod() {}\n#[cfg(test)]\nmod tests {\n    match s { HistoryScope::Agent => 1, HistoryScope::Session => 2 };\n}\n";
         assert!(
-            scope_match_sites(production_half(with_test_tail)).is_empty(),
-            "the test tail must be stripped before scanning"
+            scope_match_sites(&mika_common::source_guard::mask_test_regions(with_test_tail))
+                .is_empty(),
+            "the test tail must be masked before scanning"
+        );
+
+        // mika#2398 — and the shape the previous `split at the first marker`
+        // rule got wrong: a module-level test helper ABOVE the production this
+        // guard must read. Truncating there is what left `prompt.rs` unread
+        // past line 142.
+        let helper_first = "\
+#[cfg(test)]
+fn helper() -> u32 {
+    1
+}
+
+fn prod(scope: HistoryScope) -> usize {
+    match scope {
+        HistoryScope::Session => 1,
+        HistoryScope::Agent => 20,
+    }
+}
+";
+        assert_eq!(
+            scope_match_sites(&mika_common::source_guard::mask_test_regions(helper_first)).len(),
+            1,
+            "a decisional match AFTER a module-level test helper must still be seen — \
+             the truncating rule this guard used to apply would have missed it"
         );
     }
 
