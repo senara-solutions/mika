@@ -324,6 +324,87 @@ rejoue** — vérifier `message_count` non nul avant de conclure quoi que ce soi
 
 ---
 
+## Fire-Disposition
+
+Les livrables de §6 sont de classe détecteur. La disposition est dite **par
+détecteur** et non globalement, parce que ce plan en mêle deux classes qui n'ont
+pas la même surface de données préexistantes : des tests dont les fixtures sont
+construites dans le test, et des sondes dont l'état de déclenchement *est* la
+production.
+
+### (1) Réconciliation code-owned de `MIKA_TEST_IDENTITY` — option (c) halt-and-surface
+
+**Ce qui peut firer sur des données existantes :** un `identity.toml` de
+`mika-test` déjà sur disque dont un opérateur a édité à la main
+`[context.history]` ou `[context.summary]`. Au prochain démarrage de mika-spirit,
+`reconcile_well_known_identity` écrit les deux sections code-owned par-dessus
+(mika#2330), et l'édition manuelle est perdue.
+
+**Disposition : (c) halt-and-surface.** Ni allowlist nommée — il n'y a rien à
+exempter, la constante *est* la vérité pour une section code-owned — ni land
+disabled — un `mika-test` laissé sous le défaut conversationnel est précisément
+le défaut que ce ticket ferme, et le laisser non corrigé serait dangereux au sens
+de l'option (b) inversé. La surface est `reconciled_paths` sur
+`identity_reconcile.complete`, qui **nomme chaque chemin écrasé** : la perte est
+lisible plutôt que silencieuse (c'est le « Coût nommé » de §U1, ici sous son nom
+de disposition). Grep opérateur : `identity_reconcile` dans
+`$MIKA_SPIRIT_LOG_FILE` — `complete` au premier démarrage après déploiement,
+`in_sync` ensuite.
+
+**Nuance dite plutôt que tue :** sur ce site la réconciliation ne *s'arrête* pas,
+elle écrit et nomme. Ce qui relève de (c) est la moitié qui compte — la
+résolution du conflit est une **décision de scoping qui revient à l'opérateur**
+et n'est prise par aucun code : un opérateur qui tient à son édition ne réédite
+pas le disque (elle serait réécrasée au démarrage suivant, sans fin), il fait
+changer la constante. **Aucune implémentation nouvelle n'est requise par cette
+disposition** ; elle documente le contrat mika#2330 déjà en vigueur, qui est
+exactement ce que ce plan choisit de ne pas contourner.
+
+### (2) Sondes post-déploiement A, B et C — option (c) halt-and-surface
+
+**Ce qui peut firer sur des données existantes :** l'état de production au
+moment du rejeu — un scope non réconcilié (Halte 1), un filtre qui ne filtre pas
+(Halte 2), une attestation non lue depuis le serveur (Halte 3), une continuité
+conversationnelle perdue (Halte 4).
+
+**Disposition : (c) halt-and-surface**, et les quatre haltes de §6 **sont** la
+surface, avec leur ordre diagnostique prescrit. Aucune n'autorise un ajustement
+réflexe : Halte 1 envoie lire `identity_reconcile` **avant de toucher au code**
+(classe mika#2330, le remède est un déploiement) ; Halte 2 interdit de rétrécir
+`max_tokens` (autre axe, masquerait le symptôme) ; Halte 3 interdit d'ajuster
+l'affichage (c'est U3 qui est cassé, et c'est la seule panne qui se déguise en
+succès) ; Halte 4 envoie vérifier qu'aucune section n'a été posée hors de
+`MIKA_TEST_IDENTITY`. Une allowlist n'a pas de sens sur une sonde — il n'y a pas
+de population à exempter, il y a un déploiement à établir — et une sonde livrée
+désarmée n'est pas une sonde.
+
+**Halte générale, écrite ici parce qu'elle vaut pour les trois sondes :** le
+silence ne prouve rien si personne ne rejoue. Vérifier `message_count` non nul
+avant de conclure quoi que ce soit (mika#2205).
+
+### (3) Tests unitaires U1, U2 et U3 — aucune disposition requise
+
+`well_known_agents::tests` (constante et reprise du motif mika#2330), les
+contrôles positif et négatif de U2 au site de production, le test du canal résumé
+seul, le test fail-closed `INVALID_PARAMS`, l'assertion de non-élargissement et
+le test d'attestation absente de U3 : **tous construisent leurs fixtures dans le
+test** (identité écrite en `tmpdir`, messages semés par le harnais, `Task`
+fabriqué). Aucun ne lit de donnée préexistante, donc aucune violation
+préexistante n'est possible et la question de la disposition ne se pose pas.
+
+Deux précisions qui bornent cette affirmation plutôt que de la supposer :
+
+- Le test de reprise mika#2330 **épingle** un mécanisme qui, lui, agit sur des
+  données de production ; cette moitié-là est couverte par la disposition (1)
+  ci-dessus, pas par celle-ci.
+- Le fail-closed `INVALID_PARAMS` de U2 ne peut pas firer sur une population
+  existante : `mika.session_isolated` **n'existe pas avant cette PR**, donc aucun
+  appelant déployé ne peut poser la clé, bien ou mal. La population préexistante
+  est vide par construction — ce qui est la raison pour laquelle ce détecteur
+  peut être livré armé et strict dès le premier jour.
+
+---
+
 ## 7. Definition of Done
 
 - `MIKA_TEST_IDENTITY` déclare `[context.history] scope = "session"` et
@@ -383,3 +464,26 @@ Transcrits du corps de `senara-solutions/mika#1951` :
   (famille `calibrate-*`), pas de substrat.
 - **`mika chat`** — in-process, session stable par construction, hors du
   symptôme.
+
+---
+
+## Revision history
+
+- rev 2 (2026-09-19) : adressé F1 (BLOCKING) en ajoutant la section
+  `## Fire-Disposition` littérale, entre §6 et §7, et adressé F2 en la rédigeant
+  **par détecteur** selon le mapping suggéré — (1) réconciliation code-owned de
+  `MIKA_TEST_IDENTITY` : option (c) halt-and-surface, surface `reconciled_paths`
+  sur `identity_reconcile.complete`, avec la nuance dite que le site n'arrête
+  rien mais laisse la décision de scoping à l'opérateur ; (2) sondes A/B/C :
+  option (c) halt-and-surface, les quatre haltes de §6 étant la surface avec leur
+  ordre diagnostique ; (3) tests unitaires U1/U2/U3 : aucune disposition requise,
+  fixtures construites dans le test, avec deux bornes explicites — le test de
+  reprise mika#2330 épingle un mécanisme dont la moitié production relève de la
+  disposition (1), et le fail-closed `INVALID_PARAMS` a une population
+  préexistante **vide par construction** puisque `mika.session_isolated` n'existe
+  pas avant cette PR, ce qui est la raison pour laquelle il peut être livré armé.
+  Aucune AC affaiblie, aucun autre contenu réécrit ; le titre de section est posé
+  sans numéro pour que le gate le trouve littéralement.
+  Citations préservées : Fire-Disposition Gate mika#1574 (options canoniques
+  (a)/(b)/(c)), mika#2330 (réconciliation des sections code-owned),
+  mika#2205 (un scan silencieusement inactif se lit comme un scan oisif).
