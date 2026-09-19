@@ -981,12 +981,16 @@ mod tests {
     /// goes red and the reasoning has to be re-read.
     #[test]
     fn mika2280_the_default_floor_stays_under_the_measured_throughput() {
-        assert!(
-            DEFAULT_OUTPUT_TOKENS_PER_SEC_FLOOR < 66,
-            "the observable throughput distribution is censored — the slow calls \
+        // `const` so the guard fires at compile time — and so clippy's
+        // `assertions_on_constants` reads it as the deliberate pin it is.
+        const {
+            assert!(
+                DEFAULT_OUTPUT_TOKENS_PER_SEC_FLOOR < 66,
+                "the observable throughput distribution is censored — the slow calls \
              were killed at the plafond, so the observed floor overestimates the \
              real one (see DEFAULT_OUTPUT_TOKENS_PER_SEC_FLOOR)"
-        );
+            );
+        }
     }
 
     #[test]

@@ -951,3 +951,219 @@ async fn mika2362_anthropic_post_loop_message_names_the_deadline_not_the_retries
         "the deadline did not stop this one, got: {chain}"
     );
 }
+
+// ── mika#2280 — the plafond discriminator ─────────────────────────────────
+
+/// A one-second plafond inside a generous envelope: short enough that a
+/// `…ThenSilence` fixture costs a second per attempt, long enough that the
+/// retry the discriminator must not touch still has room to run.
+fn plafond_budget() -> LlmTimeoutBudget {
+    LlmTimeoutBudget::unvalidated(1, 3)
+}
+
+/// One attempt and no more: the error the caller sees is the one `send_once`
+/// produced, unwrapped by no retry.
+fn single_attempt_plafond_budget() -> LlmTimeoutBudget {
+    LlmTimeoutBudget::unvalidated(1, 1)
+}
+
+/// AC5 (a) + AC6 + AC7 — a body that stops arriving at the plafond is a
+/// guillotine, and saying so changes nothing about the retry.
+///
+/// Positive side: the 2xx head arrives, the body never does, the client's own
+/// plafond cuts it ⇒ one `llm_call_cap_exhausted` line carrying the geometry,
+/// and the attempt line says `cap_exhausted = true` with the `max_tokens` it
+/// asked for. Non-regression side (mika#2015): the chain still retries and the
+/// second attempt succeeds, and its own line says `false`.
+#[tokio::test]
+#[serial]
+async fn mika2280_openai_a_cut_at_the_plafond_is_attributed_and_still_retried() {
+    let api = FakeApi::start(vec![Reply::HeadersThenSilence, Reply::Ok(openai_body())]).await;
+    let provider = openai_provider(api.base_url(), plafond_budget());
+
+    let (guard, sink) = capture::start();
+    provider
+        .send_message(&llm_request())
+        .await
+        .expect("the retry must still run and succeed (AC6)");
+    let lines = sink.attempts();
+    let cuts = sink.cap_exhausted();
+    drop(guard);
+
+    assert_eq!(api.hits(), 2, "the retry must not shorten: {lines:?}");
+    assert_eq!(lines[0].outcome, "retrying", "{lines:?}");
+    assert_eq!(lines[0].cap_exhausted.as_deref(), Some("true"), "{lines:?}");
+    assert_eq!(lines[0].max_tokens, Some(64), "{lines:?}");
+    assert!(
+        lines[0].elapsed_ms >= 980,
+        "the cut must sit at the plafond: {lines:?}"
+    );
+    assert_eq!(
+        lines[1].cap_exhausted.as_deref(),
+        Some("false"),
+        "a successful attempt ran, so its flag is `false`, never absent: {lines:?}"
+    );
+
+    assert_eq!(cuts.len(), 1, "{cuts:?}");
+    let cut = &cuts[0];
+    assert_eq!(cut.model, "test-model");
+    assert_eq!(cut.max_tokens, 64);
+    assert_eq!(cut.http_timeout_secs, 1);
+    assert!(cut.elapsed_ms >= 980, "{cut:?}");
+    assert_eq!(
+        cut.reachable_output_tokens,
+        plafond_budget()
+            .reachable_output_tokens(mika_common::llm::budget::DEFAULT_OUTPUT_TOKENS_PER_SEC_FLOOR),
+        "{cut:?}"
+    );
+}
+
+/// AC6 — the error a guillotine produces is still `Transport` and still
+/// retryable: the discriminator rides beside `LlmError`, never inside it.
+#[tokio::test]
+#[serial]
+async fn mika2280_openai_a_cut_at_the_plafond_keeps_its_error_class() {
+    let api = FakeApi::start(vec![Reply::HeadersThenSilence]).await;
+    let provider = openai_provider(api.base_url(), single_attempt_plafond_budget());
+
+    let err = provider
+        .send_message(&llm_request())
+        .await
+        .expect_err("a single attempt that hangs must fail");
+
+    assert!(matches!(err, LlmError::Transport(_)), "{err:?}");
+    assert!(err.is_retryable(), "{err:?}");
+    assert_eq!(err.error_class(), "transport_timeout", "{err:?}");
+}
+
+/// AC5 (b) — the negative control of the discriminator: a body cut at once
+/// (the mika#2015 `unexpected EOF`) is a breakdown, not a guillotine.
+///
+/// Without it, a predicate answering `true` unconditionally would pass the test
+/// above.
+#[tokio::test]
+#[serial]
+async fn mika2280_openai_an_early_cut_is_not_a_guillotine() {
+    let api = FakeApi::start(vec![Reply::TruncatedBody, Reply::Ok(openai_body())]).await;
+    let provider = openai_provider(api.base_url(), plafond_budget());
+
+    let (guard, sink) = capture::start();
+    provider
+        .send_message(&llm_request())
+        .await
+        .expect("the transport retry must still run");
+    let lines = sink.attempts();
+    let cuts = sink.cap_exhausted();
+    drop(guard);
+
+    assert_eq!(lines[0].outcome, "retrying", "{lines:?}");
+    assert_eq!(
+        lines[0].cap_exhausted.as_deref(),
+        Some("false"),
+        "{lines:?}"
+    );
+    assert!(
+        cuts.is_empty(),
+        "an early cut must not be counted: {cuts:?}"
+    );
+}
+
+/// AC5 on the ollama rail, with its **site** negative control in the same call.
+///
+/// Positive side: the 2xx body that never finishes is attributed. Negative
+/// side: a non-2xx head whose error body never arrives hangs the *other*
+/// `response.text()` of this rail for the same plafond — and must emit no
+/// `llm_call_cap_exhausted`. Instrumenting the wrong site would pass every
+/// other test while inflating the population the post-deploy probe reads.
+#[tokio::test]
+#[serial]
+async fn mika2280_ollama_attributes_the_body_site_and_never_the_error_site() {
+    // -- positive: the 2xx body site --
+    let api = FakeApi::start(vec![Reply::HeadersThenSilence]).await;
+    let provider = ollama_provider(api.base_url(), single_attempt_plafond_budget());
+
+    let (guard, sink) = capture::start();
+    let err = provider
+        .send_message(&llm_request())
+        .await
+        .expect_err("a single attempt that hangs must fail");
+    let lines = sink.attempts();
+    let cuts = sink.cap_exhausted();
+    drop(guard);
+
+    assert!(matches!(err, LlmError::Transport(_)), "{err:?}");
+    assert_eq!(lines[0].cap_exhausted.as_deref(), Some("true"), "{lines:?}");
+    // This rail's chain length is not the subject here (it is not bounded by
+    // `max_attempts` the way the OpenAI rail is): what is asserted is that
+    // every attempt the server saw hang is attributed, once.
+    assert_eq!(cuts.len(), api.hits(), "{cuts:?}");
+    assert!(cuts.iter().all(|c| c.max_tokens == 64), "{cuts:?}");
+
+    // -- negative: the non-2xx error-body site --
+    let api = FakeApi::start(vec![Reply::StatusHeadersThenSilence(429)]).await;
+    let provider = ollama_provider(api.base_url(), single_attempt_plafond_budget());
+
+    let (guard, sink) = capture::start();
+    let err = provider
+        .send_message(&llm_request())
+        .await
+        .expect_err("a 429 must fail");
+    let lines = sink.attempts();
+    let cuts = sink.cap_exhausted();
+    drop(guard);
+
+    assert!(
+        matches!(err, LlmError::HttpError { status: 429, .. }),
+        "{err:?}"
+    );
+    assert_eq!(
+        lines[0].cap_exhausted.as_deref(),
+        Some("false"),
+        "{lines:?}"
+    );
+    assert!(
+        cuts.is_empty(),
+        "a slow error body is not a model still generating: {cuts:?}"
+    );
+}
+
+/// AC7 — an attempt that did not happen carries **no** `cap_exhausted`.
+///
+/// `deadline_abort` made no call, so `false` would assert something about a
+/// call that does not exist. The attempt that did run beside it carries its
+/// flag, which is the control: a line shape that dropped the field everywhere
+/// would pass the absence check alone.
+#[tokio::test]
+#[serial]
+async fn mika2280_deadline_abort_carries_no_cap_flag() {
+    let api = FakeApi::start(vec![Reply::Status(
+        429,
+        r#"{"error":{"message":"slow"}}"#.into(),
+    )])
+    .await;
+    let provider = openai_provider(api.base_url(), incident_budget());
+
+    let (guard, sink) = capture::start();
+    let _ = provider
+        .send_message_with_deadline(&llm_request(), Some(deadline_in(20)))
+        .await
+        .expect_err("the chain must fail");
+    let lines = sink.attempts();
+    drop(guard);
+
+    assert_eq!(
+        lines[0].cap_exhausted.as_deref(),
+        Some("false"),
+        "{lines:?}"
+    );
+    assert_eq!(lines[1].outcome, "deadline_abort", "{lines:?}");
+    assert_eq!(
+        lines[1].cap_exhausted, None,
+        "absent, never `false`: {lines:?}"
+    );
+    assert_eq!(
+        lines[1].max_tokens,
+        Some(64),
+        "the declaration is true everywhere: {lines:?}"
+    );
+}
