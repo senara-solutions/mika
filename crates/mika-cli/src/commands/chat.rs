@@ -362,6 +362,12 @@ async fn spawn_agent_worker(
                         global_home_dir: Some(&worker_global_home),
                         is_callback_turn: false,
                         settings: Some(&worker_settings),
+                        // mika#2304: `mika chat --model` is applied in-process by
+                        // `AppContext::override_model`, so `worker_llm` already
+                        // *is* the caller's model. There is no server-side
+                        // override for a skill's `[llm]` section to displace, and
+                        // the #463 precedence is unchanged on this path.
+                        caller_model_override: false,
                         trace_id: None,
                         correlated_task_id: None,
                         internal: false,
@@ -482,6 +488,9 @@ async fn spawn_agent_worker(
                         global_home_dir: Some(&worker_global_home),
                         is_callback_turn: true,
                         settings: Some(&worker_settings),
+                        // mika#2304: see the sibling construction above — the
+                        // chat worker's provider already carries any `--model`.
+                        caller_model_override: false,
                         trace_id: trace_id.clone(),
                         correlated_task_id: None,
                         internal: false,

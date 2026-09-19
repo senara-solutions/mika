@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
 use secrecy::ExposeSecret;
 use tokio::sync::{OwnedMutexGuard, broadcast};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use mika_a2a::jsonrpc::{
@@ -17,7 +17,8 @@ use mika_a2a::jsonrpc::{
     JsonRpcResponse, METHOD_NOT_FOUND, TASK_NOT_CANCELABLE, TASK_NOT_FOUND,
 };
 use mika_a2a::params::{
-    CALLER_SESSION_ID_KEY, MessageSendParams, ONLY_SKILLS_KEY, TaskIdParams, TaskQueryParams,
+    CALLER_SESSION_ID_KEY, EFFECTIVE_MODEL_KEY, MODEL_OVERRIDE_KEY, MessageSendParams,
+    ONLY_SKILLS_KEY, TaskIdParams, TaskQueryParams,
 };
 use mika_a2a::state_machine::TaskStateMachine;
 use mika_a2a::streaming::{StreamEvent, TaskStatusUpdateEvent};
@@ -234,6 +235,16 @@ pub async fn handle_a2a_jsonrpc(
 /// sender, task_id, and optional context_id so `process_tool_calls` can
 /// emit `ToolCallStart` / `ToolCallResult` frames (mika#1731 wire;
 /// mika#1757 emission). Non-streaming callers (`message/send`) pass `None`.
+///
+/// `model_override` is the provider the caller asked for (mika#2304), already
+/// resolved and constructed by [`resolve_caller_model_override`] — so by the time
+/// it gets here the API-key refusal has already happened and the turn is allowed
+/// to run. `None` is the nominal path and costs nothing: `agent_state.llm` is
+/// passed through unchanged, with no provider built.
+// Eighth parameter added by mika#2304. The per-turn provider must be borrowed
+// from an `Arc` the *caller* owns (`AgentParams.llm` is a `&dyn`), so it cannot
+// be folded into a struct built here.
+#[allow(clippy::too_many_arguments)]
 async fn run_a2a_agent(
     state: &AppState,
     agent_state: &Arc<AgentState>,
@@ -242,7 +253,8 @@ async fn run_a2a_agent(
     task_id: &str,
     stream_ctx: Option<Arc<mika_a2a::streaming::ToolCallStreamContext>>,
     only_skills: &[String],
-) -> Result<Option<String>, String> {
+    model_override: Option<&Arc<dyn mika_common::llm::LlmProvider>>,
+) -> Result<A2aTurn, String> {
     // Hot-reload skills if dirty
     let skills = if agent_state.skills_dirty.load(Ordering::Acquire) {
         agent_state.skills_dirty.store(false, Ordering::Release);
@@ -302,7 +314,12 @@ async fn run_a2a_agent(
         db: &agent_state.db,
         tier: agent_state.tier,
         deployment: agent_state.deployment,
-        llm: agent_state.llm.as_ref(),
+        // mika#2304. `AgentParams.llm` is a `&dyn`, and `make_provider_for`
+        // hands back an `Arc`, so the caller of this function owns the `Arc` for
+        // the whole turn and only a borrow crosses here.
+        llm: model_override
+            .map(|arc| arc.as_ref())
+            .unwrap_or_else(|| agent_state.llm.as_ref()),
         tools: &state.tools,
         skills: &skills,
         user_message: input_text,
@@ -326,6 +343,9 @@ async fn run_a2a_agent(
         global_home_dir: Some(&state.global_home_dir),
         is_callback_turn: false,
         settings: Some(&agent_state.settings),
+        // mika#2304 D7: when the caller named the model, a matched skill's
+        // `[llm]` section must not displace it.
+        caller_model_override: model_override.is_some(),
         trace_id: Some(task_id.to_string()),
         correlated_task_id: None,
         internal: false,
@@ -334,9 +354,30 @@ async fn run_a2a_agent(
     };
 
     match agent::run_agent(&params).await {
-        Ok(output) => Ok(output.text),
+        Ok(output) => Ok(A2aTurn {
+            text: output.text,
+            // mika#2304 D3: taken from the loop's own report, never recomputed
+            // here. This function knows the provider it handed *in*;
+            // `agent_loop` may substitute a per-skill one downstream, and an
+            // attestation that named the wrong one would carry the authority of
+            // a server statement while saying something false — the defect this
+            // ticket closes, one field further on.
+            effective_model: output.effective_model,
+        }),
         Err(e) => Err(e.to_string()),
     }
+}
+
+/// What a completed A2A turn reports back to its port.
+///
+/// A struct rather than a tuple because the second field is easy to drop
+/// silently: mika#2270 was caused by exactly that, `Ok(_)` throwing away the
+/// turn's own text one line before the Task was rebuilt without it.
+struct A2aTurn {
+    /// The turn's assistant text, as the loop produced it.
+    text: Option<String>,
+    /// The model that actually served, `provider/model` (mika#2304).
+    effective_model: Option<String>,
 }
 
 /// Extract the caller's session id from `message/send` request metadata
@@ -385,6 +426,143 @@ fn requested_only_skills(params: &MessageSendParams) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Extract the model the caller wants this turn to run under (mika#2304).
+///
+/// **Reading is fail-soft, exactly like [`requested_only_skills`]:** key absent,
+/// no metadata, `null`, a number, an array, an object, an empty or blank string
+/// — all yield `None`, and the turn runs under the agent's configured model as
+/// it always did. A caller from an older or a newer version of the protocol must
+/// not be able to fail a turn with a field this server is free to ignore.
+///
+/// **Applying it is not** — see [`resolve_caller_model_override`]. That
+/// asymmetry, inside one feature, is the whole design decision of mika#2304: the
+/// server may decline to *notice* an override, but once it has noticed one it may
+/// never quietly run under a different model.
+///
+/// The string is returned raw. Alias resolution and prefix stripping belong to
+/// the executing side (mika#1591 semantics depend on *this* agent's
+/// `llm_provider`), which on the `--remote` path the caller does not know.
+fn requested_model_override(params: &MessageSendParams) -> Option<&str> {
+    params
+        .metadata
+        .as_ref()?
+        .get(MODEL_OVERRIDE_KEY)?
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// Turn a caller-declared model id into the provider that will serve the turn,
+/// or refuse the request by name (mika#2304, D2).
+///
+/// # Fail-closed, and why it is placed here
+///
+/// A declared override this agent cannot honour **fails the request**; it is
+/// never degraded to "no override". The refusal is raised *before* the task row
+/// is created and before the agent lock is taken, so the caller gets a JSON-RPC
+/// error carrying the sentence — `Provider 'x' has no API key configured. Cannot
+/// route model 'y'.` — instead of a task in state `failed` whose reason lives
+/// only in the server log. `mika ask` renders that as `remote error: …`, which is
+/// the "message clair" the founding ticket asked for as its fallback option,
+/// obtained without giving up the capability.
+///
+/// # The order of the two steps is the point
+///
+/// [`mika_common::llm::model_override::resolve_model_override`] checks the API
+/// key **before** `make_provider_for` builds anything.
+/// `create_provider_with_budget` routes the ten OpenAI-compatible variants —
+/// OpenRouter among them, the rail the founding measurement ran on — to
+/// `OpenAiCompatibleProvider::new`, which returns no `Result` and never consults
+/// `api_key`. A missing key therefore *succeeds* at construction. Inverting the
+/// two would leave a built provider, an absent key, and a turn that departs
+/// anyway: the fail-closed policy written down and absent from the binary.
+///
+/// What no layer can check before the call is whether the provider actually
+/// serves that model id. An unknown id fails at the first request on the
+/// provider's own 400/404 — already fail-closed, and nothing to write for it.
+fn resolve_caller_model_override(
+    agent_state: &Arc<AgentState>,
+    params: &MessageSendParams,
+    task_id: &str,
+) -> Result<Option<Arc<dyn mika_common::llm::LlmProvider>>, JsonRpcError> {
+    let Some(requested) = requested_model_override(params) else {
+        return Ok(None);
+    };
+
+    match caller_model_provider(&agent_state.settings, requested) {
+        Ok(provider) => {
+            info!(
+                event = "a2a_model_override_applied",
+                agent = %agent_state.db.agent_id(),
+                task_id = %task_id,
+                requested = %requested,
+                resolved = %format!("{}/{}", provider.provider_name(), provider.model_name()),
+                "running this turn under the caller's model (mika#2304)"
+            );
+            Ok(Some(provider))
+        }
+        Err(reason) => {
+            warn!(
+                event = "a2a_model_override_refused",
+                agent = %agent_state.db.agent_id(),
+                task_id = %task_id,
+                requested = %requested,
+                reason = %reason,
+                "caller declared a model this agent cannot serve — refusing the turn (mika#2304)"
+            );
+            Err(JsonRpcError::with_message(INVALID_PARAMS, reason))
+        }
+    }
+}
+
+/// The decision half of [`resolve_caller_model_override`], with no `AgentState`
+/// and no logging — so it can be asserted without standing a server up.
+///
+/// `Err` carries the operator-facing sentence. There is no third outcome: the
+/// signature itself is the fail-closed policy. A `Result<Option<_>>` here, or an
+/// `.ok()` on either step, would be the silent degradation mika#2304 exists to
+/// remove.
+fn caller_model_provider(
+    settings: &mika_common::config::Settings,
+    requested: &str,
+) -> Result<Arc<dyn mika_common::llm::LlmProvider>, String> {
+    // Key check FIRST — `make_provider_for` cannot refuse a missing key on the
+    // OpenAI-compatible rail (see this function's neighbours' doc comments), so
+    // swapping these two lines would leave a built provider, an absent key, and a
+    // turn that departs anyway.
+    let (provider_kind, model_id) =
+        mika_common::llm::model_override::resolve_model_override(settings, requested)
+            .map_err(|e| e.to_string())?;
+
+    settings
+        .make_provider_for(provider_kind, Some(&model_id))
+        .map_err(|e| format!("Cannot build provider '{provider_kind}' for model '{model_id}': {e}"))
+}
+
+/// Stamp the model that served a turn onto the Task the caller receives
+/// (mika#2304, D3).
+///
+/// Written on **every** turn, override or not. Without that, an absent
+/// attestation would be ambiguous between "this server predates mika#2304" and
+/// "no override was asked for", and the client could not safely treat absence as
+/// "I do not know" — which is the whole basis on which it refuses to print a
+/// local value.
+///
+/// `None` means the turn produced no `AgentOutput` to read it from (the loop
+/// failed before the effective provider was resolved). That population is
+/// honestly *not attested*; nothing is written, and the client shows no model.
+fn stamp_effective_model(task: &mut Task, effective_model: Option<&str>) {
+    let Some(model) = effective_model else {
+        return;
+    };
+    task.metadata
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(
+            EFFECTIVE_MODEL_KEY.to_string(),
+            serde_json::Value::String(model.to_string()),
+        );
 }
 
 /// Refuse a request that could not get the agent lock, and make the refusal
@@ -717,6 +895,21 @@ async fn handle_message_send(
         .and_then(|c| c.return_immediately)
         .unwrap_or(false);
 
+    // mika#2304 D2: resolve the caller's model **before** the lock and before the
+    // task row exists. A declared override this agent cannot serve is refused as
+    // a JSON-RPC error naming the model and the provider — the caller reads a
+    // sentence, not a task in state `failed` whose reason is only in the log. It
+    // also costs no queue place and no database write.
+    //
+    // The `Arc` is bound here so it outlives the turn: `AgentParams.llm` is a
+    // `&dyn` and `make_provider_for` returns an `Arc`.
+    let caller_model = match resolve_caller_model_override(agent_state, &params, &task_id) {
+        Ok(p) => p,
+        Err(err) => {
+            return Json(JsonRpcResponse::error(request.id.clone(), err)).into_response();
+        }
+    };
+
     // Bounded wait for the agent lock (mika#2163). Take a place in the line, then
     // wait in it. The wait lives in the handler because `message/send` is
     // synchronous — the caller is holding the connection open for the completed
@@ -818,6 +1011,11 @@ async fn handle_message_send(
         // an empty rebuild lost an answer the process was still holding.
         let only_skills = requested_only_skills(&params);
 
+        // mika#2304: the model that served, kept for the same reason the text is
+        // — it exists only in this process's hand, and the Task rebuilt from the
+        // database does not carry it.
+        let mut effective_model: Option<String> = None;
+
         let turn_text = match run_a2a_agent(
             state,
             agent_state,
@@ -826,10 +1024,11 @@ async fn handle_message_send(
             &task_id,
             None,
             &only_skills,
+            caller_model.as_ref(),
         )
         .await
         {
-            Ok(text) => {
+            Ok(turn) => {
                 turn_guard.settle(
                     agent_state
                         .db
@@ -838,7 +1037,8 @@ async fn handle_message_send(
                 );
 
                 info!(task_id = %task_id, "A2A task completed via agent loop");
-                TurnText::Produced(text)
+                effective_model = turn.effective_model;
+                TurnText::Produced(turn.text)
             }
             Err(e) => {
                 error!(error = %e, task_id = %task_id, "A2A agent loop failed");
@@ -873,6 +1073,10 @@ async fn handle_message_send(
                     )
                     .await;
                 }
+                // mika#2304 D3: the mika#2270 intervention point — `task` is
+                // already `mut` here and `a2a_build_task` is upstream, so nothing
+                // downstream can overwrite the field.
+                stamp_effective_model(&mut task, effective_model.as_deref());
                 let result = serde_json::to_value(&task).unwrap_or_default();
                 Json(JsonRpcResponse::success(request.id, result)).into_response()
             }
@@ -960,6 +1164,25 @@ async fn handle_message_stream(
     let context_id = params.message.context_id.clone();
     let caller_session = caller_session_id(&params).map(str::to_string);
 
+    // mika#2304: same key, same refusal, on both ports — `message/stream` shares
+    // `MessageSendParams` with `message/send`, and a field that meant different
+    // things on two endpoints of the same protocol would be worse than no field.
+    // Resolved before the task row and before the stream opens, so the refusal is
+    // still a plain JSON-RPC error rather than a `failed` frame on an open
+    // stream.
+    //
+    // NOTE: this port does **not** stamp the attestation. It serves events, not
+    // a rebuilt `Task`, and mika#2304 scopes the attestation to synchronous
+    // `message/send` — the path both doors of `mika ask` take. A stream caller
+    // lands in the honest "not attested" population, which the client renders as
+    // an absent model rather than a local guess.
+    let caller_model = match resolve_caller_model_override(agent_state, &params, &task_id) {
+        Ok(p) => p,
+        Err(err) => {
+            return Json(JsonRpcResponse::error(request.id.clone(), err)).into_response();
+        }
+    };
+
     // Create task in DB
     let session_id = match agent_state
         .db
@@ -1011,6 +1234,7 @@ async fn handle_message_stream(
             context_id,
             tx,
             only_skills,
+            caller_model,
         };
 
         // The kill-switch path already holds the lock — it was taken in the
@@ -1178,6 +1402,11 @@ struct StreamTurn {
     /// none. Carried here rather than re-read in the spawned task because
     /// `params` does not survive the spawn.
     only_skills: Vec<String>,
+    /// The caller's model, already resolved and refused-or-accepted in the
+    /// handler (mika#2304). Same reason as `only_skills` for carrying it: the
+    /// params do not survive the spawn — and the refusal must happen before the
+    /// stream opens, so it cannot be deferred here either.
+    caller_model: Option<Arc<dyn mika_common::llm::LlmProvider>>,
 }
 
 /// Run the streaming turn. The guard is taken by value and dropped with this
@@ -1196,6 +1425,7 @@ async fn run_a2a_stream_turn(
         context_id,
         tx,
         only_skills,
+        caller_model,
     } = turn;
 
     // Transition to working
@@ -1235,10 +1465,14 @@ async fn run_a2a_stream_turn(
         &task_id,
         stream_ctx_for_agent,
         &only_skills,
+        caller_model.as_ref(),
     )
     .await
     {
-        Ok(response_text) => {
+        Ok(A2aTurn {
+            text: response_text,
+            ..
+        }) => {
             // mika#2270: the literal is shared with `message/send`, which now
             // serves the same one for a turn that produced no text. Two ports
             // answering the same situation identically is a property worth being
@@ -1994,6 +2228,311 @@ mod tests {
             writebacks, 1,
             "expected exactly one write to the cached registry (the dirty-reload); \
              found {writebacks} — a restricted registry must never be one of them"
+        );
+    }
+
+    // ===================== mika#2304 — the model override =====================
+
+    fn openrouter_settings(api_key: Option<&str>) -> mika_common::config::Settings {
+        let mut settings = mika_common::config::Settings::test_defaults();
+        settings.llm_provider = mika_common::llm::ProviderKind::OpenRouter;
+        settings.openrouter_api_key = api_key.map(secrecy::SecretString::from);
+        settings
+    }
+
+    /// **T3 / AC4 — reading the key is fail-soft.**
+    ///
+    /// Every malformed shape means "no override", never an error. A caller from
+    /// an older or a newer protocol version must not be able to fail a turn with
+    /// a field this server is free to ignore — the same contract
+    /// `requested_only_skills` carries one ticket earlier.
+    #[test]
+    fn mika2304_every_unreadable_override_shape_means_no_override() {
+        assert_eq!(
+            requested_model_override(&params_with_metadata(None)),
+            None,
+            "no metadata at all"
+        );
+        for shape in [
+            serde_json::json!({}),
+            serde_json::json!({ MODEL_OVERRIDE_KEY: serde_json::Value::Null }),
+            serde_json::json!({ MODEL_OVERRIDE_KEY: 42 }),
+            serde_json::json!({ MODEL_OVERRIDE_KEY: ["sonnet"] }),
+            serde_json::json!({ MODEL_OVERRIDE_KEY: { "model": "sonnet" } }),
+            serde_json::json!({ MODEL_OVERRIDE_KEY: "" }),
+            serde_json::json!({ MODEL_OVERRIDE_KEY: "   " }),
+            // Another key's payload must not be mistaken for this one.
+            serde_json::json!({ ONLY_SKILLS_KEY: ["mika-arch-groom-ticket"] }),
+        ] {
+            let serde_json::Value::Object(map) = shape.clone() else {
+                unreachable!()
+            };
+            let params = params_with_metadata(Some(map.into_iter().collect()));
+            assert_eq!(
+                requested_model_override(&params),
+                None,
+                "shape {shape} must degrade to no override"
+            );
+        }
+    }
+
+    /// The readable case, and it comes back **raw**: the server owns alias
+    /// resolution and prefix stripping (mika#1591 depends on *this* agent's
+    /// provider), so the reader must not pre-chew the string.
+    #[test]
+    fn mika2304_a_declared_override_is_read_verbatim() {
+        let params = params_with_metadata(Some(HashMap::from([(
+            MODEL_OVERRIDE_KEY.to_string(),
+            serde_json::Value::String("  moonshotai/kimi-k2.5  ".to_string()),
+        )])));
+        assert_eq!(
+            requested_model_override(&params),
+            Some("moonshotai/kimi-k2.5"),
+            "only surrounding whitespace is removed"
+        );
+    }
+
+    /// **T4 / AC3 — applying it is fail-CLOSED.**
+    ///
+    /// The core of mika#2304. A declared override the agent cannot serve refuses;
+    /// it is never degraded to "no override". The chosen cause is a provider with
+    /// no API key, which is the only inapplicability detectable without a network
+    /// call — an id the provider does not know is not checkable at any layer and
+    /// fails, already fail-closed, at the provider's own 400/404.
+    #[test]
+    fn mika2304_an_override_the_agent_cannot_serve_refuses_the_turn() {
+        // `unwrap_err` is unavailable here: `Arc<dyn LlmProvider>` is not `Debug`.
+        let Err(err) = caller_model_provider(&openrouter_settings(None), "moonshotai/kimi-k2.5")
+        else {
+            panic!("an override with no API key must not be honoured");
+        };
+        assert!(err.contains("openrouter"), "names the provider: {err}");
+        assert!(
+            err.contains("moonshotai/kimi-k2.5"),
+            "names the model: {err}"
+        );
+    }
+
+    /// **T4's negative control**, and the assertion that would go red the day
+    /// someone aligned this key on `only_skills`' fail-soft policy.
+    ///
+    /// The refusal must be *caused by the key*: with one configured, the same
+    /// request succeeds and lands on the caller's model. Without this half, a
+    /// function that refused everything would pass the test above.
+    #[test]
+    fn mika2304_the_refusal_is_caused_by_the_key_not_by_the_override() {
+        let provider = caller_model_provider(
+            &openrouter_settings(Some("sk-or-xxx")),
+            "moonshotai/kimi-k2.5",
+        )
+        .expect("with a key configured the override must be honoured");
+        assert_eq!(provider.provider_name(), "openrouter");
+        assert_eq!(
+            provider.model_name(),
+            "moonshotai/kimi-k2.5",
+            "an honoured override must reach the provider — falling back to the \
+             configured model here is exactly the silent no-op mika#2304 closes"
+        );
+    }
+
+    /// **T4's structural half — FD1b.** `make_provider_for` routes the ten
+    /// OpenAI-compatible variants (OpenRouter included, the rail the founding
+    /// measurement ran on) to `OpenAiCompatibleProvider::new`, which returns no
+    /// `Result` and never consults `api_key`. So the key check must be *posed*
+    /// before construction, never hoped for from it. Inverting the two lines
+    /// leaves a built provider, an absent key, and a turn that departs anyway —
+    /// a defect no behavioural test on this rail can see, because the refusal
+    /// simply stops happening.
+    #[test]
+    fn mika2304_the_key_is_checked_before_the_provider_is_built() {
+        let source = include_str!("a2a.rs");
+        let body = source
+            .split_once("fn caller_model_provider(")
+            .expect("caller_model_provider must exist")
+            .1;
+        let check = body
+            .find("resolve_model_override(")
+            .expect("the key check must be in this function");
+        let build = body
+            .find("make_provider_for(")
+            .expect("the construction must be in this function");
+        assert!(
+            check < build,
+            "mika#2304 FD1b: `resolve_model_override` (which checks the API key) \
+             must precede `make_provider_for`. `OpenAiCompatibleProvider::new` \
+             succeeds with no key, so a construction-first order writes the \
+             fail-closed policy in the plan and leaves it out of the binary."
+        );
+        // And nothing may turn the refusal back into an absence.
+        for degrader in [".ok()", "unwrap_or", "unwrap_or_default", "unwrap_or_else"] {
+            assert!(
+                !body[..build + 200].contains(degrader),
+                "`{degrader}` in `caller_model_provider` would degrade a refusal \
+                 into 'no override' — the silent no-op that IS the defect (D2)"
+            );
+        }
+    }
+
+    /// **T10 — the attestation follows the provider that SERVED.**
+    ///
+    /// Structural, and the reason is worth stating rather than hiding: the
+    /// discriminating behavioural case needs a turn whose per-skill `[llm]`
+    /// override resolves to a *different* provider, and `resolve_skill_llm_override`
+    /// builds that one through `Settings::make_provider_for` — a real HTTP
+    /// provider that `MockLlmProvider` cannot stand in for. Such a turn fails at
+    /// the first call and produces no `AgentOutput` to inspect, so the end-to-end
+    /// assertion is unreachable with the eval harness as it stands.
+    ///
+    /// What *is* checkable is the wiring, and it is where the defect would live:
+    /// the attestation must be taken on `effective_llm` (post-override) and never
+    /// on `llm` (the provider handed in). A draft of this ticket placed it in this
+    /// very file, on `agent_state.llm` — it would have shipped a field asserting a
+    /// model that did not run, wearing the authority of a server attestation.
+    #[test]
+    fn mika2304_the_attestation_is_taken_on_the_serving_provider() {
+        // Needles assembled with `concat!` so this file does not contain the
+        // strings it asserts on — otherwise the scan would match itself.
+        const ON_SERVING_PROVIDER: &str = concat!("attest_", "effective_model", "(effective_llm)");
+        const FORWARDED: &str = concat!("effective_model", ": output.effective_model");
+        const ANY_ATTESTATION_SITE: &str = concat!("attest_", "effective_model");
+
+        let loop_source = include_str!("../agent_loop/mod.rs");
+        assert!(
+            loop_source.contains(ON_SERVING_PROVIDER),
+            "mika#2304 E7/FD5: the attestation must be computed from `effective_llm`, \
+             the provider that serves the turn after any per-skill `[llm]` override — \
+             not from `llm`, which is only the one handed in."
+        );
+        // The server side must read it back, never recompute one of its own.
+        // Scoped to the production half of the file: the T11 round-trip test
+        // below legitimately calls the formatter to walk the chain end to end,
+        // and it is the *shipped* code that must not have a second site.
+        let source = include_str!("a2a.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("this module has a test section")
+            .0;
+        assert!(
+            production.contains(FORWARDED),
+            "this module must forward the loop's attestation verbatim; recomputing \
+             it here would reintroduce the entry-site reading (E7)"
+        );
+        assert!(
+            !production.contains(ANY_ATTESTATION_SITE),
+            "no second attestation site: this module does not know the effective provider"
+        );
+    }
+
+    /// The attestation is stamped where mika#2270 already intervenes, and it
+    /// never overwrites a metadata map the Task already carried.
+    #[test]
+    fn mika2304_stamping_preserves_other_metadata_and_skips_when_absent() {
+        let mut task = completed_task(Some(agent_reply("ok")));
+        task.metadata = Some(HashMap::from([(
+            "kept".to_string(),
+            serde_json::Value::String("value".to_string()),
+        )]));
+
+        stamp_effective_model(&mut task, Some("openrouter/moonshotai/kimi-k2.5"));
+        let metadata = task.metadata.clone().expect("metadata should be present");
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(
+            metadata.get(EFFECTIVE_MODEL_KEY).and_then(|v| v.as_str()),
+            Some("openrouter/moonshotai/kimi-k2.5")
+        );
+        assert_eq!(metadata.get("kept").and_then(|v| v.as_str()), Some("value"));
+
+        // No attestation → nothing written, not an empty string and not a null:
+        // the client must be able to read absence as "this server did not say".
+        let mut untouched = completed_task(Some(agent_reply("ok")));
+        stamp_effective_model(&mut untouched, None);
+        assert!(untouched.metadata.is_none());
+    }
+
+    /// **Both ports refuse the same way (D2, AC3).** `message/send` and
+    /// `message/stream` share `MessageSendParams`; a key honoured on one and
+    /// ignored on the other would mean two different things on two endpoints of
+    /// the same protocol. Structural because standing both handlers up needs a
+    /// live server, and the property is about the *number of call sites*, which a
+    /// behavioural test on either one cannot see.
+    #[test]
+    fn mika2304_both_ports_resolve_the_override_before_creating_a_task() {
+        // `concat!` again: the needles must not be found in this test's own body.
+        const RESOLVE_SITE: &str = concat!("resolve_caller_model_override", "(agent_state");
+        const REFUSAL_SITE: &str = concat!(
+            "return Json(JsonRpcResponse::error(request.id.clone(), ",
+            "err)).into_response();"
+        );
+
+        let source = include_str!("a2a.rs");
+        assert_eq!(
+            source.matches(RESOLVE_SITE).count(),
+            2,
+            "both `message/send` and `message/stream` must resolve (and be able to \
+             refuse) the caller's model — on the same key, with the same policy"
+        );
+        // The refusal must reach the caller as a JSON-RPC error. Returning it as a
+        // `failed` task would leave the reason in the server log only, which is
+        // the shape the founding ticket had to work around by reading bodies.
+        assert_eq!(
+            source.matches(REFUSAL_SITE).count(),
+            2,
+            "each port must answer a refused override with a JSON-RPC error naming it"
+        );
+    }
+
+    /// **T11 — propagation and attestation describe the same model.**
+    ///
+    /// T1…T6 each check one half from its own side, and none of them can see a
+    /// wiring where both halves work while naming two different models — which
+    /// is the shape that would put the operator back where mika#2304 found them,
+    /// reading an authoritative field about a turn that ran elsewhere.
+    ///
+    /// The chain is walked on the real types, minus HTTP: request metadata →
+    /// server read → provider → attestation → `Task.metadata` → client read. The
+    /// client's two ends are the crate-shared constants, so this test and
+    /// `remote_ask`'s `send_params_carry_the_model_override_unresolved` /
+    /// `verbose_reports_the_attested_model_on_both_formats` meet on the same two
+    /// keys — which is exactly why those keys live in `mika-a2a` (D6).
+    ///
+    /// Standing the two handlers up would need a live server and a reachable
+    /// provider; the same boundary `a2a_caller_session_correlation.rs` draws for
+    /// mika#2070, and for the same reason.
+    #[test]
+    fn mika2304_the_propagated_model_and_the_attested_model_are_the_same() {
+        // 1. What the CLI puts on the wire (raw — the server owns resolution).
+        let params = params_with_metadata(Some(HashMap::from([(
+            MODEL_OVERRIDE_KEY.to_string(),
+            serde_json::Value::String("moonshotai/kimi-k2.5".to_string()),
+        )])));
+
+        // 2. What this server reads back.
+        let requested = requested_model_override(&params).expect("the key must be read");
+
+        // 3. The provider the turn will run under.
+        let settings = openrouter_settings(Some("sk-or-xxx"));
+        let Ok(provider) = caller_model_provider(&settings, requested) else {
+            panic!("a configured provider must honour the caller's model");
+        };
+
+        // 4. What the loop attests, taken on the provider that serves.
+        let attested = crate::agent_loop::attest_effective_model(provider.as_ref());
+
+        // 5. What the caller receives.
+        let mut task = completed_task(Some(agent_reply("ok")));
+        stamp_effective_model(&mut task, Some(&attested));
+
+        // 6. What the client reads, through the shared reader.
+        assert_eq!(
+            mika_a2a::attested_model(&task),
+            Some("openrouter/moonshotai/kimi-k2.5"),
+            "the model the caller asked for, the model that served, and the model \
+             attested back must be one model — two of them agreeing is not enough"
+        );
+        assert!(
+            attested.ends_with(requested),
+            "the attestation must carry the requested id, not a configured one: \
+             requested {requested}, attested {attested}"
         );
     }
 
