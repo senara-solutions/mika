@@ -15,7 +15,7 @@ issue: senara-solutions/mika#2398
 - **Objectif :** qu'une garde structurelle de ce dépôt dise la vérité sur la population qu'elle prétend couvrir. Aujourd'hui plusieurs d'entre elles décident « ceci est de la production » à partir d'une prémisse fausse, et la moitié de l'erreur va dans la direction qui ne se voit pas : la garde reste **verte** en ayant cessé de regarder.
 - **Moyens :** (1) l'audit lui-même — le relevé mesuré, site par site, avec la direction de l'erreur ; (2) un lecteur unique de la frontière production/test ; (3) la bascule des gardes dont la cécité est mesurée ; (4) une garde anti-récidive.
 - **Autorité :** ce plan > le titre du ticket mika#2398 > le commentaire opérateur du 18/09. Le corps du ticket est **vide** — le titre porte tout l'énoncé, et l'anatomie ci-dessous est établie **par mesure dans le worktree au 2026-09-19**, pas par lecture du ticket.
-- **Conditions d'arrêt :** les deux que la version précédente de ce plan posait ont été **atteintes en pré-vol et levées par correction de la règle**, pas par exception (voir KTD2 § *La règle naïve sur-ampute* et KTD3 § *La convention de nom est fausse*). Il en reste une, et elle est étroite : s'arrêter et rapporter si U1 trouve un fichier de production dont un item de niveau module ne se ferme pas à sa propre indentation — la règle reposerait alors sur un invariant `rustfmt` que le dépôt ne respecte pas.
+- **Conditions d'arrêt :** les deux que la version précédente de ce plan posait ont été **atteintes en pré-vol et levées par correction de la règle**, pas par exception (voir KTD2 § *La règle naïve sur-ampute* et KTD3 § *La convention de nom est fausse*). Il en reste une de ce type, et elle est étroite : s'arrêter et rapporter si U1 trouve un fichier de production dont un item de niveau module ne se ferme pas à sa propre indentation — la règle reposerait alors sur un invariant `rustfmt` que le dépôt ne respecte pas. Les haltes propres aux détecteurs sont nommées une à une en § *Fire-Disposition*, qui est la section décisionnelle à lire avant de faire taire un rougissement.
 - **Profil d'exécution :** Rust, `crates/mika-agent` + `crates/mika-common`, tests inline ; aucun changement de schéma, aucune surface runtime, aucun comportement de production modifié.
 - **Livraison :** le pipeline `/mika` sur la branche `feat/2398/audit-des-autres-scanners-de-sources` ouvre la PR qui ferme mika#2398.
 
@@ -49,21 +49,57 @@ Mesuré le 2026-09-19 dans le worktree, sur les cinq crates (`mika-agent`, `mika
 | 594 | `mika-common/src/claude.rs` | 457 |
 | … | 14 autres fichiers | |
 
-**Cinq implémentations de la même amputation, quatre sémantiques distinctes :**
+**Treize implémentations de la même amputation, six sémantiques distinctes.** Le recensement est
+mesuré par scan sur les cinq crates au 2026-09-19 (`(find|split|split_once|contains|starts_with|splitn)`
+appliqué à un littéral contenant `cfg(test)` ou `mod tests`) :
 
-| Site | Forme | Périmètre scanné |
-|---|---|---|
-| `auto_pull.rs:4458` | `split("#[cfg(test)]")`, garde `[0]` | **son propre fichier** (`include_str!`) |
-| `auto_pull.rs:6880` | `split_once("mod tests {")` | son propre fichier |
-| `db.rs:14855` | `src.find("#[cfg(test)]")` | **tout `mika-agent/src`** |
-| `agent_loop/mod.rs:14279` | `src.find("#[cfg(test)]")` | tout `mika-agent/src` |
-| `agent_loop/mod.rs:8739` | `split_once("\n#[cfg(test)]\nmod tests {")` | son propre fichier |
-| `tests/eval/test_dispatch_fired_at_stamped.rs:223` | `body.find("#[cfg(test)]")` | arbre source |
-| `tests/ac8_grep_discipline.rs:41` | ligne-à-ligne, `contains("#[cfg(test)]")` | arbre source |
+| Site | Forme | Périmètre scanné | Direction de l'erreur |
+|---|---|---|---|
+| `db.rs:14855` | `src.find("#[cfg(test)]")` | **tout `mika-agent/src`** | cécité, **toutes formes** |
+| `agent_loop/mod.rs:14279` | `src.find("#[cfg(test)]")` | **tout `mika-agent/src`** | cécité, **toutes formes** |
+| `tests/eval/test_dispatch_fired_at_stamped.rs:223` | `body.find("#[cfg(test)]")` | 3 fichiers nommés | **faux positif** (prédicat `contains` positif) |
+| `auto_pull.rs:4458` | `split("#[cfg(test)]")`, garde `[0]` | son propre fichier (`include_str!`) | cécité, toutes formes |
+| `auto_pull.rs:6880` | `split_once("mod tests {")` | son propre fichier | **faux positif** (un helper de niveau module reste en production) |
+| `prompt.rs:5871` | `split_once("\nmod tests {")` | son propre fichier | **faux positif**, idem |
+| `agent_loop/mod.rs:8739` | `split_once("\n#[cfg(test)]\nmod tests {")` | son propre fichier | cécité sur (3) seulement |
+| `tests/eval/test_recurring_trigger_wiring_2337.rs:70` | `find("\n#[cfg(test)]\nmod ")` | arbre source | cécité sur (3) seulement |
+| `server/a2a.rs:1976` | `split("\n#[cfg(test)]\n")` | son propre fichier | cécité sur (1), (4), (3) |
+| `server/deadline_verdict.rs:1248` | `text.find("\n#[cfg(test)]")` | son propre fichier | cécité sur (1), (4), (3) |
+| `mika-gateway/src/telegram.rs:2265` | `source.find("\n#[cfg(test)]")` | son propre fichier | cécité sur (1), (4), (3) |
+| `mika-gateway/src/telegram_markdown.rs:800` | `source.find("\n#[cfg(test)]")` | son propre fichier | cécité sur (1), (4), (3) |
+| `tests/ac8_grep_discipline.rs:41` | ligne-à-ligne + comptage d'accolades | arbre source | **les deux**, selon la dérive du compteur |
 
-La distinction de périmètre décide la priorité : une garde qui ne lit que son propre fichier a une cécité bornée par ce fichier ; une garde qui balaie `src/` hérite de la **somme** du tableau ci-dessus. `db.rs:14855` (mika#2335, disposition *halt-and-surface*) et `agent_loop/mod.rs:14279` (mika#2305) sont dans ce second cas.
+> **Note de correction — le recensement précédent en manquait six, et en classait deux à l'opposé.**
+> La version précédente de ce plan annonçait « cinq implémentations » pour sept sites, et rangeait
+> `server/deadline_verdict.rs` et `tests/eval/test_recurring_trigger_wiring_2337.rs` parmi les gardes
+> « qui n'amputent rien du tout ». Les deux amputent (aux lignes `1248` et `70`, dans le corps du test
+> dont le plan citait l'attribut `#[test]`). Six sites étaient absents, dont **deux hors `mika-agent`**
+> (`mika-gateway/src/telegram.rs`, `telegram_markdown.rs`). Conséquence directe et chiffrée sur le
+> périmètre de travail : la population que la garde anti-récidive U4 refuse est de **13**, pas de 7 —
+> voir § *Fire-Disposition*, où c'est ce qui décide de l'étendue de U3.
 
-À quoi s'ajoutent une quinzaine de gardes qui **n'amputent rien du tout** et n'excluent, au mieux, que leur propre fichier en entier : `ready_label.rs:1030`, `auto_pull_stop.rs:339`, `planning/policy.rs:143`, `grooming_marker.rs:677`, `image_disposition.rs:579`, `server/deadline_verdict.rs:1228`, `server/mod.rs:1947`, `tools/pr_merge_with_gate.rs:2392`, `task_engine/dispatcher.rs:3966` et `:4017`, `mika-common/src/llm/mod.rs:1467`, `mika-common/src/llm/retry_gate.rs:518`, `mika-common/src/permission_authority.rs:372`, `tests/only_skills_arch_pass_2363.rs:193`, `tests/eval/test_recurring_trigger_wiring_2337.rs:190`.
+**Le préfixe `\n` n'est pas cosmétique, et c'est ce qui rend la direction de l'erreur mesurable par
+site.** `find("#[cfg(test)]")` nu coupe sur une mention en prose (forme 2) ; `find("\n#[cfg(test)]")`
+exige l'attribut en tête de ligne, donc il est **robuste** à un doc-comment (précédé de `///`) et à un
+attribut indenté (forme 6), mais reste aveugle à un helper de niveau module (1) et à un item mono-ligne
+(4). `split_once("\n#[cfg(test)]\nmod tests {")` est le plus étroit : seule la forme (3) le trompe.
+Deux formes se trompent dans la direction **inverse** — `split_once("mod tests {")` laisse un helper
+`#[cfg(test)] fn` de niveau module *dans* la production et produit donc un faux positif, pas une
+cécité. La bascule ne peut donc pas être uniforme : elle rend certaines gardes voyantes et en
+**resserre** d'autres.
+
+La distinction de périmètre décide la priorité : une garde qui ne lit que son propre fichier a une
+cécité bornée par ce fichier ; une garde qui balaie `src/` hérite de la **somme** du tableau des 24
+fichiers. `db.rs:14855` (mika#2335, disposition *halt-and-surface*) et `agent_loop/mod.rs:14279`
+(mika#2305) sont dans ce second cas, et ce sont les deux dont la bascule a été simulée en pré-vol
+(§ *Fire-Disposition*).
+
+À quoi s'ajoutent une douzaine de gardes qui **n'amputent rien du tout** et n'excluent, au mieux, que
+leur propre fichier en entier : `ready_label.rs:1030`, `auto_pull_stop.rs:339`, `planning/policy.rs:143`,
+`grooming_marker.rs:677`, `image_disposition.rs:579`, `server/mod.rs:1947`,
+`tools/pr_merge_with_gate.rs:2392`, `task_engine/dispatcher.rs:3966` et `:4017`,
+`mika-common/src/llm/mod.rs:1467`, `mika-common/src/llm/retry_gate.rs:518`,
+`mika-common/src/permission_authority.rs:372`, `tests/only_skills_arch_pass_2363.rs:193`.
 
 **La prémisse — « les tests sont dans un `mod tests` inline, précédé d'un `#[cfg(test)]` en fin de fichier, et il n'y en a qu'un » — est fausse de six façons, toutes présentes dans le dépôt :**
 
@@ -188,7 +224,7 @@ Les gardes gardent chacune leur motif, leur message et leur disposition. Ce qui 
 - `docs/solutions/architecture-patterns/2026-09-19-audit-scanners-sources-structurels.md` (nouveau)
 
 **Approach :**
-1. Recenser les scanners : tout site sous `crates/*/src/**` et `crates/*/tests/**` combinant `env!("CARGO_MANIFEST_DIR")` et une lecture de l'arbre source. Exclure ceux nommés en Scope Boundaries, en disant pourquoi — un inventaire dont on ne sait pas ce qu'il a écarté ne se relit pas.
+1. Recenser les scanners : tout site sous `crates/*/src/**` et `crates/*/tests/**` combinant `env!("CARGO_MANIFEST_DIR")` et une lecture de l'arbre source. Exclure ceux nommés en Scope Boundaries, en disant pourquoi — un inventaire dont on ne sait pas ce qu'il a écarté ne se relit pas. **Recouper avec le scan des réimplémentations** (`(find|split|split_once|contains|starts_with|splitn)` sur un littéral `cfg(test)` / `mod tests`), qui doit rendre les treize sites du tableau : la première rédaction de ce plan en avait manqué six en recensant à la main, et deux crates entières avec.
 2. Pour chacun : nom du test, ticket d'origine, motif détecté, **périmètre de scan** (fichier propre / arbre — c'est ce qui décide de l'ampleur), forme de séparation production/test, chemins en dur, **direction de l'erreur**, décision (basculer maintenant / basculer plus tard / laisser, avec le motif).
 3. Reporter le tableau de la Problem Frame (24 fichiers, 14 843 lignes) et le **recalculer** à la date de l'audit plutôt que le recopier : un chiffre transcrit d'un plan est un chiffre qui a déjà commencé à vieillir.
 4. Relever les six formes à la date de l'audit : mono-lignes (8 mesurés), indentés (13), `cfg(not(test))` (1), test-only sans marqueur (2), test-only hors convention de nom (3), mentions en prose. Pour chacune, dire si la clause KTD2/KTD3 correspondante la couvre.
@@ -234,6 +270,12 @@ Les gardes gardent chacune leur motif, leur message et leur disposition. Ce qui 
 
 **Verification :** `cargo test -p mika-common` ; le lecteur appliqué aux fichiers réels `builtin_handlers.rs`, `prompt.rs`, `auto_pull.rs`, `github.rs`, `egress_search/mod.rs` rend une frontière égale à celle relevée en U1.
 
+**Note de portée, mesurée :** les deux crates que U3 touche hors `mika-agent` déclarent déjà
+`mika-common = { workspace = true, features = ["test-utils"] }` en `[dev-dependencies]`
+(`mika-agent/Cargo.toml:83`, `mika-gateway/Cargo.toml:68`). Aucun `Cargo.toml` n'est donc modifié, ce
+qui est la moitié mesurable de R7. `mika-cli` ne l'a pas et n'en a pas besoin : aucun des treize sites
+n'y est.
+
 ### U3. Bascule des gardes aveugles
 
 **Goal :** les gardes dont la cécité est mesurée voient à nouveau ce qu'elles promettent de voir.
@@ -242,17 +284,32 @@ Les gardes gardent chacune leur motif, leur message et leur disposition. Ce qui 
 
 **Dependencies :** U1, U2
 
-**Files :** les sites que U1 classe « cécité ». Sur l'état mesuré au 19/09, au moins :
-- `crates/mika-agent/src/db.rs` (~14855) — scanne tout l'arbre
+**Files :** **les treize sites du tableau de la Problem Frame**, et non les seuls « cécité ». Ce
+périmètre est imposé par la Fire-Disposition de U4, pas par R3 : U4 refuse la *réimplémentation*, pas
+la cécité, donc tout site laissé en place la fait rougir et bloque le PR. Le tri cécité / faux positif
+de KTD4 continue d'ordonner le **travail** ; il ne réduit plus la liste.
+
+- `crates/mika-agent/src/db.rs` (~14855) — arbre
 - `crates/mika-agent/src/agent_loop/mod.rs` (~14279 — arbre ; ~8739 — fichier propre)
 - `crates/mika-agent/src/auto_pull.rs` (~4458 et ~6880, dont les exclusions `db.rs` / `async_db.rs` de ~6852, R5)
+- `crates/mika-agent/src/prompt.rs` (~5871)
+- `crates/mika-agent/src/server/a2a.rs` (~1976)
+- `crates/mika-agent/src/server/deadline_verdict.rs` (~1248)
 - `crates/mika-agent/tests/eval/test_dispatch_fired_at_stamped.rs` (~223)
+- `crates/mika-agent/tests/eval/test_recurring_trigger_wiring_2337.rs` (~70)
 - `crates/mika-agent/tests/ac8_grep_discipline.rs` (~41)
+- `crates/mika-gateway/src/telegram.rs` (~2265)
+- `crates/mika-gateway/src/telegram_markdown.rs` (~800)
 
 **Approach :**
 1. Une garde à la fois : remplacer l'amputation locale par `production_slice`, exécuter la garde seule, **lire le résultat avant de passer à la suivante**. Grouper les bascules ferait d'un rougissement une énigme à N causes.
 2. Chaque rougissement se qualifie selon R6/KTD5. La qualification s'écrit dans le document U1 : c'est le rendu de l'audit, pas une note de passage.
 3. Pour les exclusions par chemin en dur d'`auto_pull.rs:6852`, appliquer R5 : soit un critère qui suit le code (le site de définition, pas le fichier qui l'héberge), soit le maintien **daté** avec ce que mika#2321 lui fera.
+
+**Fire-Disposition :** la classe « gardes basculées » est traitée en § *Fire-Disposition* (U3), avec la
+simulation pré-vol des deux gardes à périmètre arbre, le seul rougissement mesuré
+(`mika2305` sur `prompt.rs:564-565`), son traitement dans le périmètre, et l'interdiction explicite de
+l'exception par fichier.
 
 **Execution note — l'ordre a changé, et le précédent reposait sur un chiffre faux.** Commencer par **`db.rs:14855`** : c'est une garde à périmètre *arbre*, donc sa zone aveugle est la somme du tableau de la Problem Frame — **14 843 lignes**, dont `builtin_handlers.rs` (2 999) et `prompt.rs` (1 887) qu'elle ne voit pas du tout. Le plan précédent prescrivait de commencer par `auto_pull.rs:4458` au motif que sa zone aveugle était « la plus vaste » ; `auto_pull.rs:4458` scanne son **propre fichier** et sa cécité est bornée à 1 859 lignes, soit le troisième rang. La bascule la plus susceptible de rapporter quelque chose est celle qui regarde le plus de code.
 
@@ -274,8 +331,8 @@ Les gardes gardent chacune leur motif, leur message et leur disposition. Ce qui 
 **Approach :**
 1. Balayer `crates/*/src/**` et `crates/*/tests/**` via `scan_src_tree`, refuser toute ligne de production qui compose une séparation production/test à la main : `find(` / `split(` / `split_once(` / `contains(` appliqué à un littéral contenant `cfg(test)` ou `mod tests`.
 2. Le motif est écrit en morceaux recomposés (`concat!`), comme `planning/policy.rs:143` le fait déjà — sans quoi la garde est son premier offenseur. Ce contournement est aujourd'hui une contorsion locale répétée ; ici il est **le seul restant**, ce qui est une amélioration en soi.
-3. Disposition en cas de déclenchement : **halt-and-surface, sans liste d'exceptions.** Une garde qui tolère « N sites dont cinq sont nommés » ne dit plus rien le jour où le sixième arrive — c'est la forme exacte du défaut qu'elle ferme.
-4. La garde KTD3 de cohérence : tout fichier résolu comme test-only par `test_only_modules` doit exister, et tout fichier du répertoire d'un module test-only l'est aussi. **Pas de garde sur une convention de nom** — la mesure de KTD3 montre qu'elle produirait trois faux positifs immédiats.
+3. Disposition en cas de déclenchement : **halt-and-surface, sans liste d'exceptions** — formalisée en § *Fire-Disposition* (U4/1), avec sa population comptée de **13 sites** et la conséquence qu'elle impose au périmètre de U3. Une garde qui tolère « N sites dont six sont nommés » ne dit plus rien le jour où le septième arrive — c'est la forme exacte du défaut qu'elle ferme.
+4. La garde KTD3 de cohérence : tout fichier résolu comme test-only par `test_only_modules` doit exister, et tout fichier du répertoire d'un module test-only l'est aussi. **Pas de garde sur une convention de nom** — la mesure de KTD3 montre qu'elle produirait trois faux positifs immédiats. Disposition en § *Fire-Disposition* (U4/4).
 
 **Test scenarios :**
 - Le dépôt en l'état post-U3 → zéro offenseur.
@@ -284,6 +341,129 @@ Les gardes gardent chacune leur motif, leur message et leur disposition. Ce qui 
 - Une déclaration `#[cfg(test)] mod X;` dont le fichier `X.rs` est absent → détectée.
 
 **Verification :** `cargo test -p mika-common` ; la garde rougit sur la fixture de récidive et reste verte sur l'arbre réel.
+
+---
+
+## Fire-Disposition
+
+Requis par le Fire-Disposition Gate (mika#1574), soulevé par mika-arch en première passe (F1). Ce plan
+porte **quatre** livrables de classe détecteur, et non deux : U4/1 (la garde anti-récidive), U4/4 (la
+garde de cohérence KTD3), U2 (le contrôle de bonne foi sur l'axe dangereux) et — la classe que F1
+nomme en second — **les gardes existantes que U3 bascule**, qui sont des détecteurs dont ce plan change
+la population d'entrée sans toucher leur prédicat.
+
+Tous sont des `#[test]` ordinaires, donc **bloquants en CI par le job `cargo test` existant** : aucun ne
+peut lander vert mais inerte.
+
+Chaque disposition ci-dessous est écrite sur une population **comptée dans l'arbre au 2026-09-19**, et
+la mesure a contredit le plan sur deux points, reportés en Problem Frame et en U3. C'est la précaution
+qui donne son sens au gate : sur un plan dont le sujet est *« les gardes mentent sur leur population »*,
+annoncer des exceptions sans avoir compté ce qu'on exempte serait reproduire le défaut dans le remède.
+
+### U4/1 — la garde anti-récidive
+
+**Population comptée : 13 sites** (le tableau de la Problem Frame), sur cinq fichiers de plus et deux
+crates de plus que le recensement précédent. Ils sont **tous** des violations préexistantes : la garde
+refuse la réimplémentation, et les treize *sont* la réimplémentation.
+
+**Disposition : (c) halt-and-surface, avec une liste d'exceptions vide et interdite.** La conséquence
+est un élargissement de U3 aux treize sites, et c'est le prix assumé de cette option — U4 dépend de U3
+et ne peut pas être verte tant qu'un site subsiste.
+
+Le détail d'implémentation du halt : si un des treize résiste à la bascule, ou si un quatorzième
+apparaît entre cette rédaction et le land, le poseur **s'arrête et remonte à l'opérateur** plutôt que
+d'ajouter une entrée d'exemption. La raison est mesurable et non de principe : six exceptions sur treize
+laisseraient une garde qui tolère la moitié de ce qu'elle interdit, et le jour où le quatorzième arrive
+elle ne dirait plus rien — c'est la forme exacte du défaut qu'elle ferme (l'argument est déjà écrit en
+U4/Approach 3 ; la mesure de 13 est ce qui le rend chiffré). **Écarté : (a) exception nommée par site**
+pour cette raison. **Écarté : (b) land disabled** — un `#[ignore]` sur la garde qui protège le lecteur
+unique laisserait U2 sans gardien pendant que U3 crée douze nouveaux appelants, soit le moment le moins
+propice.
+
+### U4/4 — la garde de cohérence KTD3
+
+**Population : non comptée à la rédaction, et c'est U1/6 qui la compte** (tout fichier résolu comme
+test-only doit exister ; tout fichier du répertoire d'un module test-only l'est aussi). Le pré-vol a
+établi que les trois fichiers test-only hors convention de nom sont de profondeur 1 et se résolvent,
+mais il n'a pas balayé l'arbre pour une déclaration `mod X;` orpheline.
+
+**Disposition : (c) halt-and-surface.** Une déclaration `#[cfg(test)] mod X;` dont le fichier est absent
+est un état que `cargo build` refuse déjà ; si la garde en trouve un, la bonne lecture est que la
+résolution de chemin de `test_only_modules` est fausse — donc que **KTD3 est à réparer**, pas à
+exempter. C'est R6 appliqué à la lettre : un faux positif dit que la règle de frontière est fausse.
+**Écarté : (a)** — une exception nommée ici masquerait un lecteur cassé sous une entrée d'allowlist.
+
+### U2 — le contrôle de bonne foi sur l'axe dangereux
+
+**Population comptée : 24 occurrences**, et **zéro violation.** Les 24 lignes masquées commençant par
+`pub fn` / `pub async fn` sont toutes légitimes (`test_utils.rs`, `Settings::test_defaults`,
+`GitHubApp::seed_test_token`, `receiver_count`, `for_test`) et sont exclues **structurellement**, par
+`test_only_modules` (KTD3) et par la clause d'indentation de KTD2 — jamais par une liste.
+
+**Disposition : (a) allowlist nommée, avec une liste vide.** Le contrôle est bloquant dès le land, sans
+exemption ni période de grâce, parce qu'il n'y a rien à exempter. **Aucune exemption n'est écrite pour
+les 24 occurrences** : elles passent le contrôle, et exempter d'un contrôle ce qui le passe déjà crée
+une dispense morte que plus rien ne nettoie — précisément la dette que le sous-point (3) de l'option (a)
+cherche à éviter. La distinction à retenir pour un futur lecteur : **une exclusion structurelle n'est pas
+une allowlist**, et c'est ce qui fait que la liste peut rester vide sans que le contrôle soit
+permissif.
+
+**Si le contrôle fire malgré tout : (c) halt-and-surface.** Une `pub fn` de production masquée signifie
+que `production_slice` ampute de la production — c'est-à-dire que le remède a reproduit le défaut. Ni
+exemption ni élargissement : arrêt, et réparation de la règle de frontière en U2.
+
+### U3 — les gardes basculées, sur des offenses préexistantes
+
+C'est la classe que F1 nomme en second, et la seule dont la population ne pouvait pas être supposée : la
+bascule rend visible une zone que personne n'a lue. Elle a donc été **simulée en pré-vol** sur les deux
+gardes à périmètre *arbre*, celles dont la zone aveugle est la somme des 24 fichiers.
+
+| Garde basculée | Offenses préexistantes révélées | Lecture |
+|---|---|---|
+| `db.rs:14855` (mika#2335) | **0** — le motif `update_manual_task_status` + `"in_progress"` n'a aucun site de production dans la zone aveugle ; les 21 occurrences hors production sont toutes dans un `mod tests` que `production_slice` masque | reste verte |
+| `agent_loop/mod.rs:14279` (mika#2305) | **1** — `prompt.rs:564-565`, aujourd'hui invisible parce que `prompt.rs` est coupé à la **ligne 142** par le doc-comment de mika#2292 | **rougit**, et c'est un résultat |
+| `test_dispatch_fired_at_stamped.rs:223` | **0 par construction** — son prédicat est un `contains` *positif* (« le chemin de dispatch contient encore `mark_parent_dispatched` »), donc élargir la zone lue ne peut que la rendre plus verte, jamais plus rouge | reste verte |
+| les dix autres | non simulées — périmètre *fichier propre*, cécité bornée | qualification en U3/2 |
+
+**Le seul rougissement mesuré, et pourquoi il n'est pas un offenseur.** `mika2305_the_scope_has_a_single_decisional_reader`
+asserte `sites.len() == 2` et son doc-comment nomme les deux attendus : « the decision
+(`scoped_session_id`) and the rendering (`history_scope_label`) ». Son propre nom de test dit
+« outside **deserialization** ». Or le site que la bascule révèle est `deserialize_history_scope`
+(`prompt.rs:556-570`) — de la désérialisation, donc exactement ce que l'intention écrite exclut. **La
+garde excluait la désérialisation par accident de cécité, pas par prédicat** : c'est le doc-comment de
+mika#2292 à `prompt.rs:142` qui la coupait, et la Problem Frame le documentait déjà comme la forme (2)
+la plus coûteuse — *« la doc qui explique une garde déplace une autre garde »*. Ici elle ne déplaçait
+pas seulement une frontière : elle tenait une assertion en vie.
+
+**Disposition : (c) halt-and-surface par défaut, et cet offenseur-ci est traité dans le périmètre.**
+Traitement : rendre l'exclusion de la désérialisation **explicite** dans `scope_match_sites`. Ce n'est
+pas un affaiblissement au sens de R6/AC — l'assertion (`== 2`), le message et la disposition de la garde
+restent **inchangés** ; ce qui change est son prédicat de collecte, mis en conformité avec son propre
+énoncé écrit. La nuance est écrite ici parce que sans elle le poseur se croit pris entre « ne rien
+toucher à la garde » et « la laisser rouge », et choisirait probablement le contournement.
+
+**Ce qui est interdit, et qui est la tentation la plus proche : (a) une exception par fichier ou par
+zone.** Exempter `prompt.rs` de la garde `mika2305` ré-aveuglerait la garde sur exactement la zone que
+la bascule vient de rendre visible — annulant le ticket dans le geste censé le livrer. Si une exception
+nommée devient nécessaire pour un autre site, elle doit porter sur l'**offenseur exact** (chemin + ligne
++ motif), avec ticket de suivi et assertion auto-nettoyante ; à défaut de pouvoir la formuler à cette
+granularité, c'est (c).
+
+**Écarté pour cette classe : (b) land disabled.** Un `#[ignore]` sur une garde **existante et verte**
+est une perte nette de couverture : elle protégeait déjà quelque chose avant ce ticket. L'option (b) est
+réservée par la doctrine au cas où la violation existante est elle-même dangereuse à laisser non
+signalée — ce n'est pas le cas ici, où la violation est un site de désérialisation parfaitement
+légitime.
+
+**La règle de qualification, pour les dix gardes non simulées.** Chaque rougissement se qualifie selon
+R6/KTD5 et s'écrit dans le document U1 : offenseur réel → correction dans le périmètre, ou ticket nommé
+et halt ; faux positif → la règle de frontière est fausse et se répare en U2. **Aucune garde n'est
+mergée rouge** (KTD5 : « une garde rouge mergée est une garde qu'on désarme la semaine suivante »), ce
+qui fait de (c) la seule issue quand la correction ne tient pas dans le périmètre.
+
+**Halte nommée.** Si la bascule d'une garde à périmètre *arbre* révèle plus de trois offenses réelles
+distinctes, s'arrêter et remonter : l'audit a trouvé plus que ce que ce ticket peut porter, et le
+découper est une décision d'opérateur, pas une décision de poseur.
 
 ---
 
@@ -299,6 +479,7 @@ Les gardes gardent chacune leur motif, leur message et leur disposition. Ce qui 
 
 - U1–U4 livrées, tests verts, clippy et fmt propres.
 - Aucune garde n'a vu son assertion, son message ou sa disposition affaiblis pour repasser au vert.
+- La disposition retenue en § *Fire-Disposition* a été **tenue** : aucune liste d'exceptions sur U4, aucune exemption par fichier sur une garde basculée, et tout halt annoncé a effectivement remonté à l'opérateur plutôt que d'être contourné.
 - Chaque rougissement apparu pendant U3 est qualifié dans le document d'audit : offenseur réel (corrigé, ou ticket nommé) ou défaut de la règle de frontière (réparé en U2).
 - Le document d'audit nomme ce qui **n'a pas** été traité et pourquoi : les chaînes `mod` de profondeur > 1, les scanners shell, les exclusions par chemin maintenues.
 - Le corps de PR mène par le POURQUOI — les 14 843 lignes de production invisibles sur 24 fichiers, les cinq formes pour une question, le doc-comment de `prompt.rs` qui coûte 1 887 lignes à une garde voisine — et porte `Closes #2398`.
@@ -314,8 +495,11 @@ Les gardes gardent chacune leur motif, leur message et leur disposition. Ce qui 
 - [ ] `production_slice` masque une `#[cfg(test)] fn` indentée sans masquer l'`impl` de production qui la contient (forme 6, test dédié ancré sur `github.rs`).
 - [ ] Les numéros de ligne des lignes de production sont inchangés après masquage d'une région de test.
 - [ ] Aucune ligne masquée sur l'arbre réel n'est une `pub fn` de production : les seules occurrences sont celles que U1 a classées test-only.
-- [ ] Chaque garde classée « cécité » en U1 appelle `production_slice` et passe avec son assertion, son message et sa disposition **inchangés**.
+- [ ] **Les treize sites** du tableau de la Problem Frame appellent `production_slice`, et chacun passe avec son assertion, son message et sa disposition **inchangés** (un prédicat de collecte mis en conformité avec l'énoncé écrit de la garde n'est pas un affaiblissement — voir § *Fire-Disposition* / U3).
 - [ ] Une garde anti-récidive refuse toute réimplémentation locale de la séparation production/test, sans liste d'exceptions, et rougit sur une fixture de récidive.
+- [ ] Le plan porte une section `## Fire-Disposition` qui, pour **chacun** des quatre livrables de classe détecteur (U4/1, U4/4, U2, U3), nomme une des trois options canoniques de mika#1574 avec sa population comptée et son détail d'implémentation.
+- [ ] La garde `mika2305_the_scope_has_a_single_decisional_reader` passe après bascule en excluant la désérialisation **par prédicat explicite** et non par cécité, avec son `assert_eq!(sites.len(), 2)` inchangé.
+- [ ] Aucune exception n'est posée par fichier ni par zone sur une garde basculée ; toute exemption éventuelle porte sur un offenseur exact (chemin + ligne + motif) avec ticket de suivi et assertion auto-nettoyante.
 - [ ] Aucune garde ne repose sur une convention de nom de fichier pour décider qu'un fichier est test-only.
 - [ ] `cargo build --release` réussit et le lecteur n'entre dans aucun binaire de production ; aucun fichier de production ne change hors déclarations de module.
 - [ ] Le document nomme les populations non traitées (chaînes `mod` de profondeur > 1, scanners shell, exclusions par chemin maintenues) avec, pour chacune, la conséquence de son maintien.
@@ -326,8 +510,58 @@ Les gardes gardent chacune leur motif, leur message et leur disposition. Ce qui 
 - **Mesures du 2026-09-19** dans le worktree, sur 337 fichiers `.rs` des cinq crates : 14 843 lignes de production non vides perdues sur 24 fichiers ; 8 items `cfg(test)` mono-ligne ; 13 attributs `cfg(test)` indentés ; 1 `cfg(not(test))` ; 2 fichiers test-only sans marqueur ; 3 fichiers test-only hors convention de nom ; 481 lignes sur-amputées par la règle « premier `}` en colonne 0 ».
 - mika#2321 — découpage de `db.rs` ; `scripts/check-secrets.sh:44` (exception `LARGE_FILE_ALLOWLIST`, posée par le commit `5a7a50fb`).
 - mika#2310 — `crates/mika-agent/src/db/tests/harnais_porte.rs`, premier fichier test-only né de la pression du plafond ; son commentaire de tête dit pourquoi.
-- Les sept formes d'amputation : `auto_pull.rs:4458` et `:6880`, `db.rs:14855`, `agent_loop/mod.rs:14279` et `:8739`, `tests/eval/test_dispatch_fired_at_stamped.rs:223`, `tests/ac8_grep_discipline.rs:41`.
+- **Les treize formes d'amputation**, mesurées par scan le 2026-09-19 : `db.rs:14855`, `agent_loop/mod.rs:14279` et `:8739`, `auto_pull.rs:4458` et `:6880`, `prompt.rs:5871`, `server/a2a.rs:1976`, `server/deadline_verdict.rs:1248`, `tests/eval/test_dispatch_fired_at_stamped.rs:223`, `tests/eval/test_recurring_trigger_wiring_2337.rs:70`, `tests/ac8_grep_discipline.rs:41`, `mika-gateway/src/telegram.rs:2265`, `mika-gateway/src/telegram_markdown.rs:800`.
+- **La simulation de bascule du 2026-09-19** (§ Fire-Disposition / U3) : 0 offense sur le motif de `db.rs:14855` (`update_manual_task_status` + `"in_progress"` : 21 occurrences hors production, toutes masquées par `production_slice`) ; **1** offense sur celui d'`agent_loop/mod.rs:14279` (`HistoryScope::` en bras de match — `prompt.rs:564-565`, `deserialize_history_scope`, invisible aujourd'hui parce que `prompt.rs` est coupé à la ligne 142) ; 0 par construction pour `test_dispatch_fired_at_stamped.rs:223`, dont le prédicat est un `contains` positif.
+- `docs/solutions/best-practices/fire-disposition-doctrine.md` — les trois options canoniques (a)/(b)/(c) et le gate mika#1574 qui les exige.
+- `crates/mika-agent/Cargo.toml:83` et `crates/mika-gateway/Cargo.toml:68` — `mika-common` avec `features = ["test-utils"]` déjà en `[dev-dependencies]` dans les deux crates que U3 touche.
 - Les faux-amers mesurés : `auto_pull.rs:1922`→`1936` (helper `#[cfg(test)] fn`), `prompt.rs:142` (mention en prose, mika#2292, −1 887 lignes), `agent_loop/mod.rs:8621` et `db.rs:14780` (mentions en prose bénignes), `builtin_handlers.rs:590`/`:592` (`cfg(not(test))` + mono-ligne adjacents), `github.rs:598`–`619` (`impl` de production à trois `fn` de test indentées), `egress_search/mod.rs:364` (mono-ligne, −356 lignes si mal bornée), `lib.rs:46` + `test_utils.rs`, `llm/mod.rs:5` + `mock.rs`, `voice/mod.rs:81` + `examples.rs` (test-only hors convention de nom).
 - Les gardes sans amputation : `ready_label.rs:1030` (mika#2315), `planning/policy.rs:143` (mika#2189), `grooming_marker.rs:677` (mika#2158), `auto_pull.rs:6849` (mika#2361), `auto_pull_stop.rs:339` (mika#2329), `deadline_verdict.rs:1228` (mika#2368), `pr_merge_with_gate.rs:2392` (mika#2238), `dispatcher.rs:3966`/`:4017` (mika#2205), `llm/mod.rs:1467` (mika#2342), `image_disposition.rs:579` (mika#1784).
 - Doctrine : `feedback_structural_gate_audit_grep_all_callsites` (« une garde qui couvre trois appelants sur quatre est une garde qui ment »), citée au site de `planning/policy.rs`.
 - `mika_common::llm::mock` et `Settings::test_defaults()` — précédent de la porte `test-utils` pour du code de test partagé entre crates.
+
+## Revision history
+
+- **rev 2 (2026-09-19) — adressé F1** (section `## Fire-Disposition` manquante pour les deliverables de
+  classe détecteur ; citation : review-guide.md § Fire-Disposition Gate, mika#1574).
+
+  Ajout de la section `## Fire-Disposition`, placée entre les Implementation Units et le Verification
+  Contract. Elle couvre **quatre** livrables et non les deux que F1 nommait : U4/1 (garde anti-récidive)
+  et U4/4 (garde de cohérence KTD3) comme demandé, plus U2 (le contrôle de bonne foi sur l'axe
+  dangereux, qui est aussi un scan bloquant) et U3 (les gardes basculées, la classe que F1 nomme en
+  second). Options retenues : **(c)** pour U4/1 avec liste d'exceptions vide et interdite, **(c)** pour
+  U4/4, **(a) avec liste vide** pour U2, **(c) par défaut avec traitement dans le périmètre** pour U3.
+  Chaque option porte sa population comptée, son détail d'implémentation, et les options écartées avec
+  leur motif.
+
+  Trois mesures ont été prises en pré-vol pour ne pas écrire la section sur une population supposée, et
+  **deux d'entre elles ont contredit le plan** — répercuté hors de la seule section :
+
+  1. **Le recensement des amputations était incomplet : 13 sites, pas 7.** Six sites étaient absents
+     (`prompt.rs:5871`, `server/a2a.rs:1976`, `server/deadline_verdict.rs:1248`,
+     `tests/eval/test_recurring_trigger_wiring_2337.rs:70`, `mika-gateway/src/telegram.rs:2265`,
+     `telegram_markdown.rs:800`), dont deux hors `mika-agent`, et deux d'entre eux étaient rangés à
+     l'opposé, parmi les gardes « qui n'amputent rien ». Tableau de la Problem Frame refait avec une
+     colonne *direction de l'erreur*, note de correction ajoutée, liste des gardes sans amputation
+     corrigée, U1/1 doté du scan qui aurait attrapé l'omission, Sources mises à jour. **Conséquence sur
+     le périmètre :** U3 passe de 7 à 13 sites, parce que U4 refuse la réimplémentation et non la
+     cécité — un site laissé en place la fait rougir et bloque le PR. C'est la disposition (c) de U4/1
+     qui impose cet élargissement, et le dire est tout l'objet du gate.
+  2. **La bascule fait rougir exactement une garde, et ce n'est pas un offenseur.**
+     `mika2305_the_scope_has_a_single_decisional_reader` asserte `sites.len() == 2` ; la bascule révèle
+     `prompt.rs:564-565` (`deserialize_history_scope`), aujourd'hui invisible parce que `prompt.rs` est
+     coupé à la **ligne 142** par le doc-comment de mika#2292 — la forme (2) que la Problem Frame
+     décrivait déjà comme la plus coûteuse. Le nom du test dit « outside deserialization » : la garde
+     excluait la désérialisation **par accident de cécité, pas par prédicat**. Traité dans le périmètre
+     en rendant l'exclusion explicite, sans toucher l'assertion, le message ni la disposition.
+     L'exception par fichier est explicitement interdite : elle ré-aveuglerait la garde sur la zone que
+     la bascule vient de rendre visible.
+  3. **Aucun `Cargo.toml` n'est modifié.** `mika-agent` et `mika-gateway` — les deux seules crates que
+     U3 touche — déclarent déjà `mika-common = { features = ["test-utils"] }` en `[dev-dependencies]`.
+     Noté en U2/Verification, ce qui rend R7 vérifiable plutôt que postulé.
+
+  Trois AC ajoutés (existence et complétude de la section ; `mika2305` passant par prédicat explicite ;
+  interdiction de l'exemption par fichier), un AC resserré (« les treize sites » au lieu de « chaque
+  garde classée cécité »), une ligne ajoutée à la Definition of Done. **Aucun AC affaibli** — la
+  résolution de F1 en a rendu un strictement plus exigeant.
+
+  Rien n'a été laissé en « Could not address ».
