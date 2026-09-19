@@ -368,6 +368,7 @@ async fn spawn_agent_worker(
                         // override for a skill's `[llm]` section to displace, and
                         // the #463 precedence is unchanged on this path.
                         caller_model_override: false,
+                        session_isolated: false,
                         trace_id: None,
                         correlated_task_id: None,
                         internal: false,
@@ -491,6 +492,7 @@ async fn spawn_agent_worker(
                         // mika#2304: see the sibling construction above — the
                         // chat worker's provider already carries any `--model`.
                         caller_model_override: false,
+                        session_isolated: false,
                         trace_id: trace_id.clone(),
                         correlated_task_id: None,
                         internal: false,
