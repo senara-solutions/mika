@@ -1612,6 +1612,11 @@ async fn run_agent_for_message(
         // mika#2304: the inbound-message path carries no caller model override —
         // a Telegram or GitHub webhook has no way to name one.
         caller_model_override: false,
+        // mika#1951: nor a session-isolation request, and it must not acquire
+        // one by accident. This is the path where every inbound message already
+        // mints a fresh session id, so isolating here would erase the
+        // conversational continuity that agent scope exists to carry.
+        session_isolated: false,
         trace_id: Some(req.request_id.clone()),
         correlated_task_id: None,
         internal: false,
