@@ -392,7 +392,7 @@ expect allow "arborescence portant un autre nom: geste nominal" \
 # quatre occurrences ont été mesurées, et c'est ce qui rend son raisonnement
 # relisible. Ce qui est interdit, c'est qu'un chemin gouverne une DÉCISION.
 GUARD_CODE=$(sed 's/^[[:space:]]*#.*$//' "$GUARD")
-if printf '%s' "$GUARD_CODE" | grep -qE '/data/workspace|senara-solutions|mika-platform'; then
+        if grep -qE '/data/workspace|senara-solutions|mika-platform' <<<"$GUARD_CODE"; then
 	ko "le script ne code aucun chemin de machine en dur" \
 		"un chemin absolu ou un nom d'organisation apparaît hors commentaire dans $GUARD"
 else
