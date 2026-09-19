@@ -42,7 +42,8 @@ fn offending_lines(path: &Path, production: &str) -> Vec<String> {
 
 #[test]
 fn override_used_true_only_in_tests_and_comments() {
-    let scanner = mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+    let scanner =
+        mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
     let mut offenders = Vec::new();
     scanner.for_each(|path, production| {
         offenders.extend(offending_lines(path, production));

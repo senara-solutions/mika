@@ -217,7 +217,8 @@ async fn dispatching_never_resurrects_a_parent_cancelled_meanwhile() {
 /// garde anti-récidive.
 #[test]
 fn every_production_dispatch_path_stamps() {
-    let scanner = mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+    let scanner =
+        mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
     // (fichier, fonction qui dispatche) — le recensement exhaustif des
     // appelants de production de la transition parente.
     for (rel, marker) in [

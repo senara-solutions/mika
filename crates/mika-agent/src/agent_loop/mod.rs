@@ -14485,8 +14485,10 @@ mod tests {
         // A `#[cfg(test)]` tail is not production.
         let with_test_tail = "fn prod() {}\n#[cfg(test)]\nmod tests {\n    match s { HistoryScope::Agent => 1, HistoryScope::Session => 2 };\n}\n";
         assert!(
-            scope_match_sites(&mika_common::source_guard::mask_test_regions(with_test_tail))
-                .is_empty(),
+            scope_match_sites(&mika_common::source_guard::mask_test_regions(
+                with_test_tail
+            ))
+            .is_empty(),
             "the test tail must be masked before scanning"
         );
 

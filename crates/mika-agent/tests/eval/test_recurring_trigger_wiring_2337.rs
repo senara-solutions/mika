@@ -181,7 +181,8 @@ fn source_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// voyait pas, c'est un fichier **intégralement** de test, qui ne porte aucun
 /// marqueur parce que l'attribut est sur la déclaration `mod` chez le parent.
 fn registered_triggers() -> BTreeMap<String, String> {
-    let scanner = mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+    let scanner =
+        mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
     let src_dir = scanner.src_root().to_path_buf();
 
     let mut found = BTreeMap::new();

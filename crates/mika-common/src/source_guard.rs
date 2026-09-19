@@ -1041,84 +1041,44 @@ fn blank_like(content: &str) -> String {
 mod tests {
     use super::*;
 
-    /// TEMPORARY measurement harness for the mika#2398 audit. Removed before land.
+    /// **No region in this workspace fails to close at its own indentation.**
+    ///
+    /// The residual stop condition of the mika#2398 plan: KTD2 rests on the
+    /// `rustfmt` invariant that CI already enforces (`cargo fmt --check`), and
+    /// on nothing else. Measured over 338 files on 2026-09-19: zero. A hit here
+    /// means the invariant no longer holds on some file, so the rule needs
+    /// re-deciding rather than the report needs silencing — the region is left
+    /// **visible** meanwhile, which is the loud direction.
     #[test]
-    #[ignore]
-    fn mika2398_measure_the_tree() {
-        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_path_buf();
-        let crates = [
-            "mika-agent",
-            "mika-common",
-            "mika-gateway",
-            "mika-cli",
-            "mika-a2a",
-        ];
-        let mut total_lost = 0usize;
-        let mut rows: Vec<(usize, String, usize)> = Vec::new();
-        let mut files_total = 0usize;
+    fn mika2398_no_region_in_this_workspace_fails_to_close() {
+        let mut unclosed: Vec<String> = Vec::new();
+        let mut scanned = 0usize;
 
-        for name in crates {
-            let src = workspace.join("crates").join(name).join("src");
+        for (_, src, _) in workspace_source_roots() {
             let scanner = ProductionScanner::new(&src);
-            println!(
-                "\n### {name}: test-only = {:?}",
-                scanner
-                    .test_only()
-                    .files()
-                    .iter()
-                    .map(|p| p.strip_prefix(&src).unwrap().display().to_string())
-                    .collect::<Vec<_>>()
-            );
-            println!("    unresolved = {:?}", scanner.test_only().unresolved());
-            println!("    max_chain_depth = {}", scanner.test_only().max_chain_depth());
-
             for path in scanner.files() {
-                files_total += 1;
-                let content = std::fs::read_to_string(&path).unwrap();
-                let report = scanner.report_of_content(&path, &content);
-                if !report.unclosed.is_empty() {
-                    println!(
-                        "    UNCLOSED {}: {:?}",
-                        path.strip_prefix(&workspace).unwrap().display(),
-                        report.unclosed
-                    );
-                }
-                if report.test_only_file {
-                    continue;
-                }
-                // What a naive `find("#[cfg(test)]")` truncation would lose:
-                // production lines after the first occurrence of the marker.
-                let marker = ["#[cfg", "(test)]"].concat();
-                if let Some(at) = content.find(&marker) {
-                    let cut_line = content[..at].matches('\n').count() + 1;
-                    let lost = report
-                        .production
-                        .lines()
-                        .skip(cut_line)
-                        .filter(|l| !l.trim().is_empty())
-                        .count();
-                    if lost > 0 {
-                        total_lost += lost;
-                        rows.push((
-                            lost,
-                            path.strip_prefix(&workspace).unwrap().display().to_string(),
-                            cut_line,
-                        ));
-                    }
+                let content = std::fs::read_to_string(&path).expect("readable source file");
+                scanned += 1;
+                for line in scanner.report_of_content(&path, &content).unclosed {
+                    unclosed.push(format!("{}:{line}", path.display()));
                 }
             }
         }
-        rows.sort_by(|a, b| b.0.cmp(&a.0));
-        println!("\n### files scanned = {files_total}");
-        println!("### truncation would lose {total_lost} production lines over {} files", rows.len());
-        for (lost, path, cut) in rows.iter().take(30) {
-            println!("| {lost} | `{path}` | {cut} |");
-        }
+
+        assert!(scanned > 300, "the scan read {scanned} files — broken path");
+        assert!(
+            unclosed.is_empty(),
+            "mika#2398 — {} `cfg(test)` region(s) could not be bounded by the \
+             indentation rule:\n{}\n\n\
+             The rule rests on `rustfmt` closing an item at its own indentation, \
+             which `cargo fmt --check` enforces in CI. A hit means that invariant \
+             does not hold here. The region is left VISIBLE (never masked to \
+             end-of-file — that would be the blindness this module removes), so \
+             the symptom is a guard reddening on test code, not a guard going \
+             quiet. Re-decide the rule; do not silence this report.",
+            unclosed.len(),
+            unclosed.join("\n")
+        );
     }
 
     // -- KTD2, one test per measured form -----------------------------------
@@ -1210,7 +1170,10 @@ pub fn production_after() {}
 ";
         let out = mask_test_regions(src);
         let kept: Vec<&str> = out.lines().collect();
-        assert_eq!(kept[0], "#[cfg(not(test))]", "cfg(not(test)) marks production");
+        assert_eq!(
+            kept[0], "#[cfg(not(test))]",
+            "cfg(not(test)) marks production"
+        );
         assert_eq!(kept[1], "const TICK: u64 = 30;");
         assert_eq!(kept[2], "", "the attribute is masked");
         assert_eq!(kept[3], "", "and its item, and nothing else");
@@ -1248,7 +1211,9 @@ pub fn even_further_below() {}
     fn mika2398_f5_cfg_not_test_is_production() {
         assert!(!condition_is_positively_test("not(test)"));
         assert!(condition_is_positively_test("test"));
-        assert!(condition_is_positively_test("any(test, feature = \"test-utils\")"));
+        assert!(condition_is_positively_test(
+            "any(test, feature = \"test-utils\")"
+        ));
         assert!(condition_is_positively_test("all(test, unix)"));
         assert!(
             !condition_is_positively_test("feature = \"test-utils\""),
@@ -1369,8 +1334,14 @@ pub fn after() {}
 ";
         let out = mask_test_regions(src);
         assert_eq!(src.lines().count(), out.lines().count());
-        let after_at = out.lines().position(|l| l.contains("pub fn after")).unwrap();
-        let src_after_at = src.lines().position(|l| l.contains("pub fn after")).unwrap();
+        let after_at = out
+            .lines()
+            .position(|l| l.contains("pub fn after"))
+            .unwrap();
+        let src_after_at = src
+            .lines()
+            .position(|l| l.contains("pub fn after"))
+            .unwrap();
         assert_eq!(after_at, src_after_at);
     }
 
@@ -1430,7 +1401,10 @@ pub fn before() {}
     #[test]
     fn mika2398_module_dir_follows_the_rust_convention() {
         assert_eq!(module_dir(Path::new("src/lib.rs")), Path::new("src"));
-        assert_eq!(module_dir(Path::new("src/llm/mod.rs")), Path::new("src/llm"));
+        assert_eq!(
+            module_dir(Path::new("src/llm/mod.rs")),
+            Path::new("src/llm")
+        );
         assert_eq!(module_dir(Path::new("src/db.rs")), Path::new("src/db"));
     }
 
@@ -1492,51 +1466,277 @@ pub fn before() {}
         );
     }
 
-    /// **The good-faith control, on the dangerous axis.**
-    ///
-    /// Applied to a real tree, no masked line may be a `pub fn` that production
-    /// needs. The only ones this module masks are test helpers, and they are
-    /// excluded **structurally** — by KTD3 and by the indentation clause — never
-    /// by a list. An allowlist is deliberately absent, and it is empty because
-    /// there is nothing to exempt: exempting what already passes creates a dead
-    /// dispensation nothing later cleans up.
-    ///
-    /// If this fires, `production_slice` is amputating production — the remedy
-    /// reproducing the defect. Halt and repair the boundary rule; do not widen
-    /// the control.
-    #[test]
-    fn mika2398_masking_never_hides_a_production_pub_fn() {
-        let scanner = ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
-        let mut hidden: Vec<String> = Vec::new();
+    // -- U4: the anti-recurrence guard ---------------------------------------
 
-        for path in scanner.files() {
-            let content = std::fs::read_to_string(&path).expect("readable source file");
-            if scanner.test_only().contains(&path) {
-                continue; // an entirely test-only file legitimately hides everything
+    /// Crates of this workspace, and the two trees each one's guards live in.
+    fn workspace_source_roots() -> Vec<(String, PathBuf, Option<PathBuf>)> {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("mika-common sits at <workspace>/crates/mika-common")
+            .to_path_buf();
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(workspace.join("crates"))
+            .expect("the guard must be able to read crates/")
+            .flatten()
+        {
+            let dir = entry.path();
+            let src = dir.join("src");
+            if !src.is_dir() {
+                continue;
             }
-            let production = scanner.production_of_content(&path, &content);
-            for (n, (original, kept)) in content.lines().zip(production.lines()).enumerate() {
-                if !kept.is_empty() {
-                    continue;
+            let name = dir
+                .file_name()
+                .expect("a crate directory has a name")
+                .to_string_lossy()
+                .to_string();
+            let tests = dir.join("tests");
+            out.push((name, src, tests.is_dir().then_some(tests)));
+        }
+        assert!(
+            out.len() >= 5,
+            "the guard found {} crates — it is not reading the workspace",
+            out.len()
+        );
+        out.sort();
+        out
+    }
+
+    /// A line that composes the production/test boundary by hand.
+    ///
+    /// The needles are recomposed with [`concat!`] rather than written whole.
+    /// This module is masked from its own scan twice over — it is declared
+    /// `#[cfg(any(test, feature = "test-utils"))]` in `lib.rs`, so KTD3 makes
+    /// the whole file test-only, and this block would be masked by KTD2 anyway
+    /// — so the recomposition buys nothing *today*. It is written because the
+    /// day either of those two facts changes, a guard that is its own first
+    /// offender does not fail informatively: it fails on itself, and the
+    /// natural repair is to widen it until it catches nothing.
+    fn reimplements_the_boundary(line: &str) -> bool {
+        let trimmed = line.trim_start();
+        // Prose must be able to describe what is forbidden — including the doc
+        // comments of this module, which name every one of the six forms.
+        if trimmed.starts_with("//") || trimmed.starts_with('*') {
+            return false;
+        }
+        let markers = [concat!("cfg(", "test)"), concat!("mod ", "tests")];
+        let readers = [
+            ".find(",
+            ".split(",
+            ".split_once(",
+            ".contains(",
+            ".starts_with(",
+            ".splitn(",
+        ];
+        readers.iter().any(|reader| {
+            let Some(at) = line.find(reader) else {
+                return false;
+            };
+            let argument = &line[at + reader.len()..];
+            markers.iter().any(|marker| argument.contains(marker))
+        })
+    }
+
+    /// **U4 — no fourteenth hand-rolled production/test boundary.**
+    ///
+    /// Population when this guard was written: **13 sites, six semantics**, all
+    /// of them switched by U3. A fourteenth would make no decision wrong the day
+    /// it is written; it would diverge afterwards, exactly as the thirteen
+    /// diverged — one of them carrying a comment saying it *mirrored* another,
+    /// having then missed both its widenings. No behavioural assertion can see
+    /// that class, which is why this is a source scan, the same family as
+    /// `grooming_marker::no_grooming_regex_outside_this_module` and
+    /// `auto_pull::mika2131_exclusion_skips_never_return_to_an_uncollected_debug`.
+    ///
+    /// **Disposition: halt-and-surface, with an exception list that is empty and
+    /// forbidden** (mika#2398 Fire-Disposition U4/1). Six exemptions out of
+    /// thirteen would leave a guard tolerating half of what it forbids, and the
+    /// day the fourteenth arrived it would say nothing — the exact shape of the
+    /// defect it closes. If a site genuinely cannot call `production_slice`,
+    /// stop and raise it; do not add an entry here.
+    ///
+    /// This guard is also the reader's first client, so a green run is evidence
+    /// that the reader works on the most hostile file there is: the one that
+    /// names the pattern it forbids.
+    #[test]
+    fn mika2398_no_scanner_reimplements_the_production_test_boundary() {
+        let mut offenders: Vec<String> = Vec::new();
+
+        for (crate_name, src, tests) in workspace_source_roots() {
+            let scanner = ProductionScanner::new(&src);
+            let mut collect = |path: &Path, production: &str| {
+                for (n, line) in production.lines().enumerate() {
+                    if reimplements_the_boundary(line) {
+                        offenders.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+                    }
                 }
-                let trimmed = original.trim_start();
-                if trimmed.starts_with("pub fn ") || trimmed.starts_with("pub async fn ") {
-                    hidden.push(format!("{}:{}: {}", path.display(), n + 1, trimmed));
-                }
+            };
+            scanner.for_each(&mut collect);
+            // A crate's `tests/` tree carries three of the thirteen. KTD3 does
+            // not apply there — an integration-test file is not a module of
+            // `src/` — so those files are masked by KTD2 alone, which is right:
+            // their `#[test]` bodies are the production this kind of guard reads.
+            if let Some(tests) = tests {
+                scanner.for_each_under(&tests, &mut collect);
             }
+            let _ = crate_name;
         }
 
-        // Test helpers legitimately declared `pub` inside a masked region are
-        // the expected population here; what must never appear is a `pub fn` at
-        // module level that production calls. The assertion is on the shape:
-        // every hidden `pub fn` must sit inside a `cfg(test)` region, which is
-        // true by construction of the masker — so this reports rather than
-        // forbids, and the forbidding is done by the per-crate guards.
-        for line in &hidden {
+        assert!(
+            offenders.is_empty(),
+            "mika#2398 — {} site(s) compose the production/test boundary by hand \
+             instead of calling `mika_common::source_guard`:\n{}\n\n\
+             WHY THIS MATTERS: thirteen sites did this, in six different ways, on \
+             a premise that is false six ways over in this tree (a module-level \
+             `#[cfg(test)]` helper, a prose mention of the marker, a file that is \
+             entirely test code and carries no marker, a single-line item, \
+             `cfg(not(test))` marking production, an indented attribute). Half the \
+             error goes in the direction nobody sees: the guard stays green having \
+             stopped looking. Truncating at the first marker cost 14 043 \
+             production lines across 22 files.\n\
+             FIX: `ProductionScanner::for_crate(env!(\"CARGO_MANIFEST_DIR\"))`, then \
+             `.for_each(..)` or `.production_of(&path)`.\n\
+             There is NO exception list, and adding one is not the remedy — see \
+             this test's doc comment.",
+            offenders.len(),
+            offenders.join("\n")
+        );
+    }
+
+    /// U4's good-faith control: the guard must fire on a re-introduction.
+    ///
+    /// Written against fabricated lines rather than by editing real source — a
+    /// detector verified only by its own green is verified by nothing.
+    #[test]
+    fn mika2398_the_anti_recurrence_guard_fires_on_a_relapse() {
+        for relapse in [
+            r##"        let production = match src.find("#[cfg(test)]") {"##,
+            r##"            .split_once("\nmod tests {")"##,
+            r##"        let p = source.split("\n#[cfg(test)]\n").next();"##,
+            r##"            if line.contains("#[cfg(test)]") {"##,
+        ] {
             assert!(
-                !line.contains(" pub fn main("),
-                "masking hid an entry point: {line}"
+                reimplements_the_boundary(relapse),
+                "the guard must catch a re-introduced boundary: {relapse}"
             );
         }
+
+        // Prose describing the rule is not a breach of it — without this, the
+        // doc comments of this very module would be the guard's first offender.
+        for innocent in [
+            r##"    /// splitting at the first `#[cfg(test)]` cut this file at line 142"##,
+            r##"    // `split_once("mod tests {")` left the helper in production"##,
+            r##"        let production = scanner.production_of(&path);"##,
+            r##"        if line.contains("override_used = true") {"##,
+        ] {
+            assert!(
+                !reimplements_the_boundary(innocent),
+                "the guard must not fire on: {innocent}"
+            );
+        }
+    }
+
+    /// Every `pub fn` this module hides on the real tree, measured 2026-09-19.
+    ///
+    /// **This is a census, not an allowlist**, and the difference is the whole
+    /// point of freezing it. These eight are not *exempted* from the control
+    /// below — they pass it, because each sits under an indented `cfg(test)`
+    /// attribute inside a production item and is excluded **structurally**, by
+    /// the boundary rule itself. Writing them as exemptions would create a dead
+    /// dispensation nothing later cleans up; writing them as a census makes a
+    /// future widening of the rule visible the moment it happens.
+    const MASKED_PUB_FN_CENSUS: &[(&str, &str)] = &[
+        (
+            "mika-agent/src/server/permissions_stream.rs",
+            "receiver_count",
+        ),
+        ("mika-agent/src/server/tasks_stream.rs", "receiver_count"),
+        ("mika-cli/src/tui/app.rs", "new"),
+        ("mika-common/src/claude.rs", "for_test"),
+        ("mika-common/src/config.rs", "test_defaults"),
+        ("mika-common/src/github_app.rs", "new"),
+        ("mika-common/src/github_app.rs", "seed_test_token"),
+        ("mika-common/src/github_app.rs", "new_with_test_token"),
+    ];
+
+    /// **The good-faith control, on the dangerous axis.**
+    ///
+    /// Applied to a real tree, the `pub fn` this module hides must be exactly
+    /// the eight test helpers of [`MASKED_PUB_FN_CENSUS`] — no more.
+    ///
+    /// **What this is, stated rather than overclaimed.** It is a frozen census,
+    /// not a proof: no mechanical predicate can tell a swallowed production
+    /// function from a legitimately masked helper without re-deriving what the
+    /// masker just decided, which would be circular. What freezing buys is that
+    /// a future permissiveness in the boundary rule cannot pass unnoticed — a
+    /// region that started over-running would add names here, and the diff names
+    /// them.
+    ///
+    /// **A change is a result to read, not a failure to silence.** A new entry
+    /// means either a new test helper (add it, with the reason) or
+    /// `production_slice` amputating production — the remedy reproducing the
+    /// defect, which is halt-and-surface: repair the boundary rule in KTD2, do
+    /// not widen this control.
+    #[test]
+    fn mika2398_masking_never_hides_a_production_pub_fn() {
+        let mut hidden: Vec<(String, String)> = Vec::new();
+
+        for (_, src, _) in workspace_source_roots() {
+            let scanner = ProductionScanner::new(&src);
+            let crates_root = src
+                .parent()
+                .and_then(Path::parent)
+                .expect("<workspace>/crates");
+            for path in scanner.files() {
+                if scanner.test_only().contains(&path) {
+                    continue; // an entirely test-only file legitimately hides everything
+                }
+                let content = std::fs::read_to_string(&path).expect("readable source file");
+                let production = scanner.production_of_content(&path, &content);
+                let rel = path
+                    .strip_prefix(crates_root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                for (original, kept) in content.lines().zip(production.lines()) {
+                    if !kept.is_empty() {
+                        continue;
+                    }
+                    let trimmed = original.trim_start();
+                    let Some(rest) = trimmed
+                        .strip_prefix("pub async fn ")
+                        .or_else(|| trimmed.strip_prefix("pub fn "))
+                    else {
+                        continue;
+                    };
+                    let name = rest
+                        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                        .next()
+                        .unwrap_or_default();
+                    hidden.push((rel.clone(), name.to_string()));
+                }
+            }
+        }
+
+        hidden.sort();
+        let mut expected: Vec<(String, String)> = MASKED_PUB_FN_CENSUS
+            .iter()
+            .map(|(f, n)| ((*f).to_string(), (*n).to_string()))
+            .collect();
+        expected.sort();
+
+        assert_eq!(
+            hidden, expected,
+            "mika#2398 — the set of `pub fn` hidden by the production/test boundary \
+             has changed.\n\n\
+             READ THIS BEFORE EDITING THE CENSUS. A new entry is one of two things:\n\
+             (a) a new test helper under a `cfg(test)` attribute — add it here with \
+             the reason, this census is not an allowlist and carries no exemption;\n\
+             (b) `production_slice` masking production, i.e. the remedy reproducing \
+             the defect it removes. That is halt-and-surface: repair the boundary \
+             rule (KTD2), do NOT widen this control.\n\
+             A *missing* entry means the boundary stopped covering a helper, which \
+             will show up as a guard reddening on test code."
+        );
     }
 }

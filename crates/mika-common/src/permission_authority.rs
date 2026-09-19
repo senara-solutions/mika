@@ -335,43 +335,31 @@ mod tests {
     /// tests and comments within this crate (`mika-common`). Full-tree
     /// enforcement lives in the `override_used_true_only_in_tests_and_comments`
     /// integration test at `tests/ac8_grep_discipline.rs`.
+    ///
+    /// **The two halves read the boundary the same way (mika#2398).** This one
+    /// used to skip its own file wholesale and read every *other* crate file's
+    /// `mod tests` as production; its `mika-agent` twin counted braces. Two
+    /// halves of one check, answering "is this production?" two different ways —
+    /// the divergence this ticket closes, at the scale of a single invariant.
+    /// Whitelisting this file by name is no longer needed: the reader masks this
+    /// test module like any other.
     #[test]
     fn override_used_true_absent_from_common_sources() {
-        // Walk this crate's `src/` tree; skip our own test module by
-        // whitelisting this file.
-        use std::fs;
-        use std::path::Path;
-
-        fn scan(dir: &Path, offenders: &mut Vec<String>) {
-            let Ok(entries) = fs::read_dir(dir) else {
-                return;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    scan(&path, offenders);
-                } else if path.extension().and_then(|e| e.to_str()) == Some("rs")
-                    && !path.ends_with("permission_authority.rs")
-                    && let Ok(content) = fs::read_to_string(&path)
+        let scanner = crate::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let mut offenders = Vec::new();
+        scanner.for_each(|path, production| {
+            for (idx, line) in production.lines().enumerate() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") || trimmed.starts_with('*') {
+                    continue;
+                }
+                if trimmed.contains("override_used = true")
+                    || trimmed.contains("override_used=true")
                 {
-                    for (idx, line) in content.lines().enumerate() {
-                        let trimmed = line.trim_start();
-                        if trimmed.starts_with("//") || trimmed.starts_with("*") {
-                            continue;
-                        }
-                        if trimmed.contains("override_used = true")
-                            || trimmed.contains("override_used=true")
-                        {
-                            offenders.push(format!("{}:{}: {trimmed}", path.display(), idx + 1));
-                        }
-                    }
+                    offenders.push(format!("{}:{}: {trimmed}", path.display(), idx + 1));
                 }
             }
-        }
-
-        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut offenders = Vec::new();
-        scan(&src, &mut offenders);
+        });
         assert!(
             offenders.is_empty(),
             "AC8 grep discipline: `override_used = true` must only appear in \
