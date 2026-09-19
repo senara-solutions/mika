@@ -1817,7 +1817,54 @@ impl TaskDispatcher {
 
         let proposals = crate::skills::curator::build_proposals(&candidates, max_idle_days);
 
+        // The review itself is unconditional, and stays so: only its
+        // *notification* is withheld below. `mika skills curator status` remains
+        // the operator surface, and it is the right one — it never needed to go
+        // through Telegram.
         crate::skills::curator::emit_curator_proposal(&self.db, &task.agent_id, &proposals).await?;
+
+        // mika#2358 — the third producer of unsolicited messages, and the one
+        // the code comment used to misname.
+        //
+        // The comment said "operator"; the channel says "user". `message_sender`
+        // is the same field the heartbeat uses, and on a mono-agent tenant it
+        // routes to the customer's Telegram `chat_id`. Operator and user are
+        // conflated by the topology, not by the intent of this code. On Al's
+        // tenant that meant a daily English message beginning `[Curator]`,
+        // counting "skills idle" and prescribing a shell command, landing at
+        // 10:00 local (the cron is UTC, he is at UTC+7) — a "technical report"
+        // in his own vocabulary, and a message `FAMILY_SOUL` forbids in as many
+        // words ("toute mention … de l'infrastructure sous-jacente — jamais").
+        //
+        // **Withheld by persona, not by the budget** (KTD8). Routing it under
+        // the mika#2358 wake-up budget would make it *rarer* for the tenant who
+        // should never see it and *rarer too* for the operator it is written
+        // for — a setting wrong on both tenants at once. This is not a problem
+        // of frequency but of addressee.
+        //
+        // Exhaustive `match`, no `_ =>` arm (model: mika#2290's
+        // `hosting_ground_truth_line`): a persona added later is forced to
+        // decide rather than inheriting a default in silence.
+        let notify = match self.tier.persona_profile() {
+            mika_common::home::PersonaProfile::Operator => true,
+            mika_common::home::PersonaProfile::Family => false,
+        };
+
+        if !notify {
+            // Without this line a withheld curator reads exactly like a curator
+            // with no candidates (mika#2205: a silently inert scan reads like an
+            // idle one). It is also the probe that measures the curator's share
+            // in what Al experienced.
+            info!(
+                target: "mika::otel",
+                agent_id = %task.agent_id,
+                candidates = candidates.len(),
+                persona = ?self.tier.persona_profile(),
+                event = "curator_notification_withheld",
+                "curator notification withheld: operator jargon does not go to a family channel"
+            );
+            return Ok(());
+        }
 
         // Notify operator if message_sender is available
         if let Some(ref sender) = self.message_sender {
@@ -7088,5 +7135,197 @@ mod tests {
             Some(third),
             "a change must be re-announced"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2358 U5 — the curator notification and the family channel
+    // -----------------------------------------------------------------------
+
+    /// Captures what actually went out on the user channel, so the operator
+    /// control can assert the text **word for word** — which is the half that
+    /// proves U5 withholds an addressee rather than disarming a function.
+    #[derive(Default)]
+    struct RecordingSender {
+        sent: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MessageSender for RecordingSender {
+        async fn send(&self, text: &str) -> anyhow::Result<SendOutcome> {
+            self.sent.lock().unwrap().push(text.to_string());
+            Ok(SendOutcome::Delivered)
+        }
+    }
+
+    /// One `active` skill never used — the shape `get_archival_candidates`
+    /// selects (`last_used_at IS NULL AND use_count = 0`).
+    async fn seed_archival_candidate(db: &AsyncDatabase) {
+        db.with_db(|d| {
+            d.execute_sql(
+                "INSERT INTO skill_overrides \
+                    (agent_id, skill_name, lifecycle_state, use_count, last_used_at) \
+                 VALUES ('mika', 'dormant-skill', 'active', 0, NULL)",
+                &[],
+            )
+            .map(|_| ())
+        })
+        .await
+        .expect("seeding an archival candidate must not fail");
+    }
+
+    async fn curator_task(db: &AsyncDatabase) -> crate::db::Task {
+        let id = db
+            .create_task(NewTask {
+                agent_id: "mika".to_string(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: "curator_review".to_string(),
+                trigger_type: "time".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: Some(crate::timestamp::now()),
+                timeout_at: None,
+                action_type: "run_skill".to_string(),
+                action_config: r#"{"trigger":"curator_review"}"#.to_string(),
+                input_context: None,
+                created_by_session: None,
+                created_trace_id: None,
+                reference_url: None,
+                source: None,
+                metadata: None,
+                r#type: None,
+                dispatch_class: None,
+            })
+            .await
+            .unwrap();
+        db.get_task(&id).await.unwrap().expect("task must exist")
+    }
+
+    async fn curator_proposal_rows(db: &AsyncDatabase) -> i64 {
+        db.with_db(|d| {
+            d.query_scalar::<i64>(
+                "SELECT COUNT(*) FROM audit_events WHERE tool_name = 'curator_review'",
+                &[],
+            )
+        })
+        .await
+        .expect("counting curator proposals must not fail")
+        .unwrap_or(0)
+    }
+
+    async fn run_curator(
+        tier: mika_common::home::AgentTier,
+    ) -> (Arc<RecordingSender>, AsyncDatabase) {
+        let db = test_db();
+        let sender = Arc::new(RecordingSender::default());
+        let mut d = test_dispatcher(db.clone());
+        d.tier = tier;
+        d.message_sender = Some(sender.clone());
+
+        let task = curator_task(&db).await;
+        d.dispatch_curator_review(&task)
+            .await
+            .expect("curator review must not error");
+        (sender, db)
+    }
+
+    /// **The negative control.** On an operator tenant nothing moves: the
+    /// notification goes out, at the word.
+    #[tokio::test]
+    async fn mika2358_an_operator_tenant_still_receives_the_curator_notification() {
+        let db = test_db();
+        seed_archival_candidate(&db).await;
+        let sender = Arc::new(RecordingSender::default());
+        let mut d = test_dispatcher(db.clone());
+        d.tier = mika_common::home::AgentTier::Default;
+        d.message_sender = Some(sender.clone());
+
+        let task = curator_task(&db).await;
+        d.dispatch_curator_review(&task).await.unwrap();
+
+        let sent = sender.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "the operator notification must still go out");
+        assert_eq!(
+            sent[0],
+            concat!(
+                "[Curator] 1 skill(s) idle >30d for agent mika. ",
+                "Run `mika skills curator status --agent mika` for details."
+            ),
+            "the operator text must be unchanged, at the word"
+        );
+    }
+
+    /// On a family tenant the same message is withheld. Not made rarer —
+    /// withheld: this is a problem of addressee, not of frequency (KTD8).
+    #[tokio::test]
+    async fn mika2358_a_family_tenant_receives_no_curator_jargon() {
+        let db = test_db();
+        seed_archival_candidate(&db).await;
+        let sender = Arc::new(RecordingSender::default());
+        let mut d = test_dispatcher(db.clone());
+        d.tier = mika_common::home::AgentTier::Family;
+        d.message_sender = Some(sender.clone());
+
+        let task = curator_task(&db).await;
+        d.dispatch_curator_review(&task).await.unwrap();
+
+        assert!(
+            sender.sent.lock().unwrap().is_empty(),
+            "`FAMILY_SOUL` forbids any mention of the underlying infrastructure — \
+             `[Curator] N skill(s) idle` is exactly that"
+        );
+    }
+
+    /// The property that separates "the notification is withheld" from "the
+    /// review is disarmed": `emit_curator_proposal` runs on both personas, so
+    /// `mika skills curator status` keeps its content.
+    #[tokio::test]
+    async fn mika2358_the_curator_review_itself_runs_on_both_personas() {
+        for tier in [
+            mika_common::home::AgentTier::Default,
+            mika_common::home::AgentTier::Family,
+        ] {
+            let db = test_db();
+            seed_archival_candidate(&db).await;
+            let sender = Arc::new(RecordingSender::default());
+            let mut d = test_dispatcher(db.clone());
+            d.tier = tier;
+            d.message_sender = Some(sender.clone());
+
+            let task = curator_task(&db).await;
+            d.dispatch_curator_review(&task).await.unwrap();
+
+            assert_eq!(
+                curator_proposal_rows(&db).await,
+                1,
+                "the proposal must be persisted for the operator whatever the persona \
+                 ({tier:?}) — the operator is the only possible actor on an archival"
+            );
+        }
+    }
+
+    /// No candidate, no send and no withholding line, on both personas: a
+    /// withheld curator must stay distinguishable from an idle one, and an idle
+    /// one must stay silent.
+    #[tokio::test]
+    async fn mika2358_no_candidate_produces_neither_a_send_nor_a_withholding() {
+        for tier in [
+            mika_common::home::AgentTier::Default,
+            mika_common::home::AgentTier::Family,
+        ] {
+            let (sender, db) = run_curator(tier).await;
+            assert!(
+                sender.sent.lock().unwrap().is_empty(),
+                "{tier:?}: nothing to report, nothing sent"
+            );
+            assert_eq!(
+                curator_proposal_rows(&db).await,
+                0,
+                "{tier:?}: an empty review emits no proposal either"
+            );
+        }
     }
 }
