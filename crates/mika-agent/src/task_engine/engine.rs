@@ -4193,6 +4193,7 @@ mod tests {
             settings,
             pr_reviews_posted: None,
             auto_pull_stop_armed: AtomicBool::new(false),
+            proactive_budget_reported: std::sync::Mutex::new(None),
         })
     }
 
@@ -4648,6 +4649,7 @@ mod tests {
             settings,
             pr_reviews_posted: None,
             auto_pull_stop_armed: AtomicBool::new(false),
+            proactive_budget_reported: std::sync::Mutex::new(None),
         });
         let mut engine = TaskEngine::new(db.clone(), dispatcher);
         engine.startup_recovery().await.unwrap();
@@ -4725,6 +4727,7 @@ mod tests {
             settings,
             pr_reviews_posted: None,
             auto_pull_stop_armed: AtomicBool::new(false),
+            proactive_budget_reported: std::sync::Mutex::new(None),
         });
         let mut engine = TaskEngine::new(db.clone(), dispatcher);
 
