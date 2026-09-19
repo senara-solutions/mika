@@ -422,7 +422,7 @@ laissé ce fichier lu comme de la production.
 
 | Population | Conséquence du maintien | Suivi |
 |---|---|---|
-| les 14 gardes qui ne séparent rien (§ 4) | faux positifs latents : elles lisent le `mod tests` des autres fichiers comme de la production. Bruyant si cela mord, jamais silencieux | ticket de suivi |
+| les 12 gardes qui ne séparent rien (§ 4) | faux positifs latents : elles lisent le `mod tests` des autres fichiers comme de la production. Bruyant si cela mord, jamais silencieux | ticket de suivi |
 | les scanners shell (`scripts/check-*.sh`) | l'exclusion par chemin s'y périme en silence comme partout ailleurs | ticket de suivi |
 | `check-secrets.sh` / `LARGE_FILE_ALLOWLIST` (`db.rs`) | l'exception survit au découpage et masque un futur dépassement du plafond | à retirer **par** mika#2321 |
 | chaînes `mod` de profondeur > 1 hors `cfg(test)` | un fichier test-only atteint par une telle chaîne serait lu comme de la production | aucune aujourd'hui (profondeur max = 1) ; re-mesuré par test |
