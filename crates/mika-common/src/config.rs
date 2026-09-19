@@ -1546,7 +1546,14 @@ fn default_llm_provider() -> ProviderKind {
     ProviderKind::Anthropic
 }
 
-fn default_max_tokens() -> u32 {
+/// The compiled-in output-token budget, used when no cascade door carries
+/// `llm_max_tokens`.
+///
+/// `pub(crate)` since mika#2280 so `llm::budget_provenance` can mirror
+/// `Settings`'s own fallback instead of writing `4096` a second time — the
+/// duplication that would make a reported "default" disagree with the value in
+/// force.
+pub(crate) fn default_max_tokens() -> u32 {
     4096
 }
 

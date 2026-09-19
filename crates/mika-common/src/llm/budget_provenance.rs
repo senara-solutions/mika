@@ -134,6 +134,10 @@ use super::{DEFAULT_HTTP_TIMEOUT_SECS, HTTP_TIMEOUT_ENV_VAR, MIN_HTTP_TIMEOUT_SE
 pub const HTTP_TIMEOUT_CONFIG_KEY: &str = "llm_http_timeout_secs";
 /// `config.toml` key for the per-agent envelope.
 pub const AGENT_TOTAL_TIMEOUT_CONFIG_KEY: &str = "agent_total_timeout_secs";
+/// `config.toml` key for the per-call output-token budget (mika#2280).
+pub const MAX_TOKENS_CONFIG_KEY: &str = "llm_max_tokens";
+/// Environment variable overriding the output-token budget (mika#2280).
+pub const MAX_TOKENS_ENV_VAR: &str = "MIKA_LLM_MAX_TOKENS";
 
 /// `config.toml` key selecting the active provider (mika#2328).
 pub const LLM_PROVIDER_CONFIG_KEY: &str = "llm_provider";
@@ -378,13 +382,28 @@ fn model_env_var(provider: ProviderKind) -> String {
     format!("MIKA_{}_MODEL", provider.config_prefix().to_uppercase())
 }
 
-/// The provenance of both halves of one agent's budget.
+/// The provenance of one agent's budget: the time pair, plus the output-token
+/// budget that runs inside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BudgetProvenance {
     /// The per-call plafond (`llm_http_timeout_secs` / `MIKA_LLM_HTTP_TIMEOUT_SECS`).
     pub http: ResolvedBudgetValue,
     /// The per-agent envelope (`agent_total_timeout_secs` / `MIKA_AGENT_TOTAL_TIMEOUT_SECS`).
     pub agent_total: ResolvedBudgetValue,
+    /// The per-call output-token budget (`llm_max_tokens` / `MIKA_LLM_MAX_TOKENS`),
+    /// added by mika#2280.
+    ///
+    /// It walks the **same** cascade as the two time keys — `resolve_key` is
+    /// generic, so the third key is one line and `CascadeLayers::read` already
+    /// reads each file once, making the cost nil.
+    ///
+    /// It closes a hole of the same nature as the one mika#2293 closed for the
+    /// time pair: nothing said which output budget an agent ran under, **nor
+    /// through which door it arrived**. That is the only thing that can settle
+    /// whether mika-dev's runtime still carries the constant's 8192 or a value
+    /// raised by hand — as mika-arch's had been — a question the checkout alone
+    /// cannot answer.
+    pub max_tokens: ResolvedBudgetValue,
 }
 
 impl BudgetProvenance {
@@ -404,6 +423,7 @@ impl BudgetProvenance {
             http: layers.resolve_key(HTTP_TIMEOUT_CONFIG_KEY, HTTP_TIMEOUT_ENV_VAR),
             agent_total: layers
                 .resolve_key(AGENT_TOTAL_TIMEOUT_CONFIG_KEY, AGENT_TOTAL_TIMEOUT_ENV_VAR),
+            max_tokens: layers.resolve_key(MAX_TOKENS_CONFIG_KEY, MAX_TOKENS_ENV_VAR),
         }
     }
 
@@ -433,6 +453,24 @@ impl BudgetProvenance {
             Some(secs) => secs,
         };
         LlmTimeoutBudget::unvalidated(http, total)
+    }
+
+    /// The output-token budget as the runtime would compute it (mika#2280).
+    ///
+    /// Mirror of [`Self::effective_budget`] for the third key: when no door
+    /// carries `llm_max_tokens`, or carries something unreadable, this reports
+    /// the same compiled-in fallback `Settings` itself uses — read from
+    /// `crate::config::default_max_tokens` rather than written out a second
+    /// time, so a "default" reported here cannot disagree with the value in
+    /// force.
+    ///
+    /// A value too large for a `u32` saturates rather than wrapping: reporting
+    /// a small number for a huge one would be worse than reporting a clamp.
+    pub fn effective_max_tokens(&self) -> u32 {
+        self.max_tokens
+            .value
+            .map(|v| u32::try_from(v).unwrap_or(u32::MAX))
+            .unwrap_or_else(crate::config::default_max_tokens)
     }
 }
 
@@ -604,18 +642,27 @@ const REPORTED_ATTEMPT_HARD_CAP: u32 = super::DEFAULT_ATTEMPTS_HARD_CAP;
 /// that moves only *reachability* — the very thing the new fields report —
 /// would be deduplicated away as "no change".
 ///
+/// `llm_max_tokens` and `reachable_output_tokens` joined it in mika#2280, and
+/// the reason is that lesson applied twice rather than a second paragraph: a
+/// configuration change moving only the output budget is exactly what the new
+/// fields exist to say, so leaving it out of the key would silence the event on
+/// the only change it was added for.
+///
 /// The model and its provenance are part of it for the same reason (mika#2328):
 /// an out-of-repo model swap moves neither timeout, and a signature blind to it
 /// would silence the single line that reports the swap.
 fn dedup_signature(provenance: &BudgetProvenance, model: &ModelProvenance) -> String {
     let budget = provenance.effective_budget();
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         budget.http_timeout_secs(),
         budget.agent_total_timeout_secs(),
         provenance.http.source.as_str(),
         provenance.agent_total.source.as_str(),
         budget.effective_max_attempts(REPORTED_ATTEMPT_HARD_CAP),
+        provenance.effective_max_tokens(),
+        provenance.max_tokens.source.as_str(),
+        budget.reachable_output_tokens(super::budget::output_tokens_per_sec_floor()),
         model.provider_name(),
         model.provider_value.source.as_str(),
         model.effective_model().unwrap_or(""),
@@ -648,6 +695,18 @@ pub fn log_llm_budget_resolved(agent_id: &str, global_home: &Path, agent_home: &
     seen.insert(agent_id.to_string(), signature);
     drop(seen);
 
+    // mika#2280: the output budget in force, its door, and what the plafond can
+    // physically carry. Context only — **no WARN is emitted here**. A declared
+    // budget above the reachable figure is not a defect in itself: mika#2296
+    // chose exactly that for mika-arch, as "a ceiling made non-binding". A guard
+    // firing on the declaration would contradict a documented decision at every
+    // startup, and a warning that contradicts a decision gets muted. What earns
+    // an operator's attention is a *crossing*, once per cut call — that is
+    // `llm_call_cap_exhausted`, on the rails that apply the plafond.
+    let llm_max_tokens = provenance.effective_max_tokens();
+    let reachable_output_tokens =
+        budget.reachable_output_tokens(super::budget::output_tokens_per_sec_floor());
+
     tracing::info!(
         event = "llm_budget_resolved",
         agent_id,
@@ -657,10 +716,14 @@ pub fn log_llm_budget_resolved(agent_id: &str, global_home: &Path, agent_home: &
         effective_max_attempts,
         retry_reachable,
         worst_case_failure_secs = budget.worst_case_failure_secs(REPORTED_ATTEMPT_HARD_CAP),
+        llm_max_tokens,
+        reachable_output_tokens,
         http_source = provenance.http.source.as_str(),
         total_source = provenance.agent_total.source.as_str(),
+        max_tokens_source = provenance.max_tokens.source.as_str(),
         http_raw = provenance.http.raw_or_empty(),
         total_raw = provenance.agent_total.raw_or_empty(),
+        max_tokens_raw = provenance.max_tokens.raw_or_empty(),
         // mika#2328 — the model half. `model_config_key` names the key an
         // operator would edit, which is how the "resolved from the provider,
         // never hard-coded" rule becomes checkable from the log alone.
@@ -724,7 +787,7 @@ mod tests {
     use crate::config::Settings;
     use serial_test::serial;
 
-    /// Clear both budget variables — and, since mika#2328, every variable that
+    /// Clear every budget variable — and, since mika#2328, every variable that
     /// can move the resolved model — from the process env.
     ///
     /// The model half has to clear `MIKA_LLM_PROVIDER` and all thirteen
@@ -737,6 +800,7 @@ mod tests {
         unsafe {
             std::env::remove_var(HTTP_TIMEOUT_ENV_VAR);
             std::env::remove_var(AGENT_TOTAL_TIMEOUT_ENV_VAR);
+            std::env::remove_var(MAX_TOKENS_ENV_VAR);
             std::env::remove_var(LLM_PROVIDER_ENV_VAR);
             for provider in ProviderKind::ALL {
                 std::env::remove_var(model_env_var(*provider));
@@ -757,9 +821,16 @@ mod tests {
     ///
     /// The duplication of the cascade is only tenable while what this module
     /// reconstructs equals what `Settings::load_for_agent` merges. One fixture
-    /// per cascade position, checked on **both** budget keys: the day the order
-    /// changes in `config.rs`, this goes red rather than letting the reported
-    /// provenance drift away from the value actually in force.
+    /// per cascade position, checked on **all three** budget keys since
+    /// mika#2280 (AC3): the day the order changes in `config.rs`, this goes red
+    /// rather than letting the reported provenance drift away from the value
+    /// actually in force.
+    ///
+    /// **If the third key alone goes red, halt and surface** (mika#2280 FD3):
+    /// it means `max_tokens_source` would name the wrong door, and a false
+    /// provenance is strictly worse than none — it answers, with authority, the
+    /// one question probe (a) exists to settle. Do not add an allowlist and do
+    /// not `#[ignore]`; resolving the divergence *is* the scope decision.
     #[test]
     #[serial]
     fn mika2293_reconstruction_equals_load_for_agent_on_every_cascade_position() {
@@ -769,13 +840,14 @@ mod tests {
         // Position 4 — global config.toml only.
         std::fs::write(
             global.join("config.toml"),
-            "llm_http_timeout_secs = 130\nagent_total_timeout_secs = 400\n",
+            "llm_http_timeout_secs = 130\nagent_total_timeout_secs = 400\nllm_max_tokens = 2048\n",
         )
         .unwrap();
         let p = BudgetProvenance::resolve(&global, &agent);
         let settings = Settings::load_for_agent(&global, &agent).unwrap();
         assert_eq!(p.http.source, BudgetSource::GlobalConfig);
         assert_eq!(p.agent_total.source, BudgetSource::GlobalConfig);
+        assert_eq!(p.max_tokens.source, BudgetSource::GlobalConfig);
         assert_eq!(
             p.effective_budget().http_timeout_secs(),
             settings.effective_llm_http_timeout_secs(),
@@ -786,17 +858,24 @@ mod tests {
             settings.effective_agent_total_timeout_secs(),
             "position 4 (global config.toml): enveloppe reconstruite ≠ enveloppe fusionnée"
         );
+        assert_eq!(
+            p.effective_max_tokens(),
+            settings.llm_max_tokens,
+            "position 4 (global config.toml): budget de sortie reconstruit ≠ fusionné"
+        );
 
         // Position 3 — per-agent config.toml beats the global one.
         std::fs::write(
             agent.join("config.toml"),
-            "llm_http_timeout_secs = 240\nagent_total_timeout_secs = 900\n",
+            "llm_http_timeout_secs = 240\nagent_total_timeout_secs = 900\nllm_max_tokens = 32768\n",
         )
         .unwrap();
         let p = BudgetProvenance::resolve(&global, &agent);
         let settings = Settings::load_for_agent(&global, &agent).unwrap();
         assert_eq!(p.http.source, BudgetSource::AgentConfig);
+        assert_eq!(p.max_tokens.source, BudgetSource::AgentConfig);
         assert_eq!(p.effective_budget().http_timeout_secs(), 240);
+        assert_eq!(p.effective_max_tokens(), 32_768);
         assert_eq!(
             p.effective_budget().http_timeout_secs(),
             settings.effective_llm_http_timeout_secs(),
@@ -807,16 +886,23 @@ mod tests {
             settings.effective_agent_total_timeout_secs(),
             "position 3 (config.toml per-agent): enveloppe reconstruite ≠ enveloppe fusionnée"
         );
+        assert_eq!(
+            p.effective_max_tokens(),
+            settings.llm_max_tokens,
+            "position 3 (config.toml per-agent): budget de sortie reconstruit ≠ fusionné"
+        );
 
         // Position 2 — the process env beats both config files. This is H2.
         // Safety: test-only env vars, serialized by `#[serial]`.
         unsafe {
             std::env::set_var(HTTP_TIMEOUT_ENV_VAR, "150");
             std::env::set_var(AGENT_TOTAL_TIMEOUT_ENV_VAR, "500");
+            std::env::set_var(MAX_TOKENS_ENV_VAR, "4096");
         }
         let p = BudgetProvenance::resolve(&global, &agent);
         let settings = Settings::load_for_agent(&global, &agent).unwrap();
         assert_eq!(p.http.source, BudgetSource::ProcessEnv);
+        assert_eq!(p.max_tokens.source, BudgetSource::ProcessEnv);
         assert_eq!(p.effective_budget().http_timeout_secs(), 150);
         assert_eq!(
             p.effective_budget().http_timeout_secs(),
@@ -829,17 +915,28 @@ mod tests {
             settings.effective_agent_total_timeout_secs(),
             "position 2 (env du process): enveloppe reconstruite ≠ enveloppe fusionnée"
         );
+        assert_eq!(
+            p.effective_max_tokens(),
+            settings.llm_max_tokens,
+            "position 2 (env du process): budget de sortie reconstruit ≠ fusionné — \
+             c'est le monde H2 appliqué à la troisième clé"
+        );
 
         // Position 1 — the per-agent `.env` beats the process env (mika#2218).
         std::fs::write(
             agent.join(".env"),
-            format!("{HTTP_TIMEOUT_ENV_VAR}=180\n{AGENT_TOTAL_TIMEOUT_ENV_VAR}=700\n"),
+            format!(
+                "{HTTP_TIMEOUT_ENV_VAR}=180\n{AGENT_TOTAL_TIMEOUT_ENV_VAR}=700\n\
+                 {MAX_TOKENS_ENV_VAR}=8192\n"
+            ),
         )
         .unwrap();
         let p = BudgetProvenance::resolve(&global, &agent);
         let settings = Settings::load_for_agent(&global, &agent).unwrap();
         assert_eq!(p.http.source, BudgetSource::AgentDotenv);
+        assert_eq!(p.max_tokens.source, BudgetSource::AgentDotenv);
         assert_eq!(p.effective_budget().http_timeout_secs(), 180);
+        assert_eq!(p.effective_max_tokens(), 8_192);
         assert_eq!(
             p.effective_budget().http_timeout_secs(),
             settings.effective_llm_http_timeout_secs(),
@@ -851,6 +948,34 @@ mod tests {
             settings.effective_agent_total_timeout_secs(),
             "position 1 (.env per-agent): enveloppe reconstruite ≠ enveloppe fusionnée"
         );
+        assert_eq!(
+            p.effective_max_tokens(),
+            settings.llm_max_tokens,
+            "position 1 (.env per-agent): budget de sortie reconstruit ≠ fusionné"
+        );
+
+        clean_budget_env();
+    }
+
+    /// mika#2280 — nothing anywhere carries `llm_max_tokens`, so the reported
+    /// default must be the one `Settings` itself falls back to.
+    ///
+    /// The `Default` source is H3 applied to the third key: the `config.toml`
+    /// was never read or never carried the key. Reporting a number that
+    /// disagreed with the merged one would make probe (a) send an operator to
+    /// the wrong remedy.
+    #[test]
+    #[serial]
+    fn mika2280_absent_max_tokens_reports_the_same_default_settings_uses() {
+        clean_budget_env();
+        let (_tmp, global, agent) = homes();
+
+        let p = BudgetProvenance::resolve(&global, &agent);
+        let settings = Settings::load_for_agent(&global, &agent).unwrap();
+
+        assert_eq!(p.max_tokens.source, BudgetSource::Default);
+        assert_eq!(p.max_tokens.raw, None);
+        assert_eq!(p.effective_max_tokens(), settings.llm_max_tokens);
 
         clean_budget_env();
     }
@@ -990,6 +1115,73 @@ mod tests {
         {
             let seen = LAST_EMITTED.get().unwrap().lock().unwrap();
             assert_eq!(seen.get("mika-arch"), Some(&first));
+        }
+
+        reset_dedup_for_test();
+        clean_budget_env();
+    }
+
+    /// mika#2280 AC4 — a geometry that moves **only** the output budget is
+    /// re-emitted, and a repetition stays silent.
+    ///
+    /// This is mika#2362's lesson applied to the third key: the fields added by
+    /// this ticket exist to report the output budget, so a key that ignored it
+    /// would silence the event on the one change it was added for. Both
+    /// controls are in the same call — a probe that only ever saw the silent
+    /// side could not tell a working dedup from one that suppresses everything.
+    #[test]
+    #[serial]
+    fn mika2280_a_change_in_max_tokens_alone_re_emits() {
+        clean_budget_env();
+        reset_dedup_for_test();
+        let (_tmp, global, agent) = homes();
+
+        let write_config = |max_tokens: u32| {
+            std::fs::write(
+                agent.join("config.toml"),
+                format!(
+                    "llm_http_timeout_secs = 240\nagent_total_timeout_secs = 900\n\
+                     llm_max_tokens = {max_tokens}\n"
+                ),
+            )
+            .unwrap();
+        };
+        let signature_now = || {
+            dedup_signature(
+                &BudgetProvenance::resolve(&global, &agent),
+                &ModelProvenance::resolve(&global, &agent),
+            )
+        };
+
+        write_config(8_192);
+        let first = signature_now();
+        log_llm_budget_resolved("mika-arch", &global, &agent);
+        {
+            let seen = LAST_EMITTED.get().unwrap().lock().unwrap();
+            assert_eq!(seen.get("mika-arch"), Some(&first));
+        }
+
+        // Negative control: the identical pair stays silent.
+        assert_eq!(signature_now(), first, "rien n'a bougé");
+
+        // Positive control: the time pair is UNCHANGED, only the output budget
+        // moves — precisely the change the new fields report.
+        write_config(32_768);
+        let second = signature_now();
+        assert_ne!(
+            first, second,
+            "un changement qui ne bouge que llm_max_tokens doit ré-émettre : \
+             sans ça, le champ neuf serait tu sur le seul changement qu'il décrit"
+        );
+
+        let before = BudgetProvenance::resolve(&global, &agent).effective_budget();
+        assert_eq!(before.http_timeout_secs(), 240);
+        assert_eq!(before.agent_total_timeout_secs(), 900);
+
+        log_llm_budget_resolved("mika-arch", &global, &agent);
+        {
+            let seen = LAST_EMITTED.get().unwrap().lock().unwrap();
+            assert_eq!(seen.get("mika-arch"), Some(&second));
         }
 
         reset_dedup_for_test();

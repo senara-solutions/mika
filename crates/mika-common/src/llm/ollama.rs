@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
+use super::budget::output_tokens_per_sec_floor;
 use super::error::LlmError;
 use super::openai::extract_think_block;
 use super::retry_gate::{RetryThresholds, RetryVerdict, deadline_verdict, next_attempt_verdict};
@@ -440,14 +441,27 @@ impl OllamaProvider {
         }
     }
 
-    async fn send_once(&self, request: &OllamaChatRequest) -> Result<OllamaChatResponse, LlmError> {
+    /// One HTTP round-trip, plus the mika#2280 plafond discriminator.
+    ///
+    /// The error type is a pair for the reason spelled out in `openai.rs`'s twin
+    /// method: the `bool` is `cap_exhausted`, and it cannot ride inside
+    /// `LlmError` without moving a wire format and a retryability decision that
+    /// mika#2015 measured (mika#2280 D2 / AC6).
+    async fn send_once(
+        &self,
+        request: &OllamaChatRequest,
+    ) -> Result<OllamaChatResponse, (LlmError, bool)> {
+        // The attempt's own clock — see the twin comment in `openai.rs`.
+        let started = Instant::now();
+        let plain = |e: LlmError| (e, false);
+
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         // Include auth header only if api_key is set (ollama typically runs unauthenticated)
         if let Some(ref key) = self.api_key {
             let auth = HeaderValue::from_str(&format!("Bearer {key}"))
-                .map_err(|e| LlmError::ProviderError(format!("invalid API key: {e}")))?;
+                .map_err(|e| plain(LlmError::ProviderError(format!("invalid API key: {e}"))))?;
             headers.insert(AUTHORIZATION, auth);
         }
 
@@ -479,11 +493,21 @@ impl OllamaProvider {
             .headers(headers)
             .json(request)
             .send()
-            .await?;
+            .await
+            .map_err(|e| plain(LlmError::from(e)))?;
 
         let status = response.status();
         if !status.is_success() {
             let status_code = status.as_u16();
+            // mika#2280 E6/AC5 — the site that must stay UNinstrumented, and on
+            // this rail it is the one an implementer is most likely to catch by
+            // mistake: there are two `response.text()` here, and only the one
+            // below is the ticket's population. This one reads the body of a
+            // non-2xx response, already swallowing its error via
+            // `unwrap_or_default`. A slow 429, whose error body arrives late,
+            // would otherwise be counted as "the model was still generating" —
+            // a false attribution that makes no decision wrong and makes the
+            // measurement lie, which is why it has its own negative-control test.
             let body = response.text().await.unwrap_or_default();
             let message = serde_json::from_str::<OllamaErrorResponse>(&body)
                 .map(|e| e.error)
@@ -494,11 +518,11 @@ impl OllamaProvider {
             warn!(status = status_code, error_message = %message, "Ollama API error");
             // HTTP 500 is retryable (covers model loading delays)
             let retryable = matches!(status_code, 429 | 500 | 503);
-            return Err(LlmError::HttpError {
+            return Err(plain(LlmError::HttpError {
                 status: status_code,
                 message,
                 retryable,
-            });
+            }));
         }
 
         // Read the body as text before deserializing (mika#2015 pattern, ported
@@ -534,9 +558,37 @@ impl OllamaProvider {
                     error = %chain,
                     "LLM response body read failed mid-stream (retryable transport)"
                 );
-                return Err(LlmError::Transport(format!(
-                    "failed to read response body: {chain}"
-                )));
+
+                // mika#2280 D2 — the twin of `openai.rs`'s arm, and the ONE of
+                // this file's two `response.text()` that is the ticket's
+                // population: the status has been read and is 2xx, so this means
+                // exactly *the headers arrived, the body did not finish*.
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                let cap_exhausted = self.budget.is_cap_exhaustion(elapsed_ms);
+                if cap_exhausted {
+                    warn!(
+                        target: "mika::llm",
+                        event = "llm_call_cap_exhausted",
+                        provider = %self.provider_kind,
+                        model = %request.model,
+                        max_tokens = request.options.num_predict,
+                        http_timeout_secs = self.budget.http_timeout_secs(),
+                        elapsed_ms,
+                        reachable_output_tokens = self
+                            .budget
+                            .reachable_output_tokens(output_tokens_per_sec_floor()),
+                        // Corroborating, never deciding — see `openai.rs`.
+                        cause_is_timeout = chain.contains("timed out"),
+                        "LLM call cut at its per-call plafond — the model was still generating \
+                         (mika#2280)"
+                    );
+                }
+
+                // Variant, class and retryability unchanged (AC6).
+                return Err((
+                    LlmError::Transport(format!("failed to read response body: {chain}")),
+                    cap_exhausted,
+                ));
             }
         };
 
@@ -550,11 +602,11 @@ impl OllamaProvider {
                 body_excerpt = %excerpt,
                 "ollama response body did not parse"
             );
-            LlmError::ParseError(format!(
+            plain(LlmError::ParseError(format!(
                 "failed to parse ollama response: {e} (body {} bytes, starts: {})",
                 body.len(),
                 excerpt.chars().take(120).collect::<String>()
-            ))
+            )))
         })?;
 
         // Dev-mode body logging
@@ -635,6 +687,10 @@ impl OllamaProvider {
                             last_error.as_ref().map(|e| e.error_class()).as_deref(),
                             self.budget.http_timeout_secs(),
                             Some(remaining.as_millis() as u64),
+                            ollama_request.options.num_predict,
+                            // mika#2280 AC7 — absent, never `false`; see the
+                            // twin comment in `openai.rs`.
+                            None,
                         );
                         break;
                     }
@@ -662,7 +718,12 @@ impl OllamaProvider {
 
             // mika#2331 AC2 — the outcome line; see the twin comment in `openai.rs`.
             let attempt_start = Instant::now();
-            let attempt_result = self.send_once(&ollama_request).await;
+            // mika#2280 — the pair is split at its single site; see `openai.rs`.
+            let (attempt_result, attempt_cap_exhausted) =
+                match self.send_once(&ollama_request).await {
+                    Ok(response) => (Ok(response), false),
+                    Err((e, cap_exhausted)) => (Err(e), cap_exhausted),
+                };
             let attempt_elapsed_ms = attempt_start.elapsed().as_millis() as u64;
             let deadline_remaining_ms =
                 deadline.map(|dl| dl.saturating_duration_since(Instant::now()).as_millis() as u64);
@@ -693,6 +754,9 @@ impl OllamaProvider {
                     .as_deref(),
                 self.budget.http_timeout_secs(),
                 deadline_remaining_ms,
+                ollama_request.options.num_predict,
+                // The attempt ran — `Some`, both ways (mika#2280 AC7).
+                Some(attempt_cap_exhausted),
             );
 
             match attempt_result {
