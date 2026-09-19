@@ -124,7 +124,7 @@ The 2026-05-10 fix shipped three structural changes. A fourth defect remained �
 
 ### What was missing
 
-`has_any_active_callback` (the engine-side backstop predicate at `crates/mika-agent/src/db.rs:5839`) was correctly fixed in mika#1070 to exclude `:deferred` wrappers via `AND label NOT LIKE '%:deferred'`. Its sibling `has_active_callback_tasks_excluding` (the tool-boundary per-class slot guard at `crates/mika-agent/src/db.rs:5752`) was NOT updated — it kept counting pending deferred wrappers as "active dispatches".
+`has_any_active_callback` (the engine-side backstop predicate at `crates/mika-agent/src/db.rs`) was correctly fixed in mika#1070 to exclude `:deferred` wrappers via `AND label NOT LIKE '%:deferred'`. Its sibling `has_active_callback_tasks_excluding` (the tool-boundary per-class slot guard at `crates/mika-agent/src/db.rs`) was NOT updated — it kept counting pending deferred wrappers as "active dispatches".
 
 This is an **asymmetric perimeter** failure: two predicates encoding the same concept ("is the dispatch slot occupied?") for two different consumers (engine backstop in `engine.rs:423` vs. tool-boundary gate in `executor.rs:946`). When their inclusion sets diverged, the system entered a state where:
 

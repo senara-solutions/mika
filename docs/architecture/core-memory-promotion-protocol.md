@@ -47,7 +47,7 @@ Per the gating-rationale discipline from `callback-turn-work-item-context-inject
 
 ## C3. Three-Layer Architecture
 
-Mirrors the `get_task_health_summary` pattern (`db.rs:264–285`, `agent.rs:2692–2704`, `prompt.rs:815–873`).
+Mirrors the `get_task_health_summary` pattern (`db.rs::get_task_health_summary`, `agent_loop/mod.rs::run_silent_inner`, `prompt.rs::build_silent_prompt`).
 
 ### C3.1 DB Layer
 
@@ -295,7 +295,7 @@ The spec is reviewable independently of the runtime code. The implementation tic
 - `docs/solutions/architecture/rewind-context-marker-confabulation-prevention.md` — `trust="internal"` wrapping pattern
 - `docs/plans/2026-03-03-feat-periodic-memory-reflection-plan.md` — prior `SilentTrigger::Reflection` design that this spec extends
 - `docs/memory-classification.md` — Layer 1/2/3 framework; the new injection extends the "Deterministic Operations" table
-- `crates/mika-agent/src/db.rs:264–285` — `TaskHealthSummary` / `TaskHealthAnomaly` types (analogous to `CoreMemoryPromotionCandidates`)
+- `crates/mika-agent/src/task_state/tasks.rs` — `TaskHealthSummary` / `TaskHealthAnomaly` types (analogous to `CoreMemoryPromotionCandidates`)
 - `crates/mika-agent/src/agent.rs:2459–2486` — `SilentTrigger` enum
 - `crates/mika-agent/src/agent.rs:2647–2672` — existing Reflection trigger context (additive, not displaced)
 - `crates/mika-agent/src/agent.rs:2692–2704` — silent-trigger gating block (the extension point)
