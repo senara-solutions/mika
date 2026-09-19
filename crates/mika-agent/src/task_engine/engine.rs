@@ -45,6 +45,63 @@ enum DispatchLiveness {
     Unknown,
 }
 
+/// What the dispatch-parent settler does with one row (mika#2405, U2 step 1).
+#[derive(Debug, PartialEq, Eq)]
+enum SettleAction<'a> {
+    /// Spare the row and write nothing. `reason` is the value of the
+    /// `dispatch_parent_settle_spared` log field; `child` names the live child
+    /// when there is one to name.
+    Spare {
+        reason: &'static str,
+        child: Option<(&'a str, i64)>,
+    },
+    /// Close the row. `unusable_children` rides on the settle line rather than
+    /// blocking the close — see below for why.
+    Settle { unusable_children: u32 },
+}
+
+/// Decide one row from what its dispatch children say (mika#2405, U2 step 1).
+///
+/// A **pure function** rather than a branch of the settler's loop, and that is
+/// deliberate on two counts. It is the only way to exercise
+/// [`DispatchLiveness::Unknown`], whose producer is a DB error nothing can
+/// inject end to end; and it makes "the three variants are decided separately"
+/// a property of the function, carrying its own test, rather than a shape a
+/// reader has to re-derive from the loop.
+///
+/// The three arms, each for its own reason:
+///
+/// - `Live` → spare. A dispatch is still running under this row.
+/// - `Unknown` → spare. The child lookup itself failed, and **a signal that
+///   cannot be read is never a satisfied term** (mika#2277, mika#2279). The
+///   variant's own doc prescribes exactly this reading: make no claim, let the
+///   next pass ask again.
+/// - `NoneLive` → settle, **including when `unusable_children > 0`**. This is a
+///   deliberate divergence from the phantom sweep, named here rather than
+///   discovered later. A child carrying a PID with no readable
+///   `process_start_time` is indistinguishable from a dead one, so sparing on it
+///   would be *permanent* and would make this closer inert on precisely the
+///   abnormal population it exists to close. The asymmetry leans the right way
+///   **here** because the verdict is `completed` on a correlation token: a false
+///   positive closes a tracking row early and signals **no** process (unlike the
+///   mika#2249 reaper, which kills), whereas inertia reinstates the defect. The
+///   count rides on the settle line so the divergence stays countable.
+fn settle_action(liveness: &DispatchLiveness) -> SettleAction<'_> {
+    match liveness {
+        DispatchLiveness::Live { child_id, pid } => SettleAction::Spare {
+            reason: "live",
+            child: Some((child_id.as_str(), *pid)),
+        },
+        DispatchLiveness::Unknown => SettleAction::Spare {
+            reason: "unknown",
+            child: None,
+        },
+        DispatchLiveness::NoneLive { unusable_children } => SettleAction::Settle {
+            unusable_children: *unusable_children,
+        },
+    }
+}
+
 /// Grace period (seconds) before the reaper transitions an orphaned parent
 /// self_dev task to `failed`. 600s ≈ 3× the upper bound of observed callback
 /// duration (mika#868 audit: 187s LLM latency). Long enough for #870's
@@ -163,6 +220,56 @@ const DEFERRED_PROMOTION_STALE_DEFAULT_SECS: i64 = 900;
 /// `schema_meta` key holding the instant L1 first ran in production
 /// (mika#2169, L2b). See `Database::stamp_schema_meta_epoch_if_absent`.
 const DEFERRED_PROMOTION_EPOCH_KEY: &str = "deferred_promotion_epoch";
+
+/// Kill-switch for the dispatch-parent settler (mika#2405, U3).
+const DISPATCH_PARENT_SETTLE_ENABLED_ENV: &str = "MIKA_DISPATCH_PARENT_SETTLE_ENABLED";
+
+/// Env var overriding [`DISPATCH_PARENT_SETTLE_GRACE_DEFAULT_SECS`].
+const DISPATCH_PARENT_SETTLE_GRACE_ENV: &str = "MIKA_DISPATCH_PARENT_SETTLE_GRACE_SECS";
+
+/// Grace window (seconds) before the settler closes a `manual` tracking row
+/// whose every callback child is terminal (mika#2405).
+///
+/// Deliberately **equal** to [`REAPER_GRACE_SECONDS`]: the #871/#1162 pair
+/// bounds the *same* parent↔child transition, and two grammars of grace for one
+/// question is a reading debt. It is nevertheless its own constant rather than a
+/// reuse, for the reason [`PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS`] states: the
+/// two numbers answer two questions and must be able to diverge under their env
+/// vars.
+///
+/// The cost of the window is named rather than hidden: up to one pass of delay
+/// on a row whose only function is dispatch correlation.
+const DISPATCH_PARENT_SETTLE_GRACE_DEFAULT_SECS: i64 = REAPER_GRACE_SECONDS;
+
+/// Upper clamp on the settle grace (30 days), same mechanism and same reason as
+/// [`PROMOTED_WRAPPER_LIVENESS_MAX_SECS`]: SQLite's
+/// `strftime('...', 'now', '-N seconds')` returns **NULL** for an out-of-range
+/// modifier, and `x < NULL` is NULL — so an absurd override would not widen the
+/// window, it would make the `HAVING` clause unsatisfiable and disarm the
+/// settler without a word.
+const DISPATCH_PARENT_SETTLE_GRACE_MAX_SECS: i64 = 30 * 24 * 3600;
+
+/// Log event **and** audit `tool_name` for a settled dispatch parent
+/// (mika#2405, U2 step 3 / U4).
+///
+/// SOLE WRITER: `TaskEngine::settle_dispatch_parents`. One constant, referenced
+/// from both surfaces, so the source scan
+/// `mika2405_the_settled_event_has_exactly_one_writer_in_production` sees a
+/// single literal. The absence of this name under a symptom is then itself
+/// information — the same reasoning that gave `phantom_aged_out` and
+/// `qa_callback_verdict` their own names.
+const DISPATCH_PARENT_SETTLED_EVENT: &str = "dispatch_parent_settled";
+
+/// Motif written to `tasks.result` on a settled parent.
+///
+/// `completed`, never `failed`: the row is a correlation token demanded by the
+/// Delegation Rule, and its function is discharged the moment its dispatch came
+/// back. Success or failure of the *work* is carried by the child and by the
+/// posted review, never by this token. `failed` would assert a breakage nothing
+/// establishes — which is defect #1 of the phantom sweep as a net for this
+/// population.
+const DISPATCH_PARENT_SETTLE_MOTIF: &str =
+    "dispatch_parent_settled: every callback child reached a terminal status";
 
 /// Ticks between pilot-transcript retention sweeps (mika#1705 AC6). At the 1s
 /// tick cadence, 86_400 ticks ≈ 24h — a daily prune, matching the plan's
@@ -638,6 +745,15 @@ impl TaskEngine {
             // sibling to the reaper: catches crash-recovery cases and pre-deploy
             // wedges that the inline path in `dispatch_resume_agent` can't reach.
             self.complete_parent_tasks_on_callback_success().await;
+
+            // Close `manual` tracking rows whose every callback child is
+            // terminal (mika#2405). Placed AFTER the two self_dev reapers so
+            // their population is already resolved when this passes — and it
+            // is the *complement* of that population, not an overlap: its
+            // `COALESCE(parent.source,'') != 'self_dev'` term is what keeps the
+            // richer self_dev verdicts (failed-without-PR / completed-with-PR)
+            // out of this single-verdict closer.
+            self.settle_dispatch_parents().await;
 
             // Reap parent self_dev issue tasks left in_progress with ZERO
             // callback children, aged past the childless grace window (mika#1687).
@@ -3509,6 +3625,211 @@ impl TaskEngine {
         }
     }
 
+    /// Close `manual` tracking rows whose dispatch is over (mika#2405).
+    ///
+    /// # The population, and why nothing else owns it
+    ///
+    /// The Delegation Rule in `prompt.rs` makes an agent open a `create_task`
+    /// row before **any** long-running dispatch — unconditionally ("you MUST"),
+    /// while the closing gesture it describes a few lines above is conditioned
+    /// on a user asking for it ("Direct update: When the user explicitly
+    /// requests a status change"). A QA build callback has no user asking. So
+    /// the row is opened by the model, on the prompt's injunction, and **no
+    /// code path knows it should be closed, because no code path opened it**.
+    ///
+    /// Every other closer excludes this shape by a named term — thirteen of
+    /// them on `source='self_dev'`, `process_id IS NOT NULL`,
+    /// `trigger_type='callback'`/`'a2a'`, `timeout_at IS NOT NULL`, or an
+    /// explicit `trigger_type == MANUAL → continue`. The one that does see it,
+    /// the phantom sweep (mika#1712/#2156), sees it *badly*: it writes `failed`
+    /// on work that succeeded, waits four hours, and only matches while the row
+    /// carries `action_type='none'`.
+    ///
+    /// # Why a scan rather than nine interceptions
+    ///
+    /// The *right* moment to close a parent is when its child goes terminal —
+    /// which is what `dispatcher.rs`'s three inline backstops do. But the child
+    /// has **nine** terminal paths across five modules (four exits of
+    /// `spawn_long_running_exec`, the callback delivery in `server/handlers.rs`,
+    /// the PID watchdog and the stall reaper here, `mark_tasks_expired` in
+    /// `db/tasks.rs`, and `tracking_cleanup.rs`). Instrumenting all nine is nine
+    /// write sites to keep in step for one question — the duplicated-predicate
+    /// class `grooming_marker` (mika#2158) and `live_pilot` (mika#2279) each had
+    /// to close once already. One scan is one reader, touches no existing path,
+    /// and covers the nine by construction — including a tenth nobody has
+    /// written yet. The price is named: up to one pass of lag.
+    ///
+    /// # Per row
+    ///
+    /// 1. [`Self::dispatch_liveness`], reused rather than reimplemented (the
+    ///    ticket's AC5 asks for "pgrep + mtime"; that function already is the
+    ///    `(pid, process_start_time)` pair, and a second reader of the same
+    ///    question is the class named above). Its three variants are decided
+    ///    **separately** — see the match arms for why `NoneLive` closes even
+    ///    when `unusable_children > 0`, which is a deliberate divergence from
+    ///    the phantom sweep.
+    /// 2. [`AsyncDatabase::update_task_completed`], never `update_task_status`.
+    ///    The neighbouring reaper rejects the raw call in writing at its own
+    ///    write site, and this closer has the same exposure by construction: its
+    ///    grace window guarantees a delay between the `SELECT` and the `UPDATE`,
+    ///    during which an operator may have written `cancelled`. The guarded
+    ///    call's `WHERE status IN ('pending','in_progress')` refuses to overwrite
+    ///    a terminal state, it returns a `bool` to be handled, and it stamps
+    ///    `completed_at` — which a raw status write leaves NULL, i.e. a data
+    ///    inconsistency introduced by the fix itself. Overwriting an operator's
+    ///    `cancelled` would be "reaping the living" by the second path, the one
+    ///    the liveness guard does not cover (it watches processes, not
+    ///    concurrent transitions).
+    /// 3. The audit row, on `Ok(true)` only: a row written on `Ok(false)` would
+    ///    assert a transition that did not happen.
+    ///
+    /// SOLE WRITER of [`DISPATCH_PARENT_SETTLED_EVENT`] on both surfaces.
+    async fn settle_dispatch_parents(&self) {
+        if !dispatch_parent_settle_enabled() {
+            return;
+        }
+
+        let grace_seconds = dispatch_parent_settle_grace_secs();
+        let candidates = match self
+            .db
+            .find_settleable_dispatch_parents(grace_seconds)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "dispatch_parent_settle: failed to query settleable parents"
+                );
+                return;
+            }
+        };
+
+        // Zero action, zero line (mika#2131 doctrine). An aggregate emitted on
+        // every idle pass would bury the signal it exists to raise.
+        if candidates.is_empty() {
+            return;
+        }
+
+        let trace_id = mika_common::trace::generate_trace_id();
+        let mut settled_count: u32 = 0;
+        let mut spared_count: u32 = 0;
+        let mut noop_count: u32 = 0;
+        let mut error_count: u32 = 0;
+
+        for row in candidates {
+            // Re-arm the wedge watchdog every row, as the phantom sweep does:
+            // a large pass must not look like a hung loop.
+            self.heartbeat.tick();
+
+            let system_session = format!("system-{}", row.agent_id);
+            let liveness = self.dispatch_liveness(&row.id).await;
+            let unusable_children = match settle_action(&liveness) {
+                SettleAction::Spare { reason, child } => {
+                    spared_count = spared_count.saturating_add(1);
+                    // `child_task_id` / `process_id` exist only on the `live`
+                    // reason; the `unknown` one has no child to name. Emitted as
+                    // empty / -1 rather than omitted, so a field is never
+                    // ambiguous between "absent" and "zero".
+                    let (child_task_id, process_id) = child.unwrap_or(("", -1));
+                    info!(
+                        event = "dispatch_parent_settle_spared",
+                        reason,
+                        task_id = %row.id,
+                        agent_id = %row.agent_id,
+                        child_task_id,
+                        process_id,
+                        trace_id = %trace_id,
+                        "dispatch_parent_settle: row spared, nothing written"
+                    );
+                    continue;
+                }
+                SettleAction::Settle { unusable_children } => unusable_children,
+            };
+
+            match self
+                .db
+                .update_task_completed(&row.id, Some(DISPATCH_PARENT_SETTLE_MOTIF))
+                .await
+            {
+                Ok(true) => {
+                    if let Err(e) = self
+                        .db
+                        .log_audit_event(
+                            &system_session,
+                            DISPATCH_PARENT_SETTLED_EVENT,
+                            &format!("task:{}", row.id),
+                            Some("in_progress"),
+                            Some("completed"),
+                            Some(DISPATCH_PARENT_SETTLE_MOTIF),
+                            Some(&trace_id),
+                        )
+                        .await
+                    {
+                        error_count = error_count.saturating_add(1);
+                        warn!(
+                            task_id = %row.id,
+                            error = %e,
+                            "dispatch_parent_settle: failed to write audit event \
+                             (transition succeeded)"
+                        );
+                    } else {
+                        settled_count = settled_count.saturating_add(1);
+                    }
+
+                    // `unusable_children` is always emitted, never conditionally
+                    // omitted: an absent field and a zero would be
+                    // indistinguishable, which is the failure mode the spare
+                    // line above exists to avoid. Expected value is 0; the
+                    // operator reads `select(.unusable_children > 0)`.
+                    info!(
+                        event = DISPATCH_PARENT_SETTLED_EVENT,
+                        task_id = %row.id,
+                        agent_id = %row.agent_id,
+                        child_count = row.child_count,
+                        idle_secs = compute_settle_idle_secs(&row.last_child_at),
+                        unusable_children,
+                        trace_id = %trace_id,
+                        "dispatch_parent_settle: dispatch parent settled as completed"
+                    );
+                }
+                Ok(false) => {
+                    // The row left `in_progress` between the SELECT and the
+                    // UPDATE — an operator cancel, most likely. This is the race
+                    // the guarded call renders harmless, and counting it is the
+                    // only way to know it happens. Expected: rare but non-zero.
+                    noop_count = noop_count.saturating_add(1);
+                    info!(
+                        event = "dispatch_parent_settle_noop",
+                        task_id = %row.id,
+                        agent_id = %row.agent_id,
+                        trace_id = %trace_id,
+                        "dispatch_parent_settle: row already left in_progress, no transition"
+                    );
+                }
+                Err(e) => {
+                    error_count = error_count.saturating_add(1);
+                    warn!(
+                        task_id = %row.id,
+                        error = %e,
+                        "dispatch_parent_settle: db error during transition"
+                    );
+                }
+            }
+        }
+
+        info!(
+            event = "dispatch_parent_settle_complete",
+            settled = settled_count,
+            spared = spared_count,
+            noop = noop_count,
+            errors = error_count,
+            grace_seconds,
+            trace_id = %trace_id,
+            "dispatch_parent_settle: pass complete"
+        );
+    }
+
     /// Reap parent self_dev **issue** tasks left `in_progress` with **zero**
     /// callback children, aged past the childless grace window (mika#1687).
     ///
@@ -3959,6 +4280,19 @@ fn compute_reaper_age_hours(created_at: &str) -> i64 {
         .unwrap_or(0)
 }
 
+/// How long ago the settled parent's **last** child moved (mika#2405, U4).
+///
+/// Sibling of [`compute_reaper_age_hours`], in seconds and keyed on
+/// `MAX(child.updated_at)` rather than the parent's `created_at` — a parent
+/// reused across dispatches (mika#920) is old by construction, so its own age
+/// would say nothing about the dispatch that just ended. Returns 0 on parse
+/// failure, like its siblings: a log field must not invent a duration.
+fn compute_settle_idle_secs(last_child_at: &str) -> i64 {
+    crate::timestamp::parse(last_child_at)
+        .map(|dt| (chrono::Utc::now() - dt).num_seconds())
+        .unwrap_or(0)
+}
+
 /// Compute how many minutes old a task is based on its `created_at` timestamp.
 /// Returns 0 on parse failure (conservative — won't inflate the reaped-log age).
 fn compute_reaper_age_minutes(created_at: &str) -> i64 {
@@ -4097,6 +4431,76 @@ fn parse_promoted_wrapper_liveness(raw: Option<&str>) -> i64 {
 /// deliberately leaves alone — a probe that lies.
 pub fn promoted_wrapper_liveness_secs() -> i64 {
     parse_promoted_wrapper_liveness(std::env::var(PROMOTED_WRAPPER_LIVENESS_ENV).ok().as_deref())
+}
+
+/// Pure parse of the settler grace window (mika#2405, U3). House three-tier
+/// shape — absent or empty → default; unparseable, zero, or negative → default
+/// with a WARN — plus the upper clamp
+/// [`DISPATCH_PARENT_SETTLE_GRACE_MAX_SECS`], for the same reason as
+/// [`parse_promoted_wrapper_liveness`].
+fn parse_dispatch_parent_settle_grace(raw: Option<&str>) -> i64 {
+    match raw {
+        Some(v) if !v.trim().is_empty() => match v.trim().parse::<i64>() {
+            Ok(secs) if secs > 0 && secs <= DISPATCH_PARENT_SETTLE_GRACE_MAX_SECS => secs,
+            _ => {
+                warn!(
+                    env = DISPATCH_PARENT_SETTLE_GRACE_ENV,
+                    value = %v,
+                    default = DISPATCH_PARENT_SETTLE_GRACE_DEFAULT_SECS,
+                    "invalid dispatch-parent settle grace value; falling back to default"
+                );
+                DISPATCH_PARENT_SETTLE_GRACE_DEFAULT_SECS
+            }
+        },
+        _ => DISPATCH_PARENT_SETTLE_GRACE_DEFAULT_SECS,
+    }
+}
+
+/// Resolve the settler grace window (mika#2405, U3).
+fn dispatch_parent_settle_grace_secs() -> i64 {
+    parse_dispatch_parent_settle_grace(
+        std::env::var(DISPATCH_PARENT_SETTLE_GRACE_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure parse of the settler kill-switch (mika#2405, U3). Split from the env
+/// read so it is testable without mutating a process-global variable that the
+/// tests of one binary share.
+///
+/// Absence or an empty value → **armed**: the settler is the intended
+/// behaviour, not an option. An unrecognized value is **said** and leaves it
+/// armed — a disarm by typo on a closer would be exactly the silent failure
+/// this ticket exists to close. Same truth table as
+/// `parse_qa_callback_verdict_net` (mika#2368).
+fn parse_dispatch_parent_settle_enabled(raw: Option<&str>) -> bool {
+    let Some(raw) = raw else {
+        return true;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => true,
+        "0" | "false" | "off" | "no" => false,
+        "1" | "true" | "on" | "yes" => true,
+        other => {
+            warn!(
+                event = "dispatch_parent_settle_enabled_invalid",
+                value = %format!("{other:?}"),
+                "unrecognized value for {DISPATCH_PARENT_SETTLE_ENABLED_ENV} — \
+                 the settler stays armed"
+            );
+            true
+        }
+    }
+}
+
+/// Resolve the settler kill-switch (mika#2405, U3). Default: **armed**.
+fn dispatch_parent_settle_enabled() -> bool {
+    parse_dispatch_parent_settle_enabled(
+        std::env::var(DISPATCH_PARENT_SETTLE_ENABLED_ENV)
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// Rebuild the deferred-dispatch `action_config` for a parent that never had a
@@ -6193,6 +6597,230 @@ mod tests {
             parse_promoted_wrapper_liveness(Some(&PROMOTED_WRAPPER_LIVENESS_MAX_SECS.to_string())),
             PROMOTED_WRAPPER_LIVENESS_MAX_SECS,
             "the clamp boundary itself is accepted"
+        );
+    }
+
+    /// mika#2405, U5 test 2 — the **three** liveness variants are decided
+    /// separately. The third assertion is the one that matters: it pins the
+    /// assumed divergence with the phantom sweep, which spares on
+    /// `unusable_children`. Without it, a re-read that "aligned" the closer on
+    /// the sweeper would make it inert on the abnormal population it exists to
+    /// close, and no other test would redden.
+    #[test]
+    fn mika2405_the_three_liveness_variants_are_decided_separately() {
+        let live = DispatchLiveness::Live {
+            child_id: "child-1".to_string(),
+            pid: 4242,
+        };
+        assert_eq!(
+            settle_action(&live),
+            SettleAction::Spare {
+                reason: "live",
+                child: Some(("child-1", 4242)),
+            },
+            "a running dispatch spares its row"
+        );
+
+        assert_eq!(
+            settle_action(&DispatchLiveness::Unknown),
+            SettleAction::Spare {
+                reason: "unknown",
+                child: None,
+            },
+            "an unreadable signal is never a satisfied term — spare, name no child"
+        );
+
+        assert_eq!(
+            settle_action(&DispatchLiveness::NoneLive {
+                unusable_children: 0
+            }),
+            SettleAction::Settle {
+                unusable_children: 0
+            }
+        );
+        assert_eq!(
+            settle_action(&DispatchLiveness::NoneLive {
+                unusable_children: 3
+            }),
+            SettleAction::Settle {
+                unusable_children: 3
+            },
+            "assumed divergence with the phantom sweep: unusable children do NOT \
+             spare here — sparing would be permanent and would make the closer \
+             inert on the very population it targets"
+        );
+    }
+
+    /// The two spare reasons are distinct strings, and the settle branch is not
+    /// reachable from a sparing variant. A single reason would merge two
+    /// populations whose remedies differ: `live` resolves itself, sustained
+    /// `unknown` means the child query is failing and **no** row is ever being
+    /// examined again.
+    #[test]
+    fn mika2405_the_two_spare_reasons_are_distinct() {
+        let live = DispatchLiveness::Live {
+            child_id: "c".to_string(),
+            pid: 1,
+        };
+        let (SettleAction::Spare { reason: a, .. }, SettleAction::Spare { reason: b, .. }) = (
+            settle_action(&live),
+            settle_action(&DispatchLiveness::Unknown),
+        ) else {
+            panic!("both variants must spare");
+        };
+        assert_ne!(a, b);
+    }
+
+    /// mika#2405, U3 — the settler grace follows the house three-tier shape
+    /// plus the upper clamp, for the same reason the sibling above states.
+    #[test]
+    fn mika2405_parse_dispatch_parent_settle_grace() {
+        assert_eq!(
+            parse_dispatch_parent_settle_grace(None),
+            DISPATCH_PARENT_SETTLE_GRACE_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_dispatch_parent_settle_grace(Some("  ")),
+            DISPATCH_PARENT_SETTLE_GRACE_DEFAULT_SECS
+        );
+        assert_eq!(parse_dispatch_parent_settle_grace(Some("120")), 120);
+        assert_eq!(
+            parse_dispatch_parent_settle_grace(Some("0")),
+            DISPATCH_PARENT_SETTLE_GRACE_DEFAULT_SECS,
+            "`0` is not a disarm — that is the kill-switch's job"
+        );
+        assert_eq!(
+            parse_dispatch_parent_settle_grace(Some("-1")),
+            DISPATCH_PARENT_SETTLE_GRACE_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_dispatch_parent_settle_grace(Some("nonsense")),
+            DISPATCH_PARENT_SETTLE_GRACE_DEFAULT_SECS
+        );
+        // An out-of-range strftime modifier makes SQLite return NULL, and
+        // `x < NULL` is NULL — so an absurd override would disarm the HAVING
+        // clause without a word rather than widening it.
+        assert_eq!(
+            parse_dispatch_parent_settle_grace(Some(
+                &(DISPATCH_PARENT_SETTLE_GRACE_MAX_SECS + 1).to_string()
+            )),
+            DISPATCH_PARENT_SETTLE_GRACE_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_dispatch_parent_settle_grace(Some(&i64::MAX.to_string())),
+            DISPATCH_PARENT_SETTLE_GRACE_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_dispatch_parent_settle_grace(Some(
+                &DISPATCH_PARENT_SETTLE_GRACE_MAX_SECS.to_string()
+            )),
+            DISPATCH_PARENT_SETTLE_GRACE_MAX_SECS,
+            "the clamp boundary itself is accepted"
+        );
+    }
+
+    /// mika#2405, U3 — the kill-switch. The load-bearing row is the last one:
+    /// an unrecognized value leaves the closer **armed**, because a disarm by
+    /// typo on a safety closer is exactly the silent failure this ticket
+    /// closes.
+    #[test]
+    fn mika2405_parse_dispatch_parent_settle_enabled() {
+        assert!(parse_dispatch_parent_settle_enabled(None));
+        assert!(parse_dispatch_parent_settle_enabled(Some("")));
+        assert!(parse_dispatch_parent_settle_enabled(Some("  ")));
+        for armed in ["1", "true", "TRUE", "on", "yes", " Yes "] {
+            assert!(
+                parse_dispatch_parent_settle_enabled(Some(armed)),
+                "`{armed}` must arm"
+            );
+        }
+        for disarmed in ["0", "false", "FALSE", "off", "no", " No "] {
+            assert!(
+                !parse_dispatch_parent_settle_enabled(Some(disarmed)),
+                "`{disarmed}` must disarm"
+            );
+        }
+        assert!(
+            parse_dispatch_parent_settle_enabled(Some("plif")),
+            "an unrecognized value is said and leaves the closer armed"
+        );
+    }
+
+    /// mika#2405, U3 — the settler grace defaults equal to the #871/#1162 pair's,
+    /// which bounds the same parent↔child transition. Separate constants so they
+    /// can diverge under their env vars; this pins the default relationship.
+    #[test]
+    fn mika2405_settle_grace_default_matches_reaper_grace() {
+        assert_eq!(
+            DISPATCH_PARENT_SETTLE_GRACE_DEFAULT_SECS,
+            REAPER_GRACE_SECONDS
+        );
+    }
+
+    /// mika#2405, U5 test 5 — **SOLE WRITER.** The settled event name is
+    /// written literally at exactly one place in production: the constant.
+    ///
+    /// A *source* test, because a behavioural one cannot see this class: a
+    /// second writer would make no decision wrong, it would make the population
+    /// unattributable. Every assertion would stay green while
+    /// `SELECT … WHERE tool_name = 'dispatch_parent_settled'` stopped meaning
+    /// "rows this closer transitioned".
+    #[test]
+    fn mika2405_the_settled_event_has_exactly_one_writer_in_production() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut writers: Vec<String> = Vec::new();
+
+        fn walk(dir: &std::path::Path, needle: &str, out: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, needle, out);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                // mika#2321: an extracted test module carries no `#[cfg(test)]`
+                // literal, so truncation alone would scan it whole as
+                // production. Classify by path first.
+                if crate::source_scan::is_test_source_path(&path) {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let production = match text.find("\n#[cfg(test)]") {
+                    Some(at) => &text[..at],
+                    None => &text[..],
+                };
+                for line in production.lines() {
+                    // Doc prose and comments quote the name freely — that is
+                    // text, not a writer.
+                    if line.trim_start().starts_with("//") {
+                        continue;
+                    }
+                    if line.contains(&format!("\"{needle}\"")) {
+                        out.push(path.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+
+        walk(&root, DISPATCH_PARENT_SETTLED_EVENT, &mut writers);
+
+        assert_eq!(
+            writers.len(),
+            1,
+            "{DISPATCH_PARENT_SETTLED_EVENT} must have exactly one literal writer \
+             (the constant in this module); found: {writers:?}"
+        );
+        assert!(
+            writers[0].ends_with("engine.rs"),
+            "{DISPATCH_PARENT_SETTLED_EVENT} must be written in this module, not in {:?}",
+            writers[0]
         );
     }
 

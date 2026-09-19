@@ -83,6 +83,12 @@ mod eval {
     mod test_di_builders;
     mod test_dispatch_fired_at_stamped;
     mod test_dispatch_no_grooming_marker_guard;
+
+    // mika#2405 — le fermeur des rows `manual` que la Delegation Rule fait
+    // ouvrir avant un dispatch long-running : le chemin nominal avec son
+    // contrôle négatif self_dev, la garde de vivacité sur ses deux versants, le
+    // frère `completed`, et la non-régression de la faucheuse #871.
+    mod test_dispatch_parent_settle_2405;
     mod test_dispatch_task_has_open_pr_guard;
     mod test_error_handling;
 

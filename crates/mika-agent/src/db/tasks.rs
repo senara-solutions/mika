@@ -2180,6 +2180,113 @@ impl Database {
         Ok(rows)
     }
 
+    /// Find `manual` tracking rows whose dispatch is over: **every** callback
+    /// child has reached a terminal status and the last of them stopped moving
+    /// longer ago than `grace_seconds` (mika#2405).
+    ///
+    /// # Why this is NOT a third member of the self_dev pair
+    ///
+    /// It sits next to [`Self::find_orphaned_parent_tasks`] and
+    /// [`Self::find_completable_parent_tasks_on_pr_url`] because it must be
+    /// re-read with them, and it is deliberately **not** one of them. That pair
+    /// is cut for the self_dev contract: its terminal discriminator is the
+    /// presence of `$.claude_pilot.pr_url` (absent ⇒ `failed`, present ⇒
+    /// `completed`), and a QA review never produces a `pr_url`. Widening the
+    /// pair's `source` filter — the one-term fix that suggests itself — would
+    /// send the whole non-self_dev population down the `failed` branch. Hence,
+    /// here: no `pr_url` predicate, a single verdict (`completed`), and a
+    /// `source` term that is the pair's **complement** rather than an overlap.
+    ///
+    /// The symmetry invariant stated on that pair therefore does not extend to
+    /// this query: it names a symmetry *between the two of them*, not a licence
+    /// to widen their population.
+    ///
+    /// # The four load-bearing terms
+    ///
+    /// - `COALESCE(parent.source, '') != 'self_dev'` — complement, never
+    ///   overlap. The `COALESCE` is required, not defensive: `source` is NULL
+    ///   on the target population (`create_task` writes no `source` outside the
+    ///   self-dev paths) and `NULL != 'self_dev'` evaluates to NULL in SQL, so
+    ///   without it the query returns **nothing** — the silent failure this
+    ///   whole fix exists to close.
+    /// - `NOT EXISTS (… sibling.status IN ('pending','in_progress','completed','blocked'))`
+    ///   — **`completed` is in that list on purpose.** On a callback row
+    ///   `completed` means "the pilot returned, delivery has not happened yet";
+    ///   `delivered` is the terminal state. Settling a parent whose child is
+    ///   merely `completed` would close the row before its verdict turn ran.
+    ///   Same vocabulary as the mika#2179 quarantine.
+    ///   The guard does not exclude the joined child (no `sibling.id !=
+    ///   child.id`, unlike the two neighbours): the status list holds no
+    ///   terminal state, so a terminal `child` cannot count itself, and a
+    ///   non-terminal one *must* exclude its parent. One term instead of two.
+    /// - Grace on `MAX(child.updated_at)` — time since the **last** child
+    ///   moved, never since the parent was created: a parent reused across
+    ///   dispatches (mika#920) is old by construction. It lives in `HAVING`
+    ///   rather than `WHERE` because it is a predicate on an aggregate and
+    ///   SQLite refuses an aggregate function in `WHERE`. The two neighbours
+    ///   put their grace in `WHERE` because theirs is row-wise on a single
+    ///   `child.updated_at`; this is the only shape difference and it is
+    ///   intentional.
+    /// - No predicate on the parent's `action_type`, `type`, or
+    ///   `reference_url`. Those are precisely the three terms by which the
+    ///   existing reapers exclude this population, and `action_type` in
+    ///   particular is what makes the phantom sweep (mika#1712) a partial net:
+    ///   a `manual` row carrying a real `action_type` has no reaper at all.
+    ///
+    /// # Fail-safe
+    ///
+    /// A parent with **no** callback child is out of the population — the
+    /// `JOIN` excludes it. That is deliberate: a dispatch refused before the
+    /// child was created (`dispatch_limit_exceeded`, `skills/executor.rs`)
+    /// leaves a childless row that never received a dispatch, and this query
+    /// has nothing to say about it. That residue stays with the phantom sweep
+    /// for as long as it carries `action_type='none'`.
+    ///
+    /// SOLE WRITER context: candidates selected here are transitioned to
+    /// `completed` — never `failed` — by
+    /// `TaskEngine::settle_dispatch_parents`, through the guarded
+    /// [`Self::update_task_completed`].
+    pub fn find_settleable_dispatch_parents(
+        &self,
+        agent_id: &str,
+        grace_seconds: i64,
+    ) -> Result<Vec<SettleableDispatchParent>> {
+        let grace_modifier = format!("-{grace_seconds} seconds");
+        let mut stmt = self.conn.prepare(
+            "SELECT parent.id, parent.agent_id, parent.created_at,
+                    MAX(child.updated_at) AS last_child_at,
+                    COUNT(child.id) AS child_count
+             FROM tasks parent
+             JOIN tasks child ON parent.id = child.parent_task_id
+             WHERE parent.agent_id = ?1
+               AND parent.status = 'in_progress'
+               AND parent.trigger_type = 'manual'
+               AND COALESCE(parent.source, '') != 'self_dev'
+               AND child.trigger_type = 'callback'
+               AND child.action_type = 'resume_agent'
+               AND NOT EXISTS (
+                 SELECT 1 FROM tasks sibling
+                 WHERE sibling.parent_task_id = parent.id
+                   AND sibling.status IN ('pending', 'in_progress', 'completed', 'blocked')
+               )
+             GROUP BY parent.id
+             HAVING MAX(child.updated_at) < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+             ORDER BY parent.id",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, grace_modifier], |row| {
+                Ok(SettleableDispatchParent {
+                    id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    created_at: row.get(2)?,
+                    last_child_at: row.get(3)?,
+                    child_count: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Find parent self_dev **issue** tasks left `in_progress` with **zero**
     /// callback children, aged past `grace_seconds` (mika#1687).
     ///

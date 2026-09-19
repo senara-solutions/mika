@@ -159,6 +159,25 @@ pub struct OrphanedParentTask {
     pub created_at: String,
 }
 
+/// A `manual` tracking row whose dispatch is over: every callback child has
+/// reached a terminal status and the last of them stopped moving longer ago
+/// than the grace window. Returned by
+/// `Database::find_settleable_dispatch_parents` and consumed by the dispatch
+/// parent settler (mika#2405).
+///
+/// `last_child_at` is `MAX(child.updated_at)` — the moment the *last* child
+/// moved, never the parent's own `created_at`: a parent reused across
+/// dispatches (mika#920) is old by construction. `child_count` is carried for
+/// the operator line only; no decision reads it.
+#[derive(Debug, Clone)]
+pub struct SettleableDispatchParent {
+    pub id: String,
+    pub agent_id: String,
+    pub created_at: String,
+    pub last_child_at: String,
+    pub child_count: i64,
+}
+
 /// A phantom tracking task row: `action_type='none'`, `process_id IS NULL`,
 /// `status IN ('in_progress','blocked')`, aged past the sweep grace window.
 /// Used by the NULL-PID phantom sweep (mika#1712) in both AC3 (watchdog tick)
