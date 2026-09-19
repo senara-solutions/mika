@@ -68,18 +68,25 @@ use super::*;
 /// mika#2321 sort 463 Ko et 431 tests par ce même trou, d'où la réparation.
 /// Voir [`crate::source_scan`] pour le prédicat et pourquoi il porte sur la
 /// classification et non sur les aiguilles.
+///
+/// **La frontière production/test est lue par
+/// [`mika_common::source_guard`] (mika#2398).** La troncature au premier
+/// `#[cfg(test)]` perdait **14 043 lignes de production sur 22 fichiers** —
+/// dont `builtin_handlers.rs` (3 053) et `prompt.rs` (1 886), coupé ligne 142
+/// par un doc-comment qui mentionne le marqueur en prose. Une garde à
+/// périmètre arbre hérite de la somme : elle restait verte en ayant cessé de
+/// regarder.
 #[test]
 fn mika2335_no_production_dispatch_transitions_a_parent_without_stamping() {
-    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let scanner =
+        mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
     let mut violations: Vec<String> = Vec::new();
     let mut scanned = 0usize;
 
-    for path in rust_sources_under(&src_root) {
-        let src = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("la garde doit pouvoir lire {}: {e}", path.display()));
+    scanner.for_each(|path, production| {
         scanned += 1;
-        violations.extend(dispatch_stamp_violations(&path, &src));
-    }
+        violations.extend(dispatch_stamp_violations(path, production));
+    });
 
     assert!(
         scanned > 0,

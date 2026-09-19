@@ -60,19 +60,6 @@ const DISPATCHER_SRC: &str = include_str!("../../src/task_engine/dispatcher.rs")
 
 // ───────────────────────── V3.1 — garde de classe ─────────────────────────
 
-/// Fin du bloc `#[cfg(test)] mod …` d'un fichier : tout ce qui suit est du test.
-///
-/// L'ancrage est en colonne zéro et exige `mod ` derrière l'attribut, donc un
-/// `#[cfg(test)]` posé sur une *fonction* helper au milieu d'un fichier de
-/// production ne tronque rien. C'est la précision qui manquait au prédicat
-/// textuel écarté : `engine.rs` porte exactement un helper de cette forme.
-fn production_source(src: &str) -> &str {
-    match src.find("\n#[cfg(test)]\nmod ") {
-        Some(i) => &src[..i],
-        None => src,
-    }
-}
-
 /// Les arguments de l'appel dont la parenthèse ouvrante est à `open`.
 ///
 /// Un `split(',')` naïf couperait à l'intérieur de `r#"{"trigger":"x"}"#` — qui
@@ -186,16 +173,22 @@ fn source_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// lui-même). Le scan balaie tout l'arbre plutôt que le seul `server/mod.rs`,
 /// pour qu'un septième site posé ailleurs entre dans la population au lieu d'y
 /// échapper.
+///
+/// La frontière production/test est lue par [`mika_common::source_guard`]
+/// (mika#2398). Le prédicat local qu'elle remplace — `find("\n#[cfg(test)]\nmod ")`
+/// — était déjà le plus étroit des treize, et sa précision sur le helper de
+/// niveau module est conservée par la clause de forme d'item ; ce qu'il ne
+/// voyait pas, c'est un fichier **intégralement** de test, qui ne porte aucun
+/// marqueur parce que l'attribut est sur la déclaration `mod` chez le parent.
 fn registered_triggers() -> BTreeMap<String, String> {
-    let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut files = Vec::new();
-    source_files(&src_dir, &mut files);
-    files.sort();
+    let scanner =
+        mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+    let src_dir = scanner.src_root().to_path_buf();
 
     let mut found = BTreeMap::new();
-    for path in files {
-        let raw = std::fs::read_to_string(&path).expect("lire un fichier source");
-        let src = production_source(&raw);
+    for path in scanner.files() {
+        let production = scanner.production_of(&path);
+        let src = production.as_str();
         let rel = path
             .strip_prefix(&src_dir)
             .unwrap_or(&path)
