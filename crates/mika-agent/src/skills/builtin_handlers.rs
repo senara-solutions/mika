@@ -3316,12 +3316,125 @@ fn validate_gws_input(input: &serde_json::Value) -> Result<Vec<String>, ToolOutp
     Ok(args)
 }
 
+/// Exit code `gws` uses for an authentication failure (expired or invalid
+/// credentials). Documented in the skill prompt's exit-code table.
+const GWS_AUTH_EXIT_CODE: &str = "Exit code: 2";
+
+/// Whether a `spawn_and_collect` result is a `gws` authentication failure.
+///
+/// `spawn_and_collect` formats a failure as `"Exit code: {code}\n{stderr}{stdout}"`
+/// (see its `code_display` branch), and the rest of this file already tests that
+/// prefix. This predicate follows the house pattern rather than opening a parallel
+/// channel for the exit status.
+///
+/// **A bare `starts_with("Exit code: 2")` is wrong**: it also matches `Exit code: 23`
+/// and `Exit code: 25`. The `2` must therefore be followed by a line break or by the
+/// end of the string — the same prefix trap mika#2347 had to close on the audit-key
+/// surface (`#234` matching `#2343`). Anything that does not match exactly is left
+/// untouched: an unrecognized code is never treated as an authentication error.
+fn is_gws_auth_error(content: &str) -> bool {
+    content
+        .strip_prefix(GWS_AUTH_EXIT_CODE)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('\n'))
+}
+
+/// The remediation for a `gws` authentication failure, chosen by the substrate the
+/// agent actually runs on (mika#2024).
+///
+/// **Why this lives here and not in the skill prompt.** The prompt used to prescribe
+/// `gws auth login` twice, unconditionally, and `google-workspace` is `always_on` —
+/// so the line was in the system prompt of every tenant carrying the skill, on every
+/// turn, with no tool call required to surface it. The measured incident is a *first*
+/// message: no `run_gws` had failed, the model recited its prompt. Removing the
+/// prescription from the prompt is what closes that case; posing the remediation here
+/// is what keeps the answer useful when an authentication error genuinely happens.
+/// The model then has exactly one source on the question, and it is a datum it
+/// receives rather than an instruction it must remember to condition.
+///
+/// **`Local` is the only state that gets a terminal gesture — not `Cloud` alone.**
+/// No cloud tenant emits `MIKA_DEPLOYMENT` today (the companion `mika-cloud` ticket
+/// is unshipped), so the champion tenant of the founding incident resolved
+/// [`Deployment::Unknown`], not `Cloud`. A `deployment == Cloud` predicate would have
+/// been false on exactly the damaged population. This is the same shape, for the same
+/// written reason, as mika#2290's guard 5d.
+///
+/// **The crossing is exhaustive with no `_ =>` arm**, on the model of
+/// [`crate::tools::dispatch_substrate_diagnostic`] and
+/// `prompt::hosting_ground_truth_line`: a new tier or a new deployment state must
+/// make a decision instead of inheriting one nobody took for it. `Champion` is named
+/// in its arm rather than absorbed by a catch-all (mika#2023 AC5). `Cloud` and
+/// `Unknown` converge today and are still separated: the day the provisioner emits
+/// the variable, giving `Cloud` a console link without giving it to `Unknown` is a
+/// one-arm diff.
+///
+/// **The register follows the persona axis** (mika#2290): `FAMILY_SOUL` forbids any
+/// mention of the underlying infrastructure, so the family formulation says the same
+/// fact with no technical noun. Note the consequence on `(Local, Family)`: a family
+/// tenant does **not** receive the terminal gesture even on a local install. The
+/// persona constraint is absolute, and a family member at a local install is no more
+/// able to open a shell than a cloud one — the person who set the install up is the
+/// one who reconnects it, on both.
+fn gws_auth_remediation(
+    deployment: mika_common::home::Deployment,
+    tier: mika_common::home::AgentTier,
+) -> &'static str {
+    use mika_common::home::{AgentTier, Deployment};
+
+    match (deployment, tier) {
+        // Operator register — the only population that may be told to use a shell,
+        // and only when this environment declares that it runs on the user's machine.
+        (Deployment::Local, AgentTier::Default) => {
+            "Remediation for this runtime: this instance is declared as running on the \
+             user's own machine, so re-authentication is available to them directly — \
+             `gws auth login`."
+        }
+        (Deployment::Cloud, AgentTier::Default) => {
+            "Remediation for this runtime: this instance does not run on the user's own \
+             machine, so there is nothing they can do locally to restore this access. \
+             Tell them the Google account has to be reconnected by whoever provisioned \
+             this tenant, and propose no local step."
+        }
+        (Deployment::Unknown, AgentTier::Default) => {
+            "Remediation for this runtime: this environment does not declare where this \
+             instance runs, so you cannot assume the user has access to the machine it \
+             runs on. Tell them the Google account has to be reconnected by whoever set \
+             this instance up, and propose no local step."
+        }
+        // Family register — the same fact, no infrastructure vocabulary. "Machine" is
+        // the one concrete noun, and it is the word the family hosting line already
+        // uses (`prompt::hosting_ground_truth_line`).
+        (Deployment::Local, AgentTier::Family | AgentTier::Champion) => {
+            "The link to the person's Google account has stopped working and has to be \
+             set up again. Tell them simply that you can no longer reach their mail and \
+             calendar, and that whoever set you up on their machine needs to reconnect \
+             it. Name no technical step."
+        }
+        (Deployment::Cloud, AgentTier::Family | AgentTier::Champion) => {
+            "The link to the person's Google account has stopped working and has to be \
+             set up again. You cannot do it yourself, and it is not something they can \
+             do from their side. Tell them simply that you can no longer reach their \
+             mail and calendar, and that the person who set you up needs to reconnect \
+             it. Name no technical step."
+        }
+        (Deployment::Unknown, AgentTier::Family | AgentTier::Champion) => {
+            "The link to the person's Google account has stopped working and has to be \
+             set up again. You cannot do it yourself. Tell them simply that you can no \
+             longer reach their mail and calendar, and that the person who set you up \
+             needs to reconnect it. Name no technical step."
+        }
+    }
+}
+
 /// Execute a Google Workspace CLI (`gws`) command with safe argument passing.
 ///
 /// Input: `{"command": ["gmail", "messages", "list", "--params", "{\"maxResults\": 5}"]}`
 ///
-/// Uses `gws`'s native keyring-based authentication (set up via `gws auth login`).
-async fn run_gws(input: &serde_json::Value, _ctx: &ToolContext<'_>) -> ToolOutput {
+/// Uses `gws`'s native keyring-based authentication.
+///
+/// On exit code 2 (authentication failure) the result carries an appended
+/// remediation chosen by `(ctx.deployment, ctx.tier)` — see [`gws_auth_remediation`]
+/// (mika#2024). Every other outcome is returned byte for byte as before.
+async fn run_gws(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput {
     let args = match validate_gws_input(input) {
         Ok(args) => args,
         Err(err) => return err,
@@ -3332,13 +3445,34 @@ async fn run_gws(input: &serde_json::Value, _ctx: &ToolContext<'_>) -> ToolOutpu
 
     super::executor::scrub_mika_env_vars(&mut cmd);
 
-    spawn_and_collect(
+    let mut output = spawn_and_collect(
         cmd,
         "gws",
         "Is the Google Workspace CLI installed? \
          Install via: cargo install --git https://github.com/googleworkspace/cli --locked",
     )
-    .await
+    .await;
+
+    if is_gws_auth_error(&output.content) {
+        // Blank-line separator, the same shape `dispatch_substrate_diagnostic` uses
+        // when it folds a diagnostic back into the content. `is_error` is deliberately
+        // untouched: this appends information, it does not reclassify the outcome.
+        output.content.push_str("\n\n");
+        output
+            .content
+            .push_str(gws_auth_remediation(ctx.deployment, ctx.tier));
+
+        // R7 — the population has to be countable. Deployment and tier only: nothing
+        // here may carry a Google account identifier.
+        tracing::info!(
+            event = "gws_auth_remediation_annexed",
+            deployment = ?ctx.deployment,
+            tier = ?ctx.tier,
+            "Appended a runtime-conditioned remediation to a gws authentication error"
+        );
+    }
+
+    output
 }
 
 // ---------------------------------------------------------------------------
@@ -5275,6 +5409,220 @@ mod tests {
     #[test]
     fn test_run_gws_in_known_builtins() {
         assert!(KNOWN_BUILTINS.contains(&"run_gws"));
+    }
+
+    // -- mika#2024: runtime-conditioned auth remediation --
+
+    /// The six combinations the plan enumerates, plus the three `Champion` ones
+    /// the exhaustive match also has to answer for.
+    const MIKA2024_DEPLOYMENTS: &[mika_common::home::Deployment] = &[
+        mika_common::home::Deployment::Local,
+        mika_common::home::Deployment::Cloud,
+        mika_common::home::Deployment::Unknown,
+    ];
+    const MIKA2024_TIERS: &[mika_common::home::AgentTier] = &[
+        mika_common::home::AgentTier::Default,
+        mika_common::home::AgentTier::Family,
+        mika_common::home::AgentTier::Champion,
+    ];
+
+    #[test]
+    fn mika2024_every_deployment_tier_pair_yields_a_non_empty_remediation() {
+        for &deployment in MIKA2024_DEPLOYMENTS {
+            for &tier in MIKA2024_TIERS {
+                let text = gws_auth_remediation(deployment, tier);
+                assert!(
+                    !text.trim().is_empty(),
+                    "({deployment:?}, {tier:?}) yields an empty remediation — a state \
+                     with nothing to say reopens the void that produced the incident"
+                );
+            }
+        }
+    }
+
+    /// AC1 + R3. The founding symptom verbatim was a terminal gesture served to a
+    /// tenant that has no terminal. `Local` is the only state allowed to name one,
+    /// and on the operator register only (see `gws_auth_remediation`'s doc for why
+    /// `(Local, Family)` is deliberately excluded too).
+    #[test]
+    fn mika2024_only_a_declared_local_operator_is_told_about_gws_auth_login() {
+        for &deployment in MIKA2024_DEPLOYMENTS {
+            for &tier in MIKA2024_TIERS {
+                let text = gws_auth_remediation(deployment, tier);
+                let names_the_gesture = text.contains("gws auth login");
+                let expected = deployment == mika_common::home::Deployment::Local
+                    && tier == mika_common::home::AgentTier::Default;
+                assert_eq!(
+                    names_the_gesture, expected,
+                    "({deployment:?}, {tier:?}) names `gws auth login` = \
+                     {names_the_gesture}, expected {expected}. Only a runtime that \
+                     DECLARES itself local may prescribe a shell gesture — a cloud \
+                     tenant emits no MIKA_DEPLOYMENT today and resolves Unknown, so \
+                     a `== Cloud` predicate would miss exactly the damaged population."
+                );
+            }
+        }
+    }
+
+    /// AC2. What a non-local runtime proposes has to be reachable by the person
+    /// reading it, so it may not name a shell, a terminal or a command.
+    #[test]
+    fn mika2024_non_local_remediations_name_no_shell_surface() {
+        const SHELL_SURFACE: &[&str] = &[
+            "terminal",
+            "shell",
+            "command line",
+            "gws auth",
+            "`gws",
+            "console window",
+            "prompt>",
+        ];
+        for &deployment in MIKA2024_DEPLOYMENTS {
+            if deployment == mika_common::home::Deployment::Local {
+                continue;
+            }
+            for &tier in MIKA2024_TIERS {
+                let text = gws_auth_remediation(deployment, tier).to_ascii_lowercase();
+                for needle in SHELL_SURFACE {
+                    assert!(
+                        !text.contains(needle),
+                        "({deployment:?}, {tier:?}) mentions {needle:?} — a runtime \
+                         without a terminal must not name one: {text}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// R4. `FAMILY_SOUL` forbids any mention of the underlying infrastructure, so
+    /// the family register carries the same fact with no technical noun. `Champion`
+    /// rides on the family register today (`CHAMPION_PERSONA_PLACEHOLDER`) and is
+    /// asserted here explicitly rather than assumed.
+    #[test]
+    fn mika2024_family_and_champion_remediations_carry_no_infrastructure_jargon() {
+        // "machine" is deliberately absent from this list: it is the one concrete
+        // noun the family hosting line already uses (`hosting_ground_truth_line`).
+        const JARGON: &[&str] = &[
+            "tenant",
+            "container",
+            "provision",
+            "runtime",
+            "instance",
+            "server",
+            "process",
+            "environment",
+            "cli",
+            "credential",
+            "authenticate",
+            "re-authentic",
+        ];
+        for &deployment in MIKA2024_DEPLOYMENTS {
+            for tier in [
+                mika_common::home::AgentTier::Family,
+                mika_common::home::AgentTier::Champion,
+            ] {
+                let text = gws_auth_remediation(deployment, tier).to_ascii_lowercase();
+                for needle in JARGON {
+                    assert!(
+                        !text.contains(needle),
+                        "({deployment:?}, {tier:?}) uses the infrastructure term \
+                         {needle:?}, which FAMILY_SOUL forbids: {text}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The champion tier carries the family register today. Pinned so that the day
+    /// `CHAMPION_PERSONA_PLACEHOLDER` is replaced, this test is the one that says
+    /// this surface has a champion-specific decision to make too (mika#2247).
+    #[test]
+    fn mika2024_champion_currently_reads_as_family_on_every_deployment() {
+        for &deployment in MIKA2024_DEPLOYMENTS {
+            assert_eq!(
+                gws_auth_remediation(deployment, mika_common::home::AgentTier::Champion),
+                gws_auth_remediation(deployment, mika_common::home::AgentTier::Family),
+                "champion diverged from family on {deployment:?} — if that is \
+                 intended, update this test; it exists so the divergence is a \
+                 decision and not a surprise"
+            );
+        }
+    }
+
+    /// Structural control: the crossing must stay exhaustive. Without this, a new
+    /// `Deployment` state or a new `AgentTier` would silently inherit a decision
+    /// nobody took for it — the exact mine mika#2023 M2 had to defuse on the tier
+    /// guards. A behavioural test cannot see this: a `_ =>` arm would keep every
+    /// assertion above green.
+    #[test]
+    fn mika2024_the_remediation_match_has_no_wildcard_arm() {
+        let source = include_str!("builtin_handlers.rs");
+        let start = source
+            .find("fn gws_auth_remediation(")
+            .expect("gws_auth_remediation not found — rename it here too");
+        let end = source[start..]
+            .find("\n/// Execute a Google Workspace CLI")
+            .map(|offset| start + offset)
+            .expect("could not delimit gws_auth_remediation's body");
+        let body = &source[start..end];
+
+        // Good-faith control: the slice really is the function we mean.
+        assert!(
+            body.contains("Deployment::Unknown, AgentTier::Default"),
+            "the extracted slice does not look like gws_auth_remediation's body — \
+             fix the delimiters before trusting the assertion below"
+        );
+        assert!(
+            !body.contains("_ =>"),
+            "gws_auth_remediation grew a wildcard arm. Name the new variant instead: \
+             a catch-all decides for every future tier and deployment state without \
+             anyone having taken that decision."
+        );
+    }
+
+    // -- mika#2024: exit-code predicate --
+
+    #[test]
+    fn mika2024_exit_code_2_is_recognized_bare_and_with_a_body() {
+        assert!(is_gws_auth_error("Exit code: 2"));
+        assert!(is_gws_auth_error("Exit code: 2\n"));
+        assert!(is_gws_auth_error("Exit code: 2\nauth: token expired\n"));
+    }
+
+    /// The prefix trap, in a test rather than in a comment: `starts_with("Exit code: 2")`
+    /// also matches 23 and 25, and would annex an authentication remediation onto an
+    /// unrelated failure.
+    #[test]
+    fn mika2024_exit_codes_with_a_2_prefix_are_not_auth_errors() {
+        for content in [
+            "Exit code: 23",
+            "Exit code: 25\nsomething else\n",
+            "Exit code: 20",
+            "Exit code: 2000",
+        ] {
+            assert!(
+                !is_gws_auth_error(content),
+                "{content:?} was read as an authentication error — the `2` must be \
+                 followed by a line break or the end of the string"
+            );
+        }
+    }
+
+    #[test]
+    fn mika2024_other_outcomes_are_untouched() {
+        for content in [
+            "Exit code: 1\nAPI error\n",
+            "Exit code: 3\n",
+            "Killed by signal: 9",
+            "Exit code: unknown",
+            "{\"messages\": []}",
+            "",
+        ] {
+            assert!(
+                !is_gws_auth_error(content),
+                "{content:?} was read as an authentication error"
+            );
+        }
     }
 
     #[test]

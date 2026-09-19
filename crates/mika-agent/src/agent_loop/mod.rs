@@ -22,12 +22,12 @@ use crate::compaction;
 use crate::evidence::guards::{
     ASSERT_GROUNDED_LABEL, ASSERTED_UNAVAILABILITY_LABEL, DOCTRINE_PUBLIC_PROMO_LABEL,
     DeliveryRecord, EQUIVALENCE_CLAIM_LABEL, FALSE_LOCAL_HOSTING_LABEL,
-    UNACKNOWLEDGED_SEND_FAILURE_LABEL, UndeliveredSends, assert_grounded_satisfied,
-    asserted_unavailability_satisfied, detect_affirmative_state_claim,
+    UNACKNOWLEDGED_SEND_FAILURE_LABEL, UNACTIONED_FREQUENCY_PROMISE_LABEL, UndeliveredSends,
+    assert_grounded_satisfied, asserted_unavailability_satisfied, detect_affirmative_state_claim,
     detect_asserted_unavailability, detect_doctrine_public_promo, detect_equivalence_claim,
     detect_fabricated_action_claim, detect_false_local_hosting_claim,
-    detect_unverified_callback_state_claim, equivalence_claim_satisfied,
-    undelivered_send_correction, undelivered_sends,
+    detect_unactioned_frequency_promise, detect_unverified_callback_state_claim,
+    equivalence_claim_satisfied, undelivered_send_correction, undelivered_sends,
 };
 use crate::mcp::McpManager;
 use crate::messaging::MessageSender;
@@ -2286,6 +2286,128 @@ async fn run_loop(
                             label = mode.label(),
                             event = "guard.false_local_hosting_claim_uncorrected",
                             "False local-hosting claim guard already fired this turn — \
+                             accepting EndTurn with second violation (budget exhausted)"
+                        );
+                    }
+
+                    // 5e. Unactioned frequency-promise guard (mika#2358) — refuse
+                    // a turn that promises to change the frequency of its own
+                    // unprompted messages, or to suspend them, without having
+                    // called the tool that does it.
+                    //
+                    // **The measured defect.** Asked why he had received three
+                    // technical digests when he had asked for one, Mika answered
+                    // Al: « Je vais corriger ça concrètement : plus aucun message
+                    // de veille technique aujourd'hui. Et demain, un seul. » She
+                    // called nothing — and had nothing to call: the only reachable
+                    // gesture was cancelling the `heartbeat` row, which says "none"
+                    // and never "one", and which `revert_config_cancel_recurring_task`
+                    // undoes at the next restart (mika#2271). U1 gives the promise
+                    // an actor; this guard is what makes the turn reach for it.
+                    //
+                    // Same family as 5c/5d and one step further along: those refuse
+                    // a false statement about the world, this one refuses a
+                    // commitment about the future that the turn did nothing to
+                    // bring about.
+                    //
+                    // Applies uniformly across modes (KTD6): a promise made inside
+                    // a heartbeat turn is exactly as empty as one made in
+                    // conversation, and the compacted history carries it into the
+                    // next turn. Not skipped by `skip_remaining_guards` (#1178) —
+                    // a posted PR review makes no setting change, the same literal
+                    // reason as 5c and 5d.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !intent_guard_retries.contains(UNACTIONED_FREQUENCY_PROMISE_LABEL)
+                        && let Some(promise) =
+                            detect_unactioned_frequency_promise(&text, &all_tool_summaries)
+                    {
+                        intent_guard_retries.insert(UNACTIONED_FREQUENCY_PROMISE_LABEL);
+                        let corr_id = format!(
+                            "{}:{}:unactioned_frequency_promise",
+                            tool_ctx.trace_id, step
+                        );
+                        guard_correlation = Some(GuardCorrelation {
+                            correlation_id: corr_id.clone(),
+                            guard_label: "unactioned_frequency_promise",
+                            step,
+                        });
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
+                            matched_subject = %promise.subject,
+                            matched_assertion = %promise.assertion,
+                            guard_correlation_id = %corr_id,
+                            label = mode.label(),
+                            event = "guard.unactioned_frequency_promise",
+                            "Unactioned frequency-promise guard fired — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        let correction = format!(
+                            "[mika-engine] Your response promises to change how often you \
+                             send unprompted messages, or to suspend them (matched: \
+                             `{assertion}` … `{subject}`), but this turn called no tool \
+                             that would bring that about. Saying it does not make it so: \
+                             the next scheduled wake-up will behave exactly as before.\n\n\
+                             Do ONE of these two things, then rewrite your response:\n\
+                             1. Call `set_config` now. `{budget_key}` takes a whole number \
+                             from 0 to {budget_max} — the maximum number of unprompted \
+                             check-ins you may make per day, 0 for none. `{pause_key}` \
+                             takes an RFC 3339 UTC instant to suspend them until that \
+                             moment, or `{pause_none}` to lift a suspension. Then say what \
+                             you actually set.\n\
+                             2. Or say plainly what you cannot do — that this is not \
+                             something you can change yourself, and what the person can \
+                             do instead. An honest \"I can't\" is a correct answer here; \
+                             a promise you cannot keep is not.\n\n\
+                             Do not call the tool merely to satisfy this message: only \
+                             set a value the person actually asked for. Keep the rest of \
+                             your answer; change only the unbacked promise.",
+                            assertion = promise.assertion,
+                            subject = promise.subject,
+                            budget_key = crate::config_keys::PROACTIVE_DAILY_BUDGET_KEY,
+                            budget_max = crate::config_keys::PROACTIVE_DAILY_BUDGET_MAX,
+                            pause_key = crate::config_keys::PROACTIVE_PAUSE_UNTIL_KEY,
+                            pause_none = crate::config_keys::PROACTIVE_PAUSE_NONE,
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(correction),
+                        });
+                        continue;
+                    }
+
+                    // mika#2358 — the residue of 5e's single-retry budget, named.
+                    //
+                    // Same gesture and same reason as 5d's above: once the label
+                    // is in `intent_guard_retries` the guard cannot fire again, so
+                    // a second unbacked promise would go out indistinguishable from
+                    // a healthy turn. It is not a second correction — the family
+                    // grants one re-prompt — it is what keeps the residual
+                    // population countable.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && intent_guard_retries.contains(UNACTIONED_FREQUENCY_PROMISE_LABEL)
+                        && let Some(promise) =
+                            detect_unactioned_frequency_promise(&text, &all_tool_summaries)
+                    {
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
+                            matched_subject = %promise.subject,
+                            matched_assertion = %promise.assertion,
+                            label = mode.label(),
+                            event = "guard.unactioned_frequency_promise_uncorrected",
+                            "Unactioned frequency-promise guard already fired this turn — \
                              accepting EndTurn with second violation (budget exhausted)"
                         );
                     }

@@ -70,8 +70,25 @@ struct TokensMetadata {
 /// The endpoint URL is preserved so operators can still recognise a wrong-URL
 /// misconfiguration; the pre-fix "(is it running?)" hint is dropped because it
 /// was actively misleading in the founding incident (spirit *was* running).
+///
+/// # Why the class is re-attached rather than inherited (mika#2278)
+///
+/// The flattening above is deliberate and is the whole mika#1985 fix — but it
+/// produces a *new* error with no source, so the marker
+/// [`mika_cli::remote_ask::TransportClass`] that travelled up from
+/// `send_message_to_agent` would be dropped on the floor and a restart would
+/// exit `1` like a usage error. Reading the class off the original and
+/// re-posing it on the rewritten message keeps both properties: the visible
+/// text is byte-identical to the pre-mika#2278 one (which is what
+/// `test_wrap_send_error_preserves_underlying_a2a_error_chain` defends) and the
+/// exit code still says which of the two happened.
 fn wrap_send_error(err: &anyhow::Error, spirit_endpoint: &str) -> anyhow::Error {
-    anyhow::anyhow!("mika ask to {spirit_endpoint} failed: {err:#}")
+    let message = format!("mika ask to {spirit_endpoint} failed: {err:#}");
+    if mika_cli::remote_ask::is_transport_failure(err) {
+        anyhow::Error::new(mika_cli::remote_ask::TransportClass::new(message))
+    } else {
+        anyhow::anyhow!("{message}")
+    }
 }
 
 /// The stderr notice for background work this invocation started (#265).

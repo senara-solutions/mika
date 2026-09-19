@@ -18,7 +18,9 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use mika_cli::remote_ask::{render_task_parts, send_message_to_agent};
+use mika_cli::remote_ask::{
+    EXIT_TRANSPORT_FAILURE, exit_code_for, render_task_parts, send_message_to_agent,
+};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -50,6 +52,10 @@ enum OnRecovery {
     StillWorking,
     /// No task under that context: the request never created one.
     NotFound,
+    /// The server answers `message/send` with a well-formed JSON-RPC *error*
+    /// instead of hanging up. Nothing failed on the way — the negative control
+    /// for mika#2278's transport class.
+    RefusedByProtocol,
 }
 
 /// Read one full HTTP request (headers + `Content-Length` body) off the socket.
@@ -138,6 +144,18 @@ async fn spawn_dropping_server(on_recovery: OnRecovery) -> (SocketAddr, SharedSe
                         .as_str()
                         .map(str::to_string);
                     seen.lock().unwrap().sent_context_id = ctx;
+                    if let OnRecovery::RefusedByProtocol = on_recovery {
+                        // A complete, well-formed refusal. The exchange worked.
+                        write_json(
+                            &mut stream,
+                            &serde_json::json!({
+                                "jsonrpc": "2.0", "id": 1,
+                                "error": {"code": -32602, "message": "paramètres invalides"},
+                            }),
+                        )
+                        .await;
+                        return;
+                    }
                     // The generation completed server-side; the envelope is lost.
                     drop(stream);
                     return;
@@ -160,6 +178,12 @@ async fn spawn_dropping_server(on_recovery: OnRecovery) -> (SocketAddr, SharedSe
                             "result": task_json("tâche-a2a-1", &id, "working", None),
                         }),
                         OnRecovery::NotFound => serde_json::json!({
+                            "jsonrpc": "2.0", "id": 1,
+                            "error": {"code": -32001, "message": "Task not found"},
+                        }),
+                        // Unreachable: this variant answers `message/send`
+                        // itself, so no recovery read ever follows it.
+                        OnRecovery::RefusedByProtocol => serde_json::json!({
                             "jsonrpc": "2.0", "id": 1,
                             "error": {"code": -32001, "message": "Task not found"},
                         }),
@@ -293,5 +317,78 @@ async fn a_missing_task_is_reported_differently_from_one_in_flight() {
     assert_ne!(
         missing, running,
         "'nothing was started' and 'still running' must not render the same sentence"
+    );
+}
+
+// --- mika#2278: the dead port is a *retryable* failure, end to end ------------
+
+/// **AC1 / V4, against a real socket.** A refused port is the founding
+/// incident's own shape: during a `mika-spirit` restart nothing answers, the
+/// architect pass dies, and until now the caller could not tell that apart from
+/// "your session belongs to another agent". It must exit `75`.
+///
+/// This is the same fixture as `a_refused_port_errors_without_attempting_a_recovery`
+/// read for a different property, deliberately: the message contract and the
+/// exit-code contract are two things, and collapsing them into one assertion
+/// would let a change to either pass on the strength of the other.
+#[tokio::test]
+async fn a_refused_port_is_retryable_and_exits_75() {
+    let addr = {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap()
+    };
+
+    let err = send_message_to_agent("relis ce plan", &endpoint(addr), None, &[], None)
+        .await
+        .expect_err("nothing is listening; this must fail");
+
+    assert_eq!(
+        exit_code_for(&err),
+        EXIT_TRANSPORT_FAILURE,
+        "a restarting server must invite a retry; got: {err:#}"
+    );
+}
+
+/// The same for the two recovery outcomes an in-flight restart actually
+/// produces: the socket died after the request landed, and the server either
+/// holds nothing yet or is still working. Both are transport.
+#[tokio::test]
+async fn a_dropped_socket_is_retryable_whatever_the_recovery_found() {
+    for outcome in [OnRecovery::NotFound, OnRecovery::StillWorking] {
+        let (addr, _) = spawn_dropping_server(outcome).await;
+        let err = send_message_to_agent("relis ce plan", &endpoint(addr), None, &[], None)
+            .await
+            .expect_err("a dropped socket is not an answer");
+        assert_eq!(
+            exit_code_for(&err),
+            EXIT_TRANSPORT_FAILURE,
+            "an exchange that broke on the way must invite a retry; got: {err:#}"
+        );
+    }
+}
+
+/// **AC1's negative control, and it is what carries the proof.** A server that
+/// answers — properly, over a healthy socket — with a JSON-RPC error has not
+/// failed at transport. It must exit `1`.
+///
+/// Without this case, a classifier that answered `Transport` for every failure
+/// would pass both tests above, and `_arch_ask_with_retry` would quietly pay a
+/// second architect turn for every malformed request.
+#[tokio::test]
+async fn a_protocol_refusal_is_definitive_and_exits_1() {
+    let (addr, _) = spawn_dropping_server(OnRecovery::RefusedByProtocol).await;
+
+    let err = send_message_to_agent("relis ce plan", &endpoint(addr), None, &[], None)
+        .await
+        .expect_err("the server refused the request");
+
+    assert!(
+        format!("{err:#}").contains("paramètres invalides"),
+        "the server's own words must survive; got: {err:#}"
+    );
+    assert_eq!(
+        exit_code_for(&err),
+        1,
+        "a refusal the server reasoned about is not repaired by re-sending it; got: {err:#}"
     );
 }

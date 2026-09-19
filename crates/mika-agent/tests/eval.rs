@@ -177,6 +177,11 @@ mod eval {
     // EndTurn du tour silencieux, et le registre anti-double-post qui l'atteint.
     mod test_qa_callback_verdict_net_2368;
 
+    // mika#2358 — la garde 5e sur le chemin de production : une promesse de
+    // fréquence sans acteur est refusée, l'aveu d'incapacité passe, et le
+    // budget d'un seul re-prompt tient.
+    mod test_unactioned_frequency_promise_2358;
+
     // Self-dev-callback engine consistency: documented callback-handler branches
     // produce tool calls the engine accepts or defers (mika#806).
     mod test_self_dev_callback_engine_consistency;

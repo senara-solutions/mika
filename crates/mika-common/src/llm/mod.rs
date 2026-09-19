@@ -25,7 +25,8 @@ pub use budget::{
     LlmTimeoutBudget, MIN_AGENT_TOTAL_TIMEOUT_SECS,
 };
 pub use budget_provenance::{
-    BudgetProvenance, BudgetSource, ResolvedBudgetValue, log_llm_budget_resolved,
+    BudgetProvenance, BudgetSource, MODEL_SOURCE_UNKNOWN_PROVIDER, ModelProvenance,
+    ResolvedBudgetValue, ResolvedTextValue, log_llm_budget_resolved,
 };
 pub use error::LlmError;
 pub use model_override::{

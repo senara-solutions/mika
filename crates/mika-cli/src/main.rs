@@ -335,8 +335,12 @@ async fn main() -> Result<()> {
                 {
                     Ok(()) => Ok(()),
                     Err(e) => {
+                        // The printed text is unchanged; only the exit code
+                        // distinguishes a transport failure from a broken
+                        // contract (mika#2278). `--remote` shares
+                        // `send_message_to_agent`, so it shares the classification.
                         eprintln!("Error: {e:#}");
-                        std::process::exit(1);
+                        std::process::exit(mika_cli::remote_ask::exit_code_for(&e));
                     }
                 };
             }
@@ -358,8 +362,13 @@ async fn main() -> Result<()> {
             {
                 Ok(()) => Ok(()),
                 Err(e) => {
+                    // Same contract as the `--remote` arm above: the message is
+                    // untouched, the exit code carries the class (mika#2278).
+                    // Every failure raised before the A2A send — an empty
+                    // `--session-id`, a session owned by another agent, an
+                    // unknown `--task-id` — is contract-class and still exits 1.
                     eprintln!("Error: {e}");
-                    std::process::exit(1);
+                    std::process::exit(mika_cli::remote_ask::exit_code_for(&e));
                 }
             }
         }
