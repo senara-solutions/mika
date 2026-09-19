@@ -34,6 +34,13 @@ struct MetadataEnvelope {
     session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
+    /// Whether the SERVER attested this turn ran with a session-isolated
+    /// conversation window (mika#1951). `None` means the server said nothing —
+    /// a spirit predating the key, or a path outside synchronous
+    /// `message/send` — and is serialized as an **absent** field, never as
+    /// `false` and never as the local `--isolated` flag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    isolated: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -116,6 +123,7 @@ pub async fn run(
     enable_skill: &[String],
     disable_skill: &[String],
     only_skill: &[String],
+    session_isolated: bool,
     verbose: bool,
 ) -> Result<()> {
     let ctx = init::init_for_agent(agent_name)?;
@@ -427,6 +435,7 @@ pub async fn run(
         Some(session_id.as_str()),
         only_skill,
         model_override,
+        session_isolated,
     )
     .await
     .map_err(|e| wrap_send_error(&e, &spirit_endpoint))?;
@@ -489,6 +498,12 @@ pub async fn run(
     // older than mika#2304, or a path outside synchronous `message/send`), and
     // the only honest rendering of that is *no model at all*.
     let model_string = mika_cli::remote_ask::attested_model(&task).map(str::to_string);
+    // mika#1951, same rule and same reason one field down: the isolation shown is
+    // the one the server attested on the returned Task. Reading `session_isolated`
+    // back here would print the flag this process was handed — an assertion about
+    // a turn it did not run, and the precise shape of the false green mika#2304
+    // measured on the `model:` line.
+    let isolated_attested = mika_cli::remote_ask::attested_session_isolation(&task);
 
     let envelope = MetadataEnvelope {
         // Unconditional fields — present whenever the CLI flag was provided
@@ -501,6 +516,7 @@ pub async fn run(
             None
         },
         model: if verbose { model_string } else { None },
+        isolated: if verbose { isolated_attested } else { None },
         agent_id: if verbose {
             Some(agent_name.to_string())
         } else {
@@ -520,6 +536,7 @@ pub async fn run(
     // non-task invocations).
     let has_any_field = envelope.session_id.is_some()
         || envelope.model.is_some()
+        || envelope.isolated.is_some()
         || envelope.agent_id.is_some()
         || envelope.latency_ms.is_some()
         || envelope.tokens.is_some()
@@ -549,6 +566,18 @@ pub async fn run(
                 match (&meta.model, verbose) {
                     (Some(v), _) => println!("model: {v}"),
                     (None, true) => println!("{}", mika_cli::remote_ask::NO_ATTESTATION_LINE),
+                    (None, false) => {}
+                }
+                // mika#1951: same three-arm shape as `model:` above, for the same
+                // reason. Under `--verbose` the line is always emitted and says
+                // so when the server attested nothing — an operator running a
+                // bench must be able to tell "not isolated" from "this server
+                // does not know how to tell me", and silence conflates them.
+                match (meta.isolated, verbose) {
+                    (Some(v), _) => println!("isolated: {v}"),
+                    (None, true) => {
+                        println!("{}", mika_cli::remote_ask::NO_ISOLATION_ATTESTATION_LINE)
+                    }
                     (None, false) => {}
                 }
                 if let Some(ref v) = meta.agent_id {
@@ -1053,6 +1082,7 @@ mod tests {
         let envelope = MetadataEnvelope {
             session_id: Some("sess-1".to_string()),
             model: Some("anthropic/claude-sonnet-4-6".to_string()),
+            isolated: Some(true),
             agent_id: Some("mika-dev".to_string()),
             latency_ms: Some(1234),
             tokens: Some(TokensMetadata {
@@ -1077,6 +1107,7 @@ mod tests {
         assert_eq!(parsed["tokens"]["cache_write"], 20);
         assert_eq!(parsed["task_id"], "task-1");
         assert_eq!(parsed["parent_task_id"], "parent-1");
+        assert_eq!(parsed["isolated"], serde_json::Value::Bool(true));
     }
 
     #[test]
@@ -1112,9 +1143,81 @@ mod tests {
         // No verbose-gated fields
         assert!(parsed.get("session_id").is_none());
         assert!(parsed.get("model").is_none());
+        assert!(parsed.get("isolated").is_none());
         assert!(parsed.get("agent_id").is_none());
         assert!(parsed.get("latency_ms").is_none());
         assert!(parsed.get("tokens").is_none());
+    }
+
+    // --- mika#1951 U3: the envelope reports the server, never the flag --------
+
+    /// **The attestation is a bool, and `false` is a value — not an absence.**
+    ///
+    /// `skip_serializing_if = "Option::is_none"` on an `Option<bool>` is what
+    /// keeps the three states apart on the wire: `true` (the server isolated the
+    /// turn), `false` (the server understood and did not), and the key being
+    /// **absent** (the server said nothing at all). A plain `bool` would have
+    /// collapsed the last two into `false`, which reads as "not isolated" and is
+    /// the exact conflation that lets a bench against an old spirit look
+    /// measured.
+    #[test]
+    fn mika1951_the_isolation_attestation_keeps_false_and_absent_apart() {
+        let attested_false = MetadataEnvelope {
+            isolated: Some(false),
+            ..Default::default()
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&attested_false).unwrap()).unwrap();
+        assert_eq!(
+            parsed["isolated"],
+            serde_json::Value::Bool(false),
+            "an attested `false` must be emitted, not skipped: {parsed}"
+        );
+
+        let unattested = MetadataEnvelope::default();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&unattested).unwrap()).unwrap();
+        assert!(
+            parsed.get("isolated").is_none(),
+            "an unattested turn must omit the key, never emit `false`: {parsed}"
+        );
+    }
+
+    /// **The envelope is fed by the Task, and nothing else reads the flag.**
+    ///
+    /// `run` is handed `session_isolated` and posts it on the wire; the only
+    /// other thing it may do with it is nothing. Reading it back into the
+    /// envelope would print an isolation this process asked for rather than one
+    /// that happened — the mika#2304 false green, one field over. No behavioural
+    /// test can see that substitution: both renderings say `isolated: true` on
+    /// the happy path and differ only against a server that ignored the key,
+    /// which is the population a unit test has no server for.
+    #[test]
+    fn mika1951_the_envelope_never_reads_the_local_flag() {
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let source = scanner.production_of(&scanner.src_root().join("commands/ask.rs"));
+
+        // Two mentions and two only: the parameter's declaration, and the one
+        // place it is handed to `send_message_to_agent`. Comment lines are
+        // excluded — the prose above the envelope names the flag precisely in
+        // order to say it is *not* read, and a guard that counted that mention
+        // would forbid explaining itself.
+        let mentions = source
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| l.contains("session_isolated"))
+            .count();
+        assert_eq!(
+            mentions, 2,
+            "expected `session_isolated` to appear exactly twice (declared, then \
+             passed to the wire), found {mentions} — a third mention is the flag \
+             being read back, which would make `--verbose` answer for the server"
+        );
+        assert!(
+            source.contains("attested_session_isolation(&task)"),
+            "the envelope must be fed by the server's attestation on the Task"
+        );
     }
 
     #[test]
