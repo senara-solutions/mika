@@ -75,8 +75,21 @@ impl tracing::field::Visit for FieldVisitor<'_> {
     }
 }
 
+/// A dispatcher registered for the life of the test process, so the scoped one
+/// below is never the only one.
+///
+/// tracing-core caches a callsite's interest at its first hit. While exactly one
+/// dispatcher is registered, that first computation consults the *hitting
+/// thread's* default — so another `eval` test that first reaches
+/// `emit_context_window_assembled` on its own thread, while this guard is the
+/// lone registered dispatcher, caches `never` for the whole process and this test
+/// captures zero events. With two registered, the computation iterates the
+/// registry instead and sees the capturing subscriber.
+static PINNED_DISPATCH: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+
 fn capture() -> (tracing::subscriber::DefaultGuard, Captured) {
     use tracing_subscriber::layer::SubscriberExt;
+    PINNED_DISPATCH.get_or_init(|| tracing::Dispatch::new(tracing_subscriber::registry()));
     let events: Captured = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::registry().with(CapturingLayer {
         events: Arc::clone(&events),
