@@ -336,6 +336,14 @@ components:
           oneOf:
           - type: 'null'
           - $ref: '#/components/schemas/TelegramDocument'
+        from:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/TelegramUser'
+            description: |-
+              Sender, carried only for its `language_code` (mika#2025). Telegram has
+              always sent this object; the gateway used to drop it at deserialization,
+              which is why no language signal existed anywhere in the process.
         photo:
           type:
           - array
@@ -362,6 +370,21 @@ components:
         update_id:
           type: integer
           format: int64
+    TelegramUser:
+      type: object
+      description: |-
+        Message sender. Deserialized for `language_code` alone (mika#2025) — every
+        other field of Telegram's `User` object is deliberately absent, so nothing
+        here can become a second route to user identity.
+      properties:
+        language_code:
+          type:
+          - string
+          - 'null'
+          description: |-
+            IETF language tag of the sender's **Telegram interface** (`fr`, `fr-FR`,
+            `en-US`, …), as declared by the client. Absent on channel posts and on
+            clients that send none.
     VersionInfo:
       type: object
       description: Build version info returned by the `/version` endpoint.
