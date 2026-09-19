@@ -2659,6 +2659,116 @@ mod tests {
         }
     }
 
+    /// mika#2280 AC8 / FD1 — the three shipped geometries and their
+    /// reachability verdict, frozen.
+    ///
+    /// The complement in orientation of the mika#2296 floor above: that guard
+    /// bounds the declared output budget from below, this one reads the RATIO
+    /// between the declared budget and what the time plafond can physically
+    /// carry (`reachable_output_tokens` at the default throughput floor). All
+    /// three agents are already above their reachable figure, so the naive
+    /// invariant "declared ≤ reachable" would go red on a production
+    /// configuration that did nothing wrong — hence a **named allowlist**, one
+    /// row per geometry, carrying its reason and its follow-up reference.
+    ///
+    /// **The test demands no correction.** It goes red the day one of the six
+    /// numbers moves without the arithmetic being redone — including the day a
+    /// follow-up lowers mika-dev's budget under its reachable figure, which
+    /// makes its row stale and says so instead of passing in silence. Any
+    /// declaration outside the allowlist must sit at or under its reachable
+    /// figure.
+    ///
+    /// The follow-up reference is mika#2280 itself: the per-request plafond
+    /// ticket is conditioned on the post-deploy probes (b)/(c) of its plan and
+    /// does not exist yet — its number replaces this one when it opens.
+    #[test]
+    fn mika2280_the_three_shipped_geometries_and_their_verdict() {
+        use mika_common::llm::budget::DEFAULT_OUTPUT_TOKENS_PER_SEC_FLOOR;
+        use mika_common::llm::{DEFAULT_AGENT_TOTAL_TIMEOUT_SECS, DEFAULT_HTTP_TIMEOUT_SECS};
+
+        struct Excepted {
+            agent: &'static str,
+            http_timeout_secs: u64,
+            max_tokens: i64,
+            why: &'static str,
+        }
+        const ALLOWLIST: &[Excepted] = &[
+            Excepted {
+                agent: "mika-arch",
+                http_timeout_secs: 240,
+                max_tokens: 32_768,
+                why: "decided (mika#2296): a non-binding output plafond, time is the brake — terminal",
+            },
+            Excepted {
+                agent: "mika-dev",
+                http_timeout_secs: 120,
+                max_tokens: 8_192,
+                why: "~1.8x its 4 500 reachable tokens; the measurement mika#2280 produces, not a defect it settles — follow-up: mika#2280",
+            },
+            Excepted {
+                agent: "mika-qa",
+                http_timeout_secs: 120,
+                max_tokens: 16_384,
+                why: "~3.6x its 4 500 reachable tokens; same status — follow-up: mika#2280",
+            },
+        ];
+
+        let mut seen = Vec::new();
+        for agent in WELL_KNOWN_AGENTS {
+            let Some(config_toml) = agent.config_toml else {
+                continue;
+            };
+            let config: toml::Value = toml::from_str(config_toml).unwrap_or_else(|e| {
+                panic!("{}'s config_toml should be valid TOML: {e}", agent.name)
+            });
+            let Some(declared) = config.get("llm_max_tokens").and_then(|v| v.as_integer()) else {
+                continue;
+            };
+            let int = |key: &str, default: u64| {
+                config
+                    .get(key)
+                    .and_then(|v| v.as_integer())
+                    .map_or(default, |v| v as u64)
+            };
+            let http = int("llm_http_timeout_secs", DEFAULT_HTTP_TIMEOUT_SECS);
+            let envelope = int("agent_total_timeout_secs", DEFAULT_AGENT_TOTAL_TIMEOUT_SECS);
+            let reachable = mika_common::llm::LlmTimeoutBudget::unvalidated(http, envelope)
+                .reachable_output_tokens(DEFAULT_OUTPUT_TOKENS_PER_SEC_FLOOR);
+            let above = declared as u64 > reachable;
+
+            match ALLOWLIST.iter().find(|e| e.agent == agent.name) {
+                Some(row) => {
+                    seen.push(row.agent);
+                    assert_eq!(
+                        (http, declared, above),
+                        (row.http_timeout_secs, row.max_tokens, true),
+                        "mika#2280: {}'s geometry moved (plafond {http} s, llm_max_tokens \
+                         {declared}, reachable {reachable}). Redo the arithmetic and update \
+                         its allowlist row ({}) — or remove the row if the budget now fits.",
+                        agent.name,
+                        row.why
+                    );
+                }
+                None => assert!(
+                    !above,
+                    "mika#2280: {} declares llm_max_tokens = {declared} above the {reachable} \
+                     tokens its {http} s plafond can carry at {DEFAULT_OUTPUT_TOKENS_PER_SEC_FLOOR} \
+                     tok/s. Either lower it, or add a named allowlist row with its reason.",
+                    agent.name
+                ),
+            }
+        }
+
+        // Self-cleaning: a row whose agent no longer declares a budget is stale.
+        for row in ALLOWLIST {
+            assert!(
+                seen.contains(&row.agent),
+                "mika#2280: allowlist row for {} matches no declaration — remove it",
+                row.agent
+            );
+        }
+    }
+
     /// mika#2309 § Fire-Disposition surface 3 — **contrôle positif
     /// auto-nettoyant** sur une divergence vivante, mesurée le 2026-09-18.
     ///

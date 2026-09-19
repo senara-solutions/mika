@@ -917,6 +917,81 @@ Observabilité du budget effectif + garde de demi-configuration (mika#2293) :
   par une variable d'environnement fleet-wide — voir la garde ci-dessus pour
   pourquoi.
 
+Lire une coupure au plafond (mika#2280) :
+- **Ce que ça distingue.** `LLM response body read failed mid-stream` (32/jour le
+  2026-09-10, openrouter, glm-5.3 et kimi) rend `transport_timeout` que le corps
+  ait cessé d'arriver **au plafond** (le modèle générait encore) ou **n'importe
+  quand** (le réseau est mort). Le discriminant est l'écoulé de la tentative
+  contre le plafond par appel, avec une tolérance de 2 % (`elapsed_ms >= 0.98 ×
+  plafond`). **Rien n'est corrigé ici** : aucune constante ne bouge, la
+  rétryabilité et la classe d'erreur sont inchangées (mika#2015). Ce travail
+  produit la mesure qui décidera du remède (plafond par requête — ticket de
+  suivi conditionné aux sondes (b)/(c) ci-dessous).
+- **Périmètre : les deux rails en forme OpenAI** (`openai.rs`, `ollama.rs`). Le
+  rail Anthropic passe son propre littéral `120s` à `reqwest` (mika#2189) : il
+  porte `max_tokens` sur `llm_call_attempt` mais **jamais** `cap_exhausted`.
+- `MIKA_LLM_OUTPUT_TOKENS_PER_SEC_FLOOR` — plancher de débit supposé (tok/s,
+  défaut `50`, trois paliers maison). Sert **uniquement** au champ
+  `reachable_output_tokens` = `plafond × 3/4 × plancher` (réserve de prefill
+  d'un quart). Rapporté, **jamais appliqué** : rien dans le retry ni la
+  validation ne le lit. 50 et non 66 (seul débit mesuré, mika#2296) parce que la
+  population observable est **censurée** — les appels lents ont été tués au
+  plafond, donc le plancher observé surestime le vrai.
+- **Journal** (`$MIKA_SPIRIT_LOG_FILE`) :
+  ```bash
+  # Combien de coupures sont des guillotines, et sur quel modèle
+  grep llm_call_cap_exhausted $MIKA_SPIRIT_LOG_FILE \
+    | jq '{provider, model, max_tokens, http_timeout_secs, elapsed_ms, reachable_output_tokens}'
+
+  # Le budget de sortie réellement en vigueur, et par quelle porte
+  grep llm_budget_resolved $MIKA_SPIRIT_LOG_FILE \
+    | jq '{agent_id, llm_max_tokens, max_tokens_source, reachable_output_tokens, http_timeout_secs, http_source}'
+
+  # Les tentatives coupées au plafond (mika#2331 étendu)
+  grep llm_call_attempt $MIKA_SPIRIT_LOG_FILE \
+    | jq 'select(.event == "llm_call_attempt" and .cap_exhausted == true)'
+  ```
+  `llm_budget_resolved` porte désormais `llm_max_tokens`, `max_tokens_source`,
+  `max_tokens_raw` et `reachable_output_tokens` (troisième clé de la cascade
+  mika#2293, `llm_max_tokens` / `MIKA_LLM_MAX_TOKENS`), et un changement qui ne
+  bouge que le budget de sortie **ré-émet** la ligne. `llm_call_attempt` porte
+  `max_tokens` et `cap_exhausted`.
+- **Lire un `cap_exhausted` absent : deux causes, `provider` les sépare.** La
+  tentative n'a pas eu lieu (`deadline_abort`, tous rails — **absent, jamais
+  `false`**), ou le rail n'est pas instrumenté (Anthropic, toutes ses
+  tentatives). `select(.cap_exhausted == true)` est exact ; compter les `false`
+  ne rend que la population OpenAI-compatible.
+- **Régime attendu de `llm_call_cap_exhausted` : NON VIDE.** La ligne existe pour
+  compter une population que le ticket estime à ~32/jour. Une réponse non-2xx
+  dont le corps d'erreur arrive tard (429 lent) n'y entre **jamais** — site
+  négatif épinglé par test.
+- **SQL.** Pas d'`audit_events` (`mika-common` n'a pas d'accès base) ; la surface
+  reste `llm_calls`, avec le plafond de l'agent en paramètre :
+  ```sql
+  SELECT model, COUNT(*) FROM llm_calls
+   WHERE status = 'error' AND latency_ms >= 120000 * 98 / 100   -- plafond de l'agent
+   GROUP BY 1 ORDER BY 2 DESC;
+  ```
+- **Sonde post-déploiement, et ses haltes.** (a) *Provenance d'abord* :
+  `max_tokens_source` et `http_source` pour mika-dev et mika-qa ; un
+  `process_env` signifie qu'une variable de service écrase le `config.toml` — le
+  remède est de la retirer, pas de toucher une constante. (b) *Contrôle négatif,
+  48 h — la halte principale* : **zéro ligne `llm_call_cap_exhausted` pendant
+  que `body read failed mid-stream` continue : le diagnostic est faux, ne pas
+  ouvrir le suivi.** La coupure n'est pas au plafond ; la piste devient
+  mika#2313/#2317 (relais, fin de corps) ou le fournisseur. Ne pas élargir la
+  tolérance de 2 % pour faire apparaître des lignes. (c) *Attribution, 7 jours* :
+  la distribution par modèle **est** la décision du suivi (dominée par un modèle
+  → suivi par modèle ; étalée → suivi géométrique). (d) *Débit réel* : un
+  plancher observé sous 50 tok/s rend `reachable_output_tokens` optimiste —
+  corriger la constante, pas la formule. (e) *Non-régression* : le volume de
+  `outcome == "retrying"` ne doit pas bouger ; s'il bouge, le drapeau a fuité
+  dans la rétryabilité — désarmer.
+- **Garde de géométrie.** `well_known_agents::tests::mika2280_the_three_shipped_geometries_and_their_verdict`
+  fige mika-dev 120/8192, mika-qa 120/16384 et mika-arch 240/32768 — tous trois
+  au-dessus de leur atteignable, portés par une allowlist nommée — et rougit si
+  l'un des six nombres bouge sans que l'arithmétique soit refaite.
+
 Portage de contexte entre passes architecte : la question est tranchée (mika#2305) :
 - **La réponse, par axe — c'est le livrable principal, et le ticket se trompe d'axe.**
   Le **portage intra-invocation** (1ʳᵉ passe → 2ᵉ passe, et retry UNPARSED) est
