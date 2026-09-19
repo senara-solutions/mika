@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# smoke-search-substrate — after a rotation, ask the gateway whether the search
+# substrate is actually wired, by using it.
+#
+# THE PROPERTY, not a list of statuses:
+#   A gateway whose search substrate is not wired is indistinguishable, from the
+#   outside, from a healthy one. It passes /readyz (which tests a boolean and a
+#   `SELECT 1`), the Kubernetes rollout succeeds, and `POST /internal/search`
+#   answers 404 to every tenant. The only way to learn the difference is to make
+#   a real search and read the status.
+#
+# THE FOUNDING INCIDENT is mika#2407. On 2026-09-18 the rotation to image
+# main-e1342dfa moved web search behind the gateway (mika#1971: the agent's
+# `web_search` no longer reads its own key, it POSTs /internal/search), and the
+# gateway carried neither MIKA_BRAVE_API_KEY nor MIKA_SEARCH_UPSTREAM. Six
+# tenants lost web search for about twenty hours. Nothing was red. The tenants'
+# own agents, given a 404 and a neutral substrate fallback, paraphrased it to
+# their users as "the search tool has a server-side configuration problem
+# (missing API key)" — a sentence that was both wrong and unactionable.
+#
+# WHY THIS EXISTS ALONGSIDE THE STARTUP GUARD. `MIKA_SEARCH_REQUIRED` (mika#2407
+# U2) makes a gateway refuse to start when it declares it expects search and has
+# none — structural, no caller needed, no upstream request spent. But a rotation
+# that dropped MIKA_SEARCH_UPSTREAM could equally have dropped
+# MIKA_SEARCH_REQUIRED, and a declaration nobody made guards nothing. This smoke
+# reads no variable of the pod: it asks from the outside and demands a 200. The
+# two stages do not cover each other by redundancy but by **provenance** — one
+# reads what the pod believes, the other what the pod does. Neither makes the
+# other pointless: the guard cannot see a key that is present but dead.
+#
+# ONE REQUEST, AND IT IS FIXED.
+#   The upstream quota is shared by the whole fleet and the free tier is small,
+#   so this script spends exactly one search. The query is a constant, written
+#   here in full, so that nobody reading a log can mistake it for a tenant's
+#   search. It is deliberately about this smoke and about nothing a person would
+#   plausibly look for.
+#
+# WHAT IT NEVER PRINTS.
+#   Not the token, not its length, not its prefix. Not the search results
+#   either: a 200 carries real titles and URLs, and printing them would turn a
+#   deployment check into a search log. Only the count is shown. The Q4 STRIP
+#   TOTAL discipline of crates/mika-gateway/src/egress_search/ extends to
+#   anything that calls it.
+#
+# USAGE
+#   MIKA_INTERNAL_TOKEN=<token> scripts/smoke-search-substrate https://<gateway>
+#
+#   The token is read from the environment, never from an argument: an argument
+#   lands in the process table and in shell history. The legitimate caller is
+#   the deployment pipeline, which already holds this secret because it is the
+#   same one /send uses.
+#
+# EXIT CODES — three verdicts, and the third is the one that matters most.
+#   0  the substrate is healthy (HTTP 200)
+#   1  the substrate is BROKEN, and the gateway is what must be repaired:
+#        - 404 search_upstream_not_configured — the 2026-09-18 failure exactly
+#        - 502 unauthorized — the key is present and the upstream refuses it
+#   2  NOTHING WAS VERIFIED (no token, no URL, unreachable host, 501, any other
+#      502, an unparseable answer). This is not a pass and not a failure of the
+#      substrate. A smoke that cannot authenticate has checked nothing, and
+#      saying so is the only honest output; collapsing it into 0 would make a
+#      broken pipeline look like a healthy fleet, and into 1 would send an
+#      operator to fix a gateway that may be fine.
+
+set -uo pipefail
+
+# The constant query. See "ONE REQUEST, AND IT IS FIXED" above.
+readonly SMOKE_QUERY="mika gateway search substrate deployment smoke check"
+# Smallest result set the substrate will accept; we assert on the status, never
+# on the content.
+readonly SMOKE_MAX_RESULTS=1
+readonly SMOKE_TIMEOUT_SECS=15
+
+readonly EXIT_OK=0
+readonly EXIT_SUBSTRATE_BROKEN=1
+readonly EXIT_INDETERMINATE=2
+
+usage() {
+    cat >&2 <<'USAGE'
+usage: MIKA_INTERNAL_TOKEN=<token> smoke-search-substrate <gateway-base-url>
+
+  <gateway-base-url>  e.g. https://gateway.example.com (no trailing path)
+
+exit 0 = search substrate healthy
+exit 1 = search substrate broken (gateway needs fixing)
+exit 2 = nothing was verified (missing token/URL, transport, unknown answer)
+USAGE
+}
+
+if [[ $# -ne 1 ]] || [[ "$1" == "-h" ]] || [[ "$1" == "--help" ]]; then
+    usage
+    exit "$EXIT_INDETERMINATE"
+fi
+
+base_url="${1%/}"
+if [[ -z "$base_url" ]]; then
+    echo "smoke-search-substrate: empty gateway URL — nothing verified." >&2
+    exit "$EXIT_INDETERMINATE"
+fi
+
+# Absence of a token is exit 2 and never exit 0: an unauthenticated smoke has
+# verified nothing about the substrate.
+token="${MIKA_INTERNAL_TOKEN:-}"
+if [[ -z "${token//[[:space:]]/}" ]]; then
+    echo "smoke-search-substrate: MIKA_INTERNAL_TOKEN is not set in the environment." >&2
+    echo "  POST /internal/search sits behind the same bearer auth as /send." >&2
+    echo "  Nothing was verified." >&2
+    exit "$EXIT_INDETERMINATE"
+fi
+
+endpoint="$base_url/internal/search"
+body_file="$(mktemp)"
+trap 'rm -f "$body_file"' EXIT
+
+# `--data` carries the constant query; jq builds it so the JSON is well-formed
+# whatever the constants become.
+request_body="$(jq -nc \
+    --arg q "$SMOKE_QUERY" \
+    --argjson n "$SMOKE_MAX_RESULTS" \
+    '{query: $q, max_results: $n}')"
+
+# `-w '%{http_code}'` on stdout, body to a file: the status is what we decide on
+# and it must not be mixed with a body we mostly refuse to print.
+status="$(curl -sS \
+    --max-time "$SMOKE_TIMEOUT_SECS" \
+    -o "$body_file" \
+    -w '%{http_code}' \
+    -X POST "$endpoint" \
+    -H "Authorization: Bearer $token" \
+    -H 'Content-Type: application/json' \
+    --data "$request_body" 2>/dev/null)"
+curl_rc=$?
+
+if [[ $curl_rc -ne 0 ]]; then
+    echo "smoke-search-substrate: could not reach $endpoint (curl exit $curl_rc)." >&2
+    echo "  Nothing was verified — this says nothing about the search substrate." >&2
+    exit "$EXIT_INDETERMINATE"
+fi
+
+# The taxonomy label, when the body is the substrate's own error shape. Only
+# ever a label — the handler returns `{"error": "<label>"}` and nothing else
+# (Q4 STRIP TOTAL). An unparseable body yields the empty string.
+error_label="$(jq -r 'if type == "object" and has("error") then .error else "" end' \
+    <"$body_file" 2>/dev/null || echo "")"
+
+case "$status" in
+    200)
+        result_count="$(jq -r 'if type == "object" and (.results | type) == "array"
+                               then (.results | length) else "?" end' \
+            <"$body_file" 2>/dev/null || echo "?")"
+        echo "smoke-search-substrate: OK — POST /internal/search → 200 ($result_count result(s))."
+        exit "$EXIT_OK"
+        ;;
+    404)
+        # The 2026-09-18 failure, verbatim. Named separately from every other
+        # 404 the URL could produce so a typo in the base URL is not read as a
+        # broken substrate.
+        if [[ "$error_label" == "search_upstream_not_configured" ]]; then
+            echo "smoke-search-substrate: BROKEN — POST /internal/search → 404 search_upstream_not_configured." >&2
+            echo "  The gateway has no search upstream wired. Every tenant's web search is dead," >&2
+            echo "  silently: /readyz stays green and the rollout succeeds." >&2
+            echo "  Fix: set MIKA_SEARCH_UPSTREAM=brave AND MIKA_BRAVE_API_KEY in the gateway" >&2
+            echo "  secret, then roll out. A key on its own activates nothing (mika#2407)." >&2
+            exit "$EXIT_SUBSTRATE_BROKEN"
+        fi
+        echo "smoke-search-substrate: 404 at $endpoint, but not the substrate's own" >&2
+        echo "  search_upstream_not_configured. Check the base URL points at a gateway." >&2
+        echo "  Nothing was verified." >&2
+        exit "$EXIT_INDETERMINATE"
+        ;;
+    502)
+        if [[ "$error_label" == "unauthorized" ]]; then
+            echo "smoke-search-substrate: BROKEN — the upstream refused our credentials (502 unauthorized)." >&2
+            echo "  The selector IS wired; the key is present and rejected. This is a key" >&2
+            echo "  rotation, not a missing selector — do not add MIKA_SEARCH_UPSTREAM." >&2
+            exit "$EXIT_SUBSTRATE_BROKEN"
+        fi
+        # upstream_error / transport / parse_error: the substrate is wired and
+        # the upstream had a bad moment. Not a deployment defect, so not exit 1.
+        echo "smoke-search-substrate: indeterminate — 502 ${error_label:-<unparseable body>}." >&2
+        echo "  The substrate is wired but the upstream call did not succeed. Retry before" >&2
+        echo "  concluding anything; this is not evidence of a configuration defect." >&2
+        exit "$EXIT_INDETERMINATE"
+        ;;
+    *)
+        echo "smoke-search-substrate: indeterminate — HTTP $status ${error_label:+($error_label)}." >&2
+        echo "  Nothing was verified." >&2
+        exit "$EXIT_INDETERMINATE"
+        ;;
+esac
