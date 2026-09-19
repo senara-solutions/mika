@@ -1927,6 +1927,58 @@ between mika and cm): `mika-platform/docs/operator/token-rotation-procedure.md`.
 
 All SQLite timestamp columns use ISO 8601 TEXT format (`%Y-%m-%dT%H:%M:%SZ`). The `crate::timestamp` module provides centralized helpers: `now()`, `format()`, `parse()`, `now_plus()`, `now_minus()`. Fixed-width UTC format ensures correct lexicographic ordering.
 
+## DB Module Layout (mika#2321)
+
+`crate::db` is a file module (`db.rs`) with a sibling directory (`db/`) — the
+Rust 2018 layout, so **no `db/mod.rs` exists and none is needed**. Where a piece
+of the DB layer lives is decided by one rule, not by taste:
+
+| path | holds | why there |
+|---|---|---|
+| `db.rs` | types, `open`/`open_in_memory`, the ~30 thematic `impl Database` sections, free functions | the region that *churns* — methods get rewritten, replaced, deleted |
+| `db/migrations.rs` | `migrate` + every `migrate_vN_to_vM`, and their tests | **append-only**: a migration is never deleted (v1…v54, for ever) |
+| `db/tests/` | the `#[cfg(test)]` module, split by theme | **append-only**: a test is rarely deleted |
+| `db/kg_schema.rs`, `db/operational.rs` | their own `impl Database` blocks | pre-existing, same idiom |
+
+**The two split-out regions are the two whose size is monotone.** That is the
+whole criterion (plan mika#2321 E1): `db.rs` had crossed the 1 MB cap
+`scripts/check-secrets.sh` enforces, and was exempted by name in
+`LARGE_FILE_ALLOWLIST` — an exemption that was not static but **unbounded**, and
+under which the file took ~64 KB in three days without a signal. The allowlist is
+now empty and the CI gate bounds the growth on its own.
+
+**Callers did not move, and cannot need to.** A method stays `Database::foo`
+whatever file carries its `impl`, so `async_db.rs` and the ~30 modules doing
+`use crate::db::…` are untouched. `crate::db::tests::*` — a real inter-module
+contract, imported by `skills::executor` — survives byte for byte.
+
+**Two visibility rules govern any future move**, and they are what kept this
+refactor at *one* signature change in total (`migrate` → `pub(super)`):
+
+1. A child module sees its parent's private items; two siblings do not. So
+   `db::tests` and `db::migrations`, both children of `db`, still reach every
+   private item of `db` — but not each other's.
+2. Therefore **a test module travels with the code it tests**. The migration
+   tests live in `db/migrations.rs`, not in `db/tests/`, because they call ~31
+   private `migrate_vN_to_vM`; putting them with the other tests would have cost
+   ~31 widened signatures. The same rule pulled `migration_v38_to_v39_idempotent`
+   out of `db/operational.rs`.
+
+**A guard premise this invalidated, repo-wide.** Several structural guards
+isolate "production" by truncating each file at its first `#[cfg(test)]` literal.
+An extracted test module carries no such literal — the attribute stays on the
+parent's `mod tests;` declaration — so those guards scan the whole test file as
+production. The premise was already false for `db/tests/harnais_porte.rs`
+(mika#2310) and `perimeter/tests.rs`, and merely benign. Three guards now consult
+[`crate::source_scan::is_test_source_path`] (segment `/tests/` **or** filename
+`tests.rs`, the predicate `perimeter/rules.rs` already tests) — `db` (mika#2335
+F2a), `agent_loop` (mika#2305) and `auto_pull` (mika#2361). **If a fourth reddens
+after moving test code: repair the classification, never widen the needle and
+never add a file allowlist** — each of those guards refuses that in as many
+words, and each carries a negative control proving it still catches a real
+production site. Remaining `src/**/*.rs` scanners use other exclusion mechanisms
+and have not been audited against this premise (follow-up).
+
 ## Schema Version
 
 **Current: v53.** Tables: sessions, messages (with `internal` flag for agent-to-agent visibility), team_workspace, audit_events, skill_overrides (with `enabled` column for DB-backed disable state), tasks (with manual/callback/a2a trigger types and a `type` column distinguishing `issue`/`milestone`/`project`), a2a_task_map, a2a_artifacts, a2a_push_notification_configs, llm_calls (with `response_text` and `reasoning` columns for LLM output persistence, and the two size columns `system_prompt_bytes` / `request_bytes`), tool_calls, team_runs (with `delegation_count` / `solo_absorption` / `failure_context` columns and `status` CHECK expanded to include `failed_no_delegation` — mika#1676 — and `failed_transport` — mika#1671), schema_meta (migration state tracking), kg_entities, kg_relationships, operational_items (#1262 — canonical operational-item ledger with 7 kind variants, 6 status variants, source-based dedup), permission_decisions (#1733 — provenance ledger for operator permission decisions with `classifier_verdict`/`operator_decision`/`override_used`/`decision_authority`/`tenant_id`/`agent_id` columns), pilot_transcripts (#1705 — claude-pilot LLM-call transcripts ingested from JSONL files), served_content (#1867 — per-(agent, person, category) content-serve ledger for proverb/quote/joke/poem/recommendation/story/fact dedup). **Shared-corpus KG tables (keyed by `docs_root_hash`):** kg_chunks, kg_subject_entities (with `discovered` and `discovery_reason` columns for roster-grounding #1158), kg_subject_relationships, kg_chunk_subjects, kg_chunk_subject_relationships, kg_extractions (first-writer-wins via INSERT OR IGNORE). **Per-agent KG tables:** kg_subject_resolutions, kg_resolutions_log (outcome CHECK includes `skipped_discovered_subject`), agent_kg_corpora (agent_id to docs_root_hash mapping for multi-corpus fan-out). `unified_timeline` VIEW for cross-subsystem queries. Session-based message storage with FK. System sessions (`system-{agent_id}`) for compaction.
