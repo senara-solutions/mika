@@ -4451,13 +4451,13 @@ mod tests {
     fn test_promotion_gate_never_resolves_conflicts() {
         // Scan the production half only: the needles below appear verbatim in
         // this test, so scanning the whole file would make the guard fail on
-        // itself. Splitting on the first `cfg(test)` attribute cuts exactly
-        // there — everything before it is production.
-        let src = include_str!("auto_pull.rs");
-        let production = src
-            .split("#[cfg(test)]")
-            .next()
-            .expect("split always yields a first element");
+        // itself. The boundary comes from `mika_common::source_guard`
+        // (mika#2398) — splitting on the first `cfg(test)` attribute cut this
+        // file at line 1922, where a module-level `#[cfg(test)] fn` helper
+        // sits, and left the 1 859 production lines below it unread.
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let production = scanner.production_of(&scanner.src_root().join("auto_pull.rs"));
 
         // Positive control: a bad split would hand us an empty slice, and every
         // assertion below would pass for the wrong reason. This is what makes
@@ -6840,84 +6840,73 @@ This ticket has been GROOMED and is ready.
     ///
     /// The `mod tests` of this very module is excluded: it is `#[cfg(test)]`, it
     /// names the method by construction, and without the exclusion the detector
-    /// would fail on its own existence.
+    /// would fail on its own existence. Since mika#2398 that exclusion is read by
+    /// [`mika_common::source_guard`] rather than by a local `split_once`, which
+    /// also fixes the direction the local rule got wrong: `split_once("mod tests
+    /// {")` left this file's module-level `#[cfg(test)] fn` helper *inside* the
+    /// production half.
     ///
-    /// **Test code elsewhere is excluded by its PATH (mika#2321).** This guard
-    /// shipped with a narrower premise than the one above — *"everywhere else
-    /// the file is production in full"* — which holds only while no other file
-    /// is a test module. That was already false when it was written
-    /// (`db/tests/harnais_porte.rs`, `perimeter/tests.rs`) and merely benign,
-    /// because neither names this method. mika#2321 moved 431 tests into
-    /// `db/tests/**`, three of which call `reset_auto_pull_redrive` on a
-    /// fixture, and the premise stopped being benign: the guard counted five
-    /// "production" callers. The repair is the classification, never an
-    /// allowlist — see [`crate::source_scan`], and note the assertion below
-    /// refuses an allowlist entry in as many words.
+    /// **The definition sites are found, not named (mika#2398 R5).** This guard
+    /// used to carry `[src_root.join("db.rs"), src_root.join("async_db.rs")]`.
+    /// The day mika#2321 splits `Database` across `db/*.rs`, those two paths name
+    /// files that no longer hold what they were excluding, and the new ones join
+    /// the population with nobody having decided it. A file is now excluded
+    /// because it **defines** the method, which follows the code wherever it
+    /// goes. Known bound: a genuine third caller added to a file that also
+    /// defines the method would be missed — the DB layer is not a place a
+    /// decisional caller belongs, and that would be its own anomaly.
+    ///
+    /// **Test code elsewhere is excluded by its PATH too (mika#2321).**
+    /// mika#2321 moved 431 tests into `db/tests/**`, three of which call this
+    /// method on a fixture. The scanner already drops those files by their
+    /// `#[cfg(test)] mod` declaration; [`crate::source_scan`] drops them by path
+    /// as well, so the two classifications have to *both* be wrong before a
+    /// fixture counts as a production caller. Never an allowlist.
     #[test]
     fn mika2361_reset_auto_pull_redrive_has_exactly_two_production_callers() {
         // Split so the guard's own body is not what it catches first.
         let needle = ["reset_auto_pull", "_redrive"].concat();
+        let definition = format!("fn {needle}");
 
-        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let src_root = scanner.src_root().to_path_buf();
         let this_module = src_root.join("auto_pull.rs");
-        // Definition sites, not call sites: `Database` and its async mirror.
-        let definitions = [src_root.join("db.rs"), src_root.join("async_db.rs")];
+
+        let mut definition_sites: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+        scanner.for_each(|path, production| {
+            if production.contains(&definition) {
+                definition_sites.insert(path.to_path_buf());
+            }
+        });
+        assert!(
+            !definition_sites.is_empty(),
+            "the scan found no definition of `{needle}` — it is not reading what it thinks"
+        );
 
         let mut callers = Vec::new();
-        let mut stack = vec![src_root.clone()];
-        let mut scanned = 0usize;
-
-        while let Some(dir) = stack.pop() {
-            let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| {
-                panic!("the guard must be able to read {}: {e}", dir.display())
-            });
-            for entry in entries {
-                let path = entry.expect("readable directory entry").path();
-                if path.is_dir() {
-                    stack.push(path);
+        scanner.for_each(|path, production| {
+            if definition_sites.contains(path) || crate::source_scan::is_test_source_path(path) {
+                return;
+            }
+            for (n, line) in production.lines().enumerate() {
+                let t = line.trim_start();
+                // Calls only: not doc comments, not prose.
+                if t.starts_with("//") || t.starts_with("*") {
                     continue;
                 }
-                if path.extension().is_none_or(|e| e != "rs")
-                    || definitions.contains(&path)
-                    || crate::source_scan::is_test_source_path(&path)
-                {
-                    continue;
-                }
-                let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-                    panic!("the guard must be able to read {}: {e}", path.display())
-                });
-                scanned += 1;
-
-                // `auto_pull.rs` carries its own inline `mod tests`. Test code
-                // living in its own file was skipped by path above (mika#2321);
-                // everything left here is production in full.
-                let production: &str = if path == this_module {
-                    content
-                        .split_once("mod tests {")
-                        .map_or(content.as_str(), |(before, _)| before)
-                } else {
-                    content.as_str()
-                };
-
-                for (n, line) in production.lines().enumerate() {
-                    let t = line.trim_start();
-                    // Calls only: not doc comments, not prose.
-                    if t.starts_with("//") || t.starts_with("*") {
-                        continue;
-                    }
-                    if line.contains(&needle) {
-                        callers.push(format!(
-                            "{}:{}: {}",
-                            path.strip_prefix(&src_root).unwrap_or(&path).display(),
-                            n + 1,
-                            line.trim()
-                        ));
-                    }
+                if line.contains(&needle) {
+                    callers.push(format!(
+                        "{}:{}: {}",
+                        path.strip_prefix(&src_root).unwrap_or(path).display(),
+                        n + 1,
+                        line.trim()
+                    ));
                 }
             }
-        }
+        });
 
-        assert!(scanned > 0, "the guard scanned no file — broken path");
         assert!(
             production_carries_the_reentry_arm(&std::fs::read_to_string(&this_module).unwrap()),
             "the scan is not reading the module it is about"

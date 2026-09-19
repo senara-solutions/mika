@@ -5865,12 +5865,14 @@ inject = false
     /// when every assertion above would still be green.
     #[test]
     fn mika2292_the_heading_literal_has_exactly_one_site_in_production_code() {
-        let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/prompt.rs"))
-            .expect("prompt.rs must be readable from its own test module");
-        let production = source
-            .split_once("\nmod tests {")
-            .map(|(before, _)| before)
-            .unwrap_or(&source);
+        // The boundary is read by `mika_common::source_guard` (mika#2398).
+        // `split_once("\nmod tests {")` errs the other way from a truncating
+        // guard: it leaves a module-level `#[cfg(test)]` helper *inside* the
+        // production half, so a heading literal written in such a helper would
+        // have been counted as a production site.
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let production = scanner.production_of(&scanner.src_root().join("prompt.rs"));
 
         let occurrences = production
             .lines()
