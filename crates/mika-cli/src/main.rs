@@ -324,12 +324,17 @@ async fn main() -> Result<()> {
                 // path the founding ticket names in its own title. The string
                 // travels raw; the executing agent resolves it against its own
                 // provider (mika#1591 semantics belong to the executing side).
+                // mika#1951: `--isolated` reaches this branch too. It is posted
+                // at the single `build_send_params` site both doors share, so
+                // the split that cost mika#2304 a follow-up cannot recur here —
+                // omitting it would be a deliberate act, not an oversight.
                 return match mika_cli::remote_ask::run_remote(
                     &args.message,
                     remote_url,
                     fmt,
                     args.verbose,
                     args.model.as_deref(),
+                    args.isolated,
                 )
                 .await
                 {
@@ -356,6 +361,7 @@ async fn main() -> Result<()> {
                 &args.enable_skill,
                 &args.disable_skill,
                 &args.only_skill,
+                args.isolated,
                 args.verbose,
             )
             .await
