@@ -414,9 +414,32 @@ pub fn format_event_text(event_type: &str, event: &GitHubWebhookEvent) -> String
                     .and_then(|l| l.name.as_deref())
                     .filter(|n| !n.is_empty())
             {
-                return format!(
+                let mut text = format!(
                     "[GitHub] Issue labeled {label_name} on {repo_name}#{number} — {title}\n{url}"
                 );
+                // mika#2323 — the actor crosses the boundary, informationally.
+                //
+                // `event.sender` has always been deserialized here and never
+                // emitted, which is why mika#2323's question ("is the ready-label
+                // handler filtering by actor?") could not be answered on either
+                // side: the agent had no identity to filter on. The line is
+                // APPENDED, so `READY_LABEL_DISPATCH_MARKER` still prefixes the
+                // text and `parse_ready_label_location` — which bounds its
+                // `<repo>#<n>` token at the first whitespace after the marker —
+                // cannot reach it. `webhook_queue_v2::classify_event` reads the
+                // first line only, so coalescing is likewise untouched.
+                //
+                // HARD INVARIANT: informational only. No refusal predicate on
+                // either side reads it; wiring one would be the actor filter
+                // mika#2323 established does not exist and placed out of scope.
+                if let Some(sender) = event.sender.as_ref().filter(|s| !s.login.is_empty()) {
+                    text.push_str(&format!(
+                        "\n{}{}",
+                        mika_common::github_event_format::LABELED_BY_LINE_PREFIX,
+                        sender.login
+                    ));
+                }
+                return text;
             }
             // Fallback for labeled without label name: uses generic format below.
 
@@ -2397,9 +2420,113 @@ mod tests {
         );
 
         // Existing exact-shape assertion (regression: full output stays stable).
+        //
+        // `sender: None` above, so mika#2323's actor line is absent — which is
+        // also this test's second job: an event carrying no sender must produce
+        // byte-for-byte the pre-mika#2323 text.
         assert_eq!(
             text,
             "[GitHub] Issue labeled ready on senara-solutions/mika#841 — Gate dispatch on ready label\nhttps://github.com/senara-solutions/mika/issues/841"
+        );
+    }
+
+    /// mika#2323 — the actor crosses the boundary, appended last.
+    ///
+    /// The agent could not answer "was this label applied by a human or by the
+    /// bot?" because `event.sender` was deserialized here and never emitted.
+    /// This pins the producer half of that fix, and — more importantly — pins
+    /// that appending it leaves the ready-label marker prefix intact. The
+    /// consumer half (the `<repo>#<n>` parse surviving the extra line) is pinned
+    /// in `mika_agent::server::ready_label_handler`.
+    #[test]
+    fn mika2323_labeled_event_carries_the_actor_appended_last() {
+        let event = GitHubWebhookEvent {
+            action: Some("labeled".to_string()),
+            sender: Some(GitHubUser {
+                login: "samidarko".to_string(),
+                user_type: Some("User".to_string()),
+            }),
+            installation: None,
+            check_suite: None,
+            issue: Some(GitHubIssue {
+                number: Some(2323),
+                title: Some("fix: attribution".to_string()),
+                html_url: Some("https://github.com/senara-solutions/mika/issues/2323".to_string()),
+                body: None,
+                assignee: None,
+            }),
+            pull_request: None,
+            comment: None,
+            review: None,
+            requested_reviewer: None,
+            label: Some(GitHubLabel {
+                name: Some("ready".to_string()),
+            }),
+            repository: Some(GitHubRepository {
+                full_name: Some("senara-solutions/mika".to_string()),
+                html_url: None,
+            }),
+            before: None,
+            after: None,
+        };
+        let text = format_event_text("issues", &event);
+
+        assert!(
+            text.starts_with(mika_common::github_event_format::READY_LABEL_DISPATCH_MARKER),
+            "the actor line must be APPENDED — a prefix change would make the agent stop \
+             recognizing its own dispatch trigger. Got {text:?}"
+        );
+        assert_eq!(
+            text.lines().next_back(),
+            Some("Labeled by: @samidarko"),
+            "the actor must be the LAST line: that is where the consumer reads it"
+        );
+        assert_eq!(
+            text,
+            "[GitHub] Issue labeled ready on senara-solutions/mika#2323 — fix: attribution\n\
+             https://github.com/senara-solutions/mika/issues/2323\n\
+             Labeled by: @samidarko"
+        );
+    }
+
+    /// An empty login reads as no actor at all — `@` alone names nobody, and a
+    /// line that looks like an attribution while carrying none is worse than an
+    /// absent line.
+    #[test]
+    fn mika2323_an_empty_sender_login_emits_no_actor_line() {
+        let event = GitHubWebhookEvent {
+            action: Some("labeled".to_string()),
+            sender: Some(GitHubUser {
+                login: String::new(),
+                user_type: None,
+            }),
+            installation: None,
+            check_suite: None,
+            issue: Some(GitHubIssue {
+                number: Some(2323),
+                title: Some("t".to_string()),
+                html_url: Some("https://x/y".to_string()),
+                body: None,
+                assignee: None,
+            }),
+            pull_request: None,
+            comment: None,
+            review: None,
+            requested_reviewer: None,
+            label: Some(GitHubLabel {
+                name: Some("ready".to_string()),
+            }),
+            repository: Some(GitHubRepository {
+                full_name: Some("senara-solutions/mika".to_string()),
+                html_url: None,
+            }),
+            before: None,
+            after: None,
+        };
+        let text = format_event_text("issues", &event);
+        assert!(
+            !text.contains("Labeled by:"),
+            "an empty login must not produce a dangling `Labeled by: @` — got {text:?}"
         );
     }
 
