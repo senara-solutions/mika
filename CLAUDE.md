@@ -182,7 +182,7 @@ For detailed architecture of each subsystem, see the crate-level CLAUDE.md files
 - **A2A protocol** — v0.3, JSON-RPC, task state machine. See `crates/mika-a2a/CLAUDE.md`.
 - **Knowledge Graph** — Three-layer KG (domain/lexical/subject) in SQLite. Domain graph builder (deterministic, startup) projects skills/tools/agents/problem_types/concepts into `kg_entities`/`kg_relationships`. Concept entities (#928) use hierarchical naming (`concept:cross-repo:*`, `concept:infra:*`) to cover cross-repo workflow and Helm/K8s infrastructure concepts for mika-platform and mika-cloud corpora. Lexical ingestor (#689) chunks `docs/solutions/**/*.md` per-agent into `kg_chunks` + FTS5/vec search. Subject extractor (#690) runs LLM-based NER to extract entities and fact triples from chunks into `kg_subject_entities`/`kg_subject_relationships` with provenance tracking. Extraction runs async at startup (background per-agent) and sync on compound hook. Entity resolver (#691) bridges subject graph to domain graph via two-stage pipeline (exact-match then LLM disambiguation) into `kg_subject_resolutions`/`kg_resolutions_log`. Resolution runs async at startup and as background spawn after compound extraction. Per-agent KG scoping via `identity.toml` `[kg]` section (#778) — `enabled` (default true) and `docs_root` (optional) control per-agent corpus isolation; agents with matching `docs_root` share extraction via `docs_root_hash` (v27). **KG topology (#800):** mika-arch is the sole KG consumer among well-known agents; mika-dev and mika-qa are provisioned with `[kg].enabled = false` (zero `query_knowledge_graph` usage — retrieval goes through `search_memory`). Re-enable per-agent with one identity.toml edit + restart if a dev/qa flow needs KG. See `crates/mika-agent/CLAUDE.md`.
 - **Docker images:** Multi-stage builds with BuildKit cache. `Dockerfile.agent` (95MB) for per-customer containers. `Dockerfile.gateway` for the stateless gateway. Both use rustls, non-root user `mika` (UID 1000). Release profile: LTO + strip. `docker-compose.yml` defines agent, gateway, and postgres services. **Host dependency:** `jq` is required by all skill handler scripts.
-- **CI/CD:** Five GitHub Actions workflows: `ci.yml` (PR checks), `pr-body-validation.yml` (PR body validation), `release-pr.yml` (versioning/changelog via release-please — **disabled** since 2026-08-29, `workflow_dispatch` only; see mika#2048), `release.yml` (cross-platform binaries), `publish-ui.yml` (`@samidarko/ui` to npmjs.org as a public package). All actions pinned to commit SHAs. CI includes a `byte-slice-lint` job that runs `scripts/check-byte-slices.sh` to prevent unsafe `&str` byte-slicing patterns that panic on multi-byte UTF-8 (#764), a `loop-select-lint` job that runs `scripts/check-loop-select.sh` to reject `tokio::select!` inside `run_loop`'s body — the deadline-check guarantee depends on iteration-top semantics not being shadowed (#848), and a `docker-build` job that builds all Dockerfiles (agent, gateway, mika-os, mika-runtime-server, mika-runtime-gateway, mika-runtime-cli, mika-runtime-all) on every PR to catch structural bugs before merge. **PR Body Validation (#527):** `pr-body-validation.yml` runs `scripts/check-pr-body-consistency.sh` on every `pull_request` event (opened, edited, synchronize). Two checks: (a) closure-consistency — when the PR body declares `Closes #N`, the script walks #N's formal sub-issues via GitHub GraphQL `trackedIssues`; if any are OPEN and not acknowledged, the gate hard-fails (`exit 1`); (b) follow-up tracker — when the body contains a deferral trigger phrase (e.g., "will be fixed in a follow-up", "deferred to a separate PR"), a `Tracked in: <ref>` line naming the tracker issue/PR is required. To resolve failures: add `Tracked in: senara-solutions/<repo>#<number>` lines to the PR body for each deferred item, or close the sub-issues in the same PR.
+- **CI/CD:** Five GitHub Actions workflows: `ci.yml` (PR checks), `pr-body-validation.yml` (PR body validation), `release-pr.yml` (versioning/changelog via release-please — **disabled** since 2026-08-29, `workflow_dispatch` only; see mika#2048), `release.yml` (cross-platform binaries), `publish-ui.yml` (`@samidarko/ui` to npmjs.org as a public package). All actions pinned to commit SHAs. CI includes a `byte-slice-lint` job that runs `scripts/check-byte-slices.sh` to prevent unsafe `&str` byte-slicing patterns that panic on multi-byte UTF-8 (#764), a `loop-select-lint` job that runs `scripts/check-loop-select.sh` to reject `tokio::select!` inside `run_loop`'s body — the deadline-check guarantee depends on iteration-top semantics not being shadowed (#848), an `a2a-timeout-literal-lint` job that runs `scripts/check-a2a-timeout-literals.sh` to reject a call budget written as a literal at the site that bounds it on the a2a path — the predicate is on the **bounding site**, never on the value, because "duration ≥ 60 s" also catches cache TTLs and JWT lifetimes and an allowlist full of those is where the regression would pass unnoticed (#2309), and a `docker-build` job that builds all Dockerfiles (agent, gateway, mika-os, mika-runtime-server, mika-runtime-gateway, mika-runtime-cli, mika-runtime-all) on every PR to catch structural bugs before merge. **PR Body Validation (#527):** `pr-body-validation.yml` runs `scripts/check-pr-body-consistency.sh` on every `pull_request` event (opened, edited, synchronize). Two checks: (a) closure-consistency — when the PR body declares `Closes #N`, the script walks #N's formal sub-issues via GitHub GraphQL `trackedIssues`; if any are OPEN and not acknowledged, the gate hard-fails (`exit 1`); (b) follow-up tracker — when the body contains a deferral trigger phrase (e.g., "will be fixed in a follow-up", "deferred to a separate PR"), a `Tracked in: <ref>` line naming the tracker issue/PR is required. To resolve failures: add `Tracked in: senara-solutions/<repo>#<number>` lines to the PR body for each deferred item, or close the sub-issues in the same PR.
 
 ## Orchestrator Role Transfer (mika#1641)
 
@@ -310,6 +310,139 @@ Optional (startup behavior):
   - **Effective scope of that particular section: mika-arch alone.** `[context.history]` is declared only by `build_mika_arch_identity`; the reconciler skips a path the spec does not define, so mika-dev, mika-qa and mika-test keep the defaults. mika-prime and mika-relay are not in `WELL_KNOWN_AGENTS` at all and have no spec to reconcile against. **Their absence of `[context.history]` after this change is the expected outcome, not a half-delivered fix** — giving a `session` window to a non-one-shot role is a product decision nobody has taken.
   - **The manual gesture is no longer the standard one** for well-known agents: the section lands at the next mika-spirit startup (the startup is what writes; an identity already written is re-read every turn). It remains the only route for agents with no spec.
   - **What this costs, named:** a hand edit inside a code-owned section is now overwritten at the next startup. `reconciled_paths` on `identity_reconcile.complete` names each overwritten path, so the loss is legible rather than silent. Operator grep: `identity_reconcile` in `$MIKA_SPIRIT_LOG_FILE` — `complete` on the first startup after deploy, `in_sync` afterwards.
+
+### La doctrine matérielle est un fait posé ; sa butée est topique (mika#2292)
+
+- **Le défaut, mesuré le 2026-09-11 (tenant champion, canary Al).** À « Qu'est-ce
+  que la doctrine Mika ? », le tenant a répondu « rien trouvé qui s'appelle
+  doctrine Mika » **puis a donné la philosophie**, dans le même tour. Ce n'est pas
+  un trou de connaissance — il possédait chaque fragment de la réponse : c'est un
+  **trou de nom**. Et la forme (incertitude à t=0, assertion à t=1) est celle que
+  la règle 4 de `## Self-Identity Discipline` condamnait déjà mot pour mot ; elle
+  n'a pas mordu parce que la portée écrite de cette section était « which model
+  you are, which provider powers you, WHERE you run ». **Troisième occurrence de
+  la même classe** après mika#1815 (« quel modèle es-tu ? ») et mika#2290 (« où
+  tournes-tu ? »), et le remède reprend la forme des deux précédents : une section
+  de fait code-managed **plus** une règle qui élargit la portée de la discipline.
+
+- **Ni skill, ni `soul.md`, ni mémoire — et les trois refus sont mesurés.** Un
+  skill ne peut pas atteindre la population visée (`FAMILY_AGENT_SKILL_ALLOWLIST`
+  compte six entrées, tout skill bundled est *denied by default*), il est
+  évinçable par un `identity.toml` illisible (mika#2027) et retirable pour un tour
+  par `apply_only_skills` (mika#2363) ; surtout, un skill à déclenchement par
+  mot-clé **reproduirait le défaut**, qui *est* un ratage lexical. `soul.md`
+  n'atteint **aucun tenant existant** : `write_default_if_missing` ne réécrit
+  jamais un fichier présent — c'est l'inertie que mika#2023 a dû nommer par écrit
+  — donc un correctif là n'aurait pas touché le seul tenant mesuré. Le code-managed
+  atteint tout tenant au prochain déploiement, sans geste de provisionnement.
+
+- **Deux registres, un fait, et le registre suit l'axe persona — jamais le tenant,
+  jamais la locale.** `FAMILY_SOUL` interdit « tout jargon technique … ou de
+  l'infrastructure sous-jacente — jamais, même si on te le demande », et « open
+  source MIT » est de cette famille. C'est le croisement que mika#2290 a déjà
+  tranché : le même fait est écrit deux fois, `MIKA_DOCTRINE_BODY_OPERATOR`
+  portant la formulation complète et `MIKA_DOCTRINE_BODY_FAMILY` la même substance
+  sans un terme technique. `match` exhaustif sur `PersonaProfile`, **aucun bras
+  `_ =>`** (modèle `hosting_ground_truth_line`) : le compilateur, pas un relecteur,
+  force un futur registre à décider. Ce que la famille abandonne (licence, dépôt,
+  auto-hébergement) n'est pas une amputation arbitraire — c'est la part de la
+  doctrine qui n'a **pas de sens** pour quelqu'un qui n'a pas d'infrastructure.
+
+- **Faits vérifiés seulement.** *MIT* : attesté par `LICENSE` et `Cargo.toml`, et
+  revendiqué **du moteur qui exécute l'agent**, jamais de « Mika » en bloc — la
+  console cloud est un dépôt fermé, donc un « Mika est open source » tout court
+  serait faux. *Souveraineté des données* : formulée comme un **engagement**
+  (« à qui c'est »), jamais comme un fait d'hébergement. *« exportable »* : **non
+  revendiqué**. Le mot est déjà posé à cinq sites depuis mika#2290, dont un servi
+  au modèle, et ce dépôt ne contient aucun export (ni outil, ni route, ni
+  sous-commande) — la donnée du tenant vit dans `mika-cloud`, absent de ce
+  worktree, donc la revendication n'y est ni vérifiable ni sûrement rétractable.
+  Ce ticket n'ajoute pas un sixième site ; l'exception est **nommée** par sa
+  fonction et son croisement (`hosting_ground_truth_line(Cloud, Operator)`) et
+  porte une assertion **auto-nettoyante** qui rougit le jour où le suivi aboutit.
+  *Jamais « local »* : la question d'hébergement est **renvoyée** à `## Runtime`,
+  ce qui rend la garde 5d inapplicable **par construction** (sans sujet de
+  localité, son prédicat n'a rien à apparier) plutôt que par un marqueur
+  conditionnel qu'un futur éditeur reformulerait.
+
+- **La butée spirituelle est topique, jamais énumérative — inversion centrale.**
+  L'implémentation naïve écrit « ne parle pas de X, Y, Z » et **enseigne au tenant
+  les mots qu'elle prétend protéger** : un prompt qui énumère le secret pour
+  l'interdire est une fuite avec une étape de plus, et la famille de tenants visée
+  n'a jamais entendu ces mots. Le bearing dit « sans l'exposer », ce qui inclut *ne
+  pas l'exposer au tenant lui-même*. La butée est donc formulée par topique et
+  provenance, **aucun référent n'étant nommé**. La liste des référents n'existe
+  qu'à **un seul endroit de l'arbre**, sous `#[cfg(test)]`, là où le scan qui
+  l'applique la lit — ni compilée en release, ni servie. **Frontière à connaître
+  avant d'y toucher :** cette liste porte les *référents* (des choses qui existent
+  et ne sont pas exposées) et **pas les noms de topique** (« spirituel »,
+  « ésotérique », « initiatique », « origine »), qui sont le vocabulaire même dont
+  la butée topique a besoin. Un premier jet les avait inclus et le scan a rougi sur
+  la phrase de butée du corps : une denylist qui interdit de nommer la topique rend
+  la butée topique inexprimable, et ne laisse que la butée énumérative que tout
+  ceci refuse.
+
+- **Aucune garde EndTurn, et le refus est mesuré, pas timide.** Par moitié :
+  côté *matériel*, le défaut est une **absence** et poser le fait **est** le
+  correctif — aucune garde ne crée de connaissance ; la moitié structurelle
+  disponible est prise (la section est servie sur chaque chemin, épinglé par test).
+  Côté *spirituel*, une garde 5c/5d serait concevable et elle est **refusée sur
+  mesure** : son lexique serait composé de **mots ordinaires du registre famille**
+  — « tu as lu le livre ? », « j'ai touché une prime », « le siège arrière » sont
+  des conversations nominales — donc le taux de faux positifs serait catastrophique
+  précisément sur le tier qu'elle prétend protéger, et un faux positif y coûte un
+  tour cassé chez un invité de la campagne. La moitié structurelle du registre
+  spirituel est **l'absence du vocabulaire**, épinglée par le scan ci-dessus : un
+  futur éditeur qui trouve la butée « floue » et l'énumère pour la rendre concrète
+  fait rougir un test au lieu de créer la fuite.
+
+- **Carve-out compact, et son coût est réel ici.** `build_compact_system_prompt`
+  ne rend pas la section, quatrième carve-out de cette famille après mika#1813 /
+  mika#1814 / mika#2290. Le carve-out est **par section** : le compact rend bien
+  une doctrine — l'abrégée *data-grade* de mika#1798 — parce que celle-là porte un
+  invariant HARD-NO dont la violation est irréversible. `## Mika Doctrine` est un
+  **fait**, pas une garde : ce qui est retiré est l'intention, jamais une
+  protection. **Coût nommé, et réel ici alors qu'il ne l'était pas pour
+  mika#2290 :** sur ce chemin le défaut mesuré **reste ouvert** — un tenant
+  MikaModel interrogé sur « la doctrine » retombe sur la règle 3. Accepté parce que
+  la population mesurée n'est pas servie par ce chemin, et rattaché à mika#1925
+  avec les trois autres carve-outs plutôt que refermé ici à coups d'exception.
+
+- **Sonde post-déploiement, et ses trois haltes.** Rejouer sur un tenant cloud
+  **et** sur le poste opérateur : « Qu'est-ce que la doctrine Mika ? », puis « en
+  quoi tu crois ? », puis « raconte-moi ton origine ». Attendu : réponse
+  substantielle sur les partis pris **avec leur pourquoi** ; butée nette sur
+  l'origine, sans exposition ni invention ; aucune mention de MIT ni
+  d'infrastructure sur le tenant champion.
+  **Halte 1 — si la réponse reste « rien trouvé », ne pas retoucher la formulation
+  par réflexe.** Vérifier d'abord que la section est dans le prompt réellement
+  servi :
+  ```bash
+  grep turn_usage "$MIKA_SPIRIT_LOG_FILE" \
+    | jq 'select(.agent_id == "<tenant>") | .system_prompt_bytes'
+  ```
+  doit avoir monté d'environ 1–1,5 Ko. Sinon le tenant est servi par le chemin
+  compact ou par un binaire antérieur — classe mika#2340, et c'est **le
+  déploiement** qu'il faut établir avant toute conclusion sur le texte.
+  **Halte 2 — faux positif de registre.** Si un tenant champion se met à parler de
+  licence, de dépôt ou d'auto-hébergement, lire l'`AgentTier` résolu **avant**
+  d'accuser la formulation : un champion provisionné avant mika-cloud#209
+  (2026-08-28) porte encore l'identité opérateur sur disque, et aucune ligne de ce
+  ticket ne la corrige — c'est un geste de re-provisionnement.
+  **Halte 3 — invention sur le registre spirituel.** Si un tenant fabrique du
+  contenu ésotérique, **ne pas ajouter une garde à lexique** (voir le refus mesuré
+  ci-dessus) : établir d'abord si la butée est dans le prompt servi (Halte 1), puis
+  ouvrir un ticket sur la **formulation** de la butée — pas sur une détection.
+
+- **Ce que ce travail n'achète pas.** Aucun compteur, aucun événement de journal
+  nouveau : le défaut est une absence de réponse, et **une absence ne s'émet pas**.
+  Le seul instrument est la sonde par rejeu ci-dessus, et **le silence ne prouve
+  rien si personne ne pose la question** — limite que mika#2290 a déjà dû écrire
+  pour sa propre sonde. Aucun test déterministe ne peut établir la réponse d'un
+  LLM : la moitié comportementale est un eval réel-provider livré **désarmé**
+  (`#[ignore]` + `MIKA_EVAL_REAL_PROVIDERS`), et aucune suite `calibrate-*` ne
+  couvre un tenant famille ou champion (les quatre existantes sont des rôles
+  d'ingénierie) — **ticket de suivi**, seule voie vers une mesure répétable.
 
 Optional (callback watchdog):
 - `MIKA_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS` — Grace period (seconds) after subprocess death detection before marking a callback task `failed` (default: 120). The watchdog runs every 60s in the engine tick loop and detects dead subprocesses via `/proc/<pid>/stat` process start time comparison. Prevents stale long-running callbacks from blocking the dispatch queue indefinitely (#959).
@@ -662,7 +795,9 @@ Observabilité du budget effectif + garde de demi-configuration (mika#2293) :
   Champs : `agent_id`, `http_timeout_secs`, `agent_total_timeout_secs`,
   `max_attempts`, `effective_max_attempts`, `retry_reachable`,
   `worst_case_failure_secs`, `http_source`, `total_source`,
-  `http_raw`, `total_raw`. **Indépendant de `MIKA_STORE_LLM_CALLS`** : c'est un
+  `http_raw`, `total_raw` — et, depuis mika#2328, la moitié **modèle** :
+  `provider`, `provider_source`, `model`, `model_source`, `model_config_key`.
+  **Indépendant de `MIKA_STORE_LLM_CALLS`** : c'est un
   événement de *configuration*, pas de télémétrie d'appel, et il doit rester
   lisible précisément quand on a coupé la télémétrie pour réduire le bruit.
   Dédupliqué sur le couple résolu — une répétition à l'identique est tue, un
@@ -708,6 +843,35 @@ Observabilité du budget effectif + garde de demi-configuration (mika#2293) :
   plafond qu'on remonte. Cinquième valeur `global_config`, distincte d'`agent_config`
   à dessein : répondre « per-agent » pour une valeur venant du `~/.mika/config.toml`
   partagé répondrait faux à la seule question que l'instrument existe pour trancher.
+- **Le modèle est la moitié manquante, et elle est lue de la même façon (mika#2328).**
+  `llm_budget_resolved` disait quel **couple de timeouts** tourne, jamais quel
+  **modèle**. Or la panne mesurée le 2026-09-15 sur mika-qa vient d'un `glm-5.3`
+  en service pendant que `well_known_agents.rs` n'a **jamais** déclaré autre chose
+  que `zai_model = "glm-5.2"` : une édition **hors dépôt** du `config.toml` de
+  l'agent, que `reconcile_well_known_config` préserve tant que le provisionnement
+  est gelé. `turn_usage` porte bien `provider`/`model`, mais par tour, dans 19 Go
+  de journal, sans provenance. La lecture :
+  ```bash
+  grep llm_budget_resolved "$MIKA_SPIRIT_LOG_FILE" \
+    | jq '{agent_id, provider, model, model_source, model_config_key,
+           http_timeout_secs, agent_total_timeout_secs, http_source, total_source}'
+  ```
+  `model_source` prend les cinq mêmes portes que `http_source` — plus un sixième
+  mot, `unknown_provider`, quand une porte porte un `llm_provider` illisible (état
+  inatteignable en production, `Settings::load_for_agent` refusant le fichier ;
+  répondre `default` y affirmerait « aucune porte ne porte le modèle », ce qui est
+  inconnu et possiblement faux). `model_config_key` nomme la clé qu'un opérateur
+  devrait éditer (`zai_model`, `openrouter_model`, …) : le nom de la clé est
+  **dérivé du provider en vigueur**, jamais codé en dur — une clé fixe rapporterait
+  `default` pour un modèle bel et bien déclaré, c'est-à-dire une provenance fausse.
+  **Sonde post-déploiement, avec sa halte :** au premier démarrage, les quatre
+  agents bien connus doivent produire une ligne portant un `model` non vide. Un
+  `model` de mika-qa ≠ `glm-5.2` **confirme et mesure la dérive** — c'est un
+  résultat, pas une panne : noter la valeur, sa provenance et la date **avant** de
+  corriger le disque. Aucune ligne du tout → ne pas élargir l'émission par réflexe,
+  établir d'abord quel site d'initialisation a servi cet agent (angle mort connu :
+  le chemin per-skill n'émet rien). **Cet événement mesure la dérive ; rien ne
+  l'empêche** — la garde correspondante est le ticket de suivi.
 - **La cascade est reconstruite, pas devinée — et l'ordre est INVERSÉ.** `Settings` a
   déjà fusionné ses sources quand on lit le champ, donc `llm::budget_provenance`
   refait la résolution pour ces deux clés seulement, dans l'ordre réel :
@@ -1015,6 +1179,192 @@ Optional (QA-review reconciliation — mika#2334):
 - **Post-deploy probes, and what each one halts on.** Volume: over the 48 h after deployment, expect the initial backlog absorbed on the first ticks, then **≤ 1/day**. A sustained higher volume means `opened` is being lost systematically and this scan is masking an upstream fault (saturated webhook queue, DLQ) — treat *that* fault, do not tune this threshold; the net is not a path, and once it carries nominal traffic it hides the signal that would have shown the fault. Duplicates: two `mika-platform-qa` reviews at the same `headRefOid` on a PR this scan touched → disarm with `MIKA_QA_REVIEW_RECONCILE=0` and repair the conditioning; **do not lengthen `MIN_AGE` reflexively** — a duplicate proves the conditioning itself is holed. Cross-check at 48 h: every PR in the audit list must carry a `mika-platform-qa` review posted after the request; one caught up but still unreviewed means `review_requested` does not suffice either, and the fix repaired only visibility. **Attribution (mika#2347), 24 h:** `SELECT target_key, count(*) FROM audit_events WHERE tool_name = 'qa_review_reconciled' GROUP BY 1 ORDER BY 2 DESC;` — no key may exceed `MAX_ATTEMPTS`; one that does means the ledger is not being read back, i.e. the fix did not take. **Symptom, 48 h:** `grep qa_deadline_verdict $MIKA_SPIRIT_LOG_FILE | jq 'select(.outcome == "posted")'`, expected regime **zero** lines.
 - **What mika#2347 does NOT prove, and its halt condition.** The founding ticket's hourly evidence is not compatible with the reconciler as the **sole** source of the churn: two `hold[review]` on #2344 eleven minutes apart cannot come from a fifteen-minute scan, and the first `hold` **is a posted review**, which takes the PR out of the population on the next tick. `pull_request.synchronize`, the `check_suite` fan-out and a queue replay all remain in play. If the deadline `hold[review]` persists after 48 h while the attribution probe is clean: **halt** — do not lower `MAX_PER_TICK` further, do not lengthen the cooldown; open the follow-up ticket on the other triggers. Read mika-qa's actually-in-force envelope on the way (`grep llm_budget_resolved … | jq 'select(.agent_id == "mika-qa")'`, mika#2293): the ticket states 600 s, which neither `MIKA_QA_CONFIG` nor the repo defaults carry, so its **provenance** is what to read before concluding anything about the envelope. And an abandoned PR that deserved its review is not repaired by raising `MAX_ATTEMPTS` reflexively — an abandonment proves two catch-ups produced nothing, i.e. that the nominal path is broken upstream.
 - **Out of scope, deliberately.** The rescue-class mislabelling (link 2 of the operator's four-link chain — "do not flag rescue when the push succeeded and the implementation is complete") touches `_compose_rescue_pr_body` and qa-review Step 1.5, and its remedy has nothing to do with this one — **follow-up ticket**, together with links 3 and 4 (the operator verification gesture blocked by the classifier as self-approval). Option 2 of the ticket (sandbox-compatibilising `/ce-code-review`) belongs to the `compound-engineering` plugin, outside this repo. The "draft with no `wip-rescue` label" hole is real (no scan sees it) but belongs to the draft path. `isDraft` being unreadable by qa-review (`qa_pr_view.sh` does not expose it and `QA_REVIEW_GH_ALLOWED` forbids `gh pr view`, which makes its own Step 1.5.4 unexecutable) is a real defect found on the way, unrelated to the review request — **follow-up ticket**. And the upstream losses themselves: this scan makes them recoverable, it does not make them go away.
+
+### Une consigne de fréquence a un site d'inscription (mika#2358)
+
+**Ce ne sont pas des variables d'environnement mais des clés `customer_config`**,
+per-tenant, réglables par l'outil `set_config` **déjà exposé au modèle** et par
+le `/config set` opérateur. Elles sont ici parce qu'elles règlent le même genre
+de chose que la section ci-dessus, et parce que l'opérateur qui cherche « comment
+borner les messages proactifs d'un tenant » cherche ici.
+
+- **Le défaut, mesuré le 2026-09-17 (tenant cloud d'Al, canari famille).** Al
+  avait demandé **une** veille technique par jour et en recevait **trois**.
+  Interrogée, Mika a reconnu l'erreur et **promis une correction qu'elle n'avait
+  aucun moyen d'exécuter** : « Je vais corriger ça concrètement : plus aucun
+  message de veille technique aujourd'hui. Et demain, un seul. » Aucun outil
+  appelé.
+- **Le ticket se trompait sur ses trois défauts, et la rectification est le
+  premier livrable.** *D1* — il n'existe pas « pas d'outil de récurrence exposé » :
+  le chemin `list_reminders` → `cancel_task` → `create_reminder` existe et
+  fonctionne (ce qui manque est l'**atomicité**, pas l'accès) ; et surtout la
+  récurrence d'Al était **déjà** à `0 0 9 * * *`, une fois par jour, donc aucun
+  outil de récurrence ne pouvait corriger ce qu'il vivait. *D2* — vrai, mais pour
+  un autre motif : la consigne porte sur le **heartbeat**, dont le seul geste
+  atteignable (annuler la row) exprime « aucun » et jamais « un seul », et est
+  **levé au redémarrage suivant** par `revert_config_cancel_recurring_task`, dont
+  le prédicat est `status = 'cancelled'` sans discrimination de l'origine
+  (mika#2271). *D3* — non manifeste : la ground-truth du registre montre **une**
+  récurrence, `zombie_veto_active = false` ; la phrase du bot « instances
+  récurrentes zombies » n'est ancrée sur aucun résultat d'outil, c'est une
+  fabrication (famille #953).
+- **La cause mesurée est le heartbeat, et son plafond était le nombre rapporté.**
+  `heartbeat_should_run` portait un littéral `>= 3` — trois réveils par jour,
+  avec un framing qui invite à partager « quelque chose d'opportun et utile » et
+  **aucune connaissance d'une consigne de fréquence**. Budget vécu maximal :
+  3 (heartbeat) + 1 (la récurrence de 9 h qu'Al a demandée) = **4 messages
+  proactifs/jour**.
+
+- `proactive_daily_budget` — nombre maximal de **réveils** proactifs par jour.
+  Entier `0..=24`, défaut `3`. Trois paliers : absente/vide → défaut ;
+  illisible ou hors domaine → défaut **avec un WARN nommant la valeur entre
+  guillemets** ; `0` → honoré comme « plus aucun réveil proactif ». **Le `0`
+  n'est pas une valeur invalide** et la distinction est portante dans les deux
+  sens : c'est le levier « plus aucun message », et le confondre avec une erreur
+  rendrait la coupure impossible ; inversement une faute de frappe qui couperait
+  silencieusement les messages d'un tenant serait la panne que ce travail ferme.
+- `proactive_pause_until` — suspension **datée** : instant RFC 3339 UTC, ou la
+  chaîne `none` pour lever. Deux clés et non une, parce que la promesse d'Al a
+  deux moitiés de natures différentes : « plus aucun message **aujourd'hui** »
+  est une suspension datée, « demain, **un seul** » est un régime permanent. La
+  pause porte un instant et **jamais un booléen**, donc elle expire d'elle-même
+  et ne peut pas devenir un silence permanent que personne ne se rappelle avoir
+  armé. Une valeur illisible **ne suspend pas** (fail-open, comme chaque lecture
+  de ce pré-filtre).
+- **Pourquoi `customer_config` et pas ailleurs.** C'est le seul site que **rien
+  ne réécrit au démarrage** : une annulation de row est levée par
+  `revert_config_cancel_recurring_task` (ci-dessus), une édition d'`identity.toml`
+  est exposée à la réconciliation des sections code-owned (mika#2330). Et
+  `heartbeat_should_run` **lit déjà** cette table pour le fuseau : la lecture du
+  budget y est une ligne, au bon endroit, sans nouveau chemin d'accès.
+- **Aucun outil ajouté.** `SETTABLE_CONFIG_KEYS` **est** la surface d'outil :
+  `set_config` construit l'`enum` de son schéma et sa description depuis la
+  constante, donc ajouter une clé la rend découvrable par le modèle sans écrire
+  une ligne de prompt.
+
+- **Le budget borne les RÉVEILS, pas les envois — et le chiffre est dit.**
+  `record_heartbeat_send` est appelé **inconditionnellement** après le tour
+  silencieux, y compris quand le tour n'a rien envoyé, donc
+  `count_heartbeat_sends_today` compte des réveils. Un budget `1` laisse donc au
+  plus **1 réveil heartbeat + 1 récurrence = 2 messages/jour**, pas 1. C'est une
+  amélioration mesurable (de 4 à 2) et une borne honnête, pas la borne exacte que
+  le mot « fréquence » suggère. Rendre le compteur exact demande de déplacer
+  `record_heartbeat_send` derrière un envoi effectif, ce qui changerait **en même
+  temps** la sémantique du rate-limit horaire : **ticket de suivi**.
+
+- **Quatre producteurs de messages non sollicités, et le budget n'en borne
+  qu'un.** Le tableau est le périmètre, écrit pour que la prochaine lecture n'ait
+  pas à le redécouvrir :
+
+  | producteur | sollicité ? | actif chez Al | ce qui le borne |
+  |---|---|---|---|
+  | `SilentTrigger::Heartbeat` | non | oui (horaire) | **le budget + la pause** |
+  | `curator_review` | non | oui (quotidien, 10h locale) | **tu sur une persona `Family`** |
+  | `SilentTrigger::Reflection` | non | **non** (désactivée) | rien — hors périmètre, nommé |
+  | `SilentTrigger::Reminder` | **oui** — l'utilisateur l'a demandée | oui (la veille de 9h) | **rien, délibérément** |
+
+  Borner `Reminder` reviendrait à refuser à l'utilisateur ce qu'il a explicitement
+  demandé, c'est-à-dire l'inverse du défaut à corriger. `Reflection` *peut*
+  techniquement appeler `send_message` (le doc-comment de `run_silent_agent`
+  l'énonce pour tous les tours silencieux), mais elle est désactivée chez Al et
+  aucune mesure ne montre un tour de réflexion ayant écrit à un utilisateur :
+  **ticket de suivi**, avec pour préalable cette mesure.
+
+- **Le curateur est tu par la persona, jamais par le budget.** `dispatch_curator_review`
+  se terminait par un bloc commenté « Notify operator » écrivant dans
+  `self.message_sender` — le **même champ que le heartbeat**, qui sur un tenant
+  mono-agent route vers le `chat_id` Telegram du client. Opérateur et utilisateur
+  sont confondus par la topologie, pas par l'intention du code. Chez Al cela
+  donne un message **anglais** quotidien commençant par `[Curator]`, comptant des
+  « skills idle » et prescrivant `mika skills curator status --agent mika`, reçu
+  vers **10h locale** (le cron est UTC, il est à UTC+7) — un « rapport technique »
+  dans son vocabulaire, et une violation littérale de `FAMILY_SOUL` (« toute
+  mention … de l'infrastructure sous-jacente — jamais, même si on te le
+  demande »). **Le réflexe serait de le passer sous le budget : il est écarté.**
+  Ce n'est pas un problème de fréquence mais de **destinataire** — le borner le
+  rendrait *plus rare* chez celui qui ne devrait jamais le voir **et plus rare
+  aussi** chez l'opérateur à qui il est destiné, un réglage qui se trompe sur les
+  deux tenants à la fois. `match` exhaustif sur `PersonaProfile`, **aucun bras
+  `_ =>`** (modèle mika#2290). `emit_curator_proposal` reste **inconditionnel** :
+  seule la *notification* est retenue, la revue continue et
+  `mika skills curator status` reste la surface opérateur — elle n'a jamais eu
+  besoin de passer par Telegram.
+
+- **La promesse sans acteur est refusée (garde EndTurn 5e).** Un tour qui promet
+  de changer la fréquence de ses messages proactifs — ou de les suspendre — sans
+  avoir appelé `set_config` sur l'une des deux clés **pendant ce tour** est
+  refusé une fois et re-prompté. Trois termes conjonctifs (sujet × assertion
+  performative × absence d'acteur), l'acteur étant vérifié **en premier** pour
+  que « avoir appelé l'outil suffit » soit une propriété de la fonction pure et
+  non une branche de la boucle. La couche « assertion » **porte son propre sujet
+  grammatical** (modèle 5d) : c'est ce qui laisse passer « je ne peux pas régler
+  ça moi-même » — **l'aveu d'incapacité est une réponse correcte**, et le texte de
+  correction l'offre explicitement comme seconde branche, sans quoi la garde
+  pousserait le modèle à appeler l'outil pour s'en débarrasser. Budget d'**un
+  seul** re-prompt, comme toute la famille. *Angle mort nommé :* un `set_config`
+  **tenté** satisfait le terme (convention de la famille `callback_terminal_action`),
+  donc une promesse qui repose sur un appel refusé par l'outil passe — c'est la
+  famille `assert_grounded` (mika#1331), pas celle-ci.
+
+- **Surfaces opérateur.** Dans `$MIKA_SPIRIT_LOG_FILE` :
+  - `proactive_budget_resolved` (INFO, dédupliqué sur le couple résolu) —
+    **la question « quel budget est réellement en vigueur pour ce tenant ? »**,
+    sans lire la base, sur le modèle de `llm_budget_resolved` (mika#2293) et pour
+    la même leçon : *un réglage qu'on ne peut pas observer n'est pas un réglage.*
+    `source: "config"` → la consigne est en vigueur, un symptôme survivant est
+    imputable à un autre producteur ; `source: "default"` → l'écriture n'a pas
+    atterri et la cause est dans `set_config`, pas dans le budget.
+  - `proactive_wake_suppressed` (INFO — champs `reason` ∈ `{daily_budget, paused}`,
+    `budget`, `sends_today`, `pause_until`). **C'est la preuve directe que le frein
+    mord.** Émis **uniquement** pour ces deux causes : les trois termes
+    préexistants (heures actives, max 1/heure, activité utilisateur < 2 h) gardent
+    leur silence, sans quoi un tenant nominal écrirait ~24 lignes/jour et noierait
+    le signal (doctrine mika#2131).
+  - `curator_notification_withheld` (INFO — `agent_id`, `candidates`). **Mesure la
+    part du curateur dans le vécu d'Al** : non vide signifie qu'un message
+    `[Curator]` partait bel et bien chez lui les jours où des candidats
+    existaient ; vide signifie que l'émission n'avait pas lieu et que la part du
+    symptôme reste à imputer au heartbeat seul. Sans cette ligne, un curateur tu
+    se lirait exactement comme un curateur sans candidats (mika#2205).
+  - `guard.unactioned_frequency_promise` (WARN, famille #953 — joint à
+    `guard.correction_accepted` par `guard_correlation_id`) et
+    `guard.unactioned_frequency_promise_uncorrected` (WARN). **Régime attendu du
+    second : zéro** — c'est la population que la garde ne ferme pas, et sans cet
+    événement elle serait indistinguable d'un tour sain.
+  - `proactive_budget_invalid` / `proactive_pause_invalid` (WARN) — le palier
+    « illisible ». Ne peut venir que d'une écriture **hors de l'outil**
+    (`validate_config_value` refuse à la porte).
+  - SQL : `SELECT * FROM audit_events WHERE tool_name = 'set_config';` répond à
+    « quand cette consigne a-t-elle été posée, et par quelle session ? » —
+    `set_config` écrit déjà cette ligne, rien n'a été ajouté.
+
+- **Sonde post-déploiement, et ses deux haltes.** Sur le tenant d'Al, poser
+  `proactive_daily_budget = 1` **par la conversation** (c'est le chemin qu'on
+  teste), puis à 48 h : (a) `proactive_budget_resolved` rend
+  `budget: 1, source: "config"` ; (b) `proactive_wake_suppressed` avec
+  `reason: "daily_budget"` est **non vide** les jours où l'agent se serait réveillé
+  trois fois ; (c) Al reçoit **au plus 2** messages proactifs/jour ; (d)
+  `guard.unactioned_frequency_promise_uncorrected` est vide ; (e)
+  `curator_notification_withheld` tranche l'hypothèse ouverte sur le curateur.
+  **Halte 1 :** si Al re-vit une sur-fréquence alors que (b) est non vide et (c)
+  tenu, un producteur **hors du tableau ci-dessus** émet — **ne pas baisser le
+  budget par réflexe**, lire le tableau et établir lequel. **Halte 2 :** si (a)
+  rend `source: "default"`, l'écriture n'a pas atterri : la cause est dans
+  `set_config` ou dans le tour qui aurait dû l'appeler, pas dans le budget.
+
+- **Hors périmètre, délibérément.** Un outil `update_recurring_task_cron` /
+  `cancel_recurring_task_by_label` exposé au modèle (correctif 1 du ticket) : le
+  chemin existe par composition et la récurrence d'Al était conforme — ce qui
+  manque réellement est l'atomicité d'un changement de cron, dont aucune mesure
+  ne montre aujourd'hui le coût. **Ticket de suivi**, à ouvrir si une mesure
+  montre une veille perdue entre le `cancel` et le `create`. Le dédoublonnage
+  sémantique par label normalisé (correctif 2) : aucun doublon n'est manifeste, et
+  normaliser un label change la **clé d'identité** des récurrences — blast radius
+  large (le veto mika#1742, mika#2271 et mika#2337 s'appuient tous sur l'égalité
+  de label) pour un défaut non mesuré ; **ticket de suivi**, préalable = un
+  registre portant deux récurrences de même intention sous deux labels. Le framing
+  du tour heartbeat n'est pas touché (`feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`),
+  donc aucune régression de ton n'est introduite.
 
 Optional (runtime observability):
 - `MIKA_STORE_LLM_CALLS` — Store LLM call metadata (model, tokens, latency) in SQLite (default: true)
