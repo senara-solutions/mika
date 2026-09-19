@@ -54,6 +54,21 @@ enum Reply {
     /// A complete 200 response whose body is not the expected schema — a
     /// genuine parse failure, which must stay terminal.
     Unparseable,
+    /// Send a 2xx head announcing a long body, then **go silent without
+    /// closing** (mika#2280).
+    ///
+    /// This is not `TruncatedBody` with a pause: the connection stays open, so
+    /// the client does not see an EOF — it sits in `response.text()` until its
+    /// own per-call plafond cuts it. That is the measured signature of
+    /// mika#2189/#2280 (`error decoding response body: … operation timed out`),
+    /// and the only fixture that can drive `elapsed ≈ plafond`.
+    HeadersThenSilence,
+    /// The same silence, behind a **non-2xx** head (mika#2280 AC5).
+    ///
+    /// The negative control of site: this body is read by the `!is_success()`
+    /// branch, whose error is swallowed by `unwrap_or_default`. A slow 429 must
+    /// never enter a population that asserts "the model was still generating".
+    StatusHeadersThenSilence(u16),
 }
 
 struct FakeApi {
@@ -84,34 +99,61 @@ impl FakeApi {
                     .cloned()
                     .unwrap_or_else(|| script.last().expect("non-empty").clone());
 
-                // Drain the request head (and, best effort, its body) so the
-                // client never sees a reset before it finished writing.
-                let mut buf = vec![0u8; 64 * 1024];
-                let _ = socket.read(&mut buf).await;
+                // One task per connection since mika#2280: a `…ThenSilence`
+                // reply holds its socket open for the client's whole plafond,
+                // and handling connections inline would stall `accept()` for
+                // that long — the retry's second request would never be served,
+                // which reads as "the chain did not retry".
+                tokio::spawn(async move {
+                    // Drain the request head (and, best effort, its body) so the
+                    // client never sees a reset before it finished writing.
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let _ = socket.read(&mut buf).await;
 
-                let wire = match reply {
-                    Reply::TruncatedBody => {
-                        let partial = br#"{"id":"msg_trunc","cont"#;
-                        // The announced length is deliberately far larger than
-                        // what is written: that gap, plus the close below, is
-                        // the whole fixture.
-                        let mut out = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                             Content-Length: 4096\r\nConnection: close\r\n\r\n"
-                            .to_vec();
-                        out.extend_from_slice(partial);
-                        out
+                    let hold_open = matches!(
+                        reply,
+                        Reply::HeadersThenSilence | Reply::StatusHeadersThenSilence(_)
+                    );
+
+                    let wire = match reply {
+                        Reply::TruncatedBody => {
+                            let partial = br#"{"id":"msg_trunc","cont"#;
+                            // The announced length is deliberately far larger
+                            // than what is written: that gap, plus the close
+                            // below, is the whole fixture.
+                            let mut out = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                                 Content-Length: 4096\r\nConnection: close\r\n\r\n"
+                                .to_vec();
+                            out.extend_from_slice(partial);
+                            out
+                        }
+                        Reply::Ok(body) => http_response(200, &body),
+                        Reply::Status(code, body) => http_response(code, &body),
+                        Reply::Unparseable => {
+                            http_response(200, r#"{"not":"the expected schema"}"#)
+                        }
+                        // mika#2280: head only, and no close — see the two
+                        // variants' doc comments. The hang IS the fixture, so
+                        // these two must only ever be used with a plafond of a
+                        // second or two.
+                        Reply::HeadersThenSilence => silent_head(200),
+                        Reply::StatusHeadersThenSilence(code) => silent_head(code),
+                    };
+
+                    let _ = socket.write_all(&wire).await;
+                    let _ = socket.flush().await;
+                    if hold_open {
+                        // Hold the socket until the client's plafond cuts it.
+                        // The sleep only has to outlast that plafond; the
+                        // connection dies with this task when the test ends.
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        return;
                     }
-                    Reply::Ok(body) => http_response(200, &body),
-                    Reply::Status(code, body) => http_response(code, &body),
-                    Reply::Unparseable => http_response(200, r#"{"not":"the expected schema"}"#),
-                };
-
-                let _ = socket.write_all(&wire).await;
-                let _ = socket.flush().await;
-                // Closing here is what turns a short body into an EOF rather
-                // than a hang: without it the client would wait out its full
-                // HTTP timeout for bytes that never come.
-                let _ = socket.shutdown().await;
+                    // Closing here is what turns a short body into an EOF rather
+                    // than a hang: without it the client would wait out its full
+                    // HTTP timeout for bytes that never come.
+                    let _ = socket.shutdown().await;
+                });
             }
         });
 
@@ -125,6 +167,19 @@ impl FakeApi {
     fn hits(&self) -> usize {
         self.hits.load(Ordering::SeqCst)
     }
+}
+
+/// A response head announcing a body that will never be sent (mika#2280).
+///
+/// `Connection: keep-alive` and no close: the client must **wait**, not see an
+/// EOF. That is what makes the failure a plafond crossing rather than the
+/// mika#2015 `unexpected EOF` the fixture above produces.
+fn silent_head(status: u16) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\n\
+         Content-Length: 65536\r\nConnection: keep-alive\r\n\r\n"
+    )
+    .into_bytes()
 }
 
 fn http_response(status: u16, body: &str) -> Vec<u8> {
@@ -492,6 +547,25 @@ struct Attempt {
     attempt: u64,
     outcome: String,
     elapsed_ms: u64,
+    /// The raw `cap_exhausted` field, `None` when the line does **not carry
+    /// it** (mika#2280 AC7).
+    ///
+    /// Kept as an `Option<String>` rather than parsed to a bool on purpose: the
+    /// assertion that matters is *absent* versus *present and false*, and an
+    /// `Option<bool>` built by `.map(parse)` would collapse "no field" into the
+    /// same `None` as "unparseable field".
+    cap_exhausted: Option<String>,
+    max_tokens: Option<u64>,
+}
+
+/// One `llm_call_cap_exhausted` line (mika#2280 AC5).
+#[derive(Debug)]
+struct CapExhausted {
+    model: String,
+    max_tokens: u64,
+    http_timeout_secs: u64,
+    elapsed_ms: u64,
+    reachable_output_tokens: u64,
 }
 
 /// Why **every** test in this file carries `#[serial]`, not just the capturing
@@ -516,7 +590,7 @@ mod capture {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
-    use super::Attempt;
+    use super::{Attempt, CapExhausted};
 
     #[derive(Default)]
     pub struct Sink(pub Arc<Mutex<Vec<HashMap<String, String>>>>);
@@ -598,6 +672,29 @@ mod capture {
                     attempt: f["attempt"].parse().expect("attempt is a number"),
                     outcome: f["outcome"].clone(),
                     elapsed_ms: f["elapsed_ms"].parse().expect("elapsed_ms is a number"),
+                    cap_exhausted: f.get("cap_exhausted").cloned(),
+                    max_tokens: f.get("max_tokens").and_then(|v| v.parse().ok()),
+                })
+                .collect()
+        }
+
+        /// The `llm_call_cap_exhausted` lines, in order (mika#2280).
+        pub fn cap_exhausted(&self) -> Vec<CapExhausted> {
+            self.0
+                .lock()
+                .expect("sink")
+                .iter()
+                .filter(|f| f.get("event").map(String::as_str) == Some("llm_call_cap_exhausted"))
+                .map(|f| CapExhausted {
+                    model: f["model"].clone(),
+                    max_tokens: f["max_tokens"].parse().expect("max_tokens is a number"),
+                    http_timeout_secs: f["http_timeout_secs"]
+                        .parse()
+                        .expect("http_timeout_secs is a number"),
+                    elapsed_ms: f["elapsed_ms"].parse().expect("elapsed_ms is a number"),
+                    reachable_output_tokens: f["reachable_output_tokens"]
+                        .parse()
+                        .expect("reachable_output_tokens is a number"),
                 })
                 .collect()
         }
@@ -852,5 +949,221 @@ async fn mika2362_anthropic_post_loop_message_names_the_deadline_not_the_retries
     assert!(
         !chain.contains("deadline budget insufficient"),
         "the deadline did not stop this one, got: {chain}"
+    );
+}
+
+// ── mika#2280 — the plafond discriminator ─────────────────────────────────
+
+/// A one-second plafond inside a generous envelope: short enough that a
+/// `…ThenSilence` fixture costs a second per attempt, long enough that the
+/// retry the discriminator must not touch still has room to run.
+fn plafond_budget() -> LlmTimeoutBudget {
+    LlmTimeoutBudget::unvalidated(1, 3)
+}
+
+/// One attempt and no more: the error the caller sees is the one `send_once`
+/// produced, unwrapped by no retry.
+fn single_attempt_plafond_budget() -> LlmTimeoutBudget {
+    LlmTimeoutBudget::unvalidated(1, 1)
+}
+
+/// AC5 (a) + AC6 + AC7 — a body that stops arriving at the plafond is a
+/// guillotine, and saying so changes nothing about the retry.
+///
+/// Positive side: the 2xx head arrives, the body never does, the client's own
+/// plafond cuts it ⇒ one `llm_call_cap_exhausted` line carrying the geometry,
+/// and the attempt line says `cap_exhausted = true` with the `max_tokens` it
+/// asked for. Non-regression side (mika#2015): the chain still retries and the
+/// second attempt succeeds, and its own line says `false`.
+#[tokio::test]
+#[serial]
+async fn mika2280_openai_a_cut_at_the_plafond_is_attributed_and_still_retried() {
+    let api = FakeApi::start(vec![Reply::HeadersThenSilence, Reply::Ok(openai_body())]).await;
+    let provider = openai_provider(api.base_url(), plafond_budget());
+
+    let (guard, sink) = capture::start();
+    provider
+        .send_message(&llm_request())
+        .await
+        .expect("the retry must still run and succeed (AC6)");
+    let lines = sink.attempts();
+    let cuts = sink.cap_exhausted();
+    drop(guard);
+
+    assert_eq!(api.hits(), 2, "the retry must not shorten: {lines:?}");
+    assert_eq!(lines[0].outcome, "retrying", "{lines:?}");
+    assert_eq!(lines[0].cap_exhausted.as_deref(), Some("true"), "{lines:?}");
+    assert_eq!(lines[0].max_tokens, Some(64), "{lines:?}");
+    assert!(
+        lines[0].elapsed_ms >= 980,
+        "the cut must sit at the plafond: {lines:?}"
+    );
+    assert_eq!(
+        lines[1].cap_exhausted.as_deref(),
+        Some("false"),
+        "a successful attempt ran, so its flag is `false`, never absent: {lines:?}"
+    );
+
+    assert_eq!(cuts.len(), 1, "{cuts:?}");
+    let cut = &cuts[0];
+    assert_eq!(cut.model, "test-model");
+    assert_eq!(cut.max_tokens, 64);
+    assert_eq!(cut.http_timeout_secs, 1);
+    assert!(cut.elapsed_ms >= 980, "{cut:?}");
+    assert_eq!(
+        cut.reachable_output_tokens,
+        plafond_budget()
+            .reachable_output_tokens(mika_common::llm::budget::DEFAULT_OUTPUT_TOKENS_PER_SEC_FLOOR),
+        "{cut:?}"
+    );
+}
+
+/// AC6 — the error a guillotine produces is still `Transport` and still
+/// retryable: the discriminator rides beside `LlmError`, never inside it.
+#[tokio::test]
+#[serial]
+async fn mika2280_openai_a_cut_at_the_plafond_keeps_its_error_class() {
+    let api = FakeApi::start(vec![Reply::HeadersThenSilence]).await;
+    let provider = openai_provider(api.base_url(), single_attempt_plafond_budget());
+
+    let err = provider
+        .send_message(&llm_request())
+        .await
+        .expect_err("a single attempt that hangs must fail");
+
+    assert!(matches!(err, LlmError::Transport(_)), "{err:?}");
+    assert!(err.is_retryable(), "{err:?}");
+    assert_eq!(err.error_class(), "transport_timeout", "{err:?}");
+}
+
+/// AC5 (b) — the negative control of the discriminator: a body cut at once
+/// (the mika#2015 `unexpected EOF`) is a breakdown, not a guillotine.
+///
+/// Without it, a predicate answering `true` unconditionally would pass the test
+/// above.
+#[tokio::test]
+#[serial]
+async fn mika2280_openai_an_early_cut_is_not_a_guillotine() {
+    let api = FakeApi::start(vec![Reply::TruncatedBody, Reply::Ok(openai_body())]).await;
+    let provider = openai_provider(api.base_url(), plafond_budget());
+
+    let (guard, sink) = capture::start();
+    provider
+        .send_message(&llm_request())
+        .await
+        .expect("the transport retry must still run");
+    let lines = sink.attempts();
+    let cuts = sink.cap_exhausted();
+    drop(guard);
+
+    assert_eq!(lines[0].outcome, "retrying", "{lines:?}");
+    assert_eq!(
+        lines[0].cap_exhausted.as_deref(),
+        Some("false"),
+        "{lines:?}"
+    );
+    assert!(
+        cuts.is_empty(),
+        "an early cut must not be counted: {cuts:?}"
+    );
+}
+
+/// AC5 on the ollama rail, with its **site** negative control in the same call.
+///
+/// Positive side: the 2xx body that never finishes is attributed. Negative
+/// side: a non-2xx head whose error body never arrives hangs the *other*
+/// `response.text()` of this rail for the same plafond — and must emit no
+/// `llm_call_cap_exhausted`. Instrumenting the wrong site would pass every
+/// other test while inflating the population the post-deploy probe reads.
+#[tokio::test]
+#[serial]
+async fn mika2280_ollama_attributes_the_body_site_and_never_the_error_site() {
+    // -- positive: the 2xx body site --
+    let api = FakeApi::start(vec![Reply::HeadersThenSilence]).await;
+    let provider = ollama_provider(api.base_url(), single_attempt_plafond_budget());
+
+    let (guard, sink) = capture::start();
+    let err = provider
+        .send_message(&llm_request())
+        .await
+        .expect_err("a single attempt that hangs must fail");
+    let lines = sink.attempts();
+    let cuts = sink.cap_exhausted();
+    drop(guard);
+
+    assert!(matches!(err, LlmError::Transport(_)), "{err:?}");
+    assert_eq!(lines[0].cap_exhausted.as_deref(), Some("true"), "{lines:?}");
+    // This rail's chain length is not the subject here (it is not bounded by
+    // `max_attempts` the way the OpenAI rail is): what is asserted is that
+    // every attempt the server saw hang is attributed, once.
+    assert_eq!(cuts.len(), api.hits(), "{cuts:?}");
+    assert!(cuts.iter().all(|c| c.max_tokens == 64), "{cuts:?}");
+
+    // -- negative: the non-2xx error-body site --
+    let api = FakeApi::start(vec![Reply::StatusHeadersThenSilence(429)]).await;
+    let provider = ollama_provider(api.base_url(), single_attempt_plafond_budget());
+
+    let (guard, sink) = capture::start();
+    let err = provider
+        .send_message(&llm_request())
+        .await
+        .expect_err("a 429 must fail");
+    let lines = sink.attempts();
+    let cuts = sink.cap_exhausted();
+    drop(guard);
+
+    assert!(
+        matches!(err, LlmError::HttpError { status: 429, .. }),
+        "{err:?}"
+    );
+    assert_eq!(
+        lines[0].cap_exhausted.as_deref(),
+        Some("false"),
+        "{lines:?}"
+    );
+    assert!(
+        cuts.is_empty(),
+        "a slow error body is not a model still generating: {cuts:?}"
+    );
+}
+
+/// AC7 — an attempt that did not happen carries **no** `cap_exhausted`.
+///
+/// `deadline_abort` made no call, so `false` would assert something about a
+/// call that does not exist. The attempt that did run beside it carries its
+/// flag, which is the control: a line shape that dropped the field everywhere
+/// would pass the absence check alone.
+#[tokio::test]
+#[serial]
+async fn mika2280_deadline_abort_carries_no_cap_flag() {
+    let api = FakeApi::start(vec![Reply::Status(
+        429,
+        r#"{"error":{"message":"slow"}}"#.into(),
+    )])
+    .await;
+    let provider = openai_provider(api.base_url(), incident_budget());
+
+    let (guard, sink) = capture::start();
+    let _ = provider
+        .send_message_with_deadline(&llm_request(), Some(deadline_in(20)))
+        .await
+        .expect_err("the chain must fail");
+    let lines = sink.attempts();
+    drop(guard);
+
+    assert_eq!(
+        lines[0].cap_exhausted.as_deref(),
+        Some("false"),
+        "{lines:?}"
+    );
+    assert_eq!(lines[1].outcome, "deadline_abort", "{lines:?}");
+    assert_eq!(
+        lines[1].cap_exhausted, None,
+        "absent, never `false`: {lines:?}"
+    );
+    assert_eq!(
+        lines[1].max_tokens,
+        Some(64),
+        "the declaration is true everywhere: {lines:?}"
     );
 }

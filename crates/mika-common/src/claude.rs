@@ -663,6 +663,12 @@ impl ClaudeClient {
                             last_error.as_ref().map(error_class).as_deref(),
                             ANTHROPIC_HTTP_TIMEOUT_SECS,
                             Some(remaining.as_millis() as u64),
+                            request.max_tokens,
+                            // `None` on BOTH counts here (mika#2280): the
+                            // attempt did not happen, AND this rail is not
+                            // instrumented for the plafond discriminator — see
+                            // the twin comment at the outcome site below.
+                            None,
                         );
                         break;
                     }
@@ -737,6 +743,18 @@ impl ClaudeClient {
                 attempt_result.as_ref().err().map(error_class).as_deref(),
                 ANTHROPIC_HTTP_TIMEOUT_SECS,
                 deadline_remaining_ms,
+                request.max_tokens,
+                // mika#2280 D7: `None`, always, on this rail — and for a reason
+                // distinct from the `deadline_abort` one. The attempt DID
+                // happen; what is missing is an applied plafond to compare its
+                // elapsed time against. This rail hands `reqwest` the literal
+                // `ANTHROPIC_HTTP_TIMEOUT_SECS` instead of reading the budget,
+                // so "elapsed ≈ plafond" would judge against a bound that does
+                // not govern the call — and a `false` here would assert a
+                // non-guillotine under a guillotine that was never in force.
+                // The `max_tokens` above is a declaration and is true anywhere;
+                // the flag is a judgment and needs the plafond.
+                None,
             );
 
             match attempt_result {
