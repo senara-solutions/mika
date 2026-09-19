@@ -311,7 +311,28 @@ impl GatewaySettings {
     /// protect, and an upstream outage would then be enough to keep the gateway
     /// — Telegram, GitHub webhooks, A2A — from starting at all.
     fn assert_search_substrate_expectation(&self) -> anyhow::Result<()> {
-        if !search_substrate_is_required(self.search_required.as_deref()) {
+        let declaration = parse_search_required(self.search_required.as_deref());
+
+        // **SOLE WRITER of `search_required_unrecognized_value`, and the reason
+        // is that a diagnostic which double-counts is a broken diagnostic.**
+        // `validate()` runs exactly once per process, inside `load()`. Emitting
+        // from `search_substrate_is_required` instead would fire once here and
+        // once more in `main.rs`, which reads the same value to log
+        // `search_upstream_resolved` — two lines per startup for one typo, on a
+        // ticket whose whole subject is an operator surface that failed to say
+        // the truth. Keeping the parse pure is what makes it safe to read the
+        // value from as many places as need it.
+        if let SearchRequiredDeclaration::Unrecognized(value) = declaration {
+            tracing::warn!(
+                event = "search_required_unrecognized_value",
+                value = %format!("{value:?}"),
+                "mika#2407: MIKA_SEARCH_REQUIRED carries an unrecognized value — \
+                 the search substrate is treated as REQUIRED (fail closed). \
+                 Use 1/true/on/yes to require it, 0/false/off/no to make it optional."
+            );
+        }
+
+        if !declaration.is_required() {
             return Ok(());
         }
         let upstream = self.search_upstream.as_deref().map(str::trim).unwrap_or("");
@@ -538,29 +559,50 @@ pub fn telegram_html_render_is_enabled(raw: Option<&str>) -> bool {
 /// — a rollout refused on a typo is repaired in a minute, six mute tenants are
 /// repaired only once a human notices, which on 2026-09-18 took twenty hours.
 ///
-/// The value is quoted in the WARN because a stray space is otherwise invisible
-/// (mika#2220), and it is the **trimmed original** rather than the lowercased
-/// match subject — folding its case throws away part of what was typed.
+/// **Pure**: it emits nothing. The WARN for the unrecognized tier belongs to
+/// [`GatewaySettings::assert_search_substrate_expectation`], which runs once per
+/// process — see the comment there for why that separation is load-bearing
+/// rather than tidy.
 pub fn search_substrate_is_required(raw: Option<&str>) -> bool {
+    parse_search_required(raw).is_required()
+}
+
+/// The three shapes `MIKA_SEARCH_REQUIRED` can take, kept apart because the
+/// middle two answer the same `bool` for different reasons and only one of them
+/// deserves a WARN.
+enum SearchRequiredDeclaration<'a> {
+    /// Absent, or present and blank.
+    Absent,
+    /// A recognized value.
+    Explicit(bool),
+    /// Non-empty and unrecognized. Carries the **trimmed original** rather than
+    /// the lowercased match subject: the value is quoted in the WARN so a stray
+    /// space is visible (mika#2220), and folding its case would throw away part
+    /// of what the operator actually typed.
+    Unrecognized(&'a str),
+}
+
+impl SearchRequiredDeclaration<'_> {
+    fn is_required(&self) -> bool {
+        match self {
+            SearchRequiredDeclaration::Absent => false,
+            SearchRequiredDeclaration::Explicit(value) => *value,
+            SearchRequiredDeclaration::Unrecognized(_) => true,
+        }
+    }
+}
+
+fn parse_search_required(raw: Option<&str>) -> SearchRequiredDeclaration<'_> {
     let Some(value) = raw.map(str::trim) else {
-        return false;
+        return SearchRequiredDeclaration::Absent;
     };
     if value.is_empty() {
-        return false;
+        return SearchRequiredDeclaration::Absent;
     }
     match value.to_ascii_lowercase().as_str() {
-        "1" | "true" | "on" | "yes" => true,
-        "0" | "false" | "off" | "no" => false,
-        _ => {
-            tracing::warn!(
-                event = "search_required_unrecognized_value",
-                value = %format!("{value:?}"),
-                "mika#2407: MIKA_SEARCH_REQUIRED carries an unrecognized value — \
-                 the search substrate is treated as REQUIRED (fail closed). \
-                 Use 1/true/on/yes to require it, 0/false/off/no to make it optional."
-            );
-            true
-        }
+        "1" | "true" | "on" | "yes" => SearchRequiredDeclaration::Explicit(true),
+        "0" | "false" | "off" | "no" => SearchRequiredDeclaration::Explicit(false),
+        _ => SearchRequiredDeclaration::Unrecognized(value),
     }
 }
 
@@ -1096,6 +1138,39 @@ mod tests {
         let mut explicit = test_settings();
         explicit.search_required = Some("0".to_string());
         assert!(explicit.validate().is_ok());
+    }
+
+    /// The three declarations stay distinguishable, and `Absent` never collapses
+    /// into `Explicit(false)`.
+    ///
+    /// They answer the same `bool` for two of the three, which is exactly why
+    /// the discriminant has to be pinned: only `Unrecognized` earns a WARN, and
+    /// the day someone "simplifies" the enum into a bare `bool`, the WARN has to
+    /// move back into the parse function — where it fires once per *call* rather
+    /// than once per *process*, and the operator counting typos counts two.
+    #[test]
+    fn mika2407_the_three_declarations_stay_apart() {
+        assert!(matches!(
+            parse_search_required(None),
+            SearchRequiredDeclaration::Absent
+        ));
+        assert!(matches!(
+            parse_search_required(Some("  ")),
+            SearchRequiredDeclaration::Absent
+        ));
+        assert!(matches!(
+            parse_search_required(Some("0")),
+            SearchRequiredDeclaration::Explicit(false)
+        ));
+        assert!(matches!(
+            parse_search_required(Some(" YES ")),
+            SearchRequiredDeclaration::Explicit(true)
+        ));
+        // The trimmed original reaches the WARN, accents and inner space intact.
+        assert!(matches!(
+            parse_search_required(Some("  requis à coup sûr ")),
+            SearchRequiredDeclaration::Unrecognized("requis à coup sûr")
+        ));
     }
 
     /// The provenance half of U1: `required_source` must say which of the two

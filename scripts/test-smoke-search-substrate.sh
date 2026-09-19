@@ -30,6 +30,13 @@ SMOKE="$REPO_ROOT/scripts/smoke-search-substrate"
 PASS=0
 FAIL=0
 
+# One shape for "a token the smoke will accept", so the five call sites below
+# cannot drift apart. Deliberately NOT the sentinel used by the leak assertion
+# near the end of the file: that one has to be recognisable in the output, and
+# this one has to look like a real 64-hex bearer.
+VALID_TOKEN="$(printf 'a%.0s' {1..64})"
+readonly VALID_TOKEN
+
 TMPROOT="$(mktemp -d)"
 FAKE_PID=""
 cleanup() {
@@ -155,7 +162,7 @@ assert_mode_exit() {
     local mode="$1" want="$2" name="$3"
     start_fake "$mode"
     local got=0
-    MIKA_INTERNAL_TOKEN="$(printf 'a%.0s' {1..64})" \
+    MIKA_INTERNAL_TOKEN="$VALID_TOKEN" \
         bash "$SMOKE" "$BASE_URL" >"$TMPROOT/out" 2>"$TMPROOT/err" || got=$?
     stop_fake
     if [[ "$got" -eq "$want" ]]; then
@@ -170,7 +177,7 @@ assert_mode_exit() {
 assert_mode_output_contains() {
     local mode="$1" needle="$2" name="$3"
     start_fake "$mode"
-    MIKA_INTERNAL_TOKEN="$(printf 'a%.0s' {1..64})" \
+    MIKA_INTERNAL_TOKEN="$VALID_TOKEN" \
         bash "$SMOKE" "$BASE_URL" >"$TMPROOT/out" 2>"$TMPROOT/err" || true
     stop_fake
     if grep -qF -- "$needle" "$TMPROOT/out" "$TMPROOT/err"; then
@@ -184,7 +191,7 @@ assert_mode_output_contains() {
 assert_mode_output_lacks() {
     local mode="$1" needle="$2" name="$3"
     start_fake "$mode"
-    MIKA_INTERNAL_TOKEN="$(printf 'a%.0s' {1..64})" \
+    MIKA_INTERNAL_TOKEN="$VALID_TOKEN" \
         bash "$SMOKE" "$BASE_URL" >"$TMPROOT/out" 2>"$TMPROOT/err" || true
     stop_fake
     if grep -qF -- "$needle" "$TMPROOT/out" "$TMPROOT/err"; then
@@ -215,7 +222,7 @@ assert_mode_exit healthy_empty 0 \
     "AC2 — 200 with zero results is still a pass (we assert on status, not content)"
 
 start_fake healthy
-MIKA_INTERNAL_TOKEN="$(printf 'a%.0s' {1..64})" bash "$SMOKE" "$BASE_URL" >/dev/null 2>&1
+MIKA_INTERNAL_TOKEN="$VALID_TOKEN" bash "$SMOKE" "$BASE_URL" >/dev/null 2>&1
 stop_fake
 hits="$(wc -l <"$HITS_FILE" | tr -d ' ')"
 if [[ "$hits" -eq 1 ]]; then
@@ -271,7 +278,7 @@ MIKA_INTERNAL_TOKEN="x" bash "$SMOKE" >/dev/null 2>&1 || got=$?
 
 # An unreachable host: transport failure says nothing about the substrate.
 got=0
-MIKA_INTERNAL_TOKEN="$(printf 'a%.0s' {1..64})" \
+MIKA_INTERNAL_TOKEN="$VALID_TOKEN" \
     bash "$SMOKE" "http://127.0.0.1:1" >/dev/null 2>&1 || got=$?
 [[ "$got" -eq 2 ]] && ok "unreachable gateway ⇒ exit 2" || ko "unreachable gateway ⇒ got $got"
 
