@@ -45,7 +45,7 @@ For each consumer found, apply the decision matrix:
 
 ## Worked example: mika#874 v29→v30 (`matched_llm_db_fallback`)
 
-The v29→v30 migration (mika#874) adds `matched_llm_db_fallback` to the `kg_resolutions_log.outcome` CHECK constraint. The migration is a full table rebuild (SQLite has no `ALTER TABLE ... ALTER CONSTRAINT`). The DDL is at `crates/mika-agent/src/db.rs:3809`; the audit message at `db.rs:3845` reads `"v29→v30: expanded kg_resolutions_log outcome CHECK constraint (#874)"`.
+The v29→v30 migration (mika#874) adds `matched_llm_db_fallback` to the `kg_resolutions_log.outcome` CHECK constraint. The migration is a full table rebuild (SQLite has no `ALTER TABLE ... ALTER CONSTRAINT`). The DDL is at `crates/mika-agent/src/db.rs::migrate_v29_to_v30`; the audit message at `db.rs` reads `"v29→v30: expanded kg_resolutions_log outcome CHECK constraint (#874)"`.
 
 **Consumers identified:**
 

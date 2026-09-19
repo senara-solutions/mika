@@ -192,9 +192,62 @@ log_level = "info"
 /// mika#1632 suite). Uses native `zai` (mika#1657), not openrouter — that is
 /// the provider the calibration run exercised and the current-correct routing.
 ///
+/// # The dormant ticket this constant carries: glm-5.3 for QA (mika#2328)
+///
+/// On 2026-09-15 mika-qa, running **glm-5.3**, blew its review envelope on PR
+/// #2327: turns of 258–315 s, `hold[review]` posted by the engine after 3 steps,
+/// verdict lost. The remedy applied that day was the return to glm-5.2 recorded
+/// below. Prime's decision of 15:07 makes the return to 5.3 **conjunctive** —
+/// both conditions, not either:
+///
+/// 1. **mika#2296 merged.** `llm_max_tokens = 8192` starves a reasoning model:
+///    its thinking is billed to the output budget, so the verdict is never
+///    reached. **Met** — `09bc473c` (PR #2332), 2026-09-16.
+/// 2. **A replay of the #2327 review under glm-5.3 that CONCLUDES** — a verdict
+///    posted inside the envelope, not an engine `hold[review]`. **Not met.** The
+///    procedure that produces and settles it is
+///    `docs/eval/calibration/mika-qa-2328/README.md`.
+///
+/// Until both hold, mika-qa stays on glm-5.2 and **no value here moves**.
+///
+/// **No mika-qa calibration has ever run on 5.3.** `docs/eval/calibration/`
+/// carries exactly one mika-qa artifact and it reads `"model": "zai/glm-5.2"`;
+/// the swap that broke the envelope therefore also broke mika#1190 — *no model
+/// swap without a passing calibration run* — and nothing in the system said so.
+/// The run is `make calibrate-mika-qa MODEL=zai/glm-5.3`, and the README above
+/// says why it must be preceded by a same-day 5.2 control on the current
+/// 8-scenario suite (the June baseline carries 5) and why, being **single-call**,
+/// it cannot on its own authorise the return: it measures per-call latency, not
+/// the multi-step accumulation a real review spends against an envelope.
+///
 /// `llm_max_tokens` is deliberately left at 16384 by mika#2296: the QA return
 /// to glm-5.3 is mika#2328's subject, and its budget belongs to the ticket that
-/// carries the model swap and its calibration run, not to this one.
+/// carries the model swap and its calibration run, not to this one. mika#2328
+/// does not carry it either — raising a value in service without a measurement
+/// is what `MIKA_ARCH_CONFIG`'s note refuses in as many words.
+///
+/// # This constant may not describe what is running (mika#2328 E2)
+///
+/// `zai_model = "glm-5.2"` is the only model line this file has ever declared
+/// for mika-qa — `git log -S'zai_model'` returns one commit — so the 5.3 that
+/// produced the incident was an **out-of-repo edit** of the agent's
+/// `config.toml` on disk. It survives restarts: `reconcile_well_known_config`
+/// rewrites the file whole and is skipped under
+/// `MIKA_DISABLE_AGENT_PROVISIONING`, which is exactly that flag's purpose. Same
+/// drift `MIKA_DEV_CONFIG` documents just above, on a second agent.
+///
+/// **What says so:** the `llm_budget_resolved` INFO event now carries `model`,
+/// `model_source` and `model_config_key` beside the timeout pair (mika#2328 U2).
+/// `model_source = agent_config` with a `model` other than the line below is the
+/// drift, measured. Nothing here *prevents* it — this is an instrument, not a
+/// guard.
+///
+/// ```text
+/// grep llm_budget_resolved "$MIKA_SPIRIT_LOG_FILE" \
+///   | jq 'select(.agent_id == "mika-qa")
+///         | {model, model_source, model_config_key,
+///            http_timeout_secs, agent_total_timeout_secs, http_source, total_source}'
+/// ```
 const MIKA_QA_CONFIG: &str = r#"# Mika QA — fabrication-catching review agent.
 # Base model switched to zai/glm-5.2 per mika#1670 calibration evidence (5/5 PASS).
 
@@ -2604,6 +2657,69 @@ mod tests {
                 agent.name
             );
         }
+    }
+
+    /// mika#2309 § Fire-Disposition surface 3 — **contrôle positif
+    /// auto-nettoyant** sur une divergence vivante, mesurée le 2026-09-18.
+    ///
+    /// # Le fait
+    ///
+    /// `mika_a2a::client::resolve_timeout_secs` ne lit que
+    /// `MIKA_AGENT_TOTAL_TIMEOUT_SECS` dans l'env **du process** ; il ne lit
+    /// jamais le `config.toml` **per-agent**. Or `MIKA_ARCH_CONFIG` pose
+    /// `agent_total_timeout_secs = 900` (mika#2189). Sur un appel vers
+    /// mika-arch, le client résout donc son défaut (600 s) face à une enveloppe
+    /// de 900 s : le plancher `client >= total` de mika#2297 **n'est pas tenu**,
+    /// et le client abandonne une génération que le moteur a encore le droit de
+    /// finir — exactement le sinistre du 11/09 qui a motivé le passage de 300 à
+    /// 600.
+    ///
+    /// # Pourquoi un test qui *constate* au lieu de corriger
+    ///
+    /// Corriger revient à apprendre au client a2a à lire la cascade per-agent,
+    /// c'est-à-dire un changement de **comportement runtime** que mika#2309
+    /// s'interdit en tête (« substrat borné »). Et la forme même est la
+    /// question : le client ne connaît pas l'agent visé au moment où il résout
+    /// son budget. La doctrine (`docs/solutions/best-practices/fire-disposition-doctrine.md`)
+    /// nomme ce cas — la résolution de la violation préexistante *est* la
+    /// question de périmètre — et n'autorise pas à surfacer puis passer à autre
+    /// chose : d'où ce contrôle.
+    ///
+    /// # Ce qu'il fait rougir, et c'est le point
+    ///
+    /// Il lit les **deux valeurs réelles** et affirme l'écart. Il rougit donc le
+    /// jour où l'écart disparaît — valeurs alignées, ou client apprenant à lire
+    /// le per-agent — ce qui force à retirer l'exception au lieu de la laisser
+    /// survivre à sa cause.
+    ///
+    /// # Ticket de suivi
+    ///
+    /// La divergence est remontée dans son propre ticket (portée de lecture du
+    /// plancher mika#2297 face aux cascades per-agent de mika#2189) ; son corps
+    /// intégral est reproduit dans la description de la PR qui livre mika#2309,
+    /// et son numéro s'inscrit ici à son ouverture. **Ce qui est interdit à qui
+    /// lit ce test** : aligner `DEFAULT_TIMEOUT` sur 900, ou faire lire le
+    /// `config.toml` per-agent au client, de sa propre autorité. Les deux
+    /// changent un budget de production.
+    #[test]
+    fn mika2309_client_default_is_below_the_arch_envelope() {
+        let config: toml::Value =
+            toml::from_str(MIKA_ARCH_CONFIG).expect("MIKA_ARCH_CONFIG should be valid TOML");
+        let arch_envelope = config["agent_total_timeout_secs"]
+            .as_integer()
+            .expect("mika-arch declares agent_total_timeout_secs")
+            as u64;
+
+        let client_default = mika_a2a::client::DEFAULT_TIMEOUT.as_secs();
+
+        assert!(
+            client_default < arch_envelope,
+            "mika#2309 surface 3 : l'écart mesuré entre le défaut client a2a \
+             ({client_default}s) et l'enveloppe per-agent de mika-arch \
+             ({arch_envelope}s) a disparu. Ce test est un contrôle positif \
+             auto-nettoyant : s'il rougit, la divergence est résolue et il doit \
+             être RETIRÉ avec son ticket de suivi, pas ajusté."
+        );
     }
 
     #[test]

@@ -60,7 +60,7 @@ Helper commands (prefixed with `+`) provide shortcuts for common operations:
 
 - 0: Success
 - 1: API error (check the error message for details)
-- 2: Authentication error — credentials may be expired or invalid. Ask the user to run `gws auth login` to re-authenticate.
+- 2: Authentication error — the stored Google credentials are expired or invalid. The tool result appends the remediation that applies to this runtime; relay that one.
 - 3: Validation error (bad input or missing parameters)
 - 4: Discovery service error (cannot reach Google APIs — check network connectivity)
 - 5: Internal error
@@ -71,5 +71,5 @@ When a command fails, the output starts with `Exit code: N` followed by the erro
 
 - ALWAYS confirm destructive or state-changing operations with the user before executing: sending emails, deleting files/events, modifying permissions, creating calendar events.
 - Use `--dry-run` when available to preview destructive operations before executing.
-- If `run_gws` reports an authentication error (exit code 2), tell the user their credentials may be expired and suggest running `gws auth login` to re-authenticate.
+- If `run_gws` reports an authentication error (exit code 2), tell the user their Google credentials are expired or invalid, and relay the remediation the tool result appends after the exit code — it is the one that is actually reachable from where this instance runs. Do not propose a remediation the tool result does not name, and never assume the user has a terminal.
 - Keep pagination small to avoid output truncation. Prefer `--params "{\"maxResults\": 10}"` over fetching all results.

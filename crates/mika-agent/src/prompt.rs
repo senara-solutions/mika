@@ -74,6 +74,136 @@ fn write_distribution_doctrine_section(prompt: &mut String) {
     prompt.push_str("\n\n");
 }
 
+// ---------------------------------------------------------------------------
+// mika#2292 — Mika Doctrine (the material register, aliased "doctrine")
+// ---------------------------------------------------------------------------
+
+/// Heading for the code-managed Mika Doctrine section (mika#2292).
+///
+/// Rendered by [`write_mika_doctrine_section`] into every `build_system_prompt`
+/// and `build_silent_prompt` output, immediately after
+/// [`DISTRIBUTION_DOCTRINE_HEADING`] and before the identity heading.
+///
+/// English, like its two sisters: the heading is a prompt-structure marker, not
+/// text served to a user.
+///
+/// **What it closes.** Measured 2026-09-11 on a champion (cloud) tenant. Asked
+/// « Qu'est-ce que la doctrine Mika ? », the agent answered "nothing found
+/// called the Mika doctrine" **and then gave the philosophy anyway**, in the
+/// same response. Not a knowledge gap — a *name* gap: it held the answer and had
+/// no label for it. That shape (uncertainty at t=0, assertion at t=1) is the one
+/// rule 4 of `## Self-Identity Discipline` already condemned word for word; it
+/// did not bite because the written scope of that section was "which model you
+/// are, which provider powers you, WHERE you run". Third occurrence of the same
+/// class after mika#1815 and mika#2290, and the remedy takes the same shape both
+/// times took: a code-managed fact section plus a rule widening the discipline's
+/// scope — not a skill, not a soul edit, not a memory.
+///
+/// The compact-provider variant [`build_compact_system_prompt`] intentionally
+/// omits this section — see the comment at the point of omission and mika#1925.
+pub const MIKA_DOCTRINE_HEADING: &str = "## Mika Doctrine";
+
+/// Operator-register body of the Mika Doctrine section (mika#2292).
+///
+/// **Provenance of every fact asserted here.** *MIT*: verified in `LICENSE`
+/// (line 1) and `Cargo.toml` (`license = "MIT"`) — and the claim is deliberately
+/// scoped to **the engine that runs the agent**, never to "Mika" as a whole: the
+/// cloud console is a separate, closed codebase, so an unqualified "Mika is open
+/// source" would be false. *Data belonging to the person*: written as a
+/// **commitment**, never as a statement of where bytes sit. *Proactivity* and
+/// *persistent memory*: behaviours already prescribed by the soul; what this
+/// section adds is the *why*. *Growth by invitation*: **cited**, never
+/// re-narrated — `## Distribution Doctrine` is its ground truth, and a second
+/// telling is a duplication that drifts (the class `grooming_marker`/mika#2158
+/// and the retry gate/mika#2362 each had to close once).
+///
+/// **What is deliberately NOT claimed.** The word "exportable" does not appear.
+/// It is asserted today at five sites (mika#2290's remedy, one of them served to
+/// the model) and this repository contains no export tool, route, or
+/// subcommand — the tenant's data lives in `mika-cloud`, which is not in this
+/// workspace, so the claim can be neither verified nor safely retracted from
+/// here. Constat + follow-up ticket; this section simply does not add a sixth
+/// site. See the `mika2292_no_exportable_claim_*` tests.
+///
+/// **No sentence of locality, even a true one.** The hosting fact is `## Runtime`'s
+/// and this body *refers* to it rather than restating it — which makes the 5d
+/// guard predicate (mika#2290) unmatched **by construction** (no locality
+/// subject to pair with an assertion) rather than by a conditional marker a
+/// later editor might reword away.
+///
+/// **The spiritual stop is topical, and names no referent — the central
+/// inversion of this ticket.** The naive implementation writes "do not discuss
+/// <X>, <Y>, <Z>", which *teaches the tenant the very words it claims to
+/// protect*: a prompt that enumerates a secret in order to forbid it is a leak
+/// with one extra step, and the family of tenants this serves has never heard
+/// those words. Prime's bearing says "without exposing it" — and that includes
+/// not exposing it to the agent itself. The stop is therefore expressed by topic
+/// and provenance. The list of referents exists in exactly one place in this
+/// tree, under `#[cfg(test)]`, where the scan that enforces this reads it.
+pub const MIKA_DOCTRINE_BODY_OPERATOR: &str = "\"doctrine\", \"the Mika doctrine\", \"your stances\", \"your philosophy\", \"what you stand for\", \"what do you believe in\" — every one of these names THIS section. It is the ground truth for those questions. You hold the answer, so give it: answering that you found nothing of that name is wrong, not modest.\n\nMika's public stances, each with the reason it was taken:\n\n- **The engine that runs you is open source, under the MIT licence.** So that nobody has to depend on a single company for the assistant that knows their life. State this of the engine — never of every part of Mika.\n- **What a person confides in you belongs to that person.** This is a commitment about whose it is, not a statement about where it is kept.\n- **You are proactive.** An assistant that waits to be asked leaves the mental load on the person instead of taking a share of it.\n- **You remember what matters.** Having to reintroduce oneself at every conversation is the opposite of being assisted. The memory is a deliberate choice, not a side effect.\n- **Mika grows by invitation.** `## Distribution Doctrine` above is the ground truth for that stance; read it there rather than restating it here.\n\nWhere you run, and where a person's data is physically kept, is NOT answered from this section: the hosting line of `## Runtime` is the ground truth for those, and you answer them only from it.\n\nSome questions about Mika this section does not answer: a spiritual, esoteric or initiatory dimension, its origin, or anything else not written above. You do not know them and you will not invent them. That they are not laid out is a choice of Mika's creator. Say that plainly, without embarrassment, and leave it there.";
+
+/// Family-register body of the Mika Doctrine section (mika#2292).
+///
+/// **Same substance, no infrastructure vocabulary.** `FAMILY_SOUL` forbids "tout
+/// jargon technique … ou de l'infrastructure sous-jacente — jamais, même si on
+/// te le demande", and "open source / MIT / repository / self-hosting" is exactly
+/// that family. This is the crossing mika#2290 already settled, and its decision
+/// is carried over rather than relitigated: the same fact is written twice, the
+/// operator register carrying the full formulation and this one the same
+/// substance without a single technical term. No rule is derived from the account
+/// locale or from the tenant (Prime's 2026-09-09 ruling, carried over from
+/// mika#2023). What the family register drops is not an arbitrary amputation: it
+/// is the part of the doctrine that has **no meaning** for someone who owns no
+/// infrastructure.
+///
+/// **The stop establishes NO creator referent here, and that is a decision with
+/// a named cost.** Prime's bearing prescribes "it is the creator's choice";
+/// mika#1783 removed from `FAMILY_SOUL`, *on doctrinal grounds*, any origin story
+/// giving the being a referent it could then address — founding incident "Salut
+/// Vincent", closure `the-being-does-not-have-a-maker-it-knows-about`, guarded by
+/// `home::tests::family_soul_no_operator_name`. A narrow reading is available
+/// (the constraint forbids a *nameable, addressable* referent, not the abstract
+/// fact of having been made), but mika#1783 chose "no origin story" *against*
+/// alternatives, and reopening that is not a p2's to do. So: the operator
+/// register carries the bearing's formulation, this one carries a
+/// **referent-free** stop, which satisfies *both* doctrines. This constant is the
+/// single site to change if Vincent or Prime wants "creator" in this register
+/// too. Non-blocking either way: the material register — the object of the
+/// ticket — ships in both.
+pub const MIKA_DOCTRINE_BODY_FAMILY: &str = "\"doctrine\", \"la doctrine Mika\", \"tes partis pris\", \"ta philosophie\", \"en quoi tu crois\", \"what do you stand for\" — every one of these names THIS section. You know the answer to those questions: give it, warmly and simply. Saying you found nothing of that name is wrong.\n\nWhat you stand for, and why, in everyday words:\n\n- What the person tells you belongs to the person. It is theirs and it stays theirs.\n- You remember what counts for them, and it is on purpose: nobody should have to introduce themselves again at every conversation.\n- You notice and you offer, instead of waiting to be asked. Taking a share of the load is the whole point.\n- People come to you through someone who already knows you — never through advertising.\n\nWhere you run, and where what the person tells you is kept, is not answered here: the hosting line of `## Runtime` above says it, and it is the only thing you answer that from.\n\nThere are things about yourself that you do not know, and that you will not make up. If you are asked about them, say so simply and kindly, and move on.";
+
+/// Pick the doctrine body for a persona register (mika#2292).
+///
+/// Exhaustive `match`, **no `_ =>` arm** — the model is
+/// [`hosting_ground_truth_line`], itself modelled on
+/// `tools/mod.rs::dispatch_substrate_diagnostic`. The compiler, not a reviewer,
+/// is what forces a future `PersonaProfile` to take a decision rather than
+/// inherit one nobody took for it.
+fn doctrine_body(persona: PersonaProfile) -> &'static str {
+    match persona {
+        PersonaProfile::Operator => MIKA_DOCTRINE_BODY_OPERATOR,
+        PersonaProfile::Family => MIKA_DOCTRINE_BODY_FAMILY,
+    }
+}
+
+/// Write the Mika Doctrine section (mika#2292).
+///
+/// Code-managed, like its two sisters, and for the reasons measured in
+/// mika#2023 / mika#1814: it reaches **every existing tenant** at the next
+/// deploy with no provisioning gesture (`write_default_if_missing` never
+/// rewrites an existing `soul.md`, so a soul-side fix would have missed the one
+/// tenant actually measured); it cannot be evicted by an unreadable
+/// `identity.toml` (mika#2027's fail-closed sentinel evicts every skill); it
+/// cannot be weakened by an operator editing `soul.md`; and it is not
+/// conditioned on a keyword, which a skill trigger would be — and the measured
+/// defect *is* a lexical miss, so a keyword-triggered remedy would reproduce it.
+fn write_mika_doctrine_section(prompt: &mut String, persona: PersonaProfile) {
+    prompt.push_str(MIKA_DOCTRINE_HEADING);
+    prompt.push('\n');
+    prompt.push_str(doctrine_body(persona));
+    prompt.push_str("\n\n");
+}
+
 /// Filter a `search_preferences` result set down to strict stop-topic rows
 /// (mika#1813).
 ///
@@ -1073,6 +1203,34 @@ fn write_self_identity_discipline_section(prompt: &mut String) {
          \"Local\" is not a safe default: on a cloud tenant it is a false privacy \
          claim.\n\n",
     );
+    // mika#2292 — rule 6, the symmetric sibling of rule 5. The fact section is
+    // not enough on its own: the measured defect was a *use* of this discipline,
+    // not an absence of content — the tenant held every fragment of the answer
+    // and gave it in the same breath as "nothing found". So the scope widens
+    // once more, and the measured answer is forbidden by name.
+    //
+    // Composed by interpolating `MIKA_DOCTRINE_HEADING` rather than repeating the
+    // literal: a rename of the section must not be able to leave this rule green
+    // while pointing at a section that no longer exists — the silently-broken
+    // coupling `grooming_marker` (mika#2158) had to close on another surface.
+    //
+    // No signature change: the rule is register-neutral (it is a directive about
+    // *where to look*), and this section is already served as-is to the family
+    // tier with its tool names in backticks — `FAMILY_SOUL`'s jargon ban is on
+    // what the tenant *says*, not on what its prompt contains.
+    write!(
+        prompt,
+        "6. **What Mika is, what she stands for and why, is ground truth too.** \
+         \"What is the Mika doctrine?\", \"what are your stances?\", \"what is your \
+         philosophy?\", \"what do you believe in?\" are self-identity questions, \
+         exactly like \"which model are you?\". The `{MIKA_DOCTRINE_HEADING}` section \
+         above is the ground truth for them. Answering that you found nothing of \
+         that name is NOT acceptable while that section is present — you hold the \
+         answer, so give it. And answer it FROM this prompt: a question about what \
+         Mika is, is not a memory lookup, and an empty search result is not \
+         evidence that the thing does not exist.\n\n"
+    )
+    .unwrap();
     prompt.push_str(
         "This applies self-referentially: the anti-fabrication virtue you extend to \
          user-facing tasks (phone numbers, image contents, file paths) MUST also \
@@ -1225,6 +1383,22 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     // model reads. Code-managed (constants at top of file), NOT user-editable
     // via soul.md.
     write_distribution_doctrine_section(&mut prompt);
+    // mika#2292 — the material doctrine, aliased "doctrine", sits against its
+    // sister rather than inside `## Runtime`. Three reasons, strongest first:
+    // (1) `## Runtime` is a block of *machine* facts populated at execution time,
+    // where this is a block of *project* facts constant at the binary — merging
+    // them would make one section two things, and a section that grows without a
+    // frontier is the one a later ticket cuts in the wrong place; (2) the two
+    // doctrines read together, this body *citing* `## Distribution Doctrine`
+    // instead of re-narrating growth-by-invitation — a reference to the section
+    // immediately above is adjacency, a reference across `## Identity` and
+    // `## Runtime` is distance, and distance is what produced the measured
+    // defect; (3) the mika#1814 comment above already motivates this slot with
+    // "binds before identity/time/channel context", which holds word for word.
+    // Cost, named: rule 6 cites a section that is no longer its neighbour —
+    // mitigated by the citation naming it by heading, which is also why the test
+    // asserts *order* rather than adjacency.
+    write_mika_doctrine_section(&mut prompt, ctx.persona_profile);
     write_identity_section(&mut prompt, ctx.identity);
     // Runtime ground truth (mika#1815) — placed between Identity and Current Time
     // so the "who am I / what am I running on" block reads coherently. The
@@ -1659,6 +1833,22 @@ pub fn build_compact_system_prompt(ctx: &PromptContext<'_>) -> String {
     .unwrap();
     prompt.push('\n');
 
+    // mika#2292 carve-out, the fourth of this family and the same shape as the
+    // mika#1813 / mika#1814 / mika#2290 ones. The carve-out is decided **per
+    // section**, not globally: the compact path does render a doctrine — the
+    // mika#1798 abbreviated data-grade one below — because that one carries a
+    // HARD-NO invariant whose violation is irreversible and therefore worth its
+    // bytes. `## Mika Doctrine` is a *fact*, not a guard, so what is withheld
+    // here is the intent half and never a protection.
+    //
+    // Cost, named, and real here where it was not for mika#2290: on this path
+    // the measured defect **stays open** — a MikaModel tenant asked about "the
+    // doctrine" falls back on rule 3 for want of the section. Accepted because
+    // the measured population (Al's champion tenant) is not served by this path,
+    // and joined to the mika#1925 follow-up with the three other carve-outs
+    // rather than closed here with an exception. Pinned as a decision by
+    // `mika2292_compact_prompt_omits_the_doctrine_section`.
+    //
     // mika#1798: abbreviated non-transit doctrine — ~250 chars, hard-capped at
     // 400. Preserves the HARD-NO invariant even in the compact budget.
     write_data_grade_doctrine_section_compact(&mut prompt);
@@ -1743,6 +1933,12 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
     // that spontaneously drafts a Show HN would be exactly as bad as a
     // conversation-mode one. Same code-managed section, applied uniformly.
     write_distribution_doctrine_section(&mut prompt);
+    // mika#2292 — rendered on silent turns too, and for a reason of its own
+    // rather than by symmetry. The *material* register is harmless in silent
+    // mode; the **stop** is not. A silent turn that wrote a memory fact on the
+    // spiritual register would poison every later turn through core memory,
+    // which is re-injected into every prompt. Same section, same slot.
+    write_mika_doctrine_section(&mut prompt, ctx.persona_profile);
     write_identity_section(&mut prompt, ctx.identity);
     // Runtime ground truth (mika#1815) — heartbeat/callback/reflection turns
     // may still be asked "which model are you?" via a subsequent user message
@@ -5040,8 +5236,16 @@ inject = false
             for deployment in [Deployment::Local, Deployment::Cloud, Deployment::Unknown] {
                 let ctx = hosting_ctx(&identity, &memory, deployment, persona);
                 let prompt = build_system_prompt(&ctx);
+                // mika#2292 — anchor on the heading **at line start**, not on
+                // the first occurrence of the string. `## Mika Doctrine` refers
+                // the hosting question to `## Runtime` by name (inline, in
+                // backticks) and renders *before* it, so a bare `find` lands in
+                // that body and extracts the same block for all three
+                // deployments — this assertion would go red while the code under
+                // test is correct. A heading is a line, not a substring.
                 let runtime_pos = prompt
-                    .find("## Runtime")
+                    .find("\n## Runtime\n")
+                    .map(|i| i + 1)
                     .expect("Runtime section must be present");
                 let next_heading = prompt[runtime_pos + 2..]
                     .find("\n## ")
@@ -5240,6 +5444,482 @@ inject = false
         );
     }
 
+    // -----------------------------------------------------------------------
+    // mika#2292 — the material doctrine, aliased "doctrine"
+    //
+    // **Scope of V3–V7, and it is a decision rather than a convenience.** These
+    // five scans read **the two constants this ticket creates**, never the file
+    // and never the assembled prompt. Measured on `main` at 2026-09-18:
+    // `grep -rn "exportable" crates/mika-agent/src/ docs/architecture.md` returns
+    // **five** sites — one of them, the `(Operator, Cloud)` arm of
+    // `hosting_ground_truth_line`, a constant **served to the model** — and
+    // `grep -i "Prime\|hermetic"` over `prompt.rs` + `home.rs` returns twelve, of
+    // which none is served. A file-scoped V7 or V3 would therefore go red on its
+    // first run, against correct code: the road that wears a detector out until
+    // somebody disarms it. Each tempting widening is named below with the
+    // pre-existing violation it would light up.
+    // -----------------------------------------------------------------------
+
+    /// The referent list lives here and **only** here, under `#[cfg(test)]`, per
+    /// the form the fire-disposition doctrine prescribes for a structural list
+    /// ("scope it inside `#[cfg(test)] mod tests` so the production loader
+    /// cannot consult it at runtime"). It is not compiled in release, not
+    /// served, and not readable by the tenant — which is the whole point of
+    /// D3: a prompt that enumerates the secret in order to forbid it is a leak
+    /// with one extra step.
+    ///
+    /// **It holds the referents of AC3 and nothing else, and that boundary is
+    /// itself the decision.** A referent is a *thing that exists and is not
+    /// exposed*; the **name of the topic** ("spiritual", "esoteric",
+    /// "initiatory", "origin") is not one — it is the vocabulary D3 requires in
+    /// order to express a stop *by topic*. A first draft of this list carried
+    /// `esoteric` and `initiat`, and V3 duly went red on the body's own stop
+    /// sentence: a denylist that forbids naming the topic makes the topical stop
+    /// inexpressible, which leaves only the enumerative stop D3 exists to
+    /// refuse. If a later reader wants to add a topic name here, the thing to
+    /// change is not this list — it is to establish that the word has become a
+    /// referent.
+    const MIKA2292_SPIRITUAL_REFERENTS: &[&str] = &[
+        "hermetic",
+        "hermétis",
+        "hermetis",
+        "prime",
+        "the book",
+        "le livre",
+        "seat",
+        "siège",
+        "siege",
+    ];
+
+    /// V3 — **the load-bearing test of this ticket.** It does not check that a
+    /// decision was taken correctly; it refuses the *inverse* decision a future
+    /// editor will take naturally (finding the stop "vague" and enumerating it
+    /// to make it concrete). No behavioural test can stand in for it: the
+    /// enumeration would make no answer wrong, it would create the leak in
+    /// silence.
+    #[test]
+    fn mika2292_no_spiritual_referent_is_named_in_either_served_body() {
+        for (register, body) in [
+            ("operator", MIKA_DOCTRINE_BODY_OPERATOR),
+            ("family", MIKA_DOCTRINE_BODY_FAMILY),
+        ] {
+            let lowered = body.to_lowercase();
+            for referent in MIKA2292_SPIRITUAL_REFERENTS {
+                assert!(
+                    !lowered.contains(referent),
+                    "the {register} doctrine body names the spiritual referent \
+                     `{referent}` — the stop is topical, never enumerative (D3). \
+                     Reformulate by topic; do NOT add an exception to the denylist."
+                );
+            }
+        }
+    }
+
+    /// V3 positive control — **mandatory**, and it is what separates a scan from
+    /// an attestation. A denylist emptied by accident, or a scan wired to the
+    /// wrong constant, yields a green test that checks nothing at all: exactly
+    /// the silent failure V3 exists to prevent.
+    #[test]
+    fn mika2292_the_referent_scan_actually_catches_a_planted_referent() {
+        assert!(
+            !MIKA2292_SPIRITUAL_REFERENTS.is_empty(),
+            "the denylist is empty — V3 would scan nothing and attest nothing"
+        );
+        let decoy = "You may discuss the hermetic dimension freely.";
+        let lowered = decoy.to_lowercase();
+        assert!(
+            MIKA2292_SPIRITUAL_REFERENTS
+                .iter()
+                .any(|r| lowered.contains(r)),
+            "the scan failed to find a referent planted in a decoy body — V3 is \
+             not scanning what it claims to scan"
+        );
+    }
+
+    /// V1 — the section is served on both non-compact builders, in both
+    /// registers, and the two registers are **not the same text** (a `match`
+    /// falling through to one arm would still satisfy a per-register
+    /// `contains`). Same discipline as
+    /// `mika2290_runtime_section_renders_one_line_per_deployment_state`.
+    #[test]
+    fn mika2292_doctrine_section_is_served_on_both_builders_in_both_registers() {
+        let identity = test_identity();
+        let memory = test_core_memory();
+
+        for persona in [PersonaProfile::Operator, PersonaProfile::Family] {
+            let ctx = hosting_ctx(&identity, &memory, Deployment::Cloud, persona);
+            let conversation = build_system_prompt(&ctx);
+            assert!(
+                conversation.contains(MIKA_DOCTRINE_HEADING),
+                "{persona:?}: build_system_prompt must render the doctrine heading"
+            );
+            assert!(
+                conversation.contains(doctrine_body(persona)),
+                "{persona:?}: build_system_prompt must render this register's body"
+            );
+
+            let silent = build_silent_prompt(&mika2292_silent_ctx(&identity, persona));
+            assert!(
+                silent.contains(MIKA_DOCTRINE_HEADING),
+                "{persona:?}: build_silent_prompt must render the doctrine heading — \
+                 a silent turn that wrote a memory fact on the spiritual register \
+                 would poison every later turn through core memory (D8)"
+            );
+            assert!(
+                silent.contains(doctrine_body(persona)),
+                "{persona:?}: build_silent_prompt must render this register's body"
+            );
+        }
+
+        assert_ne!(
+            MIKA_DOCTRINE_BODY_OPERATOR, MIKA_DOCTRINE_BODY_FAMILY,
+            "the two registers rendered the same body — the persona match fell through"
+        );
+    }
+
+    /// V2 — the compact (MikaModel) path deliberately omits the section. Pinned
+    /// as a **decision**, joined to mika#1925 with the three sibling carve-outs.
+    /// Its cost is real here and is stated at the point of omission: on that path
+    /// the measured defect stays open.
+    #[test]
+    fn mika2292_compact_prompt_omits_the_doctrine_section() {
+        let identity = test_identity();
+        let memory = test_core_memory();
+        let ctx = hosting_ctx(
+            &identity,
+            &memory,
+            Deployment::Cloud,
+            PersonaProfile::Operator,
+        );
+        let compact = build_compact_system_prompt(&ctx);
+
+        assert!(
+            !compact.contains(MIKA_DOCTRINE_HEADING),
+            "the compact carve-out must not render `{MIKA_DOCTRINE_HEADING}`"
+        );
+        // Control: the carve-out is per-section, not a broken builder — the
+        // compact path DOES carry the mika#1798 abbreviated data-grade doctrine,
+        // which paid its bytes because it guards an irreversible HARD-NO.
+        assert!(
+            compact.contains("## Identity"),
+            "control: the compact builder still renders its other sections"
+        );
+        assert!(
+            compact.len() <= 5 * 1024,
+            "the carve-out exists for the ≤5 KB budget; compact prompt is {} bytes",
+            compact.len()
+        );
+    }
+
+    /// V4 — neither body can trip the mika#2290 guard 5d. True **by
+    /// construction**: both bodies carry no locality subject at all (the hosting
+    /// fact is referred to `## Runtime` rather than restated), so the predicate
+    /// has nothing to pair an assertion with — rather than true by the presence
+    /// of a conditional marker a later editor could reword away.
+    ///
+    /// Deliberately NOT widened to every prompt constant: that would go red on
+    /// `hosting_ground_truth_line(Local, Operator)`, which says "on the user's
+    /// own machine" — true, served, and never reachable under `Cloud` because
+    /// the match is exhaustive. An apparent violation, not a real one.
+    #[test]
+    fn mika2292_neither_body_trips_the_false_local_hosting_guard() {
+        for deployment in [Deployment::Cloud, Deployment::Unknown] {
+            for (register, body) in [
+                ("operator", MIKA_DOCTRINE_BODY_OPERATOR),
+                ("family", MIKA_DOCTRINE_BODY_FAMILY),
+            ] {
+                assert!(
+                    crate::evidence::guards::detect_false_local_hosting_claim(body, deployment)
+                        .is_none(),
+                    "the {register} doctrine body trips guard 5d under {deployment:?} — \
+                     reformulate the body; do NOT widen CLAIM_CONDITIONAL_MARKERS, whose \
+                     narrowness is the written motive of mika#2290"
+                );
+            }
+        }
+    }
+
+    /// V5 — the family body carries no infrastructure vocabulary. Same list and
+    /// same bilingual reasoning as
+    /// `mika2290_family_cloud_line_carries_no_infrastructure_jargon`: the persona
+    /// answers in French but the prompt is written in English, so a FR-only check
+    /// would pass over an English "repository" without noticing.
+    ///
+    /// Deliberately NOT widened to the family arm of `## Runtime`: that would go
+    /// red on "server", which that arm's own doc-comment admits by name as the
+    /// one concrete noun it keeps.
+    #[test]
+    fn mika2292_family_body_carries_no_infrastructure_jargon() {
+        let lowered = MIKA_DOCTRINE_BODY_FAMILY.to_lowercase();
+        for forbidden in [
+            "open source",
+            "open-source",
+            "mit",
+            "licence",
+            "license",
+            "repository",
+            "dépôt",
+            "depot",
+            "self-host",
+            "auto-héberg",
+            "server",
+            "serveur",
+            "container",
+            "conteneur",
+            "tenant",
+            "github",
+            "ticket",
+            "skill",
+            "agent",
+            "sqlite",
+            "stack",
+            "infrastructure",
+        ] {
+            assert!(
+                !lowered.contains(forbidden),
+                "the family doctrine body carries `{forbidden}` — FAMILY_SOUL forbids \
+                 « tout jargon technique … ou de l'infrastructure sous-jacente — jamais, \
+                 même si on te le demande » (D2)"
+            );
+        }
+
+        // Control: it still says the substance, rather than saying nothing.
+        assert!(
+            lowered.contains("belongs to the person") && lowered.contains("doctrine"),
+            "the family body must still carry the substance and its alias"
+        );
+        // Control: the operator body, by contrast, IS allowed the vocabulary —
+        // without this the test would pass on a body that said nothing at all.
+        let operator = MIKA_DOCTRINE_BODY_OPERATOR.to_lowercase();
+        assert!(
+            operator.contains("open source") && operator.contains("mit licence"),
+            "the operator body must carry the full formulation, MIT included"
+        );
+    }
+
+    /// V6 — the family body establishes **no creator referent** (D4). mika#1783
+    /// removed from `FAMILY_SOUL`, on doctrinal grounds, any origin story giving
+    /// the being a referent it could then address (founding incident "Salut
+    /// Vincent"; closure `the-being-does-not-have-a-maker-it-knows-about`,
+    /// guarded by `home::tests::family_soul_no_operator_name`). Prime's bearing
+    /// prescribes "it is the creator's choice" — carried by the *operator*
+    /// register, whose control rides in this same test so the asymmetry cannot
+    /// be read as an oversight.
+    #[test]
+    fn mika2292_family_body_establishes_no_creator_referent() {
+        let lowered = MIKA_DOCTRINE_BODY_FAMILY.to_lowercase();
+        for referent in [
+            "creator",
+            "créateur",
+            "createur",
+            "maker",
+            "vincent",
+            "made by",
+            "built by",
+            "created by",
+            "conçu par",
+            "origin",
+        ] {
+            assert!(
+                !lowered.contains(referent),
+                "the family doctrine body establishes the creator referent `{referent}` — \
+                 this is the single site to change if Vincent or Prime decides otherwise (D4)"
+            );
+        }
+
+        // Control: the operator register DOES carry the bearing's formulation.
+        assert!(
+            MIKA_DOCTRINE_BODY_OPERATOR
+                .to_lowercase()
+                .contains("choice of mika's creator"),
+            "the operator body must carry the bearing's formulation"
+        );
+    }
+
+    /// V7 — "exportable" is claimed in neither body (F5). The ticket forbids
+    /// claiming it unverified; this repository contains no export tool, route or
+    /// subcommand, and the tenant's data lives in `mika-cloud`, which is not in
+    /// this workspace — so the claim can be neither verified nor safely retracted
+    /// from here. This ticket therefore adds no sixth site.
+    #[test]
+    fn mika2292_no_exportable_claim_in_either_body() {
+        for (register, body) in [
+            ("operator", MIKA_DOCTRINE_BODY_OPERATOR),
+            ("family", MIKA_DOCTRINE_BODY_FAMILY),
+        ] {
+            assert!(
+                !body.to_lowercase().contains("exportable"),
+                "the {register} doctrine body claims `exportable`, which nothing in \
+                 this repository can verify (F5)"
+            );
+        }
+    }
+
+    /// V7's **named exception, with its self-cleaning assertion** — the option
+    /// (a) disposition the fire-disposition doctrine requires when a detector's
+    /// population is not empty. The one pre-existing site that is *served to the
+    /// model* is named by its function and its crossing, never by a line number.
+    ///
+    /// This assertion goes red the day the follow-up lands, which is exactly the
+    /// property the doctrine asks for — and it is stable, where an occurrence
+    /// count would drift on any added doc-comment.
+    #[test]
+    fn mika2292_the_named_exportable_exception_is_still_there() {
+        let served = hosting_ground_truth_line(Deployment::Cloud, PersonaProfile::Operator);
+        assert!(
+            served.to_lowercase().contains("exportable"),
+            "F5 has been dealt with upstream: remove this named exception and widen \
+             V7 to the five sites (see § Hors périmètre n°1 of the mika#2292 plan)"
+        );
+    }
+
+    /// V8 — `## Mika Doctrine` precedes `## Self-Identity Discipline`, whose
+    /// rule 6 cites it. **Order, not adjacency**: the section is deliberately
+    /// docked to `## Distribution Doctrine` rather than to `## Runtime` (D10),
+    /// so it is not the discipline's immediate neighbour, and the citation names
+    /// it by heading precisely so distance costs nothing.
+    #[test]
+    fn mika2292_doctrine_section_precedes_the_discipline_that_cites_it() {
+        let identity = test_identity();
+        let memory = test_core_memory();
+        for persona in [PersonaProfile::Operator, PersonaProfile::Family] {
+            let ctx = hosting_ctx(&identity, &memory, Deployment::Cloud, persona);
+            let prompt = build_system_prompt(&ctx);
+
+            let doctrine_pos = prompt
+                .find(MIKA_DOCTRINE_HEADING)
+                .expect("the doctrine section must be present");
+            let distribution_pos = prompt
+                .find(DISTRIBUTION_DOCTRINE_HEADING)
+                .expect("the distribution doctrine section must be present");
+            let discipline_pos = prompt
+                .find("## Self-Identity Discipline")
+                .expect("the discipline section must be present");
+
+            assert!(
+                distribution_pos < doctrine_pos,
+                "{persona:?}: the two doctrines must read together, the cited one first"
+            );
+            assert!(
+                doctrine_pos < discipline_pos,
+                "{persona:?}: the doctrine section must precede the rule that cites it"
+            );
+        }
+    }
+
+    /// V9 + V13a — rule 6 exists, carries the forbidden answer **literally**, and
+    /// stays **coupled** to the section it designates.
+    ///
+    /// V9 alone could not give this: it asserts a string is present, so a rename
+    /// of the section would leave rule 6 green while pointing at a section that
+    /// no longer exists — the silently-broken coupling `grooming_marker`
+    /// (mika#2158) had to close on another surface. The structural half is the
+    /// companion source scan below; this half asserts the two render *together*.
+    #[test]
+    fn mika2292_rule_six_names_the_section_and_forbids_the_measured_answer() {
+        let identity = test_identity();
+        let memory = test_core_memory();
+        let ctx = hosting_ctx(
+            &identity,
+            &memory,
+            Deployment::Cloud,
+            PersonaProfile::Operator,
+        );
+        let prompt = build_system_prompt(&ctx);
+
+        let discipline_pos = prompt
+            .find("## Self-Identity Discipline")
+            .expect("the discipline section must be present");
+        let discipline = &prompt[discipline_pos..];
+
+        assert!(
+            discipline.contains("What Mika is, what she stands for and why"),
+            "rule 6 must be present in the discipline section"
+        );
+        assert!(
+            discipline.contains(MIKA_DOCTRINE_HEADING),
+            "rule 6 must name the doctrine section by its heading — a rename must \
+             not be able to leave it pointing into the void"
+        );
+        assert!(
+            discipline.contains("found nothing of that name is NOT acceptable"),
+            "rule 6 must forbid the measured answer by name, not by paraphrase"
+        );
+        assert!(
+            discipline.contains("is not a memory lookup"),
+            "rule 6 must carry its second clause: the answer comes from this prompt, \
+             and an empty search result is not evidence of absence"
+        );
+        // Both halves render together, in the same prompt: the fact and the rule
+        // that points at it.
+        assert!(
+            prompt.contains(MIKA_DOCTRINE_BODY_OPERATOR),
+            "the fact half must render alongside the rule half"
+        );
+    }
+
+    /// V13a structural half — rule 6 is **composed by interpolating**
+    /// `MIKA_DOCTRINE_HEADING`, never by a copied literal. Source scan, because
+    /// this is the class no behavioural test can see: a copied literal makes no
+    /// answer wrong today and breaks the coupling only on the day of a rename,
+    /// when every assertion above would still be green.
+    #[test]
+    fn mika2292_the_heading_literal_has_exactly_one_site_in_production_code() {
+        let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/prompt.rs"))
+            .expect("prompt.rs must be readable from its own test module");
+        let production = source
+            .split_once("\nmod tests {")
+            .map(|(before, _)| before)
+            .unwrap_or(&source);
+
+        let occurrences = production
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//")
+            })
+            .filter(|line| line.contains(MIKA_DOCTRINE_HEADING))
+            .count();
+
+        assert_eq!(
+            occurrences, 1,
+            "the heading literal must appear exactly once in production code (its \
+             declaration). A second occurrence means a consumer — rule 6 above all — \
+             copied it instead of interpolating it, which is the coupling that breaks \
+             silently on a rename."
+        );
+    }
+
+    /// Build a silent-mode context for the mika#2292 assertions. Kept local to
+    /// this block rather than widening `hosting_ctx`, whose callers are the
+    /// mika#2290 series.
+    fn mika2292_silent_ctx<'a>(
+        identity: &'a Identity,
+        persona: PersonaProfile,
+    ) -> SilentPromptContext<'a> {
+        SilentPromptContext {
+            soul_content: "",
+            identity,
+            core_memory: &[],
+            pending_commitments: &[],
+            trigger_context: "heartbeat",
+            current_utc: test_time(),
+            timezone: None,
+            telegram_configured: false,
+            has_message_sender: true,
+            recent_conversations: None,
+            recent_audit_events: None,
+            home_dir: None,
+            task_health: None,
+            stored_preferences: &[],
+            stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
+            deployment: Deployment::Cloud,
+            persona_profile: persona,
+        }
+    }
+
     #[test]
     fn mika1815_runtime_section_carries_ground_truth_from_context() {
         let identity = test_identity();
@@ -5309,8 +5989,13 @@ inject = false
             persona_profile: PersonaProfile::Operator,
         };
         let prompt = build_system_prompt(&ctx);
+        // mika#2292 — anchor on the heading at line start; see the sibling note
+        // in `mika2290_runtime_section_renders_one_line_per_deployment_state`.
+        // This assertion still held with a bare `find` (the inline mention also
+        // precedes the discipline), but it was measuring the wrong position.
         let runtime_pos = prompt
-            .find("## Runtime")
+            .find("\n## Runtime\n")
+            .map(|i| i + 1)
             .expect("Runtime section must be present");
         let discipline_pos = prompt
             .find("## Self-Identity Discipline")

@@ -20,6 +20,103 @@ git config core.hooksPath .githooks
 
 This runs `cargo fmt --check` and `cargo clippy` on every commit, matching the CI checks exactly.
 
+## Garde d'écriture git hors worktree (mika#2107)
+
+Une session Claude Code enracinée dans un **worktree lié** ne peut pas exécuter
+de commande git **mutante** visant un arbre hors de ce worktree — typiquement le
+checkout principal dont dépend le déploiement. Le refus arrive **avant**
+l'exécution, pas après.
+
+Elle est livrée par `.claude/settings.json`, **suivi dans le dépôt** : elle
+arrive avec le checkout et n'a **aucune étape d'installation**. C'est délibéré —
+les deux mécanismes de hook de ce dépôt (`.githooks` ci-dessus et
+`lefthook.yml`) ont un taux d'installation mesuré de **zéro**, et mika#2107 a
+établi par l'expérience que la prose ne ferme pas cette classe : un document
+écrit après la troisième occurrence n'a pas empêché la quatrième, onze heures
+plus tard, sur le même répertoire.
+
+### Ce qui est refusé, et ce qui ne l'est pas
+
+Le prédicat a quatre termes conjoints :
+
+1. le project-dir de la session est un worktree lié (`.git` y est un fichier) ;
+2. la commande est une invocation git ;
+3. le verbe n'est **pas** dans l'allow-list de lecture ;
+4. l'arbre cible effectif n'est pas le worktree de la session.
+
+Le premier terme **exempte l'opérateur et l'humain par construction** : une
+session enracinée dans le checkout principal ou à la racine de l'espace de
+travail n'est jamais dans la population, donc `/mika-platform-sync-main` et la
+maintenance ordinaire ne paient rien.
+
+Le troisième est une **allow-list de lecture, pas une deny-list de mutation**.
+Une deny-list bâtie sur les mécanismes connus (`checkout`, `reset`) aurait
+manqué la moitié des occurrences mesurées — dont `git add`, la seule qui ait
+réellement expédié du code non revu en production. Tout verbe non classé est
+donc refusé lorsqu'il vise hors du worktree.
+
+### Lever un refus
+
+Le message de refus nomme l'arbre visé, le worktree de la session, le remède et
+la dérogation. Dans l'ordre de préférence :
+
+```bash
+git -C "$CLAUDE_PROJECT_DIR" <commande>     # viser son propre worktree
+MIKA_GUARD_SHARED_CHECKOUT=0 <commande>     # dérogation explicite, journalisée
+```
+
+### Sonde d'armement — et pourquoi elle est porteuse
+
+La garde est **fail-open** : un script absent, illisible ou rendant une sortie
+invalide **laisse passer** la commande. Un fail-closed coucherait toutes les
+sessions du dépôt — dispatches et orchestrateur en incident compris — pour un
+défaut de garde qui ne protège qu'une population résiduelle.
+
+**Ce que cet arbitrage coûte, écrit plutôt que découvert : une garde cassée se
+lit exactement comme une garde qui n'a jamais eu à firer.** D'où la ligne
+d'armement, qui est la seule chose distinguant les deux :
+
+```bash
+grep shared-checkout-guard ~/.mika/state/shared-checkout-guard.log
+```
+
+- `shared-checkout-guard: armed` à chaque démarrage de session → la garde est
+  chargée. **Son absence est l'information** : elle dit que le hook n'est pas
+  chargé, et non que rien n'a eu à être refusé.
+- `deny project=… target=… verb=…` → un refus. **Régime attendu : faible mais
+  non nul.** Un flux soutenu **ne se traite pas en élargissant la garde** : il
+  dit que les consignes de spawn font dériver le répertoire courant, et c'est
+  *cela* qu'il faut traiter.
+- `bypass MIKA_GUARD_SHARED_CHECKOUT=0` → une dérogation. Un contournement
+  silencieux serait pire que pas de garde ; celui-ci est daté.
+
+Le chemin du journal est surchargeable par `MIKA_GUARD_SHARED_CHECKOUT_LOG`.
+**L'échec d'écriture du journal ne change jamais la décision** — journaliser est
+une observation, pas un terme du prédicat ; une garde qui refuserait parce
+qu'elle n'a pas pu écrire son log serait un fail-closed déguisé.
+
+La commande journalisée est **scrubée avant d'être tronquée** (motifs alignés
+sur `crates/mika-agent/src/secret_scrubber.rs`, qui fait foi en cas de
+divergence) et le fichier est créé en `0600`. Ce scrub couvre les formes de
+jeton que ce dépôt connaît, pas toutes les formes possibles : le journal reste
+un fichier à ne pas publier tel quel.
+
+### Portée
+
+La garde ne gouverne que les sessions enracinées dans **ce** dépôt : elle ferme
+deux des quatre occurrences mesurées. Les deux autres visaient le checkout
+`claude-pilot`, monté en installation éditable — celui où « changer un fichier »
+et « déployer » sont le même acte. `scripts/guard-shared-checkout` est
+volontairement agnostique du dépôt pour que son portage y soit un vendoring plus
+trois lignes de `settings.json`, pas une réécriture.
+
+Elle défend contre l'**accident**, pas contre un adversaire : le bac à sable des
+dispatches (mika#2141) est le mur, cette garde est le garde-fou.
+
+Tests : `scripts/test-guard-shared-checkout.sh` (comportement, les quatre
+occurrences en fixtures) et `scripts/check-shared-checkout-guard-wiring.sh`
+(câblage), tous deux exécutés par le job CI `shared-checkout-guard-lint`.
+
 ## Development Workflow with Claude Code
 
 The recommended workflow uses the `/mika` slash command, which chains every step from planning through documentation:

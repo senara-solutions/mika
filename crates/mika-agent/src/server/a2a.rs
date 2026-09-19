@@ -42,6 +42,110 @@ impl Drop for BroadcasterGuard {
     }
 }
 
+/// Why an abandoned turn's row was closed (mika#2379). Stored in `tasks.result`
+/// as `{"a2a_close_reason": ...}` so `tasks/get` still reads the row.
+const TURN_ABANDONED_REASON: &str = "abandoned: the turn ended before writing a terminal \
+                                     state (caller disconnected, or the turn panicked)";
+
+/// Guarantees an A2A turn's task row ends in a terminal state (mika#2379).
+///
+/// `message/send` runs its turn inside the axum handler future. When the caller
+/// hangs up — `mika ask`'s client budget and the server's turn envelope are both
+/// 660 s in production, and the server's clock starts later — hyper drops that
+/// future mid-turn, neither the `completed` nor the `failed` write runs, and the
+/// row stays `in_progress` for ever with `updated_at == created_at`. A panic in
+/// the `message/stream` spawned task has the same shape.
+///
+/// Armed once the row exists, disarmed after the normal terminal write. Dropped
+/// while still armed, it closes the row as `cancelled` — conditionally, so a
+/// terminal state already written is never overwritten — and says so with one
+/// `a2a_turn_abandoned` WARN. `Drop` cannot await, so the write is spawned on the
+/// current runtime; with no runtime (process shutting down) the row is left to
+/// the startup recovery, which fails every A2A row a dead process left open.
+struct TurnGuard {
+    db: crate::async_db::AsyncDatabase,
+    task_id: String,
+    port: &'static str,
+    started: std::time::Instant,
+    armed: bool,
+}
+
+impl TurnGuard {
+    fn arm(db: &crate::async_db::AsyncDatabase, task_id: &str, port: &'static str) -> Self {
+        Self {
+            db: db.clone(),
+            task_id: task_id.to_string(),
+            port,
+            started: std::time::Instant::now(),
+            armed: true,
+        }
+    }
+
+    /// The turn wrote its own terminal state; nothing is left to close.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// Disarm only if the turn's own terminal write landed. A failed write
+    /// (e.g. `SQLITE_BUSY` on the shared database) leaves the guard armed, so
+    /// its conditional close becomes a second attempt instead of the row
+    /// staying `in_progress` until the next daemon restart.
+    fn settle(&mut self, terminal_write: anyhow::Result<()>) {
+        match terminal_write {
+            Ok(()) => self.disarm(),
+            Err(e) => tracing::warn!(
+                agent = %self.db.agent_id(),
+                task_id = %self.task_id,
+                port = self.port,
+                error = %e,
+                "a2a terminal write failed; the turn guard stays armed to close the row"
+            ),
+        }
+    }
+}
+
+impl Drop for TurnGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let elapsed_ms = self.started.elapsed().as_millis() as u64;
+        let (db, task_id, port) = (self.db.clone(), self.task_id.clone(), self.port);
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                agent = %db.agent_id(),
+                task_id = %task_id,
+                port,
+                "a2a turn abandoned with no runtime to close its row; left to startup recovery"
+            );
+            return;
+        };
+        handle.spawn(async move {
+            match db
+                .a2a_abandon_task_if_live(&task_id, TURN_ABANDONED_REASON)
+                .await
+            {
+                Ok(true) => tracing::warn!(
+                    event = "a2a_turn_abandoned",
+                    agent = %db.agent_id(),
+                    task_id = %task_id,
+                    port,
+                    elapsed_ms,
+                    "a2a turn ended without a terminal state; task marked cancelled"
+                ),
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    agent = %db.agent_id(),
+                    task_id = %task_id,
+                    port,
+                    error = %e,
+                    "failed to close an abandoned a2a turn; left to startup recovery"
+                ),
+            }
+        });
+    }
+}
+
 /// How a `message/stream` request reaches its turn (mika#2163).
 ///
 /// The two variants are two different contracts, not two encodings of one. On the
@@ -693,7 +797,12 @@ async fn handle_message_send(
             }
         }
     } else {
-        // Process synchronously: transition to working, run agent loop, return completed task
+        // Process synchronously: transition to working, run agent loop, return completed task.
+        //
+        // mika#2379: from here the turn runs inside this handler's future, which
+        // hyper drops if the caller hangs up. The guard closes the row if that
+        // happens before the terminal write below.
+        let mut turn_guard = TurnGuard::arm(&agent_state.db, &task_id, "send");
         let _ = agent_state
             .db
             .a2a_update_task_state(&task_id, "working")
@@ -721,20 +830,24 @@ async fn handle_message_send(
         .await
         {
             Ok(text) => {
-                let _ = agent_state
-                    .db
-                    .a2a_update_task_state(&task_id, "completed")
-                    .await;
+                turn_guard.settle(
+                    agent_state
+                        .db
+                        .a2a_update_task_state(&task_id, "completed")
+                        .await,
+                );
 
                 info!(task_id = %task_id, "A2A task completed via agent loop");
                 TurnText::Produced(text)
             }
             Err(e) => {
                 error!(error = %e, task_id = %task_id, "A2A agent loop failed");
-                let _ = agent_state
-                    .db
-                    .a2a_update_task_state(&task_id, "failed")
-                    .await;
+                turn_guard.settle(
+                    agent_state
+                        .db
+                        .a2a_update_task_state(&task_id, "failed")
+                        .await,
+                );
                 TurnText::LoopFailed
             }
         };
@@ -886,6 +999,9 @@ async fn handle_message_stream(
             map: broadcasters,
             key: task_id_clone.clone(),
         };
+        // mika#2379: a disconnect does not cancel this task, but a panic ends it
+        // without a terminal write. Armed first so every path below is covered.
+        let mut turn_guard = TurnGuard::arm(&agent_state_clone.db, &task_id_clone, "stream");
         let turn = StreamTurn {
             state: state_clone,
             agent_state: agent_state_clone,
@@ -902,7 +1018,7 @@ async fn handle_message_stream(
         // wait for and nothing to abandon.
         let slot = match entry {
             StreamLockEntry::Held(guard) => {
-                run_a2a_stream_turn(guard, turn).await;
+                run_a2a_stream_turn(guard, turn, turn_guard).await;
                 return;
             }
             StreamLockEntry::Waiting(slot) => slot,
@@ -925,11 +1041,11 @@ async fn handle_message_stream(
             biased;
             _ = turn.tx.closed() => {
                 info!(task_id = %turn.task_id, "a2a_queue_abandoned");
-                let _ = turn
+                turn_guard.settle(turn
                     .agent_state
                     .db
                     .a2a_update_task_state(&turn.task_id, "canceled")
-                    .await;
+                    .await);
                 return;
             }
             result = a2a_wait_queue::wait_for_agent_lock(
@@ -976,11 +1092,12 @@ async fn handle_message_stream(
                     task_id = %turn.task_id,
                     "a2a_queue_reject"
                 );
-                let _ = turn
-                    .agent_state
-                    .db
-                    .a2a_update_task_state(&turn.task_id, "failed")
-                    .await;
+                turn_guard.settle(
+                    turn.agent_state
+                        .db
+                        .a2a_update_task_state(&turn.task_id, "failed")
+                        .await,
+                );
                 let _ = turn
                     .tx
                     .send(StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
@@ -1020,7 +1137,7 @@ async fn handle_message_stream(
             }
         };
 
-        run_a2a_stream_turn(guard, turn).await;
+        run_a2a_stream_turn(guard, turn, turn_guard).await;
     });
 
     // Return SSE stream
@@ -1065,7 +1182,11 @@ struct StreamTurn {
 
 /// Run the streaming turn. The guard is taken by value and dropped with this
 /// future, so the agent lock is held for exactly the turn's lifetime.
-async fn run_a2a_stream_turn(_lock_guard: OwnedMutexGuard<()>, turn: StreamTurn) {
+async fn run_a2a_stream_turn(
+    _lock_guard: OwnedMutexGuard<()>,
+    turn: StreamTurn,
+    mut turn_guard: TurnGuard,
+) {
     let StreamTurn {
         state,
         agent_state,
@@ -1125,10 +1246,12 @@ async fn run_a2a_stream_turn(_lock_guard: OwnedMutexGuard<()>, turn: StreamTurn)
             let text = response_text.unwrap_or_else(|| COMPLETED_WITHOUT_TEXT.to_string());
             let response_message = agent_text_message(&task_id, context_id.clone(), text);
 
-            let _ = agent_state
-                .db
-                .a2a_update_task_state(&task_id, "completed")
-                .await;
+            turn_guard.settle(
+                agent_state
+                    .db
+                    .a2a_update_task_state(&task_id, "completed")
+                    .await,
+            );
 
             // Send completion event
             let _ = tx.send(StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
@@ -1145,10 +1268,12 @@ async fn run_a2a_stream_turn(_lock_guard: OwnedMutexGuard<()>, turn: StreamTurn)
         }
         Err(e) => {
             error!(error = %e, task_id = %task_id, "A2A streaming agent loop failed");
-            let _ = agent_state
-                .db
-                .a2a_update_task_state(&task_id, "failed")
-                .await;
+            turn_guard.settle(
+                agent_state
+                    .db
+                    .a2a_update_task_state(&task_id, "failed")
+                    .await,
+            );
 
             let _ = tx.send(StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
                 task_id: task_id.clone(),
@@ -1870,5 +1995,144 @@ mod tests {
             "expected exactly one write to the cached registry (the dirty-reload); \
              found {writebacks} — a restricted registry must never be one of them"
         );
+    }
+
+    // --- mika#2379: an A2A turn always ends in a terminal state ---------------
+
+    async fn guard_db() -> crate::async_db::AsyncDatabase {
+        let db = crate::async_db::AsyncDatabase::new_with_agent(
+            crate::db::Database::open_in_memory().unwrap(),
+            "mika",
+        );
+        db.a2a_create_task("t1", None, None).await.unwrap();
+        db
+    }
+
+    async fn row(db: &crate::async_db::AsyncDatabase) -> (String, Option<String>) {
+        db.with_db(|d| {
+            Ok(d.conn.query_row(
+                "SELECT t.status, t.result FROM tasks t
+                 JOIN a2a_task_map m ON m.task_id = t.id WHERE m.a2a_task_id = 't1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The guard's write is spawned from `Drop`; give it a bounded chance to land.
+    async fn settled_row(db: &crate::async_db::AsyncDatabase) -> (String, Option<String>) {
+        for _ in 0..200 {
+            let r = row(db).await;
+            if r.0 != "in_progress" && r.0 != "pending" {
+                return r;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        row(db).await
+    }
+
+    #[tokio::test]
+    async fn mika2379_an_armed_guard_dropped_cancels_the_row() {
+        let db = guard_db().await;
+        db.a2a_update_task_state("t1", "working").await.unwrap();
+
+        drop(TurnGuard::arm(&db, "t1", "send"));
+
+        let (status, result) = settled_row(&db).await;
+        assert_eq!(status, "cancelled");
+        assert_eq!(
+            result.as_deref(),
+            Some(crate::a2a_db::a2a_close_reason_metadata(TURN_ABANDONED_REASON).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn mika2379_a_disarmed_guard_leaves_the_terminal_write_alone() {
+        let db = guard_db().await;
+        db.a2a_update_task_state("t1", "working").await.unwrap();
+        let mut guard = TurnGuard::arm(&db, "t1", "send");
+        db.a2a_update_task_state("t1", "completed").await.unwrap();
+        guard.disarm();
+        drop(guard);
+
+        // Nothing was spawned; a short wait proves no late write lands either.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(row(&db).await.0, "completed");
+    }
+
+    #[tokio::test]
+    async fn mika2379_a_guard_dropped_after_a_terminal_write_does_not_overwrite_it() {
+        let db = guard_db().await;
+        let guard = TurnGuard::arm(&db, "t1", "send");
+        db.a2a_update_task_state("t1", "failed").await.unwrap();
+        drop(guard); // still armed: the race the conditional write exists for
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(row(&db).await, ("failed".to_string(), None));
+    }
+
+    /// The disconnect shape: hyper drops the handler future while it is parked on
+    /// the agent turn. Here the turn is a future that never resolves.
+    #[tokio::test]
+    async fn mika2379_dropping_the_turn_future_mid_await_cancels_the_row() {
+        let db = guard_db().await;
+        db.a2a_update_task_state("t1", "working").await.unwrap();
+        let turn_db = db.clone();
+        let turn = async move {
+            let mut guard = TurnGuard::arm(&turn_db, "t1", "send");
+            std::future::pending::<()>().await;
+            guard.disarm();
+        };
+        // The caller's budget runs out: `timeout` drops the parked future, which
+        // is exactly what hyper does to the handler when the client hangs up.
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(20), turn).await;
+        assert!(
+            outcome.is_err(),
+            "the turn must still be parked when dropped"
+        );
+
+        assert_eq!(settled_row(&db).await.0, "cancelled");
+    }
+
+    /// A terminal write that fails leaves the guard armed, so the row is still
+    /// closed rather than left `in_progress` until the next restart.
+    #[tokio::test]
+    async fn mika2379_a_failed_terminal_write_keeps_the_guard_armed() {
+        let db = guard_db().await;
+        db.a2a_update_task_state("t1", "working").await.unwrap();
+        let mut guard = TurnGuard::arm(&db, "t1", "send");
+        guard.settle(Err(anyhow::anyhow!("database is locked")));
+        drop(guard);
+
+        assert_eq!(settled_row(&db).await.0, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn mika2379_a_landed_terminal_write_disarms_the_guard() {
+        let db = guard_db().await;
+        db.a2a_update_task_state("t1", "working").await.unwrap();
+        let mut guard = TurnGuard::arm(&db, "t1", "send");
+        guard.settle(db.a2a_update_task_state("t1", "completed").await);
+        drop(guard);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(row(&db).await.0, "completed");
+    }
+
+    #[tokio::test]
+    async fn mika2379_a_panicking_stream_turn_cancels_the_row() {
+        let db = guard_db().await;
+        db.a2a_update_task_state("t1", "working").await.unwrap();
+        let turn_db = db.clone();
+        let joined = tokio::spawn(async move {
+            let _guard = TurnGuard::arm(&turn_db, "t1", "stream");
+            panic!("simulated turn panic");
+        })
+        .await;
+        assert!(joined.unwrap_err().is_panic());
+
+        assert_eq!(settled_row(&db).await.0, "cancelled");
     }
 }
