@@ -1311,6 +1311,64 @@ surfaces that already existed: `system_prompt_assembled.active_skill_count` /
 **Both must move together** — one moving alone means the measurement is wrong, not
 the system.
 
+### Per-turn model override over A2A (mika#2304)
+
+Sister key of `mika.only_skills`, same channel, **opposite failure policy** — and
+the asymmetry is the design decision, not an oversight.
+
+`message/send` and `message/stream` read `mika.model_override`
+(`mika_a2a::params::MODEL_OVERRIDE_KEY`), the raw string the operator typed.
+`resolve_caller_model_override` resolves it against **this** agent's
+`llm_provider` (alias → conditional prefix strip → API-key check, all in
+`mika_common::llm::model_override`, the single site `mika-cli` also calls) and
+builds a provider for the turn. `run_a2a_agent` passes it as `AgentParams.llm`
+and sets `caller_model_override: true`, which makes `resolve_skill_llm_override`
+stand down — an operator running a provider pre-flight must not have their model
+replaced by a skill's `[llm]` section.
+
+**Reading is fail-soft; applying is fail-CLOSED.** Key absent, `null`,
+non-string, blank → no override, and the turn is the pre-mika#2304 turn byte for
+byte. But a **declared** override this agent cannot serve refuses the request,
+before the task row exists and before the agent lock is taken, as a JSON-RPC
+`INVALID_PARAMS` naming the model and the provider. It is never degraded to "no
+override": a skill restriction silently dropped makes a turn *wider*, which is
+visible and falsifies no measurement; a model silently dropped makes the
+measurement **wrong while producing a plausible answer** — the founding defect.
+
+**The key check precedes the construction, and that order is load-bearing.**
+`create_provider_with_budget` routes the ten OpenAI-compatible variants —
+OpenRouter among them, the rail the founding measurement ran on — to
+`OpenAiCompatibleProvider::new`, which returns no `Result` and never consults
+`api_key`. A missing key therefore *succeeds* at construction, so the refusal has
+to be **posed**, never hoped for. Pinned by
+`server::a2a::tests::mika2304_the_key_is_checked_before_the_provider_is_built`. What
+no layer can check before the call is whether the provider serves that model id:
+an unknown id fails on the provider's own 400/404, already fail-closed, with
+nothing to write.
+
+**The attestation is taken where the turn was served, not where it was handed
+in.** `AgentOutput.effective_model` is filled in `run_agent_inner` from
+`effective_llm` — *after* the per-skill recompute — and `handle_message_send`
+stamps it on `Task.metadata` under `mika.effective_model` at the mika#2270
+intervention point. Reading it in `a2a.rs` off `agent_state.llm` would compile and
+be wrong on exactly the per-skill population: a field asserting a model that did
+not run, wearing the authority of a server attestation. Written on **every** turn,
+override or not, so the client can read absence as "this server did not say" and
+refuse to print a local value.
+
+**Scope, stated rather than assumed:** synchronous `message/send` — the path both
+doors of `mika ask` take. `message/stream` refuses an unserviceable override
+identically (same key, same policy) but stamps nothing: it serves events, not a
+rebuilt `Task`. `returnImmediately` runs no turn, so there is nothing to attest.
+Both fall in the honest "not attested" population.
+
+**Operator grep signals** (`$MIKA_SPIRIT_LOG_FILE`): `a2a_model_override_applied`
+(INFO — a turn ran under a caller's model; expected rare, correlated with
+pre-flight campaigns; a sustained flow means an automated caller is imposing one
+and deserves identifying) and `a2a_model_override_refused` (WARN — **expected
+regime: zero lines**; each one names a model or a missing API key, i.e. an
+operator typo or an unconfigured agent, not a defect of the channel).
+
 **Transient enable/disable overrides (#682):** Two methods handle per-invocation skill overrides, called after `apply_overrides()` (disable first, enable second — matches Phase 0/1 pattern): (1) `SkillRegistry::apply_transient_disable(skill_names)` evicts named skills from the registry entirely for a single CLI invocation. Returns `TransientDisableResult` with `not_found` list. Used by `mika ask --disable-skill <name>` (repeatable). (2) `SkillRegistry::apply_transient_always_on(skill_names)` sets `always_on = true` on named skills. Returns `TransientOverrideResult` with separate `disabled` and `not_found` lists. Cannot resurrect disabled (evicted) or skipped skills. Used by `mika ask --enable-skill <name>` (repeatable). Neither is persisted. Conflict check: same skill name in both flags produces a hard error before any registry ops.
 
 **Oversized prompt handling (#630):** Skills with prompts exceeding their size limit are hard-skipped at scan time (pushed to `ScanResult.skipped`) regardless of `always_on` status. This prevents zombie skills with tools but no prompt context. Tool-only skills (no `system_prompt.md`) are unaffected — they load with an empty prompt via `SnippetLoadResult::Empty`.

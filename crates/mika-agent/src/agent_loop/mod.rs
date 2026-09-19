@@ -397,6 +397,28 @@ pub struct AgentOutput {
     /// so there the residue is the WARN and the audit row, whose correct reader
     /// is the operator.
     pub undelivered_sends: Option<UndeliveredSends>,
+    /// The model that actually served this turn, `provider/model` (mika#2304).
+    ///
+    /// **Why the field is here and not at the call site.** `server::a2a` holds
+    /// `agent_state.llm` — the provider it *handed in*. This function recomputes
+    /// the effective one a few lines later (`resolve_skill_llm_override`), so an
+    /// attestation read at the entry site would report a model that did not
+    /// serve whenever a matched skill carries an `[llm]` override. That is the
+    /// very defect mika#2304 exists to close (a field asserting an override that
+    /// did not happen), displaced by one hop and wearing the authority of a
+    /// server attestation instead of a local guess.
+    ///
+    /// Same reasoning for the shape as [`Self::deadline_exceeded`] two fields
+    /// above: a field rather than a widened return type, because the callers of
+    /// `run_agent` already consume this struct.
+    ///
+    /// `Some` on every path that produces an `AgentOutput` — the three
+    /// construction sites, deadline fallback included. A turn that fails *before*
+    /// the recompute (`load_agent_context`, `get_customer_config`) returns `Err`
+    /// and produces no output to attest; that population is honestly "not
+    /// attested", which is what the CLI renders as an absent model rather than a
+    /// local value.
+    pub effective_model: Option<String>,
 }
 
 /// What a caller needs to know about a turn cut off by its envelope (mika#2276).
@@ -4016,6 +4038,20 @@ pub struct AgentParams<'a> {
     /// Settings for per-skill LLM provider overrides. When a matched skill declares
     /// `[llm].provider`, this is used to construct the per-skill provider instance.
     pub settings: Option<&'a Settings>,
+    /// This turn's caller named the model (mika#2304, D7).
+    ///
+    /// `true` only when a `message/send` carried `mika.model_override` and the
+    /// server honoured it — in which case `llm` above is the provider built from
+    /// the caller's id, and `resolve_skill_llm_override` stands down so a matched
+    /// skill's `[llm]` section cannot displace it. An operator running a provider
+    /// pre-flight must not have their model silently swapped; that is the same
+    /// false measurement this ticket closes, one hop away.
+    ///
+    /// **This is the whole channel, and it is deliberately a `bool`.** The model
+    /// itself is already in `llm`; a second copy of the id here would be a second
+    /// place for the two to disagree. `false` everywhere else, including the team
+    /// path, which reads `TeamAgentParams` and so cannot see this field at all.
+    pub caller_model_override: bool,
     /// Optional external trace_id (e.g. from HTTP request_id). If None, a new one is generated.
     pub trace_id: Option<String>,
     /// Optional task_id for observability correlation. When a `mika ask` call is associated
@@ -4304,8 +4340,12 @@ async fn run_agent_inner(
     for &idx in context_exclude.iter().rev() {
         matched.remove(idx);
     }
-    // Resolve per-skill LLM override (keyword-matched skills only — #463)
-    let skill_llm_override = resolve_skill_llm_override(&matched, params.settings, llm);
+    // Resolve per-skill LLM override (keyword-matched skills only — #463).
+    // mika#2304 D7: a caller that named a model wins over a skill's `[llm]`
+    // section — otherwise the operator's `--model` would be replaced in silence,
+    // which is the same false measurement this ticket closes, one hop away.
+    let skill_llm_override =
+        resolve_skill_llm_override(&matched, params.settings, llm, params.caller_model_override);
     let matched_entries: Vec<&SkillEntry> = matched.iter().map(|m| m.entry).collect();
     let effective_llm: &dyn LlmProvider = match &skill_llm_override {
         Some(override_llm) => override_llm.as_ref(),
@@ -4314,6 +4354,10 @@ async fn run_agent_inner(
 
     let provider = effective_llm.provider_name();
     let model = effective_llm.model_name();
+    // mika#2304 V8a: the attestation, taken on the provider that will serve —
+    // never on `llm`, the one handed in. Both values are already read for the
+    // request and for `turn_usage`, so this adds a format, not a computation.
+    let effective_model_attestation = Some(attest_effective_model(effective_llm));
     let (mut skill_tool_defs, prompt_variant, per_skill_bytes) = inject_skills_and_resolve_tools(
         &matched_entries,
         tools,
@@ -4677,8 +4721,21 @@ async fn run_agent_inner(
         );
         // Prelude gate: the loop was never entered, so zero steps ran and no
         // send was attempted.
-        return persist_deadline_fallback(db, session_id, trace_id, params.internal, None, 0, None)
-            .await;
+        // mika#2304: the prelude gate runs *after* the effective provider is
+        // resolved, so this path attests too. T5's claim is "every turn that
+        // produces an `AgentOutput` attests" — no exception, including the one
+        // that never entered the loop.
+        return persist_deadline_fallback(
+            db,
+            session_id,
+            trace_id,
+            params.internal,
+            None,
+            0,
+            None,
+            effective_model_attestation,
+        )
+        .await;
     }
 
     let store_llm = params.settings.is_none_or(|s| s.store_llm_calls);
@@ -4765,6 +4822,7 @@ async fn run_agent_inner(
             usage,
             deadline_exceeded: None,
             undelivered_sends: undelivered,
+            effective_model: effective_model_attestation,
         }),
         LoopResult::MaxStepsExceeded {
             thinking,
@@ -4795,6 +4853,7 @@ async fn run_agent_inner(
                     // continuation turn.
                     crate::planning::policy::MAX_TOOL_STEPS,
                     undelivered,
+                    effective_model_attestation,
                 )
                 .await;
             }
@@ -4836,6 +4895,7 @@ async fn run_agent_inner(
                 // out of steps — the continuation summary says nothing about
                 // delivery.
                 undelivered_sends: undelivered,
+                effective_model: effective_model_attestation,
             })
         }
         LoopResult::DeadlineExceeded {
@@ -4849,6 +4909,7 @@ async fn run_agent_inner(
                 scope_task_id,
                 steps_completed,
                 undelivered,
+                effective_model_attestation,
             )
             .await
         }
@@ -4865,6 +4926,10 @@ async fn run_agent_inner(
 /// return through here, the flag cannot be set on two of them and forgotten on
 /// the third — the fan-out shape that `feedback_structural_gate_audit_grep_all_callsites`
 /// warns about.
+// Eight parameters, and the last three are the point: each is a fact the three
+// deadline call sites hold and this function cannot recompute. Bundling them into
+// a struct would add a type whose only job is to be destructured here.
+#[allow(clippy::too_many_arguments)]
 async fn persist_deadline_fallback(
     db: &AsyncDatabase,
     session_id: &str,
@@ -4876,6 +4941,15 @@ async fn persist_deadline_fallback(
     // admission as one that concludes; carried in rather than recomputed so this
     // function stays the single stamping site for both fields.
     undelivered_sends: Option<UndeliveredSends>,
+    // mika#2304 V8a — carried in for the same reason as `undelivered_sends`
+    // above: this is the third `AgentOutput` construction site and the only one
+    // outside `run_agent_inner`'s own scope, so it is the one that can be
+    // forgotten without any other test going red. A turn cut off by its envelope
+    // *did* run under a model, and that is precisely the population an operator
+    // investigates. Never `None` on this path in practice: the prelude gate runs
+    // after the effective provider is resolved, so all three deadline call sites
+    // have a value to hand in.
+    effective_model: Option<String>,
 ) -> Result<AgentOutput> {
     let fallback = "I'm sorry, that took too long. Let me try a simpler approach next time.";
     db.save_message_with_task_context(
@@ -4895,6 +4969,7 @@ async fn persist_deadline_fallback(
         // mika#2276 M2: the one place that says "cut off, not concluded".
         deadline_exceeded: Some(DeadlineOverrun { steps_completed }),
         undelivered_sends,
+        effective_model,
     })
 }
 
@@ -6102,8 +6177,17 @@ async fn run_team_agent_inner_impl(
         params.session_id,
         stage_prev,
     );
-    // Resolve per-skill LLM override (keyword-matched skills only — #463)
-    let skill_llm_override = resolve_skill_llm_override(&matched, params.settings, llm);
+    // Resolve per-skill LLM override (keyword-matched skills only — #463).
+    //
+    // mika#2304 D7: `false`, and NOT an oversight. The caller-model-override
+    // channel is a field of `AgentParams`; this function reads `TeamAgentParams`,
+    // a distinct struct, so no caller of a team run can express the intent this
+    // argument would carry. `message/send` reaches `run_agent_inner` only
+    // (`server::a2a` calls `agent::run_agent`), and no team-run caller can ask
+    // for a model. The precedence therefore has exactly one site, by typing
+    // rather than by discipline. A future `true` here would need a channel
+    // first.
+    let skill_llm_override = resolve_skill_llm_override(&matched, params.settings, llm, false);
     let matched_entries: Vec<&SkillEntry> = matched.iter().map(|m| m.entry).collect();
     let effective_llm: &dyn LlmProvider = match &skill_llm_override {
         Some(override_llm) => override_llm.as_ref(),
@@ -6472,10 +6556,33 @@ fn build_skill_tool_map<'a>(matched: &[&'a SkillEntry]) -> HashMap<String, &'a R
 ///
 /// **Same-provider short-circuit:** If the override matches the current active provider and
 /// model, no new instance is constructed.
+/// Format the attestation a turn owes its caller (mika#2304, D3).
+///
+/// `provider/model`, the same shape `mika ask --verbose` has always printed —
+/// the change is where the two halves come from, not how they read.
+///
+/// **The argument must be the provider that SERVED the turn.** Passing the one
+/// handed into `run_agent_inner` compiles just as well and is wrong whenever a
+/// matched skill carries an `[llm]` override: the field would then assert, with
+/// the authority of a server attestation, a model that did not run — which is
+/// the founding defect of mika#2304 moved one hop downstream.
+pub(crate) fn attest_effective_model(served_by: &dyn LlmProvider) -> String {
+    format!("{}/{}", served_by.provider_name(), served_by.model_name())
+}
+
+///
+/// `caller_model_override` is mika#2304 D7: when the turn's caller named a model
+/// (`mika ask --model`, carried to the server in `mika.model_override`), this
+/// function stands down. An operator running a provider pre-flight must not have
+/// their model silently replaced by a skill's `[llm]` section — that is the same
+/// false measurement the ticket closes, displaced by one hop. Only
+/// `run_agent_inner` can pass `true`; see the call site in
+/// `run_team_agent_inner_impl` for why the team path cannot.
 fn resolve_skill_llm_override(
     matched: &[MatchedSkill<'_>],
     settings: Option<&Settings>,
     default_llm: &dyn LlmProvider,
+    caller_model_override: bool,
 ) -> Option<Arc<dyn LlmProvider>> {
     // Collect unique (provider, model) override pairs from qualifying skills.
     //
@@ -6512,6 +6619,21 @@ fn resolve_skill_llm_override(
     }
 
     if overrides.is_empty() {
+        return None;
+    }
+
+    // mika#2304 D7. Tested here rather than at the top of the function on
+    // purpose: the abstention is only worth saying when there was something to
+    // abstain from, and an operator reading the log needs to know their `--model`
+    // displaced a skill's declared provider rather than merely coexisting with
+    // it. The attestation (`AgentOutput::effective_model`) is the second half —
+    // if this precedence were ever miswired, the operator would still read the
+    // model that really served.
+    if caller_model_override {
+        info!(
+            skills = ?override_skills,
+            "caller named a model for this turn — per-skill [llm] override stands down (mika#2304)"
+        );
         return None;
     }
 
@@ -11170,7 +11292,7 @@ mod tests {
             .model_name("claude-sonnet-4-6")
             .build();
         let matched: Vec<MatchedSkill<'_>> = vec![];
-        assert!(resolve_skill_llm_override(&matched, None, &mock).is_none());
+        assert!(resolve_skill_llm_override(&matched, None, &mock, false).is_none());
     }
 
     #[test]
@@ -11191,7 +11313,7 @@ mod tests {
             reason: MatchReason::AlwaysOn,
         }];
         assert!(
-            resolve_skill_llm_override(&matched, None, &mock).is_none(),
+            resolve_skill_llm_override(&matched, None, &mock, false).is_none(),
             "always_on skills should not impose [llm] override"
         );
     }
@@ -11210,7 +11332,7 @@ mod tests {
             reason: MatchReason::Dependency,
         }];
         assert!(
-            resolve_skill_llm_override(&matched, None, &mock).is_none(),
+            resolve_skill_llm_override(&matched, None, &mock, false).is_none(),
             "dependency skills should not impose [llm] override"
         );
     }
@@ -11241,7 +11363,7 @@ mod tests {
         ];
         // skill-review has no [llm], self-dev is AlwaysOn → no override
         assert!(
-            resolve_skill_llm_override(&matched, None, &mock).is_none(),
+            resolve_skill_llm_override(&matched, None, &mock, false).is_none(),
             "only keyword-matched skills with [llm] should produce an override"
         );
     }
@@ -11267,7 +11389,7 @@ mod tests {
         // Should attempt override — will return None because Settings is None,
         // but the important thing is it doesn't return None at the "no overrides" early exit.
         // We verify by checking overrides were collected (Settings absence causes the fallback path).
-        let result = resolve_skill_llm_override(&matched, None, &mock);
+        let result = resolve_skill_llm_override(&matched, None, &mock, false);
         // Without Settings, can't construct provider — returns None via the "requires Settings" path.
         // But the function got past the "overrides.is_empty()" check, proving keyword was considered.
         assert!(result.is_none()); // Expected: Settings=None means it can't construct
@@ -11291,7 +11413,7 @@ mod tests {
             reason: MatchReason::Keyword,
         }];
         assert!(
-            resolve_skill_llm_override(&matched, None, &mock).is_none(),
+            resolve_skill_llm_override(&matched, None, &mock, false).is_none(),
             "same provider+model should short-circuit to None"
         );
     }
@@ -11316,7 +11438,7 @@ mod tests {
         // Should attempt override — will return None because Settings is None,
         // but the important thing is it gets past the "overrides.is_empty()" check.
         // Without Settings, can't construct provider — returns None via the "requires Settings" path.
-        let result = resolve_skill_llm_override(&matched, None, &mock);
+        let result = resolve_skill_llm_override(&matched, None, &mock, false);
         assert!(result.is_none()); // Expected: Settings=None means it can't construct
         // The real verification is that this does NOT return None at the early
         // "overrides.is_empty()" exit — same pattern as the keyword test above.
@@ -11343,7 +11465,7 @@ mod tests {
             reason: MatchReason::AlwaysOn,
         }];
         assert!(
-            resolve_skill_llm_override(&matched, None, &mock).is_none(),
+            resolve_skill_llm_override(&matched, None, &mock, false).is_none(),
             "AlwaysOn with non-DB [llm] should not impose override (#463 regression guard)"
         );
     }
@@ -11363,7 +11485,7 @@ mod tests {
             reason: MatchReason::Dependency,
         }];
         assert!(
-            resolve_skill_llm_override(&matched, None, &mock).is_none(),
+            resolve_skill_llm_override(&matched, None, &mock, false).is_none(),
             "dependency skills with DB override should still not impose [llm] override"
         );
     }
@@ -11416,7 +11538,7 @@ mod tests {
         // Resolution returns None because Settings is None (cannot construct provider),
         // but the early-exit at overrides.is_empty() is NOT taken — proving the
         // carve-out lets the entry through.
-        let _ = resolve_skill_llm_override(&matched_callback, None, &mock);
+        let _ = resolve_skill_llm_override(&matched_callback, None, &mock, false);
 
         // Shape B — SilentTrigger::DeferredDispatch: identical matched-skill
         // construction to Callback. Same carve-out behavior expected.
@@ -11433,7 +11555,7 @@ mod tests {
             qualifies_deferred,
             "DeferredDispatch turn: AlwaysOn skill with from_db_override=true must qualify for override"
         );
-        let _ = resolve_skill_llm_override(&matched_deferred, None, &mock);
+        let _ = resolve_skill_llm_override(&matched_deferred, None, &mock, false);
 
         // Negative control — same skill without from_db_override (developer-time
         // skill.toml [llm] source) must NOT qualify. #463 protection holds for

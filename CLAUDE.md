@@ -917,6 +917,76 @@ Observabilité du budget effectif + garde de demi-configuration (mika#2293) :
   par une variable d'environnement fleet-wide — voir la garde ci-dessus pour
   pourquoi.
 
+`mika ask --model` atteint enfin l'exécutant, et `--verbose` cesse de répondre à sa place (mika#2304) :
+- **Le défaut, et il est plus large que le ticket ne le dit.** Le ticket vise
+  `--remote` ; les deux portes étaient cassées. Depuis mika#1727, `mika ask` **sans**
+  `--remote` passe aussi par A2A (`{spirit_url}/a2a/{agent}`, sans repli en process),
+  et le commentaire de `ask.rs` l'énonçait mot pour mot : *« `--model` configure the
+  local registry/LLM, which is no longer the execution surface »*. Côté `--remote`,
+  `main.rs` ne passait tout simplement pas `args.model` à `run_remote`. Un correctif
+  limité à `remote_ask.rs` — la piste du ticket — aurait laissé le chemin **par
+  défaut** cassé.
+- **Le faux vert était doublement construit, et c'est la lecture qui manquait au
+  ticket.** `override_model` écrivait le modèle demandé dans `ctx.settings`, et
+  l'enveloppe `--verbose` relisait **ce même champ** pour peupler `metadata.model`.
+  Donc `mika ask --model moonshotai/kimi-k2.5 --verbose` affichait
+  `model: openrouter/moonshotai/kimi-k2.5` — le modèle demandé — pendant que le tour
+  tournait chez spirit sous celui du `config.toml`. Le champ n'était ni absent ni
+  nul : **il affirmait, avec autorité, l'override qui n'avait pas eu lieu.** C'est ce
+  qui explique la forme de la preuve du 11/09 — l'opérateur a dû inspecter le body
+  a2a parce que la surface prévue pour le dire mentait.
+- **Deux moitiés, et elles ferment deux choses différentes.** *Propagation* : la
+  chaîne **brute** voyage dans `mika.model_override`
+  (`mika_a2a::params::MODEL_OVERRIDE_KEY`) et le **serveur** résout (alias, strip de
+  préfixe conditionnel, vérification de clé) contre le fournisseur **exécutant** —
+  résoudre localement produirait, sur `--remote`, un id résolu contre le mauvais
+  fournisseur, soit un second faux vert plus discret que le premier. *Attestation* :
+  le serveur pose le modèle **effectivement utilisé** dans `Task.metadata`
+  (`mika.effective_model`) sur **tout** tour, override ou pas, et le CLI rend
+  **cette** valeur. La propagation seule aurait remplacé un faux vert par une
+  confiance ; l'attestation ferme le défaut quelle que soit la suite.
+- **Fail-soft en lecture, fail-CLOSED en application** — l'inverse de sa clé sœur
+  `mika.only_skills`, délibérément : une restriction de skills non appliquée rend le
+  tour **plus large**, ce qui est visible et ne falsifie aucune mesure ; un modèle non
+  appliqué rend la **mesure fausse tout en produisant une réponse plausible**. Un
+  no-op silencieux ici *est* le défaut. La seule inapplicabilité détectable hors
+  réseau est la clé API absente, et elle est **posée** par un `check_provider_key`
+  explicite **avant** la construction du provider : sur le rail OpenAI-compatible —
+  OpenRouter, celui des quatre passes mesurées — `OpenAiCompatibleProvider::new` ne
+  rend pas de `Result` et ne consulte jamais `api_key`, donc espérer le refus du
+  constructeur écrirait le fail-closed dans le plan et l'omettrait du binaire. Un
+  modèle inexistant chez le fournisseur n'est détectable à aucun endroit avant
+  l'appel : il échoue en 400/404, déjà fail-closed, sans code à écrire.
+- **Ce que l'absence d'attestation veut dire :** « ce serveur n'a rien attesté »,
+  jamais « la valeur locale est bonne ». Un spirit antérieur au correctif, un agent
+  distant d'une autre version, `message/stream` et `returnImmediately` y tombent — et
+  c'est exactement la population où afficher une valeur locale serait un mensonge. En
+  texte : `model: (not attested by the server)` ; en JSON : champ absent.
+- **Surfaces opérateur** (`$MIKA_SPIRIT_LOG_FILE`) : `a2a_model_override_applied`
+  (INFO — un tour a tourné sous un modèle d'appelant ; régime attendu rare, corrélé
+  aux campagnes de pré-vol ; un flot soutenu signifie qu'un appelant automatisé impose
+  un modèle et mérite d'être identifié) ; `a2a_model_override_refused` (WARN —
+  **régime attendu : zéro ligne** ; chaque occurrence nomme un modèle ou une clé API
+  manquante, c'est-à-dire une faute de frappe d'opérateur ou une clé absente, pas un
+  défaut du canal).
+- **Sonde, sur la mesure fondatrice du 11/09, et le recoupement EST la sonde :**
+  rejouer `mika ask --agent mika-arch --model moonshotai/kimi-k2.5 --verbose "ping"`,
+  puis comparer avec
+  `grep turn_usage $MIKA_SPIRIT_LOG_FILE | jq 'select(.model) | {provider, model}' | tail -1`.
+  Croire la sortie du CLI sur parole reproduirait la méthode qui a laissé le défaut
+  passer. **Haltes :** le CLI affiche le modèle demandé et `turn_usage` en porte un
+  autre → l'attestation n'est pas lue depuis le serveur, ne pas ajuster l'affichage.
+  Le CLI n'affiche aucun modèle et `turn_usage` porte le bon → le binaire spirit qui
+  tourne est antérieur au correctif ; c'est la population que l'attestation rend
+  visible, et le remède est un déploiement, pas un élargissement de la clé.
+- **Hors périmètre, délibérément :** `--enable-skill` / `--disable-skill`, la moitié
+  **additive** du canal mika#1727, refusée par mika#2363 avec sa raison écrite (elle
+  laisserait tout appelant authentifié forcer une skill en `always_on`) ; un override
+  de modèle est borné au fournisseur configuré de l'agent et ne peut pas élargir la
+  surface d'outils du tour, et c'est cette différence qui autorise l'un et pas
+  l'autre. Également hors périmètre : les tokens par run absents du `Task` (même
+  canal, autre mesure), et `mika chat`, in-process, où `--model` fonctionnait déjà.
+
 Lire une coupure au plafond (mika#2280) :
 - **Ce que ça distingue.** `LLM response body read failed mid-stream` (32/jour le
   2026-09-10, openrouter, glm-5.3 et kimi) rend `transport_timeout` que le corps
