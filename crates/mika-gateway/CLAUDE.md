@@ -166,6 +166,109 @@ bytes (`routes.rs`). The unfinished half of mika#2134, unrelated to rendering, a
 covered incidentally by the fallback (a length 400 fails identically on the second
 send and returns that error). Follow-up ticket to open.
 
+## Search Substrate (mika#1807 / mika#1971 → mika#2407)
+
+**This section is the documentation debt mika#2407 paid on the way.** Until it was
+written, this file — the documentation of the component that carries these
+variables — contained zero occurrences of "brave" or "search upstream", and the
+only place `MIKA_SEARCH_UPSTREAM` was described at all was
+`docs/egress-search-searxng-contingency.md`, a contingency note about a
+hypothetical replacement upstream. **The variable that decides activation was
+documented only in a document about its successor.**
+
+Since mika#1971 every agent's `web_search` routes through here: the builtin no
+longer reads a key of its own, it POSTs `/internal/search`. Three variables:
+
+| variable | effect |
+|---|---|
+| `MIKA_SEARCH_UPSTREAM` | The selector. `brave` is the only recognized value; an unrecognized one refuses startup. **Absent ⇒ `search_egress_client = None` ⇒ `POST /internal/search` answers `404 search_upstream_not_configured`, whatever the key is worth.** |
+| `MIKA_BRAVE_API_KEY` | The key. Required when the selector is `brave` — enforced at startup since mika#1807. |
+| `MIKA_SEARCH_REQUIRED` | mika#2407. Declares that this deployment **expects** search; declared and unresolved ⇒ the gateway refuses to start. |
+
+**The validation was asymmetric, and the silent half is the one that fired.**
+`GatewaySettings::validate` has always hard-failed on a selector that *lies*
+(`='zorglub'`) and on a selector without its key (`='brave'` alone). It said
+nothing about a selector that is *missing* — including the shape where a key is
+present and the selector is not, which is a half-configuration whose form states
+the intent, since nobody posts a search API key by accident. That fourth row is
+the measured state of 2026-09-18.
+
+**The founding incident.** The rotation to image `main-e1342dfa` (2026-09-18,
+~14:00) moved search behind the gateway; the gateway secret carried neither
+variable. Six tenants lost web search for about twenty hours. **Nothing was
+red**: `handle_readiness` tests `state.ready` and a `SELECT 1`, `ready.store(true)`
+follows boot unconditionally, and `/health`, `/readyz` and `/livez` share that
+handler — so the deployment control that had the charge of catching this was
+green. The tenants' agents, handed a 404 and a neutral substrate fallback
+(doctrine mika#1783, which forbids operator tokens like "api key" or
+"configuration" at the family tier), paraphrased it as *« l'outil de recherche web
+a un souci de configuration côté serveur (clé API manquante) »* — wrong,
+unactionable, and a faithful reading of what the substrate returned.
+
+**Two stages, and they are not redundant.** The guard reads what the pod
+*believes*; the smoke reads what the pod *does*.
+
+1. **Startup guard** (`assert_search_substrate_expectation`, `settings.rs`).
+   Structural: the pod does not start, so the Kubernetes rollout fails on its
+   own — no scheduler to wire, no upstream request spent. **It reads
+   configuration and never the network** (KTD3): probing the upstream at boot
+   would let a crash-looping pod spend the shared monthly quota it exists to
+   protect, and would make an upstream outage enough to keep Telegram, GitHub
+   webhooks and A2A from starting at all.
+2. **External smoke** (`scripts/smoke-search-substrate`). One real search, from
+   outside, reading no variable of the pod. This is what covers the objection
+   the guard cannot answer: *a rotation that dropped `MIKA_SEARCH_UPSTREAM`
+   could equally have dropped `MIKA_SEARCH_REQUIRED`* — and a declaration nobody
+   made guards nothing. Exit `0` healthy / `1` substrate broken (404
+   `search_upstream_not_configured`, or 502 `unauthorized` = key present and
+   refused) / `2` **nothing verified**. The third is not a pass: a smoke that
+   cannot authenticate has checked nothing, and `/internal/search` sits behind
+   `require_bearer_token`, the same middleware as `/send`, so the caller needs
+   `MIKA_INTERNAL_TOKEN` — which the deployment pipeline already holds.
+
+**`/readyz` deliberately does NOT go red without search.** Taking a gateway that
+routes Telegram, GitHub webhooks and A2A out of service because web search is
+absent would withdraw a component healthy at 95 %. The startup guard is
+acceptable precisely because it is **conditioned on an explicit declaration**:
+an operator who sets `MIKA_SEARCH_REQUIRED=1` is asking for exactly that
+behaviour. The difference is not one of degree — only one of the two was asked
+for.
+
+**Operator surfaces.** `search_upstream_resolved` (INFO, once at startup, **on
+every branch, healthy one included**): `upstream`, `upstream_source`,
+`api_key_present` (**boolean only** — never the value, never a prefix, never a
+length; Q4 STRIP TOTAL extends to the construction site), `required`,
+`required_source`, `endpoint_is_default`. Its **absence** while the gateway runs
+means the deployed binary predates the fix (class mika#2340) and never "search is
+fine". `search_upstream_key_without_selector` (WARN) — the half-configuration;
+the repairing gesture is the opposite of the obvious one, add the **selector**.
+`search_required_unrecognized_value` (WARN) — names the value between quotes so a
+stray space is visible (mika#2220).
+
+**Post-rotation probe, with its halts.**
+
+```bash
+grep search_upstream_resolved <gateway-log> | jq '{upstream, upstream_source, api_key_present, required}'
+scripts/smoke-search-substrate https://<gateway> ; echo "exit=$?"
+```
+
+- `upstream: "brave"` + `exit=0` → healthy, the expected regime.
+- `upstream: "none"` with `api_key_present: true` → half-configuration. **Halt:
+  do not add another key** — the remedy is `MIKA_SEARCH_UPSTREAM=brave`.
+- `exit=1` on `unauthorized` while `api_key_present: true` → the key is there and
+  refused: a key rotation, not a code fix.
+- `exit=2` → **this is not a green.** The smoke verified nothing (token,
+  network); establish why before concluding anything about the substrate.
+- `search_upstream_resolved` **absent** from the log while the gateway runs →
+  the deployed binary predates the fix. **Halt: establish the deployment before
+  touching code.**
+
+**Out of scope, deliberately.** The 429 backoff/retry on the shared free-tier
+rate limit (1 req/s) — split to p2 by the operator on mika#2407; it was a real
+hardening need and was not the 2026-09-18 failure. `values.yaml`, the
+`setup-*.sh` scripts and the ordering of the smoke inside the rotation pipeline
+live in `mika-cloud`, outside this workspace — follow-up ticket.
+
 ## A2A Auth
 
 API keys are SHA-256 hashed and stored in Postgres `a2a_api_keys` table (migration 003); validated via `validate_a2a_api_key()` with expiry and revocation checks. See `crates/mika-a2a/CLAUDE.md` for A2A protocol details.
@@ -205,6 +308,10 @@ API keys are SHA-256 hashed and stored in Postgres `a2a_api_keys` table (migrati
 - `MIKA_GITHUB_APP_PRIVATE_KEY` — GitHub App private key (base64-encoded PEM). Required for the synchronize no-diff guard (#886). Encode with: `base64 -w0 < your-app.pem`.
 - `MIKA_GITHUB_APP_INSTALLATION_ID` — GitHub App installation ID (u64). Required for the synchronize no-diff guard (#886). All 3 GitHub App vars must be set; when incomplete, the no-diff guard is disabled (fail-open).
 - `MIKA_GATEWAY_EXTERNAL_URL` — Public HTTPS base URL of the gateway (e.g., `https://gateway.mika.example.com`). Required for per-customer webhook registration via `POST /admin/customers`. The endpoint constructs `{gateway_external_url}/webhook/telegram/{customer_id}` as the Telegram webhook URL.
+- `MIKA_SEARCH_UPSTREAM` — Search-substrate selector (mika#1807). `brave` is the only recognized value in v1; an unrecognized one refuses startup. **Absent ⇒ `POST /internal/search` answers `404 search_upstream_not_configured` whatever `MIKA_BRAVE_API_KEY` is worth** — the asymmetry mika#2407 was filed for. See § *Search Substrate*.
+- `MIKA_BRAVE_API_KEY` — Search upstream API key, **on the gateway** and not on the agent (since mika#1971 the agent's `web_search` POSTs `/internal/search`). Required when `MIKA_SEARCH_UPSTREAM=brave`, enforced at startup.
+- `MIKA_SEARCH_REQUIRED` — Declares this deployment **expects** the search substrate (mika#2407). Declared and unresolved ⇒ the gateway refuses to start, so the rollout fails instead of serving mute tenants. Absent or empty ⇒ not required; an unrecognized value ⇒ **required**, with a WARN naming it. `Option<String>`, never `bool`, for the same F8 reason as `MIKA_TELEGRAM_HTML_RENDER`.
+- `MIKA_BRAVE_ENDPOINT` — Optional upstream endpoint override, for integration tests and self-hosted mirrors. Reported as `endpoint_is_default` on `search_upstream_resolved`.
 - `MIKA_ORCHESTRATOR_INBOX_ENABLED` — Orchestrator inbox feature flag (mika#1189). Default off — `/orchestrator/inbox/*` endpoints return 404. Set `1` (or `true`, case-insensitive) to enable dual-write with the mika-platform#100 filesystem inbox. `2` (gateway-only cutover) is reserved for a future ticket and currently treated as disabled. Note: bearer auth gates the endpoints by token; orchestrator/spawn distinction is carried by path (`orchestrator_id`) and `spawn_id` field, not by separate tokens — multi-operator deployments will need per-operator scoping before exposure beyond a solo operator.
 
 ## Orchestrator Inbox (mika#1189)
