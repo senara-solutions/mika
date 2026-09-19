@@ -21,7 +21,7 @@ use std::path::Path;
 use anyhow::Result;
 use secrecy::ExposeSecret;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
 
 use egress_fetch::{FetchEgressClient, FetchUpstream, GouvFrConfig};
 use egress_search::{BraveConfig, SearchEgressClient, SearchUpstream};
@@ -197,18 +197,60 @@ async fn main() -> Result<()> {
                 .brave_endpoint
                 .clone()
                 .unwrap_or_else(|| egress_search::DEFAULT_BRAVE_ENDPOINT.to_string());
-            info!("egress-search substrate configured (upstream=brave)");
             Some(Arc::new(SearchEgressClient::new(SearchUpstream::Brave(
                 BraveConfig { api_key, endpoint },
             ))))
         }
-        Some("") => None,
-        None => {
-            info!("egress-search substrate disabled (MIKA_SEARCH_UPSTREAM not set)");
-            None
-        }
+        Some("") | None => None,
         Some(_) => unreachable!("validated in GatewaySettings::load"),
     };
+
+    // mika#2407 — say what the search substrate actually resolved to.
+    //
+    // This replaces the two `info!` lines that used to sit inside the match
+    // above, and the replacement is the point of U1. Those lines were emitted
+    // on *one branch each* and said only "configured" or "disabled": on
+    // 2026-09-18 the disabled line was written, correctly, and answered nothing
+    // — an operator asking "is search wired?" had to read the Kubernetes
+    // secret. The mika#2293 lesson applies verbatim: *a setting you cannot
+    // observe is not a setting, it is a hope.*
+    //
+    // Emitted on **every** branch, including the healthy one, so the absence of
+    // this line means "the running binary predates the fix" and never "search
+    // is fine" (V5's fifth halt, class mika#2340).
+    //
+    // `api_key_present` is a **boolean and only ever a boolean** — never the
+    // value, never a prefix, never a length. The Q4 STRIP TOTAL discipline of
+    // the egress_search module extends to the site that builds it.
+    let raw_search_required = settings.search_required.as_deref();
+    let raw_search_upstream = settings.search_upstream.as_deref();
+    let api_key_present = settings.brave_api_key.is_some();
+    let resolved_upstream = settings::resolved_search_upstream_label(raw_search_upstream);
+    info!(
+        event = "search_upstream_resolved",
+        upstream = resolved_upstream,
+        upstream_source = settings::search_required_source(raw_search_upstream),
+        api_key_present,
+        required = settings::search_substrate_is_required(raw_search_required),
+        required_source = settings::search_required_source(raw_search_required),
+        endpoint_is_default = settings.brave_endpoint.is_none(),
+        "egress-search substrate configuration resolved"
+    );
+
+    // The half-configuration of 2026-09-18: a key was posted, the selector was
+    // not, and `POST /internal/search` answered 404 whatever the key was worth.
+    // It gets its own WARN because the shape states the intent — nobody posts a
+    // search API key by accident — and because the repairing gesture is the
+    // opposite of the obvious one: add the *selector*, not another key.
+    if api_key_present && resolved_upstream == "none" {
+        warn!(
+            event = "search_upstream_key_without_selector",
+            "mika#2407: MIKA_BRAVE_API_KEY is set but MIKA_SEARCH_UPSTREAM is not — \
+             the search substrate stays DISABLED and POST /internal/search answers 404 \
+             search_upstream_not_configured. Set MIKA_SEARCH_UPSTREAM=brave; a key on \
+             its own activates nothing."
+        );
+    }
 
     // Build the egress-fetch substrate client (mika#1969) — always
     // constructed. There is no upstream selection env var per KTD2;

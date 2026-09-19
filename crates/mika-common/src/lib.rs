@@ -15,6 +15,11 @@ pub mod logging;
 pub mod mcp_config_path;
 pub mod oauth;
 pub mod permission_authority;
+/// Single reader of the production/test boundary for this repo's structural
+/// guards (mika#2398). Test-only by construction: it enters no production
+/// binary, which is how R7 is guaranteed rather than asserted.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod source_guard;
 pub mod team;
 pub mod telegram;
 pub mod telemetry;
