@@ -52,7 +52,8 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 │       ├── heartbeat.md              # Heartbeat checklist (0600)
 │       ├── user.md                   # User info seed (0600)
 │       ├── cli-reference.md          # Auto-generated CLI help
-│       ├── mcp.json                  # MCP server config (0600)
+│       ├── mcp.json                  # LEGACY MCP config (0600) — migrated once to
+│       │                             #   the operator-global path, then unread (mika#1737)
 │       ├── marketplace.lock          # Marketplace skill tracking (TOML)
 │       ├── .input_history            # TUI input history (JSON, 0600)
 │       ├── cache/                    # Cached data (0700)

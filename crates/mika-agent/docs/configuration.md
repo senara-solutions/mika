@@ -23,7 +23,7 @@ When Mika runs for the first time, it bootstraps the home directory at
   soul.md            # Personality definition (system prompt)
   heartbeat.md       # Heartbeat checklist for proactive behaviors
   user.md            # User self-description (seeds initial context)
-  mcp.json           # MCP server configuration (optional, see below)
+  mcp.json           # Legacy MCP server config — migrated once, no longer read (see below)
   data/
     mika.db          # SQLite database (conversations, memory, reminders)
   logs/              # Log files
@@ -46,11 +46,23 @@ Bootstrap never overwrites existing files. If a file already exists, the default
 content is skipped. This means you can safely customize any file and re-run
 `mika setup` without losing changes.
 
-### mcp.json
+### mcp-servers.json (MCP servers)
 
-MCP (Model Context Protocol) servers are configured in `{agent_home}/mcp.json`.
-This file is not bootstrapped automatically -- create it via `mika mcp add` or
-by writing the file manually.
+**MCP configuration is operator-global, not per-agent** (mika#1737). It is read
+from the first of these that resolves:
+
+1. `MIKA_MCP_CONFIG` (absolute path override)
+2. `$XDG_CONFIG_HOME/mika/mcp-servers.json`
+3. `$HOME/.config/mika/mcp-servers.json`
+4. `./mcp-servers.json` (last resort; emits a warning)
+
+The per-agent `{agent_home}/mcp.json` shown in the tree above is **legacy**: it
+is copied once to the resolved path on first startup and is not read afterwards.
+
+The file is not bootstrapped automatically -- create it via `mika mcp add` or by
+writing it manually. A server configured there is loaded for **every** agent on
+this installation; see [mcp.md](mcp.md) for the isolation procedure and the
+availability-by-mode table.
 
 ```json
 {
@@ -94,10 +106,13 @@ by writing the file manually.
 - `mika mcp enable <name>` -- Enable a disabled server
 - `mika mcp disable <name>` -- Disable without removing
 
-**Security:** `mcp.json` is written with `0600` permissions on Unix. Header and
+`mika mcp add` exposes no `--env` flag: a stdio server that needs an environment
+variable requires hand-editing the file.
+
+**Security:** the file is written with `0600` permissions on Unix. Header and
 env values are redacted in debug output. Header values passed via `--header` on
 the command line are visible in shell history and process listings -- for
-sensitive tokens, edit `mcp.json` directly.
+sensitive tokens, edit the file directly.
 
 ---
 
