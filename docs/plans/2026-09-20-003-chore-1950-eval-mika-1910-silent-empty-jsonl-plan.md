@@ -139,23 +139,51 @@ mais un refus d'outil suivi d'une erreur d'exécution :
 [error] error_during_execution: [ede_diagnostic] result_type=user … stop_reason=tool_use
 ```
 
-Ordres de grandeur sur le corpus complet (2351 `.stderr`) :
+Ordres de grandeur sur le corpus complet (**2352 `.stderr`, recomptés le
+2026-09-20** avec le motif ancré sur le producteur défini en U1) :
 
 | Signal | Sessions |
 |---|---|
-| `policy:deny` présent | **1181** (~50 %) |
-| Événement « empty response » réel | **4** (~0,17 %) |
-| Ligne de configuration `emptyResponseThreshold=` | 2348 (~100 %) |
+| `[policy:deny]` présent | **1182** (~50 %) |
+| `[guardrail] idle_timeout` | 402 |
+| `[guardrail] stall_detected` | 10 |
+| `[guardrail] error_max_turns` | 4 |
+| `[guardrail] prompt_cache_dead` | 1 |
+| **`[guardrail] empty_response`** | **0** |
+| Ligne de configuration `emptyResponseThreshold=` | 2349 (~100 %) |
 
-**La troisième ligne est le piège à graver.** Un script qui grepperait `empty`
-sans distinguer la constante de l'événement rapporterait ~2348 « sorties vides »
+**La dernière ligne est le piège à graver.** Un script qui grepperait `empty`
+sans distinguer la constante de l'événement rapporterait ~2349 « sorties vides »
 — un nombre faux, plausible, et porté par l'autorité d'une mesure. C'est
-exactement la forme de défaut que ce ticket existe pour ne pas reproduire.
+exactement la forme de défaut que ce ticket existe pour ne pas reproduire. Le
+piège a deux autres gueules, mesurées ce tour : `grep -i 'EmptyResponse'` matche
+`emptyResponseThreshold` (2349 faux positifs), et `grep -F 'empty_response'`
+matche le **contenu** des sessions — le symbole Rust `empty_response_result()`
+lu ou édité par un pilote (3 sessions, toutes fausses).
 
-**Statut épistémique, énoncé sans le surjouer :** ces comptes sont des greps
-d'orientation, pas la mesure. Ils suffisent à établir qu'une cause concurrente
-massive existe et que l'attribution du ticket est fragile ; ils ne suffisent pas
-à conclure sur la cause de chaque session. C'est U1 qui produit la mesure.
+**Rectification du « 4 » de la v1 de ce plan.** La v1 annonçait « événement
+empty response réel — 4 sessions (~0,17 %) ». Ce chiffre **n'est reproductible
+par aucun motif ancré sur le producteur** : les 4 sessions que le compte de
+guardrails laisse hors des familles connues sont des `error_max_turns`
+(2026-09-17 → 09-18), pas des `empty_response`. Le compte producteur-ancré de
+l'événement est **0 sur 2352**. La v1 avait donc commis en petit la faute
+qu'elle décrit — un nombre plausible tiré d'un grep non ancré — ce qui est
+précisément la raison d'être de F1 et la justification de l'invariant U1
+ci-dessous.
+
+**Conséquence sur la conduite, pas seulement sur le chiffre :** un compte à zéro
+sur l'événement rend l'**issue 1 de D4** (prémisse réfutée sur l'axe A) nettement
+plus probable, sans la trancher — c'est U1, sur la population entière et avec sa
+troisième valeur, qui conclut. Il ne faut surtout pas lire ce zéro comme « le
+symptôme n'existe pas » : il dit que le symptôme **compté par ce motif-là** est
+absent de cette population, ce qui est exactement la séparation d'axes de D3.
+
+**Statut épistémique, énoncé sans le surjouer :** ces comptes restent des greps
+d'orientation, pas la mesure — ancrés sur le producteur, donc bien meilleurs que
+ceux de la v1, mais non fail-safe (ils n'ont pas de `undetermined`). Ils
+suffisent à établir qu'une cause concurrente massive existe et que l'attribution
+du ticket est fragile ; ils ne suffisent pas à conclure sur la cause de chaque
+session. C'est U1 qui produit la mesure.
 
 #### R7 — L'instrument réclamé existe et tourne
 
@@ -174,15 +202,23 @@ reproductible de ce qu'il voit** — et c'est là que le corpus est décisif.
 | | Fixtures prescrites | Corpus disponible |
 |---|---|---|
 | Existence | **aucune** | `/var/log/claude-pilot/` — **5015 fichiers** |
-| Étendue | 2 sessions | 2351 sessions avec `.stderr` |
+| Étendue | 2 sessions | 2352 sessions avec `.stderr` (au 2026-09-20) |
 | Période | 2026-08-18 | **2026-03-18 → 2026-09-20** |
-| Régimes couverts | un | **les deux** (avant/après le 2026-08-26) |
+| Couverture calendaire | un point | **de part et d'autre du 2026-08-26** — une couverture, pas un contraste de régime : par R5 la population tourne sous Claude des deux côtés (F2) |
 | Nature | proxy, jugé inadéquat par le ticket lui-même | boucle d'outils **réelle**, en production |
 
 Le ticket reproche au proxy de ne pas solliciter la boucle à 30 tours. Le corpus
-**est** cette boucle, sur trois mois, avec le contrôle et le candidat dans le même
-jeu de données. La mesure que le rejeu devait approcher est disponible sur une
-population trois ordres de grandeur plus grande.
+**est** cette boucle, sur trois mois, en production. La mesure que le rejeu
+devait approcher est disponible sur une population trois ordres de grandeur plus
+grande.
+
+**Ce que le corpus n'est pas, et il faut le dire ici plutôt que le laisser
+espérer :** il ne contient **pas** « le contrôle et le candidat dans le même jeu
+de données ». Par R5, ces sessions tournent sous Claude de part et d'autre du
+2026-08-26 ; le candidat GLM n'y figure sur aucune ligne. Ce que le corpus offre
+est une mesure **du symptôme** sur une population réelle et étendue, pas une
+comparaison de modèles — et c'est précisément la raison d'être de la séparation
+d'axes (D3) et de l'avertissement calendaire (F2, dans U1).
 
 ### Contrainte d'accès, nommée plutôt que contournée
 
@@ -247,6 +283,11 @@ de mesure. Les trois issues et leur conduite sont fixées **avant** la mesure :
    réfutation de sa prémisse, ce qui est une réponse.
 2. **Le symptôme discrimine les périodes** → verdict FIXED/IGNORED/AGGRAVER rendu
    sur l'axe A, avec sa réserve d'attribution (R4) écrite dans la même phrase.
+   **Condition ajoutée en rev 2 (F2) :** la discrimination périodique ne suffit
+   pas à elle seule. L'axe temporel est calendaire, pas un axe de régime, donc
+   une discontinuité au 2026-08-26 sans canal causal établi retombe dans
+   l'issue 1 — et le canal candidat (pilote comme capteur aval du dispatcheur)
+   n'est prouvable que sur l'axe B, non mesuré ici.
 3. **Le corpus ne tranche pas** (signaux illisibles, `undetermined` majoritaire) →
    c'est un résultat, pas un échec : il nomme ce qu'il faudrait instrumenter.
 
@@ -277,20 +318,69 @@ une ligne JSON :
 | Champ | Source | Rôle |
 |---|---|---|
 | `task_id` | nom de fichier | jointure |
-| `date` | mtime | axe temporel (régime 5.2 / 5.3) |
+| `date` | mtime | **axe calendaire** (voir la note ci-dessous — ce n'est *pas* un axe « régime 5.2 / 5.3 ») |
 | `model` | `[init] … model <X>` | **le discriminant de R5** |
 | `tool_calls` | `grep -c '\[tool:request\]'` | la grandeur de la mesure fondatrice |
 | `policy_denies` | `grep -c '\[policy:deny\]'` | **le discriminant de R6** |
-| `empty_event` | événement réel, **jamais** `emptyResponseThreshold=` | le symptôme |
+| `empty_event` | ligne `[guardrail] empty_response:` — règle littérale ci-dessous | le symptôme |
+| `guardrail_aborts` | liste des `<type>` de toutes les lignes `[guardrail]` | les causes concurrentes, nommées plutôt qu'agrégées |
 | `error_during_execution` | présence | cause concurrente |
 | `verdict` | `produced` / `empty` / `undetermined` | vocabulaire mika#1996 |
+
+#### La règle d'extraction de `empty_event`, écrite littéralement (F1)
+
+**Elle est dérivée du producteur, jamais rétro-ingénierée depuis le log.** Le
+seul site qui produit cet événement est, dans le dépôt `claude-pilot` :
+
+- `src/claude_pilot/guardrails.py` — `self._abort("empty_response", f"{n} consecutive trivial responses (<10 chars)")`,
+  déclenché par `_consecutive_empty_turns >= config.emptyResponseThreshold` ;
+- `src/claude_pilot/ui.py:112-113` — `log_guardrail(type_, detail)` écrit
+  `f"\n{ORANGE}[guardrail]{RESET} {BOLD}{type_}{RESET}: {detail}"`.
+
+La ligne brute sur disque est donc, échappements visibles :
+
+```
+^[[38;5;208m[guardrail]^[[0m ^[[1mempty_response^[[0m: 5 consecutive trivial responses (<10 chars)
+```
+
+**Règle en deux temps, et l'ordre est portant :**
+
+1. **Dépouiller les séquences ANSI CSI de la ligne** (`\x1b\[[0-9;]*m`) *avant*
+   toute mise en correspondance. Un motif écrit sur la ligne colorée devrait
+   coder `^[[1m` entre `[guardrail]` et le type — fragile au moindre changement
+   de thème de `ui.py`, et illisible dans le script.
+2. Sur la ligne dépouillée, apparier l'ancre
+   **`[guardrail] empty_response:`** (crochets littéraux, un espace, deux-points
+   collés au type). `empty_event` est vrai si et seulement si au moins une ligne
+   de la session apparie cette ancre.
+
+**Ce que l'ancre exclut, et c'est le contrôle négatif d'AC9 :**
+`emptyResponseThreshold=5` (la constante, 2349 sessions), `EmptyResponse`
+(variante de casse de la même constante), et `empty_response_result()` (symbole
+Rust apparaissant dans le *contenu* d'une session, 3 sessions). Aucun des trois
+ne porte le préfixe `[guardrail] ` ni les deux-points collés.
+
+**`guardrail_aborts` est extrait par la même ancre généralisée**
+(`[guardrail] <type>:`), le `<type>` étant capturé et non présumé. C'est ce qui
+rend le champ honnête : les familles observées au 2026-09-20 sont
+`idle_timeout`, `stall_detected`, `error_max_turns`, `prompt_cache_dead` — et
+`error_max_turns` **n'est pas** dans la liste `Literal[...]` de `_abort`, donc il
+existe au moins un second site d'émission dans `claude-pilot`. Un type inconnu
+est **enregistré tel quel**, jamais rangé dans une famille connue ni jeté
+silencieusement.
 
 **Invariants portants :**
 
 - **La constante n'est jamais comptée comme l'événement.** Un test négatif est
   livré avec le script : un log ne portant que `emptyResponseThreshold=5` doit
-  rendre `empty_event: false`. Sans lui, le script rapporte ~2348 faux positifs
+  rendre `empty_event: false`. Sans lui, le script rapporte ~2349 faux positifs
   et personne ne le voit (R6).
+- **Le test négatif borne une frontière connue, pas une frontière devinée**
+  (F1). Il porte les **trois** leurres mesurés ci-dessus — `emptyResponseThreshold=5`,
+  `EmptyResponse`, `empty_response_result()` — et un **contrôle positif** sur la
+  ligne littérale ANSI complète copiée du producteur. Le négatif seul serait
+  satisfait par un script qui ne dit jamais `true` ; c'est la même asymétrie que
+  le §1 du Verification Contract.
 - **Fail-safe vers `undetermined`.** Modèle illisible, fichier tronqué, mtime
   absent → `undetermined`, jamais `produced` ni `empty`. Un signal qu'on ne peut
   pas lire n'est jamais un terme satisfait.
@@ -298,6 +388,39 @@ une ligne JSON :
 - **Le vocabulaire des verdicts est celui de mika#1996**, pas un troisième
   dialecte : deux orthographes d'un même verdict couperaient une population en
   deux sans le dire.
+
+#### L'axe temporel est calendaire, et le 2026-08-26 n'y est pas une frontière causale (F2)
+
+La v1 étiquetait `date` comme axe « régime 5.2 / 5.3 », frontière au 2026-08-26.
+**C'était une contradiction interne avec R5** : la population de l'axe A tourne
+sous Claude avant *et* après cette date, donc la bascule GLM n'a changé le modèle
+d'aucune de ces sessions. Étiqueter la date « régime » ré-assumait en silence
+exactement ce que R5 refuse d'assumer, et AC5 aurait pu rendre
+FIXED/IGNORED/AGGRAVER sur une frontière décorative.
+
+**Le champ est donc une pure dérive calendaire.** Le script le produit comme un
+axe de découpage neutre ; il ne porte aucune sémantique de régime, et le README
+(U3 §3) doit le dire dans les mêmes termes.
+
+**Le canal causal qui rendrait le 2026-08-26 significatif est nommé comme
+hypothèse, et il n'est pas établi ici :** une session pilote est un **capteur
+aval** du dispatcheur — si `mika-dev` (qui, lui, porte GLM) se tait ou dispatche
+mal, le pilote peut démarrer sans travail et paraître « vide » sans qu'aucun de
+ses propres tours ne le soit. Sous cette hypothèse seulement, une discontinuité
+au 2026-08-26 sur l'axe A serait imputable au swap. **Trois raisons de ne pas la
+poser comme acquise :** elle est non mesurée ici ; elle prédit un silence côté
+*dispatch*, donc sa preuve vit sur l'**axe B** (`$MIKA_SPIRIT_LOG_FILE`), qui
+n'est pas lisible depuis cette session ; et la cause concurrente de R6
+(`policy:deny`, ~50 %) suffirait à produire une discontinuité calendaire pour des
+raisons de politique de permissions, sans aucun rapport avec le modèle.
+
+**Conduite qui en découle, et elle est contraignante :** une discontinuité
+observée au voisinage du 2026-08-26 sur l'axe A **ne vaut pas** verdict
+FIXED/IGNORED/AGGRAVER. Elle relève de l'**issue 1 de D4** — la population ne
+discrimine pas le modèle — et le README doit la rapporter comme une corrélation
+calendaire dont le canal causal reste à établir sur l'axe B. Rendre un verdict
+sur cette seule discontinuité serait la faute R5 commise une seconde fois, par
+la date au lieu du modèle.
 
 ### U2 — L'artefact de mesure daté
 
@@ -313,11 +436,32 @@ qui **produit** sa conclusion sur une sortie machine et porte ses haltes. Sectio
 
 1. Ce que le ticket prescrivait, et pourquoi ce n'est pas exécutable (R1–R7,
    avec les commandes de vérification).
-2. La désambiguïsation des deux axes (D3).
-3. **Axe A** — la mesure, l'artefact, le verdict rendu ou la prémisse réfutée.
-4. **Axe B** — la procédure opérateur (commandes ci-dessous), non exécutée ici.
-5. Les haltes.
-6. Ce que ce travail **n'achète pas**.
+2. **Le chemin de retour posé par l'opérateur, et pourquoi il n'est pas pris**
+   (voir ci-dessous — F4).
+3. La désambiguïsation des deux axes (D3), **et l'avertissement F2** : l'axe
+   calendaire n'est pas un axe de régime, une discontinuité au 2026-08-26 ne
+   vaut pas verdict.
+4. **Axe A** — la mesure, l'artefact, le verdict rendu ou la prémisse réfutée.
+5. **Axe B** — la procédure opérateur (commandes ci-dessous), non exécutée ici.
+6. Les haltes.
+7. Ce que ce travail **n'achète pas**.
+
+**§2 — le chemin de retour de l'opérateur, nommé plutôt que contourné (F4).**
+Le commentaire opérateur du 2026-09-20 sur #1950 pose un retour explicite :
+*« Retour = reposer `post-launch`, retirer `ready` »* — c'est-à-dire re-parquer
+le ticket plutôt que l'exécuter. Ce plan **ne le prend pas**, et le README doit
+dire pourquoi plutôt que de laisser le lecteur croire que l'option a été
+ignorée. La raison : re-parquer ne produit rien. Le ticket est resté ouvert un
+mois précisément parce que la question « le symptôme a-t-il bougé ? » n'était
+pas re-posable sans refaire le travail (D2) ; le re-parquer une seconde fois
+reconduirait cet état en le datant. La rectification, elle, produit la mesure
+que le ticket visait — sur une population trois ordres de grandeur plus grande
+que les fixtures absentes — et laisse le ticket dans un état où sa question est
+**décidable par une commande**. Le choix est réversible et le README le dit :
+si l'opérateur juge que la rectification sort du périmètre qu'il avait en tête,
+son geste reste disponible à l'identique (reposer `post-launch`, retirer
+`ready`), et les artefacts U1/U2 gardent leur valeur indépendamment — ils ne
+présupposent rien du statut du ticket.
 
 Procédure de l'axe B, à exécuter sur l'hôte :
 
@@ -385,17 +529,34 @@ population, ce qui reste ouvert. **Pas de fermeture** (D5).
    l'histoire — le réparer avant toute conclusion.
 5. **Aucune valeur de production n'est modifiée** : `git diff` ne touche ni
    `well_known_agents.rs`, ni un `config.toml`, ni `docs/eval/calibration/mika-qa-2328/`.
+6. **Précondition R1 — halte si la prémisse porteuse tombe (F3).** Les quatre
+   commandes de vérification de R1 sont rejouées **avant toute autre unité**, et
+   leur résultat attendu est le vide. **Si l'une d'elles retourne non-vide :
+   halte.** Les fixtures existent, donc le rejeu prescrit redevient exécutable,
+   donc la rectification n'est plus fondée et doit être **re-plaidée** avant U1 —
+   pas contournée, pas notée en passant. Cette halte existe parce que l'espace
+   de recherche peut être incomplet : le corps de mika#1910 affirme que des
+   traces ont été « mergé[e]s sur mika-platform via PR#192 », et une PR d'un
+   autre dépôt du workspace n'est pas couverte par un `git log --all` local.
+   C'est la même discipline que le §4 ci-dessus, appliquée à la prémisse au lieu
+   du script : sans elle, un R1 faux découvert à mi-implémentation n'échouerait
+   qu'implicitement, au moment d'écrire un corps de PR devenu impossible à
+   rédiger honnêtement.
 
 ---
 
 ## Definition of Done
 
-- [ ] `scripts/measure-pilot-cycle-emptiness` livré, lecture seule, avec son test
-      négatif sur la constante de configuration.
+- [ ] Précondition R1 rejouée et vide (Verification Contract §6) ; sinon halte.
+- [ ] `scripts/measure-pilot-cycle-emptiness` livré, lecture seule, `empty_event`
+      extrait par l'ancre `[guardrail] empty_response:` après dépouillement ANSI,
+      avec ses tests : négatif sur les trois leurres, positif sur la ligne
+      littérale du producteur.
 - [ ] `docs/eval/mika-1950/measurement-2026-09-20.json` versé.
-- [ ] `docs/eval/mika-1950/README.md` : R1–R7 avec leurs commandes, les deux
-      axes séparés, le verdict de l'axe A **ou** la réfutation motivée de la
-      prémisse, la procédure de l'axe B, les haltes.
+- [ ] `docs/eval/mika-1950/README.md` : R1–R7 avec leurs commandes, le chemin de
+      retour opérateur et la raison de ne pas le prendre, les deux axes séparés,
+      l'avertissement sur l'axe calendaire, le verdict de l'axe A **ou** la
+      réfutation motivée de la prémisse, la procédure de l'axe B, les haltes.
 - [ ] U4 exécutée **ou** son non-déclenchement écrit dans le README avec le
       critère qui ne s'est pas réalisé.
 - [ ] Texte de la note mika#1910 fourni ; ticket **non fermé**.
@@ -413,7 +574,9 @@ condition bloquante, et des faits R1–R7.
 
 - **AC1** — L'inexécutabilité du rejeu prescrit est **établie et vérifiable** :
   le README porte les commandes qui montrent l'absence des fixtures dans le
-  dépôt, dans `git log --all`, et dans le workspace.
+  dépôt, dans `git log --all`, et dans le workspace. Les quatre commandes sont
+  **rejouées avant toute autre unité**, et le README nomme la halte si l'une
+  d'elles retourne non-vide (Verification Contract §6).
 - **AC2** — Les deux axes (cycles pilote / tours GLM) sont **nommés et séparés**,
   et le README dit lequel est mesuré ici et lequel est un geste opérateur.
 - **AC3** — Le modèle réellement en service dans la population mesurée est
@@ -422,14 +585,25 @@ condition bloquante, et des faits R1–R7.
   c'est elle qui décide si le verdict demandé a un objet.
 - **AC5** — Un verdict FIXED/IGNORED/AGGRAVER est rendu sur l'axe A **ou** la
   prémisse est réfutée par écrit ; dans les deux cas la réserve d'attribution
-  (R4 : trois changements de substrat) figure dans la même section.
+  (R4 : trois changements de substrat) figure dans la même section. **Un verdict
+  ne peut pas reposer sur la seule discontinuité calendaire du 2026-08-26** :
+  l'axe temporel est calendaire et non un axe de régime (F2), et une
+  discontinuité sans canal causal établi relève de l'issue 1 de D4.
 - **AC6** — La mesure est **reproductible** : une commande unique la refait.
 - **AC7** — La condition bloquante est traitée explicitement : le README constate
   son franchissement des deux côtés et renvoie mika-qa à mika#2328.
 - **AC8** — **Aucune promotion, aucune fermeture** : ni `glm-5.3` vers mika-dev ou
   mika-qa, ni fermeture de mika#1910.
-- **AC9** — Le script ne confond jamais `emptyResponseThreshold=` avec un
-  événement, et un test le prouve.
+- **AC9** — Le script ne confond jamais la constante avec l'événement, et des
+  tests le prouvent sur une **frontière connue** (F1) : l'ancre est
+  `[guardrail] empty_response:` après dépouillement ANSI, dérivée du producteur
+  (`claude-pilot` `guardrails.py::_abort` → `ui.py::log_guardrail`) ; le test
+  négatif porte les trois leurres mesurés (`emptyResponseThreshold=5`,
+  `EmptyResponse`, `empty_response_result()`) et un contrôle positif porte la
+  ligne ANSI littérale du producteur.
+- **AC10** — Le chemin de retour posé par l'opérateur (« reposer `post-launch`,
+  retirer `ready` ») est **nommé dans le README** avec la raison de ne pas le
+  prendre et le constat qu'il reste disponible à l'identique (F4).
 
 ---
 
@@ -443,6 +617,9 @@ condition bloquante, et des faits R1–R7.
 | **Le recoupement avec 102/120 échoue.** | Halte du Verification Contract §4 : réparer le script avant toute conclusion. Un script qui ne retrouve pas une mesure connue ne peut pas en produire une nouvelle. |
 | **U4 corrige un doc de principe à tort.** | Conditionnée (D6) à une confirmation sur la population entière ; la règle du doc ne bouge jamais, seulement son exemple chiffré. |
 | **Empiéter sur mika#2328.** | Aucun fichier sous `docs/eval/calibration/mika-qa-2328/` n'est touché ; le README y renvoie. |
+| **Lire la date comme un régime** (F2) — conclure au modèle sur une discontinuité au 2026-08-26 alors que la population tourne sous Claude des deux côtés. | Le champ est étiqueté calendaire dans le script, dans le README et dans AC5 ; le canal causal candidat est écrit comme hypothèse non établie, et sa preuve est renvoyée à l'axe B. |
+| **L'ancre `empty_event` sur- ou sous-matche sans rougir** (F1) — un motif choisi par rétro-ingénierie passerait le test négatif tout en comptant faux. | L'ancre est dérivée du producteur `claude-pilot` et citée avec son site ; le test négatif porte les trois leurres **mesurés**, et un contrôle positif porte la ligne littérale. |
+| **R1 est faux** — les fixtures existent quelque part (p. ex. via PR#192 sur un autre dépôt du workspace). | Verification Contract §6 : précondition rejouée avant toute unité, halte et re-plaidoirie de la rectification. Jamais un contournement silencieux. |
 
 ---
 
@@ -473,7 +650,15 @@ condition bloquante, et des faits R1–R7.
   dépôt ↔ runtime, documentées dans le code.
 - `skills/bundled/_shared/dispatch-lib.sh` — `_measure_cycle_output`,
   `_gate_non_empty_cycle`, `PILOT_RAN`.
-- `/var/log/claude-pilot/` — 5015 fichiers, 2026-03-18 → 2026-09-20.
+- `/var/log/claude-pilot/` — 5015 fichiers, 2026-03-18 → 2026-09-20 ; 2352
+  `.stderr`.
+- `claude-pilot` `src/claude_pilot/guardrails.py` (`_abort("empty_response", …)`,
+  seuil `emptyResponseThreshold`) et `src/claude_pilot/ui.py:112-113`
+  (`log_guardrail` — le format littéral de la ligne) — **le producteur dont
+  l'ancre de `empty_event` est dérivée** (F1).
+- Commentaire opérateur du 2026-09-20 sur mika#1950
+  (`IC_kwDORWsgGM8AAAABVsWYCg`) — le chemin de retour « reposer `post-launch`,
+  retirer `ready` » (F4).
 - Plan mika#1996 (`docs/plans/2026-08-30-002-feat-1996-cycle-non-vide-detecteur-plan.md`)
   — KTD5 : ne pas fermer mika#1910 sans mesure fraîche.
 
@@ -485,3 +670,34 @@ condition bloquante, et des faits R1–R7.
   (fixtures absentes de tout l'historique) ; le ticket est recadré sur la mesure
   qu'il visait, avec séparation des deux axes et refus explicite de produire un
   verdict inattribuable.
+- **2026-09-20** — rev 2. Quatre findings de la première passe architecte
+  adressés, tous les quatre.
+  - **F1 (bloquant)** — la règle d'extraction d'`empty_event` est désormais
+    écrite littéralement dans U1 et **dérivée du producteur**
+    (`claude-pilot` `guardrails.py::_abort("empty_response", …)` →
+    `ui.py::log_guardrail`), avec la ligne ANSI brute, l'ancre en deux temps
+    (dépouillement CSI puis `[guardrail] empty_response:`), et les trois leurres
+    qu'elle exclut. Le test négatif d'AC9 borne donc une frontière **connue**, et
+    un contrôle positif sur la ligne littérale est ajouté pour couvrir
+    l'asymétrie. Effet de bord porteur : en établissant l'ancre, **le « 4 » de
+    R6 s'est révélé non reproductible** — les 4 sessions concernées sont des
+    `error_max_turns`, et le compte producteur-ancré de l'événement est **0 sur
+    2352**. R6 est rectifié, recompté au 2026-09-20, et la v1 est nommée comme
+    ayant commis en petit la faute qu'elle décrivait.
+  - **F2** — l'axe temporel est **réétiqueté en dérive calendaire** (branche 2
+    du change required). Le canal causal candidat (pilote comme capteur aval du
+    dispatcheur) est énoncé explicitement, mais **comme hypothèse non établie**,
+    avec les trois raisons de ne pas la poser comme acquise et le renvoi de sa
+    preuve à l'axe B. AC5 est durci en conséquence : une discontinuité au
+    2026-08-26 ne vaut pas verdict et relève de l'issue 1 de D4.
+  - **F3** — Verification Contract §6 : la précondition R1 est rejouée avant
+    toute unité, avec **halte et re-plaidoirie** si une commande retourne
+    non-vide ; la raison (PR#192, espace de recherche possiblement incomplet)
+    est écrite. AC1 et la Definition of Done le portent, et un risque nommé y
+    renvoie.
+  - **F4** — U3 gagne une section §2 dédiée nommant le chemin de retour
+    opérateur (« reposer `post-launch`, retirer `ready` », commentaire
+    `IC_kwDORWsgGM8AAAABVsWYCg`), la raison de ne pas le prendre (re-parquer ne
+    produit rien et reconduirait l'état qui a laissé le ticket ouvert un mois),
+    et le constat qu'il reste disponible à l'identique. Nouvel **AC10**.
+  - Aucun AC n'est affaibli ; AC1, AC5 et AC9 sont resserrés, AC10 est ajouté.
