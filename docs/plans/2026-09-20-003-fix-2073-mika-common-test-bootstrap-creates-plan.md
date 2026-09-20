@@ -242,6 +242,33 @@ un détecteur vérifié par son seul vert n'est vérifié par rien.
 *est* le bloc de test. La garde lit le fichier brut. `ProductionScanner` reste le
 bon outil pour la garde mika#2230 voisine ; il ne l'est pas pour celle-ci.
 
+### 2.6 Le prédicat de la garde est décidé par trois mesures, pas par sa forme naïve
+
+La formulation « chaque `#[test]` non-`#[serial]` dont le corps appelle
+`bootstrap(` » est juste comme intention et fausse comme prédicat. Trois mesures
+sur l'arbre à l'état de la branche la corrigent, et chacune se paie au premier run
+de CI si elle est découverte à l'implémentation plutôt qu'ici.
+
+| Mesure | Conséquence sur le prédicat |
+|---|---|
+| **`#[serial]` a deux orthographes** : `#[serial]` (195 occurrences) et `#[serial_test::serial]` (26) — dont `server/tier_guard.rs:443` et `:461`, c'est-à-dire **les poseurs de `MIKA_AGENT_TIER` que §1.3 nomme** | reconnaître les deux, sinon la garde déclare non-sériels 26 tests qui le sont — et une garde qui crie sur des sites corrects est une garde qu'on allowliste à la première gêne, ce qui la tue |
+| **Le faux positif existe déjà dans l'arbre** : `tools/update_core_memory.rs:1093` s'appelle `test_updates_still_capped_after_bootstrap` — `bootstrap` y est dans le **nom du test**, aucun appel | le prédicat porte sur un **appel** (`bootstrap_agent(`, `bootstrap(`, `bootstrap_fresh_install(` en position d'appel), jamais sur la présence de la chaîne. Ce test est l'innocent de référence du contrôle de bonne foi d'U5 : il est réel, il est `#[tokio::test]`, et il ne doit pas tirer |
+| **Les attributs de test ne sont pas que `#[test]`** : `#[tokio::test]`, `#[tokio::test(flavor = "multi_thread", …)]` (63), `#[tokio::test(start_paused = true)]` | **décision : la garde couvre `#[test]` et `#[tokio::test…]`.** Se limiter à `#[test]` laisserait hors de portée toute la surface asynchrone de `mika-agent` — or `tools/create_agent.rs:79` appelle `bootstrap_agent` en production et ses tests sont tokio ; la mine s'armerait là sans que rien la voie |
+
+Un quatrième point suit du troisième et mérite d'être écrit : un test tokio
+**multi-thread** n'est pas plus protégé qu'un test nu — `#[serial]` et le
+parallélisme de `libtest` sont deux mécanismes distincts, et c'est la même
+confusion que §1.5 mesure sur `#[serial]`. Le geste correct reste identique :
+passer le tier.
+
+**Ce que la garde ne prétend pas faire.** Elle lit du texte, pas un AST : un appel
+écrit sur plusieurs lignes, aliasé (`use home::bootstrap as b;`) ou traversant un
+helper non nommé lui échappe. C'est acceptable parce que la classe visée est
+l'écriture ordinaire — les huit sites de §1.4 et les six de §1.3 sont tous des
+appels directs sur une ligne — et parce qu'une garde textuelle qui attrape le cas
+ordinaire vaut mieux qu'une garde AST qu'on n'écrit pas. Le dire évite qu'un
+lecteur futur la croie exhaustive et en tire une fausse assurance.
+
 ---
 
 ## Plan d'implémentation
@@ -313,11 +340,22 @@ Deux tests dans `home.rs`, sous `mod tests` :
 - `mika2073_no_bare_test_reads_the_tier_from_the_environment` — scan de source,
   workspace entier (modèle `:1941-1990` pour l'énumération des crates et le
   garde-fou « le scan a-t-il vraiment lu quelque chose ? »), allowlist vide,
-  message nommant le défaut, sa fenêtre et le geste de correction.
+  message nommant le défaut, sa fenêtre et le geste de correction. Prédicat selon
+  §2.6 : attributs `#[test]` **et** `#[tokio::test…]` ; `#[serial]` reconnu sous
+  ses **deux** orthographes ; détection sur un **appel**, jamais sur la chaîne.
 - `mika2073_the_guard_fires_on_a_relapse` — contrôle de bonne foi sur des lignes
-  **fabriquées**, jamais en éditant du source réel. Rechutes à attraper et
-  innocents à épargner (un `#[serial]` légitime, une mention de `bootstrap` dans
-  un commentaire, un appel `_with_tier`).
+  **fabriquées**, jamais en éditant du source réel. Rechutes à attraper : le
+  `#[test]` nu appelant `bootstrap(`, et son jumeau `#[tokio::test]`. Innocents à
+  épargner, les trois premiers **mesurés dans l'arbre** plutôt qu'imaginés : un
+  `#[serial]` légitime, **un `#[serial_test::serial]`** (`tier_guard.rs:443`), **un
+  nom de test contenant `bootstrap` sans appel** (`update_core_memory.rs:1093`),
+  une mention dans un commentaire, un appel `_with_tier`.
+
+**Ordre d'exécution :** écrire la garde **avant** U2/U3 et la regarder tirer sur
+les quatorze sites réels. Une garde écrite après la conversion démarre verte, et
+un détecteur dont on n'a jamais vu le rouge sur du vrai source n'est pas vérifié —
+le contrôle de bonne foi couvre la logique du prédicat, pas son branchement sur
+l'arbre. C'est la reprise du raisonnement de §2.5 appliquée à l'ordre des gestes.
 
 ### U6 — le contrôle positif déterministe (§2.4)
 
@@ -360,7 +398,9 @@ ticket existe pour fermer.
       tier explicitement ; aucun `#[serial]` n'a été ajouté pour cette raison.
 - [ ] La raison est écrite aux deux sites d'U4.
 - [ ] La garde d'U5 est verte, son contrôle de bonne foi aussi, et son allowlist
-      est vide.
+      est vide. Son prédicat couvre `#[tokio::test…]` et les deux orthographes de
+      `#[serial]` (§2.6), et elle a été **vue rouge sur les quatorze sites réels**
+      avant U2/U3.
 - [ ] Le contrôle positif d'U6 est vert et rougit si l'injection est débranchée
       (vérifié à la main une fois, mentionné dans le corps de PR).
 - [ ] `cargo test -p mika-common --lib` vert **cinq fois d'affilée**, plus une
@@ -425,6 +465,6 @@ par le contrôle déterministe d'U6, qui prouve davantage.
 | Risque | Portée | Mitigation |
 |---|---|---|
 | L'extraction change un comportement de production | faible — c'est un déplacement de `let tier = …` d'un cran | la suite existante, qui couvre les trois tiers par les tests sériels, est conservée intacte |
-| La garde d'U5 tire sur un site légitime | réelle — elle scanne tout le workspace | le contrôle de bonne foi d'U5 énumère les innocents ; si elle tire en CI, la résolution est d'injecter le tier, **jamais** d'allowlister |
+| La garde d'U5 tire sur un site légitime | **mesurée, pas hypothétique** — trois faux positifs existent dans l'arbre (§2.6) | le prédicat de §2.6 les exclut par construction ; le contrôle de bonne foi d'U5 les porte comme innocents de référence. Si elle tire quand même en CI, la résolution est d'injecter le tier ou de corriger le prédicat, **jamais** d'allowlister |
 | Un des six tests de `well_known_agents.rs` assère un contenu de gabarit | à établir en U3 | ce serait un second défaut vivant : le nommer dans le corps de PR plutôt que de le corriger en silence |
 | Les cinq exécutions d'AC4 sont vertes sans rien prouver | certaine — c'est la nature d'une preuve probabiliste sur une fenêtre étroite | c'est pourquoi U6 existe ; AC4 est livrée par fidélité au ticket, pas comme preuve principale |
