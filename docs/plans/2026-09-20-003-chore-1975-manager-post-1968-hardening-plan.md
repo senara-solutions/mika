@@ -210,6 +210,37 @@ GitHub — check network/DNS/TLS »*, ce qui est faux d'un réseau seulement len
 cela fusionnerait deux populations dont les remèdes diffèrent (« le réseau est
 mort » vs « la sonde est trop serrée ou l'hôte est chargé »).
 
+**`Timeout` est posé au site, jamais dérivé d'un texte — et cette frontière est
+la seule chose qui sépare U2 de U3 dans la même fonction.** `classify_cycle_error`
+contient **déjà** `lower.contains("timed out")`, dans la branche `Network`
+(`spawn.rs:577`). Un implémenteur qui applique U2 (resserrer les motifs
+numériques) puis U3 (ajouter la variante) lit ce motif à côté d'une variante
+`Timeout` fraîchement introduite, et le geste « par cohérence » est de le
+rebrancher. **Il ne doit pas.** Trois raisons, dans l'ordre :
+
+1. **Ce sont deux faits différents, et l'un des deux n'est pas une observation.**
+   `AuthClass::Timeout` dit *« notre budget a coupé »* — nous le savons parce que
+   c'est nous qui avons coupé, et la classe est posée directement sur le bras
+   `Err(Elapsed)` (U3), sans jamais passer par un classificateur. `"timed out"`
+   dans le texte de `gh` dit *« le transport a expiré »*, ce qui est une
+   information de réseau. Les fusionner ferait, dans l'autre sens, exactement ce
+   que le paragraphe ci-dessus refuse.
+2. **Le rebranchement ne déplacerait rien de la population visée.** Le texte du
+   timeout de la sonde n'est pas reclassé, donc le rebranchement ne changerait
+   la classe d'aucun timeout de sonde — il ne déplacerait que de vrais timeouts
+   réseau de cycle, c'est-à-dire précisément les cas où `Network` est juste.
+3. **Aucun `Timeout` ne peut naître dans le corps de cycle**, puisque D9 laisse
+   ses appels `gh` non bornés. Un motif `Timeout` dans `classify_cycle_error`
+   serait donc une classe qui ne peut classer que du texte de transport sous une
+   étiquette de budget.
+
+**Conséquence : `classify_cycle_error` ne gagne aucun motif, et `"timed out"`
+reste sous `Network`.** Ce n'est pas D7 à la lettre (D7 couvre 401/403/404) mais
+c'en est la famille : un motif retiré de `Network` change un format de fil en
+silence, et l'opérateur qui grep `auth_class=network` pour « le réseau est mort »
+cesse de voir les timeouts de transport sans qu'aucune ligne ne le dise.
+Épinglé par test (Verification Contract, AC1).
+
 **Refusé : un nom d'événement distinct**, à la manière de
 `manager_token_refresh_timeout`. Ce voisin a eu besoin de son propre nom parce
 qu'il n'a **aucun champ de classe** ; la sonde d'auth a un événement unique
@@ -427,7 +458,14 @@ resserrement ne puisse pas non plus être défait par un changement de `Display`
   `tokio::time::timeout(GH_AUTH_PROBE_TIMEOUT, …)`. Sur `Err(Elapsed)`, rendre
   `GhAuthError { auth_class: Timeout, stderr_head: format!("probe timed out after {}s", …), exit_code: -1 }`.
 - Ajouter le bras de hint `AuthClass::Timeout` dans le `match` de
-  `spawn.rs:297-311` (le `match` est exhaustif : le compilateur l'exige).
+  `spawn.rs:297-311` (le `match` est exhaustif, sans bras `_` : le compilateur
+  l'exige — vérifié sur le code au 2026-09-20).
+- **Ne rien ajouter à `classify_cycle_error`.** La variante `Timeout` n'a aucun
+  motif textuel ; elle est posée au site `Err(Elapsed)` et nulle part ailleurs.
+  `lower.contains("timed out")` (`spawn.rs:577`) reste sous `Network` — voir D3,
+  dernier bloc, pour les trois raisons et le contrôle négatif qui l'épingle.
+- Étendre le docstring de `auth_alarm_never_fires_for_non_auth_classes` en même
+  temps que sa boucle (Verification Contract, AC1).
 
 ### U4 — `spawn.rs` : la garde sans verrou (AC2, D4)
 
@@ -477,9 +515,19 @@ mika#2277.
 | `mika1975_a_probe_just_under_the_budget_succeeds` | mock dormant 14 s ⇒ `Ok(())` — contrôle négatif : sans lui, « la sonde est bornée » ne se distingue pas de « la sonde échoue toujours » |
 | `auth_alarm_never_fires_for_non_auth_classes` (étendu) | `Timeout` ajouté à la boucle ⇒ jamais d'alarme |
 | `mika1975_auth_class_as_str_is_a_wire_format` | les six valeurs épinglées |
+| `mika1975_a_transport_timeout_is_still_a_network_error` | `classify_cycle_error` sur `"gh: request timed out"` ⇒ `Network`, **pas** `Timeout`. **Contrôle négatif de la frontière D3** : la seule assertion qui rougit si quelqu'un rebranche `"timed out"` sur la variante fraîchement introduite — sans elle, ce rebranchement compile, passe toute la suite, et ampute `Network` d'un motif en silence |
 
 Le mock dormant est un nouveau `SleepingGhRunner` dans `mod tests` ; l'horloge
 virtuelle rend les deux tests instantanés et déterministes.
+
+**Conséquence documentaire obligatoire, symétrique de celle de D4.** Le docstring
+de `auth_alarm_never_fires_for_non_auth_classes` (`spawn.rs:2345-2360`) **énumère
+en prose** les classes de sa boucle et argumente pourquoi chacune y figure — il
+raconte même l'histoire du retrait de `Forbidden` par mika#2063. Étendre la boucle
+sans étendre la prose poserait un docstring qui décrit une population plus petite
+que celle qu'il teste, c'est-à-dire le même défaut que le docstring de
+`MANAGER_SPAWN_GUARD` argumentant pour le `Mutex` qu'on lui retire. La phrase à
+ajouter est celle de D3 : un budget de sonde qui coupe n'est pas une porte fermée.
 
 ### AC2 — la garde
 
@@ -553,6 +601,10 @@ continu. Vérifier qu'un redémarrage a bien eu lieu avant de conclure.
       frontière existant étendu.
 - [ ] `as_str()` rend `"timeout"` et les six valeurs sont épinglées comme format
       de fil.
+- [ ] `classify_cycle_error` ne porte **aucun** motif `Timeout` ; `"timed out"`
+      classe toujours `Network`, asserté par contrôle négatif.
+- [ ] Le docstring de `auth_alarm_never_fires_for_non_auth_classes` énumère la
+      même population que sa boucle.
 - [ ] `MANAGER_SPAWN_GUARD` est un `AtomicBool` ; plus aucun `.unwrap()` sur un
       statique dans ce fichier ; son docstring ne contredit plus son code.
 - [ ] `reset_spawn_guard_for_test` et
