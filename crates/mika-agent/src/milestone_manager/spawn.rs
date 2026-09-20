@@ -83,7 +83,12 @@ pub const ENV_DELIVERY_TOKEN: &str = "MIKA_MANAGER_DELIVERY_TOKEN";
 pub const ENV_ESCALATION_URL: &str = "MIKA_MANAGER_ESCALATION_URL";
 pub const ENV_HEALTH_URL: &str = "MIKA_MANAGER_HEALTH_URL";
 pub const ENV_CHECKPOINT_DIR: &str = "MIKA_MANAGER_CHECKPOINT_DIR";
-pub const ENV_OFFLINE_SINK_DIR: &str = "MIKA_MANAGER_OFFLINE_SINK_DIR";
+
+// `ENV_OFFLINE_SINK_DIR` vit dans `sink_dir.rs` depuis mika#2267 : l'écrivain
+// et le lecteur CLI doivent passer par le MÊME résolveur, et la garde
+// structurelle qui le tient a besoin d'un fichier propriétaire unique. Voir
+// `super::sink_dir`.
+pub use super::sink_dir::ENV_OFFLINE_SINK_DIR;
 
 /// Default heartbeat interval in seconds (6 hours per brief § verdict 2).
 pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: i64 = 21_600;
@@ -94,9 +99,6 @@ pub const DEFAULT_SILENCE_THRESHOLD_DAYS: u32 = 3;
 /// when neither `state_changed` nor `heartbeat_fired` is true, so a shorter
 /// poll costs one `gh` invocation and a digest comparison — cheap.
 pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 300;
-/// Fallback root for checkpoint/offline-sink dirs when the env vars and
-/// `HOME` are all unset (last-resort — should not be reached in production).
-const FALLBACK_STATE_ROOT: &str = "/tmp/mika-manager";
 
 /// Assemble a `ManagerConfig` from the current process env, or return
 /// `Ok(None)` when the feature-gate env var is unset.
@@ -164,9 +166,12 @@ pub async fn manager_config_from_env(
     let github_token = settings.resolve_github_token(github_app).await;
 
     let checkpoint_dir = read_path_env(ENV_CHECKPOINT_DIR)
-        .unwrap_or_else(|| default_state_root().join("checkpoints"));
-    let offline_sink_dir =
-        read_path_env(ENV_OFFLINE_SINK_DIR).unwrap_or_else(|| default_state_root().join("sink"));
+        .unwrap_or_else(|| super::sink_dir::default_state_root().join("checkpoints"));
+
+    // mika#2267 C1 — le puits passe par LE résolveur, que le lecteur CLI
+    // appelle aussi. Composer le chemin ici une seconde fois est précisément le
+    // défaut que le ticket ferme, reproduit une couche plus haut.
+    let (offline_sink_dir, sink_dir_source) = super::sink_dir::resolve_offline_sink_dir();
 
     Ok(Some(ManagerConfig {
         target,
@@ -180,6 +185,7 @@ pub async fn manager_config_from_env(
         health_url,
         checkpoint_dir,
         offline_sink_dir,
+        sink_dir_source,
     }))
 }
 
@@ -255,6 +261,8 @@ pub fn spawn_manager_cycle_task(
             escalation_url_set = cfg.escalation_url.is_some(),
             "mika-manager cadence started"
         );
+
+        emit_delivery_resolved(&cfg);
 
         // mika#1968 AC5 + mika#1974 — boot-time GitHub auth sanity call.
         // Runs before the cycle loop starts so any auth/scope failure is
@@ -452,6 +460,48 @@ pub fn spawn_manager_cycle_task(
             }
         }
     }))
+}
+
+// ---- mika#2267 C3 — où vont mes rapports ? -------------------------------
+
+/// Émettre `manager_delivery_resolved` : la ligne qui tranche la question de
+/// mika#2267 (« sink offline vs endpoint, à déterminer ») **sans lire le
+/// source**.
+///
+/// Événement distinct plutôt qu'enrichissement de `manager_cadence_start` :
+/// c'est un événement de *configuration*, il répond à « où vont mes rapports ? »
+/// et non à « la cadence a démarré », et il doit se grep seul. Précédent exact
+/// et même raisonnement : `llm_budget_resolved` (mika#2293). Modifier la forme
+/// d'un événement que des sondes existantes lisent serait par ailleurs un
+/// changement de format de fil gratuit.
+///
+/// **`delivery_token_present` est un booléen** — jamais la valeur, jamais un
+/// préfixe, jamais une longueur. Contrainte dure, doctrine `api_key_present` du
+/// `CLAUDE.md` racine, assertée par un test négatif.
+///
+/// Son **absence** pendant que la cadence tourne signifie que le binaire
+/// déployé est antérieur au correctif (classe mika#2340) — établir le
+/// déploiement avant toute conclusion sur le canal, jamais lire le silence
+/// comme « tout va bien ».
+///
+/// **`pub` pour son test de contrat, pas pour des appelants.** C'est l'unique
+/// émetteur de `manager_delivery_resolved` ; l'assertion négative — aucun
+/// matériel de credential n'atteint un champ — doit piloter le site d'émission
+/// réel, sinon elle atteste une copie de lui.
+pub fn emit_delivery_resolved(cfg: &ManagerConfig) {
+    info!(
+        target: "mika::milestone_manager",
+        event = "manager_delivery_resolved",
+        milestone = %cfg.target.as_display(),
+        route_normal = super::cadence::route_name_for(cfg.delivery_url.as_deref()),
+        route_escalation = super::cadence::route_name_for(cfg.escalation_url.as_deref()),
+        delivery_url_set = cfg.delivery_url.is_some(),
+        escalation_url_set = cfg.escalation_url.is_some(),
+        delivery_token_present = cfg.delivery_token.is_some(),
+        offline_sink_dir = %cfg.offline_sink_dir.display(),
+        sink_dir_source = cfg.sink_dir_source.as_str(),
+        "mika-manager delivery routing resolved"
+    );
 }
 
 // ---- mika#1968 AC5 GitHub auth verification ------------------------------
@@ -1178,19 +1228,6 @@ fn read_path_env(name: &str) -> Option<PathBuf> {
     read_string_env(name).map(PathBuf::from)
 }
 
-/// Resolve the fallback root for state directories (checkpoint + offline sink)
-/// when the explicit env vars are unset. Prefers `$HOME/.mika/manager`; falls
-/// back to a well-known /tmp path (last-resort, should not be hit in
-/// production but keeps the spawn from panicking if HOME is unset).
-fn default_state_root() -> PathBuf {
-    if let Ok(home) = env::var("HOME")
-        && !home.trim().is_empty()
-    {
-        return PathBuf::from(home).join(".mika").join("manager");
-    }
-    PathBuf::from(FALLBACK_STATE_ROOT)
-}
-
 /// Convert a `chrono::Duration` to `std::time::Duration`, clamping negatives
 /// to 1s so the tokio interval never receives a zero/negative period.
 fn duration_from_chrono(d: chrono::Duration) -> Duration {
@@ -1549,6 +1586,7 @@ mod tests {
             health_url: None,
             checkpoint_dir: dir.join("checkpoints"),
             offline_sink_dir: dir.join("sink"),
+            sink_dir_source: super::super::sink_dir::SinkDirSource::Default,
         }
     }
 
