@@ -809,6 +809,29 @@ pub enum MilestoneCommand {
         #[arg(long, default_value_t = 3)]
         silence_threshold_days: u32,
     },
+    /// List Phase 1 reports written to the offline sink, most recent first
+    /// (mika#2267).
+    ///
+    /// The cadence writes a report to the offline sink whenever no delivery
+    /// URL is configured, and as a fallback when an HTTP delivery fails. Until
+    /// mika#2267 nothing read that directory — this is the reader. The output
+    /// always names the directory it consulted and how that path was decided,
+    /// because the CLI (run by the operator) and the daemon (run by the
+    /// service, possibly under another HOME) can resolve different ones.
+    Reports {
+        /// Restrict to one milestone: `<owner/repo>#<number>`. Absent → all.
+        #[arg(long)]
+        target: Option<String>,
+        /// Print the most recent report's Markdown to stdout instead of
+        /// listing. `--format` is ignored: the content is the output.
+        #[arg(long)]
+        latest: bool,
+        /// How many entries to list. Ignored with `--latest`.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
 }
 
 #[derive(clap::Args)]
