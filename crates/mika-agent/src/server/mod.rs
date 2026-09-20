@@ -109,6 +109,15 @@ const WIP_RESCUE_CRON: &str = "0 */5 * * * *";
 /// one-off backlog the first tick after deployment sees.
 const QA_REVIEW_RECONCILE_CRON: &str = "0 */15 * * * *";
 
+/// Cron du reaper de worktrees de PR terminale : toutes les dix minutes
+/// (mika#2420).
+///
+/// Aligné sur [`AUTO_PULL_CRON`], et cette cadence est ce qui rend le hook
+/// post-merge superflu : le disque monte d'environ 8 %/h sur la machine mesurée,
+/// donc dix minutes de latence coûtent ~1,3 % de disque — négligeable devant
+/// l'écart entre 55 % et 85 % que la purge manuelle refait trois fois par jour.
+const WORKTREE_REAP_CRON: &str = "0 */10 * * * *";
+
 /// Build the Axum router with all routes and middleware.
 ///
 /// Shared between production `run_server` and test `test_app`.
@@ -580,6 +589,7 @@ async fn init_agent(
         // un process neuf re-photographie l'état qu'il trouve et écrit une
         // transition si le STOP est déjà armé au premier tick.
         auto_pull_stop_armed: AtomicBool::new(false),
+        worktree_reap_stop_armed: AtomicBool::new(false),
         proactive_budget_reported: std::sync::Mutex::new(None),
     });
 
@@ -1705,6 +1715,39 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
             }
         }
 
+        // Register the terminal-worktree reaper for mika-dev only (mika#2420).
+        // Same env-gated shape as its three neighbours: MIKA_WORKTREE_REAP=0
+        // disables it.
+        //
+        // The knob **cancels** the row rather than merely skipping its
+        // registration: otherwise a row posted by an earlier startup would
+        // outlive the disarm — the exact defect mika#2271 had to repair. It is a
+        // *startup* lever; the hot one is the sentinel file named by
+        // `auto_pull_stop::WORKTREE_REAP_SCAN` (that module is its sole reader,
+        // and its structural guard refuses a second occurrence of the literal
+        // anywhere under `src/`), and the third is
+        // `MIKA_WORKTREE_REAP_DISPOSITION=observe`. Three levers, three scopes,
+        // none redundant.
+        if name == "mika-dev" {
+            if std::env::var("MIKA_WORKTREE_REAP")
+                .map(|v| v == "0")
+                .unwrap_or(false)
+            {
+                info!(agent = %name, "worktree_reap disabled via MIKA_WORKTREE_REAP=0");
+                if let Err(e) = db.cancel_recurring_task_by_label("worktree_reap").await {
+                    warn!(agent = %name, error = %e, "failed to cancel stale worktree_reap task");
+                }
+            } else {
+                task_engine::ensure_recurring_task(
+                    &db,
+                    "worktree_reap",
+                    WORKTREE_REAP_CRON,
+                    r#"{"trigger":"worktree_reap"}"#,
+                )
+                .await;
+            }
+        }
+
         // Register curator review recurring task (mika#1584).
         {
             let identity = crate::prompt::load_identity_async(&agent_state.home_dir).await;
@@ -1875,6 +1918,7 @@ mod tests {
             settings: test_settings(),
             pr_reviews_posted: None,
             auto_pull_stop_armed: AtomicBool::new(false),
+            worktree_reap_stop_armed: AtomicBool::new(false),
             proactive_budget_reported: std::sync::Mutex::new(None),
         });
         let engine = Arc::new(tokio::sync::Mutex::new(TaskEngine::new(
