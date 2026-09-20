@@ -124,7 +124,22 @@ Effet de bord à connaître : `theme.css` apporte aussi des styles globaux (scro
 - pour les utilitaires Tailwind : `bg-accent/12`, `shadow-accent/8` — la syntaxe d'opacité v4 s'applique aux couleurs de thème ;
 - pour les `style={{ background: 'linear-gradient(…)' }}` : `color-mix(in srgb, var(--color-accent) 12%, transparent)`.
 
-Le critère d'acceptation est la **propriété**, pas la forme : aucun littéral de couleur d'accent ne subsiste. Si `color-mix` pose un problème sur une cible de navigateur, un `rgb(from var(--color-accent) r g b / 12%)` ou une custom property dédiée sont des replis acceptables — ce qui ne l'est pas, c'est de réécrire `rgba(173,163,255,…)`.
+**Plancher navigateur — la condition est levée, pas laissée ouverte** (F2). `site/` ne déclare ni `browserslist` (`site/package.json`) ni `build.target` (`site/vite.config.ts`), donc deux planchers s'appliquent et c'est le plus haut qui lie :
+
+| source | plancher |
+|---|---|
+| Vite 7 (`vite ^7.3.1`), défaut `baseline-widely-available` | Chrome 107, Edge 107, Firefox 104, Safari 16.0 |
+| **Tailwind CSS v4** (`tailwindcss ^4.2.1`) — contraignant | **Chrome 111, Safari 16.4, Firefox 128** |
+| `color-mix()` | Chrome 111, Edge 111, Safari 16.2, Firefox 113 |
+| `rgb(from …)` (relative color syntax) | Chrome 119, Safari 16.4, Firefox 128 |
+
+Le plancher liant est celui de Tailwind v4, et il est **au-dessus ou à égalité** du support de `color-mix()` sur les trois moteurs. Corollaire : `color-mix()` est disponible partout où la landing rend déjà quoi que ce soit — le plancher n'est pas un choix à faire, il est **déjà payé par une dépendance en place**, Tailwind v4 émettant lui-même du `color-mix()` pour ses modificateurs d'opacité (`bg-accent/12` en produit). Précédent en production dans ce dépôt : `dashboard/src/pages/SessionDetail.tsx:613`.
+
+Conséquence sur la forme : **`color-mix()` est la forme retenue, sans chaîne de repli**, et `rgb(from …)` — dont le plancher Chrome est *plus haut* de 8 versions — n'est pas un repli mais une régression de compatibilité. Si un implémenteur veut malgré tout une custom property dédiée pour la lisibilité, c'est un choix de style sans effet sur le plancher.
+
+Le critère d'acceptation reste la **propriété**, pas la forme : aucun littéral de couleur d'accent ne subsiste. Ce qui n'est en aucun cas acceptable, c'est de réécrire `rgba(173,163,255,…)` — on aurait remplacé un violet figé par un autre.
+
+_Citation F2 : `docs/architecture/review-guide.md` § KISS — une précondition d'environnement non énoncée force l'implémenteur à sur-concevoir (forme la plus conservatrice par défaut) ou à sous-spécifier (choisir et espérer). Le tableau ci-dessus la pose une fois._
 
 **Étape A4 — canal 3, le `<body>`.** `site/index.html:12` : `bg-[#0d0f12] text-[#a0a8b8]` → `bg-bg text-muted`. Ces classes existent déjà via les alias et résolvent vers le canon.
 
@@ -141,6 +156,42 @@ Job CI `landing-tokens-lint` dans `.github/workflows/ci.yml`, sur le modèle des
 **Étape B1.** Écrire `docs/design/control-monitor-scope-decision.md` : la recommandation (**rester distinct**), sa rationale citant `luminescent-core.md:4` et le caractère operator-tool de l'outil, la nuance exclusion-vs-omission, et le chemin de confirmation vers Vincent. Le fichier vit dans `docs/design/` à côté du rulebook — c'est déjà là que vit un document de réconciliation qui n'est pas le rulebook (`dashboard-stitch-map.md`).
 
 **Aucun ticket cross-repo n'est ouvert** : l'AC2 ne le demande que « si adopte ». La recommandation étant « distinct », l'ouvrir serait agir contre sa propre conclusion. Si Vincent renverse la lecture, le ticket cross-repo est son geste, et le document le dit.
+
+---
+
+## Fire-Disposition
+
+Ce plan livre un détecteur — `scripts/check-landing-tokens.sh` (A5) et son job CI `landing-tokens-lint`. La Fire-Disposition Gate (mika#1574) exige de nommer ce qui se passe quand il tire sur des données **existantes**, avant sa mise en service.
+
+**Option canonique retenue : (a) Exception nommée en allowlist.**
+
+**(i) Le tirage attendu.** Sans allowlist, le détecteur rouge dès sa première exécution sur du code que ce plan ne corrige pas : six littéraux hex, trois valeurs distinctes, deux sites.
+
+**(ii) Les exceptions, énumérées.**
+
+| hex | rôle | sites |
+|---|---|---|
+| `#ff5f57` | pastille « fermer » (chrome de fenêtre macOS) | `site/src/components/Hero.tsx:80`, `site/src/components/Teams.tsx:32` |
+| `#febc2e` | pastille « réduire » | `site/src/components/Hero.tsx:81`, `site/src/components/Teams.tsx:33` |
+| `#28c840` | pastille « agrandir » | `site/src/components/Hero.tsx:82`, `site/src/components/Teams.tsx:34` |
+
+L'allowlist du script porte ces trois valeurs **avec leur raison écrite au même endroit**, pas dans un commit message : ce sont des couleurs de chrome de fenêtre tierce dans un mockup de terminal, pas de la palette de marque. Les aligner sur le canon détruirait la citation visuelle, qui est l'intention du composant.
+
+**(iii) Tracker de suivi et assertion auto-nettoyante : écartés par conception, et c'est la partie qui doit être lue.** L'option (a) canonique les demande tous les deux. Ils sont refusés ici pour une raison de nature, pas de commodité :
+
+- **Aucun tracker n'est ouvert** parce qu'il n'y a **rien à fermer**. Un tracker de suivi suppose un chemin de résolution — « ces valeurs partiront quand X ». Ici il n'y a pas de X : le skeuomorphisme est un état cible permanent. Un ticket ouvert sur une exception sans résolution est un ticket qui ne se ferme jamais, c'est-à-dire du bruit dans le registre avec l'apparence d'une dette.
+- **Aucune assertion auto-nettoyante n'est posée** parce qu'il n'existe pas de condition d'obsolescence à asserter. Le patron auto-nettoyant (modèle : l'assertion `exportable` de mika#2292) rougit le jour où le fait qu'il garde cesse d'être vrai. Ici le fait gardé — « macOS dessine ses pastilles dans ces trois couleurs » — n'a pas de date de péremption contrôlée par ce dépôt. Une assertion qui ne peut jamais rougir n'est pas un garde-fou, c'est une ligne de test qui donne l'illusion d'en être un.
+
+Ce qui remplace ces deux éléments, et qui est le vrai garde-fou : **l'allowlist est nominative par valeur, jamais par fichier ni par motif**. Un futur `#ff5f57` écrit ailleurs qu'en pastille passerait — limite nommée, acceptée, et bornée par le fait que ces trois valeurs ne sont pas des couleurs de marque plausibles. Un futur `bg-[#7c6af7]` écrit de bonne foi, lui, rougit. Exclure les deux **fichiers** (`Hero.tsx`, `Teams.tsx`) de la vérification aurait ouvert un trou réel : ce sont deux des six composants portant du `rgba(124,106,247,…)` au canal 2.
+
+**(iv) Zéro autre violation pré-existante — vérifié, pas supposé.** L'inventaire exhaustif des littéraux hex de `site/` (`grep -rnoiE "#[0-9a-f]{6}" src/ index.html`, 2026-09-20) rend **quatorze** occurrences et rien d'autre :
+
+- huit sont des valeurs de la palette legacy (`index.css:6-11` × 6, `index.html:12` × 2) — **toutes supprimées par A2 et A4** ;
+- six sont les pastilles ci-dessus.
+
+Le canal 2 (la forme décimale `124,106,247` dans six composants) est **entièrement corrigé par A3**. L'allowlist est donc l'ensemble **complet** des exceptions, et non un premier lot : après ce plan, le détecteur tire exactement sur zéro ligne de `site/`. C'est ce qui rend V5/V6 (les contrôles négatifs) significatifs — un lint qui part déjà rouge ne prouve rien quand on le voit rougir.
+
+_Citation : `mika-arch-groom-ticket` § Fire-Disposition Gate (mika#1574), branche 2 de l'arbre de décision._
 
 ---
 
@@ -168,7 +219,7 @@ V5 et V6 sont les vérifications qui comptent : un lint qu'on n'a pas vu rougir 
 - `site/` ne porte plus aucune valeur de la palette legacy, sur les trois canaux.
 - La landing rend la palette canon, vérifié dans le CSS produit **et** à l'œil (V9).
 - `scripts/check-landing-tokens.sh` existe, est branché en CI, et a été vu rougir (V5/V6).
-- L'allowlist du script nomme les pastilles macOS et dit pourquoi.
+- L'allowlist du script nomme les trois pastilles macOS **par valeur** et dit pourquoi, conformément au § Fire-Disposition (option (a), exception nommée).
 - `docs/design/control-monitor-scope-decision.md` existe, avec recommandation, rationale citée et chemin de confirmation.
 - `docs/design/luminescent-core.md` est inchangé (`git diff` vide sur ce fichier).
 - `packages/ui/src/theme.css` est inchangé.
@@ -206,3 +257,12 @@ Transcrits du corps de mika#1804 :
 | Les alias de compat sont supprimés plus tard et cassent la landing | faible | Le commentaire de `theme.css:53-57` conditionne leur suppression à un sweep qui constaterait zéro référence : la landing en restant consommatrice **empêche** la suppression silencieuse. Le suivi de renommage ci-dessus est la sortie propre. |
 | La scrollbar stylée apportée par `theme.css` surprend en review | faible | Nommé ici et dans le corps de PR ; c'est un alignement, pas un accident. |
 | La recommandation B est renversée par Vincent | réelle et acceptée | Le document est une recommandation datée avec son chemin de confirmation, pas un fait accompli. Le renversement coûte un ticket cross-repo, que le document nomme déjà. |
+
+---
+
+## Revision history
+
+- **rev 2 (2026-09-20)** — révision en réponse aux findings de la première passe architecte (`.iterate/findings-1.md`).
+  - **F1 (BLOCKING) adressé** : ajout d'une section `## Fire-Disposition` de plein droit, là où le contenu d'allowlist n'était que de la prose dispersée en Design §A5. Elle (i) nomme l'option canonique **(a) Exception nommée en allowlist**, (ii) énumère les trois hex de pastille macOS avec leurs six sites, (iii) **écarte explicitement le tracker de suivi et l'assertion auto-nettoyante, avec leur raison de nature** — pas de chemin de résolution donc rien à fermer ; pas de condition d'obsolescence donc rien à asserter — et nomme ce qui les remplace (allowlist nominative **par valeur**, jamais par fichier, avec sa limite acceptée), et (iv) confirme par inventaire exhaustif daté que les quatorze littéraux hex de `site/` se partagent entre huit valeurs legacy supprimées par A2/A4 et les six pastilles, soit **zéro autre violation pré-existante** — l'allowlist est l'ensemble complet, pas un premier lot. Conséquence portée sur la DoD : l'allowlist est nominative par valeur. Citation préservée : mika#1574, branche 2.
+  - **F2 (sharpening) adressé** : A3 ne pose plus de conditionnel non évaluable. Le plancher navigateur de `site/` est établi (ni `browserslist` ni `build.target` déclarés ⇒ deux planchers, le liant étant Tailwind v4 : Chrome 111 / Safari 16.4 / Firefox 128) et **`color-mix()` est disponible partout où la landing rend déjà**, Tailwind v4 en émettant lui-même. La chaîne de repli disparaît : `color-mix()` devient la forme retenue et `rgb(from …)`, dont le plancher Chrome est plus haut de 8 versions, est requalifié de régression de compatibilité plutôt que de repli. Précédent en production cité (`dashboard/src/pages/SessionDetail.tsx:613`). Citation préservée : `review-guide.md` § KISS.
+  - Aucun AC affaibli ; aucune autre section réécrite.
