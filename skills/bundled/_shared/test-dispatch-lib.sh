@@ -6334,9 +6334,17 @@ _mika1943_probe() {
     rc=${err##*RC=}
     if [ "$rc" = "0" ]; then
         printf 'ACCEPTED'
-    else
-        printf 'REFUSED:%s' "$(printf '%s' "$err" | sed -n 's/.*term=\([a-z_]*\).*/\1/p' | head -1)"
+        return 0
     fi
+    # Extraction du jeton `term=` par expansion bash, sans pipe : un
+    # `sed … | head -1` sous `set -o pipefail` (en tête de ce fichier) rend 141
+    # dès que `head` ferme le tuyau avant la fin de `sed`. Ça ne se produit pas
+    # sur une ligne courte, donc ça passerait — et rougirait le jour où le
+    # message du refus s'allonge, pour une raison sans rapport avec ce qu'il
+    # teste.
+    local term=""
+    case "$err" in *term=*) term=${err#*term=}; term=${term%% *} ;; esac
+    printf 'REFUSED:%s' "$term"
 }
 
 # --- Contrôles positifs : chaque chemin est refusé, et par le bon terme ------
