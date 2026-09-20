@@ -412,12 +412,27 @@ timestamps per installed skill.
 Source: `crates/mika-agent/src/mcp/`
 
 Mika connects to external MCP servers at startup via `McpManager`, using the `rmcp`
-crate (v0.17) for both stdio and Streamable HTTP transports.
+crate (v2.0) for both stdio and Streamable HTTP transports.
+
+See [mcp.md](mcp.md) for the operator-facing contract: who a server is activated
+for, how to run one without imposing it on the whole fleet, and what the MCP
+channel does and does not protect.
 
 ### Configuration
 
-MCP servers are configured in `{agent_home}/mcp.json` (Claude Desktop convention,
-written with `0600` permissions to protect secrets):
+**MCP configuration is operator-global, not per-agent** (mika#1737). It is read
+from the first of these that resolves: `MIKA_MCP_CONFIG`,
+`$XDG_CONFIG_HOME/mika/mcp-servers.json`, `$HOME/.config/mika/mcp-servers.json`,
+then `./mcp-servers.json` (which emits a warning). The legacy per-agent
+`{agent_home}/mcp.json` is migrated once to that path and is no longer read.
+
+A server written there is loaded for **every** agent, and an agent's
+`[tools].disabled` denylist cannot refuse it — MCP tool definitions are appended
+after the per-agent visibility filter runs. Isolation is procedural today; see
+[mcp.md § 3](mcp.md).
+
+The format is unchanged (Claude Desktop convention, written with `0600`
+permissions to protect secrets):
 
 ```json
 {
@@ -477,14 +492,25 @@ Dispatch chain: builtins → skills → MCP → unknown error.
 
 | Context | MCP Available |
 |---------|--------------|
-| CLI ask mode (`mika ask`) | Yes (per-invocation connections, graceful shutdown) |
-| CLI chat mode (`mika`) | Yes (session-persistent connections) |
-| Server mode (`mika-spirit`) | Yes (per-agent manager, startup connections) |
-| Silent mode (heartbeat, reflection, callbacks) | No |
-| Team agent runs | No (Phase 4 future) |
+| Server mode (`mika-spirit`) — `POST /message`, `/a2a/{agent}` | Yes (per-agent manager, startup connections) |
+| `mika ask` | Yes — **but the turn runs in mika-spirit, not in the CLI process** |
+| CLI chat mode (`mika chat`) | Yes (session-persistent connections, graceful shutdown) |
+| Silent mode (heartbeat, reflection, reminders, callbacks, deferred dispatch) | No |
+| Team agent runs | No (both spawn sites pass `None`) |
+| `delegate_task` | No |
+
+**On `mika ask`.** Since mika#1727 it is a thin A2A client: it posts to
+`/a2a/{agent}` on the local daemon and renders the returned Task. The turn
+therefore uses **mika-spirit's** MCP manager, not a per-invocation connection —
+so after editing the MCP configuration it is mika-spirit that must be restarted,
+not the command that must be re-run. `mika chat`, which still runs its turn
+in-process, is the one CLI path that connects on its own (and the only caller of
+`McpManager::shutdown()`).
 
 CLI commands: `mika mcp add/remove/list/enable/disable`, `--header KEY=VALUE` for
-HTTP headers.
+HTTP headers. Note `mika mcp add` writes to the operator-global file and exposes
+no `--env` flag; a server needing an environment variable requires hand-editing
+the JSON.
 
 
 ## 9. Unified Task Engine
