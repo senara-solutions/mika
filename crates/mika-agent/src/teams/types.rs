@@ -153,6 +153,82 @@ pub enum RunStatus {
     FailedTransport(String),
 }
 
+/// Operator-register reason for [`RunStatus::FailedNoDelegation`] (mika#1940 D5).
+///
+/// The variant carries no field, so every reader that wants a sentence has to
+/// invent one — and two already had, with two different wordings: `engine.rs`
+/// for the `team_runs.failure_reason` column, and `notification.rs` for the
+/// user-facing message. The CLI would have been the third.
+///
+/// This constant is the single write site for the **operator** register: the DB
+/// column and `stderr`. The **user** register stays in `notification.rs` and is
+/// deliberately *not* deduplicated against it — it is a sentence addressed to a
+/// person, carrying a remediation ("Try rephrasing the goal…"), where this one
+/// is a short diagnostic that lands in a database column. Two registers for one
+/// fact, separated on purpose; same trade-off as mika#2290 and mika#2292.
+pub const NO_DELEGATION_REASON: &str =
+    "orchestrator returned a conversational reply for an actionable goal and \
+     delegated to zero members (after one reinforced retry)";
+
+/// Terminal disposition of a run, as a single compile-checked decision.
+///
+/// See [`RunStatus::disposition`] for why this exists rather than a predicate
+/// written at each call site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunDisposition<'a> {
+    /// Still running, or suspended awaiting callbacks.
+    NotTerminal,
+    /// Terminal success.
+    Success,
+    /// Terminal failure, with its operator-register reason.
+    Failure { reason: &'a str },
+}
+
+impl RunStatus {
+    /// **The** exhaustive match over `RunStatus`, with no `_` arm (mika#1940 D1).
+    ///
+    /// Two terminal failure variants were added after the CLI was written —
+    /// `FailedNoDelegation` (mika#1676) and `FailedTransport` (mika#1671) — and
+    /// the split between the readers that followed them and the readers that did
+    /// not is exactly the split between exhaustive matches and hand-written
+    /// patterns. At the time mika#1940 was opened: `Display`, the DB-column
+    /// match in `engine.rs` and `notification.rs` are exhaustive matches, and all
+    /// three had followed both additions; `ask.rs`'s two `matches!` / `if let`
+    /// and `chat.rs`'s `if let` are hand-written, and none of the three had
+    /// followed either. `matches!` and `if let` are precisely the two forms that
+    /// keep compiling when a variant appears — the same class mika#2023 M2 had
+    /// to name in writing about `tier == AgentTier::Family`, "a mine no compile
+    /// error could announce".
+    ///
+    /// So the remedy is not six more arms at the call sites; it is taking the
+    /// right to enumerate away from them. A seventh variant now fails to compile
+    /// *here*, and nowhere else has to notice.
+    ///
+    /// [`Self::is_terminal_failure`] and the failure reason are **derived** from
+    /// this, never written separately — which makes "it is a failure ⟺ it has a
+    /// reason" true by construction rather than true by test.
+    pub fn disposition(&self) -> RunDisposition<'_> {
+        match self {
+            RunStatus::Running | RunStatus::Suspended => RunDisposition::NotTerminal,
+            RunStatus::Completed => RunDisposition::Success,
+            RunStatus::Failed(reason) => RunDisposition::Failure { reason },
+            RunStatus::FailedNoDelegation => RunDisposition::Failure {
+                reason: NO_DELEGATION_REASON,
+            },
+            RunStatus::FailedTransport(reason) => RunDisposition::Failure { reason },
+        }
+    }
+
+    /// Whether this is a terminal failure — derived from [`Self::disposition`].
+    ///
+    /// Deliberately not a second match: a predicate written beside an exhaustive
+    /// match is a predicate that stops following it, which is the whole of
+    /// mika#1940.
+    pub fn is_terminal_failure(&self) -> bool {
+        matches!(self.disposition(), RunDisposition::Failure { .. })
+    }
+}
+
 /// A task delegated to a specialist agent.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TaskAssignment {
@@ -295,6 +371,83 @@ impl std::fmt::Display for TaskStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every variant has a disposition, and the three failures carry a reason.
+    ///
+    /// This is AC1 of mika#1940, extended to `FailedTransport` (M1): the ticket
+    /// named one missing variant, the code had two.
+    #[test]
+    fn mika1940_disposition_covers_every_variant() {
+        let cases: Vec<(RunStatus, RunDisposition<'_>)> = vec![
+            (RunStatus::Running, RunDisposition::NotTerminal),
+            (RunStatus::Suspended, RunDisposition::NotTerminal),
+            (RunStatus::Completed, RunDisposition::Success),
+            (
+                RunStatus::Failed("boom".to_string()),
+                RunDisposition::Failure { reason: "boom" },
+            ),
+            (
+                RunStatus::FailedNoDelegation,
+                RunDisposition::Failure {
+                    reason: NO_DELEGATION_REASON,
+                },
+            ),
+            (
+                RunStatus::FailedTransport("connection reset".to_string()),
+                RunDisposition::Failure {
+                    reason: "connection reset",
+                },
+            ),
+        ];
+
+        for (status, expected) in &cases {
+            assert_eq!(
+                status.disposition(),
+                *expected,
+                "wrong disposition for {status}"
+            );
+        }
+    }
+
+    /// `is_terminal_failure()` and `disposition()` can never disagree.
+    ///
+    /// D1 makes this almost tautological — the predicate is *derived* from the
+    /// disposition. It is written down anyway because the failure it catches is
+    /// someone rewriting `is_terminal_failure` as a second hand-written match,
+    /// which is exactly the gesture mika#1940 exists to refuse.
+    #[test]
+    fn mika1940_failure_and_reason_agree() {
+        let all = [
+            RunStatus::Running,
+            RunStatus::Suspended,
+            RunStatus::Completed,
+            RunStatus::Failed("boom".to_string()),
+            RunStatus::FailedNoDelegation,
+            RunStatus::FailedTransport("connection reset".to_string()),
+        ];
+
+        for status in &all {
+            assert_eq!(
+                status.is_terminal_failure(),
+                matches!(status.disposition(), RunDisposition::Failure { .. }),
+                "predicate and disposition disagree on {status}"
+            );
+        }
+    }
+
+    /// The constant is byte-for-byte the string `engine.rs` used to inline.
+    ///
+    /// U1.5 of mika#1940 is a deduplication, not a rewrite: the value written to
+    /// `team_runs.failure_reason` must not change. Asserted against a literal
+    /// re-typed from the pre-fix `engine.rs`, because comparing the constant to
+    /// itself would prove nothing.
+    #[test]
+    fn mika1940_no_delegation_reason_is_the_engine_string() {
+        assert_eq!(
+            NO_DELEGATION_REASON,
+            "orchestrator returned a conversational reply for an actionable goal and delegated to zero members (after one reinforced retry)"
+        );
+    }
 
     #[test]
     fn test_run_status_display() {
