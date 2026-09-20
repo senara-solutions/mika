@@ -84,6 +84,19 @@ le nom, `mika2230_from_env_reads_the_extracted_parser` (`:1874`), appelle
 `AgentTier::parse()`, une fonction **pure** : il est sain, et il ne faut pas le
 « corriger ».
 
+**Table vérifiée exhaustive** par scan de tous les appels `bootstrap*` du fichier.
+Deux tests voisins en sortent, et il faut dire pourquoi — sinon l'implémenteur qui
+refait le grep les croira ratés et perdra un aller-retour à le demander :
+
+- `test_migrate_to_multi_agent_noop_on_fresh` (`:1256`) — n'appelle **aucun**
+  `bootstrap*` : il exerce `migrate_to_multi_agent` sur un répertoire vide.
+- `test_bootstrap_fresh_install_writes_narrow_skill_allowlist` (`:1324`) — appelle
+  bien `bootstrap_fresh_install` (`:1332`), mais il est **déjà `#[serial]`** et
+  ouvre sur un `remove_var("MIKA_AGENT_TIER")` défensif. Il est hors de la classe.
+  Le convertir serait néanmoins cohérent avec U2 et supprimerait son `remove_var`
+  défensif ; **laissé au jugement de l'implémenteur**, sans quoi la garde d'U5 —
+  qui ne cible que les `#[test]` nus — resterait verte dans les deux cas.
+
 **Un seul test casse aujourd'hui ; les sept autres sont des mines armées.** Leur
 conversion ne répare rien maintenant et empêche le retour du défaut le jour où
 quelqu'un ajoute une assertion de contenu dans `test_bootstrap_agent`. C'est ce
@@ -221,8 +234,15 @@ une garde qu'on désarme à la première gêne.
 ### U3 — convertir les six tests de `well_known_agents.rs` (§1.3)
 
 Lignes 2252, 2273, 3210, 3660, 3681, 3705 → `bootstrap_agent_with_tier(…, AgentTier::Default)`.
-`pre_seed_identity` (`:3209`) est un helper : la conversion y couvre ses appelants
-d'un coup.
+Les six sont vérifiées : ce sont les seuls appels `bootstrap*` du fichier hors du
+site de production. `pre_seed_identity` (`:3209`) est un helper : la conversion y
+couvre ses appelants d'un coup.
+
+**Le septième appel, `:927`, est de production** — c'est `provision_agent` qui
+appelle `bootstrap_agent` pour créer un agent bien connu. Il doit **rester** un
+lecteur d'environnement : c'est le chemin par lequel `MIKA_AGENT_TIER` atteint
+légitimement un agent au premier démarrage (mika#1778). Le convertir inverserait le
+comportement de production, ce qu'U1 s'interdit explicitement.
 
 Vérifier au passage qu'aucun de ces six n'assère le contenu d'un gabarit. Si l'un
 le fait, **le dire dans le corps de PR** : ce serait un second défaut vivant, et
