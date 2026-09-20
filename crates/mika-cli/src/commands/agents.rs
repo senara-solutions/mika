@@ -1,8 +1,9 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use std::io::{self, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 
 use mika_common::agent::{self, DEFAULT_AGENT};
-use mika_common::home;
+use mika_common::home::{self, AgentTier};
 
 use crate::cli::{AgentsArgs, AgentsCommand, OutputFormat};
 use crate::wizard;
@@ -32,6 +33,23 @@ pub async fn run(args: AgentsArgs) -> Result<()> {
             dry_run,
             yes,
         } => reset(&global_home, &name, force, dry_run, yes),
+        AgentsCommand::Reprovision {
+            name,
+            tier,
+            identity_only,
+            dry_run,
+            yes,
+        } => reprovision(
+            &global_home,
+            &name,
+            ReprovisionOptions {
+                tier: tier.as_deref(),
+                identity_only,
+                dry_run,
+                yes,
+            },
+            &mut io::stdout(),
+        ),
     }
 }
 
@@ -492,6 +510,486 @@ fn print_counts(counts: &ResetAgentCounts) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `mika agents reprovision` (mika#2230)
+// ---------------------------------------------------------------------------
+//
+// Re-applies the authoritative `identity.toml` **and** `soul.md` for an agent
+// that already exists on disk. Until this verb, that gesture had no tooled path
+// at all: `bootstrap_fresh_install` never runs twice (`home::is_initialized` is
+// true for any tenant whose `data/mika.db` exists), `write_default_if_missing`
+// never overwrites, and `mika agents create` refuses an existing agent — so the
+// only route was hand-copying constants out of the source tree.
+//
+// Two halves, deliberately, because a tier has two axes since mika#2023: writing
+// `identity.toml` alone fabricates exactly the drift the mika#1962 boot guard
+// exists to catch (a family allowlist under an operator persona, or the reverse).
+// `--identity-only` keeps that escape hatch and *says* what it costs.
+
+/// The flags of one `reprovision` invocation, gathered so the signature stays
+/// readable and clippy's `too_many_arguments` stays quiet.
+struct ReprovisionOptions<'a> {
+    tier: Option<&'a str>,
+    identity_only: bool,
+    dry_run: bool,
+    yes: bool,
+}
+
+/// A tier, where it came from, and whether the operator's word was recognized.
+struct ResolvedTier {
+    tier: AgentTier,
+    /// Human-readable provenance, printed in the pre-digest. `llm_budget_resolved`
+    /// (mika#2293) is the model: *a setting you cannot observe is not a setting.*
+    provenance: String,
+    /// `Some(raw)` when the value was non-empty and outside the tier vocabulary.
+    /// The tier still resolves — fail-closed, mika#2023 AC2 — and the pre-digest
+    /// names the offending value between quotes rather than swallowing it.
+    unrecognized: Option<String>,
+}
+
+/// What the on-disk file is, relative to the template about to be applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileVerdict {
+    /// The file does not exist — the `identity_toml_absent` population.
+    Absent,
+    /// Byte-for-byte equal to the template: nothing to write, nothing to back up.
+    Identical,
+    /// Present and different: it is backed up, then replaced.
+    Differs,
+}
+
+impl FileVerdict {
+    fn needs_write(self) -> bool {
+        !matches!(self, Self::Identical)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Absent => "absent      → will be created",
+            Self::Identical => "identical   → left untouched",
+            Self::Differs => "differs     → backed up, then replaced",
+        }
+    }
+}
+
+/// One file of the plan: its path, the content to apply, and the verdict.
+struct PlannedFile {
+    name: &'static str,
+    path: PathBuf,
+    expected: String,
+    verdict: FileVerdict,
+}
+
+/// Re-apply the authoritative identity (and persona) templates for `name`.
+///
+/// `out` is written rather than `println!`ed so the whole report — pre-digest,
+/// warnings, outcome — is assertable by the tests without a terminal.
+fn reprovision(
+    global_home: &Path,
+    name: &str,
+    opts: ReprovisionOptions<'_>,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let name = agent::normalize_agent_name(name);
+    agent::validate_agent_name(&name)?;
+
+    // Population predicate (D5). NOT `agent::agent_exists`, which tests
+    // `config.toml`: this verb exists to repair agent homes where one of the two
+    // files is missing, and the mika#2027 shape — `identity.toml` gone,
+    // `config.toml` present — is invisible to every narrower predicate. The
+    // server's own definition of "an agent I could serve" is the union, and it
+    // has exactly one reader.
+    let servable = mika_agent::server::tier_guard::servable_agent_names(global_home);
+    if !servable.iter().any(|n| n == &name) {
+        bail!(
+            "Agent '{name}' not found under {}. \
+             Create it with `mika agents create {name}` — this command re-applies \
+             an existing agent's templates, it does not create agents.",
+            global_home.join("agents").display()
+        );
+    }
+
+    let agent_home = agent::agent_dir(global_home, &name);
+    let (identity, soul, source_line, resolved_tier) =
+        render_sources(global_home, &agent_home, &name, opts.tier)?;
+
+    // D4 — fail closed on the rendering, before anything is written.
+    validate_rendered_identity(&identity)?;
+
+    let mut plan = vec![PlannedFile {
+        name: "identity.toml",
+        verdict: verdict_for(&agent_home.join("identity.toml"), &identity)?,
+        path: agent_home.join("identity.toml"),
+        expected: identity,
+    }];
+    let soul_path = agent_home.join("soul.md");
+    let soul_verdict = if opts.identity_only {
+        // Scoped away from this file by the operator's own flag, so an unreadable
+        // persona must not abort a repair that was never going to touch it.
+        // Unknown reads as "diverges", which only arms the warning below.
+        verdict_for(&soul_path, &soul).unwrap_or(FileVerdict::Differs)
+    } else {
+        verdict_for(&soul_path, &soul)?
+    };
+    if !opts.identity_only {
+        plan.push(PlannedFile {
+            name: "soul.md",
+            verdict: soul_verdict,
+            path: soul_path,
+            expected: soul,
+        });
+    }
+
+    // Pre-digest.
+    writeln!(out, "\n  Re-provision agent '{name}'")?;
+    writeln!(out, "    source: {source_line}")?;
+    writeln!(out, "    home:   {}", agent_home.display())?;
+    writeln!(out)?;
+    for file in &plan {
+        writeln!(out, "    {:<14} {}", file.name, file.verdict.label())?;
+    }
+    if opts.identity_only {
+        writeln!(out, "    {:<14} SKIPPED (--identity-only)", "soul.md")?;
+    }
+
+    if opts.identity_only && soul_verdict.needs_write() {
+        // D1 — `--identity-only` is an escape hatch with a warning, not a silence.
+        // Leaving the persona behind while moving the allowlist puts the two
+        // detection axes of the mika#1962 guard into disagreement, which is
+        // precisely the state that guard reports. Saying so costs one line here;
+        // discovering it costs a refused startup later.
+        writeln!(
+            out,
+            "\n  WARNING — --identity-only leaves the two tier axes in disagreement.\n\
+             \x20   soul.md on disk is not the persona this template prescribes, so the\n\
+             \x20   skill allowlist (axis 2) and the persona marker (axis 1) will not\n\
+             \x20   agree. That is the exact state the mika#1962 boot guard reports.\n\
+             \x20   Re-run without --identity-only to move both axes together."
+        )?;
+    }
+
+    if let Some(tier) = resolved_tier
+        && tier.expects_family_provisioning()
+    {
+        // D3 — this is not a per-agent refusal. `assert_family_tier_env_consistency`
+        // `bail!`s out of `run_server`, so a family-provisioned agent under a
+        // non-family process tier takes EVERY agent down at the next restart.
+        writeln!(
+            out,
+            "\n  BEFORE RESTARTING — this writes family-tier provisioning to disk.\n\
+             \x20   mika-spirit refuses to start when an agent is family-provisioned\n\
+             \x20   while the PROCESS tier is not (mika#1962), and that refusal is\n\
+             \x20   process-wide: every other agent goes down with it.\n\
+             \x20   Set MIKA_AGENT_TIER=family in the SERVICE environment — the\n\
+             \x20   EnvironmentFile, the systemd drop-in, or the K8s ConfigMap —\n\
+             \x20   never in an interactive shell."
+        )?;
+    } else if let Some(tier) = resolved_tier
+        && !tier.expects_family_provisioning()
+        && reads_as_family_provisioned(&agent_home)
+    {
+        // The reverse direction, named because it cannot be guarded — the
+        // mika#1962 guard detects *family* provisioning only, so writing an
+        // operator template over a family agent removes the markers and nothing
+        // will ever say so. Conditioned on the agent ACTUALLY reading as family
+        // today: a note printed on every operator re-provision is a note
+        // operators learn to skip, and this one has to be read.
+        writeln!(
+            out,
+            "\n  WARNING — this agent currently reads as FAMILY-provisioned, and you\n\
+             \x20   are writing a {tier:?}-tier template over it.\n\
+             \x20   This direction is NOT guarded: the mika#1962 startup guard only\n\
+             \x20   detects family provisioning, so once the markers are gone nothing\n\
+             \x20   will report the mismatch. If the service still runs with\n\
+             \x20   MIKA_AGENT_TIER=family, this agent will be served under operator\n\
+             \x20   semantics, silently. Change the service environment too."
+        )?;
+    }
+
+    if !plan.iter().any(|f| f.verdict.needs_write()) {
+        writeln!(
+            out,
+            "\n  Nothing to do — every file already matches the template.\n"
+        )?;
+        return Ok(());
+    }
+
+    if opts.dry_run {
+        writeln!(out, "\n  Dry run — nothing was written.\n")?;
+        return Ok(());
+    }
+
+    if !opts.yes {
+        if !io::stdin().is_terminal() {
+            bail!(
+                "Non-interactive terminal requires --yes flag to bypass confirmation. \
+                 Use: mika agents reprovision {name} --yes"
+            );
+        }
+        write!(out, "\n  Type the agent name to confirm: ")?;
+        out.flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        if input.trim() != name {
+            writeln!(out, "  Name mismatch — aborting.")?;
+            return Ok(());
+        }
+    }
+
+    writeln!(out)?;
+    for file in &plan {
+        if !file.verdict.needs_write() {
+            continue;
+        }
+        if file.verdict == FileVerdict::Differs {
+            let backup = backup_path(&file.path);
+            std::fs::copy(&file.path, &backup)
+                .with_context(|| format!("backing up {}", file.path.display()))?;
+            set_owner_only(&backup)?;
+            writeln!(out, "    backup  {}", backup.display())?;
+        }
+        write_atomic_owner_only(&file.path, &file.expected)?;
+        writeln!(out, "    wrote   {}", file.path.display())?;
+    }
+
+    // R9 — self-check against the tier THIS process resolves. The other half of
+    // the question is the service's environment, which a CLI structurally cannot
+    // read; the block above is what covers it.
+    let process_tier = resolved_tier.unwrap_or_else(AgentTier::from_env);
+    match mika_agent::server::tier_guard::check_agent_tier_consistency(
+        &agent_home,
+        &name,
+        process_tier,
+    ) {
+        Ok(()) => writeln!(
+            out,
+            "\n  Self-check: on-disk provisioning agrees with the tier this process \
+             resolves ({process_tier:?})."
+        )?,
+        // Deliberately NOT rolled back: the disk is now coherent with the tier
+        // that was asked for; it is the *process* that is not. The guard's own
+        // message already names the agent and the fix, so it is shown verbatim.
+        Err(e) => writeln!(out, "\n  Self-check FAILED:\n    {e}")?,
+    }
+
+    writeln!(
+        out,
+        "\n  Next:\n\
+         \x20   1. restart mika-spirit (rc-service / systemctl / kubectl rollout restart)\n\
+         \x20   2. grep -E 'identity_toml_(absent|unreadable|malformed)' \"$MIKA_SPIRIT_LOG_FILE\"\n\
+         \x20      — must return nothing new\n\
+         \x20   3. mika skills list --agent {name}\n\
+         \x20      — reads identity.toml live from disk, so it shows the repaired\n\
+         \x20        boundary immediately, BEFORE any restart\n\n\
+         \x20 The symlinks under {} are re-materialized by the next startup, not by\n\
+         \x20 this command. An empty-looking directory before the restart is expected;\n\
+         \x20 do not reinstall skills to \"repair\" it.\n",
+        agent_home.join("skills").display()
+    )?;
+
+    Ok(())
+}
+
+/// Resolve which templates apply to `name`, and under which tier.
+///
+/// Returns `(identity, soul, source_line, tier)`. The tier is `None` for a
+/// well-known agent: its identity derives from its spec, not from a tier, which
+/// is why `--tier` is an error there rather than a no-op (D2 — a silently ignored
+/// flag leaves the operator believing they posed something).
+#[allow(clippy::type_complexity)]
+fn render_sources(
+    global_home: &Path,
+    agent_home: &Path,
+    name: &str,
+    tier_arg: Option<&str>,
+) -> Result<(String, String, String, Option<AgentTier>)> {
+    if let Some(spec) = mika_agent::well_known_agents::find_well_known_agent(name) {
+        if tier_arg.is_some() {
+            bail!(
+                "Agent '{name}' is a well-known agent: its identity comes from its \
+                 code spec, not from a tier, so --tier has nothing to apply. \
+                 Re-run without --tier."
+            );
+        }
+        // `load_for_agent` rather than `load`: this is a per-agent operation, and
+        // mika-arch's computed identity reads `kg_docs_roots`, which a per-agent
+        // config.toml may legitimately carry.
+        let settings = mika_common::config::Settings::load_for_agent(global_home, agent_home)
+            .with_context(|| format!("loading settings for agent '{name}'"))?;
+        // D4 (1) — an `Err` here is mika-arch without `MIKA_KG_DOCS_ROOTS`.
+        // Writing anyway would produce an architect with no corpus: an agent that
+        // starts, answers, and finds nothing.
+        let identity = mika_agent::well_known_agents::render_identity_content(spec, &settings)
+            .map_err(|e| {
+                anyhow!(
+                    "refusing to write {}: the authoritative identity for '{name}' \
+                     could not be rendered — {e}",
+                    agent_home.join("identity.toml").display()
+                )
+            })?;
+        return Ok((
+            identity,
+            spec.soul.to_string(),
+            format!("well-known spec '{}'", spec.name),
+            None,
+        ));
+    }
+
+    let resolved = resolve_tier_arg(tier_arg);
+    let mut source = format!("tier {:?} (via {})", resolved.tier, resolved.provenance);
+    if let Some(raw) = &resolved.unrecognized {
+        source.push_str(&format!(
+            " — value \"{raw}\" not recognized, failed closed to {:?} (mika#2023)",
+            resolved.tier
+        ));
+    }
+    Ok((
+        resolved.tier.identity_toml().to_string(),
+        resolved.tier.soul_md().to_string(),
+        source,
+        Some(resolved.tier),
+    ))
+}
+
+/// Does this agent home read as family-provisioned **today**, on either of the
+/// two mika#1962 detection axes?
+///
+/// Fail-**open** (an unreadable file answers `false`), deliberately, and the
+/// asymmetry with the guard it mirrors is the point: the guard refuses a startup,
+/// so it must err towards detecting; this only decides whether to print a
+/// warning, so erring towards a false alarm would train the operator to skip the
+/// one line that matters. A genuine drift the guard can see is still reported by
+/// the guard, at startup, where it is enforceable.
+fn reads_as_family_provisioned(agent_home: &Path) -> bool {
+    home::soul_has_family_marker(agent_home).unwrap_or(false)
+        || home::identity_allowlist_matches_family(agent_home).unwrap_or(false)
+}
+
+/// `--tier` when given, else `MIKA_AGENT_TIER`, else the default — and always
+/// say which.
+///
+/// The parsing itself is [`AgentTier::parse`]'s and nothing else's: the tier
+/// vocabulary and its fail-closed rule have one reader (mika#2230 D2, guarded by
+/// `mika2230_le_tier_a_un_seul_analyseur` in `mika-common`).
+fn resolve_tier_arg(flag: Option<&str>) -> ResolvedTier {
+    if let Some(raw) = flag {
+        let parsed = AgentTier::parse(raw);
+        return ResolvedTier {
+            tier: parsed.tier,
+            provenance: "--tier".to_string(),
+            unrecognized: (!parsed.recognized).then(|| raw.to_string()),
+        };
+    }
+    match std::env::var("MIKA_AGENT_TIER") {
+        Ok(raw) => {
+            let parsed = AgentTier::parse(&raw);
+            ResolvedTier {
+                tier: parsed.tier,
+                provenance: "MIKA_AGENT_TIER".to_string(),
+                unrecognized: (!parsed.recognized).then(|| raw.clone()),
+            }
+        }
+        Err(_) => ResolvedTier {
+            tier: AgentTier::Default,
+            provenance: "default (MIKA_AGENT_TIER unset)".to_string(),
+            unrecognized: None,
+        },
+    }
+}
+
+/// D4 (2) and (3) — refuse to write an identity that is not valid TOML, or whose
+/// `[skills].allowlist` is absent or empty.
+///
+/// The empty case is the trap the runbook writes in a callout:
+/// `apply_identity_allowlist` returns early on an empty list, so `allowlist = []`
+/// means *no filter* — every bundled skill active, `shell-exec` included. A
+/// repair tool able to write the most permissive configuration in the system
+/// without saying so would be worse than the hand gesture it replaces.
+fn validate_rendered_identity(content: &str) -> Result<()> {
+    let value: toml::Value = toml::from_str(content).map_err(|e| {
+        anyhow!(
+            "refusing to write identity.toml: the rendered template is not valid \
+             TOML ({e}). This is a defect in the template itself, not in the agent \
+             on disk — nothing was written."
+        )
+    })?;
+
+    match value
+        .get("skills")
+        .and_then(|s| s.get("allowlist"))
+        .and_then(|a| a.as_array())
+    {
+        Some(list) if !list.is_empty() => Ok(()),
+        Some(_) => bail!(
+            "refusing to write identity.toml: the rendered template carries an \
+             EMPTY `[skills].allowlist`. An empty allowlist is not a restriction — \
+             `apply_identity_allowlist` returns early on it, so every bundled skill \
+             stays active, `shell-exec` and `git-ops` included. Nothing was written."
+        ),
+        None => bail!(
+            "refusing to write identity.toml: the rendered template carries no \
+             `[skills].allowlist`. An absent allowlist is default-permissive \
+             (mika#1596) — it grants every bundled skill. Nothing was written."
+        ),
+    }
+}
+
+/// Compare the on-disk file with the template about to be applied.
+///
+/// An **unreadable** file is an error, never a `Differs`: `identity_toml_unreadable`
+/// is a permissions or I/O fault on content that is still there, and the runbook's
+/// § 4 says in as many words not to re-provision over it.
+fn verdict_for(path: &Path, expected: &str) -> Result<FileVerdict> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(if bytes == expected.as_bytes() {
+            FileVerdict::Identical
+        } else {
+            FileVerdict::Differs
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FileVerdict::Absent),
+        Err(e) => Err(anyhow!(
+            "refusing to re-provision: {} exists but cannot be read ({e}). \
+             Its content is still there — fix ownership/permissions instead of \
+             overwriting it (see docs/operator/agent-identity-reprovision.md § 4).",
+            path.display()
+        )),
+    }
+}
+
+/// `<file>.bak.<YYYYMMDDTHHMMSSZ>`, beside the file it copies.
+fn backup_path(path: &Path) -> PathBuf {
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let mut name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("file"))
+        .to_os_string();
+    name.push(format!(".bak.{stamp}"));
+    path.with_file_name(name)
+}
+
+/// Write via `.tmp` + `rename`, the same shape `reconcile_well_known_identity`
+/// uses, so a crash mid-write never leaves a partial identity on disk.
+fn write_atomic_owner_only(path: &Path, content: &str) -> Result<()> {
+    let tmp = path.with_extension("reprovision.tmp");
+    std::fs::write(&tmp, content).with_context(|| format!("writing {}", tmp.display()))?;
+    set_owner_only(&tmp)?;
+    std::fs::rename(&tmp, path).with_context(|| format!("renaming onto {}", path.display()))?;
+    set_owner_only(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_owner_only(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod 600 {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_owner_only(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path, depth: u32) -> Result<()> {
     if depth > 10 {
         bail!("directory nesting too deep while copying {}", src.display());
@@ -511,4 +1009,636 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path, depth: u32) 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod reprovision_tests {
+    use super::*;
+    use mika_common::home::{
+        DEFAULT_IDENTITY, DEFAULT_SOUL, FAMILY_IDENTITY, FAMILY_SOUL, FAMILY_SOUL_MARKER,
+        identity_allowlist_matches_family, soul_has_family_marker,
+    };
+    use tempfile::TempDir;
+
+    const CONFIG: &str = "log_level = \"info\"\n";
+
+    /// A multi-agent home with one agent directory, populated à la carte.
+    fn home_with(
+        name: &str,
+        config: Option<&str>,
+        identity: Option<&str>,
+        soul: Option<&str>,
+    ) -> TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("agents").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(c) = config {
+            std::fs::write(dir.join("config.toml"), c).unwrap();
+        }
+        if let Some(i) = identity {
+            std::fs::write(dir.join("identity.toml"), i).unwrap();
+        }
+        if let Some(s) = soul {
+            std::fs::write(dir.join("soul.md"), s).unwrap();
+        }
+        tmp
+    }
+
+    fn opts<'a>(tier: Option<&'a str>) -> ReprovisionOptions<'a> {
+        ReprovisionOptions {
+            tier,
+            identity_only: false,
+            dry_run: false,
+            yes: true,
+        }
+    }
+
+    /// Run the verb and hand back what it wrote to its report stream.
+    fn run(home: &Path, name: &str, o: ReprovisionOptions<'_>) -> Result<String> {
+        let mut out: Vec<u8> = Vec::new();
+        reprovision(home, name, o, &mut out)?;
+        Ok(String::from_utf8(out).unwrap())
+    }
+
+    fn read(home: &Path, name: &str, file: &str) -> String {
+        std::fs::read_to_string(home.join("agents").join(name).join(file)).unwrap()
+    }
+
+    fn backups(home: &Path, name: &str, prefix: &str) -> Vec<PathBuf> {
+        let dir = home.join("agents").join(name);
+        let mut out: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(&format!("{prefix}.bak.")))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    // -- Population and refusals (V1–V4) -------------------------------------
+
+    /// **V1** — an agent nobody can serve is refused, and the refusal names the
+    /// verb that does create agents.
+    #[test]
+    fn mika2230_v1_unknown_agent_is_refused_and_names_create() {
+        let home = home_with("nadia", Some(CONFIG), Some(DEFAULT_IDENTITY), None);
+        let err = run(home.path(), "ghost", opts(Some("default"))).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ghost"), "must name the agent: {msg}");
+        assert!(
+            msg.contains("mika agents create"),
+            "must name the creating verb: {msg}"
+        );
+    }
+
+    /// **V2** — the measured mika#2027 shape: `config.toml` present,
+    /// `identity.toml` gone. It must be *in* the population, because it is
+    /// exactly what this verb repairs.
+    #[test]
+    fn mika2230_v2_agent_missing_only_its_identity_is_in_the_population() {
+        let home = home_with("nadia", Some(CONFIG), None, Some(DEFAULT_SOUL));
+        run(home.path(), "nadia", opts(Some("default"))).expect("must be accepted");
+        assert_eq!(
+            read(home.path(), "nadia", "identity.toml"),
+            DEFAULT_IDENTITY
+        );
+    }
+
+    /// **V2b** — the negative control that justifies reading the population from
+    /// `tier_guard::servable_agent_names` (D5) rather than from
+    /// `agent::agent_exists`: an agent home carrying `identity.toml` and **no**
+    /// `config.toml` is fully servable and invisible to the narrower predicate.
+    #[test]
+    fn mika2230_v2b_agent_without_config_toml_is_still_in_the_population() {
+        let home = home_with("nadia", None, Some(DEFAULT_IDENTITY), None);
+        assert!(
+            !agent::agent_exists(home.path(), "nadia"),
+            "precondition: the narrower predicate really does miss it"
+        );
+        run(home.path(), "nadia", opts(Some("default"))).expect("must be accepted");
+        assert_eq!(read(home.path(), "nadia", "soul.md"), DEFAULT_SOUL);
+    }
+
+    /// **V3** — `--tier` on a well-known agent is an error, not a no-op: its
+    /// identity derives from a code spec, so accepting the flag would leave the
+    /// operator believing they had posed something (D2).
+    #[test]
+    fn mika2230_v3_tier_flag_is_refused_for_a_well_known_agent() {
+        let home = home_with("mika-dev", Some(CONFIG), Some(DEFAULT_IDENTITY), None);
+        let err = run(home.path(), "mika-dev", opts(Some("family"))).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--tier"), "must name the flag: {msg}");
+        assert!(msg.contains("mika-dev"), "must name the agent: {msg}");
+    }
+
+    /// **V4** — a non-interactive terminal without `--yes` is refused, and
+    /// nothing on disk moved. A confirmation must never be answered on the
+    /// operator's behalf.
+    #[test]
+    fn mika2230_v4_non_tty_without_yes_is_refused_and_writes_nothing() {
+        let home = home_with("nadia", Some(CONFIG), Some("name = \"x\"\n"), None);
+        let before = read(home.path(), "nadia", "identity.toml");
+        let err = run(
+            home.path(),
+            "nadia",
+            ReprovisionOptions {
+                tier: Some("default"),
+                identity_only: false,
+                dry_run: false,
+                yes: false,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--yes"), "{err}");
+        assert_eq!(read(home.path(), "nadia", "identity.toml"), before);
+        assert!(
+            !home.path().join("agents/nadia/soul.md").exists(),
+            "soul.md must not have been created"
+        );
+        assert!(backups(home.path(), "nadia", "identity.toml").is_empty());
+    }
+
+    // -- Fail-closed rendering (V5–V7) ---------------------------------------
+
+    /// **V5** — mika-arch's identity is *computed* and needs `MIKA_KG_DOCS_ROOTS`.
+    /// A failed render refuses the write rather than producing an architect with
+    /// no corpus: an agent that starts, answers, and finds nothing.
+    #[test]
+    #[serial_test::serial]
+    fn mika2230_v5_a_failed_computed_render_refuses_the_write() {
+        // Safety: serialized against every other test touching these vars.
+        unsafe {
+            std::env::remove_var("MIKA_KG_DOCS_ROOTS");
+            std::env::remove_var("MIKA_KG_DOCS_ROOT");
+        }
+        let sentinel = "name = \"untouched\"\n";
+        let home = home_with("mika-arch", Some(CONFIG), Some(sentinel), None);
+        let err = run(home.path(), "mika-arch", opts(None)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("MIKA_KG_DOCS_ROOTS"),
+            "the refusal must name what is missing: {msg}"
+        );
+        assert_eq!(
+            read(home.path(), "mika-arch", "identity.toml"),
+            sentinel,
+            "nothing may be written when the authoritative render failed"
+        );
+    }
+
+    /// **V6** — the runbook's boxed trap, made structural. `allowlist = []` is
+    /// *not* a restriction: `apply_identity_allowlist` returns early on it, so an
+    /// empty list means every bundled skill, `shell-exec` included. A repair tool
+    /// able to write the most permissive configuration in the system without
+    /// saying so would be worse than the hand gesture it replaces.
+    #[test]
+    fn mika2230_v6_an_empty_allowlist_refuses_the_write() {
+        let err =
+            validate_rendered_identity("name = \"x\"\n\n[skills]\nallowlist = []\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("EMPTY"), "{msg}");
+        assert!(msg.contains("Nothing was written"), "{msg}");
+    }
+
+    /// **V7** — same family: an absent `[skills]` section is default-permissive
+    /// (mika#1596), so it is refused too.
+    #[test]
+    fn mika2230_v7_a_missing_allowlist_refuses_the_write() {
+        let err = validate_rendered_identity("name = \"x\"\nemoji = \"y\"\n").unwrap_err();
+        assert!(err.to_string().contains("no `[skills].allowlist`"), "{err}");
+        // And the template the verb actually ships must pass, or the guard would
+        // be refusing the nominal path.
+        validate_rendered_identity(DEFAULT_IDENTITY).expect("DEFAULT_IDENTITY must pass");
+        validate_rendered_identity(FAMILY_IDENTITY).expect("FAMILY_IDENTITY must pass");
+    }
+
+    // -- Writing (V8–V14) -----------------------------------------------------
+
+    /// **V8** — the measured mika#2027 case: identity absent, persona intact and
+    /// already equal to the template. Exactly one file is created, and the
+    /// untouched one is neither rewritten nor backed up (R5 by construction, not
+    /// by a branch).
+    #[test]
+    fn mika2230_v8_only_the_differing_file_is_written() {
+        let home = home_with("nadia", Some(CONFIG), None, Some(DEFAULT_SOUL));
+        let soul_before = std::fs::metadata(home.path().join("agents/nadia/soul.md"))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        run(home.path(), "nadia", opts(Some("default"))).unwrap();
+
+        assert_eq!(
+            read(home.path(), "nadia", "identity.toml"),
+            DEFAULT_IDENTITY
+        );
+        assert_eq!(read(home.path(), "nadia", "soul.md"), DEFAULT_SOUL);
+        assert!(
+            backups(home.path(), "nadia", "soul.md").is_empty(),
+            "an identical file is not backed up"
+        );
+        assert!(
+            backups(home.path(), "nadia", "identity.toml").is_empty(),
+            "an absent file has nothing to back up"
+        );
+        assert_eq!(
+            std::fs::metadata(home.path().join("agents/nadia/soul.md"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            soul_before,
+            "soul.md must not have been rewritten"
+        );
+    }
+
+    /// **V9** — both files differ: both are replaced, both are backed up, and the
+    /// backups carry the original bytes.
+    #[test]
+    fn mika2230_v9_both_files_are_backed_up_byte_for_byte() {
+        let old_identity = "name = \"Old\"\n\n[skills]\nallowlist = [\"calendar\"]\n";
+        let old_soul = "# an operator's hand-tuned persona\n";
+        let home = home_with("nadia", Some(CONFIG), Some(old_identity), Some(old_soul));
+
+        run(home.path(), "nadia", opts(Some("default"))).unwrap();
+
+        assert_eq!(
+            read(home.path(), "nadia", "identity.toml"),
+            DEFAULT_IDENTITY
+        );
+        assert_eq!(read(home.path(), "nadia", "soul.md"), DEFAULT_SOUL);
+
+        let ib = backups(home.path(), "nadia", "identity.toml");
+        let sb = backups(home.path(), "nadia", "soul.md");
+        assert_eq!(ib.len(), 1, "one identity backup: {ib:?}");
+        assert_eq!(sb.len(), 1, "one soul backup: {sb:?}");
+        assert_eq!(std::fs::read(&ib[0]).unwrap(), old_identity.as_bytes());
+        assert_eq!(std::fs::read(&sb[0]).unwrap(), old_soul.as_bytes());
+    }
+
+    /// **V10** — idempotence: a second run writes nothing and backs up nothing.
+    #[test]
+    fn mika2230_v10_a_second_run_is_a_no_op() {
+        let home = home_with("nadia", Some(CONFIG), Some("name = \"Old\"\n"), None);
+        run(home.path(), "nadia", opts(Some("default"))).unwrap();
+        for prefix in ["identity.toml", "soul.md"] {
+            for stale in backups(home.path(), "nadia", prefix) {
+                std::fs::remove_file(stale).unwrap();
+            }
+        }
+
+        let report = run(home.path(), "nadia", opts(Some("default"))).unwrap();
+        assert!(report.contains("Nothing to do"), "{report}");
+        assert!(backups(home.path(), "nadia", "identity.toml").is_empty());
+        assert!(backups(home.path(), "nadia", "soul.md").is_empty());
+    }
+
+    /// **V11** — `--identity-only` leaves `soul.md` strictly alone, and the cost
+    /// is *stated*: the two detection axes of the mika#1962 guard end up in
+    /// disagreement, which is the state that guard exists to report.
+    #[test]
+    fn mika2230_v11_identity_only_leaves_the_persona_and_says_so() {
+        let hand_written = "# a persona the operator wrote\n";
+        let home = home_with("nadia", Some(CONFIG), None, Some(hand_written));
+        let before = std::fs::metadata(home.path().join("agents/nadia/soul.md"))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        let report = run(
+            home.path(),
+            "nadia",
+            ReprovisionOptions {
+                tier: Some("default"),
+                identity_only: true,
+                dry_run: false,
+                yes: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(read(home.path(), "nadia", "soul.md"), hand_written);
+        assert_eq!(
+            std::fs::metadata(home.path().join("agents/nadia/soul.md"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            before
+        );
+        assert!(backups(home.path(), "nadia", "soul.md").is_empty());
+        assert!(
+            report.contains("--identity-only leaves the two tier axes in disagreement"),
+            "the cost must be named at the moment of the gesture: {report}"
+        );
+    }
+
+    /// **V12** — `--dry-run` writes nothing and still says what it would do.
+    #[test]
+    fn mika2230_v12_dry_run_writes_nothing() {
+        let home = home_with("nadia", Some(CONFIG), Some("name = \"Old\"\n"), None);
+        let report = run(
+            home.path(),
+            "nadia",
+            ReprovisionOptions {
+                tier: Some("default"),
+                identity_only: false,
+                dry_run: true,
+                yes: true,
+            },
+        )
+        .unwrap();
+
+        assert!(!report.trim().is_empty());
+        assert!(report.contains("Dry run"), "{report}");
+        assert_eq!(
+            read(home.path(), "nadia", "identity.toml"),
+            "name = \"Old\"\n"
+        );
+        assert!(!home.path().join("agents/nadia/soul.md").exists());
+        assert!(backups(home.path(), "nadia", "identity.toml").is_empty());
+    }
+
+    /// **V13** — targets and backups are owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn mika2230_v13_targets_and_backups_are_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = home_with(
+            "nadia",
+            Some(CONFIG),
+            Some("name = \"Old\"\n"),
+            Some("# old\n"),
+        );
+        run(home.path(), "nadia", opts(Some("default"))).unwrap();
+
+        let mut paths = vec![
+            home.path().join("agents/nadia/identity.toml"),
+            home.path().join("agents/nadia/soul.md"),
+        ];
+        paths.extend(backups(home.path(), "nadia", "identity.toml"));
+        paths.extend(backups(home.path(), "nadia", "soul.md"));
+        assert_eq!(paths.len(), 4, "two targets and two backups: {paths:?}");
+
+        for path in paths {
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{} is {mode:o}", path.display());
+        }
+    }
+
+    /// **V14** — the negative control of D6. Without it, "does not touch
+    /// `config.toml`" is an intention rather than a property — and `config.toml`
+    /// is where an operator's hand-picked `llm_provider` lives (mika#2330).
+    #[test]
+    fn mika2230_v14_config_toml_is_untouched() {
+        let config = "llm_provider = \"zai\"\nzai_model = \"glm-5.2\"\n";
+        let home = home_with(
+            "nadia",
+            Some(config),
+            Some("name = \"Old\"\n"),
+            Some("# old\n"),
+        );
+        run(home.path(), "nadia", opts(Some("default"))).unwrap();
+        assert_eq!(read(home.path(), "nadia", "config.toml"), config);
+        assert!(backups(home.path(), "nadia", "config.toml").is_empty());
+    }
+
+    // -- Tier (V15–V19) -------------------------------------------------------
+
+    /// **V15/V16** — a complete re-provision to family tier writes both templates,
+    /// and the **two** mika#1962 detection axes agree afterwards. That second
+    /// assertion is what attests the two-axis correction: an identity-only tool
+    /// would pass V15 and fail V16.
+    #[test]
+    fn mika2230_v15_v16_family_tier_writes_both_axes_and_they_agree() {
+        let home = home_with(
+            "nadia",
+            Some(CONFIG),
+            Some(DEFAULT_IDENTITY),
+            Some(DEFAULT_SOUL),
+        );
+        run(home.path(), "nadia", opts(Some("family"))).unwrap();
+
+        assert_eq!(read(home.path(), "nadia", "identity.toml"), FAMILY_IDENTITY);
+        assert_eq!(read(home.path(), "nadia", "soul.md"), FAMILY_SOUL);
+        assert!(read(home.path(), "nadia", "soul.md").contains(FAMILY_SOUL_MARKER));
+
+        let agent_home = home.path().join("agents/nadia");
+        assert!(soul_has_family_marker(&agent_home).unwrap(), "axis 1");
+        assert!(
+            identity_allowlist_matches_family(&agent_home).unwrap(),
+            "axis 2"
+        );
+    }
+
+    /// **V17** — the cost of `--identity-only`, asserted rather than assumed: the
+    /// two axes genuinely diverge. This test exists so the escape hatch's price
+    /// is a measured fact, not a paragraph.
+    #[test]
+    fn mika2230_v17_identity_only_leaves_the_two_axes_diverging() {
+        let home = home_with(
+            "nadia",
+            Some(CONFIG),
+            Some(DEFAULT_IDENTITY),
+            Some(DEFAULT_SOUL),
+        );
+        run(
+            home.path(),
+            "nadia",
+            ReprovisionOptions {
+                tier: Some("family"),
+                identity_only: true,
+                dry_run: false,
+                yes: true,
+            },
+        )
+        .unwrap();
+
+        let agent_home = home.path().join("agents/nadia");
+        assert!(
+            !soul_has_family_marker(&agent_home).unwrap(),
+            "axis 1 still reads operator"
+        );
+        assert!(
+            identity_allowlist_matches_family(&agent_home).unwrap(),
+            "axis 2 now reads family — the axes disagree, which is the stated cost"
+        );
+    }
+
+    /// **V18** — the flag inherits the tier's own rule instead of inventing one:
+    /// an unrecognized value fails closed to the most restricted tools tier
+    /// (mika#2023 AC2) and the report names it between quotes.
+    #[test]
+    fn mika2230_v18_an_unrecognized_tier_value_fails_closed_and_is_named() {
+        let home = home_with(
+            "nadia",
+            Some(CONFIG),
+            Some(DEFAULT_IDENTITY),
+            Some(DEFAULT_SOUL),
+        );
+        let report = run(home.path(), "nadia", opts(Some("zorglub"))).unwrap();
+
+        assert!(
+            report.contains("\"zorglub\""),
+            "the offending value must be named between quotes: {report}"
+        );
+        assert_eq!(
+            read(home.path(), "nadia", "identity.toml"),
+            FAMILY_IDENTITY,
+            "fail-closed lands on the most restricted tools tier"
+        );
+    }
+
+    /// **V19** — no `--tier`, no `MIKA_AGENT_TIER`: operator tier, and the report
+    /// says the tier came from the default rather than from anywhere else.
+    #[test]
+    #[serial_test::serial]
+    fn mika2230_v19_absent_tier_and_absent_env_resolve_to_default() {
+        // Safety: serialized against every other MIKA_AGENT_TIER test.
+        unsafe { std::env::remove_var("MIKA_AGENT_TIER") };
+        let home = home_with("nadia", Some(CONFIG), Some("name = \"Old\"\n"), None);
+        let report = run(home.path(), "nadia", opts(None)).unwrap();
+
+        assert!(
+            report.contains("default (MIKA_AGENT_TIER unset)"),
+            "the provenance must be stated: {report}"
+        );
+        assert_eq!(
+            read(home.path(), "nadia", "identity.toml"),
+            DEFAULT_IDENTITY
+        );
+    }
+
+    /// The tier fallback really does read the environment when `--tier` is absent
+    /// — the other half of V19, without which "provenance" would be decorative.
+    #[test]
+    #[serial_test::serial]
+    fn mika2230_the_env_is_the_fallback_when_the_flag_is_absent() {
+        // Safety: serialized against every other MIKA_AGENT_TIER test.
+        unsafe { std::env::set_var("MIKA_AGENT_TIER", "family") };
+        let home = home_with("nadia", Some(CONFIG), Some("name = \"Old\"\n"), None);
+        let report = run(home.path(), "nadia", opts(None));
+        unsafe { std::env::remove_var("MIKA_AGENT_TIER") };
+
+        let report = report.unwrap();
+        assert!(report.contains("MIKA_AGENT_TIER"), "{report}");
+        assert_eq!(read(home.path(), "nadia", "identity.toml"), FAMILY_IDENTITY);
+    }
+
+    /// The ungardable direction (family → operator) is warned about **only when
+    /// the agent actually reads as family today**, and its negative control is in
+    /// the same test.
+    ///
+    /// A note printed on every operator re-provision is a note operators learn to
+    /// skip, and this one has to be read: past this write the markers are gone
+    /// and the mika#1962 guard — which detects *family* provisioning only — can
+    /// never report the mismatch again.
+    #[test]
+    fn mika2230_the_ungardable_direction_is_warned_about_only_when_it_applies() {
+        let family = home_with(
+            "nadia",
+            Some(CONFIG),
+            Some(FAMILY_IDENTITY),
+            Some(FAMILY_SOUL),
+        );
+        let report = run(
+            family.path(),
+            "nadia",
+            ReprovisionOptions {
+                tier: Some("default"),
+                identity_only: false,
+                dry_run: true,
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            report.contains("currently reads as FAMILY-provisioned"),
+            "the warning must fire on the population it describes: {report}"
+        );
+
+        // Negative control, same flags: an operator agent gets no such warning.
+        let operator = home_with(
+            "nadia",
+            Some(CONFIG),
+            Some(DEFAULT_IDENTITY),
+            Some(DEFAULT_SOUL),
+        );
+        let quiet = run(
+            operator.path(),
+            "nadia",
+            ReprovisionOptions {
+                tier: Some("default"),
+                identity_only: false,
+                dry_run: true,
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            !quiet.contains("currently reads as FAMILY-provisioned"),
+            "boilerplate on the nominal path is how a warning stops being read: {quiet}"
+        );
+    }
+
+    /// The family-tier write always warns about the SERVICE environment, because
+    /// `assert_family_tier_env_consistency` `bail!`s out of `run_server` — a
+    /// missing variable there takes every other agent down too.
+    #[test]
+    fn mika2230_a_family_write_warns_about_the_service_environment() {
+        let home = home_with(
+            "nadia",
+            Some(CONFIG),
+            Some(DEFAULT_IDENTITY),
+            Some(DEFAULT_SOUL),
+        );
+        let report = run(
+            home.path(),
+            "nadia",
+            ReprovisionOptions {
+                tier: Some("family"),
+                identity_only: false,
+                dry_run: true,
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(report.contains("SERVICE environment"), "{report}");
+        assert!(report.contains("process-wide"), "{report}");
+    }
+
+    /// An unreadable present file is refused, never overwritten — the runbook's
+    /// § 4 rule, which says the content is still there.
+    #[cfg(unix)]
+    #[test]
+    fn mika2230_an_unreadable_file_is_refused_rather_than_overwritten() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Running as root defeats the permission bits entirely.
+        if unsafe { libc_geteuid() } == 0 {
+            return;
+        }
+        let home = home_with("nadia", Some(CONFIG), Some("name = \"Old\"\n"), None);
+        let path = home.path().join("agents/nadia/identity.toml");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let err = run(home.path(), "nadia", opts(Some("default"))).unwrap_err();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let msg = err.to_string();
+        assert!(msg.contains("cannot be read"), "{msg}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "name = \"Old\"\n");
+    }
+
+    #[cfg(unix)]
+    unsafe fn libc_geteuid() -> u32 {
+        unsafe extern "C" {
+            fn geteuid() -> u32;
+        }
+        unsafe { geteuid() }
+    }
 }

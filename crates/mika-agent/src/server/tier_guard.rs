@@ -208,7 +208,15 @@ pub fn check_agent_tier_consistency(
 /// `pub(crate)` since mika#2293: the LLM-budget boot guard scans the same
 /// population, and two copies of "which agents will this process serve?" would
 /// drift the day one of them learned about a new layout.
-pub(crate) fn servable_agent_names(home_dir: &Path) -> Vec<String> {
+///
+/// `pub` since mika#2230, for a third reader with the same need and one extra
+/// reason: `mika agents reprovision` repairs precisely the agent homes where one
+/// of the two files is missing, and the narrower predicates
+/// (`agent::agent_exists`, `agent::list_agents`) both test `config.toml`, so an
+/// agent carrying `identity.toml` alone — servable by this process — is invisible
+/// to them. **A future tightening of this function narrows that verb's
+/// population too**; that is what this sentence exists to say.
+pub fn servable_agent_names(home_dir: &Path) -> Vec<String> {
     let mut names: std::collections::BTreeSet<String> = mika_common::agent::list_agents(home_dir)
         .into_iter()
         .collect();

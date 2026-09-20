@@ -830,7 +830,16 @@ pub fn find_well_known_agent(name: &str) -> Option<&'static WellKnownAgent> {
 /// - `None` → default template (name + emoji + commented KG block).
 /// - `Some(Static(s))` → returns `s`.
 /// - `Some(Computed(f))` → calls `f(settings)`; propagates `Err`.
-fn render_identity_content(spec: &WellKnownAgent, settings: &Settings) -> Result<String, String> {
+///
+/// `pub` since mika#2230: this is the **authoritative** rendering of a well-known
+/// agent's identity, the `Computed` path of mika-arch included, and
+/// `mika agents reprovision` must call it rather than carry a second renderer.
+/// Its `Err` is load-bearing there too — mika-arch without `MIKA_KG_DOCS_ROOTS`
+/// must refuse the write, not produce an architect with no corpus.
+pub fn render_identity_content(
+    spec: &WellKnownAgent,
+    settings: &Settings,
+) -> Result<String, String> {
     match &spec.identity_source {
         None => Ok(format!(
             "name = \"{}\"\nemoji = \"{}\"\n\n\

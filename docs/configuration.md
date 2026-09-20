@@ -550,9 +550,18 @@ logged under distinct event names (`identity_toml_absent`,
 different remediations. Note that **deleting the file and restarting does not
 regenerate it**: bootstrap only runs on an uninitialized home. A fail-closed
 start also empties the agent's `skills/` directory of its bundled-skill symlinks
-(re-materialized on the first valid start). The supported re-provisioning gesture
-is in `docs/operator/agent-identity-reprovision.md` in the repository — the path
-is written out rather than linked because this page is also shipped as a
+(re-materialized on the first valid start).
+
+The supported re-provisioning gesture is **`mika agents reprovision <agent>`**
+(mika#2230), which re-applies the authoritative `identity.toml` **and** `soul.md`
+— both, because a tier has two axes since mika#2023 and the boot-time tier guard
+reads either of them. It is differential (an identical file is left alone),
+backs up anything it overwrites as `<file>.bak.<timestamp>` in `0600`, refuses a
+template whose `[skills].allowlist` is absent or empty, and touches neither
+`config.toml` nor the database. Start with `--dry-run`. Full runbook, including
+the tier-change procedure and what the verb deliberately does not do, in
+`docs/operator/agent-identity-reprovision.md` in the repository — the path is
+written out rather than linked because this page is also shipped as a
 crate-local copy where a relative link would dangle.
 
 To customize, edit `~/.mika/identity.toml`:

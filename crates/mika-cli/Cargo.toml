@@ -56,6 +56,10 @@ hex.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 tempfile.workspace = true
+# `mika agents reprovision` resolves its tier from `MIKA_AGENT_TIER` when
+# `--tier` is absent (mika#2230 D2), so the tests that exercise that fallback
+# mutate process-global env state and must be serialized.
+serial_test.workspace = true
 # `source_guard::ProductionScanner` — structural guards that scan this crate's
 # own production source (mika#1951: one `build_send_params` call site, so both
 # `mika ask` doors post the same request metadata).

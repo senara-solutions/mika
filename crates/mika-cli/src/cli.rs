@@ -439,6 +439,29 @@ pub enum AgentsCommand {
         #[arg(long, short)]
         yes: bool,
     },
+    /// Re-apply the authoritative identity.toml and soul.md for an existing agent
+    Reprovision {
+        /// Agent name to re-provision
+        name: String,
+        /// Tier template to apply (customer agents only): default | family | champion.
+        /// Defaults to MIKA_AGENT_TIER. Refused for well-known agents.
+        //
+        // Deliberately `Option<String>` and not a clap `ValueEnum`: the tier
+        // vocabulary and its fail-closed rule (mika#2023 AC2) live in
+        // `AgentTier::parse`, and a `ValueEnum` would restate them here and
+        // diverge the day a fourth tier arrives (mika#2230 D2).
+        #[arg(long)]
+        tier: Option<String>,
+        /// Re-apply identity.toml only, leaving soul.md untouched
+        #[arg(long)]
+        identity_only: bool,
+        /// Show what would be written without writing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the typed-name confirmation
+        #[arg(long, short)]
+        yes: bool,
+    },
 }
 
 #[derive(clap::Args)]
