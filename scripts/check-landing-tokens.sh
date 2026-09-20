@@ -124,44 +124,46 @@ VIOLATIONS="$(printf '%s\n' "$FILES" | while IFS= read -r f; do
             for (i = 1; i <= n; i++) { ok[tolower(a[i])] = 1 }
         }
         {
-            line = $0
-
-            # Continue an open block comment.
-            if (in_block) {
-                if (match(line, /\*\//)) { line = substr(line, RSTART + 2); in_block = 0 }
-                else { next }
-            }
-            if (in_html) {
-                if (match(line, /-->/)) { line = substr(line, RSTART + 3); in_html = 0 }
-                else { next }
-            }
-
-            # Strip closed block comments, then open an unterminated one.
-            while (match(line, /\/\*[^*]*\*+([^\/*][^*]*\*+)*\//)) {
-                line = substr(line, 1, RSTART - 1) substr(line, RSTART + RLENGTH)
-            }
-            if (match(line, /\/\*/)) { line = substr(line, 1, RSTART - 1); in_block = 1 }
-
-            while (match(line, /<!--.*-->/)) {
-                line = substr(line, 1, RSTART - 1) substr(line, RSTART + RLENGTH)
-            }
-            if (match(line, /<!--/)) { line = substr(line, 1, RSTART - 1); in_html = 1 }
-
-            # Line comment, but never a URL scheme separator. The cursor walks
-            # forward by absolute offset rather than rewriting the string: a
-            # scan that edits what it is scanning has to be proved to shrink it,
-            # and this one does not need to.
-            probe = line
-            offset = 0
-            while (match(probe, /\/\//)) {
-                pos = offset + RSTART
-                if (pos > 1 && substr(line, pos - 1, 1) == ":") {
-                    offset = pos + 1
-                    probe = substr(line, offset + 1)
-                } else {
-                    line = substr(line, 1, pos - 1)
-                    break
+            # Strip comments in ONE left-to-right pass, carrying `in_block` and
+            # `in_html` across lines. `line` ends up holding the code only.
+            #
+            # One pass rather than four successive substitutions, and that is a
+            # correctness requirement rather than a taste: successive passes have
+            # to choose an order, and every order is wrong somewhere. Stripping
+            # `/* */` first reads the `/*` in `// see /* below` as the start of a
+            # block and swallows the rest of the FILE until some later `*/` —
+            # a guard that silently stops looking, which is the one failure mode
+            # worse than a guard that accuses wrongly. Stripping `//` first is no
+            # better: it truncates at the `//` inside `/* a // b */`. Scanning
+            # once makes the question of order disappear, because whichever
+            # marker comes first is simply the one encountered first.
+            #
+            # Known limit, and it fails toward the safe side: a `//` inside a
+            # string literal that is not a URL (`const s = "a // b"`) truncates
+            # the line. The scanner does not lex strings. The cost is a colour
+            # after such a literal going unseen — a false negative, never a false
+            # accusation — and `:`-prefixed `//` is exempted because that is the
+            # shape the landing actually contains (six `https://` URLs).
+            raw = $0
+            line = ""
+            i = 1
+            n_raw = length(raw)
+            while (i <= n_raw) {
+                if (in_block) {
+                    if (substr(raw, i, 2) == "*/") { in_block = 0; i += 2 } else { i++ }
+                    continue
                 }
+                if (in_html) {
+                    if (substr(raw, i, 3) == "-->") { in_html = 0; i += 3 } else { i++ }
+                    continue
+                }
+                if (substr(raw, i, 2) == "/*")   { in_block = 1; i += 2; continue }
+                if (substr(raw, i, 4) == "<!--") { in_html = 1;  i += 4; continue }
+                if (substr(raw, i, 2) == "//" && !(i > 1 && substr(raw, i - 1, 1) == ":")) {
+                    break   # the rest of the line is a comment
+                }
+                line = line substr(raw, i, 1)
+                i++
             }
 
             # ── Rule 1: colour hex literals.

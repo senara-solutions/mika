@@ -178,6 +178,24 @@ d="$(make_component '      /* historical note: #0d0f12 */
 assert_exit "$d" 1 "the comment skip ends with its block"
 rm -rf "$d"
 
+# ── 7c. A `/*` INSIDE a line comment does not open a block. Without this, the
+#       guard swallows every remaining line of the file waiting for a `*/` that
+#       is not coming — it stops looking and still exits 0, which is the one
+#       failure mode worse than accusing wrongly. This case is why the scanner
+#       makes a single pass instead of four ordered substitutions.
+d="$(make_component '      // see /* the note above
+      <div className="bg-[#7c6af7]" />')"
+assert_exit "$d" 1 "a /* inside a line comment does not blind the rest of the file"
+rm -rf "$d"
+
+# ── 7d. ...and the mirror: a `//` inside a block comment does not truncate at
+#       the `//` and leave the block unclosed.
+d="$(make_component '      /* rationale: see //internal/doc
+         the old value was #0d0f12 */
+      <div className="bg-[#7c6af7]" />')"
+assert_exit "$d" 1 "a // inside a block comment does not leave the block open"
+rm -rf "$d"
+
 # ── 8. No false positive on the shapes the landing is actually full of. A `//`
 #      inside a URL is not a line comment, and an anchor is not a colour — this
 #      landing carries six of the first and five of the second.
