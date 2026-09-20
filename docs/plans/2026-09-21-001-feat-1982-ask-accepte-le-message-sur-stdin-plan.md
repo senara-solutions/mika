@@ -226,7 +226,34 @@ une surprise — le TTY.
 ### Phase 2 — Le positionnel devient optionnel
 
 - `crates/mika-cli/src/cli.rs` : `pub message: Option<String>`, aide réécrite.
-- Corriger les usages compilés qui en découlent (`main.rs` × 3, et le test `cli.rs:1440` s'il touche `message`).
+- Corriger les sites compilés qui en découlent — **énumérés ci-dessous, pas estimés**.
+
+#### Le ripple, énuméré et borné (F3)
+
+`pub message: String` → `Option<String>` est un changement sur une structure publique du crate ; R8 ne
+peut prétendre « aucun changement au reste de la surface » qu'en montrant la borne plutôt qu'en la supposant.
+Elle est établie ici, au temps du plan, et non renvoyée à l'implémentation.
+
+| site | ce qu'il fait de `message` | effet du changement |
+|---|---|---|
+| `main.rs:137` (`run_team_ask`) | `&args.message` | réécrit — reçoit la `String` résolue (Phase 3) |
+| `main.rs:332` (`run_remote`) | `&args.message` | réécrit — reçoit la `String` résolue (Phase 3) |
+| `main.rs:353` (`ask::run`) | `&args.message` | réécrit — reçoit la `String` résolue (Phase 3) |
+| `cli.rs:1440` | **ne touche pas `message`** — assertion sur `args.continue_session` | inchangé |
+| tests `main.rs:865-955` (7 tests) | passent `"hello world"` en positionnel, assertent sur `format`, `model` | inchangés — aucun n'accède à `args.message` |
+
+Le hedge « s'il touche `message` » de la première rédaction est levé : `cli.rs:1440` est
+`Some(Commands::Ask(args)) => assert!(args.continue_session)`. Il ne touche pas le champ.
+
+**Personne ne construit `AskArgs` à la main.** La structure n'a que deux mentions dans tout l'arbre — sa
+déclaration (`cli.rs:228`) et la variante qui la porte (`cli.rs:67`) ; aucun littéral `AskArgs { … }` n'existe,
+dans ce crate ni ailleurs. Elle n'est instanciée que par clap au parse. Et `lib.rs` n'expose que `remote_ask` et
+`supervision` : `cli` n'est pas un module public, donc aucun crate tiers ne peut construire ni filtrer sur
+`AskArgs`. Le ripple est donc **exactement les trois sites de `main.rs`**, tous réécrits en Phase 3.
+
+*Citation : review-guide § Orthogonality — « changes propagate minimally » se démontre par l'énumération de la
+propagation, pas par le geste vers elle ; doctrine de la Unresolved-Decision Gate (mika#1244) — un fait de
+conception vérifiable au temps du plan se vérifie au temps du plan.*
 
 ### Phase 3 — Câblage des trois chemins
 
@@ -238,11 +265,73 @@ une surprise — le TTY.
 
 ### Phase 4 — Garde structurelle et tests
 
-- Garde R6 : scan de source refusant un `std::io::stdin()` sur le chemin `ask` hors du module
-  `ask_message`. Modèle : `mika2220_no_local_reparse_of_the_llm_bodies_env_var`. Livrée avec allowlist **vide** —
-  quand elle tire, on retire le second lecteur, on ne l'allowliste pas.
-- Test de non-régression `--remote` : la résolution est appliquée avant `run_remote` (R5). Le site est vérifié
-  structurellement plutôt qu'en réseau — le point à tenir est que `run_remote` ne reçoit plus jamais `"-"`.
+#### Le garde R6 : son périmètre est un file set, sa règle de match couvre les trois écritures (F2)
+
+Modèle : `mika2220_no_local_reparse_of_the_llm_bodies_env_var`. Ce modèle scanne **une** chaîne à orthographe
+unique ; `std::io::stdin()` n'en a pas, donc le garde doit nommer son périmètre et sa règle plutôt que les
+laisser à l'intuition — un garde dont la règle est plus floue que la chose gardée n'est pas simple, il est
+poreux (*review-guide § KISS*).
+
+**Périmètre — un file set concret, pas une notion de call-graph :**
+
+```
+crates/mika-cli/src/main.rs
+crates/mika-cli/src/commands/ask.rs
+crates/mika-cli/src/remote_ask.rs
+```
+
+`crates/mika-cli/src/ask_message.rs` est **exclu par construction** : c'est le lecteur, sa raison d'être est de
+contenir les deux appels impurs. `cli.rs` est hors périmètre — il ne porte que la déclaration clap et aucune
+lecture (sa seule occurrence du mot est le texte d'aide, sans parenthèse, donc hors de la règle de match
+ci-dessous).
+
+`main.rs` est **inclus** bien qu'il porte toutes les sous-commandes, et l'état actuel autorise ce choix sans
+allowlist : `main.rs` et `remote_ask.rs` ne contiennent **aucune** occurrence de `stdin` aujourd'hui — les huit
+sous-commandes qui lisent légitimement stdin (`credential_helper`, `setup`, `agents`, `config`, `tasks`, `kg`,
+`skills`, `provider`, `teams`) le font toutes depuis leur propre module `commands/*.rs`, jamais depuis le
+dispatch. L'inclure ferme le trou qu'un périmètre `{ask.rs, remote_ask.rs}` laisserait ouvert : une
+ré-implémentation de la lecture directement dans le bras `Commands::Ask`, c'est-à-dire précisément là où la
+résolution est câblée et donc l'endroit le plus probable d'un second lecteur.
+
+**Règle de match — une regex sur le site d'appel, pas sur le chemin qualifié :**
+
+```
+\bstdin\s*\(
+```
+
+Elle couvre les trois écritures atteignables, dont deux sont **déjà employées** ailleurs dans le crate :
+
+| écriture | d'où elle vient | employée aujourd'hui |
+|---|---|---|
+| `std::io::stdin()` | qualifiée complète | oui (majorité des sites) |
+| `io::stdin()` | après `use std::io;` | oui (`agents.rs`, `teams.rs`) |
+| `stdin()` | après `use std::io::stdin;` | non, mais atteignable |
+
+Un garde ancré sur `std::io::stdin` seul serait donc évadé par un `use` que le crate pratique déjà — c'est le cas
+de figure exact que F2 nomme. La règle porte sur le site d'appel, qui est invariant par import.
+
+**Elle couvre `is_terminal` sans second prédicat.** Tester la tty-ness de l'entrée exige d'en tenir le handle :
+les deux formes en usage dans le crate — `std::io::stdin().is_terminal()` et
+`std::io::IsTerminal::is_terminal(&std::io::stdin())` — contiennent l'une et l'autre `stdin(`. Un second
+prédicat sur `is_terminal` n'attraperait rien de plus et ajouterait une surface de faux positif.
+
+**Faux positifs vérifiés absents sur le file set.** La forme parasite est `.stdin(Stdio::piped())` du builder
+`Command` (présente dans `tui/input.rs`, hors périmètre) : ni `ask.rs` ni `remote_ask.rs` ni `main.rs` ne
+construisent de `Command`/`Stdio`. Le file set est donc propre après Phase 3, sans exception.
+
+**Limite assumée, écrite plutôt que découverte :** `use std::io::stdin as lire;` échappe à la règle. Ce garde
+borne l'inattention — un second lecteur écrit de bonne foi, qui est la forme qu'ont prise les trois divergences
+citées en Contexte — et non l'évasion délibérée, qu'aucun scan de source n'atteint.
+
+**Fixture d'évasion (obligatoire, pas décorative) :** le test du garde inclut au moins un cas
+`io::stdin()` — l'écriture importée que le crate pratique déjà — vérifiant que la règle le rejette. Sans cette
+fixture, un garde qui n'attrape que la forme qualifiée passerait au vert en ne gardant rien, ce qui est la
+panne silencieuse que tout ce garde existe pour fermer.
+
+#### Test de non-régression `--remote`
+
+La résolution est appliquée avant `run_remote` (R5). Le site est vérifié structurellement plutôt qu'en réseau —
+le point à tenir est que `run_remote` ne reçoit plus jamais `"-"`.
 
 ### Phase 5 — Documentation
 
@@ -250,6 +339,58 @@ une surprise — le TTY.
   cette dernière (elle reste la forme canonique d'un appelant scripté, et `_arch_ask` l'emploie).
 - Aide clap (`cli.rs`) : les trois portes nommées.
 - Ne **pas** toucher au commentaire de `_arch_ask` : son choix de `-` reste correct et explicite.
+
+---
+
+## Fire-Disposition
+
+Ce plan livre **deux détecteurs** — des livrables dont le chemin de succès est « aucune violation trouvée ».
+mika#1574 exige que la disposition d'échec soit pré-spécifiée *avant* la livraison, pour la raison qui décide
+tout le reste : un détecteur dont la disposition se décide au moment où il tire se décide sous la pression de
+faire passer le build, et cette pression a une réponse par défaut — allowlister — qui vide le détecteur de son
+objet sans que rien ne le dise.
+
+### Détecteur 1 — garde de source R6 (`std::io::stdin()` sur le chemin `ask`)
+
+**Disposition : (a) exception par allowlist nommée — zéro entrée.**
+
+Le garde est livré avec une allowlist **vide**, et cette vacuité est l'invariant, pas l'état initial. Trois cas,
+et deux d'entre eux ne sont pas des exceptions :
+
+1. **Il tire sur `ask.rs:271` ou `ask.rs:760`** — les deux lecteurs que la Phase 3 supprime. Ce n'est pas un
+   « tir sur données existantes » : c'est la Phase 3 qui n'a pas été faite. La disposition est de la faire.
+2. **Il tire sur un site du file set que ce plan n'a pas prévu.** Le plan affirme que le file set est propre
+   après Phase 3, et cette affirmation est vérifiée au temps du plan : `main.rs` et `remote_ask.rs` ne
+   contiennent aucune occurrence de `stdin` aujourd'hui (Phase 4). Si un site apparaît malgré tout, la
+   disposition est de **le replier dans `ask_message.rs`** — c'est-à-dire d'en faire un appelant du lecteur
+   unique — jamais de l'allowlister. C'est ce que R6 énonce et ce que les trois divergences citées en Contexte
+   (`grooming_marker`, `parse_log_llm_bodies`, `LlmUsage::accumulate`) ont coûté quand la règle n'existait pas.
+3. **Le repliement est structurellement impossible** — un site qui aurait besoin de stdin sur le chemin `ask`
+   pour une raison étrangère à la résolution du message. Aucun n'est connu, et aucune hypothèse n'en est faite
+   ici. Ce cas est **hors périmètre de ce plan** : il rouvrirait la question de savoir si le chemin `ask` a un
+   second usage légitime de stdin, ce qui est une décision d'opérateur et non un réglage de garde. La
+   disposition est alors de **halter et de la poser**, pas d'ajouter une entrée pour débloquer le build.
+
+**Ce que ce détecteur ne peut pas voir**, dit ici pour que son silence ne se lise pas comme une preuve :
+l'aliasing d'import (`use std::io::stdin as …`) et tout site hors du file set de la Phase 4. Le garde borne la
+divergence de bonne foi, qui est la forme mesurée du défaut, pas l'évasion.
+
+### Détecteur 2 — test structurel `--remote` (`run_remote` ne reçoit jamais `"-"`)
+
+**Disposition : (a) exception par allowlist nommée — zéro entrée, et aucune n'est concevable.**
+
+Ce détecteur n'affirme pas un invariant sur du code préexistant : il affirme la propriété **que la Phase 3
+crée**. Il ne peut donc pas « tirer sur des données existantes » au sens de mika#1574 — il ne peut échouer que
+si la Phase 3 est incomplète ou régresse plus tard. Dans les deux cas la disposition est **de casser le build**,
+sans exception et sans entrée d'allowlist : un `"-"` qui atteint `run_remote` est très exactement le faux vert
+de la section Contexte, c'est-à-dire une réponse plausible à une question jamais posée. Une allowlist ici
+rouvrirait le défaut que le ticket ferme.
+
+La disposition est écrite même si son cas d'application est trivial, parce que « trivialement (a) » et « non
+spécifié » produisent le même texte dans un plan et des conduites opposées le jour où le test rougit.
+
+*Citation : mika#1574 (corps d'issue — « the scope-bind MUST pre-specify the failure-disposition for when the
+detector fires on existing data ») ; Fire-Disposition Gate du skill groom-ticket, branche 2.*
 
 ---
 
@@ -277,7 +418,11 @@ une surprise — le TTY.
 - Le lecteur unique existe, est pur, et est le seul site `std::io::stdin()` du chemin `ask`.
 - Les trois chemins (local, `--team`, `--remote`) partagent cette résolution.
 - `-` fonctionne exactement comme avant sur local et `--team`, et fonctionne **désormais** sur `--remote`.
-- La garde structurelle est livrée avec une allowlist vide.
+- La garde structurelle est livrée avec une allowlist vide, son file set et sa règle de match écrits au site du
+  garde, et une fixture d'évasion (`io::stdin()`) qui rougit si la règle ne couvre que la forme qualifiée.
+- La section `## Fire-Disposition` nomme la disposition des deux détecteurs, et le code du garde porte en
+  commentaire la phrase qui la rend contraignante : *quand elle tire, on retire le second lecteur, on ne
+  l'allowliste pas*.
 - La documentation nomme les trois portes sans retirer la sentinelle.
 - `cargo test`, `clippy`, `fmt` verts.
 
@@ -297,4 +442,37 @@ demandée mais traversée par le correctif.
    (`dispatch-lib.sh:4782`) et de `docs/getting-started.md:307,311`.
 6. `--remote` applique la même résolution : `cat f | mika ask --remote <url> -` envoie le contenu de `f`, et non
    la chaîne `"-"`.
-7. `std::io::stdin()` n'apparaît qu'une fois sur le chemin `ask`, tenu par une garde de source à allowlist vide.
+7. `std::io::stdin()` n'apparaît qu'une fois sur le chemin `ask`, tenu par une garde de source à allowlist vide,
+   dont le file set et la règle de match sont écrits (Phase 4) et dont la disposition de tir est pré-spécifiée
+   (§ Fire-Disposition).
+
+---
+
+## Revision history
+
+- **rev 2 (2026-09-21)** — révision sur findings de première passe architecte (`.iterate/findings-1.md`).
+  - **F1 (bloquant) adressé** par l'ajout d'une section `## Fire-Disposition` couvrant les deux détecteurs
+    (garde de source R6, test structurel `--remote`). Option **(a) exception par allowlist nommée — zéro
+    entrée** pour les deux, avec, pour le garde R6, la distinction des trois cas de tir : Phase 3 non faite
+    (faire la phase), site imprévu du file set (replier dans `ask_message.rs`, jamais allowlister), repliement
+    impossible (halter — décision d'opérateur hors périmètre). Pour le test `--remote`, la disposition est
+    écrite bien que triviale, parce que « trivialement (a) » et « non spécifié » produisent le même texte et des
+    conduites opposées. La limite de chaque détecteur (aliasing d'import, hors-file-set) est nommée pour que son
+    silence ne se lise pas comme une preuve. Citation mika#1574 préservée.
+  - **F2 adressé** en Phase 4 : le périmètre devient un **file set concret** (`main.rs`, `commands/ask.rs`,
+    `remote_ask.rs` ; `ask_message.rs` exclu par construction) avec le motif d'inclusion de `main.rs` écrit, et
+    la règle de match devient `\bstdin\s*\(` — portant sur le **site d'appel**, invariant par import. La table
+    des trois écritures montre que deux d'entre elles (`std::io::stdin()`, `io::stdin()`) sont **déjà** en usage
+    dans le crate, donc qu'un garde ancré sur la forme qualifiée serait évadé par un `use` que le code pratique.
+    Ajout : la couverture gratuite de `is_terminal` (les deux formes contiennent `stdin(`), la vérification que
+    le file set ne porte aucun `.stdin(Stdio::piped())`, et une **fixture d'évasion obligatoire** sur
+    `io::stdin()`. Citation review-guide § KISS préservée.
+  - **F3 adressé** en Phase 2 : le hedge « s'il touche `message` » est **levé par vérification** plutôt que
+    reformulé. `cli.rs:1440` est `assert!(args.continue_session)` — il ne touche pas le champ. Table
+    d'énumération des cinq populations de sites, plus la borne externe : `AskArgs` n'a que deux mentions dans
+    l'arbre (déclaration + variante), aucun littéral ne le construit, et `lib.rs` n'exporte que `remote_ask` et
+    `supervision` — `cli` n'étant pas public, aucun crate tiers ne peut le construire. Le ripple est exactement
+    les trois sites de `main.rs`. Citation review-guide § Orthogonality + doctrine mika#1244 préservée.
+  - Répercussions : `## Definition of Done` et AC7 étendus pour que la fire-disposition et la fixture d'évasion
+    soient des conditions de livraison et non des intentions.
+  - Aucun AC affaibli, aucun retiré. Aucune décision de conception de la rev 1 renversée.
