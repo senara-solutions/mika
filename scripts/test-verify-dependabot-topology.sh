@@ -150,7 +150,7 @@ check_line() {
     # harnais au premier ajustement cosmétique du rapport, ce qui apprendrait à
     # le désarmer plutôt qu'à le lire.
     local label="$1" a="$2" b="$3"
-    if printf '%s\n' "$LAST_OUTPUT" | grep -q -- "$a.*$b"; then
+    if grep -q -- "$a.*$b" <<<"$LAST_OUTPUT"; then
         echo "  PASS  $label"
         PASS=$((PASS + 1))
     else
