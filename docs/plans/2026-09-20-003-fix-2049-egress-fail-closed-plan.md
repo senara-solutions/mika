@@ -666,6 +666,174 @@ binaire antérieur au correctif produit exactement le même silence (classe mika
 
 ---
 
+## Fire-Disposition
+
+Requis par le Fire-Disposition Gate (mika#1574), soulevé par mika-arch en première passe (F1). Ce
+lot porte **sept livrables de classe détecteur**, plus un que le F-list liste et qui n'en est pas
+un. Chacun est disposé ci-dessous sur une population **comptée dans l'arbre à HEAD**, jamais
+supposée — et la mesure déplace le plan sur deux points qu'il n'avait pas vus : la portée exacte du
+scan 7bis, et le câblage CI des quatre tests de §5.2.
+
+| # | Livrable détecteur | Où | Violations préexistantes | Disposition |
+|---|---|---|---|---|
+| D1 | §5.1 assertions 1–5 (comportement shell) | `test-dispatch-lib.sh` | 0 — état fabriqué | (a), liste vide — énoncé |
+| D2 | §5.1 assertion 6 (verdict de la garde B) | Rust, `auto_pull` | 0 — garde neuve | (a), liste vide |
+| D3 | §5.1 assertion 7 (invariant `TTL > seuil`) | Rust | 0 — constante neuve | (a), liste vide, aucune exemption écrite |
+| D4 | §5.1 assertion 7bis (scan du chemin de stamp) | scan de source | **1 — `dispatch-lib.sh:5829`** | **(a), exception nommée** |
+| D5 | §5.2 migration des quatre tests de contenance | 4 fichiers shell | **4 — nommées en §5.2** | **(a), traduction mécanique bornée ; (c) si un test la refuse** |
+| D6 | Deux noms de fil ajoutés aux scans existants | Rust ×2 | 0 — les deux sont verts et exhaustifs | (a), liste vide, aucune exemption écrite |
+| D7 | §5.1 assertion 8 (marqueur lu par la garde D) | shell | 0 — `RESULT` fabriqué | (a), liste vide |
+| — | `--restart-relay` | `scripts/canary-pilot-containment` | — | **hors classe détecteur** (§D8) |
+
+### D4 — le scan du chemin de stamp : une violation préexistante, nommée
+
+**Population, comptée.** Six résolutions de home dans `dispatch-lib.sh`. **Une seule consulte
+`MIKA_HOME`** : `:5829` (`MIKA_PR_ORIGIN_EPOCH_FILE`). Les cinq autres (`:303`, `:346`, `:934`,
+`:1176`, `:1260`) écrivent `$HOME/.mika` en dur, et sont honnêtes sur ce qu'elles font.
+
+**La portée du scan n'est pas celle qu'on écrirait d'abord, et c'est la mesure qui la décide.**
+Deux autres sites du dépôt emploient `${MIKA_HOME:-…}` — `scripts/guard-shared-checkout:55` et
+`scripts/pr-origin-report.sh:94` — et **ils ont raison de le faire** : ce sont des scripts
+opérateur, invoqués depuis un shell d'opérateur, qui ne traversent jamais `scrub_mika_env_vars` et
+pour qui la variable est réellement lisible. Un scan qui interdirait le patron *dans le dépôt*
+rougirait sur deux sites sains et devrait les exempter — il exempterait donc deux fois plus qu'il
+n'attrape, ce qui est la forme d'un détecteur qu'on finit par désarmer. La population où le patron
+est un piège est exactement **le corps de `dispatch-lib.sh`**, qui s'exécute scrubé. Le scan porte
+là, et nulle part ailleurs. Le scan garde par ailleurs sa seconde moitié inchangée : le littéral
+`state/pilot-egress-down` n'apparaît qu'aux deux sites prévus (§3.4.2).
+
+**Pourquoi `:5829` est exempté et non corrigé — mesure, pas prudence.** `pr-origin-epoch` est écrit
+par `dispatch-lib.sh:5829` et relu par `scripts/pr-origin-report.sh:94` : **shell des deux côtés**,
+donc intra-frontière. **Aucun lecteur Rust** — les trois mentions du fichier dans `crates/`
+(`auto_pull_stop.rs:96`, `dispatcher.rs:373`, `server/mod.rs:570`) sont des doc-comments. La
+résolution inopérante n'a donc aujourd'hui aucune conséquence : les deux extrémités retombent sur
+`$HOME/.mika`, l'une parce que la variable est scrubée, l'autre parce qu'un opérateur qui pose
+`MIKA_HOME` le pose pour les deux. Le corriger serait un dé-piégeage cosmétique sur un chemin sain,
+dans un PR dont le sujet est l'egress.
+
+**Les trois sous-points du doctrine, tenus :**
+
+1. **Donnée nommée** — l'allowlist contient exactement une entrée, la ligne
+   `MIKA_PR_ORIGIN_EPOCH_FILE=` de `dispatch-lib.sh`, désignée **par son nom de variable** et non
+   par un numéro de ligne (qui dérive au premier ajout au-dessus) ni par un motif.
+2. **Suivi référencé** — un ticket de suivi, dont l'ouverture est une case de la DoD : « retirer le
+   `${MIKA_HOME:-…}` inopérant de `_record_pr_origin_epoch` ». L'exemption ne couvre pas la ligne,
+   elle la date.
+3. **Assertion auto-nettoyante** — l'entrée porte son propre test : le scan rougit avec « retirez
+   cette entrée » le jour où la ligne cesse de porter le patron. Sans quoi l'exemption survivrait à
+   sa raison d'être, ce qui est la dette que ce sous-point existe pour éviter.
+
+**L'allowlist vit dans le test, jamais dans `dispatch-lib.sh`** — l'équivalent shell du
+`#[cfg(test)]` que le doctrine impose (option (a)) : rien de ce qui s'exécute en dispatch ne doit
+pouvoir consulter la liste des dispenses.
+
+**Où le scan est câblé, et c'est D5 qui le décide.** Il land dans
+`skills/bundled/_shared/test-dispatch-lib.sh`, que CI appelle déjà (`ci.yml:85`, via
+`make test-dispatch-lib`). Créer un nouveau fichier de test doté d'une nouvelle cible Makefile est
+le geste naturel, et c'est **celui qui produit un orphelin** — voir D5, où un test de contenance
+livré ainsi n'est appelé par aucune cible depuis mika#2165.
+
+### D5 — les quatre tests de §5.2 : le câblage mesuré déplace la disposition
+
+**Population.** Les quatre fichiers nommés en §5.2, qui stubent `_ensure_pilot_egress_proxy` en
+`return 1` pour exercer la branche Phase 2a, et que le fail-closed fait basculer en refus.
+
+**Le câblage n'est pas celui que le plan supposait.** Mesure :
+
+- trois des quatre sont appelés par la cible `test` du Makefile (`:137-139`) ;
+- `test_sandbox_log_dir_bound.sh` n'est appelé par **aucune cible et aucun workflow** — le seul
+  endroit du dépôt qui le nomme, hors de lui-même, est le plan de mika#2165 qui l'a créé. Il est
+  orphelin depuis sa naissance ;
+- et **aucun des quatre ne tourne en CI** : `ci.yml` appelle `cargo test`,
+  `make verify-bundled-skills`, `make test-dispatch-lib` et `make test-permission-policy-plugin`,
+  jamais `make test`.
+
+**Conséquence sur la disposition, et elle est portante.** Laisser ces tests rouges ne ferait rougir
+aucun PR : trois ne tirent que sous un `make test` local, le quatrième ne tire nulle part. C'est
+précisément la forme sous laquelle une régression de contenance passerait inaperçue — *une
+observabilité qui n'atteint aucun lecteur collecté ne distingue rien* (mika#2131, la phrase que
+§1.2 applique déjà à `pilot_egress_guard.unreachable`). La migration n'est donc pas « à faire pour
+garder le vert » : sans elle, **AC6 serait vert par absence d'exécution**.
+
+**Disposition : (a), traduction mécanique bornée, dans le même commit.** La frontière est écrite
+parce que trois des façons de faire repasser ces tests affaiblissent l'invariant qu'ils gardent :
+
+- **Autorisé** — remplacer le stub `return 1` par un stub servant (`return 0` plus un socket
+  fabriqué que `_pilot_egress_sock_connectable` accepte, ce que `_egress_guard_probe` sait déjà
+  faire, `test-dispatch-lib.sh:4428`). C'est un changement de préparation, pas de sens.
+- **Interdit** — (i) stuber `_run_pilot_sandboxed` lui-même pour court-circuiter la garde C : le
+  test n'inspecterait plus un lancement réel, donc plus l'invariant ; (ii) supprimer ou relâcher
+  une assertion pour faire passer le scénario ; (iii) armer `MIKA_PILOT_SANDBOX=0` dans le harness,
+  qui ferait sortir le test de la branche sandbox **entière** et viderait les quatre invariants
+  d'un coup.
+- **(c) halt-and-surface** si l'un des quatre refuse la traduction mécanique — c'est-à-dire si
+  l'invariant qu'il garde ne peut pas être exercé derrière un relais servant. Cela signifierait que
+  l'invariant dépendait réellement de l'absence de relais, ce qui est un fait d'architecture à
+  remonter à l'opérateur, pas un geste de poseur.
+
+**Et le plus petit geste honnête sur l'orphelin.** `test_sandbox_log_dir_bound.sh` est ajouté à la
+cible `test` du Makefile, à côté de ses trois frères. Une ligne. Sans elle, AC6 atteste « les
+quatre invariants restent testés » d'un test que rien n'exécute. Le câblage **en CI** des quatre
+est une décision sur le budget de temps de CI, sans rapport avec l'egress : hors périmètre, §6.
+
+### D1, D2, D7 — comportement sur état fabriqué : le gate est N/A, et c'est dit
+
+Les assertions 1–5 fabriquent leurs états de socket et de binaire via `_egress_guard_probe` ;
+l'assertion 6 construit son issue et ses `facts` ; l'assertion 8 passe un `RESULT` fabriqué au
+discriminant. Aucune ne s'exécute sur une donnée préexistante : il n'y a **aucune population à
+exempter**, et le gate ne les concerne pas — énoncé plutôt que tu, pour qu'un lecteur ne prenne pas
+le silence pour un oubli (arbre de décision du gate, branche 3).
+
+**À ne pas confondre avec l'anti-vacuité.** §5.1 exige que les assertions 1 et 3 **échouent contre
+`HEAD`**, et l'assertion 7 contre un TTL de 600 s. Ce n'est pas un détecteur qui tire sur des
+données existantes : c'est un contrôle négatif, vérifié une fois à l'écriture, et non un état dans
+lequel le lot land. **Les neuf assertions landent vertes et activées** — aucun `#[ignore]`, aucun
+`skip`, aucune variable de report.
+
+### D3 — l'invariant `TTL > seuil` : zéro violation, et aucune exemption écrite
+
+`MIKA_PILOT_EGRESS_DOWN_TTL_SECS` naît dans ce lot à `1800`, contre un seuil de `900`
+(`auto_pull.rs:91`). La relation est vraie dès le premier commit. **Disposition : (a) avec une
+liste vide, et aucune exemption n'est écrite** — exempter d'un détecteur ce qui le passe déjà crée
+une dispense morte que plus rien ne nettoie.
+
+Ce qui reste à livrer n'est donc pas une dispense mais l'écriture de la relation **à l'endroit où
+elle se lit** (doc-comment de la constante, nommant `STUCK_READY_THRESHOLD_ENV`, §3.4.1) : c'est ce
+qui manquait à mika#2362, où deux nombres corrects l'un sans l'autre rendaient une tentative
+inatteignable sans qu'aucun test ne rougisse.
+
+### D6 — les deux noms de fil : zéro violation, l'ajout est l'objet du test
+
+`mika2131_filter_names_are_a_wire_format` (`auto_pull.rs:7008`) et
+`mika2323_gate_names_are_a_wire_format` (`ready_label_handler.rs:1773`) sont aujourd'hui **verts et
+exhaustifs** — le second énumère les quinze variantes de `ReadyLabelGate`. Ce lot leur ajoute une
+entrée chacun. Le détecteur tire donc sur le **code neuf** (l'entrée manquante) et sur aucune donnée
+préexistante. **Disposition : (a), liste vide, aucune exemption.**
+
+Point de rédaction, parce qu'il décide si la garde mord : la valeur de fil est `egress_relay_down`
+**aux deux endroits**, délibérément — même cause, deux surfaces d'audit distinctes
+(`auto_pull_exclusion.after_value` et `ready_label_outcome`), que l'opérateur agrège séparément. Un
+nom divergent entre les deux couperait en deux la population d'un même épisode de panne, ce qui est
+l'erreur exacte que ces deux scans existent pour rendre impossible.
+
+### D8 — `--restart-relay` n'est pas de classe détecteur, et c'est énoncé
+
+Le F-list le liste parmi les livrables à disposer ; **ce n'en est pas un**. C'est un geste
+d'opérateur (tuer un proxy wedgé, relancer), sans assertion et sans population à inspecter, et
+`scripts/canary-pilot-containment` n'est appelé par aucune cible Makefile ni aucun workflow — c'est
+une sonde d'hôte vivant, exercée à la main après un déploiement (§5.3 (e)). Le gate ne le concerne
+pas. Sa moitié vérifiable est l'assertion 5 (« proxy relancé ⇒ reprise »), disposée en D1.
+
+**Ce que le gate ne concerne pas non plus.** `make verify-bundled-skills`, `cargo clippy` et
+`cargo fmt` figurent dans la DoD au titre de la **non-régression**. Ce lot ne les crée ni ne les
+étend, et leur population préexistante est verte. Énoncé pour la même raison que D1 : un silence
+sur un détecteur connu se lit comme un oubli.
+
+*Citation : mika#1574 (Fire-Disposition Gate),
+`docs/solutions/best-practices/fire-disposition-doctrine.md`.*
+
+---
+
 ## 6. Hors périmètre, délibérément
 
 - **Le relais wedgé** (accepte `connect()`, ne sert plus). Nommé en §3.6, doté d'un geste
@@ -673,6 +841,15 @@ binaire antérieur au correctif produit exactement le même silence (classe mika
   bout en bout à travers le proxy — sur le chemin critique de chaque dispatch, dont le coût et le
   taux de faux positifs n'ont pas été mesurés. **Ticket de suivi**, préalable : une mesure de la
   latence d'une telle sonde.
+- **Le câblage en CI des quatre tests de contenance de §5.2.** Mesuré en § Fire-Disposition D5 :
+  `ci.yml` n'appelle jamais `make test`, donc **aucun des quatre ne tourne sur un PR** — trois sous
+  `make test` local, le quatrième nulle part. Ce lot ferme la moitié qui lui revient (migrer les
+  quatre, et câbler l'orphelin dans `make test`) ; les câbler tous les quatre **en CI** est une
+  décision sur le budget de temps de CI, sans rapport avec l'egress. **Ticket de suivi.**
+- **Le `${MIKA_HOME:-…}` inopérant de `_record_pr_origin_epoch`** (`dispatch-lib.sh:5829`).
+  Exempté par § Fire-Disposition D4 sur une mesure — `pr-origin-epoch` est shell des deux côtés,
+  sans lecteur Rust, donc la résolution morte n'a aucune conséquence. **Ticket de suivi**, et son
+  exemption porte l'assertion qui la nettoie le jour où il aboutit.
 - **La cause de la casse du 15/09** — non établie (§1.4). Ce lot rend la panne bruyante et sans
   dommage ; il ne la fait pas disparaître.
 - **Le repli `bwrap` absent** — §4, avec son préalable de mesure.
@@ -721,13 +898,31 @@ binaire antérieur au correctif produit exactement le même silence (classe mika
 - [ ] `scripts/canary-pilot-containment --restart-relay` livré.
 - [ ] `docs/operator/pilot-egress-relay.md` livré, avec la note de désambiguïsation « egress
       pilote ≠ egress recherche ».
-- [ ] Les huit assertions de §5.1 passent ; les assertions 1 et 3 échouent contre `HEAD`, et
-      l'assertion 7 échoue contre un TTL de 600 s.
-- [ ] Les quatre tests de §5.2 sont migrés et verts.
+- [ ] Les **neuf** assertions de §5.1 (1–7, 7bis, 8) passent, **toutes activées** (aucun
+      `#[ignore]`, aucun `skip`, aucune variable de report — § Fire-Disposition D1) ; contrôles
+      négatifs vérifiés à l'écriture : les assertions 1 et 3 échouent contre `HEAD`, l'assertion 7
+      contre un TTL de 600 s.
+- [ ] **Le scan 7bis porte sur le corps de `dispatch-lib.sh`**, jamais sur le dépôt
+      (§ Fire-Disposition D4 : `scripts/guard-shared-checkout` et `scripts/pr-origin-report.sh`
+      emploient le patron **légitimement**, n'étant pas scrubés), avec **une** exception nommée —
+      `MIKA_PR_ORIGIN_EPOCH_FILE`, désignée par son nom de variable et non par un numéro de ligne —
+      portant son assertion auto-nettoyante. **L'allowlist vit dans le test**, jamais dans
+      `dispatch-lib.sh`.
+- [ ] Le scan 7bis land dans `test-dispatch-lib.sh` (déjà appelé par CI, `ci.yml:85`) et **non**
+      dans un nouveau fichier doté d'une nouvelle cible — § Fire-Disposition D5 nomme l'orphelin
+      qu'un tel geste a déjà produit.
+- [ ] **Deux tickets de suivi ouverts** (§6) : retirer le `${MIKA_HOME:-…}` inopérant de
+      `_record_pr_origin_epoch` ; câbler en CI les quatre tests de contenance de §5.2.
+- [ ] Les quatre tests de §5.2 sont migrés et verts, **selon la frontière autorisé / interdit de
+      § Fire-Disposition D5** (stub servant admis ; stuber `_run_pilot_sandboxed`, relâcher une
+      assertion ou armer `MIKA_PILOT_SANDBOX=0` dans le harness, interdits).
+- [ ] `test_sandbox_log_dir_bound.sh` est ajouté à la cible `test` du Makefile — sans cette ligne,
+      AC6 atteste un test que rien n'exécute (§ Fire-Disposition D5).
 - [ ] `make test`, `cargo clippy`, `cargo fmt`, `make verify-bundled-skills` verts.
-- [ ] Les deux nouveaux noms de fil (`egress_relay_down` en filtre et en porte) sont épinglés par
-      les scans existants (`mika2131_filter_names_are_a_wire_format`,
-      `mika2323_gate_names_are_a_wire_format`).
+- [ ] Les deux nouveaux noms de fil sont épinglés par les scans existants
+      (`mika2131_filter_names_are_a_wire_format`, `mika2323_gate_names_are_a_wire_format`), **à la
+      même valeur `egress_relay_down` aux deux endroits** : un nom divergent couperait en deux la
+      population d'un même épisode de panne (§ Fire-Disposition D6).
 - [ ] Le commentaire `dispatch-lib.sh:488-490` est remplacé par la **décision datée** (option 1,
       2026-09-20, Vincent après bearing de Prime) et non par une nouvelle justification implicite.
 - [ ] `CLAUDE.md` — entrée `MIKA_PILOT_EGRESS_DOWN_TTL_SECS` et section de lecture opérateur.
@@ -773,8 +968,54 @@ mesure de §3.5 — le fail-closed met sur le chemin nominal d'une panne un trou
 jusqu'ici dormant.*
 
 **AC6 — Aucune régression de contenance.** Les quatre invariants de §5.2 restent testés et verts
-après migration.
+après migration, la migration respectant la frontière autorisé / interdit de § Fire-Disposition D5.
+*« Testés » veut dire **exécutés par une cible**, et la mesure oblige à le préciser : trois des
+quatre ne tournent que sous `make test`, le quatrième n'était appelé par aucune cible depuis
+mika#2165. La case Makefile de la DoD est ce qui rend ce critère vérifiable plutôt que déclaratif —
+sans elle, AC6 serait vert par absence d'exécution.*
 
 **AC7 — Pas d'échappatoire.** Aucune variable d'environnement ne lève le refus (option 2 écartée
 par décision opérateur). Vérifiable : absence de toute lecture d'environnement dans la branche de
 refus de la garde C.
+
+---
+
+## Revision history
+
+- **rev 2 (2026-09-20)** — addressed **F1** (Fire-Disposition Gate, mika#1574) by adding a named
+  `## Fire-Disposition` section between §5 and §6, disposing of the seven detector-class
+  deliverables of the lot one by one (D1–D7) and naming the eighth item of the F-list,
+  `--restart-relay`, as **not** detector-class with its reason (D8). Three measurements taken to
+  ground the section rather than assume it, and two of them moved the plan:
+  - **Portée du scan 7bis (D4).** Le F-list recommandait l'option (a) pour le patron
+    `${MIKA_HOME:-…}` de `dispatch-lib.sh:5829`, et c'est ce qui est retenu — mais la mesure a
+    resserré la population du scan. Deux autres sites du dépôt (`scripts/guard-shared-checkout:55`,
+    `scripts/pr-origin-report.sh:94`) emploient ce patron **légitimement**, étant des scripts
+    opérateur que `scrub_mika_env_vars` ne traverse pas. Un scan à portée dépôt aurait dû exempter
+    deux sites sains pour en attraper un fautif ; il porte donc sur le corps de `dispatch-lib.sh`.
+    L'exemption de `:5829` est justifiée par mesure et non par prudence : `pr-origin-epoch` est
+    shell des deux côtés et n'a **aucun lecteur Rust** (les trois mentions dans `crates/` sont des
+    doc-comments), donc sa résolution morte est sans conséquence. Trois sous-points du doctrine
+    tenus (donnée nommée par nom de variable, ticket de suivi en DoD, assertion auto-nettoyante),
+    allowlist scopée dans le test.
+  - **§5.2 déplacé sous la disposition, et sa mesure de câblage corrige le plan (D5).** Le F-list
+    lisait §5.2 comme une disposition de feu présentée en section de tests : elle y est désormais
+    référencée, en (a) avec une frontière autorisé / interdit explicite (les trois façons de faire
+    repasser ces tests qui videraient l'invariant sont nommées) et une sous-branche (c)
+    halt-and-surface. La mesure a ajouté un fait que le plan n'avait pas : **aucun des quatre tests
+    ne tourne en CI** (`ci.yml` n'appelle jamais `make test`) et `test_sandbox_log_dir_bound.sh`
+    n'est appelé par **aucune cible** depuis mika#2165. Sans migration, AC6 serait vert par absence
+    d'exécution — d'où une case DoD d'une ligne pour câbler l'orphelin dans `make test`, et
+    l'ajout en §6 du câblage CI complet comme ticket de suivi. Ce même fait décide le câblage du
+    scan 7bis (D4), qui land dans `test-dispatch-lib.sh` plutôt que dans un nouveau fichier.
+  - **Zéro violation ailleurs, énoncé plutôt que tu (D1, D2, D3, D6, D7).** Les deux scans de
+    wire-format sont verts et exhaustifs à HEAD, la constante de TTL naît conforme, et les tests de
+    comportement s'exécutent sur un état fabriqué : liste vide, et **aucune exemption écrite** —
+    exempter ce qui passe déjà crée une dispense morte. L'anti-vacuité de §5.1 est explicitement
+    distinguée d'un détecteur tirant sur des données existantes.
+  - **Sans affaiblissement d'AC.** AC6 est précisé (« testés » = exécutés par une cible) et non
+    relâché ; AC1–AC5, AC7, AC8 sont inchangés. Le compte d'assertions de la DoD est corrigé de
+    huit à **neuf** (1–7, 7bis, 8), 7bis ayant été ajoutée par une révision antérieure sans que le
+    compte suive.
+  - Aucune constatation d'infaisabilité : aucun « Could not address » n'est porté par cette
+    révision.
