@@ -2365,28 +2365,78 @@ impl Database {
         parent_task_id: &str,
         promoted_liveness_seconds: i64,
     ) -> Result<bool> {
-        let liveness_modifier = format!("-{promoted_liveness_seconds} seconds");
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM tasks
-             WHERE agent_id = ?1
-               AND parent_task_id = ?2
-               AND trigger_type = 'callback'
-               AND label = ?3
-               AND (
-                 status = 'pending'
-                 OR (status = 'completed'
-                     AND completed_at IS NOT NULL
-                     AND completed_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?4))
-               )",
-            params![
+        Ok(self
+            .find_live_deferred_wrapper_child(
                 agent_id,
                 parent_task_id,
-                crate::agent::DEFERRED_DISPATCH_LABEL,
-                liveness_modifier
-            ],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
+                promoted_liveness_seconds,
+                None,
+            )?
+            .is_some())
+    }
+
+    /// Same question as [`Self::has_live_deferred_wrapper_child`], answered with
+    /// the identity of the wrapper rather than a boolean, and with one wrapper
+    /// optionally taken out of the population (mika#2413).
+    ///
+    /// **One SQL, two entry points.** The boolean sibling delegates here with
+    /// `exclude_task_id = None`, so the two cannot drift — which is the trap the
+    /// sibling's own doc-comment names, and `find_orphaned_pending_issue_tasks`
+    /// clause (1) is pinned against the sibling by a dedicated twin test.
+    ///
+    /// **Why an exclusion at all.** The mika#2413 caller is
+    /// `rearm_deferred_callback`, which asks *"is this parent represented by
+    /// anything OTHER than the wrapper whose sterility I am treating?"*. On the
+    /// `silent_turn_error` path the consumed wrapper is still `completed` with a
+    /// fresh `completed_at`, so without the exclusion it would count itself as
+    /// live and no re-arm would ever be possible again. On the `noop_completion`
+    /// path it is already `delivered` (terminal, never live) — but only when
+    /// `mark_task_delivered` landed, and that write can fail. The exclusion makes
+    /// the predicate independent of that ordering instead of relying on it.
+    ///
+    /// **Why the id and not a bool.** The caller emits
+    /// `deferred_rearm_skipped_parent_represented` naming the wrapper that is
+    /// holding the parent; a skipped re-arm with no way to see *what* holds the
+    /// parent reads exactly like a re-arm that never had a reason to happen.
+    ///
+    /// The oldest live wrapper wins, matching the FIFO order promotion uses, so
+    /// the id an operator reads is the one that will actually fire next.
+    pub fn find_live_deferred_wrapper_child(
+        &self,
+        agent_id: &str,
+        parent_task_id: &str,
+        promoted_liveness_seconds: i64,
+        exclude_task_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        let liveness_modifier = format!("-{promoted_liveness_seconds} seconds");
+        let id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM tasks
+                 WHERE agent_id = ?1
+                   AND parent_task_id = ?2
+                   AND trigger_type = 'callback'
+                   AND label = ?3
+                   AND (?5 IS NULL OR id != ?5)
+                   AND (
+                     status = 'pending'
+                     OR (status = 'completed'
+                         AND completed_at IS NOT NULL
+                         AND completed_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?4))
+                   )
+                 ORDER BY created_at, id
+                 LIMIT 1",
+                params![
+                    agent_id,
+                    parent_task_id,
+                    crate::agent::DEFERRED_DISPATCH_LABEL,
+                    liveness_modifier,
+                    exclude_task_id
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(id)
     }
 
     /// Find `pending` self_dev issue parents older than `grace_seconds` that no
@@ -2617,6 +2667,46 @@ impl Database {
             params![task_id],
         )?;
         self.get_stuck_rearm_count(task_id)
+    }
+
+    /// Reset `metadata.stuck_rearm_count` to 0 on proof that a real dispatch
+    /// happened (mika#2413). Returns whether a non-zero counter was cleared.
+    ///
+    /// **Why a reset exists at all.** `increment_stuck_rearm_count` was the only
+    /// writer, so the counter was monotone for the row's whole life — and a
+    /// groom parent *becomes* the implementation parent (mika#1614 task reuse,
+    /// `update_task_dispatch_class` flips `groom` → `implement` on the same
+    /// row). Two contentions suffered while grooming therefore condemned the
+    /// implementation before it began. A counter the success never clears ends
+    /// up bounding something other than what it measures.
+    ///
+    /// **Why this is NOT the reset mika#2158 had to remove.** That one fired on
+    /// `in_flight_self_dev` — on *having started*, the very action the counter
+    /// counted — which made the counter unreachable (31 re-drives reading 1).
+    /// This one fires on *having reached a real dispatch*, which is precisely
+    /// what the counter does not count: the budget bounds the hypothesis "this
+    /// parent's turns never dispatch", and a spawned non-deferred child refutes
+    /// that hypothesis outright. Do not move this call to the start of a
+    /// dispatch attempt; that is the regression, not the fix.
+    ///
+    /// The `> 0` guard keeps the nominal dispatch free of a write and makes the
+    /// return value mean "there was something to clear", so the caller can log
+    /// only the resets that carry information.
+    pub fn reset_stuck_rearm_count(&self, task_id: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE tasks SET
+                metadata = json_set(
+                  CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                  '$.stuck_rearm_count', 0),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?1
+               AND json_valid(metadata)
+               AND COALESCE(
+                     CAST(json_extract(metadata, '$.stuck_rearm_count') AS INTEGER),
+                     0) > 0",
+            params![task_id],
+        )?;
+        Ok(n > 0)
     }
 
     /// Parents past the grace that the reaper is sheltering **only** because a
