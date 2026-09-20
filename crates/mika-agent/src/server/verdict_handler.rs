@@ -42,6 +42,15 @@ use super::verdict::{
 };
 use super::webhook_queue::has_active_callback_child;
 
+/// Audit-event `tool_name` for a `pass` verdict arriving unapproved (mika#2237).
+///
+/// **SOLE WRITER** is the `Verdict::Pass` arm of `handle_pr_review_event` in
+/// this module. A second writer would make the two populations this name exists
+/// to separate — reviews stopped here versus reviews stopped anywhere else —
+/// inseparable, which is precisely the discipline mika#2239 applied to its own
+/// mirror event. Pinned by `sole_writer_of_verdict_pass_without_approval`.
+pub const VERDICT_PASS_WITHOUT_APPROVAL_AUDIT_TOOL: &str = "verdict_pass_without_approval";
+
 /// Maximum block[ac] retries before escalation.
 const BLOCK_AC_MAX_RETRIES: u32 = 3;
 
@@ -180,6 +189,57 @@ pub async fn try_handle_pr_review_verdict(
         Verdict::Pass => {
             // Pass verdicts still gate on state=approved for merge safety
             if event.state != "approved" {
+                // mika#2237 — the other half of mika#2239's asymmetry, and the
+                // downstream half of this ticket's own defect.
+                //
+                // A `VERDICT: pass` arriving under a non-approved review state is
+                // where the autonomous pipeline stops: the merge is refused and
+                // the event goes back to the LLM. Until now that happened with no
+                // WARN, no audit row and no counter — mika#2236 sat in exactly
+                // this state and nothing in the engine said so, which is what cost
+                // the founding defect eleven days of invisibility.
+                //
+                // `verdict_approved_but_unclassified` (mika#2239, ~1750 lines
+                // below) names the mirror case: GitHub says APPROVED and the
+                // verdict does not classify. This is its complementary
+                // population, and the two must stay countable apart.
+                //
+                // **The behaviour is unchanged.** The merge-safety gate on line
+                // 181 stands; we do not start merging on a `commented` review.
+                // What this adds is attribution, not a decision.
+                //
+                // Expected regime after the mika#2237 pre-subprocess guard
+                // ships: ZERO lines. Any occurrence is a review that got past
+                // that guard — another agent, another write path
+                // (`run_gh_subprocess`), or a binary predating the fix (class
+                // mika#2340). That is a result, not a fault.
+                warn!(
+                    event = "verdict_pass_without_approval",
+                    pr_number = event.pr_number,
+                    repo = %event.repo,
+                    reviewer = %event.reviewer,
+                    review_url = %event.review_url,
+                    state = %event.state,
+                    "verdict: body says `pass` but the GitHub review state is not `approved` — \
+                     the merge path is refused and the event falls through to the LLM (mika#2237)"
+                );
+                if let Err(e) = db
+                    .log_audit_event(
+                        session_id,
+                        VERDICT_PASS_WITHOUT_APPROVAL_AUDIT_TOOL,
+                        &format!("pr_review:{}#{}", event.repo, event.pr_number),
+                        None,
+                        Some(&event.state),
+                        Some("pass verdict arrived under a non-approved review state"),
+                        Some(trace_id),
+                    )
+                    .await
+                {
+                    // Deliberately does NOT repeat the event name: this line is a
+                    // different population (the audit write failed), and sharing the
+                    // grep would merge the two the name exists to keep apart.
+                    warn!(error = %e, "failed to write the mika#2237 unapproved-pass audit row");
+                }
                 return VerdictAction::Passthrough { enrichment: None };
             }
             handle_pass_verdict(
@@ -2884,6 +2944,95 @@ fn format_behind_main_enrichment(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod mika2237_sole_writer {
+    use super::VERDICT_PASS_WITHOUT_APPROVAL_AUDIT_TOOL;
+
+    /// The event name is a wire format (V8, first half).
+    ///
+    /// It lands in `audit_events.tool_name` and in the log line an operator
+    /// greps; two spellings would cut one population in two without saying so.
+    /// Renaming it is a break to date in `CLAUDE.md`, never a test update made
+    /// in passing.
+    #[test]
+    fn the_event_name_is_a_wire_format() {
+        assert_eq!(
+            VERDICT_PASS_WITHOUT_APPROVAL_AUDIT_TOOL,
+            "verdict_pass_without_approval"
+        );
+    }
+
+    /// Exactly one production site writes this name (V8, second half).
+    ///
+    /// A behavioural test cannot see this class: a second writer would make no
+    /// decision wrong, it would make the two populations — reviews stopped at
+    /// the merge gate, and reviews stopped anywhere else — inseparable. That is
+    /// the discipline mika#2239 applied to its own mirror event
+    /// (`verdict_approved_but_unclassified`), and the reason this ticket's U2 is
+    /// the *second* named signal of the pair rather than the first.
+    ///
+    /// The allowlist is shipped **empty and measured**: before this ticket
+    /// `grep -rn verdict_pass_without_approval crates/` returned zero sites.
+    /// **Resolution when it reddens: remove the second writer, never add an
+    /// entry** — a sole-writer guard whose allowlist grows detects nothing.
+    #[test]
+    fn sole_writer_of_verdict_pass_without_approval() {
+        /// Deliberately empty. See the doc comment above before touching it.
+        const ALLOWED_EXTRA_WRITERS: &[&str] = &[];
+
+        // Split so this guard's own body is not what it catches first.
+        let needle = ["verdict_pass", "_without_approval"].concat();
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let src_root = scanner.src_root().to_path_buf();
+
+        let mut sites = Vec::new();
+        scanner.for_each(|path, production| {
+            if crate::source_scan::is_test_source_path(path) {
+                return;
+            }
+            let rel = path
+                .strip_prefix(&src_root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            if ALLOWED_EXTRA_WRITERS.contains(&rel.as_str()) {
+                return;
+            }
+            for (n, line) in production.lines().enumerate() {
+                let t = line.trim_start();
+                // Prose and doc comments describe the name; they do not write it.
+                if t.starts_with("//") || t.starts_with('*') {
+                    continue;
+                }
+                if line.contains(&needle) {
+                    sites.push(format!("{rel}:{}: {}", n + 1, line.trim()));
+                }
+            }
+        });
+
+        // The constant's declaration plus its single use in the Pass arm.
+        assert_eq!(
+            sites.len(),
+            2,
+            "expected exactly two production occurrences of `{needle}` — the constant \
+             and the single writer in the `Verdict::Pass` arm — but found {}:\n{}\n\
+             If a second writer was added: REMOVE IT. Do not widen this guard and do \
+             not add an allowlist entry — the whole value of the name is that its \
+             population is exactly one.",
+            sites.len(),
+            sites.join("\n")
+        );
+        assert!(
+            sites
+                .iter()
+                .all(|s| s.starts_with("server/verdict_handler.rs:")),
+            "both occurrences must live in this module, got:\n{}",
+            sites.join("\n")
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
