@@ -4632,6 +4632,7 @@ mod tests {
             settings,
             pr_reviews_posted: None,
             auto_pull_stop_armed: AtomicBool::new(false),
+            worktree_reap_stop_armed: AtomicBool::new(false),
             proactive_budget_reported: std::sync::Mutex::new(None),
         })
     }
@@ -5088,6 +5089,7 @@ mod tests {
             settings,
             pr_reviews_posted: None,
             auto_pull_stop_armed: AtomicBool::new(false),
+            worktree_reap_stop_armed: AtomicBool::new(false),
             proactive_budget_reported: std::sync::Mutex::new(None),
         });
         let mut engine = TaskEngine::new(db.clone(), dispatcher);
@@ -5166,6 +5168,7 @@ mod tests {
             settings,
             pr_reviews_posted: None,
             auto_pull_stop_armed: AtomicBool::new(false),
+            worktree_reap_stop_armed: AtomicBool::new(false),
             proactive_budget_reported: std::sync::Mutex::new(None),
         });
         let mut engine = TaskEngine::new(db.clone(), dispatcher);
