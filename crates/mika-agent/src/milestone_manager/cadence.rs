@@ -53,6 +53,48 @@ pub struct ManagerConfig {
     pub checkpoint_dir: PathBuf,
     /// Directory to write offline sink reports when delivery URLs are unset.
     pub offline_sink_dir: PathBuf,
+    /// Par quelle porte `offline_sink_dir` a été décidé (mika#2267 C3).
+    ///
+    /// Porté sur la config plutôt que re-résolu au moment de l'émission de
+    /// `manager_delivery_resolved` : une seconde lecture de l'environnement
+    /// pourrait rendre une provenance qui ne décrit pas le chemin réellement
+    /// en vigueur — et une provenance fausse est strictement pire qu'aucune
+    /// provenance (mika#2293).
+    pub sink_dir_source: crate::milestone_manager::sink_dir::SinkDirSource,
+}
+
+// ---- mika#2267 C4 — `route` est un format de fil ---------------------------
+
+/// Le rapport est parti par HTTP et la livraison a réussi.
+pub const ROUTE_HTTP: &str = "http";
+/// Aucune URL applicable n'était posée : le rapport est allé au puits.
+/// **État de bring-up nominal — rien n'est en panne.**
+pub const ROUTE_OFFLINE_SINK: &str = "offline_sink";
+/// Une URL était posée, la livraison a échoué, le rapport est allé au puits.
+/// **Panne réelle.**
+///
+/// Distinct de [`ROUTE_OFFLINE_SINK`] à dessein : les deux populations disent
+/// des choses opposées et doivent rester comptables séparément. Les fondre
+/// effacerait très exactement la distinction que mika#2267 demande de faire —
+/// « sink offline vs endpoint, à déterminer ».
+pub const ROUTE_OFFLINE_SINK_FALLBACK: &str = "offline_sink_fallback";
+
+/// Une URL est-elle routable ? (posée et non vide.)
+///
+/// Lecteur unique du prédicat : `select_route` et l'événement
+/// `manager_delivery_resolved` l'appellent tous deux, donc l'événement ne peut
+/// pas annoncer une route que le cycle ne prendra pas.
+pub(crate) fn url_is_routable(url: Option<&str>) -> bool {
+    matches!(url, Some(u) if !u.is_empty())
+}
+
+/// Le nom de fil de la route qu'une sévérité prendra, vu l'URL applicable.
+pub(crate) fn route_name_for(url: Option<&str>) -> &'static str {
+    if url_is_routable(url) {
+        ROUTE_HTTP
+    } else {
+        ROUTE_OFFLINE_SINK
+    }
 }
 
 /// Trait boundary for report delivery — HTTP in production, in-memory in tests.
@@ -488,7 +530,7 @@ pub async fn run_manager_cycle_in(
                             event = "manager_cycle_delivered",
                             milestone = %cfg.target.as_display(),
                             severity = ?severity,
-                            route = "http",
+                            route = ROUTE_HTTP,
                             escalated = escalated,
                         );
                     }
@@ -508,6 +550,23 @@ pub async fn run_manager_cycle_in(
                         // a different route. Preserving `escalated` here
                         // keeps outcome telemetry honest (H2 review fix).
                         escalated = severity == Severity::Blocked;
+                        // mika#2267 C4 — avant ce ticket, c'était le SEUL des
+                        // trois chemins d'écriture à n'émettre aucun
+                        // `manager_cycle_delivered` : un rapport était écrit
+                        // sans qu'aucune ligne ne dise qu'il l'avait été, ni
+                        // où. `offline_sink_fallback` est délibérément distinct
+                        // de `offline_sink` — l'un dit « aucune URL n'était
+                        // posée » (bring-up nominal), l'autre « une URL était
+                        // posée et a échoué » (panne réelle).
+                        tracing::info!(
+                            target: "mika::milestone_manager",
+                            event = "manager_cycle_delivered",
+                            milestone = %cfg.target.as_display(),
+                            severity = ?severity,
+                            route = ROUTE_OFFLINE_SINK_FALLBACK,
+                            escalated = escalated,
+                            offline_sink_dir = %cfg.offline_sink_dir.display(),
+                        );
                     }
                 }
             }
@@ -520,8 +579,9 @@ pub async fn run_manager_cycle_in(
                     event = "manager_cycle_delivered",
                     milestone = %cfg.target.as_display(),
                     severity = ?severity,
-                    route = "offline_sink",
+                    route = ROUTE_OFFLINE_SINK,
                     escalated = escalated,
+                    offline_sink_dir = %cfg.offline_sink_dir.display(),
                 );
             }
         }
@@ -565,7 +625,7 @@ fn select_route(severity: &Severity, cfg: &ManagerConfig) -> Route {
         _ => cfg.delivery_url.clone(),
     };
     match url {
-        Some(u) if !u.is_empty() => Route::Http {
+        Some(u) if url_is_routable(Some(&u)) => Route::Http {
             url: u,
             token: cfg.delivery_token.clone(),
         },
@@ -752,6 +812,7 @@ mod tests {
             health_url: None,
             checkpoint_dir: dir.join("checkpoints"),
             offline_sink_dir: dir.join("sink"),
+            sink_dir_source: crate::milestone_manager::sink_dir::SinkDirSource::Default,
         }
     }
 

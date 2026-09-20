@@ -244,6 +244,22 @@ Requires `MIKA_GATEWAY_URL` (default: `http://localhost:3001`) and `MIKA_INTERNA
 
 `mika skills list` supports property filters (mika#606): `--source <bundle|marketplace>` filters by origin, `--always-on <true|false>` filters by activation state. Both are optional, AND semantics. Invalid `--source` values produce a clear error. HTTP equivalent: `GET /api/v1/skills?source=bundle&always_on=true`.
 
+## Milestone CLI
+
+`mika milestone {read,assess,report}` — thin adapter over `mika_agent::milestone_manager` (Phase 1, LECTURE seule). See `crates/mika-agent/CLAUDE.md` § Milestone Manager.
+
+`mika milestone reports` (mika#2267) — list the Phase 1 reports the cadence wrote to the **offline sink**, most recent first. `--target <owner/repo>#<n>` restricts to one milestone, `--latest` prints the most recent report's Markdown to stdout (`--format` is ignored there: the content is the output), `--limit` (default 20) caps the listing, `--format text|json|yaml`.
+
+The cadence writes to the sink whenever no delivery URL is configured, and as a fallback when an HTTP delivery fails. **Until mika#2267 nothing read that directory** — no command, no tool, no route, no runbook — so for a human reader "the channel is broken" and "the channel is a well" produced the same bytes: none. This is the reader.
+
+Three things worth knowing before using it:
+
+- **The output always names the directory it consulted and how that path was decided** (`path source: env|default`), including on the nominal path. That is what makes the failure mode readable in one line: the CLI runs as the operator and the daemon runs as the service, possibly under a different `HOME`, so the two can resolve different sink directories. Compare the printed path against the `offline_sink_dir` field of the `manager_delivery_resolved` log line.
+- **An absent sink and an empty sink are two distinct outputs**, never one empty list — they say opposite things (*the cadence has never written here* against *it wrote here and the sink was emptied*), and collapsing them would reproduce the silence the subcommand exists to lift. In JSON the `state` field carries `dir_absent` / `empty` / `entries`.
+- **`--latest` with nothing to show is a failure, not an empty success** (non-zero exit, reason on stderr naming which of the two no-content cases it is): the caller asked for content.
+
+Path resolution and the directory read both live in `mika_agent::milestone_manager::sink_dir`, beside the writer — recomposing either here would let the reader look somewhere the writer does not, which is the defect one layer up. A source scan (`mika2267_sink_dir_resolution_has_a_single_reader`) covers this crate and refuses a second site.
+
 ## Knowledge Graph CLI
 
 `mika kg status` — show KG state summary across all agents (entity counts, chunk counts, last extraction, enabled flag, corpus grouping by `docs_root_hash`). Multi-corpus agents (e.g., mika-arch) display one row per corpus with per-corpus resolution counts (#877); agent name and enabled flag are shown on the first row only. `--agent X` filters to one agent. Supports `--format text|json|yaml`.
