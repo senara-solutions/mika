@@ -425,6 +425,34 @@ Tool trait uses `#[async_trait]` (Send futures). Per-tool timeout override via `
 
 **Local-member reach: name-addressed, not `a2a_call` (mika#1653).** `delegate_task` is the **conversation-mode** local-delegation tool (name-addressed). In a **team run** there is no per-member reach tool: the orchestrator reaches members by listing them in the decompose-JSON task-assignment array (`[{"agent","task","output_file"}]`); the engine spawns each assigned member's session by name (decompose→spawn→resume) and members exchange results via workspace files. `a2a_call` is **suppressed from the team-mode tool array** (`teams::engine::build_team_tool_registry` removes the `TEAM_SUPPRESSED_TOOLS` entries from the team's private `ToolRegistry`; regression-gated by `test_team_registry_suppresses_a2a_call`). `a2a_call` is **remote-only** — external, cross-container agents addressed by URL; it has no local fast-path and 503s on local siblings (no gateway route exists for `~/.mika/agents/<name>`). Its description and SSRF-rejection error redirect local targets to `delegate_task` (ADR-009). Composes with mika#1652 (containment): this prevents the 503-loop, the reaper catches residual stuck `team_runs`.
 
+**A run's terminal disposition is one compile-checked decision (mika#1940).**
+`RunStatus::disposition(&self) -> RunDisposition<'_>` (`teams/types.rs`) is **the**
+exhaustive match over the enum, with no `_` arm; `is_terminal_failure()` and the
+failure reason are *derived* from it, never written beside it, which makes "it is
+a failure ⟺ it has a reason" true by construction rather than true by test. The
+constant `NO_DELEGATION_REASON` gives the field-less `FailedNoDelegation` variant
+a single write site for the **operator** register — `engine.rs`'s
+`team_runs.failure_reason` column and the CLI's `stderr`; `notification.rs` keeps
+its own, deliberately different, **user** register (mika#2290/#2292's rule).
+
+**The split it closed is between forms, not between authors.** `FailedNoDelegation`
+(mika#1676) and `FailedTransport` (mika#1671) were added after the CLI was
+written. The three exhaustive matches in this crate — `Display`, the DB-column
+match in `engine.rs`, `notification.rs` — followed **both**; the three
+hand-written patterns in `mika-cli` (`matches!`, two `if let`) followed **neither**.
+`matches!` and `if let` are exactly the two forms that keep compiling when a
+variant appears, i.e. the class mika#2023 M2 had to name in writing about
+`tier == AgentTier::Family`. The remedy was not six more arms but taking the right
+to enumerate away from the call sites: `mika-cli` now classifies through
+`commands/team_outcome.rs`, which names no variant, and
+`mika1940_no_hand_written_run_status_predicate_in_the_cli` (a `ProductionScanner`
+source scan) refuses a new one — **with an allowlist shipped empty**, since there
+is nothing to exempt, so no slot in which to drop the next lapse (mika#2323).
+Verified by hand at delivery: a seventh variant fails to compile at exactly four
+sites — `disposition()`, `Display`, `engine.rs`'s column match, `notification.rs`
+— and **zero** in `mika-cli`. Exit-code and `stdout` contract: `crates/mika-cli/CLAUDE.md`
+§ `mika ask`.
+
 ### Task Tracking
 
 4 tools: **Write** (orchestrator-only): `create_task`, `update_task_status`. **Read** (all agents): `list_tasks`, `check_task` (with optional GitHub PR/issue status enrichment). Tasks reuse the `tasks` table with `trigger_type='manual'` + `action_type='none'`.
