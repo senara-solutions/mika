@@ -225,6 +225,22 @@ jobs:
       - name: Pin the guard's negative behaviour
         run: bash scripts/test-check-dispatch-seats-declared.sh
 
+  landing-tokens-lint:
+    name: Landing Token Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      # The landing consumes the rulebook §2 palette from @samidarko/ui/theme.css
+      # (mika#1804, LC.5). A colour literal written back into site/ is a colour
+      # that stops tracking the rulebook — silently, and only visible the next
+      # time the rulebook moves. `site/` has no other automated check at all.
+      - name: Reject hardcoded colours in the landing (mika#1804)
+        run: bash scripts/check-landing-tokens.sh
+      # A guard nobody has watched go red is a decoration — same discipline as
+      # byte-slice-lint and dispatch-seats-lint above (mika#2103).
+      - name: Pin the guard's negative behaviour
+        run: bash scripts/test-check-landing-tokens.sh
+
   loop-select-lint:
     name: Loop Select Lint
     runs-on: ubuntu-22.04
