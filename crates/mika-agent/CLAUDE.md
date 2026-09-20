@@ -1347,6 +1347,70 @@ worse than the silence it replaces.
 
 **Token renewal + auth alarm (mika#2013).** The cycle token is re-resolved **before every cycle** through a `TokenResolver` (`SettingsTokenResolver` in production — PAT first per ADR-008, GitHub App installation token as fallback), never frozen at spawn. The founding bug: `ManagerConfig.github_token` was resolved once in `manager_config_from_env` and forwarded verbatim to `gh` forever, so an App installation token (~1h TTL) left the manager cycling 401 until the process restarted — 16 `manager_cycle_error auth_class=401` in one night with nothing louder than a WARN. The renewal machinery already lived in `GitHubApp::installation_token()` (memory cache + 5-min expiry buffer); the defect was only that it was asked once. A change in the resolved value emits `manager_token_refreshed` (INFO, presence booleans only — never token material). Paired with it, `AuthFailureTracker` counts the **duration** of an unbroken `AuthClass::Unauthorized` run (a duration, not a cycle count: `poll_interval` is operator-configurable, so N cycles has no stable temporal meaning). Past `AUTH_PERSISTENT_FAILURE_THRESHOLD` (30 min) it emits `manager_auth_persistent_failure` (ERROR) and escalates to `MIKA_MANAGER_ESCALATION_URL`, re-announcing at most hourly (`AUTH_ALARM_REEMIT_INTERVAL`). The escalation carries a dedicated `AuthAlarmBody`, **not** a `DeliveryBody` — the alarm fires because the milestone could not be read, so an `Assessment` there would be fabricated state on the wire. Any successful cycle clears the window; non-401 failures neither advance nor clear it (a network blip is not proof of recovery, nor of auth failure). A failed re-resolution KEEPS the previous token rather than overwriting it with `None` — `reader.rs` only sets `GH_TOKEN` when `Some`, so overwriting would silently drop the cycle onto the host's ambient credentials. The refresh is bounded by `TOKEN_REFRESH_TIMEOUT` (15s) because it sits outside the `select!` on the cancellation token and `GitHubApp` holds its cache write-lock across an un-timed HTTP call. `AuthClass::Forbidden` is excluded from the alarm — a known gap tracked as mika#2063, left open because AC3 of the ratified mika#2013 plan asserts 403 does not fire.
 
+**Post-mika#1968 hardening (mika#1975).** Three changes, none of which moves a
+delivery route or an alarm threshold.
+
+*The boot probe is bounded.* `verify_gh_auth` wraps its single `gh` call in
+`GH_AUTH_PROBE_TIMEOUT` (15s, a named constant, deliberately not
+env-configurable — the same YAGNI rule `AUTH_PERSISTENT_FAILURE_THRESHOLD`
+states). **What an unbounded probe blocked was never startup**, contrary to the
+ticket: `spawn_manager_cycle_task` returns its handle immediately and
+`run_server` never awaits it, while the probe runs *inside* the spawned task.
+What it blocked is the **cadence loop before its first tick** —
+`tokio::time::interval` is built after the probe — so a hung `gh` meant zero
+cycles for ever, and it survived graceful shutdown too (`ProcessGhRunner::run`
+has no timeout, and the `select!` on `cancel` is downstream of the probe, so
+nothing drops the future `kill_on_drop` would need). The silence looked
+healthy: `manager_cadence_start` and `manager_delivery_resolved` are both
+emitted *before* the probe. New `AuthClass::Timeout` (`auth_class=timeout`),
+posed on the `Err(Elapsed)` arm and **nowhere else** — `classify_cycle_error`
+carries no `Timeout` pattern, and `"timed out"` stays under `Network` because a
+transport timeout is an observation about the network while this variant is a
+statement about a budget we enforced. Excluded from `is_auth_failure` for
+`Network`'s reason: a slow host is not a closed door.
+
+*The classifier stops reading its own arguments.* `ProcessGhRunner` now fails
+with a typed `GhCommandError { args, stderr }` (house precedent: `DeliveryError`
++ `downcast_ref`, and the mika#2179 rule that error classes come from the
+variant). `classify_cycle_error` / `classify_milestone_probe_error` take
+`&anyhow::Error` and classify the **`stderr` alone**, falling open to the
+rendered string when the downcast misses. The vector this closes is structural
+rather than measured: the rendered error carried
+`gh api /repos/{owner}/{repo}/milestones/{N}`, so with
+`MIKA_MANAGER_TARGET_MILESTONE=owner/repo#403` *every* failure of that call —
+a 500, an unrecognised DNS wording, a parse error — classified `Forbidden`,
+reached `is_auth_failure` and fired the 30-minute alarm with the wrong class and
+the wrong hint. The three numeric tests additionally go through
+`has_http_status`, which requires a status marker (`http`/`status`/`code`)
+within 24 characters upstream and non-digit boundaries. **No non-numeric pattern
+was removed** — `unauthorized`, `bad credentials`, `gh auth login`,
+`authentication token not found`: the last two are mika#2013's *missing-token*
+shapes, which carry no HTTP status at all, and dropping one would make a
+token-less manager classify `Other`, i.e. reopen the blindness mika#2013 closed.
+That invariant (*the tightening removes false positives only*) is pinned by a
+frozen corpus, `mika1975_the_classification_of_every_measured_auth_shape_is_unchanged`.
+`stderr_head` deliberately keeps the **whole** rendered string, command line
+included: the tightening is on what is *classified*, never on what is *logged*.
+
+*The spawn guard cannot poison.* `MANAGER_SPAWN_GUARD` is an `AtomicBool` with
+`swap(true, SeqCst)` instead of a `Mutex<bool>` + `.lock().unwrap()`. The ticket
+asked for `PoisonError` recovery; the critical section was a `bool` read, a
+`warn!` and a `bool` write, so **the only realistic panic site in it was the
+logging macro** — a recovery path that logs is unreliable exactly when it is
+needed. No poisoning test was added: asserting "it does not poison" on a type
+with no poisoning is empty.
+
+**Out of scope, named.** AC4 (proactive App-token refresh) is mika#2013's whole
+subject and was removed from this ticket by an operator comment dated
+2026-08-29; mika#2013 has since shipped it (`refresh_cycle_token`). The
+cycle-body `gh` calls in `Reader::read` remain unbounded — same class, larger
+blast radius (the loop freezes mid-cycle, in steady state), different remedy
+(a per-call budget must compose with `poll_interval` and with
+`MissedTickBehavior::Burst`), and a single global timeout in
+`ProcessGhRunner::run` is refused because one constant cannot fit both
+`gh api /milestones/N` and `gh pr list --limit 100 --search`, nor the CLI paths
+where an operator is waiting. That is its own ticket.
+
 **Phase 2 gates NOT wired.** Dispatch authority stays gated behind the three portes (forge-gate loop-résistance + contention exec + INTERNAL_TOKEN alignment) documented in the brief § 3. This module contains no dispatch class, no `run_claude_pilot` invocation site, no scope-approval callsite. Promotion to Phase 2 requires updating both `no_dispatch_test.rs` FORBIDDEN_TOKENS and the module docstring atomically.
 
 ## Skills System
