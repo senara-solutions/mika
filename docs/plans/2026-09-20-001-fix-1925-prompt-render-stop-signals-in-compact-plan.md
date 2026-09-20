@@ -356,13 +356,30 @@ pas** — le précédent est nommé au site de `DATA_GRADE_DOCTRINE_COMPACT`.
 
 | propriété | genre | pourquoi celui-là |
 |---|---|---|
-| budget par constante | `const _: () = assert!(…)` | une régression de taille doit casser la compilation, pas un test qu'on peut ignorer |
-| total ≤ 5 Ko, bloc non vide | test unitaire | AC1 |
+| budget **par constante, isolément** | `const _: () = assert!(…)` | une régression de taille doit casser la compilation, pas un test qu'on peut ignorer |
+| total ≤ 5 Ko, bloc non vide | test unitaire | AC1 — **filet de secours du const-assert, pas son redondant** (voir ci-dessous) |
 | section absente quand le bloc est vide | test unitaire | le cas nominal doit rester byte-identique à aujourd'hui |
 | règle *persist* présente **même** bloc vide | test unitaire | D3 : c'est l'assertion qui empêche la régression vers l'inertie |
 | distinction AC2 présente dans les deux moitiés | test unitaire | AC2 |
 | compte de sections = 5 avec soul, 4 sans | test unitaire | D1 : la barrière réelle, mise à jour avec sa justification |
 | les trois autres carve-outs intacts | tests existants | D5 : ils doivent rester verts sans être touchés |
+
+**Périmètre de chaque garde de budget, nommé — les deux ne se recouvrent pas.**
+Chaque `const _: () = assert!(…)` porte sur **une constante et rien d'autre** :
+il n'existe pas de const-assert de total, et il ne peut pas en exister un, parce
+que le total dépend de `soul.md` et du contenu injecté, tous deux inconnus à la
+compilation. Conséquence, à écrire plutôt qu'à découvrir : **une édition future
+qui gonfle le préambule *consult* (≈ 300 octets) sans toucher `persist` passe le
+const-assert de `persist` sans rien apprendre**, et seul le test unitaire
+« total ≤ 5120 » l'attrape. Ce test n'est donc pas un doublon des const-assert —
+c'est la seule garde qui voit la **somme**, et la seule qui voit le contenu
+injecté. Les deux niveaux sont nécessaires et ni l'un ni l'autre n'est
+suffisant : le const-assert attrape tôt (à la compilation) et localement ; le
+test attrape tard et globalement. Citation : `docs/architecture/review-guide.md`
+§ defense-in-depth — une garde de budget dont le périmètre reste implicite invite
+une édition future à croire qu'une seule suffit, puis à retirer celle qui
+paraît redondante. Le doc-comment de chaque constante dit lequel des deux
+niveaux la couvre.
 
 ## Implementation Units
 
@@ -388,6 +405,37 @@ pas** — le précédent est nommé au site de `DATA_GRADE_DOCTRINE_COMPACT`.
    (#1814, #2290, #2292) et le renvoi qu'ils font à mika#1925.
 5. Retirer de la signature la mention « deliberately unused here » pour
    `stopped_topics`.
+6. **Le doc-comment du champ `PromptContext::stopped_topics` (`prompt.rs:1006-1010`)
+   est laissé INTACT, et c'est une décision, pas un oubli.** Il dit aujourd'hui :
+   *« Active stop-signals … Loaded via `db.search_preferences(STOP_TOPIC_PREFIX)`
+   at turn assembly. When non-empty, rendered as a `<stopped-topics>` block so
+   the agent sees which subjects the user has explicitly asked not to be re-raised
+   on. »* Trois raisons de ne pas y toucher, la troisième étant la seule qui
+   décide :
+   - Il ne nomme **aucun** assembleur et n'en compte aucun. Après câblage, la
+     phrase devient vraie des deux assembleurs qui lisent `PromptContext` au lieu
+     d'un seul — elle ne décrit donc pas un état que le code ne porte plus.
+   - `SilentPromptContext::stopped_topics` (`prompt.rs:1907-1910`) nomme, lui,
+     explicitement « in silent prompts » ; c'est exact et hors périmètre — ce plan
+     ne touche pas `build_silent_prompt` (§ Hors périmètre).
+   - **Surtout : y mentionner `persist` serait la dérive inverse.** Le commentaire
+     décrit ce que **le champ** produit. La règle *persist* est inconditionnelle,
+     donc elle ne lit pas `stopped_topics` et n'est produite par aucune valeur du
+     champ. L'ajouter ferait décrire au champ une règle qui ne le consulte pas —
+     c'est-à-dire créerait la contradiction doc↔code que F2 veut prévenir, au lieu
+     de l'éviter. `persist` est documentée là où elle est produite : le
+     doc-comment de `STOP_SIGNAL_PERSIST_COMPACT` (IU1 point 1) et celui du
+     builder (IU1 point 4).
+
+   **Condition de vérification, à exécuter et pas à supposer :** avant de clore
+   IU1, relire les deux doc-comments de champ et confirmer qu'aucun ne nomme un
+   assembleur qui ne le lit pas, ni un nombre d'assembleurs. Si l'un d'eux en
+   nomme un — parce qu'il aura été édité entre la rédaction de ce plan et son
+   exécution — l'harmoniser dans le même commit. Citation : classe mika#2340
+   inversée, invoquée par ce plan à Fire-Disposition (la doc ne doit pas décrire
+   un état que le code ne porte plus) ; le commentaire de champ est la surface où
+   cette dérive commence, ce qui est précisément pourquoi son sort est décidé ici
+   au lieu d'être laissé implicite.
 
 **Invariant :** aucune modification de `build_system_prompt`, de
 `build_silent_prompt`, ni du chargement en amont
@@ -528,7 +576,12 @@ ne pas ajuster le compte pour faire passer**, relire D1.
   section `## Stopped Topics` + le bloc `<stopped-topics>` quand
   `ctx.stopped_topics` est non vide.
 - La distinction stop ≠ question est portée dans les deux moitiés.
-- Les deux constantes portent chacune une assertion de budget à la compilation.
+- Les deux constantes portent chacune une assertion de budget à la compilation,
+  **portant sur la constante seule**, et le doc-comment de chacune nomme le test
+  « total ≤ 5120 » comme le filet qui voit la somme (F1).
+- Le doc-comment du champ `PromptContext::stopped_topics` est **inchangé**, et la
+  vérification d'IU1 point 6 (aucun doc-comment de champ ne nomme un assembleur
+  qui ne le lit pas) a été faite (F2).
 - `test_compact_prompt_omits_stopped_topics_block_by_design` est remplacé par son
   inverse ; deux tests neufs couvrent le cas bloc-vide et le cas bloc-plein.
 - L'assertion de compte de sections est portée à 5 **avec** sa justification
@@ -664,3 +717,23 @@ disposition d'AC4 (rien à régresser aujourd'hui) plutôt que de la contredire.
   (D3) ; AC4 n'est pas exécutable dans ce dépôt et est re-posée comme
   précondition bloquante plutôt que simulée (D4). Le statut de parapluie de
   mika#1925 est posé comme question ouverte, non tranché (D5).
+- **2026-09-20 — rev 2 (première passe architecte, `Disposition: ITERATE`, deux
+  findings de renforcement, aucun bloquant).** F1 adressée en nommant le
+  **périmètre** de chaque garde de budget au § *Ce qui est asserté* : le
+  const-assert porte sur une constante isolément et ne peut pas porter sur le
+  total (qui dépend de `soul.md` et du contenu injecté, inconnus à la
+  compilation), donc le test unitaire « total ≤ 5120 » est le **filet de secours**
+  et non un redondant — le cas concret étant une édition future du préambule
+  *consult* qui passe le const-assert de `persist` et n'est attrapée que là ;
+  citation `review-guide.md` § defense-in-depth conservée, et le doc-comment de
+  chaque constante est chargé de dire lequel des deux niveaux la couvre. F2
+  adressée par un point 6 explicite à IU1 : le doc-comment du champ
+  `PromptContext::stopped_topics` est **laissé intact**, avec les trois raisons —
+  il ne nomme aucun assembleur, son pendant `SilentPromptContext` est exact et
+  hors périmètre, et surtout y mentionner `persist` créerait la contradiction
+  doc↔code que le finding veut prévenir, puisque `persist` est inconditionnelle
+  et ne lit pas le champ ; une condition de vérification exécutable est ajoutée
+  pour le cas où l'un des deux commentaires aurait dérivé entre rédaction et
+  exécution, et la citation « classe mika#2340 inversée » est conservée. Les deux
+  décisions sont portées à la Definition of Done pour être vérifiables plutôt
+  qu'affirmées. Aucune AC affaiblie ; aucune section non concernée réécrite.
