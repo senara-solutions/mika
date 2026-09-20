@@ -113,6 +113,11 @@ mod eval {
     // lent mais borné ne l'est pas.
     mod test_llm_watchdog_2342;
     mod test_max_steps_continuation;
+    // mika#2281 — la frontière de secret du canal MCP, mesurée sur un serveur
+    // stdio factice : les noms traversent, la valeur non — et le contrôle
+    // positif montre qu'elle traverse bel et bien par le canal FICHIER, qui
+    // est le chemin réellement exposé.
+    mod test_mcp_secret_boundary_2281;
     mod test_merge_identity_2248;
     // mika#2304 — le tour dit sous quel modèle il a tourné, et un modèle nommé
     // par l'appelant l'emporte sur la section `[llm]` d'une skill.
