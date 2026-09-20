@@ -24,6 +24,33 @@ use crate::tools::{GitHubRef, ImageData, ToolOutput, parse_github_ref};
 /// Maximum output size from a skill tool (10,000 characters).
 const MAX_OUTPUT_LEN: usize = 10_000;
 
+/// Plancher sous lequel une commande de build ne peut pas aboutir (mika#2423).
+///
+/// 120 s : très au-dessus de tout budget de skill court (30 s, le défaut de
+/// manifeste et la valeur déclarée par `qa-review`), très en dessous de toute
+/// compilation réelle du workspace `mika-agent` — les deux `cargo test
+/// --release` mesurés sur PR #2275 ont pris 237,9 s et 231,1 s. Entre les deux,
+/// aucune valeur n'est défendable : ce n'est pas un budget, c'est une borne
+/// d'impossibilité.
+const BUILD_FLOOR_SECS: u64 = 120;
+
+/// Famille build v1 — close et énumérée (mika#2423).
+///
+/// Chaque entrée est `(binaire, sous-commandes)`. Une sous-commande vide
+/// (`&[]`) signifie « le binaire seul suffit ». La reconnaissance est un scan
+/// **lexical borné par identifiant**, sur le modèle exact des deux scans de
+/// `templates/skills/shell-exec/handlers/run.sh` (mika#1957, mika#1991) : la
+/// frontière est « tout caractère qui ne peut pas faire partie d'un identifiant
+/// de commande », `.` et `-` exclus de la frontière — de sorte que `cargo.log`,
+/// `make-believe` et `libcargo-dev` ne sont **pas** des correspondances.
+const BUILD_COMMAND_FAMILY: &[(&str, &[&str])] = &[
+    ("cargo", &["build", "test", "clippy", "check", "bench"]),
+    ("npm", &["run build", "run test"]),
+    ("npx", &["tsc"]),
+    ("make", &["build", "test"]),
+    ("go", &["build", "test"]),
+];
+
 /// Non-`MIKA_*` env vars that must also be scrubbed from child processes.
 ///
 /// `GH_TOKEN` is removed to prevent identity collision: if it leaked from
@@ -525,6 +552,141 @@ pub fn validate_required_fields(
     None
 }
 
+/// Un caractère qui ne peut pas faire partie d'un identifiant de commande.
+///
+/// Frontière du scan lexical de [`matched_build_family`]. `.` et `-` en sont
+/// **exclus** à dessein : `cargo.log`, `make-believe` et `libcargo-dev` doivent
+/// rester des non-correspondances. Même définition, mot pour mot, que les deux
+/// scans de `shell-exec/handlers/run.sh`.
+fn is_command_boundary(c: char) -> bool {
+    !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+}
+
+/// Les tokens qui suivent une occurrence du binaire, bornés au premier
+/// séparateur d'instruction shell.
+///
+/// La borne est ce qui garde le scan étroit : dans
+/// `cargo metadata | grep test`, le `test` appartient à une autre instruction
+/// et ne doit pas faire de `cargo` un appel de build.
+fn tokens_after_binary(rest: &str) -> Vec<&str> {
+    rest.split(|c: char| matches!(c, ';' | '|' | '&' | '\n' | '\r'))
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        // Les flags et le sélecteur de toolchain (`cargo +nightly test`) se
+        // glissent entre le binaire et sa sous-commande.
+        .filter(|t| !t.starts_with('-') && !t.starts_with('+'))
+        .collect()
+}
+
+/// Rend le nom de la famille build reconnue dans `command`, ou `None`.
+///
+/// Scan lexical borné par identifiant, puis vérification que la sous-commande
+/// suit **immédiatement** le binaire (flags et toolchain sautés). Cette seconde
+/// moitié est ce qui distingue `cargo test` d'une prose qui contient les deux
+/// mots dans le désordre.
+///
+/// **Ce que ce prédicat ne prétend pas être.** Le scan est lexical, donc
+/// contournable — découpage de token (`car""go test`), assemblage par variable,
+/// `sh -c`. C'est la posture que `run.sh` écrit déjà pour ses deux scans :
+/// *defense-in-depth, NOT a sole gate*. Le dernier recours est le kill de
+/// groupe de [`ProcessGroupKillGuard`] : une commande qui passe sous le scan et
+/// expire est tuée avec sa descendance, donc sans orphelin. C'est pourquoi les
+/// deux moitiés de mika#2423 coexistent.
+fn matched_build_family(command: &str) -> Option<String> {
+    for (binary, subcommands) in BUILD_COMMAND_FAMILY {
+        let mut search_from = 0usize;
+        while let Some(offset) = command[search_from..].find(binary) {
+            let start = search_from + offset;
+            let end = start + binary.len();
+            search_from = end;
+
+            let left_ok = command[..start]
+                .chars()
+                .next_back()
+                .is_none_or(is_command_boundary);
+            let right_ok = command[end..]
+                .chars()
+                .next()
+                .is_none_or(is_command_boundary);
+            if !left_ok || !right_ok {
+                continue;
+            }
+
+            if subcommands.is_empty() {
+                return Some((*binary).to_string());
+            }
+            let tokens = tokens_after_binary(&command[end..]);
+            for sub in *subcommands {
+                let expected: Vec<&str> = sub.split_whitespace().collect();
+                if tokens.len() >= expected.len() && tokens[..expected.len()] == expected[..] {
+                    return Some(format!("{binary} {sub}"));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Refuse une commande de build dont le budget ne peut pas contenir
+/// l'exécution (mika#2423). `None` = pas de refus.
+///
+/// **Le prédicat porte sur la conjonction commande × budget, jamais sur le nom
+/// du skill.** Le discriminant « ce tour est un tour qa-review » a été écarté :
+/// `validate_review_depth_present` le fait via
+/// `!ctx.required_tool_arg_suffixes.is_empty()` et son propre commentaire
+/// mika#2237 nomme la fragilité — la garde « disparaît en silence le jour où
+/// qa-review réorganise son manifeste ». Ce qui est posé ici est
+/// auto-descriptif et universellement vrai : *une commande de la famille build,
+/// soumise à un budget d'outil inférieur au plancher de build, ne peut pas
+/// aboutir — quel que soit l'agent qui la soumet.*
+///
+/// Conséquence voulue : mika-dev soumettant `cargo build` via `run_shell` sous
+/// 30 s est refusée aussi, et c'est correct — elle échouait déjà, en
+/// orphelinant. Les outils `long_running` (`build_mika`, `dev-pilot`) rendent
+/// la main **avant** l'application du timeout et ne traversent jamais cette
+/// garde : la voie légitime pour compiler reste ouverte, intacte.
+fn refuse_uncontainable_build(
+    tool_name: &str,
+    input: &serde_json::Value,
+    timeout_secs: u64,
+) -> Option<ToolOutput> {
+    if timeout_secs >= BUILD_FLOOR_SECS {
+        return None;
+    }
+    let command = input.get("command").and_then(serde_json::Value::as_str)?;
+    let family = matched_build_family(command)?;
+
+    // Jamais la commande complète : elle peut porter des chemins de worktree et
+    // n'ajoute rien au diagnostic que la famille ne donne déjà.
+    warn!(
+        event = "build_command_refused_over_budget",
+        tool = %tool_name,
+        timeout_secs,
+        build_floor_secs = BUILD_FLOOR_SECS,
+        matched_family = %family,
+        "refused a build command the tool budget cannot contain"
+    );
+
+    Some(ToolOutput::error(
+        serde_json::json!({
+            "error": "build_command_exceeds_tool_budget",
+            "policy": "refusal",
+            "tool": tool_name,
+            "tool_budget_secs": timeout_secs,
+            "build_floor_secs": BUILD_FLOOR_SECS,
+            "matched_family": family,
+            "detail": "This is a POLICY REFUSAL, not a tool failure. The command was never \
+                       spawned. Do NOT retry, do NOT rewrite the command to evade the scan, \
+                       and do NOT treat this as a failed verification step.",
+            "remedy": "Mark the acceptance criterion `[⏭️] not verifiable within the review \
+                       budget — requires a build` and state so in the verdict. CI runs this \
+                       build without a time limit and the merge gate reads its result.",
+        })
+        .to_string(),
+    ))
+}
+
 /// Execute a skill tool with the appropriate handler.
 ///
 /// Applies a per-skill timeout wrapping the inner execution.
@@ -549,6 +711,18 @@ pub async fn execute_skill_tool(
     // never spawns, and the LLM gets a structured retry signal in the same turn.
     if let Some(error) = validate_required_fields(skill_tool, &input) {
         return error;
+    }
+
+    // mika#2423 — une commande de build sous un budget qui ne peut pas la
+    // contenir est refusée AVANT le spawn. L'ordre est porteur : placer la
+    // garde après la branche `long_running` ci-dessous serait inoffensif
+    // aujourd'hui (aucun handler de build long-running ne porte de champ
+    // `command`), mais mettrait un futur handler de build long-running sous un
+    // prédicat qui n'est pas pour lui.
+    if let Some(refusal) =
+        refuse_uncontainable_build(&skill_tool.definition.name, &input, timeout_secs)
+    {
+        return refusal;
     }
 
     // Check for long-running exec handler
@@ -819,12 +993,80 @@ async fn process_envelope_images(image_paths: &[String]) -> (Vec<ImageData>, Vec
     (images, errors)
 }
 
+/// Tue le groupe de processus de l'enfant quand le futur est abandonné
+/// (mika#2423).
+///
+/// **Ce que `kill_on_drop` ne fait pas.** Il ne signale que le pid **direct**.
+/// Or `templates/skills/shell-exec/handlers/run.sh` finit sur
+/// `eval "$COMMAND" 2>&1` : la vraie commande est un *petit-enfant*. À
+/// l'expiration du `tokio::time::timeout` d'`execute_skill_tool`, le futur est
+/// abandonné, `run.sh` reçoit SIGKILL, et le petit-enfant survit — reparenté à
+/// init, `ppid=1`. C'est le pid 145584 du ticket, tenant le lock `target/` et
+/// garantissant l'échec de toutes les tentatives suivantes : une spirale de
+/// contention, pas une fuite isolée.
+///
+/// **Le groupe est strictement plus étroit que l'existant, pas plus large.**
+/// `process_group(0)` fait de l'enfant son propre chef de groupe, et le groupe
+/// ne contient alors que lui et sa descendance. Avant, l'enfant était dans le
+/// groupe de mika-spirit — c'est-à-dire qu'aucun kill de groupe n'était
+/// *possible* sans toucher le démon. Le motif préexiste dans ce fichier :
+/// `spawn_long_running_exec` pose `.process_group(0)` depuis mika#855.
+///
+/// **Armée après le spawn, désarmée après `wait_with_output`.** Ce désarmement
+/// est ce qui garantit qu'une commande qui finit normalement est inchangée, bit
+/// pour bit : un handler qui laisse volontairement un processus derrière lui
+/// n'est jamais atteint. Sur le chemin d'erreur d'attente, en revanche, la
+/// garde reste armée — le groupe est alors dans un état inconnu et l'abandonner
+/// reproduirait le défaut.
+struct ProcessGroupKillGuard {
+    pgid: i32,
+    disarmed: bool,
+}
+
+impl ProcessGroupKillGuard {
+    fn arm(pgid: i32) -> Self {
+        Self {
+            pgid,
+            disarmed: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for ProcessGroupKillGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        // SAFETY: `pgid` vient de `child.id()` d'un spawn réussi avec
+        // `.process_group(0)`, donc il est strictement positif et désigne un
+        // groupe dont l'enfant est le chef — distinct du groupe de mika-spirit
+        // par construction. La garde est droppée AVANT le `Child` (elle est
+        // déclarée après lui, et Rust drop les locaux en ordre inverse), donc
+        // l'enfant n'a pas encore été moissonné et le pgid ne peut pas avoir
+        // été recyclé. `killpg` est sans effet si le groupe est déjà vide.
+        let rc = unsafe { libc::killpg(self.pgid, libc::SIGKILL) };
+        if rc == 0 {
+            debug!(
+                event = "exec_process_group_killed",
+                pgid = self.pgid,
+                "killed the handler's process group on abandon"
+            );
+        }
+    }
+}
+
 /// Execute an exec-type handler by spawning a subprocess.
 ///
 /// - Resolves the command path relative to the skill directory
 /// - Pipes input JSON to stdin
 /// - Returns stdout regardless of exit code; prefixes `Exit code: N` on non-zero
 /// - Detects `__mika_v1` envelope for image-bearing results (exit 0 only)
+/// - Le sous-processus est chef de son groupe, et le groupe entier est tué si
+///   le futur est abandonné (mika#2423 — voir [`ProcessGroupKillGuard`])
 async fn execute_exec(
     command: &str,
     skill_dir: &std::path::Path,
@@ -851,7 +1093,13 @@ async fn execute_exec(
             .stderr(std::process::Stdio::piped())
             .env_remove("TMUX")
             .env_remove("TMUX_PANE")
-            .kill_on_drop(true);
+            .kill_on_drop(true)
+            // mika#2423 : chef de groupe, pour que la descendance soit
+            // atteignable par `killpg` à l'abandon. Même motif que
+            // `spawn_long_running_exec` (mika#855) — voir
+            // [`ProcessGroupKillGuard`] pour ce que `kill_on_drop` seul laisse
+            // passer.
+            .process_group(0);
         scrub_mika_env_vars(&mut cmd);
         // Re-inject agent's GitHub token for platform identity separation.
         // Same pattern as builtin run_gh handler (builtin_handlers.rs).
@@ -870,6 +1118,12 @@ async fn execute_exec(
         }
     };
 
+    // mika#2423 — armée ici, aussitôt après un spawn réussi. Déclarée APRÈS
+    // `child` à dessein : Rust drop les locaux en ordre inverse de déclaration,
+    // donc la garde part la première et l'enfant n'est pas encore moissonné
+    // quand `killpg` lit son pgid.
+    let mut group_guard = child.id().map(|pid| ProcessGroupKillGuard::arm(pid as i32));
+
     // Write input JSON to stdin and close.
     // Ignore BrokenPipe — the child may exit without reading stdin.
     if let Some(mut stdin) = child.stdin.take() {
@@ -883,6 +1137,13 @@ async fn execute_exec(
     }
 
     let output = child.wait_with_output().await?;
+
+    // Le handler a rendu la main : sa descendance ne nous regarde plus. Une
+    // erreur d'attente, en revanche, laisse la garde armée — le groupe est
+    // alors dans un état inconnu.
+    if let Some(guard) = group_guard.as_mut() {
+        guard.disarm();
+    }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -8912,5 +9173,355 @@ Harness ticket.
             assert_eq!(rejection["task_id"], "task-2310");
             assert_eq!(rejection["issue"], "senara-solutions/mika#123");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2423 — un AC comportemental non exécutable dans le budget n'est plus
+    // un `hold[review]`
+    // -----------------------------------------------------------------------
+
+    /// **V1** — le refus, et le fait qu'il précède le spawn.
+    ///
+    /// Le handler dort 10 s. Si la garde mord, l'appel revient immédiatement :
+    /// c'est la seule preuve disponible que *rien n'a été lancé*, donc qu'aucun
+    /// orphelin ne peut naître de cette tentative.
+    #[tokio::test]
+    async fn mika2423_a_build_command_under_a_short_budget_is_refused_before_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("handler.sh");
+        write_script(&script, "#!/bin/sh\nsleep 10\n");
+        let tool = make_exec_tool(dir.path(), "handler.sh");
+
+        let started = std::time::Instant::now();
+        let out = execute_skill_tool(
+            &tool,
+            serde_json::json!({ "command": "cargo test --release" }),
+            30,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(out.is_error, "a refusal is returned as an error output");
+        let body: serde_json::Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(body["error"], "build_command_exceeds_tool_budget");
+        assert_eq!(body["policy"], "refusal");
+        assert_eq!(body["tool_budget_secs"], 30);
+        assert_eq!(body["matched_family"], "cargo test");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "the refusal must precede the spawn; took {elapsed:?}"
+        );
+    }
+
+    /// **V2 — contrôle négatif.** La même commande sous un budget de build
+    /// n'est pas refusée.
+    ///
+    /// Sans lui, « refuse les builds sous budget court » serait indistinguable
+    /// de « refuse les builds », et la voie légitime pour compiler serait
+    /// fermée sans que rien ne rougisse.
+    #[test]
+    fn mika2423_the_same_command_under_a_build_budget_is_not_refused() {
+        let input = serde_json::json!({ "command": "cargo test --release" });
+        assert!(
+            refuse_uncontainable_build("run_shell", &input, 600).is_none(),
+            "a build budget contains a build"
+        );
+        assert!(
+            refuse_uncontainable_build("run_shell", &input, BUILD_FLOOR_SECS).is_none(),
+            "le plancher lui-même n'est pas un refus — le prédicat est `<`"
+        );
+        assert!(
+            refuse_uncontainable_build("run_shell", &input, BUILD_FLOOR_SECS - 1).is_some(),
+            "un cran sous le plancher, en revanche, refuse"
+        );
+    }
+
+    /// **V3 — contrôle négatif.** Une commande ordinaire n'est jamais refusée,
+    /// et la borne par identifiant est réelle.
+    ///
+    /// Les trois entrées `cargo.log` / `make-believe` / `libcargo-dev` sont les
+    /// cas que `run.sh` nomme déjà pour ses propres scans : un match par
+    /// sous-chaîne les prendrait tous les trois et rendrait la garde
+    /// inutilisable.
+    #[test]
+    fn mika2423_an_ordinary_command_is_never_refused() {
+        for ordinary in [
+            "git status",
+            "grep -r foo crates/",
+            "cat Cargo.toml",
+            "ls -la target/",
+            // Borne par identifiant — `.` et `-` ne sont pas des frontières.
+            "cat cargo.log",
+            "./make-believe test",
+            "apt list libcargo-dev",
+            // La sous-commande doit suivre le binaire, pas traîner ailleurs.
+            "cargo metadata --format-version 1 | grep test",
+            "git log --oneline | grep cargo",
+            // Une famille sans sa sous-commande n'est pas un build.
+            "cargo --version",
+            "npm ci",
+        ] {
+            let input = serde_json::json!({ "command": ordinary });
+            assert!(
+                refuse_uncontainable_build("run_shell", &input, 30).is_none(),
+                "`{ordinary}` is not a build command and must not be refused"
+            );
+        }
+    }
+
+    /// La famille v1 est reconnue en entier, flags et toolchain sautés.
+    #[test]
+    fn mika2423_the_declared_build_family_is_recognized() {
+        for (command, expected) in [
+            ("cargo build", "cargo build"),
+            ("cargo +nightly test", "cargo test"),
+            ("cargo clippy --all-targets -- -D warnings", "cargo clippy"),
+            ("cargo check -p mika-agent", "cargo check"),
+            ("cargo bench", "cargo bench"),
+            ("npm run build --prefix dashboard", "npm run build"),
+            ("npm run test", "npm run test"),
+            ("npx tsc --noEmit", "npx tsc"),
+            ("make build", "make build"),
+            ("make test", "make test"),
+            ("go build ./...", "go build"),
+            ("go test ./...", "go test"),
+            // Une instruction précédente ne masque pas le build qui suit.
+            ("cd dashboard && npm run build", "npm run build"),
+        ] {
+            assert_eq!(
+                matched_build_family(command).as_deref(),
+                Some(expected),
+                "`{command}` should match `{expected}`"
+            );
+        }
+    }
+
+    /// **V6** — le joint entre la moitié moteur et la moitié prompt.
+    ///
+    /// Le corps du refus porte `"policy": "refusal"` et la chaîne exacte que la
+    /// règle 2.5.3 du prompt qa-review prescrit. Sans ce test, U1 et U3 peuvent
+    /// diverger en silence : le moteur nommerait une classification que le
+    /// prompt ne connaît pas, et le modèle retomberait sur la ligne 40.
+    #[test]
+    fn mika2423_the_refusal_names_the_skip_classification_and_denies_being_a_failure() {
+        let input = serde_json::json!({ "command": "cargo test --release" });
+        let out = refuse_uncontainable_build("run_shell", &input, 30).expect("refusal expected");
+        let body: serde_json::Value = serde_json::from_str(&out.content).unwrap();
+
+        assert_eq!(body["policy"], "refusal");
+
+        let detail = body["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("POLICY REFUSAL, not a tool failure"),
+            "the refusal must deny being a tool failure — that denial is what \
+             breaks the line-40 `hold[review]` ceiling: {detail}"
+        );
+        assert!(
+            detail.contains("never spawned"),
+            "the refusal must say no subprocess ran: {detail}"
+        );
+        assert!(
+            detail.contains("do NOT rewrite the command to evade the scan"),
+            "same posture as the mika#1196 shell-exec refusal: {detail}"
+        );
+
+        let remedy = body["remedy"].as_str().unwrap();
+        let classification = "[⏭️] not verifiable within the review budget — requires a build";
+        assert!(
+            remedy.contains(classification),
+            "the engine must name the exact classification the prompt prescribes \
+             (`qa-review/system_prompt.md`, 2.5.3); got: {remedy}"
+        );
+
+        // Le joint, lu sur le prompt lui-même plutôt que sur une copie.
+        let prompt = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../skills/bundled/qa-review/system_prompt.md"),
+        )
+        .expect("qa-review prompt must be readable from the workspace");
+        assert!(
+            prompt.contains(classification),
+            "the classification named by the engine must exist verbatim in the \
+             prompt that is supposed to act on it"
+        );
+    }
+
+    // --- U2 : le groupe de processus meurt avec le timeout ------------------
+
+    /// `true` tant que le pid désigne un processus vivant et non-zombie.
+    ///
+    /// `/proc/<pid>` survit brièvement à la mort sous la forme d'un zombie, le
+    /// temps que le parent — ici init, l'orphelin ayant été reparenté — le
+    /// moissonne. Lire l'état évite de compter ce sursis comme une survie.
+    #[cfg(unix)]
+    fn pid_is_alive(pid: u32) -> bool {
+        match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => {
+                // Champ 3 (état), après le `comm` entre parenthèses — qui peut
+                // lui-même contenir des espaces.
+                let after_comm = stat.rsplit_once(") ").map(|(_, rest)| rest).unwrap_or("");
+                !after_comm.starts_with('Z')
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Attend au plus `limit` que `pid` meure. Rend `true` s'il est mort.
+    #[cfg(unix)]
+    async fn wait_for_death(pid: u32, limit: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        while std::time::Instant::now() < deadline {
+            if !pid_is_alive(pid) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        !pid_is_alive(pid)
+    }
+
+    /// Attend au plus `limit` que `path` apparaisse et porte un pid lisible.
+    #[cfg(unix)]
+    async fn read_pidfile(path: &std::path::Path, limit: std::time::Duration) -> Option<u32> {
+        let deadline = std::time::Instant::now() + limit;
+        while std::time::Instant::now() < deadline {
+            if let Ok(raw) = fs::read_to_string(path)
+                && let Ok(pid) = raw.trim().parse::<u32>()
+            {
+                return Some(pid);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        None
+    }
+
+    /// **V4 — le test central du corollaire du ticket.**
+    ///
+    /// Le handler lance un petit-enfant et attend. À l'expiration,
+    /// `kill_on_drop(true)` ne signale que l'enfant **direct** ; `run.sh`
+    /// finissant sur `eval "$COMMAND"`, la vraie commande est un petit-enfant,
+    /// qui survit et se fait reparenter à init — c'est exactement le pid 145584
+    /// du ticket, `ppid=1`, tenant le lock `target/`.
+    ///
+    /// **Vérifié rouge avant U2** : sans `process_group(0)` + `killpg`, le
+    /// petit-enfant survit à cette assertion. Un test de fuite de processus qui
+    /// n'a jamais été vu rouge ne prouve pas qu'il détecte la fuite — il peut
+    /// ne mesurer que le pid direct, qui mourait déjà.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mika2423_a_timed_out_handler_leaves_no_orphan_grandchild() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let script = dir.path().join("handler.sh");
+        write_script(
+            &script,
+            &format!(
+                "#!/bin/sh\n\
+                 sleep 300 >/dev/null 2>&1 &\n\
+                 echo $! > {}\n\
+                 wait\n",
+                pidfile.display()
+            ),
+        );
+        let tool = make_exec_tool(dir.path(), "handler.sh");
+
+        let call = execute_skill_tool(&tool, serde_json::json!({}), 2, None, None, None, None);
+        let pid_probe = read_pidfile(&pidfile, std::time::Duration::from_secs(5));
+        let (out, grandchild) = tokio::join!(call, pid_probe);
+
+        let grandchild = grandchild.expect("the handler must have recorded its grandchild's pid");
+        assert!(
+            out.is_error,
+            "the call must have timed out: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("timed out"),
+            "expected a timeout, got: {}",
+            out.content
+        );
+
+        assert!(
+            wait_for_death(grandchild, std::time::Duration::from_secs(5)).await,
+            "grandchild pid {grandchild} survived the timeout — this is the \
+             mika#2423 orphan leak: it now holds the `target/` lock with ppid=1 \
+             and guarantees the failure of every subsequent attempt"
+        );
+    }
+
+    /// **V5 — contrôle négatif.** Le kill est sur la branche d'expiration
+    /// seule ; un handler qui rend la main normalement ne tue rien.
+    ///
+    /// Deux cas, du plus strict au risque nommé. (a) Un processus d'arrière-plan
+    /// **resté dans le groupe** : il survit, donc le kill de groupe est bien
+    /// désarmé sur le chemin nominal — sans ce cas, « le groupe meurt à
+    /// l'expiration » serait indistinguable de « le groupe meurt toujours ».
+    /// (b) Un démon détaché par `setsid`, le risque que le plan nomme (un
+    /// handler du genre `tmux new-session -d`) : il quitte le groupe et n'est
+    /// donc atteignable par aucun `killpg`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mika2423_a_normally_completing_handler_is_not_group_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let in_group = dir.path().join("in_group.pid");
+        let detached = dir.path().join("detached.pid");
+        let script = dir.path().join("handler.sh");
+        write_script(
+            &script,
+            &format!(
+                "#!/bin/sh\n\
+                 sh -c 'echo $$ > {ig}; exec sleep 60' >/dev/null 2>&1 &\n\
+                 setsid sh -c 'echo $$ > {det}; exec sleep 60' >/dev/null 2>&1 &\n\
+                 # Laisser les deux enfants écrire leur pid avant de rendre la main.\n\
+                 while [ ! -s {ig} ] || [ ! -s {det} ]; do sleep 0.05; done\n\
+                 echo done\n",
+                ig = in_group.display(),
+                det = detached.display()
+            ),
+        );
+        let tool = make_exec_tool(dir.path(), "handler.sh");
+
+        let out =
+            execute_skill_tool(&tool, serde_json::json!({}), 30, None, None, None, None).await;
+        assert!(
+            !out.is_error,
+            "the handler completes normally: {}",
+            out.content
+        );
+
+        let in_group_pid = read_pidfile(&in_group, std::time::Duration::from_secs(5))
+            .await
+            .expect("in-group child pid");
+        let detached_pid = read_pidfile(&detached, std::time::Duration::from_secs(5))
+            .await
+            .expect("detached daemon pid");
+
+        // Laisser au kill le temps de survenir, s'il devait survenir.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let in_group_alive = pid_is_alive(in_group_pid);
+        let detached_alive = pid_is_alive(detached_pid);
+
+        // Nettoyage avant assertion — un test qui échoue ne doit pas laisser
+        // derrière lui les processus dont il dénonce la survie.
+        for pid in [in_group_pid, detached_pid] {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .status();
+        }
+
+        assert!(
+            in_group_alive,
+            "an in-group background process must survive a NORMAL completion — \
+             otherwise the group kill is not scoped to the expiry branch"
+        );
+        assert!(
+            detached_alive,
+            "a setsid-detached daemon must survive: it left the group and no \
+             killpg can reach it (the `tmux new-session -d` risk)"
+        );
     }
 }

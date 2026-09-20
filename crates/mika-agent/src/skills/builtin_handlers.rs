@@ -4496,6 +4496,37 @@ mod tests {
     use crate::test_utils::test_helpers::TestHarness;
     use std::sync::Arc;
 
+    /// **V9 (mika#2423)** — pin d'une décision, pas d'un comportement.
+    ///
+    /// mika#2423 a examiné la piste « la QA lit le log du job CI `Check` pour y
+    /// chercher `test <chemin>::<nom> ... ok` » et l'a **refusée**, sur trois
+    /// faits vérifiés. Le premier porte le reste : la porte de merge exige déjà
+    /// la CI verte, un cran en aval du verdict et sans limite de 30 s —
+    /// `server::verdict_handler` rend `Passthrough` (et ne merge pas) dès que
+    /// `classify_checks` donne `CheckClassification::HasFailures`. Faire lire la
+    /// CI à la QA dupliquerait cette porte, et une duplication de porte est une
+    /// porte qui peut diverger de l'autre (leçon `grooming_marker`, mika#2158).
+    ///
+    /// Ouvrir la voie demanderait d'élargir **deux** barrages, celui-ci et la
+    /// règle de prompt correspondante. Ce test rend le premier élargissement
+    /// délibéré : un futur éditeur qui ajoute `("run", "view")` doit d'abord
+    /// faire rougir ce test, donc lire cette raison.
+    #[test]
+    fn mika2423_the_gh_scope_for_qa_review_is_unchanged() {
+        assert_eq!(
+            QA_REVIEW_GH_ALLOWED,
+            &[
+                ("pr", "review"),
+                ("pr", "diff"),
+                ("pr", "list"),
+                ("issue", "view"),
+            ],
+            "mika#2423 examined and refused CI-log reading for qa-review: \
+             `gh run view` must stay out of this scope. Reopening it is a \
+             decision, not a detail — see the doc comment above."
+        );
+    }
+
     #[tokio::test]
     async fn test_get_documentation_all_embedded_topics() {
         let harness = TestHarness::new();
