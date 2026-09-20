@@ -133,13 +133,23 @@ le code 78 en `CONTAINMENT REFUSAL (exit 78) — the pilot was never launched`
 (`dispatch-lib.sh:2654`), texte qui dit explicitement que ce n'est ni une dérive du pilote ni un
 échec de pipeline. Il ne reste qu'à enrichir le motif du **geste de remise en marche** (R2).
 
-**Placement : avant `_stage_pilot_gh_token`.** Le staging du credential GitHub
-(`dispatch-lib.sh:605`, `umask 077`) est aujourd'hui exécuté à `dispatch-lib.sh:971`, soit **deux
-lignes avant** le point de décision. Rafraîchir un credential hôte pour un dispatch qui n'aura pas
-lieu n'est pas une fuite nouvelle (le fichier existe déjà entre deux dispatches) mais c'est un
-travail inutile sur un chemin de refus — et le précédent maison est explicite : la porte 2c de
-mika#2279 est placée « avant l'étape 3, donc sans résolution de token ». Le refus remonte donc
-avant le staging.
+**Placement : avant `_stage_pilot_gh_token`, donc avant DEUX effets de bord et non un.** La
+séquence réelle est `_stage_pilot_gh_token` (`:970`) puis `_ensure_pilot_helper || true` (`:971`)
+puis la décision (`:973`) :
+
+- `_stage_pilot_gh_token` (`dispatch-lib.sh:605`, `umask 077`) rafraîchit un credential GitHub
+  hôte. Ce n'est pas une fuite nouvelle — le fichier existe déjà entre deux dispatches — mais
+  c'est un credential rafraîchi pour un lancement qui n'aura pas lieu ;
+- `_ensure_pilot_helper` **lance un daemon**, et le plan initial l'omettait. Un refus posé après
+  lui laisse un helper démarré derrière un dispatch refusé, à chaque tentative d'une panne.
+
+Le précédent maison tranche dans le même sens : la porte 2c de mika#2279 est placée « avant
+l'étape 3, donc sans résolution de token ». Le refus remonte donc **avant les deux**.
+
+Une contrainte d'ordre à ne pas casser en le déplaçant : le commentaire mika#2056 à `:967-969`
+exige que le token soit staged **avant** le helper, « so the mitmdump github addon has a fresh
+credential to inject on its very first request ». Remonter le refus au-dessus du couple préserve
+cet ordre intact ; l'insérer *entre* les deux le romprait.
 
 **Le stamp.** Sur refus, la garde C écrit `~/.mika/state/pilot-egress-down` ; sur succès, elle le
 retire. Contenu : une ligne `<RFC3339-UTC> <motif>`. Contrairement à `auto-pull-stop` (mika#2329,
@@ -175,6 +185,53 @@ répété.
 **L'alerte ne conditionne jamais le refus.** `mika notify` est appelé en `|| true` : le refus est
 la protection, l'alerte est l'information, et une alerte qui échoue ne doit pas rendre le
 lancement au pilote. C'est l'ordre inverse de celui qu'un `set -e` mal placé produirait.
+
+#### 3.3.1 Le canal a deux préconditions, et son échec est muet — c'est la moitié dure de l'AC1
+
+Mesuré dans `crates/mika-cli/src/commands/notify.rs`, et ce sont les trois faits qui décident la
+forme du livrable :
+
+1. **`mika notify` rend `Ok(())` même quand Telegram échoue.** Lignes 73-90 : l'échec de
+   `send_via_gateway` est attrapé, écrit en `eprintln!` (« ⚠ Telegram delivery failed »), puis la
+   fonction rend `Ok`. Seul un échec d'écriture en base rend non-zéro. Le `|| true` de la §3.3
+   garde donc son utilité **pour ce cas-là uniquement** (base illisible) et n'en a aucune pour
+   l'échec de livraison, qui ne remonte pas. **Conséquence portante : l'appelant shell ne peut
+   structurellement pas savoir si l'alerte a atteint quelqu'un.**
+2. **La livraison exige un `chat_id` en base**, lu par `get_customer_config("chat_id")` sur
+   l'agent **`mika`** (`NOTIFICATIONS_AGENT`, constante du module) — jamais sur mika-dev, qui est
+   l'agent du dispatch. Absent ⇒ `bail!` (« no Telegram pairing yet ») ⇒ avalé par le point 1.
+3. **Elle exige `MIKA_INTERNAL_TOKEN`**, lu depuis `ctx.settings` et non depuis l'environnement du
+   process — donc résolu via `~/.mika/.env`, ce qui le rend **insensible au `scrub_mika_env_vars`**
+   qui retire tous les `MIKA_*` des enfants de dispatch. Cette moitié-là est saine ; c'est la
+   précondition 2 qui est fragile.
+
+**Ce que ça change pour l'AC1.** Le préalable de l'opérateur distingue « une escalade sur un canal
+réellement lu » de « seulement un événement émis ». Appeler `mika notify` produit un **appel
+émis** ; si le `chat_id` n'est pas appairé, on obtient exactement le défaut que l'AC1 récuse, en
+pire — silencieux de bout en bout, l'échec étant avalé deux fois (par le `Ok(())` et par le
+`|| true`). **Une alerte qu'on ne peut pas vérifier n'est pas une escalade, c'est un espoir**
+(formulation mika#2293 sur un réglage inobservable).
+
+Le lot doit donc livrer, en plus de l'appel :
+
+- **une vérification de praticabilité au déploiement**, pas au runtime : établir que l'agent `mika`
+  porte un `chat_id` non nul et que le gateway répond. C'est une case de la DoD et une étape du
+  runbook §3.5, pas une sonde sur le chemin critique de chaque dispatch ;
+- **la trace en base comme filet nommé** : la notification est écrite **avant** la tentative
+  d'envoi (ligne 60 avant ligne 73), donc une livraison morte laisse quand même la ligne dans la
+  session `00000000-0000-0000-0000-700000710717`. C'est ce qui rend la halte (c) de §5.3
+  décidable — présente en base et absente de Telegram sépare « le gateway est mort » de
+  « l'appel n'a pas eu lieu » ;
+- **l'assertion de test porte sur l'appel, et elle dit ce qu'elle ne couvre pas.** §5.1
+  assertion 3 assert que `mika notify` est invoqué avec les bons arguments (binaire stubé sur
+  `PATH`). Elle ne peut pas assert la livraison Telegram, qui dépend d'un état hôte hors du
+  harness. Écrire cette limite dans le test lui-même évite qu'un futur lecteur prenne le vert
+  pour une preuve de livraison.
+
+**Alternative écartée** : faire remonter l'échec de livraison en rendant `mika notify` non-zéro
+sur échec Telegram. C'est un changement de contrat d'une commande partagée, dont tous les autres
+appelants attendent le fail-soft actuel — et ça ne servirait à rien ici, puisque le refus ne doit
+de toute façon pas dépendre de l'alerte. La bonne place est la précondition de déploiement.
 
 ### 3.4 Gardes A et B — la reprise sans geste sur les tickets (R5)
 
@@ -229,7 +286,10 @@ Ce qu'il **ne** couvre pas, et que le lot ajoute :
 - **`docs/operator/pilot-egress-relay.md`** : symptômes (ce que lit l'opérateur au refus, dans
   Telegram et dans le `RESULT`), diagnostic (les trois questions : binaire installé ? socket
   connectable ? log du proxy), les gestes, et la vérification. Sur le modèle de
-  `docs/operator/agent-identity-reprovision.md`.
+  `docs/operator/agent-identity-reprovision.md`. **Plus une section « le canal d'alerte
+  fonctionne-t-il ? »** portant la précondition de §3.3.1 : vérifier le `chat_id` de l'agent
+  `mika`, émettre une notification de test, et savoir qu'un échec de livraison est muet. C'est la
+  seule page où cette vérification a une chance d'être faite avant l'incident plutôt que pendant.
 
 **Note de lecture pour le runbook** : `docs/egress-*.md` et
 `crates/mika-gateway/docs/egress-search*.md` concernent l'egress **de la recherche web** (gateway,
@@ -283,7 +343,10 @@ documenté contre un arrêt de rail non mesuré.
 2. **le motif est lisible** — le `RESULT` porte `CONTAINMENT REFUSAL`, la cause (`egress_bind_timeout`
    ou `egress_binary_missing`) **et** le geste de remise en marche.
 3. **l'alerte part** — `mika notify` est appelé, une fois, avec `--severity escalate`
-   (`mika` stubé sur `PATH` dans le test, le journal d'appels asserté).
+   (`mika` stubé sur `PATH` dans le test, le journal d'appels asserté). **Le test porte sur
+   l'appel, jamais sur la livraison** : celle-ci dépend d'un `chat_id` hôte que le harness n'a
+   pas, et `mika notify` rend `Ok` même quand Telegram échoue (§3.3.1). Cette limite est écrite
+   dans le test, pour qu'un futur lecteur ne prenne pas le vert pour une preuve de livraison.
 4. **une seconde tentative pendant la même panne n'alerte pas** — la déduplication mord.
 5. **proxy relancé ⇒ reprise** — le dispatch suivant part, le stamp est retiré, une notification
    `info` de reprise est émise.
@@ -328,11 +391,19 @@ ne pas rallonger la fenêtre de bind** : le relais est réellement instable, et 
 faut traiter. Le lecteur est `/var/log/mika/pilot-egress-proxy.log`, l'instrument de diagnostic sur
 lequel mika#2041 puis mika#2051 se sont appuyés.
 
-**(c) Halte — l'alerte n'arrive pas alors qu'un refus a eu lieu.** Vérifier **d'abord** que la
+**(c) Halte — l'alerte n'arrive pas alors qu'un refus a eu lieu.** L'ordre de lecture est imposé
+par le fait que l'échec de livraison est muet (§3.3.1) : la commande a rendu `0` dans **tous** les
+cas ci-dessous, donc son code de retour ne discrimine rien. Vérifier **d'abord** que la
 notification est en base :
 `SELECT * FROM messages WHERE session_id = '00000000-0000-0000-0000-700000710717' ORDER BY created_at DESC LIMIT 5;`
-Présente en base et absente de Telegram ⇒ le défaut est dans la livraison gateway, pas dans ce lot.
-Absente des deux ⇒ `mika notify` n'a pas été appelé, et c'est le site d'appel shell qu'il faut lire.
+
+- **Absente de la base** ⇒ `mika notify` n'a pas été appelé du tout : lire le site d'appel shell.
+- **Présente en base, absente de Telegram, `chat_id` présent et non nul** ⇒ le défaut est dans la
+  livraison gateway, pas dans ce lot.
+- **Présente en base, absente de Telegram, `chat_id` absent ou nul** ⇒ **le canal n'a jamais été
+  appairé** et la case de praticabilité de la DoD n'a pas été faite. C'est la cause la plus
+  probable d'une première alerte perdue, et le remède est un appairage, pas une correction de
+  code. Ne pas chercher le défaut dans la garde C.
 
 **(d) Halte — un ticket parqué malgré la garde B.** Lire
 `SELECT after_value, count(*) FROM audit_events WHERE tool_name = 'auto_pull_exclusion' GROUP BY 1;`
@@ -370,6 +441,9 @@ binaire antérieur au correctif produit exactement le même silence (classe mika
 - [ ] Le `RESULT` de refus nomme la cause et le geste de remise en marche.
 - [ ] `mika notify --channel telegram --severity escalate` est émis au premier refus d'un épisode,
       en `|| true`, et une notification `info` annonce la reprise.
+- [ ] **Praticabilité du canal établie au déploiement** (§3.3.1) : l'agent `mika` porte un
+      `chat_id` non nul en `customer_config` et une notification de test est reçue. Sans cette
+      case, l'AC1 livre un appel émis et non une escalade lue.
 - [ ] `~/.mika/state/pilot-egress-down` est écrit/retiré par la garde C, avec péremption
       `MIKA_PILOT_EGRESS_DOWN_TTL_SECS` (défaut 600).
 - [ ] Garde B (`auto_pull` Phase 2, filtre `egress_relay_down`, verdict `Skip`) et garde A
@@ -394,7 +468,11 @@ transcrits du commentaire opérateur du 2026-09-20T15:04:30Z (les trois préalab
 négatif), et AC5 est dérivé de la clause « sans intervention sur les tickets » de ce même test.*
 
 **AC1 — Alerte active au refus.** Un refus pour cause d'egress déclenche une escalade sur un canal
-réellement lu, par un chemin déterministe sans tour LLM. Vérifiable : §5.1 assertion 3.
+réellement lu, par un chemin déterministe sans tour LLM. Vérifiable en **deux** moitiés, parce
+qu'aucune ne suffit seule (§3.3.1) : *l'appel* par §5.1 assertion 3 (test automatisé), *la
+lecture effective* par la case de praticabilité de la DoD (`chat_id` appairé + notification de
+test reçue), vérifiée au déploiement. Un test vert seul atteste un appel émis — c'est-à-dire
+exactement ce que le préalable opérateur distingue d'une escalade.
 
 **AC2 — Diagnostic dans le motif de refus.** Le dispatch refusé dit **pourquoi** (cause distincte
 par mode de panne) et **comment relancer**. Vérifiable : §5.1 assertion 2.
