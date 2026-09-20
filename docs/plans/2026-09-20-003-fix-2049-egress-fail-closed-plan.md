@@ -145,6 +145,24 @@ intégralement et gratuitement ». La moitié *texte* est effectivement gratuite
 réutilisation de mika#2141 sans reprendre aussi ce qui, chez mika#2141, était resté dormant
 faute d'être emprunté.
 
+**Et la queue du texte emprunté dit le contraire du motif qu'on y insère.** Le bloc de
+`dispatch-lib.sh:2661-2668` ne se réduit pas au motif interpolé : il se **termine** par deux
+phrases fixes, écrites pour les deux causes gitdir de mika#2141 —
+
+```
+Fix the worktree, then re-dispatch.
+```
+
+Pour un refus d'egress, **le worktree est sain** et ce qu'il faut réparer est le relais. Un
+implémenteur qui se contente d'enrichir `_PILOT_SANDBOX_REFUSAL` — le geste que la phrase
+précédente rend naturel — livre un `RESULT` qui nomme le relais en son milieu et prescrit de
+réparer le worktree à sa fin. C'est une contradiction **dans le seul texte que l'AC2 rend
+lisible**, et elle oriente l'opérateur vers le mauvais organe au moment précis où il lit vite.
+La queue doit donc suivre la cause — soit en la déplaçant dans `_PILOT_SANDBOX_REFUSAL` chez
+les deux appelants gitdir, soit en la conditionnant. La première branche est préférable :
+elle rend le texte de refus **entièrement** porté par le motif, donc extensible sans retoucher
+ce bloc au prochain refus de contenance.
+
 **Placement : avant `_stage_pilot_gh_token`, donc avant DEUX effets de bord et non un.** La
 séquence réelle est `_stage_pilot_gh_token` (`:970`) puis `_ensure_pilot_helper || true` (`:971`)
 puis la décision (`:973`) :
@@ -322,6 +340,77 @@ ferme le tableau ci-dessus, mais rend le déblocage dépendant d'un dispatch qui
 A et B bloquant tous les chemins, plus rien ne re-sonde et le stamp ne se lève pas. C'est le
 blocage définitif que §3.4 vient d'écarter, réintroduit par l'autre bout.
 
+#### 3.4.2 Le stamp traverse une frontière que rien n'a encore traversée, et les deux côtés ne résolvent pas le même chemin
+
+**C'est le second défaut de dimensionnement de ce plan, et il annule AC5 aussi sûrement que le
+premier — mais sans qu'aucun test puisse rougir.** §3.4 pose « un seul organe d'état » sans
+établir que ses deux extrémités désignent le même fichier. Elles ne le font pas.
+
+**Mesure.** `scrub_mika_env_vars` (`crates/mika-agent/src/skills/executor.rs:40`) retire de
+l'enfant de dispatch **toute** variable commençant par `MIKA_` — `MIKA_HOME` comprise. Côté Rust,
+la résolution du home est `$MIKA_HOME > ~/.mika` (`crates/mika-common/src/home.rs:326-328`). Donc :
+
+| | Process | Résout | Sur une installation posant `MIKA_HOME` |
+|---|---|---|---|
+| Garde C (écrit) | enfant de dispatch, **scrubé** | `$HOME/.mika/state/` | `$HOME/.mika/state/` |
+| Gardes A et B (lisent) | mika-spirit | `global_home/state/` | **`$MIKA_HOME/state/`** |
+
+Le stamp est alors écrit à un endroit et cherché à un autre. **La protection tient** — la garde C
+ne lit aucun stamp et refuse sur une sonde fraîche — mais A et B, fail-open par construction
+(§3.4), lisent « pas de panne » et laissent passer chaque dispatch. La garde B ne rend jamais
+`egress_relay_down`, le budget de re-drive se consomme, et le tableau de §3.4.1 se rejoue
+intégralement : **une panne d'environ une heure parque chaque ticket.** R5 et AC5 sont faux en
+production pendant que la suite de tests est verte, puisqu'un harness pose le même home des deux
+côtés ou n'en pose aucun.
+
+**Le mode de panne est muet du côté rassurant.** Une divergence de chemin ne peut pas ouvrir le
+réseau — elle ne peut acheter que de l'inertie, jamais un faux positif. C'est l'asymétrie exacte
+que mika#2249 a dû écrire pour le couple `MIKA_PILOT_LOG_DIR` / `PILOT_LOG_DIR`, et c'est ce qui
+rend le défaut **supportable mais invisible** : rien ne casse, la boucle a l'air de fonctionner,
+et seuls des tickets parqués en témoignent — c'est-à-dire le symptôme que l'opérateur a
+explicitement demandé d'exclure.
+
+**Aucune convention à suivre : ce stamp serait le premier de son espèce.** Les trois entrées
+actuelles de `state/` sont toutes intra-frontière — `pilot-gitconfig` et `pr-origin-epoch` sont
+écrits *et* lus par le shell, `auto-pull-stop` est posé à la main par l'opérateur et lu par le
+seul Rust (mika#2329). **Aucun fichier de `state/` n'est aujourd'hui écrit par le shell et lu par
+le moteur.** Le plan doit donc poser la convention plutôt que l'hériter.
+
+**Et le patron voisin est un piège actif.** `dispatch-lib.sh:5829` écrit
+`MIKA_PR_ORIGIN_EPOCH_FILE="${MIKA_HOME:-$HOME/.mika}/state/pr-origin-epoch"` — la seule des six
+résolutions shell qui *consulte* `MIKA_HOME`, et elle est **inopérante par construction** :
+la variable a été scrubée avant que la ligne s'exécute, donc le `:-` retombe toujours sur
+`$HOME/.mika`. C'est du code qui a l'air de gérer le cas et ne le gère pas. Un implémenteur
+cherchant un modèle trouvera **celui-là en premier** — c'est le seul qui mentionne `MIKA_HOME` —
+le recopiera, et croira le problème résolu. Les cinq autres sites (`:303`, `:346`, `:934`,
+`:1176`, `:1260`) écrivent `$HOME/.mika` en dur et sont, eux, honnêtes sur ce qu'ils font.
+
+**Le livrable, et il est petit.** Le shell écrit `$HOME/.mika/state/pilot-egress-down` en dur, à
+la manière des cinq sites honnêtes et **jamais** du sixième. Le Rust lit le chemin dérivé de
+`global_home_dir`, **déjà câblé sur `TaskDispatcher`** par mika#2329
+(`crates/mika-agent/src/server/mod.rs:573`) — rien à propager. Ce qui doit être livré est
+**l'invariant qui relie les deux**, écrit aux deux extrémités :
+
+- côté Rust, dans le doc-comment de la fonction de chemin, nommant `scrub_mika_env_vars` et
+  disant que le producteur est shell et ne peut pas voir `MIKA_HOME` ;
+- côté shell, un commentaire au site d'écriture renvoyant au lecteur Rust et **interdisant
+  explicitement** le patron `${MIKA_HOME:-…}` de `:5829`, avec sa raison.
+
+**Et un test qui le tienne, sans quoi il dérive.** L'invariant est de la même famille que
+`TTL > seuil` (§3.4.1) : une relation entre deux sites qu'aucun compilateur ne vérifie. Un scan
+de source suffit et il est peu coûteux — asserter que le littéral du chemin apparaît à exactement
+deux endroits, et que le site shell ne contient pas `MIKA_HOME` sur cette ligne. Sans lui, un
+futur éditeur « harmonisant » le shell sur le patron de `:5829` rouvre ce trou en silence, et le
+symptôme qu'il produira — des tickets parqués pendant une panne de relais — ne ressemble en rien
+à sa cause.
+
+**Alternative écartée** : faire passer le chemin du stamp par une variable d'environnement
+dédiée non préfixée `MIKA_` (le patron `PILOT_LOG_DIR` de mika#2249). Elle marcherait, mais
+mika#2249 a dû documenter que deux noms distincts pour une même chose est un coût permanent de
+compréhension — et il n'y est payé que parce que le répertoire de logs a de bonnes raisons d'être
+déplacé. Ici le chemin est fixe, sous le home de l'installation, et personne n'a demandé à le
+bouger : une variable créerait la divergence qu'elle prétend gérer.
+
 **Ordre de livraison contraint.** La garde C **seule** satisfait R1 (la sûreté) mais **casse** R5.
 A et B seules ne protègent rien. D seule ne protège rien non plus mais évite un mensonge. Les
 quatre vont dans le même lot ; si le lot devait être scindé, C ne peut partir ni sans B **ni sans
@@ -477,6 +566,13 @@ documenté contre un arrêt de rail non mesuré.
    constantes peuvent dériver l'une par rapport à l'autre sans qu'aucun test ne rougisse
    (mika#2362). Elle doit **échouer contre un TTL de 600 s**, ce qui est le contrôle négatif de la
    correction elle-même.
+7bis. **les deux extrémités du stamp désignent le même fichier** (§3.4.2) — scan de source : le
+   littéral `state/pilot-egress-down` n'apparaît qu'aux deux sites prévus, et la ligne shell qui
+   l'écrit ne contient pas `MIKA_HOME`. C'est l'assertion qui tient la seconde relation
+   inter-sites du lot, de la même famille que l'assertion 7. **Un test comportemental ne peut pas
+   l'attraper** : il poserait le même home des deux côtés, la divergence ne rendrait aucune
+   décision fausse, et la garde B deviendrait inatteignable en silence.
+
 8. **un refus n'est pas rapporté comme un succès** (§3.5) — le `RESULT` produit par l'assertion 1
    est passé au discriminant de `self-dev-callback` : il route vers la branche de refus de
    contenance, et **non** vers `On success`. Vérifiable sans tour LLM en assertant que le texte
@@ -537,13 +633,23 @@ notification est en base :
 
 **(d) Halte — un ticket parqué malgré la garde B.** Lire
 `SELECT after_value, count(*) FROM audit_events WHERE tool_name = 'auto_pull_exclusion' GROUP BY 1;`
-La présence d'`egress_relay_down` prouve que B mord ; son absence pendant une panne dit que le
-stamp n'est pas lu (chemin, `MIKA_HOME`) **ou qu'il est systématiquement périmé quand Phase 2
-regarde** — lire `MIKA_PILOT_EGRESS_DOWN_TTL_SECS` contre
-`MIKA_AUTO_PULL_STUCK_READY_THRESHOLD_SECS` **avant** toute autre hypothèse : un TTL retombé sous
-le seuil restaure exactement le tableau de §3.4.1, et la garde paraît alors absente alors qu'elle
-est seulement inatteignable. Dans tous les cas, **réparer la lecture, ne pas allonger le budget de
-re-drive**, qui masquerait le symptôme sans toucher la cause.
+La présence d'`egress_relay_down` prouve que B mord. Son absence pendant une panne a **deux
+causes distinctes et il faut les départager dans cet ordre**, parce qu'elles produisent un
+symptôme rigoureusement identique — une garde qui paraît absente alors qu'elle est seulement
+inatteignable :
+
+1. **Le stamp n'est pas là où le moteur regarde** (§3.4.2). Question décidable en une commande :
+   `ls -la "$HOME/.mika/state/pilot-egress-down"` **et** la même sous `$MIKA_HOME` si la variable
+   est posée sur le service. Deux chemins distincts ⇒ c'est la divergence de §3.4.2, et le remède
+   est le chemin, pas le réglage.
+2. **Le stamp est systématiquement périmé quand Phase 2 regarde** (§3.4.1). Lire
+   `MIKA_PILOT_EGRESS_DOWN_TTL_SECS` contre `MIKA_AUTO_PULL_STUCK_READY_THRESHOLD_SECS` : un TTL
+   retombé sous le seuil restaure exactement le tableau de §3.4.1.
+
+L'ordre est imposé par le coût de l'erreur : chercher un défaut de TTL sur une divergence de
+chemin conduit à rallonger le TTL, ce qui ne répare rien et **ajoute** de la latence de reprise.
+Dans tous les cas, **réparer la lecture, ne pas allonger le budget de re-drive**, qui masquerait
+le symptôme sans toucher la cause.
 
 **(f) Halte — un refus annoncé comme un succès.** Après un refus avéré (une ligne `CONTAINMENT
 REFUSAL` dans un `RESULT`), vérifier qu'aucune notification « claude-pilot completed » ne porte le
@@ -590,7 +696,9 @@ binaire antérieur au correctif produit exactement le même silence (classe mika
 
 - [ ] `_ensure_pilot_egress_proxy` pose un motif structuré ; `_run_pilot_sandboxed` refuse
       (`return 78`) au lieu de retomber en Phase 2a, **avant** `_stage_pilot_gh_token`.
-- [ ] Le `RESULT` de refus nomme la cause et le geste de remise en marche.
+- [ ] Le `RESULT` de refus nomme la cause et le geste de remise en marche, **et sa queue fixe
+      ne prescrit plus de réparer le worktree** sur une cause d'egress (§3.2) — le texte de refus
+      est entièrement porté par le motif.
 - [ ] `mika notify --channel telegram --severity escalate` est émis au premier refus d'un épisode,
       en `|| true`, et une notification `info` annonce la reprise.
 - [ ] **Praticabilité du canal établie au déploiement** (§3.3.1) : l'agent `mika` porte un
@@ -600,6 +708,11 @@ binaire antérieur au correctif produit exactement le même silence (classe mika
       `MIKA_PILOT_EGRESS_DOWN_TTL_SECS` (défaut **1800**).
 - [ ] **L'invariant `TTL > seuil de stuck-ready` est écrit dans le doc-comment de la constante**,
       en nommant `STUCK_READY_THRESHOLD_ENV`, et tenu par l'assertion 7 de §5.1 (§3.4.1).
+- [ ] **Les deux extrémités du stamp désignent le même fichier** (§3.4.2) : le shell écrit
+      `$HOME/.mika/state/pilot-egress-down` **en dur**, jamais via `${MIKA_HOME:-…}` ; le Rust lit
+      depuis `global_home_dir` ; l'invariant est écrit **aux deux sites** (le doc-comment Rust
+      nommant `scrub_mika_env_vars`, le commentaire shell interdisant le patron de
+      `dispatch-lib.sh:5829` avec sa raison) et tenu par l'assertion 7bis de §5.1.
 - [ ] Garde B (`auto_pull` Phase 2, filtre `egress_relay_down`, verdict `Skip`) et garde A
       (`ready_label_handler`, porte `egress_relay_down`, refus `Handled`) livrées dans le même lot.
 - [ ] **Garde D** — `self-dev-callback` porte un discriminant de refus de contenance (prédicat
@@ -644,10 +757,13 @@ lisible ; proxy relancé ⇒ le dispatch reprend. Vérifiable : §5.1 assertions
 
 **AC5 — Reprise sans intervention sur les tickets.** Aucun ticket n'est parqué
 (`operator-review`) ni n'a consommé de budget de re-drive du fait de la panne. Vérifiable en
-**deux** moitiés, parce que la première ne suffit pas (§3.4.1) : *le verdict* de la garde B par
-§5.1 assertion 6 (`Skip`, jamais `SkipAndResetBudget`), *son atteignabilité* par l'assertion 7
-(le stamp est encore frais quand Phase 2 regarde). Une garde B correcte sur un stamp
-systématiquement périmé rend AC5 vert en test et faux en production.
+**trois** moitiés, et aucune ne suffit sans les deux autres : *le verdict* de la garde B par
+§5.1 assertion 6 (`Skip`, jamais `SkipAndResetBudget`) ; *son atteignabilité dans le temps* par
+l'assertion 7 (le stamp est encore frais quand Phase 2 regarde, §3.4.1) ; *son atteignabilité
+dans l'espace* par l'assertion 7bis (les deux gardes désignent le même fichier, §3.4.2). Une
+garde B correcte dont le stamp est systématiquement périmé — ou cherché ailleurs qu'il n'est
+écrit — rend AC5 **vert en test et faux en production**, et les deux défaillances produisent le
+même symptôme qu'une garde absente.
 
 **AC8 — Un refus n'est pas rapporté comme un succès.** Le `RESULT` d'un refus de contenance est
 routé par `self-dev-callback` vers une branche de refus, jamais vers `On success` ; aucune
