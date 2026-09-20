@@ -260,12 +260,98 @@ resterait verte. D'où la garde structurelle de la phase 3.
 - **F6 — pas de match par sous-chaîne.** Login `not-dependabot[bot]` +
   code-only ⇒ exit 1.
 
+- **F7 — le fail-closed ne doit pas être un plantage.** Fichier d'event présent
+  mais **malformé** (JSON invalide) + code-only ⇒ exit **1** avec le rejet
+  code-only, jamais un code de sortie de `jq`. Voir la section
+  `## Fire-Disposition` : le script tourne sous `set -euo pipefail`, donc une
+  résolution écrite naïvement transformerait une PR qui passe aujourd'hui en
+  `block[pipeline]`. C'est le seul chemin par lequel ce correctif pourrait
+  casser du préexistant.
+
 Garde structurelle (Rust, à placer près des scans de source existants) :
 assertion que le bloc Step 2B de `system_prompt.md` porte `user.login`. Un test
 comportemental ne peut pas attraper cette régression — le retrait du champ ne
 rendrait aucune décision fausse, il rendrait l'exemption **inerte**, avec F1-F6
 au vert. C'est exactement la classe que les scans de source maison existent pour
-tenir.
+tenir. Modèle en vigueur : `qa_build_callback.rs::mika2355_the_scope_header_quotes_the_engine_marker`
+(`include_str!` sur `../../skills/bundled/<skill>/system_prompt.md` depuis un
+`#[cfg(test)] mod tests`).
+
+---
+
+## Fire-Disposition
+
+*(Exigée par le Fire-Disposition Gate — mika#1574,
+`docs/solutions/best-practices/fire-disposition-doctrine.md`. Ce plan livre
+trois détecteurs : le harnais F1-F7, la garde structurelle Rust de la phase 3,
+et — si l'on considère qu'un guard modifié est un détecteur livré — le
+`verify-pipeline.sh` de la phase 1. Cette section dit ce que chacun fait face au
+**préexistant**.)*
+
+> **Disposition retenue : option (a) — exception nommée, `allowlist : zéro
+> entrée`.** La vacuité est **mesurée, pas supposée** ; chaque mesure est
+> rejouable en une commande, et la seule par laquelle elle pourrait être fausse
+> est nommée puis fermée par un test (F7).
+
+### Les trois détecteurs et leur population préexistante
+
+| Détecteur | Ce sur quoi il tire | Préexistant, mesuré le 2026-09-20 sur `7c6f787b` |
+|---|---|---|
+| **F1-F7** (`scripts/verify-pipeline-test.sh`) | ses propres fixtures — dépôts jetables qu'il construit (`mktemp -d` + `git init`, l.26-28) | **néant par construction** : le harnais ne lit aucun fichier suivi du dépôt |
+| **Garde structurelle Rust** | un fichier, un bloc : Step 2B de `skills/bundled/qa-review/system_prompt.md` (l.204) | **zéro entrée** — voir ci-dessous |
+| **`verify-pipeline.sh` modifié** | les PR que la CI et QA font passer par lui | **aucune violation préexistante possible** — voir ci-dessous |
+
+### La garde structurelle — rouge aujourd'hui, verte à l'atterrissage, et c'est le cas nominal
+
+`grep -n "user.login" skills/bundled/qa-review/system_prompt.md` rend **vide** :
+la ligne 204 porte `{"pull_request":{"number":…,"labels":[…]}}` et rien d'autre.
+La garde serait donc rouge sur l'arbre d'aujourd'hui — et elle est verte à
+l'atterrissage parce que **la phase 2 du même PR ajoute le champ qu'elle
+asserte**. La population n'est pas « tolérée », elle est **mise en conformité
+par le même diff** ; il n'y a rien à mettre en allowlist, et y écrire une entrée
+poserait une ligne que rien ne pourrait plus faire rougir — strictement pire
+qu'une table vide.
+
+Cette rougeur pré-correctif n'est d'ailleurs pas un coût : c'est le **contrôle
+positif** de la garde, du même ordre que « F1 doit échouer avant la phase 1 » au
+contrat de vérification. Une garde qui serait déjà verte avant la phase 2
+n'attesterait rien.
+
+**Emplacement obligatoire de l'allowlist si elle cessait un jour d'être vide :**
+à l'intérieur du `#[cfg(test)] mod tests`, jamais dans un chemin que le
+chargeur de production consulte (doctrine mika#1574 § *When the allowlist is
+structural*).
+
+### Le guard modifié — l'exemption n'ajoute qu'une sortie 0, sauf sur un chemin, qui est fermé
+
+Les deux blocs de rejet (`verify-pipeline.sh` l.238-273) ne font
+qu'**incrémenter `ERRORS`** ; l'unique `exit 1` est en l.284-286, conditionné à
+`ERRORS > 0`. Court-circuiter ces blocs pour un auteur reconnu ne peut donc
+**que** retirer des erreurs : l'ensemble des PR qui passeraient de exit 0 à
+exit 1 est vide par construction, et aucune PR aujourd'hui verte ne devient
+rouge. Côté CI la population est vide pour une seconde raison, indépendante :
+`ci.yml:336` saute entièrement le job sur `dependabot/`, donc aucun run n'est
+même exécuté (R1 du contexte).
+
+**La seule exception, et c'est pourquoi F7 existe.** Le script tourne sous
+`set -euo pipefail` (l.88). Une résolution d'auteur écrite naïvement —
+`AUTHOR=$(jq -r '.pull_request.user.login' "$GITHUB_EVENT_PATH")` — **avorte le
+script** quand `jq` est absent ou quand le fichier est malformé, avec le code de
+sortie de `jq`. Une PR qui passe aujourd'hui sortirait alors non-zéro, que Step
+2C lit sans jugement comme `block[pipeline]` : le correctif produirait
+exactement le symptôme qu'il ferme. La résolution doit donc reprendre mot pour
+mot le motif défensif déjà employé deux lignes plus haut dans le même fichier
+(l.217 et l.230) : `… 2>/dev/null || echo ""`. R3 dit « fail-closed ⇒ aucune
+exemption » ; cette section précise que *fail-closed* signifie **poursuivre sans
+exempter**, jamais **avorter**. F7 et AC3 (« exit 1 », littéralement, et non
+« non-zéro ») en sont les deux pins.
+
+### Halte
+
+Si l'un des trois détecteurs tire sur du préexistant que cette section n'a pas
+prévu, **la résolution est de chercher l'écrivain, jamais d'ouvrir
+l'allowlist** : une entrée ajoutée pour faire passer un rouge inattendu
+aveugle précisément la classe que le détecteur existe pour tenir.
 
 ---
 
@@ -294,8 +380,12 @@ prédicat.
 - [ ] `verify-pipeline.sh` porte le quatrième mécanisme, fail-closed, documenté
       dans son en-tête.
 - [ ] Le JSON synthétique de Step 2B porte `user.login`.
-- [ ] F1-F6 écrits, F1 vérifié rouge avant le patch.
-- [ ] Garde structurelle sur la présence de `user.login` dans le prompt.
+- [ ] F1-F7 écrits, F1 vérifié rouge avant le patch.
+- [ ] La résolution d'auteur ne peut pas avorter le script sous `set -e` : motif
+      `2>/dev/null || echo ""` employé, F7 vert (voir `## Fire-Disposition`).
+- [ ] Garde structurelle sur la présence de `user.login` dans le prompt, placée
+      dans un `#[cfg(test)] mod tests`, vérifiée **rouge** sur l'arbre
+      pré-phase-2 (contrôle positif).
 - [ ] `cargo fmt` / `cargo clippy -D warnings` / `make verify-bundled-skills`
       verts.
 - [ ] Le corps de PR porte la rectification du diagnostic (R1-R4), pour que le
@@ -342,3 +432,46 @@ prédicat.
   dans son propre périmètre. Défaut réel, déjà nommé comme ticket de suivi,
   sans rapport avec celui-ci.
 - **Un lint de parité `ci.yml` ↔ script** : voir l'arbitrage assumé ci-dessus.
+
+---
+
+## Revision history
+
+- **rev 2 (2026-09-20)** — addressed F1 (BLOCKING : détecteurs livrés sans
+  section `## Fire-Disposition`, gate mika#1574) en ajoutant cette section
+  entre les phases d'implémentation et le contrat de vérification, sans
+  renuméroter ni réécrire aucune section existante. Option canonique **(a) —
+  exception nommée, `allowlist : zéro entrée`** retenue, comme le finding
+  l'indiquait, avec sa condition de disponibilité **mesurée plutôt que
+  supposée** (2026-09-20, `7c6f787b`) : le harnais `verify-pipeline-test.sh`
+  construit ses fixtures sous `mktemp -d` + `git init` (l.26-28) et ne lit
+  aucun fichier suivi ; `grep -n "user.login" skills/bundled/qa-review/system_prompt.md`
+  rend vide, donc la garde structurelle est rouge aujourd'hui et verte à
+  l'atterrissage parce que la phase 2 du même PR ajoute le champ qu'elle
+  asserte — ce qui fait de cette rougeur le **contrôle positif** de la garde,
+  non une population à tolérer. L'emplacement obligatoire de l'allowlist si
+  elle cessait d'être vide (`#[cfg(test)] mod tests`, jamais le chemin de
+  production) est nommé, ainsi que la halte : un rouge inattendu se traite en
+  cherchant l'écrivain, jamais en ouvrant l'allowlist.
+  La seconde moitié du finding — la disposition du **guard modifié lui-même**
+  vis-à-vis des PR préexistantes — est traitée nommément, et sa conclusion
+  (« aucune violation préexistante possible, l'exemption ne fait qu'ajouter un
+  chemin de sortie 0 ») est **vérifiée plutôt que reprise** : les deux blocs de
+  rejet (l.238-273) n'incrémentent que `ERRORS`, l'unique `exit 1` étant en
+  l.284-286. La vérification a trouvé **un** chemin par lequel la conclusion
+  serait fausse, et c'est le seul écart de fond à la lettre du finding : le
+  script tourne sous `set -euo pipefail` (l.88), donc une résolution d'auteur
+  écrite sans le motif défensif déjà employé aux l.217 et 230 avorterait le
+  script sur un `jq` absent ou un event malformé, faisant sortir non-zéro une
+  PR aujourd'hui verte — c'est-à-dire produisant le `block[pipeline]` que ce
+  plan ferme. Ce chemin est fermé par un test **F7** ajouté à la phase 3 et par
+  deux cases de DoD. Aucun AC n'est ajouté ni affaibli : AC3 pinne déjà le code
+  de sortie **1** (et non « non-zéro »), ce qui est exactement l'assertion
+  qu'exige ce chemin.
+  *Citations préservées : Fire-Disposition Gate / mika#1574 /
+  `docs/solutions/best-practices/fire-disposition-doctrine.md` ; précédents de
+  résolution mika#2423 et mika#2049.*
+- Aucun autre contenu modifié. Les neuf AC existants sont inchangés — la
+  disposition retenue est une contrainte d'implémentation, couverte par AC3
+  (fail-closed avec son code de sortie littéral) et AC6 (garde structurelle sur
+  la disparition du champ).
