@@ -1064,8 +1064,109 @@ Observabilité du budget effectif + garde de demi-configuration (mika#2293) :
   laisserait tout appelant authentifié forcer une skill en `always_on`) ; un override
   de modèle est borné au fournisseur configuré de l'agent et ne peut pas élargir la
   surface d'outils du tour, et c'est cette différence qui autorise l'un et pas
-  l'autre. Également hors périmètre : les tokens par run absents du `Task` (même
-  canal, autre mesure), et `mika chat`, in-process, où `--model` fonctionnait déjà.
+  l'autre. Également hors périmètre : les tokens par run absents du `Task` —
+  même canal, autre mesure, **fermée depuis par mika#1883** (entrée ci-dessous) —
+  et `mika chat`, in-process, où `--model` fonctionnait déjà.
+
+L'usage par tour est une somme, et le no-op des drapeaux de skill est dit (mika#1883) :
+- **Ce que la lecture du code a déplacé dans le ticket, et c'est le premier
+  livrable.** mika#1883 listait trois reports du thin-client mika#1727. Le point 3
+  (bookkeeping de session) était clos par mika#2070. Le point 1 (« canal de config
+  vers spirit ») était clos aux trois quarts : le canal **existe** — six clés
+  `mika.*` dans `crates/mika-a2a/src/params.rs` — et `--model` y était déjà livré
+  (mika#2304). Restaient l'usage par tour et un quart de point 1.
+- **Le canal `mika.*`, et le statut de chaque moitié.** `mika.caller_session_id`
+  (mika#2070) ; `mika.only_skills` (mika#2363, **soustractif**) ; `mika.model_override`
+  → `mika.effective_model` (mika#2304) ; `mika.session_isolated` →
+  `mika.session_isolated_applied` (mika#1951) ; et `mika.run_usage` (ce ticket).
+  `--model` : **livré**. `--enable-skill` : **refusé**, et la raison est écrite
+  dans le substrat plutôt que dans un corps de ticket — le doc-comment
+  d'`ONLY_SKILLS_KEY` (« *by subtraction only … can therefore never widen a turn's
+  surface, which is what makes it safe on an endpoint any authenticated caller can
+  reach* ») et `skills/bundled/_shared/dispatch-lib.sh` (« *it cannot activate
+  anything* ») ; mika#2363 n'est cité que comme provenance du changement.
+  `--disable-skill` : **non livré**, et ce n'est pas le même refus — retirer une
+  skill est soustractif, donc sûr. Il n'est pas livré parce que son usage mesuré
+  est **nul** (aucune invocation dans `skills/`, `scripts/`, `.claude/`, `crates/`
+  à HEAD `10ad8f8a`), que `--only-skill` couvre le besoin, et qu'une troisième
+  sémantique de sélection sur un tour est « une composition que personne ne veut
+  déboguer » — la phrase que `cli.rs` pose déjà sur `--only-skill`.
+- **Le branchement évident aurait rendu un chiffre faux, et c'est le cœur du
+  ticket.** `AgentOutput.usage` existait, et le serveur le tenait en main à
+  l'endroit exact où il écrit ses deux attestations. Mais `run_loop` **écrase**
+  `last_usage` à chaque itération : c'est l'usage du **dernier appel**. Un tour qui
+  consomme ses 20 pas d'outil fait 21 appels ; le brancher tel quel afficherait le
+  vingt-et-unième sous l'étiquette « usage par run » — un nombre plausible, présenté
+  avec autorité, qui sous-compte d'un ordre de grandeur. C'est le défaut de
+  mika#2304 transposé d'un champ. L'agrégat est donc sommé dans la boucle et
+  `AgentOutput.usage` garde son sens à côté.
+- **Un seul additionneur, deux sites, et un scan qui le tient.** `LlmUsage::accumulate`
+  (`mika-common`) est le seul site de fusion ; les deux appelants sont la boucle et
+  le pont max-steps. Le second **ajoute** `cont.usage` là où `usage` le **substitue**
+  (`cont.usage.or(usage)`) : les deux expressions coexistent et disent deux choses
+  différentes, ce que le commentaire du site dit explicitement — un relecteur qui
+  « harmonise » l'une vers l'autre casse celle qu'il déplace. Tester le helper
+  atteste que `None + Some(n) = Some(n)` ; ça n'atteste pas que les deux sites y
+  passent, et un second site écrit à la main rendrait un total faux **avec tous les
+  tests au vert**. D'où `mika1883_run_usage_accumulates_only_via_the_one_helper`,
+  scan de source à **allowlist vide** : quand il tire, on retire le second site, on
+  ne l'allowliste pas.
+- **Sémantique exacte de `mika.run_usage`.** Somme de **tous** les appels LLM **de
+  ce tour**, continuation comprise. **Jamais la campagne** : un tour qui appelle
+  `delegate_task` ou lance une équipe dépense sous des sessions `delegate-*` /
+  `team-*` qui lui sont propres, hors de ce total — même borne que
+  `mika.caller_session_id`. **RAW** : Anthropic rapporte l'entrée fraîche, les rails
+  OpenAI-compatibles rapportent `prompt_tokens` qui **inclut** `cache_read`
+  (Signal O) ; normaliser côté serveur créerait une seconde vérité divergente de
+  `turn_usage`. Lire le `model:` de la même sortie avant de comparer deux rails.
+- **Absence, jamais zéro — et l'asymétrie avec ses deux sœurs est délibérée.**
+  `mika.effective_model` et `mika.session_isolated_applied` sont écrites
+  **inconditionnellement**, parce qu'une absence y serait ambiguë entre « serveur
+  antérieur » et « rien n'a été demandé ». Celle-ci est une **mesure** : il n'y a
+  rien à demander, et sa seule absence légitime est « le tour n'a produit aucun
+  appel dont lire l'usage ». Un `0` affiché serait indistinguable d'un tour réel
+  (`request_bytes`, mika#2331 : *« `null` is never `0` »*). Ambiguïté résiduelle
+  assumée et nommée : un spirit antérieur et un tour non mesuré se lisent pareil —
+  les deux appellent la même conduite côté client, ne rien afficher.
+- **Deux surfaces, un lecteur.** `mika ask --verbose` et `mika ask --remote --verbose`
+  lisent `mika_a2a::params::attested_run_usage`. Un second décodage de la clé hors
+  de `params.rs` est refusé par `mika1883_both_client_surfaces_read_the_one_reader`
+  (modèle `mika2220_no_local_reparse_of_the_llm_bodies_env_var`). Le non-verbose est
+  **byte-identique** sur les deux surfaces et les deux formats.
+- **Hors périmètre, délibérément :** `message/stream` et `returnImmediately`, qui ne
+  produisent pas d'`AgentOutput` synchrone à lire et tombent dans la population
+  « non attesté », exactement comme pour `mika.effective_model` ; la moitié additive
+  du canal ; et la normalisation cache/prompt par famille de fournisseur.
+- **Surface opérateur.** `grep cli_skill_flag_inert $MIKA_SPIRIT_LOG_FILE` — non, ce
+  n'est pas là : l'avertissement est émis par le **process CLI**, donc sur **stderr**
+  de l'invocation et dans `~/.mika/agents/<name>/logs/mika.log.<date>` (§ Log Sinks).
+  **Régime attendu : zéro ligne** — l'usage mesuré est nul. Une ligne est un appelant
+  à migrer vers `--only-skill`, et c'est cette mesure, si elle cessait d'être vide,
+  qui rouvrirait la décision de ne pas livrer `--disable-skill` côté serveur.
+- **Sonde post-déploiement, et ses trois haltes.**
+  ```bash
+  mika ask --agent mika-arch --verbose --session-id "probe-1883-$$" "compte jusqu'à trois"
+  grep turn_usage "$MIKA_SPIRIT_LOG_FILE" | jq 'select(.session_id == "probe-1883-…")'
+  ```
+  La somme des `input_tokens` des lignes doit égaler le `tokens.input` affiché.
+  **Halte 1 — l'affiché est inférieur à la somme et proche d'une seule ligne :**
+  c'est `last_usage` qui est servi ; **ne pas ajuster l'affichage**, l'agrégat n'est
+  pas branché. **Halte 2 — rien n'est affiché alors que `turn_usage` porte des
+  lignes :** le spirit qui tourne est antérieur au champ (classe mika#2340) —
+  établir le déploiement avant de toucher au code, c'est précisément la population
+  que l'absence d'attestation rend visible. **Halte 3 — `input` déconcerte sur un
+  rail OpenAI-compatible :** il inclut `cache_read` par construction (Signal O), ce
+  n'est pas un bug ; lire le `model:` de la même sortie avant de conclure.
+- **Un remède du plan corrigé à l'implémentation.** Le plan prescrivait de remplacer
+  la consigne `mika ask --enable-skill skill-review` imprimée par
+  `crates/mika-cli/src/commands/skills_variants.rs` (`skills variants regen`) par
+  `--only-skill skill-review`. **Ça aurait posé une seconde consigne fausse** :
+  `apply_only_skills` est purement soustractif, et `skill-review` déclare
+  `keywords = []` avec `always_on = false` — il n'y a rien à *garder*, donc le tour
+  part avec zéro skill et sans l'outil `review_skill`. La commande n'est donc plus
+  imprimée du tout : la sortie nomme la **précondition** (la skill doit être active
+  sur l'agent), dit pourquoi `--enable-skill` est mort, et nomme `--only-skill` avec
+  son vrai statut plutôt qu'en prescription.
 
 Lire une coupure au plafond (mika#2280) :
 - **Ce que ça distingue.** `LLM response body read failed mid-stream` (32/jour le

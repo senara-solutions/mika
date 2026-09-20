@@ -1096,15 +1096,17 @@ Built-in skill `always_on` preferences are stored in the SQLite `skill_overrides
 2. For built-in skills, `always_on` changes are written to the DB via `set_skill_override()`
 3. For custom/marketplace skills, `always_on` is written to `skill.toml` as before
 4. After `scan_skills_dir()` loads manifests from disk, `SkillRegistry::apply_overrides()` applies DB overrides
-5. Optionally, `apply_transient_disable()` and `apply_transient_always_on()` apply CLI `--disable-skill` / `--enable-skill` overrides (runtime-only, not persisted)
+5. Optionally, `apply_transient_disable()` and `apply_transient_always_on()` apply per-invocation overrides (runtime-only, not persisted). Both are **server-side primitives today** — see the CLI note below for which flags still reach them
 6. Setting `always_on` back to the bundled default automatically deletes the override row (prevents stale overrides from blocking future bundled default changes)
 7. `delete_skill` and `mika skills uninstall` clean up override rows
 
-**CLI transient override:**
+**CLI per-invocation skill selection:**
 
-`mika ask --enable-skill <name>` forces a skill to `always_on` for a single invocation without touching the database. Repeatable for multiple skills: `--enable-skill self-dev --enable-skill qa-review`. Cannot resurrect disabled or skipped skills — emits a warning instead.
+`mika ask --only-skill <name>` restricts the invocation to the named skill(s), evicting every other one for that turn. Repeatable. **It is the only selection flag that reaches the execution surface**: it travels to mika-spirit in `message/send` request metadata under `mika.only_skills` (mika#2363), and the server applies it via `apply_only_skills()` → `apply_transient_disable()`. Strictly subtractive — it can evict a skill, never activate one, which is what makes it safe on an endpoint any authenticated caller can reach. Naming a skill that is neither `always_on` nor keyword-triggered therefore keeps nothing.
 
-`mika ask --disable-skill <name>` transiently evicts a skill from the registry for a single invocation. Repeatable for multiple skills: `--disable-skill self-dev --disable-skill qa-review`. Useful for interactive sessions where an `always_on` skill is not needed. A skill cannot appear in both `--enable-skill` and `--disable-skill` in the same invocation (hard error).
+`mika ask --enable-skill <name>` and `mika ask --disable-skill <name>` **no longer affect the turn.** Since mika#1727 `mika ask` is a thin client: it ships the prompt to the local mika-spirit daemon over A2A and renders the returned `Task`, so a flag that mutates this process's own `SkillRegistry` mutates a registry nobody runs against. Their arg-level validation is preserved (a skill named in both is still a hard error), and since mika#1883 an invocation that passes either one gets a `cli_skill_flag_inert` **warning on stderr** naming the skills, the inertia, and `--only-skill` as the gesture that does reach the server. `--format json` output is unchanged, so parsers are unaffected.
+
+The additive half of that config channel — `--enable-skill` reaching `apply_transient_always_on()` server-side — is deliberately **not** built: it would let any authenticated caller of `/a2a/{agent}` force one of the agent's skills to `always_on` (mika#2363). `--disable-skill` is subtractive and would be safe, but was not built either: its measured usage is zero, `--only-skill` already covers the need, and three selection semantics on one turn is a composition nobody wants to debug.
 
 **Viewing overrides:**
 

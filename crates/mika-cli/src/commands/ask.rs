@@ -110,6 +110,45 @@ fn pending_callbacks_notice(count: usize) -> String {
     )
 }
 
+/// What to say when `--enable-skill` / `--disable-skill` were passed to an
+/// invocation that cannot apply them (mika#1883).
+///
+/// `None` when neither flag was used — an invocation that asked for nothing is
+/// told nothing, and a notice on every turn would bury the one that matters.
+///
+/// The text names three things, and the third is the one that makes it
+/// actionable: the skills concerned, the fact that the turn executes at
+/// mika-spirit where these flags do not travel, and **the gesture that does
+/// work** — `--only-skill`. A refusal (or a warning) that does not name its own
+/// lifting is one that gets worked around by guesswork; that rule was written
+/// for gate 2c of mika#2279 and applies here unchanged.
+///
+/// Expected regime is **zero** of these: the measured usage across `skills/`,
+/// `scripts/`, `.claude/` and `crates/` at HEAD `10ad8f8a` is no invocation at
+/// all. A line is therefore a caller to migrate — and the count is the
+/// measurement that would one day reopen the decision not to build the
+/// subtractive half of this channel server-side.
+fn inert_skill_flag_notice(enable_skill: &[String], disable_skill: &[String]) -> Option<String> {
+    if enable_skill.is_empty() && disable_skill.is_empty() {
+        return None;
+    }
+    let mut named: Vec<String> = Vec::new();
+    for name in enable_skill {
+        named.push(format!("--enable-skill {name}"));
+    }
+    for name in disable_skill {
+        named.push(format!("--disable-skill {name}"));
+    }
+    Some(format!(
+        "{} had no effect: this turn runs at mika-spirit, and these flags \
+         configure only the local skill registry, which is no longer the \
+         execution surface (mika#1727). To restrict a turn's skills on the \
+         server, use --only-skill <name>; there is no server-side equivalent \
+         for forcing a skill on.",
+        named.join(", ")
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     message: &str,
@@ -355,15 +394,27 @@ pub async fn run(
     // MCP, and per-run token accounting; this process is now a thin client that
     // ships the prompt and renders the returned Task.
     //
-    // Deferred follow-ups (flagged for MPC review, out of scope for this slice):
-    //   * `--enable-skill` / `--disable-skill` configure the *local* registry,
-    //     which is no longer the execution surface. Their arg-level validation is
-    //     preserved, but they do not yet reach spirit — that needs the additive
-    //     half of the config channel, deliberately still deferred (see below).
-    //   * per-run token usage (verbose `tokens.*`) is not carried by the A2A
-    //     `Task`, so it degrades to absent until threaded through the protocol.
+    // mika#1883 closed the last two deferrals this block used to list, and the
+    // list is gone with them: a follow-up note must not outlive its own
+    // resolution (the rule mika#2070 applied to the third one).
     //
-    // Resolved (mika#2304): `--model` used to sit in that first bullet, and its
+    // Resolved (mika#1883), per-run token usage: the `Task` now carries the
+    // turn's **total** under `mika.run_usage`, so `--verbose` reports `tokens.*`
+    // again. The obvious wiring — forwarding `AgentOutput.usage` — was refused
+    // because that field is the *last* call's (the loop overwrites it at every
+    // step), so a twenty-step turn would have reported one call in twenty-one
+    // under the label "per-run usage". The aggregate is summed in the loop
+    // instead, continuation included.
+    //
+    // Settled (mika#1883), `--enable-skill` / `--disable-skill`: they are inert
+    // and stay inert, and the invocation now **says so** on stderr rather than
+    // looking accepted. The additive half of the config channel keeps the refusal
+    // below; the subtractive half is not built for `--disable-skill` either,
+    // because `--only-skill` already covers the measured need and a third
+    // selection semantic on one turn is a composition nobody wants to debug —
+    // the reason `cli.rs` already states on `--only-skill` itself.
+    //
+    // Resolved (mika#2304): `--model` used to sit in that list, and its
     // presence there was measured as a false green rather than a missing feature.
     // It reached the *local* `Settings`, which the verbose envelope below then
     // read and printed — so `--verbose` asserted the override with full authority
@@ -398,6 +449,21 @@ pub async fn run(
                 "Cannot both enable and disable skill '{enable_name}' in the same invocation"
             );
         }
+    }
+
+    // mika#1883 — say the no-op out loud. The two flags above configure the
+    // *local* registry, which since mika#1727 is not where the turn runs, so
+    // they are validated and then abandoned in transit. Until now that happened
+    // in silence: the invocation looked accepted and the turn ran unrestricted,
+    // which is the shape of false green this ticket's sibling field exists to
+    // remove one measurement over.
+    //
+    // A warning and not a refusal, and the asymmetry is measured: an unapplied
+    // skill restriction makes a turn *wider*, which is visible and falsifies no
+    // measurement — the same reason `mika.only_skills` is fail-soft where
+    // `mika.model_override` is fail-closed.
+    if let Some(notice) = inert_skill_flag_notice(enable_skill, disable_skill) {
+        tracing::warn!(event = "cli_skill_flag_inert", "{notice}");
     }
 
     let started = std::time::Instant::now();
@@ -504,6 +570,19 @@ pub async fn run(
     // a turn it did not run, and the precise shape of the false green mika#2304
     // measured on the `model:` line.
     let isolated_attested = mika_cli::remote_ask::attested_session_isolation(&task);
+    // mika#1883, same rule and same reader as the two fields above: the token
+    // counts shown are the ones the server attested for the whole turn, read
+    // through `mika-a2a`'s single decoder so `--remote` and this path cannot
+    // answer the same question differently. `None` means the server attested
+    // nothing (a spirit older than mika#1883, or a turn that made no call whose
+    // usage could be read), and the honest rendering of that is no `tokens.*`
+    // line at all — never a zero, which is indistinguishable from a real turn.
+    let tokens_attested = mika_cli::remote_ask::attested_run_usage(&task).map(|u| TokensMetadata {
+        input: Some(u.input),
+        output: Some(u.output),
+        cache_read: u.cache_read,
+        cache_write: u.cache_write,
+    });
 
     let envelope = MetadataEnvelope {
         // Unconditional fields — present whenever the CLI flag was provided
@@ -523,12 +602,11 @@ pub async fn run(
             None
         },
         latency_ms: if verbose { Some(elapsed_ms) } else { None },
-        // #1727: per-run token usage is not carried by the A2A `Task` returned by
-        // `message/send`, so verbose `tokens.*` degrades to absent until threaded
-        // through the protocol. mika-spirit records usage server-side in the
-        // meantime. `TokensMetadata` is retained (constructed in tests + a future
-        // slice) so the JSON envelope shape stays stable for consumers.
-        tokens: None,
+        // mika#1883: the `Task` now carries the turn's total under
+        // `mika.run_usage`, so verbose `tokens.*` reports a measured sum again
+        // — of every call of this turn, continuation included, and never of the
+        // last one alone.
+        tokens: if verbose { tokens_attested } else { None },
     };
 
     // Emit None when all fields are absent so the top-level `metadata` key
@@ -1218,6 +1296,82 @@ mod tests {
             source.contains("attested_session_isolation(&task)"),
             "the envelope must be fed by the server's attestation on the Task"
         );
+    }
+
+    /// **AC6** — the two inert flags are said out loud, and never on stdout.
+    ///
+    /// Three properties in one test because they are one contract: the notice
+    /// exists only when a flag was passed, it names the working gesture, and it
+    /// leaves stdout alone.
+    ///
+    /// The stdout half is asserted **structurally**, on this file's own source.
+    /// A behavioural test cannot see it: moving the notice from `warn!` to
+    /// `println!` would make every assertion about its *content* stay green
+    /// while `mika ask --format json` stopped being parseable — the silent class
+    /// this repo answers with a scan wherever it meets it. The predicate is on
+    /// the notice's own identifier, which is the only thing the regression can
+    /// hand to a stdout writer.
+    #[test]
+    fn mika1883_the_inert_skill_flags_warn_on_stderr_only() {
+        // Nothing passed, nothing said: a notice on every invocation would bury
+        // the one that matters.
+        assert!(inert_skill_flag_notice(&[], &[]).is_none());
+
+        let notice = inert_skill_flag_notice(
+            &["qa-review".to_string()],
+            &["self-dev".to_string(), "dev-pilot".to_string()],
+        )
+        .expect("a flag was passed, so the inertia must be stated");
+
+        for named in [
+            "--enable-skill qa-review",
+            "--disable-skill self-dev",
+            "--disable-skill dev-pilot",
+        ] {
+            assert!(notice.contains(named), "{named} unnamed in: {notice}");
+        }
+        assert!(
+            notice.contains("mika-spirit"),
+            "the notice must say WHERE the turn runs, or the operator cannot act \
+             on it: {notice}"
+        );
+        assert!(
+            notice.contains("--only-skill"),
+            "a refusal that does not name its own lifting is one that gets worked \
+             around by guesswork (mika#2279 gate 2c): {notice}"
+        );
+
+        // Either flag alone is enough — the two are independent.
+        assert!(inert_skill_flag_notice(&["x".to_string()], &[]).is_some());
+        assert!(inert_skill_flag_notice(&[], &["y".to_string()]).is_some());
+
+        // Structural half: the notice never reaches a stdout writer.
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let this_file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("commands")
+            .join("ask.rs");
+        let production = scanner.production_of(&this_file);
+        // Assembled at runtime so this guard's own source is not its first
+        // offender (mika#2220's rule).
+        let stdout_writers = ["print".to_string() + "ln!", "print".to_string() + "!"];
+        for (i, line) in production.lines().enumerate() {
+            if !line.contains("inert_skill_flag_notice") {
+                continue;
+            }
+            for writer in &stdout_writers {
+                assert!(
+                    !line.contains(writer.as_str()),
+                    "mika#1883 — the inert-flag notice reaches stdout at ask.rs:{}: {}\n\
+                     It must stay on `tracing::warn!`: `--format json` is parsed by \
+                     `_arch_ask` and every scripted caller, and one extra stdout line \
+                     breaks a wire contract for a message of convenience.",
+                    i + 1,
+                    line.trim()
+                );
+            }
+        }
     }
 
     #[test]

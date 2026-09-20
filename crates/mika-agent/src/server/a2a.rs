@@ -18,8 +18,8 @@ use mika_a2a::jsonrpc::{
 };
 use mika_a2a::params::{
     CALLER_SESSION_ID_KEY, EFFECTIVE_MODEL_KEY, MODEL_OVERRIDE_KEY, MessageSendParams,
-    ONLY_SKILLS_KEY, SESSION_ISOLATED_APPLIED_KEY, SESSION_ISOLATED_KEY, TaskIdParams,
-    TaskQueryParams,
+    ONLY_SKILLS_KEY, RUN_USAGE_KEY, RunUsage, SESSION_ISOLATED_APPLIED_KEY, SESSION_ISOLATED_KEY,
+    TaskIdParams, TaskQueryParams,
 };
 use mika_a2a::state_machine::TaskStateMachine;
 use mika_a2a::streaming::{StreamEvent, TaskStatusUpdateEvent};
@@ -361,6 +361,11 @@ async fn run_a2a_agent(
     match agent::run_agent(&params).await {
         Ok(output) => Ok(A2aTurn {
             text: output.text,
+            // mika#1883: the turn's total, taken from the loop's own report for
+            // the same reason as the two fields around it — it exists only in
+            // this process's hand, and the Task rebuilt from the database does
+            // not carry it. Never `output.usage`, which is the last call.
+            run_usage: output.run_usage,
             // mika#2304 D3: taken from the loop's own report, never recomputed
             // here. This function knows the provider it handed *in*;
             // `agent_loop` may substitute a per-skill one downstream, and an
@@ -383,6 +388,12 @@ struct A2aTurn {
     text: Option<String>,
     /// The model that actually served, `provider/model` (mika#2304).
     effective_model: Option<String>,
+    /// Sum of every LLM call of the turn (mika#1883).
+    ///
+    /// The third field, and the doc comment above says why the struct is not a
+    /// tuple: a third member is exactly as easy to drop in silence as the
+    /// second was.
+    run_usage: Option<mika_common::llm::LlmUsage>,
 }
 
 /// Extract the caller's session id from `message/send` request metadata
@@ -646,6 +657,47 @@ fn stamp_effective_model(task: &mut Task, effective_model: Option<&str>) {
             EFFECTIVE_MODEL_KEY.to_string(),
             serde_json::Value::String(model.to_string()),
         );
+}
+
+/// Stamp the turn's **total** token usage onto the Task the caller receives
+/// (mika#1883).
+///
+/// Third sibling of [`stamp_effective_model`] and [`stamp_session_isolation`],
+/// at the same intervention point and for the same reason: `task` is already
+/// `mut` there, `a2a_build_task` is upstream, and nothing downstream can
+/// overwrite the field.
+///
+/// **Unlike its two siblings it is NOT written unconditionally, and that
+/// asymmetry is deliberate.** They are the answer to a flag, so an absence would
+/// be ambiguous between "this server is old" and "nothing was asked for", and
+/// the client's whole basis for refusing to print a local value would collapse.
+/// This one is a *measurement*: there is no flag to answer, and its only
+/// legitimate absence is "the turn produced no call whose usage could be read".
+/// Writing a zero there would be indistinguishable from a real turn — the same
+/// reasoning `llm_calls.request_bytes` carries (mika#2331: *"`null` is never
+/// `0`"*), transposed. The residual ambiguity — a pre-mika#1883 server and an
+/// unmeasured turn read alike — is accepted because both call for the same
+/// client conduct: show nothing.
+fn stamp_run_usage(task: &mut Task, run_usage: Option<&mika_common::llm::LlmUsage>) {
+    let Some(usage) = run_usage else {
+        return;
+    };
+    let wire = RunUsage {
+        input: usage.input_tokens,
+        output: usage.output_tokens,
+        // Absent stays absent across the boundary: `Some(0)` here would claim a
+        // provider reported a zero it never reported.
+        cache_read: usage.cache_read_input_tokens,
+        cache_write: usage.cache_creation_input_tokens,
+    };
+    let Ok(value) = serde_json::to_value(wire) else {
+        // A four-integer struct cannot fail to serialize; if it ever did, the
+        // honest outcome is *not attested* rather than a half-written object.
+        return;
+    };
+    task.metadata
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(RUN_USAGE_KEY.to_string(), value);
 }
 
 /// Refuse a request that could not get the agent lock, and make the refusal
@@ -1116,6 +1168,9 @@ async fn handle_message_send(
         // — it exists only in this process's hand, and the Task rebuilt from the
         // database does not carry it.
         let mut effective_model: Option<String> = None;
+        // mika#1883: same trajectory, same reason — the per-turn total lives
+        // only in this process's hand.
+        let mut run_usage: Option<mika_common::llm::LlmUsage> = None;
 
         let turn_text = match run_a2a_agent(
             state,
@@ -1140,6 +1195,7 @@ async fn handle_message_send(
 
                 info!(task_id = %task_id, "A2A task completed via agent loop");
                 effective_model = turn.effective_model;
+                run_usage = turn.run_usage;
                 TurnText::Produced(turn.text)
             }
             Err(e) => {
@@ -1184,6 +1240,10 @@ async fn handle_message_send(
                 // the caller sent — and the two are the same only because the
                 // refusal above made every other reading impossible.
                 stamp_session_isolation(&mut task, session_isolated);
+                // mika#1883: same intervention point, third field. Silent when
+                // the turn produced no readable usage — see `stamp_run_usage`
+                // for why this one, unlike its two siblings, is conditional.
+                stamp_run_usage(&mut task, run_usage.as_ref());
                 let result = serde_json::to_value(&task).unwrap_or_default();
                 Json(JsonRpcResponse::success(request.id, result)).into_response()
             }

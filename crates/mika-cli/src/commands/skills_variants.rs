@@ -506,12 +506,38 @@ fn run_promote(skills_dir: &Path, name: &str, variant_spec: &str) -> Result<()> 
     Ok(())
 }
 
+/// Print the gesture that regenerates a variant.
+///
+/// # Why this no longer prints a command (mika#1883)
+///
+/// It used to print `mika ask --enable-skill skill-review "…"`, and that
+/// instruction has been inert since mika#1727: `mika ask` is a thin client, the
+/// turn runs at mika-spirit, and `--enable-skill` configures only the local
+/// registry. Of the four surfaces still describing that flag as working, this
+/// was the costly one — the other three are documentation one may not read,
+/// while this is a directive the tool itself prints at the moment the operator
+/// needs it, producing a turn that never activates `skill-review` and says
+/// nothing about it.
+///
+/// **`--only-skill` is not the substitute, and pretending otherwise would just
+/// move the false instruction.** It is the one selection flag that reaches the
+/// server, but it is strictly subtractive (mika#2363) — and `skill-review`
+/// declares `keywords = []` with `always_on = false`, so there is nothing for a
+/// subtractive flag to keep. Naming the precondition instead of a command is
+/// the only formulation that is true today.
 fn run_regen(name: &str, variant_spec: &str) -> Result<()> {
     let (provider, model) = parse_variant_spec(variant_spec)?;
 
-    println!("\n  To regenerate the variant for '{name}' targeting {provider}/{model}, run:\n");
     println!(
-        "    mika ask --enable-skill skill-review \"review and generate variant for {name} targeting {provider}/{model}\"\n"
+        "\n  To regenerate the variant for '{name}' targeting {provider}/{model}, send this\n  prompt to an agent on which the `skill-review` skill is active:\n"
+    );
+    println!("    review and generate variant for {name} targeting {provider}/{model}\n");
+    println!(
+        "  Note: `mika ask --enable-skill skill-review` no longer does this. Since mika#1727\n  \
+         the turn runs at mika-spirit and that flag configures only the local registry.\n  \
+         `--only-skill` is the one selection flag that does reach the server, but it is\n  \
+         strictly subtractive and `skill-review` is neither always-on nor keyword-triggered,\n  \
+         so it cannot activate it either — the skill has to be active on the agent first.\n"
     );
     Ok(())
 }

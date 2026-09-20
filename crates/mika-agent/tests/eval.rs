@@ -118,6 +118,9 @@ mod eval {
     // par l'appelant l'emporte sur la section `[llm]` d'une skill.
     mod test_model_attestation_2304;
     mod test_multi_agent_harness_witness;
+    // mika#1883 — l'usage par tour est une SOMME : un tour à trois appels aux
+    // usages distincts, la continuation max-steps ajoutée et non substituée, et
+    // un tour non mesuré qui n'atteste rien plutôt qu'un zéro.
     mod test_multi_step;
     mod test_multi_turn_persistence;
     mod test_per_corpus_fairness_927;
@@ -126,6 +129,7 @@ mod eval {
     mod test_phantom_retry_guard;
     mod test_phantom_task_row_sweep;
     mod test_pilot_silent_stall_reaper;
+    mod test_run_usage_aggregate_1883;
 
     // mika#2237 — le mapping verdict → flag de `gh pr review`, vérifié avant le
     // sous-processus. Chemin de production déterministe (MockLlmProvider) pour
