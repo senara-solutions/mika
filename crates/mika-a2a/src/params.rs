@@ -146,6 +146,101 @@ pub const SESSION_ISOLATED_KEY: &str = "mika.session_isolated";
 /// every path outside synchronous `message/send` all land there.
 pub const SESSION_ISOLATED_APPLIED_KEY: &str = "mika.session_isolated_applied";
 
+/// Response-metadata key carrying the token usage of the **whole turn**
+/// (mika#1883).
+///
+/// Written by the server on [`Task::metadata`] when the turn produced at least
+/// one LLM call whose usage it could read. Read by `mika ask --verbose` and by
+/// `mika ask --remote --verbose`, which render it as `tokens.*`.
+///
+/// # What "the turn" means, exactly
+///
+/// The **sum** of every LLM call this turn made — the step loop plus the
+/// max-steps continuation call — not the last one. That distinction is the
+/// whole reason the field exists: `AgentOutput.usage` carries the usage of the
+/// *last* call (the loop overwrites it at each step), so a turn that spends its
+/// twenty tool steps makes twenty-one calls and would report the twenty-first
+/// under the label "per-run usage" — a plausible number, presented with
+/// authority, that undercounts massively. That is mika#2304's defect transposed
+/// one field over.
+///
+/// It does **not** include what the turn fanned out: a `delegate_task` or a team
+/// run spends under `delegate-*` / `team-*` sessions of its own. This is the
+/// turn, never the campaign — the same bound `mika ask` already documents for
+/// [`CALLER_SESSION_ID_KEY`].
+///
+/// # RAW, never normalised
+///
+/// `input` is whatever the provider reported. Anthropic reports fresh input;
+/// the OpenAI-compatible rails report `prompt_tokens`, which **includes**
+/// `cache_read`. Normalising server-side would create a second truth diverging
+/// from the `turn_usage` log stream, which is RAW by an explicit decision
+/// (mika#1889). Read `mika.effective_model` from the same Task before comparing
+/// two numbers across rails.
+///
+/// # Absence, never a zero
+///
+/// The key is **omitted** when the turn produced no usage to read. A rendered
+/// `0` would be indistinguishable from a real turn and would assert a
+/// measurement that did not happen — the same reasoning `llm_calls`'
+/// `request_bytes` carries (mika#2331: *"`null` is never `0`"*). Unlike
+/// [`EFFECTIVE_MODEL_KEY`] and [`SESSION_ISOLATED_APPLIED_KEY`], it is therefore
+/// **not** written unconditionally: those two are the answer to a flag, where an
+/// absence would be ambiguous between "this server is old" and "nothing was
+/// asked for", while this one is a measurement whose only legitimate absence is
+/// "there was nothing to measure". The residual ambiguity — a pre-mika#1883
+/// server and an unmeasured turn read alike — is accepted and named: both call
+/// for the same client conduct, showing nothing.
+///
+/// The spelling is the wire contract between `mika-cli` and `mika-agent`, which
+/// share no dependency edge of their own — it lives here, in the crate that owns
+/// [`MessageSendParams`], so neither side can rename it alone.
+pub const RUN_USAGE_KEY: &str = "mika.run_usage";
+
+/// Token usage of one whole turn, as it travels on [`RUN_USAGE_KEY`].
+///
+/// One object rather than four flat `mika.*` keys: the client renders the four
+/// numbers as a group (`tokens.input`, `tokens.output`, …), and a family of four
+/// keys for a single measurement would crowd a namespace shared by five
+/// unrelated features.
+///
+/// The two cache fields are absent when the provider reported none — see
+/// [`RUN_USAGE_KEY`] on why absence is never encoded as zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunUsage {
+    pub input: u64,
+    pub output: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<u64>,
+}
+
+/// Read the per-turn usage a server attested for a finished [`Task`]
+/// (mika#1883).
+///
+/// The third sibling of [`attested_model`] and [`attested_session_isolation`],
+/// and it lives beside them for the reason their doc comments give: both client
+/// surfaces must read the same field the same way, or `mika ask --verbose` and
+/// `mika ask --remote --verbose` answer the same question differently.
+///
+/// Every malformed shape — no metadata, key absent, `null`, not an object, a
+/// missing or non-integer `input`/`output`, a negative number — reads as *not
+/// attested*, which the caller must render as **absence of the `tokens.*`
+/// lines**, never as a zero. A cache field that is present but unreadable is
+/// dropped on its own rather than discarding the whole reading: the two totals
+/// are still true, and losing them to a malformed optional would be a worse
+/// answer than losing the optional.
+pub fn attested_run_usage(task: &Task) -> Option<RunUsage> {
+    let value = task.metadata.as_ref()?.get(RUN_USAGE_KEY)?.as_object()?;
+    Some(RunUsage {
+        input: value.get("input")?.as_u64()?,
+        output: value.get("output")?.as_u64()?,
+        cache_read: value.get("cache_read").and_then(serde_json::Value::as_u64),
+        cache_write: value.get("cache_write").and_then(serde_json::Value::as_u64),
+    })
+}
+
 /// Read the session isolation a server attested for a finished [`Task`]
 /// (mika#1951).
 ///
@@ -262,6 +357,14 @@ mod tests {
     }
 
     #[test]
+    fn run_usage_key_is_the_wire_spelling() {
+        // mika#1883. Third response key of the family, same contract: the CLI
+        // reads it and the agent writes it, with no dependency edge between
+        // them for a rename to travel along.
+        assert_eq!(RUN_USAGE_KEY, "mika.run_usage");
+    }
+
+    #[test]
     fn every_key_of_the_family_is_distinct() {
         // A copy-paste that collapsed two of them would make one flag silently
         // carry another's payload, and every per-key test would still pass.
@@ -276,6 +379,7 @@ mod tests {
             EFFECTIVE_MODEL_KEY,
             SESSION_ISOLATED_KEY,
             SESSION_ISOLATED_APPLIED_KEY,
+            RUN_USAGE_KEY,
         ];
         let unique: std::collections::HashSet<&str> = keys.iter().copied().collect();
         assert_eq!(
@@ -353,6 +457,85 @@ mod tests {
             })));
             assert_eq!(attested_session_isolation(&task), Some(declared));
         }
+    }
+
+    /// mika#1883 — a Task the server attested reads back verbatim, and the two
+    /// cache fields are optional independently of the two totals.
+    #[test]
+    fn attested_run_usage_reads_the_servers_value() {
+        let task = task_with_metadata(Some(serde_json::json!({
+            RUN_USAGE_KEY: {"input": 41_000, "output": 900, "cache_read": 38_000, "cache_write": 12},
+        })));
+        assert_eq!(
+            attested_run_usage(&task),
+            Some(RunUsage {
+                input: 41_000,
+                output: 900,
+                cache_read: Some(38_000),
+                cache_write: Some(12),
+            })
+        );
+
+        // A provider that reports no cache at all still attests its two totals.
+        let no_cache = task_with_metadata(Some(serde_json::json!({
+            RUN_USAGE_KEY: {"input": 10, "output": 2},
+        })));
+        assert_eq!(
+            attested_run_usage(&no_cache),
+            Some(RunUsage {
+                input: 10,
+                output: 2,
+                cache_read: None,
+                cache_write: None,
+            })
+        );
+    }
+
+    /// mika#1883 — every unreadable shape is *not attested*, which the caller
+    /// must render as no `tokens.*` line at all.
+    ///
+    /// A zero is in the list deliberately as a **positive** case, one assertion
+    /// down: `{"input": 0, "output": 0}` is a server saying it measured zero,
+    /// which is a different statement from a server saying nothing, and only
+    /// the *absence* of the key may render as absence.
+    #[test]
+    fn every_unreadable_run_usage_shape_reads_as_not_attested() {
+        assert_eq!(attested_run_usage(&task_with_metadata(None)), None);
+        for shape in [
+            serde_json::json!({}),
+            serde_json::json!({ RUN_USAGE_KEY: serde_json::Value::Null }),
+            serde_json::json!({ RUN_USAGE_KEY: 42 }),
+            serde_json::json!({ RUN_USAGE_KEY: "41000" }),
+            serde_json::json!({ RUN_USAGE_KEY: [1, 2] }),
+            // Half an answer is not an answer: a total missing its sibling
+            // cannot be rendered without inventing the other.
+            serde_json::json!({ RUN_USAGE_KEY: {"input": 10} }),
+            serde_json::json!({ RUN_USAGE_KEY: {"output": 10} }),
+            // A negative or fractional count is not a token count.
+            serde_json::json!({ RUN_USAGE_KEY: {"input": -1, "output": 2} }),
+            serde_json::json!({ RUN_USAGE_KEY: {"input": 1.5, "output": 2} }),
+        ] {
+            assert_eq!(
+                attested_run_usage(&task_with_metadata(Some(shape.clone()))),
+                None,
+                "shape {shape} should read as not attested"
+            );
+        }
+
+        // A malformed *optional* drops on its own — the two totals are still
+        // true, and losing them to a bad cache field would be the worse answer.
+        let bad_cache = task_with_metadata(Some(serde_json::json!({
+            RUN_USAGE_KEY: {"input": 10, "output": 2, "cache_read": "lots"},
+        })));
+        assert_eq!(
+            attested_run_usage(&bad_cache),
+            Some(RunUsage {
+                input: 10,
+                output: 2,
+                cache_read: None,
+                cache_write: None,
+            })
+        );
     }
 
     /// mika#1951 U3 — every unreadable shape is absence, never the caller's flag.
