@@ -1,0 +1,1405 @@
+diff --git a/docs/plans/2026-09-19-002-fix-2306-la-section-fire-disposition-a-un-site-de-production-plan.md b/docs/plans/2026-09-19-002-fix-2306-la-section-fire-disposition-a-un-site-de-production-plan.md
+new file mode 100644
+index 00000000..12b5df61
+--- /dev/null
++++ b/docs/plans/2026-09-19-002-fix-2306-la-section-fire-disposition-a-un-site-de-production-plan.md
+@@ -0,0 +1,601 @@
++# mika#2306 — La section `## Fire-Disposition` a un site de production
++
++**Ticket :** mika issue#2306
++**Type :** fix (substrat de la boucle de grooming)
++**Date :** 2026-09-19
++
++---
++
++## Problème
++
++Le ticket énonce : « les plans groomés par le moteur peuvent ne PAS contenir la
++section `## Fire-Disposition` que mika#1574 exige ; mika-arch ESCALATE alors à
++juste titre — et la porte de dispatch ne voit jamais `Outcome: PLAN_GROOMED` ».
++
++C'est exact, et la mesure déplace le diagnostic d'un cran : **le défaut n'est pas
++que la section manque, c'est que son absence brûle l'unique itération de la
++boucle, sur un motif purement formel et parfaitement évitable en amont.**
++
++### Trois maillons, mesurés
++
++**M1 — Le producteur ne l'émet pas, et c'est un fait déjà écrit dans ce dépôt.**
++`/ce:plan` est un plugin tiers (`compound-engineering`) qui n'a aucune
++connaissance de mika#1574. Ce n'est pas une hypothèse : le Acceptance-Criteria
++Gate de `mika-arch-groom-ticket/system_prompt.md` énonce déjà le raisonnement
++**mot pour mot** pour la section sœur —
++
++> `/ce:plan` (the third-party `compound-engineering` marketplace plugin) does not
++> produce that section […] Guaranteeing the section here, at groom time, is what
++> prevents the mika#1531/#1533/#1557/#1558 `block[pipeline]` failure class.
++> **Grooming is the surface we control between the third-party producer and our
++> validator.**
++
++`## Acceptance criteria` a reçu ce traitement (mika#1600/#1627).
++`## Fire-Disposition` ne l'a jamais reçu.
++
++**M2 — Aucune commande de groom ne prescrit la section.** Mesure exhaustive sur
++les trois commandes du pipeline :
++
++| Commande | `## Acceptance criteria` | `## Fire-Disposition` |
++|---|---|---|
++| `/mika-groom-plan-only` (boucle autonome) | **étape 5b**, explicite | **absente** |
++| `/mika-groom-ticket` (opérateur) | — | **absente** |
++| `/mika-revise-plan` (branche ITERATE) | mentionnée (« honor existing AC ») | **absente** |
++
++`grep -n "Fire-Disposition" .claude/commands/*.md` → **zéro occurrence.**
++
++**M3 — La boucle n'a qu'un seul ITERATE, et le revise ne vérifie pas ce qu'il a
++révisé.** `_iterate_groom_loop` (`dispatch-lib.sh`) est un automate à deux passes
++strictes :
++
++```
++first-pass READY    → second-pass → GROOMED | ESCALATE
++first-pass ITERATE  → _launch_revise_pilot (1×) → second-pass → GROOMED | ESCALATE
++first-pass ESCALATE → mort
++```
++
++Le gate second-passe est sans recours, et il le dit :
++
++> A revised plan that includes detector-class deliverables without a
++> `## Fire-Disposition` section MUST return `ESCALATE` — never `GROOMED`.
++> **(No ITERATE exists at second pass per the two-pass limit.)**
++
++Et `_launch_revise_pilot` valide sa révision ainsi :
++
++```sh
++local pre_hash;  pre_hash=$(sha256sum "$plan_path" | cut -d' ' -f1)
++# … lance /mika-revise-plan …
++local post_hash; post_hash=$(sha256sum "$plan_path" | cut -d' ' -f1)
++if [ "$pre_hash" != "$post_hash" ]; then … return 0    # « convergé »
++```
++
++**Le critère est « le contenu a changé », jamais « le finding a été traité ».**
++Un revise qui corrige une virgule sans ajouter la section demandée est, pour la
++boucle, indistinguable d'un revise réussi. Elle enchaîne alors sur le
++second-pass, qui ESCALATE — et l'unique itération a été dépensée pour rien.
++
++### Population
++
++Mesures reprises sur cette branche au 2026-09-20, **chacune avec sa commande** —
++un chiffre dont la méthode n'est pas écrite n'est pas reproductible, et se lit
++comme faux dès que le lecteur choisit une autre regex :
++
++| Mesure | Commande | Compte |
++|---|---|---|
++| Plans datés | `ls docs/plans/ \| grep -cE '^20[0-9]{2}-[0-9]{2}-[0-9]{2}-'` | 903 |
++| Section AC, forme canonique | `grep -lE '^## Acceptance criteria' docs/plans/20*.md \| wc -l` | 347 |
++| Section AC, toute profondeur/casse | `grep -liE '^#+ *Acceptance criteria' docs/plans/20*.md \| wc -l` | 618 |
++| Section FD, forme canonique | `grep -lE '^## Fire-Disposition' docs/plans/20*.md \| wc -l` | 79 |
++
++Les quatre chiffres ont bougé depuis la mesure du 19/09 (878 / 322 / 593 / 70) :
++la branche a rebasé sur `main` entre les deux. **Ce n'est pas du bruit, c'est la
++raison d'être du § Ancrage ci-dessous** — un plan dont les constats ne portent
++pas leur date se lit comme faux au premier rebase, et c'est la seule classe de
++défaut que ce re-groom a trouvée dans le plan précédent.
++
++**L'écart 347 / 618 sur la même section est lui-même un résultat**, et il porte :
++la moitié du corpus écrit le titre AC sous une autre profondeur ou une autre
++casse. Il rappelle que « la section est-elle là ? » n'a de réponse stable qu'avec
++sa regex — le fait même qui disqualifie une garde `grep` en CI (D2, motif 2).
++
++**La FD ajoutée après un ITERATE architecte : classe prouvée, compte borné.**
++La recherche lexicale liant `Fire-Disposition` à un finding architecte sur une
++même ligne rend **15** fichiers au 2026-09-20, dont le présent plan (qui cite le
++motif sans l'avoir subi) :
++
++```sh
++grep -liE '(Fire.Disposition.{0,80}(soulev|mika-arch|F[0-9])|(soulev|mika-arch).{0,80}Fire.Disposition)' docs/plans/20*.md
++```
++
++C'est une **borne supérieure lexicale, pas un compte vérifié** : distinguer un
++plan qui a subi l'ITERATE d'un plan qui cite la doctrine demande de lire les
++quinze. Le plan ne fabrique pas ce compte. Mais l'argument ne repose pas dessus —
++il repose sur l'**existence** de la classe, et deux témoins la prouvent, nommés
++et vérifiables à la ligne près :
++
++- `docs/plans/2026-09-01-002-fix-2126-telegram-url-nue-plan.md:232` — « Requis par
++  le Fire-Disposition Gate (mika#1574), **soulevé par mika-arch en première**
++  [passe] ».
++- `docs/plans/2026-09-07-004-fix-2228-label-write-via-app-identity-plan.md:44` —
++  la section est littéralement titrée `## Fire-Disposition (F4)` : le `(F4)` est
++  le numéro du finding architecte auquel elle répond.
++
++Chacun a consommé une passe architecte pour ajouter une section d'une quinzaine
++de lignes que le groomeur pouvait écrire du premier coup. C'est le coût que ce
++plan supprime, et il suffit qu'il soit réel.
++
++### Ce plan porte la section, et ce n'est PAS une réfutation du défaut
++
++L'objection saute aux yeux et un relecteur la fera : *ce plan-ci a été produit par
++le groom moteur et il porte `## Fire-Disposition` — le défaut est donc inexistant.*
++La chronologie la referme, et elle est écrite dans le ticket même (commentaire
++opérateur du 19/09, qui posait explicitement la mesure : « si son plan arrive
++devant l'architecte sans `## Fire-Disposition`, c'est n=2 »).
++
++La section est là parce qu'un **groom opérateur** l'a écrite à la main le 19/09,
++pas parce que le chemin moteur l'a produite. Les passages moteur qui ont suivi
++sont des **re-grooms idempotents** : l'étape 4 de `/mika-groom-plan-only`
++prescrit de réutiliser un plan existant comme point de départ, donc ils héritent
++de la section au lieu de la créer. Le chemin que le ticket accuse —
++`/ce:plan` sur un ticket vierge, sans plan préalable — **n'a jamais été exercé
++sur ce ticket.**
++
++Conséquence pour la lecture de la preuve : ce ticket ne fournit **ni** un n=2
++**ni** un contre-exemple. Il est muet sur sa propre question, et la mesure
++opérateur reste ouverte. Les deux témoins nommés ci-dessus (fix-2126, fix-2228)
++restent la preuve de la classe ; ce plan n'en est pas un troisième.
++
++Le ratio 79/903 (8,7 %) ne se lit **pas** comme un taux de défaut : la section est
++**conditionnelle** (mika#1574 : « Plan has no detector-class deliverables ⇒ gate
++is N/A »). Il n'existe aucun moyen déterministe de compter la population qui
++*aurait dû* la porter — l'obstacle même qui disqualifie la garde CI (D2).
++
++---
++
++## Requirements
++
++- **R1** — Tout pilote de groom dispatché par la boucle autonome reçoit, dans le
++  canal que le substrat contrôle, la prescription d'émettre `## Fire-Disposition`
++  quand le plan porte un livrable détecteur.
++- **R2** — Un revise lancé sur un finding réclamant `## Fire-Disposition` ne peut
++  plus rendre « convergé » alors que la section est toujours absente.
++- **R3** — Le budget architecte (deux passes) est **inchangé**. Aucun appel
++  `_arch_ask` supplémentaire.
++- **R4** — Le chemin nominal (plan sans détecteur, ou plan portant déjà la
++  section) ne paie rien : ni appel, ni branche, ni ligne de journal.
++- **R5** — Toute information illisible sort le dispatch de la population traitée
++  plutôt que de l'y faire entrer (fail-safe dans le sens de la maison).
++- **R6** — Ce qui n'est pas livrable dans ce dépôt est **nommé**, pas simulé.
++
++---
++
++## Décisions
++
++### D1 — Le site de prescription est le `PROMPT` construit par `dispatch-lib`, et c'est une contrainte de périmètre, pas une préférence
++
++Les trois commandes de groom ne sont **pas trackées par ce dépôt** :
++
++```
++$ git ls-files .claude/commands/
++.claude/commands/mika-doc-audit.md
++.claude/commands/mika-issue.md
++.claude/commands/mika-issues.md
++.claude/commands/mika.md
++```
++
++Elles vivent dans `mika-platform` et sont **semées** dans le worktree par
++`_seed_worktree_slash_commands()` (mika#1415), dont le commentaire énonce
++l'invariant : « the worktree's own tracked command wins ». Un ticket ouvert sur
++`senara-solutions/mika` ne peut donc pas éditer `/mika-groom-plan-only`.
++
++Le précédent qui tranche est dans le fichier même, à vingt lignes du site
++d'injection — `_PR_BODY_CONTAINMENT_RULE` (mika#2211) :
++
++> The rule belongs HERE and not only in a `.claude/commands/mika.md`, because
++> **this is the one channel every pilot of every repo reads.** The pilot is
++> launched with exactly two inputs […]: the entry command, resolved from the
++> TARGET repo's worktree, and this PROMPT.
++
++C'est la même configuration, pour la même raison, et le remède est déjà écrit
++dans ce dépôt. `_FIRE_DISPOSITION_RULE` suit `_PR_BODY_CONTAINMENT_RULE`.
++
++**Ce n'est pas du prompt-enforcement au sens que
++`feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate` condamne.**
++La leçon de mika#2120 est précise : *« a fix that lives in a prompt lasts exactly
++as long as the memory of whoever writes the prompt »* — neuf récurrences quand la
++consigne dépendait qu'un opérateur pense à la taper, zéro quand il y pensait. Une
++constante injectée par le substrat **à chaque dispatch** ne dépend d'aucune
++mémoire. Et la moitié structurelle est livrée séparément (U2), ce qui est
++exactement la forme que cette doctrine prescrit : jamais la prescription seule.
++
++### D2 — Une garde CI dans `verify-pipeline.sh` est REFUSÉE, sur trois motifs mesurés
++
++Le réflexe est de transposer mika#1600 intégralement : la prescription **plus**
++la garde `verify-pipeline.sh` U2. Elle est écartée, et c'est un livrable du plan.
++
++1. **Elle arriverait après l'autorité qu'elle contredirait.**
++   `verify-pipeline.sh` tourne sur la PR (`ci.yml:344`, `BASE_REF=origin/main`).
++   Le grooming, lui, n'ouvre pas de PR : il commite le plan sur la branche et
++   écrit le callout sur l'issue. La CI ne voit donc le plan qu'au moment de la PR
++   **d'implémentation** — après que mika-arch a rendu `GROOMED`. Une garde là
++   ferait rougir une PR dont le plan a déjà été déclaré conforme par l'architecte :
++   deux autorités en contradiction sur le même artefact, l'opérateur arbitrant à
++   la main. Le contraste avec AC est net — AC est inconditionnelle, donc la CI et
++   l'architecte ne peuvent pas diverger.
++
++2. **La conditionnalité n'est pas exprimable en bash.** « Le plan porte-t-il un
++   livrable détecteur ? » est le jugement sémantique que mika#1574 confie à un
++   LLM. Les deux contournements échouent : une heuristique lexicale (« test »,
++   « garde », « lint ») rend un faux positif sur quasiment tout plan de ce dépôt ;
++   et rendre la section **inconditionnelle** contredirait frontalement la doctrine
++   (« gate is N/A »), ce qui est une décision produit hors du périmètre d'un
++   ticket substrat.
++
++3. **Elle déplacerait le blocage sans le lever.** Le ticket demande que la boucle
++   dispatche. Troquer un `ESCALATE` architecte contre un rouge CI laisse le
++   ticket immobile, une porte plus loin.
++
++Si une garde déterministe devient souhaitable un jour, sa précondition est une
++**mesure** : la proportion de plans GROOMED portant un détecteur sans la section.
++Cette mesure n'existe pas et ce plan ne la fabrique pas.
++
++### D3 — Le budget élargi est celui du *revise*, jamais celui de l'architecte
++
++Deux budgets distincts sont en jeu, et les confondre serait toucher à la doctrine :
++
++- Le **budget architecte** : deux passes. C'est le design de mika#1271, il borne
++  le coût LLM et il n'est pas touché (R3).
++- Le **budget revise** : un lancement de `_launch_revise_pilot`. C'est un détail
++  d'implémentation, pas un contrat — aucun document ne le prescrit.
++
++U2 relance le revise **une** fois, avec un finding ciblé, sans appeler
++`_arch_ask`. Le plan révisé part ensuite au second-pass exactement comme
++aujourd'hui. La boucle deux-passes est intacte ; ce qui change est qu'elle ne la
++dépense plus sur un plan dont on sait déjà qu'il sera refusé.
++
++### D4 — Le prédicat est déterministe des deux côtés, et inerte sur le chemin nominal
++
++La garde U2 est une **conjonction de deux `grep`**, jamais un jugement :
++
++- l'architecte a réclamé la section ⇔ **le findings-file de première passe**
++  contient la chaîne `Fire-Disposition` (c'est le vocabulaire imposé par son
++  propre gate) ;
++- la section est absente ⇔ le plan révisé ne porte pas `^## Fire-Disposition`.
++
++**Le premier terme nomme sa source, et ce n'est pas un détail de rédaction.**
++La source est `$1` de `_launch_revise_pilot`, capturée dans `findings_file` à
++l'entrée de la fonction — c'est-à-dire `$WORKTREE_DIR/.iterate/findings-1.md`,
++écrit par `_iterate_groom_loop` depuis la sortie de `_arch_ask_with_retry` du
++**premier** passage (ligne 5829 au 2026-09-20, passé en argument ligne 5835).
++Le findings-file ciblé que la garde écrit elle-même (`findings-1-fd.md`) est
++**interdit comme source du prédicat**, et l'interdiction est portante plutôt que
++cosmétique : ce fichier contient nécessairement la chaîne `Fire-Disposition`
++puisque c'est son objet, donc un prédicat qui le relirait deviendrait
++**auto-entretenu** — son premier terme serait vrai par construction, la garde
++relancerait même quand l'architecte n'a rien demandé, et T5 passerait en vert sur
++une garde qui ne regarde plus la sortie architecte. Le compteur `_FD_REVISE_RETRIED`
++(U3) casserait la boucle infinie ; il ne rendrait pas le défaut visible.
++
++Corollaire d'implémentation, énoncé ici parce qu'il découle du prédicat et non
++d'un goût : **la relance ne se fait pas en ré-appelant `_launch_revise_pilot`.**
++Une récursion ferait de `findings-1-fd.md` le `$1` du second tour, ce qui est
++exactement la confusion de source interdite ci-dessus. La garde relance
++directement l'invocation du pilote (même forme que le lancement nominal, avec
++`@findings-1-fd.md` comme argument), à l'intérieur de la même invocation de
++`_launch_revise_pilot`. T11 est le contrôle qui verrouille la source.
++
++Si l'un des deux termes est faux, **rien ne se passe** : comportement d'avant le
++correctif, bit pour bit. Un plan sans détecteur ne paie rien, un revise qui a fait
++son travail ne paie rien (R4). Et un findings-file illisible sort le dispatch de
++la population (R5), il ne l'y fait pas entrer.
++
++### D5 — La prescription est conditionnée à `dev-groom`
++
++`$SKILL` est le discriminant, déjà disponible dans `_set_up_worktree` et déjà
++employé dans cette fonction (neuf occurrences de `[ "$SKILL" = "dev-groom" ]`
++dans le fichier au 2026-09-20). Injecter la règle pour `dev-pilot` serait du
++bruit dans le prompt d'un pilote qui n'écrit pas de plan.
++
++Le point d'attention pour l'implémenteur : le site d'injection voisin
++(`_PR_BODY_CONTAINMENT_RULE`) est **inconditionnel** dans la branche worktree —
++il s'applique à tous les skills, ce qui est correct pour lui et ne le serait pas
++ici. La condition U1 est donc à écrire explicitement ; la copier du voisin la
++perdrait, et T3 est le contrôle négatif qui attrape exactement cet écart.
++
++---
++
++## Implementation Units
++
++### Ancrage — par symbole, jamais par numéro de ligne
++
++**Aucun site d'implémentation de ce plan n'est désigné par un numéro de ligne**,
++et c'est un constat gagné plutôt qu'une préférence de style : la version du
++19/09 citait cinq lignes (`~1935`, `~2480`, `5255`, `2203`) et **les cinq avaient
++dérivé** au rebase du lendemain, sans qu'aucun des faits qu'elles désignaient ne
++change. Un implémenteur qui ouvre `~l.1935` ne trouve rien ; un implémenteur qui
++cherche `_PR_BODY_CONTAINMENT_RULE` trouve toujours. Les numéros ci-dessous sont
++donnés **entre parenthèses et datés**, comme indication de lecture — jamais comme
++adresse.
++
++| Ancre (stable) | Ligne au 2026-09-20 | Rôle |
++|---|---|---|
++| `_PR_BODY_CONTAINMENT_RULE=` (définition) | 2003 | Voisin de la constante U1 |
++| `PROMPT=$(printf … "$_PR_BODY_CONTAINMENT_RULE")` | 2587 | Site d'injection U1 |
++| `_launch_revise_pilot()` | 5317–5377 | Fonction hôte de U2 |
++| `local findings_file="$1"` (entrée de la fonction) | 5331 | **Source unique du premier terme du prédicat** (D4) |
++| `findings_file="$findings_dir/findings-1.md"` (dans `_iterate_groom_loop`) | 5829 | Producteur de cette source ; passé en argument ligne 5835 |
++| `if [ "$pre_hash" != "$post_hash" ]` | 5370 | Branche de greffe U2 |
++| `_arch_ask()` / premier appel `_arch_ask_with_retry` | 4768 / 5732 | Hors `_launch_revise_pilot` — fonde T9 |
++
++| # | Fichier | Changement |
++|---|---|---|
++| **U1** | `skills/bundled/_shared/dispatch-lib.sh` | Constante `_FIRE_DISPOSITION_RULE`, posée à côté de `_PR_BODY_CONTAINMENT_RULE`. Elle nomme la section, ses trois options canoniques (a)/(b)/(c) en une ligne chacune, et la règle N/A explicite. Injectée dans `PROMPT` au site mika#2178/#2211, **après** l'injection de `_PR_BODY_CONTAINMENT_RULE` — les trois invariants de position documentés en commentaire au-dessus de ce site restent vrais et la première ligne du `PROMPT` reste exactement `<repo>#<num>` (contrat mika#138). Conditionnée `[ "$SKILL" = "dev-groom" ]` (D5) : le site d'injection voisin est inconditionnel dans la branche worktree, la condition est donc à écrire, pas à hériter. |
++| **U2** | `skills/bundled/_shared/dispatch-lib.sh` | Dans `_launch_revise_pilot`, à l'intérieur de la branche `sha256` **réussie** (`pre_hash != post_hash`) : si **le findings-file reçu en `$1`** (`$WORKTREE_DIR/.iterate/findings-1.md`, capturé dans `findings_file` à l'entrée — D4) réclamait `Fire-Disposition` et que le plan révisé ne porte toujours pas `^## Fire-Disposition`, écrire un findings-file ciblé (`findings-1-fd.md`) et relancer le pilote de revise **une seule fois**. La relance est une invocation directe du pilote dans la même exécution de la fonction, **jamais une récursion sur `_launch_revise_pilot`** : le prédicat ne doit à aucun moment relire `findings-1-fd.md`, sous peine de devenir auto-entretenu (D4, T11). Le retour reste `0` (le plan *a* changé au premier tour) — la garde ajoute une tentative, elle ne crée pas de mode d'échec. |
++| **U2b** | *(idem)* | **Terminaison, et la distinction qui la rend vraie :** après la seconde tentative, la section est re-testée **pour journaliser, jamais pour reboucler**. La relance est gardée par `_FD_REVISE_RETRIED` (U3), donc un second échec ne peut que produire `fire_disposition_still_missing_after_retry` et rendre la main — il n'existe aucun chemin qui réarme le lancement. C'est ce qui réconcilie « une seule relance » (R3, budget) et AC7 (l'événement doit savoir si la section manque encore) : le prédicat est évalué deux fois, il n'autorise l'action qu'une. |
++| **U3** | `skills/bundled/_shared/dispatch-lib.sh` | Un compteur de garde (`_FD_REVISE_RETRIED`) explicite, remis à zéro à l'entrée de `_launch_revise_pilot`, pour que la terminaison soit lisible sans dérouler le flot de contrôle. |
++| **U4** | `skills/bundled/_shared/test-dispatch-lib.sh` | Les onze tests T1–T11 — voir § Verification Contract. Portent le harnais de 31 à 42 ; aucune famille d'assertion nouvelle. |
++| **U5** | `docs/solutions/best-practices/fire-disposition-doctrine.md` | Section « Site de production » : la doctrine décrit aujourd'hui la règle et son gate, jamais qui écrit la section. Ajouter les deux sites (prescription `PROMPT`, rattrapage revise) et le renvoi au suivi `mika-platform`. |
++
++### Journal
++
++Deux événements sur `stderr` (le canal de `dispatch-lib`, collecté dans le log
++pilote) :
++
++- `fire_disposition_revise_retried` — la garde a relancé le revise. **Régime
++  attendu : rare.** Chaque ligne est une itération architecte que la boucle n'a
++  pas gaspillée.
++- `fire_disposition_still_missing_after_retry` — la seconde tentative n'a pas
++  produit la section ; le plan part au second-pass, où il sera prévisiblement
++  refusé. **Régime attendu : zéro.** Une occurrence soutenue dit que le pilote de
++  revise ne sait pas écrire la section, donc que le correctif à faire est le suivi
++  `mika-platform` (`/mika-revise-plan`), **pas** un troisième essai ici.
++
++**Le consommateur de ces deux événements est l'opérateur, jamais la boucle.**
++Ce sont des lignes `stderr` lues à la main ou par analyse de logs (mika#2205) ;
++**aucune branche de `dispatch-lib` ne les relit et aucune décision ne les
++consulte.** La boucle continue bit pour bit comme avant l'émission : seul le
++journal change. La formulation « le plan part au second-pass en sachant qu'il
++sera refusé » du plan précédent se lisait comme un mécanisme — elle ne l'était
++pas, la boucle ne *sait* rien. Cette ligne verrouille aussi le refus d'un
++troisième essai contre une future « amélioration » qui transformerait l'événement
++en signal de contrôle : un événement d'observabilité promu en entrée de décision
++est un changement de contrat, pas un réglage.
++
++L'absence de la première ligne n'est jamais à elle seule une preuve de succès :
++elle se lit aussi « aucun groom n'a tourné ». Lire le volume de dispatches
++`dev-groom` sur la même fenêtre avant de conclure (mika#2205).
++
++---
++
++## Verification Contract
++
++Le harnais `skills/bundled/_shared/test-dispatch-lib.sh` existe — **31** fonctions
++de test au 2026-09-20, inchangé depuis la mesure du 19/09
++(`grep -cE '^test_[a-z0-9_]+\(\)' skills/bundled/_shared/test-dispatch-lib.sh`)
++— et porte déjà les deux familles employées ici : assertions de **forme de code**
++(`declare -f` + `assert_contains`) et assertions **comportementales** sur worktree
++temporaire. T1–T11 portent le total à 42 ; aucune famille nouvelle n'est requise.
++
++| # | Test | Ce qu'il attrape |
++|---|---|---|
++| T1 | `_FIRE_DISPOSITION_RULE` est non vide et nomme les trois options (a)/(b)/(c) | Une règle tronquée qui prescrit la section sans dire quoi y écrire |
++| T2 | La règle est injectée dans `PROMPT` **pour** `SKILL=dev-groom` | La prescription n'atteint pas le pilote |
++| T3 | **Contrôle négatif** : elle n'est **pas** injectée pour `SKILL=dev-pilot` | D5 régressée, bruit dans le prompt d'implémentation |
++| T4 | La première ligne du `PROMPT` reste `<repo>#<num>` après injection | Contrat mika#138 et invariant de position 2 (la regex ancrée manquerait, le dispatch tomberait en free-text et **aucun worktree** ne serait créé) |
++| T5 | Comportemental : findings réclamant FD + plan révisé sans la section ⇒ le revise est relancé exactement **une** fois | R2 — le cœur du correctif |
++| T6 | **Contrôle négatif** : findings sans mention de FD ⇒ zéro relance | R4 — la garde n'est pas inerte mais bavarde |
++| T7 | **Contrôle négatif** : plan révisé portant déjà `^## Fire-Disposition` ⇒ zéro relance | R4 — le chemin nominal ne paie rien |
++| T8 | Findings-file illisible ⇒ zéro relance, retour inchangé | R5 — fail-safe |
++| T9 | Forme de code : le bras de garde ne contient aucun appel `_arch_ask`, **et la table d'exceptions du scan est assertée vide à l'exécution** (`zero entries`) | R3 — un futur éditeur qui « améliorerait » la garde en redemandant l'avis de l'architecte doublerait le budget LLM sans qu'aucun test de comportement ne rougisse. L'assertion de vacuité fait rougir le test **le jour où** une exception est ajoutée, pas seulement quand elle devient stale (§ Fire-Disposition) |
++| T10 | Comportemental : seconde tentative **échouée** ⇒ `fire_disposition_still_missing_after_retry` émis exactement une fois sur `stderr`, retour inchangé, et **aucune troisième** relance | AC7, et la terminaison de U2b. Sans lui, une garde qui rendrait la main en silence sur ce chemin passerait T5 en vert : l'échec de second tour deviendrait indistinguable d'un succès, ce qui est précisément l'angle mort que le plan reproche au critère `sha256` |
++| T11 | **Contrôle de source** : le premier terme du prédicat lit le findings-file reçu en `$1`, et rien d'autre. Deux moitiés — (a) forme de code : le corps du bras de garde ne relit ni `findings-1-fd.md` ni `$findings_dir`, et n'appelle pas `_launch_revise_pilot` (pas de récursion) ; (b) comportemental : un findings-file de première passe **sans** mention de FD, sur un plan révisé **sans** la section, produit zéro relance — y compris après qu'un `findings-1-fd.md` a été laissé dans `.iterate/` par un dispatch antérieur | F1 — le prédicat auto-entretenu. Un implémenteur qui lit le findings ciblé (qui contient nécessairement la chaîne, c'est son objet) rend le premier terme vrai par construction : la garde relance même quand l'architecte n'a rien demandé, `_FD_REVISE_RETRIED` borne la boucle, et **T5, T6, T8 restent tous verts**. C'est la seule défaillance de cette famille qu'aucun autre test ne voit |
++
++**T3, T6, T7 et T11 sont porteurs, pas décoratifs.** Sans les trois premiers, une
++garde qui relance *toujours* passerait T5 en vert tout en doublant le coût de
++chaque grooming du dépôt ; sans T11, une garde qui relance toujours **pour une
++autre raison** — la confusion de source — y passerait aussi, et les trois
++contrôles négatifs existants ne la verraient pas (T6 exerce un findings-file de
++première passe propre, pas la lecture du mauvais fichier). T9 est structurel pour
++la même raison qu'il est structurel ailleurs dans ce dépôt : la régression qu'il
++attrape ne rendrait aucune décision fausse, elle changerait le budget en silence.
++
++---
++
++## Definition of Done
++
++- U1–U5 livrés ; `bash skills/bundled/_shared/test-dispatch-lib.sh` vert.
++- `make lint` et `make test` verts.
++- Le ticket de suivi `mika-platform` est ouvert et référencé dans le corps de la
++  PR (voir § Suivi).
++- La doctrine `fire-disposition-doctrine.md` nomme les sites de production.
++
++---
++
++## Acceptance criteria
++
++Le corps de mika#2306 ne porte pas de section `## Acceptance criteria` ; les
++critères ci-dessous sont dérivés des Requirements et du Verification Contract.
++
++- **AC1** — Un dispatch `dev-groom` reçoit dans son `PROMPT` une prescription
++  nommant `## Fire-Disposition` et ses trois options canoniques. Vérifiable sans
++  modèle, par le champ `prompt` du JSON de dry-run. (T1, T2)
++- **AC2** — Un dispatch `dev-pilot` ne reçoit **pas** cette prescription. (T3)
++- **AC3** — La première ligne du `PROMPT` d'un dispatch `dev-groom` est exactement
++  `<repo>#<num>`. (T4)
++- **AC4** — Quand les findings de première passe réclament `## Fire-Disposition`
++  et que le plan révisé ne la porte pas, `_launch_revise_pilot` relance le pilote
++  de revise exactement une fois. (T5)
++- **AC5** — Dans les trois cas négatifs — findings sans mention de FD, section
++  déjà présente, findings-file illisible — le nombre de relances est zéro et la
++  valeur de retour est celle d'avant le correctif. (T6, T7, T8)
++- **AC6** — Aucun chemin introduit par ce plan n'appelle `_arch_ask`. Le nombre
++  d'appels architecte par grooming reste de deux au maximum, et la table
++  d'exceptions du scan T9 est **vide, assertée telle à l'exécution**. (T9)
++- **AC7** — `fire_disposition_still_missing_after_retry` est émis, et lui seul,
++  quand la seconde tentative échoue : la boucle continue vers le second-pass au
++  lieu de s'interrompre, et **aucune troisième relance n'a lieu**. C'est un
++  événement `stderr` **d'observabilité pure** — consommé par l'opérateur et
++  l'analyse de logs (mika#2205), relu par aucune branche de `dispatch-lib`, sans
++  effet sur le flot de la boucle. AC7 n'exige donc **aucun** comportement de la
++  boucle au-delà de la non-relance : le critère porte sur l'émission et sur
++  l'absence de troisième essai, jamais sur une réaction. (T10)
++- **AC8** — `docs/solutions/best-practices/fire-disposition-doctrine.md` nomme les
++  deux sites de production et le ticket de suivi `mika-platform`.
++- **AC9** — Le premier terme du prédicat de la garde lit le findings-file de
++  première passe reçu en `$1` (`$WORKTREE_DIR/.iterate/findings-1.md`) et
++  **jamais** le findings ciblé `findings-1-fd.md` que la garde écrit elle-même ;
++  aucune récursion sur `_launch_revise_pilot`. Un `findings-1-fd.md` résiduel
++  dans `.iterate/` ne rend aucun terme vrai. (T11)
++
++---
++
++## Fire-Disposition
++
++Requise par le Fire-Disposition Gate (mika#1574). Les livrables détecteurs de ce
++plan sont les onze tests T1–T11 de U4, dont **T9 et la moitié (a) de T11 sont des
++scans de forme de code** — la classe qui peut tirer sur de l'existant.
++
++**Option retenue : (a) exception nommée — table vide, et la vacuité est assertée
++à l'exécution, aujourd'hui.**
++
++- **T1–T8, T10 et la moitié (b) de T11** sont des tests de comportement **sur du
++  code que ce plan crée** (`_FIRE_DISPOSITION_RULE`, le bras de garde de
++  `_launch_revise_pilot`, le compteur `_FD_REVISE_RETRIED`). Ils ne peuvent
++  structurellement pas tirer sur de l'existant : leur sujet n'existait pas avant
++  ce plan. T10 en particulier asserte l'émission d'un événement que ce plan
++  introduit, sur un chemin que ce plan introduit. Aucune exception concevable.
++- **T9 et T11(a)** scannent du code préexistant — le corps de
++  `_launch_revise_pilot`. Leur prédicat porte sur le **bras de garde introduit
++  par U2**, jamais sur la fonction entière : `_launch_revise_pilot` ne contient
++  aujourd'hui ni appel `_arch_ask`, ni lecture de `findings-1-fd.md`, ni appel
++  récursif à elle-même. Re-vérifié au 2026-09-20 : la fonction occupe les lignes
++  5317–5377 et n'en contient aucun ; les appels `_arch_ask` vivent dans
++  `_iterate_groom_loop` (premier à 5732), fonction distincte.
++
++**Table d'exceptions : zéro entrée — et c'est une assertion exécutable, pas une
++consigne à l'éditeur futur.** T9 asserte *à l'exécution* que la table
++d'exceptions du scan est vide (`zero entries`), sur le modèle de
++`scripts/test-guard-shared-checkout.sh` (« Fire-Disposition — allowlist: zero
++entries », assertée). Le test rougit donc **le jour où** quelqu'un ajoute une
++exception, pas seulement quand elle devient stale. Une table vide assertée vide
++est aussi ce qui distingue « aucune violation » de « le scan ne regarde rien ».
++
++Toute entrée future dans cette table doit porter **les trois** propriétés que
++l'option (a) du gate exige, jamais la seule troisième : (1) **nommer la donnée
++précise** qui déclenche l'exemption (le site scanné et la raison pour laquelle
++son occurrence n'est pas une violation) ; (2) **référencer un ticket de suivi**
++qui la retire ; (3) **porter une assertion auto-nettoyante** qui rougit le jour
++où la donnée nommée disparaît. Une exemption qui n'a pas les trois est un
++contournement du scan avec une ligne de commentaire par-dessus, et la version
++précédente de cette section n'exigeait que (3) — d'où la présente reformulation.
++
++**Ce qui n'est pas un détecteur ici, et pourquoi la distinction compte.** U1 et U2
++sont du **code de production** : U1 pose une chaîne dans un prompt, U2 ajoute une
++tentative. Aucun des deux n'a pour fonction primaire de signaler une violation —
++U2 en particulier ne **refuse** jamais rien : il réessaie, puis laisse passer en
++journalisant. C'est ce qui lui évite d'être lui-même un détecteur, et c'est
++délibéré : un U2 qui échouerait sur section manquante aurait déplacé l'ESCALATE
++d'une porte, ce que D2 refuse explicitement.
++
++**Aucun plan existant n'est relu.** Ce travail ne touche ni `verify-pipeline.sh`
++(D2) ni aucun chemin lisant `docs/plans/**` en masse. Les **824** plans sans
++`## Fire-Disposition` (903 − 79, § Population) restent exactement ce qu'ils sont ;
++aucune garde introduite ici ne les regarde. Ce compte croît à chaque plan écrit —
++c'est précisément pourquoi il n'est **pas** un seuil et ne gouverne rien.
++
++---
++
++## Suivi (hors périmètre, nommé)
++
++**`mika-platform` — la prescription dans les commandes de groom.** Le remède
++complet ajoute une étape `5c` à `/mika-groom-plan-only` (jumelle de la `5b` que
++mika#1600 a posée pour `## Acceptance criteria`), la même à
++`/mika-groom-ticket`, et une consigne à `/mika-revise-plan` pour que la branche
++ITERATE sache écrire la section qu'on lui réclame. Ces trois fichiers vivent dans
++`senara-solutions/mika-platform` (D1) : **ticket à ouvrir**, référencé dans le
++corps de la PR.
++
++**L'ordre n'est pas contraint, et c'est une propriété, pas un oubli.** U1 et U2
++sont tous deux fail-safe et additifs : U1 ajoute du texte à un prompt, U2 ajoute
++une tentative. Ni l'un ni l'autre ne refuse quoi que ce soit, donc livrer ce
++ticket avant son suivi ne peut pas casser un grooming qui marchait. C'est la
++différence exacte avec la garde CI de D2, dont l'ordre *aurait* été contraint —
++et c'est une raison de plus de ne pas la livrer ici.
++
++**Hors périmètre également :** la cause de la non-convergence du grooming de ce
++ticket lui-même (commentaire opérateur du 18/09 : « re-armement différé épuisé,
++noop_completion ») est un défaut de dispatch — famille mika#1124/#1172, Signal J
++— sans rapport avec le contenu des plans.
++
++**Défaut adjacent relevé en chemin, non traité :** `verify-pipeline.sh` ne
++contrôle que **le premier** plan d'une PR (`PLAN_FILE=$(echo "$PLAN" | head -1)`,
++l.109). Une PR modifiant deux plans n'en voit qu'un vérifié pour ses AC. Réel,
++indépendant de ce ticket, **ticket de suivi**.
++
++---
++
++## Risques
++
++| Risque | Portée | Traitement |
++|---|---|---|
++| Le prompt de groom s'allonge | ~10 lignes sur un prompt qui porte déjà le corps du ticket (≤ 16 KiB, mika#2178) et la règle mika#2211 | Négligeable et borné ; précédent direct |
++| La garde relance un revise inutile | Coût : une session pilote | Quatre contrôles négatifs (T6, T7, T8, T11) ; prédicat conjonctif **dont la source est nommée** (D4) ; terminaison par compteur explicite (U3) |
++| Le pilote de revise ne sait toujours pas écrire la section | La seconde tentative échoue | `fire_disposition_still_missing_after_retry` le dit, et **désigne le suivi `mika-platform`** plutôt qu'un troisième essai ici |
++| La prescription dérive du gate architecte | Deux formulations de mika#1574 | La règle U1 cite la doctrine par référence (`mika#1574`, trois options nommées), elle ne la reformule pas |
++
++---
++
++## Références
++
++- mika#1574 — Fire-Disposition Gate ; `docs/solutions/best-practices/fire-disposition-doctrine.md`
++- mika#1600 / mika#1627 — le précédent `## Acceptance criteria` : même producteur tiers, même trou, remède en deux moitiés
++- mika#2211 — `_PR_BODY_CONTAINMENT_RULE` : le précédent d'une règle injectée par `dispatch-lib` parce que le fichier de commande est hors de portée
++- mika#2178 — le site d'injection dans `PROMPT` et ses trois invariants de position
++- mika#1271 — le contrat deux-passes et la séparation pilote-contenu / dispatch-lib-convergence
++- mika#2120 — `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`
++- mika#1415 — `_seed_worktree_slash_commands` : pourquoi les commandes ne sont pas dans ce dépôt
++- mika#2286 — l'essai 5, dont ce ticket est le prérequis direct
++
++---
++
++## Revision history
++
++- **rev 2 (2026-09-20)** — révision sur les trois findings de la première passe
++  architecte (F1–F3, tous *sharpening*, aucun bloquant).
++  - **F1 addressed** — la source du premier terme du prédicat est désormais
++    nommée : `$1` de `_launch_revise_pilot`, capturée dans `findings_file` à
++    l'entrée, c'est-à-dire `$WORKTREE_DIR/.iterate/findings-1.md` écrit par
++    `_iterate_groom_loop` (ligne 5829 au 2026-09-20, passé ligne 5835). La
++    relecture de `findings-1-fd.md` comme source est **interdite** et la raison
++    est écrite (prédicat auto-entretenu, vrai par construction, invisible à T5) ;
++    le corollaire d'implémentation — pas de récursion sur `_launch_revise_pilot`,
++    la relance est une invocation directe du pilote — est énoncé en D4 et repris
++    en U2. Ajout de **T11**, le contrôle de source en deux moitiés (forme de code
++    + comportemental avec un `findings-1-fd.md` résiduel dans `.iterate/`), et de
++    **AC9**. Sites touchés : D4, table d'ancrage (deux lignes), U2, U4, § Verification
++    Contract, § Risques, § Acceptance criteria.
++    *Citation préservée : review-guide.md § KISS / Orthogonality — un prédicat
++    dont la source d'entrée n'est pas nommée laisse à l'implémenteur un choix que
++    le plan a les moyens de trancher.*
++  - **F2 addressed** — la vacuité de la table d'exceptions T9 est devenue une
++    **assertion exécutable portant sur le présent** (`zero entries`, rougit le
++    jour de l'ajout, pas seulement quand l'exemption devient stale), sur le modèle
++    de `scripts/test-guard-shared-checkout.sh`. Toute entrée future doit porter
++    **les trois** propriétés de l'option (a) — donnée nommée, tracker référencé,
++    assertion de staleness — et non la seule troisième comme le formulait la
++    rev 1. Sites touchés : § Fire-Disposition, T9, AC6.
++    *Citation préservée : Fire-Disposition Gate, option (a) — « Each exception
++    must: (1) name the specific data triggering it, (2) reference a follow-up
++    tracker issue, (3) include a self-cleaning assertion ».*
++  - **F3 addressed** — le consommateur des deux événements est nommé : opérateur
++    et analyse de logs (mika#2205), **relu par aucune branche de `dispatch-lib`,
++    sans effet sur le flot de la boucle**. La formulation « le plan part au
++    second-pass en sachant qu'il sera refusé » — une prédiction qui se lisait
++    comme un mécanisme — est remplacée. AC7 énonce explicitement qu'il n'exige
++    aucun comportement de la boucle au-delà de la non-relance, ce qui verrouille
++    le refus d'un troisième essai contre une future promotion de l'événement en
++    signal de contrôle. Sites touchés : § Journal, AC7.
++    *Citation préservée : review-guide.md § YAGNI + D2 motif 3 du plan
++    (« Elle déplacerait le blocage sans le lever »).*
++  - Aucun AC affaibli ; le périmètre, les décisions D1–D5 et le budget architecte
++    (R3) sont inchangés. Le harnais passe de 41 à 42 tests attendus (T11).
+diff --git a/docs/solutions/best-practices/fire-disposition-doctrine.md b/docs/solutions/best-practices/fire-disposition-doctrine.md
+index 35b38723..d8eb1873 100644
+--- a/docs/solutions/best-practices/fire-disposition-doctrine.md
++++ b/docs/solutions/best-practices/fire-disposition-doctrine.md
+@@ -35,15 +35,41 @@ When the allowlist is structural (a data const + test logic), scope it inside `#
+ The detector lands with `#[ignore]`, `#[cfg(skip)]`, or equivalent, plus a tracked follow-up to enable it. Use only when the existing violation is itself dangerous to leave un-flagged and the detector's CI-red state would mask the danger.
+ 
+ ### Option (c): Halt-and-surface
+ 
+ The implementation stops and surfaces to the operator for scoping. Use only when the existing violation's resolution shape is itself the operator-scoping question — the plan cannot pre-decide.
+ 
+ ## Structural enforcement
+ 
+ The fire-disposition rule is enforced by the **Fire-Disposition Gate** in `mika-arch-groom-ticket` (first-pass) and `mika-arch-second-review` (second-pass). The gate returns ITERATE (first pass) or ESCALATE (second pass) when a plan with detector deliverables lacks the `## Fire-Disposition` section. This gate is the third architect gate, alongside the Unresolved-Decision Gate (mika#1244) and the Acceptance-Criteria Gate (mika#1559).
+ 
++## Site de production (mika#2306)
++
++Cette doctrine a décrit la règle et son gate pendant près de trois mois sans jamais dire **qui écrit la section**. Le producteur des plans — `/ce:plan`, plugin tiers du marketplace `compound-engineering` — ignore mika#1574 ; aucune des trois commandes de groom ne prescrivait la section (`grep -n "Fire-Disposition" .claude/commands/*.md` rendait zéro) ; et `_iterate_groom_loop` n'a qu'un seul ITERATE. Un plan neuf livrant un détecteur arrivait donc devant l'architecte sans la section, brûlait l'unique itération sur un motif purement formel, puis ESCALATE au second passage où le gate est sans recours — et la boucle ne dispatchait jamais l'implémentation.
++
++C'est la configuration exacte que le Acceptance-Criteria Gate décrit déjà mot pour mot pour sa section sœur : *« Grooming is the surface we control between the third-party producer and our validator. »* `## Acceptance criteria` a reçu ce traitement (mika#1600/#1627) ; `## Fire-Disposition` ne l'avait jamais reçu.
++
++**Deux sites, dans `skills/bundled/_shared/dispatch-lib.sh` :**
++
++1. **Prescription** — `_FIRE_DISPOSITION_RULE`, injectée dans le `PROMPT` de chaque dispatch `dev-groom` (et d'aucun autre : un pilote d'implémentation n'écrit pas de plan). Elle nomme la section, ses trois options canoniques ci-dessus, et la règle N/A — la conditionnalité fait partie de la prescription, sans quoi un groomeur ajouterait la section à tout plan. La règle vit là plutôt que dans une commande de groom parce que les trois commandes vivent dans `senara-solutions/mika-platform` et sont semées dans le worktree par `_seed_worktree_slash_commands` (mika#1415) : ce `PROMPT` est le seul canal que le dépôt `mika` contrôle. Même raisonnement, au même endroit du fichier, que `_PR_BODY_CONTAINMENT_RULE` (mika#2211).
++
++2. **Rattrapage** — `_fd_retry_if_section_still_missing`, greffé sur la branche de succès de `_launch_revise_pilot`. Le critère de convergence du revise est « le contenu a changé », jamais « le finding a été traité » : un revise qui corrige une virgule sans ajouter la section réclamée était, pour la boucle, indistinguable d'un revise réussi. La garde est une conjonction de deux `grep` — les findings de **première passe** contiennent `Fire-Disposition`, et le plan révisé ne porte toujours pas `^## Fire-Disposition` — et relance le pilote de revise **une seule fois** avec un finding ciblé. Elle ne refuse jamais rien : elle réessaie, puis laisse passer en journalisant, parce qu'un échec dur y aurait déplacé l'ESCALATE d'une porte au lieu de le lever.
++
++**Ce que ces deux sites ne couvrent pas, et qui est nommé plutôt que simulé :** la prescription dans `/mika-groom-plan-only` (étape `5c`, jumelle de la `5b` que mika#1600 a posée pour `## Acceptance criteria`), la même dans `/mika-groom-ticket`, et une consigne à `/mika-revise-plan` pour que la branche ITERATE sache écrire la section qu'on lui réclame. Ces trois fichiers vivent dans `senara-solutions/mika-platform` — **ticket de suivi**. L'ordre de livraison n'est pas contraint : les deux sites ci-dessus sont additifs et fail-safe (l'un ajoute du texte à un prompt, l'autre ajoute une tentative), donc aucun ne peut casser un grooming qui marchait.
++
++**Surfaces opérateur** (`stderr` de `dispatch-lib`, collecté dans le log pilote) :
++
++- `fire_disposition_revise_retried` — la garde a relancé le revise. **Régime attendu : rare.** Chaque ligne est une itération architecte que la boucle n'a pas gaspillée.
++- `fire_disposition_still_missing_after_retry` — la seconde tentative n'a pas produit la section. **Régime attendu : zéro.** Une occurrence soutenue dit que le pilote de revise ne sait pas écrire la section, donc que le correctif à faire est le suivi `mika-platform` (`/mika-revise-plan`), **pas** un troisième essai dans `dispatch-lib`.
++
++Les deux sont de l'**observabilité pure** : consommés par l'opérateur et par l'analyse de logs (mika#2205), relus par aucune branche de `dispatch-lib`, sans effet sur le flot de la boucle. Promouvoir l'un d'eux en signal de contrôle serait un changement de contrat, pas un réglage. Et l'absence de la première ligne n'est jamais à elle seule une preuve de succès : elle se lit aussi « aucun groom n'a tourné » — lire le volume de dispatches `dev-groom` sur la même fenêtre avant de conclure.
++
++**Ce qui a été refusé, et pourquoi** : une garde déterministe dans `verify-pipeline.sh`, le pendant de celle que mika#1600 a posée pour `## Acceptance criteria`. Trois motifs. (1) Elle arriverait **après** l'autorité qu'elle contredirait — le grooming n'ouvre pas de PR, donc la CI ne voit le plan qu'à la PR d'implémentation, après un `GROOMED` architecte ; elle ferait rougir une PR dont le plan a déjà été déclaré conforme. Le contraste avec AC est net : AC est inconditionnelle, donc CI et architecte ne peuvent pas diverger. (2) La conditionnalité n'est pas exprimable en bash — « ce plan livre-t-il un détecteur ? » est le jugement sémantique que mika#1574 confie à un LLM, et rendre la section inconditionnelle contredirait frontalement le « gate is N/A » ci-dessus. (3) Elle déplacerait le blocage sans le lever : troquer un ESCALATE architecte contre un rouge CI laisse le ticket immobile, une porte plus loin. Si une telle garde devient souhaitable, sa précondition est une **mesure** — la proportion de plans GROOMED portant un détecteur sans la section — qui n'existe pas aujourd'hui.
++
+ ## Provenance
+ 
+ - `feedback_scope_bind_must_name_fire_disposition` (orchestrator-CC memory, 2026-06-26)
+ - mika#1574 (this ticket)
+ - Mika Prime bearing-read 2026-06-26
++- mika#2306 (2026-09-21) — § Site de production : la prescription et le rattrapage
++- mika#1600 / mika#1627 — le précédent `## Acceptance criteria` : même producteur tiers, même trou
++- mika#2211 — `_PR_BODY_CONTAINMENT_RULE` : le précédent d'une règle injectée par `dispatch-lib` parce que le fichier de commande est hors de portée
+diff --git a/skills/bundled/_shared/dispatch-lib.sh b/skills/bundled/_shared/dispatch-lib.sh
+index 9dfa690a..24ec2eb1 100644
+--- a/skills/bundled/_shared/dispatch-lib.sh
++++ b/skills/bundled/_shared/dispatch-lib.sh
+@@ -2002,20 +2002,70 @@ _is_dispatchable_repo() {
+ # carries up to 16 KiB of ticket context, and recency is the only leverage it has.
+ _PR_BODY_CONTAINMENT_RULE="RÈGLE DE DISPATCH (mika#2211) — le corps de PR ne s'écrit JAMAIS hors du worktree.
+ Pour ouvrir la PR : écris le corps dans un fichier SOUS le worktree (\`pr-body.md\` à sa racine),
+ passe-le en \`--body-file pr-body.md\`, puis supprime-le. Un corps court peut rester en \`--body\` inline.
+ N'écris jamais dans \`/tmp\` : la permission-policy refuse toute écriture hors worktree
+ (\`[policy:deny] Write: /tmp/pr-body-<N>.md\`), \`gh pr create --body-file\` ne trouve alors aucun fichier,
+ et la session se termine sans PR. N'utilise pas non plus de heredoc \`<<'BODY'\` : un corps généré peut
+ contenir la ligne délimitrice et le terminer trop tôt. Ne demande jamais à l'opérateur de coller le corps
+ — une session dispatchée qui pose une question est une session morte."
+ 
++# mika#2306 — la prescription `## Fire-Disposition`, portée par chaque dispatch
++# de grooming.
++#
++# Le défaut qu'elle ferme : `/ce:plan` est un plugin tiers
++# (`compound-engineering`) qui n'a aucune connaissance de mika#1574, donc un plan
++# neuf livrant un détecteur arrive devant mika-arch sans la section que son
++# Fire-Disposition Gate exige. L'architecte rend alors ITERATE — à juste titre —
++# et l'unique itération de `_iterate_groom_loop` est dépensée sur un motif
++# purement formel, évitable en amont. Au second passage le gate est sans recours
++# (« No ITERATE exists at second pass per the two-pass limit »), donc le ticket
++# ESCALATE et la boucle ne dispatche jamais l'implémentation.
++#
++# C'est exactement la configuration que le Acceptance-Criteria Gate décrit déjà
++# mot pour mot pour sa section sœur : « Grooming is the surface we control
++# between the third-party producer and our validator. » `## Acceptance criteria`
++# a reçu ce traitement (mika#1600/#1627) ; `## Fire-Disposition` ne l'avait
++# jamais reçu.
++#
++# La règle vit ICI et non dans `.claude/commands/mika-groom-plan-only.md` pour la
++# même raison que `_PR_BODY_CONTAINMENT_RULE` ci-dessus : les trois commandes de
++# groom vivent dans `senara-solutions/mika-platform` et sont semées dans le
++# worktree par `_seed_worktree_slash_commands` (mika#1415), donc un ticket ouvert
++# sur `senara-solutions/mika` ne peut pas les éditer. Ce PROMPT est le seul canal
++# que ce dépôt contrôle. La moitié commandes est nommée en suivi, pas simulée.
++#
++# Ce n'est pas le prompt-enforcement que
++# `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate` condamne :
++# la leçon de mika#2120 porte sur une consigne qui dépend qu'un opérateur pense à
++# la taper. Une constante injectée par le substrat à chaque dispatch ne dépend
++# d'aucune mémoire — et la moitié structurelle est livrée à côté (le rattrapage
++# de `_launch_revise_pilot`), ce que cette doctrine prescrit justement.
++#
++# Elle cite mika#1574 par référence et nomme ses trois options ; elle ne
++# reformule pas la doctrine, pour que les deux ne puissent pas diverger.
++_FIRE_DISPOSITION_RULE="RÈGLE DE GROOMING (mika#2306) — un plan qui livre un détecteur porte \`## Fire-Disposition\`.
++Détecteur = tout livrable dont la fonction primaire est de signaler une violation : test,
++assertion, règle de lint, garde CI, validateur de schéma, scan structurel, garde EndTurn —
++tout code dont le chemin de succès est « aucune violation trouvée ».
++Si le plan en livre au moins un, il DOIT porter une section \`## Fire-Disposition\` nommant
++l'une des trois options canoniques de mika#1574, avec son détail d'implémentation :
++(a) exception nommée en allowlist (défaut) — chaque violation existante reçoit une entrée
++    grep-visible qui nomme la donnée précise, référence un ticket de suivi, et porte une
++    assertion auto-nettoyante qui rougit quand l'exception devient stale ;
++(b) livrer désarmé — le détecteur atterrit avec \`#[ignore]\` / \`#[cfg(skip)]\` ou équivalent,
++    plus un suivi tracké pour l'armer ;
++(c) halte-et-remontée — l'implémentation s'arrête et remonte à l'opérateur pour cadrage.
++Si le plan ne livre AUCUN détecteur, la section n'est pas requise (gate N/A) : ne l'invente pas.
++Sans elle, mika-arch rend ITERATE en première passe et ESCALATE en seconde — et la seconde
++passe est sans recours."
++
+ # mika#2178 — render the ticket text (body AND comments) in a form that can be
+ # injected into the pilot's opening prompt.
+ #
+ # The defect this repairs: `PROMPT` was exactly `<repo>#<num>`, and claude-pilot
+ # builds its opening prompt by plain concatenation, `f"{ns.command} {opening}"`
+ # (claude_pilot/cli.py:290 interactive, :251 headless). On the plan-callout path
+ # — the one every groomed ticket takes — the pilot's real input was therefore
+ # `/ce-work docs/plans/x.md mika#N`: no body, no comments. The seven readers of
+ # the issue-body variable are all internal to this file (branch derivation,
+ # anti-re-groom gate, callout detection, rescue) and none of them writes into
+@@ -2579,20 +2629,37 @@ Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
+         # `mika`'s command file carries the canonical form (mika#2211 AC1),
+         # mika-dev's prompt carries the rule for what IT composes (AC2), and
+         # this line is what covers `mika-cloud` / `mika-skills`, whose command
+         # files still hold the pre-fix inline instruction.
+         #
+         # Appended AFTER the ticket context, so the same three position
+         # invariants documented above still hold, and the FIRST LINE of PROMPT
+         # is still exactly `<repo>#<num>` (the mika#138 contract).
+         PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$_PR_BODY_CONTAINMENT_RULE")
+ 
++        # --- mika#2306: la prescription Fire-Disposition atteint le groomeur ---
++        #
++        # Conditionnée au skill, à la différence des deux injections ci-dessus.
++        # Celles-là sont inconditionnelles et ont raison de l'être — le corps du
++        # ticket et la règle de corps de PR servent tout pilote. Celle-ci
++        # s'adresse à qui ÉCRIT un plan ; l'injecter pour `dev-pilot` serait du
++        # bruit dans le prompt d'un pilote qui n'en écrit pas. La condition est
++        # donc à écrire explicitement, jamais à hériter du voisin : la copier
++        # sans elle est exactement l'écart que le contrôle négatif T3 attrape.
++        #
++        # Appendue APRÈS les deux autres, donc les trois invariants de position
++        # documentés plus haut tiennent toujours et la PREMIÈRE LIGNE de PROMPT
++        # reste exactement `<repo>#<num>` (contrat mika#138, invariant 2).
++        if [ "$SKILL" = "dev-groom" ]; then
++            PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$_FIRE_DISPOSITION_RULE")
++        fi
++
+         # Save pre-run HEAD SHA for post-flight diff check
+         PRE_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
+         # Save pre-run remote HEAD for pilot push guard (mika#1318).
+         # Empty if branch doesn't exist on remote yet.
+         PRE_RUN_REMOTE_HEAD=$(git -C "$WORKTREE_DIR" ls-remote origin "refs/heads/$BRANCH" 2>/dev/null | cut -f1 || true)
+     else
+         # --- Free-text mode: pass prompt as-is, no worktree ---
+         PRE_RUN_HEAD=""
+         PRE_RUN_REMOTE_HEAD=""
+         LOG_ID="$TASK_ID"
+@@ -5317,24 +5384,32 @@ _trail_read() {
+ _launch_revise_pilot() {
+     # Phase D companion (mika#1271) — launch claude-pilot for content-only plan
+     # revision against architect findings. Entry command: /mika-revise-plan
+     # (slash command at mika-platform/.claude/commands/mika-revise-plan.md,
+     # copied into the worktree by _set_up_worktree at task start).
+     #
+     # The pilot reads findings, revises the plan on disk in-place, exits. We
+     # detect revision via sha256 of the plan file before-and-after. Identical
+     # content = "no revision happened" = caller falls through.
+     #
+-    # Args: $1 = absolute path to findings file
++    # Args: $1 = absolute path to findings file — le findings-file de PREMIÈRE
++    #            passe (`$WORKTREE_DIR/.iterate/findings-1.md`, écrit par
++    #            `_iterate_groom_loop` depuis la sortie architecte). C'est la
++    #            source UNIQUE du premier terme du prédicat mika#2306 ci-dessous.
+     # Returns: 0 if plan content changed, 1 otherwise (missing args, no plan
+     #          found, pilot failed to revise).
+ 
++    # mika#2306 — compteur de garde du rattrapage Fire-Disposition, remis à zéro
++    # à CHAQUE entrée. Global à dessein (pas de `local`) : la terminaison doit
++    # être lisible sans dérouler le flot de contrôle, et le test T10 la lit.
++    _FD_REVISE_RETRIED=0
++
+     local findings_file="$1"
+     [ -r "$findings_file" ] || {
+         echo "WARN: _launch_revise_pilot: findings file not readable: $findings_file" >&2
+         return 1
+     }
+     [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ] || {
+         echo "WARN: _launch_revise_pilot: WORKTREE_DIR missing" >&2; return 1; }
+     [ -n "$ISSUE_NUM" ] || {
+         echo "WARN: _launch_revise_pilot: ISSUE_NUM unset" >&2; return 1; }
+ 
+@@ -5362,27 +5437,153 @@ _launch_revise_pilot() {
+         >"$revise_stdout" 2>"$revise_stderr"
+     local revise_exit=$?
+     set -e
+ 
+     # sha256 after revise
+     local post_hash; post_hash=$(sha256sum "$plan_path" | cut -d' ' -f1)
+     rm -f "$revise_stdout" "$revise_stderr"
+ 
+     if [ "$pre_hash" != "$post_hash" ]; then
+         echo "_launch_revise_pilot: plan revised (sha changed from ${pre_hash:0:12} to ${post_hash:0:12})" >&2
++        _fd_retry_if_section_still_missing "$findings_file" "$plan_path"
+         return 0
+     else
+         echo "WARN: _launch_revise_pilot: plan unchanged after revise pilot (exit=$revise_exit)" >&2
+         return 1
+     fi
+ }
+ 
++# mika#2306 — le rattrapage Fire-Disposition, greffé sur la branche `sha256`
++# RÉUSSIE de `_launch_revise_pilot`.
++#
++# Le défaut qu'il ferme : le critère de convergence du revise est « le contenu a
++# changé », jamais « le finding a été traité ». Un revise qui corrige une virgule
++# sans ajouter la section réclamée est, pour la boucle, indistinguable d'un
++# revise réussi ; elle enchaîne sur le second passage, qui ESCALATE, et l'unique
++# itération a été dépensée pour rien.
++#
++# Le prédicat est une CONJONCTION DE DEUX `grep`, jamais un jugement :
++#   1. l'architecte a réclamé la section ⇔ le findings-file de PREMIÈRE PASSE
++#      contient la chaîne `Fire-Disposition` (le vocabulaire imposé par son
++#      propre gate) ;
++#   2. la section est absente ⇔ le plan révisé ne porte pas `^## Fire-Disposition`.
++#
++# La SOURCE du premier terme est portante, pas un détail de rédaction. C'est
++# `$1` — le findings-file de première passe reçu par `_launch_revise_pilot`. Le
++# findings ciblé que cette fonction écrit elle-même (`findings-1-fd.md`) est
++# INTERDIT comme source : il contient nécessairement la chaîne `Fire-Disposition`
++# puisque c'est son objet, donc un prédicat qui le relirait serait vrai par
++# construction — la garde relancerait même quand l'architecte n'a rien demandé,
++# et le test de relance-unique resterait vert sur une garde qui ne regarde plus
++# la sortie architecte. Le compteur casserait la boucle infinie ; il ne rendrait
++# pas le défaut visible. Même raison pour l'absence de récursion sur
++# `_launch_revise_pilot` : elle ferait de `findings-1-fd.md` le `$1` du second
++# tour, c'est-à-dire exactement la confusion de source interdite.
++#
++# Si l'un des deux termes est faux, RIEN ne se passe : comportement d'avant le
++# correctif, bit pour bit. Un plan sans détecteur ne paie rien, un revise qui a
++# fait son travail ne paie rien. Un findings-file illisible sort le dispatch de
++# la population plutôt que de l'y faire entrer.
++#
++# Le BUDGET ARCHITECTE est inchangé : aucun appel `_arch_ask` sur ce chemin. Ce
++# qui est élargi est le budget du *revise*, qui n'est le contrat de personne —
++# et d'une seule tentative. Cette fonction ne REFUSE jamais rien : elle réessaie,
++# puis laisse passer en journalisant. Un échec dur ici aurait déplacé l'ESCALATE
++# d'une porte au lieu de le lever.
++#
++# Args: $1 = findings-file de première passe (source du terme 1)
++#       $2 = chemin du plan révisé (sujet du terme 2)
++# Returns: toujours 0 — l'appelant a déjà décidé que le plan a changé.
++_fd_retry_if_section_still_missing() {
++    local first_pass_findings="$1" plan_path="$2"
++
++    # Budget : une seule relance par invocation de `_launch_revise_pilot`.
++    [ "${_FD_REVISE_RETRIED:-0}" -eq 0 ] || return 0
++    # Fail-safe : une information illisible SORT de la population.
++    [ -r "$first_pass_findings" ] || return 0
++    [ -r "$plan_path" ] || return 0
++
++    # Terme 1 — l'architecte a réclamé la section.
++    grep -qF -- 'Fire-Disposition' "$first_pass_findings" 2>/dev/null || return 0
++    # Terme 2 — le plan révisé ne la porte toujours pas.
++    ! grep -qE '^## Fire-Disposition' "$plan_path" 2>/dev/null || return 0
++
++    # Armé avant toute action : un échec en aval ne doit pas rouvrir le budget.
++    _FD_REVISE_RETRIED=1
++
++    local fd_findings_file="${first_pass_findings%/*}/findings-1-fd.md"
++    printf '%s\n' "FINDING SYNTHÉTIQUE — émis par dispatch-lib (mika#2306), pas par l'architecte.
++
++F-FD [BLOQUANT] — la section \`## Fire-Disposition\` que la première passe
++architecte a réclamée est TOUJOURS ABSENTE du plan révisé.
++
++Le plan a bien été modifié, mais le finding n'a pas été traité. En l'état il part
++au second passage architecte, où le Fire-Disposition Gate est SANS RECOURS
++(« No ITERATE exists at second pass per the two-pass limit ») : le verdict sera
++ESCALATE et le ticket ne sera jamais implémenté.
++
++Action demandée, et elle seule : ajouter au plan une section \`## Fire-Disposition\`
++nommant l'une des trois options canoniques de mika#1574, avec son détail
++d'implémentation —
++  (a) exception nommée en allowlist (défaut) : chaque violation existante reçoit
++      une entrée grep-visible qui nomme la donnée précise, référence un ticket de
++      suivi, et porte une assertion auto-nettoyante ;
++  (b) livrer désarmé : \`#[ignore]\` / \`#[cfg(skip)]\` ou équivalent, plus un suivi
++      tracké pour l'armer ;
++  (c) halte-et-remontée : l'implémentation s'arrête et remonte à l'opérateur.
++
++Si — et seulement si — le plan ne livre réellement AUCUN détecteur (test,
++assertion, lint, garde CI, validateur, scan structurel, garde EndTurn), dis-le
++explicitement dans la section plutôt que d'inventer une disposition : le gate est
++alors N/A et cette phrase est ce qui le rend lisible.
++
++Ne touche à rien d'autre du plan." > "$fd_findings_file" 2>/dev/null || {
++        echo "WARN: fire_disposition_retry_findings_unwritable: cannot write $fd_findings_file — skipping retry" >&2
++        return 0
++    }
++
++    echo "fire_disposition_revise_retried: ${REPO:-?}#${ISSUE_NUM:-?} — section absente du plan révisé alors que les findings de première passe la réclamaient ; relance unique du pilote de revise avec $(basename "$fd_findings_file")" >&2
++
++    local fd_log_id="${LOG_ID:-unknown}-revise-fd-$(date +%s)"
++    local fd_stdout; fd_stdout=$(mktemp /tmp/revise-fd-stdout-XXXXXX)
++    local fd_stderr; fd_stderr=$(mktemp /tmp/revise-fd-stderr-XXXXXX)
++
++    set +e
++    # CWD_ARGS is intentionally word-split (multiple flags)
++    # shellcheck disable=SC2086
++    _pilot_log_dir; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$fd_log_id" \
++        --command "/mika-revise-plan" $CWD_ARGS \
++        -- "@${fd_findings_file}" \
++        >"$fd_stdout" 2>"$fd_stderr"
++    set -e
++    rm -f "$fd_stdout" "$fd_stderr"
++
++    # La section est re-testée POUR JOURNALISER, jamais pour reboucler : le
++    # compteur est déjà armé, donc aucun chemin ne réarme le lancement. C'est ce
++    # qui réconcilie « une seule relance » et « l'événement doit savoir si la
++    # section manque encore » — le prédicat est évalué deux fois, il n'autorise
++    # l'action qu'une.
++    #
++    # Les deux événements sont de l'OBSERVABILITÉ PURE : consommés par
++    # l'opérateur et par l'analyse de logs (mika#2205), relus par aucune branche
++    # de ce fichier, sans effet sur le flot de la boucle. Régime attendu :
++    # `fire_disposition_revise_retried` rare, `fire_disposition_still_missing_after_retry`
++    # à zéro. Une occurrence soutenue du second dit que le pilote de revise ne
++    # sait pas écrire la section — donc que le correctif est côté
++    # `/mika-revise-plan` (suivi mika-platform), PAS un troisième essai ici.
++    if ! grep -qE '^## Fire-Disposition' "$plan_path" 2>/dev/null; then
++        echo "fire_disposition_still_missing_after_retry: ${REPO:-?}#${ISSUE_NUM:-?} — la seconde tentative n'a pas produit la section ; le plan part au second passage architecte. Aucune troisième relance (budget épuisé)." >&2
++    fi
++
++    return 0
++}
++
+ _cleanup_iterate_findings() {
+     # Sweep $WORKTREE_DIR/.iterate/ on GROOMED success. PRESERVE on ESCALATE
+     # for forensic access — the worktree TTL handles eventual cleanup, and the
+     # findings file is the operator's primary forensic artifact when deciding
+     # whether to retry, refactor, or kill the plan. Sweeping it on ESCALATE
+     # deletes the evidence at exactly the moment it's most useful.
+     [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ] || return 0
+     local findings_dir="$WORKTREE_DIR/.iterate"
+     [ -d "$findings_dir" ] || return 0
+     # mika#1943: le `[ -d ]` ci-dessus prouve que le chemin existe, jamais qu'il
+diff --git a/skills/bundled/_shared/test-dispatch-lib.sh b/skills/bundled/_shared/test-dispatch-lib.sh
+index 412427b2..5af46b27 100644
+--- a/skills/bundled/_shared/test-dispatch-lib.sh
++++ b/skills/bundled/_shared/test-dispatch-lib.sh
+@@ -5099,27 +5099,33 @@ CP_VAR_FLAGS=$(printf '%s\n' $CP_VAR_FLAGS | sort -u || true)
+ CP_BUILT_FLAGS=$(printf '%s\n%s\n' "$CP_LITERAL_FLAGS" "$CP_VAR_FLAGS" | grep -vE '^(--)?$' | sort -u || true)
+ 
+ # Known limit, stated rather than coded around: one level of indirection
+ # (`A="--trace"; B="$A"`) and a composed flag (`F="--$name"`) both slip through.
+ # Closing them would mean evaluating shell, which changes what this guard is.
+ 
+ # Count SITES, not flags. A flag floor cannot notice a lost invocation — the
+ # surviving one carries seven flags on its own, so the total never drops
+ # (measured). Pinning the site count means a renamed, reordered, or added
+ # launch point turns red instead of evaporating.
++#
++# Count moved 3 → 4 on 2026-09-21 (mika#2306): the Fire-Disposition retry in
++# `_fd_retry_if_section_still_missing` is a fourth launch point, deliberately a
++# direct invocation rather than a recursion into `_launch_revise_pilot` — the
++# recursion would make the retry's own findings-file the predicate's input and
++# render its first term true by construction.
+ CP_SITE_COUNT=$(printf '%s\n' "$CP_INVOCATIONS" | grep -c . || true)
+-if [ "$CP_SITE_COUNT" -eq 3 ]; then
++if [ "$CP_SITE_COUNT" -eq 4 ]; then
+     PASS=$((PASS + 1))
+-    echo "  ✓ all 3 claude-pilot launch sites are in the guard's sight"
++    echo "  ✓ all 4 claude-pilot launch sites are in the guard's sight"
+ else
+     FAIL=$((FAIL + 1))
+-    echo "  ✗ expected 3 claude-pilot launch sites, saw $CP_SITE_COUNT"
++    echo "  ✗ expected 4 claude-pilot launch sites, saw $CP_SITE_COUNT"
+     echo "    A site the guard cannot see is a site it cannot police. If a launch"
+     echo "    point was legitimately added or removed, update this count."
+ fi
+ 
+ # --- Pass A: every built flag is accepted (hermetic) ---
+ CP_UNKNOWN=""
+ for f in $CP_BUILT_FLAGS; do
+     case " $CP_ACCEPTED_FLAGS " in
+         *" $f "*) ;;
+         *) CP_UNKNOWN="$CP_UNKNOWN $f" ;;
+@@ -5845,21 +5851,25 @@ MIKA2165_UNCOLOCATED=$(grep -nE '\$\{?_PILOT_LOG_DIR\b' "$DISPATCH_LIB" \
+     | grep -vE '_pilot_log_dir' \
+     || true)
+ assert_eq "mika#2165: chaque lecture de \$_PILOT_LOG_DIR appelle le résolveur sur la même ligne" "" \
+     "$MIKA2165_UNCOLOCATED"
+ 
+ # `--log-dir` valué, jamais nu : nu, argparse retombe sur le `const` Python
+ # (/var/log/claude-pilot) et le pilote écrit ailleurs que là où l'hôte bind et
+ # relit — l'invariant à trois têtes casse sans qu'aucun test structurel ne bouge.
+ assert_eq "mika#2165: aucun --log-dir nu ne subsiste" "0" \
+     "$(grep -cE -- '--log-dir([[:space:]]+--|[[:space:]]*$)' "$DISPATCH_LIB" || true)"
+-assert_eq "mika#2165: chaque --log-dir est valué par le résolveur" "2" \
++#
++# Compte passé de 2 à 3 le 2026-09-21 (mika#2306) : la relance Fire-Disposition
++# est un troisième lancement, et elle reproduit la forme co-localisée ci-dessus
++# plutôt que de lire une valeur héritée du lancement nominal.
++assert_eq "mika#2165: chaque --log-dir est valué par le résolveur" "3" \
+     "$(grep -cF -- '--log-dir "$_PILOT_LOG_DIR"' "$DISPATCH_LIB" || true)"
+ 
+ # L'assertion de comportement : la surcharge posée APRÈS le source est honorée.
+ # C'est celle qui aurait attrapé la régression ci-dessus ; les assertions
+ # structurelles au-dessus n'y suffisent pas.
+ # Les sondes impriment $_PILOT_LOG_DIR elles-mêmes : le résolveur assigne, il ne
+ # rend rien sur stdout (voir la collision mika#2039 ci-dessus). Ce `printf` vit
+ # dans la suite de tests, pas dans le dispatch tracé — la garde R8 ne le voit pas
+ # et n'a pas à le voir.
+ _mika2165_late_override_probe() {
+@@ -6531,20 +6541,382 @@ assert_contains "mika#1943 U2: et l'épargne est DITE, pas silencieuse" \
+ # faisait, et il comptait les commentaires que ce même correctif venait
+ # d'ajouter.
+ _MIKA1943_CODE_LINES=$(grep -v '^[[:space:]]*#' "$DISPATCH_LIB" || true)
+ _MIKA1943_WT_REMOVES=$(printf '%s\n' "$_MIKA1943_CODE_LINES" | grep -c 'worktree remove --force' || true)
+ assert_eq "mika#1943 U2: exactement trois 'worktree remove --force' recensés" \
+     "3" "$_MIKA1943_WT_REMOVES"
+ _MIKA1943_RMRF_WT=$(printf '%s\n' "$_MIKA1943_CODE_LINES" | grep -cE 'rm -rf "\$(wt|WORKTREE_DIR|findings_dir)' || true)
+ assert_eq "mika#1943 U2: exactement deux 'rm -rf' sur un chemin de worktree" \
+     "2" "$_MIKA1943_RMRF_WT"
+ 
++# ============================================================================
++# mika#2306 — la section `## Fire-Disposition` a un site de production (T1–T11)
++# ============================================================================
++#
++# Ce que ces onze détecteurs mesurent. Avant mika#2306, aucun canal que CE dépôt
++# contrôle ne prescrivait `## Fire-Disposition` : `/ce:plan` est un plugin tiers
++# qui ignore mika#1574, les trois commandes de groom vivent dans mika-platform,
++# et `grep -n "Fire-Disposition" .claude/commands/*.md` rendait zéro. Un plan
++# neuf livrant un détecteur arrivait donc devant mika-arch sans la section, et
++# l'unique itération de la boucle était dépensée sur un motif formel — puis le
++# gate de seconde passe, sans recours, rendait ESCALATE.
++#
++# Les deux moitiés sont livrées ensemble à dessein : la prescription (T1–T4)
++# ne tiendrait pas seule, et le rattrapage (T5–T11) ne tiendrait pas seul non
++# plus. Les quatre contrôles négatifs (T3, T6, T7, T11) sont porteurs, pas
++# décoratifs : sans eux, une garde qui relance TOUJOURS passerait T5 en vert
++# tout en doublant le coût de chaque grooming du dépôt.
++
++echo ""
++echo 'Test: mika#2306 — site de production de `## Fire-Disposition` (T1–T11)'
++echo "-----------------------------------------------------------------------"
++
++# --- Outillage local de section ---------------------------------------------
++
++# Réplique le site d'injection de `_set_up_worktree` : contexte de ticket, puis
++# règle de corps de PR (inconditionnelle), puis règle Fire-Disposition
++# (conditionnée au skill). T2/T3 assertent sur CETTE chaîne ; T4 asserte que
++# l'expression source est littéralement celle répliquée ici, donc le miroir ne
++# peut pas dériver en silence (patron mika#2178 T3).
++_t2306_inject() {
++    local skill="$1" repo="${2:-mika}" issue_num="${3:-2306}"
++    local prompt="${repo}#${issue_num}"
++    prompt=$(printf '%s\n\n%s' "$prompt" "$_PR_BODY_CONTAINMENT_RULE")
++    if [ "$skill" = "dev-groom" ]; then
++        prompt=$(printf '%s\n\n%s' "$prompt" "$_FIRE_DISPOSITION_RULE")
++    fi
++    printf '%s' "$prompt"
++}
++
++# Sonde comportementale de `_launch_revise_pilot`.
++#
++# Elle exerce la VRAIE fonction : seul `_run_pilot_sandboxed` est neutralisé
++# (par redéfinition locale au sous-shell, jamais par une chaîne écrite à la
++# main), ce qui est la seule façon de prouver que le compte de relances vient de
++# la garde et de rien d'autre. Chaque invocation du pilote simulé incrémente un
++# compteur sur disque et applique la mutation demandée au plan — modifier le
++# plan est indispensable, sans quoi `pre_hash == post_hash` et le flot tombe
++# dans la branche d'échec avant d'atteindre la garde.
++#
++# $1 = contenu de .iterate/findings-1.md
++# $2 = le plan initial porte-t-il déjà la section ? (yes|no)
++# $3 = comportement du pilote simulé :
++#      never  — ne l'ajoute jamais
++#      second — l'ajoute à la deuxième invocation
++#      wipe   — supprime le findings-file de première passe (fail-safe en vol)
++# $4 = (optionnel) "residual-fd" dépose un findings-1-fd.md résiduel
++# Rend : "<rc>|<nombre d'invocations du pilote>|<stderr>"
++_t2306_revise_probe() {
++    local t2306_findings="$1" t2306_has_section="$2" t2306_behaviour="$3" t2306_extra="${4:-}"
++    local t2306_root t2306_wt t2306_plan t2306_counter t2306_err t2306_rc
++    t2306_root=$(mktemp -d)
++    t2306_wt="$t2306_root/.claude/worktrees/fix-2306-probe/mika"
++    mkdir -p "$t2306_wt/docs/plans" "$t2306_wt/.iterate"
++    t2306_plan="$t2306_wt/docs/plans/2026-09-21-001-fix-2306-sonde-plan.md"
++
++    # > 500 octets : `_find_issue_plan` filtre les plans plus courts (mika#1033).
++    # Le remplissage est volontairement large — un plan qui tombe SOUS le seuil
++    # fait rendre « no plan file to revise », c'est-à-dire un vert qui n'a rien
++    # exercé de la garde. C'est le premier défaut que cette sonde a eu.
++    {
++        printf '# mika#2306 — plan de sonde\n\n**Ticket :** mika issue#2306\n\n## Problème\n\n'
++        printf 'Corps de remplissage pour franchir le filtre des 500 octets applique par\n'
++        printf '_find_issue_plan a tous ses tiers de decouverte. Ce texte ne porte aucune\n'
++        printf 'signification pour la sonde : seules comptent sa longueur, et la presence\n'
++        printf "ou l'absence de la section testee.\n\n"
++        printf 'Le seuil existe pour ecarter les fichiers-fantomes et les ebauches vides ;\n'
++        printf "il s'applique identiquement aux trois tiers de decouverte, donc un plan\n"
++        printf 'trop court est invisible quelle que soit la façon dont il est nomme. Une\n'
++        printf 'sonde qui passe sous ce seuil ne mesure rien et le dit mal : elle rend\n'
++        printf 'exactement le meme « plan introuvable » que la garde de fonction.\n\n'
++        printf '## Implementation Units\n\nU1 — un livrable detecteur quelconque.\n\n'
++        if [ "$t2306_has_section" = "yes" ]; then
++            printf '## Fire-Disposition\n\nOption (a) — exception nommee, table vide.\n\n'
++        fi
++        printf '## Acceptance criteria\n\nAC1 — la sonde tourne.\n'
++    } > "$t2306_plan"
++
++    printf '%s\n' "$t2306_findings" > "$t2306_wt/.iterate/findings-1.md"
++    if [ "$t2306_extra" = "residual-fd" ]; then
++        printf 'Fire-Disposition — residu laisse par un dispatch anterieur.\n' \
++            > "$t2306_wt/.iterate/findings-1-fd.md"
++    fi
++
++    t2306_counter="$t2306_root/pilot-invocations"
++    printf '0\n' > "$t2306_counter"
++
++    # UNE seule exécution : le rc transite par un fichier plutôt que par une
++    # seconde passe. Rejouer la fonction avec un pilote inerte donnerait
++    # `pre_hash == post_hash`, donc un rc de 1 sans rapport avec ce qui est
++    # mesuré — un faux vert sur la moitié fail-safe.
++    t2306_err=$(
++        # shellcheck disable=SC1090
++        source "$DISPATCH_LIB" 2>/dev/null || true
++        # Neutralisation RÉELLE : seul le lancement du pilote est shadowé, tout
++        # le reste de `_launch_revise_pilot` s'exécute tel quel. C'est la seule
++        # façon de prouver que le compte de relances vient de la garde.
++        _run_pilot_sandboxed() {
++            local n; n=$(( $(cat "$t2306_counter") + 1 ))
++            printf '%s\n' "$n" > "$t2306_counter"
++            case "$t2306_behaviour" in
++                wipe) rm -f "$t2306_wt/.iterate/findings-1.md" ;;
++                second) [ "$n" -ge 2 ] && printf '\n## Fire-Disposition\n\nOption (a).\n' >> "$t2306_plan" ;;
++            esac
++            # Mutation inconditionnelle : sans elle le sha ne bouge pas, et la
++            # branche de succès — donc la garde — n'est jamais atteinte.
++            printf '\n<!-- revise %s -->\n' "$n" >> "$t2306_plan"
++            return 0
++        }
++        set +e
++        WORKTREE_DIR="$t2306_wt" ISSUE_NUM="2306" REPO="mika" LOG_ID="t2306" \
++            CWD_ARGS="--cwd $t2306_wt" \
++            _launch_revise_pilot "$t2306_wt/.iterate/findings-1.md" 2>&1 >/dev/null
++        printf '%s\n' "$?" > "$t2306_root/rc"
++    )
++    t2306_rc=$(cat "$t2306_root/rc")
++    printf '%s|%s|%s' "$t2306_rc" "$(cat "$t2306_counter")" "$t2306_err"
++    rm -rf "$t2306_root"
++}
++
++# Le champ 3 est du stderr libre — multiligne, et pouvant contenir des `|`. Un
++# `cut` nu le traiterait ligne par ligne et rendrait, pour les champs 1 et 2,
++# les lignes de stderr qui ne portent aucun délimiteur. Deuxième défaut que
++# cette sonde a eu, et il produisait des `expected: 1 / actual: 1` illisibles.
++_t2306_field() { printf '%s' "$2" | head -1 | cut -d'|' -f"$1"; }
++_t2306_err()   { printf '%s' "$1" | sed '1s/^[0-9]*|[0-9]*|//'; }
++
++T2306_FINDINGS_WITH_FD="F1 [BLOQUANT] — le plan livre des tests et ne porte pas de section
++\`## Fire-Disposition\`. Ajoute-la en nommant l'une des trois options de mika#1574.
++
++Disposition: ITERATE"
++T2306_FINDINGS_WITHOUT_FD="F1 [BLOQUANT] — l'unité U2 laisse le choix de la structure de
++données à l'implémenteur. Tranche-le dans le plan.
++
++Disposition: ITERATE"
++
++T2306_LIB_SRC=$(cat "$DISPATCH_LIB")
++T2306_SUW_SRC=$(sed -n '/^_set_up_worktree() {/,/^}/p' "$DISPATCH_LIB")
++T2306_REVISE_SRC=$(declare -f _launch_revise_pilot)
++T2306_GUARD_SRC=$(declare -f _fd_retry_if_section_still_missing)
++
++# --- T1 : la règle existe et dit quoi écrire ---------------------------------
++#
++# Une règle tronquée qui prescrit la section sans nommer ses options ferait
++# inventer une quatrième disposition au groomeur — pire que le silence, parce
++# qu'elle passerait le `grep` du gate et échouerait sur son contenu.
++
++assert_eq "T1: _FIRE_DISPOSITION_RULE est définie et non vide" "non-vide" \
++    "$([ -n "${_FIRE_DISPOSITION_RULE:-}" ] && echo non-vide || echo vide)"
++assert_contains "T1: la règle nomme la section exacte" \
++    '## Fire-Disposition' "${_FIRE_DISPOSITION_RULE:-}"
++assert_contains "T1: la règle nomme l'option (a)" "(a)" "${_FIRE_DISPOSITION_RULE:-}"
++assert_contains "T1: la règle nomme l'option (b)" "(b)" "${_FIRE_DISPOSITION_RULE:-}"
++assert_contains "T1: la règle nomme l'option (c)" "(c)" "${_FIRE_DISPOSITION_RULE:-}"
++assert_contains "T1: la règle cite la doctrine par référence plutôt que de la reformuler" \
++    "mika#1574" "${_FIRE_DISPOSITION_RULE:-}"
++# La conditionnalité est la moitié que l'option (a) du gate rend explicite :
++# sans elle, un groomeur ajouterait la section à tout plan, ce qui contredit
++# « Plan has no detector-class deliverables ⇒ gate is N/A ».
++assert_contains "T1: la règle dit que la section n'est PAS requise sans détecteur" \
++    "N/A" "${_FIRE_DISPOSITION_RULE:-}"
++
++# --- T2 : la prescription atteint le groomeur --------------------------------
++
++T2306_PROMPT_GROOM=$(_t2306_inject "dev-groom")
++assert_contains "T2: la règle est injectée dans le PROMPT pour SKILL=dev-groom" \
++    '## Fire-Disposition' "$T2306_PROMPT_GROOM"
++assert_contains "T2: et le site d'injection existe bien dans _set_up_worktree" \
++    '_FIRE_DISPOSITION_RULE' "$T2306_SUW_SRC"
++
++# --- T3 : contrôle négatif — dev-pilot ne la reçoit pas ----------------------
++#
++# Porteur, pas décoratif : le site voisin (`_PR_BODY_CONTAINMENT_RULE`) est
++# inconditionnel dans cette branche, donc la condition se PERD en copiant le
++# voisin. C'est exactement l'écart que ce test attrape — et il ne rendrait
++# aucune décision fausse, il mettrait juste du bruit dans le prompt de tout
++# pilote d'implémentation.
++
++T2306_PROMPT_PILOT=$(_t2306_inject "dev-pilot")
++assert_not_contains "T3: la règle n'est PAS injectée pour SKILL=dev-pilot" \
++    '## Fire-Disposition' "$T2306_PROMPT_PILOT"
++assert_contains "T3: mais dev-pilot reçoit bien la règle inconditionnelle voisine" \
++    "RÈGLE DE DISPATCH (mika#2211)" "$T2306_PROMPT_PILOT"
++# La garde est lue par POSITION dans les lignes de code, pas par un `grep -B`
++# à fenêtre fixe : une ligne de commentaire ajoutée demain entre les deux
++# déplacerait la fenêtre et rendrait le test vert pour la mauvaise raison.
++T2306_SUW_CODE=$(printf '%s\n' "$T2306_SUW_SRC" | grep -v '^[[:space:]]*#')
++T2306_FD_INJ_LN=$(printf '%s\n' "$T2306_SUW_CODE" | grep -n '_FIRE_DISPOSITION_RULE' | head -1 | cut -d: -f1)
++T2306_FD_PREV_LN=""
++if [ -n "$T2306_FD_INJ_LN" ] && [ "$T2306_FD_INJ_LN" -gt 1 ]; then
++    T2306_FD_PREV_LN=$(printf '%s\n' "$T2306_SUW_CODE" | sed -n "$((T2306_FD_INJ_LN - 1))p")
++fi
++assert_contains "T3: la ligne de code qui précède l'injection est la garde sur le skill" \
++    'if [ "$SKILL" = "dev-groom" ]; then' "$T2306_FD_PREV_LN"
++
++# --- T4 : contrat mika#138 et fidélité du miroir -----------------------------
++#
++# Invariant de position 2 : si la première ligne de PROMPT cesse d'être
++# `<repo>#<num>`, la regex ancrée de `_set_up_worktree` manque, le dispatch
++# tombe en mode free-text et AUCUN worktree n'est créé. Régression de premier
++# ordre, et invisible à toute assertion sur le contenu de la règle.
++
++assert_eq "T4: la première ligne du PROMPT reste exactement mika#2306" "mika#2306" \
++    "$(printf '%s' "$T2306_PROMPT_GROOM" | head -1)"
++assert_eq "T4: idem sur le chemin dev-pilot" "mika#2306" \
++    "$(printf '%s' "$T2306_PROMPT_PILOT" | head -1)"
++assert_contains "T4: l'expression source est littéralement celle que le miroir T2/T3 réplique" \
++    'PROMPT=$(printf '"'"'%s\n\n%s'"'"' "$PROMPT" "$_FIRE_DISPOSITION_RULE")' "$T2306_LIB_SRC"
++# La règle est appendue APRÈS celle de mika#2211 : l'inverse laisserait la règle
++# de corps de PR en dernier sur le chemin dev-groom, or la recency est le seul
++# levier qu'a une règle en fin d'un prompt de 16 KiB.
++assert_eq "T4: l'injection FD suit celle de mika#2211" "yes" \
++    "$(_t2178_after '"$PROMPT" "$_FIRE_DISPOSITION_RULE")' '"$PROMPT" "$_PR_BODY_CONTAINMENT_RULE")')"
++
++# --- T5 : le cœur du correctif ----------------------------------------------
++#
++# Findings réclamant la section + plan révisé qui ne la porte toujours pas
++# ⇒ exactement UNE relance (deux invocations du pilote : la nominale et elle).
++
++T2306_T5=$(_t2306_revise_probe "$T2306_FINDINGS_WITH_FD" "no" "never")
++assert_eq "T5: findings réclamant FD + section absente ⇒ exactement une relance" \
++    "2" "$(_t2306_field 2 "$T2306_T5")"
++assert_contains "T5: et la relance est DITE, pas silencieuse" \
++    "fire_disposition_revise_retried" "$T2306_T5"
++assert_eq "T5: la valeur de retour reste 0 — la garde ajoute une tentative, pas un mode d'échec" \
++    "0" "$(_t2306_field 1 "$T2306_T5")"
++
++# Et quand la seconde tentative réussit, elle se tait : l'événement d'échec est
++# réservé à l'échec, sinon il ne mesure plus rien.
++T2306_T5B=$(_t2306_revise_probe "$T2306_FINDINGS_WITH_FD" "no" "second")
++assert_eq "T5: seconde tentative réussie ⇒ toujours une seule relance" \
++    "2" "$(_t2306_field 2 "$T2306_T5B")"
++assert_not_contains "T5: et aucun événement d'échec n'est émis quand la section arrive" \
++    "fire_disposition_still_missing_after_retry" "$T2306_T5B"
++
++# --- T6 : contrôle négatif — l'architecte n'a rien demandé -------------------
++
++T2306_T6=$(_t2306_revise_probe "$T2306_FINDINGS_WITHOUT_FD" "no" "never")
++assert_eq "T6: findings sans mention de FD ⇒ zéro relance" \
++    "1" "$(_t2306_field 2 "$T2306_T6")"
++assert_not_contains "T6: et rien n'est journalisé" \
++    "fire_disposition_revise_retried" "$T2306_T6"
++
++# --- T7 : contrôle négatif — le revise a fait son travail -------------------
++
++T2306_T7=$(_t2306_revise_probe "$T2306_FINDINGS_WITH_FD" "yes" "never")
++assert_eq "T7: section déjà présente ⇒ zéro relance (le chemin nominal ne paie rien)" \
++    "1" "$(_t2306_field 2 "$T2306_T7")"
++assert_not_contains "T7: et rien n'est journalisé" \
++    "fire_disposition_revise_retried" "$T2306_T7"
++
++# --- T8 : fail-safe — une information illisible sort de la population --------
++#
++# Deux moitiés. (a) À l'entrée : la garde préexistante rend 1, et la garde FD
++# n'y change rien. (b) EN VOL : le pilote de revise supprime le findings-file
++# entre-temps. C'est la seule forme que l'illisibilité peut réellement prendre
++# ici — l'entrée est déjà gardée — et elle doit sortir le dispatch de la
++# population, jamais l'y faire entrer.
++
++assert_eq "T8 (a): findings illisible à l'entrée ⇒ retour 1, inchangé" "1" \
++    "$(WORKTREE_DIR="/tmp" ISSUE_NUM="2306" _launch_revise_pilot "/nonexistent/findings-2306.md" 2>/dev/null; echo $?)"
++
++T2306_T8=$(_t2306_revise_probe "$T2306_FINDINGS_WITH_FD" "no" "wipe")
++assert_eq "T8 (b): findings disparu en vol ⇒ zéro relance" \
++    "1" "$(_t2306_field 2 "$T2306_T8")"
++assert_eq "T8 (b): et la valeur de retour reste celle d'avant le correctif" \
++    "0" "$(_t2306_field 1 "$T2306_T8")"
++
++# --- T9 : le budget architecte est intact ------------------------------------
++#
++# Structurel, et il l'est pour la raison qui rend ces scans nécessaires ailleurs
++# dans ce dépôt : la régression qu'il attrape ne rendrait AUCUNE décision
++# fausse. Un futur éditeur qui « améliorerait » la garde en redemandant l'avis
++# de l'architecte doublerait le budget LLM par grooming sans qu'un seul test de
++# comportement ne rougisse.
++
++assert_eq "T9: zéro appel _arch_ask dans _launch_revise_pilot" "0" \
++    "$(printf '%s\n' "$T2306_REVISE_SRC" | grep -c '_arch_ask' || true)"
++assert_eq "T9: zéro appel _arch_ask dans la garde de rattrapage" "0" \
++    "$(printf '%s\n' "$T2306_GUARD_SRC" | grep -c '_arch_ask' || true)"
++
++# Fire-Disposition, option (a) — la table d'exceptions de CE scan est vide, et
++# la vacuité est assertée À L'EXÉCUTION (modèle scripts/test-guard-shared-checkout.sh).
++# Le test rougit donc LE JOUR où une exception est ajoutée, pas seulement quand
++# elle devient stale. Une table vide assertée vide est aussi ce qui distingue
++# « aucune violation » de « le scan ne regarde rien ».
++#
++# Toute entrée future doit porter LES TROIS propriétés que l'option (a) exige —
++# (1) nommer la donnée précise, (2) référencer un ticket de suivi, (3) porter une
++# assertion auto-nettoyante — et non la seule troisième.
++T2306_ARCH_ASK_ALLOWLIST=()
++assert_eq "T9: table d'exceptions du scan _arch_ask — zero entries" "0" \
++    "${#T2306_ARCH_ASK_ALLOWLIST[@]}"
++# Contre-vacuité : le scan doit voir quelque chose. `_iterate_groom_loop`, la
++# fonction voisine, en contient bien — sinon un `grep -c` qui rend 0 partout
++# prouverait seulement que la source n'est pas lue.
++_T2306_ITERATE_SRC=$(declare -f _iterate_groom_loop)
++if [ "$(printf '%s\n' "$_T2306_ITERATE_SRC" | grep -c '_arch_ask' || true)" -gt 0 ]; then
++    assert_eq "T9 contre-vacuité: le scan voit bien les _arch_ask de _iterate_groom_loop" "ok" "ok"
++else
++    assert_eq "T9 contre-vacuité: le scan voit bien les _arch_ask de _iterate_groom_loop" "ok" \
++        "le scan ne trouve aucun _arch_ask nulle part — il ne regarde rien"
++fi
++
++# --- T10 : terminaison, et l'échec de second tour est DIT --------------------
++#
++# Sans ce test, une garde qui rendrait la main en silence sur ce chemin
++# passerait T5 en vert : l'échec de second tour deviendrait indistinguable d'un
++# succès — précisément l'angle mort que ce correctif reproche au critère sha256.
++
++assert_contains "T10: seconde tentative échouée ⇒ fire_disposition_still_missing_after_retry" \
++    "fire_disposition_still_missing_after_retry" "$T2306_T5"
++assert_eq "T10: émis exactement une fois" "1" \
++    "$(_t2306_err "$T2306_T5" | grep -c 'fire_disposition_still_missing_after_retry' || true)"
++assert_eq "T10: et AUCUNE troisième relance" "2" "$(_t2306_field 2 "$T2306_T5")"
++# La terminaison est lisible sans dérouler le flot : un compteur explicite, armé
++# AVANT toute action, donc un échec en aval ne peut pas rouvrir le budget.
++assert_contains "T10: le compteur de garde existe et est armé avant l'action" \
++    "_FD_REVISE_RETRIED=1" "$T2306_GUARD_SRC"
++assert_contains "T10: et il est remis à zéro à chaque entrée de _launch_revise_pilot" \
++    "_FD_REVISE_RETRIED=0" "$T2306_REVISE_SRC"
++
++# --- T11 : contrôle de source — le prédicat auto-entretenu ------------------
++#
++# La seule défaillance de cette famille qu'aucun autre test ne voit. Un
++# implémenteur qui lit le findings CIBLÉ (qui contient nécessairement la chaîne,
++# c'est son objet) rend le premier terme vrai par construction : la garde
++# relance même quand l'architecte n'a rien demandé, le compteur borne la boucle,
++# et T5, T6, T8 restent TOUS verts. T6 exerce un findings de première passe
++# propre, pas la lecture du mauvais fichier.
++
++# (a) forme de code : aucune ligne qui manipule le findings ciblé ne l'interroge,
++#     et la relance n'est pas une récursion.
++T2306_FD_VAR_LINES=$(printf '%s\n' "$T2306_GUARD_SRC" | grep 'fd_findings_file' || true)
++assert_eq "T11 (a): aucune ligne touchant findings-1-fd.md ne l'interroge par grep" "0" \
++    "$(printf '%s\n' "$T2306_FD_VAR_LINES" | grep -c 'grep' || true)"
++assert_eq "T11 (a): et la garde ne se relance pas par récursion sur _launch_revise_pilot" "0" \
++    "$(printf '%s\n' "$T2306_GUARD_SRC" | grep -c '_launch_revise_pilot' || true)"
++# Contre-vacuité de la moitié (a) : la garde manipule réellement ce fichier.
++assert_eq "T11 (a) contre-vacuité: la garde écrit bien un findings ciblé" "yes" \
++    "$([ -n "$T2306_FD_VAR_LINES" ] && echo yes || echo non-trouvé)"
++# Et le terme 1 lit bien le paramètre reçu, pas un chemin reconstruit.
++assert_contains "T11 (a): le terme 1 interroge le findings de première passe reçu en argument" \
++    'first_pass_findings' "$(printf '%s\n' "$T2306_GUARD_SRC" | grep 'Fire-Disposition' | grep 'grep -qF' || true)"
++
++# (b) comportemental : un findings-1-fd.md résiduel laissé par un dispatch
++#     antérieur ne rend aucun terme vrai.
++T2306_T11=$(_t2306_revise_probe "$T2306_FINDINGS_WITHOUT_FD" "no" "never" "residual-fd")
++assert_eq "T11 (b): un findings-1-fd.md résiduel ne déclenche aucune relance" \
++    "1" "$(_t2306_field 2 "$T2306_T11")"
++assert_not_contains "T11 (b): et rien n'est journalisé" \
++    "fire_disposition_revise_retried" "$T2306_T11"
++
+ # --- Summary ---
+ 
+ echo ""
+ echo "========================================"
+ echo "Results: $PASS passed, $FAIL failed"
+ echo "========================================"
+ 
+ if [ "$FAIL" -gt 0 ]; then
+     exit 1
+ fi

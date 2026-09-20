@@ -1,0 +1,5 @@
+{"phase": "start", "stage": "scope", "ts": "2026-09-20T22:54:47.786915+00:00"}
+{"facts": {"changed_lines": 1210, "depth": "full", "exec_nontest_lines": 583, "size_band": "large"}, "phase": "end", "stage": "scope", "ts": "2026-09-20T22:57:10.559598+00:00"}
+{"phase": "start", "stage": "select", "ts": "2026-09-20T22:57:10.559598+00:00"}
+{"facts": {"peer": "not_started_dispatch_infrastructure_denied"}, "phase": "end", "reviewers": 8, "stage": "select", "ts": "2026-09-20T22:57:40.106126+00:00"}
+{"phase": "start", "stage": "dispatch", "ts": "2026-09-20T22:57:40.106126+00:00"}
