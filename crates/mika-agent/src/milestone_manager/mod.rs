@@ -105,6 +105,7 @@ pub mod assessor;
 pub mod cadence;
 pub mod reader;
 pub mod reporter;
+pub mod sink_dir;
 pub mod spawn;
 pub mod types;
 
@@ -114,11 +115,16 @@ mod no_dispatch_test;
 pub use assessor::{Assessor, AssessorConfig};
 pub use cadence::{
     CycleContext, CycleKind, DeliveryBody, DeliveryError, DeliveryFailureKind, HttpReportDeliverer,
-    ManagerConfig, MilestoneCheckpoint, ReportDeliverer, run_manager_cycle, run_manager_cycle_in,
+    ManagerConfig, MilestoneCheckpoint, ROUTE_HTTP, ROUTE_OFFLINE_SINK,
+    ROUTE_OFFLINE_SINK_FALLBACK, ReportDeliverer, run_manager_cycle, run_manager_cycle_in,
     run_manager_cycle_with, run_manager_cycle_with_auth, state_digest,
 };
 pub use reader::{GhRunner, ProcessGhRunner, Reader, compose_from_gh_outputs};
 pub use reporter::{AuthBoundaryNote, AuthBoundaryTracker, Reporter};
+pub use sink_dir::{
+    ENV_OFFLINE_SINK_DIR, SinkDirSource, SinkEntry, SinkListing, list_sink_reports,
+    list_sink_reports_in, resolve_offline_sink_dir,
+};
 pub use spawn::{
     AuthAlarmBody, AuthAlarmSink, HttpAuthAlarmSink, SettingsTokenResolver, TokenResolver,
     manager_config_from_env, spawn_manager_cycle_task,
